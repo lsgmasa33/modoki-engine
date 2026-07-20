@@ -1,3 +1,20 @@
 {
-   "signedContributors": []
+  "signedContributors": [
+    {
+      "name": "masaki-nomura-pf",
+      "id": 135680296,
+      "comment_id": 5028250872,
+      "created_at": "2026-07-20T23:26:46Z",
+      "repoId": 1306592917,
+      "pullRequestNo": 2
+    },
+    {
+      "name": "masaki-nomura-pf",
+      "id": 135680296,
+      "comment_id": 5028317517,
+      "created_at": "2026-07-20T23:32:58Z",
+      "repoId": 1306592917,
+      "pullRequestNo": 2
+    }
+  ]
 }
