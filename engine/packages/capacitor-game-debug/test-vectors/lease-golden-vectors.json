@@ -1,0 +1,25 @@
+{
+  "_comment": "Golden vectors for the device lease authority — the canonical parity contract shared by the TS spec (engine/plugins/backend/deviceLease.ts DeviceLeaseAuthority) and its Swift + Kotlin ports (capacitor-game-debug). Each op is applied in order at the given `now` (ms). connect/ping/disconnect assert `expect` (the reply); socketDropped has no reply; status asserts leased/live. The TS test (engine/tests/plugins/deviceLeaseGoldenVectors.test.ts) pins the TS authority to this file; the native replay tests assert their port produces the same replies. If behavior changes intentionally, regenerate + review this file.",
+  "graceMs": 5000,
+  "steps": [
+    { "op": "connect", "guid": "A", "now": 0, "expect": { "ok": true } },
+    { "op": "ping", "guid": "A", "now": 100, "expect": { "ok": true } },
+    { "op": "connect", "guid": "B", "now": 200, "expect": { "ok": false, "reason": "busy" } },
+    { "op": "socketDropped", "now": 300 },
+    { "op": "status", "now": 3000, "expect": { "leased": true, "live": false } },
+    { "op": "connect", "guid": "A", "now": 3000, "expect": { "ok": true, "resumed": true } },
+    { "op": "ping", "guid": "A", "now": 3100, "expect": { "ok": true } },
+    { "op": "socketDropped", "now": 4000 },
+    { "op": "connect", "guid": "B", "now": 9000, "expect": { "ok": true } },
+    { "op": "ping", "guid": "A", "now": 9050, "expect": { "ok": false, "reason": "not-owner" } },
+    { "op": "disconnect", "guid": "A", "now": 9100, "expect": { "ok": false, "reason": "not-owner" } },
+    { "op": "disconnect", "guid": "B", "now": 9150, "expect": { "ok": true } },
+    { "op": "status", "now": 9200, "expect": { "leased": false, "live": false } },
+    { "op": "connect", "guid": "C", "now": 9200, "expect": { "ok": true } },
+    { "op": "socketDropped", "now": 9300 },
+    { "op": "socketDropped", "now": 9400 },
+    { "op": "status", "now": 14299, "expect": { "leased": true, "live": false } },
+    { "op": "status", "now": 14300, "expect": { "leased": false, "live": false } },
+    { "op": "connect", "guid": "D", "now": 14300, "expect": { "ok": true } }
+  ]
+}

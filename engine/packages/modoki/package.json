@@ -1,0 +1,37 @@
+{
+  "name": "@modoki/engine",
+  "version": "0.1.0",
+  "description": "Modoki \u2014 2D/3D game engine with ECS runtime and visual editor",
+  "type": "module",
+  "exports": {
+    "./runtime": "./src/runtime/index.ts",
+    "./runtime/rendering": "./src/runtime/rendering/index.ts",
+    "./runtime/rendering/Scene3D": "./src/runtime/rendering/Scene3D.tsx",
+    "./runtime/rendering/Game": "./src/runtime/rendering/Game.tsx",
+    "./runtime/debug": "./src/runtime/debug/index.ts",
+    "./editor": "./src/editor/index.ts",
+    "./editor/rendering": "./src/editor/rendering/index.ts",
+    "./three": "./src/three/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.check.json"
+  },
+  "peerDependencies": {
+    "koota": ">=0.1.0",
+    "react": ">=19.0.0",
+    "three": ">=0.180.0",
+    "zustand": ">=5.0.0"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.0"
+  },
+  "dependencies": {
+    "@dimforge/rapier2d-compat": "^0.19.3",
+    "@dimforge/rapier3d-compat": "^0.19.3",
+    "@zappar/msdf-generator": "^1.2.4",
+    "maxrects-packer": "^2.7.3",
+    "poly-decomp-es": "^0.4.2"
+  }
+}

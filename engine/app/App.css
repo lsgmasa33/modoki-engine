@@ -1,0 +1,74 @@
+body {
+  margin: 0;
+  background: #0f0f23;
+  font-family: system-ui, -apple-system, sans-serif;
+  overflow: hidden;
+  /* Stop mobile browsers reclaiming a touch for scroll/refresh (pull-to-refresh,
+     rubber-band overscroll) — that reclaim fires `pointercancel` mid-gesture, which
+     would abort a drag-to-aim. Pairs with `touch-action: none` on the game canvas. */
+  overscroll-behavior: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+#root {
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.app-container {
+  width: 100%;
+  height: 100%;
+}
+
+.game-wrapper {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.game-canvas-wrapper {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+}
+
+/* The game owns every touch over its render canvas (drag-to-aim, swipes) — never let a
+   mobile browser interpret one as a scroll/zoom gesture, which fires `pointercancel`
+   mid-drag and aborts it (the Android "bands flash, puck barely moves" bug). This is the
+   load-bearing half of the Android input fix (the pointer source's cancel-as-release is
+   the belt). It MUST target the real render canvases: in the shipped game these mount
+   directly under `.game-wrapper` (Scene3D/Game — there is NO `.game-canvas-wrapper`
+   there, that class is the editor's GameView only), so style both. `touch-action` is not
+   inherited and the canvas is the hit-test target, so it must sit on the canvas itself.
+
+   The same elements also suppress the iOS touch-and-hold magnifier loupe + callout: `body`
+   already sets user-select/touch-callout none, but the loupe is only reliably killed when the
+   properties sit on the actual touch target (the render canvas + its wrapper), so we repeat
+   them here rather than lean on inheritance. Scoped to the game surface, NOT `*` — App.css is
+   shared with the editor, where text fields/inspector still need selection + the callout. */
+.game-wrapper,
+.game-canvas-wrapper,
+.game-wrapper canvas,
+.game-canvas-wrapper canvas {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.game-wrapper canvas,
+.game-canvas-wrapper canvas {
+  display: block;
+  touch-action: none;
+}
+
+@keyframes blink {
+  50% { opacity: 0; }
+}

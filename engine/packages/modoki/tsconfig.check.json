@@ -1,0 +1,16 @@
+{
+  // Standalone type-check of the engine's own source. The root `tsc -b` only compiles
+  // app/games and so checks engine files solely where they're transitively imported —
+  // orphan/internal files (e.g. an unused barrel with a stale re-export) slip through.
+  // This config checks all of src/**. Run via `npm run typecheck`.
+  //
+  // `paths` is re-stated WITHOUT the react/zustand entries the build config uses: those
+  // map `react` straight to the JS package, which bypasses @types/react resolution. Here
+  // we let normal node resolution find react + its @types so JSX/hooks type correctly.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "paths": {}
+  }
+}

@@ -1,0 +1,20 @@
+Modoki Engine
+Copyright 2026 Masaki Nomura
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product bundles or depends on third-party software, each under its own
+license. A summary and per-dependency attributions are in THIRD-PARTY-NOTICES.md.
+Notable components include:
+
+  - Three.js (MIT) — 3D rendering
+  - PixiJS (MIT) — 2D rendering
+  - koota (MIT) — ECS
+  - Rapier (@dimforge/rapier2d, rapier3d) (Apache-2.0 / MIT) — physics
+  - React (MIT) — UI runtime
+  - Electron (MIT) — desktop editor shell
+  - Vite (MIT) — build tooling
+  - Capacitor (MIT) — native iOS/Android shell
+
+The contents of this file are for informational (attribution) purposes only and
+do not modify the License.

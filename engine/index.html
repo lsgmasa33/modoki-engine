@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="%BASE_URL%favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <title>Modoki</title>
+    <script>
+      // Fatal-load guard (robust auto-open). A project's game code loads against THIS
+      // editor's engine at startup (main.tsx → App.tsx → virtual:modoki-games → the
+      // project's game.ts → …, plus deeper dynamic imports as the scene runs). If a
+      // module fails to evaluate — e.g. a project authored on a NEWER engine that
+      // exports a trait this build lacks (the cross-branch skew that white-screened
+      // the editor) — the error can fire before OR after React mounts, and it isn't a
+      // render error an ErrorBoundary can catch. This inline handler (registered before
+      // the module script) watches for module-load errors and, if #root is STILL empty
+      // a beat later (the app never rendered), swaps the blank page for an actionable
+      // message. The debounce avoids false positives from a transient mid-mount error.
+      (function () {
+        var shown = false, scheduled = false;
+        function isLoadError(msg) {
+          return /does not provide an export|Failed to fetch dynamically imported|Importing a module script failed|error loading dynamically imported|Unable to resolve|Cannot find module|SyntaxError|Unexpected (token|identifier|end)/i.test(msg || '');
+        }
+        function renderFallback(detail) {
+          var root = document.getElementById('root');
+          if (!root) return;
+          root.innerHTML =
+            '<div style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;' +
+            'font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;background:#1a1a24;color:#ddd;padding:24px;">' +
+            '<div style="max-width:520px;text-align:left;">' +
+            '<div style="font-size:20px;font-weight:600;margin-bottom:10px;color:#fff;">Couldn’t open this project</div>' +
+            '<div style="font-size:13px;line-height:1.55;color:#bbb;margin-bottom:14px;">' +
+            'A game component failed to load with this editor. The project may target a <b>newer engine version</b> ' +
+            'than this editor build. Update the editor (or this build’s engine), or open a different project via ' +
+            'the <b>File ▸ Open Project</b> menu.</div>' +
+            '<div style="font-size:11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#c98;background:#241c1c;' +
+            'border:1px solid #4a3030;border-radius:5px;padding:8px 10px;margin-bottom:16px;white-space:pre-wrap;word-break:break-word;">' +
+            String(detail).replace(/^Uncaught\s+/, '').slice(0, 300).replace(/[<>&]/g, function (c) { return { '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]; }) + '</div>' +
+            '<button id="modoki-reload" style="font-size:13px;padding:7px 16px;border-radius:5px;border:1px solid #3a6a3a;' +
+            'background:#2a4a2a;color:#dfe;cursor:pointer;">Reload</button></div></div>';
+          var btn = document.getElementById('modoki-reload');
+          if (btn) btn.addEventListener('click', function () { location.reload(); });
+        }
+        function consider(msg) {
+          try {
+            if (shown || scheduled) return;
+            if (!isLoadError(msg)) return;
+            var root = document.getElementById('root');
+            if (!root || root.childElementCount > 0) return; // app already rendered → not fatal
+            scheduled = true;
+            // The app may still be mid-mount; only a root that's STILL empty is fatal.
+            setTimeout(function () {
+              var r = document.getElementById('root');
+              if (shown || !r || r.childElementCount > 0) return; // recovered
+              shown = true;
+              renderFallback(msg);
+            }, 1400);
+          } catch (_) { /* never let the guard itself throw */ }
+        }
+        window.addEventListener('error', function (e) { consider(e && (e.message || (e.error && e.error.message))); });
+        window.addEventListener('unhandledrejection', function (e) { var r = e && e.reason; consider(r && (r.message || String(r))); });
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/app/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,12 @@
+{
+  "//": "Per-machine settings — copy to project.user.json inside a game project (games/<id>/project.user.json). GITIGNORED: never commit; your device UDIDs and local SDK paths stay off the repo. Empty strings = auto-detect.",
+  "device": {
+    "iosDeviceId": "",
+    "iosDevicectlId": "",
+    "androidDeviceId": ""
+  },
+  "sdk": {
+    "javaHome": "",
+    "androidHome": ""
+  }
+}

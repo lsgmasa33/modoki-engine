@@ -1,0 +1,10 @@
+{
+  "name": "@modoki-game/__GAME_ID__",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A Modoki game project. Its OWN npm root (not a member of the engine workspaces). The shared engine runtime (three/react/koota/@modoki/engine) is provided by the editor and resolved from its repo root (kept singleton via Vite resolve.dedupe), so this project declares no dependencies until you add native targets (which add @capacitor/*) or your own libraries.",
+  "scripts": {
+    "cap:sync": "npx cap sync"
+  }
+}

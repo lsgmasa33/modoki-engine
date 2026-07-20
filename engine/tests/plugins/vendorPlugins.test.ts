@@ -1,0 +1,364 @@
+/** vendorEnginePlugins — vendors engine Capacitor plugins into a game project as
+ *  content-addressed tarball COPIES (never symlinks). Exercised against temp
+ *  project + engine dirs with `npm pack` / `npm run build` mocked so the suite is
+ *  hermetic (no real npm, no network). */
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+// Mock npm: `npm pack` writes a deterministic tarball into --pack-destination;
+// `npm run build` materializes a dist/ dir. Lets us assert pack invocations.
+const execFileSyncMock = vi.fn((_cmd: string, args: string[], opts: { cwd?: string } = {}) => {
+  if (args[0] === 'pack') {
+    const destIdx = args.indexOf('--pack-destination');
+    const dest = args[destIdx + 1];
+    fs.writeFileSync(path.join(dest, 'pkg-0.0.0.tgz'), 'TARBALL-BYTES');
+  } else if (args[0] === 'run' && args[1] === 'build' && opts.cwd) {
+    fs.mkdirSync(path.join(opts.cwd, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(opts.cwd, 'dist', 'index.js'), '// built');
+  }
+  return Buffer.from('');
+});
+const execFileSyncExport = (...a: unknown[]) => execFileSyncMock(...(a as [string, string[], object]));
+vi.mock('node:child_process', () => ({ execFileSync: execFileSyncExport, default: { execFileSync: execFileSyncExport } }));
+
+// Import AFTER the mock is registered.
+const { vendorEnginePlugins } = await import('../../plugins/vendorPlugins');
+
+let projectRoot: string;
+let engineRoot: string;
+const PLUGIN = 'capacitor-game-debug';
+
+/** Create an engine plugin under engineRoot/engine/packages/<name>. */
+function writeEnginePlugin(name = PLUGIN, version = '1.0.0', withDist = true) {
+  const dir = path.join(engineRoot, 'engine', 'packages', name);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name, version, capacitor: { android: {}, ios: {} } }));
+  fs.writeFileSync(path.join(dir, 'src.swift'), 'plugin source v1');
+  if (withDist) {
+    fs.mkdirSync(path.join(dir, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'dist', 'index.js'), '// built');
+  }
+  return dir;
+}
+
+function writeProjectPkg(deps: Record<string, string> = {}) {
+  fs.writeFileSync(path.join(projectRoot, 'package.json'), JSON.stringify({ name: 'g', dependencies: deps }, null, 2) + '\n');
+}
+function readDeps(): Record<string, string> {
+  return JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8')).dependencies;
+}
+function listTarballs(): string[] {
+  const p = path.join(projectRoot, 'plugins');
+  return fs.existsSync(p) ? fs.readdirSync(p).filter((f) => f.endsWith('.tgz')).sort() : [];
+}
+/** Mark the plugin as already-installed (real dir) AND write the install marker
+ *  the editor writes post-install, so a follow-up vendor pass sees it as current. */
+function installRealCopy(name = PLUGIN) {
+  const nm = path.join(projectRoot, 'node_modules', name);
+  fs.mkdirSync(nm, { recursive: true });
+  fs.writeFileSync(path.join(nm, 'package.json'), '{}');
+  const markerPath = path.join(projectRoot, 'node_modules', '.modoki-vendored.json');
+  const marker = fs.existsSync(markerPath) ? JSON.parse(fs.readFileSync(markerPath, 'utf8')) : {};
+  marker[name] = readDeps()[name]; // current file:plugins/<…>.tgz spec
+  fs.writeFileSync(markerPath, JSON.stringify(marker));
+}
+
+beforeEach(() => {
+  projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-vendor-proj-'));
+  engineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-vendor-eng-'));
+  execFileSyncMock.mockClear();
+});
+afterEach(() => {
+  fs.rmSync(projectRoot, { recursive: true, force: true });
+  fs.rmSync(engineRoot, { recursive: true, force: true });
+});
+
+describe('vendorEnginePlugins', () => {
+  it('packs the plugin and rewrites the dep spec to the content-addressed tarball', () => {
+    writeEnginePlugin();
+    writeProjectPkg({ [PLUGIN]: '*' });
+
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+
+    expect(r.changed).toBe(true);
+    expect(r.vendored).toEqual([PLUGIN]);
+    const tgz = listTarballs();
+    expect(tgz).toHaveLength(1);
+    expect(tgz[0]).toMatch(/^capacitor-game-debug-1\.0\.0-[0-9a-f]{8}\.tgz$/);
+    expect(readDeps()[PLUGIN]).toBe(`file:plugins/${tgz[0]}`);
+    // not installed yet → caller must reinstall
+    expect(r.needsInstall).toBe(true);
+  });
+
+  it('migrates an old file:../../engine directory-symlink spec to the tarball copy', () => {
+    writeEnginePlugin();
+    writeProjectPkg({ [PLUGIN]: 'file:../../engine/packages/capacitor-game-debug' });
+
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+
+    expect(r.changed).toBe(true);
+    expect(readDeps()[PLUGIN]).toMatch(/^file:plugins\/capacitor-game-debug-1\.0\.0-[0-9a-f]{8}\.tgz$/);
+  });
+
+  it('is idempotent — second pass does NOT re-pack or rewrite, and reports no work', () => {
+    writeEnginePlugin();
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot); // first pass packs
+    installRealCopy(); // pretend the install happened
+    const packCallsAfterFirst = execFileSyncMock.mock.calls.filter((c) => c[1][0] === 'pack').length;
+    const pkgBefore = fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8');
+
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+
+    expect(r.changed).toBe(false);
+    expect(r.needsInstall).toBe(false);
+    expect(r.vendored).toEqual([]);
+    // no new pack invocation (tarball already content-addressed on disk)
+    const packCallsAfterSecond = execFileSyncMock.mock.calls.filter((c) => c[1][0] === 'pack').length;
+    expect(packCallsAfterSecond).toBe(packCallsAfterFirst);
+    // package.json untouched
+    expect(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8')).toBe(pkgBefore);
+  });
+
+  it('re-packs under a NEW hash when the plugin content changes, and drops the stale tarball', () => {
+    const dir = writeEnginePlugin();
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot);
+    const first = listTarballs();
+    expect(first).toHaveLength(1);
+
+    // change plugin content → new content hash → new tarball name
+    fs.writeFileSync(path.join(dir, 'src.swift'), 'plugin source v2 CHANGED');
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+
+    expect(r.changed).toBe(true);
+    const after = listTarballs();
+    expect(after).toHaveLength(1); // stale one dropped
+    expect(after[0]).not.toBe(first[0]); // different hash
+    expect(readDeps()[PLUGIN]).toBe(`file:plugins/${after[0]}`);
+  });
+
+  it('does NOT re-pack when the content-addressed tarball already exists on disk (committed-tarball fast path)', () => {
+    writeEnginePlugin();
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot); // creates the committed tarball
+    const tgz = listTarballs()[0];
+    // simulate a fresh clone: blow away node_modules but KEEP the committed tarball + spec
+    const packsBefore = execFileSyncMock.mock.calls.filter((c) => c[1][0] === 'pack').length;
+
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+
+    const packsAfter = execFileSyncMock.mock.calls.filter((c) => c[1][0] === 'pack').length;
+    expect(packsAfter).toBe(packsBefore); // committed tarball reused, no re-pack
+    expect(listTarballs()).toEqual([tgz]);
+    // spec already correct, but copy missing from node_modules → reinstall flagged
+    expect(r.needsInstall).toBe(true);
+  });
+
+  it('flags needsInstall when node_modules was extracted from an OLDER tarball (D3)', () => {
+    writeEnginePlugin();
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot);
+    installRealCopy(); // real dir + marker matching the current spec
+    // Simulate a `git pull` that brought a new committed tarball + package.json
+    // spec but did NOT touch node_modules: the marker now points at an old spec.
+    const markerPath = path.join(projectRoot, 'node_modules', '.modoki-vendored.json');
+    fs.writeFileSync(markerPath, JSON.stringify({ [PLUGIN]: 'file:plugins/capacitor-game-debug-1.0.0-deadbeef.tgz' }));
+
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+    expect(r.changed).toBe(false); // spec + tarball already current
+    expect(r.needsInstall).toBe(true); // but the installed copy is stale
+  });
+
+  // Skipped on Windows: this test SETS UP the "old symlink form" via fs.symlinkSync, which
+  // needs elevation / Developer Mode on Windows. The detection logic is OS-agnostic and
+  // exercised on macOS/Linux CI.
+  it.skipIf(process.platform === 'win32')('flags needsInstall when the installed copy is still the OLD symlink form', () => {
+    writeEnginePlugin();
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot);
+    // install as a symlink (the pre-migration form)
+    const nm = path.join(projectRoot, 'node_modules', PLUGIN);
+    fs.mkdirSync(path.dirname(nm), { recursive: true });
+    fs.symlinkSync(path.join(engineRoot, 'engine', 'packages', PLUGIN), nm, 'dir');
+
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+    expect(r.needsInstall).toBe(true);
+  });
+
+  it('does NOT delete the existing tarball when npm pack fails (D4)', () => {
+    const dir = writeEnginePlugin();
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot); // creates the initial tarball
+    const before = listTarballs();
+    expect(before).toHaveLength(1);
+
+    // Change content → a re-pack is attempted under a new hash, but make it throw.
+    fs.writeFileSync(path.join(dir, 'src.swift'), 'changed-v2');
+    execFileSyncMock.mockImplementationOnce((_c: string, args: string[]) => {
+      if (args[0] === 'pack') throw new Error('npm pack boom');
+      return Buffer.from('');
+    });
+    expect(() => vendorEnginePlugins(projectRoot, engineRoot)).toThrow(/boom/);
+    // The pre-existing tarball must survive (deletion happens only AFTER a good pack).
+    expect(listTarballs()).toEqual(before);
+  });
+
+  it('ignores engine plugins the project does not depend on', () => {
+    writeEnginePlugin();
+    writeProjectPkg({ 'some-other-dep': '^1.0.0' }); // does NOT depend on the plugin
+
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+    expect(r.changed).toBe(false);
+    expect(r.vendored).toEqual([]);
+    expect(listTarballs()).toEqual([]);
+    expect(execFileSyncMock).not.toHaveBeenCalled();
+  });
+
+  it('builds the plugin dist on demand when missing before packing', () => {
+    writeEnginePlugin(PLUGIN, '1.0.0', /*withDist*/ false);
+    writeProjectPkg({ [PLUGIN]: '*' });
+
+    vendorEnginePlugins(projectRoot, engineRoot);
+
+    const built = execFileSyncMock.mock.calls.some((c) => c[1][0] === 'run' && c[1][1] === 'build');
+    expect(built).toBe(true);
+  });
+
+  it('returns a no-op result when the project has no package.json', () => {
+    writeEnginePlugin();
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+    expect(r).toEqual({ changed: false, needsInstall: false, vendored: [], expectedVendor: {} });
+  });
+
+  it('returns a no-op result when package.json has no dependencies', () => {
+    writeEnginePlugin();
+    fs.writeFileSync(path.join(projectRoot, 'package.json'), JSON.stringify({ name: 'g' }) + '\n');
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+    expect(r.changed).toBe(false);
+    expect(r.vendored).toEqual([]);
+  });
+
+  it('content hash is stable across machines — same bytes in different fs order yield the same tarball', () => {
+    // Two engine roots with identical plugin content but files created in a
+    // different order; the content-addressed name must be identical.
+    writeEnginePlugin();
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot);
+    const nameA = listTarballs()[0];
+
+    const engineRoot2 = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-vendor-eng2-'));
+    const projectRoot2 = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-vendor-proj2-'));
+    try {
+      const dir2 = path.join(engineRoot2, 'engine', 'packages', PLUGIN);
+      fs.mkdirSync(path.join(dir2, 'dist'), { recursive: true });
+      // create files in reverse order
+      fs.writeFileSync(path.join(dir2, 'dist', 'index.js'), '// built');
+      fs.writeFileSync(path.join(dir2, 'src.swift'), 'plugin source v1');
+      fs.writeFileSync(path.join(dir2, 'package.json'), JSON.stringify({ name: PLUGIN, version: '1.0.0', capacitor: { android: {}, ios: {} } }));
+      fs.writeFileSync(path.join(projectRoot2, 'package.json'), JSON.stringify({ name: 'g', dependencies: { [PLUGIN]: '*' } }, null, 2) + '\n');
+
+      vendorEnginePlugins(projectRoot2, engineRoot2);
+      const nameB = fs.readdirSync(path.join(projectRoot2, 'plugins')).find((f) => f.endsWith('.tgz'));
+      expect(nameB).toBe(nameA);
+    } finally {
+      fs.rmSync(engineRoot2, { recursive: true, force: true });
+      fs.rmSync(projectRoot2, { recursive: true, force: true });
+    }
+  });
+});
+
+// The content hash is scoped to the fileset `npm pack` SHIPS (package.json `files`
+// allowlist + always-included manifest files), so a change to a NON-shipped dev
+// file (src/, tsconfig, lockfile) does NOT rename the content-addressed tarball
+// when the shipped dist/ios/android bytes are identical. This fixes the spurious
+// re-pack churn: the shipped bytes never changed, but the tarball name drifted.
+describe('vendorEnginePlugins — hash scoped to the published fileset', () => {
+  /** A plugin with an explicit `files` allowlist (dist + a native src dir) plus
+   *  dev-only files that npm never ships (src/, tsconfig, package-lock). */
+  function writePluginWithFiles(name = PLUGIN, version = '1.0.0') {
+    const dir = path.join(engineRoot, 'engine', 'packages', name);
+    fs.mkdirSync(path.join(dir, 'dist'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'ios', 'Sources'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({
+      name, version, capacitor: { android: {}, ios: {} },
+      files: ['dist/', 'ios/Sources/', 'Package.swift'],
+    }));
+    fs.writeFileSync(path.join(dir, 'dist', 'plugin.js'), '// shipped runtime');
+    fs.writeFileSync(path.join(dir, 'ios', 'Sources', 'Plugin.swift'), 'shipped swift');
+    fs.writeFileSync(path.join(dir, 'Package.swift'), 'shipped manifest');
+    fs.writeFileSync(path.join(dir, 'README.md'), 'shipped readme');
+    // Dev-only — NOT in `files`, npm never ships these:
+    fs.writeFileSync(path.join(dir, 'src', 'index.ts'), 'source v1');
+    fs.writeFileSync(path.join(dir, 'tsconfig.json'), '{}');
+    fs.writeFileSync(path.join(dir, 'package-lock.json'), '{"v":1}');
+    return dir;
+  }
+
+  it('does NOT re-pack when a non-shipped dev file changes (shipped bytes identical)', () => {
+    const dir = writePluginWithFiles();
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot);
+    const before = listTarballs();
+    expect(before).toHaveLength(1);
+    installRealCopy();
+    const packsBefore = execFileSyncMock.mock.calls.filter((c) => c[1][0] === 'pack').length;
+
+    // Change dev-only files that npm pack excludes — the published bytes are unchanged.
+    fs.writeFileSync(path.join(dir, 'src', 'index.ts'), 'source v2 CHANGED');
+    fs.writeFileSync(path.join(dir, 'tsconfig.json'), '{"strict":true}');
+    fs.writeFileSync(path.join(dir, 'package-lock.json'), '{"v":2}');
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+
+    expect(r.changed).toBe(false);            // no spurious re-pack
+    expect(listTarballs()).toEqual(before);   // same content-addressed name
+    const packsAfter = execFileSyncMock.mock.calls.filter((c) => c[1][0] === 'pack').length;
+    expect(packsAfter).toBe(packsBefore);
+  });
+
+  it('DOES re-pack under a new hash when a SHIPPED file changes', () => {
+    const dir = writePluginWithFiles();
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot);
+    const before = listTarballs()[0];
+
+    fs.writeFileSync(path.join(dir, 'dist', 'plugin.js'), '// shipped runtime CHANGED');
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+
+    expect(r.changed).toBe(true);
+    const after = listTarballs();
+    expect(after).toHaveLength(1);
+    expect(after[0]).not.toBe(before); // new content hash
+  });
+
+  it('a machine-local junk file (.DS_Store) inside a shipped dir does not affect the hash', () => {
+    const dir = writePluginWithFiles();
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot);
+    const before = listTarballs();
+    installRealCopy();
+
+    fs.writeFileSync(path.join(dir, 'dist', '.DS_Store'), 'FINDER JUNK');
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+
+    expect(r.changed).toBe(false);
+    expect(listTarballs()).toEqual(before);
+  });
+
+  it('falls back to whole-dir hashing when there is no `files` field (safe over-hash)', () => {
+    // No `files` field → the shipped set is unknown → hash everything (old behavior),
+    // so even a non-shipped change re-packs. Over-hashing is safe (never a collision).
+    const dir = writeEnginePlugin(); // helper writes NO files field
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot);
+    const before = listTarballs()[0];
+
+    fs.writeFileSync(path.join(dir, 'src.swift'), 'changed');
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+    expect(r.changed).toBe(true);
+    expect(listTarballs()[0]).not.toBe(before);
+  });
+});

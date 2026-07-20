@@ -1,0 +1,28 @@
+{
+  "id": "e2e-particle-scene-0000-0000-000000000000",
+  "version": 9,
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "resources": [
+    { "type": "particle", "path": "1cd1ed3b-4d9a-4b19-9e93-0ff54eb79e32" }
+  ],
+  "entities": [
+    {
+      "id": 1,
+      "name": "Ambient Light",
+      "traits": {
+        "Transform": { "x": 0, "y": 0, "z": 0, "rx": 0, "ry": 0, "rz": 0, "sx": 1, "sy": 1, "sz": 1 },
+        "EntityAttributes": { "name": "Ambient Light", "isActive": true, "sortOrder": 0, "parentId": 0, "layer": "" },
+        "Light": { "lightType": "ambient", "color": 16777215, "intensity": 1, "targetX": 0, "targetY": 0, "targetZ": 0, "distance": 0, "angle": 0.5, "penumbra": 0, "castShadow": false }
+      }
+    },
+    {
+      "id": 2,
+      "name": "Confetti Emitter",
+      "traits": {
+        "Transform": { "x": 0, "y": 0, "z": 0, "rx": 0, "ry": 0, "rz": 0, "sx": 1, "sy": 1, "sz": 1 },
+        "EntityAttributes": { "name": "Confetti Emitter", "isActive": true, "sortOrder": 1, "parentId": 0, "layer": "3d" },
+        "ParticleEmitter": { "effect": "1cd1ed3b-4d9a-4b19-9e93-0ff54eb79e32", "playOnStart": true, "playbackSpeed": 1, "isVisible": true }
+      }
+    }
+  ]
+}

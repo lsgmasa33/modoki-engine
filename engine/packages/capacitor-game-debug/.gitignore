@@ -1,0 +1,4 @@
+.build/
+.swiftpm/
+android/build/
+android/.gradle/

@@ -1,0 +1,13 @@
+{
+  "build": {
+    "webDeployMode": "none",
+    "webBucket": "",
+    "webBasePath": "/",
+    "webCdnUrlMap": "",
+    "appleTeamId": ""
+  },
+  "app": {
+    "appId": "__APP_ID__",
+    "appName": "__GAME_NAME__"
+  }
+}

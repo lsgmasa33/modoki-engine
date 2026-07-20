@@ -1,0 +1,44 @@
+{
+  "name": "capacitor-litert-lm",
+  "version": "1.0.0",
+  "description": "Capacitor plugin for on-device LLM inference via Google LiteRT-LM",
+  "main": "dist/plugin.cjs.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/esm/index.d.ts",
+  "unpkg": "dist/plugin.js",
+  "files": [
+    "android/src/main/",
+    "android/build.gradle",
+    "dist/",
+    "ios/Sources/",
+    "CapacitorLitertLm.podspec",
+    "Package.swift"
+  ],
+  "author": "",
+  "license": "MIT",
+  "scripts": {
+    "build": "npm run clean && tsc && rollup -c rollup.config.mjs",
+    "clean": "rimraf ./dist",
+    "watch": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-genai": "^0.10.0"
+  },
+  "devDependencies": {
+    "@capacitor/core": "^8.0.0",
+    "@types/google-protobuf": "^3.15.12",
+    "google-protobuf": "^4.0.2",
+    "rimraf": "^6.1.0",
+    "rollup": "^4.53.2",
+    "typescript": "^5.9.3"
+  },
+  "peerDependencies": {
+    "@capacitor/core": ">=8.0.0"
+  },
+  "capacitor": {
+    "android": {
+      "src": "android"
+    }
+  }
+}

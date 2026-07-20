@@ -1,0 +1,44 @@
+{
+  "id": "e2e-smoke-scene-0000-0000-000000000000",
+  "version": 9,
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "resources": [],
+  "entities": [
+    {
+      "id": 1,
+      "name": "CenterCube",
+      "traits": {
+        "Transform": { "x": 0, "y": 0, "z": 0, "rx": 0, "ry": 0, "rz": 0, "sx": 1, "sy": 1, "sz": 1 },
+        "Renderable3DPrimitive": { "mesh": "cube", "color": 3447003, "size": 3, "material": "", "isVisible": true },
+        "EntityAttributes": { "name": "CenterCube", "isActive": true, "sortOrder": 0, "parentId": 0, "layer": "3d" }
+      }
+    },
+    {
+      "id": 2,
+      "name": "OffsetSphere",
+      "traits": {
+        "Transform": { "x": 0, "y": 8, "z": 0, "rx": 0, "ry": 0, "rz": 0, "sx": 1, "sy": 1, "sz": 1 },
+        "Renderable3DPrimitive": { "mesh": "sphere", "color": 15158332, "size": 2, "material": "", "isVisible": true },
+        "EntityAttributes": { "name": "OffsetSphere", "isActive": true, "sortOrder": 1, "parentId": 0, "layer": "3d" }
+      }
+    },
+    {
+      "id": 3,
+      "name": "Ambient Light",
+      "traits": {
+        "Transform": { "x": 0, "y": 0, "z": 0, "rx": 0, "ry": 0, "rz": 0, "sx": 1, "sy": 1, "sz": 1 },
+        "EntityAttributes": { "name": "Ambient Light", "isActive": true, "sortOrder": 2, "parentId": 0, "layer": "" },
+        "Light": { "lightType": "ambient", "color": 16777215, "intensity": 1, "targetX": 0, "targetY": 0, "targetZ": 0, "distance": 0, "angle": 0.5, "penumbra": 0, "castShadow": false }
+      }
+    },
+    {
+      "id": 4,
+      "name": "UIButton",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 140, "height": 44, "widthUnit": "px", "heightUnit": "px", "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "E2E UI Button", "fontSize": 16, "textColor": 16777215 },
+        "EntityAttributes": { "name": "UIButton", "isActive": true, "sortOrder": 3, "parentId": 0, "layer": "ui" }
+      }
+    }
+  ]
+}

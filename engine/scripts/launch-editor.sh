@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Launch the Modoki Electron editor (dev mode, HMR via the Vite dev server).
+#
+#   scripts/launch-editor.sh [project-dir]
+#
+# - Pins the Electron backend to a fixed loopback port (MODOKI_BACKEND_PORT) so the
+#   Modoki MCP server has a stable target for the FULL toolset (capture/tap/drag/
+#   render need the Electron backend, not the Vite dev server).
+# - Clears any stray Vite dev server (5173); main now OWNS the Vite process so
+#   "Open Project" can re-root it live (the renderer loads the shell + the open
+#   project's game code + assets from it). main spawns it rooted at MODOKI_PROJECT.
+# - Builds the esbuild main/preload bundle, then launches Electron in the background.
+# - An EXPLICIT [project-dir] arg HARD-forces that project (wins over the editor's
+#   last-opened "recents" memory) — if you name a project, you get that project.
+#   Bare launches (no arg) reopen your last-opened project (recents), falling back
+#   to the dev default. To force soft/seed-only behavior for an arg, set
+#   MODOKI_PROJECT_SOFT=1. A pre-set MODOKI_PROJECT env still hard-wins over the arg.
+#
+# Prints the backend URL to point MODOKI_BACKEND at.
+set -euo pipefail
+
+# engine/scripts/ → repo root (npm/package.json + node_modules live there).
+REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$REPO"
+
+# MODOKI_MULTI=1 launches an ADDITIONAL editor alongside running ones: it skips
+# the single-instance cleanup (no pkill, no dev:stop) and lets main auto-pick free
+# Vite + backend ports (findFreePort) so nothing clashes. Default (unset) keeps the
+# single-instance behavior: relaunch replaces the prior editor on the stable 5179.
+MULTI="${MODOKI_MULTI:-}"
+# In multi mode leave the backend port unset so each editor auto-picks a free one.
+if [ -n "$MULTI" ]; then BACKEND_PORT="${MODOKI_BACKEND_PORT:-}"; else BACKEND_PORT="${MODOKI_BACKEND_PORT:-5179}"; fi
+PROJECT="${1:-}"
+# An explicitly-named project HARD-forces itself (MODOKI_PROJECT), which wins over
+# recents in main's resolveInitialProject (envProject → recents → envDefault): if you
+# type a project, you open THAT project, not whatever you had open last. A bare launch
+# passes nothing, so recents win (reopen last project) → dev default. MODOKI_PROJECT_SOFT=1
+# downgrades the arg to a seed-only default (old behavior). A pre-set MODOKI_PROJECT env
+# (CI/build) is left untouched and still hard-wins over the arg.
+# (A `${PROJECT:+VAR=val}` env-prefix from a shell *expansion* is NOT treated as an
+# assignment by bash — it becomes a bogus command — so export it explicitly instead.)
+if [ -n "$PROJECT" ]; then
+  if [ -n "${MODOKI_PROJECT_SOFT:-}" ]; then
+    export MODOKI_PROJECT_DEFAULT="$PROJECT"
+  elif [ -z "${MODOKI_PROJECT:-}" ]; then
+    export MODOKI_PROJECT="$PROJECT"
+  fi
+fi
+# Per-instance logs so parallel editors (multiple worktrees, or MULTI mode) don't
+# clobber each other's log — keyed on the pinned backend port (distinct per
+# worktree: main 5179 / work-ai 5180), falling back to this launcher's PID when the
+# port is auto-picked (MULTI mode). Without this every editor writes the same
+# /tmp/modoki-editor.log and you read the wrong instance's output.
+LOG_TAG="${BACKEND_PORT:-$$}"
+VITE_LOG="/tmp/modoki-vite-${LOG_TAG}.log"
+EDITOR_LOG="/tmp/modoki-editor-${LOG_TAG}.log"
+
+# 1. Stop ONLY this repo's prior editor + the Vite it owns — matched by this
+#    repo's ABSOLUTE paths so a sibling git worktree's editor (a DIFFERENT path,
+#    e.g. ~/Projects/modoki-ai/...) is never touched. (The old cleanup matched the
+#    editor by RELATIVE path `engine/electron/dist/main.cjs` and stopped Vite via
+#    `npm run dev:stop`, which curls /api/exit on the shared ports 5173-5176 — both
+#    killed OTHER worktrees' editors. Multi-worktree bug.) main spawns Vite from
+#    `$REPO/node_modules/vite/bin/vite.js` and stops it on quit; the second pkill
+#    sweeps any straggler if a prior editor died uncleanly. We launch the editor
+#    with its absolute main.cjs (step 3) so the first pkill can match it precisely.
+#    Skipped in multi mode (run several editors of the SAME repo side by side).
+if [ -z "$MULTI" ]; then
+  pkill -f "$REPO/engine/electron/dist/main.cjs" 2>/dev/null || true
+  pkill -f "$REPO/node_modules/vite/bin/vite.js" 2>/dev/null || true
+  sleep 0.5
+fi
+
+# 2. Build the Electron main/preload bundle.
+echo "[launch-editor] building electron bundle…"
+npm run electron:build >/dev/null 2>&1
+
+# 3. Launch Electron in the background. Pass the ABSOLUTE main.cjs path so the
+#    process is identifiable by THIS repo's path (the repo-scoped pkill in step 1
+#    relies on it). With a pinned backend port (single-instance default) export it;
+#    in multi mode leave it unset so main auto-picks free ports.
+: > "$EDITOR_LOG"
+echo "[launch-editor] launching editor (${BACKEND_PORT:+backend port $BACKEND_PORT}${BACKEND_PORT:+, }${BACKEND_PORT:-auto ports}${PROJECT:+, project $PROJECT})…"
+[ -n "$BACKEND_PORT" ] && export MODOKI_BACKEND_PORT="$BACKEND_PORT"
+# Optional CDP remote-debugging port (set via MODOKI_CDP_PORT — the editor-* aliases
+# pin one per clone). Lets CDP tooling attach to the renderer (inject console errors,
+# read React fiber state, catch WGSL validation) WITHOUT a manual relaunch. Chromium
+# binds it to 127.0.0.1 only, so it's local-dev only. Unset ⇒ no port, no change.
+# VALIDATE the value (mirrors cdp.ts isValidCdpPort, 1..65535): passing junk verbatim
+# to Chromium (which parses it as 0 → an ephemeral/random port) would silently diverge
+# from what main reports — so reject an invalid value loudly instead of guessing.
+CDP_ARG=""
+if [ -n "${MODOKI_CDP_PORT:-}" ]; then
+  if echo "$MODOKI_CDP_PORT" | grep -qE '^[0-9]+$' && [ "$MODOKI_CDP_PORT" -ge 1 ] && [ "$MODOKI_CDP_PORT" -le 65535 ]; then
+    CDP_ARG="--remote-debugging-port=${MODOKI_CDP_PORT}"
+  else
+    echo "[launch-editor] WARNING: ignoring invalid MODOKI_CDP_PORT='${MODOKI_CDP_PORT}' (want an integer 1..65535) — CDP off."
+  fi
+fi
+nohup ./node_modules/.bin/electron $CDP_ARG "$REPO/engine/electron/dist/main.cjs" >"$EDITOR_LOG" 2>&1 &
+EDITOR_PID=$!
+
+# 4. Wait for the backend to announce itself, then report.
+for _ in $(seq 1 60); do
+  grep -q "backend listening on" "$EDITOR_LOG" && break
+  kill -0 "$EDITOR_PID" 2>/dev/null || { echo "[launch-editor] ERROR: editor exited early (see $EDITOR_LOG)"; tail -5 "$EDITOR_LOG"; exit 1; }
+  sleep 0.5
+done
+
+PORT="$(grep -oE 'listening on http://127.0.0.1:[0-9]+' "$EDITOR_LOG" | grep -oE '[0-9]+$' | head -1 || true)"
+echo
+echo "[launch-editor] ✓ Editor running (pid $EDITOR_PID)."
+echo "[launch-editor]   Backend:      http://127.0.0.1:${PORT:-$BACKEND_PORT}"
+echo "[launch-editor]   MCP target:   MODOKI_BACKEND=http://127.0.0.1:${PORT:-$BACKEND_PORT}  (full toolset)"
+echo "[launch-editor]   Log:          $EDITOR_LOG"

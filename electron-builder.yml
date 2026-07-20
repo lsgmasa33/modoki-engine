@@ -1,0 +1,191 @@
+# electron-builder config (ELECTRON_PLAN Phase 7 + RESTRUCTURE C4c-3b).
+#
+# ── "Run Vite in prod" (C4c-3b) ──────────────────────────────────────────────
+# The packaged editor is the SAME as the dev editor: main spawns a Vite server
+# (engine/electron/devServer.ts) that serves the editor shell + the open project's
+# game code + assets, and the renderer loads from it (http://localhost:5173). That
+# imposes three packaging requirements the old static-`dist` design didn't:
+#   1. engine/ SOURCE + node_modules must ship as REAL files on disk — Vite can't
+#      read or watch inside an asar, and the vite binary can't be exec'd from one.
+#      So we keep `asar: true` (small main/renderer bundle) but `asarUnpack` all of
+#      engine/** and node_modules/** → they land in `app.asar.unpacked/` (a real
+#      dir). main resolves REPO_ROOT to that dir when packaged (see main.ts).
+#   2. The RENDERER's deps (pixi.js, three, react, gsap, koota, zustand, the game's
+#      imports …) must be PRESENT in node_modules — Vite resolves them per-request
+#      from source, it does NOT pre-bundle them into dist the way `vite build` did.
+#      So the old `files` exclusions that dropped pixi/firebase/@mediapipe are gone.
+#   3. dist/ (the MODOKI_EDITOR `vite build` output) is no longer the shell source;
+#      it's kept only as a harmless fallback and for asset tooling.
+# ⚠️ VERIFICATION GAP: the exact include/exclude set + the unpacked-path spawn can
+#    only be validated by a real `npm run dist` + launching the .dmg. Not run here.
+#
+# Native modules (sharp + @img) load fine once unpacked. The KTX CLI (toktx +
+# libktx) is bundled into Contents/Resources/bin by the beforePack hook
+# (scripts/stage-toktx.cjs); main resolves MODOKI_TOKTX there. Model re-import
+# (gltfpack / @gltf-transform/cli) stays a dev-toolchain feature (clear install
+# hint when its external CLI is absent on an end-user machine).
+
+appId: com.modokiengine.editor
+productName: Modoki Editor
+copyright: Copyright © 2026 Modoki
+
+# Auto-update feed (electron-updater). Generates app-update.yml (bundled into the
+# app, read at runtime to locate the feed) + latest-mac.yml (the feed manifest).
+# The feed is a PUBLIC GCS path (generic provider) — NOT GitHub Releases — because
+# the repo is private and electron-updater can't authenticate from a distributed
+# app against a private repo (every feed/asset request 404s, silently). The bucket
+# `modoki-www-site` is public-read; the release workflow gsutil-uploads
+# latest-mac.yml + the zip/blockmap here on a v* tag. The dmg for a FIRST install
+# is still attached to the GitHub Release (humans download it there); updates of an
+# already-installed editor come from this GCS feed. `npm run dist` uses `--publish
+# never`, so this only bakes WHERE to look into app-update.yml — it never uploads.
+publish:
+  provider: generic
+  url: https://storage.googleapis.com/modoki-www-site/editor
+
+# Space-free artifact names. productName is "Modoki Editor" (a space), and the
+# default `${productName}-…` name contains that space — which GitHub mangled to a
+# dot on upload (`Modoki.Editor-…`) while latest-mac.yml kept a hyphen, breaking
+# downloads by name. A space-free literal makes the produced file, the yml `url`,
+# and the uploaded GCS object all agree. The mac zip still gets its `-mac` suffix.
+artifactName: Modoki-Editor-${version}-${arch}.${ext}
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  # Vite-in-prod serves the shell + games from engine/ SOURCE, so the whole engine
+  # tree ships (not just the built electron/dist). dist/ is a vestigial fallback.
+  - engine/**/*
+  - dist/**/*
+  - package.json
+  # Size control: drop ONLY things Vite/the renderer never resolve at runtime —
+  # the Capacitor native plugin trees + every package's android/ios build dirs
+  # (huge, mobile-only) and the test/win toolchains. The renderer deps that the OLD
+  # config excluded (pixi/firebase/@mediapipe) are NO LONGER excluded — Vite resolves
+  # them from node_modules per-request, so they must remain present.
+  # NOTE: do NOT exclude @capacitor/** — the EDITOR imports @capacitor/core +
+  # @capacitor/keyboard (useKeyboardShift, platform detection) and the app shell
+  # uses others. Under "run Vite in prod" the renderer resolves them from
+  # node_modules at runtime (the old static-dist build pre-bundled them, so the
+  # exclude was safe then; it is NOT now — excluding them = white-screen on launch).
+  # Do NOT exclude capacitor-* broadly — capacitor-game-debug is ENGINE debug
+  # tooling the editor imports at runtime (engine/app/debug/bridge.ts). Only exclude
+  # capacitor-litert-lm (a different game's plugin, not needed by this editor, and
+  # it pulls @mediapipe ~76MB). Per-game packaging (#29) will relocate it properly.
+  - "!node_modules/capacitor-litert-lm/**"
+  - "!node_modules/**/{android,ios}/**"
+  - "!node_modules/{playwright-core,@playwright,electron-winstaller}/**"
+  # Firebase + its tree are a GAME app-service dep now (moved to the 3d-test
+  # @3d-test/app-services package), not an engine dep — keep them out of the editor.
+  # (~8k files: the single biggest signing-time contributor.)
+  - "!node_modules/{firebase,@firebase,@grpc,protobufjs}/**"
+  # Do NOT ship the dev Vite optimize-cache — it's baked against the dev tree (wrong
+  # for the packaged node_modules) and the signed bundle is read-only so Vite can't
+  # rewrite it. main points cacheDir at a writable userData dir; Vite re-optimizes
+  # fresh there on first launch. (MODOKI_VITE_CACHEDIR in vite.config + main.ts.)
+  - "!engine/.vite/**"
+  - "!engine/**/.vite/**"
+  # ⚠️ This exclude set is unverified against a real packaged Vite run — if a
+  #    renderer/game import 404s in the .dmg, the culprit is almost certainly an
+  #    over-broad exclude here.
+
+asar: true
+# Vite operates on real files and execs node_modules/.bin/vite — neither works
+# inside an asar, so unpack everything Vite touches (engine source + node_modules)
+# to app.asar.unpacked/. main points REPO_ROOT there when packaged (main.ts).
+asarUnpack:
+  - "**/engine/**"
+  - "**/node_modules/**"
+  # engine/vite.config.ts finds the editor root by walking up for a package.json, so the root
+  # package.json must be a real file on disk (not sealed in the asar) for the packaged web/native
+  # build to resolve its root. (package-lock.json for parity.) The build step runs
+  # `node engine/scripts/build-web.mjs` DIRECTLY — not `npm run build` — because electron-builder
+  # strips `scripts` from the generated app package.json (so `npm run build` = "Missing script").
+  - "package.json"
+  - "package-lock.json"
+
+# App version is NOT pinned here — it comes from the root `package.json` `version`
+# (the single source of truth). electron-builder injects it into the packaged app's
+# package.json, so `app.getVersion()` returns it; the dev editor + window title read
+# the SAME value via the build-time `__APP_VERSION__` define (see build-electron.mjs).
+# Bump the version in package.json; keep it ahead of the published auto-update feed so
+# an unsigned test DMG never downgrades an installed build.
+
+# Stage native CLIs into build/bin before packing, then ship them as extraResources
+# → Contents/Resources/bin (main resolves MODOKI_TOKTX / MODOKI_MSDF_ATLAS_GEN there
+# when packaged). The signing pass signs all of them; the disable-library-validation
+# entitlement lets each load its sibling dylibs under hardened runtime. beforePack
+# takes one hook → before-pack.cjs fans out to the per-tool stagers (stage-toktx.cjs =
+# KTX CLI + libktx; stage-msdf.cjs = msdf-atlas-gen + its 3 dylibs for font atlas
+# bake), each graceful when its binary is absent. We bundle ONLY tools with no npm
+# download path; ffmpeg/ffprobe are provisioned on-demand into the userData toolchain.
+beforePack: engine/scripts/before-pack.cjs
+# Copy three/examples/jsm back in (electron-builder strips "examples" dirs); runtime
+# imports three/examples/jsm/* under Vite-in-prod. Runs before signing.
+afterPack: engine/scripts/copy-three-addons.cjs
+extraResources:
+  - from: build/bin
+    to: bin
+    filter: ["**/*"]
+
+mac:
+  category: public.app-category.developer-tools
+  # arm64 only — sharp + the staged toktx are arm64 binaries; Intel Macs run the
+  # arm64 app under Rosetta. Make a universal/x64 build explicit if Intel-native
+  # is ever needed.
+  target:
+    - target: dmg
+      arch: [arm64]
+    - target: zip
+      arch: [arm64]
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # Notarization is opt-in via env in the afterSign hook (scripts/notarize.cjs),
+  # so an unsigned local `--dir` build needs no Apple credentials.
+
+dmg:
+  writeUpdateInfo: false
+
+# ── Windows (x64) ────────────────────────────────────────────────────────────
+# ⚠️ BUILD IN A win32-x64 NATIVE ENVIRONMENT. The packaged app ships real
+#    node_modules (Vite-in-prod), which include NATIVE modules resolved per
+#    platform: `sharp`/@img (texture WebP encode) install a win32-x64 prebuilt only
+#    when `npm install` runs against the win32-x64 target. The canonical path is the
+#    Windows CI runner (.github/workflows/release-windows.yml: `npm ci && npm run
+#    dist:win`), where npm ci naturally pulls the win32-x64 prebuilds. Cross-building
+#    from macOS is possible but fiddly — electron-builder runs the NSIS compiler under
+#    wine AND you must force the win prebuilds in (`npm install --os=win32 --cpu=x64
+#    sharp`, verify no other mac-only native dep) — so it's not the supported route.
+# Bundled native tools (toktx + msdf-atlas-gen): staged into build/bin by a DIFFERENT
+#    mechanism per platform, both landing in the same extraResources → resources/bin:
+#      • macOS — the beforePack stage hooks (stage-toktx.cjs / stage-msdf.cjs). They are
+#        darwin-only because they relocate Homebrew dylibs + re-sign for hardened runtime.
+#      • Windows — CI steps in .github/workflows/release-windows.yml ("Stage toktx" /
+#        "Stage msdf-atlas-gen") download the upstream Windows releases, sha256-verify,
+#        and extract toktx.exe+ktx.dll / msdf-atlas-gen.exe into build/bin BEFORE
+#        electron-builder runs. So a Windows installer DOES bundle both — full parity
+#        with the macOS bundle. main.ts resolveBundled appends `.exe` on win32.
+#    Both paths are graceful: a download/stage failure leaves build/bin empty and the app
+#    falls back to source textures / a manual-install hint, so the build never fails.
+# Icon: build/icon.ico (6 sizes, generated from build/icon.png) — auto-discovered
+#    from buildResources, named explicitly here for clarity.
+# Signing: env-gated (Azure Trusted Signing), like macOS notarization — an unsigned
+#    local build needs no credentials; SmartScreen will warn until signing is wired.
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch: [x64]
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  # Per-user install (no admin elevation) — matches the "no-toolchain user" target.
+  perMachine: false
+
+afterSign: engine/scripts/notarize.cjs
+afterAllArtifactBuild: engine/scripts/staple-dmg.cjs

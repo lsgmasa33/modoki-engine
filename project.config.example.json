@@ -1,0 +1,18 @@
+{
+  "build": {
+    "javaHome": "",
+    "webBucket": "gs://modoki-www-site/demo",
+    "webBasePath": "/demo/",
+    "webCdnUrlMap": "static-lb",
+    "iosDeviceId": "00008150-00041CAA3AB8401C",
+    "iosDevicectlId": "796DC698-BD9D-529F-B068-D14867813680",
+    "androidDeviceId": ""
+  },
+  "app": {
+    "appId": "com.modokiengine.prototype",
+    "appName": "Puzzle Prototype"
+  },
+  "content": {
+    "defaultGameId": "3d-test"
+  }
+}

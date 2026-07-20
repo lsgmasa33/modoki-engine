@@ -1,0 +1,17 @@
+@import './ui/styles/tokens.css';
+
+/* Disable iOS/WKWebView text autosizing ("font boosting"). Without this, iOS
+ * inflates text in blocks — Chromium (web / Android WebView / the Electron editor)
+ * does NOT — so a content-height UI element (e.g. a button whose height is derived
+ * from its text, not authored) renders TALLER on iOS only. Pin to the authored size
+ * everywhere. */
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}

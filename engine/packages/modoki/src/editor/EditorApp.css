@@ -1,0 +1,22 @@
+/* Editor-specific styles — imported only by EditorApp.tsx, not shipped in game builds */
+
+/* Closed hand cursor on mousedown (before drag starts) */
+body.editor-mousedown,
+body.editor-mousedown * {
+  cursor: grabbing !important;
+}
+
+/* Import progress bar animation */
+@keyframes importProgress {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(350%); }
+}
+
+/* Button press feedback — darken on click */
+button:active {
+  filter: brightness(0.7) !important;
+  transform: scale(0.97);
+}
+button {
+  transition: filter 0.05s, transform 0.05s;
+}
