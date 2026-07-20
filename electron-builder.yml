@@ -40,8 +40,9 @@ copyright: Copyright © 2026 Modoki
 # already-installed editor come from this GCS feed. `npm run dist` uses `--publish
 # never`, so this only bakes WHERE to look into app-update.yml — it never uploads.
 publish:
-  provider: generic
-  url: https://storage.googleapis.com/modoki-www-site/editor
+  provider: github
+  owner: lsgmasa33
+  repo: modoki-engine
 
 # Space-free artifact names. productName is "Modoki Editor" (a space), and the
 # default `${productName}-…` name contains that space — which GitHub mangled to a
