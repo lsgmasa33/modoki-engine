@@ -1,0 +1,229 @@
+# Windows (x64) editor installer (Phase W / W-5).
+# Builds the Modoki editor NSIS installer on a native x64 Windows runner, so the
+# packaged node_modules carry the correct win32-x64 native prebuilds (sharp/@img) —
+# the whole reason this must run on Windows rather than cross-build from the macOS
+# release job. Produces a downloadable artifact; on a v* tag it also attaches the
+# installer to the GitHub Release.
+#
+# NOT YET SIGNED: there's no Azure Trusted Signing wired up, so the installer is
+# unsigned and Windows SmartScreen will warn on first run. That's fine for a test
+# build / internal distribution; add signing (env-gated, like the macOS notarize
+# hook) before a public release. Likewise the electron-updater feed (latest.yml) is
+# NOT published to GCS here — the Windows auto-update channel waits until the build
+# is signed + validated on a real Windows box (see docs/plans/editor-toolchain-layer-plan.md,
+# Phase W).
+#
+# toktx/libktx AND msdf-atlas-gen ARE bundled on Windows via the "Stage toktx" / "Stage
+# msdf-atlas-gen" steps below (extracted from the upstream Windows releases into build/bin,
+# shipped as extraResources → resources/bin; main.ts resolves MODOKI_TOKTX /
+# MODOKI_MSDF_ATLAS_GEN there). So KTX2 texture import AND MTSDF font baking both work out
+# of the box on Windows — parity with the macOS bundle.
+
+name: Release (Windows)
+
+on:
+  workflow_dispatch:      # build a test installer any time (once this is on main)
+  push:
+    tags: ['v*']          # also build alongside a tagged release
+
+concurrency:
+  group: release-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+# action-gh-release needs contents:write to attach the installer on a tag.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest   # native x64 → npm ci pulls the win32-x64 sharp/@img prebuilds
+    steps:
+      - uses: actions/checkout@v4
+        # Do NOT fetch LFS — matches the proven macOS release.yml (which also checks
+        # out without LFS and produces a working, validated build). The LFS-tracked
+        # engine assets (fonts/favicon/cursor PNGs) bundle as pointer files and the
+        # app still renders (system-font fallback); the Windows installer icon
+        # (build/icon.ico) is NOT LFS-tracked, so it's a real file. Fetching LFS here
+        # also isn't possible right now — the repo's LFS bandwidth budget is exhausted
+        # (a separate account/billing concern, not a build issue).
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # --ignore-scripts skips the root postinstall (build:plugins + bootstrap-game-deps).
+      # The editor installer does NOT bundle games (they're opened at runtime), so we
+      # don't need the per-game deps/plugin builds that bootstrap-game-deps does — and
+      # those game builds would hit rollup #4828 on Windows anyway (each game's lockfile
+      # pins only the Linux rollup binary). We build just the root plugins the editor
+      # needs in the next step. --ignore-scripts skips SCRIPTS, not dependency installs,
+      # so the win32-x64 rollup optional dep (pinned in the lockfile) is still installed.
+      - name: Install (no scripts — skip game bootstrap)
+        run: npm ci --ignore-scripts
+
+      # The capacitor-* workspace packages ship their JS/.d.ts only in a gitignored
+      # dist/. Build them explicitly (postinstall was skipped above) so the editor vite
+      # build can resolve them. Runs rollup, which now finds @rollup/rollup-win32-x64-msvc
+      # (pinned in the lockfile → npm ci installs it on this Windows runner).
+      - name: Build native plugin packages (root)
+        run: npm run build:plugins
+
+      # Stamp package.json with the tag version (strip the leading "v") so the
+      # installer filename carries a real version. workflow_dispatch (no tag) keeps
+      # the committed version. `npm version` works the same on Windows.
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Setting version to $VERSION"
+          npm version --no-git-tag-version --allow-same-version "$VERSION"
+
+      # Bundle toktx (KTX2 texture encoder) so KTX2 import works out of the box — the
+      # macOS build stages it in beforePack, but that stager is darwin-only. KTX-Software
+      # ships Windows ONLY as an NSIS installer (no portable zip / no published sha for the
+      # .exe), so: download the official installer, verify a pinned sha256 (computed from
+      # the release asset — never install unverified bytes), 7z-extract it (7-Zip is
+      # preinstalled on windows-latest — no need to RUN the installer), and copy just
+      # toktx.exe + its ktx.dll into build/bin (electron-builder ships that as
+      # extraResources → resources/bin; main resolves MODOKI_TOKTX there). Graceful: any
+      # failure leaves build/bin present-but-empty so the build still succeeds and the app
+      # falls back to source textures (same as a dev box without toktx).
+      - name: Stage toktx (KTX-Software) for bundling
+        shell: bash
+        run: |
+          set -uo pipefail
+          KTX_VER=4.4.2
+          KTX_SHA=1f323b0fec19794f5e6c0425a61d4b1da396872a10be862d105f4f4b2d2957fe
+          mkdir -p build/bin
+          url="https://github.com/KhronosGroup/KTX-Software/releases/download/v${KTX_VER}/KTX-Software-${KTX_VER}-Windows-x64.exe"
+          if curl -fsSL "$url" -o ktx.exe && echo "${KTX_SHA} *ktx.exe" | sha256sum -c -; then
+            7z x -y ktx.exe -oktx-extract >/dev/null
+            if cp ktx-extract/bin/toktx.exe ktx-extract/bin/ktx.dll build/bin/; then
+              echo "[stage-toktx] bundled toktx.exe + ktx.dll:"; ls -la build/bin
+            else
+              echo "[stage-toktx] WARN: extract layout unexpected — building WITHOUT bundled toktx"
+            fi
+          else
+            echo "[stage-toktx] WARN: KTX download/verify failed — building WITHOUT bundled toktx (source-texture fallback)"
+          fi
+
+      # Bundle msdf-atlas-gen (MTSDF font-atlas baker) — the last macOS-only-bundled tool.
+      # Chlumsky ships a prebuilt Windows zip (unlike macOS, which has no prebuilt → stage-msdf.cjs
+      # relocates a Homebrew build). The win64 exe is a single statically-linked binary (imports only
+      # KERNEL32.dll — no sibling DLLs), so: download, verify a pinned sha256, extract the lone .exe
+      # into build/bin (shipped as extraResources → resources/bin; main resolves MODOKI_MSDF_ATLAS_GEN
+      # there). Graceful: any failure leaves build/bin as-is so the build still succeeds (font import
+      # then degrades to a clear install hint), same as a dev box without it.
+      - name: Stage msdf-atlas-gen for bundling
+        shell: bash
+        run: |
+          set -uo pipefail
+          MSDF_VER=1.4
+          MSDF_SHA=55ab2bef57b9c7bf305b610989fa8eeda812d85bc93e632b8c39ce05b6e64e9d
+          mkdir -p build/bin
+          url="https://github.com/Chlumsky/msdf-atlas-gen/releases/download/v${MSDF_VER}/msdf-atlas-gen-${MSDF_VER}-win64.zip"
+          if curl -fsSL "$url" -o msdf.zip && echo "${MSDF_SHA} *msdf.zip" | sha256sum -c -; then
+            7z x -y msdf.zip -omsdf-extract >/dev/null
+            if cp msdf-extract/msdf-atlas-gen/msdf-atlas-gen.exe build/bin/; then
+              echo "[stage-msdf] bundled msdf-atlas-gen.exe:"; ls -la build/bin
+            else
+              echo "[stage-msdf] WARN: extract layout unexpected — building WITHOUT bundled msdf-atlas-gen"
+            fi
+          else
+            echo "[stage-msdf] WARN: msdf download/verify failed — building WITHOUT bundled msdf-atlas-gen (font import degrades)"
+          fi
+
+      # build:editor (cross-env MODOKI_EDITOR=true vite build) + electron:build
+      # (esbuild main.cjs) + electron-builder --win. cross-env (a devDep) makes the
+      # env-prefixed build:editor script run under the Windows shell.
+      - name: Build Windows installer (nsis, unsigned)
+        run: npm run dist:win
+
+      # Sanity-check the installer + its unpacked app were actually produced (a
+      # silent electron-builder no-op would otherwise upload nothing).
+      - name: Verify installer produced
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la release || true
+          EXE="$(find release -maxdepth 1 -name '*.exe' | head -1)"
+          echo "Installer: $EXE"
+          test -n "$EXE"
+
+      # HARD GUARD — the Stage steps above degrade SILENTLY (a broken upstream URL or a
+      # shifted sha logs a WARN and continues), so without this a green run could ship an
+      # installer WITHOUT its bundled tools and nobody would notice until a user's KTX2
+      # texture or MTSDF font import fails. Assert every expected tool actually landed in the
+      # packaged resources/bin (electron-builder unpacks the app to release/win-unpacked);
+      # fail the build loudly if any is missing. Keep this list in sync with the Stage steps.
+      - name: Verify bundled tools present in the packaged app
+        shell: bash
+        run: |
+          set -uo pipefail
+          BIN="release/win-unpacked/resources/bin"
+          missing=0
+          for f in toktx.exe ktx.dll msdf-atlas-gen.exe; do
+            if [ -f "$BIN/$f" ]; then
+              echo "[verify-tools] OK: $f ($(wc -c < "$BIN/$f") bytes)"
+            else
+              echo "[verify-tools] MISSING: $BIN/$f"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Bundled tool(s) missing from resources/bin — a Stage step likely failed its download/sha check (see the 'Stage toktx' / 'Stage msdf-atlas-gen' logs above). Refusing to ship a toolless installer."
+            exit 1
+          fi
+          echo "[verify-tools] all bundled tools present in resources/bin."
+
+      # Run-scoped artifact — the simplest download when Actions artifact storage has
+      # room. continue-on-error: the account's artifact-storage quota is currently
+      # exhausted, and a quota failure here must NOT fail the run or block the
+      # prerelease publish below (which uses a SEPARATE storage quota). Once storage is
+      # freed, this uploads normally and the artifact is downloadable from the run.
+      - name: Upload installer artifact
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: modoki-editor-windows
+          path: |
+            release/*.exe
+            release/*.blockmap
+            release/latest.yml
+          if-no-files-found: error
+
+      # ── Auto-update feed = GitHub Releases (github provider) ───────────────────
+      # GCS retired for the OSS repo (electron-builder.yml uses the `github` provider).
+      # electron-updater reads latest.yml + the .exe from THIS repo's Release assets,
+      # attached by the steps below.
+
+      # Rolling prerelease for non-tag builds (workflow_dispatch / editor-shipping).
+      # Release-ASSET storage is a separate quota from Actions artifacts, so this
+      # sidesteps the artifact-storage limit and gives a stable download URL. The
+      # `win-nightly` tag doesn't match either workflow's `v*` trigger, so publishing
+      # it can't loop. Unsigned test build — SmartScreen will warn.
+      - name: Publish installer to rolling prerelease (non-tag builds)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: win-nightly
+          name: Modoki Editor — Windows (nightly, unsigned)
+          prerelease: true
+          body: |
+            Unsigned Windows x64 installer built from `${{ github.sha }}` (branch `${{ github.ref_name }}`).
+            SmartScreen will warn on first run (no code signing yet). For testing/internal use.
+          files: |
+            release/*.exe
+            release/*.blockmap
+            release/latest.yml
+
+      - name: Attach to GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.exe
+            release/*.blockmap
