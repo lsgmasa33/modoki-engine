@@ -221,7 +221,7 @@ jobs:
         run: rm -f "$RUNNER_TEMP/AuthKey.p8"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: modoki-editor-macos
           path: |

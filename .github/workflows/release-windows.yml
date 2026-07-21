@@ -186,7 +186,7 @@ jobs:
       # freed, this uploads normally and the artifact is downloadable from the run.
       - name: Upload installer artifact
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: modoki-editor-windows
           path: |
