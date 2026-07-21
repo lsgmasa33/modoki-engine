@@ -23,15 +23,15 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@mediapipe/tasks-genai": "^0.10.0"
+    "@mediapipe/tasks-genai": "^0.10.29"
   },
   "devDependencies": {
     "@capacitor/core": "^8.0.0",
     "@types/google-protobuf": "^3.15.12",
     "google-protobuf": "^4.0.2",
     "rimraf": "^6.1.0",
-    "rollup": "^4.53.2",
-    "typescript": "^5.9.3"
+    "rollup": "^4.62.2",
+    "typescript": "^7.0.2"
   },
   "peerDependencies": {
     "@capacitor/core": ">=8.0.0"
