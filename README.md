@@ -1,6 +1,11 @@
 # Modoki Engine
 
+[![Website](https://img.shields.io/badge/website-modoki--engine.com-2b6cb0.svg)](https://modoki-engine.com)
+[![CI](https://github.com/lsgmasa33/modoki-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/lsgmasa33/modoki-engine/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/lsgmasa33/modoki-engine?sort=semver)](https://github.com/lsgmasa33/modoki-engine/releases/latest)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
+
+**[modoki-engine.com](https://modoki-engine.com)** · [Documentation](https://modoki-engine.com/docs)
 
 **Modoki** is a Claude-friendly ECS game engine and visual editor. You author games —
 scene data, gameplay logic (TypeScript), and asset wiring — with an AI collaborator, while

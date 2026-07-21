@@ -1,7 +1,7 @@
 {
   "name": "modoki-engine",
   "private": true,
-  "version": "0.2.23",
+  "version": "0.2.24",
   "type": "module",
   "description": "Modoki — a Claude-friendly game engine + visual editor",
   "author": "Modoki",

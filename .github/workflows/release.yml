@@ -193,17 +193,14 @@ jobs:
       # "blank editor window" packaging bugs (e.g. the @zappar/msdf-generator
       # out-of-tree dep-cache resolution failure) that build+sign+notarize all pass.
       # No games/ in the public repo — scaffold a throwaway starter project for the smoke
-      # to open (scaffold-project.mjs accepts any target dir).
-      # continue-on-error UNTIL this curation is validated on a real run, so a smoke bug
-      # can't block the signed DMG + GitHub Release. Make these fatal once green.
+      # to open (scaffold-project.mjs accepts any target dir). Validated on the v0.2.23
+      # release run (all three smoke steps passed), so these are now FATAL gates.
       - name: Scaffold a smoke project (starter)
-        continue-on-error: true
         run: |
           set -euo pipefail
           node engine/scripts/scaffold-project.mjs "$RUNNER_TEMP/smoke" "Smoke"
           npm --prefix "$RUNNER_TEMP/smoke" install
       - name: Smoke — packaged editor renders (no blank window)
-        continue-on-error: true
         run: |
           set -euo pipefail
           APP="$(find release -maxdepth 2 -name '*.app' -type d | head -1)"
@@ -214,7 +211,6 @@ jobs:
       # the editor, so the render gate above can't catch it. This is the layer that
       # would have caught DMG 0.2.0 (its binary predated the https: script-src fix).
       - name: Smoke — packaged editor CSP permits on-device-LLM CDN
-        continue-on-error: true
         run: |
           set -euo pipefail
           APP="$(find release -maxdepth 2 -name '*.app' -type d | head -1)"
