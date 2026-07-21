@@ -47,7 +47,7 @@ jobs:
         # also isn't possible right now — the repo's LFS bandwidth budget is exhausted
         # (a separate account/billing concern, not a build issue).
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
