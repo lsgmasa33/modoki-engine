@@ -38,7 +38,7 @@ jobs:
   build:
     runs-on: windows-latest   # native x64 → npm ci pulls the win32-x64 sharp/@img prebuilds
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         # Do NOT fetch LFS — matches the proven macOS release.yml (which also checks
         # out without LFS and produces a working, validated build). The LFS-tracked
         # engine assets (fonts/favicon/cursor PNGs) bundle as pointer files and the
