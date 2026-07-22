@@ -11,6 +11,8 @@ import { instantiatePrefabAsync, setPrefabSource, detachPrefabInstance, reattach
 import { focusEntityInSceneView } from '../scene/sceneViewBus';
 import { getCurrentScenePath } from '../scene/serialize';
 import { useEditorStore } from '../store/editorStore';
+import { register } from '../input/keymap';
+import { useHmrEpoch } from '../input/hmrEpoch';
 import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
 import { makeReorderSiblingsAction, diffSiblingSorts } from '../undo/reorderSiblingsUndo';
@@ -113,6 +115,9 @@ function HierarchyFolderRow({ node, depth, open, count, selected, renaming, onTo
       onClick={(e) => { if (!renaming) { onSelect(); onToggle(e.altKey); } }}
       title="Click to expand/collapse · Alt-click for the whole folder subtree"
       onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onContextMenu(e); }}
+      // Addressable by Enact (`modoki_tap {selector}`) like the rest of the editor chrome —
+      // folder rows are pure canvas-less DOM with no stable text handle otherwise.
+      data-ui-id={`hierarchy.folder.${node.path}`} data-ui-kind="row" data-ui-label={`folder ${node.name}`}
       draggable={!renaming}
       onDragStart={(e) => {
         e.stopPropagation();
@@ -376,8 +381,20 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
 }, (prev, next) => {
   if (prev.entity.id !== next.entity.id) return false;
   if (prev.entity.name !== next.entity.name) return false;
-  // Re-render when THIS node enters/leaves rename mode.
-  if ((prev.renamingId === prev.entity.id) !== (next.renamingId === next.entity.id)) return false;
+  // Re-render on ANY renamingId change, not just when THIS node is the one renaming.
+  //
+  // The narrower `(prev.renamingId === prev.entity.id) !== (next.renamingId === next.entity.id)`
+  // looked right and broke every NESTED row: children receive `renamingId` as a prop from their
+  // parent, so if an ancestor compares equal — which it does, since the ancestor is not the node
+  // being renamed — the ancestor never re-renders and the new `renamingId` never reaches the row.
+  // F2 therefore did nothing on any entity below the root (all prefab-instance children, among
+  // others), and the box appeared only later, when some UNRELATED prop change (a selection
+  // change, e.g. clicking away) finally forced the ancestors to re-render.
+  //
+  // Cost of the wider check: one extra pass over visible rows when a rename starts or ends. That
+  // is a rare, user-initiated action, not a hot path — and it fixes rename EXIT for nested rows
+  // too, which had the same hole.
+  if (prev.renamingId !== next.renamingId) return false;
   if (prev.entity.traits.length !== next.entity.traits.length) return false;
   if (prev.entity.children?.length !== next.entity.children?.length) return false;
   if (prev.depth !== next.depth) return false;
@@ -401,6 +418,7 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
 });
 
 export default function Hierarchy() {
+  const hmrEpoch = useHmrEpoch();
   const selectedId = useEditorStore((s) => s.selectedEntityId);
   const selectedEntityIds = useEditorStore((s) => s.selectedEntityIds);
   const selectEntity = useEditorStore((s) => s.selectEntity);
@@ -844,172 +862,200 @@ export default function Hierarchy() {
     entityClipboard, handlePaste, handleCopy, handleCut,
   };
 
+  // ── Shortcuts, scoped to `hierarchy` (focus-scope refactor P6) ──
+  //
+  // Was a DOCUMENT keydown that yielded by reading `data-editor-panel` off
+  // document.activeElement — a mechanism stamped on only two panels, so focus inside
+  // SceneView/Animation/Timeline read as "nothing focused" and these fired anyway.
+  // Scope resolution replaces it, and it fixes the case that attribute could never
+  // handle: clicking a Hierarchy ROW leaves DOM focus on <body>, so activeElement never
+  // named this panel either.
+  //
+  // Registered ONCE with [] deps, still reading live state through `kbdRef` — dropping
+  // that indirection would reintroduce the teardown/re-add churn it was written to fix
+  // (editor-panels F12).
   useEffect(() => {
-    const isMac = navigator.platform.includes('Mac');
-    const onKey = (e: KeyboardEvent) => {
-      const {
-        selectedId, selectedEntityIds, setSelectionRaw, selectEntity,
-        entityClipboard, handlePaste, handleCopy, handleCut,
-      } = kbdRef.current;
-      // Don't intercept when typing in an input field
-      if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).tagName === 'TEXTAREA') return;
-      // This is a document-level listener, so it would otherwise fire while the
-      // user is working in another panel (e.g. Cmd+C in Assets would also copy
-      // the selected entity). Yield when focus sits inside a DIFFERENT editor
-      // panel. Focus on <body> (nothing focused) still runs these shortcuts.
-      const focusedPanel = (document.activeElement as HTMLElement | null)?.closest('[data-editor-panel]')?.getAttribute('data-editor-panel');
-      if (focusedPanel && focusedPanel !== 'hierarchy') return;
-      const mod = isMac ? e.metaKey : e.ctrlKey;
-      // Cmd/Ctrl+V → paste entity clipboard under the selected entity (or root).
-      // Skip when text is highlighted so we don't hijack a real paste.
-      if (mod && (e.key === 'v' || e.key === 'V') && entityClipboard) {
-        if (window.getSelection()?.toString()) return;
-        e.preventDefault();
-        handlePaste(selectedId ?? 0);
-        return;
-      }
-      // Cmd/Ctrl+C / Cmd/Ctrl+X → copy / cut the selected entity.
-      if (mod && (e.key === 'c' || e.key === 'C' || e.key === 'x' || e.key === 'X')) {
-        if (selectedId === null || window.getSelection()?.toString()) return;
-        const entity = getAllEntities().find(en => en.id === selectedId);
-        if (!entity || entity.id === 0 || entity.isResource) return;
-        e.preventDefault();
-        if (e.key === 'x' || e.key === 'X') handleCut(entity); else handleCopy(entity);
-        return;
-      }
-      if (selectedId === null) return;
-      // F2 → rename selected entity inline
-      if (e.key === 'F2') {
-        e.preventDefault();
-        const entity = getAllEntities().find(e => e.id === selectedId);
-        if (entity && entity.id !== 0 && !entity.isResource) setRenamingId(selectedId);
-        return;
-      }
-      // Cmd/Ctrl+D → duplicate selected entity (and its children)
-      const isDuplicateKey = (isMac ? e.metaKey : e.ctrlKey) && (e.key === 'd' || e.key === 'D');
-      if (isDuplicateKey) {
-        e.preventDefault();
-        const entity = getAllEntities().find(e => e.id === selectedId);
-        if (entity && entity.id !== 0 && !entity.isResource) {
-          duplicateEntity(entity.id, selectEntity);
-        }
-        return;
-      }
-      const isDeleteKey = isMac ? (e.key === 'Backspace' && e.metaKey) : e.key === 'Delete';
-      if (!isDeleteKey) return;
-      e.preventDefault();
-      const flat = getAllEntities();
-      const resourceIds = new Set(flat.filter(en => en.isResource).map(en => en.id));
-      // Delete the whole multi-selection (falling back to the primary), minus
-      // root/resource ids — one coalesced undo entry.
-      const ids = (selectedEntityIds.length > 0 ? selectedEntityIds : (selectedId != null ? [selectedId] : []))
-        .filter(id => id !== 0 && !resourceIds.has(id));
-      if (ids.length > 0) deleteEntitiesWithUndo(ids, setSelectionRaw);
+    /** The selected entity, if it is a real, deletable/duplicable one. */
+    const liveEntity = () => {
+      const { selectedId } = kbdRef.current;
+      if (selectedId === null) return null;
+      const entity = getAllEntities().find((en) => en.id === selectedId);
+      return entity && entity.id !== 0 && !entity.isResource ? entity : null;
     };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, []);
+    // Never hijack a REAL text copy — if the user has a text selection, Cmd+C/X belongs
+    // to the document, not to the entity clipboard. Yielding (rather than claiming and
+    // doing nothing) is what lets the native role handle it.
+    const noTextSelection = () => !window.getSelection()?.toString();
 
-  /** Thin binding wrapper over the extracted createEntityWithUndo action. */
+    // SELECTION commands, not Hierarchy commands. They act on the editor SELECTION, which
+    // is global — so they belong to every panel that DISPLAYS that selection, i.e. the
+    // Hierarchy and the SceneView. Unity behaves the same: Cmd+D duplicates the selected
+    // object whether you are in the Hierarchy or the Scene view.
+    //
+    // REGRESSION THIS FIXES (P6): scoping them to 'hierarchy' alone silently removed
+    // copy/paste/duplicate/rename/delete from the SceneView. They used to work there
+    // because the old document listener only yielded when activeElement sat inside a panel
+    // carrying `data-editor-panel`, and SceneView never set that attribute — so the loose
+    // boundary was load-bearing behaviour, not an accident to tighten up.
+    const SCOPES = ['hierarchy', 'scene'] as const;
+    /** Register one selection command in every panel that shows the selection. */
+    const each = (id: string, keys: string, when: () => boolean, run: () => void) =>
+      SCOPES.map((scope) => register({ id: `${scope}.${id}`, keys, scope, when, run }));
+    const offs = [
+      ...each('paste', 'mod+v',
+        () => !!kbdRef.current.entityClipboard && noTextSelection(),
+        () => kbdRef.current.handlePaste(kbdRef.current.selectedId ?? 0)),
+      ...each('copy', 'mod+c',
+        () => !!liveEntity() && noTextSelection(),
+        () => { const en = liveEntity(); if (en) kbdRef.current.handleCopy(en); }),
+      ...each('cut', 'mod+x',
+        () => !!liveEntity() && noTextSelection(),
+        () => { const en = liveEntity(); if (en) kbdRef.current.handleCut(en); }),
+      // Rename is Hierarchy-only: the inline edit box lives on a Hierarchy ROW, so there is
+      // nothing to show in the SceneView.
+      register({
+        id: 'hierarchy.rename', keys: 'F2', scope: 'hierarchy',
+        when: () => !!liveEntity(),
+        run: () => { const en = liveEntity(); if (en) setRenamingId(en.id); },
+      }),
+      ...each('duplicate', 'mod+d',
+        () => !!liveEntity(),
+        () => { const en = liveEntity(); if (en) duplicateEntity(en.id, kbdRef.current.selectEntity); }),
+      // Delete the whole multi-selection (falling back to the primary), minus
+      // root/resource ids — one coalesced undo entry. Mac uses Cmd+Backspace, other
+      // platforms use Delete; both are declared so neither platform's chord leaks.
+      ...(['mod+Backspace', 'Delete'] as const).flatMap((keys, i) => each(
+        `delete${i}`, keys,
+        () => deletableIds().length > 0,
+        () => {
+          const ids = deletableIds();
+          if (ids.length > 0) deleteEntitiesWithUndo(ids, kbdRef.current.setSelectionRaw);
+        })),
+    ];
+    function deletableIds(): number[] {
+      const { selectedId, selectedEntityIds } = kbdRef.current;
+      const resourceIds = new Set(getAllEntities().filter((en) => en.isResource).map((en) => en.id));
+      return (selectedEntityIds.length > 0 ? selectedEntityIds : (selectedId != null ? [selectedId] : []))
+        .filter((id) => id !== 0 && !resourceIds.has(id));
+    }
+    return () => { for (const off of offs) off(); };
+    // `hmrEpoch` (0 in production) re-runs this on a hot update — Fast Refresh re-renders
+    // the panel but never re-runs a []-deps effect, so without it an edited/added binding
+    // silently never reaches the registry. See input/hmrEpoch.ts.
+  }, [hmrEpoch]);
+
+  /** Thin binding wrapper over the extracted createEntityWithUndo action.
+   *  `folder` (optional) tags the new entity's EntityAttributes.editorFolder so it is
+   *  born INSIDE that folder — injected into the spec rather than written afterwards, so
+   *  create-in-folder stays ONE undo entry. Folders are a ROOT-entity concept (see
+   *  hierarchyFolders.ts), so this is only meaningful when parentId === 0; a parented
+   *  entity shows under its parent and ignores the tag. */
   const createEntityWithUndo = useCallback(
-    (label: string, parentId: number, traitSpecs: { name: string; data?: Record<string, any> }[]) =>
-      createEntityAction(label, parentId, traitSpecs, selectEntity),
+    (label: string, parentId: number, traitSpecs: { name: string; data?: Record<string, any> }[], folder?: string) =>
+      createEntityAction(
+        label,
+        parentId,
+        folder
+          ? traitSpecs.map(s => (s.name === 'EntityAttributes' ? { ...s, data: { ...(s.data ?? {}), editorFolder: folder } } : s))
+          : traitSpecs,
+        selectEntity,
+      ),
     [selectEntity],
   );
 
   // The "Create …" trait specs live in entityCreateSpecs.ts so the menus here and
   // the agent `create-entity` op build identical entities. Each handler just maps
   // a builder's { name, specs } onto createEntityWithUndo.
-  const handleCreateChild = useCallback((parentId: number) => {
+  const handleCreateChild = useCallback((parentId: number, folder?: string) => {
     const { specs } = emptySpecs(parentId);
-    createEntityWithUndo('Create Entity', parentId, specs);
+    createEntityWithUndo('Create Entity', parentId, specs, folder);
   }, [createEntityWithUndo]);
 
-  const handleCreatePrimitive = useCallback((meshName: string, parentId: number) => {
+  const handleCreatePrimitive = useCallback((meshName: string, parentId: number, folder?: string) => {
     const { name, specs } = primitiveSpecs(meshName, parentId);
-    createEntityWithUndo(`Create ${name}`, parentId, specs);
+    createEntityWithUndo(`Create ${name}`, parentId, specs, folder);
   }, [createEntityWithUndo]);
 
-  const handleCreate2D = useCallback((shape: string, parentId: number) => {
+  const handleCreate2D = useCallback((shape: string, parentId: number, folder?: string) => {
     const { name, specs } = shape2DSpecs(shape, parentId);
-    createEntityWithUndo(`Create ${name}`, parentId, specs);
+    createEntityWithUndo(`Create ${name}`, parentId, specs, folder);
   }, [createEntityWithUndo]);
 
-  const handleCreateCanvas2D = useCallback((parentId: number) => {
+  const handleCreateCanvas2D = useCallback((parentId: number, folder?: string) => {
     const { name, specs } = canvas2DSpecs(parentId);
-    createEntityWithUndo(`Create ${name}`, parentId, specs);
+    createEntityWithUndo(`Create ${name}`, parentId, specs, folder);
   }, [createEntityWithUndo]);
 
-  const handleCreateUI = useCallback((preset: UiPreset, parentId: number) => {
+  const handleCreateUI = useCallback((preset: UiPreset, parentId: number, folder?: string) => {
     // Anchor-first authoring: every new UI element ships with a centered UIAnchor
     // (Unity-style placement) plus its preset defaults. See uiAuthoring.ts.
     const { name, specs } = uiSpecs(preset, parentId);
-    createEntityWithUndo(`Create ${name}`, parentId, specs);
+    createEntityWithUndo(`Create ${name}`, parentId, specs, folder);
   }, [createEntityWithUndo]);
 
-  const handleCreateCamera = useCallback((parentId: number) => {
+  const handleCreateCamera = useCallback((parentId: number, folder?: string) => {
     const { specs } = cameraSpecs(parentId);
-    createEntityWithUndo('Create Camera', parentId, specs);
+    createEntityWithUndo('Create Camera', parentId, specs, folder);
   }, [createEntityWithUndo]);
 
-  const handleCreateLight = useCallback((kind: LightKind, parentId: number) => {
+  const handleCreateLight = useCallback((kind: LightKind, parentId: number, folder?: string) => {
     const { name, specs } = lightSpecs(kind, parentId);
-    createEntityWithUndo(`Create ${name}`, parentId, specs);
+    createEntityWithUndo(`Create ${name}`, parentId, specs, folder);
   }, [createEntityWithUndo]);
 
-  const handleCreateParticle = useCallback((parentId: number) => {
+  const handleCreateParticle = useCallback((parentId: number, folder?: string) => {
     const { specs } = particleSpecs(parentId);
-    createEntityWithUndo('Create Particle', parentId, specs);
+    createEntityWithUndo('Create Particle', parentId, specs, folder);
   }, [createEntityWithUndo]);
 
-  const handleCreateEnvironment = useCallback((parentId: number) => {
+  const handleCreateEnvironment = useCallback((parentId: number, folder?: string) => {
     const { specs } = environmentSpecs(parentId);
-    createEntityWithUndo('Create HDR Environment', parentId, specs);
+    createEntityWithUndo('Create HDR Environment', parentId, specs, folder);
   }, [createEntityWithUndo]);
 
   // The "Create …" group, reused at the root menu (top-level) and nested under
   // a single "Create ▸" submenu when right-clicking an existing entity.
-  const createItems = useCallback((parentId: number): ContextMenuItem[] => [
-    { label: 'Empty', onClick: () => handleCreateChild(parentId) },
+  const createItems = useCallback((parentId: number, folder?: string): ContextMenuItem[] => [
+    { label: 'Empty', onClick: () => handleCreateChild(parentId, folder) },
     {
       label: 'Primitive',
       children: PRIMITIVE_NAMES.filter(n => n !== 'box').map(n => ({
         label: n.charAt(0).toUpperCase() + n.slice(1),
-        onClick: () => handleCreatePrimitive(n, parentId),
+        onClick: () => handleCreatePrimitive(n, parentId, folder),
       })),
     },
     {
       label: '2D',
       children: [
-        { label: 'Canvas', onClick: () => handleCreateCanvas2D(parentId) },
-        { label: 'Square', onClick: () => handleCreate2D('square', parentId) },
-        { label: 'Circle', onClick: () => handleCreate2D('circle', parentId) },
-        { label: 'Triangle', onClick: () => handleCreate2D('triangle', parentId) },
+        { label: 'Canvas', onClick: () => handleCreateCanvas2D(parentId, folder) },
+        { label: 'Square', onClick: () => handleCreate2D('square', parentId, folder) },
+        { label: 'Circle', onClick: () => handleCreate2D('circle', parentId, folder) },
+        { label: 'Triangle', onClick: () => handleCreate2D('triangle', parentId, folder) },
       ],
     },
     {
       label: 'UI',
       children: [
-        { label: 'View', onClick: () => handleCreateUI('view', parentId) },
-        { label: 'Text', onClick: () => handleCreateUI('text', parentId) },
-        { label: 'Image', onClick: () => handleCreateUI('image', parentId) },
-        { label: 'Button', onClick: () => handleCreateUI('button', parentId) },
-        { label: 'Input', onClick: () => handleCreateUI('input', parentId) },
-        { label: 'Slider', onClick: () => handleCreateUI('slider', parentId) },
+        { label: 'View', onClick: () => handleCreateUI('view', parentId, folder) },
+        { label: 'Text', onClick: () => handleCreateUI('text', parentId, folder) },
+        { label: 'Image', onClick: () => handleCreateUI('image', parentId, folder) },
+        { label: 'Button', onClick: () => handleCreateUI('button', parentId, folder) },
+        { label: 'Input', onClick: () => handleCreateUI('input', parentId, folder) },
+        { label: 'Slider', onClick: () => handleCreateUI('slider', parentId, folder) },
       ],
     },
     {
       label: 'Light',
       children: [
-        { label: 'Ambient', onClick: () => handleCreateLight('ambient', parentId) },
-        { label: 'Directional', onClick: () => handleCreateLight('directional', parentId) },
-        { label: 'Point', onClick: () => handleCreateLight('point', parentId) },
-        { label: 'Spot', onClick: () => handleCreateLight('spot', parentId) },
+        { label: 'Ambient', onClick: () => handleCreateLight('ambient', parentId, folder) },
+        { label: 'Directional', onClick: () => handleCreateLight('directional', parentId, folder) },
+        { label: 'Point', onClick: () => handleCreateLight('point', parentId, folder) },
+        { label: 'Spot', onClick: () => handleCreateLight('spot', parentId, folder) },
       ],
     },
-    { label: 'Camera', onClick: () => handleCreateCamera(parentId) },
-    { label: 'Particle', onClick: () => handleCreateParticle(parentId) },
-    { label: 'HDR Environment', onClick: () => handleCreateEnvironment(parentId) },
+    { label: 'Camera', onClick: () => handleCreateCamera(parentId, folder) },
+    { label: 'Particle', onClick: () => handleCreateParticle(parentId, folder) },
+    { label: 'HDR Environment', onClick: () => handleCreateEnvironment(parentId, folder) },
   ], [handleCreateChild, handleCreatePrimitive, handleCreate2D, handleCreateCanvas2D, handleCreateUI, handleCreateLight, handleCreateCamera, handleCreateParticle, handleCreateEnvironment]);
 
   // ── Folder operations (all write EntityAttributes.editorFolder on ROOTS) ──
@@ -1225,7 +1271,9 @@ export default function Hierarchy() {
     }
   }, [selectEntity]);
 
-  const handleCreate = () => handleCreateChild(0);
+  // Toolbar '+' — creates into the SELECTED folder when one is highlighted, matching
+  // the sibling 'New Folder' button (which already respects selectedFolderPath).
+  const handleCreate = () => handleCreateChild(0, selectedFolderPath ?? undefined);
 
   // Render a run of root entities (top level or under a folder) at `depth`.
   const renderEntityRows = (rootsArr: EntityInfo[], depth: number) => rootsArr.map((entity, i) => (
@@ -1377,6 +1425,12 @@ export default function Hierarchy() {
       {folderCtx && (
         <ContextMenu
           items={[
+            // Create INTO the folder. Folders group ROOT entities (hierarchyFolders.ts),
+            // so these spawn at parentId 0 and carry the folder tag — without this a
+            // right-clicked folder offered no way to make an entity in it, and an EMPTY
+            // folder (no rows to right-click) was a dead end entirely.
+            { label: 'Create', children: createItems(0, folderCtx.path) },
+            { label: '', separator: true },
             { label: 'New Subfolder', onClick: () => createFolder(folderCtx.path) },
             { label: '', separator: true },
             { label: 'Rename Folder', onClick: () => setRenamingFolderPath(folderCtx.path) },

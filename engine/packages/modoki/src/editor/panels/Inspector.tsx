@@ -1114,28 +1114,32 @@ function CopyEditorCameraButton({ entityId }: { entityId: number }) {
 }
 
 /** Collider3D "fit to mesh bounds" — one-click size a primitive collider (box or sphere) to the
- *  bounding box / sphere of this entity's Renderable3D mesh, times its Transform.scale. Uses the
- *  same geometry the runtime mesh cache holds; writes shape + dims through the normal
- *  undo-tracked field writer. (Off-center meshes size correctly but stay origin-centered —
- *  Collider3D has no local offset yet, a later add.) */
+ *  bounding box / sphere of this entity's Renderable3D mesh. Uses the same geometry the runtime
+ *  mesh cache holds; writes shape + dims through the normal undo-tracked field writer.
+ *  (Off-center meshes size correctly but stay origin-centered — Collider3D has no local offset
+ *  yet, a later add.)
+ *
+ *  Collider extents are ENTITY-LOCAL and the runtime multiplies them by the entity's WORLD scale
+ *  (`makeColliderDesc` in physics3DSystem.ts — same convention as Unity's BoxCollider.size vs
+ *  lossyScale). So this must fit the RAW geometry bounds and must NOT pre-apply Transform.scale:
+ *  doing so double-scaled the collider (a 7x-scaled ramp got a 49-wide collider) and silently
+ *  produced physics that did not match the mesh. */
 function ColliderFitToBoundsButtons({ entityId, write }: { entityId: number; write: (field: string, value: unknown) => void }) {
   const ent = findEntity(entityId);
   const r3dMeta = getTraitByName('Renderable3D');
-  const tfMeta = getTraitByName('Transform');
   const meshGuid = ent && r3dMeta && ent.has(r3dMeta.trait) ? ((ent.get(r3dMeta.trait) as { mesh?: string }).mesh ?? '') : '';
   const geometry = meshGuid ? resolveMeshTemplate(meshGuid)?.geometry : undefined;
 
   const fit = useCallback((mode: 'box' | 'sphere') => {
     if (!ent || !geometry) return;
-    let sx = 1, sy = 1, sz = 1;
-    if (tfMeta && ent.has(tfMeta.trait)) { const t = ent.get(tfMeta.trait) as { sx: number; sy: number; sz: number }; sx = t.sx; sy = t.sy; sz = t.sz; }
+    // No scale argument on purpose — see the note above: the runtime applies world scale.
     if (mode === 'box') {
-      const he = geometryBoxHalfExtents(geometry, sx, sy, sz);
+      const he = geometryBoxHalfExtents(geometry);
       write('shape', 'box'); write('halfW', +he.x.toFixed(4)); write('halfH', +he.y.toFixed(4)); write('halfD', +he.z.toFixed(4));
     } else {
-      write('shape', 'sphere'); write('radius', +geometryBoundingRadius(geometry, sx, sy, sz).toFixed(4));
+      write('shape', 'sphere'); write('radius', +geometryBoundingRadius(geometry).toFixed(4));
     }
-  }, [ent, geometry, tfMeta, write]);
+  }, [ent, geometry, write]);
 
   if (!geometry) {
     return <div style={{ marginTop: 6, fontSize: '10px', color: '#666' }}>Add a Renderable3D mesh (and let it load) to fit the collider to its bounds.</div>;

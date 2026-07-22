@@ -116,6 +116,49 @@ describe('loadFirstScene (boot loop: canonicalize → load, raw fallback)', () =
     expect(load).toHaveBeenNthCalledWith(2, BUNDLE);
   });
 
+  /** Regression: a THROWING candidate used to abort the whole fallback chain.
+   *  loadScene rejects (rather than returning false) when the host serves the dev
+   *  server's SPA index.html instead of the scene JSON — `JSON.parse` throws
+   *  `Unexpected token '<'`. That escaped the loop, so the next candidate was never
+   *  tried and editor boot died. Real case: a stale `/@fs/<abs>` last-scene for a
+   *  project on a different Windows drive (vitejs/vite#12816). */
+  const HTML_ERR = new SyntaxError(`Unexpected token '<', "<!doctype "... is not valid JSON`);
+
+  it('advances to the next candidate when a candidate THROWS (SPA html fallback)', async () => {
+    const STALE = '/@fs/C:/Users/x/Desktop/test/runtime/assets/scenes/main.json';
+    const canonicalize = vi.fn(async (p: string) => p);
+    const load = vi.fn(async (p: string) => {
+      if (p === STALE) throw HTML_ERR; // dev server served index.html
+      return true;
+    });
+    expect(await loadFirstScene([STALE, CANON], { canonicalize, load })).toBe(CANON);
+    expect(load).toHaveBeenNthCalledWith(1, STALE);
+    expect(load).toHaveBeenNthCalledWith(2, CANON);
+  });
+
+  it('returns null (does not reject) when EVERY candidate throws', async () => {
+    const canonicalize = vi.fn(async (p: string) => p);
+    const load = vi.fn(async () => { throw HTML_ERR; });
+    await expect(loadFirstScene([BUNDLE, CANON], { canonicalize, load })).resolves.toBeNull();
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  it('falls back to the RAW candidate when the CANONICAL one throws', async () => {
+    const canonicalize = vi.fn(async () => CANON);
+    const load = vi.fn(async (p: string) => {
+      if (p === CANON) throw HTML_ERR;
+      return true;
+    });
+    expect(await loadFirstScene([BUNDLE], { canonicalize, load })).toBe(BUNDLE);
+  });
+
+  it('survives a THROWING canonicalize by using the raw candidate', async () => {
+    const canonicalize = vi.fn(async () => { throw new Error('network down'); });
+    const load = vi.fn(async () => true);
+    expect(await loadFirstScene([BUNDLE], { canonicalize, load })).toBe(BUNDLE);
+    expect(load).toHaveBeenCalledWith(BUNDLE);
+  });
+
   it('does NOT double-load when the candidate is already canonical', async () => {
     const canonicalize = vi.fn(async (p: string) => p); // already canonical
     const load = vi.fn(async () => false);

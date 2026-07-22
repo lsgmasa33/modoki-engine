@@ -31,9 +31,9 @@ import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { discoverProjects } from './projectRoots.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const gamesDir = path.join(repoRoot, 'games');
 
 // On Windows npm is `npm.cmd`, which execFile can't resolve (ENOENT) — and naming
 // `npm.cmd` explicitly now throws EINVAL under Node's CVE-2024-27980 hardening
@@ -44,17 +44,16 @@ const isWindows = process.platform === 'win32';
 const npmRun = (args, cwd) =>
   execFileSync('npm', args, { cwd, stdio: 'inherit', shell: isWindows });
 
-if (!existsSync(gamesDir)) {
-  // Not all checkouts ship the games/ folder (e.g. a packaged/external project).
-  process.exit(0);
-}
-
-const entries = readdirSync(gamesDir, { withFileTypes: true }).filter((d) => d.isDirectory());
+// Projects live under games/ AND demos/ (see engine/scripts/projectRoots.mjs).
+// Not all checkouts ship either folder (e.g. a packaged/external project, or the
+// public OSS repo) — discoverProjects returns [] rather than throwing.
+const projects = discoverProjects(repoRoot);
 let installed = 0;
 let built = 0;
 
-for (const dir of entries) {
-  const gameDir = path.join(gamesDir, dir.name);
+for (const proj of projects) {
+  const gameDir = proj.dir;
+  const label = `${proj.root}/${proj.name}`;
   const pkgPath = path.join(gameDir, 'package.json');
   if (!existsSync(pkgPath)) continue; // game has no game-owned packages
 
@@ -62,33 +61,33 @@ for (const dir of entries) {
   try {
     pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
   } catch (e) {
-    console.warn(`[bootstrap-game-deps] skip ${dir.name}: unreadable package.json (${e.message})`);
+    console.warn(`[bootstrap-game-deps] skip ${label}: unreadable package.json (${e.message})`);
     continue;
   }
   if (!pkg.workspaces) continue; // not a workspace root → nothing to link
 
-  console.log(`[bootstrap-game-deps] installing games/${dir.name} …`);
+  console.log(`[bootstrap-game-deps] installing ${label} …`);
   try {
     npmRun(['install'], gameDir);
     installed++;
   } catch (e) {
     console.warn(
-      `[bootstrap-game-deps] WARNING: npm install failed in games/${dir.name} — ` +
-        `that game won't load in the editor until its deps install. (${e.message})`
+      `[bootstrap-game-deps] WARNING: npm install failed in ${label} — ` +
+        `that project won't load in the editor until its deps install. (${e.message})`
     );
     continue; // no point building plugins if install failed
   }
 
   // Build the game's native-plugin dist/ (gitignored) when it has one.
   if (pkg.scripts?.['build:plugins']) {
-    console.log(`[bootstrap-game-deps] building plugins for games/${dir.name} …`);
+    console.log(`[bootstrap-game-deps] building plugins for ${label} …`);
     try {
       npmRun(['run', 'build:plugins'], gameDir);
       built++;
     } catch (e) {
       console.warn(
-        `[bootstrap-game-deps] WARNING: build:plugins failed in games/${dir.name} — ` +
-          `that game's native plugins won't resolve until built. (${e.message})`
+        `[bootstrap-game-deps] WARNING: build:plugins failed in ${label} — ` +
+          `that project's native plugins won't resolve until built. (${e.message})`
       );
     }
   }

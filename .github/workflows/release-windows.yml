@@ -38,7 +38,7 @@ jobs:
   build:
     runs-on: windows-latest   # native x64 → npm ci pulls the win32-x64 sharp/@img prebuilds
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         # Do NOT fetch LFS — matches the proven macOS release.yml (which also checks
         # out without LFS and produces a working, validated build). The LFS-tracked
         # engine assets (fonts/favicon/cursor PNGs) bundle as pointer files and the
@@ -47,7 +47,7 @@ jobs:
         # also isn't possible right now — the repo's LFS bandwidth budget is exhausted
         # (a separate account/billing concern, not a build issue).
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
@@ -186,7 +186,7 @@ jobs:
       # freed, this uploads normally and the artifact is downloadable from the run.
       - name: Upload installer artifact
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: modoki-editor-windows
           path: |
@@ -207,7 +207,7 @@ jobs:
       # it can't loop. Unsigned test build — SmartScreen will warn.
       - name: Publish installer to rolling prerelease (non-tag builds)
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: win-nightly
           name: Modoki Editor — Windows (nightly, unsigned)
@@ -222,7 +222,7 @@ jobs:
 
       - name: Attach to GitHub Release (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             release/*.exe

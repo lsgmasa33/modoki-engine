@@ -1478,4 +1478,7 @@ const EDITOR_ACTIONS = new Set<string>([
   // Enact Phase 1 (HTML5 drag-and-drop synthesis) — a renderer-DOM op (needs a live
   // DataTransfer), so it rides the browser relay and works in dev AND the DMG.
   'dom-dnd',
+  // Focus-scope refactor P7: set which panel owns the keyboard, so an agent can steer a
+  // panel-scoped chord instead of tapping-and-hoping.
+  'set-focus-scope',
 ]);

@@ -199,7 +199,7 @@ const KEYCODE_ALIAS: Record<string, string> = {
   ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right',
 };
 
-export async function pressKey(win: BrowserWindow, key: string, modifiers?: InputModifier[]): Promise<{ activeElement: string | null; editableFocused: boolean }> {
+export async function pressKey(win: BrowserWindow, key: string, modifiers?: InputModifier[]): Promise<{ activeElement: string | null; gameSwallows: boolean }> {
   const wc = win.webContents;
   const keyCode = KEYCODE_ALIAS[key] ?? key;
   // Keyboard sendInputEvent dispatches to the FOCUSED web contents — unlike mouse events,
@@ -217,7 +217,7 @@ export async function pressKey(win: BrowserWindow, key: string, modifiers?: Inpu
   await sleep(48); // ≈3 frames @60fps — spans a frame boundary so the per-frame sampler catches it
   wc.sendInputEvent({ type: 'keyUp', keyCode, modifiers } as Electron.KeyboardInputEvent);
   await sleep(8);
-  return { activeElement: active.descriptor, editableFocused: active.editable };
+  return { activeElement: active.descriptor, gameSwallows: active.gameSwallows };
 }
 
 /** Give the editor window/view keyboard focus (and optionally focus a specific element).
@@ -271,19 +271,40 @@ export async function focusElement(
  *  replaced rather than appended; `submitKey` presses a terminal key afterward —
  *  'Tab'/'Escape' BLUR the field (the key case for verifying commit-on-blur),
  *  'Enter' submits. */
-/** Read the DOM's currently-focused element and whether it can receive typed text.
- *  Mirrors the game's own `keyboardSource.editing()` predicate (INPUT/TEXTAREA/SELECT/
- *  contentEditable) so "editable" here means the same thing it does to the running game. */
-async function readActiveElement(wc: Electron.WebContents): Promise<{ editable: boolean; descriptor: string | null }> {
-  return wc.executeJavaScript(
-    `(() => {
-      const a = document.activeElement;
-      const editable = !!a && (/^(input|textarea|select)$/i.test(a.tagName) || a.isContentEditable === true);
-      const descriptor = a && a !== document.body ? (a.tagName ? a.tagName.toLowerCase() : String(a)) + (a.id ? '#' + a.id : '') : null;
-      return { editable, descriptor };
-    })()`,
-    true,
-  ).catch(() => ({ editable: false, descriptor: null }));
+/** TWO DIFFERENT QUESTIONS, deliberately not one predicate (measured 2026-07-22).
+ *
+ *  `typable`  — can this element actually RECEIVE typed characters? A readOnly or disabled
+ *               input, a checkbox, a <select> all hold focus and all reject text. Mirrors
+ *               the editor's `focusScope.isTextEditable()`, which is the authority: its
+ *               docblock requires these to stay in sync, and `predicateParity.test.ts`
+ *               enforces it.
+ *  `gameSwallows` — will the RUNNING GAME's sampler ignore keys right now? That is
+ *               `keyboardSource.editing()`, which is deliberately BLUNTER
+ *               (INPUT/TEXTAREA/SELECT/contentEditable, readOnly included) because it
+ *               ships in games and errs toward "the human is busy in a field".
+ *
+ *  Collapsing them produced two measured defects: `typeText` reported `{ok:true, typed:3}`
+ *  into a readOnly Inspector field that was provably unchanged, and `pressKey` warned that
+ *  a key "will be swallowed" on a press that demonstrably ran an editor shortcut (`f`
+ *  framed the selection, camera [12,15,20] → [-0.1,1.4,1.8]). */
+export const ACTIVE_ELEMENT_PROBE = `(() => {
+  const a = document.activeElement;
+  const tag = a ? a.tagName : '';
+  const TEXT_TYPES = ['text','search','url','tel','email','password','number','date','datetime-local','month','week','time'];
+  let typable = false;
+  if (a) {
+    if (a.isContentEditable === true) typable = true;
+    else if (tag === 'TEXTAREA') typable = !a.readOnly && !a.disabled;
+    else if (tag === 'INPUT') typable = !a.readOnly && !a.disabled && TEXT_TYPES.indexOf((a.type || 'text').toLowerCase()) !== -1;
+  }
+  const gameSwallows = !!a && (/^(input|textarea|select)$/i.test(tag) || a.isContentEditable === true);
+  const descriptor = a && a !== document.body ? (tag ? tag.toLowerCase() : String(a)) + (a.id ? '#' + a.id : '') : null;
+  return { typable, gameSwallows, descriptor };
+})()`;
+
+async function readActiveElement(wc: Electron.WebContents): Promise<{ typable: boolean; gameSwallows: boolean; descriptor: string | null }> {
+  return wc.executeJavaScript(ACTIVE_ELEMENT_PROBE, true)
+    .catch(() => ({ typable: false, gameSwallows: false, descriptor: null }));
 }
 
 export async function typeText(
@@ -297,7 +318,10 @@ export async function typeText(
   // fail — so the route used to report {ok:true, typed:N} typing into the void. Check first and
   // report where focus actually is, so a skipped/stolen focus step is a visible failure. (C7 re-audit.)
   const active = await readActiveElement(wc);
-  if (!active.editable) return { typed: 0, editable: false, activeElement: active.descriptor };
+  // `typable`, not `gameSwallows`: a readOnly/disabled input, a checkbox and a <select> all hold
+  // focus and all reject characters, so typing into them is a NO-OP that used to report
+  // {ok:true, typed:N}. Measured against the Inspector's readOnly name field.
+  if (!active.typable) return { typed: 0, editable: false, activeElement: active.descriptor };
   if (opts?.clearFirst) {
     // Cmd+A (macOS) / Ctrl+A elsewhere, then Backspace — empty the field first.
     const mod = process.platform === 'darwin' ? 'meta' : 'control';

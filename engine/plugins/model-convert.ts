@@ -31,7 +31,7 @@ import {
 import {
   loadGlbToThreeMeshes, applyChangesToDocument, writeDocument,
 } from './model-convert/threeAdapter';
-import { gltfTransformInvocation, gltfpackInvocation, needsWinShell } from '../toolchain';
+import { gltfTransformInvocation, gltfpackInvocation, spawnable } from '../toolchain';
 
 const GLTF_TRANSFORM_MISSING_MSG =
   '@gltf-transform/cli not found. Install it from the editor\'s Build Support dialog, or `npm i -D @gltf-transform/cli`.';
@@ -91,7 +91,8 @@ export function ensureGltfTransformCli(): void {
   }
   try {
     const inv = gltfTransformInvocation();
-    const out = execFileSync(inv.command, [...inv.prefixArgs, '--version'], { stdio: ['ignore', 'pipe', 'pipe'], shell: needsWinShell(inv.command) });
+    const s = spawnable(inv.command, [...inv.prefixArgs, '--version']);
+    const out = execFileSync(s.command, s.args, { stdio: ['ignore', 'pipe', 'pipe'], shell: s.shell });
     gltfTransformCheck = { ok: true, version: out.toString().trim() };
   } catch {
     gltfTransformCheck = { ok: false };
@@ -110,7 +111,8 @@ export function ensureGltfpackCli(): void {
   const inv = gltfpackInvocation();
   try {
     // gltfpack -v prints version (npm build → stdout exit 0; some native builds → stderr). Capture both.
-    const out = execFileSync(inv.command, [...inv.prefixArgs, '-v'], { stdio: ['ignore', 'pipe', 'pipe'], shell: needsWinShell(inv.command) });
+    const s = spawnable(inv.command, [...inv.prefixArgs, '-v']);
+    const out = execFileSync(s.command, s.args, { stdio: ['ignore', 'pipe', 'pipe'], shell: s.shell });
     gltfpackCheck = { ok: true, version: out.toString().trim() };
   } catch (e) {
     // Some gltfpack builds print version then exit non-zero. Try to recover
@@ -731,7 +733,8 @@ export async function convertModel(opts: ConvertModelOptions): Promise<ConvertMo
       const welded = path.join(tmpDir, 'welded.glb');
       try {
         const gt = gltfTransformInvocation();
-        execFileSync(gt.command, [...gt.prefixArgs, 'weld', strippedSource, welded], { stdio: 'pipe', shell: needsWinShell(gt.command) });
+        const s = spawnable(gt.command, [...gt.prefixArgs, 'weld', strippedSource, welded]);
+        execFileSync(s.command, s.args, { stdio: 'pipe', shell: s.shell });
         weldedSource = welded;
       } catch (e) {
         const stderr = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
@@ -749,7 +752,8 @@ export async function convertModel(opts: ConvertModelOptions): Promise<ConvertMo
       if (enc === 'gltfpack') {
         try {
           const gp = gltfpackInvocation();
-          execFileSync(gp.command, [...gp.prefixArgs, ...buildGltfpackArgs(strippedSource, stagingLodPaths[i], ratio, meshoptForLod, aggressiveForLod)], { stdio: 'pipe', shell: needsWinShell(gp.command) });
+          const s = spawnable(gp.command, [...gp.prefixArgs, ...buildGltfpackArgs(strippedSource, stagingLodPaths[i], ratio, meshoptForLod, aggressiveForLod)]);
+          execFileSync(s.command, s.args, { stdio: 'pipe', shell: s.shell });
         } catch (e) {
           const stderr = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
           throw new Error(`gltfpack failed for ${sourceUrlPath} (lod${i}, ratio=${ratio}): ${stderr}`);
@@ -766,7 +770,8 @@ export async function convertModel(opts: ConvertModelOptions): Promise<ConvertMo
         } else {
           try {
             const gt = gltfTransformInvocation();
-            execFileSync(gt.command, [...gt.prefixArgs, ...buildGltfTransformSimplifyArgs(weldedSource, intermediate, ratio, settings.simplifyError, !aggressiveForLod)], { stdio: 'pipe', shell: needsWinShell(gt.command) });
+            const s = spawnable(gt.command, [...gt.prefixArgs, ...buildGltfTransformSimplifyArgs(weldedSource, intermediate, ratio, settings.simplifyError, !aggressiveForLod)]);
+            execFileSync(s.command, s.args, { stdio: 'pipe', shell: s.shell });
           } catch (e) {
             const stderr = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
             throw new Error(`gltf-transform simplify failed for ${sourceUrlPath} (lod${i}, ratio=${ratio}): ${stderr}`);
@@ -775,7 +780,8 @@ export async function convertModel(opts: ConvertModelOptions): Promise<ConvertMo
         if (meshoptForLod) {
           try {
             const gt = gltfTransformInvocation();
-            execFileSync(gt.command, [...gt.prefixArgs, ...buildGltfTransformMeshoptArgs(intermediate, stagingLodPaths[i])], { stdio: 'pipe', shell: needsWinShell(gt.command) });
+            const s = spawnable(gt.command, [...gt.prefixArgs, ...buildGltfTransformMeshoptArgs(intermediate, stagingLodPaths[i])]);
+            execFileSync(s.command, s.args, { stdio: 'pipe', shell: s.shell });
           } catch (e) {
             const stderr = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
             throw new Error(`gltf-transform meshopt failed for ${sourceUrlPath} (lod${i}): ${stderr}`);

@@ -64,7 +64,7 @@ test('editing in multi-select broadcasts to every entity, and Cmd+Z restores eac
   await expect.poll(() => traitField(page, sphere!, 'EntityAttributes', 'isActive')).toBe(false);
 
   // A single undo entry restores both entities.
-  await page.keyboard.press('Meta+z');
+  await page.keyboard.press('ControlOrMeta+z');
   await expect.poll(() => traitField(page, cube!, 'EntityAttributes', 'isActive')).toBe(true);
   await expect.poll(() => traitField(page, sphere!, 'EntityAttributes', 'isActive')).toBe(true);
 });

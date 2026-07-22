@@ -26,12 +26,13 @@
  *   node engine/scripts/assert-app-csp.mjs <app-path> [project-dir]
  * Exit 0 = CSP correct; non-zero = a shipped-CSP regression (details printed).
  */
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { binInAppDir, killPackaged } from './packagedAppPaths.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const app = process.argv[2];
@@ -39,7 +40,10 @@ if (!app) { console.error('usage: assert-app-csp.mjs <app-path> [project-dir]');
 const PROJECT = path.resolve(process.argv[3] ?? path.join(REPO, 'games/3d-test'));
 const BOOT_TIMEOUT_MS = 120_000;
 
-const bin = path.join(app, 'Contents', 'MacOS', path.basename(app, '.app'));
+// `app` is the unpacked app dir — a `.app` bundle on macOS, `win-unpacked` on Windows —
+// so the executable inside it is resolved per-platform (packagedAppPaths.mjs), not by
+// assuming the mac `Contents/MacOS/<name>` layout.
+const bin = binInAppDir(app);
 if (!existsSync(bin)) { console.error(`[csp] FAIL: no executable at ${bin}`); process.exit(1); }
 
 let failed = false;
@@ -63,7 +67,7 @@ function freePort() {
 // leftover app instance, (2) pick a guaranteed-free port, (3) tell the app that port via
 // MODOKI_CDP_PORT — do NOT also pass --remote-debugging-port (the app appends it; a
 // duplicate/mismatched flag was the bug).
-try { execFileSync('pkill', ['-f', `${path.basename(app)}/Contents/MacOS`]); } catch { /* none */ }
+killPackaged(app);
 await new Promise((r) => setTimeout(r, 1500)); // let the OS release the old CDP port
 const CDP_PORT = Number(process.env.CSP_CDP_PORT) || (await freePort());
 
@@ -74,7 +78,7 @@ const child = spawn(bin, [`--user-data-dir=${userData}`], {
 });
 const cleanup = () => {
   try { child.kill('SIGKILL'); } catch { /* gone */ }
-  try { execFileSync('pkill', ['-f', `${path.basename(app)}/Contents/MacOS`]); } catch { /* none */ }
+  killPackaged(app);
   try { rmSync(userData, { recursive: true, force: true }); } catch { /* best effort */ }
 };
 process.on('exit', cleanup);

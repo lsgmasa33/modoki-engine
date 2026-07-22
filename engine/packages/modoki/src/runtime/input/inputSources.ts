@@ -28,6 +28,47 @@ export interface InputSource {
   /** Merge this source's contribution into `out` (OR held flags, add axes, set
    *  `lastDevice` on activity). Never clears another source's contribution. */
   sample(out: InputFrame): void;
+  /** Drop latched state WITHOUT detaching. Called when the input gate closes, so a key
+   *  held at that moment can't keep driving the game. Optional; a stateless source
+   *  (one that derives everything in `sample`) needs none. */
+  reset?(): void;
+}
+
+// ── Host input gate ─────────────────────────────────────────────────────────
+//
+// The HOST decides when input should stop reaching the game; the runtime only provides
+// the mechanism. Mirrors the injectable clock: mechanism here, policy outside.
+//
+// The editor uses it for focus scoping — while an editor panel other than the GameView
+// owns the keyboard, WASD must not latch into the running game. That policy CANNOT live
+// in a source: `keyboardSource` ships inside every game and must never know what a
+// "panel" is.
+//
+// A shipped game never calls setInputGate, so the gate stays null and behaviour is
+// unchanged. The headless harness never registers sources at all.
+//
+// Why here and not in keyboardSource: all three built-in sources leak, and only one has
+// any guard. keyboardSource has `editing()`; pointerSource listens on window with NO
+// guard (a pointerdown in the Hierarchy feeds the game during play); gamepadSource polls
+// with NO guard (a controller drives the game while you type in the Inspector). One gate
+// at the registry covers all three and anything a game registers later.
+
+let inputGate: (() => boolean) | null = null;
+let wasSuppressed = false;
+
+/** Install the host's suppression predicate — return true to BLOCK input from reaching
+ *  the game. Pass null to clear. */
+export function setInputGate(fn: (() => boolean) | null): void {
+  inputGate = fn;
+  if (!fn) wasSuppressed = false;
+}
+
+/** Is input currently suppressed by the host? A throwing gate fails OPEN — a broken
+ *  editor predicate must never make a game permanently uncontrollable. */
+export function isInputSuppressed(): boolean {
+  if (!inputGate) return false;
+  try { return inputGate() === true; }
+  catch { return false; }
 }
 
 const sources: InputSource[] = [];
@@ -63,8 +104,20 @@ export function detachAll(): void {
   for (const s of sources) s.detach();
 }
 
-/** Merge every attached source into `out`, in registration order. */
+/** Merge every attached source into `out`, in registration order.
+ *
+ *  While the host gate is closed, sources are NOT sampled and their latched state is
+ *  dropped on the closing edge. The reset is load-bearing, not tidiness: hold W, click
+ *  the Hierarchy, and without it `held` still contains 'w', so the character keeps
+ *  walking until you physically release. Same class as the existing blur / play-start
+ *  resets in keyboardSource. */
 export function sampleAll(out: InputFrame): void {
+  const suppressed = isInputSuppressed();
+  if (suppressed) {
+    if (!wasSuppressed) { wasSuppressed = true; for (const s of sources) s.reset?.(); }
+    return;
+  }
+  wasSuppressed = false;
   for (const s of sources) s.sample(out);
 }
 

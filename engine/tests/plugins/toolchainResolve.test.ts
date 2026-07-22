@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, PINNED_TOOL_VERSIONS, uninstall, uninstallAll, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, type DetectResult } from '../../toolchain'
+import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, versionMatchesPin, PINNED_TOOL_VERSIONS, uninstall, uninstallAll, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, spawnable, whichSync, type DetectResult } from '../../toolchain'
 
 /**
  * Guards the shared toolchain resolver (engine/toolchain) — Phase A of the toolchain-layer plan.
@@ -89,14 +89,81 @@ describe('toolchain npmSpawnSpec() — the swappable npm seam', () => {
     const spec = npmSpawnSpec()
     expect(spec.command).toBe(NODE)
     expect(spec.prefixArgs).toEqual([])
-    expect(spec.shell).toBe(process.platform === 'win32')
+    // A real executable (node/node.exe) spawns directly — a shell is needed only for a .cmd/.bat shim.
+    expect(spec.shell).toBe(false)
   })
 
-  it('falls back to system `npm` on PATH when no override is set', () => {
+  it('falls back to system `npm` on PATH, resolved to its ABSOLUTE shim (Windows: npm.cmd)', () => {
     delete process.env.MODOKI_NPM
     resetToolchainCache()
-    // On any dev/CI machine npm is on PATH, so it resolves to the bare name (present).
-    expect(npmSpawnSpec().command).toBe('npm')
+    // On any dev/CI machine npm is on PATH. It resolves to the absolute binary/shim, NOT the bare
+    // name: Windows execFile does no PATHEXT lookup, so a bare `npm` was unspawnable/unprobeable.
+    const spec = npmSpawnSpec()
+    if (process.platform === 'win32') {
+      // …and a .cmd shim goes through a shell, QUOTED so `C:\Program Files\…` survives the split.
+      expect(spec.shell).toBe(true)
+      expect(spec.command).toMatch(/^"?.*npm\.cmd"?$/i)
+      expect(spec.command.includes(' ') ? spec.command.startsWith('"') : true).toBe(true)
+    } else {
+      expect(path.isAbsolute(spec.command)).toBe(true)
+      expect(path.basename(spec.command)).toBe('npm')
+    }
+  })
+})
+
+describe('toolchain whichSync() — PATH resolution (the Windows PATHEXT fix)', () => {
+  let dir: string
+  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-which-')) })
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }))
+
+  // The bug this exists for: npm on PATH is `npm.cmd` (+ a `npm` BASH script Windows can't run).
+  // execFile/spawn without a shell look for a file named exactly `npm` → ENOENT → Build Support
+  // reported an installed npm as "✗ not found" even with "Use system-installed tools" ON.
+  it('resolves a bare name through PATHEXT on win32, preferring .EXE over .CMD', () => {
+    fs.writeFileSync(path.join(dir, 'tool'), 'bash shim — unspawnable on Windows')
+    fs.writeFileSync(path.join(dir, 'tool.cmd'), '@echo off')
+    fs.writeFileSync(path.join(dir, 'tool.exe'), '')
+    const got = whichSync('tool', { platform: 'win32', pathEnv: dir, pathExt: '.EXE;.CMD' })
+    expect(got).toBe(path.join(dir, 'tool.exe')) // PATHEXT order wins; never the extension-less shim
+  })
+
+  it('falls through to the .CMD shim when there is no .EXE (the npm case)', () => {
+    fs.writeFileSync(path.join(dir, 'npm'), 'bash shim')
+    fs.writeFileSync(path.join(dir, 'npm.cmd'), '@echo off')
+    expect(whichSync('npm', { platform: 'win32', pathEnv: dir, pathExt: '.EXE;.CMD' })).toBe(path.join(dir, 'npm.cmd'))
+  })
+
+  it('tolerates quoted PATH entries and returns null when the name is absent', () => {
+    fs.writeFileSync(path.join(dir, 'tool.cmd'), '@echo off')
+    expect(whichSync('tool', { platform: 'win32', pathEnv: `"${dir}"`, pathExt: '.CMD' })).toBe(path.join(dir, 'tool.cmd'))
+    expect(whichSync('nope-not-here', { platform: 'win32', pathEnv: dir, pathExt: '.CMD' })).toBeNull()
+    expect(whichSync('tool', { platform: 'win32', pathEnv: '', pathExt: '.CMD' })).toBeNull()
+  })
+
+  it.skipIf(process.platform === 'win32')('requires the execute bit on POSIX', () => {
+    const bin = path.join(dir, 'tool')
+    fs.writeFileSync(bin, '#!/bin/sh\n')
+    expect(whichSync('tool', { platform: 'linux', pathEnv: dir })).toBeNull() // not chmod +x yet
+    fs.chmodSync(bin, 0o755)
+    expect(whichSync('tool', { platform: 'linux', pathEnv: dir })).toBe(bin)
+  })
+})
+
+describe('toolchain spawnable() — shell + quoting for resolved commands', () => {
+  // Node concatenates argv into one command line for shell:true, so an unquoted path with a space
+  // ("C:\Users\Jane Doe\…\gltf-transform.cmd", or a project under "My Games\") got split by cmd.exe
+  // and failed with "'C:\Users\Jane' is not recognized as an internal or external command".
+  it('quotes the command AND args when a Windows batch shim needs a shell', () => {
+    const s = spawnable('C:\\Program Files\\x\\gltf-transform.cmd', ['weld', 'C:\\My Games\\a.glb', '--v'], 'win32')
+    expect(s.shell).toBe(true)
+    expect(s.command).toBe('"C:\\Program Files\\x\\gltf-transform.cmd"')
+    expect(s.args).toEqual(['weld', '"C:\\My Games\\a.glb"', '--v']) // only the ones that need it
+  })
+
+  it('passes a real executable through untouched (no shell, no quoting)', () => {
+    const s = spawnable('C:\\Program Files\\x\\ffmpeg.exe', ['-i', 'C:\\My Games\\a.wav'], 'win32')
+    expect(s).toEqual({ command: 'C:\\Program Files\\x\\ffmpeg.exe', args: ['-i', 'C:\\My Games\\a.wav'], shell: false })
+    expect(spawnable('/usr/bin/gltf-transform', ['a b'], 'darwin').shell).toBe(false)
   })
 })
 
@@ -104,11 +171,18 @@ describe('toolchain detect() — android-sdk (directory tool, the unified probe)
   let tmp: string
   let savedHome: string | undefined
   let savedRoot: string | undefined
+  let savedDir: string | undefined
 
   beforeEach(() => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-sdk-'))
     savedHome = process.env.ANDROID_HOME
     savedRoot = process.env.ANDROID_SDK_ROOT
+    // These probes are about the SYSTEM sources, so run as a DEV editor (no toolchain dir). A dev
+    // box that exports MODOKI_TOOLCHAIN_DIR (some do, so CLI builds find toktx) is bundled-only
+    // unless the toggle is on: it would gate the env candidates off AND let its own provisioned
+    // JDK/SDK win first, so these tests would resolve the machine's toolchain, not the fixture.
+    savedDir = process.env.MODOKI_TOOLCHAIN_DIR
+    delete process.env.MODOKI_TOOLCHAIN_DIR
     delete process.env.ANDROID_HOME
     delete process.env.ANDROID_SDK_ROOT
     resetToolchainCache()
@@ -118,6 +192,8 @@ describe('toolchain detect() — android-sdk (directory tool, the unified probe)
     else process.env.ANDROID_HOME = savedHome
     if (savedRoot === undefined) delete process.env.ANDROID_SDK_ROOT
     else process.env.ANDROID_SDK_ROOT = savedRoot
+    if (savedDir === undefined) delete process.env.MODOKI_TOOLCHAIN_DIR
+    else process.env.MODOKI_TOOLCHAIN_DIR = savedDir
     fs.rmSync(tmp, { recursive: true, force: true })
     resetToolchainCache()
   })
@@ -678,6 +754,94 @@ describe('toolchain — bundled-vs-system SDK preference (systemToolchainAllowed
     expect(systemToolchainAllowed()).toBe(false)
   })
 
+  // The guarantee: with the checkbox OFF, a packaged editor must build with ITS OWN tools only.
+  // JAVA_HOME / ANDROID_HOME were previously honoured unconditionally (and FIRST), so a machine
+  // with either one silently drove the build off a system SDK despite "bundled-only".
+  it('bundled-only IGNORES a system JAVA_HOME / ANDROID_HOME (env is a SYSTEM source)', () => {
+    process.env.MODOKI_TOOLCHAIN_DIR = tcDir // no settings.json → bundled-only
+    const sdk = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-sysdk-'))
+    const jdk = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-sysjdk-'))
+    fs.mkdirSync(path.join(sdk, 'platform-tools'))
+    fs.mkdirSync(path.join(jdk, 'bin'), { recursive: true })
+    fs.writeFileSync(path.join(jdk, 'bin', process.platform === 'win32' ? 'java.exe' : 'java'), '')
+    fs.writeFileSync(path.join(jdk, 'release'), 'JAVA_VERSION="21.0.11"\n')
+    const saved = { h: process.env.ANDROID_HOME, j: process.env.JAVA_HOME }
+    process.env.ANDROID_HOME = sdk
+    process.env.JAVA_HOME = jdk
+    resetToolchainCache()
+    try {
+      expect(detect('android-sdk').present).toBe(false)
+      expect(detect('java').present).toBe(false)
+      // Ticking "Use system-installed tools" brings both back — that's what the toggle is FOR.
+      process.env.MODOKI_ALLOW_SYSTEM_TOOLCHAIN = '1'
+      resetToolchainCache()
+      expect(detect('android-sdk')).toMatchObject({ present: true, path: sdk, source: 'env' })
+      expect(detect('java')).toMatchObject({ present: true, path: jdk, source: 'env' })
+    } finally {
+      if (saved.h === undefined) delete process.env.ANDROID_HOME; else process.env.ANDROID_HOME = saved.h
+      if (saved.j === undefined) delete process.env.JAVA_HOME; else process.env.JAVA_HOME = saved.j
+      fs.rmSync(sdk, { recursive: true, force: true })
+      fs.rmSync(jdk, { recursive: true, force: true })
+      resetToolchainCache()
+    }
+  })
+
+  it('OUR provisioned SDK outranks a system ANDROID_HOME even with system tools allowed', () => {
+    process.env.MODOKI_TOOLCHAIN_DIR = tcDir
+    process.env.MODOKI_ALLOW_SYSTEM_TOOLCHAIN = '1'
+    const sys = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-sysdk-'))
+    fs.mkdirSync(path.join(sys, 'platform-tools'))
+    fs.mkdirSync(path.join(tcDir, 'android-sdk', 'platform-tools'), { recursive: true })
+    const saved = process.env.ANDROID_HOME
+    process.env.ANDROID_HOME = sys
+    resetToolchainCache()
+    try {
+      // Regression: env used to be probed BEFORE our own install, so a stray ANDROID_HOME shadowed
+      // the SDK the user had just installed from the Build Support dialog.
+      expect(detect('android-sdk').path).toBe(path.join(tcDir, 'android-sdk'))
+    } finally {
+      if (saved === undefined) delete process.env.ANDROID_HOME; else process.env.ANDROID_HOME = saved
+      fs.rmSync(sys, { recursive: true, force: true })
+      resetToolchainCache()
+    }
+  })
+
+  // npm is gated only where the editor actually DOWNLOADS Node (packaged, or MODOKI_PROVISION_NODE=1
+  // in dev). A plain dev checkout has no provisioned Node, so blocking its PATH npm would report a
+  // working npm as missing with no way to install one.
+  it('bundled-only blocks the system PATH npm ONLY when the editor provisions Node', () => {
+    const saved = { p: process.env.MODOKI_PROVISION_NODE, n: process.env.MODOKI_NODE, c: process.env.MODOKI_NPM_CLI }
+    delete process.env.MODOKI_NODE
+    delete process.env.MODOKI_NPM_CLI
+    process.env.MODOKI_TOOLCHAIN_DIR = tcDir // bundled-only (no settings.json)
+    try {
+      // Packaged: we provision Node, so the machine's npm must NOT be used…
+      process.env.MODOKI_PROVISION_NODE = '1'
+      resetToolchainCache()
+      expect(detect('npm').present).toBe(false)
+      // …but a dev checkout (no provisioning) keeps using its PATH npm.
+      delete process.env.MODOKI_PROVISION_NODE
+      resetToolchainCache()
+      expect(detect('npm')).toMatchObject({ present: true, source: 'path' })
+    } finally {
+      if (saved.p === undefined) delete process.env.MODOKI_PROVISION_NODE; else process.env.MODOKI_PROVISION_NODE = saved.p
+      if (saved.n === undefined) delete process.env.MODOKI_NODE; else process.env.MODOKI_NODE = saved.n
+      if (saved.c === undefined) delete process.env.MODOKI_NPM_CLI; else process.env.MODOKI_NPM_CLI = saved.c
+      resetToolchainCache()
+    }
+  })
+
+  it('xcodebuild is exempt — Apple-supplied, so it always resolves from the system', () => {
+    process.env.MODOKI_TOOLCHAIN_DIR = tcDir // bundled-only
+    resetToolchainCache()
+    // Can't assert presence (machine-dependent), but it must never be gated OFF: on macOS with Xcode
+    // installed it stays detectable in bundled-only mode, because the editor cannot bundle Xcode.
+    if (process.platform === 'darwin' && whichSync('xcodebuild')) {
+      expect(detect('xcodebuild').present).toBe(true)
+    }
+    expect(isInstallable('xcodebuild')).toBe(false)
+  })
+
   it('MODOKI_ALLOW_SYSTEM_TOOLCHAIN=1 overrides the bundled-only default', () => {
     process.env.MODOKI_TOOLCHAIN_DIR = tcDir
     process.env.MODOKI_ALLOW_SYSTEM_TOOLCHAIN = '1'
@@ -719,6 +883,27 @@ describe('toolchain — pinned CLI/gem tool versions + staleness (bump → reins
     process.env.MODOKI_TOOLCHAIN_DIR = '/tmp/modoki-tc-x'
     // Resolved from PATH (path outside the toolchain dir) → left alone regardless of version.
     expect(isToolStale('gltf-transform-cli', mk({ version: '0.0.1', path: '/usr/local/bin/gltf-transform', source: 'path' }))).toBe(false)
+  })
+
+  // gltfpack@1.2.0's `-v` prints "gltfpack 1.2" — a plain includes('1.2.0') never matched, so the
+  // dialog showed a permanent "⟳ (update)" and re-installed it on every open.
+  it('accepts a version printed with trailing zeros TRIMMED (gltfpack 1.2 ⇒ pin 1.2.0)', () => {
+    expect(versionMatchesPin('gltfpack 1.2', '1.2.0')).toBe(true)
+    expect(versionMatchesPin('gltfpack 1.2.0', '1.2.0')).toBe(true)
+    expect(versionMatchesPin('4.4.1', '4.4.1')).toBe(true)
+    // …without going loose: a DIFFERENT release must still read as stale.
+    expect(versionMatchesPin('gltfpack 1.20', '1.2.0')).toBe(false)
+    expect(versionMatchesPin('gltfpack 1.2.1', '1.2.0')).toBe(false)
+    expect(versionMatchesPin('gltfpack 0.1.2', '1.2.0')).toBe(false)
+    expect(versionMatchesPin('4.4.10', '4.4.1')).toBe(false)
+  })
+
+  it('gltfpack installed at its pin is NOT stale (no perpetual "update" loop)', () => {
+    const tc = '/tmp/modoki-tc-gp'
+    process.env.MODOKI_TOOLCHAIN_DIR = tc
+    const d: DetectResult = { id: 'gltfpack', present: true, source: 'probe', version: 'gltfpack 1.2', path: `${tc}/npm-tools/node_modules/.bin/gltfpack` }
+    expect(PINNED_TOOL_VERSIONS.gltfpack).toBe('1.2.0')
+    expect(isToolStale('gltfpack', d)).toBe(false)
   })
 
   it('never stale for an un-pinned tool, or when absent', () => {

@@ -24,10 +24,28 @@ it runs identically in the Vite-plugin process, the Electron main backend, and h
   resolved from an **env override** → **extra candidates** (a userData install location) → **PATH**,
   each validated by a `--version` probe. Results are **cached** (the probe spawn is expensive and its
   inputs are fixed at startup).
-- **Directory tools** (`android-sdk`, `java`) — resolved from **env vars** → **well-known dirs**,
-  validated by a `marker` sub-path (`platform-tools` for the SDK, `bin/java` for a JDK), plus an
-  optional `validate(dir)` hook. **Not cached** — their inputs (`ANDROID_HOME`, `JAVA_HOME`) legitimately
-  differ per project, so a stale cache would resolve the wrong one.
+- **Directory tools** (`android-sdk`, `java`) — resolved from **our provisioned install** →
+  **env vars** → **well-known dirs**, validated by a `marker` sub-path (`platform-tools` for the SDK,
+  `bin/java` for a JDK), plus an optional `validate(dir)` hook. **Not cached** — their inputs
+  (`ANDROID_HOME`, `JAVA_HOME`) legitimately differ per project, so a stale cache would resolve the
+  wrong one. Our own install is probed **first**, so a stray `JAVA_HOME`/`ANDROID_HOME` can't shadow
+  the SDK you just installed from the dialog.
+
+### PATH resolution is explicit (`whichSync`) — the Windows PATHEXT trap
+
+A bare tool name is resolved to an **absolute path** by `whichSync()` before it's probed or spawned,
+because `execFile`/`spawn` **without a shell do no PATHEXT lookup on Windows**: they look for a file
+named exactly `npm`, while npm ships `npm.cmd` (plus a `npm` *bash* script Windows can't run). Probing
+by bare name therefore threw `ENOENT`, and Build Support reported an installed npm — and any
+PATH-resolved `toktx`/`gltfpack`/`java` — as **"✗ not found"**, even with the system-tools toggle ON.
+`whichSync` walks `PATH` × `PATHEXT` (never the extension-less shim) and requires the execute bit on
+POSIX; the absolute result also gives every PATH-found tool a usable `path`/`dir` for `withToolOnPath`.
+
+`spawnable(command, args)` is the companion: it decides whether a resolved command needs
+`{shell:true}` (a `.cmd`/`.bat` shim — see `needsWinShell`) and **quotes the command AND its args**
+when it does. Node concatenates argv into one command line for `shell:true`, so an unquoted
+`C:\Program Files\…\gltf-transform.cmd` (or an asset under `My Games\`) was split by cmd.exe. **Every
+spawn of a toolchain-resolved command should go through `spawnable`.**
 
 Related helpers: `withToolOnPath(id, env)` prepends a resolved tool's dir to a child's PATH (so a tool
 that shells another by bare name — e.g. `@gltf-transform/cli` calling `toktx` — finds our copy);
@@ -68,6 +86,38 @@ a **userData candidate** in its registry entry keyed off `MODOKI_TOOLCHAIN_DIR`,
 just-installed copy first — before any system tool — which is how the packaged editor (with no system
 toolchain) resolves them.
 
+An `install()` of an npm CLI **verifies with the same `--version` probe `detect()` uses**, not just
+`existsSync(bin)`, and **self-heals** when it fails: it wipes `npm-tools/node_modules` + the lockfile
+and installs once more from scratch. An interrupted install can leave a tree where the `.bin` shim
+exists but a dependency is half-written (seen in the wild: `@gltf-transform/core` with no
+`package.json` → `ERR_MODULE_NOT_FOUND`). With the old existsSync check that install "succeeded" while
+detection said missing, and clicking **Install** again was a no-op because npm saw the dependency
+already satisfied — an unbreakable "not found" loop.
+
+## Bundled-only vs system tools — the "Use system-installed tools" toggle
+
+A **packaged** editor defaults to **bundled-only**: it builds with the tools it ships or provisioned
+itself, so a build doesn't depend on whatever happens to be on the machine. The Build Support checkbox
+(persisted to `<toolchainDir>/settings.json`, overridable with `MODOKI_ALLOW_SYSTEM_TOOLCHAIN=1`) opts
+into system fallback; `systemToolchainAllowed()` reads it **live** in both processes that resolve tools.
+
+With the toggle OFF, *every* system source is refused for a tool the editor can supply — not just the
+PATH probe, but `JAVA_HOME`/`ANDROID_HOME` and the well-known Android-Studio/Homebrew SDK dirs, plus
+the `npx --no-install @gltf-transform/cli` / bare-`gltfpack` fallbacks (which are the machine's npm).
+The tool then reads "not found", which is the honest answer: it prompts an install instead of silently
+building on a system copy.
+
+The gate is `systemFallbackAllowed(id)` = the toggle **OR** `!editorCanProvide(id)` — because refusing
+a fallback for a tool the editor *can't* supply here would report a working tool as missing with no way
+to fix it:
+
+| Tool | Gated when toggle is OFF? |
+|---|---|
+| `java`, `android-sdk`, `gltf-transform-cli`, `gltfpack`, `ffmpeg`, `ffprobe` | **Yes** — installable into the toolchain dir |
+| `toktx`, `msdf-atlas-gen` | Yes, **when bundled** (their `MODOKI_*` env var is set by the packaged host); a dev checkout has no bundle, so PATH stays usable |
+| `npm` | Yes, **when the editor provisions Node** (packaged, or `MODOKI_PROVISION_NODE=1`); a plain dev checkout keeps its PATH npm |
+| `xcodebuild` | **No** — Apple-supplied and multi-GB; it can never be bundled, so it always resolves from the system |
+
 ## The `/api/toolchain` surface & the Build Support dialog
 
 - **`GET /api/toolchain`** (transport-agnostic backend router) → `toolchainStatus()`: every tool's
@@ -103,7 +153,9 @@ therefore re-probes on every call, so the dialog's post-install re-check reflect
 The model-import pipeline (`model-convert.ts`, `rigged-model-optimize.ts`) resolves its CLIs the same way
 via `gltfTransformInvocation()` / `gltfpackInvocation()`: prefer the resolved binary (packaged userData
 install), else fall back to `npx --no-install @gltf-transform/cli` / a bare PATH `gltfpack` for a dev
-checkout — byte-identical to the pre-layer calls.
+checkout. Those fallbacks are the **machine's** npm, so they're refused in bundled-only mode — the
+invocation throws the tool's actionable "install it from Build Support" message instead. Every spawn
+goes through `spawnable()` so a `.cmd` shim and a path with spaces both survive.
 
 ## Adding a new tool
 
@@ -121,8 +173,9 @@ checkout — byte-identical to the pre-layer calls.
 Two shipping targets: **macOS arm64** (`dmg` + `zip`) and **Windows x64** (`nsis`, per-user) — see
 `electron-builder.yml`. Every pinned download in the on-demand provisioners is keyed by
 `<platform>-<arch>`; the `*Provision.ts` modules already carry Windows URLs + checksums, and the
-`.exe`/`.cmd` path handling lives in `index.ts` (`npmToolBin` picks the `.cmd` shim, `needsWinShell()`
-forces `{shell:true}`, `ffmpegToolBin`/`ffprobeToolBin` append `.exe`). So the packaged Windows editor
+`.exe`/`.cmd` path handling lives in `index.ts` (`whichSync` does the PATHEXT lookup, `npmToolBin` picks
+the `.cmd` shim, `spawnable()`/`needsWinShell()` force + quote `{shell:true}`,
+`ffmpegToolBin`/`ffprobeToolBin` append `.exe`). So the packaged Windows editor
 provisions its own Android toolchain (Node + JDK 21 + sdkmanager all exist there) and can build Android —
 but **never iOS** (`xcodebuild` is macOS-only).
 

@@ -10,6 +10,18 @@ an `.mcp.json` for it (the AI panel shows exactly where). When the desktop edito
 project open, it exposes the tools below. **Prefer them over screenshots** — they read and
 mutate the *live* running engine, so they prove your edits actually took effect.
 
+## Observe the running game — don't infer it from source
+
+The files in this project (`game.ts`, `setup.ts`, the scene JSON) tell you what the game is
+*designed* to do. They do **NOT** tell you what it's *actually doing right now* — where an
+entity is this frame, which scene is loaded, what the human just changed, whether an event
+fired. Any claim about live state that you got by **reading files is a guess.**
+
+Before you answer "did it work / what's happening / why does it look wrong," ask yourself:
+*am I inferring this, or did I observe it?* If inferring → call a tool
+(`modoki_get_scene_state` / `modoki_journal` / `modoki_editor_journal`) and **cite what it
+returned.** "Did you check?" should never be a question the human has to ask you.
+
 ## The verification loop (do this every time)
 
 1. **Read** the live world with `modoki_get_scene_state` before changing anything.
@@ -40,9 +52,13 @@ mutate the *live* running engine, so they prove your edits actually took effect.
   `drag_handle` drive the DOM-less Canvas2D/SVG editors (bones, keyframes, collider verts).
 
 **Verify by DATA, not vibes (Percept)**
-- `modoki_journal` / `modoki_editor_journal` — the game's tick-stamped semantic events and
-  the editor-activity stream (what the human is doing). Assert on these instead of
-  screenshots. `modoki_get_editor_state` reads the whole editor UI state in one call.
+- `modoki_journal` — the game's tick-stamped semantic events (match / score / win / …);
+  assert on these instead of screenshots. `modoki_diagnose` flags likely problems (NaN
+  transforms, broken asset refs, orphaned entities) in one call.
+- `modoki_editor_journal` / `modoki_watch` — what the **human just did** in the editor
+  (selected / moved / edited) and a live watch on chosen entities/traits. Reach for these
+  *before* guessing why the scene differs from what you expected. `modoki_get_editor_state`
+  dumps the whole editor UI state in one call.
 
 **Drop into the live renderer (CDP / chrome-devtools)** — when the data isn't enough:
 read React/Three state via `evaluate_script`, validate WGSL, or grab the TRUE framebuffer

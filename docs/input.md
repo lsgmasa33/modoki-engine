@@ -42,7 +42,11 @@ deterministic sim free of live DOM reads.
 - `runtime/systems/inputSystem.ts` — the per-frame bridge: sample all sources → derive edges → write
   the singleton; also play-start edge suppression and the device-switch UI repaint.
 - `runtime/input/inputSources.ts` — the `InputSource` interface + registry (`registerSource`/
-  `sampleAll`/`attachAll`) and the app-scope `inputSourcesManager`.
+  `sampleAll`/`attachAll`) and the app-scope `inputSourcesManager`. Also the **host input gate**
+  (`setInputGate`/`isInputSuppressed`): a host may suppress ingestion wholesale, and every source's
+  optional `reset()` runs on the closing edge so held state can't strand. It lives at the registry
+  because all three sources need it and only the keyboard had any guard. A shipped game never
+  installs one — see [editor-input.md](./editor-input.md).
 - `runtime/input/keyboardSource.ts` — DOM keyboard modality: passive listeners, editing-guard,
   blur/visibility/play reset; maps held keys onto the action vocabulary.
 - `runtime/input/gamepadSource.ts` — browser Gamepad API modality, split into a pure `sampleGamepadInto`
@@ -182,6 +186,9 @@ a scene file, and intentionally not an editor-inspectable trait.
 
 ## Related
 
+- [editor-input.md](./editor-input.md) — the editor's own keyboard layer, and the `setInputGate`
+  seam it installs on the source registry to stop a focused editor panel from feeding the running
+  game (runtime = mechanism, editor = policy; a shipped game never installs a gate).
 - [managers-and-systems.md](./managers-and-systems.md) — the Manager lifecycle (`inputSourcesManager`
   is an app-scope Manager) and `SYSTEM_PRIORITY` tiers.
 - [ui-system.md](./ui-system.md) — the read-source registry + `UIBinding.textBinding` that the prompt

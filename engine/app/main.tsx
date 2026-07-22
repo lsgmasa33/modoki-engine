@@ -44,6 +44,10 @@ if (!__MODOKI_PLAYABLE__ && (Capacitor.isNativePlatform() || import.meta.env.DEV
 // is still guarded by import.meta.hot until Phase 2 swaps it for IPC.
 if (__MODOKI_EDITOR__) {
   import('./debug/agentBridge').then(({ initAgentBridge }) => initAgentBridge());
+  // HMR staleness/recovery + the game-code reload. ACTIVE in the packaged editor too —
+  // it runs a real Vite dev server, so import.meta.hot is defined there (see the module
+  // header). Inert only where there is no hot context at all.
+  import('./debug/hmrStaleness').then(({ initHmrStaleness }) => initHmrStaleness());
   // Editor-only Watch debug-menu tab — reuses the editor-side watch observer
   // (app/debug/watch.ts), which is stripped from shipped game builds. Side-effect
   // import registers the tab; gated here so a shipped game never bundles it.

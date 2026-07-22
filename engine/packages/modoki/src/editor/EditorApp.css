@@ -20,3 +20,18 @@ button:active {
 button {
   transition: filter 0.05s, transform 0.05s;
 }
+
+/* ── Focused-panel ring (focus-scope refactor P2) ─────────────────────────────
+   Which panel owns the keyboard is otherwise invisible, and a focus-scoped
+   shortcut that silently does nothing reads as "broken" rather than "scoped".
+
+   The ring is drawn on FlexLayout's tab container via :has(), because the
+   PanelFocusHost wrapper is `display: contents` and therefore has no box of its
+   own (deliberately — see PanelFocusHost.tsx). Chromium-only selector, which is
+   fine: the editor ships in Electron.
+
+   inset box-shadow rather than a border so it costs no layout — a border would
+   shift every panel's content by 1px the moment it gained focus. */
+.flexlayout__tab:has(> [data-panel-scope][data-panel-focused='true']) {
+  box-shadow: inset 0 0 0 1px #4a7fd4;
+}

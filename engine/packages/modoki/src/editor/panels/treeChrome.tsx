@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { useOverlayEscape } from '../input/useOverlayEscape';
 
 /** Shared chrome for the Assets-panel trees so the three top-level sections
  *  (Assets, Scripts, Engine) read as one consistent tree — an identical header
@@ -133,11 +134,12 @@ export function TypeFilterMenu({ types, selected, onToggle, onClear, label = 'Ty
   useEffect(() => {
     if (!open) return;
     const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
     document.addEventListener('mousedown', onDoc);
-    document.addEventListener('keydown', onKey);
-    return () => { document.removeEventListener('mousedown', onDoc); document.removeEventListener('keydown', onKey); };
+    return () => { document.removeEventListener('mousedown', onDoc); };
   }, [open]);
+  // Escape closes only the TOP overlay — this dropdown used to share the key with every
+  // other open menu/picker, so one press closed them all.
+  useOverlayEscape(open, () => setOpen(false), 'tree-chrome');
 
   // Bucket types by category (preserving each bucket's incoming order), then order
   // the buckets by groupOrder, appending any unknown categories alphabetically.

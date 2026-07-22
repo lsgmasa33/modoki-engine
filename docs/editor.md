@@ -288,9 +288,35 @@ view sharing one horizontal zoom/pan viewport (wheel zooms toward the cursor, ri
 pans).
 
 - **Binding** — a clip binds to an **Animator** root entity; track paths are relative to
-  that root. Editing a trait field **while recording** keys the clip at the playhead (the
-  record hook in `animation/recording.ts`); editing an entity **not** under the Animator
-  root warns and is dropped rather than silently lost.
+  that root. The root is discovered by scanning for the Animator whose `clips` BANK
+  references the open clip (`resolveAnimatorRootForClip`, shared by the Assets double-click
+  and the panel's re-bind recovery — matching against `Animator.clip`, the active-clip NAME,
+  never matched a GUID). A clip nobody references yet opens **unbound**: the warning bar's
+  **Bind to Entity…** button lists every entity in the scene, and picking one adds the
+  `Animator` component (when missing) pre-populated with the clip, as ONE undo entry
+  (`editor/animation/bindAnimator.ts` — a bound root with an empty bank would be the same
+  "animation data not assigned" dead end). Re-binding an already-banked clip only moves the
+  editor's root pointer — no duplicate entry.
+- **"Bound" means the entity still CARRIES an Animator**, not just that a pointer exists. The
+  root is a plain entity pointer (persisted across sessions as a guid in
+  `animation/lastAnimationClip.ts`), so removing the component — undo, Inspector — used to
+  leave the panel bound to an entity with no Animator: warning bar hidden, Bind button
+  unreachable, and a live scrub preview for a clip that would never play at runtime. Both the
+  session restore and the panel re-validate the trait and fall back to UNBOUND. The panel
+  only drops a root that RESOLVES and lacks the trait — an unresolvable id is the transient
+  mid-scene-swap state, and clearing there would flash the warning on every hot-reload.
+- Editing a trait field **while recording** keys the clip at the playhead (the record hook in
+  `animation/recording.ts`); editing an entity **not** under the Animator root warns and is
+  dropped rather than silently lost.
+- **Preview envelope + ⏹ Exit Preview** — a scrub or ▶ preview opens a snapshot session
+  (`editor/scene/timelinePreview.ts`, shared with the Timeline panel) and sets run-mode
+  `scrub`/`preview`. **Cmd+S is refused for the whole envelope** — the pose writes authored traits,
+  so a save would bake it. **⏹ Exit Preview** reverts to the authored snapshot, re-resolves the
+  Animator root (the reload reassigns entity ids) and returns to `stopped`, which re-enables saving;
+  unmount / clip-switch do the same. Without it the panel wedged saves with no way out but closing
+  the tab. Caveat: poses made OUTSIDE the envelope (MCP `set_playhead`, a clip edit's re-pose) open
+  no session, so Exit reverts only to the envelope's start — see Phase 3 of
+  `docs/plans/preview-mode-refactor.md`.
 - **Live pose** — scrubbing and preview playback pose the bound entities every frame via the
   shared runtime samplers `applyClipAtTime` + `applyClipDeform` (so a scrubbed clip previews
   skeletal/cloth deformation exactly as it plays), then fire the dirty listeners so the
@@ -437,5 +463,6 @@ The undo stack is capped at 200 entries (oldest dropped, warned once per session
 | Asset editors | `editor/panels/{AnimationEditor,ParticleEditor,SpriteEditor,SpriteAnimEditor}.tsx` |
 | Material inspector / preview | `editor/panels/assetViews/MaterialAssetView.tsx`, `editor/panels/MaterialPreview.tsx` |
 | Undo / redo | `editor/undo/undoManager.ts` |
+| Keyboard shortcuts / focus scope | `editor/input/` — see [editor-input.md](./editor-input.md) |
 | Shared 3D sync | `runtime/rendering/scene3DSync.ts` |
 | Electron host / Open+New Project | `engine/electron/{main,projects,newProject}.ts` |

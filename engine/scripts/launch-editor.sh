@@ -65,10 +65,42 @@ EDITOR_LOG="/tmp/modoki-editor-${LOG_TAG}.log"
 #    sweeps any straggler if a prior editor died uncleanly. We launch the editor
 #    with its absolute main.cjs (step 3) so the first pkill can match it precisely.
 #    Skipped in multi mode (run several editors of the SAME repo side by side).
+#
+#    WINDOWS: `pkill -f` matches against the command LINE, which MSYS/Git-Bash
+#    cannot see for native Windows processes — `ps -W` lists electron.exe by
+#    executable path only, with zero argument text. So the pattern never matched,
+#    the `|| true` swallowed it silently, and the old editor survived to hold the
+#    pinned port (main then refuses to drift → a modal "port already in use"
+#    error). Match on the real command line via CIM there instead; still scoped to
+#    THIS repo's absolute path, so a sibling clone's editor is never touched.
+kill_repo_process() { # $1 = absolute path fragment identifying this repo's process
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      local pat_m pat_w
+      # MSYS converts a unix path to a MIXED-mode path (E:/a/b) when it hands an
+      # argument to a native exe, so that is the form that actually appears in
+      # electron's command line — NOT the backslash form `cygpath -w` returns.
+      # Match BOTH so either spelling is caught. (`\` is not a -like wildcard.)
+      pat_m="$(cygpath -m "$1" 2>/dev/null || echo "$1")"
+      pat_w="$(cygpath -w "$1" 2>/dev/null || echo "$1")"
+      # Exclude THIS powershell process: the pattern is part of its own command
+      # line, so an unfiltered query matches itself and kills the killer.
+      powershell.exe -NoProfile -NonInteractive -Command \
+        "Get-CimInstance Win32_Process | Where-Object { \$_.ProcessId -ne \$PID -and (\$_.CommandLine -like '*$pat_m*' -or \$_.CommandLine -like '*$pat_w*') } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" \
+        >/dev/null 2>&1 || true
+      ;;
+    *)
+      pkill -f "$1" 2>/dev/null || true
+      ;;
+  esac
+}
+
 if [ -z "$MULTI" ]; then
-  pkill -f "$REPO/engine/electron/dist/main.cjs" 2>/dev/null || true
-  pkill -f "$REPO/node_modules/vite/bin/vite.js" 2>/dev/null || true
-  sleep 0.5
+  kill_repo_process "$REPO/engine/electron/dist/main.cjs"
+  kill_repo_process "$REPO/node_modules/vite/bin/vite.js"
+  # Windows releases a listening socket a beat after the owning process dies;
+  # too short a wait and the relaunch races the port it just freed.
+  case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) sleep 2 ;; *) sleep 0.5 ;; esac
 fi
 
 # 2. Build the Electron main/preload bundle.
@@ -101,11 +133,23 @@ nohup ./node_modules/.bin/electron $CDP_ARG "$REPO/engine/electron/dist/main.cjs
 EDITOR_PID=$!
 
 # 4. Wait for the backend to announce itself, then report.
+#    A timeout is a FAILURE, not a success. The old loop only errored when the
+#    process DIED — but a startup error (e.g. "port already in use") leaves
+#    Electron ALIVE showing a modal dialog, so the loop simply ran out and fell
+#    through to the "✓ Editor running" banner with an empty PORT backfilled from
+#    $BACKEND_PORT. That reported a healthy editor that had never started.
+READY=""
 for _ in $(seq 1 60); do
-  grep -q "backend listening on" "$EDITOR_LOG" && break
+  if grep -q "backend listening on" "$EDITOR_LOG"; then READY=1; break; fi
   kill -0 "$EDITOR_PID" 2>/dev/null || { echo "[launch-editor] ERROR: editor exited early (see $EDITOR_LOG)"; tail -5 "$EDITOR_LOG"; exit 1; }
   sleep 0.5
 done
+if [ -z "$READY" ]; then
+  echo "[launch-editor] ERROR: editor never announced its backend within 30s (see $EDITOR_LOG)"
+  echo "[launch-editor]        it is still running (pid $EDITOR_PID) — likely a startup error dialog."
+  grep -iE "error|already in use|refusing" "$EDITOR_LOG" | tail -5 || tail -5 "$EDITOR_LOG"
+  exit 1
+fi
 
 PORT="$(grep -oE 'listening on http://127.0.0.1:[0-9]+' "$EDITOR_LOG" | grep -oE '[0-9]+$' | head -1 || true)"
 echo

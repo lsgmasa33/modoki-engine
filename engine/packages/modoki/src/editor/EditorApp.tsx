@@ -7,6 +7,11 @@ import { Layout, Model, TabNode, Actions, DockLocation } from 'flexlayout-react'
 import type { IJsonModel } from 'flexlayout-react';
 import 'flexlayout-react/style/dark.css';
 
+import { PanelFocusHost } from './input/PanelFocusHost';
+import { register } from './input/keymap';
+import { useHmrEpoch } from './input/hmrEpoch';
+import { installKeymapDispatcher } from './input/dispatcher';
+import { setInputGate } from '../runtime/input/inputSources';
 import SceneView from './panels/SceneView';
 import Hierarchy from './panels/Hierarchy';
 import Inspector from './panels/Inspector';
@@ -24,7 +29,7 @@ import BuildSupportDialog from './panels/BuildSupportDialog';
 import CleanupAssetsDialog from './panels/CleanupAssetsDialog';
 import PanelErrorBoundary from './panels/PanelErrorBoundary';
 import { saveAll } from './scene/serialize';
-import { enterPlay, pausePlay } from './scene/playMode';
+import { enterPlay, pausePlay, getModeOwner } from './scene/playMode';
 import { getPlayState, setPlayState, onPlayStateChange, getRunMode, canEdit as canEditMode } from '../runtime/systems/playState';
 import { savePrefabEdit, isEditingPrefab } from './scene/prefabEdit';
 import { useEditorStore } from './store/editorStore';
@@ -268,6 +273,7 @@ const electronBridge: ElectronMenuBridge | null =
     : undefined)?.bridge ?? null;
 
 export default function EditorApp() {
+  const hmrEpoch = useHmrEpoch();
   const modelRef = useRef<Model | null>(null);
   // Latest id → action map for OS-menu clicks (kept in a ref so the once-registered
   // IPC listener always calls the current action).
@@ -403,73 +409,156 @@ export default function EditorApp() {
     return () => { alive = false; };
   }, [openBuildSupport]);
 
-  // Cmd+S → Save All
+  // App-scope shortcuts, now declared in the keymap registry and run by the single
+  // dispatcher (focus-scope refactor P3) instead of this file owning a window keydown.
+  // All three are `app-chord`: they fire from ANY panel and inside text fields.
+  //
+  // The play/prefab/run-mode guards deliberately live INSIDE run(), not in a when().
+  // A false when() YIELDS the chord (no preventDefault → the Electron menu accelerator
+  // fires instead, per plan A.8), which would swallow the explanatory toast the user
+  // needs. These commands always CLAIM their chord and then explain themselves.
   useEffect(() => {
-    function onKeyDown(e: KeyboardEvent) {
-      if ((e.metaKey || e.ctrlKey) && e.key === 's') {
-        e.preventDefault();
-        // Saving is disabled unless fully STOPPED — while playing/previewing/scrubbing the live
-        // world holds mutated/temporary state (a preview pose, a control-spawned prefab). Persisting
-        // it would bake preview state into the scene. Stop/exit preview first to save authored data.
-        // (saveScene() also refuses on its own — this is the friendly early message; see Phase 2.)
-        if (!canEditMode()) {
-          const m = getRunMode();
-          const msg = m === 'scrub' || m === 'preview'
-            ? `Exit timeline ${m} to save — Cmd+S is disabled while previewing (poses revert on exit).`
-            : 'Stop the game to save — Cmd+S is disabled during Play (live changes revert on Stop).';
-          console.warn(`[Editor] ${msg}`);
-          useEditorStore.getState().showToast(msg, 'warn');
-          return;
-        }
-        if (isEditingPrefab()) { savePrefabEdit(); useEditorStore.getState().showToast('Prefab saved', 'success'); }
-        // Report what actually happened. This showed a green "Scene saved" unconditionally —
-        // not even awaiting saveAll — so a Save-As CANCEL or a failed write (project moved,
-        // disk full, permissions) told the HUMAN their work was safe when it was not. (C7)
-        else {
-          void saveAll().then((r) => {
-            const t = useEditorStore.getState().showToast;
-            if (r.saved) t('Scene saved', 'success');
-            else if (r.reason === 'cancelled') t('Save cancelled — nothing written', 'info');
-            else t(`Save FAILED (${r.reason}) — nothing written to disk`, 'warn');
-          });
-        }
-      }
-      if ((e.metaKey || e.ctrlKey) && (e.key === 'p' || e.key === 'P')) {
-        // Cmd/Ctrl+P toggles the GameView between Play and Pause. A window-level DOM
-        // handler + modifier chord: it fires regardless of which panel has focus AND
-        // while the game is running (the game samples plain keys, so it ignores a
-        // meta-chord — no conflict, no double-handling). Reads the LIVE play state:
-        // Stopped → enter Play (snapshots the authored world), Playing → Pause,
-        // Paused → resume — via the same enterPlay/pausePlay the toolbar buttons use.
-        e.preventDefault();
-        if (getPlayState() === 'playing') pausePlay();
-        else void enterPlay();
-        return;
-      }
-      if ((e.metaKey || e.ctrlKey) && e.key === 'z') {
-        e.preventDefault();
-        // Undo/redo edit the AUTHORED scene; during Play/Pause the live world is a
-        // throwaway snapshot that reverts on Stop, so undoing then would rewrite
-        // history against temporary state. Disabled until Stopped — same rule as
-        // Cmd+S above.
-        if (getPlayState() !== 'stopped') {
-          useEditorStore.getState().showToast('Stop the game to undo — disabled during Play.', 'warn');
-          return;
-        }
-        if (e.shiftKey) redo();
-        else undo();
-      }
-    }
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
+    const offs = [
+      register({
+        id: 'app.saveAll',
+        keys: 'mod+s',
+        scope: 'app-chord',
+        menu: { path: 'File/Save All' },
+        run: () => {
+          // Saving is disabled unless fully STOPPED — while playing/previewing/scrubbing the live
+          // world holds mutated/temporary state (a preview pose, a control-spawned prefab). Persisting
+          // it would bake preview state into the scene. Stop/exit preview first to save authored data.
+          // (saveScene() also refuses on its own — this is the friendly early message; see Phase 2.)
+          if (!canEditMode()) {
+            const m = getRunMode();
+            // Name the panel that actually owns the mode: BOTH the Timeline and the Animation panel
+            // drive it, and a hardcoded "timeline" sent Animation users hunting for a control in the
+            // wrong window (which is also why the Animation panel now has its own ⏹ Exit Preview).
+            const who = getModeOwner() === 'animation' ? 'Animation' : 'Timeline';
+            const msg = m === 'scrub' || m === 'preview'
+              ? `Exit ${m} to save — press ⏹ Exit Preview in the ${who} panel (poses revert on exit).`
+              : 'Stop the game to save — Cmd+S is disabled during Play (live changes revert on Stop).';
+            console.warn(`[Editor] ${msg}`);
+            useEditorStore.getState().showToast(msg, 'warn');
+            return;
+          }
+          if (isEditingPrefab()) { savePrefabEdit(); useEditorStore.getState().showToast('Prefab saved', 'success'); }
+          // Report what actually happened. This showed a green "Scene saved" unconditionally —
+          // not even awaiting saveAll — so a Save-As CANCEL or a failed write (project moved,
+          // disk full, permissions) told the HUMAN their work was safe when it was not. (C7)
+          else {
+            void saveAll().then((r) => {
+              const t = useEditorStore.getState().showToast;
+              if (r.saved) t('Scene saved', 'success');
+              else if (r.reason === 'cancelled') t('Save cancelled — nothing written', 'info');
+              else t(`Save FAILED (${r.reason}) — nothing written to disk`, 'warn');
+            });
+          }
+        },
+      }),
+      register({
+        id: 'app.playPause',
+        keys: 'mod+p',
+        scope: 'app-chord',
+        run: () => {
+          // Toggles the GameView between Play and Pause. app-chord so it fires regardless of
+          // which panel has focus AND while the game is running (the game samples plain keys,
+          // so it ignores a meta-chord — no conflict, no double-handling). Reads the LIVE play
+          // state: Stopped → enter Play (snapshots the authored world), Playing → Pause,
+          // Paused → resume — via the same enterPlay/pausePlay the toolbar buttons use.
+          if (getPlayState() === 'playing') pausePlay();
+          else void enterPlay();
+        },
+      }),
+      // Undo/redo edit the AUTHORED scene; during Play/Pause the live world is a throwaway
+      // snapshot that reverts on Stop, so undoing then would rewrite history against temporary
+      // state. Disabled until Stopped — same rule as Save above.
+      register({
+        id: 'app.undo',
+        keys: 'mod+z',
+        scope: 'app-chord',
+        menu: { path: 'Edit/Undo' },
+        run: () => {
+          if (getPlayState() !== 'stopped') {
+            useEditorStore.getState().showToast('Stop the game to undo — disabled during Play.', 'warn');
+            return;
+          }
+          void undo();
+        },
+      }),
+      register({
+        id: 'app.redo',
+        keys: 'mod+shift+z',
+        scope: 'app-chord',
+        menu: { path: 'Edit/Redo' },
+        run: () => {
+          if (getPlayState() !== 'stopped') {
+            useEditorStore.getState().showToast('Stop the game to undo — disabled during Play.', 'warn');
+            return;
+          }
+          void redo();
+        },
+      }),
+    ];
+    const offDispatch = installKeymapDispatcher();
+
+    // Focus scoping for the RUNNING GAME (plan P5.1). While an editor panel other than
+    // the GameView owns the keyboard, input must not reach the game — otherwise typing
+    // WASD in the Hierarchy latches the character's movement keys, and a gamepad drives
+    // the game while you edit the Inspector (gamepadSource polls with no guard at all).
+    //
+    // The policy lives HERE, in the editor. The mechanism lives in the runtime's source
+    // registry, because keyboardSource ships inside every game and must never know what
+    // a "panel" is. A shipped game never installs a gate.
+    //
+    // null focus (nothing engaged yet) deliberately does NOT suppress: pressing Play and
+    // immediately using WASD has to work without first clicking the GameView.
+    setInputGate(() => {
+      const p = useEditorStore.getState().focusedPanel;
+      return p !== null && p !== 'game';
+    });
+
+    return () => {
+      setInputGate(null);
+      offDispatch();
+      for (const off of offs) off();
+    };
+    // See input/hmrEpoch.ts — 0 in production, so this stays a mount-once effect there.
+  }, [hmrEpoch]);
 
   // Auto-save layout on changes (debounced)
   const saveTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
-  const onModelChange = useCallback(() => {
+  const onModelChange = useCallback((model: Model, action?: { type: string; data?: Record<string, unknown> }) => {
     // Refresh the Window menu's visibility checkmarks immediately (a panel was
     // closed/added/moved); the actual save stays debounced below.
     setLayoutVersion((v) => v + 1);
+
+    // ── Focus follows tab selection (focus-scope refactor P3.0) ──
+    // FlexLayout's tab BUTTONS live outside PanelFocusHost, so clicking a tab to bring a
+    // panel forward would otherwise leave focus wherever it was — and once keys are
+    // scoped, that reads as "the editor ignored me". Driven off the model ACTION rather
+    // than the accidental behaviour observed in P2 (where a re-render during pointerdown
+    // let the compat mousedown hit-test into the newly-mounted panel — a race, not a rule).
+    if (action?.type === 'FlexLayout_SelectTab') {
+      const tabId = action.data?.tabNode as string | undefined;
+      const node = tabId ? model.getNodeById(tabId) : undefined;
+      const component = node instanceof TabNode ? node.getComponent() : undefined;
+      if (component) useEditorStore.getState().setFocusedPanel(component);
+    }
+
+    // ── Clear focus when the focused panel goes away ──
+    // Otherwise focusedPanel names a panel that no longer exists. It degrades safely
+    // (that panel's bindings unregistered on unmount, so resolve() yields), but the
+    // state would be a lie — and get_editor_state reports it to agents as truth.
+    const focused = useEditorStore.getState().focusedPanel;
+    if (focused) {
+      let stillOpen = false;
+      model.visitNodes((n) => {
+        if (n instanceof TabNode && n.getComponent() === focused) stillOpen = true;
+      });
+      if (!stillOpen) useEditorStore.getState().setFocusedPanel(null);
+    }
+
     clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
       const m = modelRef.current;
@@ -660,7 +749,11 @@ export default function EditorApp() {
     const label = node.getName();
     // Console reads/writes its level filter from the node config (persisted in layout).
     if (component === 'console') {
-      return <PanelErrorBoundary label={label}><Console node={node} /></PanelErrorBoundary>;
+      return (
+        <PanelFocusHost id={component}>
+          <PanelErrorBoundary label={label}><Console node={node} /></PanelErrorBoundary>
+        </PanelFocusHost>
+      );
     }
     // Resolve custom (game-registered) panels LIVE, not just from the PANELS snapshot:
     // PANELS is captured at module-eval, which can race ahead of the async editorPanels()
@@ -668,9 +761,12 @@ export default function EditorApp() {
     const Panel = component
       ? (PANELS[component] ?? getCustomPanels().find((p) => p.id === component)?.component ?? null)
       : null;
-    return Panel
-      ? <PanelErrorBoundary label={label}><Panel /></PanelErrorBoundary>
-      : <div>Unknown panel: {component}</div>;
+    if (!Panel) return <div>Unknown panel: {component}</div>;
+    return (
+      <PanelFocusHost id={component!}>
+        <PanelErrorBoundary label={label}><Panel /></PanelErrorBoundary>
+      </PanelFocusHost>
+    );
   }, []);
 
   const model = modelRef.current;

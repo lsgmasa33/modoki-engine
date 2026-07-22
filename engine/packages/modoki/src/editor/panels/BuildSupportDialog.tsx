@@ -302,10 +302,10 @@ export default function BuildSupportDialog() {
         </div>
         {data?.toolchainDir && (
           <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 12, color: '#9a9ac0', fontSize: 11, cursor: 'pointer' }}
-            title="Off (default): use only the SDKs the editor installs here, so builds don't depend on what's on your machine. On: also use Java/Android SDKs already installed on the system.">
+            title="Off (default): build ONLY with the tools the editor installs here — a tool already on your machine (PATH, JAVA_HOME, ANDROID_HOME, Android Studio's SDK) is ignored, so builds don't depend on what happens to be installed. On: fall back to those system installs when the editor doesn't have its own. Xcode is always taken from the system (it can't be bundled).">
             <input type="checkbox" checked={!!data.allowSystemToolchain} onChange={(e) => setSystemToolchain(e.target.checked)} />
-            Use system-installed SDKs when available
-            <span style={{ color: '#666' }}>— off = use the editor&apos;s own installs only</span>
+            Use system-installed tools when available
+            <span style={{ color: '#666' }}>— off = the editor&apos;s own installs only</span>
           </label>
         )}
 

@@ -12,13 +12,8 @@ set -uo pipefail
 # Repo root (engine/scripts → two up): node_modules/.bin/vite lives there.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-pids=$(pgrep -f "${ROOT}/node_modules/.bin/vite" || true)
-if [ -n "${pids}" ]; then
-  echo "Stopping this repo's dev server: ${pids}"
-  # shellcheck disable=SC2086
-  kill ${pids} 2>/dev/null || true   # SIGTERM (graceful)
-  sleep 1
-  # shellcheck disable=SC2086
-  kill -9 ${pids} 2>/dev/null || true # SIGKILL any straggler
-fi
-echo "Done."
+# The lookup + kill live in Node so this works on every platform. `pgrep` does not exist
+# in Git Bash (this script printed "Done." and killed nothing on Windows), and the old
+# forward-slash pattern could not have matched the real Windows command line
+# (`...\node_modules\.bin\\..\vite\bin\vite.js`) even where pgrep is present.
+node "${ROOT}/engine/scripts/stopDevServer.mjs" "${ROOT}"

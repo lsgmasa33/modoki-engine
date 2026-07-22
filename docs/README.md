@@ -48,6 +48,8 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 | Doc | What it is |
 |---|---|
 | [editor.md](./editor.md) | The Unity-like Electron visual editor — shell, panels, SceneView modes, GameView, ECS-as-truth, undo/redo |
+| [editor-input.md](./editor-input.md) | Editor keyboard input — the focus-scoped keymap registry, the five scope tiers, the `preventDefault` claim/yield contract that arbitrates with the Electron menu, and the runtime input gate |
+| [editor-hmr.md](./editor-hmr.md) | Editor hot reload — what Fast Refreshes, what force-reloads (game code, the input registries), why `[]`-deps effects never re-run, and how to tell a stale editor from a working one |
 | [debug-menu.md](./debug-menu.md) | The extensible in-game debug menu (F12 / 3-finger tap) — built-in tabs, floating stat widgets, registration API |
 | [asset-inspector-plan.md](./asset-inspector-plan.md) | The asset-Inspector overhaul — previews, editor-launch buttons, converter params, HDR conversion (mostly landed) |
 
@@ -78,8 +80,13 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 | Doc | What it is |
 |---|---|
 | [editor-shipping-plan.md](./plans/editor-shipping-plan.md) | Ship the editor as a consumer DMG/Windows installer — keep bundled Vite, end users build iOS+Android via a Unity-Hub-style Build Support dialog, dev/prod toolchain parity, phased roadmap |
-| [editor-toolchain-layer-plan.md](./plans/editor-toolchain-layer-plan.md) | Tracker — the `engine/toolchain/` resolution layer (Phases A–E LANDED; the shipped reference is [editor-toolchain.md](../editor-toolchain.md)). Remaining: Windows port + clean-machine DMG native-build validation |
+| [engine-oss-public-repo.md](./plans/engine-oss-public-repo.md) | Plan for the public Apache-2.0 snapshot mirror of the engine — repo layout, CLA ruleset, signed mac/Windows releases, the publish script |
+| [modoki-mcp-tools-windows-test.md](./plans/modoki-mcp-tools-windows-test.md) | Test plan validating the whole `modoki` MCP surface (Percept, Enact, editor-control/mutate/render) against a live editor on **Windows** |
+| [editor-toolchain-layer-plan.md](./plans/editor-toolchain-layer-plan.md) | Tracker — the `engine/toolchain/` resolution layer (Phases A–E LANDED; the shipped reference is [editor-toolchain.md](./editor-toolchain.md)). Remaining: Windows port + clean-machine DMG native-build validation |
 | [2d-particles-plan.md](./plans/2d-particles-plan.md) | Phased plan for a PixiJS 2D particle backend sharing the 3D particle schema and editor |
+| [engine-oss-public-repo.md](./plans/engine-oss-public-repo.md) | Publish the engine + editor as an Apache-2.0 public repo (`modoki-engine`) — curated one-way snapshots, the blocking secret/brand safety scan, Harmony CLA, public release CI |
+| [public-demos-plan.md](./plans/public-demos-plan.md) | Curated public demo projects in a new `demos/` root (CC0 assets, web-only, snapshot-published per demo) + the Windows conformance sweep over every existing project |
+| [modoki-mcp-tools-windows-test.md](./plans/modoki-mcp-tools-windows-test.md) | Windows validation of the `modoki` MCP surface (Percept/Enact/mutate round-trip) — full pass recorded, plus the two Windows spawn/WebGPU gotchas |
 | [debug-menu-plan.md](./debug-menu-plan.md) | Design/tracker for the runtime-only in-game debug menu (all phases complete) |
 | [cloud-teardown-and-migration-plan.md](./plans/cloud-teardown-and-migration-plan.md) | Plan to cancel the cloud editor, salvage its good commits to `main`, and tear down GCP |
 | [modoki-package-manager.md](./modoki-package-manager.md) | Proposal for a Unity-UPM-style editor package manager to unbundle game deps and shrink the signed app |

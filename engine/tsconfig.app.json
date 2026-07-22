@@ -24,5 +24,6 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true
   },
-  "include": ["app"]
+  "//": "KEEP IN SYNC with PROJECT_ROOT_DIRS in engine/scripts/projectRoots.mjs — static config can't import it. Missing roots glob to empty, which is how the public OSS repo typechecks with neither present.",
+  "include": ["app", "../demos"]
 }

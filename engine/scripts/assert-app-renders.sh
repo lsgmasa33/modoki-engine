@@ -27,7 +27,8 @@ PORT=5179
 pkill -f "$(basename "$APP")/Contents/MacOS" 2>/dev/null || true
 # The packaged app relocates Vite's dep cache to userData; clear it so this run re-optimizes
 # against the shipped config (a stale cache could mask or fake the resolution result).
-rm -rf "$HOME/Library/Application Support/modoki-app/vite-cache" 2>/dev/null || true
+# userData is keyed by Electron productName ("Modoki Editor"), NOT the package name.
+rm -rf "$HOME/Library/Application Support/Modoki Editor/vite-cache" 2>/dev/null || true
 sleep 0.5
 
 echo "[render] launching $(basename "$APP") headless (project: $PROJECT)"
@@ -47,7 +48,14 @@ fail=0
 if [ "${entities:-0}" -le 0 ] 2>/dev/null; then echo "[render] FAIL: renderer never answered (entityCount=$entities)"; tail -20 "$APPLOG"; fail=1
 else echo "[render] ok: renderer mounted, scene loaded (entityCount=$entities)"; fi
 
-VITE_ERR=$(grep -iE "Failed to resolve import|Internal server error|Pre-transform error|Cannot find module" "$VITELOG" 2>/dev/null | sort -u)
+# Exclude Vite's self-healing dep-optimizer reload: when the optimizer re-bundles mid-load
+# (e.g. @modoki/engine's Canvas2DMount chunk re-hashes), an in-flight request for the old
+# chunk logs "Pre-transform error: ... which is in the optimize deps directory" and Vite then
+# forces a full page reload — transient, and the renderer still mounts (entityCount proves it).
+# The genuine packaging bug this gate catches ("Failed to resolve import"/"Cannot find module")
+# is NOT self-healing and additionally leaves entityCount=0, so this exclusion keeps it intact.
+VITE_ERR=$(grep -iE "Failed to resolve import|Internal server error|Pre-transform error|Cannot find module" "$VITELOG" 2>/dev/null \
+  | grep -viE "which is in the optimize deps directory" | sort -u)
 if [ -n "$VITE_ERR" ]; then echo "[render] FAIL: Vite resolve/transform errors:"; echo "$VITE_ERR" | sed 's/^/    /' | head -10; fail=1
 else echo "[render] ok: no Vite resolve/transform errors"; fi
 

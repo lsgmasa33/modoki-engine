@@ -31,7 +31,7 @@ export interface InputOps {
   drag(from: { x: number; y: number }, to: { x: number; y: number }, opts?: { steps?: number; button?: MouseButton; modifiers?: InputModifier[] }): Promise<void>;
   hover(x: number, y: number, modifiers?: InputModifier[]): Promise<void>;
   scroll(x: number, y: number, deltaX: number, deltaY: number): Promise<void>;
-  pressKey(key: string, modifiers?: InputModifier[]): Promise<{ activeElement: string | null; editableFocused: boolean }>;
+  pressKey(key: string, modifiers?: InputModifier[]): Promise<{ activeElement: string | null; gameSwallows: boolean }>;
   typeText(text: string, opts?: { clearFirst?: boolean; submitKey?: string }): Promise<{ typed: number; editable: boolean; activeElement: string | null }>;
   focusElement(selector?: string): Promise<{ view: boolean; focused: string | null; blurred: string | null; ok: boolean }>;
 }
@@ -94,8 +94,42 @@ function provenance(p: ResolvedPoint): Record<string, unknown> {
 export function createInputRoutes(deps: InputRouteDeps) {
   const { ops, requestRenderer } = deps;
 
-  return async function inputRoutes({ method, urlPath, body }: HostRequest): Promise<BackendResult | null> {
+  /** Attribute everything this dispatch causes to the AGENT.
+   *
+   *  Trusted input is indistinguishable from a human's by construction, so the renderer
+   *  cannot infer provenance — the injector has to declare it. Without this, every agent
+   *  tap/keypress/drag journals as `source:'human'` (measured: modoki_tap on a Hierarchy
+   *  row produced !focus + !select tagged human, while modoki_gizmo — a renderer op, and
+   *  therefore wrapped — correctly said agent).
+   *
+   *  ONE seam for every /api/input/* route: a per-route wrapper would be nine chances to
+   *  forget, and the next route added would silently reintroduce the bug.
+   *
+   *  Best-effort on purpose. A failed lease must never fail the INPUT — mis-attribution is
+   *  a reporting defect, a refused tap is a broken tool — so both calls swallow their
+   *  errors, and the lease's own deadline cleans up if the close never lands. */
+  async function withAgentAttribution<T>(fn: () => Promise<T>): Promise<T> {
+    let id: number | undefined;
+    try {
+      const r = (await requestRenderer('actor-lease', { open: true })) as { id?: number } | null;
+      id = r?.id;
+    } catch { /* no renderer / op unavailable — dispatch anyway, unattributed */ }
+    try {
+      return await fn();
+    } finally {
+      if (id !== undefined) {
+        try { await requestRenderer('actor-lease', { id }); } catch { /* deadline will expire it */ }
+      }
+    }
+  }
+
+  return async function inputRoutes(req: HostRequest): Promise<BackendResult | null> {
+    const { method, urlPath } = req;
     if (!urlPath.startsWith('/api/input/') || method !== 'POST') return null;
+    return withAgentAttribution(() => dispatchInput(req));
+  };
+
+  async function dispatchInput({ urlPath, body }: HostRequest): Promise<BackendResult | null> {
 
     if (urlPath === '/api/input/tap') {
       const { x, y, selector, button, clickCount, modifiers } = (body ?? {}) as PointSpec & { button?: MouseButton; clickCount?: number; modifiers?: InputModifier[] };
@@ -111,6 +145,16 @@ export function createInputRoutes(deps: InputRouteDeps) {
       if ('error' in rf) return bad(rf.error);
       const rt = await resolvePoint(to, 'to', requestRenderer);
       if ('error' in rt) return bad(rt.error);
+      // A zero-length drag is a CLICK, not a drag: mouseDown+mouseUp at one pixel is what Blink
+      // synthesizes a `click` from. Measured — `modoki_drag {from:{700,200},to:{700,200}}` over
+      // empty SceneView space returned ok:true and CLEARED the human's selection (entity 38 →
+      // null), because SceneView's select gesture only cancels past DESELECT_DRAG_PX. Reachable
+      // via `drag_handle {delta:{dx:0,dy:0}}` or two selectors resolving to the same centre.
+      // Refuse rather than dispatch: this route already reports off-screen/disabled handles as
+      // ok:false, and a click wearing a drag's name is the same class of false success.
+      if (rf.point.x === rt.point.x && rf.point.y === rt.point.y) {
+        return bad(`drag is a no-op: from and to resolved to the same point (${rf.point.x}, ${rf.point.y}). A press+release at one pixel is a CLICK, not a drag — use modoki_tap / modoki_tap_handle, or give "to" a different point (drag_handle takes a non-zero delta).`);
+      }
       await ops.drag({ x: rf.point.x, y: rf.point.y }, { x: rt.point.x, y: rt.point.y }, { steps, button, modifiers });
       return json({
         ok: true,
@@ -137,15 +181,34 @@ export function createInputRoutes(deps: InputRouteDeps) {
     }
 
     if (urlPath === '/api/input/key') {
-      const { key, modifiers } = (body ?? {}) as { key?: string; modifiers?: InputModifier[] };
+      const { key, modifiers, panel } = (body ?? {}) as { key?: string; modifiers?: InputModifier[]; panel?: string };
       if (typeof key !== 'string' || !key) return bad('key is a required string');
+      // Panel-scoped chords resolve against the FOCUSED panel, so a bare `w` sent with the
+      // wrong panel focused does nothing — silently, since the dispatcher yields rather than
+      // erroring. `panel` sets the keyboard scope first so the caller can steer a chord
+      // instead of tapping-and-hoping. Reported back so a mismatch is visible. (P7)
+      let focusedPanel: string | null | undefined;
+      if (typeof panel === 'string' && panel) {
+        const f = (await requestRenderer('set-focus-scope', { panel })) as { focusedPanel?: string | null } | null;
+        focusedPanel = f?.focusedPanel ?? null;
+        if (focusedPanel !== panel) {
+          return bad(`could not focus panel "${panel}" (scope is now ${JSON.stringify(focusedPanel)}) — is that panel open? Panel ids are the FlexLayout tab ids: scene, game, hierarchy, inspector, console, assets, animation-editor, timeline-editor, particle-editor, spriteanim-editor, skin-editor, ai.`);
+        }
+      }
       const r = await ops.pressKey(key, modifiers);
-      // The key IS dispatched (DOM hotkeys fire regardless), so this stays ok:true — but if an
-      // editable field is focused the GAME never samples it, so surface that so a silent
-      // no-reach is visible. (C7 re-audit.)
+      // The key IS dispatched (DOM hotkeys fire regardless), so this stays ok:true — but if a
+      // field is focused the GAME never samples it, so surface that so a silent no-reach is
+      // visible. (C7 re-audit.)
+      //
+      // WORDED CAREFULLY: this warning is about the GAME's sampler only. The editor's keymap
+      // uses a narrower predicate, so a panel/app shortcut can still fire while this warns —
+      // measured: `f` framed the selection with a readOnly input focused. The old wording
+      // ("will swallow this key") claimed more than the probe knows and read as a flat
+      // contradiction of what had just happened.
       return json({
         ok: true, pressed: { key, modifiers: modifiers ?? [] }, activeElement: r.activeElement,
-        ...(r.editableFocused ? { warning: `an editable field (${r.activeElement}) is focused and will swallow this key before the game's input sampler sees it — call modoki_focus (no selector) to blur it if you meant to drive the game.` } : {}),
+        ...(focusedPanel !== undefined ? { focusedPanel } : {}),
+        ...(r.gameSwallows ? { warning: `a form field (${r.activeElement}) has focus, so the RUNNING GAME's input sampler will ignore this key — call modoki_focus (no selector) to blur it if you meant to drive the game. Editor shortcuts are unaffected and may still fire.` } : {}),
       });
     }
 
@@ -156,14 +219,34 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // Nothing editable focused ⇒ the chars went nowhere. Report ok:false (isFailureBody surfaces
       // it) with WHERE focus actually is, instead of the old {ok:true, typed:N} into the void. (C7 re-audit.)
       if (!r.editable) {
-        return json({ ok: false, typed: 0, activeElement: r.activeElement, error: `no editable element is focused (active: ${r.activeElement ?? 'none'}), so nothing was typed — modoki_tap the target input first, then type.` });
+        // Two DIFFERENT failures, and telling them apart is the whole value of the message.
+        // "Nothing focused" → tap the input. "Something IS focused but rejects text" (a readOnly
+        // or disabled field, a checkbox, a <select>) → tapping again will not help, and the old
+        // one-size message told the caller to re-do the step they had just done correctly.
+        return json({
+          ok: false, typed: 0, activeElement: r.activeElement,
+          error: r.activeElement
+            ? `the focused element (${r.activeElement}) cannot receive typed text — it is readOnly/disabled, or not a text control (checkbox, select, button). Nothing was typed. If you meant a different field, aim at it explicitly; if the field is readOnly the value is not editable here.`
+            : 'no element is focused, so nothing was typed — modoki_tap the target input first, then type.',
+        });
       }
       return json({ ok: true, typed: r.typed, activeElement: r.activeElement });
     }
 
     if (urlPath === '/api/input/focus') {
-      const { selector } = (body ?? {}) as { selector?: string };
-      return json({ ...(await ops.focusElement(selector)) });
+      const { selector, panel } = (body ?? {}) as { selector?: string; panel?: string };
+      // `panel` sets the KEYBOARD SCOPE; `selector` sets DOM focus. Genuinely different:
+      // clicking a Hierarchy row moves the scope but leaves document.activeElement on
+      // <body>. Both may be given — the scope is set first. (P7)
+      let focusedPanel: string | null | undefined;
+      if (typeof panel === 'string' && panel) {
+        const f = (await requestRenderer('set-focus-scope', { panel })) as { focusedPanel?: string | null } | null;
+        focusedPanel = f?.focusedPanel ?? null;
+      }
+      const r = selector !== undefined || panel === undefined
+        ? await ops.focusElement(selector)
+        : { ok: true as const };
+      return json({ ...r, ...(focusedPanel !== undefined ? { focusedPanel } : {}) });
     }
 
     // ── Aimed input: resolve a handle's live CSS coords in the renderer, then issue the
@@ -213,11 +296,22 @@ export function createInputRoutes(deps: InputRouteDeps) {
       }
       if (!to && h.delta) to = { x: from.x + h.delta.dx, y: from.y + h.delta.dy };
       if (!to) return bad('provide to{x,y}, toId, or delta{dx,dy}');
+      // Same degenerate case as /api/input/drag, and this is the route that reaches it most
+      // easily: `delta:{dx:0,dy:0}` is a truthy object, and a `toId` handle can sit on top of
+      // `id`. mouseDown+mouseUp at one pixel is a click — refuse rather than dispatch one under
+      // the name "drag", in a route that already refuses off-screen and disabled handles.
+      if (from.x === to.x && from.y === to.y) {
+        return json({
+          ok: false,
+          error: `drag-handle is a no-op: the destination resolved to the same point as handle '${h.id}' (${from.x}, ${from.y}) — a press+release at one pixel is a CLICK, not a drag. Use /api/input/tap-handle, or pass a non-zero delta{dx,dy}.`,
+          handle: { id: h.id, x: from.x, y: from.y },
+        });
+      }
       await ops.drag({ x: from.x, y: from.y }, to, { steps: h.steps, button: h.button, modifiers: h.modifiers });
       const occluded = from.occludedBy ?? toOccluded;
       return json({ ok: true, draggedHandle: { id: h.id, from: { x: from.x, y: from.y }, to }, ...(occluded ? { occluded } : {}) });
     }
 
     return null;
-  };
+  }
 }

@@ -12,6 +12,7 @@ import { computeKeptAssets, formatBytes } from './asset-tree-shaker';
 import { assertNoConversionFallback, type ConversionFailure } from './asset-conversion-strict';
 import { loadProjectConfig, loadProjectUserConfig, validateBuildConfig } from './load-project-config';
 import { findGamesEntry } from './findGamesEntry';
+import { projectAssetRoots } from '../scripts/projectRoots.mjs';
 import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, type BuildTarget, type ToolId } from '../toolchain';
 import { registerReimportHandler, type ReimportContext } from './reimport-registry';
 import { textureReimportHandler } from './reimport-texture';
@@ -935,17 +936,9 @@ export function findAssetRoots(projectRoot: string): AssetRoot[] {
     roots.push({ urlPrefix: '/assets', absDir: flatAssets });
   }
 
-  // games/<id>/runtime/assets/ → /games/<id>/assets (multi-game projects)
-  const gamesDir = path.join(projectRoot, 'games');
-  if (fs.existsSync(gamesDir)) {
-    for (const entry of fs.readdirSync(gamesDir, { withFileTypes: true })) {
-      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
-      const gameAssets = path.join(gamesDir, entry.name, 'runtime/assets');
-      if (fs.existsSync(gameAssets)) {
-        roots.push({ urlPrefix: `/games/${entry.name}/assets`, absDir: gameAssets });
-      }
-    }
-  }
+  // <root>/<id>/runtime/assets/ → /<root>/<id>/assets, for every project root
+  // (games/ + demos/ — see engine/scripts/projectRoots.mjs). Multi-project repos only.
+  roots.push(...projectAssetRoots(projectRoot));
 
   return roots;
 }
@@ -1008,6 +1001,40 @@ export function isUnderAssetRoot(file: string, roots: readonly Pick<AssetRoot, '
   });
 }
 
+/** True when `file` is the open project's GAME CODE — the .ts/.tsx that Vite compiles
+ *  but the running editor never re-imports (see the handleHotUpdate comment below).
+ *
+ *  `gameCodeRoot` MUST be the dir holding the project's `game.{ts,tsx}` entry, NOT
+ *  `projectRoot`: in monorepo mode (no MODOKI_PROJECT) projectRoot is the REPO root, so
+ *  anchoring there would match `engine/**` and force-reload the editor on every engine
+ *  edit. findGamesEntry returns null at the repo root, which makes this inert there.
+ *
+ *  Containment is delegated to isUnderAssetRoot for its separator normalization — a
+ *  hand-rolled startsWith re-breaks Windows (see that function's comment). Asset-root
+ *  files are excluded a SECOND time here so a .ts ever authored under an asset root can
+ *  never reach the reload branch; the caller already returns early for them.
+ *
+ *  Pure — exported for unit testing. */
+export function isGameCodeFile(
+  file: string,
+  gameCodeRoot: string | null,
+  assetRoots: readonly Pick<AssetRoot, 'absDir'>[],
+): boolean {
+  if (!gameCodeRoot) return false;
+  if (!isUnderAssetRoot(file, [{ absDir: gameCodeRoot }])) return false;
+  if (isUnderAssetRoot(file, assetRoots)) return false;
+  const norm = file.replace(/\\/g, '/');
+  if (!/\.(ts|tsx)$/i.test(norm)) return false;
+  // A game's own unit tests don't run in the editor, so reloading on them is pure noise.
+  // Match against the path RELATIVE to the game root, never the absolute path: a project
+  // that merely LIVES under some ancestor named `test/` (e.g. ~/tests/mygame) would
+  // otherwise have game-code reload silently disabled for every file it contains.
+  const root = gameCodeRoot.replace(/\\/g, '/').replace(/\/+$/, '');
+  const rel = norm.slice(root.length + 1);
+  if (/(^|\/)tests?\//i.test(rel)) return false;
+  return true;
+}
+
 export function assetScannerPlugin(): Plugin {
   let projectRoot = '';
   // The EDITOR's own root (the Vite root is engine/, so its parent is the repo
@@ -1015,6 +1042,10 @@ export function assetScannerPlugin(): Plugin {
   // runtime deps (the Basis/KTX2 transcoder) to a FLAT project that has none.
   let editorRoot = '';
   let assetRoots: AssetRoot[] = [];
+  /** Dir holding the open project's `game.{ts,tsx}` entry, or null when there is no
+   *  project game (monorepo mode at the repo root). Anchors the game-code HMR rule —
+   *  see isGameCodeFile. */
+  let gameCodeRoot: string | null = null;
   /** Cached manifest, rebuilt on file changes. Avoids re-scanning on every fetch. */
   let cachedManifest: { version: 2; assets: AssetEntry[]; folders: string[] } = { version: 2, assets: [], folders: [] };
   /** Server reference so the watcher can push HMR updates. */
@@ -1081,8 +1112,34 @@ export function assetScannerPlugin(): Plugin {
     // returning [] tells Vite there are no modules to update. The manifest rebuild +
     // `asset-manifest-updated` broadcast (see configureServer's watcher) still run
     // independently, so the client's guid→path map stays current after moves/renames.
+    // GAME CODE gets a full reload, because nothing else can apply it. Vite DOES watch
+    // and recompile games/<id>/**.ts — measured: the update propagates up the static
+    // virtual:modoki-games chain to /app/App.tsx, which is a Fast Refresh boundary and
+    // SELF-ACCEPTS, so returning undefined here reloads nothing. Meanwhile the running
+    // editor got its game from a SEPARATE @vite-ignore dynamic import (app/projectGames.ts)
+    // whose URL never changes, so ESM keeps serving the cached instance forever: the new
+    // code is compiled, served, and never asked for. Re-registering in place can't fix it
+    // either — registerAll() is a one-shot, createEditor returns a component App.tsx
+    // already resolved through React.lazy, registerDebugCommand duplicates on re-run, and
+    // App.tsx's GAMES is a different (baked) module. Hence: reload, matching what Open
+    // Project already does (electron/main.ts reloadIgnoringCache).
+    //
+    // ORDER IS LOAD-BEARING: the asset-root check must stay FIRST so a scene Cmd+S can
+    // never reach the reload branch (games/<id>/runtime/assets/** sits INSIDE the runtime
+    // dir). Send + return [] rather than returning undefined, so we own the reload instead
+    // of also letting Vite propagate one.
     handleHotUpdate(ctx: { file: string }) {
       if (isUnderAssetRoot(ctx.file, assetRoots)) return [];
+      if (isGameCodeFile(ctx.file, gameCodeRoot, assetRoots)) {
+        if (viteServer) {
+          // The RENDERER decides whether to reload now or surface a banner — an
+          // unconditional reload would silently destroy unsaved scene edits (there is no
+          // beforeunload guard anywhere). See app/debug/hmrStaleness.ts.
+          try { viteServer.ws.send({ type: 'custom', event: 'modoki:game-code-changed', data: { file: ctx.file } }); }
+          catch { /* ws not ready */ }
+        }
+        return [];
+      }
       return undefined;
     },
 
@@ -1098,6 +1155,10 @@ export function assetScannerPlugin(): Plugin {
       // editor's repo root, regardless of which project is open.
       editorRoot = path.dirname(config.root);
       assetRoots = findAssetRoots(projectRoot);
+      // null at the repo root (no game.ts there), which makes the game-code reload rule
+      // inert in monorepo mode — see isGameCodeFile.
+      const gameEntry = findGamesEntry(projectRoot);
+      gameCodeRoot = gameEntry ? path.dirname(gameEntry.path) : null;
       registerReimportHandler('texture', textureReimportHandler);
       registerReimportHandler('model', modelReimportHandler);
       registerReimportHandler('atlas', atlasReimportHandler);

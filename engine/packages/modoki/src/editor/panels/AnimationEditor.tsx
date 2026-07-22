@@ -10,10 +10,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { backendFetch } from '../backend/editorBackend';
 import { useEditorStore } from '../store/editorStore';
+import { register } from '../input/keymap';
+import { useHmrEpoch } from '../input/hmrEpoch';
 import { getCurrentWorld } from '../../runtime/ecs/world';
-import { findEntity, getAllEntities, getStructureVersion, fireDirtyListeners } from '../../runtime/ecs/entityUtils';
+import { findEntity, getStructureVersion, fireDirtyListeners } from '../../runtime/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/ecs/traitRegistry';
-import { newGuid, registerAsset, getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
+import { newGuid, registerAsset, getGuidForPath } from '../../runtime/loaders/assetManifest';
 import {
   applyClipAtTime, advanceClipTime,
 } from '../../runtime/animation/sampleClip';
@@ -41,9 +43,15 @@ import TrackList from './animation/TrackList';
 import DopesheetView from './animation/DopesheetView';
 import CurvesView from './animation/CurvesView';
 import AddPropertyPicker, { type PropertyCandidate } from './animation/AddPropertyPicker';
+import BindAnimatorPicker from './animation/BindAnimatorPicker';
+import { bindClipToEntity } from '../animation/bindAnimator';
+import { resolveAnimatorRootForClip } from './openAssetInEditor';
 import { clampKeyTime, frameToTime, snapToFrame, timeToFrame, DEFAULT_VIEWPORT, type Viewport } from './animation/timelineMath';
 import { saveAssetDialog } from '../utils/saveDialog';
-import { enterScrubMode, exitPreviewMode } from '../scene/playMode';
+import { enterScrubMode, enterPreviewMode, exitPreviewMode, getModeOwner } from '../scene/playMode';
+import {
+  beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession,
+} from '../scene/timelinePreview';
 
 const COALESCE_MS = 500;
 const AUTOSAVE_MS = 400;
@@ -56,7 +64,32 @@ const PASTE_MIN_GAP_FRAMES = 5;
 const PASTE_GAP_MARGIN_FRAMES = 8;
 type ClipAction = UndoAction & { _after: AnimationClipDef };
 
+/** End the Animation panel's preview envelope: stop the preview loop, revert the authored world to
+ *  the session snapshot (so a scrub pose never reaches disk), rebind the Animator root — the reload
+ *  rebuilds the world with new entity ids — and return the run-mode to `stopped`, which is what
+ *  un-wedges Cmd+S (saving is refused for the whole envelope, by design).
+ *
+ *  OWNERSHIP-GUARDED: no-op unless THIS panel holds the mode. Both the session and the run-mode are
+ *  globals shared with the Timeline panel, and this runs from unmount / clip-switch effects that
+ *  also fire while the Timeline owns a live preview — ending its session there would revert its
+ *  world mid-run. (`exitPreviewMode` self-guards on owner; the session end does not, hence the
+ *  explicit check.) */
+function endAnimationPreview(restore: boolean): void {
+  if (getModeOwner() !== 'animation') return;
+  const store = useEditorStore.getState();
+  store.setPreviewPlaying(false);
+  if (hasTimelinePreviewSession()) {
+    const path = store.editingAnimationAsset?.path;
+    void endTimelinePreviewSession({
+      restore,
+      rebind: () => (path ? resolveAnimatorRootForClip(path, { fallbackToSelection: false }) : null),
+    }).then((newRoot) => { if (newRoot != null) useEditorStore.getState().setAnimatorRoot(newRoot); });
+  }
+  exitPreviewMode('animation');
+}
+
 export default function AnimationEditor() {
+  const hmrEpoch = useHmrEpoch();
   const asset = useEditorStore((s) => s.editingAnimationAsset);
   const nonce = useEditorStore((s) => s.animationEditNonce);
   const clip = useEditorStore((s) => s.editingAnimationClip);
@@ -81,6 +114,12 @@ export default function AnimationEditor() {
 
   const [saveMsg, setSaveMsg] = useState('');
   const [showPicker, setShowPicker] = useState(false);
+  const [showBindPicker, setShowBindPicker] = useState(false);
+  // True while THIS panel holds a scrub/preview envelope — drives the ⏹ Exit Preview button.
+  // Local (not derived from getRunMode()) because the run-mode is a plain module global with no
+  // subscription: reading it during render would leave the button stale until something else
+  // re-rendered the panel. We set it on our own transitions, which is exactly its meaning.
+  const [inPreview, setInPreview] = useState(false);
   const [selectedTrack, setSelectedTrack] = useState<number | null>(null);
   // Multi-track selection (indices). `selectedTrack` stays the "primary" (drives the
   // curve focus + single-key inspector); `selectedTracks` adds shift/cmd multi-pick
@@ -142,36 +181,40 @@ export default function AnimationEditor() {
   const lastTime = useRef(0);
   const lastAction = useRef<ClipAction | null>(null);
   const savedMarkRef = useRef<((c: AnimationClipDef) => void) | null>(null);
-  // Shortcuts act while the pointer is over the panel OR after you've clicked into it
-  // (until you click another panel) — so e.g. selecting a key then moving the mouse to
-  // the viewport doesn't make Cmd+Delete silently miss. `activeRef` is the last-clicked
-  // state; `rootRef` scopes the containment test.
-  const hoverRef = useRef(false);
-  const activeRef = useRef(false);
+  // Shortcut scoping is no longer hover/last-click based — the keymap resolves by the
+  // FOCUSED PANEL (focus-scope refactor P5), so hoverRef/activeRef are gone. Hover-gating
+  // meant a stray pointer move, or an agent's modoki_hover, silently changed which panel
+  // claimed the next key. `rootRef` remains for layout/containment use.
   const rootRef = useRef<HTMLDivElement>(null);
 
-  // ── Auto-bind the Animator root when none is set ──
-  // Binding is normally computed when the clip is opened (Assets double-click).
-  // But a clip can end up open with no root — opened before its Animator existed,
-  // or carried across a reload. Recover by searching the live world for the
-  // Animator whose `clip` references this open clip, so authoring "just works"
-  // without forcing a reopen. Re-runs on clip change and on edit nonce (covers
-  // adding the Animator after the clip was already open).
+  // ── Keep the Animator root honest ──
+  // Binding is normally computed when the clip is opened (Assets double-click). Two ways
+  // it goes wrong, both repaired here:
+  //
+  //  1. BOUND TO A NON-ANIMATOR. The root is just an entity pointer, so removing the
+  //     Animator (undo, Inspector) leaves the panel "bound" to an entity that no longer
+  //     has one — warning bar hidden, Bind button unreachable, and a live scrub preview
+  //     for a clip that would never play at runtime. Drop the root so the fix-it path is
+  //     reachable. Only when the entity RESOLVES and lacks the trait: an unresolvable id
+  //     is the transient mid-scene-swap state, and clearing there would flash the warning
+  //     on every hot-reload.
+  //  2. NOT BOUND AT ALL — opened before its Animator existed, or carried across a reload.
+  //     Recover by searching for the Animator whose clip BANK references this clip (shared
+  //     with the open path, so both agree on what "references this clip" means).
+  //
+  // Deps include `structureVersion` (bumped by any trait add/remove) so case 1 is noticed,
+  // and `nonce` so adding the Animator after the clip was already open rebinds it.
   useEffect(() => {
-    if (rootId != null || !asset) return;
-    const animMeta = getTraitByName('Animator');
-    if (!animMeta) return;
-    const guid = getGuidForPath(asset.path);
-    for (const e of getAllEntities()) {
-      if (!e.traits.includes('Animator')) continue;
-      const data = findEntity(e.id)?.get(animMeta.trait) as Record<string, unknown> | undefined;
-      const ref = data?.clip as string | undefined;
-      if (ref && (ref === guid || resolveRef(ref) === asset.path)) {
-        useEditorStore.getState().setAnimatorRoot(e.id);
-        break;
-      }
+    if (!asset) return;
+    if (rootId != null) {
+      const meta = getTraitByName('Animator');
+      const ent = findEntity(rootId);
+      if (meta && ent && !ent.has(meta.trait)) useEditorStore.getState().setAnimatorRoot(null);
+      return;
     }
-  }, [rootId, asset, nonce]);
+    const found = resolveAnimatorRootForClip(asset.path, { fallbackToSelection: false });
+    if (found != null) useEditorStore.getState().setAnimatorRoot(found);
+  }, [rootId, asset, nonce, structureVersion]);
 
   // ── Pose the bound entities at a given time (shared runtime sampler) ──
   const pose = useCallback((c: AnimationClipDef | null, t: number) => {
@@ -199,7 +242,8 @@ export default function AnimationEditor() {
 
   // ── Load the clip when the open target changes ──
   useEffect(() => {
-    exitPreviewMode('animation'); // opening/switching a clip returns the global run-mode to stopped (drops a prior scrub)
+    endAnimationPreview(true); // opening/switching a clip ends our envelope: revert the pose, back to stopped
+    setInPreview(false);
     lastAction.current = null;
     lastGroup.current = undefined;
     setSel(new Set());
@@ -273,7 +317,13 @@ export default function AnimationEditor() {
     useEditorStore.getState().setPlayhead(clamped);
     useEditorStore.getState().setPreviewPlaying(false);
     enterScrubMode('animation'); // clip scrub is a silent pose — carry the global run-mode (shared with the Timeline panel)
-    pose(cur, clamped);
+    setInPreview(true);
+    // MANDATORY session: snapshot the authored world BEFORE the first pose of the envelope, so
+    // "⏹ Exit Preview" can revert it. Without this the scrub wrote authored traits with nothing
+    // to revert to, which is why saves stayed refused with no way out (plan Phase 3 / M1).
+    // Concurrent begins during a drag collapse to one snapshot (see beginTimelinePreviewSession).
+    if (!hasTimelinePreviewSession()) void beginTimelinePreviewSession().then(() => pose(cur, clamped));
+    else pose(cur, clamped);
   }, [pose]);
 
   const stepFrame = useCallback((dir: 1 | -1) => {
@@ -292,8 +342,14 @@ export default function AnimationEditor() {
   }, [scrub]);
 
   // ── Preview playback loop ──
+  // Also inside the preview envelope: it poses authored traits every frame exactly like a scrub,
+  // so it opens the same session and carries the `preview` run-mode. Without the run-mode a save
+  // DURING playback passed the guard and baked whatever frame was on screen.
   useEffect(() => {
     if (!playing) return;
+    enterPreviewMode(true, 'animation');
+    setInPreview(true);
+    void beginTimelinePreviewSession(); // idempotent — a scrub before ▶ already holds the snapshot
     let raf = 0;
     let last = performance.now();
     const tick = () => {
@@ -311,9 +367,16 @@ export default function AnimationEditor() {
     return () => cancelAnimationFrame(raf);
   }, [playing, pose]);
 
-  // Panel gone → return the global run-mode to stopped (drops a scrub this panel left set). Empty
-  // deps → runs only on real unmount. No-op during Play (exitPreviewMode guards it).
-  useEffect(() => () => { exitPreviewMode('animation'); }, []);
+  // Panel gone → revert the previewed pose and return the global run-mode to stopped (drops a
+  // scrub this panel left set). Empty deps → runs only on real unmount. No-op during Play, and
+  // no-op when the Timeline owns the mode (both guarded inside endAnimationPreview).
+  useEffect(() => () => { endAnimationPreview(true); }, []);
+
+  // ── Exit the preview envelope (⏹ in the toolbar) ──
+  // The explicit way out: revert to the authored snapshot and return to `stopped` so Cmd+S works
+  // again. The Timeline panel has had this since Phase 2; without it here, any scrub wedged saves
+  // with no reachable exit but closing the panel.
+  const exitPreview = useCallback(() => { endAnimationPreview(true); setInPreview(false); }, []);
 
   // ── Record hook: a field edit keys the clip at the playhead ──
   useEffect(() => {
@@ -644,77 +707,75 @@ export default function AnimationEditor() {
     mutateTrack(selectedTrack, (tr) => ({ ...tr, keys: upsertKey(tr.keys, t, v) }), `setval:${selectedTrack}`);
   }, [mutateTrack, selectedTrack]);
 
-  // Track which panel was last clicked: this panel is "active" while a pointerdown lands
-  // inside it, and yields the moment one lands elsewhere (so other panels keep Delete/dup).
+  // ── Keyboard shortcuts, scoped to `animation-editor` (focus-scope refactor P5) ──
+  //
+  // Replaces a document keydown gated on hoverRef||activeRef plus a SECOND capture-phase
+  // listener that existed only to beat Hierarchy's and Assets' bubble handlers to Cmd+D.
+  // Both are gone: the registry resolves Cmd+D by focused panel, so there is nothing to
+  // race and no stopImmediatePropagation. Hover-gating is gone too — it meant a stray
+  // pointer move (or an agent's modoki_hover) silently changed who claimed the next key.
+  //
+  // Every binding is gated on a clip being open, and the context-dependent ones keep
+  // their YIELD semantics via when(): declining falls through to the next scope and
+  // ultimately leaves the chord unclaimed, so entity/track Delete and entity/asset Cmd+D
+  // still work exactly as before.
   useEffect(() => {
-    const onDown = (e: PointerEvent) => { activeRef.current = !!rootRef.current?.contains(e.target as Node); };
-    document.addEventListener('pointerdown', onDown, true);
-    return () => document.removeEventListener('pointerdown', onDown, true);
-  }, []);
-
-  // ── Keyboard shortcuts (scoped to the engaged panel; never steals input keys) ──
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (!hoverRef.current && !activeRef.current) return;
-      const el = e.target as HTMLElement | null;
-      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
-      if (!useEditorStore.getState().editingAnimationClip) return;
-      const mod = e.metaKey || e.ctrlKey;
-      if (mod && (e.key === 'c' || e.key === 'C')) { e.preventDefault(); copyKeys(); }
-      else if (mod && (e.key === 'v' || e.key === 'V')) { e.preventDefault(); pasteKeys(); }
-      else if (e.key === ',' && !e.altKey) { e.preventDefault(); stepFrame(-1); }
-      else if (e.key === '.' && !e.altKey) { e.preventDefault(); stepFrame(1); }
-      else if (e.key === ',' && e.altKey) { e.preventDefault(); jumpKey(-1); }
-      else if (e.key === '.' && e.altKey) { e.preventDefault(); jumpKey(1); }
-      // Arrow keys — context-dependent: nudge the selected keys by a frame when keys
-      // are selected, else scrub the playhead. Shift = ×10. Up/Down nudge the key
-      // value (curve editing).
-      else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
-        e.preventDefault();
-        const dir = e.key === 'ArrowRight' ? 1 : -1;
-        const step = e.shiftKey ? 10 : 1;
-        if (selectedKeysRef.current.size) nudgeSelectedKeys(dir * step);
-        else { const s = useEditorStore.getState(); const fr = s.editingAnimationClip?.frameRate ?? 60; const f = timeToFrame(s.playheadTime, fr) + dir * step; scrub(frameToTime(Math.max(0, f), fr)); }
-      } else if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && selectedKeysRef.current.size) {
-        e.preventDefault();
-        const dir = e.key === 'ArrowUp' ? 1 : -1;
-        nudgeValueSelected(dir * (e.shiftKey ? 10 : e.altKey ? 0.1 : 1));
-      } else if (e.code === 'Space') { e.preventDefault(); const s = useEditorStore.getState(); s.setPreviewPlaying(!s.isPreviewPlaying); }
-      else if (e.key === 'k' || e.key === 'K') { e.preventDefault(); addKeyAll(); }
-      else if ((e.key === 'b' || e.key === 'B') && selectedKeysRef.current.size) { e.preventDefault(); toggleBreakSelected(); }
-      else if ((e.key === 'Home' || e.key === '0')) { e.preventDefault(); setViewport(DEFAULT_VIEWPORT); }
-      else if ((e.key === 'Delete' || e.key === 'Backspace')) {
-        // Only claim Delete when we actually have something to delete — otherwise yield
-        // (don't preventDefault) so an entity/track Delete in another context still works.
-        if (selectedKeysRef.current.size) { e.preventDefault(); deleteSelectedKeys(); }
-        else if (selectedTracks.size || selectedTrack != null) { e.preventDefault(); removeSelectedTracks(); }
-      }
+    const hasClip = () => !!useEditorStore.getState().editingAnimationClip;
+    const hasKeys = () => hasClip() && selectedKeysRef.current.size > 0;
+    const S = 'animation-editor';
+    const nudgeOrScrub = (dir: number, step: number) => {
+      if (selectedKeysRef.current.size) { nudgeSelectedKeys(dir * step); return; }
+      const s = useEditorStore.getState();
+      const fr = s.editingAnimationClip?.frameRate ?? 60;
+      scrub(frameToTime(Math.max(0, timeToFrame(s.playheadTime, fr) + dir * step), fr));
     };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [stepFrame, jumpKey, addKeyAll, deleteSelectedKeys, scrub, copyKeys, pasteKeys, nudgeSelectedKeys, nudgeValueSelected, toggleBreakSelected, removeSelectedTracks, selectedTracks, selectedTrack]);
-
-  // Cmd/Ctrl+D → duplicate the selected keys. Cmd+D is ALSO owned by the Hierarchy
-  // (entity dup) + Assets (asset dup) as document keydowns, so we CANNOT make it an
-  // Electron menu accelerator (that would swallow it globally — the Cmd+C/V trap).
-  // Instead: a CAPTURE-phase listener that runs before their bubble-phase handlers and
-  // CLAIMS the key (preventDefault + stopImmediatePropagation) only when the pointer is
-  // over this panel AND keys are selected — otherwise it yields so entity/asset dup
-  // still works. Mirrors how each panel owns Cmd+D in its own context.
-  useEffect(() => {
-    const onKeyCapture = (e: KeyboardEvent) => {
-      if (!hoverRef.current && !activeRef.current) return;
-      if (!((e.metaKey || e.ctrlKey) && (e.key === 'd' || e.key === 'D'))) return;
-      const el = e.target as HTMLElement | null;
-      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
-      if (!useEditorStore.getState().editingAnimationClip || !selectedKeysRef.current.size) return; // yield → entity/asset dup
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      duplicateSelectedKeys();
-    };
-    document.addEventListener('keydown', onKeyCapture, true); // capture: beat the bubble-phase panel listeners
-    return () => document.removeEventListener('keydown', onKeyCapture, true);
-  }, [duplicateSelectedKeys]);
+    const offs = [
+      register({ id: 'anim.copyKeys', keys: 'mod+c', scope: S, when: hasClip, run: copyKeys }),
+      register({ id: 'anim.pasteKeys', keys: 'mod+v', scope: S, when: hasClip, run: pasteKeys }),
+      register({ id: 'anim.dupKeys', keys: 'mod+d', scope: S, when: hasKeys, run: duplicateSelectedKeys }),
+      register({ id: 'anim.stepBack', keys: ',', scope: S, when: hasClip, run: () => stepFrame(-1) }),
+      register({ id: 'anim.stepFwd', keys: '.', scope: S, when: hasClip, run: () => stepFrame(1) }),
+      register({ id: 'anim.jumpKeyBack', keys: 'alt+,', scope: S, when: hasClip, run: () => jumpKey(-1) }),
+      register({ id: 'anim.jumpKeyFwd', keys: 'alt+.', scope: S, when: hasClip, run: () => jumpKey(1) }),
+      // Arrows: nudge selected keys by a frame, else scrub the playhead. Shift = ×10.
+      // Each modifier variant is its own chord — matching on the full chord is what stops
+      // a bare arrow from also claiming Shift+arrow.
+      register({ id: 'anim.navLeft', keys: 'ArrowLeft', scope: S, when: hasClip, run: () => nudgeOrScrub(-1, 1) }),
+      register({ id: 'anim.navRight', keys: 'ArrowRight', scope: S, when: hasClip, run: () => nudgeOrScrub(1, 1) }),
+      register({ id: 'anim.navLeft10', keys: 'shift+ArrowLeft', scope: S, when: hasClip, run: () => nudgeOrScrub(-1, 10) }),
+      register({ id: 'anim.navRight10', keys: 'shift+ArrowRight', scope: S, when: hasClip, run: () => nudgeOrScrub(1, 10) }),
+      // Up/Down edit the selected keys' VALUE (curve editing) — only with a selection.
+      register({ id: 'anim.valUp', keys: 'ArrowUp', scope: S, when: hasKeys, run: () => nudgeValueSelected(1) }),
+      register({ id: 'anim.valDown', keys: 'ArrowDown', scope: S, when: hasKeys, run: () => nudgeValueSelected(-1) }),
+      register({ id: 'anim.valUp10', keys: 'shift+ArrowUp', scope: S, when: hasKeys, run: () => nudgeValueSelected(10) }),
+      register({ id: 'anim.valDown10', keys: 'shift+ArrowDown', scope: S, when: hasKeys, run: () => nudgeValueSelected(-10) }),
+      register({ id: 'anim.valUpFine', keys: 'alt+ArrowUp', scope: S, when: hasKeys, run: () => nudgeValueSelected(0.1) }),
+      register({ id: 'anim.valDownFine', keys: 'alt+ArrowDown', scope: S, when: hasKeys, run: () => nudgeValueSelected(-0.1) }),
+      register({
+        id: 'anim.togglePreview', keys: 'Space', scope: S, when: hasClip,
+        run: () => { const s = useEditorStore.getState(); s.setPreviewPlaying(!s.isPreviewPlaying); },
+      }),
+      register({ id: 'anim.addKeyAll', keys: 'k', scope: S, when: hasClip, run: addKeyAll }),
+      register({ id: 'anim.breakTangents', keys: 'b', scope: S, when: hasKeys, run: toggleBreakSelected }),
+      register({ id: 'anim.resetViewHome', keys: 'Home', scope: S, when: hasClip, run: () => setViewport(DEFAULT_VIEWPORT) }),
+      register({ id: 'anim.resetView0', keys: '0', scope: S, when: hasClip, run: () => setViewport(DEFAULT_VIEWPORT) }),
+      // Delete: keys first, then tracks. Declining when neither is selected yields the
+      // chord, exactly as the hand-rolled "don't preventDefault" branch did.
+      register({
+        id: 'anim.delete', keys: 'Delete', scope: S,
+        when: () => hasClip() && (selectedKeysRef.current.size > 0 || selectedTracks.size > 0 || selectedTrack != null),
+        run: () => { if (selectedKeysRef.current.size) deleteSelectedKeys(); else removeSelectedTracks(); },
+      }),
+      register({
+        id: 'anim.deleteBack', keys: 'Backspace', scope: S,
+        when: () => hasClip() && (selectedKeysRef.current.size > 0 || selectedTracks.size > 0 || selectedTrack != null),
+        run: () => { if (selectedKeysRef.current.size) deleteSelectedKeys(); else removeSelectedTracks(); },
+      }),
+    ];
+    return () => { for (const off of offs) off(); };
+  }, [stepFrame, jumpKey, addKeyAll, deleteSelectedKeys, scrub, copyKeys, pasteKeys, nudgeSelectedKeys,
+      nudgeValueSelected, toggleBreakSelected, removeSelectedTracks, duplicateSelectedKeys,
+      selectedTracks, selectedTrack, setViewport, hmrEpoch]);
 
   // ── Debounced auto-save ──
   const writeClip = useCallback((c: AnimationClipDef): Promise<boolean> => {
@@ -789,6 +850,22 @@ export default function AnimationEditor() {
     useEditorStore.getState().openAnimationEditor({ path, type: 'animation', name }, rootId);
   }, []);
 
+  // Bind the open clip to a picked entity (adds an Animator when it has none, and
+  // files the clip in that Animator's clip bank — see editor/animation/bindAnimator).
+  // The clip's own `id` is the authoritative GUID; the manifest lookup only covers a
+  // clip whose JSON predates ids (the loader mints one but the store copy is what's live).
+  const bindToEntity = useCallback((entityId: number) => {
+    setShowBindPicker(false);
+    const store = useEditorStore.getState();
+    const cur = store.editingAnimationClip;
+    const path = store.editingAnimationAsset?.path;
+    if (!path) return;
+    const guid = cur?.id || getGuidForPath(path) || '';
+    const name = (cur?.name || store.editingAnimationAsset?.name || 'clip').replace(/\.anim\.json$/i, '');
+    if (!bindClipToEntity(entityId, guid, name)) { setSaveMsg('⚠ Bind failed — see console'); return; }
+    setSaveMsg(`Bound to “${getAnimEntityIndex().byId.get(entityId)?.name || `#${entityId}`}”`);
+  }, []);
+
   if (!asset) {
     return (
       <div style={{ ...wrap, alignItems: 'center', justifyContent: 'center', gap: 12, flexDirection: 'column', color: '#556' }}>
@@ -799,7 +876,7 @@ export default function AnimationEditor() {
   }
 
   return (
-    <div ref={rootRef} style={wrap} onPointerEnter={() => { hoverRef.current = true; }} onPointerLeave={() => { hoverRef.current = false; }}>
+    <div ref={rootRef} style={wrap}>
       {clip && (
         <AnimationToolbar
           clipName={clip.name} onRename={rename}
@@ -817,12 +894,19 @@ export default function AnimationEditor() {
           onPasteKeys={pasteKeys} canPasteKeys={hasClipboard}
           onDuplicateKeys={duplicateSelectedKeys} canDuplicateKeys={selectedKeys.size > 0}
           onUndo={() => gUndo()} onRedo={() => gRedo()}
+          inPreview={inPreview} onExitPreview={exitPreview}
           saveMsg={saveMsg}
         />
       )}
       {rootId == null && (
-        <div style={{ padding: 6, fontSize: 11, color: '#e0a030', background: '#2a2418', borderBottom: '1px solid #333' }}>
-          No Animator bound. Select an entity with an Animator component and reopen this clip to author tracks.
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: 6, fontSize: 11, color: '#e0a030', background: '#2a2418', borderBottom: '1px solid #333' }}>
+          <span>No Animator bound — this clip isn’t assigned to an entity, so tracks can’t be authored.</span>
+          <button
+            onClick={() => setShowBindPicker(true)}
+            data-ui-id="animation.bindAnimator" data-ui-kind="button" data-ui-label="bind to entity"
+            title="Pick the entity this clip animates (an Animator component is added if it has none)"
+            style={{ background: '#3a3320', color: '#f0c060', border: '1px solid #6a5a2a', borderRadius: 3, padding: '2px 10px', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11, flexShrink: 0 }}
+          >Bind to Entity…</button>
         </div>
       )}
       {selectedOutsideRoot && (
@@ -899,6 +983,13 @@ export default function AnimationEditor() {
       )}
       {showPicker && rootId != null && (
         <AddPropertyPicker rootId={rootId} existing={existingKeys} onAdd={addProperties} onClose={() => setShowPicker(false)} />
+      )}
+      {showBindPicker && (
+        <BindAnimatorPicker
+          clipName={clip?.name || asset.name}
+          onBind={bindToEntity}
+          onClose={() => setShowBindPicker(false)}
+        />
       )}
     </div>
   );

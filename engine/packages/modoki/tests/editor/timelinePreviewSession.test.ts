@@ -6,7 +6,10 @@
  *   - end({restore}) reverts to that FIRST snapshot,
  *   - the scene-path guard refuses to clobber a DIFFERENT scene loaded since the snapshot,
  *   - end always clears the active flag + skeletal seeks + control spawns,
- *   - end returns the re-resolved Director root (entity ids change on the restore reload). */
+ *   - end returns the caller's re-resolved root (entity ids change on the restore reload).
+ *
+ *  The session now backs BOTH preview panels (Timeline + Animation), so the rebind is a callback
+ *  supplied by the caller rather than a timeline path. */
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 
@@ -26,9 +29,8 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
     loadScene: async (path: string, opts: { preloaded: unknown }) => { h.loadCalls.push({ path, preloaded: opts.preloaded }); },
   },
 }));
-vi.mock('../../src/editor/panels/openAssetInEditor', () => ({
-  resolveDirectorRootForTimeline: (_p: string) => h.resolvedRoot,
-}));
+// NOTE: no openAssetInEditor mock — the controller no longer resolves a root itself; each panel
+// passes its own `rebind`, which is what `h.resolvedRoot` stands in for below.
 
 import {
   beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession,
@@ -63,7 +65,7 @@ describe('timeline preview session controller', () => {
     h.scenePath = 'A.json';
     await beginTimelinePreviewSession();
     h.scenePath = 'B.json'; // user loaded a different scene mid-preview
-    const root = await endTimelinePreviewSession({ restore: true, timelinePath: 'tl' });
+    const root = await endTimelinePreviewSession({ restore: true, rebind: () => h.resolvedRoot });
     expect(h.loadCalls).toHaveLength(0);
     expect(root).toBeNull();
   });
@@ -80,11 +82,25 @@ describe('timeline preview session controller', () => {
     expect(hasControlSpawn('dir:trk:0')).toBe(false);
   });
 
-  it('returns the RE-RESOLVED Director root after a restore (entity ids change on the reload)', async () => {
+  it("returns the caller's RE-RESOLVED root after a restore (entity ids change on the reload)", async () => {
     h.scenePath = 'A.json';
     h.resolvedRoot = 123;
     await beginTimelinePreviewSession();
-    const root = await endTimelinePreviewSession({ restore: true, timelinePath: 'cutscene.timeline.json' });
+    const root = await endTimelinePreviewSession({ restore: true, rebind: () => h.resolvedRoot });
     expect(root).toBe(123);
+  });
+
+  // A scrub drag calls begin() once per pointermove and serializeScene() is async, so without an
+  // in-flight guard the SECOND call serialized an already-posed world and overwrote the authored
+  // snapshot with it — Exit would then "revert" to the pose. Concurrent begins must share one.
+  it('collapses CONCURRENT begins into one snapshot (a scrub drag fires begin per pointermove)', async () => {
+    await Promise.all([
+      beginTimelinePreviewSession(),
+      beginTimelinePreviewSession(),
+      beginTimelinePreviewSession(),
+    ]);
+    expect(h.snapshots).toHaveLength(1);
+    await endTimelinePreviewSession({ restore: true });
+    expect(h.loadCalls[0].preloaded).toBe(h.snapshots[0]); // the AUTHORED snapshot, not a re-serialize
   });
 });

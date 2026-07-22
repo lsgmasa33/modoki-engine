@@ -288,12 +288,17 @@ export default defineConfig(({ command }) => {
       // MCP server units (result formatting, identity) — `tools/` ships to the agent,
       // not to a game, but it is still CI-gated code.
       'tests/tools/**/*.test.ts',
-      // Game-owned tests (demo-game logic + @3d-test/app-services packages). Co-located
-      // with the game's code so their deps resolve from the game's own node_modules; the
-      // glob matches nothing when games/ is absent (the public repo has no games/).
+      // Project-owned tests (game/demo logic + @3d-test/app-services packages). Co-located
+      // with the project's code so their deps resolve from its own node_modules; each glob
+      // matches nothing when that root is absent (the public repo has neither).
+      // KEEP IN SYNC with PROJECT_ROOT_DIRS in engine/scripts/projectRoots.mjs — static
+      // config can't import it.
       '../games/*/tests/**/*.test.ts',
       '../games/*/tests/**/*.test.tsx',
       '../games/*/packages/*/**/*.test.ts',
+      '../demos/*/tests/**/*.test.ts',
+      '../demos/*/tests/**/*.test.tsx',
+      '../demos/*/packages/*/**/*.test.ts',
     ],
     exclude: [
       '**/node_modules/**',

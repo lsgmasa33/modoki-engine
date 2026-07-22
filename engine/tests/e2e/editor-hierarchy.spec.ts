@@ -77,7 +77,7 @@ test('Copy → Paste deep-copies the entity under the target, and undo reverts i
 
   await expect.poll(countCube).toBe(2);
 
-  await page.keyboard.press('Meta+z');
+  await page.keyboard.press('ControlOrMeta+z');
   await expect.poll(countCube).toBe(1);
 });
 

@@ -16,7 +16,7 @@ editor. Read `engine-concepts.md` first for the entity/component/system/manager 
 > the WASM world registry.
 
 Feature-complete + behind the full CI gate; every feature has a demo scene in
-`games/2d-physics-demo/` (playground, ccd-tunneling, compound-colliders, collider-mesh,
+`demos/2d-physics-demo/` (playground, ccd-tunneling, compound-colliders, collider-mesh,
 concave-shapes, platformer). **Deferred (optional, none blocking)** — pick up if/when needed:
 
 - **Character game-feel:** coyote-time, jump-buffering, air-jumps, per-player input routing
@@ -184,7 +184,7 @@ actions). On overlap begin/end the physics system dispatches that action, passin
 entity as `ctx.target` and `{ self, other, phase }` in `ctx.params`. Dispatch goes through the new
 **pipeline-safe `dispatchGameAction`** (never throws on a missing handler, unlike the
 event-handler-only `dispatchUIAction`, whose dev-throw would abort the frame — F10). This is the
-declarative sugar on top of C. Demonstrated in `games/2d-physics-demo` (the Sensor Zone tints
+declarative sugar on top of C. Demonstrated in `demos/2d-physics-demo` (the Sensor Zone tints
 green on enter, reverts on exit, and logs a `zone` journal event).
 
 ### The shared producer + the rich `@contact` event
@@ -262,7 +262,7 @@ powerful but painful to author by hand, so there's a Unity-style **named-layer**
   NxN checkbox grid (`PhysicsLayersEditor.tsx`, `'physics-layers'` settings field type). Persisted
   through the same `/api/project-settings` path; takes effect on reload.
 
-`games/2d-physics-demo` showcases it: `Ground` (floor/walls), `Default` (boxes/balls), `Ghost`
+`demos/2d-physics-demo` showcases it: `Ground` (floor/walls), `Default` (boxes/balls), `Ghost`
 (matrix `[3,7,2]`) — the Ghost ball falls **through** the Default box pile but lands **on** the
 Ground floor, while the boxes stack on each other.
 
@@ -332,9 +332,11 @@ driver tying motion state to a clip. `CharacterAnimator2D` (`runtime/traits/Char
 - **The "add it via a menu" story:** `CharacterAnimator2D` registers in the Inspector's **Add
   Component** menu (category *Animation*) alongside `SpriteAnimator` — so authoring an animated
   character is: add both components, set the clips' frame GUIDs, done.
-- **Demo asset:** `2d-physics-demo/…/sprites/boy.png` — a Freepik character sheet (bg removed,
-  walk/run poses re-packed into a uniform 6×2 grid, sliced via its `.meta.json`; attribution in
-  `2d-physics-demo/ATTRIBUTION.md`). The `platformer.json` Player uses it (idle = walk frame 6).
+- **Demo asset:** `2d-physics-demo/…/sprites/player.png` — a **CC0** character sheet
+  (bevouliin.com via OpenGameArt), cropped to alpha bounds and packed into a uniform 6×2 grid of
+  192×320 cells, sliced via its `.meta.json`; attribution in `2d-physics-demo/ATTRIBUTION.md`.
+  The `platformer.json` Player uses it: `idle` 2 frames, `walk` 6, `jump` 2 (`mode:"once"`, so it
+  holds the falling frame while airborne).
 
 ## Scene queries & runtime forces (both dimensions)
 
@@ -529,7 +531,7 @@ and WASM registry above are the SAME shared code, dimension-parameterized. What 
 | **4.3 — Collision-mesh authoring** | SceneView "collider edit mode" (⬟ Points toolbar toggle): draggable vertex handles for `polygon`/`polyline`/`concave` colliders — drag to move, double-click an edge to insert, Alt/Cmd-click a handle to delete; writes the `points` field (undoable). Pure logic in `runtime/scene/colliderPoints.ts`; world↔local + picking in `editor/panels/colliderEdit2D.ts`. | ✅ done | `tests/runtime/colliderPoints.test.ts` (parse/serialize/move/insert/remove/nearest-edge) + `tests/editor/colliderEdit2D.test.ts` (world↔local round-trip, pickVertex). Demo `2d-physics-demo/…/collider-mesh.json` (editable polygon ramp + polyline terrain). |
 | **4.4 — Convex decomposition** | New `concave` shape: `poly-decomp-es` decomposes the point list into convex pieces → multiple `convexHull` colliders on ONE body (so a DYNAMIC concave solid works; a lone hull would fill the concavity). `makeColliderDesc` now returns a desc ARRAY; `attachCollider` returns handle[]. Falls back to a single hull if the list isn't decomposable. Editable via ⬟ Points. | ✅ done | `tests/runtime/physics2DConcave.test.ts` — a U-cup catches a ball inside (y>0) where the same points as a `polygon` hull leave it on top (y<0); decomposition splits a U into >1 piece. Demo `2d-physics-demo/…/concave-shapes.json` (bowl collecting balls + a dynamic boomerang). |
 | **4.5 — Character controller** | `CharacterController2D` trait (kinematic body) driven inside `physics2DSystem` via Rapier's `KinematicCharacterController` (collide-and-slide, autostep, slope limits, snap-to-ground, grounded + velY readback). Passive window keys (`keyboardSource`) feed the `Input` resource via `inputSystem`; `characterInputSystem` bridges that resource's moveX/jump onto the trait each frame (sim-gated; harness-safe — reads trait data, not the DOM). | ✅ done | `tests/runtime/physics2DCharacter.test.ts` — walks + grounded, falls unsupported, blocked by a wall, auto-steps a ledge only when enabled (driven by trait fields). Demo `2d-physics-demo/…/platformer.json` (A/D move · Space jump · stairs · platform · wall). |
-| **4.6 — Character sprite animation** | `CharacterAnimator2D` trait + `characterAnimationSystem` (GAME priority) map `CharacterController2D` motion state → active `SpriteAnimator` clip (jump/walk/idle) and flip facing via `Renderable2D.flipX`. Reuses the existing flipbook stack (`SpriteAnimator` + grid slicing + `resolveSprite` sub-rects). Registered in the Inspector **Add Component** menu. | ✅ done | `tests/runtime/characterAnimation.test.ts` — clip selection (idle/walk/jump, threshold), facing flip + magnitude preserved, `flip:false` opt-out. Demo `2d-physics-demo/…/platformer.json` Player uses `sprites/boy.png` (Freepik, bg-removed 6×2 sheet). |
+| **4.6 — Character sprite animation** | `CharacterAnimator2D` trait + `characterAnimationSystem` (GAME priority) map `CharacterController2D` motion state → active `SpriteAnimator` clip (jump/walk/idle) and flip facing via `Renderable2D.flipX`. Reuses the existing flipbook stack (`SpriteAnimator` + grid slicing + `resolveSprite` sub-rects). Registered in the Inspector **Add Component** menu. | ✅ done | `tests/runtime/characterAnimation.test.ts` — clip selection (idle/walk/jump, threshold), facing flip + magnitude preserved, `flip:false` opt-out. Demo `2d-physics-demo/…/platformer.json` Player uses `sprites/player.png` (CC0, 6×2 sheet of 192×320 cells). |
 
 **Note on the CCD demo (4.1):** CCD-*off* tunneling is inherently framerate-dependent (a discrete
 step tunnels only when no sub-step sample lands inside the obstacle), so the demo drives the balls

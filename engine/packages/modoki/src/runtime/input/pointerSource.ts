@@ -98,6 +98,9 @@ export const pointerSource: InputSource = {
     reset(); active = false; attached = false;
   },
 
+  /** Drop latched pointer state without detaching — host input gate closing edge. */
+  reset(): void { reset(); },
+
   sample(out: InputFrame): void {
     // Authoritative: overwrite the pointer level state wholesale (no OR-merge —
     // there is one pointer). Edge (pressed/released) is derived by inputSystem.

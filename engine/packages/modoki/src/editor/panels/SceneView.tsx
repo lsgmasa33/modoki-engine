@@ -52,6 +52,9 @@ import { findCanvasAncestor } from '../../runtime/rendering/canvas2DRouting';
 import { computePaintOrder } from '../../runtime/rendering/paintOrder';
 import { UIRenderer } from '../../runtime/ui/UIRenderer';
 import { useEditorStore } from '../store/editorStore';
+import { register } from '../input/keymap';
+import { useHmrEpoch } from '../input/hmrEpoch';
+import { isTextEditable } from '../input/focusScope';
 import { loadScene } from '../scene/serialize';
 import { worldToLocalTransform } from '../scene/gizmoTransform';
 import { boneRelToProxyLocal, proxyLocalToBoneLocal } from '../scene/billboardBonePose';
@@ -374,6 +377,7 @@ function SceneBreadcrumb({ onExitPrefab }: { onExitPrefab: () => void }) {
 }
 
 export default function SceneView() {
+  const hmrEpoch = useHmrEpoch();
   // Mode lives in the editor store (init from localStorage there) so it's
   // agent-drivable (set-scene-view-mode) — the <select> below is native and can't
   // be operated by trusted input. The setter persists to localStorage + marks 2D dirty.
@@ -525,40 +529,55 @@ export default function SceneView() {
     return !!(c2d && entity.has(c2d.trait));
   })();
 
-  // Keyboard shortcuts (Unity convention: W=translate, E=rotate, R=scale, X=space)
+  // Keyboard shortcuts (Unity convention: W=translate, E=rotate, R=scale, X=space).
+  //
+  // Registered in the keymap under the `scene` scope (focus-scope refactor P5) — these
+  // were a bare window keydown with no panel gate at all, so a `c` typed anywhere
+  // outside an input toggled collider display and `w` moved the gizmo while you were
+  // working in the Skin editor. The registry's chord matching subsumes the old
+  // meta/ctrl/alt bail (it matches the FULL chord, so 'r' never matches Cmd+R) and the
+  // input-tag check (the dispatcher's text-field tier blocks panel scopes while typing).
+  //
+  // `f` is app-key, NOT scene-scoped: users press it right after clicking an entity in
+  // the Hierarchy, and editor-hierarchy.spec.ts:84 pins exactly that. It still yields
+  // when there's nothing to frame, so an unbound `f` reaches whatever else wants it.
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement) return;
-      // These are BARE-key tools (W/E/R/X/F/P/…). A Cmd/Ctrl/Alt combo is an app or
-      // OS accelerator (Cmd+R reload, Cmd+Shift+R force-reload, Cmd+W close, …) — let
-      // it fall through instead of matching 'r'→scale and preventDefault-ing reload.
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
-      const k = e.key.toLowerCase();
-      if (k === 'x') { e.preventDefault(); setGizmoSpace(gizmoSpace === 'world' ? 'local' : 'world'); return; }
-      if (k === 'f') {
-        // Frame the selected entity in the orbit camera (3D mode only).
-        if (mode === 'ui') return;
-        const sel = useEditorStore.getState().selectedEntityId;
-        if (sel === null) return;
-        e.preventDefault();
-        focusEntityInSceneView(sel);
-        return;
-      }
-      if (k === 'p') { e.preventDefault(); setParticlePreview(!useEditorStore.getState().particlePreview); return; }
-      if (k === 'g') { e.preventDefault(); setShowGrid((v) => !v); return; }
-      if (k === 'c') { e.preventDefault(); setShowColliders((v) => !v); return; }
-      if (k === 'home' || k === '0') {
-        e.preventDefault();
-        viewRef.current = { zoom: 1, panX: 0, panY: 0 };
-        updateViewTransform();
-        return;
-      }
-      const match = gizmoModes.find((m) => m.key === k);
-      if (match) { e.preventDefault(); setGizmoMode(match.value); }
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [setGizmoMode, setGizmoSpace, gizmoSpace, setParticlePreview, mode, updateViewTransform]);
+    const offs = [
+      register({
+        id: 'scene.gizmoSpace', keys: 'x', scope: 'scene',
+        run: () => setGizmoSpace(useEditorStore.getState().gizmoSpace === 'world' ? 'local' : 'world'),
+      }),
+      register({
+        id: 'scene.frameSelected', keys: 'f', scope: 'app-key',
+        // Frame the selected entity in the orbit camera (3D mode only). `when` yields
+        // rather than claiming-and-doing-nothing, so `f` stays available elsewhere.
+        when: () => mode !== 'ui' && useEditorStore.getState().selectedEntityId !== null,
+        run: () => {
+          const sel = useEditorStore.getState().selectedEntityId;
+          if (sel !== null) focusEntityInSceneView(sel);
+        },
+      }),
+      register({
+        id: 'scene.particlePreview', keys: 'p', scope: 'scene',
+        run: () => setParticlePreview(!useEditorStore.getState().particlePreview),
+      }),
+      register({ id: 'scene.toggleGrid', keys: 'g', scope: 'scene', run: () => setShowGrid((v) => !v) }),
+      register({ id: 'scene.toggleColliders', keys: 'c', scope: 'scene', run: () => setShowColliders((v) => !v) }),
+      register({
+        id: 'scene.resetView', keys: 'Home', scope: 'scene',
+        run: () => { viewRef.current = { zoom: 1, panX: 0, panY: 0 }; updateViewTransform(); },
+      }),
+      register({
+        id: 'scene.resetView0', keys: '0', scope: 'scene',
+        run: () => { viewRef.current = { zoom: 1, panX: 0, panY: 0 }; updateViewTransform(); },
+      }),
+      ...gizmoModes.map((m) => register({
+        id: `scene.gizmo.${m.value}`, keys: m.key, scope: 'scene',
+        run: () => setGizmoMode(m.value),
+      })),
+    ];
+    return () => { for (const off of offs) off(); };
+  }, [setGizmoMode, setGizmoSpace, setParticlePreview, mode, updateViewTransform, hmrEpoch]);
 
   const handleViewportContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -2204,8 +2223,25 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // F7: hold Shift → snap. TransformControls snaps whenever a snap value is set, so
     // toggle the snaps with the Shift key (translate 0.5 units, rotate 15°, scale 0.1) —
     // matching the 2D gizmo's DEFAULT_GIZMO_SNAP. Cleared on keyup so a normal drag is free.
+    // NOT a keymap binding, deliberately: this tracks a MODIFIER'S LEVEL (it needs keyup
+    // as much as keydown), whereas the registry dispatches discrete chords on keydown.
+    // Forcing it through the registry would mean inventing a "modifier held" concept for
+    // one consumer. It stays a listener — but it is now GUARDED.
+    //
+    // It previously had NO guard of any kind: it ran on every keystroke app-wide,
+    // including inside text fields, and was harmless only because the write happens to be
+    // idempotent. Scoped now to when the SceneView actually owns the keyboard, so typing a
+    // capital letter in the Inspector no longer reaches into three.js.
     const onSnapKey = (ev: KeyboardEvent) => {
-      const on = ev.shiftKey;
+      // Guard the SET path only — NEVER early-return, or the guard can strand snapping ON.
+      // Both keydown and keyup route here, so an early return on keyup latches the snaps:
+      // hold Shift in the SceneView, then Shift-click a Hierarchy row to range-select
+      // (focus flips on pointerdown-capture) and the release would never clear them.
+      // Folding the guard into the VALUE means any release, blur or focus change resolves
+      // to `false` and clears. (P8 review D2.)
+      const scoped = useEditorStore.getState().focusedPanel === 'scene'
+        && !isTextEditable(document.activeElement);
+      const on = ev.shiftKey && scoped;
       gizmo.setTranslationSnap(on ? DEFAULT_GIZMO_SNAP.translate! : null);
       gizmo.setRotationSnap(on ? DEFAULT_GIZMO_SNAP.rotateRad! : null);
       gizmo.setScaleSnap(on ? DEFAULT_GIZMO_SNAP.scale! : null);

@@ -8,11 +8,13 @@ import { Tooltip } from '../fields';
 /** A toolbar button with a custom hover tooltip. Native HTML `title` tooltips do
  *  NOT render in the Electron editor (confirmed: hovering >5s shows nothing), so —
  *  like the Inspector's `Tooltip` — we render our own fixed-position popover. */
-export function TipButton({ tip, onClick, disabled, style, children }: {
+export function TipButton({ tip, onClick, disabled, style, uiId, children }: {
   tip: string;
   onClick?: (e: React.MouseEvent) => void;
   disabled?: boolean;
   style?: React.CSSProperties;
+  /** Optional `data-ui-id` so Enact/MCP can aim at the button by selector. */
+  uiId?: string;
   children: React.ReactNode;
 }) {
   const [show, setShow] = useState(false);
@@ -24,6 +26,7 @@ export function TipButton({ tip, onClick, disabled, style, children }: {
     <button
       onClick={onClick}
       disabled={disabled}
+      data-ui-id={uiId}
       onMouseEnter={(e) => { const r = e.currentTarget.getBoundingClientRect(); setPos({ x: r.left, y: r.bottom + 4 }); clear(); timer.current = setTimeout(() => setShow(true), 450); }}
       onMouseLeave={() => { clear(); setShow(false); }}
       onMouseDown={() => { clear(); setShow(false); }}
@@ -69,6 +72,10 @@ export interface ToolbarProps {
   canDuplicateKeys: boolean;
   onUndo: () => void;
   onRedo: () => void;
+  /** True while this panel holds a scrub/preview envelope — shows ⏹ Exit Preview. */
+  inPreview: boolean;
+  /** Leave the envelope: revert the previewed pose and return to stopped (re-enables Cmd+S). */
+  onExitPreview: () => void;
   saveMsg: string;
 }
 
@@ -82,6 +89,14 @@ export default function AnimationToolbar(p: ToolbarProps) {
       <TipButton tip={p.playing ? 'Pause (Space)' : 'Play (Space)'} onClick={p.onTogglePlay} style={btn}>{p.playing ? '⏸' : '▶'}</TipButton>
       <TipButton tip="Next frame ( . )" onClick={p.onNextFrame} style={btn}>▶|</TipButton>
       <TipButton tip="Stop (return to start)" onClick={p.onStop} style={btn}>⟲</TipButton>
+      {p.inPreview && (
+        <TipButton
+          tip="Leave preview — reverts the previewed pose to the authored scene and re-enables saving (Cmd+S is disabled while previewing)"
+          onClick={p.onExitPreview}
+          uiId="animation.transport.exit"
+          style={{ ...btn, borderColor: '#e0a05b', color: '#e0a05b' }}
+        >⏹ Exit Preview</TipButton>
+      )}
       <FrameField frame={frame} onSet={(f) => p.onScrub(p.frameRate > 0 ? f / p.frameRate : 0)} />
       <span style={{ color: '#888', width: 56, textAlign: 'right' }}>{p.playhead.toFixed(2)}s</span>
 

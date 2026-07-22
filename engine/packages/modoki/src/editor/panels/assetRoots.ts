@@ -12,12 +12,13 @@
  *  game is opened standalone (the normal flat case) NOTHING matched — and Create
  *  Prefab / Import failed with "No writable asset root". This is the single source
  *  of truth that fixes that (guarded by assetRoots.test.ts). */
-export const ASSET_ROOT_RE = /^(\/(?:assets|modoki\/assets|games\/[^/]+\/assets))(?:\/|$)/;
+export const ASSET_ROOT_RE = /^(\/(?:assets|modoki\/assets|(?:games|demos)\/[^/]+\/assets))(?:\/|$)/;
 
 /** First (sorted) writable asset root among a set of asset URL paths, or null if
- *  none match. Sorting puts the game root ("/assets" or "/games/<id>/assets")
- *  ahead of the engine "/modoki/assets" built-ins ("/a"/"/g" < "/m"), so new
- *  prefabs and imports land in the game, never in the read-only engine assets. */
+ *  none match. Sorting puts the project root ("/assets", "/games/<id>/assets", or
+ *  "/demos/<id>/assets") ahead of the engine "/modoki/assets" built-ins
+ *  ("/a"/"/d"/"/g" all < "/m"), so new prefabs and imports land in the project,
+ *  never in the read-only engine assets. */
 export function firstAssetRoot(paths: Iterable<string>): string | null {
   const roots = new Set<string>();
   for (const p of paths) {

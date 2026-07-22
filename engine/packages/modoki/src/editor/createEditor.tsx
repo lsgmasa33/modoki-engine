@@ -1,3 +1,11 @@
+// HMR: `_customPanels`/`_gameView`/`_extraMenus`/`_projectSettings` below are written ONLY
+// by createEditor(), which app/editor/setup.ts calls once at bootstrap. A module swap
+// resets them to empty with nothing to repopulate them, and EditorApp reads
+// getGameViewComponent() at MODULE scope — so the Game panel silently falls back to a stub.
+// The returned component's identity also can't be swapped into the mounted tree (App.tsx
+// resolved it through React.lazy). Reload instead; see input/keymap.ts for the pattern.
+if (import.meta.hot) import.meta.hot.accept(() => { window.location.reload(); });
+
 /** createEditor — factory that returns a configured React editor component.
  *  Games call this with their config, postprocessors, traits, and custom panels. */
 
@@ -91,10 +99,33 @@ export async function loadFirstScene(
   candidates: string[],
   deps: { canonicalize: (p: string) => Promise<string>; load: (p: string) => Promise<boolean> },
 ): Promise<string | null> {
+  // A candidate that THROWS must not abort the fallback chain. `load` rejects (it
+  // does not merely return false) whenever the host serves something that isn't the
+  // scene JSON — most commonly the dev server's SPA index.html fallback, which makes
+  // JSON.parse throw `Unexpected token '<'`. That escaped this loop, so the very
+  // fallback the loop exists to provide never ran and editor boot died on the first
+  // bad candidate. Real case: a stale `/@fs/<abs>` last-scene pointing at a project
+  // on a DIFFERENT Windows drive — Vite's html-fallback middleware refuses such
+  // paths (vitejs/vite#12816, closed as not-planned), so it 404s to index.html while
+  // the project's own `/assets/...` candidate right behind it would have loaded.
+  const tryLoad = async (p: string): Promise<boolean> => {
+    try {
+      return await deps.load(p);
+    } catch (err) {
+      console.warn(`[Editor] Scene at ${p} failed to load, trying next fallback…`, err);
+      return false;
+    }
+  };
   for (const candidate of candidates) {
-    const canonical = await deps.canonicalize(candidate);
-    if (await deps.load(canonical)) return canonical;
-    if (canonical !== candidate && (await deps.load(candidate))) return candidate;
+    // Canonicalization is best-effort: fall back to the raw candidate if it throws.
+    let canonical = candidate;
+    try {
+      canonical = await deps.canonicalize(candidate);
+    } catch {
+      canonical = candidate;
+    }
+    if (await tryLoad(canonical)) return canonical;
+    if (canonical !== candidate && (await tryLoad(candidate))) return candidate;
     console.warn(`[Editor] Scene not found at ${candidate}, trying next fallback…`);
   }
   return null;

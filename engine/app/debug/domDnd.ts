@@ -24,6 +24,15 @@ export interface DomDndParams {
   to: DndEndpoint;
 }
 
+/** How long to wait for an ASYNC drop handler before deciding nothing was committed.
+ *  `handlePrefabDrop` does `await fetch(prefabPath)` from the dev server / asar, so the
+ *  mutation lands well after `dispatchEvent` returns. Generous on purpose: a false
+ *  "nothing happened" on a slow-but-successful drop would be worse than the bug this
+ *  detects, so this errs toward waiting. */
+const COMMIT_SETTLE_MS = 400;
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 /** Fire one DnD event carrying the shared transfer at the given point. Returns the
  *  event so callers can inspect `defaultPrevented` (a target that accepts the drop
  *  calls `preventDefault` on dragover). */
@@ -48,15 +57,40 @@ export interface DomDndResult {
   /** True if the target accepted the drop (called preventDefault on dragover) — a
    *  target that ignores dragover would reject a real drop too. */
   accepted: boolean;
+  /** Did the editor actually record an edit? `accepted` only says the target was willing to
+   *  take this payload TYPE; the drop HANDLER can still reject the specific payload and do
+   *  nothing. Undefined when no probe was supplied (non-editor host). */
+  committed?: boolean;
   /** Present only on a no-op (ok:false): why the drop didn't land. */
   error?: string;
+  /** Delivered + accepted, but no edit was recorded — see `committed`. */
+  warning?: string;
 }
 
-/** Synthesize a full HTML5 drag-and-drop from → to. */
-export function performDomDnd(params: DomDndParams): DomDndResult {
+export interface DomDndOptions {
+  /** Monotonic count of non-selection edits (the editor's `getEditVersion`). Injected rather
+   *  than imported so this module keeps no editor dependency. Without it `committed` is
+   *  undefined and the acceptance-only verdict stands. */
+  editVersion?: () => number;
+}
+
+/** Synthesize a full HTML5 drag-and-drop from → to.
+ *
+ *  ACCEPTED IS NOT COMMITTED (measured 2026-07-22). A Hierarchy entity row preventDefaults
+ *  `dragover` for ANY asset payload, then routes `drop` to a handler that returns immediately
+ *  unless the asset is a PREFAB. Dropping a texture on an entity row therefore satisfied both
+ *  of the old `ok` conditions — the source wrote a transfer, the target accepted the type —
+ *  while the world was provably untouched: entityCount unchanged, the target entity
+ *  byte-identical, `unsavedChanges:false`, and `canUndo:false`, i.e. not one undo entry was
+ *  pushed. The agent was told `ok:true, accepted:true`.
+ *
+ *  So acceptance is now the FLOOR, not the verdict: when an edit-version probe is supplied we
+ *  also check whether the editor recorded an edit, and say so when it did not. */
+export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions): Promise<DomDndResult> {
   const src = resolveDomPoint(params.from, 'from');
   const dst = resolveDomPoint(params.to, 'to');
   const dt = new DataTransfer();
+  const before = opts?.editVersion?.();
 
   fireDnd(src.el, 'dragstart', src.x, src.y, dt);
   fireDnd(dst.el, 'dragenter', dst.x, dst.y, dt);
@@ -68,6 +102,13 @@ export function performDomDnd(params: DomDndParams): DomDndResult {
   fireDnd(src.el, 'dragend', dst.x, dst.y, dt);
 
   const types = Array.from(dt.types);
+  // Let an async drop handler (handlePrefabDrop awaits a fetch) run before asking whether
+  // anything changed. Only worth waiting when a commit was actually plausible.
+  let committed: boolean | undefined;
+  if (before !== undefined && types.length > 0 && accepted) {
+    await sleep(COMMIT_SETTLE_MS);
+    committed = (opts!.editVersion!() ?? before) !== before;
+  }
   // `ok` must reflect what ACTUALLY happened, not just "we fired the sequence". An empty
   // transfer means the source's dragstart wrote nothing (wrong source element ⇒ the drop
   // handler reads back nothing ⇒ genuine no-op); accepted:false means the target never
@@ -81,10 +122,18 @@ export function performDomDnd(params: DomDndParams): DomDndResult {
     to: { ...(params.to.selector ? { selector: params.to.selector } : {}), x: dst.x, y: dst.y },
     types,
     accepted,
+    ...(committed !== undefined ? { committed } : {}),
     ...(types.length === 0
       ? { error: 'drag-and-drop no-op: the source element wrote nothing to the DataTransfer — it is likely not a drag source (wrong `from` selector).' }
       : !accepted
         ? { error: 'drag-and-drop no-op: the target did not accept the drop (it never preventDefault-ed dragover — wrong `to` target, or it rejects this payload type).' }
-        : {}),
+        // A WARNING, not an error, and `ok` deliberately stays true. The DnD sequence really was
+        // delivered and really was accepted; what we cannot prove is that the handler acted.
+        // Some legitimate drops are not undoable edits (a file move writes to disk), so
+        // downgrading these to ok:false would invent failures across drop targets nobody has
+        // enumerated — trading a false success for a false failure. Say exactly what is known.
+        : committed === false
+          ? { warning: 'the target accepted the payload TYPE but no editor edit was recorded, so the drop probably did nothing — the classic case is a non-prefab asset dropped on a Hierarchy entity row, which accepts any asset on dragover and then ignores everything but a prefab. Verify with get_scene_state/history before building on this. (A drop that legitimately makes no undoable edit, e.g. a file move, also lands here.)' }
+          : {}),
   };
 }

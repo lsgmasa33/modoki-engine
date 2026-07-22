@@ -82,6 +82,10 @@ export const keyboardSource: InputSource = {
     reset(); attached = false;
   },
 
+  /** Drop held keys without detaching — used by the host input gate's closing edge
+   *  (inputSources.sampleAll) so a key held when focus leaves the game stops driving it. */
+  reset(): void { reset(); },
+
   sample(out: InputFrame): void {
     let active = false;
 

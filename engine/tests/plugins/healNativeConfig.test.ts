@@ -7,13 +7,21 @@ import path from 'node:path';
 import { healNativeConfig, androidSdkDirValue } from '../../plugins/healNativeConfig';
 
 let root: string;
+let savedToolchainDir: string | undefined;
 
 beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-heal-'));
+  // The sdk.dir heal resolves the SDK through the shared toolchain probe, which only honours
+  // ANDROID_HOME in DEV-editor mode. A dev box that exports MODOKI_TOOLCHAIN_DIR (some do, so CLI
+  // builds find toktx) is bundled-only, so the fixture SDK below would be ignored — unset it.
+  savedToolchainDir = process.env.MODOKI_TOOLCHAIN_DIR;
+  delete process.env.MODOKI_TOOLCHAIN_DIR;
 });
 afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true });
   delete process.env.ANDROID_HOME;
+  if (savedToolchainDir === undefined) delete process.env.MODOKI_TOOLCHAIN_DIR;
+  else process.env.MODOKI_TOOLCHAIN_DIR = savedToolchainDir;
 });
 
 function writeConfig(teamId: string) {

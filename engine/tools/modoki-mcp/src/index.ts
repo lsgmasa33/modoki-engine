@@ -585,12 +585,23 @@ server.tool(
     "'ArrowUp', 'w'). The key is HELD ~3 frames so per-frame game input sampling (nav/jump/" +
     'confirm) registers the edge. If keys do not reach the GAME, a DOM text field is likely ' +
     'focused (Console filter, inspector) — call modoki_focus (no selector) first to blur it. ' +
+    'PANEL-SCOPED CHORDS: editor shortcuts resolve against the FOCUSED PANEL, so a bare `w` ' +
+    'sent while the wrong panel is focused does NOTHING — silently, because the dispatcher ' +
+    'yields rather than erroring. Pass `panel` to set the keyboard scope first instead of ' +
+    'tapping-and-hoping; the response echoes `focusedPanel`. ' +
+    'CAVEAT: this is renderer-level input — it does NOT trigger native Electron MENU ' +
+    'accelerators, so a chord the OS menu claims (Cmd+R reload, Cmd+Alt+I devtools, and on ' +
+    'Windows/Linux F12) reaches page handlers here but behaves differently for a human. ' +
     'Requires the Electron editor.',
   {
     key: z.string().describe("Electron keyCode, e.g. 'Escape', 'Delete', 'ArrowLeft', 'w', 'z'."),
     modifiers: z.array(modifierEnum).optional().describe("Held modifiers, e.g. ['meta'] for Cmd+key."),
+    panel: z.string().optional().describe(
+      'Focus this panel BEFORE pressing, so a panel-scoped chord resolves there. Ids: ' +
+      'scene | game | hierarchy | inspector | console | assets | animation-editor | timeline-editor | particle-editor | spriteanim-editor | skin-editor | ai. Fails loudly if the panel is not open.',
+    ),
   },
-  async ({ key, modifiers }) => postJson('/api/input/key', { key, modifiers }),
+  async ({ key, modifiers, panel }) => postJson('/api/input/key', { key, modifiers, panel }),
 );
 
 // ── focus — move keyboard focus / blur a text field (Electron editor only) ──
@@ -603,11 +614,20 @@ server.tool(
     'while a DOM text field (Console filter, inspector) holds focus, and a viewport click ' +
     'does NOT blur it — so call this (no selector) before modoki_press_key to drive ' +
     'nav/jump/confirm. A non-focusable target (canvas/div) is given tabindex=-1 so it can ' +
-    'take focus. Returns {focused, blurred, ok}. Requires the Electron editor.',
+    'take focus. Returns {focused, blurred, ok}. ' +
+    'KEYBOARD SCOPE vs DOM FOCUS are different things: `panel` sets which panel the editor ' +
+    'keymap resolves chords against, `selector` sets document.activeElement. Clicking a ' +
+    'Hierarchy row moves the scope but leaves activeElement on <body>, which is why both ' +
+    'exist. Pass `panel` to steer panel-scoped shortcuts; the response echoes `focusedPanel`. ' +
+    'Requires the Electron editor.',
   {
     selector: z.string().optional().describe('CSS selector to focus. Omit to blur the active element.'),
+    panel: z.string().optional().describe(
+      'Set the editor KEYBOARD SCOPE to this panel (independent of DOM focus). Ids: ' +
+      'scene | game | hierarchy | inspector | console | assets | animation-editor | timeline-editor | particle-editor | spriteanim-editor | skin-editor | ai.',
+    ),
   },
-  async ({ selector }) => postJson('/api/input/focus', { selector }),
+  async ({ selector, panel }) => postJson('/api/input/focus', { selector, panel }),
 );
 
 // ── dnd — HTML5 drag-and-drop synthesis (dev + DMG) ──

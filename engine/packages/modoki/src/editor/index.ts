@@ -2,7 +2,7 @@
 
 export { backendFetch, backendPostJson, backendEventSource, backendBase, backendUrl } from './backend/editorBackend';
 export { createEditor, type EditorOptions } from './createEditor';
-export { pushAction, undo, redo, canUndo, canRedo, clearHistory, undoLabel, redoLabel } from './undo/undoManager';
+export { pushAction, undo, redo, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion } from './undo/undoManager';
 export {
   writeTraitFieldWithUndo, deleteEntityWithUndo, deleteEntitiesWithUndo, duplicateEntity,
   reparentEntity, setActionCallback, createEntityWithUndo,
@@ -14,7 +14,7 @@ export {
 } from './entityCreateSpecs';
 export { buildUiCreateSpecs, type UiPreset } from './uiAuthoring';
 export { enterPlay, stopPlay, pausePlay, resetPlayMode } from './scene/playMode';
-export { editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled, withEditorActor } from './editorJournal';
+export { editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled, withEditorActor, openActorLease, closeActorLease, ACTOR_LEASE_TTL_MS } from './editorJournal';
 export {
   getEditorViewportCamera, setEditorViewportCamera, focusEntityInSceneView,
 } from './scene/sceneViewBus';

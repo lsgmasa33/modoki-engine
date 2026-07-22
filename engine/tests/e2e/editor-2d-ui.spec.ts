@@ -34,7 +34,10 @@ test('2D gizmo: dragging the free handle moves the sprite in the ECS', async ({ 
 
   // The sprite sits at the Canvas2D reference center (540,960); with fitH scaling that
   // projects to the overlay canvas's center pixel — i.e. the free-move handle.
-  const canvas = page.locator('[data-2d-overlay]');
+  // `data-2d-pick` is the PixiJS capture layer (SceneView.tsx:1957). It replaced the old
+  // `data-2d-overlay` DOM canvas in b60ebc2d (the SceneView 2D Pixi cutover); this spec was
+  // never updated and has been failing silently ever since, because e2e runs in no gate.
+  const canvas = page.locator('[data-2d-pick]');
   await canvas.waitFor({ state: 'visible', timeout: 10_000 });
   const box = await canvas.boundingBox();
   if (!box) throw new Error('2D overlay canvas has no bounding box');

@@ -20,6 +20,7 @@ import { readdir, readFile, rm, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { projectAssetRoots } from './projectRoots.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // engine/scripts/ → repo root (node_modules + games live at the repo root; the
@@ -39,21 +40,9 @@ async function findAssetRoots() {
   const roots = [];
   const modokiAssets = join(ROOT, 'engine/packages/modoki/src/runtime/assets');
   if (existsSync(modokiAssets)) roots.push({ urlPrefix: '/modoki/assets', absDir: modokiAssets });
-  const gamesDir = join(ROOT, 'games');
-  if (existsSync(gamesDir)) {
-    for (const name of await readdirSafe(gamesDir)) {
-      const gameAssets = join(gamesDir, name, 'runtime/assets');
-      if (existsSync(gameAssets)) roots.push({ urlPrefix: `/games/${name}/assets`, absDir: gameAssets });
-    }
-  }
+  // Every project under games/ + demos/ — see engine/scripts/projectRoots.mjs.
+  roots.push(...projectAssetRoots(ROOT));
   return roots;
-}
-
-async function readdirSafe(p) {
-  try {
-    const entries = await readdir(p, { withFileTypes: true });
-    return entries.filter((e) => e.isDirectory() && !e.name.startsWith('.')).map((e) => e.name);
-  } catch { return []; }
 }
 
 /** Map a URL path (e.g. `/games/3d-test/assets/.../rock.png`) back to its

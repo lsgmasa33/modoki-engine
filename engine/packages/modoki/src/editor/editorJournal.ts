@@ -54,11 +54,78 @@ export function withEditorActor<T>(who: 'human' | 'agent', fn: () => T): T {
   return r;
 }
 
+// ── Actor lease — attribution for TRUSTED INPUT ──────────────────────────────
+//
+// `withEditorActor` only works for code the agent CALLS. Trusted input is the opposite
+// shape: `sendInputEvent` injects real OS-level input, Chromium hit-tests it, and the
+// editor's own handlers run — deliberately indistinguishable from a human's click,
+// because that fidelity is the entire point of Enact. Nothing on that path passes
+// through the renderer op registry, so `withEditorActor` never wraps it.
+//
+// Measured 2026-07-22, same session, back to back:
+//   modoki_tap   on a Hierarchy row → !focus + !select  source:"human"   ← agent-driven
+//   modoki_gizmo (a renderer op)    → !gizmo            source:"agent"   ← correct
+// Provenance depended purely on which transport the op happened to use. That defeats the
+// point of the split: the human cannot tell their own edits from Claude's, and Claude
+// reports the human "did" things Claude did.
+//
+// So the injector DECLARES itself for the duration: open a lease, dispatch, close it.
+//
+// WHY A LEASE AND NOT A FLAG. A flag set around an async dispatch is what the plan
+// rejected: if the op throws, is killed, or the renderer reloads mid-flight, the flag
+// sticks and the human's ENTIRE remaining session is mis-tagged 'agent' — strictly worse
+// than the bug being fixed. A lease carries a DEADLINE and is keyed to the in-flight
+// request, so the failure mode is bounded (it expires) and a stale close cannot cancel a
+// newer op's lease.
+//
+// WHAT THIS HONESTLY CANNOT DO: while a lease is open the human is still at the keyboard,
+// and their click is byte-identical to the agent's. So this converts "100% of agent input
+// is mislabeled human" into "agent input is labeled agent; a human action inside a short,
+// bounded window is mislabeled agent". Strictly better, not perfect — and the same
+// accepted race withEditorActor already documents, with the added safety of a deadline.
+
+interface ActorLease { who: 'human' | 'agent'; deadline: number; id: number }
+let lease: ActorLease | null = null;
+let leaseSeq = 0;
+
+/** Default lease lifetime. A backstop, not the expected duration — every caller should
+ *  close explicitly. Sized above the slowest input op (a 10-step drag is ~180ms, and an
+ *  async drop handler awaits a fetch) while staying short enough that a leaked lease
+ *  mis-attributes only a moment of the human's work. */
+export const ACTOR_LEASE_TTL_MS = 3000;
+
+/** Attribute editor activity to `who` until closed or `ttlMs` elapses. Returns the lease
+ *  id to pass to `closeActorLease`. A second open supersedes the first. */
+export function openActorLease(who: 'human' | 'agent', ttlMs: number = ACTOR_LEASE_TTL_MS): number {
+  lease = { who, deadline: Date.now() + ttlMs, id: ++leaseSeq };
+  return lease.id;
+}
+
+/** Close a lease. Ignores an id that is not the CURRENT lease, so a late close from a
+ *  superseded op cannot cancel the attribution of the one now in flight. */
+export function closeActorLease(id: number): void {
+  if (lease && lease.id === id) lease = null;
+}
+
+/** Test/teardown hook. */
+export function _clearActorLease(): void { lease = null; }
+
+/** Who gets credit for an emit right now. A live lease wins over the ambient actor: it is
+ *  the narrower, explicitly-declared claim. Expiry is LAZY — checked here rather than by a
+ *  timer, so there is no handle to leak and no cleanup to forget. */
+function currentActor(): 'human' | 'agent' {
+  if (lease) {
+    if (Date.now() <= lease.deadline) return lease.who;
+    lease = null; // expired — fall back rather than mis-attribute indefinitely
+  }
+  return actor;
+}
+
 /** Record an editor activity event, tagged with the current actor. Payloads should
  *  reference entities by GUID. No-op when disabled. */
 export function editorEmit(type: string, payload?: unknown): void {
   if (!enabled) return;
-  buffer.push({ seq: ++seq, cap: nextCaptureSeq(), ts: Date.now(), type, source: actor, payload });
+  buffer.push({ seq: ++seq, cap: nextCaptureSeq(), ts: Date.now(), type, source: currentActor(), payload });
   if (buffer.length > MAX_EVENTS) buffer.shift();
 }
 

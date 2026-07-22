@@ -55,7 +55,9 @@ test('Cmd/Ctrl+A selects every visible asset', async ({ page }) => {
 test('type filter narrows the list to one kind (footer shows N of M)', async ({ page }) => {
   await gotoEditorWithAssets(page);
   // Open the "Type" filter dropdown (replaced the old chip row).
-  await page.locator('button[title="Filter by asset type"]').click();
+  // TypeFilterMenu's default title is 'Filter by type'; Assets stopped passing a custom
+  // one in 77965ea3 (the treeChrome extraction). Stale selector, failing silently since.
+  await page.locator('button[title="Filter by type"]').click();
   // The 'texture' row shows its count (e.g. "texture27"); read it, then enable it.
   const row = page.locator('label', { hasText: 'texture' }).first();
   await row.waitFor({ state: 'visible' });

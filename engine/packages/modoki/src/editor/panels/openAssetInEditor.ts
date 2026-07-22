@@ -12,8 +12,13 @@ import { parseAnimClipBank } from '../../runtime/animation/animClipBank';
 
 /** Resolve the Animator entity a clip should bind to (so its tracks resolve their
  *  relative paths). Prefer the Animator that references the clip; else fall back to
- *  the selected entity when it has an Animator. */
-function resolveAnimatorRootForClip(path: string): number | null {
+ *  the selected entity when it has an Animator.
+ *
+ *  `fallbackToSelection: false` keeps only the exact match — used by the Animation
+ *  panel's re-bind-on-nonce recovery, where "whatever happens to be selected" would
+ *  silently bind the clip to an unrelated Animator after the user chose to leave it
+ *  unbound. */
+export function resolveAnimatorRootForClip(path: string, { fallbackToSelection = true } = {}): number | null {
   const guid = getGuidForPath(path);
   const animMeta = getTraitByName('Animator');
   if (!animMeta) return null;
@@ -26,6 +31,7 @@ function resolveAnimatorRootForClip(path: string): number | null {
     // "spin"/"" — comparing that against a GUID never matched, so auto-bind always failed.)
     if (parseAnimClipBank(data?.clips).some((c) => c.clip === guid || resolveRef(c.clip) === path)) return e.id;
   }
+  if (!fallbackToSelection) return null;
   const sel = useEditorStore.getState().selectedEntityId;
   const ent = sel != null ? findEntity(sel) : null;
   if (ent && ent.has(animMeta.trait)) return sel;

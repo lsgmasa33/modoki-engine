@@ -18,10 +18,11 @@
 import * as THREE from 'three';
 import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor } from '../debug/agentBridge';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
+import { getHmrStatus } from '../debug/hmrStaleness';
 import {
   useEditorStore, type SelectedAsset,
   enterPlay, stopPlay, pausePlay,
-  undo, redo, canUndo, canRedo, undoLabel, redoLabel,
+  undo, redo, canUndo, canRedo, undoLabel, redoLabel, getEditVersion,
   loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, isEditingPrefab,
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, reparentEntity, ensureGuid, type TraitSpec,
   buildEntityCreateSpecs, type CreateEntitySpec,
@@ -29,7 +30,7 @@ import {
   resolveExistingPrefabId, tagEntityTreeAsInstance, detachPrefabInstance,
   getEditorViewportCamera, focusEntityInSceneView,
   upsertKey, findTrack, encodeValue, backendFetch,
-  readEditorJournal, clearEditorJournal, withEditorActor,
+  readEditorJournal, clearEditorJournal, withEditorActor, openActorLease, closeActorLease,
   type PrefabFile,
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
@@ -53,6 +54,21 @@ function readEditorCamera(): { position: number[]; direction: number[]; fov: num
   return { position: [p.x, p.y, p.z], direction: [d.x, d.y, d.z], fov: cam.fov };
 }
 
+/** HMR staleness, kept OFF the payload when there is nothing to report — an editor that
+ *  has had zero updates is by definition not stale. Silence here means "this build is what
+ *  booted". (Applies to the packaged editor too: it runs a real Vite dev server, so it has
+ *  HMR — see engine/app/debug/hmrStaleness.ts.) */
+function hmrFields(): { hmrUpdates?: number; staleGameCode?: true; discardedUnsavedEdits?: true } {
+  const h = getHmrStatus();
+  const out: { hmrUpdates?: number; staleGameCode?: true; discardedUnsavedEdits?: true } = {};
+  if (h.updates > 0) out.hmrUpdates = h.updates;
+  if (h.staleGameCode) { out.staleGameCode = true; out.hmrUpdates = h.updates; }
+  // Sticky for the life of the page: the human may not have seen the banner, and an agent
+  // reading state later still needs to know work was dropped under it.
+  if (h.discardedUnsavedEdits) out.discardedUnsavedEdits = true;
+  return out;
+}
+
 /** The whole editor UI state in one read — the "get all UI state" payload. */
 function readEditorState() {
   const s = useEditorStore.getState();
@@ -67,6 +83,18 @@ function readEditorState() {
     gizmoMode: s.gizmoMode,
     gizmoSpace: s.gizmoSpace,
     sceneViewMode: s.sceneViewMode,
+    // Which panel owns the KEYBOARD ('scene' | 'hierarchy' | 'animation-editor' | …), or null.
+    // Readable as DATA on purpose: the focus ring is a CSS box-shadow, so without this the
+    // question "which panel would this key go to?" would only be answerable from a screenshot —
+    // exactly what docs/debug-tools-mcp.md forbids. (focus-scope refactor P2)
+    focusedPanel: s.focusedPanel,
+    // HMR staleness. `staleGameCode: true` means game code changed on disk but the editor
+    // could NOT reload (unsaved scene work), so this world is running the OLD build —
+    // every measurement taken here is suspect until it reloads. `hmrUpdates` is how many
+    // hot updates have landed since boot; 0 means "nothing has changed under me". Exposed
+    // as DATA because the failure mode is otherwise SILENT — neither a human nor an agent
+    // can tell a stale editor from a working one by looking. (docs/editor-hmr.md)
+    ...hmrFields(),
     colliderEditMode: s.colliderEditMode,
     fps: Math.round(getCurrentFPS()),
     entityCount: getAllEntities().length,
@@ -268,7 +296,21 @@ export function registerEditorAgentOps(): void {
   // ── HTML5 drag-and-drop (Enact Phase 1) ── synthesize the dragstart→drop
   // sequence the trusted pointer-drag can't emit (Hierarchy reparent, Assets
   // file-move, Skin sprite-onto-part). Renderer-DOM, so dev + DMG both work.
-  registerAgentOp('dom-dnd', (params) => performDomDnd((params ?? {}) as DomDndParams));
+  // ── Actor lease ── the trusted-input seam declaring itself, so injected input is
+  // journaled as `agent` instead of masquerading as the human (measured: modoki_tap's
+  // !select said source:"human"). Registered as a plain renderer op rather than through
+  // the wrapper above, because it MANAGES attribution and must not be attributed itself.
+  _registerAgentOp('actor-lease', (params) => {
+    const p = (params ?? {}) as { open?: boolean; id?: number; ttlMs?: number };
+    if (p.open) return { id: openActorLease('agent', p.ttlMs) };
+    if (typeof p.id === 'number') closeActorLease(p.id);
+    return { ok: true };
+  });
+
+  // `getEditVersion` lets the op distinguish "the target ACCEPTED this payload type" from
+  // "the handler actually did something" — measured: a texture dropped on a Hierarchy entity
+  // row reported ok:true/accepted:true and made no edit at all.
+  registerAgentOp('dom-dnd', (params) => performDomDnd((params ?? {}) as DomDndParams, { editVersion: getEditVersion }));
 
   // ── Selection ──
   registerAgentOp('set-selection', (params) => {
@@ -321,6 +363,19 @@ export function registerEditorAgentOps(): void {
     const p = (params ?? {}) as { mode?: '3d' | 'ui' };
     if (p.mode === '3d' || p.mode === 'ui') useEditorStore.getState().setSceneViewMode(p.mode);
     return readEditorState();
+  });
+  // Set the KEYBOARD SCOPE — which panel the keymap dispatcher resolves chords against
+  // (focus-scope refactor P7). Without this, an agent's only way to steer a keypress was
+  // to tap something first and hope the click landed in the right panel; after scoping
+  // landed, a bare `w` sent with the wrong panel focused simply does nothing, silently.
+  //
+  // Deliberately separate from `focus-element` (DOM focus): clicking a Hierarchy ROW moves
+  // the keyboard scope but NOT document.activeElement, so the two are genuinely different
+  // questions. Returns the resulting scope so the caller can confirm rather than assume.
+  registerAgentOp('set-focus-scope', (params) => {
+    const p = (params ?? {}) as { panel?: string | null };
+    if (p.panel !== undefined) useEditorStore.getState().setFocusedPanel(p.panel);
+    return { ok: true, focusedPanel: useEditorStore.getState().focusedPanel };
   });
   registerAgentOp('set-collider-edit', (params) => {
     const p = (params ?? {}) as { on?: boolean };

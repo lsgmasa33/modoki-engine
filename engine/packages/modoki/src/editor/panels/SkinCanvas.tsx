@@ -5,6 +5,8 @@
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useEditorStore } from '../store/editorStore';
+import { register } from '../input/keymap';
+import { useHmrEpoch } from '../input/hmrEpoch';
 import { activePartOf, withActivePart, partCount, uvToPosAffine } from './skinParts';
 import { getAssetEntry, resolveGuidToPath } from '../../runtime/loaders/assetManifest';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
@@ -103,6 +105,7 @@ function visiblePartViews(def: Rig2DFile | null | undefined, activePart: number,
 }
 
 export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTestPose }: { selBone: number; setSelBone: (i: number) => void; testPose?: Pose; setTestPose?: (u: (p: Pose) => Pose) => void }) {
+  const hmrEpoch = useHmrEpoch();
   const def = useEditorStore((s) => s.editingSkinDef);
   const nonce = useEditorStore((s) => s.skinEditNonce);
   const activePart = useEditorStore((s) => s.activeSkinPart);
@@ -186,17 +189,27 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
   const paintSubTool = useEditorStore((s) => s.skinWeightTool);
   useEffect(() => { useEditorStore.getState().setSkinWeightTool('paint'); }, [paintMode]);
   // Keyboard: B = brush, W = transform (move/rotate) — only while paint mode is active.
+  //
+  // Scoped to `skin-editor` (focus-scope refactor P5). These were bare window keydowns
+  // with only an input-tag guard, so B ALSO fired AnimationEditor's break-tangents and
+  // W ALSO moved the SceneView gizmo AND latched the running game's "up" key — three
+  // handlers on one press. Registering under the panel scope is what actually frees W.
+  // Registration is still gated on paintMode, so the chords yield entirely when the
+  // paint tools aren't active.
   useEffect(() => {
     if (!paintMode) return;
-    const onKey = (e: KeyboardEvent) => {
-      const t = e.target as HTMLElement | null;
-      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
-      if (e.key === 'b' || e.key === 'B') useEditorStore.getState().setSkinWeightTool('paint');
-      else if (e.key === 'w' || e.key === 'W') useEditorStore.getState().setSkinWeightTool('transform');
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [paintMode]);
+    const offs = [
+      register({
+        id: 'skin.toolBrush', keys: 'b', scope: 'skin-editor',
+        run: () => useEditorStore.getState().setSkinWeightTool('paint'),
+      }),
+      register({
+        id: 'skin.toolTransform', keys: 'w', scope: 'skin-editor',
+        run: () => useEditorStore.getState().setSkinWeightTool('transform'),
+      }),
+    ];
+    return () => { for (const off of offs) off(); };
+  }, [paintMode, hmrEpoch]);
   // Active gizmo drag (translate/rotate a bone — bind pose in bone edit, test pose in paint).
   const gizmoRef = useRef<{ handle: GizmoHandle; startPx: number; startPy: number; centerPx: [number, number]; worldRz: number; parentWorldRz: number; before: Rig2DFile | null } | null>(null);
   // Parts-mode translate gizmo drag: axis-constrained move of the active part's whole mesh

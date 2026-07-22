@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useOverlayEscape } from '../input/useOverlayEscape';
 
 export interface ContextMenuItem {
   label: string;
@@ -57,16 +58,23 @@ export default function ContextMenu({ items, x, y, onClose }: ContextMenuProps) 
     const handleMouseDown = (e: MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) onClose();
     };
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
     document.addEventListener('mousedown', handleMouseDown);
-    document.addEventListener('keydown', handleKey);
     return () => {
       document.removeEventListener('mousedown', handleMouseDown);
-      document.removeEventListener('keydown', handleKey);
     };
   }, [onClose]);
+  // Escape closes THIS menu only — i.e. the top of the overlay stack.
+  //
+  // NOTE (corrected): submenus are NOT nested ContextMenu instances. `MenuItemRow`
+  // renders a submenu as a plain positioned <div> (see below), so one open context menu
+  // is exactly ONE overlay, and Escape closing the whole menu — submenu included — is
+  // correct and unchanged.
+  //
+  // What the stack actually fixes here is the CROSS-COMPONENT case: this menu, the tree
+  // type-filter dropdown, DevicePicker and SpritePicker each held their own document
+  // keydown and none stopped propagation, so with two of them open a single Escape closed
+  // both. Now the most recently opened one closes first.
+  useOverlayEscape(true, onClose, 'context-menu');
 
   // Clamp using the REAL measured menu size (not an items.length * 28 estimate),
   // so tall menus near the bottom edge don't clip. Measured post-layout. (F11.)

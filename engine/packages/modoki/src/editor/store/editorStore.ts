@@ -74,6 +74,18 @@ interface EditorState {
    *  SceneView-local state into the store so it's agent-drivable (set-scene-view-mode)
    *  — the mode selector is a native <select> that trusted input can't operate. */
   sceneViewMode: '3d' | 'ui';
+  /** Which FlexLayout panel owns the keyboard ('scene' | 'hierarchy' | 'animation-editor' | …),
+   *  or null when nothing has been engaged yet. Set on capture-phase mousedown (click-to-focus).
+   *
+   *  STORE-BACKED ON PURPOSE, not derived from `document.activeElement`: clicking a Hierarchy row
+   *  is a click on a plain <div>, so DOM focus stays on <body> (measured — every captured
+   *  keypress reported target=BODY after clicking a row). Deriving it would report "nothing
+   *  focused" for the panel the user is visibly working in.
+   *
+   *  Deliberately NOT in the FlexLayout model and NOT persisted: onModelChange debounce-saves the
+   *  layout and re-IPCs the native menu, so model-resident focus would rewrite the autosave on
+   *  every click. Resets to null on launch. See docs/editor-input.md. */
+  focusedPanel: string | null;
   /** Opt-in: simulate + render ParticleEmitter effects live in the 3D SceneView */
   particlePreview: boolean;
   gameViewSize: { width: number; height: number };
@@ -219,6 +231,7 @@ interface EditorState {
   setColliderEditMode: (on: boolean) => void;
   setShowFocusGraph: (on: boolean) => void;
   setSceneViewMode: (mode: '3d' | 'ui') => void;
+  setFocusedPanel: (panel: string | null) => void;
   setGizmoSpace: (space: 'local' | 'world') => void;
   setParticlePreview: (on: boolean) => void;
   setGameViewSize: (width: number, height: number) => void;
@@ -370,6 +383,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   colliderEditMode: false,
   showFocusGraph: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:showFocusGraph') === '1'),
   sceneViewMode: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:sceneViewMode') === 'ui') ? 'ui' : '3d',
+  focusedPanel: null,
   particlePreview: false,
   gameViewSize: { width: 800, height: 450 },
   gameRect: { left: 0, top: 0, width: 800, height: 450 },
@@ -509,6 +523,17 @@ export const useEditorStore = create<EditorState>((set, get) => {
     set({ sceneViewMode: mode });
     if (typeof localStorage !== 'undefined') localStorage.setItem('editor:sceneViewMode', mode);
     mark2DDirty();
+  },
+  /** Click-to-focus. Journals `!focus` on a real SCOPE CHANGE only — a commit point, so the
+   *  stream stays sparse (never per-keystroke), and it is what makes "why did my key go there?"
+   *  answerable from data instead of a re-run. Focus is NOT undoable: it is transient chrome, and
+   *  recording it would flood the stack AND create a routing loop (undo moves focus → the next
+   *  Cmd+Z resolves in a different scope). Hence no pushAction here. */
+  setFocusedPanel: (panel: string | null) => {
+    const from = get().focusedPanel;
+    if (from === panel) return;
+    editorEmit('!focus', { panel, from });
+    set({ focusedPanel: panel });
   },
   setGizmoSpace: (space: 'local' | 'world') => { if (get().gizmoSpace !== space) editorEmit('!gizmo', { space }); set({ gizmoSpace: space }); mark2DDirty(); },
   setParticlePreview: (on: boolean) => set({ particlePreview: on }),

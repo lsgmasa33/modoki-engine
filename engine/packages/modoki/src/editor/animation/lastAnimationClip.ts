@@ -48,6 +48,20 @@ function entityForGuid(guid: string): number | null {
   return found;
 }
 
+/** Resolve a persisted root guid to a USABLE Animator root: the entity must still exist
+ *  AND still carry the `Animator` trait. A guid alone isn't enough — the component can be
+ *  removed (undo, Inspector) after the binding was persisted, and restoring that guid
+ *  leaves the panel "bound" to an entity with no Animator: no warning bar, no Bind button,
+ *  and a live scrub preview for a clip that would never play at runtime. Returns null so
+ *  the clip reopens UNBOUND and the fix-it path is reachable. */
+function animatorRootForGuid(guid: string): number | null {
+  const id = entityForGuid(guid);
+  if (id == null) return null;
+  const meta = getTraitByName('Animator');
+  const ent = findEntity(id);
+  return meta && ent?.has(meta.trait) ? id : null;
+}
+
 let registered = false;
 let unsubscribe: (() => void) | null = null;
 
@@ -91,7 +105,7 @@ export function restoreLastAnimationClip(): boolean {
   // Guids are scene-scoped — don't rebind into an unrelated scene.
   const scene = getCurrentScenePath();
   if (p.scenePath && scene && p.scenePath !== scene) return false;
-  const rootId = p.animatorGuid ? entityForGuid(p.animatorGuid) : null;
+  const rootId = p.animatorGuid ? animatorRootForGuid(p.animatorGuid) : null;
   useEditorStore.getState().openAnimationEditor({ path: p.path, type: 'animation', name: p.name }, rootId);
   return true;
 }

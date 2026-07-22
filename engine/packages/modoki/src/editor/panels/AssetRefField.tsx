@@ -69,7 +69,7 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
   mixed?: boolean;
   /** Id of a registered editor panel that edits this asset kind (FieldHint.editorPanel).
    *  When set and the ref resolves, an "Open" button selects the asset AND docks/focuses
-   *  that panel — e.g. FieldSource.level → the sling Field Editor. */
+   *  that panel — e.g. FieldSource.level → the sling Level Editor. */
   editorPanel?: string;
   /** This is a CSS-font-FAMILY field (`UIElement.fontFamily`, DOM/UI text), so a
    *  dropped font resolves to its family NAME. Default false: SDF font fields
@@ -143,7 +143,7 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
     selectAsset({ path: targetPath, type: assetTypeFromPath(targetPath), name });
   };
   // Open in the game's asset editor panel: select the asset (retargets a
-  // selection-driven panel like the Field Editor) THEN dock/focus that panel.
+  // selection-driven panel like the Level Editor) THEN dock/focus that panel.
   const canOpenPanel = !!(editorPanel && targetPath);
   const openInPanel = () => {
     if (!targetPath || !editorPanel) return;

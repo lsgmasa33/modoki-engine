@@ -6,7 +6,8 @@
  *  texture's auto whole-image SPRITE GUID (never the raw texture — 2D refs are
  *  sprites-only). Dev-only (editor). */
 
-import { useEffect, useRef } from 'react';
+import { useRef } from 'react';
+import { useOverlayEscape } from '../input/useOverlayEscape';
 import type { AssetEntry } from '../../runtime/loaders/assetManifest';
 import { resolveGuidToPath } from '../../runtime/loaders/assetManifest';
 import { deriveGuid } from '../../runtime/loaders/assetRefRules';
@@ -52,11 +53,7 @@ export function SpritePicker({ anchor, assets, onPick, onClear, onClose }: {
   onClose: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
+  useOverlayEscape(true, onClose, 'sprite-picker');
 
   // Group sprite assets by their parent texture.
   const groups = new Map<string, { texPath: string | undefined; sprites: AssetEntry[] }>();

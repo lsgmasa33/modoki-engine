@@ -130,114 +130,169 @@ function tarballName(name: string, version: string, hash: string): string {
 }
 
 /** Files npm ALWAYS excludes from a published tarball, even inside a `files` dir.
- *  Matching npm's default ignore keeps the hash over exactly the shipped bytes so
- *  machine-local junk (.DS_Store) or VCS/dev metadata never renames the tarball. */
+ *  Matching npm's default ignore keeps machine-local junk (.DS_Store) and VCS/dev
+ *  metadata out of the source-input hash so they never rename the tarball. */
 function npmAlwaysExcluded(basename: string): boolean {
   if (basename === 'node_modules' || basename === '.git' || basename === '.svn' || basename === 'CVS' || basename === '.hg') return true;
   if (basename === '.gitignore' || basename === '.npmignore' || basename === '.npmrc') return true;
   if (basename === '.DS_Store' || basename === 'npm-debug.log') return true;
   if (basename === 'package-lock.json' || basename === 'yarn.lock' || basename === 'pnpm-lock.yaml') return true;
+  if (basename === 'Package.resolved') return true; // SPM lockfile — gitignored, machine-local (like the *-lock files above)
   if (basename.endsWith('.tgz') || basename.startsWith('._') || /^\..*\.swp$/.test(basename)) return true;
   return false;
 }
 
-/** Whether a `files` entry is a glob pattern (vs a literal path/dir). */
-function isGlob(s: string): boolean {
-  return /[*?[\]{}]/.test(s);
-}
+/** Directories that hold DERIVED build output or tool caches — never source
+ *  inputs, so they're excluded from the plugin's identity hash at ANY depth.
+ *  `dist` is the JS build (rollup/tsc); `build`/`.gradle` are Android/gradle
+ *  output+cache (e.g. android/build, android/.gradle); `.build`/`DerivedData`/
+ *  `Pods`/`.cxx` are iOS/SPM/CocoaPods/NDK output; `.swiftpm` is SPM's local
+ *  workspace/user-data dir (schemes, xcuserdata — gitignored, per-machine).
+ *  Hashing any of these would make the tarball name depend on the exact toolchain
+ *  that built them and on whether a native build ran locally — exactly the
+ *  non-reproducible churn this hash must avoid. (Mirrors the repo's own "not
+ *  source" dir list.) */
+const BUILD_OUTPUT_DIRS = new Set(['dist', 'build', '.gradle', '.build', 'DerivedData', 'Pods', '.cxx', '.swiftpm']);
 
-/** The set of plugin-relative POSIX paths `npm pack` would ship, sorted. Mirrors
- *  npm's rules for the subset our engine plugins use: the package.json `files`
- *  allowlist (literal paths + directories, recursed) PLUS npm's always-included
- *  manifest files (package.json, README, LICENSE/LICENCE, NOTICE). Returns null —
- *  "can't determine the exact shipped set, hash the whole dir instead" — when the
- *  plugin has no `files` field or uses a glob entry we don't expand (over-hashing
- *  is safe: it may cause a spurious rename but NEVER a hash COLLISION between two
- *  different contents, which would break `npm ci` integrity). */
-function packedFiles(pluginDir: string): string[] | null {
-  let pkg: { files?: unknown };
-  try { pkg = JSON.parse(fs.readFileSync(path.join(pluginDir, 'package.json'), 'utf8')); }
-  catch { return null; }
-  const filesField = pkg.files;
-  if (!Array.isArray(filesField) || filesField.some((e) => typeof e === 'string' && isGlob(e))) return null;
-
-  const out = new Set<string>();
-  const add = (abs: string) => out.add(path.relative(pluginDir, abs).split(path.sep).join('/'));
-  const walk = (absDir: string): void => {
-    for (const e of fs.readdirSync(absDir, { withFileTypes: true })) {
+/** Sorted plugin-relative POSIX paths that feed the identity hash — the plugin's
+ *  SOURCE INPUTS: every file EXCEPT derived build-output/cache dirs (see
+ *  BUILD_OUTPUT_DIRS) and npm-always-excluded junk.
+ *
+ *  WHY exclude build output — it is byte-sensitive to the exact tsc/rollup/gradle
+ *  versions doing the build, gitignored, and rebuilt on every `npm install`
+ *  (root postinstall → build:plugins) or native build. Hashing it made the
+ *  tarball NAME drift whenever the toolchain drifted across clones or over time —
+ *  the recurring "sync/rebuilt tgz" churn (each install could rename the tarball
+ *  with zero source changes). The tarball's identity must answer "did the
+ *  plugin's SOURCE change?", NOT "did the build output shift?". So a source edit
+ *  (src/ or native ios/android/manifest) still yields a new hash → one fresh pack
+ *  (with a freshly-built dist INSIDE it, since packInto builds first); a pure
+ *  toolchain/build-artifact drift does not re-pack. The committed tarball is
+ *  reused across every clone → `npm ci` integrity stays put.
+ *
+ *  This supersedes the earlier "published-fileset" scoping, which still hashed
+ *  dist/ (and assumed src/ was the volatile input — it's the reverse: src/ is
+ *  stable, the build output drifts). We hash ALL inputs and exclude only derived
+ *  dirs, so we can't under-hash a real input (over-hashing a stray source file is
+ *  safe — a spurious rename at worst, never a hash COLLISION that would break
+ *  npm ci). Bonus: the hash no longer depends on whether/what got built locally,
+ *  so every clone computes the SAME name before and after its first build.
+ *
+ *  Exported so a repo-invariant test can assert this set is EXACTLY the committed
+ *  source for each real engine plugin (no untracked/gitignored file leaks in →
+ *  reproducible across clones — the litter-leak bug the BUILD_OUTPUT_DIRS list
+ *  guards against, for whatever dir names a future plugin's build tool emits). */
+export function pluginHashInputs(pluginDir: string): string[] {
+  const acc: string[] = [];
+  const stack = [pluginDir];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(cur, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
       if (npmAlwaysExcluded(e.name)) continue;
-      const abs = path.join(absDir, e.name);
-      if (e.isDirectory()) walk(abs);
-      else add(abs);
-    }
-  };
-
-  // npm always ships these top-level manifest files if present, regardless of `files`.
-  for (const name of fs.readdirSync(pluginDir)) {
-    if (name === 'package.json' || /^(README|LICEN[SC]E|NOTICE)(\..*)?$/i.test(name)) {
-      const abs = path.join(pluginDir, name);
-      try { if (fs.statSync(abs).isFile()) add(abs); } catch { /* skip */ }
+      // Skip derived build-output/cache dirs (any depth) — not source inputs.
+      if (e.isDirectory() && BUILD_OUTPUT_DIRS.has(e.name)) continue;
+      const p = path.join(cur, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else acc.push(path.relative(pluginDir, p).split(path.sep).join('/'));
     }
   }
-  // Then each `files` allowlist entry (dir → recurse; file → include; missing → skip, as npm does).
-  for (const entry of filesField as string[]) {
-    const abs = path.join(pluginDir, entry.replace(/\/+$/, ''));
-    let st: fs.Stats | null = null;
-    try { st = fs.statSync(abs); } catch { st = null; }
-    if (st?.isDirectory()) walk(abs);
-    else if (st?.isFile() && !npmAlwaysExcluded(path.basename(abs))) add(abs);
-  }
-  return [...out].sort();
+  return acc.sort();
 }
 
-/** Content hash (8 hex) of the plugin's PUBLISHED bytes — the exact fileset
- *  `npm pack` ships (see packedFiles), by sorted relative path + contents.
- *  Deterministic (no mtimes) AND scoped to shipped files, so the tarball name is
- *  stable across machines AND doesn't drift when a NON-shipped dev file changes
- *  (src/, tsconfig, rollup config, lockfile) while the shipped dist/ios/android
- *  bytes are identical — the spurious-re-pack bug this scoping fixes. Falls back
- *  to the whole-dir walk when the shipped set can't be determined exactly
- *  (no `files` field / a glob entry): over-hashing is safe (a spurious rename at
- *  worst; never a collision), under-hashing would not be. */
+/** Content hash (8 hex) of the plugin's SOURCE INPUTS (see pluginHashInputs),
+ *  by sorted relative path + contents. Deterministic (no mtimes).
+ *
+ *  A read error is NOT swallowed (D10): a listed file that fails to read would
+ *  contribute only its path → a different hash than a clean read → a spurious
+ *  re-pack. Let it throw so vendoring fails loudly (the caller logs + continues). */
 function pluginContentHash(pluginDir: string): string {
   const h = createHash('sha256');
-  let files = packedFiles(pluginDir);
-  if (!files) {
-    // Fallback: whole-dir walk (minus always-excluded), same guarantee as before.
-    const acc: string[] = [];
-    const stack = [pluginDir];
-    while (stack.length) {
-      const cur = stack.pop()!;
-      let entries: fs.Dirent[];
-      try { entries = fs.readdirSync(cur, { withFileTypes: true }); } catch { continue; }
-      for (const e of entries) {
-        if (npmAlwaysExcluded(e.name)) continue;
-        const p = path.join(cur, e.name);
-        if (e.isDirectory()) stack.push(p);
-        else acc.push(path.relative(pluginDir, p).split(path.sep).join('/'));
-      }
-    }
-    files = acc.sort();
-  }
-  for (const rel of files) {
+  for (const rel of pluginHashInputs(pluginDir)) {
     h.update(rel);
     h.update('\0');
-    // Do NOT swallow a read error: a listed file that fails to read would
-    // otherwise contribute only its path → a DIFFERENT hash than a clean read of
-    // the same bytes → a spurious re-pack + lockfile churn. Let it throw so
-    // vendoring fails loudly (the caller logs + continues). (D10)
     h.update(fs.readFileSync(path.join(pluginDir, rel)));
     h.update('\0');
   }
   return h.digest('hex').slice(0, 8);
 }
 
-/** Ensure the plugin's built `dist/` exists (it ships JS only from a gitignored
- *  dist). In a packaged editor dist is shipped; in dev it's built by the root
- *  `build:plugins` postinstall — but build it on demand if missing so a fresh
- *  worktree heals itself. */
+/** Build inputs that determine `dist/` — hashed to detect a STALE dist. Excludes
+ *  the native dirs (ios/android ship as-is, they don't feed the JS build) and
+ *  anything generated. Returns null when the plugin ships WITHOUT sources (the
+ *  packaged editor bundles a prebuilt dist and no src/) — there's nothing to
+ *  rebuild from, so the shipped dist is authoritative. */
+function pluginSourceHash(pluginDir: string): string | null {
+  const srcDir = path.join(pluginDir, 'src');
+  if (!fs.existsSync(srcDir)) return null; // packaged editor: prebuilt dist, no sources
+  const files: string[] = [];
+  const stack = [srcDir];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(cur, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      if (npmAlwaysExcluded(e.name)) continue;
+      const p = path.join(cur, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else files.push(p);
+    }
+  }
+  // Build config counts too: a tsconfig/rollup/package.json change alters output.
+  for (const cfg of ['package.json', 'tsconfig.json', 'rollup.config.mjs']) {
+    const p = path.join(pluginDir, cfg);
+    if (fs.existsSync(p)) files.push(p);
+  }
+  const h = createHash('sha256');
+  for (const abs of files.sort()) {
+    h.update(path.relative(pluginDir, abs).split(path.sep).join('/'));
+    h.update('\0');
+    h.update(fs.readFileSync(abs));
+    h.update('\0');
+  }
+  return h.digest('hex').slice(0, 16);
+}
+
+/** Where the build stamp lives. Deliberately OUTSIDE the packed fileset
+ *  (`files: [... "dist/" ...]`): pluginContentHash intentionally hashes only
+ *  SHIPPED bytes so a non-shipped dev-file change doesn't cause a spurious
+ *  re-pack — putting a source-derived stamp inside dist/ would reintroduce
+ *  exactly that bug. node_modules/ is gitignored everywhere, so the stamp is
+ *  per-clone (like dist/ itself) and never committed. */
+function buildStampPath(pluginDir: string): string {
+  return path.join(pluginDir, 'node_modules', '.modoki-buildstamp');
+}
+
+function readBuildStamp(pluginDir: string): string | null {
+  try { return fs.readFileSync(buildStampPath(pluginDir), 'utf8').trim() || null; } catch { return null; }
+}
+
+function writeBuildStamp(pluginDir: string, stamp: string): void {
+  try {
+    fs.mkdirSync(path.dirname(buildStampPath(pluginDir)), { recursive: true });
+    fs.writeFileSync(buildStampPath(pluginDir), stamp);
+  } catch { /* best-effort: a missing stamp only costs one extra rebuild */ }
+}
+
+/** Ensure the plugin's built `dist/` exists AND is CURRENT for its sources (it
+ *  ships JS only from a gitignored dist). In a packaged editor dist is shipped;
+ *  in dev it's built by the root `build:plugins` postinstall — but build it on
+ *  demand if missing OR STALE so a fresh worktree heals itself.
+ *
+ *  Staleness is decided by a SOURCE-content stamp, never mtimes: git sets file
+ *  mtimes to checkout time, so an mtime compare both spuriously rebuilds after a
+ *  branch switch AND silently misses a stale dist whose files happen to be newer.
+ *  Missing this check let a clone with an out-of-date dist pack a tarball that
+ *  didn't match its own sources — and because the content hash was computed FROM
+ *  that stale dist, the name matched the committed tarball, so vendoring was a
+ *  permanent no-op that never healed. */
 function ensurePluginBuilt(plugin: EnginePlugin): void {
-  if (fs.existsSync(path.join(plugin.dir, 'dist'))) return;
+  const srcHash = pluginSourceHash(plugin.dir);
+  const distExists = fs.existsSync(path.join(plugin.dir, 'dist'));
+  // No sources (packaged editor) ⇒ the shipped dist is authoritative.
+  if (srcHash === null && distExists) return;
+  if (distExists && srcHash !== null && readBuildStamp(plugin.dir) === srcHash) return;
   // Cross-process lock (atomic mkdir): if two editors / worktrees open projects at
   // once and both find dist missing, only ONE builds — the other waits for dist to
   // appear rather than racing writes into the same dir (a half-built dist would get
@@ -257,12 +312,19 @@ function ensurePluginBuilt(plugin: EnginePlugin): void {
     } catch { /* lost the race to another process — fall through to wait */ }
   }
   if (!held) {
+    // Wait for the concurrent build to produce a dist that is CURRENT for these
+    // sources — not merely present. Waiting on existence alone would return the
+    // moment a stale dist was on disk (or a half-written one), which is the very
+    // staleness this function exists to prevent.
+    const fresh = () =>
+      fs.existsSync(path.join(plugin.dir, 'dist')) &&
+      (srcHash === null || readBuildStamp(plugin.dir) === srcHash);
     const deadline = Date.now() + 120_000;
     const sleeper = new Int32Array(new SharedArrayBuffer(4));
-    while (!fs.existsSync(path.join(plugin.dir, 'dist')) && Date.now() < deadline) {
+    while (!fresh() && Date.now() < deadline) {
       Atomics.wait(sleeper, 0, 0, 250); // sync sleep (this whole module runs sync)
     }
-    if (!fs.existsSync(path.join(plugin.dir, 'dist'))) {
+    if (!fresh()) {
       throw new Error(`[vendor] timed out waiting for a concurrent build of ${plugin.name} dist`);
     }
     return;
@@ -271,6 +333,9 @@ function ensurePluginBuilt(plugin: EnginePlugin): void {
     console.log(`[vendor] building ${plugin.name} dist…`);
     const npm = npmSpawnSpec();
     execFileSync(npm.command, [...npm.prefixArgs, 'run', 'build'], { cwd: plugin.dir, stdio: 'inherit', shell: npm.shell, env: npm.env });
+    // Stamp AFTER a successful build only: if the build throws we leave the old
+    // (or absent) stamp so the next pass retries instead of trusting bad output.
+    if (srcHash !== null) writeBuildStamp(plugin.dir, srcHash);
   } finally {
     fs.rmSync(lock, { recursive: true, force: true });
   }
@@ -341,6 +406,12 @@ export function vendorEnginePlugins(projectRoot: string, engineRoot: string): Ve
 
   for (const plugin of plugins) {
     if (!(plugin.name in deps)) continue; // project doesn't use this plugin
+    // Build BEFORE hashing. The hash is taken over the plugin's shipped bytes,
+    // so hashing a STALE dist yields the stale tarball's name — which exists, so
+    // nothing re-packs and ensurePluginBuilt (called only from packInto, below)
+    // is never even reached. That made a stale clone a permanent no-op that
+    // silently shipped a tarball not matching its own sources.
+    ensurePluginBuilt(plugin);
     const hash = pluginContentHash(plugin.dir);
     const relTgz = `plugins/${tarballName(plugin.name, plugin.version, hash)}`;
     const absTgz = path.join(projectRoot, relTgz);

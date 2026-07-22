@@ -1416,9 +1416,18 @@ export default function Assets() {
     const mod = isMac ? e.metaKey : e.ctrlKey;
     const order = visiblePathsRef.current;
     const find = (p: string | null) => assets.find((x) => x.path === p);
-    // Claim the key so the Hierarchy's document-level Cmd+D/Delete/F2 listeners
-    // don't ALSO fire while the Assets pane is focused. Non-handled keys (e.g.
-    // Cmd+Z undo) fall through to global listeners untouched.
+    // Claim the key. This handler is ELEMENT-scoped (on the focusable list container),
+    // so unlike the other panels it was already correctly scoped by DOM focus and did
+    // not need migrating into the keymap registry (focus-scope refactor P6) — the
+    // Hierarchy's document-level rival listener it was written to deny is now gone.
+    //
+    // stopPropagation still matters: it keeps a claimed key from ALSO reaching the
+    // window-level keymap dispatcher. Non-handled keys (e.g. Cmd+Z undo) fall through
+    // to it untouched — which is what makes "let unhandled keys pass" work.
+    //
+    // TODO(P8): register these in the keymap under the `assets` scope anyway, purely so
+    // they are INTROSPECTABLE (Shortcuts panel, menu generation, MCP). Behaviour is
+    // already right; only discoverability is missing.
     const stop = () => { e.preventDefault(); e.stopPropagation(); };
 
     if (mod && e.shiftKey && (e.key === 'n' || e.key === 'N')) {

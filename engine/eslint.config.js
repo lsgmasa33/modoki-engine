@@ -29,6 +29,10 @@ export default tseslint.config(
       'release/**',
       '**/*.tsbuildinfo',
       '**/.cache/**',
+      // VitePress generated dependency cache (docs site) — minified vendor
+      // bundles, gitignored, present only after the docs site runs locally.
+      // A fresh CI checkout never has it, so this only matters for local lint.
+      '**/.vitepress/cache/**',
       // Native build outputs + vendored framework bundles — not our source.
       '**/build/**',
       '**/.build/**',

@@ -3,6 +3,7 @@
  *  duplicate entries), grouped by category, filtered live by a search box. */
 
 import { useEffect, useRef, useState } from 'react';
+import { useOverlayEscape } from '../input/useOverlayEscape';
 import {
   DEVICE_PRESETS, DEVICE_CATEGORY_ORDER, filterDevices, presetLabel,
   type DevicePreset, type DeviceCategory, type Orientation,
@@ -27,11 +28,11 @@ export default function DevicePicker({ preset, orientation, onSelect, onToggleOr
     const onDown = (e: MouseEvent) => {
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
     };
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
     document.addEventListener('mousedown', onDown);
-    document.addEventListener('keydown', onKey);
-    return () => { document.removeEventListener('mousedown', onDown); document.removeEventListener('keydown', onKey); };
+    return () => { document.removeEventListener('mousedown', onDown); };
   }, [open]);
+  // Escape closes only the TOP overlay (see useOverlayEscape).
+  useOverlayEscape(open, () => setOpen(false), 'device-picker');
 
   // Focus the search box when opening.
   useEffect(() => { if (open) inputRef.current?.focus(); }, [open]);

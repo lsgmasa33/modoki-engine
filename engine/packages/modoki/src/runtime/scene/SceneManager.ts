@@ -82,13 +82,14 @@ export interface LoadOptions {
   gameId?: string | null;
 }
 
-/** Derive a game id from a scene path by the `games/<id>/` project convention.
+/** Derive a project id from a scene path by the `games/<id>/` or `demos/<id>/`
+ *  project convention (the two project roots — see engine/scripts/projectRoots.mjs).
  *  Reliable under the dev server (unhashed asset URLs); returns null when the
- *  path doesn't carry a game segment (hashed production URLs, the menu, a
- *  prefab-edit world). Callers that know the id should pass `opts.gameId` instead
- *  of relying on this. */
+ *  path doesn't carry a project segment (hashed production URLs, a standalone flat
+ *  project whose assets serve at /assets, the menu, a prefab-edit world). Callers
+ *  that know the id should pass `opts.gameId` instead of relying on this. */
 export function gameIdFromScenePath(path: string): string | null {
-  const m = path.match(/(?:^|\/)games\/([^/]+)\//);
+  const m = path.match(/(?:^|\/)(?:games|demos)\/([^/]+)\//);
   return m ? m[1] : null;
 }
 

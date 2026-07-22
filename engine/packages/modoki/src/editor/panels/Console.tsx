@@ -31,6 +31,9 @@ export default function Console({ node }: { node?: TabNode } = {}) {
   const [viewHeight, setViewHeight] = useState(300);
   const [autoScroll, setAutoScroll] = useState(true);
   const [selectedId, setSelectedId] = useState<number | null>(null);
+  // Transient "copied ✓" ack on the detail pane's copy button; cleared whenever the
+  // selection moves so it never labels a different entry as copied.
+  const [copied, setCopied] = useState(false);
   const [filter, setFilter] = useState('');
   // Level filter + detail-pane height are persisted in the FlexLayout node config
   // so they survive reloads.
@@ -137,7 +140,7 @@ export default function Console({ node }: { node?: TabNode } = {}) {
 
   const clearLogs = () => {
     logBuffer.length = 0;
-    setSelectedId(null);
+    setSelectedId(null); setCopied(false);
     setVersion(bumpLogIdCounter());
     setAutoScroll(true);
     // Reset scroll to the top — the list is now empty, so a leftover large
@@ -259,7 +262,7 @@ export default function Console({ node }: { node?: TabNode } = {}) {
           return (
             <div
               key={entry.id}
-              onClick={() => setSelectedId(entry.id)}
+              onClick={() => { setSelectedId(entry.id); setCopied(false); }}
               style={{
                 height: ROW_HEIGHT, boxSizing: 'border-box',
                 color: levelColor[entry.level],
@@ -294,6 +297,28 @@ export default function Console({ node }: { node?: TabNode } = {}) {
               <span style={{ color: levelColor[selectedEntry.level], fontWeight: 'bold', textTransform: 'uppercase' }}>
                 {selectedEntry.level}
               </span>
+              {/* Copy the WHOLE entry — message first, then stack. A stack pasted without its
+                  message line is undiagnosable (the message names the offending value), and a
+                  reload wipes the buffer, so grabbing it in one click matters. */}
+              <button
+                onClick={() => {
+                  const { time, level, message, stack } = selectedEntry;
+                  const text = `[${time}] ${level.toUpperCase()}: ${message}${stack ? `\n${stack}` : ''}`;
+                  void navigator.clipboard.writeText(text).then(
+                    () => setCopied(true),
+                    () => setCopied(false),
+                  );
+                }}
+                title="Copy message + stack"
+                data-ui-id="console.detail.copy" data-ui-kind="button" data-ui-label="copy entry"
+                style={{
+                  marginLeft: 'auto', background: '#252540', color: '#bbb',
+                  border: '1px solid #383858', borderRadius: 3, cursor: 'pointer',
+                  fontSize: '10px', fontFamily: 'monospace', padding: '1px 7px',
+                }}
+              >
+                {copied ? 'copied ✓' : 'copy'}
+              </button>
             </div>
             <pre style={{
               margin: 0, fontSize: '11px', color: '#ddd',

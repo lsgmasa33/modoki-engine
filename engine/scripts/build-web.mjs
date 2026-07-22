@@ -13,20 +13,21 @@
 import { execSync } from 'node:child_process';
 import { writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
+import { isProjectDir } from './projectRoots.mjs';
 
 const repoRoot = process.cwd();
 const engineDir = path.join(repoRoot, 'engine');
 const proj = process.env.MODOKI_PROJECT; // 'games/<id>' (in-repo) or an external abs path
 
-// Include the engine app always; add the active game ONLY when it lives inside
-// this repo's games/ (an external project's TS isn't in the repo tsconfig graph,
-// and we never include sibling games). Paths are relative to engineDir, where the
-// generated tsconfig sits, so its `extends` + relative includes resolve correctly.
+// Include the engine app always; add the active project ONLY when it lives inside
+// one of this repo's project roots — games/ or demos/ (an external project's TS
+// isn't in the repo tsconfig graph, and we never include sibling projects). Paths
+// are relative to engineDir, where the generated tsconfig sits, so its `extends` +
+// relative includes resolve correctly.
 const include = ['app'];
 if (proj) {
   const abs = path.resolve(repoRoot, proj);
-  const gamesDir = path.join(repoRoot, 'games');
-  if (abs === path.join(gamesDir, path.basename(abs)) && abs.startsWith(gamesDir + path.sep)) {
+  if (isProjectDir(repoRoot, abs)) {
     include.push(path.relative(engineDir, abs).split(path.sep).join('/'));
   }
 }

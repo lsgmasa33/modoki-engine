@@ -92,6 +92,64 @@ describe('vendorEnginePlugins', () => {
     expect(r.needsInstall).toBe(true);
   });
 
+  /** Regression: a clone whose dist/ predates a source change used to pack that
+   *  STALE dist. Because the content hash was taken FROM the stale dist, the name
+   *  matched the already-committed tarball, so nothing re-packed and
+   *  ensurePluginBuilt (reached only via packInto) never ran — a permanent no-op
+   *  that shipped a plugin missing its newest API. Real instance: the committed
+   *  capacitor-game-debug tarball lacked getDeviceIp in dist AND native. */
+  describe('stale dist detection', () => {
+    /** A plugin with REAL sources (a src/ dir), so the build stamp applies.
+     *  writeEnginePlugin's `src.swift` is a file, not a source dir. */
+    function writeSourcedPlugin(srcBody: string) {
+      const dir = writeEnginePlugin();
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'index.ts'), srcBody);
+      return dir;
+    }
+    const buildCalls = () =>
+      execFileSyncMock.mock.calls.filter((c) => c[1][0] === 'run' && c[1][1] === 'build').length;
+
+    it('REBUILDS when sources changed since dist was built (stale dist)', () => {
+      const dir = writeSourcedPlugin('export const v = 1');
+      writeProjectPkg({ [PLUGIN]: '*' });
+      vendorEnginePlugins(projectRoot, engineRoot); // builds + stamps
+      installRealCopy();
+      execFileSyncMock.mockClear();
+
+      // Source moves on; dist on disk is now stale.
+      fs.writeFileSync(path.join(dir, 'src', 'index.ts'), 'export const v = 2');
+      vendorEnginePlugins(projectRoot, engineRoot);
+
+      expect(buildCalls()).toBe(1);
+    });
+
+    it('does NOT rebuild when sources are unchanged (stamp hit)', () => {
+      writeSourcedPlugin('export const v = 1');
+      writeProjectPkg({ [PLUGIN]: '*' });
+      vendorEnginePlugins(projectRoot, engineRoot);
+      installRealCopy();
+      execFileSyncMock.mockClear();
+
+      vendorEnginePlugins(projectRoot, engineRoot);
+
+      expect(buildCalls()).toBe(0);
+    });
+
+    it('the build stamp is NOT part of the shipped fileset (no spurious re-pack)', () => {
+      writeSourcedPlugin('export const v = 1');
+      writeProjectPkg({ [PLUGIN]: '*' });
+      vendorEnginePlugins(projectRoot, engineRoot);
+      installRealCopy();
+      const before = listTarballs();
+
+      const r = vendorEnginePlugins(projectRoot, engineRoot);
+
+      expect(r.changed).toBe(false);
+      expect(listTarballs()).toEqual(before);
+    });
+  });
+
   it('migrates an old file:../../engine directory-symlink spec to the tarball copy', () => {
     writeEnginePlugin();
     writeProjectPkg({ [PLUGIN]: 'file:../../engine/packages/capacitor-game-debug' });
@@ -275,9 +333,9 @@ describe('vendorEnginePlugins', () => {
 // file (src/, tsconfig, lockfile) does NOT rename the content-addressed tarball
 // when the shipped dist/ios/android bytes are identical. This fixes the spurious
 // re-pack churn: the shipped bytes never changed, but the tarball name drifted.
-describe('vendorEnginePlugins — hash scoped to the published fileset', () => {
-  /** A plugin with an explicit `files` allowlist (dist + a native src dir) plus
-   *  dev-only files that npm never ships (src/, tsconfig, package-lock). */
+describe('vendorEnginePlugins — hash scoped to SOURCE inputs (dist/ excluded)', () => {
+  /** A plugin with a built `dist/` (derived output) alongside its source inputs
+   *  (src/, native ios/, manifest) and a lockfile npm always excludes. */
   function writePluginWithFiles(name = PLUGIN, version = '1.0.0') {
     const dir = path.join(engineRoot, 'engine', 'packages', name);
     fs.mkdirSync(path.join(dir, 'dist'), { recursive: true });
@@ -287,18 +345,20 @@ describe('vendorEnginePlugins — hash scoped to the published fileset', () => {
       name, version, capacitor: { android: {}, ios: {} },
       files: ['dist/', 'ios/Sources/', 'Package.swift'],
     }));
-    fs.writeFileSync(path.join(dir, 'dist', 'plugin.js'), '// shipped runtime');
-    fs.writeFileSync(path.join(dir, 'ios', 'Sources', 'Plugin.swift'), 'shipped swift');
-    fs.writeFileSync(path.join(dir, 'Package.swift'), 'shipped manifest');
-    fs.writeFileSync(path.join(dir, 'README.md'), 'shipped readme');
-    // Dev-only — NOT in `files`, npm never ships these:
+    fs.writeFileSync(path.join(dir, 'dist', 'plugin.js'), '// built runtime');
+    fs.writeFileSync(path.join(dir, 'ios', 'Sources', 'Plugin.swift'), 'source swift');
+    fs.writeFileSync(path.join(dir, 'Package.swift'), 'source manifest');
+    fs.writeFileSync(path.join(dir, 'README.md'), 'source readme');
     fs.writeFileSync(path.join(dir, 'src', 'index.ts'), 'source v1');
     fs.writeFileSync(path.join(dir, 'tsconfig.json'), '{}');
     fs.writeFileSync(path.join(dir, 'package-lock.json'), '{"v":1}');
     return dir;
   }
 
-  it('does NOT re-pack when a non-shipped dev file changes (shipped bytes identical)', () => {
+  it('does NOT re-pack when ONLY the built dist/ changes (toolchain-drift churn killer)', () => {
+    // The whole point: dist/ is a build artifact that drifts with tsc/rollup
+    // versions across clones + over time. A dist-only delta must NOT rename the
+    // tarball, or every `npm install` re-vendors and commits a "sync tgz" churn.
     const dir = writePluginWithFiles();
     writeProjectPkg({ [PLUGIN]: '*' });
     vendorEnginePlugins(projectRoot, engineRoot);
@@ -307,10 +367,9 @@ describe('vendorEnginePlugins — hash scoped to the published fileset', () => {
     installRealCopy();
     const packsBefore = execFileSyncMock.mock.calls.filter((c) => c[1][0] === 'pack').length;
 
-    // Change dev-only files that npm pack excludes — the published bytes are unchanged.
-    fs.writeFileSync(path.join(dir, 'src', 'index.ts'), 'source v2 CHANGED');
-    fs.writeFileSync(path.join(dir, 'tsconfig.json'), '{"strict":true}');
-    fs.writeFileSync(path.join(dir, 'package-lock.json'), '{"v":2}');
+    // Simulate a toolchain-drift rebuild: dist/ bytes change, source is untouched.
+    fs.writeFileSync(path.join(dir, 'dist', 'plugin.js'), '// built runtime (different tsc/rollup)');
+    fs.writeFileSync(path.join(dir, 'dist', 'plugin.cjs.js'), '// new file the newer build emits');
     const r = vendorEnginePlugins(projectRoot, engineRoot);
 
     expect(r.changed).toBe(false);            // no spurious re-pack
@@ -319,13 +378,33 @@ describe('vendorEnginePlugins — hash scoped to the published fileset', () => {
     expect(packsAfter).toBe(packsBefore);
   });
 
-  it('DOES re-pack under a new hash when a SHIPPED file changes', () => {
+  it('does NOT re-pack when native build output/cache appears (android/build, .gradle)', () => {
+    // Gradle emits android/build + android/.gradle on a native build — derived,
+    // gitignored, machine-specific. Hashing them would make the tarball name
+    // depend on whether Android was built locally (a second churn vector).
+    const dir = writePluginWithFiles();
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot);
+    const before = listTarballs();
+    installRealCopy();
+
+    fs.mkdirSync(path.join(dir, 'android', 'build', 'intermediates'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'android', 'build', 'intermediates', 'App.class'), 'BYTECODE');
+    fs.mkdirSync(path.join(dir, 'android', '.gradle', '9.2.0'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'android', '.gradle', '9.2.0', 'fileHashes.bin'), 'GRADLE CACHE');
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+
+    expect(r.changed).toBe(false);
+    expect(listTarballs()).toEqual(before);
+  });
+
+  it('DOES re-pack under a new hash when a SOURCE input changes (src/)', () => {
     const dir = writePluginWithFiles();
     writeProjectPkg({ [PLUGIN]: '*' });
     vendorEnginePlugins(projectRoot, engineRoot);
     const before = listTarballs()[0];
 
-    fs.writeFileSync(path.join(dir, 'dist', 'plugin.js'), '// shipped runtime CHANGED');
+    fs.writeFileSync(path.join(dir, 'src', 'index.ts'), 'source v2 CHANGED');
     const r = vendorEnginePlugins(projectRoot, engineRoot);
 
     expect(r.changed).toBe(true);
@@ -334,23 +413,48 @@ describe('vendorEnginePlugins — hash scoped to the published fileset', () => {
     expect(after[0]).not.toBe(before); // new content hash
   });
 
-  it('a machine-local junk file (.DS_Store) inside a shipped dir does not affect the hash', () => {
+  it('DOES re-pack when a native source input changes (ios/Sources)', () => {
+    const dir = writePluginWithFiles();
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot);
+    const before = listTarballs()[0];
+
+    fs.writeFileSync(path.join(dir, 'ios', 'Sources', 'Plugin.swift'), 'source swift CHANGED');
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+
+    expect(r.changed).toBe(true);
+    expect(listTarballs()[0]).not.toBe(before);
+  });
+
+  it('does NOT re-pack when only the lockfile changes (npm-always-excluded)', () => {
     const dir = writePluginWithFiles();
     writeProjectPkg({ [PLUGIN]: '*' });
     vendorEnginePlugins(projectRoot, engineRoot);
     const before = listTarballs();
     installRealCopy();
 
-    fs.writeFileSync(path.join(dir, 'dist', '.DS_Store'), 'FINDER JUNK');
+    fs.writeFileSync(path.join(dir, 'package-lock.json'), '{"v":2}');
     const r = vendorEnginePlugins(projectRoot, engineRoot);
 
     expect(r.changed).toBe(false);
     expect(listTarballs()).toEqual(before);
   });
 
-  it('falls back to whole-dir hashing when there is no `files` field (safe over-hash)', () => {
-    // No `files` field → the shipped set is unknown → hash everything (old behavior),
-    // so even a non-shipped change re-packs. Over-hashing is safe (never a collision).
+  it('a machine-local junk file (.DS_Store) inside a source dir does not affect the hash', () => {
+    const dir = writePluginWithFiles();
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot);
+    const before = listTarballs();
+    installRealCopy();
+
+    fs.writeFileSync(path.join(dir, 'ios', 'Sources', '.DS_Store'), 'FINDER JUNK');
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+
+    expect(r.changed).toBe(false);
+    expect(listTarballs()).toEqual(before);
+  });
+
+  it('hashes source inputs even when there is no `files` field', () => {
     const dir = writeEnginePlugin(); // helper writes NO files field
     writeProjectPkg({ [PLUGIN]: '*' });
     vendorEnginePlugins(projectRoot, engineRoot);

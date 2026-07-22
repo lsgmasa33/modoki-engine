@@ -11,6 +11,10 @@
 
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
 import { backendFetch } from '../backend/editorBackend';
+import { useOverlay } from '../input/useOverlayEscape';
+import { isTextEditable } from '../input/focusScope';
+import { register } from '../input/keymap';
+import { useHmrEpoch } from '../input/hmrEpoch';
 import { useEditorStore } from '../store/editorStore';
 import { writeMetaOrWarn } from './assetViews/widgets';
 import {
@@ -51,6 +55,7 @@ const DEFAULT_GRID: GridOpts = { mode: 'count', cols: 4, rows: 4, cellW: 64, cel
 interface EditorSnap { sprites: SpriteSlice[]; grid: GridOpts; alpha: number; }
 
 export function SpriteEditor({ path, name, onClose }: { path: string; name: string; onClose: () => void }) {
+  const hmrEpoch = useHmrEpoch();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
   const [imgDims, setImgDims] = useState<{ w: number; h: number } | null>(null);
@@ -353,22 +358,38 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   // this modal. When focus is in a name/number input we still block the global
   // undo, but skip our own undo + don't preventDefault, so the browser's native
   // text-undo works inside the field.
+  // Registered in the OVERLAY scope (focus-scope refactor P6, corrected in P8).
+  //
+  // The old capture-phase listener encoded TWO separate things, and they must not be
+  // collapsed into one condition:
+  //   1. ALWAYS stopPropagation — the global scene undo must never run while this modal is
+  //      open, in any focus state, because it can change selection, swap the Inspector off
+  //      this texture and unmount the modal with unsaved slice edits.
+  //   2. preventDefault only OUTSIDE a text field — so the browser's native text-undo still
+  //      works while typing in the slice-name / number fields.
+  //
+  // The first migration expressed (2) as `when`, which silently broke (1): a false `when`
+  // YIELDS, so resolution fell through to `app.undo` (app-chord, always eligible) and the
+  // scene undo ran underneath the modal — the exact failure the original guarded against.
+  // Claiming and preventing are separate decisions, so they are separate fields.
+  const overlayId = useOverlay(true, 'sprite-editor');
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const meta = e.metaKey || e.ctrlKey;
-      if (!meta) return;
-      const k = e.key.toLowerCase();
-      if (k !== 'z' && k !== 'y') return;
-      e.stopPropagation(); // block the editor's global undo regardless of focus
-      const t = e.target as HTMLElement | null;
-      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
-      e.preventDefault();
-      if (k === 'y' || e.shiftKey) redo();
-      else undo();
-    };
-    window.addEventListener('keydown', onKey, { capture: true });
-    return () => window.removeEventListener('keydown', onKey, { capture: true } as EventListenerOptions);
-  }, [undo, redo]);
+    const notTyping = () => !isTextEditable(document.activeElement);
+    // No `when`: these ALWAYS claim, denying the chord to the app scope. `run` no-ops while
+    // typing, and `preventDefault` stays false there so native text-undo survives.
+    const mk = (id: string, keys: string, fn: () => void) =>
+      register({
+        id, keys, scope: 'overlay', owner: overlayId,
+        preventDefault: notTyping,
+        run: () => { if (notTyping()) fn(); },
+      });
+    const offs = [
+      mk('spriteEditor.undo', 'mod+z', undo),
+      mk('spriteEditor.redo', 'mod+shift+z', redo),
+      mk('spriteEditor.redoY', 'mod+y', redo),
+    ];
+    return () => { for (const off of offs) off(); };
+  }, [undo, redo, overlayId, hmrEpoch]);
 
   // ── Mouse interaction ──
   const onMouseDown = (e: React.MouseEvent) => {

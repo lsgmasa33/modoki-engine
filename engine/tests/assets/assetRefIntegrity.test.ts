@@ -21,12 +21,14 @@ import fs from 'fs';
 import { findAssetRoots, readAssetGuid, detectType, type AssetRoot } from '../../plugins/vite-asset-scanner';
 import { deriveGuid } from '../../packages/modoki/src/runtime/loaders/assetRefRules';
 import { resolveTextureType } from '../../packages/modoki/src/runtime/loaders/textureSettings';
+import { discoverProjects } from '../../scripts/projectRoots.mjs';
 
-// engine/tests/assets/ → repo root (games/ + engine/packages/modoki live there).
+// engine/tests/assets/ → repo root (games/ + demos/ + engine/packages/modoki live there).
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
-// The "real assets" checks below scan the repo's shipped GAME assets; skip the game-dependent
-// cases when games/ is absent (engine-only OSS repo). docs/plans/engine-oss-public-repo.md.
-const hasGames = fs.existsSync(path.join(PROJECT_ROOT, 'games'));
+// The "real assets" checks below scan the repo's shipped PROJECT assets (findAssetRoots
+// already covers both project roots); skip the project-dependent cases when neither root
+// exists (engine-only OSS repo). docs/plans/engine-oss-public-repo.md.
+const hasGames = discoverProjects(PROJECT_ROOT).length > 0;
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isGuid = (s: unknown): s is string => typeof s === 'string' && GUID_RE.test(s);
 

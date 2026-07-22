@@ -25,7 +25,7 @@ test('keyboard Cmd+Z reverts an Inspector edit', async ({ page }) => {
   await setInputByValue(page, 'CenterCube', 'RenamedCube');
   await expect.poll(() => traitField(page, id!, 'EntityAttributes', 'name')).toBe('RenamedCube');
 
-  await page.keyboard.press('Meta+z');
+  await page.keyboard.press('ControlOrMeta+z');
   await expect.poll(() => traitField(page, id!, 'EntityAttributes', 'name')).toBe('CenterCube');
 });
 
@@ -47,7 +47,9 @@ test('keyboard delete removes the selected entity', async ({ page }) => {
   await page.getByText('OffsetSphere', { exact: true }).click();
   await expect.poll(() => selectedName(page)).toBe('OffsetSphere');
 
-  await page.keyboard.press('Meta+Backspace'); // macOS delete-entity shortcut
+  // Hierarchy registers BOTH 'mod+Backspace' and 'Delete', and 'mod' is Cmd on mac /
+  // Ctrl elsewhere — so ControlOrMeta+Backspace hits the real binding on either platform.
+  await page.keyboard.press('ControlOrMeta+Backspace');
   await expect.poll(async () => (await entityNames(page)).includes('OffsetSphere')).toBe(false);
 });
 
@@ -64,7 +66,7 @@ test('Cmd+S serializes the live scene and POSTs it to /api/write-file', async ({
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) });
   });
 
-  await page.keyboard.press('Meta+s');
+  await page.keyboard.press('ControlOrMeta+s');
 
   await expect.poll(() => body).not.toBeNull();
   const scene = JSON.parse(body!.content!);

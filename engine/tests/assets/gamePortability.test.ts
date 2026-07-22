@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { discoverProjects } from '../../scripts/projectRoots.mjs';
 
 /**
  * PORTABILITY GUARD — a game project must be SELF-CONTAINED (#29): it's opened
@@ -16,7 +17,10 @@ import { fileURLToPath } from 'node:url';
  * `../../../../engine/app/store/gameStore` (moved to `@modoki/engine/runtime`).
  */
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
-const gamesDir = path.join(repoRoot, 'games');
+// Every project under BOTH roots — games/ (internal) and demos/ (publishable).
+// A demo is copied out of the repo even more often than a game is, so the
+// self-containment guard matters at least as much there.
+const projects = discoverProjects(repoRoot);
 
 // KNOWN, TRACKED cross-game coupling still to resolve: chess reuses llm-test's
 // on-device-LLM service (LLMService / initLLMSession). Until that's extracted to a
@@ -44,9 +48,8 @@ function walk(dir: string, out: string[] = []): string[] {
 function escapingImports(): string[] {
   const out: string[] = [];
   const importRe = /(?:from|import\()\s*['"](\.[^'"]+)['"]/g;
-  for (const g of fs.readdirSync(gamesDir)) {
-    const gameRoot = path.join(gamesDir, g);
-    if (!fs.statSync(gameRoot).isDirectory()) continue;
+  for (const proj of projects) {
+    const gameRoot = proj.dir;
     for (const file of walk(gameRoot)) {
       const src = fs.readFileSync(file, 'utf8');
       let m: RegExpExecArray | null;
@@ -63,9 +66,9 @@ function escapingImports(): string[] {
   return out;
 }
 
-// Skip when games/ is absent (the OSS public repo ships engine-only — no games to check
-// portability of). docs/plans/engine-oss-public-repo.md.
-describe.skipIf(!fs.existsSync(gamesDir))('game project portability (self-contained — no relative escapes)', () => {
+// Skip when NO project root exists (the OSS public repo ships engine-only — nothing to
+// check portability of). docs/plans/engine-oss-public-repo.md.
+describe.skipIf(projects.length === 0)('game project portability (self-contained — no relative escapes)', () => {
   it('no game imports outside its own folder except the known tracked coupling', () => {
     const unexpected = escapingImports().filter((e) => !KNOWN_ESCAPES.has(e));
     expect(
@@ -87,8 +90,8 @@ describe.skipIf(!fs.existsSync(gamesDir))('game project portability (self-contai
   // the repo. (Android already does this via capacitor.settings.gradle.)
   it('no committed iOS pbxproj references the repo engine via a path (use node_modules)', () => {
     const offenders: string[] = [];
-    for (const g of fs.readdirSync(gamesDir)) {
-      const iosDir = path.join(gamesDir, g, 'ios');
+    for (const proj of projects) {
+      const iosDir = path.join(proj.dir, 'ios');
       if (!fs.existsSync(iosDir)) continue;
       for (const file of walk(iosDir).filter((f) => f.endsWith('.pbxproj'))) {
         const src = fs.readFileSync(file, 'utf8');

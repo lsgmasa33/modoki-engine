@@ -10,6 +10,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { backendFetch } from '../backend/editorBackend';
 import { useEditorStore } from '../store/editorStore';
+import { register } from '../input/keymap';
+import { useHmrEpoch } from '../input/hmrEpoch';
 import { getCurrentWorld, onWorldSwap } from '../../runtime/ecs/world';
 import { resolveDirectorRootForTimeline } from './openAssetInEditor';
 import { fireDirtyListeners, findEntity } from '../../runtime/ecs/entityUtils';
@@ -60,6 +62,7 @@ const inputStyle: React.CSSProperties = { width: 60, background: '#191919', bord
 const btn: React.CSSProperties = { fontSize: 11, background: '#2a2a31', border: '1px solid #3a3a42', color: '#cfcfd6', borderRadius: 3, padding: '3px 8px', cursor: 'pointer' };
 
 export default function TimelineEditor() {
+  const hmrEpoch = useHmrEpoch();
   const asset = useEditorStore((s) => s.editingTimelineAsset);
   const nonce = useEditorStore((s) => s.timelineEditNonce);
   const doc = useEditorStore((s) => s.editingTimelineDoc);
@@ -111,8 +114,6 @@ export default function TimelineEditor() {
   const lastTime = useRef(0);
   const savedMarkRef = useRef<((d: TimelineDef) => void) | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const hoverRef = useRef(false);
-  const activeRef = useRef(false);
   // The live preview loop's rAF id, held in a ref so scrub()/exit can stop the loop + close the audio/
   // dispatch gates SYNCHRONOUSLY. Relying on the preview effect's cleanup alone lets one already-
   // scheduled tick fire (React defers the cleanup), advancing the playhead past the grab point (C7).
@@ -265,24 +266,19 @@ export default function TimelineEditor() {
   // engaged panel (hovered or last-clicked-inside) and yields when a text field is focused or
   // nothing is selected, so it never steals Delete from an input or another panel. ──
   useEffect(() => {
-    const onDown = (e: PointerEvent) => { activeRef.current = !!rootRef.current?.contains(e.target as Node); };
-    document.addEventListener('pointerdown', onDown, true);
-    return () => document.removeEventListener('pointerdown', onDown, true);
-  }, []);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (!hoverRef.current && !activeRef.current) return;
-      const el = e.target as HTMLElement | null;
-      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
-      if (!useEditorStore.getState().editingTimelineDoc) return;
-      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedTrack != null && selectedItem != null) {
-        e.preventDefault();
-        deleteItemAt(selectedTrack, selectedItem);
-      }
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [deleteItemAt, selectedTrack, selectedItem]);
+    // Scoped to `timeline-editor` by the keymap (focus-scope refactor P5) — was a document
+    // keydown gated on hoverRef||activeRef, so a stray pointer move changed who claimed
+    // Delete. when() preserves the original yield: with no doc open or nothing selected the
+    // chord is left unclaimed, so Hierarchy's entity-delete still works.
+    const canDelete = () =>
+      !!useEditorStore.getState().editingTimelineDoc && selectedTrack != null && selectedItem != null;
+    const del = () => { if (selectedTrack != null && selectedItem != null) deleteItemAt(selectedTrack, selectedItem); };
+    const offs = [
+      register({ id: 'timeline.deleteItem', keys: 'Delete', scope: 'timeline-editor', when: canDelete, run: del }),
+      register({ id: 'timeline.deleteItemBack', keys: 'Backspace', scope: 'timeline-editor', when: canDelete, run: del }),
+    ];
+    return () => { for (const off of offs) off(); };
+  }, [deleteItemAt, selectedTrack, selectedItem, hmrEpoch]);
 
   // ── Scrub / transport ──
   // A scrub is a silent pose inside the PREVIEW SESSION envelope (Phase 3): the session snapshots
@@ -308,7 +304,7 @@ export default function TimelineEditor() {
       // can't un-run a sim), rebind the Director (ids change on reload), REOPEN the envelope's
       // session for the ongoing scrub, then pose at the target time.
       const path = store.editingTimelineAsset?.path;
-      void endTimelinePreviewSession({ restore: true, timelinePath: path })
+      void endTimelinePreviewSession({ restore: true, rebind: () => (path ? resolveDirectorRootForTimeline(path) : null) })
         .then((newRoot) => { if (newRoot != null) useEditorStore.getState().setDirectorRoot(newRoot); return beginTimelinePreviewSession(); })
         .then(() => poseAt(clamped));
     } else if (!hasTimelinePreviewSession()) {
@@ -329,7 +325,7 @@ export default function TimelineEditor() {
     store.setPreviewPlaying(false);
     clearPreviewControls();
     const path = store.editingTimelineAsset?.path;
-    void endTimelinePreviewSession({ restore: true, timelinePath: path }).then((newRoot) => {
+    void endTimelinePreviewSession({ restore: true, rebind: () => (path ? resolveDirectorRootForTimeline(path) : null) }).then((newRoot) => {
       if (newRoot != null) useEditorStore.getState().setDirectorRoot(newRoot);
     });
     exitPreviewMode('timeline');
@@ -411,7 +407,7 @@ export default function TimelineEditor() {
     clearPreviewControls();
     if (hasTimelinePreviewSession()) {
       const path = useEditorStore.getState().editingTimelineAsset?.path;
-      void endTimelinePreviewSession({ restore: true, timelinePath: path });
+      void endTimelinePreviewSession({ restore: true, rebind: () => (path ? resolveDirectorRootForTimeline(path) : null) });
     }
     exitPreviewMode('timeline'); // panel gone → return the global run-mode to stopped
   }, []);
@@ -456,7 +452,7 @@ export default function TimelineEditor() {
   const sel = selectedTrack != null ? doc.tracks[selectedTrack] : null;
 
   return (
-    <div ref={rootRef} onMouseEnter={() => { hoverRef.current = true; }} onMouseLeave={() => { hoverRef.current = false; }}
+    <div ref={rootRef}
       style={{ display: 'flex', flexDirection: 'column', height: '100%', background: '#1b1b1f', color: '#cfcfd6', fontSize: 12 }}>
       {/* Toolbar */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 8px', borderBottom: '1px solid #2f2f37', flexWrap: 'wrap' }}>

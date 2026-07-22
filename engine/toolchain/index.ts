@@ -19,6 +19,7 @@
  */
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { ensureJdk, discoverJavaHome, jdkVersionDir } from './jdkProvision'
 import { ensureCmdlineTools, runSdkmanager, ANDROID_SDK_PACKAGES } from './androidSdkProvision'
@@ -90,6 +91,32 @@ export function systemToolchainAllowed(): boolean {
   return readToolchainSettings().allowSystemToolchain
 }
 
+/** Whether the EDITOR itself can supply this tool in the CURRENT environment — because the packaged
+ *  app bundles it (toktx, msdf-atlas-gen), provisions it (Node/npm), or can `install()` it into the
+ *  toolchain dir. Only such a tool has its system fallback gated by the toggle: refusing to fall back
+ *  for a tool we cannot provide would report a perfectly good one as missing with no way to fix it.
+ *   - `xcodebuild` — Apple-supplied, never bundled ⇒ always resolved from the system.
+ *   - `npm` — gated only where we actually download Node (packaged, or MODOKI_PROVISION_NODE=1);
+ *     a plain dev checkout has no provisioned Node, so its PATH npm stays usable.
+ *   - bundled binaries — gated only when the host set their env var (i.e. the bundle is present). */
+function editorCanProvide(id: ToolId): boolean {
+  switch (id) {
+    case 'xcodebuild': return false
+    case 'npm': return process.env.MODOKI_PROVISION_NODE === '1'
+    case 'toktx': return !!process.env.MODOKI_TOKTX
+    case 'msdf-atlas-gen': return !!process.env.MODOKI_MSDF_ATLAS_GEN
+    default: return !!process.env.MODOKI_TOOLCHAIN_DIR && isInstallable(id)
+  }
+}
+
+/** Whether resolving `id` may fall through to a SYSTEM install — a PATH binary, a user-set
+ *  JAVA_HOME/ANDROID_HOME, or a well-known Android-Studio/Homebrew dir. With "Use system-installed
+ *  SDKs" OFF this is false for every tool the editor can provide itself, so a packaged editor builds
+ *  ONLY with its own toolchain and never silently picks up whatever is on the machine. */
+function systemFallbackAllowed(id: ToolId): boolean {
+  return systemToolchainAllowed() || !editorCanProvide(id)
+}
+
 /** A binary tool: resolved from an env override or PATH, validated by a `--version` probe. */
 interface BinaryDescriptor {
   kind: 'binary'
@@ -109,9 +136,15 @@ interface BinaryDescriptor {
  *  replaces the two previously divergent Android-SDK probes (healNativeConfig + vite-asset-scanner). */
 interface DirectoryDescriptor {
   kind: 'directory'
-  /** Env vars carrying the root dir, tried first, in order. */
+  /** OUR provisioned install(s) under MODOKI_TOOLCHAIN_DIR. Always tried, and tried FIRST — the
+   *  editor's own SDK outranks a system one even with the toggle on, so a build stays reproducible
+   *  once you've installed it here. (Previously the env vars won, so a stray JAVA_HOME shadowed the
+   *  JDK the user had just installed from this very dialog.) */
+  bundled?: () => string[]
+  /** SYSTEM env vars carrying the root dir (JAVA_HOME, ANDROID_HOME), tried in order — gated by
+   *  `systemFallbackAllowed`: these point at the machine's SDKs, not ours. */
   envVars?: string[]
-  /** Well-known install dirs, tried after the env vars. */
+  /** Well-known SYSTEM install dirs, tried after the env vars — gated the same way. */
   candidates: () => string[]
   /** A sub-path that must exist under a candidate for it to count (e.g. `platform-tools`). */
   marker: string
@@ -159,33 +192,40 @@ const REGISTRY: Record<ToolId, ToolDescriptor> = {
   },
   'android-sdk': {
     kind: 'directory',
-    // env overrides first (both the Google-standard names), then the well-known install dirs —
-    // the UNION of the two former probes' candidate lists (Homebrew command-line-tools, the macOS
+    // A userData SDK from `install('android-sdk')` wins first — in a packaged editor it's the ONLY
+    // SDK. It only counts once platform-tools is installed (the marker), so a half-provisioned dir
+    // is skipped and dev machines fall through to the system dirs below.
+    bundled: () => (process.env.MODOKI_TOOLCHAIN_DIR ? [path.join(process.env.MODOKI_TOOLCHAIN_DIR, 'android-sdk')] : []),
+    // Then the env overrides (both Google-standard names), then the well-known install dirs — the
+    // UNION of the two former probes' candidate lists (Homebrew command-line-tools, the macOS
     // Android Studio location, and the Linux $HOME/Android/Sdk that only healNativeConfig had).
     envVars: ['ANDROID_HOME', 'ANDROID_SDK_ROOT'],
     candidates: () => {
-      const home = process.env.HOME ?? ''
+      const home = os.homedir()
       const list: string[] = []
-      // A userData SDK from `install('android-sdk')` wins first — in a packaged editor it's the ONLY
-      // SDK. It only counts once platform-tools is installed (the marker), so a half-provisioned dir
-      // is skipped and dev machines fall through to the well-known dirs below.
-      if (process.env.MODOKI_TOOLCHAIN_DIR) list.push(path.join(process.env.MODOKI_TOOLCHAIN_DIR, 'android-sdk'))
-      // Bundled-only (packaged editor, "Use system SDKs" off): skip the well-known
-      // Android Studio / Homebrew SDK dirs — use only our provisioned SDK.
-      if (systemToolchainAllowed()) {
-        if (process.platform === 'win32') {
-          // Android Studio's default SDK location on Windows (%LOCALAPPDATA%\Android\Sdk).
-          const localAppData = process.env.LOCALAPPDATA
-          if (localAppData) list.push(path.join(localAppData, 'Android', 'Sdk'))
-        } else {
-          list.push(
-            '/opt/homebrew/share/android-commandlinetools',
-            '/usr/local/share/android-commandlinetools',
-            path.join(home, 'Library/Android/sdk'),
-            path.join(home, 'Android/Sdk'),
-          )
+      if (process.platform === 'win32') {
+        // Android Studio's default SDK location, plus the other spellings that show up on Windows
+        // boxes (a machine-wide install under Program Files, and the bare C:\Android\Sdk people
+        // pick to dodge the space in "Program Files").
+        for (const b of [process.env.LOCALAPPDATA, path.join(home, 'AppData', 'Local')]) {
+          if (b) list.push(path.join(b, 'Android', 'Sdk'))
         }
+        for (const b of [process.env.ProgramFiles, process.env['ProgramFiles(x86)']]) {
+          if (b) list.push(path.join(b, 'Android', 'android-sdk'), path.join(b, 'Android', 'Sdk'))
+        }
+        list.push('C:\\Android\\Sdk', 'C:\\Android\\android-sdk')
+      } else {
+        list.push(
+          '/opt/homebrew/share/android-commandlinetools',
+          '/usr/local/share/android-commandlinetools',
+          path.join(home, 'Library/Android/sdk'),
+          path.join(home, 'Android/Sdk'),
+        )
       }
+      // Last resort: derive the SDK root from an `adb` the user already has on PATH
+      // (<sdk>/platform-tools/adb). Catches every non-standard install location for free.
+      const adb = whichSync(process.platform === 'win32' ? 'adb.exe' : 'adb')
+      if (adb) list.push(path.dirname(path.dirname(adb)))
       return list
     },
     // Consistent existence check: a USABLE SDK has platform-tools (adb lives here). This is
@@ -198,11 +238,12 @@ const REGISTRY: Record<ToolId, ToolDescriptor> = {
   },
   java: {
     kind: 'directory',
-    // JAVA_HOME override, else the same candidates the former build-time `javaPrefix` bash probed,
-    // in the same order: the VERSIONED Homebrew openjdk@21 (Android/AGP needs JDK 21 specifically —
-    // Gradle can't read newer bytecode), then unversioned openjdk, then `/usr/libexec/java_home -v 21`.
+    // Our provisioned Temurin first, then JAVA_HOME, then the well-known system JDK locations
+    // (on macOS the same ones the former build-time `javaPrefix` bash probed: VERSIONED Homebrew
+    // openjdk@21 → unversioned openjdk → `/usr/libexec/java_home -v 21`).
+    bundled: provisionedJavaHomes,
     envVars: ['JAVA_HOME'],
-    candidates: javaHomeCandidates,
+    candidates: systemJavaHomeCandidates,
     marker: path.join('bin', process.platform === 'win32' ? 'java.exe' : 'java'),
     // Version-strict: Android/AGP is JDK-21-specific (Gradle can't read newer bytecode), so a
     // present-but-wrong JDK (unversioned brew openjdk 25, a JAVA_HOME pointing at 17, `java_home -v
@@ -295,6 +336,79 @@ const REGISTRY: Record<ToolId, ToolDescriptor> = {
  *  (Pure/platform-injectable for host-agnostic tests.) */
 export function needsWinShell(command: string, platform: NodeJS.Platform = process.platform): boolean {
   return platform === 'win32' && /\.(cmd|bat)$/i.test(command)
+}
+
+/** Make a resolved command + args safely spawnable: whether a shell is required (a Windows
+ *  `.cmd`/`.bat` shim — see needsWinShell) and, when it is, the command/args QUOTED. Node
+ *  concatenates argv into one command line for `shell:true`, so an unquoted path with a space
+ *  (`C:\Users\Jane Doe\…\gltf-transform.cmd`, or a project under `My Games\`) is split by the
+ *  shell and the spawn fails with a baffling "is not recognized as an internal or external
+ *  command". Every spawn/execFile of a toolchain-resolved command should go through this. */
+export function spawnable(
+  command: string,
+  args: string[] = [],
+  platform: NodeJS.Platform = process.platform,
+): { command: string; args: string[]; shell: boolean } {
+  const shell = needsWinShell(command, platform)
+  if (!shell) return { command, args, shell }
+  const q = (s: string) => (/[\s&|<>^()]/.test(s) && !/^".*"$/.test(s) ? `"${s}"` : s)
+  return { command: q(command), args: args.map(q), shell }
+}
+
+/** Resolve a BARE binary name to an absolute path the way a shell would, or null if it isn't on PATH.
+ *
+ *  This exists because `execFile`/`spawn` WITHOUT a shell do no PATHEXT resolution on Windows: the OS
+ *  looks for a file named exactly `npm`, and npm ships `npm.cmd` / `npm.ps1` / a `npm` bash script.
+ *  So probing a PATH tool by bare name threw ENOENT and the Build-Support dialog reported a perfectly
+ *  installed npm (and toktx, gltfpack, …) as "not found" even with "Use system-installed SDKs" ON.
+ *  Resolving here also gives every PATH-found tool an absolute `path`/`dir`, which is what
+ *  `withToolOnPath` and the spawn sites need.
+ *
+ *  Windows tries only the PATHEXT extensions (never the extension-less file — that's the bash shim,
+ *  which Windows cannot run); POSIX requires the execute bit. Pure/injectable for host-agnostic tests. */
+export function whichSync(
+  bin: string,
+  opts: {
+    platform?: NodeJS.Platform
+    pathEnv?: string
+    pathExt?: string
+  } = {},
+): string | null {
+  const platform = opts.platform ?? process.platform
+  const win = platform === 'win32'
+  const pathEnv = opts.pathEnv ?? process.env.PATH ?? ''
+  // PATHEXT is conventionally UPPER-CASE (".COM;.EXE;…"); lower-case it so a resolved path reads
+  // `npm.cmd`, not `npm.CMD`, in the Build-Support UI and logs. Windows paths are case-insensitive,
+  // so this never changes what resolves.
+  const exts = win
+    ? (opts.pathExt ?? process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean).map((e) => e.toLowerCase())
+    : ['']
+  const runnable = (p: string): boolean => {
+    try {
+      if (!fs.statSync(p).isFile()) return false
+      if (!win) fs.accessSync(p, fs.constants.X_OK)
+      return true
+    } catch {
+      return false
+    }
+  }
+  for (const dir of pathEnv.split(win ? ';' : ':')) {
+    if (!dir) continue
+    // Strip the quotes Windows PATH entries sometimes carry ("C:\Program Files\x";…).
+    const base = path.join(dir.replace(/^"|"$/g, ''), bin)
+    for (const ext of exts) {
+      const cand = base + ext
+      if (runnable(cand)) return cand
+    }
+  }
+  return null
+}
+
+/** A candidate command → the absolute path to spawn, or null when it can't be found. A candidate that
+ *  already carries a directory is taken as-is (the caller built it); a BARE name is resolved on PATH. */
+function resolveCommand(cmd: string): string | null {
+  if (cmd.includes('/') || cmd.includes('\\')) return cmd
+  return whichSync(cmd)
 }
 
 /** Where `install()` puts an npm-CLI tool's executable in the userData toolchain dir. One shared
@@ -393,39 +507,57 @@ function javaMajorMatches(home: string, want: number): boolean {
   return major === want
 }
 
-/** Candidate JAVA_HOME dirs for `detect('java')`, mirroring the former build-time `javaPrefix`
- *  bash probe (versioned openjdk@21 → unversioned openjdk → `java_home -v 21`). These SPAWN
- *  brew/java_home, which is why `java` is a directory tool (uncached, re-probed per call). */
-function javaHomeCandidates(): string[] {
-  const out: string[] = []
-  // A userData JDK from `install('java')` (Temurin) wins first — in a packaged editor it's the ONLY
-  // Java (brew/java_home find nothing), and when a user explicitly installs one via the dialog they
-  // want it used. discoverJavaHome returns null when it isn't provisioned yet, so dev machines fall
-  // through to the brew/java_home candidates below.
-  if (process.env.MODOKI_TOOLCHAIN_DIR) {
-    // The VERSION-scoped dir (jdkVersionDir) — so detect resolves the CURRENTLY pinned JDK, not a
-    // stale one from a previous pin left orphaned next to it.
-    const userJdk = discoverJavaHome(jdkVersionDir(path.join(process.env.MODOKI_TOOLCHAIN_DIR, 'jdk')))
-    if (userJdk) out.push(userJdk)
+/** OUR provisioned JDK (`install('java')` → Temurin), or [] when it isn't provisioned here. Uses the
+ *  VERSION-scoped dir (jdkVersionDir) so detect resolves the CURRENTLY pinned JDK, not a stale one
+ *  from a previous pin left orphaned next to it. */
+function provisionedJavaHomes(): string[] {
+  if (!process.env.MODOKI_TOOLCHAIN_DIR) return []
+  const userJdk = discoverJavaHome(jdkVersionDir(path.join(process.env.MODOKI_TOOLCHAIN_DIR, 'jdk')))
+  return userJdk ? [userJdk] : []
+}
+
+/** Absolute paths of `base`'s immediate sub-dirs whose name starts with `prefix` ([] if base is
+ *  absent). JDK vendors version-suffix their install dirs (`jdk-21.0.7+6-hotspot`, `zulu-21.36`), so
+ *  the only way to find them is to enumerate. `validate` still version-gates every hit, so a stray
+ *  non-21 dir listed here is harmless. */
+function dirsStartingWith(base: string, prefix: string): string[] {
+  try {
+    return fs.readdirSync(base, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && e.name.toLowerCase().startsWith(prefix.toLowerCase()))
+      .map((e) => path.join(base, e.name))
+  } catch {
+    return []
   }
-  // Bundled-only (packaged editor, "Use system SDKs" off): our provisioned JDK is the
-  // ONLY candidate — don't fall through to Homebrew / java_home / Adoptium.
-  if (!systemToolchainAllowed()) return out
+}
+
+/** Well-known SYSTEM JAVA_HOME candidates for `detect('java')`. On macOS these SPAWN brew/java_home,
+ *  which is why `java` is a directory tool (uncached, re-probed per call). Gated by the "Use
+ *  system-installed SDKs" toggle — see systemFallbackAllowed. */
+function systemJavaHomeCandidates(): string[] {
+  const out: string[] = []
+  const home = os.homedir()
+  /** A JDK reachable as `<home>/bin/java` on PATH — the catch-all for any install layout (Chocolatey,
+   *  Scoop, winget, SDKMAN, a hand-unzipped JDK) we don't enumerate explicitly. */
+  const javaOnPath = whichSync(process.platform === 'win32' ? 'java.exe' : 'java')
   if (process.platform === 'win32') {
-    // Adoptium's Windows MSI installs to `%ProgramFiles%\Eclipse Adoptium\jdk-21.x.y-hotspot`.
-    // Enumerate that dir for a `jdk-21*` entry (the version suffix varies). The `validate` hook
-    // still version-gates whatever we surface, so a stray non-21 dir here is harmless.
-    for (const base of [process.env.ProgramFiles, process.env['ProgramFiles(x86)']]) {
+    // The vendors that ship a Windows installer, each of which version-suffixes its dir. Adoptium's
+    // MSI lands in `%ProgramFiles%\Eclipse Adoptium\jdk-21.x.y-hotspot`; the rest follow the same
+    // shape. Android Studio's bundled JetBrains Runtime (`jbr`) is the JDK most Android devs
+    // actually have — it was previously invisible, so "I have Java" still read as ✗ not found.
+    for (const base of [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], path.join(home, 'AppData', 'Local', 'Programs')]) {
       if (!base) continue
-      const adoptium = path.join(base, 'Eclipse Adoptium')
-      try {
-        for (const entry of fs.readdirSync(adoptium)) {
-          if (entry.startsWith('jdk-21')) out.push(path.join(adoptium, entry))
-        }
-      } catch {
-        /* no Adoptium dir on this box */
-      }
+      out.push(
+        ...dirsStartingWith(path.join(base, 'Eclipse Adoptium'), 'jdk-21'),
+        ...dirsStartingWith(path.join(base, 'Microsoft'), 'jdk-21'),
+        ...dirsStartingWith(path.join(base, 'Java'), 'jdk-21'),
+        ...dirsStartingWith(path.join(base, 'Zulu'), 'zulu-21'),
+        ...dirsStartingWith(path.join(base, 'Amazon Corretto'), 'jdk21'),
+        ...dirsStartingWith(path.join(base, 'BellSoft'), 'LibericaJDK-21'),
+        path.join(base, 'Android', 'Android Studio', 'jbr'),
+        path.join(base, 'Android Studio', 'jbr'),
+      )
     }
+    if (javaOnPath) out.push(path.dirname(path.dirname(javaOnPath)))
     return out
   }
   const brewPrefix = (formula: string): string | null => {
@@ -446,17 +578,24 @@ function javaHomeCandidates(): string[] {
   } catch {
     /* not macOS, or no JDK 21 */
   }
+  // Android Studio's bundled JetBrains Runtime + the standard macOS JVM dirs — the JDKs an Android
+  // dev is most likely to already have when Homebrew/java_home come up empty.
+  out.push('/Applications/Android Studio.app/Contents/jbr/Contents/Home')
+  for (const jvms of ['/Library/Java/JavaVirtualMachines', path.join(home, 'Library/Java/JavaVirtualMachines')]) {
+    for (const jdk of dirsStartingWith(jvms, '')) out.push(path.join(jdk, 'Contents', 'Home'))
+  }
+  if (javaOnPath) out.push(path.dirname(path.dirname(javaOnPath)))
   return out
 }
 
 const cache = new Map<ToolId, DetectResult>()
 
-function probeVersion(command: string, versionArgs: string[], env?: NodeJS.ProcessEnv): string | null {
+function probeVersion(cmd: string, versionArgs: string[], env?: NodeJS.ProcessEnv): string | null {
   try {
     // A `.cmd`/`.bat` shim (npm .bin on Windows, sdkmanager.bat) needs a shell or execFile throws
     // EINVAL — which otherwise reads as a just-installed tool being "not found" in Build Support.
-    const shell = needsWinShell(command)
-    const out = execFileSync(shell ? `"${command}"` : command, versionArgs, { stdio: ['ignore', 'pipe', 'pipe'], shell, ...(env ? { env } : {}) })
+    const { command, args, shell } = spawnable(cmd, versionArgs)
+    const out = execFileSync(command, args, { stdio: ['ignore', 'pipe', 'pipe'], shell, ...(env ? { env } : {}) })
     return out.toString().trim()
   } catch {
     return null
@@ -469,23 +608,27 @@ function detectBinary(id: ToolId, d: BinaryDescriptor): DetectResult {
   if (override) candidates.push({ cmd: override, source: 'env' }) // our own env (bundled/provisioned)
   for (const c of d.extraCandidates?.() ?? []) candidates.push({ cmd: c, source: 'probe' }) // our toolchain install
   // System-PATH fallback: allowed only when system tools are permitted (dev, or the "Use system SDKs"
-  // toggle), OR the tool isn't one the editor provisions (e.g. xcodebuild — a legit system tool). In
-  // bundled-only mode we NEVER resolve an INSTALLABLE tool from the machine's PATH: it must come from
-  // the editor's own install (else it reads as "not found", prompting an install), so a build never
-  // silently depends on whatever version happens to be on the box.
-  if (systemToolchainAllowed() || !INSTALLABLE.has(id)) candidates.push({ cmd: d.bin, source: 'path' })
+  // toggle), OR the tool isn't one the editor can supply here (e.g. xcodebuild — a legit system
+  // tool). In bundled-only mode we NEVER resolve a tool the editor provides from the machine's PATH:
+  // it must come from the editor's own install/bundle (else it reads as "not found", prompting an
+  // install), so a build never silently depends on whatever version happens to be on the box.
+  if (systemFallbackAllowed(id)) candidates.push({ cmd: d.bin, source: 'path' })
 
   for (const c of candidates) {
-    const version = probeVersion(c.cmd, d.versionArgs)
+    // A bare name is resolved on PATH FIRST — Windows `execFile` does no PATHEXT lookup, so probing
+    // `npm` (really npm.cmd) by name threw ENOENT and reported an installed tool as missing.
+    const cmd = resolveCommand(c.cmd)
+    if (!cmd) continue
+    const version = probeVersion(cmd, d.versionArgs)
     if (version !== null) {
-      const abs = path.isAbsolute(c.cmd)
+      const abs = path.isAbsolute(cmd)
       return {
         id,
         present: true,
-        command: c.cmd,
-        path: abs ? c.cmd : undefined,
+        command: cmd,
+        path: abs ? cmd : undefined,
         version,
-        dir: abs ? path.dirname(c.cmd) : undefined,
+        dir: abs ? path.dirname(cmd) : undefined,
         source: c.source,
       }
     }
@@ -495,11 +638,16 @@ function detectBinary(id: ToolId, d: BinaryDescriptor): DetectResult {
 
 function detectDirectory(id: ToolId, d: DirectoryDescriptor): DetectResult {
   const candidates: Array<{ dir: string; source: ToolSource }> = []
-  for (const ev of d.envVars ?? []) {
-    const v = process.env[ev]
-    if (v) candidates.push({ dir: v, source: 'env' })
+  // OUR provisioned install first — always, so the SDK you installed from this dialog outranks a
+  // stray JAVA_HOME/ANDROID_HOME. The system sources below are gated by the toggle.
+  for (const c of d.bundled?.() ?? []) candidates.push({ dir: c, source: 'probe' })
+  if (systemFallbackAllowed(id)) {
+    for (const ev of d.envVars ?? []) {
+      const v = process.env[ev]
+      if (v) candidates.push({ dir: v, source: 'env' })
+    }
+    for (const c of d.candidates()) candidates.push({ dir: c, source: 'probe' })
   }
-  for (const c of d.candidates()) candidates.push({ dir: c, source: 'probe' })
 
   for (const c of candidates) {
     // Marker existence (file OR dir): the Android SDK's `platform-tools` is a dir; a JDK home's
@@ -643,12 +791,14 @@ export function npmSpawnSpec(): SpawnSpec {
     }
   }
   const d = detect('npm')
-  return {
-    command: d.command ?? 'npm',
-    prefixArgs: [],
-    shell: process.platform === 'win32', // npm is a .cmd on Windows
-    env: process.env,
+  // detect resolves a PATH npm to its absolute shim (npm.cmd on Windows) — `spawnable` decides
+  // whether that needs a shell and quotes it, so a Program Files path survives the shell.
+  if (d.command) {
+    const { command, shell } = spawnable(d.command)
+    return { command, prefixArgs: [], shell, env: process.env }
   }
+  // Last resort: a bare `npm`, which on Windows needs a shell for PATHEXT to find npm.cmd.
+  return { command: 'npm', prefixArgs: [], shell: process.platform === 'win32', env: process.env }
 }
 
 /** How to invoke a model CLI as `{command, prefixArgs}` — callers append the tool's own args. Prefers
@@ -665,12 +815,16 @@ export interface CliInvocation {
 export function gltfTransformInvocation(): CliInvocation {
   const d = detect('gltf-transform-cli')
   if (d.present && d.command) return { command: d.command, prefixArgs: [] }
+  // `npx` is the machine's npm — a SYSTEM tool, so it's off-limits in bundled-only mode. Throwing
+  // the actionable "install it from Build Support" message beats silently running a system copy.
+  if (!systemFallbackAllowed('gltf-transform-cli')) throw new Error(REGISTRY['gltf-transform-cli'].missingMsg)
   return { command: 'npx', prefixArgs: ['--no-install', '@gltf-transform/cli'] }
 }
 
 export function gltfpackInvocation(): CliInvocation {
   const d = detect('gltfpack')
   if (d.present && d.command) return { command: d.command, prefixArgs: [] }
+  if (!systemFallbackAllowed('gltfpack')) throw new Error(REGISTRY.gltfpack.missingMsg)
   return { command: 'gltfpack', prefixArgs: [] }
 }
 
@@ -758,16 +912,30 @@ export const PINNED_TOOL_VERSIONS: Partial<Record<ToolId, string>> = {
   cocoapods: '1.17.0',
 }
 
+/** Whether `version` (a tool's raw `--version` output) reports the pinned release. Matching is
+ *  substring-based but ANCHORED — `1.2` must not match `1.20` — and accepts the pin's trailing-zero-
+ *  trimmed forms, because a tool needn't print its npm version verbatim: gltfpack@1.2.0's `-v` prints
+ *  `gltfpack 1.2`. A plain `includes(pin)` therefore never matched, so gltfpack was flagged STALE
+ *  forever — the dialog showed a permanent "⟳ (update)" and re-installed it on every open. */
+export function versionMatchesPin(version: string, pin: string): boolean {
+  const forms = [pin]
+  for (let v = pin; /\.0$/.test(v); ) {
+    v = v.replace(/\.0$/, '')
+    forms.push(v)
+  }
+  return forms.some((f) => new RegExp(`(?<![\\d.])${f.replace(/\./g, '\\.')}(?![\\d.])`).test(version))
+}
+
 /** True ⇒ this tool is version-pinned AND its OUR-toolchain install is a different version than the
  *  pin — a reinstall/update is due (e.g. after an editor pin bump). Only considers the userData
  *  install (resolved path under MODOKI_TOOLCHAIN_DIR); a system/PATH tool a dev installed is left
- *  alone. Version match is substring-based (`gltfpack 1.2.0` contains `1.2.0`, `pod` prints `1.17.0`). */
+ *  alone. */
 export function isToolStale(id: ToolId, d: DetectResult): boolean {
   const pin = PINNED_TOOL_VERSIONS[id]
   if (!pin || !d.present || !d.version) return false
   const tc = process.env.MODOKI_TOOLCHAIN_DIR
   if (!tc || !d.path || !d.path.startsWith(tc)) return false // not our install → don't touch it
-  return !d.version.includes(pin)
+  return !versionMatchesPin(d.version, pin)
 }
 
 export interface GuideLink {
@@ -921,8 +1089,8 @@ async function installCocoapods(opts: { toolchainDir: string; onLog?: (line: str
 }
 
 export async function install(id: ToolId, opts: { toolchainDir: string; onLog?: (line: string) => void }): Promise<InstallResult> {
-  if (id === 'gltf-transform-cli') return installNpmTool('@gltf-transform/cli', 'gltf-transform', PINNED_TOOL_VERSIONS['gltf-transform-cli'], opts)
-  if (id === 'gltfpack') return installNpmTool('gltfpack', 'gltfpack', PINNED_TOOL_VERSIONS.gltfpack, opts)
+  if (id === 'gltf-transform-cli') return installNpmTool(id, '@gltf-transform/cli', 'gltf-transform', PINNED_TOOL_VERSIONS['gltf-transform-cli'], opts)
+  if (id === 'gltfpack') return installNpmTool(id, 'gltfpack', 'gltfpack', PINNED_TOOL_VERSIONS.gltfpack, opts)
   // ffmpeg/ffprobe: npm packages whose PAYLOAD is the binary (no `.bin` symlink). The npm package
   // version differs from the CLI's own version (ffmpeg-static@5.3.0 ships ffmpeg 6.0), so they're
   // pinned here as the npm spec — NOT in PINNED_TOOL_VERSIONS (whose values are matched against
@@ -1058,30 +1226,62 @@ export function uninstallAll(toolchainDir: string): void {
   resetToolchainCache()
 }
 
-/** Install an npm-CLI tool as a dependency of the shared userData `npm-tools` package, exposing its
- *  `.bin/<name>`. Runs npm via `npmSpawnSpec` so it uses the provisioned Node (no system npm).
- *  Installs the PINNED `version` (reproducible + lets a pin bump update in place). */
-async function installNpmTool(pkg: string, binName: string, version: string | undefined, opts: { toolchainDir: string; onLog?: (line: string) => void }): Promise<InstallResult> {
-  const spec_pkg = version ? `${pkg}@${version}` : pkg
-  const dir = npmToolsDir(opts.toolchainDir)
+/** Ensure the shared userData `npm-tools` package exists, and `npm install <specPkg>` into it. Runs
+ *  npm via `npmSpawnSpec` so it uses the provisioned Node (no system npm). */
+async function npmToolsInstall(toolchainDir: string, specPkg: string, log: (line: string) => void): Promise<string> {
+  const dir = npmToolsDir(toolchainDir)
   fs.mkdirSync(dir, { recursive: true })
   const pkgJson = path.join(dir, 'package.json')
   if (!fs.existsSync(pkgJson)) {
     fs.writeFileSync(pkgJson, JSON.stringify({ name: 'modoki-toolchain-tools', private: true, version: '0.0.0' }, null, 2) + '\n')
   }
-  const log = opts.onLog ?? (() => {})
   const spec = npmSpawnSpec()
-  log(`Installing ${spec_pkg}…`)
+  log(`Installing ${specPkg}…`)
   await new Promise<void>((resolve, reject) => {
-    const p = spawn(spec.command, [...spec.prefixArgs, 'install', spec_pkg, '--no-audit', '--no-fund'], { cwd: dir, shell: spec.shell, env: spec.env })
+    const p = spawn(spec.command, [...spec.prefixArgs, 'install', specPkg, '--no-audit', '--no-fund'], { cwd: dir, shell: spec.shell, env: spec.env })
     p.stdout?.on('data', (d: Buffer) => log(d.toString().trimEnd()))
     p.stderr?.on('data', (d: Buffer) => log(d.toString().trimEnd()))
-    p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`npm install ${spec_pkg} exited with code ${code}`))))
+    p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`npm install ${specPkg} exited with code ${code}`))))
     p.on('error', reject)
   })
+  return dir
+}
+
+/**
+ * Install an npm-CLI tool into the shared `npm-tools` package, then PROVE it runs — and self-heal if
+ * it doesn't.
+ *
+ * An interrupted install leaves a half-written tree (seen in the wild: `@gltf-transform/core` present
+ * but with no package.json, so the CLI died with ERR_MODULE_NOT_FOUND). The old check was
+ * `existsSync(bin)` — the `.bin` shim IS there, so the install "succeeded" while `detect()` reported
+ * the tool missing. Clicking Install again was a no-op, because npm saw the dependency already
+ * satisfied: an unbreakable "not found" loop. So we verify with the same `--version` probe detect
+ * uses, and on failure wipe `node_modules` + the lockfile and install once more from scratch.
+ */
+async function installNpmTool(
+  id: ToolId, pkg: string, binName: string, version: string | undefined,
+  opts: { toolchainDir: string; onLog?: (line: string) => void },
+): Promise<InstallResult> {
+  const specPkg = version ? `${pkg}@${version}` : pkg
+  const log = opts.onLog ?? (() => {})
   const bin = npmToolBin(opts.toolchainDir, binName)
-  if (!fs.existsSync(bin)) throw new Error(`Installed ${pkg} but its executable is missing at ${bin}.`)
-  resetToolchainCache() // it's now detectable
+  const runs = () => {
+    resetToolchainCache()
+    return fs.existsSync(bin) && detect(id).present
+  }
+
+  const dir = await npmToolsInstall(opts.toolchainDir, specPkg, log)
+  if (runs()) return { path: bin }
+
+  log(`${pkg} installed but does not run — its dependency tree looks damaged. Reinstalling from scratch…`)
+  forceRemoveDir(path.join(dir, 'node_modules'))
+  try { fs.rmSync(path.join(dir, 'package-lock.json'), { force: true }) } catch { /* best-effort */ }
+  await npmToolsInstall(opts.toolchainDir, specPkg, log)
+  if (!runs()) {
+    throw new Error(
+      `Installed ${specPkg} but it still doesn't run (expected ${bin}). Try "Remove all tools" in ` +
+      `Build Support to reset the toolchain, then install again.`)
+  }
   return { path: bin }
 }
 
@@ -1097,25 +1297,20 @@ async function installNpmBinaryTool(
   pkg: string, version: string, resolveBin: (toolchainDir: string) => string,
   opts: { toolchainDir: string; onLog?: (line: string) => void },
 ): Promise<InstallResult> {
-  const dir = npmToolsDir(opts.toolchainDir)
-  fs.mkdirSync(dir, { recursive: true })
-  const pkgJson = path.join(dir, 'package.json')
-  if (!fs.existsSync(pkgJson)) {
-    fs.writeFileSync(pkgJson, JSON.stringify({ name: 'modoki-toolchain-tools', private: true, version: '0.0.0' }, null, 2) + '\n')
-  }
   const log = opts.onLog ?? (() => {})
-  const spec = npmSpawnSpec()
   const specPkg = `${pkg}@${version}`
-  log(`Installing ${specPkg}…`)
-  await new Promise<void>((resolve, reject) => {
-    const p = spawn(spec.command, [...spec.prefixArgs, 'install', specPkg, '--no-audit', '--no-fund'], { cwd: dir, shell: spec.shell, env: spec.env })
-    p.stdout?.on('data', (d: Buffer) => log(d.toString().trimEnd()))
-    p.stderr?.on('data', (d: Buffer) => log(d.toString().trimEnd()))
-    p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`npm install ${specPkg} exited with code ${code}`))))
-    p.on('error', reject)
-  })
-  const bin = resolveBin(opts.toolchainDir)
-  if (!fs.existsSync(bin)) throw new Error(`Installed ${pkg} but its executable is missing at ${bin}.`)
+  const dir = await npmToolsInstall(opts.toolchainDir, specPkg, log)
+  let bin = resolveBin(opts.toolchainDir)
+  if (!fs.existsSync(bin)) {
+    // Same self-heal as installNpmTool: a half-written tree can leave the payload binary absent even
+    // though npm exited 0. Wipe and reinstall once before giving up.
+    log(`${pkg} installed but its executable is missing — reinstalling from scratch…`)
+    forceRemoveDir(path.join(dir, 'node_modules'))
+    try { fs.rmSync(path.join(dir, 'package-lock.json'), { force: true }) } catch { /* best-effort */ }
+    await npmToolsInstall(opts.toolchainDir, specPkg, log)
+    bin = resolveBin(opts.toolchainDir)
+    if (!fs.existsSync(bin)) throw new Error(`Installed ${pkg} but its executable is missing at ${bin}.`)
+  }
   try { fs.chmodSync(bin, 0o755) } catch { /* best-effort */ }
   resetToolchainCache() // it's now detectable
   return { path: bin }

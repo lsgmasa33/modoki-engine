@@ -18,7 +18,15 @@ export const inputStyle: React.CSSProperties = {
  *  border (transparent keeps height/alignment with sibling fields) + muted text = clearly
  *  display-only, not an input box. Spread AFTER inputStyle. */
 export const readOnlyFieldStyle: React.CSSProperties = {
-  background: '#2e2e3c', color: '#9d9daf', borderColor: 'transparent', cursor: 'default',
+  background: '#2e2e3c', color: '#9d9daf', cursor: 'default',
+  // Override the full `border` SHORTHAND, not just the borderColor longhand. inputStyle
+  // sets `border: '1px solid #444'`, and spreading a `borderColor` longhand over it means
+  // that when `readOnly` flips between renders (selecting a different asset/entity swaps
+  // which fields are read-only) React must REMOVE borderColor while the shorthand is
+  // still set — which it warns about as a shorthand/non-shorthand conflict. Same fix, and
+  // same reason, as treeChrome.tsx's active-button style. Renders identically: a 1px
+  // transparent border still preserves height/alignment with sibling fields.
+  border: '1px solid transparent',
 };
 
 /** Hover tooltip used by Inspector-style fields. Renders `text` (pre-wrapped) in a
