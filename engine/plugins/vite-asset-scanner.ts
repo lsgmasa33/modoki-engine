@@ -453,6 +453,21 @@ export async function buildStepEnv(extra: NodeJS.ProcessEnv = {}): Promise<NodeJ
   }
 }
 
+/** Canonicalize a path for use as a self-write-guard key. Windows paths are
+ *  case-INSENSITIVE on the drive letter and reach the guard through two spellings:
+ *  the editor's save resolves an OPENED scene's `/@fs/<abs>` URL (whose drive-letter
+ *  case comes from wherever that URL was minted — `path.resolve` preserves it, so a
+ *  lowercase `e:` stays lowercase), while chokidar reports the SAME file with the
+ *  drive case of the watched `absDir` (derived from `projectRoot`, typically
+ *  uppercase `E:`). Keying the guard Map by the raw string then MISSES — the editor's
+ *  own save looks external and bounces the live scene (the Windows Ctrl+S full-reload
+ *  bug). Fold the drive letter to a single case and unify separators so both spellings
+ *  collapse to one key. A no-op on POSIX paths (no drive letter, no backslashes), so
+ *  Linux/macOS keying is unchanged. */
+export function normalizeWriteGuardKey(absPath: string): string {
+  return absPath.replace(/\\/g, '/').replace(/^([a-zA-Z]):/, (_m, d: string) => `${d.toLowerCase()}:`);
+}
+
 /** The self-write guard: scene/prefab files the editor just saved itself (via
  *  /api/write-file) are recorded here so the watcher skips the hot-reload broadcast
  *  for them — an editor Cmd+S must not bounce the live scene, while external edits
@@ -473,7 +488,8 @@ export function createEditorWriteGuard(ttlMs = 1500, now: () => number = Date.no
   // the fingerprint stops matching and the reload proceeds, so this can't mask a
   // real change. (editor-core F9)
   const recent = new Map<string, { exp: number; hash: string | null }>();
-  const mark = (absPath: string, hash: string | null = null) => {
+  const mark = (absPathRaw: string, hash: string | null = null) => {
+    const absPath = normalizeWriteGuardKey(absPathRaw);
     recent.set(absPath, { exp: now() + ttlMs, hash });
     setTimeout(() => {
       const e = recent.get(absPath);
@@ -485,7 +501,8 @@ export function createEditorWriteGuard(ttlMs = 1500, now: () => number = Date.no
       if (e && e.exp <= now() && e.hash == null) recent.delete(absPath);
     }, ttlMs + 100);
   };
-  const isWrite = (absPath: string, currentHash?: () => string | null) => {
+  const isWrite = (absPathRaw: string, currentHash?: () => string | null) => {
+    const absPath = normalizeWriteGuardKey(absPathRaw);
     const e = recent.get(absPath);
     if (!e) return false;
     if (e.exp > now()) return true; // fast path: still inside the burst window

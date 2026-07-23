@@ -6,7 +6,7 @@
  *  They used to import games/3d-test's `registerGameSystems` / `GamePhase` / `tropicalIslandConfig`,
  *  which coupled the engine test surface to a demo game. The OSS engine repo ships engine-only
  *  (no games/), so an engine test must not depend on one — this fixture provides the equivalent
- *  scaffolding without leaving the engine. docs/plans/engine-oss-public-repo.md. */
+ *  scaffolding without leaving the engine. docs/engine-oss-publishing.md. */
 
 import { trait } from 'koota';
 import { registerTrait, type GameConfig } from '@modoki/engine/runtime';

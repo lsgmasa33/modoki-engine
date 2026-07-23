@@ -52,6 +52,13 @@ describe('loadProjectConfig', () => {
     expect(cfg.app.appId).toBe(DEFAULT_PROJECT_CONFIG.app.appId);
   });
 
+  it('defaults build.debugBridge to false (release ships no eval-capable bridge)', () => {
+    // Absent from an existing config → the safe default. A game opts in explicitly.
+    expect(loadProjectConfig(root).build.debugBridge).toBe(false);
+    fs.writeFileSync(configPath(), JSON.stringify({ build: { debugBridge: true } }));
+    expect(loadProjectConfig(root).build.debugBridge).toBe(true);
+  });
+
   it('deep-merges nested rendering/physics sections without wiping siblings', () => {
     fs.writeFileSync(configPath(), JSON.stringify({
       rendering: { three: { exposure: 2 } },

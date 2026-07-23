@@ -12,6 +12,8 @@ import { register } from './input/keymap';
 import { useHmrEpoch } from './input/hmrEpoch';
 import { installKeymapDispatcher } from './input/dispatcher';
 import { setInputGate } from '../runtime/input/inputSources';
+import { calibratePresentationScale } from '../runtime/input/presentationScale';
+import { forwardZoomWheel } from './input/zoomWheel';
 import SceneView from './panels/SceneView';
 import Hierarchy from './panels/Hierarchy';
 import Inspector from './panels/Inspector';
@@ -859,6 +861,25 @@ export default function EditorApp() {
   useEffect(() => {
     if (!electronBridge) return;
     return electronBridge.on('menu-action', (id) => { menuActionRef.current[id as string]?.(); });
+  }, []);
+  // Cmd/Ctrl+wheel → whole-app UI zoom (VS Code–style). Forward the intent to main,
+  // which owns the webContents zoom (clamp + persist). Capture phase + non-passive so
+  // preventDefault sticks and this beats the panel wheel handlers (SceneView camera
+  // dolly, sprite/skin canvases) — they fire on a PLAIN wheel and never test ctrl/meta,
+  // so a modified wheel is unambiguously ours. No-op in the web editor (browser zooms
+  // natively). A macOS trackpad pinch also surfaces as wheel+ctrlKey → pinch-to-zoom too.
+  useEffect(() => {
+    if (!electronBridge) return;
+    const onWheel = (e: WheelEvent) => { forwardZoomWheel(e, electronBridge); };
+    window.addEventListener('wheel', onWheel, { capture: true, passive: false });
+    return () => window.removeEventListener('wheel', onWheel, { capture: true });
+  }, []);
+  // Keep game input presentation-invariant under editor UI zoom: main pushes the authoritative
+  // page-zoom factor (on mount + every zoom change), and the engine calibrates its input scale
+  // so a game's pixel-based feel (e.g. sling's pull) doesn't drift with zoom. See presentationScale.ts.
+  useEffect(() => {
+    if (!electronBridge) return;
+    return electronBridge.on('zoom-factor', (f) => { if (typeof f === 'number') calibratePresentationScale(f); });
   }, []);
   // New Project (Electron): main asks the freshly-opened project to show Project
   // Settings so the user can fill in identity/build info right after creation.

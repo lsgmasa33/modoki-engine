@@ -67,7 +67,7 @@ function escapingImports(): string[] {
 }
 
 // Skip when NO project root exists (the OSS public repo ships engine-only — nothing to
-// check portability of). docs/plans/engine-oss-public-repo.md.
+// check portability of). docs/engine-oss-publishing.md.
 describe.skipIf(projects.length === 0)('game project portability (self-contained — no relative escapes)', () => {
   it('no game imports outside its own folder except the known tracked coupling', () => {
     const unexpected = escapingImports().filter((e) => !KNOWN_ESCAPES.has(e));

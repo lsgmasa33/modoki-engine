@@ -317,6 +317,8 @@ export {
 } from './input/inputSources';
 export { keyboardSource } from './input/keyboardSource';
 export { gamepadSource, sampleGamepadInto, type GamepadSnapshot } from './input/gamepadSource';
+// Presentation-invariant input: keep gameplay feel constant under editor/browser/OS zoom.
+export { getPresentationScale, calibratePresentationScale } from './input/presentationScale';
 // Device-appropriate UI prompts ("Press A" vs "Click") — Part B4/Phase 4.
 export { promptFor, PROMPT_ACTIONS, type PromptAction } from './input/inputPrompts';
 export { registerInputPromptSources } from './input/inputPromptSources';

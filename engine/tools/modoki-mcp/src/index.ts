@@ -122,6 +122,28 @@ async function postJson(path: string, payload: unknown, timeoutMs?: number): Pro
   }
 }
 
+/** Evaluate JS in the editor renderer (`/api/eval`) and shape the reply. The renderer runs
+ *  `code` as a function body and safe-stringifies the result, so a THROWN eval comes back as a
+ *  successful `{ result: "Error: …" }` string rather than a 4xx — detect that prefix and surface
+ *  it as a tool error, so a failed eval is never misread as a successful string value (the same
+ *  false-success guard device_eval applies via isDeviceError). */
+async function evalRenderer(code: string): Promise<ToolResult> {
+  try {
+    await ensureIdentity();
+    const { status, body } = await call('/api/eval', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+    });
+    if (status >= 400) return err(`backend ${status}: ${JSON.stringify(body)}`);
+    const result = (body as { result?: unknown } | null)?.result;
+    if (typeof result === 'string' && result.startsWith('Error:')) return err(result);
+    return ok(result);
+  } catch (e) {
+    return unreachable(e);
+  }
+}
+
 
 /** POST an editor action to the relay. `action` is the op name; `params` is the
  *  rest of the body. Editor actions can touch scenes/resources, so allow generous
@@ -542,6 +564,30 @@ server.tool(
   async ({ from, to, steps, button, modifiers }) => postJson('/api/input/drag', { from, to, steps, button, modifiers }),
 );
 
+// ── pointer — SUSTAINED (held-across-calls) trusted press (Electron editor only) ──
+server.tool(
+  'modoki_pointer',
+  'Sustained/HELD trusted pointer — the stateful twin of modoki_drag, split into separate ' +
+    'calls. `action:"down"` presses at a point and LEAVES the button held; `action:"move"` ' +
+    're-aims the held pointer (a drag-move); `action:"up"` releases. Between calls the press ' +
+    'PHYSICALLY persists (no mouseUp is sent), so you can read state that exists only WHILE the ' +
+    'button is held — a slingshot pull preview, a charge-up meter, a drag-to-aim rubber-band — ' +
+    'with get_scene_state / modoki_eval / a screenshot mid-gesture (the atomic modoki_drag can\'t ' +
+    'expose it). Typical loop: down → (read) → move → (read) → up. Aim by `{x,y}` or `{selector}`. ' +
+    'move/up reuse the held button; a move/up with nothing held is refused (409). ' +
+    'Requires the Electron editor.',
+  {
+    action: z.enum(['down', 'move', 'up']).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),
+    x: z.number().optional().describe('Page CSS x. Required unless `selector` is given.'),
+    y: z.number().optional().describe('Page CSS y. Required unless `selector` is given.'),
+    selector: z.string().optional().describe('CSS selector to aim at (resolved server-side). Overrides x/y.'),
+    button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button for 'down' (default 'left'); ignored on move/up (the held button is reused)."),
+    modifiers: z.array(modifierEnum).optional().describe('Held modifier keys.'),
+  },
+  async ({ action, x, y, selector, button, modifiers }) =>
+    postJson('/api/input/pointer', { action, x, y, selector, button, modifiers }),
+);
+
 // ── hover — trusted bare mouse-move (Electron editor only) ──
 server.tool(
   'modoki_hover',
@@ -564,6 +610,8 @@ server.tool(
     'toward you); deltaX scrolls horizontally. Unlocks orbit-cam wheel-zoom, scrolling a ' +
     'long list/panel (aim it with a `selector` for that panel), and cursor-anchored zoom ' +
     'in the Canvas2D editors (Skin/Slicer/Particle). ~120 units ≈ one wheel tick. ' +
+    'Pass `modifiers` to drive a modifier-gated wheel handler — e.g. Ctrl/Cmd+wheel UI-zoom ' +
+    'or the Curve Editor value-axis zoom (a bare wheel never trips those). ' +
     'Requires the Electron editor.',
   {
     x: z.number().optional().describe('Page CSS x. Required unless `selector` is given.'),
@@ -571,8 +619,45 @@ server.tool(
     selector: z.string().optional().describe('CSS selector to aim at. Overrides x/y.'),
     deltaX: z.number().optional().describe('Horizontal wheel delta (default 0).'),
     deltaY: z.number().optional().describe('Vertical wheel delta; positive = content down.'),
+    modifiers: z.array(z.enum(['shift', 'control', 'alt', 'meta', 'cmd', 'command']))
+      .optional().describe('Held modifier keys set on the wheel event (e.g. ["control"] or ["meta"] for Ctrl/Cmd+wheel zoom).'),
   },
-  async ({ x, y, selector, deltaX, deltaY }) => postJson('/api/input/scroll', { x, y, selector, deltaX, deltaY }),
+  async ({ x, y, selector, deltaX, deltaY, modifiers }) => postJson('/api/input/scroll', { x, y, selector, deltaX, deltaY, modifiers }),
+);
+
+// ── eval — evaluate JS in the editor renderer (Electron editor only) ──
+server.tool(
+  'modoki_eval',
+  'Evaluate JavaScript in the editor RENDERER and return the value — the editor twin of ' +
+    'device_eval. Reads/pokes LIVE renderer state a static file read cannot (a global like ' +
+    'window.__3d, window.innerWidth/devicePixelRatio, a React fiber value, WGSL validation, or ' +
+    'dispatching a bridge event), so you no longer need a raw CDP client for it. Runs as a ' +
+    'function body: use `return` to yield a value. The result is safe-stringified in the renderer, ' +
+    'so return a PROJECTION for anything large/circular (e.g. `return {w: innerWidth, h: innerHeight}` ' +
+    '— a bare `window` or DOM node serializes poorly). A thrown error is reported as a tool error. ' +
+    'Requires the Electron editor.',
+  { code: z.string().describe('JavaScript to run in the editor renderer. Use `return` for a value.') },
+  async ({ code }) => evalRenderer(code),
+);
+
+// ── menu — introspect + fire NATIVE application-menu items (Electron editor only) ──
+server.tool(
+  'modoki_menu',
+  'Introspect or fire the editor\'s NATIVE application-menu items. `modoki_press_key` CANNOT ' +
+    'trigger native menu accelerators (Chromium swallows them), so menu-only actions — View → ' +
+    'Zoom In/Out/Actual Size, and any relayed menu item — are otherwise unreachable from MCP. ' +
+    'Call with no args (or `list:true`) to get the menu tree (each node carries the `path` and ' +
+    '`id` you can fire, plus `enabled`/`accelerator`); pass `path` (e.g. "View/Zoom In", ' +
+    'case-insensitive, `/` or `>` separators) or `id` to invoke that item\'s click — the same ' +
+    'callback a human\'s click runs. A miss lists the available actionable paths. ' +
+    'Requires the Electron editor.',
+  {
+    path: z.string().optional().describe('Label path of the item to fire, e.g. "View/Zoom In".'),
+    id: z.string().optional().describe('Menu item id to fire (alternative to path).'),
+    list: z.boolean().optional().describe('Return the full menu tree instead of firing an item.'),
+  },
+  async ({ path, id, list }) =>
+    (list || (!path && !id)) ? postJson('/api/menu', { list: true }) : postJson('/api/menu', { path, id }),
 );
 
 // ── press_key — standalone trusted key chord (Electron editor only) ──

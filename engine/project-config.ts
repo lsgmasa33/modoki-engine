@@ -142,6 +142,14 @@ export interface ProjectConfig {
      *  out. Set true for a QA/playtest game build that needs the menu on device.
      *  See docs/debug-menu-plan.md. */
     enableDebugMenu: boolean;
+    /** Debug bridge — ship the on-device debug server (native TCP + UDP beacon / web-WS)
+     *  that every `device_*` AI tool connects to, INCLUDING `device_eval`, which runs
+     *  ARBITRARY JavaScript on the device. Always on in the editor + dev; OFF by default
+     *  in a shipped game build so the whole `./debug/bridge` import tree-shakes out — a
+     *  release build has no eval-capable server to connect to. Set true for a game build
+     *  you intend to debug on a device. (Previously this was ungated on native, so every
+     *  native build shipped the bridge; this flag closes that exposure.) */
+    debugBridge: boolean;
     /** Build-time engine-module include/exclude toggles — tree-shakes unused
      *  SDKs (three.js / pixi.js / Rapier) out of the bundle. Each defaults to
      *  `'auto'` (detect from the included scenes; see plugins/detect-modules.ts).
@@ -287,6 +295,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     appleTeamId: '',
     enableJournal: false,
     enableDebugMenu: false,
+    debugBridge: false,
     modules: {
       render3d: 'auto', render2d: 'auto', physics2d: 'auto',
       physics3d: 'auto', npr: 'auto', gpuParticles: 'auto',

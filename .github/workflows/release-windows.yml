@@ -220,10 +220,23 @@ jobs:
             release/*.blockmap
             release/latest.yml
 
+      # Same curated notes as the macOS workflow — both attach to the SAME Release and
+      # set body_path; identical tag+repo → byte-identical body, so the order they finish
+      # in doesn't matter. Shallow checkout has no tags/history, so fetch them first.
+      - name: Generate release notes (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          git fetch --prune --unshallow 2>/dev/null || true
+          node engine/scripts/gen-release-notes.mjs "${GITHUB_REF_NAME}" release-notes.md
+
       - name: Attach to GitHub Release (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
+          body_path: release-notes.md
           files: |
             release/*.exe
             release/*.blockmap

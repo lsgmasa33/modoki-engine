@@ -30,7 +30,11 @@ export interface InputOps {
   tap(x: number, y: number, opts?: { button?: MouseButton; clickCount?: number; modifiers?: InputModifier[] }): Promise<void>;
   drag(from: { x: number; y: number }, to: { x: number; y: number }, opts?: { steps?: number; button?: MouseButton; modifiers?: InputModifier[] }): Promise<void>;
   hover(x: number, y: number, modifiers?: InputModifier[]): Promise<void>;
-  scroll(x: number, y: number, deltaX: number, deltaY: number): Promise<void>;
+  scroll(x: number, y: number, deltaX: number, deltaY: number, modifiers?: InputModifier[]): Promise<void>;
+  /** Sustained-pointer primitives (held across calls) — see rendererOps pointerDown/Move/Up. */
+  pointerDown(x: number, y: number, opts?: { button?: MouseButton; modifiers?: InputModifier[] }): Promise<void>;
+  pointerMove(x: number, y: number, opts?: { button?: MouseButton; modifiers?: InputModifier[] }): Promise<void>;
+  pointerUp(x: number, y: number, opts?: { button?: MouseButton; modifiers?: InputModifier[] }): Promise<void>;
   pressKey(key: string, modifiers?: InputModifier[]): Promise<{ activeElement: string | null; gameSwallows: boolean }>;
   typeText(text: string, opts?: { clearFirst?: boolean; submitKey?: string }): Promise<{ typed: number; editable: boolean; activeElement: string | null }>;
   focusElement(selector?: string): Promise<{ view: boolean; focused: string | null; blurred: string | null; ok: boolean }>;
@@ -41,6 +45,11 @@ export interface InputRouteDeps {
   /** Forward an op to the editor renderer (main.ts's `requestRenderer`). */
   requestRenderer(op: string, params: unknown): Promise<unknown>;
 }
+
+/** The `/api/input/*` dispatcher, plus `resetHeldPointer` for the caller to clear the
+ *  sustained-pointer state on a renderer reload (see createInputRoutes). */
+export type InputRoutesHandler =
+  ((req: HostRequest) => Promise<BackendResult | null>) & { resetHeldPointer(): void };
 
 /** A point the agent wants to act on: explicit coordinates or a CSS selector. */
 export interface PointSpec { x?: number; y?: number; selector?: string }
@@ -94,6 +103,13 @@ function provenance(p: ResolvedPoint): Record<string, unknown> {
 export function createInputRoutes(deps: InputRouteDeps) {
   const { ops, requestRenderer } = deps;
 
+  /** The currently-HELD sustained pointer (from `/api/input/pointer` action:'down'), or null.
+   *  Lives in the factory closure so it persists ACROSS requests — that is the whole point: a
+   *  `down` in one MCP call, a `move`/`up` in later ones. Tracks the button so a `move`/`up`
+   *  reuses the held one (and threads it into the event, making the move a drag-move), and so a
+   *  `move`/`up` with nothing held is a clear 409 rather than a silent stray event. */
+  let heldPointer: { button: MouseButton; x: number; y: number } | null = null;
+
   /** Attribute everything this dispatch causes to the AGENT.
    *
    *  Trusted input is indistinguishable from a human's by construction, so the renderer
@@ -123,11 +139,18 @@ export function createInputRoutes(deps: InputRouteDeps) {
     }
   }
 
-  return async function inputRoutes(req: HostRequest): Promise<BackendResult | null> {
+  const handler = (async function inputRoutes(req: HostRequest): Promise<BackendResult | null> {
     const { method, urlPath } = req;
     if (!urlPath.startsWith('/api/input/') || method !== 'POST') return null;
     return withAgentAttribution(() => dispatchInput(req));
-  };
+  }) as InputRoutesHandler;
+
+  /** Drop any held sustained-pointer press. Called when the renderer reloads/navigates: the
+   *  synthetic press has no real OS button behind it, so a new document starts with nothing
+   *  held — but `heldPointer` would otherwise persist and 409 the next `down` as "already
+   *  held" (a stranded state machine). Idempotent. */
+  handler.resetHeldPointer = () => { heldPointer = null; };
+  return handler;
 
   async function dispatchInput({ urlPath, body }: HostRequest): Promise<BackendResult | null> {
 
@@ -164,6 +187,42 @@ export function createInputRoutes(deps: InputRouteDeps) {
       });
     }
 
+    // ── SUSTAINED pointer (held across calls): down → move* → up ──
+    // The stateful twin of /api/input/drag. `down` presses and LEAVES the button held; later
+    // `move`s re-aim it (a drag-move, since the button stays down); `up` releases. Between calls
+    // the press physically persists (no mouseUp sent), so an agent can read held-only state — a
+    // slingshot pull, a charge meter, a drag-to-aim rubber-band — with get_scene_state / eval /
+    // a screenshot mid-gesture, which the atomic drag can't expose.
+    if (urlPath === '/api/input/pointer') {
+      const { action, x, y, selector, button, modifiers } =
+        (body ?? {}) as PointSpec & { action?: 'down' | 'move' | 'up'; button?: MouseButton; modifiers?: InputModifier[] };
+      if (action !== 'down' && action !== 'move' && action !== 'up') {
+        return bad(`pointer: action must be 'down', 'move', or 'up' (got ${JSON.stringify(action)})`);
+      }
+      if (action === 'down' && heldPointer) {
+        return json({ error: `a pointer is already held (button '${heldPointer.button}' down at ${heldPointer.x},${heldPointer.y}). Release it with action:'up' before pressing again.` }, 409);
+      }
+      if ((action === 'move' || action === 'up') && !heldPointer) {
+        return json({ error: `no pointer is held — send action:'down' first (this ${action} would be a stray event).` }, 409);
+      }
+      const r = await resolvePoint({ x, y, selector }, `pointer ${action}`, requestRenderer);
+      if ('error' in r) return bad(r.error);
+      // 'down' takes its button from the request (default left); 'move'/'up' REUSE the held one so
+      // the whole gesture is one consistent button and a move reads as a drag-move.
+      const effButton: MouseButton = action === 'down' ? (button ?? 'left') : heldPointer!.button;
+      if (action === 'down') {
+        await ops.pointerDown(r.point.x, r.point.y, { button: effButton, modifiers });
+        heldPointer = { button: effButton, x: r.point.x, y: r.point.y };
+      } else if (action === 'move') {
+        await ops.pointerMove(r.point.x, r.point.y, { button: effButton, modifiers });
+        heldPointer = { button: effButton, x: r.point.x, y: r.point.y };
+      } else {
+        await ops.pointerUp(r.point.x, r.point.y, { button: effButton, modifiers });
+        heldPointer = null;
+      }
+      return json({ ok: true, pointer: { action, x: r.point.x, y: r.point.y, button: effButton, held: heldPointer !== null }, ...provenance(r.point) });
+    }
+
     if (urlPath === '/api/input/hover') {
       const { x, y, selector, modifiers } = (body ?? {}) as PointSpec & { modifiers?: InputModifier[] };
       const r = await resolvePoint({ x, y, selector }, 'hover', requestRenderer);
@@ -173,11 +232,11 @@ export function createInputRoutes(deps: InputRouteDeps) {
     }
 
     if (urlPath === '/api/input/scroll') {
-      const { x, y, selector, deltaX, deltaY } = (body ?? {}) as PointSpec & { deltaX?: number; deltaY?: number };
+      const { x, y, selector, deltaX, deltaY, modifiers } = (body ?? {}) as PointSpec & { deltaX?: number; deltaY?: number; modifiers?: InputModifier[] };
       const r = await resolvePoint({ x, y, selector }, 'scroll', requestRenderer);
       if ('error' in r) return bad(r.error);
-      await ops.scroll(r.point.x, r.point.y, deltaX ?? 0, deltaY ?? 0);
-      return json({ ok: true, scrolled: { x: r.point.x, y: r.point.y, deltaX: deltaX ?? 0, deltaY: deltaY ?? 0 }, ...provenance(r.point) });
+      await ops.scroll(r.point.x, r.point.y, deltaX ?? 0, deltaY ?? 0, modifiers);
+      return json({ ok: true, scrolled: { x: r.point.x, y: r.point.y, deltaX: deltaX ?? 0, deltaY: deltaY ?? 0, ...(modifiers?.length ? { modifiers } : {}) }, ...provenance(r.point) });
     }
 
     if (urlPath === '/api/input/key') {

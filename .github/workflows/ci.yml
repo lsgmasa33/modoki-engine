@@ -1,6 +1,6 @@
 # Public-repo CI — the engine-only gate: typecheck + lint + the app & engine test suites.
 # No signing, no GPU, no Electron launch. This is the curated public counterpart of the private
-# repo's ci.yml (docs/plans/engine-oss-public-repo.md): it drops the private-only game-project
+# repo's ci.yml (docs/engine-oss-publishing.md): it drops the private-only game-project
 # steps (there is no games/ here) and git-LFS fetch (the LFS-tracked skinned-test GLBs live with a
 # game, so those tests skip). The root `npm ci` postinstall installs the MCP tool deps + builds the
 # workspace plugins, so no separate tool/game install step is needed.

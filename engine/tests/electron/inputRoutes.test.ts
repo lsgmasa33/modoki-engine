@@ -26,7 +26,10 @@ function makeOps(): InputOps {
     tap: vi.fn(async (x, y) => { calls.push(`tap(${x},${y})`); }),
     drag: vi.fn(async (from, to) => { calls.push(`drag(${from.x},${from.y}→${to.x},${to.y})`); }),
     hover: vi.fn(async (x, y) => { calls.push(`hover(${x},${y})`); }),
-    scroll: vi.fn(async (x, y, dx, dy) => { calls.push(`scroll(${x},${y},${dx},${dy})`); }),
+    scroll: vi.fn(async (x, y, dx, dy, m?) => { calls.push(`scroll(${x},${y},${dx},${dy}${m ? `,[${m.join('+')}]` : ''})`); }),
+    pointerDown: vi.fn(async (x, y, o) => { calls.push(`pdown(${x},${y},${o?.button ?? 'left'})`); }),
+    pointerMove: vi.fn(async (x, y, o) => { calls.push(`pmove(${x},${y},${o?.button ?? 'left'})`); }),
+    pointerUp: vi.fn(async (x, y, o) => { calls.push(`pup(${x},${y},${o?.button ?? 'left'})`); }),
     pressKey: vi.fn(async (k) => { calls.push(`key(${k})`); return { activeElement: null, gameSwallows: false }; }),
     typeText: vi.fn(async (t) => { calls.push(`type(${t})`); return { typed: t.length, editable: true, activeElement: null }; }),
     focusElement: vi.fn(async (s) => { calls.push(`focus(${s ?? ''})`); return { view: true, focused: s ?? null, blurred: null, ok: true }; }),
@@ -223,12 +226,25 @@ describe('hover and scroll', () => {
 
   it('scroll accepts a selector and defaults both deltas to 0', async () => {
     await post('/api/input/scroll', { selector: '#kebab' });
-    expect(ops.scroll).toHaveBeenCalledWith(210, 110, 0, 0);
+    expect(ops.scroll).toHaveBeenCalledWith(210, 110, 0, 0, undefined);
   });
 
   it('scroll passes BOTH deltas through with their DOM sign', async () => {
     await post('/api/input/scroll', { x: 1, y: 2, deltaX: -40, deltaY: 120 });
-    expect(ops.scroll).toHaveBeenCalledWith(1, 2, -40, 120);
+    expect(ops.scroll).toHaveBeenCalledWith(1, 2, -40, 120, undefined);
+  });
+
+  it('scroll forwards modifiers (Ctrl/Cmd+wheel zoom) and echoes them', async () => {
+    const res = await post('/api/input/scroll', { x: 1, y: 2, deltaY: -120, modifiers: ['control'] });
+    expect(ops.scroll).toHaveBeenCalledWith(1, 2, 0, -120, ['control']);
+    expect((res as { body: { scrolled?: { modifiers?: string[] } } }).body.scrolled?.modifiers).toEqual(['control']);
+  });
+
+  it('scroll OMITS the modifiers echo when none (or an empty array) are given', async () => {
+    const bare = await post('/api/input/scroll', { x: 1, y: 2, deltaY: -120 });
+    expect('modifiers' in (bare as { body: { scrolled: object } }).body.scrolled).toBe(false);
+    const empty = await post('/api/input/scroll', { x: 1, y: 2, deltaY: -120, modifiers: [] });
+    expect('modifiers' in (empty as { body: { scrolled: object } }).body.scrolled).toBe(false);
   });
 
   it('hover forwards its modifiers', async () => {
@@ -239,6 +255,67 @@ describe('hover and scroll', () => {
   it('hover 400s with no target', async () => {
     expect(await post('/api/input/hover', {})).toMatchObject({ status: 400 });
     expect(ops.hover).not.toHaveBeenCalled();
+  });
+});
+
+describe('sustained pointer (held across calls)', () => {
+  it('down → move → up threads ONE button and holds between calls', async () => {
+    const d = await post('/api/input/pointer', { action: 'down', x: 10, y: 20, button: 'left' });
+    expect((d as { body: { pointer: { held: boolean } } }).body.pointer.held).toBe(true);
+    // move/up reuse the held button even though none is passed
+    await post('/api/input/pointer', { action: 'move', x: 30, y: 40 });
+    const u = await post('/api/input/pointer', { action: 'up', x: 50, y: 60 });
+    expect((u as { body: { pointer: { held: boolean } } }).body.pointer.held).toBe(false);
+    expect(calls).toEqual(['pdown(10,20,left)', 'pmove(30,40,left)', 'pup(50,60,left)']);
+  });
+
+  it('the held button carries a non-left button into move/up', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1, button: 'right' });
+    await post('/api/input/pointer', { action: 'move', x: 2, y: 2 });
+    expect(calls).toEqual(['pdown(1,1,right)', 'pmove(2,2,right)']);
+  });
+
+  it('409s a move/up when nothing is held, and a second down while held', async () => {
+    expect(await post('/api/input/pointer', { action: 'move', x: 1, y: 1 })).toMatchObject({ status: 409 });
+    expect(await post('/api/input/pointer', { action: 'up', x: 1, y: 1 })).toMatchObject({ status: 409 });
+    expect(ops.pointerMove).not.toHaveBeenCalled();
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    expect(await post('/api/input/pointer', { action: 'down', x: 2, y: 2 })).toMatchObject({ status: 409 });
+    expect(ops.pointerDown).toHaveBeenCalledOnce();
+  });
+
+  it('400s an unknown action and resolves a selector like the other routes', async () => {
+    expect(await post('/api/input/pointer', { action: 'wiggle', x: 1, y: 1 })).toMatchObject({ status: 400 });
+    await post('/api/input/pointer', { action: 'down', selector: '#kebab' });
+    expect(ops.pointerDown).toHaveBeenCalledWith(210, 110, { button: 'left', modifiers: undefined });
+  });
+
+  it('a FAILED down (bad selector) holds NOTHING — a later move still 409s', async () => {
+    expect(await post('/api/input/pointer', { action: 'down', selector: '#ghost' })).toMatchObject({ status: 400 });
+    expect(ops.pointerDown).not.toHaveBeenCalled();
+    // nothing got held, so a move is still "no pointer is held"
+    expect(await post('/api/input/pointer', { action: 'move', x: 1, y: 1 })).toMatchObject({ status: 409 });
+  });
+
+  it('a FAILED move (bad selector) does NOT drop the hold — a later up still releases', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    expect(await post('/api/input/pointer', { action: 'move', selector: '#ghost' })).toMatchObject({ status: 400 });
+    expect(ops.pointerMove).not.toHaveBeenCalled();
+    // the hold survived the failed move, so up succeeds and clears it
+    const u = await post('/api/input/pointer', { action: 'up', x: 2, y: 2 });
+    expect((u as { body: { pointer: { held: boolean } } }).body.pointer.held).toBe(false);
+    expect(ops.pointerUp).toHaveBeenCalledOnce();
+  });
+});
+
+describe('createInputRoutes.resetHeldPointer', () => {
+  it('clears a held press so the next down is not 409d as already-held', async () => {
+    const routesWithReset = createInputRoutes({ ops, requestRenderer });
+    await routesWithReset({ method: 'POST', urlPath: '/api/input/pointer', query: new URLSearchParams(), body: { action: 'down', x: 1, y: 1 } });
+    // a second down would 409 — until we reset (simulating a renderer reload)
+    routesWithReset.resetHeldPointer();
+    const afterReset = await routesWithReset({ method: 'POST', urlPath: '/api/input/pointer', query: new URLSearchParams(), body: { action: 'down', x: 2, y: 2 } });
+    expect((afterReset as { body: { pointer: { held: boolean } } }).body.pointer.held).toBe(true);
   });
 });
 
@@ -501,6 +578,7 @@ describe('actor lease brackets every input dispatch', () => {
     ['/api/input/drag', { from: { x: 1, y: 2 }, to: { x: 3, y: 4 } }],
     ['/api/input/hover', { x: 1, y: 2 }],
     ['/api/input/scroll', { x: 1, y: 2, deltaY: 100 }],
+    ['/api/input/pointer', { action: 'down', x: 1, y: 2 }],
     ['/api/input/key', { key: 'Escape' }],
     ['/api/input/type', { text: 'hi' }],
     ['/api/input/focus', {}],

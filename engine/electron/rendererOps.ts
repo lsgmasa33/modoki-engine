@@ -92,10 +92,22 @@ export interface TapOpts {
   modifiers?: InputModifier[];
 }
 
+/** Convert a PUBLIC coordinate (zoomed-CSS — what getBoundingClientRect / selectors /
+ *  Percept bounds report) to the DIP space `sendInputEvent` expects. Under VS Code–style
+ *  page zoom (factor f = 1.2^level) they differ: Chromium maps an injected DIP coordinate
+ *  into the page by DIVIDING by f, so to land on the element at zoomed-CSS point P we must
+ *  inject P·f. No-op at zoom 0 (f=1). MEASURED + rationale: the coordinate audit in
+ *  docs/plans/editor-ui-zoom-plan.md. */
+const toDip = (wc: Electron.WebContents, x: number, y: number): { x: number; y: number } => {
+  const f = wc.getZoomFactor();
+  return { x: x * f, y: y * f };
+};
+
 /** Single trusted click at page CSS coordinates (x,y). `opts` unlocks right-click
  *  (context menus), double-click, and modifier+click (multi-select). */
 export async function tap(win: BrowserWindow, x: number, y: number, opts?: TapOpts): Promise<void> {
   const wc = win.webContents;
+  ({ x, y } = toDip(wc, x, y)); // zoomed-CSS → DIP for the trusted event
   const button = opts?.button ?? 'left';
   const clickCount = opts?.clickCount ?? 1;
   const modifiers = opts?.modifiers;
@@ -131,6 +143,8 @@ export async function drag(
 ): Promise<void> {
   const opts: DragOpts = typeof optsOrSteps === 'number' ? { steps: optsOrSteps } : (optsOrSteps ?? {});
   const wc = win.webContents;
+  from = toDip(wc, from.x, from.y); // zoomed-CSS → DIP (both endpoints; interpolation stays in DIP)
+  to = toDip(wc, to.x, to.y);
   const n = Math.max(2, opts.steps ?? 10);
   const button = opts.button ?? 'left';
   const modifiers = opts.modifiers;
@@ -147,10 +161,70 @@ export async function drag(
   wc.sendInputEvent({ type: 'mouseUp', x: to.x, y: to.y, button, clickCount: 1, modifiers } as Electron.MouseInputEvent);
 }
 
+export interface PointerOpts {
+  /** Mouse button (default 'left'). */
+  button?: MouseButton;
+  /** Held modifiers. */
+  modifiers?: InputModifier[];
+}
+
+/** SUSTAINED-pointer primitives — the split, cross-call twin of `drag`. `drag` is atomic
+ *  (down→moves→up in one call), so any state that exists ONLY while the button is physically
+ *  held — a slingshot pull preview, a charge-up meter, a drag-to-aim rubber-band — is gone
+ *  before the call returns and is therefore unobservable. These three send the SAME trusted
+ *  `sendInputEvent`s but across SEPARATE calls, so the agent can hold the press, read the
+ *  held-only state (get_scene_state / modoki_eval / a screenshot), move to re-aim, read
+ *  again, then release. Chromium keeps the button pressed between events as long as no
+ *  `mouseUp` is sent, so a `move` with the button set reads as a drag-move, not a hover.
+ *  The held-button STATE (and the "nothing is held" guard) lives in the route, not here —
+ *  these stay stateless so the button is explicit per event. */
+export async function pointerDown(win: BrowserWindow, x: number, y: number, opts?: PointerOpts): Promise<void> {
+  const wc = win.webContents;
+  ({ x, y } = toDip(wc, x, y)); // zoomed-CSS → DIP
+  const button = opts?.button ?? 'left';
+  const modifiers = opts?.modifiers;
+  wc.sendInputEvent({ type: 'mouseMove', x, y, modifiers } as Electron.MouseInputEvent);
+  wc.sendInputEvent({ type: 'mouseDown', x, y, button, clickCount: 1, modifiers } as Electron.MouseInputEvent);
+  await sleep(16);
+}
+
+/** The Chromium "this button is CURRENTLY held" modifier for a button — distinct from the
+ *  `button` field (which names the button an event is ABOUT). Across SEPARATE injected events
+ *  Blink does not infer a still-pressed button from an earlier mouseDown, so a held move must
+ *  re-assert it or the DOM move reports `buttons=0` (measured) and a handler that gates on
+ *  `e.buttons` treats the gesture as released. */
+function buttonHeldModifier(button: MouseButton): string {
+  return button === 'right' ? 'rightButtonDown' : button === 'middle' ? 'middleButtonDown' : 'leftButtonDown';
+}
+
+/** Move the HELD pointer to (x,y). `button` MUST be the one held (the route threads it). We send
+ *  both the `button` field AND the `*ButtonDown` held-modifier so Chromium reports `buttons` with
+ *  the button set — the move reads as a real drag-move across calls, not a hover. */
+export async function pointerMove(win: BrowserWindow, x: number, y: number, opts?: PointerOpts): Promise<void> {
+  const wc = win.webContents;
+  ({ x, y } = toDip(wc, x, y)); // zoomed-CSS → DIP
+  const button = opts?.button ?? 'left';
+  const modifiers = [...(opts?.modifiers ?? []), buttonHeldModifier(button)];
+  wc.sendInputEvent({ type: 'mouseMove', x, y, button, modifiers } as unknown as Electron.MouseInputEvent);
+  await sleep(16);
+}
+
+/** Release the held pointer at (x,y), ending the sustained gesture. */
+export async function pointerUp(win: BrowserWindow, x: number, y: number, opts?: PointerOpts): Promise<void> {
+  const wc = win.webContents;
+  ({ x, y } = toDip(wc, x, y)); // zoomed-CSS → DIP
+  const button = opts?.button ?? 'left';
+  const modifiers = opts?.modifiers;
+  wc.sendInputEvent({ type: 'mouseUp', x, y, button, clickCount: 1, modifiers } as Electron.MouseInputEvent);
+  await sleep(16);
+}
+
 /** Bare trusted mouse-move to (x,y) with no button held — triggers hover states,
  *  tooltips, and hover-to-open submenus (which a bracketed drag-move can't). */
 export async function hover(win: BrowserWindow, x: number, y: number, modifiers?: InputModifier[]): Promise<void> {
-  win.webContents.sendInputEvent({ type: 'mouseMove', x, y, modifiers } as Electron.MouseInputEvent);
+  const wc = win.webContents;
+  ({ x, y } = toDip(wc, x, y)); // zoomed-CSS → DIP
+  wc.sendInputEvent({ type: 'mouseMove', x, y, modifiers } as Electron.MouseInputEvent);
   await sleep(16);
 }
 
@@ -169,14 +243,21 @@ export async function scroll(
   y: number,
   deltaX: number,
   deltaY: number,
+  modifiers?: InputModifier[],
 ): Promise<void> {
+  const wc = win.webContents;
+  ({ x, y } = toDip(wc, x, y)); // zoomed-CSS → DIP for the wheel's target point (deltas are unscaled)
   const dx = -deltaX, dy = -deltaY; // DOM-sign → native-sign (see GOTCHA above)
   // wheelTicks track deltas in "clicks" — some listeners read them instead of the
   // pixel delta, so send both (120px ≈ one wheel tick, the Chromium convention).
-  win.webContents.sendInputEvent({
+  // `modifiers` set ctrlKey/metaKey/… on the synthesized WheelEvent, so a modifier-gated
+  // wheel handler (Ctrl/Cmd+wheel UI-zoom, the Curve Editor's value-axis zoom, Shift+wheel
+  // horizontal) is drivable — without them a bare wheel never trips those handlers.
+  wc.sendInputEvent({
     type: 'mouseWheel', x, y, deltaX: dx, deltaY: dy,
     wheelTicksX: dx / 120, wheelTicksY: dy / 120,
     canScroll: true,
+    ...(modifiers && modifiers.length ? { modifiers } : {}),
   } as Electron.MouseWheelInputEvent);
   await sleep(16);
 }
@@ -363,18 +444,24 @@ export async function captureGesture(
   const { from, to } = opts;
   const n = Math.max(2, opts.steps ?? 12);
   const frames: GestureFrame[] = [];
-  wc.sendInputEvent({ type: 'mouseMove', x: from.x, y: from.y } as Electron.MouseInputEvent);
-  wc.sendInputEvent({ type: 'mouseDown', x: from.x, y: from.y, button: 'left', clickCount: 1 } as Electron.MouseInputEvent);
+  // Dispatch in DIP (toDip), but REPORT the trajectory in the public zoomed-CSS space the
+  // caller gave — so the returned feel numbers stay comparable to selector/Percept coords.
+  const send = (type: string, x: number, y: number, extra?: Record<string, unknown>) => {
+    const p = toDip(wc, x, y);
+    wc.sendInputEvent({ type, x: p.x, y: p.y, ...extra } as Electron.MouseInputEvent);
+  };
+  send('mouseMove', from.x, from.y);
+  send('mouseDown', from.x, from.y, { button: 'left', clickCount: 1 });
   await sleep(16);
   for (let i = 1; i <= n; i++) {
     const t = i / n;
     const x = Math.round(from.x + (to.x - from.x) * t);
     const y = Math.round(from.y + (to.y - from.y) * t);
-    wc.sendInputEvent({ type: 'mouseMove', x, y, button: 'left' } as Electron.MouseInputEvent);
+    send('mouseMove', x, y, { button: 'left' });
     await sleep(16);
     frames.push({ t, x, y, sample: await opts.sample().catch(() => null) });
   }
-  wc.sendInputEvent({ type: 'mouseUp', x: to.x, y: to.y, button: 'left', clickCount: 1 } as Electron.MouseInputEvent);
+  send('mouseUp', to.x, to.y, { button: 'left', clickCount: 1 });
   await sleep(16);
   frames.push({ t: 1, x: to.x, y: to.y, sample: await opts.sample().catch(() => null) });
   return { frames };

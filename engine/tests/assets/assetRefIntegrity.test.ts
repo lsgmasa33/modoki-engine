@@ -27,7 +27,7 @@ import { discoverProjects } from '../../scripts/projectRoots.mjs';
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
 // The "real assets" checks below scan the repo's shipped PROJECT assets (findAssetRoots
 // already covers both project roots); skip the project-dependent cases when neither root
-// exists (engine-only OSS repo). docs/plans/engine-oss-public-repo.md.
+// exists (engine-only OSS repo). docs/engine-oss-publishing.md.
 const hasGames = discoverProjects(PROJECT_ROOT).length > 0;
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isGuid = (s: unknown): s is string => typeof s === 'string' && GUID_RE.test(s);

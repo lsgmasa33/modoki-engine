@@ -235,6 +235,127 @@ export function frameCameraToBoxFixed(
   camera.updateProjectionMatrix();
 }
 
+// ── Orientation-gizmo view snapping (SceneViewGizmo) ─────────────────────────
+
+/** The six canonical view directions the corner gizmo snaps to, as the OFFSET from the
+ *  orbit target toward the camera (so the camera looks back down `-dir`). RGB-signed:
+ *  +X/+Y/+Z are the solid cones, negatives the hollow ones. `label` names the resulting
+ *  view (clicking +Y looks straight DOWN, i.e. the "Top" view). */
+export const GIZMO_AXES: { name: string; label: string; dir: readonly [number, number, number] }[] = [
+  { name: '+x', label: 'Right',  dir: [1, 0, 0] },
+  { name: '-x', label: 'Left',   dir: [-1, 0, 0] },
+  { name: '+y', label: 'Top',    dir: [0, 1, 0] },
+  { name: '-y', label: 'Bottom', dir: [0, -1, 0] },
+  { name: '+z', label: 'Front',  dir: [0, 0, 1] },
+  { name: '-z', label: 'Back',   dir: [0, 0, -1] },
+];
+
+/** Camera position that looks straight down `dir` at `target` from `distance` away —
+ *  `target + normalize(dir) * distance`. Pure; used as the snap-tween end position (the
+ *  distance is the CURRENT orbit distance, so a snap only rotates the view). A degenerate
+ *  `dir` falls back to +Z so the result is always finite. */
+export function axisSnapCameraPosition(
+  target: THREE.Vector3,
+  dir: THREE.Vector3,
+  distance: number,
+  out = new THREE.Vector3(),
+): THREE.Vector3 {
+  const d = out.copy(dir);
+  if (d.lengthSq() < 1e-12) d.set(0, 0, 1);
+  d.normalize();
+  return d.multiplyScalar(distance).add(target);
+}
+
+/** Constant-distance interpolation of a camera OFFSET (position − target) from `from` to
+ *  `to`: slerp the direction on the unit sphere, lerp the magnitude. Keeps the camera on
+ *  an arc around the target (no dip through it) even when `from`/`to` point oppositely.
+ *  `t` is clamped to [0,1]. Near-antipodal inputs (dot ≈ −1) pick a stable perpendicular
+ *  axis so the arc is still well-defined. Returns `out`. */
+export function slerpCameraOffset(
+  from: THREE.Vector3,
+  to: THREE.Vector3,
+  t: number,
+  out = new THREE.Vector3(),
+): THREE.Vector3 {
+  const tc = t < 0 ? 0 : t > 1 ? 1 : t;
+  const lenFrom = from.length();
+  const lenTo = to.length();
+  const len = lenFrom + (lenTo - lenFrom) * tc;
+  const a = _tmpA.copy(from).normalize();
+  const b = _tmpB.copy(to).normalize();
+  let dot = a.dot(b);
+  dot = dot < -1 ? -1 : dot > 1 ? 1 : dot;
+  if (dot > 0.9995) {
+    // Nearly parallel — plain lerp + renormalize avoids a divide-by-tiny-sin.
+    out.copy(a).lerp(b, tc).normalize();
+    return out.multiplyScalar(len);
+  }
+  if (dot < -0.9995) {
+    // Antipodal — no unique arc; sweep `a` toward `-a` THROUGH a stable perpendicular axis.
+    // The total angle a→−a is π (the perpendicular is only the halfway point), so θ MUST run
+    // to π at t=1 — using acos(0)=π/2 here would land the tween on the perpendicular axis
+    // instead of the clicked (opposite) one. `rel` is the perpendicular unit itself.
+    const perp = Math.abs(a.x) < 0.9 ? _tmpP.set(1, 0, 0) : _tmpP.set(0, 1, 0);
+    const rel = _tmpR.copy(perp).addScaledVector(a, -a.dot(perp)).normalize();
+    const theta = Math.PI * tc;
+    out.copy(a).multiplyScalar(Math.cos(theta)).addScaledVector(rel, Math.sin(theta));
+    return out.multiplyScalar(len);
+  }
+  const theta = Math.acos(dot) * tc;
+  // Gram–Schmidt: component of b perpendicular to a, then rotate a by theta toward it.
+  const rel = _tmpR.copy(b).addScaledVector(a, -dot).normalize();
+  out.copy(a).multiplyScalar(Math.cos(theta)).addScaledVector(rel, Math.sin(theta));
+  return out.multiplyScalar(len);
+}
+const _tmpA = new THREE.Vector3();
+const _tmpB = new THREE.Vector3();
+const _tmpP = new THREE.Vector3();
+const _tmpR = new THREE.Vector3();
+
+// ── Perspective ↔ orthographic frustum matching (editor-camera projection toggle) ──
+
+/** Vertical half-height of a perspective frustum at `dist` from the camera:
+ *  `dist * tan(fov/2)`. `fovDeg` is the THREE vertical FOV in degrees. Used to size an
+ *  ortho frustum so toggling to ortho keeps the same on-screen extent at the orbit pivot. */
+export function perspHalfHeightAtDistance(fovDeg: number, dist: number): number {
+  return dist * Math.tan((fovDeg * Math.PI) / 360); // (fov/2) in radians
+}
+
+/** Inverse of {@link perspHalfHeightAtDistance}: the distance at which a perspective camera
+ *  of `fovDeg` shows `halfH` of vertical half-height. Used on ortho→persp toggle to place the
+ *  perspective camera so the extent matches. Guards a degenerate ~0 FOV. */
+export function perspDistanceForHalfHeight(fovDeg: number, halfH: number): number {
+  const t = Math.tan((fovDeg * Math.PI) / 360);
+  return t > 1e-6 ? halfH / t : halfH;
+}
+
+/** Ortho frustum extents for a given vertical `halfH` and viewport `aspect` (w/h), centered.
+ *  `zoom` stays 1; OrbitControls dolly then drives `camera.zoom`. */
+export function orthoFrustumForHalfHeight(halfH: number, aspect: number): {
+  top: number; bottom: number; left: number; right: number;
+} {
+  const halfW = halfH * aspect;
+  return { top: halfH, bottom: -halfH, left: -halfW, right: halfW };
+}
+
+/** Project a world-space axis direction into the corner gizmo's 2D face, as seen from a
+ *  camera with orientation `camQuat`. Transforms `dir` into camera space (inverse of the
+ *  camera rotation): `x` is right, `y` is up (SVG callers flip it), `depth` is toward the
+ *  viewer (larger = nearer the front → draw on top). All components are in [-1, 1] for a
+ *  unit `dir`. Pure — a plain quaternion in, plain numbers out; unit-testable without a
+ *  renderer. */
+export function projectGizmoAxis(
+  dir: THREE.Vector3,
+  camQuat: THREE.Quaternion,
+): { x: number; y: number; depth: number } {
+  // Camera looks down its local −Z, so a world axis whose camera-space z is POSITIVE points
+  // back toward the viewer (in front of the gizmo face). Invert the camera rotation to bring
+  // the world axis into camera space.
+  const v = _tmpA.copy(dir).applyQuaternion(_tmpQ.copy(camQuat).invert());
+  return { x: v.x, y: v.y, depth: v.z };
+}
+const _tmpQ = new THREE.Quaternion();
+
 /** The geometry to edge the viewport outlines from, for the object a selected entity resolves
  *  to: the yellow selection outline and a convex/trimesh Collider3D's green wireframe.
  *

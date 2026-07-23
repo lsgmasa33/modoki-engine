@@ -9,6 +9,8 @@ import * as THREE from 'three';
 import {
   setEditorViewportCamera, getEditorViewportCamera,
   setFocusEntityHandler, focusEntityInSceneView,
+  setViewportController, snapEditorViewToAxis, toggleEditorProjection, getEditorProjection,
+  type ViewportController,
 } from '../../src/editor/scene/sceneViewBus';
 
 const winCam = () => (window as unknown as { __sceneViewCamera?: THREE.Camera }).__sceneViewCamera;
@@ -50,5 +52,56 @@ describe('sceneViewBus — focus-entity command (F14)', () => {
     unregisterA(); // A's stale cleanup must NOT remove B
     focusEntityInSceneView(1);
     expect(calls).toEqual(['B']);
+  });
+});
+
+describe('sceneViewBus — viewport orientation controller (SceneViewGizmo)', () => {
+  // No public reset for the controller, so each case installs its own and unregisters; the
+  // "no viewport mounted" case runs first via an explicit unregister.
+  const mkCtrl = (over: Partial<ViewportController> = {}): { ctrl: ViewportController; calls: unknown[][] } => {
+    const calls: unknown[][] = [];
+    const ctrl: ViewportController = {
+      snapToAxis: (d) => calls.push(['snap', d.x, d.y, d.z]),
+      toggleProjection: () => calls.push(['toggle']),
+      getProjection: () => 'perspective',
+      ...over,
+    };
+    return { ctrl, calls };
+  };
+
+  it('returns false / null when no viewport controller is registered', () => {
+    const { ctrl } = mkCtrl();
+    setViewportController(ctrl)(); // register then immediately unregister → none live
+    expect(snapEditorViewToAxis(new THREE.Vector3(0, 1, 0))).toBe(false);
+    expect(toggleEditorProjection()).toBe(false);
+    expect(getEditorProjection()).toBeNull();
+  });
+
+  it('fires each command through to the registered controller', () => {
+    const { ctrl, calls } = mkCtrl({ getProjection: () => 'orthographic' });
+    const un = setViewportController(ctrl);
+    expect(snapEditorViewToAxis(new THREE.Vector3(0, 1, 0))).toBe(true);
+    expect(calls[0]).toEqual(['snap', 0, 1, 0]);
+    expect(toggleEditorProjection()).toBe(true);
+    expect(calls[1]).toEqual(['toggle']);
+    expect(getEditorProjection()).toBe('orthographic');
+    un();
+  });
+
+  it('unregister only clears the live controller — a stale remount cleanup cannot clobber it', () => {
+    const { ctrl: A } = mkCtrl({ getProjection: () => 'perspective' });
+    const { ctrl: B } = mkCtrl({ getProjection: () => 'orthographic' });
+    const unA = setViewportController(A);
+    setViewportController(B); // B is live (a "remount")
+    unA();                    // A's stale cleanup must NOT remove B
+    expect(getEditorProjection()).toBe('orthographic');
+  });
+
+  it('unregister nulls the controller so later commands no-op', () => {
+    const { ctrl } = mkCtrl();
+    const un = setViewportController(ctrl);
+    un();
+    expect(getEditorProjection()).toBeNull();
+    expect(snapEditorViewToAxis(new THREE.Vector3(1, 0, 0))).toBe(false);
   });
 });

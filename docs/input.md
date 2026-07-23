@@ -118,6 +118,21 @@ reads it via the accessors (`pointerPressed`/`pointerDown`/`pointerReleased`/`po
 and maps the coordinates to world space itself (raycast / its own projection). Worked examples:
 `games/sling` (drag-to-aim slingshot) and `games/space-invader` (absolute finger-follow + release-to-fire).
 
+**Presentation-invariant input (zoom).** Page/UI zoom — the editor's webContents zoom, a browser
+Cmd+, an OS zoom — rescales the CSS coordinate system: at zoom factor `f` the viewport holds `1/f` as
+many CSS px, so the SAME physical drag spans fewer `clientX` px. That must not change how a game
+FEELS. The contract (`runtime/input/presentationScale.ts`): input is presented as if the presentation
+were 1:1. **Positions stay raw** (`pointerPos` = viewport CSS px) — they are ratio-matched to
+`getBoundingClientRect`, so raycast/hit-testing off them is already zoom-invariant (the `f` cancels).
+**Magnitudes are normalized** — `pointerDrag` multiplies the raw delta by the presentation scale to
+recover zoom-0-equivalent px, so a game's `dragPx × k` feel constant (e.g. sling's `pullPerPx`) doesn't
+drift under zoom. Detection: `window.devicePixelRatio` tracks page zoom exactly (`dpr = displayScale ×
+f`), read live so zoom changes auto-track; `baseDpr` defaults to the load-time dpr (right for a shipped
+game at 100%) and the editor calibrates it authoritatively via `calibratePresentationScale(f)` (main
+pushes `webContents.getZoomFactor()` on mount + each change, since a persisted zoom is restored before
+the game mounts). A real in-game CAMERA/world zoom is NOT undone here — it changes framing through the
+world projection (raycast), the correct channel for it.
+
 **Character-controller bridges.** GAME-tier systems, so they tick only while the sim plays and run
 after the INPUT-tier `inputSystem` wrote this frame's edges. `characterInputSystem` sets `cc.moveX =
 axis('moveX')` and latches `cc.jump` on `pressed('jump') || pressed('navUp')` (in 2D there's no forward

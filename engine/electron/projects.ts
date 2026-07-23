@@ -216,6 +216,7 @@ export function installAppMenu(opts: {
   onMenuAction?(id: string): void;
   onCheckForUpdates?(): void;
   onAbout?(): void;
+  onZoom?(dir: 'in' | 'out' | 'reset'): void;
 }): void {
   const recents = getRecentProjects();
   const isMac = process.platform === 'darwin';
@@ -254,6 +255,14 @@ export function installAppMenu(opts: {
     { type: 'separator' }, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' },
   ];
   const viewRoleTail: Electron.MenuItemConstructorOptions[] = [
+    // Whole-app UI zoom (VS Code–style). Custom click handlers, NOT Electron's zoomIn/
+    // zoomOut/resetZoom roles, so they share the clamp + persistence of the Cmd/Ctrl+wheel
+    // path (main's zoom controller). `CmdOrCtrl+Plus` also fires on Cmd/Ctrl+= (Electron
+    // maps Plus to the unshifted = key), so no separate binding is needed.
+    { type: 'separator' },
+    { label: 'Zoom In', accelerator: 'CmdOrCtrl+Plus', click: () => opts.onZoom?.('in') },
+    { label: 'Zoom Out', accelerator: 'CmdOrCtrl+-', click: () => opts.onZoom?.('out') },
+    { label: 'Actual Size', accelerator: 'CmdOrCtrl+0', click: () => opts.onZoom?.('reset') },
     // forceReload (Cmd+Shift+R) bypasses the HTTP cache — needed to pick up a
     // rebaked asset served at its stable immutable URL.
     { type: 'separator' }, { role: 'reload' }, { role: 'forceReload' }, { role: 'toggleDevTools' }, { role: 'togglefullscreen' },

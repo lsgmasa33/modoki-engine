@@ -23,14 +23,19 @@ setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_ENABLE_DEBUG_MENU__)
 // and driven (native-only) from App.tsx's game bootstrap. See
 // @modoki/engine/runtime appServices + docs/modoki-package-manager.md.
 
-// Debug bridge
-// Native: always init (Capacitor plugin handles TCP server + UDP beacon, no tree-shaking issue)
-// Web: only in dev mode or with VITE_DEBUG_BRIDGE=1 (WebSocket fallback)
-// The `!__MODOKI_PLAYABLE__` build-constant guard lets Rollup DCE this whole branch (and the
-// `./debug/bridge` import it drags in) out of a playable ad — otherwise the runtime
-// `Capacitor.isNativePlatform()` check can't be constant-folded, so the bridge JS gets inlined
-// into the single-file creative as dead weight against the byte cap.
-if (!__MODOKI_PLAYABLE__ && (Capacitor.isNativePlatform() || import.meta.env.DEV || import.meta.env.VITE_DEBUG_BRIDGE)) {
+// Debug bridge — the native TCP + UDP beacon / web-WS server behind every device_* MCP tool
+// (device_eval runs ARBITRARY JS on the device through it). Gating, tightest-first:
+//   • Dev / VITE_DEBUG_BRIDGE=1 — always on (the local dev loop + the WebSocket fallback).
+//   • Shipped native game — ONLY when the project opts in via build.debugBridge
+//     (__MODOKI_ENABLE_DEBUG_BRIDGE__). Previously this was ungated on native, so a RELEASE
+//     build shipped the eval-capable server; now the default (flag off) constant-folds the
+//     native branch to false and Rollup DCEs the whole `./debug/bridge` import — a release
+//     build has no server to connect to. Turn it on per-game in Project Settings → Engine
+//     (or set build.debugBridge:true) for on-device debugging.
+// The `!__MODOKI_PLAYABLE__` build-constant guard additionally DCEs the branch out of a
+// playable ad (the runtime isNativePlatform() check alone can't be constant-folded, so the
+// bridge JS would otherwise inline into the single-file creative against the byte cap).
+if (!__MODOKI_PLAYABLE__ && (import.meta.env.DEV || import.meta.env.VITE_DEBUG_BRIDGE || (__MODOKI_ENABLE_DEBUG_BRIDGE__ && Capacitor.isNativePlatform()))) {
   import('@modoki/engine/runtime').then(({ useGameStore }) => {
     (window as unknown as Record<string, unknown>).__gameStore = useGameStore;
   });

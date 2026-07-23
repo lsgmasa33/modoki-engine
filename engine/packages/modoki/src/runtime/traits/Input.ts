@@ -3,6 +3,7 @@ import {
   makeAxes, makeFlags, makePointer,
   type Axis, type DigitalAction, type InputDevice, type InputFrame, type PointerFrame,
 } from '../input/actions';
+import { getPresentationScale } from '../input/presentationScale';
 import type { World } from 'koota';
 
 /** Input resource — the canonical, source-agnostic input snapshot for this frame
@@ -62,15 +63,20 @@ export function pointerDown(world: World): boolean { return getInput(world)?.poi
 export function pointerPressed(world: World): boolean { return getInput(world)?.pointer.pressed ?? false; }
 /** Falling-edge: true only on the frame the pointer went up (release/tap end). */
 export function pointerReleased(world: World): boolean { return getInput(world)?.pointer.released ?? false; }
-/** Current pointer position in viewport CSS px. */
+/** Current pointer position in viewport CSS px. Raw `clientX/clientY` — ratio-matched to
+ *  `getBoundingClientRect`, so raycast/hit-testing off this is already zoom-invariant. */
 export function pointerPos(world: World): { x: number; y: number } {
   const p = getInput(world)?.pointer ?? ZERO_POINTER;
   return { x: p.x, y: p.y };
 }
-/** Drag delta (current − press start) in CSS px; {0,0} while the pointer is up. */
+/** Drag delta (current − press start), PRESENTATION-INVARIANT: normalized to zoom-0 px so a
+ *  gesture yields the same magnitude at any editor/browser/OS zoom (see presentationScale.ts).
+ *  {0,0} while the pointer is up. Positions (`pointerPos`) stay raw — only this magnitude is
+ *  scaled, which is why a game's `dragPx × k` feel constant no longer drifts under zoom. */
 export function pointerDrag(world: World): { x: number; y: number } {
   const p = getInput(world)?.pointer ?? ZERO_POINTER;
-  return { x: p.dragX, y: p.dragY };
+  const s = getPresentationScale();
+  return { x: p.dragX * s, y: p.dragY * s };
 }
 
 // ── Harness helpers — set the resource directly in headless tests ──────────────

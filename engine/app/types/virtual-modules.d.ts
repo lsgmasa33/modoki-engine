@@ -34,6 +34,14 @@ declare const __MODOKI_ENABLE_JOURNAL__: boolean;
  *  when off). Defined via Vite `define` in vite.config.ts. */
 declare const __MODOKI_ENABLE_DEBUG_MENU__: boolean;
 
+/** Debug bridge — build-time flag: whether the native TCP / web-WS debug server (the
+ *  transport behind every `device_*` MCP tool, INCLUDING `device_eval`'s arbitrary-JS
+ *  execution) is present in this build. On for the editor + dev; for a shipped game build
+ *  it follows the project's `build.debugBridge` (default false). Gates the `./debug/bridge`
+ *  import in app/main.tsx so a release build tree-shakes the whole eval-capable server out
+ *  — there is nothing to connect to. Defined via Vite `define` in vite.config.ts. */
+declare const __MODOKI_ENABLE_DEBUG_BRIDGE__: boolean;
+
 /** Engine-module toggles — build-time flags: whether each heavy SDK is present in
  *  this build. On for editor/dev (all SDKs); for a game/playable build they follow
  *  the project's `build.modules` (resolved by plugins/detect-modules.ts). Flag-gate

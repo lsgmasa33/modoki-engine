@@ -68,6 +68,39 @@ describe.skipIf(!(gitOk() && enginePluginDirs().length > 0))(
   },
 );
 
+// ── The excluded-vs-included partition on the REAL plugin ─────────────────────
+// The reproducibility test above only checks hashed ⊆ git-tracked — it is BLIND to a
+// regression that re-includes NON-shipped dev files (the plugin's own unit tests /
+// test-vectors), because those are git-tracked too. This pins the actual partition on the
+// real capacitor-game-debug plugin: its test files must NOT feed the identity hash (the
+// churn this scoping fixed), while its shipped native + src build inputs MUST. Reverting
+// pluginHashInputs to "all non-dist inputs" fails this; over-narrowing (dropping src or
+// native) fails it too.
+describe.skipIf(!(gitOk() && enginePluginDirs().some((d) => path.basename(d) === 'capacitor-game-debug')))(
+  'plugin identity hash EXCLUDES non-shipped dev files, INCLUDES shipped + build inputs (real plugin)',
+  () => {
+    const dir = enginePluginDirs().find((d) => path.basename(d) === 'capacitor-game-debug')!;
+    const inputs = new Set(pluginHashInputs(dir));
+    const under = (prefix: string) => [...inputs].filter((p) => p === prefix || p.startsWith(prefix + '/'));
+    const onDisk = (rel: string) => fs.existsSync(path.join(dir, rel));
+
+    // Non-shipped, non-build-input dev files → must be EXCLUDED (only assert for the ones
+    // that actually exist, so a future plugin reshuffle can't falsely pass/fail).
+    for (const excluded of ['android/src/test', 'ios/Tests', 'test-vectors']) {
+      it.skipIf(!onDisk(excluded))(`excludes ${excluded}/** (not shipped, not a dist input)`, () => {
+        expect(under(excluded), `${excluded}/** must not feed the identity hash`).toEqual([]);
+      });
+    }
+
+    // Shipped native + src build inputs → must be INCLUDED (guards against over-narrowing).
+    for (const included of ['src', 'android/src/main', 'ios/Sources']) {
+      it.skipIf(!onDisk(included))(`includes ${included}/** (shipped and/or a dist build input)`, () => {
+        expect(under(included).length, `${included}/** must feed the identity hash`).toBeGreaterThan(0);
+      });
+    }
+  },
+);
+
 // ── The manual re-vendor CLI runs under the current Node ──────────────────────
 // vendor-plugins.mjs imports the single TS impl, which pulls in the toolchain via
 // a bundler-style directory specifier Node's native type-stripping rejects

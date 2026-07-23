@@ -16,7 +16,7 @@ import fs from 'fs';
 import os from 'os';
 import {
   findAssetRoots, resolveAssetPath, readAssetGuid, buildManifest, writeAssetGuid, detectType,
-  classifySceneChange, isSseRoute, createEditorWriteGuard, createBrowserRequestRegistry,
+  classifySceneChange, isSseRoute, createEditorWriteGuard, normalizeWriteGuardKey, createBrowserRequestRegistry,
   handleExitRequest, scanAllAssets, resolveModokiAssetsDir, filterKeptAssets, gamesModuleSource,
   isUnderAssetRoot,
   isValidBuildPlatform, BUILD_PLATFORMS, playableBuildSteps,
@@ -27,7 +27,7 @@ import { findGamesEntry } from '../../plugins/findGamesEntry';
 // engine/tests/plugins/ → repo root (games/ + engine/packages/modoki live there).
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
 // Skip the game-directory-discovery cases when games/ is absent (engine-only OSS repo).
-// docs/plans/engine-oss-public-repo.md.
+// docs/engine-oss-publishing.md.
 const hasGames = fs.existsSync(path.join(PROJECT_ROOT, 'games'));
 
 describe('detectType', () => {
@@ -251,6 +251,30 @@ describe('createEditorWriteGuard (self-write TTL)', () => {
     let hashed = false;
     expect(isWrite('/p/a.json', () => { hashed = true; return 'whatever'; })).toBe(true);
     expect(hashed).toBe(false); // TTL fast path short-circuits before hashing
+  });
+
+  // Windows Ctrl+S full-reload regression: the editor's save resolved an OPENED
+  // scene's `/@fs/e:/…` URL to a LOWERCASE-drive absPath, while chokidar reported the
+  // SAME file with the watched absDir's UPPERCASE `E:`. Keying the guard on the raw
+  // string missed → the save looked external → the live scene bounced (discarding
+  // unsaved edits). The guard now canonicalizes the key so both spellings match.
+  it('recognizes a self-write across a drive-letter case + separator mismatch (Windows Ctrl+S)', () => {
+    const t = 0;
+    const { mark, isWrite } = createEditorWriteGuard(1500, () => t);
+    mark('e:\\Projects\\game\\scenes\\main.json');              // marked lowercase, backslashes
+    expect(isWrite('E:\\Projects\\game\\scenes\\main.json')).toBe(true); // chokidar: uppercase drive
+    expect(isWrite('E:/Projects/game/scenes/main.json')).toBe(true);     // forward slashes too
+  });
+});
+
+describe('normalizeWriteGuardKey (Windows path canonicalization)', () => {
+  it('folds the drive letter to one case and unifies separators', () => {
+    expect(normalizeWriteGuardKey('E:\\Projects\\game\\main.json'))
+      .toBe(normalizeWriteGuardKey('e:/Projects/game/main.json'));
+    expect(normalizeWriteGuardKey('E:\\a\\b.json')).toBe('e:/a/b.json');
+  });
+  it('is a no-op on POSIX paths (no drive letter, no backslashes)', () => {
+    expect(normalizeWriteGuardKey('/home/user/game/main.json')).toBe('/home/user/game/main.json');
   });
 });
 

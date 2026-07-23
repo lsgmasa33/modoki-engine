@@ -4,10 +4,10 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { backendFetch } from '../backend/editorBackend';
 import { readTraitData, readTraitDataFull, findEntity } from '../../runtime/ecs/entityUtils';
 import { getCurrentWorld } from '../../runtime/ecs/world';
-import { writeTraitFieldWithUndo as writeField, writeTraitFieldMultiWithUndo as writeFieldMulti, writeTraitFieldPerEntityWithUndo as writeFieldPerEntity, addTraitToEntitiesWithUndo, removeTraitFromEntitiesWithUndo, deleteEntitiesWithUndo, pasteTraitValuesWithUndo, pasteTraitAsNewWithUndo } from '../undo/entityActions';
+import { writeTraitFieldWithUndo as writeField, writeTraitFieldMultiWithUndo as writeFieldMulti, writeTraitFieldPerEntityWithUndo as writeFieldPerEntity, removeTraitFromEntitiesWithUndo, deleteEntitiesWithUndo, pasteTraitValuesWithUndo } from '../undo/entityActions';
 import { type ContextMenuItem } from '../components/ContextMenu';
 import { useTraitClipboard, setTraitClipboard, isTraitCopyable } from './traitClipboard';
-import { type TraitMeta, type FieldHint, getTraitByName, getAllTraits, COMPONENT_CATEGORY_ORDER } from '../../runtime/ecs/traitRegistry';
+import { type TraitMeta, type FieldHint, getTraitByName, getAllTraits } from '../../runtime/ecs/traitRegistry';
 import { resolveMeshTemplate } from '../../runtime/loaders/meshTemplateCache';
 import { geometryBoxHalfExtents, geometryBoundingRadius } from '../../runtime/systems/meshColliderGeometry';
 import { pushAction } from '../undo/undoManager';
@@ -27,6 +27,7 @@ import { SpriteAnimatorSection } from './SpriteAnimatorSection';
 import { AnimatorClipsSection } from './AnimatorClipsSection';
 import { FieldLabel, NumberField, DropdownField, ColorField, Section, SubSection, DEFAULT_COLOR, colorToHex } from './assetViews/widgets';
 import { defaultForHint, FieldValueWidget, EntityRefField, useWorldDirtyTick } from './inspectorFields';
+import { AddComponentPicker } from './AddComponentPicker';
 import { UIActionBindingsField } from './UIActionBindingsField';
 import { MaterialOverridesField } from './MaterialOverridesField';
 import { MeshAssetView } from './assetViews/MeshAssetView';
@@ -1703,77 +1704,14 @@ export default function Inspector() {
           <TraitSection key={meta.name} meta={meta} entityIds={selectedIds} data={data} />
         ))}
 
-        {/* Add Component dropdown */}
-        {(() => {
-          const existingTraitNames = new Set(traits.map(t => t.meta.name));
-          const addable = getAllTraits().filter(t =>
-            t.category === 'component' && !existingTraitNames.has(t.name)
-          );
-          // "Paste As New" lives here rather than in a section's ⋮ menu: the trait
-          // it adds doesn't exist on the entity yet, so it has no header to hang
-          // off — and it IS an add-component action, just prefilled.
-          const pasteNewMeta = clipboard ? addable.find(t => t.name === clipboard.traitName) : undefined;
-          if (addable.length === 0) return null;
-          // Group addable traits by componentCategory (default 'Misc'),
-          // render in a fixed category order, sorted by name within each group.
-          const CATEGORY_ORDER = COMPONENT_CATEGORY_ORDER;
-          const groups = new Map<string, typeof addable>();
-          for (const t of addable) {
-            const cat = t.componentCategory ?? 'Misc';
-            const list = groups.get(cat) ?? [];
-            list.push(t);
-            groups.set(cat, list);
-          }
-          // Ordered categories: known ones first (fixed order), then any extras alphabetically.
-          const orderedCats = [
-            ...CATEGORY_ORDER.filter(c => groups.has(c)),
-            ...Array.from(groups.keys()).filter(c => !CATEGORY_ORDER.includes(c)).sort(),
-          ];
-          return (
-            <div style={{ padding: '6px 8px', borderBottom: '1px solid #333' }}>
-              <select
-                value=""
-                // Locate/read only: a native <select>'s option popup is a separate OS layer
-                // that `sendInputEvent` cannot drive. Add a component via `modoki_mutate_scene`.
-                data-ui-id="inspector.addComponent.select"
-                data-ui-kind="field"
-                data-ui-label="add component"
-                onChange={(e) => {
-                  const traitName = e.target.value;
-                  if (!traitName) return;
-                  const meta = addable.find(t => t.name === traitName);
-                  if (!meta) return;
-                  // Adds to every selected entity that doesn't already have it
-                  // (single-select is just the one), as a single undo entry.
-                  addTraitToEntitiesWithUndo(selectedIds, meta);
-                }}
-                style={{ ...inputStyle, width: '100%', color: '#888' }}
-              >
-                <option value="">Add Component...</option>
-                {orderedCats.map(cat => (
-                  <optgroup key={cat} label={cat}>
-                    {groups.get(cat)!
-                      .slice()
-                      .sort((a, b) => a.name.localeCompare(b.name))
-                      .map(t => <option key={t.name} value={t.name}>{t.name}</option>)}
-                  </optgroup>
-                ))}
-              </select>
-              {pasteNewMeta && (
-                <button
-                  onClick={() => pasteTraitAsNewWithUndo(selectedIds, pasteNewMeta, clipboard!.values)}
-                  title={`Add ${pasteNewMeta.name} with the copied values`}
-                  data-ui-id="inspector.addComponent.pasteAsNew"
-                  data-ui-kind="button"
-                  data-ui-label={`paste ${pasteNewMeta.name} as new`}
-                  style={{ ...inputStyle, width: '100%', marginTop: 4, color: '#ccc', cursor: 'pointer', textAlign: 'center' }}
-                >
-                  Paste {pasteNewMeta.name} as New
-                </button>
-              )}
-            </div>
-          );
-        })()}
+        {/* Add Component picker */}
+        <AddComponentPicker
+          addable={getAllTraits().filter(t =>
+            t.category === 'component' && !new Set(traits.map(x => x.meta.name)).has(t.name)
+          )}
+          selectedIds={selectedIds}
+          clipboard={clipboard}
+        />
 
         {tags.length > 0 && (
           <Section title="Tags">

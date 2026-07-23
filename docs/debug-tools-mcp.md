@@ -140,8 +140,14 @@ The MCP is **parity-plus** with chrome-devtools for the editor, and better on tw
 same actions + state a person has in the editor. They relay to the renderer over the SAME bridge
 (Vite HMR in dev, Electron IPC in the DMG), so they behave identically in both:
 - **See all UI state:** `modoki_get_editor_state` — selection, play state, gizmo mode/space, FPS,
-  entity count, editor camera pose, undo/redo labels (the companion to `get_scene_state`).
-  `modoki_get_console_logs` — renderer console + uncaught errors.
+  entity count, editor camera pose, undo/redo labels, and `viewport` (`innerWidth`/`innerHeight`/
+  `devicePixelRatio`/`zoomFactor` — the VS Code-style UI zoom as DATA, no CDP needed) (the companion
+  to `get_scene_state`). `modoki_get_console_logs` — renderer console + uncaught errors.
+- **Eval live renderer state:** `modoki_eval` — run JS in the editor RENDERER and get the value back
+  (the editor twin of `device_eval`). For reading/poking live state a file read can't see — a global
+  (`window.__3d`), `devicePixelRatio`, a React fiber value, WGSL validation, dispatching a bridge
+  event. Runs as a function body (`return x`); return a PROJECTION for anything large/circular. This
+  is what removed most of the "stand up a raw CDP client" cases below. *(Electron editor only.)*
 - **Play/test the game:** `modoki_play_control {play|stop|pause|resume|step}` — press Play, exercise
   with `modoki_tap`/`modoki_drag`, read `get_scene_state`, then stop (reverts the authored snapshot).
 - **Edit like a human (undoable):** `modoki_create_entity` (empty/primitive/2d/ui/camera/light/
@@ -151,6 +157,10 @@ same actions + state a person has in the editor. They relay to the renderer over
   `modoki_set_transform` sets position/rotation/scale in ONE call (partial merge) and — unlike a
   plain `setTrait` — routes a prefab INSTANCE's edit into its overrides instead of being silently
   ignored; prefer it over hand-building a `mutate_scene` op.
+- **Fire native menu items:** `modoki_menu` — `list` returns the app-menu tree (each node's `path`/
+  `id`/`accelerator`/`enabled`); `path:"View/Zoom In"` or `id:…` fires that item's click (the same
+  callback a human's click runs). This is the ONLY way to reach menu-only actions — `modoki_press_key`
+  cannot trigger native Electron menu accelerators (Chromium swallows them). *(Electron editor only.)*
 - **Keyboard focus:** `modoki_focus {selector?}` — focus that element, or with NO selector blur the
   focused one. The game's input sampler drops keys while a DOM text field (Console filter, an
   Inspector input) holds focus, so blur first when trusted key input mysteriously does nothing.
@@ -368,9 +378,17 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
   aimed at (0,0). Keep `{x,y}` for canvas/entity targets, from `get_scene_state?bounds=1`.
 - **Raw input modalities** (beyond `tap`/`drag`): `modoki_hover` (bare mouse-move → tooltips/hover-
   submenus), `modoki_scroll` (wheel → orbit-zoom, scroll a long panel, cursor-anchored Canvas2D zoom;
-  `deltaY>0` = content down, ~120 ≈ one tick), `modoki_press_key` (standalone chord into the focused
+  `deltaY>0` = content down, ~120 ≈ one tick; pass `modifiers:['control'|'meta'|…]` to drive a
+  modifier-gated wheel handler — Ctrl/Cmd+wheel UI-zoom, the Curve Editor value-axis zoom), `modoki_press_key` (standalone chord into the focused
   element — `Escape`/`Delete`/arrows + hotkeys `W`/`E`/`R` gizmo, `F` frame, `Cmd+Z` — the keys
   `type_text` could only send as a terminal `submitKey`).
+- **Sustained/HELD pointer** (`modoki_pointer {action:down|move|up}`) — the stateful twin of
+  `modoki_drag`, split across calls: `down` presses and LEAVES the button held, `move` re-aims it
+  (drag-move), `up` releases. The press physically persists between MCP calls, so state that exists
+  only *while the button is held* — a slingshot pull preview, a charge-up meter, a drag-to-aim
+  rubber-band — is readable mid-gesture (`get_scene_state`/`modoki_eval`/screenshot between the
+  down and the up), which the atomic `drag`/`dnd` cannot expose. move/up reuse the held button;
+  a move/up with nothing held (or a second down while held) is a 409.
 - **HTML5 drag-and-drop** (`modoki_dnd`) — the DnD sequence a trusted pointer-drag CANNOT emit:
   Hierarchy reparent/reorder, Assets file-move & prefab-instantiate, Skin sprite-onto-part / bone-
   reparent. Address each end by CSS `selector` or `{x,y}`; the app's own `dragstart` fills the
@@ -423,10 +441,17 @@ Need full CDP (network inspection, perf traces, heap snapshots) against Electron
 speaks CDP too — launch Electron with `--remote-debugging-port` and point `chrome-devtools` at
 the Electron window; `--inspect` debugs the main process. So nothing CDP-shaped is lost in Electron.
 
+**Try `modoki_eval` first.** For a one-shot read/poke of live renderer state (a global, a fiber
+value, `devicePixelRatio`, dispatching a bridge event, a WGSL compile check), `modoki_eval` returns
+the value over the normal MCP bridge with no CDP client to stand up — it's the editor twin of
+`device_eval` and removed most of the cases below. Reach for full CDP only when you need a CDP-native
+capability `eval` can't give you: sampling a clock/state **over time**, network/perf/heap inspection,
+or observing a transient the very act of an HMR-triggering edit would mask.
+
 **REACH for Electron CDP when the MCP/Percept surface can't answer — don't avoid it.** The
-`modoki` MCP + Percept tools are the default and cover most editor debugging, but some questions
-are only answerable by inspecting the live renderer directly, and past sessions have wrongly
-avoided this and gone in circles instead. Attach CDP when you need to: read **live React
+`modoki` MCP + Percept tools (now including `modoki_eval`) are the default and cover most editor
+debugging, but some questions are only answerable by inspecting the live renderer directly, and past
+sessions have wrongly avoided this and gone in circles instead. Attach CDP when you need to: read **live React
 fiber/component props or state** (e.g. what `node.textAnim` a UINode actually received — the
 projection value, WITHOUT a source edit); measure **CSS-animation clocks / computed transforms /
 `getAnimations()` `currentTime`** over time (motion the console can't show); diagnose
@@ -535,9 +560,18 @@ Standalone Capacitor plugin at `engine/packages/capacitor-game-debug/`. Runs a T
 - **Android:** ServerSocket (TCP, first-wins single client) + native lease handshake + `captureScreen` + `getNativeLogs` (logcat)
 - **No Bonjour/mDNS on either platform** — advertising was removed from the plugin; the backend connects by IP/adb.
 
-**Debug vs Release:**
-- iOS: `#if DEBUG` gates plugin registration in MyViewController
-- Android: `FLAG_DEBUGGABLE` runtime check rejects in release
+**Debug vs Release (two layers):**
+- **Native plugin** — iOS: `#if DEBUG` gates plugin registration in MyViewController; Android:
+  `FLAG_DEBUGGABLE` runtime check rejects in release. So a store/release-signed build has no native
+  TCP server.
+- **JS bridge** (`app/main.tsx` → `./debug/bridge`, which carries `handleEval` = arbitrary JS) —
+  gated by the `build.debugBridge` project flag (Project Settings → Developer), baked as
+  `__MODOKI_ENABLE_DEBUG_BRIDGE__`. Default **false** → the whole `./debug/bridge` import
+  tree-shakes out of a shipped game build (native AND web), so there is no eval-capable JS server at
+  all; the editor + dev keep it always-on. This is the layer that also covers the web
+  (`VITE_DEBUG_BRIDGE`) path and closes the pre-existing gap where the JS bridge was ungated on
+  native even though the native plugin was `#if DEBUG`-gated. Turn it ON per-game to debug on-device
+  (the 6 internal native testbeds already set it).
 
 **Known issues:**
 - iOS SPM static linking strips the plugin class — requires manual registration in MyViewController + Xcode file reference from App target to `engine/packages/capacitor-game-debug/ios/Sources/GameDebugPlugin/GameDebugPlugin.swift` (project-relative path in pbxproj, no copy). Edit the package source only.

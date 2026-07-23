@@ -49,7 +49,7 @@ path everywhere).
 | Backend port is `backendHandle.port` (default 5179, ephemeral fallback on clash) | `main.ts` | Main knows the exact `MODOKI_BACKEND` URL to bake; the user never could |
 | Open project root is `state.root` | `main.ts` | Main knows where to write `.mcp.json` |
 | MCP reads `MODOKI_BACKEND` (default `http://localhost:5173`) + logs a start banner | `modoki-mcp/src/index.ts:23` | The written env var is the only wiring the MCP needs |
-| Dev CDP is an electron CLI arg (`--remote-debugging-port`) set only by the launcher when `MODOKI_CDP_PORT` is set; Chromium binds it 127.0.0.1-only | `launch-editor.sh:90` | The packaged app (OS double-click, no CLI arg) `appendSwitch`es the port itself — **on by default** now (opt-out), so a plain launch opens it unless the user disabled it |
+| Dev CDP is an electron CLI arg (`--remote-debugging-port`) the launcher sets; Chromium binds it 127.0.0.1-only. **On by default** in dev too now: an explicit `MODOKI_CDP_PORT` wins, else the launcher derives a per-clone-safe default `9222 + (backend − 5179)` (5179→9222, 5180→9223, 5181→9224) whenever the backend port is pinned; only an AUTO backend port (MULTI mode) leaves it off | `launch-editor.sh` | The packaged app (OS double-click, no CLI arg) `appendSwitch`es the port itself — also **on by default** (opt-out), so a plain launch opens it unless the user disabled it |
 | The repo `.mcp.json` already runs three servers (`modoki`, `game-debug`, `chrome-devtools --browser-url`) | repo `.mcp.json` | Multi-server merge is the proven shape; `chrome-devtools` attaches to a renderer over CDP by URL |
 | Menus merge renderer items via `rendererMenuSpec` + `modoki:bridge-menu-action`; main↔renderer over the preload bridge | `projects.ts`, `preload.ts`, `main.ts` | A new menu item + a dockable panel slot into existing patterns |
 | Editor already writes project files (`project.config.json`, `.modoki/layouts/`) | `projects.ts` | Writing `.mcp.json` is an established capability, not a new trust boundary |
@@ -119,8 +119,9 @@ via `asarUnpack: **/engine/**`. **Verify** `node dist/index.js` starts and logs
 CDP is what lets Claude reach the **live renderer** when data isn't enough: read React
 fiber state and CSS-animation clocks, validate WGSL, and capture the **true framebuffer**
 via `Page.captureScreenshot` (which — unlike `capture_viewport` — does *not* force a
-render, so it exposes render-on-demand / stale-frame bugs). Today only the dev launcher
-opens it.
+render, so it exposes render-on-demand / stale-frame bugs). It is **on by default** in
+both surfaces now — the dev launcher derives a per-clone port (see the table above) and
+the packaged app opens it via the opt-out pref below.
 
 Chromium requires `--remote-debugging-port` **at startup, before `app.ready`** — it
 can't be toggled at runtime. So in `main.ts`, early:

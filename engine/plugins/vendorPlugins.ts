@@ -154,35 +154,71 @@ function npmAlwaysExcluded(basename: string): boolean {
  *  source" dir list.) */
 const BUILD_OUTPUT_DIRS = new Set(['dist', 'build', '.gradle', '.build', 'DerivedData', 'Pods', '.cxx', '.swiftpm']);
 
-/** Sorted plugin-relative POSIX paths that feed the identity hash — the plugin's
- *  SOURCE INPUTS: every file EXCEPT derived build-output/cache dirs (see
- *  BUILD_OUTPUT_DIRS) and npm-always-excluded junk.
- *
- *  WHY exclude build output — it is byte-sensitive to the exact tsc/rollup/gradle
- *  versions doing the build, gitignored, and rebuilt on every `npm install`
- *  (root postinstall → build:plugins) or native build. Hashing it made the
- *  tarball NAME drift whenever the toolchain drifted across clones or over time —
- *  the recurring "sync/rebuilt tgz" churn (each install could rename the tarball
- *  with zero source changes). The tarball's identity must answer "did the
- *  plugin's SOURCE change?", NOT "did the build output shift?". So a source edit
- *  (src/ or native ios/android/manifest) still yields a new hash → one fresh pack
- *  (with a freshly-built dist INSIDE it, since packInto builds first); a pure
- *  toolchain/build-artifact drift does not re-pack. The committed tarball is
- *  reused across every clone → `npm ci` integrity stays put.
- *
- *  This supersedes the earlier "published-fileset" scoping, which still hashed
- *  dist/ (and assumed src/ was the volatile input — it's the reverse: src/ is
- *  stable, the build output drifts). We hash ALL inputs and exclude only derived
- *  dirs, so we can't under-hash a real input (over-hashing a stray source file is
- *  safe — a spurious rename at worst, never a hash COLLISION that would break
- *  npm ci). Bonus: the hash no longer depends on whether/what got built locally,
- *  so every clone computes the SAME name before and after its first build.
- *
- *  Exported so a repo-invariant test can assert this set is EXACTLY the committed
- *  source for each real engine plugin (no untracked/gitignored file leaks in →
- *  reproducible across clones — the litter-leak bug the BUILD_OUTPUT_DIRS list
- *  guards against, for whatever dir names a future plugin's build tool emits). */
-export function pluginHashInputs(pluginDir: string): string[] {
+/** npm ALWAYS ships these plugin-ROOT files regardless of the `files` allowlist —
+ *  package.json plus npm-packlist's force-keep set (README, COPYING, LICENSE/LICENCE) —
+ *  so they're part of the shipped fileset for hashing: a change to a shipped README
+ *  genuinely changes the tarball bytes. Root only (no `/`). (NOTE current npm-packlist
+ *  does NOT force-keep NOTICE/CHANGELOG/HISTORY — that was old fstream-npm behavior — so
+ *  they're only shipped when listed in `files`, and are covered there.) */
+function isAlwaysShipped(rel: string): boolean {
+  if (rel.includes('/')) return false;
+  if (rel === 'package.json') return true;
+  return /^(readme|copying|licen[sc]e)(\.|$)/i.test(rel);
+}
+
+/** Filenames (plugin-root) that, with src/, determine the built `dist/`. ONE source
+ *  for both the identity hash (pluginHashInputs, part B) and the stale-dist stamp
+ *  (pluginSourceHash), so the two can't drift on what counts as a build input. */
+const DIST_BUILD_CONFIG_FILES = ['package.json', 'tsconfig.json', 'rollup.config.mjs'];
+
+/** A dist BUILD INPUT — everything under src/ plus the build config. Keeping these in
+ *  the identity hash preserves the contract that a src/ edit re-packs so the rebuilt
+ *  dist ships under a new tarball name (a shipped-files-only scope would drop src/ and
+ *  break it — vendorPlugins.test.ts "DOES re-pack when a SOURCE input changes"). */
+function isDistBuildInput(rel: string): boolean {
+  return rel === 'src' || rel.startsWith('src/') || DIST_BUILD_CONFIG_FILES.includes(rel);
+}
+
+/** True if `rel` is covered by the plugin's `files` allowlist. Entries here are simple
+ *  `dir/`+file paths (no globs), so a normalized prefix match is enough — do NOT pull in
+ *  npm-packlist/minimatch (not deps). The `dist` entry is intentionally never matched:
+ *  dist/ is derived + volatile and excluded from the hash (its INPUTS are covered by
+ *  isDistBuildInput instead), so a toolchain-only drift can't rename the tarball. */
+function matchesFilesEntry(rel: string, filesEntries: string[]): boolean {
+  for (const raw of filesEntries) {
+    const e = raw.replace(/^\.?\//, '').replace(/\/+$/, '');
+    if (!e || e === 'dist') continue;
+    if (rel === e || rel.startsWith(e + '/')) return true;
+  }
+  return false;
+}
+
+/** A `files` entry that the literal prefix matcher CANNOT resolve — an npm glob
+ *  (contains *, ?, [, ], {, }) or a whole-package "." / "./". A plugin with any such
+ *  entry can ship files a prefix match would miss, so pluginHashInputs falls back to the
+ *  safe wide scope (hash all inputs) rather than silently under-hashing a shipped file. */
+function hasGlobMeta(entry: string): boolean {
+  const e = entry.replace(/^\.?\//, '').replace(/\/+$/, '');
+  return e === '' || e === '.' || /[*?[\]{}]/.test(e);
+}
+
+/** The plugin's `files` allowlist (strings only), or null when absent/empty/invalid —
+ *  which triggers the "hash all source inputs" fallback in pluginHashInputs. */
+function readPackageFiles(pluginDir: string): string[] | null {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(pluginDir, 'package.json'), 'utf8'));
+    if (!Array.isArray(pkg.files)) return null;
+    const files = pkg.files.filter((f: unknown): f is string => typeof f === 'string');
+    return files.length ? files : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Every non-derived, non-junk file under the plugin, as sorted plugin-relative POSIX
+ *  paths. Excludes BUILD_OUTPUT_DIRS (dist/build/.gradle/…) at any depth and
+ *  npm-always-excluded junk. The raw candidate set pluginHashInputs narrows. */
+function allSourceInputs(pluginDir: string): string[] {
   const acc: string[] = [];
   const stack = [pluginDir];
   while (stack.length) {
@@ -198,7 +234,48 @@ export function pluginHashInputs(pluginDir: string): string[] {
       else acc.push(path.relative(pluginDir, p).split(path.sep).join('/'));
     }
   }
-  return acc.sort();
+  return acc;
+}
+
+/** Sorted plugin-relative POSIX paths that feed the identity hash. The tarball name
+ *  must answer "did the plugin's SHIPPED bytes, or the inputs that BUILD them, change?"
+ *  — nothing more. So the hashed set is the union of:
+ *
+ *    A. the SHIPPED fileset minus the volatile dist/ — files matched by package.json
+ *       `files` (matchesFilesEntry) PLUS npm's always-shipped manifest files
+ *       (isAlwaysShipped: README/LICENSE/package.json). dist/ is excluded here because
+ *       it's derived + toolchain-sensitive; its INPUTS live in B, so a real source
+ *       change still re-packs while a pure build-output drift does not.
+ *    B. the dist BUILD INPUTS — src/ + build config (isDistBuildInput), so a src/ edit
+ *       re-packs the rebuilt dist under a new name (the contract a files-only scope
+ *       would break).
+ *
+ *  Files in NEITHER set — the plugin's OWN unit tests (android/src/test, ios/Tests),
+ *  test-vectors, and other non-shipped dev files — do NOT feed the hash, so editing them
+ *  no longer renames every vendoring game's committed tarball (the recurring spurious
+ *  re-pin this scoping fixes). Over-hashing only ever costs a spurious rename, never an
+ *  npm-ci integrity break; UNDER-hashing a genuinely-shipped file would, which is why A
+ *  keeps npm's always-shipped set even though it's outside `files`.
+ *
+ *  Fallback: a plugin with NO `files` field can't be scoped to a shipped set, so it
+ *  hashes ALL source inputs (dist/ still excluded) — the prior behavior, preserved.
+ *
+ *  Exported so a repo-invariant test can assert this set is EXACTLY the committed
+ *  source for each real engine plugin (no untracked/gitignored file leaks in →
+ *  reproducible across clones — the litter-leak bug the BUILD_OUTPUT_DIRS list
+ *  guards against, for whatever dir names a future plugin's build tool emits). */
+export function pluginHashInputs(pluginDir: string): string[] {
+  const all = allSourceInputs(pluginDir);
+  const files = readPackageFiles(pluginDir);
+  // No `files`, OR any entry we can't resolve by literal prefix (an npm glob, or a
+  // whole-package "." / "./"): hash ALL source inputs. Over-hashing only costs a spurious
+  // rename; UNDER-hashing a globbed shipped file would ship stale bytes under an unchanged
+  // name — so a glob plugin gets the safe wide scope. Only literal `files` entries get the
+  // narrowed (shipped ∪ dist-build-inputs) scope.
+  if (!files || files.some(hasGlobMeta)) return all.sort();
+  return all
+    .filter((rel) => isDistBuildInput(rel) || isAlwaysShipped(rel) || matchesFilesEntry(rel, files))
+    .sort();
 }
 
 /** Content hash (8 hex) of the plugin's SOURCE INPUTS (see pluginHashInputs),
@@ -240,7 +317,8 @@ function pluginSourceHash(pluginDir: string): string | null {
     }
   }
   // Build config counts too: a tsconfig/rollup/package.json change alters output.
-  for (const cfg of ['package.json', 'tsconfig.json', 'rollup.config.mjs']) {
+  // Shared with the identity hash (isDistBuildInput) so they can't disagree.
+  for (const cfg of DIST_BUILD_CONFIG_FILES) {
     const p = path.join(pluginDir, cfg);
     if (fs.existsSync(p)) files.push(p);
   }

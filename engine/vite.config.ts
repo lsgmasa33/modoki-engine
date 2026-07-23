@@ -38,6 +38,15 @@ const enableJournalFlag = loadProjectConfig(buildProjectRoot).build.enableJourna
 // build it follows the open project's build.enableDebugMenu (default false → off).
 const enableDebugMenuFlag = loadProjectConfig(buildProjectRoot).build.enableDebugMenu === true
 
+// Debug BRIDGE — the native TCP / web-WS debug server that carries device_* MCP tools,
+// INCLUDING device_eval (arbitrary JS on the device). Same bake-as-a-define pattern as the
+// two flags above so main.tsx can constant-fold the whole `./debug/bridge` import out. Unlike
+// the others it was previously UNGATED on native (shipped in every build); now a shipped GAME
+// build follows the open project's build.debugBridge (default false → the bridge is
+// tree-shaken out entirely, so a release build has no eval-capable server to connect to).
+// Always on for the editor + dev (the DEV / __MODOKI_EDITOR__-adjacent OR in main.tsx).
+const enableDebugBridgeFlag = loadProjectConfig(buildProjectRoot).build.debugBridge === true
+
 // Absolute dir of @zappar/msdf-generator, pinned so its bare import resolves even when the
 // dep-optimize cache is relocated out of the tree in a packaged editor (see resolve.alias
 // below). Hoisting puts it at <repoRoot>/node_modules in both the dev clone AND the packaged
@@ -178,6 +187,7 @@ export default defineConfig(({ command }) => {
     __MODOKI_EDITOR__: JSON.stringify(command === 'serve' || process.env.MODOKI_EDITOR === 'true'),
     __MODOKI_ENABLE_JOURNAL__: JSON.stringify(enableJournalFlag),
     __MODOKI_ENABLE_DEBUG_MENU__: JSON.stringify(enableDebugMenuFlag),
+    __MODOKI_ENABLE_DEBUG_BRIDGE__: JSON.stringify(enableDebugBridgeFlag),
     __MODOKI_MODULE_RENDER3D__: JSON.stringify(moduleFlags.render3d),
     __MODOKI_MODULE_RENDER2D__: JSON.stringify(moduleFlags.render2d),
     __MODOKI_MODULE_PHYSICS2D__: JSON.stringify(moduleFlags.physics2d),
@@ -274,7 +284,7 @@ export default defineConfig(({ command }) => {
     hookTimeout: 30000,
     include: [
       // ENGINE tests only — tests/** is the engine test surface, and it ships to the
-      // public OSS repo (docs/plans/engine-oss-public-repo.md). DEMO-GAME tests live with
+      // public OSS repo (docs/engine-oss-publishing.md). DEMO-GAME tests live with
       // their game under ../games/<id>/tests (globbed below) and stay private. Do NOT add
       // a game-specific tests/ subdir here.
       'tests/framework/**/*.test.ts',

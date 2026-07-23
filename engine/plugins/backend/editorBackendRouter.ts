@@ -462,6 +462,20 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 502); }
   }
 
+  // ── POST /api/eval (M→R) ── evaluate JS in the editor RENDERER and return the value
+  // (compact, bounded by the MCP formatter). The editor twin of device_eval: unblocks
+  // reading/poking live renderer state (a global, window.innerWidth, devicePixelRatio, a
+  // fiber value, dispatching a bridge event) without standing up a raw CDP client. The
+  // renderer safe-stringifies the result, so a JS error comes back as an `Error: …` STRING
+  // in `result` (the MCP tool flags that as isError). Editor-only: this router is stripped
+  // from shipped game builds.
+  if (urlPath === '/api/eval' && method === 'POST') {
+    const b = (body ?? {}) as { code?: string };
+    if (typeof b.code !== 'string' || !b.code) return json({ error: 'code (string) required' }, 400);
+    try { return json({ result: await ctx.requestBrowser('eval', { code: b.code }) }); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+
   // ── Percept Watch (M→R) ── standing numeric time-series over the live world. ──
   if (urlPath === '/api/watch/start' && method === 'POST') {
     try { return json(await ctx.requestBrowser('watch-start', body ?? {})); }

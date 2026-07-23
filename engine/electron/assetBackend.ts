@@ -14,6 +14,7 @@ import crypto from 'crypto';
 import chokidar, { type FSWatcher } from 'chokidar';
 import {
   findAssetRoots, scanAllAssets, buildManifest, resolveAssetPath, absToAssetUrl, classifySceneChange,
+  normalizeWriteGuardKey,
   type AssetRoot,
   type LiveReloadKind,
 } from '../plugins/vite-asset-scanner';
@@ -57,8 +58,13 @@ export function createAssetBackend(opts: {
   // the on-disk bytes equal what we wrote). Kept inline (not the Vite plugin's
   // createEditorWriteGuard) to avoid importing a Vite-plugin module into the
   // Electron main process; the logic is identical. (editor-core F9)
+  // Keyed on a canonicalized path (drive-letter case + separators folded via
+  // normalizeWriteGuardKey) so the editor's own save — whose /@fs-derived absPath may
+  // spell the drive differently than chokidar's absDir — is recognized as a self-write
+  // on Windows instead of bouncing the live scene (Ctrl+S full-reload bug).
   const recentEditorWrites = new Map<string, { exp: number; hash: string | null }>();
-  const markEditorWrite = (absPath: string, hash: string | null = null) => {
+  const markEditorWrite = (absPathRaw: string, hash: string | null = null) => {
+    const absPath = normalizeWriteGuardKey(absPathRaw);
     recentEditorWrites.set(absPath, { exp: Date.now() + 1500, hash });
     setTimeout(() => {
       const e = recentEditorWrites.get(absPath);
@@ -69,7 +75,8 @@ export function createAssetBackend(opts: {
     try { return crypto.createHash('sha1').update(fs.readFileSync(file)).digest('hex'); }
     catch { return null; }
   };
-  const isEditorWrite = (absPath: string, currentHash?: () => string | null) => {
+  const isEditorWrite = (absPathRaw: string, currentHash?: () => string | null) => {
+    const absPath = normalizeWriteGuardKey(absPathRaw);
     const e = recentEditorWrites.get(absPath);
     if (!e) return false;
     if (e.exp > Date.now()) return true;

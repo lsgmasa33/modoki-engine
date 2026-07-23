@@ -60,7 +60,11 @@ export function useTimelineViewport(opts: TimelineViewportOptions): TimelineView
       onViewport(zoomViewport(vpRef.current, e.clientX - r.left, e.deltaY, el.clientWidth, duration));
     };
     el.addEventListener('wheel', onWheel, { passive: false });
-    return () => el.removeEventListener('wheel', onWheel);
+    // Mark this surface as owning Ctrl/Cmd+wheel so the app-level UI-zoom forwarder
+    // (EditorApp) doesn't swallow the value-axis zoom via its capture-phase listener.
+    // Only when we actually consume a modified wheel (onWheelModified given).
+    if (onWheelModified) el.setAttribute('data-modki-wheel-zoom', '');
+    return () => { el.removeEventListener('wheel', onWheel); el.removeAttribute('data-modki-wheel-zoom'); };
   }, [ref, onViewport, duration, onWheelModified]);
 
   const beginPan = useCallback((startDrag: PanStart, e: React.PointerEvent, beforeStart?: () => void) => {

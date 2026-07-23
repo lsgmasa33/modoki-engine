@@ -264,6 +264,7 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
               title: 'Developer',
               fields: [
                 { key: 'build.enableDebugMenu', label: 'Ship the in-game debug menu', type: 'checkbox', help: 'F12 / 3-finger tap opens it in the built game (stats, world, journal, device IP). Always on in the editor; off = tree-shaken out of the build. Rebuild to apply.' },
+                { key: 'build.debugBridge', label: 'Ship the debug bridge (device tools + eval)', type: 'checkbox', help: 'Runs the on-device debug server that the device_* AI tools connect to — INCLUDING device_eval (arbitrary JS on the device). Turn ON to debug this game on a device; leave OFF for release, where the whole server is tree-shaken out (nothing to connect to). Always on in the editor/dev. Rebuild to apply.' },
               ],
             },
           ],

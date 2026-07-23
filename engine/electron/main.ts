@@ -17,7 +17,7 @@
  * only the backend (/api) is main-hosted. Opening a project re-roots that server.
  */
 
-import { app, BrowserWindow, ipcMain, shell, dialog, nativeImage } from 'electron';
+import { app, BrowserWindow, ipcMain, shell, dialog, nativeImage, Menu } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import { initFileLog, getLogFilePath, logToFile } from './fileLog';
@@ -86,8 +86,9 @@ import { createAssetBackend, type ElectronAssetBackend } from './assetBackend';
 import { npmSpawnSpec, ensureNode, PINNED_NODE } from '../toolchain';
 import { startBackendServer, type BackendServerHandle, type HostRoutes } from './backendServer';
 import type { LiveReloadKind } from '../plugins/vite-asset-scanner';
-import { captureViewport, tap, drag, hover, scroll, pressKey, typeText, focusElement, captureGesture } from './rendererOps';
+import { captureViewport, tap, drag, hover, scroll, pointerDown, pointerMove, pointerUp, pressKey, typeText, focusElement, captureGesture } from './rendererOps';
 import { createInputRoutes } from './inputRoutes';
+import { serializeMenu, triggerMenuItem, type MenuItemLike } from './menuActions';
 import { getSsrLoadModule, closeSsrLoader } from './ssrLoader';
 import { buildProdCsp, PROD_CSP_ORIGINS } from './csp';
 import { startDevServer, stopDevServer, findFreePort } from './devServer';
@@ -101,6 +102,7 @@ import { ensureToken } from './instanceToken';
 import { vendorEnginePlugins, writeVendorMarker, type VendorResult } from '../plugins/vendorPlugins';
 import { healNativeConfig } from '../plugins/healNativeConfig';
 import { setupAutoUpdate, checkForUpdatesInteractive, isUpdateInstalling } from './autoUpdate';
+import { restoreZoom, handleZoom } from './zoom';
 import { registerReimportHandler } from '../plugins/reimport-registry';
 import { textureReimportHandler } from '../plugins/reimport-texture';
 import { modelReimportHandler } from '../plugins/reimport-model';
@@ -461,6 +463,11 @@ const state: { root: string; backend: ElectronAssetBackend } = {
 
 let mainWindow: BrowserWindow | null = null;
 let backendHandle: BackendServerHandle | null = null;
+// Clears the held sustained-pointer state (createInputRoutes().resetHeldPointer). Held at module
+// scope because the input routes are built in the whenReady block but the reload hook that must
+// fire it lives in the top-level createWindow(). Set once the routes exist; a reload before then
+// (there isn't one) is a harmless no-op.
+let resetHeldPointerOnReload: (() => void) | null = null;
 
 // ── R→M: the renderer's pushed trait schema (undefined ⇒ ref-only validation). ──
 let cachedSchema: SceneSchema | undefined;
@@ -658,6 +665,20 @@ async function createWindow(backendBase: string) {
   await waitForServer(pageOrigin).catch((e) => console.error('[modoki-electron]', e.message));
   // The nonce placement (QUERY before the hash) is load-bearing and lives in buildRendererUrl
   // so it's pinned by one test — a fragment-placed nonce would silently kill probeCdp. §12.2.
+  // Restore the persisted UI zoom level (VS Code–style whole-app zoom) on every load —
+  // setZoomLevel resets to 0 on each navigation, so this re-applies after reloads/HMR
+  // too. Registered BEFORE loadURL: loadURL's promise resolves ON did-finish-load, so a
+  // `.once` added after the await could miss the initial event.
+  win.webContents.on('did-finish-load', () => {
+    restoreZoom(win);
+    // A reload starts a fresh document with no button held — drop any stranded sustained-pointer
+    // press so the next `down` isn't 409'd as "already held". (docs/todo — held-pointer review.)
+    resetHeldPointerOnReload?.();
+  });
+  // Moving the window to a differently-scaled monitor changes devicePixelRatio (= displayScale
+  // × zoomFactor) but NOT getZoomFactor, so the engine's presentation baseline (baseDpr) would
+  // go stale and mis-scale game input. Re-push the authoritative factor so it recalibrates.
+  win.on('moved', () => { if (!win.isDestroyed()) win.webContents.send('modoki:bridge-zoom-factor', win.webContents.getZoomFactor()); });
   await win.loadURL(buildRendererUrl(pageOrigin, CDP_NONCE));
   // Fallback reveal: if the editor never pushes its menu-structure (the real mount
   // signal), don't leave the window hidden behind the splash forever. The common path
@@ -884,6 +905,11 @@ function rebuildMenu(): void {
     onMenuAction: (id) => mainWindow?.webContents.send('modoki:bridge-menu-action', id),
     onCheckForUpdates: () => checkForUpdatesInteractive(),
     onAbout: () => showAboutDialog(),
+    // View → Zoom In/Out/Actual Size (+ their accelerators) route through the same
+    // controller as the Cmd/Ctrl+wheel path so clamp + persistence stay consistent.
+    // Ignore when a non-main window (e.g. the fixed-size About dialog) is focused, so the
+    // accelerators don't silently zoom the editor behind it.
+    onZoom: (dir) => { const w = BrowserWindow.getFocusedWindow(); if (!w || w === mainWindow) handleZoom(mainWindow, { dir }); },
   });
 }
 
@@ -1070,13 +1096,18 @@ app.whenReady().then(async () => {
       tap: (x, y, o) => tap(mainWindow!, x, y, o),
       drag: (from, to, o) => drag(mainWindow!, from, to, o),
       hover: (x, y, m) => hover(mainWindow!, x, y, m),
-      scroll: (x, y, dx, dy) => scroll(mainWindow!, x, y, dx, dy),
+      scroll: (x, y, dx, dy, m) => scroll(mainWindow!, x, y, dx, dy, m),
+      pointerDown: (x, y, o) => pointerDown(mainWindow!, x, y, o),
+      pointerMove: (x, y, o) => pointerMove(mainWindow!, x, y, o),
+      pointerUp: (x, y, o) => pointerUp(mainWindow!, x, y, o),
       pressKey: (key, m) => pressKey(mainWindow!, key, m),
       typeText: (text, o) => typeText(mainWindow!, text, o),
       focusElement: (selector) => focusElement(mainWindow!, selector),
     },
     requestRenderer,
   });
+  // Expose the held-pointer reset to the top-level createWindow reload hook (see the module var).
+  resetHeldPointerOnReload = () => inputRoutes.resetHeldPointer();
 
   // ── Renderer-bound host routes (capture/input) — only main can serve them
   //    (they touch the live window). Tried before the shared router. ──
@@ -1161,6 +1192,28 @@ app.whenReady().then(async () => {
         sample: () => requestRenderer('scene-state', sampleParams),
       });
       return { kind: 'json', body: { ok: true, ...result } };
+    }
+    // ── /api/menu (main-process) ── introspect + fire native application-menu items. The
+    // native menu lives in the main process and its accelerators are swallowed by Chromium
+    // before the renderer sees them, so modoki_press_key cannot reach menu-only actions
+    // (View → Zoom In/Out/Actual Size, and every relayed onMenuAction item). `list` returns
+    // the tree; `path`/`id` fire an item's click() — the same callback a human's click runs.
+    if (urlPath === '/api/menu' && (method === 'GET' || method === 'POST')) {
+      const menu = Menu.getApplicationMenu();
+      // Cast at the boundary: MenuItemLike is a structural SUBSET of Electron's MenuItem (it
+      // types `click` as bare `Function`, which no specific call signature accepts).
+      const items = (menu ? menu.items : null) as unknown as MenuItemLike[] | null;
+      const b = (body ?? {}) as { list?: boolean; path?: string; id?: string };
+      const wantList = method === 'GET' || b.list === true || (!b.path && !b.id);
+      if (wantList) {
+        return { kind: 'json', body: { menu: items ? serializeMenu(items) : [] } };
+      }
+      // Pass the focused window + the editor's webContents so NATIVE role items (reload/copy/
+      // toggleDevTools/…) actually execute rather than no-op while reporting ok:true. Fall back to
+      // mainWindow when the app isn't the focused window (an agent-driven click has no OS focus).
+      const ctxWindow = BrowserWindow.getFocusedWindow() ?? mainWindow;
+      const res = triggerMenuItem(items, { path: b.path, id: b.id }, { window: ctxWindow, webContents: mainWindow?.webContents });
+      return { kind: 'json', status: res.ok ? undefined : (res.available ? 404 : 400), body: res };
     }
     return null;
   };
@@ -1270,6 +1323,10 @@ app.whenReady().then(async () => {
       // This push == the editor renderer has mounted (painted, not just page-loaded):
       // hand off from the splash to the now-ready window (no black gap).
       revealMainWindow();
+      // The renderer is now subscribed — (re)send the authoritative page-zoom factor so the
+      // engine calibrates presentation-invariant input even when a persisted zoom was restored
+      // before mount (the did-finish-load applyZoom fired before this listener existed).
+      mainWindow.webContents.send('modoki:bridge-zoom-factor', mainWindow.webContents.getZoomFactor());
       // …and it's the FIRST moment probeCdp can work: at startup the heal runs before the
       // window exists, so there is no page target on DEV_URL and CDP always reads
       // not-ours — which made the chrome-devtools re-point branch dead on the only
@@ -1286,6 +1343,10 @@ app.whenReady().then(async () => {
         pendingOpenProjectSettings = false;
         mainWindow.webContents.send('modoki:bridge-open-project-settings');
       }
+    } else if (msg.event === 'zoom') {
+      // Renderer forwarded a Cmd/Ctrl+wheel intent (the menu/accelerator paths call
+      // handleZoom directly in rebuildMenu). Whole-app UI zoom via webContents.
+      handleZoom(mainWindow, msg.data as { dir?: 'in' | 'out' | 'reset'; deltaY?: number });
     } else if (msg.event === 'response') {
       const { id, result, error } = msg.data as { id: number; result?: unknown; error?: string };
       const p = pendingRenderer.get(id);

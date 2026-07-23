@@ -37,13 +37,25 @@ const REQUIRED: Array<{ file: string; ids: string[]; why: string }> = [
   },
   {
     file: 'panels/Inspector.tsx',
-    ids: ['inspector.header.delete', 'inspector.header.active', 'inspector.header.name', 'inspector.addComponent.select', 'inspector.addComponent.pasteAsNew'],
-    why: 'the Inspector header controls and the Add Component entry point.',
+    ids: ['inspector.header.delete', 'inspector.header.active', 'inspector.header.name'],
+    why: 'the Inspector header controls.',
+  },
+  {
+    // Was inline in Inspector.tsx as a native <select> (`inspector.addComponent.select`);
+    // now a searchable popup in its own file — trigger + search field + one row per trait.
+    file: 'panels/AddComponentPicker.tsx',
+    ids: ['inspector.addComponent.trigger', 'inspector.addComponent.search', '`inspector.addComponent.item.${t.name}`', 'inspector.addComponent.pasteAsNew'],
+    why: 'the Add Component entry point — open the picker, filter it, add a trait, paste-as-new.',
   },
   {
     file: 'panels/SceneView.tsx',
     ids: ['sceneView.toolbar.gizmo.', 'sceneView.toolbar.gizmo.space', 'sceneView.toolbar.fx-preview', 'sceneView.toolbar.collider-points'],
     why: 'the viewport toolbar — gizmo mode/space, FX preview, collider point editing.',
+  },
+  {
+    file: 'panels/SceneViewGizmo.tsx',
+    ids: ['`sceneview.gizmo.axis.${a.name}`', 'sceneview.gizmo.projection'],
+    why: 'the orientation gizmo — snap the camera to an axis view and toggle perspective/orthographic.',
   },
   {
     file: 'panels/Hierarchy.tsx',

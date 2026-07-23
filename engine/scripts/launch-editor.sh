@@ -114,21 +114,37 @@ npm run electron:build >/dev/null 2>&1
 : > "$EDITOR_LOG"
 echo "[launch-editor] launching editor (${BACKEND_PORT:+backend port $BACKEND_PORT}${BACKEND_PORT:+, }${BACKEND_PORT:-auto ports}${PROJECT:+, project $PROJECT})…"
 [ -n "$BACKEND_PORT" ] && export MODOKI_BACKEND_PORT="$BACKEND_PORT"
-# Optional CDP remote-debugging port (set via MODOKI_CDP_PORT — the editor-* aliases
-# pin one per clone). Lets CDP tooling attach to the renderer (inject console errors,
-# read React fiber state, catch WGSL validation) WITHOUT a manual relaunch. Chromium
-# binds it to 127.0.0.1 only, so it's local-dev only. Unset ⇒ no port, no change.
-# VALIDATE the value (mirrors cdp.ts isValidCdpPort, 1..65535): passing junk verbatim
-# to Chromium (which parses it as 0 → an ephemeral/random port) would silently diverge
-# from what main reports — so reject an invalid value loudly instead of guessing.
+# CDP remote-debugging port — lets CDP tooling attach to the renderer (inject console
+# errors, read React fiber state, catch WGSL validation, capture the TRUE framebuffer)
+# WITHOUT a manual relaunch. Chromium binds it to 127.0.0.1 only, so it's local-dev only.
+# This editor is agent-first, so CDP is ON BY DEFAULT in dev too (matching the packaged
+# app, which defaults on via cdp.ts's opt-out model):
+#   - An explicit MODOKI_CDP_PORT always wins (validated 1..65535; junk → warn + off).
+#     Chromium parses junk as 0 → an ephemeral/random port that silently diverges from
+#     what main reports, so reject an invalid value loudly instead of guessing.
+#   - Unset + a PINNED backend port ⇒ derive a per-clone-safe default: 9222 + (backend
+#     − 5179), so 5179→9222, 5180→9223, 5181→9224 — distinct per clone, so two clones
+#     side by side never collide on the CDP port (the documented cross-clone gotcha).
+#   - Unset + an AUTO backend port (MULTI mode) ⇒ CDP off: there's no stable per-clone
+#     anchor to derive from, and several editors would race one port. Set MODOKI_CDP_PORT
+#     explicitly to force it there.
+# (mirrors cdp.ts isValidCdpPort: an integer in 1..65535.)
+valid_cdp_port() { echo "${1:-}" | grep -qE '^[0-9]+$' && [ "${1:-0}" -ge 1 ] && [ "${1:-0}" -le 65535 ]; }
 CDP_ARG=""
+CDP_PORT=""
 if [ -n "${MODOKI_CDP_PORT:-}" ]; then
-  if echo "$MODOKI_CDP_PORT" | grep -qE '^[0-9]+$' && [ "$MODOKI_CDP_PORT" -ge 1 ] && [ "$MODOKI_CDP_PORT" -le 65535 ]; then
-    CDP_ARG="--remote-debugging-port=${MODOKI_CDP_PORT}"
+  if valid_cdp_port "$MODOKI_CDP_PORT"; then
+    CDP_PORT="$MODOKI_CDP_PORT"
   else
     echo "[launch-editor] WARNING: ignoring invalid MODOKI_CDP_PORT='${MODOKI_CDP_PORT}' (want an integer 1..65535) — CDP off."
   fi
+elif [ -n "$BACKEND_PORT" ] && echo "$BACKEND_PORT" | grep -qE '^[0-9]+$'; then
+  DERIVED=$((9222 + BACKEND_PORT - 5179))
+  if valid_cdp_port "$DERIVED"; then
+    CDP_PORT="$DERIVED"
+  fi
 fi
+[ -n "$CDP_PORT" ] && CDP_ARG="--remote-debugging-port=${CDP_PORT}"
 nohup ./node_modules/.bin/electron $CDP_ARG "$REPO/engine/electron/dist/main.cjs" >"$EDITOR_LOG" 2>&1 &
 EDITOR_PID=$!
 
@@ -156,4 +172,9 @@ echo
 echo "[launch-editor] ✓ Editor running (pid $EDITOR_PID)."
 echo "[launch-editor]   Backend:      http://127.0.0.1:${PORT:-$BACKEND_PORT}"
 echo "[launch-editor]   MCP target:   MODOKI_BACKEND=http://127.0.0.1:${PORT:-$BACKEND_PORT}  (full toolset)"
+if [ -n "$CDP_PORT" ]; then
+  echo "[launch-editor]   CDP:          http://127.0.0.1:${CDP_PORT}  (renderer remote-debugging)"
+else
+  echo "[launch-editor]   CDP:          off (auto backend port; set MODOKI_CDP_PORT to enable)"
+fi
 echo "[launch-editor]   Log:          $EDITOR_LOG"

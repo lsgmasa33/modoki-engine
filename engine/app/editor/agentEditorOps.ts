@@ -15,10 +15,11 @@
  *  reparent) DO go through the undoable actions, exactly like the menus, so the
  *  agent's edits are undoable too. */
 
-import * as THREE from 'three';
+import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
 import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor } from '../debug/agentBridge';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
+import { handleEval } from '../debug/bridgeHelpers';
 import {
   useEditorStore, type SelectedAsset,
   enterPlay, stopPlay, pausePlay,
@@ -37,21 +38,17 @@ import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDI
 import {
   getPlayState, setPlayState, getRunMode, isAdvancing, getCurrentFPS, stepOneFrame, getAllEntities, findEntity, findEntityByGuid,
   getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents,
-  getTimeline, normalizeTimeline, getGuidForPath, getAssetType,
+  getTimeline, normalizeTimeline, getGuidForPath, getAssetType, getPresentationScale,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
 } from '@modoki/engine/runtime';
 
 // ── Reads ─────────────────────────────────────────────────────────────────
 
-/** The live editor orbit camera pose, or null when no viewport is mounted. We
- *  report position + forward direction + fov (OrbitControls' target isn't on the
- *  camera) — enough to reconstruct framing or feed render-scene's camera override. */
-function readEditorCamera(): { position: number[]; direction: number[]; fov: number } | null {
-  const cam = getEditorViewportCamera();
-  if (!cam) return null;
-  const p = cam.getWorldPosition(new THREE.Vector3());
-  const d = cam.getWorldDirection(new THREE.Vector3());
-  return { position: [p.x, p.y, p.z], direction: [d.x, d.y, d.z], fov: cam.fov };
+/** The live editor orbit camera pose, or null when no viewport is mounted — enough to
+ *  reconstruct framing or feed render-scene's camera override. The projection-aware shaping
+ *  (fov for perspective, orthoSize for ortho) is the pure {@link describeEditorCamera}. */
+function readEditorCamera(): EditorCameraInfo | null {
+  return describeEditorCamera(getEditorViewportCamera());
 }
 
 /** HMR staleness, kept OFF the payload when there is nothing to report — an editor that
@@ -105,6 +102,24 @@ function readEditorState() {
     },
     camera: readEditorCamera(),
     undo: { canUndo: canUndo(), canRedo: canRedo(), undoLabel: undoLabel(), redoLabel: redoLabel() },
+    // Viewport + UI zoom, exposed as DATA so "what's the current zoom / viewport size" has a
+    // Percept surface (previously answerable only via a raw CDP eval of window.*). `zoomFactor`
+    // is the VS Code–style whole-app UI zoom (getPresentationScale is editor-calibrated to
+    // webContents.getZoomFactor); `devicePixelRatio` is the raw backing-store ratio (display
+    // scale × zoom). See docs/todo.md (zoom-session MCP gaps).
+    viewport: readViewport(),
+  };
+}
+
+/** CSS viewport size + zoom, read live from the renderer window. Guarded for the
+ *  headless/SSR case (no `window`) so this stays safe if ever called off the renderer. */
+function readViewport() {
+  if (typeof window === 'undefined') return null;
+  return {
+    innerWidth: window.innerWidth,
+    innerHeight: window.innerHeight,
+    devicePixelRatio: window.devicePixelRatio || 1,
+    zoomFactor: getPresentationScale(),
   };
 }
 
@@ -206,6 +221,14 @@ export function registerEditorAgentOps(): void {
 
   // ── State read ──
   registerAgentOp('editor-state', () => readEditorState());
+
+  // Editor-renderer JS eval — the editor twin of device_eval (game-debug MCP). Runs `code`
+  // as a function body (so `return x` yields a value) and safe-stringifies the result IN the
+  // renderer, so nothing non-cloneable (a DOM node, a fiber, window) has to cross the M→R IPC
+  // bridge — a JSON string always does. Unblocks reading/poking live renderer state (a global,
+  // window.innerWidth, devicePixelRatio, dispatching a bridge event) without a raw CDP client.
+  // Editor-only: this whole module is stripped from shipped game builds.
+  registerAgentOp('eval', (params) => handleEval(((params ?? {}) as { code?: string }).code ?? ''));
 
   // Editor Percept (Phase 7 + V3): the human-activity stream (`!`-prefixed). `merged`
   // also returns the game journal AND a single-axis `timeline` that interleaves both by

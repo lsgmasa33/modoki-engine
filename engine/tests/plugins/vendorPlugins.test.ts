@@ -328,12 +328,14 @@ describe('vendorEnginePlugins', () => {
   });
 });
 
-// The content hash is scoped to the fileset `npm pack` SHIPS (package.json `files`
-// allowlist + always-included manifest files), so a change to a NON-shipped dev
-// file (src/, tsconfig, lockfile) does NOT rename the content-addressed tarball
-// when the shipped dist/ios/android bytes are identical. This fixes the spurious
-// re-pack churn: the shipped bytes never changed, but the tarball name drifted.
-describe('vendorEnginePlugins — hash scoped to SOURCE inputs (dist/ excluded)', () => {
+// The content hash is scoped to (the SHIPPED fileset − dist/) ∪ (dist BUILD INPUTS:
+// src/ + build config). So a shipped or build-input change (src/, ios/Sources,
+// manifest, README) DOES rename the content-addressed tarball, while the volatile
+// dist/ and NON-shipped, NON-build-input dev files (the plugin's own unit tests,
+// test-vectors, lockfiles) do NOT. This kills two churn vectors: a toolchain-only
+// dist/ drift, and — the one this scoping adds — editing plugin test files renaming
+// every vendoring game's committed tarball though the shipped bytes never changed.
+describe('vendorEnginePlugins — hash scoped to (shipped ∪ dist-build-inputs)', () => {
   /** A plugin with a built `dist/` (derived output) alongside its source inputs
    *  (src/, native ios/, manifest) and a lockfile npm always excludes. */
   function writePluginWithFiles(name = PLUGIN, version = '1.0.0') {
@@ -452,6 +454,103 @@ describe('vendorEnginePlugins — hash scoped to SOURCE inputs (dist/ excluded)'
 
     expect(r.changed).toBe(false);
     expect(listTarballs()).toEqual(before);
+  });
+
+  it('does NOT re-pack when a NON-shipped plugin TEST file changes (the spurious re-pin this fixes)', () => {
+    // android/src/test, ios/Tests, test-vectors are in NEITHER the `files` allowlist
+    // nor the dist build inputs — so editing them must not rename the vendored tarball.
+    // This is the exact churn that dirtied games/<id>/plugins on every editor bootstrap
+    // after the device-lease work added the plugin's unit tests.
+    const dir = writePluginWithFiles();
+    fs.mkdirSync(path.join(dir, 'ios', 'Tests', 'PluginTests'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'ios', 'Tests', 'PluginTests', 'PluginTests.swift'), 'test v1');
+    fs.mkdirSync(path.join(dir, 'test-vectors'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'test-vectors', 'golden.json'), '{"v":1}');
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot);
+    const before = listTarballs();
+    expect(before).toHaveLength(1);
+    installRealCopy();
+
+    fs.writeFileSync(path.join(dir, 'ios', 'Tests', 'PluginTests', 'PluginTests.swift'), 'test v2 CHANGED');
+    fs.writeFileSync(path.join(dir, 'test-vectors', 'golden.json'), '{"v":2}');
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+
+    expect(r.changed).toBe(false);            // not shipped, not a build input → no re-pack
+    expect(listTarballs()).toEqual(before);   // same content-addressed name
+  });
+
+  it('DOES re-pack when a SHIPPED README changes (npm ships it regardless of `files`)', () => {
+    // README is outside `files` but npm always packs it, so it's part of the shipped
+    // bytes — the never-under-hash-a-shipped-file guard.
+    const dir = writePluginWithFiles();
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot);
+    const before = listTarballs()[0];
+
+    fs.writeFileSync(path.join(dir, 'README.md'), 'source readme CHANGED — ships anyway');
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+
+    expect(r.changed).toBe(true);
+    expect(listTarballs()[0]).not.toBe(before); // new content hash
+  });
+
+  it('a NON-shipped sibling sharing a files-entry PREFIX does not enter the hash (boundary)', () => {
+    // Guards the `e + '/'` boundary in matchesFilesEntry: `ios/Sources2/` must NOT be
+    // treated as under the `ios/Sources/` allowlist entry. A regression to startsWith(e)
+    // (no slash) would hash it and spuriously re-pin on every edit.
+    const dir = writePluginWithFiles(); // files includes 'ios/Sources/'
+    fs.mkdirSync(path.join(dir, 'ios', 'Sources2'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'ios', 'Sources2', 'Decoy.swift'), 'decoy v1');
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot);
+    const before = listTarballs();
+    installRealCopy();
+
+    fs.writeFileSync(path.join(dir, 'ios', 'Sources2', 'Decoy.swift'), 'decoy v2 CHANGED');
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+
+    expect(r.changed).toBe(false);            // ios/Sources2 is NOT under ios/Sources/
+    expect(listTarballs()).toEqual(before);
+  });
+
+  it('an empty `files` array falls back to hashing ALL source inputs (not an empty allowlist)', () => {
+    // readPackageFiles returns null for files:[] → the fallback path, same as a missing
+    // field. A regression treating [] as an active empty allowlist would drop native src.
+    const dir = writePluginWithFiles();
+    const pj = path.join(dir, 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pj, 'utf8')); pkg.files = []; fs.writeFileSync(pj, JSON.stringify(pkg));
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot);
+    const before = listTarballs()[0];
+
+    // ios/Sources is native (not src/, not always-shipped): only the all-inputs fallback
+    // hashes it, so editing it MUST re-pack when files:[] falls back.
+    fs.writeFileSync(path.join(dir, 'ios', 'Sources', 'Plugin.swift'), 'native CHANGED');
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+
+    expect(r.changed).toBe(true);
+    expect(listTarballs()[0]).not.toBe(before);
+  });
+
+  it('a GLOB `files` entry falls back to all inputs, so a globbed shipped file is not under-hashed', () => {
+    // matchesFilesEntry is a literal prefix matcher; 'assets/**' would never match
+    // assets/logo.png. Rather than silently drop a shipped file (stale-tarball risk), a
+    // glob entry forces the safe wide scope → editing the asset re-packs.
+    const dir = writePluginWithFiles();
+    const pj = path.join(dir, 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pj, 'utf8')); pkg.files = ['dist/**', 'assets/**']; fs.writeFileSync(pj, JSON.stringify(pkg));
+    fs.mkdirSync(path.join(dir, 'assets'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'assets', 'logo.svg'), 'SVG v1');
+    writeProjectPkg({ [PLUGIN]: '*' });
+    vendorEnginePlugins(projectRoot, engineRoot);
+    const before = listTarballs()[0];
+
+    fs.writeFileSync(path.join(dir, 'assets', 'logo.svg'), 'SVG v2 CHANGED');
+    const r = vendorEnginePlugins(projectRoot, engineRoot);
+
+    expect(r.changed).toBe(true);              // glob → all-inputs fallback catches the shipped asset
+    expect(listTarballs()[0]).not.toBe(before);
   });
 
   it('hashes source inputs even when there is no `files` field', () => {

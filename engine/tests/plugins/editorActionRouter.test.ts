@@ -57,6 +57,34 @@ describe('/api/editor-action', () => {
   });
 });
 
+describe('/api/eval', () => {
+  it('400 on a missing/empty code string', async () => {
+    expect(((await post('/api/eval', {}, makeCtx())) as { status?: number }).status).toBe(400);
+    expect(((await post('/api/eval', { code: '' }, makeCtx())) as { status?: number }).status).toBe(400);
+  });
+
+  it('relays code to the renderer `eval` op and returns the result', async () => {
+    const requestBrowser = vi.fn(async () => '42');
+    const r = (await post('/api/eval', { code: 'return 40 + 2' }, makeCtx({ requestBrowser }))) as { body: unknown };
+    expect(requestBrowser).toHaveBeenCalledWith('eval', { code: 'return 40 + 2' });
+    expect(r.body).toEqual({ result: '42' });
+  });
+
+  it('504 when the renderer relay throws (no editor connected)', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => { throw new Error('no renderer'); } });
+    expect(((await post('/api/eval', { code: 'return 1' }, ctx)) as { status?: number }).status).toBe(504);
+  });
+
+  it('passes an "Error: …" renderer result through as a 200 body (error-shaping is the TOOL\'s job)', async () => {
+    // handleEval returns a thrown eval as an in-band "Error: …" string, not a rejected promise. The
+    // router must NOT turn that into a 5xx — the MCP tool (evalRenderer) is what flags it isError.
+    const requestBrowser = vi.fn(async () => 'Error: boom is not defined');
+    const r = (await post('/api/eval', { code: 'return boom' }, makeCtx({ requestBrowser }))) as { status?: number; body: unknown };
+    expect(r.status).toBeUndefined(); // 200
+    expect(r.body).toEqual({ result: 'Error: boom is not defined' });
+  });
+});
+
 describe('/api/editor-state', () => {
   it('relays the editor-state op', async () => {
     const requestBrowser = vi.fn(async () => ({ playState: 'stopped', selection: { entityId: 3 } }));
