@@ -3,6 +3,7 @@
  *  ES-module closures. Installed only under `import.meta.env.DEV` by createEditor,
  *  so it never ships in a production build. */
 
+import * as THREE from 'three';
 import { useEditorStore } from './store/editorStore';
 import { getAllEntities, readTraitData, deleteEntity } from '../runtime/ecs/entityUtils';
 import { getTraitByName } from '../runtime/ecs/traitRegistry';
@@ -13,6 +14,9 @@ import { previewTimelineAt } from '../runtime/systems/timelineSystem';
 import { getCurrentWorld } from '../runtime/ecs/world';
 import { fireDirtyListeners } from '../runtime/ecs/entityUtils';
 import { normalizeTimeline, type TimelineDef } from '../runtime/timeline/types';
+import { getEditorViewportCamera, isEcsObjectVisible } from './scene/sceneViewBus';
+import { worldTransforms } from '../three/systems/transformPropagationSystem';
+import { editorScene2DRenderer } from './rendering/editorScene2D';
 
 export interface EditorTestBridge {
   /** The raw Zustand store (read selectedEntityId, gizmoMode, etc.). */
@@ -44,6 +48,21 @@ export interface EditorTestBridge {
    *  then read back SkeletalAnimator.time / capture the pose. `def` is the raw
    *  timeline JSON (normalized here). */
   scrubTimeline(directorId: number, def: unknown, t: number): void;
+  /** Project an entity's WORLD position through the live 3D SceneView camera into PAGE (client)
+   *  coordinates — the same camera + canvas-rect math the real marquee/raycast use (see
+   *  ThreeJSViewport's marquee `consider()`). Lets an E2E compute a click/drag target for an
+   *  arbitrary entity instead of relying on a hardcoded camera/projection fact. Returns null
+   *  when no 3D viewport is mounted, the entity has no world transform yet (not in the current
+   *  scene, or hasn't propagated this frame), or it projects behind the camera. */
+  screenPositionOf(entityId: number): { x: number; y: number } | null;
+  /** Whether an entity's rendered 3D object is currently visible in the SceneView — `null`
+   *  when no 3D viewport is mounted or the entity has no rendered object. Lets an E2E assert
+   *  collider-only mode (the "Colliders" toolbar toggle) actually hides meshes, not just that
+   *  the button's style changed. */
+  isMeshVisible(entityId: number): boolean | null;
+  /** Whether an entity has a live 2D display-object slot in the editor's SceneView (ui-mode)
+   *  Pixi renderer — lets an E2E assert the 2D "Colliders" toggle actually hides sprites. */
+  has2DSprite(entityId: number): boolean;
 }
 
 export function installEditorTestBridge(): void {
@@ -74,6 +93,25 @@ export function installEditorTestBridge(): void {
     scrubTimeline(directorId, def, t) {
       previewTimelineAt(getCurrentWorld(), directorId, normalizeTimeline(def as Partial<TimelineDef>), t);
       fireDirtyListeners();
+    },
+    screenPositionOf(entityId) {
+      const cam = getEditorViewportCamera();
+      const w = worldTransforms.get(entityId);
+      const canvas = document.querySelector('[data-scene-viewport] canvas') as HTMLCanvasElement | null;
+      if (!cam || !w || !canvas) return null;
+      const v = new THREE.Vector3(w.x, w.y, w.z).project(cam);
+      if (v.z > 1) return null; // behind the camera / beyond the far plane
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: rect.left + (v.x * 0.5 + 0.5) * rect.width,
+        y: rect.top + (-v.y * 0.5 + 0.5) * rect.height,
+      };
+    },
+    isMeshVisible(entityId) {
+      return isEcsObjectVisible(entityId);
+    },
+    has2DSprite(entityId) {
+      return editorScene2DRenderer.hasSprite(entityId);
     },
   };
   (window as unknown as { __modokiEditorTest?: EditorTestBridge }).__modokiEditorTest = bridge;

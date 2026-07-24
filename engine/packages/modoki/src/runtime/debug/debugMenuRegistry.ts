@@ -117,7 +117,7 @@ export function getDebugMenuVersion(): number {
 let _enabled = false;
 
 /** Set by the app bootstrap: true in the editor/dev and in a shipped game build
- *  that opts in via `project.config.json` `build.enableDebugMenu`. */
+ *  that opts in via `project.config.json` `build.debugBuild`. */
 export function setDebugMenuEnabled(enabled: boolean): void {
   _enabled = enabled;
 }

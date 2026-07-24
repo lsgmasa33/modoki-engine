@@ -338,9 +338,11 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // ── GET /api/journal[?type=&clear=1] (M→R) ── the tick-stamped game-event trace
   // (emit/journalEvents) — verify game LOGIC (match/score/win) without screenshots.
   if (urlPath === '/api/journal' && method === 'GET') {
-    const params: { type?: string; clear?: boolean; limit?: number; action?: 'start' | 'stop' } = {};
+    const params: { type?: string; level?: 'info' | 'warn' | 'error'; clear?: boolean; limit?: number; action?: 'start' | 'stop' } = {};
     const type = query.get('type');
     if (type) params.type = type;
+    const level = query.get('level');
+    if (level === 'info' || level === 'warn' || level === 'error') params.level = level;
     const action = query.get('action');
     if (action === 'start' || action === 'stop') params.action = action;
     if (query.get('clear') === '1' || query.get('clear') === 'true') params.clear = true;

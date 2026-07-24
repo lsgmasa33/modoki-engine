@@ -17,6 +17,7 @@ import {
   type TextureImportSettings, type TextureType, type TextureVariant,
 } from '../packages/modoki/src/runtime/loaders/textureSettings';
 import { getCacheDir, hashKey, cachePathFor, cacheHit } from './texture-cache';
+import { nativeDynamicImport } from './native-dynamic-import';
 
 const KTX_MISSING_MSG =
   'KTX-Software CLI (toktx) not found. Set MODOKI_TOKTX to the binary path, or install toktx — ' +
@@ -168,7 +169,7 @@ export async function convertTexture(opts: ConvertOptions): Promise<ConvertResul
   const cacheDir = getCacheDir(projectRoot);
   const variants = variantsToEmit(settings.format, textureType);
 
-  const sharp = (await import('sharp')).default;
+  const sharp = ((await nativeDynamicImport('sharp')) as typeof import('sharp')).default;
 
   // Compute target dimensions: scale to fit the max-size cap (never upscale)
   // preserving aspect, then snap each axis to a multiple of 4. Block-compressed

@@ -26,6 +26,13 @@ import { type World } from 'koota';
 import { getCurrentWorld } from '../ecs/worldRegistry';
 import { EntityAttributes } from '../traits/EntityAttributes';
 
+/** Triage severity for a journal event — the axis Claude filters on first when hunting
+ *  a bug ("show me warn+ in the last N ticks") rather than reading the full trace.
+ *  Ordered `info < warn < error`; `journalEvents({level})` returns that level AND ABOVE. */
+export type JournalLevel = 'info' | 'warn' | 'error';
+
+const LEVEL_RANK: Record<JournalLevel, number> = { info: 0, warn: 1, error: 2 };
+
 export interface GameEvent {
   /** `Time.frame` when emitted — ordered, monotonic within a run. */
   tick: number;
@@ -38,6 +45,9 @@ export interface GameEvent {
    *  `seq`-stamped) can be interleaved on ONE axis for the unified timeline. Unlike
    *  `tick` (per-world sim frame) this is unique across worlds AND the editor stream. */
   cap: number;
+  /** Triage severity, defaulting to `'info'`. Set via `gameJournal.ts`'s `journalWarn`/
+   *  `journalError` helpers, or the raw `emit()` 4th arg. */
+  level: JournalLevel;
 }
 
 // ── Shared capture sequence (Percept V3) ─────────────────────────────────────
@@ -219,23 +229,30 @@ export function entityRef(entity: EntityLike): string | number {
 }
 
 /** Record a semantic event. No-op when disabled. The payload is stored verbatim —
- *  wrap any entity refs with `entityRef()` first (see the note above). */
-export function emit(type: string, payload?: unknown, world: World = getCurrentWorld()): void {
+ *  wrap any entity refs with `entityRef()` first (see the note above). `level` defaults
+ *  to `'info'`; prefer `gameJournal.ts`'s `journalWarn`/`journalError` over passing it
+ *  here directly — this 4th positional arg exists mainly so those helpers stay thin
+ *  wrappers over `emit()` instead of a parallel recording path. */
+export function emit(type: string, payload?: unknown, world: World = getCurrentWorld(), level: JournalLevel = 'info'): void {
   if (!_enabled) return;
   // Tier-2 (watch-gated) diagnostic events are dropped unless their capture window is open.
   if (VERBOSE_TYPES.has(type) && !activeVerbose.has(type)) return;
   const s = journalStateFor(world);
-  s.events.push({ tick: s.tick, type, payload, cap: nextCaptureSeq() });
+  s.events.push({ tick: s.tick, type, payload, cap: nextCaptureSeq(), level });
   if (s.events.length - s.head > MAX_EVENTS) {
     s.head++; // drop the oldest (logically) — no array re-index
     if (s.head > MAX_EVENTS) { s.events = s.events.slice(s.head); s.head = 0; } // periodic compaction
   }
 }
 
-/** Read recorded events, optionally filtered by `type`. Returns a copy. */
-export function journalEvents(filter?: { type?: string }, world: World = getCurrentWorld()): GameEvent[] {
-  const live = liveEvents(journalStateFor(world));
-  return filter?.type ? live.filter((e) => e.type === filter.type) : live;
+/** Read recorded events, optionally filtered by `type` (exact match) and/or `level`
+ *  (that severity AND ABOVE — e.g. `level: 'warn'` returns `warn` and `error`). Returns
+ *  a copy. */
+export function journalEvents(filter?: { type?: string; level?: JournalLevel }, world: World = getCurrentWorld()): GameEvent[] {
+  let out = liveEvents(journalStateFor(world));
+  if (filter?.type) out = out.filter((e) => e.type === filter.type);
+  if (filter?.level) { const min = LEVEL_RANK[filter.level]; out = out.filter((e) => LEVEL_RANK[e.level] >= min); }
+  return out;
 }
 
 /** Read AND clear — useful for "what happened since I last looked". */

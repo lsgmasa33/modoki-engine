@@ -44,19 +44,58 @@ const legacyRecentsFile = () => path.join(app.getPath('appData'), 'Electron', 'r
 let recentsScope: string | null = null;
 export function setRecentsScope(id: string): void { recentsScope = id || null; }
 
-/** The scoped recents file for the current editor identity: a sanitized basename +
- *  short content hash keeps it human-recognizable AND filesystem-safe/collision-free. */
-function scopedRecentsFile(): string {
+/** A sanitized basename + short content hash of `recentsScope`, shared by every file
+ *  scoped to this editor identity (recents, last-used-folders, …) — human-recognizable
+ *  AND filesystem-safe/collision-free. */
+function scopeFileStem(): string {
   const id = recentsScope!;
   const hash = crypto.createHash('sha256').update(id).digest('hex').slice(0, 8);
   const base = path.basename(id).replace(/[^\w.-]+/g, '-').slice(0, 40) || 'editor';
-  return path.join(RECENTS_DIR(), 'recents', `${base}-${hash}.json`);
+  return `${base}-${hash}`;
+}
+
+/** The scoped recents file for the current editor identity. */
+function scopedRecentsFile(): string {
+  return path.join(RECENTS_DIR(), 'recents', `${scopeFileStem()}.json`);
 }
 
 /** The live recents file: scoped when an editor identity is set (the normal path),
  *  else the pre-scoping global file (back-compat / no-scope callers). */
 function recentsFile(): string {
   return recentsScope ? scopedRecentsFile() : globalRecentsFile();
+}
+
+/** Per-editor-identity file remembering the folder Open/New Project dialogs last
+ *  started in, keyed the SAME way as recents (recentsScope: install path packaged,
+ *  repo root in dev) — so each clone/install has its own "last used folder" instead
+ *  of relying on the OS picker's memory, which is keyed by app bundle id and so is
+ *  shared across dev clones that run the same unpackaged Electron binary. No scope
+ *  set → no persistence (dialog falls back to the OS default), matching recents. */
+function lastFoldersFile(): string | null {
+  if (!recentsScope) return null;
+  return path.join(RECENTS_DIR(), 'recents', `${scopeFileStem()}-last-folders.json`);
+}
+
+function getLastFolder(kind: 'open' | 'new'): string | undefined {
+  const file = lastFoldersFile();
+  if (!file) return undefined;
+  try {
+    const j = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    const p = j?.[kind];
+    return typeof p === 'string' && fs.existsSync(p) ? p : undefined;
+  } catch { return undefined; }
+}
+
+function setLastFolder(kind: 'open' | 'new', dir: string): void {
+  const file = lastFoldersFile();
+  if (!file) return;
+  try {
+    let j: Record<string, string> = {};
+    try { j = JSON.parse(fs.readFileSync(file, 'utf-8')); } catch { /* fresh */ }
+    j[kind] = dir;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(j, null, 2));
+  } catch { /* best-effort */ }
 }
 
 function readRecentsRaw(file: string): string[] {
@@ -156,10 +195,12 @@ export function projectFolderKind(dir: string): 'project' | 'empty' | 'occupied'
 
 /** Native folder picker. Returns the chosen absolute path, or null if cancelled. */
 export async function pickProjectFolder(win: BrowserWindow | null): Promise<string | null> {
-  const res = win
-    ? await dialog.showOpenDialog(win, { title: 'Open Project', properties: ['openDirectory'] })
-    : await dialog.showOpenDialog({ title: 'Open Project', properties: ['openDirectory'] });
+  const opts: Electron.OpenDialogOptions = { title: 'Open Project', properties: ['openDirectory'] };
+  const defaultPath = getLastFolder('open');
+  if (defaultPath) opts.defaultPath = defaultPath;
+  const res = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts);
   if (res.canceled || !res.filePaths[0]) return null;
+  setLastFolder('open', path.dirname(res.filePaths[0]));
   return res.filePaths[0];
 }
 
@@ -173,8 +214,11 @@ export async function pickNewProjectFolder(win: BrowserWindow | null): Promise<s
     message: 'Choose an empty folder for your new Modoki project.',
     properties: ['openDirectory', 'createDirectory'],
   };
+  const defaultPath = getLastFolder('new');
+  if (defaultPath) opts.defaultPath = defaultPath;
   const res = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts);
   if (res.canceled || !res.filePaths[0]) return null;
+  setLastFolder('new', path.dirname(res.filePaths[0]));
   return res.filePaths[0];
 }
 

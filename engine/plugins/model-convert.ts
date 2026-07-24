@@ -20,6 +20,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { createRequire } from 'module';
 import { execFileSync } from 'child_process';
 import {
   type ModelImportSettings,
@@ -32,6 +33,7 @@ import {
   loadGlbToThreeMeshes, applyChangesToDocument, writeDocument,
 } from './model-convert/threeAdapter';
 import { gltfTransformInvocation, gltfpackInvocation, spawnable } from '../toolchain';
+import { nativeDynamicImport } from './native-dynamic-import';
 
 const GLTF_TRANSFORM_MISSING_MSG =
   '@gltf-transform/cli not found. Install it from the editor\'s Build Support dialog, or `npm i -D @gltf-transform/cli`.';
@@ -69,13 +71,10 @@ async function loadMeshoptVersion(): Promise<string> {
     // both in dev (node_modules) and in a packaged app (the module is bundled into
     // the asar; Electron's fs reads package.json transparently). Mixed into the
     // cache key so a `npm i meshoptimizer@next` invalidates prior cache entries.
-    const { createRequire } = await import('node:module');
-    const fs2 = await import('node:fs');
-    const path2 = await import('node:path');
     const req = createRequire(import.meta.url);
     const mainEntry = req.resolve('meshoptimizer'); // .../meshoptimizer/index.js
-    const pkgPath = path2.join(path2.dirname(mainEntry), 'package.json');
-    const pkg = JSON.parse(fs2.readFileSync(pkgPath, 'utf-8')) as { version?: string };
+    const pkgPath = path.join(path.dirname(mainEntry), 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as { version?: string };
     meshoptVersion = pkg.version ?? '';
   } catch {
     meshoptVersion = '';
@@ -263,9 +262,9 @@ export interface ConvertModelResult {
  *  reading any LOD GLB after gltfpack -cc (KHR_mesh_quantization +
  *  EXT_meshopt_compression) and for writing back stripped variants. */
 async function makeNodeIO() {
-  const { NodeIO } = await import('@gltf-transform/core');
-  const { ALL_EXTENSIONS } = await import('@gltf-transform/extensions');
-  const { MeshoptDecoder, MeshoptEncoder } = await import('meshoptimizer');
+  const { NodeIO } = (await nativeDynamicImport('@gltf-transform/core')) as typeof import('@gltf-transform/core');
+  const { ALL_EXTENSIONS } = (await nativeDynamicImport('@gltf-transform/extensions')) as typeof import('@gltf-transform/extensions');
+  const { MeshoptDecoder, MeshoptEncoder } = (await nativeDynamicImport('meshoptimizer')) as typeof import('meshoptimizer');
   await MeshoptDecoder.ready;
   await MeshoptEncoder.ready;
   return new NodeIO()
@@ -305,7 +304,7 @@ async function makeNodeIO() {
  *       Transform-extraction from `mesh.matrixWorld` lands on the same pose
  *       as the source. */
 export async function rebaseLodGeometry(absSource: string, absLod: string): Promise<void> {
-  const THREE = await import('three');
+  const THREE = (await nativeDynamicImport('three')) as typeof import('three');
   const io = await makeNodeIO();
   const sourceDoc = await io.read(absSource);
   const lodDoc = await io.read(absLod);
@@ -577,7 +576,7 @@ async function countTriangles(glbPath: string): Promise<number> {
  *  the texture savings dwarf any meshopt re-encode benefit. */
 async function stripEmbeddedTextures(glbPath: string): Promise<void> {
   const io = await makeNodeIO();
-  const { prune } = await import('@gltf-transform/functions');
+  const { prune } = (await nativeDynamicImport('@gltf-transform/functions')) as typeof import('@gltf-transform/functions');
   const doc = await io.read(glbPath);
   const textures = doc.getRoot().listTextures();
   if (textures.length === 0) return;

@@ -296,14 +296,17 @@ export function registerTools(server: McpServer) {
   server.tool('device_journal',
     'Read the tick-stamped game-event trace on the device (match/score/win/@contact/…) — the ' +
       'screenshot-free way to verify game LOGIC. Returns the last 100 events + byType counts over the ' +
-      'whole ring, plus `captures` (Tier-2 diagnostic state). Narrow with type=, raise limit=N; pair ' +
-      'with device_dispatch_action to drive the game.\n' +
+      'whole ring, plus `captures` (Tier-2 diagnostic state). Narrow with type= and/or level=, raise ' +
+      'limit=N; pair with device_dispatch_action to drive the game.\n' +
+      'LEVEL: every event carries a triage severity, `info` (default) / `warn` / `error`. ' +
+      'level:"warn" returns warn AND error, skipping normal-gameplay noise.\n' +
       'TIERS: lean events (semantic + @collision/@sensor/@zone transitions) are always recorded. ' +
       'High-frequency DIAGNOSTIC events (@contact) are WATCH-GATED — they record NOTHING until you ' +
       'open a capture and only from that point forward. Open/close with action:"start"/"stop" + ' +
       'type:"@contact" (do this BEFORE the moment you want to trace), then read, then stop.',
     {
       type: z.string().optional().describe('Read: only events of this type. With action: the watch-gated type to start/stop (e.g. "@contact").'),
+      level: z.enum(['info', 'warn', 'error']).optional().describe('Read: only events at this severity OR ABOVE (e.g. "warn" returns warn + error).'),
       action: z.enum(['start', 'stop']).optional().describe('Open ("start") or close ("stop") a Tier-2 capture window for type=. Omit to just read.'),
       limit: z.number().optional().describe('Return the last N events (default 100).'),
       clear: z.boolean().optional().describe('Clear the journal after reading.'),

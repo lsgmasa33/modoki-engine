@@ -126,30 +126,21 @@ export interface ProjectConfig {
      *  committed config, not project.user.json. The editor's heal-on-open syncs it
      *  into the iOS project's DEVELOPMENT_TEAM. Empty = leave the pbxproj as-is. */
     appleTeamId: string;
-    /** Percept — keep the event journal (`emit`/`modoki_journal`) recording in a
-     *  SHIPPED game build. The journal is always on in the editor (dev + the
-     *  packaged Electron editor, gated by `__MODOKI_EDITOR__`); in a normal
-     *  production game build it is OFF by default so `emit()` adds no per-event
-     *  allocation on hot paths (physics contacts, etc.). Set true for a
-     *  QA/profiling game build that needs the trace on device. (A broader
-     *  debug|profile|release mode enum is deferred until a profiler gives
-     *  'profile' a second consumer — see docs/percept-plan.md, Decision D.) */
-    enableJournal: boolean;
-    /** In-game debug menu — ship the extensible debug overlay (F12 / 3-finger tap:
-     *  stats, world inspector, cheats, …) in this build. Always on in the editor
-     *  (dev + packaged Electron editor, gated by `__MODOKI_EDITOR__`); OFF by
-     *  default in a shipped game build so the whole debug-menu chunk tree-shakes
-     *  out. Set true for a QA/playtest game build that needs the menu on device.
-     *  See docs/debug-menu-plan.md. */
-    enableDebugMenu: boolean;
-    /** Debug bridge — ship the on-device debug server (native TCP + UDP beacon / web-WS)
-     *  that every `device_*` AI tool connects to, INCLUDING `device_eval`, which runs
-     *  ARBITRARY JavaScript on the device. Always on in the editor + dev; OFF by default
-     *  in a shipped game build so the whole `./debug/bridge` import tree-shakes out — a
-     *  release build has no eval-capable server to connect to. Set true for a game build
-     *  you intend to debug on a device. (Previously this was ungated on native, so every
-     *  native build shipped the bridge; this flag closes that exposure.) */
-    debugBridge: boolean;
+    /** Debug build — ships the event journal (`emit`/`modoki_journal`), the in-game
+     *  debug menu (F12 / 3-finger tap: stats, world inspector, cheats, …), AND the
+     *  on-device debug server (native TCP + UDP beacon / web-WS) that every
+     *  `device_*` AI tool connects to, INCLUDING `device_eval`, which runs ARBITRARY
+     *  JavaScript on the device. One flag because in practice nobody wants a subset —
+     *  it's "is this a build I debug with," not three independent choices. Always on
+     *  in the editor (dev + the packaged Electron editor, gated by
+     *  `__MODOKI_EDITOR__`); OFF by default in a shipped game build so the journal
+     *  stops recording, the debug-menu chunk tree-shakes out, and the whole
+     *  `./debug/bridge` import tree (incl. `device_eval`'s eval capability)
+     *  tree-shakes out — a release build has no eval-capable server to connect to.
+     *  Set true for a QA/playtest/profiling game build that needs any of this on
+     *  device. (Previously the debug bridge was ungated on native, so every native
+     *  build shipped it; this flag closes that exposure.) */
+    debugBuild: boolean;
     /** Build-time engine-module include/exclude toggles — tree-shakes unused
      *  SDKs (three.js / pixi.js / Rapier) out of the bundle. Each defaults to
      *  `'auto'` (detect from the included scenes; see plugins/detect-modules.ts).
@@ -293,9 +284,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     webCdnBackendBucket: '',
     webDeployCommand: '',
     appleTeamId: '',
-    enableJournal: false,
-    enableDebugMenu: false,
-    debugBridge: false,
+    debugBuild: false,
     modules: {
       render3d: 'auto', render2d: 'auto', physics2d: 'auto',
       physics3d: 'auto', npr: 'auto', gpuParticles: 'auto',

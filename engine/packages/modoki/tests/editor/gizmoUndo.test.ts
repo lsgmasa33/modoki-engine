@@ -3,7 +3,7 @@
  *  restores the start fields and redo restores the end fields, merged onto the live
  *  transform (siblings untouched), re-resolving the entity each time. */
 import { describe, it, expect, vi } from 'vitest';
-import { buildTransformUndoAction, type UndoEntity } from '../../src/editor/scene/gizmoUndo';
+import { buildTransformUndoAction, buildGroupTransformUndoAction, type UndoEntity } from '../../src/editor/scene/gizmoUndo';
 
 const TRAIT = { name: 'Transform' };
 
@@ -87,5 +87,33 @@ describe('buildTransformUndoAction', () => {
     });
     expect(action.kind).toBeUndefined();
     expect(action.journalPayload).toBeUndefined();
+  });
+});
+
+describe('buildGroupTransformUndoAction', () => {
+  it('undo/redo of the group runs EVERY member action (one step for N members)', () => {
+    const a = fakeEntity({ x: 0 }), b = fakeEntity({ x: 10 });
+    const actions = [
+      buildTransformUndoAction({ label: 'A', trait: TRAIT, resolve: () => 1, findEntity: () => a, before: { x: 0 }, after: { x: 3 }, entityGuid: 'g-a' }),
+      buildTransformUndoAction({ label: 'B', trait: TRAIT, resolve: () => 2, findEntity: () => b, before: { x: 10 }, after: { x: 13 }, entityGuid: 'g-b' }),
+    ];
+    const group = buildGroupTransformUndoAction('Transform 2 entities', actions);
+    expect(group.label).toBe('Transform 2 entities');
+
+    group.redo();
+    expect(a.value.x).toBe(3); expect(b.value.x).toBe(13);
+    group.undo();
+    expect(a.value.x).toBe(0); expect(b.value.x).toBe(10);
+  });
+
+  it('journals a single !transform carrying every member guid + before/after', () => {
+    const actions = [
+      buildTransformUndoAction({ label: 'A', trait: TRAIT, resolve: () => 1, findEntity: () => fakeEntity({}), before: { x: 0 }, after: { x: 3 }, entityGuid: 'g-a' }),
+      buildTransformUndoAction({ label: 'B', trait: TRAIT, resolve: () => 2, findEntity: () => fakeEntity({}), before: { x: 10 }, after: { x: 13 }, entityGuid: 'g-b' }),
+    ];
+    const group = buildGroupTransformUndoAction('Transform 2 entities', actions);
+    expect(group.kind).toBe('!transform');
+    expect((group.journalPayload as { entities: string[] }).entities).toEqual(['g-a', 'g-b']);
+    expect((group.journalPayload as { members: unknown[] }).members).toHaveLength(2);
   });
 });

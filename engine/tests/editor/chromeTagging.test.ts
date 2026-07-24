@@ -49,8 +49,13 @@ const REQUIRED: Array<{ file: string; ids: string[]; why: string }> = [
   },
   {
     file: 'panels/SceneView.tsx',
-    ids: ['sceneView.toolbar.gizmo.', 'sceneView.toolbar.gizmo.space', 'sceneView.toolbar.fx-preview', 'sceneView.toolbar.collider-points'],
-    why: 'the viewport toolbar — gizmo mode/space, FX preview, collider point editing.',
+    ids: [
+      'sceneView.toolbar.gizmo.', 'sceneView.toolbar.gizmo.space', 'sceneView.toolbar.collider-points',
+      'sceneView.toolbar.viewOptions3d', 'sceneView.toolbar.viewOptionsUi',
+      'sceneView.toolbar.fx-preview', 'sceneView.toolbar.grid', 'sceneView.toolbar.colliders',
+      'sceneView.toolbar.focus', 'sceneView.toolbar.colliders2d',
+    ],
+    why: 'the viewport toolbar — gizmo mode/space, collider point editing, and the "View" dropdown (FX/Grid/Colliders in 3D, FX/Focus/Colliders in 2D).',
   },
   {
     file: 'panels/SceneViewGizmo.tsx',

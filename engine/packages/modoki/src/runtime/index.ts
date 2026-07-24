@@ -244,7 +244,7 @@ export {
   lastInputDevice, setAxis as setInputAxis, setDigital as setInputDigital,
   // Pointer / tap / drag accessors (already unambiguous, no prefix needed).
   pointer as inputPointer, pointerDown, pointerPressed, pointerReleased,
-  pointerPos, pointerDrag, setPointer as setInputPointer,
+  pointerPos, pointerDrag, getWheelDelta, setPointer as setInputPointer,
 } from './traits/Input';
 export { rawNow, setManualNow, advanceManual, restoreRealClock, isManualClock } from './systems/clock';
 export { stepSimulation, type StepOptions } from './systems/stepSimulation';
@@ -253,8 +253,9 @@ export {
   emit, entityRef, journalEvents, drainJournal, clearJournal, setJournalTick, setJournalEnabled,
   resolveRefName, setVerboseCapture, verboseCaptureState, isVerboseType,
   isJournalEnabled,
-  type GameEvent,
+  type GameEvent, type JournalLevel,
 } from './systems/journal';
+export { journalState, journalDecision, journalWarn, journalError } from './systems/gameJournal';
 export {
   createTestWorld,
   type TestWorld, type TestSystemDef, type CreateTestWorldOptions,
@@ -385,3 +386,11 @@ export { addDirtyListener } from './ecs/entityUtils';
 // `@modoki/engine/runtime` instead of a repo-relative path into the app shell —
 // the latter breaks when the game is opened standalone (copied out of the repo).
 export { useGameStore, type Screen, type FontStatus, type UIBindableState } from './store/gameStore';
+// OTA update client (docs/plans/mobile-ota-updates-plan.md). A game calls
+// checkForUpdate() with its own baseUrl/publicKey; verifyReleaseSignature and the
+// schema validators are exported for tooling/tests that want them standalone.
+export {
+  checkForUpdate, verifyReleaseSignature, validateManifest, validateRelease,
+  type OtaCheckResult, type OtaNativePlugin, type OtaManifest, type OtaRelease,
+  type CheckForUpdateOptions,
+} from './ota/otaClient';

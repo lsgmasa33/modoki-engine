@@ -10,4 +10,5 @@ export { Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAni
 // Three.js traits — re-export from @modoki/engine
 export { Light } from '@modoki/engine/three';
 export { Environment } from '@modoki/engine/three';
+export { Fog } from '@modoki/engine/three';
 

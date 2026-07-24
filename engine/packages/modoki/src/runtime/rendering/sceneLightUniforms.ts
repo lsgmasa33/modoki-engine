@@ -21,7 +21,7 @@
  *     per-fragment normal/position, for `albedo * (ambientColor + sceneDiffuse)`. */
 
 import * as THREE from 'three';
-import { uniform, normalize, max, dot, float, length, pow, clamp } from 'three/tsl';
+import { uniform, normalize, max, dot, float, length, pow, clamp, renderGroup } from 'three/tsl';
 import type { World } from 'koota';
 import { Light } from '../../three/traits/Light';
 import { worldTransforms, deactivatedEntities } from '../../three/systems/transformPropagationSystem';
@@ -46,16 +46,26 @@ export interface SceneLightUniforms {
 
 let _u: SceneLightUniforms | null = null;
 
-/** The shared singleton uniform nodes, created on first use. */
+/** The shared singleton uniform nodes, created on first use.
+ *
+ *  Every one is `.setGroup(renderGroup)` — these are SCENE-GLOBAL values, and a bare
+ *  `uniform()` lands in `objectGroup` (a per-render-object buffer) which is only
+ *  re-uploaded when `NodeMaterialObserver.needsRefresh(renderObject)` is true — false
+ *  forever for a static mesh. That would make a light change silently never reach a
+ *  NON-ANIMATING custom-shader object while animated ones updated fine. (Latent here
+ *  until now only because every shipped custom-shader object happens to animate —
+ *  space-console's ship shakes and its planet spins, which trips `needsRefresh` for
+ *  the unrelated world-matrix reason.) Same root cause as the height-fog staleness;
+ *  see the uniform-group rule in docs/rendering.md "Fog". */
 export function getSceneLightUniforms(): SceneLightUniforms {
   if (!_u) {
     _u = {
-      keyLightDir: uniform(new THREE.Vector3(0, 1, 0)),
-      keyLightColor: uniform(new THREE.Vector3(0, 0, 0)),
-      ambientColor: uniform(new THREE.Vector3(0, 0, 0)),
-      pointPos: Array.from({ length: MAX_SHADER_POINT_LIGHTS }, () => uniform(new THREE.Vector3())),
-      pointColor: Array.from({ length: MAX_SHADER_POINT_LIGHTS }, () => uniform(new THREE.Vector3())),
-      pointInvRange: Array.from({ length: MAX_SHADER_POINT_LIGHTS }, () => uniform(0)),
+      keyLightDir: uniform(new THREE.Vector3(0, 1, 0)).setGroup(renderGroup),
+      keyLightColor: uniform(new THREE.Vector3(0, 0, 0)).setGroup(renderGroup),
+      ambientColor: uniform(new THREE.Vector3(0, 0, 0)).setGroup(renderGroup),
+      pointPos: Array.from({ length: MAX_SHADER_POINT_LIGHTS }, () => uniform(new THREE.Vector3()).setGroup(renderGroup)),
+      pointColor: Array.from({ length: MAX_SHADER_POINT_LIGHTS }, () => uniform(new THREE.Vector3()).setGroup(renderGroup)),
+      pointInvRange: Array.from({ length: MAX_SHADER_POINT_LIGHTS }, () => uniform(0).setGroup(renderGroup)),
     };
   }
   return _u;

@@ -13,6 +13,7 @@ import { backendFetch } from '../backend/editorBackend';
 import { saveAssetDialog } from '../utils/saveDialog';
 import { getAllTraits, getTraitByName } from '../../runtime/ecs/traitRegistry';
 import { sceneManager } from '../../runtime/scene/SceneManager';
+import { useEditorStore } from '../store/editorStore';
 import { setPlayState, getRunMode } from '../../runtime/systems/playState';
 import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
@@ -671,10 +672,29 @@ export async function saveScene(opts: {
  *  canonical working-copy path (`/assets/scenes/x.json`, gap #2) which carries no
  *  such segment — so the editor boot passes the project's game id explicitly.
  *  Subsequent in-editor scene opens omit it and inherit the active game. */
+/** Monotonic load counter — the newest `loadScene` call owns the progress modal.
+ *  See the epoch guard inside loadScene. */
+let _loadEpoch = 0;
+
 export async function loadScene(scenePath: string, gameId?: string): Promise<boolean> {
+  // Epoch guard: SceneManager cancels an in-flight load when a newer one starts
+  // (boot autoload vs an agent/menu open, or rapid scene switches). The aborted
+  // load's `finally` must NOT clear the progress modal the WINNING load is
+  // driving, and its late onProgress must not write stale counts — so only the
+  // latest epoch touches sceneLoadStatus.
+  const epoch = ++_loadEpoch;
+  const setSceneLoadStatus = useEditorStore.getState().setSceneLoadStatus;
   try {
     setPlayState('stopped'); // a scene load always returns the editor to edit mode
-    await sceneManager.loadScene(scenePath, gameId !== undefined ? { gameId } : undefined);
+    setSceneLoadStatus({ active: true, loaded: 0, total: 0 });
+    await sceneManager.loadScene(scenePath, {
+      ...(gameId !== undefined ? { gameId } : {}),
+      // Resources acquire in parallel; each completion (on a cold cache, a finished
+      // bake) advances the bar. The SceneLoadModal only shows past a ~400ms delay.
+      onProgress: (loaded, total) => {
+        if (epoch === _loadEpoch) setSceneLoadStatus({ active: true, loaded, total });
+      },
+    });
     setCurrentScenePath(scenePath); // persists to localStorage for next editor launch
     // Swap to THIS scene's own undo history (empty on first visit) instead of
     // dropping undo globally — returning to a previously-open scene restores its
@@ -689,8 +709,14 @@ export async function loadScene(scenePath: string, gameId?: string): Promise<boo
     console.log(`[Editor] Loaded scene: ${entityCount} entities from ${scenePath}`);
     return true;
   } catch (e) {
-    console.error(`[Editor] Failed to load scene: ${e}`);
+    // An AbortError means a newer load superseded this one (by design — see the
+    // epoch guard above); it's expected, not a failure worth a red console error.
+    if ((e as Error)?.name !== 'AbortError') console.error(`[Editor] Failed to load scene: ${e}`);
     return false;
+  } finally {
+    // Only the latest load owns the modal — a superseded load must not hide the
+    // winner's progress bar (its `finally` can run after the winner set active).
+    if (epoch === _loadEpoch) useEditorStore.getState().setSceneLoadStatus({ active: false });
   }
 }
 

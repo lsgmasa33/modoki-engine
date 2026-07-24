@@ -483,7 +483,7 @@ registerAgentOp('console-logs', (params) => {
 // LOGIC (assert on match/score/win). Journaling is on by default, but force-enable
 // in case a shipped game turned it off, so the agent always sees events.
 registerAgentOp('journal-events', (params) => {
-  const p = (params ?? {}) as { type?: string; clear?: boolean; limit?: number; action?: 'start' | 'stop' };
+  const p = (params ?? {}) as { type?: string; level?: 'info' | 'warn' | 'error'; clear?: boolean; limit?: number; action?: 'start' | 'stop' };
   setJournalEnabled(true);
   // Tier-2 capture control: `action:start|stop` with `type` names the watch-gated diagnostic
   // (e.g. @contact) to begin/end capturing. Off by default so the journal stays lean; a Tier-2
@@ -495,7 +495,7 @@ registerAgentOp('journal-events', (params) => {
     setVerboseCapture(t, p.action === 'start');
     return { ok: true, action: p.action, type: t, captures: verboseCaptureState() };
   }
-  const events = journalEvents(p.type ? { type: p.type } : undefined);
+  const events = (p.type || p.level) ? journalEvents({ type: p.type, level: p.level }) : journalEvents();
   if (p.clear) clearJournal();
   // Tail at the op. `journalEvents()` stays whole for JournalTab, which slices its own view.
   // A busy physics Play session fills the 10,000-event ring with ~226-byte `@contact` events

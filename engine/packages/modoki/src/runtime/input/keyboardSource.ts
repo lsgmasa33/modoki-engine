@@ -19,6 +19,7 @@
  *    - moveY  ← W/S + ↑/↓   (held analog; forward/up = +1)
  *    - nav*   ← the same keys, consumed as edges for UI focus movement
  *    - jump   ← Space
+ *    - aim    ← F
  *    - confirm ← Space/Enter    cancel ← Esc    menu ← Esc    pause ← P
  *
  *  Guards `typeof window` so importing it headless is inert; no wall-clock / no RNG. */
@@ -102,6 +103,7 @@ export const keyboardSource: InputSource = {
     if (any(RIGHT)) out.held.navRight = true;
 
     if (held.has(' ') || held.has('space')) { out.held.jump = true; out.held.confirm = true; active = true; }
+    if (held.has('f')) { out.held.aim = true; active = true; }
     if (held.has('enter')) { out.held.confirm = true; active = true; }
     if (held.has('escape') || held.has('esc')) { out.held.cancel = true; out.held.menu = true; active = true; }
     if (held.has('p')) { out.held.pause = true; active = true; }

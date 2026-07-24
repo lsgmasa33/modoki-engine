@@ -20,9 +20,9 @@ import { worldTransforms, deactivatedEntities } from '../../three/systems/transf
 import { findEntity, fireDirtyListeners, addDirtyListener, onStructureDirty, getAllEntities, subtreeIds } from '../../runtime/ecs/entityUtils';
 import { markOverrideIfInstance } from '../undo/entityActions';
 import { Transform, EntityAttributes, Collider3D, clampAngle, Bone2D, Billboard3D, CameraFrame, Zone3D } from '../../runtime/traits';
-import { colliderWireframeGeometry, colliderOutlineSig3D, type ColliderOutline3DParams } from '../../runtime/rendering/colliderOutline3D';
+import { colliderWireframeGeometry, colliderOutlineSig3D, colliderWorldScale3D, type ColliderOutline3DParams } from '../../runtime/rendering/colliderOutline3D';
 import {
-  syncEnvironment, syncLights, syncSceneRenderables3D, orientBillboards,
+  syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards,
   refreshEnvIntensityObserver,
   createRenderState, disposeRenderState, attachInvalidationListener,
   makeWebGPURenderer, computeActiveFrameFit, applyOrthoFrustum,
@@ -58,14 +58,15 @@ import { isTextEditable } from '../input/focusScope';
 import { loadScene } from '../scene/serialize';
 import { worldToLocalTransform } from '../scene/gizmoTransform';
 import { boneRelToProxyLocal, proxyLocalToBoneLocal } from '../scene/billboardBonePose';
-import { setEditorViewportCamera, setFocusEntityHandler, focusEntityInSceneView, setViewportController } from '../scene/sceneViewBus';
+import { setEditorViewportCamera, setFocusEntityHandler, focusEntityInSceneView, setViewportController, setEcsObjectsRegistry } from '../scene/sceneViewBus';
 import { withWarnFilter } from '../scene/warnFilter';
 import { mintEditor3DFrameKey, editor2DChromeFrameKey } from '../scene/frameKeys';
-import { computeUIModeNDC, computeFullNDC, computeCamFrustumPositions, computeLetterbox, frameCameraToBox, gameAspectFromRect, createSelectGesture, outlineSourceGeometry, resolveFocusTarget, axisSnapCameraPosition, slerpCameraOffset, perspHalfHeightAtDistance, perspDistanceForHalfHeight, orthoFrustumForHalfHeight } from '../scene/sceneViewMath';
+import { computeUIModeNDC, computeFullNDC, computeCamFrustumPositions, computeLetterbox, frameCameraToBox, gameAspectFromRect, createSelectGesture, outlineSourceGeometry, resolveFocusTarget, axisSnapCameraPosition, slerpCameraOffset, perspHalfHeightAtDistance, perspDistanceForHalfHeight, orthoFrustumForHalfHeight, shouldHideMeshesForColliderMode } from '../scene/sceneViewMath';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, PREFAB_EDIT_ROOT_GUID } from '../scene/prefabEdit';
-import { pushAction } from '../undo/undoManager';
-import { buildTransformUndoAction } from '../scene/gizmoUndo';
+import { pushAction, subscribeUndo } from '../undo/undoManager';
+import { buildTransformUndoAction, buildGroupTransformUndoAction } from '../scene/gizmoUndo';
+import { applyGroupTransform3D, applyGroupTransform2D, filterOutDescendants, resolveGroupPivot2D } from '../scene/multiTransform';
 import { entityRef } from '../undo/entityRef';
 import { notifyFieldEdited } from '../animation/recording';
 import {
@@ -100,6 +101,7 @@ import { pick2D, pick3D, type Pick2DCandidate, type Pick3DEntry } from './pickin
 import { UIResizeOverlay } from './UIResizeOverlay';
 import { UIFocusGraphOverlay } from './UIFocusGraphOverlay';
 import { SceneViewGizmo } from './SceneViewGizmo';
+import { ViewOptionsMenu } from './ViewOptionsMenu';
 import { createViewportDirtyGate, useRearmDirtyOnChange } from './viewportDirtyGate';
 import { mark2DDirty, get2DDirtyVersion, ensureCanvas2DListeners } from '../store/canvas2DDirty';
 import { Canvas2DMount } from '../../runtime/rendering/Canvas2DMount';
@@ -156,13 +158,33 @@ function objectReachesScene(obj: THREE.Object3D, scene: THREE.Scene): boolean {
   }
   return false;
 }
+/** Apply a viewport pick to the selection, honouring multi-select modifiers — mirrors the
+ *  Hierarchy panel so 2D and 3D picking behave the same. Ctrl/Cmd = toggle the picked entity
+ *  in/out; Shift = add it (and make it primary); plain = select just it. A plain click on empty
+ *  space deselects; a MODIFIED empty-space click preserves the current selection (so a
+ *  shift/ctrl marquee or mis-click doesn't clear it). */
+function applyPickSelection(entityId: number | null, mods: { additive: boolean; toggle: boolean }) {
+  const st = useEditorStore.getState();
+  if (entityId === null) {
+    if (!mods.additive && !mods.toggle) st.selectEntity(null);
+    return;
+  }
+  if (mods.toggle) st.toggleEntitySelection(entityId);
+  else if (mods.additive) st.setSelectedEntities([...st.selectedEntityIds, entityId], entityId);
+  else st.selectEntity(entityId);
+}
+
 /** Shared gizmo mode + space toggle buttons used in both 3D and 2D modes. */
-function GizmoToolbar({ gizmoModes, gizmoMode, setGizmoMode, gizmoSpace, setGizmoSpace }: {
+function GizmoToolbar({ gizmoModes, gizmoMode, setGizmoMode, gizmoSpace, setGizmoSpace, gizmoPivot, setGizmoPivot, multiSelect }: {
   gizmoModes: Array<{ value: 'translate' | 'rotate' | 'scale'; icon: string; key: string }>;
   gizmoMode: string;
   setGizmoMode: (mode: 'translate' | 'rotate' | 'scale') => void;
   gizmoSpace: string;
   setGizmoSpace: (space: 'local' | 'world') => void;
+  gizmoPivot: string;
+  setGizmoPivot: (pivot: 'pivot' | 'center') => void;
+  /** >1 entity selected — the Pivot/Center toggle only affects a multi-selection. */
+  multiSelect: boolean;
 }) {
   return (
     <>
@@ -188,71 +210,19 @@ function GizmoToolbar({ gizmoModes, gizmoMode, setGizmoMode, gizmoSpace, setGizm
         borderRadius: 3, color: gizmoSpace === 'local' ? '#e74c3c' : '#444',
         fontSize: '10px', cursor: 'pointer', padding: 0, lineHeight: 1, fontWeight: 'bold', fontFamily: 'monospace',
       }} title={`Space: ${gizmoSpace} (X)`}>{gizmoSpace === 'local' ? 'L' : 'G'}</button>
-    </>
-  );
-}
-
-/** Ground-grid visibility toggle (3D mode only — the grid is always hidden in UI
- *  mode). Renders its own leading divider so callers just drop it in. */
-function GridButton({ showGrid, setShowGrid }: {
-  showGrid: boolean;
-  setShowGrid: (v: boolean) => void;
-}) {
-  return (
-    <>
-      <div style={{ width: 1, height: 18, background: '#444', margin: '0 6px' }} />
-      <button onClick={() => setShowGrid(!showGrid)} title="Show/hide the ground grid (G)"
-        data-ui-id="sceneView.toolbar.grid" data-ui-kind="toggle" data-ui-label="grid"
+      {/* Pivot/Center — Unity's multi-select handle-position toggle. Dimmed when a single
+          entity is selected (it has no effect there). Shortcut Z. */}
+      <button onClick={() => setGizmoPivot(gizmoPivot === 'center' ? 'pivot' : 'center')}
+        data-ui-id="sceneView.toolbar.gizmo.pivot" data-ui-kind="toggle" data-ui-label="gizmo pivot"
+        disabled={!multiSelect}
         style={{
-        height: 24, padding: '0 8px', display: 'flex', alignItems: 'center', gap: 4,
-        background: showGrid ? '#1e2630' : 'none',
-        border: `1px solid ${showGrid ? '#5a9fd4' : '#444'}`,
-        borderRadius: 3, color: showGrid ? '#5a9fd4' : '#666', fontSize: '10px',
-        cursor: 'pointer', fontWeight: 'bold', fontFamily: 'monospace', lineHeight: 1,
-      }}>▦ Grid</button>
-    </>
-  );
-}
-
-/** Show-all-colliders toggle. When on, the SceneView outlines EVERY Collider3D (not just
- *  the selected entity's) so generated/child colliders — field rim walls, fences — are
- *  visible for debugging without hunting entity-by-entity. */
-function ColliderButton({ showColliders, setShowColliders }: {
-  showColliders: boolean;
-  setShowColliders: (v: boolean) => void;
-}) {
-  return (
-    <button onClick={() => setShowColliders(!showColliders)} title="Show/hide all collider wireframes (C)"
-      data-ui-id="sceneView.toolbar.colliders" data-ui-kind="toggle" data-ui-label="colliders"
-      style={{
-        height: 24, padding: '0 8px', display: 'flex', alignItems: 'center', gap: 4, marginLeft: 6,
-        background: showColliders ? '#2a2618' : 'none',
-        border: `1px solid ${showColliders ? '#e0a030' : '#444'}`,
-        borderRadius: 3, color: showColliders ? '#e0a030' : '#666', fontSize: '10px',
-        cursor: 'pointer', fontWeight: 'bold', fontFamily: 'monospace', lineHeight: 1,
-      }}>◫ Colliders</button>
-  );
-}
-
-/** Particle FX preview toggle. Shared between 3D and 2D modes — particles can
- *  appear in either (3D effects, 2D match-3 bursts), so both toolbars expose it.
- *  Renders its own leading divider so callers just drop it in. */
-function FXButton({ particlePreview, setParticlePreview }: {
-  particlePreview: boolean;
-  setParticlePreview: (v: boolean) => void;
-}) {
-  return (
-    <>
-      <div style={{ width: 1, height: 18, background: '#444', margin: '0 6px' }} />
-      <button onClick={() => setParticlePreview(!particlePreview)} title="Preview particle effects in the scene (P)"
-        data-ui-id="sceneView.toolbar.fx-preview" data-ui-kind="toggle" data-ui-label="FX preview"
-        style={{
-        height: 24, padding: '0 8px', display: 'flex', alignItems: 'center', gap: 4,
-        background: particlePreview ? '#2a1e2e' : 'none',
-        border: `1px solid ${particlePreview ? '#e056fd' : '#444'}`,
-        borderRadius: 3, color: particlePreview ? '#e056fd' : '#666', fontSize: '10px',
-        cursor: 'pointer', fontWeight: 'bold', fontFamily: 'monospace', lineHeight: 1,
-      }}>✦ FX</button>
+        width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center', marginLeft: 4,
+        background: gizmoPivot === 'center' ? '#2a1e1e' : 'none',
+        border: `1px solid ${gizmoPivot === 'center' ? '#e74c3c' : '#333'}`,
+        borderRadius: 3, color: !multiSelect ? '#333' : (gizmoPivot === 'center' ? '#e74c3c' : '#444'),
+        fontSize: '10px', cursor: multiSelect ? 'pointer' : 'default', padding: 0, lineHeight: 1,
+        fontWeight: 'bold', fontFamily: 'monospace', opacity: multiSelect ? 1 : 0.5,
+      }} title={`Multi-select handle: ${gizmoPivot} (Z)`}>{gizmoPivot === 'center' ? 'C' : 'P'}</button>
     </>
   );
 }
@@ -288,25 +258,6 @@ function ColliderEditButton() {
         borderRadius: 3, color: colliderEditMode ? '#2effa6' : '#888', fontSize: '10px',
         cursor: 'pointer', fontWeight: 'bold', fontFamily: 'monospace', lineHeight: 1,
       }}>⬟ Points</button>
-  );
-}
-
-/** Toolbar toggle (UI mode) for the UIFocusable nav-graph overlay — arrows between
- *  focusables (explicit links + spatial fallback), focusOrder badges, autoFocus ring.
- *  Visualization only; state persists in localStorage via the store setter. */
-function FocusGraphButton() {
-  const showFocusGraph = useEditorStore((s) => s.showFocusGraph);
-  const setShowFocusGraph = useEditorStore((s) => s.setShowFocusGraph);
-  return (
-    <button onClick={() => setShowFocusGraph(!showFocusGraph)}
-      title="Show the UIFocusable navigation graph: solid = explicit navUp/Down/Left/Right link, dashed = spatial fallback the runtime would pick · number = focusOrder · gold ring = autoFocus"
-      style={{
-        height: 24, padding: '0 8px', display: 'flex', alignItems: 'center', gap: 4,
-        background: showFocusGraph ? '#12291f' : 'none',
-        border: `1px solid ${showFocusGraph ? '#2effa6' : '#444'}`,
-        borderRadius: 3, color: showFocusGraph ? '#2effa6' : '#888', fontSize: '10px',
-        cursor: 'pointer', fontWeight: 'bold', fontFamily: 'monospace', lineHeight: 1,
-      }}>⇄ Focus</button>
   );
 }
 
@@ -389,6 +340,21 @@ export default function SceneView() {
   const [layers, setLayers] = useState({ show3D: true, show2D: true, showUI: true });
   const [showGrid, setShowGrid] = useState(true);
   const [showColliders, setShowColliders] = useState(false);
+  const [colliders2DOnly, setColliders2DOnlyState] = useState(false);
+  // 2D counterpart of showColliders: local state drives the ViewOptionsMenu checkbox, and
+  // mirrors into editorScene2DRenderer (the actual render-loop flag Scene2D reads every
+  // frame) — there's no other consumer of this React state, so a plain setter call is enough.
+  const setColliders2DOnly = (on: boolean) => { setColliders2DOnlyState(on); editorScene2DRenderer.setCollidersOnly(on); };
+  const showFocusGraph = useEditorStore((s) => s.showFocusGraph);
+  const setShowFocusGraph = useEditorStore((s) => s.setShowFocusGraph);
+  // editorScene2DRenderer is a module-level singleton (outlives this component across
+  // remounts/HMR), so a stale `true` from a PRIOR mount could otherwise survive into a fresh
+  // mount whose React state defaults back to false — force it back in sync on mount, and
+  // clear it on unmount so a closed SceneView never leaves 2D sprites hidden behind it.
+  useEffect(() => {
+    editorScene2DRenderer.setCollidersOnly(false);
+    return () => editorScene2DRenderer.setCollidersOnly(false);
+  }, []);
   const selectedId = useEditorStore((s) => s.selectedEntityId);
   const editingPrefab = useEditorStore((s) => s.editingPrefab);
 
@@ -415,6 +381,9 @@ export default function SceneView() {
   const setGizmoMode = useEditorStore((s) => s.setGizmoMode);
   const gizmoSpace = useEditorStore((s) => s.gizmoSpace);
   const setGizmoSpace = useEditorStore((s) => s.setGizmoSpace);
+  const gizmoPivot = useEditorStore((s) => s.gizmoPivot);
+  const setGizmoPivot = useEditorStore((s) => s.setGizmoPivot);
+  const multiSelectCount = useEditorStore((s) => s.selectedEntityIds.length);
   const particlePreview = useEditorStore((s) => s.particlePreview);
   const setParticlePreview = useEditorStore((s) => s.setParticlePreview);
 
@@ -549,6 +518,12 @@ export default function SceneView() {
         run: () => setGizmoSpace(useEditorStore.getState().gizmoSpace === 'world' ? 'local' : 'world'),
       }),
       register({
+        // Pivot/Center — only meaningful with a multi-selection (matches the dimmed toolbar button).
+        id: 'scene.gizmoPivot', keys: 'z', scope: 'scene',
+        when: () => useEditorStore.getState().selectedEntityIds.length > 1,
+        run: () => setGizmoPivot(useEditorStore.getState().gizmoPivot === 'center' ? 'pivot' : 'center'),
+      }),
+      register({
         id: 'scene.frameSelected', keys: 'f', scope: 'app-key',
         // Frame the selected entity in the orbit camera (3D mode only). `when` yields
         // rather than claiming-and-doing-nothing, so `f` stays available elsewhere.
@@ -563,7 +538,14 @@ export default function SceneView() {
         run: () => setParticlePreview(!useEditorStore.getState().particlePreview),
       }),
       register({ id: 'scene.toggleGrid', keys: 'g', scope: 'scene', run: () => setShowGrid((v) => !v) }),
-      register({ id: 'scene.toggleColliders', keys: 'c', scope: 'scene', run: () => setShowColliders((v) => !v) }),
+      register({
+        id: 'scene.toggleColliders', keys: 'c', scope: 'scene',
+        // Mode-aware, mirroring scene.frameSelected above: 'c' drives whichever collider-only
+        // toggle the active viewport actually has a button for. Reads the LIVE renderer flag
+        // (not the `colliders2DOnly` React state) so this doesn't need re-registering — and
+        // can't go stale — every time the toggle flips; only `mode` needs to be in scope.
+        run: () => (mode === 'ui' ? setColliders2DOnly(!editorScene2DRenderer.isCollidersOnly()) : setShowColliders((v) => !v)),
+      }),
       register({
         id: 'scene.resetView', keys: 'Home', scope: 'scene',
         run: () => { viewRef.current = { zoom: 1, panX: 0, panY: 0 }; updateViewTransform(); },
@@ -602,16 +584,21 @@ export default function SceneView() {
           <option value="ui">2D</option>
         </select>
         {/* Gizmo mode + space toggle (shared between 3D and 2D modes) */}
-        <GizmoToolbar gizmoModes={gizmoModes} gizmoMode={gizmoMode} setGizmoMode={setGizmoMode} gizmoSpace={gizmoSpace} setGizmoSpace={setGizmoSpace} />
+        <GizmoToolbar gizmoModes={gizmoModes} gizmoMode={gizmoMode} setGizmoMode={setGizmoMode} gizmoSpace={gizmoSpace} setGizmoSpace={setGizmoSpace} gizmoPivot={gizmoPivot} setGizmoPivot={setGizmoPivot} multiSelect={multiSelectCount > 1} />
         <ColliderEditButton />
         {mode === '3d' && <>
-          <FXButton particlePreview={particlePreview} setParticlePreview={setParticlePreview} />
-          <GridButton showGrid={showGrid} setShowGrid={setShowGrid} />
-          <ColliderButton showColliders={showColliders} setShowColliders={setShowColliders} />
+          <ViewOptionsMenu uiId="sceneView.toolbar.viewOptions3d" items={[
+            { key: 'fx', label: 'FX', checked: particlePreview, onToggle: () => setParticlePreview(!particlePreview), title: 'Preview particle effects in the scene (P)', uiId: 'sceneView.toolbar.fx-preview' },
+            { key: 'grid', label: 'Grid', checked: showGrid, onToggle: () => setShowGrid(!showGrid), title: 'Show/hide the ground grid (G)', uiId: 'sceneView.toolbar.grid' },
+            { key: 'colliders', label: 'Colliders', checked: showColliders, onToggle: () => setShowColliders(!showColliders), title: 'Show only colliders, hiding regular meshes (C)', uiId: 'sceneView.toolbar.colliders' },
+          ]} />
         </>}
         {mode === 'ui' && <>
-          <FXButton particlePreview={particlePreview} setParticlePreview={setParticlePreview} />
-          <FocusGraphButton />
+          <ViewOptionsMenu uiId="sceneView.toolbar.viewOptionsUi" items={[
+            { key: 'fx', label: 'FX', checked: particlePreview, onToggle: () => setParticlePreview(!particlePreview), title: 'Preview particle effects in the scene (P)', uiId: 'sceneView.toolbar.fx-preview' },
+            { key: 'focus', label: 'Focus', checked: showFocusGraph, onToggle: () => setShowFocusGraph(!showFocusGraph), title: 'Show the UIFocusable navigation graph: solid = explicit navUp/Down/Left/Right link, dashed = spatial fallback the runtime would pick · number = focusOrder · gold ring = autoFocus', uiId: 'sceneView.toolbar.focus' },
+            { key: 'colliders', label: 'Colliders', checked: colliders2DOnly, onToggle: () => setColliders2DOnly(!colliders2DOnly), title: 'Show only colliders, hiding sprites (C)', uiId: 'sceneView.toolbar.colliders2d' },
+          ]} />
           <div style={{ width: 1, height: 18, background: '#444', margin: '0 6px' }} />
           {(['show3D', 'show2D', 'showUI'] as const).map((key, i) => {
             const colors = ['#3498db', '#2ecc71', '#f39c12'];
@@ -793,13 +780,103 @@ type Gizmo2DDragState = {
 type Collider2DVertexDrag = { entityId: number; index: number; min: number; beforePoints: string; dirtied: boolean };
 type SkinPaintStrokeState = { rigPath: string; beforeIdx: number[]; beforeW: number[] };
 type PaintCursorState = { rootId: number; lx: number; ly: number; radius: number };
+/** A member of a 2D group (multi-select) gizmo drag: its WORLD 2D transform + box half-extents,
+ *  its LOCAL transform at drag start (for undo), and its parent's world transform (for the
+ *  world→local write-back). */
+type Group2DMember = {
+  id: number;
+  world: { x: number; y: number; rz: number; sx: number; sy: number };
+  halfW: number; halfH: number;
+  local: { x: number; y: number; rz: number; sx: number; sy: number };
+  parentWorld: { x: number; y: number; rz: number; sx: number; sy: number } | null;
+};
+/** Active 2D group-gizmo drag: the virtual gizmo sits at `pivot`; its per-frame delta is applied
+ *  to every member around that pivot via applyGroupTransform2D. */
+type Group2DDragState = {
+  handle: GizmoHandle;
+  gizmoSpace: 'world' | 'local';
+  startGamePos: { x: number; y: number };
+  pivot: { x: number; y: number };
+  startVirtual: { x: number; y: number; rz: number; sx: number; sy: number };
+  members: Group2DMember[];
+};
 interface Scene2DInteractionRefs {
   dragRef: { current: Gizmo2DDragState | null };
+  groupDragRef: { current: Group2DDragState | null };
   hoveredRef: { current: GizmoHandle | null };
   vertexDragRef: { current: Collider2DVertexDrag | null };
   skinPaintStrokeRef: { current: SkinPaintStrokeState | null };
   paintCursorRef: { current: PaintCursorState | null };
   lastEditClickRef: { current: { t: number; x: number; y: number } };
+}
+
+/** A gizmo-able 2D entity's WORLD transform + box half-extents (the box the gizmo/outline frame).
+ *  Handles Renderable2D (width/height), SkinnedSprite2D (deformed-mesh AABB), and Text2D. Returns
+ *  null for entities with no 2D box. */
+function gizmo2DBoxFor(entity: ReturnType<typeof findEntity>, allTraits: ReturnType<typeof getAllTraits>):
+  { wx: number; wy: number; wrz: number; wsx: number; wsy: number; halfW: number; halfH: number } | null {
+  const transformMeta = allTraits.find((t) => t.name === 'Transform');
+  if (!transformMeta || !entity || !entity.has(transformMeta.trait)) return null;
+  const tf = entity.get(transformMeta.trait) as { x: number; y: number; rz: number; sx: number; sy: number };
+  const w = getWorldTransform2D(entity.id(), tf);
+  const r2dMeta = allTraits.find((t) => t.name === 'Renderable2D');
+  let halfW = 0, halfH = 0, ok = false;
+  if (r2dMeta && entity.has(r2dMeta.trait)) {
+    const rend = entity.get(r2dMeta.trait) as { width: number; height: number };
+    halfW = rend.width; halfH = rend.height; ok = true;
+  } else {
+    const ssMeta = allTraits.find((t) => t.name === 'SkinnedSprite2D');
+    if (ssMeta && entity.has(ssMeta.trait)) {
+      const buf = getSkin2DBuffer(entity.id());
+      if (buf) for (const part of buf.parts) for (let i = 0; i < part.positions.length; i += 2) {
+        halfW = Math.max(halfW, Math.abs(part.positions[i])); halfH = Math.max(halfH, Math.abs(part.positions[i + 1]));
+      }
+      ok = true;
+    } else {
+      const tbox = text2DGizmoBox(entity, allTraits.find((t) => t.name === 'Text2D'));
+      if (tbox) { halfW = tbox.halfW; halfH = tbox.halfH; ok = true; }
+    }
+  }
+  if (!ok) return null;
+  return { wx: w.x, wy: w.y, wrz: w.rz, wsx: w.sx, wsy: w.sy, halfW, halfH };
+}
+
+/** Compute the 2D group-gizmo geometry for the current multi-selection owned by this canvas: the
+ *  pivot point (centroid for Center mode, active-entity origin for Pivot), a box that encloses the
+ *  selection around that pivot, and each member's world/local/parent transforms. Returns null when
+ *  fewer than 2 gizmo-able members belong to this canvas. Shared by draw + hit-test so they agree. */
+function computeGroup2DGizmo(allTraits: ReturnType<typeof getAllTraits>, ownedByThisCanvas: (id: number) => boolean):
+  { pivotX: number; pivotY: number; pivotRz: number; gw: number; gh: number; members: Group2DMember[] } | null {
+  const st = useEditorStore.getState();
+  if (st.selectedEntityIds.length <= 1) return null;
+  const transformMeta = allTraits.find((t) => t.name === 'Transform');
+  const eaMeta = allTraits.find((t) => t.name === 'EntityAttributes');
+  if (!transformMeta) return null;
+  const parentOf = (id: number) => { const e = findEntity(id); return e && eaMeta && e.has(eaMeta.trait) ? (e.get(eaMeta.trait).parentId as number) : 0; };
+  const topIds = filterOutDescendants(st.selectedEntityIds, parentOf).filter(ownedByThisCanvas);
+  const members: Group2DMember[] = [];
+  for (const id of topIds) {
+    const e = findEntity(id);
+    const box = gizmo2DBoxFor(e, allTraits);
+    if (!e || !box) continue;
+    const tf = e.get(transformMeta.trait) as { x: number; y: number; rz: number; sx: number; sy: number };
+    const parentId = eaMeta && e.has(eaMeta.trait) ? (e.get(eaMeta.trait).parentId as number) : 0;
+    const pwt = parentId ? worldTransforms.get(parentId) : null;
+    members.push({
+      id, world: { x: box.wx, y: box.wy, rz: box.wrz, sx: box.wsx, sy: box.wsy },
+      halfW: box.halfW, halfH: box.halfH,
+      local: { x: tf.x, y: tf.y, rz: tf.rz, sx: tf.sx, sy: tf.sy },
+      parentWorld: pwt ? { x: pwt.x, y: pwt.y, rz: pwt.rz, sx: pwt.sx, sy: pwt.sy } : null,
+    });
+  }
+  if (members.length < 2) return null;
+  // Pivot/orientation/framing decision is pure geometry over the members — resolved by
+  // resolveGroupPivot2D (multiTransform.ts) so it's unit-testable without a live ECS world.
+  const { pivotX, pivotY, pivotRz, gw, gh } = resolveGroupPivot2D(
+    members.map((m) => ({ id: m.id, x: m.world.x, y: m.world.y, rz: m.world.rz, sx: m.world.sx, sy: m.world.sy, halfW: m.halfW, halfH: m.halfH })),
+    st.selectedEntityId, st.gizmoPivot, st.gizmoSpace,
+  );
+  return { pivotX, pivotY, pivotRz, gw, gh, members };
 }
 interface Scene2DInteractionScale { cs: ReturnType<typeof computeCanvasScale>; gizmoScreenScale: number; backingW: number; backingH: number }
 interface Scene2DInteractionOpts {
@@ -837,7 +914,7 @@ function readCanvas2DRefDims(canvasEntityId: number, fallbackW: number, fallback
 // reading `canvasRef.current` / `canvasScaleRef.current` / `gizmoScreenScaleRef.current` unchanged.
 function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteractionOpts): () => void {
   const { getScale, getTargetEl, refs, markDirty } = opts;
-  const { dragRef, hoveredRef, vertexDragRef, skinPaintStrokeRef, paintCursorRef, lastEditClickRef } = refs;
+  const { dragRef, groupDragRef, hoveredRef, vertexDragRef, skinPaintStrokeRef, paintCursorRef, lastEditClickRef } = refs;
   const selectEntity = useEditorStore.getState().selectEntity;
   const mark2DDirty = markDirty;
   const canvasRef = { get current(): HTMLElement | null { return getTargetEl(); } };
@@ -853,6 +930,8 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
     // deselect — this canvas must clear the selection itself. (Armed only on a total miss
     // below; a gizmo/collider/paint interaction leaves it disarmed, so release() is a no-op.)
     const deselectGesture = createSelectGesture();
+    // Multi-select modifiers for the 2D pick, captured at press (mirrors the 3D path).
+    let pendingMods2D = { additive: false, toggle: false };
 
     function toGame(clientX: number, clientY: number) {
       const c = canvasRef.current;
@@ -861,6 +940,53 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       const { cs, backingW, backingH } = getScale();
       return screenToReference2D(clientX, clientY, c.getBoundingClientRect(), backingW, backingH, cs);
     }
+
+    // ── Marquee (box) selection: Shift + drag on empty 2D space adds every enclosed entity to the
+    //    selection (mirrors the 3D viewport). The rubber-band rect is a client-space DOM overlay;
+    //    the enclosure test runs in reference/game space (box corners mapped via toGame). ──
+    let marquee2d: { x0: number; y0: number; moved: boolean } | null = null;
+    const marqueeEl2d = document.createElement('div');
+    marqueeEl2d.style.cssText = 'position:fixed;border:1px solid #5a9fd4;background:rgba(90,159,212,0.15);pointer-events:none;z-index:9999;display:none;';
+    document.body.appendChild(marqueeEl2d);
+    const marquee2dMove = (ev: PointerEvent) => {
+      if (!marquee2d) return;
+      if (!marquee2d.moved && Math.hypot(ev.clientX - marquee2d.x0, ev.clientY - marquee2d.y0) > 4) {
+        marquee2d.moved = true; marqueeEl2d.style.display = 'block';
+      }
+      if (marquee2d.moved) {
+        const x = Math.min(marquee2d.x0, ev.clientX), y = Math.min(marquee2d.y0, ev.clientY);
+        marqueeEl2d.style.left = `${x}px`; marqueeEl2d.style.top = `${y}px`;
+        marqueeEl2d.style.width = `${Math.abs(ev.clientX - marquee2d.x0)}px`;
+        marqueeEl2d.style.height = `${Math.abs(ev.clientY - marquee2d.y0)}px`;
+      }
+    };
+    const marquee2dUp = (ev: PointerEvent) => {
+      if (!marquee2d) return;
+      const m = marquee2d; marquee2d = null;
+      marqueeEl2d.style.display = 'none';
+      if (!m.moved) return;
+      const a = toGame(m.x0, m.y0), b = toGame(ev.clientX, ev.clientY);
+      const minX = Math.min(a.x, b.x), maxX = Math.max(a.x, b.x);
+      const minY = Math.min(a.y, b.y), maxY = Math.max(a.y, b.y);
+      const allTraits = getAllTraits();
+      const transformMeta = allTraits.find((t) => t.name === 'Transform');
+      const r2dMeta = allTraits.find((t) => t.name === 'Renderable2D');
+      if (!transformMeta || !r2dMeta) return;
+      const { parentOf, canvasIds } = getCanvas2DRouting();
+      const inside: number[] = [];
+      getCurrentWorld().query(transformMeta.trait, r2dMeta.trait).updateEach(([tf, rend]: any[], entity: any) => {
+        const id = entity.id();
+        if (!rend.isVisible || deactivatedEntities.has(id)) return;
+        if (findCanvasAncestor(id, parentOf, canvasIds) !== canvasEntityId) return;
+        const w = getWorldTransform2D(id, tf);
+        if (w.x >= minX && w.x <= maxX && w.y >= minY && w.y <= maxY) inside.push(id);
+      });
+      if (inside.length === 0) return;
+      const cur = useEditorStore.getState().selectedEntityIds;
+      useEditorStore.getState().setSelectedEntities(Array.from(new Set([...cur, ...inside])), inside[inside.length - 1]);
+    };
+    window.addEventListener('pointermove', marquee2dMove);
+    window.addEventListener('pointerup', marquee2dUp);
 
     // ── Collider-mesh editing (Phase 4.3) helpers ──
     // Resolve the selected entity's editable collider context (polygon/mesh), or null.
@@ -977,6 +1103,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
     function onPointerDown(e: PointerEvent) {
       deselectGesture.reset(); // a fresh press supersedes any stale pending deselect
       if (e.button !== 0) return;
+      pendingMods2D = { additive: e.shiftKey, toggle: e.metaKey || e.ctrlKey };
       const { x: px, y: py } = toGame(e.clientX, e.clientY);
 
       // Weight-paint brush takes precedence when active (before collider/gizmo/selection).
@@ -1038,6 +1165,26 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       const { parentOf, canvasIds } = getCanvas2DRouting();
       const paintOrder = getPaintOrder();
       const ownedByThisCanvas = (id: number) => findCanvasAncestor(id, parentOf, canvasIds) === canvasEntityId;
+
+      // Multi-select GROUP gizmo hit test (before the single-entity gizmo). The group gizmo sits
+      // at the shared pivot; a handle hit begins a group drag that transforms every member.
+      if (useEditorStore.getState().selectedEntityIds.length > 1) {
+        const grp = computeGroup2DGizmo(allTraits, ownedByThisCanvas);
+        if (grp) {
+          const { gizmoMode, gizmoSpace } = useEditorStore.getState();
+          const handle = hitTestGizmo2D(px, py, grp.pivotX, grp.pivotY, grp.pivotRz, 1, 1, grp.gw, grp.gh, gizmoMode, gizmoSpace, gizmoScreenScaleRef.current);
+          if (handle) {
+            groupDragRef.current = {
+              handle, gizmoSpace,
+              startGamePos: { x: px, y: py },
+              pivot: { x: grp.pivotX, y: grp.pivotY },
+              startVirtual: { x: grp.pivotX, y: grp.pivotY, rz: grp.pivotRz, sx: 1, sy: 1 },
+              members: grp.members,
+            };
+            e.stopPropagation(); e.preventDefault(); return;
+          }
+        }
+      }
 
       // First: try gizmo hit test on selected entity
       const selectedId = useEditorStore.getState().selectedEntityId;
@@ -1172,7 +1319,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       const bestId = pick2D(px, py, candidates);
 
       if (bestId !== null) {
-        selectEntity(bestId);
+        applyPickSelection(bestId, pendingMods2D);
         e.stopPropagation();
         e.preventDefault();
         return;
@@ -1184,7 +1331,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       // pick3D — ask the 3D viewport to raycast just the billboards under this game-cam ray.
       const bbId = _pickBillboardInUI?.(e.clientX, e.clientY);
       if (bbId != null) {
-        selectEntity(bbId);
+        applyPickSelection(bbId, pendingMods2D);
         e.stopPropagation();
         e.preventDefault();
         return;
@@ -1195,11 +1342,14 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       // showing through the transparent canvas. Select the UI node beneath, if any.
       const uiId = pickUnderlyingUIEntity(e.clientX, e.clientY);
       if (uiId !== null) {
-        selectEntity(uiId);
+        applyPickSelection(uiId, pendingMods2D);
         e.stopPropagation();
         e.preventDefault();
         return;
       }
+      // Shift + press on empty space → begin a marquee box-select (adds to the selection). A plain
+      // shift-click without travel preserves the selection (marquee2dUp no-ops when not moved).
+      if (e.shiftKey) { marquee2d = { x0: e.clientX, y0: e.clientY, moved: false }; return; }
       // Nothing hit anywhere: arm a deferred deselect. A plain click clears the selection
       // on pointer-up; a drag (past the threshold) cancels it so a pan keeps the selection.
       deselectGesture.arm(e.clientX, e.clientY, null);
@@ -1236,6 +1386,36 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
           setPointsLive(vd.entityId, cc.colMeta, serializeColliderPoints(next));
           vd.dirtied = true;
         }
+        return;
+      }
+
+      // Active GROUP drag — drive a virtual gizmo at the pivot to get the drag's world delta, then
+      // apply it around the pivot to every member (rigid orbit/spread), converting each new world
+      // transform back to its local frame. Position is written for rotate/scale too (Center/Pivot
+      // orbit moves member positions — same as the 3D group path).
+      if (groupDragRef.current) {
+        e.stopPropagation();
+        e.preventDefault();
+        const g = groupDragRef.current;
+        let worldDelta = applyGizmoDrag2D(g.handle, px, py, g.startGamePos.x, g.startGamePos.y, g.startVirtual, g.pivot, g.gizmoSpace);
+        if (e.shiftKey) worldDelta = snapDragResult(worldDelta, DEFAULT_GIZMO_SNAP);
+        const wv = { ...g.startVirtual, ...worldDelta };
+        const mode = useEditorStore.getState().gizmoMode;
+        const delta = {
+          dx: wv.x - g.startVirtual.x, dy: wv.y - g.startVirtual.y, dRz: wv.rz - g.startVirtual.rz,
+          dSx: wv.sx / (g.startVirtual.sx || 1), dSy: wv.sy / (g.startVirtual.sy || 1),
+        };
+        const news = applyGroupTransform2D({ memberStart: g.members.map((m) => m.world), pivot: g.pivot, mode, delta });
+        g.members.forEach((m, i) => {
+          const me = findEntity(m.id);
+          if (!me || !me.has(Transform)) return;
+          const localNew = worldToLocal2D(news[i], m.parentWorld);
+          const cur = me.get(Transform);
+          if (mode === 'translate') me.set(Transform, { ...cur, x: localNew.x, y: localNew.y });
+          else if (mode === 'rotate') me.set(Transform, { ...cur, x: localNew.x, y: localNew.y, rz: clampAngle(localNew.rz) });
+          else me.set(Transform, { ...cur, x: localNew.x, y: localNew.y, sx: localNew.sx, sy: localNew.sy });
+        });
+        mark2DDirty();
         return;
       }
 
@@ -1303,7 +1483,11 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
     function onPointerUp(e: PointerEvent) {
       // Empty-canvas click (armed on a total miss, not cancelled by a drag) → deselect.
       // Only true when nothing else claimed this gesture, so it can't fire mid-drag/paint.
-      if (deselectGesture.release().clicked) { selectEntity(null); return; }
+      // A modified click (shift/ctrl) preserves the selection, matching the 3D path.
+      if (deselectGesture.release().clicked) {
+        if (!pendingMods2D.additive && !pendingMods2D.toggle) selectEntity(null);
+        return;
+      }
 
       // Finish a weight-paint stroke → one undo entry (before→after weights).
       if (skinPaintStrokeRef.current) {
@@ -1338,6 +1522,30 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
             commitPoints(vd.entityId, colMeta, vd.beforePoints, parseColliderPoints(afterStr));
           }
         }
+        return;
+      }
+      // Group drag end → ONE batched undo step covering every member.
+      if (groupDragRef.current) {
+        e.stopPropagation();
+        e.preventDefault();
+        const g = groupDragRef.current;
+        groupDragRef.current = null;
+        const mode = useEditorStore.getState().gizmoMode;
+        const recFields = mode === 'translate' ? ['x', 'y'] : mode === 'rotate' ? ['x', 'y', 'rz'] : ['x', 'y', 'sx', 'sy'];
+        const actions = g.members.map((m) => {
+          const me = findEntity(m.id);
+          if (!me || !me.has(Transform)) return null;
+          const tf = me.get(Transform);
+          const after = { x: tf.x, y: tf.y, rz: tf.rz, sx: tf.sx, sy: tf.sy };
+          const ref = entityRef(m.id);
+          for (const k of recFields) { notifyFieldEdited(m.id, 'Transform', k, (after as Record<string, number>)[k]); markOverrideIfInstance(m.id, 'Transform', k); }
+          return buildTransformUndoAction({
+            label: `Transform "${me.name || `Entity ${m.id}`}"`,
+            trait: Transform, resolve: () => ref.resolve(), findEntity, before: { ...m.local }, after,
+            entityGuid: ref.guid || String(m.id),
+          });
+        }).filter(Boolean) as ReturnType<typeof buildTransformUndoAction>[];
+        if (actions.length) pushAction(buildGroupTransformUndoAction(`Transform ${actions.length} entities`, actions));
         return;
       }
       if (!dragRef.current) return;
@@ -1383,6 +1591,9 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       container.removeEventListener('pointerdown', onPointerDown, { capture: true });
       container.removeEventListener('pointermove', onPointerMove, { capture: true });
       container.removeEventListener('pointerup', onPointerUp, { capture: true });
+      window.removeEventListener('pointermove', marquee2dMove);
+      window.removeEventListener('pointerup', marquee2dUp);
+      marqueeEl2d.remove();
     };
 }
 
@@ -1669,10 +1880,14 @@ function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: S
         }
       }
 
+      // Multi-select: the group gizmo + all-member outlines replace the single-entity ones.
+      const grp2d = computeGroup2DGizmo(allTraits, (id) => findCanvasAncestor(id, parentOf, canvasIds) === canvasEntityId);
+      const isMulti2D = !!grp2d;
+
       // Draw selection outline + 2D gizmo for selected entity.
       // Both are drawn in canvas-scale space (not entity-local), so they
       // stay constant screen-size regardless of zoom and entity scale.
-      if (currentSelectedId !== null && selectedTf) {
+      if (currentSelectedId !== null && selectedTf && !isMulti2D) {
         const ss = gizmoScreenScaleRef.current;
         const { x: ex, y: ey, rz: erz, sx: esx, sy: esy } = selectedTf;
         const { ox, oy } = computePivotOffset(selectedW, selectedH, selectedPivotX, selectedPivotY);
@@ -1688,14 +1903,34 @@ function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: S
         ctx.restore();
       }
 
+      // All-member outlines for a multi-selection (primary yellow, others orange — mirrors 3D).
+      if (grp2d) {
+        const ss = gizmoScreenScaleRef.current;
+        const primaryId = useEditorStore.getState().selectedEntityId;
+        for (const m of grp2d.members) {
+          ctx.save();
+          ctx.translate(m.world.x, m.world.y);
+          ctx.rotate(m.world.rz);
+          ctx.scale(m.world.sx, m.world.sy);
+          const lw = ss / Math.abs(m.world.sx || 1);
+          ctx.strokeStyle = m.id === primaryId ? '#f1c40f' : '#e67e22';
+          ctx.lineWidth = 2 * lw;
+          const pad = 3 * lw;
+          ctx.strokeRect(-m.halfW - pad, -m.halfH - pad, m.halfW * 2 + pad * 2, m.halfH * 2 + pad * 2);
+          ctx.restore();
+        }
+      }
+
       // Gizmo + editable-collider handles are hidden while editing collider vertices.
       const colliderEditing = useEditorStore.getState().colliderEditMode;
 
       // ── Collider outline for the selected entity (ANY shape) — a read-only green
       //    silhouette so collision-vs-visual is visible on selection. Drawn with the
-      //    entity's world position+rotation but NO scale (colliders are unscaled world
-      //    units). colliderEditMode draws its own outline+handles below for editable
-      //    shapes, so skip then to avoid a double draw. ──
+      //    entity's world position+rotation; SCALE is applied via drawColliderOutline's
+      //    `scale` param (not baked into ctx.translate/rotate) since a circle/capsule's
+      //    radius can't ride a ctx.scale the way a per-axis polygon could — see
+      //    scaleColliderOutline2D. colliderEditMode draws its own outline+handles below for
+      //    editable shapes, so skip then to avoid a double draw. ──
       if (currentSelectedId !== null && !colliderEditing && colMetaDraw
           && findCanvasAncestor(currentSelectedId, parentOf, canvasIds) === canvasEntityId) {
         const selEnt = findEntity(currentSelectedId);
@@ -1704,15 +1939,21 @@ function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: S
           const ss = gizmoScreenScaleRef.current;
           ctx.save();
           ctx.translate(wt.x, wt.y);
-          ctx.rotate(wt.rz);   // position + rotation only (colliders are unscaled)
+          ctx.rotate(wt.rz);
           drawColliderOutline(ctx, selEnt.get(colMetaDraw.trait) as never,
-            { color: '#2effa6', width: 1.5 * ss, dash: [5 * ss, 4 * ss] });
+            { color: '#2effa6', width: 1.5 * ss, dash: [5 * ss, 4 * ss] },
+            { sx: wt.sx ?? 1, sy: wt.sy ?? 1 });
           ctx.restore();
         }
       }
 
       // Gizmo is hidden while editing collider vertices (they share the canvas + drags).
-      if (currentSelectedId !== null && selectedTf && !colliderEditing) {
+      // Multi-select draws ONE group gizmo at the pivot; single-select draws the entity's gizmo.
+      if (grp2d && !colliderEditing) {
+        const { gizmoMode, gizmoSpace } = useEditorStore.getState();
+        drawGizmo2D(ctx, grp2d.pivotX, grp2d.pivotY, grp2d.pivotRz, 1, 1, grp2d.gw, grp2d.gh, gizmoMode, gizmoSpace, hoveredRef.current, gizmoScreenScaleRef.current);
+        gizmo2DHandleStateRef.current = { tf: { x: grp2d.pivotX, y: grp2d.pivotY, rz: grp2d.pivotRz, sx: 1, sy: 1 }, w: grp2d.gw, h: grp2d.gh, mode: gizmoMode, space: gizmoSpace, s: gizmoScreenScaleRef.current };
+      } else if (currentSelectedId !== null && selectedTf && !colliderEditing) {
         const { gizmoMode, gizmoSpace } = useEditorStore.getState();
         drawGizmo2D(
           ctx,
@@ -1873,6 +2114,7 @@ function registerScene2DGizmoHandles(getCanvas: () => HTMLCanvasElement | null, 
 function Scene2DChromeOverlay({ canvasEntityId, showBoundary = false, viewZoom = 1 }: { canvasEntityId: number; showBoundary?: boolean; viewZoom?: number }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dragRef = useRef<Gizmo2DDragState | null>(null);
+  const groupDragRef = useRef<Group2DDragState | null>(null);
   const hoveredRef = useRef<GizmoHandle | null>(null);
   const vertexDragRef = useRef<Collider2DVertexDrag | null>(null);
   const skinPaintStrokeRef = useRef<SkinPaintStrokeState | null>(null);
@@ -1890,6 +2132,11 @@ function Scene2DChromeOverlay({ canvasEntityId, showBoundary = false, viewZoom =
   const colliderEditMode = useEditorStore((s) => s.colliderEditMode);
   const skinWeightView = useEditorStore((s) => s.skinWeightView);
   useEffect(() => { mark2DDirty(); }, [selectedEntityId, colliderEditMode, skinWeightView, showBoundary, viewZoom]);
+  // Undo/redo writes traits via a direct entity.set, which does NOT fire the dirty broadcast that
+  // normally repaints the 2D view — so a reverted 2D transform would show stale until a refocus.
+  // Both gates are render-on-demand, so wake BOTH on any undo/redo: mark2DDirty repaints THIS
+  // chrome overlay (gizmo + outlines); editorMarkScene2DDirty repaints the Pixi CONTENT underneath.
+  useEffect(() => subscribeUndo(() => { mark2DDirty(); editorMarkScene2DDirty(); }), []);
 
   // Chrome draw loop — overlays only (Pixi draws content). Backing = the pooled Pixi canvas backing,
   // so overlays pixel-align with the Pixi content regardless of DPR/zoom.
@@ -1942,7 +2189,7 @@ function Scene2DChromeOverlay({ canvasEntityId, showBoundary = false, viewZoom =
 
   // Pick + gizmo/collider/paint interaction — same handlers, now targeting this chrome canvas.
   useEffect(() => {
-    const refs: Scene2DInteractionRefs = { dragRef, hoveredRef, vertexDragRef, skinPaintStrokeRef, paintCursorRef, lastEditClickRef };
+    const refs: Scene2DInteractionRefs = { dragRef, groupDragRef, hoveredRef, vertexDragRef, skinPaintStrokeRef, paintCursorRef, lastEditClickRef };
     return installScene2DInteraction(canvasEntityId, {
       getTargetEl: () => canvasRef.current,
       getScale: () => {
@@ -2271,6 +2518,39 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     let gizmoEntityId: number | null = null;
     let gizmoDragStart: { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number } | null = null;
 
+    // ── Multi-select group gizmo ──
+    // When >1 entity is selected the gizmo attaches to this empty PROXY parked at the group
+    // pivot (Unity's Center = selection centroid / Pivot = active entity's origin). Dragging
+    // it moves/rotates/scales EVERY member together via the pure applyGroupTransform3D math.
+    // `gizmoEntityId` is null while a group is attached — the group path keys off `groupDrag`.
+    const groupProxy = new THREE.Object3D();
+    groupProxy.name = 'groupGizmoProxy';
+    scene.add(groupProxy);
+    // Non-null only during an active group drag: the filtered top-level members (descendants
+    // of a selected parent dropped so each moves once), each member's start world matrix +
+    // LOCAL before-transform (for undo), and the proxy's start world matrix.
+    let groupDrag: {
+      members: { id: number; parentId: number; startWorld: THREE.Matrix4; before: Record<string, number> }[];
+      pivotStart: THREE.Matrix4;
+    } | null = null;
+    const _grpPos = new THREE.Vector3(), _grpQuat = new THREE.Quaternion(), _grpScale = new THREE.Vector3(), _grpEuler = new THREE.Euler();
+    const _trsQuat = new THREE.Quaternion(), _trsEuler = new THREE.Euler();
+    type WT = { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number };
+    const trsToMatrix = (t: WT, out: THREE.Matrix4) =>
+      out.compose(_grpPos.set(t.x, t.y, t.z), _trsQuat.setFromEuler(_trsEuler.set(t.rx, t.ry, t.rz)), _grpScale.set(t.sx, t.sy, t.sz));
+    /** Decompose a world Matrix4 → LOCAL TRS relative to a parent's world transform. */
+    const worldMatrixToLocal = (m: THREE.Matrix4, parentWorld: WT | null | undefined) => {
+      m.decompose(_grpPos, _grpQuat, _grpScale);
+      _grpEuler.setFromQuaternion(_grpQuat);
+      return worldToLocalTransform({ position: _grpPos, rotation: _grpEuler, scale: _grpScale }, parentWorld);
+    };
+    /** The selected entities that should actually be transformed: descendants of a selected
+     *  ancestor are dropped so a parent+child selection moves the child once (Unity). */
+    const groupMemberIds = (): number[] => filterOutDescendants(
+      useEditorStore.getState().selectedEntityIds,
+      (id) => { const e = findEntity(id); return e?.has(EntityAttributes) ? (e.get(EntityAttributes).parentId as number) : 0; },
+    );
+
     // ── 2.5D billboard bone posing ──
     // A Bone2D of a billboarded rig has NO Three object of its own — its only on-screen
     // presence is the deformed billboard mesh (built in scene3DSync). To pose it with the
@@ -2287,6 +2567,21 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
     // Capture transform before drag starts
     const onGizmoMouseDown = () => {
+      // Group drag: snapshot every member's start world matrix + local before-transform, and
+      // the proxy's start world matrix. Keyed off the proxy being the attached object.
+      if (gizmo.object === groupProxy) {
+        groupProxy.updateMatrixWorld(true);
+        const members = groupMemberIds().map((id) => {
+          const e = findEntity(id);
+          const parentId = e?.has(EntityAttributes) ? (e.get(EntityAttributes).parentId as number) : 0;
+          const w = worldTransforms.get(id) ?? { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 };
+          const tf = e?.has(Transform) ? e.get(Transform) : null;
+          const before: Record<string, number> = tf ? { x: tf.x, y: tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: tf.sx, sy: tf.sy, sz: tf.sz } : {};
+          return { id, parentId, startWorld: trsToMatrix(w, new THREE.Matrix4()), before };
+        });
+        groupDrag = { members, pivotStart: groupProxy.matrixWorld.clone() };
+        return;
+      }
       if (gizmoEntityId === null) return;
       const entity = findEntity(gizmoEntityId);
       if (!entity || !entity.has(Transform)) return;
@@ -2306,7 +2601,37 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     const onGizmoChange = () => {
       if (!(gizmo as any).dragging) return;
       const obj = gizmo.object;
-      if (!obj || gizmoEntityId === null) return;
+      if (!obj) return;
+
+      // Group (multi-select) drag: apply the proxy's world delta to every member via the pure
+      // cluster math, then convert each new world matrix back to that member's LOCAL Transform.
+      // Handled before the single-entity guards because a group drag leaves gizmoEntityId null.
+      if (obj === groupProxy) {
+        if (!groupDrag) return;
+        groupProxy.updateMatrixWorld(true);
+        const mode = gizmo.getMode() as 'translate' | 'rotate' | 'scale';
+        const news = applyGroupTransform3D({
+          memberStartWorld: groupDrag.members.map((m) => m.startWorld),
+          pivotStart: groupDrag.pivotStart,
+          pivotNow: groupProxy.matrixWorld,
+          mode,
+        });
+        groupDrag.members.forEach((m, i) => {
+          const e = findEntity(m.id);
+          if (!e || !e.has(Transform)) return;
+          const local = worldMatrixToLocal(news[i], m.parentId ? worldTransforms.get(m.parentId) : null);
+          const cur = e.get(Transform);
+          // Unlike the single-entity gizmo, a GROUP rotate/scale in Center mode moves each member's
+          // POSITION too (orbit / spread around the pivot) — so position must be written for every
+          // mode, not just translate. Rotation is written for rotate, scale for scale.
+          if (mode === 'translate') e.set(Transform, { ...cur, x: local.x, y: local.y, z: local.z });
+          else if (mode === 'rotate') e.set(Transform, { ...cur, x: local.x, y: local.y, z: local.z, rx: clampAngle(local.rx), ry: clampAngle(local.ry), rz: clampAngle(local.rz) });
+          else e.set(Transform, { ...cur, x: local.x, y: local.y, z: local.z, sx: local.sx, sy: local.sy, sz: local.sz });
+        });
+        fireDirtyListeners();
+        return;
+      }
+      if (gizmoEntityId === null) return;
 
       // Billboard bone: the proxy is a child of the billboard `flip` group, so its LOCAL
       // transform is in the rig's pixel space with Y flipped and rotation negated (the
@@ -2366,6 +2691,37 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
     // On drag end, push undo action
     const onGizmoMouseUp = () => {
+      // Group drag end: one batched undo step covering every member.
+      if (gizmo.object === groupProxy) {
+        if (!groupDrag) return;
+        const mode = gizmo.getMode();
+        // Position is included for every mode: a Center-mode group rotate/scale moves each
+        // member's position too (orbit/spread), so record mode must capture x/y/z as well.
+        const recFields = mode === 'translate' ? ['x', 'y', 'z']
+          : mode === 'rotate' ? ['x', 'y', 'z', 'rx', 'ry', 'rz'] : ['x', 'y', 'z', 'sx', 'sy', 'sz'];
+        const actions = groupDrag.members.map((m) => {
+          const e = findEntity(m.id);
+          if (!e || !e.has(Transform)) return null;
+          const tf = e.get(Transform);
+          const after = { x: tf.x, y: tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: tf.sx, sy: tf.sy, sz: tf.sz };
+          const ref = entityRef(m.id);
+          // Record-mode + prefab-override hooks per member (mirrors the single-entity path).
+          for (const k of recFields) {
+            notifyFieldEdited(m.id, 'Transform', k, (after as Record<string, number>)[k]);
+            markOverrideIfInstance(m.id, 'Transform', k);
+          }
+          return buildTransformUndoAction({
+            label: `Transform "${e.name || `Entity ${m.id}`}"`,
+            trait: Transform, resolve: () => ref.resolve(), findEntity, before: m.before, after,
+            entityGuid: ref.guid || String(m.id),
+          });
+        }).filter(Boolean) as ReturnType<typeof buildTransformUndoAction>[];
+        if (actions.length) {
+          pushAction(buildGroupTransformUndoAction(`Transform ${actions.length} entities`, actions));
+        }
+        groupDrag = null;
+        return;
+      }
       if (gizmoEntityId === null || !gizmoDragStart) return;
       const entity = findEntity(gizmoEntityId);
       if (!entity || !entity.has(Transform)) return;
@@ -2400,6 +2756,16 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
     // Capture-phase: route events manually to avoid OrbitControls/gizmo conflict
     function onPointerDownCapture(event: PointerEvent) {
+      // Shift + left-drag on the 3D viewport → marquee (box) select, ADDING to the selection.
+      // Start a potential marquee and suppress orbit for this drag; a real drag draws the rect
+      // (marqueeMove/Up below), a plain shift-click without travel falls through to the additive
+      // pick. This handler only runs in 3D view (`modeRef.current !== 'ui'`) — the 2D canvas has
+      // its own equivalent marquee, installed by installScene2DInteraction below.
+      if (event.button === 0 && event.shiftKey && modeRef.current !== 'ui') {
+        marquee = { x0: event.clientX, y0: event.clientY, moved: false, prevEnabled: controls.enabled };
+        controls.enabled = false;
+        return;
+      }
       if (!(gizmo as any).enabled || !(gizmo as any).visible) return;
 
       const r = renderer.domElement.getBoundingClientRect();
@@ -2460,13 +2826,74 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // was still a plain click. Window-level move/up so a drag that leaves the canvas still
     // cancels. (2D empty clicks fall through to this same handler — see the 2D onPointerDown.)
     const selectGesture = createSelectGesture();
+    // Modifier state captured at press-time (a plain release event doesn't carry the original
+    // keys). Shift or Ctrl/Cmd → additive/toggle multi-select, mirroring the Hierarchy panel.
+    let pendingMods = { additive: false, toggle: false };
     const onSelectMove = (ev: PointerEvent) => selectGesture.move(ev.clientX, ev.clientY);
     const onSelectUp = () => {
       const { clicked, entityId } = selectGesture.release();
-      if (clicked) useEditorStore.getState().selectEntity(entityId);
+      if (!clicked) return;
+      applyPickSelection(entityId, pendingMods);
     };
     window.addEventListener('pointermove', onSelectMove);
     window.addEventListener('pointerup', onSelectUp);
+
+    // ── Marquee (box) selection ──
+    // Shift + left-drag on empty 3D viewport space draws a rubber-band rect and ADDS every entity
+    // whose screen position falls inside it to the current selection. A DOM overlay (position:fixed,
+    // client-coords) draws the rect; orbit is suppressed for the drag (see onPointerDownCapture).
+    let marquee: { x0: number; y0: number; moved: boolean; prevEnabled: boolean } | null = null;
+    const MARQUEE_MIN_PX = 4;
+    const marqueeEl = document.createElement('div');
+    marqueeEl.style.cssText = 'position:fixed;border:1px solid #5a9fd4;background:rgba(90,159,212,0.15);pointer-events:none;z-index:9999;display:none;';
+    document.body.appendChild(marqueeEl);
+    const marqueeMove = (ev: PointerEvent) => {
+      if (!marquee) return;
+      if (!marquee.moved && Math.hypot(ev.clientX - marquee.x0, ev.clientY - marquee.y0) > MARQUEE_MIN_PX) {
+        marquee.moved = true; marqueeEl.style.display = 'block';
+      }
+      if (marquee.moved) {
+        const x = Math.min(marquee.x0, ev.clientX), y = Math.min(marquee.y0, ev.clientY);
+        marqueeEl.style.left = `${x}px`; marqueeEl.style.top = `${y}px`;
+        marqueeEl.style.width = `${Math.abs(ev.clientX - marquee.x0)}px`;
+        marqueeEl.style.height = `${Math.abs(ev.clientY - marquee.y0)}px`;
+      }
+    };
+    const _marqueeV = new THREE.Vector3();
+    const marqueeUp = (ev: PointerEvent) => {
+      if (!marquee) return;
+      const m = marquee; marquee = null;
+      marqueeEl.style.display = 'none';
+      controls.enabled = m.prevEnabled; // restore orbit
+      if (!m.moved) return; // a shift-click (no drag) → handled by the additive pick in onSelectUp
+      const rect = renderer.domElement.getBoundingClientRect();
+      const minX = Math.min(m.x0, ev.clientX), maxX = Math.max(m.x0, ev.clientX);
+      const minY = Math.min(m.y0, ev.clientY), maxY = Math.max(m.y0, ev.clientY);
+      const cam = activeEditorCam;
+      const inside: number[] = [];
+      const consider = (id: number, obj: THREE.Object3D | undefined) => {
+        if (!obj || deactivatedEntities.has(id)) return; // matches click-pick (Three's raycaster skips invisible/deactivated meshes)
+        obj.getWorldPosition(_marqueeV).project(cam);
+        if (_marqueeV.z > 1) return; // behind the camera / beyond the far plane
+        const sx = rect.left + (_marqueeV.x * 0.5 + 0.5) * rect.width;
+        const sy = rect.top + (-_marqueeV.y * 0.5 + 0.5) * rect.height;
+        if (sx >= minX && sx <= maxX && sy >= minY && sy <= maxY) inside.push(id);
+      };
+      // Same selectable set as click-picking (the `entries` array above `pick3D`): meshes, text,
+      // and flame groups are gated behind the `show3D` layer toggle; billboards + gizmos are not.
+      const { show3D } = layersRef.current;
+      if (show3D) for (const [id, obj] of renderState.ecsObjects) consider(id, obj);
+      for (const [id, e] of renderState.billboards) if (e.group.visible) consider(id, e.group);
+      if (show3D) for (const [id, e] of renderState.textMeshes) if (e.group.visible) consider(id, e.group);
+      for (const [id, obj] of ecsGizmos) consider(id, obj);
+      if (show3D) for (const [id, rec] of flameState.recs) consider(id, rec.group as THREE.Object3D);
+      if (inside.length === 0) return;
+      const cur = useEditorStore.getState().selectedEntityIds;
+      const union = Array.from(new Set([...cur, ...inside]));
+      useEditorStore.getState().setSelectedEntities(union, inside[inside.length - 1]);
+    };
+    window.addEventListener('pointermove', marqueeMove);
+    window.addEventListener('pointerup', marqueeUp);
 
     // Selection raycast on pointer down (runs after TransformControls/OrbitControls native handlers)
     function onPointerDown(event: PointerEvent) {
@@ -2508,6 +2935,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         ...Array.from(ecsGizmos, ([id, object]) => ({ id, object })),
       ];
       const hitId = pick3D(mx, my, activeCam, entries, raycaster);
+      // Capture the multi-select modifiers now — the deferred pointer-up event won't carry them.
+      pendingMods = { additive: event.shiftKey, toggle: event.metaKey || event.ctrlKey };
       // Defer the selection change to pointer-up (committed by onSelectUp iff the gesture
       // stayed a click). A press is only a pick once we know it wasn't an orbit/pan — and
       // that's true whether it landed on an entity (hitId) or on empty space (null).
@@ -2695,6 +3124,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
     // ── ECS Entity Meshes (3D only) ─────────────────────
     const renderState = createRenderState();
+    setEcsObjectsRegistry(renderState.ecsObjects); // E2E observation (collider-only mode etc.)
     const unsubInvalidation = attachInvalidationListener(renderState, scene);
     // Publish this editor surface to the material broker so MaterialInstance drives
     // materials in the SceneView too (keeps it in sync with GameView).
@@ -3098,6 +3528,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
       // Sync ECS environment (shared runtime logic)
       syncEnvironment(getCurrentWorld(), scene);
+      syncFog(getCurrentWorld(), scene);
       // WebGPU render-on-demand: a change to scene.environmentIntensity isn't monitored
       // by three's NodeMaterialObserver, so on this static-camera surface the env uniform
       // stays stale on some meshes until the camera moves. When it changes, trip the
@@ -3529,7 +3960,43 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         : (selectedId !== null
             ? (renderState.ecsObjects.get(selectedId) || renderState.textMeshes.get(selectedId)?.group || ecsGizmos.get(selectedId) || flameState.recs.get(selectedId)?.group)
             : null);
-      if (selectedId !== null && selObj) {
+      // ── Multi-select: attach to the group pivot proxy ──
+      // >1 entity selected (and not the bone special-case) → drive the whole cluster. Park the
+      // proxy at the pivot (Unity Center = centroid / Pivot = active origin), oriented by the
+      // active member for Local space, then attach the gizmo to it. The group drag path
+      // (onGizmoMouseDown/Change/Up) reads the proxy and writes every member.
+      const multiSel = useEditorStore.getState().selectedEntityIds.length > 1 && !boneGizmo;
+      if (multiSel) {
+        // Don't fight an in-progress drag of the proxy (the gizmo owns it then).
+        if (!((gizmo as any).dragging && gizmo.object === groupProxy)) {
+          const pivotMode = useEditorStore.getState().gizmoPivot;
+          let px = 0, py = 0, pz = 0;
+          if (pivotMode === 'center') {
+            let n = 0;
+            for (const id of groupMemberIds()) { const w = worldTransforms.get(id); if (w) { px += w.x; py += w.y; pz += w.z; n++; } }
+            if (n) { px /= n; py /= n; pz /= n; }
+          } else {
+            const w = selectedId !== null ? worldTransforms.get(selectedId) : null;
+            if (w) { px = w.x; py = w.y; pz = w.z; }
+          }
+          groupProxy.position.set(px, py, pz);
+          // Local space orients the handles by the active member's world rotation; world = axis-aligned.
+          if (gizmoSpace === 'local' && selectedId !== null) {
+            const w = worldTransforms.get(selectedId);
+            groupProxy.rotation.set(w?.rx ?? 0, w?.ry ?? 0, w?.rz ?? 0);
+          } else {
+            groupProxy.rotation.set(0, 0, 0);
+          }
+          groupProxy.scale.set(1, 1, 1);
+          groupProxy.updateMatrixWorld(true);
+        }
+        if (gizmo.object !== groupProxy) gizmo.attach(groupProxy);
+        gizmo.setSpace(gizmoSpace);
+        gizmoEntityId = null; // group path keys off `groupDrag`, not `gizmoEntityId`
+        gizmo.showX = gizmo.showY = gizmo.showZ = true;
+        (gizmo as any).visible = true;
+        gizmo.enabled = true;
+      } else if (selectedId !== null && selObj) {
         if (gizmo.object !== selObj) gizmo.attach(selObj);
         // Keep the write-back identity in sync with the SELECTION every frame, not just
         // when `gizmo.object` changes: all bones of one rig share `boneProxy`, so a
@@ -3565,49 +4032,57 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         gizmo.enabled = false;
       }
 
-      if (selectedId !== null) {
-        const outline = outlineMeshes.get(selectedId);
-
-        // A CameraFrame owns its own on-screen representation: the teal frameBox
-        // wireframe when showGizmo is on, or the small empty marker when off — and the
-        // transform gizmo is attached to it either way. A yellow EdgesGeometry outline
-        // on top is redundant (a second box). It's also buggy: `selObj` here is that
-        // gizmo mesh, and the outline geometry is cached from whatever the gizmo slot
-        // held when it was first built, never rebuilt when the slot swaps marker↔frameBox
-        // — so the two boxes end up different sizes. Skip the outline for CameraFrame
-        // entities entirely and drop any stale one.
-        const selEnt = findEntity(selectedId);
-        const isCameraFrame = !!selEnt && selEnt.isAlive() && selEnt.has(CameraFrame);
-        if (isCameraFrame && outline) {
-          outline.removeFromParent();
-          outline.geometry.dispose();
-          (outline.material as THREE.Material).dispose();
-          outlineMeshes.delete(selectedId);
+      // Bright selection outline for EVERY selected member: the primary (active) entity in
+      // yellow, the other members in orange, so a multi-selection reads as a group with a
+      // distinct active one (mirrors the Hierarchy panel's primary-vs-member styling).
+      const selIds = useEditorStore.getState().selectedEntityIds;
+      const selIdSet = new Set(selIds);
+      const wantOutline = new Set<number>();
+      const OUTLINE_PRIMARY = 0xf1c40f, OUTLINE_MEMBER = 0xe67e22;
+      const buildOutline = (id: number, obj: THREE.Object3D | null | undefined, color: number) => {
+        // A CameraFrame owns its own on-screen representation (teal frameBox / empty marker)
+        // and the gizmo attaches to it either way — a yellow EdgesGeometry box on top is
+        // redundant AND buggy (the cached geometry never rebuilds when the slot swaps
+        // marker↔frameBox, so the boxes drift in size). Skip it and drop any stale outline.
+        const ent = findEntity(id);
+        const isCameraFrame = !!ent && ent.isAlive() && ent.has(CameraFrame);
+        const existing = outlineMeshes.get(id);
+        // Only outline objects that actually have geometry. Camera/Light/Environment gizmos
+        // and mesh-less empties resolve to bare Object3D pivots; passing their (undefined)
+        // geometry to EdgesGeometry yields a positionless BufferGeometry that makes WebGPU's
+        // NodeMaterial spam "AttributeNode: Vertex attribute 'position' not found" every frame.
+        const geo = isCameraFrame ? undefined : outlineSourceGeometry(obj);
+        if (!obj || !geo) {
+          if (existing) { existing.removeFromParent(); existing.geometry.dispose(); (existing.material as THREE.Material).dispose(); outlineMeshes.delete(id); }
+          return;
         }
-
-        // Only build an outline for objects that actually have geometry.
-        // Camera/Light/Environment gizmos resolve to bare Object3D pivots; passing
-        // their (undefined) geometry to EdgesGeometry yields a positionless
-        // BufferGeometry that makes WebGPU's NodeMaterial spam "AttributeNode:
-        // Vertex attribute 'position' not found" every frame. A LOD-baked model is
-        // the other shape here — see outlineSourceGeometry.
-        const selGeo = outlineSourceGeometry(selObj);
-        if (selObj && !isCameraFrame && !outline && selGeo) {
-          const edges = new THREE.EdgesGeometry(selGeo);
-          const newOutline = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0xf1c40f }));
-          scene.add(newOutline);
-          outlineMeshes.set(selectedId, newOutline);
+        wantOutline.add(id);
+        let outline = existing;
+        if (!outline) {
+          const edges = new THREE.EdgesGeometry(geo);
+          outline = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color }));
+          scene.add(outline);
+          outlineMeshes.set(id, outline);
         }
-        if (selObj && outline && !isCameraFrame) {
-          outline.position.copy(selObj.position);
-          outline.rotation.copy(selObj.rotation);
-          outline.scale.copy(selObj.scale);
-        }
-
-        // 2D entity selection outline is drawn by the Scene2DChromeOverlay (drawScene2D)
+        // Recolour in place so a primary↔member role swap (active-entity change) updates
+        // without a rebuild — the geometry is cached per id, only the tint changes.
+        (outline.material as THREE.LineBasicMaterial).color.setHex(color);
+        outline.position.copy(obj.position);
+        outline.rotation.copy(obj.rotation);
+        outline.scale.copy(obj.scale);
+      };
+      // Primary uses the richly-resolved selObj (billboard/bone-aware); the other members use
+      // a plain object resolve (they can never be the bone/billboard-proxy special case).
+      if (selectedId !== null) buildOutline(selectedId, selObj, OUTLINE_PRIMARY);
+      for (const id of selIds) {
+        if (id === selectedId) continue;
+        const obj = renderState.ecsObjects.get(id) || renderState.textMeshes.get(id)?.group
+          || renderState.billboards.get(id)?.group || ecsGizmos.get(id) || flameState.recs.get(id)?.group;
+        buildOutline(id, obj, OUTLINE_MEMBER);
       }
+      // 2D entity selection outline is drawn by the Scene2DChromeOverlay (drawScene2D).
       for (const [id, outline] of outlineMeshes) {
-        if (id !== selectedId) {
+        if (!wantOutline.has(id)) {
           outline.removeFromParent();
           outline.geometry.dispose();
           (outline.material as THREE.Material).dispose();
@@ -3630,6 +4105,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         const subtree = subtreeIds(getAllEntities(), selectedId);
         for (let i = 1; i < subtree.length; i++) { // skip index 0 = the selected root
           const id = subtree[i];
+          if (selIdSet.has(id)) continue; // an explicitly-selected member already has a bright outline
           const obj = renderState.ecsObjects.get(id)
             || renderState.textMeshes.get(id)?.group
             || renderState.billboards.get(id)?.group
@@ -3660,11 +4136,15 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
       // ── Collider3D wireframe gizmos (3D mode) ──
       // The SELECTED entity's collider is always outlined (green). With the "Colliders" toggle
-      // on, EVERY Collider3D is outlined too (amber) — so generated/child colliders (field rim
-      // walls, fences, enemy bodies) are visible for debugging without selecting each. Edges
-      // match the collider shape/dims and follow the entity's WORLD pose; primitive colliders
-      // ignore Transform.scale (dims are absolute) → scale=1, mesh (convex/trimesh) colliders
-      // bake scale → follow world scale. Rebuilt only when the shape/colour signature changes.
+      // on, EVERY Collider3D is outlined too (purple) AND regular meshes are hidden (below) —
+      // so generated/child colliders (field rim walls, fences, enemy bodies) are visible for
+      // debugging without selecting each. Edges match the collider shape/dims and follow the
+      // entity's WORLD pose; primitive colliders scale via colliderWorldScale3D — mirroring
+      // physics3DSystem's makeColliderDesc (box per-axis, sphere/capsule/cylinder/cone by mean
+      // radius) — so a scaled floor/wall's wireframe matches its TRUE (scaled) collider instead
+      // of a fixed unscaled box buried inside the visual mesh. Mesh (convex/trimesh) colliders
+      // bake scale → follow world scale directly. Rebuilt only when the shape/colour signature
+      // changes.
       if (modeRef.current !== 'ui') {
         const wantCollider = new Set<number>();
         const drawCollider = (id: number, color: number) => {
@@ -3697,14 +4177,17 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           if (wt) {
             wire.position.set(wt.x, wt.y, wt.z);
             wire.rotation.set(wt.rx, wt.ry, wt.rz);
-            wire.scale.set(isMesh ? (wt.sx || 1) : 1, isMesh ? (wt.sy || 1) : 1, isMesh ? (wt.sz || 1) : 1);
+            const s = isMesh
+              ? [wt.sx || 1, wt.sy || 1, wt.sz || 1]
+              : colliderWorldScale3D(c.shape, wt.sx || 1, wt.sy || 1, wt.sz || 1);
+            wire.scale.set(s[0], s[1], s[2]);
           }
         };
-        // Bulk set first (amber); the selected entity overrides to green (drawn last so it wins).
+        // Bulk set first (purple); the selected entity overrides to green (drawn last so it wins).
         if (showCollidersRef.current) {
           getCurrentWorld().query(Collider3D).updateEach((_t: unknown[], entity) => {
             const id = entity.id();
-            if (id !== selectedId) drawCollider(id, 0xe0a030);
+            if (id !== selectedId) drawCollider(id, 0x9b59b6);
           });
         }
         if (selectedId !== null) drawCollider(selectedId, 0x2ecc71);
@@ -3757,8 +4240,12 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       if (!isUI) syncFlameMeshes(getCurrentWorld(), scene, flameState);
       else if (flameState.recs.size) disposeFlameMeshSyncState(flameState, scene);
 
-      // Layer visibility
-      for (const [, mesh] of renderState.ecsObjects) mesh.visible = show3D;
+      // Layer visibility. In collider-only mode (3D), regular meshes are hidden entirely so
+      // the purple collider wireframes read cleanly — including for entities whose collider
+      // shape (convex/trimesh) is derived from this same mesh's geometry (see drawCollider
+      // above: outlineSourceGeometry reads the object's geometry regardless of .visible).
+      const hideMeshesForColliderMode = shouldHideMeshesForColliderMode(modeRef.current, showCollidersRef.current);
+      for (const [, mesh] of renderState.ecsObjects) mesh.visible = show3D && !hideMeshesForColliderMode;
 
       // UI-mode backdrop = the Camera's clearColor, matching GameView's
       // syncCamera (F3). The env block above leaves a dark editor bg
@@ -3828,6 +4315,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       unregisterFocusHandler();
       unregisterViewportController();
       setEditorViewportCamera(null); // drop the dangling reference to the disposed camera
+      setEcsObjectsRegistry(null); // drop the dangling reference to the disposed renderState
       unsubSwap();
       unsubInvalidation();
       unregisterSurface();
@@ -3840,6 +4328,9 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('pointermove', onSelectMove);
       window.removeEventListener('pointerup', onSelectUp);
+      window.removeEventListener('pointermove', marqueeMove);
+      window.removeEventListener('pointerup', marqueeUp);
+      marqueeEl.remove();
       unregisterFrameCallback(editorFrameKey);
       stopFrameDriver();
       controls.removeEventListener('change', markViewportDirty);
@@ -3854,6 +4345,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       gizmo.removeEventListener('change', onGizmoChange);
       gizmo.removeEventListener('mouseUp', onGizmoMouseUp);
       if (boneProxy.parent) boneProxy.parent.remove(boneProxy); // billboard bone-gizmo proxy
+      scene.remove(groupProxy); // multi-select group-gizmo pivot proxy
       scene.remove(gizmoHelper); // F5: explicit detach, independent of scene.clear() below
       gizmo.dispose();
       disposeRenderState(renderState, scene, true);

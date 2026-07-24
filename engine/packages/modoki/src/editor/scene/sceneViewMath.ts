@@ -387,6 +387,13 @@ export function outlineSourceGeometry(
  *  instead of slamming the near plane into it. */
 export const FOCUS_DEFAULT_RADIUS = 1;
 
+/** Collider-only mode: regular mesh rendering hides whenever the "Colliders" toolbar toggle
+ *  is on, in the 3D viewport (never in UI mode, which has no Collider3D gizmos to show in
+ *  its place). Extracted so the gating rule is unit-testable independent of the render loop. */
+export function shouldHideMeshesForColliderMode(mode: '3d' | 'ui', showColliders: boolean): boolean {
+  return mode !== 'ui' && showColliders;
+}
+
 /** What the F-key frames for one entity, in priority order:
  *
  *   1. **Meshes** — the union world-AABB of the entity's own renderable AND every

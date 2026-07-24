@@ -23,6 +23,15 @@
         "Renderable2D": { "sprite": "", "color": 15158332, "width": 240, "height": 240, "pivotX": 0.5, "pivotY": 0.5, "keepAspect": false, "isVisible": true },
         "EntityAttributes": { "name": "CenterSprite", "isActive": true, "sortOrder": 1, "parentId": 1, "layer": "2d" }
       }
+    },
+    {
+      "id": 3,
+      "name": "OffsetSprite",
+      "traits": {
+        "Transform": { "x": 540, "y": 660, "z": 0, "rx": 0, "ry": 0, "rz": 0, "sx": 1, "sy": 1, "sz": 1 },
+        "Renderable2D": { "sprite": "", "color": 3447003, "width": 160, "height": 160, "pivotX": 0.5, "pivotY": 0.5, "keepAspect": false, "isVisible": true },
+        "EntityAttributes": { "name": "OffsetSprite", "isActive": true, "sortOrder": 2, "parentId": 1, "layer": "2d" }
+      }
     }
   ]
 }

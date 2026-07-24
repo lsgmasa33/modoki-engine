@@ -42,6 +42,9 @@ export { importModel } from './scene/modelImport';
 export { useEditorStore } from './store/editorStore';
 export type { SelectedAsset } from './store/editorStore';
 export { upsertKey, findTrack, encodeValue, relativeEntityPath } from './animation/recording';
+export {
+  registerCreatableAsset, unregisterCreatableAsset, getCreatableAssets, type CreatableAssetDef,
+} from './panels/creatableAssets';
 
 // C7: agents must address entities by GUID (runtime ids are reassigned on every scene
 // hot-reload), so the ops that CREATE entities have to be able to hand one back.

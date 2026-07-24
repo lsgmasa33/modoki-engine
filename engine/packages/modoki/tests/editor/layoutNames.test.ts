@@ -6,7 +6,7 @@
 
 import { describe, it, expect } from 'vitest';
 import {
-  AUTOSAVE_NAME, isLayoutJson, sanitizeLayoutName, deriveLayoutBaseName,
+  AUTOSAVE_NAME, isLayoutJson, sanitizeLayoutName, deriveLayoutBaseName, sanitizeExportFileName,
 } from '../../src/editor/utils/layoutNames';
 
 describe('isLayoutJson guard', () => {
@@ -61,5 +61,21 @@ describe('deriveLayoutBaseName', () => {
   it('falls back to "imported" when the stem is the reserved autosave name', () => {
     expect(deriveLayoutBaseName('autosave.layout.json')).toBe('imported');
     expect(deriveLayoutBaseName('autosave.json')).toBe('imported');
+  });
+});
+
+describe('sanitizeExportFileName', () => {
+  it('sanitizes like sanitizeLayoutName but does NOT reject the reserved autosave name', () => {
+    // Unlike a write into the named-layout store, downloading a file named
+    // "autosave.layout.json" is harmless — it isn't writing into the reserved slot.
+    expect(sanitizeExportFileName(AUTOSAVE_NAME)).toBe('autosave');
+    expect(sanitizeExportFileName('  autosave  ')).toBe('autosave');
+  });
+  it('trims and passes a clean name through', () => {
+    expect(sanitizeExportFileName('  My Layout 2  ')).toBe('My-Layout-2');
+  });
+  it('falls back to "layout" for empty / all-illegal input', () => {
+    expect(sanitizeExportFileName('')).toBe('layout');
+    expect(sanitizeExportFileName('///')).toBe('layout');
   });
 });

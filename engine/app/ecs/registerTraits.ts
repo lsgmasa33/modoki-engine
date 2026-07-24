@@ -3,7 +3,7 @@
 
 import { registerTrait, type FieldHint } from '@modoki/engine/runtime';
 import {
-  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, ModelSource,
+  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
   UIElement, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, Animator, SpriteAnimator,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
@@ -46,7 +46,7 @@ const ONSEQUENCE_FIELDS: Record<string, FieldHint> = {
 //   10   Transform
 //   20   Camera
 //   30s  Rendering (Renderable3D/Primitive/2D, ModelSource, ParticleEmitter, Tint)
-//   40s  Lighting (Light, Environment)
+//   40s  Lighting (Light, Environment, Fog)
 //   50   Animation (Rotate3D)
 //   60s  UI (UIElement, UIAnchor, UIBinding, UIAction, Canvas2D)
 //   70s  Audio (AudioSource, AudioListener)
@@ -757,6 +757,20 @@ export function registerAllTraits() {
       showAsBackground: { type: 'boolean' },
       backgroundIntensity: { type: 'number', step: 0.1 },
       backgroundBlurriness: { type: 'number', step: 0.05 },
+    },
+  });
+
+  registerTrait({
+    name: 'Fog', trait: Fog, category: 'component', componentCategory: 'Lighting',
+    priority: 42,
+    fields: {
+      enabled: { type: 'boolean', tooltip: 'Enable fog for this scene (first active Fog entity wins).' },
+      mode: { type: 'enum', options: ['linear', 'exponential', 'height'], tooltip: 'linear = fades between Near/Far distances. exponential = density-based falloff (denser = fades sooner). height = density-based falloff below a world-Y ceiling (fog pools in low ground, clear above).' },
+      color: { type: 'color', tooltip: 'Fog color, blended over distant/fogged surfaces.' },
+      near: { type: 'number', step: 1, min: 0, showWhen: { mode: ['linear'] }, tooltip: 'Distance (world units) where fog starts.' },
+      far: { type: 'number', step: 1, min: 0, showWhen: { mode: ['linear'] }, tooltip: 'Distance (world units) where fog reaches full color.' },
+      density: { type: 'number', step: 0.001, min: 0, max: 1, showWhen: { mode: ['exponential', 'height'] }, tooltip: 'Fog thickness. Higher = fog closes in sooner. Rule of thumb: density ≈ 1 / typical viewing distance — a small scene (a few world units) needs a much higher density than the 0.02 default, which is tuned for scenes spanning hundreds of units. In height mode this is EXTRA sensitive: the fog factor scales with (viewing distance × depth below Height), so a camera 20+ units out saturates fully even at density 0.3 — start much lower (~0.02–0.05) and raise slowly.' },
+      height: { type: 'number', step: 0.5, showWhen: { mode: ['height'] }, tooltip: 'World-Y fog ceiling. Geometry BELOW this height fogs (denser the lower + farther); geometry above it stays clear. Requires a Y-up scene.' },
     },
   });
 

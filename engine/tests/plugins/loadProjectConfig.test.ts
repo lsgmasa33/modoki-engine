@@ -52,11 +52,25 @@ describe('loadProjectConfig', () => {
     expect(cfg.app.appId).toBe(DEFAULT_PROJECT_CONFIG.app.appId);
   });
 
-  it('defaults build.debugBridge to false (release ships no eval-capable bridge)', () => {
+  it('defaults build.debugBuild to false (release ships no journal/debug menu/eval-capable bridge)', () => {
     // Absent from an existing config → the safe default. A game opts in explicitly.
-    expect(loadProjectConfig(root).build.debugBridge).toBe(false);
-    fs.writeFileSync(configPath(), JSON.stringify({ build: { debugBridge: true } }));
-    expect(loadProjectConfig(root).build.debugBridge).toBe(true);
+    expect(loadProjectConfig(root).build.debugBuild).toBe(false);
+    fs.writeFileSync(configPath(), JSON.stringify({ build: { debugBuild: true } }));
+    expect(loadProjectConfig(root).build.debugBuild).toBe(true);
+  });
+
+  it('silently resolves debugBuild to false when only the pre-consolidation legacy keys are ' +
+     'present (enableDebugMenu/debugBridge/enableJournal) — REGRESSION: games/ota-test shipped ' +
+     'with exactly this config (missed the 7c781a61 flag-consolidation migration) and had its ' +
+     'debug menu + game-debug MCP silently disabled on-device until this was caught. The plain ' +
+     'shallow-spread merge has no back-compat fallback for these keys, so this is the CURRENT, ' +
+     'pinned behavior (a project.config.json must be migrated to `debugBuild`, not just carry the ' +
+     'old keys) — not a fix. If this test starts failing because a back-compat shim was added, ' +
+     'that is an intentional, welcome change; update this test to match.', () => {
+    fs.writeFileSync(configPath(), JSON.stringify({
+      build: { enableDebugMenu: true, debugBridge: true, enableJournal: false },
+    }));
+    expect(loadProjectConfig(root).build.debugBuild).toBe(false);
   });
 
   it('deep-merges nested rendering/physics sections without wiping siblings', () => {

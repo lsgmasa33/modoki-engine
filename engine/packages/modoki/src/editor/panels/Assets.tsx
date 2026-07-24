@@ -22,15 +22,10 @@ import {
   reimportTargets, planImports, refreshHandlerTypes, HANDLER_TYPES,
 } from './assetOps';
 import { isTextAsset, makeDeleteUndo, makeDuplicateUndo, type Snapshot, type DeleteResult, type DupResult } from './assetUndo';
-import { newGuid, registerAsset } from '../../runtime/loaders/assetManifest';
+import { newGuid, registerAsset, type AssetType } from '../../runtime/loaders/assetManifest';
+import { getCreatableAssets, type CreatableAssetDef } from './creatableAssets';
 import { reimportPaths } from './assetViews/reimport';
-import { defaultAnimationClip } from '../../runtime/animation/types';
-import { defaultParticleEffect } from '../../runtime/particles/types';
-import { defaultAssetData } from '../../runtime/assets/assetSchemas';
-import { newScene, saveScene, setCurrentScenePath } from '../scene/serialize';
-import { findEntity } from '../../runtime/ecs/entityUtils';
 import { openAssetInEditor } from './openAssetInEditor';
-import { getTraitByName } from '../../runtime/ecs/traitRegistry';
 import { saveAssetDialog } from '../utils/saveDialog';
 
 /** Display name from an asset path: last segment minus a known double/single extension. */
@@ -930,121 +925,30 @@ export default function Assets() {
     await openAssetInEditor({ path: a.path, type: a.type, name: a.name });
   }, []);
 
-  /** Create a new `.anim.json` clip — native Save dialog picks the location — then open it. */
-  const createAnimationClip = useCallback(async (folder?: string) => {
-    const path = await saveAssetDialog({ defaultName: 'New Animation.anim.json', ext: '.anim.json', defaultFolder: folder, prompt: 'Create Animation Clip' });
-    if (!path) return;
-    const name = assetDisplayName(path, '.anim.json');
-    const guid = newGuid();
-    const ok = await writeFile(path, JSON.stringify(defaultAnimationClip(guid, name), null, 2));
-    if (!ok) { console.error(`[Assets] Failed to write ${path}`); return; }
-    registerAsset(guid, path, 'animation');
-    refresh();
-    // Open immediately, bound to the currently-selected Animator entity if any.
-    const animMeta = getTraitByName('Animator');
-    const sel = useEditorStore.getState().selectedEntityId;
-    const ent = sel != null ? findEntity(sel) : null;
-    const rootId = ent && animMeta && ent.has(animMeta.trait) ? sel : null;
-    useEditorStore.getState().openAnimationEditor({ path, type: 'animation', name }, rootId);
-  }, []);
-
-  /** Create a new `.particle.json` effect — native Save dialog picks the location — then open it. */
-  const createParticle = useCallback(async (folder?: string) => {
-    const path = await saveAssetDialog({ defaultName: 'New Particle.particle.json', ext: '.particle.json', defaultFolder: folder, prompt: 'Create Particle Effect' });
+  /** Generic driver for every registered `CreatableAssetDef` (creatableAssets.ts) — the
+   *  shared "New X" flow that used to be duplicated per asset kind: native Save dialog
+   *  picks the location → mint a guid → either run `def.create` fully (Scene) or write
+   *  `def.body`'s JSON + `registerAsset` → refresh the panel → `def.onCreated` opens the
+   *  right editor / selects the new asset. `folder` (a right-clicked folder path) wins
+   *  over the def's own `defaultFolder`. */
+  const runCreate = useCallback(async (def: CreatableAssetDef, folder?: string) => {
+    const path = await saveAssetDialog({
+      defaultName: def.defaultName + def.ext, ext: def.ext,
+      defaultFolder: folder ?? def.defaultFolder, prompt: def.prompt ?? def.label,
+    });
     if (!path) return;
     const guid = newGuid();
-    const def = { ...defaultParticleEffect(), id: guid };
-    const ok = await writeFile(path, JSON.stringify(def, null, 2));
-    if (!ok) { console.error(`[Assets] Failed to write ${path}`); return; }
-    registerAsset(guid, path, 'particle');
+    const name = assetDisplayName(path, def.ext);
+    if (def.create) {
+      await def.create(path);
+    } else {
+      const body = def.body ? def.body(guid, name) : { id: guid };
+      const ok = await writeFile(path, JSON.stringify(body, null, 2));
+      if (!ok) { console.error(`[Assets] Failed to write ${path}`); return; }
+      registerAsset(guid, path, def.assetType as AssetType);
+    }
     refresh();
-    useEditorStore.getState().openParticleEditor({ path, type: 'particle', name: assetDisplayName(path, '.particle.json') });
-  }, []);
-
-  /** Create a new empty `.atlas.json` — native Save dialog picks the location, then
-   *  select it so the Atlas inspector opens (add members + Pack there). */
-  const createAtlas = useCallback(async (folder?: string) => {
-    const path = await saveAssetDialog({ defaultName: 'New Atlas.atlas.json', ext: '.atlas.json', defaultFolder: folder, prompt: 'Create Sprite Atlas' });
-    if (!path) return;
-    const guid = newGuid();
-    const def = { id: guid, version: 1, members: [], pageSize: 1024, padding: 2, extrude: 1 };
-    const ok = await writeFile(path, JSON.stringify(def, null, 2));
-    if (!ok) { console.error(`[Assets] Failed to write ${path}`); return; }
-    registerAsset(guid, path, 'atlas');
-    refresh();
-    useEditorStore.getState().selectAsset({ path, type: 'atlas', name: assetDisplayName(path, '.atlas.json') });
-  }, []);
-
-  /** Create a new `.mat.json` material — native Save dialog picks the location —
-   *  then select it so the Material inspector opens. */
-  const createMaterial = useCallback(async (folder?: string) => {
-    const path = await saveAssetDialog({ defaultName: 'New Material.mat.json', ext: '.mat.json', defaultFolder: folder, prompt: 'Create Material' });
-    if (!path) return;
-    const guid = newGuid();
-    // `id` first so a fresh guid is stamped even though defaultMaterial() has no id.
-    const def = { id: guid, ...(defaultAssetData('material') as Record<string, unknown>) };
-    const ok = await writeFile(path, JSON.stringify(def, null, 2));
-    if (!ok) { console.error(`[Assets] Failed to write ${path}`); return; }
-    registerAsset(guid, path, 'material');
-    refresh();
-    useEditorStore.getState().selectAsset({ path, type: 'material', name: assetDisplayName(path, '.mat.json') });
-  }, []);
-
-  /** Create a new empty `.animset.json` — native Save dialog picks the location —
-   *  then select it so the AnimSet inspector opens (add clips there). */
-  const createAnimSet = useCallback(async (folder?: string) => {
-    const path = await saveAssetDialog({ defaultName: 'New Animset.animset.json', ext: '.animset.json', defaultFolder: folder, prompt: 'Create Animset' });
-    if (!path) return;
-    const guid = newGuid();
-    const def = { id: guid, clips: [] };
-    const ok = await writeFile(path, JSON.stringify(def, null, 2));
-    if (!ok) { console.error(`[Assets] Failed to write ${path}`); return; }
-    registerAsset(guid, path, 'animset');
-    refresh();
-    useEditorStore.getState().selectAsset({ path, type: 'animset', name: assetDisplayName(path, '.animset.json') });
-  }, []);
-
-  /** Create a new `.spriteanim.json` (a named set of flipbook clips) — native Save
-   *  dialog picks the location — then open it in the SpriteAnim Editor panel. */
-  const createSpriteAnim = useCallback(async (folder?: string) => {
-    const path = await saveAssetDialog({ defaultName: 'New Sprite Animation.spriteanim.json', ext: '.spriteanim.json', defaultFolder: folder, prompt: 'Create Sprite Animation' });
-    if (!path) return;
-    const guid = newGuid();
-    const def = { id: guid, ...(defaultAssetData('spriteanim') as Record<string, unknown>) };
-    const ok = await writeFile(path, JSON.stringify(def, null, 2));
-    if (!ok) { console.error(`[Assets] Failed to write ${path}`); return; }
-    registerAsset(guid, path, 'spriteanim');
-    refresh();
-    useEditorStore.getState().openSpriteAnimEditor({ path, type: 'spriteanim', name: assetDisplayName(path, '.spriteanim.json') });
-  }, []);
-
-  /** Create a new `.rig2d.json` (2D skinning rig) — native Save dialog picks the
-   *  location — then open it in the Skin Editor panel. Seeds a single `root` bone +
-   *  empty mesh (same minimal shape as the Skin Editor's own "New Rig"). */
-  const createRig2D = useCallback(async (folder?: string) => {
-    const path = await saveAssetDialog({ defaultName: 'New Rig.rig2d.json', ext: '.rig2d.json', defaultFolder: folder, prompt: 'Create 2D Rig' });
-    if (!path) return;
-    const guid = newGuid();
-    const def = { id: guid, sprite: '', bones: [{ name: 'root', parent: -1, x: 0, y: 0, rot: 0 }], mesh: { verts: [], uvs: [], tris: [] }, skinIndices: [], skinWeights: [] };
-    const ok = await writeFile(path, JSON.stringify(def, null, 2));
-    if (!ok) { console.error(`[Assets] Failed to write ${path}`); return; }
-    registerAsset(guid, path, 'rig2d');
-    refresh();
-    useEditorStore.getState().openSkinEditor({ path, type: 'rig2d', name: assetDisplayName(path, '.rig2d.json') });
-  }, []);
-
-  /** Create a new scene file (default content: Camera + white-HDR Environment, via
-   *  newScene) at the chosen folder and switch to it. This replaces the old
-   *  File → New Scene, persisted to disk. Dialog first so a cancel leaves the
-   *  current world untouched. */
-  const createScene = useCallback(async (folder?: string) => {
-    const path = await saveAssetDialog({ defaultName: 'New Scene.json', ext: '.json', defaultFolder: folder ?? '/assets/scenes', prompt: 'Create Scene' });
-    if (!path) return;
-    newScene();
-    useEditorStore.getState().selectEntity(null);
-    setCurrentScenePath(path);
-    await saveScene();
-    refresh();
+    def.onCreated?.({ path, name, guid });
   }, [refresh]);
 
   const handleContextMenu = useCallback((e: React.MouseEvent, asset: AssetEntry) => {
@@ -1851,6 +1755,11 @@ export default function Assets() {
         onDragOver={handleDragOver}
         onDrop={(e) => handleDrop(e, viewMode === 'folder' ? assetsRoot.path : undefined)}
         onClick={(e) => { if (e.target === e.currentTarget) clearSelection(); }}
+        // Right-clicking empty background (either view) reaches the Create menu — it used
+        // to be reachable ONLY via a folder row's context menu, so category view (which has
+        // no folder rows) had no way to create anything. Targets defaultTargetFolder() (the
+        // same fallback chain a toolbar "New" action would use), not a specific folder.
+        onContextMenu={(e) => { if (e.target === e.currentTarget) handleFolderContextMenu(e, defaultTargetFolder(), 'Assets'); }}
       >
         {viewMode === 'category' ? (
           /* ── Category view ── */
@@ -1861,6 +1770,7 @@ export default function Assets() {
                 count={items.length}
                 open={expanded.has(type)}
                 onToggle={() => toggle(type)}
+                onContextMenu={(e) => handleFolderContextMenu(e, defaultTargetFolder(), 'Assets')}
               />
               {expanded.has(type) && items.map((a) => (
                 <AssetRowWithSprites
@@ -1980,14 +1890,9 @@ export default function Assets() {
         <ContextMenu
           items={[
             { label: 'New Folder', onClick: () => createFolder(folderCtx.path) },
-            { label: 'Create Scene', onClick: () => createScene(folderCtx.path) },
-            { label: 'Create Material', onClick: () => createMaterial(folderCtx.path) },
-            { label: 'Create Animation', onClick: () => createAnimationClip(folderCtx.path) },
-            { label: 'Create Animset', onClick: () => createAnimSet(folderCtx.path) },
-            { label: 'Create Sprite Animation', onClick: () => createSpriteAnim(folderCtx.path) },
-            { label: 'Create 2D Rig', onClick: () => createRig2D(folderCtx.path) },
-            { label: 'Create Particle', onClick: () => createParticle(folderCtx.path) },
-            { label: 'Create Atlas', onClick: () => createAtlas(folderCtx.path) },
+            // Read live at menu-open time (not memoized) so a late-registering game's
+            // entries show up without a remount — see creatableAssets.ts.
+            ...getCreatableAssets().map((d) => ({ label: d.label, onClick: () => runCreate(d, folderCtx.path) })),
             { label: 'Import Files…', onClick: () => { setCurrentFolder(folderCtx.path); importTargetRef.current = folderCtx.path; fileInputRef.current?.click(); } },
             ...(folderCtx.path !== '/' && folderCtx.path !== assetsRoot.path ? [{ label: 'Rename', onClick: () => setRenamingFolderPath(folderCtx.path) }] : []),
             ...(folderCtx.path !== '/' && folderCtx.path !== assetsRoot.path ? [{ label: 'Delete', onClick: () => handleDeleteFolder(folderCtx.path, folderCtx.name) }] : []),

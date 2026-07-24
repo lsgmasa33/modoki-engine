@@ -40,8 +40,12 @@ let activeId: number | null = null;
 let active = false;         // saw activity since last sample → sets lastDevice='pointer'
 let attached = false;
 let offPlayState: (() => void) | null = null;
+// Accumulated scroll-notch delta since the last sample (+down / −up), one unit per
+// wheel event; drained to `pointer.wheel` each frame and re-zeroed. Transient, not
+// latched level state — so it's cleared on reset() too.
+let wheelAccum = 0;
 
-function reset(): void { down = false; activeId = null; }
+function reset(): void { down = false; activeId = null; wheelAccum = 0; }
 
 function onPointerDown(e: PointerEvent): void {
   if (activeId !== null) return;           // a gesture already owns the pointer
@@ -72,6 +76,15 @@ function onPointerUp(e: PointerEvent): void {
   active = true;
 }
 
+/** Wheel/scroll — accumulate one signed notch per event (magnitude-agnostic, so a
+ *  free-spinning vs clicky wheel behave the same). Passive listener, no
+ *  `preventDefault`, so it never fights editor-panel scrolling. */
+function onWheel(e: WheelEvent): void {
+  if (e.deltaY === 0) return;
+  wheelAccum += Math.sign(e.deltaY);
+  active = true;
+}
+
 export const pointerSource: InputSource = {
   name: 'pointer',
 
@@ -81,6 +94,7 @@ export const pointerSource: InputSource = {
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
     window.addEventListener('pointercancel', onPointerUp);
+    window.addEventListener('wheel', onWheel, { passive: true });
     // Drop a stale press each time the sim (re)starts, so a pointer left down across
     // a Play toggle can't leak a held drag into the first play frame.
     offPlayState = onPlayStateChange(() => { if (getPlayState() === 'playing') reset(); });
@@ -93,6 +107,7 @@ export const pointerSource: InputSource = {
       window.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('pointerup', onPointerUp);
       window.removeEventListener('pointercancel', onPointerUp);
+      window.removeEventListener('wheel', onWheel);
     }
     offPlayState?.(); offPlayState = null;
     reset(); active = false; attached = false;
@@ -109,6 +124,7 @@ export const pointerSource: InputSource = {
     p.startX = startX; p.startY = startY;
     p.dragX = down ? x - startX : 0;
     p.dragY = down ? y - startY : 0;
+    p.wheel = wheelAccum; wheelAccum = 0; // transient per-frame delta, consumed here
     if (active) { out.lastDevice = 'pointer'; active = false; }
   },
 };

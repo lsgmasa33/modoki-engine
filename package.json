@@ -1,7 +1,7 @@
 {
   "name": "modoki-engine",
   "private": true,
-  "version": "0.2.28",
+  "version": "0.3.0",
   "type": "module",
   "description": "Modoki — a Claude-friendly game engine + visual editor",
   "author": "Modoki",
@@ -11,7 +11,7 @@
   ],
   "scripts": {
     "dev": "vite --config engine/vite.config.ts",
-    "build:plugins": "npm run build --workspace engine/packages/capacitor-game-debug --workspace engine/packages/capacitor-litert-lm",
+    "build:plugins": "npm run build --workspace engine/packages/capacitor-game-debug --workspace engine/packages/capacitor-litert-lm --workspace engine/packages/capacitor-modoki-ota",
     "postinstall": "npm run build:plugins && node engine/scripts/bootstrap-mcp-deps.mjs && node engine/scripts/bootstrap-game-deps.mjs",
     "electron:build": "node engine/scripts/build-electron.mjs",
     "dev:electron": "npm run electron:build && electron engine/electron/dist/main.cjs",
@@ -73,6 +73,7 @@
     "@zappar/msdf-generator": "^1.2.4",
     "capacitor-game-debug": "file:engine/packages/capacitor-game-debug",
     "capacitor-litert-lm": "file:engine/packages/capacitor-litert-lm",
+    "capacitor-modoki-ota": "file:engine/packages/capacitor-modoki-ota",
     "chess.js": "^1.4.0",
     "chokidar": "^5.0.0",
     "electron-updater": "^6.8.9",

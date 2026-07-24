@@ -60,3 +60,35 @@ export function colliderOutline2D(c: ColliderShapeParams): ColliderOutline | nul
       return null;
   }
 }
+
+/** Scale an already-parsed outline by the collider entity's WORLD scale, mirroring the
+ *  approximation physics2DSystem's `makeColliderDesc` applies to the LIVE Rapier collider: a
+ *  circle's radius uses the mean of |sx|,|sy| (can't represent an ellipse); a capsule's radius
+ *  likewise, but its half-height scales by |sy| alone (matches `* ay` there); polygon/polyline
+ *  points scale per-axis with the SIGNED sx/sy (matches `scalePointsInPlace`, so a mirrored/
+ *  negative scale flips the outline the same way it flips the live collider).
+ *
+ *  Used only by the DEBUG overlay draw paths (`drawColliderOutlineGfx`/`drawColliderOutline`) —
+ *  `colliderOutline2D` itself stays unscaled for editing (colliderEdit2D, which operates in
+ *  local collider space) and the collider-as-placeholder-sprite fill path (which gets scale for
+ *  free from its own Pixi container transform). Without this the debug overlay stayed at its
+ *  authored (unscaled) size regardless of Transform.scale, so a scaled floor/wall's TRUE (much
+ *  larger) collider silently rendered small, buried inside or detached from the visual mesh —
+ *  the 2D counterpart of the 3D wireframe bug (see colliderWorldScale3D). */
+export function scaleColliderOutline2D(o: ColliderOutline, sx: number, sy: number): ColliderOutline {
+  if (sx === 1 && sy === 1) return o;
+  const ax = Math.abs(sx), ay = Math.abs(sy);
+  switch (o.kind) {
+    case 'circle': {
+      const r = (ax + ay) / 2;
+      return { kind: 'circle', radius: o.radius * r };
+    }
+    case 'capsule': {
+      const r = (ax + ay) / 2;
+      return { kind: 'capsule', radius: o.radius * r, halfH: o.halfH * ay };
+    }
+    case 'polygon':
+    case 'polyline':
+      return { kind: o.kind, points: o.points.map((p) => ({ x: p.x * sx, y: p.y * sy })) };
+  }
+}

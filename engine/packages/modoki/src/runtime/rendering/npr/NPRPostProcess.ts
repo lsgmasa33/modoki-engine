@@ -39,6 +39,15 @@ import { PARTICLE_LAYER } from '../layers';
  *  Use from a shader file:
  *    mat.fragmentNode = nprFragmentOutput(vec4(myColorRgb, 1.0));
  *    mat.fragmentNode = nprFragmentOutput(vec4(rgb, 1.0), rimMask); // per-pixel
+ *
+ *  ⚠️ FOG HAZARD: if the scene has fog (`Fog` trait / `syncFog`), leaving this
+ *  material's default `fog = true` breaks the draw. `NodeMaterial.setupOutput()`
+ *  runs `setupFog()` on this outputStruct regardless of `fragmentNode`, and
+ *  `setupFog` REPLACES the whole struct with a single `vec4` — collapsing the 3 MRT
+ *  targets down to 1, which is exactly the "targets[1]/[2] have no fragment output"
+ *  case above, so WebGPU discards the draw. Prefer `applyNprFragmentOutput` below,
+ *  which sets `fog = false` for you; only call this directly if you intend to
+ *  handle fog yourself.
  */
 export function nprFragmentOutput(colorRGBA: unknown, preserve?: unknown): unknown {
   // Baking materialReference('lineColor'/'nprColorPreserve') into this material's
@@ -54,6 +63,22 @@ export function nprFragmentOutput(colorRGBA: unknown, preserve?: unknown): unkno
     vec4(normalView, 1.0) as any,
     vec4(materialReference('lineColor', 'color') as any, preserveNode as any) as any,
   );
+}
+
+/** Set a custom NPR shader's `fragmentNode` AND disable the material's `fog` flag
+ *  in one call — the safe way to wire a shader into the NPR MRT pass. See the fog
+ *  hazard note on `nprFragmentOutput` above: without `fog = false`, three's
+ *  `setupFog` collapses the 3-target outputStruct to a single vec4 and the draw
+ *  gets discarded by WebGPU whenever the scene has fog enabled. Prefer this over
+ *  calling `nprFragmentOutput` + assigning `fragmentNode` by hand.
+ *
+ *  Use from a shader file:
+ *    applyNprFragmentOutput(mat, vec4(myColorRgb, 1.0));
+ *    applyNprFragmentOutput(mat, vec4(rgb, 1.0), rimMask); // per-pixel preserve
+ */
+export function applyNprFragmentOutput(mat: { fragmentNode: unknown; fog: boolean }, colorRGBA: unknown, preserve?: unknown): void {
+  mat.fragmentNode = nprFragmentOutput(colorRGBA, preserve);
+  mat.fog = false;
 }
 
 // Default supersampling factor for the MRT and composite passes. 1 = native

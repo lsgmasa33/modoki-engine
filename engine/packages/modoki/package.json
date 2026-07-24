@@ -1,7 +1,7 @@
 {
   "name": "@modoki/engine",
   "version": "0.1.0",
-  "description": "Modoki \u2014 2D/3D game engine with ECS runtime and visual editor",
+  "description": "Modoki — 2D/3D game engine with ECS runtime and visual editor",
   "type": "module",
   "exports": {
     "./runtime": "./src/runtime/index.ts",
@@ -30,6 +30,7 @@
   "dependencies": {
     "@dimforge/rapier2d-compat": "^0.19.3",
     "@dimforge/rapier3d-compat": "^0.19.3",
+    "@noble/curves": "^2.2.0",
     "@zappar/msdf-generator": "^1.2.4",
     "maxrects-packer": "^2.7.3",
     "poly-decomp-es": "^0.4.2"

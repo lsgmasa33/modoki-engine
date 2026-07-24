@@ -17,9 +17,11 @@ export const AXES = ['moveX', 'moveY', 'lookX', 'lookY'] as const;
 export type Axis = (typeof AXES)[number];
 
 /** Digital actions. `nav*` double as UI focus movement (Part B). Each exposes an
- *  edge (`pressed`/`released`, once per transition) and a level (`held`). */
+ *  edge (`pressed`/`released`, once per transition) and a level (`held`).
+ *  `aim` is a generic aim/ADS toggle (e.g. hold-to-aim, or a mode toggle a game
+ *  wires up itself) — keyboard maps it to F, gamepad to the left trigger. */
 export const DIGITAL = [
-  'confirm', 'cancel', 'menu', 'pause', 'jump',
+  'confirm', 'cancel', 'menu', 'pause', 'jump', 'aim',
   'navUp', 'navDown', 'navLeft', 'navRight',
 ] as const;
 export type DigitalAction = (typeof DIGITAL)[number];
@@ -42,7 +44,9 @@ export type FlagMap = Record<DigitalAction, boolean>;
  *  (0 while up). A tap is a `pressed` with a small `dragX/dragY` at `released`; a
  *  drag is a `pressed`→hold-with-growing-drag→`released`. Coordinates are viewport
  *  CSS px (raw `clientX/clientY`) — a game maps them to world space itself (raycast
- *  / its own projection); deltas are already screen-space and need no mapping. */
+ *  / its own projection); deltas are already screen-space and need no mapping.
+ *  `wheel` is the accumulated scroll-notch delta THIS frame (+down / −up, one unit
+ *  per wheel event), consumed and re-zeroed every frame — for camera zoom etc. */
 export interface PointerFrame {
   x: number; y: number;
   down: boolean;
@@ -50,6 +54,7 @@ export interface PointerFrame {
   released: boolean;
   startX: number; startY: number;
   dragX: number; dragY: number;
+  wheel: number;
 }
 
 /** The merged per-frame snapshot a set of sources produces. `held` is the level
@@ -70,12 +75,12 @@ export function makeAxes(): AxisMap {
 }
 
 export function makePointer(): PointerFrame {
-  return { x: 0, y: 0, down: false, pressed: false, released: false, startX: 0, startY: 0, dragX: 0, dragY: 0 };
+  return { x: 0, y: 0, down: false, pressed: false, released: false, startX: 0, startY: 0, dragX: 0, dragY: 0, wheel: 0 };
 }
 
 export function makeFlags(): FlagMap {
   return {
-    confirm: false, cancel: false, menu: false, pause: false, jump: false,
+    confirm: false, cancel: false, menu: false, pause: false, jump: false, aim: false,
     navUp: false, navDown: false, navLeft: false, navRight: false,
   };
 }

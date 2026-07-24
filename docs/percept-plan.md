@@ -18,11 +18,11 @@ Consolidated from the per-phase "deferred" notes. Ordered by value.
 | ~~**V3**~~ ✅ | **True single-axis merged timeline** — DONE: a shared process-global `cap` capture counter stamped by BOTH `journal.ts` emit (game) and `editorJournal.ts` editorEmit (editor); the `editor-journal` merged read returns a `timeline` interleaving both streams by `cap`, each `stream`-tagged, windowed by its own `sinceCap` cursor. Reset on `createTestWorld.dispose`. Adversarially reviewed (9 agents): determinism concerns REFUTED (cap never feeds game state / no test asserts absolute cap); fixed the confirmed finding (timeline spliced the ENTIRE unfiltered game journal on a `since` poll → added the `sinceCap` single-axis cursor windowing both streams). | The "pressed Play → set timeScale 0.3 → `@match` on tick 84 → paused" correlated story. | `journal.ts`+`editorJournal.ts`+`createTestWorld.ts`+`agentEditorOps.ts`+backend+MCP | S–M |
 | ~~**V4**~~ ✅ | **Physics event GUIDs** — DONE: `@contact` (2D + 3D) payloads now use `entityRef(a.entity)`/`entityRef(b.entity)` → stable GUIDs (numeric-id fallback for un-guidable entities). `@collision`/`@sensor` turned out not to be journal-emitted (only `@contact` is), so nothing else to convert. | Cross-hot-reload-stable correlation of physics events (the last Percept ref that leaked numeric ids). | `physics2DSystem.ts`/`physics3DSystem.ts` emit sites | S |
 | ~~**V5**~~ ✅ | **Snapshot world-AABB size** (S6 leftover) — DONE: the Scene3D bounds provider now surfaces the world-space AABB it already computes as `worldAABB {size, center}` (previously discarded); folded into `get_scene_state?bounds=1` alongside the screen rect. Unit-verified (collectScreenBounds passthrough). NOTE: rides the SAME runtime Scene3D bounds provider as the S6 3D screen rect, which is only active where runtime Scene3D renders the queried world (shipped game / configured GameView) — NOT the editor-SceneView authoring context, where 3D bounds have never surfaced (pre-existing, orthogonal to V5). A follow-up could register an editor-SceneView bounds provider to fix 3D bounds in the authoring view. | Claude gets true world size, not just screen rect or authored intent. | `screenBounds.ts`/`Scene3D.tsx`/`layoutDump.ts`/`agentBridge.ts` | S |
-| **V6** | **`debug\|profile\|release` mode enum** (Decision D) — replace the `enableJournal` boolean once a profiler gives "profile" a second consumer. | Not worth building the taxonomy until there's a real second consumer. **Keep deferred** — leave the TODO. | `project.config.json`, `main.tsx` define | — (blocked) |
+| **V6** | **`debug\|profile\|release` mode enum** (Decision D) — replace the `enableJournal` boolean (since consolidated into `build.debugBuild`, shared with the debug menu/bridge) once a profiler gives "profile" a second consumer. | Not worth building the taxonomy until there's a real second consumer. **Keep deferred** — leave the TODO. | `project.config.json`, `main.tsx` define | — (blocked) |
 
 **Status:** V1–V5 ✅ **all done** (V2 incl. V2b `!transform`). **Only V6 remains — deferred by
 design** (the `debug|profile|release` mode enum, blocked until a profiler gives "profile" a
-second real consumer; the `build.enableJournal` boolean + TODO ship in its place). The Percept
+second real consumer; the `build.debugBuild` boolean + TODO ship in its place). The Percept
 system is feature-complete for v2. Follow-ups:
 - ✅ **editor-SceneView bounds provider DONE** — 3D `screen`/`worldAABB` now surface in the
   authoring view (regular AND skinned meshes; live-verified: the alien reports size
@@ -251,7 +251,7 @@ degrades to a valid `{elided, bytes, hint, preview}` envelope rather than a seve
 
 `emit(type, payload, world?)` → per-world ring buffer (`runtime/systems/journal.ts`), read
 via `modoki_journal` / `journalEvents`. O(1) push. The J1 gate landed: `main.tsx` boots
-`setJournalEnabled(__MODOKI_EDITOR__ || build.enableJournal)` — editor on, shipped game off.
+`setJournalEnabled(__MODOKI_EDITOR__ || build.debugBuild)` — editor on, shipped game off.
 On device, the debug bridge (`app/debug/bridge.ts`) re-enables recording when a debug client
 attaches (`connectionChanged`, plus a `getStatus().clientConnected` check at init for the
 page-reload-over-a-live-lease case where no reconnect event fires); `journal-events` also
@@ -261,9 +261,9 @@ force-enables on read as a belt-and-suspenders. Emitters: engine physics
 
 ### Design (decided across prior discussion)
 
-1. **Gate (perf).** `setJournalEnabled(__MODOKI_EDITOR__ || build.enableJournal)` at
+1. **Gate (perf).** `setJournalEnabled(__MODOKI_EDITOR__ || build.debugBuild)` at
    `main.tsx` bootstrap. Editor (dev + DMG) → on; shipped game → **off** (kills always-on
-   allocation on the physics hot path); QA override via `build.enableJournal?: boolean` in
+   allocation on the physics hot path); QA override via `build.debugBuild?: boolean` in
    `project.config.json`, baked as a Vite define like `appId`. The full
    `debug|profile|release` mode enum is **deferred** until a profiler gives "profile" a
    second real consumer — leave a TODO note, don't build the taxonomy speculatively.
@@ -292,7 +292,7 @@ force-enables on read as a belt-and-suspenders. Emitters: engine physics
 
 ### Phased tasks (Journal)
 
-- **J1.** Gate: bootstrap `setJournalEnabled(...)` + `build.enableJournal` define + TODO for
+- **J1.** Gate: bootstrap `setJournalEnabled(...)` + `build.debugBuild` define + TODO for
   the mode enum. *Smallest, immediate perf win, no API change.*
 - **J2.** Ergonomics + identity: `ctx.emit`, Entity→GUID auto-convert, fix demo games.
 - **J3.** Coverage: `@`-prefixed `@anim-*` / `@spawn`/`@despawn` / `@scene-*`; physics rename
@@ -427,9 +427,9 @@ the modoki MCP* (not just unit tests) before starting the next. Each phase ends 
 `npm run verify`.
 
 ### Phase 1 — Journal hardening *(self-contained; perf + identity correctness)*
-- **J1** — Gate: `setJournalEnabled(__MODOKI_EDITOR__ || build.enableJournal)` at `main.tsx`
-  bootstrap; `build.enableJournal: boolean` in `project.config.json` baked as the
-  `__MODOKI_ENABLE_JOURNAL__` Vite define. ✅ *Done.* (Mode enum still deferred — Decision D.)
+- **J1** — Gate: `setJournalEnabled(__MODOKI_EDITOR__ || build.debugBuild)` at `main.tsx`
+  bootstrap; `build.debugBuild: boolean` in `project.config.json` baked as the
+  `__MODOKI_DEBUG_BUILD__` Vite define. ✅ *Done.* (Mode enum still deferred — Decision D.)
 - **J2** — Ergonomics + identity: `ctx.emit(type, payload)` (world pre-bound) + exported
   `entityRef(entity)` helper for stable GUID refs (explicit, call-site — NOT auto-probed;
   koota entities are numbers so auto-probing corrupts scalars). Fix the `body: other.id()`
@@ -568,7 +568,7 @@ last. Recommended linear order is 1 → 2 → 3 → 4 → 5 → 6 → 7.
 - **C (Journal `@anim-*`):** `@anim-loop` fires **per loop**; `@anim-finish` fires **only
   when a non-looping clip ends**. *(Phase 4 / J3.)*
 - **D (mode enum):** the `debug|profile|release` enum is **deferred** until a profiler gives
-  "profile" a second real consumer. Phase 1 ships only the `build.enableJournal` boolean +
+  "profile" a second real consumer. Phase 1 ships only the `build.debugBuild` boolean +
   a TODO note. *(Phase 1 / J1.)*
 - **E (editor journal store):** a **separate** editor-side activity buffer (not the
   world-scoped game journal — different lifecycle: editor-only, session-scoped, wall-clock

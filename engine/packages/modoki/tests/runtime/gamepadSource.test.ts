@@ -46,7 +46,7 @@ describe('sampleGamepadInto (pure mapper)', () => {
     expect(f.axes.moveY).toBe(0);
   });
 
-  it('A → confirm + jump; B → cancel; Start → menu + pause', () => {
+  it('A → confirm + jump; B → cancel; LT → aim; Start → menu + pause', () => {
     const a = createInputFrame();
     sampleGamepadInto(mkPad({ down: [0] }), a);
     expect(a.held.confirm).toBe(true);
@@ -55,6 +55,10 @@ describe('sampleGamepadInto (pure mapper)', () => {
     const b = createInputFrame();
     sampleGamepadInto(mkPad({ down: [1] }), b);
     expect(b.held.cancel).toBe(true);
+
+    const lt = createInputFrame();
+    sampleGamepadInto(mkPad({ down: [6] }), lt);
+    expect(lt.held.aim).toBe(true);
 
     const start = createInputFrame();
     sampleGamepadInto(mkPad({ down: [9] }), start);

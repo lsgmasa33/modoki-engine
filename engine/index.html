@@ -21,6 +21,30 @@
         function isLoadError(msg) {
           return /does not provide an export|Failed to fetch dynamically imported|Importing a module script failed|error loading dynamically imported|Unable to resolve|Cannot find module|SyntaxError|Unexpected (token|identifier|end)/i.test(msg || '');
         }
+        // The RELOAD-RECOVERABLE subset: a packaged editor optimizes @modoki/engine, and
+        // opening a project can make Vite re-optimize mid-session (a game imports a subpath
+        // — e.g. runtime/rendering — the editor's own startup graph didn't). That rehashes
+        // the dep chunks, so the already-loaded `runtime.js?v=<old>` throws "does not provide
+        // an export". Vite has ALREADY written the new chunk by the time this fires, so a
+        // single reload fetches it and recovers — no manual Reload click needed. (A genuine
+        // version mismatch re-errors on reload; the rate-limit below then shows the screen.)
+        function isReloadRecoverable(msg) {
+          return /does not provide an export|Failed to fetch dynamically imported|error loading dynamically imported/i.test(msg || '');
+        }
+        function tryAutoReloadOnce(msg) {
+          if (!isReloadRecoverable(msg)) return false;
+          try {
+            var KEY = 'modoki-optimize-reload-ts';
+            var last = +(sessionStorage.getItem(KEY) || 0);
+            var now = Date.now();
+            // If we auto-reloaded within the last 5s and still hit this, the reload didn't
+            // fix it (real mismatch, not stale optimize) — stop looping, show the screen.
+            if (now - last < 5000) return false;
+            sessionStorage.setItem(KEY, String(now));
+            setTimeout(function () { location.reload(); }, 300); // let the re-optimize finish writing
+            return true;
+          } catch (_) { return false; }
+        }
         function renderFallback(detail) {
           var root = document.getElementById('root');
           if (!root) return;
@@ -47,6 +71,9 @@
             if (!isLoadError(msg)) return;
             var root = document.getElementById('root');
             if (!root || root.childElementCount > 0) return; // app already rendered → not fatal
+            // Recover transparently from a mid-session dep re-optimize before falling back
+            // to the manual screen. If the reload is rate-limited (already tried), continue.
+            if (tryAutoReloadOnce(msg)) { scheduled = true; return; }
             scheduled = true;
             // The app may still be mid-mount; only a root that's STILL empty is fatal.
             setTimeout(function () {

@@ -21,6 +21,8 @@ import { runLateUpdates, hasLateUpdates, type IdempotencyProbe } from '../system
 import { EntityAttributes } from '../traits/EntityAttributes';
 import { Light } from '../../three/traits/Light';
 import { Environment } from '../../three/traits/Environment';
+import { Fog } from '../../three/traits/Fog';
+import { fog as fogTsl, exponentialHeightFogFactor, uniform, renderGroup } from 'three/tsl';
 import { worldTransforms, deactivatedEntities, transformPropagationSystem } from '../../three/systems/transformPropagationSystem';
 import { updateSceneLightUniforms } from './sceneLightUniforms';
 import { setEntityMeshCollector } from './materialBroker';
@@ -448,6 +450,118 @@ export function refreshEnvIntensityObserver(scene: THREE.Scene): void {
   });
 }
 
+// ── Fog sync ────────────────────────────────────────────
+
+/** Persistent per-scene TSL state backing height-mode `scene.fogNode`. Keyed by the
+ *  actual `THREE.Scene` instance (the runtime Scene3D and the editor SceneView each
+ *  own a distinct scene).
+ *
+ *  TWO separate invariants live here — both were learned the hard way:
+ *
+ *  1. **Stable node identity.** `Node.getHash()` returns the node's instance id, and
+ *     that id feeds the render-object's SHADER CACHE KEY (`NodeManager.getCacheKey()`
+ *     pushes `fogNode.getCacheKey()`). Rebuilding the node every frame would recompile
+ *     every affected material's shader every frame. Uniform VALUES aren't part of that
+ *     hash, so mutating them in place is free.
+ *
+ *  2. **`.setGroup(renderGroup)` on every uniform.** A bare `uniform()` defaults to
+ *     `objectGroup` — a PER-RENDER-OBJECT uniform buffer. Those buffers are only
+ *     re-uploaded inside `Bindings.updateForRender(renderObject)`, which `Renderer`
+ *     calls **only when `NodeMaterialObserver.needsRefresh(renderObject)` is true** —
+ *     and that stays false forever for a static mesh with a plain (non-node) material,
+ *     because the observer only watches MATERIAL properties (its `refreshUniforms`
+ *     list) + world matrix + geometry. Fog is scene-global, so nothing on that list
+ *     ever changes ⇒ a live fog edit updated `.value` here but NEVER reached the GPU
+ *     on static geometry (the editor grid, unmoving terrain), while animated objects
+ *     looked fine — a maddening partial-staleness. `renderGroup` is a SHARED group
+ *     (`shared: true`, `updateType: RENDER`): every material referencing these nodes
+ *     shares ONE bind group / buffer, re-uploaded once per render call, so it can't go
+ *     per-object stale. This is exactly what three's own `NodeManager.updateFog()`
+ *     does for the classic `scene.fog` path (`reference(...).setGroup(renderGroup)`),
+ *     which is why linear/exponential fog never had this bug.
+ *
+ *  RULE OF THUMB for any future TSL uniform: if the value is SCENE-GLOBAL (fog,
+ *  scene lights, time, wind), it belongs in `renderGroup`/`frameGroup`. Only genuinely
+ *  per-object values (e.g. a `.onObjectUpdate()` uniform read from `object.userData`)
+ *  should stay in the default `objectGroup`. See docs/rendering.md "Fog". */
+interface HeightFogState {
+  node: unknown;
+  color: ReturnType<typeof uniform>;
+  density: ReturnType<typeof uniform>;
+  height: ReturnType<typeof uniform>;
+}
+const heightFogStates = new WeakMap<THREE.Scene, HeightFogState>();
+
+/** Apply the first active `Fog` entity's settings to the scene. A hybrid mechanism:
+ *
+ *  - `linear`/`exponential` drive the classic `scene.fog` object
+ *    (`THREE.Fog`/`FogExp2`). Despite this engine rendering exclusively through
+ *    WebGPURenderer/NodeMaterial, that classic object IS the right integration
+ *    point: `NodeMaterial.fog` defaults to `true`, and three's own
+ *    `NodeManager.updateFog()` transparently converts `scene.fog` into the
+ *    equivalent TSL node graph each render, caching it by the Fog/FogExp2 object's
+ *    OWN identity and refreshing color/near/far/density via `reference()` nodes
+ *    (`NodeUpdateType.OBJECT` — re-read every frame). So mutating the SAME object's
+ *    fields already gets "update without recompiling the shader" for free.
+ *  - `height` (density varying with world Y — fog pools in valleys, independent of
+ *    camera distance) has NO classic-object equivalent, so it drives `scene.fogNode`
+ *    directly via `exponentialHeightFogFactor(density, height)` — see
+ *    `HeightFogState` above for why that node's identity must stay stable.
+ *
+ *  `NodeManager.getFogNode()` prefers `scene.fogNode` over a derived-from-`scene.fog`
+ *  node, so whichever path is inactive must be explicitly cleared or a stale one
+ *  would win. First-entity-wins + clear-on-none mirrors `syncEnvironment`. */
+export function syncFog(world: World, scene: THREE.Scene) {
+  let active = false;
+  world.query(Fog).updateEach(([f], entity) => {
+    if (active || deactivatedEntities.has(entity.id())) return;
+    if (!f.enabled) return;
+    active = true;
+
+    if (f.mode === 'height') {
+      if (scene.fog) scene.fog = null;
+      let st = heightFogStates.get(scene);
+      if (!st) {
+        // `.setGroup(renderGroup)` is LOAD-BEARING, not a detail — see the
+        // uniform-group note on `HeightFogState` above. Same call three's own
+        // `NodeManager.updateFog()` makes for the classic `scene.fog` path.
+        const color = uniform(new THREE.Color(f.color)).setGroup(renderGroup);
+        const density = uniform(f.density).setGroup(renderGroup);
+        const height = uniform(f.height).setGroup(renderGroup);
+        st = { node: fogTsl(color, exponentialHeightFogFactor(density, height)), color, density, height };
+        heightFogStates.set(scene, st);
+      }
+      (st.color.value as THREE.Color).setHex(f.color);
+      st.density.value = f.density;
+      st.height.value = f.height;
+      if (scene.fogNode !== st.node) scene.fogNode = st.node as never;
+      return;
+    }
+    if (scene.fogNode) scene.fogNode = null as never;
+
+    const isExp = f.mode === 'exponential';
+    const prior = scene.fog as (THREE.Fog & THREE.FogExp2) | null;
+    const wrongType = !prior || (isExp ? !prior.isFogExp2 : !prior.isFog);
+    if (wrongType) {
+      scene.fog = (isExp
+        ? new THREE.FogExp2(f.color, f.density)
+        : new THREE.Fog(f.color, f.near, f.far)) as THREE.Fog & THREE.FogExp2;
+    }
+    const current = scene.fog as THREE.Fog & THREE.FogExp2;
+    if (current.color.getHex() !== f.color) current.color.setHex(f.color);
+    if (isExp) {
+      if (current.density !== f.density) current.density = f.density;
+    } else {
+      if (current.near !== f.near) current.near = f.near;
+      if (current.far !== f.far) current.far = f.far;
+    }
+  });
+  if (!active) {
+    if (scene.fog) scene.fog = null;
+    if (scene.fogNode) scene.fogNode = null as never;
+  }
+}
+
 // ── Light sync ──────────────────────────────────────────
 
 function createLightFromTrait(light: { lightType: string; color: number; intensity: number; distance: number; angle: number; penumbra: number }): THREE.Light | null {
@@ -462,11 +576,20 @@ function createLightFromTrait(light: { lightType: string; color: number; intensi
 
 /** Mark a freshly-created object (and any nested meshes, e.g. LOD levels or a loaded
  *  model graph) as shadow caster + receiver. Inert unless a light casts + the renderer's
- *  shadowMap is enabled (both gated elsewhere), so this is always safe to apply. */
+ *  shadowMap is enabled (both gated elsewhere), so this is always safe to apply.
+ *  A mesh whose material is alpha-blended (`transparent: true` — water, glass, sprite
+ *  billboards) does NOT cast: the shadow map treats blended geometry as fully opaque,
+ *  so a translucent surface would throw a hard, wrongly-shaped shadow (see the pond
+ *  water plane in demos/forest-camp — its shadow read as a ghost duplicate of itself
+ *  offset across the grass). It still RECEIVES shadows normally. */
 function applyShadowFlags(obj: THREE.Object3D): void {
   obj.traverse((o) => {
     const m = o as THREE.Mesh;
-    if (m.isMesh) { m.castShadow = true; m.receiveShadow = true; }
+    if (!m.isMesh) return;
+    const mat = m.material as THREE.Material | THREE.Material[] | undefined;
+    const transparent = Array.isArray(mat) ? mat.some((mm) => mm.transparent) : mat?.transparent;
+    m.castShadow = !transparent;
+    m.receiveShadow = true;
   });
 }
 
@@ -899,7 +1022,7 @@ function syncMaterial(
         _ownedMaterials.delete(oldMat);
         oldMat.dispose();
       }
-      if (newMat) t.material = newMat;
+      if (newMat) { t.material = newMat; t.castShadow = !newMat.transparent; }
     }
   } else if (!isTinted && !isInstanced && curMat) {
     // .mat.json path unchanged but the async load may have finished since
@@ -912,6 +1035,7 @@ function syncMaterial(
     if (resolved) {
       for (const t of targets) {
         if (t.material !== resolved) t.material = resolved;
+        t.castShadow = !resolved.transparent; // keep in sync even once the ref settles
       }
     }
   }

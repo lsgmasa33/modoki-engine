@@ -32,10 +32,10 @@ const GAME_ONLY = !__MODOKI_EDITOR__;
 const EditorApp = GAME_ONLY ? null : lazy(() => import('./editor/setup').then(m => m.createGameEditor()));
 
 // In-game debug menu (F12 / 3-finger tap). Present in the editor and in a game build
-// that opts in via project.config.json `build.enableDebugMenu`. The flag is a
-// build-time constant so the dynamic import below is dead-code-eliminated and the
-// whole debug-menu chunk never ships when off. See docs/debug-menu-plan.md.
-const DEBUG_MENU_ON = __MODOKI_EDITOR__ || __MODOKI_ENABLE_DEBUG_MENU__;
+// that opts in via project.config.json `build.debugBuild`. The flag is a build-time
+// constant so the dynamic import below is dead-code-eliminated and the whole
+// debug-menu chunk never ships when off. See docs/debug-menu-plan.md.
+const DEBUG_MENU_ON = __MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__;
 const DebugMenu = DEBUG_MENU_ON
   ? lazy(() => import('@modoki/engine/runtime/debug').then(m => ({ default: m.DebugMenu })))
   : null;
@@ -252,6 +252,19 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
         // for a few frames (race between swap and first populated render).
         await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
         if (cancelled) return;
+
+        // OTA boot-watchdog confirm (docs/plans/mobile-ota-updates-plan.md, Phase 1):
+        // THIS is the app's own "fully booted" signal (rendered a real frame of the
+        // ACTUAL game, not just index.html loading) — the exact proof-of-boot the native
+        // watchdog's two-boot-confirm design assumes. Best-effort and native-only: a
+        // failure here must never block the game the player is already looking at, and
+        // web has no OTA mechanism to confirm anything for (ModokiOtaWeb no-ops it
+        // anyway, but skip the dynamic import entirely rather than pay for it on web).
+        if (Capacitor.isNativePlatform()) {
+          import('capacitor-modoki-ota')
+            .then((m) => m.ModokiOta.confirmBoot({ name: 'shell' }))
+            .catch((e) => console.warn('[GameShell] OTA confirmBoot failed (non-fatal):', e));
+        }
 
         activeGameIdRef.current = gameId;
         setInitialized(true);

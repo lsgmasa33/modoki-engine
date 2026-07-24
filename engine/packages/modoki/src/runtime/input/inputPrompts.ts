@@ -21,17 +21,17 @@ import type { DigitalAction, InputDevice } from './actions';
 
 /** The digital actions a UI typically surfaces a prompt for. Nav (arrows/d-pad)
  *  is intentionally omitted — it's shown as directional hints, not a single label. */
-export const PROMPT_ACTIONS = ['confirm', 'cancel', 'menu', 'pause', 'jump'] as const;
+export const PROMPT_ACTIONS = ['confirm', 'cancel', 'menu', 'pause', 'jump', 'aim'] as const;
 export type PromptAction = (typeof PROMPT_ACTIONS)[number];
 
 /** Per-device label for each promptable action. A device that omits an action
  *  falls back to the keyboard label (a sensible textual default), then to the
  *  Capitalized action name. `none` yields '' (no device seen yet → no prompt). */
 const PROMPTS: Record<InputDevice, Partial<Record<PromptAction, string>>> = {
-  gamepad: { confirm: 'A', cancel: 'B', menu: 'Menu', pause: 'Start', jump: 'A' },
-  keyboard: { confirm: 'Enter', cancel: 'Esc', menu: 'Esc', pause: 'P', jump: 'Space' },
-  pointer: { confirm: 'Click', cancel: 'Back', menu: 'Menu', pause: 'Pause', jump: 'Click' },
-  native: { confirm: 'Tap', cancel: 'Back', menu: 'Menu', pause: 'Pause', jump: 'Tap' },
+  gamepad: { confirm: 'A', cancel: 'B', menu: 'Menu', pause: 'Start', jump: 'A', aim: 'LT' },
+  keyboard: { confirm: 'Enter', cancel: 'Esc', menu: 'Esc', pause: 'P', jump: 'Space', aim: 'F' },
+  pointer: { confirm: 'Click', cancel: 'Back', menu: 'Menu', pause: 'Pause', jump: 'Click', aim: 'Click' },
+  native: { confirm: 'Tap', cancel: 'Back', menu: 'Menu', pause: 'Pause', jump: 'Tap', aim: 'Tap' },
   none: {},
 };
 

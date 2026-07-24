@@ -106,3 +106,24 @@ export function toggleEditorProjection(): boolean {
 export function getEditorProjection(): EditorProjection | null {
   return viewportController ? viewportController.getProjection() : null;
 }
+
+// ── Rendered-entity registry (E2E observation of collider-only mode etc.) ──
+// The live `entityId -> THREE.Object3D` map is closure-scoped inside SceneView's render
+// effect (renderState.ecsObjects), so — same shape as the camera/focus channels above — the
+// viewport registers it on mount and clears it on cleanup rather than leaking a reference a
+// consumer could read after the object is disposed.
+
+let ecsObjectsRegistry: ReadonlyMap<number, THREE.Object3D> | null = null;
+
+/** SceneView calls this on mount with its live `renderState.ecsObjects`, and `null` on
+ *  cleanup. */
+export function setEcsObjectsRegistry(map: ReadonlyMap<number, THREE.Object3D> | null): void {
+  ecsObjectsRegistry = map;
+}
+
+/** Whether an entity's rendered 3D object is currently visible — `null` when no viewport is
+ *  mounted or the entity has no rendered object (no mesh, a resource, UI-layer, etc.). Used
+ *  by the E2E devTestBridge to assert collider-only mode actually hides meshes. */
+export function isEcsObjectVisible(entityId: number): boolean | null {
+  return ecsObjectsRegistry?.get(entityId)?.visible ?? null;
+}

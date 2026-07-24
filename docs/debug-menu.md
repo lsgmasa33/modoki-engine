@@ -24,18 +24,22 @@ modal is closed, so you can watch performance *while playing*.
 The whole UI is opt-in per build:
 
 ```
-project.config.json  build.enableDebugMenu: true
-      → engine/vite.config.ts  define __MODOKI_ENABLE_DEBUG_MENU__
-      → engine/app/main.tsx     setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_ENABLE_DEBUG_MENU__)
+project.config.json  build.debugBuild: true
+      → engine/vite.config.ts  define __MODOKI_DEBUG_BUILD__
+      → engine/app/main.tsx     setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
       → engine/app/App.tsx      flag-gated lazy import of @modoki/engine/runtime/debug
 ```
 
+`build.debugBuild` is one flag shared with the event journal and the debug bridge (Project
+Settings → Developer → "Debug build") — there's no independent debug-menu-only toggle; see
+[percept-plan.md](./percept-plan.md) Decision D and [debug-tools-mcp.md](./debug-tools-mcp.md).
+
 - **Editor / dev:** always enabled (`__MODOKI_EDITOR__`).
-- **Shipped game:** enabled only when the project sets `build.enableDebugMenu: true`. When off,
+- **Shipped game:** enabled only when the project sets `build.debugBuild: true`. When off,
   `App.tsx` never lazy-imports the `@modoki/engine/runtime/debug` chunk, so the entire menu (tabs,
   widgets, console capture, toaster) **tree-shakes out** of the bundle. Toggle it in the editor via
-  **Project Settings → General → Developer → "Ship the in-game debug menu"** (rebuild to apply), or
-  edit `build.enableDebugMenu` in `project.config.json` directly.
+  **Project Settings → General → Developer → "Debug build"** (rebuild to apply), or edit
+  `build.debugBuild` in `project.config.json` directly.
 - `isDebugMenuEnabled()` (from `@modoki/engine/runtime`) reflects the same gate — games check it
   before registering debug-only tabs/cheats so nothing is registered in a release build.
 
@@ -189,7 +193,7 @@ From `@modoki/engine/runtime/debug` (the UI subpath):
   engine/scripts/launch-editor.sh games/3d-test`), open Game view, press **F12** → the modal
   appears. Drive it with the `modoki` MCP (`modoki_press_key`, `modoki_tap`), confirm the FPS
   widget animates via `modoki_capture_viewport`.
-- **On-device:** build with `build.enableDebugMenu: true`, deploy, 3-finger-tap → the modal; a
+- **On-device:** build with `build.debugBuild: true`, deploy, 3-finger-tap → the modal; a
   cheat fires and FPS reads.
 - **Bundle boundary:** confirm the built game chunk pulls in **no** `editor/panels` code when the
   flag is off.

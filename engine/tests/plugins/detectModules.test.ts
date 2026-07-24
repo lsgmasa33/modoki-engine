@@ -171,6 +171,6 @@ describe('mergeProjectConfig — build.modules', () => {
     expect(cfg.build.modules.render2d).toBe('auto');
     expect(cfg.build.modules.physics3d).toBe('auto');
     // sibling build fields survive the partial too
-    expect(cfg.build.enableJournal).toBe(false);
+    expect(cfg.build.debugBuild).toBe(false);
   });
 });

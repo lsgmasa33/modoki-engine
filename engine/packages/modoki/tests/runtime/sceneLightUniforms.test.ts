@@ -101,3 +101,24 @@ describe('updateSceneLightUniforms — world → uniforms', () => {
     expect(u.keyLightDir.value.z).toBeCloseTo(0, 5);
   });
 });
+
+describe('sceneLightUniforms — uniform grouping', () => {
+  // These are SCENE-GLOBAL values shared by every custom-shader material, so they
+  // must live in `renderGroup` (a shared buffer re-uploaded once per render call).
+  // A bare `uniform()` defaults to `objectGroup` — a PER-RENDER-OBJECT buffer only
+  // re-uploaded when `NodeMaterialObserver.needsRefresh(renderObject)` is true,
+  // which is false forever for a static mesh with a plain material. That would make
+  // a light change silently never reach a NON-ANIMATING custom-shader object. Same
+  // root cause as the height-fog staleness bug; see docs/rendering.md "Fog".
+  it('puts every scene-light uniform in renderGroup, NOT the default per-object group', async () => {
+    const { uniforms } = await setup();
+    const tsl = await import('three/tsl');
+    const u = uniforms.getSceneLightUniforms();
+
+    const all = [u.keyLightDir, u.keyLightColor, u.ambientColor, ...u.pointPos, ...u.pointColor, ...u.pointInvRange];
+    for (const node of all) {
+      expect((node as unknown as { __group: unknown }).__group).toBe(tsl.renderGroup);
+      expect((node as unknown as { __group: unknown }).__group).not.toBe(tsl.objectGroup);
+    }
+  });
+});

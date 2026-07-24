@@ -14,7 +14,8 @@ This feature adds a **runtime-only, extensible debug menu** that ships in game b
 Each game can register its own tabs and cheat buttons.
 
 ### Decisions
-- **Ship scope:** shipped, flag-gated (`build.enableDebugMenu`) + always-on in dev.
+- **Ship scope:** shipped, flag-gated (`build.debugBuild`, formerly `build.enableDebugMenu` —
+  since consolidated with the journal/debug-bridge flags) + always-on in dev.
 - **Charts:** hand-rolled `<canvas>` sparkline — **zero new dependencies** (no chart.js).
 - **Delivery:** everything below, in **phases** (each independently committable/testable).
 
@@ -38,8 +39,8 @@ New shipped-safe module **`engine/packages/modoki/src/runtime/debug/`** (imports
   - `getDebugTabs()`, `getDebugCommands(tab)`, `unregisterDebugTab(id)` (game-switch teardown,
     called from `GameDefinition.unregisterSystems`).
   - `isDebugMenuEnabled()` — reads a module-level `_enabled` flag set once by `setDebugMenuEnabled()`,
-    which `app/main.tsx` calls as `setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_ENABLE_DEBUG_MENU__)`
-    (the `enableDebugMenu` config flag is baked into `__MODOKI_ENABLE_DEBUG_MENU__` at build time).
+    which `app/main.tsx` calls as `setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)`
+    (the `debugBuild` config flag is baked into `__MODOKI_DEBUG_BUILD__` at build time).
 - **`Sparkline.tsx`** — ~60-line `<canvas>` ring-buffer line chart (stream + min/max autoscale +
   last-value label). No deps.
 - **`DebugMenu.tsx`** — fixed-position overlay (modeled on `LoadingOverlay`), tab bar + active-tab
@@ -78,7 +79,7 @@ Each phase is a standalone commit on `work-ai`, ending with: tests green → rev
 - [x] `runtime/debug/`: `debugMenuRegistry.ts`, `Sparkline.tsx`, `DebugMenu.tsx`, `tabs/StatsTab.tsx`,
       `index.ts` (subpath). Pure registry re-exported via `runtime/index.ts`; UI behind the
       `@modoki/engine/runtime/debug` subpath.
-- [x] Config flag `build.enableDebugMenu` in `engine/project-config.ts` → `__MODOKI_ENABLE_DEBUG_MENU__`
+- [x] Config flag `build.debugBuild` in `engine/project-config.ts` → `__MODOKI_DEBUG_BUILD__`
       define in `vite.config.ts` → `setDebugMenuEnabled` in `app/main.tsx` + flag-gated lazy import in `App.tsx`.
 - [x] **Stats tab**: FPS sparkline (`getCurrentFPS()`), memory sparkline (`performance.memory`, labeled
       Chromium-only), GPU stats (`renderer.info` draw calls/triangles/geometries/textures/programs) +
@@ -187,7 +188,7 @@ watch WHILE PLAYING (the modal blocks the game).
 
 ### Phase 5 — Docs + sample + final polish — ✅ DONE
 - [x] `docs/debug-menu.md` — the feature doc: toggle gestures, the gating chain
-      (`build.enableDebugMenu` → `__MODOKI_ENABLE_DEBUG_MENU__` → `setDebugMenuEnabled` → lazy
+      (`build.debugBuild` → `__MODOKI_DEBUG_BUILD__` → `setDebugMenuEnabled` → lazy
       import), architecture invariants (runtime-only, pure registry vs UI subpath, editor-only
       Watch), all built-in tabs/widgets/toaster, and the full extensibility API
       (`registerDebugCommand`/`registerDebugTab`/`registerStatWidget`) with examples. Added to the
@@ -199,7 +200,7 @@ watch WHILE PLAYING (the modal blocks the game).
 ## Critical files
 - **New:** `engine/packages/modoki/src/runtime/debug/{debugMenuRegistry,Sparkline,DebugMenu}.tsx`
   + `tabs/*`; exported via `runtime/index.ts`.
-- **Edit:** `engine/app/App.tsx` (mount + toggle), `engine/project-config.ts` (`enableDebugMenu`),
+- **Edit:** `engine/app/App.tsx` (mount + toggle), `engine/project-config.ts` (`debugBuild`),
   `engine/plugins/load-project-config.ts` + `engine/vite.config.ts` (flag passthrough),
   `games/3d-test/runtime/setup.ts` (sample, P5), `CLAUDE.md` + `docs/` (docs).
 - **Reuse (no new abstractions):** `getCurrentFPS` (`frameDriver.ts`), `getAllEntities`/
@@ -214,7 +215,7 @@ watch WHILE PLAYING (the modal blocks the game).
   engine/scripts/launch-editor.sh games/3d-test`), open Game view, press **F12** → overlay
   appears; drive with the `modoki` MCP (`modoki_press_key`, `modoki_tap` tabs), confirm the FPS
   chart animates via `modoki_capture_viewport`.
-- **On-device:** build `games/3d-test` with `enableDebugMenu:true`, deploy, 3-finger-tap → overlay;
+- **On-device:** build `games/3d-test` with `debugBuild:true`, deploy, 3-finger-tap → overlay;
   confirm FPS reads and a cheat fires.
 - **Bundle boundary:** confirm the built game chunk pulls in **no** `editor/panels` code.
 - **Gate:** `npm run verify` before each push.

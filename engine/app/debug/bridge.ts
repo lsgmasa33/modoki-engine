@@ -53,7 +53,7 @@ function patchConsole() {
 
 // --- Command Handlers ---
 
-function handleEval(params: Record<string, unknown>): unknown {
+function handleEval(params: Record<string, unknown>): Promise<unknown> {
   return evalCode((params.code as string) ?? '');
 }
 

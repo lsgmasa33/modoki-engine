@@ -36,11 +36,21 @@ const chainNode = (): Record<string, unknown> => {
   n.x = n; n.y = n; n.z = n; n.rgb = n; n.a = n; n.toVar = () => n;
   return n;
 };
+// Uniform-group markers. `setGroup` RECORDS the group on the node (as `__group`)
+// so tests can assert a scene-global uniform was put in `renderGroup` rather than
+// the default per-object group — the distinction that caused the height-fog
+// staleness bug (see scene3DSync.ts `HeightFogState`).
+export const objectGroup = { name: 'object', shared: false };
+export const renderGroup = { name: 'render', shared: true };
+export const frameGroup = { name: 'frame', shared: true };
+
 export const uniform = (value: unknown) => {
   const n = chainNode();
   n.value = value;
+  n.__group = objectGroup; // three's default
   n.setName = () => n;
   n.onObjectUpdate = () => n;
+  n.setGroup = (g: unknown) => { n.__group = g; return n; };
   return n;
 };
 export const normalize = () => chainNode();
@@ -50,3 +60,11 @@ export const float = () => chainNode();
 export const length = () => chainNode();
 export const pow = () => chainNode();
 export const clamp = () => chainNode();
+
+// Fog nodes (height-mode syncFog / scene3DSync.ts) — each call returns a distinct
+// chain node so a rebuild is observably a new identity vs. an unchanged reference.
+// The inputs are stashed on the returned node (__color/__factor, __density/__height)
+// so tests can assert the uniforms were wired through correctly, not just that SOME
+// node exists.
+export const fog = (color: unknown, factor: unknown) => ({ ...chainNode(), __color: color, __factor: factor });
+export const exponentialHeightFogFactor = (density: unknown, height: unknown) => ({ ...chainNode(), __density: density, __height: height });

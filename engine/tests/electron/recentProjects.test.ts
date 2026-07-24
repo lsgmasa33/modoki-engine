@@ -11,13 +11,14 @@ import path from 'node:path';
 
 // app.getPath('appData') → <tmp>/appData ; app.getPath('userData') → <tmp>/userData.
 const root = { dir: '' };
+const showOpenDialog = vi.fn();
 vi.mock('electron', () => ({
   app: { getPath: (name: string) => path.join(root.dir, name) },
-  dialog: {},
+  dialog: { showOpenDialog: (...args: unknown[]) => showOpenDialog(...args) },
   Menu: { buildFromTemplate: () => ({}), setApplicationMenu: () => {} },
 }));
 
-import { getRecentProjects, addRecentProject, migrateLegacyRecents, setRecentsScope, chooseInitialProject, isUnderRepo, projectFolderKind } from '../../electron/projects';
+import { getRecentProjects, addRecentProject, migrateLegacyRecents, setRecentsScope, chooseInitialProject, isUnderRepo, projectFolderKind, pickProjectFolder, pickNewProjectFolder } from '../../electron/projects';
 
 const sharedFile = () => path.join(root.dir, 'appData', 'modoki-app', 'recent-projects.json');
 // The legacy DEV recents location is the literal appData/"Electron" dir — dev's userData
@@ -138,6 +139,77 @@ describe('per-editor-identity recents scoping', () => {
     setRecentsScope('/Users/x/Projects/modoki');
     migrateLegacyRecents();
     expect(getRecentProjects()).toEqual([]);
+  });
+});
+
+describe('pickProjectFolder / pickNewProjectFolder — per-editor-identity last folder', () => {
+  beforeEach(() => { showOpenDialog.mockReset(); });
+
+  it('with no scope set, no defaultPath is passed (OS default behavior)', async () => {
+    setRecentsScope('');
+    const chosen = mkProj('a');
+    showOpenDialog.mockResolvedValue({ canceled: false, filePaths: [chosen] });
+    await pickProjectFolder(null);
+    expect(showOpenDialog.mock.calls[0][0].defaultPath).toBeUndefined();
+  });
+
+  it('remembers the parent folder of the last pick, scoped to this editor identity', async () => {
+    setRecentsScope('/Users/x/Projects/modoki-ai');
+    const chosen = mkProj('a');
+    showOpenDialog.mockResolvedValue({ canceled: false, filePaths: [chosen] });
+    await pickProjectFolder(null);
+
+    showOpenDialog.mockResolvedValue({ canceled: true, filePaths: [] });
+    await pickProjectFolder(null);
+    expect(showOpenDialog.mock.calls[1][0].defaultPath).toBe(path.dirname(chosen));
+  });
+
+  it('two editor identities keep independent last-folder memory', async () => {
+    setRecentsScope('/Applications/Modoki Editor.app');
+    const a = mkProj('a');
+    showOpenDialog.mockResolvedValue({ canceled: false, filePaths: [a] });
+    await pickProjectFolder(null);
+
+    setRecentsScope('/Users/x/Projects/modoki-ai');
+    showOpenDialog.mockResolvedValue({ canceled: true, filePaths: [] });
+    await pickProjectFolder(null);
+    expect(showOpenDialog.mock.calls[1][0].defaultPath).toBeUndefined(); // fresh identity, no memory yet
+
+    setRecentsScope('/Applications/Modoki Editor.app');
+    showOpenDialog.mockResolvedValue({ canceled: true, filePaths: [] });
+    await pickProjectFolder(null);
+    expect(showOpenDialog.mock.calls[2][0].defaultPath).toBe(path.dirname(a));
+  });
+
+  it('ignores a remembered folder that no longer exists on disk', async () => {
+    setRecentsScope('/Users/x/Projects/modoki-ai');
+    const chosen = mkProj('transient'); // remembered parent is root.dir/projects
+    showOpenDialog.mockResolvedValue({ canceled: false, filePaths: [chosen] });
+    await pickProjectFolder(null);
+    fs.rmSync(path.dirname(chosen), { recursive: true, force: true }); // the remembered parent dir vanishes
+
+    showOpenDialog.mockResolvedValue({ canceled: true, filePaths: [] });
+    await pickProjectFolder(null);
+    expect(showOpenDialog.mock.calls[1][0].defaultPath).toBeUndefined();
+  });
+
+  it('pickNewProjectFolder tracks its own last folder, independent of pickProjectFolder', async () => {
+    setRecentsScope('/Users/x/Projects/modoki-ai');
+    const opened = mkProj('opened');
+    showOpenDialog.mockResolvedValue({ canceled: false, filePaths: [opened] });
+    await pickProjectFolder(null);
+
+    const created = path.join(root.dir, 'projects', 'created');
+    fs.mkdirSync(created, { recursive: true });
+    showOpenDialog.mockResolvedValue({ canceled: false, filePaths: [created] });
+    await pickNewProjectFolder(null);
+
+    showOpenDialog.mockResolvedValue({ canceled: true, filePaths: [] });
+    await pickProjectFolder(null);
+    expect(showOpenDialog.mock.calls[2][0].defaultPath).toBe(path.dirname(opened));
+
+    await pickNewProjectFolder(null);
+    expect(showOpenDialog.mock.calls[3][0].defaultPath).toBe(path.dirname(created));
   });
 });
 

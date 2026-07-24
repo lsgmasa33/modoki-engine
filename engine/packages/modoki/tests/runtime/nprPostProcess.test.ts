@@ -336,3 +336,32 @@ describe('nprFragmentOutput', () => {
     expect((b as any).lineColor.getHex()).toBe(0x000000); // still the frozen default
   });
 });
+
+describe('applyNprFragmentOutput', () => {
+  // Fog Phase 2 regression: NodeMaterial.fog defaults to true, and three's
+  // setupFog() collapses this helper's 3-target outputStruct down to a single
+  // vec4 — which WebGPU then discards (targets[1]/[2] end up with no fragment
+  // output). applyNprFragmentOutput must turn fog off on the material so a scene
+  // with a Fog entity doesn't silently drop every custom-shader draw.
+  it('sets fragmentNode from nprFragmentOutput AND disables material.fog', async () => {
+    const { applyNprFragmentOutput } = await import('../../src/runtime/rendering/npr/NPRPostProcess');
+    const mat = { fragmentNode: null as unknown, fog: true };
+    applyNprFragmentOutput(mat, { __color: true });
+
+    expect(mat.fragmentNode).toBeTruthy();
+    expect(outputStructSpy).toHaveBeenCalledTimes(1);
+    expect(mat.fog).toBe(false);
+  });
+
+  it('forwards a per-pixel preserve node to nprFragmentOutput', async () => {
+    const { applyNprFragmentOutput } = await import('../../src/runtime/rendering/npr/NPRPostProcess');
+    const mat = { fragmentNode: null as unknown, fog: true };
+    const preserve = { __rimMask: true };
+    applyNprFragmentOutput(mat, { __color: true }, preserve);
+
+    // outputStruct's 3rd arg is vec4(lineColor, preserveNode) — assert the preserve
+    // node we passed reached it, instead of the default materialReference fallback.
+    const call = outputStructSpy.mock.calls[0];
+    expect(call[2]).toEqual({ __vec4: [expect.anything(), preserve] });
+  });
+});

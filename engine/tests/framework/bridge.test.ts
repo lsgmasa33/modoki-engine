@@ -4,7 +4,7 @@
  *  ring, and handleEval. */
 
 import { describe, it, expect } from 'vitest';
-import { safeStringify, screenshotToCSS, createConsoleRing, handleEval } from '../../app/debug/bridgeHelpers';
+import { safeStringify, screenshotToCSS, createConsoleRing, handleEval, EVAL_ASYNC_TIMEOUT_MS } from '../../app/debug/bridgeHelpers';
 
 describe('safeStringify', () => {
   it('returns strings as-is', () => expect(safeStringify('hello')).toBe('hello'));
@@ -92,10 +92,24 @@ describe('console ring', () => {
 });
 
 describe('handleEval', () => {
-  it('evaluates a return expression', () => expect(handleEval('return 2 + 3')).toBe('5'));
-  it('returns a string result as-is', () => expect(handleEval('return "hello"')).toBe('hello'));
-  it('JSON-stringifies an object result', () => expect(handleEval('return { a: 1 }')).toBe('{"a":1}'));
-  it('returns undefined with no return statement', () => expect(handleEval('2 + 3')).toBeUndefined());
-  it('surfaces a runtime error as Error: …', () => expect(handleEval('throw new Error("boom")')).toBe('Error: boom'));
-  it('surfaces a syntax error', () => expect(handleEval('}{invalid')).toMatch(/Error:/));
+  it('evaluates a return expression', async () => expect(await handleEval('return 2 + 3')).toBe('5'));
+  it('returns a string result as-is', async () => expect(await handleEval('return "hello"')).toBe('hello'));
+  it('JSON-stringifies an object result', async () => expect(await handleEval('return { a: 1 }')).toBe('{"a":1}'));
+  it('returns undefined with no return statement', async () => expect(await handleEval('2 + 3')).toBeUndefined());
+  it('surfaces a runtime error as Error: …', async () => expect(await handleEval('throw new Error("boom")')).toBe('Error: boom'));
+  it('surfaces a syntax error', async () => expect(await handleEval('}{invalid')).toMatch(/Error:/));
+
+  it('awaits a returned promise and serializes its resolved value', async () => {
+    expect(await handleEval('return Promise.resolve({ ok: true })')).toBe('{"ok":true}');
+  });
+  it('awaits a returned promise resolving to a primitive', async () => {
+    expect(await handleEval('return Promise.resolve(42)')).toBe('42');
+  });
+  it('surfaces a rejected promise as an Error: …', async () => {
+    expect(await handleEval('return Promise.reject(new Error("nope"))')).toBe('Error: nope');
+  });
+  it('times out a never-resolving promise instead of hanging', async () => {
+    const result = await handleEval('return new Promise(() => {})');
+    expect(result).toMatch(/Error: eval timed out/);
+  }, EVAL_ASYNC_TIMEOUT_MS + 2000);
 });

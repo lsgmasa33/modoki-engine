@@ -94,8 +94,6 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 | [animation-window-review-plan.md](./plans/animation-window-review-plan.md) | Animation Window review-findings remediation tracker — correctness, perf, refactor, test gaps (nearly all done) |
 | [sling-field-editor-plan.md](./plans/sling-field-editor-plan.md) | Grid-painted arena editor for sling — paint floor, autotile the existing kit into walls/corners/colliders, regenerate a scene `Field` group |
 | [sling-slopes-ramps-plan.md](./plans/sling-slopes-ramps-plan.md) | Phase 2/7.2 plan (not started) — ramps let the puck jump off a slope lip to clear a hole or land on a platform, building on the fake-Y model + height layers |
-| [sling-enemy-nav-plan.md](./plans/sling-enemy-nav-plan.md) | Overarching plan — game-level enemy navigation, 3 decoupled layers (walkability → movement → crowd) ALL LANDED + live-verified; flow-field routing, directional ramps, tight-gap threading, no overlap. Remaining: warps/ziplines + continuous-mover mode. Decision record for no-engine-subsystem / no-nav-lib |
-| [sling-enemy-nav-layer1-plan.md](./plans/sling-enemy-nav-layer1-plan.md) | Layer 1 detail (LANDED) — `walkable` (standing) + `canStep` (directional traversal, body clearance) + `buildNavField`/`flowAt` (Dijkstra-to-goal flow field, steer-to-centre) over the field level; 32 unit tests |
 | [preview-mode-refactor.md](./plans/preview-mode-refactor.md) | Plan to unify the fragmented "in an editor preview?" signals into one `RunMode` + a serialization-transience rule so no preview/scrub mutation reaches disk |
 | [todo.md](./todo.md) | Open task checklist — editor, rendering/materials (`MaterialModifier`, custom shader lighting, HDR import settings), native/build |
 

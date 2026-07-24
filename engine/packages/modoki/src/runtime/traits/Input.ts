@@ -78,6 +78,11 @@ export function pointerDrag(world: World): { x: number; y: number } {
   const s = getPresentationScale();
   return { x: p.dragX * s, y: p.dragY * s };
 }
+/** Scroll-wheel notch delta THIS frame (+down / −up, one unit per wheel event);
+ *  0 when the wheel didn't move. Consumed/re-zeroed each frame — read it once. */
+export function getWheelDelta(world: World): number {
+  return getInput(world)?.pointer.wheel ?? 0;
+}
 
 // ── Harness helpers — set the resource directly in headless tests ──────────────
 

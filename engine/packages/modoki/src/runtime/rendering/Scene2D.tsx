@@ -340,6 +340,10 @@ function textCodepoints(text: string): number[] {
 }
 
 const OUTLINE_STROKE = { width: 2, color: 0x2effa6, alpha: 0.9 } as const;
+// Collider-ONLY mode (sprites hidden) uses purple — matches the 3D SceneView's collider-only
+// wireframe color (see SceneView.tsx's ThreeJSViewport `drawCollider`), so the two viewports
+// read as one consistent "you're looking at collision shapes" convention.
+const COLLIDER_ONLY_STROKE = { width: 2, color: 0x9b59b6, alpha: 0.9 } as const;
 
 // Frame-driver identity for the editor SceneView's (non-primary) renderer — distinct from the
 // runtime's 'render2d' so the two never collide in the frame-driver Map. Defined before the class
@@ -444,6 +448,10 @@ export class Scene2DRenderer {
   // ── Collider debug overlay (editor-only) ──
   private readonly colliderOverlays = new Map<number, Graphics>();
   private _showColliders = false;
+  // Collider-ONLY mode: sprites hide entirely and every Collider2D outline draws (in purple),
+  // regardless of `_showColliders` — the 2D counterpart of the 3D SceneView's collider-only
+  // toggle. Implies `_showColliders` is effectively on too (see isShowColliders()/drawColliderOverlays).
+  private _collidersOnly = false;
 
   // ── Lifecycle ──
   private started = false;
@@ -486,6 +494,21 @@ export class Scene2DRenderer {
     this._externalDirty = true;
   }
   isShowColliders() { return this._showColliders; }
+
+  /** Toggle collider-ONLY mode (editor): hides every sprite and forces every Collider2D
+   *  outline on, in purple — the 2D SceneView counterpart of the 3D "Colliders" toolbar
+   *  toggle (docs/todo.md "manual edit"). Forces a redraw so sprites vanish/reappear now. */
+  setCollidersOnly(on: boolean) {
+    if (this._collidersOnly === on) return;
+    this._collidersOnly = on;
+    this._externalDirty = true;
+  }
+  isCollidersOnly() { return this._collidersOnly; }
+
+  /** Whether an entity currently has a live display-object slot (sprite/graphics/mesh/text) —
+   *  i.e. it's actually drawn right now, not just Renderable2D.isVisible on the ECS side. Lets
+   *  an E2E assert collider-only mode really hides sprites (see devTestBridge.has2DSprite). */
+  hasSprite(entityId: number): boolean { return this.slots.has(entityId); }
 
   private findCanvasAncestor(entityId: number): number | null {
     // Per-frame cache fast-path (set by the path-caching below for siblings that
@@ -585,7 +608,7 @@ export class Scene2DRenderer {
    *  overlay Graphics. Called at the end of renderFrame; marks touched canvases dirty. */
   private drawColliderOverlays(world: World) {
     for (const g of this.colliderOverlays.values()) if (!g.destroyed) g.clear();
-    if (!this._showColliders) return;
+    if (!this._showColliders && !this._collidersOnly) return;
 
     world.query(Transform, Collider2D).updateEach(([tf, col]: [any, any], entity: any) => {
       const id = entity.id();
@@ -600,12 +623,13 @@ export class Scene2DRenderer {
       if (g.parent !== cSlot.container) { g.removeFromParent(); cSlot.container.addChild(g); }
       g.zIndex = 1e9; // above every sprite (sortableChildren re-sorts on render)
 
-      // Collider dims are world-unit (NOT scaled by Transform.scale — matching the sim), so bake
-      // position + rotation (not scale) from the world transform into the shared overlay Graphics.
+      // Collider dims scale with Transform.scale, matching the sim (physics2DSystem's
+      // makeColliderDesc) — bake position + rotation from the world transform into the shared
+      // overlay Graphics; drawColliderOutlineGfx applies `scale` to the outline's own dims.
       const wt = getWorldTransform2D(id, tf);
       const cos = Math.cos(wt.rz), sin = Math.sin(wt.rz);
       const xf = (lx: number, ly: number) => ({ x: wt.x + lx * cos - ly * sin, y: wt.y + lx * sin + ly * cos });
-      drawColliderOutlineGfx(g, col, OUTLINE_STROKE, xf, wt.rz);
+      drawColliderOutlineGfx(g, col, this._collidersOnly ? COLLIDER_ONLY_STROKE : OUTLINE_STROKE, xf, wt.rz, { sx: wt.sx ?? 1, sy: wt.sy ?? 1 });
       this.dirtyCanvases.add(canvasId);
     });
   }
@@ -693,7 +717,7 @@ export class Scene2DRenderer {
     // when their render inputs changed since last frame — redraw.
     world.query(Transform, Renderable2D).updateEach(
       ([tf, rend]: [any, any], entity: any) => {
-        if (!rend.isVisible || deactivatedEntities.has(entity.id())) return;
+        if (!rend.isVisible || this._collidersOnly || deactivatedEntities.has(entity.id())) return;
         const id = entity.id();
 
         // Custom 2D material: once its shader program is ready, the material pass (Step
@@ -886,7 +910,7 @@ export class Scene2DRenderer {
     materialIds.clear();
     world.query(Transform, Renderable2D).updateEach(
       ([tf, rend]: [any, any], entity: any) => {
-        if (!rend.isVisible || deactivatedEntities.has(entity.id())) return;
+        if (!rend.isVisible || this._collidersOnly || deactivatedEntities.has(entity.id())) return;
         if (!rend.material) return;
         const program = ensureSpriteMaterial(rend.material, () => this.markDirty()) as PixiShaderProgram | undefined;
         if (!program) return; // still loading / failed → Step 3 drew the default; nothing here
@@ -1043,7 +1067,7 @@ export class Scene2DRenderer {
     // version advanced (idle rig ⇒ no GPU churn).
     world.query(Transform, SkinnedSprite2D).updateEach(
       ([tf, ss]: [any, any], entity: any) => {
-        if (!ss.isVisible || deactivatedEntities.has(entity.id())) return;
+        if (!ss.isVisible || this._collidersOnly || deactivatedEntities.has(entity.id())) return;
         // A Billboard3D (camera-facing) or FlatSprite3D (ground-plane) companion promotes
         // this rig OUT of the flat 2D canvas and into the Three.js scene. Skip it here —
         // returning before `activeIds.add` lets the end-of-pass sweep dispose any stale 2D slot.
@@ -1171,7 +1195,7 @@ export class Scene2DRenderer {
     world.query(Transform, Text2D).updateEach(
       ([tf, t]: [any, any], entity: any) => {
        try {
-        if (!t.isVisible || deactivatedEntities.has(entity.id())) return;
+        if (!t.isVisible || this._collidersOnly || deactivatedEntities.has(entity.id())) return;
         const id = entity.id();
         const canvasId = this.findCanvasAncestor(id);
         if (canvasId === null) return;

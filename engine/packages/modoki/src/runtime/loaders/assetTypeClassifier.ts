@@ -27,6 +27,7 @@ export const JSON_ASSET_SUFFIX_TYPE: ReadonlyArray<readonly [suffix: string, typ
   ['.rig2d.json', 'rig2d'],
   ['.anim.json', 'animation'],
   ['.level.json', 'level'],
+  ['.wave.json', 'wave'],
   ['.timeline.json', 'timeline'],
 ];
 

@@ -51,9 +51,13 @@ export interface GameDefinition {
    *  it doesn't pop in a few frames after the game appears. `world` is the freshly-loaded
    *  world. Best-effort: a rejection is logged and boot continues. */
   onSceneReady?: (world: World) => Promise<void> | void;
-  /** Register game-specific editor-only glue — e.g. UIRenderer store-binding
-   *  hooks so the editor's default UI layer can resolve this game's bindings.
-   *  Called once at editor init for every game; not called in the game runtime. */
+  /** Register game-specific editor-only glue — e.g. UIRenderer store-binding hooks so
+   *  the editor's default UI layer can resolve this game's bindings, or a
+   *  `registerCreatableAsset()` call (`@modoki/engine/editor`) adding a "Create X" entry
+   *  to the Assets panel for a game-specific asset kind (e.g. sling's Level/Wave charts).
+   *  Called once at editor init for every game; not called in the game runtime — put the
+   *  `@modoki/engine/editor` import behind a lazy loader (like `editorPanels` below) so it
+   *  never reaches the production game bundle. */
   registerEditorBindings?: () => void | Promise<void>;
   /** Register game-specific dockable editor panels (e.g. a level painter). Called
    *  once at editor init; the returned components are merged into the editor's panel

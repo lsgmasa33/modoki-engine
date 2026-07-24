@@ -23,29 +23,19 @@ const repoRoot = path.resolve(engineDir, '..')
 // rsync resolve this SAME path so the three stay in lockstep.
 const buildProjectRoot = process.env.MODOKI_PROJECT ? path.resolve(process.env.MODOKI_PROJECT) : repoRoot
 
-// Percept — whether the event journal records in THIS build. Baked as a define so
-// the runtime bootstrap (app/main.tsx) can gate it without a config fetch. Always
-// on for the editor (see the __MODOKI_EDITOR__ OR in main.tsx); for a shipped GAME
-// build it follows the open project's build.enableJournal (default false → off,
-// dropping per-event overhead). Editor/dev has no project.config.json at repoRoot,
-// so this resolves to false there and the __MODOKI_EDITOR__ OR turns it on.
-const enableJournalFlag = loadProjectConfig(buildProjectRoot).build.enableJournal === true
-
-// In-game debug menu — same pattern as the journal flag. Baked as a define so the
-// runtime bootstrap (app/main.tsx) gates enablement and App.tsx gates the lazy
-// import (tree-shaking the menu out when off) without a config fetch. Always on for
-// the editor (the __MODOKI_EDITOR__ OR in App.tsx/main.tsx); for a shipped GAME
-// build it follows the open project's build.enableDebugMenu (default false → off).
-const enableDebugMenuFlag = loadProjectConfig(buildProjectRoot).build.enableDebugMenu === true
-
-// Debug BRIDGE — the native TCP / web-WS debug server that carries device_* MCP tools,
-// INCLUDING device_eval (arbitrary JS on the device). Same bake-as-a-define pattern as the
-// two flags above so main.tsx can constant-fold the whole `./debug/bridge` import out. Unlike
-// the others it was previously UNGATED on native (shipped in every build); now a shipped GAME
-// build follows the open project's build.debugBridge (default false → the bridge is
-// tree-shaken out entirely, so a release build has no eval-capable server to connect to).
-// Always on for the editor + dev (the DEV / __MODOKI_EDITOR__-adjacent OR in main.tsx).
-const enableDebugBridgeFlag = loadProjectConfig(buildProjectRoot).build.debugBridge === true
+// Debug build — whether the event journal records, the in-game debug menu ships, AND
+// the debug bridge (native TCP / web-WS server carrying device_* MCP tools, INCLUDING
+// device_eval — arbitrary JS on the device) ships in THIS build. One flag for all
+// three (see project-config.ts's `debugBuild` doc comment for why). Baked as a define
+// so the runtime bootstrap (app/main.tsx) can gate all three, and App.tsx can gate the
+// debug-menu lazy import, without a config fetch. Always on for the editor (see the
+// __MODOKI_EDITOR__ OR in main.tsx/App.tsx); for a shipped GAME build it follows the
+// open project's build.debugBuild (default false → off, dropping journal per-event
+// overhead, tree-shaking the debug-menu chunk, and tree-shaking the whole
+// `./debug/bridge` import so a release build has no eval-capable server to connect
+// to). Editor/dev has no project.config.json at repoRoot, so this resolves to false
+// there and the __MODOKI_EDITOR__ OR turns it on.
+const debugBuildFlag = loadProjectConfig(buildProjectRoot).build.debugBuild === true
 
 // Absolute dir of @zappar/msdf-generator, pinned so its bare import resolves even when the
 // dep-optimize cache is relocated out of the tree in a packaged editor (see resolve.alias
@@ -185,9 +175,7 @@ export default defineConfig(({ command }) => {
   // false, stripping the agent bridge — same as today's DEV gate did.
   define: {
     __MODOKI_EDITOR__: JSON.stringify(command === 'serve' || process.env.MODOKI_EDITOR === 'true'),
-    __MODOKI_ENABLE_JOURNAL__: JSON.stringify(enableJournalFlag),
-    __MODOKI_ENABLE_DEBUG_MENU__: JSON.stringify(enableDebugMenuFlag),
-    __MODOKI_ENABLE_DEBUG_BRIDGE__: JSON.stringify(enableDebugBridgeFlag),
+    __MODOKI_DEBUG_BUILD__: JSON.stringify(debugBuildFlag),
     __MODOKI_MODULE_RENDER3D__: JSON.stringify(moduleFlags.render3d),
     __MODOKI_MODULE_RENDER2D__: JSON.stringify(moduleFlags.render2d),
     __MODOKI_MODULE_PHYSICS2D__: JSON.stringify(moduleFlags.physics2d),
@@ -235,6 +223,27 @@ export default defineConfig(({ command }) => {
   // resolve and Vite still transforms the worker's bare imports (comlink).
   optimizeDeps: {
     exclude: ['@zappar/msdf-generator'],
+    // PACKAGED-ONLY: pre-bundle the @modoki/engine subpaths the DYNAMICALLY-loaded game
+    // module imports but the editor's own startup graph does NOT (notably
+    // `runtime/rendering`). In a packaged app electron-builder dereferences the
+    // @modoki/engine symlink into a real node_modules dir, so Vite OPTIMIZES it. If
+    // `runtime/rendering` is first seen only when a project opens, Vite re-optimizes
+    // mid-session, rehashes every @modoki_engine_* chunk, and the already-loaded
+    // `runtime.js?v=<old>` goes stale → the renderer blanks with "does not provide an
+    // export named …". Forcing these into the cold-start optimize gives one stable hash
+    // before any game loads. Gated on MODOKI_VITE_CACHEDIR (set only when packaged) so
+    // DEV keeps engine HMR — there @modoki/engine is a symlinked SOURCE dep, never
+    // optimized, and including it would replace Fast Refresh with full reloads.
+    ...(process.env.MODOKI_VITE_CACHEDIR ? {
+      include: [
+        '@modoki/engine/runtime',
+        '@modoki/engine/runtime/rendering',
+        '@modoki/engine/runtime/debug',
+        '@modoki/engine/editor',
+        '@modoki/engine/editor/rendering',
+        '@modoki/engine/three',
+      ],
+    } : {}),
   },
   resolve: {
     // Dedupe three so every TSL node builder (NPR pipeline + particle SpriteNodeMaterial)

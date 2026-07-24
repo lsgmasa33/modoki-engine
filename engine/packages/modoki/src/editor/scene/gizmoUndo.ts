@@ -52,3 +52,21 @@ export function buildTransformUndoAction(opts: TransformUndoOptions): UndoAction
   }
   return action;
 }
+
+/** Combine several per-member transform actions into ONE undo step for a group (multi-select)
+ *  gizmo drag, so undo/redo reverses the whole gesture — every member together — in one step
+ *  (gizmos: one-undo-per-drag, extended to N members). Journalled as a single `!transform`
+ *  carrying every member's guid + before/after so Percept still perceives the group edit. */
+export function buildGroupTransformUndoAction(label: string, actions: UndoAction[]): UndoAction {
+  const combined: UndoAction = {
+    label,
+    undo: () => { for (const a of actions) a.undo(); },
+    redo: () => { for (const a of actions) a.redo(); },
+  };
+  const members = actions.map((a) => a.journalPayload).filter(Boolean) as Record<string, unknown>[];
+  if (members.length) {
+    combined.kind = '!transform';
+    combined.journalPayload = { entities: members.map((m) => m.entity), members };
+  }
+  return combined;
+}

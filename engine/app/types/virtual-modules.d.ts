@@ -21,26 +21,16 @@ declare module 'virtual:modoki-games' {
  *  can enable them. Defined via Vite `define` in vite.config.ts. */
 declare const __MODOKI_EDITOR__: boolean;
 
-/** Percept — build-time flag: whether the event journal records in this build.
- *  On for the editor (folded with __MODOKI_EDITOR__ in app/main.tsx); for a
- *  shipped game build it follows the project's `build.enableJournal`. Defined via
- *  Vite `define` in vite.config.ts. */
-declare const __MODOKI_ENABLE_JOURNAL__: boolean;
-
-/** Debug menu — build-time flag: whether the in-game debug menu is present in this
- *  build. On for the editor (folded with __MODOKI_EDITOR__ in app/main.tsx); for a
- *  shipped game build it follows the project's `build.enableDebugMenu`. Gates both
- *  the runtime enablement flag AND the App.tsx lazy import (so it tree-shakes out
- *  when off). Defined via Vite `define` in vite.config.ts. */
-declare const __MODOKI_ENABLE_DEBUG_MENU__: boolean;
-
-/** Debug bridge — build-time flag: whether the native TCP / web-WS debug server (the
- *  transport behind every `device_*` MCP tool, INCLUDING `device_eval`'s arbitrary-JS
- *  execution) is present in this build. On for the editor + dev; for a shipped game build
- *  it follows the project's `build.debugBridge` (default false). Gates the `./debug/bridge`
- *  import in app/main.tsx so a release build tree-shakes the whole eval-capable server out
- *  — there is nothing to connect to. Defined via Vite `define` in vite.config.ts. */
-declare const __MODOKI_ENABLE_DEBUG_BRIDGE__: boolean;
+/** Debug build — build-time flag: whether this build ships the event journal
+ *  (recording), the in-game debug menu, AND the native TCP / web-WS debug server
+ *  (the transport behind every `device_*` MCP tool, INCLUDING `device_eval`'s
+ *  arbitrary-JS execution). On for the editor + dev (folded with __MODOKI_EDITOR__
+ *  in app/main.tsx / App.tsx); for a shipped game build it follows the project's
+ *  `build.debugBuild` (default false). Gates the App.tsx debug-menu lazy import and
+ *  the `./debug/bridge` import in app/main.tsx so a release build tree-shakes both
+ *  out entirely — there is nothing to connect to. Defined via Vite `define` in
+ *  vite.config.ts. */
+declare const __MODOKI_DEBUG_BUILD__: boolean;
 
 /** Engine-module toggles — build-time flags: whether each heavy SDK is present in
  *  this build. On for editor/dev (all SDKs); for a game/playable build they follow

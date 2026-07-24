@@ -2,7 +2,7 @@
  *
  *  Shows the recent event stream newest-first with an optional type filter and a
  *  clear button. The journal is OFF in a normal shipped game build (gated on
- *  `__MODOKI_EDITOR__ || build.enableJournal`) to keep `emit()` allocation-free on
+ *  `__MODOKI_EDITOR__ || build.debugBuild`) to keep `emit()` allocation-free on
  *  hot paths — so when it's disabled we say so rather than showing an empty list. */
 
 import { useEffect, useState, type CSSProperties } from 'react';
@@ -21,7 +21,7 @@ export function JournalTab() {
   }, []);
 
   if (!isJournalEnabled()) {
-    return <div style={mutedStyle}>Journal is disabled in this build. Enable via the editor or project.config.json <code>build.enableJournal</code>.</div>;
+    return <div style={mutedStyle}>Journal is disabled in this build. Enable via the editor or project.config.json <code>build.debugBuild</code>.</div>;
   }
 
   const all = journalEvents();
@@ -53,8 +53,9 @@ export function JournalTab() {
 
 function EventRow({ event }: { event: GameEvent }) {
   return (
-    <div style={eventRowStyle}>
+    <div style={event.level === 'error' ? errorRowStyle : event.level === 'warn' ? warnRowStyle : eventRowStyle}>
       <span style={tickStyle}>{event.tick}</span>
+      {event.level !== 'info' && <span style={event.level === 'error' ? errorTypeStyle : warnTypeStyle}>{event.level}</span>}
       <span style={typeStyle}>{event.type}</span>
       {event.payload != null && <span style={payloadStyle}>{summarize(event.payload)}</span>}
     </div>
@@ -77,7 +78,11 @@ const inputStyle: CSSProperties = { flex: 1, background: 'rgba(255,255,255,0.06)
 const btnStyle: CSSProperties = { background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.15)', color: '#c4b5fd', cursor: 'pointer', fontSize: 12, padding: '3px 8px', borderRadius: 4 };
 const listStyle: CSSProperties = { maxHeight: 240, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 2, fontSize: 12 };
 const eventRowStyle: CSSProperties = { display: 'flex', gap: 6, alignItems: 'baseline', padding: '2px 4px', borderRadius: 3, background: 'rgba(255,255,255,0.03)' };
+const warnRowStyle: CSSProperties = { ...eventRowStyle, background: 'rgba(234,179,8,0.10)' };
+const errorRowStyle: CSSProperties = { ...eventRowStyle, background: 'rgba(239,68,68,0.14)' };
 const tickStyle: CSSProperties = { color: '#6b6b85', fontVariantNumeric: 'tabular-nums', minWidth: 34, textAlign: 'right', flexShrink: 0 };
 const typeStyle: CSSProperties = { color: '#a5b4fc', fontWeight: 600, flexShrink: 0 };
+const warnTypeStyle: CSSProperties = { color: '#eab308', fontWeight: 700, flexShrink: 0, textTransform: 'uppercase', fontSize: 10 };
+const errorTypeStyle: CSSProperties = { color: '#ef4444', fontWeight: 700, flexShrink: 0, textTransform: 'uppercase', fontSize: 10 };
 const payloadStyle: CSSProperties = { color: '#8b8ba7', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
 const mutedStyle: CSSProperties = { fontSize: 11, color: '#6b6b85', fontStyle: 'italic', lineHeight: 1.5 };

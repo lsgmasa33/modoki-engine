@@ -253,7 +253,7 @@ interface GameDefinition {
   registerSystems?: () => Promise<void> | void;     // game systems + trait metadata
   unregisterSystems?: () => Promise<void> | void;   // cleanup on teardown
   registerPostprocessors?: () => Promise<void> | void;
-  registerEditorBindings?: () => void | Promise<void>; // editor-only UI binding glue
+  registerEditorBindings?: () => void | Promise<void>; // editor-only glue (UI bindings, creatable-asset registrations, …)
   registerAppServices?: () => Promise<void> | void;    // native analytics/ads/etc.
   resetPhase?: (world: World) => void;              // error-recovery reset
   UIComponent?: React.ComponentType;                // optional custom React UI layer

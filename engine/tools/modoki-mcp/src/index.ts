@@ -1226,8 +1226,12 @@ server.tool(
   'Read the tick-stamped game-event trace (events a game emits: match/score/win/…). The ' +
     'screenshot-free way to verify game LOGIC — assert on events, not pixels. Returns the ' +
     'LAST 100 events by default plus `byType` counts over the whole 10,000-event ring and ' +
-    '`captures` (Tier-2 diagnostic state). Narrow with type=, raise limit=N, pair with ' +
-    'modoki_dispatch_action to drive the game.\n' +
+    '`captures` (Tier-2 diagnostic state). Narrow with type= and/or level=, raise limit=N, pair ' +
+    'with modoki_dispatch_action to drive the game.\n' +
+    'LEVEL: every event carries a triage severity, `info` (default) / `warn` / `error` — set via ' +
+    'the `gameJournal.ts` helpers (`journalWarn`/`journalError`) or emit()\'s 4th arg. ' +
+    'level:"warn" returns warn AND error, skipping the normal-gameplay noise — the fastest way to ' +
+    'start a bug hunt.\n' +
     'TIERS: lean events (semantic + @collision/@sensor/@zone transitions) are always recorded. ' +
     'High-frequency DIAGNOSTIC events (@contact) are WATCH-GATED — they record NOTHING until you ' +
     'open a capture and only from that point forward (this keeps the journal from being dominated ' +
@@ -1235,13 +1239,15 @@ server.tool(
     'want to trace, then read, then stop.',
   {
     type: z.string().optional().describe('Read: only events of this type. With action: the watch-gated type to start/stop (e.g. "@contact").'),
+    level: z.enum(['info', 'warn', 'error']).optional().describe('Read: only events at this severity OR ABOVE (e.g. "warn" returns warn + error).'),
     action: z.enum(['start', 'stop']).optional().describe('Open ("start") or close ("stop") a Tier-2 capture window for type=. Omit to just read.'),
     limit: z.number().optional().describe('Return the last N events (default 100). An explicit limit always wins.'),
     clear: z.boolean().optional().describe('Clear the journal after reading.'),
   },
-  async ({ type, action, limit, clear }) => {
+  async ({ type, level, action, limit, clear }) => {
     const q = new URLSearchParams();
     if (type) q.set('type', type);
+    if (level) q.set('level', level);
     if (action) q.set('action', action);
     if (limit != null) q.set('limit', String(limit));
     if (clear) q.set('clear', '1');

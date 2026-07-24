@@ -5,7 +5,7 @@
  *  and shape rendering to Canvas 2D context. */
 
 import { isImagePath, resolveImageUrl, resolveDomImageUrl, resolvePrimitiveShape, type PrimitiveShape } from './renderUtils';
-import { colliderOutline2D, colliderGeomSig, type ColliderOutline, type ColliderShapeParams } from './colliderOutline2D';
+import { colliderOutline2D, colliderGeomSig, scaleColliderOutline2D, type ColliderOutline, type ColliderShapeParams } from './colliderOutline2D';
 
 /** Sentinel Renderable2D.sprite that draws the entity's OWN Collider2D shape as a filled
  *  (open polyline colliders: stroked) graphic — a visible body for polygon/polyline/concave colliders
@@ -92,8 +92,14 @@ export interface GraphicsLike {
   stroke(style: { width: number; color: number; alpha?: number; cap?: 'butt' | 'round' | 'square'; join?: 'round' | 'bevel' | 'miter' }): unknown;
 }
 
-/** Draw a Collider2D's outline as a FILLED shape into a PixiJS Graphics (runtime path).
- *  Mirrors {@link drawColliderFill} via the same {@link colliderOutline2D}. */
+/** Draw a Collider2D's outline as a FILLED shape into a PixiJS Graphics — the visual for a
+ *  `sprite: 'collider'` entity (the collider-as-placeholder-sprite render mode). Used by BOTH
+ *  the runtime `Scene2DRenderer` (`defaultRenderer`) and the editor's own Pixi instance
+ *  (`editorScene2DRenderer`) — there is no separate Canvas2D twin; the editor's 2D content
+ *  renders through Pixi too (only the gizmo/selection chrome overlay is a native Canvas2D
+ *  context — see `drawColliderOutline` below). Scale comes for free from the caller's own
+ *  Pixi container transform (`displaySlot.obj.scale`), so unlike `drawColliderOutlineGfx` this
+ *  needs no separate scale param. */
 export function drawColliderFillGfx(gfx: GraphicsLike, c: ColliderShapeParams, color: number): void {
   const o: ColliderOutline | null = colliderOutline2D(c);
   if (!o) return;
@@ -116,17 +122,22 @@ export function drawColliderFillGfx(gfx: GraphicsLike, c: ColliderShapeParams, c
   }
 }
 
-/** Draw a Collider2D's outline as a STROKE into a Canvas 2D ctx (editor selection overlay).
- *  Assumes ctx is already at the entity's world transform (translate+rotate, NO scale —
- *  colliders are unscaled). Peer of {@link drawColliderFill}; both source {@link colliderOutline2D},
- *  and the capsule is one agreed STADIUM (side lines + half-arc caps) so the two paths + the
- *  Pixi overlay can't drift. */
+/** Draw a Collider2D's outline as a STROKE into a Canvas 2D ctx — the gizmo/selection-chrome
+ *  overlay drawn on top of the editor's Pixi-rendered 2D content (`drawScene2D` in
+ *  SceneView.tsx). Assumes ctx is already at the entity's world transform (translate+rotate —
+ *  scale is applied here instead, via `scale`, since a circle/capsule's radius can't be baked
+ *  into a ctx.scale the way a per-axis polygon could: see {@link scaleColliderOutline2D}). Peer
+ *  of {@link drawColliderOutlineGfx} (the Pixi debug-overlay twin) — both source
+ *  {@link colliderOutline2D}, and the capsule is one agreed STADIUM (side lines + half-arc
+ *  caps) so the two paths can't drift. */
 export function drawColliderOutline(
   ctx: CanvasRenderingContext2D, c: ColliderShapeParams,
   opts: { color: string; width: number; dash?: number[] },
+  scale: { sx: number; sy: number } = { sx: 1, sy: 1 },
 ): void {
-  const o = colliderOutline2D(c);
+  let o = colliderOutline2D(c);
   if (!o) return;
+  o = scaleColliderOutline2D(o, scale.sx, scale.sy);
   ctx.strokeStyle = opts.color; ctx.lineWidth = opts.width;
   if (opts.dash) ctx.setLineDash(opts.dash);
   ctx.beginPath();
@@ -149,15 +160,18 @@ export function drawColliderOutline(
 
 /** Draw a Collider2D's outline as a STROKE into a PixiJS Graphics (Scene2D debug overlay).
  *  All colliders share one Graphics with no per-object transform, so points are BAKED through
- *  `xf` (world position+rotation, no scale) and cap arcs are rotated by `rot`. Same STADIUM
- *  capsule as {@link drawColliderOutline}. */
+ *  `xf` (world position+rotation; `scale` is baked into the outline's OWN dims first — see
+ *  {@link scaleColliderOutline2D} — since a circle/capsule radius can't ride a per-axis xf) and
+ *  cap arcs are rotated by `rot`. Same STADIUM capsule as {@link drawColliderOutline}. */
 export function drawColliderOutlineGfx(
   gfx: GraphicsLike, c: ColliderShapeParams,
   style: { width: number; color: number; alpha?: number },
   xf: (lx: number, ly: number) => { x: number; y: number }, rot: number,
+  scale: { sx: number; sy: number } = { sx: 1, sy: 1 },
 ): void {
-  const o = colliderOutline2D(c);
+  let o = colliderOutline2D(c);
   if (!o) return;
+  o = scaleColliderOutline2D(o, scale.sx, scale.sy);
   if (o.kind === 'circle') {
     const p = xf(0, 0); gfx.arc(p.x, p.y, o.radius, 0, Math.PI * 2);
   } else if (o.kind === 'capsule') {

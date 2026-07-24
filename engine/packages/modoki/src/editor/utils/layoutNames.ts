@@ -28,3 +28,11 @@ export function deriveLayoutBaseName(fileName: string): string {
   const base = fileName.replace(/\.layout\.json$|\.json$/i, '').replace(/[^\w-]+/g, '-').replace(/^-+|-+$/g, '') || 'imported';
   return base === AUTOSAVE_NAME ? 'imported' : base;
 }
+
+/** Sanitize a layout name for use as an EXPORT filename stem — unlike
+ *  `sanitizeLayoutName`, this does NOT reject the reserved AUTOSAVE_NAME (a
+ *  downloaded file is not a write into the project's named-layout store, so
+ *  "autosave.layout.json" is a perfectly valid filename). */
+export function sanitizeExportFileName(raw: string): string {
+  return raw.trim().replace(/[^\w-]+/g, '-').replace(/^-+|-+$/g, '') || 'layout';
+}

@@ -5,18 +5,18 @@ import App from './App.tsx'
 import { Capacitor } from '@capacitor/core'
 import { setJournalEnabled, setDebugMenuEnabled } from '@modoki/engine/runtime'
 
-// Percept — event-journal recording gate. ON in the editor (dev + the packaged
+// Debug build — event-journal recording gate. ON in the editor (dev + the packaged
 // Electron editor, __MODOKI_EDITOR__) and in a game build that opts in via
-// project.config.json `build.enableJournal`; OFF in a normal shipped game build so
+// project.config.json `build.debugBuild`; OFF in a normal shipped game build so
 // `emit()` adds no per-event allocation on hot paths (physics contacts, etc.).
 // (Deferred: a debug|profile|release mode enum — see docs/percept-plan.md.)
-setJournalEnabled(__MODOKI_EDITOR__ || __MODOKI_ENABLE_JOURNAL__)
+setJournalEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
 
 // In-game debug menu — ON in the editor (dev + packaged Electron editor) and in a
-// game build that opts in via project.config.json `build.enableDebugMenu`. The
-// App.tsx lazy import is gated on the same OR, so a release build with the flag off
+// game build that opts in via project.config.json `build.debugBuild`. The App.tsx
+// lazy import is gated on the same OR, so a release build with the flag off
 // tree-shakes the whole debug-menu chunk out. See docs/debug-menu-plan.md.
-setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_ENABLE_DEBUG_MENU__)
+setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
 
 // Native SDK init (Adjust/AppLovin) is no longer wired here — it moved into the
 // game's app-service package, registered via GameDefinition.registerAppServices()
@@ -26,16 +26,16 @@ setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_ENABLE_DEBUG_MENU__)
 // Debug bridge — the native TCP + UDP beacon / web-WS server behind every device_* MCP tool
 // (device_eval runs ARBITRARY JS on the device through it). Gating, tightest-first:
 //   • Dev / VITE_DEBUG_BRIDGE=1 — always on (the local dev loop + the WebSocket fallback).
-//   • Shipped native game — ONLY when the project opts in via build.debugBridge
-//     (__MODOKI_ENABLE_DEBUG_BRIDGE__). Previously this was ungated on native, so a RELEASE
+//   • Shipped native game — ONLY when the project opts in via build.debugBuild
+//     (__MODOKI_DEBUG_BUILD__). Previously this was ungated on native, so a RELEASE
 //     build shipped the eval-capable server; now the default (flag off) constant-folds the
 //     native branch to false and Rollup DCEs the whole `./debug/bridge` import — a release
-//     build has no server to connect to. Turn it on per-game in Project Settings → Engine
-//     (or set build.debugBridge:true) for on-device debugging.
+//     build has no server to connect to. Turn it on per-game in Project Settings → Developer
+//     (or set build.debugBuild:true) for on-device debugging.
 // The `!__MODOKI_PLAYABLE__` build-constant guard additionally DCEs the branch out of a
 // playable ad (the runtime isNativePlatform() check alone can't be constant-folded, so the
 // bridge JS would otherwise inline into the single-file creative against the byte cap).
-if (!__MODOKI_PLAYABLE__ && (import.meta.env.DEV || import.meta.env.VITE_DEBUG_BRIDGE || (__MODOKI_ENABLE_DEBUG_BRIDGE__ && Capacitor.isNativePlatform()))) {
+if (!__MODOKI_PLAYABLE__ && (import.meta.env.DEV || import.meta.env.VITE_DEBUG_BRIDGE || (__MODOKI_DEBUG_BUILD__ && Capacitor.isNativePlatform()))) {
   import('@modoki/engine/runtime').then(({ useGameStore }) => {
     (window as unknown as Record<string, unknown>).__gameStore = useGameStore;
   });

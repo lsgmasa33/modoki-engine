@@ -280,11 +280,19 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   dispatchable actions + read-values. Assert on events, not screenshots. Returns the **last 100 events
   + `byType` counts over the whole 10,000-event ring** (a `@contact`-heavy physics session is ~582k
   tokens entire) — narrow with `type=`, raise `limit=N`. (Journal is **off in shipped game builds** —
-  gated `__MODOKI_EDITOR__ || build.enableJournal`; always on in the editor. On device the bridge
+  gated `__MODOKI_EDITOR__ || build.debugBuild`; always on in the editor. On device the bridge
   turns it ON the moment a debug client attaches — on `connectionChanged` AND, because a page
   reload re-runs `main.tsx`'s disable while the native socket persists with no reconnect event, at
   bridge init via `getStatus().clientConnected` — so launch/reload-time events record during a
   debug session. Events from before the FIRST attach of a session are still unrecorded.)
+- **Severity (bug triage):** every event carries a `level` — `info` (default) / `warn` / `error`.
+  Game code sets it via `gameJournal.ts`'s `journalWarn`/`journalError` helpers (thin wrappers over
+  `emit()` for "something unexpected happened" — a missing spawn point, a failed asset acquire — the
+  kind of thing worth finding FIRST in a bug hunt); `journalState`/`journalDecision` cover `info`-level
+  state transitions and "why did the game take this branch" events. `modoki_journal`/`device_journal
+  level=` filters to that severity **and above** (`level:"warn"` returns `warn`+`error`), skipping the
+  normal-gameplay noise. Raw `emit(type, payload, world, level)` still works for a plain semantic event
+  — the helpers are convention, not a requirement.
 - **Journal TIERS (volume control).** The journal is Percept's largest payload, so events split two
   ways. **Tier-1 always-on**: semantic events + the LEAN enter/exit transitions `@collision`/`@sensor`/
   `@zone` (low-rate — a bare read always sees them). **Tier-2 watch-gated**: the high-frequency
@@ -565,8 +573,9 @@ Standalone Capacitor plugin at `engine/packages/capacitor-game-debug/`. Runs a T
   `FLAG_DEBUGGABLE` runtime check rejects in release. So a store/release-signed build has no native
   TCP server.
 - **JS bridge** (`app/main.tsx` → `./debug/bridge`, which carries `handleEval` = arbitrary JS) —
-  gated by the `build.debugBridge` project flag (Project Settings → Developer), baked as
-  `__MODOKI_ENABLE_DEBUG_BRIDGE__`. Default **false** → the whole `./debug/bridge` import
+  gated by the single `build.debugBuild` project flag (Project Settings → Developer — the same flag
+  that also gates the event journal and the in-game debug menu, see [percept-plan.md](./percept-plan.md)
+  Decision D), baked as `__MODOKI_DEBUG_BUILD__`. Default **false** → the whole `./debug/bridge` import
   tree-shakes out of a shipped game build (native AND web), so there is no eval-capable JS server at
   all; the editor + dev keep it always-on. This is the layer that also covers the web
   (`VITE_DEBUG_BRIDGE`) path and closes the pre-existing gap where the JS bridge was ungated on

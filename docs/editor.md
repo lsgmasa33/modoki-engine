@@ -46,6 +46,15 @@ On startup `loadInitialModel()` prefers the tracked file, then the localStorage 
 then the built-in default layout. *Reset Layout* clears both and reloads (live
 Three.js/Pixi viewports don't tear down cleanly on an in-place model swap).
 
+A named layout is project-local (`.modoki/layouts` is gitignored) — to move a layout to
+another project/machine or share it, both directions go through a portable
+`<name>.layout.json` FILE (not the project store): *Load Layout…* → *Load from file…*
+imports one (parsed, guarded by `isLayoutJson`, then written into the project store under
+its derived base name), and both *Save Layout As…* and *Load Layout…* have an *Export to
+file…* action that downloads the current/selected layout via a `Blob` + `<a download>`
+click (`downloadLayoutJson`, `sanitizeExportFileName` in `editor/utils/layoutNames.ts`).
+There is no top-level menu item for export — it's reached through those two modals.
+
 The menu bar (`File` / `Edit` / `View`, plus host-injected menus) is rendered by
 `components/MenuBar`. Keyboard: `Cmd/Ctrl+S` → Save All, `Cmd/Ctrl+Z` → undo,
 `Cmd/Ctrl+Shift+Z` → redo.
@@ -82,7 +91,18 @@ Panels live in `editor/panels/`:
 - **Assets** (`Assets.tsx`) — the project asset browser. Context-menu *Re-import* on a
   single asset, or *Re-import all* (recursive, per-folder + root) to regenerate
   converted texture/model variants via `/api/reimport`. See
-  [Materials & Textures](./textures.md). The bottom of the panel hosts a **Scripts**
+  [Materials & Textures](./textures.md). Right-clicking a folder (folder view), a
+  category header (category view), or empty background in either view opens a **Create**
+  menu (New Folder, Create Scene/Material/Animation/Animset/Sprite Animation/2D Rig/
+  Particle/Atlas, …) driven by the **creatable-asset registry**
+  (`editor/panels/creatableAssets.ts`): `registerCreatableAsset({ id, label, ext,
+  defaultName, assetType, body, onCreated, … })` adds an entry (idempotent by `id`);
+  `getCreatableAssets()` — read live at menu-open time — supplies the menu. Engine
+  built-ins register once via `registerBuiltinCreatableAssets()`
+  (`editor/panels/builtinCreatableAssets.ts`, called from `createEditor()`); a game adds
+  its own from `GameDefinition.registerEditorBindings` (see the Editor Panels section
+  below and `games/sling/editor/creatables.ts`, which contributes "Create Level" /
+  "Create Wave"). The bottom of the panel hosts a **Scripts**
   view (`ScriptTree.tsx`) — a lightweight collapsible tree of the project's source
   (`game.ts`, `runtime/**`, writable) plus a read-only **Engine** source root, fed by
   `GET /api/scripts/tree`. Scripts deliberately bypass the asset pipeline (no
@@ -179,6 +199,45 @@ derives basic hints from a koota schema's default values; it has no internal cal
 The gizmo mode (`translate | rotate | scale`) and space (`world | local`) live in
 `editorStore` and are shared by both modes via a toolbar.
 
+#### Multi-select gizmo
+
+When more than one entity is selected, the gizmo transforms the whole group together — Unity
+conventions, in **both** the 3D (`TransformControls`) and 2D (Canvas `Gizmo2D`) viewports. The
+group math is a single pure module, `editor/scene/multiTransform.ts` (headless-unit-tested in
+`tests/editor/multiTransform.test.ts`), so the two viewports drive identical logic.
+
+- **Two toggles.** Local/Global (`gizmoSpace`, shortcut **X**) sets the axis orientation.
+  Pivot/Center (`gizmoPivot`, shortcut **Z**, dimmed for single-select) sets **where the single
+  rotate/scale pivot sits** — `center` = the selection centroid; `pivot` = the active
+  (last-selected) entity's origin. **Both modes rotate/scale the group RIGIDLY around that one
+  point** (the member at the pivot stays put, the rest orbit/spread) — there is no "spin each in
+  place" mode; the pure math takes no pivot-mode flag, only the pivot *position* differs. Move
+  translates every member by the same delta either way. Default is **Pivot + Global** (Unity's).
+- **Descendant filtering** (`filterOutDescendants`) drops a selected child of a selected parent so
+  each transform is applied once (the child rides its parent).
+- **3D** attaches `TransformControls` to an empty pivot *proxy* parked at the pivot; the drag delta
+  (`pivotNow · pivotStart⁻¹`) is applied to every member's world matrix, then converted back to each
+  local `Transform` via `worldToLocalTransform`. **Rotate/scale write POSITION as well as
+  rotation/scale** — the group orbit/spread moves member positions (unlike a single-entity gizmo).
+- **2D** drives a *virtual* gizmo at the pivot to derive the drag's world delta, then applies it
+  around the pivot via `applyGroupTransform2D`. Center frames the whole selection; Pivot draws a
+  normal single-entity-sized box on the active entity. The pivot point, its orientation, and the
+  framing box are resolved by the pure `resolveGroupPivot2D` (`multiTransform.ts`, unit-tested) —
+  Local space orients the group gizmo's axes by the active member's world `rz` (mirroring the 3D
+  proxy's `groupProxy.rotation`); a fix, since it originally shipped hardcoded to world-aligned
+  regardless of the Local/Global toggle. Pivot mode falls back to Center framing when the active
+  entity isn't actually part of the group (filtered out as a descendant, or a different canvas).
+- **Marquee** — Shift + left-drag on empty space draws a rubber-band box that ADDS every enclosed
+  entity to the selection (plain left-drag still orbits/pans; orbit is suppressed only for the
+  shift-drag). Both viewports. Shift/Ctrl-click also add/toggle, mirroring the Hierarchy panel.
+- **Undo** — one group drag is a single batched step (`buildGroupTransformUndoAction`) covering
+  every member. Because undo/redo write traits via a direct `entity.set` (no dirty broadcast), the
+  2D overlay AND the Pixi content are both explicitly re-woken on undo (`subscribeUndo` →
+  `mark2DDirty` + `editorMarkScene2DDirty`), else a reverted 2D transform shows stale until refocus.
+- **Selection state was already array-based** (`selectedEntityIds` + primary `selectedEntityId`) —
+  this feature was purely SceneView-viewport wiring; the store, Inspector, Hierarchy, and selection
+  undo already supported multi-select.
+
 3D rendering in SceneView shares sync logic with the runtime via
 `runtime/rendering/scene3DSync.ts` (`syncRenderables` — the exported entry point; it
 composes the module-private `syncMaterial`/`applyTransform` helpers internally),
@@ -203,18 +262,26 @@ passes plain values in):
 UI mode picking is DOM-native — the `UIRenderer` reports the clicked element's entity via
 `onSelectEntity`.
 
-### 3D collider outline overlay
+### 3D collider outline overlay + collider-only mode
 
 When a `Collider3D` entity is selected in 3D mode, SceneView draws a **green wireframe**
 (`0x2ecc71` `LineSegments`) of the collider shape, built by the pure builder
 `runtime/rendering/colliderOutline3D.ts` (`colliderWireframeGeometry` +
 `colliderOutlineSig3D` change-detection, rebuilt only when the shape/dims signature
-changes). Primitive shapes (`box`/`sphere`/`cylinder`/`cone`/`capsule`) are built at their
-**absolute** collider dims and follow the entity's world position + rotation but **not**
-`Transform.scale` (colliders are unscaled world units); mesh shapes (`convex`/`trimesh`)
-edge the resolved mesh geometry and **do** bake world scale. Only the selected entity's wire
-is kept; it's disposed on deselect or a switch to UI mode. For the 2D collider
-**vertex-editing** overlay (the "Points" toolbar mode) see [physics-2d.md](./physics-2d.md).
+changes). The toolbar's **View ▾ → Colliders** checkbox (`ViewOptionsMenu.tsx`) additionally
+outlines EVERY `Collider3D` in **purple** (`0x9b59b6`) and hides regular mesh rendering
+entirely (`shouldHideMeshesForColliderMode`, `sceneViewMath.ts`) — a collider-only debug view.
+Primitive shapes (`box`/`sphere`/`cylinder`/`cone`/`capsule`) are built at their absolute
+collider dims, then the wire's `.scale` is set by `colliderWorldScale3D` to MATCH how
+`physics3DSystem`'s `makeColliderDesc` scales the live Rapier collider — box per-axis;
+sphere/capsule/cylinder/cone by mean radius (they can't represent a non-uniform scale as an
+ellipsoid) — so a scaled floor/wall's wireframe reads at its true simulated size instead of a
+fixed unscaled box. Mesh shapes (`convex`/`trimesh`) edge the resolved mesh geometry, which
+already bakes world scale, so their wire scale is taken directly from world scale. Only the
+selected entity's wire is kept outside collider-only mode; wires are disposed on deselect
+(or all of them, on a switch to UI mode). For the 2D SceneView's own collider-only mode
+(**View ▾ → Colliders**, hides sprites instead of meshes) and the 2D collider
+**vertex-editing** overlay (the "Points" toolbar mode), see [physics-2d.md](./physics-2d.md).
 
 ---
 
@@ -405,6 +472,16 @@ folder **re-roots the backend** to it (`setProject` rebinds the Vite server and 
 build/packaging + self-update detail is in [build.md](./build.md); the overall process model
 is in [architecture.md](./architecture.md).
 
+Both the recents list and the folder picker's starting directory are scoped **per editor
+identity** (`recentsScope` — install path when packaged, repo root in dev; set once at startup
+via `setRecentsScope`), not shared machine-wide: each dev clone (see the Clones section in the
+root `CLAUDE.md`) gets its own recents file AND remembers its own last-used Open/New Project
+folder (`pickProjectFolder`/`pickNewProjectFolder` pass `defaultPath` from, and persist to, a
+`<identity-hash>-last-folders.json` next to the scoped recents file). This exists because the
+OS-native picker's own "last folder" memory is keyed by app bundle id, which several unpackaged
+dev clones share — without this, opening a project in one clone would silently seed the starting
+folder for a sibling clone's picker.
+
 ---
 
 ## ECS as the source of truth
@@ -455,6 +532,7 @@ The undo stack is capped at 200 entries (oldest dropped, warned once per session
 | Trait registry / Inspector field hints | `runtime/ecs/traitRegistry.ts`, `engine/app/ecs/registerTraits.ts` |
 | 3D gizmo | Three.js `TransformControls` (in `SceneView.tsx`) |
 | UI / 2D gizmo | `editor/panels/UIResizeOverlay.tsx`, `Gizmo2D.ts` |
+| Multi-select group-gizmo math (3D + 2D) | `editor/scene/multiTransform.ts` |
 | Object picking (3D/2D hit-test) | `editor/panels/picking.ts` |
 | 3D collider outline | `runtime/rendering/colliderOutline3D.ts` |
 | Play / Stop / Pause | `editor/scene/playMode.ts`, `runtime/systems/playState.ts` |

@@ -17,7 +17,7 @@ import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_3D } fr
 import { registerSceneRenderer, unregisterSceneRenderer, type SceneRenderer } from './offscreenCapture';
 import { registerBoundsProvider, projectAABBToScreen, type EntityScreenBounds } from './screenBounds';
 import { readbackToRGBA, type ReadbackBackend } from './readbackToRGBA';
-import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncLights, syncSceneRenderables3D, orientBillboards, prewarmShadersForWorld, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
+import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, prewarmShadersForWorld, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
 import { registerRenderSurface } from './materialBroker';
 import { getRenderSettings } from './renderSettings';
 import { clampBufferSize } from './webCanvasSizing';
@@ -248,6 +248,7 @@ export default function Scene3D() {
         activeCamera = syncCamera(world, scene, camera, orthoCamera);
         applyFraming(world, activeCamera, camera.aspect, activeCamera === orthoCamera);
         syncEnvironment(world, scene);
+        syncFog(world, scene);
         syncLights(world, scene, ecsLights);
         syncSceneRenderables3D(world, scene, renderState);
         orientBillboards(renderState, activeCamera); // face billboards toward the live camera
@@ -394,6 +395,7 @@ export default function Scene3D() {
           const world = getCurrentWorld();
           const activeForCapture = syncCamera(world, scene, camera, orthoCamera);
           syncEnvironment(world, scene);
+          syncFog(world, scene);
           syncLights(world, scene, ecsLights);
           // Same unconditional renderable+skeletal core as the live renderFrame
           // (runtime-rendering-3d.md F1): without syncSkinnedModels/syncBones/

@@ -20,7 +20,7 @@ import { applyDeadzone, type InputFrame } from './actions';
 
 /** W3C "standard gamepad" button indices (https://w3c.github.io/gamepad/#remapping). */
 const BTN = {
-  A: 0, B: 1, /* X: 2, Y: 3, */ START: 9,
+  A: 0, B: 1, /* X: 2, Y: 3, */ LT: 6, START: 9,
   DPAD_UP: 12, DPAD_DOWN: 13, DPAD_LEFT: 14, DPAD_RIGHT: 15,
 } as const;
 
@@ -65,9 +65,10 @@ export function sampleGamepadInto(pad: GamepadSnapshot, out: InputFrame, deadzon
   if (pressed(pad, BTN.DPAD_RIGHT)) { out.held.navRight = true; out.axes.moveX += 1; active = true; }
 
   // Face buttons. A = confirm + jump (mirrors keyboard Space); B = cancel;
-  // Start = menu + pause.
+  // Start = menu + pause; left trigger = aim (mirrors keyboard F).
   if (pressed(pad, BTN.A)) { out.held.confirm = true; out.held.jump = true; active = true; }
   if (pressed(pad, BTN.B)) { out.held.cancel = true; active = true; }
+  if (pressed(pad, BTN.LT)) { out.held.aim = true; active = true; }
   if (pressed(pad, BTN.START)) { out.held.menu = true; out.held.pause = true; active = true; }
 
   return active;

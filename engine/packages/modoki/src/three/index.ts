@@ -2,6 +2,7 @@
 
 export { Light } from './traits/Light';
 export { Environment } from './traits/Environment';
+export { Fog } from './traits/Fog';
 export {
   worldTransforms, deactivatedEntities, transformPropagationSystem,
 } from './systems/transformPropagationSystem';

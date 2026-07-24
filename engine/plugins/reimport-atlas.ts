@@ -25,6 +25,7 @@ import { getCacheDir, cacheHit } from './texture-cache';
 import { atlasHashKey, atlasPageUrlPath, type AtlasHashMember } from './atlas-cache';
 import { readMetaSidecar, writeMetaSidecar } from './meta-sidecar';
 import type { ReimportHandler, ReimportAsset } from './reimport-registry';
+import { nativeDynamicImport } from './native-dynamic-import';
 
 export { readMetaSidecar } from './meta-sidecar';
 
@@ -122,7 +123,7 @@ export const atlasReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
     console.warn(`[atlas] ${sourceUrlPath}: ${result.overflow.length} member(s) didn't fit (page too small / maxPages) — omitted from the atlas.`);
   }
 
-  const sharp = (await import('sharp')).default;
+  const sharp = ((await nativeDynamicImport('sharp')) as typeof import('sharp')).default;
   // Group placed frames by page, each with its resolved member (source texture + slice).
   const memberByGuid = new Map(members.map((m) => [m.guid, m]));
   const framesByPage = new Map<number, { spriteGuid: string; rect: ResolvedMember['rect']; member: ResolvedMember }[]>();

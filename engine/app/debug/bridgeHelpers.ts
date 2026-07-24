@@ -47,13 +47,29 @@ export function screenshotToCSS(
   return { x: sx, y: sy };
 }
 
+/** Bound on how long an async `device_eval` (a returned Promise) is awaited before the bridge
+ *  gives up and reports a timeout — without this, a hung/never-resolving promise would wedge
+ *  the eval indefinitely instead of surfacing an error. */
+export const EVAL_ASYNC_TIMEOUT_MS = 5000;
+
 /** Run `code` as a function body (so `return x` yields a value — the device_eval contract) and
  *  serialize the result, or return an `Error: …` string. (The old `eval` fallback was dead — a
- *  function body is a superset of a script — and double-executed side effects on a runtime error.) */
-export function handleEval(code: string): unknown {
+ *  function body is a superset of a script — and double-executed side effects on a runtime error.)
+ *  A returned Promise (e.g. `return someAsyncCall()`) is awaited, bounded by
+ *  `EVAL_ASYNC_TIMEOUT_MS` — otherwise a thenable's own properties serialize to a misleading `{}`
+ *  instead of its actual resolved value (this bit a real debugging session: an eval reading OTA
+ *  state silently reported `{}` instead of the real, non-empty state). */
+export async function handleEval(code: string): Promise<unknown> {
   try {
     const fn = new Function(code);
-    return safeStringify(fn());
+    const result = fn();
+    if (result && typeof (result as { then?: unknown }).then === 'function') {
+      const timeout = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`eval timed out after ${EVAL_ASYNC_TIMEOUT_MS}ms (code returned a Promise that never resolved)`)), EVAL_ASYNC_TIMEOUT_MS),
+      );
+      return safeStringify(await Promise.race([result, timeout]));
+    }
+    return safeStringify(result);
   } catch (e) {
     return `Error: ${(e as Error).message}`;
   }

@@ -2,7 +2,7 @@
  *
  *  Separate from the main runtime index so importing the UI (DebugMenu + tabs, which
  *  pull React component code) is opt-in: the app shell lazy-imports this behind a
- *  build-flag gate, so a release game with `enableDebugMenu` off tree-shakes it out.
+ *  build-flag gate, so a release game with `debugBuild` off tree-shakes it out.
  *  The pure registry (registerDebugTab/registerDebugCommand/isDebugMenuEnabled) is
  *  re-exported from the main runtime index for cheap game-side registration.
  *

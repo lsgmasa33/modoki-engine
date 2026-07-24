@@ -72,6 +72,37 @@ export const idByName = (page: Page, name: string): Promise<number | null> =>
 export const traitField = (page: Page, id: number, trait: string, field: string): Promise<unknown> =>
   page.evaluate(({ i, t, f }) => (window as any).__modokiEditorTest.traitField(i, t, f), { i: id, t: trait, f: field });
 
+/** Whether an entity's rendered 3D object is currently visible in the SceneView — null when
+ *  no 3D viewport is mounted or the entity has no rendered object. See devTestBridge's
+ *  `isMeshVisible`. */
+export const isMeshVisible = (page: Page, id: number): Promise<boolean | null> =>
+  page.evaluate((i) => (window as any).__modokiEditorTest.isMeshVisible(i), id);
+
+/** Whether an entity has a live 2D display-object slot in the editor's ui-mode Pixi renderer.
+ *  See devTestBridge's `has2DSprite`. */
+export const has2DSprite = (page: Page, id: number): Promise<boolean> =>
+  page.evaluate((i) => (window as any).__modokiEditorTest.has2DSprite(i), id);
+
+/** Click a checkbox row inside the SceneView's "View ▾" dropdown (ViewOptionsMenu,
+ *  SceneView.tsx) — opens the menu first (via `menuUiId`) only if the row isn't already
+ *  visible, so repeated toggles of the same session don't need to re-open it every time. */
+export async function clickViewOption(page: Page, menuUiId: string, itemUiId: string) {
+  const item = page.locator(`[data-ui-id="${itemUiId}"]`);
+  if (!(await item.isVisible().catch(() => false))) {
+    await page.locator(`[data-ui-id="${menuUiId}"]`).click();
+    await item.waitFor({ state: 'visible', timeout: 5_000 });
+  }
+  await item.click();
+}
+
+/** Project an entity's WORLD position through the live 3D SceneView camera into PAGE (client)
+ *  coordinates the same way the real marquee/raycast do — see devTestBridge's
+ *  `screenPositionOf`. Lets a test compute a click/drag target for an arbitrary entity instead
+ *  of relying on a hardcoded camera/projection fact. Null when no 3D viewport is mounted, the
+ *  entity has no world transform yet, or it projects behind the camera. */
+export const screenPositionOf = (page: Page, id: number): Promise<{ x: number; y: number } | null> =>
+  page.evaluate((i) => (window as any).__modokiEditorTest.screenPositionOf(i), id);
+
 /** Find the Inspector input currently showing `currentValue`, type `newValue`, and blur.
  *  Locating by live value (a DOM property React controls) sidesteps brittle label/index
  *  selectors — we tag the element, drive it via Playwright, then untag. */

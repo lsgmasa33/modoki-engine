@@ -62,6 +62,12 @@ interface EditorState {
   gizmoMode: 'translate' | 'rotate' | 'scale';
   /** Coordinate space for gizmo transforms */
   gizmoSpace: 'world' | 'local';
+  /** Multi-select rotation/scale pivot (Unity's Pivot/Center toggle). Only matters when >1
+   *  entity is selected — it chooses WHERE the single pivot point sits; the group rotates/scales
+   *  rigidly around it either way. 'pivot' = the active (last-selected) entity's origin (that
+   *  entity stays put, the rest orbit it); 'center' = the selection centroid. Move is identical
+   *  either way. */
+  gizmoPivot: 'pivot' | 'center';
   /** On-canvas collider-mesh editing: when true, the selected entity's polygon/mesh
    *  Collider2D shows draggable vertex handles in the 2D SceneView (Phase 4.3). */
   colliderEditMode: boolean;
@@ -99,6 +105,11 @@ interface EditorState {
   /** Build progress state. `errorDetail` holds the failing step's output tail
    *  (populated on failure) so the modal can show WHY, not just THAT, it failed. */
   buildStatus: { active: boolean; message: string; step: number; totalSteps: number; failed: boolean; errorDetail?: string };
+  /** Scene-load progress. `active` spans a `loadScene` call; `loaded`/`total`
+   *  count resources acquired (each `total` entry is one fetch that, on a cold
+   *  asset cache, triggers an on-demand bake — so the bar tracks real bake work).
+   *  The modal only renders after a ~400ms delay, so warm loads never flash it. */
+  sceneLoadStatus: { active: boolean; loaded: number; total: number };
   /** Transient toast notice (e.g. save succeeded / blocked). Auto-clears. */
   toast: { id: number; message: string; kind: 'info' | 'warn' | 'success' } | null;
   /** Selective Apply-to-Prefab dialog state */
@@ -233,6 +244,7 @@ interface EditorState {
   setSceneViewMode: (mode: '3d' | 'ui') => void;
   setFocusedPanel: (panel: string | null) => void;
   setGizmoSpace: (space: 'local' | 'world') => void;
+  setGizmoPivot: (pivot: 'pivot' | 'center') => void;
   setParticlePreview: (on: boolean) => void;
   setGameViewSize: (width: number, height: number) => void;
   setGameRect: (rect: EditorState['gameRect']) => void;
@@ -243,6 +255,7 @@ interface EditorState {
    *  rejection in the console. */
   setImportError: (message: string) => void;
   setBuildStatus: (status: Partial<EditorState['buildStatus']>) => void;
+  setSceneLoadStatus: (status: Partial<EditorState['sceneLoadStatus']>) => void;
   /** Show a transient toast notice; auto-clears after ~3.5s (kind tints it). */
   showToast: (message: string, kind?: 'info' | 'warn' | 'success') => void;
   openParticleEditor: (asset: SelectedAsset) => void;
@@ -380,6 +393,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   selectedAssets: [],
   gizmoMode: 'translate',
   gizmoSpace: 'world',
+  gizmoPivot: 'pivot',
   colliderEditMode: false,
   showFocusGraph: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:showFocusGraph') === '1'),
   sceneViewMode: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:sceneViewMode') === 'ui') ? 'ui' : '3d',
@@ -390,6 +404,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   assetsVersion: 0,
   importStatus: { active: false, message: '', step: 0, totalSteps: 0 },
   buildStatus: { active: false, message: '', step: 0, totalSteps: 5, failed: false },
+  sceneLoadStatus: { active: false, loaded: 0, total: 0 },
   toast: null,
   applyPrefabDialog: { active: false, rootInstanceId: null },
   revertPrefabDialog: { active: false, rootInstanceId: null },
@@ -536,6 +551,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
     set({ focusedPanel: panel });
   },
   setGizmoSpace: (space: 'local' | 'world') => { if (get().gizmoSpace !== space) editorEmit('!gizmo', { space }); set({ gizmoSpace: space }); mark2DDirty(); },
+  setGizmoPivot: (pivot: 'pivot' | 'center') => { if (get().gizmoPivot !== pivot) editorEmit('!gizmo', { pivot }); set({ gizmoPivot: pivot }); mark2DDirty(); },
   setParticlePreview: (on: boolean) => set({ particlePreview: on }),
   setGameViewSize: (width, height) => set({ gameViewSize: { width, height } }),
   setGameRect: (rect) => set({ gameRect: rect }),
@@ -545,6 +561,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   setImportError: (message) =>
     set({ importStatus: { active: true, message, step: 0, totalSteps: 0, failed: true } }),
   setBuildStatus: (status) => set((s) => ({ buildStatus: { ...s.buildStatus, ...status } })),
+  setSceneLoadStatus: (status) => set((s) => ({ sceneLoadStatus: { ...s.sceneLoadStatus, ...status } })),
   showToast: (message, kind = 'info') => {
     if (_toastTimer !== null) clearTimeout(_toastTimer); // clear the prior toast's timer
     const id = ++_toastSeq;

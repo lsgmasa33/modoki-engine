@@ -91,6 +91,49 @@ it needs, pointing you at **Build → Build Support…** to install anything mis
 `JAVA_HOME`/`ANDROID_HOME` from that shared, version-strict detection, so you don't set them by hand
 the way the manual CLI recipes below do. Full detail: [editor-toolchain.md](./editor-toolchain.md).
 
+## Packaged editor loop (test the DMG faithfully, fast)
+
+Three loops, three jobs — don't conflate them:
+
+- **`editor:main` / `editor:ai` (+ `MODOKI_BACKEND_PORT=5181 …` for ai2)** — the **HMR dev loop**.
+  Vite dev server + Electron; edit a file, see it in ~200ms. This is for *building* the software and
+  is your default.
+- **`npm run test:packaged` / `smoke:packaged`** — the **faithful packaged loop**. Both run
+  `electron-builder --dir` to produce the REAL `Modoki Editor.app` (asar packed, workspace symlinks
+  dereferenced, devDeps pruned) — it is **the DMG minus code-signing + dmg-packaging** (the only slow
+  parts), so ~20–40s, not ~7 min. `test:packaged` launches it interactively (main-process logs stream
+  live); `smoke:packaged` launches headless and auto-asserts render **+ CSP** (via
+  `assert-app-csp.mjs`). This is for *checking that it packages* — a periodic fidelity check, NOT a
+  dev environment (the `.app` serves from a FROZEN copy of engine source, so it has **no HMR** — every
+  edit needs a rebuild).
+  - **Per-clone MCP-targetable packaged editor**: `editor:main:packaged` / `editor:ai:packaged` (or
+    `MODOKI_BACKEND_PORT=<port> bash engine/scripts/test-packaged.sh games/<id>`) build the `.app` and
+    launch it on the clone's pinned backend port — the packaged app honors `MODOKI_BACKEND_PORT`, so
+    `MODOKI_BACKEND=http://127.0.0.1:<port>` drives it exactly like the dev editor. It uses the SAME
+    port as that clone's dev editor, so run one **or** the other per clone, not both (the packaged app
+    pins the port and refuses to drift). The launch stops the local dev editor + any packaged app
+    first — it's a **single-instance** check, unlike the coexisting dev editors.
+- **Why the `.app` is built to `/tmp`, never in-repo**: the packaged app's Node resolution walks UP
+  the tree, so an in-repo `.app` would find the repo's `node_modules` and **mask** the exact
+  "dependency excluded from the package" bugs the test exists to catch. Building outside the repo is a
+  deliberate correctness property — do NOT relocate the build into the project folder.
+
+Why this loop exists: packaged-only bugs (minimal Finder PATH, asar-sealed `package.json`,
+dereferenced `@modoki/engine` symlink, pruned devDeps, PROD-only CSP) are **invisible to
+`npm run dev`** — the dev env has full PATH, live symlinks, no asar, no CSP. Static guards
+(`engine/tests/electron/cspContract.test.ts`, `packagingManifest.test.ts`, run every `npm test`)
+catch the cheap contract regressions; the `--dir` smoke catches the env-boundary class they can't.
+
+**Before pushing a packaging change** (anything under `engine/electron/**`, `electron-builder.yml`,
+`engine/plugins/**`, `engine/scripts/build-web.mjs`, `engine/toolchain/**`): run
+**`npm run verify:packaged`** — it's `verify` **plus** `smoke:packaged` (build the faithful `--dir`
+`.app` + assert it renders and enforces its prod CSP). This is a **manual** gate (no pre-push hook)
+because it does a real `--dir` build + boots an editor window (~1–2 min, macOS-only) — too heavy for
+every `verify`. Plain `verify` already runs the cheap static packaging guards, and release CI
+(`release.yml`) runs the smoke on a tag, so `verify:packaged` is the local belt-and-suspenders for
+the env-boundary class. It stops the local dev editor and builds a throwaway `.app` on port 5188
+(outside the 5179/5180/5181 human-editor range).
+
 ## CLI recipes
 
 The examples use `games/<id>`; substitute the project and its appId. Note the **project-dir cwd**

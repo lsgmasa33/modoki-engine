@@ -8,7 +8,7 @@
  *
  *  Registered tokens:
  *    {inputDevice}  → 'gamepad' | 'keyboard' | 'pointer' | 'native' | 'none'
- *    {confirmPrompt}, {cancelPrompt}, {menuPrompt}, {pausePrompt}, {jumpPrompt}
+ *    {confirmPrompt}, {cancelPrompt}, {menuPrompt}, {pausePrompt}, {jumpPrompt}, {aimPrompt}
  *
  *  Values are PULLED at resolve time from the live `Input` resource — the
  *  repaint that makes a swap visible the instant a controller is touched comes

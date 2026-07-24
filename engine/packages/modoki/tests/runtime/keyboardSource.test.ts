@@ -84,6 +84,10 @@ describe('keyboardSource key→action mapping', () => {
     expect(sampleWith(['p']).held.pause).toBe(true);
   });
 
+  it('F → aim', () => {
+    expect(sampleWith(['f']).held.aim).toBe(true);
+  });
+
   it('keyup releases; blur/detach clears all held state', () => {
     fire('keydown', { key: 'a' });
     fire('keyup', { key: 'a' });

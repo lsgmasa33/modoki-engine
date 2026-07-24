@@ -122,6 +122,119 @@ Source `.hdr` files are downscaled offline into a content cache by `env-convert.
 3. **Re-encode** — a hand-rolled canonical new-RLE RGBE `.hdr` (`encodeHDR`, literal/uncompressed runs — a layout `HDRLoader` always parses; `floatToRgbe` shared-exponent encoding). Width must be in `[8, 32767]` (a real ≥256 equirect always is; a pathologically narrow HDR THROWS → source fallback rather than silent corruption).
 4. **Cache** — the output `~env.hdr` lands in the content cache (`env-cache.ts`), keyed on source bytes + settings. A cache hit SKIPS the expensive decode entirely, reading src + variant dims cheaply from the ASCII header resolution line (`readHdrHeaderDims`).
 
+## Fog
+
+A `Fog` entity (`three/traits/Fog.ts`) drives scene-wide fog. `syncFog(world, scene)`
+(`scene3DSync.ts`) applies it every frame, mirroring `syncEnvironment`'s first-active-entity-wins +
+clear-on-none convention:
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `enabled` | `false` | Turn fog on for this scene. |
+| `mode` | `'linear'` | `'linear'` (Near/Far), `'exponential'` (Density), or `'height'` (Density + Height). |
+| `color` | `0xa8b4c0` | Fog color, blended over distant/fogged surfaces. |
+| `near` / `far` | `10` / `100` | Linear mode: distance (world units) where fog starts / reaches full color. |
+| `density` | `0.02` | Exponential + height modes: thickness — higher closes in sooner. Rule of thumb: `density ≈ 1 / typical viewing distance` — the `0.02` default is tuned for scenes spanning hundreds of units and reads as "no fog" in a small scene (a few world units needs density closer to 0.2–0.5). |
+| `height` | `10` | Height mode: world-Y fog ceiling — geometry BELOW this fogs (denser the lower + farther), geometry above stays clear. Requires Y-up. |
+
+### The hybrid mechanism (why there are two code paths)
+
+**`linear`/`exponential` → the classic `scene.fog` object.** Despite this engine rendering
+exclusively through `WebGPURenderer` with TSL/`NodeMaterial` (see "No custom GLSL" below),
+`NodeMaterial.fog` defaults to `true`, and three's own `NodeManager.updateFog()` transparently
+converts `scene.fog` (a `THREE.Fog`/`FogExp2` instance) into the equivalent TSL node graph
+(`fog(color, rangeFogFactor(near, far))` / `densityFogFactor(density)`) on every render — no manual
+`scene.fogNode`/TSL wiring needed. `syncFog` just assigns `scene.fog` directly, and three caches the
+derived TSL node by the `Fog`/`FogExp2` object's own identity, refreshing
+`color`/`near`/`far`/`density` each frame via `reference()` nodes (`NodeUpdateType.OBJECT`) — so
+mutating the SAME object's fields already gets "update without recompiling the shader" for free.
+`syncFog` only allocates a NEW `Fog`/`FogExp2` instance when `mode` switches to/from one of these
+(different classes, cached separately under different keys).
+
+**`height` → `scene.fogNode` directly.** There is no classic-object equivalent for height fog, so it
+drives `scene.fogNode` via `fog(color, exponentialHeightFogFactor(density, height))` — the same TSL
+primitives, hand-assembled. `NodeManager.getFogNode()` prefers `scene.fogNode` over a
+derived-from-`scene.fog` node, so `syncFog` explicitly nulls whichever path is inactive (a stale
+`scene.fog`/`scene.fogNode` would otherwise silently win).
+
+**A stable node identity is a correctness requirement here, not an optimization.** `Node.getHash()`
+returns the node's own instance id, and `NodeManager.getCacheKey()` folds `fogNode.getCacheKey()`
+into the render-object's SHADER CACHE KEY — so rebuilding the height-fog node every frame would
+recompile every affected material's shader every frame. `syncFog` keeps one `HeightFogState` (the
+`color`/`density`/`height` `uniform()` nodes + the composed fog node) per physical `THREE.Scene` in a
+`WeakMap`, built once and mutated in place — the same pattern `sceneLightUniforms.ts` uses for
+custom-shader lighting. Toggling `height → linear/exponential → height` reuses the cached node
+rather than rebuilding it.
+
+### ⚠️ Scene-global TSL uniforms MUST use `renderGroup` — the uniform-group rule
+
+This bit us twice (HDR env intensity, then height fog) before the root cause was understood. **The
+rule: a bare `uniform()` is a PER-OBJECT uniform, and a per-object uniform on static geometry never
+updates.** Read this before adding any new TSL uniform.
+
+Three's `uniform()` defaults to `objectGroup` — one uniform buffer **per render object**. Those
+buffers are only re-uploaded inside `Bindings.updateForRender(renderObject)`, which `Renderer`
+calls **only when `NodeMaterialObserver.needsRefresh(renderObject)` is true**. That observer
+watches only MATERIAL properties (its fixed `refreshUniforms` list), the world matrix, geometry,
+and lights — so for a **static mesh with a plain (non-node) material it returns false forever**
+once initialized. A scene-global value written into such a uniform therefore updates its JS-side
+`.value` correctly but **never reaches the GPU on non-animating geometry**, while animated objects
+update fine — a maddening *partial* staleness that looks like "some things update, some don't".
+(Diagnosing it requires a TRUE framebuffer read: a forced `modoki_capture_viewport` render does
+NOT fix it, which rules out a render-on-demand scheduling gap and points at the uniform upload.)
+
+`renderGroup` is the fix and the intended mechanism: a **shared** group (`shared: true`,
+`updateType: RENDER`) whose single bind group / buffer is shared by every material referencing
+those nodes and re-uploaded once per render call, so it cannot go per-object stale. Three's own
+`NodeManager.updateFog()` does exactly this for the classic `scene.fog` path
+(`reference(...).setGroup(renderGroup)`) — which is precisely why linear/exponential fog never had
+the bug and height fog did.
+
+```ts
+// ✅ scene-global (fog, scene lights, wind, global time)
+const color = uniform(new THREE.Color()).setGroup(renderGroup);
+// ✅ genuinely per-object (reads from object.userData)
+const t = uniform(0).onObjectUpdate(({ object }) => object.userData.stripeTime ?? 0);
+// ❌ scene-global in the default per-object group → stale on static meshes
+const bad = uniform(new THREE.Color());
+```
+
+Guarded by a unit test (`syncFog.test.ts`, "puts every height-fog uniform in renderGroup") so the
+`.setGroup` calls can't be "simplified" away.
+
+**Is this a three.js bug?** For fog, no — it was our misuse of a documented grouping mechanism.
+For `scene.environmentIntensity` it's arguably a three-side wart: `materialEnvIntensity`
+(`nodes/accessors/MaterialProperties.js`) is a single `objectGroup` uniform serving BOTH the
+per-material `material.envMapIntensity` and the scene-global `scene.environmentIntensity`
+fallback — correct for the former, structurally stale-prone for the latter. We can't re-group
+three's own node, so `refreshEnvIntensityObserver` (above) remains the justified workaround *there*
+— but it is a workaround, and should never be copied for engine-owned uniforms; use `renderGroup`.
+
+**Height-fog semantics** (`three/src/nodes/fog/Fog.js`): `distance = max(height − positionWorld.y,
+0)`; `m = distance × viewZ`; `factor = 1 − exp(−(density × m)²)`. Fog needs BOTH depth below the
+ceiling AND camera distance — a fragment just under `height` stays clear even far away. Y-up only.
+
+**Height mode is EXTRA density-sensitive** (measured live on `games/3d-test`'s ~5-unit island with
+a camera ~25 units out): because `m` is the PRODUCT of depth-below-ceiling and camera distance,
+`density: 0.3` (already the high end for plain exponential fog at that distance) fully saturated the
+entire visible scene to the fog color — indistinguishable from "nothing rendered" when the fog color
+happens to resemble the background. `density: 0.03` at the same distance gave a clean gradient
+(clear palm-tree tops, hazy water). Start an order of magnitude below the exponential-mode rule of
+thumb and raise slowly.
+
+### NPR interaction — custom shaders must opt out of fog
+
+A custom `NodeMaterial` shader that sets `fragmentNode` to an NPR `outputStruct` (via
+`nprFragmentOutput`, see "NPR Outline Post-Process" below) breaks when fog is enabled and the
+material's `fog` flag is left at its default `true`: `NodeMaterial.setupOutput()` still runs
+`setupFog()` on the struct, which REPLACES it with a single `vec4` — collapsing the 3 MRT targets
+(output/normal/lineColor) down to 1, which WebGPU then discards as an incomplete draw (the exact
+"targets[1]/[2] have no fragment output" failure `nprFragmentOutput`'s own docblock warns about,
+just triggered by fog instead of a missing wiring). **Use `applyNprFragmentOutput(mat, colorRGBA,
+preserve?)`** instead of `nprFragmentOutput` + a manual `fragmentNode` assignment — it sets both
+`fragmentNode` and `fog = false` in one call, so a scene that later gains a `Fog` entity doesn't
+silently drop the shader's draws. `games/space-console`'s `stripes`/`matcap`/`planet` shaders use it.
+
 ## Material Sync
 
 `syncMaterial(obj, id, curMat, state)` (`scene3DSync.ts`) binds a mesh renderer's material each frame. A renderer references a MATERIAL only (a `.mat.json` GUID) — never a texture directly (textures live on the material; resolution + the KTX2 variant pick are in [Materials & Textures](./textures.md)):
@@ -308,7 +421,7 @@ Sobel edge detection, built as TSL node graphs over a shared 3×3 stencil:
 - Blends lines over the fill: `mix(fillKept, lineColor, edge * lineStrength)`.
 - A background mask (`step(0.5, length(normal))`) keeps the camera's `clearColor` outside the silhouette and writes `isForeground` into the output alpha (transparent background for layered DOM).
 
-`nprFragmentOutput(colorRGBA, preserve?)` is a helper for custom `NodeMaterial` shaders rendered into the NPR pass — it wraps a fragment color into an `outputStruct` that writes **all three** MRT targets (so WebGPU validation doesn't discard the draw for missing target outputs).
+`nprFragmentOutput(colorRGBA, preserve?)` is a helper for custom `NodeMaterial` shaders rendered into the NPR pass — it wraps a fragment color into an `outputStruct` that writes **all three** MRT targets (so WebGPU validation doesn't discard the draw for missing target outputs). Prefer `applyNprFragmentOutput(mat, colorRGBA, preserve?)` over calling this directly and assigning `fragmentNode` by hand — it also sets `mat.fog = false`, which fog-enabled scenes require (see "Fog" above, NPR interaction).
 
 ### FXAA — `npr/fxaaNode.ts`
 

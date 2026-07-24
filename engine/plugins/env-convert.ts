@@ -11,6 +11,7 @@ import path from 'path';
 import type { EnvImportSettings } from '../packages/modoki/src/runtime/loaders/environmentSettings';
 import { envTargetDims, downscaleRGBA, encodeHDR, readHdrHeaderDims } from './hdr-codec';
 import { getEnvCacheDir, envHashKey, envCachePathFor, envCacheHit } from './env-cache';
+import { nativeDynamicImport } from './native-dynamic-import';
 
 export interface EnvConvertOptions {
   projectRoot: string;
@@ -38,7 +39,7 @@ export interface EnvConvertResult {
  *  so three isn't pulled into the plugin's top-level bundle — mirrors the rigged
  *  converter's lazy @gltf-transform import). */
 async function decodeHDR(srcBytes: Buffer): Promise<{ data: Float32Array; width: number; height: number }> {
-  const { HDRLoader } = await import('three/examples/jsm/loaders/HDRLoader.js');
+  const { HDRLoader } = (await nativeDynamicImport('three/examples/jsm/loaders/HDRLoader.js')) as typeof import('three/examples/jsm/loaders/HDRLoader.js');
   const loader = new HDRLoader();
   (loader as unknown as { type: number }).type = 1015; // THREE.FloatType — decode to float
   const ab = srcBytes.buffer.slice(srcBytes.byteOffset, srcBytes.byteOffset + srcBytes.byteLength);

@@ -24,6 +24,7 @@ import { loadScene, setCurrentScenePath, setScenePersistenceProject, lastSceneKe
 import { registerSelectionRestore } from './store/selectionRestore';
 import { registerLastAnimationClipPersistence, restoreLastAnimationClip } from './animation/lastAnimationClip';
 import { registerLastSkinRigPersistence, restoreLastSkinRig } from './panels/lastSkinRig';
+import { registerBuiltinCreatableAssets } from './panels/builtinCreatableAssets';
 import { ensureManifestLoaded, loadManifestJson, getGuidForPath, resolveGuidToPath, isGuid } from '../runtime/loaders/assetManifest';
 import { rendererReady } from '../runtime/loaders/textureResolver';
 import { installConsoleCapture } from './consoleCapture';
@@ -298,6 +299,10 @@ export function createEditor(options: EditorOptions): React.ComponentType {
   _gameView = options.gameView || null;
   _extraMenus = options.extraMenus || {};
   _projectSettings = options.projectSettings || null;
+
+  // Register the Assets panel's built-in "Create X" menu entries (Scene, Material,
+  // Animation, …). Idempotent — safe if createEditor() ever runs twice in a session.
+  registerBuiltinCreatableAssets();
 
   // Subscribe to world swaps to restore the editor's selection across scene loads
   registerSelectionRestore();

@@ -62,8 +62,10 @@ deterministic sim free of live DOM reads.
 ## How it works
 
 **The vocabulary (`actions.ts`).** Four analog `AXES` (`moveX`/`moveY` locomotion, `lookX`/`lookY`
-camera/aim), each −1…+1; nine `DIGITAL` actions (`confirm`, `cancel`, `menu`, `pause`, `jump`, and
-`navUp/Down/Left/Right`). An `InputFrame` carries `axes` + three flag maps (`held`, `pressed`,
+camera/aim), each −1…+1; ten `DIGITAL` actions (`confirm`, `cancel`, `menu`, `pause`, `jump`, `aim`,
+and `navUp/Down/Left/Right`). `aim` is a generic aim/ADS toggle — keyboard maps it to F, gamepad to
+the left trigger — for a game to wire up itself (e.g. `demos/forest-camp`'s shooting-mode toggle);
+it carries no built-in behavior of its own. An `InputFrame` carries `axes` + three flag maps (`held`, `pressed`,
 `released`) + `lastDevice`. `held` is the *level* each source ORs into; `pressed`/`released` are the
 *edges* the inputSystem derives — a gamepad button and a keyboard key produce identical edges because
 edge derivation is centralized, source-agnostic.
@@ -90,7 +92,7 @@ sources — so sources live app-lifetime and never load headless.
 An `editing()` guard ignores keys while an `INPUT`/`TEXTAREA`/`SELECT`/contentEditable is focused. It
 tracks only which keys are *held* (a `Set<string>`); `sample()` maps them: A/D + ←/→ → `moveX`, W/S +
 ↑/↓ → `moveY` (forward/up = +1), the same arrows → `nav*` held flags, Space → `jump`+`confirm`, Enter
-→ `confirm`, Esc → `cancel`+`menu`, P → `pause`; `lastDevice='keyboard'` only when a key was active.
+→ `confirm`, Esc → `cancel`+`menu`, P → `pause`, F → `aim`; `lastDevice='keyboard'` only when a key was active.
 `onBlur`/visibility-hidden and a play-start `onPlayStateChange` all `reset()` the held set so a stale
 key can't leak into the first play frame.
 
@@ -98,7 +100,7 @@ key can't leak into the first play frame.
 W3C "standard gamepad" snapshot (`{axes, buttons}`) into the frame — left stick → `move*`, right stick
 → `look*` (both deadzoned; Y negated because browser +Y is down while our frame is forward=+1), D-pad →
 `nav*` edges **plus** discrete `move*` (so a d-pad-only game still moves), A → `confirm`+`jump`, B →
-`cancel`, Start → `menu`+`pause`; returns whether the pad showed activity. The `gamepadSource` wrapper
+`cancel`, left trigger → `aim`, Start → `menu`+`pause`; returns whether the pad showed activity. The `gamepadSource` wrapper
 polls `navigator.getGamepads()`, first connected pad wins (single-player), and tracks a `connected`
 count via `gamepadconnected`/`disconnected` events — seeding it from the *current* pad list on
 `attach()` because a known controller does not re-emit `gamepadconnected` on a detach→attach (HMR, a
@@ -146,7 +148,7 @@ test spawns `Input`, sets fields, steps, and asserts on `moveX`/`jump`.
 degrades to the keyboard label, then the Capitalized action name; `device === 'none'` yields `''`.
 `inputPromptSources.registerInputPromptSources()` (called from the manager) registers UI read-source
 tokens — `{inputDevice}` and `{confirmPrompt}`/`{cancelPrompt}`/`{menuPrompt}`/`{pausePrompt}`/
-`{jumpPrompt}` — each **pulled at resolve time** from the live `Input` resource via `peekCurrentWorld`
+`{jumpPrompt}`/`{aimPrompt}` — each **pulled at resolve time** from the live `Input` resource via `peekCurrentWorld`
 (never lazily allocates a world; returns `''` with no world/Input yet). So an authored `UIElement.text`
 like `"Press {confirmPrompt} to start"` (with `UIBinding.textBinding` set) reads correctly per device.
 

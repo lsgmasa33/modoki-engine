@@ -40,7 +40,7 @@ import { pushAction, undo, redo, canUndo, canRedo, undoLabel, redoLabel, subscri
 
 import { getGameViewComponent, getCustomPanels, getExtraMenus, getProjectSettings } from './createEditor';
 import { dockPanel, toDockLocation } from './panelDock';
-import { AUTOSAVE_NAME, isLayoutJson, sanitizeLayoutName, deriveLayoutBaseName } from './utils/layoutNames';
+import { AUTOSAVE_NAME, isLayoutJson, sanitizeLayoutName, sanitizeExportFileName, deriveLayoutBaseName } from './utils/layoutNames';
 
 // Wire ECS action callback to editor undo system
 setActionCallback(pushAction);
@@ -189,6 +189,21 @@ function writeLayout(name: string, model: Model): Promise<boolean> {
   return writeLayoutJson(name, model.toJson());
 }
 
+
+/** Download arbitrary layout JSON as a portable `<name>.layout.json` file — the
+ *  export counterpart to `LoadLayoutModal`'s "Load from file…" import. Works in
+ *  both the Electron and web editors via a plain object-URL anchor click. */
+function downloadLayoutJson(name: string, json: unknown): void {
+  const blob = new Blob([JSON.stringify(json, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${sanitizeExportFileName(name)}.layout.json`;
+  a.click();
+  // Defer the revoke — revoking on the same tick can race the browser's download
+  // read of the object URL and drop the file.
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
 
 /** Read a saved layout by name, or null if it doesn't exist / fetch failed. */
 async function readLayout(name: string): Promise<IJsonModel | null> {
@@ -912,6 +927,7 @@ export default function EditorApp() {
         />
       </div>
       <ImportProgressModal />
+      <SceneLoadModal />
       <BuildProgressModal />
       <ToastNotice />
       <ApplyPrefabDialog />
@@ -920,7 +936,7 @@ export default function EditorApp() {
       <CleanupAssetsDialog />
       <BuildSupportDialog />
       {showLoad && <LoadLayoutModal onClose={() => setShowLoad(false)} />}
-      {showSaveAs && <SaveLayoutAsModal initial={currentLayoutName() || 'default'} onSave={saveLayoutAs} onClose={() => setShowSaveAs(false)} />}
+      {showSaveAs && <SaveLayoutAsModal initial={currentLayoutName() || 'default'} onSave={saveLayoutAs} onExport={(name) => { const m = modelRef.current; if (m) downloadLayoutJson(name, m.toJson()); }} onClose={() => setShowSaveAs(false)} />}
     </div>
   );
 }
@@ -951,11 +967,12 @@ function ToastNotice() {
 // ── Save Layout As Modal ────────────────────────────────
 // In-app name prompt (window.prompt() is unsupported in the Electron renderer).
 
-function SaveLayoutAsModal({ initial, onSave, onClose }: { initial: string; onSave: (name: string) => void; onClose: () => void }) {
+function SaveLayoutAsModal({ initial, onSave, onExport, onClose }: { initial: string; onSave: (name: string) => void; onExport: (name: string) => void; onClose: () => void }) {
   const [name, setName] = useState(initial);
   const inputRef = useRef<HTMLInputElement>(null);
   useEffect(() => { inputRef.current?.select(); }, []);
   const commit = () => { const n = name.trim(); if (n) onSave(n); };
+  const exportToFile = () => { const n = name.trim(); if (n) onExport(n); };
   return (
     <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={onClose}>
       <div onClick={(e) => e.stopPropagation()} style={{ background: '#1e1e30', border: '1px solid #555', borderRadius: 6, padding: '16px 20px', minWidth: 300, fontFamily: 'monospace' }}>
@@ -972,9 +989,12 @@ function SaveLayoutAsModal({ initial, onSave, onClose }: { initial: string; onSa
             border: '1px solid #444', background: '#11111c', color: '#eee', fontFamily: 'monospace', fontSize: 12,
           }}
         />
-        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 12 }}>
-          <button onClick={onClose} style={{ padding: '4px 16px', border: '1px solid #555', borderRadius: 3, background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11 }}>Cancel</button>
-          <button onClick={commit} style={{ padding: '4px 16px', border: '1px solid #3a6', borderRadius: 3, background: '#244', color: '#cfc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11 }}>Save</button>
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'space-between', marginTop: 12 }}>
+          <button onClick={exportToFile} title="Download the current layout as a portable .layout.json file (doesn't save it in the project)" style={{ padding: '4px 16px', border: '1px solid #555', borderRadius: 3, background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11 }}>Export to file…</button>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button onClick={onClose} style={{ padding: '4px 16px', border: '1px solid #555', borderRadius: 3, background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11 }}>Cancel</button>
+            <button onClick={commit} style={{ padding: '4px 16px', border: '1px solid #3a6', borderRadius: 3, background: '#244', color: '#cfc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11 }}>Save</button>
+          </div>
         </div>
       </div>
     </div>
@@ -1004,6 +1024,14 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
   const load = (name: string) => {
     localStorage.setItem(LAYOUT_NAME_KEY, name);
     window.location.reload(); // reload applies the layout via loadInitialModel (clean panel remount)
+  };
+
+  // Download a saved layout as a portable .layout.json — the export counterpart
+  // to "Load from file…" below.
+  const exportLayout = async (name: string) => {
+    const json = await readLayout(name);
+    if (!json) { console.error(`[Editor] Failed to read "${name}" for export`); return; }
+    downloadLayoutJson(name, json);
   };
 
   // Load an arbitrary .layout.json from anywhere on disk (file picker works in
@@ -1040,13 +1068,22 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 320, overflowY: 'auto' }}>
             {layouts.map((l) => (
-              <button key={l.name} onClick={() => load(l.name)} style={{
-                textAlign: 'left', padding: '6px 10px', border: '1px solid #444', borderRadius: 3,
-                background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 12,
-              }}
-                onMouseEnter={(e) => (e.currentTarget.style.background = '#3a3a5c')}
-                onMouseLeave={(e) => (e.currentTarget.style.background = '#2a2a40')}
-              >{l.label}</button>
+              <div key={l.name} style={{ display: 'flex', gap: 4 }}>
+                <button onClick={() => load(l.name)} style={{
+                  flex: 1, textAlign: 'left', padding: '6px 10px', border: '1px solid #444', borderRadius: 3,
+                  background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 12,
+                }}
+                  onMouseEnter={(e) => (e.currentTarget.style.background = '#3a3a5c')}
+                  onMouseLeave={(e) => (e.currentTarget.style.background = '#2a2a40')}
+                >{l.label}</button>
+                <button onClick={() => exportLayout(l.name)} title="Export to file…" style={{
+                  padding: '6px 10px', border: '1px solid #444', borderRadius: 3,
+                  background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 12,
+                }}
+                  onMouseEnter={(e) => (e.currentTarget.style.background = '#3a3a5c')}
+                  onMouseLeave={(e) => (e.currentTarget.style.background = '#2a2a40')}
+                >⭳</button>
+              </div>
             ))}
           </div>
         )}
@@ -1122,6 +1159,62 @@ function ImportProgressModal() {
             </div>
           </>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ── Scene Load Modal ────────────────────────────────────
+// Shown while a scene loads — but only after a ~400ms delay, so warm-cache loads
+// (the normal case, sub-100ms) never flash it. On a COLD asset cache the load
+// bakes textures/models/HDR on demand and can run several seconds; the bar tracks
+// resources acquired (loaded/total), each completion being one finished bake.
+
+const SCENE_LOAD_MODAL_DELAY_MS = 400;
+
+function SceneLoadModal() {
+  const { active, loaded, total } = useEditorStore((s) => s.sceneLoadStatus);
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    if (!active) { setVisible(false); return; }
+    // Arm the delay on load start; if the load finishes first (warm cache), the
+    // cleanup cancels the timer and the modal never appears.
+    const t = setTimeout(() => setVisible(true), SCENE_LOAD_MODAL_DELAY_MS);
+    return () => clearTimeout(t);
+  }, [active]);
+
+  if (!active || !visible) return null;
+  // `total` is 0 during the pre-count discovery phase (prefab/timeline walk) —
+  // show an indeterminate bar until the first onProgress reports the count.
+  const determinate = total > 0;
+  const pct = determinate ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 9999,
+      background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+    }}>
+      <div style={{
+        background: '#1e1e30', border: '1px solid #555', borderRadius: 6,
+        padding: '20px 32px', minWidth: 320, maxWidth: 480, textAlign: 'center', fontFamily: 'monospace',
+      }}>
+        <div style={{ color: '#fff', fontSize: 13, marginBottom: 8 }}>Preparing assets…</div>
+        <div style={{ color: '#888', fontSize: 11, marginBottom: 10 }}>
+          {determinate ? `Loading assets ${loaded} / ${total}` : 'Reading scene…'}
+        </div>
+        <div style={{ height: 6, background: '#333', borderRadius: 3, overflow: 'hidden', marginBottom: 8 }}>
+          {determinate ? (
+            <div style={{
+              height: '100%', width: `${pct}%`, background: '#3498db', borderRadius: 3,
+              transition: 'width 0.2s ease',
+            }} />
+          ) : (
+            <div style={{
+              height: '100%', width: '40%', background: '#3498db', borderRadius: 3,
+              animation: 'importProgress 1.5s ease-in-out infinite',
+            }} />
+          )}
+        </div>
+        <div style={{ color: '#666', fontSize: 10 }}>First load bakes textures &amp; models — this can take a moment.</div>
       </div>
     </div>
   );

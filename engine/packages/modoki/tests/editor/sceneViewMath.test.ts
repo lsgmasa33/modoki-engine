@@ -7,7 +7,7 @@ import {
   computeLetterbox, computeUIModeNDC, computeFullNDC, computeCamFrustumPositions, frameCameraToBox,
   frameCameraToBoxFixed, computeDeviceLetterbox, resolveDeviceSize, gameAspectFromRect,
   createSelectGesture, DESELECT_DRAG_PX, outlineSourceGeometry,
-  resolveFocusTarget, FOCUS_DEFAULT_RADIUS,
+  resolveFocusTarget, FOCUS_DEFAULT_RADIUS, shouldHideMeshesForColliderMode,
 } from '../../src/editor/scene/sceneViewMath';
 
 describe('frameCameraToBox (Missing Test #1 — camera framing)', () => {
@@ -377,5 +377,23 @@ describe('resolveFocusTarget (F-key framing tiers)', () => {
 
   it('returns null when there is nothing to frame at all', () => {
     expect(resolveFocusTarget([], [], null)).toBeNull();
+  });
+});
+
+describe('shouldHideMeshesForColliderMode (collider-only view mode)', () => {
+  it('hides meshes in 3D mode once the Colliders toggle is on', () => {
+    expect(shouldHideMeshesForColliderMode('3d', true)).toBe(true);
+  });
+
+  it('keeps meshes visible in 3D mode when the toggle is off', () => {
+    expect(shouldHideMeshesForColliderMode('3d', false)).toBe(false);
+  });
+
+  it('never hides meshes in UI mode, even with the toggle on (no Collider3D gizmos to show instead)', () => {
+    expect(shouldHideMeshesForColliderMode('ui', true)).toBe(false);
+  });
+
+  it('keeps meshes visible in UI mode with the toggle off', () => {
+    expect(shouldHideMeshesForColliderMode('ui', false)).toBe(false);
   });
 });

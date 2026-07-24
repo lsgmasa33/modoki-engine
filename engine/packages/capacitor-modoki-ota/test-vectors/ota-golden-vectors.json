@@ -1,0 +1,198 @@
+{
+  "_comment": "Shared spec for the OTA boot-watchdog state machine (docs/plans/mobile-ota-updates-plan.md, Phase 1). Swift (OtaCoreTests.swift) and Java (OtaCoreSelfTest.java) both replay every scenario here and must produce identical results — a native divergence fails in CI/dev instead of shipping silently. Design incorporates an adversarial review (2026-07-24) of the original one-shot-confirm design; see the plan doc for the failure scenarios this closes.",
+  "constants": { "maxAttempts": 3, "requiredConfirms": 2 },
+  "scenarios": [
+    {
+      "name": "fresh_install_no_state",
+      "op": "boot",
+      "bundle": "shell",
+      "state": null,
+      "folderExists": {},
+      "expect": { "target": { "kind": "embedded" }, "state": null }
+    },
+    {
+      "name": "normal_boot_no_pending",
+      "op": "boot",
+      "bundle": "shell",
+      "state": { "active": { "shell": "v12" } },
+      "folderExists": { "shell/v12": true },
+      "expect": {
+        "target": { "kind": "version", "name": "shell", "version": "v12" },
+        "state": { "active": { "shell": "v12" } }
+      }
+    },
+    {
+      "name": "first_pending_attempt",
+      "op": "boot",
+      "bundle": "shell",
+      "state": { "active": { "shell": "v12" }, "pending": { "shell": "v13" } },
+      "folderExists": { "shell/v12": true, "shell/v13": true },
+      "expect": {
+        "target": { "kind": "version", "name": "shell", "version": "v13" },
+        "state": {
+          "active": { "shell": "v12" },
+          "pending": { "shell": "v13" },
+          "bootAttempts": { "shell": 1 }
+        }
+      }
+    },
+    {
+      "name": "confirm_first_time_not_enough_to_promote",
+      "op": "confirm",
+      "bundle": "shell",
+      "state": {
+        "active": { "shell": "v12" },
+        "pending": { "shell": "v13" },
+        "bootAttempts": { "shell": 1 }
+      },
+      "expect": {
+        "state": {
+          "active": { "shell": "v12" },
+          "pending": { "shell": "v13" },
+          "bootAttempts": { "shell": 1 },
+          "confirmedBoots": { "shell": 1 }
+        }
+      }
+    },
+    {
+      "name": "second_boot_still_pending_below_max_attempts",
+      "op": "boot",
+      "bundle": "shell",
+      "state": {
+        "active": { "shell": "v12" },
+        "pending": { "shell": "v13" },
+        "bootAttempts": { "shell": 1 },
+        "confirmedBoots": { "shell": 1 }
+      },
+      "folderExists": { "shell/v12": true, "shell/v13": true },
+      "expect": {
+        "target": { "kind": "version", "name": "shell", "version": "v13" },
+        "state": {
+          "active": { "shell": "v12" },
+          "pending": { "shell": "v13" },
+          "bootAttempts": { "shell": 2 },
+          "confirmedBoots": { "shell": 1 }
+        }
+      }
+    },
+    {
+      "name": "confirm_second_time_promotes_pending_to_active",
+      "op": "confirm",
+      "bundle": "shell",
+      "state": {
+        "active": { "shell": "v12" },
+        "pending": { "shell": "v13" },
+        "bootAttempts": { "shell": 2 },
+        "confirmedBoots": { "shell": 1 }
+      },
+      "expect": {
+        "state": { "active": { "shell": "v13" } }
+      }
+    },
+    {
+      "name": "revert_after_max_attempts_never_confirmed",
+      "op": "boot",
+      "bundle": "shell",
+      "state": {
+        "active": { "shell": "v12" },
+        "pending": { "shell": "v13" },
+        "bootAttempts": { "shell": 3 }
+      },
+      "folderExists": { "shell/v12": true, "shell/v13": true },
+      "expect": {
+        "target": { "kind": "version", "name": "shell", "version": "v12" },
+        "state": { "active": { "shell": "v12" } }
+      }
+    },
+    {
+      "name": "confirm_is_a_noop_without_a_pending_version",
+      "op": "confirm",
+      "bundle": "shell",
+      "state": { "active": { "shell": "v12" } },
+      "expect": {
+        "state": { "active": { "shell": "v12" } }
+      }
+    },
+    {
+      "name": "missing_active_folder_falls_back_to_embedded_and_clears_active",
+      "op": "boot",
+      "bundle": "shell",
+      "state": { "active": { "shell": "v12" } },
+      "folderExists": { "shell/v12": false },
+      "expect": {
+        "target": { "kind": "embedded" },
+        "state": {}
+      }
+    },
+    {
+      "name": "missing_pending_folder_triggers_immediate_revert_not_another_attempt",
+      "op": "boot",
+      "bundle": "shell",
+      "state": {
+        "active": { "shell": "v12" },
+        "pending": { "shell": "v13" },
+        "bootAttempts": { "shell": 1 }
+      },
+      "folderExists": { "shell/v12": true, "shell/v13": false },
+      "expect": {
+        "target": { "kind": "version", "name": "shell", "version": "v12" },
+        "state": { "active": { "shell": "v12" } }
+      }
+    },
+    {
+      "name": "missing_active_AND_pending_folders_falls_back_to_embedded",
+      "op": "boot",
+      "bundle": "shell",
+      "state": {
+        "active": { "shell": "v12" },
+        "pending": { "shell": "v13" },
+        "bootAttempts": { "shell": 3 }
+      },
+      "folderExists": { "shell/v12": false, "shell/v13": false },
+      "expect": {
+        "target": { "kind": "embedded" },
+        "state": {}
+      }
+    },
+    {
+      "name": "corrupt_state_json_falls_back_to_embedded_without_throwing",
+      "op": "boot",
+      "bundle": "shell",
+      "state": "CORRUPT_JSON_MARKER",
+      "folderExists": {},
+      "expect": { "target": { "kind": "embedded" }, "state": null }
+    },
+    {
+      "name": "two_bundles_stay_independent",
+      "op": "boot",
+      "bundle": "shell",
+      "state": {
+        "active": { "shell": "v12", "sling": "v3" },
+        "pending": { "shell": "v13" }
+      },
+      "folderExists": { "shell/v12": true, "shell/v13": true },
+      "expect": {
+        "target": { "kind": "version", "name": "shell", "version": "v13" },
+        "state": {
+          "active": { "shell": "v12", "sling": "v3" },
+          "pending": { "shell": "v13" },
+          "bootAttempts": { "shell": 1 }
+        }
+      }
+    },
+    {
+      "name": "confirming_one_bundle_never_touches_another_bundles_fields",
+      "op": "confirm",
+      "bundle": "shell",
+      "state": {
+        "active": { "shell": "v12", "sling": "v3" },
+        "pending": { "shell": "v13", "sling": "v4" },
+        "bootAttempts": { "shell": 2, "sling": 1 },
+        "confirmedBoots": { "shell": 1, "sling": 1 }
+      },
+      "expect": {
+        "state": { "active": { "shell": "v13", "sling": "v3" }, "pending": { "sling": "v4" }, "bootAttempts": { "sling": 1 }, "confirmedBoots": { "sling": 1 } }
+      }
+    }
+  ]
+}

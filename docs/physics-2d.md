@@ -473,9 +473,19 @@ and WASM registry above are the SAME shared code, dimension-parameterized. What 
 
 - **Collider overlay** (DONE): Scene2D draws circle/box/capsule/polygon/polyline/concave outlines for every
   `Collider2D` entity, using the pure `colliderOutline2D()` geometry + the same
-  `getWorldTransform2D` the sprites use (so outlines align with what's rendered). Editor-only,
-  gated behind `setShowColliders2D()`; toggled by the **⬡** button in the GameView toolbar. Drawn
-  into one overlay `Graphics` per Canvas2D, on top of the sprites.
+  `getWorldTransform2D` the sprites use (so outlines align with what's rendered). The outline is
+  scaled by `scaleColliderOutline2D()` to match how `physics2DSystem`'s `makeColliderDesc` scales
+  the live Rapier collider — box/polygon/polyline per-axis; circle/capsule radius by the mean of
+  `|sx|,|sy|` (can't represent a non-uniform scale as an ellipse); capsule half-height by `|sy|`
+  alone — so a scaled collider's overlay matches its true simulated size. Two independent
+  toggles read this same overlay: the **⬡** button in the GameView toolbar
+  (`setShowColliders2D()`, `defaultRenderer`) draws it ON TOP of sprites; the editor SceneView's
+  **View ▾ → Colliders** checkbox (2D/`ui`-mode, `ViewOptionsMenu.tsx`) instead HIDES every
+  sprite and forces the overlay on in purple (`0x9b59b6`) via `Scene2DRenderer.setCollidersOnly()`
+  (`editorScene2DRenderer`) — a collider-only debug view, the 2D counterpart of the 3D
+  SceneView's own collider-only mode (see [editor.md](./editor.md) "3D collider outline overlay
+  + collider-only mode"). Drawn into one overlay `Graphics` per Canvas2D, on top of the sprites
+  (or in place of them, in collider-only mode).
 - **Collision-mesh vertex editor** (DONE, Phase 4.3): for authoring `polygon`/`polyline`/`concave`
   collider point lists visually instead of hand-editing JSON. Select an entity with such a
   `Collider2D`, click the **⬟ Points** toggle in the SceneView toolbar (only shown for those
@@ -490,10 +500,12 @@ and WASM registry above are the SAME shared code, dimension-parameterized. What 
   equivalent, so give its entity a `Renderable2D` with `sprite: 'collider'` and it draws the
   entity's **own Collider2D shape** — closed shapes filled, an open `polyline` stroked, in the
   `Renderable2D.color`/`opacity`. Single source of truth: editing the collider (⬟ Points) updates
-  the visual live (the render change-detection keys on the outline signature). Works in the runtime
-  Pixi layer (Scene2D) and the editor Canvas2D preview via the shared `drawColliderFill`/
-  `drawColliderFillGfx` (both derive from `colliderOutline2D`). `width`/`height` on such an entity
-  only size its click-pick box + selection outline (the fill comes from the collider).
+  the visual live (the render change-detection keys on the outline signature). Rendered via
+  `drawColliderFillGfx` (`runtime/rendering/render2DUtils.ts`, derived from `colliderOutline2D`) —
+  the SAME function for both the runtime Pixi layer (`Scene2D`'s `defaultRenderer`) and the
+  editor's own Pixi instance (`editorScene2DRenderer`); there is no separate Canvas2D fill path
+  (only the gizmo/selection overlay is Canvas2D — see `drawColliderOutline`). `width`/`height` on
+  such an entity only size its click-pick box + selection outline (the fill comes from the collider).
 - **Live tuning** via the `modoki_*_set` pattern: gravity, restitution, friction, joint stiffness/
   damping hot-adjustable while playing (feel iteration can't be judged from a screenshot anyway).
 - Shapes placed/sized from the Inspector; drag-to-resize gizmo is a nice-to-have, not v1.
