@@ -41,6 +41,29 @@ describe('timelineSystem — markers fire once at the crossing tick', () => {
     expect((journalMarks[0].payload as { action: string; t: number }).t).toBe(0.45);
   });
 
+  it('dispatches a signal marker to its OWN track target, not the Director root', () => {
+    // Regression test: applyDirectorFrame's 'signal' case used to hardcode
+    // `target: p.entity` (the Director), ignoring `track.target` entirely — so a signal
+    // track aimed at a descendant (e.g. a UI label to update) silently updated nothing;
+    // only a track authored with target:"" (the root itself, as every other test in this
+    // file uses) ever happened to be correct.
+    let seenTargetId: number | undefined;
+    let seenSelfId: number | undefined;
+    tw = createTestWorld({
+      dt: DT,
+      systems: [TIMELINE],
+      actions: { 'seq.mark': (ctx) => { seenTargetId = ctx.target?.id(); seenSelfId = (ctx.params?.self as { id(): number } | undefined)?.id(); } },
+    });
+    seed({ tracks: [{ id: 's', name: 'Sig', target: 'Child', type: 'signal', markers: [{ t: 0.1, action: 'seq.mark' }] }] });
+    const root = tw.spawn(EntityAttributes({ name: 'root' }), Director({ timeline: PATH }));
+    const child = tw.spawn(EntityAttributes({ name: 'Child', parentId: root.id() }));
+
+    tw.step(8); // past t=0.1
+
+    expect(seenTargetId).toBe(child.id());
+    expect(seenSelfId).toBe(root.id()); // params.self still identifies the Director, unaffected
+  });
+
   it('emits @sequence start once and end once (non-looping)', () => {
     tw = createTestWorld({ dt: DT, systems: [TIMELINE] });
     seed({ tracks: [] });

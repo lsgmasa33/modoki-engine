@@ -29,6 +29,8 @@ import ApplyPrefabDialog, { RevertPrefabDialog } from './panels/ApplyPrefabDialo
 import ProjectSettingsDialog from './panels/ProjectSettingsDialog';
 import BuildSupportDialog from './panels/BuildSupportDialog';
 import CleanupAssetsDialog from './panels/CleanupAssetsDialog';
+import PublishOtaDialog from './panels/PublishOtaDialog';
+import OtaKeysDialog from './panels/OtaKeysDialog';
 import PanelErrorBoundary from './panels/PanelErrorBoundary';
 import { saveAll } from './scene/serialize';
 import { enterPlay, pausePlay, getModeOwner } from './scene/playMode';
@@ -935,6 +937,8 @@ export default function EditorApp() {
       <ProjectSettingsDialog />
       <CleanupAssetsDialog />
       <BuildSupportDialog />
+      <PublishOtaDialog />
+      <OtaKeysDialog />
       {showLoad && <LoadLayoutModal onClose={() => setShowLoad(false)} />}
       {showSaveAs && <SaveLayoutAsModal initial={currentLayoutName() || 'default'} onSave={saveLayoutAs} onExport={(name) => { const m = modelRef.current; if (m) downloadLayoutJson(name, m.toJson()); }} onClose={() => setShowSaveAs(false)} />}
     </div>

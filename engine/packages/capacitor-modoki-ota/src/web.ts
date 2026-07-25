@@ -10,6 +10,10 @@ export class ModokiOtaWeb extends WebPlugin implements ModokiOtaPlugin {
     console.log('[ModokiOta] Web: stageUpdate is a no-op (web has no OTA mechanism)');
     return { ok: false };
   }
+  async stageUpdateDelta(): Promise<{ ok: boolean }> {
+    console.log('[ModokiOta] Web: stageUpdateDelta is a no-op (web has no OTA mechanism)');
+    return { ok: false };
+  }
   async activate(): Promise<{ ok: boolean }> {
     return { ok: false };
   }
@@ -18,5 +22,8 @@ export class ModokiOtaWeb extends WebPlugin implements ModokiOtaPlugin {
   }
   async getState(): Promise<{ stateJSON: string }> {
     return { stateJSON: 'null' };
+  }
+  async listBundles(): Promise<{ bundles: { name: string; version: string; path: string }[] }> {
+    return { bundles: [] };
   }
 }

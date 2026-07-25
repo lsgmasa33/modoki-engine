@@ -3,15 +3,17 @@
  *  Also writes assets.manifest.json on build so production builds have a static manifest. */
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { spawn, execSync } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import crypto, { randomUUID } from 'crypto';
 import type { Plugin } from 'vite';
 import { computeKeptAssets, formatBytes } from './asset-tree-shaker';
 import { assertNoConversionFallback, type ConversionFailure } from './asset-conversion-strict';
 import { loadProjectConfig, loadProjectUserConfig, validateBuildConfig } from './load-project-config';
 import { findGamesEntry } from './findGamesEntry';
+import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './backend/gcloud';
 import { projectAssetRoots } from '../scripts/projectRoots.mjs';
 import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, type BuildTarget, type ToolId } from '../toolchain';
 import { registerReimportHandler, type ReimportContext } from './reimport-registry';
@@ -391,6 +393,24 @@ export function isValidBuildPlatform(p: string | null | undefined): p is BuildPl
   return p != null && (BUILD_PLATFORMS as readonly string[]).includes(p);
 }
 
+/** /api/ota/publish only ever builds+publishes the CURRENTLY OPEN project as ITSELF — see
+ *  the route's own comment and ota-updates.md's Gotchas for why an override to a different
+ *  bundleName used to be a silent publish-corruption risk (it would ship this project's
+ *  plain shell dist/ under a DIFFERENT bundle's identity). Pure — extracted so this
+ *  invariant is unit-testable without a live editor/gcloud. */
+export function otaPublishBundleNameAllowed(requestedBundleName: string, projectOtaBundleName: string): boolean {
+  return requestedBundleName === projectOtaBundleName;
+}
+
+/** Classifies a `gcloud storage cat`/`objects describe` failure's stderr: only a genuine
+ *  "this object doesn't exist" is safe to treat as "no collision, proceed" — see
+ *  ota-updates.md's Gotchas for why treating EVERY gcloud failure (including a transient
+ *  auth/network error) as "no collision" was a real gap. Pure — extracted so the
+ *  classification itself is unit-testable independent of ever calling gcloud. */
+export function isGcloudObjectNotFoundError(stderr: string): boolean {
+  return /not found: 404|matched no objects or files/i.test(stderr);
+}
+
 /** The build steps for a `playable` target: the single-file inliner build (VITE_PLAYABLE=1 →
  *  games/<id>/ads/index.html) then reveal the ads/ dir. No favicon/deploy/native — the one HTML IS
  *  the artifact. Pure — extracted from the /api/build handler so the routing is unit-testable. */
@@ -402,36 +422,10 @@ export function playableBuildSteps(buildCwd: string, webCwd: string): BuildStep[
   ];
 }
 
-/** Resolve the directory containing the `gcloud` CLI, or null if not installed. The web GCS deploy
- *  shells out to `gcloud`, but a Finder-launched packaged editor gets a minimal PATH without the
- *  Google Cloud SDK — so probe the well-known install dirs (Homebrew, the SDK's own installers) and
- *  fall back to the login shell's `command -v gcloud` (covers a custom location). gcloud is a system
- *  tool the editor can't provision (it carries the user's cloud auth), so this is the sanctioned way
- *  to find it — distinct from the build tools we provision. Exported for unit testing. */
-export function resolveGcloudDir(override?: string): string | null {
-  // An explicit Project Settings override wins (sdk.gcloudPath — the binary OR its dir).
-  if (override) {
-    if (fs.existsSync(path.join(override, 'gcloud'))) return override;                 // a bin dir
-    if (fs.existsSync(override) && path.basename(override) === 'gcloud') return path.dirname(override); // the binary
-  }
-  if (process.platform === 'win32') return null; // web deploy steps are posix-only
-  const home = process.env.HOME ?? '';
-  const dirs = [
-    '/opt/homebrew/bin', '/usr/local/bin',
-    path.join(home, 'google-cloud-sdk', 'bin'),
-    '/usr/local/google-cloud-sdk/bin',
-    path.join(home, '.local', 'bin'),
-  ];
-  for (const d of dirs) {
-    if (d && fs.existsSync(path.join(d, 'gcloud'))) return d;
-  }
-  try {
-    const shell = process.env.SHELL || '/bin/zsh';
-    const out = execSync(`${shell} -ilc 'command -v gcloud'`, { timeout: 4000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-    if (out && fs.existsSync(out)) return path.dirname(out);
-  } catch { /* not found via the login shell */ }
-  return null;
-}
+// resolveGcloudDir moved to ./backend/gcloud.ts (shared with editorBackendRouter.ts,
+// which must stay host-agnostic / Vite-import-free) — re-exported here so existing
+// imports of it from this module (incl. tests) keep working unchanged.
+export { resolveGcloudDir };
 
 /** Env for a /api/build step, prepending the toolchain-provisioned Node's bin dir to PATH so the
  *  step's bash `npm`/`npx`/`node` run on it. The build pipeline runs in THIS Vite process, which is
@@ -1319,7 +1313,7 @@ export function assetScannerPlugin(): Plugin {
         // `/api/build-status` is NOT swallowed by a prefix match, and a query-less
         // `/api/build` still reaches its handler (which 400s) instead of falling
         // through to SPA HTML. Keep identical to the dedicated handlers below. (D5)
-        const sseRoutes = ['/api/build', '/api/add-native-target', '/api/toolchain/install'];
+        const sseRoutes = ['/api/build', '/api/add-native-target', '/api/toolchain/install', '/api/ota/publish'];
         if ((isApiRoute && !isSseRoute(req.url!, sseRoutes)) || req.url === '/assets.manifest.json') {
           const u = new URL(req.url!, 'http://localhost');
           const ctx: BackendContext = {
@@ -1638,11 +1632,26 @@ export function assetScannerPlugin(): Plugin {
             winCmd: `(if not exist assets mkdir assets) && copy /y "${iconSrcAbs}" assets\\icon.png && ${iconGen(plat)} || echo [icon] generation skipped`,
             cwd: plat === 'ios' ? iosCwd : androidCwd,
           });
+          // OTA Phase 5a: embed this build's own manifest into dist so the very FIRST
+          // OTA check on a fresh install has something local to diff against (see
+          // engine/scripts/ota-embed-manifest.mjs's header). Must run AFTER the web
+          // build, BEFORE `cap sync` — cap sync copies dist/ into the native project's
+          // bundled assets, so the manifest needs to already be there. `--dist` is
+          // absolute (unlike the other steps' project-relative paths) since this step
+          // doesn't otherwise need buildCwd-relative resolution. Gated on `ota.enabled`
+          // so a project that hasn't opted in pays zero extra build cost.
+          const projectDist = path.join(projectRoot, 'dist');
+          const otaEmbedStep: BuildStep | null = cfg.ota.enabled ? {
+            label: 'Embedding OTA manifest...',
+            cmd: `node engine/scripts/ota-embed-manifest.mjs --dist ${JSON.stringify(projectDist)} --name ${JSON.stringify(cfg.ota.bundleName)} --engine-api ${cfg.ota.engineApi}`,
+            cwd: buildCwd,
+          } : null;
           const stepsByPlatform: Record<string, BuildStep[]> = {
             // iOS is macOS-only (preflight blocks it off-darwin), so its bash-only steps
             // (`$(…)`, `~`, xcodebuild/xcrun) never run on Windows — no winCmd needed.
             ios: [
               { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs', cwd: buildCwd },
+              ...(otaEmbedStep ? [otaEmbedStep] : []),
               iconStep('ios'),
               { label: 'Syncing Capacitor iOS...', cmd: 'npx cap sync ios', cwd: iosCwd },
               { label: 'Building Xcode project...', cmd: `xcodebuild ${iosXcodeTarget} -scheme App -configuration Debug -destination 'id=${IOS_DEST}' -allowProvisioningUpdates build`, cwd: iosCwd },
@@ -1651,6 +1660,7 @@ export function assetScannerPlugin(): Plugin {
             ],
             android: [
               { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs', cwd: buildCwd },
+              ...(otaEmbedStep ? [otaEmbedStep] : []),
               iconStep('android'),
               { label: 'Syncing Capacitor Android...', cmd: 'npx cap sync android', cwd: androidCwd },
               // gradlew wrapper: posix `android/gradlew` vs Windows `android\gradlew.bat`.
@@ -1659,7 +1669,11 @@ export function assetScannerPlugin(): Plugin {
               // provisioned JDK) after the build. On Windows that daemon keeps the JDK's files LOCKED,
               // so "Remove Java SDK" (and any manual delete) fails half-way. The build JVM exits when
               // the build finishes, releasing the lock. Small perf cost on repeat builds; worth it.
-              { label: 'Building Android APK...', cmd: 'android/gradlew -p android assembleDebug --no-daemon', winCmd: 'android\\gradlew.bat -p android assembleDebug --no-daemon', env: androidBuildEnv, cwd: androidCwd },
+              // `clean` when ota.enabled: Gradle's incremental asset-merge task has been observed to
+              // miss a NEW file (ota-embedded-manifest.json) added to dist/ between builds, serving a
+              // stale merged-assets APK with no error (plan doc's "Gradle asset-merge staleness"
+              // gotcha) — costs a slower build only for OTA-enabled projects.
+              { label: 'Building Android APK...', cmd: `android/gradlew -p android ${cfg.ota.enabled ? 'clean ' : ''}assembleDebug --no-daemon`, winCmd: `android\\gradlew.bat -p android ${cfg.ota.enabled ? 'clean ' : ''}assembleDebug --no-daemon`, env: androidBuildEnv, cwd: androidCwd },
               // adb path + apk-relative path use forward slashes, which adb accepts on
               // Windows too; adb is an absolute exe path, so these run on both shells.
               { label: 'Installing on device...', cmd: `${adb} install -r android/app/build/outputs/apk/debug/app-debug.apk`, cwd: androidCwd },
@@ -2043,6 +2057,184 @@ export function assetScannerPlugin(): Plugin {
             const label = platform === 'ios' ? 'iOS' : platform === 'android' ? 'Android' : platform === 'playable' ? 'Playable Ad (ads/index.html)' : 'Web (modoki-engine.com/demo)';
             // "built" for the playable (nothing is deployed — the one HTML file IS the artifact); "deployed" for the rest.
             send(`\n✅ ${label} ${platform === 'playable' ? 'built' : 'build deployed'} successfully!`);
+            res.end();
+          })();
+          return;
+        }
+
+        // /api/ota/status (GET, JSON) and /api/ota/keygen (POST, JSON) are plain
+        // request/response — they live in the transport-agnostic editorBackendRouter.ts
+        // (handleBackendRequest, called from this middleware's dispatcher above) so they
+        // work identically in a packaged Electron editor, not just this dev server. Only
+        // the SSE publish pipeline below stays host-owned, same as /api/build.
+
+        // GET /api/ota/publish?version=v18&mandatory=1[&bundleName=][&key=][&bucket=] (SSE stream)
+        // Wraps engine/scripts/ota-publish.mjs with the safety rails the plan doc calls
+        // for: build FRESH from the current project.config.json (never accept a stale
+        // pre-built dist/), refuse a version-string collision, verify/set bucket CORS.
+        if ((req.url === '/api/ota/publish' || req.url?.startsWith('/api/ota/publish?')) && req.method === 'GET') {
+          const url = new URL(req.url, 'http://localhost');
+          const version = url.searchParams.get('version');
+          const mandatory = url.searchParams.get('mandatory') === '1';
+          const keyName = url.searchParams.get('key') || 'default';
+          const cfg = loadProjectConfig(projectRoot);
+          const bundleName = url.searchParams.get('bundleName') || cfg.ota.bundleName;
+          const bucket = url.searchParams.get('bucket') ?? deriveGcsBucketFromBaseUrl(cfg.ota.baseUrl);
+
+          if (!cfg.ota.enabled) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: 'ota.enabled is false for this project — turn it on in Project Settings first.' }));
+            return;
+          }
+          if (!version || !OTA_SAFE_TOKEN.test(version)) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: `version is required and must match ${OTA_SAFE_TOKEN}` }));
+            return;
+          }
+          if (!OTA_SAFE_TOKEN.test(bundleName) || !OTA_SAFE_TOKEN.test(keyName)) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: `bundleName/key must match ${OTA_SAFE_TOKEN}` }));
+            return;
+          }
+          // This route only ever builds via build-web.mjs (a normal standalone web build)
+          // and publishes the CURRENTLY OPEN project's own dist/ — never build-subgame.mjs's
+          // special sub-game-module format (subgame.json + globalThis.__MODOKI_SUBGAME__
+          // IIFE) that subgameLoader.ts actually expects to fetch. Overriding `bundleName`
+          // to anything other than this project's own configured name would silently
+          // publish this project's plain shell dist/ under a DIFFERENT bundle's identity —
+          // e.g. a sub-game's manifest/files overwritten with unrelated shell content, with
+          // no error until every device that loads it fails belt-and-suspenders check #2 (or
+          // worse, doesn't). Automated sub-game build+publish isn't wired into this route yet
+          // (docs/ota-subgame-modules.md) — refuse rather than proceed with the wrong
+          // bytes under someone else's name.
+          if (!otaPublishBundleNameAllowed(bundleName, cfg.ota.bundleName)) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: `bundleName ("${bundleName}") does not match this project's own ota.bundleName ("${cfg.ota.bundleName}"). This route only builds+publishes the CURRENTLY OPEN project as itself — publishing under a different bundle name would ship this project's plain web build under that bundle's identity, not a real sub-game module build. Open the sub-game's own project to publish it, or build it via build-subgame.mjs and publish by hand.` }));
+            return;
+          }
+          if (!bucket || !OTA_SAFE_BUCKET.test(bucket)) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: `Could not derive a gs:// bucket from ota.baseUrl ("${cfg.ota.baseUrl}"). Pass ?bucket=gs://... explicitly.` }));
+            return;
+          }
+          const buildCwd = editorRoot || projectRoot;
+          const keyPath = path.join(buildCwd, 'build', 'ota-keys', `${keyName}.json`);
+          if (!fs.existsSync(keyPath)) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: `Signing key "${keyName}" not found. Generate one first: POST /api/ota/keygen?name=${keyName}` }));
+            return;
+          }
+          const user = loadProjectUserConfig(projectRoot);
+          const gcloudDir = resolveGcloudDir(user.sdk.gcloudPath);
+          if (!gcloudDir) {
+            res.statusCode = 500;
+            res.end(JSON.stringify({ error: 'gcloud not found — install the Google Cloud SDK and run `gcloud auth login`, or set its path in Project Settings.' }));
+            return;
+          }
+
+          res.setHeader('Content-Type', 'text/event-stream');
+          res.setHeader('Cache-Control', 'no-cache');
+          res.setHeader('Connection', 'keep-alive');
+          const send = (data: string) => { try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch { /* client disconnected */ } };
+          const sendStatus = (status: string) => { try { res.write(`event: status\ndata: ${JSON.stringify(status)}\n\n`); } catch { /* client disconnected */ } };
+
+          const gcloudEnv = { ...process.env, PATH: `${gcloudDir}:${process.env.PATH ?? ''}` };
+          const distDir = path.join(projectRoot, 'dist');
+
+          let activeProc: ReturnType<typeof spawn> | null = null;
+          let aborted = false;
+          req.on('close', () => { aborted = true; try { activeProc?.kill('SIGTERM'); } catch { /* gone */ } });
+
+          const runStep = (label: string, cmd: string, cwd: string, env: NodeJS.ProcessEnv) => new Promise<{ ok: boolean; output: string }>((resolve) => {
+            send(`\n── ${label} ──`);
+            const proc = spawnBuildCommand(cmd, { cwd, env });
+            activeProc = proc;
+            let out = '';
+            proc.stdout?.on('data', (d: Buffer) => { const l = d.toString(); send(l.trimEnd()); out += l; });
+            proc.stderr?.on('data', (d: Buffer) => { const l = d.toString(); send(l.trimEnd()); out += l; });
+            proc.on('close', (code) => { activeProc = null; resolve({ ok: code === 0, output: out }); });
+            proc.on('error', (e) => { activeProc = null; send(`ERROR: ${e.message}`); resolve({ ok: false, output: e.message }); });
+          });
+
+          (async () => {
+            // Step 1: build FRESH from the CURRENTLY OPEN project's project.config.json.
+            // Never publish an arbitrary pre-built dist/ — that's how a stale pre-fix
+            // build once silently overwrote a freshly-fixed native install over the air.
+            sendStatus('Building web assets...');
+            const build = await runStep('Building web assets...', 'node engine/scripts/build-web.mjs', buildCwd, { ...gcloudEnv, MODOKI_PROJECT: projectRoot });
+            if (aborted) return;
+            if (!build.ok) { sendStatus(`FAILED:Building web assets\n${build.output.slice(-1500)}`); res.end(); return; }
+
+            // Step 2: refuse a version-string collision. release.json only tracks the
+            // CURRENT live version, not history, so check the versioned manifest object
+            // itself — a device that already rejected this version must never see it
+            // "successfully" republished with different bytes.
+            sendStatus('Checking for a version collision...');
+            const manifestPath = `${bucket}/bundles/${bundleName}/${version}/manifest.json`;
+            let manifestExists = false;
+            try {
+              execFileSync('gcloud', ['storage', 'cat', manifestPath], { env: gcloudEnv, stdio: ['ignore', 'ignore', 'pipe'] });
+              manifestExists = true;
+            } catch (e) {
+              // A missing object is the ONLY case that means "safe to proceed" — `gcloud
+              // storage cat` reports it as "not found: 404" or "matched no objects" on
+              // stderr. Anything else (auth expired, network blip, wrong bucket
+              // permissions) must NOT be silently treated as "no collision": that would
+              // let a publish proceed past the one guard that stops a device which
+              // already rejected this version string from being served it again under a
+              // "successful" republish. Fail loudly instead — the human re-runs once
+              // whatever's actually wrong (e.g. `gcloud auth login`) is fixed.
+              const stderr = (e as { stderr?: Buffer | string })?.stderr?.toString() ?? '';
+              if (isGcloudObjectNotFoundError(stderr)) {
+                manifestExists = false;
+              } else {
+                sendStatus(`FAILED:Could not check for a version collision\n${stderr || (e instanceof Error ? e.message : String(e))}`);
+                res.end();
+                return;
+              }
+            }
+            if (aborted) return;
+            if (manifestExists) {
+              const m = version.match(/^v(\d+)$/);
+              const hint = m ? ` Try v${Number(m[1]) + 1}.` : '';
+              sendStatus(`FAILED:Version collision\n"${bundleName}@${version}" is already published under ${bucket}. Publishing again would silently never reach any device that already rejected these bytes once.${hint}`);
+              res.end();
+              return;
+            }
+
+            // Step 3: verify/set bucket CORS (GCS sets none by default; `gcloud`/`curl`
+            // ignore CORS entirely, so nothing catches a missing policy until a real
+            // WebView fetch() fails — and checkForUpdate reports that as the generic
+            // no-release-for-bundle, i.e. silently). Non-fatal: a permissions error here
+            // shouldn't block publishing, just gets logged as a warning.
+            sendStatus('Verifying bucket CORS...');
+            const bucketRoot = bucket.match(/^gs:\/\/[^/]+/)?.[0];
+            if (bucketRoot) {
+              const corsFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-cors-')), 'cors.json');
+              fs.writeFileSync(corsFile, JSON.stringify([{ origin: ['*'], method: ['GET', 'HEAD'], responseHeader: ['Content-Type'], maxAgeSeconds: 3600 }]));
+              try {
+                execFileSync('gcloud', ['storage', 'buckets', 'update', bucketRoot, `--cors-file=${corsFile}`], { env: gcloudEnv, stdio: 'ignore' });
+                send(`CORS verified on ${bucketRoot}.`);
+              } catch (e) {
+                send(`⚠️  Could not set CORS on ${bucketRoot} (non-fatal, continuing): ${e instanceof Error ? e.message : String(e)}`);
+              }
+            }
+            if (aborted) return;
+
+            // Step 4: the actual publish.
+            sendStatus('Publishing...');
+            const mandatoryFlag = mandatory ? ' --mandatory' : '';
+            const publish = await runStep(
+              'Publishing OTA bundle...',
+              `node engine/scripts/ota-publish.mjs --dist ${JSON.stringify(distDir)} --bucket ${JSON.stringify(bucket)} --name ${JSON.stringify(bundleName)} --version ${JSON.stringify(version)} --engine-api ${cfg.ota.engineApi} --key ${JSON.stringify(keyName)} --repo-root ${JSON.stringify(buildCwd)}${mandatoryFlag}`,
+              buildCwd,
+              gcloudEnv,
+            );
+            if (aborted) return;
+            if (!publish.ok) { sendStatus(`FAILED:Publishing\n${publish.output.slice(-1500)}`); res.end(); return; }
+
+            sendStatus('DONE');
+            send(`\n✅ Published ${bundleName}@${version}${mandatory ? ' (mandatory)' : ''} to ${bucket}.`);
             res.end();
           })();
           return;

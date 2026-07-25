@@ -233,6 +233,33 @@ export interface ProjectConfig {
    *  field in a model's `.meta.json`). Drives the Stage-A bake. Empty/absent =
    *  no project postprocessors. */
   postprocessors: Record<string, ModelPostprocessorDecl>;
+  /** OTA update client config (docs/ota-updates.md, Phase 3a) — read by the app
+   *  shell (App.tsx) at boot, not by game code. `enabled: false` (the default)
+   *  means the shell skips the check entirely, so an unconfigured project pays
+   *  no network cost and never dynamic-imports the plugin. */
+  ota: {
+    enabled: boolean;
+    /** Base URL the bucket is served from, e.g. "https://cdn.example.com/games/mygame"
+     *  (no trailing slash). Empty when disabled. */
+    baseUrl: string;
+    /** Ed25519 public key (base64url, 32 raw bytes) baked into the app — the
+     *  counterpart of the PRIVATE key in build/ota-keys/<name>.json (gitignored,
+     *  never committed). Losing the private key means these installed binaries
+     *  can never be updated again. */
+    publicKey: string;
+    /** The bundle this running app instance drives. Phase 1-3 are single-game,
+     *  so this is always 'shell'; Phase 4 sub-games get their own bundle name. */
+    bundleName: string;
+    /** This BUILD's own engine-API version, stamped in — NOT a designer-tunable
+     *  knob. It's what `checkForUpdate` compares an incoming manifest/release
+     *  against to refuse an update this running JS can't execute. A build
+     *  produced by a newer/older engine should carry a different value; hand-
+     *  editing this to "fix" a rejected update defeats the gate it exists for.
+     *  Must equal `ENGINE_API_VERSION` (`runtime/version.ts`) — this file stays
+     *  import-free (see header), so the two are pinned together by a vitest
+     *  rather than a shared import. */
+    engineApi: number;
+  };
 }
 
 /** Per-machine settings kept OUT of the committed config (gitignored
@@ -314,6 +341,13 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     collisionMatrix: [0xffff],
   },
   postprocessors: {},
+  ota: {
+    enabled: false,
+    baseUrl: '',
+    publicKey: '',
+    bundleName: 'shell',
+    engineApi: 1,
+  },
 };
 
 /** Defaults for the per-machine user config. The device/SDK values here mirror
@@ -355,6 +389,7 @@ export function mergeProjectConfig(partial: Partial<ProjectConfig> | null | unde
       ...p.physics,
     },
     postprocessors: { ...d.postprocessors, ...p.postprocessors },
+    ota: { ...d.ota, ...p.ota },
   };
 }
 

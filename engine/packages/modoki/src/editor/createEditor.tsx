@@ -196,7 +196,7 @@ export async function awaitRendererReady(
 export interface ProjectSettingsField {
   key: string;
   label: string;
-  type: 'text' | 'number' | 'checkbox' | 'select' | 'combo' | 'string-list' | 'physics-layers' | 'path' | 'scene-list' | 'module-toggles';
+  type: 'text' | 'number' | 'checkbox' | 'select' | 'combo' | 'string-list' | 'physics-layers' | 'path' | 'scene-list' | 'module-toggles' | 'readonly-text';
   /** Options for `select` fields, and suggestions for a `combo` (free-text +
    *  datalist) field — the stored value is the option's `value`. */
   options?: { value: string; label: string }[];
@@ -204,6 +204,10 @@ export interface ProjectSettingsField {
   help?: string;
   /** For `path` fields — whether the Browse… button picks a file or a folder. */
   pathMode?: 'file' | 'folder';
+  /** `readonly-text` renders a disabled input showing the current value — for a
+   *  setting that's DERIVED (e.g. `ota.publicKey`, written by a dedicated flow
+   *  like the OTA Keys dialog), never hand-typed. Still persisted through the
+   *  normal save path; the form just never offers an editable control for it. */
   /** Conditional visibility: show this field only when the current value at
    *  `key` (a dot-path into the settings object) is one of `in`. Used e.g. to
    *  show the GCS/CDN fields only in the matching web-deploy mode. */

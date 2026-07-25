@@ -476,6 +476,68 @@ TSL node builders have a racy lazy initialization on the **first** compile a ren
 
 **Related HMR caveat:** the `npr/*.ts` modules call `import.meta.hot.invalidate()` to opt out of HMR. TSL node (and `wgslFn`) instances get baked into compiled WGSL pipelines; hot-reloading a module creates new node identities that the old cached pipeline still references, raising the same `unresolved type 'OutputType'` error. A full page reload is the correct (and cheap) price for a stable cache.
 
+## Bloom Post-Process
+
+A reusable whole-scene HDR bloom, added for `demos/particle-demo`'s dark-VFX showreel but not
+specific to it — any 3D scene can add the trait. **WebGPU-only**, off by default, toggled by the
+`BloomPostFX` ECS trait.
+
+### Control trait — `runtime/traits/BloomPostFX.ts`
+
+Singleton (first entity wins), editable in the Inspector:
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `enabled` | `false` | Master toggle. |
+| `strength` | `0.8` | Glow intensity (typical 0.3–1.5). |
+| `radius` | `0.6` | Blur spread (0..1). |
+| `threshold` | `0.0` | Only pixels brighter than this bloom; `0` blooms the whole scene (the right value on a near-black void, where bloom itself acts as the key light). |
+
+### Pipeline — `rendering/bloom/BloomPostProcess.ts`
+
+Far simpler than NPR — one `RenderPipeline` wrapping a single TSL bloom pass:
+
+```ts
+class BloomPostProcess {
+  constructor(renderer, scene, camera, cfg: BloomConfig)
+  render(): void
+  setConfig(c: BloomConfig): void   // live uniform update, no rebuild
+  dispose(): void
+}
+```
+
+`pass(scene, camera).getTextureNode()` gives the lit HDR color node; `bloom(color, strength,
+radius, threshold)` (from `three/examples/jsm/tsl/display/BloomNode.js`) builds the glow node;
+`pipeline.outputNode = color.add(bloomPass)` composites them. Unlike NPR, the default output color
+transform (tone map + encode) stays **on** — bloom augments the normal forward render rather than
+replacing it with a stylized one. Particles ride `PARTICLE_LAYER`, which the camera already
+enables, so a whole-scene bloom pass includes them — this is what makes additive particle effects
+read as the scene's only light source.
+
+### Integration — `Scene3D.tsx`
+
+On the plain forward-render branch (the `else` after the NPR branch):
+
+```ts
+} else if (bloomEnabled && isWebGPU) {
+  if (!bloomComposer || bloomCamera !== activeCamera) {
+    bloomComposer?.dispose();
+    bloomComposer = new BloomPostProcess(renderer, scene, activeCamera, bloomCfg);
+    bloomCamera = activeCamera;
+  } else { bloomComposer.setConfig(bloomCfg); }
+  bloomComposer.render();
+} else {
+  renderer.render(scene, activeCamera);
+}
+```
+
+- **NPR wins if both are enabled** — the NPR branch is checked first, so bloom is skipped when NPR
+  is also on. Composing bloom after NPR is out of scope for v1.
+- **WebGL fallback**: gated on `isWebGPU`; on a WebGL2 fallback render falls through to the plain
+  path (no bloom, no error).
+- Same `import.meta.hot.invalidate()` / prewarm-race caveats as NPR (see above) — TSL bakes into
+  WGSL, so bloom is disposed on camera-projection swap and never hot-reloaded in place.
+
 ## 2D Rendering (PixiJS)
 
 The `2d` layer draws `Renderable2D` (and `Text2D` / `SkinnedSprite2D`) entities with PixiJS v8, into one or more **Canvas2D** host entities. `Scene2D.tsx` owns the pass; `render2DUtils.ts` holds the shape / pivot / scale math shared with the editor's Canvas2D preview so the two can't drift (guarded by `tests/runtime/render2DParity.test.ts`).

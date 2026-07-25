@@ -1,3 +1,7 @@
+// OTA Phase 4 — must be the FIRST import so globalThis.__MODOKI_SHARED__ exists before
+// anything else (including App.tsx's sub-game loading) can ask for it. See
+// docs/ota-subgame-modules.md.
+import './sharedRegistry'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
@@ -17,6 +21,14 @@ setJournalEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
 // lazy import is gated on the same OR, so a release build with the flag off
 // tree-shakes the whole debug-menu chunk out. See docs/debug-menu-plan.md.
 setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
+
+// OTA Phase 4 — "Games" debug-menu tab, letting a player jump to a dynamically-loaded
+// sub-game (gameRegistry.ts). Not editor-only: it needs to work in a shipped debug
+// build on a real device, where loadStagedSubgames() actually discovers sub-games.
+// Side-effect import registers the tab; gated so a release build never bundles it.
+if (__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__) {
+  import('./debug/GamesTab');
+}
 
 // Native SDK init (Adjust/AppLovin) is no longer wired here — it moved into the
 // game's app-service package, registered via GameDefinition.registerAppServices()
@@ -38,6 +50,14 @@ setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
 if (!__MODOKI_PLAYABLE__ && (import.meta.env.DEV || import.meta.env.VITE_DEBUG_BRIDGE || (__MODOKI_DEBUG_BUILD__ && Capacitor.isNativePlatform()))) {
   import('@modoki/engine/runtime').then(({ useGameStore }) => {
     (window as unknown as Record<string, unknown>).__gameStore = useGameStore;
+  });
+  // OTA Phase 4 debug hook — inspect the runtime game registry (baked + dynamically
+  // loaded sub-games) via device_eval, same gating as __gameStore above. Returns plain
+  // {id,name} pairs (GameDefinition itself carries functions device_eval can't marshal).
+  import('./gameRegistry').then(({ getGames }) => {
+    (window as unknown as Record<string, unknown>).__modokiGames = {
+      list: () => getGames().map((g) => ({ id: g.id, name: g.name })),
+    };
   });
   import('./debug/bridge').then(({ initDebugBridge }) => initDebugBridge());
 }

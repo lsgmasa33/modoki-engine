@@ -26,6 +26,7 @@ import { pixiParticleBackend, type IParticle2DBackend } from '../particles/pixiP
 import type { ParticleHandle, ParticleEffectDef } from '../particles/types';
 import { getParticleEffect } from '../loaders/particleCache';
 import { getWorldTransform2DInto } from './renderUtils';
+import { deactivatedEntities } from '../../three/systems/transformPropagationSystem';
 
 /** The Scene2D-side wiring this sync needs — all resolved against Scene2D's per-frame state. */
 export interface ParticleSync2DCtx {
@@ -92,6 +93,7 @@ export function syncParticles2D(
 
   world.query(Transform, ParticleEmitter).updateEach(([tf, pe]: [TransformData, EmitterData], entity) => {
     const id = entity.id();
+    if (deactivatedEntities.has(id)) return; // entity (or an ancestor) is inactive — disposed by the cleanup pass below
     const canvasId = ctx.canvasIdOf(id);
     if (canvasId === null) return; // no Canvas2D ancestor → the 3D particleSync owns this emitter
     if (!pe.isVisible || !pe.effect) return; // disposed by the cleanup pass below

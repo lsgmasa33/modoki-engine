@@ -116,6 +116,11 @@ export function ensureCapacitorDeps(projectRoot: string, platform: NativePlatfor
     '@capacitor/app': capDepRange(editorRoot, '@capacitor/app', range),
     '@capacitor/keyboard': capDepRange(editorRoot, '@capacitor/keyboard', range),
     '@capacitor/preferences': capDepRange(editorRoot, '@capacitor/preferences', range),
+    // App.tsx calls SplashScreen.hide() once the game is actually ready to show
+    // (docs/ota-updates.md, Phase 3b) — without the plugin the call is a harmless
+    // no-op (wrapped in try/catch), so this heals in lazily rather than needing a
+    // version bump elsewhere.
+    '@capacitor/splash-screen': capDepRange(editorRoot, '@capacitor/splash-screen', range),
     'capacitor-game-debug': '*',
   };
   let changed = false;
@@ -147,7 +152,13 @@ export function ensureCapacitorConfig(projectRoot: string, cfg: ProjectConfig): 
     ios: { preferredContentMode: cfg.capacitor.iosContentMode },
     android: { allowMixedContent: cfg.capacitor.allowMixedContent },
     server: { androidScheme: cfg.capacitor.androidScheme },
-    plugins: { Keyboard: { resize: cfg.capacitor.keyboardResize } },
+    // launchAutoHide:false — the native splash stays up until App.tsx explicitly
+    // calls SplashScreen.hide() once the game has actually rendered a frame,
+    // instead of Capacitor's own fixed 3s timer racing the real load time
+    // (docs/ota-updates.md, Phase 3b). Existing projects created before this field
+    // existed keep the default timer — this only applies to a FRESH
+    // capacitor.config.json (this function never clobbers an existing one).
+    plugins: { Keyboard: { resize: cfg.capacitor.keyboardResize }, SplashScreen: { launchAutoHide: false } },
   };
   fs.writeFileSync(file, JSON.stringify(config, null, 2) + '\n');
   return { changed: true, notes: [`created capacitor.config.json (${cfg.app.appId} / "${cfg.app.appName}")`] };

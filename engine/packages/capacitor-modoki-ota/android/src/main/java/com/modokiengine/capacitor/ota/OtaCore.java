@@ -4,7 +4,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * Pure OTA boot-watchdog state machine (docs/plans/mobile-ota-updates-plan.md, Phase 1).
+ * Pure OTA boot-watchdog state machine (docs/ota-updates.md).
  *
  * java.* stdlib only — NO android.* import — so this class is testable on a plain JVM
  * (`javac`/`java`, no Gradle, no Android SDK, no device/emulator). The real plugin
@@ -23,6 +23,8 @@ public final class OtaCore {
   public static final int MAX_ATTEMPTS = 3;
   /** See OtaCore.swift: promotion requires TWO separate successful boots — not 1. */
   public static final int REQUIRED_CONFIRMS = 2;
+  /** See OtaCore.swift: FIFO cap on the per-bundle `rejected` quarantine list. */
+  public static final int MAX_REJECTED_PER_BUNDLE = 10;
 
   public enum TargetKind { EMBEDDED, VERSION }
 
@@ -61,40 +63,75 @@ public final class OtaCore {
     public final Map<String, String> pending;
     public final Map<String, Integer> bootAttempts;
     public final Map<String, Integer> confirmedBoots;
+    /** See OtaCore.swift: versions proven bad by attempt exhaustion; never stage again. */
+    public final Map<String, java.util.List<String>> rejected;
+    /** See OtaCore.swift's field doc: the app-binary version last seen by
+     *  resetForNewBinary. null = fresh install OR a pre-this-feature state.json — both
+     *  must NOT trigger a reset. */
+    public final String lastSeenBinaryVersion;
 
     public State() {
-      this(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>());
+      this(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), null);
     }
 
     public State(Map<String, String> active, Map<String, String> pending, Map<String, Integer> bootAttempts, Map<String, Integer> confirmedBoots) {
+      this(active, pending, bootAttempts, confirmedBoots, new HashMap<>(), null);
+    }
+
+    public State(Map<String, String> active, Map<String, String> pending, Map<String, Integer> bootAttempts, Map<String, Integer> confirmedBoots, Map<String, java.util.List<String>> rejected) {
+      this(active, pending, bootAttempts, confirmedBoots, rejected, null);
+    }
+
+    public State(Map<String, String> active, Map<String, String> pending, Map<String, Integer> bootAttempts, Map<String, Integer> confirmedBoots, Map<String, java.util.List<String>> rejected, String lastSeenBinaryVersion) {
       this.active = active;
       this.pending = pending;
       this.bootAttempts = bootAttempts;
       this.confirmedBoots = confirmedBoots;
+      this.rejected = rejected;
+      this.lastSeenBinaryVersion = lastSeenBinaryVersion;
     }
 
     public State copy() {
-      return new State(new HashMap<>(active), new HashMap<>(pending), new HashMap<>(bootAttempts), new HashMap<>(confirmedBoots));
+      Map<String, java.util.List<String>> rejectedCopy = new HashMap<>();
+      for (Map.Entry<String, java.util.List<String>> e : rejected.entrySet()) {
+        rejectedCopy.put(e.getKey(), new java.util.ArrayList<>(e.getValue()));
+      }
+      return new State(new HashMap<>(active), new HashMap<>(pending), new HashMap<>(bootAttempts), new HashMap<>(confirmedBoots), rejectedCopy, lastSeenBinaryVersion);
     }
 
     @Override
     public boolean equals(Object o) {
       if (!(o instanceof State)) return false;
       State s = (State) o;
-      return active.equals(s.active) && pending.equals(s.pending) && bootAttempts.equals(s.bootAttempts) && confirmedBoots.equals(s.confirmedBoots);
+      return active.equals(s.active) && pending.equals(s.pending) && bootAttempts.equals(s.bootAttempts) && confirmedBoots.equals(s.confirmedBoots) && rejected.equals(s.rejected)
+        && java.util.Objects.equals(lastSeenBinaryVersion, s.lastSeenBinaryVersion);
     }
 
     @Override
-    public int hashCode() { return java.util.Objects.hash(active, pending, bootAttempts, confirmedBoots); }
+    public int hashCode() { return java.util.Objects.hash(active, pending, bootAttempts, confirmedBoots, rejected, lastSeenBinaryVersion); }
 
     @Override
     public String toString() {
-      return "State{active=" + active + ", pending=" + pending + ", bootAttempts=" + bootAttempts + ", confirmedBoots=" + confirmedBoots + "}";
+      return "State{active=" + active + ", pending=" + pending + ", bootAttempts=" + bootAttempts + ", confirmedBoots=" + confirmedBoots + ", rejected=" + rejected + ", lastSeenBinaryVersion=" + lastSeenBinaryVersion + "}";
     }
   }
 
   public interface FolderExists {
     boolean check(String name, String version);
+  }
+
+  // ---- New-binary reset ----
+
+  /** See OtaCore.swift's resetForNewBinary doc — same contract, must behave identically. */
+  public static State resetForNewBinary(State state, String currentBinaryVersion) {
+    if (state == null) return null;
+    if (state.lastSeenBinaryVersion != null && !state.lastSeenBinaryVersion.equals(currentBinaryVersion)) {
+      return new State(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), state.rejected, currentBinaryVersion);
+    }
+    if (state.lastSeenBinaryVersion == null) {
+      return new State(state.active, state.pending, state.bootAttempts, state.confirmedBoots, state.rejected, currentBinaryVersion);
+    }
+    return state;
   }
 
   // ---- Boot ----
@@ -116,11 +153,14 @@ public final class OtaCore {
     String pendingVersion = s.pending.get(name);
     if (pendingVersion != null) {
       if (!folderExists.check(name, pendingVersion)) {
-        return revert(s, name, folderExists);
+        // Deliberately does NOT quarantine — see OtaCore.swift for why a vanished folder
+        // is not proof the bundle is bad (transient disk event; re-staging is the heal).
+        return revert(s, name, false, folderExists);
       }
       int attempts = s.bootAttempts.getOrDefault(name, 0);
       if (attempts >= MAX_ATTEMPTS) {
-        return revert(s, name, folderExists);
+        // Attempt exhaustion IS proof — quarantine so it is never staged again.
+        return revert(s, name, true, folderExists);
       }
       s.bootAttempts.put(name, attempts + 1);
       return new BootResult(Target.version(name, pendingVersion), s);
@@ -135,8 +175,16 @@ public final class OtaCore {
     return new BootResult(Target.version(name, activeVersion), s);
   }
 
-  private static BootResult revert(State state, String name, FolderExists folderExists) {
+  private static BootResult revert(State state, String name, boolean quarantine, FolderExists folderExists) {
     State s = state.copy();
+    String badVersion = s.pending.get(name);
+    if (quarantine && badVersion != null) {
+      java.util.List<String> list = s.rejected.get(name);
+      if (list == null) list = new java.util.ArrayList<>();
+      if (!list.contains(badVersion)) list.add(badVersion);
+      while (list.size() > MAX_REJECTED_PER_BUNDLE) list.remove(0);
+      s.rejected.put(name, list);
+    }
     s.pending.remove(name);
     s.bootAttempts.remove(name);
     s.confirmedBoots.remove(name);

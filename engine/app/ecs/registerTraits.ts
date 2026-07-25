@@ -4,7 +4,7 @@
 import { registerTrait, type FieldHint } from '@modoki/engine/runtime';
 import {
   Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
-  UIElement, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, Animator, SpriteAnimator,
+  UIElement, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, Animator, SpriteAnimator,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
   AudioSource, AudioListener,
@@ -1067,6 +1067,16 @@ export function registerAllTraits() {
       fxaaEdgeThresholdMin: { type: 'number', step: 0.001, min: 0, max: 0.1, section: 'FXAA', tooltip: 'Absolute luma floor — pixels below this are treated as flat. Typical 0.01–0.05.', showWhen: { fxaa: ['true'] } },
       fxaaBlendStrength: { type: 'number', step: 0.5, min: 0, max: 16, section: 'FXAA', tooltip: 'Blur strength multiplier on detected edges. Typical 2–8.', showWhen: { fxaa: ['true'] } },
       superSampleScale: { type: 'number', step: 1, min: 1, max: 4, section: 'Supersampling', tooltip: 'Supersample factor on MRT + composite RTT. 1 = native, 2 = 4× pixels (default), 4 = 16× pixels (overkill). Changing this rebuilds the pipeline.' },
+    },
+  });
+
+  registerTrait({
+    name: 'BloomPostFX', trait: BloomPostFX, category: 'resource',
+    fields: {
+      enabled: { type: 'boolean', tooltip: 'Route the (non-NPR) 3D render through the TSL bloom composer. WebGPU only; if NPR is also enabled, NPR wins.' },
+      strength: { type: 'number', step: 0.05, min: 0, max: 3, tooltip: 'Bloom intensity / glow brightness. Typical 0.3–1.5.' },
+      radius: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: 'Glow blur spread (softness/width). 0..1.' },
+      threshold: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: 'Luminance threshold — only pixels brighter than this bloom. 0 = whole scene (good on a near-black void).' },
     },
   });
 

@@ -1,8 +1,10 @@
-// OTA update Capacitor plugin (docs/plans/mobile-ota-updates-plan.md, Phase 1).
+// OTA update Capacitor plugin (docs/ota-updates.md).
 //
-// DEVICE-UNVERIFIED — written against Capacitor 8's actual source (read directly, not
-// guessed) but never built/run on a device or in Xcode. Before shipping, verify on a real
-// iPhone per the plan doc's Phase 1 gate.
+// DEVICE-VERIFIED on a real iPhone (2026-07-24/25): stage → promote → revert → fix-forward,
+// plus delta staging from both bases. Written against Capacitor 8's actual source, read
+// directly rather than guessed. The `rejected` quarantine path is the one part NOT yet
+// exercised on iOS — it passes the shared vectors and needed no change here, but see
+// docs/ota-updates.md.
 //
 // This wraps the pure ModokiOtaCore/OtaZip logic (already verified via `swift test`, no
 // device needed) with real file I/O and integrates with Capacitor's OWN existing
@@ -41,8 +43,8 @@ import Foundation
 // import. `import ModokiOtaCore` only makes sense if a consumer ever links this
 // package's real SPM product instead — not how any project integrates it today.
 
-/// The one-and-only bundle name Phase 1 drives (the whole app IS the game — see the plan
-/// doc; sub-game bundle names are a Phase 4 concern, not exercised here).
+/// The one-and-only bundle name shipped today (the whole app IS the game — see
+/// docs/ota-updates.md; per-sub-game bundle names are a future concern, not exercised here).
 public let otaShellBundleName = "shell"
 
 enum OtaPaths {
@@ -72,12 +74,33 @@ enum OtaPaths {
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir
   }
+
+  /// The app-binary version `resetForNewBinary` compares against — same signal Capacitor's
+  /// own `isNewBinary()` uses (`CFBundleVersion`, not the human-readable
+  /// `CFBundleShortVersionString`; the build number changes on every submission, the
+  /// marketing version doesn't have to). Falls back to a fixed sentinel on the
+  /// (unreachable in a real app, but defensive) case the key is absent — never crashes.
+  static var currentBinaryVersion: String {
+    (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? "unknown"
+  }
+
+  /// Guards every state.json read-MODIFY-write sequence (`OtaBootHook.run`, `activate`,
+  /// `confirmBoot`). Each individual write is already atomic (`atomically: true` — a tmp
+  /// file + rename), but that alone doesn't stop a LOST UPDATE: two concurrent callers can
+  /// both read the same old state, then both write their own modified copy — the second
+  /// write silently clobbers the first's change. OTA Phase 4 made this a real, not just
+  /// theoretical, bug: the shell's own `confirmBoot` and a sub-game's `confirmBoot` can now
+  /// fire close together in the same boot, and one's `confirmedBoots` increment was
+  /// observed lost on a real device (see docs/plans/mobile-ota-updates-plan.md). A single
+  /// shared lock serializes every mutation within this process — the only writer of this
+  /// file — which is all that's needed (no cross-process access to guard against).
+  static let stateLock = NSLock()
 }
 
 /// Called from `MyViewController.instanceDescriptor()` BEFORE `super.instanceDescriptor()`
 /// — the documented Capacitor extension point for deciding what gets served, which runs
-/// before the WKWebView/bridge exist. Example integration (added when this plugin is
-/// wired into a real project — not yet done, see the plan doc):
+/// before the WKWebView/bridge exist. Integration (live in `games/ota-test`'s
+/// MyViewController.swift — this is the real, shipped shape, not a sketch):
 ///
 /// ```swift
 /// override func instanceDescriptor() -> InstanceDescriptor {
@@ -87,16 +110,26 @@ enum OtaPaths {
 /// ```
 public enum OtaBootHook {
   public static func run(name: String) {
-    let stateJSON = try? String(contentsOf: OtaPaths.stateFilePath, encoding: .utf8)
-    let folderExists: (String, String) -> Bool = { n, v in
-      var isDir: ObjCBool = false
-      let exists = FileManager.default.fileExists(atPath: OtaPaths.versionDir(name: n, version: v).path, isDirectory: &isDir)
-      return exists && isDir.boolValue
-        && FileManager.default.fileExists(atPath: OtaPaths.versionDir(name: n, version: v).appendingPathComponent("index.html").path)
-    }
+    OtaPaths.stateLock.lock()
+    let target: OtaTarget
+    do {
+      defer { OtaPaths.stateLock.unlock() }
+      let stateJSON = try? String(contentsOf: OtaPaths.stateFilePath, encoding: .utf8)
+      let folderExists: (String, String) -> Bool = { n, v in
+        var isDir: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: OtaPaths.versionDir(name: n, version: v).path, isDirectory: &isDir)
+        return exists && isDir.boolValue
+          && FileManager.default.fileExists(atPath: OtaPaths.versionDir(name: n, version: v).appendingPathComponent("index.html").path)
+      }
 
-    let (target, newState) = OtaCore.boot(fromJSON: stateJSON, name: name, folderExists: folderExists)
-    if let newState { try? OtaCore.serialize(newState).write(to: OtaPaths.stateFilePath, atomically: true, encoding: .utf8) }
+      // Detect a genuine App/Play Store update BEFORE deciding what to boot — see
+      // OtaCore.resetForNewBinary's doc comment for why our own bookkeeping needs this
+      // independently of Capacitor's own isNewBinary() (which only decides what IT serves).
+      let parsedState = OtaCore.resetForNewBinary(OtaCore.parseState(stateJSON), currentBinaryVersion: OtaPaths.currentBinaryVersion)
+      let (bootTarget, newState) = OtaCore.boot(state: parsedState, name: name, folderExists: folderExists)
+      if let newState { try? OtaCore.serialize(newState).write(to: OtaPaths.stateFilePath, atomically: true, encoding: .utf8) }
+      target = bootTarget
+    }
 
     switch target {
     case .embedded:
@@ -117,10 +150,24 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
   public let jsName = "ModokiOta"
   public let pluginMethods: [CAPPluginMethod] = [
     CAPPluginMethod(name: "stageUpdate", returnType: CAPPluginReturnPromise),
+    CAPPluginMethod(name: "stageUpdateDelta", returnType: CAPPluginReturnPromise),
     CAPPluginMethod(name: "activate", returnType: CAPPluginReturnPromise),
     CAPPluginMethod(name: "confirmBoot", returnType: CAPPluginReturnPromise),
     CAPPluginMethod(name: "getState", returnType: CAPPluginReturnPromise),
+    CAPPluginMethod(name: "listBundles", returnType: CAPPluginReturnPromise),
   ]
+
+  /// Emits `otaProgress` (Phase 3a — plumbing only, no UI consumes this yet). Safe to
+  /// call from any queue — `CAPPlugin.notifyListeners` marshals to the bridge itself.
+  /// `bytesTotal: 0` means "genuinely unknown"; the JS side must treat that as
+  /// indeterminate, not "already done".
+  private func emitProgress(name: String, version: String, bytesDone: Int64, bytesTotal: Int64, filesDone: Int, filesTotal: Int) {
+    notifyListeners("otaProgress", data: [
+      "name": name, "version": version,
+      "bytesDone": bytesDone, "bytesTotal": bytesTotal,
+      "filesDone": filesDone, "filesTotal": filesTotal,
+    ])
+  }
 
   /// Downloads a bundle zip directly (URLSession — bypasses the JS bridge for the
   /// payload bytes entirely, the reason this needs to be native at all: marshalling
@@ -130,6 +177,11 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
   /// `ionic_built_snapshots/<name>-<version>/` location once the whole zip has been
   /// verified AND fully extracted — so a kill mid-download/mid-unzip can never leave a
   /// half-written folder where `boot()`'s `folderExists` check would find it.
+  ///
+  /// Progress: rather than switching to a delegate-based `downloadTask` (a bigger
+  /// refactor), a `dataTask`'s returned `URLSessionTask` already exposes
+  /// `countOfBytesReceived`/`countOfBytesExpectedToReceive` — a short-interval timer
+  /// polls those for real byte-level `otaProgress` ticks with a minimal diff.
   @objc func stageUpdate(_ call: CAPPluginCall) {
     guard let name = call.getString("name"), let version = call.getString("version"),
           let zipUrlString = call.getString("zipUrl"), let zipUrl = URL(string: zipUrlString),
@@ -137,8 +189,12 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
       call.reject("stageUpdate requires name, version, zipUrl, expectedZipHash")
       return
     }
+    let expectedSize = Int64(call.getInt("expectedZipSize") ?? 0)
 
-    URLSession.shared.dataTask(with: zipUrl) { data, response, error in
+    var progressTimer: DispatchSourceTimer?
+    let task = URLSession.shared.dataTask(with: zipUrl) { [weak self] data, response, error in
+      progressTimer?.cancel()
+      guard let self else { return }
       if let error { call.reject("download failed: \(error.localizedDescription)"); return }
       guard let data, let http = response as? HTTPURLResponse, http.statusCode == 200 else {
         call.reject("download failed: bad response"); return
@@ -161,22 +217,153 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
         let finalDir = OtaPaths.versionDir(name: name, version: version)
         try? FileManager.default.removeItem(at: finalDir) // a stale partial from an earlier interrupted attempt
         try FileManager.default.moveItem(at: tmpDir, to: finalDir) // atomic on the same volume
+        self.emitProgress(name: name, version: version, bytesDone: Int64(data.count), bytesTotal: max(expectedSize, Int64(data.count)), filesDone: 1, filesTotal: 1)
         call.resolve(["ok": true])
       } catch {
         call.reject("stage failed: \(error.localizedDescription)")
       }
-    }.resume()
+    }
+
+    let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+    timer.schedule(deadline: .now(), repeating: .milliseconds(200))
+    timer.setEventHandler { [weak self, weak task] in
+      guard let self, let task, task.state == .running else { return }
+      let total = task.countOfBytesExpectedToReceive > 0 ? task.countOfBytesExpectedToReceive : expectedSize
+      self.emitProgress(name: name, version: version, bytesDone: task.countOfBytesReceived, bytesTotal: total, filesDone: 0, filesTotal: 1)
+    }
+    progressTimer = timer
+    timer.resume()
+    task.resume()
+  }
+
+  /// Phase 2 delta staging (docs/ota-updates.md) — builds the `version`
+  /// folder WITHOUT downloading a whole-bundle zip: copies `copy` (unchanged relative
+  /// paths, byte-for-byte) from `baseVersion`'s already-on-disk folder — OR, when
+  /// `baseVersion == "embedded"`, from the app's OWN bundled webDir
+  /// (`Bundle.main.resourceURL/public`, Capacitor's actual default `appLocation` per
+  /// `CAPInstanceDescriptor.m` — read from source, not guessed, same discipline as the
+  /// `ionic_built_snapshots` path above) — and downloads only `download` (new/changed
+  /// files), each independently SHA-256-verified against its own hash before being
+  /// written. Same atomicity contract as `stageUpdate`: builds into a `.tmp` dir, only
+  /// renamed into place once every copy AND download has succeeded and verified.
+  @objc func stageUpdateDelta(_ call: CAPPluginCall) {
+    guard let name = call.getString("name"), let version = call.getString("version"),
+          let baseVersion = call.getString("baseVersion"),
+          let copyPaths = call.getArray("copy", String.self) else {
+      call.reject("stageUpdateDelta requires name, version, baseVersion, copy")
+      return
+    }
+    struct DeltaDownload { let path: String; let url: URL; let hash: String; let size: Int64 }
+    var downloads: [DeltaDownload] = []
+    for item in call.getArray("download") ?? [] {
+      guard let obj = item as? JSObject,
+            let path = obj["path"] as? String,
+            let urlString = obj["url"] as? String, let url = URL(string: urlString),
+            let hash = obj["hash"] as? String else {
+        call.reject("stageUpdateDelta: malformed entry in download[]")
+        return
+      }
+      let size = (obj["size"] as? NSNumber)?.int64Value ?? 0
+      downloads.append(DeltaDownload(path: path, url: url, hash: hash, size: size))
+    }
+    print("[ModokiOta] stageUpdateDelta \(name)@\(version) from \(baseVersion): copy=\(copyPaths.count) download=\(downloads.count)")
+
+    // Progress (Phase 3a — plumbing only, no UI consumes this yet). filesTotal/bytesTotal
+    // are known upfront; copies only move filesDone (no network, byte total unknown —
+    // same "byte-granularity is download-only" scope as the Android port).
+    // `progressLock` serializes filesDone/bytesDone across the concurrent download
+    // completion handlers below (each fires on its own URLSession callback thread).
+    let filesTotal = copyPaths.count + downloads.count
+    let bytesTotal = downloads.reduce(Int64(0)) { $0 + $1.size }
+    var filesDone = 0
+    var bytesDone: Int64 = 0
+    let progressLock = NSLock()
+    func reportFileDone(bytes: Int64) {
+      progressLock.lock()
+      filesDone += 1
+      bytesDone += bytes
+      let (fd, bd) = (filesDone, bytesDone)
+      progressLock.unlock()
+      emitProgress(name: name, version: version, bytesDone: bd, bytesTotal: bytesTotal, filesDone: fd, filesTotal: filesTotal)
+    }
+
+    let sourceDir = baseVersion == "embedded"
+      ? (Bundle.main.resourceURL ?? Bundle.main.bundleURL).appendingPathComponent("public")
+      : OtaPaths.versionDir(name: name, version: baseVersion)
+    var isDir: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: sourceDir.path, isDirectory: &isDir), isDir.boolValue else {
+      call.reject("stageUpdateDelta: base version folder not found: \(sourceDir.path)")
+      return
+    }
+
+    let tmpDir = OtaPaths.snapshotsDir.appendingPathComponent(".tmp-\(name)-\(version)-\(UUID().uuidString)")
+    do {
+      try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+
+      for relPath in copyPaths {
+        let src = sourceDir.appendingPathComponent(relPath)
+        guard FileManager.default.fileExists(atPath: src.path) else {
+          throw NSError(domain: "ModokiOta", code: 1, userInfo: [NSLocalizedDescriptionKey: "delta copy source missing: \(relPath)"])
+        }
+        let dst = tmpDir.appendingPathComponent(relPath)
+        try FileManager.default.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: src, to: dst)
+        reportFileDone(bytes: 0) // copies don't count toward bytesTotal — see comment above
+      }
+
+      // Plugin methods already run off the main thread, so a blocking DispatchGroup here
+      // (rather than nesting async completion handlers) is safe and keeps the
+      // stage-then-activate ordering simple, matching the synchronous copy loop above.
+      let group = DispatchGroup()
+      var downloadError: Error?
+      for d in downloads {
+        group.enter()
+        URLSession.shared.dataTask(with: d.url) { data, response, error in
+          defer { group.leave() }
+          if let error { downloadError = error; return }
+          guard let data, let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            downloadError = NSError(domain: "ModokiOta", code: 2, userInfo: [NSLocalizedDescriptionKey: "download failed: \(d.path)"])
+            return
+          }
+          let actualHash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+          guard actualHash == d.hash.lowercased() else {
+            downloadError = NSError(domain: "ModokiOta", code: 3, userInfo: [NSLocalizedDescriptionKey: "hash mismatch: \(d.path)"])
+            return
+          }
+          do {
+            let dst = tmpDir.appendingPathComponent(d.path)
+            try FileManager.default.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: dst)
+            reportFileDone(bytes: Int64(data.count))
+          } catch {
+            downloadError = error
+          }
+        }.resume()
+      }
+      group.wait()
+      if let downloadError { throw downloadError }
+
+      let finalDir = OtaPaths.versionDir(name: name, version: version)
+      try? FileManager.default.removeItem(at: finalDir) // a stale partial from an earlier interrupted attempt
+      try FileManager.default.moveItem(at: tmpDir, to: finalDir) // atomic on the same volume
+      call.resolve(["ok": true])
+    } catch {
+      try? FileManager.default.removeItem(at: tmpDir)
+      call.reject("stageUpdateDelta failed: \(error.localizedDescription)")
+    }
   }
 
   /// Marks `version` as the pending version for `name` in state.json. Does NOT touch
   /// `KeyValueStore`/serverBasePath immediately — Phase 1 is "apply next launch" by
-  /// design (see the plan doc); `OtaBootHook.run` is the sole authority over what gets
+  /// design (see docs/ota-updates.md); `OtaBootHook.run` is the sole authority over what gets
   /// served, and it re-derives that from state.json on every single launch regardless,
   /// so there is exactly one source of truth instead of two that could disagree.
   @objc func activate(_ call: CAPPluginCall) {
     guard let name = call.getString("name"), let version = call.getString("version") else {
       call.reject("activate requires name, version"); return
     }
+    OtaPaths.stateLock.lock()
+    defer { OtaPaths.stateLock.unlock() }
     var state = OtaCore.parseState(try? String(contentsOf: OtaPaths.stateFilePath, encoding: .utf8)) ?? OtaState()
     state.pending[name] = version
     state.bootAttempts.removeValue(forKey: name)
@@ -192,6 +379,8 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
   /// Called once JS reaches its OWN "fully booted" signal (App.tsx's `initialized`).
   @objc func confirmBoot(_ call: CAPPluginCall) {
     guard let name = call.getString("name") else { call.reject("confirmBoot requires name"); return }
+    OtaPaths.stateLock.lock()
+    defer { OtaPaths.stateLock.unlock() }
     let json = try? String(contentsOf: OtaPaths.stateFilePath, encoding: .utf8)
     let resultJSON = OtaCore.confirm(fromJSON: json, name: name)
     do {
@@ -206,5 +395,27 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
   @objc func getState(_ call: CAPPluginCall) {
     let json = (try? String(contentsOf: OtaPaths.stateFilePath, encoding: .utf8)) ?? "null"
     call.resolve(["stateJSON": json])
+  }
+
+  /// OTA Phase 4 (docs/ota-subgame-modules.md) — every bundle with content
+  /// actually on disk, `active` preferred over `pending` for the same name. See the
+  /// TS `listBundles` doc comment (definitions.ts) for why `pending` counts as
+  /// loadable here (unlike the shell, a sub-game has no boot-hook promotion path).
+  @objc func listBundles(_ call: CAPPluginCall) {
+    let json = try? String(contentsOf: OtaPaths.stateFilePath, encoding: .utf8)
+    guard let state = OtaCore.parseState(json) else { call.resolve(["bundles": []]); return }
+    var seen = Set<String>()
+    var result: [[String: Any]] = []
+    func appendIfStaged(_ name: String, _ version: String) {
+      guard !seen.contains(name) else { return }
+      let dir = OtaPaths.versionDir(name: name, version: version)
+      var isDir: ObjCBool = false
+      guard FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else { return }
+      result.append(["name": name, "version": version, "path": dir.path])
+      seen.insert(name)
+    }
+    for (name, version) in state.active { appendIfStaged(name, version) }
+    for (name, version) in state.pending { appendIfStaged(name, version) }
+    call.resolve(["bundles": result])
   }
 }

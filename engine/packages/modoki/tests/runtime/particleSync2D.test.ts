@@ -192,6 +192,36 @@ describe('syncParticles2D', () => {
     expect(state.recs.size).toBe(0);
   });
 
+  it('skips a deactivated entity (EntityAttributes.isActive → deactivatedEntities) and disposes its handle', async () => {
+    // Regression test: syncParticles2D used to query Transform+ParticleEmitter with no
+    // deactivatedEntities check, so an Activation-track (or any other isActive toggle) never
+    // hid/paused a 2D particle emitter — see particleSync2D.ts's deactivatedEntities import.
+    const { deactivatedEntities } = await import('../../src/three/systems/transformPropagationSystem');
+    const world = createWorld();
+    const { backend, calls } = makeMockBackend();
+    const { ctx, canvasOf } = makeMockCtx();
+    const e = world.spawn(Transform(), ParticleEmitter({ effect: EFFECT }));
+    canvasOf.set(e.id(), 5);
+
+    const state = createParticleSync2DState(backend);
+    syncParticles2D(world, ctx, state, 1 / 60);
+    expect(state.recs.size).toBe(1);
+    const createdId = calls.create[0].id;
+
+    deactivatedEntities.add(e.id());
+    try {
+      syncParticles2D(world, ctx, state, 1 / 60);
+      expect(calls.disposed.has(createdId)).toBe(true);
+      expect(state.recs.size).toBe(0);
+    } finally {
+      deactivatedEntities.delete(e.id());
+    }
+
+    syncParticles2D(world, ctx, state, 1 / 60);
+    expect(state.recs.size).toBe(1);
+    world.destroy(); // keep this file under koota's per-process world cap
+  });
+
   it('creates the handle paused when playOnStart is false', () => {
     const world = createWorld();
     const { backend, calls } = makeMockBackend();

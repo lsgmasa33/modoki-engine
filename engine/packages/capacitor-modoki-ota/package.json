@@ -1,7 +1,7 @@
 {
   "name": "capacitor-modoki-ota",
   "version": "1.0.0",
-  "description": "Capacitor plugin for Modoki's OTA update client (docs/plans/mobile-ota-updates-plan.md)",
+  "description": "Capacitor plugin for Modoki's OTA update client (docs/ota-updates.md)",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
   "types": "dist/esm/index.d.ts",

@@ -1,9 +1,9 @@
 /** Minimal ZIP writer for OTA bundle zips (Phase 1 of
- *  docs/plans/mobile-ota-updates-plan.md). Produces a standard ZIP (local file
+ *  docs/ota-updates.md). Produces a standard ZIP (local file
  *  headers + central directory + EOCD, per the classic APPNOTE.TXT layout) using
  *  only Node's built-in `zlib`/`crypto` — no dependency. Cross-verified against
  *  both the system `unzip` CLI and a from-scratch Swift reader (OtaZip.swift) using
- *  Apple's Compression framework — see the plan doc's Phase 1 section for the
+ *  Apple's Compression framework — see docs/ota-updates.md for the
  *  round-trip check. Entries use STORED (method 0) when deflating doesn't actually
  *  shrink the data (tiny/incompressible files), DEFLATE (method 8, raw — no zlib
  *  header, matching the ZIP spec) otherwise.

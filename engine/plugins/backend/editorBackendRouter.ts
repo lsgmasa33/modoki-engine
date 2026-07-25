@@ -23,6 +23,7 @@ import crypto from 'crypto';
 import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
+import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './gcloud';
 import { openInOS, revealInOS } from './osOpen';
 import { readMetaSidecar, writeMetaSidecar } from '../meta-sidecar';
 import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash } from '../asset-fs-ops';
@@ -1386,6 +1387,68 @@ async function describeUnresolvedAgainstLiveWorld(
   // instead of a raw code. Best-effort + macOS-only (returns [] elsewhere).
   if (urlPath === '/api/signing-teams' && method === 'GET') {
     return json({ teams: discoverSigningTeams() });
+  }
+
+  // ── GET /api/ota/keys?name=<name> (M) ── read-only: does build/ota-keys/<name>.json
+  // exist, and if so what's its public key? Pure fs read, no generation — lets the OTA
+  // Keys dialog show current state (and whether it matches project.config.json's
+  // ota.publicKey) WITHOUT a side-effecting keygen call just to check.
+  if (urlPath === '/api/ota/keys' && method === 'GET') {
+    const name = query.get('name') || 'default';
+    if (!OTA_SAFE_TOKEN.test(name)) return json({ ok: false, error: `name must match ${OTA_SAFE_TOKEN}` }, 400);
+    const keyPath = path.join(ctx.editorRoot || ctx.projectRoot, 'build', 'ota-keys', `${name}.json`);
+    if (!fs.existsSync(keyPath)) return json({ ok: true, name, exists: false, publicKey: null });
+    try {
+      const { publicKey } = JSON.parse(fs.readFileSync(keyPath, 'utf8')) as { publicKey?: string };
+      return json({ ok: true, name, exists: true, publicKey: publicKey ?? null });
+    } catch (e) {
+      return json({ ok: false, error: `could not read ${path.relative(ctx.projectRoot, keyPath)}: ${e instanceof Error ? e.message : String(e)}` }, 500);
+    }
+  }
+
+  // ── POST /api/ota/keygen?name=<name> (M, exec) ── generate the OTA signing keypair
+  // (engine/scripts/ota-keygen.mjs). Deliberately NO overwrite/force option: regenerating
+  // orphans every already-shipped binary (they have the old public key baked in), and the
+  // editor's typed-confirmation guard for that (plan doc, Phase 5a) doesn't exist yet —
+  // shipping a backend bypass ahead of its own guard would defeat the reason the guard
+  // exists. `ota-keygen.mjs` already refuses to overwrite; this just surfaces that refusal
+  // as JSON instead of a CLI exit code.
+  if (urlPath === '/api/ota/keygen' && method === 'POST') {
+    const name = query.get('name') || 'default';
+    if (!OTA_SAFE_TOKEN.test(name)) return json({ ok: false, error: `name must match ${OTA_SAFE_TOKEN}` }, 400);
+    try {
+      const out = execFileSync('node', ['engine/scripts/ota-keygen.mjs', name], { cwd: ctx.editorRoot || ctx.projectRoot, encoding: 'utf8' });
+      const publicKey = out.match(/^\s*(\S+)\s*$/m)?.[1] ?? null;
+      return json({ ok: true, name, publicKey, log: out });
+    } catch (e) {
+      // ota-keygen.mjs exits 1 (refuses to overwrite) — surface its stderr, not a stack trace.
+      const stderr = (e as { stderr?: Buffer | string })?.stderr?.toString() || (e instanceof Error ? e.message : String(e));
+      return json({ ok: false, error: stderr.trim() }, 409);
+    }
+  }
+
+  // ── GET /api/ota/status?bucket=gs://... (M, exec) ── read-only: the CURRENT
+  // release.json for this project's OTA bucket (or an explicit override). No
+  // project.config.json mutation, no gcloud write — safe to call anytime, incl. before
+  // ota.enabled is on (only needs a bucket to read from).
+  if (urlPath === '/api/ota/status' && method === 'GET') {
+    const cfg = loadProjectConfig(ctx.projectRoot);
+    const bucket = query.get('bucket') ?? deriveGcsBucketFromBaseUrl(cfg.ota.baseUrl);
+    if (!bucket || !OTA_SAFE_BUCKET.test(bucket)) {
+      return json({ ok: false, error: `Could not derive a gs:// bucket from ota.baseUrl ("${cfg.ota.baseUrl}"). Pass ?bucket=gs://... explicitly.` }, 400);
+    }
+    const user = loadProjectUserConfig(ctx.projectRoot);
+    const gcloudDir = resolveGcloudDir(user.sdk.gcloudPath);
+    if (!gcloudDir) {
+      return json({ ok: false, error: 'gcloud not found — install the Google Cloud SDK and run `gcloud auth login`, or set its path in Project Settings.' }, 500);
+    }
+    const env = { ...process.env, PATH: `${gcloudDir}:${process.env.PATH ?? ''}` };
+    try {
+      const raw = execFileSync('gcloud', ['storage', 'cat', `${bucket}/release.json`], { env, encoding: 'utf8' });
+      return json({ ok: true, bucket, release: JSON.parse(raw) });
+    } catch {
+      return json({ ok: true, bucket, release: null, note: 'No release.json published yet for this bucket.' });
+    }
   }
 
   // ── GET /api/toolchain (M) ── the Build-Support dialog's status read: every

@@ -28,7 +28,7 @@ import { particleBackend } from '../particles/particleBackend';
 import type { ParticleHandle, ParticleEffectDef } from '../particles/types';
 import { getParticleEffect } from '../loaders/particleCache';
 import { PARTICLE_LAYER } from './layers';
-import { worldTransforms } from '../../three/systems/transformPropagationSystem';
+import { worldTransforms, deactivatedEntities } from '../../three/systems/transformPropagationSystem';
 import { buildCanvas2DRoute, emitterCanvasId, type Canvas2DRoute } from './particle2DRouting';
 
 /** Put an emitter's whole object subtree on PARTICLE_LAYER so the NPR geometry
@@ -88,6 +88,7 @@ export function syncParticles(world: World, scene: THREE.Object3D, state: Partic
 
   world.query(Transform, ParticleEmitter).updateEach(([tf, pe]: [TransformData, EmitterData], entity) => {
     const id = entity.id();
+    if (deactivatedEntities.has(id)) return; // entity (or an ancestor) is inactive — disposed by the cleanup pass below
     if (emitterCanvasId(_route3d, id) !== null) return; // has a Canvas2D ancestor → 2D path owns it
     if (!pe.isVisible || !pe.effect) return; // disposed by the cleanup pass below
     const def = getParticleEffect(pe.effect);

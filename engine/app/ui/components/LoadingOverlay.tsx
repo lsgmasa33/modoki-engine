@@ -6,9 +6,13 @@ import { useEffect, useState } from 'react';
 
 interface Props {
   visible: boolean;
+  /** When set, shows a progress bar + label instead of the spinner — the OTA
+   *  mandatory-update download gate (docs/ota-updates.md, Phase 3b) is the only
+   *  caller today. `fraction: null` = indeterminate (total bytes not yet known). */
+  progress?: { fraction: number | null; label: string } | null;
 }
 
-export default function LoadingOverlay({ visible }: Props) {
+export default function LoadingOverlay({ visible, progress }: Props) {
   // Delay mount briefly so a fast preload (< 120 ms) doesn't flash an overlay.
   const [mounted, setMounted] = useState(false);
 
@@ -49,19 +53,53 @@ export default function LoadingOverlay({ visible }: Props) {
           gap: 12,
         }}
       >
-        <div
-          style={{
-            width: 28,
-            height: 28,
-            border: '3px solid rgba(230, 230, 255, 0.25)',
-            borderTopColor: '#e6e6ff',
-            borderRadius: '50%',
-            animation: 'loading-overlay-spin 0.9s linear infinite',
-          }}
-        />
-        <span>Loading…</span>
+        {progress ? (
+          <>
+            <div
+              style={{
+                width: 180,
+                height: 6,
+                borderRadius: 3,
+                background: 'rgba(230, 230, 255, 0.2)',
+                overflow: 'hidden',
+              }}
+            >
+              <div
+                style={{
+                  height: '100%',
+                  borderRadius: 3,
+                  background: '#e6e6ff',
+                  ...(progress.fraction != null
+                    ? { width: `${Math.round(Math.min(1, Math.max(0, progress.fraction)) * 100)}%`, transition: 'width 120ms ease-out' }
+                    : { width: '35%', animation: 'loading-overlay-indeterminate 1.1s ease-in-out infinite' }),
+                }}
+              />
+            </div>
+            <span>{progress.label}</span>
+          </>
+        ) : (
+          <>
+            <div
+              style={{
+                width: 28,
+                height: 28,
+                border: '3px solid rgba(230, 230, 255, 0.25)',
+                borderTopColor: '#e6e6ff',
+                borderRadius: '50%',
+                animation: 'loading-overlay-spin 0.9s linear infinite',
+              }}
+            />
+            <span>Loading…</span>
+          </>
+        )}
       </div>
-      <style>{`@keyframes loading-overlay-spin { to { transform: rotate(360deg); } }`}</style>
+      <style>{`
+        @keyframes loading-overlay-spin { to { transform: rotate(360deg); } }
+        @keyframes loading-overlay-indeterminate {
+          0% { margin-left: -35%; }
+          100% { margin-left: 100%; }
+        }
+      `}</style>
     </div>
   );
 }

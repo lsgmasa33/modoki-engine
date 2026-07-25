@@ -63,13 +63,13 @@ describe('ensureCapacitorDeps', () => {
     // Includes the engine-runtime native plugins (app/keyboard/preferences) — omitting them
     // ships a JS proxy with no native impl → "plugin is not implemented on <platform>" at launch.
     expect(Object.keys(deps).sort()).toEqual(
-      ['@capacitor/app', '@capacitor/cli', '@capacitor/core', '@capacitor/ios', '@capacitor/keyboard', '@capacitor/preferences', 'capacitor-game-debug'],
+      ['@capacitor/app', '@capacitor/cli', '@capacitor/core', '@capacitor/ios', '@capacitor/keyboard', '@capacitor/preferences', '@capacitor/splash-screen', 'capacitor-game-debug'],
     );
   });
 
   it('pins each engine-runtime plugin to the editor\'s OWN version (proxy must match the native plugin)', () => {
     fs.writeFileSync(path.join(editorRoot, 'package.json'), JSON.stringify({
-      dependencies: { '@capacitor/core': '^8.3.0', '@capacitor/app': '^8.1.0', '@capacitor/keyboard': '^8.0.3', '@capacitor/preferences': '^8.0.1' },
+      dependencies: { '@capacitor/core': '^8.3.0', '@capacitor/app': '^8.1.0', '@capacitor/keyboard': '^8.0.3', '@capacitor/preferences': '^8.0.1', '@capacitor/splash-screen': '^8.0.1' },
     }));
     writePkg();
     ensureCapacitorDeps(root, 'android', editorRoot);
@@ -77,6 +77,7 @@ describe('ensureCapacitorDeps', () => {
     expect(deps['@capacitor/app']).toBe('^8.1.0');
     expect(deps['@capacitor/keyboard']).toBe('^8.0.3');
     expect(deps['@capacitor/preferences']).toBe('^8.0.1');
+    expect(deps['@capacitor/splash-screen']).toBe('^8.0.1');
   });
 
   it('creates a minimal package.json when the project has none', () => {

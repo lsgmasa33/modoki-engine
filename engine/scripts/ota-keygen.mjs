@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /** Generates the Ed25519 keypair OTA releases are signed with (Phase 0 of
- *  docs/plans/mobile-ota-updates-plan.md).
+ *  docs/ota-updates.md).
  *
  *  Run ONCE per signing identity (e.g. once for the whole engine, or once per
  *  game if you want independent trust roots). The PRIVATE key is written under

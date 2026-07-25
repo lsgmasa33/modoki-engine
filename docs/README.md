@@ -64,6 +64,7 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 | [mcp-response-budget.md](./mcp-response-budget.md) | The MCP response-budget reference — compact JSON, summary-first defaults, boundary summarization, token-not-char accounting |
 | [connect-claude-code.md](./connect-claude-code.md) | Design + rationale for the shipped **AI → Connect Claude Code** flow — the dockable AI panel that one-click wires the user's own Claude Code to the running editor's `modoki` MCP **and** CDP (chrome-devtools) in the DMG/exe, plus the MCP tool-quality re-audit decisions (§15) |
 | [vscode-debugging.md](./vscode-debugging.md) | Setting VS Code breakpoints in the Electron editor's main (Node) and renderer (Chromium) processes |
+| [multi-ai-cli-support.md](./multi-ai-cli-support.md) | Cursor / Codex CLI / Antigravity CLI support alongside Claude Code — generated `AGENTS.md` + `.cursor/mcp.json` + `.codex/config.toml`, the sync guard, and why generation (not a symlink) |
 
 ## Native & Build
 
@@ -73,6 +74,8 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 | [editor-toolchain.md](./editor-toolchain.md) | Toolchain resolution & provisioning — `engine/toolchain/` detection (version-strict JDK), on-demand install of pinned Node/JDK/Android SDK/gltf tools, guided Xcode/CocoaPods, the `/api/toolchain` surface + Build Support dialog |
 | [bundle-new-tools.md](./bundle-new-tools.md) | Playbook — bundle a new external CLI tool into the editor for BOTH platforms: the `beforePack` stager's per-platform branches (mac relocate / win32 copy of the installed tool) + the `release-windows.yml` CI download; the bundle-vs-provision decision + step checklist |
 | [native-and-sdks.md](./native-and-sdks.md) | Capacitor native integration — standalone SPM plugin pattern, SDK plugins, AppLovin mediation, debug bridge, per-game signing, app-service registry |
+| [ota-updates.md](./ota-updates.md) | Over-the-air updates — signed content-addressed publish format, the native client + two-boot rollback watchdog, quarantine of proven-bad versions, delta transfer (incl. from the embedded bundle), the mandatory blocking gate + progress UI, the publish pipeline (editor UI + MCP tools), and the silent-failure gotchas |
+| [ota-subgame-modules.md](./ota-subgame-modules.md) | Sub-game modules — `globalThis` shared-singleton registry (not import maps), per-sub-game Vite build target, dynamic `GAMES` discovery, `ENGINE_API_VERSION` contract |
 | [playable-export.md](./playable-export.md) | The `VITE_PLAYABLE` single-file "playable ad" build — asset profile + single-chunk inliner (gzip/base64 + fflate fallback → `__PLAYABLE_ASSETS__` blob map), MRAID gate + CTA overlay, buffer-audio, the hard-won gotchas, and `npm run smoke:playable` |
 | [electron-signing-optimization.md](./plans/electron-signing-optimization.md) | Proposal to cut Electron-editor codesign time by shipping Vite's dep cache inside one asar |
 
@@ -94,6 +97,7 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 | [animation-window-review-plan.md](./plans/animation-window-review-plan.md) | Animation Window review-findings remediation tracker — correctness, perf, refactor, test gaps (nearly all done) |
 | [sling-field-editor-plan.md](./plans/sling-field-editor-plan.md) | Grid-painted arena editor for sling — paint floor, autotile the existing kit into walls/corners/colliders, regenerate a scene `Field` group |
 | [sling-slopes-ramps-plan.md](./plans/sling-slopes-ramps-plan.md) | Phase 2/7.2 plan (not started) — ramps let the puck jump off a slope lip to clear a hole or land on a platform, building on the fake-Y model + height layers |
+| [mobile-ota-updates-plan.md](./plans/mobile-ota-updates-plan.md) | Open items only — all phases shipped (see [ota-updates.md](./ota-updates.md) / [ota-subgame-modules.md](./ota-subgame-modules.md)): two open design conversations, known-but-unfixed edge cases, the private device-test loop |
 | [preview-mode-refactor.md](./plans/preview-mode-refactor.md) | Plan to unify the fragmented "in an editor preview?" signals into one `RunMode` + a serialization-transience rule so no preview/scrub mutation reaches disk |
 | [todo.md](./todo.md) | Open task checklist — editor, rendering/materials (`MaterialModifier`, custom shader lighting, HDR import settings), native/build |
 

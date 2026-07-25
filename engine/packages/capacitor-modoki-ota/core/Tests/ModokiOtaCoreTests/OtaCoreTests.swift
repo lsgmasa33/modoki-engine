@@ -21,17 +21,26 @@ final class OtaCoreTests: XCTestCase {
     let expectStateIsNull: Bool
   }
 
+  /// Both vector files are replayed by the SAME assertions: the Phase 1 golden vectors and
+  /// the Phase 3a gate/quarantine vectors. Java (OtaCoreSelfTest) replays the same two.
+  static let vectorFiles = [
+    "test-vectors/ota-golden-vectors.json",
+    "test-vectors/ota-gate-vectors-phase3.json",
+  ]
+
   func loadVectors() -> [[String: Any]] {
-    let thisFile = URL(fileURLWithPath: #filePath)
-    let vectorsPath = thisFile
+    let packageRoot = URL(fileURLWithPath: #filePath)
       .deletingLastPathComponent() // OtaCoreTests.swift -> ModokiOtaCoreTests/
       .deletingLastPathComponent() // -> Tests/
       .deletingLastPathComponent() // -> ios/
       .deletingLastPathComponent() // -> package root
-      .appendingPathComponent("test-vectors/ota-golden-vectors.json")
-    let data = try! Data(contentsOf: vectorsPath)
-    let obj = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
-    return obj["scenarios"] as! [[String: Any]]
+    var scenarios: [[String: Any]] = []
+    for file in Self.vectorFiles {
+      let data = try! Data(contentsOf: packageRoot.appendingPathComponent(file))
+      let obj = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+      scenarios += obj["scenarios"] as! [[String: Any]]
+    }
+    return scenarios
   }
 
   func stringMap(_ obj: [String: Any], _ key: String) -> [String: String] {
@@ -45,12 +54,18 @@ final class OtaCoreTests: XCTestCase {
     return out
   }
 
+  func stringListMap(_ obj: [String: Any], _ key: String) -> [String: [String]] {
+    (obj[key] as? [String: [String]]) ?? [:]
+  }
+
   func stateFromVectorJSON(_ obj: [String: Any]) -> OtaState {
     OtaState(
       active: stringMap(obj, "active"),
       pending: stringMap(obj, "pending"),
       bootAttempts: intMap(obj, "bootAttempts"),
-      confirmedBoots: intMap(obj, "confirmedBoots")
+      confirmedBoots: intMap(obj, "confirmedBoots"),
+      rejected: stringListMap(obj, "rejected"),
+      lastSeenBinaryVersion: obj["lastSeenBinaryVersion"] as? String
     )
   }
 
@@ -112,6 +127,12 @@ final class OtaCoreTests: XCTestCase {
       case "confirm":
         let state = OtaCore.parseState(stateJSONString)
         let resultState = OtaCore.confirm(state: state, name: bundle)
+        assertStateMatches(resultState, expect["state"] as? [String: Any], name)
+
+      case "resetForNewBinary":
+        let state = OtaCore.parseState(stateJSONString)
+        let currentBinaryVersion = raw["currentBinaryVersion"] as! String
+        let resultState = OtaCore.resetForNewBinary(state, currentBinaryVersion: currentBinaryVersion)
         assertStateMatches(resultState, expect["state"] as? [String: Any], name)
 
       default:

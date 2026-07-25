@@ -221,6 +221,9 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
         { label: iosUnavailable ? 'Add iOS Target… (needs macOS)' : 'Add iOS Target…', action: () => runAddNativeTarget('ios'), disabled: iosUnavailable },
         { label: 'Add Android Target…', action: () => runAddNativeTarget('android') },
         { label: '', separator: true },
+        { label: 'Publish OTA Update…', action: () => useEditorStore.getState().openOtaPublish() },
+        { label: 'OTA Keys…', action: () => useEditorStore.getState().openOtaKeys() },
+        { label: '', separator: true },
         { label: 'Build Support…', action: () => useEditorStore.getState().openBuildSupport() },
       ],
     },
@@ -413,6 +416,21 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
               title: '2D Physics',
               fields: [
                 { key: 'physics', label: '', type: 'physics-layers', help: '2D collision layers + matrix (Collider2D.physicsLayer picks one). Gravity is authored per-scene on the Physics2D trait.' },
+              ],
+            },
+          ],
+        },
+        {
+          title: 'OTA',
+          groups: [
+            {
+              title: 'OTA Updates',
+              fields: [
+                { key: 'ota.enabled', label: 'Enabled', type: 'checkbox', help: 'the shell checks for + applies OTA updates at boot. Off = no network call, no dynamic import of the OTA plugin.' },
+                { key: 'ota.baseUrl', label: 'Base URL', type: 'text', placeholder: 'https://storage.googleapis.com/<bucket>/<prefix>', help: 'what the CLIENT fetches from — no trailing slash' },
+                { key: 'ota.bundleName', label: 'Bundle name', type: 'text', placeholder: 'shell', help: "this build's own bundle — 'shell' for the main app; a sub-game id for a Phase 4 sub-game" },
+                { key: 'ota.engineApi', label: 'Engine API version', type: 'number', help: 'stamped from ENGINE_API_VERSION — do not hand-edit to "fix" a rejected update' },
+                { key: 'ota.publicKey', label: 'Public key', type: 'readonly-text', placeholder: 'empty — generate a key via Build → OTA Keys…', help: 'derived from build/ota-keys/<name>.json, never hand-typed (Build → OTA Keys…)' },
               ],
             },
           ],

@@ -28,10 +28,10 @@ import { uploadDenseRows } from './attributeUpload';
  */
 export function makeParticlePrimitiveGeometry(prim: MeshPrimitive | undefined): THREE.BufferGeometry {
   switch (prim) {
-    case 'sphere': return new THREE.SphereGeometry(0.5, 12, 8);
-    case 'cone': return new THREE.ConeGeometry(0.5, 1, 12);
+    case 'sphere': return new THREE.SphereGeometry(0.5, 24, 16);
+    case 'cone': return new THREE.ConeGeometry(0.5, 1, 24);
     case 'tetra': return new THREE.TetrahedronGeometry(0.6);
-    case 'torus': return new THREE.TorusGeometry(0.38, 0.18, 8, 16);
+    case 'torus': return new THREE.TorusGeometry(0.4, 0.09, 16, 80);
     case 'box':
     default: return new THREE.BoxGeometry(1, 1, 1);
   }

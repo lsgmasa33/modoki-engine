@@ -1,4 +1,4 @@
-/** OTA publish-format schema (docs/plans/mobile-ota-updates-plan.md, Phase 0).
+/** OTA publish-format schema (docs/ota-updates.md).
  *  Pure validation/assembly logic — no fs/crypto involved. */
 import { describe, it, expect } from 'vitest';
 import {

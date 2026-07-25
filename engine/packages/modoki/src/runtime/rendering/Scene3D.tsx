@@ -25,9 +25,11 @@ import { createParticleSyncState, syncParticles, disposeParticleSyncState } from
 import { createFlameMeshSyncState, syncFlameMeshes, disposeFlameMeshSyncState } from './flameMeshSync';
 import { PARTICLE_LAYER } from './layers';
 import { NPRPostFX } from '../traits/NPRPostFX';
+import { BloomPostFX } from '../traits/BloomPostFX';
 import { Camera as CameraTrait } from '../traits/Camera';
 import { EntityAttributes } from '../traits/EntityAttributes';
 import { NPRPostProcess } from './npr/NPRPostProcess';
+import { BloomPostProcess, type BloomConfig } from './bloom/BloomPostProcess';
 import { SuperSampleRebuildDebouncer } from './npr/ssRebuildDebounce';
 import { nprConfigFromTrait, nprConfigSignature, type NprTraitSnapshot } from './npr/nprConfigFromTrait';
 
@@ -180,6 +182,12 @@ export default function Scene3D() {
       // so toggling stays cheap.
       const isWebGPU = (renderer as { isWebGPURenderer?: boolean }).isWebGPURenderer === true;
       let nprComposer: NPRPostProcess | null = null;
+      // Bloom post-process (plain path only). Built lazily on the first frame where
+      // BloomPostFX.enabled is true AND NPR is off. `bloomCamera` is the camera baked
+      // into the composer — a projection toggle swaps `activeCamera`, forcing a rebuild
+      // (same reason as `nprCamera`). WebGPU-only (gated on isWebGPU below).
+      let bloomComposer: BloomPostProcess | null = null;
+      let bloomCamera: THREE.Camera | null = null;
       // The camera identity baked into `nprComposer`. A live projection toggle
       // (perspective <-> orthographic) swaps `activeCamera` to a different object;
       // the composer captured the old one at construction (and needs the ortho
@@ -342,7 +350,35 @@ export default function Scene3D() {
           }
           nprComposer.render();
         } else {
-          renderer.render(scene, activeCamera);
+          // Plain path. Optionally route through the bloom composer when a
+          // BloomPostFX singleton is enabled and we're on WebGPU. Mutually
+          // exclusive with NPR (handled above) for now.
+          let bloomFound = false;
+          let bloomEnabled = false;
+          const bloomCfg: BloomConfig = { strength: 0.8, radius: 0.6, threshold: 0 };
+          world.query(BloomPostFX).updateEach(([fx]: [BloomConfig & { enabled: boolean }]) => {
+            if (bloomFound) return; // singleton — first entity wins
+            bloomFound = true;
+            bloomEnabled = fx.enabled;
+            bloomCfg.strength = fx.strength;
+            bloomCfg.radius = fx.radius;
+            bloomCfg.threshold = fx.threshold;
+          });
+
+          if (bloomEnabled && isWebGPU) {
+            // Rebuild on camera-object swap (perspective <-> ortho), same as NPR.
+            const cameraChanged = bloomComposer != null && bloomCamera !== activeCamera;
+            if (!bloomComposer || cameraChanged) {
+              bloomComposer?.dispose();
+              bloomComposer = new BloomPostProcess(renderer, scene, activeCamera, bloomCfg);
+              bloomCamera = activeCamera;
+            } else {
+              bloomComposer.setConfig(bloomCfg); // live uniforms — cheap, no graph rebuild
+            }
+            bloomComposer.render();
+          } else {
+            renderer.render(scene, activeCamera);
+          }
         }
       }
       // Prewarm the already-current scene before the first render. The runtime
@@ -602,6 +638,8 @@ export default function Scene3D() {
         disposeFlameMeshSyncState(flameState, scene);
         nprComposer?.dispose();
         nprComposer = null;
+        bloomComposer?.dispose();
+        bloomComposer = null;
         ssRebuild = null;
         // Tear down skinned entries (stop mixers, dispose per-clone skeleton
         // boneTextures) — consistent with the world-swap path. Without this,

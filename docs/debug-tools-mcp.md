@@ -535,6 +535,14 @@ checkout** — nothing errors, nothing you expect changes. `modoki_identity` (or
 answers `{repoRoot, projectRoot, backendPort, pid, branch}`; the MCP also warns on every tool result
 when the backend's `repoRoot` isn't this session's. Call it first when edits seem to vanish.
 
+**`repoRoot` also doubles as "where is the engine's own source."** In dev it's the monorepo root;
+in a packaged editor it's `<resourcesPath>/app.asar.unpacked` — real, unpacked TypeScript (Vite runs
+it unbundled in prod), not a compiled bundle. A standalone end user's project has no engine source
+of its own (the scaffolder template declares no `@modoki/engine` dependency — the running editor
+serves it live), so `modoki_identity`'s `repoRoot` is the one deterministic way an agent finds the
+engine source to read when understanding *why* it behaves a certain way, not just what it's doing
+right now. Deliberately a field on `modoki_identity`, not a new tool.
+
 **Addressing entities across hot-reloads:** in `scene-mutate` / editor-action ops, target entities
 by `{guid}` or `{name}`, NEVER `{id}`. Runtime numeric ids are reassigned on every scene hot-reload
 (and a mutate itself triggers one), so a remembered `{id}` can point at a different entity after the

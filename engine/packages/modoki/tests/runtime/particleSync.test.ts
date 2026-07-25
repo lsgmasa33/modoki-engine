@@ -229,7 +229,7 @@ describe('syncParticles', () => {
     expect(calls.create).toHaveLength(0);
   });
 
-  it('disposes the handle when isActive flips to false', async () => {
+  it('disposes the handle when ParticleEmitter.isVisible flips to false', async () => {
     const { calls, effects, world, traits, sync } = await setup();
     const { Transform, ParticleEmitter } = traits;
     effects.set('fx/a.particle.json', fakeDef());
@@ -246,6 +246,42 @@ describe('syncParticles', () => {
     expect(calls.dispose).toContain(createdId);
     expect(scene.remove).toHaveBeenCalledTimes(1);
     expect(state.recs.size).toBe(0);
+  });
+
+  it('skips a deactivated entity (EntityAttributes.isActive → deactivatedEntities) and disposes its handle', async () => {
+    // Regression test: syncParticles used to query Transform+ParticleEmitter with no
+    // deactivatedEntities check at all, so an Activation-track (or any other isActive
+    // toggle) never hid/paused a particle emitter — every other renderer (scene3DSync,
+    // Scene2D, UI) already honored it. See particleSync.ts's deactivatedEntities import.
+    const { calls, effects, world, traits, sync } = await setup();
+    const { Transform, ParticleEmitter } = traits;
+    const { deactivatedEntities } = await import('../../src/three/systems/transformPropagationSystem');
+    effects.set('fx/a.particle.json', fakeDef());
+    const e = world.spawn(Transform(), ParticleEmitter({ effect: 'fx/a.particle.json' }));
+
+    const scene = makeScene();
+    const state = sync.createParticleSyncState();
+    sync.syncParticles(world, scene, state, 0.016);
+    expect(state.recs.size).toBe(1);
+    const createdId = calls.create[0].id;
+
+    deactivatedEntities.add(e.id());
+    try {
+      sync.syncParticles(world, scene, state, 0.016);
+      expect(calls.dispose).toContain(createdId);
+      expect(state.recs.size).toBe(0);
+
+      // Stays gone while still deactivated.
+      sync.syncParticles(world, scene, state, 0.016);
+      expect(state.recs.size).toBe(0);
+    } finally {
+      deactivatedEntities.delete(e.id());
+    }
+
+    // Reactivating recreates a fresh handle.
+    sync.syncParticles(world, scene, state, 0.016);
+    expect(state.recs.size).toBe(1);
+    world.destroy(); // keep this file under koota's per-process world cap
   });
 
   it('disposes the handle when the emitter entity is destroyed', async () => {

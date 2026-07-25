@@ -1,4 +1,4 @@
-/** Bundle-manifest hashing (docs/plans/mobile-ota-updates-plan.md, Phase 0). */
+/** Bundle-manifest hashing (docs/ota-updates.md). */
 import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';

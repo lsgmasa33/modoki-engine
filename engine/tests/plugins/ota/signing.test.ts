@@ -1,4 +1,4 @@
-/** Ed25519 signing for OTA releases (docs/plans/mobile-ota-updates-plan.md, Phase 0). */
+/** Ed25519 signing for OTA releases (docs/ota-updates.md). */
 import { describe, it, expect } from 'vitest';
 import { generateKeypair, signRelease, verifyRelease } from '../../../scripts/ota/signing.mjs';
 import { createRelease } from '../../../scripts/ota/schema.mjs';

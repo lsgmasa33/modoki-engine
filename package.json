@@ -1,7 +1,7 @@
 {
   "name": "modoki-engine",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "Modoki — a Claude-friendly game engine + visual editor",
   "author": "Modoki",
@@ -25,6 +25,8 @@
     "dist:dir": "npm run build:electron && electron-builder --dir",
     "dev:stop": "bash engine/scripts/stop-dev.sh",
     "clean:texture-cache": "node engine/scripts/clean-texture-cache.mjs",
+    "clean:packaged-cache": "node engine/scripts/clean-packaged-cache.mjs",
+    "sync:agent-configs": "node engine/scripts/sync-agent-configs.mjs",
     "build": "node engine/scripts/build-web.mjs",
     "typecheck": "tsc -b engine && npm --prefix engine/packages/modoki run typecheck && npm --prefix engine/tools/modoki-mcp run typecheck && npm --prefix engine/tools/game-debug-mcp run typecheck",
     "lint": "eslint --config engine/eslint.config.js .",
@@ -109,6 +111,7 @@
     "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.4.0",
     "jsdom": "^26.1.0",
+    "smol-toml": "^1.7.0",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.57.0",
     "vitest": "^4.1.2"

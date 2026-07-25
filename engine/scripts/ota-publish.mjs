@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/** Publishes an OTA bundle update (Phase 0/1 of docs/plans/mobile-ota-updates-plan.md).
+/** Publishes an OTA bundle update (docs/ota-updates.md).
  *
  *  Takes an already-built `dist/` directory (from `node engine/scripts/build-web.mjs`),
  *  hashes it into a bundle manifest, uploads the content-addressed files + manifest
@@ -39,7 +39,7 @@ import { createManifest, createRelease, validateManifest, validateRelease } from
 import { signRelease } from './ota/signing.mjs';
 import { buildZipFromDir } from './ota/zip.mjs';
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+const defaultRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const q = (s) => JSON.stringify(s);
 
 function parseArgs(argv) {
@@ -61,6 +61,16 @@ function fail(msg) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  // `--repo-root` lets a caller that already computed its own repo root (the
+  // /api/ota/publish route uses `editorRoot || projectRoot` for its OWN key-existence
+  // precheck) pass that SAME value through, instead of this script independently
+  // re-deriving one from `import.meta.url`. A review (2026-07-26) flagged the two
+  // resolutions as duplicated with nothing enforcing they agree — for a self-contained
+  // game opened standalone (no `engine/` alongside it), or any future path change on
+  // either side, they could silently desync and produce a misleading "key not found" (or
+  // a false "found") error. Defaults to the old behavior when omitted, e.g. for a human
+  // running this CLI directly from the repo root.
+  const repoRoot = args.repoRoot ? path.resolve(args.repoRoot) : defaultRepoRoot;
   const distDir = args.dist ? path.resolve(repoRoot, args.dist) : null;
   const bucket = args.bucket?.replace(/\/+$/, '');
   const name = args.name;
@@ -85,7 +95,7 @@ async function main() {
   // Phase 1's native OTA client downloads ONE zip directly (native HTTP, bypassing the
   // JS bridge entirely for the payload bytes) rather than fetching each content-addressed
   // file individually — thousands of small bridge round-trips would be prohibitively slow
-  // (see the plan doc). buildZip() output has already been cross-verified against both
+  // (see docs/ota-updates.md). buildZip() output has already been cross-verified against both
   // the system `unzip`/`zipinfo` CLI and a from-scratch Swift reader (OtaZip.swift).
   console.log('[ota-publish] Building bundle zip...');
   const zip = await buildZipFromDir(distDir, Object.keys(files));
@@ -131,33 +141,66 @@ async function main() {
     rmSync(stageDir, { recursive: true, force: true });
   }
 
-  // Merge into release.json: fetch current (if any), bump this bundle's
-  // version, re-sign, re-upload. Never touches other bundles' entries, so
-  // publishing "sling" can't accidentally roll back "shell" or vice versa.
+  // Merge into release.json: fetch current (if any), bump this bundle's version, re-sign,
+  // re-upload. Never touches other bundles' entries, so publishing "sling" can't
+  // accidentally roll back "shell" or vice versa.
+  //
+  // Optimistic concurrency (a fresh-eyes review, 2026-07-26, caught the original
+  // read-merge-write here had no guard at all): two publishes racing for DIFFERENT bundle
+  // names could both read the same pre-publish release.json, and whichever writes second
+  // would silently overwrite the first's just-published bundle entry — even though that
+  // bundle's files genuinely landed in the bucket. `--if-generation-match` makes the final
+  // write fail (not silently succeed) if the object changed since we read it; on that
+  // failure we re-fetch + re-merge + retry, so a losing writer's changes are never
+  // dropped, only delayed. `=0` is GCS's documented idiom for "the object must not exist
+  // yet" (the create-for-the-first-time case).
   const releasePath = `${bucket}/release.json`;
-  let existingRelease = null;
-  try {
-    const raw = execSync(`gcloud storage cat ${q(releasePath)}`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString('utf8');
-    existingRelease = JSON.parse(raw);
-  } catch {
-    console.log('[ota-publish] No existing release.json — creating the first one.');
+  const MAX_RELEASE_RETRIES = 5;
+  let published = false;
+  for (let attempt = 1; attempt <= MAX_RELEASE_RETRIES && !published; attempt++) {
+    let existingRelease = null;
+    let generation = '0';
+    try {
+      const rawGeneration = execSync(`gcloud storage objects describe ${q(releasePath)} --format="value(generation)"`, { stdio: ['ignore', 'pipe', 'pipe'] }).toString('utf8').trim();
+      if (!/^\d+$/.test(rawGeneration)) fail(`Unexpected generation value from gcloud: ${JSON.stringify(rawGeneration)}`);
+      generation = rawGeneration;
+      const raw = execSync(`gcloud storage cat ${q(releasePath)}`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString('utf8');
+      existingRelease = JSON.parse(raw);
+    } catch {
+      generation = '0';
+      if (attempt === 1) console.log('[ota-publish] No existing release.json — creating the first one.');
+    }
+
+    const bundles = { ...(existingRelease?.bundles ?? {}), [name]: version };
+    // minEngineApi is a compatibility floor, independent of `mandatory` (which is
+    // only about apply-timing) — it can only ratchet up, never down, across publishes.
+    const minEngineApi = Math.max(existingRelease?.minEngineApi ?? engineApi, engineApi);
+    const unsignedRelease = createRelease({ bundles, mandatory: !!args.mandatory, minEngineApi });
+    const release = signRelease(unsignedRelease, keypair);
+    const releaseErrors = validateRelease(release);
+    if (releaseErrors.length) fail(`Built an invalid release:\n  ${releaseErrors.join('\n  ')}`);
+
+    const releaseStageDir = mkdtempSync(path.join(tmpdir(), 'modoki-ota-release-'));
+    const tmpReleasePath = path.join(releaseStageDir, 'release.json');
+    writeFileSync(tmpReleasePath, JSON.stringify(release, null, 2));
+    try {
+      execSync(`gcloud storage cp ${q(tmpReleasePath)} ${q(releasePath)} --if-generation-match=${generation}`, { stdio: ['ignore', 'ignore', 'pipe'] });
+      execSync(`gcloud storage objects update ${q(releasePath)} --cache-control="no-cache, max-age=0"`, { stdio: 'inherit' });
+      published = true;
+    } catch (e) {
+      const stderr = e?.stderr?.toString() ?? '';
+      const isPreconditionFailure = /PreconditionFailed|GcsPreconditionFailedError/i.test(stderr);
+      if (isPreconditionFailure && attempt < MAX_RELEASE_RETRIES) {
+        console.log(`[ota-publish] release.json changed concurrently (attempt ${attempt}/${MAX_RELEASE_RETRIES}) — refetching and retrying...`);
+      } else if (isPreconditionFailure) {
+        fail(`release.json kept changing concurrently after ${MAX_RELEASE_RETRIES} attempts — another publish is racing this one. Try again once it finishes.`);
+      } else {
+        fail(`Failed to upload release.json: ${stderr || e.message}`);
+      }
+    } finally {
+      rmSync(releaseStageDir, { recursive: true, force: true });
+    }
   }
-
-  const bundles = { ...(existingRelease?.bundles ?? {}), [name]: version };
-  // minEngineApi is a compatibility floor, independent of `mandatory` (which is
-  // only about apply-timing) — it can only ratchet up, never down, across publishes.
-  const minEngineApi = Math.max(existingRelease?.minEngineApi ?? engineApi, engineApi);
-  const unsignedRelease = createRelease({ bundles, mandatory: !!args.mandatory, minEngineApi });
-  const release = signRelease(unsignedRelease, keypair);
-  const releaseErrors = validateRelease(release);
-  if (releaseErrors.length) fail(`Built an invalid release:\n  ${releaseErrors.join('\n  ')}`);
-
-  const releaseStageDir = mkdtempSync(path.join(tmpdir(), 'modoki-ota-release-'));
-  const tmpReleasePath = path.join(releaseStageDir, 'release.json');
-  writeFileSync(tmpReleasePath, JSON.stringify(release, null, 2));
-  execSync(`gcloud storage cp ${q(tmpReleasePath)} ${q(releasePath)}`, { stdio: 'inherit' });
-  execSync(`gcloud storage objects update ${q(releasePath)} --cache-control="no-cache, max-age=0"`, { stdio: 'inherit' });
-  rmSync(releaseStageDir, { recursive: true, force: true });
 
   console.log(`[ota-publish] Published ${name}@${version} — release.json now points ${name} → ${version}.`);
 }

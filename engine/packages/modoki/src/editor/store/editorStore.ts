@@ -122,6 +122,10 @@ interface EditorState {
   cleanupAssetsOpen: boolean;
   /** "Build Support" dialog open state (toolchain detection + install/guide). */
   buildSupportOpen: boolean;
+  /** "Publish OTA Update…" dialog open state (docs/plans/mobile-ota-updates-plan.md Phase 5a). */
+  otaPublishOpen: boolean;
+  /** "OTA Keys…" dialog open state (generate/inspect the OTA signing keypair). */
+  otaKeysOpen: boolean;
   /** Particle asset currently open in the Particle Editor panel (null = none). */
   editingParticleAsset: SelectedAsset | null;
   /** Live def for the open particle asset. The single source of truth the editor form
@@ -238,6 +242,10 @@ interface EditorState {
   closeCleanupAssets: () => void;
   openBuildSupport: () => void;
   closeBuildSupport: () => void;
+  openOtaPublish: () => void;
+  closeOtaPublish: () => void;
+  openOtaKeys: () => void;
+  closeOtaKeys: () => void;
   setGizmoMode: (mode: 'translate' | 'rotate' | 'scale') => void;
   setColliderEditMode: (on: boolean) => void;
   setShowFocusGraph: (on: boolean) => void;
@@ -411,6 +419,8 @@ export const useEditorStore = create<EditorState>((set, get) => {
   projectSettingsOpen: false,
   cleanupAssetsOpen: false,
   buildSupportOpen: false,
+  otaPublishOpen: false,
+  otaKeysOpen: false,
   editingParticleAsset: null,
   textureEditorRequest: null,
   editingParticleDef: null,
@@ -581,6 +591,10 @@ export const useEditorStore = create<EditorState>((set, get) => {
   closeCleanupAssets: () => set({ cleanupAssetsOpen: false }),
   openBuildSupport: () => set({ buildSupportOpen: true }),
   closeBuildSupport: () => set({ buildSupportOpen: false }),
+  openOtaPublish: () => set({ otaPublishOpen: true }),
+  closeOtaPublish: () => set({ otaPublishOpen: false }),
+  openOtaKeys: () => set({ otaKeysOpen: true }),
+  closeOtaKeys: () => set({ otaKeysOpen: false }),
   openParticleEditor: (asset) => set((s) => ({ editingParticleAsset: asset, editingParticleDef: null, particleEditNonce: s.particleEditNonce + 1 })),
   openPanel: (id) => set((s) => ({ panelOpenRequest: { id, nonce: (s.panelOpenRequest?.nonce ?? 0) + 1 } })),
   setCameraGizmoShown: (guid, on) => set((s) => {

@@ -1,6 +1,6 @@
-/** Minimal ZIP writer for OTA bundle zips (docs/plans/mobile-ota-updates-plan.md, Phase 1).
+/** Minimal ZIP writer for OTA bundle zips (docs/ota-updates.md).
  *  Cross-verified elsewhere against the system `unzip`/`zipinfo` CLI and a from-scratch
- *  Swift reader (OtaZip.swift) — see the plan doc. These tests cover structural
+ *  Swift reader (OtaZip.swift) — see docs/ota-updates.md. These tests cover structural
  *  correctness the way the repo's other unit tests do (no shelling out to `unzip` here,
  *  to keep the suite portable/fast); the cross-tool checks are a one-time verification,
  *  not something to run per-CI-invocation. */

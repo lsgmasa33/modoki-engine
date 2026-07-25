@@ -1,6 +1,10 @@
 /** @modoki/runtime — ECS core, traits, loaders, config. Ships in production. */
 
-export { ENGINE_VERSION, SCENE_FORMAT_VERSION } from './version';
+// Side-effect only, imported FIRST — see instanceGuard.ts. Detects two copies of this
+// runtime running side by side (OTA Phase 4's classic failure mode).
+import './instanceGuard';
+
+export { ENGINE_VERSION, SCENE_FORMAT_VERSION, ENGINE_API_VERSION } from './version';
 export { getCurrentWorld, setCurrentWorld, onWorldSwap } from './ecs/world';
 export { hostCanvases, hostCanvasUnder } from './ui/hostCanvas';
 export type { World } from 'koota';
@@ -24,7 +28,7 @@ export {
 export {
   Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, EntityAttributes, Camera, CameraFrame,
   PrefabInstance, ModelSource, Paused, Persistent, markPersistent, Transient, Time, Input,
-  UIElement, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, Rotate3D, Tint, MaterialInstance, type MaterialParamOverride, type MaterialParamSource, ParticleEmitter, FlameMesh,
+  UIElement, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, Rotate3D, Tint, MaterialInstance, type MaterialParamOverride, type MaterialParamSource, ParticleEmitter, FlameMesh,
   Animator, SpriteAnimator, defaultSpriteClip, clampAngle,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
@@ -386,11 +390,11 @@ export { addDirtyListener } from './ecs/entityUtils';
 // `@modoki/engine/runtime` instead of a repo-relative path into the app shell —
 // the latter breaks when the game is opened standalone (copied out of the repo).
 export { useGameStore, type Screen, type FontStatus, type UIBindableState } from './store/gameStore';
-// OTA update client (docs/plans/mobile-ota-updates-plan.md). A game calls
+// OTA update client (docs/ota-updates.md). A game calls
 // checkForUpdate() with its own baseUrl/publicKey; verifyReleaseSignature and the
 // schema validators are exported for tooling/tests that want them standalone.
 export {
-  checkForUpdate, verifyReleaseSignature, validateManifest, validateRelease,
+  checkForUpdate, fetchRelease, verifyReleaseSignature, validateManifest, validateRelease,
   type OtaCheckResult, type OtaNativePlugin, type OtaManifest, type OtaRelease,
-  type CheckForUpdateOptions,
+  type CheckForUpdateOptions, type FetchReleaseOptions, type FetchReleaseResult,
 } from './ota/otaClient';

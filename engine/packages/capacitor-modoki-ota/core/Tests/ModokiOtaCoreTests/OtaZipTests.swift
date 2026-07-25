@@ -3,7 +3,7 @@
 // implementation of the ZIP format) already confirmed is valid — proving OtaZip parses
 // authentic ZIP structure, not just its own writer's output in isolation.
 //
-// Regenerate the fixture with (see the plan doc's Phase 1 section for the full command):
+// Regenerate the fixture with (see docs/ota-updates.md for the full command):
 //   node --input-type=module -e "import {buildZip} from './engine/scripts/ota/zip.mjs'; ..."
 
 import XCTest
@@ -15,7 +15,7 @@ final class OtaZipTests: XCTestCase {
     // .zip in the repo) so the test is self-contained and reproducible without Node
     // present at test time — the CROSS-tool check (this same content, unzip'd by both
     // Node's own writer's neighbor `unzip` CLI, and by hand below) already happened
-    // manually and is recorded in the plan doc; this test locks the Swift reader's
+    // manually and is recorded in docs/ota-updates.md; this test locks the Swift reader's
     // behavior against a byte-for-byte reproduction of that verified fixture.
     let zipPath = "/tmp/ota-test.zip"
     guard FileManager.default.fileExists(atPath: zipPath) else {

@@ -123,6 +123,13 @@ function Field({ field, value, onChange, onPick }: {
           </div>
         </div>
       );
+    case 'readonly-text':
+      return (
+        <div>{label}
+          <input type="text" disabled style={{ ...inputStyle, color: '#888', background: '#101018', cursor: 'default' }}
+            value={String(value ?? '')} placeholder={field.placeholder} />
+        </div>
+      );
     case 'scene-list':
       return <div>{label}<SceneListEditor value={value} options={field.options ?? []} onChange={onChange} /></div>;
     case 'physics-layers':

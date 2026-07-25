@@ -21,6 +21,7 @@ import {
   type ProjectConfig,
   type ProjectUserConfig,
 } from '../../project-config';
+import { ENGINE_API_VERSION } from '../../packages/modoki/src/runtime/version';
 
 let root: string;
 
@@ -191,5 +192,13 @@ describe('validateBuildConfig', () => {
       DEFAULT_PROJECT_CONFIG,
       withUser(undefined, { javaHome: '/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home' }),
     )).toEqual([]);
+  });
+});
+
+describe('ota.engineApi / ENGINE_API_VERSION agreement', () => {
+  it('default ota.engineApi equals the runtime ENGINE_API_VERSION constant', () => {
+    // project-config.ts is deliberately import-free (browser type graph), so this pin
+    // lives here instead of a shared import — see the engineApi doc comment.
+    expect(DEFAULT_PROJECT_CONFIG.ota.engineApi).toBe(ENGINE_API_VERSION);
   });
 });

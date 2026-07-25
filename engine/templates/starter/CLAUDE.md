@@ -10,6 +10,32 @@ an `.mcp.json` for it (the AI panel shows exactly where). When the desktop edito
 project open, it exposes the tools below. **Prefer them over screenshots** — they read and
 mutate the *live* running engine, so they prove your edits actually took effect.
 
+**If you are Cursor, Codex CLI, or Antigravity CLI reading this as `AGENTS.md`:** there is no
+"Connect" flow for you yet — only Claude Code gets one wired automatically. If MCP tools
+below aren't available, either they were never configured for this project, or (Codex CLI
+specifically) this directory hasn't been trusted yet — Codex silently skips a project-scoped
+`.codex/config.toml`'s MCP servers until the human answers its trust prompt. Tell the human
+if tools seem to be missing rather than assuming they don't exist; don't guess at scene state
+from source alone (see the section below).
+
+## The engine's own source is on this machine — read it when you need to
+
+This project depends on `@modoki/engine`, but not as an installed npm package: the running
+**Modoki Editor** app serves it to your project live, from its own install. That means the
+engine's actual TypeScript source (rendering, ECS, physics, everything under
+`engine/packages/modoki/src/`) is sitting on disk, unpacked and readable, inside the editor
+app you have installed — not hidden inside a compiled bundle. **Don't guess the path** — call
+`modoki_identity`; its `repoRoot` field IS this path (the monorepo root in dev, or
+`<resourcesPath>/app.asar.unpacked` when `packaged` is true), and it's authoritative for
+*this* running editor rather than an assumed install location.
+
+**Reach for this when the MCP tools and this file's docs aren't enough** — e.g. a trait
+behaves unexpectedly and you need to see its actual system logic, not just its current
+data. Prefer the verification loop below for "what is the game doing right now"; reach into
+the engine source for "why does the engine behave this way." (There's also a public,
+Apache-2.0 mirror of this source — search GitHub for `modoki-engine` — if you'd rather work
+from a separate clone than the installed app's copy.)
+
 ## Observe the running game — don't infer it from source
 
 The files in this project (`game.ts`, `setup.ts`, the scene JSON) tell you what the game is

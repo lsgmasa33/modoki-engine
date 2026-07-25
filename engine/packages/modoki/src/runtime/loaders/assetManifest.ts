@@ -469,12 +469,21 @@ export function resolveRef(ref: string): string | undefined {
 }
 
 /** Bulk-load a manifest JSON (production build path). Entries without a guid
- *  are ignored — they live in the same file for legacy font/panel discovery. */
-export function loadManifestJson(json: AssetManifestFile): void {
+ *  are ignored — they live in the same file for legacy font/panel discovery.
+ *
+ *  `pathPrefix` (OTA Phase 4, docs/ota-subgame-modules.md §2): a dynamically
+ *  loaded sub-game's manifest fragment is scanned with root-absolute paths
+ *  (`/assets/x.png`) exactly like a normal per-game build — which would collide with
+ *  the shell's own assets and resolve against the shell's root. Prefixing each path
+ *  once here, at merge time, is enough: the manifest is a guid→path map consumed only
+ *  through `resolveRef` → `assetUrl`, never read again from the source JSON. */
+export function loadManifestJson(json: AssetManifestFile, opts?: { pathPrefix?: string }): void {
   if (!Array.isArray(json.assets)) return;
+  const prefix = opts?.pathPrefix ?? '';
   for (const entry of json.assets) {
     if (!entry.guid || !isGuid(entry.guid)) continue;
-    registerAsset(entry.guid, entry.path, entry.type as AssetType, entry.texture, {
+    const path = prefix ? prefix.replace(/\/$/, '') + entry.path : entry.path;
+    registerAsset(entry.guid, path, entry.type as AssetType, entry.texture, {
       model: entry.model,
       modelCache: entry.modelCache,
       postprocessor: entry.postprocessor,

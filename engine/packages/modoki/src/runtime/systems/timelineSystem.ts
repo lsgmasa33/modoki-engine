@@ -541,15 +541,22 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
   for (const track of p.def.tracks) {
     if (track.muted) continue;
     switch (track.type) {
-      case 'signal':
+      case 'signal': {
+        // Resolve the track's OWN target (relative name-path from the Director root) —
+        // same as every other track kind. A bare dispatch to p.entity (the Director) would
+        // silently ignore `track.target`, so a signal aimed at a descendant (e.g. a UI label)
+        // never reached it; only a track with target:"" (the root itself) was ever correct.
+        const targetId = resolveTrackTarget(index, p.rootId, track.target);
+        const targetEntity = (targetId !== null ? index.byId.get(targetId) as unknown as Entity | undefined : undefined) ?? p.entity;
         for (const m of track.markers) {
           if (crossed(p.prev, p.cur, m.t, p.loop, p.duration, p.justStarted, p.advanced)) {
-            dispatchGameAction(m.action, { target: p.entity, params: { self: p.entity, ...(m.params ?? {}) } });
+            dispatchGameAction(m.action, { target: targetEntity, params: { self: p.entity, ...(m.params ?? {}) } });
             emit('@marker', { director: entityRef(p.entity), action: m.action, t: m.t }, world);
             timelineEvents.__emitMarker(world, p.entity, m.action, m.t);
           }
         }
         break;
+      }
       case 'audio':
         for (const c of track.cues) {
           if (crossed(p.prev, p.cur, c.t, p.loop, p.duration, p.justStarted, p.advanced)) {

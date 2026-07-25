@@ -40,6 +40,7 @@ export { UIFocusable } from './UIFocusable';
 export { UIAnchor } from './UIAnchor';
 export { Canvas2D, type Canvas2DScaleMode } from './Canvas2D';
 export { NPRPostFX } from './NPRPostFX';
+export { BloomPostFX } from './BloomPostFX';
 export { Rotate3D } from './Rotate3D';
 export { Tint } from './Tint';
 export { MaterialInstance, hasPropOverride, isMaterialInstanced, type MaterialParamOverride, type MaterialParamSource } from './MaterialInstance';

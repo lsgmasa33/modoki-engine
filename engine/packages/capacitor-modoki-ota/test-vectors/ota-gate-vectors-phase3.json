@@ -1,0 +1,145 @@
+{
+  "_comment": "Quarantine (`rejected`) vectors for the OTA boot watchdog — SHIPPED and Android-device-verified 2026-07-25; see docs/ota-updates.md. Replayed by BOTH platforms (OtaCoreTests.swift and OtaCoreSelfTest.java) alongside ota-golden-vectors.json, and both must produce identical results. Kept as a separate file from the Phase 1 golden vectors only because it was authored as an adversarial-spike spec ahead of the implementation; the split has no runtime meaning.",
+  "_why": "revert() currently erases pending/bootAttempts/confirmedBoots, leaving NO memory that a version was ever tried and failed. checkForUpdate compares the release's target only against `active` and `pending` (otaClient.ts:275), so the very next launch re-stages the SAME known-bad version. This infinite re-stage loop was directly OBSERVED on-device during Phase 1's iOS revert test (plan doc, iOS revert section step 4) and misread at the time as correct 'two-phase self-heal' — the cycle only ended because a human published a fix. Today it costs ~75% of launches; behind a mandatory gate it is a permanent, unrecoverable brick.",
+  "constants": { "maxAttempts": 3, "requiredConfirms": 2, "maxRejectedPerBundle": 10 },
+  "scenarios": [
+    {
+      "name": "revert_after_max_attempts_QUARANTINES_the_bad_version",
+      "_note": "The headline fix. Attempt exhaustion is PROOF the bundle failed to boot 3 separate times, so the version is recorded in `rejected` and must never be staged again by this device.",
+      "op": "boot",
+      "bundle": "shell",
+      "state": {
+        "active": { "shell": "v12" },
+        "pending": { "shell": "v13" },
+        "bootAttempts": { "shell": 3 }
+      },
+      "folderExists": { "shell/v12": true, "shell/v13": true },
+      "expect": {
+        "target": { "kind": "version", "name": "shell", "version": "v12" },
+        "state": { "active": { "shell": "v12" }, "rejected": { "shell": ["v13"] } }
+      }
+    },
+    {
+      "name": "revert_to_embedded_also_quarantines",
+      "_note": "Same rule when there is no active version to fall back to (fresh install whose FIRST update is broken — exactly the iOS v7 case observed on-device).",
+      "op": "boot",
+      "bundle": "shell",
+      "state": { "pending": { "shell": "v7" }, "bootAttempts": { "shell": 3 } },
+      "folderExists": { "shell/v7": true },
+      "expect": {
+        "target": { "kind": "embedded" },
+        "state": { "rejected": { "shell": ["v7"] } }
+      }
+    },
+    {
+      "name": "missing_pending_folder_reverts_WITHOUT_quarantine",
+      "_note": "Deliberate asymmetry, and the subtlest decision in this spike. A missing staged folder is NOT proof the bundle is bad — the OS may have cleared it under disk pressure, or a partial stage was cleaned up. Re-staging is the CORRECT heal here, so quarantining would permanently block a perfectly good version over a transient disk event. Only attempt-exhaustion (the scenario above) is proof of badness.",
+      "op": "boot",
+      "bundle": "shell",
+      "state": {
+        "active": { "shell": "v12" },
+        "pending": { "shell": "v13" },
+        "bootAttempts": { "shell": 1 }
+      },
+      "folderExists": { "shell/v12": true, "shell/v13": false },
+      "expect": {
+        "target": { "kind": "version", "name": "shell", "version": "v12" },
+        "state": { "active": { "shell": "v12" } }
+      }
+    },
+    {
+      "name": "quarantine_accumulates_across_successive_bad_versions",
+      "op": "boot",
+      "bundle": "shell",
+      "state": {
+        "active": { "shell": "v12" },
+        "pending": { "shell": "v15" },
+        "bootAttempts": { "shell": 3 },
+        "rejected": { "shell": ["v13"] }
+      },
+      "folderExists": { "shell/v12": true, "shell/v15": true },
+      "expect": {
+        "target": { "kind": "version", "name": "shell", "version": "v12" },
+        "state": { "active": { "shell": "v12" }, "rejected": { "shell": ["v13", "v15"] } }
+      }
+    },
+    {
+      "name": "quarantine_is_per_bundle_independent",
+      "op": "boot",
+      "bundle": "shell",
+      "state": {
+        "active": { "shell": "v12", "sling": "v3" },
+        "pending": { "shell": "v13" },
+        "bootAttempts": { "shell": 3 },
+        "rejected": { "sling": ["v2"] }
+      },
+      "folderExists": { "shell/v12": true, "shell/v13": true },
+      "expect": {
+        "target": { "kind": "version", "name": "shell", "version": "v12" },
+        "state": {
+          "active": { "shell": "v12", "sling": "v3" },
+          "rejected": { "sling": ["v2"], "shell": ["v13"] }
+        }
+      }
+    },
+    {
+      "name": "quarantine_list_is_capped_oldest_dropped",
+      "_note": "Unbounded growth in a file read on every cold boot is a slow leak. FIFO cap at maxRejectedPerBundle; dropping the OLDEST is safe because re-staging an ancient version requires the CDN to still advertise it, which the publisher controls.",
+      "op": "boot",
+      "bundle": "shell",
+      "state": {
+        "active": { "shell": "v100" },
+        "pending": { "shell": "v111" },
+        "bootAttempts": { "shell": 3 },
+        "rejected": { "shell": ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10"] }
+      },
+      "folderExists": { "shell/v100": true, "shell/v111": true },
+      "expect": {
+        "target": { "kind": "version", "name": "shell", "version": "v100" },
+        "state": {
+          "active": { "shell": "v100" },
+          "rejected": { "shell": ["v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v111"] }
+        }
+      }
+    },
+    {
+      "name": "boot_NEVER_consults_rejected_for_an_already_active_version",
+      "_note": "Load-bearing separation of concerns: `rejected` is a STAGING-side gate (read by checkForUpdate + the mandatory gate in JS), never a BOOT-side one. If a version somehow reached `active`, it booted successfully twice and must keep booting — letting the quarantine list veto it here could strand a device with nothing to run.",
+      "op": "boot",
+      "bundle": "shell",
+      "state": { "active": { "shell": "v13" }, "rejected": { "shell": ["v13"] } },
+      "folderExists": { "shell/v13": true },
+      "expect": {
+        "target": { "kind": "version", "name": "shell", "version": "v13" },
+        "state": { "active": { "shell": "v13" }, "rejected": { "shell": ["v13"] } }
+      }
+    },
+    {
+      "name": "confirm_promotes_without_disturbing_rejected",
+      "op": "confirm",
+      "bundle": "shell",
+      "state": {
+        "active": { "shell": "v12" },
+        "pending": { "shell": "v14" },
+        "bootAttempts": { "shell": 2 },
+        "confirmedBoots": { "shell": 1 },
+        "rejected": { "shell": ["v13"] }
+      },
+      "expect": {
+        "state": { "active": { "shell": "v14" }, "rejected": { "shell": ["v13"] } }
+      }
+    },
+    {
+      "name": "unknown_rejected_field_in_old_state_json_parses_as_empty",
+      "_note": "Forward/backward compat: a device updating from a Phase 1/2 binary has a state.json with no `rejected` key at all. Must parse to an empty map, never nil-crash — same contract as every other field.",
+      "op": "boot",
+      "bundle": "shell",
+      "state": { "active": { "shell": "v12" } },
+      "folderExists": { "shell/v12": true },
+      "expect": {
+        "target": { "kind": "version", "name": "shell", "version": "v12" },
+        "state": { "active": { "shell": "v12" } }
+      }
+    }
+  ]
+}

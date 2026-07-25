@@ -20,6 +20,7 @@ import {
   handleExitRequest, scanAllAssets, resolveModokiAssetsDir, filterKeptAssets, gamesModuleSource,
   isUnderAssetRoot,
   isValidBuildPlatform, BUILD_PLATFORMS, playableBuildSteps,
+  otaPublishBundleNameAllowed, isGcloudObjectNotFoundError,
   type AssetRoot,
 } from '../../plugins/vite-asset-scanner';
 import { findGamesEntry } from '../../plugins/findGamesEntry';
@@ -1099,5 +1100,41 @@ describe('the Electron watcher must not re-implement classifySceneChange', () =>
     // The duplicated form was: detectType(rel,'.json') then `if (type === 'prefab') …`.
     expect(code).not.toMatch(/type === 'prefab'/);
     expect(code).not.toMatch(/rel\.includes\('\/scenes\/'\)/);
+  });
+});
+
+describe('otaPublishBundleNameAllowed (/api/ota/publish bundle-identity guard)', () => {
+  it('allows publishing the project as its own configured bundle', () => {
+    expect(otaPublishBundleNameAllowed('shell', 'shell')).toBe(true);
+  });
+
+  it('refuses a bundleName that differs from the project\'s own — the publish-corruption fix', () => {
+    // Before this guard, publishing "shell" content under "ota-subgame-test"'s name would
+    // silently ship the wrong bytes under someone else's identity. See ota-updates.md's
+    // Gotchas for the full failure scenario a code review caught.
+    expect(otaPublishBundleNameAllowed('ota-subgame-test', 'shell')).toBe(false);
+  });
+
+  it('is case-sensitive (no accidental leniency)', () => {
+    expect(otaPublishBundleNameAllowed('Shell', 'shell')).toBe(false);
+  });
+});
+
+describe('isGcloudObjectNotFoundError (version-collision preflight)', () => {
+  it('recognizes the "not found: 404" form (gcloud storage cat on a missing object)', () => {
+    expect(isGcloudObjectNotFoundError('ERROR: (gcloud.storage.cat) gs://bucket/x not found: 404.')).toBe(true);
+  });
+
+  it('recognizes the "matched no objects or files" form', () => {
+    expect(isGcloudObjectNotFoundError('ERROR: (gcloud.storage.cat) The following URLs matched no objects or files:\ngs://bucket/x')).toBe(true);
+  });
+
+  it('does NOT treat an auth/network error as "not found" — the ambiguity fix', () => {
+    // Before this fix, ANY gcloud failure (including these) was silently treated as "no
+    // collision, proceed" — letting a publish past the guard meant to catch a version a
+    // device already rejected. See ota-updates.md's Gotchas.
+    expect(isGcloudObjectNotFoundError('ERROR: You do not currently have an active account selected.')).toBe(false);
+    expect(isGcloudObjectNotFoundError('ERROR: (gcloud.storage.cat) HTTPError 403: Permission denied')).toBe(false);
+    expect(isGcloudObjectNotFoundError('')).toBe(false);
   });
 });

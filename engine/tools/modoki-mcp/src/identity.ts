@@ -21,6 +21,11 @@ export interface BackendIdentity {
   /** C6: how our MODOKI_TOKEN related to the editor that answered. Absent on a pre-C6
    *  backend. 'mismatch' ⇒ every non-identity call is being refused with a 403. */
   tokenCheck?: 'ok' | 'absent' | 'mismatch';
+  vitePort?: number | null;
+  cdpEnabled?: boolean;
+  cdpPort?: number | null;
+  cdpReachable?: boolean;
+  cdpOurs?: boolean;
 }
 
 /** Strip a trailing separator so `/a/b` and `/a/b/` compare equal. */

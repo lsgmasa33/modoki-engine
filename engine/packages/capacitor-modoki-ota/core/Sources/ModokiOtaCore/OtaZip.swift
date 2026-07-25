@@ -1,10 +1,10 @@
-// Minimal ZIP reader for OTA bundle zips (docs/plans/mobile-ota-updates-plan.md, Phase 1).
+// Minimal ZIP reader for OTA bundle zips (docs/ota-updates.md).
 //
 // Foundation + Compression only (no Capacitor/UIKit) — same reasoning as OtaCore.swift:
 // this builds and tests on plain macOS via `swift test`, no device/Xcode project needed.
 // Verified against BOTH the matching Node writer (engine/scripts/ota/zip.mjs) and
 // independently against the system `unzip`/`zipinfo` CLI's own reading of that same file
-// (see the plan doc) — so this isn't just internally self-consistent, it's been checked
+// (see docs/ota-updates.md) — so this isn't just internally self-consistent, it's been checked
 // against a third, independent implementation of the ZIP format.
 //
 // Deliberately narrow: reads the central directory + STORED (method 0) and raw-DEFLATE

@@ -1127,7 +1127,12 @@ server.tool(
     'when editor calls "succeed" but nothing you expect changes — with two clones of the ' +
     'repo on one machine it is easy to be driving the sibling clone\'s editor, which fails ' +
     'silently. A mismatch against this session\'s working directory is also warned about ' +
-    'automatically on every tool result.',
+    'automatically on every tool result. `repoRoot` also doubles as the path to the ' +
+    'ENGINE SOURCE this editor is running: the monorepo root in dev, or ' +
+    '`<resourcesPath>/app.asar.unpacked` (unpacked, readable TypeScript — not a compiled ' +
+    'bundle) when `packaged` is true. Read files under `${repoRoot}/engine/packages/modoki/src` ' +
+    'when you need to understand WHY the engine behaves a certain way, not just what it\'s ' +
+    'doing right now.',
   {},
   () => getJson('/api/identity'),
 );
@@ -1212,6 +1217,53 @@ server.tool(
     'Target…". Consumes the stream to completion.',
   { platform: z.enum(['ios', 'android']) },
   async ({ platform }) => consumeBuildStream(`/api/add-native-target?platform=${platform}`, 15 * 60_000),
+);
+
+// ── OTA publish (SSE consumed to completion) + status/keygen (JSON) ──
+// No editor menu entry exists yet for any of these (docs/plans/mobile-ota-updates-plan.md,
+// Phase 5a — the UI half is deliberately deferred); this tool surface is the ONLY way to
+// publish an OTA update short of hand-invoking the CLIs, so an agent is a first-class
+// consumer here, not an afterthought.
+server.tool(
+  'modoki_ota_publish',
+  'Publish an OTA update for the open project (docs/ota-updates.md): builds FRESH from the ' +
+    "current project.config.json (never a stale dist/), refuses a version string that's " +
+    "already published (suggests the next free vN), verifies/sets the bucket's CORS, then " +
+    'runs ota-publish.mjs. Requires ota.enabled + a signing key already generated ' +
+    '(modoki_ota_keygen). Consumes the stream to completion — can take a minute+.',
+  {
+    version: z.string().describe('New version string, e.g. "v18". Must not already be published for this bundleName.'),
+    mandatory: z.boolean().optional().describe('Mandatory update: blocks with a restart-to-continue gate instead of applying next launch.'),
+    bundleName: z.string().optional().describe('Must equal (or be omitted, defaulting to) this project\'s own project.config.json ota.bundleName — the server refuses any other value. This route always builds the CURRENTLY OPEN project as a normal web build and publishes it as itself; it does NOT build/publish a Phase 4 sub-game module bundle (that needs build-subgame.mjs + a manual publish, not this tool). To publish a sub-game, open ITS OWN project and call this tool there.'),
+    key: z.string().optional().describe('Signing key name under build/ota-keys/<key>.json (default "default").'),
+    bucket: z.string().optional().describe('gs://bucket[/prefix] override — only needed when ota.baseUrl is a custom CDN domain that cannot be reverse-derived to its gs:// form.'),
+  },
+  async ({ version, mandatory, bundleName, key, bucket }) => {
+    const qs = new URLSearchParams({ version });
+    if (mandatory) qs.set('mandatory', '1');
+    if (bundleName) qs.set('bundleName', bundleName);
+    if (key) qs.set('key', key);
+    if (bucket) qs.set('bucket', bucket);
+    return consumeBuildStream(`/api/ota/publish?${qs}`, 5 * 60_000);
+  },
+);
+server.tool(
+  'modoki_ota_status',
+  "Read-only: the current release.json for the open project's OTA bucket (which version is " +
+    'live per bundle, mandatory flag, minEngineApi). Returns release:null if nothing has been ' +
+    'published yet.',
+  { bucket: z.string().optional().describe('gs://bucket[/prefix] override — see modoki_ota_publish.') },
+  async ({ bucket }) => getJson(`/api/ota/status${bucket ? `?bucket=${encodeURIComponent(bucket)}` : ''}`, 15_000),
+);
+server.tool(
+  'modoki_ota_keygen',
+  'Generate the Ed25519 OTA signing keypair (build/ota-keys/<name>.json) needed before the ' +
+    'first modoki_ota_publish. REFUSES to overwrite an existing key — regenerating orphans ' +
+    'every already-shipped binary (they have the old public key baked in). There is ' +
+    'deliberately no force/overwrite option on this tool; if you need to rotate a key, that ' +
+    "is a decision for the project owner, not something to script around this refusal.",
+  { name: z.string().optional().describe('Key identity name (default "default"). The public key belongs in project.config.json ota.publicKey.') },
+  async ({ name }) => postJson(`/api/ota/keygen${name ? `?name=${encodeURIComponent(name)}` : ''}`, undefined, 15_000),
 );
 
 // ════════════════════════════════════════════════════════════════════════════

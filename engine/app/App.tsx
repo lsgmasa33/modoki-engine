@@ -13,6 +13,10 @@ import type { GameDefinition } from '@modoki/engine/runtime';
 import { setActiveResetPhase } from './ui/components/ErrorBoundary';
 import { audioDispose, audioResume } from '@modoki/engine/runtime';
 import { useKeyboardShift } from './hooks/useKeyboardShift';
+import { checkAppOtaUpdate, subscribeOtaGate, type OtaGateState } from './ota';
+import OtaRestartGate from './ui/components/OtaRestartGate';
+import { loadStagedSubgames } from './subgameLoader';
+import { findGame as findGameInRegistry } from './gameRegistry';
 import './App.css';
 
 // NOTE: the app shell no longer reaches into a specific game (it used to eagerly
@@ -74,9 +78,10 @@ function useHashRoute() {
   return hash;
 }
 
-/** Resolve a game definition by ID (one project = one game). */
+/** Resolve a game definition by ID — the project's baked game(s) plus any OTA Phase 4
+ *  sub-game bundles loaded so far this session (gameRegistry.ts). */
 function findGame(gameId: string): GameDefinition | undefined {
-  return GAMES.find(g => g.id === gameId);
+  return findGameInRegistry(gameId);
 }
 
 /** Keeps Scene3D/Game/UIRenderer mounted across game changes. On gameId change:
@@ -120,7 +125,10 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
   const [transitioning, setTransitioning] = useState(false);
   const [GameUI, setGameUI] = useState<React.ComponentType | null>(null);
   const [disable3D, setDisable3D] = useState(false);
+  const [otaGate, setOtaGate] = useState<OtaGateState | null>(null);
   const activeGameIdRef = useRef<string | null>(null);
+
+  useEffect(() => subscribeOtaGate(setOtaGate), []);
 
   useEffect(() => {
     const def = findGame(gameId);
@@ -230,7 +238,28 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
         if (requestedScene && !overridePath) {
           console.warn(`[GameShell] ?scene="${requestedScene}" did not match a shipped scene; using default.`);
         }
-        const bootScenePath = overridePath ?? config.scenePath;
+        // OTA update check (docs/ota-updates.md, Phase 3a/3b) — deliberately BEFORE
+        // scene load: a game's onSceneReady only fires after the scene has already
+        // rendered, too late for the blocking gate below to have anywhere to block
+        // from. A routine (non-mandatory) update, an error, or nothing to do all
+        // resolve `true` and boot proceeds normally in the background.
+        // `false` means a MANDATORY update just finished staging — stop here and
+        // defer to the OtaRestartGate UI (subscribed via `otaGate` above) for the
+        // rest of this app launch; never load the scene this session (no
+        // mid-session hot-swap — see the plan's Phase 3 decision).
+        const otaShouldProceed = await checkAppOtaUpdate();
+        if (cancelled) return;
+        if (!otaShouldProceed) return;
+
+        // OTA Phase 4 — a sub-game's config.scenePath is a root-relative build-output
+        // literal baked against ITS OWN origin (config.assetBaseUrl, set by
+        // subgameLoader.ts), not the shell's — prefix it here or the fetch 404s
+        // against the shell's webroot instead of the staged bundle. Unset (baked
+        // shell game) is a no-op. See config.ts's assetBaseUrl doc.
+        const defaultScenePath = config.assetBaseUrl && config.scenePath?.startsWith('/')
+          ? config.assetBaseUrl + config.scenePath
+          : config.scenePath;
+        const bootScenePath = overridePath ?? defaultScenePath;
         if (bootScenePath) {
           await sceneManager.loadScene(bootScenePath, { gameId });
         }
@@ -253,7 +282,7 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
         await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
         if (cancelled) return;
 
-        // OTA boot-watchdog confirm (docs/plans/mobile-ota-updates-plan.md, Phase 1):
+        // OTA boot-watchdog confirm (docs/ota-updates.md):
         // THIS is the app's own "fully booted" signal (rendered a real frame of the
         // ACTUAL game, not just index.html loading) — the exact proof-of-boot the native
         // watchdog's two-boot-confirm design assumes. Best-effort and native-only: a
@@ -264,6 +293,18 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
           import('capacitor-modoki-ota')
             .then((m) => m.ModokiOta.confirmBoot({ name: 'shell' }))
             .catch((e) => console.warn('[GameShell] OTA confirmBoot failed (non-fatal):', e));
+        }
+
+        // Dismiss the native splash on this SAME "fully booted" signal (Phase 3b) —
+        // previously nothing called this, so the splash dismissed on Capacitor's own
+        // fixed ~3s timer regardless of actual load time (a plugin with no native impl
+        // yet, or launchAutoHide left at its Capacitor default of true, makes this a
+        // harmless no-op — see capacitor.config.json's plugins.SplashScreen). Only on
+        // a FIRST load: a game-to-game switch mid-session has no splash left to hide.
+        if (Capacitor.isNativePlatform() && isFirstLoad) {
+          import('@capacitor/splash-screen')
+            .then((m) => m.SplashScreen.hide())
+            .catch((e) => console.warn('[GameShell] SplashScreen.hide failed (non-fatal):', e));
         }
 
         activeGameIdRef.current = gameId;
@@ -319,7 +360,14 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
           ) : (
             <DefaultGameUILayer />
           )}
-          <LoadingOverlay visible={!initialized || transitioning} />
+          <LoadingOverlay
+            visible={!initialized || transitioning}
+            progress={otaGate?.phase === 'downloading' ? {
+              fraction: otaGate.progress && otaGate.progress.bytesTotal > 0 ? otaGate.progress.bytesDone / otaGate.progress.bytesTotal : null,
+              label: 'Downloading update…',
+            } : null}
+          />
+          {otaGate?.phase === 'ready-to-restart' && <OtaRestartGate version={otaGate.version} />}
           {DebugMenu && <Suspense fallback={null}><DebugMenu /></Suspense>}
         </div>
       </ErrorBoundary>
@@ -337,6 +385,18 @@ function App() {
   // accumulation on HMR and error-boundary recovery).
   useEffect(() => {
     return () => { appServices().ads?.cleanup(); audioDispose(); };
+  }, []);
+
+  // OTA Phase 4 (docs/ota-subgame-modules.md) — discover + load any sub-game
+  // bundles already staged on this device, additively in the BACKGROUND. Deliberately
+  // NOT part of GameShell's per-gameId boot effect (which resolves `findGame(gameId)`
+  // synchronously at the top of its work, before any await) — this runs once, here, so
+  // the existing boot path for every baked game stays behaviorally unchanged regardless
+  // of whether/when this settles. A sub-game becomes selectable via `findGame` only once
+  // this finishes; a future in-session game-switch is the intended consumer, not the
+  // FIRST gameId this app launch resolves (that's always a baked game today).
+  useEffect(() => {
+    void loadStagedSubgames();
   }, []);
 
   // Make pending PlayerPrefs writes durable when the app is backgrounded/hidden —

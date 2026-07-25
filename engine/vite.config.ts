@@ -8,6 +8,7 @@ import { assetScannerPlugin } from './plugins/vite-asset-scanner'
 import { loadProjectConfig } from './plugins/load-project-config'
 import { resolveModules } from './plugins/detect-modules'
 import { inlinePlayablePlugin } from './plugins/inlinePlayable'
+import { subgameBuildPlugin, SUBGAME_ENTRY_VIRTUAL_ID, subgameOutDir } from './plugins/subgameBuild'
 
 // C3: engine/ is the vite root (this config + index.html + app/ live here). The
 // npm root + node_modules stay at the repo root (Capacitor needs them there), so
@@ -157,6 +158,13 @@ export default defineConfig(({ command }) => {
   }
   const playableBuildCfg = loadProjectConfig(buildProjectRoot).build
   const playableMaxBytes = playableBuildCfg.playableMaxBytes
+
+  // OTA Phase 4 — sub-game module target (engine/scripts/build-subgame.mjs sets this,
+  // never a normal `vite build`). Builds buildProjectRoot's game.ts as one externalized
+  // IIFE (games/<id>/subgame-dist/subgame.js) instead of the shell app. See
+  // plugins/subgameBuild.ts + docs/ota-subgame-modules.md §2.
+  const isSubgame = command === 'build' && process.env.MODOKI_SUBGAME === '1'
+  const subgameEngineApi = loadProjectConfig(buildProjectRoot).ota.engineApi
   return {
   root: engineDir,
   // Vite's dep-optimize cache. Default (under the Vite root) is fine for dev, but a
@@ -188,7 +196,14 @@ export default defineConfig(({ command }) => {
     __MODOKI_PLAYABLE__: JSON.stringify(isPlayable),
     __MODOKI_PLAYABLE_CLICK_URL__: JSON.stringify(isPlayable ? playableBuildCfg.playableClickUrl : ''),
   },
-  plugins: [react(), faviconPlugin(), assetScannerPlugin(), ...(externalProject ? [hostSharedDeps()] : []), ...(isPlayable ? [inlinePlayablePlugin(playableMaxBytes)] : [])],
+  plugins: [
+    react(),
+    faviconPlugin(),
+    assetScannerPlugin(),
+    ...(externalProject ? [hostSharedDeps()] : []),
+    ...(isPlayable ? [inlinePlayablePlugin(playableMaxBytes)] : []),
+    ...(isSubgame ? [subgameBuildPlugin({ projectRoot: buildProjectRoot, engineApi: subgameEngineApi })] : []),
+  ],
   publicDir: false, // No public/ — assets served via convention-based assets/ folders
   build: {
     // Emit to the open project's dist/ (games/<id>/dist for a flat project; repo
@@ -196,7 +211,7 @@ export default defineConfig(({ command }) => {
     // output dir, and Capacitor webDir + /api/build resolve the same path. A
     // playable build diverts to a SEPARATE `ads/` dir (see the isPlayable note above)
     // so it never clobbers the web/native `dist/`.
-    outDir: isPlayable ? playableOutDir : path.join(buildProjectRoot, 'dist'),
+    outDir: isSubgame ? subgameOutDir(buildProjectRoot) : (isPlayable ? playableOutDir : path.join(buildProjectRoot, 'dist')),
     emptyOutDir: true,
     // Don't inline assets as base64 data URLs — scene files use path-based
     // callbacks that break when Vite inlines small JSON as data: URLs.
@@ -207,6 +222,27 @@ export default defineConfig(({ command }) => {
     // entry chunk) — NOT `codeSplitting`, which Rollup silently ignores, leaving the
     // lazy renderer chunk split out so the inliner's stray-JS guard aborts the build.
     ...(isPlayable ? { rollupOptions: { output: { inlineDynamicImports: true } } } : {}),
+    // Sub-game: build the virtual entry (subgameBuildPlugin re-exports the project's
+    // game.ts) as one IIFE instead of the default index.html/ESM app build. externals
+    // are resolved by that plugin's `resolveId` hook; format/globals MUST be set HERE,
+    // in config, not via a plugin's `outputOptions` hook — measured: a plugin-returned
+    // outputOptions object was silently not applied (format stayed 'es'), so this
+    // config-level `rollupOptions` is the only place confirmed to take effect.
+    // NOTE: this Vite ships Rolldown as its bundler, which does not expose IIFE named
+    // exports the way classic Rollup does — measured: an `export const` with no other
+    // reference was silently dropped (empty bundle) regardless of `treeshake`/`minify`
+    // settings. subgameBuildPlugin's entry source works around this by having the
+    // module itself assign `globalThis.__MODOKI_SUBGAME__` as a side effect, so
+    // `output.name` (Rollup's own iife-export-naming option) is unused here.
+    ...(isSubgame ? { rollupOptions: {
+      input: SUBGAME_ENTRY_VIRTUAL_ID,
+      output: {
+        format: 'iife',
+        inlineDynamicImports: true,
+        entryFileNames: 'subgame.js',
+        globals: (id: string) => `__MODOKI_SHARED__.modules[${JSON.stringify(id)}]`,
+      },
+    } } : {}),
   },
   server: {
     // The app (under engine/) imports the open project's games via

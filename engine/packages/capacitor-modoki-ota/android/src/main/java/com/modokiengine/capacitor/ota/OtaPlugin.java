@@ -2,6 +2,10 @@ package com.modokiengine.capacitor.ota;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
+import android.util.Log;
+import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
@@ -16,8 +20,10 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.zip.ZipEntry;
@@ -26,11 +32,11 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 /**
- * OTA update Capacitor plugin (docs/plans/mobile-ota-updates-plan.md, Phase 1).
+ * OTA update Capacitor plugin (docs/ota-updates.md).
  *
- * DEVICE-UNVERIFIED — written against Capacitor 8's actual Bridge.java source (read
- * directly, not guessed) but never built/run on a device or emulator. Verify on a real
- * Android device per the plan doc's Phase 1 gate before shipping.
+ * DEVICE-VERIFIED on a real Samsung (2026-07-24/25): stage → promote → revert →
+ * fix-forward, delta staging from both bases, and the `rejected` quarantine path. Written
+ * against Capacitor 8's actual Bridge.java source, read directly rather than guessed.
  *
  * Integrates with Capacitor's OWN existing live-update mechanism (SharedPreferences file
  * "CapWebViewSettings", key "serverBasePath", read in Bridge.loadWebView() — see
@@ -51,21 +57,40 @@ public class OtaPlugin extends Plugin {
   private static final String PREFS_NAME = "CapWebViewSettings"; // Capacitor's own prefs file
   private static final String PREFS_KEY_SERVER_PATH = "serverBasePath"; // Capacitor's own key
 
+  /** Guards every state.json read-MODIFY-write sequence (activate/confirmBoot/
+   *  runBootHook). Each individual write is already atomic (tmp file + rename in
+   *  writeState below), but that alone doesn't stop a LOST UPDATE: two concurrent
+   *  callers can both read the same old state, then both write their own modified
+   *  copy — the second write silently clobbers the first's change. OTA Phase 4 made
+   *  this a real, not just theoretical, bug: the shell's own confirmBoot and a
+   *  sub-game's confirmBoot can now fire close together in the same boot, and one's
+   *  confirmedBoots increment was observed lost on a real device (see
+   *  docs/plans/mobile-ota-updates-plan.md). A single static monitor serializes every
+   *  mutation within this process — the only writer of this file — which is all that's
+   *  needed (no cross-process access to guard against). */
+  private static final Object STATE_LOCK = new Object();
+
   @PluginMethod
   public void stageUpdate(PluginCall call) {
     String name = call.getString("name");
     String version = call.getString("version");
     String zipUrl = call.getString("zipUrl");
     String expectedHash = call.getString("expectedZipHash");
+    Integer expectedSize = call.getInt("expectedZipSize"); // may be null on an older caller
     if (name == null || version == null || zipUrl == null || expectedHash == null) {
       call.reject("stageUpdate requires name, version, zipUrl, expectedZipHash");
       return;
     }
+    final long bytesTotal = expectedSize != null ? expectedSize : 0;
 
     new Thread(() -> {
       File tmpDir = null;
       try {
-        byte[] zipBytes = download(zipUrl);
+        long[] bytesDone = {0};
+        byte[] zipBytes = download(zipUrl, n -> {
+          bytesDone[0] += n;
+          emitProgress(name, version, bytesDone[0], bytesTotal, 0, 1);
+        });
         String actualHash = sha256Hex(zipBytes);
         if (!actualHash.equalsIgnoreCase(expectedHash)) {
           call.reject("hash mismatch: expected " + expectedHash + ", got " + actualHash);
@@ -80,6 +105,7 @@ public class OtaPlugin extends Plugin {
         if (!tmpDir.renameTo(finalDir)) { // atomic on the same volume (both under versionsDir)
           throw new IOException("rename to final version dir failed");
         }
+        emitProgress(name, version, zipBytes.length, Math.max(bytesTotal, zipBytes.length), 1, 1);
 
         JSObject ret = new JSObject();
         ret.put("ok", true);
@@ -87,6 +113,121 @@ public class OtaPlugin extends Plugin {
       } catch (Exception e) {
         if (tmpDir != null) deleteRecursively(tmpDir);
         call.reject("stageUpdate failed: " + e.getMessage(), e);
+      }
+    }).start();
+  }
+
+  /**
+   * Phase 2 delta staging (docs/ota-updates.md) — builds the `version`
+   * folder WITHOUT downloading a whole-bundle zip: copies `copy` (unchanged relative
+   * paths, byte-for-byte) from `baseVersion`'s already-on-disk folder — OR, when
+   * `baseVersion` is the sentinel "embedded", from the app's OWN bundled APK assets.
+   * Embedded content is NOT an ordinary filesystem File (unlike an OTA snapshot folder)
+   * — it ships packed inside the APK and is only reachable via AssetManager streaming,
+   * at the fixed prefix "public/" (Capacitor's own webDir convention, matching
+   * Bridge.java's default asset path — see this class's header comment for the OTA
+   * snapshot equivalent). Downloads only `download` (new/changed files), each
+   * independently SHA-256-verified against its own hash before being written. Same
+   * atomicity contract as stageUpdate: builds into a ".tmp" dir, only renamed into place
+   * once every copy AND download has succeeded and verified.
+   */
+  @PluginMethod
+  public void stageUpdateDelta(PluginCall call) {
+    String name = call.getString("name");
+    String version = call.getString("version");
+    String baseVersion = call.getString("baseVersion");
+    JSArray copyArray = call.getArray("copy");
+    JSArray downloadArray = call.getArray("download");
+    if (name == null || version == null || baseVersion == null || copyArray == null) {
+      call.reject("stageUpdateDelta requires name, version, baseVersion, copy");
+      return;
+    }
+
+    new Thread(() -> {
+      File tmpDir = null;
+      try {
+        List<String> copyPaths = copyArray.toList();
+        final int filesTotal = copyPaths.size() + (downloadArray != null ? downloadArray.length() : 0);
+        int[] filesDone = {0};
+        long bytesTotalSum = 0;
+        if (downloadArray != null) {
+          for (int i = 0; i < downloadArray.length(); i++) bytesTotalSum += downloadArray.getJSONObject(i).optLong("size", 0);
+        }
+        final long bytesTotal = bytesTotalSum; // effectively-final copy for the lambdas below
+        long[] bytesDone = {0};
+        Log.d(
+          "ModokiOta",
+          "stageUpdateDelta " + name + "@" + version + " from " + baseVersion +
+          ": copy=" + copyPaths.size() + " download=" + (downloadArray != null ? downloadArray.length() : 0)
+        );
+        boolean fromEmbedded = "embedded".equals(baseVersion);
+        File baseDir = fromEmbedded ? null : versionDir(getContext(), name, baseVersion);
+        if (!fromEmbedded && !baseDir.isDirectory()) {
+          throw new IOException("stageUpdateDelta: base version folder not found: " + baseDir);
+        }
+
+        tmpDir = new File(versionsDir(getContext()), ".tmp-" + name + "-" + version + "-" + UUID.randomUUID());
+        tmpDir.mkdirs();
+
+        // Copies are already on disk (no network), so they only move filesDone — bytesTotal
+        // above deliberately counts ONLY the download[] entries (the ones with a known
+        // size), matching the plan's "byte-granularity needs the download loop" scope.
+        for (String relPath : copyPaths) {
+          File dst = new File(tmpDir, relPath);
+          dst.getParentFile().mkdirs();
+          if (fromEmbedded) {
+            try (
+              InputStream in = getContext().getAssets().open("public/" + relPath);
+              OutputStream out = new FileOutputStream(dst)
+            ) {
+              byte[] buf = new byte[64 * 1024];
+              int n;
+              while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+            }
+          } else {
+            File src = new File(baseDir, relPath);
+            if (!src.isFile()) throw new IOException("delta copy source missing: " + relPath);
+            Files.copy(src.toPath(), dst.toPath(), StandardCopyOption.REPLACE_EXISTING);
+          }
+          filesDone[0]++;
+          emitProgress(name, version, bytesDone[0], bytesTotal, filesDone[0], filesTotal);
+        }
+
+        if (downloadArray != null) {
+          for (int i = 0; i < downloadArray.length(); i++) {
+            JSONObject entry = downloadArray.getJSONObject(i);
+            String path = entry.getString("path");
+            String url = entry.getString("url");
+            String expectedHash = entry.getString("hash");
+            final long baseDone = bytesDone[0];
+            byte[] bytes = download(url, n -> emitProgress(name, version, baseDone + n, bytesTotal, filesDone[0], filesTotal));
+            String actualHash = sha256Hex(bytes);
+            if (!actualHash.equalsIgnoreCase(expectedHash)) {
+              throw new IOException("hash mismatch: " + path + " expected " + expectedHash + ", got " + actualHash);
+            }
+            File dst = new File(tmpDir, path);
+            dst.getParentFile().mkdirs();
+            try (FileOutputStream out = new FileOutputStream(dst)) {
+              out.write(bytes);
+            }
+            bytesDone[0] += bytes.length;
+            filesDone[0]++;
+            emitProgress(name, version, bytesDone[0], bytesTotal, filesDone[0], filesTotal);
+          }
+        }
+
+        File finalDir = versionDir(getContext(), name, version);
+        deleteRecursively(finalDir); // a stale partial from an earlier interrupted attempt
+        if (!tmpDir.renameTo(finalDir)) { // atomic on the same volume (both under versionsDir)
+          throw new IOException("rename to final version dir failed");
+        }
+
+        JSObject ret = new JSObject();
+        ret.put("ok", true);
+        call.resolve(ret);
+      } catch (Exception e) {
+        if (tmpDir != null) deleteRecursively(tmpDir);
+        call.reject("stageUpdateDelta failed: " + e.getMessage(), e);
       }
     }).start();
   }
@@ -100,12 +241,14 @@ public class OtaPlugin extends Plugin {
       return;
     }
     try {
-      OtaCore.State state = readState(getContext());
-      if (state == null) state = new OtaCore.State();
-      state.pending.put(name, version);
-      state.bootAttempts.remove(name);
-      state.confirmedBoots.remove(name);
-      writeState(getContext(), state);
+      synchronized (STATE_LOCK) {
+        OtaCore.State state = readState(getContext());
+        if (state == null) state = new OtaCore.State();
+        state.pending.put(name, version);
+        state.bootAttempts.remove(name);
+        state.confirmedBoots.remove(name);
+        writeState(getContext(), state);
+      }
       JSObject ret = new JSObject();
       ret.put("ok", true);
       call.resolve(ret);
@@ -122,8 +265,10 @@ public class OtaPlugin extends Plugin {
       return;
     }
     try {
-      OtaCore.State state = OtaCore.confirm(readState(getContext()), name);
-      writeState(getContext(), state != null ? state : new OtaCore.State());
+      synchronized (STATE_LOCK) {
+        OtaCore.State state = OtaCore.confirm(readState(getContext()), name);
+        writeState(getContext(), state != null ? state : new OtaCore.State());
+      }
       JSObject ret = new JSObject();
       ret.put("ok", true);
       call.resolve(ret);
@@ -143,18 +288,66 @@ public class OtaPlugin extends Plugin {
     }
   }
 
+  /**
+   * OTA Phase 4 (docs/ota-subgame-modules.md) — every bundle with content actually
+   * on disk, `active` preferred over `pending` for the same name. See the TS
+   * `listBundles` doc comment (definitions.ts) for why `pending` counts as loadable here
+   * (unlike the shell, a sub-game has no boot-hook promotion path of its own).
+   */
+  @PluginMethod
+  public void listBundles(PluginCall call) {
+    try {
+      OtaCore.State state = readState(getContext());
+      JSArray bundles = new JSArray();
+      java.util.Set<String> seen = new java.util.HashSet<>();
+      if (state != null) {
+        appendStagedBundles(bundles, seen, state.active);
+        appendStagedBundles(bundles, seen, state.pending);
+      }
+      JSObject ret = new JSObject();
+      ret.put("bundles", bundles);
+      call.resolve(ret);
+    } catch (Exception e) {
+      call.reject("listBundles failed: " + e.getMessage(), e);
+    }
+  }
+
+  private void appendStagedBundles(JSArray bundles, java.util.Set<String> seen, Map<String, String> versions) {
+    for (Map.Entry<String, String> entry : versions.entrySet()) {
+      String name = entry.getKey();
+      String version = entry.getValue();
+      if (seen.contains(name)) continue;
+      File dir = versionDir(getContext(), name, version);
+      if (!dir.isDirectory()) continue;
+      JSObject bundle = new JSObject();
+      bundle.put("name", name);
+      bundle.put("version", version);
+      bundle.put("path", dir.getAbsolutePath());
+      bundles.put(bundle);
+      seen.add(name);
+    }
+  }
+
   // ---- Boot hook — call from the game's MainActivity.onCreate() BEFORE super.onCreate(),
   // exactly like MyViewController.instanceDescriptor() on iOS (see OtaPlugin.swift). Not
-  // yet wired into any actual MainActivity.java — see the plan doc's Phase 1 status. ----
+  // live in games/ota-test's MainActivity.java — the real, shipped shape. ----
 
   public static void runBootHook(Context context, String name) {
-    OtaCore.State state = readState(context);
-    OtaCore.FolderExists folderExists = (n, v) -> {
-      File dir = versionDir(context, n, v);
-      return dir.isDirectory() && new File(dir, "index.html").exists();
-    };
-    OtaCore.BootResult result = OtaCore.boot(state, name, folderExists);
-    writeState(context, result.state != null ? result.state : new OtaCore.State());
+    OtaCore.BootResult result;
+    synchronized (STATE_LOCK) {
+      OtaCore.State state = readState(context);
+      // Detect a genuine Play Store update BEFORE deciding what to boot — see
+      // OtaCore.resetForNewBinary's doc comment (OtaCore.swift) for why our own
+      // bookkeeping needs this independently of Bridge.java's own isNewBinary() check
+      // (which only decides what IT serves, not what OUR state.json still references).
+      state = OtaCore.resetForNewBinary(state, currentBinaryVersion(context));
+      OtaCore.FolderExists folderExists = (n, v) -> {
+        File dir = versionDir(context, n, v);
+        return dir.isDirectory() && new File(dir, "index.html").exists();
+      };
+      result = OtaCore.boot(state, name, folderExists);
+      writeState(context, result.state != null ? result.state : new OtaCore.State());
+    }
 
     SharedPreferences.Editor editor = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit();
     if (result.target.kind == OtaCore.TargetKind.EMBEDDED) {
@@ -163,6 +356,21 @@ public class OtaPlugin extends Plugin {
       editor.putString(PREFS_KEY_SERVER_PATH, versionDir(context, result.target.name, result.target.version).getAbsolutePath());
     }
     editor.apply();
+  }
+
+  /** The app-binary version `resetForNewBinary` compares against — same signal
+   *  Bridge.java's own `isNewBinary()` uses (versionCode, not the human-readable
+   *  versionName; the build number changes on every submission the marketing version
+   *  doesn't have to). Falls back to a fixed sentinel if PackageManager somehow can't
+   *  resolve the app's own package (should never happen in a real app) — never throws. */
+  @SuppressWarnings("deprecation") // getLongVersionCode() needs API 28; minSdk here is 24
+  private static String currentBinaryVersion(Context context) {
+    try {
+      PackageInfo info = context.getPackageManager().getPackageInfo(context.getPackageName(), 0);
+      return String.valueOf(info.versionCode);
+    } catch (PackageManager.NameNotFoundException e) {
+      return "unknown";
+    }
   }
 
   // ---- File layout ----
@@ -206,7 +414,7 @@ public class OtaPlugin extends Plugin {
     try (FileOutputStream out = new FileOutputStream(tmp)) {
       out.write(stateToJson(state).getBytes(StandardCharsets.UTF_8));
       out.getFD().sync(); // durable — this is exactly the write PlayerPrefs' debounced,
-      // non-fsync'd Android backend can't provide (see the plan doc's rationale for why
+      // non-fsync'd Android backend can't provide (see docs/ota-updates.md's rationale for why
       // OTA state is NOT stored in PlayerPrefs).
     } catch (IOException e) {
       throw new RuntimeException(e);
@@ -221,6 +429,14 @@ public class OtaPlugin extends Plugin {
       obj.put("pending", new JSONObject(state.pending));
       obj.put("bootAttempts", new JSONObject(state.bootAttempts));
       obj.put("confirmedBoots", new JSONObject(state.confirmedBoots));
+      JSONObject rejected = new JSONObject();
+      for (Map.Entry<String, java.util.List<String>> e : state.rejected.entrySet()) {
+        rejected.put(e.getKey(), new org.json.JSONArray(e.getValue()));
+      }
+      obj.put("rejected", rejected);
+      // Omit the key entirely when null (rather than writing JSON null) — matches how a
+      // Phase 1/2-written state.json has no key at all; both read back as null below.
+      if (state.lastSeenBinaryVersion != null) obj.put("lastSeenBinaryVersion", state.lastSeenBinaryVersion);
       return obj.toString();
     } catch (JSONException e) {
       throw new RuntimeException(e);
@@ -229,12 +445,31 @@ public class OtaPlugin extends Plugin {
 
   private static OtaCore.State jsonToState(String json) throws JSONException {
     JSONObject obj = new JSONObject(json);
+    String lastSeenBinaryVersion = obj.has("lastSeenBinaryVersion") && !obj.isNull("lastSeenBinaryVersion")
+      ? obj.getString("lastSeenBinaryVersion") : null;
     return new OtaCore.State(
       stringMap(obj.optJSONObject("active")),
       stringMap(obj.optJSONObject("pending")),
       intMap(obj.optJSONObject("bootAttempts")),
-      intMap(obj.optJSONObject("confirmedBoots"))
+      intMap(obj.optJSONObject("confirmedBoots")),
+      stringListMap(obj.optJSONObject("rejected")),
+      lastSeenBinaryVersion
     );
+  }
+
+  /** Absent (a state.json written by a Phase 1/2 binary) parses as empty, never throws. */
+  private static Map<String, java.util.List<String>> stringListMap(JSONObject obj) throws JSONException {
+    Map<String, java.util.List<String>> out = new HashMap<>();
+    if (obj == null) return out;
+    java.util.Iterator<String> keys = obj.keys();
+    while (keys.hasNext()) {
+      String k = keys.next();
+      org.json.JSONArray arr = obj.optJSONArray(k);
+      java.util.List<String> list = new java.util.ArrayList<>();
+      if (arr != null) for (int i = 0; i < arr.length(); i++) list.add(arr.getString(i));
+      out.put(k, list);
+    }
+    return out;
   }
 
   private static Map<String, String> stringMap(JSONObject obj) throws JSONException {
@@ -259,9 +494,35 @@ public class OtaPlugin extends Plugin {
     return out;
   }
 
+  // ---- Progress events (Phase 3a — plumbing only, no UI consumes this yet) ----
+
+  /** Emits `otaProgress` for the JS listener added via `ModokiOta.addListener`. Safe to
+   *  call from the background staging thread — `Plugin.notifyListeners` marshals to the
+   *  bridge internally. `bytesTotal: 0` means "genuinely unknown" (a copy-only delta, or
+   *  a caller that didn't pass expectedZipSize) — the JS side must treat that as
+   *  indeterminate progress, not "already done". */
+  private void emitProgress(String name, String version, long bytesDone, long bytesTotal, int filesDone, int filesTotal) {
+    JSObject data = new JSObject();
+    data.put("name", name);
+    data.put("version", version);
+    data.put("bytesDone", bytesDone);
+    data.put("bytesTotal", bytesTotal);
+    data.put("filesDone", filesDone);
+    data.put("filesTotal", filesTotal);
+    notifyListeners("otaProgress", data);
+  }
+
+  /** Called once per chunk read off the network with the chunk's byte count — NOT a
+   *  running total, so callers accumulate their own `bytesDone`. Kept chunk-granular
+   *  (the existing 64KB read buffer) rather than time-throttled: OTA bundles are small
+   *  enough (single-digit MB) that this is at most a few hundred bridge calls. */
+  private interface ProgressCallback {
+    void onChunk(int chunkBytes);
+  }
+
   // ---- Download / hash / unzip ----
 
-  private static byte[] download(String urlString) throws IOException {
+  private static byte[] download(String urlString, ProgressCallback progress) throws IOException {
     HttpURLConnection conn = (HttpURLConnection) new URL(urlString).openConnection();
     try {
       conn.setRequestMethod("GET");
@@ -269,18 +530,21 @@ public class OtaPlugin extends Plugin {
       conn.setReadTimeout(60_000);
       if (conn.getResponseCode() != 200) throw new IOException("HTTP " + conn.getResponseCode());
       try (InputStream in = conn.getInputStream()) {
-        return readAll(in);
+        return readAll(in, progress);
       }
     } finally {
       conn.disconnect();
     }
   }
 
-  private static byte[] readAll(InputStream in) throws IOException {
+  private static byte[] readAll(InputStream in, ProgressCallback progress) throws IOException {
     java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
     byte[] buf = new byte[64 * 1024];
     int n;
-    while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+    while ((n = in.read(buf)) != -1) {
+      out.write(buf, 0, n);
+      if (progress != null) progress.onChunk(n);
+    }
     return out.toByteArray();
   }
 

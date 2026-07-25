@@ -19,25 +19,37 @@ import java.util.Map;
 public final class OtaCoreSelfTest {
   private static int failures = 0;
 
-  public static void main(String[] args) throws Exception {
-    Path vectorsPath = Paths.get(args.length > 0 ? args[0] : "../../../test-vectors/ota-golden-vectors.json");
-    String json = new String(Files.readAllBytes(vectorsPath));
-    @SuppressWarnings("unchecked")
-    Map<String, Object> root = (Map<String, Object>) MinimalJson.parse(json);
-    @SuppressWarnings("unchecked")
-    List<Object> scenarios = (List<Object>) root.get("scenarios");
+  /** Both vector files, replayed by the same assertions — must match OtaCoreTests.swift's
+   *  `vectorFiles` exactly, or the two platforms stop being held to the same spec. */
+  private static final String[] VECTOR_FILES = {
+    "test-vectors/ota-golden-vectors.json",
+    "test-vectors/ota-gate-vectors-phase3.json",
+  };
 
-    for (Object rawObj : scenarios) {
+  public static void main(String[] args) throws Exception {
+    // Default resolves from the package root (engine/packages/capacitor-modoki-ota), which
+    // is the cwd docs/ota-updates.md's documented run command uses. Pass a dir to override.
+    Path root = Paths.get(args.length > 0 ? args[0] : ".");
+    int total = 0;
+    for (String file : VECTOR_FILES) {
+      String json = new String(Files.readAllBytes(root.resolve(file)));
       @SuppressWarnings("unchecked")
-      Map<String, Object> raw = (Map<String, Object>) rawObj;
-      runScenario(raw);
+      Map<String, Object> parsed = (Map<String, Object>) MinimalJson.parse(json);
+      @SuppressWarnings("unchecked")
+      List<Object> scenarios = (List<Object>) parsed.get("scenarios");
+      for (Object rawObj : scenarios) {
+        @SuppressWarnings("unchecked")
+        Map<String, Object> raw = (Map<String, Object>) rawObj;
+        runScenario(raw);
+      }
+      total += scenarios.size();
     }
 
     if (failures > 0) {
       System.err.println(failures + " scenario(s) FAILED");
       System.exit(1);
     }
-    System.out.println("All " + scenarios.size() + " OTA golden-vector scenarios passed.");
+    System.out.println("All " + total + " OTA golden-vector scenarios passed.");
   }
 
   private static void runScenario(Map<String, Object> raw) {
@@ -88,6 +100,10 @@ public final class OtaCoreSelfTest {
     } else if ("confirm".equals(op)) {
       OtaCore.State result = OtaCore.confirm(state, bundle);
       checkState(name, expect.get("state"), result);
+    } else if ("resetForNewBinary".equals(op)) {
+      String currentBinaryVersion = (String) raw.get("currentBinaryVersion");
+      OtaCore.State result = OtaCore.resetForNewBinary(state, currentBinaryVersion);
+      checkState(name, expect.get("state"), result);
     } else {
       throw new RuntimeException("unknown op " + op);
     }
@@ -99,7 +115,20 @@ public final class OtaCoreSelfTest {
     Map<String, String> pending = stringMap((Map<String, Object>) obj.getOrDefault("pending", new HashMap<>()));
     Map<String, Integer> bootAttempts = intMap((Map<String, Object>) obj.getOrDefault("bootAttempts", new HashMap<>()));
     Map<String, Integer> confirmedBoots = intMap((Map<String, Object>) obj.getOrDefault("confirmedBoots", new HashMap<>()));
-    return new OtaCore.State(active, pending, bootAttempts, confirmedBoots);
+    Map<String, List<String>> rejected = stringListMap((Map<String, Object>) obj.getOrDefault("rejected", new HashMap<>()));
+    String lastSeenBinaryVersion = (String) obj.get("lastSeenBinaryVersion");
+    return new OtaCore.State(active, pending, bootAttempts, confirmedBoots, rejected, lastSeenBinaryVersion);
+  }
+
+  @SuppressWarnings("unchecked")
+  private static Map<String, List<String>> stringListMap(Map<String, Object> raw) {
+    Map<String, List<String>> out = new HashMap<>();
+    for (Map.Entry<String, Object> e : raw.entrySet()) {
+      List<String> list = new java.util.ArrayList<>();
+      for (Object v : (List<Object>) e.getValue()) list.add((String) v);
+      out.put(e.getKey(), list);
+    }
+    return out;
   }
 
   private static Map<String, String> stringMap(Map<String, Object> raw) {

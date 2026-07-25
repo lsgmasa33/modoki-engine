@@ -33,6 +33,16 @@ export interface GameConfig {
   /** Asset manifest path (relative to public/) */
   assetManifest?: string;
 
+  /** OTA Phase 4 — origin to resolve `scenePath` against, for a sub-game bundle
+   *  whose files live in a separately-staged native folder rather than the
+   *  shell's own served webroot (`Capacitor.convertFileSrc()` of the staged
+   *  bundle root). Root-relative build output like `/assets/main-<hash>.json`
+   *  otherwise 404s — it resolves against the SHELL's origin, not the bundle's.
+   *  Unset for the shell's own (baked) game. Set by `app/subgameLoader.ts`,
+   *  consumed by `App.tsx`'s scene-boot-path resolution. See
+   *  docs/ota-subgame-modules.md §3. */
+  assetBaseUrl?: string;
+
   /** Transform entity names for display (e.g., Russian→English mapping) */
   nameTransform?: (name: string) => string;
 }

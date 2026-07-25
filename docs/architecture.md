@@ -116,6 +116,7 @@ koota's `trait({...})`. The main ones:
 | `Persistent` | `traits/Persistent.ts` | Tag: survive scene swaps. Apply via `markPersistent()` (root-only, assigns guid). |
 | `PrefabInstance` | `traits/PrefabInstance.ts` | Links an entity back to its source prefab + local id. |
 | `NPRPostFX` | `traits/NPRPostFX.ts` | Resource: non-photoreal edge-detection / fill post-processing for the 3D layer. |
+| `BloomPostFX` | `traits/BloomPostFX.ts` | Resource: WebGPU/TSL whole-scene HDR bloom post-process for the 3D layer. |
 | `UIElement` | `traits/UIElement.ts` | Consolidated UI layout + style + text + image (~50 fields). |
 | `UIBinding` | `traits/UIBinding.ts` | Store bindings (text templates, visibility, two-way input). |
 | `UIAction` | `traits/UIAction.ts` | Button/input events (`onClick`, `onChange`, `onSubmit`). |

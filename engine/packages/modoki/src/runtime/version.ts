@@ -14,3 +14,11 @@ export const ENGINE_VERSION = '0.1.0';
 // v9: renderable traits' `isActive` → `isVisible` (split per-renderer visibility from
 // the entity on/off EntityAttributes.isActive).
 export const SCENE_FORMAT_VERSION = 9;
+
+// The runtime ABI a dynamically-loaded OTA sub-game module is built against (OTA Phase 4,
+// docs/ota-subgame-modules.md). A sub-game bundle stamps this value in at build time
+// and the shell checks it for EXACT equality before registering the game — never `>=`, since
+// a sub-game built against an older engine must refuse to load loudly, not crash mid-scene.
+// `project.config.json`'s `ota.engineApi` (a separate, per-build-artifact field) must equal
+// this constant; bump both together when the runtime surface a sub-game depends on changes.
+export const ENGINE_API_VERSION = 1;

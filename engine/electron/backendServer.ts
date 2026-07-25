@@ -106,8 +106,10 @@ export function startBackendServer(ctx: BackendContext, opts: BackendServerOptio
     //    duplicating it. /api/build = build+deploy; /api/add-native-target =
     //    one-click `cap add` scaffold; /api/toolchain/install = auto-install a
     //    build tool into the userData toolchain dir (the JSON status sibling
-    //    /api/toolchain falls through to the direct router below). ──
-    if (req.method === 'GET' && (u.pathname === '/api/build' || u.pathname === '/api/add-native-target' || u.pathname === '/api/toolchain/install')) {
+    //    /api/toolchain falls through to the direct router below); /api/ota/publish =
+    //    the OTA publish pipeline (fresh build + gcloud) — same reasoning, JSON
+    //    siblings /api/ota/status and /api/ota/keygen fall through to the router. ──
+    if (req.method === 'GET' && (u.pathname === '/api/build' || u.pathname === '/api/add-native-target' || u.pathname === '/api/toolchain/install' || u.pathname === '/api/ota/publish')) {
       if (!viteOrigin) {
         res.statusCode = 503;
         res.setHeader('Content-Type', 'application/json');

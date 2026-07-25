@@ -1,4 +1,4 @@
-/** OTA publish-format schema (Phase 0 of docs/plans/mobile-ota-updates-plan.md).
+/** OTA publish-format schema (docs/ota-updates.md).
  *
  *  Two JSON documents make up a release:
  *   - a per-bundle `manifest.json` (one per {name, version}) — the file list a
