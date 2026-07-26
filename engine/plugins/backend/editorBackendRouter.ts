@@ -52,7 +52,7 @@ import { toolchainStatus, writeToolchainSettings, uninstall, uninstallAll, type 
 import { loadProjectConfig, writeProjectConfig, validateBuildConfig, loadProjectUserConfig, writeProjectUserConfig } from '../load-project-config';
 import { mergeProjectConfig, mergeProjectUserConfig } from '../../project-config';
 import { validateSceneData, type SceneSchema } from '../../packages/modoki/src/runtime/scene/sceneValidation';
-import { applyOps, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
+import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
 import { getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData, type AssetSchemaType } from '../../packages/modoki/src/runtime/assets/assetSchemas';
 import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
@@ -682,15 +682,13 @@ async function describeUnresolvedAgainstLiveWorld(
         }
       } catch { /* no editor connected — headless file edit, safe to proceed */ }
       const scene = JSON.parse(fs.readFileSync(absPath, 'utf-8')) as MutableScene;
+      // Phase 3, scene-loading.md — a v12+ file has no entity ids; this
+      // module still addresses entities by numeric id internally, so backfill one per
+      // entry for the duration of this call. Stripped back off (stripBackfilledEntityIds,
+      // below) before writing — otherwise every setTrait through this route would
+      // reintroduce an `id` field on EVERY entity, the exact diff noise Phase 3 removed.
+      const backfilledIds = assignSyntheticEntityIds(scene);
       const { changed, errors, warnings: opWarnings, unresolved } = applyOps(scene, ops);
-      // ── C7: "no entity matching {guid}" was a LIE. ──
-      // This route edits the scene FILE; create_entity/duplicate/prefab edit the LIVE world
-      // and don't save. So a brand-new entity is real, selected, and visible — yet invisible
-      // here until save_all, and the agent was told its guid didn't exist. It then re-queried
-      // scene-state, got the SAME guid back, and concluded the tooling was broken.
-      // applyOps is pure (file-only) and CANNOT know; this route can ASK the renderer, so
-      // the explanation belongs here. One probe, only when something failed to resolve.
-      const liveHint = unresolved.length ? await describeUnresolvedAgainstLiveWorld(ctx, unresolved) : null;
       // Surface BOTH the op-level warnings (dangling refs / orphaned parents from F5)
       // and the post-apply schema validation warnings.
       const schema = ctx.getSchema();
@@ -719,7 +717,24 @@ async function describeUnresolvedAgainstLiveWorld(
       const allErrors = typoError ? [...errors, typoError] : errors;
       // Only persist when at least one op succeeded — a structural-op error
       // (entity-not-found) leaves the file untouched so a typo is a no-op.
-      if (changed > 0) writeJsonAtomic(absPath, scene);
+      // Written HERE, immediately after applyOps and with no `await` in between since the
+      // read above — the liveHint lookup below is async (a round-trip to the browser) and
+      // used to sit BEFORE this write, leaving a window where a concurrent writer to the
+      // same file (another /api/scene-mutate call, a Save All, /api/write-file) could land
+      // and then get silently clobbered by this handler writing back its now-stale in-memory
+      // `scene`. Only the response's liveHint needs the await; it doesn't touch the file.
+      if (changed > 0) {
+        stripBackfilledEntityIds(scene, backfilledIds);
+        writeJsonAtomic(absPath, scene);
+      }
+      // ── C7: "no entity matching {guid}" was a LIE. ──
+      // This route edits the scene FILE; create_entity/duplicate/prefab edit the LIVE world
+      // and don't save. So a brand-new entity is real, selected, and visible — yet invisible
+      // here until save_all, and the agent was told its guid didn't exist. It then re-queried
+      // scene-state, got the SAME guid back, and concluded the tooling was broken.
+      // applyOps is pure (file-only) and CANNOT know; this route can ASK the renderer, so
+      // the explanation belongs here. One probe, only when something failed to resolve.
+      const liveHint = unresolved.length ? await describeUnresolvedAgainstLiveWorld(ctx, unresolved) : null;
       // Do NOT echo the scene by default. A `setTrait` always changes something, so this
       // fired on EVERY edit — ~10k tokens of agent context per call, on the hottest write
       // path, and nobody read it. It is also the wrong data: this is the pre-expansion
@@ -1060,7 +1075,20 @@ async function describeUnresolvedAgainstLiveWorld(
       ctx.markEditorWrite(absPath, crypto.createHash('sha1').update(bytes).digest('hex'));
       const dir = path.dirname(absPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(absPath, bytes);
+      // Atomic write (tmp + rename), not a direct writeFileSync: this endpoint is
+      // what saveAll uses to write EVERY scene in a base-scene chain, and a bare
+      // writeFileSync leaves a window where the Vite asset-scanner's chokidar
+      // watcher can react to the file mid-write and rescan a torn/partial JSON.
+      // `readAssetGuid` (vite-asset-scanner.ts) swallows that parse failure
+      // silently and just omits the asset's guid from the manifest, which can
+      // transiently break base-scene chain resolution (SceneManager.loadScene's
+      // resolveGuidToPath lookup) right after a Save All. The write-guard above
+      // already anticipates a rename landing after the initial write (see its
+      // "write+rename" burst handling), so this doesn't change hot-reload
+      // suppression behavior — same pattern as writeJsonAtomic in this file.
+      const tmpPath = `${absPath}.tmp`;
+      fs.writeFileSync(tmpPath, bytes);
+      fs.renameSync(tmpPath, absPath);
       return json({ ok: true });
     } catch (e) {
       return json({ error: String(e) }, 500);
@@ -1554,6 +1582,7 @@ const EDITOR_ACTIONS = new Set<string>([
   'dispatch-action', 'clear-journal', 'set-timescale',
   // Phase D (particle/animation first-pass editing).
   'anim-add-key', 'set-playhead', 'particle-set', 'anim-set-clip',
+  'timeline-set', 'timeline-add-clip',
   // Enact Phase 1 (HTML5 drag-and-drop synthesis) — a renderer-DOM op (needs a live
   // DataTransfer), so it rides the browser relay and works in dev AND the DMG.
   'dom-dnd',

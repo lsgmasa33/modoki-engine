@@ -34,7 +34,7 @@ vi.mock('../../src/runtime/ecs/world', () => ({
 
 const traitDefs = [
   { name: 'Transform', trait: Transform, category: 'component' as const, fields: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } } },
-  { name: 'EntityAttributes', trait: EntityAttributes, category: 'component' as const, fields: { name: { type: 'string' }, parentId: { type: 'number' }, guid: { type: 'string' } } },
+  { name: 'EntityAttributes', trait: EntityAttributes, category: 'component' as const, fields: { name: { type: 'string' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, guid: { type: 'string' } } },
   { name: 'Bare', trait: Bare, category: 'component' as const, fields: { v: { type: 'number' } } },
 ];
 

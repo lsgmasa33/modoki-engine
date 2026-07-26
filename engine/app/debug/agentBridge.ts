@@ -48,6 +48,7 @@ import {
   type OffscreenRenderOpts,
   type SceneData,
   invalidateAnimationClip,
+  invalidateTimeline,
   findEntityByGuid,
 } from '@modoki/engine/runtime';
 import { computeLayoutBounds, type LayoutBoundsParams } from './layoutDump';
@@ -728,9 +729,15 @@ export async function runAgentOp(op: string, params: unknown = {}): Promise<unkn
 }
 const handleOp = runAgentOp;
 
+/** What a watched-file change asks this renderer to do. Structurally mirrors `LiveReloadKind`
+ *  in `engine/plugins/vite-asset-scanner.ts` (the producer) — kept as a local union rather than
+ *  a type import because the plugin is a Node module and the app tsconfig has no node types.
+ *  Keep the two in sync; a new kind that lands here without a branch below is simply ignored. */
+type SceneChangedKind = 'scene' | 'prefab' | 'animation' | 'timeline';
+
 /** Hot-reload the active scene when its file (or any prefab) changes on disk.
  *  Shared by the Vite HMR path and the Electron IPC path. */
-async function handleSceneChanged(msg: { urlPath: string; kind: 'scene' | 'prefab' | 'animation' }): Promise<void> {
+async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind }): Promise<void> {
   // An .anim.json changed on disk → drop the cached clip. NOT a scene reload: the clip cache
   // is the only thing stale, and reloading would throw away unsaved live work.
   //
@@ -741,6 +748,17 @@ async function handleSceneChanged(msg: { urlPath: string; kind: 'scene' | 'prefa
   // own Claude Code editing a .anim.json with a plain file Write. (C7)
   if (msg.kind === 'animation') {
     invalidateAnimationClip(msg.urlPath);
+    return;
+  }
+  // A .timeline.json changed on disk → drop the cached definition. Same shape as the clip
+  // above, and the same defect it fixed: `invalidateTimeline` was exported and tested with ZERO
+  // production callers, so `timelineCache` keyed a parsed timeline by path and never let go —
+  // not on a file write, not on load_scene, not on a Stop/Play cycle (all three measured). A
+  // running Director kept firing the OLD markers on schedule, which reads as "the new marker
+  // params are being ignored" rather than as a stale cache. NOT a scene reload: the cache is
+  // the only stale thing, and reloading would throw away unsaved live work.
+  if (msg.kind === 'timeline') {
+    invalidateTimeline(msg.urlPath);
     return;
   }
   const current = sceneManager.getCurrent()?.path;
@@ -756,25 +774,48 @@ async function handleSceneChanged(msg: { urlPath: string; kind: 'scene' | 'prefa
   // In prefab-edit mode the active "scene" is a synthetic in-memory scene
   // (`/__prefab-edit__/<guid>`) with no file on disk — leave it alone.
   if (current.startsWith('/__prefab-edit__/')) return;
-  // Prefab edits require re-expanding instances → always reload the current
-  // scene. Scene edits only reload if they touch the active scene.
-  if (msg.kind === 'scene' && normScenePath(msg.urlPath) !== normScenePath(current)) return;
+  // A7 (scene-loading.md): the changed file may be a BASE in the
+  // loaded chain, not the primary — match against EVERY loaded scene, not just the
+  // primary's path. Without this, editing Base.json on disk (an agent's
+  // scene-mutate write, or a hand edit) landed silently: the live world kept
+  // rendering the stale copy with no warning, because the old check only ever
+  // compared against the primary.
+  let changedBaseGuid: string | undefined;
+  if (msg.kind === 'scene') {
+    const normChanged = normScenePath(msg.urlPath);
+    let matchedAny = false;
+    for (const entry of sceneManager.getLoadedScenes().values()) {
+      if (normScenePath(entry.path) !== normChanged) continue;
+      matchedAny = true;
+      if (entry.role === 'base') changedBaseGuid = entry.guid;
+      break;
+    }
+    if (!matchedAny) return; // touches no scene in the currently-loaded chain
+  }
   try {
     // Fetch the fresh file once: validate it AND hand it to loadScene via
     // `preloaded` so the reload doesn't fetch the same bytes a second time.
+    // Only usable when the CHANGED file is the primary itself — a changed base's
+    // bytes go through `forceReloadBases` below instead (loadScene re-fetches it
+    // as part of resolving the chain).
     let preloaded: SceneData | undefined;
-    try {
-      const res = await fetch(current, { cache: 'no-store' });
-      if (res.ok) {
-        preloaded = await res.json();
-        const { warnings } = validateSceneData(preloaded, buildSceneSchema());
-        if (warnings.length) {
-          console.warn(`[agentBridge] ${warnings.length} validation warning(s) in ${current}:`);
-          for (const w of warnings) console.warn(`  • ${w}`);
+    if (!changedBaseGuid) {
+      try {
+        const res = await fetch(current, { cache: 'no-store' });
+        if (res.ok) {
+          preloaded = await res.json();
+          const { warnings } = validateSceneData(preloaded, buildSceneSchema());
+          if (warnings.length) {
+            console.warn(`[agentBridge] ${warnings.length} validation warning(s) in ${current}:`);
+            for (const w of warnings) console.warn(`  • ${w}`);
+          }
         }
-      }
-    } catch { /* fall back to loadScene's own fetch */ }
-    await sceneManager.loadScene(current, preloaded ? { preloaded } : undefined);
+      } catch { /* fall back to loadScene's own fetch */ }
+    }
+    await sceneManager.loadScene(current, {
+      ...(preloaded ? { preloaded } : undefined),
+      ...(changedBaseGuid ? { forceReloadBases: [changedBaseGuid] } : undefined),
+    });
     console.log(`[agentBridge] hot-reloaded scene (${msg.kind} change: ${msg.urlPath})`);
   } catch (e) {
     // A newer reload superseding this one aborts the in-flight load
@@ -835,7 +876,7 @@ export function initAgentBridge(): void {
     // for an Electron bridge this is ALWAYS the case, dev or packaged. See
     // sceneReloadSource for why the Vite HMR path must NOT also drive reloads here.
     if (reloadSource === 'bridge') {
-      bridge.on('scene-changed', (data) => { void handleSceneChanged(data as { urlPath: string; kind: 'scene' | 'prefab' | 'animation' }); });
+      bridge.on('scene-changed', (data) => { void handleSceneChanged(data as { urlPath: string; kind: SceneChangedKind }); });
     }
     if (!hot) {
       // Packaged build (no Vite HMR): main also drives manifest updates. In dev,
@@ -871,6 +912,6 @@ export function initAgentBridge(): void {
   //    here too would double-reload AND bounce the scene on the editor's own writes
   //    (Vite's guard is never marked from this renderer). See sceneReloadSource.
   if (reloadSource === 'vite') {
-    hot.on('modoki:scene-changed', (msg: { urlPath: string; kind: 'scene' | 'prefab' | 'animation' }) => { void handleSceneChanged(msg); });
+    hot.on('modoki:scene-changed', (msg: { urlPath: string; kind: SceneChangedKind }) => { void handleSceneChanged(msg); });
   }
 }

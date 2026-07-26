@@ -12,7 +12,7 @@ const EntityAttributes = trait({ name: '' as string, parentId: 0, guid: '' as st
 const TimeLike = trait({ timeScale: 1, delta: 0, elapsed: 0, frame: 0, smoothedDelta: 0, smoothedElapsed: 0 });
 
 const TRAITS = [
-  { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: {}, parentId: {}, guid: {}, sortOrder: {}, isActive: {}, layer: {} } },
+  { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: {}, parentId: { entityId: { onMissing: 'root' } }, guid: {}, sortOrder: {}, isActive: {}, layer: {} } },
   {
     name: 'TimeLike', trait: TimeLike, category: 'resource',
     fields: {
@@ -70,7 +70,7 @@ vi.mock('../../src/runtime/loaders/assetManifest', () => ({
   deriveGuid: (seed: string) => `derived-${seed}`,
 }));
 vi.mock('../../src/runtime/loaders/assetUrl', () => ({ assetUrl: (p: string) => p }));
-vi.mock('../../src/runtime/scene/SceneManager', () => ({ sceneManager: { loadScene: vi.fn() } }));
+vi.mock('../../src/runtime/scene/SceneManager', () => ({ sceneManager: { loadScene: vi.fn(), getLoadedScenes: () => new Map() } }));
 vi.mock('../../src/editor/undo/undoManager', () => ({ clearHistory: vi.fn() }));
 
 beforeEach(() => { testWorld = createWorld(); index.clear(); guidN = 0; });

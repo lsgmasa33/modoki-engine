@@ -179,3 +179,165 @@ describe('syncLights — F6 orphaned-target regression', () => {
     expect(scene.children).not.toContain(oldSpot.target);      // stray target reaped on switch
   });
 });
+
+describe('syncLights — aim uses the renderer\'s euler order (XYZ)', () => {
+  /** A pose where the two candidate orders genuinely DISAGREE. This matters: the old
+   *  hand-rolled formula was YXZ (Ry·Rx) while `applyTransform` orients every other object
+   *  with three's default XYZ, so the same authored euler meant two different orientations.
+   *  The bug hid for a long time because the orders AGREE whenever `ry ≈ 0`, which is true
+   *  of most authored spots — so a test at `ry = 0` would have passed either way and proved
+   *  nothing. Both angles must be non-zero here. */
+  const RX = -0.6;
+  const RY = 1.2;
+
+  it('aims a spot light along its XYZ-euler forward, not the legacy YXZ one', async () => {
+    const { world, Light, sync, scene } = await setup();
+    const map = new Map<number, THREE.Light>();
+    const e = world.spawn(Light({ lightType: 'spot', isActive: true }));
+    worldTransforms.set(e.id(), { ...wt(0, 5, 0), rx: RX, ry: RY });
+
+    sync.syncLights(world, scene, map);
+    const spot = map.get(e.id())! as THREE.SpotLight;
+
+    // Expected: three's own transform of -Z by an XYZ euler — the same operation
+    // `obj.rotation.set(rx, ry, rz)` performs for meshes and cameras.
+    const expected = new THREE.Vector3(0, 0, -1)
+      .applyEuler(new THREE.Euler(RX, RY, 0))
+      .add(new THREE.Vector3(0, 5, 0));
+    expect(spot.target.position.x).toBeCloseTo(expected.x, 6);
+    expect(spot.target.position.y).toBeCloseTo(expected.y, 6);
+    expect(spot.target.position.z).toBeCloseTo(expected.z, 6);
+
+    // And it must NOT be the legacy YXZ result, or this test is vacuous.
+    const legacyY = 5 + Math.sin(RX);
+    expect(Math.abs(spot.target.position.y - legacyY)).toBeGreaterThan(0.05);
+  });
+
+  it('matches the orientation a mesh with the same euler would take', async () => {
+    const { world, Light, sync, scene } = await setup();
+    const map = new Map<number, THREE.Light>();
+    const e = world.spawn(Light({ lightType: 'directional', isActive: true }));
+    worldTransforms.set(e.id(), { ...wt(0, 0, 0), rx: RX, ry: RY });
+
+    sync.syncLights(world, scene, map);
+    const dir = map.get(e.id())! as THREE.DirectionalLight;
+
+    // A plain Object3D given the SAME euler — the mesh/camera path (applyTransform).
+    const proxy = new THREE.Object3D();
+    proxy.rotation.set(RX, RY, 0);
+    proxy.updateMatrixWorld(true);
+    const meshForward = new THREE.Vector3(0, 0, -1).applyQuaternion(proxy.quaternion);
+
+    // One authored euler must mean ONE orientation, light or mesh.
+    expect(dir.target.position.x).toBeCloseTo(meshForward.x, 6);
+    expect(dir.target.position.y).toBeCloseTo(meshForward.y, 6);
+    expect(dir.target.position.z).toBeCloseTo(meshForward.z, 6);
+  });
+
+  it('ignores roll — rotating about Z cannot change the -Z forward', async () => {
+    const { world, Light, sync, scene } = await setup();
+    const map = new Map<number, THREE.Light>();
+    const e = world.spawn(Light({ lightType: 'spot', isActive: true }));
+    worldTransforms.set(e.id(), { ...wt(0, 0, 0), rx: RX, ry: RY, rz: 0.9 });
+
+    sync.syncLights(world, scene, map);
+    const spot = map.get(e.id())! as THREE.SpotLight;
+    const noRoll = new THREE.Vector3(0, 0, -1).applyEuler(new THREE.Euler(RX, RY, 0));
+    expect(spot.target.position.x).toBeCloseTo(noRoll.x, 6);
+    expect(spot.target.position.y).toBeCloseTo(noRoll.y, 6);
+    expect(spot.target.position.z).toBeCloseTo(noRoll.z, 6);
+  });
+});
+
+describe('syncLights — authored Light.target* aim', () => {
+  /** The fields were declared, shown in the Inspector, and written into prefab defaults, but
+   *  NOTHING read them: a spot authored with correct target coordinates and rotation (0,0,0)
+   *  fired horizontally down -Z and appeared to do nothing. These pin BOTH directions of the
+   *  fix, because the fallback is what keeps every pre-existing scene (all of which serialize
+   *  0,0,0) aiming exactly as before. */
+  const target = { targetX: -3, targetY: 1.5, targetZ: -8 };
+  // A rotation the fallback cases aim by (same "the two euler orders disagree" pose as above).
+  const RX = -0.6;
+  const RY = 1.2;
+
+  it('aims a spot at the authored target in WORLD space, ignoring rotation', async () => {
+    const { world, Light, sync, scene } = await setup();
+    const map = new Map<number, THREE.Light>();
+    const e = world.spawn(Light({ lightType: 'spot', isActive: true, ...target }));
+    // A rotation that would aim somewhere else entirely — the target must win.
+    worldTransforms.set(e.id(), { ...wt(2, 4, 1), rx: -0.6, ry: 1.2 });
+
+    sync.syncLights(world, scene, map);
+    const spot = map.get(e.id())! as THREE.SpotLight;
+
+    // Absolute world coordinates — NOT offset from the light's position.
+    expect(spot.target.position.x).toBeCloseTo(target.targetX, 6);
+    expect(spot.target.position.y).toBeCloseTo(target.targetY, 6);
+    expect(spot.target.position.z).toBeCloseTo(target.targetZ, 6);
+    expect(scene.children).toContain(spot.target);
+  });
+
+  it('aims a directional light at the authored target too', async () => {
+    const { world, Light, sync, scene } = await setup();
+    const map = new Map<number, THREE.Light>();
+    const e = world.spawn(Light({ lightType: 'directional', isActive: true, ...target }));
+    worldTransforms.set(e.id(), wt(0, 10, 0));
+
+    sync.syncLights(world, scene, map);
+    const dir = map.get(e.id())! as THREE.DirectionalLight;
+
+    expect(dir.target.position.x).toBeCloseTo(target.targetX, 6);
+    expect(dir.target.position.y).toBeCloseTo(target.targetY, 6);
+    expect(dir.target.position.z).toBeCloseTo(target.targetZ, 6);
+  });
+
+  it('treats an ALL-ZERO target as unset and falls back to the euler forward', async () => {
+    const { world, Light, sync, scene } = await setup();
+    const map = new Map<number, THREE.Light>();
+    // targetX/Y/Z default to 0 — exactly what every scene authored before the fix serializes.
+    const e = world.spawn(Light({ lightType: 'spot', isActive: true }));
+    worldTransforms.set(e.id(), { ...wt(0, 5, 0), rx: RX, ry: RY });
+
+    sync.syncLights(world, scene, map);
+    const spot = map.get(e.id())! as THREE.SpotLight;
+
+    const expected = new THREE.Vector3(0, 0, -1)
+      .applyEuler(new THREE.Euler(RX, RY, 0))
+      .add(new THREE.Vector3(0, 5, 0));
+    expect(spot.target.position.x).toBeCloseTo(expected.x, 6);
+    expect(spot.target.position.y).toBeCloseTo(expected.y, 6);
+    expect(spot.target.position.z).toBeCloseTo(expected.z, 6);
+    // And NOT the origin, which is what "all-zero means aim at (0,0,0)" would have given.
+    expect(spot.target.position.length()).toBeGreaterThan(0.1);
+  });
+
+  it('a SINGLE non-zero axis is enough to count as set', async () => {
+    const { world, Light, sync, scene } = await setup();
+    const map = new Map<number, THREE.Light>();
+    const e = world.spawn(Light({ lightType: 'spot', isActive: true, targetY: 2 }));
+    worldTransforms.set(e.id(), { ...wt(0, 5, 0), rx: RX, ry: RY });
+
+    sync.syncLights(world, scene, map);
+    const spot = map.get(e.id())! as THREE.SpotLight;
+
+    expect(spot.target.position.x).toBeCloseTo(0, 6);
+    expect(spot.target.position.y).toBeCloseTo(2, 6);
+    expect(spot.target.position.z).toBeCloseTo(0, 6);
+  });
+
+  it('follows a live target edit without recreating the light', async () => {
+    const { world, Light, sync, scene } = await setup();
+    const map = new Map<number, THREE.Light>();
+    const e = world.spawn(Light({ lightType: 'spot', isActive: true, targetX: 1 }));
+    worldTransforms.set(e.id(), wt(0, 5, 0));
+
+    sync.syncLights(world, scene, map);
+    const spot = map.get(e.id())! as THREE.SpotLight;
+
+    e.set(Light, { lightType: 'spot', color: 0xffffff, intensity: 1, targetX: 1, targetY: 0, targetZ: -9, distance: 0, angle: 0.5, penumbra: 0, castShadow: false, isActive: true });
+    sync.syncLights(world, scene, map);
+
+    expect(map.get(e.id())).toBe(spot);                        // same instance
+    expect(spot.target.position.z).toBeCloseTo(-9, 6);
+  });
+});

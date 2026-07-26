@@ -139,6 +139,19 @@ describe('classifySceneChange (hot-reload broadcast classification)', () => {
     expect(classifySceneChange('/games/x/assets/models/cube.mesh.json')).toBeNull();
     expect(classifySceneChange('/games/x/assets/fx/spark.particle.json')).toBeNull();
   });
+  // Cache-invalidation kinds: NOT a scene reload (that would discard unsaved work) — the
+  // renderer drops just the one stale asset. `.timeline.json` returned null before the fix,
+  // so nothing was broadcast at all and a running Director kept firing the OLD markers.
+  it("broadcasts an .anim.json as 'animation' (clip-cache invalidation, not a reload)", () => {
+    expect(classifySceneChange('/games/x/assets/anim/walk.anim.json')).toBe('animation');
+  });
+  it("broadcasts a .timeline.json as 'timeline' (timeline-cache invalidation, not a reload)", () => {
+    expect(classifySceneChange('/games/x/assets/timelines/tour.timeline.json')).toBe('timeline');
+  });
+  it('classifies a .timeline.json the same way regardless of folder', () => {
+    // It must NOT fall through to the catch-all 'scene' just because it sits under /scenes/.
+    expect(classifySceneChange('/games/x/assets/scenes/tour.timeline.json')).toBe('timeline');
+  });
 });
 
 describe('isSseRoute (catch-all exclusion)', () => {

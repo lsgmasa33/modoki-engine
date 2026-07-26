@@ -37,6 +37,7 @@ import { setTimeScale as setWorldTimeScale } from '../systems/getTime';
 import { clearControlSpawns } from '../systems/controlSpawnRegistry';
 import { clearSkeletalSeeks } from '../systems/skeletalSeek';
 import { clearParticleControls } from '../systems/particleControlRegistry';
+import { clearTimelineWarnings } from '../systems/timelineSystem';
 import { setTimelinePreviewActive } from '../systems/timelinePreview';
 
 /** A game system to run each frame, with its pipeline priority. */
@@ -150,6 +151,7 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
       clearControlSpawns();
       clearSkeletalSeeks();
       clearParticleControls();
+      clearTimelineWarnings();          // warn-once sets are keyed by world-local entity ids
       setTimelinePreviewActive(false);
       setPlayState(prevPlay);
       if (prevWorld) setCurrentWorld(prevWorld);

@@ -7,6 +7,7 @@ import type { EntityInfo } from '../../src/runtime/ecs/entityUtils';
 import {
   filterEntityTree, collectEntityTypes, normalizeFolderPath,
   buildHierarchyFolders, countFolderRoots, folderSubtreePaths, folderSubtreeRootIds, revealTargetsFor,
+  groupRootsBySourceScene,
 } from '../../src/editor/panels/hierarchyFolders';
 
 /** Minimal EntityInfo factory. */
@@ -208,5 +209,58 @@ describe('revealTargetsFor', () => {
   it('normalizes a sloppily-typed folder tag', () => {
     const messy = [ent(1, 'R', { editorFolder: ' /Levels// Tropical/ ' }), ent(2, 'C', { parentId: 1 })];
     expect(revealTargetsFor(messy, 2).folderPaths).toEqual(['Levels', 'Levels/Tropical']);
+  });
+});
+
+describe('groupRootsBySourceScene (base-scene plan, Phase 9)', () => {
+  it('a scene with no base loaded collapses to a single primary group', () => {
+    const roots = [ent(1, 'A'), ent(2, 'B')];
+    const groups = groupRootsBySourceScene(roots, ['']);
+    expect(groups).toEqual([{ sourceScene: '', roots }]);
+  });
+
+  it('orders base-most first, primary LAST — matching the chain load order', () => {
+    const roots = [
+      ent(1, 'LevelThing', { sourceScene: '' }),
+      ent(2, 'Camera', { sourceScene: 'g-base' }),
+      ent(3, 'Time', { sourceScene: 'g-base' }),
+    ];
+    const groups = groupRootsBySourceScene(roots, ['g-base', '']);
+    expect(groups.map((g) => g.sourceScene)).toEqual(['g-base', '']);
+    expect(groups[0].roots.map((r) => r.id)).toEqual([2, 3]);
+    expect(groups[1].roots.map((r) => r.id)).toEqual([1]);
+  });
+
+  it('omits a scene from sceneOrder that contributed no roots', () => {
+    const roots = [ent(1, 'LevelThing', { sourceScene: '' })];
+    const groups = groupRootsBySourceScene(roots, ['g-base', '']);
+    expect(groups.map((g) => g.sourceScene)).toEqual(['']);
+  });
+
+  it('supports a nested chain (two base scenes)', () => {
+    const roots = [
+      ent(1, 'EngineThing', { sourceScene: 'g-engine' }),
+      ent(2, 'GameThing', { sourceScene: 'g-game' }),
+      ent(3, 'LevelThing', { sourceScene: '' }),
+    ];
+    const groups = groupRootsBySourceScene(roots, ['g-engine', 'g-game', '']);
+    expect(groups.map((g) => g.sourceScene)).toEqual(['g-engine', 'g-game', '']);
+  });
+
+  it('a stale sourceScene not in sceneOrder is still surfaced, not dropped', () => {
+    const roots = [
+      ent(1, 'LevelThing', { sourceScene: '' }),
+      ent(2, 'Orphan', { sourceScene: 'g-gone' }),
+    ];
+    const groups = groupRootsBySourceScene(roots, ['']);
+    expect(groups.map((g) => g.sourceScene)).toEqual(['', 'g-gone']);
+    expect(groups[1].roots.map((r) => r.id)).toEqual([2]);
+  });
+
+  it('an undefined sourceScene is treated the same as empty (primary)', () => {
+    const roots = [ent(1, 'A'), ent(2, 'B', { sourceScene: '' })];
+    const groups = groupRootsBySourceScene(roots, ['']);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].roots.map((r) => r.id)).toEqual([1, 2]);
   });
 });

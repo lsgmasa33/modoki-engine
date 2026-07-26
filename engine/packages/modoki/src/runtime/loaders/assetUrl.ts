@@ -15,7 +15,17 @@ export function assetUrl(path: string): string {
     if (inlined) return inlined;
   }
   const base = import.meta.env?.BASE_URL || '/';
-  const resolved = (base === '/' || !path.startsWith('/') || path.startsWith(base)) ? path : base + path.slice(1);
+  // Vite does NOT guarantee BASE_URL ends with "/" — it only normalizes a leading
+  // slash (resolveBaseUrl in vite's config resolution), so a build invoked with
+  // BASE_PATH=/demo (no trailing slash) yields BASE_URL "/demo". Joining that
+  // directly against a root-absolute path ("/demo" + "assets.json" — path.slice(1)
+  // drops the leading "/") glues the two segments with no separator, producing
+  // "/demoassets.json": a silent 404 that fails EVERY GUID lookup at once (every
+  // mesh drops, black screen) rather than an obvious per-asset error. Strip a
+  // trailing slash before joining so the result is correct either way.
+  const resolved = (base === '/' || !path.startsWith('/') || path.startsWith(base))
+    ? path
+    : (base.endsWith('/') ? base.slice(0, -1) : base) + path;
   // iOS Capacitor serves the app from a CUSTOM scheme (capacitor://localhost). PixiJS's URL
   // resolver is written for http/https/file and mis-parses a root-absolute path under a custom
   // scheme — it drops the host, so "/assets/x" becomes "capacitor://assets/x" (host "assets") →

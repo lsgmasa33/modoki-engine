@@ -4,7 +4,7 @@
 import { registerTrait, type FieldHint } from '@modoki/engine/runtime';
 import {
   Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
-  UIElement, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, Animator, SpriteAnimator,
+  UIElement, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, Animator, SpriteAnimator,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
   AudioSource, AudioListener,
@@ -742,9 +742,10 @@ export function registerAllTraits() {
       name: { type: 'string' },
       isActive: { type: 'boolean' },
       sortOrder: { type: 'number', step: 1 },
-      parentId: { type: 'number', step: 1 },
+      parentId: { type: 'number', step: 1, entityId: { onMissing: 'root' } },
       layer: { type: 'enum', options: ['', '3d', '2d', 'ui'] },
       guid: { type: 'string', readOnly: true },
+      sourceScene: { type: 'string', hidden: true, runtimeOnly: true },
     },
   });
 
@@ -781,9 +782,9 @@ export function registerAllTraits() {
       lightType: { type: 'enum', options: ['ambient', 'directional', 'point', 'spot'] },
       color: { type: 'color' },
       intensity: { type: 'number', step: 0.1 },
-      targetX: { type: 'number', step: 0.1, group: 'Target' },
-      targetY: { type: 'number', step: 0.1, group: 'Target' },
-      targetZ: { type: 'number', step: 0.1, group: 'Target' },
+      targetX: { type: 'number', step: 0.1, group: 'Target', tooltip: 'World-space point this directional/spot light aims AT. Any non-zero value here overrides the light’s rotation; leave all three at 0 to aim by rotation instead (0,0,0 means “unset”, not “aim at the origin” — to aim at the origin nudge one axis to 0.001).' },
+      targetY: { type: 'number', step: 0.1, group: 'Target', tooltip: 'World-space point this directional/spot light aims AT. Any non-zero value here overrides the light’s rotation; leave all three at 0 to aim by rotation instead.' },
+      targetZ: { type: 'number', step: 0.1, group: 'Target', tooltip: 'World-space point this directional/spot light aims AT. Any non-zero value here overrides the light’s rotation; leave all three at 0 to aim by rotation instead.' },
       distance: { type: 'number', step: 1 },
       angle: { type: 'number', step: 0.01, display: 'degrees' },
       penumbra: { type: 'number', step: 0.1, min: 0, max: 1 },
@@ -813,7 +814,7 @@ export function registerAllTraits() {
     fields: {
       source: { type: 'string', readOnly: true },
       localId: { type: 'number', readOnly: true },
-      rootInstanceId: { type: 'number', readOnly: true },
+      rootInstanceId: { type: 'number', readOnly: true, entityId: { onMissing: 'stripTrait' } },
       parentLocalId: { type: 'number', readOnly: true },
     },
   });
@@ -1073,10 +1074,38 @@ export function registerAllTraits() {
   registerTrait({
     name: 'BloomPostFX', trait: BloomPostFX, category: 'resource',
     fields: {
-      enabled: { type: 'boolean', tooltip: 'Route the (non-NPR) 3D render through the TSL bloom composer. WebGPU only; if NPR is also enabled, NPR wins.' },
+      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s bloom stage. WebGPU only; composes with NPR/Vignette/DOF/AO.' },
       strength: { type: 'number', step: 0.05, min: 0, max: 3, tooltip: 'Bloom intensity / glow brightness. Typical 0.3–1.5.' },
       radius: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: 'Glow blur spread (softness/width). 0..1.' },
       threshold: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: 'Luminance threshold — only pixels brighter than this bloom. 0 = whole scene (good on a near-black void).' },
+    },
+  });
+
+  registerTrait({
+    name: 'VignettePostFX', trait: VignettePostFX, category: 'resource',
+    fields: {
+      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s vignette stage. WebGPU only; composes with NPR/Bloom/DOF/AO.' },
+      intensity: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: 'Darkening strength at the screen edge. 0 = no vignette, 1 = edges go black.' },
+      smoothness: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: 'Falloff softness of the radial mask. Higher spreads the darkening further toward the center.' },
+    },
+  });
+
+  registerTrait({
+    name: 'DepthOfFieldPostFX', trait: DepthOfFieldPostFX, category: 'resource',
+    fields: {
+      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s depth-of-field stage. WebGPU only; composes with NPR/Bloom/Vignette/AO.' },
+      focusDistance: { type: 'number', step: 0.5, min: 0, tooltip: 'Distance along the camera\'s look direction (world units) that stays in focus.' },
+      focalLength: { type: 'number', step: 0.1, min: 0.01, tooltip: 'How far (world units) from the focus distance before it\'s fully out of focus. Smaller = shallower depth of field.' },
+      bokehScale: { type: 'number', step: 0.1, min: 0, max: 5, tooltip: 'Unitless artistic multiplier on bokeh circle size.' },
+    },
+  });
+
+  registerTrait({
+    name: 'AmbientOcclusionPostFX', trait: AmbientOcclusionPostFX, category: 'resource',
+    fields: {
+      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s GTAO stage. WebGPU only; composes with NPR/Bloom/Vignette/DOF. Adds a normal buffer to the scene pass (same one NPR uses) — a custom-shader material combined with AO must emit both MRT targets or its draw is dropped.' },
+      radius: { type: 'number', step: 0.05, min: 0.01, max: 2, tooltip: 'World-space sample radius for the occlusion horizon search.' },
+      intensity: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: '0 = no darkening, 1 = full raw occlusion.' },
     },
   });
 

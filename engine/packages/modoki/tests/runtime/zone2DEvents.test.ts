@@ -9,6 +9,7 @@ import { ZoneOccupant } from '../../src/runtime/traits/ZoneOccupant';
 import { OnZone2D } from '../../src/runtime/traits/OnZone2D';
 import { zone2DSystem } from '../../src/runtime/systems/zone2DSystem';
 import { zone3DSystem } from '../../src/runtime/systems/zone3DSystem';
+import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
 import { zone2DEvents } from '../../src/runtime/managers/Zone2DEvents';
 import { zone3DEvents } from '../../src/runtime/managers/Zone3DEvents';
 
@@ -131,5 +132,60 @@ describe('Zone triggers — 2D/3D channel isolation', () => {
 
     moveTo(occ, 100, 0); tw.step(1);   // leaves both → one exit each
     expect([e2, x2, e3, x3]).toEqual([1, 1, 1, 1]);
+  });
+});
+
+describe('Zone2D triggers — deactivation means GONE, not paused', () => {
+  /** The 2D half of the same contract the 3D suite pins: a deactivated zone/occupant drops out of
+   *  the frame's lists and the membership diff synthesizes the exits, so the enter/exit ledger
+   *  stays balanced. Duplicated per dimension ON PURPOSE — the guard lives in each system (only
+   *  the containment test is dimension-specific), so a fix applied to one and not the other is
+   *  exactly the drift `zoneTriggerCore`'s shared-core discipline exists to catch. */
+  it('deactivating the ZONE fires exit, and re-activating fires a fresh enter', () => {
+    tw = createTestWorld({ systems: [ZONE2D] });
+    const zone = tw.spawn(Transform({ x: 0, y: 0, sx: 4, sy: 4 }), Zone2D({ shape: 'box' }), EntityAttributes({ name: 'z' }));
+    tw.spawn(Transform({ x: 0, y: 0 }), ZoneOccupant);
+    const hits: string[] = [];
+    zone2DEvents.onZone((_z, _o, phase) => hits.push(phase), tw.world);
+
+    tw.step(1);
+    expect(hits).toEqual(['enter']);
+
+    zone.set(EntityAttributes, { ...zone.get(EntityAttributes)!, isActive: false });
+    tw.step(2);
+    expect(hits).toEqual(['enter', 'exit']);   // once, then quiet
+
+    zone.set(EntityAttributes, { ...zone.get(EntityAttributes)!, isActive: true });
+    tw.step(1);
+    expect(hits).toEqual(['enter', 'exit', 'enter']);
+  });
+
+  it('deactivating an OCCUPANT exits it from the zone', () => {
+    tw = createTestWorld({ systems: [ZONE2D] });
+    tw.spawn(Transform({ x: 0, y: 0, sx: 4, sy: 4 }), Zone2D({ shape: 'box' }));
+    const occ = tw.spawn(Transform({ x: 0, y: 0 }), ZoneOccupant, EntityAttributes({ name: 'o' }));
+    const hits: string[] = [];
+    zone2DEvents.onZone((_z, _o, phase) => hits.push(phase), tw.world);
+
+    tw.step(1);
+    occ.set(EntityAttributes, { ...occ.get(EntityAttributes)!, isActive: false });
+    tw.step(1);
+
+    expect(hits).toEqual(['enter', 'exit']);
+  });
+
+  it('CASCADES — deactivating the zone\'s parent exits its occupants', () => {
+    tw = createTestWorld({ systems: [ZONE2D] });
+    const parent = tw.spawn(Transform({ x: 0, y: 0 }), EntityAttributes({ name: 'group' }));
+    tw.spawn(Transform({ x: 0, y: 0, sx: 4, sy: 4 }), Zone2D({ shape: 'box' }), EntityAttributes({ name: 'z', parentId: parent.id() }));
+    tw.spawn(Transform({ x: 0, y: 0 }), ZoneOccupant);
+    const hits: string[] = [];
+    zone2DEvents.onZone((_z, _o, phase) => hits.push(phase), tw.world);
+
+    tw.step(1);
+    parent.set(EntityAttributes, { ...parent.get(EntityAttributes)!, isActive: false });
+    tw.step(1);
+
+    expect(hits).toEqual(['enter', 'exit']);
   });
 });

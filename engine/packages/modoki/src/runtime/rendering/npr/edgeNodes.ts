@@ -1,6 +1,8 @@
-// HMR: see NPRPostProcess.ts — TSL nodes baked into compiled pipelines can't
-// safely hot-reload.
-if (import.meta.hot) import.meta.hot.invalidate();
+// HMR: this module's TSL nodes bake into compiled WGSL pipelines, so an edit here needs a full
+// RELOAD, not a hot patch. The dev server forces one by path (isShaderGraphFile in
+// plugins/vite-asset-scanner.ts). Do NOT re-add `import.meta.hot.invalidate()` — it only
+// propagates to importers and was silently swallowed by Scene3D.tsx's Fast Refresh boundary,
+// which is exactly how a correct shader fix ended up looking broken.
 
 /** Sobel edge-detection helpers as TSL nodes.
  *

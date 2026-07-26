@@ -42,7 +42,7 @@ import { normalizeTimeline } from '../../src/runtime/timeline/types';
 function registerAll() {
   registerTrait({
     name: 'EntityAttributes', trait: EntityAttributes, category: 'component',
-    fields: { name: {}, isActive: {}, sortOrder: {}, parentId: {}, layer: {}, guid: {} },
+    fields: { name: {}, isActive: {}, sortOrder: {}, parentId: { entityId: { onMissing: 'root' } }, layer: {}, guid: {} },
   });
   registerTrait({
     name: 'Transform', trait: Transform, category: 'component',

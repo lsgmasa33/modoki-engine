@@ -107,6 +107,47 @@ export function folderSubtreeRootIds(node: HierarchyFolder): number[] {
   return out;
 }
 
+/** One scene's slice of the Hierarchy — its own root entities, keyed by
+ *  `sourceScene` ('' = the primary scene). Base-scene plan Phase 9. */
+export interface SceneGroup {
+  /** Guid of the scene these roots came from; '' = the primary. */
+  sourceScene: string;
+  roots: EntityInfo[];
+}
+
+/** Partition ROOT entities by `EntityAttributes.sourceScene` ('' = primary),
+ *  ordered by `sceneOrder` (root-most base first, primary LAST — the same order
+ *  `resolveSceneChain`/`SceneManager.loadScene` use, so the Hierarchy's scene
+ *  groups read top-to-bottom exactly like the chain loads). A scene with zero
+ *  roots is omitted (nothing to show). A root whose `sourceScene` doesn't match
+ *  ANY entry in `sceneOrder` (a stale stamp — shouldn't happen in practice) is
+ *  still surfaced, appended at the end, rather than silently dropped.
+ *
+ *  Returns a single group (the roots as given, key '') when every root shares
+ *  the same '' sourceScene — the common case with no base scene loaded — so a
+ *  caller can cheaply special-case "just one group ⇒ render exactly as before,
+ *  no scene-group chrome at all". */
+export function groupRootsBySourceScene(roots: EntityInfo[], sceneOrder: string[]): SceneGroup[] {
+  const byScene = new Map<string, EntityInfo[]>();
+  for (const r of roots) {
+    const key = r.sourceScene || '';
+    const arr = byScene.get(key);
+    if (arr) arr.push(r); else byScene.set(key, [r]);
+  }
+  const out: SceneGroup[] = [];
+  const seen = new Set<string>();
+  for (const key of sceneOrder) {
+    seen.add(key);
+    const list = byScene.get(key);
+    if (list && list.length) out.push({ sourceScene: key, roots: list });
+  }
+  for (const [key, list] of byScene) {
+    if (seen.has(key) || !list.length) continue;
+    out.push({ sourceScene: key, roots: list });
+  }
+  return out;
+}
+
 /** Everything that must be un-collapsed for `selectedId`'s row to actually exist in the
  *  Hierarchy DOM: its ancestor entities, and the folder its ROOT ancestor is tagged into
  *  (plus that folder's own ancestor folders, since "Enemies/Ranged" renders inside

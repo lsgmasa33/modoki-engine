@@ -39,7 +39,9 @@ import { spawnPrefabInstance } from '../loaders/loadSceneFile';
 import { deleteEntity } from '../ecs/entityUtils';
 import { getControlSpawn, setControlSpawn, hasControlSpawn, deleteControlSpawn, listControlSpawns } from './controlSpawnRegistry';
 import { requestParticleControl, reflectParticleScrub, resetScrubParticleReflect, noteScrubParticleState, type ParticleControlAction } from './particleControlRegistry';
-import { buildEntityIndex, resolveTrackTarget, applyClipAtTime, applyClipAtTimeBlended, type EntityIndex } from '../animation/sampleClip';
+import { applyClipAtTime, applyClipAtTimeBlended } from '../animation/sampleClip';
+import { buildEntityIndex, resolveTrackTarget, isEntityActiveInHierarchy, type EntityIndex } from '../ecs/entityIndex';
+import { onWorldSwap } from '../ecs/worldRegistry';
 import { applyClipDeform } from './deform2DSystem';
 import { beginDeform2DFrame } from './deform2DBuffers';
 import { resolveClipByName } from '../animation/animClipBank';
@@ -160,6 +162,25 @@ export function applyTimelineState(world: World, rootId: number, def: TimelineDe
     } else if (track.type === 'activation') {
       const desired = track.spans.some((s) => t >= s.start && t < s.end);
       const cur = entity.get(EntityAttributes) as Record<string, unknown> | undefined;
+      // SELF-DEACTIVATION IS A ONE-WAY DOOR — say so, loudly, once. An activation track whose
+      // target resolves to its OWN Director root (target "" is the root) switches the Director's
+      // entity off; a deactivated entity FREEZES its Director (see timelineSystem's PASS 1), so
+      // the playhead stops at that instant and can never reach the span that would switch it back
+      // on. Measured: frozen at t=0.2333 forever. We deliberately do NOT special-case it away —
+      // "deactivated means frozen" is the whole point of that guard, and an exception would make
+      // activation tracks mean something different depending on who they point at. But a SILENT
+      // soft-lock is exactly the failure class this subsystem keeps getting bitten by, so it is
+      // reported instead. Author the track against the object being shown/hidden, not the Director.
+      if (cur && cur.isActive !== desired && !desired && targetId === rootId && !_warnedSelfDeact.has(rootId)) {
+        _warnedSelfDeact.add(rootId);
+        console.warn(
+          `[timeline] activation track "${track.name}" targets its OWN Director (entity ${rootId}) and is ` +
+          `switching it OFF at t=${t.toFixed(3)}. A deactivated entity freezes its Director, so this ` +
+          `timeline will STOP HERE permanently and cannot re-activate itself. Point the track at the ` +
+          `object you want to show/hide instead.`,
+        );
+        emit('@timeline-selfdeact', { director: rootId, track: track.name, t });
+      }
       if (cur && cur.isActive !== desired) entity.set(EntityAttributes, { ...cur, isActive: desired });
     }
   }
@@ -377,7 +398,25 @@ function controlParticle(world: World, director: Entity, targetId: number, actio
 
 // ── Sub-directors (Phase F — nested timelines) ────────────────────────────────────────────────
 
+/** Warn-once bookkeeping for the two authoring foot-guns this system can detect (sub-director
+ *  cycles; an activation track switching off its own Director). Both would otherwise log every
+ *  frame — an editor scrub drags across the same boundary dozens of times a second.
+ *
+ *  ⚠️ These are keyed by ENTITY ID, which is world-local and REASSIGNED on every scene load, so
+ *  they MUST NOT survive a world swap: a stale id would silently suppress a genuine warning for
+ *  an unrelated entity in the next scene — a warn-once that degrades into a warn-never, which is
+ *  precisely the silent-failure class this system keeps getting bitten by. (Measured: a second
+ *  test world reusing id 1 got no warning at all.) Hence the `onWorldSwap` reset below, mirroring
+ *  `controlSpawnRegistry`. */
 const _warnedSubCycle = new Set<number>();
+const _warnedSelfDeact = new Set<number>();
+
+/** Drop the warn-once bookkeeping (scene swap / test teardown) — see the note above. */
+export function clearTimelineWarnings(): void {
+  _warnedSubCycle.clear();
+  _warnedSelfDeact.clear();
+}
+onWorldSwap(() => clearTimelineWarnings());
 
 /** Memoized "does this timeline have ANY sub-director control clip?" A `.timeline.json` is immutable
  *  once loaded (a re-import replaces the def object), so a WeakMap keyed on the def is a stable,
@@ -403,6 +442,11 @@ const _EMPTY_SLAVED: ReadonlySet<number> = new Set();
  *  query pass; its parent drives its frame synced to the clip (single authority, no double-fire). Scans
  *  ALL directors (not only playing ones): a parent-controlled child freezes when its parent isn't
  *  advancing, which is the correct "the parent owns me" semantics and avoids any double-run.
+ *
+ *  Scanning ALL directors is load-bearing for the INACTIVE case too: a parent whose entity was
+ *  deactivated still slaves its children, so they stay frozen with it. Skipping inactive parents
+ *  here would un-slave those children and set them SELF-ADVANCING the moment their parent is
+ *  switched off — the exact opposite of what deactivating the parent is asking for.
  *
  *  A MUTED subdirector track does NOT slave its child (review, muted-track consistency): muting the
  *  track means the parent stops driving it, so the child runs on its own clock instead of freezing
@@ -446,6 +490,9 @@ function driveSubdirector(
   }
   const child = index.byId.get(childId) as unknown as Entity | undefined;
   if (!child || !child.has(Director)) return;
+  // An inactive child freezes even when a parent is driving it — otherwise deactivating a
+  // nested Director would do nothing at all, since PASS 1 already skips it as `slaved`.
+  if (!isEntityActiveInHierarchy(index, childId)) return;
   const cd = child.get(Director) as { timeline: string } | undefined;
   const childDef = cd?.timeline ? getTimeline(cd.timeline) : undefined;
   if (!childDef) return;
@@ -668,6 +715,13 @@ export function timelineSystem(world: World): void {
   const pending: Pending[] = [];
   world.query(Director).updateEach(([dir], entity) => {
     if (entity.has(Paused)) return;
+    // Deactivating an entity turns it OFF — that must FREEZE its Director, the same way
+    // deactivating a mesh hides it. Without this the playhead kept advancing and its signal/
+    // activation markers kept firing while the entity was supposedly held still (measured:
+    // time went 2.7434 → 2.7566 on an inactive Director, flipping a demo through its stations).
+    // FREEZE, not stop: `dir.time`/`started` are left untouched, so reactivating resumes where
+    // it left off. `Director.playing = false` remains the separate PAUSE concept.
+    if (!isEntityActiveInHierarchy(index, entity.id())) return;
     if (slaved.has(entity.id())) return; // parent-driven sub-director — skip self-advance (Phase F)
     if (!dir.playing) return;
     const def = getTimeline(dir.timeline);

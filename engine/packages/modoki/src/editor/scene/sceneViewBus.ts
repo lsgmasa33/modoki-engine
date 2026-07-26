@@ -59,6 +59,15 @@ export function focusEntityInSceneView(entityId: number): boolean {
   return true;
 }
 
+/** Guard for the `F` "frame selected" chord, shared by its two panel-scoped bindings
+ *  (SceneView's `scene.frameSelected`, Hierarchy's `hierarchy.frameSelected`) so they can't
+ *  drift apart. `F` only makes sense when there's an orbit camera to frame with (not in UI
+ *  mode) and something selected to frame. WHICH panel gets to fire it at all is handled by
+ *  keymap scope, not by this predicate — see the `scope: 'scene'`/`'hierarchy'` registrations. */
+export function canFrameSelected(s: { sceneViewMode: string; selectedEntityId: number | null }): boolean {
+  return s.sceneViewMode !== 'ui' && s.selectedEntityId !== null;
+}
+
 // ── Viewport orientation controller (SceneViewGizmo corner widget) ──
 // Same register-on-mount / fire-and-forget shape as the focus handler: the widget is a
 // sibling React component with no access to SceneView's closure-scoped camera/controls, so

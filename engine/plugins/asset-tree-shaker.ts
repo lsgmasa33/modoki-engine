@@ -273,6 +273,40 @@ function probeTraitRefs(traits: Record<string, unknown>, state: WalkState, refer
     for (const field of fields) pushRef(state, 'asset', t[field], referencedBy);
   }
 
+  // ── Generic scalar/array GUID sweep — makes GAME-DEFINED traits work with no registry ──
+  //
+  // REF_FIELDS_BY_TRAIT above only knows ENGINE traits; a GAME trait like sling's FieldSource
+  // (level/wave/enemyPrefab — all .json asset guids) can't register into it without the game
+  // reaching into the engine, which the portability rule forbids. So its refs were invisible to
+  // the tree-shaker, and every new Sling level had to be hand-added to asset-keep.json with
+  // nothing catching a forgotten one — the exact class of drift REF_FIELDS_BY_TRAIT exists to
+  // prevent (the historical Animator.clip break this file already cites), just for a trait the
+  // registry can't reach.
+  //
+  // Fix: the shaker already builds a COMPLETE guid → path index over every shippable asset
+  // (buildGuidIndex). A trait field whose string value is a guid PRESENT in that index is, by
+  // construction, a reference to a real asset — no per-game registration needed, ever, for any
+  // game. Walk every trait bag's own fields (unwrapping one level of string array, to also catch
+  // an AnimationLibrary-shaped guid array on a game trait) and keep any hit.
+  //
+  // Deliberately does NOT warn on a miss, unlike the loop above: an ENTITY reference is also a
+  // guid and is never in the asset index, so warning here would flood every build log with false
+  // "unresolved ref" noise for ordinary entity refs. Pre-checking guidIndex membership before
+  // calling pushRef is what keeps this silent on a miss (pushRef only warns when isGuid() is
+  // true and the index lookup fails — that branch is unreachable from this call site).
+  for (const bag of Object.values(traits)) {
+    if (!bag || typeof bag !== 'object') continue;
+    for (const value of Object.values(bag as Record<string, unknown>)) {
+      if (typeof value === 'string') {
+        if (isGuid(value) && state.guidIndex.has(value.toLowerCase())) pushRef(state, 'asset', value, referencedBy);
+      } else if (Array.isArray(value)) {
+        for (const el of value) {
+          if (typeof el === 'string' && isGuid(el) && state.guidIndex.has(el.toLowerCase())) pushRef(state, 'asset', el, referencedBy);
+        }
+      }
+    }
+  }
+
   // ── Refs that are NOT a scalar guid field, so they can't live in the registry ──
 
   // UIElement.fontFamily is a CSS family NAME, not an asset guid — resolved to
@@ -679,6 +713,10 @@ export function computeKeptAssets(projectRoot: string, roots: AssetRoot[]): Tree
       }
     }
     // All other types (model, texture, environment, font, shader-src, unknown-json) are leaves.
+    // Deliberately includes 'level'/'wave' (Sling's `.level.json`/`.wave.json`): verified by
+    // reading real fixtures that they're pure ASCII grids (floor/ramp/zones layers, a spawn-chart
+    // `rows` array) with no embedded asset refs — they ARE leaves today. If a future level format
+    // ever embeds a guid, its walk branch goes here.
   }
 
   // Resolve font families → actual files.

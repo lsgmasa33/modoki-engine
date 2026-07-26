@@ -4,7 +4,7 @@
  *  the engine-path write guard on /api/write-file. No live renderer needed —
  *  these are pure filesystem handlers over real temp dirs. */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
@@ -139,5 +139,58 @@ describe('/api/write-file engine-path guard', () => {
     const r = (await post('/api/write-file', { path: abs, content: 'export function setup() { return 42; }\n' }, makeCtx())) as { body: { ok?: boolean } };
     expect(r.body.ok).toBe(true);
     expect(fs.readFileSync(path.join(projectRoot, 'runtime', 'setup.ts'), 'utf-8')).toContain('return 42');
+  });
+});
+
+describe('/api/write-file — atomic write (338b1446)', () => {
+  // Regression test: this endpoint used to write via a bare fs.writeFileSync,
+  // leaving a window where the Vite asset-scanner's chokidar watcher could rescan
+  // a torn/partial write mid-save — silently dropping a scene's guid from the
+  // asset manifest and breaking base-scene chain resolution right after a Save
+  // All. The fix writes to a `.tmp` sibling and renameSync's it into place, so a
+  // concurrent reader only ever sees the OLD complete file or the NEW complete
+  // file, never a partial one.
+  it('writes via tmp-file + rename, not a direct writeFileSync', async () => {
+    const target = path.join(projectRoot, 'runtime', 'setup.ts');
+    const writeFileSpy = vi.spyOn(fs, 'writeFileSync');
+    const renameSpy = vi.spyOn(fs, 'renameSync');
+
+    const abs = '/@fs/' + target;
+    const r = (await post('/api/write-file', { path: abs, content: 'export const x = 1;\n' }, makeCtx())) as { body: { ok?: boolean } };
+    expect(r.body.ok).toBe(true);
+
+    // The write lands on a `.tmp` path, never directly on the final target.
+    expect(writeFileSpy).toHaveBeenCalledWith(`${target}.tmp`, expect.anything());
+    expect(writeFileSpy.mock.calls.some(([p]) => p === target)).toBe(false);
+    // The tmp file is then renamed into place.
+    expect(renameSpy).toHaveBeenCalledWith(`${target}.tmp`, target);
+
+    // No leftover .tmp file, and the final content is correct.
+    expect(fs.existsSync(`${target}.tmp`)).toBe(false);
+    expect(fs.readFileSync(target, 'utf-8')).toBe('export const x = 1;\n');
+
+    writeFileSpy.mockRestore();
+    renameSpy.mockRestore();
+  });
+
+  it('a reader can never observe a partial file mid-write', async () => {
+    // Simulate a concurrent reader (the chokidar watcher) sampling the file
+    // DURING the write by hooking writeFileSync to snapshot the tmp file's
+    // sibling (the real target) at that exact moment.
+    const target = path.join(projectRoot, 'runtime', 'setup.ts');
+    const original = fs.readFileSync(target, 'utf-8'); // pre-write content
+    const realWriteFileSync = fs.writeFileSync.bind(fs);
+    const writeFileSpy = vi.spyOn(fs, 'writeFileSync').mockImplementation((p, data) => {
+      // At the instant the tmp file is written, the real target must still be
+      // exactly its old, complete content — never truncated/partial.
+      expect(fs.readFileSync(target, 'utf-8')).toBe(original);
+      return realWriteFileSync(p as string, data as Buffer);
+    });
+
+    const abs = '/@fs/' + target;
+    await post('/api/write-file', { path: abs, content: 'export function setup() { return 99; }\n' }, makeCtx());
+
+    expect(fs.readFileSync(target, 'utf-8')).toContain('return 99');
+    writeFileSpy.mockRestore();
   });
 });

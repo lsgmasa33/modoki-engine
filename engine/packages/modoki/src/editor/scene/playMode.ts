@@ -17,18 +17,33 @@
 import type { SceneData } from '../../runtime/loaders/loadSceneFile';
 import { getPlayState, setPlayState, getRunMode, setRunMode } from '../../runtime/systems/playState';
 import { sceneManager } from '../../runtime/scene/SceneManager';
-import { serializeScene, getCurrentScenePath, type SceneFile } from './serialize';
+import { serializeScene, getCurrentScenePath, type SceneFile, type SerializedEntity } from './serialize';
 import { undoDepth, truncateUndoTo } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { hasTimelinePreviewSession, endTimelinePreviewSession } from './timelinePreview';
 import { setVerboseCapture, isVerboseCaptureActive } from '../../runtime/systems/journal';
 import { fetchAiSettings, getCachedAiSettings } from '../panels/aiSettingsModel';
+import { findEntityByGuid } from '../../runtime/ecs/world';
+import { writeTraitField } from '../../runtime/ecs/entityUtils';
+import { getAllTraits } from '../../runtime/ecs/traitRegistry';
 
 /** In-memory authored snapshot captured at the moment Play was pressed, plus the
  *  scene path it belongs to (so a scene swap mid-play can't revert the wrong
  *  scene). */
 let _snapshot: SceneFile | null = null;
 let _snapshotPath: string | null = null;
+/** A5 (scene-loading.md, Phase 12): authored snapshots of every
+ *  BASE scene in the chain at the moment Play was pressed, keyed by scene guid. The
+ *  primary's own snapshot excludes base-origin entities entirely (Phase 6), and
+ *  SceneManager CARRIES a kept base across the Stop-revert reload rather than
+ *  re-loading its file — so without this, a base entity mutated during Play (a fish
+ *  that swam, a camera the game moved) silently keeps its play-mode value after Stop.
+ *  Harmless while base entities could never reach disk; now that Phase 12 makes them
+ *  writable, that drift is a real data-corruption path. Each snapshot's trait data is
+ *  ALREADY authored-only (`serializeScene` skips `runtimeOnly` fields when building
+ *  it), so Time.elapsed/frame are simply absent — replaying it back can never regress
+ *  Phase 7's verified "Time keeps climbing across Stop" gate. */
+let _baseSnapshots: Map<string, SceneFile> | null = null;
 /** Undo-stack depth captured at the Play press. On Stop we truncate back to this
  *  so during-Play editor edits (discarded by the revert) don't leave incoherent
  *  undo entries — while ALL pre-Play history is preserved (guid-resolved undo
@@ -53,6 +68,23 @@ export async function enterPlay(): Promise<void> {
   // the snapshot JSON, not the live world. Do not pass { assignGuids: true } here.
   _snapshot = await serializeScene();
   _snapshotPath = getCurrentScenePath();
+  // A5: snapshot every base in the chain too, so Stop can restore authored base
+  // state (see `_baseSnapshots`'s own doc comment). No-op cost when there is no
+  // base (the common case, and every project before this plan) — empty map.
+  _baseSnapshots = new Map();
+  for (const entry of sceneManager.getLoadedScenes().values()) {
+    if (entry.role !== 'base') continue;
+    // Defensive per-base catch: if a base fails to serialize, skip ITS A5 restore
+    // rather than block Play entirely (its authored state then just isn't restored
+    // on Stop). This used to fire routinely for a base containing a prefab instance
+    // — Phase 12's A8/A9 safety guard — which is now gone, both bugs being fixed;
+    // sling's Base.json snapshots normally. Kept for resilience, not for that guard.
+    try {
+      _baseSnapshots.set(entry.guid, await serializeScene({ scene: { path: entry.path, guid: entry.guid } }));
+    } catch (e) {
+      console.warn(`[Editor] A5 base snapshot skipped for "${entry.path}": ${(e as Error).message}`);
+    }
+  }
   // Mark the undo barrier at the real Play press (not the paused→playing resume
   // above) so Stop can drop only during-Play edits.
   _undoBarrier = undoDepth();
@@ -99,8 +131,10 @@ export async function stopPlay(): Promise<void> {
   editorEmit('!stop', {});
   const snap = _snapshot;
   const snapPath = _snapshotPath;
+  const baseSnaps = _baseSnapshots;
   _snapshot = null;
   _snapshotPath = null;
+  _baseSnapshots = null;
   if (!snap) return;
   // Guard: if the active scene changed since Play, the snapshot is for a
   // different scene — reverting it would clobber the current one. Skip.
@@ -112,8 +146,58 @@ export async function stopPlay(): Promise<void> {
   // their targets by stable guid (see entityRef.ts), so PRE-Play history survives
   // — we only truncate the during-Play edits the revert just discarded.
   await sceneManager.loadScene(path ?? '', { preloaded: snap as unknown as SceneData });
+  // A5: the reload above CARRIES a kept base rather than re-loading its file, so a
+  // base entity's play-mode drift (Transform, or any other authored field a game
+  // system wrote at runtime) is still sitting on the just-carried live entities.
+  // Replay each base's authored snapshot back onto them, by guid.
+  if (baseSnaps) for (const snapshot of baseSnaps.values()) restoreAuthoredEntities(snapshot.entities);
   truncateUndoTo(_undoBarrier);
   _undoBarrier = 0;
+}
+
+/** Write each snapshot entry's AUTHORED fields back onto the matching LIVE entity
+ *  (resolved by guid), skipping entities no longer present (a base's file/subtree
+ *  changed shape between Play and Stop — rare, and a missing entity is simply not
+ *  restored rather than an error). `entry.traits` already excludes `runtimeOnly`
+ *  fields (serializeScene's own filter) and EntityAttributes/PrefabInstance are
+ *  skipped here too — identity/hierarchy fields don't drift at runtime the way
+ *  gameplay-mutated fields (Transform, a binding-driven trait) do, and blindly
+ *  replaying a snapshot's `parentId`/`sortOrder` could undo a LEGITIMATE structural
+ *  edit made to the base while Play was running via the editor's own tools (not the
+ *  game) — out of scope for what A5 exists to fix.
+ *
+ *  A prefab-instance ROOT writes only `PrefabInstance` in `entry.traits` (Phase 6's
+ *  serialize convention) — its actual authored field values (Transform, a custom
+ *  trait like `Fish`) live in `entry.overrides[localId]`, keyed by the root's OWN
+ *  localId. Resolved from the LIVE entity's current PrefabInstance.localId (stable
+ *  across Play — reparenting/duplication during Play would be reverted structurally
+ *  by the primary's own snapshot revert, not by this pass). */
+function restoreAuthoredEntities(entries: SerializedEntity[]): void {
+  const allTraits = getAllTraits();
+  const piMeta = allTraits.find((m) => m.name === 'PrefabInstance');
+  for (const entry of entries) {
+    const guid = entry.guid || (entry.traits.EntityAttributes && entry.traits.EntityAttributes !== true
+      ? (entry.traits.EntityAttributes as Record<string, unknown>).guid as string | undefined
+      : undefined);
+    if (!guid) continue;
+    const liveEntity = findEntityByGuid(guid);
+    if (!liveEntity) continue;
+    const liveId = liveEntity.id();
+
+    let fieldsByTrait: Record<string, Record<string, unknown> | boolean> = entry.traits;
+    if (entry.prefab && entry.overrides && piMeta && liveEntity.has(piMeta.trait)) {
+      const localId = (liveEntity.get(piMeta.trait) as { localId?: number }).localId;
+      fieldsByTrait = (localId != null ? entry.overrides[localId] : undefined) ?? {};
+    }
+
+    for (const [traitName, fields] of Object.entries(fieldsByTrait)) {
+      if (traitName === 'EntityAttributes' || traitName === 'PrefabInstance') continue;
+      if (fields === true) continue; // a tag trait's presence doesn't drift at runtime
+      const meta = allTraits.find((m) => m.name === traitName);
+      if (!meta) continue;
+      for (const [field, value] of Object.entries(fields)) writeTraitField(liveId, meta, field, value);
+    }
+  }
 }
 
 // ── Editor preview/scrub run-mode transitions (preview-mode-refactor, Phase 1) ──
@@ -174,6 +258,7 @@ function closeAutoContactCapture(): void {
 export function resetPlayMode(): void {
   _snapshot = null;
   _snapshotPath = null;
+  _baseSnapshots = null;
   _undoBarrier = 0;
   _modeOwner = null;
   closeAutoContactCapture();

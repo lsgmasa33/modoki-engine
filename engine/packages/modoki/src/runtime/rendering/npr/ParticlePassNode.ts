@@ -73,6 +73,15 @@ export class ParticlePassNode extends PassNode {
     this.prepQuad = new QuadMesh(prep);
   }
 
+  /** PassNode.dispose() frees only `this.renderTarget` — it knows nothing about the
+   *  prefill quad's material, which owns a compiled program + the stylized-color
+   *  texture binding. The post-FX stack rebuilds on any stage-set change, so
+   *  leaking one NodeMaterial per rebuild adds up; free it alongside the base. */
+  dispose(): void {
+    (this.prepQuad.material as unknown as { dispose?(): void }).dispose?.();
+    super.dispose();
+  }
+
   updateBefore(frame: Parameters<PassNode['updateBefore']>[0]): ReturnType<PassNode['updateBefore']> {
     const renderer = (frame as unknown as { renderer: unknown }).renderer as RendererLike;
     const scene = this.scene as unknown as THREE.Scene;

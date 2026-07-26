@@ -22,7 +22,9 @@ koota `World` and exposes:
 Consumers must call `getCurrentWorld()` **inside** callbacks/functions, never
 capture it at module load — otherwise a swap wouldn't take effect for them.
 `runtime/ecs/world.ts` re-exports these and adds entity-index helpers
-(`registerEntity`, `findEntityById`, `unregisterEntity`).
+(`registerEntity`, `findEntityById`, `unregisterEntity`, `findEntityByGuid`,
+`guidOf`) — the guid lookup is load-bearing for resolving a guid-form `parentId` /
+`rootInstanceId` on load (see "Entity-id stability on disk" below).
 
 During a load, `SceneManager` builds a fresh staging world with koota's
 `createWorld()`, populates it in isolation (no system runs against it because
@@ -69,19 +71,25 @@ only drops to zero once no remaining scene owns it.
 
 ## Scene manifest format
 
-The current scene file version is **9** (`SceneFile.version`), stamped from
+The current scene file version is **12** (`SceneFile.version`), stamped from
 `SCENE_FORMAT_VERSION` in `runtime/version.ts`; the `SceneFile` interface is
 defined in `editor/scene/serialize.ts`:
 
 ```ts
 interface SceneFile {
   id: string;             // stable UUID, written once, survives renames/moves
-  version: number;        // stamped from SCENE_FORMAT_VERSION (currently 9)
-  createdAt: string;
+  version: number;        // stamped from SCENE_FORMAT_VERSION (currently 12)
+  createdAt: string;      // preserved across saves, not regenerated — see "Entity-id
+                           // stability on disk" below
+  baseScene?: string;     // v10+: guid of a base scene this scene extends — see
+                           // "Base scenes" below
   resources: ResourceRef[];
   entities: SerializedEntity[];
 }
 ```
+
+`SerializedEntity.id` is now optional and, since v12, never written — see "Entity-id
+stability on disk" below.
 
 A `ResourceRef` has `{ type, path, loader?, postprocessor? }` where `type` is one
 of `model | riggedModel | mesh | material | texture | prefab | font | environment | particle | animation`.
@@ -112,6 +120,284 @@ Migrations chain in `loadSceneFile.ts` and run before any entity spawns:
 - `migrateV8toV9` — rename renderable traits' per-renderer `isActive` → `isVisible`
   (splitting it from the entity on/off `EntityAttributes.isActive`), walking traits
   plus prefab override/added/nestedOverride subtrees
+- `migrateV9toV10` — no-op passthrough; adds the optional top-level `baseScene` ref
+  (base scenes, below) — older files simply have none
+- `migrateV10toV11` — no-op passthrough; changes HOW `PrefabInstance.rootInstanceId`
+  (and any future `FieldHint.entityId`-flagged field) is *written* — a GUID instead of
+  a raw ecs id — not the shape of the data (see "Entity-id stability on disk")
+- `migrateV11toV12` — no-op passthrough; `serializeScene` stops writing the per-entity
+  `id` field entirely. This is the terminal step — it stamps `data.version =
+  SCENE_FORMAT_VERSION`, so bumping the constant without chaining a new migration
+  can't silently mislabel a freshly-migrated file as under-versioned
+
+## Entity-id stability on disk
+
+The scene file carries **no live ecs id** at all, and a no-op Save All is a true no-op
+— getting there took the three v10–v12 migrations above.
+
+**The mental model.** `EntityAttributes.parentId` was already a **guid** on disk (only
+a legacy pre-guid file carries a numeric one). `PrefabInstance.rootInstanceId` was the
+last numeric on-disk entity reference, and it went to disk as the entity's **live ecs
+id** — a koota allocation slot, i.e. whatever the loader happened to hand that entity
+*this session*. Once both are guids, nothing on disk references the per-entity `id`
+field, so `serializeScene` stops writing it.
+
+Instead, **both independent parsers of the scene-file format** each backfill a
+synthesized id for their own single-call internal bookkeeping — the entity's array
+index, skipping any index already claimed by an explicit `id` elsewhere in the file
+(a genuinely mixed file — some entries id'd, some not — is unusual but not impossible,
+e.g. hand-edited or partially migrated):
+
+| Parser | Backfill | Used for |
+|---|---|---|
+| `runtime/loaders/loadSceneFile.ts` (`assignSyntheticEntityIds`) | called once right after the migration chain, before anything else reads `entry.id` | `idMap`, `spawnedByEntryId`, `onEntitySpawned`'s `oldId` |
+| `runtime/scene/sceneMutate.ts` (`assignSyntheticEntityIds` + `stripBackfilledEntityIds`) | called before `applyOps`, stripped again right before writing the file back | its internal entity graph, `EntityRef.id` lookups, `nextId()`'s minting |
+
+The shim is **duplicated, not shared** — `sceneMutate.ts` is deliberately standalone
+and dependency-free so it runs identically in Node and the browser. Neither
+synthesized id is ever persisted or compared across loads. `sceneMutate.ts`'s copy
+strips its backfilled ids again before writing — otherwise a single `setTrait` through
+`/api/scene-mutate` would silently reintroduce an `id` on **every** entity in an
+id-less file, the exact diff noise this whole mechanism exists to remove, just via a
+different write path than Save All. (An entity `addEntity` genuinely adds keeps its
+real id — it mints one via `nextId()` *after* the backfill ran, so it was never in the
+backfilled set.)
+
+The **carry snapshot is untouched** by any of this: it keeps setting real ecs ids,
+because `onEntitySpawned` hands `SceneManager` genuine old→new ecs-id pairs that the
+override-mark re-seed and the id remap below both depend on. The scene *file* and the
+carry *snapshot* are two different things that briefly wore the same `SceneData` type —
+the file's id churn existed entirely because it had borrowed the snapshot's
+representation.
+
+### `FieldHint.entityId` — the registry mechanism
+
+A trait field that holds a **live entity id** declares it in the trait registry
+(`runtime/ecs/traitRegistry.ts`):
+
+```ts
+entityId?: { onMissing: 'root' | 'stripTrait' };
+```
+
+Declared fields today (`engine/app/ecs/registerTraits.ts`):
+
+| Field | `onMissing` | Why |
+|---|---|---|
+| `EntityAttributes.parentId` | `'root'` (write the schema default, silent) | An orphan is a legitimate partial-load outcome; `sceneValidation` already warns at author time |
+| `PrefabInstance.rootInstanceId` | `'stripTrait'` + loud warn | Neither `0` nor a stale value is safe — both poison instance-membership lookups |
+
+Driven generically off the registry, on both sides:
+
+- **Write** — `serializeScene` maps every `entityId`-hinted field through `guidForId`
+  (`editor/scene/serialize.ts`), so a future such field is guid-ified automatically —
+  not a name-check on `rootInstanceId`.
+- **Read** — one registry-driven loop in `loadSceneFile.ts` replaced two hand-written
+  remap blocks. `resolveEntityIdField` is dual-mode: a **string** resolves via
+  `findEntityByGuid`, a **number** via the legacy/carry `idMap`. Every `entityId`-hinted
+  field is also **zeroed at spawn time** — spawning a guid string into a numeric koota
+  SoA field writes `NaN` before the remap pass can fix it.
+
+This closed a real bug class: `PrefabInstance.rootInstanceId` going stale across a
+respawn because nobody remembered to add it to a hand-maintained remap list (it now
+lives structurally in the registry instead). The guard against a *third* such field
+regressing the same way is opt-**out**, not opt-in:
+`engine/tests/editor/registerTraits.test.ts` walks every registered trait's koota
+schema for `/Id$/`-shaped numeric fields and fails unless the field is declared
+`entityId` or carries an explicit allowlist entry with a reason
+(`PrefabInstance.localId`/`parentLocalId` — prefab-LOCAL ids, not ecs ids, are the
+allowlisted case).
+
+> The **runtime** representation did not change: `parentId` and `rootInstanceId` stay
+> numeric ecs ids in the live world. Making them guids at runtime was analysed and
+> rejected — `transformPropagationSystem` rebuilds a `Map<number,number>` every frame,
+> guids are lazily minted, and duplicate guids would make the *hierarchy* ambiguous
+> rather than just lookups. This is a **disk-form change only**; translation stays at
+> the load seam.
+
+### Why it mattered, and the regression gate
+
+A scene saved after a base-scene **carry** (a level swap that keeps a shared base
+loaded — see "Base scenes" below) used to produce a completely different file than the
+same scene saved after a **cold** load — different ids throughout, different entity
+order, and a regenerated `createdAt` — with zero actual edits. Two further fixes closed
+that:
+
+- **`createdAt` is preserved** — captured from the raw parsed JSON into
+  `SceneManager`'s per-scene `loadedScenes` bookkeeping at load time and reused on
+  save; a fresh stamp only when there is none.
+- **Entity order for a carried scene now matches a cold load** — the carry snapshot's
+  respawn order used to be its subtree-descent (BFS) order;
+  `snapshotPersistentEntities` now sorts its entries by ecs id, which on a cold load
+  *is* file order. (Parent-before-child is not required: `loadSceneFile` spawns
+  everything in pass 1 and resolves `parentId` in pass 2.)
+
+The regression gate is `engine/packages/modoki/tests/editor/scenePathIndependence.test.ts`:
+with real `sceneManager.loadScene` + real `serializeScene`, a scene's serialized output
+— entities, `rootInstanceId`s and `createdAt` — must be **identical** whether it
+arrived via a cold chain load or a carried swap, for the base and the primary alike,
+and repeated cycles must be deterministic.
+
+> **"A no-op Save All produces an empty `git diff`" is a FALSE PASS** and must never be
+> used as the test on its own. `saveAll` only writes **dirty** scenes, so a clean base
+> is skipped entirely and the empty diff means *not written*. Assert the file was
+> actually written (mtime/hash), or — better — call `serializeScene` and compare the
+> RESULT, which needs no write at all.
+
+## Base scenes (nestable, cross-scene persistence)
+
+A scene may declare a **base scene** — `baseScene: "<guid>"` at the top level. The base
+loads **additively into the same world**, before the primary, and **survives a swap to
+another scene that shares it**. Shared rig and session state (Time, camera, lights,
+UI, physics config) is authored **once** in the base; a level file becomes only what is
+actually per-level.
+
+The problem it solves is concrete: sling's `Lvl-0001.json` and `Lvl-0002.json` were
+byte-identical except `FieldSource.level`/`.wave` — ~38 duplicated entities per file,
+and no state (not even `Time.elapsed`) carried across the swap. Base scenes dissolve
+that identity problem rather than papering over it: there is exactly one Time entity,
+defined in one file.
+
+> A koota world can **never** survive a swap — `SceneManager.loadScene` always builds a
+> fresh `createWorld()` and `destroy()`s the old one (koota caps at 16 worlds). So "the
+> base survives" is implemented as **snapshot-and-carry**: the kept scenes' entities are
+> serialized out of the dying world and respawned into the staging world, NOT re-read
+> from file. Re-reading would reset `Time.elapsed` to its authored value, defeating the
+> feature. This is the generalization of `snapshotPersistentEntities` (see
+> [Persistent entities](#persistent-entities) below) — the two mechanisms coexist: base
+> scene = "shared rig authored once", `Persistent` = "*this* entity survives a load".
+
+### Chain resolution
+
+`runtime/scene/sceneChain.ts` (`resolveSceneChain(startPath, fetchSceneMeta)`) walks
+`baseScene` refs upward and returns `{ chain, warnings }`:
+
+- **Nesting is allowed** (engine-base → game-base → level).
+- **A `visited` Set of scene guids** handles cycles *and* diamonds — two bases sharing
+  a base is a normal case once nesting exists, and loading it twice is the bug; a plain
+  depth counter doesn't cover that.
+- **Order is root-most base FIRST, primary LAST** — so a level's own entities win, and
+  "everything not from the primary is base-origin" reads correctly in the editor.
+- **A depth cap** (`MAX_CHAIN_DEPTH`, mirroring `NavigationManager.MAX_HISTORY`) is a
+  runaway backstop.
+- **Cycles, dangling refs and the cap all WARN and DEGRADE, never throw** — the walk
+  stops and returns whatever resolved.
+
+On each load `SceneManager` diffs the chains by scene guid: `kept = old ∩ new`
+(carried), `toLoad = new \ kept` (spawned from file, in chain order), `toDrop = old \
+new` (torn down, resources released per scene id) — the same set-intersection the
+resource refcount already does. **Unload is therefore declarative**:
+`loadScene(levelB)` already expresses it, and there is deliberately no
+`unloadScene()` — a targeted unload would destroy entities with no notification seam
+for games holding module-level entity refs, and it would break the atomic two-world
+swap.
+
+### Provenance — `EntityAttributes.sourceScene`
+
+Every entity a **base** scene spawns is stamped with that scene's guid in
+`EntityAttributes.sourceScene` (registered `{ type:'string', hidden:true,
+runtimeOnly:true }`). It rides through the world swap for free, unlike an id-keyed side
+map.
+
+> **LOAD-BEARING: empty `sourceScene` means "belongs to the primary scene", not
+> "belongs to nothing".** Otherwise every entity a human creates in the editor would
+> silently fail to save.
+
+Two consumers:
+
+- **Save filtering** — `serializeScene` excludes any entity (and its subtree) whose
+  `sourceScene` is "foreign" to the scene being saved, mirroring the existing
+  `Transient` exclusion. A level's file therefore never absorbs base rig, and a
+  non-chained scene's save is byte-identical to pre-base-scene behaviour.
+- **Editor grouping/ghosting** — `EntityInfo.sourceScene` (`runtime/ecs/entityUtils.ts`)
+  drives the Hierarchy's scene groups and the ghost styling.
+
+### Editor authoring surface
+
+- **Set the ref** — `editor/panels/assetViews/SceneAssetView.tsx`: select a scene in
+  Assets, set its base via an `AssetRefField` with an inline cycle warning. It writes
+  through `POST /api/scene-mutate`'s `setBaseScene` op (see "Scene-file mutation ops"
+  below), **not** the generic whole-file asset-write path — a scene file is also what
+  the live world serializes into, so a blind write from React state could race a
+  Play/Stop snapshot or an agent's concurrent mutate.
+- **Hierarchy scene groups** — `editor/panels/Hierarchy.tsx` (grouping helper in
+  `hierarchyFolders.ts`): base scenes render as collapsed-by-default "🔗 Base" header
+  rows above the primary content, with a dirty dot when that base has unsaved edits. A
+  scene with no base collapses to exactly one group, so a non-chained Hierarchy renders
+  exactly as before.
+- **Base entities are editable IN PLACE, not read-only.** The original design was
+  "ghost — fields disabled, edit by opening the base scene"; the owner reversed it, so
+  ghosting survives as a *visual* provenance marker plus an explicit Lock/Unlock
+  affordance in the Inspector. Edits are staged in the live world and routed to the
+  **base's own file** on save: `saveAll` walks `getLoadedScenes()` and writes every
+  dirty scene in the chain via `serializeScene({ scene })`. Cmd+S silently writes the
+  base too — owner-confirmed, with the dirty dot + per-file reporting as the
+  non-optional visibility half.
+- **Promote / demote** — drag a Hierarchy row across a scene-group boundary to move
+  which scene FILE authors an entity: `moveEntityToScene` /
+  `promoteEntityToScene` / `demoteEntityToScene` (`editor/undo/entityActions.ts`)
+  re-stamp the whole subtree's `sourceScene` as one staged undo action (files change on
+  the next save, not on the drop). `editor/scene/sceneMoveScan.ts` is the advisory
+  pre-flight: it scans sibling scenes for guid collisions and names every scene a
+  demote would strip the entity from. Guids are **preserved, never rekeyed** on a move
+  — `entityRef` trait fields address entities by guid across the chain, so a rekey
+  would silently break live refs. A demote that removes shared rig from sibling levels
+  is **allowed with a confirm**, not refused — that blast radius is the understood
+  semantic.
+
+### Two guards that keep this safe
+
+- **No cross-scene parenting.** A level entity parented under a base entity breaks save
+  provenance (filtering keys off an entity's OWN `sourceScene`, not its parent's) and
+  teardown. `reparentEntity` hard-rejects it — the one interactive path both
+  `modoki_reparent_entity` and the Hierarchy drag go through — and `SceneManager` warns
+  at load time after the staging world is fully populated. Promote/demote *changes*
+  `sourceScene`, so it satisfies the guard rather than relaxing it.
+- **Duplicate guids across the chain.** `filterDuplicateChainGuids`
+  (`SceneManager.ts`) drops a root (and its subtree) whose guid a chain scene already
+  spawned, warning loudly. Chain order means the **first scene to spawn a guid keeps
+  it**. This is a transitional safety net for bases extracted by copy-and-thin (sling's
+  two levels shared all 38 guids), not a statement about precedence.
+
+### Gotchas
+
+- **A carried prefab instance loses its EDITOR bookkeeping** (Apply-to-Prefab,
+  structural overrides) across a swap that keeps its base loaded — the carry flattens
+  the instance structure and never calls `instantiatePrefabIntoWorld`. Documented,
+  accepted; the **runtime trait data is unaffected**, and `SceneManager` warns so it is
+  never silent — but only at the moment a carry actually happens (a base already known
+  to contain a prefab instance shows up in that load's `keptBaseGuids`), not on every
+  fresh load. A base with a prefab instance loading for the first time, or reloading
+  fresh (not carried), is silent — the loss only occurs on the carry itself. (Authored
+  *override values* on carried instances DO survive — the mark set is captured off the
+  old world and re-seeded per entity through the old→new id map.)
+- **The Time/Input singleton fallback must run AFTER the carry respawn.** A level whose
+  Time lives in its base has no Time of its own, so a fallback running first spawns a
+  phantom fresh Time and the carried one lands on top of it — two Time entities, which
+  is a live bug (`getTime` is `queryFirst` while `timeSystem` is
+  `query().updateEach`, so every read gets an arbitrary winner and `setJournalTick`
+  fires twice a frame).
+- **Override marks are WORLD-scoped, not per-`loadSceneFile`-call.** A chain loads N
+  scene files into ONE staging world, so a per-call `clearAllOverrideMarks()` has the
+  primary wipe the marks the base just seeded — on *every* chain load, carry or not.
+  `loadSceneFile` takes `clearMarks` (default `true`, so every other caller is
+  unchanged); `SceneManager` clears once per staging world and passes `false` for its
+  chain and carry calls.
+- **Editing a base file on disk while a level is open** does not hot-reload by guid
+  alone (a base's guid doesn't change when its file does). `agentBridge` matches the
+  changed path against every `getLoadedScenes()` entry and reloads via
+  `loadScene(current, { forceReloadBases: [changedGuid] })`, which forces that base out
+  of `kept` into toDrop+toLoad so it re-fetches instead of being carried.
+- **Play → Stop restores authored base state by guid**, skipping `runtimeOnly` fields —
+  so `Time.elapsed` keeps its carried value while a drifted `Transform` reverts.
+  Without this, Play → Stop → Cmd+S would bake play-mode drift into shared rig. This is
+  also why dirt is recorded from **authored edits** (`editor/scene/sceneDirty.ts`) and
+  never inferred by diffing the world against the file.
+
+**Key files:** `runtime/scene/sceneChain.ts` (`resolveSceneChain`) ·
+`runtime/scene/SceneManager.ts` (chain load, carry, `loadedScenes`) ·
+`editor/scene/serialize.ts` (`serializeScene({ scene })`, multi-scene `saveAll`) ·
+`editor/scene/sceneDirty.ts` · `editor/panels/assetViews/SceneAssetView.tsx` ·
+`editor/panels/Hierarchy.tsx` · `editor/scene/sceneMoveScan.ts`.
 
 ## SceneManager API
 
@@ -122,31 +408,48 @@ call is:
 await sceneManager.loadScene(path, {
   onProgress?: (loaded, total) => void,
   signal?: AbortSignal,
+  preloaded?: SceneData,           // caller-supplied data instead of a fetch
+  gameId?: string,                 // explicit game switch (see managers-and-systems.md)
+  forceReloadBases?: string[],     // guids to pull OUT of `kept` even though they'd
+                                    // otherwise carry — the base-file hot-reload primitive
 });
 ```
 
-`loadScene` flow:
+`loadScene` flow — a scene may declare `baseScene`, so this is a **chain** load, not a
+single-scene one (see [Base scenes](#base-scenes-nestable-cross-scene-persistence)):
 
 1. **Cancel in-flight load** — aborts the previous preload and releases its
    acquired resources (cancel-and-replace; only one preload runs at a time).
-2. **Allocate** a fresh `SceneId` + `AbortController`.
-3. **Fetch + migrate** the scene JSON.
-4. **Acquire all resources in parallel** (`Promise.all`), iteratively expanding
-   nested prefab resources first.
-5. **Spawn entities** into the staging world via `loadSceneFile` (dormant — no
-   active system touches them).
-6. **`beforeSwapHooks`** run (`registerBeforeSwap`) — e.g. renderer shader
+2. **Resolve the chain** (`resolveSceneChain`) and diff it against the currently loaded
+   chain: `kept` (carried), `toLoad` (spawned from file), `toDrop` (torn down).
+3. **Allocate** a fresh `SceneId` per `toLoad` entry + one `AbortController`.
+4. **Fetch + migrate** each `toLoad` scene's JSON.
+5. **Acquire all resources in parallel** (`Promise.all`) for every `toLoad` scene,
+   iteratively expanding nested prefab resources first.
+6. **Carry** — snapshot every kept-base and `Persistent`-tagged entity out of the dying
+   world (`snapshotPersistentEntities`), THEN **spawn** every `toLoad` scene (root-most
+   base first, primary last) plus the carried snapshot into the staging world via
+   `loadSceneFile` (dormant — no active system touches them). The Time/Input singleton
+   fallback runs last, after the carry — see the base-scenes gotchas.
+7. **`beforeSwapHooks`** run (`registerBeforeSwap`) — e.g. renderer shader
    pre-warm via `compileAsync` to kill the first-frame stutter. Failures are
    logged and swallowed.
-7. **Atomic swap** — `setCurrentWorld(staging)` fires `onWorldSwap`; then
-   `releaseAllForScene(oldSceneId)` drops the old scene's refcounts; then
+8. **Rebuild `loadedScenes`**, THEN **atomic swap** — `setCurrentWorld(staging)` fires
+   `onWorldSwap`, which editor panels read `loadedScenes` from, so the rebuild must
+   happen first or a base's Hierarchy label falls back to its raw guid. Then
+   `releaseAllForScene(id)` for every `toDrop` scene id drops its refcounts; then
    `oldWorld.destroy()` frees the koota slot.
-8. **Scene callbacks** (`registerSceneCallback`) fire for dynamic spawning.
+9. **Scene callbacks** (`registerSceneCallback`) fire for dynamic spawning.
 
-Conceptually each scene moves through the states `loading → ready → active →
-unloading` (`getCurrent()` reports the active scene, `getNext()` the preloading
-one). On **failure or abort**, the staging world is destroyed and its resources
-released — the current scene is left completely untouched.
+On **failure or abort**, the staging world is destroyed and its resources released —
+the current scene (and its whole chain) is left completely untouched.
+
+**Reads:** `getCurrent()` returns the **primary** (unchanged signature —
+`NavigationManager`'s back-stack depends on it). `getLoadedScenes()` returns
+`Map<SceneId, { path, guid, role: 'primary' | 'base', baseScene?, createdAt? }>` — every
+scene currently in the chain, primary included. **Mutation is exactly one entry point**:
+`loadScene(path)` = "make this primary, resolve its chain, diff". There is deliberately
+no `unloadScene()` — see [Base scenes](#base-scenes-nestable-cross-scene-persistence).
 
 The editor wrapper `loadScene()` in `editor/scene/serialize.ts` delegates to
 `sceneManager.loadScene`, then tracks the scene path and swaps to **this
@@ -171,14 +474,24 @@ Because koota entity handles encode their owning world, a persistent entity
 staging world. `SceneManager`:
 
 1. Snapshots persistent root subtrees from the current world
-   (`snapshotPersistentEntities`).
+   (`snapshotPersistentEntities`) — this is also the mechanism
+   [base scenes](#base-scenes-nestable-cross-scene-persistence) generalize: the same
+   function additionally snapshots any root whose `sourceScene` is a KEPT base guid, so
+   one snapshot call covers `Persistent` entities and a carried base's entities
+   together. Entries come back sorted by ecs id (not snapshot/insertion order) so a
+   carried scene's later save matches what a cold load would have produced.
 2. Acquires the resources those snapshots reference under the new `sceneId`, so
    they survive the post-swap release even if the new scene doesn't list them.
 3. Drops any scene-file root whose `EntityAttributes.guid` matches a persistent
    guid (`filterPersistentDuplicates`) — the live persistent entity shadows the
    file copy, preventing duplicates.
 4. Respawns the snapshots into the staging world (tagged `version:
-   SCENE_FORMAT_VERSION`, currently 9, so migrations don't needlessly re-run).
+   SCENE_FORMAT_VERSION`, currently 12, so migrations don't needlessly re-run).
+
+Each snapshotted field is the union of the trait's koota `.schema` keys and its
+registered `meta.fields` keys (not `meta.fields` alone, which is a curated Inspector
+subset) — otherwise a field absent from the Inspector's curated set (e.g.
+`Time.timeScale`) would silently reset to its schema default across every swap.
 
 > Persistent entities must be **ECS-pure** — trait data only. Anything held in a
 > closure, an in-flight tween, or a Web Audio node is lost on swap, since that
@@ -260,20 +573,25 @@ hot-reload reflect the change. GUID minting is injected (`mint`, defaults to
 identically in Node and the browser. It **mutates `scene` in place and also
 returns it** inside `ApplyResult { scene, changed, errors, warnings }`.
 
-Four ops, all resolving an existing entity by `EntityRef` (`id` | `name` |
+Five ops. The first four resolve an existing entity by `EntityRef` (`id` | `name` |
 `guid`, at least one; an ambiguous `name` match is an error — disambiguate with
-`id`/`guid`):
+`id`/`guid`). `EntityRef.id` and `addEntity`'s minted id are the module's OWN internal
+numeric addressing, synthesized on parse for a file that carries none (see "Entity-id
+stability on disk" above) — they never round-trip to disk as-is.
 
 - **`setTrait`** — merges `fields` into the trait (spread over any existing
   data); no `fields` = tag presence. Re-tagging or a no-op merge does **not**
   count as `changed`.
 - **`removeTrait`** — refuses the core traits `Transform` / `EntityAttributes`;
   removing an absent trait is a silent no-op, not an error.
-- **`addEntity`** — allocates the next free numeric id and ensures
-  `EntityAttributes` carries a stable `guid` + `name` + `parentId` so the entity
-  round-trips through load/save + selection-restore.
+- **`addEntity`** — allocates the next free numeric id (real, not synthesized — it
+  persists) and ensures `EntityAttributes` carries a stable `guid` + `name` +
+  `parentId` so the entity round-trips through load/save + selection-restore.
 - **`removeEntity`** — deletes the entity plus its whole subtree (children found
   by `parentId`, GUID or legacy numeric).
+- **`setBaseScene`** — sets or clears a scene's top-level `baseScene` ref (see
+  [Base scenes](#base-scenes-nestable-cross-scene-persistence)); what
+  `SceneAssetView`'s Inspector field writes through.
 
 `errors` are **hard** (entity not found, malformed op) — those ops are skipped;
 the caller decides whether to still write (the `/api/scene-mutate` endpoint only

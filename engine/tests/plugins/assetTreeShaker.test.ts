@@ -340,6 +340,64 @@ describe('asset-tree-shaker', () => {
     expect(result.kept).not.toContain('/games/test/assets/prefabs/unused.prefab.json');
   });
 
+  // ── Generic GUID sweep (2026-07-26) — game-defined traits with no REF_FIELDS_BY_TRAIT
+  //    entry. Sling's `FieldSource` (level/wave/enemyPrefab, all asset guids) is a GAME trait
+  //    that can't register into the engine's registry without violating the game-portability
+  //    rule, so its refs were invisible to the tree-shaker until the sweep below was added. ──
+
+  it('keeps an asset referenced by an UNREGISTERED trait — the sling FieldSource bug, generically', () => {
+    const levelGuid = 'c0ffee00-0000-4000-8000-000000000001';
+    fx.writeJson('/games/test/assets/levels/0001.level.json', { id: levelGuid, cols: 1, rows: 1 });
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6, resources: [],
+      // FieldSource is NOT in REF_FIELDS_BY_TRAIT — a plain game trait.
+      entities: [{ traits: { FieldSource: { level: levelGuid, wave: '', enemyPrefab: '' } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/games/test/assets/levels/0001.level.json');
+  });
+
+  it('follows an unregistered-trait ref TRANSITIVELY (prefab -> mesh -> material -> texture)', () => {
+    const prefabGuid = 'c0ffee00-0000-4000-8000-000000000002';
+    fx.writeVirtual('/games/test/assets/tex/enemy.png', 'fake-png');
+    fx.writeJson('/games/test/assets/mats/enemy.mat.json', { texture: '/games/test/assets/tex/enemy.png' });
+    fx.writeJson('/games/test/assets/meshes/enemy.mesh.json', { material: '/games/test/assets/mats/enemy.mat.json' });
+    fx.writeJson('/games/test/assets/prefabs/enemy.prefab.json', {
+      id: prefabGuid,
+      entities: [{ traits: { Renderable3D: { mesh: '/games/test/assets/meshes/enemy.mesh.json' } } }],
+    });
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6, resources: [],
+      entities: [{ traits: { FieldSource: { level: '', wave: '', enemyPrefab: prefabGuid } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/games/test/assets/prefabs/enemy.prefab.json');
+    expect(result.kept).toContain('/games/test/assets/meshes/enemy.mesh.json');
+    expect(result.kept).toContain('/games/test/assets/mats/enemy.mat.json');
+    expect(result.kept).toContain('/games/test/assets/tex/enemy.png');
+  });
+
+  it('does NOT keep or warn on a well-formed guid that is NOT an asset (an entity reference)', () => {
+    // The sweep must stay silent on a miss: an entity-ref field is ALSO a guid-shaped string,
+    // and it is never in the asset index. If the sweep routed misses through pushRef's warning
+    // path, every ordinary entity reference would flood the build log with false
+    // "unresolved GUID ref" noise. Regression pin for that trap.
+    const entityRefGuid = 'deadbeef-0000-4000-8000-000000000099'; // not backed by any asset file
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6, resources: [],
+      entities: [{ traits: { SomeGameTrait: { targetEntity: entityRefGuid } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect([...result.kept].some((p) => p.includes(entityRefGuid))).toBe(false);
+    expect(result.warnings).toEqual([]);
+  });
+
   // ── Drift guards: keep the tree-shaker's knowledge in lock-step with the two
   //    registries it derives from, so a new asset type / ref field can't ship in
   //    dev but get shaken out of prod (the Animator.clip class of bug). ──

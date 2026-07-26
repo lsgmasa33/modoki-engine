@@ -2,11 +2,11 @@
  *  Wraps runtime entityUtils with undo/redo tracking. */
 
 import * as THREE from 'three';
-import { getCurrentWorld, registerEntity } from '../../runtime/ecs/world';
+import { getCurrentWorld, registerEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/ecs/world';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/ecs/traitRegistry';
 import {
   findEntity, readTraitData, readTraitDataFull, writeTraitField,
-  getAllEntities, deleteEntity, markStructureDirty, cloneTraitValues,
+  getAllEntities, deleteEntity, markStructureDirty, cloneTraitValues, subtreeIds,
 } from '../../runtime/ecs/entityUtils';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid } from '../../runtime/loaders/assetManifest';
@@ -15,6 +15,7 @@ import { worldTransforms } from '../../three/systems/transformPropagationSystem'
 import { pushAction, type EditDetail } from './undoManager';
 import { entityRef, ensureGuid, buildGuidIndex, resolveWith, type EntityRef } from './entityRef';
 import { notifyFieldEdited } from '../animation/recording';
+import { resolveAffectedScenes, markSceneDirty } from '../scene/sceneDirty';
 
 /** Record a deliberate per-instance override when the user edits a field on a
  *  prefab-instance member, so the change survives serialize even if the prefab
@@ -48,6 +49,10 @@ export function writeTraitFieldWithUndo(entityId: number, meta: TraitMeta, field
     const data = readTraitDataFull(entityId, meta);
     oldValue = data ? data[field] : undefined;
   }
+  // Resolve BEFORE the write — a field edit never changes sourceScene, but this is
+  // the uniform "resolve before mutation" convention (Phase 12, M2) every affected-
+  // scene call in this file follows.
+  const affectedScenes = resolveAffectedScenes([entityId]);
   writeTraitField(entityId, meta, field, value);
   markFieldOverrideIfInstance(entityId, meta, field);
   // Capture a guid-based ref so undo/redo survive a world rebuild (Play→Stop).
@@ -58,6 +63,7 @@ export function writeTraitFieldWithUndo(entityId: number, meta: TraitMeta, field
     redo: () => { const id = ref.resolve(); if (id == null) return; writeTraitField(id, meta, field, value); markFieldOverrideIfInstance(id, meta, field); },
     coalesceKey: fieldCoalesceKey(meta, field, [entityId]),
     detail: editDetail([ref], meta, field, [oldValue], [value]),
+    affectedScenes,
   });
   // Animation record mode: key this field at the playhead (no-op unless recording).
   notifyFieldEdited(entityId, meta.name, field, value);
@@ -78,6 +84,7 @@ export function writeTraitFieldMultiWithUndo(entityIds: number[], meta: TraitMet
     const data = readTraitDataFull(id, meta); // off-meta fields (see writeTraitFieldWithUndo)
     return data ? data[field] : undefined;
   });
+  const affectedScenes = resolveAffectedScenes(entityIds);
   entityIds.forEach((id) => { writeTraitField(id, meta, field, value); markFieldOverrideIfInstance(id, meta, field); });
   // Guid refs (positionally aligned with oldValues) so undo/redo survive a rebuild.
   const refs = entityIds.map((id) => entityRef(id));
@@ -88,6 +95,7 @@ export function writeTraitFieldMultiWithUndo(entityIds: number[], meta: TraitMet
     redo: () => { const idx = buildGuidIndex(); refs.forEach((r) => { const id = resolveWith(r, idx); if (id != null) { writeTraitField(id, meta, field, value); markFieldOverrideIfInstance(id, meta, field); } }); },
     coalesceKey: fieldCoalesceKey(meta, field, entityIds),
     detail: editDetail(refs, meta, field, oldValues, refs.map(() => value)),
+    affectedScenes,
   });
   // Animation record mode: key each edited entity's field at the playhead.
   entityIds.forEach((id) => notifyFieldEdited(id, meta.name, field, value));
@@ -115,6 +123,7 @@ export function writeTraitFieldPerEntityWithUndo(
     return { id, ref: entityRef(id), oldValue, newValue: compute(oldValue, id) };
   }).filter((e) => !Object.is(e.oldValue, e.newValue));
   if (entries.length === 0) return;
+  const affectedScenes = resolveAffectedScenes(entries.map((e) => e.id));
   // Resolve by guid each invocation (incl. the immediate apply) so redo survives a rebuild.
   const applyAll = () => {
     const idx = buildGuidIndex();
@@ -128,6 +137,7 @@ export function writeTraitFieldPerEntityWithUndo(
     redo: applyAll,
     coalesceKey: fieldCoalesceKey(meta, field, entityIds),
     detail: editDetail(entries.map((e) => e.ref), meta, field, entries.map((e) => e.oldValue), entries.map((e) => e.newValue)),
+    affectedScenes,
   });
   entries.forEach(({ id, newValue }) => notifyFieldEdited(id, meta.name, field, newValue));
 }
@@ -156,6 +166,7 @@ export function writeTraitFieldsPerEntityWithUndo(
     return { id, ref: entityRef(id), oldValues, patch };
   }).filter((e) => Object.keys(e.patch).length > 0);
   if (entries.length === 0) return;
+  const affectedScenes = resolveAffectedScenes(entries.map((e) => e.id));
   const writeMany = (id: number, values: Record<string, unknown>) => {
     for (const [field, value] of Object.entries(values)) { writeTraitField(id, meta, field, value); markFieldOverrideIfInstance(id, meta, field); }
   };
@@ -169,6 +180,7 @@ export function writeTraitFieldsPerEntityWithUndo(
     label: `${label}${suffix}`,
     undo: () => { const idx = buildGuidIndex(); entries.forEach(({ ref, oldValues }) => { const id = resolveWith(ref, idx); if (id != null) writeMany(id, oldValues); }); },
     redo: applyAll,
+    affectedScenes,
   });
   entries.forEach(({ id, patch }) => { for (const [field, value] of Object.entries(patch)) notifyFieldEdited(id, meta.name, field, value); });
 }
@@ -204,6 +216,7 @@ export function addTraitToEntitiesWithUndo(
     return !!e && !e.has(meta.trait);
   });
   if (targets.length === 0) return;
+  const affectedScenes = resolveAffectedScenes(targets);
   const initial = values ? filterToTraitSchema(meta, values) : undefined;
   const refs = targets.map((id) => entityRef(id));
   const apply = () => {
@@ -226,6 +239,7 @@ export function addTraitToEntitiesWithUndo(
     label: `${label}${targets.length > 1 ? ` (${targets.length})` : ''}`,
     undo: revert,
     redo: apply,
+    affectedScenes,
   });
   // Prefilled fields are real field edits: tell the animation recorder, exactly as the
   // trait-field writers do. Without this an armed Auto-Key misses a pasted component's
@@ -247,6 +261,7 @@ export function removeTraitFromEntitiesWithUndo(entityIds: number[], meta: Trait
     if (e && e.has(meta.trait)) targets.push({ ref: entityRef(id), data: readTraitData(id, meta) });
   }
   if (targets.length === 0) return;
+  const affectedScenes = resolveAffectedScenes(entityIds);
   const apply = () => {
     const idx = buildGuidIndex();
     targets.forEach((t) => { const id = resolveWith(t.ref, idx); if (id != null) findEntity(id)?.remove(meta.trait); });
@@ -262,6 +277,7 @@ export function removeTraitFromEntitiesWithUndo(entityIds: number[], meta: Trait
     label: `Remove ${meta.name}${targets.length > 1 ? ` (${targets.length})` : ''}`,
     undo: revert,
     redo: apply,
+    affectedScenes,
   });
 }
 
@@ -298,7 +314,7 @@ export function pasteTraitAsNewWithUndo(entityIds: number[], meta: TraitMeta, va
 
 // ── Action callback (for backward compat during migration) ──
 
-type ActionCallback = (action: { label: string; undo: () => void; redo: () => void; coalesceKey?: string; detail?: EditDetail; kind?: string; journalPayload?: Record<string, unknown> }) => void;
+type ActionCallback = (action: { label: string; undo: () => void; redo: () => void; coalesceKey?: string; detail?: EditDetail; kind?: string; journalPayload?: Record<string, unknown>; affectedScenes?: string[] }) => void;
 
 /** GUID for a parent id in a structural journal payload: 'root' for 0, else the
  *  entity's stable guid (stringified raw id only for an un-guidable entity). */
@@ -488,6 +504,10 @@ export function createEntityWithUndo(
   const snap = snapshotEntity(currentId);
   const guid = rootGuidOf(snap!);
   const parentRef = parentId ? entityRef(parentId) : null;
+  // A freshly-created entity has no sourceScene stamp (schema default '') — it is
+  // always primary-owned; a base-origin create doesn't exist yet (Phase 14's promote
+  // is the only way an entity ever becomes base-owned).
+  const affectedScenes = resolveAffectedScenes([currentId]);
   selectEntity(currentId);
   _pushAction({
     label,
@@ -495,6 +515,7 @@ export function createEntityWithUndo(
     redo: () => { if (snap) { currentId = respawnFromSnapshot(snap, parentRef?.resolve() ?? 0); selectEntity(currentId); } },
     kind: '!create',
     journalPayload: { entity: guid || String(currentId), parent: parentGuid(parentId) },
+    affectedScenes,
   });
   return currentId;
 }
@@ -550,6 +571,7 @@ export function createEntitySubtreeWithUndo(
   const snap = snapshotEntity(currentId);
   const guid = rootGuidOf(snap!);
   const parentRef = parentId ? entityRef(parentId) : null;
+  const affectedScenes = resolveAffectedScenes([currentId]);
   selectEntity(currentId);
   _pushAction({
     label,
@@ -557,6 +579,7 @@ export function createEntitySubtreeWithUndo(
     redo: () => { if (snap) { currentId = respawnFromSnapshot(snap, parentRef?.resolve() ?? 0); selectEntity(currentId); } },
     kind: '!create',
     journalPayload: { entity: guid || String(currentId), parent: parentGuid(parentId) },
+    affectedScenes,
   });
   return currentId;
 }
@@ -615,6 +638,9 @@ export function duplicateEntity(
     return id;
   };
   let currentId = spawnCopy(parentId);
+  // Resolved from the COPY, after spawn — its sourceScene mirrors the source's
+  // (respawnFromSnapshot copies EntityAttributes verbatim, sourceScene included).
+  const affectedScenes = resolveAffectedScenes([currentId]);
   selectEntity(currentId);
   _pushAction({
     label: 'Duplicate Entity',
@@ -627,6 +653,7 @@ export function duplicateEntity(
     // Source guid from the attrData already read above — do NOT entityRef(entityId) here:
     // that mints+writes a guid to the SOURCE, dirtying authored data purely to log it.
     journalPayload: { entity: guid || String(currentId), source: ((attrData?.guid as string) || String(entityId)), parent: parentGuid(parentId) },
+    affectedScenes,
   });
   return currentId;
 }
@@ -678,6 +705,9 @@ export function deleteEntitiesWithUndo(
   }
   if (snaps.length === 0) return;
 
+  // Resolve BEFORE deleting — the entities are about to be destroyed, and undo/redo
+  // share this same set (they act on the same subtree either way).
+  const affectedScenes = resolveAffectedScenes(snaps.map(s => s.snapshot.id));
   snaps.forEach(s => deleteEntity(s.snapshot.id));
   setSelection?.([]);
 
@@ -695,6 +725,7 @@ export function deleteEntitiesWithUndo(
     },
     kind: '!delete',
     journalPayload: { entities: snaps.map(s => s.guid || String(s.snapshot.id)) },
+    affectedScenes,
   });
 }
 
@@ -712,6 +743,8 @@ export function deleteEntityWithUndo(entityId: number): void {
   })();
   const guid = rootGuidOf(snapshot);
   const parentRef = originalParentId ? entityRef(originalParentId) : null;
+  // Resolve BEFORE deleting — same reasoning as deleteEntitiesWithUndo above.
+  const affectedScenes = resolveAffectedScenes([entityId]);
   deleteEntity(entityId);
   _pushAction({
     label: 'Delete Entity',
@@ -721,6 +754,7 @@ export function deleteEntityWithUndo(entityId: number): void {
     redo: () => { const id = findByRootGuid(guid); if (id != null) deleteEntity(id); },
     kind: '!delete',
     journalPayload: { entities: [guid || String(entityId)] },
+    affectedScenes,
   });
 }
 
@@ -781,6 +815,24 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   const parentChanged = oldParentId !== newParentId;
   const orderChanged = newSortOrder !== undefined && newSortOrder !== oldSortOrder;
   if (!parentChanged && !orderChanged) return false;
+
+  // Base-scene persistence guard (Phase 6): refuse a reparent that would put an
+  // entity under a parent from a DIFFERENT source scene. Cross-scene parenting
+  // breaks save provenance (a foreign child silently vanishes from either
+  // scene's save) and teardown (a scene-scoped subtree walk expects to stay
+  // within one scene) — see scene-loading.md Phase 6.
+  if (parentChanged && newParentId !== 0) {
+    const newParentAttr = readTraitData(newParentId, attrMeta);
+    const entitySource = (oldAttr.sourceScene as string) || '';
+    const parentSource = (newParentAttr?.sourceScene as string) || '';
+    if (entitySource !== parentSource) {
+      console.warn(
+        `[reparentEntity] refused: cross-scene parenting (entity sourceScene="${entitySource || 'primary'}", ` +
+        `new parent sourceScene="${parentSource || 'primary'}") — scene-loading.md Phase 6 guard.`,
+      );
+      return false;
+    }
+  }
 
   // Maintenance rule: editorFolder (the Hierarchy grouping tag) is only valid on
   // ROOTS. When an entity gains a parent it stops being a root, so drop its folder
@@ -871,6 +923,10 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   const ref = entityRef(entityId);
   const oldParentRef = oldParentId ? entityRef(oldParentId) : null;
   const newParentRef = savedNewParentId ? entityRef(savedNewParentId) : null;
+  // The cross-scene-parenting guard above already refuses any reparent that would
+  // change the entity's effective scene, so its sourceScene is the SAME before and
+  // after — one scene, resolved once, post-mutation is fine.
+  const affectedScenes = resolveAffectedScenes([entityId]);
 
   _pushAction({
     label,
@@ -896,7 +952,322 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
     // `from`/`to` are parent guids ('root' for scene root); equal when this is a pure
     // reorder (sortOrder change under the same parent).
     journalPayload: { entity: ref.guid || String(entityId), from: parentGuid(oldParentId), to: parentGuid(savedNewParentId), reorder: !parentChanged },
+    affectedScenes,
   });
 
   return true;
+}
+
+// ── Move between scenes (scene-loading.md Phase 14) ──
+
+/** One entityRef-shaped field rewritten by a guid rekey — informational (which
+ *  field on which entity changed); `rewriteEntityRefsForGuid` is symmetric under
+ *  swapping its two arguments, so undo/redo just call it again in the opposite
+ *  direction rather than replaying this list — see `moveEntityToScene`'s rekey
+ *  handling below. */
+interface RefRewrite { ref: EntityRef; traitName: string; field: string; prev: unknown }
+
+/** Every registry-declared `{meta, field}` pair whose FieldHint is `type:
+ *  'entityRef'` — swept off the trait registry so a newly-registered entityRef
+ *  field is covered automatically, with no hardcoded field list to keep in sync.
+ *  Deliberately does NOT include UIAction.bindings (`type: 'bindings'`, an AoS
+ *  array of `{target, ...}` rows) — that field is special-cased in
+ *  `rewriteEntityRefsForGuid` because a generic per-field sweep can't see inside
+ *  an array-of-objects. */
+function entityRefFields(): { meta: TraitMeta; field: string }[] {
+  const out: { meta: TraitMeta; field: string }[] = [];
+  for (const meta of getAllTraits()) {
+    for (const [field, hint] of Object.entries(meta.fields)) {
+      if (hint.type === 'entityRef') out.push({ meta, field });
+    }
+  }
+  return out;
+}
+
+/** Rewrite every LIVE reference to `oldGuid` → `newGuid`, across every entity in
+ *  the current world (i.e. the whole loaded scene chain — both the source and
+ *  target scene are in the same world once additively loaded). Covers every
+ *  registry `entityRef` field plus `UIAction.bindings[].target` (§0.4 — a
+ *  `bindings` field is an AoS array, not swept by `entityRefFields`). Returns the
+ *  rewrites performed so the caller can fold them into ONE undo action.
+ *
+ *  Does NOT touch `EntityAttributes.parentId` — that is a live numeric ecs id at
+ *  runtime (D1), not a guid; only its SERIALIZED form is a guid, re-derived by
+ *  the serializer from the live parent, so renaming the parent's guid needs no
+ *  rewrite here.
+ *
+ *  A ref living in a SIBLING scene file that is not currently loaded cannot be
+ *  reached or rewritten by this function — surface that risk to the user via
+ *  `preflightSceneMove` (sceneMoveScan.ts) before rekeying, not here. */
+function rewriteEntityRefsForGuid(oldGuid: string, newGuid: string): RefRewrite[] {
+  if (!oldGuid || oldGuid === newGuid) return [];
+  const rewrites: RefRewrite[] = [];
+  const refFields = entityRefFields();
+  const bindingsMeta = getTraitByName('UIAction');
+  for (const info of getAllEntities()) {
+    for (const { meta, field } of refFields) {
+      const entity = findEntity(info.id);
+      if (!entity || !entity.has(meta.trait)) continue;
+      const data = readTraitData(info.id, meta);
+      if (!data || data[field] !== oldGuid) continue;
+      rewrites.push({ ref: entityRef(info.id), traitName: meta.name, field, prev: oldGuid });
+      writeTraitField(info.id, meta, field, newGuid);
+    }
+    if (bindingsMeta) {
+      const entity = findEntity(info.id);
+      if (!entity || !entity.has(bindingsMeta.trait)) continue;
+      const full = readTraitDataFull(info.id, bindingsMeta);
+      const bindings = full?.bindings as Array<Record<string, unknown>> | undefined;
+      if (!Array.isArray(bindings) || bindings.length === 0) continue;
+      let changed = false;
+      const next = bindings.map((b) => {
+        if (b.target !== oldGuid) return b;
+        changed = true;
+        return { ...b, target: newGuid };
+      });
+      if (changed) {
+        rewrites.push({ ref: entityRef(info.id), traitName: 'UIAction', field: 'bindings', prev: bindings });
+        writeTraitField(info.id, bindingsMeta, 'bindings', next);
+      }
+    }
+  }
+  return rewrites;
+}
+
+export interface SceneMoveResult {
+  ok: boolean;
+  reason?: 'no-entity' | 'no-attrs' | 'same-scene' | 'trait-missing';
+  /** Live ids of every entity re-stamped (the subtree, root first). */
+  movedIds: number[];
+  /** True when the root's parentId was cleared (landed at the target scene's
+   *  root) rather than reparented under an explicit `opts.newParentId`. */
+  reRooted: boolean;
+  /** Guid rekeys performed (empty unless `opts.rekeyGuids` was supplied). */
+  rekeyed: { oldGuid: string; newGuid: string }[];
+}
+
+export interface SceneMoveOptions {
+  /** Reparent the moved root directly under this entity in the TARGET scene —
+   *  the cross-scene-group ROW-drop gesture (owner decision: a row drop takes
+   *  only the dragged subtree, reparented under the drop target; the old parent
+   *  is left behind untouched). Only honoured when this entity's OWN sourceScene
+   *  already equals `targetScene` — otherwise it would recreate the cross-scene-
+   *  parented state Phase 6's guard exists to prevent, so the move silently
+   *  falls back to landing at the target scene's root (same as a group-header
+   *  drop). */
+  newParentId?: number;
+  /** Guids in the subtree to rekey (from a pre-flight collision scan, see
+   *  sceneMoveScan.ts). For each, a fresh guid is minted and every pointing
+   *  entityRef/binding across the whole loaded chain is rewritten in this SAME
+   *  undo action. Not wired to the Hierarchy UI yet (owner decision: the confirm
+   *  dialog is advisory-only) — this exists for a future caller/test. */
+  rekeyGuids?: Set<string>;
+  label?: string;
+}
+
+const NULL_MOVE_RESULT: Omit<SceneMoveResult, 'reason'> = { ok: false, movedIds: [], reRooted: false, rekeyed: [] };
+
+/** Change which scene FILE authors this subtree — "promote" (level → base,
+ *  `targetScene` = the base's guid) or "demote" (base → level, `targetScene` =
+ *  ''). This is **not** a reparent: Phase 6's cross-scene-parenting guard stays
+ *  in force unchanged and is trivially satisfied afterwards, because the WHOLE
+ *  subtree re-stamps `sourceScene` together (scene-loading.md
+ *  Phase 14). Staged write (plan M3): mutates the live world, marks BOTH scenes
+ *  dirty, and pushes ONE undo action — no file changes until the next Save All. */
+export function moveEntityToScene(entityId: number, targetScene: string, opts?: SceneMoveOptions): SceneMoveResult {
+  const attrMeta = getTraitByName('EntityAttributes');
+  if (!attrMeta) return { ...NULL_MOVE_RESULT, reason: 'trait-missing' };
+  const oldAttr = readTraitData(entityId, attrMeta);
+  if (!oldAttr) return { ...NULL_MOVE_RESULT, reason: 'no-attrs' };
+  const fromScene = (oldAttr.sourceScene as string) || '';
+  if (fromScene === targetScene) return { ...NULL_MOVE_RESULT, reason: 'same-scene' };
+
+  const flat = getAllEntities();
+  const byId = new Map(flat.map((e) => [e.id, e]));
+  const rootInfo = byId.get(entityId);
+  if (!rootInfo) return { ...NULL_MOVE_RESULT, reason: 'no-entity' };
+  // Same walk serializeScene uses for its sourceScene exclusions (editor/scene/
+  // serialize.ts) — a half-moved subtree is exactly the cross-scene-parented
+  // state the Phase 6 guard exists to prevent.
+  const ids = subtreeIds(flat, entityId);
+
+  const allTraitsList = getAllTraits();
+  const transformMeta = allTraitsList.find((m) => m.name === 'Transform');
+  const piMeta = getTraitByName('PrefabInstance');
+
+  // Prefab-instance warn (informational, non-blocking — Phase 5's documented
+  // carried-instance bookkeeping limitation still applies once a base is
+  // savable; A8/A9 are fixed, so this is NOT "unsavable", just "may lose some
+  // editor bookkeeping across a later swap that keeps this base loaded").
+  const instanceRootNames: string[] = [];
+  if (piMeta) {
+    for (const id of ids) {
+      const e = findEntity(id);
+      const pd = e?.has(piMeta.trait) ? (e.get(piMeta.trait) as Record<string, unknown>) : null;
+      if (pd && (pd.rootInstanceId as number) === id) instanceRootNames.push(byId.get(id)?.name || `Entity ${id}`);
+    }
+  }
+  if (instanceRootNames.length > 0) {
+    console.warn(
+      `[moveEntityToScene] "${rootInfo.name}" carries ${instanceRootNames.length} prefab instance root(s) ` +
+      `(${instanceRootNames.join(', ')}) into ${targetScene ? 'a base scene' : 'the primary'} — its editor ` +
+      `bookkeeping (Apply-to-Prefab, structural overrides) may not survive a later swap that keeps this base ` +
+      `loaded (scene-loading.md Phase 5 limitation; the scene itself IS savable — A8/A9 fixed).`,
+    );
+  }
+
+  // Re-root vs. reparent-under-a-row (owner decision, see SceneMoveOptions doc).
+  const oldParentId = (oldAttr.parentId as number) || 0;
+  let newParentId = 0;
+  if (opts?.newParentId) {
+    const parentInfo = byId.get(opts.newParentId);
+    if (parentInfo && (parentInfo.sourceScene || '') === targetScene) newParentId = opts.newParentId;
+  }
+  const reRooted = newParentId === 0;
+  const parentChanged = oldParentId !== newParentId;
+  const oldFolder = rootInfo.editorFolder || '';
+  // Maintenance rule mirrored from reparentEntity: editorFolder (Hierarchy
+  // grouping tag) is root-only. Clear it when the root GAINS a parent; keep it
+  // when re-rooting (the entity IS a root of the target scene, so the tag still
+  // means something there).
+  const clearFolder = parentChanged && newParentId !== 0 && oldFolder !== '';
+
+  // Preserve world pose across the parent change (owner decision) — identical
+  // math to reparentEntity's (module-private matrixFromTransform/decomposeMatrix
+  // defined above in this file).
+  const fields = ['x', 'y', 'z', 'rx', 'ry', 'rz', 'sx', 'sy', 'sz'] as const;
+  let oldLocal: Record<string, number> | null = null;
+  let newLocal: Record<string, number> | null = null;
+  if (parentChanged && transformMeta) {
+    oldLocal = readTraitData(entityId, transformMeta) as Record<string, number> | null;
+    if (oldLocal) {
+      const entityWorld = worldTransforms.get(entityId);
+      const entityWorldMatrix = entityWorld ? matrixFromTransform(entityWorld) : matrixFromTransform(oldLocal as any);
+      let newParentWorldMatrix = new THREE.Matrix4();
+      if (newParentId !== 0) {
+        const parentWorld = worldTransforms.get(newParentId);
+        if (parentWorld) newParentWorldMatrix = matrixFromTransform(parentWorld);
+      }
+      const invParent = newParentWorldMatrix.clone().invert();
+      newLocal = decomposeMatrix(new THREE.Matrix4().multiplyMatrices(invParent, entityWorldMatrix));
+    }
+  }
+
+  // sortOrder: land after the target's existing siblings (mirrors
+  // createEntityWithUndo's auto-assign) so it can't collide with one of them.
+  const siblingScope = newParentId !== 0
+    ? flat.filter((e) => e.parentId === newParentId)
+    : flat.filter((e) => e.parentId === 0 && (e.sourceScene || '') === targetScene);
+  const oldSortOrder = rootInfo.sortOrder;
+  const newSortOrder = siblingScope.length > 0 ? Math.max(...siblingScope.map((e) => e.sortOrder)) + 1 : 0;
+
+  // Capture undo state for every entity in the subtree BEFORE mutating — guid
+  // refs survive a world rebuild (entityRef.ts).
+  const perEntity = ids.map((id) => ({ ref: entityRef(id), prevSourceScene: byId.get(id)?.sourceScene || '' }));
+  const rootRef = perEntity[0].ref; // subtreeIds puts the root first
+  const oldParentRef = oldParentId ? entityRef(oldParentId) : null;
+  const newParentRef = newParentId ? entityRef(newParentId) : null;
+
+  const applyStamps = () => {
+    const idx = buildGuidIndex();
+    for (const { ref } of perEntity) {
+      const id = resolveWith(ref, idx); if (id != null) writeTraitField(id, attrMeta, 'sourceScene', targetScene);
+    }
+    const rid = resolveWith(rootRef, idx); if (rid == null) return;
+    if (parentChanged) writeTraitField(rid, attrMeta, 'parentId', newParentRef?.resolve() ?? 0);
+    writeTraitField(rid, attrMeta, 'sortOrder', newSortOrder);
+    if (clearFolder) writeTraitField(rid, attrMeta, 'editorFolder', '');
+    if (newLocal && transformMeta) for (const f of fields) writeTraitField(rid, transformMeta, f, newLocal[f]);
+  };
+  const undoStamps = () => {
+    const idx = buildGuidIndex();
+    for (const { ref, prevSourceScene } of perEntity) {
+      const id = resolveWith(ref, idx); if (id != null) writeTraitField(id, attrMeta, 'sourceScene', prevSourceScene);
+    }
+    const rid = resolveWith(rootRef, idx); if (rid == null) return;
+    if (parentChanged) writeTraitField(rid, attrMeta, 'parentId', oldParentRef?.resolve() ?? 0);
+    writeTraitField(rid, attrMeta, 'sortOrder', oldSortOrder);
+    if (clearFolder) writeTraitField(rid, attrMeta, 'editorFolder', oldFolder);
+    if (oldLocal && transformMeta) for (const f of fields) writeTraitField(rid, transformMeta, f, oldLocal[f]);
+  };
+  applyStamps();
+
+  // Rekey (owner decision D: machinery built, not wired to the Hierarchy confirm
+  // dialog yet). `rewriteEntityRefsForGuid` is symmetric under argument order, so
+  // undo/redo just call it again reversed rather than replaying a captured list.
+  const rekeyPairs = ids
+    .map((id) => ({ id, guid: byId.get(id)?.guid || '' }))
+    .filter((e) => e.guid && opts?.rekeyGuids?.has(e.guid))
+    .map((e) => ({ oldGuid: e.guid, newGuid: newGuid() }));
+  const applyRekeys = () => {
+    for (const { oldGuid, newGuid: minted } of rekeyPairs) {
+      const ent = findEntityByGuid(oldGuid);
+      if (!ent) continue;
+      writeTraitField(ent.id(), attrMeta, 'guid', minted);
+      indexEntityGuid(ent);
+      rewriteEntityRefsForGuid(oldGuid, minted);
+    }
+  };
+  const undoRekeys = () => {
+    for (const { oldGuid, newGuid: minted } of rekeyPairs) {
+      const ent = findEntityByGuid(minted);
+      if (!ent) continue;
+      writeTraitField(ent.id(), attrMeta, 'guid', oldGuid);
+      indexEntityGuid(ent);
+      rewriteEntityRefsForGuid(minted, oldGuid);
+    }
+  };
+  applyRekeys();
+
+  markStructureDirty();
+  markUIDirty();
+  if (fromScene) markSceneDirty(fromScene);
+  if (targetScene) markSceneDirty(targetScene);
+
+  const targetLabel = targetScene ? 'base' : 'primary';
+  // NOT resolveAffectedScenes (that reads the CURRENT stamp — post-mutation both
+  // ids would resolve to targetScene, losing the "from" side). Both scenes are
+  // affected regardless of direction; empty strings (primary) are filtered out,
+  // matching resolveAffectedScenes' own "primary contributes nothing" contract.
+  const affectedScenes = [fromScene, targetScene].filter(Boolean);
+
+  _pushAction({
+    label: opts?.label ?? (targetScene ? `Promote "${rootInfo.name}" → ${targetLabel}` : `Demote "${rootInfo.name}" → ${targetLabel}`),
+    undo: () => {
+      undoRekeys();
+      undoStamps();
+      markStructureDirty(); markUIDirty();
+      if (fromScene) markSceneDirty(fromScene);
+      if (targetScene) markSceneDirty(targetScene);
+    },
+    redo: () => {
+      applyStamps();
+      applyRekeys();
+      markStructureDirty(); markUIDirty();
+      if (fromScene) markSceneDirty(fromScene);
+      if (targetScene) markSceneDirty(targetScene);
+    },
+    kind: '!sceneMove',
+    journalPayload: {
+      entity: rootRef.guid || String(entityId),
+      from: fromScene || 'primary', to: targetScene || 'primary',
+      count: ids.length, reRooted, rekeyed: rekeyPairs.length,
+    },
+    affectedScenes,
+    // Deliberately NOT _isFileDirect — staged (plan M3) means nothing is written
+    // to disk yet; Save All is what writes both files.
+  });
+
+  return { ok: true, movedIds: ids, reRooted, rekeyed: rekeyPairs };
+}
+
+/** Promote: level → base. `baseSceneGuid` must be a base already loaded in the
+ *  current chain (an entity can only move to a scene that's actually resolved). */
+export function promoteEntityToScene(entityId: number, baseSceneGuid: string, opts?: Omit<SceneMoveOptions, 'label'>): SceneMoveResult {
+  return moveEntityToScene(entityId, baseSceneGuid, opts);
+}
+
+/** Demote: base → primary (Phase 3's "empty sourceScene = primary" convention). */
+export function demoteEntityToScene(entityId: number, opts?: Omit<SceneMoveOptions, 'label'>): SceneMoveResult {
+  return moveEntityToScene(entityId, '', opts);
 }

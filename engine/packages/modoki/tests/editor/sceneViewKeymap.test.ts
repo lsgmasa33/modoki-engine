@@ -11,6 +11,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { register, resolve, clearBindings, type ResolveContext } from '../../src/editor/input/keymap';
+import { canFrameSelected } from '../../src/editor/scene/sceneViewBus';
 
 const ctx = (over: Partial<ResolveContext> = {}): ResolveContext => ({
   focusedPanel: null, overlay: null, textEditable: false, ...over,
@@ -91,34 +92,61 @@ describe('full-chord matching — Cmd+R must not hit the scale gizmo', () => {
   });
 });
 
-describe('`f` frame-selected is app-key, not scene-scoped', () => {
+describe('`f` frame-selected — Scene view / Hierarchy ONLY, via the real canFrameSelected guard', () => {
+  // Owner's decision (2026-07-26): F must frame the selection ONLY when the Scene view or
+  // the Hierarchy owns the keyboard — nowhere else (not the Game view, not the Inspector, not
+  // with nothing focused). Mirrors the real registration: two panel-scoped bindings (`scene`,
+  // `hierarchy`) sharing the actual `canFrameSelected` predicate from sceneViewBus.ts, so this
+  // test exercises the same guard SceneView/Hierarchy register, not a hand-written stub.
+  let sceneViewMode: string;
+  let selectedEntityId: number | null;
+
   beforeEach(() => {
     clearBindings();
-    // Mirrors SceneView: yields when there is nothing to frame.
-    let framable = true;
-    register({
-      id: 'scene.frameSelected', keys: 'f', scope: 'app-key',
-      when: () => framable, run: noop,
-    });
-    (globalThis as Record<string, unknown>).__setFramable = (v: boolean) => { framable = v; };
+    sceneViewMode = '3d';
+    selectedEntityId = 1;
+    const when = () => canFrameSelected({ sceneViewMode, selectedEntityId });
+    register({ id: 'scene.frameSelected', keys: 'f', scope: 'scene', when, run: noop });
+    register({ id: 'hierarchy.frameSelected', keys: 'f', scope: 'hierarchy', when, run: noop });
+  });
+
+  it('fires from the SCENE view', () => {
+    expect(resolve('f', ctx({ focusedPanel: 'scene' }))?.id).toBe('scene.frameSelected');
   });
 
   it('fires from the HIERARCHY — the pinned e2e behaviour', () => {
     // editor-hierarchy.spec.ts:84 presses `f` after clicking a Hierarchy row and expects
-    // SceneView to frame the entity. A `scene`-scoped `f` would fail that test.
-    expect(resolve('f', ctx({ focusedPanel: 'hierarchy' }))?.id).toBe('scene.frameSelected');
+    // SceneView to frame the entity.
+    expect(resolve('f', ctx({ focusedPanel: 'hierarchy' }))?.id).toBe('hierarchy.frameSelected');
   });
 
-  it('fires with nothing focused at all', () => {
-    expect(resolve('f', ctx())?.id).toBe('scene.frameSelected');
+  it('does NOT fire with nothing focused at all', () => {
+    // Intentional behaviour change (T2.1): F used to be app-key and fired from anywhere,
+    // including a cold editor with no panel clicked yet. That's exactly the "fires from the
+    // Game view / anywhere" bug this re-scope closes — nothing focused no longer frames.
+    expect(resolve('f', ctx())).toBeNull();
+  });
+
+  it('does NOT fire from the Game view', () => {
+    expect(resolve('f', ctx({ focusedPanel: 'game' }))).toBeNull();
+  });
+
+  it('does NOT fire from the Inspector', () => {
+    expect(resolve('f', ctx({ focusedPanel: 'inspector' }))).toBeNull();
   });
 
   it('does NOT fire while typing — so "fog" does not frame three times', () => {
     expect(resolve('f', ctx({ focusedPanel: 'hierarchy', textEditable: true }))).toBeNull();
   });
 
-  it('yields when there is nothing to frame', () => {
-    (globalThis as Record<string, () => void> & { __setFramable: (v: boolean) => void }).__setFramable(false);
+  it('yields when there is nothing to frame (no selection)', () => {
+    selectedEntityId = null;
+    expect(resolve('f', ctx({ focusedPanel: 'scene' }))).toBeNull();
+    expect(resolve('f', ctx({ focusedPanel: 'hierarchy' }))).toBeNull();
+  });
+
+  it('yields in UI mode (no orbit camera to frame with)', () => {
+    sceneViewMode = 'ui';
     expect(resolve('f', ctx({ focusedPanel: 'scene' }))).toBeNull();
   });
 });

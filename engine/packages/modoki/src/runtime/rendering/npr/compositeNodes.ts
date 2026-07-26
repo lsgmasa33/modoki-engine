@@ -1,6 +1,8 @@
-// HMR: see NPRPostProcess.ts — TSL nodes baked into compiled pipelines can't
-// safely hot-reload.
-if (import.meta.hot) import.meta.hot.invalidate();
+// HMR: this module's TSL nodes bake into compiled WGSL pipelines, so an edit here needs a full
+// RELOAD, not a hot patch. The dev server forces one by path (isShaderGraphFile in
+// plugins/vite-asset-scanner.ts). Do NOT re-add `import.meta.hot.invalidate()` — it only
+// propagates to importers and was silently swallowed by Scene3D.tsx's Fast Refresh boundary,
+// which is exactly how a correct shader fix ended up looking broken.
 
 /** NPR composite — combines edges + fill into the final pixel.
  *
@@ -21,7 +23,10 @@ import { sobelDepth, sobelNormal, sobelLuminance } from './edgeNodes';
 // don't expose. Use `any` at the boundary to avoid noise.
 type UniformNode = any;
 
-export interface NPRUniforms {
+/** The uniforms the composite node itself reads. FXAA's four used to live in
+ *  this same bag (NPR owned both stages); Phase 3 moved AA into its own
+ *  `PostFXStack` stage, so they're gone from here — see `FxaaStageConfig`. */
+export interface NPRCompositeUniforms {
   /** 0 = flat-white, 1 = lit-grayscale. */
   fillMode: UniformNode;
   depthThreshold: UniformNode;
@@ -33,14 +38,6 @@ export interface NPRUniforms {
   grayscaleLift: UniformNode;
   /** vec2(1/width, 1/height) — owner updates on resize. */
   texelSize: UniformNode;
-  /** Live FXAA toggle — 0 disables AA, 1 enables. Drives a branch inside the shader. */
-  fxaaEnabled: UniformNode;
-  /** Relative-contrast threshold for FXAA edge detection (0..1). */
-  fxaaEdgeThreshold: UniformNode;
-  /** Absolute floor for FXAA edge detection — prevents AA on near-flat regions. */
-  fxaaEdgeThresholdMin: UniformNode;
-  /** Multiplier on the blend curve (higher = more blur on detected edges). */
-  fxaaBlendStrength: UniformNode;
   /** Camera clear color (RGB) — shows through where the MRT pass drew no
    *  geometry. The composite covers every pixel, so without this uniform
    *  the camera's clearColor would never reach the swapchain when NPR is on. */
@@ -61,7 +58,7 @@ export interface BuildCompositeArgs {
    *  linear depth→viewZ reconstructor in `sobelDepth` (F10). Defaults to
    *  perspective (the shipping island/game cameras). */
   isOrthographic?: boolean;
-  uniforms: NPRUniforms;
+  uniforms: NPRCompositeUniforms;
 }
 
 export function buildCompositeNode(args: BuildCompositeArgs): any {

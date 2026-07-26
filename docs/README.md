@@ -23,7 +23,7 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 | [rendering.md](./rendering.md) | The three rendering layers (3d/2d/ui), the WebGPU renderer, and the NPR outline post-process pipeline |
 | [textures.md](./textures.md) | Per-texture import — `.meta.json` settings, KTX2/WebP conversion, content cache, GPU-aware runtime variant resolution |
 | [model-pipeline.md](./model-pipeline.md) | GLB model import — postprocessor fixups, two-stage LOD baking, caching, runtime `THREE.LOD` |
-| [scene-loading.md](./scene-loading.md) | Scene loading — two-world staging swap, refcounted resource cache, manifest/migrations, `SceneManager`, persistent entities |
+| [scene-loading.md](./scene-loading.md) | Scene loading — two-world staging swap, refcounted resource cache, manifest/migrations, `SceneManager`, persistent entities, nestable base scenes (cross-scene persistence), entity-id stability on disk |
 | [prefabs.md](./prefabs.md) | The prefab system — `.prefab.json`, `PrefabInstance` trait, override capture, edit mode, nested (v2) prefabs |
 | [prefab-structural-overrides.md](./prefab-structural-overrides.md) | How prefab instances add/remove child entities and traits, round-trip on save, and push back via Apply-to-Prefab |
 | [animation.md](./animation.md) | Animation runtime — keyframe clips (`.anim.json`), 3D skeletal + mixer, hand-posable bones, `SkinnedMeshRenderer`, animsets, 2D flipbook |

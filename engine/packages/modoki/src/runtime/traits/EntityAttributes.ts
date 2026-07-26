@@ -29,4 +29,12 @@ export const EntityAttributes = trait({
    *  entity is an ungrouped root. Purely organizational — it has NO runtime effect
    *  (no system reads it); it only drives how the Hierarchy panel groups roots. */
   editorFolder: '' as string,
+  /** Base-scene persistence provenance: the guid of the scene (in the active
+   *  chain) this entity was loaded from. Empty = belongs to the PRIMARY scene
+   *  (load-bearing default — an entity a human creates in the editor, or any
+   *  entity in a scene with no base, must save correctly with zero extra work).
+   *  Only entities loaded from a non-primary scene in the chain get stamped.
+   *  Derived at load time, never authored — see the `runtimeOnly` hint on its
+   *  registration. */
+  sourceScene: '' as string,
 });

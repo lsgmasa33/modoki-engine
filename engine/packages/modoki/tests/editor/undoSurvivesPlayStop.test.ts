@@ -40,7 +40,7 @@ vi.mock('../../src/runtime/ecs/world', () => ({
 
 const traitDefs = [
   { name: 'Transform', trait: Transform, category: 'component' as const, fields: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' }, rx: { type: 'number' }, ry: { type: 'number' }, rz: { type: 'number' }, sx: { type: 'number' }, sy: { type: 'number' }, sz: { type: 'number' } } },
-  { name: 'EntityAttributes', trait: EntityAttributes, category: 'component' as const, fields: { name: { type: 'string' }, isActive: { type: 'boolean' }, sortOrder: { type: 'number' }, parentId: { type: 'number' }, guid: { type: 'string' }, layer: { type: 'string' } } },
+  { name: 'EntityAttributes', trait: EntityAttributes, category: 'component' as const, fields: { name: { type: 'string' }, isActive: { type: 'boolean' }, sortOrder: { type: 'number' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, guid: { type: 'string' }, layer: { type: 'string' } } },
 ];
 
 vi.mock('../../src/runtime/ecs/traitRegistry', () => ({

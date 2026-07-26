@@ -5,7 +5,13 @@ export const Light = trait({
   lightType: 'directional' as 'ambient' | 'directional' | 'point' | 'spot',
   color: 0xffffff as number,
   intensity: 1 as number,
-  // Directional/spot: target to look at
+  // Directional/spot: the WORLD-space point to aim at. When any of the three is non-zero
+  // the light points here and its Transform rotation is ignored; ALL-ZERO means UNSET, and
+  // the aim falls back to the light's rotation (its local -Z forward). All-zero is "unset"
+  // rather than "aim at the world origin" so every scene authored before these fields were
+  // wired up — they all serialize 0,0,0 — keeps aiming exactly as it did. To aim at the
+  // origin, nudge one axis (e.g. targetY 0.001). Read by `syncLights` (runtime/rendering/
+  // scene3DSync.ts).
   targetX: 0 as number,
   targetY: 0 as number,
   targetZ: 0 as number,

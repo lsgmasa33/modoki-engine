@@ -293,7 +293,7 @@ server.tool(
 // ── mutate_scene — the validated way to edit scene structure ──
 server.tool(
   'modoki_mutate_scene',
-  'Apply validated ops to a scene FILE (setTrait / removeTrait / addEntity / removeEntity), ' +
+  'Apply validated ops to a scene FILE (setTrait / removeTrait / addEntity / removeEntity / setBaseScene), ' +
     'then atomically write it; the editor hot-reloads. GUIDs are minted as needed. This is ' +
     'how you edit scene structure — do NOT hand-write scene JSON. The entity ref is an ' +
     'OBJECT {id} | {name} | {guid}; setTrait carries the changed values under "fields". ' +
@@ -307,7 +307,9 @@ server.tool(
       'Ops. setTrait: {"op":"setTrait","entity":{"name":"Title"},"trait":"UIElement","fields":{"fontSize":56}}. ' +
       'removeTrait (remove a component; core Transform/EntityAttributes refused): {"op":"removeTrait","entity":{"id":7},"trait":"Light"}. ' +
       'addEntity: {"op":"addEntity","name":"Box","parentId":0,"traits":{"Transform":{...},"EntityAttributes":{"layer":"3d"}}}. ' +
-      'removeEntity: {"op":"removeEntity","entity":{"id":11}}.'),
+      'removeEntity: {"op":"removeEntity","entity":{"id":11}}. ' +
+      'setBaseScene (base-scene persistence — scene-level, no entity ref; guid of a base scene to load additively, or null to clear): ' +
+      '{"op":"setBaseScene","baseScene":"<scene guid>"}.'),
   },
   async ({ path, ops }) => postJson('/api/scene-mutate', { path, ops }),
 );

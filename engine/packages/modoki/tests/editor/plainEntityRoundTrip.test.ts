@@ -33,7 +33,7 @@ const Frozen = trait();
 function registerAll() {
   registerTrait({
     name: 'EntityAttributes', trait: EntityAttributes, category: 'component',
-    fields: { name: {}, isActive: {}, sortOrder: {}, parentId: {}, layer: {}, guid: {} },
+    fields: { name: {}, isActive: {}, sortOrder: {}, parentId: { entityId: { onMissing: 'root' } }, layer: {}, guid: {} },
   });
   registerTrait({
     name: 'Transform', trait: Transform, category: 'component',
@@ -249,5 +249,11 @@ describe('plain-entity serialize → load round-trip (real serialize + real load
     expect(entry).toBeDefined();
     // top-level name === EntityAttributes.name (canonical source of truth).
     expect(entry.name).toBe((entry.traits.EntityAttributes as Record<string, unknown>).name);
+    // scene-loading.md, Phase 3 — nothing on disk references the old
+    // live-ecs-id-derived entry.id any more (parentId and rootInstanceId are both
+    // guids as of Phase 1/2), so serializeScene stops writing it. (No extra world
+    // budget here — reuses this test's own serializeScene() call rather than a
+    // fresh roundTrip(), since this file already sits at koota's 16-world cap.)
+    expect('id' in entry).toBe(false);
   });
 });

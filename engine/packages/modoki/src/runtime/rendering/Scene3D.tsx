@@ -26,12 +26,16 @@ import { createFlameMeshSyncState, syncFlameMeshes, disposeFlameMeshSyncState } 
 import { PARTICLE_LAYER } from './layers';
 import { NPRPostFX } from '../traits/NPRPostFX';
 import { BloomPostFX } from '../traits/BloomPostFX';
+import { VignettePostFX } from '../traits/VignettePostFX';
+import { DepthOfFieldPostFX } from '../traits/DepthOfFieldPostFX';
+import { AmbientOcclusionPostFX } from '../traits/AmbientOcclusionPostFX';
 import { Camera as CameraTrait } from '../traits/Camera';
 import { EntityAttributes } from '../traits/EntityAttributes';
-import { NPRPostProcess } from './npr/NPRPostProcess';
-import { BloomPostProcess, type BloomConfig } from './bloom/BloomPostProcess';
+import { PostFXStack } from './postfx/PostFXStack';
+import { planStages, planFxaaEnabled, stackSignature } from './postfx/stackPlan';
+import type { BloomStageConfig, VignetteStageConfig, DofStageConfig, AoStageConfig, PostFXRequest } from './postfx/stackPlan';
 import { SuperSampleRebuildDebouncer } from './npr/ssRebuildDebounce';
-import { nprConfigFromTrait, nprConfigSignature, type NprTraitSnapshot } from './npr/nprConfigFromTrait';
+import { nprConfigFromTrait, type NprTraitSnapshot } from './npr/nprConfigFromTrait';
 
 let nextInstanceId = 0;
 
@@ -176,28 +180,28 @@ export default function Scene3D() {
       // this world's live materials + object userData. getCurrentWorld follows swaps.
       const unregisterSurface = registerRenderSurface(getCurrentWorld, renderState);
 
-      // NPR post-process — built lazily on first frame where NPRPostFX.enabled
-      // is true. Requires WebGPURenderer (gated below). When the trait turns
-      // off we keep the composer alive but route through plain renderer.render
-      // so toggling stays cheap.
+      // Post-FX stack — the ONE composable post-process path (NPR stylize,
+      // NPR particles, DOF, bloom, vignette, FXAA). Built lazily on the first
+      // frame any *PostFX trait is enabled. Requires WebGPURenderer (gated
+      // below). When every trait turns off we keep the stack alive but route
+      // through plain renderer.render so toggling stays cheap.
       const isWebGPU = (renderer as { isWebGPURenderer?: boolean }).isWebGPURenderer === true;
-      let nprComposer: NPRPostProcess | null = null;
-      // Bloom post-process (plain path only). Built lazily on the first frame where
-      // BloomPostFX.enabled is true AND NPR is off. `bloomCamera` is the camera baked
-      // into the composer — a projection toggle swaps `activeCamera`, forcing a rebuild
-      // (same reason as `nprCamera`). WebGPU-only (gated on isWebGPU below).
-      let bloomComposer: BloomPostProcess | null = null;
-      let bloomCamera: THREE.Camera | null = null;
-      // The camera identity baked into `nprComposer`. A live projection toggle
+      // The WebGPURenderer can run ON TOP of WebGL2 when WebGPU is unavailable
+      // (GameConfig.preferWebGPU) — `isWebGPU` above is true either way. FXAA is
+      // a raw-WGSL wgslFn the WebGL backend's GLSL parser can't compile, so the
+      // stage has to be planned away there (planFxaaEnabled).
+      const isWebGLBackend = (renderer as { backend?: { isWebGLBackend?: boolean } }).backend?.isWebGLBackend === true;
+      let postfxStack: PostFXStack | null = null;
+      // The camera identity baked into `postfxStack`. A live projection toggle
       // (perspective <-> orthographic) swaps `activeCamera` to a different object;
-      // the composer captured the old one at construction (and needs the ortho
-      // depth-reconstruction path), so a change forces a full rebuild.
-      let nprCamera: THREE.Camera | null = null;
-      // Edge-trigger key for the NPR config (F6): only rebuild `nprConfig` + call
-      // `setConfig` (13 uniform writes + a Color.setHex) when the trait's tracked values
-      // actually change, instead of every rendered frame while playing.
-      let lastNprSig: string | null = null;
-      // Coalesces SS-scale-driven NPR pipeline rebuilds (F9): an SS-scale change
+      // the stack captured the old one at construction (and NPR/DOF need the
+      // matching ortho depth-reconstruction path), so a change forces a rebuild.
+      let postfxCamera: THREE.Camera | null = null;
+      // Edge-trigger key for the whole request (F6): only call `setConfig` (the
+      // per-stage uniform writes) when something a stage reads actually changed,
+      // instead of every rendered frame while playing.
+      let lastStackSig: string | null = null;
+      // Coalesces SS-scale-driven stack rebuilds (F9): an SS-scale change
       // forces a full dispose()+reconstruct (shader recompile), so dragging the
       // supersample slider — which sweeps values frame-by-frame — would thrash
       // compiles. The debouncer waits for the target scale to settle before
@@ -297,88 +301,152 @@ export default function Scene3D() {
           };
         });
 
-        if (nprEnabled && isWebGPU && nprHold.snap) {
-          // Camera.clearColor → NPR background. The composite shader covers every
-          // pixel, so without piping this in the swapchain stays whatever the NPR
-          // fill produced (pure white in flat mode, luminance-remapped grayscale
-          // otherwise) regardless of scene.background. Last active camera wins.
-          let clearColor = 0x000000;
+        // Camera.clearColor → NPR background. The composite shader covers every
+        // pixel, so without piping this in the swapchain stays whatever the NPR
+        // fill produced (pure white in flat mode, luminance-remapped grayscale
+        // otherwise) regardless of scene.background. Last active camera wins.
+        let clearColor = 0x000000;
+        if (nprEnabled) {
           world.query(CameraTrait, EntityAttributes).updateEach(([cam, attrs]: [{ clearColor: number }, { isActive: boolean }]) => {
             if (!attrs.isActive) return;
             clearColor = cam.clearColor ?? 0x000000;
           });
+        }
 
-          // Edge-trigger (F6): skip the config-object build + setConfig entirely when
-          // nothing the NPR pass reads has changed since the last applied config.
-          const liveConfig = nprConfigFromTrait(nprHold.snap, clearColor);
-          const sig = nprConfigSignature(liveConfig);
-          // A projection toggle swapped the active camera object — the composer
-          // baked the old one (incl. its perspective/ortho depth path), so rebuild.
-          const cameraChanged = nprComposer != null && nprCamera !== activeCamera;
-          if (!nprComposer || cameraChanged) {
-            nprComposer?.dispose();
-            nprComposer = new NPRPostProcess(renderer, scene, activeCamera, liveConfig);
-            nprCamera = activeCamera;
-            ssRebuild = new SuperSampleRebuildDebouncer(liveConfig.superSampleScale);
-            lastNprSig = sig;
+        let bloomFound = false;
+        let bloomEnabled = false;
+        const bloomCfg: BloomStageConfig = { strength: 0.8, radius: 0.6, threshold: 0 };
+        world.query(BloomPostFX).updateEach(([fx]: [BloomStageConfig & { enabled: boolean }]) => {
+          if (bloomFound) return; // singleton — first entity wins
+          bloomFound = true;
+          bloomEnabled = fx.enabled;
+          bloomCfg.strength = fx.strength;
+          bloomCfg.radius = fx.radius;
+          bloomCfg.threshold = fx.threshold;
+        });
+
+        let vignetteFound = false;
+        let vignetteEnabled = false;
+        const vignetteCfg: VignetteStageConfig = { intensity: 0.4, smoothness: 0.5 };
+        world.query(VignettePostFX).updateEach(([fx]: [VignetteStageConfig & { enabled: boolean }]) => {
+          if (vignetteFound) return; // singleton — first entity wins
+          vignetteFound = true;
+          vignetteEnabled = fx.enabled;
+          vignetteCfg.intensity = fx.intensity;
+          vignetteCfg.smoothness = fx.smoothness;
+        });
+
+        let dofFound = false;
+        let dofEnabled = false;
+        const dofCfg: DofStageConfig = { focusDistance: 10, focalLength: 1, bokehScale: 1 };
+        world.query(DepthOfFieldPostFX).updateEach(([fx]: [DofStageConfig & { enabled: boolean }]) => {
+          if (dofFound) return; // singleton — first entity wins
+          dofFound = true;
+          dofEnabled = fx.enabled;
+          dofCfg.focusDistance = fx.focusDistance;
+          dofCfg.focalLength = fx.focalLength;
+          dofCfg.bokehScale = fx.bokehScale;
+        });
+
+        let aoFound = false;
+        let aoEnabled = false;
+        const aoCfg: AoStageConfig = { radius: 0.25, intensity: 1 };
+        world.query(AmbientOcclusionPostFX).updateEach(([fx]: [AoStageConfig & { enabled: boolean }]) => {
+          if (aoFound) return; // singleton — first entity wins
+          aoFound = true;
+          aoEnabled = fx.enabled;
+          aoCfg.radius = fx.radius;
+          aoCfg.intensity = fx.intensity;
+        });
+
+        // Phase 3: ONE request describes every enabled effect — NPR is just
+        // another stage now, so `NPRPostFX` + `BloomPostFX` compose instead of
+        // NPR winning and bloom being skipped. `ssScale` is a parameter because
+        // the SS-scale debouncer needs to build the request at BOTH the live
+        // value (to detect intent) and the currently-applied value (to hold the
+        // rebuild off until the drag settles) — and FXAA's legality depends on
+        // it (F7), so both must be derived from the same scale.
+        const nprSnap = nprEnabled && nprHold.snap ? nprConfigFromTrait(nprHold.snap, clearColor) : null;
+        const buildReq = (ssScale: number): PostFXRequest => {
+          const req: PostFXRequest = {};
+          if (nprSnap) {
+            req.npr = {
+              isOrthographic: activeCamera === orthoCamera,
+              superSampleScale: ssScale,
+              fillMode: nprSnap.fillMode,
+              depthThreshold: nprSnap.depthThreshold,
+              normalThreshold: nprSnap.normalThreshold,
+              colorThreshold: nprSnap.colorThreshold,
+              lineThickness: nprSnap.lineThickness,
+              lineStrength: nprSnap.lineStrength,
+              grayscaleGamma: nprSnap.grayscaleGamma,
+              grayscaleLift: nprSnap.grayscaleLift,
+              clearColor: nprSnap.clearColor,
+            };
+            if (planFxaaEnabled({ requested: nprSnap.fxaa, isWebGLBackend, superSampleScale: ssScale })) {
+              req.fxaa = {
+                edgeThreshold: nprSnap.fxaaEdgeThreshold,
+                edgeThresholdMin: nprSnap.fxaaEdgeThresholdMin,
+                blendStrength: nprSnap.fxaaBlendStrength,
+              };
+            }
+          }
+          if (aoEnabled) req.ao = aoCfg;
+          if (dofEnabled) req.dof = dofCfg;
+          if (bloomEnabled) req.bloom = bloomCfg;
+          if (vignetteEnabled) req.vignette = vignetteCfg;
+          return req;
+        };
+
+        // Clamp HERE, at the single source, so the planner and the stage both see
+        // the SAME number. PostFXStack clamps internally too; if the raw value
+        // reached the planner a hand-authored `superSampleScale: 0.5` would render
+        // at effective scale 1 but silently fail planFxaaEnabled's `=== 1` test,
+        // and every distinct sub-1 value would force a rebuild producing a
+        // byte-identical graph. (The Inspector pins min:1 — this is data-authored
+        // scenes / MCP writes only.)
+        const liveSs = nprSnap ? Math.max(1, nprSnap.superSampleScale) : 1;
+        const liveReq = buildReq(liveSs);
+        if (planStages(liveReq).length > 0 && isWebGPU) {
+          // Rebuild on camera-object swap (perspective <-> ortho): the stack
+          // baked the old camera object, incl. its depth-reconstruction path.
+          const cameraChanged = postfxStack != null && postfxCamera !== activeCamera;
+          if (!postfxStack || cameraChanged) {
+            postfxStack?.dispose();
+            postfxStack = new PostFXStack(renderer, scene, activeCamera, liveReq);
+            postfxCamera = activeCamera;
+            ssRebuild = new SuperSampleRebuildDebouncer(liveSs);
+            lastStackSig = stackSignature(liveReq);
           } else {
             // F9: feed the live SS-scale target to the debouncer every frame. It
-            // returns true only once the value has settled — so a slider drag that
-            // sweeps SS-scale frame-by-frame recompiles the pipeline once, not per
-            // intermediate value. (Note: SS scale is NOT in the F6 sig path's gate
-            // anymore — it's coalesced here regardless of the sig fast-out.)
-            const doSsRebuild = ssRebuild!.tick(liveConfig.superSampleScale);
-            if (sig !== lastNprSig || doSsRebuild) {
-              // Apply cheap uniform updates every change, but hold off the costly
-              // structural rebuild until the SS-scale has actually settled. While
-              // the SS-scale is mid-settle, pin setConfig's view of it to the
-              // applied (live-pipeline) value so it can't signal an SS rebuild
-              // before the debouncer commits one.
-              const cfgScale = doSsRebuild ? liveConfig.superSampleScale : ssRebuild!.appliedScale;
-              const nprConfig = { ...liveConfig, superSampleScale: cfgScale };
-              const needsRebuild = nprComposer.setConfig(nprConfig);
-              if (needsRebuild || doSsRebuild) {
-                nprComposer.dispose();
-                nprComposer = new NPRPostProcess(renderer, scene, activeCamera, nprConfig);
-                nprCamera = activeCamera;
+            // returns true only once the value has settled — so a slider drag
+            // that sweeps SS-scale frame-by-frame recompiles once, not per
+            // intermediate value. (SS scale is NOT gated by the F6 sig fast-out;
+            // it's coalesced here regardless.)
+            const doSsRebuild = ssRebuild!.tick(liveSs);
+            const sig = stackSignature(liveReq);
+            if (sig !== lastStackSig || doSsRebuild) {
+              // Apply cheap uniform updates on every change, but hold the costly
+              // structural rebuild until the SS-scale has actually settled: while
+              // it's mid-settle, pin the request's scale to the applied (live
+              // pipeline) value so `needsRebuild` can't fire early.
+              const cfgScale = doSsRebuild ? liveSs : ssRebuild!.appliedScale;
+              const effectiveReq = cfgScale === liveSs ? liveReq : buildReq(cfgScale);
+              const rebuild = postfxStack.setConfig(effectiveReq);
+              if (rebuild || doSsRebuild) {
+                postfxStack.dispose();
+                postfxStack = new PostFXStack(renderer, scene, activeCamera, effectiveReq);
+                postfxCamera = activeCamera;
               }
               // Only mark the sig applied once the SS-scale is in sync with the
-              // pipeline — otherwise a still-settling SS change would latch the sig
-              // and the post-settle rebuild would be skipped.
-              if (cfgScale === liveConfig.superSampleScale) lastNprSig = sig;
+              // pipeline — otherwise a still-settling SS change would latch the
+              // sig and the post-settle rebuild would be skipped.
+              if (cfgScale === liveSs) lastStackSig = sig;
             }
           }
-          nprComposer.render();
+          postfxStack.render();
         } else {
-          // Plain path. Optionally route through the bloom composer when a
-          // BloomPostFX singleton is enabled and we're on WebGPU. Mutually
-          // exclusive with NPR (handled above) for now.
-          let bloomFound = false;
-          let bloomEnabled = false;
-          const bloomCfg: BloomConfig = { strength: 0.8, radius: 0.6, threshold: 0 };
-          world.query(BloomPostFX).updateEach(([fx]: [BloomConfig & { enabled: boolean }]) => {
-            if (bloomFound) return; // singleton — first entity wins
-            bloomFound = true;
-            bloomEnabled = fx.enabled;
-            bloomCfg.strength = fx.strength;
-            bloomCfg.radius = fx.radius;
-            bloomCfg.threshold = fx.threshold;
-          });
-
-          if (bloomEnabled && isWebGPU) {
-            // Rebuild on camera-object swap (perspective <-> ortho), same as NPR.
-            const cameraChanged = bloomComposer != null && bloomCamera !== activeCamera;
-            if (!bloomComposer || cameraChanged) {
-              bloomComposer?.dispose();
-              bloomComposer = new BloomPostProcess(renderer, scene, activeCamera, bloomCfg);
-              bloomCamera = activeCamera;
-            } else {
-              bloomComposer.setConfig(bloomCfg); // live uniforms — cheap, no graph rebuild
-            }
-            bloomComposer.render();
-          } else {
-            renderer.render(scene, activeCamera);
-          }
+          renderer.render(scene, activeCamera);
         }
       }
       // Prewarm the already-current scene before the first render. The runtime
@@ -636,10 +704,8 @@ export default function Scene3D() {
         unregisterFrameCallback(frameKey);
         disposeParticleSyncState(particleState, scene);
         disposeFlameMeshSyncState(flameState, scene);
-        nprComposer?.dispose();
-        nprComposer = null;
-        bloomComposer?.dispose();
-        bloomComposer = null;
+        postfxStack?.dispose();
+        postfxStack = null;
         ssRebuild = null;
         // Tear down skinned entries (stop mixers, dispose per-clone skeleton
         // boneTextures) — consistent with the world-swap path. Without this,

@@ -41,7 +41,8 @@ export type MutateOp =
   | { op: 'setTrait'; entity: EntityRef; trait: string; fields?: Record<string, unknown> }
   | { op: 'removeTrait'; entity: EntityRef; trait: string }
   | { op: 'addEntity'; name?: string; parentId?: number | string; traits?: Record<string, Record<string, unknown> | boolean> }
-  | { op: 'removeEntity'; entity: EntityRef };
+  | { op: 'removeEntity'; entity: EntityRef }
+  | { op: 'setBaseScene'; baseScene: string | null };
 
 /** Core traits every entity needs — refused by removeTrait (a human can't remove
  *  these in the Inspector either; dropping them corrupts the entity). */
@@ -167,6 +168,16 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
         scene.entities = scene.entities.filter((e) => !toRemove.has(e.id));
         if (removedGuids.size) flagDanglingRefs(scene, removedGuids, warnings, where);
         changed++;
+      } else if (op.op === 'setBaseScene') {
+        // Top-level scene-format field (scene-loading.md), not an
+        // entity — the only op that touches `scene` directly rather than `scene.entities`.
+        // null/'' clears it (a scene with no base omits the field entirely, not `baseScene: ''`).
+        if (op.baseScene) {
+          if (scene.baseScene !== op.baseScene) { scene.baseScene = op.baseScene; changed++; }
+        } else if ('baseScene' in scene) {
+          delete scene.baseScene;
+          changed++;
+        }
       } else {
         errors.push(`${where}: unknown op '${(op as { op?: string }).op}'`);
       }
@@ -294,6 +305,59 @@ function collectSubtree(scene: MutableScene, rootId: number): Set<number> {
     if (g) for (const c of childrenByKey.get(g) ?? []) stack.push(c);    // guid ref (current)
   }
   return out;
+}
+
+/** Backfill a synthesized numeric id (its array index) for any entity that lacks
+ *  one. A v12+ scene file (scene-loading.md, Phase 3) no longer
+ *  carries `id` at all — the interactive Save All path stopped writing it once
+ *  nothing on disk referenced it any more. This module still identifies entities
+ *  by numeric id throughout (`EntityRef.id`, `nextId`, `collectSubtree`'s legacy
+ *  parentId branch), so a caller parsing a scene file MUST call this before
+ *  `applyOps` — mirrors `loadSceneFile.ts`'s `assignSyntheticEntityIds`, same
+ *  reasoning, kept as a separate copy since this module is deliberately
+ *  standalone/dependency-free (runs identically in Node and the browser). A file
+ *  that DOES carry ids (v11 and earlier, or hand-authored) is untouched — this
+ *  only fills gaps, never overwrites. Mutates `scene` in place, like `applyOps`.
+ *
+ *  Returns the set of entity objects it backfilled, so a caller that writes the
+ *  scene back to disk can strip those synthetic ids first (`stripBackfilledEntityIds`)
+ *  — otherwise a single setTrait through this path would silently reintroduce an
+ *  `id` field on EVERY entity in an id-less v12+ file, the exact per-entity diff
+ *  noise Phase 3 removed, just via a different write path than Save All. Safe to
+ *  discard the return value if the caller never writes `scene` back out (e.g. a
+ *  read-only validation pass).
+ *
+ *  Skips any array index already taken by an EXPLICIT id elsewhere in the file
+ *  (a genuinely mixed file — some entries id'd, some not — is unusual but not
+ *  impossible: hand-edited, or partially migrated) so a synthesized id can never
+ *  collide with a real one, which would otherwise let `EntityRef.id` silently
+ *  resolve to the WRONG entity — caught by independent code review, 2026-07-26. */
+export function assignSyntheticEntityIds(scene: MutableScene): Set<MutableEntity> {
+  const backfilled = new Set<MutableEntity>();
+  const used = new Set<number>();
+  for (const e of scene.entities) if (typeof e.id === 'number') used.add(e.id);
+  let next = 0;
+  for (const e of scene.entities) {
+    if (e.id != null) continue;
+    while (used.has(next)) next++;
+    e.id = next;
+    used.add(next);
+    backfilled.add(e);
+  }
+  return backfilled;
+}
+
+/** Undo `assignSyntheticEntityIds`' backfill on exactly the entities it touched,
+ *  right before writing `scene` back to disk. Entities `applyOps` REMOVED are
+ *  simply absent from `scene.entities` already (no-op for those); entities
+ *  `addEntity` ADDED were never in `backfilled` (they mint a real, meaningful id
+ *  via `nextId()`, called after the backfill ran) and keep theirs. Safe even
+ *  though nothing downstream re-reads these entities' `id` after this call —
+ *  it exists purely to keep the WRITTEN file id-less, matching what a fresh
+ *  `serializeScene` save would have produced. */
+export function stripBackfilledEntityIds(scene: MutableScene, backfilled: Set<MutableEntity>): void {
+  if (backfilled.size === 0) return;
+  for (const e of scene.entities) if (backfilled.has(e)) delete (e as { id?: number }).id;
 }
 
 /** Next free numeric entity id (max existing + 1, min 1). */

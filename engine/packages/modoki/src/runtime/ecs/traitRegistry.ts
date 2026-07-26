@@ -27,6 +27,28 @@ export interface FieldHint {
    *  re-derives it from the schema default. Independent of `readOnly` (a field
    *  can be read-only in the Inspector yet still authored/persisted). */
   runtimeOnly?: boolean;
+  /** Never rendered in the Inspector; still a real registered field for every
+   *  serialize/snapshot path (buildSceneSchema, snapshotPersistentEntities, the
+   *  override-map field guard in loadSceneFile). Use this instead of leaving a
+   *  field out of `fields` entirely — an unregistered field needs a hardcoded
+   *  name-check wherever code walks `meta.fields` (see EntityAttributes.editorFolder,
+   *  the wart this exists to avoid repeating). */
+  hidden?: boolean;
+  /** This numeric field holds a LIVE koota entity id (e.g. EntityAttributes.parentId,
+   *  PrefabInstance.rootInstanceId) — a raw ecs id from the file/dying-world side, which
+   *  is meaningless after a respawn until remapped through the loader's `idMap`.
+   *  `loadSceneFile.ts` drives ONE declarative remap loop off every field flagged here,
+   *  instead of a hand-maintained list per field (the bug class base-scene-and-
+   *  persistence-plan.md's "A8" finding closes structurally — Phase 15). `onMissing`
+   *  says what to do when the referenced id has no live counterpart in this load:
+   *  - 'root'       → silently write 0 (the field's schema default). Use when losing the
+   *                    link degrades to a legitimate, already-handled state (e.g. an
+   *                    orphaned parent — sceneValidation.ts warns on that at author time).
+   *  - 'stripTrait' → remove the WHOLE trait from the entity and warn loudly. Use when
+   *                    neither 0 nor the stale value is safe to keep (e.g. a prefab-
+   *                    instance root pointer — either would let the entity poison
+   *                    downstream instance-membership lookups). */
+  entityId?: { onMissing: 'root' | 'stripTrait' };
   /** For a `color` field: the name of a sibling 0..1 number field that holds its
    *  alpha. The Inspector folds that field into the color picker as an A slider and
    *  hides it as a standalone row (e.g. UIElement.backgroundColor ↔ backgroundOpacity). */

@@ -187,13 +187,24 @@ export function initHmrStaleness(
     }
   } catch { /* sessionStorage unavailable */ }
 
-  // ── 1. Game code changed → reload; warn first if that costs unsaved work ──
+  // ── 1. Code that ONLY a reload can apply → reload; warn first if that costs unsaved work ──
+  //
+  // Two producers, one policy (both sent by plugins/vite-asset-scanner.ts handleHotUpdate):
+  //   • GAME CODE   — the editor imported the game once through a @vite-ignore dynamic import
+  //     whose URL never changes, so ESM keeps serving the cached instance forever.
+  //   • SHADER GRAPH (postfx/npr TSL) — the node instances are already baked into a compiled
+  //     WGSL pipeline, so hot-patching the module leaves the OLD graph rendering. This one is
+  //     especially corrosive: it makes a CORRECT fix look wrong, so you revert it and chase
+  //     ghosts. It used to rely on `import.meta.hot.invalidate()` inside each shader module,
+  //     which a Fast Refresh boundary upstream silently swallowed.
+  // Same handling for both, deliberately: the reload WILL happen (stale is the worse failure),
+  // but never at the cost of unsaved scene work without a readable warning first.
   let countdown: ReturnType<typeof setInterval> | null = null;
-  hot.on('modoki:game-code-changed', async (data: { file?: string }) => {
-    const file = data?.file ?? 'game code';
+  const onCodeChanged = (label: string) => async (data: { file?: string }) => {
+    const file = data?.file ?? label;
     const dirty = await isDirty();
     if (!dirty) {
-      console.info(`[modoki] game code changed (${file}) — reloading to apply.`);
+      console.info(`[modoki] ${label} changed (${file}) — reloading to apply.`);
       location.reload();
       return;
     }
@@ -215,8 +226,9 @@ export function initHmrStaleness(
       }
       location.reload();
     };
+    const capitalized = label.charAt(0).toUpperCase() + label.slice(1);
     const text = (msLeft: number) =>
-      `Game code changed — reloading in ${Math.ceil(msLeft / 1000)}s; unsaved scene changes will be LOST`;
+      `${capitalized} changed — reloading in ${Math.ceil(msLeft / 1000)}s; unsaved scene changes will be LOST`;
     const banner = showBanner(text(DISCARD_GRACE_MS), [
       { label: 'Reload now', onClick: () => { void discardNow(); } },
       {
@@ -228,18 +240,18 @@ export function initHmrStaleness(
           // measurements silently lie.
           status.staleGameCode = true;
           console.warn(
-            `[modoki] reload cancelled — this editor is now running STALE game code (${file}). ` +
+            `[modoki] reload cancelled — this editor is now running STALE ${label} (${file}). ` +
             `Save and reload before trusting anything you measure here.`,
           );
-          journal('!hmr.stale-game-code', { file });
-          showBanner('Running STALE game code — reload to apply', [
+          journal('!hmr.stale-game-code', { file, kind: label });
+          showBanner(`Running STALE ${label} — reload to apply`, [
             { label: 'Reload', onClick: () => location.reload() },
           ]);
         },
       },
     ]);
     console.warn(
-      `[modoki] game code changed (${file}) and the scene has UNSAVED CHANGES — ` +
+      `[modoki] ${label} changed (${file}) and the scene has UNSAVED CHANGES — ` +
       `reloading in ${DISCARD_GRACE_MS / 1000}s, which will discard them.`,
     );
     countdown = setInterval(() => {
@@ -247,7 +259,12 @@ export function initHmrStaleness(
       if (left <= 0) void discardNow();
       else banner.setText(text(left));
     }, 250);
-  });
+  };
+  hot.on('modoki:game-code-changed', onCodeChanged('game code'));
+  // A stale shader graph lies exactly the way stale game code does, so it gets the same
+  // treatment — including `staleGameCode` on Cancel, which is the flag agents are told to
+  // distrust measurements from.
+  hot.on('modoki:shader-code-changed', onCodeChanged('shader code'));
 
   // ── 2. Unrecoverable Fast Refresh (hook-order) → reload once ──
   const recentlyUpdated = () =>

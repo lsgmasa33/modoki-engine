@@ -7,6 +7,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 
 function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
@@ -55,6 +56,44 @@ describe('/api/editor-action', () => {
     const r = (await post('/api/editor-action', { action: 'undo' }, ctx)) as { status?: number };
     expect(r.status).toBe(504);
   });
+});
+
+/** Drift guard for the timeline-MCP-400 bug (2026-07-26): `editorBackendRouter.ts`'s
+ *  `EDITOR_ACTIONS` allow-list is maintained BY HAND, separately from the MCP tools that call
+ *  it, and `'timeline-set'`/`'timeline-add-clip'` were simply never added — every call 400d
+ *  with "unknown or missing editor action" until fixed.
+ *
+ *  This asserts the relationship that actually matters: every LITERAL action name the MCP
+ *  server passes to `editorAction()` must be in the allow-list. That is a SUBSET check, not
+ *  equality with the renderer's full `registerAgentOp` list — plenty of registered ops
+ *  (`scene-state`, `journal-events`, `layout-bounds`, `diagnose`, `watch-*`, `eval`, …) are
+ *  read-only and reach the renderer through their OWN routes, never through
+ *  `/api/editor-action`, so they are correctly absent from `EDITOR_ACTIONS`. Asserting
+ *  equality with `registerAgentOp` would be the WRONG check and would fail immediately —
+ *  don't "fix" this test into that shape.
+ *
+ *  Two call sites in index.ts pass a caller-supplied `action` (zod-enum-restricted to
+ *  play/stop/pause/resume/step and undo/redo) rather than a literal — those are validated by
+ *  the zod schema at the tool boundary, not by this regex, and are not covered here. */
+describe('drift guard: every literal MCP editorAction() name survives the router allowlist', () => {
+  // Resolve relative to THIS test file's own path, not cwd — fileURLToPath, not
+  // new URL(...).pathname, so the `/E:/…` leading-slash drive form doesn't double on
+  // Windows (see games/sling/tests/testGamePath.ts for the same trap).
+  const mcpSourcePath = path.join(path.dirname(fileURLToPath(import.meta.url)), '../../tools/modoki-mcp/src/index.ts');
+  const mcpSource = fs.readFileSync(mcpSourcePath, 'utf-8');
+  const actionNames = [...mcpSource.matchAll(/editorAction\(\s*'([^']+)'/g)].map((m) => m[1]);
+  const uniqueActionNames = [...new Set(actionNames)];
+
+  it('found a non-trivial set of literal action names to check (guards against a broken regex)', () => {
+    expect(uniqueActionNames.length).toBeGreaterThan(15);
+  });
+
+  for (const action of uniqueActionNames) {
+    it(`'${action}' is allow-listed (not a 400)`, async () => {
+      const r = (await post('/api/editor-action', { action }, makeCtx())) as { status?: number };
+      expect(r.status).not.toBe(400);
+    });
+  }
 });
 
 describe('/api/eval', () => {

@@ -92,3 +92,49 @@ describe('timelineCache — async loader paths', () => {
     expect(def?.duration).toBe(2);
   });
 });
+
+describe('timelineCache — a GUID-loaded timeline is invalidated BY PATH', () => {
+  /** THE CRUX of the live-edit fix, and the one thing the plugin-side classification test cannot
+   *  reach. A Director references its timeline by GUID, so `getTimeline` caches it under
+   *  `resolveRef(guid)` — the manifest PATH. The dev-server watcher, meanwhile, only knows the
+   *  file that changed and calls `invalidateTimeline(urlPath)`. If those two key forms did not
+   *  agree, invalidation would silently no-op and the whole fix would do nothing while every
+   *  other test stayed green — exactly how `invalidateAnimationClip` sat dead for so long. */
+  const PATH = '/assets/timelines/tour.timeline.json';
+  const GUID = '11111111-2222-4333-8444-555555555555';
+
+  beforeEach(async () => {
+    const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
+    registerAsset(GUID, PATH, 'timeline');
+  });
+
+  it('resolves a GUID ref, then drops it when the watcher invalidates the resolved path', async () => {
+    fetchMock.mockResolvedValueOnce(okResponse({ ...DEF, id: GUID, name: 'BEFORE' }));
+
+    expect(getTimeline(GUID)).toBeNull();       // kicks off the async load
+    await flush();
+    expect(getTimeline(GUID)?.name).toBe('BEFORE');
+    expect(fetchMock).toHaveBeenCalledTimes(1); // now cached — no second fetch
+
+    // What the dev server does on a .timeline.json write: it knows the PATH, not the GUID.
+    invalidateTimeline(PATH);
+
+    fetchMock.mockResolvedValueOnce(okResponse({ ...DEF, id: GUID, name: 'AFTER' }));
+    expect(getTimeline(GUID)).toBeNull();       // cache miss ⇒ re-fetch, proving the keys agree
+    await flush();
+    expect(getTimeline(GUID)?.name).toBe('AFTER');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('invalidating an UNRELATED path leaves the cached timeline alone', async () => {
+    // Non-vacuity: the test above would also pass if invalidateTimeline nuked everything.
+    fetchMock.mockResolvedValueOnce(okResponse({ ...DEF, id: GUID, name: 'BEFORE' }));
+    getTimeline(GUID);
+    await flush();
+
+    invalidateTimeline('/assets/timelines/some-other.timeline.json');
+
+    expect(getTimeline(GUID)?.name).toBe('BEFORE');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});

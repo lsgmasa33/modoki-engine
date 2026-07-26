@@ -1,6 +1,7 @@
 /** Undo/Redo manager — command stack for all editor actions. */
 
 import { editorEmit } from '../editorJournal';
+import { markSceneDirty } from '../scene/sceneDirty';
 
 /** Structured diff for a trait-field edit — the machine-readable companion to an
  *  action's human `label`, forwarded into the editor journal's `!edit` event so
@@ -62,6 +63,25 @@ export interface UndoAction {
   journalPayload?: Record<string, unknown>;
   /** Internal tag for coalescing consecutive selection-only actions */
   _isSelection?: boolean;
+  /** This action's undo/redo/initial-apply writes straight to a FILE (e.g.
+   *  SceneAssetView's base-ref edit via /api/scene-mutate), not the live world —
+   *  so, unlike a normal trait/entity edit, there is nothing pending a Cmd+S.
+   *  Skips the `notifyEdited()` bump `hasUnsavedChanges()` reads, so this
+   *  action's own undo/redo doesn't falsely mark the active scene dirty (and
+   *  self-block a follow-up file-direct write via the "unsaved live changes"
+   *  guard some of those routes carry). A genuinely-pending unrelated
+   *  live-world edit is untouched either way — this flag only opts THIS
+   *  action out of contributing its own bump. */
+  _isFileDirect?: boolean;
+  /** Scene guids this action's entities belong to (scene-loading.md
+   *  Phase 12, M2) — resolved by the CALLER before the mutation runs (a delete/reparent
+   *  can destroy the entity or is otherwise unsafe to re-resolve after the fact, so the
+   *  caller captures this once and both directions share it: undo and redo touch the
+   *  SAME entities, so the same scenes are dirtied either way). Marks every listed scene
+   *  dirty on push AND on undo/redo (mirrors `notifyEdited()`'s own unconditional bump on
+   *  all three) — skipped when `_isFileDirect` (that action's write is already on disk,
+   *  nothing pending). Omit for actions with no live-world entity effect (selection). */
+  affectedScenes?: string[];
   /** Consecutive actions sharing a non-null `coalesceKey`, pushed within
    *  COALESCE_MS of each other, merge into the existing top entry: its `redo`
    *  (and `label`) advance to the latest edit while its original `undo` — the
@@ -122,6 +142,13 @@ export function getUndoVersion(): number { return _version; }
 // reads as dirty. A spurious "save or pass force" is a nuisance; the reverse is data loss.
 let _editVersion = 0;
 function notifyEdited() { _editVersion++; }
+/** Mark every scene an action's entities belong to as dirty (Phase 12, M2) — the same
+ *  skip condition as `notifyEdited()` (a selection or file-direct action has no
+ *  live-world edit to attribute to a scene). */
+function markAffectedScenesDirty(action: UndoAction) {
+  if (action._isSelection || action._isFileDirect) return;
+  for (const guid of action.affectedScenes ?? []) markSceneDirty(guid);
+}
 /** Monotonic count of non-selection edits. Compare against a snapshot to detect unsaved work. */
 export function getEditVersion(): number { return _editVersion; }
 /** The in-flight coalesce chain: which key, and when it last advanced. Reset by
@@ -164,7 +191,8 @@ function serialize<T>(op: () => Promise<T>): Promise<T> {
 /** Push a new action. Clears redo stack. */
 export function pushAction(action: UndoAction) {
   if (_executing) return; // don't push during undo/redo execution
-  if (!action._isSelection) notifyEdited(); // a real edit → the world now differs from disk
+  if (!action._isSelection && !action._isFileDirect) notifyEdited(); // a real edit → the world now differs from disk
+  markAffectedScenesDirty(action);
   // Coalesce consecutive same-key edits (opt-in via coalesceKey) into the top
   // entry instead of stacking one per keystroke.
   if (action.coalesceKey != null) {
@@ -233,7 +261,8 @@ export function undo(): Promise<boolean> {
     _executing = true;
     try { await action.undo(); } finally { _executing = false; }
     redoStack.push(action);
-    if (!action._isSelection) notifyEdited(); // the world moved relative to disk
+    if (!action._isSelection && !action._isFileDirect) notifyEdited(); // the world moved relative to disk
+    markAffectedScenesDirty(action);
     notifyUndoChanged();
     editorEmit('!undo', buildEditorPayload(action));
     return true;
@@ -249,7 +278,8 @@ export function redo(): Promise<boolean> {
     _executing = true;
     try { await action.redo(); } finally { _executing = false; }
     undoStack.push(action);
-    if (!action._isSelection) notifyEdited(); // the world moved relative to disk
+    if (!action._isSelection && !action._isFileDirect) notifyEdited(); // the world moved relative to disk
+    markAffectedScenesDirty(action);
     notifyUndoChanged();
     editorEmit('!redo', buildEditorPayload(action));
     return true;

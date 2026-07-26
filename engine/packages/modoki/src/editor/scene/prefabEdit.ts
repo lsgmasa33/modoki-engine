@@ -9,7 +9,7 @@
 
 import type { PrefabFile } from './prefab';
 import { serializePrefab, writePrefabFile, setPrefabCache, preloadNestedPrefabs } from './prefab';
-import { collectResourceRefs, setCurrentScenePath, getCurrentScenePath, saveScene, type SerializedEntity } from './serialize';
+import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, type SerializedEntity } from './serialize';
 import { swapHistory } from '../undo/undoManager';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import type { SceneData, SceneEntityEntry } from '../../runtime/loaders/loadSceneFile';
@@ -134,6 +134,7 @@ export async function openPrefabForEditing(asset: { path: string; name: string }
     return;
   }
   setCurrentScenePath(null); // normal scene-save must not target a real file
+  setCurrentBaseScene(undefined); // the prefab-edit scene never carries a baseScene
   // Swap to this prefab-edit context's OWN undo stack (keyed by the synthetic
   // prefab-edit path). The main scene's stack is saved and restored when
   // exitPrefabEdit reloads the return scene (via the serialize.loadScene wrapper).

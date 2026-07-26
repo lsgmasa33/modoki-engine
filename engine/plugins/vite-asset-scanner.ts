@@ -357,9 +357,9 @@ export function detectType(relPath: string, ext: string): string | null {
  *  `rel` is the forward-slash relative/url path. Pure — exported for unit testing
  *  the exact regression the inline comment warns about. */
 /** What a watched .json change asks the live renderer to do. 'scene'/'prefab' hot-reload the
- *  world; 'animation' only invalidates the clip cache (reloading the scene would be wrong —
- *  and would discard unsaved work). */
-export type LiveReloadKind = 'scene' | 'prefab' | 'animation';
+ *  world; 'animation' and 'timeline' only invalidate their asset cache (reloading the scene
+ *  would be wrong — and would discard unsaved work). */
+export type LiveReloadKind = 'scene' | 'prefab' | 'animation' | 'timeline';
 
 export function classifySceneChange(rel: string): LiveReloadKind | null {
   const type = detectType(rel, '.json');
@@ -371,6 +371,13 @@ export function classifySceneChange(rel: string): LiveReloadKind | null {
   // modoki_write_asset and the headline case for this whole feature: the user's own Claude
   // Code editing the .anim.json with a plain file Write. (C7)
   if (type === 'animation') return 'animation';
+  // A .timeline.json edit must INVALIDATE the renderer's timeline cache, for exactly the same
+  // reason (and with exactly the same history) as the animation clip above: `invalidateTimeline`
+  // was exported, tested, and had ZERO production callers, so `timelineCache` held the pre-edit
+  // definition forever. The failure mode is especially misleading — the OLD markers keep firing
+  // on schedule, so captions still update and effects still toggle; it just looks like the new
+  // marker params are ignored. Only a renderer reload cleared it.
+  if (type === 'timeline') return 'timeline';
   if (type === 'scene' && (rel.includes('/scenes/') || rel.endsWith('/scene.json'))) return 'scene';
   return null;
 }
@@ -1046,6 +1053,30 @@ export function isGameCodeFile(
   return true;
 }
 
+/** True for an engine SHADER-GRAPH module — anything under `runtime/rendering/postfx/` or
+ *  `runtime/rendering/npr/`. These are the TSL files whose node instances BAKE INTO a compiled
+ *  WGSL pipeline, so hot-patching the module leaves the renderer running the PREVIOUSLY compiled
+ *  graph and the edit appears to do nothing.
+ *
+ *  Why a path rule here instead of `import.meta.hot.invalidate()` in each file (which is what
+ *  these modules used to do, and what this replaces): `invalidate()` does NOT force a reload — it
+ *  propagates the update to importers and stops at the first one that ACCEPTS. The only importer
+ *  is `runtime/rendering/Scene3D.tsx`, a React Fast Refresh boundary that self-accepts, so the
+ *  reload was swallowed; Fast Refresh then re-ran the component but not its `[]`-deps effect, so
+ *  the already-constructed PostFXStack — holding the old compiled WGSL — survived untouched. That
+ *  is the whole bug: a CORRECT shader fix reads as "didn't work" (measured three times in a row
+ *  while fixing a DOF viewZ bug), so it gets reverted and the real cause is chased elsewhere.
+ *  Deciding it by path on the server can't be swallowed by anything in the module graph.
+ *
+ *  Matched against the path RELATIVE to nothing in particular — these directories are unique to
+ *  the engine package, and the check is anchored on `runtime/rendering/` so an unrelated project
+ *  folder merely NAMED `npr/` can't trigger a reload. Pure — exported for unit testing. */
+export function isShaderGraphFile(file: string): boolean {
+  const norm = file.replace(/\\/g, '/');
+  if (!/\.(ts|tsx)$/i.test(norm)) return false;
+  return norm.includes('/runtime/rendering/postfx/') || norm.includes('/runtime/rendering/npr/');
+}
+
 export function assetScannerPlugin(): Plugin {
   let projectRoot = '';
   // The EDITOR's own root (the Vite root is engine/, so its parent is the repo
@@ -1147,6 +1178,17 @@ export function assetScannerPlugin(): Plugin {
           // unconditional reload would silently destroy unsaved scene edits (there is no
           // beforeunload guard anywhere). See app/debug/hmrStaleness.ts.
           try { viteServer.ws.send({ type: 'custom', event: 'modoki:game-code-changed', data: { file: ctx.file } }); }
+          catch { /* ws not ready */ }
+        }
+        return [];
+      }
+      // Engine SHADER GRAPH (postfx/npr TSL): same "only a reload can apply this" situation as
+      // game code, for a different reason — the old node graph is already baked into a compiled
+      // pipeline. Reuses the SAME renderer-decides handshake, so a shader edit can't silently
+      // destroy unsaved scene edits either. See isShaderGraphFile + app/debug/hmrStaleness.ts.
+      if (isShaderGraphFile(ctx.file)) {
+        if (viteServer) {
+          try { viteServer.ws.send({ type: 'custom', event: 'modoki:shader-code-changed', data: { file: ctx.file } }); }
           catch { /* ws not ready */ }
         }
         return [];

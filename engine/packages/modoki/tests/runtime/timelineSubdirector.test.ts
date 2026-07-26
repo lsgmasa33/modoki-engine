@@ -231,3 +231,40 @@ describe('sub-directors (nested timelines)', () => {
     expect(beats[0].tick).toBe(61); // t=2 → tick 61
   });
 });
+
+describe('sub-directors — deactivation freezes a nested child too', () => {
+  /** Belt and braces: PASS 1 already skips a slaved child (its parent owns it), so without a
+   *  guard inside `driveSubdirector` a deactivated NESTED Director would keep being driven and
+   *  `isActive: false` would do nothing at all for it. */
+  it('does not drive an INACTIVE child, and fires none of its markers', () => {
+    tw = createTestWorld({ dt: DT, systems: [TIMELINE], actions: NOOP });
+    authorNested();
+    const parent = tw.spawn(EntityAttributes({ name: 'Parent', guid: 'parent-guid' }), Director({ timeline: PARENT }));
+    const child = tw.spawn(EntityAttributes({ name: 'Child', guid: 'child-guid', parentId: parent.id(), isActive: false }), Director({ timeline: CHILD, playing: true }));
+
+    tw.step(200);
+
+    expect(child.get(Director)!.time).toBe(0);
+    const beats = tw.events({ type: '@marker' }).filter((e) => (e.payload as { action: string }).action === 'childBeat');
+    expect(beats).toHaveLength(0);
+    expect(bySeq(tw, 'child-guid')).toHaveLength(0);
+    // The parent is unaffected — only the child was switched off.
+    expect(parent.get(Director)!.time).toBeGreaterThan(0);
+  });
+
+  it('an inactive PARENT freezes its slaved child instead of setting it free', () => {
+    // The subtle one: `collectSlavedDirectors` deliberately scans ALL directors, including
+    // inactive ones. If it skipped them, deactivating the parent would UN-SLAVE the child and
+    // set it self-advancing on its own clock — the opposite of switching the parent off.
+    tw = createTestWorld({ dt: DT, systems: [TIMELINE], actions: NOOP });
+    authorNested();
+    const parent = tw.spawn(EntityAttributes({ name: 'Parent', guid: 'parent-guid', isActive: false }), Director({ timeline: PARENT }));
+    const child = tw.spawn(EntityAttributes({ name: 'Child', guid: 'child-guid', parentId: parent.id() }), Director({ timeline: CHILD, playing: true }));
+
+    tw.step(200);
+
+    expect(parent.get(Director)!.time).toBe(0);
+    expect(child.get(Director)!.time).toBe(0); // frozen WITH its parent, not running free
+    expect(tw.events({ type: '@marker' })).toHaveLength(0);
+  });
+});

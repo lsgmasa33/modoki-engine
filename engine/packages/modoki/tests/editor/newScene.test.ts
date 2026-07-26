@@ -22,7 +22,7 @@ import { newScene, getCurrentScenePath, setCurrentScenePath } from '../../src/ed
 import { WHITE_HDR_GUID } from '../../src/runtime/assets/builtinAssets';
 
 function registerAll() {
-  registerTrait({ name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: {}, isActive: {}, sortOrder: {}, parentId: {}, layer: {}, guid: {} } });
+  registerTrait({ name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: {}, isActive: {}, sortOrder: {}, parentId: { entityId: { onMissing: 'root' } }, layer: {}, guid: {} } });
   registerTrait({ name: 'Transform', trait: Transform, category: 'component', fields: { x: {}, y: {}, z: {}, rx: {}, ry: {}, rz: {}, sx: {}, sy: {}, sz: {} } });
   registerTrait({ name: 'Camera', trait: Camera, category: 'component', fields: { fov: {} } });
   registerTrait({ name: 'Environment', trait: Environment, category: 'component', fields: { hdrPath: {}, intensity: {} } });

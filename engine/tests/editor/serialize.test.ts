@@ -2,7 +2,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createWorld } from 'koota';
-import { getCurrentWorld, loadSceneFile } from '@modoki/engine/runtime';
+import { getCurrentWorld, loadSceneFile, SCENE_FORMAT_VERSION } from '@modoki/engine/runtime';
 import { Transform, Renderable3D, Renderable3DPrimitive, EntityAttributes, Time, Paused, Transient, PrefabInstance } from '@modoki/engine/runtime';
 import { RenderableUI, UIElement, UIBinding, UIAction } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -36,7 +36,7 @@ describe('serializeScene', () => {
 
   it('serializes all entities with current version format', async () => {
     const scene = await serializeScene();
-    expect(scene.version).toBe(9);
+    expect(scene.version).toBe(SCENE_FORMAT_VERSION);
     expect(scene.createdAt).toBeDefined();
     expect(scene.resources).toBeDefined();
     expect(Array.isArray(scene.resources)).toBe(true);

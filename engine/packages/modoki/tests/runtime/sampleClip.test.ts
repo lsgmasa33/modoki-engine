@@ -29,7 +29,8 @@ const WIDGET_MODES = ['fitW', 'fitH', 'fill'];
 const Panel = trait({ w: 0 });
 /** A throwaway tag trait (no fields), to exercise the tag-category skip. */
 const TagOnly = trait();
-import { applyClipAtTime, applyClipAtTimeBlended, advanceClipTime, buildEntityIndex, resolveTrackTarget } from '../../src/runtime/animation/sampleClip';
+import { applyClipAtTime, applyClipAtTimeBlended, advanceClipTime } from '../../src/runtime/animation/sampleClip';
+import { buildEntityIndex, resolveTrackTarget } from '../../src/runtime/ecs/entityIndex';
 import type { AnimationClipDef, Keyframe } from '../../src/runtime/animation/types';
 
 const key = (t: number, v: number): Keyframe => ({ t, v, inTangent: 0, outTangent: 0 });

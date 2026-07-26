@@ -48,7 +48,7 @@ vi.mock('three/examples/jsm/loaders/GLTFLoader.js', () => ({
 vi.mock('../../src/runtime/ecs/traitRegistry', () => {
   const traits = [
     { name: 'Transform', trait: Transform, category: 'component', fields: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' }, rx: { type: 'number' }, ry: { type: 'number' }, rz: { type: 'number' }, sx: { type: 'number' }, sy: { type: 'number' }, sz: { type: 'number' } } },
-    { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: { type: 'string' }, isActive: { type: 'boolean' }, sortOrder: { type: 'number' }, parentId: { type: 'number' }, layer: { type: 'string' }, guid: { type: 'string' } } },
+    { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: { type: 'string' }, isActive: { type: 'boolean' }, sortOrder: { type: 'number' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, layer: { type: 'string' }, guid: { type: 'string' } } },
     { name: 'Renderable3D', trait: Renderable3D, category: 'component', fields: { mesh: { type: 'string' }, material: { type: 'string' }, isVisible: { type: 'boolean' } } },
     { name: 'PlayerProfile', trait: PlayerProfile, category: 'component', fields: { score: { type: 'number' }, level: { type: 'number' } } },
     { name: 'Persistent', trait: null as any, category: 'tag', fields: {} }, // patched in beforeEach
@@ -483,6 +483,60 @@ describe('SceneManager — persistent entities', () => {
     // Children should be parented to the new root id (different from old)
     const childNames = namesByParent.get(newRootId)?.sort();
     expect(childNames).toEqual(['Child1', 'Child2']);
+  });
+
+  it('carries multiple persistent subtrees in OLD-ID order, not BFS/subtree-grouped order (Phase 3, scene-loading.md)', async () => {
+    // Regression test for the "carry-order" fix (commit aa562944): snapshotPersistentEntities
+    // used to return entities in BFS/subtree order (root A + all its descendants, THEN root B +
+    // its descendants), which does NOT match the order a COLD load would produce (file/id order).
+    // That mismatch was pure diff noise on every save of a scene that carried >1 persistent
+    // subtree. The fix sorts the snapshot by OLD ecs id before handing it to loadSceneFile, so
+    // the respawn order (and therefore the NEW ids assigned in the destination world) reproduces
+    // id order instead of being regrouped by root.
+    defineSceneA();
+    defineSceneB_sharedM2();
+    const { sceneManager } = await getSceneManager();
+    const { markPersistent } = await import('../../src/runtime/traits/Persistent');
+    const { getCurrentWorld } = await getWorld();
+
+    await sceneManager.loadScene('/sceneA.json');
+
+    const mainWorld = getCurrentWorld();
+    // Spawn order deliberately interleaves two persistent subtrees so BFS-grouped order
+    // and ascending-id order diverge: rootA, rootB, childA1, childB1, childA2.
+    const rootA = mainWorld.spawn(Transform({ x: 1 }), EntityAttributes({ name: 'RootA', parentId: 0 }));
+    markPersistent(rootA, 'guid-root-a');
+    const rootB = mainWorld.spawn(Transform({ x: 2 }), EntityAttributes({ name: 'RootB', parentId: 0 }));
+    markPersistent(rootB, 'guid-root-b');
+    mainWorld.spawn(Transform({ x: 3 }), EntityAttributes({ name: 'ChildA1', parentId: rootA.id() }));
+    mainWorld.spawn(Transform({ x: 4 }), EntityAttributes({ name: 'ChildB1', parentId: rootB.id() }));
+    mainWorld.spawn(Transform({ x: 5 }), EntityAttributes({ name: 'ChildA2', parentId: rootA.id() }));
+
+    await sceneManager.loadScene('/sceneB.json');
+
+    // Carried entities respawn AFTER scene B's own entities, so their relative spawn
+    // (= new-id) order directly reflects snapshotPersistentEntities' output order.
+    const newWorld = getCurrentWorld();
+    const idByName = new Map<string, number>();
+    newWorld.query(EntityAttributes).updateEach(([attr]: any[], entity: { id(): number }) => {
+      idByName.set((attr as any).name as string, entity.id());
+    });
+
+    const carriedNames = ['RootA', 'RootB', 'ChildA1', 'ChildB1', 'ChildA2'];
+    const orderedByNewId = carriedNames
+      .filter((n) => idByName.has(n))
+      .sort((a, b) => idByName.get(a)! - idByName.get(b)!);
+
+    // Ascending-OLD-id order (the fix): RootA < RootB < ChildA1 < ChildB1 < ChildA2.
+    // BFS/subtree-grouped order (the bug) would instead produce:
+    // RootA, ChildA1, ChildA2, RootB, ChildB1.
+    expect(orderedByNewId).toEqual(['RootA', 'RootB', 'ChildA1', 'ChildB1', 'ChildA2']);
+
+    // Release both worlds' ids — koota caps live worlds at 16 process-wide and this
+    // file is already at budget across its other tests (see the "beforeSwap hooks"
+    // comment below); this test uses 2 (mainWorld + newWorld) that nothing else needs.
+    mainWorld.destroy();
+    newWorld.destroy();
   });
 
   it('same-name scene root with a different guid is NOT shadowed', async () => {

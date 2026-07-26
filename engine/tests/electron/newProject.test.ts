@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { scaffoldProject, slugify } from '../../electron/newProject';
+import { SCENE_FORMAT_VERSION } from '@modoki/engine/runtime';
 
 const TEMPLATE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../templates/starter');
 const tmps: string[] = [];
@@ -65,7 +66,7 @@ describe('scaffoldProject', () => {
     const scene = JSON.parse(fs.readFileSync(scenePath, 'utf8'));
     const template = JSON.parse(fs.readFileSync(path.join(TEMPLATE_DIR, 'runtime/assets/scenes/main.json'), 'utf8'));
 
-    expect(scene.version).toBe(9);
+    expect(scene.version).toBe(SCENE_FORMAT_VERSION);
     expect(scene.id).not.toBe(template.id);
 
     const guids = scene.entities.map((e: { traits: { EntityAttributes: { guid: string } } }) => e.traits.EntityAttributes.guid);

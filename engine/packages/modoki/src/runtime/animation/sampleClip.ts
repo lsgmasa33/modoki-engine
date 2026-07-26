@@ -8,58 +8,15 @@
  */
 
 import type { World } from 'koota';
-import { EntityAttributes } from '../traits/EntityAttributes';
+// The entity index is engine core (runtime/ecs/entityIndex.ts) — the renderer, the sequencer
+// and 2D deform all use it too, so it is not an animation detail. Imported, NOT re-exported:
+// one source of truth per symbol, so nobody has to wonder which path is canonical.
+import { buildEntityIndex, resolveTrackTarget, type Ent, type EntityIndex } from '../ecs/entityIndex';
 import { getTraitByName, type TraitMeta } from '../ecs/traitRegistry';
 import { markUIDirty } from '../ui/uiTreeStore';
 import { evalTrackValue } from './curveEval';
 import { setPath } from './pathValue';
 import type { AnimationClipDef, AnimationTrack } from './types';
-
-/** koota entity handle (minimal surface we use). */
-type Ent = {
-  id(): number;
-  has(trait: unknown): boolean;
-  get(trait: unknown): Record<string, unknown> | undefined;
-  set(trait: unknown, value: Record<string, unknown>): void;
-};
-
-export interface EntityIndex {
-  byId: Map<number, Ent>;
-  /** parentId → (childName → child entity id). Last writer wins on duplicate names. */
-  childrenByParent: Map<number, Map<string, number>>;
-}
-
-/** Build a one-shot index of the world's entities by id + name-keyed children.
- *  A single EntityAttributes query; build ONCE per frame and pass it to every
- *  `applyClipAtTime` call so N animators cost O(N + entities), not O(N × entities). */
-export function buildEntityIndex(world: World): EntityIndex {
-  const byId = new Map<number, Ent>();
-  const childrenByParent = new Map<number, Map<string, number>>();
-  world.query(EntityAttributes).updateEach(([attr]: [Record<string, unknown>], entity: Ent) => {
-    const id = entity.id();
-    byId.set(id, entity);
-    const parentId = (attr.parentId as number) ?? 0;
-    const name = (attr.name as string) ?? '';
-    let bucket = childrenByParent.get(parentId);
-    if (!bucket) { bucket = new Map(); childrenByParent.set(parentId, bucket); }
-    bucket.set(name, id);
-  });
-  return { byId, childrenByParent };
-}
-
-/** Resolve a relative name-path from `rootId` to a descendant entity id, or null.
- *  "" resolves to the root itself. */
-export function resolveTrackTarget(index: EntityIndex, rootId: number, path: string): number | null {
-  if (!path) return index.byId.has(rootId) ? rootId : null;
-  let current = rootId;
-  for (const seg of path.split('/')) {
-    if (!seg) continue;
-    const child = index.childrenByParent.get(current)?.get(seg);
-    if (child === undefined) return null;
-    current = child;
-  }
-  return current;
-}
 
 /** Coerce an evaluated number to the value a trait field expects. Enum tracks
  *  store an option index, so the field's static option list maps it back to the

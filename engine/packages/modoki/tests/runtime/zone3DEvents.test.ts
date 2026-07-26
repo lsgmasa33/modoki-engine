@@ -332,3 +332,99 @@ describe('Zone3D triggers — shape coverage', () => {
     expect(insideFires(mk(), 0, 0, 3.1)).toBe(false);      // outside Z half-extent
   });
 });
+
+describe('Zone3D triggers — deactivation means GONE, not paused', () => {
+  /** A deactivated zone/occupant drops out of the frame's lists, so the existing membership diff
+   *  synthesizes the exits — the same path a DESPAWNED zone takes. The property that matters is
+   *  LEDGER BALANCE: anything that got an `enter` gets its `exit`, so a listener counting
+   *  occupants can never be left holding a phantom. (Contrast Director, which freezes.) */
+  const phases = (hits: { phase: string }[]) => hits.map((h) => h.phase);
+
+  it('deactivating the ZONE fires exit for everyone inside', () => {
+    tw = createTestWorld({ systems: [ZONE] });
+    const zone = tw.spawn(Transform({ x: 0, y: 0, z: 0, sx: 4, sy: 4, sz: 4 }), Zone3D({ shape: 'box' }), EntityAttributes({ name: 'z' }));
+    const occ = tw.spawn(Transform({ x: 0, y: 0, z: 0 }), ZoneOccupant);
+    const hits: { phase: string }[] = [];
+    zone3DEvents.onZone((_z, _o, phase) => hits.push({ phase }), tw.world);
+
+    tw.step(1);
+    expect(phases(hits)).toEqual(['enter']);
+
+    zone.set(EntityAttributes, { ...zone.get(EntityAttributes)!, isActive: false });
+    tw.step(1);
+    expect(phases(hits)).toEqual(['enter', 'exit']);
+
+    tw.step(3); // and it stays quiet while off — no re-fire storm
+    expect(phases(hits)).toEqual(['enter', 'exit']);
+    void occ;
+  });
+
+  it('re-activating the zone fires a fresh enter for whoever is still inside', () => {
+    tw = createTestWorld({ systems: [ZONE] });
+    const zone = tw.spawn(Transform({ x: 0, y: 0, z: 0, sx: 4, sy: 4, sz: 4 }), Zone3D({ shape: 'box' }), EntityAttributes({ name: 'z' }));
+    tw.spawn(Transform({ x: 0, y: 0, z: 0 }), ZoneOccupant);
+    const hits: { phase: string }[] = [];
+    zone3DEvents.onZone((_z, _o, phase) => hits.push({ phase }), tw.world);
+
+    tw.step(1);
+    zone.set(EntityAttributes, { ...zone.get(EntityAttributes)!, isActive: false });
+    tw.step(1);
+    zone.set(EntityAttributes, { ...zone.get(EntityAttributes)!, isActive: true });
+    tw.step(1);
+
+    expect(phases(hits)).toEqual(['enter', 'exit', 'enter']);
+  });
+
+  it('deactivating an OCCUPANT exits it from the zone, leaving other occupants alone', () => {
+    tw = createTestWorld({ systems: [ZONE] });
+    tw.spawn(Transform({ x: 0, y: 0, z: 0, sx: 4, sy: 4, sz: 4 }), Zone3D({ shape: 'box' }));
+    const a = tw.spawn(Transform({ x: 0, y: 0, z: 0 }), ZoneOccupant, EntityAttributes({ name: 'a' }));
+    const b = tw.spawn(Transform({ x: 0.5, y: 0, z: 0 }), ZoneOccupant, EntityAttributes({ name: 'b' }));
+    const hits: { other: number; phase: string }[] = [];
+    zone3DEvents.onZone((_z, o, phase) => hits.push({ other: o.id(), phase }), tw.world);
+
+    tw.step(1);
+    expect(hits.filter((h) => h.phase === 'enter')).toHaveLength(2);
+
+    a.set(EntityAttributes, { ...a.get(EntityAttributes)!, isActive: false });
+    tw.step(2);
+
+    const exits = hits.filter((h) => h.phase === 'exit');
+    expect(exits).toHaveLength(1);
+    expect(exits[0].other).toBe(a.id());     // only the deactivated one left
+    expect(b.get(EntityAttributes)!.isActive).toBe(true);
+  });
+
+  it('CASCADES — deactivating a zone\'s parent exits its occupants too', () => {
+    tw = createTestWorld({ systems: [ZONE] });
+    const parent = tw.spawn(Transform({ x: 0, y: 0, z: 0 }), EntityAttributes({ name: 'group' }));
+    tw.spawn(
+      Transform({ x: 0, y: 0, z: 0, sx: 4, sy: 4, sz: 4 }), Zone3D({ shape: 'box' }),
+      EntityAttributes({ name: 'z', parentId: parent.id() }),
+    );
+    tw.spawn(Transform({ x: 0, y: 0, z: 0 }), ZoneOccupant);
+    const hits: { phase: string }[] = [];
+    zone3DEvents.onZone((_z, _o, phase) => hits.push({ phase }), tw.world);
+
+    tw.step(1);
+    parent.set(EntityAttributes, { ...parent.get(EntityAttributes)!, isActive: false });
+    tw.step(1);
+
+    expect(phases(hits)).toEqual(['enter', 'exit']);
+  });
+
+  it('the LAST active zone going inactive still flushes its exits', () => {
+    // Guards the early-out: an all-inactive zone list must still run the diff, not return early.
+    tw = createTestWorld({ systems: [ZONE] });
+    const zone = tw.spawn(Transform({ x: 0, y: 0, z: 0, sx: 4, sy: 4, sz: 4 }), Zone3D({ shape: 'box' }), EntityAttributes({ name: 'only' }));
+    tw.spawn(Transform({ x: 0, y: 0, z: 0 }), ZoneOccupant);
+    const hits: { phase: string }[] = [];
+    zone3DEvents.onZone((_z, _o, phase) => hits.push({ phase }), tw.world);
+
+    tw.step(1);
+    zone.set(EntityAttributes, { ...zone.get(EntityAttributes)!, isActive: false });
+    tw.step(1);
+
+    expect(phases(hits)).toEqual(['enter', 'exit']);
+  });
+});

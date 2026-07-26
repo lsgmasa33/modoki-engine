@@ -63,7 +63,7 @@ vi.mock('../../src/runtime/ecs/traitRegistry', () => {
       name: 'EntityAttributes', trait: EntityAttributes, category: 'component',
       fields: {
         name: { type: 'string' }, isActive: { type: 'boolean' },
-        sortOrder: { type: 'number' }, parentId: { type: 'number' },
+        sortOrder: { type: 'number' }, parentId: { type: 'number', entityId: { onMissing: 'root' } },
         layer: { type: 'string' },
       },
     },

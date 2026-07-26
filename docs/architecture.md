@@ -97,6 +97,35 @@ Every entity carries the **`EntityAttributes`** trait
 `guid` is the entity's stable UUID that survives scene swaps and cross-prefab
 references.
 
+### `isActive` — who honours it, and what "off" means to them
+
+`isActive: false` switches an entity **and every descendant** off. There are two readings of
+the CASCADE and two readings of what a subsystem should DO, so both are pinned here rather
+than rediscovered per subsystem:
+
+- **The cascade** is computed two ways, deliberately. RENDERERS read `deactivatedEntities`, the
+  set built by `transformPropagationSystem` (a THREE module, priority 200). SIM systems use
+  `isEntityActiveInHierarchy` (`runtime/ecs/entityIndex.ts`), which walks `parentId` over the
+  per-frame entity index — because the renderer set comes from THREE (it would drag three into a
+  2D-only bundle), is one frame stale for anything running before priority 200, and is always
+  empty headless (the harness registers no propagation system), which would make any guard built
+  on it silently inert *and* untestable.
+- **What "off" means is per-subsystem, and that is not an inconsistency.** A [Director](./timeline.md)
+  FREEZES — the playhead holds and resumes where it stopped, because a playhead has no ledger to
+  keep balanced. A [Zone trigger](./zones.md) fires `exit` and behaves as if DESPAWNED, because it
+  does have one: anything that received an `enter` must receive its `exit`, or a listener counting
+  occupants is left holding a phantom.
+
+| Subsystem | Honours `isActive`? | "Off" means |
+|---|---|---|
+| Rendering (3D/2D/UI, lights, particles) | yes | not drawn |
+| `Director` / timeline | yes | frozen; resumes where it stopped |
+| Zone triggers (2D + 3D) | yes | `exit` fires; re-activating fires a fresh `enter` |
+| Physics (Rapier 2D/3D) | **no** | body keeps simulating and colliding |
+
+Physics is the remaining gap. It needs a decision first — whether a deactivated body leaves the
+Rapier world entirely or stays as an inert ghost — so it was left out rather than guessed at.
+
 ## Traits
 
 Components are koota traits, defined under `packages/modoki/src/runtime/traits/`

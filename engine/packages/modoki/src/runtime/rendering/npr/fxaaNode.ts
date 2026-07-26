@@ -1,6 +1,8 @@
-// HMR: see NPRPostProcess.ts — wgslFn instances baked into compiled pipelines
-// can't safely hot-reload.
-if (import.meta.hot) import.meta.hot.invalidate();
+// HMR: this module's TSL nodes bake into compiled WGSL pipelines, so an edit here needs a full
+// RELOAD, not a hot patch. The dev server forces one by path (isShaderGraphFile in
+// plugins/vite-asset-scanner.ts). Do NOT re-add `import.meta.hot.invalidate()` — it only
+// propagates to importers and was silently swallowed by Scene3D.tsx's Fast Refresh boundary,
+// which is exactly how a correct shader fix ended up looking broken.
 
 /** FXAA — Fast Approximate Anti-Aliasing in raw WGSL.
  *
@@ -26,17 +28,11 @@ const fxaaFn = wgslFn(`
     tex: texture_2d<f32>,
     samp: sampler,
     texelSize: vec2<f32>,
-    enabled: f32,
     edgeThreshold: f32,
     edgeThresholdMin: f32,
     blendStrength: f32
   ) -> vec4<f32> {
     let rgbM = textureSample(tex, samp, uv).rgb;
-
-    // Live toggle — skip all AA work when disabled.
-    if (enabled < 0.5) {
-      return vec4<f32>(rgbM, 1.0);
-    }
 
     let lumaCoef = vec3<f32>(0.299, 0.587, 0.114);
 
@@ -81,14 +77,19 @@ const fxaaFn = wgslFn(`
 `);
 
 /** Build an FXAA output node that samples `inputTex` (an RTT/TextureNode) and
- *  returns the antialiased screen color. Pass it to `pipeline.outputNode`.
+ *  returns the antialiased screen color.
  *
- *  All threshold uniforms come from the caller so they can be live-tunable —
- *  reuse the NPRUniforms that the post-process owner already created. */
+ *  All threshold uniforms come from the caller so they can be live-tunable.
+ *
+ *  There is deliberately NO `enabled` uniform. This used to carry one, because
+ *  `NPRPostProcess` wired FXAA as its permanent pipeline output and needed an
+ *  in-shader branch to switch it off. In the post-FX stack, FXAA is an ordinary
+ *  stage: it exists in the chain only when it is on, so the branch was dead code
+ *  that implied a live toggle the stack does not have. Presence IS the toggle —
+ *  the same contract as every other stage (bloom, vignette, DOF). */
 export function buildFXAANode(opts: {
   inputTex: unknown;
   texelSize: unknown;
-  enabled: unknown;
   edgeThreshold: unknown;
   edgeThresholdMin: unknown;
   blendStrength: unknown;
@@ -98,7 +99,6 @@ export function buildFXAANode(opts: {
     tex: opts.inputTex,
     samp: (sampler as unknown as (t: unknown) => unknown)(opts.inputTex),
     texelSize: opts.texelSize,
-    enabled: opts.enabled,
     edgeThreshold: opts.edgeThreshold,
     edgeThresholdMin: opts.edgeThresholdMin,
     blendStrength: opts.blendStrength,

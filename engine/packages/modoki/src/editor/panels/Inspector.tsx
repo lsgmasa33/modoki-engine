@@ -44,6 +44,7 @@ import { EnvironmentAssetView } from './assetViews/EnvironmentAssetView';
 import { FontAssetView } from './assetViews/FontAssetView';
 import { ModelAssetView } from './assetViews/ModelAssetView';
 import { ShaderAssetView } from './assetViews/ShaderAssetView';
+import { SceneAssetView } from './assetViews/SceneAssetView';
 import { openAssetInEditor } from './openAssetInEditor';
 import { isSelfPlacementDisabled } from '../uiAuthoring';
 import { onEditorDirty } from '../../runtime/ui/uiTreeStore';
@@ -752,7 +753,9 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
   // context, the group anchored at its first member's position. Memoized on
   // `meta` (static per trait) so we don't rebuild on every value edit.
   const { topItems, sections, fieldCount } = useMemo(() => {
-    const entries = Object.entries(meta.fields);
+    // `hidden` fields (e.g. EntityAttributes.sourceScene) are real registered
+    // fields for every serialize/snapshot path but must never render here.
+    const entries = Object.entries(meta.fields).filter(([, hint]) => !hint.hidden);
     // First pass: collect each group's member fields + its section (from the
     // first member — all members of a group share one section by construction).
     const groupFields = new Map<string, { key: string; hint: FieldHint }[]>();
@@ -1330,12 +1333,15 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
         )}
 
         {asset.type === 'scene' && (
-          <button
-            onClick={() => openAssetInEditor({ path: asset.path, type: 'scene', name: asset.name })}
-            style={reimportBtnStyle}
-          >
-            Open Scene
-          </button>
+          <>
+            <button
+              onClick={() => openAssetInEditor({ path: asset.path, type: 'scene', name: asset.name })}
+              style={reimportBtnStyle}
+            >
+              Open Scene
+            </button>
+            <SceneAssetView path={asset.path} name={asset.name} />
+          </>
         )}
 
         {asset.type === 'animset' && <AnimSetAssetView path={asset.path} />}
@@ -1371,6 +1377,13 @@ export default function Inspector() {
   const [entityName, setEntityName] = useState('');
   const [overrides, setOverrides] = useState<Set<string>>(new Set());
   const [nonSharedTraits, setNonSharedTraits] = useState<string[]>([]);
+  // Phase 13 (scene-loading.md): which selection is unlocked for
+  // in-place editing of a ghosted base entity — store-backed (not local state) so
+  // the SceneView gizmo reads the SAME unlock (see editorStore.ts's own doc
+  // comment). A selection change automatically re-locks: the stored key stops
+  // matching the new selKey.
+  const unlockedFor = useEditorStore((s) => s.unlockedGhostSelKey);
+  const setUnlockedFor = useEditorStore((s) => s.setUnlockedGhostSelKey);
 
   const multi = selectedIds.length > 1;
   // Stable dependency key so the effect re-runs when the selection set changes
@@ -1405,6 +1418,7 @@ export default function Inspector() {
       for (const { meta, data } of result) {
         if (!data || meta.category !== 'component') continue;
         for (const [key, hint] of Object.entries(meta.fields)) {
+          if (hint.hidden) continue; // e.g. EntityAttributes.sourceScene — not a display name
           if (hint.type === 'string' && data[key]) {
             setEntityName(String(data[key]));
             return;
@@ -1554,6 +1568,23 @@ export default function Inspector() {
     );
   }
 
+  // Base-scene ghost (Phase 9, REVERSED by Phase 12/13 — base-scene-and-persistence-
+  // plan.md): a base-origin entity (EntityAttributes.sourceScene non-empty) stays
+  // selectable + inspectable; its fields are DISABLED BY DEFAULT but unlockable
+  // in-place (no more "edit it by opening the base scene" — the owner asked for
+  // in-place editing 2026-07-26, reversing Phase 9's original design). `sourceScene`
+  // is a real registered field (`hidden: true` only hides it from TraitSection's OWN
+  // render loop, see meta.fields filtering there), so it's present on the merged
+  // EntityAttributes data read here. Anchors on the PRIMARY (first) selected entity
+  // — a multi-selection spanning primary + base entities is an edge case this
+  // doesn't specially handle, matching Phase 9's original scope (no cross-scene
+  // guard changes).
+  const ghosted = !!traits.find((t) => t.meta.name === 'EntityAttributes')?.data?.['sourceScene'];
+  // Unlocked only for THIS exact selection (see unlockedFor's own doc comment) — an
+  // edit here persists to the BASE's OWN file (Phase 12's serializeScene({scene})),
+  // not the currently-open level's, on the next Save All.
+  const unlocked = unlockedFor === selKey;
+
   // Separate EntityAttributes from other components
   const entityAttr = traits.find((t) => t.meta.name === 'EntityAttributes');
   const components = traits
@@ -1658,8 +1689,38 @@ export default function Inspector() {
         <span style={{ color: '#555', fontSize: '10px', flexShrink: 0 }}>{multi ? `×${selectedIds.length}` : `id:${selectedId}`}</span>
       </div>
 
-      {/* Trait sections — auto-generated (excluding EntityAttributes) */}
-      <div style={{ flex: 1, overflow: 'auto' }}>
+      {/* Base-scene ghost banner (Phase 9, unlock added Phase 13) — selectable +
+          inspectable always; fields disabled UNLESS unlocked for this exact
+          selection. The failure mode this guards against: a human changing SHARED
+          rig while believing they changed one level — so the affordance stays loud
+          rather than a quiet toggle, and unlocking never sticks past a reselect. */}
+      {ghosted && (
+        <div style={{ padding: '4px 8px', borderBottom: '1px solid #333', background: '#22222e', color: unlocked ? '#f1c40f' : '#888', fontSize: '10px', fontStyle: 'italic', display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ flex: 1 }}>
+            {unlocked
+              ? '🔓 Editing a BASE entity — shared by every level using this base. Saved on the next Save All.'
+              : '🔗 From a base scene — shared by every level using it.'}
+          </span>
+          <button
+            onClick={() => setUnlockedFor(unlocked ? null : selKey)}
+            style={{ background: unlocked ? '#f1c40f' : '#333', color: unlocked ? '#000' : '#ccc', border: 'none', borderRadius: 3, padding: '2px 6px', fontSize: '10px', cursor: 'pointer', flexShrink: 0 }}
+            title={unlocked ? 'Re-lock (re-selecting also re-locks)' : 'Unlock to edit this base entity in place'}
+            data-ui-id="inspector.ghost.unlock" data-ui-kind="button" data-ui-label={unlocked ? 're-lock base entity' : 'unlock base entity'}
+          >
+            {unlocked ? 'Lock' : 'Unlock'}
+          </button>
+        </div>
+      )}
+
+      {/* Trait sections — auto-generated (excluding EntityAttributes). Ghosted AND
+          still locked: fields stay visible (inspectable) but inert — pointer-events
+          off + dimmed, the simplest gate that can't miss a field TYPE the way
+          threading a disabled flag through every renderer (number/string/color/
+          bool/enum/vec/asset-ref/entityRef/bindings/materialOverrides…)
+          individually could. Unlocked: fully live — writeTraitFieldWithUndo already
+          works on a base entity unchanged (Phase 12 made it dirty-track by scene,
+          not by which scene is OPEN). */}
+      <div style={{ flex: 1, overflow: 'auto', ...(ghosted && !unlocked ? { pointerEvents: 'none', opacity: 0.5 } : {}) }}>
         {components.map(({ meta, data, mixed }) => {
           if (!data) return null;
           // Don't allow removing core traits

@@ -21,6 +21,7 @@ import { captureInstanceOverrides, captureInstanceStructure, getPrefabSource, ge
 import type { AddedEntity, NestedOverridePaths } from '../../runtime/loaders/loadSceneFile';
 import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, collectResourceRefsFromEntities } from '../../runtime/loaders/loadSceneFile';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
+import { clearAllSceneDirty, clearSceneDirty, isSceneDirty } from './sceneDirty';
 import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/scene/sceneValidation';
 import { SCENE_FORMAT_VERSION } from '../../runtime/version';
@@ -28,7 +29,12 @@ import { SCENE_FORMAT_VERSION } from '../../runtime/version';
 // ── Types ───────────────────────────────────────────────
 
 export interface SerializedEntity {
-  id: number;
+  /** No longer written (scene-loading.md, Phase 3) — nothing on disk
+   *  references it any more (parentId and rootInstanceId are both guids). Kept
+   *  optional, not removed, so in-memory callers that still pass a `SerializedEntity`
+   *  around (e.g. a carried snapshot's shape, or a caller-held `preloaded` object)
+   *  aren't forced to omit it. The loader synthesizes its own key on read regardless. */
+  id?: number;
   /** DECORATIVE parity/label only — `EntityAttributes.name` is the SOURCE OF TRUTH.
    *  The loader (`loadSceneFile`) reads name solely from `EntityAttributes.name`; this
    *  top-level copy exists for human-readable scene files and name-based entity refs
@@ -78,6 +84,9 @@ export interface SceneFile {
   createdAt: string;
   resources: ResourceRef[];
   entities: SerializedEntity[];
+  /** v10+: guid of a base scene this scene extends (base-scene persistence).
+   *  Omitted when the scene has no base. */
+  baseScene?: string;
 }
 
 // ── Serialize Scene (generic) ───────────────────────────
@@ -146,8 +155,20 @@ function resolveEffectivePrefabOverride(
  *  (`enterPlay`) calls this with no options: it must NOT mutate authored data —
  *  Play/Stop's contract is "Stop throws every play-mode mutation away; authored
  *  data is untouched" — so a missing guid is minted into the output JSON only
- *  (two worktrees Playing the same scene must not mint divergent guids into it). */
-export async function serializeScene(opts?: { assignGuids?: boolean }): Promise<SceneFile> {
+ *  (two worktrees Playing the same scene must not mint divergent guids into it).
+ *
+ *  `opts.scene` (Phase 12, M1 — scene-loading.md) serializes a
+ *  NAMED loaded scene instead of the primary: pass `{ path, guid }` for a BASE entry
+ *  from `sceneManager.getLoadedScenes()` (the primary always keeps using the no-arg
+ *  call — every caller, `saveAll` included, only ever targets a base this way).
+ *  Omitted (the default): behaves EXACTLY as before — this is the regression net
+ *  every existing caller (enterPlay, timelinePreview, applyPrefabUndo, saveScene)
+ *  depends on. */
+export async function serializeScene(opts?: {
+  assignGuids?: boolean;
+  scene?: { path: string; guid: string };
+}): Promise<SceneFile> {
+  const targetScene = opts?.scene;
   // TRANSIENCE (preview-mode-refactor, Phase 2): drop every entity SPAWNED during a
   // scrub/preview/play (a `Transient` root) AND its whole subtree from serialization — a
   // preview/scrub mutation must never reach disk. Exclude the subtree up front so ALL passes
@@ -158,10 +179,50 @@ export async function serializeScene(opts?: { assignGuids?: boolean }): Promise<
   for (const e of allInfos) {
     if (findEntity(e.id)?.has(Transient)) for (const id of subtreeIds(allInfos, e.id)) transientIds.add(id);
   }
-  const entityInfos = transientIds.size ? allInfos.filter((e) => !transientIds.has(e.id)) : allInfos;
+  // Base-scene persistence (Phase 6, generalized in Phase 12): never bake an entity
+  // that doesn't belong to the scene being saved into that scene's file.
+  // EntityAttributes.sourceScene is stamped non-empty ONLY on entities a BASE scene
+  // spawned into the chain (SceneManager.loadScene); the primary's own entities keep
+  // the schema default '' (Phase 3's load-bearing "empty means primary" rule).
+  //
+  // - No `targetScene` (the default, every pre-Phase-12 caller): "foreign" = any
+  //   non-empty sourceScene — i.e. exclude every base-origin entity, save only the
+  //   primary's own. Byte-identical to Phase 6.
+  // - `targetScene` given (Phase 12 — saving a NAMED BASE scene, e.g. a base entity
+  //   edited in place): "foreign" = this entity's raw sourceScene does not match the
+  //   target's guid. A primary-owned entity's sourceScene is '' and no base's guid is
+  //   ever '', so it is correctly excluded — only the target base's own entities
+  //   survive. (targetScene never names the primary — see the doc comment above.)
+  //
+  // Subtree walk (either branch): every base-origin entity is independently stamped
+  // at spawn time, so this is belt-and-suspenders, not the primary mechanism.
+  const foreignIds = new Set<number>();
+  for (const e of allInfos) {
+    const entity = findEntity(e.id);
+    if (!entity?.has(EntityAttributes)) continue;
+    const data = entity.get(EntityAttributes) as { sourceScene?: string };
+    const isForeign = targetScene ? (data.sourceScene || '') !== targetScene.guid : !!data.sourceScene;
+    if (isForeign) for (const id of subtreeIds(allInfos, e.id)) foreignIds.add(id);
+  }
+  const excludedIds = transientIds.size || foreignIds.size ? new Set<number>([...transientIds, ...foreignIds]) : null;
+  const entityInfos = excludedIds ? allInfos.filter((e) => !excludedIds.has(e.id)) : allInfos;
   const allTraits = getAllTraits();
   const piMeta = getTraitByName('PrefabInstance');
   const entities: SerializedEntity[] = [];
+
+  // (Phase 12's A8/A9 SAFETY GUARD lived here and is GONE — both bugs are fixed.
+  //  It refused to serialize a targeted base containing any prefab instance, because
+  //  two separate defects on the carried-base-scene path could silently drop or
+  //  misattribute that instance's data: A8 (`PrefabInstance.rootInstanceId` going
+  //  stale across a respawn, fixed in `loadSceneFile.ts`) and A9 (override marks
+  //  being wiped by a chain load and never carried across a world rebuild, fixed in
+  //  `loadSceneFile.ts` + `SceneManager.ts`). Removing it was gated on a LIVE
+  //  acceptance run against sling's real `Base.json`, not merely on the code
+  //  landing — see the plan's "A9 — live acceptance gate" section for the record.
+  //  The regression tests that replace it are in `baseSceneTargetSerialize.test.ts`
+  //  ("a targeted base containing a prefab instance now SERIALIZES"), plus the
+  //  defect-level suites in `loadSceneFile.test.ts` and
+  //  `sceneManagerBaseSceneChain.test.ts`.)
 
   // Pre-pass: ensure every entity has a stable EntityAttributes.guid in the
   // OUTPUT. New entities get a freshly-minted UUID; cross-scene refs (prefab
@@ -319,7 +380,10 @@ export async function serializeScene(opts?: { assignGuids?: boolean }): Promise<
     // Skip prefab children + structural additions — re-instantiated from the prefab
     if (prefabChildIds.has(info.id)) continue;
 
-    const entry: SerializedEntity = { id: info.id, name: info.name, traits: {} };
+    // No `id` (Phase 3, scene-loading.md) — the loader synthesizes its
+    // own per-load key (array index) now that nothing on disk references the old
+    // live-ecs-id-derived value (that's exactly what made it churn on every save).
+    const entry: SerializedEntity = { name: info.name, traits: {} };
     const rootInfo = prefabRootInfo.get(info.id);
     // True once we've successfully captured overrides for a prefab root — then the
     // entry stores only PrefabInstance and everything else flows through overrides.
@@ -429,6 +493,22 @@ export async function serializeScene(opts?: { assignGuids?: boolean }): Promise<
           const pid = data.parentId as number;
           traitData.parentId = pid ? guidForId(pid) : '';
         }
+        // Write every OTHER `entityId`-flagged field (Phase 15's FieldHint;
+        // parentId above is the one special case, handled separately since '' means
+        // root rather than "unset") as its target's stable GUID instead of the raw
+        // live koota id — the same "survives a world rebuild" rationale, generalized
+        // via the registry so a future entityId field is guid-ified automatically
+        // (scene-loading.md, Phase 2). This is what makes
+        // PrefabInstance.rootInstanceId — the last numeric on-disk entity ref —
+        // stable across the arrival-path-dependent id churn Phase 0/1 measured: the
+        // loader's `resolveEntityIdField` already resolves a guid string via
+        // `findEntityByGuid` with no idMap involved, for BOTH a fresh load and a
+        // carried respawn.
+        for (const [key, hint] of Object.entries(meta.fields)) {
+          if (!hint.entityId || (meta.name === 'EntityAttributes' && key === 'parentId')) continue;
+          const raw = data[key] as number;
+          traitData[key] = raw ? guidForId(raw) : '';
+        }
         entry.traits[meta.name] = traitData;
       } catch { /* trait not initialized in world */ }
     }
@@ -445,11 +525,39 @@ export async function serializeScene(opts?: { assignGuids?: boolean }): Promise<
   const resources = collectResourceRefs(entities);
 
   // Scene file gets its own stable id — reuse the one registered when the
-  // scene was loaded, or mint a fresh one for first-save.
-  const sceneId = _currentScenePath
-    ? (getGuidForPath(_currentScenePath) ?? newGuid())
-    : newGuid();
-  return { id: sceneId, version: SCENE_FORMAT_VERSION, createdAt: new Date().toISOString(), resources, entities };
+  // scene was loaded, or mint a fresh one for first-save. A named target uses ITS
+  // OWN guid directly (already known from `getLoadedScenes()`, no lookup needed).
+  const sceneId = targetScene
+    ? targetScene.guid
+    : (_currentScenePath ? (getGuidForPath(_currentScenePath) ?? newGuid()) : newGuid());
+  // This scene's own `loadedScenes` bookkeeping, keyed by guid — the one lookup backs
+  // BOTH `createdAt` preservation (Phase 1, scene-loading.md: reuse the
+  // FILE's original stamp instead of unconditionally minting a fresh one on every
+  // save) and, for a named target, its own `baseScene` ref below. Absent for a
+  // scene that was never loaded (a brand-new scene from `newScene()`) — that's the
+  // one case a fresh `createdAt` is actually correct.
+  let ownLoadedEntry: { createdAt?: string; baseScene?: string } | undefined;
+  for (const entry of sceneManager.getLoadedScenes().values()) {
+    if (entry.guid === sceneId) { ownLoadedEntry = entry; break; }
+  }
+  const file: SceneFile = {
+    id: sceneId, version: SCENE_FORMAT_VERSION,
+    createdAt: ownLoadedEntry?.createdAt ?? new Date().toISOString(),
+    resources, entities,
+  };
+  // A top-level baseScene ref is editor module state (like _currentScenePath) for
+  // the PRIMARY — it has no other path back into the serialized output — but a named
+  // target reads its OWN baseScene straight from `getLoadedScenes()` (Phase 12, M1's
+  // prerequisite: each loaded-scene entry now carries its own base ref, not just the
+  // primary's). Emitted only when set — an unset base must not appear as
+  // `baseScene: undefined` in the written JSON (A3: this is what Play/Stop and undo
+  // round-trip through, one level up for a target scene that is itself nested).
+  if (targetScene) {
+    if (ownLoadedEntry?.baseScene) file.baseScene = ownLoadedEntry.baseScene;
+  } else if (_currentBaseScene) {
+    file.baseScene = _currentBaseScene;
+  }
+  return file;
 }
 
 /** Dev guard: console.error if any REF field anywhere in a serialized entity holds an
@@ -536,6 +644,15 @@ export function lastSceneKey(configName: string | undefined): string {
 let _sceneProject: string | undefined;
 export function setScenePersistenceProject(name: string | undefined) { _sceneProject = name; }
 
+// Base-scene ref of the currently-loaded scene (base-scene persistence). Mirrors
+// _currentScenePath: not a live-world value, so it must be tracked as editor
+// module state and re-emitted by serializeScene (A3) or every serializeScene()→
+// loadScene({preloaded}) round-trip (Play/Stop, undo, timeline preview) silently
+// drops it. Reset alongside the scene path whenever a new scene loads.
+let _currentBaseScene: string | undefined;
+export function getCurrentBaseScene() { return _currentBaseScene; }
+export function setCurrentBaseScene(baseScene: string | undefined) { _currentBaseScene = baseScene; }
+
 export function getCurrentScenePath() { return _currentScenePath; }
 export function setCurrentScenePath(path: string | null) {
   _currentScenePath = path;
@@ -583,6 +700,11 @@ export interface SaveResult {
   saved: boolean;
   path: string | null;
   reason: 'ok' | 'cancelled' | 'write-failed' | 'needs-path' | 'playing';
+  /** Other loaded scenes (Phase 12, M3 — a dirty BASE, edited in place) written in
+   *  the SAME `saveAll` call, alongside the primary. Absent/empty when nothing else
+   *  was dirty. A base is only ever written once the primary's own save succeeded —
+   *  `saveScene`'s run-mode refusal sits above both, so neither writes during Play. */
+  extraSaved?: { path: string; guid: string }[];
 }
 
 export async function saveScene(opts: {
@@ -696,6 +818,7 @@ export async function loadScene(scenePath: string, gameId?: string): Promise<boo
       },
     });
     setCurrentScenePath(scenePath); // persists to localStorage for next editor launch
+    setCurrentBaseScene(sceneManager.getCurrentBaseScene());
     // Swap to THIS scene's own undo history (empty on first visit) instead of
     // dropping undo globally — returning to a previously-open scene restores its
     // stack. Per-scene keying also keeps another scene's actions (stale ids) from
@@ -704,6 +827,9 @@ export async function loadScene(scenePath: string, gameId?: string): Promise<boo
     swapHistory(scenePath);
     const entityCount = getAllEntities().length;
     markSceneSaved(); // the freshly loaded world matches disk — a new baseline (C7)
+    // A stale dirty guid from the PREVIOUS chain (e.g. a base no longer loaded) must
+    // not linger — the freshly loaded chain has no unsaved live-world work yet either.
+    clearAllSceneDirty();
     // Editor Percept (V2): the human opened a scene — correlate later game/edit events to it.
     editorEmit('!scene-load', { path: scenePath, entityCount });
     console.log(`[Editor] Loaded scene: ${entityCount} entities from ${scenePath}`);
@@ -750,15 +876,57 @@ export function newScene(): void {
     EntityAttributes({ name: 'Ambient Light', sortOrder: 3 }),
   ));
   setCurrentScenePath(null);
+  setCurrentBaseScene(undefined);
   swapHistory('');
   markSceneSaved(); // a fresh untitled scene has no unsaved WORK yet — new baseline (C7)
+  clearAllSceneDirty();
   console.log('[Editor] New scene created');
 }
 
-/** Save all editor-managed assets. Currently just the scene file — per-material
- *  edits are persisted in their own `.mat.json` files via the Asset Inspector
- *  (using the dev-server `/api/write-file` endpoint), so there's nothing else
- *  to flush here. The name is kept so File → Save All stays familiar. */
+/** Save all editor-managed assets: the primary scene file (via `saveScene`), THEN
+ *  every OTHER dirty scene in the loaded chain — a base edited in place (Phase 12,
+ *  M3, scene-loading.md) — to ITS OWN file. Per-material edits are
+ *  persisted separately in their own `.mat.json` files via the Asset Inspector, so
+ *  there's nothing else to flush here.
+ *
+ *  A base is written ONLY after the primary's own save succeeds — `saveScene`'s
+ *  run-mode refusal (no writing while playing/previewing) sits above this loop, so it
+ *  covers bases too; a cancelled Save-As or a failed primary write means nothing else
+ *  gets written either, and the caller sees the primary's own failure reason
+ *  unchanged. Silent by design (the owner's call, 2026-07-26) — the dirty-dot on the
+ *  Hierarchy scene-group row (Phase 13) is the visibility half that makes a silent
+ *  multi-file save legible instead of a surprise. */
 export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {}): Promise<SaveResult> {
-  return saveScene(opts);
+  const primaryResult = await saveScene(opts);
+  if (!primaryResult.saved) return primaryResult;
+
+  const extraSaved: { path: string; guid: string }[] = [];
+  // Snapshot the chain BEFORE iterating — each iteration below `await`s (serialize +
+  // write), and a scene swap landing mid-loop would otherwise mutate the live Map
+  // out from under a bare `for...of`, skipping or misattributing entries.
+  const loadedScenes = [...sceneManager.getLoadedScenes().values()];
+  for (const entry of loadedScenes) {
+    if (entry.role === 'primary' || !isSceneDirty(entry.guid)) continue;
+    // Catch per-scene so one scene that fails to serialize can't block every OTHER
+    // dirty scene in the same Save All, and so its dirty flag stays SET (not
+    // silently cleared) until it can actually be written. This used to be load-
+    // bearing for Phase 12's A8/A9 guard, which threw for a base containing a
+    // prefab instance; that guard is gone (both bugs fixed), but the per-scene
+    // isolation is worth keeping on its own merits for any future throw.
+    let sceneFile;
+    try {
+      sceneFile = await serializeScene({ scene: { path: entry.path, guid: entry.guid } });
+    } catch (e) {
+      console.error(`[Editor] Refused to save "${entry.path}": ${(e as Error).message}`);
+      continue;
+    }
+    const ok = await writeFileToServer(entry.path, JSON.stringify(sceneFile, null, 2));
+    if (!ok) { console.error(`[Editor] Failed to save scene to ${entry.path}`); continue; }
+    registerAsset(entry.guid, entry.path, 'scene');
+    clearSceneDirty(entry.guid);
+    editorEmit('!save', { path: entry.path, entities: sceneFile.entities.length }); // Editor Percept (V2)
+    console.log(`[Editor] Saved scene: ${sceneFile.entities.length} entities → ${entry.path}`);
+    extraSaved.push({ path: entry.path, guid: entry.guid });
+  }
+  return extraSaved.length ? { ...primaryResult, extraSaved } : primaryResult;
 }

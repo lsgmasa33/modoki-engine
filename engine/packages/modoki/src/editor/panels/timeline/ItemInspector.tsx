@@ -11,6 +11,7 @@ import type { TrackItemPatch } from './itemEdit';
 import { getItem } from './itemEdit';
 import { getUIActionParams } from '../../../runtime/ui/actionRegistry';
 import type { FieldHint } from '../../../runtime/ecs/traitRegistry';
+import { colorToHex, normalizeColor } from '../assetViews/widgets';
 
 const inp: React.CSSProperties = { background: '#191919', border: '1px solid #333', color: '#cfcfd6', fontSize: 11, padding: '2px 4px', borderRadius: 2 };
 const inpFull: React.CSSProperties = { ...inp, flex: 1, minWidth: 0 };
@@ -51,8 +52,31 @@ function ParamField({ name, hint, value, onChange, actionNames }: {
   if (hint.type === 'boolean') {
     return <label style={row}>{label}<input type="checkbox" checked={value === true} onChange={(e) => onChange(e.target.checked)} /></label>;
   }
-  if (hint.type === 'number' || hint.type === 'color') {
-    return <label style={row}>{label}<input style={inpFull} type="number" min={hint.min} max={hint.max} step={hint.step ?? (hint.type === 'color' ? 1 : 0.1)}
+  // `color` gets a real swatch + hex field, matching the trait Inspector's ColorField.
+  // It used to fall through to the numeric input below, which meant authoring a colour
+  // param by typing its DECIMAL value (white = 16777215) — technically editable, but not
+  // something anyone can do by eye.
+  if (hint.type === 'color') {
+    const n = normalizeColor(typeof value === 'number' ? value : 0);
+    return (
+      <label style={row}>
+        {label}
+        <span style={{ position: 'relative', width: 28, height: 18, flex: 'none', borderRadius: 2, overflow: 'hidden', border: '1px solid #333' }}>
+          <span style={{ position: 'absolute', inset: 0, backgroundColor: colorToHex(n) }} />
+          <input type="color" value={colorToHex(n)} aria-label={`${name} color`}
+            onChange={(e) => onChange(parseInt(e.target.value.slice(1), 16))}
+            style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', opacity: 0, border: 'none', padding: 0, cursor: 'pointer' }} />
+        </span>
+        <input style={{ ...inp, width: 72, flex: 'none' }} value={colorToHex(n)} spellCheck={false}
+          onChange={(e) => {
+            const m = /^#?([0-9a-f]{6})$/i.exec(e.target.value.trim());
+            if (m) onChange(parseInt(m[1], 16));
+          }} />
+      </label>
+    );
+  }
+  if (hint.type === 'number') {
+    return <label style={row}>{label}<input style={inpFull} type="number" min={hint.min} max={hint.max} step={hint.step ?? 0.1}
       value={typeof value === 'number' ? value : ''} onChange={(e) => onChange(Number(e.target.value) || 0)} /></label>;
   }
   const opts = hint.type === 'enum' ? (hint.optionsSource === 'uiActions' ? actionNames : (hint.options ?? [])) : null;

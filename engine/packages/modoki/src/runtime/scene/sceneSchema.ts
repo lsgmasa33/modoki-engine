@@ -25,23 +25,30 @@ function inferType(value: unknown): FieldType | undefined {
   return undefined; // object/array/null → known field, not type-checked
 }
 
+/** Resolve a trait's koota `.schema` to a plain default object. SoA traits
+ *  (`trait({...})`) expose `.schema` as the object; AoS traits
+ *  (`trait(() => ({...}))`) expose it as a FACTORY — call it to get the default
+ *  object, so AoS fields (AnimationLibrary.animSets/boneMaps,
+ *  SkinnedMeshRenderer.materials) are visible to callers. Returns undefined for
+ *  tags (no schema) or a factory that throws. */
+export function resolveKootaSchema(trait: unknown): Record<string, unknown> | undefined {
+  let koota = (trait as { schema?: Record<string, unknown> | (() => Record<string, unknown>) })?.schema;
+  if (typeof koota === 'function') {
+    try { koota = (koota as () => Record<string, unknown>)(); }
+    catch { return undefined; }
+  }
+  return koota && typeof koota === 'object' ? koota : undefined;
+}
+
 export function buildSceneSchema(): SceneSchema {
   const traits: SceneSchema['traits'] = {};
   for (const meta of getAllTraits()) {
     const fields: Record<string, FieldEntry> = {};
 
-    // 1. Every field in the koota schema (the serialized field set). SoA traits
-    //    (`trait({...})`) expose `.schema` as the object; AoS traits
-    //    (`trait(() => ({...}))`) expose it as a FACTORY — call it to get the
-    //    default object, so AoS fields (AnimationLibrary.animSets/boneMaps,
-    //    SkinnedMeshRenderer.materials) are KNOWN to the validator and don't
-    //    false-flag as 'unknown field'. Matches what serialize.ts writes.
-    let koota = (meta.trait as { schema?: Record<string, unknown> | (() => Record<string, unknown>) }).schema;
-    if (typeof koota === 'function') {
-      try { koota = (koota as () => Record<string, unknown>)(); }
-      catch { koota = undefined; }
-    }
-    if (koota && typeof koota === 'object') {
+    // 1. Every field in the koota schema (the serialized field set) — the
+    //    authoritative set; `meta.fields` is deliberately a subset.
+    const koota = resolveKootaSchema(meta.trait);
+    if (koota) {
       for (const [name, def] of Object.entries(koota)) {
         fields[name] = { type: inferType(def) };
       }

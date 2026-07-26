@@ -223,3 +223,142 @@ describe('timelineSystem — determinism', () => {
     expect(a).toEqual(b);
   });
 });
+
+describe('timelineSystem — a deactivated entity FREEZES its Director', () => {
+  /** Measured bug: `EntityAttributes.isActive: false` did nothing to a Director. The playhead
+   *  kept advancing (2.7434 → 2.7566 frame to frame) and its signal markers kept firing, so a
+   *  demo flipped through its stations while it was supposed to be held still. Every renderer
+   *  honours `isActive`; the sequencer did not. */
+  it('does not advance the playhead while the entity is inactive', () => {
+    tw = createTestWorld({ dt: DT, systems: [TIMELINE] });
+    seed({ duration: 10, tracks: [] });
+    const e = tw.spawn(EntityAttributes({ name: 'root', isActive: false }), Director({ timeline: PATH }));
+
+    tw.step(10);
+
+    expect(e.get(Director)!.time).toBe(0);
+    expect(e.get(Director)!.started).toBe(false);
+  });
+
+  it('fires no markers while inactive', () => {
+    const marks: number[] = [];
+    tw = createTestWorld({ dt: DT, systems: [TIMELINE], actions: { 'm': () => marks.push(1) } });
+    seed({ duration: 1, tracks: [{ id: 's', name: 'Sig', target: '', type: 'signal', markers: [{ t: 0.2, action: 'm' }] }] });
+    tw.spawn(EntityAttributes({ name: 'root', isActive: false }), Director({ timeline: PATH }));
+
+    tw.step(20); // well past t=0.2
+
+    expect(marks).toHaveLength(0);
+    expect(tw.events({ type: '@marker' })).toHaveLength(0);
+    expect(tw.events({ type: '@sequence' })).toHaveLength(0); // not even the start edge
+  });
+
+  it('FREEZES rather than stops — reactivating resumes from where it was', () => {
+    tw = createTestWorld({ dt: DT, systems: [TIMELINE] });
+    seed({ duration: 10, tracks: [] });
+    const e = tw.spawn(EntityAttributes({ name: 'root' }), Director({ timeline: PATH }));
+
+    tw.step(6);
+    const before = e.get(Director)!.time;
+    expect(before).toBeGreaterThan(0);
+
+    e.set(EntityAttributes, { ...e.get(EntityAttributes)!, isActive: false });
+    tw.step(30);
+    expect(e.get(Director)!.time).toBe(before); // held, not rewound and not advanced
+
+    e.set(EntityAttributes, { ...e.get(EntityAttributes)!, isActive: true });
+    tw.step(3);
+    expect(e.get(Director)!.time).toBeGreaterThan(before); // picks up where it left off
+  });
+
+  it('freezes a Director whose ANCESTOR is inactive (the cascade, not just self)', () => {
+    tw = createTestWorld({ dt: DT, systems: [TIMELINE] });
+    seed({ duration: 10, tracks: [] });
+    const parent = tw.spawn(EntityAttributes({ name: 'parent', isActive: false }));
+    const child = tw.spawn(EntityAttributes({ name: 'child', parentId: parent.id() }), Director({ timeline: PATH }));
+
+    tw.step(10);
+
+    expect(child.get(Director)!.time).toBe(0);
+  });
+
+  it('leaves an ACTIVE sibling Director running (the guard is per-entity)', () => {
+    tw = createTestWorld({ dt: DT, systems: [TIMELINE] });
+    seed({ duration: 10, tracks: [] });
+    const off = tw.spawn(EntityAttributes({ name: 'off', isActive: false }), Director({ timeline: PATH }));
+    const on = tw.spawn(EntityAttributes({ name: 'on' }), Director({ timeline: PATH }));
+
+    tw.step(8);
+
+    expect(off.get(Director)!.time).toBe(0);
+    expect(on.get(Director)!.time).toBeGreaterThan(0);
+  });
+
+  it('survives a parentId CYCLE without recursing forever', () => {
+    tw = createTestWorld({ dt: DT, systems: [TIMELINE] });
+    seed({ duration: 10, tracks: [] });
+    const a = tw.spawn(EntityAttributes({ name: 'a' }));
+    const b = tw.spawn(EntityAttributes({ name: 'b', parentId: a.id() }), Director({ timeline: PATH }));
+    a.set(EntityAttributes, { ...a.get(EntityAttributes)!, parentId: b.id() }); // A→B→A
+
+    expect(() => tw!.step(4)).not.toThrow();
+    expect(b.get(Director)!.time).toBeGreaterThan(0); // cycle breaks to "active"
+  });
+});
+
+describe('timelineSystem — self-deactivation is a ONE-WAY DOOR, and says so', () => {
+  /** The hazard the freeze guard introduces, pinned deliberately rather than special-cased: an
+   *  activation track whose target resolves to its OWN Director root (target "" IS the root)
+   *  switches that entity off, and a deactivated entity freezes its Director — so the playhead
+   *  stops at that instant and can never reach the span that would switch it back on. Making
+   *  activation tracks mean something different when they point at the Director would be worse
+   *  than the foot-gun; a SILENT soft-lock would not be. Hence: it happens, and it is reported. */
+  const selfDeactTimeline = () => seed({
+    duration: 5,
+    tracks: [{ id: 'a', name: 'Act', target: '', type: 'activation', spans: [{ start: 0, end: 0.2 }] }],
+  });
+
+  it('freezes permanently once the track switches its own root off', () => {
+    tw = createTestWorld({ dt: DT, systems: [TIMELINE] });
+    selfDeactTimeline();
+    const e = tw.spawn(EntityAttributes({ name: 'root' }), Director({ timeline: PATH }));
+
+    tw.step(12); // past the 0.2s span end
+    expect(e.get(EntityAttributes)!.isActive).toBe(false);
+    const frozenAt = e.get(Director)!.time;
+    expect(frozenAt).toBeGreaterThan(0.2);
+
+    tw.step(60); // two more seconds of ticking
+    expect(e.get(Director)!.time).toBe(frozenAt); // never reaches the next span — one-way door
+  });
+
+  it('WARNS once, and journals it, instead of soft-locking silently', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    tw = createTestWorld({ dt: DT, systems: [TIMELINE] });
+    selfDeactTimeline();
+    tw.spawn(EntityAttributes({ name: 'root' }), Director({ timeline: PATH }));
+
+    tw.step(40);
+
+    const msgs = warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('targets its OWN Director'));
+    expect(msgs).toHaveLength(1);                       // once, not every frame
+    expect(msgs[0]).toContain('cannot re-activate itself');
+    expect(tw.events({ type: '@timeline-selfdeact' })).toHaveLength(1);
+    warn.mockRestore();
+  });
+
+  it('does NOT warn for an activation track aimed at another entity (the normal case)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    tw = createTestWorld({ dt: DT, systems: [TIMELINE] });
+    seed({ duration: 5, tracks: [{ id: 'a', name: 'Act', target: 'Prop', type: 'activation', spans: [{ start: 0, end: 0.2 }] }] });
+    const root = tw.spawn(EntityAttributes({ name: 'root' }), Director({ timeline: PATH }));
+    const prop = tw.spawn(EntityAttributes({ name: 'Prop', parentId: root.id() }));
+
+    tw.step(40);
+
+    expect(prop.get(EntityAttributes)!.isActive).toBe(false); // the track still works
+    expect(root.get(Director)!.time).toBeGreaterThan(1);      // and the Director keeps running
+    expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('targets its OWN Director'))).toHaveLength(0);
+    warn.mockRestore();
+  });
+});

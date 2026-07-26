@@ -30,11 +30,13 @@ const selectEntity = vi.fn();
 let pushed: UndoAction | null = null;
 let applyResult: any;
 
+const setCurrentBaseScene = vi.fn();
 vi.mock('../../src/editor/scene/serialize', () => ({
   serializeScene: (...a: any[]) => serializeScene(...a),
   saveScene: (...a: any[]) => saveScene(...a),
   getCurrentScenePath: () => 'scenes/test.json',
   setCurrentScenePath: vi.fn(),
+  setCurrentBaseScene: (...a: any[]) => setCurrentBaseScene(...a),
 }));
 
 vi.mock('../../src/editor/scene/prefab', () => ({
@@ -44,8 +46,9 @@ vi.mock('../../src/editor/scene/prefab', () => ({
   entityIdForGuid: (guid: string) => (guid === 'g-root' ? 1 : 0),
 }));
 
+let currentBaseScene: string | undefined;
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
-  sceneManager: { loadScene: (...a: any[]) => loadScene(...a) },
+  sceneManager: { loadScene: (...a: any[]) => loadScene(...a), getCurrentBaseScene: () => currentBaseScene },
 }));
 
 vi.mock('../../src/editor/store/editorStore', () => ({
@@ -66,6 +69,8 @@ describe('applyToPrefabWithUndo — Apply is undoable, restores BOTH prefab + sc
     installPrefabSnapshot.mockClear();
     loadScene.mockClear();
     selectEntity.mockClear();
+    setCurrentBaseScene.mockClear();
+    currentBaseScene = undefined;
     pushed = null;
     applyResult = {
       applied: true, source: SRC,
@@ -98,6 +103,21 @@ describe('applyToPrefabWithUndo — Apply is undoable, restores BOTH prefab + sc
     await pushed!.redo();
     expect(installPrefabSnapshot).toHaveBeenCalledWith(SRC, prefabAfter);
     expect(loadScene).toHaveBeenCalledWith('scenes/test.json', { preloaded: sceneAfter });
+  });
+
+  // A3 (base-scene plan, Phase 1): sceneManager.loadScene({preloaded}) records a
+  // restored scene's baseScene ref internally, but the editor's own tracking
+  // (re-emitted by serializeScene) is separate module state — restoreSnapshot must
+  // re-sync it explicitly, exactly like it does for setCurrentScenePath, or a
+  // post-undo save would silently drop the base ref.
+  it('re-syncs the editor baseScene tracking after restoreSnapshot reloads the scene', async () => {
+    const { applyToPrefabWithUndo } = await getModule();
+    await applyToPrefabWithUndo(1, new Set(['1.Transform.x']));
+
+    currentBaseScene = 'base-guid-after-undo';
+    setCurrentBaseScene.mockClear();
+    await pushed!.undo();
+    expect(setCurrentBaseScene).toHaveBeenCalledWith('base-guid-after-undo');
   });
 
   it('does not push an undo entry for a no-op apply', async () => {

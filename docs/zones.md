@@ -67,6 +67,18 @@ For every enter and exit, `zone2DSystem` / `zone3DSystem` fan out to:
 - **Despawn-safe.** Membership is recomputed and diffed each frame, so removing a zone fires `exit`
   for all its occupants, and removing an occupant fires `exit` from every zone it was in — the same
   discipline `synthesizeContactExits` gives the physics sensors.
+- **Deactivation = GONE, not paused.** Setting `EntityAttributes.isActive: false` on a zone (or on
+  any ancestor of it) fires `exit` for everyone inside; on an occupant it fires `exit` from every
+  zone it was in. Re-activating fires a fresh `enter` for whoever is still inside, so a one-shot
+  "first time you step here" handler needs its own guard. This rides the despawn path above rather
+  than adding a second concept, and the reason it's an exit rather than a freeze is **ledger
+  balance**: anything that received an `enter` always receives its `exit`, so a listener tracking
+  who's inside can never be left holding a phantom occupant. (Matches Unity, where disabling a
+  trigger collider fires `OnTriggerExit`.) ⚠️ Note this is the OPPOSITE of `Director`, which FREEZES
+  when its entity is deactivated (see [timeline.md](./timeline.md)) — a playhead has no ledger to
+  keep balanced, so resuming where it stopped is the useful behaviour there. Both use the same core
+  predicate, `isEntityActiveInHierarchy` (`runtime/ecs/entityIndex.ts`); what differs is what the
+  subsystem does about it.
 - **Self-skip.** A zone that is itself tagged `ZoneOccupant` never triggers on itself.
 - **Channel isolation.** 2D and 3D occupancy state is kept per-channel, so a scene running both
   dimensions never has one system's diff clobber the other's membership.

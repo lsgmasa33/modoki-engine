@@ -14,6 +14,7 @@ const EntityAttributes = trait({
   parentId: 0,
   guid: '' as string,
   layer: '' as '' | '3d' | '2d' | 'ui',
+  sourceScene: '' as string,
 });
 const TestTag = trait();
 const Health = trait({ hp: 100 });
@@ -58,8 +59,9 @@ const traitDefs = [
     name: 'EntityAttributes', trait: EntityAttributes, category: 'component' as const,
     fields: {
       name: { type: 'string' }, isActive: { type: 'boolean' },
-      sortOrder: { type: 'number' }, parentId: { type: 'number' },
+      sortOrder: { type: 'number' }, parentId: { type: 'number', entityId: { onMissing: 'root' } },
       guid: { type: 'string' }, layer: { type: 'string' },
+      sourceScene: { type: 'string', hidden: true, runtimeOnly: true },
     },
   },
   { name: 'TestTag', trait: TestTag, category: 'tag' as const, fields: {} },
@@ -70,7 +72,7 @@ const traitDefs = [
     name: 'PrefabInstance', trait: PrefabInstance, category: 'component' as const,
     fields: {
       source: { type: 'string' }, localId: { type: 'number' },
-      rootInstanceId: { type: 'number' }, parentLocalId: { type: 'number' },
+      rootInstanceId: { type: 'number', entityId: { onMissing: 'stripTrait' } }, parentLocalId: { type: 'number' },
     },
   },
 ];
@@ -728,6 +730,29 @@ describe('reparentEntity core rules (panels #1)', () => {
     const b = spawnEntity('B', {}, a.id()); // B is a child of A
     expect(reparentEntity(a.id(), b.id())).toBe(false); // can't put A under B
     expect(pushedActions).toHaveLength(0);
+  });
+
+  it('base-scene guard (Phase 6): refuses reparenting an entity under a parent from a DIFFERENT sourceScene', async () => {
+    const { reparentEntity } = await getModule();
+    const baseParent = testWorld.spawn(Transform({}), EntityAttributes({ name: 'BaseCamera', parentId: 0, sourceScene: 'base-guid-1' }));
+    entityIndex.set(baseParent.id(), baseParent);
+    const levelChild = testWorld.spawn(Transform({}), EntityAttributes({ name: 'LevelThing', parentId: 0, sourceScene: '' }));
+    entityIndex.set(levelChild.id(), levelChild);
+
+    expect(reparentEntity(levelChild.id(), baseParent.id())).toBe(false);
+    expect(pushedActions).toHaveLength(0);
+    expect(attrOf(levelChild.id())!.parentId).toBe(0); // unchanged
+  });
+
+  it('base-scene guard (Phase 6): allows reparenting within the SAME sourceScene', async () => {
+    const { reparentEntity } = await getModule();
+    const baseParent = testWorld.spawn(Transform({}), EntityAttributes({ name: 'BaseGroup', parentId: 0, sourceScene: 'base-guid-1' }));
+    entityIndex.set(baseParent.id(), baseParent);
+    const baseChild = testWorld.spawn(Transform({}), EntityAttributes({ name: 'BaseThing', parentId: 0, sourceScene: 'base-guid-1' }));
+    entityIndex.set(baseChild.id(), baseChild);
+
+    expect(reparentEntity(baseChild.id(), baseParent.id())).toBe(true);
+    expect(attrOf(baseChild.id())!.parentId).toBe(baseParent.id());
   });
 
   it('is a no-op (returns false, no undo) when parent and order are unchanged', async () => {

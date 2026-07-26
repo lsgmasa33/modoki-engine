@@ -83,6 +83,10 @@ export interface SceneData {
    *  before instantiating any entities. */
   resources?: SceneResourceRef[];
   entities: SceneEntityEntry[];
+  /** v10+: guid of a base scene this scene extends (base-scene persistence).
+   *  Loaded additively before this scene's own entities and survives a swap
+   *  to another scene sharing the same base. Absent = no base. */
+  baseScene?: string;
 }
 
 export interface LoadSceneOptions {
@@ -118,6 +122,22 @@ export interface LoadSceneOptions {
   /** Target world for entity spawning. Defaults to getCurrentWorld(). SceneManager
    *  passes the staging `nextWorld` so entities are isolated until the swap. */
   world?: World;
+  /** Drop EVERY override mark before spawning (default `true`).
+   *
+   *  The global clear defends against ecs-id reuse ACROSS WORLDS — a world-scoped
+   *  concern that was attached to a *call* back when one `loadSceneFile` call WAS
+   *  one world. Phase 5 (base scenes) broke that equivalence: a chain loads N scene
+   *  files into ONE world, bases first and the primary last, so the primary's call
+   *  wiped the marks the base's call had just seeded and every carried/chained
+   *  prefab instance serialized with EMPTY overrides (finding "A9" —
+   *  `docs/reviews/a9-carried-instance-overrides-investigation.md`, defect 1).
+   *
+   *  `SceneManager` therefore clears ONCE per staging world and passes `false` for
+   *  every chain + carry call. Left `true` by default so every other caller (tests,
+   *  and any future single-scene caller) keeps byte-identical behaviour — per-entity
+   *  hygiene against id reuse is independent of this flag and always runs
+   *  (`clearOverrideMarks(entity.id())` on each fresh spawn, below). */
+  clearMarks?: boolean;
 }
 
 const TEXT_FIELDS = ['fontSize', 'fontWeight', 'textColor', 'textAlign'] as const;
@@ -268,6 +288,66 @@ export function renameRenderableActiveToVisibleDeep(node: unknown): void {
 function migrateV8toV9(data: SceneData): void {
   if (data.version >= 9) return;
   for (const entry of data.entities) renameRenderableActiveToVisibleDeep(entry);
+  data.version = 9;
+}
+
+/** Migrate v9→v10: no-op passthrough. v10 only adds an optional top-level
+ *  `baseScene` ref (base-scene persistence) — older files simply have none. */
+function migrateV9toV10(data: SceneData): void {
+  if (data.version >= 10) return;
+  data.version = 10;
+}
+
+/** Backfill a synthesized numeric id (its array index) for any entry that lacks one.
+ *  A v12+ file (scene-loading.md, Phase 3) no longer WRITES `entry.id`
+ *  at all — nothing on disk references it any more, now that `PrefabInstance.
+ *  rootInstanceId` (Phase 2) and `EntityAttributes.parentId` (pre-existing) are
+ *  both guids. The loader still needs SOME per-entry numeric key for its own
+ *  internal bookkeeping this pass (`idMap`, `spawnedByEntryId`,
+ *  `onEntitySpawned`'s `oldId`) — the array index serves that purpose and is
+ *  stable within a single load, though meaningless across loads (unlike the old
+ *  on-disk id, it is never persisted or compared to a prior load's). Mutates in
+ *  place, same as the version migrations above; a file that DOES carry ids
+ *  (any version through v11, or hand-authored) is untouched — this only fills
+ *  gaps, never overwrites. Every consumer downstream in this file assumes
+ *  `entry.id` is a real number; this call is what makes that true.
+ *
+ *  Skips any array index already taken by an EXPLICIT id elsewhere in the file
+ *  (a genuinely mixed file — some entries id'd, some not — is unusual but not
+ *  impossible: hand-edited, or partially migrated) so a synthesized id can never
+ *  collide with a real one. A collision would silently alias two different
+ *  entities in `idMap`, misattributing a parent/prefab-root reference with no
+ *  warning — caught by independent code review, 2026-07-26. */
+function assignSyntheticEntityIds(data: SceneData): void {
+  const used = new Set<number>();
+  for (const entry of data.entities) if (typeof entry.id === 'number') used.add(entry.id);
+  let next = 0;
+  for (const entry of data.entities) {
+    if (entry.id != null) continue;
+    while (used.has(next)) next++;
+    entry.id = next;
+    used.add(next);
+  }
+}
+
+/** Migrate v10→v11: no-op passthrough. v11 only changes HOW `PrefabInstance.
+ *  rootInstanceId` (and any future `entityId`-flagged field) is WRITTEN — a GUID
+ *  string instead of a raw ecs id — not the shape of the data. An older file's
+ *  numeric `rootInstanceId` still loads via the same `resolveEntityIdField`'s
+ *  number branch (scene-loading.md, Phase 2). */
+function migrateV10toV11(data: SceneData): void {
+  if (data.version >= 11) return;
+  data.version = 11;
+}
+
+/** Migrate v11→v12: no-op passthrough. v12 only changes HOW entities are keyed —
+ *  `serializeScene` stops writing `entry.id` entirely, since nothing on disk
+ *  references it any more (scene-loading.md's `parentId` guid,
+ *  Phase 2's `rootInstanceId` guid). An older file's `entry.id` is simply ignored;
+ *  `assignSyntheticEntityIds` (above) backfills a fresh one for a file that lacks
+ *  it, so both shapes load identically (scene-loading.md, Phase 3). */
+function migrateV11toV12(data: SceneData): void {
+  if (data.version >= 12) return;
   // Terminal version of the migration chain. Sourced from SCENE_FORMAT_VERSION so
   // the constant is the single source of truth: bumping it (without chaining a new
   // migration) can't silently mislabel a freshly-migrated file as under-versioned.
@@ -1120,17 +1200,45 @@ function resolveParentRef(raw: unknown, idMap: Map<number, number>, world: World
   return 0;
 }
 
+/** Resolve a serialized `FieldHint.entityId`-flagged field value to a live koota id.
+ *  - GUID string (current files) → the entity carrying that guid, via the guid index.
+ *  - number > 0 (legacy files / raw ecs ids, e.g. PrefabInstance.rootInstanceId) →
+ *    remapped through `idMap` (file/old-world id → fresh koota id).
+ *  - '' / 0 / unknown → `'empty'` (nothing to remap; the field already holds its
+ *    schema default).
+ *  Returns `'miss'` when the reference doesn't resolve — distinct from `'empty'` so
+ *  the caller applies the field's declared `onMissing` policy instead of guessing. */
+function resolveEntityIdField(raw: unknown, idMap: Map<number, number>, world: World): number | 'empty' | 'miss' {
+  if (raw == null || raw === '' || raw === 0) return 'empty';
+  if (typeof raw === 'string') {
+    const ent = findEntityByGuid(raw, world);
+    return ent ? ent.id() : 'miss';
+  }
+  if (typeof raw === 'number' && raw > 0) {
+    const mapped = idMap.get(raw);
+    return mapped ?? 'miss';
+  }
+  return 'empty';
+}
+
 /** Spawn entities from scene data, remap parentIds, optionally load models and prefabs. */
 export async function loadSceneFile(data: SceneData, options: LoadSceneOptions): Promise<void> {
-  // New scene → drop every prior override mark (ecs ids are reused across worlds).
+  // New WORLD → drop every prior override mark (ecs ids are reused across worlds).
   // Marks for this scene's instances are re-seeded below as overrides are applied.
-  clearAllOverrideMarks();
+  // Opt-out for a chain/carry load, where SceneManager owns the once-per-world clear
+  // and a per-call clear would wipe the marks an earlier scene in the chain seeded
+  // (A9 defect 1) — see the `clearMarks` docblock on LoadSceneOptions.
+  if (options.clearMarks !== false) clearAllOverrideMarks();
   migrateSceneData(data);
   migrateV4toV5(data);
   migrateV5toV6(data);
   migrateV6toV7(data);
   migrateV7toV8(data);
   migrateV8toV9(data);
+  migrateV9toV10(data);
+  migrateV10toV11(data);
+  migrateV11toV12(data);
+  assignSyntheticEntityIds(data);
   stripLegacyCameraFrameShowGizmo(data);
   // Forward-version guard: the migration steps only upgrade OLDER files. A scene
   // authored by a NEWER engine (version > current) passes through untouched and
@@ -1156,13 +1264,22 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
       const meta = allTraits.find((m) => m.name === traitName);
       if (!meta) continue;
       if (traitData === true) traitArgs.push(meta.trait());
-      else if (traitName === 'EntityAttributes') {
-        // parentId in the file is a GUID (current) or a legacy file id (number) —
-        // neither is a valid live koota id, and spawning a string into the numeric
-        // parentId field would corrupt it. Spawn with 0; pass 2 resolves the real id.
-        traitArgs.push(meta.trait({ ...(traitData as Record<string, unknown>), parentId: 0 }));
+      else {
+        // Every `entityId`-flagged field (Phase 15's FieldHint — EntityAttributes.
+        // parentId, PrefabInstance.rootInstanceId) holds a GUID (current files, since
+        // Phase 2, scene-loading.md) or a legacy numeric file id — neither
+        // is a valid live koota id, and spawning a GUID STRING into a numeric koota SoA
+        // field would corrupt it (silently becomes NaN, not caught until the declarative
+        // remap pass below runs — too late, the trait is already spawned broken). Zero
+        // every such field at spawn; pass 2 resolves the real id.
+        const entityIdFieldNames = Object.entries(meta.fields).filter(([, hint]) => hint.entityId).map(([k]) => k);
+        if (entityIdFieldNames.length === 0) traitArgs.push(meta.trait(traitData as Record<string, unknown>));
+        else {
+          const patched: Record<string, unknown> = { ...(traitData as Record<string, unknown>) };
+          for (const key of entityIdFieldNames) patched[key] = 0;
+          traitArgs.push(meta.trait(patched));
+        }
       }
-      else traitArgs.push(meta.trait(traitData as Record<string, unknown>));
     }
     if (traitArgs.length > 0) {
       const entity = world.spawn(...traitArgs);
@@ -1173,20 +1290,56 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
     }
   }
 
-  // Remap parentIds (in EntityAttributes). Resolve each entity's serialized parentId
-  // (a GUID in current files, a numeric file id in legacy ones) to its fresh koota id.
-  // The guid form needs no idMap — it survives the world rebuild on its own.
-  const attrMeta = allTraits.find((m) => m.name === 'EntityAttributes');
-  if (attrMeta) {
+  // Remap every registered `entityId`-flagged field (EntityAttributes.parentId,
+  // PrefabInstance.rootInstanceId, and any future field a trait declares) through
+  // `idMap` in ONE declarative pass, instead of a hand-maintained block per field —
+  // the bug class scene-loading.md's "A8" finding closes structurally
+  // (Phase 15). Each such field holds a raw ecs id (or, for `parentId`, sometimes a
+  // guid string) captured from the OLD world/file — meaningless in this fresh world
+  // until resolved. `resolveEntityIdField` handles both forms; each field's declared
+  // `onMissing` policy decides what happens when the id has no live counterpart here
+  // (see the `FieldHint.entityId` docblock in traitRegistry.ts for why the two existing
+  // fields use different policies).
+  //
+  // For a prefab-instance root this is a harmless no-op on a FRESH (non-carry) load:
+  // the placeholder gets this same self-consistent remap, then `onInstantiatePrefab`
+  // (below) destroys it and re-instantiates the whole prefab fresh, which patches its
+  // own members' rootInstanceId correctly and independently. It matters on a CARRIED
+  // base-scene snapshot (SceneManager.ts's carry respawn, which omits
+  // `onInstantiatePrefab` — every entity, root and members alike, spawns here as a flat
+  // entry with baked trait data verbatim, copied straight out of the dying world).
+  for (const meta of allTraits) {
+    const entityIdFields = Object.entries(meta.fields).filter(([, hint]) => hint.entityId);
+    if (entityIdFields.length === 0) continue;
     for (const entry of data.entities) {
-      const ea = entry.traits['EntityAttributes'] as Record<string, unknown> | undefined;
-      if (!ea) continue;
+      const traitData = entry.traits[meta.name] as Record<string, unknown> | undefined;
+      if (!traitData) continue;
       const entity = spawnedByEntryId.get(entry.id);
-      if (!entity) continue;
-      const newParentId = resolveParentRef(ea.parentId, idMap, world);
-      if (!newParentId) continue; // root (or unresolved) — already spawned with parentId 0
-      if (entity.has(attrMeta.trait)) {
-        entity.set(attrMeta.trait, { ...(entity.get(attrMeta.trait) as Record<string, unknown>), parentId: newParentId });
+      if (!entity || !entity.has(meta.trait)) continue;
+      let patch: Record<string, unknown> | undefined;
+      let stripped = false;
+      for (const [fieldName, hint] of entityIdFields) {
+        const resolved = resolveEntityIdField(traitData[fieldName], idMap, world);
+        if (resolved === 'empty') continue; // no value / already 0 — nothing to remap
+        if (resolved !== 'miss') { (patch ??= {})[fieldName] = resolved; continue; }
+        if (hint.entityId!.onMissing === 'stripTrait') {
+          const name = (entry.traits['EntityAttributes'] as Record<string, unknown> | undefined)?.name ?? entry.id;
+          console.warn(
+            `[loadSceneFile] entity "${name}" carries a ${meta.name} whose ${fieldName} has no live ` +
+            `counterpart in this load — stripping ${meta.name} so it can't poison downstream lookups ` +
+            `(scene-loading.md, Phase 15).`,
+          );
+          entity.remove(meta.trait);
+          stripped = true;
+          break;
+        }
+        // 'root' — silently write the field's schema default (0). An orphan is a
+        // legitimate partial-load outcome; sceneValidation.ts already warns on it at
+        // author time, so no runtime warning here.
+        (patch ??= {})[fieldName] = 0;
+      }
+      if (!stripped && patch) {
+        entity.set(meta.trait, { ...(entity.get(meta.trait) as Record<string, unknown>), ...patch });
       }
     }
   }
@@ -1233,8 +1386,19 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
       const source = (entry.prefab as string | undefined) ?? (pi?.source as string | undefined);
       if (!source) continue;
       if (pi && !entry.prefab) {
-        const rootInstanceId = pi.rootInstanceId as number;
-        if (rootInstanceId !== 0 && rootInstanceId !== entry.id) continue;
+        // rootInstanceId is a GUID string (current files, since Phase 2, scene-save-
+        // stability-plan.md) or a raw numeric file/ecs id (legacy files; the in-
+        // memory carry-respawn snapshot, which never round-trips through JSON so it
+        // stays numeric regardless of format version). "This entry IS the root" means
+        // the id/guid points at ITSELF — compare against entry.id for the numeric
+        // form, or this entry's OWN guid for the string form. 0 / '' means unset,
+        // which is also treated as root (nothing to remap yet).
+        const rootInstanceId = pi.rootInstanceId as number | string;
+        const entryGuid = (entry.traits['EntityAttributes'] as Record<string, unknown> | undefined)?.guid as string | undefined;
+        const isSelfOrUnset = typeof rootInstanceId === 'string'
+          ? (rootInstanceId === '' || (!!entryGuid && rootInstanceId === entryGuid))
+          : (rootInstanceId === 0 || rootInstanceId === entry.id);
+        if (!isSelfOrUnset) continue;
       }
 
       const newEntityId = idMap.get(entry.id);

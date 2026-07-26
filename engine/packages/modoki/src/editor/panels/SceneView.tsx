@@ -58,7 +58,7 @@ import { isTextEditable } from '../input/focusScope';
 import { loadScene } from '../scene/serialize';
 import { worldToLocalTransform } from '../scene/gizmoTransform';
 import { boneRelToProxyLocal, proxyLocalToBoneLocal } from '../scene/billboardBonePose';
-import { setEditorViewportCamera, setFocusEntityHandler, focusEntityInSceneView, setViewportController, setEcsObjectsRegistry } from '../scene/sceneViewBus';
+import { setEditorViewportCamera, setFocusEntityHandler, focusEntityInSceneView, canFrameSelected, setViewportController, setEcsObjectsRegistry } from '../scene/sceneViewBus';
 import { withWarnFilter } from '../scene/warnFilter';
 import { mintEditor3DFrameKey, editor2DChromeFrameKey } from '../scene/frameKeys';
 import { computeUIModeNDC, computeFullNDC, computeCamFrustumPositions, computeLetterbox, frameCameraToBox, gameAspectFromRect, createSelectGesture, outlineSourceGeometry, resolveFocusTarget, axisSnapCameraPosition, slerpCameraOffset, perspHalfHeightAtDistance, perspDistanceForHalfHeight, orthoFrustumForHalfHeight, shouldHideMeshesForColliderMode } from '../scene/sceneViewMath';
@@ -508,9 +508,13 @@ export default function SceneView() {
   // meta/ctrl/alt bail (it matches the FULL chord, so 'r' never matches Cmd+R) and the
   // input-tag check (the dispatcher's text-field tier blocks panel scopes while typing).
   //
-  // `f` is app-key, NOT scene-scoped: users press it right after clicking an entity in
-  // the Hierarchy, and editor-hierarchy.spec.ts:84 pins exactly that. It still yields
-  // when there's nothing to frame, so an unbound `f` reaches whatever else wants it.
+  // `f` is `scene`-scoped, NOT app-key: it reframes an orbit camera the user can't see
+  // from the Assets panel or a running game, so it only fires when the Scene view itself
+  // owns the keyboard. Hierarchy registers the same chord (`hierarchy.frameSelected`,
+  // scope 'hierarchy') since users also press it right after clicking an entity there
+  // (editor-hierarchy.spec.ts:84) — the two share `canFrameSelected` (sceneViewBus.ts) so
+  // they can't drift. Everywhere else — Game view, Inspector, nothing focused — yields,
+  // for free, via keymap scope priority; no `focusedPanel` check needed here at all.
   useEffect(() => {
     const offs = [
       register({
@@ -524,10 +528,13 @@ export default function SceneView() {
         run: () => setGizmoPivot(useEditorStore.getState().gizmoPivot === 'center' ? 'pivot' : 'center'),
       }),
       register({
-        id: 'scene.frameSelected', keys: 'f', scope: 'app-key',
-        // Frame the selected entity in the orbit camera (3D mode only). `when` yields
-        // rather than claiming-and-doing-nothing, so `f` stays available elsewhere.
-        when: () => mode !== 'ui' && useEditorStore.getState().selectedEntityId !== null,
+        id: 'scene.frameSelected', keys: 'f', scope: 'scene',
+        // Read sceneViewMode from the store rather than closing over the `mode` prop, so
+        // this binding never needs re-registering on a UI/3D mode flip.
+        when: () => canFrameSelected({
+          sceneViewMode: useEditorStore.getState().sceneViewMode,
+          selectedEntityId: useEditorStore.getState().selectedEntityId,
+        }),
         run: () => {
           const sel = useEditorStore.getState().selectedEntityId;
           if (sel !== null) focusEntityInSceneView(sel);
@@ -3965,6 +3972,22 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // proxy at the pivot (Unity Center = centroid / Pivot = active origin), oriented by the
       // active member for Local space, then attach the gizmo to it. The group drag path
       // (onGizmoMouseDown/Change/Up) reads the proxy and writes every member.
+      // Base-scene ghost (Phase 9, unlock added Phase 13): no transform handles on a
+      // LOCKED base-origin entity — editor-UI gate only (no runtime distinction).
+      // Single-select only; a multi-selection mixing primary + base entities is an
+      // edge case this doesn't specially handle, matching the Inspector's own scope.
+      // Unlocked (via the Inspector's ghost banner) gains handles too — same store
+      // flag the Inspector's field gate reads, so both surfaces unlock together and
+      // both re-lock together on a selection change.
+      const ghostEaMeta = getAllTraits().find((t) => t.name === 'EntityAttributes');
+      const isGhostedEntity = (id: number | null): boolean => {
+        if (id === null || !ghostEaMeta) return false;
+        const e = findEntity(id);
+        const sourceScene = e && e.has(ghostEaMeta.trait) ? (e.get(ghostEaMeta.trait) as { sourceScene?: string }).sourceScene : undefined;
+        if (!sourceScene) return false;
+        const selKey = useEditorStore.getState().selectedEntityIds.join(',');
+        return useEditorStore.getState().unlockedGhostSelKey !== selKey;
+      };
       const multiSel = useEditorStore.getState().selectedEntityIds.length > 1 && !boneGizmo;
       if (multiSel) {
         // Don't fight an in-progress drag of the proxy (the gizmo owns it then).
@@ -3996,7 +4019,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         gizmo.showX = gizmo.showY = gizmo.showZ = true;
         (gizmo as any).visible = true;
         gizmo.enabled = true;
-      } else if (selectedId !== null && selObj) {
+      } else if (selectedId !== null && selObj && !isGhostedEntity(selectedId)) {
         if (gizmo.object !== selObj) gizmo.attach(selObj);
         // Keep the write-back identity in sync with the SELECTION every frame, not just
         // when `gizmo.object` changes: all bones of one rig share `boneProxy`, so a

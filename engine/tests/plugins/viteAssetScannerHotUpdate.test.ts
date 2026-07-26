@@ -31,7 +31,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { assetScannerPlugin, isGameCodeFile } from '../../plugins/vite-asset-scanner';
+import { assetScannerPlugin, isGameCodeFile, isShaderGraphFile } from '../../plugins/vite-asset-scanner';
 
 /** Vite hands handleHotUpdate a POSIX-normalized path even on Windows. */
 const posix = (p: string) => p.split(path.sep).join('/');
@@ -247,5 +247,70 @@ describe('isGameCodeFile', () => {
     expect(isGameCodeFile('/Users/x/tests/mygame/game.ts', under, assets)).toBe(true);
     // …while the game's OWN tests/ dir is still excluded.
     expect(isGameCodeFile('/Users/x/tests/mygame/tests/a.test.ts', under, assets)).toBe(false);
+  });
+});
+
+describe('shader-graph reload (postfx/npr TSL)', () => {
+  /** Same class of bug as the game-code rule above, different mechanism: TSL node instances
+   *  bake into a compiled WGSL pipeline, so hot-patching the module leaves the renderer running
+   *  the PREVIOUSLY compiled graph. These files used to self-`invalidate()`, which only
+   *  propagates to importers and was swallowed by Scene3D.tsx's Fast Refresh boundary — so a
+   *  correct shader fix looked broken and got reverted. Decided by PATH on the server now,
+   *  where nothing in the module graph can swallow it. */
+  const shaderSignals = () => sent.filter((m) => m.event === 'modoki:shader-code-changed');
+
+  it('signals a reload for postfx and npr modules, with the wire shape the renderer reads', () => {
+    // Monorepo mode, like the engine's own dev editor: no <root>/game.ts ⇒ the game-code rule
+    // is inert, so a shader signal here can only come from the shader rule.
+    delete process.env.MODOKI_PROJECT;
+    fs.rmSync(path.join(projectRoot, 'game.ts'));
+    const engineDir = path.join(projectRoot, 'engine/packages/modoki/src/runtime/rendering');
+    fs.mkdirSync(path.join(engineDir, 'postfx'), { recursive: true });
+    fs.mkdirSync(path.join(engineDir, 'npr'), { recursive: true });
+    const p = armedPlugin();
+
+    for (const rel of ['postfx/PostFXStack.ts', 'postfx/dofViewZ.ts', 'npr/edgeNodes.ts', 'npr/fxaaNode.ts']) {
+      sent = [];
+      const file = posix(path.join(engineDir, rel));
+      expect(p.handleHotUpdate({ file }), `${rel} must be owned by us, not propagated`).toEqual([]);
+      expect(sent).toContainEqual({ type: 'custom', event: 'modoki:shader-code-changed', data: { file } });
+    }
+  });
+
+  it('leaves every OTHER engine module on Fast Refresh', () => {
+    // The blast radius has to stay tiny: forcing a reload for all of engine/** would destroy
+    // Fast Refresh for editor development, which is the regression the monorepo test above
+    // guards for game code.
+    delete process.env.MODOKI_PROJECT;
+    fs.rmSync(path.join(projectRoot, 'game.ts'));
+    fs.mkdirSync(path.join(projectRoot, 'engine/packages/modoki/src/runtime/rendering'), { recursive: true });
+    const p = armedPlugin();
+    const sibling = posix(path.join(projectRoot, 'engine/packages/modoki/src/runtime/rendering/Scene3D.tsx'));
+
+    expect(p.handleHotUpdate({ file: sibling })).toBeUndefined();
+    expect(shaderSignals()).toHaveLength(0);
+  });
+});
+
+describe('isShaderGraphFile', () => {
+  it('matches .ts under runtime/rendering/{postfx,npr}', () => {
+    expect(isShaderGraphFile('/repo/engine/packages/modoki/src/runtime/rendering/postfx/PostFXStack.ts')).toBe(true);
+    expect(isShaderGraphFile('/repo/engine/packages/modoki/src/runtime/rendering/npr/compositeNodes.ts')).toBe(true);
+  });
+
+  it('normalizes Windows separators', () => {
+    expect(isShaderGraphFile('C:\\repo\\engine\\packages\\modoki\\src\\runtime\\rendering\\npr\\fxaaNode.ts')).toBe(true);
+  });
+
+  it('does NOT match the sibling renderer, other rendering subdirs, or non-code files', () => {
+    expect(isShaderGraphFile('/repo/engine/.../runtime/rendering/Scene3D.tsx')).toBe(false);
+    expect(isShaderGraphFile('/repo/engine/.../runtime/rendering/scene3DSync.ts')).toBe(false);
+    expect(isShaderGraphFile('/repo/engine/.../runtime/rendering/postfx/notes.md')).toBe(false);
+  });
+
+  it('is anchored on runtime/rendering — a project folder merely NAMED npr does not match', () => {
+    // Otherwise any game with an `npr/` directory would force-reload the editor on every edit.
+    expect(isShaderGraphFile('/repo/games/x/runtime/npr/shader.ts')).toBe(false);
+    expect(isShaderGraphFile('/repo/games/x/postfx/thing.ts')).toBe(false);
   });
 });

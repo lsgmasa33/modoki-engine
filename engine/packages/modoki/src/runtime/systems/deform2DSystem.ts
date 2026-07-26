@@ -6,7 +6,7 @@
  *  the clip's relative name-path (reusing `resolveTrackTarget`), plus a part name. */
 
 import type { World } from 'koota';
-import { resolveTrackTarget, buildEntityIndex, type EntityIndex } from '../animation/sampleClip';
+import { resolveTrackTarget, buildEntityIndex, type EntityIndex } from '../ecs/entityIndex';
 import { evalDeformTrack } from '../animation/deformEval';
 import type { AnimationClipDef } from '../animation/types';
 import { setDeform2D } from './deform2DBuffers';

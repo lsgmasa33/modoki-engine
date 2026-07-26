@@ -11,6 +11,7 @@ import { createWorld } from 'koota';
 import {
   getCurrentWorld, setCurrentWorld, getAllEntities, readTraitData, getTraitByName,
   writeTraitField, deleteEntity, loadSceneFile, instantiatePrefabIntoWorld, markOverride, type SceneData,
+  SCENE_FORMAT_VERSION,
 } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import {
@@ -64,7 +65,7 @@ describe('scene serialization round-trip', () => {
     );
 
     const scene = await serializeScene();
-    expect(scene.version).toBe(9);
+    expect(scene.version).toBe(SCENE_FORMAT_VERSION);
 
     await reloadInFreshWorld(scene);
 

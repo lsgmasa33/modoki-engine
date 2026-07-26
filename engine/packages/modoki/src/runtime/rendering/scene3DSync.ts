@@ -28,7 +28,8 @@ import { updateSceneLightUniforms } from './sceneLightUniforms';
 import { setEntityMeshCollector } from './materialBroker';
 import { getAnimationClip } from '../loaders/animationClipCache';
 import { resolveActiveClip, resolveClipByName } from '../animation/animClipBank';
-import { applyClipAtTime, applyClipAtTimeBlended, buildEntityIndex } from '../animation/sampleClip';
+import { applyClipAtTime, applyClipAtTimeBlended } from '../animation/sampleClip';
+import { buildEntityIndex } from '../ecs/entityIndex';
 import type { AnimationClipDef } from '../animation/types';
 import {
   resolveMeshTemplate, resolveMeshLodInfo, resolveMaterialForMesh, resolveMaterial,
@@ -642,6 +643,11 @@ function lightMatchesType(l: THREE.Light, lightType: string): boolean {
   }
 }
 
+/** Scratch for deriving a spot/directional light's aim (see syncLights). Module-level so
+ *  the per-frame light sweep allocates nothing. */
+const _lightEuler = new THREE.Euler();
+const _lightForward = new THREE.Vector3();
+
 export function syncLights(world: World, scene: THREE.Scene, ecsLights: Map<number, THREE.Light>) {
   _activeLightIds.clear();
   world.query(Light).updateEach(([light], entity) => {
@@ -692,11 +698,35 @@ export function syncLights(world: World, scene: THREE.Scene, ecsLights: Map<numb
       // SpotLight (and DirectionalLight) point toward `target.position`. Without
       // syncing the target, spot lights keep aiming at (0,0,0) regardless of
       // parent transform. Project the light's local -Z forward into world space.
+      //
+      // Derive it through `applyEuler` rather than hand-rolled trig, so a light's aim uses
+      // the SAME euler order the renderer applies to every other object — three's default
+      // XYZ, as in `applyTransform`'s `obj.rotation.set(...)` and `getWorldTransform3D`'s
+      // decomposition. The previous inline formula
+      // `(-sin(ry)cos(rx), sin(rx), -cos(ry)cos(rx))` is YXZ (Ry·Rx), so the same authored
+      // euler meant one orientation on a mesh/camera and a different one on a light. The
+      // two agree only when `ry ≈ 0`, which is why it went unnoticed — most authored spots
+      // have little yaw. (Roll is irrelevant either way: rotating about Z leaves the -Z
+      // axis fixed, so `rz` cannot change the forward direction.)
+      //
+      // AUTHORED TARGET WINS. `targetX/Y/Z` are world-space coordinates to aim AT; when any
+      // of them is non-zero the light points there and the rotation is ignored. All-zero
+      // means UNSET (not "aim at the world origin") — that is what keeps every scene authored
+      // before the fields were wired working unchanged, since they all serialize 0,0,0. To
+      // aim at the origin, nudge one axis (e.g. targetY 0.001); the direction error is
+      // immeasurable at any real light distance.
       if (l instanceof THREE.SpotLight || l instanceof THREE.DirectionalLight) {
-        const forwardX = wt.x - Math.sin(wt.ry) * Math.cos(wt.rx);
-        const forwardY = wt.y + Math.sin(wt.rx);
-        const forwardZ = wt.z - Math.cos(wt.ry) * Math.cos(wt.rx);
-        l.target.position.set(forwardX, forwardY, forwardZ);
+        if (light.targetX !== 0 || light.targetY !== 0 || light.targetZ !== 0) {
+          l.target.position.set(light.targetX, light.targetY, light.targetZ);
+        } else {
+          _lightEuler.set(wt.rx, wt.ry, wt.rz);
+          _lightForward.set(0, 0, -1).applyEuler(_lightEuler);
+          l.target.position.set(
+            wt.x + _lightForward.x,
+            wt.y + _lightForward.y,
+            wt.z + _lightForward.z,
+          );
+        }
         if (!l.target.parent) scene.add(l.target);
       }
     }

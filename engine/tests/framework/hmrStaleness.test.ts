@@ -195,3 +195,59 @@ describe('no hot context (a shipped game build)', () => {
     expect(banner()).toBeNull();
   });
 });
+
+describe('shader code changed (postfx/npr TSL)', () => {
+  /** The shader-graph twin of the game-code reload. TSL nodes bake into a compiled WGSL
+   *  pipeline, so a hot patch leaves the OLD graph rendering and a correct fix reads as
+   *  "didn't work" — the same lying-measurement failure class, and therefore the same policy:
+   *  reload, but never silently at the cost of unsaved scene work. */
+  it('reloads immediately when the scene is clean', async () => {
+    const hot = fakeHot();
+    initHmrStaleness(hot, () => false);
+    hot.emit('modoki:shader-code-changed', { file: '/e/runtime/rendering/postfx/dofViewZ.ts' });
+    await settle();
+
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(banner()).toBeNull();
+    expect(sessionStorage.getItem(DISCARDED_KEY)).toBeNull();
+  });
+
+  it('warns before discarding unsaved scene work, naming the shader edit', async () => {
+    const hot = fakeHot();
+    initHmrStaleness(hot, () => true);
+    hot.emit('modoki:shader-code-changed', { file: '/e/runtime/rendering/npr/edgeNodes.ts' });
+    await settle();
+
+    expect(reload).not.toHaveBeenCalled();
+    expect(bannerText()).toContain('Shader code changed');
+    expect(bannerText()).toContain('unsaved scene changes will be LOST');
+
+    vi.advanceTimersByTime(5200);
+    await settle();
+    expect(reload).toHaveBeenCalledTimes(1);
+    const rec = JSON.parse(sessionStorage.getItem(DISCARDED_KEY) ?? 'null');
+    expect(rec?.file).toBe('/e/runtime/rendering/npr/edgeNodes.ts');
+  });
+
+  it('Cancel marks the editor STALE — measurements from it are not to be trusted', async () => {
+    const hot = fakeHot();
+    initHmrStaleness(hot, () => true);
+    hot.emit('modoki:shader-code-changed', { file: '/e/runtime/rendering/postfx/PostFXStack.ts' });
+    await settle();
+
+    clickButton('Cancel');
+    await settle();
+
+    expect(reload).not.toHaveBeenCalled();
+    expect(getHmrStatus().staleGameCode).toBe(true);
+    expect(bannerText()).toContain('STALE');
+  });
+
+  it('still handles a game-code change — the two producers share one handler', async () => {
+    const hot = fakeHot();
+    initHmrStaleness(hot, () => false);
+    hot.emit('modoki:game-code-changed', { file: '/g/runtime/systems.ts' });
+    await settle();
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+});

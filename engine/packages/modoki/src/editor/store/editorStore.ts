@@ -68,6 +68,14 @@ interface EditorState {
    *  entity stays put, the rest orbit it); 'center' = the selection centroid. Move is identical
    *  either way. */
   gizmoPivot: 'pivot' | 'center';
+  /** Phase 13 (scene-loading.md): which exact selection (a
+   *  comma-joined entity-id key, matching the Inspector's own `selKey`) is unlocked
+   *  for in-place editing of a ghosted (base-origin) entity. Store-backed (not
+   *  component-local state) so BOTH the Inspector (field pointer-events gate) and
+   *  the SceneView gizmo (Phase 9's `isGhostedEntity` handle gate) read the SAME
+   *  unlock — a selection change naturally re-locks, since the stored key stops
+   *  matching the new selKey. null = nothing unlocked. */
+  unlockedGhostSelKey: string | null;
   /** On-canvas collider-mesh editing: when true, the selected entity's polygon/mesh
    *  Collider2D shows draggable vertex handles in the 2D SceneView (Phase 4.3). */
   colliderEditMode: boolean;
@@ -253,6 +261,7 @@ interface EditorState {
   setFocusedPanel: (panel: string | null) => void;
   setGizmoSpace: (space: 'local' | 'world') => void;
   setGizmoPivot: (pivot: 'pivot' | 'center') => void;
+  setUnlockedGhostSelKey: (key: string | null) => void;
   setParticlePreview: (on: boolean) => void;
   setGameViewSize: (width: number, height: number) => void;
   setGameRect: (rect: EditorState['gameRect']) => void;
@@ -402,6 +411,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   gizmoMode: 'translate',
   gizmoSpace: 'world',
   gizmoPivot: 'pivot',
+  unlockedGhostSelKey: null,
   colliderEditMode: false,
   showFocusGraph: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:showFocusGraph') === '1'),
   sceneViewMode: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:sceneViewMode') === 'ui') ? 'ui' : '3d',
@@ -562,6 +572,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   },
   setGizmoSpace: (space: 'local' | 'world') => { if (get().gizmoSpace !== space) editorEmit('!gizmo', { space }); set({ gizmoSpace: space }); mark2DDirty(); },
   setGizmoPivot: (pivot: 'pivot' | 'center') => { if (get().gizmoPivot !== pivot) editorEmit('!gizmo', { pivot }); set({ gizmoPivot: pivot }); mark2DDirty(); },
+  setUnlockedGhostSelKey: (key: string | null) => set({ unlockedGhostSelKey: key }),
   setParticlePreview: (on: boolean) => set({ particlePreview: on }),
   setGameViewSize: (width, height) => set({ gameViewSize: { width, height } }),
   setGameRect: (rect) => set({ gameRect: rect }),

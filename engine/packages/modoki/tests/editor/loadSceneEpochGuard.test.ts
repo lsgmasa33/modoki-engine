@@ -36,6 +36,7 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
       new Promise<void>((resolve, reject) => {
         h.loadCalls.push({ path, opts, resolve, reject });
       }),
+    getCurrentBaseScene: () => undefined,
   },
 }));
 

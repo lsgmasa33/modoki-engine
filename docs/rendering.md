@@ -20,7 +20,7 @@ Layering: `Scene3D` mounts an absolutely-positioned container at `zIndex: 0`. Th
 
 - `syncCamera(world, scene, camera)` — pushes the active `Camera` + `Transform` onto the Three camera, applies FOV/near/far and `clearColor`.
 - `syncEnvironment(world, scene)` — binds the cached HDR `Environment` texture (envmap + optional background).
-- `syncLights(world, scene, ecsLights)` — creates/updates/removes `THREE.Light` instances from the `Light` trait (ambient / directional / point / spot), re-aiming spot & directional targets from the world transform.
+- `syncLights(world, scene, ecsLights)` — creates/updates/removes `THREE.Light` instances from the `Light` trait (ambient / directional / point / spot), re-aiming spot & directional targets from the authored `target*` point, or from the world transform when it's unset.
 - `syncRenderables(world, scene, state)` — the main mesh sync. Handles GLB meshes (`Renderable3D`, including baked `THREE.LOD` sets) and procedural primitives (`Renderable3DPrimitive`). Internally it uses:
   - `syncMaterial(...)` — resolves `.mat.json` references, inline texture paths, and the default material; fans the result out to single meshes or every LOD child.
   - `applyTransform(...)` — copies the propagated world transform (from `worldTransforms`) onto the object, falling back to the local `Transform`.
@@ -71,8 +71,25 @@ The key geometric shortcut: translating the camera along its own forward axis ch
 
 - **Types** — `lightType` selects `AmbientLight` / `DirectionalLight` / `PointLight` / `SpotLight` (`createLightFromTrait`). Switching the type at runtime disposes the old instance and recreates it (`lightMatchesType`).
 - **Per-frame fields** — `color`, `intensity`, `castShadow` are re-applied every frame; `distance` for point/spot; `angle` + `penumbra` for spot. Subclasses ignore irrelevant fields (an `AmbientLight` has no `distance`).
-- **Aiming** — directional/spot lights aim at a `target` Object3D added to the scene; each frame `syncLights` projects the light's local −Z forward from the WORLD transform onto that target, so a parented spot follows its transform instead of always aiming at the origin. A reaped or type-switched light removes its stray target too (`removeLightTarget`), else empties accumulate on churn.
-  - **GOTCHA — aim comes from `Transform` ROTATION, and the `Light` trait's `targetX/targetY/targetZ` fields are NOT read by `syncLights`.** The forward vector is computed purely from `rx`/`ry` (`forward = (−sin ry·cos rx, sin rx, −cos ry·cos rx)`), so a light with **zero rotation always points along −Z — dead horizontal — no matter where you place it or what you type into `target*`.** Positioning a sun high above the scene and setting its target to the origin does nothing on its own. Symptom: ground planes render **black** (their +Y normal is edge-on to the light, N·L ≈ 0) while walls and object sides light normally, and `castShadow` appears to do nothing because the shadow map is cast edge-on. Cost a long false hunt for a "WebGPU shadow bug" in `demos/3d-physics-demo`; the fix was rotating the light. To aim a light at a point, set the rotation: `rx = asin(u.y)`, `ry = atan2(−u.x, −u.z)` where `u` is the normalized direction from the light to the target.
+- **Aiming** — directional/spot lights aim at a `target` Object3D added to the scene. Two ways to author it, checked in this order each frame by `syncLights`. A reaped or type-switched light removes its stray target too (`removeLightTarget`), else empties accumulate on churn.
+  - **1. `Light.targetX/targetY/targetZ` — a WORLD-space point to aim AT.** Set any one of them non-zero and the light points there, ignoring its rotation entirely. This is usually what you want: "this spot lights that statue" is a position, not an euler.
+  - **2. Rotation fallback** — when all three are 0 the aim is the light's local −Z forward put through its WORLD euler, so a parented spot follows its transform instead of always aiming at the origin. To aim at a point this way, set the rotation from the normalized light→target direction `u`: **`ry = asin(−u.x)`, `rx = atan2(u.y, −u.z)`** (roll is irrelevant — rotating about Z cannot move the −Z axis).
+  - **`(0,0,0)` means UNSET, not "aim at the world origin"** — that is what keeps every scene authored before the fields were wired working unchanged, since they all serialize `0,0,0`. To aim at the origin, nudge one axis (`targetY: 0.001`); the direction error is immeasurable at any real light distance. Both directions are pinned in `tests/runtime/syncLights.test.ts`.
+  - **⚠️ Historical trap (fixed 2026-07-26): the `target*` fields used to be DEAD.** They were declared on the trait, shown in the Inspector under a "Target" group, and written into prefab defaults — and read by nothing, so a light with **zero rotation always pointed along −Z, dead horizontal, no matter what you typed into `target*`.** Symptom: ground planes render **black** (their +Y normal is edge-on to the light, N·L ≈ 0) while walls and object sides light normally, and `castShadow` appears to do nothing because the shadow map is cast edge-on. Cost a long false hunt for a "WebGPU shadow bug" in `demos/3d-physics-demo`, and made a correctly-targeted spot in `demos/postfx-demo` look dead at intensity 4000. If you meet a scene that still aims six spots by hand-computed `asin`/`atan2` rotations, that is the old workaround — it still works (all-zero targets), and can be simplified to plain targets.
+  - **⚠️ Post-FX stages that reconstruct DEPTH must be handed the SCENE camera's near/far as
+    caller-owned uniforms — never TSL's global `cameraNear`/`cameraFar`** (fixed 2026-07-26).
+    Those globals resolve from whatever camera renders the CURRENT pass, and a post-FX stage
+    like DOF's circle-of-confusion pass is a full-screen QUAD with its own camera — so they
+    silently resolve to the quad's near/far and the reconstructed viewZ becomes effectively
+    constant across the frame. three's own `PassNode.getViewZNode()` sidesteps this with the
+    pass's private `_cameraNear`/`_cameraFar`; `buildViewZNode` (`postfx/dofViewZ.ts`) takes
+    them as explicit parameters, and the DOF stage updates them each frame in its
+    `StageHandle.prepare()`. **Symptom to recognise:** depth-of-field with *no depth* — near
+    and far objects blur by the same amount and move together as `focusDistance` changes,
+    and the effect completely ignores the scene camera's `near` (the diagnostic: change
+    `Camera.near` and watch nothing happen). It cost hours because it looks like a tuning
+    problem, not a wiring one.
+  - **Euler order is XYZ — the same order the renderer applies to every other object** (`applyTransform`'s `obj.rotation.set(rx, ry, rz)` at three's default, and `getWorldTransform3D`'s decomposition). ⚠️ **Historical trap (fixed 2026-07-26):** `syncLights` used to derive the aim with a hand-rolled `(−sin ry·cos rx, sin rx, −cos ry·cos rx)`, which is **YXZ** — so one authored euler meant one orientation on a mesh/camera and a *different* one on a light. The two agree only when `ry ≈ 0`, true of most authored spots, which is why it survived so long; a light with both pitch and yaw was mis-aimed (measured: 80° on one scene's key light). The fix routes the forward through `applyEuler`, and the 24 affected lights across ~20 scenes were migrated so their directions are unchanged. **If you ever re-test this, use a pose where the orders disagree — both pitch and yaw non-zero. A test at `ry = 0` passes either way and proves nothing** (`tests/runtime/syncLights.test.ts`).
 - **Particle layer** — every created light enables `PARTICLE_LAYER` (Three lights are layer-gated); without it, lit mesh-particle materials render black.
 - A light whose query row vanishes is removed + disposed at the end of the pass.
 
@@ -378,31 +395,99 @@ The `GameConfig.preferWebGPU` JSDoc in `runtime/config.ts` is likewise stale (st
 
 Materials are standard Three.js materials (`MeshStandardMaterial`, GLB-imported materials, etc.). `WebGPURenderer` auto-converts them to TSL/WGSL — there is no hand-written shader source in the standard render path. The NPR post-process is the one place that authors node graphs, and it does so through TSL (plus one small raw-WGSL `wgslFn` for FXAA).
 
-## NPR Outline Post-Process
+## Post-Process Stack
 
-The engine ships a stylized cel/outline post-process that runs **only on WebGPU**. It is off by default and toggled by the `NPRPostFX` ECS trait.
+All 3D post-processing runs through **one composable chain**, `rendering/postfx/PostFXStack.ts`.
+Effects are **not** mutually exclusive: `NPRPostFX` + `BloomPostFX` + `VignettePostFX` +
+`DepthOfFieldPostFX` + `AmbientOcclusionPostFX` can all be on at once. (Before the stack landed,
+`Scene3D` had two exclusive branches and "NPR wins, bloom is skipped" — that is gone.)
+**WebGPU-only**; on a WebGL2 fallback every effect is skipped and the render falls through to a
+plain `renderer.render`.
 
-### Pipeline — `npr/NPRPostProcess.ts`
-
-`NPRPostProcess` owns the node graph and uniforms for one `Scene3D` instance.
-
-```ts
-class NPRPostProcess {
-  constructor(renderer, scene, camera, initial?: Partial<NPRConfig>)
-  render(): void                            // replaces renderer.render(scene, camera)
-  setConfig(config: Partial<NPRConfig>): boolean   // returns true if a rebuild is needed
-  resize(width, height): void
-  dispose(): void
-}
+```
+scenePass  ── MRT: { output, [normal], [lineColor] }   + depth (free)
+     │
+     ├─▶ [NPR stylize]        normal + lineColor + depth → stylized color
+     ├─▶ [NPR particles]      scene-injecting: particles drawn over the stylized buffer
+     ├─▶ [AO]                 consumes depth + normal (see AO section — normal is NOT optional here)
+     ├─▶ [DOF]                consumes viewZ
+     ├─▶ [Bloom]              color only
+     ├─▶ [Vignette]           color only
+     └─▶ [FXAA]               tail AA
+             │
+             ▼
+      terminal RenderPipeline  (outputColorTransform = true)
 ```
 
-It builds a single geometry `pass(scene, camera)` with an **MRT** (`setMRT(mrt({...}))`) writing three targets:
+### The two invariants
+
+- **I1 — one terminal color transform.** Every stage works in **linear/working space**. The
+  stack's own `RenderPipeline` is the *sole* terminal one and keeps `outputColorTransform = true`
+  (tone map + sRGB encode, applied exactly once). The NPR particle stage owns an **internal**
+  pipeline and must therefore set `outputColorTransform = false`. Getting this backwards
+  double-encodes the frame (visibly washed out or crushed).
+- **I2 — one canonical MRT layout.** The scene pass's targets are the **union** of what the
+  enabled stages need (`output`, plus `normal` for NPR *or* AO, plus `lineColor` for NPR only),
+  computed once — never a per-effect target set. This matters because under MRT a `NodeMaterial`
+  whose `fragmentNode` writes only target[0] has its **draw silently discarded by WebGPU**.
+
+### Planning is pure — `rendering/postfx/stackPlan.ts`
+
+Zero `three`/TSL imports, so every decision is unit-testable with no GPU
+(`tests/runtime/postfxStackPlan.test.ts`). `PostFXStack` must not re-derive any of it:
+
+| Function | Decides |
+|---|---|
+| `planStages(req)` | The enabled stages in canonical order (NPR → NPR-particles → AO → DOF → bloom → vignette → FXAA), never the request's key order. |
+| `requiredMrtTargets(req)` | The minimal MRT union (I2). |
+| `stackSignature(req)` | Edge-trigger key, so a static scene does zero per-frame config work. |
+| `needsRebuild(prev, next)` | `true` iff the stage SET, the MRT layout, or an NPR **structural** field (`superSampleScale`, `isOrthographic`) changed. A param-only edit returns `false` → a live uniform write, not a shader recompile. |
+| `planFxaaEnabled({...})` | FXAA's three preconditions: requested, not the WebGL2 backend, and `superSampleScale === 1`. |
+
+### Stage shapes
+
+Most stages are pure color-node transforms (color in, color out). Two are not, and both are NPR's:
+the **stylize** stage reads extra MRT targets, and the **particle** stage is a real scene draw, not
+a filter — see the NPR section below.
+
+### Ordering deviations (deliberate — don't "fix" these)
+
+- **Vignette runs pre-tonemap.** Most engines apply it inside the tonemapper; keeping it linear
+  preserves I1, and a real lens vignette *is* pre-sensor.
+- **FXAA runs pre-tonemap**, matching what NPR did historically. FXAA's luma heuristics assume
+  gamma space, so this is a known, pre-existing compromise.
+
+## NPR Outline Post-Process
+
+The engine ships a stylized cel/outline post-process that runs **only on WebGPU**. It is off by default and toggled by the `NPRPostFX` ECS trait. It is **two stages of the post-FX stack** above, not a standalone pipeline — so it composes with bloom/vignette/DOF.
+
+### Stages — `postfx/PostFXStack.ts` (+ `npr/NPRPostProcess.ts`)
+
+There is **no `NPRPostProcess` class**. It used to own two `RenderPipeline`s and was mutually
+exclusive with bloom; it is now the `'npr'` and `'npr-particles'` stages built inside
+`PostFXStack.buildStage`. `npr/NPRPostProcess.ts` survives as the NPR **shared vocabulary** only:
+the public `nprFragmentOutput` / `applyNprFragmentOutput` helpers games call from custom shaders,
+the `ensureLineColorOnMaterials` prototype patch, `NPRConfig`, and `computeNprTexelSize`.
+
+**Stage 1 — stylize.** The stack's geometry `pass(scene, camera)` carries an **MRT**
+(`setMRT(mrt({...}))`) writing three targets:
 
 - `output` — lit scene color.
 - `normal` — view-space normal (`normalView`).
 - `lineColor` — `vec4(materialReference('lineColor','color'), materialReference('nprColorPreserve','float'))`: the per-material outline color in RGB and the color-preserve amount in alpha.
 
-The pass plus the screen-space composite are wired into a `RenderPipeline` (from `three/webgpu`); `render()` drives `pipeline.render()`.
+The pass excludes `PARTICLE_LAYER` (particles must not be Sobel-outlined or grayscaled) and is
+supersampled by `setResolutionScale(superSampleScale)`. `buildCompositeNode` turns those targets
+into a stylized color node, which flows on to the next stage.
+
+**Stage 2 — particles (`npr/ParticlePassNode.ts`).** This one is a **real scene draw, not a
+filter**: it renders the particle layer with `autoClear = false` over a prefilled color + depth
+buffer, so it needs a concrete *texture* to prefill from. Rather than teach the generic stack about
+scene-injecting stages, the stage keeps that shape internally — its own `RenderTarget` plus an
+**internal** `RenderPipeline` (`outputColorTransform = false`, per I1) that renders everything
+upstream into the stylized texture — and hands the chain `particlePass.getTextureNode()`, a plain
+texture node every downstream stage filters like any other color. That is what lets bloom glow the
+stylized frame *including* its particles.
 
 ### Edge detection — `npr/edgeNodes.ts`
 
@@ -425,13 +510,30 @@ Sobel edge detection, built as TSL node graphs over a shared 3×3 stencil:
 
 ### FXAA — `npr/fxaaNode.ts`
 
-`buildFXAANode(...)` adds post-composite anti-aliasing to soften the hard black outlines. It is a self-contained raw-WGSL `wgslFn` (simplified FXAA 3.11) used because Three.js's built-in `FXAANode` trips a `setLayout`/`Fn` build bug on r183/r184. The on/off toggle is a uniform branch inside the shader, so flipping `fxaa` is instant once the FXAA path is built.
+`buildFXAANode(...)` softens the hard black outlines. It is a self-contained raw-WGSL `wgslFn`
+(simplified FXAA 3.11) used because Three.js's built-in `FXAANode` trips a `setLayout`/`Fn` build
+bug on r183/r184.
+
+It is now the stack's **tail `'fxaa'` stage**, not part of NPR — NPR used to reason about "FXAA is
+the pipeline output", which is invalid once anything runs downstream of it. Because the `wgslFn`
+samples with `textureSample`, the stage needs a real texture node: it uses the incoming color
+directly when that is already one (the NPR particle texture, or a supersample RTT) and otherwise
+resolves the chain through an `rtt()` first. Its texel size is always derived at **display**
+resolution. Legality is decided by `planFxaaEnabled` — the `NPRPostFX.fxaa` field still owns the
+knob, but the stage is dropped on the WebGL2 backend (the `wgslFn` cannot compile there) and
+whenever `superSampleScale > 1` (SSAA already covers it, at scale² cost).
 
 ### Supersampling
 
 `superSampleScale` (1 or 2) renders the MRT pass and the composite RTT at a higher internal resolution (`setResolutionScale` / `setPixelRatio`), reducing aliasing at silhouettes and creases before FXAA.
 
-> **Rebuild rule:** only a `superSampleScale` change (or turning `fxaa` on while in the no-RTT fast path) triggers a full pipeline **rebuild**. Every other parameter is a cheap in-place uniform update. `setConfig()` returns `true` to signal the caller must `dispose()` and recreate the instance.
+> **Rebuild rule:** `superSampleScale` and the camera projection are **structural** — they resize
+> every render target / swap the depth reconstructor, so `needsRebuild` reports them and the driver
+> must `dispose()` + reconstruct the stack. Every other NPR parameter is a cheap in-place uniform
+> update. An SS-scale change is additionally **debounced** (`npr/ssRebuildDebounce.ts`): dragging
+> the slider sweeps a new value almost every frame, and rebuilding per intermediate value thrashes
+> shader compiles. The driver holds the request's scale pinned to the applied value until the
+> target settles, and only then latches the signature — do not simplify this away.
 
 ### Color preservation
 
@@ -462,11 +564,20 @@ Both `lineColor` and `nprColorPreserve` are auto-patched onto `THREE.Material.pr
 
 ### Integration — `Scene3D.tsx`
 
-- The composer is created **lazily** on the first frame where `NPRPostFX.enabled` is true *and* the renderer is WebGPU (`renderer.isWebGPURenderer === true`).
-- Each frame, `Scene3D` reads the singleton `NPRPostFX` into an `NPRConfig` and feeds the active camera's `clearColor` into `nprConfig.clearColor`.
-- Per frame the render routes through `nprComposer.render()` when NPR is enabled, else `renderer.render(scene, camera)`. Turning the trait off keeps the composer alive but bypasses it, so toggling stays cheap.
-- `setConfig()` is called for cheap updates; a `true` return disposes and rebuilds the composer.
-- The `ResizeObserver` resizes both the renderer and `nprComposer.resize(w, h)`.
+There is **one** post-FX code path; NPR has no branch of its own.
+
+- Each frame `Scene3D` reads the `NPRPostFX`, `BloomPostFX`, `VignettePostFX` and
+  `DepthOfFieldPostFX` singletons (first entity with the trait wins) and builds a single
+  `PostFXRequest`. NPR also feeds the active camera's `clearColor` into its stage config.
+- The stack is built **lazily** on the first frame `planStages(req)` is non-empty *and* the
+  renderer is WebGPU (`renderer.isWebGPURenderer === true`); otherwise
+  `renderer.render(scene, activeCamera)`.
+- Turning every trait off keeps the stack alive but routes around it, so toggling stays cheap.
+- `setConfig()` applies cheap uniform updates; a `true` return disposes and rebuilds. A
+  camera-object swap (perspective ↔ ortho) also forces a rebuild.
+- The request is edge-triggered on `stackSignature`, so a static scene does no per-frame config work.
+- Resizing needs no post-FX call: every resolution-derived uniform (NPR + FXAA texel size, the
+  stylized RT size) is recomputed from the live drawing buffer in each stage's per-frame prologue.
 
 ## Gotcha: TSL first-compile race (prewarm)
 
@@ -474,13 +585,16 @@ TSL node builders have a racy lazy initialization on the **first** compile a ren
 
 **Fix:** `Scene3D.tsx` calls `prewarmShadersForWorld(getCurrentWorld(), renderer, camera)` on mount, **before** registering the render loop, so a normal material compiles first and primes the node builder. (`prewarmShadersForWorld` also mirrors the world's lights and environment so it compiles the correct PBR shader variants, eliminating first-frame stutter on scene swap.)
 
-**Related HMR caveat:** the `npr/*.ts` modules call `import.meta.hot.invalidate()` to opt out of HMR. TSL node (and `wgslFn`) instances get baked into compiled WGSL pipelines; hot-reloading a module creates new node identities that the old cached pipeline still references, raising the same `unresolved type 'OutputType'` error. A full page reload is the correct (and cheap) price for a stable cache.
+**Related HMR caveat — editing a shader module forces a RELOAD, automatically.** TSL node (and `wgslFn`) instances get baked into compiled WGSL pipelines; hot-reloading a module creates new node identities that the old cached pipeline still references, raising the same `unresolved type 'OutputType'` error — or, worse, silently keeps rendering the PREVIOUSLY compiled graph so a correct fix looks like it did nothing. A full page reload is the correct (and cheap) price for a stable cache.
+
+The reload is now decided **by path on the dev server**: `isShaderGraphFile` (`engine/plugins/vite-asset-scanner.ts`) matches anything under `runtime/rendering/postfx/` or `runtime/rendering/npr/`, and `handleHotUpdate` sends `modoki:shader-code-changed` instead of letting Vite propagate an update. The renderer (`engine/app/debug/hmrStaleness.ts`) then reloads — via the same unsaved-scene countdown banner the game-code reload uses, so a shader edit can never silently discard scene work. ⚠️ **Do NOT re-add `import.meta.hot.invalidate()` to these modules** (they all used to carry it): `invalidate()` does not force a reload, it propagates to importers and stops at the first one that ACCEPTS — and the only importer is `Scene3D.tsx`, a React Fast Refresh boundary that self-accepts, so it was silently swallowed. Fast Refresh then re-ran the component but not its `[]`-deps effect, leaving the already-built `PostFXStack` (and its stale compiled graph) alive. That is exactly how one DOF `viewZ` fix was concluded "didn't work" three separate times. Since `engine/plugins/**` is not hot-reloadable, restart the editor once after changing the rule itself.
 
 ## Bloom Post-Process
 
 A reusable whole-scene HDR bloom, added for `demos/particle-demo`'s dark-VFX showreel but not
 specific to it — any 3D scene can add the trait. **WebGPU-only**, off by default, toggled by the
-`BloomPostFX` ECS trait.
+`BloomPostFX` ECS trait. It is a **stage of the post-FX stack**, so it composes with NPR,
+vignette and DOF rather than being an alternative to them.
 
 ### Control trait — `runtime/traits/BloomPostFX.ts`
 
@@ -493,50 +607,64 @@ Singleton (first entity wins), editable in the Inspector:
 | `radius` | `0.6` | Blur spread (0..1). |
 | `threshold` | `0.0` | Only pixels brighter than this bloom; `0` blooms the whole scene (the right value on a near-black void, where bloom itself acts as the key light). |
 
-### Pipeline — `rendering/bloom/BloomPostProcess.ts`
+### The stage
 
-Far simpler than NPR — one `RenderPipeline` wrapping a single TSL bloom pass:
+There is no `BloomPostProcess` class — it was replaced by the stack. The `'bloom'` stage is a few
+lines of `PostFXStack.buildStage`: `bloom(color, strength, radius, threshold)` (from
+`three/examples/jsm/tsl/display/BloomNode.js`) builds the glow node and `add(color, bloomPass)`
+composites it. `bloom()` returns a Node class whose `strength`/`radius`/`threshold` are live
+uniforms, so `setConfig` is a uniform write and never a rebuild.
 
-```ts
-class BloomPostProcess {
-  constructor(renderer, scene, camera, cfg: BloomConfig)
-  render(): void
-  setConfig(c: BloomConfig): void   // live uniform update, no rebuild
-  dispose(): void
-}
-```
+All three tunables update live. Particles ride `PARTICLE_LAYER`, which the camera already enables,
+so a whole-scene bloom includes them — this is what makes additive particle effects read as the
+scene's only light source. Under NPR the particles arrive via the NPR particle stage instead, and
+bloom still sees them.
 
-`pass(scene, camera).getTextureNode()` gives the lit HDR color node; `bloom(color, strength,
-radius, threshold)` (from `three/examples/jsm/tsl/display/BloomNode.js`) builds the glow node;
-`pipeline.outputNode = color.add(bloomPass)` composites them. Unlike NPR, the default output color
-transform (tone map + encode) stays **on** — bloom augments the normal forward render rather than
-replacing it with a stylized one. Particles ride `PARTICLE_LAYER`, which the camera already
-enables, so a whole-scene bloom pass includes them — this is what makes additive particle effects
-read as the scene's only light source.
+- **NPR + bloom compose.** Bloom operates on the working-space stylized color, so a stylized scene
+  gets a real glow. (This was the exclusivity the post-FX stack existed to remove.)
+- **WebGL fallback**: gated on `isWebGPU`; on a WebGL2 fallback the render falls through to the
+  plain path (no bloom, no error).
+- Same shader-HMR / prewarm-race caveats as NPR (see above) — TSL bakes into WGSL, so the stack is
+  disposed on camera-projection swap and never hot-reloaded in place; editing anything under
+  `postfx/` forces a full reload from the dev server.
 
-### Integration — `Scene3D.tsx`
+## Vignette & Depth of Field
 
-On the plain forward-render branch (the `else` after the NPR branch):
+Two more stack stages, each with its own singleton trait
+(`VignettePostFX` `{enabled, intensity, smoothness}`, `DepthOfFieldPostFX`
+`{enabled, focusDistance, focalLength, bokehScale}`), both WebGPU-only and off by default.
 
-```ts
-} else if (bloomEnabled && isWebGPU) {
-  if (!bloomComposer || bloomCamera !== activeCamera) {
-    bloomComposer?.dispose();
-    bloomComposer = new BloomPostProcess(renderer, scene, activeCamera, bloomCfg);
-    bloomCamera = activeCamera;
-  } else { bloomComposer.setConfig(bloomCfg); }
-  bloomComposer.render();
-} else {
-  renderer.render(scene, activeCamera);
-}
-```
+- **Vignette** uses `vignette()` from `three/examples/jsm/tsl/display/CRT.js`, which is a bare TSL
+  `Fn`, **not** a Node class — so the stage must pass `uniform()` nodes for `intensity`/
+  `smoothness`, or the values freeze at graph-build time and `setConfig` can never reach them.
+- **DOF** uses `dof(color, viewZ, ...)`. ⚠️ Its `viewZ` must **not** come from
+  `PassNode.getViewZNode()`, which hardcodes `perspectiveDepthToViewZ` with no ortho branch —
+  `postfx/dofViewZ.ts` picks the matching reconstructor from the camera's projection instead
+  (`tests/runtime/dofViewZ.test.ts` pins it).
 
-- **NPR wins if both are enabled** — the NPR branch is checked first, so bloom is skipped when NPR
-  is also on. Composing bloom after NPR is out of scope for v1.
-- **WebGL fallback**: gated on `isWebGPU`; on a WebGL2 fallback render falls through to the plain
-  path (no bloom, no error).
-- Same `import.meta.hot.invalidate()` / prewarm-race caveats as NPR (see above) — TSL bakes into
-  WGSL, so bloom is disposed on camera-projection swap and never hot-reloaded in place.
+## Ambient Occlusion (GTAO)
+
+`AmbientOcclusionPostFX` `{enabled, radius, intensity}`, WebGPU-only, off by default. Uses
+`ao(depthNode, normalNode, camera)` from `three/examples/jsm/tsl/display/GTAONode.js`, which
+returns a `GTAONode`; its output texture's `.r` (raw 0..1 occlusion) is lerped toward `1` by
+`intensity` (GTAO has no strength knob of its own) and multiplied into the incoming color.
+
+⚠️ **Always passes a REAL normal buffer — the "nullable normalNode" cheap path is broken here.**
+`ao()`'s `normalNode` argument is documented as nullable (GTAO reconstructs normals from depth
+when it's `null`), and that was the original plan. It doesn't work under this renderer:
+`getNormalFromDepth`'s null-normal fallback compiles `textureDimensions(depthTex, 0)`, but the
+depth attachment is **multisampled**, and WGSL's multisampled-texture overload of
+`textureDimensions` takes **no level argument** — confirmed via the browser's native WGSL
+compiler diagnostic (`THREE.[Invalid ShaderModule "fragment_GTAO"]`, root cause `no matching
+call to 'textureDimensions(texture_depth_multisampled_2d, abstract-int)'`), not a wiring
+mistake. So `requiredMrtTargets` forces the `'normal'` MRT target for AO too — the same target
+NPR already forces, just triggered by one more gate (never `lineColor`, which stays NPR-only).
+When NPR is also enabled they **share** the same normal texture node; AO alone still costs the
+extra MRT target.
+
+⚠️ Same silently-discarded-draw hazard as NPR (I2): a custom-shader `NodeMaterial` combined with
+AO on the (previously MRT-free) plain path must emit both MRT targets or its draw is dropped.
+Inert today — no shipped game enables `AmbientOcclusionPostFX`.
 
 ## 2D Rendering (PixiJS)
 

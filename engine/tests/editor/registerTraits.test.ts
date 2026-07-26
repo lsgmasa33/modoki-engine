@@ -4,8 +4,20 @@
 
 import { describe, it, expect } from 'vitest';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
-import { getTraitByName, getAllTraits } from '@modoki/engine/runtime';
+import { getTraitByName, getAllTraits, type FieldHint } from '@modoki/engine/runtime';
 import { registerTestGameTraits } from './_fixtures/testGame';
+
+/** Mirrors sceneSchema.ts's `resolveKootaSchema` (not exported from the package) — the
+ *  authoritative serialized field set is the trait's koota `.schema`, not just the
+ *  curated Inspector `meta.fields`. */
+function schemaKeys(trait: unknown): string[] {
+  let koota = (trait as { schema?: Record<string, unknown> | (() => Record<string, unknown>) })?.schema;
+  if (typeof koota === 'function') {
+    try { koota = (koota as () => Record<string, unknown>)(); }
+    catch { return []; }
+  }
+  return koota && typeof koota === 'object' ? Object.keys(koota) : [];
+}
 
 // Ensure traits are registered (engine + fixture game trait)
 registerAllTraits();
@@ -126,5 +138,50 @@ describe('registerTraits (engine + fixture game trait)', () => {
     const element = getTraitByName('UIElement')!;
     expect(anchor.priority).toBeLessThan(element.priority!);
     expect(anchor.componentCategory).toBe('UI');
+  });
+
+  // Phase 15 (scene-loading.md) — opt-OUT guard: a numeric,
+  // id-shaped field must be a DECLARATION (entityId, remapped) or an ALLOWLIST entry
+  // (deliberately not a live entity id), never silent. This is the backstop for the
+  // exact class of bug "A8" was: a new field holding a live koota id that nobody
+  // remembered to add to the (formerly hand-maintained) remap list. Scoped to
+  // engine-registered traits — a game's own traits (registered by its own setup.ts,
+  // not this harness) aren't covered here.
+  describe('every id-shaped numeric field is either entityId-remapped or allowlisted (Phase 15 guard)', () => {
+    // Prefab-LOCAL ids (unique only within one prefab's own file), not live ecs ids —
+    // remapping them through the world-level `idMap` would be a category error.
+    const ALLOWLIST = new Set(['PrefabInstance.localId', 'PrefabInstance.parentLocalId']);
+
+    it('flags every /Id$/ numeric field', () => {
+      const offenders: string[] = [];
+      for (const meta of getAllTraits()) {
+        for (const key of schemaKeys(meta.trait)) {
+          if (!/Id$/.test(key)) continue;
+          const hint = meta.fields[key] as FieldHint | undefined;
+          if (hint?.entityId) continue;
+          const qualified = `${meta.name}.${key}`;
+          if (ALLOWLIST.has(qualified)) continue;
+          offenders.push(qualified);
+        }
+      }
+      expect(offenders).toEqual([]);
+    });
+
+    it('the guard actually fires — a synthetic undeclared id-shaped field is caught', () => {
+      const fakeTrait = { schema: { widgetId: 0 } };
+      const fakeMeta = { name: 'FakeTrait', trait: fakeTrait, category: 'component' as const, fields: {} };
+      const offenders: string[] = [];
+      for (const meta of [...getAllTraits(), fakeMeta]) {
+        for (const key of schemaKeys(meta.trait)) {
+          if (!/Id$/.test(key)) continue;
+          const hint = meta.fields[key] as FieldHint | undefined;
+          if (hint?.entityId) continue;
+          const qualified = `${meta.name}.${key}`;
+          if (ALLOWLIST.has(qualified)) continue;
+          offenders.push(qualified);
+        }
+      }
+      expect(offenders).toContain('FakeTrait.widgetId');
+    });
   });
 });

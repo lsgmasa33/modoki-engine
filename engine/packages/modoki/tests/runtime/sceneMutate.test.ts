@@ -2,7 +2,7 @@
  *  scene shape. Deterministic GUID minting injected. Pure, no world. */
 
 import { describe, it, expect } from 'vitest';
-import { applyOps, type MutableScene, type MutateOp } from '../../src/runtime/scene/sceneMutate';
+import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp } from '../../src/runtime/scene/sceneMutate';
 import { validateSceneData, type SceneSchema } from '../../src/runtime/scene/sceneValidation';
 
 let guidN = 0;
@@ -266,6 +266,44 @@ describe('applyOps — removeEntity', () => {
   });
 });
 
+describe('applyOps — setBaseScene (scene-loading.md Phase 7)', () => {
+  it('sets the top-level baseScene field', () => {
+    const scene = freshScene();
+    const res = applyOps(scene, [{ op: 'setBaseScene', baseScene: 'base-guid-1' }], mint);
+    expect(res.errors).toEqual([]);
+    expect(res.changed).toBe(1);
+    expect(scene.baseScene).toBe('base-guid-1');
+  });
+
+  it('is a no-op when the field already holds the same value', () => {
+    const scene = freshScene();
+    scene.baseScene = 'base-guid-1';
+    const res = applyOps(scene, [{ op: 'setBaseScene', baseScene: 'base-guid-1' }], mint);
+    expect(res.changed).toBe(0);
+  });
+
+  it('clears the field with null, omitting it entirely (not baseScene: "")', () => {
+    const scene = freshScene();
+    scene.baseScene = 'base-guid-1';
+    const res = applyOps(scene, [{ op: 'setBaseScene', baseScene: null }], mint);
+    expect(res.changed).toBe(1);
+    expect('baseScene' in scene).toBe(false);
+  });
+
+  it('clearing an already-absent field is a no-op', () => {
+    const scene = freshScene();
+    const res = applyOps(scene, [{ op: 'setBaseScene', baseScene: null }], mint);
+    expect(res.changed).toBe(0);
+  });
+
+  it('does not touch entities', () => {
+    const scene = freshScene();
+    const before = JSON.stringify(scene.entities);
+    applyOps(scene, [{ op: 'setBaseScene', baseScene: 'base-guid-1' }], mint);
+    expect(JSON.stringify(scene.entities)).toBe(before);
+  });
+});
+
 describe('applyOps — robustness', () => {
   it('reports an error for an unknown op but keeps processing others', () => {
     const scene = freshScene();
@@ -289,7 +327,7 @@ describe('applyOps + validateSceneData — integration round-trip', () => {
     traits: {
       Transform: { category: 'component', fields: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } } },
       Renderable3D: { category: 'component', fields: { mesh: { type: 'string' } } },
-      EntityAttributes: { category: 'component', fields: { name: { type: 'string' }, guid: { type: 'string' }, parentId: { type: 'number' } } },
+      EntityAttributes: { category: 'component', fields: { name: { type: 'string' }, guid: { type: 'string' }, parentId: { type: 'number', entityId: { onMissing: 'root' } } } },
     },
   };
 
@@ -363,5 +401,157 @@ describe('applyOps — unresolved refs (C7)', () => {
     ] as never);
     expect(res.errors.join('\n')).toMatch(/needs an id, name, or guid/);
     expect(res.unresolved).toEqual([]);
+  });
+});
+
+// scene-loading.md, Phase 3 — a v12+ scene file carries NO entity
+// `id` at all (serializeScene stopped writing it, since nothing on disk
+// references it any more). This module still identifies entities by numeric id
+// throughout, so the router-level caller MUST backfill before applyOps — this is
+// the shim being tested directly, not through the router.
+describe('assignSyntheticEntityIds (Phase 3, scene-loading.md)', () => {
+  it('backfills the array index for every entity missing an id', () => {
+    const scene: MutableScene = {
+      version: 12,
+      entities: [
+        { name: 'Root', traits: { EntityAttributes: { name: 'Root', guid: 'g-root', parentId: 0 } } } as never,
+        { name: 'Child', traits: { EntityAttributes: { name: 'Child', guid: 'g-child', parentId: 0 } } } as never,
+      ],
+    };
+    assignSyntheticEntityIds(scene);
+    expect(scene.entities[0].id).toBe(0);
+    expect(scene.entities[1].id).toBe(1);
+  });
+
+  it('does NOT overwrite an id that is already present — only fills gaps', () => {
+    const scene: MutableScene = {
+      version: 11,
+      entities: [
+        { id: 7, name: 'Root', traits: {} },
+        { id: 3, name: 'Child', traits: {} },
+      ],
+    };
+    assignSyntheticEntityIds(scene);
+    expect(scene.entities[0].id).toBe(7);
+    expect(scene.entities[1].id).toBe(3);
+  });
+
+  it('a MIXED file (some entries id-less, some explicit) never lets a backfilled id collide with a real one', () => {
+    // Entry 0 is id-less (array index 0 would normally be assigned), but entry 1
+    // already explicitly claims id 0 — the naive "just use the index" backfill
+    // would alias them, making EntityRef.id:0 ambiguous between two entities.
+    const scene: MutableScene = {
+      version: 12,
+      entities: [
+        { name: 'Gapless', traits: {} } as never,
+        { id: 0, name: 'Explicit', traits: {} },
+      ],
+    };
+    assignSyntheticEntityIds(scene);
+    const ids = scene.entities.map((e) => e.id);
+    expect(new Set(ids).size).toBe(2); // no collision
+    expect(scene.entities[1].id).toBe(0); // explicit id untouched
+    expect(scene.entities[0].id).not.toBe(0); // backfill skipped the taken slot
+  });
+
+  it('applyOps resolves entities by NAME/GUID (unaffected) and by the backfilled id, on a scene with no prior ids', () => {
+    const scene: MutableScene = {
+      version: 12,
+      entities: [
+        { name: 'Root', traits: { EntityAttributes: { name: 'Root', guid: 'g-root', parentId: 0 } } } as never,
+        { name: 'Child', traits: { EntityAttributes: { name: 'Child', guid: 'g-child', parentId: 0 }, Transform: { x: 0 } } } as never,
+      ],
+    };
+    assignSyntheticEntityIds(scene);
+    // Address by the freshly-backfilled numeric id (Child = index 1).
+    const res = applyOps(scene, [{ op: 'setTrait', entity: { id: 1 }, trait: 'Transform', fields: { x: 9 } }], mint);
+    expect(res.changed).toBe(1);
+    expect((scene.entities[1].traits.Transform as Record<string, unknown>).x).toBe(9);
+  });
+
+  it('a fresh addEntity on a backfilled scene mints an id above the backfilled range (no collision)', () => {
+    const scene: MutableScene = {
+      version: 12,
+      entities: [
+        { name: 'A', traits: {} } as never,
+        { name: 'B', traits: {} } as never,
+      ],
+    };
+    assignSyntheticEntityIds(scene); // ids become 0, 1
+    const res = applyOps(scene, [{ op: 'addEntity', name: 'New' }], mint);
+    expect(res.changed).toBe(1);
+    const added = scene.entities.find((e) => e.name === 'New')!;
+    expect(added.id).toBeGreaterThan(1);
+    // Uniqueness — the new id doesn't collide with either backfilled entity.
+    expect(new Set(scene.entities.map((e) => e.id)).size).toBe(3);
+  });
+});
+
+// Independent code review finding (2026-07-26): the router's real caller
+// (editorBackendRouter.ts's /api/scene-mutate handler) writes `scene` back to
+// disk after applyOps — without this, a single-field setTrait on a clean v12+
+// file (no entity ids anywhere) would silently reintroduce an `id` on EVERY
+// entity, exactly the diff noise Phase 3 removed, just via a different write
+// path than Save All.
+describe('stripBackfilledEntityIds (write-path fix for the assignSyntheticEntityIds backfill)', () => {
+  it('removes ids from entities that were backfilled, leaving a mutated field intact', () => {
+    const scene: MutableScene = {
+      version: 12,
+      entities: [
+        { name: 'A', traits: { EntityAttributes: { name: 'A', guid: 'g-a' } } } as never,
+        { name: 'B', traits: { Transform: { x: 0 } } } as never,
+      ],
+    };
+    const backfilled = assignSyntheticEntityIds(scene);
+    applyOps(scene, [{ op: 'setTrait', entity: { id: 1 }, trait: 'Transform', fields: { x: 9 } }], mint);
+    stripBackfilledEntityIds(scene, backfilled);
+
+    expect(scene.entities.every((e) => e.id === undefined)).toBe(true);
+    expect((scene.entities[1].traits.Transform as Record<string, unknown>).x).toBe(9);
+  });
+
+  it('does NOT strip the real id of an entity added by this same call', () => {
+    const scene: MutableScene = {
+      version: 12,
+      entities: [{ name: 'A', traits: {} } as never],
+    };
+    const backfilled = assignSyntheticEntityIds(scene);
+    applyOps(scene, [{ op: 'addEntity', name: 'New' }], mint);
+    stripBackfilledEntityIds(scene, backfilled);
+
+    const original = scene.entities.find((e) => e.name === 'A')!;
+    const added = scene.entities.find((e) => e.name === 'New')!;
+    expect(original.id).toBeUndefined();
+    expect(added.id).toBeDefined();
+  });
+
+  it('is a no-op for a scene that never needed backfilling (already-idd entities keep their real ids)', () => {
+    const scene: MutableScene = {
+      version: 11,
+      entities: [
+        { id: 7, name: 'A', traits: {} },
+        { id: 9, name: 'B', traits: {} },
+      ],
+    };
+    const backfilled = assignSyntheticEntityIds(scene); // empty — both already had ids
+    expect(backfilled.size).toBe(0);
+    stripBackfilledEntityIds(scene, backfilled);
+    expect(scene.entities[0].id).toBe(7);
+    expect(scene.entities[1].id).toBe(9);
+  });
+
+  it('handles a REMOVED backfilled entity without error (simply absent from the array)', () => {
+    const scene: MutableScene = {
+      version: 12,
+      entities: [
+        { name: 'A', traits: { EntityAttributes: { name: 'A', guid: 'g-a' } } } as never,
+        { name: 'B', traits: { EntityAttributes: { name: 'B', guid: 'g-b' } } } as never,
+      ],
+    };
+    const backfilled = assignSyntheticEntityIds(scene);
+    applyOps(scene, [{ op: 'removeEntity', entity: { name: 'A' } }], mint);
+    expect(() => stripBackfilledEntityIds(scene, backfilled)).not.toThrow();
+    expect(scene.entities).toHaveLength(1);
+    expect(scene.entities[0].id).toBeUndefined();
   });
 });

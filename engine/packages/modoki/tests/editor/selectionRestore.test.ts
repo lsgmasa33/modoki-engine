@@ -24,7 +24,7 @@ const Persistent = trait({});
 vi.mock('../../src/runtime/ecs/traitRegistry', () => {
   const traits = [
     { name: 'Transform', trait: Transform, category: 'component', fields: { x: { type: 'number' } } },
-    { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: { type: 'string' }, parentId: { type: 'number' }, sortOrder: { type: 'number' }, layer: { type: 'string' }, guid: { type: 'string' } } },
+    { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: { type: 'string' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, sortOrder: { type: 'number' }, layer: { type: 'string' }, guid: { type: 'string' } } },
     { name: 'Persistent', trait: Persistent, category: 'tag', fields: {} },
   ];
   return {

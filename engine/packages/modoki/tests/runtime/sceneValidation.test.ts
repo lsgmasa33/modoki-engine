@@ -18,7 +18,7 @@ const schema: SceneSchema = {
     },
     EntityAttributes: {
       category: 'component',
-      fields: { name: { type: 'string' }, guid: { type: 'string' }, layer: { type: 'enum', options: ['2d', '3d', 'ui'] }, parentId: { type: 'number' } },
+      fields: { name: { type: 'string' }, guid: { type: 'string' }, layer: { type: 'enum', options: ['2d', '3d', 'ui'] }, parentId: { type: 'number', entityId: { onMissing: 'root' } } },
     },
     UIElement: {
       category: 'component',

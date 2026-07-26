@@ -28,7 +28,7 @@ export {
 export {
   Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, EntityAttributes, Camera, CameraFrame,
   PrefabInstance, ModelSource, Paused, Persistent, markPersistent, Transient, Time, Input,
-  UIElement, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, Rotate3D, Tint, MaterialInstance, type MaterialParamOverride, type MaterialParamSource, ParticleEmitter, FlameMesh,
+  UIElement, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, type MaterialParamOverride, type MaterialParamSource, ParticleEmitter, FlameMesh,
   Animator, SpriteAnimator, defaultSpriteClip, clampAngle,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
@@ -56,7 +56,8 @@ export {
   evalTrack, evalColorTrack, evalBooleanTrack, evalTrackValue,
   findKeyIndex, applyTangentMode, autoTangents, type TangentMode,
 } from './animation/curveEval';
-export { applyClipAtTime, resolveTrackTarget, advanceClipTime } from './animation/sampleClip';
+export { applyClipAtTime, advanceClipTime } from './animation/sampleClip';
+export { resolveTrackTarget, buildEntityIndex, isEntityActiveInHierarchy, type EntityIndex } from './ecs/entityIndex';
 export { switchableClipNames, ANIMATOR_CLIP_TRAITS } from './animation/switchableClips';
 export {
   getAnimationClip, setAnimationClip, invalidateAnimationClip, clearAnimationClipCache,

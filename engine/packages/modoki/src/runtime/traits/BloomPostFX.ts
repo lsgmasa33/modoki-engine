@@ -1,15 +1,13 @@
 import { trait } from 'koota';
 
 /** BloomPostFX — HDR bloom post-processing config (singleton per scene).
- *  When `enabled` AND NPR is off, Scene3D routes the plain forward render
- *  through a TSL bloom composer (whole-scene threshold bloom over `pass(scene,
- *  camera)`). All values are live uniforms on the underlying three BloomNode —
- *  changes update in place without rebuilding the node graph.
- *
- *  Mutually exclusive with NPRPostFX for now: if BOTH are enabled the NPR
- *  branch wins and bloom is skipped (composing bloom after the NPR stylize
- *  pass is out of scope). Requires the WebGPU backend — on WebGL2 the plain
- *  render runs without bloom. */
+ *  When `enabled`, Scene3D routes the render through the post-FX stack's
+ *  bloom stage (`postfx/PostFXStack.ts`) — whole-scene threshold bloom over
+ *  the incoming color, including NPR's stylized output when NPR is also
+ *  enabled (they compose; see docs/rendering.md "Post-Process Stack"). All
+ *  values are live uniforms — changes update in place without rebuilding the
+ *  node graph. Requires the WebGPU backend — on WebGL2 the plain render runs
+ *  without bloom. */
 export const BloomPostFX = trait({
   enabled: false,
   /** Bloom intensity / glow brightness. Higher = brighter bleed. Typical 0.3–1.5. */

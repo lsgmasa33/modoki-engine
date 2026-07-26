@@ -264,6 +264,13 @@ export interface EntityInfo {
   /** Editor Hierarchy folder path (EntityAttributes.editorFolder). Only meaningful
    *  on roots (parentId 0); '' / undefined = ungrouped. */
   editorFolder?: string;
+  /** Base-scene persistence provenance (EntityAttributes.sourceScene) — the guid
+   *  of the scene (in the active chain) this entity was loaded from. '' / undefined
+   *  = the primary scene (Phase 3's load-bearing default). Stamped on every entity
+   *  a base scene spawns, not just its roots, so a descendant reads its OWN value
+   *  rather than inheriting from an ancestor. Drives the Hierarchy's scene-group
+   *  ghosting (base-scene plan Phase 9). */
+  sourceScene?: string;
   children?: EntityInfo[];
 }
 
@@ -339,6 +346,7 @@ export function getAllEntities(): EntityInfo[] {
     let layer: EntityInfo['layer'];
     let editorFolder = '';
     let guid = '';
+    let sourceScene = '';
     if (attrMeta && entityHas(attrMeta.trait)) {
       const attr = entity.get(attrMeta.trait) as Record<string, unknown>;
       parentId = (attr.parentId as number) || 0;
@@ -348,6 +356,7 @@ export function getAllEntities(): EntityInfo[] {
       if (l === '3d' || l === '2d' || l === 'ui') layer = l;
       if (typeof attr.editorFolder === 'string') editorFolder = attr.editorFolder;
       if (typeof attr.guid === 'string') guid = attr.guid;
+      if (typeof attr.sourceScene === 'string') sourceScene = attr.sourceScene;
     }
     // Reconcile against the present renderable trait so the stored `layer` can't drift
     // (a Renderable2D entity stuck at '3d', a Renderable3DPrimitive at ''). F8.
@@ -364,7 +373,7 @@ export function getAllEntities(): EntityInfo[] {
       else { name = `Entity ${id}`; }
     }
 
-    entities.push({ id, name: transformName(name), traits: traitNames, parentId, sortOrder, layer, guid, isResource, editorFolder });
+    entities.push({ id, name: transformName(name), traits: traitNames, parentId, sortOrder, layer, guid, isResource, editorFolder, sourceScene });
   }
   return entities;
 }

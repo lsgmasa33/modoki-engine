@@ -38,7 +38,13 @@ clean and hot-reloads.
 - `runtime/animation/curveEval.ts` — pure curve math: `evalTrack` (weighted-bezier Hermite),
   `evalColorTrack`/`evalBooleanTrack`/`evalSteppedTrack`, `applyTangentMode`. No THREE, no ECS.
 - `runtime/animation/sampleClip.ts` — `applyClipAtTime` (sample every track, name-path resolve,
-  batch-write onto bound entities), `buildEntityIndex`, `advanceClipTime`. Shared by playback + scrub.
+  batch-write onto bound entities), `applyClipAtTimeBlended`, `advanceClipTime`. Shared by playback + scrub.
+- `runtime/ecs/entityIndex.ts` — **engine core, not animation**: the per-frame `EntityIndex`
+  (`buildEntityIndex`), relative name-path resolution (`resolveTrackTarget`) and the
+  active-in-hierarchy predicate (`isEntityActiveInHierarchy`). Born here for clip binding, but the
+  renderer, the sequencer and 2D deform all build the same index — so it lives in core and the
+  dependency arrow points the right way (a physics/zone system can use the predicate without
+  importing an animation module).
 - `runtime/systems/animationSystem.ts` — the pipeline system that advances `Animator.time` and poses.
 - `runtime/traits/{Animator,SkeletalAnimator,SkinnedModel,Bone,BoneAttachment,SkinnedMeshRenderer,AnimationLibrary,SpriteAnimator}.ts`
   — the eight data traits (each doc-commented with its exact field contract).

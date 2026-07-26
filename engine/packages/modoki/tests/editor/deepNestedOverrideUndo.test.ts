@@ -81,7 +81,7 @@ vi.mock('../../src/runtime/loaders/assetManifest', () => ({
   resolveRef: (g: string) => `/__prefabs__/${g}.json`,
 }));
 vi.mock('../../src/runtime/loaders/assetUrl', () => ({ assetUrl: (p: string) => p }));
-vi.mock('../../src/runtime/scene/SceneManager', () => ({ sceneManager: { loadScene: vi.fn() } }));
+vi.mock('../../src/runtime/scene/SceneManager', () => ({ sceneManager: { loadScene: vi.fn(), getLoadedScenes: () => new Map() } }));
 // NB: undoManager is REAL here — this test drives its async undo/redo.
 
 beforeEach(async () => {

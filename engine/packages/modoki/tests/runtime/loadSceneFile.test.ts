@@ -49,12 +49,27 @@ vi.mock('../../src/runtime/ecs/world', () => {
   };
 });
 
+// A synthetic trait exercising `entityId: {onMissing:'root'}` on a field that ISN'T
+// EntityAttributes.parentId — proves the remap is registry-driven, not a hardcoded
+// name-check on 'parentId' (Phase 15).
+const LinkedRef = trait({ targetId: 0 as number });
+
 vi.mock('../../src/runtime/ecs/traitRegistry', () => {
   const traits = [
     { name: 'Transform', trait: Transform, category: 'component', fields: {} },
-    { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: {} },
-    { name: 'PrefabInstance', trait: PrefabInstance, category: 'component', fields: {} },
+    {
+      name: 'EntityAttributes', trait: EntityAttributes, category: 'component',
+      fields: { parentId: { type: 'number', entityId: { onMissing: 'root' } } },
+    },
+    {
+      name: 'PrefabInstance', trait: PrefabInstance, category: 'component',
+      fields: { rootInstanceId: { type: 'number', entityId: { onMissing: 'stripTrait' } } },
+    },
     { name: 'ModelSource', trait: ModelSource, category: 'component', fields: {} },
+    {
+      name: 'LinkedRef', trait: LinkedRef, category: 'component',
+      fields: { targetId: { type: 'number', entityId: { onMissing: 'root' } } },
+    },
   ];
   return {
     getAllTraits: () => traits,
@@ -455,6 +470,319 @@ describe('loadSceneFile', () => {
       });
 
       expect(onInstantiatePrefab).not.toHaveBeenCalled();
+    });
+  });
+
+  // scene-loading.md, Phase 12's "A8" finding: PrefabInstance.
+  // rootInstanceId is a raw ecs id, and — like EntityAttributes.parentId — must be
+  // remapped through idMap on every respawn or it silently goes stale. This is most
+  // visible on SceneManager's carried-base-scene-snapshot respawn, which omits
+  // `onInstantiatePrefab` entirely (loadSceneFile.ts's re-instantiation block never
+  // runs), so EVERY entity — root and members alike — spawns via the flat/no-prefab
+  // path with its baked trait data verbatim. These tests drive that exact shape
+  // directly against `loadSceneFile`, without SceneManager, mirroring a real carried
+  // snapshot's `entry.id`s: OLD ecs ids from a dying world, deliberately NOT matching
+  // whatever fresh ids this world's own allocator will hand out.
+  describe('PrefabInstance.rootInstanceId remapping (A8 fix)', () => {
+    it('remaps a multi-member (flat) prefab instance\'s rootInstanceId to the root\'s fresh id — no onInstantiatePrefab (the carry shape)', async () => {
+      const { loadSceneFile } = await getLoader();
+      // Old-world ids: root=22, bones=28,29,30,31 (exactly the pattern observed live).
+      const data = {
+        version: SCENE_FORMAT_VERSION,
+        entities: [
+          { id: 22, traits: { Transform: true, EntityAttributes: { name: 'Fish' }, PrefabInstance: { source: 'fish.prefab.json', rootInstanceId: 22 } } },
+          { id: 28, traits: { Transform: true, EntityAttributes: { name: 'head', parentId: 22 }, PrefabInstance: { source: 'fish.prefab.json', rootInstanceId: 22 } } },
+          { id: 29, traits: { Transform: true, EntityAttributes: { name: 'spine1', parentId: 28 }, PrefabInstance: { source: 'fish.prefab.json', rootInstanceId: 22 } } },
+          { id: 30, traits: { Transform: true, EntityAttributes: { name: 'spine2', parentId: 29 }, PrefabInstance: { source: 'fish.prefab.json', rootInstanceId: 22 } } },
+          { id: 31, traits: { Transform: true, EntityAttributes: { name: 'tail', parentId: 30 }, PrefabInstance: { source: 'fish.prefab.json', rootInstanceId: 22 } } },
+        ],
+      };
+      const spawnedEntities: { entity: any; oldId: number }[] = [];
+      await loadSceneFile(data, {
+        fetchPrefab: async () => null, // no onInstantiatePrefab — the carry shape
+        onEntitySpawned: (entity: any, oldId: number) => { spawnedEntities.push({ entity, oldId }); },
+        loadModels: false,
+      });
+      const rootNewId = spawnedEntities.find(e => e.oldId === 22)!.entity.id();
+      for (const oldId of [22, 28, 29, 30, 31]) {
+        const e = spawnedEntities.find(s => s.oldId === oldId)!.entity;
+        let rootInstanceId = -1;
+        testWorld.query(PrefabInstance).updateEach(([pi]: any[], ent: any) => {
+          if (ent.id() === e.id()) rootInstanceId = pi.rootInstanceId;
+        });
+        expect(rootInstanceId).toBe(rootNewId);
+      }
+    });
+
+    it('is a no-op for a SINGLE-member instance where nothing collides (still correct, not just lucky)', async () => {
+      const { loadSceneFile } = await getLoader();
+      const data = {
+        version: SCENE_FORMAT_VERSION,
+        entities: [
+          { id: 75, traits: { Transform: true, EntityAttributes: { name: 'FieldCorner' }, PrefabInstance: { source: 'corner.prefab.json', rootInstanceId: 75 } } },
+        ],
+      };
+      const spawnedEntities: { entity: any; oldId: number }[] = [];
+      await loadSceneFile(data, {
+        fetchPrefab: async () => null,
+        onEntitySpawned: (entity: any, oldId: number) => { spawnedEntities.push({ entity, oldId }); },
+        loadModels: false,
+      });
+      const e = spawnedEntities[0].entity;
+      let rootInstanceId = -1;
+      testWorld.query(PrefabInstance).updateEach(([pi]: any[], ent: any) => {
+        if (ent.id() === e.id()) rootInstanceId = pi.rootInstanceId;
+      });
+      expect(rootInstanceId).toBe(e.id());
+    });
+
+    it('strips PrefabInstance (and warns) when rootInstanceId has no live counterpart in this load', async () => {
+      const { loadSceneFile } = await getLoader();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const data = {
+        version: SCENE_FORMAT_VERSION,
+        entities: [
+          // rootInstanceId 999 was never a root in THIS load's subtree (e.g. its
+          // root was filtered out upstream) — a poisoned pointer, not "root == self".
+          { id: 40, traits: { Transform: true, EntityAttributes: { name: 'Orphan' }, PrefabInstance: { source: 'fish.prefab.json', rootInstanceId: 999 } } },
+        ],
+      };
+      const spawnedEntities: { entity: any; oldId: number }[] = [];
+      await loadSceneFile(data, {
+        fetchPrefab: async () => null,
+        onEntitySpawned: (entity: any, oldId: number) => { spawnedEntities.push({ entity, oldId }); },
+        loadModels: false,
+      });
+      const e = spawnedEntities[0].entity;
+      expect(e.has(PrefabInstance)).toBe(false);
+      expect(warn).toHaveBeenCalled();
+      warn.mockRestore();
+    });
+
+    it('leaves rootInstanceId 0 (unset) untouched — nothing to remap yet', async () => {
+      const { loadSceneFile } = await getLoader();
+      const data = {
+        version: SCENE_FORMAT_VERSION,
+        entities: [
+          { id: 5, traits: { Transform: true, EntityAttributes: { name: 'Pending' }, PrefabInstance: { source: 'x.prefab.json', rootInstanceId: 0 } } },
+        ],
+      };
+      const spawnedEntities: { entity: any; oldId: number }[] = [];
+      await loadSceneFile(data, {
+        fetchPrefab: async () => null,
+        onEntitySpawned: (entity: any, oldId: number) => { spawnedEntities.push({ entity, oldId }); },
+        loadModels: false,
+      });
+      const e = spawnedEntities[0].entity;
+      expect(e.has(PrefabInstance)).toBe(true);
+      let rootInstanceId = -1;
+      testWorld.query(PrefabInstance).updateEach(([pi]: any[], ent: any) => {
+        if (ent.id() === e.id()) rootInstanceId = pi.rootInstanceId;
+      });
+      expect(rootInstanceId).toBe(0);
+    });
+  });
+
+  // scene-loading.md, Phase 2 — rootInstanceId is now written as a GUID
+  // string (the last numeric on-disk entity ref, guid-ified so it no longer churns
+  // across the arrival-path-dependent id assignment Phase 0/1 measured). The A8-fix
+  // suite above exercises the LEGACY numeric form (still fully supported — old files
+  // simply keep it); these exercise the new guid form specifically.
+  describe('PrefabInstance.rootInstanceId as a GUID (Phase 2 write format)', () => {
+    it('resolves a guid-valued rootInstanceId to the matching entity\'s fresh id', async () => {
+      const { loadSceneFile } = await getLoader();
+      const data = {
+        version: SCENE_FORMAT_VERSION,
+        entities: [
+          { id: 1, traits: { Transform: true, EntityAttributes: { name: 'Root', guid: 'g-root' }, PrefabInstance: { source: 'fish.prefab.json', rootInstanceId: 'g-root' } } },
+          { id: 2, traits: { Transform: true, EntityAttributes: { name: 'Member', parentId: 1 }, PrefabInstance: { source: 'fish.prefab.json', rootInstanceId: 'g-root' } } },
+        ],
+      };
+      const spawnedEntities: { entity: any; oldId: number }[] = [];
+      await loadSceneFile(data, {
+        fetchPrefab: async () => null, // no onInstantiatePrefab — exercises the flat/carry-shaped spawn path
+        onEntitySpawned: (entity: any, oldId: number) => { spawnedEntities.push({ entity, oldId }); },
+        loadModels: false,
+      });
+      const root = spawnedEntities.find((e) => e.oldId === 1)!.entity;
+      const member = spawnedEntities.find((e) => e.oldId === 2)!.entity;
+      let rootRootInstanceId = -1, memberRootInstanceId = -1;
+      testWorld.query(PrefabInstance).updateEach(([pi]: any[], ent: any) => {
+        if (ent.id() === root.id()) rootRootInstanceId = pi.rootInstanceId;
+        if (ent.id() === member.id()) memberRootInstanceId = pi.rootInstanceId;
+      });
+      expect(rootRootInstanceId).toBe(root.id());
+      expect(memberRootInstanceId).toBe(root.id());
+    });
+
+    it('never lets a guid string reach the live trait as NaN — the spawn-time zero guard applies to EVERY entityId field, not just EntityAttributes', async () => {
+      const { loadSceneFile } = await getLoader();
+      const data = {
+        version: SCENE_FORMAT_VERSION,
+        entities: [
+          { id: 1, traits: { Transform: true, EntityAttributes: { name: 'Root', guid: 'g-root' }, PrefabInstance: { source: 'fish.prefab.json', rootInstanceId: 'g-root' } } },
+        ],
+      };
+      const observedAtSpawn: number[] = [];
+      await loadSceneFile(data, {
+        fetchPrefab: async () => null,
+        onEntitySpawned: (entity: any) => {
+          // Fires DURING pass 1, immediately after spawn — BEFORE the entityId remap
+          // pass runs. If the spawn-time guard were missing (still checking only
+          // `traitName === 'EntityAttributes'`), the guid string would have been
+          // written straight into PrefabInstance's numeric SoA field here.
+          testWorld.query(PrefabInstance).updateEach(([pi]: any[], ent: any) => {
+            if (ent.id() === entity.id()) observedAtSpawn.push(pi.rootInstanceId);
+          });
+        },
+        loadModels: false,
+      });
+      expect(observedAtSpawn).toEqual([0]);
+      expect(Number.isNaN(observedAtSpawn[0])).toBe(false);
+    });
+
+    it('the root-identity check (pi && !entry.prefab path) treats a guid rootInstanceId matching its OWN guid as "this entry IS the root"', async () => {
+      const { loadSceneFile } = await getLoader();
+      const onInstantiatePrefab = vi.fn();
+      const data = {
+        version: SCENE_FORMAT_VERSION,
+        entities: [{
+          id: 1,
+          traits: {
+            Transform: true,
+            EntityAttributes: { name: 'Root', guid: 'g-root' },
+            PrefabInstance: { source: 'prefabs/fish.prefab.json', rootInstanceId: 'g-root' },
+          },
+        }],
+      };
+      await loadSceneFile(data, {
+        fetchPrefab: async () => ({ version: 1, entities: [] }),
+        onInstantiatePrefab,
+        loadModels: false,
+      });
+      // Not skipped as "a non-root member" — onInstantiatePrefab fired for it.
+      expect(onInstantiatePrefab).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // Phase 15 — the remap loop is REGISTRY-driven: any trait field flagged
+  // `entityId` gets remapped through `idMap` with no changes to loadSceneFile.ts
+  // itself. `LinkedRef.targetId` (declared only in this test file's mocked
+  // registry, onMissing:'root') proves that — it isn't 'parentId' or
+  // 'rootInstanceId', the two fields loadSceneFile.ts's own comments name.
+  describe('declarative entityId remap (Phase 15)', () => {
+    it('remaps a non-parentId/rootInstanceId field flagged entityId', async () => {
+      const { loadSceneFile } = await getLoader();
+      const data = {
+        version: SCENE_FORMAT_VERSION,
+        entities: [
+          { id: 10, traits: { EntityAttributes: { name: 'Target' } } },
+          { id: 20, traits: { EntityAttributes: { name: 'Linker' }, LinkedRef: { targetId: 10 } } },
+        ],
+      };
+      const spawnedEntities: { entity: any; oldId: number }[] = [];
+      await loadSceneFile(data, {
+        fetchPrefab: async () => null,
+        onEntitySpawned: (entity: any, oldId: number) => { spawnedEntities.push({ entity, oldId }); },
+        loadModels: false,
+      });
+      const target = spawnedEntities.find((e) => e.oldId === 10)!.entity;
+      const linker = spawnedEntities.find((e) => e.oldId === 20)!.entity;
+      let targetId = -1;
+      testWorld.query(LinkedRef).updateEach(([lr]: any[], ent: any) => {
+        if (ent.id() === linker.id()) targetId = lr.targetId;
+      });
+      expect(targetId).toBe(target.id());
+    });
+
+    it('applies onMissing:"root" (silent 0, trait kept) when an entityId field has no live counterpart', async () => {
+      const { loadSceneFile } = await getLoader();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const data = {
+        version: SCENE_FORMAT_VERSION,
+        entities: [
+          { id: 20, traits: { EntityAttributes: { name: 'Linker' }, LinkedRef: { targetId: 999 } } },
+        ],
+      };
+      const spawnedEntities: { entity: any; oldId: number }[] = [];
+      await loadSceneFile(data, {
+        fetchPrefab: async () => null,
+        onEntitySpawned: (entity: any, oldId: number) => { spawnedEntities.push({ entity, oldId }); },
+        loadModels: false,
+      });
+      const linker = spawnedEntities[0].entity;
+      expect(linker.has(LinkedRef)).toBe(true);
+      let targetId = -1;
+      testWorld.query(LinkedRef).updateEach(([lr]: any[], ent: any) => {
+        if (ent.id() === linker.id()) targetId = lr.targetId;
+      });
+      expect(targetId).toBe(0);
+      expect(warn).not.toHaveBeenCalled(); // 'root' is a silent policy
+      warn.mockRestore();
+    });
+  });
+
+  /** A9 defect 1 — the chain-order mark wipe.
+   *
+   *  `clearAllOverrideMarks()` defends against ecs-id reuse ACROSS WORLDS, but it
+   *  used to run unconditionally on every `loadSceneFile` CALL. That equivalence
+   *  ("one call == one world") died with base scenes: a chain loads N scene files
+   *  into ONE world, bases first and the primary last, so the primary's call wiped
+   *  the marks the base's call had just seeded — and every chained prefab instance
+   *  then serialized with EMPTY overrides, because `captureInstanceOverrides`
+   *  mark-gates every diff.
+   *
+   *  These two tests pin the MECHANISM (the flag). The wiring — SceneManager
+   *  clearing exactly once per staging world for a whole chain — is pinned in
+   *  sceneManagerBaseSceneChain.test.ts.
+   *  See docs/reviews/a9-carried-instance-overrides-investigation.md. */
+  describe('override-mark lifetime (A9 defect 1)', () => {
+    it('clears marks by default — an ordinary single-scene load is unchanged', async () => {
+      const { loadSceneFile } = await getLoader();
+      const { markOverride, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
+      // A mark left on an id from a PREVIOUS world. 4242 is never spawned by this
+      // load, so only the global clear can remove it (per-entity hygiene can't).
+      markOverride(4242, 'Transform', 'x');
+      expect(getOverrideMarkSet(4242)?.has('Transform.x')).toBe(true);
+
+      await loadSceneFile(
+        { version: SCENE_FORMAT_VERSION, entities: [{ id: 1, traits: { Transform: true } }] },
+        { fetchPrefab: async () => null, loadModels: false },
+      );
+
+      expect(getOverrideMarkSet(4242)).toBeUndefined();
+    });
+
+    it('clearMarks:false preserves marks an EARLIER scene in the same chain seeded', async () => {
+      const { loadSceneFile } = await getLoader();
+      const { markOverride, getOverrideMarkSet, clearAllOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
+      clearAllOverrideMarks();
+
+      // Scene 1 of the chain (the BASE) — spawn an instance member and mark a
+      // field on it, standing in for applyOverrides* seeding from the file.
+      const spawned: { entity: any; oldId: number }[] = [];
+      await loadSceneFile(
+        {
+          version: SCENE_FORMAT_VERSION,
+          entities: [{ id: 22, traits: { Transform: true, EntityAttributes: { name: 'Fish' }, PrefabInstance: { source: 'fish.prefab.json', rootInstanceId: 22 } } }],
+        },
+        {
+          world: testWorld, clearMarks: false, fetchPrefab: async () => null, loadModels: false,
+          onEntitySpawned: (entity: any, oldId: number) => { spawned.push({ entity, oldId }); },
+        },
+      );
+      const fishId = spawned.find((s) => s.oldId === 22)!.entity.id();
+      markOverride(fishId, 'Transform', 'x');
+      expect(getOverrideMarkSet(fishId)?.has('Transform.x')).toBe(true);
+
+      // Scene 2 of the chain (the PRIMARY) — same world, no prefab instances of
+      // its own. Before the fix this call wiped the base's marks. It must not.
+      await loadSceneFile(
+        { version: SCENE_FORMAT_VERSION, entities: [{ id: 7, traits: { Transform: true, EntityAttributes: { name: 'Pad' } } }] },
+        { world: testWorld, clearMarks: false, fetchPrefab: async () => null, loadModels: false },
+      );
+
+      expect(getOverrideMarkSet(fishId)?.has('Transform.x')).toBe(true);
     });
   });
 
@@ -972,5 +1300,159 @@ describe('migration terminal version', () => {
       loadModels: false,
     });
     expect(data.version).toBe(SCENE_FORMAT_VERSION);
+  });
+});
+
+describe('migrateV9toV10 (base-scene plan, Phase 1)', () => {
+  // v10 is a deliberately inert no-op passthrough (owner-confirmed) — it only
+  // moves the terminal version stamp; nothing else about a v9 file may change.
+  it('migrates a v9 scene to v10 with no diff other than `version`', async () => {
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: 9,
+      resources: [],
+      entities: [{
+        id: 1,
+        traits: { EntityAttributes: { name: 'X', parentId: 0 }, Transform: { x: 5 } },
+      }],
+    };
+    const before = JSON.parse(JSON.stringify(data));
+    await loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false });
+    expect(data.version).toBe(SCENE_FORMAT_VERSION);
+    const { version: _v, ...rest } = data as any;
+    const { version: _bv, ...beforeRest } = before;
+    expect(rest).toEqual(beforeRest);
+  });
+
+  it('round-trips an optional baseScene ref through the migration chain', async () => {
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: 3,
+      baseScene: 'base-scene-guid-123',
+      entities: [{ id: 1, traits: { EntityAttributes: { name: 'X', parentId: 0 } } }],
+    };
+    await loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false });
+    expect((data as any).baseScene).toBe('base-scene-guid-123');
+    expect(data.version).toBe(SCENE_FORMAT_VERSION);
+  });
+});
+
+describe('migrateV10toV11 (scene-loading.md, Phase 2)', () => {
+  // v11 is a deliberately inert no-op passthrough — it only changes HOW
+  // rootInstanceId is WRITTEN going forward, not the shape of an existing file.
+  // A v10 file's numeric rootInstanceId must load completely unchanged.
+  it('migrates a v10 scene to v11 with no diff other than `version` — including a legacy numeric rootInstanceId', async () => {
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: 10,
+      resources: [],
+      entities: [{
+        id: 1,
+        traits: {
+          EntityAttributes: { name: 'X', parentId: 0 },
+          PrefabInstance: { source: 'fish.prefab.json', rootInstanceId: 1 },
+        },
+      }],
+    };
+    const before = JSON.parse(JSON.stringify(data));
+    await loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false });
+    expect(data.version).toBe(SCENE_FORMAT_VERSION);
+    const { version: _v, ...rest } = data as any;
+    const { version: _bv, ...beforeRest } = before;
+    expect(rest).toEqual(beforeRest);
+  });
+});
+
+describe('migrateV11toV12 + assignSyntheticEntityIds (scene-loading.md, Phase 3)', () => {
+  // v12 is a deliberately inert no-op passthrough — it only changes HOW entities
+  // are keyed going forward (no `id` written at all), not the shape of an
+  // existing file. A v11 file that STILL carries ids must load completely
+  // unchanged (assignSyntheticEntityIds only fills GAPS, never overwrites).
+  it('migrates a v11 scene (with explicit ids) to v12 with no diff other than `version`', async () => {
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: 11,
+      resources: [],
+      entities: [{
+        id: 5,
+        traits: { EntityAttributes: { name: 'X', parentId: 0 } },
+      }],
+    };
+    const before = JSON.parse(JSON.stringify(data));
+    await loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false });
+    expect(data.version).toBe(SCENE_FORMAT_VERSION);
+    const { version: _v, ...rest } = data as any;
+    const { version: _bv, ...beforeRest } = before;
+    expect(rest).toEqual(beforeRest);
+  });
+
+  it('loads a v12 file with NO entity ids at all — spawns every entity and resolves guid-based parentId', async () => {
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: SCENE_FORMAT_VERSION,
+      entities: [
+        { traits: { Transform: true, EntityAttributes: { name: 'Root', guid: 'g-root' } } },
+        { traits: { Transform: true, EntityAttributes: { name: 'Child', guid: 'g-child', parentId: 'g-root' } } },
+      ],
+    };
+    const spawnedEntities: { entity: any; oldId: number }[] = [];
+    await loadSceneFile(data as any, {
+      fetchPrefab: async () => null,
+      onEntitySpawned: (entity: any, oldId: number) => { spawnedEntities.push({ entity, oldId }); },
+      loadModels: false,
+    });
+    expect(spawnedEntities).toHaveLength(2);
+    // The synthesized oldIds are the array indices (0, 1) — proving the backfill ran.
+    expect(spawnedEntities.map((e) => e.oldId).sort()).toEqual([0, 1]);
+    const root = spawnedEntities.find((e) => e.oldId === 0)!.entity;
+    const child = spawnedEntities.find((e) => e.oldId === 1)!.entity;
+    let childParentId = -1;
+    testWorld.query(EntityAttributes).updateEach(([ea]: any[], ent: any) => {
+      if (ent.id() === child.id()) childParentId = (ea as any).parentId;
+    });
+    expect(childParentId).toBe(root.id());
+  });
+
+  it('a MIXED file (some entries id-less, some explicit) never lets a backfilled id collide with a real one', async () => {
+    // Entry 0 is id-less (array index 0 would normally be assigned), but entry 1
+    // already explicitly claims id 0 — the naive "just use the index" backfill
+    // would alias them in idMap, misattributing a parentId/rootInstanceId
+    // reference to the wrong entity with no warning.
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: SCENE_FORMAT_VERSION,
+      entities: [
+        { traits: { Transform: true, EntityAttributes: { name: 'Gapless' } } },
+        { id: 0, traits: { Transform: true, EntityAttributes: { name: 'Explicit' } } },
+      ],
+    };
+    const spawnedEntities: { entity: any; oldId: number }[] = [];
+    await loadSceneFile(data as any, {
+      fetchPrefab: async () => null,
+      onEntitySpawned: (entity: any, oldId: number) => { spawnedEntities.push({ entity, oldId }); },
+      loadModels: false,
+    });
+    expect(spawnedEntities).toHaveLength(2);
+    const oldIds = spawnedEntities.map((e) => e.oldId);
+    expect(new Set(oldIds).size).toBe(2); // no collision
+    expect(spawnedEntities.some((e) => e.oldId === 0)).toBe(true); // the explicit id survived
+  });
+
+  it('a serializeScene → loadSceneFile round-trip works with no entity ids anywhere in between', async () => {
+    // serializeScene() itself lives in editor/, out of reach for this runtime-only
+    // test file's mocked registry — so this directly exercises what serializeScene
+    // NOW produces: entities with no `id` field at all.
+    const { loadSceneFile } = await getLoader();
+    const serializedShape = {
+      version: SCENE_FORMAT_VERSION,
+      entities: [
+        { name: 'Solo', traits: { Transform: true, EntityAttributes: { name: 'Solo', guid: 'g-solo' } } },
+      ],
+    };
+    expect('id' in serializedShape.entities[0]).toBe(false);
+    await loadSceneFile(serializedShape as any, { fetchPrefab: async () => null, loadModels: false });
+    let found = false;
+    testWorld.query(EntityAttributes).updateEach(([ea]: any[]) => { if ((ea as any).name === 'Solo') found = true; });
+    expect(found).toBe(true);
   });
 });

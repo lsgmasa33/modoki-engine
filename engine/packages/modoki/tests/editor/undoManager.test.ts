@@ -511,4 +511,35 @@ describe('getEditVersion (C7)', () => {
     for (let i = 0; i < 5; i++) { pushAction(action(`edit ${i}`)); seen.add(getEditVersion()); }
     expect(seen.size).toBe(5);
   });
+
+  // _isFileDirect (base-scene plan Phase 8) — an action whose undo/redo/initial-apply
+  // writes straight to a FILE (SceneAssetView's base-ref edit via /api/scene-mutate),
+  // not the live world, so there is nothing pending a Cmd+S. Found live: without this,
+  // a base-ref edit's own pushAction bump self-blocked a FOLLOW-UP scene-mutate call
+  // via the "unsaved live changes" guard that route carries — an edit tripping the
+  // very guard meant to protect against edits like itself.
+  it('does NOT bump on a file-direct action — it is already persisted', async () => {
+    const { pushAction, getEditVersion } = await getUndoManager();
+    const before = getEditVersion();
+    pushAction({ label: 'Set base scene', undo: () => {}, redo: () => {}, _isFileDirect: true });
+    expect(getEditVersion()).toBe(before);
+  });
+
+  it('does NOT bump on undo/redo of a file-direct action either', async () => {
+    const { pushAction, undo, redo, getEditVersion } = await getUndoManager();
+    pushAction({ label: 'Set base scene', undo: () => {}, redo: () => {}, _isFileDirect: true });
+    const afterPush = getEditVersion();
+    await undo();
+    expect(getEditVersion()).toBe(afterPush);
+    await redo();
+    expect(getEditVersion()).toBe(afterPush);
+  });
+
+  it('a file-direct action does not mask a genuinely unsaved edit already on the stack', async () => {
+    const { pushAction, getEditVersion } = await getUndoManager();
+    pushAction(action('Move Cube')); // a real, pending live-world edit
+    const afterRealEdit = getEditVersion();
+    pushAction({ label: 'Set base scene', undo: () => {}, redo: () => {}, _isFileDirect: true });
+    expect(getEditVersion()).toBe(afterRealEdit); // unchanged — still reads as dirty
+  });
 });

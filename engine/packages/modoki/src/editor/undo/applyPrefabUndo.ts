@@ -19,7 +19,7 @@
 import { pushAction, type UndoAction } from './undoManager';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import type { SceneData } from '../../runtime/loaders/loadSceneFile';
-import { serializeScene, saveScene, getCurrentScenePath, setCurrentScenePath } from '../scene/serialize';
+import { serializeScene, saveScene, getCurrentScenePath, setCurrentScenePath, setCurrentBaseScene } from '../scene/serialize';
 import {
   applyToPrefabSelective, installPrefabSnapshot, guidForEntityId, entityIdForGuid,
   type ApplyResult, type PrefabFile,
@@ -42,6 +42,10 @@ async function restoreSnapshot(
   if (scenePath) {
     await sceneManager.loadScene(scenePath, { preloaded: clone(scene) });
     setCurrentScenePath(scenePath);
+    // A3: sceneManager.loadScene({preloaded}) records the base ref internally, but
+    // the editor's own baseScene tracking (re-emitted by serializeScene) is separate
+    // module state — must be re-synced explicitly, same as setCurrentScenePath above.
+    setCurrentBaseScene(sceneManager.getCurrentBaseScene());
     await saveScene(); // persist the restored world so disk matches the live state
   }
   const id = selGuid ? entityIdForGuid(selGuid) : 0;

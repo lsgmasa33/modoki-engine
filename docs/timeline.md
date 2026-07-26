@@ -58,6 +58,25 @@ Advances every `Director` playhead, then applies each track. **Collect-then-appl
 `emit` run *after* the query (those touch other entities / run their own queries — the same
 discipline as `animationSystem` and `zoneTriggerCore`).
 
+### Three ways a Director stops advancing — they mean different things
+
+- **`Director.playing = false`** — PAUSE. The entity is still live; you're holding the playhead.
+- **`EntityAttributes.isActive = false`** — DISABLE. Deactivating an entity FREEZES its Director,
+  the same way deactivating a mesh hides it (self or any ancestor — the cascade counts). `time` and
+  `started` are untouched, so reactivating **resumes from where it stopped**; no markers fire while
+  it's off, not even the `@sequence` start edge. This is a fix (2026-07-26): the sequencer used to
+  have no activity guard at all, so an "off" Director kept advancing (measured: 2.7434 → 2.7566 frame
+  to frame) and kept firing its signal markers, visibly flipping a demo through its stations while it
+  was supposed to be held still. Workaround-by-`playing` was the natural reach and is a *different*
+  concept. The guard is `isEntityActiveInHierarchy` (`runtime/ecs/entityIndex.ts`), which walks
+  `parentId` over the index the system already builds — deliberately NOT the renderers'
+  `deactivatedEntities`, which comes from a THREE module, is produced at priority 200 (one frame
+  late for a system at 149), and is always empty headless. A nested/slaved child freezes with its
+  parent: `collectSlavedDirectors` scans ALL directors, including inactive ones, precisely so
+  switching a parent off doesn't UN-slave its children and set them running free.
+- **The sim isn't running** (stopped/paused editor, `timeScale = 0`) — `getSimDelta` returns 0, so
+  the whole system is inert. See below.
+
 ### Determinism (headless-verifiable)
 
 The playhead advances on **`getSimDelta`** (raw × `timeScale`, `0` when the sim isn't running), so
@@ -171,6 +190,18 @@ the GUID itself). The build tree-shaker has a matching `processTimeline` followe
 control-only prefab survives the prod tree-shake.
 (Animation-track clips are NAMES resolved via the target `Animator` bank, so they're already owned.)
 The lazy def cache is `runtime/loaders/timelineCache.ts` (`getTimeline`, cleared on scene swap).
+
+**Live edits reach a running Director.** The cache keys parsed timelines by resolved path, and used
+to hold a def forever: not a file write, not `load_scene`, not a Stop/Play cycle dropped it (all
+three measured). The old markers kept firing on schedule, so captions still updated and effects
+still toggled — it looked like the new marker params were being *ignored*, not cached, which is a
+badly misleading failure mode. Now the dev-server watcher classifies a `.timeline.json` change as
+`LiveReloadKind: 'timeline'` (`classifySceneChange`, `engine/plugins/vite-asset-scanner.ts`) and the
+renderer calls `invalidateTimeline(path)` (`engine/app/debug/agentBridge.ts`). Deliberately NOT a
+scene reload — the cache is the only stale thing, and reloading would discard unsaved live work.
+Covers external writes (MCP `write_asset`, a plain file edit); the editor's own Timeline panel
+already seeded the cache directly via `setTimeline`. Same defect, and same fix, as the animation
+clip cache.
 
 ## Editor panel
 

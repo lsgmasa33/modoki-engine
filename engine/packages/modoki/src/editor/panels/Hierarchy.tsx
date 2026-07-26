@@ -5,11 +5,14 @@ import { onWorldSwap } from '../../runtime/ecs/world';
 import { getAllTraits, getTraitByName, COMPONENT_CATEGORY_ORDER } from '../../runtime/ecs/traitRegistry';
 import { getAllEntities, buildEntityTree, deleteEntity, onStructureDirtyCoalesced, getStructureVersion, writeTraitField, readTraitData, subtreeIds, type EntityInfo } from '../../runtime/ecs/entityUtils';
 import { flattenVisibleIds, rangeBetween } from './hierarchySelection';
-import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids, classifyPrefabDuplicate, stripPrefabInstanceFromSnapshot, reRootPrefabInstanceSubtree, type EntitySnapshot } from '../undo/entityActions';
+import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids, classifyPrefabDuplicate, stripPrefabInstanceFromSnapshot, reRootPrefabInstanceSubtree, moveEntityToScene, type EntitySnapshot } from '../undo/entityActions';
+import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
 import { entityRef } from '../undo/entityRef';
 import { instantiatePrefabAsync, setPrefabSource, detachPrefabInstance, reattachPrefabInstance, type PrefabFile } from '../scene/prefab';
-import { focusEntityInSceneView } from '../scene/sceneViewBus';
+import { focusEntityInSceneView, canFrameSelected } from '../scene/sceneViewBus';
 import { getCurrentScenePath } from '../scene/serialize';
+import { sceneManager } from '../../runtime/scene/SceneManager';
+import { assetDisplayName } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
@@ -21,7 +24,8 @@ import RenameInput from '../components/RenameInput';
 import { TreeSearchInput, TypeFilterMenu, treeRowPadLeft } from './treeChrome';
 import { useExpandedSet } from './useExpandedSet';
 import { remapPrefix } from '../utils/assetPaths';
-import { filterEntityTree, collectEntityTypes, normalizeFolderPath, buildHierarchyFolders, countFolderRoots, folderSubtreePaths, folderSubtreeRootIds, revealTargetsFor, type HierarchyFolder } from './hierarchyFolders';
+import { filterEntityTree, collectEntityTypes, normalizeFolderPath, buildHierarchyFolders, countFolderRoots, folderSubtreePaths, folderSubtreeRootIds, revealTargetsFor, groupRootsBySourceScene, type HierarchyFolder } from './hierarchyFolders';
+import { isSceneDirty } from '../scene/sceneDirty';
 import { startDragGhost, endDragGhost, armGrabCursor } from '../utils/dragGhost';
 import { PRIMITIVE_NAMES } from '../../runtime/loaders/primitives';
 import { type UiPreset } from '../uiAuthoring';
@@ -167,6 +171,63 @@ function HierarchyFolderRow({ node, depth, open, count, selected, renaming, onTo
   );
 }
 
+/** A base scene's collapsible group header (base-scene plan, Phase 9) — greyed, no
+ *  drag/drop/rename/context-menu (it's not a folder you author into, it's read-only
+ *  provenance grouping). Collapsed by default; the caller (Hierarchy) derives `open`
+ *  from a per-guid expanded-set rather than this component owning the default. */
+function SceneGroupRow({ label, open, count, depth, onToggle, dirty, onDropEntity }: {
+  label: string;
+  open: boolean;
+  count: number;
+  depth: number;
+  onToggle: () => void;
+  /** Phase 13 (scene-loading.md): this base has an unsaved
+   *  in-place edit pending (sceneDirty.ts) — the "did I just change shared rig?"
+   *  answer at a glance, the visibility half of Cmd+S silently multi-file-saving. */
+  dirty: boolean;
+  /** The promote/header-drop gesture (Phase 14): a cross-scene-group drop landing
+   *  at this scene's ROOT (no explicit parent row). */
+  onDropEntity: (entityId: number) => void;
+}) {
+  const [over, setOver] = useState(false);
+  return (
+    <div
+      onClick={onToggle}
+      title={`Base scene "${label}" — loaded additively, carried across level swaps.${dirty ? ' Has unsaved edits — Save All writes it too.' : ' Unlock an entity in the Inspector to edit it in place.'} Drop an entity here to promote/demote it into this scene.`}
+      data-ui-id={`hierarchy.sceneGroup.${label}`} data-ui-kind="row" data-ui-label={`base scene ${label}`}
+      onDragOver={(e) => {
+        if (!e.dataTransfer.types.includes('application/editor-entity')) return;
+        e.preventDefault();
+        e.stopPropagation(); // don't also fire the panel's empty-area drop (§0.5)
+        e.dataTransfer.dropEffect = 'move';
+        setOver(true);
+      }}
+      onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setOver(false); }}
+      onDrop={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setOver(false);
+        const raw = e.dataTransfer.getData('application/editor-entity');
+        if (!raw) return;
+        const { id } = JSON.parse(raw) as { id: number };
+        onDropEntity(id);
+      }}
+      style={{
+        padding: '3px 8px', paddingLeft: treeRowPadLeft(depth), cursor: 'pointer',
+        display: 'flex', alignItems: 'center', gap: 4,
+        background: over ? 'rgba(52, 152, 219, 0.35)' : '#22222e', userSelect: 'none', whiteSpace: 'nowrap',
+      }}
+    >
+      <span style={{ color: '#666', fontSize: 10, width: 10, textAlign: 'center' }}>{open ? '▼' : '▶'}</span>
+      <span style={{ color: '#666', fontSize: 11 }}>🔗</span>
+      <span style={{ color: '#777', flex: 1, fontStyle: 'italic' }}>{label}</span>
+      {dirty && <span style={{ color: '#f1c40f', fontSize: 14, lineHeight: 1 }} title="Unsaved edits">●</span>}
+      <span style={{ color: '#666', fontSize: 9, fontWeight: 'bold', border: '1px solid #444', borderRadius: 3, padding: '0 3px' }}>BASE</span>
+      <span style={{ color: '#555', fontSize: 10, marginLeft: 2 }}>({count})</span>
+    </div>
+  );
+}
+
 interface EntityNodeProps {
   entity: EntityInfo;
   depth: number;
@@ -177,6 +238,12 @@ interface EntityNodeProps {
   onSelect: (id: number, e: React.MouseEvent) => void;
   onContextMenu: (e: React.MouseEvent, entity: EntityInfo) => void;
   onReparent: (entityId: number, newParentId: number, sortOrder?: number) => void;
+  /** Cross-scene-group drop (scene-loading.md Phase 14): the
+   *  dragged entity's sourceScene differs from this row's — promote/demote it,
+   *  reparenting directly under this row (owner decision: a row-drop takes only
+   *  the dragged subtree, landing under the target row; the old parent is left
+   *  behind untouched). */
+  onMoveToScene: (entityId: number, targetScene: string, newParentId?: number) => void;
   onPrefabDrop: (e: React.DragEvent, parentId: number) => void;
   collapsed: Set<number>;
   onToggle: (id: number, recursive?: boolean) => void;
@@ -189,7 +256,7 @@ interface EntityNodeProps {
   onCancelRename: () => void;
 }
 
-const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, selectedIds, onSelect, onContextMenu, onReparent, onPrefabDrop, collapsed, onToggle, prevSiblingSort, nextSiblingSort, parentLayer, parentHasCanvas2D, renamingId, onCommitRename, onCancelRename }: EntityNodeProps) {
+const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, selectedIds, onSelect, onContextMenu, onReparent, onMoveToScene, onPrefabDrop, collapsed, onToggle, prevSiblingSort, nextSiblingSort, parentLayer, parentHasCanvas2D, renamingId, onCommitRename, onCancelRename }: EntityNodeProps) {
   const isRenaming = renamingId === entity.id;
   const hasChildren = entity.children && entity.children.length > 0;
   const isCollapsed = collapsed.has(entity.id);
@@ -197,6 +264,14 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
   const isSelected = selectedIds.has(entity.id);
   const isPrimary = selectedId === entity.id;
   const isPrefab = entity.traits.includes('PrefabInstance');
+  // Base-scene ghost (Phase 9): derived per-entity from its OWN sourceScene stamp,
+  // not threaded down from an ancestor prop — SceneManager stamps every entity a
+  // base scene spawns, not just its roots, so this is correct at any depth even
+  // under a scene-group header the caller never reaches (search/filter can surface
+  // a ghosted descendant on its own). Selectable + inspectable, not draggable —
+  // reparenting into/out of it is refused server-side anyway (reparentEntity's
+  // cross-scene guard), so disabling drag here avoids a "nothing happened" drag.
+  const ghosted = !!entity.sourceScene;
   // 2d entities under a Canvas2D parent (ui layer) are valid — not a mismatch
   const layerMismatch = !!(parentLayer && entity.layer && entity.layer !== parentLayer
     && !(entity.layer === '2d' && parentHasCanvas2D));
@@ -233,6 +308,10 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
         }}
         onDragEnd={endDragGhost}
         onDragOver={(e) => {
+          // A ghost (base-origin) row is now a valid drop target too — either a
+          // same-scene-group reparent (Phase 6 guard passes, sourceScene matches)
+          // or a cross-scene-group promote/demote (Phase 14, routed in onDrop
+          // below). Only the guard itself refuses; dragover never pre-judges it.
           const isEntity = e.dataTransfer.types.includes('application/editor-entity');
           const isAsset = e.dataTransfer.types.includes('application/editor-asset');
           if (!isEntity && !isAsset) return;
@@ -258,6 +337,18 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
           if (!raw) return;
           const { id } = JSON.parse(raw) as { id: number };
           if (id === entity.id) return;
+
+          // Cross-scene-group drop (Phase 14): re-read the dragged entity's LIVE
+          // sourceScene (not the drag-start payload — it can go stale across a
+          // structure change mid-drag) and compare against THIS row's. A mismatch
+          // means promote/demote, reparenting directly under this row; a same-
+          // scene drop falls through to the existing zone-based reparent below.
+          const draggedScene = getAllEntities().find((x) => x.id === id)?.sourceScene || '';
+          const targetScene = entity.sourceScene || '';
+          if (draggedScene !== targetScene) {
+            onMoveToScene(id, targetScene, entity.id);
+            return;
+          }
 
           if (zone === 'child') {
             // Drop ON entity → make child (append at end)
@@ -346,7 +437,7 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
             onCancel={onCancelRename}
           />
         ) : (
-          <span style={{ color: isSelected ? '#fff' : isPrefab ? '#5dade2' : '#bbb', flex: 1 }}>{entity.name}</span>
+          <span style={{ color: ghosted ? '#666' : isSelected ? '#fff' : isPrefab ? '#5dade2' : '#bbb', flex: 1, fontStyle: ghosted ? 'italic' : 'normal' }}>{entity.name}</span>
         )}
         {entity.isResource && <span style={{ color: '#888', fontSize: '9px', fontWeight: 'bold' }}>R</span>}
         {entity.layer && <span style={{ color: layerColor[entity.layer], fontSize: '9px', fontWeight: 'bold' }}>{entity.layer.toUpperCase()}</span>}
@@ -364,6 +455,7 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
           onSelect={onSelect}
           onContextMenu={onContextMenu}
           onReparent={onReparent}
+          onMoveToScene={onMoveToScene}
           onPrefabDrop={onPrefabDrop}
           collapsed={collapsed}
           onToggle={onToggle}
@@ -396,6 +488,7 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
   // too, which had the same hole.
   if (prev.renamingId !== next.renamingId) return false;
   if (prev.entity.traits.length !== next.entity.traits.length) return false;
+  if ((prev.entity.sourceScene || '') !== (next.entity.sourceScene || '')) return false;
   if (prev.entity.children?.length !== next.entity.children?.length) return false;
   if (prev.depth !== next.depth) return false;
   // Re-render only when THIS node's selection state (membership or primary) flips.
@@ -473,6 +566,28 @@ export default function Hierarchy() {
   const [scenePath, setScenePath] = useState<string>(() => getCurrentScenePath() || '');
   useEffect(() => onWorldSwap(() => setScenePath(getCurrentScenePath() || '')), []);
 
+  // ── Scene groups (base-scene plan, Phase 9) ──
+  // sceneManager isn't itself observable, so re-read its loaded-scenes snapshot on
+  // the same trigger as scenePath (a world swap is exactly when it can have changed).
+  // Map iteration order already matches root-most-base-first/primary-last (a KEPT
+  // base's Map entry keeps its original insertion position; the primary always gets
+  // a freshly-allocated id every swap, so it's always the newest — i.e. last —
+  // entry) — see SceneManager.loadScene's rebuild step. Primary is keyed '' here
+  // (not its own guid) to match EntityAttributes.sourceScene's "empty = primary"
+  // convention (Phase 3).
+  const readSceneOrder = () => {
+    const order: string[] = [];
+    const labels = new Map<string, string>();
+    for (const { path, guid, role } of sceneManager.getLoadedScenes().values()) {
+      const key = role === 'primary' ? '' : guid;
+      order.push(key);
+      labels.set(key, assetDisplayName(path));
+    }
+    return { order, labels };
+  };
+  const [sceneOrder, setSceneOrder] = useState<{ order: string[]; labels: Map<string, string> }>(readSceneOrder);
+  useEffect(() => onWorldSwap(() => setSceneOrder(readSceneOrder())), []);
+
   // Empty (just-created, rootless) folders — editor-local, persisted per scene. Loaded
   // when the scene changes, saved on every mutation.
   const [emptyFolders, setEmptyFolders] = useState<Set<string>>(() => loadEmptyFolders(getCurrentScenePath() || ''));
@@ -483,7 +598,35 @@ export default function Hierarchy() {
   // highlight). Folders aren't entities, so this is separate from entity selection.
   const [selectedFolderPath, setSelectedFolderPath] = useState<string | null>(null);
 
-  const { folders, ungrouped } = useMemo(() => buildHierarchyFolders(displayTree, emptyFolders), [displayTree, emptyFolders]);
+  // Partition by source scene FIRST — the primary's own roots (the ones every existing
+  // create/drop/folder action below operates on) vs. any base scene's (read-only ghost
+  // groups, rendered separately above). A scene with no base loaded collapses to exactly
+  // one group whose sourceScene is '' — `baseGroups` is then empty and `folders`/
+  // `ungrouped` are computed from the FULL displayTree exactly as before Phase 9, so a
+  // non-chained scene's Hierarchy is byte-identical to today's.
+  const sceneGroups = useMemo(
+    () => groupRootsBySourceScene(displayTree, sceneOrder.order),
+    [displayTree, sceneOrder.order],
+  );
+  const primaryRoots = useMemo(
+    () => sceneGroups.length <= 1 ? displayTree : (sceneGroups.find((g) => g.sourceScene === '')?.roots ?? []),
+    [sceneGroups, displayTree],
+  );
+  const baseGroups = useMemo(
+    () => sceneGroups.length <= 1 ? [] : sceneGroups.filter((g) => g.sourceScene !== ''),
+    [sceneGroups],
+  );
+  const { folders, ungrouped } = useMemo(() => buildHierarchyFolders(primaryRoots, emptyFolders), [primaryRoots, emptyFolders]);
+  // Each base group's own folder tree — same helper the primary uses, no extraPaths
+  // (a ghost group has no "create empty folder" affordance, so nothing to seed).
+  const baseGroupFolders = useMemo(
+    () => baseGroups.map((g) => ({ sourceScene: g.sourceScene, ...buildHierarchyFolders(g.roots) })),
+    [baseGroups],
+  );
+  // Base-scene group expand/collapse (localStorage). Membership = EXPANDED here
+  // (opposite of collapsedFolders below) so the empty-set default is exactly
+  // "collapsed by default" (the plan's spec) with no extra XOR bookkeeping.
+  const { expanded: expandedSceneGroups, setExpanded: setExpandedSceneGroups, toggle: toggleSceneGroup } = useExpandedSet('editor:hierarchy:sceneGroupsExpanded:v1');
   // Collapsed-folder state (localStorage). Membership = collapsed, so a brand-new /
   // untracked folder defaults to EXPANDED (empty set = all open).
   const { expanded: collapsedFolders, setExpanded: setCollapsedFolders, toggle: toggleFolder } = useExpandedSet('editor:hierarchy:foldersCollapsed:v1');
@@ -918,6 +1061,22 @@ export default function Hierarchy() {
         when: () => !!liveEntity(),
         run: () => { const en = liveEntity(); if (en) setRenamingId(en.id); },
       }),
+      // `f` frames the selection in the SceneView orbit camera — the twin of SceneView's
+      // own `scene.frameSelected` (same `canFrameSelected` guard, shared via sceneViewBus so
+      // the two can't drift). Hierarchy-scoped, not app-key: users press it right after
+      // clicking a row (editor-hierarchy.spec.ts), but it must NOT fire from every other
+      // panel (Game view, Inspector, Assets, ...) — that was the bug.
+      register({
+        id: 'hierarchy.frameSelected', keys: 'f', scope: 'hierarchy',
+        when: () => canFrameSelected({
+          sceneViewMode: useEditorStore.getState().sceneViewMode,
+          selectedEntityId: kbdRef.current.selectedId,
+        }),
+        run: () => {
+          const sel = kbdRef.current.selectedId;
+          if (sel !== null) focusEntityInSceneView(sel);
+        },
+      }),
       ...each('duplicate', 'mod+d',
         () => !!liveEntity(),
         () => { const en = liveEntity(); if (en) duplicateEntity(en.id, kbdRef.current.selectEntity); }),
@@ -1230,6 +1389,31 @@ export default function Hierarchy() {
     reparentEntity(entityId, newParentId, sortOrder);
   }, []);
 
+  /** Cross-scene-group drop (scene-loading.md Phase 14):
+   *  change which scene FILE authors this subtree — "promote" (level → base,
+   *  `targetScene` truthy) or "demote" (base → primary, `targetScene` ''). Runs
+   *  the sibling-collision pre-flight, confirms with the user (advisory only —
+   *  owner decision: never offers an auto-rekey), then applies the move. On
+   *  success, auto-expands the target scene group and keeps the entity selected
+   *  (owner decision — a promoted entity ghosts + its group may be collapsed by
+   *  default, so it can otherwise look like it vanished). `newParentId` is the
+   *  row-drop gesture (reparent directly under that row); omitted for a
+   *  group-header/folder drop (lands at the target scene's root). `folderPath`
+   *  additionally tags the moved root into that folder once landed (used when
+   *  the drop target was one of the target scene's OWN folder rows). */
+  const handleMoveToScene = useCallback(async (entityId: number, targetScene: string, newParentId?: number, folderPath?: string) => {
+    const pre = await preflightSceneMove(entityId, targetScene);
+    if (!window.confirm(formatSceneMoveConfirm(pre, targetScene))) return;
+    const res = moveEntityToScene(entityId, targetScene, newParentId ? { newParentId } : undefined);
+    if (!res.ok) return;
+    if (folderPath !== undefined) {
+      const eaMeta = eaMetaFind();
+      if (eaMeta) writeTraitFieldWithUndo(entityId, eaMeta, 'editorFolder', normalizeFolderPath(folderPath));
+    }
+    if (targetScene) setExpandedSceneGroups((prev) => { const next = new Set(prev); next.add(targetScene); return next; });
+    selectEntity(entityId);
+  }, [selectEntity, setExpandedSceneGroups]);
+
   // Drop handler: prefab dragged from Assets → instantiate in scene
   const [dropActive, setDropActive] = useState(false);
 
@@ -1286,6 +1470,7 @@ export default function Hierarchy() {
       onSelect={handleSelectClick}
       onContextMenu={handleContextMenu}
       onReparent={handleReparent}
+      onMoveToScene={handleMoveToScene}
       onPrefabDrop={handlePrefabDrop}
       collapsed={effectiveCollapsed}
       onToggle={handleToggle}
@@ -1299,7 +1484,11 @@ export default function Hierarchy() {
 
   // Render a folder row + (when open) its subfolders and member roots. While a search
   // is active, folders are force-open so matches inside them stay visible.
-  const renderFolder = (node: HierarchyFolder, depth: number): React.ReactNode => {
+  // `targetScene` is which scene this folder's roots belong to (''=primary, or a
+  // base's guid when called from renderSceneGroup) — Phase 14: a drop from a
+  // DIFFERENT scene routes to promote/demote (landing at targetScene's root, then
+  // tagged into this folder) instead of the plain same-scene moveEntityToFolder.
+  const renderFolder = (node: HierarchyFolder, depth: number, targetScene: string = ''): React.ReactNode => {
     const open = isFiltering || !collapsedFolders.has(node.path);
     return (
       <React.Fragment key={`folder:${node.path}`}>
@@ -1313,7 +1502,11 @@ export default function Hierarchy() {
           onToggle={(recursive) => handleFolderToggle(node, recursive)}
           onSelect={() => { setSelectedFolderPath(node.path); setSelectedEntities([]); }}
           onContextMenu={(e) => setFolderCtx({ x: e.clientX, y: e.clientY, path: node.path, name: node.name })}
-          onDropEntity={(id) => moveEntityToFolder(id, node.path)}
+          onDropEntity={(id) => {
+            const draggedScene = getAllEntities().find((x) => x.id === id)?.sourceScene || '';
+            if (draggedScene === targetScene) { moveEntityToFolder(id, node.path); return; }
+            handleMoveToScene(id, targetScene, undefined, node.path);
+          }}
           onDropAsset={(e) => handlePrefabDrop(e, 0)}
           onDropFolder={(src) => moveFolder(src, node.path)}
           onCommitRename={(name) => commitFolderRename(node.path, name)}
@@ -1321,8 +1514,33 @@ export default function Hierarchy() {
         />
         {open && (
           <>
-            {node.children.map((c) => renderFolder(c, depth + 1))}
+            {node.children.map((c) => renderFolder(c, depth + 1, targetScene))}
             {renderEntityRows(node.roots, depth + 1)}
+          </>
+        )}
+      </React.Fragment>
+    );
+  };
+
+  // Render one base scene's group header + (when open) its own folder tree/roots —
+  // reuses renderFolder/renderEntityRows as-is: ghosting is derived per-entity from
+  // EntityInfo.sourceScene inside EntityNode itself, not threaded through as a prop.
+  const renderSceneGroup = (group: { sourceScene: string; folders: HierarchyFolder[]; ungrouped: EntityInfo[] }, depth: number): React.ReactNode => {
+    const open = isFiltering || expandedSceneGroups.has(group.sourceScene);
+    const label = sceneOrder.labels.get(group.sourceScene) ?? group.sourceScene;
+    const count = group.folders.reduce((n, f) => n + countFolderRoots(f), 0) + group.ungrouped.length;
+    return (
+      <React.Fragment key={`scene:${group.sourceScene}`}>
+        <SceneGroupRow
+          label={label} open={open} count={count} depth={depth}
+          onToggle={() => toggleSceneGroup(group.sourceScene)}
+          dirty={isSceneDirty(group.sourceScene)}
+          onDropEntity={(id) => handleMoveToScene(id, group.sourceScene)}
+        />
+        {open && (
+          <>
+            {group.folders.map((f) => renderFolder(f, depth + 1, group.sourceScene))}
+            {renderEntityRows(group.ungrouped, depth + 1)}
           </>
         )}
       </React.Fragment>
@@ -1395,20 +1613,28 @@ export default function Hierarchy() {
             return;
           }
           // Entity drop onto empty area → top-level UNGROUPED root: reparent to root
-          // AND clear any folder tag (drag-out-of-folder gesture).
+          // AND clear any folder tag (drag-out-of-folder gesture). A base-origin
+          // entity dropped here is a DEMOTE to the primary (Phase 14) rather than
+          // the plain same-scene moveEntityToFolder.
           const raw = e.dataTransfer.getData('application/editor-entity');
           if (raw) {
             e.preventDefault();
             const { id } = JSON.parse(raw) as { id: number };
+            const draggedScene = getAllEntities().find((x) => x.id === id)?.sourceScene || '';
+            if (draggedScene) { handleMoveToScene(id, ''); return; }
             moveEntityToFolder(id, '');
           }
         }}
       >
-        {/* Folders first (alphabetical), then ungrouped roots — a scene with no
-            editorFolder tags renders exactly as before (folders=[], ungrouped=all). */}
+        {/* Base scene groups (root-most base first), collapsed by default, ABOVE the
+            primary's own content — empty when no base is loaded (byte-identical to
+            before Phase 9). Then the primary: folders first (alphabetical), then
+            ungrouped roots — a scene with no editorFolder tags renders exactly as
+            before (folders=[], ungrouped=all). */}
+        {baseGroupFolders.map((g) => renderSceneGroup(g, 0))}
         {folders.map((f) => renderFolder(f, 0))}
         {renderEntityRows(ungrouped, 0)}
-        {isFiltering && folders.length === 0 && ungrouped.length === 0 && (
+        {isFiltering && folders.length === 0 && ungrouped.length === 0 && baseGroupFolders.length === 0 && (
           <div style={{ padding: 12, color: '#555' }}>No entities match.</div>
         )}
       </div>
