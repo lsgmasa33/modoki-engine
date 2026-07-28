@@ -6,11 +6,11 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createWorld } from 'koota';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { PrefabInstance } from '../../src/runtime/traits/PrefabInstance';
-import { setCurrentWorld, registerEntity, indexEntityGuid } from '../../src/runtime/ecs/world';
-import { registerTrait } from '../../src/runtime/ecs/traitRegistry';
-import { setRunMode } from '../../src/runtime/systems/playState';
+import { setCurrentWorld, registerEntity, indexEntityGuid } from '../../src/runtime/core/ecs/world';
+import { registerTrait } from '../../src/runtime/core/ecs/traitRegistry';
+import { setRunMode } from '../../src/runtime/core/playState';
 
 const mockAssets: { guid: string; path: string; type: string }[] = [];
 vi.mock('../../src/runtime/loaders/assetManifest', () => ({

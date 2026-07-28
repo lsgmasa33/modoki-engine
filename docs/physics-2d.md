@@ -190,7 +190,7 @@ green on enter, reverts on exit, and logs a `zone` journal event).
 ### The shared producer + the rich `@contact` event
 
 The enter/exit fan-out is dimension-agnostic and lives in ONE module,
-`runtime/systems/physicsContactEvents.ts` (`drainContactEvents` / `routePair` /
+`runtime/physics/physicsContactEvents.ts` (`drainContactEvents` / `routePair` /
 `synthesizeContactExits` / `makeFireOnCollision`), used by BOTH `physics2DSystem` and
 `physics3DSystem` — only the injected event bus + `OnCollision` trait differ, so a fix to the
 correctness-critical enter/exit balance can't silently miss a dimension. The bus itself comes from
@@ -217,7 +217,7 @@ logical contact (one per convex piece / child collider) — dedupe by entity id 
 
 `@contact`/`@sensor` answer *when* two things touched; once a resting contact's begin-event scrolls
 out of the journal ring the event stream can't answer *what is touching now*.
-`runtime/systems/physicsContactIndex.ts` is that STATE counterpart — a per-world index of each
+`runtime/physics/physicsContactIndex.ts` is that STATE counterpart — a per-world index of each
 **body** entity's current solid `contacts` + sensor `overlaps`, maintained **incrementally** from
 the same enter/exit events `routePair` already fires (NOT a per-frame scan, so a settled pile of
 crates costs nothing).
@@ -237,7 +237,7 @@ crates costs nothing).
 - **Folded into `get_scene_state`.** `getContactState(world, id)` returns sorted `contacts`/
   `overlaps` id arrays; `agentBridge.ts` resolves each to a GUID and attaches them under the
   `contacts` enricher (`?contacts=1`). Cleared on scene swap + Play→Stop (same lifecycle as the
-  physics world). See [percept-plan.md](./percept-plan.md).
+  physics world). See [debug-tools-mcp.md](./debug-tools-mcp.md) "Percept".
 
 ## Collision layers (named layers + matrix)
 
@@ -249,7 +249,7 @@ powerful but painful to author by hand, so there's a Unity-style **named-layer**
   bit; index 0 = `Default`) and a symmetric **collision matrix** (`collisionMatrix[i]` = the 16-bit
   mask of layer indices layer i collides with). Pushed into the runtime once at boot via
   `setPhysicsLayers(projectConfig.physics)` in `app/ecs/register.ts`.
-- **Runtime registry** (`runtime/systems/physicsLayers.ts`, process-global like the trait registry):
+- **Runtime registry** (`runtime/physics/physicsLayers.ts`, process-global like the trait registry):
   `resolveColliderBits(layer, rawGroups, rawMask)` maps a collider's `physicsLayer` name →
   `{ groups: 1<<idx, mask: matrix[idx] }`. An **empty or unknown** layer falls back to the raw
   `collisionGroups`/`collisionMask` (the advanced escape hatch). Default (no config) = one `Default`
@@ -389,7 +389,7 @@ both endpoints exist). Anchors are body-local offsets in world units.
 
 ## 3D physics (Rapier3D) — the parallel integration
 
-`physics3DSystem` (`runtime/systems/physics3DSystem.ts`) is a near-exact parallel of the 2D
+`physics3DSystem` (`runtime/physics/physics3DSystem.ts`) is a near-exact parallel of the 2D
 reconciler on **`@dimforge/rapier3d-compat`**, sharing the PHYSICS tier (175): both systems run
 there and each early-outs when its own body query is empty, so a scene runs whichever dimension it
 authored — or both. Everything above about retained-mode reconciliation, structural-signature
@@ -405,7 +405,7 @@ and WASM registry above are the SAME shared code, dimension-parameterized. What 
   acceleration handed straight to Rapier (NOT scaled by `unitsPerMeter`); default `(0, -9.81, 0)`.
 - **Euler ↔ quaternion is the one load-bearing seam.** Transform stores rotation as Euler radians
   `rx/ry/rz`; Rapier stores a unit quaternion `{x,y,z,w}`. `eulerToQuat`/`quatToEuler` hard-code
-  THREE's `'XYZ'` order and reproduce `three/systems/transformPropagationSystem.makeMatrix` EXACTLY
+  THREE's `'XYZ'` order and reproduce `core/ecs/transformPropagationSystem.makeMatrix` EXACTLY
   (rather than relying on THREE's ambient default), so physics can't silently desync from what the
   renderer draws. Pure THREE-only functions (no WASM) → unit-testable headlessly.
 - **Per-axis locks.** `RigidBody3D` exposes `fixedRotation` (lock all spin — upright characters)
@@ -455,7 +455,7 @@ and WASM registry above are the SAME shared code, dimension-parameterized. What 
   would leak one Rapier `World` + `EventQueue` per scene swap.
 - **Shared WASM registry.** The per-World state map + those four free points are dimension-agnostic,
   so both systems build theirs from `createPhysicsWorldRegistry(freeState)`
-  (`runtime/systems/physicsWorldRegistry.ts`): the factory owns the `Map<World, State>`, registers
+  (`runtime/physics/physicsWorldRegistry.ts`): the factory owns the `Map<World, State>`, registers
   the Stop + `onWorldSwap` hooks once, and returns `dispose`/`disposeAll`. 2D's `freeState` frees
   its `world` + `eventQueue`; 3D exposes `disposePhysics3D`/`disposeAllPhysics3D` symmetrically. The
   contact index is cleared on the same swap/Stop lifecycle (`clearContactIndex`).
@@ -517,7 +517,7 @@ and WASM registry above are the SAME shared code, dimension-parameterized. What 
   authored point list into convex pieces at collider-build time, and each piece becomes a
   `convexHull` collider on the one body — a compound built inside `attachCollider` (distinct from
   the hierarchy compound of 4.2, which is one collider per child entity). `decomposeConcaveToPhys`
-  (`runtime/systems/concaveDecomp.ts`) runs `makeCCW` + `quickDecomp` (deterministic, no RNG →
+  (`runtime/physics/concaveDecomp.ts`) runs `makeCCW` + `quickDecomp` (deterministic, no RNG →
   determinism-guard-safe) and converts each piece to physics space. If the list is too small or
   self-intersecting it falls back to a single convex hull so the body still gets a collider. The
   outline + ⬟ Points editor treat `concave` like a closed polygon (the decomposition is a

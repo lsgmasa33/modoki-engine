@@ -33,12 +33,12 @@ let editorWorld: ReturnType<typeof createWorld>;
 const index = new Map<number, any>();
 const traitNamesOf = (e: any) => TRAITS.filter((t) => e.has(t.trait)).map((t) => t.name);
 
-vi.mock('../../src/runtime/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => editorWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   unregisterEntity: (e: any) => index.delete(e.id()),
 }));
-vi.mock('../../src/runtime/ecs/entityUtils', () => ({
+vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   getAllEntities: () => {
     const out: any[] = [];
     editorWorld.query(EntityAttributes).updateEach(([ea], e) => {
@@ -65,7 +65,7 @@ vi.mock('../../src/runtime/ecs/entityUtils', () => ({
   readTraitData: vi.fn(),
   writeTraitField: vi.fn(),
 }));
-vi.mock('../../src/runtime/ecs/traitRegistry', () => ({
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getTraitByName: (n: string) => TRAITS.find((t) => t.name === n),
   getAllTraits: () => TRAITS,
 }));

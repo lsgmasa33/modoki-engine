@@ -2,8 +2,7 @@ import { trait } from 'koota';
 import {
   makeAxes, makeFlags, makePointer,
   type Axis, type DigitalAction, type InputDevice, type InputFrame, type PointerFrame,
-} from '../input/actions';
-import { getPresentationScale } from '../input/presentationScale';
+} from '../core/inputActions';
 import type { World } from 'koota';
 
 /** Input resource — the canonical, source-agnostic input snapshot for this frame
@@ -69,14 +68,16 @@ export function pointerPos(world: World): { x: number; y: number } {
   const p = getInput(world)?.pointer ?? ZERO_POINTER;
   return { x: p.x, y: p.y };
 }
-/** Drag delta (current − press start), PRESENTATION-INVARIANT: normalized to zoom-0 px so a
- *  gesture yields the same magnitude at any editor/browser/OS zoom (see presentationScale.ts).
+/** Drag delta (current − press start), PRESENTATION-INVARIANT: `inputSystem` scales it to
+ *  zoom-0-equivalent px once, at the point it merges the pointer frame into this resource (see
+ *  presentationScale.ts), so a gesture yields the same magnitude at any editor/browser/OS zoom.
  *  {0,0} while the pointer is up. Positions (`pointerPos`) stay raw — only this magnitude is
- *  scaled, which is why a game's `dragPx × k` feel constant no longer drifts under zoom. */
+ *  scaled, which is why a game's `dragPx × k` feel constant no longer drifts under zoom. A plain
+ *  read: `Input.pointer.dragX/dragY` IS the presentation-invariant value, not a second raw copy —
+ *  reading the field directly gives the same answer as this accessor. */
 export function pointerDrag(world: World): { x: number; y: number } {
   const p = getInput(world)?.pointer ?? ZERO_POINTER;
-  const s = getPresentationScale();
-  return { x: p.dragX * s, y: p.dragY * s };
+  return { x: p.dragX, y: p.dragY };
 }
 /** Scroll-wheel notch delta THIS frame (+down / −up, one unit per wheel event);
  *  0 when the wheel didn't move. Consumed/re-zeroed each frame — read it once. */

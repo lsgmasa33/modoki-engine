@@ -10,7 +10,7 @@ import { useRef } from 'react';
 import { useOverlayEscape } from '../input/useOverlayEscape';
 import type { AssetEntry } from '../../runtime/loaders/assetManifest';
 import { resolveGuidToPath } from '../../runtime/loaders/assetManifest';
-import { deriveGuid } from '../../runtime/loaders/assetRefRules';
+import { deriveGuid } from '../../runtime/core/assetRefRules';
 import { assetDisplayName } from './AssetRefField';
 
 /** The whole-image sprite GUID a 2D/UI texture auto-exposes — must match the

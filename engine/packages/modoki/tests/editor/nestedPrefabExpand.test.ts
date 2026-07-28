@@ -45,12 +45,12 @@ function readTraitDataImpl(id: number, meta: any) {
   return out;
 }
 
-vi.mock('../../src/runtime/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   unregisterEntity: (e: any) => index.delete(e.id()),
 }));
-vi.mock('../../src/runtime/ecs/entityUtils', () => ({
+vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   getAllEntities: () => getAllEntitiesImpl(),
   findEntity: (id: number) => index.get(id),
   markStructureDirty: vi.fn(),
@@ -58,7 +58,7 @@ vi.mock('../../src/runtime/ecs/entityUtils', () => ({
   readTraitData: (id: number, meta: any) => readTraitDataImpl(id, meta),
   writeTraitField: vi.fn(),
 }));
-vi.mock('../../src/runtime/ecs/traitRegistry', () => ({
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getTraitByName: (n: string) => TRAITS.find((t) => t.name === n),
   getAllTraits: () => TRAITS,
 }));

@@ -3,7 +3,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp } from '../../src/runtime/scene/sceneMutate';
-import { validateSceneData, type SceneSchema } from '../../src/runtime/scene/sceneValidation';
+import { validateSceneData, type SceneSchema } from '../../src/runtime/loaders/sceneValidation';
 
 let guidN = 0;
 const mint = () => `guid-${++guidN}`;

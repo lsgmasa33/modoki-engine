@@ -2,7 +2,7 @@
  *  parent indices and per-vertex skinIndices/skinWeights so the rig stays valid. Used by
  *  the Skin-panel bone editor. Deterministic, no side effects (returns a new Rig2DFile). */
 
-import { type Rig2DFile } from '../loaders/rig2dCache';
+import { type Rig2DFile } from './rig2dTypes';
 import { deriveBindMatrices, invert2D, identity2D, apply2D, type BindBone } from './rig2dMath';
 
 type Bones = NonNullable<Rig2DFile['bones']>;

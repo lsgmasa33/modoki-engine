@@ -3,7 +3,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 async function getActionRegistry() {
-  return import('../../../src/runtime/ui/actionRegistry');
+  return import('../../src/runtime/core/actionRegistry');
 }
 
 beforeEach(() => {
@@ -35,8 +35,8 @@ describe('actionRegistry', () => {
 
   it('resolves targetGuid to ctx.target', async () => {
     const { registerUIAction, dispatchUIAction } = await getActionRegistry();
-    const { getCurrentWorld } = await import('../../../src/runtime/ecs/world');
-    const { EntityAttributes } = await import('../../../src/runtime/traits/EntityAttributes');
+    const { getCurrentWorld } = await import('../../../src/runtime/core/ecs/world');
+    const { EntityAttributes } = await import('../../src/runtime/core/traits/EntityAttributes');
 
     const e = getCurrentWorld().spawn(EntityAttributes({ guid: 'target-guid' }));
     let target: unknown;
@@ -49,7 +49,7 @@ describe('actionRegistry', () => {
 
   it('is inert when the sim is not running', async () => {
     const { registerUIAction, dispatchUIAction } = await getActionRegistry();
-    const { setPlayState } = await import('../../../src/runtime/systems/playState');
+    const { setPlayState } = await import('../../src/runtime/core/playState');
 
     const handler = vi.fn();
     registerUIAction('gated', handler);
@@ -61,7 +61,7 @@ describe('actionRegistry', () => {
 
   it('registerSystem actions option registers and unregisters its UIActions', async () => {
     const { getUIActionNames } = await getActionRegistry();
-    const { registerSystem, unregisterSystem } = await import('../../../src/runtime/systems/pipeline');
+    const { registerSystem, unregisterSystem } = await import('../../src/runtime/core/pipeline');
 
     registerSystem('sysWithActions', () => {}, 100, { actions: { 'sysWithActions.go': () => {} } });
     expect(getUIActionNames()).toContain('sysWithActions.go');

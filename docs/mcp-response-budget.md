@@ -100,10 +100,10 @@ A corollary, learned adversarially:
 
 ## The compaction choke point — `result.ts`
 
-The single highest-leverage mechanism is one function applied to all 67 tools' output, with no shape
+The single highest-leverage mechanism is one function applied to all 75 tools' output, with no shape
 change. Result formatting lives in `engine/tools/modoki-mcp/src/result.ts` — a pure, importable
 module with no MCP-SDK dependency, so it is unit-testable
-(`engine/tests/tools/mcpResult.test.ts`); `index.ts` keeps the 67 `server.tool(...)` registrations
+(`engine/tests/tools/mcpResult.test.ts`); `index.ts` keeps the 75 `server.tool(...)` registrations
 and imports the formatter.
 
 ```ts
@@ -132,7 +132,7 @@ Load-bearing details:
 - **Compact JSON everywhere.** `ok()` no longer does `JSON.stringify(data, null, 2)`. The indent was
   pure overhead — MCP ships `content[].text` opaquely and the model reads compact JSON identically.
   Pretty-printing cost 48% of `layout-bounds`, 38% of `scene-state`, 25% of `scan-assets`, across
-  all 67 tools.
+  all 75 tools.
 - **The identity `banner()` is prepended OUTSIDE the capped payload.** The "you are driving the
   sibling clone's editor" warning must never be the thing that gets truncated.
 - **`err()` bodies are capped too** — a backend 500 that echoes a scene or a stack was unbounded.

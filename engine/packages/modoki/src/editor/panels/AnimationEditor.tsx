@@ -12,15 +12,15 @@ import { backendFetch } from '../backend/editorBackend';
 import { useEditorStore } from '../store/editorStore';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
-import { getCurrentWorld } from '../../runtime/ecs/world';
-import { findEntity, getStructureVersion, fireDirtyListeners } from '../../runtime/ecs/entityUtils';
-import { getTraitByName } from '../../runtime/ecs/traitRegistry';
+import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { findEntity, getStructureVersion, fireDirtyListeners } from '../../runtime/core/ecs/entityUtils';
+import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { newGuid, registerAsset, getGuidForPath } from '../../runtime/loaders/assetManifest';
 import {
   applyClipAtTime, advanceClipTime,
 } from '../../runtime/animation/sampleClip';
-import { applyClipDeform } from '../../runtime/systems/deform2DSystem';
-import { beginDeform2DFrame } from '../../runtime/systems/deform2DBuffers';
+import { applyClipDeform } from '../../runtime/animation/deform2DSystem';
+import { beginDeform2DFrame } from '../../runtime/animation/deform2DBuffers';
 import {
   defaultAnimationClip, normalizeAnimationClip,
   type AnimationClipDef, type AnimationTrack, type TrackValueType,

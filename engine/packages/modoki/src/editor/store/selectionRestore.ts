@@ -15,8 +15,8 @@
  *  For non-persistent entities the path won't be found and selection clears. */
 
 import { type World } from 'koota';
-import { onWorldSwap } from '../../runtime/ecs/world';
-import { getAllTraits, getTraitByName } from '../../runtime/ecs/traitRegistry';
+import { onWorldSwap } from '../../runtime/core/ecs/world';
+import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { useEditorStore } from './editorStore';
 
 let registered = false;

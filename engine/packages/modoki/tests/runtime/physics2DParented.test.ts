@@ -7,16 +7,16 @@
 
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
-import { SYSTEM_PRIORITY } from '../../src/runtime/systems/pipeline';
-import { Transform } from '../../src/runtime/traits/Transform';
+import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
+import { Transform } from '../../src/runtime/core/traits/Transform';
 import { RigidBody2D } from '../../src/runtime/traits/RigidBody2D';
 import { Collider2D } from '../../src/runtime/traits/Collider2D';
 import { Physics2D } from '../../src/runtime/traits/Physics2D';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
-import { physics2DSystem, disposePhysics2D } from '../../src/runtime/systems/physics2DSystem';
-import { transformPropagationSystem } from '../../src/three/systems/transformPropagationSystem';
-import { getWorldTransform3D } from '../../src/runtime/ecs/worldTransform';
-import { initRapier2D } from '../../src/runtime/systems/rapierLoader';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
+import { physics2DSystem, disposePhysics2D } from '../../src/runtime/physics/physics2DSystem';
+import { transformPropagationSystem } from '../../src/runtime/core/ecs/transformPropagationSystem';
+import { getWorldTransform3D } from '../../src/runtime/core/ecs/worldTransform';
+import { initRapier2D } from '../../src/runtime/physics/rapierLoader';
 
 beforeAll(async () => { await initRapier2D(); });
 

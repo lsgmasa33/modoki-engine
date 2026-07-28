@@ -1,4 +1,4 @@
-/** The core entity index (`runtime/ecs/entityIndex.ts`) — specifically the
+/** The core entity index (`runtime/core/ecs/entityIndex.ts`) — specifically the
  *  `isEntityActiveInHierarchy` predicate, tested DIRECTLY rather than only through its first
  *  consumer (timelineSystem's Director freeze).
  *
@@ -10,9 +10,9 @@
 
 import { describe, it, expect } from 'vitest';
 import { createWorld } from 'koota';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { Director } from '../../src/runtime/traits/Director';
-import { buildEntityIndex, isEntityActiveInHierarchy } from '../../src/runtime/ecs/entityIndex';
+import { buildEntityIndex, isEntityActiveInHierarchy } from '../../src/runtime/core/ecs/entityIndex';
 
 describe('isEntityActiveInHierarchy', () => {
   it('reports a plain active root as active', () => {

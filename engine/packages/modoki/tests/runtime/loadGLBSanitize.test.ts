@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 const sanitizeSpy = vi.fn();
 const geometries: { dispose: ReturnType<typeof vi.fn> }[] = [];
 
-vi.mock('../../src/runtime/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => ({ spawn: () => ({ id: () => 1 }) }),
   registerEntity: vi.fn(),
 }));

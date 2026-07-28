@@ -8,7 +8,7 @@
  *  fixed store fields (entityCount/gamePhase/fps/…). */
 import { useSyncExternalStore } from 'react';
 import { addStoreHook } from './storeHooks';
-import { onWorldSwap } from '../ecs/world';
+import { onWorldSwap } from '../core/ecs/world';
 
 type UIValue = string | number | boolean;
 

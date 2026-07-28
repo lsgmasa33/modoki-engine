@@ -8,8 +8,8 @@
  *  small frame-preview + track-name helpers that the SpriteAnim Editor panel reuses. */
 
 import { useState, useEffect } from 'react';
-import { findEntity } from '../../runtime/ecs/entityUtils';
-import { type TraitMeta } from '../../runtime/ecs/traitRegistry';
+import { findEntity } from '../../runtime/core/ecs/entityUtils';
+import { type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { writeTraitFieldsPerEntityWithUndo as writeTraitFields } from '../undo/entityActions';
 import { getAssetEntry, resolveGuidToPath } from '../../runtime/loaders/assetManifest';
 import { getSpriteAnim } from '../../runtime/loaders/spriteAnimCache';

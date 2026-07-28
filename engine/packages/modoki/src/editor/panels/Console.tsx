@@ -4,8 +4,8 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Actions, type TabNode } from 'flexlayout-react';
 import { computeVisibleRange, clampScrollTop } from './consoleVirtualization';
-import { getAllEntities } from '../../runtime/ecs/entityUtils';
-import { onStructureDirtyCoalesced } from '../../runtime/ecs/entityUtils';
+import { getAllEntities } from '../../runtime/core/ecs/entityUtils';
+import { onStructureDirtyCoalesced } from '../../runtime/core/ecs/entityUtils';
 import { getCurrentFPS } from '../../runtime/rendering/frameDriver';
 import {
   installConsoleCapture, setOnNewLog, logBuffer, getLogIdCounter, bumpLogIdCounter,

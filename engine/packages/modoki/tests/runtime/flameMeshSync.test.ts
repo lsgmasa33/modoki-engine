@@ -41,15 +41,15 @@ vi.mock('three/tsl', () => {
 });
 
 // World transform map: empty → syncFlameMeshes falls back to the entity Transform.
-vi.mock('../../src/three/systems/transformPropagationSystem', () => ({
+vi.mock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
   worldTransforms: new Map(),
 }));
 // onWorldSwap is called at module load to register the geometry-cache teardown —
 // make it a no-op so importing the module doesn't pull the real world graph.
-vi.mock('../../src/runtime/ecs/world', () => ({ onWorldSwap: vi.fn() }));
+vi.mock('../../src/runtime/core/ecs/world', () => ({ onWorldSwap: vi.fn() }));
 
 import { createWorld } from 'koota';
-import { Transform } from '../../src/runtime/traits/Transform';
+import { Transform } from '../../src/runtime/core/traits/Transform';
 import { FlameMesh } from '../../src/runtime/traits/FlameMesh';
 import { PARTICLE_LAYER, DEFAULT_LAYER } from '../../src/runtime/rendering/layers';
 import { createFlameMeshSyncState, syncFlameMeshes, disposeFlameMeshSyncState } from '../../src/runtime/rendering/flameMeshSync';

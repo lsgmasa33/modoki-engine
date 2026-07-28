@@ -1,9 +1,9 @@
 /** Hierarchy — shows ECS entities as a tree with parent-child relationships */
 
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { onWorldSwap } from '../../runtime/ecs/world';
-import { getAllTraits, getTraitByName, COMPONENT_CATEGORY_ORDER } from '../../runtime/ecs/traitRegistry';
-import { getAllEntities, buildEntityTree, deleteEntity, onStructureDirtyCoalesced, getStructureVersion, writeTraitField, readTraitData, subtreeIds, type EntityInfo } from '../../runtime/ecs/entityUtils';
+import { onWorldSwap } from '../../runtime/core/ecs/world';
+import { getAllTraits, getTraitByName, COMPONENT_CATEGORY_ORDER } from '../../runtime/core/ecs/traitRegistry';
+import { getAllEntities, buildEntityTree, deleteEntity, onStructureDirtyCoalesced, getStructureVersion, writeTraitField, readTraitData, subtreeIds, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { flattenVisibleIds, rangeBetween } from './hierarchySelection';
 import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids, classifyPrefabDuplicate, stripPrefabInstanceFromSnapshot, reRootPrefabInstanceSubtree, moveEntityToScene, type EntitySnapshot } from '../undo/entityActions';
 import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
@@ -24,7 +24,7 @@ import RenameInput from '../components/RenameInput';
 import { TreeSearchInput, TypeFilterMenu, treeRowPadLeft } from './treeChrome';
 import { useExpandedSet } from './useExpandedSet';
 import { remapPrefix } from '../utils/assetPaths';
-import { filterEntityTree, collectEntityTypes, normalizeFolderPath, buildHierarchyFolders, countFolderRoots, folderSubtreePaths, folderSubtreeRootIds, revealTargetsFor, groupRootsBySourceScene, type HierarchyFolder } from './hierarchyFolders';
+import { filterEntityTree, collectEntityTypes, normalizeFolderPath, buildHierarchyFolders, countFolderRoots, folderSubtreePaths, folderSubtreeRootIds, revealTargetsFor, groupRootsBySourceScene, resolveDropFolderSync, type HierarchyFolder } from './hierarchyFolders';
 import { isSceneDirty } from '../scene/sceneDirty';
 import { startDragGhost, endDragGhost, armGrabCursor } from '../utils/dragGhost';
 import { PRIMITIVE_NAMES } from '../../runtime/loaders/primitives';
@@ -363,8 +363,9 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
             const loSort = zone === 'before' ? prevSiblingSort : entity.sortOrder;
             const hiSort = zone === 'before' ? entity.sortOrder : nextSiblingSort;
             const collides = loSort !== null && hiSort !== null && loSort === hiSort;
+            const eaMeta = getAllTraits().find(t => t.name === 'EntityAttributes');
+            let newSort: number;
             if (collides) {
-              const eaMeta = getAllTraits().find(t => t.name === 'EntityAttributes');
               if (eaMeta) {
                 const siblings = getAllEntities()
                   .filter(e => e.parentId === targetParent && e.id !== id)
@@ -389,13 +390,29 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
               const flat = getAllEntities();
               const updatedEntity = flat.find(e => e.id === entity.id);
               const updatedSort = updatedEntity?.sortOrder ?? 0;
-              const newSort = zone === 'before' ? updatedSort - 5 : updatedSort + 5;
-              onReparent(id, targetParent, newSort);
+              newSort = zone === 'before' ? updatedSort - 5 : updatedSort + 5;
             } else {
-              const newSort = zone === 'before'
+              newSort = zone === 'before'
                 ? ((prevSiblingSort ?? entity.sortOrder - 2) + entity.sortOrder) / 2
                 : (entity.sortOrder + (nextSiblingSort ?? entity.sortOrder + 2)) / 2;
-              onReparent(id, targetParent, newSort);
+            }
+            onReparent(id, targetParent, newSort);
+            // Root-level reorder (folders only tag ROOTS): a drop next to an
+            // ungrouped sibling must also clear the dragged entity's folder tag,
+            // and a drop next to a folder MEMBER must adopt that folder — the
+            // drop position decides membership, same as reparenting into/out of a
+            // folder header. Without this, dropping near an already-ungrouped
+            // sibling silently left the stale tag, so the entity never visibly
+            // moved (the only WORKING "drag out of a folder" gesture was dropping
+            // on the panel's empty background — unreachable once the tree
+            // overflows the panel, which is any real scene). A separate undo
+            // entry, same as moveEntityToFolder's own non-root branch.
+            if (eaMeta) {
+              const draggedEntity = getAllEntities().find(e => e.id === id);
+              const nextFolder = draggedEntity
+                ? resolveDropFolderSync(targetParent, entity.editorFolder || '', draggedEntity.editorFolder || '')
+                : null;
+              if (nextFolder !== null) writeTraitFieldWithUndo(id, eaMeta, 'editorFolder', nextFolder);
             }
           }
         }}

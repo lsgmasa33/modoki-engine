@@ -6,7 +6,7 @@ import {
   timeSystem, uiTreeProjection, rotate3DSystem, timelineSystem, animationSystem, spriteAnimationSystem,
   physics2DSystem, physics3DSystem, zone2DSystem, zone3DSystem, inputSystem, characterInputSystem, characterInput3DSystem, characterAnimationSystem, uiFocusSystem, skin2DSystem, audioSystem, setAudioWorldPositionResolver, materialInstanceSystem, SYSTEM_PRIORITY,
 } from '@modoki/engine/runtime';
-import { transformPropagationSystem, worldTransforms } from '@modoki/engine/three';
+import { transformPropagationSystem, worldTransforms } from '@modoki/engine/runtime';
 
 // Spatial audio reads WORLD positions for nested rigs via the Three-computed worldTransforms
 // cache — injected here so the engine's audioSystem stays THREE-free (P3). Audio runs after

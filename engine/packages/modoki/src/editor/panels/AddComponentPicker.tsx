@@ -7,7 +7,7 @@
  *  in tests/editor/addComponentPicker.test.ts) — the component only renders it. */
 
 import { useState, useEffect, useMemo, useRef } from 'react';
-import { type TraitMeta, COMPONENT_CATEGORY_ORDER } from '../../runtime/ecs/traitRegistry';
+import { type TraitMeta, COMPONENT_CATEGORY_ORDER } from '../../runtime/core/ecs/traitRegistry';
 import { addTraitToEntitiesWithUndo, pasteTraitAsNewWithUndo } from '../undo/entityActions';
 import { type TraitClipboardEntry } from './traitClipboard';
 import { inputStyle } from './fields';

@@ -15,8 +15,8 @@
  *  its file until it's next saved. Advisory only (owner decision) — this never
  *  offers or performs a rekey; it only reports so the user can judge. */
 
-import { getAllEntities, subtreeIds, findEntity } from '../../runtime/ecs/entityUtils';
-import { getTraitByName } from '../../runtime/ecs/traitRegistry';
+import { getAllEntities, subtreeIds, findEntity } from '../../runtime/core/ecs/entityUtils';
+import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { ASSET_FETCH_INIT } from '../../runtime/loaders/assetFetch';
 import { getAllAssets } from '../../runtime/loaders/assetManifest';

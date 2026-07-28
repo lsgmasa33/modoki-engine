@@ -22,7 +22,7 @@
  *     emits zero KTX2 variants, so nothing decodes them at runtime. */
 
 import type { TextureImportSettings, TextureMaxSize } from '../packages/modoki/src/runtime/loaders/textureSettings';
-import type { EnvImportSettings, EnvMaxSize } from '../packages/modoki/src/runtime/loaders/environmentSettings';
+import type { EnvImportSettings, EnvMaxSize } from '../packages/modoki/src/runtime/core/environmentSettings';
 
 /** Longest-edge caps for the playable profile. Deliberately small — a playable is a
  *  low-fidelity ad, not the shipped game. */

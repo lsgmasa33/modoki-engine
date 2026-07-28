@@ -5,8 +5,7 @@ device bridge (`game-debug`), the Electron editor bridge (`modoki`), the Chrome 
 loop, and the dev-server `curl` API. `CLAUDE.md`'s "Debug Tools" section is the
 in-context summary; this is the detail.
 
-Companion design docs: [percept-plan.md](./percept-plan.md) (the Percept perception
-layer — Snapshot/Journal/Watch), [enact.md](./enact.md) (the
+Companion design docs: [enact.md](./enact.md) (the
 Enact trusted-input layer), [mcp-response-budget.md](./mcp-response-budget.md) (the
 response-budget design), [connect-claude-code.md](./connect-claude-code.md).
 
@@ -185,11 +184,11 @@ single most confusing failure on this surface: an entity that is *right there on
 | | Tools | Writes to |
 |---|---|---|
 | **LIVE world only** (the running editor; undoable, like the menus) | `create_entity`, `duplicate_entity`, `delete_entities`, `reparent_entity`, `prefab` (instantiate / detach), `history`, `set_selection`, `gizmo`, `collider_edit`, `play_control`, `set_timescale` | RAM. **Not saved.** |
-| **SCENE FILE** (JSON on disk; the editor hot-reloads it) | `set_transform`, `mutate_scene`, `validate_scene` (reads) | disk |
-| **LIVE *and* the ASSET file** (applies live, then persists that asset — NOT the scene) | `particle_set`, `anim_set_clip`, `anim_add_key` | both |
-| **ASSET file only** | `write_asset`, `create_asset`, `import_file`, `reimport_asset` | disk |
+| **SCENE FILE, or LIVE — depends on the session's persistence mode** | `set_transform`, `mutate_scene`, `validate_scene` (reads) | see **Persistence modes** below |
+| **LIVE *and*, depending on mode, the ASSET file** | `particle_set`, `anim_set_clip`, `anim_add_key`, `timeline_set`, `timeline_add_clip` | RAM always; disk depends on mode (see below) |
+| **ASSET file only** | `write_asset`, `create_asset`, `import_file`, `reimport_asset` | disk, unconditionally — unaffected by persistence mode |
 | **ASSET file *and* the LIVE world** | `prefab` (**create** → writes the `.prefab.json` **and** tags the source entities as a `PrefabInstance` in the live world, **unsaved** — run `save_all` to persist that linkage into the scene, or a reload discards it) | disk + RAM |
-| **Both worlds** | `save_all` (live → disk), `load_scene` / `new_scene` (disk → live, **replacing** the live world) | — |
+| **Both worlds** | `save_all` (live → disk, **and flushes any pending dirty assets — see below**), `load_scene` / `new_scene` (disk → live, **replacing** the live world) | — |
 | **Reads the LIVE world** | `get_scene_state`, `get_layout_bounds`, `watch`, `journal`, `diagnose`, `capture_viewport`, `capture_gesture`, `get_editor_state` | — |
 | **Reads the FILE** | `build`, `list_scenes`, `list_assets` | — |
 
@@ -204,9 +203,58 @@ save_all        → now the file has it
 set_transform   → ok
 ```
 
+That failure mode is now mostly historical for `set_transform`/`mutate_scene` specifically —
+see **Persistence modes** below — but it still applies verbatim to `particle_set`/`anim_*`/
+`timeline_*` in 'auto' mode, and to any tool reaching a scene FILE that isn't the one the
+editor has open live.
+
 **Why not just auto-save?** Because the editor is a *shared* surface: an implicit save would
 commit the human collaborator's unrelated unsaved work. A surprise write is worse than a
 clear error, so file tools **fail with the fix in the message** instead.
+
+### Persistence modes — `auto` vs `manual` (mcp-persistence.md)
+
+Every mutating tool's result carries a `saved: true|false` field so you never have to *infer*
+whether an edit reached disk. `modoki_persistence` reads or sets the session-wide mode
+(`{mode?}` — bare call reads; `mode: 'auto'|'manual'` sets it for every later call this
+session), and `modoki_get_editor_state` echoes it as `persistenceMode`.
+
+- **`auto` (default)** — the original per-tool behaviour, unchanged: `mutate_scene`/
+  `set_transform` write the scene FILE directly (unless a renderer is connected on the exact
+  scene being edited — see below); `particle_set`/`anim_set_clip`/`anim_add_key`/
+  `timeline_set`/`timeline_add_clip` apply live AND save their asset file immediately;
+  `write_asset`/`create_asset` always write the file; the live-world entity/prefab tools never
+  save (unchanged either way — this split predates and is orthogonal to the mode knob).
+- **`manual`** — the SAME edits become live-only, parked until an explicit `save_all`:
+  - `mutate_scene`/`set_transform`, when a renderer is connected and has this exact scene
+    open, apply to the LIVE world as **one undoable step** (a human can Cmd-Z the whole
+    tool call, not just its last op) instead of touching the file.
+  - `particle_set`/`anim_*`/`timeline_*` still apply live immediately (so the panel/viewport
+    updates), but the disk write is parked in a **dirty-asset registry** instead of happening
+    right away.
+  - `write_asset`/`create_asset` are unaffected by the mode either way — they are explicit
+    "write this file" tools, not live-state edits.
+  - `save_all` flushes BOTH: it serializes the live scene to its file and, alongside that,
+    writes out every pending dirty asset (each via the same validated `/api/asset-write`
+    route those tools already use). A `path -> doc` entry that fails to write is **left
+    pending** (never silently dropped) and reported in the result's `assets.failed`; entries
+    that succeed move to `assets.saved`.
+  - `get_editor_state`'s `dirtyAssetPaths` (omitted when empty) lists exactly which asset
+    paths are pending — the Percept surface for "what would `load_scene`/discard destroy?",
+    matching what `unsavedChanges` already does for live scene edits. `hasUnsavedChanges`
+    (and therefore the `load_scene`/`new_scene` unsaved-work guard) is `true` while ANY
+    dirty asset is pending, even if the scene itself has no pending edit.
+
+**`mutate_scene`/`set_transform`'s live-world path has a fallback, not a hard requirement**:
+when no editor is connected, or the call targets a scene FILE that ISN'T the one currently
+open live, or an op is `setBaseScene` (no live-world equivalent — it changes what the scene
+*loads*, not any live entity's state), the call falls back to the FILE-DIRECT write exactly as
+before (today's browser-free curl-editing path stays intact). This is why `saved` and `mode`
+are always in the result — trust them over assuming which path a given call took.
+
+A per-call `save?: boolean` param exists on every mutating tool's schema, reserved for a
+future per-call override of the session mode — **not yet honored** by this build; the session
+mode (`modoki_persistence`) is the only thing that currently changes behaviour.
 
 ### The corollaries (each was a real, silent bug the MCP re-audit closed)
 
@@ -216,11 +264,15 @@ clear error, so file tools **fail with the fix in the message** instead.
   live-world mutator accepts it: `delete_entities`/`duplicate_entity`/`reparent_entity`/`focus_entity`/
   `set_selection` (and `create_entity`'s parent, `prefab`'s entity/parent) take `guid`/`guids` (wins
   over `id`), as `mutate_scene`/`set_transform`/`get_scene_state {guid}` already did.
-- **`load_scene`/`new_scene`/`mutate_scene`/`set_transform` REFUSE when there is unsaved live work.**
-  load/new would replace the live world; `mutate_scene`/`set_transform` edit the FILE, and the write
-  hot-reloads the scene — rebuilding the live world and destroying live-only entities (create_entity/
-  prefab) not yet saved. `save_all` first, then the reload is lossless. (`load_scene`/`new_scene` take
-  `force: true` to discard deliberately.)
+- **`load_scene`/`new_scene` REFUSE when there is unsaved live work** (a scene edit OR a
+  pending dirty asset) — both would replace/discard it. `save_all` first, then the reload is
+  lossless. (`force: true` discards deliberately.) `mutate_scene`/`set_transform` used to carry
+  the SAME refusal for the mirror-image reason (their file write would hot-reload the scene and
+  destroy unsaved live-only entities) — that guard is now unreachable in practice: whenever a
+  renderer is connected on the targeted scene, the call goes through the LIVE world first (see
+  **Persistence modes** above), so it *joins* whatever unsaved work already existed instead of
+  destroying it. The guard still fires for genuine file-direct calls (no renderer, wrong scene,
+  or `setBaseScene`).
 - **`build` REFUSES on unsaved changes** — it reads the FILE, so the artifact would be
   missing your work. `force: true` builds the on-disk scene deliberately.
 - **`save_all` after `new_scene` needs `{path}`** — there is no path yet, and the Save-As
@@ -266,8 +318,8 @@ across the drill-downs). Full design + the measured per-tool budgets: [mcp-respo
 ## Percept — verify by data, not pixels
 
 **Claude is weak at visual feel — give it numbers/events.** This is **Percept**, the engine's
-AI-perception layer (full design/tracker: [percept-plan.md](./percept-plan.md)). Three
-primitives × two subjects: **Snapshot** ("what's true now?" — `get_scene_state`/`get_layout_bounds`/
+AI-perception layer. Three primitives × two subjects: **Snapshot** ("what's true now?" —
+`get_scene_state`/`get_layout_bounds`/
 `diagnose`/`get_editor_state`), **Journal** ("what happened, in order?" — `journal`/`editor_journal`),
 **Watch** ("how did this number move?" — `watch`); over the **game world** AND the **editor session**
 (what your human collaborator is doing). Provenance **sigil** on every journal event: `@` = engine-
@@ -365,6 +417,11 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   (`247.13061935179246` → `247.130619`; max error 3.5e-7) — ~18–21% of the tokens on a Transform
   drill-down. **Verify an edit with a TOLERANCE, not `===`.** `precision=0` returns exact float64;
   the same param exists on `get_layout_bounds` and `watch`.
+
+Percept is feature-complete for v2 (Snapshot/Journal/Watch/Editor-Percept all shipped, tested,
+adversarially reviewed). One item is deliberately deferred: a `debug|profile|release` journal-mode
+enum to replace the current `enableJournal` boolean (now `build.debugBuild`) — not worth building
+until a profiler gives `"profile"` a second real consumer.
 
 ## Enact — act like a human, not just read like one
 
@@ -529,6 +586,17 @@ guess. Chrome is a browser-tab renderer loop only, never the editor debugger.
 bounds read and a tap invalidates the coordinates. Nearly every "the tool is broken" moment has been a
 stale read, not a bug. `selector`/`tap_handle` resolve inside the call and don't have this problem.
 
+**Coordinate space under UI zoom.** The editor supports app-wide UI zoom (see
+[editor.md](./editor.md) "UI Zoom") via Electron's `webContents` zoom. The **public coordinate
+space for every MCP tool is zoomed-CSS** — the same space `getBoundingClientRect`, `selector`
+resolution, `screenBounds`, and `interactionHandles` already report, so nothing above changes
+under zoom: pass a `selector` or `{x,y}` from `get_scene_state?bounds=1` as usual. Internally,
+`rendererOps.ts` converts that public coordinate to DIP (`×getZoomFactor()`) at the one seam
+where it meets `sendInputEvent`, since Chromium's trusted-input API expects zoom-0 DIP px — this
+conversion is transparent to callers. The one residual mismatch is `modoki_capture_viewport`'s
+reported `cssWidth`/`scale`, which describe the image in DIP, not zoomed-CSS — so an `{x,y}`
+eyeballed off a capture (already discouraged above) is off by the zoom factor when zoom ≠ 100%.
+
 **Which editor is `MODOKI_BACKEND` pointing at?** Multiple clones of this repo run side by side, each with
 its own editor on its own port. Pointed at the wrong one, **every call succeeds and drives the other
 checkout** — nothing errors, nothing you expect changes. `modoki_identity` (or `GET /api/identity`)
@@ -582,8 +650,9 @@ Standalone Capacitor plugin at `engine/packages/capacitor-game-debug/`. Runs a T
   TCP server.
 - **JS bridge** (`app/main.tsx` → `./debug/bridge`, which carries `handleEval` = arbitrary JS) —
   gated by the single `build.debugBuild` project flag (Project Settings → Developer — the same flag
-  that also gates the event journal and the in-game debug menu, see [percept-plan.md](./percept-plan.md)
-  Decision D), baked as `__MODOKI_DEBUG_BUILD__`. Default **false** → the whole `./debug/bridge` import
+  that also gates the event journal and the in-game debug menu; the `debug|profile|release` mode enum
+  once floated to replace this boolean is deliberately deferred, see "Percept" above), baked as
+  `__MODOKI_DEBUG_BUILD__`. Default **false** → the whole `./debug/bridge` import
   tree-shakes out of a shipped game build (native AND web), so there is no eval-capable JS server at
   all; the editor + dev keep it always-on. This is the layer that also covers the web
   (`VITE_DEBUG_BRIDGE`) path and closes the pre-existing gap where the JS bridge was ungated on

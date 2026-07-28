@@ -8,10 +8,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render, cleanup, fireEvent } from '@testing-library/react';
 import { getCurrentWorld } from '@modoki/engine/runtime';
-import { Time } from '../../packages/modoki/src/runtime/traits/Time';
-import { getTimeScale } from '../../packages/modoki/src/runtime/systems/getTime';
-import { emit, clearJournal, setJournalEnabled } from '../../packages/modoki/src/runtime/systems/journal';
-import { registerReadSource } from '../../packages/modoki/src/runtime/ui/readSourceRegistry';
+import { Time } from '../../packages/modoki/src/runtime/core/traits/Time';
+import { getTimeScale } from '../../packages/modoki/src/runtime/core/getTime';
+import { emit, clearJournal, setJournalEnabled } from '../../packages/modoki/src/runtime/core/journal';
+import { registerReadSource } from '../../packages/modoki/src/runtime/core/readSourceRegistry';
 import { TimeTab } from '../../packages/modoki/src/runtime/debug/tabs/TimeTab';
 import { JournalTab } from '../../packages/modoki/src/runtime/debug/tabs/JournalTab';
 import { StoreTab } from '../../packages/modoki/src/runtime/debug/tabs/StoreTab';

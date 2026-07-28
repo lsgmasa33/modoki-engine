@@ -22,8 +22,8 @@ import {
 } from './types';
 import { CpuParticleSim } from './cpuSimulator';
 import { createPixiParticles, type PixiParticleObject } from './pixiParticleObject';
-import { resolveImageUrl } from '../rendering/renderUtils';
-import { ensurePixiKtxTranscoder } from '../rendering/pixiKtxTranscoder';
+import { resolveImageUrl } from '../core/textureRefs';
+import { textureProvider } from '../core/textureProvider';
 
 /** The 2D (PixiJS) particle backend contract: the renderer-agnostic core plus the PixiJS
  *  `Container` to mount (the 2D counterpart of {@link IParticleBackend}'s `getObject3D`). */
@@ -97,7 +97,7 @@ export class PixiParticleBackend implements IParticle2DBackend {
     if (!ref || typeof window === 'undefined') return; // headless: no async texture load
     const url = resolveImageUrl(ref);
     if (!url) return;
-    ensurePixiKtxTranscoder(); // idempotent; registers the KTX2 loader before we fetch one
+    textureProvider.get()?.ensurePixiKtxTranscoder(); // idempotent; registers the KTX2 loader before we fetch one
     // Lazy import Assets so a headless/test import of this module doesn't require a browser.
     import('pixi.js')
       .then(({ Assets }) => Assets.load(url))

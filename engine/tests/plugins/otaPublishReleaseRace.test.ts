@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { execFileSync } from 'child_process';
 
 const engineRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -131,9 +131,19 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
     fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
 
     binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-'));
-    const gcloudPath = path.join(binDir, 'gcloud');
-    fs.writeFileSync(gcloudPath, FAKE_GCLOUD_SRC);
-    fs.chmodSync(gcloudPath, 0o755);
+    // The fake `gcloud` must be executable by NAME off PATH on both platforms.
+    // POSIX: an extensionless shebang script chmod +x. Windows: cmd.exe cannot run a
+    // shebang script and ignores the +x bit entirely, and only resolves names carrying
+    // a PATHEXT extension — so ship the body as .cjs plus a .cmd shim that invokes node.
+    if (process.platform === 'win32') {
+      // .cjs, not .mjs — FAKE_GCLOUD_SRC is CommonJS (it uses require()).
+      fs.writeFileSync(path.join(binDir, 'gcloud.cjs'), FAKE_GCLOUD_SRC);
+      fs.writeFileSync(path.join(binDir, 'gcloud.cmd'), `@node "%~dp0gcloud.cjs" %*\r\n`);
+    } else {
+      const gcloudPath = path.join(binDir, 'gcloud');
+      fs.writeFileSync(gcloudPath, FAKE_GCLOUD_SRC);
+      fs.chmodSync(gcloudPath, 0o755);
+    }
 
     bucketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-bucket-'));
     distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-race-dist-'));
@@ -151,7 +161,7 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
   function publish(name: string, version: string, envOverrides: NodeJS.ProcessEnv = {}, extraArgs: string[] = []) {
     return runNode(repoRoot, {
       ...process.env,
-      PATH: `${binDir}:${process.env.PATH}`,
+      PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
       FAKE_GCS_BUCKET_DIR: bucketDir,
       FAKE_GCS_RACE_FLAG: raceFlag,
       ...envOverrides,
@@ -171,15 +181,20 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
     const keyDir = path.join(root, 'build', 'ota-keys');
     fs.mkdirSync(keyDir, { recursive: true });
     const signingPath = path.join(repoRoot, 'engine', 'scripts', 'ota', 'signing.mjs');
+    // MUST be a file:// URL, not the raw fs path. On Windows an absolute path like
+    // `E:\…\signing.mjs` is not a valid ESM specifier — Node reads the drive letter as a
+    // URL scheme and throws ERR_UNSUPPORTED_ESM_URL_SCHEME — and its backslashes would
+    // additionally be mangled as escape sequences inside the generated source string.
+    const signingUrl = pathToFileURL(signingPath).href;
     const out = execFileSync('node', ['--input-type=module', '-e',
-      `import { generateKeypair } from ${JSON.stringify(signingPath)}; process.stdout.write(JSON.stringify(generateKeypair()));`,
+      `import { generateKeypair } from ${JSON.stringify(signingUrl)}; process.stdout.write(JSON.stringify(generateKeypair()));`,
     ], { encoding: 'utf8' });
     fs.writeFileSync(path.join(keyDir, `${name}.json`), out);
   }
 
   it('retries once and merges correctly when a concurrent writer races the first upload attempt', () => {
     // Seed a real key via the actual ota-keygen.mjs (it's cheap and exercises real code).
-    const keygenEnv = { ...process.env, PATH: `${binDir}:${process.env.PATH}` };
+    const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
     execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
 
     // First publish: creates release.json fresh (no race — flag absent).
@@ -200,7 +215,7 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
   });
 
   it('publishes cleanly with no retry when nothing races it', () => {
-    const keygenEnv = { ...process.env, PATH: `${binDir}:${process.env.PATH}` };
+    const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
     execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
 
     const result = publish('shell', 'v1');
@@ -214,7 +229,7 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
     // A key generated at the script's own default repoRoot must NOT be visible when an
     // explicit --repo-root points elsewhere — proving the override actually takes effect
     // rather than being silently ignored in favor of import.meta.url's own guess.
-    const keygenEnv = { ...process.env, PATH: `${binDir}:${process.env.PATH}` };
+    const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
     execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
 
     const otherRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-other-root-'));

@@ -9,11 +9,11 @@
  *           param widgets from the action's declared schema or one freeform payload. */
 
 import { useState, useMemo } from 'react';
-import { readTraitData } from '../../runtime/ecs/entityUtils';
-import { getCurrentWorld } from '../../runtime/ecs/world';
-import { type TraitMeta, getTraitByName, getAllTraits } from '../../runtime/ecs/traitRegistry';
+import { readTraitData } from '../../runtime/core/ecs/entityUtils';
+import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { type TraitMeta, getTraitByName, getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { writeTraitFieldPerEntityWithUndo as writeFieldPerEntity } from '../undo/entityActions';
-import { getUIActionNames, getUIActionParams } from '../../runtime/ui/actionRegistry';
+import { getUIActionNames, getUIActionParams } from '../../runtime/core/actionRegistry';
 import type { UIActionBinding, UIActionEvent, UIActionKind } from '../../runtime/ui/bindings';
 import { VALUE_TOKEN } from '../../runtime/ui/bindings';
 import { BufferedTextInput, inputStyle, MIXED_PLACEHOLDER } from './fields';

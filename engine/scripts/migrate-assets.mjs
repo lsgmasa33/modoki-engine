@@ -4,7 +4,7 @@
  *
  * Loads all scene files (under a `scenes/` dir + the e2e fixtures) and all prefab files
  * (`*.prefab.json`), applies the field migrations below, and stamps each SCENE with the
- * current `SCENE_FORMAT_VERSION` (read from `runtime/version.ts` — the single source of
+ * current `SCENE_FORMAT_VERSION` (read from `runtime/core/version.ts` — the single source of
  * truth, so this tool never goes stale). Prefab files carry an independent schema
  * `version` and are NOT version-stamped here; their trait data is still migrated.
  *
@@ -13,7 +13,7 @@
  * here. Idempotent — safe to re-run; it rewrites a file only when something changed.
  *
  * Adding a future migration: extend `TRANSFORMS` with another deep transform and bump
- * `SCENE_FORMAT_VERSION` in `runtime/version.ts`; re-running this tool upgrades every
+ * `SCENE_FORMAT_VERSION` in `runtime/core/version.ts`; re-running this tool upgrades every
  * committed file in place.
  *
  * Usage:  node engine/scripts/migrate-assets.mjs [--dry]
@@ -27,9 +27,9 @@ const DRY = process.argv.includes('--dry');
 
 // ── Current scene format version (single source of truth) ──────────────────────────
 const versionSrc = readFileSync(
-  path.join(REPO_ROOT, 'engine/packages/modoki/src/runtime/version.ts'), 'utf8');
+  path.join(REPO_ROOT, 'engine/packages/modoki/src/runtime/core/version.ts'), 'utf8');
 const m = versionSrc.match(/SCENE_FORMAT_VERSION\s*=\s*(\d+)/);
-if (!m) { console.error('could not read SCENE_FORMAT_VERSION from runtime/version.ts'); process.exit(1); }
+if (!m) { console.error('could not read SCENE_FORMAT_VERSION from runtime/core/version.ts'); process.exit(1); }
 const SCENE_FORMAT_VERSION = Number(m[1]);
 
 // ── Field transforms (mirror loadSceneFile.ts migrations) ──────────────────────────

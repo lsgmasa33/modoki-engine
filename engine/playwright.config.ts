@@ -25,7 +25,29 @@ export default defineConfig({
   timeout: 60_000,
   expect: { timeout: 15_000 },
   fullyParallel: true,
-  workers: 4,
+  // SERIAL ON PURPOSE — do not raise this back to 4 for speed.
+  //
+  // `webServer` below spins up ONE dev server, so every worker drives the SAME editor
+  // instance: one scene, one selection, one undo stack, one asset manifest. Specs that
+  // load scenes, select entities and POST /api/write-file therefore stomp on each other,
+  // and at `workers: 4` the suite failed nondeterministically — measured on one commit,
+  // back to back: 2 failed / 44 passed, then 46/46 green, no code change between them.
+  // The flakes were never one bad spec (editor-collider-mode, editor-assets:153 twice,
+  // editor-2d-ui:12, editor-model-import:53 have all taken a turn) and every one passed
+  // when re-run alone — the signature of contention, not of a broken test.
+  //
+  // That cost real time twice, in separate sessions, because a red e2e run is
+  // indistinguishable from a genuine regression until you re-run it. e2e is also
+  // deliberately NOT CI-gated (see CLAUDE.md), so it is the only thing watching editor
+  // interaction — a gate you have to second-guess is worse than a slow one.
+  //
+  // And serial costs ~6%: measured 4m51s for all 46 specs here, vs 4.5-4.9m at `workers: 4`.
+  // The parallelism was buying almost nothing precisely BECAUSE the workers were contending.
+  //
+  // `retries` stays 0 deliberately: retrying would paper over exactly the signal this
+  // suite exists to give. The real fix is per-worker isolation (a dev server each), which
+  // would let this go parallel again; until then, serial. See docs/todo.md.
+  workers: 1,
   retries: 0,
   reporter: [['list']],
   use: {

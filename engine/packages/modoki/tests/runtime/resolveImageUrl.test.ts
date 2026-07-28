@@ -10,12 +10,12 @@
 import { readFileSync } from 'node:fs';
 import { describe, it, expect, vi } from 'vitest';
 
-vi.mock('../../src/runtime/loaders/textureResolver', () => ({
-  resolveTextureVariantUrl: vi.fn((ref: string, usage: string) => (usage === '2d' ? `/variant/${ref}.webp` : `/wrong/${ref}`)),
+const resolveTextureVariantUrl = vi.fn((ref: string, usage: string) => (usage === '2d' ? `/variant/${ref}.webp` : `/wrong/${ref}`));
+vi.mock('../../src/runtime/core/textureProvider', () => ({
+  textureProvider: { get: () => ({ resolveTextureVariantUrl }) },
 }));
 
 const { resolveImageUrl } = await import('../../src/runtime/rendering/renderUtils');
-const { resolveTextureVariantUrl } = await import('../../src/runtime/loaders/textureResolver');
 
 describe('resolveImageUrl', () => {
   it('routes a ref through the 2D (WebP) texture variant', () => {

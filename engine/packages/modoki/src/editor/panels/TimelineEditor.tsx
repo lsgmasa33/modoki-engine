@@ -12,19 +12,19 @@ import { backendFetch } from '../backend/editorBackend';
 import { useEditorStore } from '../store/editorStore';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
-import { getCurrentWorld, onWorldSwap } from '../../runtime/ecs/world';
+import { getCurrentWorld, onWorldSwap } from '../../runtime/core/ecs/world';
 import { resolveDirectorRootForTimeline } from './openAssetInEditor';
-import { fireDirtyListeners, findEntity } from '../../runtime/ecs/entityUtils';
+import { fireDirtyListeners, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { Director } from '../../runtime/traits/Director';
 import { newGuid, registerAsset, getAllAssets } from '../../runtime/loaders/assetManifest';
-import { getUIActionNames } from '../../runtime/ui/actionRegistry';
+import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { advanceClipTime } from '../../runtime/animation/sampleClip';
-import { previewTimelineAt, previewTimelineStep, previewControlAt, clearPreviewControls } from '../../runtime/systems/timelineSystem';
+import { previewTimelineAt, previewTimelineStep, previewControlAt, clearPreviewControls } from '../../runtime/timeline/timelineSystem';
 import {
   beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession, setTimelinePreviewActive,
 } from '../scene/timelinePreview';
 import { enterScrubMode, enterPreviewMode, exitPreviewMode } from '../scene/playMode';
-import { getRunMode, isAdvancing, onRunModeChange } from '../../runtime/systems/playState';
+import { getRunMode, isAdvancing, onRunModeChange } from '../../runtime/core/playState';
 import {
   defaultTimeline, normalizeTimeline,
   type TimelineDef, type TrackDef, type TrackKind,

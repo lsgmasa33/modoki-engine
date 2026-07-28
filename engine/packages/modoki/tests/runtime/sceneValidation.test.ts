@@ -2,7 +2,7 @@
  *  the GUID asset-reference rule. Pure module, no world needed. */
 
 import { describe, it, expect } from 'vitest';
-import { validateSceneData, type SceneSchema } from '../../src/runtime/scene/sceneValidation';
+import { validateSceneData, type SceneSchema } from '../../src/runtime/loaders/sceneValidation';
 
 const GUID = 'a1b2c3d4-1111-2222-3333-444455556666';
 
@@ -31,6 +31,15 @@ const schema: SceneSchema = {
     MaterialInstance: {
       category: 'component',
       fields: { overrides: { type: 'materialOverrides' } },
+    },
+    PrefabInstance: {
+      category: 'component',
+      fields: {
+        source: { type: 'string' },
+        localId: { type: 'number' },
+        rootInstanceId: { type: 'number' },
+        parentLocalId: { type: 'number' },
+      },
     },
     Persistent: { category: 'tag', fields: {} },
   },
@@ -148,6 +157,17 @@ describe('validateSceneData — schema checks', () => {
       { id: 3, name: 'P', traits: { EntityAttributes: {} } },
     ]), schema);
     expect(legacyParent.warnings.join('\n')).not.toMatch(/parentId/);
+  });
+
+  it('accepts PrefabInstance.rootInstanceId as a GUID string (serialized form, Phase 2, scene-loading.md) or a legacy number', () => {
+    const guidForm = validateSceneData(scene([
+      { id: 1, name: 'Root', guid: GUID, traits: { EntityAttributes: { parentId: '' }, PrefabInstance: { source: GUID, rootInstanceId: GUID } } },
+    ]), schema);
+    expect(guidForm.warnings.join('\n')).not.toMatch(/rootInstanceId/);
+    const legacyForm = validateSceneData(scene([
+      { id: 1, name: 'Root', traits: { PrefabInstance: { source: GUID, rootInstanceId: 1 } } },
+    ]), schema);
+    expect(legacyForm.warnings.join('\n')).not.toMatch(/rootInstanceId/);
   });
 
   it('treats a typeless field as known and skips type-checking it', () => {

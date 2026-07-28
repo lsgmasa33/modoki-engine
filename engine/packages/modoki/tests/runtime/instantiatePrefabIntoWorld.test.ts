@@ -46,13 +46,13 @@ const Library = trait(() => ({
 
 let testWorld: ReturnType<typeof createWorld>;
 
-vi.mock('../../src/runtime/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
   registerEntity: vi.fn(),
   setStructureCallback: vi.fn(),
 }));
 
-vi.mock('../../src/runtime/ecs/traitRegistry', () => {
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
   const traits = [
     { name: 'Transform', trait: Transform, category: 'component', fields: { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 } },
     { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: '', parentId: 0 } },

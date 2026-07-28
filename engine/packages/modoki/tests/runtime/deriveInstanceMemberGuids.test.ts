@@ -3,7 +3,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createWorld } from 'koota';
 import { EntityAttributes, PrefabInstance } from '../../src/runtime/traits';
-import { registerTrait } from '../../src/runtime/ecs/traitRegistry';
+import { registerTrait } from '../../src/runtime/core/ecs/traitRegistry';
 import { deriveInstanceMemberGuids } from '../../src/runtime/loaders/loadSceneFile';
 import { deriveGuid, isGuid } from '../../src/runtime/loaders/assetManifest';
 

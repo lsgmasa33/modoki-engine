@@ -1,5 +1,5 @@
 import { trait } from 'koota';
-import type { CurvePoint } from '../particles/types';
+import type { CurvePoint } from '../core/curves';
 
 /** MaterialInstance — Unity `.material` / Unreal Material Instance Dynamic.
  *

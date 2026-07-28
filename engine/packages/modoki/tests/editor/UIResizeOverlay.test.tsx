@@ -51,10 +51,10 @@ const fakeEntity = {
   id: () => 2,
   name: '2D Canvas',
 };
-vi.mock('../../src/runtime/ecs/entityUtils', () => ({
+vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   findEntity: (id: number) => (id === 2 ? fakeEntity : null),
 }));
-vi.mock('../../src/runtime/ecs/traitRegistry', () => ({
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getAllTraits: () => [
     { name: 'UIElement', trait: 'UIElement' },
     { name: 'UIAnchor', trait: 'UIAnchor' },

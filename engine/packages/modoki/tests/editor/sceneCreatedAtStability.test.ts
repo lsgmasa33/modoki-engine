@@ -19,7 +19,7 @@ const EntityAttributes = trait({
   layer: '' as '' | '3d' | '2d' | 'ui', guid: '', sourceScene: '',
 });
 
-vi.mock('../../src/runtime/ecs/traitRegistry', () => {
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
   const traits = [
     { name: 'Transform', trait: Transform, category: 'component', fields: { x: {}, y: {}, z: {}, rx: {}, ry: {}, rz: {}, sx: {}, sy: {}, sz: {} } },
     { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: {}, isActive: {}, sortOrder: {}, parentId: { entityId: { onMissing: 'root' } }, layer: {}, guid: {}, sourceScene: { hidden: true, runtimeOnly: true } } },
@@ -81,7 +81,7 @@ beforeEach(async () => {
     '/base.json': sceneOf('BaseThing', { id: BASE_GUID, createdAt: BASE_CREATED_AT }),
   };
   const { Persistent } = await import('../../src/runtime/traits/Persistent');
-  const { getAllTraits } = await import('../../src/runtime/ecs/traitRegistry');
+  const { getAllTraits } = await import('../../src/runtime/core/ecs/traitRegistry');
   const meta = getAllTraits().find((m: { name: string }) => m.name === 'Persistent');
   if (meta) (meta as { trait: unknown }).trait = Persistent;
   const manifest = await import('../../src/runtime/loaders/assetManifest');

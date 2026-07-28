@@ -7,9 +7,9 @@ import type { ReactNode } from 'react';
 import { useUIEntities } from './useUIEntities';
 import { UINode } from './UINode';
 import { markUIDirty } from './uiTreeStore';
-import { onPlayStateChange } from '../systems/playState';
+import { onPlayStateChange } from '../core/playState';
 import { useFocusStore, consumePendingActivation } from './focusManager';
-import { getCurrentWorld } from '../ecs/world';
+import { getCurrentWorld } from '../core/ecs/world';
 
 interface UIRendererProps {
   /** Store state object for binding resolution (typically from useGameStore) */

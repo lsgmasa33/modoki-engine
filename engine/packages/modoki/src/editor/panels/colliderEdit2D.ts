@@ -6,8 +6,8 @@
  *  handles are drawn by mapping each point through the entity's world Transform, and a
  *  pointer position is mapped back to local before editing the list. */
 
-import type { Pt } from '../../runtime/scene/colliderPoints';
-import { parseColliderPoints, minPointsForShape } from '../../runtime/scene/colliderPoints';
+import type { Pt } from '../../runtime/core/colliderPoints';
+import { parseColliderPoints, minPointsForShape } from '../../runtime/core/colliderPoints';
 import { colliderOutline2D, type ColliderShapeParams } from '../../runtime/rendering/colliderOutline2D';
 
 /** Origin-centered AABB half-extents that fully contain a collider's outline — used to

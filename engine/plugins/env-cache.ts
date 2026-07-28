@@ -6,7 +6,7 @@
 import fs from 'fs';
 import path from 'path';
 import { createHash } from 'crypto';
-import type { EnvImportSettings } from '../packages/modoki/src/runtime/loaders/environmentSettings';
+import type { EnvImportSettings } from '../packages/modoki/src/runtime/core/environmentSettings';
 
 /** Bump when the encoder / downscale recipe changes so stale entries regenerate. */
 export const ENV_ENCODER_VERSION = 'env-1';

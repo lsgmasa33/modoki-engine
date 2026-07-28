@@ -24,15 +24,23 @@ vi.mock('../../src/runtime/audio/audioContext', async (importOriginal) => ({
 }));
 
 // Controllable buffer cache: a clip is "decoded" only once it's in the `decoded` set.
-vi.mock('../../src/runtime/loaders/audioBufferCache', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../src/runtime/loaders/audioBufferCache')>();
-  return { ...actual, getCachedAudioBuffer: (ref: string) => (decoded.has(ref) ? ({} as AudioBuffer) : undefined) };
+// audioSystem now reaches audio-asset lookups via the audio/audioAssetProvider slot (P7 C12)
+// rather than importing loaders/audioBufferCache directly, so the provider is mocked here
+// instead — real resolveAudioUrl/retryFailedAudioDecodes/getAudioLoadType underneath.
+vi.mock('../../src/runtime/audio/audioAssetProvider', async () => {
+  const { resolveAudioUrl, retryFailedAudioDecodes } = await import('../../src/runtime/loaders/audioBufferCache');
+  const { getAudioLoadType } = await import('../../src/runtime/loaders/assetManifest');
+  const impl = {
+    getCachedAudioBuffer: (ref: string) => (decoded.has(ref) ? ({} as AudioBuffer) : undefined),
+    resolveAudioUrl, retryFailedAudioDecodes, getAudioLoadType,
+  };
+  return { audioAssetProvider: { get: () => impl } };
 });
 
-import { audioSystem } from '../../src/runtime/systems/audioSystem';
+import { audioSystem } from '../../src/runtime/audio/audioSystem';
 import { cueClip } from '../../src/runtime/audio/audioCues';
 import { getAudioLog, clearAudioLog, setAudioRecordMode } from '../../src/runtime/audio/audioService';
-import { setPlayState } from '../../src/runtime/systems/playState';
+import { setPlayState } from '../../src/runtime/core/playState';
 import { registerAsset, newGuid, clearManifest } from '../../src/runtime/loaders/assetManifest';
 
 function mintClip(): string {

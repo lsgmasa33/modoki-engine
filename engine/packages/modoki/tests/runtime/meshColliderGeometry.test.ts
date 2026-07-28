@@ -3,8 +3,8 @@ import * as THREE from 'three';
 import {
   colliderPositions, colliderIndices, geometryBoxHalfExtents, geometryBoundingRadius,
   buildMeshColliderDescs,
-} from '../../src/runtime/systems/meshColliderGeometry';
-import { initRapier3D, getRapier3D } from '../../src/runtime/systems/rapier3DLoader';
+} from '../../src/runtime/physics/meshColliderGeometry';
+import { initRapier3D, getRapier3D } from '../../src/runtime/physics/rapier3DLoader';
 
 describe('meshColliderGeometry — pure extraction', () => {
   it('colliderPositions extracts + scales vertices (robust to indexed/interleaved)', () => {

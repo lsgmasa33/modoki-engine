@@ -8,8 +8,8 @@
  *  the Animation panel; here you only pick which clips exist and which one plays. */
 
 import { useState } from 'react';
-import { findEntity } from '../../runtime/ecs/entityUtils';
-import { type TraitMeta } from '../../runtime/ecs/traitRegistry';
+import { findEntity } from '../../runtime/core/ecs/entityUtils';
+import { type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import {
   writeTraitFieldPerEntityWithUndo as writeFieldPerEntity,
   writeTraitFieldsPerEntityWithUndo as writeTraitFields,

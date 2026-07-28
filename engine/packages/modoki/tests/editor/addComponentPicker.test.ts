@@ -4,8 +4,8 @@
  *  and the by-name sort within each bucket. No React / live world needed. */
 
 import { describe, it, expect } from 'vitest';
-import type { TraitMeta } from '../../src/runtime/ecs/traitRegistry';
-import { COMPONENT_CATEGORY_ORDER } from '../../src/runtime/ecs/traitRegistry';
+import type { TraitMeta } from '../../src/runtime/core/ecs/traitRegistry';
+import { COMPONENT_CATEGORY_ORDER } from '../../src/runtime/core/ecs/traitRegistry';
 import { filterAndGroupAddable } from '../../src/editor/panels/AddComponentPicker';
 
 // Minimal TraitMeta stubs — the builder only reads `name` + `componentCategory`.

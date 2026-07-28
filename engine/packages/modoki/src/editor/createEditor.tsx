@@ -10,16 +10,16 @@ if (import.meta.hot) import.meta.hot.accept(() => { window.location.reload(); })
  *  Games call this with their config, postprocessors, traits, and custom panels. */
 
 import React from 'react';
-import type { GameConfig } from '../runtime/config';
-import type { EditorPanelDef } from '../runtime/gameDefinition';
-import type { TraitMeta } from '../runtime/ecs/traitRegistry';
+import type { GameConfig } from '../runtime/core/config';
+import type { EditorPanelDef } from '../runtime/core/gameDefinition';
+import type { TraitMeta } from '../runtime/core/ecs/traitRegistry';
 import { registerModelPostprocessor, type ModelPostprocessor } from '../runtime/loaders/modelPostprocessorRegistry';
-import { registerTrait } from '../runtime/ecs/traitRegistry';
-import { setGameConfig } from '../runtime/config';
-import { getCurrentWorld, registerEntity } from '../runtime/ecs/world';
+import { registerTrait } from '../runtime/core/ecs/traitRegistry';
+import { setGameConfig } from '../runtime/core/config';
+import { getCurrentWorld, registerEntity } from '../runtime/core/ecs/world';
 import { Camera } from '../runtime/traits/Camera';
-import { Transform } from '../runtime/traits/Transform';
-import { EntityAttributes } from '../runtime/traits/EntityAttributes';
+import { Transform } from '../runtime/core/traits/Transform';
+import { EntityAttributes } from '../runtime/core/traits/EntityAttributes';
 import { loadScene, setCurrentScenePath, setScenePersistenceProject, lastSceneKey } from './scene/serialize';
 import { registerSelectionRestore } from './store/selectionRestore';
 import { registerLastAnimationClipPersistence, restoreLastAnimationClip } from './animation/lastAnimationClip';
@@ -69,12 +69,49 @@ export function resolveSceneCandidates(lastScene: string | null | undefined, con
  *  unregistered scene) falls back to the raw candidate, preserving the dev `?url`
  *  behaviour. Requires the manifest to be loaded first. The `doFetch` injection
  *  point exists for unit testing. */
+// Matches a dev-mode `/@fs/<abs>/runtime/assets/<rest>` candidate — produced when
+// config.ts's `?url` import resolves OUTSIDE Vite's root — capturing `<rest>` so it can
+// be rewritten to the asset-scanner's `/assets/<rest>` convention for the OPEN project
+// (flat-project layout: `<projectRoot>/runtime/assets` → `/assets`).
+//
+// ⚠️ The match alone does NOT prove the file belongs to the open project. findAssetRoots
+// serves THREE roots that all end in `/runtime/assets/`: `/assets` (the open project),
+// `/modoki/assets` (the engine's built-ins), and `/<root>/<id>/assets` (every OTHER
+// project in a multi-project repo). Rewriting any of the latter two to `/assets/…` would
+// silently point at a same-named file under the open project — a wrong-file load, which
+// is worse than the boot failure this rewrite exists to prevent. So the rewrite must be
+// CONFIRMED against the manifest before it is used (see canonicalBootScenePath).
+const FS_RUNTIME_ASSETS_RE = /^\/@fs\/.*\/runtime\/assets\/(.+)$/;
+
 export async function canonicalBootScenePath(
   scenePath: string,
   doFetch: typeof fetch = fetch,
 ): Promise<string> {
   // Already a registered manifest path (the working-copy canonical) → nothing to do.
   if (getGuidForPath(scenePath)) return scenePath;
+  // A `/@fs/<abs>/runtime/assets/<rest>` candidate is ALREADY the working-copy file, so
+  // map it to `/assets/<rest>` instead of fetching it. That sidesteps a Windows-only Vite
+  // bug: `/@fs/`'s raw-static-file middleware strips the drive letter and serves via a
+  // root-relative `sirv`, so a project on a DIFFERENT DRIVE than the running Vite
+  // process's cwd 404s internally and silently falls through to the SPA `index.html`
+  // (a 200 OK `<!doctype …>` body) — which is why fetching it can't be trusted at all.
+  //
+  // Only accept the rewrite when the manifest actually registers it: an unregistered
+  // rewrite is discarded and we fall through, so the worst case stays the pre-existing
+  // boot failure rather than becoming a silent wrong-file load.
+  //
+  // KNOWN LIMITATION: this disambiguates by NAME, not by origin. A foreign-root candidate
+  // (engine built-in, or another project) whose tail happens to match a registered file of
+  // the open project would still be accepted as that file. Closing it properly needs the
+  // open project's ROOT here so the `/@fs/<abs>` prefix can be compared directly; the
+  // editor doesn't currently plumb it this far. Reachability is low — boot candidates come
+  // from the project's own config or its project-SCOPED `lastScene` key — so this is left
+  // as a documented gap rather than speculative plumbing.
+  const fsMatch = scenePath.match(FS_RUNTIME_ASSETS_RE);
+  if (fsMatch) {
+    const openProjectPath = `/assets/${fsMatch[1]}`;
+    if (getGuidForPath(openProjectPath)) return openProjectPath;
+  }
   try {
     const res = await doFetch(scenePath, { cache: 'no-store' });
     if (!res.ok) return scenePath;

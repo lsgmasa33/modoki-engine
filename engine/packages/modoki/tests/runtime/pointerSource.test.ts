@@ -13,7 +13,7 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { pointerSource } from '../../src/runtime/input/pointerSource';
-import { createInputFrame, computePointerEdge, type InputFrame } from '../../src/runtime/input/actions';
+import { createInputFrame, computePointerEdge, type InputFrame } from '../../src/runtime/core/inputActions';
 
 /** jsdom lacks a PointerEvent constructor in some versions — synthesize one that
  *  carries pointerId + clientX/clientY, dispatched as the given type. */

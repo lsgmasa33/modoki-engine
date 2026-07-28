@@ -10,11 +10,11 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { createWorld } from 'koota';
 import { sampleGamepadInto, type GamepadSnapshot } from '../../src/runtime/input/gamepadSource';
-import { createInputFrame, clampAxes } from '../../src/runtime/input/actions';
-import { inputSystem } from '../../src/runtime/systems/inputSystem';
+import { createInputFrame, clampAxes } from '../../src/runtime/core/inputActions';
+import { inputSystem } from '../../src/runtime/input/inputSystem';
 import { Input, getInput } from '../../src/runtime/traits/Input';
 import { registerSource, unregisterSource, type InputSource } from '../../src/runtime/input/inputSources';
-import { setPlayState } from '../../src/runtime/systems/playState';
+import { setPlayState } from '../../src/runtime/core/playState';
 
 /** Build a W3C standard-gamepad snapshot. `axes` defaults to centered sticks;
  *  `down` lists pressed button indices. */

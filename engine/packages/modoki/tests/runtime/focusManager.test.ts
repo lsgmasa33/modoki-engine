@@ -8,7 +8,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import {
   pickInDirection, pushScope, popScope, activeScope, setFocus, focusedGuid, resetFocus,
 } from '../../src/runtime/ui/focusManager';
-import type { ScreenRect } from '../../src/runtime/rendering/screenBounds';
+import type { ScreenRect } from '../../src/runtime/core/screenBounds';
 
 const rect = (x: number, y: number): ScreenRect => ({ x, y, w: 10, h: 10 });
 

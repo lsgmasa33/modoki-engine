@@ -2,25 +2,27 @@
 
 // Side-effect only, imported FIRST — see instanceGuard.ts. Detects two copies of this
 // runtime running side by side (OTA Phase 4's classic failure mode).
-import './instanceGuard';
+import './core/instanceGuard';
+// Side-effect only — wires every core/providerSlot.ts seam (P7 C8+). See its own header.
+import './loaders/registerProviders';
 
-export { ENGINE_VERSION, SCENE_FORMAT_VERSION, ENGINE_API_VERSION } from './version';
-export { getCurrentWorld, setCurrentWorld, onWorldSwap } from './ecs/world';
+export { ENGINE_VERSION, SCENE_FORMAT_VERSION, ENGINE_API_VERSION } from './core/version';
+export { getCurrentWorld, setCurrentWorld, onWorldSwap } from './core/ecs/world';
 export { hostCanvases, hostCanvasUnder } from './ui/hostCanvas';
 export type { World } from 'koota';
 export {
   registerTrait, getAllTraits, getTraitByName, getTraitMeta, inferFields,
   setNameTransform, transformName,
   type TraitMeta, type FieldHint, type FieldType,
-} from './ecs/traitRegistry';
+} from './core/ecs/traitRegistry';
 export {
   type GameConfig, setGameConfig, getGameConfig,
-} from './config';
-export type { GameDefinition, EditorPanelDef } from './gameDefinition';
+} from './core/config';
+export type { GameDefinition, EditorPanelDef } from './core/gameDefinition';
 export {
   registerAppServices, appServices, clearAppServices,
   type AppServices, type CrashlyticsService, type AdsService, type AttributionService,
-} from './appServices';
+} from './core/appServices';
 export {
   PlayerPrefs, InMemoryBackend, LocalStorageBackend, PreferencesBackend, selectDefaultBackend,
   type JsonValue, type PlayerPrefsInitOptions, type PrefsBackend,
@@ -57,7 +59,7 @@ export {
   findKeyIndex, applyTangentMode, autoTangents, type TangentMode,
 } from './animation/curveEval';
 export { applyClipAtTime, advanceClipTime } from './animation/sampleClip';
-export { resolveTrackTarget, buildEntityIndex, isEntityActiveInHierarchy, type EntityIndex } from './ecs/entityIndex';
+export { resolveTrackTarget, buildEntityIndex, isEntityActiveInHierarchy, type EntityIndex } from './core/ecs/entityIndex';
 export { switchableClipNames, ANIMATOR_CLIP_TRAITS } from './animation/switchableClips';
 export {
   getAnimationClip, setAnimationClip, invalidateAnimationClip, clearAnimationClipCache,
@@ -73,14 +75,14 @@ export {
 export {
   getTimeline, setTimeline, invalidateTimeline, clearTimelineCache, loadTimelineNow,
 } from './loaders/timelineCache';
-export { timelineSystem, resolveTimelineAt, applyTimelineState, previewTimelineAt, previewTimelineStep } from './systems/timelineSystem';
-export { requestSkeletalSeek, getSkeletalSeek, clearSkeletalSeeks, hasSkeletalSeeks } from './systems/skeletalSeek';
-export { setTimelinePreviewActive, isTimelinePreviewActive } from './systems/timelinePreview';
-export { clearControlSpawns } from './systems/controlSpawnRegistry';
+export { timelineSystem, resolveTimelineAt, applyTimelineState, previewTimelineAt, previewTimelineStep } from './timeline/timelineSystem';
+export { requestSkeletalSeek, getSkeletalSeek, clearSkeletalSeeks, hasSkeletalSeeks } from './core/skeletalSeek';
+export { setTimelinePreviewActive, isTimelinePreviewActive } from './core/timelinePreview';
+export { clearControlSpawns } from './timeline/controlSpawnRegistry';
 export {
   timelineEvents, timelineEventsManager,
   type SequenceStartHandler, type SequenceEndHandler, type SequenceMarkerHandler,
-} from './managers/TimelineEvents';
+} from './timeline/TimelineEvents';
 export {
   getAnimSet, resolveAnimSetParams, setAnimSet, invalidateAnimSet, clearAnimSetCache,
   ANIMSET_DEFAULTS,
@@ -111,8 +113,8 @@ export {
   getAllEntities, buildEntityTree, deleteEntity, deleteEntities, deriveLayer,
   onStructureDirty, markStructureDirty, getStructureVersion,
   type EntityInfo,
-} from './ecs/entityUtils';
-export { findEntityById, findEntityByGuid, registerEntity, unregisterEntity } from './ecs/world';
+} from './core/ecs/entityUtils';
+export { findEntityById, findEntityByGuid, registerEntity, unregisterEntity } from './core/ecs/world';
 export {
   registerModelPostprocessor, getModelPostprocessor, getAllModelPostprocessors, getModelPostprocessorIds,
   type ModelPostprocessor,
@@ -161,8 +163,8 @@ registerBuiltinMaterialTypes();
 export { isPrimitive, createPrimitiveMesh, PRIMITIVE_NAMES } from './loaders/primitives';
 export { loadSceneFile, collectResourceRefsFromEntities, instantiatePrefabIntoWorld, spawnPrefabInstance, deriveInstanceMemberGuids, type SceneData, type LoadSceneOptions, type SceneResourceRef, type SceneEntityEntry } from './loaders/loadSceneFile';
 export { markOverride, getOverrideMarkSet, clearOverrideMarks, clearAllOverrideMarks } from './loaders/overrideMarks';
-export { sceneManager, gameIdFromScenePath, type Scene, type SceneState, type LoadOptions as SceneLoadOptions } from './scene/SceneManager';
-export { validateSceneData, REF_FIELDS_BY_TRAIT, type SceneSchema, type ValidationResult } from './scene/sceneValidation';
+export { sceneManager, gameIdFromScenePath, type Scene, type SceneState, type LoadOptions as SceneLoadOptions, type SceneManager, type LoadedSceneEntry } from './scene/SceneManager';
+export { validateSceneData, REF_FIELDS_BY_TRAIT, type SceneSchema, type ValidationResult } from './loaders/sceneValidation';
 export { buildSceneSchema } from './scene/sceneSchema';
 export { applyOps, type MutateOp, type MutableScene, type MutableEntity, type EntityRef as MutateEntityRef, type ApplyResult } from './scene/sceneMutate';
 export { loadFont, loadAllFonts, getLoadedFontFamilies, getLoadedFonts, fontFamilyFromPath, fontPathFromFamily, parseFontFilename, type FontInfo } from './loaders/fontLoader';
@@ -175,13 +177,13 @@ export {
 } from './loaders/assetManifest';
 export { assetUrl, withCacheBust } from './loaders/assetUrl';
 export { UIRenderer } from './ui/UIRenderer';
-export { registerUIAction, unregisterUIAction, dispatchUIAction, dispatchGameAction, hasUIAction, getUIActionNames, getUIActionParams } from './ui/actionRegistry';
-export type { UIActionContext, UIActionHandler, UIActionDef, UIActionPayload, DispatchOptions } from './ui/actionRegistry';
-export { registerEngineActions } from './ui/engineActions';
+export { registerUIAction, unregisterUIAction, dispatchUIAction, dispatchGameAction, hasUIAction, getUIActionNames, getUIActionParams } from './core/actionRegistry';
+export type { UIActionContext, UIActionHandler, UIActionDef, UIActionPayload, DispatchOptions } from './core/actionRegistry';
+export { registerEngineActions } from './actions/engineActions';
 export { applyBindings, VALUE_TOKEN } from './ui/bindings';
 export type { UIActionBinding, UIActionEvent, UIActionKind } from './ui/bindings';
 export { resolveTemplate } from './ui/bindingResolver';
-export { registerReadSource, unregisterReadSource, getReadValue, getReadSourceNames } from './ui/readSourceRegistry';
+export { registerReadSource, unregisterReadSource, getReadValue, getReadSourceNames } from './core/readSourceRegistry';
 export { addStoreHook, removeStoreHook, getStoreHooks, subscribeHooksVersion, getHooksVersion } from './ui/storeHooks';
 export type { StoreHook } from './ui/storeHooks';
 export { setUIValues, setUIValue, clearUIValues } from './ui/uiValues';
@@ -214,8 +216,12 @@ export {
   setRenderSettings, getRenderSettings, resetRenderSettings, resolveToneMapping,
 } from './rendering/renderSettings';
 export type { RenderSettings, ThreeRenderSettings, PixiRenderSettings, WebRenderSettings } from './rendering/renderSettings';
-export { getWorldTransform3D, getWorldMatrix3D, getParentWorldMatrix3D, worldToLocal3D, hasParent } from './ecs/worldTransform';
-export type { WorldTransform3D } from './ecs/worldTransform';
+export { getWorldTransform3D, getWorldMatrix3D, getParentWorldMatrix3D, worldToLocal3D, hasParent } from './core/ecs/worldTransform';
+export type { WorldTransform3D } from './core/ecs/worldTransform';
+// The CACHED half of the world-transform contract (the on-demand half is worldTransform.ts
+// above). Lived in `src/three/` until P5; `@modoki/engine/three` still re-exports these for
+// back-compat, but this barrel is the canonical import path.
+export { transformPropagationSystem, worldTransforms, deactivatedEntities } from './core/ecs/transformPropagationSystem';
 export { computeContainerBox, clampBufferSize } from './rendering/webCanvasSizing';
 export type { WebSizing, ContainerBox } from './rendering/webCanvasSizing';
 export { useGameLoop } from './rendering/useGameLoop';
@@ -228,7 +234,7 @@ export {
 export {
   registerBoundsProvider, collectScreenBounds,
   type ScreenRect, type EntityScreenBounds, type BoundsProvider,
-} from './rendering/screenBounds';
+} from './core/screenBounds';
 export {
   registerHandleProvider, collectHandles, resolveHandle,
   type InteractionHandle, type HandleFilter, type HandleProvider,
@@ -239,8 +245,8 @@ export {
 } from './assets/assetSchemas';
 
 // ── Engine Systems ──
-export { timeSystem, resetTimeBaseline } from './systems/timeSystem';
-export { getTime, getSimDelta, getVisualDelta, getTimeScale, setTimeScale } from './systems/getTime';
+export { timeSystem, resetTimeBaseline } from './core/timeSystem';
+export { getTime, getSimDelta, getVisualDelta, getTimeScale, setTimeScale } from './core/getTime';
 // Input resource accessors — `input`-prefixed on the public surface to avoid
 // colliding with the generic short names (`axis`/`held`/`pressed`/`released`).
 export {
@@ -251,54 +257,54 @@ export {
   pointer as inputPointer, pointerDown, pointerPressed, pointerReleased,
   pointerPos, pointerDrag, getWheelDelta, setPointer as setInputPointer,
 } from './traits/Input';
-export { rawNow, setManualNow, advanceManual, restoreRealClock, isManualClock } from './systems/clock';
-export { stepSimulation, type StepOptions } from './systems/stepSimulation';
-export { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from './systems/rng';
+export { rawNow, setManualNow, advanceManual, restoreRealClock, isManualClock } from './core/clock';
+export { stepSimulation, type StepOptions } from './core/stepSimulation';
+export { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';
 export {
   emit, entityRef, journalEvents, drainJournal, clearJournal, setJournalTick, setJournalEnabled,
   resolveRefName, setVerboseCapture, verboseCaptureState, isVerboseType,
   isJournalEnabled,
   type GameEvent, type JournalLevel,
-} from './systems/journal';
-export { journalState, journalDecision, journalWarn, journalError } from './systems/gameJournal';
+} from './core/journal';
+export { journalState, journalDecision, journalWarn, journalError } from './core/gameJournal';
 export {
   createTestWorld,
   type TestWorld, type TestSystemDef, type CreateTestWorldOptions,
 } from './harness/createTestWorld';
-export { rotate3DSystem } from './systems/rotate3DSystem';
-export { materialInstanceSystem, resetMaterialInstanceClocks } from './systems/materialInstanceSystem';
+export { rotate3DSystem } from './rendering/rotate3DSystem';
+export { materialInstanceSystem, resetMaterialInstanceClocks } from './rendering/materialInstanceSystem';
 export { resetMaterialInstanceClones } from './rendering/materialInstanceClones';
-export { animationSystem } from './systems/animationSystem';
-export { spriteAnimationSystem } from './systems/spriteAnimationSystem';
-export { skin2DSystem } from './systems/skin2DSystem';
+export { animationSystem } from './animation/animationSystem';
+export { spriteAnimationSystem } from './animation/spriteAnimationSystem';
+export { skin2DSystem } from './skinning/skin2DSystem';
 export {
   getSkin2DBuffer, getSkin2DDeformVersion, clearSkin2DBuffers, type Skin2DBuffer,
-} from './systems/skin2DBuffers';
+} from './skinning/skin2DBuffers';
 export {
   getDeform2D, getDeform2DVersion, setDeform2D, beginDeform2DFrame, clearDeform2DBuffers,
-} from './systems/deform2DBuffers';
-export { applyClipDeform } from './systems/deform2DSystem';
+} from './animation/deform2DBuffers';
+export { applyClipDeform } from './animation/deform2DSystem';
 export {
   physics2DSystem, raycast2D, shapeCast2D, pointQuery2D, disposePhysics2D, disposeAllPhysics2D,
   applyImpulse2D, applyTorqueImpulse2D, addForce2D, addTorque2D,
   setLinvel2D, setAngvel2D, resetForces2D, wakeBody2D,
-} from './systems/physics2DSystem';
-export { initRapier2D, isRapierReady } from './systems/rapierLoader';
+} from './physics/physics2DSystem';
+export { initRapier2D, isRapierReady } from './physics/rapierLoader';
 export {
   physics3DSystem, raycast3D, shapeCast3D, pointQuery3D, disposePhysics3D, disposeAllPhysics3D,
   applyImpulse3D, applyTorqueImpulse3D, addForce3D, addTorque3D,
   setLinvel3D, setAngvel3D, setBodyTranslation3D, resetForces3D, wakeBody3D,
-} from './systems/physics3DSystem';
-export { initRapier3D, isRapier3DReady } from './systems/rapier3DLoader';
-export { getContactState } from './systems/physicsContactIndex';
-export { zone2DSystem } from './systems/zone2DSystem';
-export { zone3DSystem } from './systems/zone3DSystem';
-export { clearZoneState } from './systems/zoneTriggerCore';
-export { characterInputSystem } from './systems/characterInputSystem';
-export { characterInput3DSystem } from './systems/characterInput3DSystem';
-export { characterAnimationSystem } from './systems/characterAnimationSystem';
-export { audioSystem, stopWorldAudio, stopEntityAudio, setAudioWorldPositionResolver } from './systems/audioSystem';
-export { registerAudioControls, useAudioMixStore } from './audio/audioControls';
+} from './physics/physics3DSystem';
+export { initRapier3D, isRapier3DReady } from './physics/rapier3DLoader';
+export { getContactState } from './physics/physicsContactIndex';
+export { zone2DSystem } from './zones/zone2DSystem';
+export { zone3DSystem } from './zones/zone3DSystem';
+export { clearZoneState } from './zones/zoneTriggerCore';
+export { characterInputSystem } from './input/characterInputSystem';
+export { characterInput3DSystem } from './input/characterInput3DSystem';
+export { characterAnimationSystem } from './animation/characterAnimationSystem';
+export { audioSystem, stopWorldAudio, stopEntityAudio, setAudioWorldPositionResolver } from './audio/audioSystem';
+export { registerAudioControls, useAudioMixStore } from './actions/audioControls';
 // Audio subsystem — service (playback backend), cue bus, context, buffer cache.
 export {
   play as audioPlay, stopAll as audioStopAll, resume as audioResume, dispose as audioDispose,
@@ -316,7 +322,7 @@ export {
   getAudioCacheStats, invalidateAudio,
 } from './loaders/audioBufferCache';
 // Source-agnostic input seam (Part A of the input-and-ui-focus plan).
-export { inputSystem } from './systems/inputSystem';
+export { inputSystem } from './input/inputSystem';
 export {
   registerSource, unregisterSource, getSources, attachAll as attachInputSources,
   detachAll as detachInputSources, inputSourcesManager, type InputSource,
@@ -332,26 +338,26 @@ export {
   AXES, DIGITAL, applyDeadzone, clampAxes, computeEdges, computePointerEdge, createInputFrame, beginSample,
   makeAxes, makeFlags, makePointer,
   type Axis, type DigitalAction, type InputDevice, type InputFrame, type AxisMap, type FlagMap, type PointerFrame,
-} from './input/actions';
+} from './core/inputActions';
 export {
   vecEcsToPhys, vecPhysToEcs, angEcsToPhys, angPhysToEcs, lenToPhys, packCollisionGroups,
   parsePointsToPhys,
   type Vec2,
-} from './systems/physics2DConvert';
+} from './physics/physics2DConvert';
 export {
   vecEcsToPhys as vecEcsToPhys3D, vecPhysToEcs as vecPhysToEcs3D,
   lenToPhys as lenToPhys3D, packCollisionGroups as packCollisionGroups3D,
   eulerToQuat, quatToEuler,
   type Vec3, type Quat, type Euler3,
-} from './systems/physics3DConvert';
+} from './physics/physics3DConvert';
 export { colliderOutline2D } from './rendering/colliderOutline2D';
 export {
   registerSystem, unregisterSystem, runPipeline, getRegisteredSystems,
   SYSTEM_PRIORITY,
-} from './systems/pipeline';
-export type { SystemOptions } from './systems/pipeline';
-export { registerLateUpdate, unregisterLateUpdate, runLateUpdates, clearLateUpdates, type LateUpdateFn } from './systems/lateUpdate';
-export { registerProjection, unregisterProjection, type SubscribableStore } from './systems/projection';
+} from './core/pipeline';
+export type { SystemOptions } from './core/pipeline';
+export { registerLateUpdate, unregisterLateUpdate, runLateUpdates, clearLateUpdates, type LateUpdateFn } from './core/lateUpdate';
+export { registerProjection, unregisterProjection, type SubscribableStore } from './core/projection';
 // ── Managers (event-driven counterpart to Systems) ──
 export {
   registerManager, registerManagers, unregisterManager, unregisterManagers,
@@ -359,34 +365,34 @@ export {
   disposeActiveGameManagers, initGameManagersFor, getActiveGameId,
 } from './managers/managerRegistry';
 export type { ManagerDef, ManagerContext, ManagerScope } from './managers/managerRegistry';
-export { timeManager } from './managers/TimeManager';
-export { navigationManager } from './managers/NavigationManager';
-export { physics2DEvents, physics2DEventsManager } from './managers/Physics2DEvents';
-export type { CollisionPhase, SensorHandler, CollisionHandler } from './managers/Physics2DEvents';
-export { physics3DEvents, physics3DEventsManager } from './managers/Physics3DEvents';
-export type { CollisionPhase3D, SensorHandler3D, CollisionHandler3D, ContactDetail3D, ContactHandler3D } from './managers/Physics3DEvents';
-export { zone2DEvents, zone2DEventsManager } from './managers/Zone2DEvents';
-export { zone3DEvents, zone3DEventsManager } from './managers/Zone3DEvents';
-export type { ZonePhase, ZoneHandler } from './managers/zoneEventBus';
+export { timeManager, type TimeManager } from './managers/TimeManager';
+export { navigationManager, type NavigationManager } from './managers/NavigationManager';
+export { physics2DEvents, physics2DEventsManager } from './physics/Physics2DEvents';
+export type { CollisionPhase, SensorHandler, CollisionHandler } from './physics/Physics2DEvents';
+export { physics3DEvents, physics3DEventsManager } from './physics/Physics3DEvents';
+export type { CollisionPhase3D, SensorHandler3D, CollisionHandler3D, ContactDetail3D, ContactHandler3D } from './physics/Physics3DEvents';
+export { zone2DEvents, zone2DEventsManager } from './zones/Zone2DEvents';
+export { zone3DEvents, zone3DEventsManager } from './zones/Zone3DEvents';
+export type { ZonePhase, ZoneHandler } from './zones/zoneEventBus';
 export {
   setPhysicsLayers, resetPhysicsLayers, getPhysicsLayerNames, getPhysicsLayerMatrix,
   layersCollide, resolveColliderBits,
-} from './systems/physicsLayers';
-export type { PhysicsLayersConfig } from './systems/physicsLayers';
+} from './physics/physicsLayers';
+export type { PhysicsLayersConfig } from './physics/physicsLayers';
 export {
   type PlayState, getPlayState, setPlayState, onPlayStateChange, isSimRunning,
   type RunMode, getRunMode, setRunMode, isAdvancing, onRunModeChange,
   shouldFireActions, shouldRunSimTier, isPoseOnly, isLiveRender, canEdit, inPreviewSession,
-} from './systems/playState';
+} from './core/playState';
 export { uiTreeProjection, markUIDirty, setEditorDirtyCallback, onEditorDirty } from './ui/uiTreeStore';
 // UI focus / navigation (Part B of the input-and-ui-focus plan).
-export { uiFocusSystem } from './systems/uiFocusSystem';
+export { uiFocusSystem } from './ui/uiFocusSystem';
 export {
   useFocusStore, activeScope, focusedGuid, setFocus, pushScope, popScope,
   requestActivate, resetFocus, consumePendingActivation, pickInDirection,
   type NavDir,
 } from './ui/focusManager';
-export { addDirtyListener } from './ecs/entityUtils';
+export { addDirtyListener } from './core/ecs/entityUtils';
 // Default game store (ECS→React bridge). Exported so a game imports it via
 // `@modoki/engine/runtime` instead of a repo-relative path into the app shell —
 // the latter breaks when the game is opened standalone (copied out of the repo).

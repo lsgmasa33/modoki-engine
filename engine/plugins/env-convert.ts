@@ -8,7 +8,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import type { EnvImportSettings } from '../packages/modoki/src/runtime/loaders/environmentSettings';
+import type { EnvImportSettings } from '../packages/modoki/src/runtime/core/environmentSettings';
 import { envTargetDims, downscaleRGBA, encodeHDR, readHdrHeaderDims } from './hdr-codec';
 import { getEnvCacheDir, envHashKey, envCachePathFor, envCacheHit } from './env-cache';
 import { nativeDynamicImport } from './native-dynamic-import';

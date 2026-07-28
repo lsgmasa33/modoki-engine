@@ -63,7 +63,7 @@ let spawned: SpawnedEntity[] = [];
 let nextId = 1;
 const entityIndex = new Map<number, SpawnedEntity>();
 let testWorld: any;
-vi.mock('../../src/runtime/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
   findEntityById: (id: number) => entityIndex.get(id),
   setStructureCallback: vi.fn(),

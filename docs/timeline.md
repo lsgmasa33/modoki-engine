@@ -50,7 +50,7 @@ prefabs are GUIDs. A spawned control prefab can *also* carry a `ParticleEmitter`
 on a beat" and "re-trigger an emitter already in the scene" are both covered; nested sub-directors
 compose reusable sub-cutscenes (all three control kinds are landed — see Playback below).
 
-## Playback — `timelineSystem` (`runtime/systems/timelineSystem.ts`)
+## Playback — `timelineSystem` (`runtime/timeline/timelineSystem.ts`)
 
 Registered at `SYSTEM_PRIORITY.ANIMATION - 1 = 149`, one tick **before** `animationSystem` (150).
 Advances every `Director` playhead, then applies each track. **Collect-then-apply**: the
@@ -119,7 +119,7 @@ point (keyframe scrub + activation), shared with the editor scrub-preview via
 **During editor SCRUB, 3D skeletal IS posed to the exact time** (Phase 5). A `SkeletalAnimator`'s pose
 lives in a `THREE.AnimationMixer` the render layer owns — the runtime scrub path can't sample it like a
 keyframe `Animator`. So `previewTimelineAt` publishes a **seek request** per skeletal target through
-`runtime/systems/skeletalSeek.ts` (a plain module singleton mirroring `skeletalPreview`); the render
+`runtime/core/skeletalSeek.ts` (a plain module singleton mirroring `skeletalPreview`); the render
 sync (`scene3DSync.syncSkinnedModels`) consumes it with `blendSkeletal`, which sets each requested
 clip's action to its time+weight (one clip = a seek at weight 1; two = a **crossfade** — Phase B) and
 bakes the pose with `mixer.update(0)`
@@ -132,7 +132,7 @@ bind. Sprite/flipbook animators remain trigger-only (no arbitrary-time seek). Sh
 
 **Particle control (Phase E) uses the same render-bridge pattern.** A `particle` control clip can't
 touch the emitter's live `IParticleBackend` handle from the deterministic pipeline, so
-`timelineSystem` writes a restart/pause request through `runtime/systems/particleControlRegistry.ts`
+`timelineSystem` writes a restart/pause request through `runtime/core/particleControlRegistry.ts`
 (a module singleton like `skeletalSeek`, keyed by the target's entity id, cleared on world swap); both
 `particleSync` (3D) and `particleSync2D` drain it per emitter and call `backend.restart(handle)` /
 `backend.pause(handle)` before that frame's update. The deterministic edge is still the journaled
@@ -226,7 +226,7 @@ passes `forceTransient`), so the serializer always drops it — a scrub reconcil
 **audio cues, signal markers (camera/text/…), and `OnSequence`** — so you can see AND hear the
 cutscene without entering Play. The loop calls `previewTimelineStep` (pose + forward edge-fire over
 `(prevT,curT]`). Because the engine gates those effects on `getPlayState()==='playing'`, preview
-opens exactly two gates via a flag (`runtime/systems/timelinePreview.ts`, `setTimelinePreviewActive`):
+opens exactly two gates via a flag (`runtime/core/timelinePreview.ts`, `setTimelinePreviewActive`):
 `dispatchGameAction` (signals/OnSequence) and `audioSystem` (cues). Play stays `'stopped'`, so
 `runPipeline` still skips the whole simulation tier — the rest of the sim (physics/input/gameplay)
 never runs. A signal action can mutate anything (a `cameraMove` moves the camera, `showText` sets a

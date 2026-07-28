@@ -11,8 +11,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createWorld } from 'koota';
 import { mixerAdvanceDelta } from '../../src/runtime/rendering/scene3DSync';
-import { setPlayState } from '../../src/runtime/systems/playState';
-import { setSkeletalPreview } from '../../src/runtime/systems/skeletalPreview';
+import { setPlayState } from '../../src/runtime/core/playState';
+import { setSkeletalPreview } from '../../src/runtime/core/skeletalPreview';
 import { Time } from '../../src/runtime/traits';
 
 let world: ReturnType<typeof createWorld>;

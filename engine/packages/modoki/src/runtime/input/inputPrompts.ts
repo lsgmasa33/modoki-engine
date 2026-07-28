@@ -17,7 +17,7 @@
  *  in any font — a game that wants glyph icons can build its own map on top of
  *  `lastInputDevice`. */
 
-import type { DigitalAction, InputDevice } from './actions';
+import type { DigitalAction, InputDevice } from '../core/inputActions';
 
 /** The digital actions a UI typically surfaces a prompt for. Nav (arrows/d-pad)
  *  is intentionally omitted — it's shown as directional hints, not a single label. */

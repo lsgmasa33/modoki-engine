@@ -3,6 +3,8 @@
  *  sprite + bones and drives it through skin2DSystem. Headless, no renderer. */
 
 import { describe, it, expect, afterEach } from 'vitest';
+// Side-effect only: wires core provider slots (P7 C13) so the real rig2d cache below resolves correctly.
+import '../../src/runtime/loaders/registerProviders';
 import { createWorld } from 'koota';
 import { generateGridMesh } from '../../src/runtime/skinning/rig2dTessellate';
 import { computeAutoWeights } from '../../src/runtime/skinning/rig2dAutoWeights';
@@ -10,8 +12,8 @@ import { suggestBones } from '../../src/runtime/skinning/rig2dAutoBones';
 import { buildRig2D, autoRig2D } from '../../src/runtime/skinning/rig2dBuild';
 import { deriveBindMatrices } from '../../src/runtime/skinning/rig2dMath';
 import { Transform, SkinnedSprite2D, Bone2D, EntityAttributes } from '../../src/runtime/traits';
-import { skin2DSystem } from '../../src/runtime/systems/skin2DSystem';
-import { getSkin2DBuffer, clearSkin2DBuffers } from '../../src/runtime/systems/skin2DBuffers';
+import { skin2DSystem } from '../../src/runtime/skinning/skin2DSystem';
+import { getSkin2DBuffer, clearSkin2DBuffers } from '../../src/runtime/skinning/skin2DBuffers';
 import { setRig2D, clearRig2DCache, normalizeRig2D } from '../../src/runtime/loaders/rig2dCache';
 
 describe('generateGridMesh', () => {

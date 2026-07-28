@@ -10,7 +10,7 @@
  * free (non-weighted) Hermite, which already gives editable tangent handles.
  */
 
-import { lerp } from '../particles/curves';
+import { lerp } from '../core/curves';
 import { DEFAULT_TANGENT_WEIGHT, STEPPED, type AnimationTrack, type Keyframe, type TangentMode, type TrackValueType } from './types';
 
 /** Find the index `i` of the last key with `keys[i].t <= time`, via binary search.

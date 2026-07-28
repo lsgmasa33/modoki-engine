@@ -34,7 +34,7 @@ import OtaKeysDialog from './panels/OtaKeysDialog';
 import PanelErrorBoundary from './panels/PanelErrorBoundary';
 import { saveAll } from './scene/serialize';
 import { enterPlay, pausePlay, getModeOwner } from './scene/playMode';
-import { getPlayState, setPlayState, onPlayStateChange, getRunMode, canEdit as canEditMode } from '../runtime/systems/playState';
+import { getPlayState, setPlayState, onPlayStateChange, getRunMode, canEdit as canEditMode } from '../runtime/core/playState';
 import { savePrefabEdit, isEditingPrefab } from './scene/prefabEdit';
 import { useEditorStore } from './store/editorStore';
 import { setActionCallback } from './undo/entityActions';

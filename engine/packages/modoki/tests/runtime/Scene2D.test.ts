@@ -199,8 +199,8 @@ async function setup(opts: { start?: boolean } = {}) {
   mockDeps();
   const pixi: any = await import('pixi.js');
   const traits = await import('../../src/runtime/traits');
-  const { registerTrait } = await import('../../src/runtime/ecs/traitRegistry');
-  const worldReg = await import('../../src/runtime/ecs/worldRegistry');
+  const { registerTrait } = await import('../../src/runtime/core/ecs/traitRegistry');
+  const worldReg = await import('../../src/runtime/core/ecs/worldRegistry');
   const pool = await import('../../src/runtime/rendering/canvas2DPool');
   const scene2d = await import('../../src/runtime/rendering/Scene2D');
   const { createWorld } = await import('koota');
@@ -1153,7 +1153,7 @@ describe('Scene2D.renderFrame', () => {
 
     it('skips the whole frame while the sim is stopped and nothing is externally dirty', async () => {
       const { traits, pool, scene2d, world } = await setup();
-      const { setPlayState } = await import('../../src/runtime/systems/playState');
+      const { setPlayState } = await import('../../src/runtime/core/playState');
       const canvas = spawnCanvas(world, traits);
       const child = spawnChild(world, traits, canvas.id(), { sprite: 'square', color: 0x111111 });
 
@@ -1272,7 +1272,7 @@ describe('Scene2DRenderer instancing', () => {
 describe('Scene2DRenderer 2D-particle-preview render gate (Phase 4)', () => {
   it('a preview provider keeps renderFrame alive while stopped; undefined skips as before', async () => {
     const { traits, scene2d, pool, world } = await setup();
-    const { setPlayState } = await import('../../src/runtime/systems/playState');
+    const { setPlayState } = await import('../../src/runtime/core/playState');
     setPlayState('stopped'); // the editor opens scenes stopped; the harness defaults to 'playing'
     const editorPool = new pool.Canvas2DPool();
     let previewDt: number | undefined;
@@ -1300,7 +1300,7 @@ describe('Scene2DRenderer 2D-particle-preview render gate (Phase 4)', () => {
 
   it('the default (runtime) renderer has no provider and still skips a direct write while stopped', async () => {
     const { traits, scene2d, pool, world } = await setup();
-    const { setPlayState } = await import('../../src/runtime/systems/playState');
+    const { setPlayState } = await import('../../src/runtime/core/playState');
     setPlayState('stopped');
     const canvas = spawnCanvas(world, traits);
     const child = spawnChild(world, traits, canvas.id(), { sprite: 'square' });

@@ -7,14 +7,14 @@
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createWorld } from 'koota';
-import { Time } from '../../src/runtime/traits/Time';
-import { timeSystem } from '../../src/runtime/systems/timeSystem';
-import { getTime } from '../../src/runtime/systems/getTime';
-import { stepSimulation } from '../../src/runtime/systems/stepSimulation';
-import { registerSystem, unregisterSystem, SYSTEM_PRIORITY } from '../../src/runtime/systems/pipeline';
-import { restoreRealClock, isManualClock } from '../../src/runtime/systems/clock';
-import { getPlayState, setPlayState } from '../../src/runtime/systems/playState';
-import { emit, journalEvents, clearJournal } from '../../src/runtime/systems/journal';
+import { Time } from '../../src/runtime/core/traits/Time';
+import { timeSystem } from '../../src/runtime/core/timeSystem';
+import { getTime } from '../../src/runtime/core/getTime';
+import { stepSimulation } from '../../src/runtime/core/stepSimulation';
+import { registerSystem, unregisterSystem, SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
+import { restoreRealClock, isManualClock } from '../../src/runtime/core/clock';
+import { getPlayState, setPlayState } from '../../src/runtime/core/playState';
+import { emit, journalEvents, clearJournal } from '../../src/runtime/core/journal';
 
 function runStepped(ticks: number, dt: number) {
   const world = createWorld();

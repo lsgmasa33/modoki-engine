@@ -24,11 +24,11 @@ const findEntity = (id: number) => {
   return { has: () => data !== undefined, get: () => data };
 };
 
-vi.mock('../../src/runtime/ecs/entityUtils', () => ({
+vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   findEntity: (id: number) => findEntity(id),
   getAllEntities: () => [], // BindAnimatorPicker imports it; buildEntityRows takes entities as an arg
 }));
-vi.mock('../../src/runtime/ecs/traitRegistry', () => ({
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getTraitByName: (n: string) => (missingTrait || n !== 'Animator' ? undefined : animMeta),
 }));
 

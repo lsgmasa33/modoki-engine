@@ -9,12 +9,12 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { trait, createWorld } from 'koota';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
-import { emit, journalEvents } from '../../src/runtime/systems/journal';
-import { getCurrentWorld } from '../../src/runtime/ecs/world';
-import { getPlayState } from '../../src/runtime/systems/playState';
-import { rngInt, rngNext, seedRng } from '../../src/runtime/systems/rng';
-import { SYSTEM_PRIORITY } from '../../src/runtime/systems/pipeline';
-import { Time } from '../../src/runtime/traits/Time';
+import { emit, journalEvents } from '../../src/runtime/core/journal';
+import { getCurrentWorld } from '../../src/runtime/core/ecs/world';
+import { getPlayState } from '../../src/runtime/core/playState';
+import { rngInt, rngNext, seedRng } from '../../src/runtime/core/rng';
+import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
+import { Time } from '../../src/runtime/core/traits/Time';
 
 const Score = trait({ value: 0, won: false });
 

@@ -3,7 +3,7 @@
  *  cache bookkeeping back to the meta. Registered for the `environment` asset type. */
 
 import { randomUUID } from 'crypto';
-import { resolveEnvSettings } from '../packages/modoki/src/runtime/loaders/environmentSettings';
+import { resolveEnvSettings } from '../packages/modoki/src/runtime/core/environmentSettings';
 import { convertEnvironment } from './env-convert';
 import { readMetaSidecar, writeMetaSidecar } from './meta-sidecar';
 import type { ReimportHandler } from './reimport-registry';

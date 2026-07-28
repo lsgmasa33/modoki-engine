@@ -8,17 +8,17 @@ import { createWorld as _createWorld, trait, type World } from 'koota';
 const _worlds: World[] = [];
 function createWorld(): World { const w = _createWorld(); _worlds.push(w); return w; }
 afterEach(() => { for (const w of _worlds.splice(0)) w.destroy(); });
-import { Transform } from '../../src/runtime/traits/Transform';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { Transform } from '../../src/runtime/core/traits/Transform';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { Tint } from '../../src/runtime/traits/Tint';
 import { MaterialInstance } from '../../src/runtime/traits/MaterialInstance';
-import { registerTrait, getAllTraits } from '../../src/runtime/ecs/traitRegistry';
-import { markUIDirty } from '../../src/runtime/ui/uiTreeStore';
+import { registerTrait, getAllTraits } from '../../src/runtime/core/ecs/traitRegistry';
+import { markUIDirty } from '../../src/runtime/core/uiDirty';
 
 // Spy on markUIDirty so we can assert the UI tree is dirtied ONLY when a UI trait
-// is animated (the rest of uiTreeStore is preserved via importOriginal).
-vi.mock('../../src/runtime/ui/uiTreeStore', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../src/runtime/ui/uiTreeStore')>();
+// is animated (the rest of core/uiDirty is preserved via importOriginal).
+vi.mock('../../src/runtime/core/uiDirty', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/runtime/core/uiDirty')>();
   return { ...actual, markUIDirty: vi.fn() };
 });
 
@@ -30,7 +30,7 @@ const Panel = trait({ w: 0 });
 /** A throwaway tag trait (no fields), to exercise the tag-category skip. */
 const TagOnly = trait();
 import { applyClipAtTime, applyClipAtTimeBlended, advanceClipTime } from '../../src/runtime/animation/sampleClip';
-import { buildEntityIndex, resolveTrackTarget } from '../../src/runtime/ecs/entityIndex';
+import { buildEntityIndex, resolveTrackTarget } from '../../src/runtime/core/ecs/entityIndex';
 import type { AnimationClipDef, Keyframe } from '../../src/runtime/animation/types';
 
 const key = (t: number, v: number): Keyframe => ({ t, v, inTangent: 0, outTangent: 0 });

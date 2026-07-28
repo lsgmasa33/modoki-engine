@@ -1,6 +1,6 @@
 /** 2D Transform Gizmo — Canvas2D rendering, hit testing, and drag math. */
 
-import { clampAngle } from '../../runtime/traits/Transform';
+import { clampAngle } from '../../runtime/core/traits/Transform';
 
 // ── Handle Types ──
 

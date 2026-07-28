@@ -8,7 +8,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 let entities: { id: number; name: string; parentId: number }[] = [];
 let version = 0;
 
-vi.mock('../../src/runtime/ecs/entityUtils', () => ({
+vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   getAllEntities: () => entities,
   getStructureVersion: () => version,
 }));

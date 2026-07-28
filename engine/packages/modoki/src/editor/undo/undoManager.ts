@@ -188,9 +188,73 @@ function serialize<T>(op: () => Promise<T>): Promise<T> {
   return run;
 }
 
+// ── Action capture (the composite/transaction primitive's collection half) ────
+//
+// A batch operation (one `mutate_scene` tool call carrying N ops, a multi-step
+// authoring command) must land as ONE undo entry, not N. The natural way to build
+// such a batch is to call the existing `*WithUndo` helpers per op — they already
+// know how to construct a correct per-op undo/redo closure (guid re-resolution
+// across a world rebuild, prefab-override routing, animation-record notification).
+// But each of those helpers ends in `pushAction`, so a naive batch pushes N entries.
+//
+// Capture inverts that: while a capture frame is open, `pushAction` DIVERTS the
+// action into the frame instead of the stack, so the helpers stay untouched and the
+// batch builder decides what one entry looks like (see compositeAction.ts).
+//
+// Why here and not in entityActions' `setActionCallback` indirection: that hook only
+// covers entityActions.ts. Prefab, gizmo, reorder and asset actions call `pushAction`
+// DIRECTLY, so a capture installed there would silently miss them — a batch would
+// push some of its ops as separate entries and Cmd-Z would half-revert it. Diverting
+// at the single choke point every action must pass through is the only version that
+// cannot be bypassed.
+//
+// A STACK, not a flag, so a composite nested inside another composite folds in
+// correctly: the inner one pushes its finished composite action, which the outer
+// frame captures as a single sub-action.
+//
+// Deliberately NOT covered: pushes that arrive during an `await` inside the batch
+// body from unrelated code (a debounced React effect committing). Single-threaded JS
+// makes this rare, and batch bodies are expected to be short; the alternative
+// (attributing pushes by async context) is not available in the browser. Keep batch
+// bodies synchronous-ish.
+const _captureStack: UndoAction[][] = [];
+
+/** True while a capture frame is open — pushes are being diverted, not stacked. */
+export function isCapturingActions(): boolean { return _captureStack.length > 0; }
+
+/** Open a capture frame. Every subsequent `pushAction` lands in the returned array
+ *  instead of the undo stack, until the frame is closed with `endActionCapture`.
+ *  Callers MUST close it (use `runAsCompositeAction`, which does so even on throw) —
+ *  a leaked frame silently swallows the human's edits. */
+export function beginActionCapture(): UndoAction[] {
+  const frame: UndoAction[] = [];
+  _captureStack.push(frame);
+  return frame;
+}
+
+/** Close the frame opened by `beginActionCapture` and return its captured actions.
+ *  Also drops any frames opened ABOVE it that were never closed, so one leaked
+ *  nested capture cannot wedge the manager into swallowing every later push. */
+export function endActionCapture(frame: UndoAction[]): UndoAction[] {
+  const idx = _captureStack.lastIndexOf(frame);
+  if (idx === -1) {
+    console.error('[undoManager] endActionCapture: frame is not open (double close?)');
+    return frame;
+  }
+  if (idx !== _captureStack.length - 1) {
+    console.error(`[undoManager] endActionCapture: ${_captureStack.length - 1 - idx} nested capture frame(s) were never closed; dropping them.`);
+  }
+  _captureStack.length = idx;
+  return frame;
+}
+
 /** Push a new action. Clears redo stack. */
 export function pushAction(action: UndoAction) {
   if (_executing) return; // don't push during undo/redo execution
+  // Divert into the innermost open capture frame (see the block comment above).
+  // BEFORE notifyEdited/coalesce/emit: a captured sub-action is not yet a committed
+  // edit — the composite that wraps it does all three exactly once, for the batch.
+  if (_captureStack.length > 0) { _captureStack[_captureStack.length - 1].push(action); return; }
   if (!action._isSelection && !action._isFileDirect) notifyEdited(); // a real edit → the world now differs from disk
   markAffectedScenesDirty(action);
   // Coalesce consecutive same-key edits (opt-in via coalesceKey) into the top
@@ -368,6 +432,7 @@ export function swapHistory(key: string) {
 export function _resetHistoryContexts() {
   _histories.clear();
   _activeKey = '';
+  _captureStack.length = 0; // a test that threw mid-batch must not leak a capture frame
   undoStack.length = 0;
   redoStack.length = 0;
   _coalesce = null;

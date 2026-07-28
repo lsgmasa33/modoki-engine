@@ -61,7 +61,7 @@ import { computeDiagnostics } from './diagnose';
 import { startWatch, readWatch, listWatches, clearWatch, type StartWatchParams } from './watch';
 // Percept S3: resolved world transforms + hierarchy-deactivation set, both computed
 // each frame by transformPropagationSystem. Same module instance the renderers read.
-import { worldTransforms, deactivatedEntities } from '@modoki/engine/three';
+import { worldTransforms, deactivatedEntities } from '@modoki/engine/runtime';
 
 /** Minimal transport the bridge needs — implemented over the Electron preload
  *  IPC channel (window.__modokiElectron.bridge) under Electron. */

@@ -4,10 +4,13 @@
  *  are unchanged (no uvRect). Headless — asserts the buffer, no renderer. */
 
 import { describe, it, expect, afterEach } from 'vitest';
+// Side-effect only: wires core/textureProvider so skin2DSystem's resolveSprite lookup (routed
+// through the provider slot, P7 C9) resolves against the real assetManifest below.
+import '../../src/runtime/loaders/registerProviders';
 import { createWorld } from 'koota';
 import { Transform, SkinnedSprite2D, Bone2D, EntityAttributes } from '../../src/runtime/traits';
-import { skin2DSystem } from '../../src/runtime/systems/skin2DSystem';
-import { getSkin2DBuffer, clearSkin2DBuffers, frameSkin2DUVs } from '../../src/runtime/systems/skin2DBuffers';
+import { skin2DSystem } from '../../src/runtime/skinning/skin2DSystem';
+import { getSkin2DBuffer, clearSkin2DBuffers, frameSkin2DUVs } from '../../src/runtime/skinning/skin2DBuffers';
 import { setRig2D, clearRig2DCache } from '../../src/runtime/loaders/rig2dCache';
 import { clearManifest, registerAsset, registerSprite } from '../../src/runtime/loaders/assetManifest';
 import { DEFAULT_TEXTURE_SETTINGS } from '../../src/runtime/loaders/textureSettings';

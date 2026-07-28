@@ -5,7 +5,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
-import { getCurrentWorld, registerEntity } from '../ecs/world';
+import { getCurrentWorld, registerEntity } from '../core/ecs/world';
 import { Transform, Renderable3D, EntityAttributes } from '../traits';
 import { getModelPostprocessor } from './modelPostprocessorRegistry';
 import { getModelHierarchy, findNearestMeshAncestor, decomposeLocalTransform, modelGlbUrl, sanitizeGeometryAttributes, type MeshHierarchyEntry } from './meshTemplateCache';

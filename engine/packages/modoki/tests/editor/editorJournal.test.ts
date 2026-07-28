@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled, withEditorActor } from '../../src/editor/editorJournal';
 import { pushAction, pushSelectionChange, undo, redo, clearHistory, _setUndoClock } from '../../src/editor/undo/undoManager';
-import { nextCaptureSeq, _resetCaptureSeq } from '../../src/runtime/systems/journal';
+import { nextCaptureSeq, _resetCaptureSeq } from '../../src/runtime/core/journal';
 
 beforeEach(() => {
   clearEditorJournal(); setEditorJournalEnabled(true);

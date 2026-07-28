@@ -51,7 +51,7 @@ import { discoverSigningTeams } from '../signingTeams';
 import { toolchainStatus, writeToolchainSettings, uninstall, uninstallAll, type ToolId } from '../../toolchain';
 import { loadProjectConfig, writeProjectConfig, validateBuildConfig, loadProjectUserConfig, writeProjectUserConfig } from '../load-project-config';
 import { mergeProjectConfig, mergeProjectUserConfig } from '../../project-config';
-import { validateSceneData, type SceneSchema } from '../../packages/modoki/src/runtime/scene/sceneValidation';
+import { validateSceneData, type SceneSchema } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
 import { getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData, type AssetSchemaType } from '../../packages/modoki/src/runtime/assets/assetSchemas';
 import { pruneOldTempFiles } from './tempFiles';
@@ -128,6 +128,21 @@ export interface BackendRequest {
 const json = (body: unknown, status?: number): BackendResult => ({ kind: 'json', status, body });
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// ── MCP persistence mode (mcp-persistence.md Phase 1) ──────────
+// One flag, backend-side (not the renderer store), because it gates BOTH file-direct
+// routes (scene-mutate, asset-write — live here in Node) and live-world routes (routed
+// through /api/editor-action to the renderer) — the backend is the one place that fronts
+// both. 'auto' (default) preserves every tool's pre-existing behaviour byte-for-byte;
+// 'manual' is read by later phases (2b/3) to route mutations into the live world only.
+// As of Phase 1 this is READ but not yet ACTED on anywhere — landing the knob first, per
+// the plan's ship gate, so nothing changes behaviourally until Phase 2/3 wire it up.
+export type PersistenceMode = 'auto' | 'manual';
+let persistenceMode: PersistenceMode = 'auto';
+export function getPersistenceMode(): PersistenceMode { return persistenceMode; }
+export function setPersistenceMode(mode: PersistenceMode): void { persistenceMode = mode; }
+/** Test-only: reset to the default so one test's mode change can't leak into another. */
+export function _resetPersistenceMode(): void { persistenceMode = 'auto'; }
 
 /** Decode a `data:image/…;base64,…` URL (the renderer's render_scene result) to a
  *  temp file, returning its path — so an agent receives a path, never an inline
@@ -654,33 +669,75 @@ async function describeUnresolvedAgainstLiveWorld(
       if (!absPath) return json({ error: 'path outside allowed directories' }, 403);
       if (!fs.existsSync(absPath)) return json({ error: `scene not found: ${scenePath}` }, 404);
       if (!Array.isArray(ops)) return json({ error: 'ops must be an array' }, 400);
-      // Refuse while the editor is Playing/Paused: the edit would hot-reload the
-      // live world but Stop reverts to the Play-press snapshot, silently discarding
-      // it (see agentBridge scene-reload suppression). Ask the renderer for its play
-      // state; if there's no editor to ask (relay throws / unknown op / pure game
-      // runtime), proceed — there's no snapshot that could clobber the edit.
-      try {
-        const st = (await ctx.requestBrowser('editor-state', {}, 2000)) as { playState?: string; unsavedChanges?: boolean } | null;
-        const playState = st?.playState;
-        if (playState === 'playing' || playState === 'paused') {
+      // Probe the renderer ONCE: play state (both paths refuse during Play/Pause — an edit
+      // now would touch the Play snapshot either way), the active scene path (the LIVE path
+      // below only ever exists for the scene actually loaded live — this route can target ANY
+      // scene FILE on disk, loaded or not), and unsavedChanges (only load-bearing on the
+      // FILE-DIRECT fallback below; see its own comment for why).
+      type EditorStateProbe = { playState?: string; unsavedChanges?: boolean; scenePath?: string };
+      let st: EditorStateProbe | null = null;
+      try { st = (await ctx.requestBrowser('editor-state', {}, 2000)) as EditorStateProbe; }
+      catch { /* no editor connected — headless file edit is the only option, and is safe */ }
+      if (st?.playState === 'playing' || st?.playState === 'paused') {
+        return json({
+          error: `game is ${st.playState} — stop the game (press Stop) before editing the scene; edits during Play are discarded on Stop`,
+          playState: st.playState,
+        }, 409);
+      }
+      // ── Live-world path (mcp-persistence.md Phase 2) ──
+      // Route through the live world whenever it's SAFE to: a renderer is connected, its
+      // active scene is the one THIS call targets (the live world only ever represents one
+      // scene — applying to a scene that isn't loaded would silently do nothing), and none of
+      // the ops is `setBaseScene` (no live-world equivalent — it changes what the scene LOADS,
+      // not any live entity's state). Going live makes the edit undoable (ONE composite entry
+      // per call) and — because it no longer needs to overwrite the file out from under the
+      // live world — makes the old "unsaved live work" 409 below unreachable for this call:
+      // the edit joins whatever unsaved work already existed instead of destroying it.
+      const hasSetBaseScene = ops.some((op) => (op as { op?: string })?.op === 'setBaseScene');
+      const canGoLive = !!st && st.scenePath === scenePath && !hasSetBaseScene;
+      if (canGoLive) {
+        try {
+          const live = (await ctx.requestBrowser('apply-scene-ops', { ops }, 30_000)) as {
+            ok: boolean; changed: number; errors: string[]; warnings: string[]; unresolved: EntityRef[];
+          };
+          let saved = false;
+          let saveError: string | undefined;
+          const mode = getPersistenceMode();
+          if (mode === 'auto' && live.changed > 0) {
+            try {
+              const saveResult = (await ctx.requestBrowser('save-all', {}, 60_000)) as { ok?: boolean; scenePath?: string };
+              saved = !!saveResult?.ok;
+            } catch (e) {
+              saveError = e instanceof Error ? e.message : String(e);
+            }
+          }
           return json({
-            error: `game is ${playState} — stop the game (press Stop) before editing the scene; edits during Play are discarded on Stop`,
-            playState,
-          }, 409);
+            ok: live.errors.length === 0, changed: live.changed, errors: live.errors, warnings: live.warnings,
+            saved, mode,
+            ...(saveError ? { saveError } : {}),
+            ...(live.unresolved.length ? { unresolved: live.unresolved } : {}),
+          });
+        } catch (e) {
+          // The live path itself failed (relay error mid-call, not "no editor") — this is NOT
+          // "fall back to file-direct" territory (that would silently re-run the edit against a
+          // stale file while the live world is in an unknown state); surface it.
+          return json({ error: `apply-scene-ops failed: ${e instanceof Error ? e.message : String(e)}` }, 500);
         }
-        // Refuse when the editor has UNSAVED live work — entities created via create_entity /
-        // duplicate_entity / prefab that are not in the scene file yet. This route edits the FILE, and
-        // the resulting disk hot-reload rebuilds the live world FROM that file, silently DESTROYING
-        // those unsaved entities while the tool reported ok:true, changed:N. Save first, then the reload
-        // is lossless. Mirrors the load_scene / new_scene guardUnsaved sibling. (F3)
-        if (st?.unsavedChanges === true) {
-          return json({
-            ok: false,
-            error: `the editor has unsaved live changes (entities created via create_entity / duplicate_entity / prefab are not in the scene file yet). This route edits the FILE, and the write hot-reloads the scene — which would DISCARD that unsaved work. Run modoki_save_all first, then retry.`,
-            unsavedChanges: true,
-          }, 409);
-        }
-      } catch { /* no editor connected — headless file edit, safe to proceed */ }
+      }
+      // ── File-direct fallback (headless curl, no renderer, wrong scene loaded, or setBaseScene) ──
+      // Refuse when the editor has UNSAVED live work — entities created via create_entity /
+      // duplicate_entity / prefab that are not in the scene file yet. This route edits the FILE, and
+      // the resulting disk hot-reload rebuilds the live world FROM that file, silently DESTROYING
+      // those unsaved entities while the tool reported ok:true, changed:N. Save first, then the reload
+      // is lossless. Mirrors the load_scene / new_scene guardUnsaved sibling. (F3) Moot when we just
+      // went live above (that branch returned already) — this only guards the true file-direct case.
+      if (st?.unsavedChanges === true) {
+        return json({
+          ok: false,
+          error: `the editor has unsaved live changes (entities created via create_entity / duplicate_entity / prefab are not in the scene file yet). This route edits the FILE, and the write hot-reloads the scene — which would DISCARD that unsaved work. Run modoki_save_all first, then retry.`,
+          unsavedChanges: true,
+        }, 409);
+      }
       const scene = JSON.parse(fs.readFileSync(absPath, 'utf-8')) as MutableScene;
       // Phase 3, scene-loading.md — a v12+ file has no entity ids; this
       // module still addresses entities by numeric id internally, so backfill one per
@@ -742,6 +799,11 @@ async function describeUnresolvedAgainstLiveWorld(
       // `/api/scene-state`. Opt in with `returnScene` if you genuinely want the file back.
       return json({
         ok: allErrors.length === 0, changed, errors: allErrors, warnings,
+        // This route always writes the FILE when anything changed (Path A — see
+        // mcp-persistence.md); `saved` names that plainly so an agent never
+        // has to infer it from `changed`/`ok`. Phase 2 gives mutate_scene a live-world
+        // path where `saved` can be false in 'manual' mode — until then it mirrors `changed > 0`.
+        saved: changed > 0,
         ...(liveHint ? { hint: liveHint } : {}),
         ...(returnScene && changed > 0 ? { scene } : {}),
       });
@@ -1018,7 +1080,7 @@ async function describeUnresolvedAgainstLiveWorld(
         try { const prev = JSON.parse(fs.readFileSync(abs, 'utf-8')); if (prev?.id) out.id = prev.id; } catch { /* ignore */ }
       }
       writeJsonAtomic(abs, out);
-      return json({ ok: true, warnings, path: assetPath });
+      return json({ ok: true, saved: true, warnings, path: assetPath });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -1039,7 +1101,7 @@ async function describeUnresolvedAgainstLiveWorld(
       data.id = id;
       writeJsonAtomic(abs, data);
       ctx.rebuildManifest(); // register the new asset's GUID
-      return json({ ok: true, path: assetPath, id });
+      return json({ ok: true, saved: true, path: assetPath, id });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -1351,10 +1413,29 @@ async function describeUnresolvedAgainstLiveWorld(
   // state live there). The "see everything a human sees" read.
   if (urlPath === '/api/editor-state' && method === 'GET') {
     try {
-      return json(await ctx.requestBrowser('editor-state', {}));
+      const state = await ctx.requestBrowser('editor-state', {});
+      return json({ ...(state && typeof state === 'object' ? state : {}), persistenceMode: getPersistenceMode() });
     } catch (e) {
       return json({ error: String(e instanceof Error ? e.message : e) }, 504);
     }
+  }
+
+  // ── POST /api/persistence {mode?} (M) ── get/set the session's MCP persistence mode
+  // (mcp-persistence.md). No `mode` ⇒ read-only. Also reports the renderer's
+  // `unsavedChanges` (best-effort — null if no editor is connected) so an agent can see
+  // pending live-world work in the same call it checks the mode in.
+  if (urlPath === '/api/persistence' && method === 'POST') {
+    const { mode } = (body ?? {}) as { mode?: string };
+    if (mode !== undefined) {
+      if (mode !== 'auto' && mode !== 'manual') return json({ error: `mode must be 'auto' or 'manual', got '${mode}'` }, 400);
+      setPersistenceMode(mode);
+    }
+    let unsavedChanges: boolean | null = null;
+    try {
+      const state = (await ctx.requestBrowser('editor-state', {}, 2000)) as { unsavedChanges?: boolean } | null;
+      if (state && typeof state.unsavedChanges === 'boolean') unsavedChanges = state.unsavedChanges;
+    } catch { /* no editor connected — mode is still readable/settable headlessly */ }
+    return json({ mode: getPersistenceMode(), unsavedChanges });
   }
 
   // ── GET /api/editor-journal[?type=&since=&sinceCap=&merged=1&clear=1] (M→R) ── Editor
@@ -1391,10 +1472,17 @@ async function describeUnresolvedAgainstLiveWorld(
       return json({ error: `unknown or missing editor action '${action}' (allowed: ${[...EDITOR_ACTIONS].join(', ')})` }, 400);
     }
     const { action: _omit, ...params } = b;
+    // The asset-shaped ops (mcp-persistence.md Phase 3) apply live either way but
+    // only persist to disk in 'auto' mode — in 'manual' mode they park the pending write in the
+    // renderer's dirty-asset registry instead. The mode lives in THIS process (Node), not the
+    // renderer, so it rides along as an extra param rather than requiring a separate round trip.
+    const relayParams = ASSET_PERSISTENCE_ACTIONS.has(action)
+      ? { ...params, _persistenceMode: getPersistenceMode() }
+      : params;
     try {
       // Scene/resource-touching actions (load-scene, play) can take a while — give
       // them generous headroom over the default relay timeout.
-      return json(await ctx.requestBrowser(action, params, 60_000));
+      return json(await ctx.requestBrowser(action, relayParams, 60_000));
     } catch (e) {
       return json({ error: String(e instanceof Error ? e.message : e) }, 504);
     }
@@ -1589,4 +1677,12 @@ const EDITOR_ACTIONS = new Set<string>([
   // Focus-scope refactor P7: set which panel owns the keyboard, so an agent can steer a
   // panel-scoped chord instead of tapping-and-hoping.
   'set-focus-scope',
+]);
+
+/** The asset-shaped ops that apply live and (in 'auto' mode) also persist to disk —
+ *  mcp-persistence.md Phase 3. Gets `_persistenceMode` injected into its relay
+ *  params so the renderer (which doesn't otherwise know this Node-process-side flag) can
+ *  decide between persisting immediately and parking the write in the dirty-asset registry. */
+const ASSET_PERSISTENCE_ACTIONS = new Set<string>([
+  'particle-set', 'anim-set-clip', 'anim-add-key', 'timeline-set', 'timeline-add-clip',
 ]);

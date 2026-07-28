@@ -18,7 +18,7 @@ const EntityAttributes = trait({ name: '' as string, isActive: true, sortOrder: 
 let testWorld: ReturnType<typeof createWorld>;
 const entityIndex = new Map<number, any>();
 
-vi.mock('../../src/runtime/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
   findEntityById: (id: number) => entityIndex.get(id),
   registerEntity: (e: any) => entityIndex.set(e.id(), e),
@@ -43,18 +43,18 @@ const traitDefs = [
   { name: 'EntityAttributes', trait: EntityAttributes, category: 'component' as const, fields: { name: { type: 'string' }, isActive: { type: 'boolean' }, sortOrder: { type: 'number' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, guid: { type: 'string' }, layer: { type: 'string' } } },
 ];
 
-vi.mock('../../src/runtime/ecs/traitRegistry', () => ({
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getAllTraits: () => traitDefs,
   getTraitByName: (name: string) => traitDefs.find(t => t.name === name),
   transformName: (n: string) => n,
 }));
 
-vi.mock('../../src/three/systems/transformPropagationSystem', () => ({ worldTransforms: new Map() }));
+vi.mock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({ worldTransforms: new Map() }));
 vi.mock('../../src/editor/animation/recording', () => ({ notifyFieldEdited: vi.fn() }));
 
 import { writeTraitFieldWithUndo, deleteEntityWithUndo, createEntityWithUndo } from '../../src/editor/undo/entityActions';
 import { undo, redo, clearHistory, undoDepth } from '../../src/editor/undo/undoManager';
-import { readTraitData } from '../../src/runtime/ecs/entityUtils';
+import { readTraitData } from '../../src/runtime/core/ecs/entityUtils';
 
 const eaMeta = traitDefs[1];
 const tfMeta = traitDefs[0];

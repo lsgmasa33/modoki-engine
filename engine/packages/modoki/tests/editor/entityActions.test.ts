@@ -26,7 +26,7 @@ const PrefabInstance = trait({ source: '', localId: 0, rootInstanceId: 0, parent
 let testWorld: ReturnType<typeof createWorld>;
 const entityIndex = new Map<number, any>();
 
-vi.mock('../../src/runtime/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
   findEntityById: (id: number) => entityIndex.get(id),
   registerEntity: (entity: any) => entityIndex.set(entity.id(), entity),
@@ -77,14 +77,14 @@ const traitDefs = [
   },
 ];
 
-vi.mock('../../src/runtime/ecs/traitRegistry', () => ({
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getAllTraits: () => traitDefs,
   getTraitByName: (name: string) => traitDefs.find(t => t.name === name),
   transformName: (n: string) => n,
 }));
 
 // Mock worldTransforms (used by reparentEntity)
-vi.mock('../../src/three/systems/transformPropagationSystem', () => ({
+vi.mock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
   worldTransforms: new Map(),
 }));
 
@@ -781,7 +781,7 @@ describe('reparentEntity core rules (panels #1)', () => {
   });
 
   it('compensates the local transform on parent change to preserve world position', async () => {
-    const mod = await import('../../src/three/systems/transformPropagationSystem');
+    const mod = await import('../../src/runtime/core/ecs/transformPropagationSystem');
     const wt = mod.worldTransforms as Map<number, any>;
     wt.clear();
     const { reparentEntity } = await getModule();
@@ -797,7 +797,7 @@ describe('reparentEntity core rules (panels #1)', () => {
   });
 
   it('undo restores parent + sortOrder + local transform; redo re-applies', async () => {
-    const mod = await import('../../src/three/systems/transformPropagationSystem');
+    const mod = await import('../../src/runtime/core/ecs/transformPropagationSystem');
     const wt = mod.worldTransforms as Map<number, any>;
     wt.clear();
     const { reparentEntity } = await getModule();

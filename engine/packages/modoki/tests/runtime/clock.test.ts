@@ -3,7 +3,7 @@
  *  a manual clock pins/advances time so a headless run is reproducible. */
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { rawNow, setManualNow, advanceManual, isManualClock, restoreRealClock } from '../../src/runtime/systems/clock';
+import { rawNow, setManualNow, advanceManual, isManualClock, restoreRealClock } from '../../src/runtime/core/clock';
 
 afterEach(() => restoreRealClock());
 

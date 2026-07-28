@@ -20,7 +20,7 @@ See also: [Prefabs](./prefabs.md) · [Scene Loading](./scene-loading.md) · [Vis
 | | Add | Remove |
 |---|---|---|
 | **Child entity** | **new** — `added` list | **new** — `removed` list |
-| **Component (trait)** | already works — captured as an *added-trait override* in `overrides` (`getOverrideValues` `prefab.ts:314`) | **new** — `removedTraits` map |
+| **Component (trait)** | already works — captured as an *added-trait override* in `overrides` (`getOverrideValues` `prefab.ts:658`) | **new** — `removedTraits` map |
 
 Adding a component to an instance already round-trips (whole-trait override) and
 already appears in the Apply dialog as that trait's fields. The three **new**
@@ -39,14 +39,14 @@ nothing happens, because the new child falls through every stage:
 
 | Stage | File / fn | Why the added child is invisible |
 |---|---|---|
-| Capture | `prefab.ts` `captureInstanceOverrides` (`:360`) | Walks members by `PrefabInstance.rootInstanceId`. A freshly-created child has **no `PrefabInstance` trait** (`createEntityWithUndo` spawns only `EntityAttributes`+`Transform`), so it's never visited. |
-| Diff | `prefab.ts` `getOverrideValues` (`:302`) | `prefab.entities.find(e => e.localId === id)` is `undefined` for a localId the prefab lacks → returns `{}`. |
-| Dialog | `ApplyPrefabDialog.tsx` `buildTree` (`:50`) | Renders only entities from that same member walk (and skips tags at `:67`). Nothing to check off. |
-| Apply | `prefab.ts` `applyToPrefabSelective` (`:577`) | Overlays values onto `newPrefab.entities.find(...)`; it can't **insert** an entity. |
+| Capture | `prefab.ts` `captureInstanceOverrides` (`:755`) | Walks members by `PrefabInstance.rootInstanceId`. A freshly-created child has **no `PrefabInstance` trait** (`createEntityWithUndo` spawns only `EntityAttributes`+`Transform`), so it's never visited. |
+| Diff | `prefab.ts` `getOverrideValues` (`:658`) | `prefab.entities.find(e => e.localId === id)` is `undefined` for a localId the prefab lacks → returns `{}`. |
+| Dialog | `ApplyPrefabDialog.tsx` `buildTree` (`:69`) | Renders only entities from that same member walk (and skips tags at `:67`). Nothing to check off. |
+| Apply | `prefab.ts` `applyToPrefabSelective` (`:1480`) | Overlays values onto `newPrefab.entities.find(...)`; it can't **insert** an entity. |
 
 There is also a **silent round-trip bug** independent of *Apply*: an added child
 *is* serialized today (it isn't in `prefabChildIds` since it has no
-`PrefabInstance` trait — `serialize.ts:71`), but with `EntityAttributes.parentId`
+`PrefabInstance` trait — `serialize.ts:265`), but with `EntityAttributes.parentId`
 set to the **save-time ECS id** of a prefab member. On reload the prefab
 re-instantiates with **fresh** ECS ids, so that `parentId` dangles and the child
 orphans (floats to root or vanishes). So added children don't survive a reload

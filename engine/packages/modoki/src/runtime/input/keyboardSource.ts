@@ -25,8 +25,8 @@
  *  Guards `typeof window` so importing it headless is inert; no wall-clock / no RNG. */
 
 import type { InputSource } from './inputSources';
-import type { InputFrame } from './actions';
-import { getPlayState, onPlayStateChange } from '../systems/playState';
+import type { InputFrame } from '../core/inputActions';
+import { getPlayState, onPlayStateChange } from '../core/playState';
 
 const LEFT = ['a', 'arrowleft'];
 const RIGHT = ['d', 'arrowright'];

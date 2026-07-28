@@ -31,7 +31,7 @@ const UIAction = trait(() => ({ bindings: [] as Array<{ event: string; target?: 
 let testWorld: ReturnType<typeof createWorld>;
 const entityIndex = new Map<number, any>();
 
-vi.mock('../../src/runtime/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
   findEntityById: (id: number) => entityIndex.get(id),
   registerEntity: (entity: any) => entityIndex.set(entity.id(), entity),
@@ -87,13 +87,13 @@ const traitDefs = [
   },
 ];
 
-vi.mock('../../src/runtime/ecs/traitRegistry', () => ({
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getAllTraits: () => traitDefs,
   getTraitByName: (name: string) => traitDefs.find(t => t.name === name),
   transformName: (n: string) => n,
 }));
 
-vi.mock('../../src/three/systems/transformPropagationSystem', () => ({
+vi.mock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
   worldTransforms: new Map(),
 }));
 
@@ -293,7 +293,7 @@ describe('moveEntityToScene — undo/redo', () => {
   });
 
   it('preserves world pose across the parent change (decision: preserve, not jump)', async () => {
-    const mod = await import('../../src/three/systems/transformPropagationSystem');
+    const mod = await import('../../src/runtime/core/ecs/transformPropagationSystem');
     const wt = mod.worldTransforms as Map<number, any>;
     wt.clear();
     const { moveEntityToScene } = await getModule();

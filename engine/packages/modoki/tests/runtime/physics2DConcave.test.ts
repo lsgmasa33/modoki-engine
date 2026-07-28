@@ -5,14 +5,14 @@
 
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
-import { SYSTEM_PRIORITY } from '../../src/runtime/systems/pipeline';
-import { Transform } from '../../src/runtime/traits/Transform';
+import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
+import { Transform } from '../../src/runtime/core/traits/Transform';
 import { RigidBody2D } from '../../src/runtime/traits/RigidBody2D';
 import { Collider2D } from '../../src/runtime/traits/Collider2D';
 import { Physics2D } from '../../src/runtime/traits/Physics2D';
-import { physics2DSystem, disposePhysics2D } from '../../src/runtime/systems/physics2DSystem';
-import { initRapier2D } from '../../src/runtime/systems/rapierLoader';
-import { decomposeConcaveToPhys } from '../../src/runtime/systems/concaveDecomp';
+import { physics2DSystem, disposePhysics2D } from '../../src/runtime/physics/physics2DSystem';
+import { initRapier2D } from '../../src/runtime/physics/rapierLoader';
+import { decomposeConcaveToPhys } from '../../src/runtime/physics/concaveDecomp';
 
 // A U/cup opening toward -Y (screen up): solid bottom + two side walls, hollow middle.
 const CUP = '[[-100,-100],[-60,-100],[-60,60],[60,60],[60,-100],[100,-100],[100,100],[-100,100]]';

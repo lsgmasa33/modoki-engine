@@ -18,15 +18,15 @@
 import * as THREE from 'three';
 import type { World } from 'koota';
 import type { Container } from 'pixi.js';
-import { Transform } from '../traits/Transform';
+import { Transform } from '../core/traits/Transform';
 import { ParticleEmitter } from '../traits/ParticleEmitter';
-import { getVisualDelta } from '../systems/getTime';
-import { takeParticleControl } from '../systems/particleControlRegistry';
+import { getVisualDelta } from '../core/getTime';
+import { takeParticleControl } from '../core/particleControlRegistry';
 import { pixiParticleBackend, type IParticle2DBackend } from '../particles/pixiParticleBackend';
 import type { ParticleHandle, ParticleEffectDef } from '../particles/types';
-import { getParticleEffect } from '../loaders/particleCache';
+import { particleDefProvider } from '../particles/particleDefProvider';
 import { getWorldTransform2DInto } from './renderUtils';
-import { deactivatedEntities } from '../../three/systems/transformPropagationSystem';
+import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 
 /** The Scene2D-side wiring this sync needs — all resolved against Scene2D's per-frame state. */
 export interface ParticleSync2DCtx {
@@ -97,7 +97,7 @@ export function syncParticles2D(
     const canvasId = ctx.canvasIdOf(id);
     if (canvasId === null) return; // no Canvas2D ancestor → the 3D particleSync owns this emitter
     if (!pe.isVisible || !pe.effect) return; // disposed by the cleanup pass below
-    const def = getParticleEffect(pe.effect);
+    const def = particleDefProvider.get()?.getParticleEffect(pe.effect) ?? null;
     if (!def) return; // asset still loading — retry next frame
     const slot = ctx.slotContainer(canvasId);
     if (!slot) return; // canvas not allocated yet — retry next frame

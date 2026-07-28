@@ -14,13 +14,28 @@
  *
  *  See docs/managers-and-systems.md ("Time"). */
 
-import { getCurrentWorld, onWorldSwap } from '../ecs/world';
-import { getTime } from '../systems/getTime';
-import { getPlayState, onPlayStateChange } from '../systems/playState';
-import { registerReadSource, unregisterReadSource } from '../ui/readSourceRegistry';
+import { getCurrentWorld, onWorldSwap } from '../core/ecs/world';
+import { getTime } from '../core/getTime';
+import { getPlayState, onPlayStateChange } from '../core/playState';
+import { registerReadSource, unregisterReadSource } from '../core/readSourceRegistry';
 import type { ManagerDef } from './managerRegistry';
 
 const READ_SOURCES = ['deltaTime', 'timeSinceGameStart', 'timeSinceSceneLoad'] as const;
+
+/** Public surface of the {@link timeManager} singleton — event anchors and derived
+ *  reads over the pause-aware engine clock. See the module doc above. */
+export interface TimeManager extends ManagerDef {
+  /** Stamp a named anchor at the current elapsed time. */
+  mark(name: string): void;
+  /** Seconds since a named anchor was stamped (0 if never stamped). */
+  timeSince(name: string): number;
+  /** Current frame delta (seconds), pause- and timeScale-aware. */
+  readonly deltaTime: number;
+  /** Seconds since the game (session) started, or since the last editor Play. */
+  readonly timeSinceGameStart: number;
+  /** Seconds since the current scene finished loading. */
+  readonly timeSinceSceneLoad: number;
+}
 
 class TimeManagerImpl implements ManagerDef {
   name = 'engine.time';
@@ -81,5 +96,7 @@ class TimeManagerImpl implements ManagerDef {
 }
 
 /** The singleton TimeManager. Registered by core (app/ecs/register.ts); call its
- *  methods by importing this directly. */
-export const timeManager = new TimeManagerImpl();
+ *  methods by importing this directly. Typed as {@link TimeManager} (not the
+ *  `Impl` class) so the public surface — and the generated API reference — show
+ *  the documented interface, not the private implementation. */
+export const timeManager: TimeManager = new TimeManagerImpl();

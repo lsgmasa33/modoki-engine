@@ -30,14 +30,14 @@
 
 import type { World } from 'koota';
 import { Graphics, Sprite, Mesh, MeshGeometry, Texture, Rectangle, Assets, Container, Buffer, BufferUsage, type Shader } from 'pixi.js';
-import { deactivatedEntities } from '../../three/systems/transformPropagationSystem';
-import { getCurrentWorld, onWorldSwap } from '../ecs/world';
-import { getAllTraits } from '../ecs/traitRegistry';
+import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
+import { getCurrentWorld, onWorldSwap } from '../core/ecs/world';
+import { getAllTraits } from '../core/ecs/traitRegistry';
 import { Transform, Renderable2D, Collider2D, SkinnedSprite2D, Billboard3D, FlatSprite3D, Text2D, TextAnimation } from '../traits';
 import { MaterialInstance } from '../traits/MaterialInstance';
 import { applyTextAnimation, isTextAnimating, isColorEffect, type TextAnimParams } from './text/textAnimate';
-import { getTime } from '../systems/getTime';
-import { ensureFontLoaded, getLoadedFont } from './text/fontAtlasLoader';
+import { getTime } from '../core/getTime';
+import { ensureFontLoaded, getLoadedFont } from '../loaders/fontAtlasLoader';
 import { getFontTexturePixi } from './text/fontTexturePixi';
 import { loadPixiTexture } from './pixiTextureLoad';
 import { makeMtsdfPixiShader, updateMtsdfPixiStyle } from './text/mtsdfPixiShader';
@@ -47,8 +47,8 @@ import type { TextQuad } from './text/layoutText';
 import { getTextDirtyVersion, onTextDirty } from './text/textDirty';
 import type { MtsdfStyle } from './text/mtsdfStyle';
 import { getCurrentSceneId } from '../scene/SceneManager';
-import { getSkin2DBuffer, clearSkin2DBuffers, frameSkin2DUVs } from '../systems/skin2DBuffers';
-import { clearDeform2DBuffers } from '../systems/deform2DBuffers';
+import { getSkin2DBuffer, clearSkin2DBuffers, frameSkin2DUVs } from '../skinning/skin2DBuffers';
+import { clearDeform2DBuffers } from '../animation/deform2DBuffers';
 import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_2D, PRIORITY_EDITOR_2D } from './frameDriver';
 import { sceneManager } from '../scene/SceneManager';
 import { isImagePath, resolveImageUrl, resolvePrimitiveShape, getWorldTransform2D, resolveSprite, type ResolvedSprite } from './renderUtils';
@@ -65,11 +65,11 @@ import {
   createParticleSync2DState, syncParticles2D, releaseCanvas2DEmitters, disposeParticleSync2DState,
   type ParticleSync2DState, type ParticleSync2DCtx,
 } from './particleSync2D';
-import { addDirtyListener, onStructureDirty } from '../ecs/entityUtils';
-import { isSimRunning, onPlayStateChange } from '../systems/playState';
+import { addDirtyListener, onStructureDirty } from '../core/ecs/entityUtils';
+import { isSimRunning, onPlayStateChange } from '../core/playState';
 import { Canvas2DPool, defaultPool } from './canvas2DPool';
-import { registerBoundsProvider, type EntityScreenBounds } from './screenBounds';
-import { ensurePixiKtxTranscoder } from './pixiKtxTranscoder';
+import { registerBoundsProvider, type EntityScreenBounds } from '../core/screenBounds';
+import { ensurePixiKtxTranscoder } from '../loaders/pixiKtxTranscoder';
 
 // ── Display object tracking ──
 

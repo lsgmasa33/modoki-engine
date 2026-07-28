@@ -18,9 +18,9 @@
  *  behavior for guid-less entities. */
 
 import { type World } from 'koota';
-import { getCurrentWorld, getGuidIndex, findEntityByGuid, indexEntityGuid, rebuildGuidIndexSync } from '../../runtime/ecs/world';
-import { getTraitByName } from '../../runtime/ecs/traitRegistry';
-import { readTraitData, writeTraitField, findEntity } from '../../runtime/ecs/entityUtils';
+import { getCurrentWorld, getGuidIndex, findEntityByGuid, indexEntityGuid, rebuildGuidIndexSync } from '../../runtime/core/ecs/world';
+import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
+import { readTraitData, writeTraitField, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { newGuid } from '../../runtime/loaders/assetManifest';
 
 export interface EntityRef {

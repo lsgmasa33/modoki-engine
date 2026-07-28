@@ -37,9 +37,9 @@ vi.mock('../../src/runtime/rendering/Canvas2DMount', () => ({
 
 import { createWorld } from 'koota';
 import { Transform, EntityAttributes, RenderableUI, UIElement } from '../../src/runtime/traits';
-import { registerTrait } from '../../src/runtime/ecs/traitRegistry';
-import { setCurrentWorld } from '../../src/runtime/ecs/world';
-import { transformPropagationSystem, deactivatedEntities } from '../../src/three/systems/transformPropagationSystem';
+import { registerTrait } from '../../src/runtime/core/ecs/traitRegistry';
+import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
+import { transformPropagationSystem, deactivatedEntities } from '../../src/runtime/core/ecs/transformPropagationSystem';
 import { uiTreeProjection, markUIDirty } from '../../src/runtime/ui/uiTreeStore';
 import { UIRenderer } from '../../src/runtime/ui/UIRenderer';
 

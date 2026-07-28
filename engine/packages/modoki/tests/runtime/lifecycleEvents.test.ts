@@ -4,9 +4,9 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
-import { registerEntity, unregisterEntity, setCurrentWorld } from '../../src/runtime/ecs/world';
-import { journalEvents, clearJournal, setJournalEnabled } from '../../src/runtime/systems/journal';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
+import { registerEntity, unregisterEntity, setCurrentWorld } from '../../src/runtime/core/ecs/world';
+import { journalEvents, clearJournal, setJournalEnabled } from '../../src/runtime/core/journal';
 
 beforeEach(() => { setJournalEnabled(true); });
 

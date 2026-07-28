@@ -42,4 +42,4 @@ export {
   randRange,
   clamp01,
   lerp,
-} from './curves';
+} from '../core/curves';

@@ -27,7 +27,7 @@ const traitsById: Record<number, { name: string; category?: string; fields: Reco
 // MaterialInstance override data the picker reads via readTraitData (per entity id).
 const materialDataById: Record<number, { overrides: unknown[] }> = {};
 
-vi.mock('../../src/runtime/ecs/entityUtils', () => ({
+vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   getAllEntities: () => entities,
   getStructureVersion: () => version,
   getEntityTraits: (id: number) => traitsById[id] ?? [],

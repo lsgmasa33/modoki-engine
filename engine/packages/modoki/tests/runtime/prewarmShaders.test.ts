@@ -21,7 +21,7 @@ beforeEach(() => {
 });
 
 async function setup() {
-  vi.doMock('../../src/three/systems/transformPropagationSystem', () => ({
+  vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
     worldTransforms, deactivatedEntities, transformPropagationSystem: {},
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({

@@ -10,7 +10,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { keyboardSource } from '../../src/runtime/input/keyboardSource';
-import { createInputFrame } from '../../src/runtime/input/actions';
+import { createInputFrame } from '../../src/runtime/core/inputActions';
 
 type Handler = (e: unknown) => void;
 let handlers: Record<string, Handler[]>;

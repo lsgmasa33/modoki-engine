@@ -14,7 +14,7 @@ import crypto from 'crypto';
 import chokidar, { type FSWatcher } from 'chokidar';
 import {
   findAssetRoots, scanAllAssets, buildManifest, resolveAssetPath, absToAssetUrl, classifySceneChange,
-  normalizeWriteGuardKey,
+  normalizeWriteGuardKey, isUnderAssetRoot,
   type AssetRoot,
   type LiveReloadKind,
 } from '../plugins/vite-asset-scanner';
@@ -113,7 +113,13 @@ export function createAssetBackend(opts: {
     pendingRebuild = setTimeout(flushPending, 150);
   };
   const onChange = (file: string) => {
-    if (!assetRoots.some((r) => file.startsWith(r.absDir))) return;
+    // Reuse the scanner's helper rather than a bare `file.startsWith(r.absDir)`, which
+    // has no separator boundary and so also matches a sibling root sharing the prefix
+    // (`<root>-evil`, `…/assets-extra`) — the same shape as the traversal bug fixed in
+    // asset-tree-shaker. Benign here (an extra manifest rebuild, not an escape) because
+    // chokidar is seeded from these very roots, but there's no reason to keep a fourth
+    // hand-rolled copy of containment logic when a tested one is already exported.
+    if (!isUnderAssetRoot(file, assetRoots)) return;
     if (path.extname(file).toLowerCase() === '.json' && !isEditorWrite(file, () => hashFileSync(file))) {
       const rel = file.split(path.sep).join('/');
       // CALL the shared classifier — do NOT re-implement it. This block used to duplicate

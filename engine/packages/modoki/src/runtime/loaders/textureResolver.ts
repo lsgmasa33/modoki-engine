@@ -17,7 +17,11 @@ import {
   resolveTextureSettings, selectVariant, browserVariant, variantSuffix,
   type TextureImportSettings, type TextureWrap,
 } from './textureSettings';
-import { envVariantSuffix, type EnvFormat } from './environmentSettings';
+import { envVariantSuffix, type EnvFormat } from '../core/environmentSettings';
+import { setActiveRendererHandle, isRendererReadyFired, rendererReady } from '../core/activeRenderer';
+export { getActiveRenderer, onRendererReady, rendererReady } from '../core/activeRenderer';
+export type { ResolvedSprite } from '../core/textureProvider';
+import type { ResolvedSprite } from '../core/textureProvider';
 
 const WRAP: Record<TextureWrap, THREE.Wrapping> = {
   repeat: THREE.RepeatWrapping,
@@ -28,24 +32,6 @@ const WRAP: Record<TextureWrap, THREE.Wrapping> = {
 let ktx2Loader: KTX2Loader | null = null;
 let texLoader: THREE.TextureLoader | null = null;
 let detectedCaps = { astc: false };
-
-/** Resolves on the FIRST `setActiveRenderer` call. Editor bootstrap awaits
- *  this before calling `sceneManager.loadScene()` so the KTX2 transcoder has
- *  the GPU caps it needs before any texture load fires — without that
- *  ordering, scene preload races renderer init and KTX2Loader.loadAsync
- *  throws "Missing initialization with .detectSupport()" on the first
- *  ASTC-variant material. Public so callers can await it directly. */
-let _rendererReadyResolve: () => void;
-export const rendererReady: Promise<void> = new Promise((r) => { _rendererReadyResolve = r; });
-let rendererReadyFired = false;
-let activeRenderer: WebGPURenderer | THREE.WebGLRenderer | null = null;
-
-/** The most recently activated renderer, or null before init. Used by the GPU
- *  particle backend to dispatch compute passes (the CPU backend needs no renderer
- *  ref — it uploads via instanced attributes at render time). */
-export function getActiveRenderer(): WebGPURenderer | THREE.WebGLRenderer | null {
-  return activeRenderer;
-}
 
 export function getKTX2Loader(): KTX2Loader {
   if (!ktx2Loader) {
@@ -63,7 +49,6 @@ function getTextureLoader(): THREE.TextureLoader {
  *  formats the GPU supports. Must run after `renderer.init()` for WebGPU.
  *  Idempotent + cheap — safe to call from every renderer creation site. */
 export function setActiveRenderer(renderer: WebGPURenderer | THREE.WebGLRenderer): void {
-  activeRenderer = renderer;
   try {
     const loader = getKTX2Loader();
     loader.detectSupport(renderer as never);
@@ -72,7 +57,7 @@ export function setActiveRenderer(renderer: WebGPURenderer | THREE.WebGLRenderer
   } catch (e) {
     console.warn('[textureResolver] detectSupport failed:', e);
   }
-  if (!rendererReadyFired) { rendererReadyFired = true; _rendererReadyResolve(); }
+  setActiveRendererHandle(renderer);
 }
 
 /** The texture's baked import settings, or defaults when unconverted. */
@@ -110,24 +95,6 @@ export function resolveEnvVariantUrl(ref: string): string | undefined {
  *  when unconverted — drives which three loader the runtime env loader picks. */
 export function getEnvFormat(ref: string): EnvFormat | undefined {
   return getAssetEntry(ref)?.environment?.format;
-}
-
-/** A resolved sprite: the served URL of the texture (or, post-packing, atlas page)
- *  that backs it, the source-pixel frame rect, and the slice's pivot. A whole-texture
- *  ref resolves with `frame: null` (use the entire image). */
-export interface ResolvedSprite {
-  url: string;
-  /** Source-pixel rect within the authored sheet, or null for the whole image.
-   *  The render path scales this to the actually-loaded variant via {@link sheetW}. */
-  frame: { x: number; y: number; w: number; h: number } | null;
-  pivot: { x: number; y: number } | null;
-  /** Source-sheet dims the frame was authored against. When the loaded variant is
-   *  downscaled, multiply frame coords by `loadedTexW / sheetW`. Null ⇒ no scaling. */
-  sheetW: number | null;
-  sheetH: number | null;
-  /** 9-slice border insets (source px), for UI `border-image`. Absent ⇒ plain image.
-   *  `scale` = CSS px drawn per source px of border (Unity PPU-style); absent ⇒ 1. */
-  border?: { l: number; r: number; t: number; b: number; scale?: number };
 }
 
 /** Resolve a built-atlas page's served URL for a member frame, mirroring
@@ -315,7 +282,7 @@ export async function loadTexture3D(ref: string, opts?: { flipY?: boolean }): Pr
   // The synchronous cache check above is preserved, so concurrent acquires of the
   // same texture still dedup to one load. Non-KTX sources (TextureLoader) need no
   // renderer and aren't gated.
-  const gate = isKtx && !rendererReadyFired ? rendererReady : Promise.resolve();
+  const gate = isKtx && !isRendererReadyFired() ? rendererReady : Promise.resolve();
   // Cast unifies the KTX2Loader/TextureLoader loadAsync union (CompressedTexture
   // extends Texture) so the extra `.then` gate doesn't break inference.
   entry.promise = gate.then(() => loader.loadAsync(url) as Promise<THREE.Texture>).then((loaded) => {
@@ -373,14 +340,6 @@ export function getSharedTextureStats(): { count: number; refs: number } {
 export function disposeAllSharedTextures(): void {
   for (const e of texCache.values()) e.texture?.dispose();
   texCache.clear();
-}
-
-/** Subscribe to the FIRST `setActiveRenderer` call. Used by callers that
- *  failed a KTX2 transcode before the renderer was ready, to retry after
- *  the loader's worker has its GPU caps. */
-export function onRendererReady(fn: () => void): void {
-  if (rendererReadyFired) { fn(); return; }
-  rendererReady.then(fn);
 }
 
 /** Drop the shared cache's textures for a ref's variants so a subsequent load

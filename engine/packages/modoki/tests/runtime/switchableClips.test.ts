@@ -1,6 +1,8 @@
 /** switchableClipNames — the discoverable engine.playClip targets per animator trait. */
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
+// Side-effect only: wires core provider slots (P7 C11+) so real-cache tests below resolve correctly.
+import '../../src/runtime/loaders/registerProviders';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
 import { Animator } from '../../src/runtime/traits/Animator';
 import { SpriteAnimator } from '../../src/runtime/traits/SpriteAnimator';

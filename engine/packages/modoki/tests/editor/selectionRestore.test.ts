@@ -21,7 +21,7 @@ const Transform = trait({ x: 0, y: 0, z: 0 });
 const EntityAttributes = trait({ name: '', parentId: 0, sortOrder: 0, layer: '', guid: '' });
 const Persistent = trait({});
 
-vi.mock('../../src/runtime/ecs/traitRegistry', () => {
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
   const traits = [
     { name: 'Transform', trait: Transform, category: 'component', fields: { x: { type: 'number' } } },
     { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: { type: 'string' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, sortOrder: { type: 'number' }, layer: { type: 'string' }, guid: { type: 'string' } } },
@@ -270,7 +270,7 @@ describe('registerSelectionRestore', () => {
   it('is idempotent: registering twice only subscribes one listener', async () => {
     // Capture registered listeners via a mock of the worldRegistry
     const registered: Array<(newWorld: any, oldWorld: any) => void> = [];
-    vi.doMock('../../src/runtime/ecs/world', () => ({
+    vi.doMock('../../src/runtime/core/ecs/world', () => ({
       onWorldSwap: (fn: any) => { registered.push(fn); return () => {}; },
       // editorStore now transitively pulls in entityUtils (via entityRef), which
       // calls setStructureCallback at module load.
@@ -285,13 +285,13 @@ describe('registerSelectionRestore', () => {
     registerSelectionRestore();
 
     expect(registered).toHaveLength(1);
-    vi.doUnmock('../../src/runtime/ecs/world');
+    vi.doUnmock('../../src/runtime/core/ecs/world');
   });
 
   it('wires restoreSelectionAcrossSwap into the onWorldSwap callback', async () => {
     // Intercept the listener at registration time so we can invoke it manually
     let listener: ((newWorld: any, oldWorld: any) => void) | null = null;
-    vi.doMock('../../src/runtime/ecs/world', () => ({
+    vi.doMock('../../src/runtime/core/ecs/world', () => ({
       onWorldSwap: (fn: any) => { listener = fn; return () => {}; },
       getCurrentWorld: () => undefined, findEntityById: () => undefined,
       unregisterEntity: () => {}, setStructureCallback: () => {},
@@ -314,6 +314,6 @@ describe('registerSelectionRestore', () => {
     listener!(newWorld, oldWorld);
 
     expect(useEditorStore.getState().selectedEntityId).toBe(newCamera.id());
-    vi.doUnmock('../../src/runtime/ecs/world');
+    vi.doUnmock('../../src/runtime/core/ecs/world');
   });
 });

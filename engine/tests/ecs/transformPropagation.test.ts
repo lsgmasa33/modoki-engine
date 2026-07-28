@@ -3,7 +3,7 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { createWorld } from 'koota';
-import { transformPropagationSystem, worldTransforms, deactivatedEntities } from '@modoki/engine/three';
+import { transformPropagationSystem, worldTransforms, deactivatedEntities } from '@modoki/engine/runtime';
 import { Transform, EntityAttributes } from '@modoki/engine/runtime';
 
 let w: ReturnType<typeof createWorld>;

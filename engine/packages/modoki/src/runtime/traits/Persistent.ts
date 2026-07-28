@@ -23,7 +23,7 @@
  *  in services outside the ECS, keyed by trait data. */
 
 import { trait, type Entity } from 'koota';
-import { getTraitByName } from '../ecs/traitRegistry';
+import { getTraitByName } from '../core/ecs/traitRegistry';
 
 export const Persistent = trait({});
 

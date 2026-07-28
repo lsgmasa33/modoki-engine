@@ -6,7 +6,7 @@ import { describe, it, expect } from 'vitest';
 import {
   vecEcsToPhys, vecPhysToEcs, angEcsToPhys, angPhysToEcs, lenToPhys, packCollisionGroups,
   parsePointsToPhys,
-} from '../../src/runtime/systems/physics2DConvert';
+} from '../../src/runtime/physics/physics2DConvert';
 
 describe('physics2DConvert', () => {
   it('Y is flipped and scaled by pixelsPerMeter', () => {

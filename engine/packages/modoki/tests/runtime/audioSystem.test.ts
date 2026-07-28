@@ -9,16 +9,16 @@
 
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
-import { Transform } from '../../src/runtime/traits/Transform';
+import { Transform } from '../../src/runtime/core/traits/Transform';
 import { AudioSource } from '../../src/runtime/traits/AudioSource';
 import { AudioListener } from '../../src/runtime/traits/AudioListener';
-import { audioSystem, stopWorldAudio } from '../../src/runtime/systems/audioSystem';
+import { audioSystem, stopWorldAudio } from '../../src/runtime/audio/audioSystem';
 import { cueSound, cueClip } from '../../src/runtime/audio/audioCues';
 import {
   getAudioLog, clearAudioLog, setAudioRecordMode, setBusVolume, resume,
 } from '../../src/runtime/audio/audioService';
-import { getPlayState, setPlayState } from '../../src/runtime/systems/playState';
-import { setTimelinePreviewActive } from '../../src/runtime/systems/timelinePreview';
+import { getPlayState, setPlayState } from '../../src/runtime/core/playState';
+import { setTimelinePreviewActive } from '../../src/runtime/core/timelinePreview';
 import {
   acquireAudio, releaseAudioForScene, disposeAllAudioBuffers, getAudioCacheStats,
   retryFailedAudioDecodes,

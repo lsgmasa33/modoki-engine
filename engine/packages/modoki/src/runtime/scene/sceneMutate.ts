@@ -10,7 +10,7 @@
  *  or the `EntityAttributes.guid`. New entities get the next free numeric id and
  *  a fresh guid. */
 
-import { newGuid } from '../loaders/assetRefRules';
+import { newGuid } from '../core/assetRefRules';
 
 /** Minimal on-disk entity shape (matches editor SerializedEntity / runtime
  *  SceneEntityEntry — kept structural to avoid a cross-layer import). */

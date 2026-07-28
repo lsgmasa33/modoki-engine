@@ -26,7 +26,7 @@
  *  this module along with everything else. */
 
 import { useSyncExternalStore } from 'react';
-import type { TraitMeta } from '../../runtime/ecs/traitRegistry';
+import type { TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 
 export interface TraitClipboardEntry {
   /** Trait name the values were read from. Paste requires an exact match. */

@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { backendFetch } from '../backend/editorBackend';
-import { getGameConfig } from '../../runtime/config';
+import { getGameConfig } from '../../runtime/core/config';
 import { loadAllFonts } from '../../runtime/loaders/fontLoader';
 import {
   instantiatePrefabAsync, setPrefabSource, type PrefabFile, serializePrefab,
@@ -60,7 +60,7 @@ async function instantiatePrefabFromPath(prefabPath: string, _name: string) {
     setPrefabSource(rootId, prefabPath);
     console.log(`[Assets] Instantiated prefab "${prefab.name}"`);
 
-    const { deleteEntity } = await import('../../runtime/ecs/entityUtils');
+    const { deleteEntity } = await import('../../runtime/core/ecs/entityUtils');
     pushAction(makePrefabInstantiateAction({
       label: `Instantiate "${prefab.name}"`,
       initialId: rootId,
@@ -176,7 +176,7 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
     const prefab = serializePrefab(rootId);
 
     // Remove temporary entities from scene
-    const { deleteEntity } = await import('../../runtime/ecs/entityUtils');
+    const { deleteEntity } = await import('../../runtime/core/ecs/entityUtils');
     deleteEntity(rootId);
 
     if (prefab) {
@@ -1868,13 +1868,27 @@ export default function Assets() {
         <ScriptTree filter={filter} hidden={!showScripts} onCount={setScriptCount} />
       </div>
 
-      {/* Footer */}
-      <div style={{ padding: '4px 8px', borderTop: '1px solid #333', color: '#555', fontSize: '10px' }}>
-        {selection.size > 1
-          ? `${selection.size} selected`
-          : (selected || (filtered.length !== flatTotal
-              ? `${filtered.length} of ${flatTotal} assets`
-              : `${flatTotal} assets`))}
+      {/* Footer — a type filter narrowing the list gets a distinct, clickable-to-clear
+          callout (not just the dim count text) so a stale filter from a past session
+          can't silently hide most of a project's assets with no visible sign. */}
+      <div style={{ padding: '4px 8px', borderTop: '1px solid #333', color: '#555', fontSize: '10px', display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span>
+          {selection.size > 1
+            ? `${selection.size} selected`
+            : (selected || (filtered.length !== flatTotal
+                ? `${filtered.length} of ${flatTotal} assets`
+                : `${flatTotal} assets`))}
+        </span>
+        {typeFilter.size > 0 && (
+          <span
+            onClick={() => setTypeFilter(new Set())}
+            title="A type filter is active, hiding non-matching assets — click to clear"
+            data-ui-id="assets.toolbar.typeFilterBanner" data-ui-kind="button" data-ui-label="clear type filter"
+            style={{ color: '#5a8ec5', cursor: 'pointer', textDecoration: 'underline' }}
+          >
+            type filter active ✕
+          </span>
+        )}
       </div>
 
       {ctxMenu && (

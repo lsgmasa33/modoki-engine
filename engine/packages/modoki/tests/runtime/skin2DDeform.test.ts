@@ -5,13 +5,15 @@
  *  doesn't re-write it (epoch). No renderer, no wall-clock. */
 
 import { describe, it, expect, afterEach } from 'vitest';
+// Side-effect only: wires core provider slots (P7 C13) so the real rig2d cache below resolves correctly.
+import '../../src/runtime/loaders/registerProviders';
 import { createWorld } from 'koota';
 import { Transform, SkinnedSprite2D, Bone2D, EntityAttributes } from '../../src/runtime/traits';
-import { skin2DSystem } from '../../src/runtime/systems/skin2DSystem';
-import { getSkin2DBuffer, clearSkin2DBuffers } from '../../src/runtime/systems/skin2DBuffers';
+import { skin2DSystem } from '../../src/runtime/skinning/skin2DSystem';
+import { getSkin2DBuffer, clearSkin2DBuffers } from '../../src/runtime/skinning/skin2DBuffers';
 import {
   beginDeform2DFrame, setDeform2D, clearDeform2DBuffers, getDeform2D, getDeform2DVersion,
-} from '../../src/runtime/systems/deform2DBuffers';
+} from '../../src/runtime/animation/deform2DBuffers';
 import { evalDeformTrack } from '../../src/runtime/animation/deformEval';
 import type { DeformTrack } from '../../src/runtime/animation/types';
 import { setRig2D, clearRig2DCache } from '../../src/runtime/loaders/rig2dCache';

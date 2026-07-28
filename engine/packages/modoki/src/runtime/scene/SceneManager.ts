@@ -22,16 +22,16 @@
  */
 
 import { createWorld, type World, type Entity } from 'koota';
-import { setCurrentWorld, getCurrentWorld, registerEntity } from '../ecs/world';
-import { getAllTraits } from '../ecs/traitRegistry';
+import { setCurrentWorld, getCurrentWorld, registerEntity } from '../core/ecs/world';
+import { getAllTraits } from '../core/ecs/traitRegistry';
 import { resolveKootaSchema } from './sceneSchema';
 import { resolveSceneChain, type SceneRef, type FetchSceneMeta } from './sceneChain';
-import { emit } from '../systems/journal';
+import { emit } from '../core/journal';
 import { clearAllOverrideMarks, getOverrideMarkSet, markOverride } from '../loaders/overrideMarks';
-import { SCENE_FORMAT_VERSION } from '../version';
+import { SCENE_FORMAT_VERSION } from '../core/version';
 
 import { Persistent } from '../traits/Persistent';
-import { Time } from '../traits/Time';
+import { Time } from '../core/traits/Time';
 import { Input } from '../traits/Input';
 import {
   acquireMaterial, acquireMesh, acquireModel, acquirePrefab, acquireEnvironment,
@@ -40,7 +40,7 @@ import {
 } from '../loaders/meshTemplateCache';
 import { acquireRiggedModel } from '../loaders/riggedModelCache';
 import { acquireAudio } from '../loaders/audioBufferCache';
-import { acquireFont } from '../rendering/text/fontAtlasLoader';
+import { acquireFont } from '../loaders/fontAtlasLoader';
 import { registerAsset, isGuid, resolveRef, resolveGuidToPath, getAudioLoadType } from '../loaders/assetManifest';
 import { loadTimelineNow } from '../loaders/timelineCache';
 import { collectTimelineAudioRefs, collectTimelineControlRefs } from '../timeline/types';
@@ -116,9 +116,42 @@ export type BeforeSwapHook = (stagingWorld: World) => Promise<void>;
  *  minting a fresh one. Absent for a scene with no prior stamp (e.g. one authored
  *  before this field existed) — `serializeScene` mints a fresh one only in that
  *  case. */
-type LoadedSceneEntry = { path: string; guid: string; role: 'primary' | 'base'; baseScene?: string; createdAt?: string };
+export type LoadedSceneEntry = { path: string; guid: string; role: 'primary' | 'base'; baseScene?: string; createdAt?: string };
 
-class SceneManagerImpl {
+/** Public surface of the {@link sceneManager} singleton. See the module doc above. */
+export interface SceneManager {
+  /** Register an async hook that runs after entities are spawned into the
+   *  staging world but before the atomic swap. Use for shader prewarm. */
+  registerBeforeSwap(hook: BeforeSwapHook): void;
+  /** Remove a previously-registered beforeSwap hook. */
+  unregisterBeforeSwap(hook: BeforeSwapHook): void;
+  /** Register a callback to run after a specific scene loads (by path or substring match).
+   *  Use '*' as path to match all scenes. */
+  registerSceneCallback(pathPattern: string, callback: () => void): void;
+  /** Remove a previously registered scene callback. */
+  unregisterSceneCallback(pathPattern: string): void;
+  /** The currently-active scene. null until the first loadScene() resolves.
+   *  Returns the PRIMARY scene — the one `loadScene(path)` was called with, as
+   *  opposed to a base loaded additively alongside it. */
+  getCurrent(): Scene | null;
+  /** Every scene currently loaded into the active world — the primary plus any
+   *  base scenes in its chain. */
+  getLoadedScenes(): ReadonlyMap<SceneId, LoadedSceneEntry>;
+  /** The `baseScene` guid ref of the currently-active scene, if any. */
+  getCurrentBaseScene(): string | undefined;
+  /** The scene currently preloading (if any). */
+  getNext(): Scene | null;
+  /** Load a scene file. Cancels any in-flight load. Resolves when the swap is
+   *  complete and the new scene is active. Rejects if the load fails or is
+   *  aborted (the current scene remains untouched on failure). */
+  loadScene(path: string, opts?: LoadOptions): Promise<void>;
+  /** For tests + shutdown. Releases everything and resets the manager. */
+  unloadAll(): Promise<void>;
+  /** For tests: reset the sceneId counter so test runs are deterministic. */
+  resetForTesting(): void;
+}
+
+class SceneManagerImpl implements SceneManager {
   // Multi-scene internals (base-scene plan, Phase 2). With no scene ever declaring
   // `baseScene` yet, every load populates exactly one entry with role 'primary' —
   // behaviourally identical to the old single `currentScene` field. Phase 5 is what
@@ -531,7 +564,7 @@ class SceneManagerImpl {
             // the user added in the editor). Without this, anything beyond the prefab's
             // own traits would be dropped on every reload.
             if (rootEcsId && rootExtraTraits) {
-              const allTraitsMeta = (await import('../ecs/traitRegistry')).getAllTraits();
+              const allTraitsMeta = (await import('../core/ecs/traitRegistry')).getAllTraits();
               for (const e of stagingWorld.entities) {
                 if ((e as unknown as { id(): number }).id() !== rootEcsId) continue;
                 for (const [name, traitData] of Object.entries(rootExtraTraits)) {
@@ -1318,7 +1351,7 @@ async function acquireResource(sceneId: SceneId, ref: SceneResourceRef): Promise
 }
 
 /** The singleton SceneManager. Importers should generally just call sceneManager.loadScene(). */
-export const sceneManager = new SceneManagerImpl();
+export const sceneManager: SceneManager = new SceneManagerImpl();
 
 /** The id of the currently-loaded scene (for scene-scoped resource ownership from
  *  the renderers — e.g. the Text sync acquiring a font not yet in the manifest).
@@ -1329,5 +1362,5 @@ export function getCurrentSceneId(): number | undefined {
 
 // Expose for debug console: window.__sceneManager
 if (typeof window !== 'undefined') {
-  (window as Window & { __sceneManager?: SceneManagerImpl }).__sceneManager = sceneManager;
+  (window as Window & { __sceneManager?: SceneManager }).__sceneManager = sceneManager;
 }

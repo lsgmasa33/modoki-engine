@@ -3,7 +3,7 @@
 
 import * as THREE from 'three';
 import { backendFetch } from '../backend/editorBackend';
-import { getCurrentWorld, registerEntity } from '../../runtime/ecs/world';
+import { getCurrentWorld, registerEntity } from '../../runtime/core/ecs/world';
 import { Transform, EntityAttributes, ModelSource, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, Bone, type MeshAsset, type MaterialAsset } from '../../runtime/traits';
 import { loadModelTemplates, getTemplatesForModel, invalidateModel, invalidateMaterial } from '../../runtime/loaders/meshTemplateCache';
 import { ensureRiggedModelLoaded, invalidateRiggedModel } from '../../runtime/loaders/riggedModelCache';

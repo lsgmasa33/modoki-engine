@@ -1,0 +1,81 @@
+{
+  "_note": "P2 of docs/plans/api-reference-usability-plan.md. Purely editorial — nothing here changes what's exported or documented; it only decides what surfaces first in the sidebar under an 'Essential' bucket (expanded), ahead of the full kind-grouped remainder (collapsed). An unlisted symbol is not 'internal' — it's just not promoted. Completeness is explicitly not required (see the plan); this seeds from the guide's vocabulary (site/docs/guide/core-concepts.md, writing-code-by-hand.md) plus what games/demos actually import. Group headers here are for human readability only — they do not have to match the TypeDoc category a symbol actually renders under (that's derived from its source folder, see typedoc-category-by-folder.mjs); membership is checked by symbol name alone.",
+  "groups": {
+    "ECS core": [
+      "getCurrentWorld", "setCurrentWorld",
+      "registerTrait", "registerSystem", "registerProjection", "SYSTEM_PRIORITY",
+      "Time", "Transform", "getSimDelta", "getVisualDelta", "getTimeScale", "setTimeScale",
+      "stepSimulation", "createTestWorld", "TestWorld",
+      "emit", "journalEvents",
+      "registerUIAction", "dispatchUIAction", "UIActionContext",
+      "getPlayState", "setPlayState",
+      "deleteEntity", "deleteEntities", "findEntityByGuid", "findEntityById", "getAllEntities",
+      "seedRng", "rngFloat", "rngInt", "rngPick",
+      "GameConfig", "setGameConfig", "getGameConfig", "GameDefinition",
+      "registerAppServices", "AppServices",
+      "newGuid", "isGuid"
+    ],
+    "Traits — the vocabulary you place on entities": [
+      "Transform", "Renderable3D", "Renderable2D", "RenderableUI",
+      "Camera", "Input", "Time",
+      "UIElement",
+      "RigidBody2D", "RigidBody3D", "Collider2D", "Collider3D", "Physics2D", "Physics3D",
+      "CharacterController2D", "CharacterController3D",
+      "AudioSource", "AudioListener",
+      "ParticleEmitter",
+      "Animator", "SpriteAnimator", "SkeletalAnimator", "SkinnedModel",
+      "Text2D", "Text3D",
+      "Zone2D", "Zone3D", "Director",
+      "ModelSource", "Persistent", "Paused", "PrefabInstance", "EntityAttributes",
+      "MaterialInstance", "Tint", "Canvas2D"
+    ],
+    "Input reads (inside a system/manager)": [
+      "getInput", "inputAxis", "inputHeld", "inputPressed", "inputReleased",
+      "pointerDown", "pointerDrag", "pointerPos", "pointerPressed", "pointerReleased",
+      "lastInputDevice", "setInputAxis", "setInputPointer"
+    ],
+    "Physics": [
+      "physics2DEvents", "physics3DEvents",
+      "raycast2D", "raycast3D",
+      "applyImpulse2D", "applyImpulse3D",
+      "addForce2D", "addForce3D",
+      "setLinvel2D", "setLinvel3D",
+      "initRapier2D", "initRapier3D"
+    ],
+    "Zones": ["zone2DEvents", "zone3DEvents"],
+    "Timeline": ["timelineEvents", "TimelineDef"],
+    "Particles": ["ParticleEffectDef", "ParticleHandle"],
+    "Audio": [
+      "audioPlay", "cueSound", "cueClip",
+      "setAudioMuted", "setAudioBusVolume",
+      "stopEntityAudio", "stopWorldAudio",
+      "AudioCue", "AudioPlaySpec", "BusName"
+    ],
+    "UI": [
+      "UIRenderer",
+      "setUIValue", "setUIValues", "clearUIValues", "markUIDirty",
+      "requestActivate", "setFocus", "resetFocus",
+      "hostCanvasUnder"
+    ],
+    "Storage": ["PlayerPrefs"],
+    "Rendering — render settings + the mounted components": [
+      "RenderSettings", "getRenderSettings", "SceneRenderer",
+      "Scene3D", "Scene2D", "Game", "Canvas2DMount"
+    ],
+    "Resource Cache & Assets — the resource lifecycle a game/editor touches directly": [
+      "resolveRef", "assetUrl", "AssetType",
+      "acquireModel", "acquireMesh", "acquireMaterial", "acquirePrefab", "releaseAllForScene",
+      "spawnPrefabInstance", "collectResourceRefsFromEntities", "SceneResourceRef"
+    ],
+    "Scenes": ["Scene", "SceneState", "gameIdFromScenePath"],
+    "Managers": [
+      "timeManager", "TimeManager",
+      "navigationManager", "NavigationManager",
+      "sceneManager", "SceneManager",
+      "registerManager", "getActiveGameId"
+    ],
+    "Store": ["useGameStore"],
+    "OTA Updates": ["checkForUpdate", "fetchRelease"],
+    "Debug menu": ["registerDebugCommand", "isDebugMenuEnabled"]
+  }
+}

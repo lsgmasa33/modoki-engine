@@ -40,7 +40,7 @@ let testWorld: ReturnType<typeof createWorld>;
 const entityIndex = new Map<number, any>();
 
 // Mock world module
-vi.mock('../../src/runtime/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
   findEntityById: (id: number) => entityIndex.get(id),
   registerEntity: (entity: any) => entityIndex.set(entity.id(), entity),
@@ -49,7 +49,7 @@ vi.mock('../../src/runtime/ecs/world', () => ({
 }));
 
 // Mock trait registry
-vi.mock('../../src/runtime/ecs/traitRegistry', () => {
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
   const traits = [
     {
       name: 'Transform', trait: Transform, category: 'component',
@@ -97,7 +97,7 @@ afterEach(() => {
 });
 
 async function getUtils() {
-  return import('../../src/runtime/ecs/entityUtils');
+  return import('../../src/runtime/core/ecs/entityUtils');
 }
 
 describe('findEntity', () => {

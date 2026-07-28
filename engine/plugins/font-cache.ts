@@ -18,8 +18,8 @@
 import fs from 'fs';
 import path from 'path';
 import { createHash } from 'crypto';
-import type { FontImportSettings } from '../packages/modoki/src/runtime/loaders/fontSettings';
-import { expandCharset } from '../packages/modoki/src/runtime/loaders/fontSettings';
+import type { FontImportSettings } from '../packages/modoki/src/runtime/core/fontSettings';
+import { expandCharset } from '../packages/modoki/src/runtime/core/fontSettings';
 
 /** Bump when msdf-atlas-gen flags / the converter pipeline change so stale cache
  *  entries are invalidated automatically. */

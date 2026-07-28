@@ -13,7 +13,7 @@ import {
   PLAYABLE_WEBP_QUALITY,
 } from '../../plugins/playable-profile';
 import type { TextureImportSettings } from '../../packages/modoki/src/runtime/loaders/textureSettings';
-import type { EnvImportSettings } from '../../packages/modoki/src/runtime/loaders/environmentSettings';
+import type { EnvImportSettings } from '../../packages/modoki/src/runtime/core/environmentSettings';
 
 const tex = (over: Partial<TextureImportSettings> = {}): TextureImportSettings => ({
   format: 'ktx2-uastc',

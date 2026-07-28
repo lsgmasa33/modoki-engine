@@ -11,8 +11,8 @@ import { createWorld } from 'koota';
 import {
   setCurrentWorld, getCurrentWorld, registerEntity, unregisterEntity,
   findEntityByGuid, indexEntityGuid,
-} from '../../src/runtime/ecs/world';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+} from '../../src/runtime/core/ecs/world';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 
 let world: ReturnType<typeof createWorld>;
 

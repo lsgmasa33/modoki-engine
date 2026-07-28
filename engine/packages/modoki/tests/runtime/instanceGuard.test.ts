@@ -18,7 +18,7 @@ describe('instanceGuard', () => {
   it('sets the counter to 1 and logs nothing on first evaluation', async () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     vi.resetModules();
-    await import('../../src/runtime/instanceGuard');
+    await import('../../src/runtime/core/instanceGuard');
 
     expect(globalThis.__MODOKI_RUNTIME_INSTANCES__).toBe(1);
     expect(errorSpy).not.toHaveBeenCalled();
@@ -29,14 +29,14 @@ describe('instanceGuard', () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     vi.resetModules();
-    await import('../../src/runtime/instanceGuard');
+    await import('../../src/runtime/core/instanceGuard');
     expect(globalThis.__MODOKI_RUNTIME_INSTANCES__).toBe(1);
 
     // Simulate a SECOND, independent copy of this module evaluating (exactly what a
     // botched externalization/dedup failure would do) — resetModules + re-import forces
     // a fresh top-level run, sharing the same globalThis the first copy already touched.
     vi.resetModules();
-    await expect(import('../../src/runtime/instanceGuard')).resolves.toBeDefined();
+    await expect(import('../../src/runtime/core/instanceGuard')).resolves.toBeDefined();
 
     expect(globalThis.__MODOKI_RUNTIME_INSTANCES__).toBe(2);
     expect(errorSpy).toHaveBeenCalledTimes(1);

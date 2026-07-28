@@ -31,12 +31,15 @@ const h = vi.hoisted(() => {
   };
 });
 
-vi.mock('../../src/runtime/loaders/textureResolver', () => ({
-  loadTexture3D: vi.fn(() => Promise.resolve(h.makeTex())),
-  // Fake textures carry no shared-cache key; the real releaseTexture3D disposes a
-  // non-cache texture directly, so model that here to keep the dispose-spy assertions.
-  releaseTexture3D: vi.fn((t?: { dispose?: () => void }) => t?.dispose?.()),
-}));
+vi.mock('../../src/runtime/core/textureProvider', () => {
+  const impl = {
+    loadTexture3D: vi.fn(() => Promise.resolve(h.makeTex())),
+    // Fake textures carry no shared-cache key; the real releaseTexture3D disposes a
+    // non-cache texture directly, so model that here to keep the dispose-spy assertions.
+    releaseTexture3D: vi.fn((t?: { dispose?: () => void }) => t?.dispose?.()),
+  };
+  return { textureProvider: { get: () => impl } };
+});
 vi.mock('../../src/runtime/particles/spriteBillboard', () => ({
   createBillboard: () => ({ mesh: new THREE.Object3D(), outputs: {}, dispose: vi.fn() }),
 }));
@@ -46,8 +49,11 @@ vi.mock('../../src/runtime/particles/meshParticles', () => ({
 vi.mock('../../src/runtime/particles/trailLines', () => ({
   createTrail: () => ({ mesh: new THREE.Object3D(), outputs: {}, dispose: vi.fn() }),
 }));
-vi.mock('../../src/runtime/particles/particleCache', () => ({
-  getParticleEffect: () => null,
+// cpuTslBackend reaches particle-def lookups via the particleDefProvider slot (P7 C8), not
+// a direct particleCache import (which doesn't even exist at this path — the real cache lives
+// at loaders/particleCache.ts). Mock the slot directly instead.
+vi.mock('../../src/runtime/particles/particleDefProvider', () => ({
+  particleDefProvider: { get: () => ({ getParticleEffect: () => null }) },
 }));
 vi.mock('../../src/runtime/particles/cpuSimulator', () => ({
   CpuParticleSim: class {

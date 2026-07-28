@@ -17,15 +17,15 @@ import { takeParsedGltf, clearParsedGltfHandoff } from './parsedGltfHandoff';
 import { addToOwnerSet, removeFromOwnerSet } from './ownerSet';
 import { loadTexture3D, releaseTexture3D, isSharedTexture, resolveEnvVariantUrl, getEnvFormat } from './textureResolver';
 import { clearParticleCache } from './particleCache';
-import { fireDirtyListeners } from '../ecs/entityUtils';
+import { fireDirtyListeners } from '../core/ecs/entityUtils';
 import { clearAnimationClipCache } from './animationClipCache';
 import { clearTimelineCache } from './timelineCache';
-import { clearControlSpawns } from '../systems/controlSpawnRegistry';
+import { clearControlSpawns } from '../timeline/controlSpawnRegistry';
 import { clearAnimSetCache } from './animSetCache';
 import { clearSpriteAnimCache } from './spriteAnimCache';
 import { releaseRiggedModelsForScene, disposeAllRiggedModels, getRiggedOwnerCounts } from './riggedModelCache';
 import { releaseAudioForScene, disposeAllAudioBuffers } from './audioBufferCache';
-import { releaseFontsForScene, disposeAllFonts } from '../rendering/text/fontAtlasLoader';
+import { releaseFontsForScene, disposeAllFonts } from './fontAtlasLoader';
 
 // Ensure built-in material presets (pbr/unlit/custom) are registered regardless
 // of how this module is imported (production main bundle, tests with reset

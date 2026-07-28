@@ -26,8 +26,8 @@
  *  hijack an in-progress drag. */
 
 import type { InputSource } from './inputSources';
-import type { InputFrame } from './actions';
-import { getPlayState, onPlayStateChange } from '../systems/playState';
+import type { InputFrame } from '../core/inputActions';
+import { getPlayState, onPlayStateChange } from '../core/playState';
 
 // Tracked level state of the owning pointer. `activeId` is the pointerId that owns
 // the current gesture (null = no pointer down). start* latch on press for the drag delta.

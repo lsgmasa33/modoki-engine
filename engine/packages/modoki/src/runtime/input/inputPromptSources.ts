@@ -21,11 +21,11 @@
  *  init and unregistered via the returned disposer on dispose (read sources are
  *  NOT auto-cleared on world swap; see readSourceRegistry F9). */
 
-import { peekCurrentWorld } from '../ecs/worldRegistry';
-import { registerReadSource } from '../ui/readSourceRegistry';
+import { peekCurrentWorld } from '../core/ecs/worldRegistry';
+import { registerReadSource } from '../core/readSourceRegistry';
 import { lastInputDevice } from '../traits/Input';
 import { promptFor, PROMPT_ACTIONS } from './inputPrompts';
-import type { InputDevice } from './actions';
+import type { InputDevice } from '../core/inputActions';
 
 function currentDevice(): InputDevice {
   const world = peekCurrentWorld();

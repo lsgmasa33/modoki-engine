@@ -6,28 +6,29 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createWorld } from 'koota';
-import { Time } from '../../src/runtime/traits/Time';
+import { Time } from '../../src/runtime/core/traits/Time';
 import { MaterialInstance, type MaterialParamOverride } from '../../src/runtime/traits/MaterialInstance';
 import { Renderable3DPrimitive } from '../../src/runtime/traits/Renderable3DPrimitive';
-import { setPlayState } from '../../src/runtime/systems/playState';
+import { setPlayState } from '../../src/runtime/core/playState';
 
 // entity.id() → its fake drawable objects. The system reads this through the broker.
 const fakeObjects = new Map<number, { userData: Record<string, unknown>; material?: unknown }[]>();
 vi.mock('../../src/runtime/rendering/materialBroker', () => ({
   getEntityObjects: (_w: unknown, id: number) => fakeObjects.get(id) ?? [],
 }));
-// The prop path resolves the base material from the entity's GUID via meshTemplateCache —
-// mock it to hand back a per-GUID fake base (a clone-able stub).
+// The prop path resolves the base material from the entity's GUID via the
+// rendering/materialProvider slot (P7 C14) — mock it to hand back a per-GUID fake base
+// (a clone-able stub).
 const fakeBases = new Map<string, unknown>();
-vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({
-  resolveMaterial: (guid: string) => fakeBases.get(guid),
+vi.mock('../../src/runtime/rendering/materialProvider', () => ({
+  materialProvider: { get: () => ({ resolveMaterial: (guid: string) => fakeBases.get(guid) }) },
 }));
 // onWorldSwap is a lightweight callback registry; keep the real one (the system
 // registers a clock-clear on it at import) — no THREE pulled in.
 
-import { materialInstanceSystem, resetMaterialInstanceClocks } from '../../src/runtime/systems/materialInstanceSystem';
+import { materialInstanceSystem, resetMaterialInstanceClocks } from '../../src/runtime/rendering/materialInstanceSystem';
 import { resetMaterialInstanceClones } from '../../src/runtime/rendering/materialInstanceClones';
-import { registerReadSource, __resetReadSourcesForTesting } from '../../src/runtime/ui/readSourceRegistry';
+import { registerReadSource, __resetReadSourcesForTesting } from '../../src/runtime/core/readSourceRegistry';
 import { register2DMaterialShaderMap, isEntity2DMaterialDirty } from '../../src/runtime/rendering/sprite2DMaterialBroker';
 
 // koota caps at 16 live worlds/process — track and destroy each test's world.

@@ -448,7 +448,7 @@ describe('refcount cache — environment (HDR)', () => {
     const { acquireEnvironment, getCachedEnvironment } = await getCache();
     // addDirtyListener must come from the SAME fresh module graph the cache calls
     // fireDirtyListeners() on (resetModules wiped both), so import it post-reset here.
-    const { addDirtyListener } = await import('../../src/runtime/ecs/entityUtils');
+    const { addDirtyListener } = await import('../../src/runtime/core/ecs/entityUtils');
     const dirty = vi.fn();
     const unsub = addDirtyListener(dirty);
     try {
@@ -467,7 +467,7 @@ describe('refcount cache — environment (HDR)', () => {
     // setTimeout onLoad fires), then flush: the arriving texture must be disposed (not
     // left owner-less in the cache) and the dirty signal must NOT fire.
     const { acquireEnvironment, releaseEnvironment, getCachedEnvironment } = await getCache();
-    const { addDirtyListener } = await import('../../src/runtime/ecs/entityUtils');
+    const { addDirtyListener } = await import('../../src/runtime/core/ecs/entityUtils');
     const dirty = vi.fn();
     const unsub = addDirtyListener(dirty);
     try {

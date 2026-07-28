@@ -4,15 +4,15 @@
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
-import { SYSTEM_PRIORITY } from '../../src/runtime/systems/pipeline';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { Director } from '../../src/runtime/traits/Director';
 import { OnSequence } from '../../src/runtime/traits/OnSequence';
-import { timelineSystem, previewTimelineStep, previewControlAt } from '../../src/runtime/systems/timelineSystem';
-import { setTimelinePreviewActive } from '../../src/runtime/systems/timelinePreview';
-import { setPlayState } from '../../src/runtime/systems/playState';
-import { takeParticleControl, resetScrubParticleReflect } from '../../src/runtime/systems/particleControlRegistry';
-import { timelineEvents } from '../../src/runtime/managers/TimelineEvents';
+import { timelineSystem, previewTimelineStep, previewControlAt } from '../../src/runtime/timeline/timelineSystem';
+import { setTimelinePreviewActive } from '../../src/runtime/core/timelinePreview';
+import { setPlayState } from '../../src/runtime/core/playState';
+import { takeParticleControl, resetScrubParticleReflect } from '../../src/runtime/core/particleControlRegistry';
+import { timelineEvents } from '../../src/runtime/timeline/TimelineEvents';
 import { setTimeline, getTimeline, clearTimelineCache } from '../../src/runtime/loaders/timelineCache';
 import { drainAudioCues } from '../../src/runtime/audio/audioCues';
 import { normalizeTimeline } from '../../src/runtime/timeline/types';

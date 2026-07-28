@@ -8,18 +8,18 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
-import { SYSTEM_PRIORITY } from '../../src/runtime/systems/pipeline';
+import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
 import { Input, setDigital } from '../../src/runtime/traits/Input';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { UIElement } from '../../src/runtime/traits/UIElement';
 import { UIFocusable } from '../../src/runtime/traits/UIFocusable';
 import { UIAction } from '../../src/runtime/traits/UIAction';
-import { uiFocusSystem } from '../../src/runtime/systems/uiFocusSystem';
-import { registerBoundsProvider, type EntityScreenBounds } from '../../src/runtime/rendering/screenBounds';
+import { uiFocusSystem } from '../../src/runtime/ui/uiFocusSystem';
+import { registerBoundsProvider, type EntityScreenBounds } from '../../src/runtime/core/screenBounds';
 import {
   useFocusStore, resetFocus, pushScope, consumePendingActivation, focusedGuid,
 } from '../../src/runtime/ui/focusManager';
-import { emit } from '../../src/runtime/systems/journal';
+import { emit } from '../../src/runtime/core/journal';
 
 let game: TestWorld | undefined;
 afterEach(() => { game?.dispose(); game = undefined; resetFocus(); });

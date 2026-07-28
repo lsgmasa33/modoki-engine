@@ -15,7 +15,7 @@
  *  the actual playback. */
 
 import { type World } from 'koota';
-import { getCurrentWorld } from '../ecs/worldRegistry';
+import { getCurrentWorld } from '../core/ecs/worldRegistry';
 
 export interface AudioCue {
   /** Named cue → plays any AudioSource whose `playOnCue` matches. */

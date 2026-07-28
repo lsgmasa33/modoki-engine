@@ -5,8 +5,8 @@ import { createWorld, type Entity } from 'koota';
 import {
   emit, entityRef, journalEvents, drainJournal, clearJournal, setJournalTick, setJournalEnabled,
   _resetCaptureSeq,
-} from '../../src/runtime/systems/journal';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+} from '../../src/runtime/core/journal';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { createTestWorld } from '../../src/runtime/harness/createTestWorld';
 
 beforeEach(() => {

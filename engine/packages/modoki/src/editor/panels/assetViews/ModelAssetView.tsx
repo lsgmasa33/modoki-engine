@@ -18,7 +18,7 @@ import { DEFAULT_MODEL_SETTINGS, resolveModelSettings, type ModelImportSettings,
 import { DEFAULT_TEXTURE_SETTINGS, TEXTURE_MAX_SIZES, DEFAULT_UASTC_LEVEL, DEFAULT_UASTC_RDO_LAMBDA, UASTC_LEVELS, resolveTextureSettings, resolveUastcRdoLambda, type TextureImportSettings, type TextureFormat } from '../../../runtime/loaders/textureSettings';
 import { invalidateModel, loadModelTemplates, getTemplatesForModel, getModelHierarchy } from '../../../runtime/loaders/meshTemplateCache';
 import { registerAsset } from '../../../runtime/loaders/assetManifest';
-import { newGuid } from '../../../runtime/loaders/assetRefRules';
+import { newGuid } from '../../../runtime/core/assetRefRules';
 import { decimateMesh, buildCollisionGLB, bytesToBase64, mergeModelGeometry } from '../../scene/collisionMeshGen';
 import { inputStyle, BufferedNumberInput } from '../fields';
 import { ModelPreview } from '../ModelPreview';
@@ -197,7 +197,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       // 2. Browser-side regen of .mesh.json / .mat.json / texture sidecars.
       //    `importModel` spawns entities as a side effect; for a GLB we seed the
       //    prefab from them, then discard them.
-      const { deleteEntity } = await import('../../../runtime/ecs/entityUtils');
+      const { deleteEntity } = await import('../../../runtime/core/ecs/entityUtils');
       const prefix = name.replace(/\s+/g, '_').toLowerCase();
       const rootId = await importModel(path, prefix, postprocessor);
       if (rootId) {

@@ -9,6 +9,7 @@ import { resolveRef, isGuid, registerAsset } from './assetManifest';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT } from './assetFetch';
 import { defaultParticleEffect, type ParticleEffectDef, type CollisionConfig } from '../particles/types';
+import { particleDefProvider } from '../particles/particleDefProvider';
 
 const cache = new Map<string, ParticleEffectDef>();
 const loading = new Map<string, Promise<void>>();
@@ -174,3 +175,5 @@ export function clearParticleCache(): void {
   loading.clear();
   failed.clear();
 }
+
+particleDefProvider.provide({ getParticleEffect });

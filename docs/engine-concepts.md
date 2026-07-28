@@ -96,7 +96,7 @@ registerSystem('space-console/shipShake', shipShakeSystem, SYSTEM_PRIORITY.GAME 
 Priorities run in tiers: `TIME (0)` → `INPUT (50)` → `GAME (100)` →
 `ANIMATION (150)` → `TRANSFORM_PREPASS (170)` → `PHYSICS (175)` →
 `LATE_UPDATE (185)` → `TRANSFORM (200)` → `AUDIO (250)` → `MATERIAL (260)` →
-`PROJECTION (300)` (the full `SYSTEM_PRIORITY` set in `runtime/systems/pipeline.ts`;
+`PROJECTION (300)` (the full `SYSTEM_PRIORITY` set in `runtime/core/pipeline.ts`;
 see `managers-and-systems.md` for what each tier is for). When the sim isn't running
 (editor Stopped/Paused), tiers below `TRANSFORM` are skipped so game time freezes.
 A System may **own UIActions** via `{ actions }` — registered/dropped with it.

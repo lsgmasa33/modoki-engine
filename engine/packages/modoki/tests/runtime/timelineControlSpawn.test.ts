@@ -19,30 +19,35 @@ const h = vi.hoisted(() => ({
   nextId: 500,
 }));
 
-vi.mock('../../src/runtime/loaders/meshTemplateCache', async (orig) => ({
-  ...(await orig<Record<string, unknown>>()),
-  getCachedPrefab: () => h.prefabDef,
-}));
-vi.mock('../../src/runtime/loaders/loadSceneFile', async (orig) => ({
-  ...(await orig<Record<string, unknown>>()),
-  spawnPrefabInstance: (_w: unknown, _p: unknown, opts: { parentId?: number; guidSeed?: string; rootTransform?: Record<string, number> }) => {
-    h.spawnCalls.push({ parentId: opts.parentId, guidSeed: opts.guidSeed, rootTransform: opts.rootTransform });
-    const id = h.nextId++;
-    h.spawnReturns.push(id);
-    return id;
-  },
-}));
-vi.mock('../../src/runtime/ecs/entityUtils', async (orig) => ({
+// timelineSystem now reaches getTimeline/getCachedPrefab/spawnPrefabInstance via the
+// timeline/assetProvider slot (P7 C14) instead of importing loaders/ directly. getTimeline
+// routes to the REAL loaders/timelineCache (this test seeds it via setTimeline for the
+// nested-subdirector case); only the prefab cache + spawn are stubbed.
+vi.mock('../../src/runtime/timeline/assetProvider', async () => {
+  const { getTimeline } = await import('../../src/runtime/loaders/timelineCache');
+  const impl = {
+    getTimeline,
+    getCachedPrefab: () => h.prefabDef,
+    spawnPrefabInstance: (_w: unknown, _p: unknown, opts: { parentId?: number; guidSeed?: string; rootTransform?: Record<string, number> }) => {
+      h.spawnCalls.push({ parentId: opts.parentId, guidSeed: opts.guidSeed, rootTransform: opts.rootTransform });
+      const id = h.nextId++;
+      h.spawnReturns.push(id);
+      return id;
+    },
+  };
+  return { timelineAssetProvider: { get: () => impl } };
+});
+vi.mock('../../src/runtime/core/ecs/entityUtils', async (orig) => ({
   ...(await orig<Record<string, unknown>>()),
   deleteEntity: (id: number) => { h.deleted.push(id); },
 }));
 
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
-import { SYSTEM_PRIORITY } from '../../src/runtime/systems/pipeline';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { Director } from '../../src/runtime/traits/Director';
-import { timelineSystem, previewControlAt, clearPreviewControls } from '../../src/runtime/systems/timelineSystem';
-import { clearControlSpawns } from '../../src/runtime/systems/controlSpawnRegistry';
+import { timelineSystem, previewControlAt, clearPreviewControls } from '../../src/runtime/timeline/timelineSystem';
+import { clearControlSpawns } from '../../src/runtime/timeline/controlSpawnRegistry';
 import { setTimeline, clearTimelineCache } from '../../src/runtime/loaders/timelineCache';
 import { normalizeTimeline } from '../../src/runtime/timeline/types';
 

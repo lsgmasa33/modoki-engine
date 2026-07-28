@@ -243,7 +243,7 @@ trait fields controlled by built-in actions** — and every game gets it for fre
 - **World-space spatial** ✅ SHIPPED — spatial positions now read each entity's
   **world** position, so nested rigs are spatialized correctly. `audioSystem` exposes
   `setAudioWorldPositionResolver` and stays **THREE-free**: the app injects a resolver
-  reading the Three-computed `worldTransforms` cache (`app/ecs/pipeline.ts`), so the
-  Three dep lives on the app side, not in the engine. Falls back to the LOCAL Transform
+  reading the `worldTransforms` cache (`app/ecs/pipeline.ts`), so the THREE dep that cache
+  carries lives on the app side of the seam, not inside `audioSystem`. Falls back to the LOCAL Transform
   when no resolver is wired (standalone/2D). Covered by
   `tests/runtime/audioWorldPosition.test.ts`.

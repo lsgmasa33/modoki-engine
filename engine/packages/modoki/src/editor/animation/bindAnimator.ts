@@ -13,8 +13,8 @@
  *  state (Animator added but clip not in the bank) would be a bound root whose
  *  clip still isn't assigned, i.e. the exact bug this closes. */
 
-import { getTraitByName } from '../../runtime/ecs/traitRegistry';
-import { findEntity } from '../../runtime/ecs/entityUtils';
+import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
+import { findEntity } from '../../runtime/core/ecs/entityUtils';
 import {
   parseAnimClipBank, stringifyAnimClipBank, type AnimatorClip,
 } from '../../runtime/animation/animClipBank';

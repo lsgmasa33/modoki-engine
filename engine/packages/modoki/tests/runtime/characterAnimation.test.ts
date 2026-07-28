@@ -3,15 +3,17 @@
  *  so it verifies headlessly. */
 
 import { describe, it, expect, afterEach } from 'vitest';
+// Side-effect only: wires core provider slots (P7 C11+) so real-cache tests below resolve correctly.
+import '../../src/runtime/loaders/registerProviders';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
-import { SYSTEM_PRIORITY } from '../../src/runtime/systems/pipeline';
-import { Transform } from '../../src/runtime/traits/Transform';
+import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
+import { Transform } from '../../src/runtime/core/traits/Transform';
 import { Renderable2D } from '../../src/runtime/traits/Renderable2D';
 import { SpriteAnimator } from '../../src/runtime/traits/SpriteAnimator';
 import { setSpriteAnim, clearSpriteAnimCache } from '../../src/runtime/loaders/spriteAnimCache';
 import { CharacterController2D } from '../../src/runtime/traits/CharacterController2D';
 import { CharacterAnimator2D } from '../../src/runtime/traits/CharacterAnimator2D';
-import { characterAnimationSystem } from '../../src/runtime/systems/characterAnimationSystem';
+import { characterAnimationSystem } from '../../src/runtime/animation/characterAnimationSystem';
 
 let tw: TestWorld | undefined;
 afterEach(() => { if (tw) { tw.dispose(); tw = undefined; } clearSpriteAnimCache(); });

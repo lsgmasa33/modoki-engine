@@ -1,5 +1,5 @@
 /** Manager registry — the event-driven counterpart to the per-frame System
- *  pipeline (`systems/pipeline.ts`). A Manager owns long-lived state + a method
+ *  pipeline (`core/pipeline.ts`). A Manager owns long-lived state + a method
  *  surface and reacts to events (scene swaps, clicks, SDK callbacks); it has no
  *  per-frame tick. This is symmetric to `registerSystem`: a Manager may own
  *  UIActions (same `actions` shape) that are folded into the action registry on
@@ -26,39 +26,10 @@
  *
  *  See docs/managers-and-systems.md for the full design. */
 
-import type { World } from 'koota';
-import { getCurrentWorld } from '../ecs/world';
-import { registerUIAction, unregisterUIAction, type UIActionHandler, type UIActionDef } from '../ui/actionRegistry';
-
-export type ManagerScope = 'app' | 'scene' | 'game';
-
-/** Passed to a Manager's `init()`. `world` is the active world at activation;
- *  `scenePath` is the scene that triggered it (the current scene for app/game scope). */
-export interface ManagerContext {
-  world: World;
-  scenePath: string;
-}
-
-/** A Manager is a plain singleton implementing this shape. `registerManager`
- *  only wires its lifecycle + owned actions — other code calls its methods by
- *  importing the singleton directly (no service locator). */
-export interface ManagerDef {
-  name: string;
-  /** Default 'scene'. */
-  scope?: ManagerScope;
-  /** Scene scope only: path substrings to match; omit = every scene. */
-  scenes?: string[];
-  /** Game scope only: active-game ids to match; omit = every game. */
-  games?: string[];
-  /** Named UIAction handlers owned by this manager (same shape systems use).
-   *  Registered on activate, removed on deactivate. */
-  actions?: Record<string, UIActionHandler | UIActionDef>;
-  init?(ctx: ManagerContext): void | Promise<void>;
-  /** `ctx` carries the world the manager was operating against (on a scene swap
-   *  this is the OLD world, still alive until just after dispose runs) so a
-   *  dispose can tear down world-bound state on the correct world. Optional. */
-  dispose?(ctx?: ManagerContext): void;
-}
+import { getCurrentWorld } from '../core/ecs/world';
+import { registerUIAction, unregisterUIAction } from '../core/actionRegistry';
+import type { ManagerScope, ManagerContext, ManagerDef } from '../core/managerTypes';
+export type { ManagerScope, ManagerContext, ManagerDef } from '../core/managerTypes';
 
 interface Entry {
   def: ManagerDef;

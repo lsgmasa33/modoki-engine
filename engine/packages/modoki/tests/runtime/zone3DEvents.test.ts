@@ -1,15 +1,15 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import type { Entity } from 'koota';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
-import { SYSTEM_PRIORITY } from '../../src/runtime/systems/pipeline';
-import { setPlayState } from '../../src/runtime/systems/playState';
-import { Transform } from '../../src/runtime/traits/Transform';
+import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
+import { setPlayState } from '../../src/runtime/core/playState';
+import { Transform } from '../../src/runtime/core/traits/Transform';
 import { Zone3D } from '../../src/runtime/traits/Zone3D';
 import { ZoneOccupant } from '../../src/runtime/traits/ZoneOccupant';
 import { OnZone3D } from '../../src/runtime/traits/OnZone3D';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
-import { zone3DSystem } from '../../src/runtime/systems/zone3DSystem';
-import { zone3DEvents } from '../../src/runtime/managers/Zone3DEvents';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
+import { zone3DSystem } from '../../src/runtime/zones/zone3DSystem';
+import { zone3DEvents } from '../../src/runtime/zones/Zone3DEvents';
 
 // Zone systems are internally play-state-gated; run them at their production tier (post-transform).
 const ZONE = { name: 'zone3D', fn: zone3DSystem, priority: SYSTEM_PRIORITY.TRANSFORM + 2 };

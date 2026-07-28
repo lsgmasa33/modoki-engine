@@ -7,7 +7,7 @@
 import { generateGridMesh } from './rig2dTessellate';
 import { computeAutoWeights, type AutoWeightOptions } from './rig2dAutoWeights';
 import { suggestBones } from './rig2dAutoBones';
-import type { Rig2DFile, Rig2DBone } from '../loaders/rig2dCache';
+import type { Rig2DFile, Rig2DBone } from './rig2dTypes';
 
 export interface BuildRig2DOptions {
   /** Rig GUID (top-level `id`); omit to leave unset (caller mints on save). */

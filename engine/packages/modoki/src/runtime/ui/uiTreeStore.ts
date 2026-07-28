@@ -9,11 +9,13 @@
  *  - React components subscribe via Zustand selectors — no polling needed */
 
 import { create } from 'zustand';
-import { onWorldSwap } from '../ecs/world';
-import { getAllTraits, getTraitByName } from '../ecs/traitRegistry';
-import { addDirtyListener } from '../ecs/entityUtils';
-import { isSimRunning } from '../systems/playState';
-import { deactivatedEntities } from '../../three/systems/transformPropagationSystem';
+import { onWorldSwap } from '../core/ecs/world';
+import { getAllTraits, getTraitByName } from '../core/ecs/traitRegistry';
+import { addDirtyListener } from '../core/ecs/entityUtils';
+import { isSimRunning } from '../core/playState';
+import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
+import { markUIDirty, isUIDirty, clearUIDirty } from '../core/uiDirty';
+export { onEditorDirty, setEditorDirtyCallback, markUIDirty } from '../core/uiDirty';
 import type { World } from 'koota';
 import type { UIActionBinding } from './bindings';
 export interface UINodeData {
@@ -75,37 +77,7 @@ export const useUITreeStore = create<UITreeState>(() => ({
   tree: [],
 }));
 
-// ── Dirty flag ──
-
-let _dirty = true; // Start dirty so first frame builds the tree
-
-// Editor dirty subscriber set — Inspector, UIResizeOverlay, etc. subscribe for event-driven refresh.
-const _editorDirtyListeners = new Set<() => void>();
-let _singleEditorCb: (() => void) | null = null;
-
-/** Subscribe to editor dirty notifications. Returns an unsubscribe function. */
-export function onEditorDirty(fn: () => void): () => void {
-  _editorDirtyListeners.add(fn);
-  return () => { _editorDirtyListeners.delete(fn); };
-}
-
-/** Legacy single-callback API for backward compat (Inspector). */
-export function setEditorDirtyCallback(fn: (() => void) | null) {
-  if (_singleEditorCb) _editorDirtyListeners.delete(_singleEditorCb);
-  _singleEditorCb = fn;
-  if (fn) _editorDirtyListeners.add(fn);
-}
-
-function notifyEditorDirty() {
-  for (const fn of _editorDirtyListeners) fn();
-}
-
-/** Mark the UI tree as needing a rebuild. Called from writeTraitField, deleteEntity, etc.
- *  Cost: setting a boolean + notifying editor subscribers. */
-export function markUIDirty() {
-  _dirty = true;
-  notifyEditorDirty();
-}
+// ── Dirty flag (core/uiDirty.ts owns the state — see the import above) ──
 
 // Register listeners lazily on first projection call to avoid module-level side effects in tests
 let _initialized = false;
@@ -127,8 +99,7 @@ function ensureInitialized() {
   addDirtyListener(markUIDirty);
   // Force rebuild on world swap (scene change)
   onWorldSwap(() => {
-    _dirty = true;
-    notifyEditorDirty();
+    markUIDirty();
     _prevById = new Map(); // drop old-scene refs so they're never reused
     useUITreeStore.setState({ tree: [] });
   });
@@ -432,8 +403,8 @@ function buildTree(world: World): UINodeData[] {
 /** ECS system that rebuilds the UI tree when dirty. Register at SYSTEM_PRIORITY.PROJECTION. */
 export function uiTreeProjection(world: World) {
   ensureInitialized();
-  if (!_dirty) return;
-  _dirty = false;
+  if (!isUIDirty()) return;
+  clearUIDirty();
   const tree = buildTree(world);
   useUITreeStore.setState({ tree });
 }

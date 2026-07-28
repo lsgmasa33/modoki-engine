@@ -5,12 +5,12 @@
 
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
-import { Transform } from '../../src/runtime/traits/Transform';
+import { Transform } from '../../src/runtime/core/traits/Transform';
 import { AudioSource } from '../../src/runtime/traits/AudioSource';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
-import { audioSystem, stopWorldAudio, setAudioWorldPositionResolver } from '../../src/runtime/systems/audioSystem';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
+import { audioSystem, stopWorldAudio, setAudioWorldPositionResolver } from '../../src/runtime/audio/audioSystem';
 import { getAudioLog, clearAudioLog, setAudioRecordMode } from '../../src/runtime/audio/audioService';
-import { setPlayState } from '../../src/runtime/systems/playState';
+import { setPlayState } from '../../src/runtime/core/playState';
 import { registerAsset, newGuid, clearManifest } from '../../src/runtime/loaders/assetManifest';
 
 function mintClip(): string {

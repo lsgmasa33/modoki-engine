@@ -7,7 +7,7 @@
  *  controls can register its own tab via `registerDebugTab`. Refreshes on interval. */
 
 import { useEffect, useState, type CSSProperties } from 'react';
-import { getReadSourceNames, getReadValue } from '../../ui/readSourceRegistry';
+import { getReadSourceNames, getReadValue } from '../../core/readSourceRegistry';
 
 const REFRESH_MS = 250;
 

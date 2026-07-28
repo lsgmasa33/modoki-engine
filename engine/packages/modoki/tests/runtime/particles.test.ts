@@ -3,7 +3,7 @@
 import { describe, it, expect } from 'vitest';
 import * as THREE from 'three';
 import { CpuParticleSim, type ParticleOutputs, type TrailOutputs } from '../../src/runtime/particles/cpuSimulator';
-import { sampleCurve, sampleGradientColor, sampleGradientAlpha } from '../../src/runtime/particles/curves';
+import { sampleCurve, sampleGradientColor, sampleGradientAlpha } from '../../src/runtime/core/curves';
 import { composeParticleMatrices } from '../../src/runtime/particles/meshMatrices';
 import { defaultParticleEffect, spriteFrameIndex, clampSimDt, MAX_SIM_DT, seekSteps, SEEK_MAX_STEPS, PREWARM_STEP, MAX_GPU_FORCES, gpuDefSupported, type ParticleEffectDef, type ForceField } from '../../src/runtime/particles/types';
 import { resolveCollider, collide, type CollisionHit } from '../../src/runtime/particles/colliders';

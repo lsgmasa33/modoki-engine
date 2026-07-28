@@ -6,7 +6,7 @@
  *  hot paths — so when it's disabled we say so rather than showing an empty list. */
 
 import { useEffect, useState, type CSSProperties } from 'react';
-import { journalEvents, clearJournal, isJournalEnabled, type GameEvent } from '../../systems/journal';
+import { journalEvents, clearJournal, isJournalEnabled, type GameEvent } from '../../core/journal';
 
 const REFRESH_MS = 300;
 const MAX_ROWS = 100;

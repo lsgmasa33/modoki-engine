@@ -4,7 +4,7 @@ import { describe, it, expect } from 'vitest';
 import {
   parseColliderPoints, serializeColliderPoints, moveVertex, insertVertex, removeVertex,
   nearestEdgeInsertion, minPointsForShape, type Pt,
-} from '../../src/runtime/scene/colliderPoints';
+} from '../../src/runtime/core/colliderPoints';
 
 const TRI: Pt[] = [{ x: -50, y: -50 }, { x: 50, y: -50 }, { x: 0, y: 50 }];
 

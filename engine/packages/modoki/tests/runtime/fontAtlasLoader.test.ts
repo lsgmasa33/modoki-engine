@@ -18,7 +18,7 @@ vi.mock('../../src/runtime/loaders/assetUrl', () => ({
 
 import {
   acquireFont, releaseFontsForScene, getLoadedFont, getFontOwnerCounts, disposeAllFonts,
-} from '../../src/runtime/rendering/text/fontAtlasLoader';
+} from '../../src/runtime/loaders/fontAtlasLoader';
 
 const METRICS = {
   atlas: { type: 'mtsdf', distanceRange: 4, width: 64, height: 64, size: 48, yOrigin: 'top' },

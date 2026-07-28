@@ -27,8 +27,12 @@ import {
   loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, isEditingPrefab,
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, reparentEntity, ensureGuid, type TraitSpec,
   buildEntityCreateSpecs, type CreateEntitySpec,
-  getPrefabSource, instantiatePrefabAsync, serializePrefab, writePrefabFile,
-  resolveExistingPrefabId, tagEntityTreeAsInstance, detachPrefabInstance,
+  writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
+  runAsCompositeAction, markAssetDirty, getDirtyAssetPaths,
+  getPrefabSource, instantiatePrefabAsync, setPrefabSource, serializePrefab, writePrefabFile,
+  resolveExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance,
+  detachPrefabInstance, reattachPrefabInstance,
+  pushAction, makePrefabInstantiateAction, entityRef,
   getEditorViewportCamera, focusEntityInSceneView,
   upsertKey, findTrack, encodeValue, backendFetch,
   readEditorJournal, clearEditorJournal, withEditorActor, openActorLease, closeActorLease,
@@ -36,9 +40,10 @@ import {
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
-  getPlayState, setPlayState, getRunMode, isAdvancing, getCurrentFPS, stepOneFrame, getAllEntities, findEntity, findEntityByGuid,
+  getPlayState, setPlayState, getRunMode, isAdvancing, getCurrentFPS, stepOneFrame, getAllEntities, findEntity, findEntityByGuid, deleteEntity,
   getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents,
   getTimeline, normalizeTimeline, getGuidForPath, getAssetType, getPresentationScale,
+  getAllTraits, type MutateOp, type MutateEntityRef,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
 } from '@modoki/engine/runtime';
 
@@ -73,7 +78,12 @@ function readEditorState() {
     scenePath: getCurrentScenePath(),
     // Live-world work not on disk. Anything reading the scene FILE (set_transform,
     // mutate_scene, build) is looking at a DIFFERENT world while this is true. (C7)
+    // Also true while a dirty asset (below) is pending — see hasUnsavedChanges()'s own comment.
     unsavedChanges: hasUnsavedChanges(),
+    // Pending 'manual'-mode particle/anim/timeline writes (mcp-persistence.md
+    // Phase 3) — omitted when empty (nothing pending has nothing to show). A dirty asset an
+    // agent can't SEE is the same silent-loss trap `unsavedChanges` already exists to close.
+    ...(getDirtyAssetPaths().length ? { dirtyAssetPaths: getDirtyAssetPaths() } : {}),
     playState: getPlayState(),
     runMode: getRunMode(),   // 'stopped' | 'scrub' | 'preview' | 'playing' (preview-mode-refactor)
     advancing: isAdvancing(), // false = a frozen frame (Play paused, or a paused preview)
@@ -180,6 +190,123 @@ function requireLiveId(ref: { id?: number; guid?: string } | undefined, op: stri
     throw new Error(`${op}: ${what} matched no live entity — it may be stale (runtime ids are reassigned on every scene reload; prefer addressing by guid). Re-read it with get_scene_state.`);
   }
   return id;
+}
+
+/** Resolve a `mutate_scene`-shaped entity ref ({id}|{name}|{guid}) against the LIVE world —
+ *  the live-path twin of sceneMutate.ts's `resolveEntity` (which resolves against the FILE).
+ *  `name` is not covered by `resolveLiveId` (structural ops only ever took id/guid), so this
+ *  adds it for parity with the file-direct op vocabulary. */
+function resolveLiveEntityRef(ref: MutateEntityRef | undefined): number | null {
+  if (!ref) return null;
+  if (ref.guid) { const e = findEntityByGuid(ref.guid); return e ? e.id() : null; }
+  if (ref.id != null) return findEntity(ref.id) ? ref.id : null;
+  if (ref.name) { const e = getAllEntities().find((en) => en.name === ref.name); return e ? e.id : null; }
+  return null;
+}
+
+/** Core traits every entity needs — mirrors sceneMutate.ts's CORE_TRAITS. removeTrait refuses
+ *  to drop these live too (a human can't remove them in the Inspector either). */
+const LIVE_CORE_TRAITS = new Set(['Transform', 'EntityAttributes']);
+
+/** The live-world twin of sceneMutate.ts's `applyOps` — same {@link MutateOp} vocabulary
+ *  (setTrait / removeTrait / addEntity / removeEntity), applied to the running ECS world via
+ *  the existing undoable `*WithUndo` helpers instead of a scene-file JSON object, wrapped in
+ *  ONE composite undo entry (compositeAction.ts) so an N-op tool call is one Cmd-Z.
+ *
+ *  `setBaseScene` has NO live-world equivalent — it changes what the scene *loads*, not any
+ *  live entity's state — so it is refused here entirely; the caller (the `/api/scene-mutate`
+ *  route) keeps any call containing it on the file-direct path regardless of persistence mode
+ *  (mcp-persistence.md Phase 2 "setBaseScene" caveat).
+ *
+ *  Deliberately NOT at full parity with `applyOps`: it does not detect unknown-field typos
+ *  against the trait schema, and removeEntity does not scan for now-dangling UIAction
+ *  references. Both are diagnostic niceties on the file-direct path (schema/warnings live
+ *  there), not correctness requirements for the live world — a follow-up can port them if an
+ *  agent actually hits one live. */
+async function applySceneOpsLive(ops: MutateOp[]): Promise<{
+  changed: number; errors: string[]; warnings: string[]; unresolved: MutateEntityRef[];
+}> {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const unresolved: MutateEntityRef[] = [];
+  let changed = 0;
+  const allTraitsList = getAllTraits();
+
+  await runAsCompositeAction({ label: `Mutate Scene (${ops.length} op${ops.length === 1 ? '' : 's'})`, kind: '!mutate' }, () => {
+    for (let i = 0; i < ops.length; i++) {
+      const op = ops[i];
+      const where = `op[${i}] (${op?.op ?? 'unknown'})`;
+      try {
+        if (op.op === 'setTrait') {
+          const id = resolveLiveEntityRef(op.entity);
+          if (id == null) { errors.push(`${where}: no LIVE entity matching ${JSON.stringify(op.entity)}`); unresolved.push(op.entity); continue; }
+          if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
+          const meta = allTraitsList.find((t) => t.name === op.trait);
+          if (!meta) { errors.push(`${where}: unknown trait '${op.trait}' — list traits with modoki_list_traits`); continue; }
+          const fields = op.fields ?? {};
+          const entity = findEntity(id);
+          if (Object.keys(fields).length === 0) {
+            // No fields → tag presence, mirroring sceneMutate.ts (don't clobber existing data;
+            // re-tagging an existing trait is a genuine no-op, not a change).
+            if (entity && !entity.has(meta.trait)) { addTraitToEntitiesWithUndo([id], meta); changed++; }
+          } else if (entity && !entity.has(meta.trait)) {
+            // The entity doesn't have this trait yet — ADD it seeded with `fields`, mirroring
+            // sceneMutate.ts's setTrait (merge onto an empty base when absent). Without this,
+            // writeTraitFieldWithUndo below silently no-ops on a missing trait (it requires the
+            // entity to already have it) while still reporting changed:1 and pushing an inert
+            // undo entry — a live-path-only regression from file-direct parity, found while
+            // testing the composite-batch removeTrait+removeEntity case.
+            addTraitToEntitiesWithUndo([id], meta, fields);
+            changed++;
+          } else {
+            // writeTraitFieldWithUndo already routes into prefab-INSTANCE overrides
+            // (markFieldOverrideIfInstance) — the live-world equivalent of sceneMutate.ts's
+            // traitWriteContainer comes for free from the existing helper, not reimplemented here.
+            for (const [field, value] of Object.entries(fields)) writeTraitFieldWithUndo(id, meta, field, value);
+            changed++;
+          }
+        } else if (op.op === 'removeTrait') {
+          const id = resolveLiveEntityRef(op.entity);
+          if (id == null) { errors.push(`${where}: no LIVE entity matching ${JSON.stringify(op.entity)}`); unresolved.push(op.entity); continue; }
+          if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
+          if (LIVE_CORE_TRAITS.has(op.trait)) { errors.push(`${where}: cannot remove core trait '${op.trait}'`); continue; }
+          const meta = allTraitsList.find((t) => t.name === op.trait);
+          if (!meta) { errors.push(`${where}: unknown trait '${op.trait}'`); continue; }
+          const entity = findEntity(id);
+          if (entity?.has(meta.trait)) { removeTraitFromEntitiesWithUndo([id], meta); changed++; }
+          // Removing an absent trait is a genuine no-op, not an error (mirrors sceneMutate.ts).
+        } else if (op.op === 'addEntity') {
+          const parentRaw = op.parentId;
+          const parentId = typeof parentRaw === 'number' ? parentRaw
+            : typeof parentRaw === 'string' ? (resolveLiveEntityRef({ guid: parentRaw }) ?? 0)
+            : 0;
+          const specs: TraitSpec[] = Object.entries(op.traits ?? {}).map(([name, data]) => ({
+            name, data: data === true ? undefined : data as Record<string, unknown>,
+          }));
+          if (!specs.some((s) => s.name === 'EntityAttributes')) {
+            specs.push({ name: 'EntityAttributes', data: { name: op.name ?? 'New Entity', parentId } });
+          } else if (op.name) {
+            const attrs = specs.find((s) => s.name === 'EntityAttributes')!;
+            attrs.data = { ...(attrs.data ?? {}), name: op.name, parentId };
+          }
+          const newId = createEntityWithUndo(op.name ?? 'Add Entity', parentId, specs, () => {});
+          if (newId == null) { errors.push(`${where}: nothing was created (an unregistered trait in ${JSON.stringify(Object.keys(op.traits ?? {}))}?)`); continue; }
+          changed++;
+        } else if (op.op === 'removeEntity') {
+          const id = resolveLiveEntityRef(op.entity);
+          if (id == null) { errors.push(`${where}: no LIVE entity matching ${JSON.stringify(op.entity)}`); unresolved.push(op.entity); continue; }
+          deleteEntitiesWithUndo([id]);
+          changed++;
+        } else {
+          errors.push(`${where}: '${(op as { op?: string }).op}' has no live-world equivalent`);
+        }
+      } catch (e) {
+        errors.push(`${where}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  });
+
+  return { changed, errors, warnings, unresolved };
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────
@@ -550,14 +677,17 @@ export function registerEditorAgentOps(): void {
     // can even resolve to the WRONG entity in a scene file. This path already mints a guid
     // internally and threw it away, leaving the one identifier the docs mandate
     // unobtainable from the tool that creates the entity. (C7)
-    return { id, name, guid: ensureGuid(id) };
+    // `saved: false` — this is a Path B (live-world) op; nothing reaches disk until
+    // modoki_save_all (mcp-persistence.md). Explicit rather than implied so an
+    // agent never has to infer persistence from the tool description alone.
+    return { id, name, guid: ensureGuid(id), saved: false };
   });
   registerAgentOp('duplicate-entity', (params) => {
     const p = (params ?? {}) as { id?: number; guid?: string };
     const id = requireLiveId(p, 'duplicate-entity'); // guid wins; throws on a stale ref (C7 re-audit)
     const newId = duplicateEntity(id, (i) => setSelectionRaw(i, i != null ? [i] : []));
     if (newId == null) throw new Error(`duplicate-entity: nothing was duplicated for entity ${id} (does it exist?)`); // C7
-    return { id: newId, guid: ensureGuid(newId) }; // stable handle — see create-entity (C7)
+    return { id: newId, guid: ensureGuid(newId), saved: false }; // stable handle — see create-entity (C7)
   });
   registerAgentOp('delete-entities', (params) => {
     // Accept guids (stable) and/or ids, resolving each to a LIVE id. This closes the C7 residual:
@@ -583,7 +713,7 @@ export function registerEditorAgentOps(): void {
       throw new Error('delete-entities: none of the requested entities exist — nothing was deleted. Runtime ids are reassigned on every scene reload; re-read them with get_scene_state, or address entities by guid.');
     }
     deleteEntitiesWithUndo(deleted, (sel) => setSelectionRaw(sel[0] ?? null, sel));
-    return { ok: true, deleted, ...(missing.length ? { skipped: missing, warning: `${missing.length} ref(s) matched no live entity and were skipped (ids are reassigned on scene reload — prefer guid)` } : {}) };
+    return { ok: true, deleted, saved: false, ...(missing.length ? { skipped: missing, warning: `${missing.length} ref(s) matched no live entity and were skipped (ids are reassigned on scene reload — prefer guid)` } : {}) };
   });
   registerAgentOp('reparent-entity', (params) => {
     // guid (stable) wins over id for BOTH the moved entity and the new parent — the reparent is
@@ -597,30 +727,86 @@ export function registerEditorAgentOps(): void {
     if (!ok) {
       throw new Error(`reparent-entity: refused to move ${id} under ${parentId} — the move is illegal (self-parent, or ${parentId} is a descendant of ${id}).`);
     }
-    return { ok };
+    return { ok, saved: false };
+  });
+
+  // ── Live-world scene mutation (mcp-persistence.md Phase 2) ──
+  // The live-world twin of /api/scene-mutate's file-based applyOps — same MutateOp
+  // vocabulary (setTrait/removeTrait/addEntity/removeEntity), one composite undo entry
+  // per call. `setBaseScene` has no live equivalent; the backend route keeps any call
+  // containing it on the file-direct path instead of reaching this op at all.
+  registerAgentOp('apply-scene-ops', async (params) => {
+    const p = (params ?? {}) as { ops?: MutateOp[] };
+    if (!Array.isArray(p.ops) || p.ops.length === 0) throw new Error('apply-scene-ops requires a non-empty { ops } array');
+    const { changed, errors, warnings, unresolved } = await applySceneOpsLive(p.ops);
+    return { ok: errors.length === 0, changed, errors, warnings, unresolved, saved: false };
   });
 
   // ── Prefab ops ──
+  //  All three actions mutate the LIVE world (instantiate spawns entities; create/detach
+  //  tag or strip PrefabInstance traits) and must therefore push an undo entry — not just
+  //  so the human can Cmd-Z the agent's work, but because `pushAction` is the ONLY thing
+  //  that bumps `_editVersion`, i.e. the only thing that makes `hasUnsavedChanges()` true.
+  //  Without it these ops were live-only yet reported `unsavedChanges: false`, so neither
+  //  `guardUnsaved` (load_scene / new_scene) nor the /api/scene-mutate 409 fired, and the
+  //  next file-write hot-reload silently DESTROYED the agent's prefab work while every tool
+  //  had reported ok:true. Mirrors Hierarchy.tsx / Assets.tsx / Inspector.tsx.
   registerAgentOp('prefab', async (params) => {
     const p = (params ?? {}) as PrefabParams;
     if (p.action === 'instantiate') {
       if (!p.path) throw new Error('prefab instantiate requires { path }');
-      const prefab = await getPrefabSource(p.path);
-      if (!prefab) throw new Error(`prefab not found: ${p.path}`);
+      const path = p.path;
+      const prefab = await getPrefabSource(path);
+      if (!prefab) throw new Error(`prefab not found: ${path}`);
+      // Track the parent by guid: `redo` can run after a world rebuild (Play→Stop), where a
+      // raw parent id would resolve to a DIFFERENT entity and reparent the instance silently.
       const parentId = p.parentGuid ? requireLiveId({ guid: p.parentGuid }, 'prefab instantiate parent') : (p.parentId ?? 0);
+      const parentRef = parentId ? entityRef(parentId) : null;
       const rootId = await instantiatePrefabAsync(prefab as PrefabFile, parentId);
+      // The human paths all pair instantiate with setPrefabSource — without it the spawned
+      // tree carries no link back to the prefab, so overrides/revert/apply have no source.
+      setPrefabSource(rootId, path);
       setSelectionRaw(rootId, [rootId]);
-      return { ok: true, rootId, guid: ensureGuid(rootId) };
+      pushAction(makePrefabInstantiateAction({
+        label: `Instantiate "${(prefab as PrefabFile).name ?? path}"`,
+        initialId: rootId,
+        respawn: async () => {
+          const again = await getPrefabSource(path);
+          if (!again) return null;
+          const id = await instantiatePrefabAsync(again as PrefabFile, parentRef ? (parentRef.resolve() ?? 0) : 0);
+          setPrefabSource(id, path);
+          return id;
+        },
+        remove: (id) => { deleteEntity(id); },
+      }));
+      return { ok: true, rootId, guid: ensureGuid(rootId), saved: false };
     }
     if (p.action === 'create') {
       if ((p.entityId == null && !p.entityGuid) || !p.path) throw new Error('prefab create requires { entityId | entityGuid, path }');
+      const path = p.path;
       const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab create'); // guid wins (C7 re-audit)
-      const existingId = await resolveExistingPrefabId(p.path);
+      const existingId = await resolveExistingPrefabId(path);
       const prefab = serializePrefab(entityId, existingId);
       if (!prefab) throw new Error(`could not serialize prefab from entity ${entityId}`);
-      const ok = await writePrefabFile(p.path, prefab);
-      if (ok) tagEntityTreeAsInstance(entityId, p.path);
-      return { ok, source: p.path };
+      const ok = await writePrefabFile(path, prefab);
+      if (ok) {
+        tagEntityTreeAsInstance(entityId, path);
+        // Undo reverts the LIVE tagging only — deliberately NOT the file write. Deleting the
+        // .prefab.json on undo (as the human path does for a brand-new prefab) is wrong here:
+        // this op also OVERWRITES an existing prefab (`existingId` preserves its GUID), and
+        // undoing an overwrite by deleting the file would destroy an asset the agent never
+        // created. File-direct writes are not undoable anywhere else in the MCP surface either.
+        const ref = entityRef(entityId);
+        pushAction({
+          label: `Create prefab "${prefab.name ?? path}" (link only)`,
+          undo: () => { const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id); },
+          redo: () => { const id = ref.resolve(); if (id != null) tagEntityTreeAsInstance(id, path); },
+        });
+      }
+      // `saved` describes the .prefab.json FILE write (ok). The live-world PrefabInstance
+      // TAG on the source entity is separate and unsaved until modoki_save_all — reported so
+      // an agent doesn't conflate "the asset file landed" with "the scene linkage did too".
+      return { ok, source: path, saved: ok, sceneLinkageSaved: false };
     }
     if (p.action === 'detach') {
       if (p.entityId == null && !p.entityGuid) throw new Error('prefab detach requires { entityId | entityGuid }');
@@ -632,7 +818,16 @@ export function registerEditorAgentOps(): void {
       if (!snapshot.length) {
         throw new Error(`prefab detach: entity ${entityId} is not a prefab instance (nothing to unpack). Only an instantiated prefab can be detached.`);
       }
-      return { ok: true, detached: snapshot.length };
+      // Same entry the Hierarchy "Detach Prefab" menu pushes: undo re-attaches from the
+      // snapshot, redo re-resolves by guid (the raw id is stale after a world rebuild).
+      const name = getAllEntities().find(e => e.id === entityId)?.name ?? String(entityId);
+      const ref = entityRef(entityId);
+      pushAction({
+        label: `Detach prefab "${name}"`,
+        undo: () => { reattachPrefabInstance(snapshot); },
+        redo: () => { const id = ref.resolve(); if (id != null) detachPrefabInstance(id); },
+      });
+      return { ok: true, detached: snapshot.length, saved: false };
     }
     throw new Error(`unknown prefab action '${(p as { action?: string }).action}'`);
   });
@@ -646,31 +841,32 @@ export function registerEditorAgentOps(): void {
     return { ok: true, playhead: useEditorStore.getState().playheadTime };
   });
 
-  // Replace a particle effect def — applies LIVE (cache) AND persists to disk.
+  // Replace a particle effect def — applies LIVE (cache) AND persists to disk (or, in
+  // 'manual' mode, parks the write in the dirty-asset registry — Phase 3).
   registerAgentOp('particle-set', async (params) => {
-    const { path, def } = (params ?? {}) as { path?: string; def?: unknown };
+    const { path, def, _persistenceMode } = (params ?? {}) as { path?: string; def?: unknown; _persistenceMode?: unknown };
     if (!path || !def) throw new Error('particle-set requires { path, def }');
     const { errors, warnings } = validateAssetData('particle', def);
     if (errors.length) return { ok: false, errors, warnings };
     useEditorStore.getState().applyParticleDef(path, def as Parameters<ReturnType<typeof useEditorStore.getState>['applyParticleDef']>[1]);
-    await persistAsset(path, 'particle', def);
-    return { ok: true, warnings };
+    const saved = await persistOrMarkDirty(path, 'particle', def, _persistenceMode);
+    return { ok: true, saved, warnings };
   });
 
-  // Replace an animation clip — normalize, apply LIVE, persist.
+  // Replace an animation clip — normalize, apply LIVE, persist (or park — Phase 3).
   registerAgentOp('anim-set-clip', async (params) => {
-    const { clipPath, clip } = (params ?? {}) as { clipPath?: string; clip?: unknown };
+    const { clipPath, clip, _persistenceMode } = (params ?? {}) as { clipPath?: string; clip?: unknown; _persistenceMode?: unknown };
     if (!clipPath || !clip) throw new Error('anim-set-clip requires { clipPath, clip }');
     const norm = normalizeAnimationClip(clip as Partial<AnimationClipDef>);
     useEditorStore.getState().applyAnimationClip(clipPath, norm);
-    await persistAsset(clipPath, 'animation', norm);
-    return { ok: true, tracks: norm.tracks.length };
+    const saved = await persistOrMarkDirty(clipPath, 'animation', norm, _persistenceMode);
+    return { ok: true, saved, tracks: norm.tracks.length };
   });
 
   // Add/update one keyframe at a time — the granular "first-pass timing" primitive.
-  // Creates the track if absent. Applies LIVE + persists.
+  // Creates the track if absent. Applies LIVE + persists (or parks — Phase 3).
   registerAgentOp('anim-add-key', async (params) => {
-    const p = (params ?? {}) as { clipPath?: string; path?: string; trait?: string; field?: string; time?: number; value?: unknown; type?: TrackValueType };
+    const p = (params ?? {}) as { clipPath?: string; path?: string; trait?: string; field?: string; time?: number; value?: unknown; type?: TrackValueType; _persistenceMode?: unknown };
     if (!p.clipPath || !p.trait || !p.field || p.time == null) {
       throw new Error('anim-add-key requires { clipPath, trait, field, time, value }');
     }
@@ -687,13 +883,14 @@ export function registerEditorAgentOps(): void {
     if (!track) { track = { path: relPath, trait: p.trait, field: p.field, type: p.type ?? 'number', keys: [] }; next.tracks.push(track); }
     track.keys = upsertKey(track.keys, Number(p.time), encodeValue(track.type, p.value));
     useEditorStore.getState().applyAnimationClip(p.clipPath, next);
-    await persistAsset(p.clipPath, 'animation', next);
-    return { ok: true, tracks: next.tracks.length, keys: track.keys.length };
+    const saved = await persistOrMarkDirty(p.clipPath, 'animation', next, p._persistenceMode);
+    return { ok: true, saved, tracks: next.tracks.length, keys: track.keys.length };
   });
 
-  // Replace a whole timeline — normalize, apply LIVE (the panel + runtime cache), persist.
+  // Replace a whole timeline — normalize, apply LIVE (the panel + runtime cache), persist
+  // (or park — Phase 3).
   registerAgentOp('timeline-set', async (params) => {
-    const { timelinePath, timeline } = (params ?? {}) as { timelinePath?: string; timeline?: unknown };
+    const { timelinePath, timeline, _persistenceMode } = (params ?? {}) as { timelinePath?: string; timeline?: unknown; _persistenceMode?: unknown };
     if (!timelinePath || !timeline) throw new Error('timeline-set requires { timelinePath, timeline }');
     const before = countTimelineItems(timeline as Partial<TimelineDef>);
     const norm = normalizeTimeline(timeline as Partial<TimelineDef>);
@@ -706,14 +903,14 @@ export function registerEditorAgentOps(): void {
       throw new Error(`timeline-set: ${before - after} of ${before} item(s) rejected by normalization (malformed — span end<=start, empty clip/action name, or missing audio clip GUID). Nothing was saved; fix the items and retry.`);
     }
     useEditorStore.getState().applyTimelineDoc(timelinePath, norm);
-    await persistAsset(timelinePath, 'timeline', norm);
-    return { ok: true, tracks: norm.tracks.length, items: after };
+    const saved = await persistOrMarkDirty(timelinePath, 'timeline', norm, _persistenceMode);
+    return { ok: true, saved, tracks: norm.tracks.length, items: after };
   });
 
   // Add ONE item (clip / marker / cue / span) to a timeline track (creating the track if absent).
   // Applies LIVE + persists. `item` is the raw per-kind body; normalization drops it if malformed.
   registerAgentOp('timeline-add-clip', async (params) => {
-    const p = (params ?? {}) as { timelinePath?: string; trackType?: TrackKind; target?: string; item?: Record<string, unknown> };
+    const p = (params ?? {}) as { timelinePath?: string; trackType?: TrackKind; target?: string; item?: Record<string, unknown>; _persistenceMode?: unknown };
     if (!p.timelinePath || !p.trackType || !p.item) {
       throw new Error('timeline-add-clip requires { timelinePath, trackType, item }');
     }
@@ -752,8 +949,8 @@ export function registerEditorAgentOps(): void {
       throw new Error('timeline-add-clip: item rejected by normalization — malformed for a ' + p.trackType + ' track (need: animation clip name non-empty · signal action non-empty · audio clip GUID non-empty · activation end > start · control prefab GUID non-empty OR particle:true OR subdirector:true)');
     }
     useEditorStore.getState().applyTimelineDoc(p.timelinePath, norm);
-    await persistAsset(p.timelinePath, 'timeline', norm);
-    return { ok: true, tracks: norm.tracks.length, items: gotCount };
+    const saved = await persistOrMarkDirty(p.timelinePath, 'timeline', norm, p._persistenceMode);
+    return { ok: true, saved, tracks: norm.tracks.length, items: gotCount };
   });
 }
 
@@ -780,4 +977,19 @@ async function persistAsset(path: string, type: 'material' | 'particle' | 'anima
     const why = errors || (typeof body?.error === 'string' ? body.error : `HTTP ${res.status}`);
     throw new Error(`saving ${type} '${path}' FAILED: ${why} — the live world was updated but NOTHING was written to disk, so this edit is lost on the next reload.`);
   }
+}
+
+/** Persist an asset edit (auto mode — today's default) OR park it in the dirty-asset
+ *  registry (manual mode) instead, mcp-persistence.md Phase 3. `mode` is
+ *  `params._persistenceMode`, injected by the backend router's /api/editor-action relay
+ *  (see ASSET_PERSISTENCE_ACTIONS in editorBackendRouter.ts) — undefined for any caller
+ *  that reaches this op some other way (e.g. a direct in-process test), which defaults to
+ *  'auto' so existing behaviour is unchanged unless a caller explicitly opts into 'manual'.
+ *  Returns whether the edit reached disk, for the op's `saved` field. */
+async function persistOrMarkDirty(
+  path: string, type: 'material' | 'particle' | 'animation' | 'timeline', data: unknown, mode: unknown,
+): Promise<boolean> {
+  if (mode === 'manual') { markAssetDirty(path, type, data); return false; }
+  await persistAsset(path, type, data);
+  return true;
 }

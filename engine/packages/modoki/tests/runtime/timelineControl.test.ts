@@ -3,13 +3,15 @@
  *  no-op but still journals (like an audio cue) — which is what we assert on. */
 
 import { describe, it, expect, afterEach } from 'vitest';
+// Side-effect only: wires core provider slots (P7 C14) so the real timeline/prefab caches below resolve correctly.
+import '../../src/runtime/loaders/registerProviders';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
-import { SYSTEM_PRIORITY } from '../../src/runtime/systems/pipeline';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { Director } from '../../src/runtime/traits/Director';
-import { timelineSystem } from '../../src/runtime/systems/timelineSystem';
-import { clearControlSpawns } from '../../src/runtime/systems/controlSpawnRegistry';
-import { takeParticleControl, hasParticleControls, clearParticleControls } from '../../src/runtime/systems/particleControlRegistry';
+import { timelineSystem } from '../../src/runtime/timeline/timelineSystem';
+import { clearControlSpawns } from '../../src/runtime/timeline/controlSpawnRegistry';
+import { takeParticleControl, hasParticleControls, clearParticleControls } from '../../src/runtime/core/particleControlRegistry';
 import { setTimeline, clearTimelineCache } from '../../src/runtime/loaders/timelineCache';
 import { normalizeTimeline } from '../../src/runtime/timeline/types';
 

@@ -15,8 +15,8 @@
  *  every unit test that touches a trait edit. Scenes are tracked by guid, matching
  *  `EntityAttributes.sourceScene`'s own values directly. */
 
-import { findEntity } from '../../runtime/ecs/entityUtils';
-import { getTraitByName } from '../../runtime/ecs/traitRegistry';
+import { findEntity } from '../../runtime/core/ecs/entityUtils';
+import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 
 const dirtySceneGuids = new Set<string>();
 

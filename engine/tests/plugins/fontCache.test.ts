@@ -4,7 +4,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { hashKey, atlasCachePath, metricsCachePath, getFontCacheDir } from '../../plugins/font-cache';
-import { DEFAULT_FONT_SETTINGS, resolveFontSettings, expandCharset } from '../../packages/modoki/src/runtime/loaders/fontSettings';
+import { DEFAULT_FONT_SETTINGS, resolveFontSettings, expandCharset } from '../../packages/modoki/src/runtime/core/fontSettings';
 
 const bytes = Buffer.from('fake-font-source-bytes');
 const S = DEFAULT_FONT_SETTINGS;

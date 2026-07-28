@@ -8,7 +8,7 @@ import { createWorld, trait } from 'koota';
 const Transform = trait({ x: 0, y: 0, z: 0 });
 const EntityAttributes = trait({ name: '' as string, parentId: 0, guid: '' as string });
 
-vi.mock('../../src/runtime/ecs/traitRegistry', () => ({
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getTraitByName: (name: string) =>
     name === 'EntityAttributes' ? { name, trait: EntityAttributes } : undefined,
 }));

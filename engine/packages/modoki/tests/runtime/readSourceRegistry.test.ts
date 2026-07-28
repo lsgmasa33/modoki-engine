@@ -5,7 +5,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import {
   registerReadSource, unregisterReadSource, getReadValue, getReadSourceNames,
   __resetReadSourcesForTesting,
-} from '../../src/runtime/ui/readSourceRegistry';
+} from '../../src/runtime/core/readSourceRegistry';
 import { resolveTemplate } from '../../src/runtime/ui/bindingResolver';
 
 describe('readSourceRegistry', () => {

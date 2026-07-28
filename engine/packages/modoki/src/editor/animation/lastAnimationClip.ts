@@ -10,9 +10,9 @@
  *  guid-keyed approach in `selectionRestore.ts`. */
 
 import { useEditorStore } from '../store/editorStore';
-import { getCurrentWorld } from '../../runtime/ecs/world';
-import { getTraitByName } from '../../runtime/ecs/traitRegistry';
-import { findEntity } from '../../runtime/ecs/entityUtils';
+import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
+import { findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getCurrentScenePath } from '../scene/serialize';
 
 const KEY = 'editor:lastAnimationClip';

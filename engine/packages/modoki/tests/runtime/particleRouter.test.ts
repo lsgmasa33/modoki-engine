@@ -18,7 +18,7 @@ const fake = (tag: string) => class {
 };
 vi.mock('../../src/runtime/particles/cpuTslBackend', () => ({ CpuTslBackend: fake('cpu') }));
 vi.mock('../../src/runtime/particles/gpuComputeBackend', () => ({ GpuComputeBackend: fake('gpu') }));
-vi.mock('../../src/runtime/loaders/textureResolver', () => ({ getActiveRenderer: () => h.renderer }));
+vi.mock('../../src/runtime/core/activeRenderer', () => ({ getActiveRenderer: () => h.renderer }));
 
 const { particleBackend } = await import('../../src/runtime/particles/particleBackend');
 

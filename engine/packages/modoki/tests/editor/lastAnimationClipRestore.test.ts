@@ -28,7 +28,7 @@ let hasAnimator: Record<number, boolean> = {};
 let guidToId: Record<string, number> = {};
 let scenePath: string | null = '/assets/scenes/empty.json';
 
-vi.mock('../../src/runtime/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => ({
     query: () => ({
       updateEach: (fn: (d: Record<string, unknown>[], e: { id(): number }) => void) => {
@@ -37,10 +37,10 @@ vi.mock('../../src/runtime/ecs/world', () => ({
     }),
   }),
 }));
-vi.mock('../../src/runtime/ecs/traitRegistry', () => ({
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getTraitByName: (n: string) => (n === 'Animator' || n === 'EntityAttributes' ? animMeta : undefined),
 }));
-vi.mock('../../src/runtime/ecs/entityUtils', () => ({
+vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   findEntity: (id: number) => (id in hasAnimator ? { has: () => hasAnimator[id] } : null),
 }));
 vi.mock('../../src/editor/scene/serialize', () => ({ getCurrentScenePath: () => scenePath }));

@@ -17,10 +17,10 @@
 
 import { create } from 'zustand';
 import type { World } from 'koota';
-import { onWorldSwap, findEntityByGuid } from '../ecs/world';
+import { onWorldSwap, findEntityByGuid } from '../core/ecs/world';
 import { UIAction } from '../traits/UIAction';
 import { applyBindings, type UIActionBinding } from './bindings';
-import type { ScreenRect } from '../rendering/screenBounds';
+import type { ScreenRect } from '../core/screenBounds';
 
 export type NavDir = 'up' | 'down' | 'left' | 'right';
 

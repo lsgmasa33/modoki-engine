@@ -7,7 +7,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { trait } from 'koota';
 import { registerTrait, getCurrentWorld, EntityAttributes } from '@modoki/engine/runtime';
-import { worldTransforms, deactivatedEntities } from '@modoki/engine/three';
+import { worldTransforms, deactivatedEntities } from '@modoki/engine/runtime';
 import { dumpSceneState, DEFAULT_INDEX_LIMIT } from '../../app/debug/agentBridge';
 
 // SoA trait whose curated meta.fields OMITS `b` (present in the koota schema) — the

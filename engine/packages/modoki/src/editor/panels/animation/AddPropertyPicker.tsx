@@ -4,11 +4,11 @@
  *  hidden. Mirrors Unity's Add Property picker. */
 
 import { useMemo, useState } from 'react';
-import { getEntityTraits, readTraitData } from '../../../runtime/ecs/entityUtils';
+import { getEntityTraits, readTraitData } from '../../../runtime/core/ecs/entityUtils';
 import { relativeEntityPath, trackKey } from '../../animation/recording';
 import { getAnimEntityIndex } from '../../animation/entityIndex';
 import type { TrackValueType } from '../../../runtime/animation/types';
-import type { FieldHint } from '../../../runtime/ecs/traitRegistry';
+import type { FieldHint } from '../../../runtime/core/ecs/traitRegistry';
 
 export interface PropertyCandidate {
   path: string;        // relative to root

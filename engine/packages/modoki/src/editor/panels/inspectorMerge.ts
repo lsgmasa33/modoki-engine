@@ -2,8 +2,8 @@
  *  trait-intersection + mixed-field computation can be unit-tested without the
  *  panel's heavy transitive deps (three.js, model import, texture resolver). */
 
-import { getEntityTraits, readTraitData } from '../../runtime/ecs/entityUtils';
-import type { TraitMeta } from '../../runtime/ecs/traitRegistry';
+import { getEntityTraits, readTraitData } from '../../runtime/core/ecs/entityUtils';
+import type { TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 
 /** One trait entry in an Inspector read snapshot. `mixed` (multi-select only)
  *  holds the field keys whose values differ across the selected entities. */

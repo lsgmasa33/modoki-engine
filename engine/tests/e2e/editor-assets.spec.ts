@@ -69,8 +69,27 @@ test('type filter narrows the list to one kind (footer shows N of M)', async ({ 
   const paths = await rowPaths(page);
   expect(paths.length).toBeGreaterThan(0);
   expect(paths.length).toBeLessThanOrEqual(count);
-  // "All types" clears the filter → full list again.
-  await page.locator('label', { hasText: 'All types' }).locator('input[type="checkbox"]').click();
+  // A stale filter must not go unnoticed: the footer carries a clickable
+  // "type filter active" banner alongside the narrowed count.
+  const banner = page.locator('[data-ui-id="assets.toolbar.typeFilterBanner"]');
+  await expect(banner).toBeVisible();
+  await banner.click();
+  await expect(banner).not.toBeVisible();
+  await expect(page.getByText(/^\d+ assets$/)).toBeVisible();
+});
+
+test('a stale type filter is surfaced by a clearable footer banner', async ({ page }) => {
+  // Simulates the reported bug: a type filter left over from a PAST session,
+  // present before the panel ever mounts (not toggled live in this test).
+  await page.addInitScript(() => {
+    localStorage.setItem('editor:assets:typeFilter', JSON.stringify(['texture']));
+  });
+  await gotoEditorWithAssets(page);
+  const banner = page.locator('[data-ui-id="assets.toolbar.typeFilterBanner"]');
+  await expect(banner).toBeVisible();
+  await expect(page.getByText(/^\d+ of \d+ assets$/)).toBeVisible();
+  await banner.click();
+  await expect(banner).not.toBeVisible();
   await expect(page.getByText(/^\d+ assets$/)).toBeVisible();
 });
 

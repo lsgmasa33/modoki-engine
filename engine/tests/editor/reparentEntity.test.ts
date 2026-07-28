@@ -8,7 +8,7 @@ import { readTraitData, getAllEntities, buildEntityTree } from '@modoki/engine/r
 import { reparentEntity, setActionCallback } from '@modoki/engine/editor';
 import { getTraitByName } from '@modoki/engine/runtime';
 import { pushAction, clearHistory, undo, redo, canUndo } from '@modoki/engine/editor';
-import { worldTransforms } from '@modoki/engine/three';
+import { worldTransforms } from '@modoki/engine/runtime';
 
 registerAllTraits();
 setActionCallback(pushAction);

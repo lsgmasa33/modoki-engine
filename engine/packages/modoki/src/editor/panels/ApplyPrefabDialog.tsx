@@ -19,9 +19,9 @@ import {
 import { pushAction } from '../undo/undoManager';
 import { entityRef } from '../undo/entityRef';
 import { applyToPrefabWithUndo } from '../undo/applyPrefabUndo';
-import { getTraitByName, getAllTraits } from '../../runtime/ecs/traitRegistry';
-import { readTraitData } from '../../runtime/ecs/entityUtils';
-import { getCurrentWorld } from '../../runtime/ecs/world';
+import { getTraitByName, getAllTraits } from '../../runtime/core/ecs/traitRegistry';
+import { readTraitData } from '../../runtime/core/ecs/entityUtils';
+import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import type { AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { buildOverrideForest, type ForestNode } from './prefabOverrideForest';
 

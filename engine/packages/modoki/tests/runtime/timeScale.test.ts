@@ -7,11 +7,11 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createWorld } from 'koota';
-import { Time } from '../../src/runtime/traits/Time';
-import { timeSystem, resetTimeBaseline } from '../../src/runtime/systems/timeSystem';
-import { getTime, getSimDelta, getVisualDelta, getTimeScale, setTimeScale } from '../../src/runtime/systems/getTime';
-import { setManualNow, advanceManual, restoreRealClock } from '../../src/runtime/systems/clock';
-import { setPlayState } from '../../src/runtime/systems/playState';
+import { Time } from '../../src/runtime/core/traits/Time';
+import { timeSystem, resetTimeBaseline } from '../../src/runtime/core/timeSystem';
+import { getTime, getSimDelta, getVisualDelta, getTimeScale, setTimeScale } from '../../src/runtime/core/getTime';
+import { setManualNow, advanceManual, restoreRealClock } from '../../src/runtime/core/clock';
+import { setPlayState } from '../../src/runtime/core/playState';
 
 function tick(world: ReturnType<typeof createWorld>, dtMs = 16) {
   advanceManual(dtMs);

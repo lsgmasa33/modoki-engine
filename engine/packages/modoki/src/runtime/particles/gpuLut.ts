@@ -9,7 +9,7 @@
 
 import * as THREE from 'three';
 import type { ParticleEffectDef } from './types';
-import { sampleCurve, sampleGradientAlpha, sampleGradientColor } from './curves';
+import { sampleCurve, sampleGradientAlpha, sampleGradientColor } from '../core/curves';
 
 export const LUT_WIDTH = 64;
 

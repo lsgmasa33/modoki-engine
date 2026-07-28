@@ -25,9 +25,9 @@ vi.mock('../../src/runtime/loaders/assetManifest', async (importOriginal) => {
 
 import { navigationManager } from '../../src/runtime/managers/NavigationManager';
 import { registerManager, unregisterManager } from '../../src/runtime/managers/managerRegistry';
-import { dispatchUIAction } from '../../src/runtime/ui/actionRegistry';
-import { setPlayState } from '../../src/runtime/systems/playState';
-import { getReadValue, __resetReadSourcesForTesting } from '../../src/runtime/ui/readSourceRegistry';
+import { dispatchUIAction } from '../../src/runtime/core/actionRegistry';
+import { setPlayState } from '../../src/runtime/core/playState';
+import { getReadValue, __resetReadSourcesForTesting } from '../../src/runtime/core/readSourceRegistry';
 
 const GUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 

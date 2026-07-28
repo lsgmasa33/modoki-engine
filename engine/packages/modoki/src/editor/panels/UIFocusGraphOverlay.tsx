@@ -21,12 +21,12 @@
  *  in the DOM, so it's skipped, mirroring `gatherCandidates`. */
 
 import { useEffect, useState } from 'react';
-import { getCurrentWorld } from '../../runtime/ecs/worldRegistry';
+import { getCurrentWorld } from '../../runtime/core/ecs/worldRegistry';
 import { UIFocusable } from '../../runtime/traits/UIFocusable';
-import { EntityAttributes } from '../../runtime/traits/EntityAttributes';
+import { EntityAttributes } from '../../runtime/core/traits/EntityAttributes';
 import { onEditorDirty, useUITreeStore } from '../../runtime/ui/uiTreeStore';
 import { pickInDirection, type NavDir } from '../../runtime/ui/focusManager';
-import type { ScreenRect } from '../../runtime/rendering/screenBounds';
+import type { ScreenRect } from '../../runtime/core/screenBounds';
 import { frameToLogicalRect } from '../scene/uiResizeMath';
 import { useEditorStore } from '../store/editorStore';
 

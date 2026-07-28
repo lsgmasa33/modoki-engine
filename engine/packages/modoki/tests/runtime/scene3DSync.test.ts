@@ -18,14 +18,14 @@ function mockSceneSyncDeps() {
     Transform: {}, Renderable3D: {}, Renderable3DPrimitive: {}, Camera: {}, Tint: {},
     SkinnedModel: {}, SkeletalAnimator: {}, AnimationLibrary: {}, BoneAttachment: {},
   }));
-  vi.doMock('../../src/runtime/traits/EntityAttributes', () => ({ EntityAttributes: {} }));
+  vi.doMock('../../src/runtime/core/traits/EntityAttributes', () => ({ EntityAttributes: {} }));
   vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
     getRiggedModel: vi.fn(), ensureRiggedModelLoaded: vi.fn(),
   }));
   vi.doMock('three/examples/jsm/utils/SkeletonUtils.js', () => ({ clone: vi.fn(), retargetClip: vi.fn() }));
   vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
   vi.doMock('../../src/three/traits/Environment', () => ({ Environment: {} }));
-  vi.doMock('../../src/three/systems/transformPropagationSystem', () => ({
+  vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
     worldTransforms: new Map(), deactivatedEntities: new Set(),
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
@@ -86,7 +86,7 @@ describe('scene3DSync', () => {
       }));
       vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
       vi.doMock('../../src/three/traits/Environment', () => ({ Environment: {} }));
-      vi.doMock('../../src/three/systems/transformPropagationSystem', () => ({
+      vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
         worldTransforms: new Map(),
         deactivatedEntities: new Set(),
       }));
@@ -124,7 +124,7 @@ describe('scene3DSync', () => {
       }));
       vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
       vi.doMock('../../src/three/traits/Environment', () => ({ Environment: {} }));
-      vi.doMock('../../src/three/systems/transformPropagationSystem', () => ({
+      vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
         worldTransforms: new Map(),
         deactivatedEntities: new Set(),
       }));
@@ -174,7 +174,7 @@ describe('scene3DSync', () => {
       }));
       vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
       vi.doMock('../../src/three/traits/Environment', () => ({ Environment: {} }));
-      vi.doMock('../../src/three/systems/transformPropagationSystem', () => ({
+      vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
         worldTransforms: new Map(),
         deactivatedEntities: new Set(),
       }));
@@ -214,7 +214,7 @@ describe('scene3DSync', () => {
       }));
       vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
       vi.doMock('../../src/three/traits/Environment', () => ({ Environment: {} }));
-      vi.doMock('../../src/three/systems/transformPropagationSystem', () => ({
+      vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
         worldTransforms: new Map(),
         deactivatedEntities: new Set(),
       }));
@@ -301,7 +301,7 @@ describe('scene3DSync', () => {
       }));
       vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
       vi.doMock('../../src/three/traits/Environment', () => ({ Environment: {} }));
-      vi.doMock('../../src/three/systems/transformPropagationSystem', () => ({
+      vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
         worldTransforms: new Map(),
         deactivatedEntities: new Set(),
       }));
@@ -917,10 +917,10 @@ describe('scene3DSync', () => {
   describe('mixerAdvanceDelta', () => {
     async function load(playState: string, visual: number) {
       mockSceneSyncDeps();
-      vi.doMock('../../src/runtime/systems/playState', () => ({ getPlayState: () => playState }));
-      vi.doMock('../../src/runtime/systems/getTime', () => ({ getVisualDelta: () => visual }));
+      vi.doMock('../../src/runtime/core/playState', () => ({ getPlayState: () => playState }));
+      vi.doMock('../../src/runtime/core/getTime', () => ({ getVisualDelta: () => visual }));
       const sync = await import('../../src/runtime/rendering/scene3DSync');
-      const preview = await import('../../src/runtime/systems/skeletalPreview');
+      const preview = await import('../../src/runtime/core/skeletalPreview');
       return { ...sync, ...preview };
     }
 

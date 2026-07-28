@@ -55,16 +55,17 @@ async function setup() {
   vi.doMock('../../src/runtime/particles/particleBackend', () => ({ particleBackend: backend }));
 
   const effects = new Map<string, ParticleEffectDef>();
-  vi.doMock('../../src/runtime/loaders/particleCache', () => ({
-    getParticleEffect: vi.fn((ref: string) => effects.get(ref) ?? null),
+  const getParticleEffect = vi.fn((ref: string) => effects.get(ref) ?? null);
+  vi.doMock('../../src/runtime/particles/particleDefProvider', () => ({
+    particleDefProvider: { get: () => ({ getParticleEffect }) },
   }));
 
   const { createWorld } = await import('koota');
   const traits = await import('../../src/runtime/traits');
   const sync = await import('../../src/runtime/rendering/particleSync');
   // Same reset module graph as `sync`, so the registry singleton is shared with syncParticles.
-  const particleControl = await import('../../src/runtime/systems/particleControlRegistry');
-  const { worldTransforms } = await import('../../src/three/systems/transformPropagationSystem');
+  const particleControl = await import('../../src/runtime/core/particleControlRegistry');
+  const { worldTransforms } = await import('../../src/runtime/core/ecs/transformPropagationSystem');
   worldTransforms.clear();
   return { backend, calls, effects, world: createWorld(), traits, sync, particleControl, worldTransforms };
 }
@@ -255,7 +256,7 @@ describe('syncParticles', () => {
     // Scene2D, UI) already honored it. See particleSync.ts's deactivatedEntities import.
     const { calls, effects, world, traits, sync } = await setup();
     const { Transform, ParticleEmitter } = traits;
-    const { deactivatedEntities } = await import('../../src/three/systems/transformPropagationSystem');
+    const { deactivatedEntities } = await import('../../src/runtime/core/ecs/transformPropagationSystem');
     effects.set('fx/a.particle.json', fakeDef());
     const e = world.spawn(Transform(), ParticleEmitter({ effect: 'fx/a.particle.json' }));
 

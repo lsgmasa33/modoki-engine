@@ -8,14 +8,14 @@ beforeEach(() => {
 
 // Mock the ECS dependencies that uiTreeStore imports
 function mockDeps() {
-  vi.doMock('../../src/runtime/ecs/world', () => ({
+  vi.doMock('../../src/runtime/core/ecs/world', () => ({
     getCurrentWorld: vi.fn(),
     onWorldSwap: vi.fn(),
   }));
-  vi.doMock('../../src/runtime/ecs/traitRegistry', () => ({
+  vi.doMock('../../src/runtime/core/ecs/traitRegistry', () => ({
     getAllTraits: vi.fn(() => []),
   }));
-  vi.doMock('../../src/runtime/ecs/entityUtils', () => ({
+  vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({
     addDirtyListener: vi.fn(),
   }));
 }
@@ -81,14 +81,14 @@ describe('uiTreeStore', () => {
     it('skips rebuild when not dirty', async () => {
       // First call to uiTreeProjection sets dirty=false after build.
       // Second call should be a no-op.
-      vi.doMock('../../src/runtime/ecs/world', () => ({
+      vi.doMock('../../src/runtime/core/ecs/world', () => ({
         getCurrentWorld: vi.fn(),
         onWorldSwap: vi.fn(),
       }));
-      vi.doMock('../../src/runtime/ecs/traitRegistry', () => ({
+      vi.doMock('../../src/runtime/core/ecs/traitRegistry', () => ({
         getAllTraits: vi.fn(() => []),
       }));
-      vi.doMock('../../src/runtime/ecs/entityUtils', () => ({
+      vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({
         addDirtyListener: vi.fn(),
       }));
 
@@ -113,14 +113,14 @@ describe('uiTreeStore', () => {
     });
 
     it('rebuilds after markUIDirty', async () => {
-      vi.doMock('../../src/runtime/ecs/world', () => ({
+      vi.doMock('../../src/runtime/core/ecs/world', () => ({
         getCurrentWorld: vi.fn(),
         onWorldSwap: vi.fn(),
       }));
-      vi.doMock('../../src/runtime/ecs/traitRegistry', () => ({
+      vi.doMock('../../src/runtime/core/ecs/traitRegistry', () => ({
         getAllTraits: vi.fn(() => []),
       }));
-      vi.doMock('../../src/runtime/ecs/entityUtils', () => ({
+      vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({
         addDirtyListener: vi.fn(),
       }));
 
@@ -152,18 +152,18 @@ describe('uiTreeStore', () => {
       const rUI = { name: 'RenderableUI' } as any;
       const ui = { name: 'UIElement' } as any;
       const attr = { name: 'EntityAttributes' } as any;
-      vi.doMock('../../src/runtime/ecs/world', () => ({
+      vi.doMock('../../src/runtime/core/ecs/world', () => ({
         getCurrentWorld: vi.fn(),
         onWorldSwap: vi.fn(),
       }));
-      vi.doMock('../../src/runtime/ecs/traitRegistry', () => ({
+      vi.doMock('../../src/runtime/core/ecs/traitRegistry', () => ({
         getAllTraits: () => [
           { name: 'RenderableUI', trait: rUI, category: 'component', fields: {} },
           { name: 'UIElement', trait: ui, category: 'component', fields: {} },
           { name: 'EntityAttributes', trait: attr, category: 'component', fields: {} },
         ],
       }));
-      vi.doMock('../../src/runtime/ecs/entityUtils', () => ({
+      vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({
         addDirtyListener: vi.fn(),
       }));
 
@@ -234,18 +234,18 @@ describe('uiTreeStore', () => {
       const rUI = { name: 'RenderableUI' } as any;
       const ui = { name: 'UIElement' } as any;
       const attr = { name: 'EntityAttributes' } as any;
-      vi.doMock('../../src/runtime/ecs/world', () => ({
+      vi.doMock('../../src/runtime/core/ecs/world', () => ({
         getCurrentWorld: vi.fn(),
         onWorldSwap: vi.fn(),
       }));
-      vi.doMock('../../src/runtime/ecs/traitRegistry', () => ({
+      vi.doMock('../../src/runtime/core/ecs/traitRegistry', () => ({
         getAllTraits: () => [
           { name: 'RenderableUI', trait: rUI, category: 'component', fields: {} },
           { name: 'UIElement', trait: ui, category: 'component', fields: {} },
           { name: 'EntityAttributes', trait: attr, category: 'component', fields: {} },
         ],
       }));
-      vi.doMock('../../src/runtime/ecs/entityUtils', () => ({
+      vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({
         addDirtyListener: vi.fn(),
       }));
 
@@ -288,7 +288,7 @@ describe('uiTreeStore', () => {
       ]);
       const { uiTreeProjection, useUITreeStore, markUIDirty } =
         await import('../../src/runtime/ui/uiTreeStore');
-      const { deactivatedEntities } = await import('../../src/three/systems/transformPropagationSystem');
+      const { deactivatedEntities } = await import('../../src/runtime/core/ecs/transformPropagationSystem');
 
       deactivatedEntities.clear();
       deactivatedEntities.add(2); // the entity itself…
@@ -311,7 +311,7 @@ describe('uiTreeStore', () => {
       ]);
       const { uiTreeProjection, useUITreeStore, markUIDirty } =
         await import('../../src/runtime/ui/uiTreeStore');
-      const { deactivatedEntities } = await import('../../src/three/systems/transformPropagationSystem');
+      const { deactivatedEntities } = await import('../../src/runtime/core/ecs/transformPropagationSystem');
 
       deactivatedEntities.clear();
       markUIDirty();
@@ -335,11 +335,11 @@ describe('uiTreeStore', () => {
       const ui = { name: 'UIElement' } as any;
       const attr = { name: 'EntityAttributes' } as any;
       const textAnim = { name: 'TextAnimation' } as any;
-      vi.doMock('../../src/runtime/ecs/world', () => ({
+      vi.doMock('../../src/runtime/core/ecs/world', () => ({
         getCurrentWorld: vi.fn(),
         onWorldSwap: vi.fn(),
       }));
-      vi.doMock('../../src/runtime/ecs/traitRegistry', () => ({
+      vi.doMock('../../src/runtime/core/ecs/traitRegistry', () => ({
         getAllTraits: () => [
           { name: 'RenderableUI', trait: rUI, category: 'component', fields: {} },
           { name: 'UIElement', trait: ui, category: 'component', fields: {} },
@@ -347,7 +347,7 @@ describe('uiTreeStore', () => {
           { name: 'TextAnimation', trait: textAnim, category: 'component', fields: {} },
         ],
       }));
-      vi.doMock('../../src/runtime/ecs/entityUtils', () => ({
+      vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({
         addDirtyListener: vi.fn(),
       }));
 
@@ -384,7 +384,7 @@ describe('uiTreeStore', () => {
       const world = fakeTextWorld();
       const { uiTreeProjection, useUITreeStore, markUIDirty } =
         await import('../../src/runtime/ui/uiTreeStore');
-      const { setPlayState } = await import('../../src/runtime/systems/playState');
+      const { setPlayState } = await import('../../src/runtime/core/playState');
 
       // Stopped → frozen to base text (no animation on the node).
       setPlayState('stopped');
@@ -419,8 +419,8 @@ describe('uiTreeStore', () => {
       const ui = { name: 'UIElement' } as any;
       const attr = { name: 'EntityAttributes' } as any;
       const bindingTrait = { name: 'UIBinding' } as any;
-      vi.doMock('../../src/runtime/ecs/world', () => ({ getCurrentWorld: vi.fn(), onWorldSwap: vi.fn() }));
-      vi.doMock('../../src/runtime/ecs/traitRegistry', () => ({
+      vi.doMock('../../src/runtime/core/ecs/world', () => ({ getCurrentWorld: vi.fn(), onWorldSwap: vi.fn() }));
+      vi.doMock('../../src/runtime/core/ecs/traitRegistry', () => ({
         getAllTraits: () => [
           { name: 'RenderableUI', trait: rUI, category: 'component', fields: {} },
           { name: 'UIElement', trait: ui, category: 'component', fields: {} },
@@ -428,7 +428,7 @@ describe('uiTreeStore', () => {
           { name: 'UIBinding', trait: bindingTrait, category: 'component', fields: {} },
         ],
       }));
-      vi.doMock('../../src/runtime/ecs/entityUtils', () => ({ addDirtyListener: vi.fn() }));
+      vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn() }));
       const uiEl = {
         width: 0, height: 0, widthUnit: 'px', heightUnit: 'px',
         flexDirection: 'row', justifyContent: 'flex-start', alignItems: 'stretch',

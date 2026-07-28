@@ -68,16 +68,16 @@ vi.mock('../../src/runtime/loaders/overrideMarks', () => {
   };
 });
 
-vi.mock('../../src/runtime/traits/Time', () => ({ Time: TimeLike }));
+vi.mock('../../src/runtime/core/traits/Time', () => ({ Time: TimeLike }));
 vi.mock('../../src/runtime/traits/Input', () => ({ Input: InputLike }));
-// `runtime/ecs/world.ts` (registerEntity/findEntityByGuid/guidOf) imports the REAL
+// `runtime/core/ecs/world.ts` (registerEntity/findEntityByGuid/guidOf) imports the REAL
 // EntityAttributes trait directly — same identity-split hazard as Time/Input above.
 // The cross-scene-parenting guard test below resolves a parentId GUID ref through
 // findEntityByGuid, which is a no-op unless the entities it's indexing carry the
 // SAME trait identity the traitRegistry mock spawns them with.
-vi.mock('../../src/runtime/traits/EntityAttributes', () => ({ EntityAttributes }));
+vi.mock('../../src/runtime/core/traits/EntityAttributes', () => ({ EntityAttributes }));
 
-vi.mock('../../src/runtime/ecs/traitRegistry', () => {
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
   const traits = [
     { name: 'Transform', trait: Transform, category: 'component', fields: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } } },
     { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: { type: 'string' }, isActive: { type: 'boolean' }, sortOrder: { type: 'number' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, layer: { type: 'string' }, guid: { type: 'string' }, sourceScene: { type: 'string', hidden: true, runtimeOnly: true } } },
@@ -184,7 +184,7 @@ beforeEach(async () => {
   defineLevel2();
 
   const { Persistent } = await import('../../src/runtime/traits/Persistent');
-  const { getAllTraits } = await import('../../src/runtime/ecs/traitRegistry');
+  const { getAllTraits } = await import('../../src/runtime/core/ecs/traitRegistry');
   const persistentMeta = getAllTraits().find((m: any) => m.name === 'Persistent');
   if (persistentMeta) (persistentMeta as any).trait = Persistent;
 
@@ -204,7 +204,7 @@ async function getSceneManager() {
   mod.sceneManager.resetForTesting();
   return mod;
 }
-async function getWorld() { return import('../../src/runtime/ecs/world'); }
+async function getWorld() { return import('../../src/runtime/core/ecs/world'); }
 async function getCache() { return import('../../src/runtime/loaders/meshTemplateCache'); }
 
 describe('SceneManager base-scene chain — additive load + carry-across-swap', () => {

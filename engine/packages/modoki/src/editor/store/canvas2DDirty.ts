@@ -4,8 +4,8 @@
  *  The rAF draw callback checks this flag and early-exits when clean (O(1)).
  *  Any ECS write, selection change, viewport change, or image load sets it. */
 
-import { addDirtyListener } from '../../runtime/ecs/entityUtils';
-import { onWorldSwap } from '../../runtime/ecs/world';
+import { addDirtyListener } from '../../runtime/core/ecs/entityUtils';
+import { onWorldSwap } from '../../runtime/core/ecs/world';
 
 let _dirty = true; // Start dirty so first frame draws
 // Monotonic redraw version. A single boolean can only be consumed by ONE reader

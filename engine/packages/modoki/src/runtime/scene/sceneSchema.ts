@@ -12,9 +12,9 @@
  *  the schema default; fields with no confident primitive type are left
  *  untyped (known, but not type-checked). */
 
-import { getAllTraits } from '../ecs/traitRegistry';
-import type { FieldType } from '../ecs/traitRegistry';
-import type { SceneSchema } from './sceneValidation';
+import { getAllTraits } from '../core/ecs/traitRegistry';
+import type { FieldType } from '../core/ecs/traitRegistry';
+import type { SceneSchema } from '../loaders/sceneValidation';
 
 type FieldEntry = { type?: FieldType; options?: string[] };
 

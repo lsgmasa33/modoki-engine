@@ -64,7 +64,7 @@ Bone2D Transforms ──► skin2DSystem ──► skin2DBuffers ──► Scene
                                                           (same buffer)          + Canvas2D overlays
 ```
 
-- **`skin2DSystem`** (`runtime/systems/skin2DSystem.ts`) — registered at
+- **`skin2DSystem`** (`runtime/skinning/skin2DSystem.ts`) — registered at
   `SYSTEM_PRIORITY.TRANSFORM + 1` (201), so it runs even when the sim is Stopped/Paused
   (hand-posing a bone deforms the mesh live in the editor), matching 3D `syncBones`.
   Per `SkinnedSprite2D`: resolve the rig, collect its descendant `Bone2D` entities,
@@ -73,7 +73,7 @@ Bone2D Transforms ──► skin2DSystem ──► skin2DBuffers ──► Scene
   `skinMatrix[b] = rootLocalNow[b] · invBind[b]` (identity at bind), and linear-blend-
   skin each vertex into the buffer. Deterministic (no wall-clock/RNG). A cheap per-bone
   skinning-matrix comparison gates the per-vertex work, so an idle rig re-skins nothing.
-- **`skin2DBuffers`** (`runtime/systems/skin2DBuffers.ts`) — a module-level registry
+- **`skin2DBuffers`** (`runtime/skinning/skin2DBuffers.ts`) — a module-level registry
   keyed by entity id: `{ parts, version, bindMinY, bindMaxY }`, where each part is a
   `Skin2DPartBuffer` `{ positions, uvs, indices, url, sprite?, uvRect?, order, name,
   visible }`. A single-part (v1) rig has exactly one part; a multi-part (v2) rig has
@@ -198,14 +198,17 @@ an optional alpha coverage predicate; these return a ready `.rig2d.json` payload
 
 ## Authoring today vs. planned
 
-- **Today:** rigs are hand-authored JSON (or generated via the `autoRig2D` core). Open a
-  scene with a `SkinnedSprite2D` + `Bone2D` children; select a bone in the Hierarchy or
-  by clicking its joint in SceneView; pose it with the gizmo (works while stopped) and
-  the mesh deforms live in both viewports.
-- **Planned (Phase 2 UI):** a dockable Sprite editor `Skin` module — draw/auto-place
-  bones, auto-tessellate from the sprite outline, paint weights (heatmap) — wired to the
-  `autoRig2D` core above. Follow-ups: scene-scoped rig+texture refcounting, tree-shaker
-  rig→texture dep-follow, atlas/sliced-sprite UV remap, alpha-outline tessellation.
+- **Today:** a dockable Sprite editor `Skin` module (`editor/panels/SkinEditor.tsx` +
+  `SkinCanvas.tsx`, registered as the `skin-editor` panel in `EditorApp.tsx`) — place/
+  auto-place bones (Rig mode), Re-tessellate the mesh at a chosen grid density,
+  Auto-weight, paint weights with a heatmap overlay, and a one-click Auto-rig that runs
+  the whole `autoRig2D` pipeline on the active part. Rigs can also be hand-authored JSON.
+  Once a rig exists, open a scene with a `SkinnedSprite2D` + `Bone2D` children; select a
+  bone in the Hierarchy or by clicking its joint in SceneView; pose it with the gizmo
+  (works while stopped) and the mesh deforms live in both viewports.
+- **Planned:** scene-scoped rig+texture refcounting, tree-shaker rig→texture dep-follow,
+  atlas/sliced-sprite UV remap, alpha-outline tessellation (grid+cull already gives an
+  artifact-free mesh in the meantime).
 
 ## Fixture + tests
 

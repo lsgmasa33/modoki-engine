@@ -1,15 +1,17 @@
 /** animationSystem — advances Animator.time and drives bound trait fields. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+// Side-effect only: wires core provider slots (P7 C11+) so real-cache tests below resolve correctly.
+import '../../src/runtime/loaders/registerProviders';
 import { createWorld } from 'koota';
-import { Transform } from '../../src/runtime/traits/Transform';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { Transform } from '../../src/runtime/core/traits/Transform';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { Animator } from '../../src/runtime/traits/Animator';
 import { Paused } from '../../src/runtime/traits/Paused';
-import { Time } from '../../src/runtime/traits/Time';
-import { registerTrait, getAllTraits } from '../../src/runtime/ecs/traitRegistry';
+import { Time } from '../../src/runtime/core/traits/Time';
+import { registerTrait, getAllTraits } from '../../src/runtime/core/ecs/traitRegistry';
 import { setAnimationClip } from '../../src/runtime/loaders/animationClipCache';
-import { animationSystem } from '../../src/runtime/systems/animationSystem';
+import { animationSystem } from '../../src/runtime/animation/animationSystem';
 import type { AnimationClipDef } from '../../src/runtime/animation/types';
 
 const CLIP: AnimationClipDef = {

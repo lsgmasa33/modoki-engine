@@ -4,9 +4,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as THREE from 'three';
 import { createWorld } from 'koota';
 import { Transform, EntityAttributes } from '../../src/runtime/traits';
-import { registerEntity } from '../../src/runtime/ecs/world';
-import { setCurrentWorld } from '../../src/runtime/ecs/worldRegistry';
-import { getWorldTransform3D, worldToLocal3D } from '../../src/runtime/ecs/worldTransform';
+import { registerEntity } from '../../src/runtime/core/ecs/world';
+import { setCurrentWorld } from '../../src/runtime/core/ecs/worldRegistry';
+import { getWorldTransform3D, worldToLocal3D } from '../../src/runtime/core/ecs/worldTransform';
 
 let w: ReturnType<typeof createWorld>;
 beforeEach(() => { w = createWorld(); setCurrentWorld(w); });

@@ -3,7 +3,7 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createWorld } from 'koota';
 import { timeSystem, resetTimeBaseline, rotate3DSystem, Rotate3D } from '@modoki/engine/runtime';
-import { transformPropagationSystem, worldTransforms, deactivatedEntities } from '@modoki/engine/three';
+import { transformPropagationSystem, worldTransforms, deactivatedEntities } from '@modoki/engine/runtime';
 import { Transform, Time, Paused, EntityAttributes } from '@modoki/engine/runtime';
 
 // Each test creates a local world — must destroy it afterwards to stay within koota's 16-world limit.

@@ -24,7 +24,7 @@ import * as THREE from 'three';
 import { uniform, normalize, max, dot, float, length, pow, clamp, renderGroup } from 'three/tsl';
 import type { World } from 'koota';
 import { Light } from '../../three/traits/Light';
-import { worldTransforms, deactivatedEntities } from '../../three/systems/transformPropagationSystem';
+import { worldTransforms, deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { MAX_SHADER_POINT_LIGHTS, pickSceneLights, type LightSample } from './sceneLightPicker';
 
 type UniformNode = ReturnType<typeof uniform>;

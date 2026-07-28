@@ -15,7 +15,7 @@ import { backendFetch } from '../../backend/editorBackend';
 import { invalidateMaterial } from '../../../runtime/loaders/meshTemplateCache';
 import { invalidateAnimSet, setAnimSet, type AnimSetClipDef } from '../../../runtime/loaders/animSetCache';
 import { clearSpriteMaterialCache } from '../../../runtime/loaders/spriteMaterialCache';
-import { fireDirtyListeners } from '../../../runtime/ecs/entityUtils';
+import { fireDirtyListeners } from '../../../runtime/core/ecs/entityUtils';
 
 export const clampNum = (v: number, min?: number, max?: number) => {
   let r = v;

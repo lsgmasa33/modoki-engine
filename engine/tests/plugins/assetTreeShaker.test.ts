@@ -6,10 +6,10 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { computeKeptAssets } from '../../plugins/asset-tree-shaker';
-import { detectType, type AssetRoot } from '../../plugins/vite-asset-scanner';
+import { computeKeptAssets, virtualToAbs } from '../../plugins/asset-tree-shaker';
+import { detectType, resolveAssetPath, type AssetRoot } from '../../plugins/vite-asset-scanner';
 import { JSON_ASSET_SUFFIX_TYPE, ID_BEARING_TYPES, classifyJsonAssetSuffix } from '../../plugins/assetTypes';
-import { REF_FIELDS_BY_TRAIT } from '../../packages/modoki/src/runtime/scene/sceneValidation';
+import { REF_FIELDS_BY_TRAIT } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { MATERIAL_TEXTURE_SLOTS } from '../../packages/modoki/src/runtime/assets/materialTextureSlots';
 
 // ── Fixture helpers ──────────────────────────────────
@@ -74,6 +74,73 @@ function createFixture(): Fixture {
 }
 
 // ── Tests ────────────────────────────────────────────
+
+/** virtualToAbs duplicates resolveAssetPath's (vite-asset-scanner) containment logic.
+ *  That one had a bare-`startsWith` traversal guard, was fixed, and pinned by
+ *  viteAssetScanner.test.ts's "sibling dir that shares the root prefix (regression)".
+ *  This copy kept the vulnerable form until it was found in a Windows path audit —
+ *  mirror the same cases here so the two implementations can't drift apart again. */
+describe('asset-tree-shaker virtualToAbs (path-traversal guard)', () => {
+  const roots: AssetRoot[] = [{ urlPrefix: '/assets', absDir: path.resolve('/project/assets') }];
+
+  it('resolves a legitimate in-root path', () => {
+    expect(virtualToAbs('/assets/models/a.glb', roots))
+      .toBe(path.resolve('/project/assets', 'models/a.glb'));
+  });
+
+  it('rejects an upward traversal', () => {
+    expect(virtualToAbs('/assets/../../etc/passwd', roots)).toBeNull();
+  });
+
+  it('rejects a sibling dir that merely shares the root prefix (regression)', () => {
+    // `<root>-evil` / `assets-extra` share the textual prefix of `<root>`, so the old
+    // `abs.startsWith(root.absDir)` check accepted them. They resolve OUTSIDE the root.
+    expect(virtualToAbs('/assets/../assets-evil/secret', roots)).toBeNull();
+    expect(virtualToAbs('/assets/sub/../../assets-extra/x', roots)).toBeNull();
+  });
+
+  it('still allows a nested .. that normalizes back inside the root', () => {
+    expect(virtualToAbs('/assets/a/b/../c.png', roots))
+      .toBe(path.resolve('/project/assets', 'a/c.png'));
+  });
+
+  /** THE ACTUAL ANTI-RECURRENCE GUARD. The bug above wasn't "someone wrote a weak check" —
+   *  it was that the SAME containment logic exists twice (virtualToAbs here,
+   *  resolveAssetPath in vite-asset-scanner), one copy got hardened, and the other silently
+   *  kept the vulnerable form for however long. Per-function tests can't catch that: both
+   *  copies passed their own suites. Assert the two agree on the same inputs, so hardening
+   *  or weakening either one alone fails here. Delete this only by deduplicating them.
+   *
+   *  SCOPE: plain (already-decoded) paths only — the twins legitimately differ on
+   *  percent-encoding and that is NOT drift to "fix". resolveAssetPath serves HTTP
+   *  requests, so it decodeURIComponent()s first; virtualToAbs consumes authored refs out
+   *  of scene JSON, which are not URL-encoded. Measured consequence, recorded so nobody
+   *  "aligns" them by accident:
+   *    '/assets/%2e%2e/evil.png'  → scanner null (decodes to '..', rejects)
+   *                               → shaker  <root>/%2e%2e/evil.png (literal dir name)
+   *  The shaker's answer stays INSIDE the root, so this is not an escape — but note the
+   *  mirror case: a ref containing '%20' would have the shaker look for a literal
+   *  'nor%20mal.png' while the scanner resolves 'nor mal.png'. Asset names with spaces do
+   *  exist here (e.g. '2D Animation.json'), so if encoded refs ever reach the shaker, that
+   *  asymmetry — not the traversal guard — is the thing to look at. */
+  it('agrees with resolveAssetPath on every containment case (twin-drift guard)', () => {
+    const cases = [
+      '/assets/models/a.glb',          // plain in-root
+      '/assets/a/b/../c.png',          // .. that normalizes back inside
+      '/assets/../../etc/passwd',      // upward escape
+      '/assets/../assets-evil/secret', // prefix-sharing sibling
+      '/assets/sub/../../assets-extra/x',
+      '/assets/',                      // degenerate
+      '/unrelated/x.png',              // no matching root
+    ];
+    for (const c of cases) {
+      const shaker = virtualToAbs(c, roots);
+      const scanner = resolveAssetPath(c, roots);
+      // Compare null-ness (the security-relevant decision) AND the resolved path.
+      expect({ case: c, abs: shaker }).toEqual({ case: c, abs: scanner });
+    }
+  });
+});
 
 describe('asset-tree-shaker', () => {
   let fx: Fixture;

@@ -22,21 +22,23 @@ const PREFAB_DEF = {
 };
 
 // Only the cache lookup is stubbed — spawnPrefabInstance (the code under test) stays REAL.
-vi.mock('../../src/runtime/loaders/meshTemplateCache', async (orig) => ({
-  ...(await orig<Record<string, unknown>>()),
-  getCachedPrefab: () => PREFAB_DEF,
-}));
+// timelineSystem now reaches these via the timeline/assetProvider slot (P7 C14).
+vi.mock('../../src/runtime/timeline/assetProvider', async () => {
+  const { spawnPrefabInstance } = await import('../../src/runtime/loaders/loadSceneFile');
+  const impl = { getTimeline: () => null, getCachedPrefab: () => PREFAB_DEF, spawnPrefabInstance };
+  return { timelineAssetProvider: { get: () => impl } };
+});
 
 import { createWorld } from 'koota';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
-import { Transform } from '../../src/runtime/traits/Transform';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
+import { Transform } from '../../src/runtime/core/traits/Transform';
 import { Transient } from '../../src/runtime/traits/Transient';
-import { setCurrentWorld, registerEntity, indexEntityGuid } from '../../src/runtime/ecs/world';
-import { registerTrait } from '../../src/runtime/ecs/traitRegistry';
+import { setCurrentWorld, registerEntity, indexEntityGuid } from '../../src/runtime/core/ecs/world';
+import { registerTrait } from '../../src/runtime/core/ecs/traitRegistry';
 import { serializeScene } from '../../src/editor/scene/serialize';
-import { setRunMode } from '../../src/runtime/systems/playState';
+import { setRunMode } from '../../src/runtime/core/playState';
 import { spawnPrefabInstance } from '../../src/runtime/loaders/loadSceneFile';
-import { previewControlAt, clearPreviewControls } from '../../src/runtime/systems/timelineSystem';
+import { previewControlAt, clearPreviewControls } from '../../src/runtime/timeline/timelineSystem';
 import { normalizeTimeline } from '../../src/runtime/timeline/types';
 
 function registerAll() {

@@ -6,8 +6,8 @@
 
 import { useEditorStore, type SelectedAsset } from '../store/editorStore';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
-import { getTraitByName } from '../../runtime/ecs/traitRegistry';
-import { getAllEntities, findEntity } from '../../runtime/ecs/entityUtils';
+import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
+import { getAllEntities, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { parseAnimClipBank } from '../../runtime/animation/animClipBank';
 
 /** Resolve the Animator entity a clip should bind to (so its tracks resolve their

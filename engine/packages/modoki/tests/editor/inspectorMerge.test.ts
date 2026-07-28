@@ -12,7 +12,7 @@ function setEntity(id: number, traits: { meta: FakeTrait; data: Record<string, u
   entities.set(id, new Map(traits.map((t) => [t.meta, t.data])));
 }
 
-vi.mock('../../src/runtime/ecs/entityUtils', () => ({
+vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   getEntityTraits: (id: number) => [...(entities.get(id)?.keys() ?? [])],
   readTraitData: (id: number, meta: FakeTrait) => entities.get(id)?.get(meta) ?? null,
 }));

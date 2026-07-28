@@ -5,9 +5,9 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
 import { Input, getInput } from '../../src/runtime/traits/Input';
-import type { InputDevice } from '../../src/runtime/input/actions';
+import type { InputDevice } from '../../src/runtime/core/inputActions';
 import { registerInputPromptSources } from '../../src/runtime/input/inputPromptSources';
-import { getReadValue } from '../../src/runtime/ui/readSourceRegistry';
+import { getReadValue } from '../../src/runtime/core/readSourceRegistry';
 
 let game: TestWorld | undefined;
 let dispose: (() => void) | undefined;

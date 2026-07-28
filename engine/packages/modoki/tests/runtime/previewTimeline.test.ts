@@ -4,15 +4,17 @@
  *  pose the THREE mixer at the exact time. */
 
 import { describe, it, expect, beforeEach } from 'vitest';
+// Side-effect only: wires core provider slots (P7 C11+) so real-cache tests below resolve correctly.
+import '../../src/runtime/loaders/registerProviders';
 import { createWorld } from 'koota';
-import { Transform } from '../../src/runtime/traits/Transform';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { Transform } from '../../src/runtime/core/traits/Transform';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { Animator } from '../../src/runtime/traits/Animator';
 import { SkeletalAnimator } from '../../src/runtime/traits/SkeletalAnimator';
-import { registerTrait, getAllTraits } from '../../src/runtime/ecs/traitRegistry';
+import { registerTrait, getAllTraits } from '../../src/runtime/core/ecs/traitRegistry';
 import { setAnimationClip } from '../../src/runtime/loaders/animationClipCache';
-import { previewTimelineAt } from '../../src/runtime/systems/timelineSystem';
-import { getSkeletalSeek, hasSkeletalSeeks, clearSkeletalSeeks } from '../../src/runtime/systems/skeletalSeek';
+import { previewTimelineAt } from '../../src/runtime/timeline/timelineSystem';
+import { getSkeletalSeek, hasSkeletalSeeks, clearSkeletalSeeks } from '../../src/runtime/core/skeletalSeek';
 import { normalizeTimeline } from '../../src/runtime/timeline/types';
 import type { AnimationClipDef } from '../../src/runtime/animation/types';
 

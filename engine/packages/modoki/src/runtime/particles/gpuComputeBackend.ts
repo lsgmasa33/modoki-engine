@@ -35,7 +35,15 @@ import { resolveGravity, type Vec3 } from './simSpec';
 import { createOverLifeLUT, type OverLifeLUT } from './gpuLut';
 import { makeParticlePrimitiveGeometry } from './meshParticles';
 import { orientSampleUv, radialAlpha, softParticleFade, spriteFrameNode, spriteSheetUv } from './billboardTsl';
-import { loadTexture3D, releaseTexture3D } from '../loaders/textureResolver';
+import { textureProvider } from '../core/textureProvider';
+
+function loadTexture3D(ref: string, opts?: { flipY?: boolean }): Promise<THREE.Texture> {
+  const p = textureProvider.get();
+  return p ? p.loadTexture3D(ref, opts) : Promise.reject(new Error('textureProvider not wired'));
+}
+function releaseTexture3D(tex: THREE.Texture | null | undefined): void {
+  textureProvider.get()?.releaseTexture3D(tex);
+}
 
 /** Minimal view of the renderer used to dispatch compute passes. */
 interface ComputeRenderer { compute(node: unknown): void; }

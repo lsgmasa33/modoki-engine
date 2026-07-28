@@ -8,7 +8,7 @@ import {
   getRunMode, setRunMode, isAdvancing, getPlayState, setPlayState, isSimRunning,
   onPlayStateChange, onRunModeChange,
   shouldFireActions, shouldRunSimTier, isPoseOnly, isLiveRender, canEdit,
-} from '../../src/runtime/systems/playState';
+} from '../../src/runtime/core/playState';
 
 afterEach(() => { setRunMode('playing', { advancing: true }); }); // restore the runtime default
 

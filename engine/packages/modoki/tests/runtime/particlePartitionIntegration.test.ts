@@ -94,7 +94,7 @@ async function setup() {
   // Use the REAL particle cache (seed via setParticleEffect, per the plan). Both sync
   // modules read getParticleEffect from this same instance.
   const cache = await import('../../src/runtime/loaders/particleCache');
-  const { worldTransforms } = await import('../../src/three/systems/transformPropagationSystem');
+  const { worldTransforms } = await import('../../src/runtime/core/ecs/transformPropagationSystem');
   worldTransforms.clear();
   cache.clearParticleCache();
 

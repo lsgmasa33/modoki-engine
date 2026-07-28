@@ -16,7 +16,7 @@
  *  not a resource" decision) — a rebindable table is Phase 4. No wall-clock, no RNG. */
 
 import type { InputSource } from './inputSources';
-import { applyDeadzone, type InputFrame } from './actions';
+import { applyDeadzone, type InputFrame } from '../core/inputActions';
 
 /** W3C "standard gamepad" button indices (https://w3c.github.io/gamepad/#remapping). */
 const BTN = {

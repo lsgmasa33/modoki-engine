@@ -4,28 +4,17 @@
  *  reused by whatever draws it (Scene2D / SceneView). The caller applies the entity's
  *  world transform. Returns null for an unresolvable shape (e.g. bad point list). */
 
-import { parseColliderPoints } from '../scene/colliderPoints';
+import { parseColliderPoints } from '../core/colliderPoints';
+// ColliderShapeParams/colliderGeomSig moved to traits/Collider2D.ts (P7 C14) — they describe
+// that trait's own fields. Re-exported here for existing callers.
+export { type ColliderShapeParams, colliderGeomSig } from '../traits/Collider2D';
+import type { ColliderShapeParams } from '../traits/Collider2D';
 
 export type ColliderOutline =
   | { kind: 'circle'; radius: number }
   | { kind: 'capsule'; halfH: number; radius: number }
   | { kind: 'polygon'; points: { x: number; y: number }[] } // closed loop
   | { kind: 'polyline'; points: { x: number; y: number }[] }; // open chain
-
-export interface ColliderShapeParams {
-  shape: string;
-  radius: number;
-  halfW: number;
-  halfH: number;
-  points: string;
-}
-
-/** Signature of the GEOMETRY fields that define a collider's outline/shape (no material).
- *  The single definition shared by render change-detection (colliderOutlineSig) and the
- *  physics reconciler's structural rebuild check (colliderGeomSig on the entity). Pure. */
-export function colliderGeomSig(c: ColliderShapeParams): string {
-  return `${c.shape}:${c.radius}:${c.halfW}:${c.halfH}:${c.points}`;
-}
 
 /** Parse an inline point list ([[x,y],…] or flat [x,y,…]) into world-unit points for drawing
  *  in the ECS frame. Thin wrapper over the shared parser + a min-count gate. Null if < min. */

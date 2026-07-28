@@ -3,10 +3,10 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createWorld } from 'koota';
-import { getCurrentWorld, setCurrentWorld } from '../../src/runtime/ecs/world';
-import { setPlayState } from '../../src/runtime/systems/playState';
-import { runPipeline } from '../../src/runtime/systems/pipeline';
-import { registerProjection, unregisterProjection } from '../../src/runtime/systems/projection';
+import { getCurrentWorld, setCurrentWorld } from '../../src/runtime/core/ecs/world';
+import { setPlayState } from '../../src/runtime/core/playState';
+import { runPipeline } from '../../src/runtime/core/pipeline';
+import { registerProjection, unregisterProjection } from '../../src/runtime/core/projection';
 
 function makeStore() {
   const listeners = new Set<() => void>();

@@ -7,7 +7,7 @@ beforeEach(() => {
 });
 
 async function getModule() {
-  return import('../../../src/runtime/systems/pipeline');
+  return import('../../src/runtime/core/pipeline');
 }
 
 describe('pipeline', () => {
@@ -173,7 +173,7 @@ describe('pipeline', () => {
 
   describe('simulation gating (ecs-core P2)', () => {
     async function getPlayState() {
-      return import('../../../src/runtime/systems/playState');
+      return import('../../src/runtime/core/playState');
     }
     const registerTiers = (registerSystem: any, SYSTEM_PRIORITY: any, order: string[]) => {
       registerSystem('time', () => order.push('time'), SYSTEM_PRIORITY.TIME);

@@ -7,8 +7,8 @@
  *  buttons render here alongside the actions instead of in an auto-generated tab). */
 
 import { useEffect, useState, type CSSProperties } from 'react';
-import { getUIActionNames, getUIActionParams, dispatchUIAction } from '../../ui/actionRegistry';
-import { isSimRunning } from '../../systems/playState';
+import { getUIActionNames, getUIActionParams, dispatchUIAction } from '../../core/actionRegistry';
+import { isSimRunning } from '../../core/playState';
 import { getDebugCommands, type DebugCommandDef } from '../debugMenuRegistry';
 
 const REFRESH_MS = 500;

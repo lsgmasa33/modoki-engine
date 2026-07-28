@@ -9,7 +9,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import {
   getRunMode, setRunMode, isAdvancing, getPlayState,
-} from '../../src/runtime/systems/playState';
+} from '../../src/runtime/core/playState';
 import { enterScrubMode, enterPreviewMode, exitPreviewMode, getModeOwner } from '../../src/editor/scene/playMode';
 
 afterEach(() => { setRunMode('playing', { advancing: true }); }); // restore the runtime default

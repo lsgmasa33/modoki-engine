@@ -8,7 +8,7 @@
 
 import { useState, useCallback } from 'react';
 import ContextMenu, { type ContextMenuItem } from '../../components/ContextMenu';
-import type { FieldHint } from '../../../runtime/ecs/traitRegistry';
+import type { FieldHint } from '../../../runtime/core/ecs/traitRegistry';
 import { backendFetch } from '../../backend/editorBackend';
 import {
   useBufferedValue, parseNumber, clampRange, Tooltip, inputStyle, readOnlyFieldStyle, MIXED_PLACEHOLDER,

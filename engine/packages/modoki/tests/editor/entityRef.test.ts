@@ -12,7 +12,7 @@ const Bare = trait({ v: 0 }); // an entity carrying this but NOT EntityAttribute
 let testWorld: ReturnType<typeof createWorld>;
 const entityIndex = new Map<number, any>();
 
-vi.mock('../../src/runtime/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
   findEntityById: (id: number) => entityIndex.get(id),
   registerEntity: (e: any) => entityIndex.set(e.id(), e),
@@ -38,14 +38,14 @@ const traitDefs = [
   { name: 'Bare', trait: Bare, category: 'component' as const, fields: { v: { type: 'number' } } },
 ];
 
-vi.mock('../../src/runtime/ecs/traitRegistry', () => ({
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getAllTraits: () => traitDefs,
   getTraitByName: (name: string) => traitDefs.find(t => t.name === name),
   transformName: (n: string) => n,
 }));
 
 import { ensureGuid, entityRef, buildGuidIndex, resolveRefs } from '../../src/editor/undo/entityRef';
-import { readTraitData } from '../../src/runtime/ecs/entityUtils';
+import { readTraitData } from '../../src/runtime/core/ecs/entityUtils';
 
 function spawn(world: ReturnType<typeof createWorld>, guid: string, name = '') {
   const e = world.spawn(Transform({ x: 1 }), EntityAttributes({ name, guid }));

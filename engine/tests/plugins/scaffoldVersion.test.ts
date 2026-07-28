@@ -16,7 +16,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '.
 
 describe('SCENE_FORMAT_VERSION sync', () => {
   it('starter template scene matches the engine source of truth', () => {
-    const src = readFileSync(path.join(root, 'packages/modoki/src/runtime/version.ts'), 'utf8');
+    const src = readFileSync(path.join(root, 'packages/modoki/src/runtime/core/version.ts'), 'utf8');
     const m = src.match(/SCENE_FORMAT_VERSION\s*=\s*(\d+)/);
     if (!m) throw new Error('SCENE_FORMAT_VERSION not found in version.ts');
     const engine = Number(m[1]);

@@ -7,9 +7,9 @@
  *  editor. Readouts (frame/elapsed/delta/state) refresh on a slow interval. */
 
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
-import { getCurrentWorld } from '../../ecs/world';
-import { getTime, getTimeScale, setTimeScale } from '../../systems/getTime';
-import { getPlayState } from '../../systems/playState';
+import { getCurrentWorld } from '../../core/ecs/world';
+import { getTime, getTimeScale, setTimeScale } from '../../core/getTime';
+import { getPlayState } from '../../core/playState';
 
 const REFRESH_MS = 200;
 const PRESETS = [0.25, 0.5, 1, 2];

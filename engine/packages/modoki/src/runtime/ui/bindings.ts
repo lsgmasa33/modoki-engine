@@ -20,37 +20,17 @@
  *  while playing are reverted by Stop (snapshot/revert) and Cmd+S is blocked in
  *  play, so runtime state never reaches disk. */
 
-import { getCurrentWorld, findEntityByGuid } from '../ecs/world';
-import { getTraitByName } from '../ecs/traitRegistry';
+import { getCurrentWorld, findEntityByGuid } from '../core/ecs/world';
+import { getTraitByName } from '../core/ecs/traitRegistry';
 import { markUIDirty } from './uiTreeStore';
-import { isSimRunning } from '../systems/playState';
-import { dispatchUIAction, type UIActionPayload } from './actionRegistry';
+import { isSimRunning } from '../core/playState';
+import { dispatchUIAction, type UIActionPayload } from '../core/actionRegistry';
 
-export type UIActionEvent = 'click' | 'change' | 'submit';
-export type UIActionKind = 'set' | 'call';
-
-/** One event→response binding on a UIAction. */
-export interface UIActionBinding {
-  /** Which interaction fires this binding. Defaults to 'click' when omitted. */
-  event: UIActionEvent;
-  /** What the binding does. */
-  kind: UIActionKind;
-  // ── kind: 'set' ── declarative write
-  /** Target entity GUID. For 'set' it's the entity written; for 'call' it's
-   *  passed to the handler as ctx.target. Empty → the element's own entity. */
-  target?: string;
-  /** Component (trait) name to write, e.g. 'UIElement'. */
-  component?: string;
-  /** Field on that component, e.g. 'isVisible'. */
-  property?: string;
-  /** Value to write — typed by the field's FieldHint, or the token '$value'. */
-  value?: unknown;
-  // ── kind: 'call' ── named action
-  /** Action name (system-owned or engine built-in). */
-  action?: string;
-  /** Typed arguments for the action; values may be the '$value' token. */
-  params?: Record<string, unknown>;
-}
+// UIActionEvent/UIActionKind/UIActionBinding are the UIAction trait's own schema — defined in
+// traits/UIAction.ts and re-exported here (not the reverse) so every existing import of these
+// three names, from this file or the runtime barrel, keeps working unchanged.
+import type { UIActionEvent, UIActionKind, UIActionBinding } from '../traits/UIAction';
+export type { UIActionEvent, UIActionKind, UIActionBinding };
 
 /** The `$value` token resolves to the triggering event's value at dispatch. */
 export const VALUE_TOKEN = '$value';

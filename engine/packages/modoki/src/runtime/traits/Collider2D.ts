@@ -47,3 +47,21 @@ export const Collider2D = trait({
   collisionGroups: 0xffff as number,
   collisionMask: 0xffff as number,
 });
+
+/** The GEOMETRY subset of a Collider2D's fields (no material/physics-layer params) —
+ *  moved here from `rendering/colliderOutline2D.ts` (P7 C14) since it describes this
+ *  trait's own fields. */
+export interface ColliderShapeParams {
+  shape: string;
+  radius: number;
+  halfW: number;
+  halfH: number;
+  points: string;
+}
+
+/** Signature of the GEOMETRY fields that define a collider's outline/shape (no material).
+ *  The single definition shared by render change-detection (colliderOutlineSig) and the
+ *  physics reconciler's structural rebuild check (colliderGeomSig on the entity). Pure. */
+export function colliderGeomSig(c: ColliderShapeParams): string {
+  return `${c.shape}:${c.radius}:${c.halfW}:${c.halfH}:${c.points}`;
+}

@@ -10,7 +10,7 @@
 import { describe, it, expect } from 'vitest';
 import { createWorld } from 'koota';
 import { buildCanvas2DRoute, emitterCanvasId, type Canvas2DRoute } from '../../src/runtime/rendering/particle2DRouting';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { Canvas2D } from '../../src/runtime/traits/Canvas2D';
 
 const route = (parentOf: [number, number][], canvasIds: number[]): Canvas2DRoute => ({

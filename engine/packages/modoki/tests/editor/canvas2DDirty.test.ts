@@ -7,7 +7,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { mark2DDirty, get2DDirtyVersion, consume2DDirty, ensureCanvas2DListeners } from '../../src/editor/store/canvas2DDirty';
-import { fireDirtyListeners } from '../../src/runtime/ecs/entityUtils';
+import { fireDirtyListeners } from '../../src/runtime/core/ecs/entityUtils';
 
 describe('canvas2DDirty version counter', () => {
   it('bumps the version on every mark2DDirty', () => {

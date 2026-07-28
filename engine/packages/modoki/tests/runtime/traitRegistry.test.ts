@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { trait } from 'koota';
 
 async function getRegistry() {
-  return import('../../../src/runtime/ecs/traitRegistry');
+  return import('../../../src/runtime/core/ecs/traitRegistry');
 }
 
 beforeEach(() => {

@@ -7,9 +7,9 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
-import { setCurrentWorld, registerEntity } from '../../src/runtime/ecs/world';
-import { registerTrait } from '../../src/runtime/ecs/traitRegistry';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
+import { setCurrentWorld, registerEntity } from '../../src/runtime/core/ecs/world';
+import { registerTrait } from '../../src/runtime/core/ecs/traitRegistry';
 import {
   markSceneDirty, resolveAffectedScenes, markSceneDirtyForEntity,
   clearSceneDirty, isSceneDirty, clearAllSceneDirty, dirtySceneGuidsSnapshot,

@@ -10,12 +10,12 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
-import { setCurrentWorld, getCurrentWorld } from '../../src/runtime/ecs/world';
-import { registerTrait } from '../../src/runtime/ecs/traitRegistry';
-import { getAllEntities } from '../../src/runtime/ecs/entityUtils';
+import { setCurrentWorld, getCurrentWorld } from '../../src/runtime/core/ecs/world';
+import { registerTrait } from '../../src/runtime/core/ecs/traitRegistry';
+import { getAllEntities } from '../../src/runtime/core/ecs/entityUtils';
 import { Camera } from '../../src/runtime/traits/Camera';
-import { Transform } from '../../src/runtime/traits/Transform';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { Transform } from '../../src/runtime/core/traits/Transform';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { Environment } from '../../src/three/traits/Environment';
 import { Light } from '../../src/three/traits/Light';
 import { newScene, getCurrentScenePath, setCurrentScenePath } from '../../src/editor/scene/serialize';

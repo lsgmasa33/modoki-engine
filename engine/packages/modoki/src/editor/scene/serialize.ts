@@ -1,20 +1,20 @@
 /** Serialize the ECS world to scene + materials JSON files.
  *  Uses the trait registry — no hardcoded trait knowledge. */
 
-import { getAllEntities, readTraitData, findEntity, deleteEntities, subtreeIds } from '../../runtime/ecs/entityUtils';
+import { getAllEntities, readTraitData, findEntity, deleteEntities, subtreeIds } from '../../runtime/core/ecs/entityUtils';
 import { Transient } from '../../runtime/traits/Transient';
-import { getCurrentWorld, registerEntity } from '../../runtime/ecs/world';
+import { getCurrentWorld, registerEntity } from '../../runtime/core/ecs/world';
 import { Camera } from '../../runtime/traits/Camera';
-import { Transform } from '../../runtime/traits/Transform';
-import { EntityAttributes } from '../../runtime/traits/EntityAttributes';
+import { Transform } from '../../runtime/core/traits/Transform';
+import { EntityAttributes } from '../../runtime/core/traits/EntityAttributes';
 import { Environment } from '../../three/traits/Environment';
 import { Light } from '../../three/traits/Light';
 import { backendFetch } from '../backend/editorBackend';
 import { saveAssetDialog } from '../utils/saveDialog';
-import { getAllTraits, getTraitByName } from '../../runtime/ecs/traitRegistry';
+import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { useEditorStore } from '../store/editorStore';
-import { setPlayState, getRunMode } from '../../runtime/systems/playState';
+import { setPlayState, getRunMode } from '../../runtime/core/playState';
 import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { captureInstanceOverrides, captureInstanceStructure, getPrefabSource, getCachedPrefabSync } from './prefab';
@@ -23,8 +23,9 @@ import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, co
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
 import { clearAllSceneDirty, clearSceneDirty, isSceneDirty } from './sceneDirty';
 import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
-import { REF_FIELDS_BY_TRAIT } from '../../runtime/scene/sceneValidation';
-import { SCENE_FORMAT_VERSION } from '../../runtime/version';
+import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
+import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
+import { hasDirtyAssets, flushDirtyAssets, type FlushResult } from './dirtyAssets';
 
 // ── Types ───────────────────────────────────────────────
 
@@ -693,8 +694,11 @@ let _savedAtEditVersion = 0;
 export function markSceneSaved(): void { _savedAtEditVersion = getEditVersion(); }
 /** Is there live-world work not on disk? Used to stop load_scene/new_scene silently
  *  DESTROYING it — that reported {ok:true} while the entity you just created was gone from
- *  the world, the file, and the undo stack, with nothing anywhere saying why. */
-export function hasUnsavedChanges(): boolean { return getEditVersion() !== _savedAtEditVersion; }
+ *  the world, the file, and the undo stack, with nothing anywhere saying why.
+ *  Also true while a 'manual'-mode particle/anim/timeline edit is pending a save
+ *  (dirtyAssets.ts, mcp-persistence.md Phase 3) — those are asset-shaped work,
+ *  not scene-edit-version work, so `getEditVersion()` alone can't see them. */
+export function hasUnsavedChanges(): boolean { return getEditVersion() !== _savedAtEditVersion || hasDirtyAssets(); }
 
 export interface SaveResult {
   saved: boolean;
@@ -705,6 +709,8 @@ export interface SaveResult {
    *  was dirty. A base is only ever written once the primary's own save succeeded —
    *  `saveScene`'s run-mode refusal sits above both, so neither writes during Play. */
   extraSaved?: { path: string; guid: string }[];
+  /** Pending particle/anim/timeline writes (Phase 3) flushed alongside this save, if any. */
+  assets?: FlushResult;
 }
 
 export async function saveScene(opts: {
@@ -747,8 +753,9 @@ export async function saveScene(opts: {
       if (knownPath !== _currentScenePath) setCurrentScenePath(knownPath);
       editorEmit('!save', { path: knownPath, entities: scene.entities.length }); // Editor Percept (V2)
       console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${knownPath}`);
+      const assets = await flushDirtyAssets(); // Phase 3: pending manual-mode particle/anim/timeline edits
       markSceneSaved();
-      return { saved: true, path: knownPath, reason: 'ok' };
+      return { saved: true, path: knownPath, reason: 'ok', ...(assets.saved.length || assets.failed.length ? { assets } : {}) };
     }
     console.error(`[Editor] Failed to save scene to ${knownPath}`);
     return { saved: false, path: knownPath, reason: 'write-failed' };
@@ -777,8 +784,9 @@ export async function saveScene(opts: {
     setCurrentScenePath(target); // persists, so the next Save All goes straight to it
     editorEmit('!save', { path: target, entities: scene.entities.length }); // Editor Percept (V2)
     console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${target}`);
+    const assets = await flushDirtyAssets(); // Phase 3: pending manual-mode particle/anim/timeline edits
     markSceneSaved();
-    return { saved: true, path: target, reason: 'ok' };
+    return { saved: true, path: target, reason: 'ok', ...(assets.saved.length || assets.failed.length ? { assets } : {}) };
   }
   console.error(`[Editor] Failed to save scene to ${target}`);
   return { saved: false, path: target, reason: 'write-failed' };

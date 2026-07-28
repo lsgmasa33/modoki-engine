@@ -50,13 +50,12 @@ import {
   roundPixelsBit, roundPixelsBitGl,
   // Program types are structural; import lazily via the compile fns' return type.
 } from 'pixi.js';
-import { assetUrl } from '../loaders/assetUrl';
-import { ASSET_FETCH_INIT } from '../loaders/assetFetch';
 import { resolvePixiBackend } from './canvas2DPool';
 import {
-  coerceParamValue, fetchShaderManifest, mergeParamDefaults, shaderSpace,
+  coerceParamValue, mergeParamDefaults, shaderSpace,
   type ShaderParam, type ShaderParamType, type ShaderManifest, type ShaderParamSchema,
-} from '../loaders/shaderSchema';
+} from '../core/shaderSchema';
+import { assetPlumbing } from '../core/assetPlumbing';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -219,7 +218,7 @@ function variantPath(manifestPath: string, ext: 'wgsl' | 'glsl'): string {
  *  not a 2D shader, or the backend-matched body is absent. Compiles ONE gl + one gpu
  *  program; call once per asset and reuse across entities. */
 export async function buildPixiShaderProgram(manifestPath: string): Promise<PixiShaderProgram | null> {
-  const manifest = await fetchShaderManifest(manifestPath);
+  const manifest = await assetPlumbing.get()?.fetchShaderManifest(manifestPath) ?? null;
   if (!manifest) return null;
   if (shaderSpace(manifest) !== '2d') {
     console.warn(`[pixiShader] ${manifestPath}: not a 2D shader (space='${manifest.space ?? '3d'}') — skipped.`);
@@ -244,7 +243,8 @@ export async function buildPixiShaderProgram(manifestPath: string): Promise<Pixi
   // override), so the compiled program always matches the live renderer.
   const ext: 'wgsl' | 'glsl' = (await resolvePixiBackend()) === 'webgpu' ? 'wgsl' : 'glsl';
   const webgpu = ext === 'wgsl';
-  const bodyRes = await fetch(assetUrl(variantPath(manifestPath, ext)), ASSET_FETCH_INIT).catch(() => null);
+  const plumbing = assetPlumbing.get();
+  const bodyRes = plumbing ? await fetch(plumbing.assetUrl(variantPath(manifestPath, ext)), plumbing.fetchInit).catch(() => null) : null;
   const body = bodyRes?.ok ? (await bodyRes.text()).trim() : '';
   if (!body) {
     console.warn(`[pixiShader] ${manifestPath}: missing ${ext.toUpperCase()} body for the active backend — falling back to the default sprite shader.`);

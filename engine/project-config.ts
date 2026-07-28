@@ -255,7 +255,7 @@ export interface ProjectConfig {
      *  against to refuse an update this running JS can't execute. A build
      *  produced by a newer/older engine should carry a different value; hand-
      *  editing this to "fix" a rejected update defeats the gate it exists for.
-     *  Must equal `ENGINE_API_VERSION` (`runtime/version.ts`) — this file stays
+     *  Must equal `ENGINE_API_VERSION` (`runtime/core/version.ts`) — this file stays
      *  import-free (see header), so the two are pinned together by a vitest
      *  rather than a shared import. */
     engineApi: number;

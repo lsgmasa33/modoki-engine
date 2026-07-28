@@ -3,7 +3,7 @@
  *                    Called with getCurrentWorld() each frame. */
 
 import { useEffect } from 'react';
-import { getCurrentWorld } from '../ecs/world';
+import { getCurrentWorld } from '../core/ecs/world';
 import { registerFrameCallback, unregisterFrameCallback, startFrameDriver, stopFrameDriver, PRIORITY_ECS } from './frameDriver';
 import type { World } from 'koota';
 

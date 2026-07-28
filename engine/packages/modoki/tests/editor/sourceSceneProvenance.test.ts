@@ -14,13 +14,13 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createWorld } from 'koota';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
-import { Transform } from '../../src/runtime/traits/Transform';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
+import { Transform } from '../../src/runtime/core/traits/Transform';
 import { Persistent } from '../../src/runtime/traits/Persistent';
-import { setCurrentWorld, registerEntity, indexEntityGuid } from '../../src/runtime/ecs/world';
-import { registerTrait, getAllTraits } from '../../src/runtime/ecs/traitRegistry';
+import { setCurrentWorld, registerEntity, indexEntityGuid } from '../../src/runtime/core/ecs/world';
+import { registerTrait, getAllTraits } from '../../src/runtime/core/ecs/traitRegistry';
 import { serializeScene } from '../../src/editor/scene/serialize';
-import { setRunMode } from '../../src/runtime/systems/playState';
+import { setRunMode } from '../../src/runtime/core/playState';
 
 function registerAll() {
   registerTrait({

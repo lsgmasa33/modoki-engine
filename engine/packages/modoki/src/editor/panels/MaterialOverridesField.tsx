@@ -10,8 +10,8 @@
  *  (undo-tracked). Editing is single-entity only — a multi-selection shows a hint (see `multi`). */
 
 import { useState, useEffect } from 'react';
-import { readTraitData } from '../../runtime/ecs/entityUtils';
-import { type TraitMeta, getTraitByName } from '../../runtime/ecs/traitRegistry';
+import { readTraitData } from '../../runtime/core/ecs/entityUtils';
+import { type TraitMeta, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { writeTraitFieldPerEntityWithUndo as writeFieldPerEntity } from '../undo/entityActions';
 import type { MaterialParamOverride, MaterialParamSource } from '../../runtime/traits/MaterialInstance';
 import { resolveGuidToPath, resolveRef, isGuid } from '../../runtime/loaders/assetManifest';

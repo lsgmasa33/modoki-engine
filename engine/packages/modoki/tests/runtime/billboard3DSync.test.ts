@@ -12,7 +12,7 @@ beforeEach(() => { vi.resetModules(); });
 async function setup() {
   vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
   vi.doMock('../../src/three/traits/Environment', () => ({ Environment: {} }));
-  vi.doMock('../../src/three/systems/transformPropagationSystem', () => ({
+  vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
     worldTransforms: new Map(), deactivatedEntities: new Set(),
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
@@ -26,7 +26,7 @@ async function setup() {
     getRiggedModel: vi.fn(() => undefined), ensureRiggedModelLoaded: vi.fn(),
   }));
   // Any non-empty sprite ref is treated as a GUID so the texture-load path fires.
-  vi.doMock('../../src/runtime/loaders/assetRefRules', () => ({ isGuid: (s: string) => !!s }));
+  vi.doMock('../../src/runtime/core/assetRefRules', () => ({ isGuid: (s: string) => !!s }));
   // Mock the KTX2 loader (billboards load part.url via getKTX2Loader / TextureLoader).
   const loadAsync = vi.fn(async () => ({ isTexture: true, colorSpace: '', flipY: false }));
   vi.doMock('../../src/runtime/loaders/textureResolver', () => ({
@@ -36,7 +36,7 @@ async function setup() {
   const { createWorld } = await import('koota');
   const traits = await import('../../src/runtime/traits');
   const sync = await import('../../src/runtime/rendering/scene3DSync');
-  const bufs = await import('../../src/runtime/systems/skin2DBuffers');
+  const bufs = await import('../../src/runtime/skinning/skin2DBuffers');
   const T = await import('three');
   bufs.clearSkin2DBuffers();
   return { world: createWorld(), traits, sync, bufs, T, loadAsync };

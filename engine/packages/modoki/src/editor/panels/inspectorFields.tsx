@@ -4,13 +4,13 @@
  *  could move to its own file without a circular import back into Inspector. */
 
 import { useState, useEffect, useMemo } from 'react';
-import { findEntity } from '../../runtime/ecs/entityUtils';
-import { getCurrentWorld } from '../../runtime/ecs/world';
-import { type FieldHint, getTraitByName } from '../../runtime/ecs/traitRegistry';
+import { findEntity } from '../../runtime/core/ecs/entityUtils';
+import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { type FieldHint, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { newGuid } from '../../runtime/loaders/assetManifest';
 import { onEditorDirty } from '../../runtime/ui/uiTreeStore';
-import { getUIActionNames } from '../../runtime/ui/actionRegistry';
-import { getPhysicsLayerNames } from '../../runtime/systems/physicsLayers';
+import { getUIActionNames } from '../../runtime/core/actionRegistry';
+import { getPhysicsLayerNames } from '../../runtime/physics/physicsLayers';
 import { BufferedTextInput, BufferedNumberInput, inputStyle, MIXED_PLACEHOLDER } from './fields';
 import { FieldLabel, DropdownField, ColorField, DEFAULT_COLOR } from './assetViews/widgets';
 import { useEditorStore } from '../store/editorStore';

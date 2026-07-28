@@ -9,7 +9,7 @@
  *  Bone locals are parent-relative in texture space (pivot-centered), matching the
  *  `.rig2d.json` convention. */
 
-import type { Rig2DBone } from '../loaders/rig2dCache';
+import type { Rig2DBone } from './rig2dTypes';
 
 export interface SuggestBonesOptions {
   width: number;

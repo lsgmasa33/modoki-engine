@@ -22,6 +22,16 @@ import { summarizeAssets, summarizeTraits, type AssetEntry, type TraitSchema } f
 
 const BACKEND = (process.env.MODOKI_BACKEND || 'http://localhost:5173').replace(/\/$/, '');
 
+/** Reserved for the persistence-mode Phase 2/3 per-call override (mcp-persistence-
+ *  unification.md) — NOT YET HONORED. Every mutating tool accepts it now so its schema
+ *  doesn't need to change again once Phase 2/3 wire it up; every tool's `saved` field in its
+ *  result reflects what it ACTUALLY did today, regardless of this param. */
+const SAVE_PARAM = z.boolean().optional().describe(
+  "Reserved for the persistence-mode per-call override (modoki_persistence) — NOT YET " +
+  'HONORED by this build. Accepted for forward compatibility; every tool\'s `saved` field ' +
+  'in its result reflects what actually happened, independent of this flag.',
+);
+
 /** C6 — the instance token identifying WHICH editor+project this config was written for.
  *  Baked into `.mcp.json` by AI → Connect Claude Code. A port names a socket, not an
  *  editor: if another editor now holds our port, the backend refuses these requests (403)
@@ -293,14 +303,19 @@ server.tool(
 // ── mutate_scene — the validated way to edit scene structure ──
 server.tool(
   'modoki_mutate_scene',
-  'Apply validated ops to a scene FILE (setTrait / removeTrait / addEntity / removeEntity / setBaseScene), ' +
-    'then atomically write it; the editor hot-reloads. GUIDs are minted as needed. This is ' +
-    'how you edit scene structure — do NOT hand-write scene JSON. The entity ref is an ' +
-    'OBJECT {id} | {name} | {guid}; setTrait carries the changed values under "fields". ' +
-    'Returns {ok, changed, errors, warnings} — deliberately NOT the scene (echoing the whole ' +
-    'file on every edit cost ~10k tokens for data nobody read, and it was the pre-expansion ' +
-    'file, not the live world). After mutating, verify with modoki_get_scene_state, which ' +
-    'reads the running engine.',
+  'Apply validated ops (setTrait / removeTrait / addEntity / removeEntity / setBaseScene) to a scene. ' +
+    'GUIDs are minted as needed. This is how you edit scene structure — do NOT hand-write scene JSON. ' +
+    'The entity ref is an OBJECT {id} | {name} | {guid}; setTrait carries the changed values under ' +
+    '"fields". Returns {ok, changed, errors, warnings, saved, mode} — deliberately NOT the scene ' +
+    '(echoing the whole file on every edit cost ~10k tokens for data nobody read). After mutating, ' +
+    'verify with modoki_get_scene_state, which reads the running engine. ' +
+    'PERSISTENCE (mcp-persistence.md): when the editor has this exact scene open, the ' +
+    'whole call applies to the LIVE world as ONE undoable step (a human can Cmd-Z it) — \'auto\' mode ' +
+    '(default) then saves it to disk too; \'manual\' mode (modoki_persistence) leaves it live-only ' +
+    'until modoki_save_all. `setBaseScene` has no live equivalent and always goes straight to the ' +
+    'FILE regardless of mode. With no editor connected, or targeting a scene that ISN\'T the one open ' +
+    'live, this falls back to writing the scene FILE directly (today\'s original behaviour — the ' +
+    'browser-free curl-editing path).',
   {
     path: z.string().describe('Asset-root URL of the scene, e.g. /games/x/assets/scenes/main.json'),
     ops: z.array(z.record(z.any())).describe(
@@ -310,6 +325,7 @@ server.tool(
       'removeEntity: {"op":"removeEntity","entity":{"id":11}}. ' +
       'setBaseScene (base-scene persistence — scene-level, no entity ref; guid of a base scene to load additively, or null to clear): ' +
       '{"op":"setBaseScene","baseScene":"<scene guid>"}.'),
+    save: SAVE_PARAM,
   },
   async ({ path, ops }) => postJson('/api/scene-mutate', { path, ops }),
 );
@@ -321,9 +337,10 @@ server.tool(
     'path for placing, scaling, or rotating an entity without hand-building a ' +
     'mutate_scene op. Only the components you pass are changed (partial merge). ' +
     'Handles prefab INSTANCES correctly (routes the edit into the instance overrides, ' +
-    'where a plain setTrait would be silently ignored). Writes the scene file and the ' +
-    'editor hot-reloads. `path` defaults to the active scene. Verify with ' +
-    'modoki_get_scene_state.',
+    'where a plain setTrait would be silently ignored). Goes through modoki_mutate_scene under ' +
+    'the hood, so the same persistence behaviour applies (see its description): live + undoable ' +
+    'when the editor has this scene open, file-direct otherwise. `path` defaults to the active ' +
+    'scene. Verify with modoki_get_scene_state.',
   {
     entity: z.object({
       id: z.number().optional(),
@@ -335,6 +352,7 @@ server.tool(
     scale: z.union([z.number(), z.array(z.number()).length(3)]).optional()
       .describe('Uniform scale (a single number) or per-axis [sx, sy, sz].'),
     path: z.string().optional().describe('Scene file URL. Defaults to the active scene.'),
+    save: SAVE_PARAM,
   },
   async ({ entity, position, rotation, scale, path }) => {
     const fields: Record<string, number> = {};
@@ -824,11 +842,32 @@ server.tool(
   'modoki_get_editor_state',
   'Read the WHOLE editor UI state in one call: current scene path, play state ' +
     '(stopped/playing/paused), gizmo mode/space, FPS, entity count, current selection ' +
-    '(entity ids + selected asset), the editor viewport camera pose, and undo/redo ' +
-    'availability + labels. The companion to get_scene_state (which reads the ECS world): ' +
-    'this reads the EDITOR. Requires a connected editor renderer.',
+    '(entity ids + selected asset), the editor viewport camera pose, undo/redo ' +
+    'availability + labels, and `persistenceMode` (\'auto\' | \'manual\' — see modoki_persistence). ' +
+    'The companion to get_scene_state (which reads the ECS world): this reads the EDITOR. ' +
+    'Requires a connected editor renderer.',
   {},
   async () => getJson('/api/editor-state'),
+);
+
+// ── persistence — the MCP persistence-mode knob (mcp-persistence.md) ──
+server.tool(
+  'modoki_persistence',
+  'Get or set the session\'s MCP persistence mode. Bare call reads the current mode ' +
+    '(also returned in every modoki_get_editor_state read as `persistenceMode`) plus ' +
+    '`unsavedChanges` (null if no editor is connected). Pass `mode` to change it for every ' +
+    'later tool call in this session. \'auto\' (default) matches the original per-tool ' +
+    'behaviour: modoki_mutate_scene/modoki_set_transform and the particle/anim/timeline ops ' +
+    'save to disk immediately (when a live edit happens at all — see each tool\'s own ' +
+    'description); the live-world entity/prefab tools always applied only to the running ' +
+    'world regardless of mode, unchanged. \'manual\' mode makes those SAME edits live-only: ' +
+    'modoki_mutate_scene/modoki_set_transform apply as ONE undoable step to the running world ' +
+    'without touching the scene file, and the particle/anim/timeline ops park their write in a ' +
+    'dirty-asset registry (visible via modoki_get_editor_state `dirtyAssetPaths`) — both need ' +
+    'modoki_save_all to reach disk. modoki_write_asset/modoki_create_asset are unaffected by ' +
+    'this knob either way (explicit "write this file" tools).',
+  { mode: z.enum(['auto', 'manual']).optional().describe('Set the session mode. Omit to just read the current mode + pending-work status.') },
+  async ({ mode }) => postJson('/api/persistence', mode ? { mode } : {}),
 );
 
 // ── editor_journal — the human-activity stream (Editor Percept) ──
@@ -986,6 +1025,7 @@ server.tool(
     shape: z.string().optional().describe('For kind=2d.'),
     preset: z.enum(['view', 'text', 'image', 'button', 'input', 'slider']).optional().describe('For kind=ui.'),
     light: z.enum(['ambient', 'directional', 'point', 'spot']).optional().describe('For kind=light.'),
+    save: SAVE_PARAM,
   },
   async ({ kind, parentId, parentGuid, mesh, shape, preset, light }) => {
     // Build the discriminated CreateEntitySpec the renderer op expects.
@@ -1005,7 +1045,7 @@ server.tool(
   'Duplicate an entity and its subtree (undoable, like Cmd+D). Address it by `guid` (PREFER — ' +
     'stable) or `id`. Returns {id, guid} of the new copy — carry the guid. LIVE-world only: NOT ' +
     'saved to disk (run modoki_save_all to persist).',
-  { id: z.number().optional().describe('Runtime id — reassigned on hot-reload. Prefer guid.'), guid: z.string().optional().describe('Stable entity guid (preferred). Wins over id.') },
+  { id: z.number().optional().describe('Runtime id — reassigned on hot-reload. Prefer guid.'), guid: z.string().optional().describe('Stable entity guid (preferred). Wins over id.'), save: SAVE_PARAM },
   async ({ id, guid }) => editorAction('duplicate-entity', { id, guid }),
 );
 server.tool(
@@ -1018,6 +1058,7 @@ server.tool(
     id: z.number().optional(),
     guids: z.array(z.string()).optional().describe('Stable entity guids (preferred).'),
     guid: z.string().optional(),
+    save: SAVE_PARAM,
   },
   async ({ ids, id, guids, guid }) => editorAction('delete-entities', { ids, id, guids, guid }),
 );
@@ -1032,6 +1073,7 @@ server.tool(
     parentId: z.number().optional().describe('New parent runtime id (0 or omitted = root). Prefer parentGuid.'),
     parentGuid: z.string().optional().describe('New parent guid (preferred). Wins over parentId.'),
     sortOrder: z.number().optional(),
+    save: SAVE_PARAM,
   },
   async ({ id, guid, parentId, parentGuid, sortOrder }) => editorAction('reparent-entity', { id, guid, parentId, parentGuid, sortOrder }),
 );
@@ -1053,6 +1095,7 @@ server.tool(
     parentGuid: z.string().optional().describe('instantiate: parent entity guid (preferred; wins over parentId).'),
     entityId: z.number().optional().describe('create/detach: the entity id. Prefer entityGuid.'),
     entityGuid: z.string().optional().describe('create/detach: the entity guid (preferred; wins over entityId).'),
+    save: SAVE_PARAM,
   },
   async (p) => editorAction('prefab', p),
 );
@@ -1477,10 +1520,13 @@ server.tool(
 server.tool(
   'modoki_create_asset',
   'Scaffold a new asset (material/particle/animation) with sensible defaults + a fresh GUID at ' +
-    'the given path. Then edit it with modoki_write_asset or (for live preview) the particle/anim ops.',
+    'the given path. Then edit it with modoki_write_asset or (for live preview) the particle/anim ops. ' +
+    'Always writes the file directly, regardless of persistence mode (modoki_persistence) — this is ' +
+    'an explicit "write this file" tool, not a live-state edit.',
   {
     type: z.enum(['material', 'particle', 'animation']),
     path: z.string().describe('Asset-root URL, e.g. /games/x/assets/fx/spark.particle.json'),
+    save: SAVE_PARAM,
   },
   async ({ type, path }) => postJson('/api/create-asset', { type, path }),
 );
@@ -1488,11 +1534,14 @@ server.tool(
   'modoki_write_asset',
   'Write an asset JSON file (material/particle/animation) with validation (warn-but-write — hard ' +
     'errors block, warnings are returned). Preserves the existing file\'s id if `data` omits one. ' +
-    'For a LIVE particle/animation preview while tuning, prefer modoki_particle_set / modoki_anim_set_clip.',
+    'Always writes the file directly, regardless of persistence mode (modoki_persistence) — this is ' +
+    'an explicit "write this file" tool, not a live-state edit. For a LIVE particle/animation preview ' +
+    'while tuning, prefer modoki_particle_set / modoki_anim_set_clip.',
   {
     path: z.string(),
     type: z.enum(['material', 'particle', 'animation']),
     data: z.record(z.any()).describe('The asset document (see modoki_asset_schema for the shape).'),
+    save: SAVE_PARAM,
   },
   async ({ path, type, data }) => postJson('/api/asset-write', { path, type, data }),
 );
@@ -1507,29 +1556,37 @@ server.tool(
 );
 server.tool(
   'modoki_particle_set',
-  'Replace a particle effect definition — applies LIVE (you see it immediately) AND saves the ' +
-    '.particle.json. Get the shape from modoki_asset_schema particle. Tune emission/lifetime/size, ' +
-    'then judge motion with modoki_render_sequence (the human refines the final feel).',
+  'Replace a particle effect definition — applies LIVE (you see it immediately). In \'auto\' ' +
+    'persistence mode (default) it also saves the .particle.json immediately; in \'manual\' mode ' +
+    '(modoki_persistence) the write is parked in a dirty-asset registry instead — visible via ' +
+    'modoki_get_editor_state `dirtyAssetPaths` — until modoki_save_all flushes it. Get the shape ' +
+    'from modoki_asset_schema particle. Tune emission/lifetime/size, then judge motion with ' +
+    'modoki_render_sequence (the human refines the final feel).',
   {
     path: z.string().describe('Asset-root URL of the .particle.json'),
     def: z.record(z.any()).describe('Full ParticleEffectDef (see modoki_asset_schema particle).'),
+    save: SAVE_PARAM,
   },
   async ({ path, def }) => editorAction('particle-set', { path, def }),
 );
 server.tool(
   'modoki_anim_set_clip',
-  'Replace a whole animation clip — normalized, applied LIVE, and saved to the .anim.json.',
+  'Replace a whole animation clip — normalized, applied LIVE. Saved to the .anim.json in \'auto\' ' +
+    'mode (default); parked in the dirty-asset registry in \'manual\' mode (modoki_persistence) ' +
+    'until modoki_save_all.',
   {
     clipPath: z.string(),
     clip: z.record(z.any()).describe('Full AnimationClipDef (see modoki_asset_schema animation).'),
+    save: SAVE_PARAM,
   },
   async ({ clipPath, clip }) => editorAction('anim-set-clip', { clipPath, clip }),
 );
 server.tool(
   'modoki_anim_add_key',
   'Add/update ONE keyframe on a clip track (creates the track if absent) — the granular way to ' +
-    'rough-in timing. Applies live + saves. `path` is the relative entity name-path from the ' +
-    'Animator root ("" = root). `type` defaults to number (use color/boolean/enum for those fields).',
+    'rough-in timing. Applies live; saves in \'auto\' mode (default) or parks the write in \'manual\' ' +
+    'mode (modoki_persistence) until modoki_save_all. `path` is the relative entity name-path from ' +
+    'the Animator root ("" = root). `type` defaults to number (use color/boolean/enum for those fields).',
   {
     clipPath: z.string(),
     trait: z.string().describe('e.g. "Transform"'),
@@ -1538,16 +1595,20 @@ server.tool(
     value: z.union([z.number(), z.string(), z.boolean()]).describe('Value (encoded per track type).'),
     path: z.string().optional().describe('Relative name-path from the Animator root (default "").'),
     type: z.enum(['number', 'color', 'boolean', 'enum']).optional(),
+    save: SAVE_PARAM,
   },
   async (p) => editorAction('anim-add-key', p),
 );
 server.tool(
   'modoki_timeline_set',
-  'Replace a whole timeline sequence — normalized, applied LIVE (panel + runtime), and saved to the ' +
-    '.timeline.json. Tracks target descendants of the Director root by relative name-path.',
+  'Replace a whole timeline sequence — normalized, applied LIVE (panel + runtime). Saved to the ' +
+    '.timeline.json in \'auto\' mode (default); parked in the dirty-asset registry in \'manual\' mode ' +
+    '(modoki_persistence) until modoki_save_all. Tracks target descendants of the Director root by ' +
+    'relative name-path.',
   {
     timelinePath: z.string(),
     timeline: z.record(z.any()).describe('Full TimelineDef (see modoki_asset_schema timeline).'),
+    save: SAVE_PARAM,
   },
   async ({ timelinePath, timeline }) => editorAction('timeline-set', { timelinePath, timeline }),
 );
@@ -1556,12 +1617,15 @@ server.tool(
   'Add ONE item to a timeline track (creates the track if absent) — the granular way to build a ' +
     'cutscene. `trackType` picks the lane; `item` is the per-kind body: animation → ' +
     '{start,duration?,clip(NAME in the target animator bank),scrub?} · signal → {t,action(UIAction),params?} · ' +
-    'audio → {t,clip(audio GUID),bus?,volume?,pitch?} · activation → {start,end}. Applies live + saves.',
+    'audio → {t,clip(audio GUID),bus?,volume?,pitch?} · activation → {start,end}. Applies live; saves ' +
+    'in \'auto\' mode (default) or parks the write in \'manual\' mode (modoki_persistence) until ' +
+    'modoki_save_all.',
   {
     timelinePath: z.string(),
     trackType: z.enum(['animation', 'signal', 'audio', 'activation']),
     target: z.string().optional().describe('Relative name-path from the Director root (default "" = root).'),
     item: z.record(z.any()).describe('The per-kind item body (see description).'),
+    save: SAVE_PARAM,
   },
   async (p) => editorAction('timeline-add-clip', p),
 );

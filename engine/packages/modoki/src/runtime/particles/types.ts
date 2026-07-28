@@ -42,48 +42,12 @@ export const SEEK_MAX_STEPS = 600;
 export const seekSteps = (fromTime: number, toTime: number): number =>
   Math.min(SEEK_MAX_STEPS, Math.max(0, Math.floor((toTime - fromTime) / PREWARM_STEP)));
 
-export interface MinMax {
-  min: number;
-  max: number;
-}
-
-/** Linear-space RGB, each channel 0..1. */
-export interface RGB {
-  r: number;
-  g: number;
-  b: number;
-}
-
-/** A single value keyframe: `t` is normalized lifetime 0..1, `v` the value. */
-export interface CurvePoint {
-  t: number;
-  v: number;
-}
-
-/**
- * Piecewise-linear curve over normalized lifetime (0..1). Sorted by `t`.
- * `scale` multiplies the sampled value (lets the editor keep points in 0..1 and scale).
- */
-export interface Curve {
-  points: CurvePoint[];
-  scale?: number;
-}
-
-export interface ColorStop {
-  t: number;
-  color: RGB;
-}
-
-export interface AlphaStop {
-  t: number;
-  alpha: number;
-}
-
-/** Color + alpha gradient over normalized lifetime (0..1). Stops sorted by `t`. */
-export interface Gradient {
-  colorStops: ColorStop[];
-  alphaStops: AlphaStop[];
-}
+// MinMax/RGB/CurvePoint/Curve/ColorStop/AlphaStop/Gradient are generic curve/color types, not
+// particle-specific — they live in core/curves.ts (L0) alongside the sampling functions that
+// operate on them, and are re-exported here (not the reverse) so every existing import of these
+// names from this file keeps working unchanged.
+import type { MinMax, RGB, CurvePoint, Curve, ColorStop, AlphaStop, Gradient } from '../core/curves';
+export type { MinMax, RGB, CurvePoint, Curve, ColorStop, AlphaStop, Gradient };
 
 export type EmitterShapeType = 'point' | 'cone' | 'sphere' | 'box' | 'circle' | 'cylinder' | 'polyline';
 
@@ -144,13 +108,11 @@ export type BlendMode = 'normal' | 'additive' | 'multiply' | 'screen';
 /** Built-in geometry used when {@link RenderConfig.mode} is `'mesh'`. */
 export type MeshPrimitive = 'box' | 'sphere' | 'cone' | 'tetra' | 'torus';
 
-/**
- * Sprite-sheet playback over a particle's normalized lifetime (0..1):
- * - `once` — single forward pass, frame 0 → last, then holds the last frame (default).
- * - `loop` — cycle forward repeatedly ({@link RenderConfig.spriteCycles} times over the life).
- * - `pingpong` — forward then backward (flip-flop), repeating for `spriteCycles` cycles.
- */
-export type SpriteMode = 'once' | 'loop' | 'pingpong';
+/** `SpriteMode` moved to `core/spriteFrames.ts` (P7 C2) — it's shared with 2D flipbook
+ *  playback (`animation/spriteAnimationSystem.ts`), not a particles-owned type. Re-exported
+ *  here so existing imports of `particles/types` keep working. */
+export type { SpriteMode } from '../core/spriteFrames';
+import type { SpriteMode } from '../core/spriteFrames';
 
 export interface EmissionBurst {
   /** seconds into the system duration */
@@ -491,35 +453,10 @@ export function spriteFrameIndex(
   return spriteIndexFromStep(step, tiles, mode, offset);
 }
 
-/**
- * Maps a monotonic integer frame counter (`step`) to a concrete frame index for the
- * given play mode. The discrete core shared by `spriteFrameIndex` (which derives
- * `step` from a normalized phase × cycles) and fps-driven flipbook playback
- * (`spriteAnimationSystem`, where `step = floor(time·fps)`).
- *
- * - `once`: clamps to the last frame.
- * - `loop`: wraps (`step mod tiles`).
- * - `pingpong`: triangle wave over `2·tiles−2` virtual frames per cycle (forward then back),
- *   `(tiles−1) − |vf − (tiles−1)|`.
- *
- * `offset` (0..tiles−1) shifts the start frame.
- */
-export function spriteIndexFromStep(
-  step: number, tiles: number, mode: SpriteMode = 'once', offset = 0,
-): number {
-  if (tiles <= 1) return 0;
-  let frame: number;
-  if (mode === 'loop') {
-    frame = ((step % tiles) + tiles) % tiles;
-  } else if (mode === 'pingpong') {
-    const period = 2 * tiles - 2; // forward 0..N-1 then back N-2..1
-    const vf = ((step % period) + period) % period;
-    frame = (tiles - 1) - Math.abs(vf - (tiles - 1));
-  } else {
-    frame = Math.min(tiles - 1, Math.max(0, step)); // once
-  }
-  return offset ? (frame + offset) % tiles : frame;
-}
+/** `spriteIndexFromStep` moved to `core/spriteFrames.ts` (P7 C2) — re-exported here so
+ *  existing imports of `particles/types` keep working. */
+export { spriteIndexFromStep } from '../core/spriteFrames';
+import { spriteIndexFromStep } from '../core/spriteFrames';
 
 /**
  * Signature of the render fields that require a backend rebuild (mesh/material/buffers)

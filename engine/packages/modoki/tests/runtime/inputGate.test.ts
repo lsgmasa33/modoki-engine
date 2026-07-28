@@ -11,8 +11,8 @@ import {
   setInputGate, isInputSuppressed, sampleAll, registerSource, unregisterSource,
   type InputSource,
 } from '../../src/runtime/input/inputSources';
-import { createInputFrame } from '../../src/runtime/input/actions';
-import type { InputFrame } from '../../src/runtime/input/actions';
+import { createInputFrame } from '../../src/runtime/core/inputActions';
+import type { InputFrame } from '../../src/runtime/core/inputActions';
 
 // Use the REAL frame factory: the built-in keyboard/gamepad/pointer sources are
 // globally registered and sample into it too, so a hand-rolled partial frame throws

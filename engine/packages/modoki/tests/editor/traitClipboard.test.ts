@@ -12,7 +12,7 @@ import {
   cloneCopyableValues, setTraitClipboard, getTraitClipboard, subscribeTraitClipboard,
   isTraitCopyable,
 } from '../../src/editor/panels/traitClipboard';
-import type { TraitMeta } from '../../src/runtime/ecs/traitRegistry';
+import type { TraitMeta } from '../../src/runtime/core/ecs/traitRegistry';
 
 const meta = (name: string, category: string) => ({ name, category } as unknown as TraitMeta);
 

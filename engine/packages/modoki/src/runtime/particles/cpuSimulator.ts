@@ -9,7 +9,7 @@
  */
 
 import { spriteFrameIndex, type ParticleEffectDef, type RGB } from './types';
-import { makeRng, randRange, sampleCurve, sampleGradientAlpha, sampleGradientColor } from './curves';
+import { makeRng, randRange, sampleCurve, sampleGradientAlpha, sampleGradientColor } from '../core/curves';
 import { resolveCollider, collide, type CollisionHit } from './colliders';
 import { resolveShape, samplePolyline, type ResolvedShape } from './emitterShapes';
 import { accumNoise, accumForce, dragFactor, annulusRadius, sphereRadius, resolveGravity, type Vec3 } from './simSpec';

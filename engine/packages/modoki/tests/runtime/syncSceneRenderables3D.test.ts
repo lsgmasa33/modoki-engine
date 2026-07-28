@@ -45,7 +45,7 @@ beforeEach(() => { vi.resetModules(); });
 async function setup() {
   vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
   vi.doMock('../../src/three/traits/Environment', () => ({ Environment: {} }));
-  vi.doMock('../../src/three/systems/transformPropagationSystem', () => ({
+  vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
     worldTransforms: new Map(), deactivatedEntities: new Set(),
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
@@ -282,7 +282,7 @@ describe('syncSkinnedModels — lifecycle', () => {
   async function setupSkinned() {
     vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
     vi.doMock('../../src/three/traits/Environment', () => ({ Environment: {} }));
-    vi.doMock('../../src/three/systems/transformPropagationSystem', () => ({
+    vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
       worldTransforms: new Map(), deactivatedEntities: new Set(),
     }));
     vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
@@ -397,7 +397,7 @@ describe('attachInvalidationListener — re-import eviction', () => {
   async function setupInval() {
     vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
     vi.doMock('../../src/three/traits/Environment', () => ({ Environment: {} }));
-    vi.doMock('../../src/three/systems/transformPropagationSystem', () => ({
+    vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
       worldTransforms: new Map(), deactivatedEntities: new Set(),
     }));
     vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
@@ -475,7 +475,7 @@ describe('syncEnvironment — cached branch is change-gated', () => {
     // module so getAssetEntry exists (returns undefined for an unregistered path → boost 1).
     vi.doMock('../../src/runtime/loaders/assetManifest', async (orig: () => Promise<unknown>) => await orig());
     vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
-    vi.doMock('../../src/three/systems/transformPropagationSystem', () => ({
+    vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
       worldTransforms: new Map(), deactivatedEntities: new Set(),
     }));
     const acquireEnvironment = vi.fn();

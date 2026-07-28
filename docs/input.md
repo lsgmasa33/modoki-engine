@@ -39,7 +39,7 @@ deterministic sim free of live DOM reads.
 - `runtime/traits/Input.ts` — the `Input` resource trait + read accessors (`axis`/`held`/`pressed`/
   `released`/`lastInputDevice`; pointer: `pointer`/`pointerDown`/`pointerPressed`/`pointerReleased`/
   `pointerPos`/`pointerDrag`) and harness setters (`setAxis`/`setDigital`/`setPointer`).
-- `runtime/systems/inputSystem.ts` — the per-frame bridge: sample all sources → derive edges → write
+- `runtime/input/inputSystem.ts` — the per-frame bridge: sample all sources → derive edges → write
   the singleton; also play-start edge suppression and the device-switch UI repaint.
 - `runtime/input/inputSources.ts` — the `InputSource` interface + registry (`registerSource`/
   `sampleAll`/`attachAll`) and the app-scope `inputSourcesManager`. Also the **host input gate**
@@ -54,7 +54,7 @@ deterministic sim free of live DOM reads.
 - `runtime/input/pointerSource.ts` — mouse/primary-touch modality: Pointer Events on `window` with
   `setPointerCapture`, reports the single active pointer as a `PointerFrame` (position + down + drag
   delta). Treats `pointercancel` as a clean release so an Android touch-reclaim can't strand a drag.
-- `runtime/systems/characterInputSystem.ts` / `characterInput3DSystem.ts` — GAME-tier bridges copying
+- `runtime/input/characterInputSystem.ts` / `characterInput3DSystem.ts` — GAME-tier bridges copying
   `Input` actions onto `CharacterController2D`/`3D` move/jump fields.
 - `runtime/input/inputPrompts.ts` / `inputPromptSources.ts` — the pure `promptFor(device, action)`
   lookup table + its wiring into the UI read-source registry (`{confirmPrompt}` etc.).

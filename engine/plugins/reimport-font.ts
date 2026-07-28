@@ -6,7 +6,7 @@
  *  guid-less and is referenced by `fontFamily` instead). */
 
 import { randomUUID } from 'crypto';
-import { resolveFontSettings, type FontImportSettings } from '../packages/modoki/src/runtime/loaders/fontSettings';
+import { resolveFontSettings, type FontImportSettings } from '../packages/modoki/src/runtime/core/fontSettings';
 import { convertFont } from './font-convert';
 import { readMetaSidecar, writeMetaSidecar } from './meta-sidecar';
 import type { ReimportHandler } from './reimport-registry';

@@ -3,7 +3,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 async function getConfig() {
-  return import('../../../src/runtime/config');
+  return import('../../src/runtime/core/config');
 }
 
 beforeEach(() => {

@@ -14,11 +14,11 @@ import { readAssetGuid, type AssetRoot } from './vite-asset-scanner';
 import { readMetaSidecar } from './meta-sidecar';
 import { parseFontFilename } from '../packages/modoki/src/runtime/loaders/fontNaming';
 import { classifyJsonAssetSuffix, BINARY_EXT_TYPE } from './assetTypes';
-import { REF_FIELDS_BY_TRAIT } from '../packages/modoki/src/runtime/scene/sceneValidation';
+import { REF_FIELDS_BY_TRAIT } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { MATERIAL_TEXTURE_SLOTS } from '../packages/modoki/src/runtime/assets/materialTextureSlots';
 import { resolveTextureType } from '../packages/modoki/src/runtime/loaders/textureSettings';
-import { ULTRAHDR_VARIANT_SUFFIX } from '../packages/modoki/src/runtime/loaders/environmentSettings';
-import { deriveGuid } from '../packages/modoki/src/runtime/loaders/assetRefRules';
+import { ULTRAHDR_VARIANT_SUFFIX } from '../packages/modoki/src/runtime/core/environmentSettings';
+import { deriveGuid } from '../packages/modoki/src/runtime/core/assetRefRules';
 import { parseAnimClipBank } from '../packages/modoki/src/runtime/animation/animClipBank';
 
 /** UUID v4 shape — matches the runtime assetManifest GUID_RE. */
@@ -99,13 +99,23 @@ function classify(virtualPath: string): string {
 
 // ── Path resolution ───────────────────────────────────
 
-function virtualToAbs(virtualPath: string, roots: AssetRoot[]): string | null {
+/** Resolve an asset URL to an absolute file path, or null if it escapes every root.
+ *  Exported for unit testing (the traversal guard is security-relevant). */
+export function virtualToAbs(virtualPath: string, roots: AssetRoot[]): string | null {
   const cleaned = virtualPath.startsWith('/') ? virtualPath : '/' + virtualPath;
   for (const root of roots) {
     if (cleaned.startsWith(root.urlPrefix + '/')) {
       const rel = cleaned.substring(root.urlPrefix.length + 1);
       const abs = path.resolve(root.absDir, rel);
-      if (!abs.startsWith(root.absDir)) return null; // traversal
+      // Path-traversal guard — MUST match resolveAssetPath's (vite-asset-scanner.ts).
+      // A bare startsWith() is unsafe: it accepts a sibling dir that merely shares the
+      // prefix (`<root>-evil`, `…/assets-extra`). Use path.relative and reject results
+      // that escape upward (`..`) or are absolute (a different Windows drive, where
+      // path.relative returns e.g. `E:\other` rather than a `..` chain).
+      const relToRoot = path.relative(root.absDir, abs);
+      if (relToRoot === '..' || relToRoot.startsWith('..' + path.sep) || path.isAbsolute(relToRoot)) {
+        return null;
+      }
       return abs;
     }
   }

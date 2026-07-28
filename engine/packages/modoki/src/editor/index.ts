@@ -2,7 +2,11 @@
 
 export { backendFetch, backendPostJson, backendEventSource, backendBase, backendUrl } from './backend/editorBackend';
 export { createEditor, type EditorOptions } from './createEditor';
-export { pushAction, undo, redo, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion } from './undo/undoManager';
+export {
+  pushAction, undo, redo, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion,
+  beginActionCapture, endActionCapture, isCapturingActions, type UndoAction,
+} from './undo/undoManager';
+export { runAsCompositeAction, composeUndoActions, type CompositeActionOptions } from './undo/compositeAction';
 export {
   writeTraitFieldWithUndo, deleteEntityWithUndo, deleteEntitiesWithUndo, duplicateEntity,
   reparentEntity, setActionCallback, createEntityWithUndo,
@@ -38,6 +42,9 @@ export {
   saveScene, saveAll, serializeScene, loadScene, newScene,
   getCurrentScenePath, setCurrentScenePath, type SceneFile,
 } from './scene/serialize';
+export {
+  markAssetDirty, hasDirtyAssets, getDirtyAssetPaths, clearDirtyAssets, flushDirtyAssets, type FlushResult,
+} from './scene/dirtyAssets';
 export { importModel } from './scene/modelImport';
 export { useEditorStore } from './store/editorStore';
 export type { SelectedAsset } from './store/editorStore';
@@ -48,7 +55,13 @@ export {
 
 // C7: agents must address entities by GUID (runtime ids are reassigned on every scene
 // hot-reload), so the ops that CREATE entities have to be able to hand one back.
-export { ensureGuid } from './undo/entityRef';
+export { ensureGuid, entityRef, type EntityRef } from './undo/entityRef';
+
+// The agent prefab ops (engine/app/editor/agentEditorOps.ts) must push the SAME undo
+// entries as the Hierarchy/Assets/Inspector paths — otherwise an agent-instantiated
+// prefab is live-only AND invisible to `hasUnsavedChanges()`, so the unsaved-work
+// guards let a later load_scene / scene-mutate hot-reload silently destroy it.
+export { makePrefabInstantiateAction } from './undo/prefabInstantiateUndo';
 
 // C7: agent ops must refuse to DESTROY unsaved live work (load_scene/new_scene swap the world).
 export { hasUnsavedChanges, markSceneSaved, type SaveResult } from './scene/serialize';

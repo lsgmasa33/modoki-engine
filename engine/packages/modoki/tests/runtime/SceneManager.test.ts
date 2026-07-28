@@ -45,7 +45,7 @@ vi.mock('three/examples/jsm/loaders/GLTFLoader.js', () => ({
 
 // ── Mock the trait registry to expose our test traits ──────────────────
 
-vi.mock('../../src/runtime/ecs/traitRegistry', () => {
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
   const traits = [
     { name: 'Transform', trait: Transform, category: 'component', fields: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' }, rx: { type: 'number' }, ry: { type: 'number' }, rz: { type: 'number' }, sx: { type: 'number' }, sy: { type: 'number' }, sz: { type: 'number' } } },
     { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: { type: 'string' }, isActive: { type: 'boolean' }, sortOrder: { type: 'number' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, layer: { type: 'string' }, guid: { type: 'string' } } },
@@ -143,7 +143,7 @@ beforeEach(async () => {
   // Patch the Persistent trait into our trait registry mock so it matches the
   // real Persistent trait that SceneManager imports
   const { Persistent } = await import('../../src/runtime/traits/Persistent');
-  const { getAllTraits } = await import('../../src/runtime/ecs/traitRegistry');
+  const { getAllTraits } = await import('../../src/runtime/core/ecs/traitRegistry');
   const persistentMeta = getAllTraits().find((m: any) => m.name === 'Persistent');
   if (persistentMeta) (persistentMeta as any).trait = Persistent;
 
@@ -168,7 +168,7 @@ async function getCache() {
 }
 
 async function getWorld() {
-  return import('../../src/runtime/ecs/world');
+  return import('../../src/runtime/core/ecs/world');
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -807,7 +807,7 @@ describe('beforeSwap hooks', () => {
   it('fires hooks in order before swap, swallows errors, and respects unregister', async () => {
     defineSceneA();
     const { sceneManager } = await getSceneManager();
-    const { getCurrentWorld } = await import('../../src/runtime/ecs/world');
+    const { getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
 
     let hookWorld: any = null;
     let mainWorldDuringHook: any = null;

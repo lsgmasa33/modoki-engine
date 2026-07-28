@@ -5,7 +5,7 @@ import {
   setSkeletalPreview,
   isSkeletalPreviewing,
   skeletalPreviewDelta,
-} from '../../src/runtime/systems/skeletalPreview';
+} from '../../src/runtime/core/skeletalPreview';
 
 describe('skeletalPreview', () => {
   beforeEach(() => setSkeletalPreview(false, 0));

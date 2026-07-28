@@ -19,26 +19,26 @@
  *  systems/actions, which is what unit-level logic verification needs. */
 
 import { createWorld, type World } from 'koota';
-import { Time } from '../traits/Time';
-import { getCurrentWorld, setCurrentWorld } from '../ecs/world';
-import { registerSystem, unregisterSystem, SYSTEM_PRIORITY } from '../systems/pipeline';
-import { timeSystem } from '../systems/timeSystem';
-import { setManualNow, restoreRealClock } from '../systems/clock';
-import { advanceFixedSteps } from '../systems/stepSimulation';
-import { resetTimeBaseline } from '../systems/timeSystem';
-import { getPlayState, setPlayState, type PlayState } from '../systems/playState';
-import { seedRng } from '../systems/rng';
-import { clearJournal, journalEvents, _resetCaptureSeq, setVerboseCapture, verboseCaptureState, type GameEvent } from '../systems/journal';
+import { Time } from '../core/traits/Time';
+import { getCurrentWorld, setCurrentWorld } from '../core/ecs/world';
+import { registerSystem, unregisterSystem, SYSTEM_PRIORITY } from '../core/pipeline';
+import { timeSystem } from '../core/timeSystem';
+import { setManualNow, restoreRealClock } from '../core/clock';
+import { advanceFixedSteps } from '../core/stepSimulation';
+import { resetTimeBaseline } from '../core/timeSystem';
+import { getPlayState, setPlayState, type PlayState } from '../core/playState';
+import { seedRng } from '../core/rng';
+import { clearJournal, journalEvents, _resetCaptureSeq, setVerboseCapture, verboseCaptureState, type GameEvent } from '../core/journal';
 import {
   registerUIAction, unregisterUIAction, dispatchUIAction,
   type UIActionHandler, type UIActionDef, type UIActionPayload,
-} from '../ui/actionRegistry';
-import { setTimeScale as setWorldTimeScale } from '../systems/getTime';
-import { clearControlSpawns } from '../systems/controlSpawnRegistry';
-import { clearSkeletalSeeks } from '../systems/skeletalSeek';
-import { clearParticleControls } from '../systems/particleControlRegistry';
-import { clearTimelineWarnings } from '../systems/timelineSystem';
-import { setTimelinePreviewActive } from '../systems/timelinePreview';
+} from '../core/actionRegistry';
+import { setTimeScale as setWorldTimeScale } from '../core/getTime';
+import { clearControlSpawns } from '../timeline/controlSpawnRegistry';
+import { clearSkeletalSeeks } from '../core/skeletalSeek';
+import { clearParticleControls } from '../core/particleControlRegistry';
+import { clearTimelineWarnings } from '../timeline/timelineSystem';
+import { setTimelinePreviewActive } from '../core/timelinePreview';
 
 /** A game system to run each frame, with its pipeline priority. */
 export interface TestSystemDef {

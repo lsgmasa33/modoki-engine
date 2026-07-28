@@ -2,7 +2,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { createWorld } from 'koota';
-import { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from '../../src/runtime/systems/rng';
+import { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from '../../src/runtime/core/rng';
 
 describe('rng', () => {
   it('is reproducible — same seed produces the same sequence', () => {

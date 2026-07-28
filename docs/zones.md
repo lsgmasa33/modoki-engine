@@ -96,8 +96,8 @@ For every enter and exit, `zone2DSystem` / `zone3DSystem` fan out to:
 
 - Traits: `runtime/traits/{Zone3D,Zone2D,ZoneOccupant,OnZone3D,OnZone2D}.ts`
 - Shared core (routing + occupancy diff + despawn synthesis + world-pose read):
-  `runtime/systems/zoneTriggerCore.ts`
-- Dimension systems: `runtime/systems/{zone3DSystem,zone2DSystem}.ts` (containment math per shape)
+  `runtime/zones/zoneTriggerCore.ts`
+- Dimension systems: `runtime/zones/{zone3DSystem,zone2DSystem}.ts` (containment math per shape)
 - Event buses: `runtime/managers/{zoneEventBus,Zone3DEvents,Zone2DEvents}.ts`
 - Wiring: systems in `engine/app/ecs/pipeline.ts`, managers in `engine/app/ecs/register.ts`, editor
   metadata in `engine/app/ecs/registerTraits.ts`

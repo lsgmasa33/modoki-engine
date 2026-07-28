@@ -16,7 +16,7 @@ import { trait } from 'koota';
 const Transform = trait({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
 const EntityAttributes = trait({ name: '', isActive: true, sortOrder: 0, parentId: 0, layer: '' as '' | '3d' | '2d' | 'ui', guid: '' });
 
-vi.mock('../../src/runtime/ecs/traitRegistry', () => {
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
   const traits = [
     { name: 'Transform', trait: Transform, category: 'component', fields: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' }, rx: { type: 'number' }, ry: { type: 'number' }, rz: { type: 'number' }, sx: { type: 'number' }, sy: { type: 'number' }, sz: { type: 'number' } } },
     { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: { type: 'string' }, isActive: { type: 'boolean' }, sortOrder: { type: 'number' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, layer: { type: 'string' }, guid: { type: 'string' } } },
@@ -37,7 +37,7 @@ const sceneOf = (name: string) => ({
 beforeEach(async () => {
   vi.resetModules();
   const { Persistent } = await import('../../src/runtime/traits/Persistent');
-  const { getAllTraits } = await import('../../src/runtime/ecs/traitRegistry');
+  const { getAllTraits } = await import('../../src/runtime/core/ecs/traitRegistry');
   const meta = getAllTraits().find((m: { name: string }) => m.name === 'Persistent');
   if (meta) (meta as { trait: unknown }).trait = Persistent;
 });
@@ -47,7 +47,7 @@ async function setup() {
   scene.sceneManager.resetForTesting();
   const managers = await import('../../src/runtime/managers/managerRegistry');
   managers.__resetManagersForTesting();
-  const world = await import('../../src/runtime/ecs/world');
+  const world = await import('../../src/runtime/core/ecs/world');
   return { sceneManager: scene.sceneManager, managers, getCurrentWorld: world.getCurrentWorld };
 }
 

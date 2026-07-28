@@ -1,14 +1,18 @@
 version: 2
 updates:
-  # npm dependencies (root + workspaces). Grouped into one PR per run to cut noise.
+  # npm dependencies (root + workspaces). Minor/patch bumps are grouped into one
+  # low-risk PR per run; majors are excluded from the group so each lands as its
+  # own PR for individual review (a grouped major can silently break peer deps —
+  # see lsgmasa33/modoki-engine#19, typescript@7.0.2 vs typescript-eslint@8.65.0).
   - package-ecosystem: npm
     directory: "/"
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
-      npm-all:
+      npm-minor-patch:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
   # GitHub Actions used by the workflows.
   - package-ecosystem: github-actions
     directory: "/"

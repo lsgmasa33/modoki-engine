@@ -2,14 +2,14 @@
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { backendFetch } from '../backend/editorBackend';
-import { readTraitData, readTraitDataFull, findEntity } from '../../runtime/ecs/entityUtils';
-import { getCurrentWorld } from '../../runtime/ecs/world';
+import { readTraitData, readTraitDataFull, findEntity } from '../../runtime/core/ecs/entityUtils';
+import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { writeTraitFieldWithUndo as writeField, writeTraitFieldMultiWithUndo as writeFieldMulti, writeTraitFieldPerEntityWithUndo as writeFieldPerEntity, removeTraitFromEntitiesWithUndo, deleteEntitiesWithUndo, pasteTraitValuesWithUndo } from '../undo/entityActions';
 import { type ContextMenuItem } from '../components/ContextMenu';
 import { useTraitClipboard, setTraitClipboard, isTraitCopyable } from './traitClipboard';
-import { type TraitMeta, type FieldHint, getTraitByName, getAllTraits } from '../../runtime/ecs/traitRegistry';
+import { type TraitMeta, type FieldHint, getTraitByName, getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { resolveMeshTemplate } from '../../runtime/loaders/meshTemplateCache';
-import { geometryBoxHalfExtents, geometryBoundingRadius } from '../../runtime/systems/meshColliderGeometry';
+import { geometryBoxHalfExtents, geometryBoundingRadius } from '../../runtime/physics/meshColliderGeometry';
 import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
 import { getAnimSet } from '../../runtime/loaders/animSetCache';
@@ -48,8 +48,8 @@ import { SceneAssetView } from './assetViews/SceneAssetView';
 import { openAssetInEditor } from './openAssetInEditor';
 import { isSelfPlacementDisabled } from '../uiAuthoring';
 import { onEditorDirty } from '../../runtime/ui/uiTreeStore';
-import { getUIActionNames } from '../../runtime/ui/actionRegistry';
-import { getPhysicsLayerNames } from '../../runtime/systems/physicsLayers';
+import { getUIActionNames } from '../../runtime/core/actionRegistry';
+import { getPhysicsLayerNames } from '../../runtime/physics/physicsLayers';
 import { getClipNames, getBoneNames, getNodeMaterials } from '../../runtime/loaders/riggedModelCache';
 import { EntityAttributes } from '../../runtime/traits';
 import { registerFrameCallback, unregisterFrameCallback, startFrameDriver, stopFrameDriver } from '../../runtime/rendering/frameDriver';
@@ -1257,7 +1257,7 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
                   // Make it undoable via the shared helper (prefab F4) — same
                   // reassign-on-redo semantics as Hierarchy/Assets so Cmd+Z removes
                   // the instance and redo respawns + retracks the new id.
-                  const { deleteEntity } = await import('../../runtime/ecs/entityUtils');
+                  const { deleteEntity } = await import('../../runtime/core/ecs/entityUtils');
                   pushAction(makePrefabInstantiateAction({
                     label: `Instantiate "${prefab.name}"`,
                     initialId: rootId,

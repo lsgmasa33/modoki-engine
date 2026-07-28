@@ -5,14 +5,14 @@
  *  resolves to the CHILD entity (event mapping). 3D is Y-up → gravity pulls toward −Y. */
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
-import { SYSTEM_PRIORITY } from '../../src/runtime/systems/pipeline';
-import { Transform } from '../../src/runtime/traits/Transform';
+import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
+import { Transform } from '../../src/runtime/core/traits/Transform';
 import { RigidBody3D } from '../../src/runtime/traits/RigidBody3D';
 import { Collider3D } from '../../src/runtime/traits/Collider3D';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { Physics3D } from '../../src/runtime/traits/Physics3D';
-import { physics3DSystem, disposePhysics3D } from '../../src/runtime/systems/physics3DSystem';
-import { initRapier3D } from '../../src/runtime/systems/rapier3DLoader';
+import { physics3DSystem, disposePhysics3D } from '../../src/runtime/physics/physics3DSystem';
+import { initRapier3D } from '../../src/runtime/physics/rapier3DLoader';
 
 beforeAll(async () => { await initRapier3D(); });
 let tw: TestWorld | undefined;

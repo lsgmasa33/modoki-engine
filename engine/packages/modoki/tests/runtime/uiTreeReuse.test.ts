@@ -71,9 +71,9 @@ function makeWorld(getSpecs: () => Spec[]) {
 }
 
 function mockDeps() {
-  vi.doMock('../../src/runtime/ecs/world', () => ({ getCurrentWorld: vi.fn(), onWorldSwap: vi.fn() }));
-  vi.doMock('../../src/runtime/ecs/entityUtils', () => ({ addDirtyListener: vi.fn() }));
-  vi.doMock('../../src/runtime/ecs/traitRegistry', () => ({
+  vi.doMock('../../src/runtime/core/ecs/world', () => ({ getCurrentWorld: vi.fn(), onWorldSwap: vi.fn() }));
+  vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn() }));
+  vi.doMock('../../src/runtime/core/ecs/traitRegistry', () => ({
     getAllTraits: () => [
       { name: 'RenderableUI', trait: RUI, category: 'component', fields: {} },
       { name: 'UIElement', trait: UIEL, category: 'component', fields: {} },

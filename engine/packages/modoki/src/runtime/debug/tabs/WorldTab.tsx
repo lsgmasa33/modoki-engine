@@ -10,8 +10,8 @@
  *  on a slow interval so live gameplay changes show without a per-frame cost. */
 
 import { useEffect, useMemo, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react';
-import { getAllEntities, buildEntityTree, onStructureDirty, getStructureVersion, readTraitData, writeTraitField, type EntityInfo } from '../../ecs/entityUtils';
-import { getTraitByName, type TraitMeta, type FieldHint } from '../../ecs/traitRegistry';
+import { getAllEntities, buildEntityTree, onStructureDirty, getStructureVersion, readTraitData, writeTraitField, type EntityInfo } from '../../core/ecs/entityUtils';
+import { getTraitByName, type TraitMeta, type FieldHint } from '../../core/ecs/traitRegistry';
 
 const VALUE_REFRESH_MS = 250;
 const layerColor: Record<string, string> = { '3d': '#7dd3fc', '2d': '#fca5a5', ui: '#c4b5fd' };

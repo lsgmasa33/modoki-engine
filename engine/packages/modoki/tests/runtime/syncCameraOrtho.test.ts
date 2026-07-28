@@ -8,11 +8,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as THREE from 'three';
 import { createWorld } from 'koota';
-import { Transform } from '../../src/runtime/traits/Transform';
+import { Transform } from '../../src/runtime/core/traits/Transform';
 import { Camera } from '../../src/runtime/traits/Camera';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { syncCamera, applyOrthoFrustum } from '../../src/runtime/rendering/scene3DSync';
-import { deactivatedEntities } from '../../src/three/systems/transformPropagationSystem';
+import { deactivatedEntities } from '../../src/runtime/core/ecs/transformPropagationSystem';
 
 beforeEach(() => {
   // scene3DSync's syncCamera doesn't fetch, but sibling helpers in the module may

@@ -297,7 +297,7 @@ for the layer model.
 
 ## Play / Stop / Pause
 
-The editor drives a global three-state play mode (`runtime/systems/playState.ts`:
+The editor drives a global three-state play mode (`runtime/core/playState.ts`:
 `'stopped' | 'playing' | 'paused'`). The **shipped** game defaults to `'playing'` so its
 systems run with zero setup; the **editor** opens every scene `'stopped'`. `isSimRunning()`
 (true only while playing) gates the TIME / GAME / ANIMATION pipeline stages and UI-action
@@ -323,7 +323,7 @@ enter-play / revert-on-stop:
 This is what makes binding-driven `isVisible` (and any other system that writes ECS state at
 runtime) safe: those writes only ever happen while playing, and Stop throws them away before
 they reach disk. Transitions emit `!play`/`!pause`/`!stop` to the editor journal (see
-[percept-plan](./percept-plan.md)).
+[debug-tools-mcp.md](./debug-tools-mcp.md) "Percept").
 
 ## Selection restore across world swaps
 
@@ -401,6 +401,15 @@ pans).
 
 Both views also register **interaction handles** (`registerHandleProvider`) so an agent can
 query and drag keys/tangents by id — see the Enact tooling in the repo `CLAUDE.md`.
+- **Architecture** — the edit logic is pure functions in `animation/recording.ts` /
+  `animation/clipEdits.ts` (`planPaste`, `extractKeyBlock`, `applyBreakUnify`,
+  `remapSelectionAfterRemoval/Reorder/Delete`, `groupSelection`), not component closures —
+  keeps `AnimationEditor.tsx` a thin store-wiring shell and makes the edit logic unit-testable
+  without mounting the panel. `trackKey(t)` (`path|trait|field`) is the single source of truth
+  for track identity, exported from `recording.ts` and used everywhere a copy/paste/React-key
+  needs to match a track. `useTimelineViewport` owns the shared X-axis wheel-zoom/right-drag-pan
+  plumbing for Dopesheet + Curves. The playhead subscription is isolated to a small memoized
+  overlay leaf so the 60fps scrub/preview loop doesn't re-render the whole panel.
 
 ### Particle Editor
 
@@ -482,6 +491,22 @@ OS-native picker's own "last folder" memory is keyed by app bundle id, which sev
 dev clones share — without this, opening a project in one clone would silently seed the starting
 folder for a sibling clone's picker.
 
+### UI Zoom (VS Code–style)
+
+App-wide UI zoom via Electron `webContents` zoom (`engine/electron/zoom.ts`) — Cmd/Ctrl+wheel
+anywhere in the editor, Cmd/Ctrl+`=`/`-`/`0`, and native **View → Zoom In/Out/Actual Size** menu
+items (`projects.ts`'s `viewRoleTail`), all routed through one controller so wheel/menu/accelerator
+stay in sync. `factor = 1.2^level`, step 0.5, clamped to level ∈ [−3, +4] (matches VS Code). The
+level persists per editor identity (`userData/ui-prefs.json`) and restores on `did-finish-load`. A
+capture-phase Ctrl/Cmd+wheel forwarder in `EditorApp.tsx` (`editor/input/zoomWheel.ts`) pre-empts
+panels that also consume modified wheel (SceneView camera dolly, the Animation Curve Editor's
+value-axis zoom) via a `data-modki-wheel-zoom` opt-out marker, so UI zoom and panel-local zoom don't
+double-fire.
+
+Zoom changes the DOM's zoomed-CSS coordinate space, which mattered for trusted input — see
+[debug-tools-mcp.md](./debug-tools-mcp.md) for the coordinate-space contract and
+[input.md](./input.md) for the presentation-invariant gameplay-input split it also motivated.
+
 ---
 
 ## ECS as the source of truth
@@ -535,7 +560,7 @@ The undo stack is capped at 200 entries (oldest dropped, warned once per session
 | Multi-select group-gizmo math (3D + 2D) | `editor/scene/multiTransform.ts` |
 | Object picking (3D/2D hit-test) | `editor/panels/picking.ts` |
 | 3D collider outline | `runtime/rendering/colliderOutline3D.ts` |
-| Play / Stop / Pause | `editor/scene/playMode.ts`, `runtime/systems/playState.ts` |
+| Play / Stop / Pause | `editor/scene/playMode.ts`, `runtime/core/playState.ts` |
 | Selection restore on world swap | `editor/store/selectionRestore.ts` |
 | Console capture | `editor/consoleCapture.ts`, `editor/panels/Console.tsx` |
 | Asset editors | `editor/panels/{AnimationEditor,ParticleEditor,SpriteEditor,SpriteAnimEditor}.tsx` |

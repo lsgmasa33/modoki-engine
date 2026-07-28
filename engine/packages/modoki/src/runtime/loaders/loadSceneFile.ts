@@ -1,17 +1,17 @@
 /** Load a scene JSON file into an ECS world. Shared between editor and runtime. */
 
 import { type World } from 'koota';
-import { getCurrentWorld, registerEntity, indexEntityGuid, findEntityByGuid } from '../ecs/world';
-import { getAllTraits, getTraitByName } from '../ecs/traitRegistry';
+import { getCurrentWorld, registerEntity, indexEntityGuid, findEntityByGuid } from '../core/ecs/world';
+import { getAllTraits, getTraitByName } from '../core/ecs/traitRegistry';
 import { loadModelTemplates, getCachedPrefab } from './meshTemplateCache';
 import { isGuid, isExternalUrl, resolveRef, getAssetType, deriveGuid, newGuid, getAssetEntry } from './assetManifest';
 import { markUIDirty } from '../ui/uiTreeStore';
 import { markOverride, clearOverrideMarks, clearAllOverrideMarks } from './overrideMarks';
-import { SCENE_FORMAT_VERSION } from '../version';
-import { REF_FIELDS_BY_TRAIT } from '../scene/sceneValidation';
+import { SCENE_FORMAT_VERSION } from '../core/version';
+import { REF_FIELDS_BY_TRAIT } from './sceneValidation';
 import { parseClipBank } from '../audio/clipBank';
 import { parseAnimClipBank } from '../animation/animClipBank';
-import { getRunMode } from '../systems/playState';
+import { getRunMode } from '../core/playState';
 import { Transient } from '../traits/Transient';
 
 /** A child subtree an instance adds beyond what its prefab defines. Anchored to
@@ -1273,9 +1273,23 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
         // remap pass below runs — too late, the trait is already spawned broken). Zero
         // every such field at spawn; pass 2 resolves the real id.
         const entityIdFieldNames = Object.entries(meta.fields).filter(([, hint]) => hint.entityId).map(([k]) => k);
-        if (entityIdFieldNames.length === 0) traitArgs.push(meta.trait(traitData as Record<string, unknown>));
+        let fieldData = traitData as Record<string, unknown>;
+        // A prefab-instance root's own identity lives at `entry.guid` (top-level —
+        // serialize.ts never bakes it into EntityAttributes.guid on disk, since it's
+        // never an override). Stamp it in here so the placeholder is discoverable via
+        // `findEntityByGuid` like any other entity — without it, a GUID-form
+        // `rootInstanceId` that self-references this same root can never resolve in
+        // the pass-2 remap below (nothing in the live world carries that guid yet),
+        // so it always misses and gets stripped + warned, even though the root is
+        // sitting right here. Only applies to EntityAttributes on an entry that
+        // carries a top-level guid; plain entities keep serializing their guid
+        // directly inside EntityAttributes and are unaffected.
+        if (traitName === 'EntityAttributes' && entry.guid && !fieldData.guid) {
+          fieldData = { ...fieldData, guid: entry.guid };
+        }
+        if (entityIdFieldNames.length === 0) traitArgs.push(meta.trait(fieldData));
         else {
-          const patched: Record<string, unknown> = { ...(traitData as Record<string, unknown>) };
+          const patched: Record<string, unknown> = { ...fieldData };
           for (const key of entityIdFieldNames) patched[key] = 0;
           traitArgs.push(meta.trait(patched));
         }

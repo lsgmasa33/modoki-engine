@@ -19,7 +19,7 @@ import { describe, it, expect } from 'vitest';
 import path from 'path';
 import fs from 'fs';
 import { findAssetRoots, readAssetGuid, detectType, type AssetRoot } from '../../plugins/vite-asset-scanner';
-import { deriveGuid } from '../../packages/modoki/src/runtime/loaders/assetRefRules';
+import { deriveGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { resolveTextureType } from '../../packages/modoki/src/runtime/loaders/textureSettings';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
 

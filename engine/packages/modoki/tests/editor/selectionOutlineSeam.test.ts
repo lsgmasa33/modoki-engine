@@ -24,7 +24,7 @@ beforeEach(() => { vi.resetModules(); });
 /** Load scene3DSync with only the IO/global-state edges stubbed (the mesh cache stays REAL
  *  — it's half the seam under test). */
 async function setup() {
-  vi.doMock('../../src/three/systems/transformPropagationSystem', () => ({
+  vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
     worldTransforms: new Map(), deactivatedEntities: new Set(), transformPropagationSystem: vi.fn(),
   }));
   vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({

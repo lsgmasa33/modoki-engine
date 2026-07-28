@@ -11,7 +11,7 @@
 
 import type { World } from 'koota';
 import { Canvas2D } from '../traits/Canvas2D';
-import { EntityAttributes } from '../traits/EntityAttributes';
+import { EntityAttributes } from '../core/traits/EntityAttributes';
 import { findCanvasAncestor } from './canvas2DRouting';
 
 /** Per-frame snapshot of the hierarchy needed to route emitters: every entity's parent, and the

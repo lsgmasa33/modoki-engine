@@ -5,8 +5,8 @@ import { describe, it, expect, vi } from 'vitest';
 
 async function setup() {
   vi.resetModules();
-  const { registerEngineActions } = await import('../../src/runtime/ui/engineActions');
-  const reg = await import('../../src/runtime/ui/actionRegistry');
+  const { registerEngineActions } = await import('../../src/runtime/actions/engineActions');
+  const reg = await import('../../src/runtime/core/actionRegistry');
   registerEngineActions();
   return reg;
 }
@@ -29,8 +29,8 @@ describe('engineActions', () => {
 
   it('engine.toggleAnimator flips playing on the target SkeletalAnimator instance', async () => {
     const { dispatchUIAction } = await setup();
-    const { getCurrentWorld } = await import('../../src/runtime/ecs/world');
-    const { EntityAttributes } = await import('../../src/runtime/traits/EntityAttributes');
+    const { getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    const { EntityAttributes } = await import('../../src/runtime/core/traits/EntityAttributes');
     const { SkeletalAnimator } = await import('../../src/runtime/traits/SkeletalAnimator');
 
     const e = getCurrentWorld().spawn(EntityAttributes({ guid: 'skel-guid' }), SkeletalAnimator({ playing: true }));
@@ -44,8 +44,8 @@ describe('engineActions', () => {
 
   it('engine.toggleAnimator flips playing on the target Animator instance', async () => {
     const { dispatchUIAction } = await setup();
-    const { getCurrentWorld } = await import('../../src/runtime/ecs/world');
-    const { EntityAttributes } = await import('../../src/runtime/traits/EntityAttributes');
+    const { getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    const { EntityAttributes } = await import('../../src/runtime/core/traits/EntityAttributes');
     const { Animator } = await import('../../src/runtime/traits/Animator');
 
     const e = getCurrentWorld().spawn(EntityAttributes({ guid: 'anim-guid' }), Animator({ playing: false }));
@@ -56,8 +56,8 @@ describe('engineActions', () => {
 
   it('engine.toggleAnimator only affects the targeted instance, not sibling animators', async () => {
     const { dispatchUIAction } = await setup();
-    const { getCurrentWorld } = await import('../../src/runtime/ecs/world');
-    const { EntityAttributes } = await import('../../src/runtime/traits/EntityAttributes');
+    const { getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    const { EntityAttributes } = await import('../../src/runtime/core/traits/EntityAttributes');
     const { SkeletalAnimator } = await import('../../src/runtime/traits/SkeletalAnimator');
 
     const world = getCurrentWorld();
@@ -72,8 +72,8 @@ describe('engineActions', () => {
 
   it('engine.toggleAnimator warns and no-ops when target has no animator trait', async () => {
     const { dispatchUIAction } = await setup();
-    const { getCurrentWorld } = await import('../../src/runtime/ecs/world');
-    const { EntityAttributes } = await import('../../src/runtime/traits/EntityAttributes');
+    const { getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    const { EntityAttributes } = await import('../../src/runtime/core/traits/EntityAttributes');
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     getCurrentWorld().spawn(EntityAttributes({ guid: 'bare-guid' }));
@@ -85,8 +85,8 @@ describe('engineActions', () => {
 
   it('engine.playClip switches a keyframe Animator by name (resets time, plays)', async () => {
     const { dispatchUIAction } = await setup();
-    const { getCurrentWorld } = await import('../../src/runtime/ecs/world');
-    const { EntityAttributes } = await import('../../src/runtime/traits/EntityAttributes');
+    const { getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    const { EntityAttributes } = await import('../../src/runtime/core/traits/EntityAttributes');
     const { Animator } = await import('../../src/runtime/traits/Animator');
 
     const clips = JSON.stringify([{ name: 'idle', clip: 'g-idle' }, { name: 'walk', clip: 'g-walk' }]);
@@ -105,8 +105,8 @@ describe('engineActions', () => {
 
   it('engine.playClip switches a SkeletalAnimator by name (no synchronous guard — mixer validates)', async () => {
     const { dispatchUIAction } = await setup();
-    const { getCurrentWorld } = await import('../../src/runtime/ecs/world');
-    const { EntityAttributes } = await import('../../src/runtime/traits/EntityAttributes');
+    const { getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    const { EntityAttributes } = await import('../../src/runtime/core/traits/EntityAttributes');
     const { SkeletalAnimator } = await import('../../src/runtime/traits/SkeletalAnimator');
 
     const e = getCurrentWorld().spawn(EntityAttributes({ guid: 's1' }), SkeletalAnimator({ clip: 'Idle', playing: false }));
@@ -118,8 +118,8 @@ describe('engineActions', () => {
 
   it('engine.playClip warns + no-ops for a name not in a keyframe/sprite bank', async () => {
     const { dispatchUIAction } = await setup();
-    const { getCurrentWorld } = await import('../../src/runtime/ecs/world');
-    const { EntityAttributes } = await import('../../src/runtime/traits/EntityAttributes');
+    const { getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    const { EntityAttributes } = await import('../../src/runtime/core/traits/EntityAttributes');
     const { Animator } = await import('../../src/runtime/traits/Animator');
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
@@ -135,8 +135,8 @@ describe('engineActions', () => {
 
   it('engine.playClip warns when the target has no animator trait at all', async () => {
     const { dispatchUIAction } = await setup();
-    const { getCurrentWorld } = await import('../../src/runtime/ecs/world');
-    const { EntityAttributes } = await import('../../src/runtime/traits/EntityAttributes');
+    const { getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    const { EntityAttributes } = await import('../../src/runtime/core/traits/EntityAttributes');
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     getCurrentWorld().spawn(EntityAttributes({ guid: 'bare2' }));

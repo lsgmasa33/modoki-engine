@@ -14,9 +14,9 @@ import { swapHistory } from '../undo/undoManager';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import type { SceneData, SceneEntityEntry } from '../../runtime/loaders/loadSceneFile';
 import { useEditorStore } from '../store/editorStore';
-import { getCurrentWorld } from '../../runtime/ecs/world';
-import { SCENE_FORMAT_VERSION } from '../../runtime/version';
-import { getTraitByName } from '../../runtime/ecs/traitRegistry';
+import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
+import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
 
 /** Sentinel guid stamped on the prefab root in the synthetic edit scene so the

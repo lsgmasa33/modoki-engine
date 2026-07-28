@@ -93,6 +93,50 @@ describe('canonicalBootScenePath (gap #2 — boot the working-copy scene, not a 
     expect(await canonicalBootScenePath(BUNDLE, (async () => jsonResponse({ id: 'nope' })) as never)).toBe(BUNDLE);
     expect(await canonicalBootScenePath(BUNDLE, (async () => jsonResponse({})) as never)).toBe(BUNDLE);
   });
+
+  /** Regression: on Windows, a `/@fs/<abs>` request for a file on a DIFFERENT DRIVE
+   *  than the running Vite process's cwd silently 404s inside Vite's raw-fs `sirv`
+   *  middleware and falls through to the SPA `index.html` (200 OK, not a real 404) —
+   *  so a plain fetch-then-map approach can never distinguish "denied" from "success".
+   *  A `/@fs/.../runtime/assets/...` candidate is rewritten to `/assets/...` directly,
+   *  with NO fetch at all, so this can't happen. */
+  it('rewrites a `/@fs/<abs>/runtime/assets/...` candidate to `/assets/...` without fetching', async () => {
+    registerAsset(SCENE_GUID, '/assets/scenes/main.json', 'scene');
+    const FS_PATH = '/@fs/E:/Projects/modoki/demos/postfx-demo/runtime/assets/scenes/main.json';
+    const doFetch = vi.fn();
+    expect(await canonicalBootScenePath(FS_PATH, doFetch as never)).toBe('/assets/scenes/main.json');
+    expect(doFetch).not.toHaveBeenCalled();
+  });
+
+  /** findAssetRoots serves THREE roots ending in `/runtime/assets/`: `/assets` (the open
+   *  project), `/modoki/assets` (engine built-ins) and `/<root>/<id>/assets` (every other
+   *  project). The regex matches all three, so an unconfirmed rewrite would remap the
+   *  latter two onto a same-named file under the OPEN project — a silent wrong-file load,
+   *  strictly worse than the boot failure the rewrite exists to prevent. The manifest
+   *  check is what rules that out, so pin it: no registration → no rewrite. */
+  it('does NOT rewrite when the target is not registered for the open project', async () => {
+    // Manifest is empty for `/assets/scenes/main.json` → the rewrite must be discarded.
+    const OTHER_PROJECT = '/@fs/E:/Projects/modoki/games/some-other-game/runtime/assets/scenes/main.json';
+    const doFetch = vi.fn(async () => jsonResponse(null, false, 404));
+    expect(await canonicalBootScenePath(OTHER_PROJECT, doFetch as never)).toBe(OTHER_PROJECT);
+  });
+
+  it('does not rewrite a foreign-root candidate when its tail is unregistered', async () => {
+    // The engine's built-ins live under `/modoki/assets`, not `/assets`. With nothing
+    // registered at the rewritten tail, the candidate is left alone rather than being
+    // remapped onto the open project.
+    registerAsset(SCENE_GUID, '/modoki/assets/scenes/white.json', 'scene');
+    const ENGINE_BUILTIN = '/@fs/E:/Projects/modoki/engine/packages/modoki/src/runtime/assets/scenes/white.json';
+    const doFetch = vi.fn(async () => jsonResponse(null, false, 404));
+    expect(await canonicalBootScenePath(ENGINE_BUILTIN, doFetch as never)).toBe(ENGINE_BUILTIN);
+  });
+
+  it('leaves a `/@fs/...` candidate with no `runtime/assets` segment untouched (falls through to fetch)', async () => {
+    const doFetch = vi.fn(async () => jsonResponse(null, false, 404));
+    const FS_PATH = '/@fs/E:/Projects/modoki/demos/postfx-demo/game.ts';
+    expect(await canonicalBootScenePath(FS_PATH, doFetch as never)).toBe(FS_PATH);
+    expect(doFetch).toHaveBeenCalledWith(FS_PATH, { cache: 'no-store' });
+  });
 });
 
 describe('loadFirstScene (boot loop: canonicalize → load, raw fallback)', () => {

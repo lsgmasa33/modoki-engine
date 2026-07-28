@@ -15,7 +15,7 @@ documented in **[debug-tools-mcp.md](./debug-tools-mcp.md)**; this doc is the *w
 
 ## The gap this closes
 
-Modoki's whole pitch is **Claude-friendly**: the `modoki` MCP (67 tools), **Percept**
+Modoki's whole pitch is **Claude-friendly**: the `modoki` MCP (75 tools), **Percept**
 (read-by-data), **Enact** (trusted input), and **CDP** (drop into the live renderer)
 let Claude author scenes and *verify its own work*. Today that loop **only works from a
 cloned git repo** — the repo's `.mcp.json` hardcodes `npx tsx
@@ -602,7 +602,7 @@ the MCP. Verified manually against the signed 0.2.12 DMG:
 
 | Surface | Check | Result |
 |---|---|---|
-| MCP | bundled server → `tools/list` + `get_scene_state` | 67 tools, live scene ✅ |
+| MCP | bundled server → `tools/list` + `get_scene_state` | 75 tools, live scene ✅ |
 | Vite | `GET http://127.0.0.1:<vitePort>/` | HTTP 200, serves the shell ✅ |
 | CDP | `/json/list` → `Runtime.evaluate` on the page target | `Modoki`, `__3d present` ✅ |
 

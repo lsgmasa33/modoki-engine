@@ -56,7 +56,7 @@ describe('bindingResolver', () => {
     it('treats a null store value as absent (not the literal "null")', async () => {
       const { resolveTemplate } = await getBindingResolver();
       const { registerReadSource, __resetReadSourcesForTesting } =
-        await import('../../../src/runtime/ui/readSourceRegistry');
+        await import('../../src/runtime/core/readSourceRegistry');
       __resetReadSourcesForTesting();
 
       // No read source → null falls through to the literal placeholder, not "null".
@@ -71,7 +71,7 @@ describe('bindingResolver', () => {
     it('falsy-but-present store values (0/false/"") do NOT fall through to a read source', async () => {
       const { resolveTemplate } = await getBindingResolver();
       const { registerReadSource, __resetReadSourcesForTesting } =
-        await import('../../../src/runtime/ui/readSourceRegistry');
+        await import('../../src/runtime/core/readSourceRegistry');
       __resetReadSourcesForTesting();
       registerReadSource('n', () => 999);
 
@@ -83,7 +83,7 @@ describe('bindingResolver', () => {
     it('resolves an undefined store field via the read source', async () => {
       const { resolveTemplate } = await getBindingResolver();
       const { registerReadSource, __resetReadSourcesForTesting } =
-        await import('../../../src/runtime/ui/readSourceRegistry');
+        await import('../../src/runtime/core/readSourceRegistry');
       __resetReadSourcesForTesting();
       registerReadSource('timeSinceGameStart', () => 12);
 
@@ -130,7 +130,7 @@ describe('bindingResolver', () => {
     it('falls back to the read source, and never hides on an unknown op', async () => {
       const { evalVisibility } = await getBindingResolver();
       const { registerReadSource, __resetReadSourcesForTesting } =
-        await import('../../../src/runtime/ui/readSourceRegistry');
+        await import('../../src/runtime/core/readSourceRegistry');
       __resetReadSourcesForTesting();
       registerReadSource('live', () => 7);
       expect(evalVisibility({}, 'live', '>=', '5')).toBe(true);   // resolved via read source

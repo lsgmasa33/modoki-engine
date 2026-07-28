@@ -1,17 +1,17 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import type { Entity } from 'koota';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
-import { SYSTEM_PRIORITY } from '../../src/runtime/systems/pipeline';
-import { Transform } from '../../src/runtime/traits/Transform';
+import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
+import { Transform } from '../../src/runtime/core/traits/Transform';
 import { Zone2D } from '../../src/runtime/traits/Zone2D';
 import { Zone3D } from '../../src/runtime/traits/Zone3D';
 import { ZoneOccupant } from '../../src/runtime/traits/ZoneOccupant';
 import { OnZone2D } from '../../src/runtime/traits/OnZone2D';
-import { zone2DSystem } from '../../src/runtime/systems/zone2DSystem';
-import { zone3DSystem } from '../../src/runtime/systems/zone3DSystem';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
-import { zone2DEvents } from '../../src/runtime/managers/Zone2DEvents';
-import { zone3DEvents } from '../../src/runtime/managers/Zone3DEvents';
+import { zone2DSystem } from '../../src/runtime/zones/zone2DSystem';
+import { zone3DSystem } from '../../src/runtime/zones/zone3DSystem';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
+import { zone2DEvents } from '../../src/runtime/zones/Zone2DEvents';
+import { zone3DEvents } from '../../src/runtime/zones/Zone3DEvents';
 
 const ZONE2D = { name: 'zone2D', fn: zone2DSystem, priority: SYSTEM_PRIORITY.TRANSFORM + 2 };
 const ZONE3D = { name: 'zone3D', fn: zone3DSystem, priority: SYSTEM_PRIORITY.TRANSFORM + 2 };

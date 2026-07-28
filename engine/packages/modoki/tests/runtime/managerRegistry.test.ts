@@ -5,9 +5,9 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createWorld } from 'koota';
-import { setCurrentWorld } from '../../src/runtime/ecs/world';
-import { setPlayState } from '../../src/runtime/systems/playState';
-import { getUIActionNames, dispatchUIAction } from '../../src/runtime/ui/actionRegistry';
+import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
+import { setPlayState } from '../../src/runtime/core/playState';
+import { getUIActionNames, dispatchUIAction } from '../../src/runtime/core/actionRegistry';
 import {
   registerManager, registerManagers, unregisterManager,
   disposeActiveSceneManagers, initSceneManagersFor, getRegisteredManagers,

@@ -6,12 +6,12 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createWorld } from 'koota';
-import { Transform, clampAngle } from '../../src/runtime/traits/Transform';
+import { Transform, clampAngle } from '../../src/runtime/core/traits/Transform';
 import { Paused } from '../../src/runtime/traits/Paused';
 import { Rotate3D } from '../../src/runtime/traits/Rotate3D';
-import { Time } from '../../src/runtime/traits/Time';
-import { rotate3DSystem } from '../../src/runtime/systems/rotate3DSystem';
-import { setPlayState } from '../../src/runtime/systems/playState';
+import { Time } from '../../src/runtime/core/traits/Time';
+import { rotate3DSystem } from '../../src/runtime/rendering/rotate3DSystem';
+import { setPlayState } from '../../src/runtime/core/playState';
 
 // Visual delta = Time.smoothedDelta × timeScale, frozen to 0 unless the sim is
 // running. Spawn a Time entity that represents a frame timeSystem already produced.

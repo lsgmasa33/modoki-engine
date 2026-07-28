@@ -12,8 +12,8 @@
  *  Registered as an app-scope Manager (`inputSourcesManager`) so they attach/detach
  *  with the session and never load in the headless harness (keeping it deterministic). */
 
-import type { ManagerDef } from '../managers/managerRegistry';
-import type { InputFrame } from './actions';
+import type { ManagerDef } from '../core/managerTypes';
+import type { InputFrame } from '../core/inputActions';
 import { keyboardSource } from './keyboardSource';
 import { gamepadSource } from './gamepadSource';
 import { pointerSource } from './pointerSource';

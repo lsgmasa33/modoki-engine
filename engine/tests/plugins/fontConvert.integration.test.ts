@@ -9,7 +9,7 @@ import os from 'os';
 import path from 'path';
 import { convertFont, ensureMsdfAtlasGen } from '../../plugins/font-convert';
 import { getFontCacheDir, atlasCachePath, metricsCachePath } from '../../plugins/font-cache';
-import { DEFAULT_FONT_SETTINGS } from '../../packages/modoki/src/runtime/loaders/fontSettings';
+import { DEFAULT_FONT_SETTINGS } from '../../packages/modoki/src/runtime/core/fontSettings';
 
 const FONT = path.resolve(
   __dirname,

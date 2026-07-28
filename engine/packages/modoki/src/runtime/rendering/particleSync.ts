@@ -20,15 +20,15 @@
 
 import * as THREE from 'three';
 import type { World } from 'koota';
-import { Transform } from '../traits/Transform';
+import { Transform } from '../core/traits/Transform';
 import { ParticleEmitter } from '../traits/ParticleEmitter';
-import { getVisualDelta } from '../systems/getTime';
-import { takeParticleControl } from '../systems/particleControlRegistry';
+import { getVisualDelta } from '../core/getTime';
+import { takeParticleControl } from '../core/particleControlRegistry';
 import { particleBackend } from '../particles/particleBackend';
 import type { ParticleHandle, ParticleEffectDef } from '../particles/types';
-import { getParticleEffect } from '../loaders/particleCache';
+import { particleDefProvider } from '../particles/particleDefProvider';
 import { PARTICLE_LAYER } from './layers';
-import { worldTransforms, deactivatedEntities } from '../../three/systems/transformPropagationSystem';
+import { worldTransforms, deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { buildCanvas2DRoute, emitterCanvasId, type Canvas2DRoute } from './particle2DRouting';
 
 /** Put an emitter's whole object subtree on PARTICLE_LAYER so the NPR geometry
@@ -91,7 +91,7 @@ export function syncParticles(world: World, scene: THREE.Object3D, state: Partic
     if (deactivatedEntities.has(id)) return; // entity (or an ancestor) is inactive — disposed by the cleanup pass below
     if (emitterCanvasId(_route3d, id) !== null) return; // has a Canvas2D ancestor → 2D path owns it
     if (!pe.isVisible || !pe.effect) return; // disposed by the cleanup pass below
-    const def = getParticleEffect(pe.effect);
+    const def = particleDefProvider.get()?.getParticleEffect(pe.effect) ?? null;
     if (!def) return; // asset still loading — retry next frame
 
     seen.add(id);

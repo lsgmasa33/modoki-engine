@@ -4,7 +4,7 @@
  *  transforms, entity create/delete, play/stop, undo/redo). So Claude can pair,
  *  correlate human actions with game events, and reproduce hand-demonstrated bugs.
  *
- *  SEPARATE from the game journal (runtime/systems/journal.ts): different lifecycle —
+ *  SEPARATE from the game journal (runtime/core/journal.ts): different lifecycle —
  *  editor-only, session-scoped (not world-scoped), wall-clock stamped, never
  *  production-gated. Provenance sigil `!` = human/editor (vs `@` = engine, bare = game).
  *
@@ -13,7 +13,7 @@
  *  (an undo-stack push, a play toggle) — not per-drag-frame — so the stream stays
  *  naturally sparse. */
 
-import { nextCaptureSeq } from '../runtime/systems/journal';
+import { nextCaptureSeq } from '../runtime/core/journal';
 
 interface EditorEvent {
   /** Editor-local monotonic sequence — the poll cursor (use as `since`). Bumps only

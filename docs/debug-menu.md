@@ -6,9 +6,6 @@ developer an on-device way to watch performance, inspect the live ECS world, dri
 (Journal/Time/Store), fire cheats, and read the console — none of which the tree-shaken-out
 editor is available for in a shipped game.
 
-> Design history + phase tracker: `docs/debug-menu-plan.md`. This doc is the reference for
-> **using and extending** the menu.
-
 ## Toggle
 
 - **F12** (keyboard) — suppressed when a text field is focused (so typing an F12 in an input
@@ -32,7 +29,7 @@ project.config.json  build.debugBuild: true
 
 `build.debugBuild` is one flag shared with the event journal and the debug bridge (Project
 Settings → Developer → "Debug build") — there's no independent debug-menu-only toggle; see
-[percept-plan.md](./percept-plan.md) Decision D and [debug-tools-mcp.md](./debug-tools-mcp.md).
+[debug-tools-mcp.md](./debug-tools-mcp.md) "Percept".
 
 - **Editor / dev:** always enabled (`__MODOKI_EDITOR__`).
 - **Shipped game:** enabled only when the project sets `build.debugBuild: true`. When off,

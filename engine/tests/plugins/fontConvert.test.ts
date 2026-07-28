@@ -11,7 +11,7 @@ vi.mock('child_process', () => {
 });
 
 import { buildAtlasGenArgs, buildCharsetFile, ensureMsdfAtlasGen, __resetMsdfCheck } from '../../plugins/font-convert';
-import { DEFAULT_FONT_SETTINGS } from '../../packages/modoki/src/runtime/loaders/fontSettings';
+import { DEFAULT_FONT_SETTINGS } from '../../packages/modoki/src/runtime/core/fontSettings';
 
 const S = DEFAULT_FONT_SETTINGS;
 

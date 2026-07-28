@@ -30,7 +30,7 @@ let testWorld: any;
 const entityIndex = new Map<number, any>();
 let nextEntityId = 1;
 
-vi.mock('../../src/runtime/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
   findEntityById: (id: number) => entityIndex.get(id),
   setStructureCallback: vi.fn(),

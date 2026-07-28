@@ -24,7 +24,7 @@ import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT } from './assetFetch';
 import type { TextureImportSettings, TextureType } from './textureSettings';
 import type { AudioImportSettings, AudioCacheInfo } from './audioSettings';
-import type { EnvManifestBlock } from './environmentSettings';
+import type { EnvManifestBlock } from '../core/environmentSettings';
 export type { AudioImportSettings } from './audioSettings';
 import type { ModelImportSettings, ModelCacheInfo } from './modelSettings';
 import { lodUrlSuffix } from './modelSettings';
@@ -160,9 +160,9 @@ export interface BinaryAssetMeta {
   audioCache?: AudioCacheInfo;
   /** Font import settings (font assets only). Edited via the Font Inspector;
    *  consumed by the msdf-atlas-gen conversion service + runtime font loader. */
-  font?: import('./fontSettings').FontImportSettings;
+  font?: import('../core/fontSettings').FontImportSettings;
   /** Content-cache bookkeeping written by the font conversion service. */
-  fontCache?: import('./fontSettings').FontCacheInfo;
+  fontCache?: import('../core/fontSettings').FontCacheInfo;
   /** Sliced sprites carved from this texture (texture assets in "multiple" mode).
    *  Edited via the Sprite Editor; each slice gets a stable GUID + registers as a
    *  `'sprite'` manifest entry. Absent ⇒ the texture is a single whole-image sprite. */
@@ -178,13 +178,13 @@ const pathToGuid = new Map<string, string>();
 // Pure ref predicates live in assetRefRules.ts (zero imports, Node-safe) so they
 // can be shared with the dev-server plugin + scene validator/mutator. Imported
 // for internal use AND re-exported to keep assetManifest's public API stable.
-import { isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid } from './assetRefRules';
+import { isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid } from '../core/assetRefRules';
 export { isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid };
 // FontManifestBlock is defined in the pure fontSettings module (Node-safe, so the
 // build plugins can import it without pulling this browser-coupled module into
 // their Node typecheck); re-exported here for runtime consumers.
-import type { FontManifestBlock } from './fontSettings';
-export type { FontManifestBlock } from './fontSettings';
+import type { FontManifestBlock } from '../core/fontSettings';
+export type { FontManifestBlock } from '../core/fontSettings';
 
 /** Re-derive a model's variant GLB URLs (`<src>.processed.glb`, `<src>.lod<N>.glb`)
  *  from the asset's CURRENT resolved `path` — never trust the ones baked into the

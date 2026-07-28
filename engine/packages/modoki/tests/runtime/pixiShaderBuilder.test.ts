@@ -145,6 +145,14 @@ describe('buildPixiShaderProgram (WebGPU backend, mocked fetch)', () => {
     // assetUrl passthrough + a fetch that serves the in-memory file map.
     vi.doMock('../../src/runtime/loaders/assetUrl', () => ({ assetUrl: (p: string) => p }));
     vi.doMock('../../src/runtime/loaders/assetFetch', () => ({ ASSET_FETCH_INIT: {} }));
+    // pixiShaderBuilder now reaches fetchShaderManifest/assetUrl/fetchInit via the
+    // core/assetPlumbing provider slot (P7 C10) rather than importing loaders/ directly —
+    // wire it to the real fetchShaderManifest, which itself picks up the mocked
+    // assetUrl/ASSET_FETCH_INIT above.
+    vi.doMock('../../src/runtime/core/assetPlumbing', async () => {
+      const { fetchShaderManifest } = await import('../../src/runtime/loaders/shaderSchema');
+      return { assetPlumbing: { get: () => ({ assetUrl: (p: string) => p, fetchInit: {}, fetchShaderManifest }) } };
+    });
     vi.stubGlobal('fetch', vi.fn((url: string) => {
       const body = files.get(String(url));
       return Promise.resolve(body != null

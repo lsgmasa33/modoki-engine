@@ -1,7 +1,7 @@
 /** Binding resolver — resolves text templates from a store state object, falling
  *  back to the read-source registry (Manager/System-exposed live values). */
 
-import { getReadValue } from './readSourceRegistry';
+import { getReadValue } from '../core/readSourceRegistry';
 
 /** Resolve "{field}" placeholders in a text template. Each placeholder resolves
  *  against the store `state` first, then a registered read source, else stays

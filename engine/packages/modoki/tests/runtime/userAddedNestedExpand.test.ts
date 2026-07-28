@@ -16,13 +16,13 @@ const TRAITS = [
   { name: 'PrefabInstance', trait: PrefabInstance, category: 'component', fields: { source: 0, localId: 0, rootInstanceId: 0, parentLocalId: 0 } },
 ] as const;
 
-vi.mock('../../src/runtime/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => createWorld(),
   registerEntity: vi.fn(),
   unregisterEntity: vi.fn(),
   setStructureCallback: vi.fn(),
 }));
-vi.mock('../../src/runtime/ecs/traitRegistry', () => ({
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getAllTraits: () => TRAITS,
   getTraitByName: (name: string) => TRAITS.find((t) => t.name === name),
 }));

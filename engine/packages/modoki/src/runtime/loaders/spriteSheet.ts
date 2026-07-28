@@ -10,7 +10,7 @@
  *
  *  Pure — zero THREE/DOM/Vite imports — so it runs in Node tooling and headless tests. */
 
-import { newGuid } from './assetRefRules';
+import { newGuid } from '../core/assetRefRules';
 
 /** A sub-rect of a source texture, in SOURCE pixels (top-left origin). */
 export interface SpriteRect {

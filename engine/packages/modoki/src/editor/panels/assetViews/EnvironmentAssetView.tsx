@@ -12,7 +12,7 @@ import * as THREE from 'three';
 import { HDRLoader } from 'three/examples/jsm/loaders/HDRLoader.js';
 import { backendFetch } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
-import { DEFAULT_ENV_SETTINGS, ENV_MAX_SIZES, ULTRAHDR_VARIANT_SUFFIX, resolveEnvSettings, type EnvImportSettings, type EnvMaxSize, type EnvCacheInfo } from '../../../runtime/loaders/environmentSettings';
+import { DEFAULT_ENV_SETTINGS, ENV_MAX_SIZES, ULTRAHDR_VARIANT_SUFFIX, resolveEnvSettings, type EnvImportSettings, type EnvMaxSize, type EnvCacheInfo } from '../../../runtime/core/environmentSettings';
 import { invalidateEnvironment } from '../../../runtime/loaders/meshTemplateCache';
 import { assetUrl } from '../../../runtime/loaders/assetUrl';
 import { inputStyle } from '../fields';

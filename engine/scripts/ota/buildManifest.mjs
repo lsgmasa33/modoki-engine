@@ -33,7 +33,7 @@ async function walk(dir, root, out) {
 /** Hashes every file under `distDir` and returns `{ name, version, engineApi,
  *  files }` ready for `createManifest`/`createRelease`. `engineApi` is passed
  *  in by the caller (the publish CLI), not derived here — it comes from the
- *  engine's own version source of truth (`runtime/version.ts`), which this
+ *  engine's own version source of truth (`runtime/core/version.ts`), which this
  *  module deliberately does not import to stay dist-shape-agnostic. */
 export async function buildManifestFiles(distDir) {
   const relPaths = [];

@@ -9,8 +9,8 @@ import { useState } from 'react';
 import type { TrackDef } from '../../../runtime/timeline/types';
 import type { TrackItemPatch } from './itemEdit';
 import { getItem } from './itemEdit';
-import { getUIActionParams } from '../../../runtime/ui/actionRegistry';
-import type { FieldHint } from '../../../runtime/ecs/traitRegistry';
+import { getUIActionParams } from '../../../runtime/core/actionRegistry';
+import type { FieldHint } from '../../../runtime/core/ecs/traitRegistry';
 import { colorToHex, normalizeColor } from '../assetViews/widgets';
 
 const inp: React.CSSProperties = { background: '#191919', border: '1px solid #333', color: '#cfcfd6', fontSize: 11, padding: '2px 4px', borderRadius: 2 };

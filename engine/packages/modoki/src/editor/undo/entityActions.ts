@@ -2,16 +2,16 @@
  *  Wraps runtime entityUtils with undo/redo tracking. */
 
 import * as THREE from 'three';
-import { getCurrentWorld, registerEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/ecs/world';
-import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/ecs/traitRegistry';
+import { getCurrentWorld, registerEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
+import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import {
   findEntity, readTraitData, readTraitDataFull, writeTraitField,
   getAllEntities, deleteEntity, markStructureDirty, cloneTraitValues, subtreeIds,
-} from '../../runtime/ecs/entityUtils';
+} from '../../runtime/core/ecs/entityUtils';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid } from '../../runtime/loaders/assetManifest';
 import { markOverride } from '../../runtime/loaders/overrideMarks';
-import { worldTransforms } from '../../three/systems/transformPropagationSystem';
+import { worldTransforms } from '../../runtime/core/ecs/transformPropagationSystem';
 import { pushAction, type EditDetail } from './undoManager';
 import { entityRef, ensureGuid, buildGuidIndex, resolveWith, type EntityRef } from './entityRef';
 import { notifyFieldEdited } from '../animation/recording';

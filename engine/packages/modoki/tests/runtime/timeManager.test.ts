@@ -3,12 +3,12 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createWorld } from 'koota';
-import { getCurrentWorld, setCurrentWorld } from '../../src/runtime/ecs/world';
+import { getCurrentWorld, setCurrentWorld } from '../../src/runtime/core/ecs/world';
 import { Time } from '../../src/runtime/traits';
-import { setPlayState } from '../../src/runtime/systems/playState';
+import { setPlayState } from '../../src/runtime/core/playState';
 import { timeManager } from '../../src/runtime/managers/TimeManager';
 import { resolveTemplate } from '../../src/runtime/ui/bindingResolver';
-import { __resetReadSourcesForTesting } from '../../src/runtime/ui/readSourceRegistry';
+import { __resetReadSourcesForTesting } from '../../src/runtime/core/readSourceRegistry';
 
 /** Set the active world's Time.elapsed/delta (spawns the Time singleton if absent). */
 function setElapsed(elapsed: number, delta = 0) {

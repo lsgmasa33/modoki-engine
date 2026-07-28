@@ -3,11 +3,11 @@
  *  (nestable via "/", empty folders seeded via `extraPaths`) without rendering React. */
 
 import { describe, it, expect } from 'vitest';
-import type { EntityInfo } from '../../src/runtime/ecs/entityUtils';
+import type { EntityInfo } from '../../src/runtime/core/ecs/entityUtils';
 import {
   filterEntityTree, collectEntityTypes, normalizeFolderPath,
   buildHierarchyFolders, countFolderRoots, folderSubtreePaths, folderSubtreeRootIds, revealTargetsFor,
-  groupRootsBySourceScene,
+  groupRootsBySourceScene, resolveDropFolderSync,
 } from '../../src/editor/panels/hierarchyFolders';
 
 /** Minimal EntityInfo factory. */
@@ -262,5 +262,37 @@ describe('groupRootsBySourceScene (base-scene plan, Phase 9)', () => {
     const groups = groupRootsBySourceScene(roots, ['']);
     expect(groups).toHaveLength(1);
     expect(groups[0].roots.map((r) => r.id)).toEqual([1, 2]);
+  });
+});
+
+// Regression coverage for the Hierarchy before/after drag-reorder folder-sync fix
+// (2026-07-27): dropping a folder member next to an ungrouped sibling used to silently
+// leave the stale editorFolder tag, because the reorder path only touched
+// parentId/sortOrder. The decision itself is extracted here so it's unit-testable
+// without a rendered Hierarchy + real drag events (Hierarchy.tsx's EntityNode drop
+// handler is the only caller).
+describe('resolveDropFolderSync', () => {
+  it('dropping next to an ungrouped sibling clears the dragged entity\'s folder tag', () => {
+    expect(resolveDropFolderSync(0, '', 'Enemies')).toBe('');
+  });
+
+  it('dropping next to a folder member adopts that folder', () => {
+    expect(resolveDropFolderSync(0, 'Enemies', '')).toBe('Enemies');
+  });
+
+  it('dropping next to a member of the SAME folder is a no-op (returns null)', () => {
+    expect(resolveDropFolderSync(0, 'Enemies', 'Enemies')).toBeNull();
+  });
+
+  it('dropping next to an ungrouped sibling when already ungrouped is a no-op', () => {
+    expect(resolveDropFolderSync(0, '', '')).toBeNull();
+  });
+
+  it('a non-root reorder (nested sibling) never touches the folder tag — folders only tag roots', () => {
+    expect(resolveDropFolderSync(7, 'Enemies', '')).toBeNull();
+  });
+
+  it('normalizes both sides before comparing, so equivalent paths are not treated as a change', () => {
+    expect(resolveDropFolderSync(0, '/Enemies/', 'Enemies')).toBeNull();
   });
 });

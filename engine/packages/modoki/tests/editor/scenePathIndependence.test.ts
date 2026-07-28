@@ -25,14 +25,14 @@ const EntityAttributes = trait({
 });
 const PrefabInstance = trait({ source: '', localId: 0, rootInstanceId: 0, parentLocalId: 0 });
 
-// `runtime/ecs/world.ts` (registerEntity/findEntityByGuid/indexEntityGuid) imports the
+// `runtime/core/ecs/world.ts` (registerEntity/findEntityByGuid/indexEntityGuid) imports the
 // REAL EntityAttributes trait directly — a guid-based lookup (rootInstanceId as a guid,
 // Phase 2) silently fails to resolve unless this test's spawned entities carry the SAME
 // trait identity the guid index reads. See sceneManagerBaseSceneChain.test.ts for the
 // same gotcha, documented at length there.
-vi.mock('../../src/runtime/traits/EntityAttributes', () => ({ EntityAttributes }));
+vi.mock('../../src/runtime/core/traits/EntityAttributes', () => ({ EntityAttributes }));
 
-vi.mock('../../src/runtime/ecs/traitRegistry', () => {
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
   const traits = [
     { name: 'Transform', trait: Transform, category: 'component', fields: { x: {}, y: {}, z: {}, rx: {}, ry: {}, rz: {}, sx: {}, sy: {}, sz: {} } },
     { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: {}, isActive: {}, sortOrder: {}, parentId: { entityId: { onMissing: 'root' } }, layer: {}, guid: {}, sourceScene: { hidden: true, runtimeOnly: true } } },
@@ -121,7 +121,7 @@ beforeEach(async () => {
     },
   };
   const { Persistent } = await import('../../src/runtime/traits/Persistent');
-  const { getAllTraits } = await import('../../src/runtime/ecs/traitRegistry');
+  const { getAllTraits } = await import('../../src/runtime/core/ecs/traitRegistry');
   const meta = getAllTraits().find((m: { name: string }) => m.name === 'Persistent');
   if (meta) (meta as { trait: unknown }).trait = Persistent;
   const manifest = await import('../../src/runtime/loaders/assetManifest');
@@ -211,7 +211,7 @@ describe('Phase 4 gate 3 — round-trip integrity: a carried prefab member never
     await load('/level2.json');
     await load('/level1.json'); // carries the base
 
-    const { getCurrentWorld } = await import('../../src/runtime/ecs/world');
+    const { getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
     const world = getCurrentWorld();
     const rows: { name: string; hasPI: boolean; rootInstanceId?: number }[] = [];
     world.query(EntityAttributes).updateEach(([ea]: Record<string, unknown>[], e: { id(): number; has(t: unknown): boolean; get(t: unknown): Record<string, unknown> }) => {

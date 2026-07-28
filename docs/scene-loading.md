@@ -197,6 +197,25 @@ Driven generically off the registry, on both sides:
   field is also **zeroed at spawn time** — spawning a guid string into a numeric koota
   SoA field writes `NaN` before the remap pass can fix it.
 
+**Gotcha — a prefab-instance root's own guid lives at `entry.guid` (top-level), not
+inside its serialized `EntityAttributes`** (`serialize.ts`: "Prefab roots write only
+their stable guid here — never as an override"). A root's `rootInstanceId` is a
+*self*-reference (it equals its own guid), so on load, pass 1 used to spawn the
+placeholder with `EntityAttributes.guid` still empty — nothing in the live world yet
+carried that guid — and pass 2's `resolveEntityIdField` self-lookup always missed,
+stripping `PrefabInstance` and logging `"no live counterpart in this load"` on
+**every** load, harmlessly (a fresh load's placeholder gets destroyed and
+re-instantiated correctly regardless) but noisily, and — on a base-scene **carry**,
+which spawns flat with no re-instantiation step — for real. Fixed by stamping
+`entry.guid` into the `EntityAttributes` trait args at spawn time (pass 1) whenever
+the entry carries one and doesn't already set it, so the placeholder is
+self-discoverable exactly like any other entity. `sceneValidation.ts`'s field-type
+check needed the matching fix: it carved out `EntityAttributes.parentId` accepting a
+string (serialized) or number (live schema) but never extended that carve-out to
+`PrefabInstance.rootInstanceId`, so a valid guid-form file loudly failed the "unknown
+trait/field" schema check whenever the connected editor's live registry pushed the
+schema over the agent bridge.
+
 This closed a real bug class: `PrefabInstance.rootInstanceId` going stale across a
 respawn because nobody remembered to add it to a hand-maintained remap list (it now
 lives structurally in the registry instead). The guard against a *third* such field

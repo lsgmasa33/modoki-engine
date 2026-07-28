@@ -15,7 +15,7 @@
 import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react';
 import { backendFetch } from '../backend/editorBackend';
 import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath, getGuidForPath } from '../../runtime/loaders/assetManifest';
-import { deriveGuid } from '../../runtime/loaders/assetRefRules';
+import { deriveGuid } from '../../runtime/core/assetRefRules';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { type Rig2DFile, type Rig2DBone } from '../../runtime/loaders/rig2dCache';
 import { generateGridMesh } from '../../runtime/skinning/rig2dTessellate';

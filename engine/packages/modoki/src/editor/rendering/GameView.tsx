@@ -4,7 +4,7 @@ import { useState, useCallback, useEffect, useRef, useSyncExternalStore, type Re
 import Scene3D from '../../runtime/rendering/Scene3D';
 import Game from '../../runtime/rendering/Game';
 import { stepOneFrame } from '../../runtime/rendering/frameDriver';
-import { getPlayState, setPlayState, onPlayStateChange } from '../../runtime/systems/playState';
+import { getPlayState, setPlayState, onPlayStateChange } from '../../runtime/core/playState';
 import { setShowColliders2D, isShowColliders2D } from '../../runtime/rendering';
 import { setAudioMuted, isAudioMuted } from '../../runtime/audio/audioService';
 import { enterPlay, stopPlay, pausePlay } from '../scene/playMode';

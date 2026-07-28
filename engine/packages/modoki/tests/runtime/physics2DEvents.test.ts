@@ -7,16 +7,16 @@
 import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
 import type { Entity } from 'koota';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
-import { SYSTEM_PRIORITY } from '../../src/runtime/systems/pipeline';
-import { Transform } from '../../src/runtime/traits/Transform';
+import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
+import { Transform } from '../../src/runtime/core/traits/Transform';
 import { RigidBody2D } from '../../src/runtime/traits/RigidBody2D';
 import { Collider2D } from '../../src/runtime/traits/Collider2D';
 import { Physics2D } from '../../src/runtime/traits/Physics2D';
 import { OnCollision2D } from '../../src/runtime/traits/OnCollision2D';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
-import { physics2DSystem, disposePhysics2D } from '../../src/runtime/systems/physics2DSystem';
-import { physics2DEvents } from '../../src/runtime/managers/Physics2DEvents';
-import { initRapier2D } from '../../src/runtime/systems/rapierLoader';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
+import { physics2DSystem, disposePhysics2D } from '../../src/runtime/physics/physics2DSystem';
+import { physics2DEvents } from '../../src/runtime/physics/Physics2DEvents';
+import { initRapier2D } from '../../src/runtime/physics/rapierLoader';
 
 beforeAll(async () => { await initRapier2D(); });
 let tw: TestWorld | undefined;
@@ -123,7 +123,7 @@ describe('Physics2DEvents — manager subscribers', () => {
   });
 
   it('resolveRefName names an entity by GUID even after it despawns (side-table)', async () => {
-    const { resolveRefName } = await import('../../src/runtime/systems/journal');
+    const { resolveRefName } = await import('../../src/runtime/core/journal');
     tw = createTestWorld({ systems: [PHYS] });
     tw.spawn(Physics2D({ gravityX: 0, gravityY: 20, pixelsPerMeter: 100 }));
     tw.spawn(Transform({ x: 0, y: 300 }), RigidBody2D({ bodyType: 'static' }),
@@ -142,7 +142,7 @@ describe('Physics2DEvents — manager subscribers', () => {
   });
 
   it('@contact is Tier-2 watch-gated: dropped when capture is off, lean @collision stays always-on', async () => {
-    const { setVerboseCapture } = await import('../../src/runtime/systems/journal');
+    const { setVerboseCapture } = await import('../../src/runtime/core/journal');
     tw = createTestWorld({ systems: [PHYS] }); // harness opens all Tier-2 captures by default
     tw.spawn(Physics2D({ gravityX: 0, gravityY: 20, pixelsPerMeter: 100 }));
     tw.spawn(Transform({ x: 0, y: 300 }), RigidBody2D({ bodyType: 'static' }),

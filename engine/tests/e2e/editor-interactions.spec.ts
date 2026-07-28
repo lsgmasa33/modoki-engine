@@ -18,7 +18,7 @@ import { gotoEditorWithScene, selectedName, entityNames, idByName, traitField, s
 // engine/tests/plugins/scaffoldVersion.test.ts's own text-parse technique, used for
 // exactly this reason.
 function readSceneFormatVersion(): number {
-  const versionTs = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../packages/modoki/src/runtime/version.ts');
+  const versionTs = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../packages/modoki/src/runtime/core/version.ts');
   const src = readFileSync(versionTs, 'utf8');
   const m = src.match(/SCENE_FORMAT_VERSION\s*=\s*(\d+)/);
   if (!m) throw new Error('SCENE_FORMAT_VERSION not found in version.ts');
@@ -89,7 +89,7 @@ test('Cmd+S serializes the live scene and POSTs it to /api/write-file', async ({
 
   await expect.poll(() => body).not.toBeNull();
   const scene = JSON.parse(body!.content!);
-  // Must track SCENE_FORMAT_VERSION (runtime/version.ts) — this rotted silently
+  // Must track SCENE_FORMAT_VERSION (runtime/core/version.ts) — this rotted silently
   // after the base-scene plan's Phase 1 bump (9→10, commit 0657034e) because
   // e2e isn't gated in CI (see CLAUDE.md "Tests"); caught running the suite by
   // hand for an unrelated editor-DOM change (base-scene plan Phase 8). Now

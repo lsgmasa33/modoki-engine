@@ -10,17 +10,17 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
-import { SYSTEM_PRIORITY } from '../../src/runtime/systems/pipeline';
+import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
 import {
   Input, setAxis, setDigital, setPointer,
   pointer, pointerDown, pointerPressed, pointerReleased, pointerPos, pointerDrag,
 } from '../../src/runtime/traits/Input';
-import { computePointerEdge } from '../../src/runtime/input/actions';
+import { computePointerEdge } from '../../src/runtime/core/inputActions';
 import { CharacterController2D } from '../../src/runtime/traits/CharacterController2D';
 import { CharacterController3D } from '../../src/runtime/traits/CharacterController3D';
-import { characterInputSystem } from '../../src/runtime/systems/characterInputSystem';
-import { characterInput3DSystem } from '../../src/runtime/systems/characterInput3DSystem';
-import { createInputFrame, beginSample, computeEdges, applyDeadzone, makeFlags } from '../../src/runtime/input/actions';
+import { characterInputSystem } from '../../src/runtime/input/characterInputSystem';
+import { characterInput3DSystem } from '../../src/runtime/input/characterInput3DSystem';
+import { createInputFrame, beginSample, computeEdges, applyDeadzone, makeFlags } from '../../src/runtime/core/inputActions';
 
 let game: TestWorld | undefined;
 afterEach(() => { game?.dispose(); game = undefined; });

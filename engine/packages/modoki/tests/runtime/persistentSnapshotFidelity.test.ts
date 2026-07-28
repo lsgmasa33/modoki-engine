@@ -24,7 +24,7 @@ const TimeLike = trait({ delta: 0, elapsed: 0, frame: 0, timeScale: 1 });
 // AoS trait — schema is a factory, and its field is not in meta.fields.
 const AnimationLibraryLike = trait(() => ({ animSets: [] as unknown[] }));
 
-vi.mock('../../src/runtime/ecs/traitRegistry', () => {
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
   const traits = [
     { name: 'Transform', trait: Transform, category: 'component', fields: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } } },
     { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: { type: 'string' }, isActive: { type: 'boolean' }, sortOrder: { type: 'number' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, layer: { type: 'string' }, guid: { type: 'string' } } },
@@ -67,7 +67,7 @@ beforeEach(async () => {
   };
 
   const { Persistent } = await import('../../src/runtime/traits/Persistent');
-  const { getAllTraits } = await import('../../src/runtime/ecs/traitRegistry');
+  const { getAllTraits } = await import('../../src/runtime/core/ecs/traitRegistry');
   const meta = getAllTraits().find((m: { name: string }) => m.name === 'Persistent');
   if (meta) (meta as { trait: unknown }).trait = Persistent;
 
@@ -80,7 +80,7 @@ describe('persistent snapshot fidelity', () => {
     const { sceneManager } = await import('../../src/runtime/scene/SceneManager');
     sceneManager.resetForTesting();
     const { markPersistent } = await import('../../src/runtime/traits/Persistent');
-    const { getCurrentWorld } = await import('../../src/runtime/ecs/world');
+    const { getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
 
     await sceneManager.loadScene('/sceneA.json');
 

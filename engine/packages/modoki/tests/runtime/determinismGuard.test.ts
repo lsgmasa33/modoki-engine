@@ -19,8 +19,8 @@ const RUNTIME = join(fileURLToPath(new URL('.', import.meta.url)), '../../src/ru
 
 /** Files permitted to read the real wall-clock, each for a documented reason. */
 const ALLOW_WALLCLOCK = new Set<string>([
-  'systems/clock.ts',         // THE sanctioned wrapper — the single source of "now"
-  'systems/rng.ts',           // sanctioned RNG entropy seed (Date.now at module load)
+  'core/clock.ts',            // THE sanctioned wrapper — the single source of "now"
+  'core/rng.ts',              // sanctioned RNG entropy seed (Date.now at module load)
 ]);
 
 /** Files permitted to use Math.random (cosmetic-only; never gameplay state). */
@@ -35,7 +35,7 @@ const ALLOW_RANDOM = new Set<string>([
  *  replay-stable event journal, exactly the Timeline control-track bug) — it must instead derive
  *  a stable guid (e.g. spawnPrefabInstance's `guidSeed`) or be consciously allowlisted here. */
 const ALLOW_UNSEEDED_GUID = new Set<string>([
-  'loaders/assetRefRules.ts',   // DEFINES newGuid() — the sanctioned random-guid source
+  'core/assetRefRules.ts',      // DEFINES newGuid() — the sanctioned random-guid source
   'loaders/loadGLB.ts',         // mints asset guids at GLB import time (authoring)
   'loaders/spriteSheet.ts',     // mints sprite guids at slice time (authoring)
   'loaders/loadSceneFile.ts',   // ad-hoc runtime-spawn fallback; deterministic callers pass guidSeed

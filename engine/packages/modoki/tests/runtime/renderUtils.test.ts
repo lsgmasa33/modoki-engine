@@ -1,6 +1,10 @@
 /** renderUtils unit tests — isImagePath, resolvePrimitiveShape. */
 
 import { describe, it, expect } from 'vitest';
+// Side-effect only: wires core/textureProvider so isImagePath's getAssetType lookup (routed
+// through the provider slot, P7 C9) resolves against the real assetManifest below instead of
+// warning + returning undefined.
+import '../../src/runtime/loaders/registerProviders';
 
 async function getModule() {
   return import('../../../src/runtime/rendering/renderUtils');

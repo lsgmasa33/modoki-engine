@@ -5,11 +5,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as THREE from 'three';
 import { createWorld } from 'koota';
-import { Transform } from '../../src/runtime/traits/Transform';
+import { Transform } from '../../src/runtime/core/traits/Transform';
 import { CameraFrame } from '../../src/runtime/traits/CameraFrame';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { computeActiveFrameFit, activeFrameId, setActiveCameraFrame } from '../../src/runtime/rendering/scene3DSync';
-import { deactivatedEntities } from '../../src/three/systems/transformPropagationSystem';
+import { deactivatedEntities } from '../../src/runtime/core/ecs/transformPropagationSystem';
 
 beforeEach(() => {
   vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('no fetch in test'))));

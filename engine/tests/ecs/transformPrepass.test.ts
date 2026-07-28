@@ -6,7 +6,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { createTestWorld, type TestWorld, Transform, EntityAttributes } from '@modoki/engine/runtime';
 import { SYSTEM_PRIORITY } from '@modoki/engine/runtime';
-import { transformPropagationSystem, worldTransforms } from '@modoki/engine/three';
+import { transformPropagationSystem, worldTransforms } from '@modoki/engine/runtime';
 
 let tw: TestWorld | undefined;
 afterEach(() => { tw?.dispose(); tw = undefined; });

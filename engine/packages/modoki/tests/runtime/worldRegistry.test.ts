@@ -7,7 +7,7 @@ beforeEach(() => {
 });
 
 async function getModule() {
-  return import('../../../src/runtime/ecs/worldRegistry');
+  return import('../../../src/runtime/core/ecs/worldRegistry');
 }
 
 describe('worldRegistry', () => {

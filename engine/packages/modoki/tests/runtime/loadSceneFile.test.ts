@@ -2,7 +2,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createWorld, trait } from 'koota';
-import { SCENE_FORMAT_VERSION } from '../../src/runtime/version';
+import { SCENE_FORMAT_VERSION } from '../../src/runtime/core/version';
 
 // We need to mock the world and traitRegistry modules that loadSceneFile imports
 
@@ -34,7 +34,7 @@ const ModelSource = trait({
 let testWorld: ReturnType<typeof createWorld>;
 
 // Mock the modules before importing loadSceneFile
-vi.mock('../../src/runtime/ecs/world', () => {
+vi.mock('../../src/runtime/core/ecs/world', () => {
   return {
     getCurrentWorld: () => testWorld,
     registerEntity: vi.fn(),
@@ -54,7 +54,7 @@ vi.mock('../../src/runtime/ecs/world', () => {
 // name-check on 'parentId' (Phase 15).
 const LinkedRef = trait({ targetId: 0 as number });
 
-vi.mock('../../src/runtime/ecs/traitRegistry', () => {
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
   const traits = [
     { name: 'Transform', trait: Transform, category: 'component', fields: {} },
     {
@@ -663,6 +663,51 @@ describe('loadSceneFile', () => {
       // Not skipped as "a non-root member" — onInstantiatePrefab fired for it.
       expect(onInstantiatePrefab).toHaveBeenCalledTimes(1);
     });
+
+    it('resolves a self-referencing rootInstanceId even when the guid lives ONLY in the entry\'s top-level `guid` field, not EntityAttributes.guid', async () => {
+      // This is the shape serialize.ts actually writes for a prefab-instance root
+      // (docblock: "Prefab roots write only their ... guid is never an override —
+      // so it's persisted here [entry.guid]... Only set for prefab roots; plain
+      // entities keep guid in EntityAttributes directly"). Unlike the sibling test
+      // above (which bakes `guid` straight into the EntityAttributes trait data —
+      // the CARRIED-snapshot shape), a real single-instance root's file entry has
+      // NO EntityAttributes.guid at all. Before the fix, pass 1 spawned the
+      // placeholder with an empty guid, so pass 2's self-referencing
+      // rootInstanceId could never resolve via findEntityByGuid — it always
+      // "missed" and got stripped + warned, on every load, for every project using
+      // this write format (forest-camp's Char_ranger being the first).
+      const { loadSceneFile } = await getLoader();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const data = {
+        version: SCENE_FORMAT_VERSION,
+        entities: [{
+          id: 1,
+          guid: 'g-root',
+          traits: {
+            Transform: true,
+            EntityAttributes: { name: 'Char_ranger' }, // no guid field — matches the real write shape
+            PrefabInstance: { source: 'prefabs/ranger.prefab.json', rootInstanceId: 'g-root' },
+          },
+        }],
+      };
+      const spawnedEntities: { entity: any; oldId: number }[] = [];
+      await loadSceneFile(data, {
+        fetchPrefab: async () => null, // no onInstantiatePrefab — isolates pass 1 + pass 2
+        onEntitySpawned: (entity: any, oldId: number) => { spawnedEntities.push({ entity, oldId }); },
+        loadModels: false,
+      });
+      // Restore BEFORE asserting — an assertion failure here must not leave the
+      // spy mocked for later tests (it would swallow/mis-attribute their own warns).
+      warn.mockRestore();
+      const e = spawnedEntities[0].entity;
+      expect(e.has(PrefabInstance)).toBe(true); // NOT stripped
+      expect(warn).not.toHaveBeenCalled();
+      let rootInstanceId = -1;
+      testWorld.query(PrefabInstance).updateEach(([pi]: any[], ent: any) => {
+        if (ent.id() === e.id()) rootInstanceId = pi.rootInstanceId;
+      });
+      expect(rootInstanceId).toBe(e.id()); // self-reference resolved to its own fresh id
+    });
   });
 
   // Phase 15 — the remap loop is REGISTRY-driven: any trait field flagged
@@ -1114,7 +1159,7 @@ describe('collectResourceRefsFromEntities', () => {
   // caused pop-in + a scene-scoped refcount leak — the acquire-side .anim.json bug).
   it('DRIFT GUARD: emits a resource for every scalar field in REF_FIELDS_BY_TRAIT', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
-    const { REF_FIELDS_BY_TRAIT } = await import('../../../src/runtime/scene/sceneValidation');
+    const { REF_FIELDS_BY_TRAIT } = await import('../../src/runtime/loaders/sceneValidation');
 
     let n = 0;
     const guidFor = () => `cccccccc-0000-4000-8000-${String(++n).padStart(12, '0')}`;

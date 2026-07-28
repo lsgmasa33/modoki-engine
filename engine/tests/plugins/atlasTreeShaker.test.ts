@@ -8,7 +8,7 @@ import os from 'os';
 import path from 'path';
 import { computeKeptAssets } from '../../plugins/asset-tree-shaker';
 import type { AssetRoot } from '../../plugins/vite-asset-scanner';
-import { deriveGuid } from '../../packages/modoki/src/runtime/loaders/assetRefRules';
+import { deriveGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 
 const TEX_GUID = '11111111-1111-4111-8111-111111111111';
 const SLICE_GUID = '22222222-2222-4222-8222-222222222222';

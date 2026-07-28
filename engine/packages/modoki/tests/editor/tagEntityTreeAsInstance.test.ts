@@ -23,14 +23,14 @@ const entityIndex = new Map<number, any>();
 // Minimal EntityInfo list (collectTree only reads id + parentId).
 let entityInfos: { id: number; parentId: number }[] = [];
 
-vi.mock('../../src/runtime/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', () => ({
   onWorldSwap: () => () => {},
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => entityIndex.set(e.id(), e),
   unregisterEntity: (e: any) => entityIndex.delete(e.id()),
 }));
 
-vi.mock('../../src/runtime/ecs/entityUtils', () => ({
+vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   getAllEntities: () => entityInfos,
   findEntity: (id: number) => entityIndex.get(id),
   markStructureDirty: vi.fn(),
@@ -39,7 +39,7 @@ vi.mock('../../src/runtime/ecs/entityUtils', () => ({
   writeTraitField: vi.fn(),
 }));
 
-vi.mock('../../src/runtime/ecs/traitRegistry', () => ({
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getTraitByName: (name: string) => {
     if (name === 'PrefabInstance') return { name, trait: PrefabInstance, category: 'component', fields: {} };
     if (name === 'Transform') return { name, trait: Transform, category: 'component', fields: {} };

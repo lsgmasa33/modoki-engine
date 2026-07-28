@@ -10,8 +10,8 @@ import { registerCreatableAsset } from './creatableAssets';
 import { defaultAnimationClip } from '../../runtime/animation/types';
 import { defaultParticleEffect } from '../../runtime/particles/types';
 import { defaultAssetData } from '../../runtime/assets/assetSchemas';
-import { findEntity } from '../../runtime/ecs/entityUtils';
-import { getTraitByName } from '../../runtime/ecs/traitRegistry';
+import { findEntity } from '../../runtime/core/ecs/entityUtils';
+import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { newScene, saveScene, setCurrentScenePath } from '../scene/serialize';
 import { useEditorStore } from '../store/editorStore';
 

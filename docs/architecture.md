@@ -104,10 +104,10 @@ the CASCADE and two readings of what a subsystem should DO, so both are pinned h
 than rediscovered per subsystem:
 
 - **The cascade** is computed two ways, deliberately. RENDERERS read `deactivatedEntities`, the
-  set built by `transformPropagationSystem` (a THREE module, priority 200). SIM systems use
-  `isEntityActiveInHierarchy` (`runtime/ecs/entityIndex.ts`), which walks `parentId` over the
-  per-frame entity index — because the renderer set comes from THREE (it would drag three into a
-  2D-only bundle), is one frame stale for anything running before priority 200, and is always
+  set built by `transformPropagationSystem` (`runtime/core/ecs/`, priority 200). SIM systems use
+  `isEntityActiveInHierarchy` (`runtime/core/ecs/entityIndex.ts`), which walks `parentId` over the
+  per-frame entity index — because the renderer set is built by a module whose matrix math is THREE
+  (importing it drags three into a 2D-only bundle), is one frame stale for anything running before priority 200, and is always
   empty headless (the harness registers no propagation system), which would make any guard built
   on it silently inert *and* untestable.
 - **What "off" means is per-subsystem, and that is not an inconsistency.** A [Director](./timeline.md)
@@ -194,7 +194,7 @@ any callback that throws 10 times in a row. `stepOneFrame()` runs all callbacks 
 for the editor's step button.
 
 The ECS pipeline itself runs at `PRIORITY_ECS`. Its systems are ordered by
-`SYSTEM_PRIORITY` tiers (`runtime/systems/pipeline.ts`):
+`SYSTEM_PRIORITY` tiers (`runtime/core/pipeline.ts`):
 `TIME (0) → INPUT (50) → GAME (100) → ANIMATION (150) → TRANSFORM_PREPASS (170) →
 PHYSICS (175) → LATE_UPDATE (185) → TRANSFORM (200) → AUDIO/MATERIAL (250/260) →
 PROJECTION (300)`. Systems below `TRANSFORM` are gated with the sim (skipped when
@@ -219,10 +219,11 @@ once per frame. No per-frame diffing, no extra rAF.
 
 ## World Transforms
 
-`runtime/ecs/worldTransform.ts` is the canonical, **headless-safe** API that composes an
+`runtime/core/ecs/worldTransform.ts` is the canonical, **headless-safe** API that composes an
 entity's LOCAL `Transform` + its `parentId` chain into a WORLD pose on demand, and inverts
-a world pose back to local. It is the ON-DEMAND complement to `transformPropagationSystem`,
-which maintains the per-frame `worldTransforms` cache map for the render path (O(1)
+a world pose back to local. It is the ON-DEMAND complement to `transformPropagationSystem`
+(`runtime/core/ecs/transformPropagationSystem.ts` — its L0 sibling since the P5 relocation out
+of `src/three/`), which maintains the per-frame `worldTransforms` cache map for the render path (O(1)
 lookups): use the cached map in hot per-entity render loops, and these getters when you
 need a world pose at a moment the cache may be stale or unpopulated — a game system reading
 a parented marker at scene bootstrap, or physics reading back a parented body mid-tick.

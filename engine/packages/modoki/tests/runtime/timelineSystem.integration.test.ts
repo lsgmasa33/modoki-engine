@@ -1,11 +1,13 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
+// Side-effect only: wires core provider slots (P7 C14) so the real timeline/prefab caches below resolve correctly.
+import '../../src/runtime/loaders/registerProviders';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
-import { SYSTEM_PRIORITY } from '../../src/runtime/systems/pipeline';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { Animator } from '../../src/runtime/traits/Animator';
 import { Director } from '../../src/runtime/traits/Director';
-import { timelineSystem } from '../../src/runtime/systems/timelineSystem';
-import { timelineEvents } from '../../src/runtime/managers/TimelineEvents';
+import { timelineSystem } from '../../src/runtime/timeline/timelineSystem';
+import { timelineEvents } from '../../src/runtime/timeline/TimelineEvents';
 import { setTimeline, clearTimelineCache } from '../../src/runtime/loaders/timelineCache';
 import { drainAudioCues } from '../../src/runtime/audio/audioCues';
 import { normalizeTimeline } from '../../src/runtime/timeline/types';

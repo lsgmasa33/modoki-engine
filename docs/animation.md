@@ -45,12 +45,12 @@ clean and hot-reloads.
   renderer, the sequencer and 2D deform all build the same index — so it lives in core and the
   dependency arrow points the right way (a physics/zone system can use the predicate without
   importing an animation module).
-- `runtime/systems/animationSystem.ts` — the pipeline system that advances `Animator.time` and poses.
+- `runtime/animation/animationSystem.ts` — the pipeline system that advances `Animator.time` and poses.
 - `runtime/traits/{Animator,SkeletalAnimator,SkinnedModel,Bone,BoneAttachment,SkinnedMeshRenderer,AnimationLibrary,SpriteAnimator}.ts`
   — the eight data traits (each doc-commented with its exact field contract).
 - `runtime/rendering/scene3DSync.ts` — the skeletal engine: `syncSkinnedModels`, `driveAnimator`,
   `mergeAnimationLibrary`, `syncBones`, `syncBoneAttachments`, `syncSkinnedMeshRenderers`.
-- `runtime/systems/spriteAnimationSystem.ts` — the 2D flipbook driver.
+- `runtime/animation/spriteAnimationSystem.ts` — the 2D flipbook driver.
 - `runtime/loaders/{animationClipCache,animSetCache,spriteAnimCache}.ts` — the three lazy asset
   caches (`.anim.json` / `.animset.json` / `.spriteanim.json`), all the same fetch-once-retry shape.
 

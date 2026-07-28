@@ -10,7 +10,7 @@ import { useEditorStore } from '../../store/editorStore';
 import {
   DEFAULT_FONT_SETTINGS, resolveFontSettings, FONT_ATLAS_SUFFIX,
   type FontImportSettings, type FontFieldType, type FontCharsetPreset, type FontMode, type FontCacheInfo,
-} from '../../../runtime/loaders/fontSettings';
+} from '../../../runtime/core/fontSettings';
 import { assetUrl } from '../../../runtime/loaders/assetUrl';
 import { inputStyle } from '../fields';
 import { DropdownField, formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';

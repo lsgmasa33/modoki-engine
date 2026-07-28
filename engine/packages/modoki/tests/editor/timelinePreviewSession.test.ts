@@ -35,9 +35,9 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
 import {
   beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession,
 } from '../../src/editor/scene/timelinePreview';
-import { isTimelinePreviewActive, setTimelinePreviewActive } from '../../src/runtime/systems/timelinePreview';
-import { requestSkeletalSeek, hasSkeletalSeeks, clearSkeletalSeeks } from '../../src/runtime/systems/skeletalSeek';
-import { setControlSpawn, hasControlSpawn, clearControlSpawns } from '../../src/runtime/systems/controlSpawnRegistry';
+import { isTimelinePreviewActive, setTimelinePreviewActive } from '../../src/runtime/core/timelinePreview';
+import { requestSkeletalSeek, hasSkeletalSeeks, clearSkeletalSeeks } from '../../src/runtime/core/skeletalSeek';
+import { setControlSpawn, hasControlSpawn, clearControlSpawns } from '../../src/runtime/timeline/controlSpawnRegistry';
 
 afterEach(async () => {
   // End any dangling session so the module-level snapshot doesn't leak to the next test.

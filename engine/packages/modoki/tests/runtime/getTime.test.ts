@@ -17,16 +17,16 @@ beforeEach(() => {
 
 describe('getTime', () => {
   it('returns null when no Time entity exists', async () => {
-    vi.doMock('../../src/runtime/traits', () => ({ Time }));
-    const { getTime } = await import('../../src/runtime/systems/getTime');
+    vi.doMock('../../src/runtime/core/traits/Time', () => ({ Time }));
+    const { getTime } = await import('../../src/runtime/core/getTime');
 
     const world = createWorld();
     expect(getTime(world)).toBeNull();
   });
 
   it('returns the Time data when a Time entity exists', async () => {
-    vi.doMock('../../src/runtime/traits', () => ({ Time }));
-    const { getTime } = await import('../../src/runtime/systems/getTime');
+    vi.doMock('../../src/runtime/core/traits/Time', () => ({ Time }));
+    const { getTime } = await import('../../src/runtime/core/getTime');
 
     const world = createWorld();
     world.spawn(Time);
@@ -47,8 +47,8 @@ describe('getTime', () => {
   });
 
   it('returns mutable reference that reflects ECS updates', async () => {
-    vi.doMock('../../src/runtime/traits', () => ({ Time }));
-    const { getTime } = await import('../../src/runtime/systems/getTime');
+    vi.doMock('../../src/runtime/core/traits/Time', () => ({ Time }));
+    const { getTime } = await import('../../src/runtime/core/getTime');
 
     const world = createWorld();
     world.spawn(Time);

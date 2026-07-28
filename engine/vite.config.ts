@@ -340,6 +340,7 @@ export default defineConfig(({ command }) => {
       'tests/plugins/**/*.test.ts',
       'tests/assets/**/*.test.ts',
       'tests/electron/**/*.test.ts',
+      'tests/architecture/**/*.test.ts',
       // MCP server units (result formatting, identity) — `tools/` ships to the agent,
       // not to a game, but it is still CI-gated code.
       'tests/tools/**/*.test.ts',

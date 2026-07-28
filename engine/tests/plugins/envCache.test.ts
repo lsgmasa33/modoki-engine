@@ -3,7 +3,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { envHashKey, envCachePathFor, getEnvCacheDir } from '../../plugins/env-cache';
-import { DEFAULT_ENV_SETTINGS } from '../../packages/modoki/src/runtime/loaders/environmentSettings';
+import { DEFAULT_ENV_SETTINGS } from '../../packages/modoki/src/runtime/core/environmentSettings';
 
 const bytes = Buffer.from('fake-hdr-source-bytes');
 const S = DEFAULT_ENV_SETTINGS;

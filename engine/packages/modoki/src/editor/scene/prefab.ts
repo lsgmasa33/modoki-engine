@@ -1,9 +1,9 @@
 /** Prefab system — save, load, and instantiate prefab entity trees. */
 
-import { getCurrentWorld, registerEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/ecs/world';
+import { getCurrentWorld, registerEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { backendFetch } from '../backend/editorBackend';
-import { getAllTraits, getTraitByName } from '../../runtime/ecs/traitRegistry';
-import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, readTraitDataFull, writeTraitField, findEntity, subtreeIds, type EntityInfo } from '../../runtime/ecs/entityUtils';
+import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
+import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, readTraitDataFull, writeTraitField, findEntity, subtreeIds, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { Transient } from '../../runtime/traits/Transient';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';

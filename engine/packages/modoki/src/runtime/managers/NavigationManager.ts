@@ -17,10 +17,10 @@
 
 import { sceneManager } from '../scene/SceneManager';
 import { resolveGuidToPath } from '../loaders/assetManifest';
-import { isGuid } from '../loaders/assetRefRules';
-import { registerReadSource, unregisterReadSource } from '../ui/readSourceRegistry';
+import { isGuid } from '../core/assetRefRules';
+import { registerReadSource, unregisterReadSource } from '../core/readSourceRegistry';
 import type { ManagerDef } from './managerRegistry';
-import type { UIActionContext } from '../ui/actionRegistry';
+import type { UIActionContext } from '../core/actionRegistry';
 
 /** Resolve a scene ref (GUID or path/URL) to a load path, or undefined. */
 function resolvePath(ref: unknown): string | undefined {
@@ -33,6 +33,19 @@ function resolvePath(ref: unknown): string | undefined {
  *  rarely nests more than a handful of scenes; the cap just bounds pathological
  *  growth (e.g. a menu loop that forward-navigates instead of using back()). */
 const MAX_HISTORY = 50;
+
+/** Public surface of the {@link navigationManager} singleton. See the module doc above. */
+export interface NavigationManager extends ManagerDef {
+  /** True once at least one `loadScene`/back-eligible navigation has happened. */
+  readonly canGoBack: boolean;
+  /** Navigate to a scene (GUID or path), pushing the current scene onto history
+   *  so `back()` can return to it. */
+  loadScene(ref: unknown): Promise<void>;
+  /** Navigate to the previous scene, if any. Inert (no-op) at the root. */
+  back(): Promise<void>;
+  /** Navigate without recording history. */
+  replace(ref: unknown): Promise<void>;
+}
 
 class NavigationManagerImpl implements ManagerDef {
   name = 'engine.navigation';
@@ -96,5 +109,7 @@ class NavigationManagerImpl implements ManagerDef {
 }
 
 /** The singleton NavigationManager. Registered by core (app/ecs/register.ts);
- *  call its methods by importing this directly. */
-export const navigationManager = new NavigationManagerImpl();
+ *  call its methods by importing this directly. Typed as {@link NavigationManager}
+ *  (not the `Impl` class) so the public surface — and the generated API
+ *  reference — show the documented interface, not the private implementation. */
+export const navigationManager: NavigationManager = new NavigationManagerImpl();

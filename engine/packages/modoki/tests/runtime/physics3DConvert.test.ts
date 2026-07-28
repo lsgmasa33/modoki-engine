@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import {
   vecEcsToPhys, vecPhysToEcs, lenToPhys, packCollisionGroups,
   eulerToQuat, quatToEuler,
-} from '../../src/runtime/systems/physics3DConvert';
+} from '../../src/runtime/physics/physics3DConvert';
 
 describe('physics3DConvert — vectors & lengths (no flip, right-handed Y-up both sides)', () => {
   it('scales by unitsPerMeter with NO axis flip', () => {

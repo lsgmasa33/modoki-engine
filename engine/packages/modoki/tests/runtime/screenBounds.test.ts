@@ -3,7 +3,7 @@
 
 import { describe, it, expect } from 'vitest';
 import * as THREE from 'three';
-import { projectAABBToScreen, registerBoundsProvider, collectScreenBounds } from '../../src/runtime/rendering/screenBounds';
+import { projectAABBToScreen, registerBoundsProvider, collectScreenBounds } from '../../src/runtime/core/screenBounds';
 
 const vp = { left: 0, top: 0, width: 100, height: 100 };
 

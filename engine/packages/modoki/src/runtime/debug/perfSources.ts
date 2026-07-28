@@ -3,7 +3,7 @@
 
 import { getCurrentFPS } from '../rendering/frameDriver';
 import { getActiveRenderer } from '../loaders/textureResolver';
-import { getAllEntities } from '../ecs/entityUtils';
+import { getAllEntities } from '../core/ecs/entityUtils';
 
 export const MB = 1024 * 1024;
 

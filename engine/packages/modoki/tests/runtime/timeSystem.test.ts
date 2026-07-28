@@ -27,8 +27,8 @@ describe('timeSystem', () => {
     vi.spyOn(performance, 'now').mockImplementation(() => now);
 
     // Mock traits import to use our local Time trait
-    vi.doMock('../../src/runtime/traits', () => ({ Time }));
-    const { timeSystem } = await import('../../src/runtime/systems/timeSystem');
+    vi.doMock('../../src/runtime/core/traits/Time', () => ({ Time }));
+    const { timeSystem } = await import('../../src/runtime/core/timeSystem');
 
     const world = createWorld();
     world.spawn(Time);
@@ -62,8 +62,8 @@ describe('timeSystem', () => {
     let now = 1000;
     vi.spyOn(performance, 'now').mockImplementation(() => now);
 
-    vi.doMock('../../src/runtime/traits', () => ({ Time }));
-    const { timeSystem } = await import('../../src/runtime/systems/timeSystem');
+    vi.doMock('../../src/runtime/core/traits/Time', () => ({ Time }));
+    const { timeSystem } = await import('../../src/runtime/core/timeSystem');
 
     const world = createWorld();
     world.spawn(Time);
@@ -89,8 +89,8 @@ describe('timeSystem', () => {
     let now = 1000;
     vi.spyOn(performance, 'now').mockImplementation(() => now);
 
-    vi.doMock('../../src/runtime/traits', () => ({ Time }));
-    const { timeSystem } = await import('../../src/runtime/systems/timeSystem');
+    vi.doMock('../../src/runtime/core/traits/Time', () => ({ Time }));
+    const { timeSystem } = await import('../../src/runtime/core/timeSystem');
 
     const world = createWorld();
     world.spawn(Time);
@@ -123,8 +123,8 @@ describe('timeSystem', () => {
   it('F6: smoothedDelta EASES from the capped delta after a stall (no MAX_DELTA pin)', async () => {
     let now = 1000;
     vi.spyOn(performance, 'now').mockImplementation(() => now);
-    vi.doMock('../../src/runtime/traits', () => ({ Time }));
-    const { timeSystem } = await import('../../src/runtime/systems/timeSystem');
+    vi.doMock('../../src/runtime/core/traits/Time', () => ({ Time }));
+    const { timeSystem } = await import('../../src/runtime/core/timeSystem');
 
     const world = createWorld();
     world.spawn(Time);
@@ -149,8 +149,8 @@ describe('timeSystem', () => {
     let now = 1000;
     vi.spyOn(performance, 'now').mockImplementation(() => now);
 
-    vi.doMock('../../src/runtime/traits', () => ({ Time }));
-    const { timeSystem } = await import('../../src/runtime/systems/timeSystem');
+    vi.doMock('../../src/runtime/core/traits/Time', () => ({ Time }));
+    const { timeSystem } = await import('../../src/runtime/core/timeSystem');
 
     const world = createWorld();
     world.spawn(Time);
@@ -177,8 +177,8 @@ describe('timeSystem', () => {
     let now = 1000;
     vi.spyOn(performance, 'now').mockImplementation(() => now);
 
-    vi.doMock('../../src/runtime/traits', () => ({ Time }));
-    const { timeSystem } = await import('../../src/runtime/systems/timeSystem');
+    vi.doMock('../../src/runtime/core/traits/Time', () => ({ Time }));
+    const { timeSystem } = await import('../../src/runtime/core/timeSystem');
     const { Paused } = await import('../../src/runtime/traits/Paused');
 
     const world = createWorld();

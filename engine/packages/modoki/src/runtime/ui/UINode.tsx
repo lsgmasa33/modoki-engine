@@ -13,8 +13,8 @@ import { resolveTemplate, evalVisibility } from './bindingResolver';
 const Canvas2DMount = __MODOKI_MODULE_RENDER2D__
   ? lazy(() => import('../rendering/Canvas2DMount').then((m) => ({ default: m.Canvas2DMount })))
   : null;
-import { resolveDomImageUrl, resolveSprite } from '../rendering/renderUtils';
-import { isGuid } from '../loaders/assetManifest';
+import { resolveDomImageUrl, resolveSprite } from '../core/textureRefs';
+import { isGuid } from '../core/assetRefRules';
 import { applyAnchorStyle } from './anchorCss';
 import { NineSliceImage } from './NineSliceImage';
 import { uiTextAnimation, ensureUITextAnimStyles } from './uiTextAnimation';

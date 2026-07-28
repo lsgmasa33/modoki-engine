@@ -15,6 +15,7 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 | [engine-concepts.md](./engine-concepts.md) | The core ECS vocabulary — entity, trait, system, projection, manager, store, service — and when to reach for each |
 | [architecture.md](./architecture.md) | Core engine architecture — koota world registry, traits, three render layers, frame driver, Zustand bridge, game decoupling |
 | [managers-and-systems.md](./managers-and-systems.md) | The engine's five logic roles — System, Manager, Projection, Store, Trait — and the first-class Manager primitive |
+| [architecture-layers.md](./architecture-layers.md) | The runtime's L0–L3 layer contract — what each layer may import, why ESM cycles make it a correctness rule, the registration-inversion pattern, and how to add a subsystem without breaking it |
 
 ## Rendering & Assets
 
@@ -52,14 +53,13 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 | [editor-hmr.md](./editor-hmr.md) | Editor hot reload — what Fast Refreshes, what force-reloads (game code, the input registries), why `[]`-deps effects never re-run, and how to tell a stale editor from a working one |
 | [scene-view-gizmo.md](./scene-view-gizmo.md) | The SceneView orientation gizmo + orthographic editor camera — animated 6-axis snap, independent persp↔ortho toggle, and the spiked ortho risk analysis future ortho work reuses |
 | [debug-menu.md](./debug-menu.md) | The extensible in-game debug menu (F12 / 3-finger tap) — built-in tabs, floating stat widgets, registration API |
-| [asset-inspector-plan.md](./asset-inspector-plan.md) | The asset-Inspector overhaul — previews, editor-launch buttons, converter params, HDR conversion (mostly landed) |
 
 ## Agent / MCP Tooling
 
 | Doc | What it is |
 |---|---|
 | [debug-tools-mcp.md](./debug-tools-mcp.md) | The agent-facing debug surface — `game-debug`/`modoki`/Chrome MCPs, the tool catalog, dev-server `curl` API, Electron CDP |
-| [percept-plan.md](./percept-plan.md) | Percept, the agent-perception layer (Snapshot/Journal/Watch over game and editor) — design, rollout, v2 backlog |
+| [mcp-persistence.md](./mcp-persistence.md) | Design reference for the `auto`/`manual` MCP persistence mode knob — the composite undo primitive, the dirty-asset registry, and why `mutate_scene`/`set_transform` fall back to file-direct writes (headless, wrong scene, `setBaseScene`) |
 | [enact.md](./enact.md) | Enact — the trusted-input layer making editor chrome agent-addressable via `data-ui-id` handles, selector input, identity checks |
 | [mcp-response-budget.md](./mcp-response-budget.md) | The MCP response-budget reference — compact JSON, summary-first defaults, boundary summarization, token-not-char accounting |
 | [connect-claude-code.md](./connect-claude-code.md) | Design + rationale for the shipped **AI → Connect Claude Code** flow — the dockable AI panel that one-click wires the user's own Claude Code to the running editor's `modoki` MCP **and** CDP (chrome-devtools) in the DMG/exe, plus the MCP tool-quality re-audit decisions (§15) |
@@ -83,22 +83,24 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 
 | Doc | What it is |
 |---|---|
-| [editor-shipping-plan.md](./plans/editor-shipping-plan.md) | Ship the editor as a consumer DMG/Windows installer — keep bundled Vite, end users build iOS+Android via a Unity-Hub-style Build Support dialog, dev/prod toolchain parity, phased roadmap |
+| [api-reference-usability-plan.md](./plans/api-reference-usability-plan.md) | Make the generated TypeDoc API reference usable — kind-subgrouped sidebar, manager interfaces documenting their methods, and an editorial "Essential" whitelist that ranks the 877-symbol surface without hiding any of it |
+| [editor-shipping-plan.md](./plans/editor-shipping-plan.md) | Ship the editor as a consumer DMG/Windows installer — keep bundled Vite, end users build iOS+Android via a Unity-Hub-style Build Support dialog, dev/prod toolchain parity, phased roadmap (5 demos published, Windows NSIS installer built + tested; native-prebuild audit + code signing still open) |
 | [engine-oss-publishing.md](./engine-oss-publishing.md) | Reference (graduated, private) — how the engine is published as the Apache-2.0 `modoki-engine` public mirror: curated one-way snapshots, the blocking secret/brand safety scan, Harmony CLA, signed mac/Windows release CI. Cited by `publish-engine-oss.sh`, `scan-publish-safety.mjs`, `vite.config.ts` |
-| [modoki-mcp-tools-windows-test.md](./plans/modoki-mcp-tools-windows-test.md) | Test plan validating the whole `modoki` MCP surface (Percept, Enact, editor-control/mutate/render) against a live editor on **Windows** |
+| [modoki-mcp-tools-windows-test.md](./plans/modoki-mcp-tools-windows-test.md) | Test plan + results validating the whole `modoki` MCP surface (Percept, Enact, editor-control/mutate/render) against a live editor on **Windows** — full pass recorded, plus the two Windows spawn/WebGPU gotchas; packaged-Windows identity is the one untested quadrant |
 | [editor-toolchain-layer-plan.md](./plans/editor-toolchain-layer-plan.md) | Tracker — the `engine/toolchain/` resolution layer (Phases A–E LANDED; the shipped reference is [editor-toolchain.md](./editor-toolchain.md)). Remaining: Windows port + clean-machine DMG native-build validation |
-| [2d-particles-plan.md](./plans/2d-particles-plan.md) | Phased plan for a PixiJS 2D particle backend sharing the 3D particle schema and editor |
-| [public-demos-plan.md](./plans/public-demos-plan.md) | Curated public demo projects in a new `demos/` root (CC0 assets, web-only, snapshot-published per demo) + the Windows conformance sweep over every existing project |
-| [modoki-mcp-tools-windows-test.md](./plans/modoki-mcp-tools-windows-test.md) | Windows validation of the `modoki` MCP surface (Percept/Enact/mutate round-trip) — full pass recorded, plus the two Windows spawn/WebGPU gotchas |
-| [debug-menu-plan.md](./debug-menu-plan.md) | Design/tracker for the runtime-only in-game debug menu (all phases complete) |
+| [2d-particles-plan.md](./plans/2d-particles-plan.md) | Phased plan for a PixiJS 2D particle backend sharing the 3D particle schema and editor (Phases 0-2 shipped; editor SceneView 2D preview open, blocked on a design decision) |
+| [public-demos-plan.md](./plans/public-demos-plan.md) | Curated public demo projects in a new `demos/` root (CC0 assets, web-only, snapshot-published per demo) + the Windows conformance sweep over every existing project (5 demos shipped; the full sweep + per-demo doc checklist still open) |
+| [asset-inspector-plan.md](./plans/asset-inspector-plan.md) | The asset-Inspector overhaul — previews, editor-launch buttons, converter params, HDR conversion (mostly landed; Phase 5 open) |
 | [cloud-teardown-and-migration-plan.md](./plans/cloud-teardown-and-migration-plan.md) | Plan to cancel the cloud editor, salvage its good commits to `main`, and tear down GCP |
 | [modoki-package-manager.md](./modoki-package-manager.md) | Proposal for a Unity-UPM-style editor package manager to unbundle game deps and shrink the signed app |
 | [custom-editor-windows-inspectors-plan.md](./plans/custom-editor-windows-inspectors-plan.md) | Plan to let games register custom editor windows, inspector/asset-view overrides, and field widgets (Tier 2 not yet built) |
-| [animation-window-review-plan.md](./plans/animation-window-review-plan.md) | Animation Window review-findings remediation tracker — correctness, perf, refactor, test gaps (nearly all done) |
+| [game-journal-plan.md](./plans/game-journal-plan.md) | Game-level journal convention + production gating (`build.debugBuild`) — Phases 1-4 landed in one pass |
 | [sling-field-editor-plan.md](./plans/sling-field-editor-plan.md) | Grid-painted arena editor for sling — paint floor, autotile the existing kit into walls/corners/colliders, regenerate a scene `Field` group |
+| [sling-review-and-test-plan.md](./plans/sling-review-and-test-plan.md) | Point-in-time multi-agent code review + test-coverage audit of `games/sling` — 40 confirmed findings after adversarial refutation, tracked to landed/remaining |
 | [sling-slopes-ramps-plan.md](./plans/sling-slopes-ramps-plan.md) | Phase 2/7.2 plan (not started) — ramps let the puck jump off a slope lip to clear a hole or land on a platform, building on the fake-Y model + height layers |
 | [mobile-ota-updates-plan.md](./plans/mobile-ota-updates-plan.md) | Open items only — all phases shipped (see [ota-updates.md](./ota-updates.md) / [ota-subgame-modules.md](./ota-subgame-modules.md)): two open design conversations, known-but-unfixed edge cases, the private device-test loop |
 | [preview-mode-refactor.md](./plans/preview-mode-refactor.md) | Plan to unify the fragmented "in an editor preview?" signals into one `RunMode` + a serialization-transience rule so no preview/scrub mutation reaches disk |
+| [entity-id-guard-game-traits-plan.md](./plans/entity-id-guard-game-traits-plan.md) | Extend Phase 15's entity-id remap guard from engine-only tests to a registration-time check covering GAME traits too (`notEntityId` hint + dev warning), and fix the one live offender — sling's `Enemy.hpBarId`; also adds a click-to-copy entity-GUID chip to the Inspector header |
 | [todo.md](./todo.md) | Open task checklist — editor, rendering/materials (`MaterialModifier`, custom shader lighting, HDR import settings), native/build |
 
 ## Background & Evaluations
@@ -106,4 +108,4 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 | Doc | What it is |
 |---|---|
 | [unity-vs-react-pixijs.md](./unity-vs-react-pixijs.md) | Point-in-time evaluation comparing Unity against a React + PixiJS/Three.js web stack for 2D puzzle games |
-| [reviews/](./reviews/) | Dated point-in-time architecture/code reviews — incl. [2026-07-02 Rapier2D subsystem review](./reviews/2026-07-02-physics-2d-subsystem-review.md) (22 findings, all resolved) and [2026-06-15 architecture review](./reviews/2026-06-15-architecture-review.md) |
+| [reviews/](./reviews/) | Dated point-in-time architecture/code reviews — incl. [2026-07-02 Rapier2D subsystem review](./reviews/2026-07-02-physics-2d-subsystem-review.md) (22 findings, all resolved), [2026-06-15 architecture review](./reviews/2026-06-15-architecture-review.md), [2026-07-19 Windows editor test](./reviews/2026-07-19-windows-editor-test.md), and the [carried-instance-overrides investigation](./reviews/a9-carried-instance-overrides-investigation.md) (resolved 2026-07-26) |

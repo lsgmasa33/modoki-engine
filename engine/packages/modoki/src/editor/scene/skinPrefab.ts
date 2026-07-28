@@ -10,7 +10,7 @@
 import { registerAsset, getGuidForPath } from '../../runtime/loaders/assetManifest';
 import { type Rig2DFile, type Rig2DBone } from '../../runtime/loaders/rig2dCache';
 import { spawnEntitySubtree, type SubtreeSpec } from '../undo/entityActions';
-import { deleteEntity } from '../../runtime/ecs/entityUtils';
+import { deleteEntity } from '../../runtime/core/ecs/entityUtils';
 import { serializePrefab, setPrefabCache } from './prefab';
 import { writeAssetFile, deleteAssetFile } from '../panels/assetOps';
 import { pushAction, type UndoAction } from '../undo/undoManager';

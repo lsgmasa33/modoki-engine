@@ -9,7 +9,7 @@
  *  just appends to its clip bank) is the obvious choice when it exists. */
 
 import { useMemo, useState } from 'react';
-import { getAllEntities, type EntityInfo } from '../../../runtime/ecs/entityUtils';
+import { getAllEntities, type EntityInfo } from '../../../runtime/core/ecs/entityUtils';
 
 export interface BindEntityRow {
   id: number;

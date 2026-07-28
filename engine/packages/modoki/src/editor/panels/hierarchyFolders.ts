@@ -9,7 +9,7 @@
  *  synthesize the (rootless) folder node. Once a root is dropped in, the folder becomes
  *  scene-backed and the marker is dropped. */
 
-import type { EntityInfo } from '../../runtime/ecs/entityUtils';
+import type { EntityInfo } from '../../runtime/core/ecs/entityUtils';
 
 /** Prune the entity tree to nodes matching `pred`, KEEPING every ancestor of a match
  *  so the surviving rows still read as a tree. A node survives iff it matches OR one
@@ -41,6 +41,22 @@ export function collectEntityTypes(nodes: EntityInfo[]): [string, number][] {
 /** Normalize a folder path: trim each segment, drop empties, rejoin. `''` = ungrouped. */
 export function normalizeFolderPath(s: string): string {
   return s.split('/').map((x) => x.trim()).filter(Boolean).join('/');
+}
+
+/** A root-level before/after (same-parent) drag-reorder must also decide folder
+ *  membership: folders only tag ROOTS, and the drop position is the only signal a
+ *  root-level reorder gives for "should this now be in a folder, or out of one" —
+ *  dropping among an ungrouped sibling means "ungroup", dropping among a folder's
+ *  members means "adopt that folder". Returns the new `editorFolder` value to write,
+ *  or `null` when no write is needed (not a root-level drop, or already matching).
+ *  Pure so the decision is unit-testable without a rendered Hierarchy + real drag
+ *  events — the DOM wiring lives in Hierarchy.tsx's `EntityNode` drop handler. */
+export function resolveDropFolderSync(
+  targetParentId: number, targetFolder: string, draggedFolder: string,
+): string | null {
+  if (targetParentId !== 0) return null; // folders only tag roots — non-root reorders are moot
+  const wanted = normalizeFolderPath(targetFolder);
+  return normalizeFolderPath(draggedFolder) === wanted ? null : wanted;
 }
 
 export interface HierarchyFolder {

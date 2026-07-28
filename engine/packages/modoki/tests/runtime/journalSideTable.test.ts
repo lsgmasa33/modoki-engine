@@ -6,8 +6,8 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
-import { entityRef, resolveRefName, MAX_NAMES } from '../../src/runtime/systems/journal';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { entityRef, resolveRefName, MAX_NAMES } from '../../src/runtime/core/journal';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 
 let tw: TestWorld | undefined;
 afterEach(() => { if (tw) { tw.dispose(); tw = undefined; } });

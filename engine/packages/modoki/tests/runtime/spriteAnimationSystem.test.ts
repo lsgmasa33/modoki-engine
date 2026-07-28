@@ -4,13 +4,15 @@
  *  path so resolution is synchronous in the headless harness. */
 
 import { describe, it, expect, afterEach } from 'vitest';
+// Side-effect only: wires core provider slots (P7 C11+) so real-cache tests below resolve correctly.
+import '../../src/runtime/loaders/registerProviders';
 import { createWorld, type World } from 'koota';
 import { Renderable2D } from '../../src/runtime/traits/Renderable2D';
 import { Paused } from '../../src/runtime/traits/Paused';
-import { Time } from '../../src/runtime/traits/Time';
+import { Time } from '../../src/runtime/core/traits/Time';
 import { SpriteAnimator, type SpriteClip } from '../../src/runtime/traits/SpriteAnimator';
 import { setSpriteAnim, clearSpriteAnimCache } from '../../src/runtime/loaders/spriteAnimCache';
-import { spriteAnimationSystem } from '../../src/runtime/systems/spriteAnimationSystem';
+import { spriteAnimationSystem } from '../../src/runtime/animation/spriteAnimationSystem';
 import { spriteIndexFromStep, spriteFrameIndex } from '../../src/runtime/particles/types';
 
 afterEach(() => clearSpriteAnimCache());

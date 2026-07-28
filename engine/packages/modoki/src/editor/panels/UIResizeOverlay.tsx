@@ -2,8 +2,8 @@
  *  Renders as DOM overlay (not Canvas) since UI entities are already DOM elements. */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { findEntity } from '../../runtime/ecs/entityUtils';
-import { getAllTraits } from '../../runtime/ecs/traitRegistry';
+import { findEntity } from '../../runtime/core/ecs/entityUtils';
+import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { markUIDirty, onEditorDirty, useUITreeStore } from '../../runtime/ui/uiTreeStore';
 import { pushAction } from '../undo/undoManager';
 import { entityRef } from '../undo/entityRef';

@@ -12,11 +12,11 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { Container } from 'pixi.js';
 import { createWorld } from 'koota';
-import { Transform } from '../../src/runtime/traits/Transform';
+import { Transform } from '../../src/runtime/core/traits/Transform';
 import { ParticleEmitter } from '../../src/runtime/traits/ParticleEmitter';
 import { defaultParticleEffect } from '../../src/runtime/particles/types';
 import { setParticleEffect, clearParticleCache } from '../../src/runtime/loaders/particleCache';
-import { worldTransforms } from '../../src/three/systems/transformPropagationSystem';
+import { worldTransforms } from '../../src/runtime/core/ecs/transformPropagationSystem';
 import {
   createParticleSync2DState,
   syncParticles2D,
@@ -196,7 +196,7 @@ describe('syncParticles2D', () => {
     // Regression test: syncParticles2D used to query Transform+ParticleEmitter with no
     // deactivatedEntities check, so an Activation-track (or any other isActive toggle) never
     // hid/paused a 2D particle emitter — see particleSync2D.ts's deactivatedEntities import.
-    const { deactivatedEntities } = await import('../../src/three/systems/transformPropagationSystem');
+    const { deactivatedEntities } = await import('../../src/runtime/core/ecs/transformPropagationSystem');
     const world = createWorld();
     const { backend, calls } = makeMockBackend();
     const { ctx, canvasOf } = makeMockCtx();

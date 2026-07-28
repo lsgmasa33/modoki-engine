@@ -9,7 +9,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { World } from 'koota';
 import {
   registerLateUpdate, runLateUpdates, clearLateUpdates, type IdempotencyProbe,
-} from '../../src/runtime/systems/lateUpdate';
+} from '../../src/runtime/core/lateUpdate';
 
 const W = {} as unknown as World; // systems under test ignore the world arg
 

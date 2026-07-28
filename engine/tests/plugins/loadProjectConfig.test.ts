@@ -21,7 +21,7 @@ import {
   type ProjectConfig,
   type ProjectUserConfig,
 } from '../../project-config';
-import { ENGINE_API_VERSION } from '../../packages/modoki/src/runtime/version';
+import { ENGINE_API_VERSION } from '../../packages/modoki/src/runtime/core/version';
 
 let root: string;
 

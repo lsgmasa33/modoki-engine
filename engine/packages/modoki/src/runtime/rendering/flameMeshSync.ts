@@ -19,11 +19,11 @@ import {
   dot, abs, clamp, mix, smoothstep, oneMinus, vec3, float, uniform, sin,
 } from 'three/tsl';
 import type { World } from 'koota';
-import { Transform } from '../traits/Transform';
+import { Transform } from '../core/traits/Transform';
 import { FlameMesh } from '../traits/FlameMesh';
 import { PARTICLE_LAYER, DEFAULT_LAYER } from './layers';
-import { worldTransforms } from '../../three/systems/transformPropagationSystem';
-import { onWorldSwap } from '../ecs/world';
+import { worldTransforms } from '../core/ecs/transformPropagationSystem';
+import { onWorldSwap } from '../core/ecs/world';
 
 interface FlameUniforms {
   outerColor: { value: THREE.Color };

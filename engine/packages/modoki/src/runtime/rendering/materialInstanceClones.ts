@@ -23,7 +23,7 @@
  *  custom UNIFORM override instead. */
 
 import * as THREE from 'three';
-import { onWorldSwap } from '../ecs/world';
+import { onWorldSwap } from '../core/ecs/world';
 
 /** entity id → its owned clone + the base material the clone was derived from. The base
  *  is the RESOLVED shared material (from the entity's material GUID, re-resolved each frame

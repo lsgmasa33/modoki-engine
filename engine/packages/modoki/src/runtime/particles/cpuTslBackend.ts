@@ -15,9 +15,17 @@ import { CpuParticleSim } from './cpuSimulator';
 import { createBillboard, type BillboardObject } from './spriteBillboard';
 import { createMeshParticles } from './meshParticles';
 import { createTrail, type TrailObject } from './trailLines';
-import { makeRng } from './curves';
-import { getParticleEffect } from '../loaders/particleCache';
-import { loadTexture3D, releaseTexture3D } from '../loaders/textureResolver';
+import { makeRng } from '../core/curves';
+import { particleDefProvider } from './particleDefProvider';
+import { textureProvider } from '../core/textureProvider';
+
+function loadTexture3D(ref: string, opts?: { flipY?: boolean }): Promise<THREE.Texture> {
+  const p = textureProvider.get();
+  return p ? p.loadTexture3D(ref, opts) : Promise.reject(new Error('textureProvider not wired'));
+}
+function releaseTexture3D(tex: THREE.Texture | null | undefined): void {
+  textureProvider.get()?.releaseTexture3D(tex);
+}
 
 /**
  * A nested sub-emitter instance. Its own continuous emission is disabled and its own
@@ -181,7 +189,7 @@ export class CpuTslBackend implements IParticleBackend {
 
   /** Try to materialize a not-yet-built sub-emitter child once its asset has loaded. */
   private tryBuildChild(entry: Entry, c: SubChild): void {
-    const raw = getParticleEffect(c.config.effect);
+    const raw = particleDefProvider.get()?.getParticleEffect(c.config.effect) ?? null;
     if (!raw) return; // not loaded yet (or failed) — retry next frame
     // Disable the child's own continuous emission + sub-emitters: it is driven purely by
     // injected bursts, and recursion is capped at depth 1.

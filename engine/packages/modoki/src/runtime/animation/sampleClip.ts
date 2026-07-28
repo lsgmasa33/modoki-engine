@@ -8,12 +8,12 @@
  */
 
 import type { World } from 'koota';
-// The entity index is engine core (runtime/ecs/entityIndex.ts) — the renderer, the sequencer
+// The entity index is engine core (runtime/core/ecs/entityIndex.ts) — the renderer, the sequencer
 // and 2D deform all use it too, so it is not an animation detail. Imported, NOT re-exported:
 // one source of truth per symbol, so nobody has to wonder which path is canonical.
-import { buildEntityIndex, resolveTrackTarget, type Ent, type EntityIndex } from '../ecs/entityIndex';
-import { getTraitByName, type TraitMeta } from '../ecs/traitRegistry';
-import { markUIDirty } from '../ui/uiTreeStore';
+import { buildEntityIndex, resolveTrackTarget, type Ent, type EntityIndex } from '../core/ecs/entityIndex';
+import { getTraitByName, type TraitMeta } from '../core/ecs/traitRegistry';
+import { markUIDirty } from '../core/uiDirty';
 import { evalTrackValue } from './curveEval';
 import { setPath } from './pathValue';
 import type { AnimationClipDef, AnimationTrack } from './types';

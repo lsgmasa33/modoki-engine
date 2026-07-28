@@ -21,7 +21,7 @@ import {
 import {
   DEFAULT_ENV_SETTINGS, resolveEnvSettings, envVariantUrl, envVariantSuffix,
   ENV_VARIANT_SUFFIX, ULTRAHDR_VARIANT_SUFFIX,
-} from '../../src/runtime/loaders/environmentSettings';
+} from '../../src/runtime/core/environmentSettings';
 import { resolveEnvVariantUrl, getEnvFormat } from '../../src/runtime/loaders/textureResolver';
 import { registerAsset, clearManifest } from '../../src/runtime/loaders/assetManifest';
 

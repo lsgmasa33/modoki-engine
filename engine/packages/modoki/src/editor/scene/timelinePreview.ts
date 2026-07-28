@@ -4,7 +4,7 @@
  *  stop/scrub/close we revert to it via `SceneManager.loadScene({ preloaded })`, discarding every
  *  preview-mode mutation a signal action / OnSequence made (camera moved, text shown, isActive
  *  toggled). Play stays `'stopped'` throughout — only the two side-effect gates open (see
- *  `runtime/systems/timelinePreview.ts`), so the rest of the sim never runs.
+ *  `runtime/core/timelinePreview.ts`), so the rest of the sim never runs.
  *
  *  NAMED for the Timeline panel because it shipped there first, but it now backs BOTH preview
  *  owners — the Animation panel's clip scrub/preview opens the same session so its poses are
@@ -22,9 +22,9 @@
 
 import type { SceneData } from '../../runtime/loaders/loadSceneFile';
 import { sceneManager } from '../../runtime/scene/SceneManager';
-import { setTimelinePreviewActive } from '../../runtime/systems/timelinePreview';
-import { clearSkeletalSeeks } from '../../runtime/systems/skeletalSeek';
-import { clearControlSpawns } from '../../runtime/systems/controlSpawnRegistry';
+import { setTimelinePreviewActive } from '../../runtime/core/timelinePreview';
+import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
+import { clearControlSpawns } from '../../runtime/timeline/controlSpawnRegistry';
 import { serializeScene, getCurrentScenePath, type SceneFile } from './serialize';
 
 /** Authored-world snapshot captured at the first ▶ of a preview session, plus the scene path it

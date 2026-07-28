@@ -8,7 +8,7 @@
  *  and Vite failed to resolve it. */
 
 import { create } from 'zustand';
-import { appServices } from '../appServices';
+import { appServices } from '../core/appServices';
 
 export type Screen = 'home' | 'game' | 'result';
 export type FontStatus = 'idle' | 'loading' | 'ready' | 'error';

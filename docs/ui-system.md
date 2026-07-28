@@ -27,7 +27,7 @@ entities render into it) — are optional add-ons.
 
 ### `UIElement` — the consolidated element trait
 
-`UIElement` is a single ~60-field trait holding layout, box style, text, image, and
+`UIElement` is a single ~73-field trait holding layout, box style, text, image, and
 element-type properties. There is no separate "label" vs "panel" vs "button" trait —
 **rendering is content-driven**: a node renders its `text` if non-empty, and paints
 `imageSrc` as a CSS `backgroundImage` if non-empty (so text can sit *over* an image).
@@ -40,10 +40,14 @@ Field groups (representative fields, verified against `UIElement.ts`):
   `minWidth`/`maxWidth`/`minHeight`/`maxHeight`, `alignSelf`, `zIndex`, `overflow`
   (`visible | hidden | scroll`), `isVisible`.
 - **Style (box visuals)** — `backgroundColor` (packed hex int, `0` = transparent),
-  `backgroundOpacity`, `borderRadius`, `borderWidth`, `borderColor`, `opacity`.
+  `backgroundOpacity`, `borderRadius`, `borderWidth`, `borderColor`, `borderOpacity`
+  (border color alpha, folded into the `borderColor` picker), `opacity`.
 - **Text** — `text`, `fontFamily`, `fontSize`, `fontWeight`, `fontStyle`, `textColor`,
-  `textAlign`, `lineHeight`, `letterSpacing`, `textShadow*` (color/offsetX/offsetY/blur),
-  `textStrokeColor`/`textStrokeWidth`, `textOverflow` (`clip | ellipsis`), `maxLines`.
+  `textOpacity` (folded into the `textColor` picker), `textAlign`, `lineHeight`,
+  `letterSpacing`, `textShadow*` (color/opacity/offsetX/offsetY/blur — `textShadowOpacity`
+  folded into `textShadowColor`), `textStrokeColor`/`textStrokeOpacity`
+  (folded into `textStrokeColor`)/`textStrokeWidth`, `textOverflow` (`clip | ellipsis`),
+  `maxLines`.
 - **Image** — `imageSrc`, `imageMode` (`cover | contain | fill | none`).
 - **Element type** — `elementType` (`div | input | range`) and `placeholder`. Most
   elements are `div`; `input` renders an `<input>` text field and `range` renders an
@@ -105,7 +109,7 @@ sim is stopped, so editor Stopped/Paused states never mutate the scene.)
 
 #### Engine built-in `UIAction`s
 
-Three stateless lifecycle/animator handlers are registered once at startup by
+Four stateless lifecycle/animator handlers are registered once at startup by
 `registerEngineActions()` (`runtime/ui/engineActions.ts`), callable from any
 `kind:'call'` binding by name:
 
@@ -116,6 +120,12 @@ Three stateless lifecycle/animator handlers are registered once at startup by
   animator, toggling whichever of `SkeletalAnimator` (GLB skeletal clips) / `Animator`
   (keyframe `.anim.json`) the target carries — a plain field write the render sync picks
   up next frame. Warns if the target is missing or carries neither trait.
+- **`engine.playClip`** — switches the target's active clip BY NAME across all three
+  animator flavours (`Animator` keyframe, `SpriteAnimator` flipbook, `SkeletalAnimator`
+  GLB) — the unified twin of `engine.toggleAnimator`. The clip name comes from the
+  binding's typed `clip` param (or the event `$value`); keyframe/sprite validate the name
+  synchronously against their clip bank and no-op+warn on an unknown one, while skeletal
+  clips are validated at the render layer (unknown names are ignored there).
 
 Scene navigation (`engine.loadScene` / `engine.navigateBack`) is **not** here — it lives
 in `NavigationManager`, which owns the history stack (see
@@ -234,7 +244,7 @@ editor-authorable:
 
 ### `uiFocusSystem` + `focusManager`
 
-`uiFocusSystem` (`runtime/systems/uiFocusSystem.ts`) is an app-pipeline GAME-tier system
+`uiFocusSystem` (`runtime/ui/uiFocusSystem.ts`) is an app-pipeline GAME-tier system
 — it runs only while the sim plays, after `inputSystem` writes the frame's input edges.
 Each tick it: gathers focusable candidates in the **active scope** (top of the scope
 stack), ensures something is focused (autofocus if not), moves focus on a nav edge
@@ -437,7 +447,7 @@ verified against the game's `game.ts`/`runtime/setup.ts` and `app/App.tsx`.)
 
 | Concern | Where |
 | --- | --- |
-| Element trait (~60 fields) | `runtime/traits/UIElement.ts` |
+| Element trait (~73 fields) | `runtime/traits/UIElement.ts` |
 | Bindings / actions / anchor | `runtime/traits/UIBinding.ts`, `UIAction.ts`, `UIAnchor.ts` |
 | Renderer + DOM node | `runtime/ui/UIRenderer.tsx`, `UINode.tsx` |
 | Tree build + dirty flag | `runtime/ui/uiTreeStore.ts` (`buildTree`, `markUIDirty`, `uiTreeProjection`) |
@@ -445,7 +455,7 @@ verified against the game's `game.ts`/`runtime/setup.ts` and `app/App.tsx`.)
 | Action registry + engine built-ins | `runtime/ui/actionRegistry.ts`, `runtime/ui/engineActions.ts` |
 | Binding resolver | `runtime/ui/bindingResolver.ts` |
 | Anchor math | `runtime/ui/anchorLayout.ts` |
-| Focus nav (trait / system / manager) | `runtime/traits/UIFocusable.ts`, `runtime/systems/uiFocusSystem.ts`, `runtime/ui/focusManager.ts` |
+| Focus nav (trait / system / manager) | `runtime/traits/UIFocusable.ts`, `runtime/ui/uiFocusSystem.ts`, `runtime/ui/focusManager.ts` |
 | Text animation | `runtime/traits/TextAnimation.ts`, `runtime/ui/uiTextAnimation.ts`, `runtime/rendering/text/textAnimate.ts` |
 | Nine-slice image + editor | `runtime/ui/NineSliceImage.tsx`, `editor/panels/NineSliceEditor.tsx` |
 | Fonts (FontFace loader / MSDF convert / settings) | `runtime/loaders/fontLoader.ts`, `plugins/font-convert.ts`, `runtime/loaders/fontSettings.ts` |

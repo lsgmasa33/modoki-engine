@@ -17,7 +17,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 const spawned: Record<string, any>[] = [];
 let nextId = 1;
 
-vi.mock('../../src/runtime/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => ({
     spawn: (...traits: any[]) => {
       const merged: Record<string, any> = {};

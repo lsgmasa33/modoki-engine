@@ -18,7 +18,7 @@ import type { IParticleBackend, ParticleEffectDef, ParticleHandle } from './type
 import { gpuDefSupported } from './types';
 import { CpuTslBackend } from './cpuTslBackend';
 import { GpuComputeBackend } from './gpuComputeBackend';
-import { getActiveRenderer } from '../loaders/textureResolver';
+import { getActiveRenderer } from '../core/activeRenderer';
 
 /** True when an effect should run on the GPU compute backend. */
 function gpuEligible(def: ParticleEffectDef): boolean {

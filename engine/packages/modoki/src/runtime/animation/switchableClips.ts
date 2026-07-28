@@ -9,16 +9,17 @@
  *  return [] until the asset has loaded into its cache (the same lazy-load the runtime uses).
  *  Returns [] for an entity that lacks the trait. Fed into `get_scene_state` (Percept). */
 
-import { findEntity } from '../ecs/entityUtils';
+import { findEntity } from '../core/ecs/entityUtils';
 import { Animator } from '../traits/Animator';
 import { SpriteAnimator } from '../traits/SpriteAnimator';
 import { SkeletalAnimator } from '../traits/SkeletalAnimator';
 import { SkinnedModel } from '../traits/SkinnedModel';
 import { AnimationLibrary } from '../traits/AnimationLibrary';
 import { parseAnimClipBank } from './animClipBank';
-import { getSpriteAnim } from '../loaders/spriteAnimCache';
-import { getClipNames } from '../loaders/riggedModelCache';
-import { getAnimSet } from '../loaders/animSetCache';
+import { animationAssetProvider } from './assetProviders';
+function getSpriteAnim(ref: string) { return animationAssetProvider.get()?.getSpriteAnim(ref) ?? null; }
+function getClipNames(modelRef: string) { return animationAssetProvider.get()?.getClipNames(modelRef) ?? []; }
+function getAnimSet(ref: string) { return animationAssetProvider.get()?.getAnimSet(ref) ?? null; }
 
 /** Trait names that carry a switchable named-clip pointer (the `engine.playClip` targets). */
 export const ANIMATOR_CLIP_TRAITS = new Set(['Animator', 'SpriteAnimator', 'SkeletalAnimator']);

@@ -15,17 +15,17 @@
  *  playing, and Stop throws them away — they never reach disk. */
 
 import type { SceneData } from '../../runtime/loaders/loadSceneFile';
-import { getPlayState, setPlayState, getRunMode, setRunMode } from '../../runtime/systems/playState';
+import { getPlayState, setPlayState, getRunMode, setRunMode } from '../../runtime/core/playState';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { serializeScene, getCurrentScenePath, type SceneFile, type SerializedEntity } from './serialize';
 import { undoDepth, truncateUndoTo } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { hasTimelinePreviewSession, endTimelinePreviewSession } from './timelinePreview';
-import { setVerboseCapture, isVerboseCaptureActive } from '../../runtime/systems/journal';
+import { setVerboseCapture, isVerboseCaptureActive } from '../../runtime/core/journal';
 import { fetchAiSettings, getCachedAiSettings } from '../panels/aiSettingsModel';
-import { findEntityByGuid } from '../../runtime/ecs/world';
-import { writeTraitField } from '../../runtime/ecs/entityUtils';
-import { getAllTraits } from '../../runtime/ecs/traitRegistry';
+import { findEntityByGuid } from '../../runtime/core/ecs/world';
+import { writeTraitField } from '../../runtime/core/ecs/entityUtils';
+import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 
 /** In-memory authored snapshot captured at the moment Play was pressed, plus the
  *  scene path it belongs to (so a scene swap mid-play can't revert the wrong

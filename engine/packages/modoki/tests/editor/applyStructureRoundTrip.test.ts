@@ -20,7 +20,7 @@ const TRAITS = [
   { name: 'Rotate3D', trait: Rotate3D, category: 'component', fields: { axis: 0, speed: 0 } },
 ] as const;
 
-vi.mock('../../src/runtime/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', () => ({
   onWorldSwap: () => () => {},
   getCurrentWorld: () => createWorld(),
   registerEntity: vi.fn(),
@@ -28,7 +28,7 @@ vi.mock('../../src/runtime/ecs/world', () => ({
   setStructureCallback: vi.fn(),
 }));
 
-vi.mock('../../src/runtime/ecs/traitRegistry', () => ({
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getAllTraits: () => TRAITS,
   getTraitByName: (name: string) => TRAITS.find((t) => t.name === name),
 }));

@@ -110,8 +110,8 @@ import { audioReimportHandler } from '../plugins/reimport-audio';
 import { fontReimportHandler } from '../plugins/reimport-font';
 import { environmentReimportHandler } from '../plugins/reimport-environment';
 import type { BackendContext } from '../plugins/backend/editorBackendRouter';
-import type { SceneSchema } from '../packages/modoki/src/runtime/scene/sceneValidation';
-import { ENGINE_VERSION } from '../packages/modoki/src/runtime/version';
+import type { SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
+import { ENGINE_VERSION } from '../packages/modoki/src/runtime/core/version';
 
 /**
  * Find the enclosing git repo/worktree root for a project path by walking up

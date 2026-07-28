@@ -6,7 +6,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { trait } from 'koota';
-import { registerTrait } from '../../src/runtime/ecs/traitRegistry';
+import { registerTrait } from '../../src/runtime/core/ecs/traitRegistry';
 import { buildSceneSchema } from '../../src/runtime/scene/sceneSchema';
 
 describe('buildSceneSchema', () => {

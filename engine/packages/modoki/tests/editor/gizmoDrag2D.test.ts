@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { applyGizmoDrag2D, worldToLocal2D, rotateInverse2D, snapDragResult, DEFAULT_GIZMO_SNAP, type GizmoDragStart, type Transform2D } from '../../src/editor/panels/Gizmo2D';
-import { clampAngle } from '../../src/runtime/traits/Transform';
+import { clampAngle } from '../../src/runtime/core/traits/Transform';
 
 /** Compose a local transform under a parent into world space (inverse of worldToLocal2D). */
 function localToWorld2D(local: Transform2D, parent: Transform2D | null): Transform2D {

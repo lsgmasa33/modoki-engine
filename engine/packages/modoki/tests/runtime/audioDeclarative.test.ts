@@ -5,15 +5,15 @@
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
 import { AudioSource } from '../../src/runtime/traits/AudioSource';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
-import { audioSystem } from '../../src/runtime/systems/audioSystem';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
+import { audioSystem } from '../../src/runtime/audio/audioSystem';
 import {
   getAudioLog, clearAudioLog, setAudioRecordMode,
 } from '../../src/runtime/audio/audioService';
-import { registerAudioControls, useAudioMixStore } from '../../src/runtime/audio/audioControls';
-import { dispatchUIAction } from '../../src/runtime/ui/actionRegistry';
-import { setCurrentWorld } from '../../src/runtime/ecs/world';
-import { getPlayState, setPlayState } from '../../src/runtime/systems/playState';
+import { registerAudioControls, useAudioMixStore } from '../../src/runtime/actions/audioControls';
+import { dispatchUIAction } from '../../src/runtime/core/actionRegistry';
+import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
+import { getPlayState, setPlayState } from '../../src/runtime/core/playState';
 import { registerAsset, newGuid, clearManifest } from '../../src/runtime/loaders/assetManifest';
 
 function mintClip(): string {

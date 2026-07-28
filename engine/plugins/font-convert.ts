@@ -16,8 +16,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
-import type { FontImportSettings } from '../packages/modoki/src/runtime/loaders/fontSettings';
-import { expandCharset } from '../packages/modoki/src/runtime/loaders/fontSettings';
+import type { FontImportSettings } from '../packages/modoki/src/runtime/core/fontSettings';
+import { expandCharset } from '../packages/modoki/src/runtime/core/fontSettings';
 import { getFontCacheDir, hashKey, atlasCachePath, metricsCachePath, fontCacheHit } from './font-cache';
 
 const MSDF_MISSING_MSG =

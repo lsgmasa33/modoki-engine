@@ -26,14 +26,14 @@ let testWorld: ReturnType<typeof createWorld>;
 const entityIndex = new Map<number, any>();
 let entityInfos: { id: number; name: string; parentId: number; sortOrder: number; traits: string[] }[] = [];
 
-vi.mock('../../src/runtime/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', () => ({
   onWorldSwap: () => () => {},
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => entityIndex.set(e.id(), e),
   unregisterEntity: (e: any) => entityIndex.delete(e.id()),
 }));
 
-vi.mock('../../src/runtime/ecs/entityUtils', () => ({
+vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   getAllEntities: () => entityInfos,
   findEntity: (id: number) => entityIndex.get(id),
   markStructureDirty: vi.fn(),
@@ -50,7 +50,7 @@ vi.mock('../../src/runtime/ecs/entityUtils', () => ({
   },
 }));
 
-vi.mock('../../src/runtime/ecs/traitRegistry', () => ({
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getTraitByName: (name: string) => TRAITS.find((t) => t.name === name),
   getAllTraits: () => TRAITS,
 }));

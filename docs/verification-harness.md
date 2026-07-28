@@ -56,10 +56,10 @@ not "build a harness from scratch."
 | Need | Existing seam | File |
 |------|---------------|------|
 | Centralized time | `Time` trait (`delta`/`elapsed`/`smoothedDelta`/`frame`) | `runtime/traits/Time.ts` |
-| Clock source | `timeSystem` — module-global `let lastTime = performance.now()` | `runtime/systems/timeSystem.ts` |
+| Clock source | `timeSystem` — module-global `let lastTime = performance.now()` | `runtime/core/timeSystem.ts` |
 | Single-step | `Paused` trait + `stepOneFrame` (editor step button) | `runtime/rendering/frameDriver.ts`, `timeSystem.ts` |
-| Sim on/off gate | `playState` — `getPlayState/setPlayState/isSimRunning` | `runtime/systems/playState.ts` |
-| System ordering / registry | `registerSystem(name, fn, priority, {actions})`, `runPipeline(world)` (skips TIME/GAME/ANIMATION when `!isSimRunning()`) | `runtime/systems/pipeline.ts` |
+| Sim on/off gate | `playState` — `getPlayState/setPlayState/isSimRunning` | `runtime/core/playState.ts` |
+| System ordering / registry | `registerSystem(name, fn, priority, {actions})`, `runPipeline(world)` (skips TIME/GAME/ANIMATION when `!isSimRunning()`) | `runtime/core/pipeline.ts` |
 | Named-input dispatch (spine for intents) | `dispatchUIAction(name, {targetGuid,...})`, `actionRegistry` | `runtime/ui/actionRegistry.ts` |
 | Headless scene load | `loadSceneFile({ world })` — already takes a target world | `runtime/loaders/loadSceneFile.ts` |
 | World management | `getCurrentWorld`, `registerEntity` | `runtime/ecs/world.ts` |

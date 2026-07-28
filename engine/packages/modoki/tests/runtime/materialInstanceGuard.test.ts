@@ -16,7 +16,7 @@ async function setup() {
 
   vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
   vi.doMock('../../src/three/traits/Environment', () => ({ Environment: {} }));
-  vi.doMock('../../src/three/systems/transformPropagationSystem', () => ({
+  vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
     worldTransforms: new Map(), deactivatedEntities: new Set(),
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({

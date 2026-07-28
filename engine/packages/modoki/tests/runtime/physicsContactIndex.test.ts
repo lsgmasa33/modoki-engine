@@ -6,16 +6,16 @@
 
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
-import { SYSTEM_PRIORITY } from '../../src/runtime/systems/pipeline';
-import { Transform } from '../../src/runtime/traits/Transform';
+import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
+import { Transform } from '../../src/runtime/core/traits/Transform';
 import { RigidBody2D } from '../../src/runtime/traits/RigidBody2D';
 import { Collider2D } from '../../src/runtime/traits/Collider2D';
 import { Physics2D } from '../../src/runtime/traits/Physics2D';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
-import { physics2DSystem, disposePhysics2D } from '../../src/runtime/systems/physics2DSystem';
-import { physics2DEvents } from '../../src/runtime/managers/Physics2DEvents';
-import { getContactState, updateContactIndex, _resetContactIndex } from '../../src/runtime/systems/physicsContactIndex';
-import { initRapier2D } from '../../src/runtime/systems/rapierLoader';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
+import { physics2DSystem, disposePhysics2D } from '../../src/runtime/physics/physics2DSystem';
+import { physics2DEvents } from '../../src/runtime/physics/Physics2DEvents';
+import { getContactState, updateContactIndex, _resetContactIndex } from '../../src/runtime/physics/physicsContactIndex';
+import { initRapier2D } from '../../src/runtime/physics/rapierLoader';
 import type { World } from 'koota';
 
 beforeAll(async () => { await initRapier2D(); });

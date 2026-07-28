@@ -11,13 +11,13 @@ import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js';
-import { getCurrentWorld, onWorldSwap } from '../../runtime/ecs/world';
-import { isSimRunning, onPlayStateChange, inPreviewSession } from '../../runtime/systems/playState';
-import { setSkeletalPreview } from '../../runtime/systems/skeletalPreview';
-import { clearSkeletalSeeks } from '../../runtime/systems/skeletalSeek';
-import { getAllTraits } from '../../runtime/ecs/traitRegistry';
-import { worldTransforms, deactivatedEntities } from '../../three/systems/transformPropagationSystem';
-import { findEntity, fireDirtyListeners, addDirtyListener, onStructureDirty, getAllEntities, subtreeIds } from '../../runtime/ecs/entityUtils';
+import { getCurrentWorld, onWorldSwap } from '../../runtime/core/ecs/world';
+import { isSimRunning, onPlayStateChange, inPreviewSession } from '../../runtime/core/playState';
+import { setSkeletalPreview } from '../../runtime/core/skeletalPreview';
+import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
+import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
+import { worldTransforms, deactivatedEntities } from '../../runtime/core/ecs/transformPropagationSystem';
+import { findEntity, fireDirtyListeners, addDirtyListener, onStructureDirty, getAllEntities, subtreeIds } from '../../runtime/core/ecs/entityUtils';
 import { markOverrideIfInstance } from '../undo/entityActions';
 import { Transform, EntityAttributes, Collider3D, clampAngle, Bone2D, Billboard3D, CameraFrame, Zone3D } from '../../runtime/traits';
 import { colliderWireframeGeometry, colliderOutlineSig3D, colliderWorldScale3D, type ColliderOutline3DParams } from '../../runtime/rendering/colliderOutline3D';
@@ -34,14 +34,14 @@ import {
   PRIORITY_EDITOR_3D, PRIORITY_EDITOR_2D,
 } from '../../runtime/rendering/frameDriver';
 import { createParticleSyncState, syncParticles, disposeParticleSyncState } from '../../runtime/rendering/particleSync';
-import { registerBoundsProvider, projectAABBToScreen, type EntityScreenBounds } from '../../runtime/rendering/screenBounds';
+import { registerBoundsProvider, projectAABBToScreen, type EntityScreenBounds } from '../../runtime/core/screenBounds';
 import { registerHandleProvider, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
 import { createFlameMeshSyncState, syncFlameMeshes, disposeFlameMeshSyncState } from '../../runtime/rendering/flameMeshSync';
 import { PARTICLE_LAYER } from '../../runtime/rendering/layers';
 import { getWorldTransform2D, getWorldTransform2DInto } from '../../runtime/rendering/renderUtils';
 import { setActiveRenderer } from '../../runtime/loaders/textureResolver';
 import { drawColliderOutline, drawSkinnedMeshFlat2D, drawSkinnedMeshWireframe2D, drawWeightHeatmap2D, drawDominantBoneMap2D, computePivotOffset, COLLIDER_SPRITE } from '../../runtime/rendering/render2DUtils';
-import { getSkin2DBuffer } from '../../runtime/systems/skin2DBuffers';
+import { getSkin2DBuffer } from '../../runtime/skinning/skin2DBuffers';
 import { getRig2D, type ParsedRig2D } from '../../runtime/loaders/rig2dCache';
 import { getGuidForPath } from '../../runtime/loaders/assetManifest';
 import { resolveMeshTemplate } from '../../runtime/loaders/meshTemplateCache';
@@ -72,11 +72,11 @@ import { notifyFieldEdited } from '../animation/recording';
 import {
   parseColliderPoints, serializeColliderPoints, moveVertex, insertVertex, removeVertex,
   nearestEdgeInsertion, minPointsForShape, type Pt,
-} from '../../runtime/scene/colliderPoints';
+} from '../../runtime/core/colliderPoints';
 import { colliderEditInfo, worldPointToLocal, localToWorld, pickVertex, colliderPickHalfExtents } from './colliderEdit2D';
 import { drawGizmo2D, hitTestGizmo2D, cursorForHandle, applyGizmoDrag2D, snapDragResult, DEFAULT_GIZMO_SNAP, worldToLocal2D, type GizmoHandle } from './Gizmo2D';
 import { layoutText } from '../../runtime/rendering/text/layoutText';
-import { getLoadedFont } from '../../runtime/rendering/text/fontAtlasLoader';
+import { getLoadedFont } from '../../runtime/loaders/fontAtlasLoader';
 import { onTextDirty } from '../../runtime/rendering/text/textDirty';
 
 /** The 2D gizmo box for a Text2D entity: the laid-out text block (px in Canvas2D

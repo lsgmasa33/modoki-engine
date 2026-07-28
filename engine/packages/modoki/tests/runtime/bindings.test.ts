@@ -3,14 +3,14 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createWorld } from 'koota';
-import { setCurrentWorld } from '../../src/runtime/ecs/world';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { UIElement } from '../../src/runtime/traits/UIElement';
-import { Transform } from '../../src/runtime/traits/Transform';
-import { registerTrait } from '../../src/runtime/ecs/traitRegistry';
+import { Transform } from '../../src/runtime/core/traits/Transform';
+import { registerTrait } from '../../src/runtime/core/ecs/traitRegistry';
 import { applyBindings, type UIActionBinding } from '../../src/runtime/ui/bindings';
-import { registerUIAction, unregisterUIAction } from '../../src/runtime/ui/actionRegistry';
-import { setPlayState } from '../../src/runtime/systems/playState';
+import { registerUIAction, unregisterUIAction } from '../../src/runtime/core/actionRegistry';
+import { setPlayState } from '../../src/runtime/core/playState';
 
 // applyBindings resolves components via the trait registry (like the runtime).
 registerTrait({ name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: {} });

@@ -22,7 +22,7 @@ const h = vi.hoisted(() => ({
   evalVisibility: vi.fn((_s: Record<string, unknown>, _f: string, _o: string, _v: string) => true),
 }));
 
-vi.mock('../../src/runtime/rendering/renderUtils', () => ({
+vi.mock('../../src/runtime/core/textureRefs', () => ({
   resolveDomImageUrl: (ref: string) => h.resolveDomImageUrl(ref),
   resolveSprite: (ref: string) => h.resolveSprite(ref),
 }));

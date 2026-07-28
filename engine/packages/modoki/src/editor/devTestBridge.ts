@@ -5,17 +5,17 @@
 
 import * as THREE from 'three';
 import { useEditorStore } from './store/editorStore';
-import { getAllEntities, readTraitData, deleteEntity } from '../runtime/ecs/entityUtils';
-import { getTraitByName } from '../runtime/ecs/traitRegistry';
+import { getAllEntities, readTraitData, deleteEntity } from '../runtime/core/ecs/entityUtils';
+import { getTraitByName } from '../runtime/core/ecs/traitRegistry';
 import { importModel } from './scene/modelImport';
 import { loadScene } from './scene/serialize';
-import { isSkeletalPreviewing } from '../runtime/systems/skeletalPreview';
-import { previewTimelineAt } from '../runtime/systems/timelineSystem';
-import { getCurrentWorld } from '../runtime/ecs/world';
-import { fireDirtyListeners } from '../runtime/ecs/entityUtils';
+import { isSkeletalPreviewing } from '../runtime/core/skeletalPreview';
+import { previewTimelineAt } from '../runtime/timeline/timelineSystem';
+import { getCurrentWorld } from '../runtime/core/ecs/world';
+import { fireDirtyListeners } from '../runtime/core/ecs/entityUtils';
 import { normalizeTimeline, type TimelineDef } from '../runtime/timeline/types';
 import { getEditorViewportCamera, isEcsObjectVisible } from './scene/sceneViewBus';
-import { worldTransforms } from '../three/systems/transformPropagationSystem';
+import { worldTransforms } from '../runtime/core/ecs/transformPropagationSystem';
 import { editorScene2DRenderer } from './rendering/editorScene2D';
 
 export interface EditorTestBridge {

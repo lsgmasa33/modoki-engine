@@ -15,7 +15,8 @@
  *  dependency on the journal being enabled. */
 
 import { getAudioContext, hasAudioSupport } from './audioContext';
-import { retryFailedAudioDecodes } from '../loaders/audioBufferCache';
+import { audioAssetProvider } from './audioAssetProvider';
+function retryFailedAudioDecodes() { audioAssetProvider.get()?.retryFailedAudioDecodes(); }
 
 export type BusName = 'master' | 'music' | 'sfx' | 'ui';
 

@@ -4,11 +4,13 @@
  *  the correct GLOBAL ticks and stay deterministic. All headless via the journal. */
 
 import { describe, it, expect, afterEach } from 'vitest';
+// Side-effect only: wires core provider slots (P7 C14) so the real timeline/prefab caches below resolve correctly.
+import '../../src/runtime/loaders/registerProviders';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
-import { SYSTEM_PRIORITY } from '../../src/runtime/systems/pipeline';
-import { EntityAttributes } from '../../src/runtime/traits/EntityAttributes';
+import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { Director } from '../../src/runtime/traits/Director';
-import { timelineSystem } from '../../src/runtime/systems/timelineSystem';
+import { timelineSystem } from '../../src/runtime/timeline/timelineSystem';
 import { setTimeline, clearTimelineCache } from '../../src/runtime/loaders/timelineCache';
 import { normalizeTimeline } from '../../src/runtime/timeline/types';
 

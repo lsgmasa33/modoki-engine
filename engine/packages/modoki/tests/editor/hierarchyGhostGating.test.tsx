@@ -24,16 +24,16 @@ const hooks = vi.hoisted(() => ({
   version: { v: 0 },
 }));
 
-vi.mock('../../src/runtime/ecs/world', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../src/runtime/ecs/world')>()),
+vi.mock('../../src/runtime/core/ecs/world', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/runtime/core/ecs/world')>()),
   onWorldSwap: (fn: () => void) => { hooks.worldSwap.push(fn); return () => {}; },
 }));
-vi.mock('../../src/runtime/ecs/traitRegistry', () => ({
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getAllTraits: () => [], getTraitByName: () => undefined, COMPONENT_CATEGORY_ORDER: [],
 }));
 
-vi.mock('../../src/runtime/ecs/entityUtils', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../src/runtime/ecs/entityUtils')>();
+vi.mock('../../src/runtime/core/ecs/entityUtils', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/runtime/core/ecs/entityUtils')>();
   return {
     ...actual, // buildEntityTree / subtreeIds stay real
     getAllEntities: () => ENTITIES,

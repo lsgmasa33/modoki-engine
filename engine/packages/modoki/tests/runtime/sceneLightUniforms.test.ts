@@ -16,7 +16,7 @@ const deactivatedEntities = new Set<number>();
 async function setup() {
   worldTransforms.clear();
   deactivatedEntities.clear();
-  vi.doMock('../../src/three/systems/transformPropagationSystem', () => ({
+  vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
     worldTransforms, deactivatedEntities,
   }));
   const { createWorld } = await import('koota');

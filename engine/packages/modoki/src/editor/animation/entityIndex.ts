@@ -9,7 +9,7 @@
  *  entity add/remove/reparent/rename). During a drag the hierarchy is stable,
  *  so the same index is reused every frame. */
 
-import { getAllEntities, getStructureVersion } from '../../runtime/ecs/entityUtils';
+import { getAllEntities, getStructureVersion } from '../../runtime/core/ecs/entityUtils';
 import type { AttrNode } from './recording';
 
 export interface AnimEntityIndex {
