@@ -94,11 +94,25 @@ function pushEntry(level: LogEntry['level'], message: string, src: StackSource) 
   notifyNewLog();
 }
 
+/** `String(err)` plus the `cause` chain (depth-capped). Exported for unit testing. */
+export function formatError(err: Error, depth = 0): string {
+  const head = `${err.name || 'Error'}: ${err.message}`;
+  const cause = (err as { cause?: unknown }).cause;
+  if (depth >= 4 || !(cause instanceof Error)) return head;
+  return `${head}\n  caused by: ${formatError(cause, depth + 1)}`;
+}
+
 function stringifyArgs(args: unknown[]): string {
   const parts: string[] = [];
   for (const a of args) {
     if (typeof a === 'string') parts.push(a);
     else if (a == null) parts.push(String(a));
+    // An Error has no enumerable own properties, so JSON.stringify(err) === '{}'.
+    // That is how "[Editor] scene load failed: {}" reached the Console panel and the
+    // agent log bridge with the ACTUAL cause (a rendererReady timeout) erased — the
+    // single most expensive silent failure in the editor's history. Format errors
+    // explicitly, including the `cause` chain, so the reason always survives.
+    else if (a instanceof Error) parts.push(formatError(a));
     else {
       try { parts.push(JSON.stringify(a, null, 2)); }
       catch { parts.push('[Circular]'); }

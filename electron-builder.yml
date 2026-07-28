@@ -88,6 +88,16 @@ files:
   # fresh there on first launch. (MODOKI_VITE_CACHEDIR in vite.config + main.ts.)
   - "!engine/.vite/**"
   - "!engine/**/.vite/**"
+  # Test suites (~5.9MB) — nothing at runtime imports them (verified: no import of
+  # engine/tests from app/, electron/, plugins/, or the runtime package; vite.config's
+  # `setupFiles` sits in the vitest-only `test:` block, which Vite never resolves).
+  # Shipping them isn't just dead weight — it's a live footgun: `release/` then holds a
+  # full stale COPY of the suite, and while vite.config correctly excludes `**/release/**`,
+  # any vitest run that passes an explicit path or a bare `-t` filter re-includes it and
+  # runs build-time-stale tests against current source. That produced phantom failures
+  # (a stale agentConfigSync snapshot "failing", stale vendorPlugins copies) more than once.
+  - "!engine/tests/**"
+  - "!engine/packages/*/tests/**"
   # ⚠️ This exclude set is unverified against a real packaged Vite run — if a
   #    renderer/game import 404s in the .dmg, the culprit is almost certainly an
   #    over-broad exclude here.

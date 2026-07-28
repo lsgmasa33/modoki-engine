@@ -324,7 +324,12 @@ function nameFromFile(filename: string): string {
 
 /** Detect type from file extension + directory convention */
 export function detectType(relPath: string, ext: string): string | null {
-  if (relPath.endsWith('.meta.json')) return null;
+  // Both sidecar forms are METADATA about an asset, never assets themselves. The
+  // `.meta.local.json` half (gitignored machine-local byte-stats — see meta-sidecar.ts)
+  // must be listed explicitly: it does NOT end with `.meta.json`, so it used to fall
+  // through to the `.json` catch-all below and get classified as a SCENE, which minted a
+  // GUID into it and registered it in the manifest as a scene.
+  if (relPath.endsWith('.meta.json') || relPath.endsWith('.meta.local.json')) return null;
   // Committed UltraHDR variant (`<src>.hdr~ultrahdr.jpg`) — a DERIVED file next to its
   // source HDR, NOT a standalone texture asset. Exclude it from the scan (else it'd be
   // classified `.jpg` → texture and get its own meta/manifest entry).

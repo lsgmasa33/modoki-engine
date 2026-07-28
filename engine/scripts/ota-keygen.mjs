@@ -67,5 +67,14 @@ if (process.platform === 'win32') {
 // Reported AFTER the ACL step, not before it: on Windows a failed ACL deletes the key, so
 // announcing the write first would claim a file that no longer exists.
 console.log(`[ota-keygen] Wrote ${path.relative(repoRoot, keyPath)} (private — do not commit, do not share).`);
+// The 0o600 above is a POSIX no-op on Windows (Node's `mode` can only toggle read-only
+// there), so the key lands readable by every local account. Say so rather than implying
+// a protection that isn't there; restricting it needs an ACL, e.g.
+//   icacls "<file>" /inheritance:r /grant:r "%USERNAME%:R"
+if (process.platform === 'win32') {
+  console.warn('[ota-keygen] WARNING (Windows): file permissions were NOT restricted — POSIX mode 0600 is');
+  console.warn('[ota-keygen] not enforceable here, so this key is readable by other local accounts.');
+  console.warn(`[ota-keygen] To lock it down: icacls "${keyPath}" /inheritance:r /grant:r "%USERNAME%:R"`);
+}
 console.log('[ota-keygen] Public key (bake this into the app / native trust store):');
 console.log(`  ${publicKey}`);

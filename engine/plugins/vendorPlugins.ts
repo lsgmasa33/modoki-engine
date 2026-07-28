@@ -28,6 +28,14 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { npmSpawnSpec } from '../toolchain';
 
+export interface VendorOptions {
+  /** May this process BUILD a plugin whose dist/ is missing or stale? True in a
+   *  developer checkout (the default). The PACKAGED editor must pass false: it ships
+   *  each plugin's src/ and dist/ but none of the devDependencies a build needs, so
+   *  attempting one blocks the main thread and then fails. See ensurePluginBuilt. */
+  canBuild?: boolean;
+}
+
 export interface VendorResult {
   /** True if any tarball was (re)generated or any dependency spec was rewritten. */
   changed: boolean;
@@ -365,19 +373,67 @@ function writeBuildStamp(pluginDir: string, stamp: string): void {
  *  didn't match its own sources — and because the content hash was computed FROM
  *  that stale dist, the name matched the committed tarball, so vendoring was a
  *  permanent no-op that never healed. */
-function ensurePluginBuilt(plugin: EnginePlugin): void {
+function ensurePluginBuilt(plugin: EnginePlugin, canBuild: boolean): void {
   const srcHash = pluginSourceHash(plugin.dir);
   const distExists = fs.existsSync(path.join(plugin.dir, 'dist'));
   // No sources (packaged editor) ⇒ the shipped dist is authoritative.
   if (srcHash === null && distExists) return;
+  // A PACKAGED editor must never try to build: it ships src/ AND dist/ but none of the
+  // plugin's devDependencies (rollup/tsc), so `npm run build` blocks the main thread for
+  // seconds and then fails. The `srcHash === null` check above was meant to cover this,
+  // but the packaged app DOES ship src/, so it doesn't. Nor can this be sniffed from disk
+  // — under npm workspaces a legitimate dev checkout also has no per-package node_modules
+  // (deps hoist to the root), so absence of it does NOT imply "packaged". The caller knows
+  // (app.isPackaged); it must say so. The shipped dist IS that build's output — trust it.
+  //
+  // Without this, only a Program Files install is safe, and then only by accident (it's
+  // unwritable, so the lock below fails and we bail). electron-builder's NSIS default is
+  // perMachine:false → a PER-USER install under %LOCALAPPDATA%\Programs, which IS
+  // writable and would take the doomed build path.
+  if (!canBuild && distExists) return;
   if (distExists && srcHash !== null && readBuildStamp(plugin.dir) === srcHash) return;
+  if (!canBuild) {
+    throw new Error(`[vendor] cannot build ${plugin.name}: this editor ships no toolchain and the plugin ships no dist/`);
+  }
   // Cross-process lock (atomic mkdir): if two editors / worktrees open projects at
   // once and both find dist missing, only ONE builds — the other waits for dist to
   // appear rather than racing writes into the same dir (a half-built dist would get
   // packed). (D7)
   const lock = path.join(plugin.dir, '.modoki-building');
   let held = false;
-  try { fs.mkdirSync(lock); held = true; } catch { /* another process is building */ }
+  let lockErr: NodeJS.ErrnoException | null = null;
+  try { fs.mkdirSync(lock); held = true; } catch (e) { lockErr = e as NodeJS.ErrnoException; }
+  // ONLY EEXIST means "another process is building" — the case the wait below exists for.
+  // Any other failure (EPERM/EACCES/EROFS) means this plugin dir is NOT WRITABLE, so no
+  // build can ever happen here and no other process can be building either: waiting is
+  // guaranteed to burn the full deadline and then throw. That is exactly what happened in
+  // the packaged Windows editor, installed under Program Files: it ships src/ (so srcHash
+  // is non-null and the "no sources" early-return above is skipped) but NOT the stamp
+  // (which lives under node_modules, unpackaged), so it reached this lock, mkdir failed
+  // EPERM, and the loop below sync-slept `Atomics.wait` for 120s ON ELECTRON'S MAIN THREAD
+  // — freezing the whole app (HTTP backend + CDP dead, window "not responding") on every
+  // open of a project that depends on an engine plugin. Trust the shipped dist instead.
+  if (!held && lockErr && lockErr.code !== 'EEXIST') {
+    if (distExists) {
+      // Reaching here means the stamp said this dist is STALE (a current one returns
+      // above), so we're knowingly proceeding with out-of-date plugin output. In a
+      // packaged editor that's correct and silent — canBuild:false already returned
+      // long before this. But canBuild is TRUE here, i.e. a developer checkout whose
+      // plugin dir happens to be unwritable, and silently shipping a stale dist is
+      // exactly the failure this function's header calls out: "a permanent no-op that
+      // never healed", which silently packed a tarball not matching its own sources.
+      // Not fatal (far better than the 120s hang this replaced) — but it must be VISIBLE.
+      console.warn(
+        `[vendor] ${plugin.name}: dist/ is STALE and ${plugin.dir} is not writable (${lockErr.code}) — ` +
+          `using the existing dist as-is. Fix the directory permissions, or rebuild it with ` +
+          `\`npm run build --workspace ${plugin.dir}\`.`,
+      );
+      return;
+    }
+    throw new Error(
+      `[vendor] cannot build ${plugin.name}: ${plugin.dir} is not writable (${lockErr.code}) and ships no dist/`,
+    );
+  }
   if (!held) {
     // Steal a STALE lock (a crashed build that never released it) so vendoring
     // doesn't wedge forever; a live build refreshes faster than this threshold.
@@ -422,8 +478,8 @@ function ensurePluginBuilt(plugin: EnginePlugin): void {
 /** Pack `plugin` into `<projectRoot>/plugins/<name>-<ver>-<hash>.tgz` (real copy),
  *  drop stale tarballs for the same plugin (older content hashes), and return the
  *  tarball's project-relative path. */
-function packInto(plugin: EnginePlugin, projectRoot: string, hash: string): string {
-  ensurePluginBuilt(plugin);
+function packInto(plugin: EnginePlugin, projectRoot: string, hash: string, canBuild: boolean): string {
+  ensurePluginBuilt(plugin, canBuild);
   const pluginsDir = path.join(projectRoot, 'plugins');
   fs.mkdirSync(pluginsDir, { recursive: true });
   const destName = tarballName(plugin.name, plugin.version, hash);
@@ -459,7 +515,15 @@ function packInto(plugin: EnginePlugin, projectRoot: string, hash: string): stri
  *       off any old `file:../../engine/...` directory-symlink spec).
  *  Idempotent: a no-op once the tarball is current and the spec already matches.
  *  Returns {changed} so the caller can decide whether to reinstall. */
-export function vendorEnginePlugins(projectRoot: string, engineRoot: string): VendorResult {
+export function vendorEnginePlugins(
+  projectRoot: string,
+  engineRoot: string,
+  opts: VendorOptions = {},
+): VendorResult {
+  // Default TRUE: every other caller (Vite plugins, the scaffolder, tests) runs from a
+  // developer checkout where building is both possible and wanted. Only the packaged
+  // editor opts out — see ensurePluginBuilt.
+  const canBuild = opts.canBuild ?? true;
   const empty: VendorResult = { changed: false, needsInstall: false, vendored: [], expectedVendor: {} };
   const pkgPath = path.join(projectRoot, 'package.json');
   if (!fs.existsSync(pkgPath)) return empty;
@@ -489,7 +553,7 @@ export function vendorEnginePlugins(projectRoot: string, engineRoot: string): Ve
     // nothing re-packs and ensurePluginBuilt (called only from packInto, below)
     // is never even reached. That made a stale clone a permanent no-op that
     // silently shipped a tarball not matching its own sources.
-    ensurePluginBuilt(plugin);
+    ensurePluginBuilt(plugin, canBuild);
     const hash = pluginContentHash(plugin.dir);
     const relTgz = `plugins/${tarballName(plugin.name, plugin.version, hash)}`;
     const absTgz = path.join(projectRoot, relTgz);
@@ -500,7 +564,7 @@ export function vendorEnginePlugins(projectRoot: string, engineRoot: string): Ve
     // keeps `npm ci` integrity stable. Only a real content change (new hash →
     // absent file) triggers a fresh pack.
     if (!fs.existsSync(absTgz)) {
-      packInto(plugin, projectRoot, hash);
+      packInto(plugin, projectRoot, hash, canBuild);
       changed = true;
       vendored.push(plugin.name);
     }

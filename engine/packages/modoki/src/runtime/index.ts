@@ -207,9 +207,10 @@ export type { DebugTabDef, DebugCommandDef } from './debug/debugMenuRegistry';
 export {
   registerFrameCallback, unregisterFrameCallback,
   startFrameDriver, stopFrameDriver, stepOneFrame,
-  setTargetFPS, targetFPS, getCurrentFPS,
+  setTargetFPS, targetFPS, getCurrentFPS, getFrameLoopHealth,
   PRIORITY_ECS, PRIORITY_RENDER_3D, PRIORITY_RENDER_2D,
 } from './rendering/frameDriver';
+export type { FrameLoopHealth } from './rendering/frameDriver';
 
 // ── Render settings (project-configured renderer knobs) ──
 export {

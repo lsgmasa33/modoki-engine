@@ -26,6 +26,7 @@ import { registerLastAnimationClipPersistence, restoreLastAnimationClip } from '
 import { registerLastSkinRigPersistence, restoreLastSkinRig } from './panels/lastSkinRig';
 import { registerBuiltinCreatableAssets } from './panels/builtinCreatableAssets';
 import { ensureManifestLoaded, loadManifestJson, getGuidForPath, resolveGuidToPath, isGuid } from '../runtime/loaders/assetManifest';
+import { backendFetch } from './backend/editorBackend';
 import { rendererReady } from '../runtime/loaders/textureResolver';
 import { installConsoleCapture } from './consoleCapture';
 import { useEditorStore } from './store/editorStore';
@@ -80,12 +81,28 @@ export function resolveSceneCandidates(lastScene: string | null | undefined, con
 // project in a multi-project repo). Rewriting any of the latter two to `/assets/…` would
 // silently point at a same-named file under the open project — a wrong-file load, which
 // is worse than the boot failure this rewrite exists to prevent. So the rewrite must be
-// CONFIRMED against the manifest before it is used (see canonicalBootScenePath).
-const FS_RUNTIME_ASSETS_RE = /^\/@fs\/.*\/runtime\/assets\/(.+)$/;
+// CONFIRMED — by origin when we have the open project's root, else by manifest name match
+// (see canonicalBootScenePath) — before it is used.
+const FS_RUNTIME_ASSETS_RE = /^\/@fs\/(.*)\/runtime\/assets\/(.+)$/;
+
+/** Normalize a filesystem path for a Windows-safe prefix comparison: forward slashes,
+ *  lowercase (Windows paths are case-insensitive), no trailing separator. */
+function normalizeFsPath(p: string): string {
+  const s = p.replace(/\\/g, '/').toLowerCase();
+  return s.length > 1 && s.endsWith('/') ? s.slice(0, -1) : s;
+}
+
+/** Segment-aware: is `child` the same path as, or inside, `parent`? Avoids a bare
+ *  `startsWith` false-positive on a prefix-sharing sibling (`sling` vs `sling-evil`). */
+function isWithinPath(child: string, parent: string): boolean {
+  const c = normalizeFsPath(child), p = normalizeFsPath(parent);
+  return c === p || c.startsWith(`${p}/`);
+}
 
 export async function canonicalBootScenePath(
   scenePath: string,
   doFetch: typeof fetch = fetch,
+  projectRoot?: string,
 ): Promise<string> {
   // Already a registered manifest path (the working-copy canonical) → nothing to do.
   if (getGuidForPath(scenePath)) return scenePath;
@@ -95,21 +112,25 @@ export async function canonicalBootScenePath(
   // root-relative `sirv`, so a project on a DIFFERENT DRIVE than the running Vite
   // process's cwd 404s internally and silently falls through to the SPA `index.html`
   // (a 200 OK `<!doctype …>` body) — which is why fetching it can't be trusted at all.
-  //
-  // Only accept the rewrite when the manifest actually registers it: an unregistered
-  // rewrite is discarded and we fall through, so the worst case stays the pre-existing
-  // boot failure rather than becoming a silent wrong-file load.
-  //
-  // KNOWN LIMITATION: this disambiguates by NAME, not by origin. A foreign-root candidate
-  // (engine built-in, or another project) whose tail happens to match a registered file of
-  // the open project would still be accepted as that file. Closing it properly needs the
-  // open project's ROOT here so the `/@fs/<abs>` prefix can be compared directly; the
-  // editor doesn't currently plumb it this far. Reachability is low — boot candidates come
-  // from the project's own config or its project-SCOPED `lastScene` key — so this is left
-  // as a documented gap rather than speculative plumbing.
   const fsMatch = scenePath.match(FS_RUNTIME_ASSETS_RE);
   if (fsMatch) {
-    const openProjectPath = `/assets/${fsMatch[1]}`;
+    const [, absPrefix, rest] = fsMatch;
+    const openProjectPath = `/assets/${rest}`;
+    // Prefer disambiguating by ORIGIN — does the `/@fs/<abs>` prefix actually sit inside the
+    // open project's root? This is strictly safer than the manifest check below (it can't be
+    // fooled by a same-named file in a sibling project or the engine's built-ins) and doesn't
+    // depend on the manifest having caught up yet, which the manifest-only check below could
+    // race on a cold boot. `projectRoot` is optional (backward-compatible: a caller that can't
+    // supply it — e.g. no `/api/identity` reachable yet — falls through to the manifest check).
+    if (projectRoot) {
+      return isWithinPath(absPrefix, projectRoot) ? openProjectPath : scenePath;
+    }
+    // No project root available: fall back to the OLD name-based check. Only accept the
+    // rewrite when the manifest actually registers it; an unregistered rewrite is discarded
+    // and we fall through, so the worst case stays the pre-existing boot failure rather than
+    // becoming a silent wrong-file load. KNOWN LIMITATION (when projectRoot is absent): this
+    // disambiguates by NAME, not origin — a foreign-root candidate whose tail happens to match
+    // a registered file of the open project would still be accepted as that file.
     if (getGuidForPath(openProjectPath)) return openProjectPath;
   }
   try {
@@ -390,6 +411,18 @@ export function createEditor(options: EditorOptions): React.ComponentType {
     // editor has no game-shell boot, so this is the only place it gets loaded.
     await ensureManifestLoaded(options.config.assetManifest || '/assets.manifest.json');
 
+    // The open project's absolute root, so canonicalBootScenePath can disambiguate a
+    // `/@fs/<abs>/runtime/assets/...` boot candidate by ORIGIN (is <abs> actually inside
+    // this project?) instead of by manifest name-match alone — closes the "KNOWN
+    // LIMITATION" gap that let a same-named sibling-project/engine-builtin file be
+    // silently accepted. Best-effort: `/api/identity` is the main-process backend's own
+    // route (always reachable under Electron), but a failure here just falls back to the
+    // old name-based check in canonicalBootScenePath, never blocks boot.
+    const projectRoot = await backendFetch('/api/identity')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { projectRoot?: string } | null) => data?.projectRoot)
+      .catch(() => undefined);
+
     // Re-open the .rig2d the user was last editing in the Skin panel. A rig is a
     // scene-independent asset (loaded by path, sprites resolved via the manifest), so
     // restore it here — right after the manifest, before the scene — not gated on which
@@ -418,7 +451,7 @@ export function createEditor(options: EditorOptions): React.ComponentType {
     // the project's game id so its game-scoped managers activate (the canonical
     // path carries no `/games/<id>/` segment to derive it from).
     const loadedPath = await loadFirstScene(candidates, {
-      canonicalize: canonicalBootScenePath,
+      canonicalize: (p) => canonicalBootScenePath(p, fetch, projectRoot),
       load: (p) => loadScene(p, options.gameId),
     });
     if (loadedPath) {

@@ -83,6 +83,7 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 
 | Doc | What it is |
 |---|---|
+| [court-prototype-plan.md](./plans/court-prototype-plan.md) | New deduction-puzzle prototype (`games/court`) — chess pieces one-per-region, non-attacking, guarding the whole board while sparing "civilian" cells. Phased build with per-phase model routing; civilians are *derived* from the placement, which makes level generation nearly free |
 | [api-reference-usability-plan.md](./plans/api-reference-usability-plan.md) | Make the generated TypeDoc API reference usable — kind-subgrouped sidebar, manager interfaces documenting their methods, and an editorial "Essential" whitelist that ranks the 877-symbol surface without hiding any of it |
 | [editor-shipping-plan.md](./plans/editor-shipping-plan.md) | Ship the editor as a consumer DMG/Windows installer — keep bundled Vite, end users build iOS+Android via a Unity-Hub-style Build Support dialog, dev/prod toolchain parity, phased roadmap (5 demos published, Windows NSIS installer built + tested; native-prebuild audit + code signing still open) |
 | [engine-oss-publishing.md](./engine-oss-publishing.md) | Reference (graduated, private) — how the engine is published as the Apache-2.0 `modoki-engine` public mirror: curated one-way snapshots, the blocking secret/brand safety scan, Harmony CLA, signed mac/Windows release CI. Cited by `publish-engine-oss.sh`, `scan-publish-safety.mjs`, `vite.config.ts` |

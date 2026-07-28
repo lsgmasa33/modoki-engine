@@ -19,6 +19,7 @@ import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo'
 import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor } from '../debug/agentBridge';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
+import { getGameBootFaults } from './gameBootFaults';
 import { handleEval } from '../debug/bridgeHelpers';
 import {
   useEditorStore, type SelectedAsset,
@@ -40,7 +41,7 @@ import {
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
-  getPlayState, setPlayState, getRunMode, isAdvancing, getCurrentFPS, stepOneFrame, getAllEntities, findEntity, findEntityByGuid, deleteEntity,
+  getPlayState, setPlayState, getRunMode, isAdvancing, getCurrentFPS, getFrameLoopHealth, stepOneFrame, getAllEntities, findEntity, findEntityByGuid, deleteEntity,
   getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents,
   getTimeline, normalizeTimeline, getGuidForPath, getAssetType, getPresentationScale,
   getAllTraits, type MutateOp, type MutateEntityRef,
@@ -69,6 +70,16 @@ function hmrFields(): { hmrUpdates?: number; staleGameCode?: true; discardedUnsa
   // reading state later still needs to know work was dropped under it.
   if (h.discardedUnsavedEdits) out.discardedUnsavedEdits = true;
   return out;
+}
+
+/** Frame-loop liveness, included only when it is NOT plainly healthy — a running loop is
+ *  the norm and needs no words. `hidden` is reported too: it is benign (the OS window is
+ *  occluded/minimised, so the browser throttles rAF) but it explains an `fps: 0` reading
+ *  and a failing `capture_viewport`, which otherwise look identical to a real wedge. */
+function frameLoopFields(): { frameLoop?: ReturnType<typeof getFrameLoopHealth> } {
+  const h = getFrameLoopHealth();
+  if (h.status === 'running' && h.recovered === 0) return {};
+  return { frameLoop: h };
 }
 
 /** The whole editor UI state in one read — the "get all UI state" payload. */
@@ -104,6 +115,18 @@ function readEditorState() {
     ...hmrFields(),
     colliderEditMode: s.colliderEditMode,
     fps: Math.round(getCurrentFPS()),
+    // Liveness, NOT run mode. `playState`/`runMode`/`advancing` above only say what the
+    // editor INTENDS to do; they read "playing"/true even when the rAF chain is dead and
+    // nothing has ticked for minutes. `frameLoop.status` is the only field here that
+    // answers "are frames actually being pumped right now?" — omitted while healthy so
+    // the common payload stays small, present (with a `detail` string) the moment it is
+    // not, because a wedge that an agent has to INFER from `fps: 0` is what made this
+    // failure cost four debugging sessions.
+    ...(frameLoopFields()),
+    // Game code that threw while the editor booted. The project is loaded DEGRADED — its
+    // systems/traits are partly unregistered — so anything measured here may be wrong for
+    // reasons that have nothing to do with the scene. Omitted when the project booted clean.
+    ...(getGameBootFaults().length ? { gameBootFaults: getGameBootFaults() } : {}),
     entityCount: getAllEntities().length,
     selection: {
       entityId: s.selectedEntityId,

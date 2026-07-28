@@ -57,6 +57,18 @@ describe('detectType', () => {
   it('classifies a .hdr as an environment asset', () => {
     expect(detectType('/games/x/assets/env/studio.hdr', '.hdr')).toBe('environment');
   });
+  /** Regression: `.meta.local.json` (the gitignored machine-local byte-stats half of the
+   *  sidecar split — see meta-sidecar.ts) does NOT end with `.meta.json`, so it fell
+   *  through to the 'scene' catch-all above. The scanner then minted a GUID INTO those
+   *  gitignored files and registered them in the manifest as scenes — observed live:
+   *    [asset-scanner] minted missing GUID for /demos/postfx-demo/…/…png.meta.local.json
+   *  Both sidecar forms are metadata about an asset, never assets. */
+  it('EXCLUDES both sidecar forms — .meta.json AND .meta.local.json', () => {
+    expect(detectType('/games/x/assets/textures/sand.png.meta.json', '.json')).toBeNull();
+    expect(detectType('/games/x/assets/textures/sand.png.meta.local.json', '.json')).toBeNull();
+    // A model sidecar too — the catch-all was extension-driven, not type-driven.
+    expect(detectType('/games/x/assets/models/water.glb.meta.local.json', '.json')).toBeNull();
+  });
   it('EXCLUDES a committed ~ultrahdr.jpg variant (a derived file, not a texture)', () => {
     expect(detectType('/games/x/assets/env/studio.hdr~ultrahdr.jpg', '.jpg')).toBeNull();
     // …but a normal .jpg is still a texture.

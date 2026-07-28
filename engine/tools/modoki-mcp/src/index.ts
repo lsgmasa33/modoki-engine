@@ -468,9 +468,11 @@ server.tool(
     '(read it with your file tool). Use AFTER verifying data with get_scene_state, to ' +
     'catch the "numbers right, renders black/NaN" class of bug. A single screenshot ' +
     'shows STATIC correctness only — never judge motion/timing from one frame. The result ' +
-    'also reports `cssWidth`/`cssHeight` (the window size tap/drag coordinates live in) and ' +
-    '`scale` = width/cssWidth: image px ÷ scale = CSS px. Do NOT eyeball tap coordinates off ' +
-    'the image — prefer a `selector` (modoki_tap) or entity bounds (get_scene_state). ' +
+    'also reports `cssWidth`/`cssHeight` (DIP window size) and `scale` = width/cssWidth: ' +
+    'image px ÷ scale = DIP px. `zoomFactor` is the live Chromium page-zoom factor — DIP px ÷ ' +
+    'zoomFactor = the zoomed-CSS space tap/drag\'s `{x,y}` aim mode actually uses, so an ' +
+    'eyeballed coordinate must divide by it when UI zoom ≠ 100%. Prefer a `selector` ' +
+    '(modoki_tap) or entity bounds (get_scene_state) over eyeballing at all. ' +
     'Requires the Electron editor (MODOKI_BACKEND must point at it, not the Vite dev server).',
   {
     maxSide: z.number().optional().describe('Longest-side cap in px (default 1568).'),

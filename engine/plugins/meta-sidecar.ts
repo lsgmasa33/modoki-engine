@@ -88,6 +88,9 @@ export function writeMetaSidecar(absPath: string, meta: Record<string, unknown>)
 
 function writeJsonAtomic(final: string, obj: unknown): void {
   const tmp = final + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+  // Trailing newline: these sidecars are COMMITTED, and without it every rewrite shows
+  // up as "\ No newline at end of file" in the diff. The tree was split 65/198 on this,
+  // so sidecars churned purely on formatting depending on which tool wrote them last.
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n');
   fs.renameSync(tmp, final);
 }

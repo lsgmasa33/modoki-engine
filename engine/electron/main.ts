@@ -293,7 +293,9 @@ async function ensureProjectDeps(projectRoot: string): Promise<void> {
   let needsInstall = !fs.existsSync(path.join(projectRoot, 'node_modules'));
   let vendorResult: VendorResult | null = null;
   try {
-    vendorResult = vendorEnginePlugins(projectRoot, REPO_ROOT);
+    // canBuild:false when packaged — the app bundle ships each plugin's src/ + dist/ but
+    // none of its devDependencies, so a build attempt here can only block then fail.
+    vendorResult = vendorEnginePlugins(projectRoot, REPO_ROOT, { canBuild: !app.isPackaged });
     if (vendorResult.vendored.length) console.log(`[modoki-electron] vendored engine plugin(s): ${vendorResult.vendored.join(', ')}`);
     needsInstall = needsInstall || vendorResult.needsInstall;
   } catch (e) {

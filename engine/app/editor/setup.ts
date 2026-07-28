@@ -17,6 +17,7 @@ import { loadProjectGames } from '../projectGames';
 import { registerAll } from '../ecs/register';
 import { DefaultGameUILayer } from '../ui/DefaultGameUILayer';
 import { registerEditorAgentOps } from './agentEditorOps';
+import { addGameBootFault, describeGameBootFaults } from './gameBootFaults';
 
 // Wrap modoki GameView with game-specific UI layer
 function GameViewWithUI() {
@@ -25,6 +26,25 @@ function GameViewWithUI() {
 
 /** Minimal config for an empty project (no games) so the editor still mounts. */
 const EMPTY_CONFIG: GameConfig = { name: 'Empty Project', sceneSetup: () => {}, initWorld: () => {} };
+
+/** Run one game-provided boot hook, converting a throw into a recorded fault instead of
+ *  letting it reject `createGameEditor()` and take the whole editor down with it.
+ *  See `./gameBootFaults` for the full rationale. */
+async function runGameHook(gameId: string, phase: string, hook?: () => unknown): Promise<void> {
+  if (!hook) return;
+  try {
+    await hook();
+  } catch (err) {
+    const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    addGameBootFault({ gameId, phase, message });
+    console.error(
+      `[editor] game "${gameId}" ${phase}() FAILED — the editor is booting anyway, with this ` +
+      `game's registrations INCOMPLETE. Scene entities that rely on its systems/traits will ` +
+      `not behave correctly until the error below is fixed and the editor reloads.`,
+      err,
+    );
+  }
+}
 
 /** Trigger a build + deploy via the dev server's SSE endpoint */
 async function runBuild(platform: 'ios' | 'android' | 'web' | 'playable') {
@@ -122,7 +142,11 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
   let defaultConfig: GameConfig | undefined;
   let chosenGameId: string | undefined;
   for (const g of ALL_GAMES) {
-    const cfg = await g.loadConfig().catch(() => undefined);
+    // A failed config used to vanish into `.catch(() => undefined)` and silently degrade the
+    // project to EMPTY_CONFIG — the editor would open on the WRONG config with no hint why.
+    // Record it like every other game-code fault.
+    let cfg: GameConfig | undefined;
+    await runGameHook(g.id, 'loadConfig', async () => { cfg = await g.loadConfig(); });
     if (cfg && !defaultConfig) {
       defaultConfig = cfg;
       chosenGameId = g.id;
@@ -139,15 +163,16 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
   //    editorPanels() loader keeps its (editor-only) module off the game bundle.
   const gamePanels: EditorPanelDef[] = [];
   for (const g of ALL_GAMES) {
-    await g.registerPostprocessors?.();
-    await g.registerSystems?.();
-    await g.registerEditorBindings?.();
+    // Each hook is independently guarded: one broken module must not prevent the REST of the
+    // project (or the editor itself) from registering. `editorPanels` was already guarded —
+    // its three siblings were not, and that asymmetry was the whole bug.
+    await runGameHook(g.id, 'registerPostprocessors', () => g.registerPostprocessors?.());
+    await runGameHook(g.id, 'registerSystems', () => g.registerSystems?.());
+    await runGameHook(g.id, 'registerEditorBindings', () => g.registerEditorBindings?.());
     if (g.editorPanels) {
-      try {
-        gamePanels.push(...(await g.editorPanels()));
-      } catch (err) {
-        console.error(`[editor] game "${g.id}" editorPanels() failed:`, err);
-      }
+      await runGameHook(g.id, 'editorPanels', async () => {
+        gamePanels.push(...(await g.editorPanels!()));
+      });
     }
   }
 
@@ -465,5 +490,28 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
     },
   });
 
-  return { default: Editor };
+  // The editor booted, but this project's game code did not. Say so ON SCREEN — a console
+  // line is not enough when the consequence (systems missing, entities inert) looks exactly
+  // like a scene-authoring mistake. The banner sits above the editor rather than replacing
+  // it, because the editor is still fully usable and is where the fix gets made.
+  const bootFaultSummary = describeGameBootFaults();
+  if (!bootFaultSummary) return { default: Editor };
+  console.error(`[editor] project booted DEGRADED — ${bootFaultSummary}`);
+  const Degraded: React.ComponentType = () => createElement(
+    'div',
+    { style: { display: 'flex', flexDirection: 'column', height: '100vh' } },
+    createElement(
+      'div',
+      {
+        'data-game-boot-fault': '',
+        style: {
+          background: '#7f1d1d', color: '#fee2e2', padding: '8px 14px', fontSize: 13,
+          fontFamily: 'system-ui, sans-serif', borderBottom: '1px solid #ef4444', flex: '0 0 auto',
+        },
+      },
+      `Game code failed to load — this project is running DEGRADED (its systems are not registered). ${bootFaultSummary}`,
+    ),
+    createElement('div', { style: { flex: '1 1 auto', minHeight: 0 } }, createElement(Editor)),
+  );
+  return { default: Degraded };
 }

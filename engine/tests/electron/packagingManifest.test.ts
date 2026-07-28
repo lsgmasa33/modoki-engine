@@ -3,6 +3,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import yaml from 'js-yaml';
+import picomatch from 'picomatch';
 
 /**
  * PACKAGING GUARD — electron-builder.yml packaging contract.
@@ -65,6 +66,51 @@ describe('electron-builder packaging manifest', () => {
       extra.some((e) => e && e.from === 'build/bin' && e.to === 'bin'),
       `electron-builder.yml must ship build/bin → bin (extraResources); got ${JSON.stringify(extra)}`,
     ).toBe(true);
+  });
+
+  it('excludes the test suites (dead weight + a stale-copy footgun in release/)', () => {
+    // `engine/**/*` swept up 201 test files (~5.9MB) into every install. Worse, `release/`
+    // then held a build-time COPY of the suite: vite.config excludes `**/release/**`, but a
+    // vitest run given an explicit path or a bare `-t` filter treats it as a filter that
+    // RE-INCLUDES excluded files, so build-time-stale tests ran against current source and
+    // produced phantom failures. Nothing imports tests at runtime, so they must stay out.
+    const files = cfg.files ?? [];
+    for (const needle of ['!engine/tests/**', '!engine/packages/*/tests/**']) {
+      expect(files, `electron-builder.yml must exclude ${needle}`).toContain(needle);
+    }
+  });
+
+  it('the test exclude does NOT over-reach into shipped engine code', () => {
+    // The counterweight to the test above: `!engine/tests/**` must not become something
+    // like `!engine/**/test*/**`, which would also drop engine/templates (New Project) or
+    // engine/tools. This exclude list is documented as unverified against a real packaged
+    // Vite run — an over-broad entry surfaces as a runtime 404, never a build error.
+    //
+    // Matched with a REAL glob engine against representative file paths, not a prefix
+    // heuristic: a naive "does this dir start with the glob's literal prefix" test reports
+    // `!engine/packages/*/tests/**` as dropping `engine/packages/modoki/src/**`, which it
+    // plainly does not (that was this test's own first draft, and it failed on it).
+    const excludes = (cfg.files ?? []).filter((f) => f.startsWith('!')).map((f) => f.slice(1));
+    const mustShip = [
+      'engine/app/main.tsx',
+      'engine/plugins/vite-asset-scanner.ts',
+      'engine/electron/main.ts',
+      'engine/templates/starter/CLAUDE.md',
+      'engine/tools/modoki-mcp/src/index.ts',
+      'engine/packages/modoki/src/editor/createEditor.tsx',
+      'engine/packages/modoki/src/runtime/core/clock.ts',
+    ];
+    for (const file of mustShip) {
+      const hit = excludes.filter((glob) => picomatch.isMatch(file, glob));
+      expect(hit, `exclude(s) dropping runtime-shipped ${file}: ${hit.join(', ')}`).toHaveLength(0);
+    }
+    // …and the excludes we DO want must actually match what they claim to.
+    for (const [file, glob] of [
+      ['engine/tests/assets/agentConfigSync.test.ts', 'engine/tests/**'],
+      ['engine/packages/modoki/tests/runtime/clock.test.ts', 'engine/packages/*/tests/**'],
+    ] as const) {
+      expect(picomatch.isMatch(file, glob), `${glob} should match ${file}`).toBe(true);
+    }
   });
 
   it('does not broadly exclude capacitor plugins the editor imports at runtime', () => {

@@ -137,6 +137,50 @@ describe('canonicalBootScenePath (gap #2 — boot the working-copy scene, not a 
     expect(await canonicalBootScenePath(FS_PATH, doFetch as never)).toBe(FS_PATH);
     expect(doFetch).toHaveBeenCalledWith(FS_PATH, { cache: 'no-store' });
   });
+
+  /** Closes the "KNOWN LIMITATION" above: when the open project's root is known,
+   *  disambiguate by ORIGIN instead of manifest name-match — no fetch, no manifest
+   *  dependency, so it can't race a cold-boot manifest that hasn't caught up yet. */
+  describe('origin-based confirmation (projectRoot param)', () => {
+    it('rewrites when the `/@fs/<abs>` prefix is inside the open project root — no manifest, no fetch', async () => {
+      const FS_PATH = '/@fs/E:/Projects/modoki/games/sling/runtime/assets/scenes/Lvl-0001.json';
+      const doFetch = vi.fn();
+      const result = await canonicalBootScenePath(FS_PATH, doFetch as never, 'E:\\Projects\\modoki\\games\\sling');
+      expect(result).toBe('/assets/scenes/Lvl-0001.json');
+      expect(doFetch).not.toHaveBeenCalled();
+    });
+
+    it('does NOT rewrite a sibling project even if the manifest would have matched it by name', async () => {
+      registerAsset(SCENE_GUID, '/assets/scenes/main.json', 'scene');
+      const OTHER_PROJECT = '/@fs/E:/Projects/modoki/games/some-other-game/runtime/assets/scenes/main.json';
+      const doFetch = vi.fn();
+      const result = await canonicalBootScenePath(OTHER_PROJECT, doFetch as never, 'E:\\Projects\\modoki\\games\\sling');
+      expect(result).toBe(OTHER_PROJECT);
+      expect(doFetch).not.toHaveBeenCalled();
+    });
+
+    it('is segment-aware — a prefix-sharing sibling folder is not treated as inside the root', async () => {
+      const FS_PATH = '/@fs/E:/Projects/modoki/games/sling-evil/runtime/assets/scenes/main.json';
+      const result = await canonicalBootScenePath(FS_PATH, (async () => jsonResponse(null, false, 404)) as never, 'E:\\Projects\\modoki\\games\\sling');
+      expect(result).toBe(FS_PATH);
+    });
+
+    it('is case-insensitive and separator-insensitive (Windows drive letter, slash direction)', async () => {
+      const FS_PATH = '/@fs/e:/Projects/Modoki/Games/SLING/runtime/assets/scenes/Lvl-0001.json';
+      const doFetch = vi.fn();
+      const result = await canonicalBootScenePath(FS_PATH, doFetch as never, 'E:\\projects\\modoki\\games\\sling');
+      expect(result).toBe('/assets/scenes/Lvl-0001.json');
+      expect(doFetch).not.toHaveBeenCalled();
+    });
+
+    it('falls back to the manifest-based check when projectRoot is not supplied', async () => {
+      registerAsset(SCENE_GUID, '/assets/scenes/main.json', 'scene');
+      const FS_PATH = '/@fs/E:/Projects/modoki/demos/postfx-demo/runtime/assets/scenes/main.json';
+      const doFetch = vi.fn();
+      expect(await canonicalBootScenePath(FS_PATH, doFetch as never)).toBe('/assets/scenes/main.json');
+      expect(doFetch).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe('loadFirstScene (boot loop: canonicalize → load, raw fallback)', () => {

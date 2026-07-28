@@ -150,6 +150,136 @@ describe('vendorEnginePlugins', () => {
     });
   });
 
+  /** Regression: the packaged editor froze for exactly ~120s on every open of a
+   *  project that depends on an engine plugin.
+   *
+   *  The installed app (Program Files / /Applications) is NOT writable, and it ships
+   *  the plugin's src/ but NOT its build stamp (which lives under node_modules, and so
+   *  isn't packaged). So `pluginSourceHash` was non-null, the stamp never matched, and
+   *  ensurePluginBuilt fell through to its cross-process build lock — where
+   *  `fs.mkdirSync(lock)` failed EPERM and a bare `catch` misread that as "another
+   *  process is building". It then sync-slept `Atomics.wait` for the FULL 120s deadline
+   *  waiting for a stamp that could never appear, ON ELECTRON'S MAIN THREAD (the HTTP
+   *  backend and CDP port both went dead; the window showed as "not responding"), then
+   *  threw — and main.ts caught it and carried on, so nothing pointed at the cause.
+   *
+   *  Only EEXIST may wait. An unwritable dir means no build can happen here and no
+   *  other process is building either, so trust the shipped dist and return at once. */
+  describe('read-only install (packaged editor)', () => {
+    /** Fail ONLY the `.modoki-building` lock mkdir, the way an unwritable install dir
+     *  does — every other mkdir (dist, plugins/, node_modules) must still work. */
+    function denyLockMkdir(code: 'EPERM' | 'EACCES' | 'EROFS' = 'EPERM') {
+      const real = fs.mkdirSync;
+      return vi.spyOn(fs, 'mkdirSync').mockImplementation(((p: fs.PathLike, o?: object) => {
+        if (String(p).endsWith('.modoki-building')) {
+          throw Object.assign(new Error(`${code}: operation not permitted, mkdir '${p}'`), { code });
+        }
+        return (real as (p: fs.PathLike, o?: object) => string | undefined)(p, o);
+      }) as typeof fs.mkdirSync);
+    }
+
+    it('returns IMMEDIATELY (does not burn the 120s lock deadline) when the plugin dir is unwritable', () => {
+      const dir = writeEnginePlugin();
+      // Ships sources but no build stamp — exactly the packaged layout.
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'index.ts'), 'export const v = 1');
+      writeProjectPkg({ [PLUGIN]: '*' });
+      const spy = denyLockMkdir();
+
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const started = Date.now();
+      const r = vendorEnginePlugins(projectRoot, engineRoot);
+      const elapsed = Date.now() - started;
+
+      spy.mockRestore();
+      // The bug slept the full 120_000ms here. Generous bound: still ~1000x under it.
+      expect(elapsed).toBeLessThan(5_000);
+      // …but proceeding with a STALE dist must be VISIBLE, not silent: canBuild is true
+      // here (a dev checkout with an unwritable plugin dir), and a silently stale dist is
+      // the "permanent no-op that never healed" this function's header warns about.
+      const warned = warn.mock.calls.map((c) => String(c[0] ?? ''));
+      expect(warned.some((m) => /STALE/.test(m) && m.includes(PLUGIN)), `expected a stale-dist warning, got: ${warned.join(' | ')}`).toBe(true);
+      warn.mockRestore();
+      // The shipped dist is trusted, so vendoring completes normally rather than throwing.
+      expect(listTarballs()).toHaveLength(1);
+      expect(readDeps()[PLUGIN]).toBe(`file:plugins/${listTarballs()[0]}`);
+      expect(r.changed).toBe(true);
+    });
+
+    it('does NOT attempt a build it cannot perform in an unwritable dir', () => {
+      const dir = writeEnginePlugin();
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'index.ts'), 'export const v = 1');
+      writeProjectPkg({ [PLUGIN]: '*' });
+      const spy = denyLockMkdir('EACCES');
+
+      vendorEnginePlugins(projectRoot, engineRoot);
+
+      spy.mockRestore();
+      const builds = execFileSyncMock.mock.calls.filter((c) => c[1][0] === 'run' && c[1][1] === 'build');
+      expect(builds).toHaveLength(0);
+    });
+
+    /** The packaged editor's NSIS default is perMachine:false, so a PER-USER install
+     *  lands in a WRITABLE dir — the EPERM guard above never fires there, and it would
+     *  instead run `npm run build` in the app bundle, which ships no devDependencies.
+     *  The caller must declare it can't build; disk can't be sniffed for this, since a
+     *  workspace dev checkout also has no per-package node_modules (deps hoist). */
+    it('canBuild:false trusts the shipped dist and never shells out, even when WRITABLE', () => {
+      const dir = writeEnginePlugin();
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'index.ts'), 'export const v = 1');
+      writeProjectPkg({ [PLUGIN]: '*' });
+
+      const started = Date.now();
+      const r = vendorEnginePlugins(projectRoot, engineRoot, { canBuild: false });
+
+      expect(Date.now() - started).toBeLessThan(5_000);
+      const builds = execFileSyncMock.mock.calls.filter((c) => c[1][0] === 'run' && c[1][1] === 'build');
+      expect(builds).toHaveLength(0);
+      // Packing still happens — it writes into the PROJECT (writable), not the bundle.
+      expect(listTarballs()).toHaveLength(1);
+      expect(r.changed).toBe(true);
+    });
+
+    it('canBuild:false throws a named error rather than hanging when no dist ships', () => {
+      const dir = writeEnginePlugin(PLUGIN, '1.0.0', /* withDist */ false);
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'index.ts'), 'export const v = 1');
+      writeProjectPkg({ [PLUGIN]: '*' });
+
+      expect(() => vendorEnginePlugins(projectRoot, engineRoot, { canBuild: false }))
+        .toThrow(/ships no toolchain/);
+    });
+
+    it('DEFAULTS to canBuild:true so a developer checkout still builds a stale dist', () => {
+      const dir = writeEnginePlugin(PLUGIN, '1.0.0', /* withDist */ false);
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'index.ts'), 'export const v = 1');
+      writeProjectPkg({ [PLUGIN]: '*' });
+
+      vendorEnginePlugins(projectRoot, engineRoot); // no opts
+
+      const builds = execFileSyncMock.mock.calls.filter((c) => c[1][0] === 'run' && c[1][1] === 'build');
+      expect(builds).toHaveLength(1);
+    });
+
+    it('throws a NAMED error (not a 120s hang) when unwritable AND no dist ships', () => {
+      const dir = writeEnginePlugin(PLUGIN, '1.0.0', /* withDist */ false);
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'index.ts'), 'export const v = 1');
+      writeProjectPkg({ [PLUGIN]: '*' });
+      const spy = denyLockMkdir();
+
+      const started = Date.now();
+      expect(() => vendorEnginePlugins(projectRoot, engineRoot)).toThrow(/not writable \(EPERM\).*ships no dist/s);
+      const elapsed = Date.now() - started;
+
+      spy.mockRestore();
+      expect(elapsed).toBeLessThan(5_000);
+    });
+  });
+
   it('migrates an old file:../../engine directory-symlink spec to the tarball copy', () => {
     writeEnginePlugin();
     writeProjectPkg({ [PLUGIN]: 'file:../../engine/packages/capacitor-game-debug' });

@@ -29,6 +29,10 @@ export const JSON_ASSET_SUFFIX_TYPE: ReadonlyArray<readonly [suffix: string, typ
   ['.level.json', 'level'],
   ['.wave.json', 'wave'],
   ['.timeline.json', 'timeline'],
+  // Court's puzzle level data (regions/civilians/solution) — a pure-data leaf, same
+  // shape as Sling's `.level.json`/`.wave.json`: no embedded asset refs, so the
+  // tree-shaker's default "leaf" handling is correct with no extra walk branch.
+  ['.court.json', 'court-level'],
 ];
 
 /** Classify a JSON asset by filename suffix. Returns the asset type, or null when

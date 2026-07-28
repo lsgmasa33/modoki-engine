@@ -116,19 +116,51 @@ describe('frameDriver', () => {
       expect(cancelAnimationFrame).toHaveBeenCalledTimes(1);
     });
 
-    it('does not go negative with extra stops', async () => {
+    it('ignores extra stops instead of cancelling a chain it does not own', async () => {
       setupRAFMock();
-      const { startFrameDriver, stopFrameDriver } = await getFrameDriver();
+      const { startFrameDriver, stopFrameDriver, getFrameLoopHealth } = await getFrameDriver();
 
       startFrameDriver();
       stopFrameDriver();
       stopFrameDriver();
       stopFrameDriver();
 
-      // cancelAnimationFrame is called for each extra stop (refCount goes negative),
-      // but the driver state is safe — calling cancelAnimationFrame with an old ID is a no-op.
-      // The key invariant: refCount stays at 0 and no errors are thrown.
-      expect(cancelAnimationFrame).toHaveBeenCalledTimes(3);
+      // Only the BALANCED stop may cancel. The old code decremented past zero and called
+      // cancelAnimationFrame on every extra stop; combined with a later start that took the
+      // "already running" branch, that is how the loop could end up dead while callers still
+      // believed it was pumping — the silent frozen-editor wedge.
+      expect(cancelAnimationFrame).toHaveBeenCalledTimes(1);
+      expect(getFrameLoopHealth().refCount).toBe(0);
+    });
+
+    it('an unbalanced stop cannot kill a chain another caller still holds', async () => {
+      setupRAFMock();
+      const { startFrameDriver, stopFrameDriver, getFrameLoopHealth } = await getFrameDriver();
+
+      startFrameDriver();      // caller A
+      startFrameDriver();      // caller B
+      stopFrameDriver();       // A releases → B still holds one ref
+      stopFrameDriver();       // B releases → chain legitimately cancelled
+      stopFrameDriver();       // stray cleanup with no matching start — must be inert
+
+      expect(cancelAnimationFrame).toHaveBeenCalledTimes(1);
+      expect(getFrameLoopHealth().refCount).toBe(0);
+    });
+
+    it('re-arms a dead chain on start even when refCount is still positive', async () => {
+      setupRAFMock();
+      const { startFrameDriver, getFrameLoopHealth } = await getFrameDriver();
+
+      startFrameDriver();                       // refCount 1, chain armed
+      expect(getFrameLoopHealth().armed).toBe(true);
+      const armsAfterFirst = (requestAnimationFrame as unknown as { mock: { calls: unknown[] } }).mock.calls.length;
+
+      // A second start while already running must NOT arm a duplicate chain — the generation
+      // guard exists precisely so a repair attempt can never double-step every system.
+      startFrameDriver();
+      expect((requestAnimationFrame as unknown as { mock: { calls: unknown[] } }).mock.calls.length)
+        .toBe(armsAfterFirst);
+      expect(getFrameLoopHealth().refCount).toBe(2);
     });
 
     it('re-starts after full stop', async () => {

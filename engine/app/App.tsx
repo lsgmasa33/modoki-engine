@@ -68,6 +68,40 @@ class GameUIErrorBoundary extends Component<{ fallback: ReactNode; children: Rea
   }
 }
 
+/** Last-resort boundary around the editor route. The editor is loaded through a bare
+ *  `React.lazy`, so ANY rejection during its bootstrap used to unmount the tree and leave a
+ *  BLANK window — alive, serving HTTP, rendering nothing, with the reason visible only to
+ *  someone who thought to open the console. That silent-blank outcome is what made the
+ *  wedged-editor bug cost four debugging sessions, so it must not be reachable by any path,
+ *  including ones nobody has hit yet. Paint the error instead. */
+class EditorBootBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state: { error: Error | null } = { error: null };
+  static getDerivedStateFromError(error: Error) { return { error }; }
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('[EditorBootBoundary] the editor failed to start:', error, info.componentStack);
+  }
+  render() {
+    const { error } = this.state;
+    if (!error) return this.props.children;
+    return (
+      <div style={{
+        height: '100vh', background: '#1a1a2e', color: '#fee2e2', padding: 28, overflow: 'auto',
+        fontFamily: 'system-ui, sans-serif',
+      }}>
+        <h2 style={{ margin: '0 0 10px', color: '#fca5a5' }}>The editor failed to start</h2>
+        <p style={{ margin: '0 0 14px', color: '#e5e7eb', maxWidth: 760, lineHeight: 1.5 }}>
+          Nothing is rendering because the editor never finished booting. This is the error that
+          stopped it — fix it and the editor reloads automatically.
+        </p>
+        <pre style={{
+          whiteSpace: 'pre-wrap', background: '#0f172a', border: '1px solid #334155',
+          padding: 14, color: '#fecaca', fontSize: 13, margin: 0,
+        }}>{`${error.name}: ${error.message}\n\n${error.stack ?? ''}`}</pre>
+      </div>
+    );
+  }
+}
+
 function useHashRoute() {
   const [hash, setHash] = useState(window.location.hash);
   useEffect(() => {
@@ -446,9 +480,11 @@ function App() {
   // Editor route (omitted from game-only builds)
   if (!GAME_ONLY && hash === '#/editor' && EditorApp) {
     return (
-      <Suspense fallback={<div style={{ color: '#fff', padding: 20, background: '#1a1a2e', height: '100vh' }}>Loading editor...</div>}>
-        <EditorApp />
-      </Suspense>
+      <EditorBootBoundary>
+        <Suspense fallback={<div style={{ color: '#fff', padding: 20, background: '#1a1a2e', height: '100vh' }}>Loading editor...</div>}>
+          <EditorApp />
+        </Suspense>
+      </EditorBootBoundary>
     );
   }
 

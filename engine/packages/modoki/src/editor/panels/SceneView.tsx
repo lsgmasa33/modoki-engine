@@ -4403,7 +4403,20 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     }; // end setup
 
     // Fire-and-forget; the async body guards on `outerDisposed` after its await.
-    void setup();
+    // The `.catch` is load-bearing, not hygiene: `setup()` registers the frame callback and
+    // calls startFrameDriver() at its very END, after ~2000 lines of synchronous scene/gizmo
+    // wiring. A throw anywhere in there leaves the renderer ALREADY registered (so
+    // `rendererReady` resolved and the scene loaded normally) while the frame loop was never
+    // started — the exact "playing, advancing, entityCount correct, fps 0, nothing renders"
+    // wedge. Unhandled, the reason went nowhere useful. Report it as a viewport failure.
+    void setup().catch((e) => {
+      initedRef.current = false; // let a remount retry rather than latching the panel dead
+      console.error(
+        '[SceneView] viewport setup FAILED after the renderer was created — the 3D viewport ' +
+        'will not render and its frame loop never started. The scene itself may have loaded ' +
+        'fine, so entity data can look correct while nothing is drawn:', e,
+      );
+    });
 
     return () => {
       outerDisposed = true;

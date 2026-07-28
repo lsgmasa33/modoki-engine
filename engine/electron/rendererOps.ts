@@ -31,6 +31,11 @@ export interface CaptureResult {
   /** `width / cssWidth`. Multiply an image pixel by `1/scale` to get a tappable CSS
    *  coordinate. 1 when the window was small enough to capture unscaled. */
   scale: number;
+  /** Chromium page zoom factor (`webContents.getZoomFactor()`) at capture time. `cssWidth`/
+   *  `cssHeight` are DIP (unaffected by page zoom), NOT the public zoomed-CSS space `tap`/
+   *  `drag`'s `selector`-less `{x,y}` aim mode uses — divide `cssWidth`/`cssHeight` by this to
+   *  get that space, or prefer `selector`/`get_scene_state?bounds=1` and skip the conversion. */
+  zoomFactor: number;
 }
 
 /** Pure resize math: fit (w,h) inside a longest-side cap, preserving aspect. Split out
@@ -46,6 +51,41 @@ export function fitToMaxSide(width: number, height: number, maxSide: number): { 
   return { width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale)), scale };
 }
 
+/** `webContents.capturePage()` asks Chromium's compositor (Viz) for a frame. When the
+ *  compositor cannot produce one it rejects with a bare `UnknownVizError` — no window
+ *  state, no page state, nothing pointing at WHY. That opaque string is what agents have
+ *  been left holding while the real story (a minimised/occluded window, a destroyed
+ *  webContents, or a renderer whose frame loop has died) sat one property lookup away.
+ *  Re-throw with the window/page facts that actually identify the cause. */
+async function capturePageOrExplain(win: BrowserWindow) {
+  try {
+    return await win.webContents.capturePage();
+  } catch (e) {
+    const reasons: string[] = [];
+    let ctx = '';
+    try {
+      if (win.isDestroyed()) reasons.push('the editor window has been destroyed');
+      else {
+        const wc = win.webContents;
+        const bounds = win.getBounds();
+        if (wc.isDestroyed()) reasons.push('the editor webContents has been destroyed');
+        if (wc.isCrashed?.()) reasons.push('the renderer process has CRASHED');
+        if (!win.isVisible()) reasons.push('the window is not visible (hidden or on another Space)');
+        if (win.isMinimized()) reasons.push('the window is minimized');
+        if (bounds.width === 0 || bounds.height === 0) reasons.push('the window has a zero-sized bounds');
+        ctx = ` [visible=${win.isVisible()} minimized=${win.isMinimized()} focused=${win.isFocused()} ` +
+          `bounds=${bounds.width}x${bounds.height} crashed=${wc.isCrashed?.() ?? 'n/a'} url=${wc.getURL()}]`;
+      }
+    } catch { /* the window died mid-inspection — the raw cause below still stands */ }
+    const why = reasons.length
+      ? `Likely cause: ${reasons.join('; ')}.`
+      : 'The window looks alive and visible, so the compositor produced no frame — the renderer ' +
+        'is most likely wedged (check `frameLoop.status` in modoki_get_editor_state: a "stalled" ' +
+        'frame loop means nothing is being drawn to composite).';
+    throw new Error(`capture_viewport failed: ${String(e)}. ${why}${ctx}`, { cause: e });
+  }
+}
+
 /** Capture the visible editor window → downscaled JPEG on disk. Returns the path
  *  Claude reads, the final dimensions, AND the CSS size + scale it was reduced from —
  *  without which an agent measuring a button in the image has no way to tap it. */
@@ -56,7 +96,7 @@ export async function captureViewport(win: BrowserWindow, opts?: { maxSide?: num
   // passing e.g. 0.9 can't crash the native binding with a "conversion failure".
   const rawQuality = opts?.quality ?? JPEG_QUALITY;
   const quality = Math.max(1, Math.min(100, Math.round(rawQuality <= 1 ? rawQuality * 100 : rawQuality)));
-  let image = await win.webContents.capturePage();
+  let image = await capturePageOrExplain(win);
   // `NativeImage.getSize()` reports DIP (CSS) px, not device px — so this IS the
   // coordinate space `tap`/`drag` take, and it is worth returning verbatim.
   const { width: cssWidth, height: cssHeight } = image.getSize();
@@ -72,6 +112,7 @@ export async function captureViewport(win: BrowserWindow, opts?: { maxSide?: num
     width: finalSize.width, height: finalSize.height,
     cssWidth, cssHeight,
     scale: cssWidth > 0 ? finalSize.width / cssWidth : 1,
+    zoomFactor: win.webContents.getZoomFactor(),
   };
 }
 

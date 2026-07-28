@@ -18,14 +18,14 @@ vi.mock('node:fs', async (importOriginal) => {
 /** A window whose capturePage() yields an image of the given CSS size. `resize` records
  *  what it was asked for and reports that as the new size — i.e. it stands in for the
  *  ENCODER, which is what `captureViewport` deliberately trusts over its own arithmetic. */
-function fakeWindow(cssWidth: number, cssHeight: number) {
+function fakeWindow(cssWidth: number, cssHeight: number, zoomFactor = 1) {
   const resize = vi.fn();
   const makeImage = (w: number, h: number): Record<string, unknown> => ({
     getSize: () => ({ width: w, height: h }),
     toJPEG: () => Buffer.from(''),
     resize: (o: { width: number; height: number }) => { resize(o); return makeImage(o.width, o.height); },
   });
-  const win = { webContents: { capturePage: vi.fn(async () => makeImage(cssWidth, cssHeight)) } };
+  const win = { webContents: { capturePage: vi.fn(async () => makeImage(cssWidth, cssHeight)), getZoomFactor: () => zoomFactor } };
   return { win: win as unknown as BrowserWindow, resize };
 }
 
@@ -123,5 +123,11 @@ describe('captureViewport', () => {
     const res = await captureViewport(win, { maxSide: 4000 });
     expect(resize).not.toHaveBeenCalled();
     expect(res).toMatchObject({ width: 1600, cssWidth: 1600, scale: 1 });
+  });
+
+  it('reports the live zoom factor, so cssWidth/cssHeight (DIP) self-describe how to reach zoomed-CSS', async () => {
+    const { win } = fakeWindow(1600, 968, 1.2); // one zoom-in step (1.2^1)
+    const res = await captureViewport(win);
+    expect(res.zoomFactor).toBe(1.2);
   });
 });

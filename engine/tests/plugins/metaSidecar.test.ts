@@ -38,6 +38,20 @@ describe('writeMetaSidecar — atomic write', () => {
     expect(JSON.parse(raw)).toEqual({ id: 'guid-1', version: 2 });
   });
 
+  /** These sidecars are COMMITTED. Without a trailing newline every rewrite shows up as
+   *  "\ No newline at end of file" in the diff, and the tree was split 65/198 on it — so
+   *  sidecars churned on formatting alone depending on which tool wrote them last. Both
+   *  halves must end with exactly one newline. */
+  it('ends the file with a trailing newline (committed sidecars must not churn)', () => {
+    writeMetaSidecar(absPath, { id: 'guid-1', version: 2, textureCache: { variantBytes: { webp: 42 } } });
+    const committed = fs.readFileSync(absPath + '.meta.json', 'utf-8');
+    expect(committed.endsWith('\n')).toBe(true);
+    expect(committed.endsWith('\n\n')).toBe(false); // exactly one
+    const local = fs.readFileSync(absPath + '.meta.local.json', 'utf-8');
+    expect(local.endsWith('\n')).toBe(true);
+    expect(local.endsWith('\n\n')).toBe(false);
+  });
+
   it('replaces an existing sidecar (no stale data)', () => {
     fs.writeFileSync(absPath + '.meta.json', JSON.stringify({ id: 'old', version: 1 }));
     writeMetaSidecar(absPath, { id: 'new', version: 2 });
