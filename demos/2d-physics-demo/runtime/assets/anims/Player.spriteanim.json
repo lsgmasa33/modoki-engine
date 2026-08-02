@@ -1,0 +1,36 @@
+{
+  "id": "c30624da-016c-40dc-a0f1-3f9330e0c665",
+  "clips": {
+    "idle": {
+      "frames": [
+        "b6d82e66-0a65-411d-9c5c-c895ba47156a",
+        "88e3d50a-1240-4390-89ca-e1acb7e1302e"
+      ],
+      "fps": 2,
+      "mode": "loop",
+      "cycles": 0
+    },
+    "walk": {
+      "frames": [
+        "86e73ddf-c6e0-4747-b22d-b9d2891e0a8c",
+        "5ca1d3e1-7820-4860-b856-bccd5abe3e3c",
+        "350e9cac-58e6-45e5-848f-b63d8e8170cf",
+        "af29793c-7c31-4f02-85cf-3671fbf852b2",
+        "a865dc9f-efef-4592-9007-95455d5ada30",
+        "4dd5254b-2161-4098-b370-8e26a8343281"
+      ],
+      "fps": 10,
+      "mode": "loop",
+      "cycles": 0
+    },
+    "jump": {
+      "frames": [
+        "92c0b4e6-f916-4bc0-a921-9eda8709c75b",
+        "6d49f451-c775-4db4-a029-8ef6b9aa3a80"
+      ],
+      "fps": 6,
+      "mode": "once",
+      "cycles": 0
+    }
+  }
+}

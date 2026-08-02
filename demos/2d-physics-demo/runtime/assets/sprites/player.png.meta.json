@@ -1,0 +1,159 @@
+{
+  "version": 2,
+  "id": "fa4adec8-c305-47f9-8380-31234126851c",
+  "texture": {
+    "format": "webp",
+    "maxSize": 2048,
+    "mipmaps": false,
+    "wrapS": "clamp",
+    "wrapT": "clamp",
+    "colorspace": "srgb"
+  },
+  "spriteMode": "multiple",
+  "spriteSheet": {
+    "width": 1152,
+    "height": 640
+  },
+  "sprites": [
+    {
+      "guid": "86e73ddf-c6e0-4747-b22d-b9d2891e0a8c",
+      "name": "player_run_0",
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "w": 192,
+        "h": 320
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    {
+      "guid": "5ca1d3e1-7820-4860-b856-bccd5abe3e3c",
+      "name": "player_run_1",
+      "rect": {
+        "x": 192,
+        "y": 0,
+        "w": 192,
+        "h": 320
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    {
+      "guid": "350e9cac-58e6-45e5-848f-b63d8e8170cf",
+      "name": "player_run_2",
+      "rect": {
+        "x": 384,
+        "y": 0,
+        "w": 192,
+        "h": 320
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    {
+      "guid": "af29793c-7c31-4f02-85cf-3671fbf852b2",
+      "name": "player_run_3",
+      "rect": {
+        "x": 576,
+        "y": 0,
+        "w": 192,
+        "h": 320
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    {
+      "guid": "a865dc9f-efef-4592-9007-95455d5ada30",
+      "name": "player_run_4",
+      "rect": {
+        "x": 768,
+        "y": 0,
+        "w": 192,
+        "h": 320
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    {
+      "guid": "4dd5254b-2161-4098-b370-8e26a8343281",
+      "name": "player_run_5",
+      "rect": {
+        "x": 960,
+        "y": 0,
+        "w": 192,
+        "h": 320
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    {
+      "guid": "92c0b4e6-f916-4bc0-a921-9eda8709c75b",
+      "name": "player_jump_up",
+      "rect": {
+        "x": 0,
+        "y": 320,
+        "w": 192,
+        "h": 320
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    {
+      "guid": "6d49f451-c775-4db4-a029-8ef6b9aa3a80",
+      "name": "player_jump_fall",
+      "rect": {
+        "x": 192,
+        "y": 320,
+        "w": 192,
+        "h": 320
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    {
+      "guid": "b6d82e66-0a65-411d-9c5c-c895ba47156a",
+      "name": "player_idle_0",
+      "rect": {
+        "x": 384,
+        "y": 320,
+        "w": 192,
+        "h": 320
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    {
+      "guid": "88e3d50a-1240-4390-89ca-e1acb7e1302e",
+      "name": "player_idle_1",
+      "rect": {
+        "x": 576,
+        "y": 320,
+        "w": 192,
+        "h": 320
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    }
+  ]
+}

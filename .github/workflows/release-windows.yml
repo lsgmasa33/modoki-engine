@@ -49,7 +49,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: '24'   # Node 24 Active LTS — matches package.json engines + PINNED_NODE (the runtime the editor SHIPS)
           cache: npm
 
       # --ignore-scripts skips the root postinstall (build:plugins + bootstrap-game-deps).

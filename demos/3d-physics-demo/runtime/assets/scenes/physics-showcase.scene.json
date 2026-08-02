@@ -1,0 +1,2115 @@
+{
+  "id": "c911ab20-c98d-4471-8bfe-f6eea7c5091d",
+  "version": 9,
+  "createdAt": "2026-07-22T02:54:58.942Z",
+  "resources": [],
+  "entities": [
+    {
+      "id": 1,
+      "name": "Camera",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": 9,
+          "z": 19,
+          "rx": -0.42,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Camera": {
+          "projection": "perspective",
+          "fov": 55,
+          "orthoSize": 5,
+          "near": 0.1,
+          "far": 1000,
+          "overlayDistance": 10,
+          "clearColor": 1712691
+        },
+        "EntityAttributes": {
+          "name": "Camera",
+          "isActive": true,
+          "sortOrder": 0,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "58b89a44-719f-41d9-b3c4-d25245642e0c",
+          "editorFolder": "Setup"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "name": "Physics3D",
+      "traits": {
+        "Physics3D": {
+          "gravityX": 0,
+          "gravityY": -9.81,
+          "gravityZ": 0,
+          "unitsPerMeter": 1
+        },
+        "EntityAttributes": {
+          "name": "Physics3D",
+          "isActive": true,
+          "sortOrder": 1,
+          "parentId": "",
+          "layer": "",
+          "guid": "3d5684d5-1810-4863-a572-c2c5a7cc46d7",
+          "editorFolder": "Setup"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "name": "Directional Light",
+      "traits": {
+        "Transform": {
+          "x": 10,
+          "y": 24,
+          "z": 9,
+          "rx": -1.212025603457462,
+          "ry": 0.3719750128543334,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "EntityAttributes": {
+          "name": "Directional Light",
+          "isActive": true,
+          "sortOrder": 2,
+          "parentId": "",
+          "layer": "",
+          "guid": "05766041-9f39-41f3-8094-1739f41faff8",
+          "editorFolder": "Setup"
+        },
+        "Light": {
+          "lightType": "directional",
+          "color": 16777215,
+          "intensity": 4.5,
+          "targetX": 0,
+          "targetY": 0,
+          "targetZ": 0,
+          "distance": 0,
+          "angle": 0.5,
+          "penumbra": 0,
+          "castShadow": true,
+          "shadowMapSize": 2048,
+          "shadowCameraSize": 20,
+          "shadowBias": -0.0003,
+          "shadowNormalBias": 0.008,
+          "shadowRadius": 4,
+          "showShadowFrustum": false
+        }
+      }
+    },
+    {
+      "id": 4,
+      "name": "Ambient Light",
+      "traits": {
+        "EntityAttributes": {
+          "name": "Ambient Light",
+          "isActive": true,
+          "sortOrder": 3,
+          "parentId": "",
+          "layer": "",
+          "guid": "1b0b9ca4-0395-4250-8201-95d84d1d2b51",
+          "editorFolder": "Setup"
+        },
+        "Light": {
+          "lightType": "ambient",
+          "color": 12374271,
+          "intensity": 0.8,
+          "targetX": 0,
+          "targetY": 0,
+          "targetZ": 0,
+          "distance": 0,
+          "angle": 0.5,
+          "penumbra": 0,
+          "castShadow": false,
+          "shadowMapSize": 2048,
+          "shadowCameraSize": 16,
+          "shadowBias": -0.0003,
+          "shadowNormalBias": 0.008,
+          "shadowRadius": 4,
+          "showShadowFrustum": false
+        }
+      }
+    },
+    {
+      "id": 5,
+      "name": "Floor",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": 0,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 24,
+          "sy": 0.5,
+          "sz": 24
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "box",
+          "color": 5595250,
+          "size": 1,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "static",
+          "linearDamping": 0,
+          "angularDamping": 0,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "box",
+          "mesh": "",
+          "radius": 0.5,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.8,
+          "restitution": 0,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Floor",
+          "isActive": true,
+          "sortOrder": 4,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "2cefda8b-6067-448d-ad82-1885baff4d4d",
+          "editorFolder": "Level"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "name": "Wall +X",
+      "traits": {
+        "Transform": {
+          "x": 12,
+          "y": 1.5,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 0.5,
+          "sy": 3,
+          "sz": 24
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "box",
+          "color": 4542566,
+          "size": 1,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "static",
+          "linearDamping": 0,
+          "angularDamping": 0,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "box",
+          "mesh": "",
+          "radius": 0.5,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.6,
+          "restitution": 0,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Wall +X",
+          "isActive": true,
+          "sortOrder": 5,
+          "parentId": "96beab37-61a1-4c88-9549-16f7ae316777",
+          "layer": "3d",
+          "guid": "8cc5ccb1-04a0-4570-b4c3-0f7e97d2e2aa",
+          "editorFolder": ""
+        }
+      }
+    },
+    {
+      "id": 7,
+      "name": "Wall -X",
+      "traits": {
+        "Transform": {
+          "x": -12,
+          "y": 1.5,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 0.5,
+          "sy": 3,
+          "sz": 24
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "box",
+          "color": 4542566,
+          "size": 1,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "static",
+          "linearDamping": 0,
+          "angularDamping": 0,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "box",
+          "mesh": "",
+          "radius": 0.5,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.6,
+          "restitution": 0,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Wall -X",
+          "isActive": true,
+          "sortOrder": 6,
+          "parentId": "96beab37-61a1-4c88-9549-16f7ae316777",
+          "layer": "3d",
+          "guid": "22378f6f-2cb0-4fcc-a0c8-d96c28d19290",
+          "editorFolder": ""
+        }
+      }
+    },
+    {
+      "id": 8,
+      "name": "Wall +Z",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": 1.5,
+          "z": 12,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 24,
+          "sy": 3,
+          "sz": 0.5
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "box",
+          "color": 4542566,
+          "size": 1,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "static",
+          "linearDamping": 0,
+          "angularDamping": 0,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "box",
+          "mesh": "",
+          "radius": 0.5,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.6,
+          "restitution": 0,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Wall +Z",
+          "isActive": true,
+          "sortOrder": 7,
+          "parentId": "96beab37-61a1-4c88-9549-16f7ae316777",
+          "layer": "3d",
+          "guid": "87997872-6278-4937-9c38-d8f677babd9a",
+          "editorFolder": ""
+        }
+      }
+    },
+    {
+      "id": 9,
+      "name": "Wall -Z",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": 1.5,
+          "z": -12,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 24,
+          "sy": 3,
+          "sz": 0.5
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "box",
+          "color": 4542566,
+          "size": 1,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "static",
+          "linearDamping": 0,
+          "angularDamping": 0,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "box",
+          "mesh": "",
+          "radius": 0.5,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.6,
+          "restitution": 0,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Wall -Z",
+          "isActive": true,
+          "sortOrder": 8,
+          "parentId": "96beab37-61a1-4c88-9549-16f7ae316777",
+          "layer": "3d",
+          "guid": "bb912380-6674-446b-9129-5640716e1406",
+          "editorFolder": ""
+        }
+      }
+    },
+    {
+      "id": 10,
+      "name": "Ramp",
+      "traits": {
+        "Transform": {
+          "x": -6,
+          "y": 2,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": -0.32,
+          "sx": 7,
+          "sy": 0.5,
+          "sz": 5
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "box",
+          "color": 8016432,
+          "size": 1,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "static",
+          "linearDamping": 0,
+          "angularDamping": 0,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "box",
+          "mesh": "",
+          "radius": 0.5,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.5,
+          "restitution": 0,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Ramp",
+          "isActive": true,
+          "sortOrder": 9,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "a21df0de-e141-4f0b-bd31-ce6613416041",
+          "editorFolder": "Level"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "name": "Rolling Ball",
+      "traits": {
+        "Transform": {
+          "x": -7.5,
+          "y": 5,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "sphere",
+          "color": 15158332,
+          "size": 1,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "dynamic",
+          "linearDamping": 0.15,
+          "angularDamping": 0.4,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "sphere",
+          "mesh": "",
+          "radius": 0.5,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.5,
+          "restitution": 0.2,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Rolling Ball",
+          "isActive": true,
+          "sortOrder": 10,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "c873a254-451f-46c1-aa58-e2984e4cf617",
+          "editorFolder": "Bodies"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "name": "Crate A",
+      "traits": {
+        "Transform": {
+          "x": 4,
+          "y": 3,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "box",
+          "color": 2600544,
+          "size": 1,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "dynamic",
+          "linearDamping": 0.15,
+          "angularDamping": 0.4,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "box",
+          "mesh": "",
+          "radius": 0.5,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.6,
+          "restitution": 0,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Crate A",
+          "isActive": true,
+          "sortOrder": 11,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "c545497a-9d42-4b4c-9bdd-43b90e374f5b",
+          "editorFolder": "Bodies"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "name": "Crate B",
+      "traits": {
+        "Transform": {
+          "x": 4,
+          "y": 5.2,
+          "z": 0,
+          "rx": 0,
+          "ry": 0.15,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "box",
+          "color": 3066993,
+          "size": 1,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "dynamic",
+          "linearDamping": 0.15,
+          "angularDamping": 0.4,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "box",
+          "mesh": "",
+          "radius": 0.5,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.6,
+          "restitution": 0,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Crate B",
+          "isActive": true,
+          "sortOrder": 12,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "07be2440-b2a9-4233-88e9-917f9a5656fe",
+          "editorFolder": "Bodies"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "name": "Crate C",
+      "traits": {
+        "Transform": {
+          "x": 4,
+          "y": 7.4,
+          "z": 0,
+          "rx": 0,
+          "ry": 0.3,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "box",
+          "color": 5822093,
+          "size": 1,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "dynamic",
+          "linearDamping": 0.15,
+          "angularDamping": 0.4,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "box",
+          "mesh": "",
+          "radius": 0.5,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.6,
+          "restitution": 0,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Crate C",
+          "isActive": true,
+          "sortOrder": 13,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "1ff7a891-b0ae-4790-b088-0bc940b4b80d",
+          "editorFolder": "Bodies"
+        }
+      }
+    },
+    {
+      "id": 15,
+      "name": "Bouncy Ball",
+      "traits": {
+        "Transform": {
+          "x": 0.5,
+          "y": 10,
+          "z": 0.5,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "sphere",
+          "color": 15844367,
+          "size": 1,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "dynamic",
+          "linearDamping": 0.15,
+          "angularDamping": 0.4,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "sphere",
+          "mesh": "",
+          "radius": 0.5,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.4,
+          "restitution": 0.6,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Bouncy Ball",
+          "isActive": true,
+          "sortOrder": 14,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "a8271897-36a6-46f0-b4c5-ba7847d0f0cd",
+          "editorFolder": "Bodies"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "name": "Capsule",
+      "traits": {
+        "Transform": {
+          "x": 2.2,
+          "y": 7,
+          "z": 3,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "capsule",
+          "color": 10181046,
+          "size": 1.5,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "dynamic",
+          "linearDamping": 0.15,
+          "angularDamping": 0.4,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "capsule",
+          "mesh": "",
+          "radius": 0.375,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.375,
+          "density": 1,
+          "friction": 0.5,
+          "restitution": 0,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Capsule",
+          "isActive": true,
+          "sortOrder": 15,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "8683159b-e75b-4469-a03f-ab8a5e4e0626",
+          "editorFolder": "Bodies"
+        }
+      }
+    },
+    {
+      "id": 17,
+      "name": "Cylinder",
+      "traits": {
+        "Transform": {
+          "x": -2.5,
+          "y": 7,
+          "z": -2.5,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "cylinder",
+          "color": 3447003,
+          "size": 1.2,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "dynamic",
+          "linearDamping": 0.15,
+          "angularDamping": 0.4,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "cylinder",
+          "mesh": "",
+          "radius": 0.6,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.6,
+          "density": 1,
+          "friction": 0.5,
+          "restitution": 0,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Cylinder",
+          "isActive": true,
+          "sortOrder": 16,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "fe747467-af9f-4e7e-b3ba-b193b3f35748",
+          "editorFolder": "Bodies"
+        }
+      }
+    },
+    {
+      "id": 18,
+      "name": "Cone",
+      "traits": {
+        "Transform": {
+          "x": -0.5,
+          "y": 7,
+          "z": -3.5,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "cone",
+          "color": 15105570,
+          "size": 1.2,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "dynamic",
+          "linearDamping": 0.15,
+          "angularDamping": 0.4,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "cone",
+          "mesh": "",
+          "radius": 0.6,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.6,
+          "density": 1,
+          "friction": 0.5,
+          "restitution": 0,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Cone",
+          "isActive": true,
+          "sortOrder": 17,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "193f14a6-a3c0-4b4e-8ffd-1ed04a2f6261",
+          "editorFolder": "Bodies"
+        }
+      }
+    },
+    {
+      "id": 19,
+      "name": "Sensor Zone",
+      "traits": {
+        "Transform": {
+          "x": 8,
+          "y": 4,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 3,
+          "sy": 1,
+          "sz": 3
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "box",
+          "color": 1752220,
+          "size": 1,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "static",
+          "linearDamping": 0,
+          "angularDamping": 0,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "box",
+          "mesh": "",
+          "radius": 0.5,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.5,
+          "restitution": 0,
+          "isSensor": true,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "OnCollision3D": {
+          "onEnter": "sensorZone3D/enter",
+          "onExit": "sensorZone3D/exit"
+        },
+        "EntityAttributes": {
+          "name": "Sensor Zone",
+          "isActive": true,
+          "sortOrder": 18,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "fc6d110e-20e4-4a16-b557-0ec9e0719e28",
+          "editorFolder": "Interaction"
+        }
+      }
+    },
+    {
+      "id": 20,
+      "name": "Probe",
+      "traits": {
+        "Transform": {
+          "x": 8,
+          "y": 9.5,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "sphere",
+          "color": 15528177,
+          "size": 0.8,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "dynamic",
+          "linearDamping": 0.15,
+          "angularDamping": 0.4,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "sphere",
+          "mesh": "",
+          "radius": 0.4,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.5,
+          "restitution": 0.3,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Probe",
+          "isActive": true,
+          "sortOrder": 19,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "145677b3-9f46-4a0c-99db-9d2735548f21",
+          "editorFolder": "Interaction"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "name": "Time (resource)",
+      "traits": {
+        "Time": {
+          "timeScale": 1
+        },
+        "EntityAttributes": {
+          "name": "Time (resource)",
+          "isActive": true,
+          "sortOrder": 20,
+          "parentId": "",
+          "layer": "",
+          "guid": "e2bf4800-cb96-4ced-91ae-258f9beb95e2",
+          "editorFolder": "Setup"
+        }
+      }
+    },
+    {
+      "id": 22,
+      "name": "Pendulum Anchor",
+      "traits": {
+        "Transform": {
+          "x": -6,
+          "y": 9,
+          "z": -6,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "box",
+          "color": 10134706,
+          "size": 0.35,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "static",
+          "linearDamping": 0,
+          "angularDamping": 0,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "EntityAttributes": {
+          "name": "Pendulum Anchor",
+          "isActive": true,
+          "sortOrder": 21,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "672714d1-2ad6-4a77-a6aa-cde419c07bdc",
+          "editorFolder": "Joints/Pendulum"
+        }
+      }
+    },
+    {
+      "id": 23,
+      "name": "Pendulum Bob",
+      "traits": {
+        "Transform": {
+          "x": -4,
+          "y": 9,
+          "z": -6,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "sphere",
+          "color": 16739179,
+          "size": 0.8,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "dynamic",
+          "linearDamping": 0.08,
+          "angularDamping": 0.15,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "sphere",
+          "mesh": "",
+          "radius": 0.4,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.5,
+          "restitution": 0.1,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Pendulum Bob",
+          "isActive": true,
+          "sortOrder": 22,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "3413a7a0-7c00-405d-a252-035dc9e6d766",
+          "editorFolder": "Joints/Pendulum"
+        }
+      }
+    },
+    {
+      "id": 24,
+      "name": "Pendulum Joint",
+      "traits": {
+        "Joint3D": {
+          "type": "revolute",
+          "entityA": "672714d1-2ad6-4a77-a6aa-cde419c07bdc",
+          "entityB": "3413a7a0-7c00-405d-a252-035dc9e6d766",
+          "anchorAX": 0,
+          "anchorAY": 0,
+          "anchorAZ": 0,
+          "anchorBX": -2,
+          "anchorBY": 0,
+          "anchorBZ": 0,
+          "length": 1,
+          "stiffness": 50,
+          "damping": 5,
+          "axisX": 0,
+          "axisY": 0,
+          "axisZ": 1,
+          "limitsEnabled": false,
+          "limitMin": 0,
+          "limitMax": 0,
+          "motorEnabled": false,
+          "motorTargetVel": 0,
+          "motorTargetPos": 0,
+          "motorStiffness": 0,
+          "motorDamping": 1
+        },
+        "EntityAttributes": {
+          "name": "Pendulum Joint",
+          "isActive": true,
+          "sortOrder": 23,
+          "parentId": "",
+          "layer": "",
+          "guid": "7a583c3e-1a68-48bd-82a2-28bcf93807bf",
+          "editorFolder": "Joints/Pendulum"
+        }
+      }
+    },
+    {
+      "id": 25,
+      "name": "Chain Anchor",
+      "traits": {
+        "Transform": {
+          "x": 6,
+          "y": 9,
+          "z": -6,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "box",
+          "color": 10134706,
+          "size": 0.35,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "static",
+          "linearDamping": 0,
+          "angularDamping": 0,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "EntityAttributes": {
+          "name": "Chain Anchor",
+          "isActive": true,
+          "sortOrder": 24,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "8fce1206-9c18-493b-a333-e9523e8b652a",
+          "editorFolder": "Joints/Chain"
+        }
+      }
+    },
+    {
+      "id": 26,
+      "name": "Chain Link 1",
+      "traits": {
+        "Transform": {
+          "x": 6.4,
+          "y": 8,
+          "z": -6,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "sphere",
+          "color": 5164484,
+          "size": 0.6,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "dynamic",
+          "linearDamping": 0.08,
+          "angularDamping": 0.15,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "sphere",
+          "mesh": "",
+          "radius": 0.3,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.5,
+          "restitution": 0.1,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Chain Link 1",
+          "isActive": true,
+          "sortOrder": 25,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "9df6df8a-e047-4924-97da-e1243d67772c",
+          "editorFolder": "Joints/Chain"
+        }
+      }
+    },
+    {
+      "id": 27,
+      "name": "Chain Link 2",
+      "traits": {
+        "Transform": {
+          "x": 6.8,
+          "y": 7,
+          "z": -6,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "sphere",
+          "color": 4569007,
+          "size": 0.6,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "dynamic",
+          "linearDamping": 0.08,
+          "angularDamping": 0.15,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "sphere",
+          "mesh": "",
+          "radius": 0.3,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.5,
+          "restitution": 0.1,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Chain Link 2",
+          "isActive": true,
+          "sortOrder": 26,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "31dcf330-7bdc-4728-9d37-01059488bb25",
+          "editorFolder": "Joints/Chain"
+        }
+      }
+    },
+    {
+      "id": 28,
+      "name": "Chain Link 3",
+      "traits": {
+        "Transform": {
+          "x": 7.2,
+          "y": 6,
+          "z": -6,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "sphere",
+          "color": 3842971,
+          "size": 0.6,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "dynamic",
+          "linearDamping": 0.08,
+          "angularDamping": 0.15,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "sphere",
+          "mesh": "",
+          "radius": 0.3,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.5,
+          "restitution": 0.1,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Chain Link 3",
+          "isActive": true,
+          "sortOrder": 27,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "275c9df0-7f63-4f25-9ec1-341278ef31b5",
+          "editorFolder": "Joints/Chain"
+        }
+      }
+    },
+    {
+      "id": 29,
+      "name": "Chain Joint 1",
+      "traits": {
+        "Joint3D": {
+          "type": "spherical",
+          "entityA": "8fce1206-9c18-493b-a333-e9523e8b652a",
+          "entityB": "9df6df8a-e047-4924-97da-e1243d67772c",
+          "anchorAX": 0,
+          "anchorAY": -0.5,
+          "anchorAZ": 0,
+          "anchorBX": 0,
+          "anchorBY": 0.5,
+          "anchorBZ": 0,
+          "length": 1,
+          "stiffness": 50,
+          "damping": 5,
+          "axisX": 0,
+          "axisY": 1,
+          "axisZ": 0,
+          "limitsEnabled": false,
+          "limitMin": 0,
+          "limitMax": 0,
+          "motorEnabled": false,
+          "motorTargetVel": 0,
+          "motorTargetPos": 0,
+          "motorStiffness": 0,
+          "motorDamping": 1
+        },
+        "EntityAttributes": {
+          "name": "Chain Joint 1",
+          "isActive": true,
+          "sortOrder": 28,
+          "parentId": "",
+          "layer": "",
+          "guid": "6f44d2e1-d5b7-48fd-93ea-ab65c45c748d",
+          "editorFolder": "Joints/Chain"
+        }
+      }
+    },
+    {
+      "id": 30,
+      "name": "Chain Joint 2",
+      "traits": {
+        "Joint3D": {
+          "type": "spherical",
+          "entityA": "9df6df8a-e047-4924-97da-e1243d67772c",
+          "entityB": "31dcf330-7bdc-4728-9d37-01059488bb25",
+          "anchorAX": 0,
+          "anchorAY": -0.5,
+          "anchorAZ": 0,
+          "anchorBX": 0,
+          "anchorBY": 0.5,
+          "anchorBZ": 0,
+          "length": 1,
+          "stiffness": 50,
+          "damping": 5,
+          "axisX": 0,
+          "axisY": 1,
+          "axisZ": 0,
+          "limitsEnabled": false,
+          "limitMin": 0,
+          "limitMax": 0,
+          "motorEnabled": false,
+          "motorTargetVel": 0,
+          "motorTargetPos": 0,
+          "motorStiffness": 0,
+          "motorDamping": 1
+        },
+        "EntityAttributes": {
+          "name": "Chain Joint 2",
+          "isActive": true,
+          "sortOrder": 29,
+          "parentId": "",
+          "layer": "",
+          "guid": "51e63e76-3a53-4e41-839f-3d169cae3e22",
+          "editorFolder": "Joints/Chain"
+        }
+      }
+    },
+    {
+      "id": 31,
+      "name": "Chain Joint 3",
+      "traits": {
+        "Joint3D": {
+          "type": "spherical",
+          "entityA": "31dcf330-7bdc-4728-9d37-01059488bb25",
+          "entityB": "275c9df0-7f63-4f25-9ec1-341278ef31b5",
+          "anchorAX": 0,
+          "anchorAY": -0.5,
+          "anchorAZ": 0,
+          "anchorBX": 0,
+          "anchorBY": 0.5,
+          "anchorBZ": 0,
+          "length": 1,
+          "stiffness": 50,
+          "damping": 5,
+          "axisX": 0,
+          "axisY": 1,
+          "axisZ": 0,
+          "limitsEnabled": false,
+          "limitMin": 0,
+          "limitMax": 0,
+          "motorEnabled": false,
+          "motorTargetVel": 0,
+          "motorTargetPos": 0,
+          "motorStiffness": 0,
+          "motorDamping": 1
+        },
+        "EntityAttributes": {
+          "name": "Chain Joint 3",
+          "isActive": true,
+          "sortOrder": 30,
+          "parentId": "",
+          "layer": "",
+          "guid": "1ac1a7fa-57cc-4abe-a2c1-1c333aec7774",
+          "editorFolder": "Joints/Chain"
+        }
+      }
+    },
+    {
+      "id": 32,
+      "name": "Player",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": 3,
+          "z": 7,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "capsule",
+          "color": 16769126,
+          "size": 1.2,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "kinematic",
+          "linearDamping": 0,
+          "angularDamping": 0,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "capsule",
+          "mesh": "",
+          "radius": 0.3,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.3,
+          "density": 1,
+          "friction": 0.5,
+          "restitution": 0,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "CharacterController3D": {
+          "speed": 4,
+          "jumpSpeed": 5,
+          "gravityScale": 1,
+          "maxSlopeClimbDeg": 46,
+          "minSlopeSlideDeg": 30,
+          "autostepHeight": 0.3,
+          "autostepMinWidth": 0.05,
+          "snapToGroundDist": 0.3,
+          "skin": 0.02
+        },
+        "EntityAttributes": {
+          "name": "Player",
+          "isActive": true,
+          "sortOrder": 31,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "beb971aa-24d8-470a-84d9-7e0acda6aba0",
+          "editorFolder": "Interaction"
+        }
+      }
+    },
+    {
+      "id": 33,
+      "name": "Walls",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": 0,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "EntityAttributes": {
+          "name": "Walls",
+          "isActive": true,
+          "sortOrder": 5,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "96beab37-61a1-4c88-9549-16f7ae316777",
+          "editorFolder": "Level"
+        }
+      }
+    },
+    {
+      "id": 34,
+      "name": "Slider Anchor",
+      "traits": {
+        "Transform": {
+          "x": -8,
+          "y": 7,
+          "z": 6,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "box",
+          "color": 10133670,
+          "size": 0.4,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "static",
+          "linearDamping": 0,
+          "angularDamping": 0,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "EntityAttributes": {
+          "name": "Slider Anchor",
+          "isActive": true,
+          "sortOrder": 34,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "fc92d070-83b7-4cf9-9216-84a82e72e755",
+          "editorFolder": "Joints/Slider Test"
+        }
+      }
+    },
+    {
+      "id": 35,
+      "name": "Slider Body",
+      "traits": {
+        "Transform": {
+          "x": -8,
+          "y": 5,
+          "z": 6,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "box",
+          "color": 16747520,
+          "size": 0.8,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "dynamic",
+          "linearDamping": 0.05,
+          "angularDamping": 0.1,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "Collider3D": {
+          "shape": "box",
+          "mesh": "",
+          "radius": 0.4,
+          "halfW": 0.4,
+          "halfH": 0.4,
+          "halfD": 0.4,
+          "halfHeight": 0.4,
+          "density": 1,
+          "friction": 0.5,
+          "restitution": 0.1,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Slider Body",
+          "isActive": true,
+          "sortOrder": 35,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "baa0ab7f-ac26-4005-a719-9740564b29a2",
+          "editorFolder": "Joints/Slider Test"
+        }
+      }
+    },
+    {
+      "id": 36,
+      "name": "Slider Joint",
+      "traits": {
+        "Joint3D": {
+          "type": "prismatic",
+          "entityA": "fc92d070-83b7-4cf9-9216-84a82e72e755",
+          "entityB": "baa0ab7f-ac26-4005-a719-9740564b29a2",
+          "anchorAX": 0,
+          "anchorAY": 0,
+          "anchorAZ": 0,
+          "anchorBX": 0,
+          "anchorBY": 2,
+          "anchorBZ": 0,
+          "length": 1,
+          "stiffness": 50,
+          "damping": 5,
+          "axisX": 0,
+          "axisY": 1,
+          "axisZ": 0,
+          "limitsEnabled": true,
+          "limitMin": -3,
+          "limitMax": 0,
+          "motorEnabled": false,
+          "motorTargetVel": 0,
+          "motorTargetPos": 0,
+          "motorStiffness": 0,
+          "motorDamping": 1
+        },
+        "EntityAttributes": {
+          "name": "Slider Joint",
+          "isActive": true,
+          "sortOrder": 36,
+          "parentId": "",
+          "layer": "",
+          "guid": "846a725b-617e-4727-b706-d10b2496a862",
+          "editorFolder": "Joints/Slider Test"
+        }
+      }
+    },
+    {
+      "id": 37,
+      "name": "Cube",
+      "traits": {
+        "Transform": {
+          "x": -4.3892163112032145,
+          "y": 4.066919062785445,
+          "z": 6.610751290252174,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "cube",
+          "color": 8947848,
+          "size": 1,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "static",
+          "linearDamping": 0,
+          "angularDamping": 0,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": true
+        },
+        "EntityAttributes": {
+          "name": "Cube",
+          "isActive": true,
+          "sortOrder": 37,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "56da2d7a-dff4-4bb9-b7b0-44436bb3cb80",
+          "editorFolder": "manual_test"
+        }
+      }
+    },
+    {
+      "id": 38,
+      "name": "Sphere",
+      "traits": {
+        "Transform": {
+          "x": -1.38921631,
+          "y": 4.06691906,
+          "z": 6.61075129,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "sphere",
+          "color": 16711680,
+          "size": 1,
+          "material": "",
+          "isVisible": true
+        },
+        "RigidBody3D": {
+          "bodyType": "dynamic",
+          "linearDamping": 0,
+          "angularDamping": 0,
+          "gravityScale": 1,
+          "fixedRotation": false,
+          "lockRotX": false,
+          "lockRotY": false,
+          "lockRotZ": false,
+          "lockTransX": false,
+          "lockTransY": false,
+          "lockTransZ": false,
+          "ccd": false,
+          "canSleep": false
+        },
+        "Collider3D": {
+          "shape": "sphere",
+          "mesh": "",
+          "radius": 0.5,
+          "halfW": 0.5,
+          "halfH": 0.5,
+          "halfD": 0.5,
+          "halfHeight": 0.5,
+          "density": 1,
+          "friction": 0.5,
+          "restitution": 0,
+          "isSensor": false,
+          "physicsLayer": "Default",
+          "collisionGroups": 65535,
+          "collisionMask": 65535
+        },
+        "EntityAttributes": {
+          "name": "Sphere",
+          "isActive": true,
+          "sortOrder": 38,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "0287c5c8-2e17-4faa-af45-1fb6ece58763",
+          "editorFolder": "manual_test"
+        }
+      }
+    },
+    {
+      "id": 39,
+      "name": "constrain",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": 0,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Joint3D": {
+          "type": "spherical",
+          "entityA": "56da2d7a-dff4-4bb9-b7b0-44436bb3cb80",
+          "entityB": "0287c5c8-2e17-4faa-af45-1fb6ece58763",
+          "anchorAX": 0,
+          "anchorAY": 0,
+          "anchorAZ": 0,
+          "anchorBX": -3,
+          "anchorBY": 0,
+          "anchorBZ": 0,
+          "length": 0.5,
+          "stiffness": 50,
+          "damping": 5,
+          "axisX": 0,
+          "axisY": 0,
+          "axisZ": 1,
+          "limitsEnabled": false,
+          "limitMin": 0,
+          "limitMax": 0,
+          "motorEnabled": false,
+          "motorTargetVel": 0,
+          "motorTargetPos": 0,
+          "motorStiffness": 0,
+          "motorDamping": 1
+        },
+        "EntityAttributes": {
+          "name": "constrain",
+          "isActive": true,
+          "sortOrder": 39,
+          "parentId": "",
+          "layer": "",
+          "guid": "e3f9c507-00c0-4fbf-a40d-721124e12e30",
+          "editorFolder": "manual_test"
+        }
+      }
+    }
+  ]
+}

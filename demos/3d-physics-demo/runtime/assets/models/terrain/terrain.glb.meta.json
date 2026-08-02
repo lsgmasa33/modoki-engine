@@ -1,0 +1,14 @@
+{
+  "id": "10443b75-a801-4199-846b-2ce8f49a3acd",
+  "version": 2,
+  "postprocessor": "none",
+  "generated": {
+    "meshes": [
+      "/assets/models/terrain/meshes/terrain.mesh.json"
+    ],
+    "materials": [
+      "/assets/models/terrain/materials/mat_ffffff.mat.json"
+    ],
+    "textures": []
+  }
+}

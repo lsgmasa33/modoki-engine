@@ -1,0 +1,637 @@
+{
+ "id": "a511e071-e7a0-499f-98e4-65201f95986b",
+ "version": 9,
+ "createdAt": "2026-07-02T06:00:00.000Z",
+ "resources": [],
+ "entities": [
+  {
+   "id": 1,
+   "name": "Camera",
+   "traits": {
+    "Transform": {
+     "x": 0,
+     "y": 0,
+     "z": 0,
+     "rx": 0,
+     "ry": 0,
+     "rz": 0,
+     "sx": 1,
+     "sy": 1,
+     "sz": 1
+    },
+    "Camera": {
+     "fov": 50,
+     "near": 0.1,
+     "far": 1000,
+     "overlayDistance": 10,
+     "clearColor": 921114
+    },
+    "EntityAttributes": {
+     "name": "Camera",
+     "isActive": true,
+     "sortOrder": 0,
+     "parentId": "",
+     "layer": "3d",
+     "guid": "72f07414-44c2-448a-99ff-8ebc4573a0bb"
+    }
+   }
+  },
+  {
+   "id": 2,
+   "name": "Physics2D",
+   "traits": {
+    "Physics2D": {
+     "gravityX": 0,
+     "gravityY": 16,
+     "pixelsPerMeter": 100
+    },
+    "EntityAttributes": {
+     "name": "Physics2D",
+     "isActive": true,
+     "sortOrder": 0,
+     "parentId": "",
+     "layer": "",
+     "guid": "44e61b4b-1dac-4967-914f-6e97cef3de93"
+    }
+   }
+  },
+  {
+   "id": 3,
+   "name": "Playground",
+   "traits": {
+    "RenderableUI": true,
+    "UIElement": {
+     "width": 100,
+     "height": 100,
+     "widthUnit": "%",
+     "heightUnit": "%",
+     "flexDirection": "column",
+     "flexWrap": "nowrap",
+     "justifyContent": "flex-start",
+     "alignItems": "stretch",
+     "gap": 0,
+     "flexGrow": 0,
+     "flexShrink": 1,
+     "paddingTop": 0,
+     "paddingTopUnit": "%",
+     "paddingLeft": 0,
+     "paddingLeftUnit": "%",
+     "paddingRight": 0,
+     "paddingRightUnit": "%",
+     "paddingBottom": 0,
+     "paddingBottomUnit": "%",
+     "marginTop": 0,
+     "marginTopUnit": "%",
+     "marginRight": 0,
+     "marginRightUnit": "%",
+     "marginBottom": 0,
+     "marginBottomUnit": "%",
+     "marginLeft": 0,
+     "marginLeftUnit": "%",
+     "minWidth": 0,
+     "minWidthUnit": "px",
+     "maxWidth": 0,
+     "maxWidthUnit": "px",
+     "minHeight": 0,
+     "minHeightUnit": "px",
+     "maxHeight": 0,
+     "maxHeightUnit": "px",
+     "alignSelf": "auto",
+     "zIndex": 0,
+     "overflow": "hidden",
+     "isVisible": true,
+     "backgroundColor": 1315880,
+     "backgroundOpacity": 1,
+     "borderRadius": 0,
+     "borderWidth": 0,
+     "borderColor": 3359829,
+     "opacity": 1,
+     "text": "",
+     "fontFamily": "",
+     "fontSize": 16,
+     "fontWeight": "normal",
+     "fontStyle": "normal",
+     "textColor": 16777215,
+     "textAlign": "left",
+     "lineHeight": 0,
+     "letterSpacing": 0,
+     "textShadowColor": 0,
+     "textShadowOffsetX": 0,
+     "textShadowOffsetY": 0,
+     "textShadowBlur": 0,
+     "textStrokeColor": 0,
+     "textStrokeWidth": 0,
+     "textOverflow": "clip",
+     "maxLines": 0,
+     "imageSrc": "",
+     "imageMode": "cover",
+     "elementType": "div",
+     "placeholder": "",
+     "rangeMin": 0,
+     "rangeMax": 100,
+     "rangeStep": 1
+    },
+    "Canvas2D": {
+     "referenceWidth": 1000,
+     "referenceHeight": 1000,
+     "scaleMode": "contain"
+    },
+    "UIAnchor": {
+     "anchor": "stretch",
+     "top": 0,
+     "topUnit": "px",
+     "left": 0,
+     "leftUnit": "px",
+     "right": 0,
+     "rightUnit": "px",
+     "bottom": 0,
+     "bottomUnit": "px",
+     "pivotX": 0,
+     "pivotY": 0,
+     "safeArea": false,
+     "zIndex": 0
+    },
+    "EntityAttributes": {
+     "name": "Playground",
+     "isActive": true,
+     "sortOrder": 0,
+     "parentId": "",
+     "layer": "ui",
+     "guid": "a92d95fd-80c8-4de5-8974-9c0687fc0383"
+    }
+   }
+  },
+  {
+   "id": 4,
+   "name": "Floor",
+   "traits": {
+    "Transform": {
+     "x": 500,
+     "y": 915,
+     "z": 0,
+     "rx": 0,
+     "ry": 0,
+     "rz": 0,
+     "sx": 1,
+     "sy": 1,
+     "sz": 1
+    },
+    "Renderable2D": {
+     "sprite": "square",
+     "color": 5923954,
+     "opacity": 1.0,
+     "width": 470,
+     "height": 14,
+     "pivotX": 0.5,
+     "pivotY": 0.5,
+     "keepAspect": false,
+     "isVisible": true
+    },
+    "RigidBody2D": {
+     "bodyType": "static",
+     "linearDamping": 0,
+     "angularDamping": 0.05,
+     "gravityScale": 1.0,
+     "fixedRotation": false,
+     "ccd": false,
+     "canSleep": true
+    },
+    "Collider2D": {
+     "shape": "box",
+     "radius": 0,
+     "halfW": 470,
+     "halfH": 14,
+     "points": "",
+     "density": 1,
+     "friction": 0.8,
+     "restitution": 0.0,
+     "isSensor": false,
+     "physicsLayer": "Ground",
+     "collisionGroups": 65535,
+     "collisionMask": 65535
+    },
+    "EntityAttributes": {
+     "name": "Floor",
+     "isActive": true,
+     "sortOrder": 0,
+     "parentId": "a92d95fd-80c8-4de5-8974-9c0687fc0383",
+     "layer": "2d",
+     "guid": "b49a9f7b-2b55-4f8f-80d4-5217435018f3"
+    }
+   }
+  },
+  {
+   "id": 5,
+   "name": "Bowl (concave)",
+   "traits": {
+    "Transform": {
+     "x": 340,
+     "y": 640,
+     "z": 0,
+     "rx": 0,
+     "ry": 0,
+     "rz": 0,
+     "sx": 1,
+     "sy": 1,
+     "sz": 1
+    },
+    "Renderable2D": {
+     "sprite": "collider",
+     "color": 1482885,
+     "opacity": 1.0,
+     "width": 210,
+     "height": 120,
+     "pivotX": 0.5,
+     "pivotY": 0.5,
+     "keepAspect": false,
+     "isVisible": true
+    },
+    "RigidBody2D": {
+     "bodyType": "static",
+     "linearDamping": 0,
+     "angularDamping": 0.05,
+     "gravityScale": 1.0,
+     "fixedRotation": false,
+     "ccd": false,
+     "canSleep": true
+    },
+    "Collider2D": {
+     "shape": "concave",
+     "radius": 0,
+     "halfW": 0,
+     "halfH": 0,
+     "points": "[[-210,-120],[-140,-120],[-140,70],[140,70],[140,-120],[210,-120],[210,120],[-210,120]]",
+     "density": 1,
+     "friction": 0.6,
+     "restitution": 0.05,
+     "isSensor": false,
+     "physicsLayer": "Ground",
+     "collisionGroups": 65535,
+     "collisionMask": 65535
+    },
+    "EntityAttributes": {
+     "name": "Bowl (concave)",
+     "isActive": true,
+     "sortOrder": 0,
+     "parentId": "a92d95fd-80c8-4de5-8974-9c0687fc0383",
+     "layer": "2d",
+     "guid": "cc4fa956-7a18-4d4e-b9cb-6ab7d84f2fe0"
+    }
+   }
+  },
+  {
+   "id": 6,
+   "name": "Ball 1",
+   "traits": {
+    "Transform": {
+     "x": 260,
+     "y": 120,
+     "z": 0,
+     "rx": 0,
+     "ry": 0,
+     "rz": 0,
+     "sx": 1,
+     "sy": 1,
+     "sz": 1
+    },
+    "Renderable2D": {
+     "sprite": "circle",
+     "color": 15158332,
+     "opacity": 1.0,
+     "width": 26,
+     "height": 26,
+     "pivotX": 0.5,
+     "pivotY": 0.5,
+     "keepAspect": false,
+     "isVisible": true
+    },
+    "RigidBody2D": {
+     "bodyType": "dynamic",
+     "linearDamping": 0,
+     "angularDamping": 0.05,
+     "gravityScale": 1.0,
+     "fixedRotation": false,
+     "ccd": false,
+     "canSleep": true
+    },
+    "Collider2D": {
+     "shape": "circle",
+     "radius": 26,
+     "halfW": 0,
+     "halfH": 0,
+     "points": "",
+     "density": 1,
+     "friction": 0.5,
+     "restitution": 0.15,
+     "isSensor": false,
+     "physicsLayer": "Default",
+     "collisionGroups": 65535,
+     "collisionMask": 65535
+    },
+    "EntityAttributes": {
+     "name": "Ball 1",
+     "isActive": true,
+     "sortOrder": 0,
+     "parentId": "a92d95fd-80c8-4de5-8974-9c0687fc0383",
+     "layer": "2d",
+     "guid": "7ab23412-2bcd-44e4-b0f9-7f5e46ed2143"
+    }
+   }
+  },
+  {
+   "id": 7,
+   "name": "Ball 2",
+   "traits": {
+    "Transform": {
+     "x": 310,
+     "y": 65,
+     "z": 0,
+     "rx": 0,
+     "ry": 0,
+     "rz": 0,
+     "sx": 1,
+     "sy": 1,
+     "sz": 1
+    },
+    "Renderable2D": {
+     "sprite": "circle",
+     "color": 15844367,
+     "opacity": 1.0,
+     "width": 26,
+     "height": 26,
+     "pivotX": 0.5,
+     "pivotY": 0.5,
+     "keepAspect": false,
+     "isVisible": true
+    },
+    "RigidBody2D": {
+     "bodyType": "dynamic",
+     "linearDamping": 0,
+     "angularDamping": 0.05,
+     "gravityScale": 1.0,
+     "fixedRotation": false,
+     "ccd": false,
+     "canSleep": true
+    },
+    "Collider2D": {
+     "shape": "circle",
+     "radius": 26,
+     "halfW": 0,
+     "halfH": 0,
+     "points": "",
+     "density": 1,
+     "friction": 0.5,
+     "restitution": 0.15,
+     "isSensor": false,
+     "physicsLayer": "Default",
+     "collisionGroups": 65535,
+     "collisionMask": 65535
+    },
+    "EntityAttributes": {
+     "name": "Ball 2",
+     "isActive": true,
+     "sortOrder": 0,
+     "parentId": "a92d95fd-80c8-4de5-8974-9c0687fc0383",
+     "layer": "2d",
+     "guid": "ad7d164f-36f1-4928-a28a-06f6e3aca4bc"
+    }
+   }
+  },
+  {
+   "id": 8,
+   "name": "Ball 3",
+   "traits": {
+    "Transform": {
+     "x": 360,
+     "y": 10,
+     "z": 0,
+     "rx": 0,
+     "ry": 0,
+     "rz": 0,
+     "sx": 1,
+     "sy": 1,
+     "sz": 1
+    },
+    "Renderable2D": {
+     "sprite": "circle",
+     "color": 3066993,
+     "opacity": 1.0,
+     "width": 26,
+     "height": 26,
+     "pivotX": 0.5,
+     "pivotY": 0.5,
+     "keepAspect": false,
+     "isVisible": true
+    },
+    "RigidBody2D": {
+     "bodyType": "dynamic",
+     "linearDamping": 0,
+     "angularDamping": 0.05,
+     "gravityScale": 1.0,
+     "fixedRotation": false,
+     "ccd": false,
+     "canSleep": true
+    },
+    "Collider2D": {
+     "shape": "circle",
+     "radius": 26,
+     "halfW": 0,
+     "halfH": 0,
+     "points": "",
+     "density": 1,
+     "friction": 0.5,
+     "restitution": 0.15,
+     "isSensor": false,
+     "physicsLayer": "Default",
+     "collisionGroups": 65535,
+     "collisionMask": 65535
+    },
+    "EntityAttributes": {
+     "name": "Ball 3",
+     "isActive": true,
+     "sortOrder": 0,
+     "parentId": "a92d95fd-80c8-4de5-8974-9c0687fc0383",
+     "layer": "2d",
+     "guid": "2c3f87e4-e40e-41cf-9391-770b719d8c16"
+    }
+   }
+  },
+  {
+   "id": 9,
+   "name": "Ball 4",
+   "traits": {
+    "Transform": {
+     "x": 410,
+     "y": -45,
+     "z": 0,
+     "rx": 0,
+     "ry": 0,
+     "rz": 0,
+     "sx": 1,
+     "sy": 1,
+     "sz": 1
+    },
+    "Renderable2D": {
+     "sprite": "circle",
+     "color": 3447003,
+     "opacity": 1.0,
+     "width": 26,
+     "height": 26,
+     "pivotX": 0.5,
+     "pivotY": 0.5,
+     "keepAspect": false,
+     "isVisible": true
+    },
+    "RigidBody2D": {
+     "bodyType": "dynamic",
+     "linearDamping": 0,
+     "angularDamping": 0.05,
+     "gravityScale": 1.0,
+     "fixedRotation": false,
+     "ccd": false,
+     "canSleep": true
+    },
+    "Collider2D": {
+     "shape": "circle",
+     "radius": 26,
+     "halfW": 0,
+     "halfH": 0,
+     "points": "",
+     "density": 1,
+     "friction": 0.5,
+     "restitution": 0.15,
+     "isSensor": false,
+     "physicsLayer": "Default",
+     "collisionGroups": 65535,
+     "collisionMask": 65535
+    },
+    "EntityAttributes": {
+     "name": "Ball 4",
+     "isActive": true,
+     "sortOrder": 0,
+     "parentId": "a92d95fd-80c8-4de5-8974-9c0687fc0383",
+     "layer": "2d",
+     "guid": "a87f00f9-f07e-4f9f-9535-2d20fe980c1b"
+    }
+   }
+  },
+  {
+   "id": 10,
+   "name": "Ball 5",
+   "traits": {
+    "Transform": {
+     "x": 335,
+     "y": -100,
+     "z": 0,
+     "rx": 0,
+     "ry": 0,
+     "rz": 0,
+     "sx": 1,
+     "sy": 1,
+     "sz": 1
+    },
+    "Renderable2D": {
+     "sprite": "circle",
+     "color": 10181046,
+     "opacity": 1.0,
+     "width": 26,
+     "height": 26,
+     "pivotX": 0.5,
+     "pivotY": 0.5,
+     "keepAspect": false,
+     "isVisible": true
+    },
+    "RigidBody2D": {
+     "bodyType": "dynamic",
+     "linearDamping": 0,
+     "angularDamping": 0.05,
+     "gravityScale": 1.0,
+     "fixedRotation": false,
+     "ccd": false,
+     "canSleep": true
+    },
+    "Collider2D": {
+     "shape": "circle",
+     "radius": 26,
+     "halfW": 0,
+     "halfH": 0,
+     "points": "",
+     "density": 1,
+     "friction": 0.5,
+     "restitution": 0.15,
+     "isSensor": false,
+     "physicsLayer": "Default",
+     "collisionGroups": 65535,
+     "collisionMask": 65535
+    },
+    "EntityAttributes": {
+     "name": "Ball 5",
+     "isActive": true,
+     "sortOrder": 0,
+     "parentId": "a92d95fd-80c8-4de5-8974-9c0687fc0383",
+     "layer": "2d",
+     "guid": "8cc5d7d6-6ead-41b4-9fb5-7bffa9c44ed4"
+    }
+   }
+  },
+  {
+   "id": 11,
+   "name": "Boomerang (dynamic concave)",
+   "traits": {
+    "Transform": {
+     "x": 760,
+     "y": 150,
+     "z": 0,
+     "rx": 0,
+     "ry": 0,
+     "rz": 0,
+     "sx": 1,
+     "sy": 1,
+     "sz": 1
+    },
+    "Renderable2D": {
+     "sprite": "collider",
+     "color": 2600544,
+     "opacity": 1.0,
+     "width": 110,
+     "height": 65,
+     "pivotX": 0.5,
+     "pivotY": 0.5,
+     "keepAspect": false,
+     "isVisible": true
+    },
+    "RigidBody2D": {
+     "bodyType": "dynamic",
+     "linearDamping": 0,
+     "angularDamping": 0.3,
+     "gravityScale": 1.0,
+     "fixedRotation": false,
+     "ccd": false,
+     "canSleep": true
+    },
+    "Collider2D": {
+     "shape": "concave",
+     "radius": 0,
+     "halfW": 0,
+     "halfH": 0,
+     "points": "[[-110,-40],[0,25],[110,-40],[110,25],[0,90],[-110,25]]",
+     "density": 1,
+     "friction": 0.7,
+     "restitution": 0.1,
+     "isSensor": false,
+     "physicsLayer": "Default",
+     "collisionGroups": 65535,
+     "collisionMask": 65535
+    },
+    "EntityAttributes": {
+     "name": "Boomerang (dynamic concave)",
+     "isActive": true,
+     "sortOrder": 0,
+     "parentId": "a92d95fd-80c8-4de5-8974-9c0687fc0383",
+     "layer": "2d",
+     "guid": "44bdb905-1460-4bba-9a0e-6792c928b553"
+    }
+   }
+  }
+ ]
+}

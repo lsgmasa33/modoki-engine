@@ -1,0 +1,11 @@
+{
+  "id": "29f3d8a3-9544-419a-a5c4-7452ebc028d1",
+  "version": 2,
+  "generated": {
+    "meshes": [
+      "/assets/models/terrain/meshes/terrain_col.mesh.json"
+    ],
+    "materials": [],
+    "textures": []
+  }
+}

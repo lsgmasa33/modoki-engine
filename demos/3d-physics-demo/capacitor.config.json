@@ -1,0 +1,19 @@
+{
+  "appId": "com.modokiengine.physics3ddemo",
+  "appName": "3D Physics Demo",
+  "webDir": "dist",
+  "ios": {
+    "preferredContentMode": "mobile"
+  },
+  "android": {
+    "allowMixedContent": true
+  },
+  "server": {
+    "androidScheme": "http"
+  },
+  "plugins": {
+    "Keyboard": {
+      "resize": "none"
+    }
+  }
+}

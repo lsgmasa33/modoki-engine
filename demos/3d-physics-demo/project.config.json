@@ -1,0 +1,59 @@
+{
+  "app": {
+    "appId": "com.modokiengine.physics3ddemo",
+    "appName": "3D Physics Demo",
+    "iconSource": ""
+  },
+  "content": {
+    "scenes": []
+  },
+  "build": {
+    "webDeployMode": "none",
+    "webBucket": "",
+    "webBasePath": "/",
+    "webCdnUrlMap": "",
+    "webCdnBackendBucket": "",
+    "webDeployCommand": "",
+    "appleTeamId": ""
+  },
+  "capacitor": {
+    "webDir": "dist",
+    "iosContentMode": "mobile",
+    "androidScheme": "http",
+    "allowMixedContent": true,
+    "keyboardResize": "none",
+    "orientation": "auto",
+    "statusBarHidden": false,
+    "statusBarStyle": "default"
+  },
+  "rendering": {
+    "targetFps": 60,
+    "three": {
+      "backend": "auto",
+      "antialias": true,
+      "pixelRatioCap": 2,
+      "shadows": true,
+      "toneMapping": "ACESFilmic",
+      "exposure": 1.1
+    },
+    "pixi": {
+      "backend": "auto",
+      "antialias": true,
+      "resolution": 0
+    },
+    "web": {
+      "sizeMode": "free",
+      "width": 1280,
+      "height": 720
+    }
+  },
+  "physics": {
+    "layers": [
+      "Default"
+    ],
+    "collisionMatrix": [
+      1
+    ]
+  },
+  "postprocessors": {}
+}

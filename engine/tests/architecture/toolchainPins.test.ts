@@ -143,3 +143,62 @@ describe('engine-owned typescript pins are deliberate, not drift', () => {
     }
   });
 });
+
+/** Guard: every workflow's `node-version` tracks PINNED_NODE's major — INCLUDING the `oss/`
+ *  overlay that ships to the public repo.
+ *
+ *  `nodeProvision.ts` already states the rule ("the pin must stay in lockstep with `@types/node`
+ *  and the workflows' `node-version`") and `nodeProvision.test.ts` asserts the pin is v24 — but
+ *  nothing ever read a workflow, so the rule was documented and unenforced. It drifted exactly
+ *  where you would expect: `9e632573` ("align on Node 24 Active LTS — types, CI, and the runtime
+ *  the editor SHIPS") updated the three PRIVATE workflows and missed all three in `oss/`, so the
+ *  public repo went on building the SHIPPED .dmg/.exe on Node 22 while package.json declared
+ *  `engines: >=24`. Nothing failed, because npm treats `engines` as a warning — the drift was
+ *  invisible by construction.
+ *
+ *  The overlay is the half that matters most and the half nobody looks at: it is not exercised by
+ *  any local gate, only by the public repo after a publish. Hence a test here rather than a note. */
+describe('workflow node-version tracks the provisioned Node', () => {
+  const WORKFLOW_DIRS = ['.github/workflows', 'oss/.github/workflows'];
+
+  function pins(): { file: string; version: string }[] {
+    const out: { file: string; version: string }[] = [];
+    for (const dir of WORKFLOW_DIRS) {
+      const abs = path.join(repoRoot, dir);
+      if (!fs.existsSync(abs)) continue;
+      for (const name of fs.readdirSync(abs)) {
+        if (!/\.ya?ml$/.test(name)) continue;
+        const src = fs.readFileSync(path.join(abs, name), 'utf8');
+        for (const m of src.matchAll(/^\s*node-version:\s*['"]?([0-9.]+)['"]?/gm)) {
+          out.push({ file: `${dir}/${name}`, version: m[1] });
+        }
+      }
+    }
+    return out;
+  }
+
+  it('every workflow (private AND the oss/ overlay) pins the PINNED_NODE major', () => {
+    // Read the pin from source rather than hard-coding 24 — a hard-coded copy is the same drift
+    // this guard exists to catch, one level up.
+    const src = fs.readFileSync(path.join(repoRoot, 'engine/toolchain/nodeProvision.ts'), 'utf8');
+    const pinned = src.match(/version:\s*'v(\d+)\./);
+    expect(pinned, 'could not read PINNED_NODE.version from nodeProvision.ts').not.toBeNull();
+    const major = pinned![1];
+
+    const wrong = pins().filter((p) => p.version.split('.')[0] !== major);
+    expect(
+      wrong.map((p) => `${p.file} → ${p.version}`),
+      `these workflows do not track PINNED_NODE (v${major}). The oss/ overlay is the easy one to ` +
+        'miss and the costly one to get wrong — it builds the artifacts users install.',
+    ).toEqual([]);
+  });
+
+  it('finds workflows in BOTH trees (the walker is not silently empty)', () => {
+    const found = pins();
+    expect(found.length, 'no node-version pins found at all — the walker is broken').toBeGreaterThan(3);
+    expect(
+      found.some((p) => p.file.startsWith('oss/')),
+      'the oss/ overlay was not scanned — that is the half that drifted',
+    ).toBe(true);
+  });
+});

@@ -1,0 +1,68 @@
+{
+  "id": "990e7e63-60eb-474d-97fb-86ae6af3f4e4",
+  "version": 1,
+  "name": "Terrain",
+  "rootLocalId": 1,
+  "entities": [
+    {
+      "localId": 1,
+      "name": "Terrain",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": 0,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "EntityAttributes": {
+          "name": "Terrain",
+          "isActive": true,
+          "sortOrder": 0,
+          "parentId": 0,
+          "layer": "",
+          "guid": ""
+        },
+        "ModelSource": {
+          "glbPath": "10443b75-a801-4199-846b-2ce8f49a3acd",
+          "postprocessor": "none",
+          "prefix": "terrain"
+        }
+      }
+    },
+    {
+      "localId": 2,
+      "name": "terrain",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": 0,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3D": {
+          "mesh": "11c1f8c8-ec0e-4a6f-a697-1ba37e50e2a3",
+          "material": "31346841-4eda-451a-a52a-da7ec87908b1",
+          "isVisible": true
+        },
+        "EntityAttributes": {
+          "name": "terrain",
+          "isActive": true,
+          "sortOrder": 0,
+          "parentId": 1,
+          "layer": "3d",
+          "guid": ""
+        }
+      }
+    }
+  ]
+}

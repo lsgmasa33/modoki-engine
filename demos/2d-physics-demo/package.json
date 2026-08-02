@@ -1,0 +1,13 @@
+{
+  "name": "@modoki-game/2d-physics-demo",
+  "version": "0.0.0",
+  "description": "Rapier2D physics showcase for the Modoki engine — joints, sensors, CCD, compound and concave colliders, and a platformer, authored almost entirely as scene data",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@capacitor/android": "^8.3.0",
+    "@capacitor/cli": "^8.3.0",
+    "@capacitor/core": "^8.3.0",
+    "@capacitor/ios": "^8.3.0"
+  }
+}

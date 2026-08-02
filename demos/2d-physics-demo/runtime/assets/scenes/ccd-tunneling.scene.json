@@ -1,0 +1,342 @@
+{
+ "id": "2af02673-27ae-4059-b422-330ffb617554",
+ "version": 9,
+ "createdAt": "2026-07-02T06:00:00.000Z",
+ "resources": [],
+ "entities": [
+  {
+   "id": 1,
+   "name": "Camera",
+   "traits": {
+    "Transform": {
+     "x": 0,
+     "y": 0,
+     "z": 0,
+     "rx": 0,
+     "ry": 0,
+     "rz": 0,
+     "sx": 1,
+     "sy": 1,
+     "sz": 1
+    },
+    "Camera": {
+     "fov": 50,
+     "near": 0.1,
+     "far": 1000,
+     "overlayDistance": 10,
+     "clearColor": 921114
+    },
+    "EntityAttributes": {
+     "name": "Camera",
+     "isActive": true,
+     "sortOrder": 0,
+     "parentId": "",
+     "layer": "3d",
+     "guid": "b11b3657-d7b4-4bdf-8430-2d086d502d51"
+    }
+   }
+  },
+  {
+   "id": 2,
+   "name": "Physics2D",
+   "traits": {
+    "Physics2D": {
+     "gravityX": 250,
+     "gravityY": 0,
+     "pixelsPerMeter": 100
+    },
+    "EntityAttributes": {
+     "name": "Physics2D",
+     "isActive": true,
+     "sortOrder": 0,
+     "parentId": "",
+     "layer": "",
+     "guid": "1a5d4ced-a99d-429e-b250-c8a364f2c491"
+    }
+   }
+  },
+  {
+   "id": 3,
+   "name": "Playground",
+   "traits": {
+    "RenderableUI": true,
+    "UIElement": {
+     "width": 100,
+     "height": 100,
+     "widthUnit": "%",
+     "heightUnit": "%",
+     "flexDirection": "column",
+     "flexWrap": "nowrap",
+     "justifyContent": "flex-start",
+     "alignItems": "stretch",
+     "gap": 0,
+     "flexGrow": 0,
+     "flexShrink": 1,
+     "paddingTop": 0,
+     "paddingTopUnit": "%",
+     "paddingLeft": 0,
+     "paddingLeftUnit": "%",
+     "paddingRight": 0,
+     "paddingRightUnit": "%",
+     "paddingBottom": 0,
+     "paddingBottomUnit": "%",
+     "marginTop": 0,
+     "marginTopUnit": "%",
+     "marginRight": 0,
+     "marginRightUnit": "%",
+     "marginBottom": 0,
+     "marginBottomUnit": "%",
+     "marginLeft": 0,
+     "marginLeftUnit": "%",
+     "minWidth": 0,
+     "minWidthUnit": "px",
+     "maxWidth": 0,
+     "maxWidthUnit": "px",
+     "minHeight": 0,
+     "minHeightUnit": "px",
+     "maxHeight": 0,
+     "maxHeightUnit": "px",
+     "alignSelf": "auto",
+     "zIndex": 0,
+     "overflow": "hidden",
+     "isVisible": true,
+     "backgroundColor": 1315880,
+     "backgroundOpacity": 1,
+     "borderRadius": 0,
+     "borderWidth": 0,
+     "borderColor": 3359829,
+     "opacity": 1,
+     "text": "",
+     "fontFamily": "",
+     "fontSize": 16,
+     "fontWeight": "normal",
+     "fontStyle": "normal",
+     "textColor": 16777215,
+     "textAlign": "left",
+     "lineHeight": 0,
+     "letterSpacing": 0,
+     "textShadowColor": 0,
+     "textShadowOffsetX": 0,
+     "textShadowOffsetY": 0,
+     "textShadowBlur": 0,
+     "textStrokeColor": 0,
+     "textStrokeWidth": 0,
+     "textOverflow": "clip",
+     "maxLines": 0,
+     "imageSrc": "",
+     "imageMode": "cover",
+     "elementType": "div",
+     "placeholder": "",
+     "rangeMin": 0,
+     "rangeMax": 100,
+     "rangeStep": 1
+    },
+    "Canvas2D": {
+     "referenceWidth": 1000,
+     "referenceHeight": 1000,
+     "scaleMode": "contain"
+    },
+    "UIAnchor": {
+     "anchor": "stretch",
+     "top": 0,
+     "topUnit": "px",
+     "left": 0,
+     "leftUnit": "px",
+     "right": 0,
+     "rightUnit": "px",
+     "bottom": 0,
+     "bottomUnit": "px",
+     "pivotX": 0,
+     "pivotY": 0,
+     "safeArea": false,
+     "zIndex": 0
+    },
+    "EntityAttributes": {
+     "name": "Playground",
+     "isActive": true,
+     "sortOrder": 0,
+     "parentId": "",
+     "layer": "ui",
+     "guid": "82724c73-4be0-4893-8c7c-86f6d8c34310"
+    }
+   }
+  },
+  {
+   "id": 4,
+   "name": "Wall (thin)",
+   "traits": {
+    "Transform": {
+     "x": 850,
+     "y": 300,
+     "z": 0,
+     "rx": 0,
+     "ry": 0,
+     "rz": 0,
+     "sx": 1,
+     "sy": 1,
+     "sz": 1
+    },
+    "Renderable2D": {
+     "sprite": "square",
+     "color": 8949916,
+     "opacity": 1.0,
+     "width": 2,
+     "height": 250,
+     "pivotX": 0.5,
+     "pivotY": 0.5,
+     "keepAspect": false,
+     "isVisible": true
+    },
+    "RigidBody2D": {
+     "bodyType": "static",
+     "linearDamping": 0,
+     "angularDamping": 0.05,
+     "gravityScale": 1.0,
+     "fixedRotation": false,
+     "ccd": false,
+     "canSleep": true
+    },
+    "Collider2D": {
+     "shape": "box",
+     "radius": 0,
+     "halfW": 2,
+     "halfH": 250,
+     "points": "",
+     "density": 1,
+     "friction": 0.3,
+     "restitution": 0.2,
+     "isSensor": false,
+     "physicsLayer": "Ground",
+     "collisionGroups": 65535,
+     "collisionMask": 65535
+    },
+    "EntityAttributes": {
+     "name": "Wall (thin)",
+     "isActive": true,
+     "sortOrder": 0,
+     "parentId": "82724c73-4be0-4893-8c7c-86f6d8c34310",
+     "layer": "2d",
+     "guid": "c2666346-90db-4e7c-971c-fc66082d6192"
+    }
+   }
+  },
+  {
+   "id": 5,
+   "name": "Ball \u2014 CCD On (stops at wall)",
+   "traits": {
+    "Transform": {
+     "x": 80,
+     "y": 240,
+     "z": 0,
+     "rx": 0,
+     "ry": 0,
+     "rz": 0,
+     "sx": 1,
+     "sy": 1,
+     "sz": 1
+    },
+    "Renderable2D": {
+     "sprite": "circle",
+     "color": 3066993,
+     "opacity": 1.0,
+     "width": 5,
+     "height": 5,
+     "pivotX": 0.5,
+     "pivotY": 0.5,
+     "keepAspect": false,
+     "isVisible": true
+    },
+    "RigidBody2D": {
+     "bodyType": "dynamic",
+     "linearDamping": 0,
+     "angularDamping": 0.05,
+     "gravityScale": 1.0,
+     "fixedRotation": false,
+     "ccd": true,
+     "canSleep": true
+    },
+    "Collider2D": {
+     "shape": "circle",
+     "radius": 5,
+     "halfW": 0,
+     "halfH": 0,
+     "points": "",
+     "density": 1,
+     "friction": 0.2,
+     "restitution": 0.1,
+     "isSensor": false,
+     "physicsLayer": "Default",
+     "collisionGroups": 65535,
+     "collisionMask": 65535
+    },
+    "EntityAttributes": {
+     "name": "Ball \u2014 CCD On (stops at wall)",
+     "isActive": true,
+     "sortOrder": 0,
+     "parentId": "82724c73-4be0-4893-8c7c-86f6d8c34310",
+     "layer": "2d",
+     "guid": "6a99aa79-47d7-4cf7-91c7-b0274b975085"
+    }
+   }
+  },
+  {
+   "id": 6,
+   "name": "Ball \u2014 CCD Off (tunnels through)",
+   "traits": {
+    "Transform": {
+     "x": 80,
+     "y": 360,
+     "z": 0,
+     "rx": 0,
+     "ry": 0,
+     "rz": 0,
+     "sx": 1,
+     "sy": 1,
+     "sz": 1
+    },
+    "Renderable2D": {
+     "sprite": "circle",
+     "color": 15158332,
+     "opacity": 1.0,
+     "width": 5,
+     "height": 5,
+     "pivotX": 0.5,
+     "pivotY": 0.5,
+     "keepAspect": false,
+     "isVisible": true
+    },
+    "RigidBody2D": {
+     "bodyType": "dynamic",
+     "linearDamping": 0,
+     "angularDamping": 0.05,
+     "gravityScale": 1.0,
+     "fixedRotation": false,
+     "ccd": false,
+     "canSleep": true
+    },
+    "Collider2D": {
+     "shape": "circle",
+     "radius": 5,
+     "halfW": 0,
+     "halfH": 0,
+     "points": "",
+     "density": 1,
+     "friction": 0.2,
+     "restitution": 0.1,
+     "isSensor": false,
+     "physicsLayer": "Default",
+     "collisionGroups": 65535,
+     "collisionMask": 65535
+    },
+    "EntityAttributes": {
+     "name": "Ball \u2014 CCD Off (tunnels through)",
+     "isActive": true,
+     "sortOrder": 0,
+     "parentId": "82724c73-4be0-4893-8c7c-86f6d8c34310",
+     "layer": "2d",
+     "guid": "b5fcc852-3640-4e63-9569-e3fff833bf1a"
+    }
+   }
+  }
+ ]
+}

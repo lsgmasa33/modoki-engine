@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "color": 16777215,
+  "roughness": 1,
+  "metalness": 1,
+  "emissive": 0,
+  "emissiveIntensity": 1,
+  "transparent": false,
+  "opacity": 1,
+  "side": "front",
+  "alphaTest": 0,
+  "envMapIntensity": 1,
+  "aoMapIntensity": 1,
+  "lightMapIntensity": 1,
+  "bumpScale": 1,
+  "displacementScale": 1,
+  "displacementBias": 0,
+  "normalScale": 1,
+  "flatShading": false,
+  "wireframe": false,
+  "vertexColors": false,
+  "id": "31346841-4eda-451a-a52a-da7ec87908b1"
+}
