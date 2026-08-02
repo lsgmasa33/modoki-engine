@@ -75,3 +75,17 @@ export function hasOssOverlay(): boolean {
 export function hasInternalGames(): boolean {
   return discoverProjects(REPO_ROOT).some((p) => p.root === 'games');
 }
+
+/** True when ANY project exists under ANY root — `games/` OR `demos/`.
+ *
+ *  The honest name for the loose check. Use it ONLY where "is there something to scan?" is
+ *  genuinely the question — e.g. a sanity assertion that a walk found assets at all. If the
+ *  test needs internal game CONTENT (a baseline, an allowlist, a specific asset), it wants
+ *  `hasInternalGames()` instead; the two are NOT interchangeable, and the CI snapshot is the
+ *  case that separates them (it ships demos, no games).
+ *
+ *  This exists as a named export rather than an inline `discoverProjects(...).length > 0`
+ *  precisely so the choice between loose and strict is visible at the call site. */
+export function hasAnyProject(): boolean {
+  return discoverProjects(REPO_ROOT).length > 0;
+}

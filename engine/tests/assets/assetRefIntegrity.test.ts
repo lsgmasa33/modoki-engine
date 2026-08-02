@@ -21,14 +21,16 @@ import fs from 'fs';
 import { findAssetRoots, readAssetGuid, detectType, type AssetRoot } from '../../plugins/vite-asset-scanner';
 import { deriveGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { resolveTextureType } from '../../packages/modoki/src/runtime/loaders/textureSettings';
-import { discoverProjects } from '../../scripts/projectRoots.mjs';
+import { hasAnyProject } from '../helpers/repoLayout';
 
 // engine/tests/assets/ → repo root (games/ + demos/ + engine/packages/modoki live there).
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
-// The "real assets" checks below scan the repo's shipped PROJECT assets (findAssetRoots
-// already covers both project roots); skip the project-dependent cases when neither root
-// exists (engine-only OSS repo). docs/engine-oss-publishing.md.
-const hasGames = discoverProjects(PROJECT_ROOT).length > 0;
+// The "real assets" checks below scan the repo's shipped PROJECT assets (findAssetRoots covers
+// both project roots), so the LOOSE predicate is the right one here: the question is "is there
+// anything to scan?", not "is internal game content present". Named accordingly — this was
+// `hasGames` while meaning "any project", and that mismatch caused the same bug three times
+// (see repoLayout.ts). docs/engine-oss-publishing.md.
+const hasProjectAssets = hasAnyProject();
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isGuid = (s: unknown): s is string => typeof s === 'string' && GUID_RE.test(s);
 
@@ -101,7 +103,7 @@ const REF_BEARING_TYPES = new Set(['scene', 'prefab', 'mesh', 'material', 'parti
 const refBearing = assets.filter((a) => REF_BEARING_TYPES.has(a.type));
 
 describe('asset GUID reference integrity (real assets)', () => {
-  it.skipIf(!hasGames)('finds the shipped assets (sanity: the suite is actually scanning)', () => {
+  it.skipIf(!hasProjectAssets)('finds the shipped assets (sanity: the suite is actually scanning)', () => {
     // Asserts the SCAN worked, not that any particular asset KIND exists. `particles.length > 0`
     // used to stand in for "scanning works" and was wrong for a reason worth recording: it is a
     // claim about content. The public snapshot ships two physics demos and no particles at all,
@@ -292,7 +294,7 @@ describe('sprites-only 2D references (real assets)', () => {
 // ── P5: skeletal animset assets ────────────────────────────────────────────
 const animsets = assets.filter((a) => a.type === 'animset');
 
-describe.skipIf(!hasGames)('skeletal animset assets (real assets)', () => {
+describe.skipIf(!hasProjectAssets)('skeletal animset assets (real assets)', () => {
   it('every .animset.json has a valid in-file GUID id and a clips array', () => {
     const bad: string[] = [];
     for (const a of animsets) {

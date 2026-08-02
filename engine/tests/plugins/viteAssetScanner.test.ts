@@ -24,12 +24,16 @@ import {
   type AssetRoot,
 } from '../../plugins/vite-asset-scanner';
 import { findGamesEntry } from '../../plugins/findGamesEntry';
+import { hasInternalGames } from '../helpers/repoLayout';
 
 // engine/tests/plugins/ → repo root (games/ + engine/packages/modoki live there).
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
 // Skip the game-directory-discovery cases when games/ is absent (engine-only OSS repo).
+// STRICT on purpose: these assert on `/games/3d-test/assets` specifically, so `demos/` alone
+// must not satisfy it — the CI snapshot ships demos and no games. Routed through the shared
+// helper rather than a local existsSync so there is ONE definition of this question.
 // docs/engine-oss-publishing.md.
-const hasGames = fs.existsSync(path.join(PROJECT_ROOT, 'games'));
+const hasGames = hasInternalGames();
 
 describe('detectType', () => {
   it('classifies a .shader.json as a shader asset', () => {
