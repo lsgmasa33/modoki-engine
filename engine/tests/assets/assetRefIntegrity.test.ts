@@ -102,7 +102,13 @@ const refBearing = assets.filter((a) => REF_BEARING_TYPES.has(a.type));
 
 describe('asset GUID reference integrity (real assets)', () => {
   it.skipIf(!hasGames)('finds the shipped assets (sanity: the suite is actually scanning)', () => {
-    expect(particles.length).toBeGreaterThan(0);
+    // Asserts the SCAN worked, not that any particular asset KIND exists. `particles.length > 0`
+    // used to stand in for "scanning works" and was wrong for a reason worth recording: it is a
+    // claim about content. The public snapshot ships two physics demos and no particles at all,
+    // so it failed there with `expected 0 to be greater than 0` — a content gap reported as a
+    // broken scanner. Particle correctness is covered by the particle tests below, which run
+    // wherever particles actually exist.
+    expect(assets.length).toBeGreaterThan(0);
     expect(refBearing.length).toBeGreaterThan(0);
   });
 
@@ -303,20 +309,44 @@ describe.skipIf(!hasGames)('skeletal animset assets (real assets)', () => {
     expect(bad).toEqual([]);
   });
 
-  it('the alien-animal animset resolves to its authored per-clip params', async () => {
-    const aa = animsets.find((a) => a.url.endsWith('alien-animal.animset.json'));
-    expect(aa, 'alien-animal animset present').toBeTruthy();
-    const def = JSON.parse(fs.readFileSync(aa!.abs, 'utf-8'));
+});
+
+// Reads the TESTBED fixture, not a real game — so it runs everywhere, including the public
+// snapshot which ships no games/ (#97). It was `alien-animal.animset.json`, found via the scan
+// above; that coupled a test of *engine resolution logic* to one game's authored content, and it
+// broke twice over: the asset vanished in the snapshot, AND the enclosing `hasGames` guard went
+// TRUE there anyway once two demos shipped, so it ran and failed instead of skipping.
+//
+// Deliberately read by PATH rather than through `collectAssets()`: the testbed is not under a
+// PROJECT_ROOT_DIRS root, so `discoverProjects()` — and therefore the scan — cannot see it. That
+// is by design (see the fixture's CLAUDE.md); a test must point at it explicitly.
+describe('animset param resolution (testbed fixture)', () => {
+  const ANIMSET = path.resolve(
+    __dirname, '../fixtures/testbed/runtime/assets/animsets/testbed.animset.json',
+  );
+
+  it('resolves authored per-clip params, and falls back per FIELD for anything unauthored', async () => {
+    const def = JSON.parse(fs.readFileSync(ANIMSET, 'utf-8'));
     const { resolveAnimSetParams, setAnimSet, clearAnimSetCache, ANIMSET_DEFAULTS } =
       await import('../../packages/modoki/src/runtime/loaders/animSetCache');
     clearAnimSetCache();
-    setAnimSet('aa', def);
-    // Authored values come through…
-    expect(resolveAnimSetParams('aa', 'Run-Cycle')).toEqual({ speed: 1.2, loop: true, fadeDuration: 0.2 });
-    expect(resolveAnimSetParams('aa', 'Attack_Bite')).toEqual({ speed: 1, loop: false, fadeDuration: 0.1 });
-    expect(resolveAnimSetParams('aa', 'Idel_Normal')).toEqual({ speed: 1, loop: true, fadeDuration: 0.3 });
-    // …and an unlisted clip falls back to engine defaults.
-    expect(resolveAnimSetParams('aa', 'NotAClip')).toEqual(ANIMSET_DEFAULTS);
-    clearAnimSetCache();
+    setAnimSet('tb', def);
+    try {
+      // Authored values come through…
+      expect(resolveAnimSetParams('tb', 'Loop-Fast')).toEqual({ speed: 1.2, loop: true, fadeDuration: 0.2 });
+      expect(resolveAnimSetParams('tb', 'OneShot')).toEqual({ speed: 1, loop: false, fadeDuration: 0.1 });
+      expect(resolveAnimSetParams('tb', 'Idle')).toEqual({ speed: 1, loop: true, fadeDuration: 0.3 });
+      // …a PARTIALLY authored clip keeps its own field and defaults the rest. The old
+      // alien-animal fixture had no such clip, so this merge path went uncovered.
+      expect(resolveAnimSetParams('tb', 'PartiallyAuthored')).toEqual({
+        speed: 0.5,
+        loop: ANIMSET_DEFAULTS.loop,
+        fadeDuration: ANIMSET_DEFAULTS.fadeDuration,
+      });
+      // …and an unlisted clip falls back to engine defaults wholesale.
+      expect(resolveAnimSetParams('tb', 'NotAClip')).toEqual(ANIMSET_DEFAULTS);
+    } finally {
+      clearAnimSetCache();
+    }
   });
 });
