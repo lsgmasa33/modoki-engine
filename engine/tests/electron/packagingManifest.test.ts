@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import yaml from 'js-yaml';
 import picomatch from 'picomatch';
+import { hasOssOverlay } from '../helpers/repoLayout';
 
 /**
  * PACKAGING GUARD — electron-builder.yml packaging contract.
@@ -141,7 +142,9 @@ describe('electron-builder packaging manifest', () => {
  * Asserted as a PAIR — the two workflows are twins and the bug was exactly one of
  * them drifting from the other, which a single-platform test cannot catch.
  */
-describe('OSS release workflows attach the electron-updater manifest', () => {
+// The public engine snapshot does not ship the oss/ publish overlay it is itself built
+// from (it IS the output of that overlay) — nothing to read here in that checkout.
+describe.skipIf(!hasOssOverlay())('OSS release workflows attach the electron-updater manifest', () => {
   const cases = [
     { file: 'release-windows.yml', manifest: 'release/latest.yml', installer: 'release/*.exe' },
     { file: 'release.yml', manifest: 'release/latest-mac.yml', installer: 'release/*.dmg' },

@@ -1,0 +1,151 @@
+{
+  "id": "195cb815-e2c5-489e-8c4b-fb1f0b7b878f",
+  "version": 12,
+  "createdAt": "1970-01-01T00:00:00.000Z",
+  "resources": [],
+  "entities": [
+    {
+      "id": 1,
+      "name": "Main Camera",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": 6,
+          "z": 12,
+          "rx": -0.45,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Camera": {
+          "fov": 50,
+          "near": 0.1,
+          "far": 500,
+          "clearColor": 2832981
+        },
+        "EntityAttributes": {
+          "name": "Main Camera",
+          "isActive": true,
+          "sortOrder": 0,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "9554579c-7466-427a-8d5c-bbf3c7529309"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "name": "Ambient Light",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": 0,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Light": {
+          "lightType": "ambient",
+          "color": 16777215,
+          "intensity": 0.6
+        },
+        "EntityAttributes": {
+          "name": "Ambient Light",
+          "isActive": true,
+          "sortOrder": 10,
+          "parentId": "",
+          "layer": "",
+          "guid": "484886b8-3e88-4ca3-8e25-5e6829721208"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "name": "Sun",
+      "traits": {
+        "Transform": {
+          "x": 5,
+          "y": 10,
+          "z": 4,
+          "rx": -0.9396258266828337,
+          "ry": 0.24449494730810023,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Light": {
+          "lightType": "directional",
+          "color": 16774368,
+          "intensity": 1.4,
+          "castShadow": true
+        },
+        "EntityAttributes": {
+          "name": "Sun",
+          "isActive": true,
+          "sortOrder": 11,
+          "parentId": "",
+          "layer": "",
+          "guid": "b82f30ac-cd66-4930-a5e5-6ffa483ba0d9"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "name": "HUD",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "width": 100,
+          "widthUnit": "%",
+          "height": 100,
+          "heightUnit": "%",
+          "flexDirection": "column",
+          "justifyContent": "center",
+          "alignItems": "center",
+          "isVisible": true
+        },
+        "UIAnchor": {
+          "anchor": "stretch"
+        },
+        "EntityAttributes": {
+          "name": "HUD",
+          "isActive": true,
+          "sortOrder": 0,
+          "parentId": "",
+          "layer": "ui",
+          "guid": "bc80376e-e389-426f-9b92-d5e4ba35dbea"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "name": "Title",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "text": "Testbed",
+          "fontSize": 48,
+          "fontWeight": "bold",
+          "textColor": 16777215,
+          "textAlign": "center",
+          "isVisible": true
+        },
+        "EntityAttributes": {
+          "name": "Title",
+          "isActive": true,
+          "sortOrder": 0,
+          "parentId": "bc80376e-e389-426f-9b92-d5e4ba35dbea",
+          "layer": "ui",
+          "guid": "1d339dc8-d25a-4886-9fa3-a65f7ce8259b"
+        }
+      }
+    }
+  ]
+}

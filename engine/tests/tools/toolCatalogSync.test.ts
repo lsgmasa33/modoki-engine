@@ -19,7 +19,12 @@ import { CONTRACTS } from '../../tools/modoki-mcp/src/contracts';
 import { renderCatalog, extractCatalog, CATALOG_BEGIN, CATALOG_END } from '../../tools/modoki-mcp/src/toolCatalog';
 
 const DOC = join(__dirname, '../../../docs/debug-tools-mcp.md');
-const doc = readFileSync(DOC, 'utf8');
+// Normalise CRLF → LF. `renderCatalog()` emits \n, so on a checkout where this .md landed with
+// CRLF the comparison below fails showing two strings that look CHARACTER-FOR-CHARACTER
+// IDENTICAL in the diff — which is how it presented on the public repo's Windows leg, where the
+// snapshot ships no line-ending pins of its own (see oss/.gitattributes). The pins fix the
+// checkout; this makes the test correct regardless of how any checkout is configured.
+const doc = readFileSync(DOC, 'utf8').replace(/\r\n/g, '\n');
 
 describe('the generated tool catalog is in sync with the contract table', () => {
   it('the markers are present, exactly once each', () => {

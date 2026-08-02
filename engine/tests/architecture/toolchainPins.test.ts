@@ -34,6 +34,7 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { hasOssOverlay } from '../helpers/repoLayout';
 
 const repoRoot = path.resolve(__dirname, '../../..');
 
@@ -193,9 +194,33 @@ describe('workflow node-version tracks the provisioned Node', () => {
     ).toEqual([]);
   });
 
-  it('finds workflows in BOTH trees (the walker is not silently empty)', () => {
+  it('finds workflows in every tree that is present (the walker is not silently empty)', () => {
+    // Independently count workflow FILES that mention `node-version:` at all, via simple
+    // string search rather than pins()'s own regex — so this is a genuine cross-check on
+    // the walker, not a tautology. Derived from what's actually on disk (not a hardcoded
+    // 3) so it stays meaningful in the public snapshot, which ships only some workflows.
+    const filesWithNodeVersion: string[] = [];
+    for (const dir of WORKFLOW_DIRS) {
+      const abs = path.join(repoRoot, dir);
+      if (!fs.existsSync(abs)) continue;
+      for (const name of fs.readdirSync(abs)) {
+        if (!/\.ya?ml$/.test(name)) continue;
+        if (fs.readFileSync(path.join(abs, name), 'utf8').includes('node-version:')) {
+          filesWithNodeVersion.push(`${dir}/${name}`);
+        }
+      }
+    }
+    expect(filesWithNodeVersion.length, 'no workflow files on disk mention node-version — nothing to prove').toBeGreaterThan(0);
+
     const found = pins();
-    expect(found.length, 'no node-version pins found at all — the walker is broken').toBeGreaterThan(3);
+    expect(found.length, 'no node-version pins found at all — the walker is broken').toBeGreaterThanOrEqual(filesWithNodeVersion.length);
+  });
+
+  // The oss/ overlay is what CI publishes and builds the shipped installers from — but a
+  // checkout of the public snapshot IS that overlay's output, so it never carries oss/
+  // itself; nothing to scan there in that case.
+  it.skipIf(!hasOssOverlay())('the oss/ overlay is scanned too — that is the half that drifted before', () => {
+    const found = pins();
     expect(
       found.some((p) => p.file.startsWith('oss/')),
       'the oss/ overlay was not scanned — that is the half that drifted',

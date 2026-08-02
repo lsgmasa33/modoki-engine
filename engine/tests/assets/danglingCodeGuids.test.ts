@@ -30,6 +30,7 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { hasRealProjects } from '../helpers/repoLayout';
 
 const REPO = path.resolve(__dirname, '../../..');
 const GUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
@@ -72,7 +73,11 @@ function definedGuids(files: string[]): Set<string> {
 }
 
 describe('GUID literals in game code resolve to a real asset or entity (#70)', () => {
-  it('has no dangling GUID in games/ or demos/', () => {
+  // The public engine snapshot ships neither games/ nor demos/ — with no game code and no
+  // committed JSON to scan, both safety assertions below ("found no GUIDs at all" /
+  // "scanned no game .ts files") would fire for the wrong reason: nothing walked, not a
+  // broken walker.
+  it.skipIf(!hasRealProjects())('has no dangling GUID in games/ or demos/', () => {
     const files = ['games', 'demos']
       .map((r) => path.join(REPO, r))
       .filter((d) => fs.existsSync(d))

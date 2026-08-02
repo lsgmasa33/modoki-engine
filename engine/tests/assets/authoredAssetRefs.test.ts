@@ -34,11 +34,12 @@ import { describe, it, expect } from 'vitest';
 import path from 'path';
 import fs from 'fs';
 import { findAssetRoots, readAssetGuid, detectType, type AssetRoot } from '../../plugins/vite-asset-scanner';
-import { discoverProjects } from '../../scripts/projectRoots.mjs';
+import { hasRealProjects } from '../helpers/repoLayout';
 
 // engine/tests/assets/ → repo root (games/ + demos/ live there).
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
-const hasGames = discoverProjects(PROJECT_ROOT).length > 0;
+// The public engine snapshot ships neither games/ nor demos/ — nothing to audit there.
+const hasGames = hasRealProjects();
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isGuid = (s: unknown): s is string => typeof s === 'string' && GUID_RE.test(s);
 
