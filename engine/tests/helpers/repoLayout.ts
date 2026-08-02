@@ -56,9 +56,22 @@ export function hasOssOverlay(): boolean {
   return fs.existsSync(path.join(REPO_ROOT, 'oss', '.github', 'workflows'));
 }
 
-/** True when at least one real project exists under `games/` or `demos/` — the public
- *  engine snapshot ships neither, so every audit that polices actual game content is
- *  meaningless (and would false-fail on an empty walk) without this. */
-export function hasRealProjects(): boolean {
-  return discoverProjects(REPO_ROOT).length > 0;
+/** True when the INTERNAL `games/` root exists and holds at least one project.
+ *
+ *  Deliberately NOT "any project under any root". `discoverProjects()` also enumerates
+ *  `demos/`, and the CI snapshot DOES ship two demos — so a `length > 0` check reads TRUE
+ *  there and the guarded test runs anyway, against content that cannot satisfy it. That is
+ *  not hypothetical: it is how this failed twice. `assetRefIntegrity`'s own `hasGames` guard
+ *  went true once demos shipped and the test failed instead of skipping; then the first
+ *  version of THIS helper repeated the mistake, and four audits kept failing on the public
+ *  gate for exactly the same reason.
+ *
+ *  Every caller polices `games/` content specifically — baselines of blank asset refs,
+ *  the pending-migration backlog, KNOWN_ESCAPES, a minimum game-`.ts` count. Two published
+ *  demos satisfy "a project exists" without satisfying any of those premises.
+ *
+ *  The lesson, worth keeping: gate on the thing the test actually needs, not on a proxy that
+ *  happens to correlate with it today. */
+export function hasInternalGames(): boolean {
+  return discoverProjects(REPO_ROOT).some((p) => p.root === 'games');
 }

@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest'
 import fs from 'node:fs'
 import path from 'node:path'
 import type { UserConfig } from 'vite'
-import { hasRealProjects } from '../helpers/repoLayout'
+import { hasInternalGames } from '../helpers/repoLayout'
 
 /**
  * Regression guard for the packaged-editor "project opens TWICE" bug.
@@ -27,13 +27,13 @@ import { hasRealProjects } from '../helpers/repoLayout'
  *     the SAME resolved path, so cold-scan-time and live-import-time resolution agree.
  */
 // Requires a real `games/3d-test` project, which the PUBLIC engine snapshot
-// (lsgmasa33/modoki-engine) does not ship. NOTE: hasRealProjects() only proves `games/`
+// (lsgmasa33/modoki-engine) does not ship. NOTE: hasInternalGames() only proves `games/`
 // exists in this checkout — it does NOT prove games/3d-test's `node_modules` (in particular
 // `@capacitor-firebase/analytics` + `@capacitor-firebase/crashlytics`) are installed. A clone
 // that has `games/` but never ran the per-game `npm install` for 3d-test will still fail these
 // assertions — that is a real signal (the deps genuinely are not there), not a bug in this gate,
 // so the `fs.existsSync` checks below are left as-is rather than weakened to paper over it.
-describe.skipIf(!hasRealProjects())('vite.config native-SDK app-services deps (packaged double-reload fix)', () => {
+describe.skipIf(!hasInternalGames())('vite.config native-SDK app-services deps (packaged double-reload fix)', () => {
   const ENV_KEYS = ['MODOKI_VITE_CACHEDIR', 'MODOKI_PROJECT'] as const
   const prevEnv: Record<string, string | undefined> = {}
   for (const k of ENV_KEYS) prevEnv[k] = process.env[k]
