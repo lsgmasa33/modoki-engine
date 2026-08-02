@@ -151,3 +151,95 @@ jobs:
           path: test-results/
           retention-days: 7
           if-no-files-found: ignore
+
+  # ── Packaged editor: DMG + Windows installer, as ARTIFACTS ────────────────────────────────────
+  # NOT a release. No tag, no signing, no publish, nothing uploaded to Releases — the real release
+  # pipelines (release.yml / release-windows.yml) stay the only things that ship. These exist to
+  # catch PACKAGING breaks, which is a class the unit gate structurally cannot see: everything here
+  # can be green while the packaged app fails to build or start, because packaging exercises
+  # electron-builder, the beforePack stagers, asar layout and native deps — none of which `npm test`
+  # touches.
+  #
+  # Free on public runners, and macos-14 is where that matters most: privately macOS carries a 10x
+  # multiplier, so this is the leg that could never be afforded on a per-push basis. Windows is 2x
+  # and is where this repo's packaging bugs actually live (the GNU-tar-vs-bsdtar bug broke ALL
+  # packaged toolchain provisioning while the smoke gate stayed green).
+  #
+  # UNSIGNED on purpose. The public repo has no signing material for these, and it should not:
+  # an unsigned artifact proves the BUILD, which is what is being gated. CSC_IDENTITY_AUTO_DISCOVERY
+  # is off so electron-builder does not go hunting for a keychain identity and fail the job on its
+  # absence.
+  #
+  # ⚠️ These artifacts are NOT shippable, and not only because they are unsigned. The release
+  # workflows INSTALL toktx + msdf-atlas-gen before packing, because the beforePack stagers
+  # (stage-toktx.cjs / stage-msdf.cjs) copy whatever is on the build machine into
+  # Resources/bin — and when the tools are absent they degrade SILENTLY (log + skip). These jobs
+  # skip those installs to keep a per-push gate cheap, so the app they produce ships toolless:
+  # fine for proving the build, wrong for handing to anyone. Download them to debug packaging,
+  # never to distribute.
+  #
+  # Deliberately NOT wired here: `assert-app-renders.sh`, the render gate. That is #94's job and
+  # its own change — a build gate and a render gate fail for different reasons and should be
+  # legible apart.
+  package:
+    name: package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14        # Apple Silicon — matches the shipped build target
+            script: dist:mac
+            artifact: modoki-editor-dmg
+            path: release/*.dmg
+          - os: windows-latest
+            script: dist:win
+            artifact: modoki-editor-installer
+            path: release/*.exe
+    steps:
+      - name: Enable long paths (Windows)
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build native plugin packages
+        run: npm run build:plugins
+
+      - name: Build the packaged editor
+        env:
+          # No keychain/cert on these runners, and none wanted — see the header.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run ${{ matrix.script }}
+
+      # A silent electron-builder no-op would otherwise upload nothing and still go green, which
+      # is the failure mode this whole job exists to avoid. Fail loudly on an empty output.
+      - name: Verify an artifact was actually produced
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(${{ matrix.path }})
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no artifact matched '${{ matrix.path }}' — electron-builder produced nothing."
+            ls -la release/ || echo "(no release/ directory at all)"
+            exit 1
+          fi
+          printf 'built: %s\n' "${files[@]}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.path }}
+          # Short on purpose: these rebuild on every push to main, so they are a rolling
+          # build check, not an archive. The real releases are the durable artifacts.
+          retention-days: 5
+          if-no-files-found: error
