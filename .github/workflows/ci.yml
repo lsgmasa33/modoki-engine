@@ -93,3 +93,61 @@ jobs:
 
       - name: Engine tests
         run: npm --prefix engine/packages/modoki test
+
+  # ── Playwright e2e — the ONLY end-to-end coverage of editor interaction that exists ────────────
+  # It has never had a CI counterpart anywhere, private or public, and that is exactly how two
+  # specs rotted silently for months: `editor-2d-ui` waited on a DOM canvas the PixiJS cutover had
+  # deleted, and `editor-assets` clicked a button title a refactor had removed. Nothing was
+  # watching, so nothing complained.
+  #
+  # Runs here because it is free, and because the private repo deliberately runs it only on the
+  # hub clone before a push — one machine, one person remembering.
+  #
+  # ubuntu ONLY, on purpose. The value is "e2e runs at all"; a Windows browser leg is a different
+  # question (different GPU/ANGLE stack, different flake profile) and would double the wall-clock
+  # to re-prove mostly the same thing. Revisit if a Windows-only editor-input bug ever appears.
+  #
+  # Separate job, not another step in `check`: it needs a browser download the unit gate does not,
+  # and keeping it separate means a red e2e is legible at a glance instead of hidden inside a
+  # matrix leg that also runs typecheck.
+  e2e:
+    name: e2e (editor, chromium)
+    runs-on: ubuntu-latest
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'   # e2e drives the Vite dev server in a browser, not Electron
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build native plugin packages
+        run: npm run build:plugins
+
+      # `--with-deps` installs the system libraries headless Chromium needs on a bare runner.
+      # Only chromium: the suite declares no `projects`, so it runs the default browser alone —
+      # installing all three would cost a download for nothing.
+      - name: Install Playwright chromium
+        run: npx playwright install --with-deps chromium
+
+      # The suite runs SERIAL (workers: 1) and retries: 0, both deliberate — see
+      # engine/playwright.config.ts. A flake here is meant to be indistinguishable from a
+      # regression precisely so neither gets ignored; do not add retries to quiet it.
+      - name: e2e
+        run: npm run test:e2e
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-traces
+          # Repo ROOT, not engine/ — Playwright resolves outputDir against the process cwd, and
+          # `npm run test:e2e` runs from the root. Verified on disk; a wrong path here would fail
+          # silently as "no artifacts found" exactly when you need the trace.
+          path: test-results/
+          retention-days: 7
+          if-no-files-found: ignore
