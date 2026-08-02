@@ -18,20 +18,22 @@ import { fileURLToPath } from 'node:url';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
 
 /** Walk up from this file's own location (not `process.cwd()`, which varies with how the
- *  test runner was invoked) until we find the repo root — identified by the root
- *  `package.json` (`name: "modoki-app"`, see root CLAUDE.md) sitting next to the `engine/`
- *  tree. Throws rather than guessing: a helper that silently resolves to the wrong root
- *  would make every predicate below lie. */
+ *  test runner was invoked) until we find the repo root: a directory holding BOTH a
+ *  `package.json` and the `engine/` tree.
+ *
+ *  Deliberately does NOT key on the package NAME. `scripts/publish-engine-oss.sh` rewrites
+ *  it from `modoki-app` to `modoki-engine` when it assembles the public snapshot, so a name
+ *  check resolves here and throws there — which is exactly what happened on the public CI's
+ *  first run with this helper. The structural marker holds in both repos.
+ *
+ *  Throws rather than guessing: a helper that silently resolved to the wrong root would make
+ *  every predicate below lie, and a predicate that lies switches tests off without a word. */
 function findRepoRoot(): string {
   const start = path.dirname(fileURLToPath(import.meta.url));
   let dir = start;
   for (let i = 0; i < 12; i++) {
-    const pkgPath = path.join(dir, 'package.json');
-    if (fs.existsSync(pkgPath)) {
-      try {
-        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as { name?: string };
-        if (pkg.name === 'modoki-app' && fs.existsSync(path.join(dir, 'engine'))) return dir;
-      } catch { /* not the one, keep walking */ }
+    if (fs.existsSync(path.join(dir, 'package.json')) && fs.existsSync(path.join(dir, 'engine'))) {
+      return dir;
     }
     const parent = path.dirname(dir);
     if (parent === dir) break;
