@@ -9,7 +9,7 @@
  *    - a spurious warning on every legitimate DMG session trains the reader to ignore it. */
 
 import { describe, it, expect } from 'vitest';
-import { identityMismatch, tokenMismatchWarning, describeIdentity, isWithin, type BackendIdentity } from '../../tools/modoki-mcp/src/identity';
+import { identityMismatch, tokenMismatchWarning, describeIdentity, isWithin, type BackendIdentity } from '../../tools/shared/identity';
 
 const URL_ = 'http://127.0.0.1:5180';
 
@@ -39,6 +39,43 @@ describe('isWithin', () => {
     expect(isWithin('/a/b/', '/a/b')).toBe(true);
     expect(isWithin('/a/b', '/a/b/')).toBe(true);
   });
+
+  // ── Windows path shapes (#30 close-out) ────────────────────────────────────────────
+  // These are pure string comparisons, so they run identically on either OS — a Linux CI
+  // leg catches a Windows-only regression here.
+
+  it('REGRESSION: a backslash descendant is inside its parent', () => {
+    // The bug: norm() stripped only '/' and isWithin joined only with '/', so EVERY
+    // Windows session run from a subdirectory warned "WRONG EDITOR" against its own
+    // editor. It was visible as far back as the Run 1 Windows log, where the MCP's own
+    // `npm --prefix engine/tools/modoki-mcp` smoke was written off as a benign
+    // "cwd artifact" — it was this. See docs/plans/modoki-mcp-tools-windows-test.md.
+    expect(isWithin('E:\\Projects\\modoki\\games\\3d-test', 'E:\\Projects\\modoki')).toBe(true);
+    expect(isWithin('E:\\Projects\\modoki\\engine\\tools\\modoki-mcp', 'E:\\Projects\\modoki')).toBe(true);
+  });
+
+  it('folds drive-letter case, which spells the same dir two ways', () => {
+    expect(isWithin('e:\\Projects\\modoki\\games', 'E:\\Projects\\modoki')).toBe(true);
+    expect(isWithin('E:\\Projects\\modoki\\games', 'e:\\Projects\\modoki')).toBe(true);
+  });
+
+  it('treats mixed separators as the same path', () => {
+    expect(isWithin('E:/Projects/modoki/games', 'E:\\Projects\\modoki')).toBe(true);
+  });
+
+  it('stays segment-aware on Windows: the sibling clone is still NOT inside', () => {
+    // The fix must not buy the subdirectory case by widening into a naive prefix match —
+    // this is the pair the whole feature exists to tell apart.
+    expect(isWithin('E:\\Projects\\modoki-ai2', 'E:\\Projects\\modoki-ai')).toBe(false);
+  });
+
+  it('does NOT fold case beyond the drive letter (Linux is case-sensitive)', () => {
+    expect(isWithin('/a/B', '/a/b')).toBe(false);
+  });
+
+  it('a genuinely different Windows checkout is still outside', () => {
+    expect(isWithin('E:\\Projects\\other', 'E:\\Projects\\modoki')).toBe(false);
+  });
 });
 
 describe('identityMismatch', () => {
@@ -64,6 +101,27 @@ describe('identityMismatch', () => {
 
   it('stays silent when the served repo is inside the cwd', () => {
     expect(identityMismatch(identity({ repoRoot: '/Users/x/Projects/modoki-ai' }), '/Users/x/Projects', URL_)).toBeNull();
+  });
+
+  // ── Windows, through the predicate production actually calls (#30 close-out) ────────
+  // isWithin is the unit; identityMismatch is the seam the MCP servers drive
+  // (modoki-mcp/src/context.ts, game-debug-mcp/src/mcp-tools.ts) on every tool result.
+
+  it('REGRESSION: a Windows DEV editor run from a subdirectory does not cry wolf', () => {
+    // Pre-fix this warned on every Windows session, which trains the reader to ignore the
+    // one warning that matters. A dev (NOT packaged) editor is required to reach the path
+    // compare at all — `if (id.packaged) return null` short-circuits before it.
+    const win = identity({ repoRoot: 'E:\\Projects\\modoki', branch: 'win' });
+    expect(identityMismatch(win, 'E:\\Projects\\modoki\\games\\3d-test', URL_)).toBeNull();
+    expect(identityMismatch(win, 'E:\\Projects\\modoki\\engine\\tools\\modoki-mcp', URL_)).toBeNull();
+    expect(identityMismatch(win, 'E:\\Projects\\modoki', URL_)).toBeNull();
+  });
+
+  it('still warns for a genuinely different Windows checkout', () => {
+    // The false-positive fix must not cost the true positive.
+    const win = identity({ repoRoot: 'E:\\Projects\\modoki', branch: 'win' });
+    const warning = identityMismatch(win, 'E:\\Projects\\modoki-other', URL_);
+    expect(warning).toContain('WRONG EDITOR');
   });
 
   it('never warns for a PACKAGED editor, whose repoRoot is inside the .app bundle', () => {

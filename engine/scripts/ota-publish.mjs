@@ -167,7 +167,7 @@ async function main() {
       const raw = execSync(`gcloud storage cat ${q(releasePath)}`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString('utf8');
       existingRelease = JSON.parse(raw);
     } catch {
-      generation = '0';
+      // generation is already '0' (the declaration default).
       if (attempt === 1) console.log('[ota-publish] No existing release.json — creating the first one.');
     }
 

@@ -9,6 +9,8 @@
  *  be imported by a test, so anything with logic in it ships unguarded. See
  *  `docs/mcp-response-budget.md` Phase 5, and the Phase-1 review that learned this the hard way. */
 
+import type { ToolErrorDetail } from './result.js';
+
 export interface AssetEntry { guid: string; path: string; name: string; type: string }
 export interface TraitSchema { category?: string; fields?: Record<string, unknown> }
 
@@ -50,7 +52,9 @@ export function summarizeAssets(assets: AssetEntry[], q: AssetQuery = {}) {
 
 export interface TraitQuery { name?: string; all?: boolean }
 export type TraitResult =
-  | { error: string }
+  /** A §5 envelope detail, not a message: the two failure modes here need DIFFERENT codes
+   *  ("could not look" vs "not there"), and the caller reacts differently to each. */
+  | { error: Omit<ToolErrorDetail, 'tool'> }
   | { schemaAvailable?: boolean; traits: Record<string, TraitSchema> }
   | { schemaAvailable?: boolean; traitCount: number; byCategory: Record<string, string[]>; hint: string };
 
@@ -70,10 +74,21 @@ export function summarizeTraits(
       // silent too, and `list_traits {name:'Transform'}` told the agent Transform is not a
       // registered trait. It then abandoned a perfectly good setTrait. (C7)
       if (schemaAvailable === false || Object.keys(traits).length === 0) {
-        return { error: `the trait registry is EMPTY — no editor renderer has pushed it yet (cold start, or the window is reloading). This says NOTHING about whether "${q.name}" exists. Wait for the editor window to finish loading, then retry.` };
+        return { error: {
+          code: 'NO_RENDERER',
+          what: `look up the field schema for trait "${q.name}"`,
+          why: 'the trait registry is EMPTY — no editor renderer has pushed it yet (cold start, or the window is reloading). This says NOTHING about whether the trait exists.',
+          options: ['wait for the editor window to finish loading, then retry', 'check the editor is running: modoki_identity'],
+        } };
       }
       const near = Object.keys(traits).filter((t) => t.toLowerCase().includes(q.name!.toLowerCase())).slice(0, 8);
-      return { error: `unknown trait "${q.name}"${near.length ? ` — did you mean: ${near.join(', ')}?` : ''}` };
+      return { error: {
+        code: 'NOT_FOUND',
+        what: `look up the field schema for trait "${q.name}"`,
+        why: 'no registered trait has that name. Trait names are case-sensitive.',
+        got: q.name,
+        ...(near.length ? { options: near } : { options: ['call modoki_list_traits bare for every registered name, grouped by category'] }),
+      } };
     }
     return { schemaAvailable, traits: { [q.name]: hit } };
   }

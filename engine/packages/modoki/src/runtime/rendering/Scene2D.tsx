@@ -53,7 +53,7 @@ import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_2D, PRI
 import { sceneManager } from '../scene/SceneManager';
 import { isImagePath, resolveImageUrl, resolvePrimitiveShape, getWorldTransform2D, resolveSprite, type ResolvedSprite } from './renderUtils';
 import { computePivotOffset, computeSpriteScale, drawPrimitiveShapeGfx, drawColliderFillGfx, drawColliderOutlineGfx, colliderOutlineSig, COLLIDER_SPRITE, pixiBlendMode2D } from './render2DUtils';
-import { computeCanvasScale } from './canvas2DScaler';
+import { computeCanvasScale, canvasPxToClient } from './canvas2DScaler';
 import { getSpriteEpoch } from '../loaders/assetManifest';
 import { ensureSpriteMaterial, clearSpriteMaterialCache } from '../loaders/spriteMaterialCache';
 import { makePixiShaderInstance, type PixiShaderProgram } from './pixiShaderBuilder';
@@ -68,7 +68,7 @@ import {
 import { addDirtyListener, onStructureDirty } from '../core/ecs/entityUtils';
 import { isSimRunning, onPlayStateChange } from '../core/playState';
 import { Canvas2DPool, defaultPool } from './canvas2DPool';
-import { registerBoundsProvider, type EntityScreenBounds } from '../core/screenBounds';
+import { registerBoundsProvider, type BoundsSurface, type EntityScreenBounds } from '../core/screenBounds';
 import { ensurePixiKtxTranscoder } from '../loaders/pixiKtxTranscoder';
 
 // ── Display object tracking ──
@@ -697,8 +697,15 @@ export class Scene2DRenderer {
         const refW = c2d.referenceWidth || 1080;
         const refH = c2d.referenceHeight || 1920;
         const mode = c2d.scaleMode || 'fitH';
+        // The container this scale/offset positions lives in the Pixi renderer's
+        // logical `screen` space, NOT necessarily the canvas's backing-pixel size —
+        // those diverge once a project pins `rendering.pixi.resolution` > 0 (which
+        // turns on autoDensity in canvas2DPool). Falls back to the backing size
+        // pre-init (screen isn't available yet, and at that point they're equal).
+        const actualW = slot.app.renderer?.screen?.width || slot.canvas.width;
+        const actualH = slot.app.renderer?.screen?.height || slot.canvas.height;
         const { scaleX, scaleY, offsetX, offsetY, compensateX, compensateY } =
-          computeCanvasScale(refW, refH, slot.canvas.width, slot.canvas.height, mode);
+          computeCanvasScale(refW, refH, actualW, actualH, mode);
         slot.container.scale.set(scaleX, scaleY);
         slot.container.position.set(offsetX, offsetY);
         this.canvasCompensate.set(canvasEntityId, { x: compensateX, y: compensateY });
@@ -1411,28 +1418,41 @@ export class Scene2DRenderer {
     this.pool.renderAll(this.dirtyCanvases);
   }
 
+  /** Which on-screen surface THIS instance speaks for — `'game-2d'` for the primary
+   *  runtime/GameView renderer, `'scene-view'` for the editor's own instance (#80). Single
+   *  source of truth for both the `registerBoundsProvider` label and the rect stamp below —
+   *  deriving both from this getter means they can't drift apart. */
+  private get boundsSurface(): BoundsSurface { return this.primary ? 'game-2d' : 'scene-view'; }
+
   /** Screen-bounds provider (layout-bounds agent op): map each Renderable2D's live
    *  PixiJS bounds → viewport CSS px via its canvas, so an agent gets numeric 2D rects
-   *  (overlap/off-screen) without a screenshot. Best-effort + guarded. Registered only
-   *  by the primary renderer (the runtime/GameView view the agent inspects). */
+   *  (overlap/off-screen) without a screenshot. Best-effort + guarded. Registered by every
+   *  instance — primary (GameView) and non-primary (editor SceneView, #80) alike — each
+   *  labelling its rects with its own `boundsSurface`. */
   private bounds2DProvider(ids?: Set<number>): EntityScreenBounds[] {
+    const surface = this.boundsSurface;
     const out: EntityScreenBounds[] = [];
     for (const [id, slot] of this.slots) {
       if (ids && !ids.has(id)) continue;
       const canvasId = this.canvasOfEntity.get(id);
       const cSlot = canvasId != null ? this.pool.getSlot(canvasId) : null;
-      if (!cSlot) { out.push({ id, layer: '2d', screen: null, onScreen: false }); continue; }
+      if (!cSlot || !cSlot.canvas.isConnected) { out.push({ id, layer: '2d', surface, screen: null, onScreen: false, canvasId }); continue; }
       try {
         const b = slot.obj.getBounds(); // PixiJS Bounds in the renderer's logical (screen) space
         const rect = cSlot.canvas.getBoundingClientRect();
-        const lw = cSlot.app.renderer?.screen?.width || cSlot.canvas.width || rect.width || 1;
-        const lh = cSlot.app.renderer?.screen?.height || cSlot.canvas.height || rect.height || 1;
-        const sx = rect.width / lw, sy = rect.height / lh;
-        const x = rect.left + b.minX * sx, y = rect.top + b.minY * sy;
-        const w = (b.maxX - b.minX) * sx, h = (b.maxY - b.minY) * sy;
+        if (rect.width <= 0 || rect.height <= 0) { out.push({ id, layer: '2d', surface, screen: null, onScreen: false, canvasId }); continue; }
+        // Same canvas-px→client transform bounds2DProvider and screenToReference2D/
+        // referenceToScreen2D share (canvas2DScaler.ts) — one source of truth for the
+        // client↔canvas coordinate space, so a reported bounds rect and an aim computed
+        // from the design space always agree.
+        const backingW = cSlot.app.renderer?.screen?.width || cSlot.canvas.width || 1;
+        const backingH = cSlot.app.renderer?.screen?.height || cSlot.canvas.height || 1;
+        const p0 = canvasPxToClient(b.minX, b.minY, rect, backingW, backingH);
+        const p1 = canvasPxToClient(b.maxX, b.maxY, rect, backingW, backingH);
+        const x = p0.x, y = p0.y, w = p1.x - p0.x, h = p1.y - p0.y;
         const onScreen = x < rect.right && x + w > rect.left && y < rect.bottom && y + h > rect.top;
-        out.push({ id, layer: '2d', screen: { x, y, w, h }, onScreen });
-      } catch { out.push({ id, layer: '2d', screen: null, onScreen: false }); }
+        out.push({ id, layer: '2d', surface, screen: { x, y, w, h }, onScreen, canvasId });
+      } catch { out.push({ id, layer: '2d', surface, screen: null, onScreen: false, canvasId }); }
     }
     return out;
   }
@@ -1502,10 +1522,11 @@ export class Scene2DRenderer {
       this._externalDirty = true;  // redraw the incoming scene
     });
 
-    if (this.primary) {
-      sceneManager.registerBeforeSwap(prewarmHook);
-      this.unsubBounds = registerBoundsProvider((ids) => this.bounds2DProvider(ids));
-    }
+    if (this.primary) sceneManager.registerBeforeSwap(prewarmHook);
+    // Registered unconditionally (#80): the editor's non-primary SceneView instance needs a
+    // bounds provider too, just labelled 'scene-view' instead of 'game-2d' — prewarmHook stays
+    // primary-gated above since it's a module-level hook that must not double-run.
+    this.unsubBounds = registerBoundsProvider((ids) => this.bounds2DProvider(ids), this.boundsSurface);
   }
 
   stop() {

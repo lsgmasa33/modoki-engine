@@ -36,6 +36,7 @@ import { createOverLifeLUT, type OverLifeLUT } from './gpuLut';
 import { makeParticlePrimitiveGeometry } from './meshParticles';
 import { orientSampleUv, radialAlpha, softParticleFade, spriteFrameNode, spriteSheetUv } from './billboardTsl';
 import { textureProvider } from '../core/textureProvider';
+import { warnVocabOnce } from '../core/warnVocab';
 
 function loadTexture3D(ref: string, opts?: { flipY?: boolean }): Promise<THREE.Texture> {
   const p = textureProvider.get();
@@ -216,6 +217,7 @@ function applyUniforms(u: GpuUniforms, def: ParticleEffectDef): void {
   u.noiseStr.value = def.noise?.strength ?? 0;
   u.noiseFreq.value = def.noise?.frequency ?? 1;
   u.noiseScroll.value = def.noise?.scrollSpeed ?? 1;
+  if (!(def.shape.type in SHAPE)) warnVocabOnce('particles', 'EmitterShape.type', def.shape.type, "treated as 'point'");
   u.shapeType.value = SHAPE[def.shape.type] ?? 0;
   const rsh = resolveShape(def.shape);
   u.radiusInner.value = rsh.innerR;

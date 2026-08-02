@@ -9,7 +9,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
-  editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled,
+  editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled, withEditorActor,
 } from '@modoki/engine/editor';
 import {
   emit, journalEvents, clearJournal, setJournalEnabled, createTestWorld, type TestWorld,
@@ -29,11 +29,16 @@ beforeEach(() => {
 });
 afterEach(() => { game?.dispose(); game = undefined; });
 
+// Mirrors the `editor`/`timeline` item shapes the op actually returns (readEditorJournal's
+// EditorEvent — seq/cap/ts/type/source/payload — isn't exported from editorJournal.ts, so
+// this is hand-typed rather than imported; kept accurate to that shape, not a partial guess).
 type Result = {
-  editor: Array<{ type: string }>; editorTotal: number; byType: Record<string, number>;
+  editor: Array<{ seq: number; cap: number; ts: number; type: string; source: 'human' | 'agent'; payload?: unknown }>;
+  editorTotal: number; byType: Record<string, number>;
   truncated?: boolean; hint?: string;
   game?: unknown[]; gameTotal?: number; gameByType?: Record<string, number>;
-  timeline?: Array<{ stream: string }>; timelineTotal?: number;
+  timeline?: Array<{ stream: 'editor' | 'game'; cap: number; ts: number; type: string }>;
+  timelineTotal?: number;
 };
 
 describe('editor-journal: tail + histogram at the op', () => {
@@ -196,5 +201,50 @@ describe('editor-journal: forward cursor windows oldest-after-cursor', () => {
     expect(r.timeline.map((e) => e.cap)).toEqual(caps.slice(0, 20)); // OLDEST 20, in order
     expect(r.truncated).toBe(true);
     expect(r.nextCap).toBe(caps[19]);
+  });
+});
+
+// #28 — the long-poll twin of editor-journal.
+describe('wait-for-edit op', () => {
+  it('resolves immediately when a matching event is already pending', async () => {
+    editorEmit('!edit');
+    const r = await runAgentOp('wait-for-edit', { since: 0, timeoutMs: 5000 }) as { timedOut: boolean; events: unknown[] };
+    expect(r.timedOut).toBe(false);
+    expect(r.events).toHaveLength(1);
+  });
+
+  it('times out with {events:[], timedOut:true} — a normal result, not a thrown error', async () => {
+    const r = await runAgentOp('wait-for-edit', { since: 0, timeoutMs: 20 }) as { timedOut: boolean; events: unknown[] };
+    expect(r.timedOut).toBe(true);
+    expect(r.events).toEqual([]);
+  });
+
+  it('defaults source to "human" — an agent-sourced edit does not wake it', async () => {
+    const p = runAgentOp('wait-for-edit', { since: 0, timeoutMs: 200 }) as Promise<{ timedOut: boolean }>;
+    withEditorActor('agent', () => editorEmit('!edit')); // must be ignored
+    const r = await p;
+    expect(r.timedOut).toBe(true);
+  });
+
+  it('a human edit wakes it before the deadline', async () => {
+    const p = runAgentOp('wait-for-edit', { since: 0, timeoutMs: 5000 }) as Promise<{ timedOut: boolean; events: Array<{ type: string }> }>;
+    editorEmit('!select');
+    const r = await p;
+    expect(r.timedOut).toBe(false);
+    expect(r.events.map((e) => e.type)).toEqual(['!select']);
+  });
+
+  // Regression guard for the fix: this op is registered via the RAW op registry
+  // (bypassing the `registerAgentOp` wrapper that shadows every other op), specifically
+  // BECAUSE that wrapper holds the ambient actor='agent' for the whole lifetime of an
+  // async handler — and this handler can legitimately be in flight for up to two minutes.
+  // If it were wrapped, any human editor action committed anywhere while a wait-for-edit
+  // call is parked would be mis-tagged source:'agent' in the journal.
+  it('does NOT hold the ambient actor as "agent" while parked — a concurrent human edit stays tagged human', async () => {
+    const p = runAgentOp('wait-for-edit', { since: 0, timeoutMs: 5000 }) as Promise<unknown>;
+    await Promise.resolve(); // let the op start and register its listener
+    editorEmit('!select'); // simulates an unrelated human UI action while the op is in flight
+    expect(readEditorJournal()[0].source).toBe('human');
+    await p; // resolves via the emit above — nothing left parked
   });
 });

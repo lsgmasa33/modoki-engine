@@ -169,6 +169,10 @@ describe('Phase 4 gate 1 — path-independence: cold chain load vs. carried leve
     await b.load('/level1.json');
     const baseB = await b.serializeBase();
 
+    // `id` belongs in this comparison as much as `createdAt` does — both are facts
+    // about the FILE, and leaving it out is how a re-minted scene guid went unnoticed
+    // until it dangled a real reference (sceneIdStability.test.ts).
+    expect(normalize(baseB.id)).toBe(normalize(baseA.id));
     expect(normalize(baseB.createdAt)).toBe(normalize(baseA.createdAt));
     expect(normalize(baseB.entities)).toEqual(normalize(baseA.entities));
   });
@@ -185,6 +189,7 @@ describe('Phase 4 gate 1 — path-independence: cold chain load vs. carried leve
     await b.load('/level1.json');
     const primaryB = await b.serializeScene();
 
+    expect(normalize(primaryB.id)).toBe(normalize(primaryA.id));
     expect(normalize(primaryB.createdAt)).toBe(normalize(primaryA.createdAt));
     expect(normalize(primaryB.entities)).toEqual(normalize(primaryA.entities));
   });

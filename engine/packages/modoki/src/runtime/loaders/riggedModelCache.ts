@@ -25,7 +25,7 @@ import { isInternalAssetPath, getAssetEntry } from './assetManifest';
 import { modelGlbUrl, resolveRefWarnOnce } from './modelGlbUrl';
 import { addToOwnerSet, removeFromOwnerSet } from './ownerSet';
 import { lodUrlSuffix } from './modelSettings';
-import { getKTX2Loader, onRendererReady } from './textureResolver';
+import { getKTX2Loader, ensureKtx2Caps } from './textureResolver';
 import { getModelPostprocessor } from './modelPostprocessorRegistry';
 import { takeParsedGltf, disposePendingGltf } from './parsedGltfHandoff';
 
@@ -224,14 +224,15 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
     );
     // An optimized rigged GLB (`.processed.glb`) carries its textures as embedded
     // KTX2 (KHR_texture_basisu), decoded by the shared KTX2Loader the GLTFLoader
-    // was handed above. That loader can't decode until setActiveRenderer wires its
-    // GPU caps (detectSupport), so start the load only once the renderer is ready —
-    // otherwise the GLTFLoader's internal KTX2 decode races WebGPU init and throws
-    // "Missing initialization with `.detectSupport( renderer )`" (the same Android
-    // race fixed for loadTexture3D). onRendererReady fires synchronously if the
-    // renderer is already active; a rigged model only loads in a 3D-render context,
-    // so the renderer always arrives (a 2D-only `disable3D` game never gets here).
-    onRendererReady(() => tryLoad(0));
+    // was handed above. That loader can't decode until GPU caps are known
+    // (detectSupport), so start the load only once they are — otherwise the
+    // GLTFLoader's internal KTX2 decode races WebGPU init and throws "Missing
+    // initialization with `.detectSupport( renderer )`" (the same Android race
+    // fixed for loadTexture3D). This is a KTX2-CAPS concern, not "a viewport is
+    // live" — `ensureKtx2Caps` resolves via a real viewport when one exists, or a
+    // throwaway probe when none does (scene load no longer waits for a viewport
+    // to exist; see docs/textures.md, "Runtime resolution").
+    void ensureKtx2Caps().then(() => tryLoad(0));
   }).finally(() => {
     loadPromises.delete(path);
   });

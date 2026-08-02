@@ -1,9 +1,16 @@
-/** canvas2DScaler unit tests — edge cases and negative inputs not covered by app-level tests. */
+// @vitest-environment jsdom
+/** canvas2DScaler unit tests — edge cases and negative inputs not covered by app-level tests.
+ *  jsdom (not the package's node default) because clientToDesign2D/designToClient2D tests
+ *  below need a real HTMLCanvasElement + `document`. */
 
 import { describe, it, expect } from 'vitest';
 
+import {
+  computeCanvasScale, screenToReference2D, referenceToScreen2D, clientToDesign2D, designToClient2D,
+} from '../../src/runtime/rendering/canvas2DScaler';
+
 async function getModule() {
-  return import('../../../src/runtime/rendering/canvas2DScaler');
+  return { computeCanvasScale, screenToReference2D, referenceToScreen2D, clientToDesign2D, designToClient2D };
 }
 
 describe('computeCanvasScale edge cases', () => {
@@ -173,5 +180,86 @@ describe('screenToReference2D — the pick coordinate inverse (Phase 2)', () => 
     const center = screenToReference2D(rect.width / 2, rect.height / 2, rect, backingW, backingH, cs);
     expect(center.x).toBeCloseTo(refW / 2, 3);
     expect(center.y).toBeCloseTo(refH / 2, 3);
+  });
+});
+
+// referenceToScreen2D is the forward twin of screenToReference2D, added so bounds reporting
+// (Scene2D.tsx's bounds2DProvider) and agent-aim (games/court's clientToDesign2D usage) share
+// ONE coordinate transform instead of each re-deriving it — see docs/todo.md's "bounds coords
+// don't match the aim space" entry. referenceToScreen2D ∘ screenToReference2D must be the
+// identity for every scale mode and any device-pixel-ratio / viewZoom baked into the rect.
+describe('referenceToScreen2D — the forward twin (round-trip with screenToReference2D)', () => {
+  it('round-trips reference→client→reference for every scale mode', async () => {
+    const { computeCanvasScale, screenToReference2D, referenceToScreen2D } = await getModule();
+    const refW = 1080, refH = 1920, backingW = 800, backingH = 600;
+    const rect = { left: 40, top: 17, width: backingW / 3, height: backingH / 3 };
+    for (const mode of ['fitW', 'fitH', 'contain', 'cover', 'fill', 'none'] as const) {
+      const cs = computeCanvasScale(refW, refH, backingW, backingH, mode);
+      for (const [rx, ry] of [[0, 0], [540, 960], [1080, 1920], [-200, 300]]) {
+        const { x: clientX, y: clientY } = referenceToScreen2D(rx, ry, rect, backingW, backingH, cs);
+        const back = screenToReference2D(clientX, clientY, rect, backingW, backingH, cs);
+        expect(back.x).toBeCloseTo(rx, 4);
+        expect(back.y).toBeCloseTo(ry, 4);
+      }
+    }
+  });
+
+  it('round-trips client→reference→client (the other direction)', async () => {
+    const { computeCanvasScale, screenToReference2D, referenceToScreen2D } = await getModule();
+    const refW = 1080, refH = 1920, backingW = 1000, backingH = 2000;
+    const cs = computeCanvasScale(refW, refH, backingW, backingH, 'contain');
+    const rect = { left: 12, top: 8, width: 333, height: 640 };
+    for (const [cx, cy] of [[rect.left, rect.top], [rect.left + rect.width / 2, rect.top + rect.height / 2], [rect.left + rect.width, rect.top + rect.height]]) {
+      const ref = screenToReference2D(cx, cy, rect, backingW, backingH, cs);
+      const back = referenceToScreen2D(ref.x, ref.y, rect, backingW, backingH, cs);
+      expect(back.x).toBeCloseTo(cx, 4);
+      expect(back.y).toBeCloseTo(cy, 4);
+    }
+  });
+
+  it('degenerate backing size returns the rect origin (never NaN)', async () => {
+    const { referenceToScreen2D } = await getModule();
+    const cs = { scale: 1, scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0, compensateX: 1, compensateY: 1 };
+    const rect = { left: 5, top: 9, width: 100, height: 200 };
+    expect(referenceToScreen2D(50, 50, rect, 0, 100, cs)).toEqual({ x: 5, y: 9 });
+  });
+});
+
+// clientToDesign2D / designToClient2D — the one-call convenience court now uses instead of a
+// hand-rolled copy of computeCanvasScale + screenToReference2D (docs/todo.md).
+describe('clientToDesign2D / designToClient2D — game-facing convenience wrapper', () => {
+  function makeCanvas(cssW: number, cssH: number, backingW: number, backingH: number): HTMLCanvasElement {
+    const canvas = document.createElement('canvas');
+    canvas.width = backingW;
+    canvas.height = backingH;
+    document.body.appendChild(canvas);
+    canvas.getBoundingClientRect = () => ({
+      left: 10, top: 20, width: cssW, height: cssH, right: 10 + cssW, bottom: 20 + cssH,
+      x: 10, y: 20, toJSON: () => ({}),
+    });
+    return canvas;
+  }
+
+  it('round-trips client→design→client on a connected canvas', async () => {
+    const { clientToDesign2D, designToClient2D } = await getModule();
+    const canvas = makeCanvas(500, 900, 1000, 1800); // dpr 2, fitH-friendly aspect
+    const refW = 1080, refH = 1920;
+    const clientX = 10 + 250, clientY = 20 + 450; // rect center
+    const design = clientToDesign2D(canvas, clientX, clientY, refW, refH, 'fitH');
+    expect(design).not.toBeNull();
+    const back = designToClient2D(canvas, design!.x, design!.y, refW, refH, 'fitH');
+    expect(back).not.toBeNull();
+    expect(back!.x).toBeCloseTo(clientX, 3);
+    expect(back!.y).toBeCloseTo(clientY, 3);
+  });
+
+  it('returns null for a disconnected or degenerate canvas', async () => {
+    const { clientToDesign2D } = await getModule();
+    const detached = document.createElement('canvas');
+    detached.width = 100; detached.height = 100;
+    expect(clientToDesign2D(detached, 0, 0, 1080, 1920, 'fitH')).toBeNull();
+
+    const zeroBacking = makeCanvas(500, 900, 0, 0);
+    expect(clientToDesign2D(zeroBacking, 10, 10, 1080, 1920, 'fitH')).toBeNull();
   });
 });

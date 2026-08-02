@@ -21,11 +21,12 @@ import { captureInstanceOverrides, captureInstanceStructure, getPrefabSource, ge
 import type { AddedEntity, NestedOverridePaths } from '../../runtime/loaders/loadSceneFile';
 import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, collectResourceRefsFromEntities } from '../../runtime/loaders/loadSceneFile';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
-import { clearAllSceneDirty, clearSceneDirty, isSceneDirty } from './sceneDirty';
+import { isGuid } from '../../runtime/core/assetRefRules';
+import { clearAllSceneDirty, clearSceneDirty, dirtySceneGuidsSnapshot, isSceneDirty } from './sceneDirty';
 import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
-import { hasDirtyAssets, flushDirtyAssets, type FlushResult } from './dirtyAssets';
+import { hasDirtyAssets, getDirtyAssetPaths, flushDirtyAssets, type FlushResult } from './dirtyAssets';
 
 // ── Types ───────────────────────────────────────────────
 
@@ -165,6 +166,28 @@ function resolveEffectivePrefabOverride(
  *  Omitted (the default): behaves EXACTLY as before — this is the regression net
  *  every existing caller (enterPlay, timelinePreview, applyPrefabUndo, saveScene)
  *  depends on. */
+/** True when a live field value is indistinguishable from its trait's schema default,
+ *  and therefore safe to OMIT from the scene file (the loader re-derives it).
+ *
+ *  Deliberately SCALAR-ONLY. A non-scalar default (array/object) in a koota SoA schema
+ *  is a single shared instance handed to every entity, so "equal to the default" is
+ *  neither cheap nor safe to decide: a deep compare would omit a live array that merely
+ *  happens to match today, and identity compare would omit one the entity is actually
+ *  ALIASING. Either way the file would stop recording a real value. Non-scalars are
+ *  always written — the diff cost is small (few traits have them) and the semantics stay
+ *  obvious. Same reasoning excludes AoS traits wholesale at the call site: their schema
+ *  is a *function*, so there is no default to compare against at all.
+ *
+ *  `Object.is` (not `===`) so `NaN` matches its own default and `-0` does NOT collapse
+ *  into `0` — a signed zero is a different authored value in a direction/velocity field.
+ *
+ *  Exported for unit testing. */
+export function isTraitDefault(value: unknown, def: unknown): boolean {
+  if (def !== null && (typeof def === 'object' || typeof def === 'function')) return false;
+  if (value !== null && (typeof value === 'object' || typeof value === 'function')) return false;
+  return Object.is(value, def);
+}
+
 export async function serializeScene(opts?: {
   assignGuids?: boolean;
   scene?: { path: string; guid: string };
@@ -469,12 +492,26 @@ export async function serializeScene(opts?: {
         // e.g. UIAction with its onClickSet array) expose a *function* schema, so
         // fall back to the live data's own keys for those.
         const schema = (meta.trait as { schema?: Record<string, unknown> }).schema;
-        const keys = schema && typeof schema === 'object' ? Object.keys(schema) : Object.keys(data);
+        const soa = !!schema && typeof schema === 'object';
+        const keys = soa ? Object.keys(schema!) : Object.keys(data);
         for (const key of keys) {
           // Skip pure runtime fields (e.g. Time.elapsed/frame): recomputed each
           // frame, so persisting them bakes a stale snapshot and churns the file
           // on every save. The loader re-derives them from the schema default.
           if (meta.fields[key]?.runtimeOnly) continue;
+          // Omit a field that still holds its trait default: the loader
+          // reconstructs it from the same schema (`meta.trait(partialData)` — koota
+          // fills every absent key), so this is lossless, and it keeps DEFAULTS LIVE.
+          // Writing them out instead FREEZES each file at the defaults of the day it
+          // was saved, so a later change to a trait default silently stops reaching
+          // every already-saved scene — the reason the repo-wide legacy-scene
+          // migration was on hold (docs/todo.md). Owner's call, 2026-07-31.
+          // …except a field the passes below REWRITE (parentId + every other
+          // `entityId`-flagged ref, guid-ified there). Those are always emitted, so
+          // skipping one here would only move it to the END of the object — pure diff
+          // noise across a bulk migration. Assigning in schema order now and
+          // overwriting in place later keeps key order stable.
+          if (soa && !meta.fields[key]?.entityId && isTraitDefault(data[key], schema![key])) continue;
           traitData[key] = data[key];
         }
         // Snapshot path: the world wasn't mutated, so a freshly-minted guid for a
@@ -525,22 +562,38 @@ export async function serializeScene(opts?: {
 
   const resources = collectResourceRefs(entities);
 
-  // Scene file gets its own stable id — reuse the one registered when the
-  // scene was loaded, or mint a fresh one for first-save. A named target uses ITS
-  // OWN guid directly (already known from `getLoadedScenes()`, no lookup needed).
+  // This scene's own `loadedScenes` bookkeeping — the one lookup backs the scene's
+  // `id`, its `createdAt` preservation (Phase 1, scene-loading.md: reuse the FILE's
+  // original stamp instead of unconditionally minting a fresh one on every save)
+  // and, for a named target, its own `baseScene` ref below. Absent for a scene that
+  // was never loaded (a brand-new scene from `newScene()`) — that's the one case a
+  // fresh id + `createdAt` are actually correct.
+  //
+  // A named target is keyed by GUID (the caller already read it out of
+  // `getLoadedScenes()`); the PRIMARY is keyed by PATH, because its guid is what
+  // we're trying to recover. Keying the primary by guid was circular — it needed
+  // the id it was computing — so a re-minted id silently reset `createdAt` too.
+  let ownLoadedEntry: { guid: string; createdAt?: string; baseScene?: string } | undefined;
+  for (const entry of sceneManager.getLoadedScenes().values()) {
+    const hit = targetScene ? entry.guid === targetScene.guid
+      : entry.role === 'primary' && entry.path === _currentScenePath;
+    if (hit) { ownLoadedEntry = entry; break; }
+  }
+  // Scene identity is a fact about the FILE, carried forward from the load — never
+  // re-derived. Prefer the loaded-scene entry (what `loadSceneFile` read off disk),
+  // which is what `saveAll` already hands a named base. The asset-manifest reverse
+  // lookup is only a fallback for a serialize with no live load behind it: it reads
+  // a mutable global whose `pathToGuid` entry is EVICTED whenever the same guid is
+  // re-registered under a different path string (a scanner rescan is enough), and a
+  // miss there mints a fresh guid — which dangles every reference to the scene,
+  // `project.config.json`'s included. That is how `tropical-island.json` lost its
+  // `4bc54ae4-…` id on a save (docs/todo.md, 2026-07-30).
+  // `LoadedSceneEntry.guid` falls back to a `path:…` tag for a file with no valid
+  // guid, so it is only trustworthy when it actually IS a guid.
   const sceneId = targetScene
     ? targetScene.guid
-    : (_currentScenePath ? (getGuidForPath(_currentScenePath) ?? newGuid()) : newGuid());
-  // This scene's own `loadedScenes` bookkeeping, keyed by guid — the one lookup backs
-  // BOTH `createdAt` preservation (Phase 1, scene-loading.md: reuse the
-  // FILE's original stamp instead of unconditionally minting a fresh one on every
-  // save) and, for a named target, its own `baseScene` ref below. Absent for a
-  // scene that was never loaded (a brand-new scene from `newScene()`) — that's the
-  // one case a fresh `createdAt` is actually correct.
-  let ownLoadedEntry: { createdAt?: string; baseScene?: string } | undefined;
-  for (const entry of sceneManager.getLoadedScenes().values()) {
-    if (entry.guid === sceneId) { ownLoadedEntry = entry; break; }
-  }
+    : (ownLoadedEntry && isGuid(ownLoadedEntry.guid) ? ownLoadedEntry.guid
+      : (_currentScenePath ? (getGuidForPath(_currentScenePath) ?? newGuid()) : newGuid()));
   const file: SceneFile = {
     id: sceneId, version: SCENE_FORMAT_VERSION,
     createdAt: ownLoadedEntry?.createdAt ?? new Date().toISOString(),
@@ -697,8 +750,40 @@ export function markSceneSaved(): void { _savedAtEditVersion = getEditVersion();
  *  the world, the file, and the undo stack, with nothing anywhere saying why.
  *  Also true while a 'manual'-mode particle/anim/timeline edit is pending a save
  *  (dirtyAssets.ts, mcp-persistence.md Phase 3) — those are asset-shaped work,
- *  not scene-edit-version work, so `getEditVersion()` alone can't see them. */
-export function hasUnsavedChanges(): boolean { return getEditVersion() !== _savedAtEditVersion || hasDirtyAssets(); }
+ *  not scene-edit-version work, so `getEditVersion()` alone can't see them.
+ *
+ *  THIRD cause, and the reason it can't be dropped: a still-dirty NON-PRIMARY loaded
+ *  scene. `saveScene` calls `markSceneSaved()` the moment the PRIMARY write lands, which
+ *  rebaselines the edit version — but `saveAll` writes the bases AFTER that, and a base
+ *  that fails keeps its dirty flag (by design, so a later save retries it). Without this
+ *  term a partially-failed Save All reported `unsavedChanges:false` while a base-scene
+ *  edit existed only in memory, and the game-code-reload gate (CLAUDE.md: an agent checks
+ *  this flag before writing a `.ts` that force-reloads the editor) would then discard the
+ *  human's work believing there was none. */
+export function hasUnsavedChanges(): boolean {
+  return getEditVersion() !== _savedAtEditVersion || hasDirtyAssets() || dirtySceneGuidsSnapshot().size > 0;
+}
+
+/** WHICH kind of unsaved work exists — the three independent causes above, told apart.
+ *
+ *  S3.11: the load_scene / new_scene refusal built one fixed string blaming
+ *  create_entity/duplicate_entity/prefab, so an agent whose only pending work was a dirty
+ *  particle/anim/timeline doc went looking for live entities it had never created. A refusal that
+ *  names the wrong cause is worse than a generic one — it sends the reader somewhere specific and
+ *  wrong. All three causes are cleared by the same `save_all`, but the caller has to be told what
+ *  `force:true` would DISCARD.
+ *
+ *  `dirtyScenes` is the third cause (see `hasUnsavedChanges`): non-primary loaded scenes
+ *  whose edits are still only in memory — typically a base whose write failed in a
+ *  partial `saveAll`. It must be reported, or a refusal triggered by it alone would name
+ *  no cause at all. */
+export function unsavedChangeCauses(): { sceneDirty: boolean; dirtyAssetPaths: string[]; dirtyScenes: string[] } {
+  return {
+    sceneDirty: getEditVersion() !== _savedAtEditVersion,
+    dirtyAssetPaths: getDirtyAssetPaths(),
+    dirtyScenes: [...dirtySceneGuidsSnapshot()],
+  };
+}
 
 export interface SaveResult {
   saved: boolean;
@@ -709,6 +794,17 @@ export interface SaveResult {
    *  was dirty. A base is only ever written once the primary's own save succeeded —
    *  `saveScene`'s run-mode refusal sits above both, so neither writes during Play. */
   extraSaved?: { path: string; guid: string }[];
+  /** Other loaded scenes that FAILED to save in this call, and why.
+   *
+   *  These used to be a `console.error` and a `continue` — so a Save All in which a dirty BASE
+   *  scene could not be serialized or written still returned the primary's `{saved:true}`, and the
+   *  agent op reported `{ok:true}`. The edit stayed only in memory, and a later build (which reads
+   *  FILES) shipped without it, with nothing anywhere saying why. Per-scene isolation is right —
+   *  one bad scene must not block the others — but isolation must not mean silence
+   *  (`docs/mcp-tool-conventions.md` §5: PARTIAL is a failure unless the tool documents otherwise).
+   *
+   *  Their dirty flags stay SET, so a later save retries them. */
+  failed?: { path: string; guid: string; reason: string }[];
   /** Pending particle/anim/timeline writes (Phase 3) flushed alongside this save, if any. */
   assets?: FlushResult;
 }
@@ -909,6 +1005,7 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
   if (!primaryResult.saved) return primaryResult;
 
   const extraSaved: { path: string; guid: string }[] = [];
+  const failed: { path: string; guid: string; reason: string }[] = [];
   // Snapshot the chain BEFORE iterating — each iteration below `await`s (serialize +
   // write), and a scene swap landing mid-loop would otherwise mutate the live Map
   // out from under a bare `for...of`, skipping or misattributing entries.
@@ -926,15 +1023,24 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
       sceneFile = await serializeScene({ scene: { path: entry.path, guid: entry.guid } });
     } catch (e) {
       console.error(`[Editor] Refused to save "${entry.path}": ${(e as Error).message}`);
+      failed.push({ path: entry.path, guid: entry.guid, reason: `serialize failed: ${(e as Error).message}` });
       continue;
     }
     const ok = await writeFileToServer(entry.path, JSON.stringify(sceneFile, null, 2));
-    if (!ok) { console.error(`[Editor] Failed to save scene to ${entry.path}`); continue; }
+    if (!ok) {
+      console.error(`[Editor] Failed to save scene to ${entry.path}`);
+      failed.push({ path: entry.path, guid: entry.guid, reason: 'the write to disk was rejected' });
+      continue;
+    }
     registerAsset(entry.guid, entry.path, 'scene');
     clearSceneDirty(entry.guid);
     editorEmit('!save', { path: entry.path, entities: sceneFile.entities.length }); // Editor Percept (V2)
     console.log(`[Editor] Saved scene: ${sceneFile.entities.length} entities → ${entry.path}`);
     extraSaved.push({ path: entry.path, guid: entry.guid });
   }
-  return extraSaved.length ? { ...primaryResult, extraSaved } : primaryResult;
+  return {
+    ...primaryResult,
+    ...(extraSaved.length ? { extraSaved } : {}),
+    ...(failed.length ? { failed } : {}),
+  };
 }

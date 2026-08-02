@@ -62,7 +62,7 @@ describe('meshTemplateCache — a moved model loads its CURRENT-path variants (s
       modelCache: staleCacheAt('/assets/models/pad.gltf'),
     });
 
-    await cache.acquireModel('scene-1', guid);
+    await cache.acquireModel(1, guid);
 
     // Three LOD GLBs fetched, all from the CURRENT pad/ location, none stale.
     expect(loadedUrls).toHaveLength(3);
@@ -86,7 +86,7 @@ describe('meshTemplateCache — a moved model loads its CURRENT-path variants (s
       modelCache: staleCacheAt('/assets/models/pad.gltf'),
     });
 
-    await cache.acquireModel('scene-2', guid);
+    await cache.acquireModel(2, guid);
 
     expect(loadedUrls).toHaveLength(3);
     expect(loadedUrls.every((u) => u.includes('/assets/models/sub/pad.gltf'))).toBe(true);

@@ -72,7 +72,7 @@ async function textureNode(ref: string, acquired: THREE.Texture[]): Promise<unkn
     tex = await loadTexture3D(ref, { flipY: false });
   } catch (e) {
     console.warn(`[FileShader] texture load failed: ${ref}`, e);
-    tex = null;
+    // tex is already null (the declaration default).
   }
   if (tex) acquired.push(tex);
   return tex ? texture(tex) : vec4(1, 1, 1, 1);

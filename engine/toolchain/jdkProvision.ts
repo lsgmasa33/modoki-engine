@@ -119,7 +119,7 @@ export async function ensureJdk(baseDir: string, opts: { fetchImpl?: FetchLike; 
   fs.writeFileSync(tmpArchive, buf)
   try {
     log('Extracting…')
-    extractArchive(tmpArchive, versionDir, dist.archiveKind)
+    await extractArchive(tmpArchive, versionDir, dist.archiveKind)
   } finally {
     fs.rmSync(tmpArchive, { force: true })
   }

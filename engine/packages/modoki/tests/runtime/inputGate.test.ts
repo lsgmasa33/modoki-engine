@@ -85,7 +85,29 @@ describe('gate closed — input stops reaching the game', () => {
 
     blocked = true;
     sampleAll(emptyFrame());
-    expect(fake.calls.reset).toBe(2); // closing edge fires again
+    expect(fake.calls.reset).toBe(3); // closing edge fires again (see reopening test below for why +2, not +1)
+  });
+
+  it('ALSO resets on the REOPENING edge, so a backlog queued while suppressed cannot replay', () => {
+    // A source's raw listeners aren't detached by the gate (only `sample()` is
+    // skipped) — a discrete-event source (pointerSource's press/release FIFO) keeps
+    // enqueuing events made in an editor panel while the game is unfocused. Without
+    // a reset on the REOPENING edge too, that backlog would replay into the game one
+    // entry per frame once the panel loses focus and the GameView regains it.
+    let blocked = true;
+    setInputGate(() => blocked);
+    sampleAll(emptyFrame());
+    expect(fake.calls.reset).toBe(1); // closing edge
+
+    blocked = false;
+    sampleAll(emptyFrame());
+    expect(fake.calls.reset).toBe(2); // reopening edge, BEFORE this frame's sample
+    expect(fake.calls.sample).toBe(1);
+
+    // Staying open must not re-fire reset every frame — edge-triggered, not continuous.
+    sampleAll(emptyFrame());
+    expect(fake.calls.reset).toBe(2);
+    expect(fake.calls.sample).toBe(2);
   });
 });
 

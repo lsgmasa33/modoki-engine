@@ -15,6 +15,8 @@
  *      an anchored panel stacking a runtime-variable list) → stays live.
  *  Only the first set lives in SELF_PLACEMENT_PROPS. */
 
+import { isSizeInert } from '../runtime/ui/anchorLayout';
+
 export type UiPreset = 'view' | 'text' | 'image' | 'button' | 'input' | 'slider';
 
 export interface UiTraitSpec {
@@ -63,4 +65,47 @@ export const SELF_PLACEMENT_PROPS: ReadonlySet<string> = new Set(['flexGrow', 'f
  *  width/height are handled separately (disabled only on a stretched axis). */
 export function isSelfPlacementDisabled(traitName: string, hasAnchor: boolean, key: string): boolean {
   return traitName === 'UIElement' && hasAnchor && SELF_PLACEMENT_PROPS.has(key);
+}
+
+/** How a per-field gate resolves across a MULTI-selection.
+ *  `inert` = dead on every selected entity (safe to make read-only),
+ *  `mixed` = dead on some and live on others,
+ *  `live`  = dead on none. */
+export type SelectionGate = 'live' | 'mixed' | 'inert';
+
+/** Resolve a gate from a per-entity predicate over the whole selection.
+ *
+ *  WHY THIS EXISTS (issue #34): the gates below used to read the PRIMARY entity
+ *  alone, which is wrong in BOTH directions once the gate drives `readOnly` rather
+ *  than mere dimming — a stretched primary made the field read-only on siblings
+ *  where the value is genuinely live, and a non-stretched primary let a write land
+ *  on siblings that silently discard it (the #16 trap, re-entered via the
+ *  selection). Only a unanimous verdict may disable a control; anything else is
+ *  `mixed` and must stay editable, labelled as mixed. */
+function resolveGate<T>(items: readonly T[], isInert: (item: T) => boolean): SelectionGate {
+  if (items.length === 0) return 'live';
+  let inert = 0;
+  for (const item of items) if (isInert(item)) inert += 1;
+  if (inert === 0) return 'live';
+  return inert === items.length ? 'inert' : 'mixed';
+}
+
+/** The width/height gate across a selection. `anchors` is one entry per selected
+ *  entity: its UIAnchor mode, or null/undefined when it has no anchor (a free-flow
+ *  element, whose size is always live). */
+export function selectionSizeGate(
+  anchors: readonly (string | null | undefined)[],
+  axis: 'width' | 'height',
+): SelectionGate {
+  return resolveGate(anchors, (a) => !!a && isSizeInert(a, axis));
+}
+
+/** The self-placement (flexGrow/flexShrink/alignSelf) gate across a selection.
+ *  Any anchor at all kills these, whatever its mode — so this asks only whether each
+ *  selected entity HAS one, i.e. its entry is non-null. An anchored entity whose mode
+ *  is unreadable (`''`) still counts as anchored: `''` is a missing MODE, not a missing
+ *  anchor, and the two must not collapse (they answer different questions here and in
+ *  `selectionSizeGate`, where `''` correctly stretches nothing). */
+export function selectionAnchorGate(anchors: readonly (string | null | undefined)[]): SelectionGate {
+  return resolveGate(anchors, (a) => a !== null && a !== undefined);
 }

@@ -69,37 +69,65 @@ public class GameDebugPlugin extends Plugin {
             return;
         }
 
-        serverPort = call.getInt("port", DEFAULT_PORT);
-
-        serverThread = new Thread(() -> {
-            try {
-                serverSocket = new ServerSocket(serverPort);
-                serverSocket.setReuseAddress(true);
-                running = true;
-                Log.i(TAG, "TCP server listening on port " + serverPort);
-
-                while (running) {
-                    try {
-                        Socket socket = serverSocket.accept();
-                        handleNewClient(socket);
-                    } catch (Exception e) {
-                        if (running) Log.w(TAG, "Accept error: " + e.getMessage());
-                    }
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "Server start failed: " + e.getMessage());
-            }
-        });
-        serverThread.setDaemon(true);
-        serverThread.start();
+        int preferred = call.getInt("port", DEFAULT_PORT);
 
         // No LAN discovery: connection is by MANUAL target through Modoki's lease (adb-forward
         // over USB, or the device IP over WiFi). NSD/Bonjour advertising + the UDP beacon were
         // removed — they broadcast the device on the LAN, which is exactly what let idle Claude
         // sessions auto-grab it. See docs/debug-tools-mcp.md.
+        startListener(preferred, true, call);
+    }
+
+    /** Bind the TCP server + resolve JS with the ACTUAL port — only once the bind outcome is
+     *  known, never before (a fixed port can't be assumed bound: a lingering previous app
+     *  instance holds it -> `BindException: EADDRINUSE`). On that conflict, retry on an
+     *  OS-assigned free port (port 0), mirroring `GameDebugPlugin.swift`'s `startListener`. Unlike
+     *  iOS's async `NWListener`, `new ServerSocket(...)` binds synchronously, so there is no
+     *  listener-state callback to wait for — the try/catch below IS the bind outcome, and
+     *  `call.resolve`/`call.reject` only fires once it is known. (Capacitor invokes plugin methods
+     *  off the main thread, so this synchronous bind cannot trip `NetworkOnMainThreadException` —
+     *  the accept LOOP still runs on its own daemon thread since it blocks indefinitely.) */
+    private void startListener(int port, boolean allowFallback, PluginCall call) {
+        ServerSocket socket;
+        try {
+            socket = new ServerSocket(port);
+            socket.setReuseAddress(true);
+        } catch (java.net.BindException e) {
+            if (allowFallback) {
+                Log.w(TAG, "port " + port + " in use (previous instance?) — retrying on an OS-assigned port");
+                startListener(0, false, call);
+                return;
+            }
+            Log.e(TAG, "Server start failed: " + e.getMessage());
+            call.reject("TCP server failed: " + e.getMessage(), e);
+            return;
+        } catch (Exception e) {
+            Log.e(TAG, "Server start failed: " + e.getMessage());
+            call.reject("Failed to create server socket: " + e.getMessage(), e);
+            return;
+        }
+
+        serverSocket = socket;
+        int actualPort = socket.getLocalPort();
+        serverPort = actualPort;
+        running = true;
+        Log.i(TAG, "TCP server listening on port " + actualPort);
+
+        serverThread = new Thread(() -> {
+            while (running) {
+                try {
+                    Socket client = serverSocket.accept();
+                    handleNewClient(client);
+                } catch (Exception e) {
+                    if (running) Log.w(TAG, "Accept error: " + e.getMessage());
+                }
+            }
+        });
+        serverThread.setDaemon(true);
+        serverThread.start();
 
         JSObject result = new JSObject();
-        result.put("port", serverPort);
+        result.put("port", actualPort);
         call.resolve(result);
     }
 

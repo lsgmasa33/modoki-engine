@@ -7,14 +7,17 @@ import './core/instanceGuard';
 import './loaders/registerProviders';
 
 export { ENGINE_VERSION, SCENE_FORMAT_VERSION, ENGINE_API_VERSION } from './core/version';
+export { WHITE_HDR_GUID, DEFAULT_FONT_GUID } from './assets/builtinAssets';
 export { getCurrentWorld, setCurrentWorld, onWorldSwap } from './core/ecs/world';
 export { hostCanvases, hostCanvasUnder } from './ui/hostCanvas';
+export { clientToDesign2D, designToClient2D } from './rendering/canvas2DScaler';
 export type { World } from 'koota';
 export {
   registerTrait, getAllTraits, getTraitByName, getTraitMeta, inferFields,
   setNameTransform, transformName,
   type TraitMeta, type FieldHint, type FieldType,
 } from './core/ecs/traitRegistry';
+export { traitFieldOrDefault } from './core/ecs/traitSchema';
 export {
   type GameConfig, setGameConfig, getGameConfig,
 } from './core/config';
@@ -43,7 +46,7 @@ export {
 // free of the `three/webgpu` import.
 export { defaultParticleEffect } from './particles/types';
 export type {
-  ParticleEffectDef, IParticleBackend, ParticleHandle, EmitterShape, EmitterShapeType,
+  ParticleEffectDef, IParticleBackend, IParticleBackendCore, ParticleHandle, EmitterShape, EmitterShapeType,
   BlendMode, Curve, CurvePoint, Gradient, ColorStop, AlphaStop, RGB, MinMax, RenderConfig, EmissionBurst,
 } from './particles/types';
 export { getParticleEffect, setParticleEffect, invalidateParticleEffect, clearParticleCache } from './loaders/particleCache';
@@ -142,8 +145,10 @@ export {
 export { loadGLB } from './loaders/loadGLB';
 export {
   rendererReady, setActiveRenderer, loadTexture3D, releaseTexture3D, onRendererReady,
+  getRendererGateHealth,
   invalidateTexture, getSharedTextureStats, disposeAllSharedTextures,
 } from './loaders/textureResolver';
+export { getGpuFaultState, MAX_REPORTED_GPU_ERRORS, type GpuFaultState } from './core/activeRenderer';
 export { registerMaterialType, getMaterialBuilder, getRegisteredMaterialTypes, type MaterialBuilder } from './loaders/materialTypes';
 export { registerCustomShader, unregisterCustomShader, getCustomShader, getCustomShaderSchema, getRegisteredShaderNames, type CustomShaderBuild } from './loaders/customShaders';
 export { mergeParamDefaults, coerceParamValue, fetchShaderManifest, type ShaderParam, type ShaderParamType, type ShaderParamSchema, type ShaderManifest } from './loaders/shaderSchema';
@@ -161,15 +166,24 @@ import { registerBuiltinMaterialTypes } from './loaders/materialPresets';
 // Side-effect: register pbr/unlit/custom presets at engine init.
 registerBuiltinMaterialTypes();
 export { isPrimitive, createPrimitiveMesh, PRIMITIVE_NAMES } from './loaders/primitives';
+export { PRIMITIVE_SPRITE_NAMES } from './loaders/sceneValidation';
 export { loadSceneFile, collectResourceRefsFromEntities, instantiatePrefabIntoWorld, spawnPrefabInstance, deriveInstanceMemberGuids, type SceneData, type LoadSceneOptions, type SceneResourceRef, type SceneEntityEntry } from './loaders/loadSceneFile';
 export { markOverride, getOverrideMarkSet, clearOverrideMarks, clearAllOverrideMarks } from './loaders/overrideMarks';
 export { sceneManager, gameIdFromScenePath, type Scene, type SceneState, type LoadOptions as SceneLoadOptions, type SceneManager, type LoadedSceneEntry } from './scene/SceneManager';
-export { validateSceneData, REF_FIELDS_BY_TRAIT, type SceneSchema, type ValidationResult } from './loaders/sceneValidation';
+export { validateSceneData, typeMismatch, REF_FIELDS_BY_TRAIT, type SceneSchema, type ValidationResult } from './loaders/sceneValidation';
 export { buildSceneSchema } from './scene/sceneSchema';
 export { applyOps, type MutateOp, type MutableScene, type MutableEntity, type EntityRef as MutateEntityRef, type ApplyResult } from './scene/sceneMutate';
+/** LOCAL↔WORLD Transform authoring (`set_transform {space}`) — the FILE-path conversion.
+ *  The live path uses `worldToLocal3D`/`getWorldTransform3D` from core/ecs/worldTransform. */
+export { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes, type TRS } from './scene/transformSpace';
 export { loadFont, loadAllFonts, getLoadedFontFamilies, getLoadedFonts, fontFamilyFromPath, fontPathFromFamily, parseFontFilename, type FontInfo } from './loaders/fontLoader';
+// Text MEASUREMENT, exported because fitting text into a box is a game-level concern, not just a
+// renderer-internal one: a game that generates its own copy (Court's hint narration) has to be
+// able to prove the result still fits the panel it draws it in, and a game may only reach the
+// engine through this package specifier (see the portability guard). Pure — no GPU, no DOM.
+export { layoutText, type LayoutFont, type LayoutOptions, type TextLayout, type TextAlign } from './rendering/text/layoutText';
 export {
-  isGuid, isExternalUrl, isInternalAssetPath, newGuid, registerAsset, unregisterAsset, resolveGuidToPath,
+  isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid, registerAsset, unregisterAsset, resolveGuidToPath,
   getGuidForPath, getAssetType, getAssetEntry, getAudioLoadType, resolveRef, loadManifestJson, ensureManifestLoaded, serializeManifest,
   clearManifest, getAllAssets, resolveSceneByName,
   type AssetType, type AssetEntry, type AssetManifestEntry, type AssetManifestFile, type BinaryAssetMeta,
@@ -230,12 +244,17 @@ export { useGameLoop } from './rendering/useGameLoop';
 // ── Offscreen scene capture (render_scene; pure registry, no heavy deps) ──
 export {
   registerSceneRenderer, unregisterSceneRenderer, hasSceneRenderer, renderSceneOffscreen,
+  normalizeJpegQuality,
   type OffscreenRenderOpts, type OffscreenRenderResult, type OffscreenCameraOverride, type SceneRenderer,
 } from './rendering/offscreenCapture';
 export {
-  registerBoundsProvider, collectScreenBounds,
-  type ScreenRect, type EntityScreenBounds, type BoundsProvider,
+  registerBoundsProvider, collectScreenBounds, mountedSurfaces,
+  type ScreenRect, type EntityScreenBounds, type BoundsProvider, type BoundsSurface,
 } from './core/screenBounds';
+export {
+  registerPickProvider, pickAt, pickableSurfaces, hasPickProvider,
+  type PickProvider,
+} from './core/screenPick';
 export {
   registerHandleProvider, collectHandles, resolveHandle,
   type InteractionHandle, type HandleFilter, type HandleProvider,
@@ -335,6 +354,10 @@ export { getPresentationScale, calibratePresentationScale } from './input/presen
 // Device-appropriate UI prompts ("Press A" vs "Click") — Part B4/Phase 4.
 export { promptFor, PROMPT_ACTIONS, type PromptAction } from './input/inputPrompts';
 export { registerInputPromptSources } from './input/inputPromptSources';
+// Pointer-block roots — a DOM overlay (a game's own hand-built chrome, e.g. a modal
+// sibling of the game canvas) claims exclusive ownership of pointer gestures that
+// start on it, so `pointerSource` never latches them as a game gesture.
+export { registerPointerBlocker, registerPointerPassthrough, isPointerBlocked } from './core/pointerBlockers';
 export {
   AXES, DIGITAL, applyDeadzone, clampAxes, computeEdges, computePointerEdge, createInputFrame, beginSample,
   makeAxes, makeFlags, makePointer,
@@ -349,6 +372,8 @@ export {
   vecEcsToPhys as vecEcsToPhys3D, vecPhysToEcs as vecPhysToEcs3D,
   lenToPhys as lenToPhys3D, packCollisionGroups as packCollisionGroups3D,
   eulerToQuat, quatToEuler,
+  // eulerToQuatInto/quatToEulerInto: allocation-free `Into` twins of the pair above, for hot loops.
+  eulerToQuatInto, quatToEulerInto,
   type Vec3, type Quat, type Euler3,
 } from './physics/physics3DConvert';
 export { colliderOutline2D } from './rendering/colliderOutline2D';
@@ -401,8 +426,10 @@ export { useGameStore, type Screen, type FontStatus, type UIBindableState } from
 // OTA update client (docs/ota-updates.md). A game calls
 // checkForUpdate() with its own baseUrl/publicKey; verifyReleaseSignature and the
 // schema validators are exported for tooling/tests that want them standalone.
+// signingPayload: the canonical payload serializer that must match the signing side
+// byte-for-byte, exported for anyone verifying or re-signing a release.
 export {
-  checkForUpdate, fetchRelease, verifyReleaseSignature, validateManifest, validateRelease,
+  checkForUpdate, fetchRelease, verifyReleaseSignature, signingPayload, validateManifest, validateRelease,
   type OtaCheckResult, type OtaNativePlugin, type OtaManifest, type OtaRelease,
   type CheckForUpdateOptions, type FetchReleaseOptions, type FetchReleaseResult,
 } from './ota/otaClient';

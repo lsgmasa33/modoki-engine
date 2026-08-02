@@ -44,11 +44,11 @@ import { normalizeTimeline } from '../../src/runtime/timeline/types';
 function registerAll() {
   registerTrait({
     name: 'EntityAttributes', trait: EntityAttributes, category: 'component',
-    fields: { name: {}, isActive: {}, sortOrder: {}, parentId: { entityId: { onMissing: 'root' } }, layer: {}, guid: {} },
+    fields: { name: { type: 'string' }, isActive: { type: 'boolean' }, sortOrder: { type: 'number' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, layer: { type: 'enum', options: ['', '3d', '2d', 'ui'] }, guid: { type: 'string' } },
   });
   registerTrait({
     name: 'Transform', trait: Transform, category: 'component',
-    fields: { x: {}, y: {}, z: {}, rx: {}, ry: {}, rz: {}, sx: {}, sy: {}, sz: {} },
+    fields: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' }, rx: { type: 'number' }, ry: { type: 'number' }, rz: { type: 'number' }, sx: { type: 'number' }, sy: { type: 'number' }, sz: { type: 'number' } },
   });
 }
 
@@ -110,7 +110,7 @@ describe('timeline scrub control-spawn transience (review C1)', () => {
     const plainId = spawnPrefabInstance(world, PREFAB_DEF, { parentId: parent.id() });
     const forcedId = spawnPrefabInstance(world, PREFAB_DEF, { parentId: parent.id(), forceTransient: true });
 
-    const get = (id: number) => {
+    const get = (id: number): { has(t: unknown): boolean } | null => {
       let e: { has(t: unknown): boolean } | null = null;
       world.query(EntityAttributes).updateEach((_v, entity) => {
         if (!e && (entity as unknown as { id(): number }).id() === id) e = entity as unknown as { has(t: unknown): boolean };

@@ -54,7 +54,11 @@ const flush = async (): Promise<void> => { for (let i = 0; i < 12; i++) await Pr
 class MockDevice {
   authority: DeviceLeaseAuthority;
   reachable = true;
-  constructor(private clock: ManualClock, graceMs = LEASE_GRACE_MS) {
+  // Not a parameter-property shorthand (erasableSyntaxOnly forbids it, since it emits a runtime
+  // field assignment, not just a type) — declare + assign explicitly.
+  private clock: ManualClock;
+  constructor(clock: ManualClock, graceMs = LEASE_GRACE_MS) {
+    this.clock = clock;
     this.authority = new DeviceLeaseAuthority(graceMs);
   }
   get now(): number { return this.clock.now; }
@@ -65,7 +69,8 @@ class MockDevice {
 class MockTransport implements LeaseTransport {
   private dropCb: () => void = () => {};
   private attached = false;
-  constructor(private dev: MockDevice) {}
+  private dev: MockDevice;
+  constructor(dev: MockDevice) { this.dev = dev; }
 
   onDrop(cb: () => void): void { this.dropCb = cb; }
 

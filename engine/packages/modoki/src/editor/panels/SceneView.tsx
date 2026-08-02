@@ -35,11 +35,16 @@ import {
 } from '../../runtime/rendering/frameDriver';
 import { createParticleSyncState, syncParticles, disposeParticleSyncState } from '../../runtime/rendering/particleSync';
 import { registerBoundsProvider, projectAABBToScreen, type EntityScreenBounds } from '../../runtime/core/screenBounds';
+import { registerPickProvider } from '../../runtime/core/screenPick';
 import { registerHandleProvider, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
 import { createFlameMeshSyncState, syncFlameMeshes, disposeFlameMeshSyncState } from '../../runtime/rendering/flameMeshSync';
 import { PARTICLE_LAYER } from '../../runtime/rendering/layers';
 import { getWorldTransform2D, getWorldTransform2DInto } from '../../runtime/rendering/renderUtils';
 import { setActiveRenderer } from '../../runtime/loaders/textureResolver';
+import {
+  noteRendererProgress, reportRendererInitFailure, clearRendererInitFailure,
+} from '../../runtime/core/activeRenderer';
+import { acquireRenderer, releaseRenderer } from './rendererLease';
 import { drawColliderOutline, drawSkinnedMeshFlat2D, drawSkinnedMeshWireframe2D, drawWeightHeatmap2D, drawDominantBoneMap2D, computePivotOffset, COLLIDER_SPRITE } from '../../runtime/rendering/render2DUtils';
 import { getSkin2DBuffer } from '../../runtime/skinning/skin2DBuffers';
 import { getRig2D, type ParsedRig2D } from '../../runtime/loaders/rig2dCache';
@@ -756,7 +761,7 @@ function pickUnderlyingUIEntity(clientX: number, clientY: number): number | null
   const surfaces = Array.from(document.querySelectorAll<HTMLElement>('canvas[data-2d-overlay], [data-2d-pick], [data-canvas2d-mount]'));
   const prev = surfaces.map((c) => c.style.pointerEvents);
   surfaces.forEach((c) => { c.style.pointerEvents = 'none'; });
-  let el: Element | null = null;
+  let el: Element | null;
   try { el = document.elementFromPoint(clientX, clientY); }
   finally { surfaces.forEach((c, i) => { c.style.pointerEvents = prev[i]; }); }
   const uiEl = el?.closest('[data-entity-id]') as HTMLElement | null;
@@ -1107,6 +1112,104 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       mark2DDirty();
     }
 
+    // Predicts what a real click at a viewport point would select on THIS 2D canvas — the exact
+    // candidate-gather + pick2D call `onPointerDown` runs below, plus its billboard/underlying-UI
+    // fallbacks, hoisted out so it can also be registered as this canvas's pick provider
+    // (`registerPickProvider`, F15 — `docs/enact.md`). Must stay the
+    // ONE code path both callers use — see the rule in `screenPick.ts`. Returns `null` for
+    // "nothing here", including a point outside this canvas's own rect (do not clamp — an
+    // out-of-rect point belongs to whichever surface actually covers it, if any).
+    function pickEntityAtViewportPoint(clientX: number, clientY: number): number | null {
+      const c = canvasRef.current;
+      if (!c) return null;
+      const rect = c.getBoundingClientRect();
+      if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) return null;
+      const { x: px, y: py } = toGame(clientX, clientY);
+      const allTraits = getAllTraits();
+      const transformMeta = allTraits.find((t) => t.name === 'Transform');
+      const r2dMeta = allTraits.find((t) => t.name === 'Renderable2D');
+      if (!transformMeta || !r2dMeta) return null;
+      // Hit-testing uses THIS layer's coordinate transform, so only consider entities routed to
+      // this Canvas2D — same recipe onPointerDown uses for its own gizmo/candidate hit tests.
+      const { parentOf, canvasIds } = getCanvas2DRouting();
+      const paintOrder = getPaintOrder();
+      const ownedByThisCanvas = (id: number) => findCanvasAncestor(id, parentOf, canvasIds) === canvasEntityId;
+
+      // Entity selection hit test (axis-aligned bounding box) — mirrors onPointerDown's "Second" step.
+      const colMetaPick = allTraits.find((t) => t.name === 'Collider2D');
+      const candidates: Pick2DCandidate[] = [];
+      getCurrentWorld().query(transformMeta.trait, r2dMeta.trait).updateEach(([tf, rend], entity) => {
+        if (!rend.isVisible || deactivatedEntities.has(entity.id())) return;
+        if (!ownedByThisCanvas(entity.id())) return;
+        const { x: wx, y: wy, sx: wsx, sy: wsy } = getWorldTransform2D(entity.id(), tf);
+        // Default: pick by the Renderable2D box (unchanged for image/primitive sprites).
+        let width = rend.width, height = rend.height;
+        let pivotX = rend.pivotX ?? 0.5, pivotY = rend.pivotY ?? 0.5;
+        // Collider-fill entities have no meaningful Renderable2D box — the visible shape is
+        // the collider — so pick by the collider's AABB instead. ONLY when sprite='collider'
+        // AND a Collider2D is present; every other sprite is untouched.
+        if (rend.sprite === COLLIDER_SPRITE && colMetaPick && entity.has(colMetaPick.trait)) {
+          const b = colliderPickHalfExtents(entity.get(colMetaPick.trait) as never);
+          if (b) { width = b.halfW; height = b.halfH; pivotX = 0.5; pivotY = 0.5; }
+        }
+        candidates.push({
+          id: entity.id(),
+          wx, wy, wsx, wsy,
+          width, height, pivotX, pivotY,
+          order: paintOrder.get(entity.id()) ?? 0,
+        });
+      });
+      // SkinnedSprite2D bodies pick by their deformed-mesh AABB (they carry no Renderable2D).
+      const ssMetaPick = allTraits.find((t) => t.name === 'SkinnedSprite2D');
+      if (ssMetaPick) {
+        getCurrentWorld().query(transformMeta.trait, ssMetaPick.trait).updateEach(([tf, ss]: any, entity: any) => {
+          if (!ss.isVisible || deactivatedEntities.has(entity.id()) || !ownedByThisCanvas(entity.id())) return;
+          const buf = getSkin2DBuffer(entity.id());
+          if (!buf || !buf.parts[0]?.positions.length) return;
+          const { x: wx, y: wy, sx: wsx, sy: wsy } = getWorldTransform2D(entity.id(), tf);
+          // True AABB (matches the selection outline), not a symmetric ±max|·| — union all parts.
+          let mnX = Infinity, mnY = Infinity, mxX = -Infinity, mxY = -Infinity;
+          for (const part of buf.parts) for (let i = 0; i < part.positions.length; i += 2) {
+            const vx = part.positions[i], vy = part.positions[i + 1];
+            if (vx < mnX) mnX = vx; if (vx > mxX) mxX = vx;
+            if (vy < mnY) mnY = vy; if (vy > mxY) mxY = vy;
+          }
+          const bw = mxX - mnX, bh = mxY - mnY;
+          candidates.push({ id: entity.id(), wx, wy, wsx, wsy, width: bw / 2 || 20, height: bh / 2 || 20, pivotX: bw > 1e-6 ? -mnX / bw : 0.5, pivotY: bh > 1e-6 ? -mnY / bh : 0.5, order: paintOrder.get(entity.id()) ?? 0 });
+        });
+      }
+      // Text2D bodies pick by their laid-out text block (they carry no Renderable2D) —
+      // same box the gizmo/outline uses, so click-to-select matches what's drawn.
+      const text2dMetaPick = allTraits.find((t) => t.name === 'Text2D');
+      if (text2dMetaPick) {
+        getCurrentWorld().query(transformMeta.trait, text2dMetaPick.trait).updateEach(([tf]: any, entity: any) => {
+          const eid = entity.id();
+          if (deactivatedEntities.has(eid) || !ownedByThisCanvas(eid)) return;
+          const tbox = text2DGizmoBox(entity, text2dMetaPick);
+          if (!tbox) return;
+          const { x: wx, y: wy, sx: wsx, sy: wsy } = getWorldTransform2D(eid, tf);
+          candidates.push({ id: eid, wx, wy, wsx, wsy, width: tbox.halfW, height: tbox.halfH, pivotX: tbox.pivotX, pivotY: tbox.pivotY, order: paintOrder.get(eid) ?? 0 });
+        });
+      }
+      const bestId = pick2D(px, py, candidates);
+      if (bestId !== null) return bestId;
+
+      // No 2D entity here — but a 2.5D billboard (SkinnedSprite2D + Billboard3D) renders via the
+      // 3D game camera even in 2D mode, so its screen hit is a raycast our AABB pick2D can't do.
+      // This overlay sits ABOVE the 3D canvas, so the click never reaches the viewport's own
+      // pick3D — ask the 3D viewport to raycast just the billboards under this game-cam ray.
+      const bbId = _pickBillboardInUI?.(clientX, clientY);
+      if (bbId != null) return bbId;
+
+      // No 2D entity here. This canvas (pointerEvents:'auto') sits above the DOM
+      // UI layer, so without this it would swallow clicks meant for a UI element
+      // showing through the transparent canvas. Select the UI node beneath, if any.
+      const uiId = pickUnderlyingUIEntity(clientX, clientY);
+      if (uiId !== null) return uiId;
+
+      return null;
+    }
+
     function onPointerDown(e: PointerEvent) {
       deselectGesture.reset(); // a fresh press supersedes any stale pending deselect
       if (e.button !== 0) return;
@@ -1168,9 +1271,9 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       if (!transformMeta || !r2dMeta || !eaMeta2D) return;
 
       // Hit-testing uses THIS layer's coordinate transform, so only consider
-      // entities routed to this Canvas2D.
+      // entities routed to this Canvas2D. (`paintOrder` moved into `pickEntityAtViewportPoint`,
+      // which now owns the candidate-gather this block used to do.)
       const { parentOf, canvasIds } = getCanvas2DRouting();
-      const paintOrder = getPaintOrder();
       const ownedByThisCanvas = (id: number) => findCanvasAncestor(id, parentOf, canvasIds) === canvasEntityId;
 
       // Multi-select GROUP gizmo hit test (before the single-entity gizmo). The group gizmo sits
@@ -1267,89 +1370,11 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
         }
       }
 
-      // Second: entity selection hit test (axis-aligned bounding box)
-      const colMetaPick = getAllTraits().find((t) => t.name === 'Collider2D');
-      const candidates: Pick2DCandidate[] = [];
-      getCurrentWorld().query(transformMeta.trait, r2dMeta.trait).updateEach(([tf, rend], entity) => {
-        if (!rend.isVisible || deactivatedEntities.has(entity.id())) return;
-        if (!ownedByThisCanvas(entity.id())) return;
-        const { x: wx, y: wy, sx: wsx, sy: wsy } = getWorldTransform2D(entity.id(), tf);
-        // Default: pick by the Renderable2D box (unchanged for image/primitive sprites).
-        let width = rend.width, height = rend.height;
-        let pivotX = rend.pivotX ?? 0.5, pivotY = rend.pivotY ?? 0.5;
-        // Collider-fill entities have no meaningful Renderable2D box — the visible shape is
-        // the collider — so pick by the collider's AABB instead. ONLY when sprite='collider'
-        // AND a Collider2D is present; every other sprite is untouched.
-        if (rend.sprite === COLLIDER_SPRITE && colMetaPick && entity.has(colMetaPick.trait)) {
-          const b = colliderPickHalfExtents(entity.get(colMetaPick.trait) as never);
-          if (b) { width = b.halfW; height = b.halfH; pivotX = 0.5; pivotY = 0.5; }
-        }
-        candidates.push({
-          id: entity.id(),
-          wx, wy, wsx, wsy,
-          width, height, pivotX, pivotY,
-          order: paintOrder.get(entity.id()) ?? 0,
-        });
-      });
-      // SkinnedSprite2D bodies pick by their deformed-mesh AABB (they carry no Renderable2D).
-      const ssMetaPick = allTraits.find((t) => t.name === 'SkinnedSprite2D');
-      if (ssMetaPick) {
-        getCurrentWorld().query(transformMeta.trait, ssMetaPick.trait).updateEach(([tf, ss]: any, entity: any) => {
-          if (!ss.isVisible || deactivatedEntities.has(entity.id()) || !ownedByThisCanvas(entity.id())) return;
-          const buf = getSkin2DBuffer(entity.id());
-          if (!buf || !buf.parts[0]?.positions.length) return;
-          const { x: wx, y: wy, sx: wsx, sy: wsy } = getWorldTransform2D(entity.id(), tf);
-          // True AABB (matches the selection outline), not a symmetric ±max|·| — union all parts.
-          let mnX = Infinity, mnY = Infinity, mxX = -Infinity, mxY = -Infinity;
-          for (const part of buf.parts) for (let i = 0; i < part.positions.length; i += 2) {
-            const vx = part.positions[i], vy = part.positions[i + 1];
-            if (vx < mnX) mnX = vx; if (vx > mxX) mxX = vx;
-            if (vy < mnY) mnY = vy; if (vy > mxY) mxY = vy;
-          }
-          const bw = mxX - mnX, bh = mxY - mnY;
-          candidates.push({ id: entity.id(), wx, wy, wsx, wsy, width: bw / 2 || 20, height: bh / 2 || 20, pivotX: bw > 1e-6 ? -mnX / bw : 0.5, pivotY: bh > 1e-6 ? -mnY / bh : 0.5, order: paintOrder.get(entity.id()) ?? 0 });
-        });
-      }
-      // Text2D bodies pick by their laid-out text block (they carry no Renderable2D) —
-      // same box the gizmo/outline uses, so click-to-select matches what's drawn.
-      const text2dMetaPick = allTraits.find((t) => t.name === 'Text2D');
-      if (text2dMetaPick) {
-        getCurrentWorld().query(transformMeta.trait, text2dMetaPick.trait).updateEach(([tf]: any, entity: any) => {
-          const eid = entity.id();
-          if (deactivatedEntities.has(eid) || !ownedByThisCanvas(eid)) return;
-          const tbox = text2DGizmoBox(entity, text2dMetaPick);
-          if (!tbox) return;
-          const { x: wx, y: wy, sx: wsx, sy: wsy } = getWorldTransform2D(eid, tf);
-          candidates.push({ id: eid, wx, wy, wsx, wsy, width: tbox.halfW, height: tbox.halfH, pivotX: tbox.pivotX, pivotY: tbox.pivotY, order: paintOrder.get(eid) ?? 0 });
-        });
-      }
-      const bestId = pick2D(px, py, candidates);
-
-      if (bestId !== null) {
-        applyPickSelection(bestId, pendingMods2D);
-        e.stopPropagation();
-        e.preventDefault();
-        return;
-      }
-
-      // No 2D entity here — but a 2.5D billboard (SkinnedSprite2D + Billboard3D) renders via the
-      // 3D game camera even in 2D mode, so its screen hit is a raycast our AABB pick2D can't do.
-      // This overlay sits ABOVE the 3D canvas, so the click never reaches the viewport's own
-      // pick3D — ask the 3D viewport to raycast just the billboards under this game-cam ray.
-      const bbId = _pickBillboardInUI?.(e.clientX, e.clientY);
-      if (bbId != null) {
-        applyPickSelection(bbId, pendingMods2D);
-        e.stopPropagation();
-        e.preventDefault();
-        return;
-      }
-
-      // No 2D entity here. This canvas (pointerEvents:'auto') sits above the DOM
-      // UI layer, so without this it would swallow clicks meant for a UI element
-      // showing through the transparent canvas. Select the UI node beneath, if any.
-      const uiId = pickUnderlyingUIEntity(e.clientX, e.clientY);
-      if (uiId !== null) {
-        applyPickSelection(uiId, pendingMods2D);
+      // Second: entity selection (2D bodies, then the 3D-billboard and underlying-UI fallbacks) —
+      // the same predictive pick registered as this canvas's `registerPickProvider`.
+      const pickedId = pickEntityAtViewportPoint(e.clientX, e.clientY);
+      if (pickedId !== null) {
+        applyPickSelection(pickedId, pendingMods2D);
         e.stopPropagation();
         e.preventDefault();
         return;
@@ -1594,6 +1619,14 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
     container.addEventListener('pointerdown', onPointerDown, { capture: true });
     container.addEventListener('pointermove', onPointerMove, { capture: true });
     container.addEventListener('pointerup', onPointerUp, { capture: true });
+    // Pick provider (F15 — docs/enact.md): `pickEntityAtViewportPoint` (defined above,
+    // beside `onPointerDown`) is the SAME candidate-gather + pick2D call the pointer handler
+    // runs, so this can never drift from what a real click actually selects. One registration
+    // per mounted Canvas2D — `pickAt('scene-view', …)` tries every registered provider for the
+    // surface and takes the first non-null hit, so several canvases coexist correctly.
+    // Priority 10 (#80): the 2D canvas overlay visually sits ON TOP of the 3D viewport, so it
+    // must win when both answer for the same point — higher than the 3D provider's default 0.
+    const unregPick2D = registerPickProvider(pickEntityAtViewportPoint, 'scene-view', 10);
     return () => {
       container.removeEventListener('pointerdown', onPointerDown, { capture: true });
       container.removeEventListener('pointermove', onPointerMove, { capture: true });
@@ -1601,6 +1634,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       window.removeEventListener('pointermove', marquee2dMove);
       window.removeEventListener('pointerup', marquee2dUp);
       marqueeEl2d.remove();
+      unregPick2D();
     };
 }
 
@@ -2323,6 +2357,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     let outerDisposed = false;
     let cleanup: (() => void) | undefined;
 
+    noteRendererProgress('viewport effect entered; renderer init starting');
+
     const setup = async () => {
     // Three.js r183 WebGPU's node system warns 'Light node not found' for
     // dynamically-added lights (they still work — a Three.js internal issue). It's
@@ -2335,21 +2371,80 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // makeWebGPURenderer creates + inits the renderer (and appends its canvas),
     // so the backend is fully settled BEFORE we bind OrbitControls /
     // TransformControls and pointer listeners to renderer.domElement below.
-    let renderer: WebGPURenderer;
+    // Renderer creation is RETRIED, not attempted once. The old code gave up permanently on
+    // the first throw — and because the effect has `[]` deps and is latched by `initedRef`, a
+    // mounted-but-failed viewport could never try again. Since nothing then ever called
+    // `setActiveRenderer`, the scene-load gate sat on its full 120s cold-start budget before
+    // reporting a failure that had already been decided in the first two seconds.
+    //
+    // What retrying is and is NOT justified by, stated honestly:
+    //   - The defect being fixed is structural and confirmed: a failure here was treated as
+    //     PERMANENT with no path back. The effect has `[]` deps and is latched by `initedRef`,
+    //     so a viewport that failed once could never try again for the life of the page. Any
+    //     recoverable failure was therefore unrecoverable. That is the bug.
+    //   - The retry is VERIFIED to work: with an injected fault, attempt 1 failed, the 250ms
+    //     retry succeeded, and the scene loaded with zero error-level output.
+    //   - What is NOT established: that real-world init failures here are transient. No natural
+    //     failure of `makeWebGPURenderer` has been captured, so the retry is insurance against a
+    //     plausible-but-unconfirmed class (contended adapter during a reload storm; the
+    //     double-mount below briefly holding two GPU contexts), NOT a measured cure for an
+    //     observed flake. If it never rescues anything in practice it costs one extra attempt
+    //     on a genuinely dead GPU and nothing else.
+    // The delays are a deliberate guess, not tuned data: fast enough that a recoverable case
+    // heals well inside the old 120s budget, slow enough to outlast a context teardown.
+    const RETRY_DELAYS_MS = [250, 1000, 3000];
+    const createWithRetry = async (): Promise<WebGPURenderer> => {
+      for (let attempt = 0; ; attempt++) {
+        noteRendererProgress(`creating renderer (attempt ${attempt + 1})`);
+        try {
+          const r = await makeWebGPURenderer(container);
+          noteRendererProgress(`renderer created on attempt ${attempt + 1}`);
+          clearRendererInitFailure(); // a success clears any earlier attempt's failure
+          return r;
+        } catch (e) {
+          if (attempt >= RETRY_DELAYS_MS.length) throw e;
+          console.warn(
+            `[SceneView] renderer init attempt ${attempt + 1} failed; retrying in ` +
+            `${RETRY_DELAYS_MS[attempt]}ms:`, e,
+          );
+          await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
+        }
+      }
+    };
+
+    let created: WebGPURenderer;
     try {
-      renderer = await makeWebGPURenderer(container);
+      // Leased per container, so a StrictMode remount reuses this renderer rather than racing
+      // a second GPU device into existence while the first is still releasing.
+      created = await acquireRenderer(container, createWithRetry,
+        () => noteRendererProgress('reusing the renderer already leased to this container'));
     } catch (e) {
-      console.warn('[SceneView] renderer init failed (no WebGPU or WebGL2):', e);
+      if (outerDisposed) return; // unmounted mid-attempt — nothing to recover for
+      const err = e instanceof Error ? e : new Error(String(e));
+      noteRendererProgress(`renderer init failed after ${RETRY_DELAYS_MS.length + 1} attempts: ${err.message}`);
+      // ERROR, not warn. This was logged at warn level while the timeout message told the
+      // reader to "check the console for a WebGPU/WebGL init error" — so anyone filtering
+      // to `error`, exactly as instructed, saw an empty console and blamed their own code.
+      console.error(
+        `[SceneView] renderer init FAILED after ${RETRY_DELAYS_MS.length + 1} attempts — the 3D ` +
+        `viewport cannot render and no scene will load. This does not recover on its own; ` +
+        `relaunch the editor once the cause below is addressed.`, err,
+      );
       initedRef.current = false;
+      // Unblock every scene-load waiter NOW rather than leaving them on the 120s budget.
+      reportRendererInitFailure(err);
       return;
     }
-    // The component may have unmounted while init was in flight.
+    const renderer: WebGPURenderer = created;
+    // The component may have unmounted while init was in flight. Release our hold rather than
+    // disposing directly — a StrictMode remount is about to re-acquire this very renderer.
     if (outerDisposed) {
-      renderer.dispose();
-      renderer.domElement.remove();
+      noteRendererProgress('viewport unmounted before the renderer could be registered');
+      releaseRenderer(container);
       return;
     }
     setActiveRenderer(renderer); // KTX2Loader GPU-format detection
+    noteRendererProgress('renderer registered (setActiveRenderer called)');
     rendererRef.current = renderer;
 
     let disposed = false;
@@ -2902,23 +2997,26 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     window.addEventListener('pointermove', marqueeMove);
     window.addEventListener('pointerup', marqueeUp);
 
-    // Selection raycast on pointer down (runs after TransformControls/OrbitControls native handlers)
-    function onPointerDown(event: PointerEvent) {
-      selectGesture.reset(); // a fresh press supersedes any stale pending selection
-      if ((gizmo as any).dragging) return; // Don't reselect/deselect during gizmo drag
-      if (event.button !== 0) return;
-
-      // Raycast for entity selection
+    // Predicts what a real click at a viewport point would select in THIS 3D viewport — the
+    // exact candidate-gather + pick3D call `onPointerDown` below runs, hoisted out so it can
+    // also be registered as this surface's pick provider (`registerPickProvider`, F15 —
+    // `docs/enact.md`). Must stay the ONE code path both callers
+    // use: a second, independently-written raycast could disagree with the real click, which
+    // is exactly the false guarantee that design rejects. Returns `null` for "nothing here",
+    // including a point outside this viewport's own rect (do not clamp — an out-of-rect point
+    // belongs to whichever surface actually covers it, if any).
+    function pickEntityAtViewportPoint(clientX: number, clientY: number): number | null {
       const r = renderer.domElement.getBoundingClientRect();
+      if (clientX < r.left || clientX > r.right || clientY < r.top || clientY > r.bottom) return null;
       const isUI = modeRef.current === 'ui';
       // In UI mode the 3D render is letterboxed to the game aspect ratio, so NDC is
       // computed relative to the letterboxed viewport, not the full canvas. The aspect
       // comes from the SAME source as the render-side scissor + gameCam projection
       // (gameRect, F11) so picking can't drift from what's drawn.
       const { x: mx, y: my } = isUI
-        ? computeUIModeNDC(event.clientX, event.clientY, r,
+        ? computeUIModeNDC(clientX, clientY, r,
             gameAspectFromRect(useEditorStore.getState().gameRect, getGameAspect()))
-        : computeFullNDC(event.clientX, event.clientY, r);
+        : computeFullNDC(clientX, clientY, r);
       const activeCam = isUI ? gameActiveCam : activeEditorCam;
       const { show3D } = layersRef.current;
       // Meshes listed before gizmos so a mesh wins the tie at a shared ancestor.
@@ -2941,7 +3039,16 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           .map(([id, entry]) => ({ id, object: entry.group as THREE.Object3D })) : []),
         ...Array.from(ecsGizmos, ([id, object]) => ({ id, object })),
       ];
-      const hitId = pick3D(mx, my, activeCam, entries, raycaster);
+      return pick3D(mx, my, activeCam, entries, raycaster);
+    }
+
+    // Selection raycast on pointer down (runs after TransformControls/OrbitControls native handlers)
+    function onPointerDown(event: PointerEvent) {
+      selectGesture.reset(); // a fresh press supersedes any stale pending selection
+      if ((gizmo as any).dragging) return; // Don't reselect/deselect during gizmo drag
+      if (event.button !== 0) return;
+
+      const hitId = pickEntityAtViewportPoint(event.clientX, event.clientY);
       // Capture the multi-select modifiers now — the deferred pointer-up event won't carry them.
       pendingMods = { additive: event.shiftKey, toggle: event.metaKey || event.ctrlKey };
       // Defer the selection change to pointer-up (committed by onSelectUp iff the gesture
@@ -3161,7 +3268,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           _svBoundsBox.getSize(_svSize); _svBoundsBox.getCenter(_svCenter);
           worldAABB = { size: [_svSize.x, _svSize.y, _svSize.z], center: [_svCenter.x, _svCenter.y, _svCenter.z] };
         }
-        out.push({ id, layer: '3d', screen, onScreen, ...(worldAABB ? { worldAABB } : {}) });
+        out.push({ id, layer: '3d', surface: 'scene-view', screen, onScreen, ...(worldAABB ? { worldAABB } : {}) });
       };
       for (const [id, obj] of renderState.ecsObjects) projectOne(id, obj);
       // Skinned meshes (SkinnedMeshRenderer) live in `skinned`, keyed by entity id, with
@@ -3170,7 +3277,15 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // parity there is a possible follow-up.) setFromObject uses the bind-pose bounds.
       for (const [id, entry] of renderState.skinned) projectOne(id, entry.root);
       return out;
-    });
+    }, 'scene-view');
+
+    // Pick provider (F15 — docs/enact.md): `pickEntityAtViewportPoint` (defined above,
+    // beside `onPointerDown`) is the SAME candidate-gather + pick3D call the pointer handler
+    // runs, so this can never drift from what a real click actually selects. This is what
+    // promotes a `scene-view` 2D/3D entity aim from `occlusionScope:'canvas'` to `'entity'`
+    // (`entityResolve.ts`). Left at the default priority (0) — the 2D canvas overlay above
+    // registers at 10 since it visually sits on top and must win when both answer (#80).
+    const unregPick = registerPickProvider(pickEntityAtViewportPoint, 'scene-view');
 
     const ecsGizmos = new Map<number, THREE.Object3D>();
     const outlineMeshes = new Map<number, THREE.LineSegments>();
@@ -4312,6 +4427,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     if (!disposed) {
       registerFrameCallback(editorFrameKey, animate, PRIORITY_EDITOR_3D);
       startFrameDriver();
+      noteRendererProgress('viewport live (frame loop started)');
     }
 
     // ── Resize (using ResizeObserver for panel resizing) ──
@@ -4343,6 +4459,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       unsubInvalidation();
       unregisterSurface();
       unregBounds();
+      unregPick();
       unregGizmo3DHandles();
       resizeObserver.disconnect();
       renderer.domElement.removeEventListener('pointerdown', onPointerDownCapture, true);
@@ -4396,8 +4513,10 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       GIZMO_SHAPES.empty.dispose();
       GIZMO_SHAPES.frameBox.dispose();
       scene.clear();
-      renderer.dispose();
-      renderer.domElement.remove();
+      // Drop our hold instead of disposing outright. Under StrictMode this cleanup is followed
+      // immediately by a remount, which re-acquires the same renderer; the lease only tears the
+      // GPU device down once nothing has claimed it by the next macrotask.
+      releaseRenderer(container);
       initedRef.current = false;
     };
     }; // end setup
@@ -4435,3 +4554,4 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 }
 
 import React from 'react';
+// hmr probe 2

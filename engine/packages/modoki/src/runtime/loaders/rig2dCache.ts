@@ -12,6 +12,7 @@
 import { resolveRef, isGuid, registerAsset } from './assetManifest';
 import { assetUrl } from './assetUrl';
 import { normalizeRig2D, type Rig2DFile, type ParsedRig2D } from '../skinning/rig2dTypes';
+import { parseAssetJson } from './assetFetch';
 
 export {
   type Rig2DBone, type Rig2DPart, type Rig2DFile, type ParsedRig2DPart, type ParsedRig2D,
@@ -32,19 +33,24 @@ function rig2dCacheKey(refOrPath: string): string | undefined {
 
 /** Resolve a rig ref to its parsed rig, or null if not yet loaded. Kicks off a lazy
  *  fetch on first miss (retried each frame by the caller). */
-export function getRig2D(ref: string): ParsedRig2D | null {
+export function getRig2D(ref: string, opts?: { load?: boolean }): ParsedRig2D | null {
   if (!ref) return null;
   const path = rig2dCacheKey(ref);
   if (!path) return null;
   const hit = cache.get(path);
   if (hit) return hit;
   if (failed.has(path)) return null;
+  // `load:false` — PEEK the cache without starting a fetch. For callers whose contract is "what is
+  // in the live cache right now" (the `read-asset-def` agent op): the default getter treats a miss
+  // as "not loaded YET" and kicks off a background load, so asking about an absent asset queued a
+  // fetch that could only fail, and logged a warning into the human's console for a question the
+  // caller had already decided to answer with a refusal.
+  if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const gen = generation;
     const p = fetch(assetUrl(path))
       .then((r) => {
-        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-        return r.json();
+        return parseAssetJson(r, path);
       })
       .then((json) => {
         if (gen !== generation) return;       // scene swap mid-flight

@@ -1,6 +1,7 @@
 import { defineConfig } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { clonePort } from './tests/e2e/clonePort';
 
 // Repo root (parent of engine/). Playwright runs webServer.command with cwd = this
 // config file's dir (engine/), which has no package.json — so `npm run dev` must be
@@ -15,10 +16,36 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 // Dedicated high port (NOT the editor's 5173) so the e2e suite always spins up its
 // OWN isolated dev server and can never hijack a live editor session — these specs
 // mutate scenes + POST /api/write-file, so running them against your real editor
-// would write changes to disk. Override with MODOKI_E2E_PORT when running e2e from a
-// second worktree so each targets its own server (see CLAUDE.md worktree rules).
-const PORT = process.env.MODOKI_E2E_PORT ?? '38173';
+// would write changes to disk.
+//
+// PER-CLONE by default (#20). One hardcoded port shared by every clone meant two
+// clones could not run e2e at the same time: with `reuseExistingServer: false` below
+// the second run at least fails LOUDLY rather than testing the first clone's tree,
+// but "wait your turn" is a poor gate for a 4-clone setup, and this is the one gate
+// with no remote counterpart.
+//
+// The offset is derived from the REPO PATH, not from MODOKI_BACKEND_PORT as #20
+// proposed: that variable is set by launch-editor.sh for the EDITOR process only, so
+// it is unset in the plain shell that runs `npm run test:e2e` and every clone would
+// have collapsed back onto the same default. The repo path is the clone's identity,
+// is always available here, and needs no setup — which is the point.
+//
+// MODOKI_E2E_PORT still wins, for CI or a deliberate pin.
+// Derivation + its rationale live in ./tests/e2e/clonePort.ts so they are unit-testable
+// without importing this config.
+const PORT = process.env.MODOKI_E2E_PORT ?? String(clonePort(REPO_ROOT));
+
 const BASE_URL = `http://localhost:${PORT}`;
+
+// Announce it: the port is derived, so it is no longer a number you can memorise, and
+// the documented recovery for a stale orphan ("kill whatever holds the port") needs to
+// know which one. The config is loaded more than once per run (the runner, then the
+// webServer child, which inherits env) — guard so it prints ONCE and doesn't read like
+// a stutter.
+if (!process.env.__MODOKI_E2E_PORT_LOGGED) {
+  process.env.__MODOKI_E2E_PORT_LOGGED = '1';
+  console.log(`[e2e] dev server port ${PORT} (this clone: ${REPO_ROOT})`);
+}
 
 export default defineConfig({
   testDir: './tests/e2e',
@@ -49,7 +76,9 @@ export default defineConfig({
   // would let this go parallel again; until then, serial. See docs/todo.md.
   workers: 1,
   retries: 0,
-  reporter: [['list']],
+  // `list` for humans, plus a guard that fails a run which reported success while covering only
+  // part of the suite (observed once: 17 passed of 46, exit 0). See runCompleteReporter.ts.
+  reporter: [['list'], ['./tests/e2e/runCompleteReporter.ts']],
   use: {
     baseURL: BASE_URL,
     trace: 'retain-on-failure',
@@ -64,12 +93,24 @@ export default defineConfig({
   },
   webServer: {
     // --strictPort so a freshly-spawned server binds exactly PORT (fail fast on
-    // conflict) instead of incrementing and mismatching `url`. When a dev server
-    // is already up on PORT, reuseExistingServer skips the command entirely.
+    // conflict) instead of incrementing and mismatching `url`.
     command: `npm run dev -- --port ${PORT} --strictPort`,
     cwd: REPO_ROOT,
     url: BASE_URL,
-    reuseExistingServer: true,
+    // NEVER adopt a server this run did not start. `true` cost a long debugging session on
+    // 2026-07-29: an ORPHANED vite was bound to 38173, Playwright silently adopted it, and it
+    // died mid-run — producing a wall of `net::ERR_CONNECTION_REFUSED` whose failure point moved
+    // between runs (test 38, then 13, then 5), plus at least one run that finished EARLY and
+    // still reported success. Measured, same commit and tree: adopted orphan -> 41 failed / 5
+    // passed; port cleared first -> 46 passed, exit 0, clean teardown.
+    //
+    // Reuse bought almost nothing here — 38173 is a dedicated port that exists precisely so e2e
+    // never touches a live editor, so there is rarely a server on it worth reusing. With
+    // `false` + `--strictPort`, a stale orphan now fails the run LOUDLY at startup ("Port … is
+    // already in use") instead of corrupting it silently. Clear it with `lsof -ti :<port>`,
+    // taking the port from the `[e2e] dev server port …` line the config prints at startup —
+    // it is per-clone now (#20), so it is no longer always 38173.
+    reuseExistingServer: false,
     timeout: 120_000,
   },
 });

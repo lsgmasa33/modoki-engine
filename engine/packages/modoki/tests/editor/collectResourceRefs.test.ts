@@ -1,10 +1,10 @@
 /** collectResourceRefs unit tests — resource extraction, deduplication, sorting. */
 
 import { describe, it, expect } from 'vitest';
-import type { SerializedEntity } from '../../../src/editor/scene/serialize';
+import type { SerializedEntity, ResourceRef } from '../../src/editor/scene/serialize';
 
 async function getModule() {
-  return import('../../../src/editor/scene/serialize');
+  return import('../../src/editor/scene/serialize');
 }
 
 function entity(name: string, traits: Record<string, Record<string, unknown> | boolean>, extra: Partial<SerializedEntity> = {}): SerializedEntity {
@@ -51,7 +51,7 @@ describe('collectResourceRefs', () => {
   it('collects a Renderable3DPrimitive material as TEXTURE when the GUID is a texture asset', async () => {
     // A primitive textured directly with a raw texture GUID must be collected
     // under 'texture' (else the material pipeline drops it and it never loads).
-    const manifest = await import('../../../src/runtime/loaders/assetManifest');
+    const manifest = await import('../../src/runtime/loaders/assetManifest');
     const TEX_GUID = 'a0000000-0000-4000-8000-0000000000aa';
     manifest.registerAsset(TEX_GUID, '/games/x/assets/textures/wood.png', 'texture');
     const { collectResourceRefs } = await getModule();
@@ -221,7 +221,7 @@ describe('collectResourceRefs', () => {
       entity('a', { Renderable3D: { mesh: MESH_GUID, material: '' } }),
       entity('b', { Renderable3D: { mesh: MESH_GUID, material: '' } }),
     ]);
-    const meshRefs = refs.filter(r => r.path === MESH_GUID);
+    const meshRefs = refs.filter((r: ResourceRef) => r.path === MESH_GUID);
     expect(meshRefs).toHaveLength(1);
   });
 
@@ -232,7 +232,7 @@ describe('collectResourceRefs', () => {
       entity('b', { Environment: { hdrPath: '/sky.hdr' } }),
       entity('c', { Renderable3D: { mesh: '/a.mesh.json', material: '' } }),
     ]);
-    const types = refs.map(r => r.type);
+    const types = refs.map((r: ResourceRef) => r.type);
     const sorted = [...types].sort();
     expect(types).toEqual(sorted);
   });

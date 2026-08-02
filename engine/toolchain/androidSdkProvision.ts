@@ -97,8 +97,9 @@ export async function ensureCmdlineTools(sdkRoot: string, opts: { fetchImpl?: Fe
     fs.mkdirSync(stage, { recursive: true })
     // The zip contains a top-level `cmdline-tools/` dir; sdkmanager wants it at
     // `<sdkRoot>/cmdline-tools/latest/`. Extract to a stage, then move that dir into place.
-    // `extractArchive` uses system `tar` (bsdtar), which unzips on macOS/Linux/Windows alike.
-    extractArchive(tmpZip, stage, 'zip')
+    // `extractArchive` uses system `tar`, which unzips on macOS/Linux/Windows alike. (NOT necessarily
+    // bsdtar: Git for Windows puts GNU tar ahead of System32 — see extractArchive's drive-letter note.)
+    await extractArchive(tmpZip, stage, 'zip')
     const extracted = path.join(stage, 'cmdline-tools')
     if (!fs.existsSync(extracted)) throw new Error('cmdline-tools zip layout unexpected — no cmdline-tools/ dir')
     const destParent = path.join(sdkRoot, 'cmdline-tools')

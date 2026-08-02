@@ -34,11 +34,11 @@ const VIEW: TimelineView = { originX: TRACK_PAD_LEFT, pxPerSec: 10 };
 const xToT = (x: number) => (x - VIEW.originX) / VIEW.pxPerSec;
 
 interface Spies {
-  onScrub: ReturnType<typeof vi.fn>;
-  onDragSelectedKeys: ReturnType<typeof vi.fn>;
-  onEndKeyDrag: ReturnType<typeof vi.fn>;
-  onMarqueeSelect: ReturnType<typeof vi.fn>;
-  onCustomDrag: ReturnType<typeof vi.fn>;
+  onScrub: ReturnType<typeof vi.fn<(t: number) => void>>;
+  onDragSelectedKeys: ReturnType<typeof vi.fn<(targetTime: number) => void>>;
+  onEndKeyDrag: ReturnType<typeof vi.fn<() => void>>;
+  onMarqueeSelect: ReturnType<typeof vi.fn<(ids: string[], additive: boolean) => void>>;
+  onCustomDrag: ReturnType<typeof vi.fn<(drag: Drag, pt: { x: number; y: number }) => void>>;
   keysInBox: (b: MarqueeBox) => string[];
 }
 

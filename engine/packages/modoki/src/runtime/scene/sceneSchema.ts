@@ -16,7 +16,17 @@ import { getAllTraits } from '../core/ecs/traitRegistry';
 import type { FieldType } from '../core/ecs/traitRegistry';
 import type { SceneSchema } from '../loaders/sceneValidation';
 
-type FieldEntry = { type?: FieldType; options?: string[] };
+type FieldEntry = { type?: FieldType; options?: string[]; default?: unknown };
+
+/** Scene files OMIT a field still holding its trait default (serialize.ts's
+ *  `isTraitDefault`), so a reader of a scene file can no longer tell a missing field's
+ *  effective value without knowing the default — hence publishing it here. Scalars only,
+ *  matching exactly what omission can apply to: a non-scalar default is a single shared
+ *  instance, is never omitted, and would bloat this payload for nothing. */
+function scalarDefault(value: unknown): unknown | undefined {
+  if (value === null) return null;
+  return typeof value === 'object' || typeof value === 'function' ? undefined : value;
+}
 
 function inferType(value: unknown): FieldType | undefined {
   if (typeof value === 'number') return 'number';
@@ -50,13 +60,22 @@ export function buildSceneSchema(): SceneSchema {
     const koota = resolveKootaSchema(meta.trait);
     if (koota) {
       for (const [name, def] of Object.entries(koota)) {
-        fields[name] = { type: inferType(def) };
+        const dflt = scalarDefault(def);
+        fields[name] = dflt === undefined ? { type: inferType(def) } : { type: inferType(def), default: dflt };
       }
     }
 
-    // 2. Overlay Inspector hints (more precise type: color/enum + options).
+    // 2. Overlay Inspector hints (more precise type: color/enum + options). Carries
+    //    the default forward — the hint has no opinion on it, and dropping it here
+    //    would silently blank the default for every field that HAS an Inspector hint
+    //    (i.e. most of them).
     for (const [name, hint] of Object.entries(meta.fields)) {
-      fields[name] = hint.options ? { type: hint.type, options: hint.options } : { type: hint.type };
+      const dflt = fields[name]?.default;
+      fields[name] = {
+        type: hint.type,
+        ...(hint.options ? { options: hint.options } : {}),
+        ...(dflt === undefined ? {} : { default: dflt }),
+      };
     }
 
     traits[meta.name] = { category: meta.category, fields };

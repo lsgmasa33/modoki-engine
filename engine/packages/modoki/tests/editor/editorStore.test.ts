@@ -31,7 +31,7 @@ beforeEach(() => {
     gameViewSize: { width: 800, height: 450 },
     gameRect: { left: 0, top: 0, width: 800, height: 450 },
     assetsVersion: 0,
-    importStatus: { active: false, message: '' },
+    importStatus: { active: false, message: '', step: 0, totalSteps: 0 },
     buildStatus: { active: false, message: '', step: 0, totalSteps: 5, failed: false },
   });
 });

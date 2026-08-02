@@ -15,36 +15,42 @@
  *  reparent) DO go through the undoable actions, exactly like the menus, so the
  *  agent's edits are undoable too. */
 
+import * as THREE from 'three';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
 import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor } from '../debug/agentBridge';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
 import { getGameBootFaults } from './gameBootFaults';
 import { handleEval } from '../debug/bridgeHelpers';
+import { makeEvalApi } from './evalApi';
 import {
   useEditorStore, type SelectedAsset,
   enterPlay, stopPlay, pausePlay,
   undo, redo, canUndo, canRedo, undoLabel, redoLabel, getEditVersion,
-  loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, isEditingPrefab,
+  loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses, isEditingPrefab,
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, reparentEntity, ensureGuid, type TraitSpec,
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
-  runAsCompositeAction, markAssetDirty, getDirtyAssetPaths,
+  runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
   getPrefabSource, instantiatePrefabAsync, setPrefabSource, serializePrefab, writePrefabFile,
   resolveExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance,
   detachPrefabInstance, reattachPrefabInstance,
   pushAction, makePrefabInstantiateAction, entityRef,
   getEditorViewportCamera, focusEntityInSceneView,
-  upsertKey, findTrack, encodeValue, backendFetch,
+  upsertKey, findTrack, encodeValue,
   readEditorJournal, clearEditorJournal, withEditorActor, openActorLease, closeActorLease,
+  waitForEditorJournal,
+  getResolvedRender3d,
   type PrefabFile,
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
-  getPlayState, setPlayState, getRunMode, isAdvancing, getCurrentFPS, getFrameLoopHealth, stepOneFrame, getAllEntities, findEntity, findEntityByGuid, deleteEntity,
-  getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents,
+  getPlayState, setPlayState, getRunMode, isAdvancing, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, findEntityByGuid, deleteEntity,
+  getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents, getParticleEffect, mountedSurfaces,
   getTimeline, normalizeTimeline, getGuidForPath, getAssetType, getPresentationScale,
-  getAllTraits, type MutateOp, type MutateEntityRef,
+  getSpriteAnim, getRig2D,
+  getAllTraits, PRIMITIVE_NAMES, PRIMITIVE_SPRITE_NAMES, type MutateOp, type MutateEntityRef,
+  Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
 } from '@modoki/engine/runtime';
 
@@ -80,6 +86,34 @@ function frameLoopFields(): { frameLoop?: ReturnType<typeof getFrameLoopHealth> 
   const h = getFrameLoopHealth();
   if (h.status === 'running' && h.recovered === 0) return {};
   return { frameLoop: h };
+}
+
+/** Renderer-gate health, included only when the renderer is NOT ready. `pending` is normal
+ *  for the first seconds of a cold start; `failed` never self-recovers and means every
+ *  scene-dependent reading here is meaningless until the editor is relaunched.
+ *
+ *  `render3d` is the resolved `build.modules.render3d` fact (`createEditor.tsx`'s
+ *  `getResolvedRender3d`) — `undefined` while the boot fetch is still in flight, `true`/`false`
+ *  once resolved. It explains WHY the no-viewport watchdog warning is (or isn't) firing: a
+ *  `'pending'` gate with `render3d: false` is an expected, silent state for a 2D/UI-only
+ *  project, not a stall to chase. */
+function rendererGateFields(): {
+  rendererGate?: ReturnType<typeof getRendererGateHealth> & { render3d?: boolean };
+} {
+  const g = getRendererGateHealth();
+  if (g.status === 'ready') return {};
+  const render3d = getResolvedRender3d();
+  return { rendererGate: render3d === undefined ? g : { ...g, render3d } };
+}
+
+/** GPU device-loss / uncaptured-error state, included only when something has actually gone
+ *  wrong — the healthy case (`getGpuFaultState()` returning null) needs no words, same
+ *  convention as `frameLoopFields`/`rendererGateFields`. This is the CAUSE `frameLoop.status:
+ *  'stalled'` is often only the SYMPTOM of: a lost GPU device stops the compositor from ever
+ *  producing a frame, which the stall watchdog reports as a wedge with no idea why. */
+function gpuFields(): { gpu?: ReturnType<typeof getGpuFaultState> } {
+  const g = getGpuFaultState();
+  return g ? { gpu: g } : {};
 }
 
 /** The whole editor UI state in one read — the "get all UI state" payload. */
@@ -123,6 +157,13 @@ function readEditorState() {
     // not, because a wedge that an agent has to INFER from `fps: 0` is what made this
     // failure cost four debugging sessions.
     ...(frameLoopFields()),
+    // Renderer-gate liveness — the INDEPENDENT twin of `frameLoop`. Measured: a viewport whose
+    // renderer failed to init leaves the frame loop at a healthy 61fps while nothing renders and
+    // the scene never loads, so `fps` cannot speak for this. Omitted once the renderer is ready.
+    ...(rendererGateFields()),
+    // GPU device loss / uncaptured errors — the cause a `frameLoop.status: 'stalled'` reading
+    // is often only the symptom of. See `gpuFields`.
+    ...(gpuFields()),
     // Game code that threw while the editor booted. The project is loaded DEGRADED — its
     // systems/traits are partly unregistered — so anything measured here may be wrong for
     // reasons that have nothing to do with the scene. Omitted when the project booted clean.
@@ -141,6 +182,12 @@ function readEditorState() {
     // webContents.getZoomFactor); `devicePixelRatio` is the raw backing-store ratio (display
     // scale × zoom). See docs/todo.md (zoom-session MCP gaps).
     viewport: readViewport(),
+    // Which on-screen surfaces have a bounds provider mounted RIGHT NOW. A 2D/3D entity aim
+    // REQUIRES a `surface` (docs/enact.md), so without this a caller had to guess at exactly the
+    // thing the requirement exists to stop it guessing about — and a batch, which cannot read a
+    // response to recover from a refusal, would lose the whole batch to the guess. Cheap: it reads
+    // the provider registry, not the scene.
+    surfaces: mountedSurfaces(),
   };
 }
 
@@ -161,7 +208,16 @@ function readViewport() {
 interface SetSelectionParams { entityId?: number | null; entityIds?: number[]; guid?: string; guids?: string[]; asset?: SelectedAsset | null }
 interface CreateEntityParams { spec: CreateEntitySpec; parentId?: number; parentGuid?: string }
 interface PrefabParams {
-  action: 'instantiate' | 'create' | 'detach';
+  /** Which prefab operation. Callers reaching this op DIRECTLY (`runAgentOp`, `modoki_eval`) may
+   *  use `action`; anything arriving via `POST /api/editor-action` MUST use `prefabAction`.
+   *
+   *  Why the second name exists: that route takes the OP NAME in `action` and strips it before
+   *  relaying (`const { action: _omit, ...params }`), so a param called `action` is structurally
+   *  unreachable through it — and `modoki_prefab`, which spread its args over the routing key,
+   *  sent `action:'instantiate'` as the op name and got a 400 listing the valid ops. Every
+   *  prefab call through the MCP failed that way. */
+  prefabAction?: 'instantiate' | 'create' | 'detach';
+  action?: 'instantiate' | 'create' | 'detach';
   /** instantiate: prefab asset path. create: source path to write. */
   path?: string;
   /** instantiate: parent entity id (default root). */
@@ -215,16 +271,208 @@ function requireLiveId(ref: { id?: number; guid?: string } | undefined, op: stri
   return id;
 }
 
+/** The parent an entity should be created under / moved to, VALIDATED.
+ *
+ *  `parentGuid` was checked and `parentId` was not, so a stale or invented id sailed through as a
+ *  literal. Measured 2026-07-30: `create-entity {spec:{kind:'primitive',mesh:'cube'}, parentId:99999}`
+ *  returned `{id:141, name:'Cube', guid:…}` — a clean success — and produced an entity whose
+ *  `EntityAttributes.parentId` pointed at nothing. An ORPHAN: it is in the world, it has a parent
+ *  that does not exist, and nothing said so. Runtime ids are reassigned on every scene reload, so a
+ *  stale `parentId` is not an exotic input — it is what an agent holds after any hot-reload.
+ *
+ *  `0` stays literal: it means ROOT, not "entity 0", and must never be resolved. */
+function resolveParentId(p: { parentId?: number; parentGuid?: string }, op: string): number {
+  if (p.parentGuid) return requireLiveId({ guid: p.parentGuid }, op);
+  if (p.parentId) return requireLiveId({ id: p.parentId }, op);
+  return 0; // omitted, or an explicit 0 → root
+}
+
+/** Make an agent asset-def edit UNDOABLE, the way the equivalent panel edit already is.
+ *
+ *  The five asset-authoring ops (`particle-set`, `anim-set-clip`, `anim-add-key`, `timeline-set`,
+ *  `timeline-add-clip`) applied their change and pushed NOTHING, while `ParticleEditor` pushes a
+ *  before/after entry to the SAME global `undoManager` for the identical edit. Two consequences,
+ *  and the second is the damaging one: the agent's edit could not be undone at all, and a human
+ *  pressing Cmd-Z after it silently unwound THEIR OWN earlier action — one they had no reason to
+ *  think was next on the stack. (Audit S2.27; owner decision 2026-07-30 to close the asymmetry.)
+ *
+ *  `_isFileDirect` is load-bearing, not decoration. Without it, pushing the entry ALSO bumps
+ *  `notifyEdited()`, so `hasUnsavedChanges()` reports the SCENE dirty for an asset-only edit — and
+ *  the dirty-asset registry already tracks the asset's own pending write separately. That bump is
+ *  what `dirtyAssets.test.ts` guards, and it is a real defect, not a technicality: a falsely-dirty
+ *  scene self-blocks the file-direct routes that refuse when live work is unsaved.
+ *
+ *  `apply` is the same store call the op itself uses, so undo/redo replay the exact path the edit
+ *  took rather than a reconstruction of it.
+ *
+ *  BOTH DIRECTIONS MUST MOVE THE PARKED WRITE, not just the live cache (independent review,
+ *  2026-07-30). Persistence is manual-only, so the op parks its result in the dirty-asset registry
+ *  and `save_all` is what commits it. When undo only re-applied the old def to the CACHE, the
+ *  registry still held the new one — so the next `save_all` wrote to disk exactly the value the
+ *  caller had just undone, and the undo silently un-did itself at save time.
+ *
+ *  Which way undo moves the registry depends on whether a write was ALREADY parked for this path
+ *  before this edit (captured here, before the op's own `persistOrMarkDirty` runs):
+ *   - already pending → the parked doc WAS `before`, so re-park `before`: state restored exactly.
+ *   - not pending → disk already holds `before`, so DISCARD the parked write instead of re-parking.
+ *     Re-parking would leave the asset dirty forever after an undo, and `hasUnsavedChanges()` would
+ *     then block the file-direct routes over an edit that no longer exists. */
+function pushAssetUndo<T>(
+  label: string, before: T | null | undefined, after: T, apply: (def: T) => void,
+  path: string, type: 'particle' | 'animation' | 'timeline',
+): void {
+  // No prior def means this is the FIRST write to that asset — there is no state to revert TO, so
+  // an entry would be a lie about what undo can do. The write itself still stands.
+  //
+  // `== null` catches BOTH, deliberately: every asset cache getter returns `null` for a miss
+  // (`getParticleEffect`, `getAnimationClip`, `getTimeline`), so a strict `=== undefined` check
+  // never fired and we pushed an entry whose `undo()` applied `null` — restoring nothing while
+  // consuming the human's Cmd-Z, which is worse than the missing entry it was meant to prevent.
+  if (before == null) return;
+  const wasPending = getDirtyAssetPaths().includes(path);
+  pushAction({
+    label,
+    undo: () => {
+      apply(before);
+      if (wasPending) markAssetDirty(path, type, before);
+      else discardDirtyAssets([path]);
+    },
+    redo: () => {
+      apply(after);
+      markAssetDirty(path, type, after);
+    },
+    kind: '!asset-edit',
+    _isFileDirect: true,
+  });
+}
+
+/** Refuse an asset-editing op whose `path` names no asset that exists.
+ *
+ *  `particle-set` / `anim-set-clip` / `timeline-set` REPLACE a def by path and, under manual
+ *  persistence, park the write for `save_all` to flush. None of them checked that the path was a
+ *  real asset — so a typo (or a file nothing has loaded) was applied to nothing, reported
+ *  `{ok:true}`, and `save_all` later MATERIALISED it as a brand-new file. The agent believes it
+ *  edited an existing effect; what it actually did was create a second one with a slightly wrong
+ *  name, leaving the original untouched. Their granular siblings (`anim-add-key`,
+ *  `timeline-add-clip`) already resolve the asset first — this brings the wholesale ops in line.
+ *
+ *  Returns a refusal object, or null when the path is fine. */
+function requireExistingAsset(path: string, op: string, kind: string): { ok: false; error: string; hint: string } | null {
+  if (getGuidForPath(path)) return null;
+  return {
+    ok: false,
+    error:
+      `${op}: no ${kind} asset exists at ${JSON.stringify(path)} — nothing was applied and nothing was parked. ` +
+      'This op REPLACES an existing def; it does not create one, and a save would otherwise have ' +
+      'written a brand-new file under this name while the asset you meant stayed untouched.',
+    hint: `Check the path with modoki_list_assets (type=${kind}), or create it first with modoki_create_asset.`,
+  };
+}
+
+/** WORLD-space Transform fields → the LOCAL fields actually stored, against the LIVE world.
+ *
+ *  The live twin of `sceneMutate.ts`'s `worldFieldsToLocal`, and it converts the WHOLE POSE for
+ *  the same reason: with a rotated parent a world X depends on the child's world Y and Z, so
+ *  converting one field against zeros would silently move the other axes.
+ *
+ *  TRS IS THE PARENT CONVENTION — deliberately, and it is why this no longer calls `worldToLocal3D`
+ *  (owner decision, 2026-07-31; independent review, 2026-07-30).
+ *
+ *  A hierarchy in Modoki is TRS at every level, the way Unity's `Transform` is; a sheared parent
+ *  (non-uniform scale ABOVE a rotation) is not a legal state. `worldToLocal3D` inverts the RAW
+ *  composed matrix, so it is exact even under shear — and that made it the OUTLIER: the file path
+ *  (`parentWorldTrs` → `worldToLocalTrs`) and the human 3D gizmo
+ *  (`gizmoTransform.worldToLocalTransform`, fed the render cache's decomposed parent) both compose
+ *  the chain and decompose ONCE. So the same `{space:'world'}` op landed the entity in a different
+ *  place depending on whether an editor happened to be open, and neither answer matched a gizmo
+ *  drag. Measured on a 2-level chain: requesting world (10,0,0) put it at (10,0,0) live and
+ *  (12.638, 0.270, 0) headless. Authoring now speaks one language across all three.
+ *
+ *  SCOPE, also deliberate: `worldToLocal3D` itself is UNCHANGED. Physics uses it every frame to
+ *  write a stepped body's world pose back into a parented local Transform, as do `games/sling`
+ *  (fish steering) and `demos/forest-camp` (arrow attach) — simulation wants the exact inverse and
+ *  a per-frame decompose is a cost with no authoring benefit. The split is authoring vs simulation,
+ *  which is a real line, not two accidental conventions.
+ *
+ *  A ROOT entity's parent matrix is the identity, so this is an exact no-op there. */
+/** Scratch for the parent-chain composition — this runs per set_transform op, not per frame,
+ *  but allocating a Matrix4 per call for no reason is still noise. */
+const _parentM = new THREE.Matrix4();
+
+function worldFieldsToLocalLive(id: number, fields: Record<string, unknown>): { fields: Record<string, unknown> } | { error: string } {
+  const entity = findEntity(id);
+  const cur = entity?.get(Transform) as Record<string, number> | undefined;
+  if (!cur) return { fields };
+  const local = {
+    x: cur.x ?? 0, y: cur.y ?? 0, z: cur.z ?? 0,
+    rx: cur.rx ?? 0, ry: cur.ry ?? 0, rz: cur.rz ?? 0,
+    sx: cur.sx ?? 1, sy: cur.sy ?? 1, sz: cur.sz ?? 1,
+  };
+  const w = getWorldTransform3D(id);
+  const world = { x: w.x, y: w.y, z: w.z, rx: w.rx, ry: w.ry, rz: w.rz, sx: w.sx, sy: w.sy, sz: w.sz };
+  // Root: world == local already, so no conversion is needed (and none is safe to apply — the
+  // decompose round-trip would introduce float noise on untouched axes).
+  const isRoot = (['x', 'y', 'z', 'rx', 'ry', 'rz', 'sx', 'sy', 'sz'] as const)
+    .every((k) => Math.abs(world[k] - local[k]) < 1e-9);
+  if (isRoot) return { fields };
+
+  const wantWorld = mergeTrs(world, fields);
+  // Compose the parent chain exactly, then decompose ONCE — byte-for-byte what `parentWorldTrs`
+  // does on the file side, and what the render cache hands the gizmo. `getParentWorldMatrix3D` is
+  // the composition; the decompose is what makes this the TRS convention rather than the exact one.
+  const parentTrs = matrixToTrs(getParentWorldMatrix3D(id, getCurrentWorld(), _parentM));
+  // Same refusal as the file path: a zero-scaled ancestor collapses every descendant onto its
+  // origin, so the request has no solution and `decompose` would silently substitute an identity
+  // parent. See `collapsedParentAxes`.
+  const collapsed = collapsedParentAxes(parentTrs);
+  if (collapsed) {
+    return { error:
+      `space:'world' is not solvable here: an ancestor has ZERO scale on ${collapsed.join('/')}, which `
+      + 'collapses every descendant onto its origin, so no local transform can place this entity at the '
+      + "requested world point. Give the ancestor a non-zero scale, or write space:'local'." };
+  }
+  const next = worldToLocalTrs(wantWorld, parentTrs);
+  const all: Record<string, number> = {
+    x: next.x, y: next.y, z: next.z, rx: next.rx, ry: next.ry, rz: next.rz, sx: next.sx, sy: next.sy, sz: next.sz,
+  };
+  // Write back the whole GROUP each named axis belongs to — see `persistedTrsKeys`, shared with
+  // the file path so the two cannot diverge.
+  const out: Record<string, unknown> = {};
+  for (const k of persistedTrsKeys(fields)) out[k] = all[k];
+  return { fields: out };
+}
+
 /** Resolve a `mutate_scene`-shaped entity ref ({id}|{name}|{guid}) against the LIVE world —
  *  the live-path twin of sceneMutate.ts's `resolveEntity` (which resolves against the FILE).
  *  `name` is not covered by `resolveLiveId` (structural ops only ever took id/guid), so this
- *  adds it for parity with the file-direct op vocabulary. */
-function resolveLiveEntityRef(ref: MutateEntityRef | undefined): number | null {
-  if (!ref) return null;
-  if (ref.guid) { const e = findEntityByGuid(ref.guid); return e ? e.id() : null; }
-  if (ref.id != null) return findEntity(ref.id) ? ref.id : null;
-  if (ref.name) { const e = getAllEntities().find((en) => en.name === ref.name); return e ? e.id : null; }
-  return null;
+ *  adds it for parity with the file-direct op vocabulary.
+ *
+ *  An AMBIGUOUS `name` is an error, not a first-match. It used to be `.find()`, and duplicate
+ *  names are ordinary (three entities called "Enemy") — MEASURED on `games/3d-test`: with two
+ *  entities named `DUP_probe`, `set_transform {name:'DUP_probe'}` moved ONE of them and returned
+ *  `{ok:true, changed:1, errors:[], warnings:[]}`. The other was untouched and nothing said so.
+ *  Inside a batch there is no intermediate response in which to notice, and the entity-aimed input
+ *  path already refuses exactly this (see `entityResolve.ts`) — so the two halves of the agent
+ *  surface disagreed about whether an ambiguous name is addressable. It is not. */
+function resolveLiveEntityRef(ref: MutateEntityRef | undefined): { id: number } | { error: string } {
+  if (!ref) return { error: 'no entity ref given — pass {guid} | {name} | {id}' };
+  if (ref.guid) {
+    const e = findEntityByGuid(ref.guid);
+    return e ? { id: e.id() } : { error: `no LIVE entity with guid ${JSON.stringify(ref.guid)}` };
+  }
+  if (ref.id != null) {
+    return findEntity(ref.id) ? { id: ref.id } : { error: `no LIVE entity with id ${ref.id}` };
+  }
+  if (ref.name) {
+    const hits = getAllEntities().filter((en) => en.name === ref.name);
+    if (hits.length === 0) return { error: `no LIVE entity named ${JSON.stringify(ref.name)}` };
+    if (hits.length > 1) {
+      const which = hits.map((e) => e.guid || `id:${e.id}`).join(', ');
+      return { error: `${hits.length} LIVE entities are named ${JSON.stringify(ref.name)} (${which}) — address by guid` };
+    }
+    return { id: hits[0].id };
+  }
+  return { error: 'entity ref has none of {guid} | {name} | {id}' };
 }
 
 /** Core traits every entity needs — mirrors sceneMutate.ts's CORE_TRAITS. removeTrait refuses
@@ -248,10 +496,15 @@ const LIVE_CORE_TRAITS = new Set(['Transform', 'EntityAttributes']);
  *  agent actually hits one live. */
 async function applySceneOpsLive(ops: MutateOp[]): Promise<{
   changed: number; errors: string[]; warnings: string[]; unresolved: MutateEntityRef[];
+  created: Array<{ op: number; id: number; guid: string; name: string }>;
 }> {
   const errors: string[] = [];
   const warnings: string[] = [];
   const unresolved: MutateEntityRef[] = [];
+  // What each addEntity op created, in op order (S3.12) — the live twin of applyOps' `created`.
+  // Without it `changed:N` was the whole answer, so an agent had to re-find its own entity by
+  // name, which this surface refuses when the name is ambiguous.
+  const created: Array<{ op: number; id: number; guid: string; name: string }> = [];
   let changed = 0;
   const allTraitsList = getAllTraits();
 
@@ -261,12 +514,23 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
       const where = `op[${i}] (${op?.op ?? 'unknown'})`;
       try {
         if (op.op === 'setTrait') {
-          const id = resolveLiveEntityRef(op.entity);
-          if (id == null) { errors.push(`${where}: no LIVE entity matching ${JSON.stringify(op.entity)}`); unresolved.push(op.entity); continue; }
+          const resolved = resolveLiveEntityRef(op.entity);
+          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); continue; }
+          const id = resolved.id;
           if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
           const meta = allTraitsList.find((t) => t.name === op.trait);
           if (!meta) { errors.push(`${where}: unknown trait '${op.trait}' — list traits with modoki_list_traits`); continue; }
-          const fields = op.fields ?? {};
+          if (op.space && op.trait !== 'Transform') {
+            // Never silently ignore a parameter (§6) — mirrors the file path.
+            errors.push(`${where}: 'space' applies only to trait 'Transform' (got '${op.trait}').`);
+            continue;
+          }
+          let fields = op.fields ?? {};
+          if (op.space === 'world') {
+            const converted = worldFieldsToLocalLive(id, fields);
+            if ('error' in converted) { errors.push(`${where}: ${converted.error}`); continue; }
+            fields = converted.fields;
+          }
           const entity = findEntity(id);
           if (Object.keys(fields).length === 0) {
             // No fields → tag presence, mirroring sceneMutate.ts (don't clobber existing data;
@@ -289,8 +553,9 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
             changed++;
           }
         } else if (op.op === 'removeTrait') {
-          const id = resolveLiveEntityRef(op.entity);
-          if (id == null) { errors.push(`${where}: no LIVE entity matching ${JSON.stringify(op.entity)}`); unresolved.push(op.entity); continue; }
+          const resolved = resolveLiveEntityRef(op.entity);
+          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); continue; }
+          const id = resolved.id;
           if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
           if (LIVE_CORE_TRAITS.has(op.trait)) { errors.push(`${where}: cannot remove core trait '${op.trait}'`); continue; }
           const meta = allTraitsList.find((t) => t.name === op.trait);
@@ -300,9 +565,23 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
           // Removing an absent trait is a genuine no-op, not an error (mirrors sceneMutate.ts).
         } else if (op.op === 'addEntity') {
           const parentRaw = op.parentId;
-          const parentId = typeof parentRaw === 'number' ? parentRaw
-            : typeof parentRaw === 'string' ? (resolveLiveEntityRef({ guid: parentRaw }) ?? 0)
-            : 0;
+          // A string parentId is a GUID. An unresolvable one falls back to the root (0) — the
+          // pre-existing behaviour, kept deliberately: a missing parent is not worth failing the
+          // whole op over, and the entity is still created somewhere visible.
+          let parentId = 0;
+          if (typeof parentRaw === 'number') {
+            // A NUMERIC parent was taken literally with no check, while the string/guid form below
+            // was resolved and warned about — so the same mistake was loud one way and silent the
+            // other, and a stale id (they are reassigned on every scene reload) produced an ORPHAN:
+            // an entity whose parentId points at nothing, reported as a clean success. Same
+            // treatment for both now: resolve, else warn and fall back to the root.
+            if (parentRaw === 0 || resolveLiveId({ id: parentRaw }) != null) parentId = parentRaw;
+            else warnings.push(`${where}: parent id ${parentRaw} matched no live entity (runtime ids are reassigned on every scene reload — prefer a guid) — parented to the scene root instead`);
+          } else if (typeof parentRaw === 'string') {
+            const pr = resolveLiveEntityRef({ guid: parentRaw });
+            if ('id' in pr) parentId = pr.id;
+            else warnings.push(`${where}: parent guid ${JSON.stringify(parentRaw)} did not resolve (${pr.error}) — parented to the scene root instead`);
+          }
           const specs: TraitSpec[] = Object.entries(op.traits ?? {}).map(([name, data]) => ({
             name, data: data === true ? undefined : data as Record<string, unknown>,
           }));
@@ -315,9 +594,11 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
           const newId = createEntityWithUndo(op.name ?? 'Add Entity', parentId, specs, () => {});
           if (newId == null) { errors.push(`${where}: nothing was created (an unregistered trait in ${JSON.stringify(Object.keys(op.traits ?? {}))}?)`); continue; }
           changed++;
+          created.push({ op: i, id: newId, guid: ensureGuid(newId), name: op.name ?? 'New Entity' });
         } else if (op.op === 'removeEntity') {
-          const id = resolveLiveEntityRef(op.entity);
-          if (id == null) { errors.push(`${where}: no LIVE entity matching ${JSON.stringify(op.entity)}`); unresolved.push(op.entity); continue; }
+          const resolved = resolveLiveEntityRef(op.entity);
+          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); continue; }
+          const id = resolved.id;
           deleteEntitiesWithUndo([id]);
           changed++;
         } else {
@@ -329,12 +610,27 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
     }
   });
 
-  return { changed, errors, warnings, unresolved };
+  return { changed, errors, warnings, unresolved, created };
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────
 
 let registered = false;
+
+/** `wait-for-edit` (#28) timeout bounds. Exported so the backend relay
+ *  (`editorBackendRouter.ts`) and the MCP tool (`modoki-mcp/src/tools/editor.ts`) can give
+ *  their OWN transport timeouts generous headroom over this op's internal deadline — a
+ *  relay/HTTP timeout shorter than the op's own wait would kill a legitimate long park and
+ *  report it as a dead backend rather than the normal `timedOut:true` answer. */
+export const WAIT_FOR_EDIT_DEFAULT_MS = 30_000;
+/** Upper bound on a single park. Long enough for a human to look away and make one edit;
+ *  short enough that a wedged/disconnected renderer doesn't hold an HTTP request open
+ *  indefinitely (this is a blocking long-poll, not an SSE stream — see the #28 brief for why
+ *  SSE was passed over). A caller that wants to keep watching just calls again with the
+ *  returned `nextSeq`. */
+export const WAIT_FOR_EDIT_MAX_MS = 120_000;
+/** Floor — guards against a 0/negative timeoutMs turning this into a busy-poll. */
+export const WAIT_FOR_EDIT_MIN_MS = 50;
 
 /** Total item count across a timeline's tracks (clips / markers / cues / spans), tolerant of both a
  *  raw partial doc and a normalized one — so timeline-set can compare pre/post normalization and detect
@@ -378,7 +674,28 @@ export function registerEditorAgentOps(): void {
   // bridge — a JSON string always does. Unblocks reading/poking live renderer state (a global,
   // window.innerWidth, devicePixelRatio, dispatching a bridge event) without a raw CDP client.
   // Editor-only: this whole module is stripped from shipped game builds.
-  registerAgentOp('eval', (params) => handleEval(((params ?? {}) as { code?: string }).code ?? ''));
+  // Registered UNWRAPPED (_registerAgentOp) on purpose. The shadow above holds ambient
+  // actor='agent' for a handler's whole lifetime, and an eval body runs for an UNBOUNDED
+  // time — it can loop, await, or call modoki.waitForEdit() and park for two minutes. Holding
+  // the ambient actor across that would tag every concurrent HUMAN edit as 'agent'. Attribution
+  // is instead applied PER CALL inside makeEvalApi(), which is both accurate and bounded.
+  _registerAgentOp('eval', (params) => handleEval(((params ?? {}) as { code?: string }).code ?? '', makeEvalApi()));
+
+  // Discovery for `eval`: lists the generated `modoki` scripting surface (op list + camelCase
+  // method names + the fixed call/ops/api/composite helpers) so an agent never has to read
+  // source to find what modoki_eval can call. A pure sync read — still goes through the local
+  // registerAgentOp shadow above like every other op here, which is inert on a read.
+  registerAgentOp('eval-api', () => ({
+    ops: makeEvalApi().ops(),
+    usage: [
+      'modoki.call(op, params) — invoke any op by its raw kebab-case name',
+      'modoki.<camelCaseName>(params) — generated shortcut for each op above',
+      'modoki.ops() — same {op, method} listing as this discovery call, from inside eval code',
+      'modoki.api(path, init) — fetch() a host route with no matching op (list_assets, write_asset, import_file, build, add_native_target, the OTA tools, mutate_scene\'s file-direct path, …), routed through backendFetch',
+      'modoki.composite(label, fn) — collapse every mutation fn() makes into ONE undo entry',
+    ],
+    note: 'Call modoki_eval_api (or GET /api/eval-api) any time to see this listing again.',
+  }));
 
   // Editor Percept (Phase 7 + V3): the human-activity stream (`!`-prefixed). `merged`
   // also returns the game journal AND a single-axis `timeline` that interleaves both by
@@ -478,6 +795,22 @@ export function registerEditorAgentOps(): void {
     if (p.open) return { id: openActorLease('agent', p.ttlMs) };
     if (typeof p.id === 'number') closeActorLease(p.id);
     return { ok: true };
+  });
+
+  // ── wait-for-edit (#28) ── long-poll twin of editor-journal: park until the human does
+  // something instead of the agent polling in a loop. Registered as a plain renderer op
+  // (bypassing the `registerAgentOp` wrapper above) DELIBERATELY: that wrapper holds the
+  // ambient actor='agent' for the whole lifetime of an async handler (see withEditorActor's
+  // own doc — "the window spans the await"), and this handler can legitimately park for up
+  // to WAIT_FOR_EDIT_MAX_MS. Wrapping it would mis-attribute any HUMAN edit committed
+  // anywhere in the editor during that entire window as source:'agent' — silently defeating
+  // the one thing this tool exists to report. Same reasoning as 'actor-lease' above: this op
+  // manages/observes attribution, so it must not itself be attributed.
+  _registerAgentOp('wait-for-edit', (params) => {
+    const p = (params ?? {}) as { type?: string; source?: 'human' | 'agent'; since?: number; timeoutMs?: number };
+    const requested = typeof p.timeoutMs === 'number' && Number.isFinite(p.timeoutMs) ? p.timeoutMs : WAIT_FOR_EDIT_DEFAULT_MS;
+    const timeoutMs = Math.max(WAIT_FOR_EDIT_MIN_MS, Math.min(WAIT_FOR_EDIT_MAX_MS, requested));
+    return waitForEditorJournal({ type: p.type, source: p.source ?? 'human', since: p.since }, timeoutMs);
   });
 
   // `getEditVersion` lets the op distinguish "the target ACCEPTED this payload type" from
@@ -593,9 +926,39 @@ export function registerEditorAgentOps(): void {
 
   // ── Play control ── matches the GameView transport bar.
   registerAgentOp('play', async () => { await enterPlay(); return readEditorState(); });
-  registerAgentOp('resume', async () => { await enterPlay(); return readEditorState(); });
+  // `resume` and `pause` are TRANSITIONS, and both used to accept any state and report the editor
+  // state back as a success. From STOPPED, `resume` ran a full `enterPlay()` — a snapshot + run,
+  // i.e. the thing `play` does — so an agent that meant "carry on from where we paused" silently
+  // restarted the game from the authored snapshot and lost the state it was inspecting. `pause`
+  // from stopped was a plain no-op reported as done. `step` has guarded its precondition since it
+  // was written; these two now match it (§8: a no-op the caller asked for as a change is a failure).
+  registerAgentOp('resume', async () => {
+    const st = getPlayState();
+    if (st !== 'paused') {
+      return {
+        ok: false,
+        error: `resume requires the PAUSED state (currently: ${st}). From '${st}' this would run a full Play — a fresh snapshot + run — which discards whatever you were inspecting, so it is refused rather than done silently.`,
+        playState: st,
+        hint: st === 'stopped' ? "Use action:'play' to start the game." : "Already running — action:'pause' first if you meant to freeze it.",
+      };
+    }
+    await enterPlay();
+    return readEditorState();
+  });
   registerAgentOp('stop', async () => { await stopPlay(); return readEditorState(); });
-  registerAgentOp('pause', () => { pausePlay(); return readEditorState(); });
+  registerAgentOp('pause', () => {
+    const st = getPlayState();
+    if (st !== 'playing') {
+      return {
+        ok: false,
+        error: `pause requires the PLAYING state (currently: ${st}) — nothing to freeze, so this would be a no-op reported as success.`,
+        playState: st,
+        hint: st === 'stopped' ? "Use action:'play' first." : 'Already paused.',
+      };
+    }
+    pausePlay();
+    return readEditorState();
+  });
   // Step one frame while Paused: flip to 'playing' around a single synchronous
   // frame, then freeze again (exactly GameView's stepOnce).
   registerAgentOp('step', () => {
@@ -621,11 +984,21 @@ export function registerEditorAgentOps(): void {
   // no longer exists anywhere. Refuse by default; `force` discards deliberately. (C7)
   const guardUnsaved = (op: string, force: boolean | undefined) => {
     if (force || !hasUnsavedChanges()) return;
+    // S3.11 — name the ACTUAL cause. `hasUnsavedChanges()` has two independent ones, and the
+    // fixed string blamed only the first: an agent whose pending work was a dirty
+    // particle/anim/timeline doc was sent looking for live entities it had never created. Both
+    // clear with save_all; the difference is what `force:true` would discard.
+    const { sceneDirty, dirtyAssetPaths, dirtyScenes } = unsavedChangeCauses();
+    const causes: string[] = [];
+    if (sceneDirty) causes.push('LIVE-WORLD scene edits (e.g. from create_entity / duplicate_entity / prefab / mutate_scene, which do NOT save)');
+    if (dirtyAssetPaths.length) causes.push(`${dirtyAssetPaths.length} pending ASSET edit(s) awaiting a save: ${dirtyAssetPaths.join(', ')}`);
+    // Third cause: a non-primary loaded scene still dirty (a base whose write failed in a
+    // partial save_all). Without it a refusal driven by this alone would name no cause.
+    if (dirtyScenes.length) causes.push(`${dirtyScenes.length} non-primary loaded scene(s) with edits still only in memory (guid(s): ${dirtyScenes.join(', ')}) — a previous save_all may have failed to write them`);
     throw new Error(
-      `${op}: the editor has UNSAVED live-world changes (e.g. from create_entity / ` +
-      `duplicate_entity / prefab, which do NOT save). ${op} swaps the world, so they would be ` +
-      `destroyed — gone from the world, the file, and the undo stack. Run modoki_save_all ` +
-      `first, or pass force:true to discard them deliberately.`,
+      `${op}: the editor has UNSAVED work — ${causes.join(' AND ')}. ${op} swaps the world, so ` +
+      `${sceneDirty ? 'the scene edits would be destroyed (gone from the world, the file, and the undo stack)' : 'the pending asset writes would be lost'}` +
+      `. Run modoki_save_all first, or pass force:true to discard ${causes.length > 1 ? 'them' : 'it'} deliberately.`,
     );
   };
   registerAgentOp('load-scene', async (params) => {
@@ -670,11 +1043,30 @@ export function registerEditorAgentOps(): void {
       );
     }
     const r = await saveAll({ path: savePath, allowDialog: false });
-    if (r.saved) return { ok: true, scenePath: r.path };
+    // PARTIAL IS A FAILURE (conventions §5). The primary scene saving does not mean Save All
+    // succeeded: a dirty BASE scene that could not be serialized or written was previously just a
+    // `console.error` + `continue`, and this returned `{ok:true}`. The edit then lived only in
+    // memory, and a later build — which reads FILES — shipped without it, with nothing saying why.
+    // Two independent partial-failure channels, and the op reported ok:true through BOTH:
+    // other loaded SCENES (`r.failed`) and parked ASSET writes (`r.assets.failed`, e.g. a
+    // particle/anim def whose disk write was rejected — it stays pending and hasUnsavedChanges()
+    // stays true, but the agent was told the save succeeded).
+    const sceneFails = (r.failed ?? []).map((f) => `scene ${f.path} (${f.reason})`);
+    const assetFails = (r.assets?.failed ?? []).map((f) => `asset ${f.path} (${f.error})`);
+    const allFails = [...sceneFails, ...assetFails];
+    if (allFails.length) {
+      throw new Error(
+        `save-all PARTIALLY failed: the primary scene ${r.saved ? `saved to ${r.path}` : 'did not save'}, but ` +
+        `${allFails.length} item(s) did NOT: ${allFails.join('; ')}. Those changes are still in the ` +
+        `live world / pending only, and stay marked dirty — a build reads FILES and would ship ` +
+        `WITHOUT them. Fix the cause and call save_all again.`,
+      );
+    }
+    if (r.saved) return { ok: true, scenePath: r.path, ...(r.extraSaved?.length ? { extraSaved: r.extraSaved } : {}) };
     if (r.reason === 'needs-path') {
       throw new Error(
         'save-all: this scene has no path yet (new_scene never saved), and the Save-As panel ' +
-        'needs a human. Pass an explicit path, e.g. save_all { path: "/assets/scenes/my-scene.json" }.',
+        'needs a human. Pass an explicit path, e.g. save_all { path: "/assets/scenes/my-scene.scene.json" }.',
       );
     }
     if (r.reason === 'playing') {
@@ -683,12 +1075,71 @@ export function registerEditorAgentOps(): void {
     throw new Error(`save-all FAILED (${r.reason}) for ${r.path ?? '(no path)'} — NOTHING was written to disk.`);
   });
 
+  /** The counterpart to `save-all` for PARKED ASSET WRITES: drop them instead of persisting them.
+   *
+   *  Manual persistence shipped with only one exit from the dirty-asset registry — a save — so an
+   *  exploratory particle/anim/timeline edit could not be abandoned. Re-applying the previous def
+   *  looks like an undo and is not one: it re-parks a write (still dirty, still committed by the
+   *  next save) and it writes back the MIGRATED def, so a legacy `gravity: 6` returns as
+   *  `[0,-6,0]`. Measured on `confetti.particle.json` — the live smoke suite reported that it had
+   *  restored the asset while leaving exactly that residue.
+   *
+   *  A BARE CALL IS REFUSED. Discarding every pending write is the destructive default that
+   *  `set_selection` taught us not to ship: there, a bare call cleared the selection, so one
+   *  misspelled argument key silently became "clear everything". The caller must name `paths`, or
+   *  say `all:true` and mean it. The refusal lists what is pending, so the naming is a copy-paste. */
+  registerAgentOp('discard-asset-edits', (params) => {
+    const p = (params ?? {}) as { paths?: string[]; all?: boolean };
+    const pending = getDirtyAssetPaths();
+    if (p.paths !== undefined && !Array.isArray(p.paths)) throw new Error('discard-asset-edits: `paths` must be an array of asset paths.');
+    if (!p.paths?.length && !p.all) {
+      throw new Error(
+        'discard-asset-edits: say WHAT to discard — pass `paths:[…]`, or `all:true` to drop every '
+        + `pending asset write. A bare call is refused because dropping them all is unrecoverable. ${
+          pending.length ? `Pending now (${pending.length}): ${pending.join(', ')}` : 'Nothing is pending right now.'}`,
+      );
+    }
+    if (p.paths?.length && p.all) throw new Error('discard-asset-edits: pass `paths` OR `all:true`, not both — they disagree about the scope.');
+    const r = discardDirtyAssets(p.all ? undefined : p.paths);
+    return {
+      ok: true,
+      ...r,
+      remaining: getDirtyAssetPaths(),
+      // Say plainly what was NOT undone. The parked write is gone; the value the editor is showing
+      // is not, and an agent that reads the def back and sees its own edit must not conclude the
+      // discard failed.
+      note: r.discarded.length
+        ? 'The pending WRITE(s) were dropped — nothing will reach disk on the next save. The live '
+          + 'editor cache still holds the edited def until the asset is reloaded; apply the previous '
+          + 'def first if you need the value reverted too.'
+        : 'Nothing was pending, so nothing changed.',
+    };
+  });
+
   // ── Entity create / duplicate / delete / reparent ── (undoable, like the menus).
   registerAgentOp('create-entity', (params) => {
     const p = (params ?? {}) as CreateEntityParams;
     if (!p.spec) throw new Error('create-entity requires { spec }');
-    // parentGuid (stable) wins over parentId; 0 = root stays literal (never resolved). (C7 re-audit.)
-    const parentId = p.parentGuid ? requireLiveId({ guid: p.parentGuid }, 'create-entity parent') : (p.parentId ?? 0);
+    // `mesh` / `shape` were free strings, so `{kind:'primitive', mesh:'pyramid'}` returned
+    // `{id, name:'Pyramid', guid}` — a clean success — and produced an entity whose renderer
+    // resolves to nothing: invisible, with no error anywhere. Validate against the ONE vocabulary
+    // the renderer actually has, and name the valid values (§5).
+    const spec = p.spec as { kind?: string; mesh?: string; shape?: string };
+    // Defaults belong HERE, not in the MCP tool that happens to be one caller of many. They lived
+    // in tools/editor.ts (`mesh ?? 'sphere'`), so a direct op call — the curl API, a test, any
+    // future caller — reached `cap(undefined)` and died with a raw
+    // `Cannot read properties of undefined (reading 'charAt')`. §9: the curl surface is not exempt
+    // from the contract the MCP tool advertises.
+    if (spec.kind === 'primitive' && !spec.mesh) spec.mesh = 'sphere';
+    if (spec.kind === '2d' && !spec.shape) spec.shape = 'square';
+    if (spec.kind === 'primitive' && spec.mesh && !PRIMITIVE_NAMES.includes(spec.mesh)) {
+      throw new Error(`create-entity: unknown primitive mesh "${spec.mesh}" — nothing was created. Valid: ${PRIMITIVE_NAMES.join(', ')}.`);
+    }
+    if (spec.kind === '2d' && spec.shape && !(PRIMITIVE_SPRITE_NAMES as readonly string[]).includes(spec.shape)) {
+      throw new Error(`create-entity: unknown 2D shape "${spec.shape}" — nothing was created. Valid: ${PRIMITIVE_SPRITE_NAMES.join(', ')}. (For an image sprite, create the entity then set Renderable2D.sprite to a texture GUID.)`);
+    }
+    // parentGuid (stable) wins over parentId; BOTH are validated; 0 = root stays literal.
+    const parentId = resolveParentId(p, 'create-entity parent');
     const { name, specs } = buildEntityCreateSpecs(p.spec, parentId);
     const id = createEntityWithUndo(`Create ${name}`, parentId, specs as TraitSpec[], (i) => setSelectionRaw(i, i != null ? [i] : []));
     // null = nothing was created. Reporting {id:null} as a success let an agent proceed as
@@ -743,7 +1194,7 @@ export function registerEditorAgentOps(): void {
     // a structural edit where a recycled id would silently move the wrong node. (C7 re-audit.)
     const p = (params ?? {}) as { id?: number; guid?: string; parentId?: number; parentGuid?: string; sortOrder?: number };
     const id = requireLiveId(p, 'reparent-entity');
-    const parentId = p.parentGuid ? requireLiveId({ guid: p.parentGuid }, 'reparent-entity parent') : (p.parentId ?? 0);
+    const parentId = resolveParentId(p, 'reparent-entity parent');
     const ok = reparentEntity(id, parentId, p.sortOrder);
     // reparentEntity returns false for a no-op OR a rejected move (self-parent, or a cycle) —
     // {ok:false} alone left the agent unable to tell "done nothing" from "refused, and why". (C7)
@@ -761,8 +1212,9 @@ export function registerEditorAgentOps(): void {
   registerAgentOp('apply-scene-ops', async (params) => {
     const p = (params ?? {}) as { ops?: MutateOp[] };
     if (!Array.isArray(p.ops) || p.ops.length === 0) throw new Error('apply-scene-ops requires a non-empty { ops } array');
-    const { changed, errors, warnings, unresolved } = await applySceneOpsLive(p.ops);
-    return { ok: errors.length === 0, changed, errors, warnings, unresolved, saved: false };
+    const { changed, errors, warnings, unresolved, created } = await applySceneOpsLive(p.ops);
+    return { ok: errors.length === 0, changed, errors, warnings, unresolved, saved: false,
+      ...(created.length ? { created } : {}) };
   });
 
   // ── Prefab ops ──
@@ -776,7 +1228,8 @@ export function registerEditorAgentOps(): void {
   //  had reported ok:true. Mirrors Hierarchy.tsx / Assets.tsx / Inspector.tsx.
   registerAgentOp('prefab', async (params) => {
     const p = (params ?? {}) as PrefabParams;
-    if (p.action === 'instantiate') {
+    const which = p.prefabAction ?? p.action;
+    if (which === 'instantiate') {
       if (!p.path) throw new Error('prefab instantiate requires { path }');
       const path = p.path;
       const prefab = await getPrefabSource(path);
@@ -804,7 +1257,7 @@ export function registerEditorAgentOps(): void {
       }));
       return { ok: true, rootId, guid: ensureGuid(rootId), saved: false };
     }
-    if (p.action === 'create') {
+    if (which === 'create') {
       if ((p.entityId == null && !p.entityGuid) || !p.path) throw new Error('prefab create requires { entityId | entityGuid, path }');
       const path = p.path;
       const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab create'); // guid wins (C7 re-audit)
@@ -831,7 +1284,7 @@ export function registerEditorAgentOps(): void {
       // an agent doesn't conflate "the asset file landed" with "the scene linkage did too".
       return { ok, source: path, saved: ok, sceneLinkageSaved: false };
     }
-    if (p.action === 'detach') {
+    if (which === 'detach') {
       if (p.entityId == null && !p.entityGuid) throw new Error('prefab detach requires { entityId | entityGuid }');
       const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab detach'); // guid wins (C7 re-audit)
       const snapshot = detachPrefabInstance(entityId);
@@ -852,44 +1305,78 @@ export function registerEditorAgentOps(): void {
       });
       return { ok: true, detached: snapshot.length, saved: false };
     }
-    throw new Error(`unknown prefab action '${(p as { action?: string }).action}'`);
+    throw new Error(
+      `unknown prefab action '${which}' — pass prefabAction: 'instantiate' | 'create' | 'detach' ` +
+      "(the name is `prefabAction`, not `action`: /api/editor-action spends `action` on the op name).",
+    );
   });
 
   // ── Phase D: particle / animation first-pass editing (Claude scaffolds, human refines) ──
 
   // Move the animation playhead (scrub) — drives preview + record insertion point.
   registerAgentOp('set-playhead', (params) => {
+    // This op writes the playhead NUMBER and nothing else. The human scrub path
+    // (AnimationEditor `scrub`) additionally clamps to the clip, leaves preview-playing, enters
+    // scrub mode, opens a revert snapshot, and POSES the rig — so the description's promise that
+    // this "drives the live preview" was false: a render taken after it shows the unchanged pose.
+    // Say what actually happened instead of implying the rest (§5), and at least clamp the number
+    // so it means the same thing it does on the human path.
     const { t } = (params ?? {}) as { t?: number };
-    useEditorStore.getState().setPlayhead(Number(t) || 0);
-    return { ok: true, playhead: useEditorStore.getState().playheadTime };
+    const st = useEditorStore.getState();
+    const clip = st.editingAnimationClip as { duration?: number; name?: string } | null | undefined;
+    const asked = Number(t) || 0;
+    const clamped = clip?.duration != null ? Math.max(0, Math.min(clip.duration, asked)) : Math.max(0, asked);
+    st.setPlayhead(clamped);
+    return {
+      ok: true,
+      playhead: useEditorStore.getState().playheadTime,
+      ...(clamped !== asked ? { clampedFrom: asked, duration: clip?.duration } : {}),
+      /** Did anything get POSED? No — this moves the editor's playhead value only. */
+      posed: false,
+      boundClip: clip?.name ?? null,
+      note: clip
+        ? `Playhead moved to ${clamped}s for clip "${clip.name ?? '(unnamed)'}". This does NOT pose the rig — the value moved, the viewport did not. A render/capture taken now shows the UNCHANGED pose.`
+        : 'Playhead moved, but NO clip is bound to the Animation/Timeline editor — so this value currently drives nothing at all. Open a clip first (modoki_open_particle_editor / the Animation panel).',
+    };
   });
 
   // Replace a particle effect def — applies LIVE (cache) AND persists to disk (or, in
   // 'manual' mode, parks the write in the dirty-asset registry — Phase 3).
   registerAgentOp('particle-set', async (params) => {
-    const { path, def, _persistenceMode } = (params ?? {}) as { path?: string; def?: unknown; _persistenceMode?: unknown };
+    const { path, def } = (params ?? {}) as { path?: string; def?: unknown };
     if (!path || !def) throw new Error('particle-set requires { path, def }');
+    const missing = requireExistingAsset(path, 'particle-set', 'particle');
+    if (missing) return missing;
     const { errors, warnings } = validateAssetData('particle', def);
     if (errors.length) return { ok: false, errors, warnings };
-    useEditorStore.getState().applyParticleDef(path, def as Parameters<ReturnType<typeof useEditorStore.getState>['applyParticleDef']>[1]);
-    const saved = await persistOrMarkDirty(path, 'particle', def, _persistenceMode);
+    type ParticleDef = Parameters<ReturnType<typeof useEditorStore.getState>['applyParticleDef']>[1];
+    const applyParticle = (d: ParticleDef) => useEditorStore.getState().applyParticleDef(path, d);
+    const prevParticle = getParticleEffect(path) as ParticleDef | undefined;
+    applyParticle(def as ParticleDef);
+    pushAssetUndo(`Edit particle ${path.split('/').pop()}`, prevParticle, def as ParticleDef, applyParticle, path, 'particle');
+    const saved = await persistOrMarkDirty(path, 'particle', def);
     return { ok: true, saved, warnings };
   });
 
   // Replace an animation clip — normalize, apply LIVE, persist (or park — Phase 3).
   registerAgentOp('anim-set-clip', async (params) => {
-    const { clipPath, clip, _persistenceMode } = (params ?? {}) as { clipPath?: string; clip?: unknown; _persistenceMode?: unknown };
+    const { clipPath, clip } = (params ?? {}) as { clipPath?: string; clip?: unknown };
     if (!clipPath || !clip) throw new Error('anim-set-clip requires { clipPath, clip }');
+    const missingClip = requireExistingAsset(clipPath, 'anim-set-clip', 'animation');
+    if (missingClip) return missingClip;
     const norm = normalizeAnimationClip(clip as Partial<AnimationClipDef>);
-    useEditorStore.getState().applyAnimationClip(clipPath, norm);
-    const saved = await persistOrMarkDirty(clipPath, 'animation', norm, _persistenceMode);
+    const applyClip = (c: typeof norm) => useEditorStore.getState().applyAnimationClip(clipPath, c);
+    const prevClip = getAnimationClip(clipPath) as typeof norm | undefined;
+    applyClip(norm);
+    pushAssetUndo(`Edit clip ${clipPath.split('/').pop()}`, prevClip, norm, applyClip, clipPath, 'animation');
+    const saved = await persistOrMarkDirty(clipPath, 'animation', norm);
     return { ok: true, saved, tracks: norm.tracks.length };
   });
 
   // Add/update one keyframe at a time — the granular "first-pass timing" primitive.
   // Creates the track if absent. Applies LIVE + persists (or parks — Phase 3).
   registerAgentOp('anim-add-key', async (params) => {
-    const p = (params ?? {}) as { clipPath?: string; path?: string; trait?: string; field?: string; time?: number; value?: unknown; type?: TrackValueType; _persistenceMode?: unknown };
+    const p = (params ?? {}) as { clipPath?: string; path?: string; trait?: string; field?: string; time?: number; value?: unknown; type?: TrackValueType };
     if (!p.clipPath || !p.trait || !p.field || p.time == null) {
       throw new Error('anim-add-key requires { clipPath, trait, field, time, value }');
     }
@@ -905,16 +1392,22 @@ export function registerEditorAgentOps(): void {
     let track = findTrack(next.tracks, relPath, p.trait, p.field);
     if (!track) { track = { path: relPath, trait: p.trait, field: p.field, type: p.type ?? 'number', keys: [] }; next.tracks.push(track); }
     track.keys = upsertKey(track.keys, Number(p.time), encodeValue(track.type, p.value));
-    useEditorStore.getState().applyAnimationClip(p.clipPath, next);
-    const saved = await persistOrMarkDirty(p.clipPath, 'animation', next, p._persistenceMode);
+    const keyClipPath = String(p.clipPath);
+    const applyKeyClip = (c: typeof next) => useEditorStore.getState().applyAnimationClip(keyClipPath, c);
+    const prevKeyClip = getAnimationClip(keyClipPath) as typeof next | undefined;
+    applyKeyClip(next);
+    pushAssetUndo(`Add key ${keyClipPath.split('/').pop()}`, prevKeyClip, next, applyKeyClip, keyClipPath, 'animation');
+    const saved = await persistOrMarkDirty(p.clipPath, 'animation', next);
     return { ok: true, saved, tracks: next.tracks.length, keys: track.keys.length };
   });
 
   // Replace a whole timeline — normalize, apply LIVE (the panel + runtime cache), persist
   // (or park — Phase 3).
   registerAgentOp('timeline-set', async (params) => {
-    const { timelinePath, timeline, _persistenceMode } = (params ?? {}) as { timelinePath?: string; timeline?: unknown; _persistenceMode?: unknown };
+    const { timelinePath, timeline } = (params ?? {}) as { timelinePath?: string; timeline?: unknown };
     if (!timelinePath || !timeline) throw new Error('timeline-set requires { timelinePath, timeline }');
+    const missingTl = requireExistingAsset(timelinePath, 'timeline-set', 'timeline');
+    if (missingTl) return missingTl;
     const before = countTimelineItems(timeline as Partial<TimelineDef>);
     const norm = normalizeTimeline(timeline as Partial<TimelineDef>);
     const after = countTimelineItems(norm);
@@ -925,15 +1418,18 @@ export function registerEditorAgentOps(): void {
     if (after < before) {
       throw new Error(`timeline-set: ${before - after} of ${before} item(s) rejected by normalization (malformed — span end<=start, empty clip/action name, or missing audio clip GUID). Nothing was saved; fix the items and retry.`);
     }
-    useEditorStore.getState().applyTimelineDoc(timelinePath, norm);
-    const saved = await persistOrMarkDirty(timelinePath, 'timeline', norm, _persistenceMode);
+    const applyTl = (t: typeof norm) => useEditorStore.getState().applyTimelineDoc(timelinePath, t);
+    const prevTl = getTimeline(timelinePath) as typeof norm | undefined;
+    applyTl(norm);
+    pushAssetUndo(`Edit timeline ${timelinePath.split('/').pop()}`, prevTl, norm, applyTl, timelinePath, 'timeline');
+    const saved = await persistOrMarkDirty(timelinePath, 'timeline', norm);
     return { ok: true, saved, tracks: norm.tracks.length, items: after };
   });
 
   // Add ONE item (clip / marker / cue / span) to a timeline track (creating the track if absent).
   // Applies LIVE + persists. `item` is the raw per-kind body; normalization drops it if malformed.
   registerAgentOp('timeline-add-clip', async (params) => {
-    const p = (params ?? {}) as { timelinePath?: string; trackType?: TrackKind; target?: string; item?: Record<string, unknown>; _persistenceMode?: unknown };
+    const p = (params ?? {}) as { timelinePath?: string; trackType?: TrackKind; target?: string; item?: Record<string, unknown> };
     if (!p.timelinePath || !p.trackType || !p.item) {
       throw new Error('timeline-add-clip requires { timelinePath, trackType, item }');
     }
@@ -971,48 +1467,102 @@ export function registerEditorAgentOps(): void {
     if (gotCount < wantCount) {
       throw new Error('timeline-add-clip: item rejected by normalization — malformed for a ' + p.trackType + ' track (need: animation clip name non-empty · signal action non-empty · audio clip GUID non-empty · activation end > start · control prefab GUID non-empty OR particle:true OR subdirector:true)');
     }
-    useEditorStore.getState().applyTimelineDoc(p.timelinePath, norm);
-    const saved = await persistOrMarkDirty(p.timelinePath, 'timeline', norm, p._persistenceMode);
+    const tlClipPath = String(p.timelinePath);
+    const applyTlClip = (t: typeof norm) => useEditorStore.getState().applyTimelineDoc(tlClipPath, t);
+    const prevTlClip = getTimeline(tlClipPath) as typeof norm | undefined;
+    applyTlClip(norm);
+    pushAssetUndo(`Add timeline clip ${tlClipPath.split('/').pop()}`, prevTlClip, norm, applyTlClip, tlClipPath, 'timeline');
+    const saved = await persistOrMarkDirty(p.timelinePath, 'timeline', norm);
     return { ok: true, saved, tracks: norm.tracks.length, items: gotCount };
   });
-}
 
-/** Persist an asset edit through the validated host route (warn-but-write).
- *
- *  THROWS when the write was rejected. It used to `await backendFetch(...)` and discard the
- *  Response — and backendFetch does NOT throw on 4xx/5xx (callsites own their handling; this
- *  one owned none). So every rejection was invisible: a 403 'path outside allowed
- *  directories' (easy to hit — the GUID-only-refs convention encourages passing a guid where
- *  a URL is wanted), a 400 with validation errors, a 500. The ops apply the change LIVE
- *  first, so the viewport visibly updated and the tool returned ok:true while NOTHING reached
- *  disk — the edit then vanished at the next reload. Throwing surfaces the backend's own
- *  actionable message, which was being thrown away. (C7) */
-async function persistAsset(path: string, type: 'material' | 'particle' | 'animation' | 'timeline', data: unknown): Promise<void> {
-  const res = await backendFetch('/api/asset-write', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path, type, data }),
+  /** Read an asset definition back — the READ half of the asset-editor surface.
+   *
+   *  Why it exists: `particle-set` / `anim-set-clip` / `timeline-set` all require the FULL
+   *  definition, and until now nothing in the agent surface returned one. Two consequences,
+   *  both found running batch use case 6:
+   *
+   *  1. To change ONE field you had to obtain the def from outside the tool surface (read the
+   *     `.particle.json` off disk and map an asset-root URL to a filesystem path by hand) — which
+   *     a packaged or remote editor cannot do at all.
+   *  2. You could not VERIFY an asset edit. The write returned `{ok:true}` and the only suggested
+   *     check was `render_sequence`, i.e. judging by PIXELS — exactly what
+   *     `docs/debug-tools-mcp.md` tells an agent not to do.
+   *
+   *  Reads the LIVE cache, not the file, and that distinction is the point: persistence is manual,
+   *  so an unsaved edit exists ONLY live. A file read would report the pre-edit value and make a
+   *  successful edit look like it did nothing. `source` says which the answer came from. */
+  registerAgentOp('read-asset-def', (params) => {
+    const { path, type } = (params ?? {}) as { path?: string; type?: string };
+    if (!path) throw new Error('read-asset-def requires { path }');
+    const kind = type ?? inferAssetDefType(path);
+    if (!kind) {
+      throw new Error(
+        `read-asset-def: cannot tell what kind of asset '${path}' is — pass ` +
+        "type: 'particle' | 'animation' | 'timeline' | 'spriteanim' | 'rig2d'.",
+      );
+    }
+    // PEEK, don't load. This op reports what is in the LIVE cache — it has no business fetching.
+    // The plain getters treat a miss as "not loaded YET" and kick off a background fetch, so asking
+    // about an asset that does not exist queued a load that could only fail and logged
+    // `[particleCache] failed to load …` into the human's console — for a question this op then
+    // answered with a refusal anyway. The MCP live sweep reads a deliberately-absent probe path on
+    // every run, so it did that on every run.
+    const peek = { load: false } as const;
+    const def =
+      kind === 'particle' ? getParticleEffect(path, peek)
+      : kind === 'animation' ? getAnimationClip(path, peek)
+      : kind === 'timeline' ? getTimeline(path, peek)
+      : kind === 'spriteanim' ? getSpriteAnim(path, peek)
+      : kind === 'rig2d' ? getRig2D(path, peek)
+      : undefined;
+    if (def === undefined) {
+      throw new Error(
+        `read-asset-def: unsupported type '${kind}' (particle | animation | timeline | spriteanim | rig2d).`,
+      );
+    }
+    if (def === null) {
+      // NOT an empty answer: nothing has loaded this asset into the live cache, so there is no
+      // live def to report. Saying so beats returning null, which reads as "the asset is empty".
+      throw new Error(
+        `read-asset-def: '${path}' is not in the live ${kind} cache — nothing in the open scene ` +
+        'has loaded it yet. Load a scene that uses it (or open its editor panel) first.',
+      );
+    }
+    const dirty = getDirtyAssetPaths().includes(path);
+    return { ok: true, path, type: kind, source: 'live', unsaved: dirty, def };
   });
-  type WriteReply = { ok?: unknown; error?: unknown; errors?: unknown };
-  let body: WriteReply | null = null;
-  try { body = (await res.json()) as WriteReply; } catch { /* non-JSON body */ }
-  const errors = Array.isArray(body?.errors) ? (body.errors as unknown[]).join('; ') : '';
-  if (!res.ok || body?.ok === false || errors) {
-    const why = errors || (typeof body?.error === 'string' ? body.error : `HTTP ${res.status}`);
-    throw new Error(`saving ${type} '${path}' FAILED: ${why} — the live world was updated but NOTHING was written to disk, so this edit is lost on the next reload.`);
-  }
 }
 
-/** Persist an asset edit (auto mode — today's default) OR park it in the dirty-asset
- *  registry (manual mode) instead, mcp-persistence.md Phase 3. `mode` is
- *  `params._persistenceMode`, injected by the backend router's /api/editor-action relay
- *  (see ASSET_PERSISTENCE_ACTIONS in editorBackendRouter.ts) — undefined for any caller
- *  that reaches this op some other way (e.g. a direct in-process test), which defaults to
- *  'auto' so existing behaviour is unchanged unless a caller explicitly opts into 'manual'.
- *  Returns whether the edit reached disk, for the op's `saved` field. */
+/** Guess an asset-def kind from its filename. The three write ops each take a fixed type, so the
+ *  read one is the only place that has to work it out — and the suffixes are the project's own
+ *  convention (`docs/doc-conventions.md`), not a heuristic. */
+function inferAssetDefType(path: string): 'particle' | 'animation' | 'timeline' | 'spriteanim' | 'rig2d' | null {
+  if (path.endsWith('.particle.json')) return 'particle';
+  if (path.endsWith('.anim.json')) return 'animation';
+  if (path.endsWith('.timeline.json')) return 'timeline';
+  if (path.endsWith('.spriteanim.json')) return 'spriteanim';
+  if (path.endsWith('.rig2d.json')) return 'rig2d';
+  return null;
+}
+
+/** Park an asset edit in the dirty-asset registry. Applied LIVE by the caller; reaches disk only
+ *  via `save-all`.
+ *
+ *  Persistence is MANUAL-ONLY (owner decision 2026-07-30 — see PERSISTENCE_MODE in
+ *  `editorBackendRouter.ts`). This used to branch on `params._persistenceMode`, writing straight to
+ *  disk in `auto` mode and parking only in `manual`. The branch is gone along with `auto`.
+ *
+ *  The removed default mattered: an undefined `mode` — every in-process caller that did not come
+ *  through the relay — fell into the WRITE branch. Keeping the parameter after removing `auto`
+ *  would have left that path silently saving while every relayed call parked, which is precisely
+ *  the "same call, different effect" confusion the removal exists to end. So the parameter is gone
+ *  too, not merely defaulted.
+ *
+ *  Always returns false (nothing reached disk) for the op's `saved` field. */
 async function persistOrMarkDirty(
-  path: string, type: 'material' | 'particle' | 'animation' | 'timeline', data: unknown, mode: unknown,
+  path: string, type: 'material' | 'particle' | 'animation' | 'timeline', data: unknown,
 ): Promise<boolean> {
-  if (mode === 'manual') { markAssetDirty(path, type, data); return false; }
-  await persistAsset(path, type, data);
-  return true;
+  markAssetDirty(path, type, data);
+  return false;
 }

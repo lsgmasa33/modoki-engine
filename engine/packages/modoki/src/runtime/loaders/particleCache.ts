@@ -7,7 +7,7 @@
 
 import { resolveRef, isGuid, registerAsset } from './assetManifest';
 import { assetUrl } from './assetUrl';
-import { ASSET_FETCH_INIT } from './assetFetch';
+import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { defaultParticleEffect, type ParticleEffectDef, type CollisionConfig } from '../particles/types';
 import { particleDefProvider } from '../particles/particleDefProvider';
 
@@ -99,7 +99,7 @@ export function normalizeParticleDef(json: Partial<ParticleEffectDef>): Particle
 }
 
 /** Resolve a `.particle.json` ref to its parsed definition, or null if not yet loaded. */
-export function getParticleEffect(ref: string): ParticleEffectDef | null {
+export function getParticleEffect(ref: string, opts?: { load?: boolean }): ParticleEffectDef | null {
   if (!ref) return null;
   // Use the path-tolerant key helper (not raw resolveRef) — the live particle
   // editor preview passes a file path, which resolveRef would reject loudly.
@@ -108,12 +108,17 @@ export function getParticleEffect(ref: string): ParticleEffectDef | null {
   const hit = cache.get(path);
   if (hit) return hit;
   if (failed.has(path)) return null;
+  // `load:false` — PEEK the cache without starting a fetch. For callers whose contract is "what is
+  // in the live cache right now" (the `read-asset-def` agent op): the default getter treats a miss
+  // as "not loaded YET" and kicks off a background load, so asking about an absent asset queued a
+  // fetch that could only fail, and logged a warning into the human's console for a question the
+  // caller had already decided to answer with a refusal.
+  if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const gen = generation; // capture to detect a cache clear during the async load
     const p = fetch(assetUrl(path), ASSET_FETCH_INIT)
       .then((r) => {
-        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-        return r.json();
+        return parseAssetJson(r, path);
       })
       .then((json) => {
         // A scene swap (clearParticleCache) happened mid-flight: drop the result

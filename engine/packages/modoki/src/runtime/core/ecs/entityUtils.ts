@@ -194,7 +194,10 @@ const STRUCTURE_FIELDS = new Set(['name', 'layer', 'parentId', 'sortOrder', 'edi
  *  unable to disagree, `deriveLayer` reconciles the stored value against this map on
  *  read (`getAllEntities`): when a primary renderable trait is present its layer wins;
  *  otherwise the stored value stands (Light/HDR/ModelSource/group-node entities have no
- *  unambiguous primary renderer and legitimately store `''` or `'3d'`). F8. */
+ *  unambiguous primary renderer and legitimately store `''` or `'3d'`). F8.
+ *
+ *  Full rule (stored vs exposed type, why the caller owns the narrowing):
+ *  docs/architecture.md § "The `layer` system". */
 const PRIMARY_RENDERABLE_LAYER: Record<string, EntityInfo['layer']> = {
   Renderable3D: '3d',
   Renderable3DPrimitive: '3d',
@@ -206,8 +209,13 @@ const PRIMARY_RENDERABLE_LAYER: Record<string, EntityInfo['layer']> = {
 };
 
 /** Derive the authoritative rendering layer for an entity from the renderable traits
- *  it actually has, falling back to the stored `EntityAttributes.layer` when none of the
- *  primary renderable traits is present. See {@link PRIMARY_RENDERABLE_LAYER}. */
+ *  it actually has, falling back to `storedLayer` when none of the primary renderable
+ *  traits is present. `storedLayer` is the ALREADY-NARROWED `EntityAttributes.layer`:
+ *  the caller maps `''` (and anything unrecognised) to `undefined` first, so this takes
+ *  and returns the same three-layer type. Which traits count as primary, and the layer each
+ *  maps to, is the `PRIMARY_RENDERABLE_LAYER` table directly above — module-private, so this
+ *  comment points at it rather than restating it (a copy here would silently drift). Full
+ *  rule: docs/architecture.md § "The `layer` system". */
 export function deriveLayer(traitNames: readonly string[], storedLayer: EntityInfo['layer']): EntityInfo['layer'] {
   for (const t of traitNames) {
     const derived = PRIMARY_RENDERABLE_LAYER[t];
@@ -352,6 +360,10 @@ export function getAllEntities(): EntityInfo[] {
       parentId = (attr.parentId as number) || 0;
       sortOrder = (attr.sortOrder as number) || 0;
       if (attr.name) { name = String(attr.name); nameFound = true; }
+      // Accept ONLY the three real layers; everything else stays undefined. This is not
+      // just an '' → undefined narrowing — `attr` is unknown-typed data out of
+      // hot-reloadable scene JSON, so it also rejects junk (a hand-edited "layer": "3D"),
+      // which is why deriveLayer takes the narrow type instead of doing this itself. #36.
       const l = attr.layer as string;
       if (l === '3d' || l === '2d' || l === 'ui') layer = l;
       if (typeof attr.editorFolder === 'string') editorFolder = attr.editorFolder;

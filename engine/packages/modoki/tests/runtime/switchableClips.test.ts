@@ -67,7 +67,7 @@ describe('switchableClipNames', () => {
     const e = tw.spawn(
       SkinnedModel({ model: 'model-guid' }),
       SkeletalAnimator({ animSet: 'set-a', clip: 'idle' }),
-      AnimationLibrary({ animSets: ['set-lib'] }),
+      AnimationLibrary({ animSets: ['set-lib'], retarget: false, boneMaps: {} }),
     );
     // idle+walk (GLB) ∪ run+idle (animSet) ∪ jump (library) → {idle, walk, run, jump}.
     expect(switchableClipNames(e.id(), 'SkeletalAnimator').sort()).toEqual(['idle', 'jump', 'run', 'walk']);

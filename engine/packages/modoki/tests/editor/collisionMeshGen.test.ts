@@ -119,7 +119,10 @@ describe('collisionMeshGen — buildCollisionGLB', () => {
   it('produces a GLB the real three GLTFLoader parses into a mesh (the runtime path)', async () => {
     const out = decimateMesh(grid(20).positions, grid(20).indices, 8);
     const glb = buildCollisionGLB(out.positions, out.normals, out.indices, 'terrain_col');
-    const ab = glb.buffer.slice(glb.byteOffset, glb.byteOffset + glb.byteLength);
+    // buildCollisionGLB's Uint8Array is always backed by a plain ArrayBuffer (never a
+    // SharedArrayBuffer), so this narrows the TS-widened ArrayBufferLike to what
+    // GLTFLoader.parse actually accepts.
+    const ab = glb.buffer.slice(glb.byteOffset, glb.byteOffset + glb.byteLength) as ArrayBuffer;
     const loader = new GLTFLoader();
     const gltf = await new Promise<{ scene: { traverse: (f: (o: unknown) => void) => void } }>((res, rej) => loader.parse(ab, '', res as never, rej));
     let mesh: { geometry: { getAttribute: (n: string) => { count: number }; index: { count: number } } } | null = null;

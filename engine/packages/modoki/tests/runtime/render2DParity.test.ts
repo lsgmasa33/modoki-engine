@@ -29,8 +29,10 @@ function recordingGfx(): { calls: Call[]; gfx: GraphicsLike } {
     moveTo: (...a: number[]) => { calls.push(['moveTo', ...a]); return gfx; },
     lineTo: (...a: number[]) => { calls.push(['lineTo', ...a]); return gfx; },
     ellipse: (...a: number[]) => { calls.push(['ellipse', ...a]); return gfx; },
+    arc: (cx: number, cy: number, radius: number, startAngle: number, endAngle: number) => { calls.push(['arc', cx, cy, radius, startAngle, endAngle]); return gfx; },
     closePath: () => gfx,
     fill: () => gfx,
+    stroke: () => gfx,
   };
   return { calls, gfx };
 }

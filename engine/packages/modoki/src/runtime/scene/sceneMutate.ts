@@ -11,6 +11,7 @@
  *  a fresh guid. */
 
 import { newGuid } from '../core/assetRefRules';
+import { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, persistedTrsKeys, collapsedParentAxes, type TRS } from './transformSpace';
 
 /** Minimal on-disk entity shape (matches editor SerializedEntity / runtime
  *  SceneEntityEntry — kept structural to avoid a cross-layer import). */
@@ -38,7 +39,12 @@ export interface EntityRef {
 }
 
 export type MutateOp =
-  | { op: 'setTrait'; entity: EntityRef; trait: string; fields?: Record<string, unknown> }
+  /** `space` applies to `trait:'Transform'` ONLY. Omitted (the default) the fields are written
+   *  VERBATIM — `x/y/z` etc. ARE the local fields, which is this op's literal contract. Pass
+   *  `'world'` to give world-space values and have them converted against the parent chain.
+   *  `modoki_set_transform` REQUIRES the caller to state the space; this low-level op keeps the
+   *  literal default because writing trait fields is exactly what it is for. */
+  | { op: 'setTrait'; entity: EntityRef; trait: string; fields?: Record<string, unknown>; space?: 'local' | 'world' }
   | { op: 'removeTrait'; entity: EntityRef; trait: string }
   | { op: 'addEntity'; name?: string; parentId?: number | string; traits?: Record<string, Record<string, unknown> | boolean> }
   | { op: 'removeEntity'; entity: EntityRef }
@@ -60,6 +66,14 @@ export interface ApplyResult {
    *  reach the renderer explain them. (The C7 save-state audit in docs/connect-claude-code.md
    *  assumed this resolver knew both; it does not, and cannot.) */
   unresolved: EntityRef[];
+  /** What each `addEntity` op CREATED, in op order (S3.12).
+   *
+   *  `changed:N` alone left the agent to re-find its own new entity by name — which this very
+   *  surface refuses outright when the name is ambiguous, so "create then edit" could dead-end on
+   *  the second step. The sibling `create-entity` op returns `{id, name, guid}` for exactly this
+   *  reason; both mutate paths now do too. Omitted (absent, not `[]`) when nothing was created, so
+   *  a caller can't mistake "no adds in this batch" for "the add produced nothing". */
+  created?: Array<{ op: number; id: number; guid: string; name: string }>;
   /** Hard errors (entity not found, malformed op). Non-empty means some ops
    *  were skipped — the caller decides whether to still write. */
   errors: string[];
@@ -75,6 +89,7 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
   const errors: string[] = [];
   const warnings: string[] = [];
   const unresolved: EntityRef[] = [];
+  const created: Array<{ op: number; id: number; guid: string; name: string }> = [];
   let changed = 0;
 
   if (!scene || !Array.isArray(scene.entities)) {
@@ -90,6 +105,15 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
         if (!entity) continue;
         if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
         const fields = op.fields ?? {};
+        // Check `space` BEFORE the empty-fields (tag) branch. It used to sit in the `else if`
+        // after it, so `{op:'setTrait', trait:'<non-Transform>', space:'world'}` with no fields was
+        // accepted and tagged — the parameter silently ignored — while the LIVE twin refused it
+        // unconditionally. Same op, two behaviours, decided by whether an editor happened to have
+        // the scene open (§9).
+        if (op.space && op.trait !== 'Transform') {
+          errors.push(`${where}: 'space' applies only to trait 'Transform' (got '${op.trait}').`);
+          continue;
+        }
         // Prefab-instance roots route trait writes into their overrides (see helper).
         const container = traitWriteContainer(entity);
         if (Object.keys(fields).length === 0) {
@@ -103,7 +127,13 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
         } else {
           const existing = container[op.trait];
           const base = existing && typeof existing === 'object' ? existing : {};
-          container[op.trait] = { ...base, ...fields };
+          let write = fields;
+          if (op.space === 'world') {
+            const converted = worldFieldsToLocal(scene, entity, base as Record<string, unknown>, fields);
+            if ('error' in converted) { errors.push(`${where}: ${converted.error}`); continue; }
+            write = converted.fields;
+          }
+          container[op.trait] = { ...base, ...write };
           changed++;
         }
       } else if (op.op === 'removeTrait') {
@@ -153,6 +183,12 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
         const entity: MutableEntity = { id, name: (traits.EntityAttributes as { name: string }).name, traits };
         scene.entities.push(entity);
         changed++;
+        created.push({
+          op: i,
+          id,
+          guid: String((traits.EntityAttributes as { guid?: unknown }).guid ?? ''),
+          name: (traits.EntityAttributes as { name: string }).name,
+        });
       } else if (op.op === 'removeEntity') {
         const entity = resolveEntity(scene, op.entity, errors, where, unresolved);
         if (!entity) continue;
@@ -186,7 +222,7 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
     }
   }
 
-  return { scene, changed, errors, warnings, unresolved };
+  return { scene, changed, errors, warnings, unresolved, ...(created.length ? { created } : {}) };
 }
 
 /** Scan surviving entities for entity-ref fields that still point at a removed guid.
@@ -245,6 +281,47 @@ function entityGuid(e: MutableEntity): string | undefined {
   const attrGuid = attrs && typeof attrs === 'object' ? (attrs as { guid?: string }).guid : undefined;
   // Prefab instances carry their guid at the node top level, not in EntityAttributes.
   return attrGuid ?? e.guid;
+}
+
+/** Convert WORLD-space Transform fields into the LOCAL fields actually stored.
+ *
+ *  Converts the WHOLE POSE, not field-by-field. With a rotated parent a world X depends on the
+ *  child's world Y and Z too, so converting `{x}` against a base of zeros would silently move the
+ *  other axes. The current local transform is therefore lifted to world, the caller's fields are
+ *  overlaid on THAT, and the result converted back — so a partial world write moves only what the
+ *  caller named.
+ *
+ *  A ROOT entity's parent chain is empty, so this is an exact no-op there. */
+function worldFieldsToLocal(
+  scene: MutableScene,
+  entity: MutableEntity,
+  existingLocal: Record<string, unknown>,
+  fields: Record<string, unknown>,
+): { fields: Record<string, unknown> } | { error: string } {
+  const parent = parentWorldTrs(scene.entities, entity);
+  if (!parent) return { fields }; // root: world == local
+  // A collapsed (zero-scale) ancestor makes the request unsatisfiable — refuse rather than answer
+  // with the identity parent `decompose` silently substitutes. See `collapsedParentAxes`.
+  const collapsed = collapsedParentAxes(parent);
+  if (collapsed) {
+    return { error:
+      `space:'world' is not solvable here: an ancestor has ZERO scale on ${collapsed.join('/')}, which `
+      + 'collapses every descendant onto its origin, so no local transform can place this entity at the '
+      + "requested world point. Give the ancestor a non-zero scale, or write space:'local'." };
+  }
+  const n = (k: string, d: number) => (typeof existingLocal[k] === 'number' ? (existingLocal[k] as number) : d);
+  const local: TRS = {
+    x: n('x', 0), y: n('y', 0), z: n('z', 0),
+    rx: n('rx', 0), ry: n('ry', 0), rz: n('rz', 0),
+    sx: n('sx', 1), sy: n('sy', 1), sz: n('sz', 1),
+  };
+  const wantWorld = mergeTrs(localToWorldTrs(local, parent), fields);
+  const nextLocal = worldToLocalTrs(wantWorld, parent);
+  // Write back the whole GROUP each named axis belongs to — see `persistedTrsKeys`. Filtering to
+  // the named keys alone discarded part of the conversion's own answer under a rotated parent.
+  const out: Record<string, unknown> = {};
+  for (const k of persistedTrsKeys(fields)) out[k] = nextLocal[k];
+  return { fields: out };
 }
 
 /** The object a setTrait/removeTrait write should land in. For a normal entity

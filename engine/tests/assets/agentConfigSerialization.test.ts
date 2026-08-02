@@ -1,6 +1,21 @@
 import { describe, it, expect } from 'vitest';
 import TOML from 'smol-toml';
+import type { TomlValue } from 'smol-toml';
 import { tomlString, mcpServersToToml, expectedCursorMcpJson } from '../../scripts/sync-agent-configs.mjs';
+
+/** The shape `mcpServersToToml`'s output parses back into: a `[mcp_servers.<name>]` table
+ *  per server. Narrows the parser's generic `TomlValue` union once so callers below can
+ *  index into it directly instead of casting at every access. */
+interface McpServersTomlDoc {
+  mcp_servers: Record<string, { command?: string; args?: string[]; env?: Record<string, string> }>;
+}
+
+function asMcpServersToml(value: TomlValue): McpServersTomlDoc {
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || !('mcp_servers' in value)) {
+    throw new Error('expected a parsed TOML document with an mcp_servers table');
+  }
+  return value as unknown as McpServersTomlDoc;
+}
 
 /**
  * Unit coverage for the hand-rolled TOML/JSON serializers in sync-agent-configs.mjs —
@@ -39,7 +54,7 @@ describe('mcpServersToToml', () => {
         env: { MODOKI_BACKEND: 'http://127.0.0.1:5179' },
       },
     });
-    const parsed = TOML.parse(toml);
+    const parsed = asMcpServersToml(TOML.parse(toml));
     expect(parsed.mcp_servers.modoki).toEqual({
       command: 'npx',
       args: ['tsx', 'engine/tools/modoki-mcp/src/index.ts'],
@@ -52,24 +67,24 @@ describe('mcpServersToToml', () => {
       modoki: { command: 'npx', args: ['tsx', 'a.ts'], env: { X: '1' } },
       'game-debug': { command: 'npx', args: ['tsx', 'b.ts'], env: { X: '2' } },
     });
-    const parsed = TOML.parse(toml);
+    const parsed = asMcpServersToml(TOML.parse(toml));
     expect(Object.keys(parsed.mcp_servers)).toEqual(['modoki', 'game-debug']);
-    expect(parsed.mcp_servers.modoki.env.X).toBe('1');
-    expect(parsed.mcp_servers['game-debug'].env.X).toBe('2');
+    expect(parsed.mcp_servers.modoki.env?.X).toBe('1');
+    expect(parsed.mcp_servers['game-debug'].env?.X).toBe('2');
   });
 
   it('omits the env table entirely when a server has no env (matches chrome-devtools in .mcp.json)', () => {
     const toml = mcpServersToToml({
       'chrome-devtools': { command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest'] },
     });
-    const parsed = TOML.parse(toml);
+    const parsed = asMcpServersToml(TOML.parse(toml));
     expect(parsed.mcp_servers['chrome-devtools'].env).toBeUndefined();
     expect(toml).not.toContain('chrome-devtools.env');
   });
 
   it('omits args when a server has none', () => {
     const toml = mcpServersToToml({ bare: { command: 'node' } });
-    const parsed = TOML.parse(toml);
+    const parsed = asMcpServersToml(TOML.parse(toml));
     expect(parsed.mcp_servers.bare.args).toBeUndefined();
   });
 
@@ -81,10 +96,10 @@ describe('mcpServersToToml', () => {
         env: { PATH_HINT: 'C:\\Users\\"quoted"\\dir' },
       },
     });
-    const parsed = TOML.parse(toml);
+    const parsed = asMcpServersToml(TOML.parse(toml));
     expect(parsed.mcp_servers.windows.command).toBe('C:\\Program Files\\node.exe');
-    expect(parsed.mcp_servers.windows.args[0]).toBe('--flag="value"');
-    expect(parsed.mcp_servers.windows.env.PATH_HINT).toBe('C:\\Users\\"quoted"\\dir');
+    expect(parsed.mcp_servers.windows.args?.[0]).toBe('--flag="value"');
+    expect(parsed.mcp_servers.windows.env?.PATH_HINT).toBe('C:\\Users\\"quoted"\\dir');
   });
 
   it('is idempotent — serializing twice produces identical output', () => {

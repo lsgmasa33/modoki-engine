@@ -67,7 +67,8 @@ on disk (`color` = packed `0xRRGGBB`, `boolean` = 0|1, `enum` = the option index
 static option list).
 
 `Animator` holds a NAMED LIST of clips and plays one at a time:
-`{ clips, clip, time, speed, playing, loop, activeClip }`. `clips` is a **JSON-string bank**
+`{ clips, clip, time, speed, playing, loop, fadeDuration }`, plus the runtimeOnly read-back
+`{ activeClip, fadeFrom, fadeFromTime, fadeElapsed }`. `clips` is a **JSON-string bank**
 (`[{ name, clip: guid, speed?, loop?, fadeDuration? }]`, decoded by `animation/animClipBank.ts` —
 the ONE decoder, shared by the play loop, the resource collector, and the tree-shaker, same pattern
 as `AudioSource.clips`); `clip` is the **active clip NAME** (empty → first entry), so switching

@@ -13,6 +13,7 @@ import {
   deriveGcsBucketFromBaseUrl,
   OTA_SAFE_TOKEN,
   OTA_SAFE_BUCKET,
+  isGcsObjectMissing,
 } from '../../plugins/backend/gcloud';
 
 describe('deriveGcsBucketFromBaseUrl', () => {
@@ -127,5 +128,39 @@ describe('resolveGcloudDir', () => {
     } finally {
       Object.defineProperty(process, 'platform', { value: originalPlatform });
     }
+  });
+});
+
+describe('isGcsObjectMissing — "nothing published" vs "could not look"', () => {
+  // /api/ota/status used to swallow EVERY gcloud failure and answer
+  // {ok:true, release:null, note:'No release.json published yet'}. An agent then believes a fact
+  // about PRODUCTION and acts on it — re-publishing, or telling the human the rollout never
+  // landed. Only a genuinely absent object is an empty answer (conventions §5).
+  it('recognises the absent-object messages gcloud actually emits', () => {
+    for (const stderr of [
+      'ERROR: (gcloud.storage.cat) The following URLs matched no objects or files: gs://b/release.json',
+      'ERROR: (gcloud.storage.cat) NOT_FOUND: The specified key does not exist.',
+      'ERROR: (gcloud.storage.cat) HTTPError 404: No such object: b/release.json',
+    ]) expect(isGcsObjectMissing(stderr), stderr).toBe(true);
+  });
+
+  it('does NOT mistake a could-not-look failure for an empty bucket', () => {
+    for (const stderr of [
+      'ERROR: (gcloud.storage.cat) You do not currently have an active account selected.',
+      'ERROR: (gcloud.storage.cat) Reauthentication required. Please run: gcloud auth login',
+      'ERROR: (gcloud.storage.cat) HTTPError 403: does not have storage.objects.get access',
+      'ERROR: (gcloud.storage.cat) Unable to connect to the server. Check your network.',
+      // The one that caught a real bug in the predicate: a broad /not found/ matched this, i.e.
+      // gcloud is not INSTALLED — reported as a confident statement about production.
+      'gcloud: command not found',
+      '',
+    ]) expect(isGcsObjectMissing(stderr), stderr).toBe(false);
+  });
+
+  it('is wrong only in the SAFE direction — an unrecognised failure is never "nothing there"', () => {
+    // The predicate is deliberately specific rather than broad: a message it does not recognise
+    // must fall through to "could not look", because that error is recoverable and a false
+    // "nothing is published" is not.
+    expect(isGcsObjectMissing('ERROR: something nobody has seen before')).toBe(false);
   });
 });

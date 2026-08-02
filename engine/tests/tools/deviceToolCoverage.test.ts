@@ -1,0 +1,149 @@
+/** Phase 8, device half — T2 across ALL 20 `device_*` tools, table-driven.
+ *
+ *  The editor surface got a contract table (`contracts.ts`) and therefore per-tool conformance for
+ *  all 77 tools. The device surface had neither: `deviceToolSurface.test.ts` asserts a dozen
+ *  specific behaviours (identity banner, lease refusal, unscaled-tap refusal, reply decoding) but
+ *  NOTHING per tool — so 14 of the 20 had no test that called them at all, and the one failure mode
+ *  this whole audit is about (a tool that is dead, or that swallows a failure) was unobservable for
+ *  them.
+ *
+ *  Rather than duplicate the editor's full contract table for the device server — a second table to
+ *  keep in sync, which §9 says will drift — this asserts the two invariants that actually matter and
+ *  derives everything else from the live registry:
+ *
+ *    1. every DATA-PLANE tool proxies through `/api/device/request` (the lease is the only path to
+ *       the device; a tool that talks to anything else has escaped the controlled-comms design), and
+ *    2. every tool reports a failure as an `isError` §5 envelope rather than a cheerful string.
+ *
+ *  The control-plane exceptions (`device_status`/`connect`/`disconnect` hit `/api/device/*`, and
+ *  `device_screenshot`/`device_native_logs` can take the adb side channel) are named, with reasons.
+ */
+
+import { describe, it, expect, afterEach } from 'vitest';
+import { loadDeviceSurface, deviceReply, type DeviceSurface } from './deviceSurface';
+
+let surface: DeviceSurface | undefined;
+afterEach(() => { surface?.restore(); surface = undefined; });
+
+/** Tools that legitimately do NOT go through `/api/device/request`, and why. */
+const NOT_DATA_PLANE: Record<string, string> = {
+  device_status: 'control plane — reads the lease itself via /api/device/status',
+  device_connect: 'control plane — opens the lease via /api/device/connect',
+  device_disconnect: 'control plane — closes the lease via /api/device/disconnect',
+  device_screenshot: 'may use the adb side channel: an Android WebView composites WebGPU in a separate GPU surface, so the device-side captureScreen returns a BLACK frame and only `adb screencap` sees the real one',
+  device_native_logs: 'reads logcat/idevicesyslog through adb — there is no device-side op for it',
+};
+
+/** The smallest VALID call per tool — the ergonomic form, same rule as the editor table's
+ *  `minimalArgs`. Explicit rather than synthesized: a synthesized aim (`{x:1,y:2}`) would trip the
+ *  unscaled-coordinate refusal and test that instead of the tool. */
+const MINIMAL: Record<string, Record<string, unknown>> = {
+  device_status: {},
+  device_connect: { useAdb: true },
+  device_disconnect: {},
+  device_get_scene_state: {},
+  device_diagnose: {},
+  device_journal: {},
+  device_watch: { action: 'list' },
+  device_layout_bounds: {},
+  device_resolve_refs: { refs: ['g-1'] },
+  device_introspect: {},
+  device_dispatch_action: { name: 'engine.playClip' },
+  device_console_logs: {},
+  device_native_logs: {},
+  device_eval: { code: 'return 1' },
+  device_eval_api: {},   // discovery for device_eval's injected `modoki` object (#83) — no params
+  device_screenshot: {},
+  device_tap: { selector: '#play' },
+  device_drag: { fromSelector: '#a', toSelector: '#b' },
+  device_pointer: { action: 'down', selector: '#play' },
+  device_hover: { selector: '#play' },
+  device_scroll: { selector: '#list', deltaY: 120 },   // canonical name — see the twin-parity note in mcp-tools.ts
+  device_press_key: { key: 'Space' },
+  device_type_text: { text: 'hi' },
+};
+
+describe('device tool surface — every tool, table-driven', () => {
+  it('the MINIMAL table covers exactly the registered tools (neither stale nor short)', async () => {
+    const s = (surface = await loadDeviceSurface());
+    expect(Object.keys(MINIMAL).sort()).toEqual([...s.names].sort());
+  });
+
+  it('every fixture is VALID against its own strict schema', async () => {
+    // A fixture the transport would refuse describes a call that cannot happen — the harness must
+    // not manufacture states (mcpSurface's docblock; nine unreachable findings came from it once).
+    const s = (surface = await loadDeviceSurface());
+    const bad: string[] = [];
+    for (const [name, args] of Object.entries(MINIMAL)) {
+      const v = s.validate(name, args);
+      if (!v.ok) bad.push(`${name}: ${v.error}`);
+    }
+    expect(bad).toEqual([]);
+  });
+
+  describe('a data-plane tool proxies through the lease relay', () => {
+    for (const name of Object.keys(MINIMAL)) {
+      if (name in NOT_DATA_PLANE) continue;
+      it(`${name} → POST /api/device/request`, async () => {
+        const s = (surface = await loadDeviceSurface((req) =>
+          req.path === '/api/device/request' ? deviceReply({ ok: true }) : undefined));
+        await s.call(name, MINIMAL[name]);
+        const sent = s.real().find((r) => r.path === '/api/device/request');
+        expect(sent, `${name} never reached the lease relay; it called: ${s.real().map((r) => r.path).join(', ') || '(nothing)'}`).toBeDefined();
+        expect(sent!.method).toBe('POST');
+        // The relay envelope names the device-side op — a tool sending no `method` would reach the
+        // device's router default ("Unknown method"), which is a dead tool with a 200 in front of it.
+        expect((sent!.body as { method?: string })?.method, `${name} sent no device op name`).toBeTruthy();
+      });
+    }
+  });
+
+  describe('every tool reports a transport failure as a §5 envelope', () => {
+    for (const name of Object.keys(MINIMAL)) {
+      it(`${name} surfaces an unreachable backend`, async () => {
+        const s = (surface = await loadDeviceSurface(() => { throw new Error('ECONNREFUSED'); }));
+        const r = await s.call(name, MINIMAL[name]);
+        expect(r.isError, `${name} reported an unreachable backend as success`).toBe(true);
+        const text = s.text(r);
+        const parsed = JSON.parse(text.split('\n').pop()!) as { error?: { code?: string; tool?: string; why?: string } };
+        expect(parsed.error?.code, `${name} failure carries no code`).toBeTruthy();
+        expect(parsed.error?.tool, `${name} failure does not name the tool`).toBe(name);
+        expect(parsed.error?.why, `${name} failure has no cause`).toBeTruthy();
+      });
+    }
+  });
+
+  describe('every data-plane tool fails when the DEVICE refuses', () => {
+    // The device signals a handler failure by RETURNING an `Error: …` string, which the transport
+    // resolves as a normal result — the C7 class, and the reason `isDeviceError` exists. It was
+    // fixed for the six Percept tools; this asserts it for all of them.
+    for (const name of Object.keys(MINIMAL)) {
+      if (name in NOT_DATA_PLANE) continue;
+      it(`${name} treats an 'Error: …' reply as a failure`, async () => {
+        const s = (surface = await loadDeviceSurface((req) =>
+          req.path === '/api/device/request' ? deviceReply('Error: the op refused') : undefined));
+        const r = await s.call(name, MINIMAL[name]);
+        expect(r.isError, `${name} reported a device refusal as success`).toBe(true);
+        expect(s.text(r)).toMatch(/refused/);
+      });
+    }
+  });
+
+  it('device_native_logs also fails on an `Error: …` reply (it is outside the loop above)', async () => {
+    // Exempt from the data-plane loop because it can take the adb side channel — so it needs its own
+    // assertion, or the fix that gave it `isDeviceError` would have nothing watching it. Without the
+    // check the error string was String()'d straight into the payload and read as log CONTENT.
+    const s = (surface = await loadDeviceSurface((req) =>
+      req.path === '/api/device/request' ? deviceReply('Error: logcat unavailable') : undefined));
+    const r = await s.call('device_native_logs', MINIMAL.device_native_logs);
+    expect(r.isError).toBe(true);
+    expect(s.text(r)).toMatch(/logcat unavailable/);
+  });
+
+  it('the NOT_DATA_PLANE exemptions each carry a real reason', () => {
+    for (const [tool, why] of Object.entries(NOT_DATA_PLANE)) {
+      expect(why.length, `${tool} needs a real reason`).toBeGreaterThan(20);
+      expect(Object.keys(MINIMAL), `${tool} is exempted but not registered`).toContain(tool);
+    }
+  });
+});

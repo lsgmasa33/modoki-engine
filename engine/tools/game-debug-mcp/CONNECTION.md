@@ -151,7 +151,9 @@ No Bonjour/mDNS advertising on either platform — it was removed from both the 
 
 ## Troubleshooting
 
-- **`device_*` says "no device connected"** — connect in the AI panel first; check `device_status`.
+- **`device_*` says "no device connected"** — open the lease with `device_connect {ip:"<device IP
+  from the game's debug menu>"}` or `{useAdb:true}` (bare = reconnect the last target), or the
+  editor AI panel → **Connect a Device**; `device_status` reports the current lease state.
 - **Connect stuck / times out** — wrong IP, not on the same WiFi, not a Debug build, or firewalled.
   The connect is bounded (~6s) and reports which of these to check. On Android, prefer adb.
 - **iOS drops after a while** — the app was backgrounded; keep it foregrounded and reconnect.

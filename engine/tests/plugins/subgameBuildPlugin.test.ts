@@ -5,7 +5,7 @@
  *  imports (not the full SUBGAME_SHARED_KEYS list — see the plugin's own header on why
  *  over-declaring would force the shell to eager-load renderers a sub-game never uses),
  *  and that a project with no game.ts fails loudly instead of silently. */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -75,7 +75,10 @@ describe('subgameBuildPlugin', () => {
 
     const emitted: { fileName: string; source: string }[] = [];
     const ctx = { emitFile: (asset: { fileName: string; source: string }) => emitted.push(asset) };
-    (plugin.generateBundle as (this: typeof ctx) => void).call(ctx);
+    // The test deliberately calls the hook against a STUB `this` (only `emitFile`, not the
+    // full Rollup PluginContext) — through `unknown` because that stub is narrower than the
+    // real hook's `this` type, which is exactly what's being exercised.
+    (plugin.generateBundle as unknown as (this: typeof ctx) => void).call(ctx);
 
     expect(emitted).toHaveLength(1);
     expect(emitted[0].fileName).toBe('subgame.json');
@@ -88,7 +91,7 @@ describe('subgameBuildPlugin', () => {
     const plugin = subgameBuildPlugin({ projectRoot, engineApi: 1 });
     const emitted: { fileName: string; source: string }[] = [];
     const ctx = { emitFile: (asset: { fileName: string; source: string }) => emitted.push(asset) };
-    (plugin.generateBundle as (this: typeof ctx) => void).call(ctx);
+    (plugin.generateBundle as unknown as (this: typeof ctx) => void).call(ctx);
     expect(JSON.parse(emitted[0].source).sharedDeps).toEqual([]);
   });
 });

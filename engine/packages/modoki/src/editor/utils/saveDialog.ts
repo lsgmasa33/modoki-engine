@@ -70,7 +70,7 @@ export async function saveAssetDialog(opts: {
   prompt?: string;
 }): Promise<string | null> {
   const { defaultName, ext, defaultFolder, prompt } = opts;
-  let res: { path?: string; cancelled?: boolean; unsupported?: boolean; error?: string } = {};
+  let res: { path?: string; cancelled?: boolean; unsupported?: boolean; error?: string };
   try {
     res = await backendFetch('/api/save-dialog', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },

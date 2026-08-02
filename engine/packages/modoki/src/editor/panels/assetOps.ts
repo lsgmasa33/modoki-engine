@@ -13,7 +13,7 @@
  *  the logic is unit-testable without rendering a React panel. */
 
 import { backendFetch } from '../backend/editorBackend';
-import { serializePrefab, tagEntityTreeAsInstance, untagEntityTreeAsInstance, setPrefabCache, type PrefabFile } from '../scene/prefab';
+import { serializePrefab, tagEntityTreeAsInstance, untagEntityTreeAsInstance, setPrefabCache, warnInertPrefabSizes, type PrefabFile } from '../scene/prefab';
 import { entityRef } from '../undo/entityRef';
 import type { UndoAction } from '../undo/undoManager';
 import { registerAsset } from '../../runtime/loaders/assetManifest';
@@ -198,6 +198,7 @@ export interface CreatePrefabResult {
  *
  *  Returns null if the entity can't be serialized or the file write fails;
  *  callers log the appropriate panel-specific error. */
+
 export async function createPrefabFromEntity(
   entityId: number,
   savePath: string,
@@ -205,6 +206,7 @@ export async function createPrefabFromEntity(
 ): Promise<CreatePrefabResult | null> {
   const prefab = serializePrefab(entityId);
   if (!prefab) return null;
+  warnInertPrefabSizes(prefab, savePath);
   const content = JSON.stringify(prefab, null, 2);
   if (!(await writeAssetFile(savePath, content))) return null;
 

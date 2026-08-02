@@ -4,6 +4,7 @@
  *  GUID → path resolution, and editor seed/invalidate. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { completeResponse } from '../stubs/assetResponse';
 
 /** Flush the fetch().then().then().finally() microtask chain + one macrotask. */
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -19,7 +20,9 @@ async function setup() {
 }
 
 function mockFetch(impl: (url: string) => Promise<unknown>) {
-  const fn = vi.fn((url: string) => impl(url));
+  // completeResponse fills in text() — the stubs below only supply json(), and the loaders read
+  // the body as text so they can spot Vite's index.html SPA fallback. See tests/stubs/assetResponse.ts.
+  const fn = vi.fn(async (url: string) => completeResponse(await impl(url)));
   vi.stubGlobal('fetch', fn);
   return fn;
 }
@@ -209,5 +212,35 @@ describe('clearParticleCache (scene swap)', () => {
     await flush(); // disk fetch resolves — must NOT overwrite the seed
 
     expect(cache.getParticleEffect('fx/edit.particle.json')!.maxParticles).toBe(4242);
+  });
+});
+
+/** `load:false` — peek the cache without starting a fetch.
+ *
+ *  The `read-asset-def` agent op reports what is in the LIVE cache; the plain getter treats a miss
+ *  as "not loaded YET" and queues a background load. So asking about an asset that does not exist
+ *  fetched it anyway, failed, and warned into the human's editor console — for a question the op
+ *  had already decided to refuse. The MCP live sweep reads an absent probe path every run. */
+describe('getParticleEffect load:false (peek)', () => {
+  it('returns null and does NOT fetch on a miss', async () => {
+    const { cache } = await setup();
+    const fetchFn = mockFetch(async () => ({ ok: true, json: async () => ({ version: 1, maxParticles: 5 }) }));
+    expect(cache.getParticleEffect('/assets/particles/absent.particle.json', { load: false })).toBeNull();
+    expect(fetchFn, 'a peek must not queue a load').not.toHaveBeenCalled();
+  });
+
+  it('still returns a cached def', async () => {
+    const { cache } = await setup();
+    const fetchFn = mockFetch(async () => ({ ok: true, json: async () => ({}) }));
+    cache.setParticleEffect('/assets/particles/seeded.particle.json', { version: 1, maxParticles: 42 } as never);
+    expect(cache.getParticleEffect('/assets/particles/seeded.particle.json', { load: false })?.maxParticles).toBe(42);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('the DEFAULT still loads — the peek must not become the behaviour', async () => {
+    const { cache } = await setup();
+    const fetchFn = mockFetch(async () => ({ ok: true, json: async () => ({ version: 1, maxParticles: 7 }) }));
+    expect(cache.getParticleEffect('/assets/particles/lazy.particle.json')).toBeNull();
+    expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 });

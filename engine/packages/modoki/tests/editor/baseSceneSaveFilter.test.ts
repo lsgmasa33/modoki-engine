@@ -16,11 +16,11 @@ import { setRunMode } from '../../src/runtime/core/playState';
 function registerAll() {
   registerTrait({
     name: 'EntityAttributes', trait: EntityAttributes, category: 'component',
-    fields: { name: {}, isActive: {}, sortOrder: {}, parentId: { entityId: { onMissing: 'root' } }, layer: {}, guid: {} },
+    fields: { name: { type: 'string' }, isActive: { type: 'boolean' }, sortOrder: { type: 'number' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, layer: { type: 'enum' }, guid: { type: 'string' } },
   });
   registerTrait({
     name: 'Transform', trait: Transform, category: 'component',
-    fields: { x: {}, y: {}, z: {}, rx: {}, ry: {}, rz: {}, sx: {}, sy: {}, sz: {} },
+    fields: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' }, rx: { type: 'number' }, ry: { type: 'number' }, rz: { type: 'number' }, sx: { type: 'number' }, sy: { type: 'number' }, sz: { type: 'number' } },
   });
 }
 

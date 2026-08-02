@@ -61,6 +61,20 @@ vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
     for (const k of Object.keys(meta.fields)) out[k] = data[k];
     return out;
   },
+  // Mirrors the real readTraitDataFull: the keys a trait PERSISTS — its koota
+  // schema for a SoA trait, the live object's own keys for AoS — NOT the
+  // meta.fields Inspector subset that readTraitData reads.
+  readTraitDataFull: (id: number, meta: any) => {
+    const e = entityIndex.get(id);
+    if (!e || !e.has(meta.trait)) return null;
+    if (meta.category === 'tag') return {};
+    const data = e.get(meta.trait);
+    const schema = (meta.trait as { schema?: unknown }).schema;
+    const keys = schema && typeof schema === 'object' ? Object.keys(schema) : Object.keys(data);
+    const out: Record<string, unknown> = {};
+    for (const k of keys) out[k] = data[k];
+    return out;
+  },
 }));
 
 vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({

@@ -475,4 +475,5 @@ describe('resolveSceneByName', () => {
     expect(resolveSceneByName('does-not-exist')).toBeUndefined();
     expect(resolveSceneByName('')).toBeUndefined();
   });
+
 });

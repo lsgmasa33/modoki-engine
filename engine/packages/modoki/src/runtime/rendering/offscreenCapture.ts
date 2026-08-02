@@ -27,12 +27,35 @@ export interface OffscreenCameraOverride {
   fov?: number;
 }
 
+/** JPEG quality, ONE UNIT: 1–100 (S3.13).
+ *
+ *  `quality` used to mean two different things across the three sibling capture tools —
+ *  `render_scene`/`render_sequence` took a 0..1 fraction (straight to `canvas.toDataURL`, which
+ *  per the HTML spec SILENTLY IGNORES an out-of-range number and uses the browser default), while
+ *  `capture_viewport` took 1–100. So a sibling-habituated `quality:70` on render_scene produced
+ *  the default with no warning, and `quality:0.9` on capture_viewport could have crashed the
+ *  native encoder. The MCP tools now all take 1–100 and this converts; a legacy 0..1 fraction
+ *  from a raw curl caller is still accepted rather than silently misread as "1%".
+ *
+ *  MIRRORED in `engine/electron/rendererOps.ts` (`normalizeJpegQuality`) — the Electron main
+ *  process cannot import the runtime package. `engine/tests/electron/captureScale.test.ts` asserts
+ *  the two agree over a sample, so the copies cannot drift (conventions §9). */
+export function normalizeJpegQuality(raw: number | undefined, fallback = 85): { pct: number; fraction: number } {
+  const n = typeof raw === 'number' && Number.isFinite(raw) ? raw : fallback;
+  // A value in (0,1] is a legacy fraction; 1 is ambiguous and means "1%" nowhere useful, so it is
+  // read as the fraction 1.0 = best quality.
+  const pct = n > 0 && n <= 1 ? n * 100 : n;
+  const clamped = Math.max(1, Math.min(100, Math.round(pct)));
+  return { pct: clamped, fraction: clamped / 100 };
+}
+
 export interface OffscreenRenderOpts {
   /** Output width in px (default: the live viewport width; clamped to 4096). */
   width?: number;
   /** Output height in px (default: the live viewport height; clamped to 4096). */
   height?: number;
-  /** JPEG quality 0..1 (default 0.85). */
+  /** JPEG quality 1–100 (default 85). A legacy 0..1 fraction is still accepted — see
+   *  {@link normalizeJpegQuality}. The effective 1–100 value is echoed back as `quality`. */
   quality?: number;
   /** Optional deterministic camera override. */
   camera?: OffscreenCameraOverride;
@@ -41,6 +64,9 @@ export interface OffscreenRenderOpts {
 export interface OffscreenRenderResult {
   width: number;
   height: number;
+  /** The EFFECTIVE JPEG quality actually used, 1–100 — echoed so a caller can see that its
+   *  out-of-unit value was converted/clamped rather than silently ignored (S3.13). */
+  quality?: number;
   /** A `data:image/jpeg;base64,…` URL of the rendered frame. The backend decodes
    *  it to a temp file so an agent gets a path, not an inline image. */
   dataUrl: string;

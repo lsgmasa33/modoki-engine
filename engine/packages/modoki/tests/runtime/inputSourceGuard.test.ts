@@ -106,6 +106,6 @@ describe('input source guard (Part A6)', () => {
   });
 
   it('the allowlist stays small (review pressure)', () => {
-    expect(ALLOW.size).toBeLessThanOrEqual(3);
+    expect(ALLOW.size).toBeLessThanOrEqual(2);
   });
 });

@@ -135,7 +135,7 @@ describe('stepSimulation — headless-only guard', () => {
   // The guard is dev-gated (import.meta.env.DEV) — vitest runs as PROD by default,
   // so stub DEV on to exercise it.
   it('warns when invoked while a live real-clock "playing" session is active', () => {
-    vi.stubEnv('DEV', 'true');
+    vi.stubEnv('DEV', true);
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const world = createWorld();
     world.spawn(Time);
@@ -154,7 +154,7 @@ describe('stepSimulation — headless-only guard', () => {
   });
 
   it('does NOT warn for normal headless use (stopped, real clock)', () => {
-    vi.stubEnv('DEV', 'true');
+    vi.stubEnv('DEV', true);
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const world = createWorld();
     world.spawn(Time);
@@ -172,7 +172,7 @@ describe('stepSimulation — headless-only guard', () => {
   });
 
   it('does NOT warn on the supported chain path (manual clock already active)', () => {
-    vi.stubEnv('DEV', 'true');
+    vi.stubEnv('DEV', true);
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const world = createWorld();
     world.spawn(Time);

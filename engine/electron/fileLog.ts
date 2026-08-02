@@ -57,7 +57,7 @@ function fmt(level: string, args: unknown[]): string {
  */
 export function initFileLog(): string {
   if (stream) return logFilePath;
-  let dir = '';
+  let dir: string;
   try {
     dir = path.join(app.getPath('userData'), 'logs');
   } catch {

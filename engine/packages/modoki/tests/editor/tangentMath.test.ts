@@ -4,7 +4,7 @@ import { describe, it, expect } from 'vitest';
 import { deriveTangentFromHandle, handleDataPt } from '../../src/editor/panels/animation/tangentMath';
 import { DEFAULT_TANGENT_WEIGHT, type Keyframe } from '../../src/runtime/animation/types';
 
-const key = (over: Partial<Keyframe> = {}): Keyframe => ({ t: 1, v: 2, ...over });
+const key = (over: Partial<Keyframe> = {}): Keyframe => ({ t: 1, v: 2, inTangent: 0, outTangent: 0, ...over });
 
 describe('handleDataPt — forward (slope+weight → data point)', () => {
   it('out handle points forward in time along the slope', () => {

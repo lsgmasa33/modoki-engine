@@ -10,6 +10,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { summarizeAssets, summarizeTraits, type AssetEntry, type TraitSchema } from '../../tools/modoki-mcp/src/summarize';
+import type { ToolErrorDetail } from '../../tools/modoki-mcp/src/result';
 
 const ASSETS: AssetEntry[] = [
   { guid: 'g1', path: '/assets/scenes/main.json', name: 'Main', type: 'scene' },
@@ -27,11 +28,11 @@ const TRAITS: Record<string, TraitSchema> = {
 
 describe('summarizeAssets — bare returns counts', () => {
   it('per-type counts, no entries', () => {
-    const d = summarizeAssets(ASSETS) as { total: number; byType: Record<string, number>; assets?: unknown };
+    const d = summarizeAssets(ASSETS) as { total: number; byType: Record<string, number>; assets?: unknown; hint: string };
     expect(d.total).toBe(4);
     expect(d.byType).toEqual({ scene: 2, mesh: 1, texture: 1 });
     expect(d.assets).toBeUndefined();
-    expect((d as { hint: string }).hint).toContain('folder=');
+    expect(d.hint).toContain('folder=');
   });
 
   it('all=true forces the full list', () => {
@@ -111,16 +112,26 @@ describe('summarizeTraits — name= returns exactly one schema', () => {
     expect(d.traits.Transform.fields).toEqual({ x: { type: 'number' }, y: { type: 'number' } });
   });
 
-  it('an unknown trait errors with a did-you-mean, not a silent empty', () => {
-    const d = summarizeTraits(TRAITS, true, { name: 'transform' }) as { error: string };
-    expect(d.error).toContain('unknown trait "transform"');
-    expect(d.error).toContain('Transform'); // case-insensitive suggestion
+  // The failure is a §5 envelope DETAIL, not a message: "the registry is empty" and "no such
+  // trait" need different codes because the caller reacts differently (wait and retry vs pick
+  // another name), and prose cannot carry that distinction to a test or to the reader.
+  it('an unknown trait is NOT_FOUND, with the near matches as options', () => {
+    const d = summarizeTraits(TRAITS, true, { name: 'transform' }) as { error: ToolErrorDetail };
+    expect(d.error.code).toBe('NOT_FOUND');
+    expect(d.error.got).toBe('transform');
+    expect(d.error.options).toContain('Transform'); // case-insensitive suggestion
   });
 
-  it('an unknown trait with no near match still errors cleanly', () => {
-    const d = summarizeTraits(TRAITS, true, { name: 'Zzz' }) as { error: string };
-    expect(d.error).toContain('unknown trait "Zzz"');
-    expect(d.error).not.toContain('did you mean');
+  it('an unknown trait with no near match still points at how to list them', () => {
+    const d = summarizeTraits(TRAITS, true, { name: 'Zzz' }) as { error: ToolErrorDetail };
+    expect(d.error.code).toBe('NOT_FOUND');
+    expect(d.error.options?.join(' ')).toContain('modoki_list_traits');
+  });
+
+  it('an EMPTY registry is NO_RENDERER, never "unknown trait" — it says nothing about existence', () => {
+    const d = summarizeTraits({}, false, { name: 'Transform' }) as { error: ToolErrorDetail };
+    expect(d.error.code).toBe('NO_RENDERER');
+    expect(d.error.why).toContain('EMPTY');
   });
 
   it('all=true returns every schema', () => {

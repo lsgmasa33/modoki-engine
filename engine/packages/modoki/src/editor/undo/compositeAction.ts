@@ -123,6 +123,14 @@ async function runSequential(steps: (() => void | Promise<void>)[], what: string
  *  them: both flags mean "this entry is not pending live-world work", and one real edit
  *  in the batch makes the batch a real edit. Conservative in the safe direction — the
  *  cost of over-reporting dirty is a spurious save prompt; of under-reporting, data loss.
+ *
+ *  `affectedScenes` is UNIONED from the sub-actions, and the composite MUST carry it:
+ *  `pushAction` diverts a sub-action into the capture frame BEFORE it reaches
+ *  `markAffectedScenesDirty`, so a captured sub never marks its own scene dirty. Dropping
+ *  the union here made a live edit to a NON-primary loaded scene (a base scene) invisible
+ *  to `saveAll`, which writes such a scene only `if (isSceneDirty(guid))` — the edit was
+ *  silently never saved. The per-action skip condition is applied per SUB (a selection or
+ *  file-direct sub contributes nothing), mirroring what each would have done unbatched.
  */
 export function composeUndoActions(
   subActions: UndoAction[],
@@ -142,6 +150,12 @@ export function composeUndoActions(
   if (opts.coalesceKey != null) action.coalesceKey = opts.coalesceKey;
   if (subs.every((a) => a._isSelection)) action._isSelection = true;
   if (subs.every((a) => a._isFileDirect)) action._isFileDirect = true;
+  const scenes = new Set<string>();
+  for (const a of subs) {
+    if (a._isSelection || a._isFileDirect) continue; // that sub would not have marked either
+    for (const guid of a.affectedScenes ?? []) scenes.add(guid);
+  }
+  if (scenes.size) action.affectedScenes = [...scenes];
   return action;
 }
 

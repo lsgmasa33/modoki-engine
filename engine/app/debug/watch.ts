@@ -214,9 +214,28 @@ export interface StartWatchParams {
   expireFrames?: number;
 }
 
-export function startWatch(p: StartWatchParams): { ok: boolean; id?: string; component?: string; fields?: string[]; matched?: string[]; unmatchedGuids?: string[]; names?: string[]; matchedNow?: number; error?: string } {
+export function startWatch(p: StartWatchParams): { ok: boolean; id?: string; component?: string; fields?: string[]; matched?: string[]; unmatchedGuids?: string[]; names?: string[]; matchedNow?: number; error?: string; hint?: string } {
+  // `component` is what a watch IS ABOUT, so an absent one is not "unknown component undefined" —
+  // it is a missing required argument, and the refusal has to say so and list the options. The
+  // ergonomic minimal call `{action:'start'}` previously answered `unknown component "undefined"`,
+  // which names neither the missing param nor anything to try next (§5).
+  if (!p.component) {
+    const sample = getAllTraits().filter((m) => numericFields(m, undefined).length > 0).map((m) => m.name).slice(0, 12);
+    return {
+      ok: false,
+      error: 'watch-start requires `component` — the trait whose numeric fields to sample (e.g. Transform, RigidBody2D). Nothing was started.',
+      hint: `Components with numeric fields include: ${sample.join(', ')}${sample.length === 12 ? ', …' : ''}. Full list: modoki_list_traits.`,
+    };
+  }
   const meta = getAllTraits().find((m) => m.name === p.component);
-  if (!meta) return { ok: false, error: `unknown component "${p.component}"` };
+  if (!meta) {
+    const near = getAllTraits().map((m) => m.name).filter((n) => n.toLowerCase().includes(String(p.component).toLowerCase())).slice(0, 8);
+    return {
+      ok: false,
+      error: `unknown component "${p.component}" — nothing was started.`,
+      hint: near.length ? `Did you mean: ${near.join(', ')}?` : 'List valid names with modoki_list_traits (component names are case-sensitive).',
+    };
+  }
   const fields = numericFields(meta, p.fields);
   if (fields.length === 0) {
     return { ok: false, error: `no numeric fields on "${p.component}"${p.fields ? ` matching ${JSON.stringify(p.fields)}` : ''}` };
@@ -295,6 +314,8 @@ export function readWatch(id: string, opts?: { clear?: boolean; name?: string; g
   const guidFilter = opts?.guids && opts.guids.length ? new Set(opts.guids) : undefined;
   const limit = opts?.limit != null && opts.limit >= 0 ? Math.floor(opts.limit) : undefined;
   const series = [] as unknown[];
+  /** The series keys actually RETURNED — `clear` empties exactly these. See the clear below. */
+  const emitted: string[] = [];
   let matchedSeries = 0;
   for (const [k, s] of w.series) {
     const [guid, field] = splitKey(k);
@@ -302,6 +323,7 @@ export function readWatch(id: string, opts?: { clear?: boolean; name?: string; g
     if (nameFilter && !(s.name ?? '').toLowerCase().includes(nameFilter)) continue;
     matchedSeries++;
     if (limit != null && series.length >= limit) continue; // count every match; emit up to `limit`
+    emitted.push(k);
     const vals = s.samples.map((x) => x.value);
     const lastTick = s.samples.length ? s.samples[s.samples.length - 1].tick : 0;
     series.push({
@@ -327,10 +349,40 @@ export function readWatch(id: string, opts?: { clear?: boolean; name?: string; g
     truncated: w.truncated || undefined,
     seriesTotal: matchedSeries,
     ...(limit != null && matchedSeries > series.length ? { seriesTruncated: true } : {}),
+    // Say what a `clear` actually did, so "I cleared it" is never ambiguous about scope.
+    ...(opts?.clear ? { cleared: series.length, clearedScope: series.length === w.series.size ? 'all' : 'returned-only' } : {}),
     series,
   };
-  // Clear empties every series → they all revert to baseline-pending, so the mover budget frees up.
-  if (opts?.clear) { for (const s of w.series.values()) s.samples = []; w.moverCount = 0; }
+  // Clear empties exactly the series this call RETURNED — not every series in the watch.
+  //
+  // It used to empty all of them. A read is capped (100 series by default) and can be narrowed by
+  // name/guids, so `{action:'read', clear:true}` on a 300-series watch showed 100 and destroyed
+  // the samples of all 300 — including the 200 the caller never saw, and any the human's WatchTab
+  // was charting. "Clear what I was just shown" is a coherent consume-and-acknowledge; "clear
+  // things I did not see" is data loss disguised as bookkeeping.
+  //
+  // `moverCount` is only zeroed on a FULL clear: it budgets moving series across the whole watch,
+  // so releasing the whole budget after a partial clear would let the cap be exceeded.
+  if (opts?.clear) {
+    // Decrement the mover budget for each series we actually clear.
+    //
+    // `moverCount` is incremented once per series, at its FIRST movement, and that is detected by
+    // `samples.length === 1` (the baseline). Emptying `samples` returns the series to
+    // baseline-pending, so its next movement increments the counter AGAIN — meaning a repeated
+    // read+clear loop (the natural way to poll a watch) inflated `moverCount` by the number of
+    // cleared series every cycle until it hit `maxSeries`, at which point every further movement
+    // was dropped and a MOVING entity read as settled. The original code sidestepped this by
+    // always resetting to 0; scoping the clear to the returned series (S2.36) removed that reset
+    // without replacing the bookkeeping it was doing.
+    let clearedMovers = 0;
+    for (const k of emitted) {
+      const s = w.series.get(k);
+      if (!s) continue;
+      if (s.samples.length > 1) clearedMovers++; // it HAD moved, so it holds a mover slot
+      s.samples = [];
+    }
+    w.moverCount = Math.max(0, w.moverCount - clearedMovers);
+  }
   return out;
 }
 

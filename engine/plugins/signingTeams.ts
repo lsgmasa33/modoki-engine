@@ -80,7 +80,7 @@ export function discoverSigningTeams(): SigningTeam[] {
 
   // 1) Provisioning profiles — decode each with `security cms -D`.
   for (const dir of provisioningDirs()) {
-    let files: string[] = [];
+    let files: string[];
     try {
       files = fs.readdirSync(dir).filter((f) => f.endsWith('.mobileprovision') || f.endsWith('.provisionprofile'));
     } catch { continue; } // dir missing → skip

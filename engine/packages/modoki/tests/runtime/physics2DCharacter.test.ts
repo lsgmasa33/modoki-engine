@@ -34,7 +34,7 @@ function character(x = 0, y = 440, extra: Record<string, unknown> = {}) {
 }
 const y = (e: unknown) => tw!.trait<{ y: number }>(Transform, e).y;
 const x = (e: unknown) => tw!.trait<{ x: number }>(Transform, e).x;
-const cc = (e: unknown) => tw!.trait<{ grounded: boolean; velY: number }>(CharacterController2D, e);
+const cc = (e: unknown) => tw!.trait<{ grounded: boolean; velY: number; jump: boolean }>(CharacterController2D, e);
 
 describe('physics2D — character controller', () => {
   it('walks along the ground and reports grounded', () => {

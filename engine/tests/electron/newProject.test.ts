@@ -29,7 +29,7 @@ describe('scaffoldProject', () => {
     expect(res.appId).toBe('com.example.mycoolgame');
     expect(res.name).toBe('My Cool Game');
 
-    for (const f of ['game.ts', 'project.config.json', 'package.json', 'runtime/config.ts', 'runtime/setup.ts', 'runtime/assets/scenes/main.json']) {
+    for (const f of ['game.ts', 'project.config.json', 'package.json', 'runtime/config.ts', 'runtime/setup.ts', 'runtime/assets/scenes/main.scene.json']) {
       expect(fs.existsSync(path.join(target, f)), f).toBe(true);
     }
 
@@ -62,9 +62,9 @@ describe('scaffoldProject', () => {
     const target = freshTmp();
     scaffoldProject(target, { name: 'Alpha', templateDir: TEMPLATE_DIR });
 
-    const scenePath = path.join(target, 'runtime', 'assets', 'scenes', 'main.json');
+    const scenePath = path.join(target, 'runtime', 'assets', 'scenes', 'main.scene.json');
     const scene = JSON.parse(fs.readFileSync(scenePath, 'utf8'));
-    const template = JSON.parse(fs.readFileSync(path.join(TEMPLATE_DIR, 'runtime/assets/scenes/main.json'), 'utf8'));
+    const template = JSON.parse(fs.readFileSync(path.join(TEMPLATE_DIR, 'runtime/assets/scenes/main.scene.json'), 'utf8'));
 
     expect(scene.version).toBe(SCENE_FORMAT_VERSION);
     expect(scene.id).not.toBe(template.id);

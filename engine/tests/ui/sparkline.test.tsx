@@ -39,8 +39,12 @@ function installCanvasStub() {
     lineWidth: 0,
     lineJoin: '',
   };
+  // HTMLCanvasElement.getContext is overloaded per contextId ('2d'/'webgl'/'webgpu'/...);
+  // referenced as a plain value (not called), TS collapses that to its LAST overload
+  // (webgpu), so vi.spyOn would otherwise type mockReturnValue as GPUCanvasContext. Narrow
+  // the spy target to the one overload Sparkline actually calls ('2d') before spying.
   const spy = vi
-    .spyOn(HTMLCanvasElement.prototype, 'getContext')
+    .spyOn(HTMLCanvasElement.prototype as unknown as { getContext(id: '2d'): CanvasRenderingContext2D | null }, 'getContext')
     .mockReturnValue(ctx as unknown as CanvasRenderingContext2D);
   return { rec, restore: () => spy.mockRestore() };
 }

@@ -4,6 +4,7 @@
  *  resolution, self-registration of the clip's id, and editor seed/invalidate. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { completeResponse } from '../stubs/assetResponse';
 import { ASSET_FETCH_INIT } from '../../src/runtime/loaders/assetFetch';
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -17,7 +18,9 @@ async function setup() {
 }
 
 function mockFetch(impl: (url: string) => Promise<unknown>) {
-  const fn = vi.fn((url: string) => impl(url));
+  // completeResponse fills in text() — the stubs below only supply json(), and the loaders read
+  // the body as text so they can spot Vite's index.html SPA fallback. See tests/stubs/assetResponse.ts.
+  const fn = vi.fn(async (url: string) => completeResponse(await impl(url)));
   vi.stubGlobal('fetch', fn);
   return fn;
 }

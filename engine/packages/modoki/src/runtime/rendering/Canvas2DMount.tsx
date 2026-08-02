@@ -5,7 +5,9 @@
 import { useRef, useEffect } from 'react';
 import { defaultPool, type Canvas2DPool } from './canvas2DPool';
 import { markScene2DDirty } from './Scene2D';
-import { retrySizeUntilMeasured } from './canvas2DSizing';
+import { retrySizeUntilMeasured, computeBackingSize } from './canvas2DSizing';
+import { getRenderSettings } from './renderSettings';
+import { onForceResize } from './resizeBus';
 
 interface Canvas2DMountProps {
   entityId: number;
@@ -21,9 +23,15 @@ interface Canvas2DMountProps {
    *  crisp on its own. This is a safety CAP knob: we clamp the effective supersample so an extreme
    *  zoom can't blow past the GPU max-texture size. Default 1 (runtime GameView — no zoom). */
   viewZoom?: number;
+  /** Honor `rendering.web.sizeMode` (the `max` buffer clamp), matching Scene3D. OPT-IN and
+   *  default false because this component backs BOTH the shipped-game/GameView surface (which
+   *  must honour it) AND the editor SceneView viewport (which must not — it sizes itself / uses
+   *  device presets). Defaulting off means a new call site can never accidentally shrink the
+   *  editor viewport by inheriting a game's `max` config. */
+  applyWebSizeMode?: boolean;
 }
 
-export function Canvas2DMount({ entityId, pool = defaultPool, markDirty = markScene2DDirty, viewZoom = 1 }: Canvas2DMountProps) {
+export function Canvas2DMount({ entityId, pool = defaultPool, markDirty = markScene2DDirty, viewZoom = 1, applyWebSizeMode = false }: Canvas2DMountProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const updateSizeRef = useRef<(() => void) | null>(null);
   // Re-measure the backing when the editor viewport zoom changes (the ResizeObserver can't see a
@@ -43,23 +51,19 @@ export function Canvas2DMount({ entityId, pool = defaultPool, markDirty = markSc
 
     function measure() {
       const rect = el!.getBoundingClientRect();
-      const dpr = window.devicePixelRatio || 1;
-      // rect is post-CSS-transform, so it already includes the editor zoom → backing = rect × dpr is
-      // 1:1 with device pixels (crisp at any zoom). At an EXTREME editor zoom the backing could exceed
-      // the GPU max-texture size (a Pixi Application fails to allocate above it), so cap the LONGER axis
-      // and scale BOTH by the same factor — a UNIFORM downscale that preserves aspect (a per-axis clamp
-      // would stretch the CSS-stretched canvas). 8192 is safe on desktop GPUs and above any realistic
-      // runtime/GameView backing (dpr × screen), so the runtime is unaffected — only extreme zoom bites.
-      const MAX_BACKING = 8192;
-      let w = Math.round(rect.width * dpr);
-      let h = Math.round(rect.height * dpr);
-      const longest = Math.max(w, h);
-      if (longest > MAX_BACKING) {
-        const k = MAX_BACKING / longest;
-        w = Math.round(w * k);
-        h = Math.round(h * k);
-      }
-      return { w, h };
+      // computeBackingSize handles: rect × dpr (capped at pixi.pixelRatioCap on the auto
+      // path — every 2D surface, editor viewport included; a pinned pixi.resolution is
+      // never capped), the `max` sizeMode buffer clamp (only when applyWebSizeMode —
+      // excludes the editor viewport), and the GPU max-texture longer-axis cap. See
+      // canvas2DSizing.ts for the full mechanics.
+      return computeBackingSize({
+        rectWidth: rect.width,
+        rectHeight: rect.height,
+        devicePixelRatio: window.devicePixelRatio || 1,
+        resolution: getRenderSettings().pixi.resolution,
+        pixelRatioCap: getRenderSettings().pixi.pixelRatioCap,
+        web: applyWebSizeMode ? getRenderSettings().web : null,
+      });
     }
 
     function applySize(w: number, h: number) {
@@ -74,6 +78,9 @@ export function Canvas2DMount({ entityId, pool = defaultPool, markDirty = markSc
     // Expose to the viewZoom effect below: a CSS-transform zoom changes the ON-SCREEN size but NOT the
     // layout box, so the ResizeObserver never fires for it — we must re-measure explicitly on zoom.
     updateSizeRef.current = updateSize;
+    // Let the debug menu's Device tab force a re-measure (e.g. after flipping pixelRatioCap
+    // live) without waiting on a DOM resize. See resizeBus.ts.
+    const unregisterForceResize = onForceResize(updateSize);
 
     function mount() {
       if (cancelled || !el) return;
@@ -118,13 +125,14 @@ export function Canvas2DMount({ entityId, pool = defaultPool, markDirty = markSc
       cancelled = true;
       if (cancelRetry) cancelRetry(); // stop any pending size retry (F10)
       if (ro) ro.disconnect();
+      unregisterForceResize();
       if (slot.canvas.parentElement === el) {
         el.removeChild(slot.canvas);
       }
       updateSizeRef.current = null;
       pool.unmount(entityId); // drop the mount claim → slot reclaimed if sim isn't holding it
     };
-  }, [entityId, pool, markDirty]);
+  }, [entityId, pool, markDirty, applyWebSizeMode]);
 
   return (
     <div

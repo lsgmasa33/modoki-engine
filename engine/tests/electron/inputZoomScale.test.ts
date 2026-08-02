@@ -6,20 +6,20 @@
  *  element at zoomed-CSS point P we must inject P·f. This pins that scaling for tap/drag/
  *  hover/scroll so a future refactor can't silently reintroduce the off-by-zoom miss that a
  *  live audit measured (docs/plans/editor-ui-zoom-plan.md). */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import type { BrowserWindow } from 'electron';
 import { tap, drag, hover, scroll, captureGesture } from '../../electron/rendererOps';
 
 /** A window whose webContents reports a fixed zoom factor and records every injected event. */
 function fakeWindow(zoomFactor: number) {
-  const events: Array<{ type: string; x?: number; y?: number }> = [];
+  const events: Array<{ type: string; x?: number; y?: number; deltaY?: number }> = [];
   const win = { webContents: {
     getZoomFactor: () => zoomFactor,
-    sendInputEvent: (e: { type: string; x?: number; y?: number }) => { events.push(e); },
+    sendInputEvent: (e: { type: string; x?: number; y?: number; deltaY?: number }) => { events.push(e); },
   } };
   return { win: win as unknown as BrowserWindow, events };
 }
-const moves = (events: Array<{ type: string; x?: number; y?: number }>) =>
+const moves = (events: Array<{ type: string; x?: number; y?: number; deltaY?: number }>) =>
   events.filter((e) => e.type === 'mouseMove' || e.type === 'mouseDown' || e.type === 'mouseUp' || e.type === 'mouseWheel');
 
 describe('trusted input scales zoomed-CSS → DIP', () => {

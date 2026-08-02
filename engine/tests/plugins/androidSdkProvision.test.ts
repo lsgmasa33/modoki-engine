@@ -16,7 +16,17 @@ describe('androidSdkProvision — ensureCmdlineTools (mocked fetch)', () => {
   afterEach(() => { fs.rmSync(sdkRoot, { recursive: true, force: true }) })
 
   const fakeFetch = (bytes: Buffer, ok = true, status = 200): FetchLike =>
-    async () => ({ ok, status, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) })
+    async () => ({
+      ok, status,
+      // A real ArrayBuffer copy, not `.buffer.slice(...)` — Buffer's backing store is typed
+      // ArrayBufferLike (ArrayBuffer | SharedArrayBuffer) in current @types/node, which is
+      // wider than FetchLike's `arrayBuffer(): Promise<ArrayBuffer>`.
+      arrayBuffer: async () => {
+        const ab = new ArrayBuffer(bytes.byteLength)
+        new Uint8Array(ab).set(bytes)
+        return ab
+      },
+    })
 
   it('REFUSES to install bytes whose sha1 does not match the pin', async () => {
     if (!PINNED_CMDLINE_TOOLS.dist[cmdlineToolsKey()]) return // unsupported platform here

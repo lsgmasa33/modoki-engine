@@ -35,15 +35,31 @@ TMPBASE="$(node "$PATHS" tmpdir)"
 OUT="$TMPBASE/modoki-pkg-test"
 VITELOG="$TMPBASE/modoki-smoke-vite.log"; APPLOG="$TMPBASE/modoki-smoke-app.log"
 BUILDLOG="$TMPBASE/modoki-smoke-build.log"
+# A THROWAWAY Chromium profile for the launch leg — see the --user-data-dir note at the
+# launch below. Not under the packaged product name: `killPackaged`'s no-appDir fallback
+# reaps on `Modoki Editor.app/Contents/`, and Electron repeats --user-data-dir in every
+# helper's command line, so a profile path containing that substring would make our own
+# helpers reapable by a machine-wide clean (the #69 signature, in reverse).
+USERDATA="$TMPBASE/modoki-smoke-userdata"
 # Dedicated port OUTSIDE the human-editor range (5179 main / 5180 ai / 5181 ai2) so a
 # throwaway smoke build (e.g. from `npm run verify:packaged`) can't collide with a
 # sibling clone's live dev editor — the packaged app pins MODOKI_BACKEND_PORT and
-# refuses to drift, so a clash would just fail the smoke. Overridable if needed.
-PORT="${SMOKE_BACKEND_PORT:-5188}"
+# refuses to drift, so a clash would just fail the smoke.
+# Also PER CLONE (#69): a single shared 5188 meant two clones could not run this at the
+# same time, for the same reason. A dedicated high block (38600-38799) rather than a tight
+# range next to the editor ports — 10 slots was tried first and produced an ACTUAL
+# collision between two clones on this machine (birthday problem: ~30% for 4 clones in 10
+# slots), which defeats the point. A clash is still possible but rare and LOUD, and
+# SMOKE_BACKEND_PORT overrides.
+PORT="${SMOKE_BACKEND_PORT:-$(node "$REPO/engine/scripts/clonePort.mjs" 38600 200 "$REPO")}"
 
 node "$PATHS" kill 2>/dev/null || true
 npm run dev:stop >/dev/null 2>&1 || true
-node "$PATHS" clearViteCache 2>/dev/null || true
+# A fresh profile per run, which SUBSUMES the `clearViteCache` this replaces: that dropped
+# the stale packaged Vite dep-cache (baked against whichever tree last ran, and unwritable
+# inside a signed bundle) out of the SHARED profile. An empty profile cannot hold a stale
+# cache at all — and it no longer reaches into the real one to do it.
+rm -rf "${USERDATA:?}"
 sleep 0.5
 
 echo "[smoke] building faithful packaged app → $OUT"
@@ -59,7 +75,19 @@ BIN="$(node "$PATHS" "$OUT" bin)"
 
 echo "[smoke] launching headless (project: $PROJECT)"
 : > "$VITELOG"; : > "$APPLOG"
-MODOKI_PROJECT="$PROJECT" MODOKI_BACKEND_PORT="$PORT" MODOKI_VITE_LOG="$VITELOG" MODOKI_NO_AUTOUPDATE=1 "$BIN" >"$APPLOG" 2>&1 &
+# --user-data-dir ISOLATES THIS LEG. resolveUserDataDir (engine/electron/userDataDir.ts)
+# scopes the profile per CLONE only for DEV; packaged returns the one shared
+# `<appData>/Modoki Editor`, on the correct premise that a shipped app is installed once.
+# This gate breaks that premise — four clones each build and smoke their OWN packaged app,
+# so they shared one profile, and `modoki-last-scene:<project name>` is keyed by project
+# NAME while its value is a clone-ABSOLUTE path. Measured 2026-08-02: a run here restored
+# ai2's remembered scene, `/@fs` (scoped to this clone's root) correctly 403'd it, and the
+# gate reported FAILED — the boot itself was fine, since loadFirstScene self-heals to
+# config.scenePath, but the recovery leaves a console error and this script counts any
+# console error as fatal. shouldOverrideUserData() stands down when this switch is passed,
+# exactly so a harness can do this; assert-app-csp.mjs already did, which is why the CSP
+# leg was hermetic and this one was not.
+MODOKI_PROJECT="$PROJECT" MODOKI_BACKEND_PORT="$PORT" MODOKI_VITE_LOG="$VITELOG" MODOKI_NO_AUTOUPDATE=1 "$BIN" "--user-data-dir=$USERDATA" >"$APPLOG" 2>&1 &
 PID=$!
 
 entities=0
@@ -91,11 +119,48 @@ CONSOLE_ERR=$(curl -s -m 3 "http://127.0.0.1:$PORT/api/console-logs" 2>/dev/null
 if [ -n "$CONSOLE_ERR" ]; then echo "[smoke] FAIL: renderer console errors:"; echo "$CONSOLE_ERR" | sed 's/^/    /'; fail=1
 else echo "[smoke] ok: no renderer console errors"; fi
 
+# ── the packaged editor must provision its OWN Node (#89) ──
+# `ensureNodeProvisioned()` CATCHES its own failure and falls back to system npm, so a
+# dev box (which has npm) looks perfectly healthy: the editor boots, the scene loads,
+# every assertion above passes. That is not hypothetical — a bare `tar` on Windows
+# resolved to Git's GNU tar, which cannot read a zip and reads `C:\…` as a remote host,
+# so the packaged Windows editor could NEVER extract its toolchain (2effb33b) while this
+# script reported PASS ✅ for however long it had been broken. An END USER has no system
+# Node, so for them the fallback is not a fallback — it is a dead build.
+#
+# Assert the PINNED version, not merely that some provisioning line appeared: the log
+# embeds PINNED_NODE.version, so comparing against the repo's pin also catches a stale
+# packaged build (shipping an older pin than the tree claims). Read the pin from source
+# rather than duplicating it here — a hard-coded copy is exactly the drift this catches.
+PIN="$(sed -n "s/^  version: '\(v[0-9][0-9.]*\)',*$/\1/p" "$REPO/engine/toolchain/nodeProvision.ts" | head -1)"
+if [ -z "$PIN" ]; then
+  # Never let a broken extraction make the assertion vacuous — an empty PIN would turn the
+  # grep below into "match any provisioning line at all", silently weakening the gate.
+  echo "[smoke] FAIL: could not read PINNED_NODE.version from engine/toolchain/nodeProvision.ts"; fail=1
+elif grep -q "Node provisioning failed" "$APPLOG" 2>/dev/null; then
+  echo "[smoke] FAIL: Node provisioning failed — the packaged editor fell back to system npm:"
+  grep "Node provisioning failed" "$APPLOG" | sed 's/^/    /' | head -3; fail=1
+elif ! grep -q "provisioned Node $PIN " "$APPLOG" 2>/dev/null; then
+  echo "[smoke] FAIL: no 'provisioned Node $PIN' line — the pinned toolchain never came up."
+  grep -i "provisioned Node" "$APPLOG" | sed 's/^/    got: /' | head -3; fail=1
+else echo "[smoke] ok: provisioned Node $PIN"; fi
+
 # bash `kill` on a native Windows process started from Git Bash does not reliably
 # terminate it, and a survivor would hold the CDP port the CSP probe needs next.
 kill $PID 2>/dev/null || true
 node "$PATHS" kill 2>/dev/null || true
-sleep 1
+# A fixed `sleep 1` here raced teardown against the CSP leg's own boot: nothing confirmed
+# the first instance was actually gone before the second one started, so on a slow
+# shutdown (log flush, GPU process teardown) the CSP leg could boot while a survivor was
+# still mid-exit. Poll for the PID's actual death instead — bounded, so a genuinely stuck
+# process still fails loud rather than hanging the gate forever. `kill -0` is portable
+# (works under Git Bash for a process bash itself knows about); it does not need GNU tools.
+DEAD=0
+for i in $(seq 1 20); do
+  kill -0 $PID 2>/dev/null || { DEAD=1; break; }
+  sleep 0.5
+done
+[ "$DEAD" = 1 ] || echo "[smoke] WARNING: first instance (pid $PID) still alive 10s after kill — proceeding anyway, CSP leg may race it"
 
 # ── CSP gate (separate boot, CDP-based — the render checks above can't see it) ──
 # A CSP-blocked CDN script (MediaPipe wasm loader for chess/llm-test) doesn't blank

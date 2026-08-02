@@ -9,6 +9,13 @@ export interface ScreenInfoParam { imgW: number; imgH: number; nativeW: number; 
 
 export const MAX_CONSOLE_LOGS = 200;
 
+/** 'layout-bounds' -> 'layoutBounds'. Shared by both eval-scripting surfaces (editor's evalApi.ts
+ *  and device's deviceEvalApi.ts) so the mapping can't drift between them — moved here (#83) from
+ *  evalApi.ts, which re-exports it for anything still importing it from there. */
+export function kebabToCamel(op: string): string {
+  return op.replace(/-([a-z0-9])/g, (_, c) => c.toUpperCase());
+}
+
 export interface ConsoleLine {
   type: 'console';
   level: 'log' | 'warn' | 'error' | 'info';
@@ -58,11 +65,14 @@ export const EVAL_ASYNC_TIMEOUT_MS = 5000;
  *  A returned Promise (e.g. `return someAsyncCall()`) is awaited, bounded by
  *  `EVAL_ASYNC_TIMEOUT_MS` — otherwise a thenable's own properties serialize to a misleading `{}`
  *  instead of its actual resolved value (this bit a real debugging session: an eval reading OTA
- *  state silently reported `{}` instead of the real, non-empty state). */
-export async function handleEval(code: string): Promise<unknown> {
+ *  state silently reported `{}` instead of the real, non-empty state). `arg`, if given, is passed
+ *  as the function's sole parameter named `modoki` — the caller builds whatever scripting object
+ *  it wants visible to `code` (this file stays dependency-free, so it never builds that object
+ *  itself); omitted, `code` sees `modoki === undefined` and behaves exactly as before. */
+export async function handleEval(code: string, arg?: unknown): Promise<unknown> {
   try {
-    const fn = new Function(code);
-    const result = fn();
+    const fn = new Function('modoki', code);
+    const result = fn(arg);
     if (result && typeof (result as { then?: unknown }).then === 'function') {
       const timeout = new Promise((_, reject) =>
         setTimeout(() => reject(new Error(`eval timed out after ${EVAL_ASYNC_TIMEOUT_MS}ms (code returned a Promise that never resolved)`)), EVAL_ASYNC_TIMEOUT_MS),

@@ -120,7 +120,7 @@ export function computeFrameFit(input: FrameFitInput): FrameFitResult {
   }
 
   let orthoSize = 0;
-  let distance = 0;
+  let distance: number;
 
   if (ortho) {
     // Orthographic: size is set by half-height; depth doesn't affect size.

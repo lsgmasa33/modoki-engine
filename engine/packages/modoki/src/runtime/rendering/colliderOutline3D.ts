@@ -31,7 +31,7 @@ export function colliderOutlineSig3D(c: ColliderOutline3DParams): string {
  *  geometry when it rebuilds/removes the gizmo. For `convex`/`trimesh` pass the collider's mesh
  *  `THREE.BufferGeometry`. */
 export function colliderWireframeGeometry(c: ColliderOutline3DParams, meshGeometry?: THREE.BufferGeometry | null): THREE.BufferGeometry | null {
-  let solid: THREE.BufferGeometry | null = null;
+  let solid: THREE.BufferGeometry | null;
   switch (c.shape) {
     case 'box':
       solid = new THREE.BoxGeometry(c.halfW * 2, c.halfH * 2, c.halfD * 2);

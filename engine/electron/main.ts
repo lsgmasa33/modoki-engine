@@ -20,6 +20,7 @@
 import { app, BrowserWindow, ipcMain, shell, dialog, nativeImage, Menu } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import { initFileLog, getLogFilePath, logToFile } from './fileLog';
 import { resolveUserDataDir, resolveToolchainDir, shouldOverrideUserData, adoptLegacyToolchain, multiProfileKey } from './userDataDir';
 
@@ -87,6 +88,7 @@ import { npmSpawnSpec, ensureNode, PINNED_NODE } from '../toolchain';
 import { startBackendServer, type BackendServerHandle, type HostRoutes } from './backendServer';
 import type { LiveReloadKind } from '../plugins/vite-asset-scanner';
 import { captureViewport, tap, drag, hover, scroll, pointerDown, pointerMove, pointerUp, pressKey, typeText, focusElement, captureGesture } from './rendererOps';
+import type { RenderSurfaceFacts } from './rendererOps';
 import { createInputRoutes } from './inputRoutes';
 import { serializeMenu, triggerMenuItem, type MenuItemLike } from './menuActions';
 import { getSsrLoadModule, closeSsrLoader } from './ssrLoader';
@@ -100,6 +102,7 @@ import { portCandidates, readLastPort, writeLastPort, parseBackendPort } from '.
 import { buildMcpServerEntry, buildChromeDevtoolsEntry, mergeMcpConfig, isMcpStale, mcpChromePort, isMcpTokenForeign, ensureMcpGitignored, detectClaudeCli, atomicWriteFileSync, healMcpPort, resolveMcpTarget, mcpHasModoki, mcpBackendRaw, gitTrackedState, ensureProjectClaudeMd } from './connectClaude';
 import { ensureToken } from './instanceToken';
 import { vendorEnginePlugins, writeVendorMarker, type VendorResult } from '../plugins/vendorPlugins';
+import { composeDepsInstallError } from './projectDeps';
 import { healNativeConfig } from '../plugins/healNativeConfig';
 import { setupAutoUpdate, checkForUpdatesInteractive, isUpdateInstalling } from './autoUpdate';
 import { restoreZoom, handleZoom } from './zoom';
@@ -292,6 +295,7 @@ async function ensureProjectDeps(projectRoot: string): Promise<void> {
   // gitignored tarball, in which case node_modules must be (re)built.
   let needsInstall = !fs.existsSync(path.join(projectRoot, 'node_modules'));
   let vendorResult: VendorResult | null = null;
+  let vendorError: string | null = null;
   try {
     // canBuild:false when packaged — the app bundle ships each plugin's src/ + dist/ but
     // none of its devDependencies, so a build attempt here can only block then fail.
@@ -299,7 +303,15 @@ async function ensureProjectDeps(projectRoot: string): Promise<void> {
     if (vendorResult.vendored.length) console.log(`[modoki-electron] vendored engine plugin(s): ${vendorResult.vendored.join(', ')}`);
     needsInstall = needsInstall || vendorResult.needsInstall;
   } catch (e) {
-    console.warn(`[modoki-electron] plugin vendoring failed (continuing): ${e instanceof Error ? e.message : e}`);
+    // Continuing is right — a project with no engine plugin still installs fine. But KEEP
+    // the reason: vendoring is what rewrites an engine plugin's dep from the placeholder
+    // `"*"` to `file:plugins/<name>-<hash>.tgz`. Those plugins are NOT published to the
+    // public npm registry, so if this failed, the `"*"` survives and the install below is
+    // guaranteed to fail resolving it — reporting only "npm install exited with code N"
+    // and burying the true cause in the log. That misdirection cost a user (and their
+    // agent) a long debugging session; the install failure now names this as the cause.
+    vendorError = e instanceof Error ? e.message : String(e);
+    console.warn(`[modoki-electron] plugin vendoring failed (continuing): ${vendorError}`);
   }
 
   if (!needsInstall) return; // node_modules present and engine-plugin copies current
@@ -307,7 +319,14 @@ async function ensureProjectDeps(projectRoot: string): Promise<void> {
   console.log(`[modoki-electron] installing dependencies for ${projectRoot} …`);
   // ci is safe (clean + integrity-checked) only when vendoring didn't just rewrite
   // package.json; otherwise the lockfile is behind and we must `npm install`. (D1)
-  await installProjectDeps(projectRoot, { preferCi: !(vendorResult?.changed) });
+  try {
+    await installProjectDeps(projectRoot, { preferCi: !(vendorResult?.changed) });
+  } catch (e) {
+    // A vendoring failure GUARANTEES this install fails (the plugin's `"*"` dep never got
+    // rewritten to its local tarball and isn't on the public registry), so report it as the
+    // cause instead of leaving only "npm install exited with code N". See projectDeps.ts.
+    throw composeDepsInstallError(e, vendorError);
+  }
   // Record which tarball each plugin was installed from, so the next open can
   // detect a stale extraction (D3).
   if (vendorResult) writeVendorMarker(projectRoot, vendorResult.expectedVendor);
@@ -315,11 +334,16 @@ async function ensureProjectDeps(projectRoot: string): Promise<void> {
 }
 
 // The Vite dev-server origin the renderer loads from. Resolved at startup:
-// MODOKI_DEV_URL pins it explicitly; otherwise main picks a free port PREFERRING
-// 5173 (findFreePort) so a SECOND editor can launch on another port instead of
-// hard-failing on the --strictPort clash. Mutable because the free-port pick
-// happens after module load, before any consumer (createWindow/backend) runs.
-let DEV_URL = process.env.MODOKI_DEV_URL || 'http://127.0.0.1:5173';
+// MODOKI_DEV_URL PINS the origin explicitly — findFreePort is skipped entirely, so
+// a clash there is fatal (use it only when you mean "this exact server").
+// MODOKI_VITE_PORT only seeds the PREFERENCE: findFreePort still runs, so an
+// occupied port falls back to an ephemeral one instead of failing to boot. That is
+// what launch-editor.sh sets to give each clone its own lane (5173 + backend −
+// 5179); see docs/editor.md § "Port selection".
+// Otherwise main prefers 5173, so a SECOND editor can launch on another port
+// instead of hard-failing on the --strictPort clash. Mutable because the free-port
+// pick happens after module load, before any consumer (createWindow/backend) runs.
+let DEV_URL = process.env.MODOKI_DEV_URL || `http://127.0.0.1:${process.env.MODOKI_VITE_PORT || 5173}`;
 // Prod mode: a packaged app, or MODOKI_PROD=1 to test the packaged path against
 // a `vite build` dist without the Vite dev server. In prod the renderer shell +
 // project assets + /api all load from main's own HTTP server (one origin); in
@@ -377,6 +401,16 @@ setRecentsScope(editorIdentity());
 /** The backend's real port, filled in once it binds. Read by `/api/identity`, whose whole
  *  job is to let a client confirm it is talking to the editor it meant to. */
 let resolvedBackendPort = 0;
+
+/** MODOKI_SCENE — a launch-scoped scene override (issue #43), resolved once at startup
+ *  alongside the project (`resolveInitialProject` below). Exposed via `/api/boot-scene`
+ *  for the renderer's boot-scene resolution. Env, not a CLI arg: the launcher→main hop is
+ *  a spawn (see launch-editor.sh's `--scene`), and env is the correct carrier across a
+ *  spawn boundary the way MODOKI_PROJECT already is. STICKY for the whole process
+ *  lifetime, not one-shot — a Fast-Refresh/HMR reload should stay in the overridden scene
+ *  rather than silently snapping back to the remembered one; "this editor instance was
+ *  launched into X" is the predictable reading. */
+const resolvedBootScene: string | null = process.env.MODOKI_SCENE || null;
 
 /** Current branch, read straight from `.git/HEAD` — no child process, no gitdir walking
  *  beyond the common case. Purely informational (the identity banner); `null` for a
@@ -545,6 +579,61 @@ function revealMainWindow(): void {
   closeSplash();
 }
 
+// ── Kill forensics: WHO sent the SIGTERM? ────────────────────────────────────────────────────
+//
+// `render-process-gone`/`child-process-gone` tell us THAT something was killed (reason='killed',
+// exitCode=15) but not WHO — a signal carries no sender, and by the time anyone reads the log the
+// killer may already have exited. Measured incidents (CLAUDE.md, this task's brief): three
+// SIGTERMs on one clone's editor within ~30 minutes, GPU/network/audio utility processes all hit
+// while the MAIN process survived. Best guess at the time was "some reap script on this shared
+// machine matched the wrong process" (#69's whole class of bug), but nothing recorded evidence.
+//
+// This snapshots our own pid/ppid (a parent shell being torn down would show here) plus a
+// filtered `ps` listing of any STILL-RUNNING process that could plausibly have sent it — the known
+// reap scripts/tools in this repo, by name. An EMPTY match list is itself evidence: it means the
+// killer already exited by the time we looked, which rules out "something is still running and
+// about to do it again" and points at a one-shot script or CI step instead.
+//
+// Best-effort only — never throws, never blocks quit, 2s timeout on the `ps` call. POSIX-only:
+// `ps -Ao` is not portable, so on win32 we just say so rather than trying a `tasklist` translation
+// nobody has needed yet. Rate-limited to 3 dumps per process lifetime for the same reason as the
+// `win.on('moved')` handler above logs sparingly — the measured incident repeated 3x in 30 minutes,
+// and an unbounded dump on every repeat would bury the first (most useful) one under noise.
+let killForensicsLogged = 0;
+const KILL_FORENSICS_MAX = 3;
+const KILL_FORENSICS_CANDIDATES = /pkill|test-packaged|assert-app-renders|launch-editor|stop-dev|vitest|electron-builder|npm run verify/;
+function logKillForensics(context: string): void {
+  if (killForensicsLogged >= KILL_FORENSICS_MAX) return;
+  killForensicsLogged += 1;
+  console.error(
+    `[modoki-electron] ${context} reason=killed — capturing a forensic snapshot ` +
+    `(pid=${process.pid} ppid=${process.ppid}, ${killForensicsLogged}/${KILL_FORENSICS_MAX} this run). ` +
+    'A SIGTERM carries no sender; this is the best reconstruction possible after the fact.',
+  );
+  if (process.platform === 'win32') {
+    console.error('[modoki-electron] kill forensics: skipped — `ps -Ao` is POSIX-only (this is win32)');
+    return;
+  }
+  try {
+    const ps = spawn('ps', ['-Ao', 'pid,ppid,lstart,command'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    const timer = setTimeout(() => { try { ps.kill(); } catch { /* best effort */ } }, 2000);
+    ps.stdout.on('data', (d: Buffer) => { out += d.toString(); });
+    ps.on('close', () => {
+      clearTimeout(timer);
+      try {
+        const lines = out.split('\n').filter((l) => KILL_FORENSICS_CANDIDATES.test(l)).slice(0, 20);
+        console.error(
+          `[modoki-electron] kill forensics: ${lines.length} candidate process(es) still running ` +
+          '(empty means the killer had already exited by the time this ran):\n' +
+          lines.join('\n'),
+        );
+      } catch { /* best effort — never throw out of a diagnostic */ }
+    });
+    ps.on('error', () => { clearTimeout(timer); /* ps missing/failed — nothing to log */ });
+  } catch { /* best effort — never throw out of a diagnostic */ }
+}
+
 async function createWindow(backendBase: string) {
   mainWindowRevealed = false;
   // The editor ALWAYS loads its shell — and the open project's game code + assets —
@@ -671,6 +760,58 @@ async function createWindow(backendBase: string) {
   // setZoomLevel resets to 0 on each navigation, so this re-applies after reloads/HMR
   // too. Registered BEFORE loadURL: loadURL's promise resolves ON did-finish-load, so a
   // `.once` added after the await could miss the initial event.
+  // ── Why did the renderer die? ────────────────────────────────────────────────────────────────
+  //
+  // A dead renderer presents as a BLANK WINDOW with a live backend: `/api/identity` still answers
+  // (it is served from the main process) while every renderer-side call hangs, so it reads like a
+  // hang rather than a death. Diagnosed once by hand on 2026-08-01 and it took a CDP session to
+  // establish the basic fact — Chromium's own process list had no renderer in it — by which point
+  // the reason was long gone. Electron hands us that reason directly, so record it.
+  //
+  // `reason` is the answer to the question the logs could not previously answer: 'crashed' (a real
+  // fault, which also writes an OS crash report), 'oom', 'killed' (SIGTERM from outside — nothing
+  // wrong with our code), 'launch-failed', or 'integrity-failure'. Those imply completely different
+  // fixes, and guessing between them cost an afternoon.
+  win.webContents.on('render-process-gone', (_e, details) => {
+    console.error(
+      `[modoki-electron] RENDERER GONE reason=${details.reason} exitCode=${details.exitCode} — ` +
+      'the window is now blank while the backend stays up. If reason is "killed", something ' +
+      'outside Electron terminated it; if "crashed", look for an OS crash report; if "oom", check ' +
+      'for another editor instance competing for memory/GPU.',
+    );
+    if (details.reason === 'killed') logKillForensics('RENDERER GONE');
+  });
+  // The GPU and network services are UTILITY processes, so their deaths arrive here instead. They
+  // are usually COLLATERAL — Chromium restarts them after a renderer dies — which is exactly the
+  // misreading that sent the first investigation after a "GPU crash loop" that was a symptom.
+  // Logged with the service name so the ordering against the renderer's death is readable.
+  app.on('child-process-gone', (_e, details) => {
+    console.error(
+      `[modoki-electron] CHILD PROCESS GONE type=${details.type} ` +
+      `service=${details.serviceName ?? details.name ?? '?'} reason=${details.reason} ` +
+      `exitCode=${details.exitCode} (often collateral to a renderer death — check the ordering)`,
+    );
+    if (details.reason === 'killed') logKillForensics(`CHILD PROCESS GONE (${details.serviceName ?? details.name ?? details.type})`);
+  });
+  // A HANG, not a death: `unresponsive` is Chromium's own detector for a renderer whose main
+  // thread has stopped pumping its event loop while the PROCESS is still alive — the opposite
+  // failure mode from `render-process-gone` above, and it wants a different fix (the process
+  // doesn't need restarting, whatever is blocking the main thread needs finding). Also log
+  // `getGPUFeatureStatus()` here: it distinguishes "GPU acceleration disabled / fell back to
+  // software" (an environment problem, no driver hang involved) from "everything enabled but
+  // stuck" (points at a real GPU-side wedge) — the two look identical from `unresponsive` alone.
+  win.webContents.on('unresponsive', () => {
+    console.error(
+      '[modoki-electron] RENDERER UNRESPONSIVE — the process is alive but its main thread has ' +
+      `stopped responding. GPU feature status: ${JSON.stringify(app.getGPUFeatureStatus())}`,
+    );
+  });
+  // The other half of `unresponsive` — logged so a transient hang reads as transient in the log
+  // instead of looking permanent (nothing else marks the recovery).
+  win.webContents.on('responsive', () => {
+    console.log('[modoki-electron] renderer responsive again — the hang recovered on its own.');
+  });
+
   win.webContents.on('did-finish-load', () => {
     restoreZoom(win);
     // A reload starts a fresh document with no button held — drop any stranded sustained-pointer
@@ -680,7 +821,15 @@ async function createWindow(backendBase: string) {
   // Moving the window to a differently-scaled monitor changes devicePixelRatio (= displayScale
   // × zoomFactor) but NOT getZoomFactor, so the engine's presentation baseline (baseDpr) would
   // go stale and mis-scale game input. Re-push the authoritative factor so it recalibrates.
-  win.on('moved', () => { if (!win.isDestroyed()) win.webContents.send('modoki:bridge-zoom-factor', win.webContents.getZoomFactor()); });
+  // ⚠️ Guard the WEBCONTENTS, not just the window. `win.isDestroyed()` asks whether the BrowserWindow
+  // object is gone; a renderer can die while the window object lives on, and then every send throws
+  // "Render frame was disposed before WebFrameMain could be accessed". Observed 2026-08-01: a dead
+  // renderer turned this handler into ~10 stack traces/second, burying the actual first error (a GPU
+  // process exit) under thousands of identical lines and making the log useless for diagnosis.
+  win.on('moved', () => {
+    if (win.isDestroyed() || win.webContents.isDestroyed()) return;
+    win.webContents.send('modoki:bridge-zoom-factor', win.webContents.getZoomFactor());
+  });
   await win.loadURL(buildRendererUrl(pageOrigin, CDP_NONCE));
   // Fallback reveal: if the editor never pushes its menu-structure (the real mount
   // signal), don't leave the window hidden behind the splash forever. The common path
@@ -1150,10 +1299,24 @@ app.whenReady().then(async () => {
         tokenCheck,
       } };
     }
+    // ── GET /api/boot-scene — launch-scoped scene override (issue #43). Deliberately
+    //    NOT a field on /api/identity: identity is the "which editor am I talking to?"
+    //    diagnostic, and this is a boot-time instruction, not a fact about the editor's
+    //    identity. Answered before the mainWindow guard like /api/identity — it doesn't
+    //    touch the window, just reports process-level state. ──
+    if (urlPath === '/api/boot-scene' && method === 'GET') {
+      return { kind: 'json', body: { scene: resolvedBootScene } };
+    }
     if (!mainWindow) return null;
     if (urlPath === '/api/capture-viewport' && (method === 'GET' || method === 'POST')) {
       const opts = (body ?? {}) as { maxSide?: number; quality?: number };
-      const result = await captureViewport(mainWindow, opts);
+      // The probe runs ONLY if the compositor refuses a frame — it is what lets the error say
+      // "no viewport is mounted, nothing to capture" instead of blaming a wedged renderer for a
+      // supported layout. Short timeout: a diagnostic must not out-wait the thing it explains.
+      const result = await captureViewport(mainWindow, {
+        ...opts,
+        probe: () => requestRenderer('editor-state', {}, 1500) as Promise<RenderSurfaceFacts | null>,
+      });
       return { kind: 'json', body: result };
     }
     // ── Trusted input (`/api/input/*`), incl. selector-aware aiming. Extracted so the
@@ -1214,8 +1377,29 @@ app.whenReady().then(async () => {
       // toggleDevTools/…) actually execute rather than no-op while reporting ok:true. Fall back to
       // mainWindow when the app isn't the focused window (an agent-driven click has no OS focus).
       const ctxWindow = BrowserWindow.getFocusedWindow() ?? mainWindow;
-      const res = triggerMenuItem(items, { path: b.path, id: b.id }, { window: ctxWindow, webContents: mainWindow?.webContents });
-      return { kind: 'json', status: res.ok ? undefined : (res.available ? 404 : 400), body: res };
+      // ATTRIBUTE the click to the AGENT. A menu item's callback is the HUMAN path by
+      // construction — the same closure a real click runs — so an agent firing Edit → Undo,
+      // File → Save All or View → Reset Layout journaled as `source:'human'`, i.e. the tool lying
+      // about who acted in the very record a human consults to see what the agent did. This is
+      // exactly the shape the actor LEASE exists for (trusted input has the same problem and
+      // solves it this way in `inputRoutes.ts`).
+      //
+      // Best-effort, deliberately: a failed lease must never fail the CLICK. Mis-attribution is a
+      // reporting defect; a refused menu action is a broken tool. The lease's own deadline cleans
+      // up if the close never lands.
+      let leaseId: number | undefined;
+      try {
+        const lease = (await requestRenderer('actor-lease', { open: true })) as { id?: number } | null;
+        leaseId = lease?.id;
+      } catch { /* no renderer / older build — fire anyway, unattributed */ }
+      try {
+        const res = triggerMenuItem(items, { path: b.path, id: b.id }, { window: ctxWindow, webContents: mainWindow?.webContents });
+        return { kind: 'json', status: res.ok ? undefined : (res.available ? 404 : 400), body: res };
+      } finally {
+        if (leaseId !== undefined) {
+          try { await requestRenderer('actor-lease', { id: leaseId }); } catch { /* the deadline expires it */ }
+        }
+      }
     }
     return null;
   };
@@ -1535,12 +1719,19 @@ app.whenReady().then(async () => {
     // import of a newly-added export fails ("@modoki_engine_runtime.js does not provide an export
     // named 'Transient'"), crashing the editor renderer. userData survives app updates, so the stale
     // cache persists across them. Fix: wipe the cache whenever the build changes. buildSig = version
-    // + this main.cjs's size/mtime — main.cjs is regenerated (fresh mtime) on every `build:electron`,
-    // so a rebuild always busts it; same build reuses it (fast relaunch). Best-effort: a re-optimize
-    // is far cheaper than a stale-cache crash.
+    // + this main.cjs's size + a CONTENT HASH; main.cjs is regenerated on every `build:electron`, so
+    // a rebuild always busts it; same build reuses it (fast relaunch). Best-effort: a re-optimize is
+    // far cheaper than a stale-cache crash.
+    //
+    // ⚠️ Hash the BYTES — never a `fs.stat` timestamp. `__filename` is a path inside app.asar, and
+    // Electron's asar shim fabricates stat times, so an mtime-keyed signature never matches itself
+    // and wipes the cache on EVERY boot (#21). Why, and the measurements, live in docs/build.md
+    // § "Packaged editor loop"; guarded by tests/architecture/viteCacheBustSignature.test.ts.
+    // Reading + hashing this file costs ~0.5ms (measured, 523KB) — don't "optimize" it to a stat.
     try {
-      const st = fs.statSync(__filename); // the packaged main.cjs (app.asar.unpacked/.../dist/main.cjs)
-      const buildSig = `${app.getVersion()}:${st.size}:${Math.round(st.mtimeMs)}`;
+      const buf = fs.readFileSync(__filename); // the packaged main.cjs (path is inside app.asar)
+      const hash = createHash('sha256').update(buf).digest('hex').slice(0, 16);
+      const buildSig = `${app.getVersion()}:${buf.length}:${hash}`;
       const sigFile = path.join(app.getPath('userData'), '.vite-cache-build');
       const prev = fs.existsSync(sigFile) ? fs.readFileSync(sigFile, 'utf8') : '';
       if (prev !== buildSig) {
@@ -1590,6 +1781,7 @@ app.whenReady().then(async () => {
         );
       } catch { /* pre-window dialog best-effort */ }
       closeSplash();
+      quitExitCode = 1; // a failed launch must not exit 0 — see quitExitCode (#68)
       app.quit();
       return;
     }
@@ -1628,6 +1820,19 @@ app.on('window-all-closed', () => {
 // would let the process exit before close() finishes. Defer the quit: prevent it
 // once, run the (awaited) teardown, then exit for real.
 let quitting = false;
+/** Exit code for the deferred quit below. 0 unless a startup path declared a FAILURE.
+ *
+ *  Why this exists (#68): a dev-server start failure called `app.quit()`, which lands in
+ *  the teardown below and ended `app.exit(0)` — so a hard startup failure was
+ *  indistinguishable from a clean user quit. `assert-app-csp.mjs` reported exactly that as
+ *  "app exited early (code 0)", and the issue reasonably read code 0 as "a clean quit, not
+ *  a crash" and looked for a teardown race. The exit code was lying, so it sent the
+ *  investigation somewhere the bug wasn't. Note the generic startup handler 25 lines up
+ *  already used `app.exit(1)` — this path just never matched it.
+ *
+ *  Set it rather than calling `app.exit(1)` directly, so the awaited teardown (E4) still
+ *  runs — the backend is already listening by the time the dev server is started. */
+let quitExitCode = 0;
 app.on('before-quit', (e) => {
   // An update install ("Restart Now") drives its OWN quit via Squirrel — do NOT
   // preventDefault or app.exit(0) here, or the install handshake is aborted and
@@ -1650,7 +1855,7 @@ app.on('before-quit', (e) => {
     try {
       await Promise.race([teardown, timeout]);
     } finally {
-      app.exit(0);
+      app.exit(quitExitCode);
     }
   })();
 });

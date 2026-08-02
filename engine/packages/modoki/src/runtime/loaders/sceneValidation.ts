@@ -13,6 +13,7 @@
  *  type checks are skipped (reported once as an info note by the caller). */
 
 import { isGuid, isExternalUrl, isInternalAssetPath } from '../core/assetRefRules';
+import { isSizeInert } from '../ui/anchorLayout';
 
 /** Asset-reference fields, keyed by the trait they live on. A value in one of
  *  these fields must be a GUID or an external URL — never a project-internal
@@ -50,9 +51,13 @@ export const REF_FIELDS_BY_TRAIT: Record<string, string[]> = {
 
 /** Primitive sprite keywords that are valid `Renderable2D.sprite` values even
  *  though they're neither GUIDs nor URLs. */
-const PRIMITIVE_SPRITES = new Set(['circle', 'square', 'triangle']);
+/** The built-in 2D sprite keywords (not asset refs). Exported because `create_entity` validates
+ *  `shape` against it — an unknown value used to produce an entity with an unresolvable sprite,
+ *  reported as a clean success. ONE list, so the tool and the validator cannot drift. */
+export const PRIMITIVE_SPRITE_NAMES = ['circle', 'square', 'triangle'] as const;
+const PRIMITIVE_SPRITES = new Set<string>(PRIMITIVE_SPRITE_NAMES);
 
-type FieldType = 'number' | 'string' | 'boolean' | 'color' | 'enum' | 'entityRef' | 'bindings' | 'materialOverrides';
+export type FieldType = 'number' | 'string' | 'boolean' | 'color' | 'enum' | 'entityRef' | 'bindings' | 'materialOverrides';
 
 /** Per-trait schema slice the validator needs — a subset of the editor's
  *  TraitMeta, serializable so the browser can push it over the HMR socket.
@@ -61,7 +66,10 @@ type FieldType = 'number' | 'string' | 'boolean' | 'color' | 'enum' | 'entityRef
  *  registry can't confidently infer (objects, arrays). */
 export interface TraitSchema {
   category: 'component' | 'resource' | 'tag';
-  fields: Record<string, { type?: FieldType; options?: string[] }>;
+  /** `default` is the trait's koota schema default, scalars only. Load-bearing now that
+   *  serialize.ts OMITS a field still holding its default: without it a reader of a scene
+   *  file cannot tell what an absent field's effective value is. */
+  fields: Record<string, { type?: FieldType; options?: string[]; default?: unknown }>;
 }
 
 export interface SceneSchema {
@@ -78,10 +86,74 @@ interface SceneEntityLike {
   id?: number;
   name?: string;
   traits?: Record<string, unknown>;
+  /** Prefab-instance field overrides, keyed by prefab `localId` (string) → trait
+   *  name → changed field. Sibling of `traits`, not inside it (prefabs.md). */
+  overrides?: unknown;
 }
 
-/** Validate an on-disk scene object. `schema` is optional (see module docs). */
-export function validateSceneData(data: unknown, schema?: SceneSchema): ValidationResult {
+/** Resolve a `PrefabInstance.source` ref to that prefab's parsed `.prefab.json`, or
+ *  undefined when it cannot be resolved. Injected by the caller so this module stays
+ *  pure — it does no I/O of its own (see module docs). Absent ⇒ prefab-supplied
+ *  anchors are simply not checked (a conservative false negative, never a wrong claim). */
+export type PrefabResolver = (sourceRef: string) => unknown;
+
+/** Is an authored `UIElement.${axis}` value a NEUTRAL "unset"/"agrees with stretch"
+ *  claim, not a real trap? Shared by the direct-trait path and the prefab-override
+ *  path so they cannot drift on the noise budget:
+ *    0    — the "unset" default every UIElement carries.
+ *    100% — "fill the parent", which AGREES with what stretch does. It is what the
+ *           editor itself writes for a stretched element, so warning on it would have
+ *           fired 102 times across games/ + demos/ while the real traps numbered 3
+ *           (court's NarrationBand 90%, 3d-test's 2D 200%).
+ *  Known limit: 100% is let through even under insetting offsets, where the true
+ *  extent is smaller. Tightening that needs viewport math this module does not have,
+ *  and would reintroduce the 102. */
+function isNeutralSize(v: unknown, unit: unknown): boolean {
+  return v === 0 || (v === 100 && unit === '%');
+}
+
+/**
+ * Inert-size warnings for ONE entity's trait bag: a `UIElement.width`/`height` authored on an
+ * axis its `UIAnchor` stretches is stored, shown in the Inspector, and never applied, because a
+ * stretched axis is sized entirely by its two offsets.
+ *
+ * The three authoring shapes, which entry point reports each, and the noise budget are owned by
+ * **docs/scene-loading.md** (pass 4). What matters here: a prefab entity has the identical `traits`
+ * shape as a scene entity, so ONE predicate serves every caller — restating the rule per call site
+ * is how the `0` / `100%` exclusions drift, and those exclusions are the difference between 3 real
+ * findings and 102 false ones.
+ *
+ * `label` is prefixed to each message; the caller owns what an entity is CALLED (a scene entity by
+ * name, a prefab entity by localId), because that is the only part that differs.
+ */
+export function inertSizeWarnings(traits: unknown, label: string): string[] {
+  const out: string[] = [];
+  if (!traits || typeof traits !== 'object') return out;
+  const uel = (traits as Record<string, unknown>).UIElement;
+  const uan = (traits as Record<string, unknown>).UIAnchor;
+  if (!uel || typeof uel !== 'object' || !uan || typeof uan !== 'object') return out;
+  const anchor = (uan as { anchor?: unknown }).anchor;
+  if (typeof anchor !== 'string') return out;
+  for (const axis of ['width', 'height'] as const) {
+    const v = (uel as Record<string, unknown>)[axis];
+    const unit = (uel as Record<string, unknown>)[`${axis}Unit`];
+    if (typeof v === 'number' && !isNeutralSize(v, unit) && isSizeInert(anchor, axis)) {
+      // Echo the value WITH its unit — '90%' is what the author sees in the Inspector, so a
+      // bare '90' makes them hunt for which field is meant.
+      const authored = `${v}${typeof unit === 'string' && unit ? unit : 'px'}`;
+      out.push(
+        `${label}.UIElement.${axis} is inert: the '${anchor}' anchor sizes that axis from its `
+        + `${axis === 'width' ? 'left/right' : 'top/bottom'} offsets, which overwrite the authored ${authored}`,
+      );
+    }
+  }
+  return out;
+}
+
+/** Validate an on-disk scene object. `schema` is optional (see module docs);
+ *  `getPrefab` is optional (see `PrefabResolver` docs) — omitted, prefab-instance
+ *  overrides are simply not checked for the inert-size trap. */
+export function validateSceneData(data: unknown, schema?: SceneSchema, getPrefab?: PrefabResolver): ValidationResult {
   const warnings: string[] = [];
   const schemaApplied = !!schema;
 
@@ -218,11 +290,94 @@ export function validateSceneData(data: unknown, schema?: SceneSchema): Validati
       }
     }
 
+    // UIElement size vs UIAnchor stretch: a stretched axis is sized by its offsets, so
+    // an authored width/height on that axis is stored, shown, and never applied. It
+    // reads as intentional — games/court's NarrationBand carries width:90% under
+    // L=5% R=5% offsets that happen to produce the same 90%, so it looks deliberate and
+    // correct. Warn rather than stay silent: the Inspector greys the field out, but
+    // someone reading the JSON gets no such signal. Axes are independent.
+    warnings.push(...inertSizeWarnings(e.traits, label));
+
     // Prefab self-reference: an instance whose source is its OWN guid would recurse.
     const pi = e.traits?.PrefabInstance;
     if (pi && typeof pi === 'object' && ownGuid) {
       const src = (pi as { source?: unknown }).source;
       if (typeof src === 'string' && src === ownGuid) warnings.push(`${label}.PrefabInstance.source references its own entity (self-reference)`);
+    }
+
+    // UIElement size vs UIAnchor stretch — the prefab-instance twin of the direct
+    // check above (#35). A prefab instance's overridden fields live in the SIBLING
+    // `overrides` object (keyed by prefab localId → trait → field), not in `traits`
+    // (which for an instance carries only PrefabInstance/EntityAttributes) — so the
+    // direct check above never sees an instance's size or anchor. Resolving the
+    // prefab needs I/O this module deliberately doesn't do (module docs), so it's
+    // BYOD: `getPrefab` is caller-injected and optional; without it this stays silent
+    // (a conservative false negative, never a wrong claim).
+    if (pi && typeof pi === 'object') {
+      const overrides = e.overrides;
+      if (overrides && typeof overrides === 'object') {
+        const src = (pi as { source?: unknown }).source;
+        let prefab: unknown;
+        if (typeof src === 'string' && src && getPrefab) {
+          try { prefab = getPrefab(src); } catch { prefab = undefined; }
+        }
+        // Build a localId → traits lookup from the resolved prefab, tolerating any
+        // malformed shape by falling back to "unresolved" (no throw).
+        let prefabTraitsByLocalId: Map<number, Record<string, unknown>> | undefined;
+        try {
+          const entities = (prefab as { entities?: unknown } | undefined)?.entities;
+          if (Array.isArray(entities)) {
+            prefabTraitsByLocalId = new Map();
+            for (const pe of entities) {
+              const localId = (pe as { localId?: unknown } | null)?.localId;
+              const traits = (pe as { traits?: unknown } | null)?.traits;
+              if (typeof localId === 'number' && traits && typeof traits === 'object') {
+                prefabTraitsByLocalId.set(localId, traits as Record<string, unknown>);
+              }
+            }
+          }
+        } catch { prefabTraitsByLocalId = undefined; }
+
+        for (const [localIdKey, traitOverridesRaw] of Object.entries(overrides as Record<string, unknown>)) {
+          if (!traitOverridesRaw || typeof traitOverridesRaw !== 'object') continue;
+          const traitOverrides = traitOverridesRaw as Record<string, unknown>;
+          const ovUel = traitOverrides.UIElement;
+          const ovUelObj = ovUel && typeof ovUel === 'object' ? (ovUel as Record<string, unknown>) : undefined;
+          if (!ovUelObj) continue; // this group doesn't touch UIElement at all
+          const ovUan = traitOverrides.UIAnchor;
+          const ovUanObj = ovUan && typeof ovUan === 'object' ? (ovUan as Record<string, unknown>) : undefined;
+
+          const prefabTraits = prefabTraitsByLocalId?.get(Number(localIdKey));
+          const prefabUel = prefabTraits?.UIElement as Record<string, unknown> | undefined;
+          const prefabUan = prefabTraits?.UIAnchor as Record<string, unknown> | undefined;
+
+          const ovAnchorRaw = ovUanObj?.anchor;
+          const anchorFromPrefab = typeof ovAnchorRaw !== 'string';
+          const anchor = typeof ovAnchorRaw === 'string'
+            ? ovAnchorRaw
+            : (typeof prefabUan?.anchor === 'string' ? prefabUan.anchor : undefined);
+          if (typeof anchor !== 'string') continue;
+
+          for (const axis of ['width', 'height'] as const) {
+            const unitField = `${axis}Unit`;
+            // Only consider an axis the OVERRIDE actually touches — a size authored
+            // purely inside the prefab is a different (prefab-side) bug, out of scope
+            // here, and warning on it would duplicate across every instance.
+            if (!(axis in ovUelObj) && !(unitField in ovUelObj)) continue;
+            const v = axis in ovUelObj ? ovUelObj[axis] : prefabUel?.[axis];
+            const unit = unitField in ovUelObj ? ovUelObj[unitField] : prefabUel?.[unitField];
+            if (typeof v === 'number' && !isNeutralSize(v, unit) && isSizeInert(anchor, axis)) {
+              const authored = `${v}${typeof unit === 'string' && unit ? unit : 'px'}`;
+              warnings.push(
+                `${label}.overrides[${localIdKey}].UIElement.${axis} is inert: the '${anchor}' anchor `
+                + `${anchorFromPrefab ? `(from its prefab, localId ${localIdKey}) ` : ''}`
+                + `sizes that axis from its ${axis === 'width' ? 'left/right' : 'top/bottom'} offsets, `
+                + `which overwrite the overridden ${authored}`,
+              );
+            }
+          }
+        }
+      }
     }
   });
 
@@ -244,7 +399,12 @@ function entityLabel(entity: SceneEntityLike | undefined, idx: number): string {
 }
 
 /** Returns a human-readable mismatch message, or null if the value fits the type. */
-function typeMismatch(type: FieldType, value: unknown): string | null {
+/** Exported so the scene-mutate PRE-FLIGHT can run the same type check the file-path validator
+ *  runs (independent review, 2026-07-30). The live branch — which `canGoLive` made the path almost
+ *  every agent edit takes — never called `validateSceneData`, so a field written with the wrong
+ *  TYPE came back `{ok:true, changed:1, warnings:[]}` while the file branch warned about it. One
+ *  primitive, both branches, so they cannot answer differently about the same op. */
+export function typeMismatch(type: FieldType, value: unknown): string | null {
   switch (type) {
     case 'number':
       return typeof value === 'number' && !Number.isNaN(value) ? null : `expected number, got ${describe(value)}`;
@@ -319,4 +479,38 @@ function describe(value: unknown): string {
   if (value === null) return 'null';
   if (Array.isArray(value)) return 'array';
   return typeof value;
+}
+
+/**
+ * Validate an on-disk `.prefab.json` (#42) — the THIRD and last place the inert-size trap can be
+ * authored, and the only one nothing checked.
+ *
+ * A separate entry point rather than a branch inside `validateSceneData`, because reporting a
+ * prefab-authored size from the scene side gets both the FILE and the COUNT wrong — see
+ * docs/scene-loading.md (pass 4) for the reasoning and the numbers.
+ *
+ * Deliberately narrow: this checks the inert-size rule only, not the whole schema. A prefab's
+ * traits are already type-checked wherever it is instantiated, so widening this would duplicate
+ * that; the gap being closed is specifically the one no caller existed for.
+ *
+ * Returns warnings — never throws, matching this module's warn-but-load contract. An unparseable
+ * or unexpected shape yields no warnings rather than a complaint, because a prefab that fails to
+ * PARSE is a different (and much louder) failure that the loader already reports.
+ */
+export function validatePrefabData(data: unknown): ValidationResult {
+  const warnings: string[] = [];
+  const entities = (data as { entities?: unknown })?.entities;
+  if (!Array.isArray(entities)) return { warnings, schemaApplied: false };
+  for (const entry of entities) {
+    if (!entry || typeof entry !== 'object') continue;
+    const e = entry as { localId?: unknown; name?: unknown; traits?: unknown };
+    // Prefab entities are keyed by `localId` (EntityAttributes.parentId inside a prefab addresses
+    // localIds, not ECS ids), so that is the address a reader can act on. The name is included
+    // when present because it is what they see in the Hierarchy, but the localId is the identity.
+    const named = typeof e.name === 'string' && e.name ? ` "${e.name}"` : '';
+    warnings.push(...inertSizeWarnings(e.traits, `entity[localId=${String(e.localId)}]${named}`));
+  }
+  // schemaApplied stays false: no trait schema is consulted (see above), and claiming otherwise
+  // would tell a caller its type checks ran when they did not.
+  return { warnings, schemaApplied: false };
 }

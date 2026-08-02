@@ -3,7 +3,7 @@
 import { describe, it, expect, vi } from 'vitest';
 
 async function getModule() {
-  return import('../../../src/runtime/rendering/render2DUtils');
+  return import('../../src/runtime/rendering/render2DUtils');
 }
 
 describe('render2DUtils', () => {

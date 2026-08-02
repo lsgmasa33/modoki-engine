@@ -62,22 +62,80 @@ function installExitHook(): void {
  * an ephemeral port — used when the port is an explicitly-pinned, stable contract
  * (MODOKI_BACKEND_PORT, the MCP target) that must not silently change. (E6)
  */
-export function findFreePort(preferred?: number, allowFallback = true): Promise<number> {
-  const probe = (p: number, fallback: boolean): Promise<number> =>
-    new Promise((resolve, reject) => {
-      const srv = net.createServer();
-      srv.unref();
-      srv.once('error', (err: NodeJS.ErrnoException) => {
-        if (fallback && err.code === 'EADDRINUSE') resolve(probe(0, false));
-        else reject(err);
-      });
-      srv.listen(p, '127.0.0.1', () => {
-        const { port } = srv.address() as net.AddressInfo;
-        srv.close(() => resolve(port));
-      });
+/** Addresses to bind-probe before calling a port free.
+ *
+ *  ONE bind probe is not enough, because `SO_REUSEADDR` (which Node sets on every
+ *  `net.Server`) lets a bind succeed alongside an existing one on a DIFFERENT
+ *  address. Measured on macOS — rows are who already holds the port, columns are
+ *  what a probe reports:
+ *
+ *      held        probe 0.0.0.0   probe 127.0.0.1   probe ::1
+ *      0.0.0.0     EADDRINUSE      free              free
+ *      127.0.0.1   free            EADDRINUSE        free
+ *      ::          EADDRINUSE      free              free
+ *      ::1         free            free              EADDRINUSE
+ *
+ *  Note there is no superset: probing only `127.0.0.1` (what we did before #67)
+ *  is blind to a sibling clone's `vite --host 0.0.0.0`, and probing only
+ *  `0.0.0.0` would be blind to our OWN `--host 127.0.0.1` dev server, which is
+ *  the far more common clash. A port is free only when EVERY probe says so.
+ *  Full rule + the ownership guard: docs/editor.md § "Port selection". */
+const PROBE_HOSTS = ['0.0.0.0', '127.0.0.1', '::1'] as const;
+
+/** Bind-probe one address. Resolves 'in-use' ONLY for a real clash: any other
+ *  error (no IPv6 stack → EADDRNOTAVAIL/EAFNOSUPPORT, a sandbox refusing the
+ *  wildcard → EACCES) means this address can't testify, and treating that as a
+ *  clash would make the editor refuse a perfectly free port. */
+function probeHost(port: number, host: string): Promise<'free' | 'in-use'> {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.once('error', (err: NodeJS.ErrnoException) => {
+      resolve(err.code === 'EADDRINUSE' ? 'in-use' : 'free');
     });
+    srv.listen(port, host, () => srv.close(() => resolve('free')));
+  });
+}
+
+/** OS-assigned ephemeral port. */
+function ephemeralPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address() as net.AddressInfo;
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+export async function findFreePort(preferred?: number, allowFallback = true): Promise<number> {
   const want = preferred && preferred > 0 ? preferred : 0;
-  return probe(want, allowFallback && want !== 0);
+  // Ephemeral is asked of the OS, which won't hand out a port it has bound — no
+  // multi-host probe needed (and nothing to prefer if it did clash).
+  if (want === 0) return ephemeralPort();
+
+  // SEQUENTIALLY, never Promise.all. The probes bind the SAME port on overlapping addresses
+  // (0.0.0.0 covers 127.0.0.1), so run concurrently they collide with EACH OTHER: on Linux,
+  // binding a specific address while the wildcard is held needs SO_REUSEPORT, and SO_REUSEADDR
+  // — which is what Node sets — only covers TIME_WAIT reuse. macOS is permissive here, so the
+  // bug was invisible on every dev machine while making findFreePort report EVERY port as
+  // in-use on Linux, i.e. silently never honouring a preferred port and always falling back to
+  // an ephemeral one. That is the E6 pinned-port contract failing quietly on that platform.
+  // Measured via CI (run 30700447503): an identically-shaped concurrent probe in the test
+  // helper found all 40 ports of a fresh 61000-61039 band "occupied".
+  let inUse = false;
+  for (const h of PROBE_HOSTS) {
+    if (await probeHost(want, h) === 'in-use') { inUse = true; break; }
+  }
+  if (!inUse) return want;
+  if (!allowFallback) {
+    const err: NodeJS.ErrnoException = new Error(`listen EADDRINUSE: address already in use ${want}`);
+    err.code = 'EADDRINUSE';
+    throw err;
+  }
+  return ephemeralPort();
 }
 
 /** Single reachability probe — resolves true if the dev server answers `url`. */
@@ -91,12 +149,29 @@ function reachable(url: string, timeoutMs = 1000): Promise<boolean> {
 
 /** Poll `url` until it answers (the dev server finished booting) or we time out.
  *  `abort()` lets the caller fail fast — e.g. the Vite child already exited (a
- *  --strictPort clash), so there's no point polling for the full timeout. (E7) */
-async function waitForServer(url: string, timeoutMs = 30000, abort?: () => boolean): Promise<void> {
+ *  --strictPort clash), so there's no point polling for the full timeout. (E7)
+ *  Exported for tests: the #67 adoption guard below is otherwise only reachable by
+ *  racing a real Vite spawn against a foreign server. */
+export async function waitForServer(url: string, timeoutMs = 30000, abort?: () => boolean): Promise<void> {
   const start = Date.now();
   for (;;) {
     if (abort?.()) throw new Error(`dev server process exited before becoming reachable at ${url} (port clash? — see the vite log)`);
-    if (await reachable(url)) return;
+    if (await reachable(url)) {
+      // Re-check AFTER the probe, not just before it. `reachable` only proves that
+      // SOMETHING answers on this port — and if our own Vite has exited in the
+      // meantime (--strictPort clash), that something is ANOTHER server: a sibling
+      // clone's dev server, or a stray `npm run dev`. Returning here would load the
+      // renderer against a foreign project root, which surfaces much later as a
+      // baffling "dev server can't serve code outside its allowed roots" for a path
+      // that plainly exists. Fail loudly instead. (#67)
+      if (abort?.()) {
+        throw new Error(
+          `something is answering at ${url}, but it is NOT our dev server — our Vite exited ` +
+          `(port clash with another editor or clone? — see the vite log)`,
+        );
+      }
+      return;
+    }
     if (Date.now() - start > timeoutMs) throw new Error(`dev server not reachable at ${url} within ${timeoutMs}ms`);
     await new Promise((r) => setTimeout(r, 300));
   }
@@ -134,10 +209,12 @@ export async function startDevServer(opts: { repoRoot: string; projectRoot: stri
 
   intentionalStop = false;
   // Pin Vite to 127.0.0.1 (NOT the default `localhost`, which Node resolves to
-  // ::1/IPv6). findFreePort probes 127.0.0.1, so a second editor only detects a
-  // 5173 clash — and the renderer only loads the right server — if Vite binds the
-  // SAME IPv4 interface. Without this, two editors silently split across
-  // 127.0.0.1:5173 / [::1]:5173 and load each other's project.
+  // ::1/IPv6), so the interface we bind is the one the renderer loads and the one
+  // findFreePort probed. Without this, two editors silently split across
+  // 127.0.0.1:5173 / [::1]:5173 and load each other's project. findFreePort probes
+  // every address a clash could hide behind (see PROBE_HOSTS), so it now also sees
+  // a server bound to the wildcard — e.g. another CLONE's `vite --host 0.0.0.0`,
+  // which used to read as "free" and cost us this whole class of bug. (#67)
   // `--configLoader runner` loads vite.config.ts via Vite's module runner (on the
   // fly, in memory) instead of the default `bundle` loader, which esbuild-bundles the
   // config and WRITES it to `<root>/node_modules/.vite-temp/…mjs`. Under a packaged

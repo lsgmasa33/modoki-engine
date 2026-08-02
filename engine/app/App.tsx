@@ -1,10 +1,12 @@
 import React, { Component, lazy, Suspense, useEffect, useRef, useState } from 'react';
 import type { ErrorInfo, ReactNode } from 'react';
 import { Capacitor } from '@capacitor/core';
-import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, computeContainerBox, getRenderSettings, getCurrentWorld, PlayerPrefs, selectDefaultBackend } from '@modoki/engine/runtime';
+import { useWebCanvasSizing } from './useWebCanvasSizing';
+import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend } from '@modoki/engine/runtime';
 import { App as CapacitorApp } from '@capacitor/app';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
 import ErrorBoundary from './ui/components/ErrorBoundary';
+import { EditorBootBoundary } from './ui/components/EditorBootBoundary';
 import LoadingOverlay from './ui/components/LoadingOverlay';
 import { initWorldSync } from './ecs/init';
 import { runPipeline } from './ecs/pipeline';
@@ -68,40 +70,6 @@ class GameUIErrorBoundary extends Component<{ fallback: ReactNode; children: Rea
   }
 }
 
-/** Last-resort boundary around the editor route. The editor is loaded through a bare
- *  `React.lazy`, so ANY rejection during its bootstrap used to unmount the tree and leave a
- *  BLANK window — alive, serving HTTP, rendering nothing, with the reason visible only to
- *  someone who thought to open the console. That silent-blank outcome is what made the
- *  wedged-editor bug cost four debugging sessions, so it must not be reachable by any path,
- *  including ones nobody has hit yet. Paint the error instead. */
-class EditorBootBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
-  state: { error: Error | null } = { error: null };
-  static getDerivedStateFromError(error: Error) { return { error }; }
-  componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error('[EditorBootBoundary] the editor failed to start:', error, info.componentStack);
-  }
-  render() {
-    const { error } = this.state;
-    if (!error) return this.props.children;
-    return (
-      <div style={{
-        height: '100vh', background: '#1a1a2e', color: '#fee2e2', padding: 28, overflow: 'auto',
-        fontFamily: 'system-ui, sans-serif',
-      }}>
-        <h2 style={{ margin: '0 0 10px', color: '#fca5a5' }}>The editor failed to start</h2>
-        <p style={{ margin: '0 0 14px', color: '#e5e7eb', maxWidth: 760, lineHeight: 1.5 }}>
-          Nothing is rendering because the editor never finished booting. This is the error that
-          stopped it — fix it and the editor reloads automatically.
-        </p>
-        <pre style={{
-          whiteSpace: 'pre-wrap', background: '#0f172a', border: '1px solid #334155',
-          padding: 14, color: '#fecaca', fontSize: 13, margin: 0,
-        }}>{`${error.name}: ${error.message}\n\n${error.stack ?? ''}`}</pre>
-      </div>
-    );
-  }
-}
-
 function useHashRoute() {
   const [hash, setHash] = useState(window.location.hash);
   useEffect(() => {
@@ -131,22 +99,6 @@ function findGame(gameId: string): GameDefinition | undefined {
  *  NOTE: Scene3D captures GameConfig at mount only (Scene3D.tsx). Today both
  *  games' sceneSetup hooks are no-ops so this is safe. If a future game needs
  *  per-game sceneSetup, Scene3D will need a gameConfig subscription. */
-/** Tracks the letterbox container box for the shipped web build's `rendering.web`
- *  sizeMode. Recomputes on window resize. For `free`/`max` the box fills the viewport
- *  (`letterboxed:false`) so the wrapper keeps its default 100%×100% CSS. */
-function useWebCanvasSizing() {
-  const [box, setBox] = useState(() =>
-    computeContainerBox(window.innerWidth, window.innerHeight, getRenderSettings().web));
-  useEffect(() => {
-    const apply = () =>
-      setBox(computeContainerBox(window.innerWidth, window.innerHeight, getRenderSettings().web));
-    apply(); // re-read after boot-time setRenderSettings injection
-    window.addEventListener('resize', apply);
-    return () => window.removeEventListener('resize', apply);
-  }, []);
-  return box;
-}
-
 const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) {
   useKeyboardShift();
 
@@ -360,7 +312,7 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
   // the game to its authored aspect; `free`/`max` fill the viewport (max clamps the
   // 3D drawing buffer in Scene3D instead). Editor viewports are unaffected — this is
   // the standalone game shell only.
-  const sizeBox = useWebCanvasSizing();
+  const sizeBox = useWebCanvasSizing(configReady);
 
   if (error) {
     return (

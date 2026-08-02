@@ -10,9 +10,13 @@ import { createElement } from 'react';
 import type React from 'react';
 import { createEditor, useEditorStore, backendFetch, backendEventSource } from '@modoki/engine/editor';
 import { GameView } from '@modoki/engine/editor/rendering';
-import { setGameConfig, setPhysicsLayers } from '@modoki/engine/runtime';
+import { PlayerPrefs, selectDefaultBackend, setGameConfig, setPhysicsLayers } from '@modoki/engine/runtime';
 import type { GameConfig, EditorPanelDef } from '@modoki/engine/runtime';
 import projectConfig from 'virtual:modoki-project-config';
+import {
+  CAPACITOR_ORIENTATIONS, STATUS_BAR_STYLES, KEYBOARD_RESIZE_MODES, WEB_DEPLOY_MODES, WEB_SIZE_MODES,
+  PLAYABLE_NETWORKS, IOS_CONTENT_MODES, ANDROID_SCHEMES, GPU_BACKENDS, TONE_MAPPINGS,
+} from '../../project-config';
 import { loadProjectGames } from '../projectGames';
 import { registerAll } from '../ecs/register';
 import { DefaultGameUILayer } from '../ui/DefaultGameUILayer';
@@ -26,6 +30,12 @@ function GameViewWithUI() {
 
 /** Minimal config for an empty project (no games) so the editor still mounts. */
 const EMPTY_CONFIG: GameConfig = { name: 'Empty Project', sceneSetup: () => {}, initWorld: () => {} };
+
+/** Pair a project-config union constant with its human-readable labels for a
+ *  `select` field's options. `Record<T, string>` makes a missing/misspelled
+ *  member a compile error — the union constant and the dialog can never drift. */
+const labeled = <T extends string>(vals: readonly T[], labels: Record<T, string>) =>
+  vals.map((v) => ({ value: v as string, label: labels[v] }));
 
 /** Run one game-provided boot hook, converting a throw into a recorded fault instead of
  *  letting it reject `createGameEditor()` and take the whole editor down with it.
@@ -154,6 +164,27 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
   }
   defaultConfig ??= EMPTY_CONFIG;
 
+  // 1b. Hydrate PlayerPrefs BEFORE registerSystems/scene load, so a game system that reads
+  //     saved progress at spawn sees it — same ordering rationale as `GameShell` in App.tsx.
+  //
+  //     Why this exists at all: `PlayerPrefs.init` was called ONLY in `GameShell`, and App.tsx
+  //     renders `EditorApp` INSTEAD of `GameShell` on the `#/editor` route. So a game played in
+  //     the editor never initialised prefs and silently ran on the in-memory default backend —
+  //     every save alive until Stop or a reload, nothing on disk. Found from play: Court's level
+  //     resume pointed back at level 1 after a Stop/Play, and `localStorage` held ZERO `mk:` keys
+  //     while being perfectly writable. The resume code was fine; it was reading an empty box.
+  //
+  //     ISOLATED namespace (owner's call): editor play must NOT share saved data with a real
+  //     build of the same game. Same origin + same namespace would mean playtest experiments
+  //     writing into the save a web build reads. `@editor` is a suffix the game's own namespace
+  //     can never produce, so the two stores can't collide.
+  if (chosenGameId) {
+    await PlayerPrefs.init({
+      namespace: `${chosenGameId}@editor`,
+      backend: selectDefaultBackend(),
+    });
+  }
+
   // 2. setGameConfig before registerAll (which reads nameTransform).
   setGameConfig(defaultConfig);
 
@@ -268,24 +299,24 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
             {
               title: 'Mobile (iOS + Android)',
               fields: [
-                { key: 'capacitor.orientation', label: 'Orientation', type: 'select', options: [
-                  { value: 'auto', label: 'Auto (portrait + landscape)' },
-                  { value: 'portrait', label: 'Portrait' },
-                  { value: 'landscape', label: 'Landscape' },
-                ] },
+                { key: 'capacitor.orientation', label: 'Orientation', type: 'select', options: labeled(CAPACITOR_ORIENTATIONS, {
+                  auto: 'Auto (portrait + landscape)',
+                  portrait: 'Portrait',
+                  landscape: 'Landscape',
+                }) },
                 { key: 'capacitor.statusBarHidden', label: 'Hide status bar (clock/wifi)', type: 'checkbox' },
-                { key: 'capacitor.statusBarStyle', label: 'Status bar style', type: 'select', options: [
-                  { value: 'default', label: 'Default (OS decides)' },
-                  { value: 'light', label: 'Light text (dark bg)' },
-                  { value: 'dark', label: 'Dark text (light bg)' },
-                ], showIf: { key: 'capacitor.statusBarHidden', in: ['false'] } },
+                { key: 'capacitor.statusBarStyle', label: 'Status bar style', type: 'select', options: labeled(STATUS_BAR_STYLES, {
+                  default: 'Default (OS decides)',
+                  light: 'Light text (dark bg)',
+                  dark: 'Dark text (light bg)',
+                }), showIf: { key: 'capacitor.statusBarHidden', in: ['false'] } },
               ],
             },
             {
               title: 'Capacitor',
               fields: [
                 { key: 'capacitor.webDir', label: 'Web dir', type: 'text', placeholder: 'dist' },
-                { key: 'capacitor.keyboardResize', label: 'Keyboard resize', type: 'select', options: ['none', 'native', 'body', 'ionic'].map((v) => ({ value: v, label: v })) },
+                { key: 'capacitor.keyboardResize', label: 'Keyboard resize', type: 'select', options: KEYBOARD_RESIZE_MODES.map((v) => ({ value: v, label: v })) },
               ],
             },
             {
@@ -314,11 +345,11 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
               title: 'Web Deploy',
               fields: [
                 { key: 'build.webBasePath', label: 'Web base path', type: 'text', placeholder: '/demo/', help: 'sub-path hosting — applies in every mode' },
-                { key: 'build.webDeployMode', label: 'Deploy target', type: 'select', options: [
-                  { value: 'none', label: 'None — build to dist/ only' },
-                  { value: 'gcs', label: 'Google Cloud Storage (built-in gcloud)' },
-                  { value: 'custom', label: 'Custom command' },
-                ] },
+                { key: 'build.webDeployMode', label: 'Deploy target', type: 'select', options: labeled(WEB_DEPLOY_MODES, {
+                  none: 'None — build to dist/ only',
+                  gcs: 'Google Cloud Storage (built-in gcloud)',
+                  custom: 'Custom command',
+                }) },
                 // GCS-only fields
                 { key: 'build.webBucket', label: 'Web GCS bucket', type: 'text', placeholder: 'gs://…', showIf: { key: 'build.webDeployMode', in: ['gcs'] } },
                 { key: 'build.webCdnUrlMap', label: 'Web CDN url-map', type: 'text', placeholder: 'empty = no CDN', help: 'gcloud compute url-maps invalidate-cdn-cache <name>', showIf: { key: 'build.webDeployMode', in: ['gcs'] } },
@@ -333,11 +364,11 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
             {
               title: 'Screen / Canvas Size',
               fields: [
-                { key: 'rendering.web.sizeMode', label: 'Size mode', type: 'select', options: [
-                  { value: 'free', label: 'Free — fill window (responsive)' },
-                  { value: 'fixed', label: 'Fixed — render at W×H, letterbox' },
-                  { value: 'max', label: 'Max — fill but clamp buffer to W×H' },
-                ] },
+                { key: 'rendering.web.sizeMode', label: 'Size mode', type: 'select', options: labeled(WEB_SIZE_MODES, {
+                  free: 'Free — fill window (responsive)',
+                  fixed: 'Fixed — render at W×H, letterbox',
+                  max: 'Max — fill but clamp buffer to W×H',
+                }) },
                 { key: 'rendering.web.width', label: 'Width', type: 'number', placeholder: '1280', showIf: { key: 'rendering.web.sizeMode', in: ['fixed', 'max'] } },
                 { key: 'rendering.web.height', label: 'Height', type: 'number', placeholder: '720', showIf: { key: 'rendering.web.sizeMode', in: ['fixed', 'max'] } },
               ],
@@ -346,14 +377,14 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
               title: 'Playable Ad',
               fields: [
                 { key: 'build.playableClickUrl', label: 'CTA click URL', type: 'text', placeholder: 'https://apps.apple.com/…  (empty = CTA inert)', help: 'the Install/CTA tap opens this via mraid.open in an ad container; the network usually overrides the destination but needs a URL to fire' },
-                { key: 'build.playableNetwork', label: 'Ad network', type: 'select', options: [
-                  { value: 'applovin', label: 'AppLovin MAX' },
-                  { value: 'unity', label: 'Unity Ads' },
-                  { value: 'ironsource', label: 'ironSource' },
-                  { value: 'facebook', label: 'Meta / Facebook' },
-                  { value: 'mintegral', label: 'Mintegral' },
-                  { value: 'generic', label: 'Generic (MRAID)' },
-                ], help: 'targeted MRAID/CTA conventions (Build → Playable Ad output)' },
+                { key: 'build.playableNetwork', label: 'Ad network', type: 'select', options: labeled(PLAYABLE_NETWORKS, {
+                  applovin: 'AppLovin MAX',
+                  unity: 'Unity Ads',
+                  ironsource: 'ironSource',
+                  facebook: 'Meta / Facebook',
+                  mintegral: 'Mintegral',
+                  generic: 'Generic (MRAID)',
+                }), help: 'targeted MRAID/CTA conventions (Build → Playable Ad output)' },
                 { key: 'build.playableMaxBytes', label: 'Max size (bytes)', type: 'number', placeholder: '5242880', help: 'build fails if the single HTML exceeds this — AppLovin caps at 5 MB' },
               ],
             },
@@ -378,7 +409,7 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
             {
               title: 'Capacitor (iOS)',
               fields: [
-                { key: 'capacitor.iosContentMode', label: 'Content mode', type: 'select', options: ['mobile', 'desktop', 'recommended'].map((v) => ({ value: v, label: v })) },
+                { key: 'capacitor.iosContentMode', label: 'Content mode', type: 'select', options: IOS_CONTENT_MODES.map((v) => ({ value: v, label: v })) },
               ],
             },
           ],
@@ -397,7 +428,7 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
             {
               title: 'Capacitor (Android)',
               fields: [
-                { key: 'capacitor.androidScheme', label: 'URL scheme', type: 'select', options: ['http', 'https'].map((v) => ({ value: v, label: v })) },
+                { key: 'capacitor.androidScheme', label: 'URL scheme', type: 'select', options: ANDROID_SCHEMES.map((v) => ({ value: v, label: v })) },
                 { key: 'capacitor.allowMixedContent', label: 'Allow mixed content', type: 'checkbox' },
               ],
             },
@@ -421,20 +452,21 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
             {
               title: 'Three.js (3D)',
               fields: [
-                { key: 'rendering.three.backend', label: 'GPU backend', type: 'select', options: ['auto', 'webgpu', 'webgl'].map((v) => ({ value: v, label: v })), help: 'auto = detect, prefer WebGPU' },
+                { key: 'rendering.three.backend', label: 'GPU backend', type: 'select', options: GPU_BACKENDS.map((v) => ({ value: v, label: v })), help: 'auto = detect, prefer WebGPU' },
                 { key: 'rendering.three.antialias', label: 'Antialias', type: 'checkbox' },
                 { key: 'rendering.three.shadows', label: 'Shadows', type: 'checkbox' },
-                { key: 'rendering.three.pixelRatioCap', label: 'Pixel-ratio cap', type: 'number', placeholder: '2' },
-                { key: 'rendering.three.toneMapping', label: 'Tone mapping', type: 'select', options: ['ACESFilmic', 'AgX', 'Neutral', 'Linear', 'None'].map((v) => ({ value: v, label: v })) },
+                { key: 'rendering.three.pixelRatioCap', label: 'Pixel-ratio cap', type: 'number', placeholder: '2 (0 = uncapped)' },
+                { key: 'rendering.three.toneMapping', label: 'Tone mapping', type: 'select', options: TONE_MAPPINGS.map((v) => ({ value: v, label: v })) },
                 { key: 'rendering.three.exposure', label: 'Exposure', type: 'number', placeholder: '1' },
               ],
             },
             {
               title: 'PixiJS (2D)',
               fields: [
-                { key: 'rendering.pixi.backend', label: 'GPU backend', type: 'select', options: ['auto', 'webgpu', 'webgl'].map((v) => ({ value: v, label: v })), help: 'auto = detect, prefer WebGPU' },
+                { key: 'rendering.pixi.backend', label: 'GPU backend', type: 'select', options: GPU_BACKENDS.map((v) => ({ value: v, label: v })), help: 'auto = detect, prefer WebGPU' },
                 { key: 'rendering.pixi.antialias', label: 'Antialias', type: 'checkbox' },
                 { key: 'rendering.pixi.resolution', label: 'Resolution', type: 'number', placeholder: '0 = auto (devicePixelRatio)' },
+                { key: 'rendering.pixi.pixelRatioCap', label: 'Pixel-ratio cap', type: 'number', placeholder: '2 (0 = uncapped)' },
               ],
             },
             {
@@ -467,11 +499,16 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(values),
-        }).then((r) => {
+        }).then(async (r) => {
           // Apply physics layers live so the editor reflects matrix/name edits without
           // a reload — colliders rebuild next tick (resolved bits are in their signature).
           if (r.ok && values.physics) setPhysicsLayers(values.physics as Parameters<typeof setPhysicsLayers>[0]);
-          return r.ok;
+          if (r.ok) return true;
+          // Surface the server's reason. The route refuses a save for things the user
+          // can fix (an unsafe build field, a config file that no longer parses), and
+          // dropping the message left the dialog just not closing, with no explanation.
+          const msg = await r.json().then((j: { error?: string }) => j?.error).catch(() => undefined);
+          return msg || `Save failed (${r.status})`;
         }),
       pickPath: async (mode) => {
         try {

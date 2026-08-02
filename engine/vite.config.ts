@@ -4,6 +4,7 @@ import react from '@vitejs/plugin-react'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
 import { assetScannerPlugin } from './plugins/vite-asset-scanner'
 import { loadProjectConfig } from './plugins/load-project-config'
 import { resolveModules } from './plugins/detect-modules'
@@ -46,6 +47,78 @@ const debugBuildFlag = loadProjectConfig(buildProjectRoot).build.debugBuild === 
 const msdfGeneratorDir = (() => {
   const dir = path.join(repoRoot, 'node_modules', '@zappar', 'msdf-generator')
   return fs.existsSync(path.join(dir, 'package.json')) ? dir : null
+})()
+
+// PACKAGED-ONLY: same "first seen only once a project opens" class of bug as the
+// @modoki/engine subpaths below, but for a GAME's own native-SDK wrapper deps
+// (`games/<id>/packages/app-services` — AppLovin/Adjust/Firebase, per CLAUDE.md's
+// Native SDK Pattern). Those are dynamic-imported only from inside the game module,
+// so Vite's cold-start scan never sees them; it discovers them mid-session instead,
+// forces a full reload to re-optimize, and the editor's project-open flow (asset
+// import progress dialog) visibly runs TWICE. Confirmed via engine-vite.log: EVERY
+// packaged boot logs `dependencies optimized: @capacitor-firebase/analytics,
+// @capacitor-firebase/crashlytics` + `optimized dependencies changed. reloading`
+// right after the project's dev server comes up — 100% reproducible, not the rare
+// race the @modoki/engine include list guards against (though a request landing in
+// THAT reload's window is the leading theory for the rare EditorBootBoundary retry
+// case in App.tsx). Reads the CURRENTLY OPEN project's app-services package.json
+// (buildProjectRoot tracks MODOKI_PROJECT, re-resolved fresh per dev-server spawn —
+// see devServer.ts) so this generalizes to any future game's app-services deps
+// without hardcoding package names here. Skips file:/link:/workspace: specifiers —
+// those are local source packages (like @modoki/engine), not registry deps, and
+// forcing them into the optimizer would fight the same class of staleness this is
+// meant to fix.
+//
+// GOTCHA #1 that cost a full extra build/install cycle to find: a bare package NAME in
+// optimizeDeps.include resolves relative to VITE'S OWN ROOT (engine/), via ordinary
+// node_modules walk-up from there — NOT relative to the game project. `games/<id>`'s
+// own node_modules (where these deps actually live, npm workspaces don't hoist them
+// to the repo root) is a SIBLING of engine/, not an ancestor, so the bare name never
+// resolves and Vite logs "Failed to resolve dependency ... present in client
+// optimizeDeps.include" and silently falls back to the exact lazy mid-session
+// discovery this was meant to prevent (confirmed via modoki-vite.log on a real
+// packaged install — the reload fired anyway).
+//
+// GOTCHA #2, found immediately after fixing #1 by handing Vite the resolved absolute
+// path instead of the bare name: that made the COLD scan succeed, but the game's own
+// `import { X } from '@capacitor-firebase/analytics'` in app-services/src/analytics.ts
+// still resolves the BARE name from ITS OWN location at live-import time — a different
+// id than the absolute path we fed the cold scan, as far as Vite's optimizer cache is
+// concerned — so it treated that as a NEWLY discovered dependency and re-optimized +
+// reloaded anyway (confirmed live: `_metadata.json` ended up with BOTH the bare name
+// AND the raw path as separate optimized entries). Fix: also `resolve.alias` the bare
+// name to the SAME resolved path, so cold-scan-time and live-import-time resolution
+// produce the identical id — same technique already used for @zappar/msdf-generator
+// below, for the same "resolves differently depending on where Vite is looking from"
+// class of bug.
+//
+// `firebase` itself is deliberately NOT force-included even though it's declared in
+// app-services/package.json: it's an ESM-only package whose `exports` map has no root
+// entry reachable via `require.resolve` (peer dep of @capacitor-firebase/*, never
+// imported by bare name from game code) — see the resolution-failure log this emits
+// if that ever changes.
+const nativeSdkRequire = createRequire(import.meta.url)
+const projectNativeSdkDeps: { name: string; resolvedPath: string }[] = (() => {
+  const pkgPath = path.join(buildProjectRoot, 'packages', 'app-services', 'package.json')
+  if (!fs.existsSync(pkgPath)) return []
+  const appServicesDir = path.dirname(pkgPath)
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as { dependencies?: Record<string, string> }
+    const names = Object.entries(pkg.dependencies ?? {})
+      .filter(([, spec]) => !/^(file:|link:|workspace:)/.test(spec))
+      .map(([name]) => name)
+    const resolved: { name: string; resolvedPath: string }[] = []
+    for (const name of names) {
+      try {
+        resolved.push({ name, resolvedPath: nativeSdkRequire.resolve(name, { paths: [appServicesDir, buildProjectRoot] }) })
+      } catch (e) {
+        console.warn(`[vite.config] could not cold-start pre-bundle native-SDK dep "${name}" from ${appServicesDir} — it will still be discoverable lazily at runtime, just re-optimized mid-session (double reload). Resolution error: ${e instanceof Error ? e.message : e}`)
+      }
+    }
+    return resolved
+  } catch {
+    return []
+  }
 })()
 
 // An external project (MODOKI_PROJECT outside the repo), if any.
@@ -165,6 +238,24 @@ export default defineConfig(({ command }) => {
   // plugins/subgameBuild.ts + docs/ota-subgame-modules.md §2.
   const isSubgame = command === 'build' && process.env.MODOKI_SUBGAME === '1'
   const subgameEngineApi = loadProjectConfig(buildProjectRoot).ota.engineApi
+  // Sub-path hosting (#40). An explicit BASE_PATH still wins. Otherwise ONLY a
+  // web-target build takes the project's build.webBasePath — a native build's dist is
+  // served from the app root by Capacitor, and a playable is one self-contained file,
+  // so both must stay "/". The target arrives as MODOKI_BUILD_TARGET from
+  // build-web.mjs (--target); a direct `vite build` (build:editor, build-subgame.mjs)
+  // has no target and keeps "/".
+  const resolvedBase = process.env.BASE_PATH
+    || (process.env.MODOKI_BUILD_TARGET === 'web'
+      ? (loadProjectConfig(buildProjectRoot).build.webBasePath || '/')
+      : '/')
+  if (command === 'build') {
+    const source = process.env.BASE_PATH
+      ? 'BASE_PATH env'
+      : process.env.MODOKI_BUILD_TARGET === 'web'
+        ? 'build.webBasePath'
+        : 'default'
+    console.log(`[vite.config] base=${JSON.stringify(resolvedBase)} (${source})`)
+  }
   return {
   root: engineDir,
   // Vite's dep-optimize cache. Default (under the Vite root) is fine for dev, but a
@@ -172,10 +263,9 @@ export default defineConfig(({ command }) => {
   // there. main sets MODOKI_VITE_CACHEDIR to a writable userData path when packaged
   // so optimizeDeps works on first launch. Unset in dev → Vite default.
   ...(process.env.MODOKI_VITE_CACHEDIR ? { cacheDir: process.env.MODOKI_VITE_CACHEDIR } : {}),
-  // Sub-path hosting (e.g. GCS bucket served at modoki-engine.com/demo). Defaults
-  // to '/' so dev and native Capacitor builds are unaffected; the web deploy sets
-  // BASE_PATH=/demo/. Runtime asset URLs are prefixed via assetUrl() to match.
-  base: process.env.BASE_PATH || '/',
+  // Sub-path hosting (e.g. GCS bucket served at modoki-engine.com/demo) — see
+  // resolvedBase above. Runtime asset URLs are prefixed via assetUrl() to match.
+  base: resolvedBase,
   // ELECTRON_PLAN Phase 1: the editor + agent/backend APIs are gated on this
   // explicit flag, NOT on import.meta.env.DEV / import.meta.hot. True in `vite`
   // dev (command==='serve') and for any build that opts in via MODOKI_EDITOR=true
@@ -278,6 +368,7 @@ export default defineConfig(({ command }) => {
         '@modoki/engine/editor',
         '@modoki/engine/editor/rendering',
         '@modoki/engine/three',
+        ...projectNativeSdkDeps.map(d => d.name),
       ],
     } : {}),
   },
@@ -308,12 +399,24 @@ export default defineConfig(({ command }) => {
     // registerAppServices is a dynamic-import closure the single-chunk build folds in) would ship
     // as dead SDK weight against the byte cap. registerAppServices() is skipped in a playable
     // anyway (App.tsx), so the no-op stub is safe. Regex matches the whole `@<scope>/app-services`.
+    // See GOTCHA #2 by projectNativeSdkDeps above: aliasing each native-SDK bare name to
+    // the SAME resolved path fed to optimizeDeps.include makes cold-scan-time and
+    // live-import-time resolution agree, so the mid-session re-optimize + reload doesn't
+    // fire a second time after the cold pre-bundle already covered it. Same gate
+    // (MODOKI_VITE_CACHEDIR, packaged-only) as the include list — they must move together.
     ...(isPlayable
       ? { alias: [
           { find: '@zappar/msdf-generator', replacement: path.join(engineDir, 'plugins/playable-msdf-stub.ts') },
           { find: /^@[^/]+\/app-services$/, replacement: path.join(engineDir, 'plugins/playable-appservices-stub.ts') },
         ] }
-      : (msdfGeneratorDir ? { alias: { '@zappar/msdf-generator': msdfGeneratorDir } } : {})),
+      : {
+          alias: {
+            ...(msdfGeneratorDir ? { '@zappar/msdf-generator': msdfGeneratorDir } : {}),
+            ...(process.env.MODOKI_VITE_CACHEDIR
+              ? Object.fromEntries(projectNativeSdkDeps.map(d => [d.name, d.resolvedPath]))
+              : {}),
+          },
+        }),
   },
   test: {
     // Paths are relative to root (engineDir): tests/ and packages/ live under engine/.

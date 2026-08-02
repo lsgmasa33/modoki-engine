@@ -1047,8 +1047,9 @@ function fetchMaterial(matPath: string): Promise<void> {
       // textures via TSL. Each map's colorspace comes from the texture's own
       // import settings (albedo srgb, normal/rough/metal linear). The PBR maps
       // load in parallel — a single missing map shouldn't block the others.
-      // SceneManager.loadScene runs *after* `rendererReady` resolves (gated in
-      // createEditor), so KTX2Loader has GPU caps by the time loadTexture3D fires.
+      // loadTexture3D gates its own KTX2 loads on `ensureKtx2Caps()` (a real viewport, or a
+      // throwaway probe when none exists), so KTX2Loader always has GPU caps by the time it
+      // fires — SceneManager.loadScene itself no longer waits on any viewport/renderer.
       if ('map' in mat) {
         const std = mat as THREE.MeshStandardMaterial;
         const flipY = (data.flipY as boolean) ?? false;

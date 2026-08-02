@@ -6,6 +6,7 @@
  *  hot paths — so when it's disabled we say so rather than showing an empty list. */
 
 import { useEffect, useState, type CSSProperties } from 'react';
+import { fillRootStyle, fillRegionStyle } from '../tabLayout';
 import { journalEvents, clearJournal, isJournalEnabled, type GameEvent } from '../../core/journal';
 
 const REFRESH_MS = 300;
@@ -29,7 +30,7 @@ export function JournalTab() {
   const rows = (f ? all.filter((e) => e.type.toLowerCase().includes(f)) : all).slice(-MAX_ROWS).reverse();
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+    <div style={fillRootStyle()}>
       <div style={{ display: 'flex', gap: 6 }}>
         <input
           type="text"
@@ -76,7 +77,7 @@ function summarize(payload: unknown): string {
 
 const inputStyle: CSSProperties = { flex: 1, background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.15)', borderRadius: 4, color: '#e6e6ff', fontSize: 12, padding: '3px 6px' };
 const btnStyle: CSSProperties = { background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.15)', color: '#c4b5fd', cursor: 'pointer', fontSize: 12, padding: '3px 8px', borderRadius: 4 };
-const listStyle: CSSProperties = { maxHeight: 240, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 2, fontSize: 12 };
+const listStyle: CSSProperties = { ...fillRegionStyle, display: 'flex', flexDirection: 'column', gap: 2, fontSize: 12 };
 const eventRowStyle: CSSProperties = { display: 'flex', gap: 6, alignItems: 'baseline', padding: '2px 4px', borderRadius: 3, background: 'rgba(255,255,255,0.03)' };
 const warnRowStyle: CSSProperties = { ...eventRowStyle, background: 'rgba(234,179,8,0.10)' };
 const errorRowStyle: CSSProperties = { ...eventRowStyle, background: 'rgba(239,68,68,0.14)' };

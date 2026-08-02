@@ -7,6 +7,7 @@
  *  buttons render here alongside the actions instead of in an auto-generated tab). */
 
 import { useEffect, useState, type CSSProperties } from 'react';
+import { scrollRootStyle } from '../tabLayout';
 import { getUIActionNames, getUIActionParams, dispatchUIAction } from '../../core/actionRegistry';
 import { isSimRunning } from '../../core/playState';
 import { getDebugCommands, type DebugCommandDef } from '../debugMenuRegistry';
@@ -25,7 +26,7 @@ export function CheatsTab() {
   const running = isSimRunning();
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+    <div style={scrollRootStyle(12)}>
       {commands.length > 0 && (
         <section>
           <div style={headingStyle}>Commands</div>

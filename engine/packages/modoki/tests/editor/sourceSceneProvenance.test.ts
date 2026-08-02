@@ -26,13 +26,13 @@ function registerAll() {
   registerTrait({
     name: 'EntityAttributes', trait: EntityAttributes, category: 'component',
     fields: {
-      name: {}, isActive: {}, sortOrder: {}, parentId: { entityId: { onMissing: 'root' } }, layer: {}, guid: {},
-      sourceScene: { hidden: true, runtimeOnly: true },
+      name: { type: 'string' }, isActive: { type: 'boolean' }, sortOrder: { type: 'number' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, layer: { type: 'enum', options: ['', '3d', '2d', 'ui'] }, guid: { type: 'string' },
+      sourceScene: { type: 'string', hidden: true, runtimeOnly: true },
     },
   });
   registerTrait({
     name: 'Transform', trait: Transform, category: 'component',
-    fields: { x: {}, y: {}, z: {}, rx: {}, ry: {}, rz: {}, sx: {}, sy: {}, sz: {} },
+    fields: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' }, rx: { type: 'number' }, ry: { type: 'number' }, rz: { type: 'number' }, sx: { type: 'number' }, sy: { type: 'number' }, sz: { type: 'number' } },
   });
   registerTrait({ name: 'Persistent', trait: Persistent, category: 'tag', fields: {} });
 }
@@ -56,7 +56,7 @@ afterEach(() => { setRunMode('playing', { advancing: true }); }); // restore run
 describe('EntityAttributes.sourceScene (Phase 3)', () => {
   it('is registered hidden + runtimeOnly, unlike editorFolder which is unregistered', () => {
     const meta = getAllTraits().find((m) => m.name === 'EntityAttributes')!;
-    expect(meta.fields.sourceScene).toEqual({ hidden: true, runtimeOnly: true });
+    expect(meta.fields.sourceScene).toEqual({ type: 'string', hidden: true, runtimeOnly: true });
     // The wart this deliberately avoids repeating.
     expect(meta.fields.editorFolder).toBeUndefined();
   });

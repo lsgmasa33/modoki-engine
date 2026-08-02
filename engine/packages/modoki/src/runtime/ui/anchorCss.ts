@@ -10,12 +10,11 @@
  *  build instead of silently mis-positioning UI on device. */
 
 import type { CSSProperties } from 'react';
-import type { AnchorData } from './anchorLayout';
+// STRETCH_X/STRETCH_Y come from anchorLayout so the two paths cannot disagree on WHICH
+// modes stretch — that membership now decides offset semantics, not just pivot.
+import { STRETCH_X, STRETCH_Y, type AnchorData } from './anchorLayout';
 
 export type AnchorCssData = AnchorData & { safeArea?: boolean; zIndex?: number };
-
-const STRETCH_X = ['stretch', 'top-stretch', 'bottom-stretch', 'h-stretch'];
-const STRETCH_Y = ['stretch', 'left-stretch', 'right-stretch', 'v-stretch'];
 
 /** Mutate `style` in place with the absolute-positioning CSS for anchor `a`.
  *  (Mirrors anchorLayout.resolveAnchorRect — keep them in sync; parity-tested.) */
@@ -26,7 +25,15 @@ export function applyAnchorStyle(style: CSSProperties, a: AnchorCssData): void {
   // Position the element's top-left at the anchor reference point.
   // All non-stretch modes use top+left so pivot translate(-X%,-Y%) works uniformly.
   switch (a.anchor) {
-    case 'stretch': style.inset = 0; style.width = undefined; style.height = undefined; break;
+    // Four LONGHANDS, deliberately not the `inset: 0` shorthand. The offset block
+    // below writes `style.right`/`style.bottom` on a stretched axis, and a shorthand
+    // would only be overridden by them via declaration ORDER (React emits style keys
+    // in insertion order) — a silent, invisible dependency in the exact code path
+    // whose bug was that offsets silently did nothing. Longhands make the 0 an
+    // explicit base that fmtAdd composes with, order be damned.
+    case 'stretch':
+      style.top = 0; style.right = 0; style.bottom = 0; style.left = 0;
+      style.width = undefined; style.height = undefined; break;
     case 'top-stretch': style.top = 0; style.left = 0; style.right = 0; style.width = undefined; break;
     case 'bottom-stretch': style.top = '100%'; style.left = 0; style.right = 0; style.width = undefined; break;
     case 'left-stretch': style.top = 0; style.left = 0; style.bottom = 0; style.height = undefined; break;
@@ -44,9 +51,13 @@ export function applyAnchorStyle(style: CSSProperties, a: AnchorCssData): void {
     case 'v-stretch': style.top = 0; style.bottom = 0; style.left = '50%'; style.height = undefined; break;
   }
 
-  // Apply offsets as additions to top/left. For anchors that use 50%/100% base
-  // values, offsets are combined with calc(). Right/bottom offsets are subtracted
-  // (push inward from the far edge).
+  // Which axes are stretched (both edges pinned) — decides BOTH the offset semantics
+  // below and the pivot translate further down.
+  const stretchX = STRETCH_X.includes(a.anchor);
+  const stretchY = STRETCH_Y.includes(a.anchor);
+
+  // Apply offsets. For anchors that use 50%/100% base values, offsets are combined
+  // with calc().
   // A length TERM (no base), e.g. '12%', '12px', or '12 * var(--ui-vw, 1vw)'.
   // Viewport units resolve via the container-relative CSS vars UIRenderer publishes
   // — mirrors cssVal (UINode.tsx) and resolveLengthPx (anchorLayout.ts); keep in sync.
@@ -67,10 +78,24 @@ export function applyAnchorStyle(style: CSSProperties, a: AnchorCssData): void {
     if (!v) return base ?? 0;
     return base ? `calc(${base}${typeof base === 'number' ? 'px' : ''} - ${term(v, unit)})` : bare(-v, unit);
   };
+  // A NON-stretched axis is anchored at a single POINT, so every offset resolves
+  // against that one edge: near-edge offsets add, far-edge offsets SUBTRACT (pushing
+  // inward from the far edge) — the box moves, its size is untouched.
+  // A STRETCHED axis has BOTH edges pinned, so each offset insets ITS OWN edge
+  // (`right` → `style.right`) and the box SHRINKS. Folding `right` back into
+  // `style.left` there would make `left: 5%` + `right: 5%` cancel to a full-bleed box
+  // instead of the side margins it reads as. Mirrors resolveAnchorRect's rw/rh
+  // subtraction (anchorLayout.ts); parity-tested.
   if (a.top) style.top = fmtAdd(style.top, a.top, a.topUnit);
   if (a.left) style.left = fmtAdd(style.left, a.left, a.leftUnit);
-  if (a.bottom) style.top = fmtSub(style.top, a.bottom, a.bottomUnit);
-  if (a.right) style.left = fmtSub(style.left, a.right, a.rightUnit);
+  if (a.bottom) {
+    if (stretchY) style.bottom = fmtAdd(style.bottom, a.bottom, a.bottomUnit);
+    else style.top = fmtSub(style.top, a.bottom, a.bottomUnit);
+  }
+  if (a.right) {
+    if (stretchX) style.right = fmtAdd(style.right, a.right, a.rightUnit);
+    else style.left = fmtSub(style.left, a.right, a.rightUnit);
+  }
 
   // For anchored (absolute) elements, margin does not affect position — the pivot
   // sits at the anchor point regardless. Margin is only effective in flow layout.
@@ -82,8 +107,6 @@ export function applyAnchorStyle(style: CSSProperties, a: AnchorCssData): void {
   // Pivot (0,0) = element's top-left sits at the anchor point.
   // Pivot (0.5,0.5) = element's center sits at the anchor point.
   // Stretched axes ignore pivot (both edges pinned).
-  const stretchX = STRETCH_X.includes(a.anchor);
-  const stretchY = STRETCH_Y.includes(a.anchor);
   const tx = stretchX ? 0 : -a.pivotX * 100;
   const ty = stretchY ? 0 : -a.pivotY * 100;
   if (tx || ty) {

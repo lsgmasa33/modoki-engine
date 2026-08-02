@@ -18,6 +18,7 @@
 
 import { resolveRef, isGuid, registerAsset } from './assetManifest';
 import { assetUrl } from './assetUrl';
+import { parseAssetJson } from './assetFetch';
 
 /** Per-clip playback parameters within an animset. All optional — a missing
  *  field falls back to the engine default (see ANIMSET_DEFAULTS), which is also
@@ -83,8 +84,7 @@ export function getAnimSet(ref: string): AnimSetDef | null {
     const gen = generation;
     const p = fetch(assetUrl(path))
       .then((r) => {
-        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-        return r.json();
+        return parseAssetJson(r, path);
       })
       .then((json) => {
         if (gen !== generation) return;       // scene swap mid-flight

@@ -112,7 +112,7 @@ function runGltfTransform(args: string[], label: string): void {
     });
   } catch (e) {
     const stderr = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
-    throw new Error(`gltf-transform ${label} failed: ${stderr}`);
+    throw new Error(`gltf-transform ${label} failed: ${stderr}`, { cause: e });
   }
 }
 

@@ -54,6 +54,9 @@ deterministic sim free of live DOM reads.
 - `runtime/input/pointerSource.ts` — mouse/primary-touch modality: Pointer Events on `window` with
   `setPointerCapture`, reports the single active pointer as a `PointerFrame` (position + down + drag
   delta). Treats `pointercancel` as a clean release so an Android touch-reclaim can't strand a drag.
+- `runtime/core/pointerBlockers.ts` — the pointer-block-root registry (`registerPointerBlocker`/
+  `isPointerBlocked`), consulted by `pointerSource.ts` at ingestion. Lives in `core/` (L0), not
+  `input/` or `ui/` (both L2), because both need to reach it and there is no `ui → input` zone edge.
 - `runtime/input/characterInputSystem.ts` / `characterInput3DSystem.ts` — GAME-tier bridges copying
   `Input` actions onto `CharacterController2D`/`3D` move/jump fields.
 - `runtime/input/inputPrompts.ts` / `inputPromptSources.ts` — the pure `promptFor(device, action)`
@@ -119,6 +122,48 @@ moves keep flowing outside the origin element, and treats `pointercancel` **iden
 reads it via the accessors (`pointerPressed`/`pointerDown`/`pointerReleased`/`pointerPos`/`pointerDrag`)
 and maps the coordinates to world space itself (raycast / its own projection). Worked examples:
 `games/sling` (drag-to-aim slingshot) and `games/space-invader` (absolute finger-follow + release-to-fire).
+
+**Pointer-block roots (a DOM overlay claiming pointer exclusivity).** The pointer source binds to
+`window`, so a DOM overlay drawn as a sibling of the game canvas (the engine `UIRenderer`, the F12
+debug menu panel, a game's own hand-built chrome — e.g. `games/court`'s rules dialog) does NOT, by
+itself, stop the game from also seeing the same tap underneath. `registerPointerBlocker(el)`
+(`core/pointerBlockers.ts`, exported from `@modoki/engine/runtime`) fixes this: it registers `el` as
+a block root, and `onPointerDown`/`onWheel` consult `isPointerBlocked(e.target)` BEFORE latching a
+gesture or accumulating wheel delta — never inside `sample()`, which would corrupt the down/up FIFO's
+alternation invariant (see the source file's own banner). Because a blocked pointer never latches
+`activeId`, its whole gesture (later `pointermove`/`pointerup`, even off the registered root, e.g. a
+drag that started on a DOM button then left it) stays invisible for free, with no per-pointer claim
+state to leak — an EARLIER design keyed a claim by `pointerId` and had to defend against a leaked
+claim permanently deafening the game to that pointer; this design has no claim to leak in the first
+place, since the block decision is recomputed from the live DOM at every event. `UIRenderer` registers
+its own root automatically, but ONLY in runtime mode (`!onSelectEntity`) — the editor mounts the same
+UI tree a second time inside SceneView's authoring preview, where a click manipulates gizmos/
+selection, not the running game, and must never claim its pointer. A game's own DOM chrome (like
+`rulesDialog.ts`) registers/unregisters manually around its own mount/unmount.
+
+⚠️ **PASSTHROUGH SURFACES — a block root alone over-blocks, and it killed all 2D input for a day.**
+`UIRenderer` registers its WHOLE UI root, but that root is not "chrome": it is a LAYER holding chrome
+AND, for every 2D game in this repo, the game's own render surface. The standard scene shape puts
+`Canvas2D` on a `UIElement`, so the game's `<canvas>` is a DESCENDANT of the UI root — and judging by
+containment alone classified every press on the game's own board as a press on chrome. `onPointerDown`
+returned before latching, so ALL pointer input to the game was dead: measured across 19 scenes in 10
+projects, including both published demos. **The block direction worked; nothing asserted the pass
+direction**, which is how a one-directional guard ships — it passes by blocking everything.
+
+`registerPointerPassthrough(el)` marks a surface as the game's own, exempt even inside a block root.
+`canvas2DPool` registers each slot's canvas automatically, so games need no opt-in. Resolution is
+**nearest-ancestor**: the registration closer to the event target decides, so chrome deliberately
+registered inside a passthrough surface still blocks.
+
+**Register the `<canvas>` ELEMENT, never a wrapper around it.** This is the entire safety argument for
+"if UI picks the click, it must not reach the canvas/2D Pixi layer or 3D": a UI element can never be a
+DOM descendant of a `<canvas>` (fallback content is not rendered or hit-tested), so a press on a UI
+button over the canvas still has `target = button` — inside the block root, outside the passthrough
+surface — and is blocked exactly as before. Register the canvas's PARENT instead and every UI element
+inside it starts leaking presses into the game, which is the original bug this system exists to
+prevent. Pinned by `pointerBlockers.test.ts` (both directions, plus the wrapper failure mode) and by
+`pointerBlockRootsIntegration.test.ts`, which fires a real `pointerdown` on a canvas inside a real
+rendered `UIRenderer` and asserts the game's `Input` DOES see it.
 
 **Presentation-invariant input (zoom).** Page/UI zoom — the editor's webContents zoom, a browser
 Cmd+, an OS zoom — rescales the CSS coordinate system: at zoom factor `f` the viewport holds `1/f` as
@@ -200,6 +245,14 @@ a scene file, and intentionally not an editor-inspectable trait.
 - **Y sign conventions differ by layer.** The frame is forward/up = +1; the browser gamepad is +Y down
   (negated in the mapper); 3D locomotion is −Z forward (negated in `characterInput3DSystem`). Keep the
   negations where they are.
+- **A new DOM overlay over the game must register a pointer-block root, or it leaks.** Anything drawn
+  as a sibling of the game canvas (a game's own hand-built modal/HUD, not routed through `UIElement`)
+  needs `registerPointerBlocker(rootEl)` around its own mount/unmount, or a tap on it will ALSO
+  register as a tap on the game underneath — the "phantom paint" / stray-placement symptom is nasty to
+  diagnose because it reads as a layering bug, not an input one. `UIElement`/`UIRenderer`-based UI
+  gets this for free. The registration must happen synchronously inside the DOM event's own dispatch
+  (e.g. a mount-time callback ref) — a claim decided asynchronously (a `useEffect`, a `setState`) is
+  too late for the `pointerdown` that already started ingesting.
 
 ## Related
 

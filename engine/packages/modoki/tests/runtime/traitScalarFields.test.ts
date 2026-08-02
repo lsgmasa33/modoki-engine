@@ -58,7 +58,7 @@ const ALLOWLIST = new Set<string>([
 
 /** A koota trait is a function carrying the internal symbol. */
 function isTrait(v: unknown): v is Trait {
-  return typeof v === 'function' && !!(v as Record<symbol, unknown>)[$internal];
+  return typeof v === 'function' && !!(v as unknown as Record<symbol, unknown>)[$internal];
 }
 
 /** Collect every engine trait as [name, trait], from the runtime barrel + the

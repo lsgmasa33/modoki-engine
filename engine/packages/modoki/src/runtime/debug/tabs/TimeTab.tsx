@@ -7,6 +7,7 @@
  *  editor. Readouts (frame/elapsed/delta/state) refresh on a slow interval. */
 
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
+import { scrollRootStyle } from '../tabLayout';
 import { getCurrentWorld } from '../../core/ecs/world';
 import { getTime, getTimeScale, setTimeScale } from '../../core/getTime';
 import { getPlayState } from '../../core/playState';
@@ -38,7 +39,7 @@ export function TimeTab() {
   const togglePause = () => setScale(paused ? lastNonZero.current || 1 : 0);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+    <div style={scrollRootStyle(12)}>
       <section>
         <div style={rowStyle}>
           <span style={labelStyle}>Time scale</span>

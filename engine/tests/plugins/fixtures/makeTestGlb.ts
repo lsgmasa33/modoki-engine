@@ -28,10 +28,13 @@ import os from 'os';
 import sharp from 'sharp';
 
 interface MeshData {
-  positions: Float32Array;
-  normals: Float32Array;
-  uvs: Float32Array;
-  indices: Uint16Array;
+  // Pinned to the `<ArrayBuffer>` generic (not the newer default `ArrayBufferLike`) because
+  // @gltf-transform/core's `setArray` is typed against exactly that — a bare `Float32Array`
+  // widens to `ArrayBufferLike` under current @types/node lib defs and no longer satisfies it.
+  positions: Float32Array<ArrayBuffer>;
+  normals: Float32Array<ArrayBuffer>;
+  uvs: Float32Array<ArrayBuffer>;
+  indices: Uint16Array<ArrayBuffer>;
 }
 
 /** Axis-aligned cube, 24 verts (4 per face) so normals + UVs are per-face. */

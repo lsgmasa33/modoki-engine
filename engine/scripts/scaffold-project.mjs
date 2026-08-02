@@ -9,7 +9,7 @@
  *   <dir>/
  *     game.ts · project.config.json · package.json · CLAUDE.md · README.md
  *     runtime/config.ts · runtime/setup.ts
- *     runtime/assets/scenes/main.json   — hello-world scene (camera + lights + title)
+ *     runtime/assets/scenes/main.scene.json   — hello-world scene (camera + lights + title)
  *     runtime/assets/{models,textures,materials,prefabs}/.gitkeep
  *
  * Usage:  node engine/scripts/scaffold-project.mjs <target-dir> [project-name]
@@ -64,7 +64,7 @@ for (const file of walk(targetDir)) {
 
 // Mint fresh scene GUIDs (parentId references a parent's guid string → global
 // old→new text remap keeps the hierarchy intact).
-const scenePath = path.join(targetDir, 'runtime', 'assets', 'scenes', 'main.json');
+const scenePath = path.join(targetDir, 'runtime', 'assets', 'scenes', 'main.scene.json');
 if (fs.existsSync(scenePath)) {
   let sceneText = fs.readFileSync(scenePath, 'utf8');
   const scene = JSON.parse(sceneText);

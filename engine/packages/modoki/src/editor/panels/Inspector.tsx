@@ -19,6 +19,10 @@ import { getEditorViewportCamera } from '../scene/sceneViewBus';
 import { instantiatePrefabAsync, setPrefabSource, type PrefabFile } from '../scene/prefab';
 import { getModelPostprocessorIds } from '../../runtime/loaders/modelPostprocessorRegistry';
 import { isGuid, resolveGuidToPath, getAssetEntry } from '../../runtime/loaders/assetManifest';
+// Which anchors stretch which axis is decided ONCE, in anchorLayout — the same import
+// anchorCss makes, and for the same reason: the Inspector's "this field is inert" gating
+// must not be able to disagree with the layout that makes it inert.
+import { STRETCH_X, STRETCH_Y, isSizeInert } from '../../runtime/ui/anchorLayout';
 import { BufferedTextInput, BufferedNumberInput, inputStyle, readOnlyFieldStyle, MIXED_PLACEHOLDER } from './fields';
 import { type TraitEntry, sameTraitResult, readMergedTraits } from './inspectorMerge';
 import { AssetRefField } from './AssetRefField';
@@ -46,7 +50,7 @@ import { ModelAssetView } from './assetViews/ModelAssetView';
 import { ShaderAssetView } from './assetViews/ShaderAssetView';
 import { SceneAssetView } from './assetViews/SceneAssetView';
 import { openAssetInEditor } from './openAssetInEditor';
-import { isSelfPlacementDisabled } from '../uiAuthoring';
+import { isSelfPlacementDisabled, selectionAnchorGate, selectionSizeGate } from '../uiAuthoring';
 import { onEditorDirty } from '../../runtime/ui/uiTreeStore';
 import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { getPhysicsLayerNames } from '../../runtime/physics/physicsLayers';
@@ -93,6 +97,39 @@ export const UNIT_FIELD_MAPS: Record<string, Record<string, string>> = {
 export const UNIT_COMPANION_FIELDS: Record<string, Set<string>> = Object.fromEntries(
   Object.entries(UNIT_FIELD_MAPS).map(([trait, map]) => [trait, new Set(Object.values(map))]),
 );
+
+/** The explanation shown on a `UIElement.width`/`height` field that the sibling
+ *  UIAnchor has made inert. Greying the field out says "you can't edit this" but not
+ *  WHY or what to reach for instead, which is the whole complaint in issue #16 — on a
+ *  stretched axis the two offsets are the ONLY way to size it. Pure + exported so the
+ *  wording is unit-testable without mounting the Inspector. */
+export function inertSizeTooltip(axis: 'width' | 'height', anchor: string): string {
+  const offsets = axis === 'width' ? 'left/right' : 'top/bottom';
+  return `${axis} has no effect on a '${anchor}' anchor: that axis is sized by the anchor's `
+    + `${offsets} offsets, which overwrite it. Edit those offsets to size it, or choose a `
+    + `non-stretched anchor to make ${axis} live again.`;
+}
+
+/** Same explanation, for a multi-selection whose inert anchors DIFFER (say one
+ *  `stretch` and one `bottom-stretch` — both kill `width`). Naming one of them would
+ *  name the wrong anchor for the rest of the selection, so this names none. */
+export function inertSizeTooltipMultiAnchor(axis: 'width' | 'height'): string {
+  const offsets = axis === 'width' ? 'left/right' : 'top/bottom';
+  return `${axis} has no effect on ANY of the selected elements: each one's anchor stretches that `
+    + `axis, so it is sized by that anchor's ${offsets} offsets, which overwrite it. Edit those `
+    + `offsets to size them, or choose a non-stretched anchor to make ${axis} live again.`;
+}
+
+/** The MIXED case (issue #34): the axis is inert on part of the selection and live on
+ *  the rest. The field deliberately stays EDITABLE — disabling it would remove the only
+ *  way to author the entities where the value works — so the explanation's job is to
+ *  say up front that part of the write will be discarded. */
+export function partiallyInertSizeTooltip(axis: 'width' | 'height', inert: number, total: number): string {
+  const offsets = axis === 'width' ? 'left/right' : 'top/bottom';
+  return `${axis} is live on ${total - inert} of the ${total} selected elements and inert on the `
+    + `other ${inert}, whose anchor stretches that axis (sized by its ${offsets} offsets instead). `
+    + `Editing here writes to all of them; the stretched ones will discard it.`;
+}
 
 /** Coerce a raw `<input type="number">` value into a finite sort key. Clearing
  *  the box yields '' → Number('') is NaN; a NaN sort key silently breaks sibling
@@ -654,7 +691,20 @@ function AudioSourceClips({ entityIds, meta }: {
 }
 
 /** Inline note shown atop the Layout section when a UIElement is anchored. */
-function AnchorLayoutNote() {
+/** `mixed` = only PART of the selection is anchored (issue #34). The fields are then
+ *  NOT disabled — a unanimous verdict is required for that — so the note must not claim
+ *  they are, and must warn that an edit lands on entities that ignore it. */
+function AnchorLayoutNote({ mixed = false }: { mixed?: boolean }) {
+  if (mixed) {
+    return (
+      <div style={{ background: '#2a2640', border: '1px solid #4a4270', borderRadius: 3, padding: '5px 7px', margin: '2px 0 6px', fontSize: '11px', color: '#b8b0d8', lineHeight: 1.4 }}>
+        📌 <b>Partly anchored</b> — some of the selected elements have a <b>UIAnchor</b> and
+        some don't. Self-placement fields (grow / shrink / align-self) stay editable so the
+        un-anchored ones can still be authored, but the anchored ones will ignore what you
+        write. Select them separately to be sure of the result.
+      </div>
+    );
+  }
   return (
     <div style={{ background: '#2a2640', border: '1px solid #4a4270', borderRadius: 3, padding: '5px 7px', margin: '2px 0 6px', fontSize: '11px', color: '#b8b0d8', lineHeight: 1.4 }}>
       📌 <b>Anchored</b> — position is controlled by the <b>UIAnchor</b> above.
@@ -729,22 +779,37 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
     writeFieldMulti(entityIds, meta, field, value);
   }, [entityIds, meta]);
 
-  // UIElement: gray out flexGrow/flexShrink when entity has UIAnchor (absolute positioning ignores flex-child props)
-  // Also track anchor value to disable width/height when anchor stretches along that axis.
-  // Multi-select: inspect the primary entity (anchor decoration is cosmetic).
-  const [hasAnchor, anchorValue] = meta.name === 'UIElement' ? (() => {
-    const allTraits = getAllTraits();
-    const anchorMeta = allTraits.find(t => t.name === 'UIAnchor');
-    if (!anchorMeta) return [false, ''] as const;
-    const entity = findEntity(primaryId);
-    if (!entity || !entity.has(anchorMeta.trait)) return [false, ''] as const;
-    return [true, (entity.get(anchorMeta.trait) as any).anchor as string] as const;
-  })() : [false, ''] as const;
+  // UIElement: gray out flexGrow/flexShrink when the entity has a UIAnchor (absolute
+  // positioning ignores flex-child props), and disable width/height on an axis the
+  // anchor stretches. Both read the SIBLING UIAnchor, which the per-trait field loop
+  // does not carry — hence the live world read here.
+  //
+  // Read EVERY selected entity, not just the primary (issue #34). These gates drive
+  // `readOnly`, not just dimming, so resolving them from whoever happens to be primary
+  // makes a live field un-editable on the others — or, the other way round, lets a write
+  // land on entities that discard it. One entry per selection member.
+  //
+  // `null` means NO UIAnchor trait; `''` means anchored with no readable mode. Those two
+  // must stay distinct: any anchor at all kills self-placement whatever its mode, so
+  // collapsing an unreadable mode to "un-anchored" would quietly re-enable flexGrow on an
+  // anchored element (the trait defaults `anchor` to 'stretch', so this is a guard, not a
+  // live case — but it is exactly the distinction the two gates disagree on).
+  const anchorModes: (string | null)[] = meta.name === 'UIElement' ? (() => {
+    const anchorMeta = getAllTraits().find(t => t.name === 'UIAnchor');
+    if (!anchorMeta) return entityIds.map(() => null);
+    return entityIds.map((id) => {
+      const entity = findEntity(id);
+      if (!entity || !entity.has(anchorMeta.trait)) return null;
+      return ((entity.get(anchorMeta.trait) as any)?.anchor as string) ?? '';
+    });
+  })() : [];
 
   // A self-placement prop (grow/shrink/align-self) is dead once the element is
   // anchored — see uiAuthoring.SELF_PLACEMENT_PROPS. Container/child-layout
   // props (direction/justify/align/gap) stay live (the Unity LayoutGroup).
-  const selfPlacementDisabled = (key: string) => isSelfPlacementDisabled(meta.name, hasAnchor, key);
+  // Only a UNANIMOUS anchor disables the control; a mixed selection stays editable.
+  const anchorGate = selectionAnchorGate(anchorModes);
+  const selfPlacementDisabled = (key: string) => isSelfPlacementDisabled(meta.name, anchorGate === 'inert', key);
 
   // Classify fields into an ordered item stream (single field OR a grouped
   // VecField), split by section. A grouped VecField respects its members'
@@ -842,8 +907,8 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
     // UIAnchor: hide pivotX/pivotY when their axis is stretched (pivot has no effect)
     if (meta.name === 'UIAnchor' && (key === 'pivotX' || key === 'pivotY')) {
       const anchor = data.anchor as string;
-      const stretchX = ['stretch', 'top-stretch', 'bottom-stretch', 'h-stretch'].includes(anchor);
-      const stretchY = ['stretch', 'left-stretch', 'right-stretch', 'v-stretch'].includes(anchor);
+      const stretchX = STRETCH_X.includes(anchor);
+      const stretchY = STRETCH_Y.includes(anchor);
       if (key === 'pivotX' && stretchX) return null;
       if (key === 'pivotY' && stretchY) return null;
     }
@@ -852,14 +917,35 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
     if (unitFieldMap[key]) {
       const unitKey = unitFieldMap[key];
       const unit = (data[unitKey] as string) || 'px';
-      // Disable width/height when anchor stretches along that axis
-      const stretchDisabled = meta.name === 'UIElement' && hasAnchor && (
-        (key === 'width' && ['stretch', 'top-stretch', 'bottom-stretch', 'h-stretch'].includes(anchorValue)) ||
-        (key === 'height' && ['stretch', 'left-stretch', 'right-stretch', 'v-stretch'].includes(anchorValue))
-      );
+      // A stretched axis SIZES ITSELF from the two offsets, so the authored
+      // width/height on that axis is inert (applyAnchorStyle/resolveAnchorRect both
+      // overwrite it). Gate the axes INDEPENDENTLY — a top-stretch element has an
+      // inert width but a perfectly live height. Dimming alone left the reason
+      // unstated, so say it, and say what to edit instead (issue #16). The reason rides
+      // on the LABEL's hint, not a `title=` — native tooltips never render in this
+      // Electron build, so `title` would have been an explanation nobody can read.
+      //
+      // Across a MULTI-selection the gate is unanimous-or-nothing (issue #34): read-only
+      // only when the axis is inert on EVERY selected entity; a mixed selection stays
+      // editable (half-dimmed) and says so, because disabling it there would strand the
+      // entities where the value is live.
+      const isSizeKey = meta.name === 'UIElement' && (key === 'width' || key === 'height');
+      const axis = key as 'width' | 'height';
+      const sizeGate = isSizeKey ? selectionSizeGate(anchorModes, axis) : 'live';
+      const stretchDisabled = sizeGate === 'inert';
+      // Distinct anchor modes among the entities the axis is inert on — one means we can
+      // name it (the common single-select case), several means we must not.
+      const inertAnchors = isSizeKey && sizeGate !== 'live'
+        ? [...new Set(anchorModes.filter((a): a is string => !!a && isSizeInert(a, axis)))]
+        : [];
+      const labelHint = sizeGate === 'inert'
+        ? { ...hint, tooltip: inertAnchors.length === 1 ? inertSizeTooltip(axis, inertAnchors[0]) : inertSizeTooltipMultiAnchor(axis) }
+        : sizeGate === 'mixed'
+          ? { ...hint, tooltip: partiallyInertSizeTooltip(axis, anchorModes.filter((a) => !!a && isSizeInert(a, axis)).length, anchorModes.length) }
+          : hint;
       return (
-        <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2, ...(ov ? overrideStyle : {}), ...(stretchDisabled ? { opacity: 0.35 } : {}) }}>
-          <FieldLabel label={key} hint={hint} style={{ width: 50, color: ov ? '#5dade2' : '#888', fontSize: '11px', fontWeight: ov ? 'bold' : 'normal' }} />
+        <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2, ...(ov ? overrideStyle : {}), ...(sizeGate === 'inert' ? { opacity: 0.35 } : sizeGate === 'mixed' ? { opacity: 0.65 } : {}) }}>
+          <FieldLabel label={key} hint={labelHint} style={{ width: 50, color: ov ? '#5dade2' : '#888', fontSize: '11px', fontWeight: ov ? 'bold' : 'normal' }} />
           <BufferedNumberInput value={val as number} step={hint.step ?? 1} mixed={mx} min={hint.min} max={hint.max}
             onChange={v => write(key, v)} readOnly={stretchDisabled}
             style={{ flex: 1, background: '#111', color: '#ddd', border: '1px solid #444', borderRadius: 3, padding: '2px 4px', fontSize: '12px', fontFamily: 'monospace' }} />
@@ -954,17 +1040,20 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
       // Disable the checkbox there so the UI doesn't imply an effect it won't have.
       const safeAreaInert = meta.name === 'UIAnchor' && key === 'safeArea' && (() => {
         const anc = data.anchor as string;
-        const sx = ['stretch', 'top-stretch', 'bottom-stretch', 'h-stretch'].includes(anc);
-        const sy = ['stretch', 'left-stretch', 'right-stretch', 'v-stretch'].includes(anc);
-        return !(sx || sy);
+        return !(STRETCH_X.includes(anc) || STRETCH_Y.includes(anc));
       })();
+      // The reason moved off `title=` and onto the label's Tooltip: native tooltips
+      // never render in this Electron build, so this explanation was unreadable.
+      const safeAreaHint = safeAreaInert
+        ? { ...hint, tooltip: 'Safe Area only applies to a stretched anchor — it insets a container’s children from the notch/home-indicator. No effect on a non-stretched element.' }
+        : hint;
       return (
-        <label key={key} title={safeAreaInert ? 'Safe Area only applies to a stretched anchor — it insets a container’s children from the notch/home-indicator. No effect on a non-stretched element.' : undefined}
+        <label key={key}
           style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: safeAreaInert ? 'default' : 'pointer', fontSize: '11px', marginBottom: 2, ...(safeAreaInert ? { opacity: 0.4 } : {}) }}>
           <input type="checkbox" checked={mx ? false : (val as boolean)} disabled={safeAreaInert}
             ref={(el) => { if (el) el.indeterminate = mx; }}
             onChange={(e) => write(key, e.target.checked)} />
-          <FieldLabel label={key} hint={hint} style={{ color: '#bbb' }} />
+          <FieldLabel label={key} hint={safeAreaHint} style={{ color: '#bbb' }} />
         </label>
       );
     }
@@ -1005,14 +1094,14 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
       {/* Collapsible sub-sections */}
       {Array.from(sections.entries()).map(([sectionName, { items, defaultOpen, divider }]) => {
         if (!sectionHasVisibleItems(items)) return null;
-        const showAnchorNote = meta.name === 'UIElement' && hasAnchor && sectionName === 'Layout';
+        const showAnchorNote = meta.name === 'UIElement' && anchorGate !== 'live' && sectionName === 'Layout';
         const activeLayer = typeof data['physicsLayer'] === 'string' ? (data['physicsLayer'] as string) : '';
         const showFilterNote = meta.name === 'Collider2D' && sectionName === 'Advanced Filter' && activeLayer.length > 0;
         return (
           <div key={sectionName}>
             {divider && <div style={{ borderTop: '1px solid #444', margin: '6px 0' }} />}
             <SubSection title={sectionName} defaultOpen={defaultOpen}>
-              {showAnchorNote && <AnchorLayoutNote />}
+              {showAnchorNote && <AnchorLayoutNote mixed={anchorGate === 'mixed'} />}
               {showFilterNote && <FilterIgnoredNote layer={activeLayer} />}
               {items.map(renderItem)}
             </SubSection>

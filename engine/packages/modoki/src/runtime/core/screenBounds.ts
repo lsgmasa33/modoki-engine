@@ -58,17 +58,55 @@ export interface EntityScreenBounds {
    *  real size ("this mesh is 2.3×1.1×0.8") without a screenshot. Omitted for 2D/UI
    *  and for entities with no projectable geometry. */
   worldAABB?: { size: [number, number, number]; center: [number, number, number] };
+  /** 2D only: the entity id of the Canvas2D host these bounds were measured against —
+   *  a Canvas2D host can be mounted in more than one on-screen surface (e.g. both the
+   *  editor's GameView and a preview), so bounds alone don't say which rect they
+   *  describe without this. Omitted for 3D/UI. */
+  canvasId?: number;
+  /** WHICH on-screen surface this rect was measured in. See `BoundsSurface`.
+   *
+   *  Load-bearing, not decorative: the SAME entity is routinely measured by two providers at
+   *  once (open the editor's Scene and Game panels and every 3D entity gets a rect from each,
+   *  through two different cameras). MEASURED on `games/3d-test`, entity `cube`, one id:
+   *  `{x:755,y:312,w:47,h:45}` from the GameView and `{x:76,y:-63,w:496,h:372}` from the
+   *  SceneView. Nothing in the rect says which panel it belongs to, so a consumer picking
+   *  "the" rect by id was picking one of two live answers at random — and an entity-aimed
+   *  click resolved from the loser lands in the wrong panel while reporting success. */
+  surface?: BoundsSurface;
 }
+
+/** The on-screen surface a bounds provider speaks for. A provider MUST label its rects: an
+ *  unlabelled rect is indistinguishable from another provider's, which is the bug above.
+ *
+ *  - `game-3d`    — the runtime Three.js renderer (`Scene3D`), through the GAME camera.
+ *  - `game-2d`    — the runtime PixiJS renderer (`Scene2D`).
+ *  - `scene-view` — the EDITOR authoring viewport, through the editor orbit camera.
+ *    Editor-only, and the one that collides with `game-3d` whenever both panels are open. */
+export type BoundsSurface = 'game-3d' | 'game-2d' | 'scene-view';
 
 /** A layer's bounds computer. `ids` (when given) limits the work to those entities. */
 export type BoundsProvider = (ids?: Set<number>) => EntityScreenBounds[];
 
-const providers = new Set<BoundsProvider>();
+const providers = new Map<BoundsProvider, BoundsSurface | undefined>();
 
-/** A rendering layer registers its bounds computer (returns an unregister fn). */
-export function registerBoundsProvider(fn: BoundsProvider): () => void {
-  providers.add(fn);
+/** A rendering layer registers its bounds computer (returns an unregister fn). `surface` names the
+ *  on-screen surface it speaks for — pass it, and stamp the same value on the rects returned.
+ *
+ *  Recording it HERE as well as on each rect is what makes "which surfaces are mounted right now?"
+ *  answerable without projecting every entity in the scene. That question is load-bearing: a 2D/3D
+ *  entity aim REQUIRES a `surface` (`docs/enact.md`), so a caller that cannot see the mounted set
+ *  is reduced to guessing at the very thing the requirement exists to stop it guessing about. */
+export function registerBoundsProvider(fn: BoundsProvider, surface?: BoundsSurface): () => void {
+  providers.set(fn, surface);
   return () => { providers.delete(fn); };
+}
+
+/** Which on-screen surfaces currently have a bounds provider mounted, in registration order.
+ *  Cheap (no projection) — it reads the registry, not the scene. */
+export function mountedSurfaces(): BoundsSurface[] {
+  const out: BoundsSurface[] = [];
+  for (const s of providers.values()) if (s && !out.includes(s)) out.push(s);
+  return out;
 }
 
 /** Collect screen bounds from every registered layer. A provider that throws is
@@ -76,7 +114,7 @@ export function registerBoundsProvider(fn: BoundsProvider): () => void {
 export function collectScreenBounds(ids?: number[]): EntityScreenBounds[] {
   const set = ids && ids.length ? new Set(ids) : undefined;
   const out: EntityScreenBounds[] = [];
-  for (const p of providers) {
+  for (const p of providers.keys()) {
     try { out.push(...p(set)); } catch { /* skip a failing layer */ }
   }
   return out;

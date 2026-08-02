@@ -28,7 +28,7 @@ function esbuildOk(): boolean {
 }
 /** The real engine capacitor plugins (the ones vendorEnginePlugins packs). */
 function enginePluginDirs(): string[] {
-  let names: string[] = [];
+  let names: string[];
   try { names = fs.readdirSync(enginePkgs); } catch { return []; }
   return names
     .filter((n) => n.startsWith('capacitor-'))

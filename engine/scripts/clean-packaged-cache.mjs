@@ -15,6 +15,7 @@
  *    node engine/scripts/clean-packaged-cache.mjs                  # dry-run-safe subset (default = REAL delete, see flags)
  *    node engine/scripts/clean-packaged-cache.mjs --dry-run         # report only, delete nothing
  *    node engine/scripts/clean-packaged-cache.mjs --toolchain       # also wipe the provisioned JDK/Android SDK/toktx (multi-GB re-download)
+ *                                                                   # honours MODOKI_TOOLCHAIN_DIR — wipes the override AND the default
  *    node engine/scripts/clean-packaged-cache.mjs --force           # kill a running packaged instance first instead of aborting
  *    node engine/scripts/clean-packaged-cache.mjs --eject-volumes   # (macOS) eject stale mounted "<productName> *" DMG volumes
  */
@@ -84,7 +85,27 @@ function targets() {
     list.push({ p: path.join(os.homedir(), '.cache', NAME), reason: 'Chromium disk cache' });
   }
   if (INCLUDE_TOOLCHAIN) {
-    list.push({ p: path.join(support, SHARED_DIR, 'toolchain'), reason: 'provisioned JDK/Android SDK/toktx/msdf-atlas-gen — MULTI-GB RE-DOWNLOAD' });
+    // MODOKI_TOOLCHAIN_DIR OVERRIDES the default location, so wipe BOTH — the override is where the
+    // toolchain actually lives when it is set, and the default may still hold an older provision.
+    //
+    // Why both, and why this matters more than it looks: this script exists to set up a clean-install
+    // test. Reporting "[done] removed 3 path(s)" while the LIVE toolchain sits untouched somewhere
+    // else does not just fail to clean — it manufactures a test that silently proves nothing, because
+    // `ensureNode`/`ensureJdk` return early when their binaries are already present. Measured
+    // 2026-08-02 on the Windows clone: MODOKI_TOOLCHAIN_DIR pointed at E:\dev-cache\modoki-toolchain
+    // holding ~1.1GB across node/jdk/android-sdk/npm-tools, none of which this script touched.
+    const seen = new Set();
+    for (const dir of [process.env.MODOKI_TOOLCHAIN_DIR, path.join(support, SHARED_DIR, 'toolchain')]) {
+      if (!dir) continue;
+      const resolved = path.resolve(dir);
+      if (seen.has(resolved)) continue;         // the override may equal the default
+      seen.add(resolved);
+      list.push({
+        p: resolved,
+        reason: 'provisioned JDK/Android SDK/toktx/msdf-atlas-gen — MULTI-GB RE-DOWNLOAD'
+          + (resolved !== path.resolve(path.join(support, SHARED_DIR, 'toolchain')) ? ' [MODOKI_TOOLCHAIN_DIR]' : ''),
+      });
+    }
   }
   return list;
 }

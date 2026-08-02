@@ -331,7 +331,7 @@ describe('syncFog — integration with syncEnvironment + syncLights', () => {
 
     world.spawn(Fog({ enabled: true, mode: 'linear', near: 5, far: 50 }));
     world.spawn(Environment({ hdrPath: '' })); // no hdrPath: exercises the "active but unloaded" branch
-    world.spawn(Light({ lightType: 'ambient', color: 0x223344, intensity: 0.5, isActive: true }));
+    world.spawn(Light({ lightType: 'ambient', color: 0x223344, intensity: 0.5 }));
     const ecsLights = new Map<number, THREE.Light>();
 
     // Same order Scene3D.tsx/SceneView.tsx call these each frame.

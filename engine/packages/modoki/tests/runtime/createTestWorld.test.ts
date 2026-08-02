@@ -64,7 +64,8 @@ describe('createTestWorld', () => {
     game = createTestWorld({});
     game.step(7).step(3); // 10 fixed-dt frames total, across two calls
     let frame = 0, elapsed = 0;
-    game.query(Time).updateEach(([t]: [{ frame: number; elapsed: number }]) => { frame = t.frame; elapsed = t.elapsed; });
+    // game.world (not game.query — which erases trait types) gives updateEach a properly typed tuple.
+    game.world.query(Time).updateEach(([t]) => { frame = t.frame; elapsed = t.elapsed; });
     expect(frame).toBe(10);
     expect(elapsed).toBeCloseTo(10 / 60, 6);
   });

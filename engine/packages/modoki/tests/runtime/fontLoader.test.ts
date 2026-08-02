@@ -7,7 +7,7 @@ beforeEach(() => {
 });
 
 async function getLoader() {
-  return import('../../../src/runtime/loaders/fontLoader');
+  return import('../../src/runtime/loaders/fontLoader');
 }
 
 describe('fontLoader', () => {
@@ -186,6 +186,44 @@ describe('fontLoader', () => {
     function flush(source: string) {
       (resolvers[source] ?? []).forEach(r => r());
     }
+
+    describe('same-family (weight, style) collisions', () => {
+      /** `loadAllFonts` loads every `font` asset in the manifest — the ENGINE's bundled families and
+       *  the GAME's own. A game carrying its own copy of a bundled font (Court ships a byte-identical
+       *  Arimo) therefore collides by construction, and warning about it trained people to ignore a
+       *  warning that CAN matter: two DIFFERENT files normalizing to one family is a real ambiguity,
+       *  because which typeface you get depends on load order. Basename discriminates the two. */
+      async function loadBoth(a: string, b: string) {
+        installFontFaceMock();
+        const { loadFont } = await getLoader();
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+        const pa = loadFont(a); flush(`url("${a}")`); await pa;
+        const pb = loadFont(b); flush(`url("${b}")`); await pb;
+        const warnings = warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('already has'));
+        const logs = log.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('already has'));
+        warn.mockRestore(); log.mockRestore();
+        return { warnings, logs };
+      }
+
+      it('does NOT warn when the SAME font file is shipped under two paths', async () => {
+        const { warnings, logs } = await loadBoth(
+          '/modoki/assets/fonts/Arimo/Arimo-VariableFont_wght.ttf',
+          '/assets/fonts/Arimo-VariableFont_wght.ttf',
+        );
+        expect(warnings, 'a duplicate copy is expected, not a problem').toEqual([]);
+        expect(logs.length, 'but it is still reported, at log level').toBe(1);
+        expect(logs[0]).toContain('SAME font file');
+      });
+
+      it('warns for a different file at the same family/weight/style', async () => {
+        const { warnings, logs } = await loadBoth('/vendor/Roboto-Bold.ttf', '/game/Roboto-Bold.otf');
+        // Different basenames (extension differs) at identical CSS coordinates → real ambiguity.
+        expect(logs).toEqual([]);
+        expect(warnings.length).toBe(1);
+        expect(warnings[0]).toContain('DIFFERENT file');
+      });
+    });
 
     it('shares one underlying load for two concurrent calls of the same path (F7)', async () => {
       installFontFaceMock();

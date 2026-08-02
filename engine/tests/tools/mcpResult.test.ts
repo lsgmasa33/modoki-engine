@@ -18,6 +18,7 @@ import {
   capText,
   summarize,
   createFormatter,
+  errorDetailOf,
   MAX_PAYLOAD_CHARS,
 } from '../../tools/modoki-mcp/src/result';
 
@@ -187,17 +188,40 @@ describe('createFormatter — the identity banner outlives the cap', () => {
     expect(ok({ a: 1 }).content[0].text.startsWith(WARNING)).toBe(true);
   });
 
-  it('err(): flags isError and caps an unbounded backend body', () => {
-    const { err } = createFormatter(() => null);
-    const res = err(`backend 500: ${'x'.repeat(MAX_PAYLOAD_CHARS * 2)}`);
+  // These two used to exercise `err(msg)`, the free-text failure constructor. It is GONE (§5):
+  // nothing forced a call site to supply a code, a cause, or the options, so most supplied none of
+  // the three, and the same failure got reported four different ways. `fail` is now the only way to
+  // fail, which makes the convention enforced by the type checker instead of by a guard test.
+  it('fail(): flags isError and bounds an echoed backend body', () => {
+    const { fail } = createFormatter(() => null);
+    const res = fail({
+      code: 'REFUSED_BY_OP',
+      tool: 'modoki_mutate_scene',
+      what: 'set Transform.x on Capsule',
+      why: 'the route reported ok:false',
+      got: 'x'.repeat(MAX_PAYLOAD_CHARS * 2),
+    });
     expect(res.isError).toBe(true);
-    expect(res.content[0].text).toContain('chars elided of');
-    expect(res.content[0].text.length).toBeLessThan(MAX_PAYLOAD_CHARS + 200);
+    const env = JSON.parse(res.content[0].text) as { error: { code: string; got: string } };
+    // The whole envelope stays PARSEABLE and the code survives — the oversized `got` is what gets
+    // trimmed, never the fields the reader needs to act.
+    expect(env.error.code).toBe('REFUSED_BY_OP');
+    expect(env.error.got).toContain('chars elided of');
+    expect(res.content[0].text.length).toBeLessThan(MAX_PAYLOAD_CHARS);
   });
 
-  it('err(): banner survives a capped error body too', () => {
-    const { err } = createFormatter(() => WARNING);
-    const text = err('x'.repeat(MAX_PAYLOAD_CHARS * 2)).content[0].text;
+  it('fail(): banner survives, and precedes the envelope', () => {
+    const { fail } = createFormatter(() => WARNING);
+    const text = fail({ code: 'NOT_FOUND', what: 'find it', why: 'it is absent' }).content[0].text;
     expect(text.startsWith(WARNING)).toBe(true);
+  });
+
+  it('fail(): carries the detail on a symbol so the tool name can be stamped centrally', () => {
+    const { fail } = createFormatter(() => null);
+    const res = fail({ code: 'NOT_FOUND', what: 'find it', why: 'it is absent' });
+    expect(errorDetailOf(res)?.code).toBe('NOT_FOUND');
+    expect(errorDetailOf(res)?.tool).toBeUndefined();
+    // A symbol, so it can never leak onto the wire result and trip the SDK's schema validation.
+    expect(JSON.parse(JSON.stringify(res))).toEqual({ content: res.content, isError: true });
   });
 });

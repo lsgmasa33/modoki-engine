@@ -16,11 +16,11 @@ import { setRunMode } from '../../src/runtime/core/playState';
 function registerAll() {
   registerTrait({
     name: 'EntityAttributes', trait: EntityAttributes, category: 'component',
-    fields: { name: {}, isActive: {}, sortOrder: {}, parentId: { entityId: { onMissing: 'root' } }, layer: {}, guid: {}, sourceScene: { hidden: true, runtimeOnly: true } },
+    fields: { name: { type: 'string' }, isActive: { type: 'boolean' }, sortOrder: { type: 'number' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, layer: { type: 'enum' }, guid: { type: 'string' }, sourceScene: { type: 'string', hidden: true, runtimeOnly: true } },
   });
   registerTrait({
     name: 'Transform', trait: Transform, category: 'component',
-    fields: { x: {}, y: {}, z: {}, rx: {}, ry: {}, rz: {}, sx: {}, sy: {}, sz: {} },
+    fields: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' }, rx: { type: 'number' }, ry: { type: 'number' }, rz: { type: 'number' }, sx: { type: 'number' }, sy: { type: 'number' }, sz: { type: 'number' } },
   });
 }
 
@@ -87,7 +87,7 @@ describe('serializeScene({ scene }) — target a named base (Phase 12, M1)', () 
   it('a targeted base containing a prefab instance now SERIALIZES (A8+A9 fixed; the Phase 12 guard is gone)', async () => {
     registerTrait({
       name: 'PrefabInstance', trait: PrefabInstance, category: 'component',
-      fields: { source: {}, localId: {}, rootInstanceId: { entityId: { onMissing: 'stripTrait' } }, parentLocalId: {} },
+      fields: { source: { type: 'string' }, localId: { type: 'number' }, rootInstanceId: { type: 'number', entityId: { onMissing: 'stripTrait' } }, parentLocalId: { type: 'number' } },
     });
     const ent = spawn(
       EntityAttributes({ name: 'FishLike', guid: 'g-fish', sourceScene: 'base-guid-1' }),
@@ -109,7 +109,7 @@ describe('serializeScene({ scene }) — target a named base (Phase 12, M1)', () 
   it('a captured prefab root writes rootInstanceId as its OWN guid, not the raw ecs id', async () => {
     registerTrait({
       name: 'PrefabInstance', trait: PrefabInstance, category: 'component',
-      fields: { source: {}, localId: {}, rootInstanceId: { entityId: { onMissing: 'stripTrait' } }, parentLocalId: {} },
+      fields: { source: { type: 'string' }, localId: { type: 'number' }, rootInstanceId: { type: 'number', entityId: { onMissing: 'stripTrait' } }, parentLocalId: { type: 'number' } },
     });
     const ent = spawn(
       EntityAttributes({ name: 'FishLike', guid: 'g-fish-root', sourceScene: 'base-guid-1' }),
@@ -127,7 +127,7 @@ describe('serializeScene({ scene }) — target a named base (Phase 12, M1)', () 
   it('the default (no opts.scene) path is UNAFFECTED by the guard — a primary with a prefab instance still saves', async () => {
     registerTrait({
       name: 'PrefabInstance', trait: PrefabInstance, category: 'component',
-      fields: { source: {}, localId: {}, rootInstanceId: { entityId: { onMissing: 'stripTrait' } }, parentLocalId: {} },
+      fields: { source: { type: 'string' }, localId: { type: 'number' }, rootInstanceId: { type: 'number', entityId: { onMissing: 'stripTrait' } }, parentLocalId: { type: 'number' } },
     });
     const ent = spawn(
       EntityAttributes({ name: 'FishLike', guid: 'g-fish', sourceScene: '' }),

@@ -218,6 +218,32 @@ describe('applyOps — addEntity', () => {
     expect(applyOps(freshScene(), [{ op: 'addEntity', name: 'B', parentId: 'g-root' }], mint).warnings).toEqual([]);
   });
 
+  it('reports what it CREATED — {op, id, guid, name} per addEntity (S3.12)', () => {
+    // `changed:N` was the whole answer, so an agent had to re-find its own new entity by name —
+    // which this surface refuses outright when the name is ambiguous, dead-ending "create then
+    // edit" on step two. The sibling create-entity op has returned {id, name, guid} since C7.
+    const scene = freshScene();
+    const res = applyOps(scene, [
+      { op: 'setTrait', entity: { name: 'Child' }, trait: 'Transform', fields: { x: 1 } },
+      { op: 'addEntity', name: 'Box', parentId: 1 },
+      { op: 'addEntity', name: 'Ball', parentId: 1 },
+    ], mint);
+    expect(res.created).toEqual([
+      { op: 1, id: 3, guid: 'guid-1', name: 'Box' },
+      { op: 2, id: 4, guid: 'guid-2', name: 'Ball' },
+    ]);
+  });
+
+  it('omits `created` entirely when no entity was added (not an empty array)', () => {
+    const res = applyOps(freshScene(), [{ op: 'setTrait', entity: { name: 'Child' }, trait: 'Transform', fields: { x: 1 } }], mint);
+    expect(res.created).toBeUndefined();
+  });
+
+  it('the reported guid is the CALLER-SUPPLIED one when there is one', () => {
+    const res = applyOps(freshScene(), [{ op: 'addEntity', name: 'New', traits: { EntityAttributes: { guid: 'preset' } } }], mint);
+    expect(res.created?.[0].guid).toBe('preset');
+  });
+
   it('does NOT warn for a parent created by an earlier op in the same batch', () => {
     const res = applyOps(freshScene(), [
       { op: 'addEntity', name: 'P', traits: { EntityAttributes: { guid: 'g-new-parent' } } },
@@ -327,7 +353,7 @@ describe('applyOps + validateSceneData — integration round-trip', () => {
     traits: {
       Transform: { category: 'component', fields: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } } },
       Renderable3D: { category: 'component', fields: { mesh: { type: 'string' } } },
-      EntityAttributes: { category: 'component', fields: { name: { type: 'string' }, guid: { type: 'string' }, parentId: { type: 'number', entityId: { onMissing: 'root' } } } },
+      EntityAttributes: { category: 'component', fields: { name: { type: 'string' }, guid: { type: 'string' }, parentId: { type: 'number' } } },
     },
   };
 
@@ -553,5 +579,61 @@ describe('stripBackfilledEntityIds (write-path fix for the assignSyntheticEntity
     expect(() => stripBackfilledEntityIds(scene, backfilled)).not.toThrow();
     expect(scene.entities).toHaveLength(1);
     expect(scene.entities[0].id).toBeUndefined();
+  });
+});
+
+describe("setTrait {space:'world'} — authoring in world coordinates (file path)", () => {
+  /** A parent at (200,247) with a child whose LOCAL is (623,679) — i.e. world (823,926). The exact
+   *  shape measured live when `set_transform`'s `position` was documented as "World" and wrote
+   *  LOCAL: asking for the child's own current world position displaced it by the parent offset. */
+  const parented = (): MutableScene => ({
+    entities: [
+      { id: 1, name: 'Parent', traits: { Transform: { x: 200, y: 247, z: 0 }, EntityAttributes: { parentId: 0 } } },
+      { id: 2, name: 'Child', traits: { Transform: { x: 623, y: 679, z: 0 }, EntityAttributes: { parentId: 1 } } },
+    ],
+  });
+  const tf = (s: MutableScene, id: number) => s.entities.find((e) => e.id === id)!.traits.Transform as Record<string, number>;
+
+  it("writing the child's OWN world position is a NO-OP (the bug, inverted)", () => {
+    const scene = parented();
+    const r = applyOps(scene, [{ op: 'setTrait', entity: { id: 2 }, trait: 'Transform', space: 'world', fields: { x: 823, y: 926 } }]);
+    expect(r.errors).toEqual([]);
+    expect(tf(scene, 2).x).toBeCloseTo(623, 6);
+    expect(tf(scene, 2).y).toBeCloseTo(679, 6);
+  });
+
+  it("without `space` the fields are written VERBATIM — the low-level op's literal contract", () => {
+    const scene = parented();
+    applyOps(scene, [{ op: 'setTrait', entity: { id: 2 }, trait: 'Transform', fields: { x: 823 } }]);
+    expect(tf(scene, 2).x).toBe(823); // local, unconverted — and now at world 1023
+  });
+
+  it("space:'world' places the child at the world point asked for", () => {
+    const scene = parented();
+    applyOps(scene, [{ op: 'setTrait', entity: { id: 2 }, trait: 'Transform', space: 'world', fields: { x: 0, y: 0 } }]);
+    expect(tf(scene, 2).x).toBeCloseTo(-200, 6);
+    expect(tf(scene, 2).y).toBeCloseTo(-247, 6);
+  });
+
+  it('a PARTIAL world write leaves the unnamed axes alone', () => {
+    const scene = parented();
+    applyOps(scene, [{ op: 'setTrait', entity: { id: 2 }, trait: 'Transform', space: 'world', fields: { x: 1000 } }]);
+    expect(tf(scene, 2).x).toBeCloseTo(800, 6);
+    expect(tf(scene, 2).y).toBe(679); // untouched, exactly — no decompose noise
+  });
+
+  it('is an exact no-op for a ROOT entity (world == local)', () => {
+    const scene: MutableScene = { entities: [{ id: 1, traits: { Transform: { x: 5, y: 6 }, EntityAttributes: { parentId: 0 } } }] };
+    applyOps(scene, [{ op: 'setTrait', entity: { id: 1 }, trait: 'Transform', space: 'world', fields: { x: 42 } }]);
+    expect(tf(scene, 1)).toEqual({ x: 42, y: 6 }); // untouched keys stay byte-identical
+  });
+
+  it("REFUSES `space` on a non-Transform trait rather than ignoring it", () => {
+    // Never silently accept a parameter that does nothing — it implies a conversion that
+    // never happened.
+    const scene = parented();
+    const r = applyOps(scene, [{ op: 'setTrait', entity: { id: 2 }, trait: 'EntityAttributes', space: 'world', fields: { name: 'x' } }]);
+    expect(r.errors.join(' ')).toMatch(/'space' applies only to trait 'Transform'/);
+    expect(r.changed).toBe(0);
   });
 });

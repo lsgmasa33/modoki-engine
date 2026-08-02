@@ -232,7 +232,7 @@ export async function convertTexture(opts: ConvertOptions): Promise<ConvertResul
             execFileSync(cli, buildToktxArgs(v as KtxVariant, settings, tmpPng, tmpOut), { stdio: 'pipe' });
           } catch (e) {
             const stderr = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
-            throw new Error(`toktx failed for ${sourceUrlPath} (${v}): ${stderr}`);
+            throw new Error(`toktx failed for ${sourceUrlPath} (${v}): ${stderr}`, { cause: e });
           }
         }
         fs.renameSync(tmpOut, outPath); // atomic within the cache dir

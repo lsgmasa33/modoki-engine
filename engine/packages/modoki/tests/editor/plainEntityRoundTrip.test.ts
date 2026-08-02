@@ -33,19 +33,19 @@ const Frozen = trait();
 function registerAll() {
   registerTrait({
     name: 'EntityAttributes', trait: EntityAttributes, category: 'component',
-    fields: { name: {}, isActive: {}, sortOrder: {}, parentId: { entityId: { onMissing: 'root' } }, layer: {}, guid: {} },
+    fields: { name: { type: 'string' }, isActive: { type: 'boolean' }, sortOrder: { type: 'number' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, layer: { type: 'enum', options: ['', '3d', '2d', 'ui'] }, guid: { type: 'string' } },
   });
   registerTrait({
     name: 'Transform', trait: Transform, category: 'component',
-    fields: { x: {}, y: {}, z: {}, rx: {}, ry: {}, rz: {}, sx: {}, sy: {}, sz: {} },
+    fields: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' }, rx: { type: 'number' }, ry: { type: 'number' }, rz: { type: 'number' }, sx: { type: 'number' }, sy: { type: 'number' }, sz: { type: 'number' } },
   });
   registerTrait({
     name: 'Health', trait: Health, category: 'component',
-    fields: { hp: {}, max: {}, regen: {}, label: {}, alive: {}, tint: { type: 'color' } },
+    fields: { hp: { type: 'number' }, max: { type: 'number' }, regen: { type: 'number' }, label: { type: 'string' }, alive: { type: 'boolean' }, tint: { type: 'color' } },
   });
   registerTrait({
     name: 'Mover', trait: Mover, category: 'component',
-    fields: { speed: {}, _accum: { runtimeOnly: true } },
+    fields: { speed: { type: 'number' }, _accum: { type: 'number', runtimeOnly: true } },
   });
   registerTrait({ name: 'Frozen', trait: Frozen, category: 'tag', fields: {} });
 }

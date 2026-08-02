@@ -2,6 +2,7 @@
  *  syncMaterial (indirectly via syncRenderables), resolveInlineTextureMaterial. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { SkinnedEntry } from '../../src/runtime/rendering/scene3DSync';
 
 beforeEach(() => {
   vi.resetModules();
@@ -63,8 +64,8 @@ const rendererMock = vi.hoisted(() => {
       this.forceWebGL = !!opts?.forceWebGL;
       state.instances.push(this);
     }
-    setPixelRatio() {}
-    setSize() {}
+    setPixelRatio = vi.fn();
+    setSize = vi.fn();
     set toneMapping(_v: unknown) {}
     init = vi.fn(() => state.initFor(this.forceWebGL));
   }
@@ -382,6 +383,99 @@ describe('scene3DSync', () => {
       expect(instances).toHaveLength(1); // no second attempt
       expect(instances[0].forceWebGL).toBe(true);
     });
+
+    /** #56: the FIRST buffer must already honour `max`. The clamp used to live only in
+     *  Scene3D's ResizeObserver, so a `max`-mode game allocated one full-resolution
+     *  drawing buffer at mount — precisely the allocation the mode exists to avoid, and
+     *  the transient peak is what matters on a memory-tight device. The clamp is opt-in
+     *  because makeWebGPURenderer is shared with the editor's own viewports. */
+    describe('sizeMode `max` clamps the FIRST buffer (#56)', () => {
+      /** 393×852 CSS @ DPR 2 = 786×1704 device px; `max` 1280×720 → the 720 height
+       *  binds, scale 720/1704, so the ratio lands at 2 × that. */
+      async function makeWith(
+        opts: Parameters<typeof import('../../src/runtime/rendering/scene3DSync').makeWebGPURenderer>[1],
+        web: { sizeMode: 'free' | 'fixed' | 'max'; width: number; height: number },
+        dpr = 2,
+      ) {
+        vi.doMock('../../src/runtime/rendering/gpuDetect', () => ({ getWebGPUSupported: async () => true }));
+        mockSceneSyncDeps();
+        vi.stubGlobal('window', { devicePixelRatio: dpr });
+        const { setRenderSettings, resetRenderSettings } =
+          await import('../../src/runtime/rendering/renderSettings');
+        resetRenderSettings();
+        setRenderSettings({ web });
+        const { makeWebGPURenderer } = await import('../../src/runtime/rendering/scene3DSync');
+        const container: any = { clientWidth: 393, clientHeight: 852, appendChild: vi.fn() };
+        const r: any = await makeWebGPURenderer(container, opts);
+        resetRenderSettings();
+        return r;
+      }
+
+      it('applies the `max` ratio clamp at CREATION when opted in', async () => {
+        const r = await makeWith({ applyWebSizeMode: true }, { sizeMode: 'max', width: 1280, height: 720 });
+        const ratio = r.setPixelRatio.mock.calls[0][0];
+        // ≈, not =: clampBufferSize rounds the buffer to whole pixels before the
+        // ratio is derived back out of it.
+        expect(ratio).toBeCloseTo(2 * (720 / 1704), 3);
+        // The clamp rides the RATIO, never the CSS size handed to setSize — three
+        // re-multiplies that by the ratio, which is why `max` was a no-op before #38.
+        expect(r.setSize).toHaveBeenCalledWith(393, 852);
+        // …and the buffer three will allocate is inside the cap, on both axes.
+        expect(393 * ratio).toBeLessThanOrEqual(1280);
+        expect(Math.round(852 * ratio)).toBeLessThanOrEqual(720);
+      });
+
+      /** The creation-time clamp and Scene3D's ResizeObserver must agree EXACTLY for the
+       *  same container, or the observer's first fire would resize the buffer a frame after
+       *  mount — trading the allocation spike this fixed for a pointless reallocation. */
+      it('lands on the identical ratio Scene3D\'s resize path computes, so the first observer fire is a no-op', async () => {
+        const r = await makeWith({ applyWebSizeMode: true }, { sizeMode: 'max', width: 1280, height: 720 });
+        const { clampPixelRatio } = await import('../../src/runtime/rendering/webCanvasSizing');
+        // Scene3D recomputes basePR as min(devicePixelRatio, three.pixelRatioCap) = min(2, 2).
+        expect(r.setPixelRatio.mock.calls[0][0])
+          .toBe(clampPixelRatio(393, 852, 2, { sizeMode: 'max', width: 1280, height: 720 }));
+      });
+
+      it('leaves the editor surfaces unclamped — the opt-in defaults to off', async () => {
+        const r = await makeWith(undefined, { sizeMode: 'max', width: 1280, height: 720 });
+        expect(r.setPixelRatio).toHaveBeenCalledWith(2); // min(DPR, pixelRatioCap)
+      });
+
+      /** The ratio the clamp scales DOWN from must be the capped one, exactly as Scene3D's
+       *  resize path recomputes it. Asserted at DPR 3 against the default cap of 2 — at
+       *  DPR 2 the `min` is invisible, so dropping the cap would go unnoticed. */
+      it('clamps down from the CAPPED base ratio, not raw devicePixelRatio', async () => {
+        const free = await makeWith({ applyWebSizeMode: true }, { sizeMode: 'free', width: 1280, height: 720 }, 3);
+        expect(free.setPixelRatio).toHaveBeenCalledWith(2); // capped, not 3
+
+        const { clampPixelRatio } = await import('../../src/runtime/rendering/webCanvasSizing');
+        const web = { sizeMode: 'max' as const, width: 1280, height: 720 };
+        const max = await makeWith({ applyWebSizeMode: true }, web, 3);
+        expect(max.setPixelRatio.mock.calls[0][0]).toBe(clampPixelRatio(393, 852, 2, web));
+      });
+
+      it('is a no-op for free/fixed even when opted in', async () => {
+        for (const sizeMode of ['free', 'fixed'] as const) {
+          const r = await makeWith({ applyWebSizeMode: true }, { sizeMode, width: 1280, height: 720 });
+          expect(r.setPixelRatio).toHaveBeenCalledWith(2);
+        }
+      });
+
+      it('createRenderer — the game/GameView 3D surface — opts in', async () => {
+        vi.doMock('../../src/runtime/rendering/gpuDetect', () => ({ getWebGPUSupported: async () => true }));
+        mockSceneSyncDeps();
+        vi.stubGlobal('window', { devicePixelRatio: 2 });
+        const { setRenderSettings, resetRenderSettings } =
+          await import('../../src/runtime/rendering/renderSettings');
+        resetRenderSettings();
+        setRenderSettings({ web: { sizeMode: 'max', width: 1280, height: 720 } });
+        const { createRenderer } = await import('../../src/runtime/rendering/scene3DSync');
+        const container: any = { clientWidth: 393, clientHeight: 852, appendChild: vi.fn() };
+        const r: any = await createRenderer(container);
+        expect(r.setPixelRatio.mock.calls[0][0]).toBeLessThan(2);
+        resetRenderSettings();
+      });
+    });
   });
 
   // ── Skeletal: per-clone skeleton disposal (A1) ──────────────
@@ -432,10 +526,12 @@ describe('scene3DSync', () => {
         enabled: false, paused: false, timeScale: 1, clampWhenFinished: false,
       };
     }
-    function entryWith(clips: string[]) {
+    // fakeAction() is a partial THREE.AnimationAction stand-in (only the members
+    // driveAnimator actually calls) — cast through unknown to SkinnedEntry deliberately.
+    function entryWith(clips: string[]): SkinnedEntry {
       const actions = new Map<string, ReturnType<typeof fakeAction>>();
       for (const c of clips) actions.set(c, fakeAction());
-      return { modelRef: 'm.glb', root: {} as any, mixer: {} as any, actions, firstClip: clips[0] ?? '', bones: new Map(), nodes: new Map() };
+      return { modelRef: 'm.glb', root: {} as any, mixer: {} as any, actions, firstClip: clips[0] ?? '', bones: new Map(), nodes: new Map() } as unknown as SkinnedEntry;
     }
     const anim = (clip: string, over: Partial<{ animSet: string; playing: boolean; speed: number; loop: boolean; fadeDuration: number }> = {}) =>
       ({ animSet: '', clip, playing: true, speed: 1, loop: true, fadeDuration: 0, ...over });
@@ -595,7 +691,7 @@ describe('scene3DSync', () => {
       expect(effectiveLibrary({ animSets: ['lib'], retarget: true, boneMaps: { lib: { a: 'b' } } }, 'setA'))
         .toEqual({ animSets: ['lib', 'setA'], retarget: true, boneMaps: { lib: { a: 'b' } } });
       // Already present → no duplicate (animset on BOTH library + animator).
-      expect(effectiveLibrary({ animSets: ['setA'] }, 'setA').animSets).toEqual(['setA']);
+      expect(effectiveLibrary({ animSets: ['setA'] }, 'setA')!.animSets).toEqual(['setA']);
       // No animSet → returns the library unchanged (identical legacy behaviour).
       const lib = { animSets: ['lib'] };
       expect(effectiveLibrary(lib, undefined)).toBe(lib);

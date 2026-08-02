@@ -9,6 +9,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   lastSceneKey,
   resolveSceneCandidates,
+  resolveBootSceneOverride,
   canonicalBootScenePath,
   loadFirstScene,
   awaitRendererReady,
@@ -44,6 +45,78 @@ describe('resolveSceneCandidates (fallback order)', () => {
   });
   it('returns an empty list when neither is set (→ initWorld/empty-camera path)', () => {
     expect(resolveSceneCandidates(null, undefined)).toEqual([]);
+  });
+});
+
+describe('resolveBootSceneOverride (issue #43 — --scene / MODOKI_SCENE launch override)', () => {
+  const SCENES = ['/assets/scenes/Level-0001.json', '/assets/scenes/Level-0002.json', '/assets/scenes/main.json'];
+
+  it('returns a path candidate verbatim, no lookup (contains a slash)', () => {
+    expect(resolveBootSceneOverride('/assets/scenes/Level-0002.json', SCENES)).toBe('/assets/scenes/Level-0002.json');
+    // Not even present in the list — still passed through untouched.
+    expect(resolveBootSceneOverride('/assets/scenes/not-in-manifest.json', SCENES)).toBe('/assets/scenes/not-in-manifest.json');
+  });
+
+  it('returns a bare filename verbatim, no lookup (ends in .json)', () => {
+    expect(resolveBootSceneOverride('Level-0002.json', SCENES)).toBe('Level-0002.json');
+  });
+
+  it('matches a bare name case-insensitively against the scene list', () => {
+    expect(resolveBootSceneOverride('level-0002', SCENES)).toBe('/assets/scenes/Level-0002.json');
+    expect(resolveBootSceneOverride('LEVEL-0002', SCENES)).toBe('/assets/scenes/Level-0002.json');
+    expect(resolveBootSceneOverride('main', SCENES)).toBe('/assets/scenes/main.json');
+  });
+
+  it('falls through to null when the name matches nothing (typo)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(resolveBootSceneOverride('Level-9999', SCENES)).toBeNull();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("'Level-9999' matched no scene"));
+    warn.mockRestore();
+  });
+
+  it('refuses to guess on an ambiguous name (>1 match) rather than first-matching', () => {
+    const dupes = ['/assets/scenes/foo.json', '/other-root/scenes/foo.json'];
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(resolveBootSceneOverride('foo', dupes)).toBeNull();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("'foo' is ambiguous"));
+    warn.mockRestore();
+  });
+
+  it('returns null for a null/empty/undefined override (no warning — nothing was asked for)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(resolveBootSceneOverride(null, SCENES)).toBeNull();
+    expect(resolveBootSceneOverride(undefined, SCENES)).toBeNull();
+    expect(resolveBootSceneOverride('', SCENES)).toBeNull();
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('precedence: the resolved override goes in FRONT of the normal candidates, which stay behind it', () => {
+    // Ordering is asserted through resolveSceneCandidates — the production function that
+    // decides it — so this cannot pass while the real boot order drifts.
+    const resolved = resolveBootSceneOverride('level-0002', SCENES);
+    expect(resolveSceneCandidates('/assets/scenes/last-opened.json', '/assets/scenes/config-default.json', resolved)).toEqual([
+      '/assets/scenes/Level-0002.json',
+      '/assets/scenes/last-opened.json',
+      '/assets/scenes/config-default.json',
+    ]);
+  });
+
+  it('an override that FAILED to resolve leaves the normal candidate order untouched', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const resolved = resolveBootSceneOverride('Level-9999', SCENES); // null — typo
+    expect(resolveSceneCandidates('/assets/scenes/last-opened.json', '/assets/scenes/config-default.json', resolved)).toEqual([
+      '/assets/scenes/last-opened.json',
+      '/assets/scenes/config-default.json',
+    ]);
+    warn.mockRestore();
+  });
+
+  it('an override EQUAL to the remembered scene collapses rather than duplicating', () => {
+    expect(resolveSceneCandidates('/assets/scenes/main.json', '/assets/scenes/config-default.json', '/assets/scenes/main.json')).toEqual([
+      '/assets/scenes/main.json',
+      '/assets/scenes/config-default.json',
+    ]);
   });
 });
 
@@ -302,6 +375,191 @@ describe('awaitRendererReady', () => {
     cbs.get(120_000)!(); // hard deadline elapses — THIS rejects
     await expect(p).rejects.toThrow(/rendererReady did not resolve within 120000ms/);
     expect(clearT).toHaveBeenCalledTimes(2); // both handles cleared, no dangling timer
+  });
+
+  it('a definitive init FAILURE rejects immediately, without burning the cold-start budget', async () => {
+    // The wedge this closes: renderer creation threw at ~1.5s, but nothing could distinguish
+    // "failed" from "still warming up", so the editor sat blank for the full 120s before
+    // saying anything. A failure signal must short-circuit the budget outright.
+    const setT = vi.fn((_cb: () => void, delay: number) => delay as unknown as ReturnType<typeof setTimeout>);
+    const clearT = vi.fn();
+    const failed = Promise.resolve(new Error('WebGPU adapter unavailable'));
+
+    const p = awaitRendererReady(
+      new Promise(() => {}), // never ready
+      120_000,
+      { setTimeout: setT as never, clearTimeout: clearT as never },
+      { failed, progress: () => 'creating renderer (attempt 4)' },
+    );
+
+    // Rejects on the FAILURE, not the timeout — and carries the real cause, not a guess.
+    await expect(p).rejects.toThrow(/renderer init FAILED/);
+    await expect(p).rejects.toThrow(/WebGPU adapter unavailable/);
+    // No timer was left pending; the hard deadline never got a chance to fire.
+    expect(clearT).toHaveBeenCalledTimes(2);
+  });
+
+  it('a pending failure promise does not disturb the happy path', async () => {
+    const setT = vi.fn((_cb: () => void, delay: number) => delay as unknown as ReturnType<typeof setTimeout>);
+    const clearT = vi.fn();
+    await awaitRendererReady(
+      Promise.resolve(), 120_000,
+      { setTimeout: setT as never, clearTimeout: clearT as never },
+      { failed: new Promise<Error>(() => {}) }, // never fails — the normal case
+    );
+    expect(clearT).toHaveBeenCalledTimes(2);
+  });
+
+  it('the timeout message reports measured progress instead of asserting a cause', async () => {
+    const cbs = new Map<number, () => void>();
+    const setT = vi.fn((cb: () => void, delay: number) => { cbs.set(delay, cb); return delay as unknown as ReturnType<typeof setTimeout>; });
+    const clearT = vi.fn();
+    const p = awaitRendererReady(
+      new Promise(() => {}), 120_000,
+      { setTimeout: setT as never, clearTimeout: clearT as never },
+      { softTimeoutMs: 15_000, onSoftTimeout: () => {}, progress: () => 'viewport effect never entered' },
+    );
+    cbs.get(120_000)!();
+    // The old text claimed "SceneView never called setActiveRenderer" and pointed at a console
+    // level the failure was never logged at. Facts only now.
+    await expect(p).rejects.toThrow(/Last renderer bring-up progress: viewport effect never entered/);
+    await expect(p).rejects.not.toThrow(/Check the browser console/);
+  });
+
+  it('fails FAST when no viewport ever began renderer creation', async () => {
+    // "Nothing started" and "renderer is slow" used to be indistinguishable, so the
+    // never-started case waited out the full 120s cold-start budget for no reason.
+    const cbs = new Map<number, () => void>();
+    const setT = vi.fn((cb: () => void, delay: number) => { cbs.set(delay, cb); return delay as unknown as ReturnType<typeof setTimeout>; });
+    const clearT = vi.fn();
+    const p = awaitRendererReady(
+      new Promise(() => {}), 120_000,
+      { setTimeout: setT as never, clearTimeout: clearT as never },
+      { hasViewportBegun: () => false, noViewportMs: 12_000 },
+    );
+    cbs.get(12_000)!(); // the SHORT deadline, not the 120s one
+    await expect(p).rejects.toThrow(/no 3D viewport began renderer creation within 12000ms/);
+    await expect(p).rejects.toThrow(/NOT a slow cold start/);
+    // The scene-load gate this message used to guard was removed (docs/editor.md,
+    // `createEditor()`) — the scene loads regardless of a viewport, so the message must no
+    // longer claim otherwise.
+    await expect(p).rejects.not.toThrow(/no scene can load/);
+    await expect(p).rejects.not.toThrow(/scene could load/);
+  });
+
+  it('suppresses the no-viewport rejection entirely when shouldWarnNoViewport() returns false', async () => {
+    // A 2D/UI-only project (resolved `build.modules.render3d === false`) should never see "no
+    // 3D viewport" — it's noise, not diagnosis (Phase 2.5). Suppressing must not reject with a
+    // DIFFERENT message either — the promise should simply never settle via this branch.
+    const cbs = new Map<number, () => void>();
+    const setT = vi.fn((cb: () => void, delay: number) => { cbs.set(delay, cb); return delay as unknown as ReturnType<typeof setTimeout>; });
+    const clearT = vi.fn();
+    let resolveReady: () => void = () => {};
+    const ready = new Promise<void>((r) => { resolveReady = r; });
+    const p = awaitRendererReady(
+      ready, 120_000,
+      { setTimeout: setT as never, clearTimeout: clearT as never },
+      { hasViewportBegun: () => false, noViewportMs: 12_000, shouldWarnNoViewport: () => false },
+    );
+    cbs.get(12_000)!(); // fires, but suppressed — must not reject
+    resolveReady();     // settle via the `ready` branch instead
+    await expect(p).resolves.toBeUndefined();
+  });
+
+  it('still fires the no-viewport rejection when shouldWarnNoViewport() returns true', async () => {
+    const cbs = new Map<number, () => void>();
+    const setT = vi.fn((cb: () => void, delay: number) => { cbs.set(delay, cb); return delay as unknown as ReturnType<typeof setTimeout>; });
+    const clearT = vi.fn();
+    const p = awaitRendererReady(
+      new Promise(() => {}), 120_000,
+      { setTimeout: setT as never, clearTimeout: clearT as never },
+      { hasViewportBegun: () => false, noViewportMs: 12_000, shouldWarnNoViewport: () => true },
+    );
+    cbs.get(12_000)!();
+    await expect(p).rejects.toThrow(/no 3D viewport began renderer creation within 12000ms/);
+  });
+
+  it('warns by default (fail-open) when shouldWarnNoViewport is omitted — the old behaviour', async () => {
+    const cbs = new Map<number, () => void>();
+    const setT = vi.fn((cb: () => void, delay: number) => { cbs.set(delay, cb); return delay as unknown as ReturnType<typeof setTimeout>; });
+    const clearT = vi.fn();
+    const p = awaitRendererReady(
+      new Promise(() => {}), 120_000,
+      { setTimeout: setT as never, clearTimeout: clearT as never },
+      { hasViewportBegun: () => false, noViewportMs: 12_000 },
+    );
+    cbs.get(12_000)!();
+    await expect(p).rejects.toThrow(/no 3D viewport began renderer creation/);
+  });
+
+  it('suppression also silences the SOFT (15s) nudge when no viewport is expected', async () => {
+    // Observed live on a render3d:false project (games/court): the 12s message was correctly
+    // suppressed, but the DEFAULT onSoftTimeout still fired at 15s — a real gap, since the
+    // owner's ask was "no warnings at all" for a 2D-only project, not "just the 12s one".
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const cbs = new Map<number, () => void>();
+    const setT = vi.fn((cb: () => void, delay: number) => { cbs.set(delay, cb); return delay as unknown as ReturnType<typeof setTimeout>; });
+    const clearT = vi.fn();
+    const p = awaitRendererReady(
+      new Promise(() => {}), 120_000,
+      { setTimeout: setT as never, clearTimeout: clearT as never },
+      { softTimeoutMs: 15_000, hasViewportBegun: () => false, shouldWarnNoViewport: () => false },
+    );
+    cbs.get(15_000)!(); // the soft deadline fires, but must stay silent
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+    void p; // never settles via any branch in this test — deliberately left pending
+  });
+
+  it('suppression also silences the HARD (120s) cap when no viewport is expected', async () => {
+    const cbs = new Map<number, () => void>();
+    const setT = vi.fn((cb: () => void, delay: number) => { cbs.set(delay, cb); return delay as unknown as ReturnType<typeof setTimeout>; });
+    const clearT = vi.fn();
+    let resolveReady: () => void = () => {};
+    const ready = new Promise<void>((r) => { resolveReady = r; });
+    const p = awaitRendererReady(
+      ready, 120_000,
+      { setTimeout: setT as never, clearTimeout: clearT as never },
+      { hasViewportBegun: () => false, shouldWarnNoViewport: () => false },
+    );
+    cbs.get(120_000)!(); // the hard cap fires, but must not reject
+    resolveReady();      // settle via the `ready` branch instead, proving nothing rejected first
+    await expect(p).resolves.toBeUndefined();
+  });
+
+  it('suppression LIFTS once a viewport begins — soft/hard reporting resumes for that attempt', async () => {
+    // Per the owner's decision: a viewport that DOES start (e.g. the user opens a Scene panel
+    // on a 2D project anyway) makes renderer health relevant again.
+    let viewportBegan = false;
+    const cbs = new Map<number, () => void>();
+    const setT = vi.fn((cb: () => void, delay: number) => { cbs.set(delay, cb); return delay as unknown as ReturnType<typeof setTimeout>; });
+    const clearT = vi.fn();
+    const p = awaitRendererReady(
+      new Promise(() => {}), 120_000,
+      { setTimeout: setT as never, clearTimeout: clearT as never },
+      { hasViewportBegun: () => viewportBegan, shouldWarnNoViewport: () => false },
+    );
+    viewportBegan = true; // a viewport started AFTER boot, before the hard cap fires
+    cbs.get(120_000)!();
+    await expect(p).rejects.toThrow(/rendererReady did not resolve within 120000ms/);
+  });
+
+  it('does NOT fail fast when bring-up is genuinely underway — the long budget still applies', async () => {
+    // The whole point of splitting the budgets: a slow-but-progressing cold start must keep
+    // its generous allowance. Firing the short deadline here would re-break the original bug.
+    const cbs = new Map<number, () => void>();
+    const setT = vi.fn((cb: () => void, delay: number) => { cbs.set(delay, cb); return delay as unknown as ReturnType<typeof setTimeout>; });
+    const clearT = vi.fn();
+    let resolveReady: () => void = () => {};
+    const ready = new Promise<void>((r) => { resolveReady = r; });
+    const p = awaitRendererReady(
+      ready, 120_000,
+      { setTimeout: setT as never, clearTimeout: clearT as never },
+      { hasViewportBegun: () => true, noViewportMs: 12_000 },
+    );
+    cbs.get(12_000)!();   // elapses, but a viewport IS working — must NOT reject
+    resolveReady();       // the slow cold start eventually finishes
+    await expect(p).resolves.toBeUndefined();
   });
 
   it('the SOFT warning fires but a slow cold start still RECOVERS (does not abort the scene load)', async () => {

@@ -363,29 +363,57 @@ describe('resolvePixiBackend', () => {
 
   it("honors an explicit 'webgpu' setting without consulting detection", async () => {
     const { pool, rs, getWebGPUSupported } = await setup(false); // detection would say webgl — must be ignored
-    rs.setRenderSettings({ pixi: { backend: 'webgpu', antialias: true, resolution: 0 } });
+    rs.setRenderSettings({ pixi: { backend: 'webgpu', antialias: true, resolution: 0, pixelRatioCap: 2 } });
     await expect(pool.resolvePixiBackend()).resolves.toBe('webgpu');
     expect(getWebGPUSupported).not.toHaveBeenCalled();
   });
 
   it("honors an explicit 'webgl' setting without consulting detection", async () => {
     const { pool, rs, getWebGPUSupported } = await setup(true); // detection would say webgpu — must be ignored
-    rs.setRenderSettings({ pixi: { backend: 'webgl', antialias: true, resolution: 0 } });
+    rs.setRenderSettings({ pixi: { backend: 'webgl', antialias: true, resolution: 0, pixelRatioCap: 2 } });
     await expect(pool.resolvePixiBackend()).resolves.toBe('webgl');
     expect(getWebGPUSupported).not.toHaveBeenCalled();
   });
 
   it("falls back to detection for 'auto' → webgpu when supported", async () => {
     const { pool, rs, getWebGPUSupported } = await setup(true);
-    rs.setRenderSettings({ pixi: { backend: 'auto', antialias: true, resolution: 0 } });
+    rs.setRenderSettings({ pixi: { backend: 'auto', antialias: true, resolution: 0, pixelRatioCap: 2 } });
     await expect(pool.resolvePixiBackend()).resolves.toBe('webgpu');
     expect(getWebGPUSupported).toHaveBeenCalled();
   });
 
   it("falls back to detection for 'auto' → webgl when unsupported", async () => {
     const { pool, rs, getWebGPUSupported } = await setup(false);
-    rs.setRenderSettings({ pixi: { backend: 'auto', antialias: true, resolution: 0 } });
+    rs.setRenderSettings({ pixi: { backend: 'auto', antialias: true, resolution: 0, pixelRatioCap: 2 } });
     await expect(pool.resolvePixiBackend()).resolves.toBe('webgl');
     expect(getWebGPUSupported).toHaveBeenCalled();
+  });
+});
+
+/** The engine — not Pixi — owns the backing-size computation (canvas2DSizing.computeBackingSize).
+ *  Pixi must therefore stay at its DEFAULT resolution of 1 so `renderer.resize(w, h)` means
+ *  literally w×h backing pixels. Pinned because re-adding `resolution` here is a plausible
+ *  "fix" that silently reintroduces #38's double-count: Canvas2DMount has already multiplied
+ *  by dpr/resolution before it calls resize, so a second multiply inside Pixi compounds. */
+describe('Application init options (#38)', () => {
+  async function initSlot(resolution: number) {
+    mockDeps();
+    const rs = await import('../../src/runtime/rendering/renderSettings');
+    rs.setRenderSettings({ pixi: { backend: 'auto', antialias: true, resolution, pixelRatioCap: 2 } });
+    const pool = await import('../../src/runtime/rendering/canvas2DPool');
+    const slot = pool.allocate(900)!;
+    await slot.ready;
+    return (slot.app.init as unknown as { mock: { calls: [Record<string, unknown>][] } }).mock.calls[0][0];
+  }
+
+  it('never passes `resolution` or `autoDensity`, even when a project PINS pixi.resolution', async () => {
+    const opts = await initSlot(3);
+    expect(opts).not.toHaveProperty('resolution');
+    expect(opts).not.toHaveProperty('autoDensity');
+  });
+
+  it('still forwards the settings Pixi does own (antialias)', async () => {
+    const opts = await initSlot(0);
+    expect(opts.antialias).toBe(true);
   });
 });

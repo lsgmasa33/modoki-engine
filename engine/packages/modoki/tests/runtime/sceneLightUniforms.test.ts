@@ -32,6 +32,12 @@ function setWT(id: number, over: Partial<{ x: number; y: number; z: number; rx: 
   worldTransforms.set(id, { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1, ...over });
 }
 
+// three/tsl's public types leave a UniformNode's `.value` as `unknown` (TSL nodes are
+// loosely typed upstream) — the test stub (tests/stubs/three-tsl.ts) puts a real Vector3
+// / number there at runtime, so these narrow the read for assertions.
+const vec3 = (v: unknown) => v as { x: number; y: number; z: number };
+const num = (v: unknown) => v as number;
+
 describe('updateSceneLightUniforms — world → uniforms', () => {
   it('writes key / ambient / point values from the scene lights', async () => {
     const { world, Light, uniforms } = await setup();
@@ -47,16 +53,16 @@ describe('updateSceneLightUniforms — world → uniforms', () => {
     const u = uniforms.getSceneLightUniforms();
 
     // Ambient: white linear (1) × 0.5.
-    expect(u.ambientColor.value.x).toBeCloseTo(0.5, 5);
+    expect(vec3(u.ambientColor.value).x).toBeCloseTo(0.5, 5);
     // Key directional: white × 3, aimed straight down -Z so toward-light is +Z.
-    expect(u.keyLightColor.value.x).toBeCloseTo(3, 5);
-    expect([u.keyLightDir.value.x, u.keyLightDir.value.y, u.keyLightDir.value.z].map((n: number) => Math.round(n) + 0))
+    expect(vec3(u.keyLightColor.value).x).toBeCloseTo(3, 5);
+    expect([vec3(u.keyLightDir.value).x, vec3(u.keyLightDir.value).y, vec3(u.keyLightDir.value).z].map((n: number) => Math.round(n) + 0))
       .toEqual([0, 0, 1]);
     // Point: red × 2 at its world position, invRange = 1/10.
-    expect(u.pointColor[0].value.x).toBeCloseTo(2, 5);
-    expect(u.pointColor[0].value.y).toBeCloseTo(0, 5);
-    expect([u.pointPos[0].value.x, u.pointPos[0].value.y, u.pointPos[0].value.z]).toEqual([4, 5, 6]);
-    expect(u.pointInvRange[0].value).toBeCloseTo(0.1, 6);
+    expect(vec3(u.pointColor[0].value).x).toBeCloseTo(2, 5);
+    expect(vec3(u.pointColor[0].value).y).toBeCloseTo(0, 5);
+    expect([vec3(u.pointPos[0].value).x, vec3(u.pointPos[0].value).y, vec3(u.pointPos[0].value).z]).toEqual([4, 5, 6]);
+    expect(num(u.pointInvRange[0].value)).toBeCloseTo(0.1, 6);
   });
 
   it('zeroes unused point slots', async () => {
@@ -67,10 +73,10 @@ describe('updateSceneLightUniforms — world → uniforms', () => {
     uniforms.updateSceneLightUniforms(world);
     const u = uniforms.getSceneLightUniforms();
 
-    expect(u.pointInvRange[0].value).toBe(0); // distance 0 → infinite range
+    expect(num(u.pointInvRange[0].value)).toBe(0); // distance 0 → infinite range
     // Slot 1 (no light) is zeroed.
-    expect(u.pointColor[1].value.x).toBe(0);
-    expect(u.pointInvRange[1].value).toBe(0);
+    expect(vec3(u.pointColor[1].value).x).toBe(0);
+    expect(num(u.pointInvRange[1].value)).toBe(0);
   });
 
   it('ignores deactivated light entities', async () => {
@@ -79,11 +85,11 @@ describe('updateSceneLightUniforms — world → uniforms', () => {
     setWT(dir.id(), {});
 
     uniforms.updateSceneLightUniforms(world);
-    expect(uniforms.getSceneLightUniforms().keyLightColor.value.x).toBeCloseTo(4, 5);
+    expect(vec3(uniforms.getSceneLightUniforms().keyLightColor.value).x).toBeCloseTo(4, 5);
 
     deactivatedEntities.add(dir.id());
     uniforms.updateSceneLightUniforms(world);
-    expect(uniforms.getSceneLightUniforms().keyLightColor.value.x).toBe(0);
+    expect(vec3(uniforms.getSceneLightUniforms().keyLightColor.value).x).toBe(0);
   });
 
   it('tracks a moved key light (direction follows the transform)', async () => {
@@ -91,14 +97,14 @@ describe('updateSceneLightUniforms — world → uniforms', () => {
     const dir = world.spawn(Light({ lightType: 'directional', color: 0xffffff, intensity: 1 }));
     setWT(dir.id(), { rx: 0, ry: 0 });
     uniforms.updateSceneLightUniforms(world);
-    const before = uniforms.getSceneLightUniforms().keyLightDir.value.z;
+    const before = vec3(uniforms.getSceneLightUniforms().keyLightDir.value).z;
 
     setWT(dir.id(), { rx: 0, ry: Math.PI / 2 }); // rotate 90° → toward-light swings to +X
     uniforms.updateSceneLightUniforms(world);
     const u = uniforms.getSceneLightUniforms();
     expect(before).toBeCloseTo(1, 5);
-    expect(u.keyLightDir.value.x).toBeCloseTo(1, 5);
-    expect(u.keyLightDir.value.z).toBeCloseTo(0, 5);
+    expect(vec3(u.keyLightDir.value).x).toBeCloseTo(1, 5);
+    expect(vec3(u.keyLightDir.value).z).toBeCloseTo(0, 5);
   });
 });
 

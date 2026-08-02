@@ -12,9 +12,29 @@ editor is available for in a shipped game.
   doesn't open it).
 - **3-finger tap** (touch) — the on-device gesture, latch-debounced to fire once per gesture.
 
-The menu is a **fullscreen modal** with a left tab sidebar. The FPS/Memory/GPU stat displays
-are **separate floating widgets** you spawn from the Stats tab; they stay on screen while the
-modal is closed, so you can watch performance *while playing*.
+The menu is a **fullscreen modal**. Tabs live behind the **☰ button** in its header (a
+dropdown, not a persistent sidebar — on a phone a fixed tab column ate a third of the width,
+and the tabs that matter most on device are exactly the list-heavy ones); the header shows the
+active tab's title. **Escape** backs out one level — dropdown first, then the modal. The
+FPS/Memory/GPU stat displays are **separate floating widgets** you spawn from the Stats tab;
+they stay on screen while the modal is closed, so you can watch performance *while playing*.
+
+### Tab layout — the body does NOT scroll
+
+The modal body is a fixed-height flex column with `overflow: hidden`; **scrolling is the tab's
+job**. That's what lets a list fill the dialog instead of sitting in a fixed-height box with dead
+space under it. Use the helpers from `@modoki/engine/runtime/debug` (`runtime/debug/tabLayout.ts`)
+rather than a `maxHeight` magic number:
+
+| Helper | Use it when |
+|---|---|
+| `fillRootStyle(gap?)` | The tab has ONE growing region (a list/tree). Put `fillRegionStyle` on that region; headers/filter rows stay pinned and the region takes the leftover height and scrolls itself. |
+| `scrollRootStyle(gap?)` | The tab is a stack of short sections with no natural growing region (Stats, Time, Device, Cheats) — the root scrolls when it overflows. |
+| `fillRegionStyle` | The one region inside a `fillRootStyle` tab that absorbs leftover height. |
+
+Both roots set `minHeight: 0`: a flex child's default `min-height: auto` refuses to shrink below
+its content, which silently defeats the inner `overflow: auto`. (`WorldTab` is the two-region
+case — tree and inspector split the body 45/55 and scroll independently.)
 
 ## Gating — how it ships (and how it's kept out)
 
@@ -77,7 +97,40 @@ the input-source guard.
 | **Prefs** | `PlayerPrefs` viewer — the engine-owned per-key JSON store (per-game namespace). |
 | **Cheats** | Auto-listed UIActions (`getUIActionNames` → `dispatchUIAction`) **plus** game `registerDebugCommand` buttons. |
 | **Console** | Ring-buffer view of captured `console.*` with a level filter + Clear. |
-| **Device** | Platform / viewport / screen / DPR / cores / memory / safe-area (refreshes on rotation). |
+| **Device** | Platform / viewport / screen / DPR / cores / memory / safe-area (refreshes on rotation), plus the **Backing resolution** A/B below. |
+
+### Backing resolution — the live `pixelRatioCap` A/B (Device tab)
+
+Flips `rendering.pixi.pixelRatioCap` (2D) and `rendering.three.pixelRatioCap` (3D) **at runtime**
+— `1` / `2` / `3` / `Off`, where `Off` sends `0`, the engine's existing uncapped sentinel (see
+[rendering.md](rendering.md)). Below the buttons it prints each canvas's REAL drawing buffer
+(`canvas.width×height`) next to its CSS box, split into 2D (Pixi, under `[data-canvas2d-mount]`)
+and 3D (everything else) and numbered when a surface appears more than once.
+
+**Why it exists.** The caps are baked into the build's config, so comparing 2× against 3× used to
+mean an edit plus a rebuild per flip — which is not an A/B at all, since you end up comparing
+against memory rather than back-to-back. It matters only where a cap actually binds, i.e. a
+DPR-3 phone: at DPR ≤ 2 a cap of 2 is arithmetically a no-op, so on a typical desktop the
+buttons correctly do nothing visible.
+
+**Why the buffer readout is the point, not decoration.** Sharpness is exactly the kind of claim
+that is easy to imagine a difference in. The printed buffer says whether the flip landed *before*
+anyone judges pixels — if the numbers don't move, the comparison is two identical frames and any
+verdict is imaginary.
+
+Measured on an iPhone Air (DPR 3, `space-invader`, 2D canvas CSS 420×810) — the buffer tracks the
+cap exactly, `Off` equals raw DPR, and the **CSS box never moves** (the clamp rides the buffer, not
+the CSS size — the #38 failure):
+
+| 2D cap | 1 | 2 (default) | 3 | Off |
+|---|---|---|---|---|
+| buffer | 420×810 | 840×1620 | 1260×2430 | 1260×2430 |
+
+Mechanism: `rendering/resizeBus.ts` (`onForceResize` / `forceResizeAllSurfaces`). Both
+`Canvas2DMount.measure()` and `Scene3D`'s `ResizeObserver` already re-read `getRenderSettings()`
+on every run, so a live settings change only needs those handlers re-invoked — nothing caches or
+diffs, and the bus stays a dumb listener registry. Changes are runtime-only: nothing is persisted,
+so a relaunch returns to the project's configured caps.
 
 ### Floating stat widgets
 

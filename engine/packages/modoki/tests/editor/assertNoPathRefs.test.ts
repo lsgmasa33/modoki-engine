@@ -15,8 +15,8 @@ let err: ReturnType<typeof vi.spyOn>;
 beforeEach(() => { err = vi.spyOn(console, 'error').mockImplementation(() => {}); });
 afterEach(() => { err.mockRestore(); });
 
-const flaggedContexts = () => err.mock.calls.map((c) => String(c[0]));
-const flaggedWith = (needle: string) => flaggedContexts().some((m) => m.includes(needle));
+const flaggedContexts = () => err.mock.calls.map((c: unknown[]) => String(c[0]));
+const flaggedWith = (needle: string) => flaggedContexts().some((m: string) => m.includes(needle));
 
 function base(): SerializedEntity {
   return { id: 1, name: 'e', traits: {} };

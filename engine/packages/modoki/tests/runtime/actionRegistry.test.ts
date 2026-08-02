@@ -35,7 +35,7 @@ describe('actionRegistry', () => {
 
   it('resolves targetGuid to ctx.target', async () => {
     const { registerUIAction, dispatchUIAction } = await getActionRegistry();
-    const { getCurrentWorld } = await import('../../../src/runtime/core/ecs/world');
+    const { getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
     const { EntityAttributes } = await import('../../src/runtime/core/traits/EntityAttributes');
 
     const e = getCurrentWorld().spawn(EntityAttributes({ guid: 'target-guid' }));

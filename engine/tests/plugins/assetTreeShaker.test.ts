@@ -721,6 +721,32 @@ describe('asset-tree-shaker', () => {
     expect(result.kept).toContain('/games/test/assets/extras/loose.png');
   });
 
+  it('keeps an ENGINE asset listed by a keep-list entry under /modoki/assets', () => {
+    // The path Court's production build actually takes since #52: it renders its board labels
+    // with the engine's built-in MSDF font (DEFAULT_FONT_GUID) instead of a copy in its own
+    // assets, and nothing in a scene references it — so the ONLY thing keeping that font in the
+    // build is a keep-list entry pointing OUT of the project, into the engine asset root.
+    //
+    // Every other keep-list test above lists a `/games/test/assets/...` path, and the two engine
+    // font tests reach `/modoki/assets` by CSS FAMILY, which is a different resolver. So nothing
+    // covered an engine-root path arriving through the keep list. If `loadKeepList`'s
+    // virtualToAbs stopped resolving against the engine root, it would not fail quietly: a
+    // keep entry that resolves to nothing is treated as STALE and THROWS. That is a broken
+    // build for every game using a built-in asset, and this is what would catch it.
+    fx.writeVirtual('/modoki/assets/fonts/Arimo/Arimo-VariableFont_wght.ttf', 'fake');
+    fx.writeVirtual('/modoki/assets/fonts/Nunito/Nunito-VariableFont_wght.ttf', 'fake');
+    fx.writeJson('/games/test/assets/scenes/main.json', { version: 6, entities: [] });
+    fx.writeKeepList(['/modoki/assets/fonts/Arimo/Arimo-VariableFont_wght.ttf']);
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/modoki/assets/fonts/Arimo/Arimo-VariableFont_wght.ttf');
+    // The blessed font is kept BY NAME, not by "engine assets are exempt" — an unlisted engine
+    // font next to it still drops. This is the measurement behind keeping 5 bundled families:
+    // they cost a game nothing, so the answer to "ship only one?" is no.
+    expect(result.kept).not.toContain('/modoki/assets/fonts/Nunito/Nunito-VariableFont_wght.ttf');
+  });
+
   it('walks keep-list entries transitively (a listed prefab keeps its mesh/material/texture)', () => {
     // A code-spawned prefab (e.g. sling's field kit, instantiated only by rebuildField):
     // nothing in the scene graph references it, so ONLY the keep-list can reach it — and
@@ -748,6 +774,36 @@ describe('asset-tree-shaker', () => {
     expect(result.kept).toContain('/games/test/assets/mats/grass.mat.json');
     expect(result.kept).toContain('/games/test/assets/tex/grass.png');
     expect(result.kept).toContain('/games/test/assets/models/blade.glb');
+  });
+
+  it('expands a filename glob in asset-keep.json (GENERATED content: court levels)', () => {
+    // Court's .court.json levels are minted by tools/generate.ts and fetched by PATH from
+    // game code, so neither the scene graph nor the generic trait sweep can reach them.
+    // A literal keep-list would go stale on the next generate run with nothing catching it,
+    // so the glob is what makes generated content safe to add.
+    fx.writeJson('/games/test/assets/levels/a.court.json', { id: 'a' });
+    fx.writeJson('/games/test/assets/levels/b.court.json', { id: 'b' });
+    fx.writeJson('/games/test/assets/levels/index.json', { levels: [] });
+    fx.writeVirtual('/games/test/assets/levels/notes.txt', 'not a level');
+    fx.writeJson('/games/test/assets/scenes/empty.json', { version: 6, entities: [] });
+    fx.writeKeepList(['/games/test/assets/levels/*.court.json']);
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/games/test/assets/levels/a.court.json');
+    expect(result.kept).toContain('/games/test/assets/levels/b.court.json');
+    // The glob is not a directory wildcard — siblings it doesn't match stay dropped.
+    expect(result.kept).not.toContain('/games/test/assets/levels/index.json');
+    expect(result.kept).not.toContain('/games/test/assets/levels/notes.txt');
+  });
+
+  it('fails loudly when an asset-keep.json glob matches nothing', () => {
+    // A stale pattern must fail the build just as loudly as a stale literal path —
+    // otherwise a renamed/moved directory silently ships a game with no content.
+    fx.writeJson('/games/test/assets/scenes/empty.json', { version: 6, entities: [] });
+    fx.writeKeepList(['/games/test/assets/levels/*.court.json']);
+
+    expect(() => computeKeptAssets(fx.projectRoot, fx.roots)).toThrow(/do not exist/i);
   });
 
   it('fails loudly when asset-keep.json references a missing file', () => {

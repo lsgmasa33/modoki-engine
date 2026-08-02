@@ -18,6 +18,7 @@ import { markUIDirty, isUIDirty, clearUIDirty } from '../core/uiDirty';
 export { onEditorDirty, setEditorDirtyCallback, markUIDirty } from '../core/uiDirty';
 import type { World } from 'koota';
 import type { UIActionBinding } from './bindings';
+import type { AnchorMode } from '../traits/UIAnchor';
 export interface UINodeData {
   entityId: number;
   guid: string;
@@ -59,7 +60,11 @@ export interface UINodeData {
   // ── Separate traits (optional) ──
   binding?: { textBinding: string; inputBinding: string; visibleBinding?: string; visibleOp?: string; visibleValue?: string };
   action?: { bindings: UIActionBinding[] };
-  anchor?: { anchor: string; top: number; topUnit: string; right: number; rightUnit: string; bottom: number; bottomUnit: string; left: number; leftUnit: string; pivotX: number; pivotY: number; safeArea: boolean; zIndex: number };
+  // `AnchorMode`, not `string` — the projection sits between the trait (which is
+  // already a union) and the layout modules (whose switches have no `default`), so
+  // widening here would hand an unrecognised mode straight through to a silently
+  // unpositioned element.
+  anchor?: { anchor: AnchorMode; top: number; topUnit: string; right: number; rightUnit: string; bottom: number; bottomUnit: string; left: number; leftUnit: string; pivotX: number; pivotY: number; safeArea: boolean; zIndex: number };
   canvas2D?: { referenceWidth: number; referenceHeight: number; scaleMode: string };
   /** TextAnimation trait — whole-element CSS text animation (fade/wave/bounce/jitter/
    *  rainbow/typewriter) realized by UINode. Shared trait with the 2D/3D geometry paths. */

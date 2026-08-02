@@ -2,7 +2,7 @@
  *  routes the tap through installClick, the end-card appears on the time-cap AND on a
  *  `playable:end` event, and Replay clears it. */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, fireEvent, cleanup, act } from '@testing-library/react';
 import { PlayableOverlay } from '../../app/playable/PlayableOverlay';
 

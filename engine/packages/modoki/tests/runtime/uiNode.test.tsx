@@ -34,8 +34,13 @@ vi.mock('../../src/runtime/ui/bindingResolver', () => ({
   evalVisibility: (s: Record<string, unknown>, f: string, o: string, v: string) => h.evalVisibility(s, f, o, v),
 }));
 vi.mock('../../src/runtime/rendering/Canvas2DMount', () => ({
-  Canvas2DMount: ({ entityId }: { entityId: number }) =>
-    React.createElement('div', { 'data-testid': 'canvas2dmount', 'data-entity-id': entityId }),
+  // Surfaces applyWebSizeMode so the runtime-vs-editor sizeMode contract (#38) is assertable.
+  Canvas2DMount: ({ entityId, applyWebSizeMode }: { entityId: number; applyWebSizeMode?: boolean }) =>
+    React.createElement('div', {
+      'data-testid': 'canvas2dmount',
+      'data-entity-id': entityId,
+      'data-web-size-mode': String(!!applyWebSizeMode),
+    }),
 }));
 
 import { UINode, cssVal, hexToRgba, hexToColor } from '../../src/runtime/ui/UINode';
@@ -226,7 +231,10 @@ describe('UINode image path (F3)', () => {
     // The hard CLAUDE.md rule: DOM images must resolve via resolveDomImageUrl.
     expect(h.resolveDomImageUrl).toHaveBeenCalledWith('tex-guid-123');
     expect(el.style.backgroundImage).toMatch(/url\(["']?variant:tex-guid-123["']?\)/);
-    expect(el.style.backgroundPosition).toBe('center');
+    // jsdom 30 serializes the `background-position` shorthand spec-correctly as two axes
+    // ('center' → 'center center'); jsdom 26 echoed the input. The assertion is about the image
+    // being CENTRED, not about which spelling the environment round-trips, so accept both.
+    expect(el.style.backgroundPosition).toMatch(/^center( center)?$/);
     expect(el.style.backgroundRepeat).toBe('no-repeat');
   });
 
@@ -302,11 +310,44 @@ describe('UINode anchor CSS', () => {
     expect(el.style.transform).toBe('');
   });
 
-  it('stretch: inset 0, width/height cleared', () => {
+  it('stretch: four edge longhands (NOT the inset shorthand), width/height cleared', () => {
     const el = renderNode(makeNode({ width: 100, height: 40, anchor: anchor({ anchor: 'stretch' }) }));
-    expect(el.style.inset).toBe('0');   // jsdom serializes the unitless 0
+    // Deliberately longhands: the offset block writes style.right/style.bottom, which
+    // against a shorthand would only win by declaration ORDER. See anchorCss.ts.
+    expect([el.style.top, el.style.right, el.style.bottom, el.style.left])
+      .toEqual(['0px', '0px', '0px', '0px']);
+    expect(el.style.cssText).not.toContain('inset');
     expect(el.style.width).toBe('');
     expect(el.style.height).toBe('');
+  });
+
+  // A STRETCHED axis pins both edges, so each offset insets ITS OWN edge and the box
+  // shrinks — `left` + `right` are side margins, not two descriptions of one edge.
+  // (Until 2026-07-31 both folded into the near edge, so they cancelled to full-bleed.)
+  it('stretched axis: left/right land on their own edges and do not cancel', () => {
+    const el = renderNode(makeNode({
+      anchor: anchor({ anchor: 'bottom-stretch', left: 5, leftUnit: '%', right: 5, rightUnit: '%' }),
+    }));
+    expect(el.style.left).toBe('5%');
+    expect(el.style.right).toBe('5%');
+    expect(el.style.left).not.toContain('calc');
+  });
+
+  it('stretched axis: top/bottom inset vertically on a v-stretched mode', () => {
+    const el = renderNode(makeNode({
+      anchor: anchor({ anchor: 'left-stretch', top: 12, topUnit: 'px', bottom: 20, bottomUnit: 'px' }),
+    }));
+    expect(el.style.top).toBe('12px');
+    expect(el.style.bottom).toBe('20px');
+  });
+
+  it('non-stretched axis keeps point semantics: a far-edge offset folds into the near edge', () => {
+    // bottom-stretch stretches X only, so `bottom` must still SHIFT rather than inset.
+    const el = renderNode(makeNode({
+      anchor: anchor({ anchor: 'bottom-stretch', bottom: 30, bottomUnit: 'px' }),
+    }));
+    expect(el.style.top).toMatch(/calc\(100% - 30px\)/);
+    expect(el.style.bottom).toBe('');
   });
 
   it('offsets: plain value off a 0 base; calc(+/-) off a percentage base', () => {
@@ -433,6 +474,17 @@ describe('UINode canvas2D branch', () => {
     expect(mount.getAttribute('data-entity-id')).toBe('5');
   });
 
+  it('runtime opts INTO rendering.web.sizeMode — the shipped-game/GameView surface (#38)', async () => {
+    // Pairs with the editor case below: the `max` buffer clamp must reach the shipped game
+    // (matching Scene3D, which clamps the 3D layer on this same surface) and must NOT reach
+    // the editor SceneView viewport, which sizes itself / uses device presets. The prop
+    // defaults to false, so this is the call site that has to opt in — if it stops passing
+    // applyWebSizeMode, `max` silently goes back to doing nothing on the 2D layer.
+    const node = makeNode({ entityId: 7, canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH' } });
+    const { findByTestId } = render(<UINode node={node} storeState={{}} />);
+    expect((await findByTestId('canvas2dmount')).getAttribute('data-web-size-mode')).toBe('true');
+  });
+
   it('dev-warns when Canvas2D coexists with a non-div elementType (F8 — canvas would not mount)', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const node = makeNode({
@@ -462,6 +514,10 @@ describe('UINode canvas2D branch', () => {
     expect(getByTestId('injected').getAttribute('data-id')).toBe('9');
     expect(queryByTestId('canvas2dmount')).toBeNull();
     expect(renderCanvas2D).toHaveBeenCalledWith(9);
+    // #38: the editor branch takes over ENTIRELY, so it cannot inherit the runtime's
+    // applyWebSizeMode opt-in — SceneView mounts Canvas2DMount itself, without the prop.
+    expect(renderCanvas2D).toHaveBeenCalledTimes(1);
+    expect(renderCanvas2D.mock.calls[0]).toHaveLength(1);
   });
 });
 

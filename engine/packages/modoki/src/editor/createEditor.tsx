@@ -25,9 +25,10 @@ import { registerSelectionRestore } from './store/selectionRestore';
 import { registerLastAnimationClipPersistence, restoreLastAnimationClip } from './animation/lastAnimationClip';
 import { registerLastSkinRigPersistence, restoreLastSkinRig } from './panels/lastSkinRig';
 import { registerBuiltinCreatableAssets } from './panels/builtinCreatableAssets';
-import { ensureManifestLoaded, loadManifestJson, getGuidForPath, resolveGuidToPath, isGuid } from '../runtime/loaders/assetManifest';
+import { ensureManifestLoaded, loadManifestJson, getGuidForPath, resolveGuidToPath, isGuid, getAllAssets } from '../runtime/loaders/assetManifest';
 import { backendFetch } from './backend/editorBackend';
 import { rendererReady } from '../runtime/loaders/textureResolver';
+import { rendererInitFailedPromise, getRendererProgress, hasViewportBegunInit } from '../runtime/core/activeRenderer';
 import { installConsoleCapture } from './consoleCapture';
 import { useEditorStore } from './store/editorStore';
 import { assetSetSignature } from './assetSetSignature';
@@ -36,18 +37,74 @@ import { assetSetSignature } from './assetSetSignature';
  *  for why we dedupe rather than refresh on every broadcast). */
 let lastAssetSig: string | null = null;
 
+// ── Phase 2.5: resolved `build.modules.render3d` fact ─────────────────────────────────────
+// Fetched once at boot (see `sceneReady` below) via `/api/build-modules`, which resolves
+// `'auto' | boolean` server-side (a Node-only scene scan the browser can't run itself).
+// Exposed so the renderer-health watchdog can suppress its "no 3D viewport" warning for a
+// project that doesn't render 3D at all, and so `modoki_get_editor_state`'s `rendererGate`
+// (`app/editor/agentEditorOps.ts`) can explain WHY. `undefined` until the fetch resolves, or
+// forever on failure — callers must treat that as "unknown" (fail OPEN: still warn), never as
+// `false`.
+let resolvedRender3d: boolean | undefined;
+export function getResolvedRender3d(): boolean | undefined {
+  return resolvedRender3d;
+}
+
 // `lastSceneKey` now lives in scene/serialize (single source shared with the writer,
 // setCurrentScenePath). Re-exported here for existing test imports.
 export { lastSceneKey };
 
 /** Build the ordered, de-duplicated list of scene paths to try, most-preferred
- *  first: the stored last-opened scene, then the project's configured default.
- *  Falsy entries are dropped and duplicates collapsed (a last-scene equal to the
- *  default yields a single candidate). Pure — exported for unit testing. */
-export function resolveSceneCandidates(lastScene: string | null | undefined, configScenePath: string | undefined): string[] {
+ *  first: a launch-scoped `--scene` override (issue #43, already resolved by
+ *  `resolveBootSceneOverride`), then the stored last-opened scene, then the project's
+ *  configured default. Falsy entries are dropped and duplicates collapsed (a last-scene
+ *  equal to the default yields a single candidate).
+ *
+ *  The override is PREPENDED, never substituted — that is what makes a bad override
+ *  degrade to the remembered scene via `loadFirstScene`'s existing 404 self-heal instead
+ *  of booting a blank world. Keeping the precedence here (rather than combining at the
+ *  call site) is deliberate: it is the one place the boot order is decided, so a test can
+ *  actually pin it. Pure — exported for unit testing. */
+export function resolveSceneCandidates(
+  lastScene: string | null | undefined,
+  configScenePath: string | undefined,
+  overrideScene?: string | null,
+): string[] {
   return [...new Set(
-    [lastScene, configScenePath].filter((p): p is string => !!p),
+    [overrideScene, lastScene, configScenePath].filter((p): p is string => !!p),
   )];
+}
+
+/** Resolve a `--scene`/`MODOKI_SCENE` boot override (issue #43) to a scene path, or
+ *  `null` if it doesn't resolve — a typo, no match, or an ambiguous name. `null` tells
+ *  the caller to fall through to the normal last-scene/config.scenePath candidates
+ *  rather than booting a blank world.
+ *
+ *  Accepts EITHER a path (contains `/` or ends in `.json` — used as-is, no lookup)
+ *  OR a bare name (`Level-0002`), matched case-insensitively against `sceneList`'s
+ *  basenames with the `.json` extension stripped — that's what an agent actually
+ *  types on the command line.
+ *
+ *  An ambiguous name (>1 match) is refused rather than guessed, matching this repo's
+ *  rule that an ambiguous NAME lookup is refused everywhere rather than first-matched
+ *  (the same rule `{name}` entity addressing follows). Pure — exported for unit
+ *  testing; the caller supplies `sceneList` (the open project's registered scene
+ *  paths) since resolution here must not depend on the manifest module directly. */
+export function resolveBootSceneOverride(override: string | null | undefined, sceneList: string[]): string | null {
+  if (!override) return null;
+  if (override.includes('/') || override.toLowerCase().endsWith('.json')) return override;
+  const target = override.toLowerCase();
+  const matches = sceneList.filter((p) => {
+    const base = (p.split('/').pop() ?? p).replace(/\.json$/i, '');
+    return base.toLowerCase() === target;
+  });
+  if (matches.length === 1) return matches[0];
+  if (matches.length === 0) {
+    console.warn(`[Editor] --scene override '${override}' matched no scene. Available scenes: ${sceneList.length ? sceneList.join(', ') : '(none)'}`);
+  } else {
+    console.warn(`[Editor] --scene override '${override}' is ambiguous — matches: ${matches.join(', ')}. Pass a full path to disambiguate.`);
+  }
+  return null;
 }
 
 /** Map a boot-scene candidate to its canonical working-copy path before loading.
@@ -181,7 +238,7 @@ export async function loadFirstScene(
     try {
       canonical = await deps.canonicalize(candidate);
     } catch {
-      canonical = candidate;
+      // canonical is already `candidate` (the declaration default).
     }
     if (await tryLoad(canonical)) return canonical;
     if (canonical !== candidate && (await tryLoad(candidate))) return candidate;
@@ -207,6 +264,16 @@ export const RENDERER_READY_TIMEOUT_MS = 120_000;
  *  progress signal (it forwards to the packaged main.log for diagnosis). */
 export const RENDERER_READY_SOFT_TIMEOUT_MS = 15_000;
 
+/** Deadline for ANY viewport to at least BEGIN renderer creation.
+ *
+ *  Distinct from the two budgets above because it answers a different question. Those ask
+ *  "has the renderer finished?", which a cold Vite dep-optimize can legitimately stretch to
+ *  a minute or more. This asks "has anything even STARTED?", which does not depend on GPU or
+ *  bundler speed at all — only on a viewport mounting and running its effect. Measured on a
+ *  normal boot, that happens at ~1.0s; 12s is ~12x headroom. Past it, waiting the remaining
+ *  108s cannot help, because nothing is in flight to finish. */
+export const NO_VIEWPORT_TIMEOUT_MS = 12_000;
+
 /** Await `ready`, but reject if it doesn't settle within `timeoutMs` (the HARD cap). A
  *  non-fatal soft warning fires at `softTimeoutMs` and we KEEP waiting — a slow-but-fine
  *  cold start (Vite dep-optimize / GPU warm-up) recovers instead of aborting the scene load.
@@ -216,6 +283,7 @@ export const RENDERER_READY_SOFT_TIMEOUT_MS = 15_000;
 export async function awaitRendererReady(
   ready: Promise<unknown>,
   timeoutMs: number = RENDERER_READY_TIMEOUT_MS,
+  // NOTE: `failed` is injected (defaulted below) so this stays a pure, unit-testable race.
   // NOTE: the defaults MUST be bound to globalThis. A bare `{ setTimeout, clearTimeout }`
   // is invoked as `timers.setTimeout(...)` → `this === timers`, which browsers reject with
   // "Illegal invocation" (the real scene-load path, not exercised by injected fake timers).
@@ -223,8 +291,41 @@ export async function awaitRendererReady(
     setTimeout: globalThis.setTimeout.bind(globalThis),
     clearTimeout: globalThis.clearTimeout.bind(globalThis),
   },
-  opts: { softTimeoutMs?: number; onSoftTimeout?: () => void } = {},
+  opts: {
+    softTimeoutMs?: number;
+    onSoftTimeout?: () => void;
+    /** Resolves ONLY on a definitive renderer-init failure. Racing it is what turns a
+     *  two-minute silent wait into a sub-second, correctly-attributed error. */
+    failed?: Promise<Error>;
+    /** Last known bring-up progress, quoted in the timeout message. */
+    progress?: () => string;
+    /** Has any viewport begun renderer creation? Enables the fast no-viewport deadline. */
+    hasViewportBegun?: () => boolean;
+    /** Deadline for the above (default `NO_VIEWPORT_TIMEOUT_MS`). */
+    noViewportMs?: number;
+    /** Should the ENTIRE watchdog actually warn about a missing viewport — the 12s
+     *  fast-fail, the 15s soft-timeout nudge, AND the 120s hard-cap message alike? Injected so
+     *  this function stays a pure, timer-injectable race — the caller (createEditor's boot
+     *  sequence) decides based on whether the project renders 3D at all (see Phase 2.5,
+     *  `/api/build-modules`); telling a 2D-only project ANY flavor of "renderer isn't ready" is
+     *  noise, not diagnosis — the owner confirmed this after seeing the 15s nudge fire live on a
+     *  render3d:false project even though the 12s message was correctly suppressed. Defaults to
+     *  always-warn when omitted, i.e. the old behaviour.
+     *
+     *  Suppression lifts the instant `hasViewportBegun()` turns true — a viewport that DOES
+     *  start (e.g. the user opens a Scene panel on a 2D project anyway) makes renderer health
+     *  relevant again, so normal soft/hard-cap reporting resumes for that attempt. When
+     *  suppressed, the soft/hard timers still fire on schedule but simply skip their side
+     *  effect — the hard-cap's promise branch just never settles (mirrors the no-viewport
+     *  branch below), which is harmless: nothing awaits it exclusively. */
+    shouldWarnNoViewport?: () => boolean;
+  } = {},
 ): Promise<void> {
+  // True when the caller says "don't warn" AND no viewport has begun yet. Re-checked at every
+  // firing point (not cached) since `hasViewportBegun` can flip true between them.
+  const suppressed = () =>
+    !!opts.shouldWarnNoViewport && !opts.shouldWarnNoViewport() && !(opts.hasViewportBegun?.() ?? false);
+
   const softMs = Math.min(opts.softTimeoutMs ?? RENDERER_READY_SOFT_TIMEOUT_MS, timeoutMs);
   const onSoftTimeout = opts.onSoftTimeout ?? (() => console.warn(
     `[Editor] renderer still initializing after ${softMs}ms — a cold Vite dep-optimize / GPU ` +
@@ -234,17 +335,60 @@ export async function awaitRendererReady(
   let hardId: ReturnType<typeof setTimeout> | undefined;
   const rendererTimeout = new Promise<never>((_, reject) => {
     hardId = timers.setTimeout(() => {
+      if (suppressed()) return; // no viewport expected, none began — the long budget was moot
+      // Report the last thing bring-up actually managed, rather than asserting a cause. The
+      // old message flatly claimed "SceneView never called setActiveRenderer" and told the
+      // reader to look for a WebGPU/WebGL init error — which SceneView logged at WARN level,
+      // so anyone filtering the console to `error` (as the message implies) found nothing.
       reject(new Error(
-        `[Editor] rendererReady did not resolve within ${timeoutMs}ms — ` +
-        `SceneView never called setActiveRenderer. Check the browser console for a WebGPU/WebGL init error.`,
+        `[Editor] rendererReady did not resolve within ${timeoutMs}ms. ` +
+        `Last renderer bring-up progress: ${opts.progress?.() ?? 'unknown'}. ` +
+        `The 3D viewport never registered a renderer, so nothing will render in the Scene/Game ` +
+        `panels (the scene's entity data still loads normally).`,
       ));
     }, timeoutMs);
   });
-  const softId = timers.setTimeout(() => { onSoftTimeout(); }, softMs);
+  // A definitive init failure short-circuits the whole budget.
+  const failedRace = opts.failed
+    ? opts.failed.then((e) => {
+        throw new Error(
+          `[Editor] renderer init FAILED — the 3D viewport could not create a renderer, so ` +
+          `nothing will render in the Scene/Game panels (the scene's entity data still loads ` +
+          `normally). This is not a slow start; it will not resolve on its own. Cause: ${e.message}`,
+          { cause: e },
+        );
+      })
+    : null;
+  // Fast, DISTINGUISHABLE failure: nothing ever started. Only armed when the caller can
+  // answer the question — a caller that can't keeps exactly the old behaviour.
+  let noViewportId: ReturnType<typeof setTimeout> | undefined;
+  const noViewportRace = opts.hasViewportBegun
+    ? new Promise<never>((_, reject) => {
+        noViewportId = timers.setTimeout(() => {
+          if (opts.hasViewportBegun!()) return; // bring-up IS underway — let the long budget run
+          // The project may not render 3D at all (Phase 2.5) — telling it "no 3D viewport" would
+          // be noise, not diagnosis. Suppressing here just means this promise never settles; the
+          // hard-cap budget above keeps running underneath (also suppressed — see `suppressed`).
+          if (suppressed()) return;
+          reject(new Error(
+            `[Editor] no 3D viewport began renderer creation within ` +
+            `${opts.noViewportMs ?? NO_VIEWPORT_TIMEOUT_MS}ms — nothing will render in the ` +
+            `Scene/Game panels until one is open. The scene itself loads normally. This is NOT a ` +
+            `slow cold start — nothing has started, so waiting longer cannot help. Open a Scene ` +
+            `or Game panel from the Window menu.`,
+          ));
+        }, opts.noViewportMs ?? NO_VIEWPORT_TIMEOUT_MS);
+      })
+    : null;
+  const softId = timers.setTimeout(() => { if (!suppressed()) onSoftTimeout(); }, softMs);
   try {
-    await Promise.race([ready, rendererTimeout]);
+    const racers: Promise<unknown>[] = [ready, rendererTimeout];
+    if (failedRace) racers.push(failedRace);
+    if (noViewportRace) racers.push(noViewportRace);
+    await Promise.race(racers);
   } finally {
     if (hardId !== undefined) timers.clearTimeout(hardId);
+    if (noViewportId !== undefined) timers.clearTimeout(noViewportId);
     timers.clearTimeout(softId);
   }
 }
@@ -290,8 +434,12 @@ export interface ProjectSettingsSchema {
   tabs: ProjectSettingsTab[];
   /** Fetch the current values (e.g. GET /api/project-settings). */
   load: () => Promise<Record<string, unknown>>;
-  /** Persist values on Apply. Resolve `true` on success. */
-  save: (values: Record<string, unknown>) => Promise<boolean>;
+  /** Persist values on Apply. Resolve `true` on success, or a MESSAGE explaining
+   *  the refusal so the dialog can show it. The backend rejects a save for reasons
+   *  the user can act on (an unsafe build field, a hand-edited config that no longer
+   *  parses); returning a bare `false` for those left the dialog silently refusing
+   *  to close with the reason stranded in the console. */
+  save: (values: Record<string, unknown>) => Promise<boolean | string>;
   /** Open a native file/folder chooser for `path` fields. Resolves the chosen
    *  path (project-relative when inside the project, else absolute), or null on
    *  cancel/unsupported. Host-provided so the package stays backend-agnostic. */
@@ -397,14 +545,24 @@ export function createEditor(options: EditorOptions): React.ComponentType {
     });
   }
 
-  // Scene loading: try last opened scene, then config.scenePath, then initWorld.
-  // This runs in parallel with the React app mounting: the manifest load is
-  // cheap and can proceed immediately, but the actual scene load (which
-  // preloads materials → textures → KTX2Loader) waits on `rendererReady` so
-  // KTX2Loader.detectSupport has run before any loadAsync call. That gate
-  // resolves when SceneView's renderer fires setActiveRenderer, which
-  // requires the EditorApp bundle to have mounted — hence the React.lazy
-  // below is no longer gated on sceneReady (it can't be, or we'd deadlock).
+  // Fire-and-forget: resolve `build.modules.render3d` for the open project, for the
+  // renderer-health watchdog below. Not awaited anywhere on the scene-load path — the
+  // watchdog's no-viewport deadline is ≥2s out, comfortably more slack than this needs.
+  void backendFetch('/api/build-modules')
+    .then((r) => (r.ok ? r.json() : null))
+    .then((data: { modules?: Record<string, boolean> } | null) => {
+      resolvedRender3d = data?.modules?.render3d;
+    })
+    .catch(() => { /* fails open: resolvedRender3d stays undefined → the watchdog still warns */ });
+
+  // Scene loading: try last opened scene, then config.scenePath, then initWorld. This runs
+  // in parallel with the React app mounting and no longer waits on any 3D viewport/renderer
+  // existing — entity data, prefabs, and non-KTX2 textures load the moment the asset manifest
+  // is up. The one real dependency (three's KTX2Loader needing GPU caps before `loadAsync`)
+  // is a narrower, terminating gate of its own now: `ensureKtx2Caps()`
+  // (`runtime/loaders/textureResolver.ts`), which every KTX2-touching load site awaits
+  // individually rather than the whole scene load blocking up front. See `docs/editor.md`
+  // (`createEditor()`) and `docs/textures.md` ("Runtime resolution") for the full rationale.
   const sceneReady = (async () => {
     // Populate the guid → path map BEFORE loading any scene — otherwise every
     // GUID ref resolves to undefined (missing meshes, black materials). The
@@ -429,13 +587,6 @@ export function createEditor(options: EditorOptions): React.ComponentType {
     // scene loads. Sets the store; the Skin panel shows it whenever it next mounts.
     restoreLastSkinRig();
 
-    // Wait for the renderer to be registered with the texture resolver. Until
-    // then KTX2Loader has no workerConfig and loadAsync throws. If SceneView
-    // never resolves `rendererReady` (WebGL init failure inside the lazy
-    // EditorApp bundle, mount loop, etc.), the scene load would otherwise
-    // hang forever silently — time it out and surface the failure.
-    await awaitRendererReady(rendererReady);
-
     // Scope the "last opened scene" by project (config.name) — otherwise the key
     // is global and one project's scene (e.g. 3d-test's "2D Animation.json")
     // leaks into every other project, which then 404s. As a second guard, fall
@@ -444,7 +595,28 @@ export function createEditor(options: EditorOptions): React.ComponentType {
     // last-scene self-heals to the project default instead of a blank world.
     const LAST_SCENE_KEY = lastSceneKey(options.config.name);
     const lastScene = localStorage.getItem(LAST_SCENE_KEY);
-    const candidates = resolveSceneCandidates(lastScene, options.config.scenePath);
+
+    // ── Issue #43: a launch-scoped `--scene`/MODOKI_SCENE override, read from main via
+    //    /api/boot-scene. Best-effort like the /api/identity fetch above — a missing route
+    //    (older/packaged main) must never block boot. STICKY for the whole editor process
+    //    (main doesn't clear it), so this also applies across a Fast-Refresh reload. ──
+    const bootSceneOverride = await backendFetch('/api/boot-scene')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { scene?: string | null } | null) => data?.scene ?? null)
+      .catch(() => null);
+    const sceneList = getAllAssets().filter((a) => a.type === 'scene').map((a) => a.path);
+    const resolvedOverride = resolveBootSceneOverride(bootSceneOverride, sceneList);
+    // Precompute the override's canonical form (best-effort) purely so the don't-clobber
+    // check below can recognize it after loadFirstScene canonicalizes it again internally.
+    let canonicalOverride: string | null = null;
+    if (resolvedOverride) {
+      canonicalOverride = await canonicalBootScenePath(resolvedOverride, fetch, projectRoot).catch(() => resolvedOverride);
+    }
+
+    // The override slots in FRONT of the normal candidates — never replaces them — so a
+    // bad/missing override degrades to the remembered scene (or config default) rather
+    // than a blank world. That ordering lives in resolveSceneCandidates, not here.
+    const candidates = resolveSceneCandidates(lastScene, options.config.scenePath, resolvedOverride);
 
     // Boot the working-copy scene, not a hashed bundle copy, so saves +
     // external-edit hot-reload round-trip in a built/cloud editor (gap #2); pass
@@ -455,7 +627,30 @@ export function createEditor(options: EditorOptions): React.ComponentType {
       load: (p) => loadScene(p, options.gameId),
     });
     if (loadedPath) {
-      localStorage.setItem(LAST_SCENE_KEY, loadedPath);
+      // Don't clobber the remembered scene with a one-off override (#43) — a `--scene` launch
+      // must not change where the human's NEXT bare launch lands, or an agent's throwaway
+      // launch silently moves them.
+      //
+      // NOT-ENOUGH-TO-SKIP-THE-WRITE, measured: `loadScene()` calls `setCurrentScenePath()`
+      // (scene/serialize.ts), which writes this very key on EVERY scene switch — so by the time
+      // we get here the override has ALREADY been persisted, and merely omitting a write here
+      // changes nothing. Confirmed by tracing `Storage.setItem` across a real boot with a
+      // `--scene` override: setCurrentScenePath fires first with the OVERRIDE's path, so the
+      // prior value has to be put back explicitly rather than just left alone.
+      //
+      // Only the PER-PROJECT key is restored. The unscoped legacy `modoki-last-scene` is a
+      // "scene currently open" proxy for SceneView's prefab-return and devTestBridge, so it must
+      // keep tracking the scene actually loaded — rewinding that one would send prefab-return to
+      // a scene the user is not in.
+      const cameFromOverride = resolvedOverride != null && (loadedPath === resolvedOverride || loadedPath === canonicalOverride);
+      if (cameFromOverride) {
+        if (lastScene) localStorage.setItem(LAST_SCENE_KEY, lastScene);
+        else localStorage.removeItem(LAST_SCENE_KEY);
+      } else {
+        // The override missed (typo/ambiguous) and boot fell through to the remembered or
+        // default candidate — that IS a normal boot, so persist it as usual.
+        localStorage.setItem(LAST_SCENE_KEY, loadedPath);
+      }
       // Re-open the clip the user was editing last time (same scene only).
       restoreLastAnimationClip();
       return;
@@ -479,13 +674,28 @@ export function createEditor(options: EditorOptions): React.ComponentType {
     console.log('[Editor] Created empty scene with default camera');
   })();
 
-  // Lazy-import EditorApp. We intentionally do NOT gate on `sceneReady`:
-  // sceneReady awaits `rendererReady`, which only fires once SceneView
-  // (inside EditorApp) mounts its WebGPU renderer. EditorApp must therefore
-  // mount BEFORE sceneReady resolves. The empty initial world renders fine
-  // for a fraction of a second until the scene populates entities.
-  // sceneReady is awaited here only to keep the promise rejection visible.
+  // Lazy-import EditorApp. sceneReady no longer depends on it mounting (that dependency was
+  // the renderer gate this plan removed), but EditorApp still owns the SceneView/GameView that
+  // WOULD register a renderer, so it must still mount for the watchdog below to have any
+  // chance of seeing one. The empty initial world renders fine for a fraction of a second
+  // until the scene populates entities. sceneReady is awaited here only to keep the promise
+  // rejection visible — a real failure (e.g. a scene file 404) is still worth logging loudly.
   sceneReady.catch((e) => console.error('[Editor] scene load failed:', e));
+
+  // Renderer-health watchdog — no longer on the scene-load critical path (the scene's entity
+  // data loads regardless of whether any 3D viewport exists). Always reports a DEFINITIVE
+  // renderer init failure fast (a viewport actually tried and threw — a real error, never
+  // suppressed). Otherwise — once `resolvedRender3d` settles false and no viewport ever begins
+  // — the fast (12s), soft (15s), and hard-cap (120s) "nothing is rendering" messages are ALL
+  // suppressed: a 2D-only project should see zero renderer-health noise. Suppression lifts the
+  // moment a viewport DOES begin (e.g. the user opens one anyway).
+  void awaitRendererReady(rendererReady, RENDERER_READY_TIMEOUT_MS, undefined, {
+    failed: rendererInitFailedPromise(),
+    progress: getRendererProgress,
+    hasViewportBegun: hasViewportBegunInit,
+    shouldWarnNoViewport: () => resolvedRender3d !== false,
+  }).catch((e) => console.warn(`[Editor] ${(e as Error).message}`));
+
   const LazyEditor = React.lazy(() => import('./EditorApp'));
 
   const EditorWrapper: React.FC = () => (

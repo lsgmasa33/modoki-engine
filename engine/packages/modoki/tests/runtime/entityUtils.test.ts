@@ -5,6 +5,12 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createWorld, trait } from 'koota';
+import type { EntityInfo } from '../../src/runtime/core/ecs/entityUtils';
+
+// "no stored layer" reaches deriveLayer as `undefined`, never as ''. The EntityAttributes
+// trait does store '' (Light/HDR/ModelSource/group nodes), but getAllEntities narrows that
+// — along with any unrecognised string — to undefined before calling. #36.
+const NO_LAYER: EntityInfo['layer'] = undefined;
 
 // Real traits matching modoki runtime
 const Transform = trait({
@@ -35,6 +41,16 @@ const Library = trait(() => ({
   retarget: false as boolean,
   boneMaps: {} as Record<string, Record<string, string>>,
 }));
+
+// SoA trait with a persistent field the Inspector does NOT list — mirrors Animator,
+// whose `clips` bank + active `clip` are owned by a custom Inspector section
+// (AnimatorClipsSection) and so are absent from meta.fields BY DESIGN. Exercises the
+// rule that persistence is keyed on the koota SCHEMA, never on meta.fields.
+const Player = trait({
+  clips: '[]' as string,
+  clip: '' as string,
+  speed: 1,
+});
 
 let testWorld: ReturnType<typeof createWorld>;
 const entityIndex = new Map<number, any>();
@@ -74,6 +90,11 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
       // Only `retarget` is a curated Inspector field; animSets/boneMaps are AoS-only.
       name: 'Library', trait: Library, category: 'component',
       fields: { retarget: { type: 'boolean' } },
+    },
+    {
+      // Only `speed` is generic; `clips`/`clip` are owned by a custom Inspector section.
+      name: 'Player', trait: Player, category: 'component',
+      fields: { speed: { type: 'number' } },
     },
     { name: 'Renderable3D', trait: Renderable3D, category: 'component', fields: {} },
     { name: 'Renderable2D', trait: Renderable2D, category: 'component', fields: {} },
@@ -233,6 +254,25 @@ describe('readTraitData', () => {
     expect(data.x).toBe(1);
     expect(data.sy).toBe(3);
     expect(Object.keys(data).sort()).toEqual(['rx', 'ry', 'rz', 'sx', 'sy', 'sz', 'x', 'y', 'z']);
+  });
+
+  // ── SoA fields hidden from the Inspector (the Animator.clips data loss) ──
+  it('readTraitData DROPS a SoA field absent from meta.fields (the persistence trap)', async () => {
+    const { readTraitData, getEntityTraits } = await getUtils();
+    const entity = testWorld.spawn(EntityAttributes({ name: 'P' }), Player({ clips: '[{"name":"skin"}]', clip: 'skin', speed: 2 }));
+    entityIndex.set(entity.id(), entity);
+    const meta = getEntityTraits(entity.id()).find(t => t.name === 'Player')!;
+    // Documents WHY no persistence path may use this reader: it is the Inspector's
+    // view, and a save built on it silently erases the two authored fields.
+    expect(readTraitData(entity.id(), meta)).toEqual({ speed: 2 });
+  });
+
+  it('readTraitDataFull keeps a SoA field absent from meta.fields', async () => {
+    const { readTraitDataFull, getEntityTraits } = await getUtils();
+    const entity = testWorld.spawn(EntityAttributes({ name: 'P' }), Player({ clips: '[{"name":"skin"}]', clip: 'skin', speed: 2 }));
+    entityIndex.set(entity.id(), entity);
+    const meta = getEntityTraits(entity.id()).find(t => t.name === 'Player')!;
+    expect(readTraitDataFull(entity.id(), meta)).toEqual({ clips: '[{"name":"skin"}]', clip: 'skin', speed: 2 });
   });
 });
 
@@ -641,27 +681,27 @@ describe('getTrait / setTrait (typed, direct component access)', () => {
 describe('deriveLayer (F8 — reconcile stored layer against the present renderable trait)', () => {
   it('maps each primary renderable trait to its layer regardless of stored value', async () => {
     const { deriveLayer } = await getUtils();
-    expect(deriveLayer(['Transform', 'Renderable3D'], '')).toBe('3d');
-    expect(deriveLayer(['Transform', 'Renderable3DPrimitive'], '')).toBe('3d');
-    expect(deriveLayer(['Transform', 'Renderable2D'], '')).toBe('2d');
-    expect(deriveLayer(['Transform', 'Text3D'], '')).toBe('3d');
-    expect(deriveLayer(['Transform', 'Text2D'], '')).toBe('2d');
-    expect(deriveLayer(['UIElement', 'RenderableUI'], '')).toBe('ui');
-    expect(deriveLayer(['RenderableUI'], '')).toBe('ui');
+    expect(deriveLayer(['Transform', 'Renderable3D'], NO_LAYER)).toBe('3d');
+    expect(deriveLayer(['Transform', 'Renderable3DPrimitive'], NO_LAYER)).toBe('3d');
+    expect(deriveLayer(['Transform', 'Renderable2D'], NO_LAYER)).toBe('2d');
+    expect(deriveLayer(['Transform', 'Text3D'], NO_LAYER)).toBe('3d');
+    expect(deriveLayer(['Transform', 'Text2D'], NO_LAYER)).toBe('2d');
+    expect(deriveLayer(['UIElement', 'RenderableUI'], NO_LAYER)).toBe('ui');
+    expect(deriveLayer(['RenderableUI'], NO_LAYER)).toBe('ui');
   });
 
   it('the present renderable trait WINS over a drifted stored layer', async () => {
     const { deriveLayer } = await getUtils();
-    // A Renderable2D entity stuck at '3d', a Renderable3DPrimitive stuck at '' — both reconciled.
+    // A Renderable2D entity stuck at '3d', a Renderable3DPrimitive with none stored — both reconciled.
     expect(deriveLayer(['Renderable2D'], '3d')).toBe('2d');
-    expect(deriveLayer(['Renderable3DPrimitive'], '')).toBe('3d');
+    expect(deriveLayer(['Renderable3DPrimitive'], NO_LAYER)).toBe('3d');
   });
 
   it('falls back to the stored layer when no primary renderable trait is present', async () => {
     const { deriveLayer } = await getUtils();
     // Light / HDR / ModelSource / group nodes have no unambiguous primary renderer.
     expect(deriveLayer(['Light'], '3d')).toBe('3d');
-    expect(deriveLayer(['Transform'], '')).toBe('');
+    expect(deriveLayer(['Transform'], NO_LAYER)).toBeUndefined();
     expect(deriveLayer([], 'ui')).toBe('ui');
   });
 });
@@ -686,5 +726,21 @@ describe('getAllEntities — layer reconciliation (F8)', () => {
     expect(all.find(e => e.id === ui.id())!.layer).toBe('ui');
     expect(all.find(e => e.id === light.id())!.layer).toBe('3d');
     expect(all.find(e => e.id === group.id())!.layer).toBeUndefined();
+  });
+
+  it('narrows an unrecognised stored layer to undefined rather than passing it through', async () => {
+    const { getAllEntities } = await getUtils();
+    // `attr` is read as unknown-typed data out of hot-reloadable scene JSON, so a
+    // hand-edited `"layer": "3D"` casing typo is reachable. It must NOT reach a consumer:
+    // EntityInfo['layer'] is the three real layers or undefined, nothing else. #36.
+    const typo = testWorld.spawn(Transform(), EntityAttributes({ name: 'Typo', layer: '3D' as '3d' }));
+    // A renderable trait still wins over the junk — derivation doesn't consult it at all.
+    const junkButRenderable = testWorld.spawn(
+      Renderable2D(), EntityAttributes({ name: 'JunkButRenderable', layer: 'sprite' as '2d' }),
+    );
+
+    const all = getAllEntities();
+    expect(all.find(e => e.id === typo.id())!.layer).toBeUndefined();
+    expect(all.find(e => e.id === junkButRenderable.id())!.layer).toBe('2d');
   });
 });

@@ -4,10 +4,10 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createWorld } from 'koota';
 import { getCurrentWorld, loadSceneFile, SCENE_FORMAT_VERSION } from '@modoki/engine/runtime';
 import { Transform, Renderable3D, Renderable3DPrimitive, EntityAttributes, Time, Paused, Transient, PrefabInstance } from '@modoki/engine/runtime';
-import { RenderableUI, UIElement, UIBinding, UIAction } from '@modoki/engine/runtime';
+import { RenderableUI, UIElement, UIBinding, UIAction, type UIActionBinding } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { TestPhase, registerTestGameTraits } from './_fixtures/testGame';
-import { serializeScene } from '@modoki/engine/editor';
+import { serializeScene, isTraitDefault } from '@modoki/engine/editor';
 
 // Ensure traits are registered (idempotent — registerTrait overwrites)
 registerAllTraits();
@@ -66,16 +66,22 @@ describe('serializeScene', () => {
     const hero = scene.entities.find((e) => e.name === 'hero');
     const rend = hero!.traits['Renderable3D'] as Record<string, unknown>;
     expect(rend.mesh).toBe(HERO_MESH_GUID);
-    expect(rend.isVisible).toBe(true);
+    // `isVisible` is left at its schema default (true) by this fixture, so it is
+    // deliberately ABSENT — the loader re-derives it. Asserting `true` here used to
+    // pass for the wrong reason; the authored-value assertion is `mesh` above.
+    // See traitDefaultOmission.test.ts for the rule itself.
+    expect(rend).not.toHaveProperty('isVisible');
   });
 
   it('serializes Renderable3DPrimitive trait data', async () => {
     const scene = await serializeScene();
     const prim = scene.entities.find((e) => e.name === 'prim');
     const rend = prim!.traits['Renderable3DPrimitive'] as Record<string, unknown>;
-    expect(rend.mesh).toBe('cube');
+    // color + size are authored away from their defaults (0xffffff / 1) → written.
     expect(rend.color).toBe(0x00ff00);
     expect(rend.size).toBe(2);
+    // mesh IS 'cube', which is also the schema default → omitted, and reloads as 'cube'.
+    expect(rend).not.toHaveProperty('mesh');
   });
 
   it('serializes resource entities', async () => {
@@ -252,35 +258,55 @@ describe('serializeScene', () => {
   // Regression guard: serialization must emit EVERY field a trait defines in its
   // schema, not just the curated Inspector fields (meta.fields). A re-serialization
   // that only wrote meta.fields silently dropped the chat-input wiring
-  // (elementType/inputBinding/onChange/onSubmit) from the llm/chess scenes.
+  // (elementType/inputBinding/bindings) from the llm/chess scenes.
   it('serializes the full trait schema, not just curated Inspector fields', async () => {
-    getCurrentWorld().spawn(
+    const node0 = getCurrentWorld().spawn(
       RenderableUI(),
       EntityAttributes({ name: 'chat-input', isActive: true, layer: 'ui' }),
       UIElement({ elementType: 'input', placeholder: 'Type a message...' }),
       UIBinding({ inputBinding: 'inputText' }),
-      UIAction({ onChange: 'llm.setInputText', onSubmit: 'llm.sendMessage' }),
+      UIAction({
+        bindings: [
+          { event: 'change', kind: 'call', action: 'llm.setInputText' },
+          { event: 'submit', kind: 'call', action: 'llm.sendMessage' },
+        ],
+      }),
     );
+    // The live values the file is compared against below.
+    const liveUIElement = { ...(node0.get(UIElement) as Record<string, unknown>) };
 
     const scene = await serializeScene();
     const node = scene.entities.find((e) => e.name === 'chat-input');
     expect(node).toBeDefined();
 
-    // Every UIElement schema field must be present in the serialized output —
-    // this fails if the serializer only writes the curated meta.fields subset.
-    const schemaKeys = Object.keys((UIElement as unknown as { schema: object }).schema).sort();
+    // The regression this guards: the serializer once wrote only the curated
+    // `meta.fields` subset, silently dropping schema-only fields — which is how a
+    // re-save wiped the chat inputs in the llm/chess scenes. `elementType` and
+    // `placeholder` are exactly such fields, so a return to the curated read fails here.
+    //
+    // The instrument is no longer "serialized keys === ALL schema keys": a field still
+    // holding its schema default is now deliberately omitted so the default stays live
+    // (traitDefaultOmission.test.ts). So the expectation is every schema field the
+    // fixture actually AUTHORED — which still covers the schema-only ones, since both
+    // authored fields above are schema-only.
+    const schema = (UIElement as unknown as { schema: Record<string, unknown> }).schema;
     const serializedKeys = Object.keys(node!.traits.UIElement as object).sort();
-    expect(serializedKeys).toEqual(schemaKeys);
+    const authoredKeys = Object.keys(schema)
+      .filter((k) => !isTraitDefault(liveUIElement[k], schema[k]))
+      .sort();
+    expect(serializedKeys).toEqual(authoredKeys);
+    // …and nothing outside the schema leaked in.
+    expect(serializedKeys.every((k) => k in schema)).toBe(true);
 
     // …and the input wiring round-trips with the right values.
     const ui = node!.traits.UIElement as Record<string, unknown>;
     const bind = node!.traits.UIBinding as Record<string, unknown>;
-    const act = node!.traits.UIAction as Record<string, unknown>;
+    const act = node!.traits.UIAction as { bindings: UIActionBinding[] };
     expect(ui.elementType).toBe('input');
     expect(ui.placeholder).toBe('Type a message...');
     expect(bind.inputBinding).toBe('inputText');
-    expect(act.onChange).toBe('llm.setInputText');
-    expect(act.onSubmit).toBe('llm.sendMessage');
+    expect(act.bindings).toContainEqual({ event: 'change', kind: 'call', action: 'llm.setInputText' });
+    expect(act.bindings).toContainEqual({ event: 'submit', kind: 'call', action: 'llm.sendMessage' });
   });
 });
 

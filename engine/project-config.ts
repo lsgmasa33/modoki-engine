@@ -3,15 +3,31 @@
  *
  *  This file is intentionally PURE (no Node imports) so it is safe for the
  *  browser type graph. The Node-side reader lives in
- *  plugins/load-project-config.ts; the browser receives resolved values via
+ *  plugins/load-project-config.ts; the browser receives resolved VALUES via
  *  the `virtual:modoki-project-config` module (see vite-asset-scanner.ts).
+ *
+ *  That "values come from the virtual module" rule is about the resolved CONFIG,
+ *  not about this module as a whole: the string-union constants below (ORIENTATIONS,
+ *  TONE_MAPPINGS, …) are imported as real values by the editor's Project Settings
+ *  (app/editor/setup.ts) so the dropdowns and the validator cannot drift. That is
+ *  safe precisely because this file is import-free — and it costs a game build
+ *  nothing, since setup.ts only exists in the `__MODOKI_EDITOR__` chunk.
  *
  *  TWO FILES (deliberate split):
  *   - project.config.json  — COMMITTED, shareable project data (identity, scenes,
  *     web deploy target, renderer/physics, capacitor). Owned by {@link ProjectConfig}.
  *   - project.user.json    — GITIGNORED, per-machine settings (which physical device
  *     to deploy to, local SDK paths). Owned by {@link ProjectUserConfig}. Never
- *     committed, so one dev's device UDID / JAVA path never leaks into the repo. */
+ *     committed, so one dev's device UDID / JAVA path never leaks into the repo.
+ *
+ *  THE FILE STAYS MINIMAL. project.config.json records only what the project
+ *  CHOSE; everything else resolves from {@link DEFAULT_PROJECT_CONFIG} at load.
+ *  So a save must never write back the fully-RESOLVED config — that bakes today's
+ *  engine defaults into every project (it once handed an internal game the demo
+ *  deploy bucket) and hard-couples the file to the defaults of the day. Writers go
+ *  through {@link deepMergeConfigPatch} + {@link pruneProjectConfig}; readers go
+ *  through {@link mergeProjectConfig}. Don't collapse those two merges into one —
+ *  see the note on deepMergeConfigPatch. */
 
 /** A project's declaration of one model postprocessor (the Stage-A bake recipe
  *  for a GLB). The PROJECT owns this — the engine no longer hardcodes per-game
@@ -100,7 +116,7 @@ export interface ProjectConfig {
      *   - `custom` → run webDeployCommand (uses {dist} {base}); bucket/CDN ignored.
      *  The webBucket / webCdn* fields ONLY apply in `gcs` mode; webDeployCommand
      *  ONLY in `custom`. */
-    webDeployMode: 'none' | 'gcs' | 'custom';
+    webDeployMode: (typeof WEB_DEPLOY_MODES)[number];
     /** GCS bucket the web build is rsynced to (gcs mode). */
     webBucket: string;
     /** Vite BASE_PATH for the web build (sub-path hosting). */
@@ -160,7 +176,7 @@ export interface ProjectConfig {
     playableClickUrl: string;
     /** Ad network the playable targets (Phase 5/8) — reserved for per-network CTA/
      *  MRAID quirks. Default 'applovin'. */
-    playableNetwork: string;
+    playableNetwork: (typeof PLAYABLE_NETWORKS)[number];
   };
   /** Native Capacitor shell settings, synthesized into `capacitor.config.json`
    *  (previously hardcoded in the generator) plus native-project patches applied
@@ -169,13 +185,13 @@ export interface ProjectConfig {
     /** Web assets dir Capacitor serves from (relative to the project). */
     webDir: string;
     /** iOS `preferredContentMode` ('mobile' | 'desktop' | 'recommended'). */
-    iosContentMode: string;
+    iosContentMode: (typeof IOS_CONTENT_MODES)[number];
     /** Android URL scheme ('http' | 'https'). */
-    androidScheme: string;
+    androidScheme: (typeof ANDROID_SCHEMES)[number];
     /** Android `allowMixedContent`. */
     allowMixedContent: boolean;
     /** Capacitor Keyboard plugin `resize` mode ('none' | 'native' | 'body' | 'ionic'). */
-    keyboardResize: string;
+    keyboardResize: (typeof KEYBOARD_RESIZE_MODES)[number];
     /** Supported device orientation → iOS UISupportedInterfaceOrientations +
      *  Android android:screenOrientation. 'auto' = allow both portrait+landscape. */
     orientation: 'auto' | 'portrait' | 'landscape';
@@ -199,7 +215,7 @@ export interface ProjectConfig {
       pixelRatioCap: number;
       shadows: boolean;
       /** Tone-mapping operator ('ACESFilmic' | 'AgX' | 'Neutral' | 'Linear' | 'None'). */
-      toneMapping: string;
+      toneMapping: (typeof TONE_MAPPINGS)[number];
       exposure: number;
     };
     pixi: {
@@ -208,6 +224,9 @@ export interface ProjectConfig {
       antialias: boolean;
       /** Pixi renderer resolution; 0 = auto (devicePixelRatio). */
       resolution: number;
+      /** Upper bound on devicePixelRatio for the auto path only (perf vs sharpness);
+       *  a pinned `resolution` above is never capped. Mirrors `three.pixelRatioCap`. */
+      pixelRatioCap: number;
     };
     /** How the web canvas is sized in the browser build:
      *   - `free`  → fill the window responsively (default).
@@ -333,7 +352,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   rendering: {
     targetFps: 60, // matches the frame driver's historical default cap
     three: { backend: 'auto', antialias: true, pixelRatioCap: 2, shadows: true, toneMapping: 'ACESFilmic', exposure: 1.2 },
-    pixi: { backend: 'auto', antialias: true, resolution: 0 },
+    pixi: { backend: 'auto', antialias: true, resolution: 0, pixelRatioCap: 2 },
     web: { sizeMode: 'free', width: 1280, height: 720 },
   },
   physics: {
@@ -366,23 +385,162 @@ export const DEFAULT_PROJECT_USER_CONFIG: ProjectUserConfig = {
   },
 };
 
+/** Coerce a hand-edited string-union field to a value a consumer actually handles.
+ *
+ *  The file is committed JSON a human (or an older tool) edits by hand, and the
+ *  merge below is a plain spread — so an out-of-union string used to flow straight
+ *  through, TYPED as the union, and land on whatever branch the consumer's `!==`
+ *  guards happened to leave. That is silent and wrong, not loud and wrong:
+ *  `rendering.web.sizeMode: "portrait"` (games/sling, issue #25 — the native
+ *  `capacitor.orientation` vocabulary leaking into the web sizing field) rendered
+ *  identically to `free` for months, ignoring the 1080×1920 sitting next to it,
+ *  and showed as an unmatched blank in the Project Settings dropdown.
+ *
+ *  Falling back to the DEFAULT (rather than throwing) keeps a typo'd config
+ *  openable in the editor, which is the same call the malformed-JSON read path
+ *  makes; the warn is what stops it being silent. Coercions are also RECORDED (the
+ *  optional `issues` sink) so a UI can say it happened — see
+ *  {@link projectConfigIssues}. */
+function oneOf<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  fallback: T,
+  path: string,
+  issues?: ProjectConfigIssue[],
+): T {
+  if (value === undefined) return fallback;
+  if (typeof value === 'string' && (allowed as readonly string[]).includes(value)) return value as T;
+  const message = `${path}: ${JSON.stringify(value)} is not one of ` +
+    `${allowed.map((a) => JSON.stringify(a)).join(' | ')} — using ${JSON.stringify(fallback)}.`;
+  if (issues) issues.push({ path, value, allowed: allowed as readonly string[], using: fallback, message });
+  else console.warn(`[project-config] ${message}`); // a collector means someone is reporting it; don't double-log
+  return fallback;
+}
+
+/** One out-of-union value found while resolving a config (see {@link oneOf}). */
+export interface ProjectConfigIssue {
+  /** Dot-path of the offending field, e.g. `rendering.web.sizeMode`. */
+  path: string;
+  /** What the file actually said. */
+  value: unknown;
+  /** The values a consumer handles. */
+  allowed: readonly string[];
+  /** What the resolved config is using instead. */
+  using: string;
+  /** Display-ready one-liner. */
+  message: string;
+}
+
+/** The out-of-union values in a raw config, WITHOUT resolving it for use.
+ *
+ *  Exists because coercing silently trades one invisible problem for another: before
+ *  it, a bad `sizeMode` showed as an unmatched BLANK in the Project Settings dropdown
+ *  (odd-looking, so maybe noticed); after it, the dropdown reads "Free" and looks
+ *  perfectly correct while the file still says `portrait` — and the write path
+ *  deliberately keeps the file's word, so the two disagree indefinitely. That is the
+ *  same "plausible-looking lie" the `configErrors` diagnostic was invented for on this
+ *  very route (a malformed file rendering as engine defaults with nothing saying so),
+ *  so it gets the same treatment: the GET reports it, the dialog shows it. */
+export function projectConfigIssues(partial: Partial<ProjectConfig> | null | undefined): ProjectConfigIssue[] {
+  const issues: ProjectConfigIssue[] = [];
+  mergeProjectConfig(partial, { issues });
+  return issues;
+}
+
+/** The legal value sets for every string-union config field — ONE source, exported, so the
+ *  type, the merge-time validator and (via a guard test) the editor's select options cannot
+ *  disagree. Before #39 each set existed up to three times: as a TS union, restated in a doc
+ *  comment, and hardcoded again in the Project Settings dropdown.
+ *
+ *  Kept here rather than beside each consumer because this file is deliberately IMPORT-FREE
+ *  (see the header) — a set defined in the package could not be reached from here without
+ *  breaking that. The one place that costs us is `TONE_MAPPINGS`, whose consumer
+ *  (`resolveToneMapping`, in the package) owns the name→THREE mapping; the pairing is held by
+ *  a guard test instead of by an import. */
+export const WEB_SIZE_MODES = ['free', 'fixed', 'max'] as const;
+export const GPU_BACKENDS = ['auto', 'webgpu', 'webgl'] as const;
+export const WEB_DEPLOY_MODES = ['none', 'gcs', 'custom'] as const;
+/** Ad-network MRAID/CTA conventions for the playable export. */
+export const PLAYABLE_NETWORKS = ['applovin', 'unity', 'ironsource', 'facebook', 'mintegral', 'generic'] as const;
+export const CAPACITOR_ORIENTATIONS = ['auto', 'portrait', 'landscape'] as const;
+export const STATUS_BAR_STYLES = ['default', 'light', 'dark'] as const;
+/** Capacitor `ios.preferredContentMode` (see addNativeTarget.ts). */
+export const IOS_CONTENT_MODES = ['mobile', 'desktop', 'recommended'] as const;
+/** Capacitor `server.androidScheme`. Capacitor itself tolerates a custom scheme, but this
+ *  project has only ever meant one of these two — widen the set deliberately if that changes,
+ *  rather than by typo. */
+export const ANDROID_SCHEMES = ['http', 'https'] as const;
+/** Capacitor Keyboard plugin `resize` mode. */
+export const KEYBOARD_RESIZE_MODES = ['none', 'native', 'body', 'ionic'] as const;
+/** three.js tone-mapping names. MUST stay in step with `resolveToneMapping`'s switch in
+ *  runtime/rendering/renderSettings.ts — that function owns the name→THREE constant mapping and
+ *  falls unknown back to ACESFilmic, which is exactly why a typo was invisible (#39): the most
+ *  common intended value IS the fallback. Guarded by a test that compares the two. */
+export const TONE_MAPPINGS = ['None', 'Linear', 'ACESFilmic', 'AgX', 'Neutral'] as const;
+
 /** Merge a (possibly partial) config object over the defaults. Pure — usable in
  *  both the Node loader and the browser. Nested objects are merged one level so a
- *  partial `rendering`/`physics`/`capacitor` doesn't wipe sibling defaults. */
-export function mergeProjectConfig(partial: Partial<ProjectConfig> | null | undefined): ProjectConfig {
+ *  partial `rendering`/`physics`/`capacitor` doesn't wipe sibling defaults.
+ *  EVERY string-union field in the config is validated (see {@link oneOf}).
+ *
+ *  `coerceUnions:false` turns that validation OFF, and the WRITE path must use it.
+ *  The editor's save resolves the patched config through this function and writes the
+ *  RESULT back (pruned), so with coercion on, pressing Apply on an unrelated section
+ *  would silently rewrite an out-of-union value the author never touched. That is not
+ *  a harmless heal: `sizeMode: "portrait"` is what revealed sling was *meant* to be
+ *  portrait (issue #25) — normalizing it to `free` on some unrelated save would have
+ *  erased the only evidence of intent and left a file that merely looked correct.
+ *  Reading coerces (so the engine renders something a consumer handles); writing
+ *  round-trips (so the file keeps saying what its author said). */
+export function mergeProjectConfig(
+  partial: Partial<ProjectConfig> | null | undefined,
+  opts?: { coerceUnions?: boolean; issues?: ProjectConfigIssue[] },
+): ProjectConfig {
   const p = partial ?? {};
   const d = DEFAULT_PROJECT_CONFIG;
+  const pick = <T extends string>(value: unknown, allowed: readonly T[], fallback: T, path: string): T =>
+    // `=== undefined`, not `??`: with coercion off this must round-trip whatever the
+    // file said, and a hand-written `null` is something the author wrote too.
+    opts?.coerceUnions === false ? (value === undefined ? fallback : (value as T)) : oneOf(value, allowed, fallback, path, opts?.issues);
   return {
     app: { ...d.app, ...p.app },
     content: { ...d.content, ...p.content },
-    build: { ...d.build, ...p.build, modules: { ...d.build.modules, ...p.build?.modules } },
-    capacitor: { ...d.capacitor, ...p.capacitor },
+    build: {
+      ...d.build, ...p.build,
+      modules: { ...d.build.modules, ...p.build?.modules },
+      // #39: these were plain spreads, so an out-of-union value flowed through untouched and the
+      // deploy/playable step silently picked a branch for it.
+      webDeployMode: pick(p.build?.webDeployMode, WEB_DEPLOY_MODES, d.build.webDeployMode, 'build.webDeployMode'),
+      playableNetwork: pick(p.build?.playableNetwork, PLAYABLE_NETWORKS, d.build.playableNetwork, 'build.playableNetwork'),
+    },
+    capacitor: {
+      ...d.capacitor, ...p.capacitor,
+      // #39: written into NATIVE config verbatim, so a typo here ships. `orientation` is the
+      // sharp one — a bad value silently unlocks rotation on BOTH platforms (iOS falls back to
+      // `auto` in healNativeConfig, Android to `fullSensor`) while the launch log echoes the value
+      // you wrote, so the log looks correct.
+      orientation: pick(p.capacitor?.orientation, CAPACITOR_ORIENTATIONS, d.capacitor.orientation, 'capacitor.orientation'),
+      statusBarStyle: pick(p.capacitor?.statusBarStyle, STATUS_BAR_STYLES, d.capacitor.statusBarStyle, 'capacitor.statusBarStyle'),
+      iosContentMode: pick(p.capacitor?.iosContentMode, IOS_CONTENT_MODES, d.capacitor.iosContentMode, 'capacitor.iosContentMode'),
+      androidScheme: pick(p.capacitor?.androidScheme, ANDROID_SCHEMES, d.capacitor.androidScheme, 'capacitor.androidScheme'),
+      keyboardResize: pick(p.capacitor?.keyboardResize, KEYBOARD_RESIZE_MODES, d.capacitor.keyboardResize, 'capacitor.keyboardResize'),
+    },
     rendering: {
       ...d.rendering,
       ...p.rendering,
-      three: { ...d.rendering.three, ...p.rendering?.three },
-      pixi: { ...d.rendering.pixi, ...p.rendering?.pixi },
-      web: { ...d.rendering.web, ...p.rendering?.web },
+      three: {
+        ...d.rendering.three, ...p.rendering?.three,
+        backend: pick(p.rendering?.three?.backend, GPU_BACKENDS, d.rendering.three.backend, 'rendering.three.backend'),
+        toneMapping: pick(p.rendering?.three?.toneMapping, TONE_MAPPINGS, d.rendering.three.toneMapping, 'rendering.three.toneMapping'),
+      },
+      pixi: {
+        ...d.rendering.pixi, ...p.rendering?.pixi,
+        backend: pick(p.rendering?.pixi?.backend, GPU_BACKENDS, d.rendering.pixi.backend, 'rendering.pixi.backend'),
+      },
+      web: {
+        ...d.rendering.web, ...p.rendering?.web,
+        sizeMode: pick(p.rendering?.web?.sizeMode, WEB_SIZE_MODES, d.rendering.web.sizeMode, 'rendering.web.sizeMode'),
+      },
     },
     physics: {
       ...d.physics,
@@ -401,6 +559,152 @@ export function mergeProjectUserConfig(partial: Partial<ProjectUserConfig> | nul
     device: { ...d.device, ...p.device },
     sdk: { ...d.sdk, ...p.sdk },
   };
+}
+
+/** The on-disk shape of either config file: whatever subset of the config the
+ *  project actually chose to record. NOT the resolved config — see the
+ *  file-stays-minimal invariant below. */
+export type RawProjectConfig = Record<string, unknown>;
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/** Keys that must never be copied out of an untrusted patch body: assigning
+ *  `out.__proto__` reparents the object instead of adding a property, so the key
+ *  silently vanishes from the written JSON (and can reshape the merge result).
+ *  JSON.parse DOES produce these as own properties, so a body can carry them. */
+const FORBIDDEN_PATCH_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/** Deep-merge a (possibly partial) PATCH onto a BASE. This is the WRITE-time
+ *  merge — the counterpart to {@link mergeProjectConfig}, which is the LOAD-time
+ *  resolver that merges over the DEFAULTS. Keep them separate: "resolve what this
+ *  project's values are" and "apply an edit to what's on disk" are different
+ *  operations, and conflating them is what made a partial save destructive.
+ *
+ *  Rules:
+ *   - Plain objects merge recursively, so a patch touching only `build.debugBuild`
+ *     leaves `app.*` and the rest of `build` alone.
+ *   - ARRAYS ARE LEAVES — replaced wholesale, never concatenated or index-merged.
+ *     Otherwise you could never remove a `content.scenes` entry or a physics layer.
+ *   - A key PRESENT in the patch always wins, including `""`, `false` and `0`.
+ *     Only ABSENCE means "don't touch" — which is what lets the Project Settings
+ *     dialog (which posts the whole object) still blank a field.
+ *   - `undefined` in the patch is treated as absent (JSON never produces it, but a
+ *     hand-built body might). `null` is NOT: no config field is nullable, so a null
+ *     is a caller mistake, and silently dropping it would be a false success. The
+ *     caller-facing check is {@link findNullPatchPaths}, which the route rejects on.
+ *   - MAP-LIKE sections can only be added to or updated, never pruned: `postprocessors`
+ *     is keyed by postprocessor id, and since objects merge recursively there is no way
+ *     to express "delete this entry" through a patch. Removing one means editing
+ *     project.config.json directly. Fixed-shape sections are unaffected, and arrays
+ *     (content.scenes, physics.layers) do support removal because they replace. */
+export function deepMergeConfigPatch(base: RawProjectConfig, patch: RawProjectConfig): RawProjectConfig {
+  const out: RawProjectConfig = { ...base };
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined || FORBIDDEN_PATCH_KEYS.has(k)) continue;
+    const prev = out[k];
+    out[k] = isPlainObject(v) && isPlainObject(prev) ? deepMergeConfigPatch(prev, v) : v;
+  }
+  return out;
+}
+
+/** Collect the dot-paths of every `null` in a patch body. No field in either config
+ *  is nullable, so a null means the caller wanted to CLEAR something and picked the
+ *  wrong value — writing it through poisons a typed field (`appName: null` survives
+ *  the merge and reaches consumers), and skipping it silently would report success
+ *  for an edit that did nothing. Reject instead, and say to use `""`/`false`/`0`. */
+export function findNullPatchPaths(patch: unknown, prefix = ''): string[] {
+  const out: string[] = [];
+  const at = (k: string | number) => (prefix ? `${prefix}.${k}` : String(k));
+  // Arrays too: content.scenes / physics.layers hold objects and strings, and a null
+  // smuggled inside one would otherwise slip past the guard the route relies on.
+  const entries: [string | number, unknown][] = Array.isArray(patch)
+    ? patch.map((v, i) => [i, v])
+    : isPlainObject(patch) ? Object.entries(patch) : [];
+  for (const [k, v] of entries) {
+    if (v === null) out.push(at(k));
+    else if (v && typeof v === 'object') out.push(...findNullPatchPaths(v, at(k)));
+  }
+  return out;
+}
+
+/** Prune a RESOLVED config down to what belongs in the file, so
+ *  project.config.json records only what the project CHOSE and everything else
+ *  resolves from {@link DEFAULT_PROJECT_CONFIG} at load time.
+ *
+ *  `onDisk` MUST be the file as it was BEFORE the edit, not the patched result.
+ *  Pass the patched config and every key is trivially "already present", so
+ *  nothing prunes — which is exactly what a full-object save from the Project
+ *  Settings dialog posts, and it would silently restore the write-the-resolved-
+ *  config bug for the most common human path. (Measured: it did.)
+ *
+ *  A key is emitted iff it differs from the default OR it was already explicitly
+ *  present in `onDisk`. The "already present" half is deliberate:
+ *   - it keeps existing project files byte-stable instead of slimming all of them
+ *     on their next save (quiet diffs), and
+ *   - it records deliberate intent: a project that chose today's default value
+ *     keeps that choice instead of silently following a future default change.
+ *  The "differs from default" half is what stops a save from INTRODUCING keys the
+ *  project never had — the bug that handed an internal game the demo deploy
+ *  bucket.
+ *
+ *  `defaults` is REQUIRED, not defaulted to DEFAULT_PROJECT_CONFIG: this function
+ *  serves BOTH config files, and silently pruning project.user.json against the
+ *  PROJECT defaults would match nothing and write every resolved value back —
+ *  including the repo owner's real device UDID, onto a machine that never set one.
+ *  Make the caller name which defaults it means.
+ *
+ *  INVARIANT: `mergeProjectConfig(pruneProjectConfig(resolved, onDisk, defaults))`
+ *  must deep-equal `resolved`. Pruning may never change what a project resolves to. */
+export function pruneProjectConfig(
+  resolved: RawProjectConfig,
+  onDisk: RawProjectConfig,
+  defaults: RawProjectConfig,
+): RawProjectConfig {
+  const kept: [string, unknown][] = [];
+  for (const [k, v] of Object.entries(resolved)) {
+    if (v === undefined) continue;
+    const def = defaults[k];
+    const disk = onDisk[k];
+    const onDiskHasKey = Object.prototype.hasOwnProperty.call(onDisk, k);
+    if (isPlainObject(v) && isPlainObject(def)) {
+      const nested = pruneProjectConfig(v, isPlainObject(disk) ? disk : {}, def);
+      // An empty nested result means every child matched its default and none was
+      // recorded — emit the branch only if the file already had it.
+      if (Object.keys(nested).length > 0 || onDiskHasKey) kept.push([k, nested]);
+      continue;
+    }
+    if (onDiskHasKey || !deepEqualJson(v, def)) kept.push([k, v]);
+  }
+  // Emit in the file's existing key order, with genuinely new keys appended in
+  // resolved order. Purely cosmetic, but it makes a no-op save a no-op DIFF —
+  // otherwise every project's config gets reordered the first time anyone opens
+  // Project Settings and hits OK, which reads as a real change in review.
+  const order = Object.keys(onDisk);
+  const rank = (k: string) => {
+    const i = order.indexOf(k);
+    return i === -1 ? Number.MAX_SAFE_INTEGER : i;
+  };
+  return Object.fromEntries(kept.map((e, i) => [e, i] as const)
+    .sort(([a, ia], [b, ib]) => rank(a[0]) - rank(b[0]) || ia - ib) // stable
+    .map(([e]) => e));
+}
+
+/** Structural equality over JSON-shaped values (used to compare a resolved value
+ *  against its default). Key ORDER is irrelevant; array order is not. */
+function deepEqualJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((x, i) => deepEqualJson(x, b[i]));
+  }
+  if (isPlainObject(a) && isPlainObject(b)) {
+    const ka = Object.keys(a);
+    const kb = Object.keys(b);
+    if (ka.length !== kb.length) return false;
+    return ka.every((k) => Object.prototype.hasOwnProperty.call(b, k) && deepEqualJson(a[k], b[k]));
+  }
+  return false;
 }
 
 export const PROJECT_CONFIG_FILENAME = 'project.config.json';

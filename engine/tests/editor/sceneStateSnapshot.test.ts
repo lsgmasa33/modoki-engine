@@ -45,11 +45,13 @@ const names = (d: ReturnType<typeof dumpSceneState>) => d.entities.map((e) => e.
 
 describe('dumpSceneState — S2 full-fidelity trait values', () => {
   it('omits uncurated fields by default, includes them with full:true', () => {
+    // `traits` is a dynamic per-entity bag (production types it `Record<string, unknown>`, its
+    // real declared shape, agentBridge.ts) — TS can't know `P2Full` is a key without that cast.
     const compact = dumpSceneState({ name: 'P2FullEnt' });
-    expect(compact.entities[0].traits.P2Full).toEqual({ a: 1 }); // `b` dropped (curated)
+    expect((compact.entities[0].traits as Record<string, unknown>).P2Full).toEqual({ a: 1 }); // `b` dropped (curated)
 
     const full = dumpSceneState({ name: 'P2FullEnt', full: true });
-    expect(full.entities[0].traits.P2Full).toEqual({ a: 1, b: 2 }); // `b` surfaced
+    expect((full.entities[0].traits as Record<string, unknown>).P2Full).toEqual({ a: 1, b: 2 }); // `b` surfaced
   });
 });
 
@@ -81,7 +83,7 @@ describe('dumpSceneState — S1 resource exclusion', () => {
   it('reaches a resource entity when its trait is targeted via trait=', () => {
     const d = dumpSceneState({ trait: 'P2Res' });
     const res = d.entities.find((e) => e.name === 'P2ResEnt');
-    expect(res?.traits.P2Res).toEqual({ path: 'x' });
+    expect((res?.traits as Record<string, unknown> | undefined)?.P2Res).toEqual({ path: 'x' });
   });
   it('reaches a resource entity when queried via where= (no silent empty)', () => {
     const d = dumpSceneState({ where: 'P2Res.path~x' });

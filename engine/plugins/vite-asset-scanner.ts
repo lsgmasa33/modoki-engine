@@ -11,7 +11,7 @@ import crypto, { randomUUID } from 'crypto';
 import type { Plugin } from 'vite';
 import { computeKeptAssets, formatBytes } from './asset-tree-shaker';
 import { assertNoConversionFallback, type ConversionFailure } from './asset-conversion-strict';
-import { loadProjectConfig, loadProjectUserConfig, validateBuildConfig } from './load-project-config';
+import { loadProjectConfig, loadProjectUserConfig, validateBuildConfig, projectConfigUnionErrors } from './load-project-config';
 import { findGamesEntry } from './findGamesEntry';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './backend/gcloud';
 import { projectAssetRoots } from '../scripts/projectRoots.mjs';
@@ -86,7 +86,7 @@ async function scaffoldNativeTarget(opts: {
   if (!(await runShell('npm install', 'npm install', projectRoot))) throw new Error('npm install failed');
   writeVendorMarker(projectRoot, v.expectedVendor); // record installed tarballs (D3)
   // 3. Web build → games/<id>/dist (cap add needs webDir to exist).
-  if (!(await runShell('Building web assets', 'node engine/scripts/build-web.mjs', buildCwd))) throw new Error('web build failed');
+  if (!(await runShell('Building web assets', 'node engine/scripts/build-web.mjs --target native', buildCwd))) throw new Error('web build failed');
   // 4. cap add (project) — generates the native project with the capacitor.config identity baked in.
   if (!(await runShell(`cap add ${platform}`, `npx cap add ${platform}`, projectRoot))) throw new Error(`cap add ${platform} failed`);
   // 5. Heal native config (local.properties / DEVELOPMENT_TEAM) + flag missing Firebase.
@@ -201,6 +201,15 @@ interface AssetEntry {
 
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isGuidShape = (s: unknown): s is string => typeof s === 'string' && GUID_RE.test(s);
+// An "ID_BEARING_TYPES" JSON asset stamps its guid into a top-level `id` field —
+// only possible when the parsed JSON is a plain object. A top-level ARRAY (e.g. a
+// hand-authored level-index manifest that isn't itself one of the recognized JSON
+// asset kinds) silently drops non-index properties on JSON.stringify, so `json.id =
+// guid` writes nothing back to disk while still reporting success. Anything that
+// isn't a stampable object falls back to the same `<file>.meta.json` sidecar used
+// by binary assets instead.
+const isStampableObject = (json: unknown): json is Record<string, unknown> =>
+  !!json && typeof json === 'object' && !Array.isArray(json);
 
 /** Read the GUID for an asset file.
  *  - JSON assets (.mesh/.mat/.prefab/.scene/.animset): top-level `id` field.
@@ -210,9 +219,11 @@ export function readAssetGuid(absPath: string, type: string): string | undefined
   try {
     if (ID_BEARING_TYPES.has(type)) {
       const json = JSON.parse(fs.readFileSync(absPath, 'utf-8'));
-      return isGuidShape(json?.id) ? json.id : undefined;
+      if (isStampableObject(json)) return isGuidShape(json?.id) ? json.id : undefined;
+      // Top-level array (or other non-object shape, e.g. a level-index manifest) —
+      // falls through to the sidecar below, mirroring writeAssetGuid's fallback.
     }
-    // Binary: read sidecar
+    // Binary (or non-object ID-bearing JSON): read sidecar
     const sidecar = absPath + '.meta.json';
     if (!fs.existsSync(sidecar)) return undefined;
     const meta = JSON.parse(fs.readFileSync(sidecar, 'utf-8'));
@@ -277,9 +288,13 @@ export function writeAssetGuid(absPath: string, type: string, guid: string): boo
   try {
     if (ID_BEARING_TYPES.has(type)) {
       const json = JSON.parse(fs.readFileSync(absPath, 'utf-8'));
-      json.id = guid;
-      writeJsonAtomic(absPath, json);
-      return true;
+      if (isStampableObject(json)) {
+        json.id = guid;
+        writeJsonAtomic(absPath, json);
+        return true;
+      }
+      // Not a stampable object (e.g. a top-level array) — fall through to the
+      // sidecar branch below instead of silently no-op'ing via JSON.stringify.
     }
     const sidecar = absPath + '.meta.json';
     let meta: Record<string, unknown> = { version: 2 };
@@ -312,10 +327,22 @@ const EXT_TYPE: Record<string, string> = {
   '.obj': 'model', '.dae': 'model',
 };
 
+/** Strip a filename's asset suffix for display-name derivation. `.scene.json`
+ *  carries TWO dots, so naively stripping just the last extension leaves the
+ *  middle segment behind (`main.scene.json` → `main.scene`, displayed as
+ *  "Main.Scene") — a regression introduced by issue #54's `.scene.json`
+ *  migration, since scenes previously had no compound suffix to strip. Handled
+ *  narrowly here (only `.scene.json`, not a general compound-suffix table): the
+ *  other JSON asset kinds (`.prefab.json`, `.mesh.json`, …) already strip only the
+ *  last extension today, pre-existing behavior this migration leaves untouched. */
+function stripAssetSuffix(filename: string): string {
+  if (filename.endsWith('.scene.json')) return filename.slice(0, -'.scene.json'.length);
+  return filename.replace(/\.[^.]+$/, '');
+}
+
 /** Derive a human-readable name from a filename */
 function nameFromFile(filename: string): string {
-  return filename
-    .replace(/\.[^.]+$/, '')         // strip extension
+  return stripAssetSuffix(filename)
     .replace(/[_-]/g, ' ')           // underscores/hyphens → spaces
     .replace(/([a-z])([A-Z])/g, '$1 $2') // camelCase → spaces
     .replace(/\b\w/g, c => c.toUpperCase()) // capitalize words
@@ -340,13 +367,17 @@ export function detectType(relPath: string, ext: string): string | null {
   if (ext === '.json') {
     if (relPath.endsWith('.layout.json')) return 'layout';
     // Shared JSON asset-kind classifier (see plugins/assetTypes.ts) — the single
-    // list the tree-shaker's classify() also uses, so the two can't drift.
+    // list the tree-shaker's classify() also uses, so the two can't drift. Scenes
+    // are matched here too, by the `.scene.json` suffix (issue #54).
     const jsonAssetType = classifyJsonAssetSuffix(relPath);
     if (jsonAssetType) return jsonAssetType;
+    // LEGACY fallback (issue #54): before the `.scene.json` suffix existed, a scene
+    // was any plain `.json` under a `/scenes/` directory (or a top-level `scene.json`).
+    // Keep honoring that convention so an externally-authored OSS project, or an
+    // already-published demo snapshot, whose scenes are still plain `.json` under
+    // `/scenes/` keeps working. New scenes are always `.scene.json`.
     if (relPath.includes('/scenes/') || relPath.endsWith('/scene.json')) return 'scene';
     if (relPath.includes('/materials/')) return 'material';
-    // Any .json in an assets folder that isn't categorized above — treat as scene
-    if (/\.json$/.test(relPath) && !relPath.endsWith('manifest.json')) return 'scene';
     return null;
   }
   return EXT_TYPE[ext] || null;
@@ -354,17 +385,15 @@ export function detectType(relPath: string, ext: string): string | null {
 
 /** Decide whether a changed `.json` file should trigger a live hot-reload
  *  broadcast, and as what kind. The watcher (`onChange`) classifies via the same
- *  `detectType` the scanner uses, then REFINES it: `detectType`'s catch-all labels
- *  ANY uncategorized `.json` under an asset root as `'scene'`, which would bounce
- *  the live scene on unrelated config edits — so a `'scene'` verdict is only honored
- *  for files that follow the `/scenes/` (or top-level `scene.json`) convention.
+ *  `detectType` the scanner uses: a `'scene'` verdict is now positively identified
+ *  (the `.scene.json` suffix, or the legacy `/scenes/` directory convention —
+ *  issue #54), so it can be trusted directly, no separate refinement needed.
  *  `prefab` always broadcasts. Returns null for everything else (no broadcast).
- *  `rel` is the forward-slash relative/url path. Pure — exported for unit testing
- *  the exact regression the inline comment warns about. */
+ *  `rel` is the forward-slash relative/url path. Pure — exported for unit testing. */
 /** What a watched .json change asks the live renderer to do. 'scene'/'prefab' hot-reload the
- *  world; 'animation' and 'timeline' only invalidate their asset cache (reloading the scene
- *  would be wrong — and would discard unsaved work). */
-export type LiveReloadKind = 'scene' | 'prefab' | 'animation' | 'timeline';
+ *  world; 'animation', 'timeline' and 'particle' only invalidate their asset cache (reloading
+ *  the scene would be wrong — and would discard unsaved work). */
+export type LiveReloadKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d';
 
 export function classifySceneChange(rel: string): LiveReloadKind | null {
   const type = detectType(rel, '.json');
@@ -383,7 +412,24 @@ export function classifySceneChange(rel: string): LiveReloadKind | null {
   // on schedule, so captions still update and effects still toggle; it just looks like the new
   // marker params are ignored. Only a renderer reload cleared it.
   if (type === 'timeline') return 'timeline';
-  if (type === 'scene' && (rel.includes('/scenes/') || rel.endsWith('/scene.json'))) return 'scene';
+  // A .particle.json edit must invalidate `particleCache` for the THIRD instance of the same
+  // defect (independent review, 2026-07-30): `invalidateParticleEffect` was exported and had
+  // ZERO production callers, so the cache held the pre-edit def forever. Animation and timeline
+  // each got this case after the same bug; particle was simply missed. It matters more here than
+  // it looks, because `read_asset_def` reports the LIVE cache as authoritative (`source:'live'`)
+  // — so after a `modoki_write_asset` the read tool handed back the OLD document, and any
+  // read-modify-write reverted the file that had just been written.
+  if (type === 'particle') return 'particle';
+  // `.spriteanim.json` / `.rig2d.json` — the FOURTH and FIFTH instances of the same defect as the
+  // three above (#74). Both invalidators were exported, tested, and had ZERO production callers,
+  // because `detectType` typed the files correctly while this function had no case for them, so the
+  // verdict fell through to `null` and no broadcast ever fired. Everything downstream then held the
+  // pre-edit definition forever — worst on the read-modify-write path, where `read_asset_def`
+  // reports the live cache as authoritative, so a write followed by a read hands back the OLD
+  // document and the round-trip reverts the file that was just written.
+  if (type === 'spriteanim') return 'spriteanim';
+  if (type === 'rig2d') return 'rig2d';
+  if (type === 'scene') return 'scene';
   return null;
 }
 
@@ -414,6 +460,24 @@ export function otaPublishBundleNameAllowed(requestedBundleName: string, project
   return requestedBundleName === projectOtaBundleName;
 }
 
+/** Why an OTA publish must be REFUSED on the signing key, or null when the key is usable.
+ *
+ *  `keyPublicKey` is the public half of `build/ota-keys/<name>.json`; `projectPublicKey` is
+ *  `project.config.json` `ota.publicKey`, the value baked into the SHIPPED BINARY and the only key
+ *  `verifyReleaseSignature` accepts. The preflight used to check merely that the key FILE existed
+ *  (independent review, 2026-07-30), so publishing with a non-matching key produced a well-formed,
+ *  signed release that every installed app silently refused while the tool reported success — and
+ *  `/api/ota/status` then confirmed the version as live. Pure, so the invariant is unit-testable
+ *  without gcloud, a bucket, or a real publish (the same reason its two siblings here are pure). */
+export function otaSigningKeyRefusal(
+  keyPublicKey: string | null | undefined,
+  projectPublicKey: string | null | undefined,
+): 'no-key-public-half' | 'project-public-key-empty' | 'mismatch' | null {
+  if (!keyPublicKey) return 'no-key-public-half';
+  if (!projectPublicKey) return 'project-public-key-empty';
+  return keyPublicKey === projectPublicKey ? null : 'mismatch';
+}
+
 /** Classifies a `gcloud storage cat`/`objects describe` failure's stderr: only a genuine
  *  "this object doesn't exist" is safe to treat as "no collision, proceed" — see
  *  ota-updates.md's Gotchas for why treating EVERY gcloud failure (including a transient
@@ -429,7 +493,7 @@ export function isGcloudObjectNotFoundError(stderr: string): boolean {
 export function playableBuildSteps(buildCwd: string, webCwd: string): BuildStep[] {
   const adsDir = path.join(webCwd, 'ads');
   return [
-    { label: 'Building playable ad (single HTML)...', cmd: 'node engine/scripts/build-web.mjs', env: { VITE_PLAYABLE: '1' }, cwd: buildCwd },
+    { label: 'Building playable ad (single HTML)...', cmd: 'node engine/scripts/build-web.mjs --target playable', env: { VITE_PLAYABLE: '1' }, cwd: buildCwd },
     { label: 'Revealing ads/...', cmd: `open ${JSON.stringify(adsDir)}`, winCmd: `start "" "${adsDir}"`, cwd: webCwd },
   ];
 }
@@ -864,7 +928,12 @@ export function buildManifest(assets: AssetEntry[], heal = false): { version: 2;
       if (it.entry.guid || !it.absPath || !fs.existsSync(it.absPath)) continue;
       // Fonts are the one type referenced by CSS family name, never by GUID
       // (see assetManifest's fontFamily exception) — minting sidecars for the
-      // ~140 bundled fonts would be pure churn, so skip them.
+      // bundled families would be pure churn, so skip them.
+      // NOTE this skips MINTING only. A font that already HAS a sidecar keeps its
+      // guid: the loop bails at the `it.entry.guid` check above, and the manifest
+      // reads the id like any other asset. That is how the engine's default MSDF
+      // font works — its sidecar is committed (builtinAssets' DEFAULT_FONT_GUID)
+      // rather than minted here, which is why it survives this skip.
       if (it.entry.type === 'font') continue;
       const fresh = randomUUID();
       if (writeAssetGuid(it.absPath, it.entry.type, fresh)) {
@@ -1293,14 +1362,13 @@ export function assetScannerPlugin(): Plugin {
       for (const root of assetRoots) server.watcher.add(root.absDir);
       const onChange = (file: string) => {
         if (!isUnderAssetRoot(file, assetRoots)) return;
-        // Classify via the same detector the scanner uses — scene files in this
-        // project are plain `.json` under a `scenes/` dir, not `.scene.json`.
+        // Classify via the same detector the scanner uses — new scenes are
+        // `.scene.json`; a plain `.json` under a `scenes/` dir is the legacy fallback (#54).
         if (path.extname(file).toLowerCase() === '.json' && !isEditorWrite(file, () => hashFileSync(file))) {
           const rel = file.split(path.sep).join('/');
-          // classifySceneChange refines detectType: its catch-all labels ANY
-          // uncategorized .json under an asset root as 'scene', which would bounce
-          // the live scene on unrelated config edits — so 'scene' is gated by the
-          // /scenes/ convention. 'prefab' always broadcasts.
+          // classifySceneChange just forwards detectType's verdict for 'scene' now that
+          // the catch-all is gone (#54) — every 'scene' is positively identified (suffix
+          // or legacy /scenes/ dir), so no further gating is needed. 'prefab' always broadcasts.
           const kind = classifySceneChange(rel);
           if (kind) {
             const urlPath = absToAssetUrl(file, assetRoots);
@@ -1400,7 +1468,28 @@ export function assetScannerPlugin(): Plugin {
                 query: u.searchParams,
                 body,
               });
-              if (!result) { next(); return; }
+              if (!result) {
+                // An UNMATCHED /api/* route must 404 as JSON, never fall through to Vite.
+                //
+                // `next()` handed it to Vite's htmlFallbackMiddleware, which accepts node fetch's
+                // default `accept: */*` and rewrote the URL to /index.html — so a missing (or
+                // misspelled) API route answered **200 with the editor's HTML page**, and every
+                // GET client read that as a successful call whose payload happened to be a string.
+                // The MCP transport now detects the HTML shape defensively (V3), but the route
+                // that produced it is here, and a `curl` user got the same lie. A missing route
+                // must look missing. (mirrors backendServer.ts, which already 404s.)
+                if (u.pathname.startsWith('/api/')) {
+                  res.statusCode = 404;
+                  res.setHeader('Content-Type', 'application/json');
+                  res.end(JSON.stringify({
+                    error: `no such API route: ${req.method || 'GET'} ${u.pathname}`,
+                    hint: 'Check the path and method. This backend is the Vite dev server; some routes exist only on the Electron host (see docs/debug-tools-mcp.md).',
+                  }));
+                  return;
+                }
+                next();
+                return;
+              }
               writeBackendResult(res, result);
             } catch (e) {
               res.statusCode = 500;
@@ -1432,7 +1521,11 @@ export function assetScannerPlugin(): Plugin {
           const sendStep = (step: number, total: number) => { try { res.write(`event: step\ndata: ${JSON.stringify({ step, total })}\n\n`); } catch { /* disconnected */ } };
 
           const cfg = loadProjectConfig(projectRoot);
-          const cfgErrors = validateBuildConfig(cfg, loadProjectUserConfig(projectRoot));
+          // #39: union errors come from a SEPARATE pass because validateBuildConfig sees the
+          // already-resolved config, where a bad value has been coerced to its default and is no
+          // longer visible. Load stays forgiving so a typo can't make a project un-openable; the
+          // build is where it's fatal, because it's the last moment before the value ships.
+          const cfgErrors = [...projectConfigUnionErrors(projectRoot), ...validateBuildConfig(cfg, loadProjectUserConfig(projectRoot))];
           if (cfgErrors.length) {
             sendStatus(`FAILED:Invalid project settings\n${cfgErrors.join('\n')}`);
             send('Aborted — fix these Project Settings fields:\n' + cfgErrors.join('\n'));
@@ -1579,7 +1672,11 @@ export function assetScannerPlugin(): Plugin {
           const user = loadProjectUserConfig(projectRoot);
           // These values are interpolated into `bash -c` below — reject anything
           // with shell metacharacters before building any command string.
-          const cfgErrors = validateBuildConfig(cfg, user);
+          // #39: union errors come from a SEPARATE pass because validateBuildConfig sees the
+          // already-resolved config, where a bad value has been coerced to its default and is no
+          // longer visible. Load stays forgiving so a typo can't make a project un-openable; the
+          // build is where it's fatal, because it's the last moment before the value ships.
+          const cfgErrors = [...projectConfigUnionErrors(projectRoot), ...validateBuildConfig(cfg, user)];
           if (cfgErrors.length) {
             sendStatus(`FAILED:Invalid project settings\n${cfgErrors.join('\n')}`);
             send('Build aborted — fix these Project Settings fields:\n' + cfgErrors.join('\n'));
@@ -1697,7 +1794,7 @@ export function assetScannerPlugin(): Plugin {
             // iOS is macOS-only (preflight blocks it off-darwin), so its bash-only steps
             // (`$(…)`, `~`, xcodebuild/xcrun) never run on Windows — no winCmd needed.
             ios: [
-              { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs', cwd: buildCwd },
+              { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', cwd: buildCwd },
               ...(otaEmbedStep ? [otaEmbedStep] : []),
               iconStep('ios'),
               { label: 'Syncing Capacitor iOS...', cmd: 'npx cap sync ios', cwd: iosCwd },
@@ -1706,7 +1803,7 @@ export function assetScannerPlugin(): Plugin {
               { label: 'Launching app...', cmd: `xcrun devicectl device process launch --device ${IOS_DEVICECTL} ${APP_ID}`, cwd: iosCwd },
             ],
             android: [
-              { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs', cwd: buildCwd },
+              { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', cwd: buildCwd },
               ...(otaEmbedStep ? [otaEmbedStep] : []),
               iconStep('android'),
               { label: 'Syncing Capacitor Android...', cmd: 'npx cap sync android', cwd: androidCwd },
@@ -1731,7 +1828,7 @@ export function assetScannerPlugin(): Plugin {
             // bucket is set) > none (stop at dist). "Not everyone has a GCS bucket."
             web: [
               // env-var prefixes → spawn env (cross-platform; bash-only `FOO=bar cmd` fails on cmd).
-              { label: 'Building web assets (game-only)...', cmd: 'node engine/scripts/build-web.mjs', env: { BASE_PATH: cfg.build.webBasePath, VITE_GAME_ONLY: 'true' }, cwd: buildCwd },
+              { label: 'Building web assets (game-only)...', cmd: 'node engine/scripts/build-web.mjs --target web', env: { BASE_PATH: cfg.build.webBasePath, VITE_GAME_ONLY: 'true' }, cwd: buildCwd },
               { label: 'Adding favicon...', cmd: `cp ${JSON.stringify(faviconSrc)} dist/favicon.png`, winCmd: `copy /y "${faviconSrc}" dist\\favicon.png`, cwd: webCwd },
             ],
             // Playable ad: a single self-contained HTML (VITE_PLAYABLE=1 → the asset
@@ -1855,7 +1952,13 @@ export function assetScannerPlugin(): Plugin {
               `\`xcrun xctrace list devices\`, iosDevicectlId = the id from \`xcrun devicectl list devices\`. ` +
               `Without it the build can't target or install on your iPhone.`;
             send(msg);
-            sendStatus('No iOS device configured — see log');
+            // A DELIBERATE REFUSAL must be `FAILED:…`, not a bare status. `consumeBuildStream`
+            // pushes any non-DONE/non-FAILED status into the log and, when the stream then closes,
+            // reports "build stream ended without a final status" — so a clear, actionable config
+            // refusal reached the agent disguised as an SSE protocol anomaly, and the reader went
+            // looking for a wedge instead of setting a device id. The sibling refusals a few
+            // hundred lines up (invalid project settings, platform exists) already use FAILED:.
+            sendStatus(`FAILED:No iOS device configured\n${msg}`);
             res.end();
             return;
           }
@@ -2017,7 +2120,7 @@ export function assetScannerPlugin(): Plugin {
               // The scaffold already ran `npm run build` against unchanged source,
               // so drop the build's leading web-build step — dist is current; cap
               // sync / xcodebuild / gradle still run on it.
-              if (steps[0]?.cmd === 'node engine/scripts/build-web.mjs') steps.shift();
+              if (steps[0]?.cmd?.startsWith('node engine/scripts/build-web.mjs')) steps.shift();
               send(`\n✅ ${platform}/ scaffolded — continuing the build.`);
             }
             // Re-heal the native config before building so machine/identity settings
@@ -2171,6 +2274,36 @@ export function assetScannerPlugin(): Plugin {
             res.end(JSON.stringify({ error: `Signing key "${keyName}" not found. Generate one first: POST /api/ota/keygen?name=${keyName}` }));
             return;
           }
+          // The key must be the one the SHIPPED APP verifies against, not merely a key that
+          // exists (independent review, 2026-07-30). `ota.publicKey` is baked into the binary and
+          // is the ONLY key `verifyReleaseSignature` will accept. Signing with any other keypair
+          // produces a perfectly well-formed, signed release.json that every installed app
+          // silently refuses (`outcome: 'signature-invalid'`) — while this route reported success
+          // and `/api/ota/status` then CONFIRMED the version as published. A release that no
+          // device can install, reported as a successful ship, is the worst failure this route
+          // has: it is remote, silent, and looks fine from here.
+          {
+            let keyPub: string | null;
+            try {
+              keyPub = (JSON.parse(fs.readFileSync(keyPath, 'utf8')) as { publicKey?: string }).publicKey ?? null;
+            } catch {
+              res.statusCode = 400;
+              res.end(JSON.stringify({ error: `Signing key "${keyName}" (${keyPath}) could not be parsed as JSON — regenerate it: POST /api/ota/keygen?name=${keyName}` }));
+              return;
+            }
+            const cfgPub = cfg.ota.publicKey;
+            const refusal = otaSigningKeyRefusal(keyPub, cfgPub);
+            if (refusal) {
+              const why = {
+                'no-key-public-half': `Signing key "${keyName}" has no publicKey field — regenerate it: POST /api/ota/keygen?name=${keyName}`,
+                'project-public-key-empty': `This project's ota.publicKey is EMPTY, so no installed app can verify a release. Set it to the signing key's public half ("${keyPub}") in Project Settings → OTA, rebuild + ship the native app so the new key is baked in, and publish then.`,
+                mismatch: `Signing key "${keyName}" does NOT match this project's ota.publicKey — every installed app would reject the release as signature-invalid, while this publish reported success. Key "${keyName}" public half: "${keyPub}". project.config.json ota.publicKey: "${cfgPub}". Publish with the key that matches (?key=<name>), or — only if you intend to ROTATE the key — set ota.publicKey to the new value and ship a native build carrying it BEFORE publishing, or installed apps will be stranded.`,
+              }[refusal];
+              res.statusCode = 400;
+              res.end(JSON.stringify({ error: why }));
+              return;
+            }
+          }
           const user = loadProjectUserConfig(projectRoot);
           const gcloudDir = resolveGcloudDir(user.sdk.gcloudPath);
           if (!gcloudDir) {
@@ -2185,7 +2318,14 @@ export function assetScannerPlugin(): Plugin {
           const send = (data: string) => { try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch { /* client disconnected */ } };
           const sendStatus = (status: string) => { try { res.write(`event: status\ndata: ${JSON.stringify(status)}\n\n`); } catch { /* client disconnected */ } };
 
-          const gcloudEnv = { ...process.env, PATH: `${gcloudDir}:${process.env.PATH ?? ''}` };
+          // Build the step env through `buildStepEnv` like /api/build does, THEN prepend gcloud.
+          // It was raw `process.env`, so on a PACKAGED editor — which ships its own node and has
+          // none on the system PATH — the very first step died with a bare
+          // `node: command not found`, i.e. the publish was impossible in the one build where the
+          // editor is most likely to be used and the failure said nothing about why. (§9: the
+          // build family should not have two different notions of "the environment a step runs in".)
+          const baseEnv = await buildStepEnv({ MODOKI_PROJECT: projectRoot });
+          const gcloudEnv = { ...baseEnv, PATH: `${gcloudDir}:${baseEnv.PATH ?? ''}` };
           const distDir = path.join(projectRoot, 'dist');
 
           let activeProc: ReturnType<typeof spawn> | null = null;
@@ -2207,8 +2347,11 @@ export function assetScannerPlugin(): Plugin {
             // Step 1: build FRESH from the CURRENTLY OPEN project's project.config.json.
             // Never publish an arbitrary pre-built dist/ — that's how a stale pre-fix
             // build once silently overwrote a freshly-fixed native install over the air.
+            // `--target native` despite the GCS upload below: an OTA bundle replaces the web
+            // content INSIDE an installed native app, so it is served from the app root — never
+            // `--target web`, which would bake in the project's sub-path webBasePath (#40).
             sendStatus('Building web assets...');
-            const build = await runStep('Building web assets...', 'node engine/scripts/build-web.mjs', buildCwd, { ...gcloudEnv, MODOKI_PROJECT: projectRoot });
+            const build = await runStep('Building web assets...', 'node engine/scripts/build-web.mjs --target native', buildCwd, { ...gcloudEnv, MODOKI_PROJECT: projectRoot });
             if (aborted) return;
             if (!build.ok) { sendStatus(`FAILED:Building web assets\n${build.output.slice(-1500)}`); res.end(); return; }
 
@@ -2233,7 +2376,7 @@ export function assetScannerPlugin(): Plugin {
               // whatever's actually wrong (e.g. `gcloud auth login`) is fixed.
               const stderr = (e as { stderr?: Buffer | string })?.stderr?.toString() ?? '';
               if (isGcloudObjectNotFoundError(stderr)) {
-                manifestExists = false;
+                // manifestExists is already false (the declaration default).
               } else {
                 sendStatus(`FAILED:Could not check for a version collision\n${stderr || (e instanceof Error ? e.message : String(e))}`);
                 res.end();
@@ -2280,8 +2423,18 @@ export function assetScannerPlugin(): Plugin {
             if (aborted) return;
             if (!publish.ok) { sendStatus(`FAILED:Publishing\n${publish.output.slice(-1500)}`); res.end(); return; }
 
+            // Echo the EFFECTIVE parameters, not just a tick. `mandatory` and `key` are optional
+            // and were echoed nowhere, so "publish v19 as mandatory, signed with prod" could
+            // silently publish a NON-mandatory bundle signed with the default key and still read
+            // as success — and an OTA release is the one artifact you cannot quietly re-do.
+            // (The misspelled-arg half of this is now caught by strict validation; this is the
+            // half that needs the RESULT to be checkable.)
             sendStatus('DONE');
-            send(`\n✅ Published ${bundleName}@${version}${mandatory ? ' (mandatory)' : ''} to ${bucket}.`);
+            send(
+              `\n✅ Published — effective parameters: bundleName=${bundleName} version=${version} ` +
+              `mandatory=${mandatory ? 'true' : 'false'} key=${keyName} bucket=${bucket}. ` +
+              `Verify with modoki_ota_status.`,
+            );
             res.end();
           })();
           return;

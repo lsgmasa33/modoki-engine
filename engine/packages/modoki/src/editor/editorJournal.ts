@@ -15,7 +15,7 @@
 
 import { nextCaptureSeq } from '../runtime/core/journal';
 
-interface EditorEvent {
+export interface EditorEvent {
   /** Editor-local monotonic sequence — the poll cursor (use as `since`). Bumps only
    *  on editor emits, so it stays contiguous within the editor stream. */
   seq: number;
@@ -121,12 +121,32 @@ function currentActor(): 'human' | 'agent' {
   return actor;
 }
 
+// ── Append listeners (#28 — wait_for_edit) ───────────────────────────────────
+//
+// A minimal notify hook so a long-poll waiter can be WOKEN by the append path instead
+// of polling the buffer on a timer. Deliberately a plain Set of callbacks, not an
+// EventTarget/EventEmitter: this module has no such dependency today and one callback
+// shape is all a waiter needs. `clearEditorJournal()` does NOT notify listeners — a
+// clear is not an edit, so a parked waiter must keep waiting through one.
+type JournalListener = (e: EditorEvent) => void;
+const listeners = new Set<JournalListener>();
+
+/** Subscribe to every appended event (post-filter is the caller's job). Returns an
+ *  unsubscribe function; always call it (on wake, on timeout, on error) — a
+ *  never-unsubscribed listener is a slow leak in a long editor session. */
+function onEditorJournalAppend(cb: JournalListener): () => void {
+  listeners.add(cb);
+  return () => { listeners.delete(cb); };
+}
+
 /** Record an editor activity event, tagged with the current actor. Payloads should
  *  reference entities by GUID. No-op when disabled. */
 export function editorEmit(type: string, payload?: unknown): void {
   if (!enabled) return;
-  buffer.push({ seq: ++seq, cap: nextCaptureSeq(), ts: Date.now(), type, source: currentActor(), payload });
+  const event: EditorEvent = { seq: ++seq, cap: nextCaptureSeq(), ts: Date.now(), type, source: currentActor(), payload };
+  buffer.push(event);
   if (buffer.length > MAX_EVENTS) buffer.shift();
+  for (const cb of listeners) cb(event);
 }
 
 /** Read the editor-activity stream, optionally filtered by `type`, `source`, and/or
@@ -144,3 +164,56 @@ export function clearEditorJournal(): void { buffer.length = 0; }
 
 /** Enable/disable capture (e.g. to mute during a bulk programmatic operation). */
 export function setEditorJournalEnabled(on: boolean): void { enabled = on; }
+
+export interface WaitForEditResult {
+  events: EditorEvent[];
+  /** True iff no matching event arrived before the deadline — a NORMAL result, not an
+   *  error (the caller should just poll again). */
+  timedOut: boolean;
+  /** Advance a subsequent wait/poll with this as `since` — contiguous with `events`,
+   *  same forward-cursor convention as `readEditorJournal`/the `editor-journal` op. */
+  nextSeq: number;
+}
+
+/** Park until a matching event is appended, or `timeoutMs` elapses — the long-poll
+ *  twin of `readEditorJournal`, so an agent can be WOKEN instead of polling in a loop.
+ *
+ *  Reuses `readEditorJournal`'s forward-cursor semantics exactly: `since` (default —
+ *  the current tip, i.e. "wait for the NEXT matching event", not "replay history") is
+ *  a `seq`, and a match returns every event strictly after it (never just the one that
+ *  woke the waiter), so a caller polling with `nextSeq` next time never sees a gap or a
+ *  duplicate. If matching events are ALREADY pending past `since`, this resolves
+ *  immediately — a caller must never be made to wait for something that already
+ *  happened.
+ *
+ *  A `clearEditorJournal()` call while parked does NOT wake or corrupt a waiter: `seq`
+ *  is never reset by a clear (only the buffer array is emptied), so the cursor
+ *  comparison stays correct against events appended after the clear. */
+export function waitForEditorJournal(
+  filter: { type?: string; source?: 'human' | 'agent'; since?: number },
+  timeoutMs: number,
+): Promise<WaitForEditResult> {
+  const baseline = filter.since ?? seq; // "now" when no cursor was given
+  const already = readEditorJournal({ type: filter.type, source: filter.source, since: baseline });
+  if (already.length > 0) {
+    return Promise.resolve({ events: already, timedOut: false, nextSeq: already[already.length - 1].seq });
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: WaitForEditResult): void => {
+      if (settled) return;
+      settled = true;
+      unsubscribe();
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const unsubscribe = onEditorJournalAppend((e) => {
+      if (filter.type && e.type !== filter.type) return;
+      if (filter.source && e.source !== filter.source) return;
+      if (e.seq <= baseline) return; // pre-existing event replaying through some other path
+      const events = readEditorJournal({ type: filter.type, source: filter.source, since: baseline });
+      finish({ events, timedOut: false, nextSeq: events.length ? events[events.length - 1].seq : baseline });
+    });
+    const timer = setTimeout(() => finish({ events: [], timedOut: true, nextSeq: baseline }), timeoutMs);
+  });
+}

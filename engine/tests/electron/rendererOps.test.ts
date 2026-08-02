@@ -9,7 +9,7 @@
 
 import { describe, it, expect } from 'vitest';
 import type { BrowserWindow } from 'electron';
-import { pointerDown, pointerMove, pointerUp, scroll } from '../../electron/rendererOps';
+import { pointerDown, pointerMove, pointerUp, scroll, drag } from '../../electron/rendererOps';
 
 interface RecordedEvent { type: string; x?: number; y?: number; button?: string; clickCount?: number; modifiers?: string[]; deltaX?: number; deltaY?: number }
 
@@ -78,6 +78,59 @@ describe('pointerUp', () => {
     expect(events).toEqual([
       { type: 'mouseUp', x: 50, y: 60, button: 'right', clickCount: 1, modifiers: undefined },
     ]);
+  });
+});
+
+describe('drag — the atomic down→moves→up gesture (regression: modifier parity with pointerMove)', () => {
+  // Live testing found the SAME buttons=0 bug in the atomic `drag()` as pointerMove had:
+  // each intermediate move sent no `*ButtonDown` modifier, so Blink reported `buttons=0`
+  // on every move of an atomic drag — a listener gating on `e.buttons` (or a game whose
+  // drag-detection mirrors pointerMove's contract) would see a hover burst, not a drag.
+  it('carries the held-button modifier on every INTERMEDIATE move, but not the leading move or the final mouseUp', async () => {
+    const { win, events } = makeWin();
+    await drag(win, { x: 0, y: 0 }, { x: 100, y: 100 }, { steps: 3 });
+    // Sequence: leading mouseMove, mouseDown, 3 intermediate mouseMoves, mouseUp.
+    expect(events).toHaveLength(6);
+    expect(events[0]).toMatchObject({ type: 'mouseMove' });
+    expect(events[0].modifiers).toBeUndefined();
+    expect(events[1]).toMatchObject({ type: 'mouseDown', button: 'left', clickCount: 1 });
+    for (const e of events.slice(2, 5)) {
+      expect(e).toMatchObject({ type: 'mouseMove', button: 'left' });
+      expect(e.modifiers).toContain('leftButtonDown');
+    }
+    const up = events[5];
+    expect(up).toMatchObject({ type: 'mouseUp', button: 'left', clickCount: 1 });
+    expect(up.modifiers).toBeUndefined();
+  });
+
+  it.each([
+    ['right', 'rightButtonDown'],
+    ['middle', 'middleButtonDown'],
+  ] as const)('uses the %s held modifier for a %s-button drag', async (button, heldMod) => {
+    const { win, events } = makeWin();
+    await drag(win, { x: 0, y: 0 }, { x: 10, y: 10 }, { steps: 2, button });
+    const moves = events.filter((e) => e.type === 'mouseMove' && e.button === button);
+    expect(moves.length).toBeGreaterThan(0);
+    for (const m of moves) expect(m.modifiers).toContain(heldMod);
+  });
+
+  it('appends the held modifier to caller-supplied modifiers on intermediate moves (does not replace them)', async () => {
+    const { win, events } = makeWin();
+    await drag(win, { x: 0, y: 0 }, { x: 10, y: 10 }, { steps: 2, modifiers: ['shift'] });
+    const intermediateMoves = events.filter((e) => e.type === 'mouseMove' && e.button === 'left');
+    expect(intermediateMoves.length).toBe(2);
+    for (const m of intermediateMoves) expect(m.modifiers).toEqual(['shift', 'leftButtonDown']);
+    // The leading (pre-down) move and the final mouseUp keep the BARE caller modifiers.
+    expect(events[0].modifiers).toEqual(['shift']);
+    expect(events[events.length - 1].modifiers).toEqual(['shift']);
+  });
+
+  it('scales page-CSS coords to DIP by the zoom factor for both endpoints', async () => {
+    const { win, events } = makeWin(1.2);
+    await drag(win, { x: 10, y: 10 }, { x: 20, y: 20 }, { steps: 2 });
+    // 10*1.2=12, 20*1.2=24.
+    expect(events[0]).toMatchObject({ x: 12, y: 12 }); // leading move at `from`
+    expect(events[events.length - 1]).toMatchObject({ x: 24, y: 24 }); // mouseUp at `to`
   });
 });
 

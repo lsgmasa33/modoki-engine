@@ -1,7 +1,7 @@
 /** @modoki/editor — Visual editor, dev-only. Not shipped in production builds. */
 
 export { backendFetch, backendPostJson, backendEventSource, backendBase, backendUrl } from './backend/editorBackend';
-export { createEditor, type EditorOptions } from './createEditor';
+export { createEditor, type EditorOptions, getResolvedRender3d } from './createEditor';
 export {
   pushAction, undo, redo, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion,
   beginActionCapture, endActionCapture, isCapturingActions, type UndoAction,
@@ -18,7 +18,11 @@ export {
 } from './entityCreateSpecs';
 export { buildUiCreateSpecs, type UiPreset } from './uiAuthoring';
 export { enterPlay, stopPlay, pausePlay, resetPlayMode } from './scene/playMode';
-export { editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled, withEditorActor, openActorLease, closeActorLease, ACTOR_LEASE_TTL_MS } from './editorJournal';
+export {
+  editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled,
+  withEditorActor, openActorLease, closeActorLease, ACTOR_LEASE_TTL_MS,
+  waitForEditorJournal, type EditorEvent, type WaitForEditResult,
+} from './editorJournal';
 export {
   getEditorViewportCamera, setEditorViewportCamera, focusEntityInSceneView,
 } from './scene/sceneViewBus';
@@ -40,10 +44,11 @@ export {
 } from './scene/prefab';
 export {
   saveScene, saveAll, serializeScene, loadScene, newScene,
-  getCurrentScenePath, setCurrentScenePath, type SceneFile,
+  getCurrentScenePath, setCurrentScenePath, isTraitDefault, type SceneFile,
 } from './scene/serialize';
 export {
-  markAssetDirty, hasDirtyAssets, getDirtyAssetPaths, clearDirtyAssets, flushDirtyAssets, type FlushResult,
+  markAssetDirty, hasDirtyAssets, getDirtyAssetPaths, peekDirtyAsset, clearDirtyAssets,
+  discardDirtyAssets, flushDirtyAssets, type FlushResult,
 } from './scene/dirtyAssets';
 export { importModel } from './scene/modelImport';
 export { useEditorStore } from './store/editorStore';
@@ -64,7 +69,7 @@ export { ensureGuid, entityRef, type EntityRef } from './undo/entityRef';
 export { makePrefabInstantiateAction } from './undo/prefabInstantiateUndo';
 
 // C7: agent ops must refuse to DESTROY unsaved live work (load_scene/new_scene swap the world).
-export { hasUnsavedChanges, markSceneSaved, type SaveResult } from './scene/serialize';
+export { hasUnsavedChanges, unsavedChangeCauses, markSceneSaved, type SaveResult } from './scene/serialize';
 
 // C7: the agent save-all path must honour prefab-edit mode like the human paths do —
 // otherwise an explicit `path` writes the SYNTHETIC prefab-edit world over a real scene.

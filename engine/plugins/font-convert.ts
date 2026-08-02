@@ -56,7 +56,7 @@ export function ensureMsdfAtlasGen(): string {
     // args exits 0, so an ENOENT (spawn failure) is the miss signal.
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
       genCheck = { ok: false, cli };
-      throw new Error(MSDF_MISSING_MSG);
+      throw new Error(MSDF_MISSING_MSG, { cause: e });
     }
     // Any other error (e.g. non-zero exit) still means the binary ran → available.
     genCheck = { ok: true, cli };
@@ -169,7 +169,7 @@ export async function convertFont(opts: FontConvertOptions): Promise<FontConvert
       execFileSync(cli, buildAtlasGenArgs(settings, absSource, charsetFilePath, tmpPng, tmpJson), { stdio: 'pipe' });
     } catch (e) {
       const stderr = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
-      throw new Error(`msdf-atlas-gen failed for ${sourceUrlPath}: ${stderr}`);
+      throw new Error(`msdf-atlas-gen failed for ${sourceUrlPath}: ${stderr}`, { cause: e });
     }
     fs.renameSync(tmpPng, atlasPath);
     fs.renameSync(tmpJson, metricsPath);

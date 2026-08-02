@@ -23,9 +23,9 @@ const sceneAfter = { id: 'scene-1', entities: [{ id: 1, name: 'Ship', traits: { 
 // serializeScene returns sceneBefore on the first call (pre-apply snapshot), then
 // sceneAfter on the second (post-apply snapshot) — mirroring real ordering.
 const serializeScene = vi.fn();
-const saveScene = vi.fn(async () => {});
-const installPrefabSnapshot = vi.fn(async () => {});
-const loadScene = vi.fn(async () => {});
+const saveScene = vi.fn<(...args: any[]) => Promise<void>>(async () => {});
+const installPrefabSnapshot = vi.fn<(...args: any[]) => Promise<void>>(async () => {});
+const loadScene = vi.fn<(...args: any[]) => Promise<void>>(async () => {});
 const selectEntity = vi.fn();
 let pushed: UndoAction | null = null;
 let applyResult: any;

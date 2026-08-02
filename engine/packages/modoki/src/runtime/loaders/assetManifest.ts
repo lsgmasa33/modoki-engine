@@ -582,7 +582,12 @@ function normalizeSceneName(s: string): string {
  *  public web shell to honor a `?scene=` query param (e.g. `?scene=Warp`,
  *  `?scene=2D%20Animation`, or a raw GUID). Returns the path of a registered
  *  `'scene'` asset whose filename matches `nameOrGuid`, or undefined if none.
- *  The manifest must be loaded first (`ensureManifestLoaded`). */
+ *  The manifest must be loaded first (`ensureManifestLoaded`).
+ *
+ *  `entry.type === 'scene'` is trustworthy on its own now: scenes are positively
+ *  identified by the `.scene.json` suffix (or the legacy `/scenes/` directory
+ *  convention) — issue #54's migration removed the catch-all that used to type
+ *  ANY uncategorized `.json` under an asset root as `'scene'`. */
 export function resolveSceneByName(nameOrGuid: string): string | undefined {
   if (!nameOrGuid) return undefined;
   if (isGuid(nameOrGuid)) {

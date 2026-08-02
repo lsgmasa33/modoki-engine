@@ -1194,7 +1194,7 @@ describe('Scene2D collider overlay (editor)', () => {
     // Enabled → one overlay Graphics with a stroked box outline.
     scene2d.setShowColliders2D(true);
     scene2d.renderFrame();
-    const overlays = slot.container.children.filter((c: any) => c.kind === 'graphics' && c.stroke.mock.calls.length > 0);
+    const overlays = (slot.container.children as any[]).filter((c: any) => c.kind === 'graphics' && c.stroke.mock.calls.length > 0);
     expect(overlays.length).toBe(1);
     const g = overlays[0];
     expect(g.moveTo.mock.calls.length + g.lineTo.mock.calls.length).toBeGreaterThan(0); // box perimeter drawn
@@ -1282,7 +1282,7 @@ describe('Scene2DRenderer 2D-particle-preview render gate (Phase 4)', () => {
     const canvas = spawnCanvas(world, traits);
     const child = spawnChild(world, traits, canvas.id(), { sprite: 'square' });
     r.renderFrame(); // first frame is _externalDirty → renders + clears the flag
-    const obj = editorPool.getSlot(canvas.id())!.container.children[0] as { _x: number };
+    const obj = editorPool.getSlot(canvas.id())!.container.children[0] as unknown as { _x: number };
     expect(obj._x).toBe(0);
 
     // Direct koota write — bypasses the dirty listeners, so the gate alone decides if it renders.
@@ -1305,7 +1305,7 @@ describe('Scene2DRenderer 2D-particle-preview render gate (Phase 4)', () => {
     const canvas = spawnCanvas(world, traits);
     const child = spawnChild(world, traits, canvas.id(), { sprite: 'square' });
     scene2d.renderFrame();
-    const obj = pool.getSlot(canvas.id())!.container.children[0] as { _x: number };
+    const obj = pool.getSlot(canvas.id())!.container.children[0] as unknown as { _x: number };
     child.set(traits.Transform, { ...child.get(traits.Transform), x: 99 });
     scene2d.renderFrame();           // no provider, stopped, clean ⇒ skip (unchanged behavior)
     expect(obj._x).toBe(0);

@@ -581,6 +581,35 @@ function resolveFontsByFamily(
 
 // ── Keep-list loader ──────────────────────────────────
 
+/** Expand a keep-list entry whose FILENAME contains `*` into the files it matches
+ *  (e.g. `/assets/levels/*.court.json`). Only the basename may glob — a `*` in a
+ *  directory segment is not supported, so the directory resolves through the same
+ *  traversal-guarded virtualToAbs() as a literal entry.
+ *
+ *  Why globs exist at all: a game whose content is GENERATED (Court's puzzle levels
+ *  are minted by `tools/generate.ts`, one `.court.json` per level) would otherwise
+ *  need every new file hand-added here, with nothing catching a forgotten one — the
+ *  exact drift class this file's probeTraitRefs comments already call out for sling.
+ *  A generated file is unreachable through the trait sweep too, because game code
+ *  fetches it by path rather than a scene authoring a ref to it.
+ *
+ *  Returns [] when the directory is absent; the caller reports a zero-match pattern
+ *  as missing, so a stale glob fails the build just as loudly as a stale literal. */
+function expandKeepGlob(entry: string, roots: AssetRoot[]): string[] {
+  const slash = entry.lastIndexOf('/');
+  const dir = entry.substring(0, slash);
+  const pattern = entry.substring(slash + 1);
+  if (dir.includes('*')) return []; // directory globs unsupported → reported as missing
+  const absDir = virtualToAbs(dir, roots);
+  if (!absDir || !fs.existsSync(absDir)) return [];
+  // Escape everything but `*`, which becomes "any run of non-separator chars".
+  const re = new RegExp('^' + pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*') + '$');
+  return fs.readdirSync(absDir)
+    .filter((name) => re.test(name) && !name.endsWith('.meta.json') && !name.endsWith('.meta.local.json'))
+    .sort()
+    .map((name) => `${dir}/${name}`);
+}
+
 function loadKeepList(projectRoot: string, roots: AssetRoot[]): string[] {
   const keepPath = path.join(projectRoot, 'asset-keep.json');
   if (!fs.existsSync(keepPath)) return [];
@@ -590,14 +619,22 @@ function loadKeepList(projectRoot: string, roots: AssetRoot[]): string[] {
   try {
     parsed = JSON.parse(raw);
   } catch (e) {
-    throw new Error(`asset-keep.json is not valid JSON: ${(e as Error).message}`);
+    throw new Error(`asset-keep.json is not valid JSON: ${(e as Error).message}`, { cause: e });
   }
 
   const entries = Array.isArray(parsed.keep) ? parsed.keep : [];
   const missing: string[] = [];
+  const resolved: string[] = [];
   for (const entry of entries) {
+    if (entry.includes('*')) {
+      const matches = expandKeepGlob(entry, roots);
+      if (matches.length === 0) missing.push(`${entry} (pattern matched no files)`);
+      else resolved.push(...matches);
+      continue;
+    }
     const abs = virtualToAbs(entry, roots);
     if (!abs || !fs.existsSync(abs)) missing.push(entry);
+    else resolved.push(entry);
   }
   if (missing.length > 0) {
     throw new Error(
@@ -606,7 +643,7 @@ function loadKeepList(projectRoot: string, roots: AssetRoot[]): string[] {
     );
   }
 
-  return entries;
+  return resolved;
 }
 
 // ── Main entry point ──────────────────────────────────
@@ -663,6 +700,10 @@ export function computeKeptAssets(projectRoot: string, roots: AssetRoot[]): Tree
     const type = classify(virtualPath);
     if (type === 'meta') continue;
 
+    // NOTE (issue #54): scenes are positively identified here too — by the
+    // `.scene.json` suffix (via `classifyJsonAssetSuffix`) or, for a legacy
+    // pre-migration project, a plain `.json` under `/scenes/`. Anything else
+    // uncategorized is 'unknown-json', not guessed as a scene.
     if (type === 'scene' || type === 'prefab') {
       try {
         const json = JSON.parse(fs.readFileSync(abs, 'utf-8'));

@@ -6,7 +6,6 @@
   "main": "src/index.ts",
   "scripts": {
     "start": "tsx src/index.ts",
-    "build": "tsc",
     "typecheck": "tsc --noEmit",
     "dev": "tsx watch src/index.ts"
   },
@@ -14,8 +13,9 @@
     "@modelcontextprotocol/sdk": "^1.12.1"
   },
   "devDependencies": {
+    "@types/node": "^24.13.3",
     "tsx": "^4.19.0",
-    "typescript": "~5.9.3"
+    "typescript": "~6.0.3"
   },
   "overrides": {
     "esbuild": "^0.28.1"

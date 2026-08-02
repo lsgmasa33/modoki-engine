@@ -69,7 +69,7 @@ describe('journal', () => {
   it('journalEvents returns a copy (mutating it does not corrupt the buffer)', () => {
     emit('a');
     const snap = journalEvents();
-    snap.push({ tick: 99, type: 'injected', cap: 0 });
+    snap.push({ tick: 99, type: 'injected', cap: 0, level: 'info' });
     expect(journalEvents()).toHaveLength(1);
   });
 

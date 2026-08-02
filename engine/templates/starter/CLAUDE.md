@@ -115,11 +115,11 @@ __GAME_NAME__/
     ├── config.ts                        # GameConfig (points at the starting scene)
     ├── setup.ts                         # register your ECS systems here
     └── assets/                          # asset root → served at /assets/...
-        ├── scenes/main.json             # the starting scene (edit via modoki_mutate_scene)
+        ├── scenes/main.scene.json             # the starting scene (edit via modoki_mutate_scene)
         └── models/  textures/  materials/  prefabs/   # drop assets here
 ```
 
-The starting scene's URL is `/assets/scenes/main.json` — pass that as `path` to
+The starting scene's URL is `/assets/scenes/main.scene.json` — pass that as `path` to
 `modoki_mutate_scene` / `modoki_validate_scene`.
 
 Start by inspecting the current scene with `modoki_get_scene_state`, then ask the human

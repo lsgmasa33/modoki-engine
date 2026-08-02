@@ -32,9 +32,6 @@ export interface GameDefinition {
   id: string;
   name: string;
   description?: string;
-  /** Thumbnail asset GUID (resolved via the manifest), or an external URL.
-   *  Stored into UIElement.imageSrc, which is GUID-only — never a literal path. */
-  thumbnailUrl?: string;
   loadConfig: () => Promise<GameConfig>;
   registerPostprocessors?: () => Promise<void> | void;
   /** Register game-specific ECS systems and trait editor metadata. */

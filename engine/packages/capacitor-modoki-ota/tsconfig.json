@@ -10,6 +10,7 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "outDir": "dist/esm",
+    "skipLibCheck": true,
     "sourceMap": true,
     "strict": true,
     "target": "ES2023"

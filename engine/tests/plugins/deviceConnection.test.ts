@@ -197,7 +197,12 @@ describe('TcpLeaseTransport timeouts', () => {
       await expect(t.send('echo', {})).rejects.toThrow(/timed out/i);
     } finally {
       t.close();
-      serverSock?.destroy();                       // else server.close() waits on the live socket
+      // Cast back to the declared type: TS narrows `serverSock` to `null` here because the only
+      // reassignment it can see directly in THIS function scope is the `= null` initializer — the
+      // real write happens inside the createServer callback, a separate closure that CFA doesn't
+      // cross (same reason `live?.destroy()` above needs no cast: it's read from inside ANOTHER
+      // closure, which resets narrowing back to the declared type instead of over-narrowing).
+      (serverSock as net.Socket | null)?.destroy(); // else server.close() waits on the live socket
       await new Promise<void>((r) => server.close(() => r()));
     }
   });

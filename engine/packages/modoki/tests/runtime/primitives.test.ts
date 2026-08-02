@@ -4,7 +4,7 @@ import { describe, it, expect } from 'vitest';
 import * as THREE from 'three';
 
 async function getPrimitives() {
-  return import('../../../src/runtime/loaders/primitives');
+  return import('../../src/runtime/loaders/primitives');
 }
 
 describe('primitives', () => {

@@ -3,7 +3,7 @@
 
 import { describe, it, expect } from 'vitest';
 import * as THREE from 'three';
-import { projectAABBToScreen, registerBoundsProvider, collectScreenBounds } from '../../src/runtime/core/screenBounds';
+import { projectAABBToScreen, registerBoundsProvider, collectScreenBounds, mountedSurfaces } from '../../src/runtime/core/screenBounds';
 
 const vp = { left: 0, top: 0, width: 100, height: 100 };
 
@@ -66,5 +66,61 @@ describe('collectScreenBounds — worldAABB passthrough (V5)', () => {
       const e = collectScreenBounds([8]).find((b) => b.id === 8);
       expect(e?.worldAABB).toBeUndefined();
     } finally { unreg(); }
+  });
+});
+
+/** `mountedSurfaces()` — which on-screen surfaces have a provider right now.
+ *
+ *  Load-bearing rather than informational: a 2D/3D entity aim REQUIRES a `surface`
+ *  (`docs/enact.md`), and this is the ONLY way a caller can learn what to pass. A batch in
+ *  particular cannot read a response to recover from a refusal, so a wrong guess costs the whole
+ *  batch. It reads the registry, never the scene — asking "what is mounted?" must not cost a
+ *  projection of every entity. */
+describe('mountedSurfaces', () => {
+  it('reports a provider\'s surface, and drops it again on unregister', () => {
+    const before = mountedSurfaces();
+    expect(before).not.toContain('game-3d');
+    const unreg = registerBoundsProvider(() => [], 'game-3d');
+    try {
+      expect(mountedSurfaces()).toContain('game-3d');
+    } finally { unreg(); }
+    // Unmounting a panel must remove it — a stale surface would be advertised as aimable and
+    // every aim into it refused, with nothing explaining why.
+    expect(mountedSurfaces()).not.toContain('game-3d');
+  });
+
+  it('de-duplicates: two providers for the same surface list it once', () => {
+    const a = registerBoundsProvider(() => [], 'game-2d');
+    const b = registerBoundsProvider(() => [], 'game-2d');
+    try {
+      expect(mountedSurfaces().filter((s) => s === 'game-2d')).toEqual(['game-2d']);
+    } finally { a(); b(); }
+  });
+
+  it('OMITS an unlabelled provider rather than inventing a name for it', () => {
+    // The list is a menu of values a caller may pass to `surface`. An unlabelled provider has no
+    // such value, so advertising a placeholder would offer an aim that can never resolve.
+    const unreg = registerBoundsProvider(() => []);
+    try {
+      expect(mountedSurfaces()).not.toContain(undefined);
+      expect(mountedSurfaces().some((s) => String(s).includes('unlabelled'))).toBe(false);
+    } finally { unreg(); }
+  });
+
+  it('does not call any provider — no projection cost, and a throwing provider cannot break it', () => {
+    let calls = 0;
+    const unreg = registerBoundsProvider(() => { calls++; throw new Error('boom'); }, 'scene-view');
+    try {
+      expect(mountedSurfaces()).toContain('scene-view');
+      expect(calls).toBe(0);
+    } finally { unreg(); }
+  });
+
+  it('keeps registration ORDER, so the first suggestion in a refusal is stable', () => {
+    const a = registerBoundsProvider(() => [], 'scene-view');
+    const b = registerBoundsProvider(() => [], 'game-3d');
+    try {
+      expect(mountedSurfaces()).toEqual(['scene-view', 'game-3d']);
+    } finally { a(); b(); }
   });
 });

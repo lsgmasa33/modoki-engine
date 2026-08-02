@@ -8,11 +8,19 @@ import { forwardZoomWheel } from '../../src/editor/input/zoomWheel';
 afterEach(() => { document.body.innerHTML = ''; });
 
 /** Dispatch a wheel on `target` through a capture-phase listener that runs the forwarder,
- *  mirroring how EditorApp attaches it. Returns the send spy + whether default was prevented. */
+ *  mirroring how EditorApp attaches it. Returns the send spy + whether default was prevented.
+ *
+ *  `passive: false` is LOAD-BEARING and must match EditorApp.tsx:891. A `wheel` listener on
+ *  window/document/body is passive BY DEFAULT (per the DOM spec, and in every real browser), and
+ *  `preventDefault()` from a passive listener is silently ignored — which would let the browser
+ *  page-zoom on Ctrl+wheel instead of the editor's UI zoom. jsdom 26 did not implement the passive
+ *  default, so this helper omitted the flag and the `defaultPrevented` assertion below passed
+ *  anyway; jsdom 30 does implement it, which is what exposed the drift. The production code was
+ *  always right — the test simply was not mirroring it, despite this comment saying it did. */
 function fire(target: Element, opts: { deltaY?: number; ctrl?: boolean; meta?: boolean }) {
   const bridge = { send: vi.fn() };
   const handler = (e: Event) => forwardZoomWheel(e as WheelEvent, bridge);
-  window.addEventListener('wheel', handler, { capture: true });
+  window.addEventListener('wheel', handler, { capture: true, passive: false });
   const e = new WheelEvent('wheel', {
     deltaY: opts.deltaY ?? -120, ctrlKey: !!opts.ctrl, metaKey: !!opts.meta, bubbles: true, cancelable: true,
   });
@@ -49,5 +57,24 @@ describe('forwardZoomWheel', () => {
     const { send, defaultPrevented } = fire(child, { ctrl: true });
     expect(send).not.toHaveBeenCalled();   // left for the Curve Editor's value-axis zoom
     expect(defaultPrevented).toBe(false);
+  });
+
+  /** The tests above attach their OWN listener, so they pin `forwardZoomWheel`'s behaviour but
+   *  CANNOT see how EditorApp attaches it — dropping `passive: false` there would break Ctrl+wheel
+   *  zoom in the real editor with every test above still green. That gap is exactly what jsdom 30
+   *  exposed (see `fire`), so pin the attach site itself. A source scan rather than a mount:
+   *  EditorApp is a large component whose effect needs an electronBridge, and the invariant is one
+   *  line of options. */
+  it('EditorApp attaches the wheel listener non-passively (else preventDefault is ignored)', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const src = fs.readFileSync(
+      path.resolve(__dirname, '../../src/editor/EditorApp.tsx'),
+      'utf8',
+    );
+    const attach = src.match(/addEventListener\(\s*'wheel'[^)]*\)/)?.[0];
+    expect(attach, "EditorApp no longer attaches a 'wheel' listener — has the zoom moved?").toBeDefined();
+    expect(attach, 'a wheel listener on window is passive BY DEFAULT; without an explicit ' +
+      "`passive: false` its preventDefault() is ignored and the browser page-zooms instead").toContain('passive: false');
   });
 });

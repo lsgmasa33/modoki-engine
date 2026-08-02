@@ -25,5 +25,7 @@
     "noUncheckedSideEffectImports": true
   },
   "//": "KEEP IN SYNC with PROJECT_ROOT_DIRS in engine/scripts/projectRoots.mjs — static config can't import it. Missing roots glob to empty, which is how the public OSS repo typechecks with neither present.",
-  "include": ["app", "../demos"]
+  "include": ["app", "../demos"],
+  "//exclude": "A project's tools/ is BUILD-TIME Node code (fs, path, process) that never ships to the browser — typechecking it against these DOM/browser settings fails on 'Cannot find module node:fs'. It is exercised by vite-node and its own tests instead. Keep this in sync with the scoped include built in engine/scripts/build-web.mjs, or a per-game build will disagree with `npm run typecheck`.",
+  "exclude": ["../games/*/tools", "../demos/*/tools"]
 }

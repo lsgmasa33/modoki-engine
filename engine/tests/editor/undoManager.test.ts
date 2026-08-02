@@ -28,7 +28,7 @@ describe('undoManager', () => {
   });
 
   it('undo reverses the action and enables redo', async () => {
-    let value = 0;
+    let value: number;
     pushAction({ label: 'set to 1', undo: () => { value = 0; }, redo: () => { value = 1; } });
     value = 1;
 
@@ -40,7 +40,7 @@ describe('undoManager', () => {
   });
 
   it('redo re-applies the action', async () => {
-    let value = 0;
+    let value: number;
     pushAction({ label: 'set to 1', undo: () => { value = 0; }, redo: () => { value = 1; } });
     value = 1;
 
@@ -63,9 +63,9 @@ describe('undoManager', () => {
 
   it('multiple undo/redo in sequence', async () => {
     const values: number[] = [];
-    pushAction({ label: 'a1', undo: () => values.push(1), redo: () => values.push(-1) });
-    pushAction({ label: 'a2', undo: () => values.push(2), redo: () => values.push(-2) });
-    pushAction({ label: 'a3', undo: () => values.push(3), redo: () => values.push(-3) });
+    pushAction({ label: 'a1', undo: () => { values.push(1); }, redo: () => { values.push(-1); } });
+    pushAction({ label: 'a2', undo: () => { values.push(2); }, redo: () => { values.push(-2); } });
+    pushAction({ label: 'a3', undo: () => { values.push(3); }, redo: () => { values.push(-3); } });
 
     await undo(); // undo a3
     await undo(); // undo a2
@@ -99,7 +99,7 @@ describe('writeTraitFieldWithUndo', () => {
   it('writes value and creates undo entry', () => {
     const entity = getCurrentWorld().spawn(
       Transform({ x: 10, y: 0, z: 0 }),
-      Renderable3D({ mesh: 'undo-test', color: 0xff0000, size: 1 }),
+      Renderable3D({ mesh: 'undo-test' }),
     );
 
     const tfMeta = getTraitByName('Transform')!;

@@ -427,7 +427,11 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   if (node.canvas2D) {
     const canvas2DContent = renderCanvas2D
       ? renderCanvas2D(node.entityId)
-      : (!onSelectEntity && Canvas2DMount ? <Suspense fallback={null}><Canvas2DMount entityId={node.entityId} /></Suspense> : null);
+      // applyWebSizeMode: this is the shipped-game / GameView surface, so it honours
+      // `rendering.web.sizeMode` — matching Scene3D, which clamps the 3D buffer on the
+      // same surface. The editor branch above (renderCanvas2D, SceneView.tsx) deliberately
+      // does NOT pass it — the editor viewport sizes itself / uses device presets.
+      : (!onSelectEntity && Canvas2DMount ? <Suspense fallback={null}><Canvas2DMount entityId={node.entityId} applyWebSizeMode /></Suspense> : null);
     return (
       <div style={style} onClick={handleClick} data-entity-id={node.entityId}>
         {nineSliceLayer}

@@ -148,7 +148,7 @@ export default function GameView({ uiLayer }: GameViewProps) {
       </div>
 
       {/* Game area */}
-      <div ref={gameAreaRef} style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+      <div ref={gameAreaRef} data-game-view-area style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
         {/* Device preview: render the content at the LOGICAL device resolution
             (deviceW×deviceH) and visually fit it with transform: scale(). This
             keeps the preview pixel-faithful to the device — px text, vmin-sized

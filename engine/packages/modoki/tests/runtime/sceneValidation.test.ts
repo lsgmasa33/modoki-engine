@@ -2,7 +2,7 @@
  *  the GUID asset-reference rule. Pure module, no world needed. */
 
 import { describe, it, expect } from 'vitest';
-import { validateSceneData, type SceneSchema } from '../../src/runtime/loaders/sceneValidation';
+import { validateSceneData, type SceneSchema, type PrefabResolver } from '../../src/runtime/loaders/sceneValidation';
 
 const GUID = 'a1b2c3d4-1111-2222-3333-444455556666';
 
@@ -18,7 +18,7 @@ const schema: SceneSchema = {
     },
     EntityAttributes: {
       category: 'component',
-      fields: { name: { type: 'string' }, guid: { type: 'string' }, layer: { type: 'enum', options: ['2d', '3d', 'ui'] }, parentId: { type: 'number', entityId: { onMissing: 'root' } } },
+      fields: { name: { type: 'string' }, guid: { type: 'string' }, layer: { type: 'enum', options: ['2d', '3d', 'ui'] }, parentId: { type: 'number' } },
     },
     UIElement: {
       category: 'component',
@@ -363,5 +363,268 @@ describe('validateSceneData — materialOverrides shape', () => {
   it('flags a missing / non-object source', () => {
     expect(validateSceneData(mi([{ target: 'x', kind: 'uniform' }]), schema).warnings.join('\n'))
       .toMatch(/override\[0\]\.source must be an object/);
+  });
+});
+
+/** Issue #16 — an authored UIElement size on a stretched anchor axis is stored, shown,
+ *  and then overwritten by the anchor's offsets. The Inspector greys the field out; a
+ *  scene READ as JSON gets no such signal, so the validator says it. Schema omitted:
+ *  the check is cross-trait and independent of the field-type pass. */
+describe('validateSceneData — UIElement size inert under a stretched UIAnchor (#16)', () => {
+  const band = (anchor: string, el: Record<string, unknown>) => scene([
+    { id: 1, name: 'NarrationBand', traits: { UIElement: el, UIAnchor: { anchor } } },
+  ]);
+
+  it('warns on a width authored under a bottom-stretch anchor (the court case)', () => {
+    const res = validateSceneData(band('bottom-stretch', { width: 90, widthUnit: '%' }));
+    expect(res.warnings.join('\n')).toMatch(/UIElement\.width is inert.*bottom-stretch.*left\/right offsets.*90/s);
+  });
+
+  it('echoes the value WITH its unit, so the reader can find the field', () => {
+    expect(validateSceneData(band('bottom-stretch', { width: 90, widthUnit: '%' })).warnings[0])
+      .toMatch(/authored 90%$/);
+    // A missing unit means px (the trait default), not a bare number.
+    expect(validateSceneData(band('bottom-stretch', { width: 90 })).warnings[0])
+      .toMatch(/authored 90px$/);
+  });
+
+  it('names the top/bottom offsets for an inert height', () => {
+    const res = validateSceneData(band('left-stretch', { height: 40 }));
+    expect(res.warnings.join('\n')).toMatch(/UIElement\.height is inert.*top\/bottom offsets/s);
+  });
+
+  it('stays silent on the LIVE axis of a half-stretched anchor', () => {
+    // top-stretch overwrites width only — an authored height there is real, and
+    // warning about it would be a false positive that teaches people to ignore this.
+    const res = validateSceneData(band('top-stretch', { height: 40 }));
+    expect(res.warnings).toEqual([]);
+  });
+
+  it('warns about BOTH axes under a full stretch', () => {
+    const res = validateSceneData(band('stretch', { width: 90, height: 40 }));
+    expect(res.warnings).toHaveLength(2);
+    expect(res.warnings.join('\n')).toMatch(/width is inert/);
+    expect(res.warnings.join('\n')).toMatch(/height is inert/);
+  });
+
+  it('ignores a 0 size — that is the unset default, not a claim about size', () => {
+    // Every UIElement carries width:0/height:0 when unsized; warning on those would
+    // fire on nearly every stretched element and drown the real signal.
+    const res = validateSceneData(band('stretch', { width: 0, height: 0 }));
+    expect(res.warnings).toEqual([]);
+  });
+
+  it('ignores 100% — "fill the parent" AGREES with stretch, and is what the editor writes', () => {
+    // Measured before narrowing this: warning on 100% fired 102 times across games/ +
+    // demos/ while the genuine traps numbered 3. A channel that is 97% false positives
+    // is one nobody reads, so the neutral value is excluded by design.
+    const res = validateSceneData(band('stretch', {
+      width: 100, widthUnit: '%', height: 100, heightUnit: '%',
+    }));
+    expect(res.warnings).toEqual([]);
+  });
+
+  it('still warns on 100 PX — a pixel size is a real claim a stretch overrides', () => {
+    const res = validateSceneData(band('stretch', { width: 100, widthUnit: 'px' }));
+    expect(res.warnings.join('\n')).toMatch(/UIElement\.width is inert/);
+  });
+
+  it('warns on the two real traps this check exists for', () => {
+    // court's NarrationBand and 3d-test's 2D — the values that read as intentional.
+    expect(validateSceneData(band('bottom-stretch', { width: 90, widthUnit: '%' })).warnings)
+      .toHaveLength(1);
+    expect(validateSceneData(band('stretch', { width: 200, widthUnit: '%' })).warnings)
+      .toHaveLength(1);
+  });
+
+  it('stays silent on a non-stretched anchor', () => {
+    const res = validateSceneData(band('bottom', { width: 90, height: 40 }));
+    expect(res.warnings).toEqual([]);
+  });
+
+  it('needs BOTH traits — a UIElement with no UIAnchor is unconstrained', () => {
+    const res = validateSceneData(scene([{ id: 1, name: 'Free', traits: { UIElement: { width: 90 } } }]));
+    expect(res.warnings).toEqual([]);
+  });
+
+  it('does not throw on a malformed anchor value', () => {
+    const res = validateSceneData(band(42 as unknown as string, { width: 90 }));
+    expect(res.warnings.filter((w) => /is inert/.test(w))).toEqual([]);
+  });
+});
+
+/** Issue #35 — the twin of #16 for a PREFAB INSTANCE. An instance's overridden
+ *  fields live in the SIBLING `overrides` object (keyed by prefab localId → trait →
+ *  field), not in `traits` (which for an instance carries only PrefabInstance /
+ *  EntityAttributes), so the #16 check above never sees an instance's size or
+ *  anchor. Resolving the prefab needs I/O this module doesn't do, so a resolver is
+ *  caller-injected and optional. */
+describe('validateSceneData — UIElement size inert under a stretched UIAnchor, prefab-instance overrides (#35)', () => {
+  const PREFAB_GUID = 'b2c3d4e5-1111-2222-3333-444455556666';
+
+  const instance = (overrides: Record<string, unknown>) => scene([
+    {
+      id: 1,
+      name: 'Instance',
+      traits: { PrefabInstance: { source: PREFAB_GUID, localId: 1, rootInstanceId: 1 } },
+      overrides,
+    },
+  ]);
+
+  const prefabWith = (entityTraits: Record<string, unknown>) => ({
+    id: PREFAB_GUID,
+    version: 1,
+    name: 'Prefab',
+    rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Root', traits: entityTraits }],
+  });
+
+  it('warns: anchor from the prefab, size overridden in the scene, resolver supplied', () => {
+    const getPrefab: PrefabResolver = (ref) => (ref === PREFAB_GUID ? prefabWith({ UIAnchor: { anchor: 'bottom-stretch' } }) : undefined);
+    const res = validateSceneData(instance({ 1: { UIElement: { width: 90, widthUnit: '%' } } }), undefined, getPrefab);
+    expect(res.warnings.join('\n')).toMatch(/overrides\[1\]\.UIElement\.width is inert.*bottom-stretch.*from its prefab, localId 1.*left\/right offsets.*overridden 90%/s);
+  });
+
+  it('stays silent with NO resolver passed (conservative silence)', () => {
+    const res = validateSceneData(instance({ 1: { UIElement: { width: 90, widthUnit: '%' } } }));
+    expect(res.warnings.filter((w) => /is inert/.test(w))).toEqual([]);
+  });
+
+  it('warns with NO resolver at all when anchor AND size are both in the same override group', () => {
+    const res = validateSceneData(instance({
+      1: { UIAnchor: { anchor: 'bottom-stretch' }, UIElement: { width: 90, widthUnit: '%' } },
+    }));
+    expect(res.warnings.join('\n')).toMatch(/overrides\[1\]\.UIElement\.width is inert/);
+    // The anchor came from the override group itself, not the prefab — no "(from its prefab...)" note.
+    expect(res.warnings.join('\n')).not.toMatch(/from its prefab/);
+  });
+
+  it('excludes 0 in the prefab path', () => {
+    const getPrefab: PrefabResolver = () => prefabWith({ UIAnchor: { anchor: 'stretch' } });
+    const res = validateSceneData(instance({ 1: { UIElement: { width: 0 } } }), undefined, getPrefab);
+    expect(res.warnings).toEqual([]);
+  });
+
+  it('excludes 100% where the UNIT comes from the prefab (unit-merge case)', () => {
+    const getPrefab: PrefabResolver = () => prefabWith({
+      UIAnchor: { anchor: 'stretch' },
+      UIElement: { widthUnit: '%' },
+    });
+    // Override only the numeric value; the '%' unit is merged in from the prefab.
+    const res = validateSceneData(instance({ 1: { UIElement: { width: 100 } } }), undefined, getPrefab);
+    expect(res.warnings).toEqual([]);
+  });
+
+  it('stays silent on a non-stretched prefab anchor', () => {
+    const getPrefab: PrefabResolver = () => prefabWith({ UIAnchor: { anchor: 'bottom' } });
+    const res = validateSceneData(instance({ 1: { UIElement: { width: 90, widthUnit: '%' } } }), undefined, getPrefab);
+    expect(res.warnings).toEqual([]);
+  });
+
+  it('stays silent when the override group does not touch UIElement at all (prefab-side authoring, out of scope)', () => {
+    const getPrefab: PrefabResolver = () => prefabWith({
+      UIAnchor: { anchor: 'stretch' },
+      UIElement: { width: 200, widthUnit: '%' },
+    });
+    const res = validateSceneData(instance({ 1: { Transform: { x: 1 } } }), undefined, getPrefab);
+    expect(res.warnings).toEqual([]);
+  });
+
+  it('does not crash and does not warn when the resolver throws', () => {
+    const getPrefab: PrefabResolver = () => { throw new Error('boom'); };
+    expect(() => validateSceneData(instance({ 1: { UIElement: { width: 90, widthUnit: '%' } } }), undefined, getPrefab)).not.toThrow();
+    const res = validateSceneData(instance({ 1: { UIElement: { width: 90, widthUnit: '%' } } }), undefined, getPrefab);
+    expect(res.warnings.filter((w) => /is inert/.test(w))).toEqual([]);
+  });
+
+  it('does not crash and does not warn when the resolver returns garbage', () => {
+    const getPrefab: PrefabResolver = () => 'not a prefab object' as unknown;
+    const res = validateSceneData(instance({ 1: { UIElement: { width: 90, widthUnit: '%' } } }), undefined, getPrefab);
+    expect(res.warnings.filter((w) => /is inert/.test(w))).toEqual([]);
+  });
+
+  it('names the top/bottom offsets for an inert HEIGHT (the other axis)', () => {
+    const getPrefab: PrefabResolver = () => prefabWith({ UIAnchor: { anchor: 'left-stretch' } });
+    const res = validateSceneData(instance({ 1: { UIElement: { height: 40, heightUnit: '%' } } }), undefined, getPrefab);
+    expect(res.warnings.join('\n')).toMatch(/overrides\[1\]\.UIElement\.height is inert.*left-stretch.*top\/bottom offsets.*overridden 40%/s);
+  });
+
+  it('warns on a UNIT-only override, taking the value from the prefab', () => {
+    // The override changes only `widthUnit`; the 90 comes from the prefab. The axis is
+    // still touched by the override, and 90% is still inert — so this must warn, with
+    // the merged value echoed.
+    const getPrefab: PrefabResolver = () => prefabWith({
+      UIAnchor: { anchor: 'bottom-stretch' },
+      UIElement: { width: 90, widthUnit: 'px' },
+    });
+    const res = validateSceneData(instance({ 1: { UIElement: { widthUnit: '%' } } }), undefined, getPrefab);
+    expect(res.warnings.join('\n')).toMatch(/overrides\[1\]\.UIElement\.width is inert.*overridden 90%/s);
+  });
+
+  it('lets an override ANCHOR win over the prefab: stretched prefab, non-stretched override', () => {
+    const getPrefab: PrefabResolver = () => prefabWith({ UIAnchor: { anchor: 'bottom-stretch' } });
+    const res = validateSceneData(instance({
+      1: { UIAnchor: { anchor: 'bottom' }, UIElement: { width: 90, widthUnit: '%' } },
+    }), undefined, getPrefab);
+    // The override un-stretches the axis, so the authored width is LIVE — silence is correct.
+    expect(res.warnings.filter((w) => /is inert/.test(w))).toEqual([]);
+  });
+
+  it('reports each override group independently, naming its own localId', () => {
+    const getPrefab: PrefabResolver = () => ({
+      id: PREFAB_GUID, version: 1, name: 'Prefab', rootLocalId: 1,
+      entities: [
+        { localId: 1, name: 'A', traits: { UIAnchor: { anchor: 'bottom-stretch' } } },
+        { localId: 2, name: 'B', traits: { UIAnchor: { anchor: 'right-stretch' } } },
+      ],
+    });
+    const res = validateSceneData(instance({
+      1: { UIElement: { width: 90, widthUnit: '%' } },
+      2: { UIElement: { height: 30, heightUnit: '%' } },
+    }), undefined, getPrefab);
+    expect(res.warnings.join('\n')).toMatch(/overrides\[1\]\.UIElement\.width is inert/);
+    expect(res.warnings.join('\n')).toMatch(/overrides\[2\]\.UIElement\.height is inert/);
+  });
+
+  it('stays silent when the override localId has no matching prefab entity', () => {
+    const getPrefab: PrefabResolver = () => prefabWith({ UIAnchor: { anchor: 'bottom-stretch' } }); // only localId 1
+    const res = validateSceneData(instance({ 7: { UIElement: { width: 90, widthUnit: '%' } } }), undefined, getPrefab);
+    expect(res.warnings.filter((w) => /is inert/.test(w))).toEqual([]);
+  });
+
+  it('never calls the resolver when PrefabInstance.source is empty', () => {
+    let calls = 0;
+    const getPrefab: PrefabResolver = () => { calls++; return undefined; };
+    const res = validateSceneData(scene([{
+      id: 1, name: 'Instance',
+      traits: { PrefabInstance: { source: '', localId: 1, rootInstanceId: 1 } },
+      overrides: { 1: { UIElement: { width: 90, widthUnit: '%' } } },
+    }]), undefined, getPrefab);
+    expect(calls).toBe(0);
+    expect(res.warnings.filter((w) => /is inert/.test(w))).toEqual([]);
+  });
+
+  it('resolves the prefab ONCE per entity, not once per override group', () => {
+    let calls = 0;
+    const getPrefab: PrefabResolver = () => {
+      calls++;
+      return { id: PREFAB_GUID, version: 1, name: 'P', rootLocalId: 1, entities: [
+        { localId: 1, traits: { UIAnchor: { anchor: 'stretch' } } },
+        { localId: 2, traits: { UIAnchor: { anchor: 'stretch' } } },
+        { localId: 3, traits: { UIAnchor: { anchor: 'stretch' } } },
+      ] };
+    };
+    validateSceneData(instance({
+      1: { UIElement: { width: 90, widthUnit: '%' } },
+      2: { UIElement: { width: 80, widthUnit: '%' } },
+      3: { UIElement: { width: 70, widthUnit: '%' } },
+    }), undefined, getPrefab);
+    expect(calls).toBe(1);
+  });
+
+  it('stays silent when the resolved prefab has no entities array', () => {
+    const getPrefab: PrefabResolver = () => ({ id: PREFAB_GUID, version: 1, name: 'P', rootLocalId: 1 });
+    const res = validateSceneData(instance({ 1: { UIElement: { width: 90, widthUnit: '%' } } }), undefined, getPrefab);
+    expect(res.warnings.filter((w) => /is inert/.test(w))).toEqual([]);
   });
 });

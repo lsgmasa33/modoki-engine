@@ -44,7 +44,7 @@ async function load(
 ): Promise<void> {
   const { GLTFLoader } = await import('three/examples/jsm/loaders/GLTFLoader.js');
   const spy = vi.spyOn(GLTFLoader.prototype, 'load').mockImplementation(
-    (_url: string, onLoad: (gltf: { scene: THREE.Object3D }) => void) => {
+    (_url: string, onLoad: (gltf: any) => void) => {
       onLoad(makeScene(meshNames));
     },
   );

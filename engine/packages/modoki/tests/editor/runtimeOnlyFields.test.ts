@@ -50,6 +50,20 @@ vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   markStructureDirty: vi.fn(),
   deleteEntities: vi.fn(),
   readTraitData: () => null,
+  // Mirrors the real readTraitDataFull: the keys a trait PERSISTS — its koota
+  // schema for a SoA trait, the live object's own keys for AoS — NOT the
+  // meta.fields Inspector subset that readTraitData reads.
+  readTraitDataFull: (id: number, meta: any) => {
+    const e: any = index.get(id);
+    if (!e || !e.has(meta.trait)) return null;
+    if (meta.category === 'tag') return {};
+    const data = e.get(meta.trait);
+    const schema = (meta.trait as { schema?: unknown }).schema;
+    const keys = schema && typeof schema === 'object' ? Object.keys(schema) : Object.keys(data);
+    const out: Record<string, unknown> = {};
+    for (const k of keys) out[k] = data[k];
+    return out;
+  },
   writeTraitField: vi.fn(),
 }));
 vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
@@ -99,9 +113,14 @@ describe('runtimeOnly field serialization', () => {
     expect(t).not.toHaveProperty('smoothedElapsed');
   });
 
-  it('serializes ALL fields for a trait with no runtimeOnly markings', async () => {
+  it('serializes every NON-DEFAULT field for a trait with no runtimeOnly markings', async () => {
     const e = testWorld.spawn(
-      EntityAttributes({ name: 'Plain', guid: 'cccc-dddd', parentId: 0, sortOrder: 0, isActive: true, layer: '' }),
+      // sortOrder/isActive deliberately set AWAY from their schema defaults (0/true),
+      // so this test pins the runtimeOnly filter alone. A field can now be absent for
+      // two independent reasons — runtimeOnly, or "still equal to its default" — and
+      // an assertion that can't tell them apart passes for the wrong reason. The
+      // default-omission rule gets its own test below.
+      EntityAttributes({ name: 'Plain', guid: 'cccc-dddd', parentId: 0, sortOrder: 7, isActive: false, layer: '2d' }),
     );
     index.set(e.id(), e);
 
@@ -109,11 +128,35 @@ describe('runtimeOnly field serialization', () => {
     const scene = await serializeScene();
     const entry = scene.entities.find((x) => x.name === 'Plain')!;
     const ea = entry.traits.EntityAttributes as Record<string, unknown>;
-    // EntityAttributes marks nothing runtimeOnly → every field round-trips.
+    // EntityAttributes marks nothing runtimeOnly → every authored field round-trips.
     expect(ea).toHaveProperty('name', 'Plain');
-    // parentId now serializes as a GUID ('' for a root entity), not a koota id.
+    expect(ea).toHaveProperty('sortOrder', 7);
+    expect(ea).toHaveProperty('isActive', false);
+    expect(ea).toHaveProperty('layer', '2d');
+    // parentId now serializes as a GUID ('' for a root entity), not a koota id. It is
+    // written unconditionally (guid-ified after the field loop), so the default rule
+    // never applies to it.
     expect(ea).toHaveProperty('parentId', '');
-    expect(ea).toHaveProperty('sortOrder', 0);
+  });
+
+  it('omits a field still holding its schema default — defaults stay LIVE instead of being frozen into the file', async () => {
+    const e = testWorld.spawn(
+      EntityAttributes({ name: 'Defaulted', guid: 'eeee-ffff', parentId: 0, sortOrder: 0, isActive: true, layer: '' }),
+    );
+    index.set(e.id(), e);
+
+    const { serializeScene } = await import('../../src/editor/scene/serialize');
+    const scene = await serializeScene();
+    const entry = scene.entities.find((x) => x.name === 'Defaulted')!;
+    const ea = entry.traits.EntityAttributes as Record<string, unknown>;
+    // Authored (differs from the '' default) → written.
+    expect(ea).toHaveProperty('name', 'Defaulted');
+    expect(ea).toHaveProperty('guid', 'eeee-ffff');
+    // Untouched defaults → absent, so a later change to the trait default still
+    // reaches this scene. The loader rebuilds them via `meta.trait(partialData)`.
+    expect(ea).not.toHaveProperty('sortOrder');
+    expect(ea).not.toHaveProperty('isActive');
+    expect(ea).not.toHaveProperty('layer');
   });
 
   it("serializes a child's parentId as the parent's GUID (not the koota id)", async () => {

@@ -5,7 +5,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-let build: ReturnType<typeof vi.fn>;
+let build: ReturnType<typeof vi.fn<(p: string) => unknown>>;
 const paths = new Map<string, string>();
 
 vi.mock('../../src/runtime/loaders/assetManifest', () => ({
@@ -20,7 +20,7 @@ let cache: typeof import('../../src/runtime/loaders/spriteMaterialCache');
 beforeEach(async () => {
   vi.resetModules();
   paths.clear();
-  build = vi.fn();
+  build = vi.fn<(p: string) => unknown>();
   cache = await import('../../src/runtime/loaders/spriteMaterialCache');
 });
 afterEach(() => { vi.restoreAllMocks(); });

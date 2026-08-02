@@ -5,6 +5,7 @@
  *  the heavy renderer module. collectEntityMeshes itself is covered in scene3DSync.test.ts. */
 
 import { describe, it, expect, beforeEach } from 'vitest';
+import type { Mesh } from 'three';
 
 // A RenderState is opaque to the broker — it only forwards it to the collector.
 // Model one as { meshes: Map<id, THREE.Mesh[]> } and have the fake collector read it.
@@ -28,7 +29,7 @@ const asWorld = (w: object) => w as unknown as Parameters<typeof getEntityObject
 beforeEach(() => {
   clearRenderSurfaces();
   // Inject the fake collector (in the real runtime, scene3DSync does this at load).
-  setEntityMeshCollector((state, id) => (state as FakeState).meshes.get(id) ?? []);
+  setEntityMeshCollector((state, id) => ((state as unknown as FakeState).meshes.get(id) ?? []) as unknown as Mesh[]);
 });
 
 describe('materialBroker', () => {

@@ -13,6 +13,8 @@ import {
   UI_PRESET_DEFAULTS,
   SELF_PLACEMENT_PROPS,
   isSelfPlacementDisabled,
+  selectionSizeGate,
+  selectionAnchorGate,
   type UiPreset,
 } from '../../src/editor/uiAuthoring';
 
@@ -92,5 +94,55 @@ describe('isSelfPlacementDisabled (anchor overrides self-placement only)', () =>
   it('only applies to UIElement, not other traits', () => {
     expect(isSelfPlacementDisabled('UIAnchor', true, 'flexGrow')).toBe(false);
     expect(isSelfPlacementDisabled('Transform', true, 'flexGrow')).toBe(false);
+  });
+});
+
+describe('selectionSizeGate (unanimous-or-nothing across a multi-selection, #34)', () => {
+  it('is live when nothing in the selection stretches that axis', () => {
+    expect(selectionSizeGate(['bottom', 'center', null], 'width')).toBe('live');
+  });
+
+  it('is inert only when EVERY entity has that axis stretched', () => {
+    expect(selectionSizeGate(['stretch', 'bottom-stretch', 'h-stretch'], 'width')).toBe('inert');
+    // The same selection for HEIGHT: only 'stretch' kills it → not unanimous.
+    expect(selectionSizeGate(['stretch', 'bottom-stretch', 'h-stretch'], 'height')).toBe('mixed');
+  });
+
+  it('is mixed regardless of which end the live one sits at', () => {
+    // The pre-#34 bug was order-sensitive (it read entityIds[0]); the verdict must not be.
+    expect(selectionSizeGate(['bottom-stretch', 'bottom'], 'width')).toBe('mixed');
+    expect(selectionSizeGate(['bottom', 'bottom-stretch'], 'width')).toBe('mixed');
+  });
+
+  it('counts an un-anchored entity as live — its size always takes effect', () => {
+    expect(selectionSizeGate(['stretch', null], 'width')).toBe('mixed');
+    expect(selectionSizeGate([null, undefined], 'width')).toBe('live');
+  });
+
+  it('single-select still collapses to a plain inert/live answer', () => {
+    expect(selectionSizeGate(['bottom-stretch'], 'width')).toBe('inert');
+    expect(selectionSizeGate(['bottom-stretch'], 'height')).toBe('live');
+  });
+
+  it('an empty selection gates nothing', () => {
+    expect(selectionSizeGate([], 'width')).toBe('live');
+  });
+});
+
+describe('selectionAnchorGate (self-placement props, #34)', () => {
+  it('only reports inert when every entity is anchored — any mode counts', () => {
+    expect(selectionAnchorGate(['center', 'stretch'])).toBe('inert');
+    expect(selectionAnchorGate(['center', null])).toBe('mixed');
+    expect(selectionAnchorGate([null, null])).toBe('live');
+    expect(selectionAnchorGate([])).toBe('live');
+  });
+
+  it('counts an anchor with an unreadable mode ("") as anchored', () => {
+    // `''` = anchored, mode unknown; `null` = no anchor at all. The two gates disagree
+    // about it ON PURPOSE — any anchor kills self-placement, but an unknown mode
+    // stretches nothing — so collapsing them would break exactly one of the two.
+    expect(selectionAnchorGate(['', ''])).toBe('inert');
+    expect(selectionAnchorGate(['', null])).toBe('mixed');
+    expect(selectionSizeGate(['', ''], 'width')).toBe('live');
   });
 });

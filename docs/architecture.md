@@ -162,6 +162,24 @@ entity**. It is derived from which `Renderable*` trait is present (e.g.
 rendering layer queries only the entities tagged for it, so the three renderers stay
 fully decoupled.
 
+**Stored and exposed are two different types, and the read path reconciles them.** The
+stored field is `'' | '3d' | '2d' | 'ui'`; what consumers see (`EntityInfo['layer']`) is
+`'3d' | '2d' | 'ui' | undefined`. `getAllEntities` closes the gap on every read
+(`deriveLayer`, `runtime/core/ecs/entityUtils.ts`):
+
+- **A present primary renderable trait WINS** over the stored value, so the two cannot
+  drift — a `Renderable2D` entity left at `layer:'3d'` still reads as `'2d'`. The
+  authoritative map is `PRIMARY_RENDERABLE_LAYER`.
+- **Otherwise the stored value stands.** Lights, HDR environments, `ModelSource`, and
+  group nodes have no unambiguous primary renderer and legitimately store `''` or `'3d'`.
+- **The caller narrows before deriving, and that is deliberate.** `getAllEntities`
+  accepts only the three real layers and maps everything else to `undefined` — both the
+  legitimate `''` and any junk string, since the trait is read as `unknown`-typed data
+  out of hot-reloadable scene JSON where a hand-edited `"layer": "3D"` is reachable.
+  `deriveLayer` therefore takes the already-narrowed type; **don't widen it to accept
+  `''`** — folding the narrowing inward would drop the junk rejection that keeps a typo
+  out of the Hierarchy filters and `get_scene_state` (#36).
+
 ## Three Rendering Layers
 
 Each layer is driven by an entity's `layer` value:
@@ -249,6 +267,85 @@ a parented marker at scene bootstrap, or physics reading back a parented body mi
 
 **Gotcha:** the decomposed getters return a **shared singleton** — read/destructure its
 fields immediately, never retain it (two live results alias the same object).
+
+### Authoring in world space (`set_transform {space}`)
+
+An agent READS world coordinates (`get_scene_state {world:1}` is what answers "where is this?")
+and then naturally writes them back — so authoring needs the same conversion the simulation half
+has. `modoki_set_transform` therefore takes a **required** `space: 'local' | 'world'`.
+
+**Required, with no default, deliberately.** The parameter was previously documented as *"World
+position"* while writing the LOCAL fields, so asking for a parented entity's own current world
+position displaced it by exactly the parent offset and reported success (measured 2026-07-30:
+local `(623, 679)` / world `(823, 926)` → written as `(823, 926)` → now at world `(1023, 1173)`).
+A default would not remove that mistake, only relocate it into the caller's head; for a ROOT
+entity both values are correct anyway, so stating it costs nothing where it cannot matter.
+
+Two implementations, because `set_transform` has two backends and a capability that works in only
+one of them is the mode-dependent inconsistency this contract exists to prevent:
+
+- **Live path** — `getWorldTransform3D` + `getParentWorldMatrix3D` for the parent chain (a koota
+  query), then `matrixToTrs` → `worldToLocalTrs`.
+- **File path** — `runtime/scene/transformSpace.ts`, which walks `EntityAttributes.parentId`
+  through the scene JSON's entity array and composes the same euler-XYZ product.
+
+**Both DECOMPOSE the parent, and that is the contract** (owner decision, 2026-07-31). The parent's
+world transform is a **TRS**, so both paths compose the ancestor chain exactly and then decompose
+**once** — which is also what the SceneView gizmo does (it is handed the render cache's decomposed
+parent TRS). All three authoring surfaces therefore write the same local value for the same request.
+
+The live path used to invert the RAW composed matrix instead (`worldToLocal3D`, which is exact even
+under shear), making it the odd one out: the same `{space:'world'}` op landed the entity in a
+different place depending only on whether an editor happened to be open, and the live answer matched
+neither the file path nor a gizmo drag. Measured on a 2-level chain (grandparent scale `(2,1,1)` →
+parent rotated 45° → child), requesting world `(10,0,0)` produced local x `3.5355` live vs `4.6589`
+headless. `engine/tests/editor/applySceneOpsLive.test.ts` now runs the identical op through both
+paths and compares.
+
+**`worldToLocal3D` is unchanged and still exact** — the split is *authoring vs simulation*, not an
+accident. Physics writes a stepped body's world pose back through it every frame, as do
+`games/sling` (fish steering) and `demos/forest-camp` (arrow attach); simulation wants the exact
+inverse, and a per-frame decompose would be cost with no authoring benefit.
+
+Both convert the **whole pose**, never field-by-field: under a rotated parent a world X depends on
+the child's world Y and Z too, so converting one field against a base of zeros would silently move
+the other axes. The current pose is lifted to world, the caller's fields are overlaid on that, and
+the result is converted back.
+
+The write-back is **group-wise** (`persistedTrsKeys`): naming any of `x`/`y`/`z` persists all three,
+same for the rotation and scale triples, and the groups are independent. Persisting only the keys
+the caller literally named threw away part of the conversion's own answer — `{space:'world', x:10}`
+kept `x`, dropped the `y`/`z` that made it correct, and left the entity where it was while reporting
+`changed:1`. Writing all nine instead would land decompose noise on axes nobody mentioned.
+
+A **collapsed** (zero-scale) ancestor is **refused**, naming the axes: it maps every descendant onto
+its own origin, so the request has no solution. This was silent by construction —
+`Matrix4.decompose` hits its `det === 0` branch and substitutes scale `(1,1,1)` with an identity
+quaternion, so a collapsed parent read back as unscaled *and* unrotated and the conversion proceeded
+confidently on a parent that does not exist.
+
+A **prefab-instance** ancestor contributes its `overrides[localId].Transform`, not `traits.Transform`
+— a captured instance root has no top-level Transform at all. (Narrower remaining gap: an instance
+with no override Transform inherits its placement from the prefab FILE, which the file-path
+conversion cannot read; such an ancestor is still treated as identity.)
+
+The low-level `mutate_scene` `setTrait` op takes the same `space` as an **optional** field
+defaulting to literal (local) writes — writing trait fields verbatim is exactly what that op is
+for; `space` on any trait other than `Transform` is refused rather than ignored.
+
+**Known limit, and it is a DESIGN DECISION rather than a defect**: a non-uniformly-scaled parent
+applied to a rotated child produces a sheared world matrix, and `Matrix4.decompose` cannot reduce
+shear back to clean TRS — that combination does not round-trip exactly. This follows directly from
+the engine storing a **TRS `Transform` rather than a 4×4 matrix**, chosen deliberately (an
+inspectable, authorable, diffable nine-field trait beats sixteen opaque numbers for a scene format
+humans and agents both edit). Shear is the price. It applies identically to the human SceneView
+gizmo (`editor/scene/gizmoTransform.ts`) — so it is a property of the format, not of any one
+writer, and nothing downstream should try to "fix" it locally.
+
+The corollary, confirmed as the convention on 2026-07-31: **a sheared parent is not a legal state**,
+the way it is not in Unity's `Transform`. An authoring path that is *more* exact than the format is
+not more correct — it just disagrees with the format, the gizmo, and the other path. That is why the
+live path was changed to decompose rather than the file path being changed to invert.
 
 ## Zustand Bridge
 

@@ -40,6 +40,7 @@ import { physics3DEvents } from './Physics3DEvents';
 import { makeFireOnCollision, drainContactEvents, synthesizeContactExits, refOf, type ColliderInfo } from './physicsContactEvents';
 import { dropEntityFromContactIndex } from './physicsContactIndex';
 import { emit, isVerboseCaptureActive } from '../core/journal';
+import { warnVocabOnce } from '../core/warnVocab';
 import { initRapier3D, isRapier3DReady, getRapier3D, type Rapier3D } from './rapier3DLoader';
 import {
   vecEcsToPhys, vecEcsToPhysInto, vecPhysToEcs, vecPhysToEcsInto, lenToPhys, packCollisionGroups,
@@ -409,7 +410,14 @@ function createBody(
   let desc;
   if (rb.bodyType === 'static') desc = R.RigidBodyDesc.fixed();
   else if (rb.bodyType === 'kinematic') desc = R.RigidBodyDesc.kinematicPositionBased();
-  else desc = R.RigidBodyDesc.dynamic();
+  else {
+    // Consequence is NOT simply "behaves dynamic": BodyRec.bodyType caches the raw authored
+    // string and the Rapier->ECS pull-back gate below tests it against the literal 'dynamic',
+    // so an unrecognised value yields a dynamic body whose Transform is never written back.
+    // The visible symptom is a FROZEN entity, not a falling one — say so (#73).
+    if (rb.bodyType !== 'dynamic') warnVocabOnce('physics3D', 'RigidBody3D.bodyType', rb.bodyType, "a dynamic body is created, but its Transform is never pulled back — the entity will appear frozen");
+    desc = R.RigidBodyDesc.dynamic();
+  }
 
   desc.setTranslation(pos.x, pos.y, pos.z).setRotation(quat)
     .setLinvel(vel.x, vel.y, vel.z).setAngvel({ x: rb.avx, y: rb.avy, z: rb.avz })
@@ -589,7 +597,9 @@ function createJoint(
     case 'prismatic': jd = R.JointData.prismatic(a1, a2, normAxis()); break;
     // Identity frames lock a ZERO relative rotation — the weld aligns both bodies' orientations.
     case 'fixed': jd = R.JointData.fixed(a1, { x: 0, y: 0, z: 0, w: 1 }, a2, { x: 0, y: 0, z: 0, w: 1 }); break;
-    default: return;
+    default:
+      warnVocabOnce('physics3D', 'Joint3D.type', j.type, 'joint not created');
+      return;
   }
 
   const joint = st.world.createImpulseJoint(jd, bodyA, bodyB, true);

@@ -13,7 +13,7 @@
 
 import { chromium } from 'playwright';
 import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
 
@@ -28,12 +28,14 @@ const ok = (name, cond, detail = '') => { console.log(`${cond ? 'PASS' : 'FAIL'}
 // 0. Build the artifact fresh.
 console.log(`[smoke-playable] building ${project} playable…`);
 fs.rmSync(path.join(REPO_ROOT, project, 'ads'), { recursive: true, force: true });
-execFileSync('node', ['engine/scripts/build-web.mjs'], {
+execFileSync('node', ['engine/scripts/build-web.mjs', '--target', 'playable'], {
   cwd: REPO_ROOT, stdio: ['ignore', 'ignore', 'inherit'],
   env: { ...process.env, MODOKI_PROJECT: project, VITE_PLAYABLE: '1' },
 });
 if (!fs.existsSync(artifact)) { console.error(`[smoke-playable] no artifact at ${artifact}`); process.exit(1); }
-const ART = `file://${artifact}`;
+// pathToFileURL, not a `file://${…}` template: `artifact` is an absolute OS path, so a
+// space in the repo path (or a Windows drive letter) yields a URL page.goto cannot open.
+const ART = pathToFileURL(artifact).href;
 
 const MRAID_INIT = (viewable) => `(() => {
   const L = {}; window.__mraidOpen = null; window.__viewable = ${viewable};

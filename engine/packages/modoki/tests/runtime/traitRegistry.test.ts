@@ -2,9 +2,10 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { trait } from 'koota';
+import type { TraitMeta } from '../../src/runtime/core/ecs/traitRegistry';
 
 async function getRegistry() {
-  return import('../../../src/runtime/core/ecs/traitRegistry');
+  return import('../../src/runtime/core/ecs/traitRegistry');
 }
 
 beforeEach(() => {
@@ -35,7 +36,7 @@ describe('traitRegistry', () => {
       const { registerTrait, getTraitMeta, getTraitByName } = await getRegistry();
 
       const TestTrait = trait({ value: 0 });
-      const meta = { name: 'TestTrait', trait: TestTrait, category: 'resource', fields: { value: { type: 'number' } } };
+      const meta: TraitMeta = { name: 'TestTrait', trait: TestTrait, category: 'resource', fields: { value: { type: 'number' } } };
       registerTrait(meta);
 
       expect(getTraitMeta(TestTrait)).toBe(meta);

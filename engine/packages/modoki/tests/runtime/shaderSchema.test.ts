@@ -67,7 +67,7 @@ describe('fetchShaderManifest — param-type validation (F10)', () => {
     global.fetch = vi.fn(async () => okJson({ params: { tint: { type: 'flot', default: 0xffffff } } })) as never;
     const m = await fetchShaderManifest('/shaders/x.shader.json');
     expect(m).not.toBeNull();
-    expect(warn.mock.calls.some((c) => String(c[0]).includes("param 'tint'") && String(c[0]).includes('flot'))).toBe(true);
+    expect(warn.mock.calls.some((c: unknown[]) => String(c[0]).includes("param 'tint'") && String(c[0]).includes('flot'))).toBe(true);
   });
 
   it('does not warn when every param type is valid', async () => {

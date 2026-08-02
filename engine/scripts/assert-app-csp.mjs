@@ -28,17 +28,35 @@
  */
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { binInAppDir, killPackaged } from './packagedAppPaths.mjs';
+import { clonePort } from './clonePort.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const app = process.argv[2];
 if (!app) { console.error('usage: assert-app-csp.mjs <app-path> [project-dir]'); process.exit(1); }
 const PROJECT = path.resolve(process.argv[3] ?? path.join(REPO, 'games/3d-test'));
 const BOOT_TIMEOUT_MS = 120_000;
+
+// This leg used to spawn the app with NO backend port pinned, so it took main.ts's
+// sticky-then-scan path and bound whatever was free — measured: **5179**, i.e. the MAIN
+// clone's editor port (and its dev server landed on 5173, likewise the main clone's).
+// Two consequences, both bad and neither loud:
+//   1. A throwaway smoke app squats the port an agent's `MODOKI_BACKEND` points at, so a
+//      `modoki_*` call aimed at the main clone's editor can hit THIS app instead — the
+//      exact silent cross-clone failure the root CLAUDE.md's "which editor is this?"
+//      gotcha is about, and the reason every other harness here derives a per-clone port.
+//   2. It confounds #68: the leg's environment depended on whether a sibling clone
+//      happened to hold 5179, which is not something a flake hunt should have to guess at.
+// So pin it, per clone, like smoke-packaged.sh's render leg already does. A DIFFERENT
+// block from that leg's 38600-38799 on purpose — the two legs run seconds apart against
+// the same clone, and reusing one block would hand the CSP boot the port a just-killed
+// render instance may still be releasing. A pinned port also makes main.ts take its
+// fail-loud path (E6) if it IS taken, which is what we want here: loud beats silent.
+const BACKEND_PORT = Number(process.env.CSP_BACKEND_PORT) || clonePort(REPO, 38800, 200);
 
 // `app` is the unpacked app dir — a `.app` bundle on macOS, `win-unpacked` on Windows —
 // so the executable inside it is resolved per-platform (packagedAppPaths.mjs), not by
@@ -72,10 +90,40 @@ await new Promise((r) => setTimeout(r, 1500)); // let the OS release the old CDP
 const CDP_PORT = Number(process.env.CSP_CDP_PORT) || (await freePort());
 
 const userData = mkdtempSync(path.join(tmpdir(), 'modoki-csp-ud-'));
+const bootStart = Date.now();
+
+// A clean-exit failure ("app exited early (code 0)") used to tell us NOTHING about why —
+// stdio was only ever `inherit`ed, so once the run scrolled past there was no way to look
+// back, and the app's OWN main.log (under this run's fresh --user-data-dir) was never even
+// checked. Capture a rolling tail of the child's stdout/stderr here (still inherited live,
+// so a human watching the terminal sees the same thing as before) and print it — plus the
+// app's main.log tail and how long it survived — on ANY failure, so the next flake is
+// diagnosable from this output alone, no re-run required.
+const MAX_CAPTURED_LINES = 200;
+const outputLines = [];
+function capture(chunk) {
+  for (const line of chunk.toString().split('\n')) {
+    outputLines.push(line);
+    if (outputLines.length > MAX_CAPTURED_LINES) outputLines.shift();
+  }
+}
 const child = spawn(bin, [`--user-data-dir=${userData}`], {
-  env: { ...process.env, MODOKI_NO_AUTOUPDATE: '1', MODOKI_PROJECT: PROJECT, MODOKI_CDP_PORT: String(CDP_PORT) },
-  stdio: ['ignore', 'inherit', 'inherit'],
+  env: {
+    ...process.env,
+    MODOKI_NO_AUTOUPDATE: '1',
+    MODOKI_PROJECT: PROJECT,
+    MODOKI_CDP_PORT: String(CDP_PORT),
+    MODOKI_BACKEND_PORT: String(BACKEND_PORT),   // per-clone — see the note above
+    // Same reasoning, weaker stakes: unpinned, this leg's dev server took 5173 — the main
+    // clone's editor PAGE port. MODOKI_VITE_PORT only seeds a PREFERENCE (findFreePort still
+    // runs, main.ts:339), so this cannot fail the leg if the port is busy; it just stops a
+    // throwaway smoke boot from sitting on a port a human's editor announces.
+    MODOKI_VITE_PORT: String(BACKEND_PORT + 1),
+  },
+  stdio: ['ignore', 'pipe', 'pipe'],
 });
+child.stdout.on('data', (d) => { process.stdout.write(d); capture(d); });
+child.stderr.on('data', (d) => { process.stderr.write(d); capture(d); });
 const cleanup = () => {
   try { child.kill('SIGKILL'); } catch { /* gone */ }
   killPackaged(app);
@@ -83,6 +131,32 @@ const cleanup = () => {
 };
 process.on('exit', cleanup);
 process.on('SIGINT', () => { cleanup(); process.exit(1); });
+
+/** Dump everything needed to diagnose a failure without a re-run: how long the app
+ *  survived, its exit code/signal, its captured stdout/stderr tail, and the tail of its
+ *  OWN main.log (fileLog.ts — `<userData>/logs/main.log`, findable because THIS run's
+ *  --user-data-dir is a fresh, known dir). Called once, from the finally block, so
+ *  multiple fail() calls in one run don't each reprint it. */
+function dumpDiagnostics() {
+  const survivedSec = ((Date.now() - bootStart) / 1000).toFixed(1);
+  // The ports are part of the diagnosis, not decoration: #68's whole difficulty was that a
+  // clean `code 0` said nothing about the environment the boot actually got.
+  log(`diagnostics — survived ${survivedSec}s, exitCode=${child.exitCode}, signal=${child.signalCode}, backendPort=${BACKEND_PORT}, cdpPort=${CDP_PORT}`);
+  if (outputLines.length) {
+    log(`captured app stdout/stderr (last ${Math.min(50, outputLines.length)} of ${outputLines.length} lines):`);
+    for (const l of outputLines.slice(-50)) console.error('    ' + l);
+  } else {
+    log('captured app stdout/stderr: (nothing captured)');
+  }
+  const mainLogPath = path.join(userData, 'logs', 'main.log');
+  try {
+    const tail = readFileSync(mainLogPath, 'utf8').split('\n').slice(-50);
+    log(`tail of ${mainLogPath}:`);
+    for (const l of tail) console.error('    ' + l);
+  } catch (e) {
+    log(`could not read ${mainLogPath}: ${e?.message ?? e}`);
+  }
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function editorPage() {
@@ -177,6 +251,7 @@ try {
 } catch (e) {
   fail(String(e?.stack ?? e));
 } finally {
+  if (failed) dumpDiagnostics();
   cleanup();
   process.removeAllListeners('exit');
   if (failed) console.error('[csp] FAILED ❌');

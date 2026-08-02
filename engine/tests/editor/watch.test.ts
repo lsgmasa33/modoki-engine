@@ -21,7 +21,10 @@ beforeAll(() => {
 afterEach(() => clearWatch());
 
 function setup() {
-  w = createWorld();
+  // Reuse ONE world across the file. koota caps at 16 worlds per process, and a create-per-test
+  // file hits that ceiling as soon as anyone adds cases — which is a harness limit masquerading
+  // as a failure in whatever was added last.
+  if (w) w.reset(); else { w = createWorld(); setCurrentWorld(w); }
   setCurrentWorld(w);
   timeEnt = w.spawn(Time({ frame: 0 }));
   return w;
@@ -81,7 +84,7 @@ describe('Watch — change-detection + stats', () => {
     const started = startWatch({ component: 'WPos', guids: ['rj'], fields: ['x'], epsilon: 0.001 });
     tick(1);
     tick(2, () => (e as unknown as { destroy(): void }).destroy()); // gone → despawnedAt=2
-    let r = readWatch(started.id!) as { series: { despawnedAt?: number }[] };
+    let r = readWatch(started.id!) as { series: { despawnedAt?: number; samples: { value: number }[] }[] };
     expect(r.series[0].despawnedAt).toBe(2);
     w.spawn(EntityAttributes({ guid: 'rj', name: 'RJ' }), WPos({ x: 9 })); // respawn, same guid
     tick(3);
@@ -189,5 +192,97 @@ describe('Watch — change-detection + stats', () => {
   it('rejects an unknown component / no numeric fields', () => {
     setup();
     expect((startWatch({ component: 'Nope' }) as { ok: boolean; error?: string }).ok).toBe(false);
+  });
+});
+
+describe('read {clear:true} clears ONLY what it returned — never what it did not show', () => {
+  /** A read is capped (100 series by default at the op) and can be narrowed by name/guids, but
+   *  `clear` used to empty EVERY series in the watch. So a read that showed 2 of 4 destroyed the
+   *  samples of all 4 — including the ones the caller never saw and any the human's WatchTab was
+   *  charting. "Clear what I was just shown" is a coherent consume-and-acknowledge; clearing
+   *  things nobody looked at is data loss disguised as bookkeeping. */
+  function fourMovingSeries() {
+    setup();
+    const es = ['a', 'b', 'c', 'd'].map((g) => w.spawn(EntityAttributes({ guid: g, name: `E_${g}` }), WPos({ x: 0 })));
+    const started = startWatch({ component: 'WPos', fields: ['x'], epsilon: 0.001 });
+    tick(1);
+    tick(2, () => es.forEach((e, i) => e.set(WPos, { ...e.get(WPos)!, x: i + 1 })));
+    return started.id!;
+  }
+  const counts = (id: string) =>
+    (readWatch(id) as { series: { guid: string; count: number }[] }).series
+      .reduce<Record<string, number>>((acc, s) => { acc[s.guid] = s.count; return acc; }, {});
+
+  it('a LIMITED read + clear leaves the unread series intact', () => {
+    const id = fourMovingSeries();
+    expect(Object.values(counts(id)).every((c) => c > 0)).toBe(true);
+
+    const r = readWatch(id, { limit: 2, clear: true }) as { series: unknown[]; cleared: number; clearedScope: string };
+    expect(r.series).toHaveLength(2);
+    expect(r.cleared).toBe(2);
+    expect(r.clearedScope).toBe('returned-only');
+
+    const after = counts(id);
+    expect(Object.values(after).filter((c) => c === 0)).toHaveLength(2); // exactly the two shown
+    expect(Object.values(after).filter((c) => c > 0)).toHaveLength(2);   // the rest survive
+  });
+
+  it('a FILTERED read + clear leaves the non-matching series intact', () => {
+    const id = fourMovingSeries();
+    readWatch(id, { guids: ['a'], clear: true });
+    const after = counts(id);
+    expect(after.a).toBe(0);
+    expect(after.b).toBeGreaterThan(0);
+  });
+
+  it('an UNFILTERED read + clear still clears everything, and says so', () => {
+    const id = fourMovingSeries();
+    const r = readWatch(id, { clear: true }) as { cleared: number; clearedScope: string };
+    expect(r.clearedScope).toBe('all');
+    expect(r.cleared).toBe(4);
+    expect(Object.values(counts(id)).every((c) => c === 0)).toBe(true);
+  });
+});
+
+describe('watch-start refuses a missing component with the options, not "unknown undefined"', () => {
+  it('names the missing param and lists components that have numeric fields', () => {
+    setup();
+    const r = startWatch({} as Parameters<typeof startWatch>[0]);
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/requires `component`/);
+    expect(r.error).toMatch(/Nothing was started/);
+    expect(r.hint).toMatch(/WPos/); // an actual valid choice, not just prose
+  });
+
+  it('an unknown component offers a did-you-mean rather than a bare rejection', () => {
+    setup();
+    const r = startWatch({ component: 'wpos' });      // wrong case
+    expect(r.ok).toBe(false);
+    expect(r.hint).toMatch(/WPos/);
+  });
+});
+
+describe('read+clear does not leak the mover budget (review follow-up)', () => {
+  it('polling with clear:true keeps moverCount bounded — a moving entity must not read as settled', () => {
+    // moverCount is incremented once per series at its FIRST movement, detected by
+    // `samples.length === 1`. Emptying samples returns the series to baseline-pending, so its next
+    // movement increments AGAIN — meaning the natural poll loop (read+clear, repeat) inflated the
+    // counter every cycle until it hit maxSeries, after which every further movement was DROPPED
+    // and a moving entity read as settled. Scoping the clear to the returned series removed the
+    // unconditional reset that had been hiding this.
+    setup();
+    const e = w.spawn(EntityAttributes({ guid: 'p', name: 'Poll' }), WPos({ x: 0 }));
+    const started = startWatch({ component: 'WPos', fields: ['x'], epsilon: 0.001, maxSeries: 2 });
+    let t = 0;
+    for (let cycle = 0; cycle < 6; cycle++) {
+      tick(++t);
+      tick(++t, () => e.set(WPos, { ...e.get(WPos)!, x: cycle + 1 }));
+      readWatch(started.id!, { clear: true });
+    }
+    // After six poll cycles the series must STILL be recording movement.
+    tick(t + 1, () => e.set(WPos, { ...e.get(WPos)!, x: 99 }));
+    const r = readWatch(started.id!) as { series: { count: number }[]; truncated?: boolean };
+    expect(r.truncated, 'the mover cap must not have been exhausted by polling').toBeFalsy();
+    expect(r.series[0].count, 'a moving entity must still record after repeated read+clear').toBeGreaterThan(0);
   });
 });

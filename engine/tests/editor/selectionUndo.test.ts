@@ -52,7 +52,7 @@ describe('selection undo', () => {
     useEditorStore.getState().selectEntity(1);
 
     // Push a non-selection action (simulating a field edit)
-    let val = 0;
+    let val: number;
     pushAction({ label: 'edit', undo: () => { val = 0; }, redo: () => { val = 1; } });
     val = 1;
 

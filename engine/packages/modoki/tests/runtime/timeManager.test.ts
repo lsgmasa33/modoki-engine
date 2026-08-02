@@ -8,7 +8,16 @@ import { Time } from '../../src/runtime/traits';
 import { setPlayState } from '../../src/runtime/core/playState';
 import { timeManager } from '../../src/runtime/managers/TimeManager';
 import { resolveTemplate } from '../../src/runtime/ui/bindingResolver';
-import { __resetReadSourcesForTesting } from '../../src/runtime/core/readSourceRegistry';
+import { getReadValue, __resetReadSourcesForTesting } from '../../src/runtime/core/readSourceRegistry';
+import { registerManager, unregisterManager } from '../../src/runtime/managers/managerRegistry';
+
+// Called as methods (not extracted) so `this` inside TimeManagerImpl still resolves.
+// These used to need an `as unknown as () => void` cast: the `TimeManager` interface
+// inherited `ManagerDef`'s `init(ctx: ManagerContext)` while the implementation takes
+// no ctx, so a direct call had to fabricate a context this suite has no use for. The
+// interface now declares the no-arg form it actually has (#37).
+const init = () => timeManager.init();
+const dispose = () => timeManager.dispose();
 
 /** Set the active world's Time.elapsed/delta (spawns the Time singleton if absent). */
 function setElapsed(elapsed: number, delta = 0) {
@@ -25,7 +34,7 @@ describe('TimeManager', () => {
     setElapsed(0);
   });
   afterEach(() => {
-    timeManager.dispose();
+    dispose();
     __resetReadSourcesForTesting();
     setPlayState('playing');
   });
@@ -57,7 +66,7 @@ describe('TimeManager', () => {
   // ── event anchoring (requires init's listeners) ─────────────────────────────
 
   it('re-stamps gameStart on every entry into Playing (editor Stop→Play)', () => {
-    timeManager.init();                 // stamps gameStart at elapsed 0
+    init();                 // stamps gameStart at elapsed 0
     setPlayState('stopped');
     setElapsed(5);
     setPlayState('playing');            // → re-stamps gameStart at elapsed 5
@@ -66,7 +75,7 @@ describe('TimeManager', () => {
   });
 
   it('re-stamps sceneLoad on every world swap', () => {
-    timeManager.init();                 // stamps sceneLoad at elapsed 0
+    init();                 // stamps sceneLoad at elapsed 0
     const next = createWorld();
     next.spawn(Time({ elapsed: 100, delta: 0 }));
     setCurrentWorld(next);              // fires onWorldSwap → re-stamps sceneLoad at 100
@@ -84,8 +93,81 @@ describe('TimeManager', () => {
   // ── read-source integration ─────────────────────────────────────────────────
 
   it('exposes timeSinceGameStart to UI text bindings via the read-source registry', () => {
-    timeManager.init();                 // registers read sources, stamps gameStart at 0
+    init();                 // registers read sources, stamps gameStart at 0
     setElapsed(7);
     expect(resolveTemplate('{timeSinceGameStart}', {})).toBe('7');
+  });
+
+  // ── dispose actually tears down (the listeners init() subscribed) ────────────
+  // dispose() drops the read sources AND unsubscribes the playState/worldSwap
+  // listeners. The unsubscribe half was previously unasserted: a leaked listener
+  // keeps re-stamping anchors on a disposed manager, which is invisible until some
+  // later scene mis-reports its timings. Observed via the anchor, not the internals —
+  // a live listener would re-stamp, a dead one leaves timeSince at 0 (unknown anchor).
+
+  it('dispose() unsubscribes the playState listener — no re-stamp after teardown', () => {
+    init();
+    dispose();
+    setPlayState('stopped');
+    setElapsed(5);
+    setPlayState('playing');  // a leaked listener would re-stamp gameStart here
+    setElapsed(9);
+    expect(timeManager.timeSince('gameStart')).toBe(0);
+  });
+
+  it('dispose() unsubscribes the worldSwap listener — no re-stamp after teardown', () => {
+    init();
+    dispose();
+    const next = createWorld();
+    next.spawn(Time({ elapsed: 100, delta: 0 }));
+    setCurrentWorld(next);    // a leaked listener would re-stamp sceneLoad here
+    setElapsed(102);
+    expect(timeManager.timeSince('sceneLoad')).toBe(0);
+  });
+
+  it('dispose() drops the read sources it registered', () => {
+    init();
+    expect(getReadValue('timeSinceGameStart')).toBeDefined();
+    dispose();
+    for (const n of ['deltaTime', 'timeSinceGameStart', 'timeSinceSceneLoad']) {
+      expect(getReadValue(n)).toBeUndefined();
+    }
+  });
+
+  // ── registry integration: the path production actually uses ─────────────────
+  // Every test above calls init()/dispose() directly. Production never does — core
+  // registers the singleton and the registry drives it, calling init({world, scenePath})
+  // with a REAL ManagerContext that this manager ignores (#37). That seam was uncovered:
+  // nothing asserted the manager still works when a ctx it does not read is handed to it.
+
+  describe('driven through managerRegistry', () => {
+    afterEach(() => { unregisterManager('engine.time'); });
+
+    it('registerManager activates it (app scope) — anchors stamped, read sources live', () => {
+      registerManager(timeManager);   // scope 'app' → activates immediately, init(ctx)
+      setElapsed(7);
+      expect(resolveTemplate('{timeSinceGameStart}', {})).toBe('7');
+      expect(timeManager.timeSinceSceneLoad).toBe(7);
+    });
+
+    it('the ignored ctx changes nothing — registered behaves exactly like a direct init()', () => {
+      registerManager(timeManager);
+      setPlayState('stopped');
+      setElapsed(5);
+      setPlayState('playing');        // listeners wired by the registry-driven init
+      setElapsed(9);
+      expect(timeManager.timeSinceGameStart).toBe(4);
+    });
+
+    it('unregisterManager disposes it — read sources dropped, listeners unsubscribed', () => {
+      registerManager(timeManager);
+      unregisterManager('engine.time');
+      expect(getReadValue('timeSinceGameStart')).toBeUndefined();
+      setPlayState('stopped');
+      setElapsed(5);
+      setPlayState('playing');
+      setElapsed(9);
+      expect(timeManager.timeSince('gameStart')).toBe(0);
+    });
   });
 });

@@ -169,7 +169,7 @@ describe('registerTraits (engine + fixture game trait)', () => {
 
     it('the guard actually fires — a synthetic undeclared id-shaped field is caught', () => {
       const fakeTrait = { schema: { widgetId: 0 } };
-      const fakeMeta = { name: 'FakeTrait', trait: fakeTrait, category: 'component' as const, fields: {} };
+      const fakeMeta = { name: 'FakeTrait', trait: fakeTrait, category: 'component' as const, fields: {} as Record<string, FieldHint> };
       const offenders: string[] = [];
       for (const meta of [...getAllTraits(), fakeMeta]) {
         for (const key of schemaKeys(meta.trait)) {

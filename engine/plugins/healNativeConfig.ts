@@ -463,8 +463,31 @@ function healIosOrientationStatusBar(projectRoot: string, cap: ProjectConfig['ca
   const orig = text;
   const toArray = (vals: string[]) => '<array>\n' + vals.map((v) => `\t\t<string>${v}</string>`).join('\n') + '\n\t</array>';
   const phone = ORIENT_STRINGS[cap.orientation] ?? ORIENT_STRINGS.auto;
-  // iPad additionally allows upside-down for portrait/auto (Apple convention).
-  const pad = cap.orientation === 'landscape' ? phone : [...phone, 'UIInterfaceOrientationPortraitUpsideDown'];
+  // ⚠️ THE IPAD KEY IS NOT THE PHONE KEY PLUS UPSIDE-DOWN. App Store Connect REJECTS a bundle that
+  // claims iPad support (`TARGETED_DEVICE_FAMILY = "1,2"`, the Capacitor default) while declaring
+  // fewer than all four orientations under `~ipad` — iPad multitasking requires every one of them:
+  //
+  //   "The UIInterfaceOrientationPortrait,UIInterfaceOrientationPortraitUpsideDown orientations
+  //    were provided ... but you need to include all of the [four] orientations to support iPad
+  //    multitasking."
+  //
+  // This bit a real TestFlight upload (Court, 2026-07-31). It was invisible until then because the
+  // only game that had ever shipped was `auto`, which happens to emit all four; EVERY portrait game
+  // was building an invalid bundle. `UIRequiresFullScreen` used to exempt an app from this and Apple
+  // has retired it, so the two honest choices are "declare all four on iPad" or "do not ship on
+  // iPad" (`TARGETED_DEVICE_FAMILY = 1`) — and a build pipeline should default to the one that
+  // UPLOADS, since the other is a product decision nobody made by accident.
+  //
+  // A portrait game therefore stays portrait-only on iPhone and becomes rotatable on iPad. That is
+  // Apple's rule, not a preference: the game has to survive landscape there. Court does because its
+  // Canvas2D `scaleMode: 'contain'` letterboxes instead of cropping.
+  const ALL_IOS_ORIENTATIONS = [
+    'UIInterfaceOrientationPortrait',
+    'UIInterfaceOrientationPortraitUpsideDown',
+    'UIInterfaceOrientationLandscapeLeft',
+    'UIInterfaceOrientationLandscapeRight',
+  ];
+  const pad = ALL_IOS_ORIENTATIONS;
   text = setPlistKey(text, 'UISupportedInterfaceOrientations', toArray(phone));
   text = setPlistKey(text, 'UISupportedInterfaceOrientations~ipad', toArray(pad));
   text = setPlistKey(text, 'UIStatusBarHidden', cap.statusBarHidden ? '<true/>' : '<false/>');

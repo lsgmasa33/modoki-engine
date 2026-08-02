@@ -185,7 +185,7 @@ function fetchAudioBuffer(path: string): Promise<void> {
         // native console — log its name/message + the byte count so an iOS-only decode
         // failure (e.g. WKWebView refusing a codec) is diagnosable from device logs.
         const e = decodeErr as { name?: string; message?: string };
-        throw new Error(`decodeAudioData ${e?.name ?? 'error'}: ${e?.message ?? decodeErr} (${bytes.byteLength}B, ctx ${ctx.state} @${ctx.sampleRate}Hz)`);
+        throw new Error(`decodeAudioData ${e?.name ?? 'error'}: ${e?.message ?? decodeErr} (${bytes.byteLength}B, ctx ${ctx.state} @${ctx.sampleRate}Hz)`, { cause: decodeErr });
       }
       // Dropped mid-load (teardown or last owner released)? Discard the result
       // rather than leaving an owner-less buffer resident forever.

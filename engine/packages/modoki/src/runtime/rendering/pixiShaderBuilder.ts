@@ -237,6 +237,16 @@ export async function buildPixiShaderProgram(manifestPath: string): Promise<Pixi
     return null;
   }
 
+  // Remaining well-formedness findings — today that is an unknown/missing param `type`, which the
+  // two guards above do NOT cover and which otherwise zero-fills silently. Reported here rather
+  // than duplicated inline: `validatePixiShaderManifest` is the one place the manifest rules live
+  // (it is also what the unit tests assert against), and before #74 it had no production caller at
+  // all, so the check existed and never ran. Placed AFTER the space + reserved-name guards, both of
+  // which `return null`, so those two can never be reported twice.
+  for (const issue of validatePixiShaderManifest(manifest)) {
+    console.warn(`[pixiShader] ${manifestPath}: ${issue}`);
+  }
+
   // Compile ONLY the active backend's program. Fetch just that backend's body; a
   // missing variant → fall back to the default sprite shader. Backend is resolved
   // the SAME way the Canvas2D pool picks its renderer (honors the pixi.backend

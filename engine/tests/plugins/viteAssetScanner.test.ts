@@ -20,7 +20,7 @@ import {
   handleExitRequest, scanAllAssets, resolveModokiAssetsDir, filterKeptAssets, gamesModuleSource,
   isUnderAssetRoot,
   isValidBuildPlatform, BUILD_PLATFORMS, playableBuildSteps,
-  otaPublishBundleNameAllowed, isGcloudObjectNotFoundError,
+  otaPublishBundleNameAllowed, otaSigningKeyRefusal, isGcloudObjectNotFoundError,
   type AssetRoot,
 } from '../../plugins/vite-asset-scanner';
 import { findGamesEntry } from '../../plugins/findGamesEntry';
@@ -49,24 +49,39 @@ describe('detectType', () => {
   it('classifies a .spriteanim.json as a spriteanim asset (not a scene)', () => {
     expect(detectType('/games/x/assets/anims/hero.spriteanim.json', '.json')).toBe('spriteanim');
   });
-  // The catch-all that classifySceneChange must defend against: ANY uncategorized
-  // .json under an asset root is labeled 'scene'.
-  it("catch-all labels an uncategorized .json as 'scene'", () => {
-    expect(detectType('/games/x/assets/config/settings.json', '.json')).toBe('scene');
+  // Issue #54: scenes are now POSITIVELY identified, like every other JSON asset
+  // kind — the `.scene.json` suffix (new scenes), or the `/scenes/` directory as a
+  // LEGACY fallback (pre-migration / externally-authored projects). The old
+  // catch-all (ANY uncategorized .json under an asset root → 'scene') is gone:
+  // an uncategorized .json now returns null (the exact regression this issue was
+  // filed for — Court's `assets/levels/index.json` used to be typed 'scene').
+  it("classifies a .scene.json as a scene, regardless of folder", () => {
+    expect(detectType('/games/x/assets/scenes/main.scene.json', '.json')).toBe('scene');
+    expect(detectType('/games/x/assets/config/settings.scene.json', '.json')).toBe('scene');
+  });
+  it('classifies a legacy plain .json under /scenes/ as a scene (back-compat)', () => {
+    expect(detectType('/games/x/assets/scenes/level1.json', '.json')).toBe('scene');
+    expect(detectType('/games/x/assets/scene.json', '.json')).toBe('scene');
+  });
+  it('does NOT classify an uncategorized .json outside /scenes/ as a scene (the #54 bug)', () => {
+    expect(detectType('/games/x/assets/levels/index.json', '.json')).toBeNull();
+    expect(detectType('/games/x/assets/config/settings.json', '.json')).toBeNull();
   });
   it('classifies a .hdr as an environment asset', () => {
     expect(detectType('/games/x/assets/env/studio.hdr', '.hdr')).toBe('environment');
   });
   /** Regression: `.meta.local.json` (the gitignored machine-local byte-stats half of the
-   *  sidecar split — see meta-sidecar.ts) does NOT end with `.meta.json`, so it fell
-   *  through to the 'scene' catch-all above. The scanner then minted a GUID INTO those
-   *  gitignored files and registered them in the manifest as scenes — observed live:
+   *  sidecar split — see meta-sidecar.ts) does NOT end with `.meta.json`, so before #54's
+   *  catch-all removal it fell through and got classified as a scene. The scanner then
+   *  minted a GUID INTO those gitignored files and registered them in the manifest as
+   *  scenes — observed live:
    *    [asset-scanner] minted missing GUID for /demos/postfx-demo/…/…png.meta.local.json
-   *  Both sidecar forms are metadata about an asset, never assets. */
+   *  Both sidecar forms are metadata about an asset, never assets — must be excluded
+   *  explicitly, since there's no longer a catch-all for them to slip past. */
   it('EXCLUDES both sidecar forms — .meta.json AND .meta.local.json', () => {
     expect(detectType('/games/x/assets/textures/sand.png.meta.json', '.json')).toBeNull();
     expect(detectType('/games/x/assets/textures/sand.png.meta.local.json', '.json')).toBeNull();
-    // A model sidecar too — the catch-all was extension-driven, not type-driven.
+    // A model sidecar too.
     expect(detectType('/games/x/assets/models/water.glb.meta.local.json', '.json')).toBeNull();
   });
   it('EXCLUDES a committed ~ultrahdr.jpg variant (a derived file, not a texture)', () => {
@@ -129,11 +144,14 @@ describe('isUnderAssetRoot (Cmd+S full-reload — Windows separator safety)', ()
 });
 
 describe('classifySceneChange (hot-reload broadcast classification)', () => {
-  // The regression the onChange inline comment warns about: detectType's catch-all
-  // would bounce the live scene on any unrelated .json edit, so a 'scene' verdict
-  // is gated by the /scenes/ convention; 'prefab' always broadcasts.
-  it("broadcasts a .json under /scenes/ as 'scene'", () => {
+  // Scenes are positively identified now (issue #54): a `.json` under /scenes/ is
+  // accepted as a LEGACY scene, `.scene.json` is the current convention; 'prefab'
+  // always broadcasts.
+  it("broadcasts a legacy .json under /scenes/ as 'scene'", () => {
     expect(classifySceneChange('/games/x/assets/scenes/level1.json')).toBe('scene');
+  });
+  it("broadcasts a .scene.json as 'scene', regardless of folder", () => {
+    expect(classifySceneChange('/games/x/assets/scenes/main.scene.json')).toBe('scene');
   });
   it("broadcasts a top-level scene.json as 'scene'", () => {
     expect(classifySceneChange('/games/x/assets/scene.json')).toBe('scene');
@@ -141,15 +159,13 @@ describe('classifySceneChange (hot-reload broadcast classification)', () => {
   it("broadcasts a .prefab.json as 'prefab' regardless of folder", () => {
     expect(classifySceneChange('/games/x/assets/prefabs/ship.prefab.json')).toBe('prefab');
   });
-  it('does NOT broadcast an uncategorized .json outside /scenes/ (the catch-all trap)', () => {
-    // detectType says 'scene' (catch-all), but it's not under /scenes/ → no bounce.
-    expect(detectType('/games/x/assets/config/settings.json', '.json')).toBe('scene');
+  it('does NOT broadcast an uncategorized .json outside /scenes/ (the #54 bug)', () => {
+    expect(detectType('/games/x/assets/config/settings.json', '.json')).toBeNull();
     expect(classifySceneChange('/games/x/assets/config/settings.json')).toBeNull();
   });
-  it('does NOT broadcast typed sibling assets (.mat/.mesh/.particle.json)', () => {
+  it('does NOT broadcast typed sibling assets with no runtime cache (.mat/.mesh)', () => {
     expect(classifySceneChange('/games/x/assets/materials/metal.mat.json')).toBeNull();
     expect(classifySceneChange('/games/x/assets/models/cube.mesh.json')).toBeNull();
-    expect(classifySceneChange('/games/x/assets/fx/spark.particle.json')).toBeNull();
   });
   // Cache-invalidation kinds: NOT a scene reload (that would discard unsaved work) — the
   // renderer drops just the one stale asset. `.timeline.json` returned null before the fix,
@@ -163,6 +179,29 @@ describe('classifySceneChange (hot-reload broadcast classification)', () => {
   it('classifies a .timeline.json the same way regardless of folder', () => {
     // It must NOT fall through to the catch-all 'scene' just because it sits under /scenes/.
     expect(classifySceneChange('/games/x/assets/scenes/tour.timeline.json')).toBe('timeline');
+  });
+  it("broadcasts a .particle.json as 'particle' (effect-cache invalidation, not a reload)", () => {
+    // This asserted `null` until 2026-07-30 — the test encoded the bug. `invalidateParticleEffect`
+    // had ZERO production callers, so `particleCache` held the pre-edit def forever and
+    // `read_asset_def` (which reports the live cache as authoritative) handed back the stale
+    // document after a write; a read-modify-write then reverted the file.
+    expect(classifySceneChange('/games/x/assets/fx/spark.particle.json')).toBe('particle');
+  });
+
+  /** FAMILY GUARD. Three separate asset caches shipped with an exported `invalidate*` and no
+   *  caller — animation, then timeline, then particle — each found only after it silently
+   *  reverted a user's file. A per-type test cannot catch the FOURTH one, so assert totality:
+   *  every asset type the runtime caches by path must classify to a non-null kind here. Adding a
+   *  new cached asset type without a `classifySceneChange` case fails this. */
+  it('every path-cached asset type has a live-reload kind (no silently-stale cache)', () => {
+    const CACHED_ASSET_TYPES: { type: string; sample: string; kind: string }[] = [
+      { type: 'animation', sample: '/games/x/assets/anim/a.anim.json', kind: 'animation' },
+      { type: 'timeline', sample: '/games/x/assets/tl/a.timeline.json', kind: 'timeline' },
+      { type: 'particle', sample: '/games/x/assets/fx/a.particle.json', kind: 'particle' },
+    ];
+    for (const { type, sample, kind } of CACHED_ASSET_TYPES) {
+      expect(classifySceneChange(sample), `${type} must broadcast a cache-invalidation kind`).toBe(kind);
+    }
   });
 });
 
@@ -189,7 +228,7 @@ describe('isSseRoute (catch-all exclusion)', () => {
     const steps = playableBuildSteps('/repo', '/repo/games/space-invader');
     expect(steps).toHaveLength(2);
     // Step 1 = the inliner build, steered by VITE_PLAYABLE=1, run from the editor root.
-    expect(steps[0]).toMatchObject({ cmd: 'node engine/scripts/build-web.mjs', env: { VITE_PLAYABLE: '1' }, cwd: '/repo' });
+    expect(steps[0]).toMatchObject({ cmd: 'node engine/scripts/build-web.mjs --target playable', env: { VITE_PLAYABLE: '1' }, cwd: '/repo' });
     // Step 2 = reveal the project's ads/ dir (posix `open`, win `start`) — NO favicon/deploy step.
     // The SUT joins the path with the host's `path.join`, so on Windows both fields carry
     // backslashes (`winCmd` = `start "" "C:\…\ads"`, the correct Windows form actually executed;
@@ -752,7 +791,9 @@ describe('buildManifest', () => {
   it('strips the internal absPath from serialized entries', () => {
     const guid = 'a1b2c3d4-e5f6-4789-9abc-def012345678';
     const m = buildManifest([{ guid, path: '/a.mat.json', name: 'A', type: 'material', absPath: '/tmp/a.mat.json' }]);
-    expect((m.assets[0] as Record<string, unknown>).absPath).toBeUndefined();
+    // AssetEntry is a plain interface (no index signature), so the cast needs an `unknown`
+    // hop — this is purely a probe for a field the type says is absent after stripping.
+    expect((m.assets[0] as unknown as Record<string, unknown>).absPath).toBeUndefined();
   });
 });
 
@@ -930,6 +971,44 @@ describe('writeAssetGuid', () => {
     const fresh = '99999999-aaaa-4bbb-8ccc-dddddddddddd';
     expect(writeAssetGuid(glb, 'model', fresh)).toBe(true);
     expect(JSON.parse(fs.readFileSync(glb + '.meta.json', 'utf-8')).id).toBe(fresh);
+  });
+
+  // Regression for the non-deterministic-GUID bug (docs/todo.md, 2026-07-28): an
+  // unrecognized top-level-ARRAY .json (e.g. a level-index manifest) falls through
+  // detectType's catch-all to 'scene' (an ID_BEARING_TYPE), but `json.id = guid` on
+  // an array is dropped by JSON.stringify — the old code reported success while
+  // writing nothing, so a fresh GUID was (silently) re-minted on every single scan.
+  it('falls back to a sidecar for a top-level JSON ARRAY, instead of silently no-op-ing', () => {
+    const p = path.join(tmpDir, 'index.json');
+    fs.writeFileSync(p, JSON.stringify([{ id: 'level-1' }, { id: 'level-2' }]));
+    const fresh = '11111111-2222-4333-8444-555555555555';
+    expect(writeAssetGuid(p, 'scene', fresh)).toBe(true);
+    // The source array is untouched — no dropped-write, no corrupted level data.
+    expect(JSON.parse(fs.readFileSync(p, 'utf-8'))).toEqual([{ id: 'level-1' }, { id: 'level-2' }]);
+    // The id actually lives on disk now, in a sidecar — so the NEXT scan's
+    // readAssetGuid finds it and does not re-mint.
+    expect(JSON.parse(fs.readFileSync(p + '.meta.json', 'utf-8')).id).toBe(fresh);
+    expect(readAssetGuid(p, 'scene')).toBe(fresh);
+  });
+
+  it('buildManifest heal is now stable across repeated scans for a top-level-array JSON asset', () => {
+    const p = path.join(tmpDir, 'index.json');
+    fs.writeFileSync(p, JSON.stringify([{ id: 'level-1' }]));
+    const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    // Mirror the real scanDir → buildManifest pipeline: each scan re-reads the
+    // guid from disk (readAssetGuid) BEFORE handing the entry to buildManifest.
+    const scan = () => buildManifest([
+      { path: '/index.json', name: 'index', type: 'scene', absPath: p, guid: readAssetGuid(p, 'scene') },
+    ], true).assets[0].guid;
+
+    const first = scan();
+    const second = scan();
+    const third = scan();
+    expect(first).toBeDefined();
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+    spy.mockRestore();
   });
 });
 
@@ -1142,6 +1221,40 @@ describe('otaPublishBundleNameAllowed (/api/ota/publish bundle-identity guard)',
 
   it('is case-sensitive (no accidental leniency)', () => {
     expect(otaPublishBundleNameAllowed('Shell', 'shell')).toBe(false);
+  });
+});
+
+/** REGRESSION (independent review, 2026-07-30). The publish preflight validated only that the key
+ *  FILE existed — never that its public half matched `ota.publicKey`, the key baked into the
+ *  shipped binary and the ONLY one `verifyReleaseSignature` accepts. Publishing with a
+ *  non-matching key produced a well-formed signed release that every installed app silently
+ *  refused (`outcome: 'signature-invalid'`), while the tool reported success and `ota_status`
+ *  confirmed the version as live. Remote, silent, and it looks fine from the editor. */
+describe('otaSigningKeyRefusal (/api/ota/publish signing-key identity guard)', () => {
+  const KEY_A = 'MCowBQYDK2VwAyEAaaaa';
+  const KEY_B = 'MCowBQYDK2VwAyEAbbbb';
+
+  it('allows a key whose public half IS the project\'s baked-in ota.publicKey', () => {
+    expect(otaSigningKeyRefusal(KEY_A, KEY_A)).toBeNull();
+  });
+
+  it('refuses a key that does not match — the release every installed app would reject', () => {
+    expect(otaSigningKeyRefusal(KEY_A, KEY_B)).toBe('mismatch');
+  });
+
+  it('refuses when the project has no ota.publicKey at all (nothing could verify the release)', () => {
+    expect(otaSigningKeyRefusal(KEY_A, '')).toBe('project-public-key-empty');
+    expect(otaSigningKeyRefusal(KEY_A, undefined)).toBe('project-public-key-empty');
+  });
+
+  it('refuses a keyfile with no publicKey field rather than signing with a half-read key', () => {
+    expect(otaSigningKeyRefusal(null, KEY_A)).toBe('no-key-public-half');
+    expect(otaSigningKeyRefusal('', KEY_A)).toBe('no-key-public-half');
+  });
+
+  it('is exact — no trimming or case leniency on a cryptographic identity', () => {
+    expect(otaSigningKeyRefusal(`${KEY_A} `, KEY_A)).toBe('mismatch');
+    expect(otaSigningKeyRefusal(KEY_A.toLowerCase(), KEY_A)).toBe('mismatch');
   });
 });
 

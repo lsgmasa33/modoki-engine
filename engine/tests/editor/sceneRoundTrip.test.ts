@@ -9,7 +9,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
 import {
-  getCurrentWorld, setCurrentWorld, getAllEntities, readTraitData, getTraitByName,
+  getCurrentWorld, setCurrentWorld, getAllEntities, readTraitData, readTraitDataFull,
+  findEntity, getTraitByName,
   writeTraitField, deleteEntity, loadSceneFile, instantiatePrefabIntoWorld, markOverride, type SceneData,
   SCENE_FORMAT_VERSION,
 } from '@modoki/engine/runtime';
@@ -25,7 +26,7 @@ async function reloadInFreshWorld(
   scene: unknown,
   fetchPrefab: (source: string) => Promise<PrefabFile | null> = async () => null,
 ) {
-  setCurrentWorld(createWorld());
+  swapInFreshWorld();
   // Deep clone — loadSceneFile mutates the data (migrations) in place.
   const data = JSON.parse(JSON.stringify(scene)) as SceneData;
   await loadSceneFile(data, {
@@ -48,8 +49,18 @@ function idByName(name: string): number | undefined {
   return getAllEntities().find(e => e.name === name)?.id;
 }
 
-beforeEach(() => {
+/** koota caps a process at 16 live worlds, and each test here builds at least one
+ *  (a reload builds a second). Release the outgoing world instead of leaking it,
+ *  or adding a test to this file starts failing UNRELATED tests with "Too many
+ *  worlds created" — a cap failure reads nothing like the test that tripped it. */
+function swapInFreshWorld() {
+  const prev = getCurrentWorld();
   setCurrentWorld(createWorld());
+  prev?.destroy();
+}
+
+beforeEach(() => {
+  swapInFreshWorld();
 });
 
 describe('scene serialization round-trip', () => {
@@ -224,5 +235,159 @@ describe('prefab instance round-trip', () => {
     const tf = readTraitData(newChild, getTraitByName('Transform')!)!;
     expect(tf.x).toBe(99);   // overridden
     expect(tf.y).toBe(0);    // from prefab base
+  });
+
+  /** End-to-end reproduction of the `skinned-test.json` data loss (2026-07-31): a
+   *  prefab instance carrying an ADDED `Animator` lost its `clips` bank and active
+   *  `clip` on a load→save, because both persistence directions keyed on the
+   *  Inspector's `meta.fields` — which omits those two by design (AnimatorClipsSection
+   *  owns them) — instead of the koota schema.
+   *
+   *  TWO hops on purpose. The bug hid behind one: with only the write side fixed, hop
+   *  one still looked right and hop two came back EMPTY, which is exactly how the live
+   *  run caught the read side. A single serialize→assert would pass over half a fix. */
+  it('an added Animator keeps its clips bank + active clip across TWO save→load hops', async () => {
+    const BANK = '[{"name":"skin","clip":"f1cc3b85-2c23-457b-938a-3470ada21b36"}]';
+    const rootId = instantiatePrefab(makePrefab());
+    setPrefabSource(rootId, SOURCE);
+
+    // The prefab defines no Animator at localId 1 → this is an added-trait override.
+    findEntity(rootId)!.add(getTraitByName('Animator')!.trait({ clips: BANK, clip: 'skin' }));
+
+    const scene1 = await serializeScene();
+    expect(scene1.entities.find(e => e.name === 'PRoot')!.overrides?.[1]?.Animator)
+      .toMatchObject({ clips: BANK, clip: 'skin' });
+
+    await reloadInFreshWorld(scene1, async (s) => (s === SOURCE ? makePrefab() : null));
+
+    // Live state after the load — the half the write-only fix left broken.
+    const reloaded = idByName('PRoot')!;
+    const live = readTraitDataFull(reloaded, getTraitByName('Animator')!)!;
+    expect(live.clips).toBe(BANK);
+    expect(live.clip).toBe('skin');
+
+    // …and it still serializes, so the value is stable rather than decaying per save.
+    setPrefabSource(reloaded, SOURCE);
+    const scene2 = await serializeScene();
+    expect(scene2.entities.find(e => e.name === 'PRoot')!.overrides?.[1]?.Animator)
+      .toMatchObject({ clips: BANK, clip: 'skin' });
+  });
+});
+
+/** INTEGRATION — the real trait registry, the real loader, the real serializer.
+ *
+ *  Every unit test around prefab overrides mocks `entityUtils` and the trait
+ *  registry, which is exactly how this defect survived: the mocks encoded the
+ *  same wrong belief as the code (`meta.fields` == the fields a trait persists),
+ *  so both agreed and both were wrong. `Animator.clips`/`clip` are koota-schema
+ *  fields deliberately ABSENT from `meta.fields` because AnimatorClipsSection
+ *  renders them, and nothing below is stubbed — the registration is the real one
+ *  from `registerAllTraits()`, so if someone "tidies" those fields back into a
+ *  mock's shape this still fails.
+ *
+ *  Reproduces the reported loss on skinned-test.json: a populated clip bank
+ *  naming a real guid disappeared from the file on a load→save, and the instance
+ *  came up with an EMPTY bank at runtime. See docs/prefabs.md. */
+describe('prefab override over a schema field with no Inspector row (integration)', () => {
+  const SOURCE = 'test://animator-override.prefab.json';
+  const BANK = JSON.stringify([{ name: 'skin', clip: 'f1cc3b85-2c23-457b-938a-3470ada21b36' }]);
+
+  /** The prefab DEFINES an Animator with an empty bank, so the instance's populated
+   *  bank is a genuine base-relative field override — the mark-gated path, not the
+   *  "added trait, keep everything" shortcut that cone.prefab.json happened to take. */
+  function makePrefab(): PrefabFile {
+    return {
+      version: 1, name: 'animator-override', rootLocalId: 1,
+      entities: [{
+        localId: 1, name: 'ARoot', traits: {
+          Transform: { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 },
+          EntityAttributes: { name: 'ARoot', parentId: 0, layer: '3d' },
+          Animator: { clips: '[]', clip: '', speed: 1, playing: true, loop: true },
+        },
+      }],
+    };
+  }
+
+  beforeEach(() => setPrefabCache(SOURCE, makePrefab()));
+
+  /** Sanity: the premise. If Animator ever gains Inspector rows for these fields
+   *  the tests below would pass for the WRONG reason — they'd no longer exercise
+   *  a field outside meta.fields at all. */
+  it('premise: Animator persists clips/clip but declares no Inspector field for them', () => {
+    const meta = getTraitByName('Animator')!;
+    const schema = (meta.trait as unknown as { schema: Record<string, unknown> }).schema;
+    expect(Object.keys(schema)).toEqual(expect.arrayContaining(['clips', 'clip']));
+    expect(meta.fields).not.toHaveProperty('clips');
+    expect(meta.fields).not.toHaveProperty('clip');
+  });
+
+  it('CAPTURES a clips/clip override into the scene file', async () => {
+    const rootId = instantiatePrefab(makePrefab());
+    setPrefabSource(rootId, SOURCE);
+    const animator = getTraitByName('Animator')!;
+    writeTraitField(rootId, animator, 'clips', BANK);
+    writeTraitField(rootId, animator, 'clip', 'skin');
+    markOverride(rootId, 'Animator', 'clips');
+    markOverride(rootId, 'Animator', 'clip');
+
+    const scene = await serializeScene();
+    const entry = scene.entities.find((e) => e.prefab === SOURCE);
+    expect(entry?.overrides?.[1]?.Animator?.clips).toBe(BANK);
+    expect(entry?.overrides?.[1]?.Animator?.clip).toBe('skin');
+  });
+
+  it('RE-APPLIES it on load — the instance comes up with the populated bank', async () => {
+    const rootId = instantiatePrefab(makePrefab());
+    setPrefabSource(rootId, SOURCE);
+    const animator = getTraitByName('Animator')!;
+    writeTraitField(rootId, animator, 'clips', BANK);
+    writeTraitField(rootId, animator, 'clip', 'skin');
+    markOverride(rootId, 'Animator', 'clips');
+    markOverride(rootId, 'Animator', 'clip');
+
+    const scene = await serializeScene();
+    await reloadInFreshWorld(scene, async (s) => (s === SOURCE ? makePrefab() : null));
+
+    const newRoot = idByName('ARoot');
+    expect(newRoot).toBeDefined();
+    const live = getCurrentWorld().entities.find((e) => e.id() === newRoot)!.get(animator.trait) as Record<string, unknown>;
+    expect(live.clips).toBe(BANK);   // pre-fix: '[]' — the clip never played
+    expect(live.clip).toBe('skin');
+  });
+
+  it('SURVIVES a second save — the load→save that deleted it from skinned-test.json', async () => {
+    const rootId = instantiatePrefab(makePrefab());
+    setPrefabSource(rootId, SOURCE);
+    const animator = getTraitByName('Animator')!;
+    writeTraitField(rootId, animator, 'clips', BANK);
+    writeTraitField(rootId, animator, 'clip', 'skin');
+    markOverride(rootId, 'Animator', 'clips');
+    markOverride(rootId, 'Animator', 'clip');
+
+    const once = await serializeScene();
+    await reloadInFreshWorld(once, async (s) => (s === SOURCE ? makePrefab() : null));
+    setPrefabCache(SOURCE, makePrefab());
+    const twice = await serializeScene();
+
+    const entry = twice.entities.find((e) => e.prefab === SOURCE);
+    expect(entry?.overrides?.[1]?.Animator?.clips).toBe(BANK);
+    expect(entry?.overrides?.[1]?.Animator?.clip).toBe('skin');
+  });
+
+  it('never writes a runtimeOnly read-back field into the file', async () => {
+    const rootId = instantiatePrefab(makePrefab());
+    setPrefabSource(rootId, SOURCE);
+    const animator = getTraitByName('Animator')!;
+    // What a frame of playback leaves behind, plus a stray mark to prove the
+    // exclusion is at the READ and no later path can resurrect it.
+    writeTraitField(rootId, animator, 'activeClip', 'skin');
+    writeTraitField(rootId, animator, 'fadeElapsed', 0.25);
+    markOverride(rootId, 'Animator', 'activeClip');
+    markOverride(rootId, 'Animator', 'fadeElapsed');
+
+    const scene = await serializeScene();
+    const entry = scene.entities.find((e) => e.prefab === SOURCE);
+    expect(entry?.overrides?.[1]?.Animator ?? {}).not.toHaveProperty('activeClip');
+    expect(entry?.overrides?.[1]?.Animator ?? {}).not.toHaveProperty('fadeElapsed');
   });
 });

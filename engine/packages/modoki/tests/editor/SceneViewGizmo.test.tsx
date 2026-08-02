@@ -35,7 +35,7 @@ const q = (root: ParentNode, sel: string) => root.querySelector(sel);
 
 beforeEach(() => {
   vi.useFakeTimers();
-  globalThis.requestAnimationFrame = ((cb: FrameRequestCallback) => setTimeout(() => cb(0), 0)) as typeof requestAnimationFrame;
+  globalThis.requestAnimationFrame = ((cb: FrameRequestCallback) => setTimeout(() => cb(0), 0)) as unknown as typeof requestAnimationFrame;
   globalThis.cancelAnimationFrame = ((id: number) => clearTimeout(id)) as typeof cancelAnimationFrame;
   mock.cam = new THREE.PerspectiveCamera();
   mock.cam.updateMatrixWorld();

@@ -85,7 +85,7 @@ export async function ensureRuby(
   const tmp = path.join(baseDir, `.portable-ruby-${PINNED_RUBY.version}.download`)
   fs.writeFileSync(tmp, buf)
   try {
-    extractArchive(tmp, baseDir, 'tar.gz')
+    await extractArchive(tmp, baseDir, 'tar.gz')
   } finally {
     fs.rmSync(tmp, { force: true })
   }

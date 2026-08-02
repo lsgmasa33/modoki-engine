@@ -48,5 +48,7 @@ registerDebugTab({ id: 'device', title: 'Device', order: 70, Component: DeviceTa
 
 export { DebugMenu } from './DebugMenu';
 export { Sparkline, sparkPoints, type SparklineProps } from './Sparkline';
+// Layout helpers so a game- or app-registered tab fills the body like the built-ins.
+export { fillRootStyle, scrollRootStyle, fillRegionStyle } from './tabLayout';
 export { registerStatWidget, toggleWidget, isWidgetOpen, type StatWidgetDef } from './widgetStore';
 export * from './debugMenuRegistry';

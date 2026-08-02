@@ -461,6 +461,26 @@ describe('healNativeConfig — orientation + status bar', () => {
     fs.writeFileSync(manifestPath(), MANIFEST);
   }
 
+  // App Store Connect REJECTS an upload whose `~ipad` array has fewer than all four orientations,
+  // for any bundle that claims iPad support (`TARGETED_DEVICE_FAMILY = "1,2"`, the Capacitor
+  // default). This suite asserted only that the key EXISTED, never what was in it — so every
+  // portrait game built an invalid bundle and nothing noticed until a real TestFlight upload was
+  // refused (Court, 2026-07-31). The phone array is the game's choice; the iPad array is Apple's.
+  it.each(['portrait', 'landscape', 'auto'] as const)(
+    'declares all four iPad orientations regardless of the game being %s',
+    (orientation) => {
+      writeIosPlist();
+      writeCapConfig({ orientation, statusBarHidden: false, statusBarStyle: 'default' });
+      healNativeConfig(root);
+      const out = fs.readFileSync(iosPlistPath(), 'utf8');
+      const padArray = out.split('UISupportedInterfaceOrientations~ipad</key>')[1].split('</array>')[0];
+      for (const o of ['Portrait', 'PortraitUpsideDown', 'LandscapeLeft', 'LandscapeRight']) {
+        expect(padArray, `iPad multitasking requires UIInterfaceOrientation${o}`)
+          .toContain(`UIInterfaceOrientation${o}</string>`);
+      }
+    },
+  );
+
   it('replaces the existing orientation array with portrait-only + adds status-bar keys', () => {
     writeIosPlist();
     writeCapConfig({ orientation: 'portrait', statusBarHidden: true, statusBarStyle: 'light' });

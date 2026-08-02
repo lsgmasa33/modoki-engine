@@ -10,6 +10,7 @@ import { markUIDirty } from './uiTreeStore';
 import { onPlayStateChange } from '../core/playState';
 import { useFocusStore, consumePendingActivation } from './focusManager';
 import { getCurrentWorld } from '../core/ecs/world';
+import { registerPointerBlocker } from '../core/pointerBlockers';
 
 interface UIRendererProps {
   /** Store state object for binding resolution (typically from useGameStore) */
@@ -56,10 +57,24 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
   // only coincidentally correct on-device, and wildly wrong in editor previews
   // where the window != the simulated device). The callback ref fires exactly
   // when the div mounts/unmounts, so the observer is always wired to a live node.
+  // Claims this root as a pointer-block root (`core/pointerBlockers.ts`) so a tap on
+  // a UI element never also reaches the game underneath — see `pointerSource.ts`'s
+  // "POINTER-BLOCK ROOTS" section. Runtime mode ONLY (`!onSelectEntity`): the editor
+  // mounts this SAME UI tree a second time inside SceneView's authoring preview
+  // (`onSelectEntity` set), and a click there manipulates gizmos/selection, not the
+  // running game — it must never claim the pointer out from under the actual
+  // GameView instance. `onSelectEntity`'s presence is a structural property of which
+  // viewport mounted this component, not a per-render toggle, so closing over it
+  // inside this ref (recreated only when it changes) is safe.
+  const unblockRef = useRef<(() => void) | null>(null);
+
   const measureRef = useCallback((el: HTMLDivElement | null) => {
     roRef.current?.disconnect();
     roRef.current = null;
+    unblockRef.current?.();
+    unblockRef.current = null;
     if (!el) return;
+    if (!onSelectEntity) unblockRef.current = registerPointerBlocker(el);
     const update = () => {
       const w = el.clientWidth;
       const h = el.clientHeight;
@@ -88,6 +103,10 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
     });
     ro.observe(el);
     roRef.current = ro;
+    // onSelectEntity is intentionally omitted below: it's fixed for this component
+    // instance's whole lifetime (see the comment above this callback), so closing
+    // over its mount-time value is deliberate, not a staleness bug.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   if (tree.length === 0) return null;

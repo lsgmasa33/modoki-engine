@@ -105,7 +105,7 @@ describe('useRearmDirtyOnChange — re-arm on mode/layer change (the regression)
 
     const { rerender } = renderHook(
       ({ mode }: { mode: '3d' | 'ui' }) => useRearmDirtyOnChange(() => gate.markDirty(), [mode]),
-      { initialProps: { mode: '3d' as const } },
+      { initialProps: { mode: '3d' as '3d' | 'ui' } },
     );
     gate.shouldDraw(false, false); // consume the mount re-arm
     while (gate.shouldDraw(false, false)) { /* drain back to idle */ }

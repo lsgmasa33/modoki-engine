@@ -124,7 +124,7 @@ export function ensureGltfpackCli(): void {
       return;
     }
     gltfpackCheck = { ok: false };
-    throw new Error(GLTFPACK_MISSING_MSG);
+    throw new Error(GLTFPACK_MISSING_MSG, { cause: e });
   }
 }
 
@@ -737,7 +737,7 @@ export async function convertModel(opts: ConvertModelOptions): Promise<ConvertMo
         weldedSource = welded;
       } catch (e) {
         const stderr = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
-        throw new Error(`gltf-transform weld failed for ${sourceUrlPath}: ${stderr}`);
+        throw new Error(`gltf-transform weld failed for ${sourceUrlPath}: ${stderr}`, { cause: e });
       }
     }
 
@@ -755,7 +755,7 @@ export async function convertModel(opts: ConvertModelOptions): Promise<ConvertMo
           execFileSync(s.command, s.args, { stdio: 'pipe', shell: s.shell });
         } catch (e) {
           const stderr = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
-          throw new Error(`gltfpack failed for ${sourceUrlPath} (lod${i}, ratio=${ratio}): ${stderr}`);
+          throw new Error(`gltfpack failed for ${sourceUrlPath} (lod${i}, ratio=${ratio}): ${stderr}`, { cause: e });
         }
       } else {
         // gltf-transform: aggressive flips --lock-border to 0; meshopt runs
@@ -773,7 +773,7 @@ export async function convertModel(opts: ConvertModelOptions): Promise<ConvertMo
             execFileSync(s.command, s.args, { stdio: 'pipe', shell: s.shell });
           } catch (e) {
             const stderr = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
-            throw new Error(`gltf-transform simplify failed for ${sourceUrlPath} (lod${i}, ratio=${ratio}): ${stderr}`);
+            throw new Error(`gltf-transform simplify failed for ${sourceUrlPath} (lod${i}, ratio=${ratio}): ${stderr}`, { cause: e });
           }
         }
         if (meshoptForLod) {
@@ -783,7 +783,7 @@ export async function convertModel(opts: ConvertModelOptions): Promise<ConvertMo
             execFileSync(s.command, s.args, { stdio: 'pipe', shell: s.shell });
           } catch (e) {
             const stderr = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
-            throw new Error(`gltf-transform meshopt failed for ${sourceUrlPath} (lod${i}): ${stderr}`);
+            throw new Error(`gltf-transform meshopt failed for ${sourceUrlPath} (lod${i}): ${stderr}`, { cause: e });
           }
         }
       }
@@ -807,7 +807,7 @@ export async function convertModel(opts: ConvertModelOptions): Promise<ConvertMo
         // Fail the whole conversion — silently shipping mis-rebased LODs
         // renders the wrong scale/offset on that level only, which is the
         // worst-of-both-worlds failure mode. Build-time failure surfaces it.
-        throw new Error(`rebaseLodGeometry failed for ${sourceUrlPath} (lod${i}): ${e instanceof Error ? e.message : String(e)}`);
+        throw new Error(`rebaseLodGeometry failed for ${sourceUrlPath} (lod${i}): ${e instanceof Error ? e.message : String(e)}`, { cause: e });
       }
     }
 

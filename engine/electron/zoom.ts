@@ -51,7 +51,9 @@ export function applyZoom(win: BrowserWindow | null, level: number): void {
   const next = clamp(level);
   const changed = next !== currentLevel;
   currentLevel = next;
-  if (win && !win.isDestroyed()) {
+  // Same wrong-object trap as main.ts's 'moved' handler: the WINDOW can be alive while the
+  // renderer is dead, and then both calls below throw "Render frame was disposed".
+  if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
     win.webContents.setZoomLevel(currentLevel);
     // Tell the renderer the authoritative page-zoom factor so the engine can keep game
     // input presentation-invariant (calibratePresentationScale). Harmless if the renderer

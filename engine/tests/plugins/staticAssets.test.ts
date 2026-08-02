@@ -50,7 +50,7 @@ describe('serveProjectAsset — model LOD cache miss degrades to the source GLB 
     expect(res).not.toBeNull();
     // Degrades to the source bytes so the base mesh renders instead of an empty viewport.
     expect(res!.kind).toBe('file');
-    expect(res!.contentType).toBe('model/gltf-binary');
+    expect((res as { contentType: string }).contentType).toBe('model/gltf-binary');
     expect((res as { path?: string }).path).toBe(path.join(root, 'assets/models/x.glb'));
     // no-cache so a later real bake is picked up.
     expect((res as { headers?: Record<string, string> }).headers?.['Cache-Control']).toBe('no-cache');
@@ -62,7 +62,7 @@ describe('serveProjectAsset — model LOD cache miss degrades to the source GLB 
     writeModel(null); // source exists, no meta
     const res = await serveProjectAsset(ctx(), '/assets/models/x.glb.lod2.glb');
     expect(res!.kind).toBe('file');
-    expect(res!.contentType).toBe('model/gltf-binary');
+    expect((res as { contentType: string }).contentType).toBe('model/gltf-binary');
     expect(warnSpy).toHaveBeenCalledOnce();
   });
 
@@ -98,7 +98,7 @@ describe('serveProjectAsset — auto-import on variant cache-miss (autoConvert)'
     writeModel('stalecommittedhash'); // committed hash, no local cache bytes
     const res = await serveProjectAsset(autoCtx(), '/assets/models/x.glb.processed.glb');
     expect(res!.kind).toBe('file');
-    expect(res!.contentType).toBe('model/gltf-binary');
+    expect((res as { contentType: string }).contentType).toBe('model/gltf-binary');
     expect(bakeCalls).toBe(1);
     expect(errSpy).not.toHaveBeenCalled(); // healed, not the loud miss
   });
@@ -118,7 +118,7 @@ describe('serveProjectAsset — auto-import on variant cache-miss (autoConvert)'
     writeModel('stalecommittedhash');
     const res = await serveProjectAsset(ctx(), '/assets/models/x.glb.processed.glb');
     expect(res!.kind).toBe('file'); // source-GLB fallback, not 404
-    expect(res!.contentType).toBe('model/gltf-binary');
+    expect((res as { contentType: string }).contentType).toBe('model/gltf-binary');
     expect(bakeCalls).toBe(0);
     expect(warnSpy).toHaveBeenCalledOnce();
   });
@@ -128,7 +128,7 @@ describe('serveProjectAsset — auto-import on variant cache-miss (autoConvert)'
     writeModel('stalecommittedhash');
     const res = await serveProjectAsset(autoCtx(), '/assets/models/x.glb.processed.glb');
     expect(res!.kind).toBe('file'); // bake failed → source-GLB fallback, not 404
-    expect(res!.contentType).toBe('model/gltf-binary');
+    expect((res as { contentType: string }).contentType).toBe('model/gltf-binary');
     expect(warnSpy).toHaveBeenCalled();
   });
 });
@@ -148,7 +148,7 @@ describe('serveProjectAsset — converted model variant is revalidatable, NOT im
 
     const res = await serveProjectAsset(ctx(), '/assets/models/x.glb.processed.glb');
     expect(res!.kind).toBe('file');
-    expect(res!.contentType).toBe('model/gltf-binary');
+    expect((res as { contentType: string }).contentType).toBe('model/gltf-binary');
     const cc = res!.headers?.['Cache-Control'] ?? '';
     expect(cc).toContain('no-cache');
     expect(cc).not.toContain('immutable'); // the regression we're guarding
@@ -176,7 +176,7 @@ describe('serveProjectAsset — .gltf-named source serves its baked LOD variants
 
     const res = await serveProjectAsset(ctx(), '/assets/models/pad.gltf.lod1.glb');
     expect(res!.kind).toBe('file');
-    expect(res!.contentType).toBe('model/gltf-binary');
+    expect((res as { contentType: string }).contentType).toBe('model/gltf-binary');
     expect(res!.headers?.ETag).toBe(`"${hash}"`);
   });
 });

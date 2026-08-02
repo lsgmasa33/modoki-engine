@@ -7,6 +7,7 @@ import { loadModelTemplates, getCachedPrefab } from './meshTemplateCache';
 import { isGuid, isExternalUrl, resolveRef, getAssetType, deriveGuid, newGuid, getAssetEntry } from './assetManifest';
 import { markUIDirty } from '../ui/uiTreeStore';
 import { markOverride, clearOverrideMarks, clearAllOverrideMarks } from './overrideMarks';
+import { isPersistentTraitField } from '../core/ecs/traitSchema';
 import { SCENE_FORMAT_VERSION } from '../core/version';
 import { REF_FIELDS_BY_TRAIT } from './sceneValidation';
 import { parseClipBank } from '../audio/clipBank';
@@ -399,21 +400,18 @@ export function applyOverridesByLocalToEcs(
         markOverride(ecsId, traitName, '');
         continue;
       }
-      // AoS traits (function/undefined schema) carry non-scalar fields NOT listed in
-      // meta.fields (AnimationLibrary.animSets/boneMaps, SkinnedMeshRenderer.materials,
-      // UIAction.onClickSet). The meta.fields guard would drop them on load — the same
-      // bone-map-lost-on-reload bug as the save path. Skip the guard for AoS; keep it
-      // for SoA so a genuinely renamed/stale scalar field is still ignored.
-      const aos = typeof (meta.trait as { schema?: unknown }).schema !== 'object';
+      // Accept any field the trait PERSISTS — its koota schema, not the meta.fields
+      // Inspector list. AoS traits carry non-scalar fields no Inspector row declares
+      // (AnimationLibrary's animSets/boneMaps, SkinnedMeshRenderer's materials,
+      // UIAction's onClickSet — the bone-map-lost-on-reload bug), and SoA traits do
+      // too: Animator.clips/clip belong to a custom Inspector section and
+      // EntityAttributes.editorFolder has no row at all, so the old guard dropped
+      // them here AND left them unmarked, which made the next save delete them.
+      // A field the schema does not declare is still skipped — the genuinely
+      // renamed/stale case. See runtime/core/ecs/traitSchema.ts.
       const known: Record<string, unknown> = {};
       for (const [field, value] of Object.entries(fields)) {
-        // EntityAttributes.editorFolder is the editor Hierarchy folder tag — a real
-        // per-instance field with NO Inspector metadata, so it isn't in meta.fields and
-        // the SoA guard would wrongly drop it. Let it through so a foldered prefab
-        // instance keeps its folder when the tag rides the override map (e.g. an
-        // /api/scene-mutate edit). Mirrored in prefab.ts applyOverridesByRootInstance.
-        const allowed = (field in meta.fields) || (meta.name === 'EntityAttributes' && field === 'editorFolder');
-        if (!aos && !allowed) {
+        if (!isPersistentTraitField(meta, field)) {
           console.debug(`[loadSceneFile] override skipped: unknown field ${traitName}.${field}`);
           continue;
         }
@@ -1260,9 +1258,11 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   // First pass: spawn all entities
   for (const entry of data.entities) {
     const traitArgs: any[] = [];
+    let sawEntityAttributes = false;
     for (const [traitName, traitData] of Object.entries(entry.traits)) {
       const meta = allTraits.find((m) => m.name === traitName);
       if (!meta) continue;
+      if (traitName === 'EntityAttributes') sawEntityAttributes = true;
       if (traitData === true) traitArgs.push(meta.trait());
       else {
         // Every `entityId`-flagged field (Phase 15's FieldHint — EntityAttributes.
@@ -1294,6 +1294,22 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
           traitArgs.push(meta.trait(patched));
         }
       }
+    }
+    // The stamp above only fires while ITERATING an 'EntityAttributes' entry — but
+    // serialize.ts's captured-prefab-root shape omits EntityAttributes from
+    // entry.traits ENTIRELY (`minimalEa` stays empty for a top-level, unfoldered
+    // instance — see serialize.ts's prefabRootCaptured), not merely guid-less. That
+    // placeholder then spawns with NO EntityAttributes trait at all — undiscoverable
+    // via findEntityByGuid — so pass 2's self-referencing rootInstanceId always
+    // misses and strips PrefabInstance + warns, on every Stop/load, for any
+    // top-level unfoldered prefab instance (observed 2026-07-28, games/3d-test's
+    // "2D Animation" scene). Give the placeholder a minimal EntityAttributes carrying
+    // entry.guid so it's discoverable in the meantime — onInstantiatePrefab (below)
+    // replaces this placeholder with the real, fully-populated instance moments
+    // later, so a bare guid-only stand-in here is enough for pass 2 to resolve.
+    if (!sawEntityAttributes && entry.guid) {
+      const eaMeta = allTraits.find((m) => m.name === 'EntityAttributes');
+      if (eaMeta) traitArgs.push(eaMeta.trait({ guid: entry.guid }));
     }
     if (traitArgs.length > 0) {
       const entity = world.spawn(...traitArgs);
@@ -1337,9 +1353,15 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
         if (resolved === 'empty') continue; // no value / already 0 — nothing to remap
         if (resolved !== 'miss') { (patch ??= {})[fieldName] = resolved; continue; }
         if (hint.entityId!.onMissing === 'stripTrait') {
-          const name = (entry.traits['EntityAttributes'] as Record<string, unknown> | undefined)?.name ?? entry.id;
+          // Say which id space `label` is in — `entry.id` is a per-LOAD synthetic
+          // index (Phase 3, scene-loading.md), not a file id or a live koota id, and
+          // reading it as either sends you to the wrong entity. Prefer the entity's
+          // name, else its guid (present on a captured prefab root even when its
+          // EntityAttributes is otherwise absent), else label the index explicitly.
+          const eaData = entry.traits['EntityAttributes'] as Record<string, unknown> | undefined;
+          const label = (eaData?.name as string | undefined) || entry.guid || `entry-index ${entry.id}`;
           console.warn(
-            `[loadSceneFile] entity "${name}" carries a ${meta.name} whose ${fieldName} has no live ` +
+            `[loadSceneFile] entity "${label}" carries a ${meta.name} whose ${fieldName} has no live ` +
             `counterpart in this load — stripping ${meta.name} so it can't poison downstream lookups ` +
             `(scene-loading.md, Phase 15).`,
           );

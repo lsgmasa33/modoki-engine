@@ -326,7 +326,7 @@ describe('invalidateModel — loading-map key matching', () => {
     const { GLTFLoader } = await import('three/examples/jsm/loaders/GLTFLoader.js');
     let loadCount = 0;
     const loadSpy = vi.spyOn(GLTFLoader.prototype, 'load').mockImplementation(
-      (_url: string, onLoad: (gltf: { scene: THREE.Object3D }) => void) => {
+      (_url: string, onLoad: (gltf: any) => void) => {
         loadCount++;
         const root = new THREE.Group();
         const mesh = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial());
@@ -377,7 +377,7 @@ describe('loadModelTemplates — Float32 conversion + node TRS preservation', ()
     const { cache } = await getMods();
     const { GLTFLoader } = await import('three/examples/jsm/loaders/GLTFLoader.js');
     const loadSpy = vi.spyOn(GLTFLoader.prototype, 'load').mockImplementation(
-      (_url: string, onLoad: (gltf: { scene: THREE.Object3D }) => void) => {
+      (_url: string, onLoad: (gltf: any) => void) => {
         onLoad(setupGltf());
       },
     );
@@ -508,7 +508,7 @@ describe('loadModelTemplates — cross-path equivalence', () => {
     const cache = await import('../../src/runtime/loaders/meshTemplateCache');
     const { GLTFLoader } = await import('three/examples/jsm/loaders/GLTFLoader.js');
     const loadSpy = vi.spyOn(GLTFLoader.prototype, 'load').mockImplementation(
-      (_url: string, onLoad: (gltf: { scene: THREE.Object3D }) => void) => {
+      (_url: string, onLoad: (gltf: any) => void) => {
         onLoad(setupGltf());
       },
     );

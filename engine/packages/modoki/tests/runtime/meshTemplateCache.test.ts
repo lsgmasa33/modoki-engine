@@ -8,7 +8,7 @@ beforeEach(() => {
 });
 
 async function getCache() {
-  return import('../../../src/runtime/loaders/meshTemplateCache');
+  return import('../../src/runtime/loaders/meshTemplateCache');
 }
 
 describe('meshTemplateCache', () => {
@@ -234,8 +234,8 @@ describe('meshTemplateCache', () => {
       // idle scene never re-applies it (meshes stay stale until reload). fetchMaterial
       // must fire the dirty signal on completion so syncMaterial re-binds deterministically.
       const cache = await getCache();
-      const { registerBuiltinMaterialTypes } = await import('../../../src/runtime/loaders/materialPresets');
-      const { addDirtyListener } = await import('../../../src/runtime/core/ecs/entityUtils');
+      const { registerBuiltinMaterialTypes } = await import('../../src/runtime/loaders/materialPresets');
+      const { addDirtyListener } = await import('../../src/runtime/core/ecs/entityUtils');
       registerBuiltinMaterialTypes();
 
       // Minimal textureless pbr material so the build is synchronous (no KTX2 decode).

@@ -16,6 +16,13 @@
 /** JSON asset kinds keyed by filename suffix. Each `.<kind>.json` file also carries
  *  its GUID in a top-level `id` field (see ID_BEARING_TYPES). */
 export const JSON_ASSET_SUFFIX_TYPE: ReadonlyArray<readonly [suffix: string, type: string]> = [
+  // Scenes are positively identified by suffix, like every other JSON asset kind
+  // (issue #54) — before this, `detectType`'s JSON classification ended in a
+  // catch-all that guessed ANY uncategorized `.json` under an asset root was a
+  // scene, which misclassified e.g. Court's `assets/levels/index.json`. New scenes
+  // are `.scene.json`; a plain `.json` under a `/scenes/` directory is still
+  // accepted as a LEGACY fallback (see `detectType`'s comment).
+  ['.scene.json', 'scene'],
   ['.atlas.json', 'atlas'],
   ['.mesh.json', 'mesh'],
   ['.mat.json', 'material'],
@@ -65,12 +72,11 @@ export const BINARY_EXT_TYPE: Readonly<Record<string, string>> = {
   '.mp3': 'audio', '.m4a': 'audio', '.aac': 'audio', '.wav': 'audio', '.ogg': 'audio', '.flac': 'audio',
 };
 
-/** Asset types whose GUID lives in the file's OWN top-level `id` (JSON assets), as
- *  opposed to a `<file>.meta.json` sidecar (binary assets). Derived from the JSON
- *  suffix table plus `scene` (scenes are JSON with a top-level `id` but matched by
- *  directory convention, not a distinct suffix). Consumed by readAssetGuid /
- *  writeAssetGuid so the id-source list can't drift from the classifier. */
-export const ID_BEARING_TYPES: ReadonlySet<string> = new Set<string>([
-  ...JSON_ASSET_SUFFIX_TYPE.map(([, type]) => type),
-  'scene',
-]);
+/** Asset types whose GUID lives in the file's OWN top-level `id` (JSON assets),
+ *  as opposed to a `<file>.meta.json` sidecar (binary assets). `scene` now comes
+ *  from the JSON suffix table itself (`.scene.json`, issue #54) rather than being
+ *  appended by hand. Consumed by readAssetGuid / writeAssetGuid so the id-source
+ *  list can't drift from the classifier. */
+export const ID_BEARING_TYPES: ReadonlySet<string> = new Set<string>(
+  JSON_ASSET_SUFFIX_TYPE.map(([, type]) => type),
+);

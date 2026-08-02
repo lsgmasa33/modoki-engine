@@ -138,7 +138,7 @@ function mockMaterial(opts: {
   metalness?: number;
   transparent?: boolean;
   opacity?: number;
-  side?: number;
+  side?: THREE.Side;
   alphaTest?: number;
   envMapIntensity?: number;
   map?: THREE.Texture | null;

@@ -8,7 +8,9 @@ async function getModule() {
 }
 
 function makePrefab(entities: { localId: number; traits: Record<string, Record<string, unknown> | boolean> }[]) {
-  return { name: 'test', entities, rootLocalId: 1, version: 1 as const };
+  // getOverrideValues only reads localId/traits per entity — PrefabEntity.name is
+  // filled with a placeholder since these fixtures don't exercise naming.
+  return { name: 'test', entities: entities.map((e) => ({ ...e, name: '' })), rootLocalId: 1, version: 1 as const };
 }
 
 describe('getOverrideValues', () => {

@@ -56,7 +56,7 @@ describe('resolveTextureVariantUrl', () => {
   });
 
   it('appends ?v=<hash> in production builds (immutable-cache bust)', () => {
-    vi.stubEnv('PROD', 'true');
+    vi.stubEnv('PROD', true);
     try {
       registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, undefined, 'deadbeef');
       expect(resolveTextureVariantUrl(GUID, '3d')).toContain(PATH + '~uastc.ktx2?v=deadbeef');
@@ -184,13 +184,13 @@ describe('shared texture cache (F3 — dedup + refcount)', () => {
   // THREE.TextureLoader, whose loadAsync is inherited from Loader.prototype. Each
   // call resolves a FRESH THREE.Texture so instance identity proves sharing.
   let loadAsyncSpy: ReturnType<typeof vi.spyOn>;
-  // loadTexture3D now gates a KTX2 load on `rendererReady` (the runtime fix for the
+  // loadTexture3D gates a KTX2 load on `ensureKtx2Caps()` (the runtime fix for the
   // Android "Missing initialization with `.detectSupport( renderer )`" race — a KTX2
-  // load must not fire before `setActiveRenderer` wires the loader's GPU caps). Prime
-  // that ready state once so the KTX-loading tests here (and in the later
-  // applyTextureSettings block — `rendererReadyFired` is module-monotonic) don't hang
-  // waiting for a renderer. Stub detectSupport so caps stay the pristine {astc:false}
-  // the earlier variant-selection tests assert against.
+  // load must not fire before GPU caps are known). Prime that ready state once so the
+  // KTX-loading tests here (and in the later applyTextureSettings block —
+  // `ktx2CapsReadyFired` is module-monotonic) don't hang waiting on a probe. Stub
+  // detectSupport so caps stay the pristine {astc:false} the earlier variant-selection
+  // tests assert against.
   beforeAll(() => {
     const detect = vi.spyOn(getKTX2Loader(), 'detectSupport').mockImplementation(function (this: { workerConfig?: { astcSupported?: boolean } }) {
       this.workerConfig = { astcSupported: false }; return this as never;
@@ -381,7 +381,7 @@ describe('applyTextureSettings branches (via loadTexture3D)', () => {
   });
 
   it('routes a ?v=<hash> cache-busted .ktx2 URL down the KTX branch (regex handles the suffix)', async () => {
-    vi.stubEnv('PROD', 'true'); // PROD appends ?v=<hash>
+    vi.stubEnv('PROD', true); // PROD appends ?v=<hash>
     const ktxSpy = vi.spyOn(getKTX2Loader(), 'loadAsync').mockImplementation(async () => new THREE.Texture() as never);
     try {
       registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, undefined, 'cafef00d');

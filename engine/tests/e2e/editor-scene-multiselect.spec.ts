@@ -55,7 +55,7 @@ test.describe('3D viewport multi-select', () => {
 
     // Shift-click OffsetSphere adds it, becoming the active (primary) member.
     await modifierClickUntil(page, spherePos!.x, spherePos!.y, 'Shift', async () =>
-      (await selectedIds(page)).sort((a, b) => a - b).join(',') === [cube, sphere].sort((a, b) => a - b).join(','));
+      (await selectedIds(page)).sort((a, b) => a - b).join(',') === [cube!, sphere!].sort((a, b) => a - b).join(','));
     expect(await primarySelectedId(page)).toBe(sphere);
   });
 
@@ -108,7 +108,7 @@ test.describe('3D viewport multi-select', () => {
     await page.keyboard.up('Shift');
 
     await expect.poll(async () => (await selectedIds(page)).sort((a, b) => a - b))
-      .toEqual([cube, sphere, light].sort((a, b) => a - b));
+      .toEqual([cube!, sphere!, light!].sort((a, b) => a - b));
   });
 
   test('Z toggles the multi-select Pivot/Center gizmo mode, only once >1 entity is selected', async ({ page }) => {

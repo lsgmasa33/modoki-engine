@@ -344,6 +344,27 @@ describe('composeUndoActions', () => {
     expect(composeUndoActions([sel, live], { label: 'B' })!._isSelection).toBeUndefined();
   });
 
+  /** REGRESSION (independent review, 2026-07-30). `pushAction` diverts a sub-action into
+   *  the capture frame BEFORE `markAffectedScenesDirty` runs, so a captured sub never marks
+   *  its own scene dirty. The composite therefore has to carry the union — and did not, so a
+   *  live agent edit to a BASE-scene entity was dirty nowhere, and `saveAll` (which writes a
+   *  non-primary scene only `if (isSceneDirty(guid))`) silently never saved it. */
+  it('unions affectedScenes from its subs, so a base-scene edit survives to saveAll', () => {
+    const inBase = (guid: string) => ({ label: 'e', undo: () => {}, redo: () => {}, affectedScenes: [guid] });
+    const act = composeUndoActions([inBase('base-1'), inBase('base-2'), inBase('base-1')], { label: 'B' })!;
+    expect([...(act.affectedScenes ?? [])].sort()).toEqual(['base-1', 'base-2']); // deduped
+  });
+
+  it('omits affectedScenes contributed by a selection or file-direct sub', () => {
+    // Those subs are skipped by markAffectedScenesDirty when pushed alone; batching must
+    // not smuggle their scenes in — over-reporting dirty here would mean a spurious refusal.
+    const sel = { label: 's', undo: () => {}, redo: () => {}, _isSelection: true as const, affectedScenes: ['s1'] };
+    const fd = { label: 'f', undo: () => {}, redo: () => {}, _isFileDirect: true as const, affectedScenes: ['f1'] };
+    const live = { label: 'l', undo: () => {}, redo: () => {}, affectedScenes: ['live-1'] };
+    expect(composeUndoActions([sel, fd, live], { label: 'B' })!.affectedScenes).toEqual(['live-1']);
+    expect(composeUndoActions([sel, fd], { label: 'B' })!.affectedScenes).toBeUndefined();
+  });
+
   it('defaults to NO coalesceKey — every batch is its own undo step', () => {
     const act = composeUndoActions([{ label: 'a', undo: () => {}, redo: () => {} }], { label: 'B' })!;
     expect(act.coalesceKey).toBeUndefined();

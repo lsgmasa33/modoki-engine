@@ -17,6 +17,7 @@ import { normalizeTimeline, type TimelineDef } from '../runtime/timeline/types';
 import { getEditorViewportCamera, isEcsObjectVisible } from './scene/sceneViewBus';
 import { worldTransforms } from '../runtime/core/ecs/transformPropagationSystem';
 import { editorScene2DRenderer } from './rendering/editorScene2D';
+import { getInput } from '../runtime/traits/Input';
 
 export interface EditorTestBridge {
   /** The raw Zustand store (read selectedEntityId, gizmoMode, etc.). */
@@ -63,6 +64,12 @@ export interface EditorTestBridge {
   /** Whether an entity has a live 2D display-object slot in the editor's SceneView (ui-mode)
    *  Pixi renderer — lets an E2E assert the 2D "Colliders" toggle actually hides sprites. */
   has2DSprite(entityId: number): boolean;
+  /** The live `Input.pointer` level state (down/pressed/x/y), read straight off the runtime
+   *  `Input` resource — null if no Input resource is spawned yet. Lets an E2E assert the
+   *  pointer-block-root mechanism end-to-end: a real mouse press over a registered DOM
+   *  overlay (e.g. GameView's UIRenderer root) must never reach here, while a press
+   *  elsewhere must. */
+  getPointerState(): { down: boolean; pressed: boolean; x: number; y: number } | null;
 }
 
 export function installEditorTestBridge(): void {
@@ -112,6 +119,12 @@ export function installEditorTestBridge(): void {
     },
     has2DSprite(entityId) {
       return editorScene2DRenderer.hasSprite(entityId);
+    },
+    getPointerState() {
+      const input = getInput(getCurrentWorld());
+      if (!input) return null;
+      const { down, pressed, x, y } = input.pointer;
+      return { down, pressed, x, y };
     },
   };
   (window as unknown as { __modokiEditorTest?: EditorTestBridge }).__modokiEditorTest = bridge;

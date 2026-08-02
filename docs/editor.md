@@ -65,11 +65,116 @@ The menu bar (`File` / `Edit` / `View`, plus host-injected menus) is rendered by
 editor. It registers the game config, model postprocessors, and game-specific traits,
 and stashes custom panels, the Game View component, extra menus, and an optional
 **Project Settings** schema for `EditorApp` to pick up. It also kicks off scene loading:
-the manifest loads immediately, but the actual scene load awaits `rendererReady` (so
-`KTX2Loader.detectSupport` has run before any `loadAsync`). Critically, the `React.lazy`
-import of `EditorApp` is **not** gated on `sceneReady` — `sceneReady` itself awaits
-`rendererReady`, which only fires once `SceneView` (inside `EditorApp`) mounts its
-renderer, so gating would deadlock. See [Scene Loading](./scene-loading.md).
+the manifest loads immediately, and the scene load itself no longer waits on any 3D
+viewport or renderer existing — a layout with no Scene/Game panel open loads the scene
+just fine (see [Scene Loading](./scene-loading.md)). A separate, non-blocking
+renderer-health **watchdog** runs alongside it: it reports a definitive renderer-init
+failure fast, and warns if no viewport ever begins renderer creation — but only for a
+project that actually renders 3D (`build.modules.render3d`, resolved via
+`/api/build-modules` since `'auto'` can only be resolved server-side); a 2D/UI-only
+project gets no such warning. Suppression covers all three firing points (the 12s
+no-viewport message, the 15s soft nudge, the 120s hard cap) and **lifts the moment a
+viewport does begin** — a 2D project on which the user opens a Scene panel anyway gets
+normal renderer-health reporting. A definitive renderer-init FAILURE is never suppressed:
+a viewport that tried and threw is a real error whatever `render3d` says.
+
+### Project Settings — the save contract
+
+`ProjectSettingsDialog` edits the schema `createEditor()` registered; it `GET`s
+`/api/project-settings` and `POST`s back. Two rules govern that route
+(`editorBackendRouter.ts`), and both exist because breaking them silently corrupted real
+projects:
+
+- **The body is a PATCH, deep-merged onto the file ON DISK.** A section you omit is left as
+  the file had it — absence never means "reset to default". This matters because the dialog
+  posts the *whole* object while `modoki_project_settings action=set` and OtaKeysDialog's
+  "sync public key" post a *single* section. The route used to merge onto
+  `DEFAULT_PROJECT_CONFIG` instead (`mergeProjectConfig` is the **load-time** resolver, not a
+  write-time merge), so every partial caller reset app identity to
+  `com.modokiengine.prototype` and blanked `appleTeamId`. Keep the two merges separate:
+  `deepMergeConfigPatch` writes, `mergeProjectConfig` reads.
+- **`project.config.json` stays MINIMAL** — it records only what the project *chose*;
+  everything else resolves from the defaults at load. A save persists
+  `pruneProjectConfig(resolved, preEditFile, defaults)`, which keeps a key iff it differs
+  from its default **or** was already in the file, and preserves the file's key order so a
+  no-op save is a no-op diff. Writing the *resolved* config instead is what once handed an
+  internal game `webBucket: "gs://modoki-www-site/demo"`. Note prune measures "already
+  recorded" against the **pre-edit** file: pass the patched one and every key is trivially
+  present, nothing prunes, and the bug returns for full-object saves.
+- **Reading COERCES a bad string-union value; writing ROUND-TRIPS it.** `mergeProjectConfig`
+  falls an out-of-union value back to the default and warns, for EVERY string-union field in
+  the config — not just `rendering.web.sizeMode` / the three/pixi `backend`s (#39) — so the
+  engine renders something a consumer actually handles. But the route resolves with
+  `{ coerceUnions: false }`, because the resolved config is what
+  gets written. With coercion on, pressing Apply on an unrelated section would silently
+  normalize a field the author never touched. That is not a harmless heal: `sizeMode:
+  "portrait"` is what revealed `games/sling` was *meant* to be portrait (issue #25) —
+  rewriting it to `free` would have erased the only evidence of intent and left a file that
+  merely looked correct. The out-of-union value is caught instead by a test over every
+  committed `project.config.json`, and reported to the human as `configWarnings` (below).
+- **Load coerces; the BUILD REFUSES.** Coercing keeps a typo'd project openable — you cannot fix
+  a config you cannot open — but the build is the last moment before the value ships, so there it
+  is fatal (`projectConfigUnionErrors`, `plugins/load-project-config.ts`, wired into both SSE
+  build gates). It is a SEPARATE pass on the raw file, deliberately: `validateBuildConfig` sees
+  the already-RESOLVED config, where the bad value has been coerced away and is no longer there
+  to complain about. Not wired into the settings-save route, which round-trips out-of-union
+  values on purpose (`coerceUnions:false`).
+- **A vocabulary is declared ONCE, in `engine/project-config.ts`.** Each string union is an
+  exported `as const` tuple (`ORIENTATIONS`, `TONE_MAPPINGS`, `WEB_DEPLOY_MODES`, …) that both
+  the validator and the Project Settings dropdowns read — the dialog used to restate all ten
+  option lists by hand, so the two could silently disagree. Label-carrying selects pair the
+  tuple with a `Record<T, string>` label map, which makes adding a member without a label a
+  compile error; for the fields still typed as narrow unions, widening the tuple without
+  widening the `ProjectConfig` type is a compile error too. **Add a union member in one place
+  and the build tells you the other places.**
+
+Two refusals, both surfaced in the dialog as a red banner (the dialog stays open with the
+draft intact, so the offending value can be fixed in place):
+
+| Refusal | Why |
+|---|---|
+| A `null` anywhere in the patch → 400 naming the dot-paths | No config field is nullable. Persisting it poisons a typed field; dropping it would report success for an edit that did nothing. Use `""` / `false` / `0` to clear. |
+| The config file exists but is not valid JSON → 400 | The raw read is the base a patch merges onto, so the loaders' forgiving "treat as defaults" fallback would replace a hand-edited file with just the section being saved. Reading stays forgiving; **writing refuses**. |
+
+**The GET says when it fell back**, because the two halves of that last row disagree on
+purpose and the gap was visible to a human. Reading a malformed config is forgiving while
+writing refuses — each right alone, but together they put the dialog in a state where every
+field was a plausible-looking lie: measured on `games/sling`, a one-character JSON typo made
+Bundle ID read `com.modokiengine.prototype` and App name "Puzzle Prototype" — the identity
+that project retired — with nothing on screen saying so, and the truth reachable only by
+pressing Apply. The save refusal bounds the damage to *display*; it does not prevent someone
+reading those fields, believing them, and acting on them.
+
+So GET also returns `configErrors: [{file, message}]` (from `readProjectConfigParseErrors`),
+**omitted entirely** when both files parse — the healthy response is unchanged. The dialog
+shows it as a banner and makes the form inert; tab switching stays live, since reading around
+is fine and editing a lie is not. Two rules that are easy to get wrong:
+
+- **The banner names the FILE, not the screen.** `project.config.json` and `project.user.json`
+  define different fields, so only the latter failing leaves app identity perfectly real —
+  claiming "these are all defaults" there would be the same overclaim the banner exists to
+  fix. (Editing is still disabled wholesale, because one Apply writes both.)
+- **`configErrors` is a diagnostic, not a section.** The POST drops it before the
+  unknown-section check, since the dialog posts back the whole object it loaded.
+
+**`configWarnings` is the same diagnostic one notch down** — the file *parsed*, but a field
+holds a value no consumer handles, so the resolved config substituted a default
+(`projectConfigIssues`, same union table as the coercion). It exists because coercing traded
+one invisible problem for another: before it, `sizeMode: "portrait"` showed as an unmatched
+**blank** in the dropdown — odd enough to notice; after it, the dropdown reads "Free" and
+looks perfectly correct while the file still says `portrait`, and the write path deliberately
+keeps the file's word, so the two disagree indefinitely. Differences from `configErrors`:
+editing stays **enabled** (the rest of the values are the project's real ones, and the repair
+is usually to pick the right entry in the very dropdown being warned about), the banner states
+that saving other settings will *not* rewrite the value, and it is suppressed when
+`project.config.json` itself failed to parse — that resolves to *pure* defaults, so blaming a
+specific field would be a lie. A malformed `project.user.json` does **not** suppress it.
+
+`validateBuildConfig` still runs against the **resolved** config, so a partial patch cannot
+smuggle a shell metacharacter past a rule by omitting the field next to it. Nothing is
+written on any refusal. Caveat: `postprocessors` is a map, so a patch can add or update an
+entry but never delete one; and unknown *top-level* keys are dropped by `mergeProjectConfig`'s
+explicit key list (unknown keys nested inside a declared section survive).
 
 ---
 
@@ -490,6 +595,143 @@ folder (`pickProjectFolder`/`pickNewProjectFolder` pass `defaultPath` from, and 
 OS-native picker's own "last folder" memory is keyed by app bundle id, which several unpackaged
 dev clones share — without this, opening a project in one clone would silently seed the starting
 folder for a sibling clone's picker.
+
+### Launching into a named scene (`--scene`)
+
+The editor remembers the last scene per project, and until #43 nothing could override it at
+launch — a project could be forced (`launch-editor.sh games/sling`, or `MODOKI_PROJECT`), a
+scene could not. The only lever was renderer-side `localStorage`, which a launching process
+cannot write. That made "launch and look" depend on the launcher's history rather than on the
+command, and cost an agent an extra round trip plus a window where measurements came from the
+wrong scene.
+
+```bash
+engine/scripts/launch-editor.sh games/sling --scene Level-0002          # by NAME
+engine/scripts/launch-editor.sh games/sling --scene assets/scenes/x.json # by PATH
+```
+
+`--scene=<v>` works too, and the flag may sit anywhere in the arg list — it is stripped before
+the bare project-dir positional is read. A **valueless** `--scene` exits 2 with a message; it
+used to reach `shift 2` with one arg left, which under `set -e` killed the launcher with no
+output at all. The value crosses launcher → Electron main as **`MODOKI_SCENE`** (env, because
+that hop is a spawn — same carrier as `MODOKI_PROJECT`), and main serves it to the renderer at
+**`GET /api/boot-scene`**. Deliberately not a field on `/api/identity`: that route is the
+"which editor am I talking to?" diagnostic, and a boot instruction is not a fact about identity.
+
+Four decisions worth knowing, because each has a wrong-looking alternative:
+
+- **Precedence mirrors the project's**: override → stored last-scene → `config.scenePath`. The
+  override is *prepended to* the candidate list, never substituted for it, so it inherits
+  `loadFirstScene`'s existing 404 self-heal — a typo degrades to the remembered scene instead
+  of booting a blank world.
+- **A name or a path.** `resolveSceneCandidates` speaks paths, but `--scene Level-0002` is what
+  gets typed. A value containing `/` or ending `.json` is used as-is; anything else is matched
+  case-insensitively against the manifest's scene basenames. **An ambiguous name is refused**,
+  not first-matched — the same rule `{name}` entity addressing follows — and both the no-match
+  and ambiguous cases `console.warn` with the available scenes before falling through.
+- **It does NOT overwrite the remembered scene.** A one-off agent launch must not change where
+  the human's next bare launch lands, so the `localStorage` write is skipped when the override
+  supplied the loaded scene. If the override *missed* and boot fell through, the normal write
+  still happens. A later manual scene load by the human persists as usual.
+- **Sticky, not one-shot.** `/api/boot-scene` keeps answering for the process lifetime, so a
+  Fast-Refresh/HMR reload stays in the overridden scene rather than silently snapping back.
+  "This editor instance was launched into X" is the predictable reading.
+
+### Port selection (and why a free-looking port may not be)
+
+Two ports are chosen at startup, on different contracts. The **backend** port is the MCP
+target, so an explicit `MODOKI_BACKEND_PORT` **fails loudly** when taken rather than drifting
+to one no MCP client could find (E6); without it the port is sticky — last-bound, then 5179,
+then a deterministic scan. The **Vite** port is only a preference and falls back to an
+ephemeral one, which is what lets a second editor start at all.
+
+**Per-clone lanes.** Several clones share one machine (see the Clones section in the root
+`CLAUDE.md`), so `launch-editor.sh` derives both other ports from the pinned backend —
+Vite `5173 + (backend − 5179)`, CDP `9222 + (backend − 5179)`. One anchor, no extra flags,
+and no two clones aiming at the same port. Without it every clone *preferred* 5173, only the
+first to launch got it, and the rest landed on unpredictable ephemeral ports — which also made
+the documented `localhost:5173/#/editor` true for exactly one clone.
+
+The launcher passes this as **`MODOKI_VITE_PORT`**, which seeds the preference and keeps the
+ephemeral fallback. That is deliberately *not* `MODOKI_DEV_URL`: setting `MODOKI_DEV_URL` makes
+main skip `findFreePort` entirely and pin that exact origin, so a clash there is fatal. Use it
+only when you mean "this exact server". Because the derived port can still lose a race, the
+launch banner reports the port Vite ACTUALLY bound, flagging the difference
+(`Editor page: … (wanted 5173 — it was taken)`) rather than echoing what it asked for.
+
+Deciding "is this port free" is subtler than it looks, and getting it wrong is how one clone
+ends up serving another clone's project. Node sets `SO_REUSEADDR` on every `net.Server`, and
+that lets a bind succeed *alongside* an existing bind on a different address — so a single
+probe is not a free/busy oracle. Measured (rows = who holds the port, columns = what a probe
+reports):
+
+| held | probe `0.0.0.0` | probe `127.0.0.1` | probe `::1` |
+|---|---|---|---|
+| `0.0.0.0` | EADDRINUSE | free | free |
+| `127.0.0.1` | free | EADDRINUSE | free |
+| `::` | EADDRINUSE | free | free |
+| `::1` | free | free | EADDRINUSE |
+
+**There is no single address that sees every clash.** `findFreePort` therefore probes all of
+them (`PROBE_HOSTS`, `devServer.ts`) and calls a port free only when every probe agrees; a
+non-`EADDRINUSE` error (no IPv6 stack, a sandbox refusing the wildcard) counts as *no evidence*
+rather than a clash. Probing only loopback — the pre-#67 behaviour — is blind to a sibling
+clone's `vite --host 0.0.0.0`; probing only the wildcard would be blind to our own
+`--host 127.0.0.1` Vite, the more common clash.
+
+**Test harnesses derive theirs the same way.** Anything that binds a fixed port assumes it is
+the only clone on the machine, so the e2e suite and the packaged harnesses all derive from the
+repo path through the one implementation in `engine/scripts/clonePort.mjs` (a `.mjs` with a
+`.d.mts` sidecar so the TypeScript Playwright config and the bash harnesses share an algorithm
+rather than keeping two copies of the hash):
+
+| Harness | Block | Override |
+|---|---|---|
+| Playwright e2e (`playwright.config.ts`) | 38173 + 0..199 | `MODOKI_E2E_PORT` |
+| `smoke-packaged.sh` | 38600 + 0..199 | `SMOKE_BACKEND_PORT` |
+| `assert-app-renders.sh` | 38900 + 0..199 | `RENDER_BACKEND_PORT` |
+
+Keep the blocks wide. A tight range is the tempting simplification and it is wrong: 10 slots was
+tried for the packaged harnesses and immediately mapped two real clones to the same port
+(birthday problem — ~30% for four clones in ten slots), which is a per-clone scheme that isn't.
+`assert-app-renders.sh` previously hardcoded **5179**, the main clone's own editor backend port,
+so it could not run while your editor was up.
+
+A correct probe still isn't proof of ownership, so there is a second guard: `waitForServer`
+re-checks that our own Vite child is alive **after** a positive reachability probe. Reachable
+only means *something* answered — and if our Vite has meanwhile exited on a `--strictPort`
+clash, that something is a foreign server. Adopting it used to surface much later as a baffling
+"the dev server can't serve code outside its allowed roots" naming a path that plainly exists,
+because the roots being enforced belonged to the *other* clone. It now fails immediately and
+says so.
+
+### The launch log — who started which editor
+
+`launch-editor.sh` appends every launch to **`~/.modoki/editor-launches.log`**
+(`MODOKI_LAUNCH_LOG` overrides). It lives outside the repo on purpose: the question it answers
+is a *cross-clone* one — "whose editor is on this port?", "who is holding 5173?" — and a
+per-clone log cannot see the sibling that caused the collision.
+
+```
+2026-08-01T04:03:41Z  START  modoki (main)  pid=83473
+  cmd:   engine/scripts/launch-editor.sh games/court
+  want:  backend=5179 vite=5173 cdp=9222
+  ready: backend=5179 vite=65018 cdp=9222  page=http://127.0.0.1:65018/#/editor
+2026-08-01T04:04:06Z  EXIT   modoki (main)  pid=83473
+```
+
+Three things make it worth reading rather than just writing:
+
+- **`cmd:` is reproducible.** The shell does not preserve a caller's `VAR=x cmd` prefix, so the
+  line is rebuilt from a snapshot taken *before* the launcher exports its own derived values —
+  only pins you actually typed appear, so it can be copy-pasted.
+- **`want:` and `ready:` are separate** because the Vite port is a preference, not a pin. Above,
+  5173 was taken by a sibling clone and the editor landed on 65018; a log that recorded only the
+  request would send you to an editor that isn't there.
+- **A `START` with no `EXIT` means that editor is still up — or leaked.** A background waiter
+  outlives the launcher to write the `EXIT` line, so the pairing is the liveness signal.
+
+Logging is best-effort throughout: it must never take down a launch.
 
 ### UI Zoom (VS Code–style)
 

@@ -72,8 +72,12 @@ const bloomSpy = vi.fn((_color: unknown, strength: number, radius: number, thres
   return n;
 });
 
-const vignetteSpy = vi.fn((_color: unknown, intensity: unknown, smoothness: unknown) => ({ __vignette: [intensity, smoothness] }));
-const dofSpy = vi.fn((_color: unknown, viewZ: unknown, focusDistance: unknown, focalLength: unknown, bokehScale: unknown) => (
+// intensity/smoothness/focusDistance/focalLength/bokehScale are TSL uniform() nodes —
+// typed by their `.value` shape (not the full TSL node type) so setConfig-mutation
+// assertions below can read `.value` without a cast.
+type UniformNode = { value: number };
+const vignetteSpy = vi.fn((_color: unknown, intensity: UniformNode, smoothness: UniformNode) => ({ __vignette: [intensity, smoothness] }));
+const dofSpy = vi.fn((_color: unknown, viewZ: unknown, focusDistance: UniformNode, focalLength: UniformNode, bokehScale: UniformNode) => (
   // Real DepthOfFieldNode owns 6 render targets + 5 materials and has a dispose().
   { __dof: [viewZ, focusDistance, focalLength, bokehScale], dispose: vi.fn() }
 ));

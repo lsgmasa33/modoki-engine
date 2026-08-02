@@ -3,7 +3,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 async function getUndoManager() {
-  return import('../../../src/editor/undo/undoManager');
+  return import('../../src/editor/undo/undoManager');
 }
 
 beforeEach(async () => {

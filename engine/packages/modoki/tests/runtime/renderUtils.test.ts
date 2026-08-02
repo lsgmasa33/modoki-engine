@@ -7,7 +7,7 @@ import { describe, it, expect } from 'vitest';
 import '../../src/runtime/loaders/registerProviders';
 
 async function getModule() {
-  return import('../../../src/runtime/rendering/renderUtils');
+  return import('../../src/runtime/rendering/renderUtils');
 }
 
 describe('renderUtils', () => {
@@ -69,7 +69,7 @@ describe('renderUtils', () => {
 
     it('returns true for a texture GUID but false for a material GUID', async () => {
       const { isImagePath } = await getModule();
-      const { registerAsset, clearManifest } = await import('../../../src/runtime/loaders/assetManifest');
+      const { registerAsset, clearManifest } = await import('../../src/runtime/loaders/assetManifest');
       clearManifest();
       const texGuid = 'a1b2c3d4-e5f6-4789-9abc-def012345678';
       const matGuid = '11111111-2222-4333-8444-555555555555';
@@ -84,7 +84,7 @@ describe('renderUtils', () => {
 
     it('returns false for an unknown GUID (not in manifest)', async () => {
       const { isImagePath } = await getModule();
-      const { clearManifest } = await import('../../../src/runtime/loaders/assetManifest');
+      const { clearManifest } = await import('../../src/runtime/loaders/assetManifest');
       clearManifest();
       expect(isImagePath('99999999-aaaa-4bbb-8ccc-dddddddddddd')).toBe(false);
     });

@@ -14,13 +14,14 @@ import { ease } from './cameraFraming';
 import { isSkeletalPreviewing } from '../core/skeletalPreview';
 import { sceneManager } from '../scene/SceneManager';
 import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_3D } from './frameDriver';
-import { registerSceneRenderer, unregisterSceneRenderer, type SceneRenderer } from './offscreenCapture';
+import { registerSceneRenderer, unregisterSceneRenderer, normalizeJpegQuality, type SceneRenderer } from './offscreenCapture';
 import { registerBoundsProvider, projectAABBToScreen, type EntityScreenBounds } from '../core/screenBounds';
 import { readbackToRGBA, type ReadbackBackend } from './readbackToRGBA';
 import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, prewarmShadersForWorld, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
 import { registerRenderSurface } from './materialBroker';
 import { getRenderSettings } from './renderSettings';
-import { clampBufferSize } from './webCanvasSizing';
+import { onForceResize } from './resizeBus';
+import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
 import { createParticleSyncState, syncParticles, disposeParticleSyncState } from './particleSync';
 import { createFlameMeshSyncState, syncFlameMeshes, disposeFlameMeshSyncState } from './flameMeshSync';
 import { PARTICLE_LAYER } from './layers';
@@ -469,7 +470,10 @@ export default function Scene3D() {
         const vw = container.clientWidth || 1280, vh = container.clientHeight || 720;
         const w = Math.max(1, Math.min(Math.round(opts.width ?? vw), 4096));
         const h = Math.max(1, Math.min(Math.round(opts.height ?? vh), 4096));
-        const quality = opts.quality ?? 0.85;
+        // ONE unit for `quality` across capture_viewport / render_scene / render_sequence: 1–100,
+        // converted here. Passing opts.quality straight to toDataURL meant a sibling-habituated
+        // `quality:70` was silently ignored by the HTML spec's out-of-range rule (S3.13).
+        const { pct: qualityPct, fraction: quality } = normalizeJpegQuality(opts.quality);
         const r = renderer as unknown as {
           getRenderTarget(): THREE.RenderTarget | null;
           setRenderTarget(rt: THREE.RenderTarget | null): void;
@@ -587,7 +591,7 @@ export default function Scene3D() {
             // so the live loop resumes against the right framebuffer.
             r.setRenderTarget(prevRT);
           }
-          return { width: w, height: h, dataUrl: captureCanvas.toDataURL('image/jpeg', quality) };
+          return { width: w, height: h, quality: qualityPct, dataUrl: captureCanvas.toDataURL('image/jpeg', quality) };
         } finally {
           capturing = false;
         }
@@ -620,10 +624,10 @@ export default function Scene3D() {
             const c = _boundsBox.getCenter(new THREE.Vector3());
             worldAABB = { size: [s.x, s.y, s.z], center: [c.x, c.y, c.z] };
           }
-          out.push({ id, layer: '3d', screen, onScreen, ...(worldAABB ? { worldAABB } : {}) });
+          out.push({ id, layer: '3d', surface: 'game-3d', screen, onScreen, ...(worldAABB ? { worldAABB } : {}) });
         }
         return out;
-      });
+      }, 'game-3d');
 
       // On world swap, drop all cached Three.js objects (entity IDs are world-scoped).
       // Sync functions will rebuild from queries on the next frame.
@@ -659,7 +663,7 @@ export default function Scene3D() {
       };
       sceneManager.registerBeforeSwap(prewarmHook);
 
-      const resizeObserver = new ResizeObserver(() => {
+      function applyResize() {
         const w = container.clientWidth;
         const h = container.clientHeight;
         if (w === 0 || h === 0) return;
@@ -669,22 +673,28 @@ export default function Scene3D() {
         // frame, but update here so a resize while paused reframes immediately.
         applyOrthoFrustum(orthoCamera, orthoCamera.top, w / h);
         framingDirty = true; // re-fit the CameraFrame for the new aspect
-        // `max` sizeMode: render into a clamped drawing buffer (≤ web.width×height)
-        // but keep the canvas CSS-sized to the container so it upscales to fill.
-        // `free`/`fixed` pass through (buf === w×h). No-op for the editor (free).
-        const buf = clampBufferSize(w, h, getRenderSettings().web);
-        if (buf.width !== w || buf.height !== h) {
-          renderer.setSize(buf.width, buf.height, false);
-          renderer.domElement.style.width = `${w}px`;
-          renderer.domElement.style.height = `${h}px`;
-        } else {
-          renderer.setSize(w, h);
-        }
+        // `max` sizeMode: clamp the REAL drawing buffer (device px, after DPR) to ≤
+        // web.width×height while the canvas stays CSS-sized to the container, so it
+        // upscales to fill. clampPixelRatio does that via the RATIO (see its doc for
+        // why the CSS size can't carry the clamp); it returns basePR untouched for
+        // free/fixed, making this identical to the pre-clamp setSize path. basePR is
+        // recomputed here every resize — never renderer.getPixelRatio(), which is the
+        // already-clamped value and so can't climb back when the container shrinks.
+        const rs = getRenderSettings();
+        const basePR = basePixelRatio(window.devicePixelRatio, rs.three.pixelRatioCap);
+        renderer.setPixelRatio(clampPixelRatio(w, h, basePR, rs.web));
+        renderer.setSize(w, h, false);
+        renderer.domElement.style.width = `${w}px`;
+        renderer.domElement.style.height = `${h}px`;
         // NPR texelSize is recomputed every frame from the live drawing buffer
         // (NPRPostProcess.render), so the resize itself needs no NPR-side call.
         markRenderDirty(); // re-render at the new size even while stopped
-      });
+      }
+      const resizeObserver = new ResizeObserver(applyResize);
       resizeObserver.observe(container);
+      // Let the debug menu's Device tab force a re-measure (e.g. after flipping
+      // pixelRatioCap live) without waiting on a DOM resize. See resizeBus.ts.
+      const unregisterForceResize = onForceResize(applyResize);
 
       cleanupRef.current = () => {
         unregisterSceneRenderer(offscreenRender);
@@ -701,6 +711,7 @@ export default function Scene3D() {
         for (const unsub of dirtyUnsubs) unsub();
         sceneManager.unregisterBeforeSwap(prewarmHook);
         resizeObserver.disconnect();
+        unregisterForceResize();
         unregisterFrameCallback(frameKey);
         disposeParticleSyncState(particleState, scene);
         disposeFlameMeshSyncState(flameState, scene);

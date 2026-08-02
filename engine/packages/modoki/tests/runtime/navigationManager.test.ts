@@ -129,4 +129,31 @@ describe('NavigationManager', () => {
     await navigationManager.loadScene('/scenes/B.json');
     expect(getReadValue('canGoBack')).toBe(true);
   });
+
+  // ── lifecycle, called directly ──────────────────────────────────────────────
+  // Every test above drives the manager through registerManager/unregisterManager,
+  // so init()/dispose() were only ever exercised transitively — nothing asserted what
+  // they do. These call them directly, which is also the no-arg form the interface now
+  // declares (#37); before that they inherited ManagerDef's init(ctx: ManagerContext)
+  // and a direct call had to fabricate a context the manager never reads.
+
+  it('dispose() clears history and drops the canGoBack read source', async () => {
+    currentPath = '/scenes/A.json';
+    await navigationManager.loadScene('/scenes/B.json');
+    expect(navigationManager.canGoBack).toBe(true);
+
+    navigationManager.dispose();
+
+    expect(navigationManager.canGoBack).toBe(false);   // history cleared
+    expect(getReadValue('canGoBack')).toBeUndefined(); // read source gone
+  });
+
+  it('init() re-registers the canGoBack read source after a dispose', () => {
+    navigationManager.dispose();
+    expect(getReadValue('canGoBack')).toBeUndefined();
+
+    navigationManager.init();
+
+    expect(getReadValue('canGoBack')).toBe(false);
+  });
 });

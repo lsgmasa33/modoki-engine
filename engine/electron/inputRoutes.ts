@@ -6,11 +6,13 @@
  *  pinned by a test — "did we resolve BEFORE dispatching, or after?" is invisible in a
  *  screenshot and catastrophic in a race.
  *
- *  ADDRESSING. Every pointer route accepts either explicit viewport CSS `{x,y}` or a CSS
- *  `selector`, resolved in the renderer (`resolve-dom-point`) inside the same call. That
- *  ordering is the point: an agent that reads coordinates, then taps them in a second
- *  round-trip, is aiming at where the element WAS. `tap-handle`/`drag-handle` already work
- *  this way for canvas handles; `selector` extends it to editor chrome.
+ *  ADDRESSING. Every pointer route accepts an `entity` ({guid|name|id}), a CSS `selector`, or
+ *  explicit viewport CSS `{x,y}` — in that precedence order. The first two are resolved in the
+ *  renderer (`resolve-entity-point` / `resolve-dom-point`) inside the same call. That ordering
+ *  is the point: an agent that reads coordinates, then taps them in a second round-trip, is
+ *  aiming at where the target WAS. `tap-handle`/`drag-handle` already work this way for canvas
+ *  handles; `selector` extends it to editor chrome and `entity` to scene entities — the three
+ *  target surfaces aimed input has.
  *
  *  Every selector-resolved response carries `matched` (what the selector found) and
  *  `hitTarget` (the topmost element at that point). When they differ, `occluded` is true
@@ -24,6 +26,7 @@ import type { MouseButton, InputModifier } from './rendererOps';
 // than re-declared because both sides speak this shape over the bridge, and a second copy
 // of a wire contract silently drifts.
 import type { DomPointResolution } from '../app/debug/domPointContract';
+import type { EntityPointSpec, EntityPointResolution, OcclusionScope, AimedAt } from '../app/debug/entityPointContract';
 
 /** The trusted-input primitives, pre-bound to the live window by the caller. */
 export interface InputOps {
@@ -36,8 +39,20 @@ export interface InputOps {
   pointerMove(x: number, y: number, opts?: { button?: MouseButton; modifiers?: InputModifier[] }): Promise<void>;
   pointerUp(x: number, y: number, opts?: { button?: MouseButton; modifiers?: InputModifier[] }): Promise<void>;
   pressKey(key: string, modifiers?: InputModifier[]): Promise<{ activeElement: string | null; gameSwallows: boolean }>;
-  typeText(text: string, opts?: { clearFirst?: boolean; submitKey?: string }): Promise<{ typed: number; editable: boolean; activeElement: string | null }>;
-  focusElement(selector?: string): Promise<{ view: boolean; focused: string | null; blurred: string | null; ok: boolean }>;
+  typeText(text: string, opts?: { clearFirst?: boolean; submitKey?: string }): Promise<{
+    typed: number; editable: boolean; activeElement: string | null;
+    /** The focused element's text after typing, when readable — makes `typed` checkable (S3.18). */
+    valueAfter?: string | null;
+    /** Set when fewer characters landed than were requested. */
+    error?: string;
+  }>;
+  focusElement(selector?: string): Promise<{
+    view: boolean; focused: string | null; blurred: string | null; ok: boolean;
+    /** A NAMED cause for a miss (invalid selector / no match / focus refused) — S3.7. */
+    error?: string;
+    /** Where focus actually ended up. */
+    activeElement?: string | null;
+  }>;
 }
 
 export interface InputRouteDeps {
@@ -51,13 +66,42 @@ export interface InputRouteDeps {
 export type InputRoutesHandler =
   ((req: HostRequest) => Promise<BackendResult | null>) & { resetHeldPointer(): void };
 
-/** A point the agent wants to act on: explicit coordinates or a CSS selector. */
-export interface PointSpec { x?: number; y?: number; selector?: string }
+/** A point the agent wants to act on: an ENTITY, a CSS selector, or explicit coordinates.
+ *
+ *  Precedence is `entity` → `selector` → `{x,y}`, extending the existing
+ *  selector-overrides-coordinates rule rather than replacing it (the tool descriptions have
+ *  documented that ordering since selectors landed, so re-litigating it here would break
+ *  callers for no gain). */
+export interface PointSpec { x?: number; y?: number; selector?: string; entity?: EntityPointSpec }
 
 /** A resolved point plus the provenance an agent needs to trust it. */
 export interface ResolvedPoint {
   x: number; y: number;
   matched?: string | null; hitTarget?: string | null; occluded?: boolean;
+  /** How far the occlusion check could see — see `OcclusionScope`. Present only for
+   *  entity-aimed calls, where `occluded:false` means different things for a UI node
+   *  (element-level: trustworthy) and a mesh (canvas-level: says nothing about a mesh in
+   *  front of it). Reporting the scope is what keeps the weaker check from reading as the
+   *  stronger one. */
+  occlusionScope?: OcclusionScope;
+  /** The entity an `{entity}` aim resolved to. Echoed because a `{name}` aim should be
+   *  checkable, and because a guid-addressed call still reports the volatile id it hit. */
+  entity?: { id: number; name: string; guid?: string; layer?: string | null };
+  /** Which on-screen surface a 2D/3D entity aim was measured in ('game-3d' | 'game-2d' |
+   *  'scene-view'). Present whenever it is known — without it, "I tapped the cube" does not
+   *  say WHICH on-screen cube, and in the editor there are routinely two. */
+  surface?: string;
+  /** Which entity the surface's own hit-test says is actually at the aim point — `null` for
+   *  empty space. Only present on the `'entity'` occlusion scope; names the blocker the way
+   *  `hitTarget` names a covering DOM element (F15, `docs/enact.md`). */
+  occludedByEntity?: { id: number; name: string; guid?: string } | null;
+  /** How the aim point inside the entity's projected rect was chosen — `'centre'` (clean hit)
+   *  or `'sampled'` (the centre missed a concave/hollow shape, so the rect was searched). Only
+   *  present on the `'entity'` scope. */
+  aimedAt?: AimedAt;
+  /** How many points were tried before the aim succeeded or gave up, when the centre missed
+   *  and the rect was sampled. Only present when sampling actually ran. */
+  samplesTried?: number;
 }
 
 const json = (body: unknown, status?: number): BackendResult => ({ kind: 'json', ...(status ? { status } : {}), body });
@@ -70,6 +114,28 @@ export async function resolvePoint(
   which: string,
   requestRenderer: InputRouteDeps['requestRenderer'],
 ): Promise<{ point: ResolvedPoint } | { error: string }> {
+  // ── entity: resolve {guid}/{name}/{id} to the entity's LIVE screen rect in the renderer. ──
+  // Highest precedence: it is the most specific thing the caller can say, and (unlike a
+  // selector) there is no legacy call shape that passes it incidentally.
+  if (spec && spec.entity && typeof spec.entity === 'object' && Object.keys(spec.entity).length > 0) {
+    let res: EntityPointResolution | null;
+    try {
+      res = (await requestRenderer('resolve-entity-point', spec.entity)) as EntityPointResolution | null;
+    } catch (e) {
+      return { error: `${which}: renderer could not resolve entity (${e instanceof Error ? e.message : String(e)})` };
+    }
+    if (!res || !res.ok || typeof res.x !== 'number' || typeof res.y !== 'number') {
+      return { error: `${which}: ${res?.error ?? 'entity did not resolve'}` };
+    }
+    return {
+      point: {
+        x: res.x, y: res.y,
+        matched: res.matched, hitTarget: res.hitTarget, occluded: res.occluded,
+        occlusionScope: res.occlusionScope, entity: res.entity, surface: res.surface,
+        occludedByEntity: res.occludedByEntity, aimedAt: res.aimedAt, samplesTried: res.samplesTried,
+      },
+    };
+  }
   if (spec && typeof spec.selector === 'string' && spec.selector) {
     let res: DomPointResolution | null;
     try {
@@ -85,7 +151,7 @@ export async function resolvePoint(
   if (spec && typeof spec.x === 'number' && typeof spec.y === 'number') {
     return { point: { x: spec.x, y: spec.y } };
   }
-  return { error: `${which}: provide a selector or {x,y}` };
+  return { error: `${which}: provide an entity {guid|name|id}, a selector, or {x,y}` };
 }
 
 /** Strip the undefined provenance fields so a coordinate-addressed call's response stays
@@ -95,6 +161,15 @@ function provenance(p: ResolvedPoint): Record<string, unknown> {
   if (p.matched !== undefined) out.matched = p.matched;
   if (p.hitTarget !== undefined) out.hitTarget = p.hitTarget;
   if (p.occluded !== undefined) out.occluded = p.occluded;
+  // Only ever set alongside `occluded`, and always when an entity resolved it — so a caller
+  // can never see an entity-aimed `occluded` without the scope that qualifies it.
+  if (p.occlusionScope !== undefined) out.occlusionScope = p.occlusionScope;
+  if (p.entity !== undefined) out.entity = p.entity;
+  if (p.surface !== undefined) out.surface = p.surface;
+  // Only ever set on the 'entity' occlusion scope — see the fields' own doc comments above.
+  if (p.occludedByEntity !== undefined) out.occludedByEntity = p.occludedByEntity;
+  if (p.aimedAt !== undefined) out.aimedAt = p.aimedAt;
+  if (p.samplesTried !== undefined) out.samplesTried = p.samplesTried;
   return out;
 }
 
@@ -155,8 +230,8 @@ export function createInputRoutes(deps: InputRouteDeps) {
   async function dispatchInput({ urlPath, body }: HostRequest): Promise<BackendResult | null> {
 
     if (urlPath === '/api/input/tap') {
-      const { x, y, selector, button, clickCount, modifiers } = (body ?? {}) as PointSpec & { button?: MouseButton; clickCount?: number; modifiers?: InputModifier[] };
-      const r = await resolvePoint({ x, y, selector }, 'tap', requestRenderer);
+      const { x, y, selector, entity, button, clickCount, modifiers } = (body ?? {}) as PointSpec & { button?: MouseButton; clickCount?: number; modifiers?: InputModifier[] };
+      const r = await resolvePoint({ x, y, selector, entity }, 'tap', requestRenderer);
       if ('error' in r) return bad(r.error);
       await ops.tap(r.point.x, r.point.y, { button, clickCount, modifiers });
       return json({ ok: true, tapped: { x: r.point.x, y: r.point.y, button: button ?? 'left', clickCount: clickCount ?? 1 }, ...provenance(r.point) });
@@ -194,7 +269,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
     // slingshot pull, a charge meter, a drag-to-aim rubber-band — with get_scene_state / eval /
     // a screenshot mid-gesture, which the atomic drag can't expose.
     if (urlPath === '/api/input/pointer') {
-      const { action, x, y, selector, button, modifiers } =
+      const { action, x, y, selector, entity, button, modifiers } =
         (body ?? {}) as PointSpec & { action?: 'down' | 'move' | 'up'; button?: MouseButton; modifiers?: InputModifier[] };
       if (action !== 'down' && action !== 'move' && action !== 'up') {
         return bad(`pointer: action must be 'down', 'move', or 'up' (got ${JSON.stringify(action)})`);
@@ -205,7 +280,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       if ((action === 'move' || action === 'up') && !heldPointer) {
         return json({ error: `no pointer is held — send action:'down' first (this ${action} would be a stray event).` }, 409);
       }
-      const r = await resolvePoint({ x, y, selector }, `pointer ${action}`, requestRenderer);
+      const r = await resolvePoint({ x, y, selector, entity }, `pointer ${action}`, requestRenderer);
       if ('error' in r) return bad(r.error);
       // 'down' takes its button from the request (default left); 'move'/'up' REUSE the held one so
       // the whole gesture is one consistent button and a move reads as a drag-move.
@@ -224,17 +299,25 @@ export function createInputRoutes(deps: InputRouteDeps) {
     }
 
     if (urlPath === '/api/input/hover') {
-      const { x, y, selector, modifiers } = (body ?? {}) as PointSpec & { modifiers?: InputModifier[] };
-      const r = await resolvePoint({ x, y, selector }, 'hover', requestRenderer);
+      const { x, y, selector, entity, modifiers } = (body ?? {}) as PointSpec & { modifiers?: InputModifier[] };
+      const r = await resolvePoint({ x, y, selector, entity }, 'hover', requestRenderer);
       if ('error' in r) return bad(r.error);
       await ops.hover(r.point.x, r.point.y, modifiers);
       return json({ ok: true, hovered: { x: r.point.x, y: r.point.y }, ...provenance(r.point) });
     }
 
     if (urlPath === '/api/input/scroll') {
-      const { x, y, selector, deltaX, deltaY, modifiers } = (body ?? {}) as PointSpec & { deltaX?: number; deltaY?: number; modifiers?: InputModifier[] };
-      const r = await resolvePoint({ x, y, selector }, 'scroll', requestRenderer);
+      const { x, y, selector, entity, deltaX, deltaY, modifiers } = (body ?? {}) as PointSpec & { deltaX?: number; deltaY?: number; modifiers?: InputModifier[] };
+      const r = await resolvePoint({ x, y, selector, entity }, 'scroll', requestRenderer);
       if ('error' in r) return bad(r.error);
+      // A scroll with no delta is a no-op wearing an action's name (S3.15). `deltaY` documents no
+      // default and the tool shape is non-strict about intent — a misspelled `dy` reaches here as
+      // nothing at all — so the pre-fix behaviour dispatched a zero-delta wheel and answered
+      // `ok:true, scrolled:{deltaX:0,deltaY:0}`. Refuse, exactly as /api/input/drag and
+      // /api/input/drag-handle refuse a zero-length gesture, and for the same reason.
+      if (!deltaX && !deltaY) {
+        return bad('scroll is a no-op: neither deltaX nor deltaY is a non-zero number, so no wheel movement would be delivered. Pass deltaY (~120 ≈ one wheel tick down, negative = up) and/or deltaX. Accepted keys: x, y, selector, entity, deltaX, deltaY, modifiers.');
+      }
       await ops.scroll(r.point.x, r.point.y, deltaX ?? 0, deltaY ?? 0, modifiers);
       return json({ ok: true, scrolled: { x: r.point.x, y: r.point.y, deltaX: deltaX ?? 0, deltaY: deltaY ?? 0, ...(modifiers?.length ? { modifiers } : {}) }, ...provenance(r.point) });
     }
@@ -289,7 +372,16 @@ export function createInputRoutes(deps: InputRouteDeps) {
             : 'no element is focused, so nothing was typed — modoki_tap the target input first, then type.',
         });
       }
-      return json({ ok: true, typed: r.typed, activeElement: r.activeElement });
+      // A SHORT insert is a failure, not a success with a small number (S3.18): `typed` is now the
+      // MEASURED delta of the focused element's value, and Chromium's synthetic char path silently
+      // drops anything it cannot express as a keyCode (CJK, emoji, accented letters). Reporting
+      // ok:true there is the same false success the readOnly case was fixed for.
+      if (r.error) {
+        return json({ ok: false, typed: r.typed, requested: text.length, activeElement: r.activeElement,
+          ...(r.valueAfter !== undefined ? { valueAfter: r.valueAfter } : {}), error: r.error });
+      }
+      return json({ ok: true, typed: r.typed, activeElement: r.activeElement,
+        ...(r.valueAfter !== undefined ? { valueAfter: r.valueAfter } : {}) });
     }
 
     if (urlPath === '/api/input/focus') {
@@ -321,7 +413,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // the result to {id,x,y} and DROPPED them, so tap/drag fired unconditionally: an off-screen
       // handle taps nothing, an occluded one hits the covering element, a disabled one is inert, and
       // all three returned ok:true. (F1)
-      type ResolvedHandle = { id: string; x: number; y: number; onScreen?: boolean; occludedBy?: string; meta?: { disabled?: boolean } };
+      type ResolvedHandle = { id: string; x: number; y: number; onScreen?: boolean; occludedBy?: string; occlusionChecked?: boolean; meta?: { disabled?: boolean } };
       const resolve = async (id: string) => {
         const res = (await requestRenderer('enact-handles', { ids: [id] })) as { handles?: ResolvedHandle[] } | null;
         return res?.handles?.find((x) => x.id === id) ?? null;
@@ -338,20 +430,43 @@ export function createInputRoutes(deps: InputRouteDeps) {
       if (!from) return json({ error: `no live handle with id '${h.id}' (query /api/enact-handles to list current handles)` }, 404);
       const fromBlocked = blockedReason(from);
       if (fromBlocked) return json({ ok: false, error: `handle '${h.id}' is ${fromBlocked}`, handle: { id: h.id, x: from.x, y: from.y, onScreen: from.onScreen ?? true } });
+      // S3.17 — `occluded` means the SAME thing here as on every other aimed route: a BOOLEAN,
+      // always present, with the covering element's identity in `occludedBy`. The handle routes
+      // used to emit `occluded` as a STRING naming the cover and omit it when clean, so a caller
+      // written against tap/drag/hover/pointer read a truthy string as "occluded: yes" only by
+      // accident and could not branch on the absent case at all.
+      //
+      // …but `occluded` must not be ASSERTED when the check never ran (independent review,
+      // 2026-07-30). Deriving it from `occludedBy !== undefined` alone reported
+      // `occluded:false, occludedBy:null` — an affirmative "nothing covers this" — for every
+      // handle whose provider supplies no owning element, and NO Canvas2D/SVG provider does. So
+      // every keyframe / bone / vertex / gizmo handle claimed a clean occlusion check that had not
+      // happened. Before S3.17 the field was simply absent (absent = unknown), so the
+      // normalisation turned a silence into a wrong answer.
+      //
+      // `computeHandles` already distinguishes the two with `occlusionChecked`; this just has to
+      // honour it. `occluded:null` = not checked, and `occlusionChecked` says so explicitly —
+      // mirroring `occlusionScope` on the entity-aim path, where the same "how far can this
+      // guarantee see" question is answered rather than implied.
+      const occlusion = (hd: ResolvedHandle): Record<string, unknown> => (
+        hd.occlusionChecked
+          ? { occluded: hd.occludedBy !== undefined, occludedBy: hd.occludedBy ?? null, occlusionChecked: true }
+          : { occluded: null, occludedBy: null, occlusionChecked: false }
+      );
       if (urlPath === '/api/input/tap-handle') {
         await ops.tap(from.x, from.y, { button: h.button, clickCount: h.clickCount, modifiers: h.modifiers });
-        return json({ ok: true, tappedHandle: { id: h.id, x: from.x, y: from.y }, ...(from.occludedBy ? { occluded: from.occludedBy } : {}) });
+        return json({ ok: true, tappedHandle: { id: h.id, x: from.x, y: from.y }, ...occlusion(from) });
       }
       // drag-handle: destination is an explicit to{}, another handle (toId), or from+delta.
       let to: { x: number; y: number } | null = h.to ?? null;
-      let toOccluded: string | undefined;
+      let toHandle: ResolvedHandle | null = null;
       if (!to && h.toId) {
         const t = await resolve(h.toId);
         if (!t) return json({ error: `no live handle with toId '${h.toId}'` }, 404);
         const tBlocked = blockedReason(t);
         if (tBlocked) return json({ ok: false, error: `toId handle '${h.toId}' is ${tBlocked}`, handle: { id: h.toId, x: t.x, y: t.y, onScreen: t.onScreen ?? true } });
         to = { x: t.x, y: t.y };
-        toOccluded = t.occludedBy;
+        toHandle = t;
       }
       if (!to && h.delta) to = { x: from.x + h.delta.dx, y: from.y + h.delta.dy };
       if (!to) return bad('provide to{x,y}, toId, or delta{dx,dy}');
@@ -367,8 +482,19 @@ export function createInputRoutes(deps: InputRouteDeps) {
         });
       }
       await ops.drag({ x: from.x, y: from.y }, to, { steps: h.steps, button: h.button, modifiers: h.modifiers });
-      const occluded = from.occludedBy ?? toOccluded;
-      return json({ ok: true, draggedHandle: { id: h.id, from: { x: from.x, y: from.y }, to }, ...(occluded ? { occluded } : {}) });
+      // PER ENDPOINT, mirroring /api/input/drag's fromTarget/toTarget: collapsing the two into one
+      // `occluded` field left the caller unable to tell WHICH end was covered — and a covered
+      // destination and a covered source call for different fixes. `toTarget` is reported only for
+      // a `toId` destination (a raw to{x,y} or a delta has no handle to inspect).
+      return json({
+        ok: true,
+        draggedHandle: { id: h.id, from: { x: from.x, y: from.y }, to },
+        fromTarget: { id: h.id, ...occlusion(from) },
+        ...(toHandle ? { toTarget: { id: h.toId, ...occlusion(toHandle) } } : {}),
+        // Kept for callers written against the old shape: true when EITHER end is covered.
+        occluded: from.occludedBy !== undefined || toHandle?.occludedBy !== undefined,
+        occludedBy: from.occludedBy ?? toHandle?.occludedBy ?? null,
+      });
     }
 
     return null;

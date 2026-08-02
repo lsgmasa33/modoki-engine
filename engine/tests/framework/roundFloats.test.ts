@@ -80,7 +80,10 @@ describe('roundFloats — deep, and non-mutating', () => {
   });
 
   it('does not rebuild exotic objects into {}', () => {
-    class Rect { constructor(public x = 1.23456789012) {} }
+    class Rect {
+      x: number;
+      constructor(x = 1.23456789012) { this.x = x; }
+    }
     const src = { r: new Rect(), d: new Date(0) };
     const out = roundFloats(src, 9);
     expect(out.r).toBeInstanceOf(Rect);

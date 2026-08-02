@@ -19,6 +19,7 @@ vi.mock('../../src/runtime/ui/UINode', () => ({
 }));
 
 import { UIRenderer } from '../../src/runtime/ui/UIRenderer';
+import { isPointerBlocked, clearPointerBlockers } from '../../src/runtime/core/pointerBlockers';
 
 // jsdom has no ResizeObserver — install a controllable fake that records instances.
 class FakeRO {
@@ -38,6 +39,7 @@ afterEach(() => {
   cleanup();
   delete (HTMLElement.prototype as { clientWidth?: number }).clientWidth;
   delete (HTMLElement.prototype as { clientHeight?: number }).clientHeight;
+  clearPointerBlockers();
 });
 
 function sizeDom(w: number, h: number) {
@@ -58,7 +60,9 @@ describe('UIRenderer', () => {
     const root = container.firstElementChild as HTMLElement;
     expect(root).not.toBeNull();
     expect(root.style.position).toBe('absolute');
-    expect(root.style.inset).toBe('0');
+    // jsdom 30 normalizes a zero <length> to '0px'; jsdom 26 echoed '0'. The assertion is that
+    // the overlay is pinned to all four edges, not how the environment stringifies zero.
+    expect(root.style.inset).toMatch(/^0(px)?$/);
     expect(root.style.pointerEvents).toBe('none'); // root passes events through to nodes
     expect(root.style.overflow).toBe('hidden');
     expect(root.querySelectorAll('[data-testid=uinode]').length).toBe(2);
@@ -90,5 +94,30 @@ describe('UIRenderer', () => {
     expect(FakeRO.instances[0].observe).toHaveBeenCalledTimes(1);
     unmount();
     expect(FakeRO.instances[0].disconnect).toHaveBeenCalled();
+  });
+
+  describe('pointer-block registration', () => {
+    it('registers its root as a pointer-block root in runtime mode (no onSelectEntity)', () => {
+      h.tree.current = [{ entityId: 1 }];
+      const { container } = render(<UIRenderer />);
+      const root = container.firstElementChild as HTMLElement;
+      expect(isPointerBlocked(root)).toBe(true);
+    });
+
+    it('does NOT register when onSelectEntity is set — the editor SceneView preview must never claim the running game pointer', () => {
+      h.tree.current = [{ entityId: 1 }];
+      const { container } = render(<UIRenderer onSelectEntity={() => {}} />);
+      const root = container.firstElementChild as HTMLElement;
+      expect(isPointerBlocked(root)).toBe(false);
+    });
+
+    it('unregisters on unmount', () => {
+      h.tree.current = [{ entityId: 1 }];
+      const { container, unmount } = render(<UIRenderer />);
+      const root = container.firstElementChild as HTMLElement;
+      expect(isPointerBlocked(root)).toBe(true);
+      unmount();
+      expect(isPointerBlocked(root)).toBe(false);
+    });
   });
 });

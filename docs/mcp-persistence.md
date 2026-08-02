@@ -1,71 +1,70 @@
-# MCP persistence — one live-world path + explicit save
+# MCP persistence — manual-only
 
-**Status: landed** (all phases). This doc is the durable design reference the implementation
-cites by path; the phased checklist that got it here is gone (git history has it) — see
-`docs/doc-conventions.md`'s plan lifecycle for why this file exists instead of a deleted
-`docs/plans/` tracker.
+**A live edit never reaches disk on its own. `modoki_save_all` is the only thing that writes.**
 
-**Goal:** an agent can make a change that exists **only in the running editor's memory** —
-try it, look at it, iterate, revert it — and the file on disk changes only when someone
-explicitly saves. A human can **Cmd-Z an agent's edit** the same way they'd undo their own.
+## What this is, and what changed
 
-## 1. The problem this replaced
+There used to be two modes. `auto` (the default) made every live mutation ALSO save to disk;
+`manual` parked it until an explicit save. **`auto` was removed on 2026-07-30** (owner decision), so
+there is now exactly one behaviour.
 
-Persistence used to be an **accident of which backend route a tool happened to call**, not a
-policy — two disjoint paths with no way to choose between them:
+**Why:** two modes meant the same tool call did different things depending on a flag set in an
+earlier turn, and the agent-facing symptom — *"did that save or not?"* — could only be resolved by
+asking. One predictable behaviour is worth more than the convenience of the other. `modoki_persistence`
+is now a **read**; passing `mode` returns a 400 rather than being silently ignored, because a caller
+who believes it re-enabled auto-save would lose work when nothing saved.
 
-- **File-direct** — `modoki_mutate_scene`/`modoki_set_transform` → `/api/scene-mutate` →
-  `writeJsonAtomic` → the file watcher hot-reloads the editor from disk. Particle/anim/timeline
-  ops applied live then always persisted via `/api/asset-write`. Always saved. Never undoable.
-- **Live-world** — `create_entity`/`duplicate_entity`/`delete_entities`/`reparent_entity`/
-  `prefab` → `/api/editor-action` → `registerAgentOp` handlers → the in-memory ECS/editor
-  store, via the same `*WithUndo` helpers the menus use. Never saved until `save_all`.
+**The per-call `save?: boolean` param is IGNORED.** It survives on every mutating tool's schema so
+existing callers don't break. It was documented for two years as "reserved… NOT YET HONORED", which
+is worse than either honouring or removing it; treat it as removed.
 
-The two interlocked badly: `/api/scene-mutate` refused with a 409 whenever the editor had
-*any* unsaved live work (a `create_entity` not yet saved), because writing the file would
-hot-reload the scene and destroy that unsaved work. So the moment any live-only edit existed,
-every file-direct tool started refusing.
+## The contract
 
-## 2. The design
+| Tools | Effect |
+|---|---|
+| `mutate_scene`, `set_transform` | apply to the LIVE world as **one undoable step** (a human can Cmd-Z the whole call); `saved:false` + a hint naming `save_all`. An `addEntity` op also returns `created:[{op, id, guid, name}]` (S3.12) — from BOTH the live and file paths — so the caller addresses what it just made by GUID instead of re-finding it by name, which this surface refuses when the name is ambiguous |
+| `particle_set`, `anim_set_clip`, `anim_add_key`, `timeline_set`, `timeline_add_clip` | apply live, park the disk write in the **dirty-asset registry** (`get_editor_state.dirtyAssetPaths`); each is UNDOABLE, with `_isFileDirect` so an asset-only edit still does not dirty the scene (S2.27) |
+| `create_entity`, `duplicate_entity`, `delete_entities`, `reparent_entity`, `prefab` | live-only — unchanged; this split predates the mode knob |
+| `write_asset`, `create_asset`, `import_file`, `reimport_asset` | always write — explicit "write this file" tools |
+| `save_all` | serializes the live scene **and** flushes every pending dirty asset |
+| `discard_asset_edits` | the counterpart to `save_all` for the registry: drops parked asset writes **without** writing them. Names `paths`, or `all:true`; a bare call is refused (dropping everything is unrecoverable — the `set_selection` lesson). Drops the WRITE, not the edit: the editor cache keeps the applied def until the asset reloads |
 
-**One live-world path.** Every mutating MCP tool applies to the **in-memory editor world**
-where it safely can, and pushes an undo entry. `modoki_save_all` remains the only thing that
-writes scene state to disk.
+**`save_all` never silently drops a pending asset:** an entry that fails to write stays in the
+registry (so `hasUnsavedChanges()` remains true) and is reported in `assets.failed`.
 
-**Two knobs:**
+## The file-direct path is NOT `auto` coming back
 
-- **Session mode** — `modoki_persistence({mode?})`: `auto` (default, saves after each
-  mutation) or `manual` (memory only). Set once per session; reported in
-  `modoki_get_editor_state.persistenceMode`.
-- **Per-call override** — a `save?: boolean` param exists on every mutating tool's schema,
-  reserved for a future per-call override of the session mode. **Not yet honored** — landed as
-  API surface so a later change doesn't need a schema migration, but only the session mode
-  currently does anything.
+With no renderer connected, or a call targeting a scene FILE that isn't the one open live, or an op
+that is `setBaseScene` (no live-world equivalent — it changes what the scene *loads*, not any live
+entity's state), the call writes the file. Not because a mode says so, but because **there is no
+live world to hold the edit**. This keeps the browser-free curl-editing path working.
 
-**Every mutating tool's result carries `saved: true|false`** so an agent is never guessing
-whether a change reached disk.
+So `mutate_scene` still reports `saved: true` sometimes. Trust `saved` and `mode` in the result over
+assuming which path a call took.
 
-Full behavioural detail (the mode table, the `dirtyAssetPaths` field, which tools are
-unaffected) lives in `docs/debug-tools-mcp.md`'s "Persistence modes" section — that's the
-single source of truth for *what each tool does*; this doc is *why the mechanism works the way
-it does*.
+## Consequences of manual-only (accepted with the decision)
 
-## 3. `mutate_scene`/`set_transform` — live path with a file-direct fallback
+`unsavedChanges: true` is the normal state after any agent edit, and three gates key off it. All
+three were rare under `auto` and are routine now:
 
-`modoki_mutate_scene`'s live path only exists when a renderer is connected **and** its active
-scene matches the one the call targets — the live world only ever represents ONE scene, so
-targeting a different scene file (or running headless, e.g. the documented curl-editing
-workflow) falls back to the original file-direct write, unchanged. This fallback is not a
-missing feature — CLAUDE.md documents `/api/scene-mutate` as a browser-free editing surface,
-and breaking that would be a regression, not a improvement.
+- **`modoki_build` REFUSES** while unsaved — it reads the FILE, so the artifact would miss the work.
+- **A file-direct `mutate_scene` 409s** while unsaved — its write hot-reloads the scene and would
+  destroy live-only work.
+- **A game-code (`.ts`) edit force-reloads the editor and DISCARDS unsaved scene edits** after a 5s
+  countdown (CLAUDE.md). This is the sharpest one: accumulated unsaved work is more exposed than it
+  was under `auto`.
 
-**`setBaseScene` has no live-world equivalent** — it changes what the scene *loads*, not any
-live entity's state — so a call containing it always stays file-direct regardless of mode or
-which scene is open. `agentEditorOps.ts`'s `apply-scene-ops` op refuses it defensively too
-(belt-and-braces for any caller that reaches it some other way), but the router is what
-actually keeps such a call off the live path.
+Therefore: `save_all` before a build, before a scene swap, and before editing game code.
 
-## 4. The composite undo primitive (the hard part)
+## Where it lives
+
+- `PERSISTENCE_MODE` + the live-apply branch — `engine/plugins/backend/editorBackendRouter.ts`
+- the dirty-asset registry — `engine/packages/modoki/src/editor/scene/dirtyAssets.ts`
+- `persistOrMarkDirty` (always parks) — `engine/app/editor/agentEditorOps.ts`
+- tests — `engine/tests/plugins/persistenceRouter.test.ts`, `engine/tests/editor/dirtyAssets.test.ts`,
+  `engine/tests/editor/agentPersistence.test.ts`
+
+## The composite undo primitive (the hard part)
 
 Collapsing an N-op `mutate_scene` call into ONE undo entry needed a real primitive, not the
 pre-existing `coalesceKey` (time-windowed coalescing for repeated edits to the SAME field —
@@ -119,6 +118,35 @@ injects `_persistenceMode` into the params of exactly these five ops before forw
 
 `write_asset`/`create_asset` are deliberately unaffected by the mode: they're explicit "write
 this file" tools, not live-state edits.
+
+### Abandoning a parked write — `discard_asset_edits`
+
+The registry originally had exactly ONE exit, `saveAll`, so an exploratory asset edit could not be
+backed out. The obvious workaround — re-apply the previous def — **is not an undo**, and both ways
+it differs were measured on `confetti.particle.json`:
+
+- it **re-parks a write**, so the doc stays dirty and the next `save_all` commits it; and
+- the def a caller can read back is the **migrated** one, so a committed legacy `"gravity": 6` is
+  rewritten as `[0,-6,0]`.
+
+That is how the live smoke suite (`test-smoke.mjs` UC6) came to modify a committed game asset while
+reporting that it had restored it — its check compared only the field it had changed, and the
+residue surfaced one `save_all` later. `discardDirtyAssets` is the missing exit, and UC6 now uses
+it, so running the live gate leaves the working tree unchanged the way the e2e suite does.
+
+Scope is deliberately narrow: it drops the pending WRITE, not the edit. The panel and viewport are
+already showing the applied def and snapping them back would be a second surprise, so the live cache
+keeps it until the asset reloads. To revert the value too: apply the previous def, **then** discard
+the write that re-parked.
+
+## The unsaved-work refusal names WHICH kind (S3.11)
+
+`load_scene` / `new_scene` swap the world, so they refuse while `hasUnsavedChanges()` is true. That
+function has **two independent causes** — a dirty scene edit-version and a pending asset write — and the
+refusal used to blame only the first, naming `create_entity`/`duplicate_entity`/`prefab`. An agent whose
+only unsaved work was a parked particle edit went looking for live entities it had never created. The
+message is now built from `unsavedChangeCauses()` and lists `getDirtyAssetPaths()` when non-empty, so
+`force:true` tells you what it would discard. Both causes still clear with one `save_all`.
 
 ## 6. Prior fix this generalizes
 

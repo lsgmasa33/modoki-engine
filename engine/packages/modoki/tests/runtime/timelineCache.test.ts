@@ -11,7 +11,12 @@ import { getTimeline, loadTimelineNow, invalidateTimeline, setTimeline, clearTim
 import { normalizeTimeline } from '../../src/runtime/timeline/types';
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
-const okResponse = (body: unknown) => ({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(body) });
+// text() as well as json(): the loaders read the body as TEXT so they can spot Vite's index.html
+// SPA fallback and report a MISSING asset instead of a JSON syntax error.
+const okResponse = (body: unknown) => {
+  const text = typeof body === 'string' ? body : JSON.stringify(body);
+  return { ok: true, status: 200, statusText: 'OK', text: () => Promise.resolve(text), json: () => Promise.resolve(body) };
+};
 const httpError = (status: number) => ({ ok: false, status, statusText: 'err', json: () => Promise.reject(new Error('no body')) });
 const DEF = { id: 'plain-id', name: 'A', duration: 2, frameRate: 30, tracks: [] };
 

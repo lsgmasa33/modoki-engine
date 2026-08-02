@@ -5,6 +5,7 @@
  *  state from the debug menu is deliberately out of scope. Mirrors StoreTab. */
 
 import { useEffect, useState, type CSSProperties } from 'react';
+import { fillRootStyle, fillRegionStyle } from '../tabLayout';
 import { PlayerPrefs } from '../../storage';
 
 const REFRESH_MS = 250;
@@ -24,7 +25,7 @@ export function PlayerPrefsTab() {
     .sort((a, b) => a.localeCompare(b));
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+    <div style={fillRootStyle()}>
       <input type="text" placeholder="filter…" value={filter} onChange={(e) => setFilter(e.target.value)} style={inputStyle} />
       <div style={listStyle}>
         {keys.length === 0 ? (
@@ -58,7 +59,7 @@ function formatPrefValue(v: unknown): string {
 }
 
 const inputStyle: CSSProperties = { background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.15)', borderRadius: 4, color: '#e6e6ff', fontSize: 12, padding: '3px 6px' };
-const listStyle: CSSProperties = { maxHeight: 260, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 2, fontSize: 12 };
+const listStyle: CSSProperties = { ...fillRegionStyle, display: 'flex', flexDirection: 'column', gap: 2, fontSize: 12 };
 const rowStyle: CSSProperties = { display: 'flex', justifyContent: 'space-between', gap: 8, padding: '2px 4px', borderRadius: 3, background: 'rgba(255,255,255,0.03)' };
 const nameStyle: CSSProperties = { color: '#8b8ba7', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
 const valueStyle: CSSProperties = { color: '#e6e6ff', fontVariantNumeric: 'tabular-nums', textAlign: 'right', flexShrink: 0, maxWidth: '55%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };

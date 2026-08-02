@@ -15,13 +15,87 @@
  *
  *  See `docs/mcp-response-budget.md` Phase 7. */
 
-/** ~15k tokens, matching the modoki-mcp cap. */
-export const MAX_TEXT_CHARS = 60_000;
+// The cap, `capText`, `encode` and `isFailureBody` are SHARED with the editor MCP server — one
+// implementation, because a rule implemented twice diverges (conventions §9). This file keeps only
+// what is genuinely device-specific: eval serialization, screenshots, MIME extensions.
+export { isFailureBody } from '../../shared/mcpResult.js';
+export { ERROR_CODES, type ErrorCode, type ToolErrorDetail } from '../../shared/mcpResult.js';
+import {
+  MAX_PAYLOAD_CHARS, capText as sharedCapText, encode, encodeError,
+  type ToolErrorDetail,
+} from '../../shared/mcpResult.js';
+
+// ── Failures: the §5 envelope, device edition ────────────────────────────────
+// `docs/mcp-tool-conventions.md` §5. Before this, every device tool ended in
+// `catch (e) { text: `Error: ${e.message}` }` — literally the "it didn't work" shape the audit
+// exists to remove. The message that mattered most ("no device connected — connect in the AI
+// panel") was in there, but flattened to the same anonymous prose as a wedged socket or a typo'd
+// selector, with no code to branch on and no next move spelled out.
+//
+// This server registers tools directly with `server.tool(...)` (it has no `registerAll` indirection
+// like the editor server), so `tool` is passed EXPLICITLY at each site rather than stamped centrally.
+
+export type DeviceResult = { content: Array<{ type: 'text'; text: string }>; isError?: boolean };
+
+/** The one failure constructor for this server. */
+export function deviceFail(detail: ToolErrorDetail): DeviceResult {
+  return { content: [{ type: 'text', text: encodeError(detail) }], isError: true };
+}
+
+/** Turn a THROWN transport error into an envelope, classified by what actually went wrong.
+ *  All three cases used to arrive as the same `Error: <message>` string. */
+export function caughtFailure(tool: string, what: string, e: unknown): DeviceResult {
+  const msg = e instanceof Error ? e.message : String(e);
+  // The backend is up but holds no lease — by far the most common failure, and the only one with a
+  // precise remedy. Reported as anonymous prose it read as "the tool is broken".
+  if (/no device connected/i.test(msg)) {
+    return deviceFail({
+      code: 'NOT_AVAILABLE_HERE',
+      tool, what,
+      why: `Modoki holds no device lease, so there is no device to talk to (${msg}).`,
+      options: [
+        'the HUMAN connects the device deliberately: editor AI panel → "Connect a Device" (device IP from the debug menu, or adb)',
+        'device_connect {ip} / {useAdb:true} opens the lease from here',
+        'device_status reports the current lease state',
+      ],
+    });
+  }
+  if (/can't reach the modoki backend/i.test(msg)) {
+    return deviceFail({
+      code: 'NOT_AVAILABLE_HERE',
+      tool, what,
+      why: msg,
+      options: [
+        'start this clone\'s editor: engine/scripts/launch-editor.sh games/<id>',
+        'each clone pins its own backend port (main=5179, work-ai=5180, work-ai2=5181) — check MODOKI_BACKEND',
+      ],
+    });
+  }
+  return deviceFail({
+    code: 'NOT_AVAILABLE_HERE',
+    tool, what,
+    why: `the request to the device failed: ${msg}`,
+    options: ['device_status — confirm the lease is still held', 'the device app may have been backgrounded or killed; relaunch it and reconnect'],
+  });
+}
+
+/** The device answered, but its reply is an `Error: …` STRING rather than a thrown error — a
+ *  selector miss, an occluded target, no canvas. A refusal by the op, not a transport failure. */
+export function deviceReplyFailure(tool: string, what: string, reply: unknown, options?: string[]): DeviceResult {
+  return deviceFail({
+    code: 'REFUSED_BY_OP',
+    tool, what,
+    why: `the device refused: ${String(reply)}`,
+    ...(options ? { options } : {}),
+  });
+}
+
+/** ~15k tokens. Re-exported under the device server's historical name so call sites are unchanged. */
+export const MAX_TEXT_CHARS = MAX_PAYLOAD_CHARS;
 
 /** Truncate plain text, saying how much was dropped. */
 export function capText(text: string, maxChars: number = MAX_TEXT_CHARS): string {
-  if (text.length <= maxChars) return text;
-  return text.slice(0, maxChars) + `\n…[${text.length - maxChars} chars elided of ${text.length}]`;
+  return sharedCapText(text, maxChars);
 }
 
 /** Serialize a `device_eval` result: compact, bounded, and never `[object Object]`.
@@ -39,13 +113,18 @@ export function encodeEvalResult(result: unknown, maxChars: number = MAX_TEXT_CH
   return capText(text, maxChars);
 }
 
-/** Encode a structured op result (Percept: `scene-state`/`diagnose`/`journal`/…) as pretty, bounded
- *  JSON. The ops are already summary-first (index mode, tails, per-field stats), so the cap is a
- *  backstop, not the primary limiter. A string passes through (a device may hand back a bare reply). */
+/** Encode a structured op result (Percept: `scene-state`/`diagnose`/`journal`/…): COMPACT and
+ *  bounded, via the shared encoder. A string passes through (a device may hand back a bare reply).
+ *
+ *  This used to `JSON.stringify(value, null, 2)` and then `capText` the result — two defects the
+ *  shared module fixes: the pretty-print paid ~40% indentation overhead on every device Percept
+ *  response, and capping JSON by characters MID-SLICES IT, producing a blob that neither
+ *  `JSON.parse` nor the model can read. Over the cap the shared encoder emits a valid
+ *  `{elided:true, bytes, hint, preview}` envelope instead. */
 export function encodeStructuredResult(value: unknown, maxChars: number = MAX_TEXT_CHARS): string {
   if (typeof value === 'string') return capText(value, maxChars);
   try {
-    return capText(JSON.stringify(value, null, 2) ?? String(value), maxChars);
+    return encode(value, maxChars);
   } catch (e) {
     return `[unserializable result: ${e instanceof Error ? e.message : String(e)}]`;
   }

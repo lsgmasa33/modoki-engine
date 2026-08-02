@@ -1,8 +1,9 @@
 /** Prefab system — save, load, and instantiate prefab entity trees. */
 
 import { getCurrentWorld, registerEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
+import { validatePrefabData } from '../../runtime/loaders/sceneValidation';
 import { backendFetch } from '../backend/editorBackend';
-import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
+import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, readTraitDataFull, writeTraitField, findEntity, subtreeIds, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { Transient } from '../../runtime/traits/Transient';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
@@ -10,8 +11,27 @@ import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../.
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { invalidatePrefab } from '../../runtime/loaders/meshTemplateCache';
 import { markOverride, clearOverrideMarks, getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
+import { isPersistentTraitField, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
 import type { AddedEntity, NestedOverridePaths } from '../../runtime/loaders/loadSceneFile';
 import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, prefabSubtreeLocalIds, deriveInstanceMemberGuids, applyStructureCore } from '../../runtime/loaders/loadSceneFile';
+
+/** Fields that persist in a SCENE but must never be baked into a prefab TEMPLATE,
+ *  keyed "Trait.field".
+ *
+ *  `EntityAttributes.editorFolder` is the Hierarchy grouping tag — where the author
+ *  filed THIS entity in THIS scene, with no runtime effect. A template inheriting it
+ *  would drop every future instance into one author's folder. It is excluded here
+ *  DELIBERATELY and by name; it used to be excluded by accident, as collateral of the
+ *  `meta.fields` gate that also lost `Animator.clips` (see traitSchema.ts). `guid` is
+ *  handled separately below — it is rewritten, not dropped. */
+const SCENE_ONLY_TEMPLATE_FIELDS = new Set(['EntityAttributes.editorFolder']);
+
+/** True when a live field must be kept OUT of a written prefab template: pure
+ *  runtime read-back, or a scene-only organizational field. Shared by both paths
+ *  that write a template — creating a prefab, and applying overrides back into one. */
+function isTemplateExcludedField(meta: TraitMeta, field: string): boolean {
+  return isRuntimeOnlyField(meta, field) || SCENE_ONLY_TEMPLATE_FIELDS.has(`${meta.name}.${field}`);
+}
 
 // ── Types ───────────────────────────────────────────────
 
@@ -170,20 +190,21 @@ export function serializePrefab(selectedEntityId: number, existingId?: string): 
       }
 
       // O(1) direct read — was a full-world query.updateEach per trait (O(n²) over
-      // the scene). AoS traits (function/undefined schema, e.g. AnimationLibrary's
-      // animSets/boneMaps) need the FULL live-key read so their non-scalar fields
-      // persist into the prefab file; SoA traits keep the curated meta.fields read so
-      // a prefab stays a clean delta (full-schema serialize is the SCENE path's job).
-      const aos = typeof (meta.trait as { schema?: unknown }).schema !== 'object';
-      const traitData = aos ? readTraitDataFull(entityInfo.id, meta) : readTraitData(entityInfo.id, meta);
+      // the scene). Read what the trait PERSISTS (its koota schema), the same rule
+      // the override paths use: AoS traits need it for their non-scalar fields
+      // (AnimationLibrary's animSets/boneMaps), and SoA traits need it for a schema
+      // field a custom Inspector section owns — Animator.clips/clip, which the old
+      // curated read dropped, so Create Prefab produced a template with an EMPTY
+      // clip bank. See runtime/core/ecs/traitSchema.ts.
+      const traitData = readTraitDataFull(entityInfo.id, meta);
 
       if (traitData) {
-        // Drop pure runtime read-back fields (e.g. Time.elapsed, RigidBody.isSleeping,
-        // SkeletalAnimator.activeClip/time/weight) — like the scene serialize path
-        // (serialize.ts). Otherwise creating a prefab from a live/animating entity
-        // bakes a nondeterministic frame snapshot into the .prefab.json.
+        // Drop what a TEMPLATE must not carry: runtime read-back (Time.elapsed,
+        // RigidBody.isSleeping, SkeletalAnimator.activeClip/time/weight — otherwise
+        // creating a prefab from an animating entity bakes a nondeterministic frame
+        // in) and scene-only organizational fields.
         for (const key of Object.keys(traitData)) {
-          if (meta.fields[key]?.runtimeOnly) delete (traitData as Record<string, unknown>)[key];
+          if (isTemplateExcludedField(meta, key)) delete (traitData as Record<string, unknown>)[key];
         }
         // Remap parentId from ECS IDs to localIds (parentId is in EntityAttributes).
         // Clear `guid` — prefab files are templates; per-instance identity lives on
@@ -769,19 +790,28 @@ export function captureInstanceOverrides(
     const localId = piData.localId as number;
     if (!localId) return;
 
-    // Snapshot live trait data for comparison. AoS traits (function/undefined schema)
-    // need the FULL live-key read so their non-scalar fields — AnimationLibrary's
+    // Snapshot live trait data for comparison. Read what the trait PERSISTS (its
+    // koota schema), exactly as serializeScene does — NOT the meta.fields subset.
+    // AoS traits need it for their non-scalar fields (AnimationLibrary's
     // animSets/boneMaps, SkinnedMeshRenderer's materials, UIAction's onClickSet —
-    // survive the override capture instead of being dropped by the meta.fields-only
-    // read (the bone-map-lost-on-save bug). SoA traits keep the curated read (their
-    // override deltas are over scalar fields). Tags: both reads return {} for a tag
-    // the entity has (null if absent), so an added tag shows up as `{name: {}}`.
+    // the bone-map-lost-on-save bug), and SoA traits need it too: a schema field
+    // can be absent from meta.fields because a custom Inspector section owns it
+    // (Animator.clips/clip) or it has no row at all (EntityAttributes.editorFolder),
+    // and the curated read made those invisible to the diff, so a save dropped them.
+    // runtimeOnly fields are excluded here — live read-back (Animator.activeClip,
+    // SkeletalAnimator.time) must never be frozen into a file as an override, and
+    // excluding it at the READ means no later path can resurrect it. Tags: the read
+    // returns {} for a tag the entity has (null if absent), so an added tag shows up
+    // as `{name: {}}`. See runtime/core/ecs/traitSchema.ts.
     const currentTraits: Record<string, Record<string, unknown>> = {};
     for (const meta of allTraits) {
       if (meta.name === 'PrefabInstance') continue;
-      const aos = typeof (meta.trait as { schema?: unknown }).schema !== 'object';
-      const data = aos ? readTraitDataFull(entity.id(), meta) : readTraitData(entity.id(), meta);
-      if (data) currentTraits[meta.name] = data;
+      const data = readTraitDataFull(entity.id(), meta);
+      if (!data) continue;
+      for (const field of Object.keys(data)) {
+        if (isRuntimeOnlyField(meta, field)) delete data[field];
+      }
+      currentTraits[meta.name] = data;
     }
 
     const diffs = getOverrideValues(localId, currentTraits, prefab);
@@ -873,17 +903,14 @@ export function applyOverridesByRootInstance(
         markOverride(ecsId, traitName, '');
         continue;
       }
-      // AoS traits (function/undefined schema) carry non-scalar fields NOT in
-      // meta.fields (AnimationLibrary.animSets/boneMaps, etc.) — don't drop them on a
-      // prefab-refresh re-apply. SoA keeps the guard (skip a stale/renamed scalar).
-      const aos = typeof (meta.trait as { schema?: unknown }).schema !== 'object';
+      // Accept any field the trait PERSISTS (its koota schema), so a re-apply keeps
+      // an AoS trait's non-scalar fields AND a SoA field that has no Inspector row
+      // (Animator.clips/clip, EntityAttributes.editorFolder). A field the schema does
+      // not declare is still skipped — that's the stale/renamed case the old guard
+      // wanted. See runtime/core/ecs/traitSchema.ts.
       const known: Record<string, unknown> = {};
       for (const [field, value] of Object.entries(fields)) {
-        // Let EntityAttributes.editorFolder through the SoA guard — it's the editor
-        // Hierarchy folder tag, a real per-instance field with no Inspector metadata
-        // (so it's absent from meta.fields). Mirrors loadSceneFile.applyOverridesByLocalToEcs.
-        const allowed = (field in meta.fields) || (meta.name === 'EntityAttributes' && field === 'editorFolder');
-        if (!aos && !allowed) {
+        if (!isPersistentTraitField(meta, field)) {
           console.debug(`[Prefab] override skipped: unknown field ${traitName}.${field}`);
           continue;
         }
@@ -1356,6 +1383,23 @@ function resolveInstanceContext(entityId: number): { source: string; rootInstanc
 
 /** Write the new prefab JSON to its source path. Tries the dev-server API
  *  first (we know the path); falls back to a save-file picker. */
+/** Warn about the inert-size trap at prefab WRITE time (#42) — a `UIElement` size authored on an
+ *  axis the anchor stretches is stored and shown in the Inspector, but never applied.
+ *
+ *  Why write time rather than load, and why this is only half the fix: docs/scene-loading.md
+ *  (pass 4). Warns, never blocks — a dead size is inert, not corrupt.
+ *
+ *  The one thing that must stay HERE, because it is invisible in the code and looks like an
+ *  obvious cleanup: call this from the AUTHORING writes only (Apply-to-Prefab, Save-as-Prefab),
+ *  never from `writePrefabFile`. That is the single choke point for prefab writes AND the
+ *  undo/redo restore path (`installPrefabSnapshot`), so hooking it warns while someone REVERTS the
+ *  value. Guarded by tests/editor/warnInertPrefabSizes.test.ts. */
+export function warnInertPrefabSizes(prefab: unknown, source: string): void {
+  for (const w of validatePrefabData(prefab).warnings) {
+    console.warn(`[Editor] ${source}: ${w}`);
+  }
+}
+
 export async function writePrefabFile(source: string, prefab: PrefabFile): Promise<boolean> {
   if (!prefab.id) prefab.id = newGuid();
   // `source` may be a GUID — resolve to the real file path before writing,
@@ -1477,6 +1521,20 @@ export interface ApplyResult {
 /** Shared no-op result so every early return is consistent. */
 const NOOP_APPLY: ApplyResult = { promotedAdditions: 0, applied: false };
 
+/** Deep-copy a live trait bag before it is written into a prefab TEMPLATE.
+ *  Mirrors `cloneTraitValues`, kept local so this module doesn't grow another
+ *  entityUtils import. Falls back to the original bag if a value refuses to
+ *  clone (a class instance, a function) — such a field can't be JSON-serialized
+ *  into a prefab anyway, so the fallback costs nothing that wasn't already lost. */
+function clonePersistable(data: Record<string, unknown> | null): Record<string, unknown> | null {
+  if (!data) return data;
+  try {
+    return structuredClone(data);
+  } catch {
+    return data;
+  }
+}
+
 export async function applyToPrefabSelective(
   rootInstanceId: number,
   selectedKeys: Set<string>,
@@ -1565,9 +1623,21 @@ export async function applyToPrefabSelective(
     if (!ecsId) continue;
     const meta = getTraitByName(traitName);
     if (!meta || meta.category === 'tag') continue;
-    if (!(fieldName in meta.fields)) continue;
+    // Accept any field the trait PERSISTS, and read the same way. Both used to key
+    // on meta.fields, so applying an override over a field owned by a custom
+    // Inspector section (Animator.clips/clip) was skipped HERE and would have read
+    // undefined anyway — "Apply to Prefab" reported success and changed nothing.
+    // See runtime/core/ecs/traitSchema.ts.
+    if (!isPersistentTraitField(meta, fieldName)) continue;
+    if (isTemplateExcludedField(meta, fieldName)) continue; // read-back / scene-only: never in a template
 
-    const liveData = readTraitData(ecsId, meta);
+    // CLONE: readTraitDataFull hands back LIVE references into the trait store, and
+    // widening the read above admitted AoS object/array fields (AnimationLibrary's
+    // animSets/boneMaps) that the meta.fields gate used to exclude. Storing one in
+    // the prefab would alias the template to THIS instance through prefabCache —
+    // editing the instance would silently rewrite the template. Scalars are
+    // unaffected; the clone is per applied field, not per frame.
+    const liveData = clonePersistable(readTraitDataFull(ecsId, meta));
     if (!liveData) continue;
     const liveValue = liveData[fieldName];
 
@@ -1577,11 +1647,15 @@ export async function applyToPrefabSelective(
     if (traitBag === true) continue; // already a tag in the prefab — nothing to set
     if (!traitBag) {
       // Added component: the prefab lacks this trait at this localId, so the user
-      // added it on the instance. Seed the prefab with the WHOLE live trait (all
-      // fields) so applying actually persists the new component — without this the
-      // trait was silently dropped (the ShipShake bug). Subsequent field keys for
-      // the same trait then overlay onto this bag.
-      traitBag = { ...liveData };
+      // added it on the instance. Seed the prefab with the WHOLE live trait so
+      // applying actually persists the new component — without this the trait was
+      // silently dropped (the ShipShake bug). Subsequent field keys for the same
+      // trait then overlay onto this bag. runtimeOnly fields are dropped: a
+      // template must not carry one instance's read-back frame.
+      traitBag = {};
+      for (const [k, v] of Object.entries(liveData)) {
+        if (!isTemplateExcludedField(meta, k)) (traitBag as Record<string, unknown>)[k] = v;
+      }
       prefabEntity.traits[traitName] = traitBag;
     }
     (traitBag as Record<string, unknown>)[fieldName] = liveValue;
@@ -1593,6 +1667,7 @@ export async function applyToPrefabSelective(
     return NOOP_APPLY;
   }
 
+  warnInertPrefabSizes(newPrefab, source);
   const ok = await writePrefabFile(source, newPrefab);
   if (!ok) return NOOP_APPLY;
 

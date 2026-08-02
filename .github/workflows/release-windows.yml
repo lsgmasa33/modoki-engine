@@ -237,6 +237,19 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           body_path: release-notes.md
+          # latest.yml is LOAD-BEARING, not an extra: with the `github` provider,
+          # electron-updater on Windows fetches latest.yml from the release assets to
+          # discover the new version. Without it every update check 404s, so an installed
+          # editor can never self-update — it was omitted here while the win-nightly step
+          # above attached it, so the nightly channel worked and every STABLE release
+          # (v0.3.0 → v0.3.5) shipped an .exe no installed editor could ever find.
+          # The macOS twin attaches its latest-mac.yml for exactly this reason.
+          #
+          # fail_on_unmatched_files: softprops' default is to WARN on an unmatched pattern,
+          # so if latest.yml ever stopped being produced this bug would come back silently.
+          # A release missing a listed asset must fail and be re-run.
+          fail_on_unmatched_files: true
           files: |
             release/*.exe
             release/*.blockmap
+            release/latest.yml

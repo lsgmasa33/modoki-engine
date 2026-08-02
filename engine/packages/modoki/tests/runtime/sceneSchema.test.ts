@@ -29,14 +29,20 @@ describe('buildSceneSchema', () => {
     const schema = buildSceneSchema();
     const fields = schema.traits['SchemaTestTrait'].fields;
 
-    // koota-only field with primitive default → inferred type
-    expect(fields.flag).toEqual({ type: 'boolean' });
-    // koota-only field with non-primitive default (array) → known but untyped
+    // koota-only field with primitive default → inferred type, and the default is
+    // PUBLISHED: scene files omit a field still holding it (serialize.ts's
+    // isTraitDefault), so a reader of a scene file needs it to know the effective value.
+    expect(fields.flag).toEqual({ type: 'boolean', default: false });
+    // koota-only field with non-primitive default (array) → known but untyped, and NO
+    // default: a non-scalar is never omitted by the serializer, so publishing it would
+    // bloat the payload for nothing.
     expect(fields.tags).toEqual({ type: undefined });
     // koota string field
-    expect(fields.label).toEqual({ type: 'string' });
-    // Inspector overlay wins for precise type
-    expect(fields.x).toEqual({ type: 'number' });
+    expect(fields.label).toEqual({ type: 'string', default: '' });
+    // Inspector overlay wins for precise type — and must CARRY THE DEFAULT FORWARD.
+    // Dropping it here would blank the default for every field that has a hint, i.e. most.
+    expect(fields.x).toEqual({ type: 'number', default: 0 });
+    // Hint-only field (absent from the koota schema) → no default to publish.
     expect(fields.color).toEqual({ type: 'color' });
     expect(fields.mode).toEqual({ type: 'enum', options: ['a', 'b'] });
   });
@@ -53,7 +59,7 @@ describe('buildSceneSchema', () => {
     });
 
     const fields = buildSceneSchema().traits['SchemaAoSTrait'].fields;
-    expect(fields.retarget).toEqual({ type: 'boolean' });
+    expect(fields.retarget).toEqual({ type: 'boolean', default: false });
     expect(fields.animSets).toEqual({ type: undefined }); // known (array) but untyped → not "unknown field"
     expect(fields.boneMaps).toEqual({ type: undefined }); // known (object) but untyped
   });

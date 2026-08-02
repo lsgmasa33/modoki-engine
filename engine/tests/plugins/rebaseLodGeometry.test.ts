@@ -25,7 +25,7 @@ afterEach(() => { fs.rmSync(tmpRoot, { recursive: true, force: true }); });
 /** Build a minimal source GLB:
  *    Root → Child node (scale = `scaleNode`) → mesh with positions `verts`
  *  The "world transform" of the mesh is `Root × Child = scaleNode`. */
-async function buildSourceGlb(absPath: string, scaleNode: [number, number, number], verts: Float32Array): Promise<void> {
+async function buildSourceGlb(absPath: string, scaleNode: [number, number, number], verts: Float32Array<ArrayBuffer>): Promise<void> {
   const { Document, NodeIO } = await import('@gltf-transform/core');
   const doc = new Document();
   const buffer = doc.createBuffer();
@@ -50,7 +50,7 @@ async function buildFlatLodGlb(
   absPath: string,
   nodeT: [number, number, number],
   nodeS: [number, number, number],
-  verts: Float32Array,
+  verts: Float32Array<ArrayBuffer>,
 ): Promise<void> {
   const { Document, NodeIO } = await import('@gltf-transform/core');
   const doc = new Document();

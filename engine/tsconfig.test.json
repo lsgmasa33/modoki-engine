@@ -1,0 +1,41 @@
+{
+  // Typechecks the ENGINE test suite (engine/tests/**), which no other config covers:
+  // tsconfig.app.json's include is ["app", "../games", "../demos"], so all 244 files here
+  // were transpiled by vitest (which does not typecheck) and never type-verified — a stale
+  // mock could drift from the real module and still pass `npm test`. See issue #23.
+  //
+  // Deliberately a SEPARATE config rather than an extra `include` on tsconfig.app.json:
+  // tests need Node types (fs/path/process in the plugin + electron + tools suites) and
+  // vitest globals, and folding those into the app program would make `node:*` resolve for
+  // browser-side app code too — exactly the ambient-leak masking documented in issue #24.
+  "compilerOptions": {
+    "target": "ES2023",
+    "useDefineForClassFields": true,
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    // vitest/globals supplies describe/it/expect/vi (test.globals is true in vite.config.ts);
+    // node is required because this suite drives build-time code, unlike the app program.
+    "types": ["vite/client", "vitest/globals", "node"],
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true
+  },
+  // `app/types` carries the ambient declarations for the Vite `define` flags
+  // (__MODOKI_EDITOR__, __MODOKI_MODULE_*) and the `virtual:modoki-*` modules. Tests reach
+  // app + engine source transitively, so without it every flag-gated file errors TS2304.
+  "include": ["tests", "app/types"]
+}

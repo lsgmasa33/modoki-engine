@@ -34,7 +34,7 @@ This is the same template + token contract the editor's **File → New Project**
 (`engine/electron/newProject.ts`). It copies `engine/templates/starter`, substitutes identity
 tokens, and mints fresh scene GUIDs → a complete, runnable hello-world project (`game.ts` ·
 `project.config.json` · `runtime/config.ts` · `runtime/setup.ts` ·
-`runtime/assets/scenes/main.json`). **Do NOT hand-write `game.ts` / config / scene JSON** —
+`runtime/assets/scenes/main.scene.json`). **Do NOT hand-write `game.ts` / config / scene JSON** —
 you'll miss the GUID/manifest/config wiring.
 
 ## Per-clone dependency bootstrap
@@ -46,6 +46,18 @@ native plugins → `dist/`) **and** `engine/scripts/bootstrap-game-deps.mjs`, wh
 `games/<id>` that is a workspace root runs its own `npm install` + `build:plugins`. A missing
 `dist/` is what makes `npm test` / the editor fail with `Failed to resolve import
 "capacitor-<x>"`. See the Two Clones section of `CLAUDE.md`.
+
+⚠️ **That same error can mean a HALF-built `dist/`, not a missing one — and the install will
+have told you it succeeded.** A plugin's `build` is `tsc && rollup`, so a `tsc` failure leaves
+`dist/esm` present and `dist/plugin.cjs.js` (the `main` entry) absent; `bootstrap-game-deps.mjs`
+swallows the per-game failure and reports a clean install. Measured 2026-08-02: the #57 dep bump
+hoisted `minimatch` 3.1.5 → 10.2.5 to the repo root, and `@types/glob@8.1.0` — pulled in
+transitively by `@gltf-transform/cli`, deprecated and frozen since glob started shipping its own
+types at v9 — still references `minimatch.IOptions`, which v10 dropped. `tsc` auto-includes every
+`@types/*` it can see, so the four plugin tsconfigs that set neither `skipLibCheck` nor `types`
+died on a package none of them import. **Check `dist/plugin.cjs.js` exists, not just `dist/`**, and
+if a plugin build fails, run it directly (`npm --prefix <pkg> run build`) — the root install hides
+the real error. Guarded now by `engine/tests/architecture/ambientTypesOptOut.test.ts`.
 
 ## Native scaffolding: auto on first build
 
@@ -91,7 +103,88 @@ it needs, pointing you at **Build → Build Support…** to install anything mis
 `JAVA_HOME`/`ANDROID_HOME` from that shared, version-strict detection, so you don't set them by hand
 the way the manual CLI recipes below do. Full detail: [editor-toolchain.md](./editor-toolchain.md).
 
+## Assets the build cannot see — why an asset ref never belongs in code
+
+The build's asset passes are **static**: they read authored DATA, never `.ts`. So an asset
+referenced only from game code is dropped, and the game is perfect in dev and broken when built.
+This is the single nastiest failure mode in the pipeline, because **dev serves every asset off
+disk** — nothing is missing until you ship.
+
+Found on `games/court`, the first project whose content is created almost entirely by game code
+rather than authored in a scene. It broke **three independent passes at once**, against a build
+whose log was clean:
+
+| Pass | What it walks | What it missed | Symptom in the build |
+|---|---|---|---|
+| Asset tree-shaker | scene → prefab → mesh → material ref graph | `PIECE_ICON` texture GUIDs, the font | no piece art, no text |
+| Asset manifest | filtered to the kept assets | same | `resolveGuidToPath` resolves nothing |
+| `detectType` | filename/dir convention | `assets/levels/index.json` typed `scene` | level manifest offered as the BOOT scene |
+
+**The fix is to author the ref, not to patch the keep-list.** Put it on a **resource trait** in
+the scene: the tree-shaker's generic sweep (`probeTraitRefs`, `engine/plugins/asset-tree-shaker.ts`)
+keeps any GUID on any trait bag that resolves in the asset index — **game-defined traits included,
+with no registration** — so the ref becomes visible automatically, gains scene validation, and
+becomes editor-editable (drag a texture onto the field to reskin).
+
+`games/<id>/asset-keep.json` is the escape hatch, and it is a **patch, not a fix**: hand-maintained,
+and nothing fails when someone forgets an entry. That is precisely why the guard below exists.
+
+**Guard**: `engine/tests/assets/codeAssetRefs.test.ts` (in `npm test`) fails on an asset ref held in
+game code, in either form — a GUID **literal**, or an imported **engine constant** such as
+`DEFAULT_FONT_GUID`. It discriminates by resolving each candidate against the real asset index: a
+GUID a real asset owns is a failure, while an **entity** GUID in code is legitimate and ignored
+(addressing a scene-authored entity from code is a normal pattern — `demos/postfx-demo` does it).
+That distinction is why this is a vitest guard rather than an ESLint rule: a static rule cannot
+consult the asset index, and a blanket "no GUID literals" rule fires on ~10 legitimate entity refs.
+
+**The other half of the trade** (#53): moving a ref off a code constant and onto an authored trait
+field buys build visibility at the price of a failure mode a code constant could not have — the
+field can be left **blank**. An empty string is neither dangling nor a literal path, so
+`assetRefIntegrity.test.ts` passes it and it surfaces only in a production build or on device.
+`engine/tests/assets/authoredAssetRefs.test.ts` closes that direction: a `(trait, field)` pair is
+**proven** an asset ref when some instance anywhere resolves to a real asset GUID, and every blank
+instance of a proven pair then fails. Legitimate blanks (an optional override slot, a field with a
+code fallback) are pinned in its `BASELINE` with a reason and a two-way staleness check — a new
+blank fails, and so does an exemption that no longer fires. The baseline is a record of what
+already existed, not an approval: shrink it, never grow it.
+
+**Companion guard — a code GUID that resolves to NOTHING**:
+`engine/tests/assets/danglingCodeGuids.test.ts`. The guard above skips unresolvable GUIDs, by
+design (its job is refs the build cannot see, not broken refs), and #70 fell through that gap: a
+`thumbnailUrl` GUID whose asset had been deleted sat in `games/3d-test/game.ts` unnoticed. Note the
+"~10 legitimate entity refs" caveat above applies to the **asset index alone** — an entity guid is
+not an asset, but it *is* defined in committed scene JSON. So resolving against asset `id`s **and**
+entity `guid`s makes "unresolvable ⇒ broken" exact rather than noisy: measured across `games/` +
+`demos/`, 2319 defined GUIDs, 33 code literals, **0** false positives. A guid minted at runtime
+(never serialised) would be the one legitimate exception; there is none today, and the guard has an
+`ALLOWED` map that demands a reason rather than a widened rule.
+
+Two things it deliberately does not reach: a GUID assembled at runtime from non-constant parts, and
+an asset fetched by PATH rather than GUID (Court's generated `levels/index.json` — a resource trait
+cannot enumerate a generated set; that needs `index.json` to become a real ID-bearing asset type).
+
+Pre-existing refs are listed in that file's `PENDING_MIGRATION`, pinned per `file:guid` and
+stale-checked both ways so the backlog can only shrink. **Verify any migration with a real
+production build** (`MODOKI_PROJECT=games/<id> npm run build -- --target web`) — `npm test` cannot
+see this class.
+
 ## Packaged editor loop (test the DMG faithfully, fast)
+
+⚠️ **Why the packaged reaper is anchored to a bundle PATH, and must stay that way.** For months,
+dev editors across every clone died at random and it read as a GPU fault. The cause was
+`killPackaged()` called with no `appDir`, reaping by the bare product name:
+
+    pkill -f "Modoki Editor"
+
+Electron passes the app name to every child in `--user-data-dir`, so that pattern matched every
+clone's DEV editor helpers (GPU/network/audio) while MISSING the main process. **That asymmetry is
+what disguised it**: the helpers died, the main process survived and dutifully logged their deaths
+with nothing to blame. Now anchored to `Modoki Editor.app/Contents/`, which keeps the machine-wide
+scope the caller wants while making a dev editor structurally unmatchable, and
+`engine/tests/architecture/reapScoping.test.ts` fails any `pkill -f` pattern under
+`engine/scripts/**` that is not anchored to `/` or `$`. `main.ts` also dumps a filtered `ps`
+snapshot on any `reason=killed`, naming the processes that could have sent it — an EMPTY list is
+itself evidence (the killer already exited). Do not "simplify" the pattern back.
 
 Three loops, three jobs — don't conflate them:
 
@@ -102,10 +195,20 @@ Three loops, three jobs — don't conflate them:
   `electron-builder --dir` to produce the REAL `Modoki Editor.app` (asar packed, workspace symlinks
   dereferenced, devDeps pruned) — it is **the DMG minus code-signing + dmg-packaging** (the only slow
   parts), so ~20–40s, not ~7 min. `test:packaged` launches it interactively (main-process logs stream
-  live); `smoke:packaged` launches headless and auto-asserts render **+ CSP** (via
-  `assert-app-csp.mjs`). This is for *checking that it packages* — a periodic fidelity check, NOT a
+  live); `smoke:packaged` launches headless and auto-asserts render, **CSP** (via
+  `assert-app-csp.mjs`), and that the app **provisioned its own pinned Node** — see "What the
+  packaged smoke asserts" below. This is for *checking that it packages* — a periodic fidelity check, NOT a
   dev environment (the `.app` serves from a FROZEN copy of engine source, so it has **no HMR** — every
   edit needs a rebuild).
+  - **Both legs pin a per-clone port, and must keep doing so.** `smoke:packaged` runs two boots — the
+    render leg, then the CSP leg — and each derives its own backend port from `clonePort.mjs`
+    (render `38600+200`, CSP `38800+200`; the CSP leg also seeds `MODOKI_VITE_PORT`). Separate
+    blocks on purpose: the legs run seconds apart against the same clone, so a shared block could
+    hand the second boot a port the just-killed first is still releasing. Until 2026-08-02 the CSP
+    leg pinned **nothing** and bound whatever was free — measured **5179/5173, the main clone's
+    editor lane** — so a throwaway smoke build could silently answer an agent's `modoki_*` calls
+    (#68). `engine/tests/architecture/clonePortHardcoding.test.ts` now fails any packaged-app
+    spawner that doesn't derive a port.
   - **Per-clone MCP-targetable packaged editor**: `editor:main:packaged` / `editor:ai:packaged` (or
     `MODOKI_BACKEND_PORT=<port> bash engine/scripts/test-packaged.sh games/<id>`) build the `.app` and
     launch it on the clone's pinned backend port — the packaged app honors `MODOKI_BACKEND_PORT`, so
@@ -118,6 +221,19 @@ Three loops, three jobs — don't conflate them:
   "dependency excluded from the package" bugs the test exists to catch. Building outside the repo is a
   deliberate correctness property — do NOT relocate the build into the project folder.
 
+⚠️ **`fs.stat` timestamps are FABRICATED for paths inside `app.asar`.** Electron's asar shim
+reports a real `size` but synthesizes the times — measured on packaged Windows (2026-08-02),
+`fs.statSync(__filename).mtimeMs` returned the current wall-clock on every launch. This silently
+broke the Vite dep-cache bust in `engine/electron/main.ts`, whose signature was
+`version:size:mtimeMs`: it never matched itself, so the packaged editor wiped and **cold
+re-optimized its whole dep graph on every boot** instead of only after an app update — the
+opposite of the intent, and it paid the cold-scan race window of #21 on every launch. The
+signature is a content hash now, guarded by
+`engine/tests/architecture/viteCacheBustSignature.test.ts`. **Never key packaged-build identity on
+a file timestamp**; hash the bytes — reading + hashing `main.cjs` measures ~0.5ms (523KB), against
+a full cold dep-optimize every launch. Measured after the fix: the wipe fires once per build and
+then never again, and boot drops 9.6s → 7.8s across relaunches.
+
 Why this loop exists: packaged-only bugs (minimal Finder PATH, asar-sealed `package.json`,
 dereferenced `@modoki/engine` symlink, pruned devDeps, PROD-only CSP) are **invisible to
 `npm run dev`** — the dev env has full PATH, live symlinks, no asar, no CSP. Static guards
@@ -128,11 +244,51 @@ catch the cheap contract regressions; the `--dir` smoke catches the env-boundary
 `engine/plugins/**`, `engine/scripts/build-web.mjs`, `engine/toolchain/**`): run
 **`npm run verify:packaged`** — it's `verify` **plus** `smoke:packaged` (build the faithful `--dir`
 `.app` + assert it renders and enforces its prod CSP). This is a **manual** gate (no pre-push hook)
-because it does a real `--dir` build + boots an editor window (~1–2 min, macOS-only) — too heavy for
+because it does a real `--dir` build + boots an editor window (~1–2 min) — too heavy for
 every `verify`. Plain `verify` already runs the cheap static packaging guards, and release CI
 (`release.yml`) runs the smoke on a tag, so `verify:packaged` is the local belt-and-suspenders for
-the env-boundary class. It stops the local dev editor and builds a throwaway `.app` on port 5188
-(outside the 5179/5180/5181 human-editor range).
+the env-boundary class.
+
+⚠️ **It runs on Windows too — it is not a macOS-only gate**, despite having been described as one
+until 2026-08-02. `smoke-packaged.sh` carries no platform table: `engine/scripts/packagedAppPaths.mjs`
+resolves the output dir, the executable (`.app/Contents/MacOS/…` vs `win-unpacked\….exe`), the
+userData/vite-cache location, and the reap mechanism (`pkill -f` vs a `Win32_Process` filter on
+`ExecutablePath`). Believing it was macOS-only is part of why a *packaged Windows* bug — the editor
+being unable to extract any provisioned toolchain — survived undetected; see "Never assume `tar` is
+bsdtar" in [editor-toolchain.md](editor-toolchain.md). Its release-time sibling
+`assert-app-renders.sh` genuinely WAS macOS-only until the same date, and `release-windows.yml`
+still has no render gate wired up (#94).
+
+It stops the local dev editor and builds a throwaway `.app` on a **per-clone port outside the
+5179/5180/5181 human-editor range** — the block and its override live in the harness port table in
+[editor.md](editor.md) § "Port selection", not restated here.
+
+### What the packaged smoke asserts
+
+Four things, and the last two exist because this gate has twice reported a cheerful result while the
+thing it was watching was broken:
+
+1. **The renderer mounted** — `entityCount > 0` from `/api/scene-state`, which relays through the
+   renderer, so a non-zero count already proves it answered.
+2. **No Vite resolve/transform error** in the dev-server log, and no renderer console error.
+3. **The app provisioned its own pinned Node.** `ensureNodeProvisioned()` catches its own failure and
+   falls back to system npm, so on a dev box — which *has* npm — a total provisioning failure is
+   invisible and every other assertion still passes. That is not hypothetical: a bare `tar` on Windows
+   resolved to Git's GNU tar, which cannot read a zip and treats `C:\…` as a remote host, so the
+   packaged Windows editor could **never** extract its toolchain while this gate printed `PASS ✅`.
+   The asymmetry that makes it worth guarding: an end user has no system Node, so what degrades
+   gracefully here is a dead build for them. The assertion compares against `PINNED_NODE.version`
+   read from `engine/toolchain/nodeProvision.ts`, so it also catches a **stale packaged build**
+   shipping an older Node than the tree pins.
+4. **Nothing leaked in from another clone.** The launch passes `--user-data-dir`, because
+   `resolveUserDataDir` scopes the profile per clone only for **dev** — packaged returns the single
+   `<appData>/Modoki Editor`, correctly assuming a shipped app is installed once. Our harnesses break
+   that assumption: four clones each build and smoke their own packaged app. Since
+   `modoki-last-scene:<project name>` is keyed by project NAME with a clone-ABSOLUTE value, a run
+   restored another clone's scene, `/@fs` correctly 403'd it, and assertion 2 failed for a reason
+   unrelated to the commit. `shouldOverrideUserData()` stands down for that switch precisely so a
+   harness can isolate itself. `assert-app-renders.sh` (the release gate) does the same.
+   Guarded by `engine/tests/architecture/packagedLaunchIsolation.test.ts`.
 
 ## CLI recipes
 
@@ -142,12 +298,16 @@ its own `games/<id>/CLAUDE.md`.
 
 ### Web
 ```bash
-MODOKI_PROJECT=games/<id> npm run build   # TypeScript check + Vite build → games/<id>/dist
+MODOKI_PROJECT=games/<id> npm run build -- --target web   # TypeScript check + Vite build → games/<id>/dist
 ```
+`--target` is required (#40) — `web` honors the project's `build.webBasePath` (sub-path hosting), so
+the SAME command run for an iOS/Android pre-`cap sync` build must say `--target native` instead
+(base `"/"`, since Capacitor serves the dist from the app root). There is no default in either
+direction: defaulting would be silently wrong for one of the two callers.
 
 ### iOS Simulator
 ```bash
-MODOKI_PROJECT=games/<id> npm run build
+MODOKI_PROJECT=games/<id> npm run build -- --target native
 (cd games/<id> && npx cap sync ios)
 xcodebuild -project games/<id>/ios/App/App.xcodeproj -scheme App -configuration Debug \
   -sdk iphonesimulator -destination 'id=<SIM_UDID>' build
@@ -158,7 +318,7 @@ xcrun simctl launch booted <appId>
 
 ### iOS Device
 ```bash
-MODOKI_PROJECT=games/<id> npm run build
+MODOKI_PROJECT=games/<id> npm run build -- --target native
 (cd games/<id> && npx cap sync ios)
 xcodebuild -project games/<id>/ios/App/App.xcodeproj -scheme App -configuration Debug \
   -destination 'id=<DEVICE_UDID>' -allowProvisioningUpdates build
@@ -171,7 +331,7 @@ VPN & Device Management → Trust.
 
 ### Android Device
 ```bash
-MODOKI_PROJECT=games/<id> npm run build
+MODOKI_PROJECT=games/<id> npm run build -- --target native
 (cd games/<id> && npx cap sync android)
 JAVA_HOME=$(/usr/libexec/java_home -v 21) games/<id>/android/gradlew -p games/<id>/android assembleDebug
 adb install games/<id>/android/app/build/outputs/apk/debug/app-debug.apk

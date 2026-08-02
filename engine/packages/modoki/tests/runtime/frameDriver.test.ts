@@ -14,7 +14,7 @@ afterEach(() => {
 });
 
 async function getDriver() {
-  return import('../../../src/runtime/rendering/frameDriver');
+  return import('../../src/runtime/rendering/frameDriver');
 }
 
 describe('frameDriver FPS capping', () => {

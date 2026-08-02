@@ -33,13 +33,56 @@ Grouped:
 
 - **Utility:** `device_status` (lease state / how to connect — call it when a tool errors) ·
   `device_connect` (open the lease — `ip`/`useAdb`, or bare to reconnect the last target) ·
-  `device_disconnect` · `device_eval` (compact, size-capped JSON; survives a circular result) ·
+  `device_disconnect` · `device_eval` (compact, size-capped JSON; survives a circular result;
+  `code` sees an injected `modoki` scripting object — the live agent-op registry, generated per op)
+  · `device_eval_api` (discovery: what that object exposes) ·
   `device_screenshot` ·
   `device_console_logs` · `device_native_logs` (both default `limit:50`).
 - **Percept (read-by-data):** `device_get_scene_state` · `device_diagnose` · `device_journal` ·
   `device_resolve_refs` · `device_introspect` · `device_layout_bounds` · `device_watch`.
-- **Enact (trusted input):** `device_tap` · `device_drag` · `device_dispatch_action` ·
-  `device_press_key` · `device_hover` · `device_scroll`.
+- **Enact (input):** `device_tap` · `device_drag` · `device_pointer` (sustained/HELD
+  press, split into down/move/up — the stateful twin of `device_drag`) · `device_dispatch_action` ·
+  `device_press_key` · `device_hover` · `device_scroll` · `device_type_text`.
+  ⚠️ **Device input is SYNTHETIC, not trusted** — unlike the editor's `modoki_*` twins, which go
+  through Electron's real `sendInputEvent`. Every reply says so (` [input:synthetic]`, or an
+  `inputMechanism` field on `device_type_text`), and `device_status` reports it so you can ask
+  before you act. What that costs you, and the plan to close it per platform, is
+  [docs/enact.md](enact.md) § input fidelity → `docs/plans/trusted-device-input-plan.md` (#32).
+
+⚠️ **Which APP is answering? The bridge port (9095) is a FIXED default shared by every Modoki
+game**, and Android keeps a backgrounded app resident. If another Modoki app already owns 9095, the
+one you just installed fails to bind — **both platforms now resolve/reject on the ACTUAL bind
+outcome and fall back to an OS-assigned free port on conflict** (`GameDebugPlugin.java`
+`startListener` mirrors the iOS `.ready`/`EADDRINUSE`-fallback shape fixed in #88; before that fix
+Android resolved `startServer` unconditionally, before the bind was even known, so a failed bind
+still reported success). The remaining hazard is the STALE lease: the adb forward / WiFi connect
+still points at whichever app held the socket first, so if a backgrounded app got there before your
+fresh install, `device_*` calls keep working and answering **from that other game**. Measured
+2026-08-02: a rebuilt `3d-test` looked like it was missing a just-landed bridge change; a
+backgrounded `court` was answering the whole time. This is the on-device twin of the "which editor
+is this?" gotcha below — same silent-wrong-target shape. `device_status` now reports the app
+package/bundle id the socket is actually held by (`App: <name> (<id>) [<platform>] — reported by
+the device holding the socket`, via `@capacitor/app`'s `getInfo()` read in the SAME page context as
+the TCP server — so the answer can't be a locally-derived guess) whenever a lease is connected: the
+one-call check for this that used to take a logcat hunt. **If a device answer looks impossible,
+`device_status` first; failing that, check `adb shell ps -A | grep modoki` and force-stop the
+others.**
+
+Two limits on that check, both measured on the Samsung 2026-08-02 — know them before you trust it:
+
+- **The squatter is usually the app that CANNOT answer.** Whichever app won the port is by
+  definition the one that was already resident, so it is typically the OLDER build — predating the
+  handler. Its reply is `Unknown method: app-identity` (the bridge signals a missing handler by
+  *returning* the string, not throwing — see `isDeviceError`), and `device_status` surfaces that as
+  `App: UNKNOWN — … predates #88 …` rather than swallowing it. An old bridge on the socket is
+  itself the signal: it is not the app you just launched. The named identity only appears once the
+  squatter is also on a post-#88 build, which is why all nine projects were re-vendored together.
+- **The EADDRINUSE fallback buys honesty, not reachability.** The app rebinds to an OS-assigned
+  port and logs the true one, but the lease dials a fixed `DEVICE_PORT = 9095`
+  (`engine/plugins/backend/deviceConnection.ts`) and `adb forward` maps `tcp:9095 → tcp:9095`.
+  Nothing discovers the fallback port, so a fallen-back app is not reachable over the lease at all —
+  the connection still lands on the squatter. The fix stops the *lie*; the remedy is still to
+  force-stop the other app so your app gets 9095.
 
 **How the Percept/Enact tools work — one delegation, zero duplication.** The device runs the SAME game
 ECS + renderer + DOM as the editor, and the Percept/Enact op registry (`engine/app/debug/agentBridge.ts`
@@ -121,6 +164,30 @@ The MCP is **parity-plus** with chrome-devtools for the editor, and better on tw
   now take `button` (`right`→context menu, `middle`→orbit-pan), `clickCount` (`2`→double-click), and
   `modifiers` (`shift`/`meta`→multi-select, snap). Full raw-input siblings — `modoki_hover`,
   `modoki_scroll`, `modoki_press_key`, `modoki_dnd` — and the aimed-drag layer are under **Enact** below.
+- `modoki_batch` — run several tools **in order, in one turn**. Reach for it when you already know
+  the whole sequence (`create_entity` → `set_transform` → `save_all`, or `tap` → `wait` → capture).
+  It exists for two reasons: **ordering cannot be expressed any other way** — issuing several tool
+  calls in one message does NOT guarantee they run in order — and it lets you **drop the intermediate
+  responses**, which is where the token saving is (it saves nothing on transport; every tool is a
+  local `fetch`).
+  - **Do NOT use it when you need a step's response to decide a later step.** There is no branching;
+    use `modoki_eval` for that.
+  - `result` per step: `"none"` (omit), `"ack"` (default — small payloads verbatim, large ones
+    summarized), `"full"` (automatic for the LAST step, so a batch ending in a read needs no
+    annotation). `resultDefault:"none"` suits a pure input macro.
+  - **A failure is never hidden by `"none"`**: the failing step is reported in full, AND the steps
+    *before* it are un-suppressed — they already applied, and **a batch is not a transaction**
+    (nothing is rolled back, since each step is its own call).
+  - `{"tool":"wait","args":{"ms":100}}` is a pseudo-step for letting the renderer settle before a
+    capture.
+  - **Refused at pre-flight, so nothing runs:** unknown tool, args that fail the tool's real schema,
+    raw `{x,y}` aiming on `tap`/`hover`/`scroll`/`pointer`/`drag`/`dnd`/`drag_handle` (aim by
+    `entity`/`selector`/handle id, or `drag_handle`'s `toId`/`delta`), and
+    `modoki_build`/`modoki_add_native_target`/`modoki_ota_publish`/`modoki_capture_gesture`/a nested
+    batch (run those alone — `capture_gesture`'s `from`/`to` are REQUIRED raw coordinates, so it has
+    no stale-proof aim to offer).
+  - **Undo:** each step is its own undoable action, so a human's Cmd-Z unwinds a batch one step at a
+    time rather than all at once.
 - `modoki_type_text` — **trusted** keyboard input into the focused element (tap the input first);
   a real Chromium `char` event, so React controlled inputs (Inspector `BufferedTextInput`) fire
   their `onChange`. `clearFirst` replaces vs appends; `submitKey` `'Tab'`/`'Escape'` BLURs (to test
@@ -164,7 +231,10 @@ same actions + state a person has in the editor. They relay to the renderer over
   focused one. The game's input sampler drops keys while a DOM text field (Console filter, an
   Inspector input) holds focus, so blur first when trusted key input mysteriously does nothing.
 - **Scenes/assets:** `modoki_list_scenes` / `modoki_load_scene` / `modoki_new_scene` /
-  `modoki_save_all`; `modoki_import_file` (drag-from-Finder equivalent); `modoki_project_settings`.
+  `modoki_save_all`; `modoki_import_file` (drag-from-Finder equivalent); `modoki_project_settings`
+  (`action=set` is a PATCH deep-merged onto the on-disk config — a partial is safe, and omitted
+  sections are untouched; the contract + its two refusals live in
+  [editor.md → Project Settings — the save contract](./editor.md#project-settings--the-save-contract)).
 - **Build/deploy (heavy):** `modoki_build {web|ios|android}` / `modoki_add_native_target {ios|android}`
   — wraps the Build menu's SSE pipeline, consumed to completion; minutes-long, installs on device.
 
@@ -184,9 +254,9 @@ single most confusing failure on this surface: an entity that is *right there on
 | | Tools | Writes to |
 |---|---|---|
 | **LIVE world only** (the running editor; undoable, like the menus) | `create_entity`, `duplicate_entity`, `delete_entities`, `reparent_entity`, `prefab` (instantiate / detach), `history`, `set_selection`, `gizmo`, `collider_edit`, `play_control`, `set_timescale` | RAM. **Not saved.** |
-| **SCENE FILE, or LIVE — depends on the session's persistence mode** | `set_transform`, `mutate_scene`, `validate_scene` (reads) | see **Persistence modes** below |
-| **LIVE *and*, depending on mode, the ASSET file** | `particle_set`, `anim_set_clip`, `anim_add_key`, `timeline_set`, `timeline_add_clip` | RAM always; disk depends on mode (see below) |
-| **ASSET file only** | `write_asset`, `create_asset`, `import_file`, `reimport_asset` | disk, unconditionally — unaffected by persistence mode |
+| **LIVE world (or the FILE when there is no live world to hold it)** | `set_transform`, `mutate_scene`, `validate_scene` (reads) | see **Persistence** below |
+| **LIVE, with the ASSET write parked until `save_all`** | `particle_set`, `anim_set_clip`, `anim_add_key`, `timeline_set`, `timeline_add_clip` (read one back with `read_asset_def`) | RAM now; disk on `save_all` (see below) |
+| **ASSET file only** | `write_asset`, `create_asset`, `import_file`, `reimport_asset` | disk, unconditionally — explicit write tools |
 | **ASSET file *and* the LIVE world** | `prefab` (**create** → writes the `.prefab.json` **and** tags the source entities as a `PrefabInstance` in the live world, **unsaved** — run `save_all` to persist that linkage into the scene, or a reload discards it) | disk + RAM |
 | **Both worlds** | `save_all` (live → disk, **and flushes any pending dirty assets — see below**), `load_scene` / `new_scene` (disk → live, **replacing** the live world) | — |
 | **Reads the LIVE world** | `get_scene_state`, `get_layout_bounds`, `watch`, `journal`, `diagnose`, `capture_viewport`, `capture_gesture`, `get_editor_state` | — |
@@ -203,58 +273,73 @@ save_all        → now the file has it
 set_transform   → ok
 ```
 
-That failure mode is now mostly historical for `set_transform`/`mutate_scene` specifically —
-see **Persistence modes** below — but it still applies verbatim to `particle_set`/`anim_*`/
-`timeline_*` in 'auto' mode, and to any tool reaching a scene FILE that isn't the one the
-editor has open live.
+That failure mode is now mostly historical for `set_transform`/`mutate_scene` specifically — with a
+renderer on the targeted scene they go through the LIVE world (see **Persistence** below), so they
+see live work rather than missing it. It still applies verbatim to any tool reaching a scene FILE
+that isn't the one the editor has open live.
 
 **Why not just auto-save?** Because the editor is a *shared* surface: an implicit save would
 commit the human collaborator's unrelated unsaved work. A surprise write is worse than a
-clear error, so file tools **fail with the fix in the message** instead.
+clear error, so file tools **fail with the fix in the message** instead. This is also why the
+`auto` persistence mode was removed rather than kept as an option.
 
-### Persistence modes — `auto` vs `manual` (mcp-persistence.md)
+### Persistence: MANUAL-ONLY (mcp-persistence.md)
 
-Every mutating tool's result carries a `saved: true|false` field so you never have to *infer*
-whether an edit reached disk. `modoki_persistence` reads or sets the session-wide mode
-(`{mode?}` — bare call reads; `mode: 'auto'|'manual'` sets it for every later call this
-session), and `modoki_get_editor_state` echoes it as `persistenceMode`.
+**A live edit never reaches disk on its own. `modoki_save_all` is the only thing that writes.**
+Every mutating tool's result carries `saved: true|false` so you never have to *infer* it, and
+`modoki_get_editor_state` echoes `persistenceMode: 'manual'`.
 
-- **`auto` (default)** — the original per-tool behaviour, unchanged: `mutate_scene`/
-  `set_transform` write the scene FILE directly (unless a renderer is connected on the exact
-  scene being edited — see below); `particle_set`/`anim_set_clip`/`anim_add_key`/
-  `timeline_set`/`timeline_add_clip` apply live AND save their asset file immediately;
-  `write_asset`/`create_asset` always write the file; the live-world entity/prefab tools never
-  save (unchanged either way — this split predates and is orthogonal to the mode knob).
-- **`manual`** — the SAME edits become live-only, parked until an explicit `save_all`:
-  - `mutate_scene`/`set_transform`, when a renderer is connected and has this exact scene
-    open, apply to the LIVE world as **one undoable step** (a human can Cmd-Z the whole
-    tool call, not just its last op) instead of touching the file.
-  - `particle_set`/`anim_*`/`timeline_*` still apply live immediately (so the panel/viewport
-    updates), but the disk write is parked in a **dirty-asset registry** instead of happening
-    right away.
-  - `write_asset`/`create_asset` are unaffected by the mode either way — they are explicit
-    "write this file" tools, not live-state edits.
-  - `save_all` flushes BOTH: it serializes the live scene to its file and, alongside that,
-    writes out every pending dirty asset (each via the same validated `/api/asset-write`
-    route those tools already use). A `path -> doc` entry that fails to write is **left
-    pending** (never silently dropped) and reported in the result's `assets.failed`; entries
-    that succeed move to `assets.saved`.
-  - `get_editor_state`'s `dirtyAssetPaths` (omitted when empty) lists exactly which asset
-    paths are pending — the Percept surface for "what would `load_scene`/discard destroy?",
-    matching what `unsavedChanges` already does for live scene edits. `hasUnsavedChanges`
-    (and therefore the `load_scene`/`new_scene` unsaved-work guard) is `true` while ANY
-    dirty asset is pending, even if the scene itself has no pending edit.
+There used to be an `auto` mode (the default) in which a live mutation ALSO saved immediately, and
+a `manual` mode that parked it. **`auto` was removed** (2026-07-30) so a tool's effect never depends
+on invisible session state set in some earlier turn — "did that save?" is now answerable without
+asking. `modoki_persistence` is consequently a **read**; passing `mode` gets a 400, not silence.
 
-**`mutate_scene`/`set_transform`'s live-world path has a fallback, not a hard requirement**:
-when no editor is connected, or the call targets a scene FILE that ISN'T the one currently
-open live, or an op is `setBaseScene` (no live-world equivalent — it changes what the scene
-*loads*, not any live entity's state), the call falls back to the FILE-DIRECT write exactly as
-before (today's browser-free curl-editing path stays intact). This is why `saved` and `mode`
-are always in the result — trust them over assuming which path a given call took.
+What that means per tool:
 
-A per-call `save?: boolean` param exists on every mutating tool's schema, reserved for a
-future per-call override of the session mode — **not yet honored** by this build; the session
-mode (`modoki_persistence`) is the only thing that currently changes behaviour.
+- **`mutate_scene` / `set_transform`**, when a renderer has this exact scene open, apply to the LIVE
+  world as **one undoable step** (a human can Cmd-Z the whole tool call, not just its last op) and
+  do **not** touch the file. `saved: false`, with a hint naming `save_all`.
+- **`particle_set` / `anim_set_clip` / `anim_add_key` / `timeline_set` / `timeline_add_clip`** apply
+  live immediately (so the panel/viewport updates) and park the disk write in a **dirty-asset
+  registry**. `get_editor_state`'s `dirtyAssetPaths` (omitted when empty) lists what is pending —
+  the Percept answer to "what would `load_scene`/discard destroy?".
+  **Read one back with `modoki_read_asset_def`** — the READ half of that family, and the reason it
+  exists: those five tools all take a FULL definition, so without it you could neither obtain a def
+  to modify nor VERIFY an edit (the write returns `{ok:true}` and the only other check was judging a
+  rendered frame — see the "verify by DATA" rule above). It reads the **LIVE** cache, not the file,
+  which is the whole point under manual persistence: an unsaved edit exists only live, so a file
+  read would report the pre-edit value and make a successful edit look like a no-op. `unsaved: true`
+  means a write is parked for it.
+- **`write_asset` / `create_asset` / `import_file` / `reimport_asset`** always write. They are
+  explicit "write this file" tools, not live-state edits.
+- **The live-world entity/prefab tools** (`create_entity`, `duplicate_entity`, `delete_entities`,
+  `reparent_entity`, `prefab` instantiate/detach) never saved. Unchanged — that split predates the
+  mode knob and is orthogonal to it.
+- **`save_all` flushes BOTH**: it serializes the live scene AND writes every pending dirty asset
+  (each through the same validated `/api/asset-write` route). An entry that fails to write is **left
+  pending** (never silently dropped) and reported in `assets.failed`; successes move to
+  `assets.saved`.
+
+**The FILE-DIRECT fallback is not `auto` coming back.** When no editor is connected, or the call
+targets a scene FILE that ISN'T the one open live, or an op is `setBaseScene` (no live-world
+equivalent — it changes what the scene *loads*, not any live entity's state), the call writes the
+file, because **there is no live world to hold the edit**. This keeps the browser-free curl-editing
+path intact. Trust `saved` and `mode` in the result over assuming which path a call took.
+
+⚠️ **Consequence you WILL hit: `unsavedChanges: true` is now the normal state after any agent edit**,
+and three things are gated on it. All three were rare under `auto` and are routine now:
+
+| Gate | Behaviour |
+|---|---|
+| `modoki_build` | **REFUSES** while unsaved — it reads the FILE, so the artifact would miss your work (`force: true` builds the on-disk scene deliberately) |
+| file-direct `mutate_scene` (other scene, or `setBaseScene`) | **409s** while unsaved — its write would hot-reload the scene and destroy live-only work |
+| a game-code (`.ts`) edit | force-reloads the editor and **DISCARDS** unsaved scene edits after a 5s countdown (CLAUDE.md) |
+
+So: **`save_all` before a build, before a scene swap, and before editing game code** — and don't let
+unsaved work pile up across a long session.
+
+The per-call `save?: boolean` param on every mutating tool's schema is **ignored**. It is kept only
+so existing callers don't break; don't pass it.
 
 ### The corollaries (each was a real, silent bug the MCP re-audit closed)
 
@@ -270,7 +355,7 @@ mode (`modoki_persistence`) is the only thing that currently changes behaviour.
   the SAME refusal for the mirror-image reason (their file write would hot-reload the scene and
   destroy unsaved live-only entities) — that guard is now unreachable in practice: whenever a
   renderer is connected on the targeted scene, the call goes through the LIVE world first (see
-  **Persistence modes** above), so it *joins* whatever unsaved work already existed instead of
+  **Persistence** above), so it *joins* whatever unsaved work already existed instead of
   destroying it. The guard still fires for genuine file-direct calls (no renderer, wrong scene,
   or `setBaseScene`).
 - **`build` REFUSES on unsaved changes** — it reads the FILE, so the artifact would be
@@ -280,11 +365,219 @@ mode (`modoki_persistence`) is the only thing that currently changes behaviour.
 - **A tool result means what it says.** A tool that did nothing now FAILS; it does not return
   a cheerful `ok:true` with the bad news buried in a field. `unsavedChanges` on
   `get_editor_state` tells you where you stand. The re-audit swept this across the whole surface:
-  `tap_handle`/`drag_handle` refuse an off-screen/disabled handle and surface `occluded`;
+  `tap_handle`/`drag_handle` refuse an off-screen/disabled handle and report `occluded` (a BOOLEAN,
+  always present) + `occludedBy`, per endpoint for `drag_handle` (S3.17);
   `dispatch_action`/`play_clip` fail on an unknown name / stale guid / no-animator target;
   `reimport`/`import_file` fail on a no-match / unrecognized type; `timeline_set` fails when
   normalization drops a malformed item; `capture_gesture` requires the game Playing; and `diagnose`
   only counts console errors from the last 30s (a stale error no longer pins `ok:false`).
+
+## Failures: one envelope, one closed code set
+
+**Every failed tool call answers three questions: what was attempted, why it failed, what to do
+instead.** `isError: true` plus a single shape (full contract:
+[mcp-tool-conventions.md](./mcp-tool-conventions.md) §5):
+
+```jsonc
+{ "error": {
+    "code": "NOT_FOUND",              // from the closed set below
+    "tool": "modoki_set_transform",   // stamped centrally — always present
+    "what": "…what was attempted, in YOUR terms",
+    "why":  "…the actual cause",
+    "got":  "…what was received (structured, not a nested JSON string)",
+    "expected": "…the shape that would work",
+    "options": ["…the real choices"]  // this is the field that unblocks you
+} }
+```
+
+`UNKNOWN_PARAM` · `AMBIGUOUS` · `NOT_FOUND` · `AMBIGUOUS_SURFACE` · `OCCLUDED` · `REFUSED_BY_OP` ·
+`NO_RENDERER` · `TIMEOUT` · `TOO_LARGE` · `REQUIRES_SAVE` · `NOT_AVAILABLE_HERE` · `PARTIAL`.
+
+**Read the `code` before the prose** — it tells you whether to retry, re-aim, save first, or stop:
+
+| code | what it means for your next call |
+|---|---|
+| `NOT_FOUND` / `AMBIGUOUS` | your AIM was wrong — re-read state and address by `guid` |
+| `AMBIGUOUS_SURFACE` | the entity is on screen in several viewports — pass `surface` |
+| `OCCLUDED` | something covers the target; the input was NOT sent somewhere else |
+| `REFUSED_BY_OP` | the operation itself declined — including a no-op you asked to change |
+| `REQUIRES_SAVE` | live-world work isn't on disk; `modoki_save_all`, or force deliberately |
+| `NOT_AVAILABLE_HERE` | **could not look** — never read this as "nothing is there" |
+| `TIMEOUT` | retryable; the editor may be busy or wedged |
+| `PARTIAL` | some of it applied. A batch is not a transaction — verify before retrying |
+
+Two distinctions this exists to protect, both of which were real silent bugs:
+
+- **"Could not look" is never "nothing is there."** An unreachable source, an absent route, an empty
+  trait registry → `NOT_AVAILABLE_HERE`, not an empty answer. `list_traits {name:'Transform'}` once
+  answered *"unknown trait"* when the registry simply hadn't loaded, and the agent abandoned a
+  perfectly good `setTrait`.
+- **A no-op you asked to change is a FAILURE.** `changed:0`, or a write whose keys the loader
+  ignores, is `REFUSED_BY_OP` naming the real field names — not `{ok:true}`.
+
+If you are WRITING a tool: `ctx.fail(...)` / `ctx.httpFailure(...)` are the only ways to fail (the
+device server: `deviceFail` / `caughtFailure` / `deviceReplyFailure`). There is deliberately no
+free-text error constructor — a failure with no code is a failure nobody can act on.
+
+## Tool catalog — every `modoki_*` tool, generated from the contract table
+
+The prose above says which tool to reach for and why; this table is the **facts** — endpoint, whether
+it mutates, whether Cmd-Z takes it back, what must be true for it to work, how it is aimed, and the
+smallest call that is valid. It is **generated from `engine/tools/modoki-mcp/src/contracts.ts`**, which
+is also what the batch pre-flight, the conformance tests, the over-cap hints and the live sweep read —
+so a fact appears here once and cannot drift into a plausible-looking lie. `npm test` fails if the
+table and the table-of-record disagree.
+
+Two things the table is worth reading FOR, not just referring to:
+- **`Smallest call`** is the exact object the T2 fixtures and the live sweep call each tool with, so it
+  is machine-checked copy-paste. It is deliberately the *ergonomic* form (the laziest valid call), not
+  a defensive one — every one of the nine bugs the batch pass found hid behind a defensively-complete
+  call that a test would naturally write.
+- **`Effect`** is the answer to "will this survive, and can I take it back": `live` is lost on a scene
+  swap, `file` is on disk, `both` does both, `session` is editor state (selection, gizmo, watchers),
+  and `undoable` means a human's Cmd-Z unwinds it as ONE step. Persistence is MANUAL-only — see the
+  LIVE WORLD vs SCENE FILE section above.
+
+<!-- BEGIN GENERATED TOOL CATALOG -->
+
+*80 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
+run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fails `npm test`.*
+
+#### Read — answer a question about state (never changes anything)
+
+| Tool | Endpoint | Effect | Needs | Aim | Smallest call |
+|---|---|---|---|---|---|
+| `modoki_asset_schema` | GET `/api/asset-schema` | read-only | editor | — | `{"type":"particle"}` |
+| `modoki_capture_viewport` | POST `/api/capture-viewport` | read-only | editor + electron | — | *(no args)* |
+| `modoki_diagnose` | GET `/api/diagnose` | read-only | editor + scene | — | *(no args)* |
+| `modoki_editor_journal` | GET `/api/editor-journal` | session · **IMPURE READ** (an optional arg destroys state) | editor | — | *(no args)* |
+| `modoki_eval_api` | GET `/api/eval-api` | read-only | editor + renderer | — | *(no args)* |
+| `modoki_get_asset_meta` | GET `/api/read-meta` | read-only | project | asset | `{"path":"/assets/textures/probe.png"}` |
+| `modoki_get_console_logs` | GET `/api/console-logs` | read-only | editor | — | *(no args)* |
+| `modoki_get_editor_state` | GET `/api/editor-state` | read-only | editor | — | *(no args)* |
+| `modoki_get_layout_bounds` | GET `/api/layout-bounds` | read-only | editor + renderer | — | *(no args)* |
+| `modoki_get_scene_state` | GET `/api/scene-state` | read-only | editor + scene | — | *(no args)* |
+| `modoki_handles` | GET `/api/enact-handles` | read-only | editor | — | *(no args)* |
+| `modoki_identity` | — | read-only | editor | — | *(no args)* |
+| `modoki_journal` | GET `/api/journal` | session · **IMPURE READ** (an optional arg destroys state) | editor + renderer | — | *(no args)* |
+| `modoki_list_actions` | GET `/api/game-introspect` | read-only | editor + renderer | — | *(no args)* |
+| `modoki_list_assets` | GET `/api/scan-assets` | read-only | project | — | *(no args)* |
+| `modoki_list_scenes` | GET `/api/scenes` | read-only | project | — | *(no args)* |
+| `modoki_list_traits` | GET `/api/trait-schema` | read-only | editor | — | *(no args)* |
+| `modoki_ota_status` | GET `/api/ota/status` | read-only | project | — | *(no args)* |
+| `modoki_read_asset_def` | GET `/api/asset-def` | read-only | editor | asset | `{"path":"/assets/particles/probe.particle.json"}` |
+| `modoki_render_scene` | POST `/api/render-scene` | read-only | editor + renderer + scene | — | *(no args)* |
+| `modoki_render_sequence` | POST `/api/render-sequence` | read-only | editor + renderer + scene | — | *(no args)* |
+| `modoki_resolve_refs` | GET `/api/resolve-refs` | read-only | project | — | `{"refs":["00000000-0000-0000-0000-000000000000"]}` |
+| `modoki_validate_scene` | GET `/api/validate-scene` | read-only | project | asset | `{"path":"/assets/scenes/main.scene.json"}` |
+| `modoki_wait_for_edit` | GET `/api/wait-for-edit` | read-only | editor | — | `{"timeoutMs":50}` |
+
+#### Mutate — change scene/world data
+
+| Tool | Endpoint | Effect | Needs | Aim | Smallest call |
+|---|---|---|---|---|---|
+| `modoki_create_entity` | POST `/api/editor-action` `create-entity` | live · undoable | editor + scene | — | `{"kind":"empty"}` |
+| `modoki_delete_entities` | POST `/api/editor-action` `delete-entities` | live · undoable | editor + scene | entity | *(no args)* |
+| `modoki_discard_asset_edits` | POST `/api/editor-action` `discard-asset-edits` | session | editor | — | `{"all":true}` |
+| `modoki_duplicate_entity` | POST `/api/editor-action` `duplicate-entity` | live · undoable | editor + scene | entity | *(no args)* |
+| `modoki_mutate_scene` | POST `/api/scene-mutate` | live · undoable | editor + scene | entity | `{"ops":[{"op":"addEntity","name":"ContractProbe","parentId":0}]}` |
+| `modoki_prefab` | POST `/api/editor-action` `prefab` | both · undoable | editor + scene | entity | `{"action":"instantiate","path":"/assets/prefabs/probe.prefab.json"}` |
+| `modoki_reparent_entity` | POST `/api/editor-action` `reparent-entity` | live · undoable | editor + scene | entity | *(no args)* |
+| `modoki_save_all` | POST `/api/editor-action` `save-all` | file | editor | — | *(no args)* |
+| `modoki_set_transform` | POST `/api/scene-mutate` | live · undoable | editor + scene | entity | `{"entity":{"name":"ContractProbe"},"space":"local","position":[1,2,3]}` |
+
+#### Asset — read or write an asset definition
+
+| Tool | Endpoint | Effect | Needs | Aim | Smallest call |
+|---|---|---|---|---|---|
+| `modoki_anim_add_key` | POST `/api/editor-action` `anim-add-key` | live | editor | asset | `{"clipPath":"/assets/anim/probe.anim.json","trait":"Transform","field":"x","time":0,"value":1}` |
+| `modoki_anim_set_clip` | POST `/api/editor-action` `anim-set-clip` | live | editor | asset | `{"clipPath":"/assets/anim/probe.anim.json","clip":{}}` |
+| `modoki_create_asset` | POST `/api/create-asset` | file | project | asset | `{"type":"particle","path":"/assets/particles/probe.particle.json"}` |
+| `modoki_import_file` | POST `/api/import-file` | file | project | — | `{"srcPath":"/tmp/probe.png","destFolder":"/assets/textures"}` |
+| `modoki_particle_set` | POST `/api/editor-action` `particle-set` | live | editor | asset | `{"path":"/assets/particles/probe.particle.json","def":{}}` |
+| `modoki_reimport_asset` | POST `/api/reimport` | file | project | asset | `{"path":"/assets/textures/probe.png"}` |
+| `modoki_timeline_add_clip` | POST `/api/editor-action` `timeline-add-clip` | live | editor | asset | `{"timelinePath":"/assets/timelines/probe.timeline.json","trackType":"animation","item":{}}` |
+| `modoki_timeline_set` | POST `/api/editor-action` `timeline-set` | live | editor | asset | `{"timelinePath":"/assets/timelines/probe.timeline.json","timeline":{}}` |
+| `modoki_write_asset` | POST `/api/asset-write` | file | project | asset | `{"path":"/assets/particles/probe.particle.json","type":"particle","data":{}}` |
+
+#### Input (Enact) — trusted input injection
+
+| Tool | Endpoint | Effect | Needs | Aim | Smallest call |
+|---|---|---|---|---|---|
+| `modoki_capture_gesture` | POST `/api/capture-gesture` | no persistence | editor + electron | point | `{"from":{"x":0,"y":0},"to":{"x":10,"y":10}}` |
+| `modoki_dnd` | POST `/api/editor-action` `dom-dnd` | no persistence | editor + electron | selector | `{"from":{"selector":"#a"},"to":{"selector":"#b"}}` |
+| `modoki_drag` | POST `/api/input/drag` | no persistence | editor + electron | entity | `{"from":{"selector":"#a"},"to":{"selector":"#b"}}` |
+| `modoki_drag_handle` | POST `/api/input/drag-handle` | no persistence | editor + electron | handle | `{"id":"probe-handle","to":{"x":10,"y":10}}` |
+| `modoki_focus` | POST `/api/input/focus` | no persistence | editor + electron | selector | `{"selector":"#probe"}` |
+| `modoki_hover` | POST `/api/input/hover` | no persistence | editor + electron | entity | `{"selector":"#probe"}` |
+| `modoki_pointer` | POST `/api/input/pointer` | no persistence | editor + electron | entity | `{"action":"down","selector":"#probe"}` |
+| `modoki_press_key` | POST `/api/input/key` | no persistence | editor + electron | — | `{"key":"Escape"}` |
+| `modoki_scroll` | POST `/api/input/scroll` | no persistence | editor + electron | entity | `{"selector":"#probe"}` |
+| `modoki_tap` | POST `/api/input/tap` | no persistence | editor + electron | entity | `{"selector":"#probe"}` |
+| `modoki_tap_handle` | POST `/api/input/tap-handle` | no persistence | editor + electron | handle | `{"id":"probe-handle"}` |
+| `modoki_type_text` | POST `/api/input/type` | no persistence | editor + electron | — | `{"text":"probe"}` |
+
+#### Control — drive the editor session, not scene data
+
+| Tool | Endpoint | Effect | Needs | Aim | Smallest call |
+|---|---|---|---|---|---|
+| `modoki_collider_edit` | POST `/api/editor-action` `set-collider-edit` | session | editor | — | `{"on":true}` |
+| `modoki_dispatch_action` | POST `/api/editor-action` `dispatch-action` | no persistence | editor + renderer | — | `{"name":"probe"}` |
+| `modoki_eval` | POST `/api/eval` | no persistence | editor + renderer | — | `{"code":"return 1 + 1;"}` |
+| `modoki_focus_entity` | POST `/api/editor-action` `focus-entity` | no persistence | editor + scene | entity | *(no args)* |
+| `modoki_gizmo` | POST `/api/editor-action` `set-gizmo` | session | editor | — | *(no args)* |
+| `modoki_history` | POST `/api/editor-action` *(op = your `action`)* | live | editor | — | `{"action":"undo"}` |
+| `modoki_load_scene` | POST `/api/editor-action` `load-scene` | live | editor + project | asset | `{"path":"/assets/scenes/main.scene.json"}` |
+| `modoki_menu` | POST `/api/menu` | session | editor + electron | — | *(no args)* |
+| `modoki_new_scene` | POST `/api/editor-action` `new-scene` | live | editor + project | — | *(no args)* |
+| `modoki_open_nine_slice_editor` | POST `/api/editor-action` `open-nine-slice-editor` | no persistence | editor | asset | `{"path":"/assets/textures/probe.png"}` |
+| `modoki_open_particle_editor` | POST `/api/editor-action` `open-particle-editor` | no persistence | editor | asset | `{"path":"/assets/particles/probe.particle.json"}` |
+| `modoki_open_sprite_editor` | POST `/api/editor-action` `open-sprite-editor` | no persistence | editor | asset | `{"path":"/assets/textures/probe.png"}` |
+| `modoki_persistence` | POST `/api/persistence` | no persistence | editor | — | *(no args)* |
+| `modoki_play_clip` | POST `/api/editor-action` `dispatch-action` | no persistence | editor + renderer | entity | `{"guid":"00000000-0000-0000-0000-000000000000","clip":"Idle"}` |
+| `modoki_play_control` | POST `/api/editor-action` *(op = your `action`)* | session | editor | — | `{"action":"stop"}` |
+| `modoki_project_settings` | GET `/api/project-settings` *(method varies)* | file | project | — | `{"action":"get"}` |
+| `modoki_scene_view_mode` | POST `/api/editor-action` `set-scene-view-mode` | session | editor | — | `{"mode":"3d"}` |
+| `modoki_set_playhead` | POST `/api/editor-action` `set-playhead` | session | editor | — | `{"t":0}` |
+| `modoki_set_selection` | POST `/api/editor-action` `set-selection` | session | editor | entity | *(no args)* |
+| `modoki_set_timescale` | POST `/api/editor-action` `set-timescale` | no persistence | editor + renderer | — | `{"scale":1}` |
+| `modoki_watch` | GET `/api/watch/list` *(both varies)* | session | editor + renderer | — | `{"action":"list"}` |
+
+#### Build — long-running toolchain work
+
+| Tool | Endpoint | Effect | Needs | Aim | Smallest call |
+|---|---|---|---|---|---|
+| `modoki_add_native_target` | GET `/api/add-native-target` | file | project | — | `{"platform":"ios"}` |
+| `modoki_build` | GET `/api/build` | file | project | — | `{"platform":"web"}` |
+| `modoki_ota_keygen` | POST `/api/ota/keygen` | file | project | — | *(no args)* |
+| `modoki_ota_publish` | GET `/api/ota/publish` | file | project | — | `{"version":"1.0.0"}` |
+
+#### Meta — operates on the tool surface itself
+
+| Tool | Endpoint | Effect | Needs | Aim | Smallest call |
+|---|---|---|---|---|---|
+| `modoki_batch` | — | live | editor | — | `{"steps":[{"tool":"wait","args":{"ms":1}}]}` |
+<!-- END GENERATED TOOL CATALOG -->
+
+### `device_*` vs `modoki_*` — the naming asymmetries, stated once
+
+The two surfaces answer several of the same questions under different names. This is **historical, not
+meaningful**, and it is recorded here rather than renamed away: an alias churn would break every
+existing agent call for a cosmetic win. Read across:
+
+| Question | Editor | Device |
+|---|---|---|
+| recent console output | `modoki_get_console_logs` | `device_console_logs` |
+| screen-space rects | `modoki_get_layout_bounds` | `device_layout_bounds` |
+| a picture of it | `modoki_capture_viewport` | `device_screenshot` |
+| what can I dispatch? | `modoki_list_actions` | `device_introspect` |
+
+Where the two DO share a param name, they now mean the same thing — `device_scroll` took `dx`/`dy`
+against the editor's `deltaX`/`deltaY` until the Phase-8 device sweep; `deltaX`/`deltaY` are canonical
+on both now, with `dx`/`dy` kept as aliases. **Editor-only by nature** (no game equivalent exists):
+`handles` / `tap_handle` / `drag_handle` / `dnd` / `focus` (editor chrome + Canvas2D authoring),
+`render_scene`, `play_control` / `set_timescale` / `history`, `identity`. **Known device gaps**, logged
+as features rather than audit fixes: no `device_type_text`, no `device_pointer` (sustained press).
 
 ## Response budget (read this before adding a tool)
 
@@ -392,9 +685,12 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   `runtime/rendering/screenBounds.ts`, `app/debug/layoutDump.ts`.)
 - **Diagnose:** `modoki_diagnose` → structured causes (bad refs, NaN/zero-scale transforms, no camera,
   off-screen, console errors) — run FIRST when something renders wrong. (`app/debug/diagnose.ts`.)
-- **Console:** `modoki_get_console_logs` returns the **last 50 + `byLevel` counts** over the 500-entry
-  ring (error entries carry full stacks, so the whole ring can exceed 20k tokens). `limit`/`level`/`since`
-  narrow it.
+- **Console:** `modoki_get_console_logs` returns the **last 50** plus three numbers that do NOT mean the
+  same thing: `count` (what came back), `total` (what matched `level=`/`since=`), and
+  `ringTotal`+`byLevel` (the WHOLE 500-entry ring, regardless of the filter). That last part is the
+  point — a `level:'warn'` read still tells you whether any errors exist. It used to build the
+  histogram over the already-filtered array, so "are there errors?" answered *no* (S3.8). Error
+  entries carry full stacks, so the whole ring can exceed 20k tokens.
 - **Asset authoring (no guessing JSON):** `modoki_asset_schema {material|particle|animation}` →
   field metadata + example; `modoki_create_asset` / `modoki_write_asset` (validated, warn-but-write);
   live tuning via `modoki_particle_set` / `modoki_anim_set_clip` / `modoki_anim_add_key` /
@@ -405,7 +701,10 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
 - **Snapshot (`modoki_get_scene_state`):** **called bare it returns an INDEX** — per entity `id`,
   `guid`, `name`, `parentId`, `layer` + its trait **NAMES**, no field values, under a default `limit`,
   plus a `hint`. That's the cheap "what exists?" question; ask it first, then drill down. (It used to
-  dump every field of every trait: ~40k tokens on a 135-entity scene.) **Any target or enricher returns
+  dump every field of every trait: ~40k tokens on a 135-entity scene.) **`guid` is on EVERY row, not
+  just the index** (S3.12/S3.9): a `trait=` drill-down used to return id-only rows — from the very tool
+  that tells you runtime ids are reassigned on every hot-reload — because the guid lived inside
+  `traits.EntityAttributes`, which the `trait` filter excludes. **Any target or enricher returns
   VALUES:** filters `trait`/`id`/`guid` (the stable address to prefer)/`name` (substring)/`where`
   ("Trait.field op value" — **reports a parse/unknown-field error** instead of silently dumping everything); enrichers `full` (full-fidelity
   trait dump — AoS/object fields the compact default drops, PLUS runtime read-back fields like
@@ -432,15 +731,50 @@ agent can do anything a mouse+keyboard can, in dev AND the DMG. Reach for it whe
 Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor trusted input except
 `dnd`/`handles`, which ride the editor-action relay and work in dev too. (Design:
 [enact.md](./enact.md).)
-- **Aim by `selector`, not by pixels.** `modoki_tap`/`drag`/`hover`/`scroll` take an optional CSS
-  `selector` instead of `{x,y}`, resolved to the element's centre **server-side in the same call** —
-  so nothing can move between reading a coordinate and acting on it (drag takes a `{selector}` per
-  endpoint). The response reports `matched` (what the selector found), `hitTarget` (the topmost
-  element at that point) and `occluded`: when `occluded` is true **something covered your target and
-  the click landed on it** — the silent-miss class of bug, as data, with no screenshot. Occlusion is
-  measured at resolve time, a few ms before dispatch, and is **provenance, not a veto** (the input is
-  still sent). A hidden/zero-rect element or an invalid selector is refused with a 400 rather than
-  aimed at (0,0). Keep `{x,y}` for canvas/entity targets, from `get_scene_state?bounds=1`.
+- **Never aim by pixels. There are three aim modes, and `{x,y}` is the last resort.** Precedence is
+  `entity` → `selector` → `{x,y}`; the first two resolve **server-side in the same call**, so nothing
+  can move between reading a coordinate and acting on it.
+  - **`selector`** (a CSS selector) for **editor chrome** — resolved to the element's centre. Drag
+    takes one point spec per endpoint.
+  - **`entity: {guid|name|id}`** for a **scene entity** in a viewport — resolved to the entity's live
+    screen rect. Prefer `guid`: runtime ids are reassigned on every scene reload. A `name` matching
+    several entities is **refused**, not first-matched.
+    - ⚠️ **A 2D/3D aim REQUIRES `surface`** (`game-3d` | `game-2d` | `scene-view`) — a UI aim
+      refuses it. One entity is often on screen more than once: with the Scene and Game panels both
+      open, `Scene3D` and `SceneView` each measure every 3D entity through their own camera
+      (measured: `47x45 at (755,312)` vs `496x372 at (76,-63)`, same id, both `onScreen`). It is
+      required **even when only one viewport has it**, because otherwise the call succeeds without
+      you having said what you meant — so a wrong assumption gets confirmed instead of corrected.
+      Read `get_editor_state.surfaces` for what is mounted; a successful aim echoes the `surface` it
+      used. Before this, the resolver took whichever rect came first and could click the wrong panel
+      while reporting success.
+  - **`{x,y}`** only when neither fits (empty canvas space). It is **rejected outright inside
+    `modoki_batch`**, where coordinates read before the batch are measured against state its own
+    earlier steps invalidated.
+  The response reports `matched` (what resolved), `hitTarget` (the topmost element at that point) and
+  `occluded`: when `occluded` is true **something covered your target and the click landed on it** —
+  the silent-miss class of bug, as data, with no screenshot. Occlusion is measured at resolve time, a
+  few ms before dispatch, and is **provenance, not a veto** (the input is still sent). A hidden/
+  zero-rect element, an invalid selector, an off-screen entity, or one whose rect centre falls
+  outside the window is refused with a 400 rather than aimed at (0,0) or clamped to an edge.
+  - ⚠️ **`occlusionScope` qualifies `occluded` for an entity aim, and you must read it.**
+    `'element'` (UI entities, which are real DOM nodes) is a true element-level comparison — trust
+    `occluded:false`. **`'entity'` (2D/3D entities on a surface with a registered pick provider —**
+    today, the editor's `scene-view` **)** asked the surface's OWN hit-test what a click there
+    would actually select, so a mesh directly in front of the target IS detected — and by default
+    the call **refuses** rather than reporting `occluded:true`: an entity aim expresses intent
+    about the ENTITY ("click the character"), so a click the surface would not honour is a failed
+    intent, not something to dispatch quietly. The 400 names the blocking entity. Pass
+    `entity.allowOccluded:true` to dispatch anyway and see what was actually hit. **`'canvas'`
+    (2D/3D entities on a surface with NO pick provider — the runtime `game-2d`/`game-3d` until a
+    game registers one) only detects DOM-level covering**: a panel or dialog over the canvas is
+    caught, but **a mesh directly in front of the target reports `occluded:false`**, because
+    nothing asked the scene what is actually there. Treat `'canvas'` + `occluded:false` as "the
+    click reaches the canvas", not "the click hits the entity". A successful `'entity'`-scope
+    response also carries `aimedAt` (`'centre'` | `'sampled'` — whether the entity's projected-rect
+    centre picked it, or a concave/hollow shape needed a searched point instead) and, on a refusal
+    or an `allowOccluded` dispatch, `occludedByEntity` naming who is actually there. Design +
+    tests: [docs/enact.md](enact.md).
 - **Raw input modalities** (beyond `tap`/`drag`): `modoki_hover` (bare mouse-move → tooltips/hover-
   submenus), `modoki_scroll` (wheel → orbit-zoom, scroll a long panel, cursor-anchored Canvas2D zoom;
   `deltaY>0` = content down, ~120 ≈ one tick; pass `modifiers:['control'|'meta'|…]` to drive a
@@ -690,10 +1024,11 @@ Standalone Capacitor plugin at `engine/packages/capacitor-game-debug/`. Runs a T
 
 Dev-only endpoints + scene hot-reload so an AI agent (or any tooling) can edit scenes via plain `curl` and verify the result **without driving a browser/screenshot**. All dev-only (the asset-scanner middleware only runs under `vite` dev). Server: `engine/plugins/vite-asset-scanner.ts`. Browser client: `engine/app/debug/agentBridge.ts` (gated on `import.meta.hot`, stripped from prod). Pure logic (shared Node + browser): `packages/modoki/src/runtime/scene/{sceneValidation,sceneMutate,sceneSchema}.ts`; ref predicates in import-free `runtime/loaders/assetRefRules.ts`.
 
-- **Scene/prefab hot-reload** — editing a scene file on disk (the `Edit` tool, `git checkout`, `/api/scene-mutate`) auto-reloads the **active** scene in the browser; editor camera + selection are preserved (selection via the existing GUID-keyed `selectionRestore`). A prefab edit reloads the current scene (instances re-expand). The watcher classifies files with the scanner's own `detectType()` — **scene files here are plain `.json` under a `scenes/` dir, not `.scene.json`**. The editor's own Cmd+S saves (`/api/write-file`) are suppressed (1.5s self-write guard) so they don't bounce the live scene; external edits still reload.
+- **Scene/prefab hot-reload** — editing a scene file on disk (the `Edit` tool, `git checkout`, `/api/scene-mutate`) auto-reloads the **active** scene in the browser; editor camera + selection are preserved (selection via the existing GUID-keyed `selectionRestore`). A prefab edit reloads the current scene (instances re-expand). The watcher classifies files with the scanner's own `detectType()` — **scene files are positively identified by the `.scene.json` suffix** (or, as a legacy fallback, a plain `.json` under a `scenes/` dir — issue #54). The editor's own Cmd+S saves (`/api/write-file`) are suppressed (1.5s self-write guard) so they don't bounce the live scene; external edits still reload.
 - **`curl localhost:5173/api/scene-state[?trait=Transform][&id=N]`** — returns the **live ECS world** as JSON. **Bare it is an INDEX** (`{scenePath, entityCount, entities:[{id,guid,name,parentId,layer,traits:[names]}], hint}`), capped at a default `limit` of 200 entities — past that it clips and gains `truncated`/`totalCount`. Pass a target (`trait`/`id`/`name`/`where`) or an enricher (`full`/`world`/`bounds`/`contacts`) to get trait **values** (`traits` becomes an object); a targeted query is never capped unless you pass `limit`. Relays to the open tab over the HMR socket (504 if no app is open). Because it reads the live world (not the file), a changed value here proves a hot-reload actually took effect. **Prefer this over screenshots to verify scene edits.**
 - **`curl .../api/validate-scene?path=/games/.../x.json`** — warn-but-load validation: unknown trait/field, type mismatch, and the literal-asset-path-instead-of-GUID mistake (see "Asset References" in `CLAUDE.md`). Needs a tab open to push the trait schema (`schemaAvailable:false` ⇒ ref checks still run, type checks skipped).
 - **`POST .../api/scene-mutate {path, ops}`** — validated `setTrait`/`removeTrait`/`addEntity`/`removeEntity` (entity ref by `id`/`name`/`guid`; mints GUIDs); writes atomically; returns `{ok, changed, errors, warnings}`. Hot-reload then reflects it. It does **NOT** echo the scene back (that fired on every edit and cost ~10k tokens of context for data nobody read — and it was the pre-expansion *file*, not the live world). Pass `returnScene:true` if you actually want the written file; **to verify an edit, read `/api/scene-state`.**
 - **`GET .../api/editor-state`** + **`POST .../api/editor-action {action, …}`** (allowlisted) + **`GET .../api/scenes`** + **`POST .../api/import-file {srcPath, destFolder}`** — the editor-parity surface (live UI state read; selection/play/undo/scene/prefab/entity actions; scene list; Finder-style import). `editor-state`/`editor-action` relay to the renderer, so they need a tab/editor open. See the modoki MCP section above for the tool wrappers.
+- **`GET .../api/build-modules`** — resolves `build.modules` (`'auto' | boolean` per module) for the OPEN project, reusing the same Node-side scene-scan `resolveModules` a real build uses (`engine/plugins/detect-modules.ts`). No renderer/tab needed — pure filesystem read. Lets an agent (or `get_editor_state`'s `rendererGate.render3d`) tell whether a project actually renders 3D, e.g. to explain a suppressed "no 3D viewport" watchdog warning on a 2D/UI-only project.
 
 **Gotcha:** the Vite plugin loads once at server startup. Editing the plugin **or any module it imports** (`sceneValidation`, `sceneMutate`, `assetRefRules`) requires a dev-server restart (`curl /api/exit` + `npm run dev`). Browser-side modules (`agentBridge`, `sceneSchema`) hot-update normally.

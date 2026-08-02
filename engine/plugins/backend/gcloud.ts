@@ -55,3 +55,36 @@ export function deriveGcsBucketFromBaseUrl(baseUrl: string): string | null {
 export const OTA_SAFE_TOKEN = /^[A-Za-z0-9._-]{1,64}$/;
 /** A `gs://bucket[/prefix]` URL, similarly constrained before shell interpolation. */
 export const OTA_SAFE_BUCKET = /^gs:\/\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._/-]*)?$/;
+
+/** Did `gcloud storage cat <bucket>/release.json` fail because the object genuinely ISN'T THERE,
+ *  or because we COULD NOT LOOK?
+ *
+ *  `/api/ota/status` used to swallow every failure in a bare `catch` and answer
+ *  `{ok:true, release:null, note:'No release.json published yet for this bucket.'}`. Expired
+ *  credentials, no network, a typo'd bucket, a missing IAM permission — all of them reported as
+ *  the authoritative statement "nothing has been published". That is the worst shape an answer can
+ *  take on an agent surface short of a false success: the agent believes a fact about production
+ *  and acts on it (re-publishing, or telling the human the rollout never landed).
+ *
+ *  "Could not look" is never reported as "nothing is there" (`docs/mcp-tool-conventions.md` §5).
+ *  Only a NOT_FOUND on the object is an empty answer; everything else is `NOT_AVAILABLE_HERE`.
+ *
+ *  Pure over the CLI's stderr — exported for unit testing, since the alternative is a live GCS
+ *  bucket in a unit test. */
+export function isGcsObjectMissing(stderr: string): boolean {
+  const s = stderr.toLowerCase();
+  // The shapes `gcloud storage cat` actually emits for an absent object. Deliberately specific:
+  // an unrecognised failure must fall through to "could not look", never to "nothing is there" —
+  // if this predicate is going to be wrong, it must be wrong in the safe direction.
+  //
+  // NOTE the underscore form `not_found` and NOT the loose English "not found": the broad version
+  // matched `gcloud: command not found`, i.e. gcloud is not INSTALLED — which is the furthest thing
+  // from "the bucket is empty", and would have reported a missing toolchain as a confident
+  // statement about production. Caught by the test below, which is why it enumerates real stderr.
+  return (
+    s.includes('matched no objects') ||
+    s.includes('not_found') ||
+    s.includes('no such object') ||
+    (s.includes('404') && s.includes('release.json'))
+  );
+}

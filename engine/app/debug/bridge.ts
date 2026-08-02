@@ -9,7 +9,9 @@
  * (launch Chrome with --remote-debugging-port).
  */
 
+import { makeDeviceEvalApi } from './deviceEvalApi';
 import { Capacitor } from '@capacitor/core';
+import { App as CapacitorApp } from '@capacitor/app';
 import { setJournalEnabled } from '@modoki/engine/runtime';
 import {
   safeStringify,
@@ -28,6 +30,29 @@ interface Request {
 }
 
 let initialized = false;
+
+// --- Input fidelity (#32) ---
+
+/** What mechanism EVERY device input handler below actually uses to deliver a tap/drag/pointer/
+ *  key/hover/scroll/type. Today that is a synthetic DOM event (+ a private-API PixiJS v8 poke for
+ *  the canvas ops) — never OS-level trusted input. This is the SINGLE place that fact lives; every
+ *  handler reads this constant rather than a per-handler literal, so Phase 1 (Android CDP) and
+ *  Phase 2 (iOS WebDriverAgent) in docs/plans/trusted-device-input-plan.md change ONLY this one
+ *  spot (eventually replacing the constant with per-platform detection) as each trusted route
+ *  lands. See also `docs/enact.md` § "Input fidelity".
+ *  Wire format: appended to a successful string reply as ` [input:synthetic]`; the object-shaped
+ *  type-text reply carries it as a real `inputMechanism` field instead (see handleType).
+ *  Exported so `deviceInputMechanism.test.ts` asserts against THIS value rather than a duplicated
+ *  literal — a test that hardcodes 'synthetic' would keep passing if the two silently diverged. */
+export const INPUT_MECHANISM = 'synthetic' as const;
+
+/** Append the mechanism marker to a SUCCESSFUL string reply from an input-dispatch handler. Never
+ *  applied to an `Error: …` reply — a refusal/aim-resolution failure did not deliver any input, so
+ *  there is no mechanism to report. One helper so the wire format (` [input:synthetic]`) cannot
+ *  drift between the six string-returning handlers that call it. */
+function withMechanismSuffix(reply: string): string {
+  return reply.startsWith('Error:') ? reply : `${reply} [input:${INPUT_MECHANISM}]`;
+}
 
 // Original console for bridge's own logging (avoids feedback loop)
 const _log = console.log.bind(console);
@@ -53,8 +78,12 @@ function patchConsole() {
 
 // --- Command Handlers ---
 
-function handleEval(params: Record<string, unknown>): Promise<unknown> {
-  return evalCode((params.code as string) ?? '');
+/** Exported for `deviceEvalWiring.test.ts` — same reason the input handlers below are: the unit
+ *  test for `makeDeviceEvalApi()` calls that builder DIRECTLY, so it stays green even if this
+ *  function stops passing the object it builds. This is the seam production actually takes
+ *  (`case 'eval'` → here → `evalCode(code, api)`), so it is the one worth asserting. */
+export async function handleEval(params: Record<string, unknown>): Promise<unknown> {
+  return evalCode((params.code as string) ?? '', await makeDeviceEvalApi());
 }
 
 /** Convert screenshot pixel coords → CSS, reading the bridge's live `lastScreenInfo` + device dpr.
@@ -216,14 +245,14 @@ async function dispatchTapAt(x: number, y: number): Promise<string> {
   return `ok (${via}) css(${Math.round(x)},${Math.round(y)})`;
 }
 
-async function handleTap(params: Record<string, unknown>): Promise<string> {
+export async function handleTap(params: Record<string, unknown>): Promise<string> {
   const aim = await resolveAim(params, 'selector', 'x', 'y');
   if ('error' in aim) { _log(`[debug-bridge] TAP → ${aim.error}`); return aim.error; }
   _log(`[debug-bridge] TAP @ ${aim.label}`);
-  return `${await dispatchTapAt(aim.x, aim.y)} @ ${aim.label}`;
+  return withMechanismSuffix(`${await dispatchTapAt(aim.x, aim.y)} @ ${aim.label}`);
 }
 
-async function handleDrag(params: Record<string, unknown>): Promise<string> {
+export async function handleDrag(params: Record<string, unknown>): Promise<string> {
   const fromAim = await resolveAim(params, 'fromSelector', 'fromX', 'fromY');
   if ('error' in fromAim) { _log(`[debug-bridge] DRAG → ${fromAim.error}`); return fromAim.error; }
   const toAim = await resolveAim(params, 'toSelector', 'toX', 'toY');
@@ -250,7 +279,7 @@ async function handleDrag(params: Record<string, unknown>): Promise<string> {
   const domMode = explicitDom === true || (explicitDom !== false && !!grabEl && grabEl.tagName !== 'CANVAS' && !grabEl.closest('canvas'));
   if (domMode) {
     if (!grabEl) return `Error: no element to drag at ${typeof params.fromSelector === 'string' ? JSON.stringify(params.fromSelector) : `(${Math.round(from.x)},${Math.round(from.y)})`}`;
-    return domDrag(grabEl, from, to, steps, delayMs);
+    return withMechanismSuffix(await domDrag(grabEl, from, to, steps, delayMs));
   }
 
   // World-space drag: dispatch a real pointer sequence ON the canvas so it bubbles to `window` and
@@ -276,11 +305,245 @@ async function handleDrag(params: Record<string, unknown>): Promise<string> {
   if (es) es._onPointerUp(mkPointerEvent('pointerup', to.x, to.y));
   const via = [canvas && 'window', es && 'pixi'].filter(Boolean).join('+');
   _log(`[debug-bridge] DRAG → ${via}`);
-  return `ok (${via}) css(${Math.round(from.x)},${Math.round(from.y)})→(${Math.round(to.x)},${Math.round(to.y)})`;
+  return withMechanismSuffix(`ok (${via}) css(${Math.round(from.x)},${Math.round(from.y)})→(${Math.round(to.x)},${Math.round(to.y)})`);
 }
 
 function handleConsoleLogs(params: Record<string, unknown>): ReturnType<typeof consoleRing.query> {
   return consoleRing.query((params.limit as number) || 50, params.level as string | undefined);
+}
+
+// --- App identity (#88) ---
+
+/** Which app is actually holding this socket — the on-device twin of `modoki_identity`.
+ *
+ *  Port 9095 is a fixed default shared by every Modoki game, and Android keeps a backgrounded
+ *  app's process (and its bound socket) alive — so a `device_*` call can silently be answered by
+ *  a DIFFERENT app than the one just launched (#88). The MCP's `device_status` reports this so
+ *  that mismatch is one call away instead of a logcat hunt: it's read here, in the SAME page
+ *  context as the TCP server, so the answer is reported by the app that actually holds the
+ *  socket — not derived by the MCP client, which could only ever guess.
+ *
+ *  `@capacitor/app`'s `getInfo()` is unimplemented on web (throws) — this bridge only runs the
+ *  native path in practice (`initNativeBridge`, gated on `Capacitor.isNativePlatform()`), but the
+ *  fallback keeps this handler total rather than a rejection the router would have to translate. */
+export async function handleAppIdentity(): Promise<{ platform: string; appId: string; appName: string }> {
+  const platform = Capacitor.getPlatform();
+  try {
+    const info = await CapacitorApp.getInfo();
+    return { platform, appId: info.id, appName: info.name };
+  } catch {
+    return { platform, appId: '', appName: '' };
+  }
+}
+
+// --- Sustained pointer (held across calls): down / move / up (#31) ---
+
+/** The currently-HELD sustained pointer, or null between gestures.
+ *
+ *  Lives at MODULE scope in this file — the device-side analogue of the editor route's
+ *  `heldPointer` closure (`engine/electron/inputRoutes.ts`). The editor keeps the held state in
+ *  the Node BACKEND because the thing that can go away mid-gesture is the renderer (a page
+ *  reload wipes it, so the backend resets it explicitly on reload — see `resetHeldPointer`
+ *  there). On the device there is no separate backend: this bridge script IS the thing that
+ *  would go away on a reload, and a reload re-runs this whole module from scratch (this `let`
+ *  reinitializes to null for free) — so module scope is the honest equivalent of "the process
+ *  that owns the gesture", not a workaround. A held press does NOT currently survive a page
+ *  navigation/reload on the device (unlike the editor, which explicitly persists across one);
+ *  that asymmetry is inherent to there being no separate backend process here. */
+let heldPointer: { button: number; x: number; y: number } | null = null;
+
+/** Test-only reset — a held gesture left by one test would otherwise leak into the next
+ *  (module state persists for the life of the imported module, and vitest does not re-import
+ *  per test). Not called by production code. */
+export function _resetHeldPointerForTests(): void { heldPointer = null; }
+
+const POINTER_BUTTON_CODE: Record<string, number> = { left: 0, middle: 1, right: 2 };
+const POINTER_BUTTON_NAME = ['left', 'middle', 'right'];
+
+/** A pointer event carrying a real button/buttons state (unlike `mkPointerEvent`, which is
+ *  hardcoded to button 0 for the atomic tap). `buttons` is the CURRENTLY-held mask — 0 on
+ *  pointerup, the bit for the pressed button otherwise — so a held move reads as a drag, not a
+ *  hover, mirroring the `buttonHeldModifier` re-assertion `rendererOps.pointerMove` does for the
+ *  Electron path. */
+function mkButtonedPointerEvent(type: string, x: number, y: number, button: number): PointerEvent {
+  return new PointerEvent(type, {
+    clientX: x, clientY: y, bubbles: true, cancelable: true,
+    pointerId: 1, pointerType: 'mouse', isPrimary: true, button,
+    buttons: type === 'pointerup' ? 0 : (1 << button),
+  });
+}
+
+/** Sustained pointer: `action:'down'` presses and HOLDS (no matching up is sent), `'move'`
+ *  re-aims the still-held pointer, `'up'` releases. A `move`/`up` with nothing held, or a `down`
+ *  while already held, is refused rather than silently re-aiming/re-pressing — the same guard
+ *  the editor route (`/api/input/pointer`) makes. Each call is aimed independently (selector or
+ *  screenshot-pixel `x`/`y`, already resolved to CSS by the caller via `resolveAim`). */
+// Exported for direct unit testing (bridgePointerAndType.test.ts) — the held-pointer refusal
+// logic and the synthetic-typing fallback live ONLY here (device-side), so a test that stubs the
+// backend and asserts on the MCP tool's relayed payload cannot exercise them; jsdom lets this
+// module import cleanly (measured), so a direct call is the honest way to cover them.
+export async function handlePointer(params: Record<string, unknown>): Promise<string> {
+  const action = params.action as string;
+  if (action !== 'down' && action !== 'move' && action !== 'up') {
+    return `Error: pointer action must be 'down', 'move', or 'up' (got ${JSON.stringify(action)})`;
+  }
+  if (action === 'down' && heldPointer) {
+    return `Error: a pointer is already held (button ${POINTER_BUTTON_NAME[heldPointer.button]} down at ${heldPointer.x.toFixed(1)},${heldPointer.y.toFixed(1)}). Release it with action:'up' before pressing again.`;
+  }
+  if ((action === 'move' || action === 'up') && !heldPointer) {
+    return `Error: no pointer is held — send action:'down' first (this ${action} would be a stray event).`;
+  }
+  // A 'move'/'up' MAY omit the aim, and an 'up' normally does — releasing happens wherever the
+  // gesture got to. Fall back to the HELD position, for the same reason the button is reused
+  // below: the event must state where the pointer is, and there is no aim to resolve.
+  // Measured on-device before this fell back: `up` with no coords resolved to NaN and the
+  // canvas received pointerup at (0,0) instead of the drag-end point — a Pixi drag would
+  // release at the origin rather than where it was dragged to.
+  const hasAim = params.x !== undefined || params.y !== undefined
+    || params.selector !== undefined || params.entity !== undefined;
+  let aim: { x: number; y: number; label: string };
+  if (hasAim || action === 'down') {
+    const resolved = await resolveAim(params, 'selector', 'x', 'y');
+    if ('error' in resolved) { _log(`[debug-bridge] POINTER ${action} → ${resolved.error}`); return resolved.error; }
+    aim = resolved;
+  } else {
+    aim = { x: heldPointer!.x, y: heldPointer!.y, label: `css(${heldPointer!.x},${heldPointer!.y}) [held]` };
+  }
+
+  // 'down' picks the button (default left); 'move'/'up' MUST reuse the one already held — the
+  // event has to say which button is down, and there is no way to change it mid-gesture.
+  const buttonName = action === 'down' ? ((params.button as string) ?? 'left') : POINTER_BUTTON_NAME[heldPointer!.button];
+  const button = POINTER_BUTTON_CODE[buttonName] ?? 0;
+
+  const canvas = document.querySelector('canvas');
+  const es = getPixiEventSystem();
+  if (!canvas && !es) return 'Error: No canvas element found';
+
+  const type = action === 'down' ? 'pointerdown' : action === 'move' ? 'pointermove' : 'pointerup';
+  if (canvas) canvas.dispatchEvent(mkButtonedPointerEvent(type, aim.x, aim.y, button));
+  if (es) {
+    const ev = mkButtonedPointerEvent(type, aim.x, aim.y, button);
+    if (action === 'down') es._onPointerDown(ev);
+    else if (action === 'move') es._onPointerMove(ev);
+    else es._onPointerUp(ev);
+  }
+  showMarker(aim.x, aim.y, action === 'down' ? 'orange' : action === 'move' ? 'yellow' : 'purple', `pointer${action}(${Math.round(aim.x)},${Math.round(aim.y)})`);
+  heldPointer = action === 'up' ? null : { button, x: aim.x, y: aim.y };
+  await new Promise((r) => setTimeout(r, 16)); // let per-frame Input sampling see the edge, same as tap/drag
+
+  const via = [canvas && 'window', es && 'pixi'].filter(Boolean).join('+');
+  _log(`[debug-bridge] POINTER ${action} → ${via} @ ${aim.label}`);
+  return withMechanismSuffix(`ok (${action} ${via}, button ${buttonName}, held:${heldPointer !== null}) @ ${aim.label}`);
+}
+
+// --- Type text into the focused element (#31) ---
+
+/** e.code for a submitKey (Enter/Tab/Escape already match; reuse the tap-key helper otherwise). */
+function typeCode(key: string): string {
+  return keyToCode(key);
+}
+
+/** Set a form element's value through its NATIVE property setter and fire a real `input` event.
+ *
+ *  React patches `HTMLInputElement.prototype.value`'s setter on the instance so it can detect a
+ *  plain `el.value = x` and IGNORE it (to keep the controlled value authoritative) — so a raw
+ *  assignment does not fire `onChange`, which is exactly the outcome we must avoid (the editor's
+ *  `typeText` gets this for free because Electron's `sendInputEvent` flows through Chromium's
+ *  real input pipeline, which the device has no equivalent of). Calling the ORIGINAL prototype
+ *  setter bypasses React's instance override, and the `input` event is what React's synthetic
+ *  event system actually listens for — the same technique `@testing-library/react`'s
+ *  `fireEvent.change` uses under the hood. This is a SYNTHETIC event, not a trusted OS-level one
+ *  (out of scope here — see #32); it is the closest available substitute on a device WebView. */
+function setControlledValue(el: HTMLInputElement | HTMLTextAreaElement, value: string): void {
+  const proto = el instanceof HTMLTextAreaElement ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+  if (setter) setter.call(el, value); else el.value = value;
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+/** Same TWO QUESTIONS the editor's `typeText` distinguishes (`rendererOps.ts` ACTIVE_ELEMENT_PROBE):
+ *  can this element receive typed characters at all (readOnly/disabled/checkbox/select all hold
+ *  focus and all reject text)? Kept in sync by inspection, not import — this file cannot import
+ *  Electron-main code, and the predicate is small enough that duplicating it is cheaper than a
+ *  cross-package shared module for one boolean. */
+function typableFocus(): { typable: boolean; descriptor: string | null; el: HTMLElement | null } {
+  const a = document.activeElement as HTMLElement | null;
+  const tag = a?.tagName ?? '';
+  const TEXT_TYPES = ['text', 'search', 'url', 'tel', 'email', 'password', 'number', 'date', 'datetime-local', 'month', 'week', 'time'];
+  let typable = false;
+  if (a) {
+    if ((a as HTMLElement).isContentEditable === true) typable = true;
+    else if (tag === 'TEXTAREA') typable = !(a as HTMLTextAreaElement).readOnly && !(a as HTMLTextAreaElement).disabled;
+    else if (tag === 'INPUT') {
+      const inp = a as HTMLInputElement;
+      typable = !inp.readOnly && !inp.disabled && TEXT_TYPES.includes((inp.type || 'text').toLowerCase());
+    }
+  }
+  const descriptor = a && a !== document.body ? (tag ? tag.toLowerCase() : String(a)) + ((a as HTMLElement).id ? '#' + (a as HTMLElement).id : '') : null;
+  return { typable, descriptor, el: a };
+}
+
+function readFocusedValue(el: HTMLElement): string | null {
+  if (el.isContentEditable) return el.textContent ?? '';
+  const v = (el as HTMLInputElement | HTMLTextAreaElement).value;
+  return typeof v === 'string' ? v : null;
+}
+
+/** Type text into the CURRENTLY-focused element. `clearFirst` empties the field before typing
+ *  (replace vs append); `submitKey` dispatches a terminal key chord afterward ('Enter' submits,
+ *  'Tab'/'Escape' blur — mirrors `modoki_type_text`'s `submitKey`). Returns the SAME envelope
+ *  shape as the editor route (`ok`, `typed`, `activeElement`, `valueAfter`, `error`) so the MCP
+ *  tool can report it identically. `typed` is MEASURED (whether the requested text landed in the
+ *  field afterward), not the length of what was asked for — an unfocused/non-typable target is a
+ *  reported failure, never a silent no-op dressed as success. A successful reply also carries
+ *  `inputMechanism` (see INPUT_MECHANISM above) — this handler returns an OBJECT rather than the
+ *  string the other input handlers do, so the mechanism is a real field here instead of the
+ *  ` [input:synthetic]` suffix those use; a failure carries no field, matching the string handlers'
+ *  rule that a refusal never claims a mechanism because nothing was dispatched. */
+export async function handleType(params: Record<string, unknown>): Promise<{ ok: boolean; typed: number; activeElement: string | null; valueAfter?: string | null; error?: string; inputMechanism?: typeof INPUT_MECHANISM }> {
+  const text = params.text;
+  if (typeof text !== 'string') return { ok: false, typed: 0, activeElement: null, error: 'type-text needs a `text` string' };
+
+  const { typable, descriptor, el } = typableFocus();
+  if (!typable || !el) {
+    return {
+      ok: false, typed: 0, activeElement: descriptor,
+      error: descriptor
+        ? `the focused element (${descriptor}) cannot receive typed text — it is readOnly/disabled, or not a text control (checkbox, select, button). Nothing was typed.`
+        : 'no element is focused, so nothing was typed — device_tap the target input first, then type.',
+    };
+  }
+
+  const clearFirst = params.clearFirst === true;
+  if (el.isContentEditable) {
+    if (clearFirst) el.textContent = '';
+    el.textContent = (el.textContent ?? '') + text;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  } else {
+    const input = el as HTMLInputElement | HTMLTextAreaElement;
+    const before = clearFirst ? '' : input.value;
+    setControlledValue(input, before + text);
+  }
+  const after = readFocusedValue(el) ?? '';
+
+  const submitKey = params.submitKey;
+  if (typeof submitKey === 'string' && submitKey) {
+    const init: KeyboardEventInit = { key: submitKey, code: typeCode(submitKey), bubbles: true, cancelable: true };
+    el.dispatchEvent(new KeyboardEvent('keydown', init));
+    el.dispatchEvent(new KeyboardEvent('keyup', init));
+  }
+
+  // WHAT LANDED, not a length delta (mirrors rendererOps.typeText's S3.18 reasoning) — a landed
+  // insert is a substring of the after-value for both append and replace(clearFirst) flows.
+  const landed = text.length === 0 || after.includes(text);
+  _log(`[debug-bridge] TYPE "${text.length > 40 ? text.slice(0, 40) + '…' : text}" → ${descriptor}`);
+  if (!landed) {
+    return {
+      ok: false, typed: 0, activeElement: descriptor, valueAfter: after,
+      error: `the requested text did not land in the field (valueAfter: ${JSON.stringify(after)}) — a device WebView can only insert characters through a synthetic value-set, which some controlled inputs may reject or transform`,
+    };
+  }
+  return { ok: true, typed: text.length, activeElement: descriptor, valueAfter: after, inputMechanism: INPUT_MECHANISM };
 }
 
 // --- Enact: DOM-element drag, keyboard, hover, scroll (Phase 4) ---
@@ -323,7 +586,7 @@ function keyToCode(key: string): string {
 /** Press a key chord (keydown, hold ~1–2 frames, keyup) — open the debug menu (F12), Escape a modal,
  *  drive gameplay keys. Dispatched on the focused element (bubbles to `window`, where the menu +
  *  input sources listen). The hold lets per-frame input sampling see the down edge. */
-async function handlePressKey(params: Record<string, unknown>): Promise<string> {
+export async function handlePressKey(params: Record<string, unknown>): Promise<string> {
   const key = params.key as string;
   if (!key) return 'Error: press-key needs a key';
   const mods = (params.modifiers as string[]) ?? [];
@@ -336,12 +599,12 @@ async function handlePressKey(params: Record<string, unknown>): Promise<string> 
   await new Promise((r) => setTimeout(r, 50)); // hold ~1–2 frames so per-frame input sampling sees the edge
   target.dispatchEvent(new KeyboardEvent('keyup', init));
   _log(`[debug-bridge] KEY ${key}${mods.length ? ' +' + mods.join('+') : ''}`);
-  return `ok (key ${key}${mods.length ? ' +' + mods.join('+') : ''})`;
+  return withMechanismSuffix(`ok (key ${key}${mods.length ? ' +' + mods.join('+') : ''})`);
 }
 
 /** Hover: move the pointer over the resolved element/point (pointerover/enter/move + mousemove) so
  *  :hover styles, tooltips, and hover-gated UI light up. */
-async function handleHover(params: Record<string, unknown>): Promise<string> {
+export async function handleHover(params: Record<string, unknown>): Promise<string> {
   const aim = await resolveAim(params, 'selector', 'x', 'y');
   if ('error' in aim) return aim.error;
   const el = document.elementFromPoint(aim.x, aim.y);
@@ -351,11 +614,11 @@ async function handleHover(params: Record<string, unknown>): Promise<string> {
   el.dispatchEvent(new PointerEvent('pointerenter', { ...base, bubbles: false }));
   el.dispatchEvent(new PointerEvent('pointermove', base));
   el.dispatchEvent(new MouseEvent('mousemove', { clientX: aim.x, clientY: aim.y, bubbles: true, cancelable: true }));
-  return `ok (hover ${el.tagName.toLowerCase()}) @ ${aim.label}`;
+  return withMechanismSuffix(`ok (hover ${el.tagName.toLowerCase()}) @ ${aim.label}`);
 }
 
 /** Scroll: dispatch a wheel event at the resolved point (defaults to viewport center). */
-async function handleScroll(params: Record<string, unknown>): Promise<string> {
+export async function handleScroll(params: Record<string, unknown>): Promise<string> {
   const hasAim = typeof params.selector === 'string' || (typeof params.x === 'number' && typeof params.y === 'number');
   const p = hasAim ? params : { ...params, x: window.innerWidth / 2, y: window.innerHeight / 2 };
   const aim = await resolveAim(p, 'selector', 'x', 'y');
@@ -364,7 +627,7 @@ async function handleScroll(params: Record<string, unknown>): Promise<string> {
   const dx = (params.dx as number) ?? 0;
   const dy = (params.dy as number) ?? 0;
   el.dispatchEvent(new WheelEvent('wheel', { clientX: aim.x, clientY: aim.y, deltaX: dx, deltaY: dy, bubbles: true, cancelable: true }));
-  return `ok (scroll dx=${dx} dy=${dy}) @ ${aim.label}`;
+  return withMechanismSuffix(`ok (scroll dx=${dx} dy=${dy}) @ ${aim.label}`);
 }
 
 // --- Message Router ---
@@ -377,10 +640,13 @@ async function handleMessage(req: Request): Promise<unknown> {
     // reaches here; the old in-page canvas-extract path was dead and has been removed (D4).
     case 'tap': return await handleTap(p);
     case 'drag': return await handleDrag(p);
+    case 'pointer': return await handlePointer(p);
     case 'press-key': return await handlePressKey(p);
     case 'hover': return await handleHover(p);
     case 'scroll': return await handleScroll(p);
+    case 'type-text': return await handleType(p);
     case 'consoleLogs': return handleConsoleLogs(p);
+    case 'app-identity': return await handleAppIdentity();
     // Percept / Enact on device (device_get_scene_state, device_diagnose, device_journal, …).
     // Delegate any other method to the SHARED runtime op registry (engine/app/debug/agentBridge)
     // — the same summary-first, GUID-addressed, float-rounded ops the editor MCP uses. Its

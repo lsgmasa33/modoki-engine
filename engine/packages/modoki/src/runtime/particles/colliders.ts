@@ -12,6 +12,7 @@
  */
 
 import type { CollisionConfig, ColliderShape } from './types';
+import { warnVocabOnce } from '../core/warnVocab';
 
 /** Runtime form of a {@link CollisionConfig} — defaults filled, plane normal unit-length. */
 export interface ResolvedCollider {
@@ -163,6 +164,7 @@ export function collide(
     const s = rc.invert ? -1 : 1; // container → normal points inward
     nx = ux * s; ny = uy * s; nz = uz * s;
   } else { // solid box (axis-aligned)
+    if (rc.shape !== 'box') warnVocabOnce('particles', 'CollisionConfig.shape', rc.shape, "treated as 'box'");
     const lx = x - rc.cx, ly = y - rc.cy, lz = z - rc.cz;
     const px = rc.hx - Math.abs(lx);
     const py = rc.hy - Math.abs(ly);

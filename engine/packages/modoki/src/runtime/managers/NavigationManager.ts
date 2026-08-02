@@ -36,6 +36,12 @@ const MAX_HISTORY = 50;
 
 /** Public surface of the {@link navigationManager} singleton. See the module doc above. */
 export interface NavigationManager extends ManagerDef {
+  /** Narrowed to the no-arg form the implementation actually has — inheriting
+   *  `ManagerDef`'s `init(ctx: ManagerContext)` would force every direct caller to
+   *  fabricate a context this manager never reads (#37). Required, not optional: both
+   *  are always implemented. Rule + rationale: `docs/managers-and-systems.md`. */
+  init(): void;
+  dispose(): void;
   /** True once at least one `loadScene`/back-eligible navigation has happened. */
   readonly canGoBack: boolean;
   /** Navigate to a scene (GUID or path), pushing the current scene onto history

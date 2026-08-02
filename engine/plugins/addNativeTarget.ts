@@ -169,7 +169,7 @@ export function ensureCapacitorConfig(projectRoot: string, cfg: ProjectConfig): 
  *  the app will crash on launch (FirebaseApp.configure throws). Returns
  *  human-readable warnings (empty = nothing missing / no Firebase). */
 export function detectMissingFirebase(projectRoot: string, platform: NativePlatform): string[] {
-  let deps: Record<string, string> = {};
+  let deps: Record<string, string>;
   try {
     deps = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8')).dependencies ?? {};
   } catch { return []; }

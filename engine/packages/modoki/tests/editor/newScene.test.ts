@@ -22,11 +22,11 @@ import { newScene, getCurrentScenePath, setCurrentScenePath } from '../../src/ed
 import { WHITE_HDR_GUID } from '../../src/runtime/assets/builtinAssets';
 
 function registerAll() {
-  registerTrait({ name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: {}, isActive: {}, sortOrder: {}, parentId: { entityId: { onMissing: 'root' } }, layer: {}, guid: {} } });
-  registerTrait({ name: 'Transform', trait: Transform, category: 'component', fields: { x: {}, y: {}, z: {}, rx: {}, ry: {}, rz: {}, sx: {}, sy: {}, sz: {} } });
-  registerTrait({ name: 'Camera', trait: Camera, category: 'component', fields: { fov: {} } });
-  registerTrait({ name: 'Environment', trait: Environment, category: 'component', fields: { hdrPath: {}, intensity: {} } });
-  registerTrait({ name: 'Light', trait: Light, category: 'component', fields: { lightType: {}, color: {}, intensity: {} } });
+  registerTrait({ name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: { type: 'string' }, isActive: { type: 'boolean' }, sortOrder: { type: 'number' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, layer: { type: 'enum', options: ['', '3d', '2d', 'ui'] }, guid: { type: 'string' } } });
+  registerTrait({ name: 'Transform', trait: Transform, category: 'component', fields: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' }, rx: { type: 'number' }, ry: { type: 'number' }, rz: { type: 'number' }, sx: { type: 'number' }, sy: { type: 'number' }, sz: { type: 'number' } } });
+  registerTrait({ name: 'Camera', trait: Camera, category: 'component', fields: { fov: { type: 'number' } } });
+  registerTrait({ name: 'Environment', trait: Environment, category: 'component', fields: { hdrPath: { type: 'string' }, intensity: { type: 'number' } } });
+  registerTrait({ name: 'Light', trait: Light, category: 'component', fields: { lightType: { type: 'enum', options: ['ambient', 'directional', 'point', 'spot'] }, color: { type: 'color' }, intensity: { type: 'number' } } });
 }
 
 // serialize.ts persists the last-scene path to localStorage; the jsdom env here

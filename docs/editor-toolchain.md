@@ -74,12 +74,29 @@ tool that must be installed by hand. The dialog shows an **Install** button for 
 
 | Tool | How it's provisioned | Pin |
 |---|---|---|
-| **Node** | `nodeProvision.ts` `ensureNode()` — downloaded from nodejs.org, **sha256**-verified, `tar`-extracted. Always used (dev opt-in via `MODOKI_PROVISION_NODE=1`; automatic when packaged), so npm never depends on a user install. | `v22.23.1` (matches CI setup-node 22) |
+| **Node** | `nodeProvision.ts` `ensureNode()` — downloaded from nodejs.org, **sha256**-verified, `tar`-extracted. Always used (dev opt-in via `MODOKI_PROVISION_NODE=1`; automatic when packaged), so npm never depends on a user install. | `v24.18.1` — Active LTS, and matched by CI `setup-node` 24, `@types/node` ^24, and the root `engines`. Node 22 went maintenance-only 2025-10-21, so the packaged editor was provisioning a security-fixes-only runtime. Keep those four in lockstep: `@types/node` above the provisioned runtime typechecks clean and then fails at RUNTIME here, where nothing else is watching. |
 | **`gltf-transform-cli`**, **`gltfpack`** | `installNpmTool()` — npm-installed into a shared `<toolchainDir>/npm-tools`, exposing `.bin/<name>`. Both are npm/WASM CLIs (no native binary). | `4.4.1` / `1.2.0` |
 | **`java`** | `jdkProvision.ts` `ensureJdk()` — a pinned **Temurin JDK 21** downloaded from Adoptium, **sha256**-verified, extracted. `discoverJavaHome()` is layout-robust (macOS `Contents/Home` vs plain `bin/java`). | Temurin `21.0.11+10` |
 | **`android-sdk`** | `androidSdkProvision.ts` — bootstrap the pinned **cmdline-tools** zip (**sha1** from Google's `repository2-3.xml`) → run `sdkmanager` for the games' packages (`platform-tools`, `platforms;android-36`, `build-tools;36.0.0` — matching every game's `variables.gradle` compileSdk 36) with non-interactive license accept. **Ensures the pinned Temurin JDK first** (sdkmanager is a Java program — the chicken-and-egg), NEVER an arbitrary system JDK, so provisioning is reproducible. | cmdline-tools `15641748` |
 | **`xcodebuild` (Xcode)** | **Guided only** — multi-GB, App-Store-gated, macOS-only. `guide('xcodebuild')` gives the App Store link + `xcode-select`/license/Apple-ID steps. | — |
 | **`cocoapods`** | **Auto-installed on macOS** (`isInstallable` returns true on `darwin`, guided elsewhere) — `installCocoapods()` provisions an **isolated portable Ruby** into `<toolchainDir>/ruby` (`rubyProvision.ts`), then `gem install cocoapods` into an isolated `GEM_HOME` (`<toolchainDir>/cocoapods-gems`) — no Homebrew, no system Ruby. Native gem extensions compile against Xcode's clang (already required for iOS). `guide('cocoapods')` points at the one-click Install button. Not a `preflight('ios')` blocker — most iOS games are SPM-only and never need it. | `1.17.0` |
+
+⚠️ **`tar` does NOT mean bsdtar on Windows — never spawn a bare `tar`.** Every provisioner above
+extracts through one shared `extractArchive()`, and that one code path only works because **bsdtar**
+(libarchive) reads both `.tar.gz` and `.zip`. Windows 10 1803+ ships bsdtar at `System32\tar.exe`,
+but Git for Windows ships **GNU tar** at `/usr/bin/tar`, so a bare `tar` resolves by PATH order —
+and GNU tar breaks this two ways: it cannot read a zip at all (`This does not look like a tar
+archive`), and it parses an archive argument containing a colon as a remote `host:path`, so any
+absolute Windows path fails with `Cannot connect to E: resolve failed` on **every** drive letter.
+Measured 2026-08-02: on a PATH favouring Git, the packaged editor provisioned *nothing* — Node,
+JDK, Android SDK and Ruby all — and fell back to a system npm that the no-toolchain user it targets
+does not have. `extractArchive` therefore names `System32\tar.exe` via `tarBin()` and passes the
+archive as a bare filename with `cwd` set to its directory. Guarded by real-extraction tests in
+`engine/tests/plugins/nodeProvision.test.ts`.
+
+The failure was invisible twice over, which is the part worth remembering: `ensureNodeProvisioned()`
+catches and degrades to system npm, so **`smoke:packaged` reported PASS** throughout; and macOS is
+immune (its `tar` is bsdtar, and there are no drive letters), so no Mac clone could ever reproduce it.
 
 Each installable-into-userData tool (`java`, `android-sdk`, `gltf-transform-cli`, `gltfpack`) also has
 a **userData candidate** in its registry entry keyed off `MODOKI_TOOLCHAIN_DIR`, so `detect()` finds the

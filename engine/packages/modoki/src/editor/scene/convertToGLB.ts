@@ -408,9 +408,9 @@ export async function loadSourceModel(sourcePath: string, postprocessorId = 'non
     // supported, FileVersion: 6100" or "Cannot find the version number" — both
     // mean the same thing to a user who just wants their model in.
     if (ext === '.fbx' && /version/i.test(msg)) {
-      throw new Error(`${fileName}: this is an old FBX (6.x) format three.js can't read. Re-export it as FBX 7.x (binary), or import the OBJ/DAE version instead.`);
+      throw new Error(`${fileName}: this is an old FBX (6.x) format three.js can't read. Re-export it as FBX 7.x (binary), or import the OBJ/DAE version instead.`, { cause: e });
     }
-    throw new Error(`${fileName}: could not be loaded — ${msg}`);
+    throw new Error(`${fileName}: could not be loaded — ${msg}`, { cause: e });
   }
 
   // Drop postprocessor-filtered meshes (ground/helper planes) before anything

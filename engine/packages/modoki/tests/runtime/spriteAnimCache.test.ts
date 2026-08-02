@@ -29,6 +29,13 @@ describe('spriteAnimCache', () => {
     expect(resolveSpriteClip('foo.spriteanim.json', 'walk')).toBeUndefined();
   });
 
+  it('{load:false} PEEKS a cold miss without starting a fetch', () => {
+    // The `read-asset-def` agent op's contract: report what is in the live cache right
+    // now, never kick off a background load for a question it is about to refuse anyway.
+    expect(getSpriteAnim('peek.spriteanim.json', { load: false })).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it('resolves a seeded clip by name', () => {
     setSpriteAnim('a.spriteanim.json', {
       clips: { walk: { frames: ['g1', 'g2'], fps: 10, mode: 'loop', cycles: 0 } },
@@ -49,8 +56,10 @@ describe('spriteAnimCache', () => {
   });
 
   it('normalizes malformed seed data (drops non-string frames, fills timing defaults)', () => {
+    // Deliberately partial/malformed clip (missing fps/mode/cycles, junk frame entries) —
+    // exercises the normalizer's defaulting/filtering, so the cast is the point of the test.
     setSpriteAnim('b.spriteanim.json', {
-      clips: { walk: { frames: ['ok', 5, null] as unknown as string[] } },
+      clips: { walk: { frames: ['ok', 5, null] } as unknown as import('../../src/runtime/traits/SpriteAnimator').SpriteClip },
     });
     const clip = resolveSpriteClip('b.spriteanim.json', 'walk')!;
     expect(clip.frames).toEqual(['ok']);       // non-strings dropped

@@ -35,6 +35,7 @@ import { physics2DEvents } from './Physics2DEvents';
 import { makeFireOnCollision, drainContactEvents, synthesizeContactExits, refOf, type ColliderInfo } from './physicsContactEvents';
 import { dropEntityFromContactIndex } from './physicsContactIndex';
 import { emit, isVerboseCaptureActive } from '../core/journal';
+import { warnVocabOnce } from '../core/warnVocab';
 import { initRapier2D, isRapierReady, getRapier, type Rapier } from './rapierLoader';
 import {
   vecEcsToPhys, vecPhysToEcs, vecEcsToPhysInto, vecPhysToEcsInto,
@@ -393,7 +394,14 @@ function createBody(
   let desc;
   if (rb.bodyType === 'static') desc = R.RigidBodyDesc.fixed();
   else if (rb.bodyType === 'kinematic') desc = R.RigidBodyDesc.kinematicPositionBased();
-  else desc = R.RigidBodyDesc.dynamic();
+  else {
+    // Consequence is NOT simply "behaves dynamic": BodyRec.bodyType caches the raw authored
+    // string and the Rapier->ECS pull-back gate below tests it against the literal 'dynamic',
+    // so an unrecognised value yields a dynamic body whose Transform is never written back.
+    // The visible symptom is a FROZEN entity, not a falling one — say so (#73).
+    if (rb.bodyType !== 'dynamic') warnVocabOnce('physics2D', 'RigidBody2D.bodyType', rb.bodyType, "a dynamic body is created, but its Transform is never pulled back — the entity will appear frozen");
+    desc = R.RigidBodyDesc.dynamic();
+  }
 
   desc.setTranslation(pos.x, pos.y).setRotation(ang)
     .setLinvel(vel.x, vel.y).setAngvel(angEcsToPhys(rb.angularVel))
@@ -577,7 +585,9 @@ function createJoint(
     // Frame angles 0/0 lock a ZERO relative rotation — a weld aligns the two bodies'
     // orientations (not "preserve current relative angle"). Matches the doc's "orientation locked".
     case 'fixed': jd = R.JointData.fixed(a1, 0, a2, 0); break;
-    default: return;
+    default:
+      warnVocabOnce('physics2D', 'Joint2D.type', j.type, 'joint not created');
+      return;
   }
 
   const joint = st.world.createImpulseJoint(jd, bodyA, bodyB, true);

@@ -117,6 +117,14 @@ export function sampleAll(out: InputFrame): void {
     if (!wasSuppressed) { wasSuppressed = true; for (const s of sources) s.reset?.(); }
     return;
   }
+  // Reset again on the REOPENING edge, not just the closing one: a source's raw
+  // listeners (window pointerdown/up, etc.) are never detached by the gate — only
+  // `sample()` is skipped while suppressed — so a source that queues discrete events
+  // (pointerSource's press/release FIFO) keeps enqueuing every click made in an
+  // editor panel while the game is unfocused. Without this, reopening the gate
+  // replays that whole backlog into the game one entry per frame. Closing-edge reset
+  // alone only clears what was ALREADY latched at the moment of closing.
+  if (wasSuppressed) { for (const s of sources) s.reset?.(); }
   wasSuppressed = false;
   for (const s of sources) s.sample(out);
 }

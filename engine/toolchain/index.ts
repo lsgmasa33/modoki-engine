@@ -1176,7 +1176,7 @@ function forceRemoveDir(dir: string): void {
       throw new Error(
         `Could not fully remove ${dir} — some files are still in use (a Gradle build daemon may be ` +
         `running). Close any running build and try again; if it persists, quit the editor (or restart ` +
-        `the machine) and retry.`)
+        `the machine) and retry.`, { cause: e })
     }
     throw e
   }

@@ -23,7 +23,7 @@ import { convertTexture, __resetKtxCheck } from '../../plugins/texture-convert';
 import { getCacheDir, cachePathFor } from '../../plugins/texture-cache';
 import {
   DEFAULT_TEXTURE_SETTINGS, variantsForFormat, variantExtension,
-  type TextureFormat, type TextureImportSettings, type TextureType, type TextureVariant,
+  type TextureFormat, type TextureImportSettings, type TextureMaxSize, type TextureType, type TextureVariant,
 } from '../../packages/modoki/src/runtime/loaders/textureSettings';
 
 function toktxPresent(): boolean {
@@ -69,7 +69,11 @@ afterAll(() => {
 });
 
 function settings(format: TextureFormat, over: Partial<TextureImportSettings> = {}): TextureImportSettings {
-  return { ...DEFAULT_TEXTURE_SETTINGS, format, maxSize: 64, mipmaps: true, ...over };
+  // 64 is deliberately smaller than any TextureMaxSize enum member (256..4096) — it's not a
+  // supported Inspector dropdown value, but convertTexture only ever treats maxSize as a plain
+  // numeric scale cap (see texture-convert.ts), so an out-of-enum size still converts correctly
+  // and keeps this suite's real-encoder runs fast.
+  return { ...DEFAULT_TEXTURE_SETTINGS, format, maxSize: 64 as TextureMaxSize, mipmaps: true, ...over };
 }
 
 async function run(format: TextureFormat, over: Partial<TextureImportSettings> = {}, textureType?: TextureType) {
@@ -122,7 +126,7 @@ describe('texture conversion pipeline (real encoders)', () => {
   }, 30_000);
 
   it('changing settings changes the content hash', async () => {
-    const a = await run('webp', { maxSize: 64 });
+    const a = await run('webp', { maxSize: 64 as TextureMaxSize }); // see `settings()`'s note on 64
     const b = await run('webp', { maxSize: 256 });
     expect(b.result.hash).not.toBe(a.result.hash);
   }, 30_000);

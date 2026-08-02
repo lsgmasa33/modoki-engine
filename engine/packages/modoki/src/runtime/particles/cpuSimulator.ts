@@ -13,6 +13,7 @@ import { makeRng, randRange, sampleCurve, sampleGradientAlpha, sampleGradientCol
 import { resolveCollider, collide, type CollisionHit } from './colliders';
 import { resolveShape, samplePolyline, type ResolvedShape } from './emitterShapes';
 import { accumNoise, accumForce, dragFactor, annulusRadius, sphereRadius, resolveGravity, type Vec3 } from './simSpec';
+import { warnVocabOnce } from '../core/warnVocab';
 
 /** Instance buffers the simulator writes into each step (owned by the renderer). */
 export interface ParticleOutputs {
@@ -194,8 +195,8 @@ export class CpuParticleSim {
     const rng = this.rng;
 
     // ---- spawn position + direction by emitter shape ----
-    let ox = 0, oy = 0, oz = 0; // position
-    let dx = 0, dy = 1, dz = 0; // unit direction
+    let ox: number, oy: number, oz: number; // position
+    let dx: number, dy: number, dz: number; // unit direction
     const shape = def.shape;
     const rs = this.rshape;
     // annulus radius with uniform area density: r = sqrt(mix(in², out², u)) — canonical form in
@@ -281,7 +282,10 @@ export class CpuParticleSim {
         break;
       }
       case 'point':
+        ox = 0; oy = 0; oz = 0; dx = 0; dy = 1; dz = 0;
+        break;
       default:
+        warnVocabOnce('particles', 'EmitterShape.type', shape.type, "treated as 'point'");
         ox = 0; oy = 0; oz = 0; dx = 0; dy = 1; dz = 0;
         break;
     }

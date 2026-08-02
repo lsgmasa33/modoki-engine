@@ -51,6 +51,47 @@ function makeRenderer(overrides?: Record<string, unknown>) {
       if (sel === '#covered') return { ok: true, x: 50, y: 60, matched: 'button#covered', hitTarget: 'div.menu', occluded: true };
       return { ok: false, error: `no element matches selector "${sel}"` };
     }
+    if (op === 'resolve-entity-point') {
+      const spec = (params ?? {}) as { guid?: string; name?: string; id?: number; allowOccluded?: boolean };
+      // 'Puck' is a 3D scene entity — canvas-scope occlusion, nothing covering it.
+      if (spec.guid === 'g-puck' || spec.name === 'Puck') {
+        return {
+          ok: true, x: 400, y: 300,
+          entity: { id: 7, name: 'Puck', guid: 'g-puck', layer: '3d' },
+          matched: 'Puck [g-puck]', hitTarget: 'canvas', occluded: false, occlusionScope: 'canvas',
+        };
+      }
+      // A UI entity that something is covering — element-scope, so `occluded` is trustworthy.
+      if (spec.name === 'StartButton') {
+        return {
+          ok: true, x: 120, y: 80,
+          entity: { id: 9, name: 'StartButton', guid: 'g-start', layer: 'ui' },
+          matched: 'StartButton [g-start]', hitTarget: 'div.modal', occluded: true, occlusionScope: 'element',
+        };
+      }
+      // F15: a 2D/3D entity on an 'entity'-scope surface, sitting behind a wall. Mirrors what
+      // `entityResolve.ts` itself returns — a refusal by default, a resolved report of what was
+      // actually hit when `allowOccluded` rides along on `spec`.
+      if (spec.guid === 'g-hero' || spec.name === 'Hero') {
+        if (!spec.allowOccluded) {
+          return {
+            ok: false,
+            error: "entity Hero [g-hero] is not clickable in 'game-3d': a click at its aim point "
+              + 'selects Wall [g-wall], not it. Pass allowOccluded:true to click anyway and see what happens.',
+          };
+        }
+        return {
+          ok: true, x: 500, y: 250,
+          entity: { id: 11, name: 'Hero', guid: 'g-hero', layer: '3d' },
+          matched: 'Hero [g-hero]', hitTarget: 'canvas (entity: Wall [g-wall])',
+          occluded: true, occlusionScope: 'entity',
+          occludedByEntity: { id: 12, name: 'Wall', guid: 'g-wall' },
+          aimedAt: 'centre',
+        };
+      }
+      if (spec.name === 'Enemy') return { ok: false, error: '3 entities are named "Enemy" (g-a, g-b, g-c) — address by guid' };
+      return { ok: false, error: `no entity with guid ${JSON.stringify(spec.guid ?? spec.name ?? spec.id)}` };
+    }
     if (op === 'set-focus-scope') {
       const wanted = (params as { panel: string }).panel;
       // The real op returns the store's value AFTER the set — a panel that is not open
@@ -61,12 +102,18 @@ function makeRenderer(overrides?: Record<string, unknown>) {
       const wanted = (params as { ids: string[] }).ids;
       // computeHandles annotates each handle with onScreen / occludedBy / meta.disabled (F1). The
       // resolve closure used to drop them; these fixtures cover each un-clickable state.
-      const known: Array<{ id: string; x: number; y: number; onScreen?: boolean; occludedBy?: string; meta?: { disabled?: boolean } }> = [
-        { id: 'bone.0', x: 11, y: 22 },
-        { id: 'bone.1', x: 90, y: 80 },
+      // `occlusionChecked` mirrors what `computeHandles` really emits: TRUE only for a handle whose
+      // provider named an owning DOM element. No Canvas2D/SVG provider does, so `bone.canvas`
+      // below is the realistic shape for a keyframe/bone/vertex handle — the majority case that
+      // the old `occluded: occludedBy !== undefined` derivation answered `false` for, asserting a
+      // check that never ran.
+      const known: Array<{ id: string; x: number; y: number; onScreen?: boolean; occludedBy?: string; occlusionChecked?: boolean; meta?: { disabled?: boolean } }> = [
+        { id: 'bone.0', x: 11, y: 22, occlusionChecked: true },
+        { id: 'bone.1', x: 90, y: 80, occlusionChecked: true },
         { id: 'bone.off', x: -5, y: 400, onScreen: false },
         { id: 'bone.disabled', x: 30, y: 30, onScreen: true, meta: { disabled: true } },
-        { id: 'bone.covered', x: 40, y: 40, onScreen: true, occludedBy: 'div.modal' },
+        { id: 'bone.covered', x: 40, y: 40, onScreen: true, occludedBy: 'div.modal', occlusionChecked: true },
+        { id: 'bone.canvas', x: 60, y: 60, onScreen: true },
       ];
       return { handles: known.filter((h) => wanted.includes(h.id)) };
     }
@@ -79,7 +126,7 @@ let requestRenderer: ReturnType<typeof makeRenderer>;
 let routes: ReturnType<typeof createInputRoutes>;
 
 const post = (urlPath: string, body: unknown) =>
-  routes({ method: 'POST', urlPath, query: new URLSearchParams(), body });
+  routes({ method: 'POST', urlPath, query: new URLSearchParams(), body, tokenCheck: 'ok' });
 
 beforeEach(() => {
   calls = [];
@@ -92,7 +139,7 @@ beforeEach(() => {
 describe('routing', () => {
   it('declines non-input paths and non-POST methods, so the caller falls through', async () => {
     expect(await post('/api/capture-viewport', {})).toBeNull();
-    expect(await routes({ method: 'GET', urlPath: '/api/input/tap', query: new URLSearchParams(), body: {} })).toBeNull();
+    expect(await routes({ method: 'GET', urlPath: '/api/input/tap', query: new URLSearchParams(), body: {}, tokenCheck: 'ok' })).toBeNull();
     expect(await post('/api/input/unknown', {})).toBeNull();
   });
 });
@@ -136,9 +183,9 @@ describe('tap', () => {
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
-  it('400s when given neither a selector nor coordinates', async () => {
+  it('400s when given no aim at all — and the message names all three modes', async () => {
     const res = await post('/api/input/tap', {});
-    expect(res).toMatchObject({ status: 400, body: { error: 'tap: provide a selector or {x,y}' } });
+    expect(res).toMatchObject({ status: 400, body: { error: 'tap: provide an entity {guid|name|id}, a selector, or {x,y}' } });
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
@@ -224,9 +271,21 @@ describe('hover and scroll', () => {
     expect(calls).toEqual(['renderer:resolve-dom-point', 'hover(210,110)']);
   });
 
-  it('scroll accepts a selector and defaults both deltas to 0', async () => {
-    await post('/api/input/scroll', { selector: '#kebab' });
-    expect(ops.scroll).toHaveBeenCalledWith(210, 110, 0, 0, undefined);
+  it('a scroll with NO delta is refused, not dispatched as a zero-delta no-op (S3.15)', async () => {
+    // Pre-fix: `ops.scroll(x, y, 0, 0)` was dispatched and the route answered
+    // `ok:true, scrolled:{deltaX:0,deltaY:0}` — nothing moved, reported as success, in the one
+    // input family whose siblings (drag, drag-handle) already refuse the analogous no-op.
+    const res = await post('/api/input/scroll', { selector: '#kebab' });
+    const body = (res as { body: { ok?: boolean; error?: string } }).body;
+    expect(body.ok).toBeFalsy();
+    expect(body.error).toMatch(/no-op/);
+    expect(body.error).toMatch(/deltaY/);
+    expect(ops.scroll).not.toHaveBeenCalled();
+  });
+
+  it('deltaX alone is enough (the guard refuses NO delta, not a missing deltaY)', async () => {
+    await post('/api/input/scroll', { selector: '#kebab', deltaX: -40 });
+    expect(ops.scroll).toHaveBeenCalledWith(210, 110, -40, 0, undefined);
   });
 
   it('scroll passes BOTH deltas through with their DOM sign', async () => {
@@ -311,10 +370,10 @@ describe('sustained pointer (held across calls)', () => {
 describe('createInputRoutes.resetHeldPointer', () => {
   it('clears a held press so the next down is not 409d as already-held', async () => {
     const routesWithReset = createInputRoutes({ ops, requestRenderer });
-    await routesWithReset({ method: 'POST', urlPath: '/api/input/pointer', query: new URLSearchParams(), body: { action: 'down', x: 1, y: 1 } });
+    await routesWithReset({ method: 'POST', urlPath: '/api/input/pointer', query: new URLSearchParams(), body: { action: 'down', x: 1, y: 1 }, tokenCheck: 'ok' });
     // a second down would 409 — until we reset (simulating a renderer reload)
     routesWithReset.resetHeldPointer();
-    const afterReset = await routesWithReset({ method: 'POST', urlPath: '/api/input/pointer', query: new URLSearchParams(), body: { action: 'down', x: 2, y: 2 } });
+    const afterReset = await routesWithReset({ method: 'POST', urlPath: '/api/input/pointer', query: new URLSearchParams(), body: { action: 'down', x: 2, y: 2 }, tokenCheck: 'ok' });
     expect((afterReset as { body: { pointer: { held: boolean } } }).body.pointer.held).toBe(true);
   });
 });
@@ -363,6 +422,31 @@ describe('key, type, focus (unchanged by selectors)', () => {
     expect(err).not.toMatch(/modoki_tap the target input first/);
   });
 
+  it('a SHORT insert is ok:false, naming what actually landed (S3.18)', async () => {
+    // `typed` used to be `text.length` — a restatement of the request. sendInputEvent cannot fail,
+    // and Chromium's synthetic char path only inserts what it can express as a keyCode, so CJK /
+    // emoji / accented input was reported as typed while the field was unchanged.
+    (ops.typeText as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      typed: 0, editable: true, activeElement: 'input#name', valueAfter: '',
+      error: 'only 0 of 3 requested character(s) reached the field',
+    });
+    const res = await post('/api/input/type', { text: 'あいう' });
+    const body = (res as { body: { ok?: boolean; typed?: number; requested?: number; valueAfter?: string; error?: string } }).body;
+    expect(body.ok).toBe(false);
+    expect(body.typed).toBe(0);
+    expect(body.requested).toBe(3);
+    expect(body.valueAfter).toBe('');
+    expect(body.error).toMatch(/only 0 of 3/);
+  });
+
+  it('a full insert echoes valueAfter so `typed` is checkable, not just asserted (S3.18)', async () => {
+    (ops.typeText as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      typed: 5, editable: true, activeElement: 'input#name', valueAfter: 'hello',
+    });
+    expect(await post('/api/input/type', { text: 'hello' }))
+      .toMatchObject({ body: { ok: true, typed: 5, valueAfter: 'hello' } });
+  });
+
   it('key stays ok:true but surfaces the focused field that stops the GAME sampling it', async () => {
     (ops.pressKey as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ activeElement: 'input#console-filter', gameSwallows: true });
     const res = await post('/api/input/key', { key: 'ArrowRight' });
@@ -379,6 +463,21 @@ describe('key, type, focus (unchanged by selectors)', () => {
   it('focus with no selector blurs, and passes the result straight back', async () => {
     expect(await post('/api/input/focus', {})).toMatchObject({ body: { ok: true, view: true } });
     expect(ops.focusElement).toHaveBeenCalledWith(undefined);
+  });
+
+  it('a focus MISS keeps its named cause and the activeElement echo (S3.7)', async () => {
+    // The route must not flatten a named failure back to a bare ok:false — that is what made the
+    // tool answer "the operation reported ok:false", with no cause and no distinction between
+    // "no element matched" and "the element refused focus".
+    (ops.focusElement as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      view: true, focused: null, blurred: null, ok: false,
+      error: 'no element matches #nope — re-read the DOM', activeElement: 'body',
+    });
+    const res = await post('/api/input/focus', { selector: '#nope' });
+    const body = (res as { body: { ok?: boolean; error?: string; activeElement?: string | null } }).body;
+    expect(body.ok).toBe(false);
+    expect(body.error).toMatch(/no element matches/);
+    expect(body.activeElement).toBe('body');
   });
 });
 
@@ -459,7 +558,16 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
   it('tap-handle TAPS an occluded handle but surfaces `occluded` (provenance, not a veto)', async () => {
     const res = await post('/api/input/tap-handle', { id: 'bone.covered' }) as { body: Record<string, unknown> };
     expect(ops.tap).toHaveBeenCalledWith(40, 40, expect.anything());
-    expect(res.body).toMatchObject({ ok: true, occluded: 'div.modal' });
+    // S3.17 — `occluded` is a BOOLEAN here, exactly as on tap/hover/drag/pointer; the covering
+    // element's identity lives in `occludedBy`. It used to be the STRING itself, so the handle
+    // routes disagreed with every other aimed route about what the field means.
+    expect(res.body).toMatchObject({ ok: true, occluded: true, occludedBy: 'div.modal' });
+  });
+
+  it('…and a CLEAN handle says so explicitly instead of omitting the field (S3.17)', async () => {
+    // Omission made "not occluded" and "this route does not report occlusion" identical.
+    const res = await post('/api/input/tap-handle', { id: 'bone.0' }) as { body: Record<string, unknown> };
+    expect(res.body).toMatchObject({ ok: true, occluded: false, occludedBy: null, occlusionChecked: true });
   });
 
   it('drag-handle refuses an off-screen FROM, and a blocked toId, dispatching nothing', async () => {
@@ -474,7 +582,37 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
   it('drag-handle still drags an occluded endpoint but reports `occluded`', async () => {
     const res = await post('/api/input/drag-handle', { id: 'bone.covered', to: { x: 5, y: 5 } }) as { body: Record<string, unknown> };
     expect(ops.drag).toHaveBeenCalledWith({ x: 40, y: 40 }, { x: 5, y: 5 }, expect.anything());
-    expect(res.body).toMatchObject({ ok: true, occluded: 'div.modal' });
+    expect(res.body).toMatchObject({ ok: true, occluded: true, occludedBy: 'div.modal' });
+  });
+
+  it('drag-handle says WHICH endpoint was covered (S3.17)', async () => {
+    // The two endpoints used to collapse into one `occluded` field, so a caller could not tell a
+    // covered source from a covered destination — and the fixes differ.
+    const res = await post('/api/input/drag-handle', { id: 'bone.0', toId: 'bone.covered' }) as
+      { body: { fromTarget?: Record<string, unknown>; toTarget?: Record<string, unknown> } };
+    expect(res.body.fromTarget).toMatchObject({ id: 'bone.0', occluded: false, occludedBy: null, occlusionChecked: true });
+    expect(res.body.toTarget).toMatchObject({ id: 'bone.covered', occluded: true, occludedBy: 'div.modal', occlusionChecked: true });
+  });
+
+  /** REGRESSION (independent review, 2026-07-30). S3.17 derived `occluded` from
+   *  `occludedBy !== undefined`, but `occludedBy` is only produced for a handle whose provider
+   *  names an owning DOM element — and NO Canvas2D/SVG provider does. So every keyframe / bone /
+   *  vertex / gizmo handle came back `occluded:false, occludedBy:null`: an affirmative "nothing
+   *  covers this" for a check that never ran. Before S3.17 the field was absent (absent = unknown),
+   *  so the normalisation converted a silence into a wrong answer. `computeHandles` already
+   *  distinguishes the two with `occlusionChecked`; the route now honours it. */
+  it('a CANVAS handle reports occlusion as UNKNOWN, not as a clean bill of health', async () => {
+    const res = await post('/api/input/tap-handle', { id: 'bone.canvas' }) as { body: Record<string, unknown> };
+    expect(res.body).toMatchObject({ ok: true, occluded: null, occludedBy: null, occlusionChecked: false });
+    // …and it still TAPS: unknown occlusion is not a veto, exactly as a known one is not.
+    expect(ops.tap).toHaveBeenCalledWith(60, 60, expect.anything());
+  });
+
+  it('drag-handle omits toTarget for a raw destination (there is no handle to inspect)', async () => {
+    const res = await post('/api/input/drag-handle', { id: 'bone.0', to: { x: 400, y: 300 } }) as
+      { body: { fromTarget?: unknown; toTarget?: unknown } };
+    expect(res.body.fromTarget).toBeDefined();
+    expect(res.body.toTarget).toBeUndefined();
   });
 
   it('tap-handle forwards button/clickCount/modifiers', async () => {
@@ -493,6 +631,94 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
 
   it('400s when the handle id is missing', async () => {
     expect(await post('/api/input/tap-handle', {})).toMatchObject({ status: 400, body: { error: /id \(handle id\) is required/ } });
+  });
+});
+
+describe('entity-aimed input (the third target surface)', () => {
+  /** Editor chrome had `selector` and the canvas editors had handle ids, but a SCENE ENTITY
+   *  could only be aimed at with `{x,y}` read from a previous `get_scene_state` call — the
+   *  one read-then-act race the Enact design never closed. These tests pin that it is closed
+   *  the same way the others are: resolved in the renderer, inside the dispatching call. */
+
+  it('resolves the entity BEFORE dispatching the tap', async () => {
+    const res = await post('/api/input/tap', { entity: { guid: 'g-puck' } });
+    expect(calls).toEqual(['renderer:resolve-entity-point', 'tap(400,300)']);
+    expect((res as { body: { ok: boolean } }).body.ok).toBe(true);
+  });
+
+  it('echoes WHICH entity resolved, so a {name} aim is checkable', async () => {
+    const res = await post('/api/input/tap', { entity: { name: 'Puck' } });
+    expect((res as { body: unknown }).body).toMatchObject({ entity: { id: 7, name: 'Puck', guid: 'g-puck', layer: '3d' } });
+  });
+
+  it('reports occlusionScope alongside occluded, so the weak check cannot read as the strong one', async () => {
+    // canvas scope: `occluded:false` says nothing about a mesh in FRONT of the target.
+    const mesh = await post('/api/input/tap', { entity: { guid: 'g-puck' } });
+    expect((mesh as { body: unknown }).body).toMatchObject({ occluded: false, occlusionScope: 'canvas' });
+    // element scope: a real DOM comparison, so this one is trustworthy.
+    const ui = await post('/api/input/tap', { entity: { name: 'StartButton' } });
+    expect((ui as { body: unknown }).body).toMatchObject({ occluded: true, occlusionScope: 'element', hitTarget: 'div.modal' });
+  });
+
+  it('refuses an ambiguous name instead of picking one — and dispatches nothing', async () => {
+    const res = await post('/api/input/tap', { entity: { name: 'Enemy' } });
+    expect((res as { status: number }).status).toBe(400);
+    expect((res as { body: { error: string } }).body.error).toContain('address by guid');
+    expect(calls).toEqual(['renderer:resolve-entity-point']);
+  });
+
+  it('takes precedence over selector and {x,y}', async () => {
+    await post('/api/input/tap', { entity: { guid: 'g-puck' }, selector: '#kebab', x: 1, y: 2 });
+    expect(calls).toEqual(['renderer:resolve-entity-point', 'tap(400,300)']);
+  });
+
+  it('an EMPTY entity object falls through to the other aim modes', async () => {
+    // `{}` is what a caller sends when it built the field conditionally and had nothing to
+    // put in it. Treating that as "aim at entity" would fail every such call with a confusing
+    // "provide an entity" while a perfectly good selector sat right beside it.
+    await post('/api/input/tap', { entity: {}, selector: '#kebab' });
+    expect(calls).toEqual(['renderer:resolve-dom-point', 'tap(210,110)']);
+  });
+
+  it('works on hover, scroll, and the sustained pointer too', async () => {
+    await post('/api/input/hover', { entity: { guid: 'g-puck' } });
+    expect(calls).toContain('hover(400,300)');
+    calls.length = 0;
+    await post('/api/input/scroll', { entity: { guid: 'g-puck' }, deltaY: 120 });
+    expect(calls).toContain('scroll(400,300,0,120)');
+    calls.length = 0;
+    await post('/api/input/pointer', { action: 'down', entity: { guid: 'g-puck' } });
+    expect(calls).toContain('pdown(400,300,left)');
+  });
+
+  it('aims BOTH drag endpoints', async () => {
+    await post('/api/input/drag', { from: { entity: { guid: 'g-puck' } }, to: { selector: '#kebab' } });
+    expect(calls).toEqual([
+      'renderer:resolve-entity-point', 'renderer:resolve-dom-point', 'drag(400,300\u2192210,110)',
+    ]);
+  });
+
+  // F15 (docs/enact.md): an occluded 'entity'-scope aim is a REFUSAL by default, and
+  // `allowOccluded` is the escape hatch \u2014 verified here at the HOST seam (the resolver's own
+  // decision is pinned in `entityResolve.test.ts`; this checks the route forwards the flag and
+  // turns the refusal into a 400 with nothing dispatched).
+  it('REFUSES (400) an occluded entity aim by default, and dispatches nothing', async () => {
+    const res = await post('/api/input/tap', { entity: { guid: 'g-hero' } });
+    expect((res as { status: number }).status).toBe(400);
+    expect((res as { body: { error: string } }).body.error).toContain('Wall');
+    expect((res as { body: { error: string } }).body.error).toContain('allowOccluded');
+    expect(calls).toEqual(['renderer:resolve-entity-point']); // the tap op was never called
+  });
+
+  it('threads `allowOccluded` through to the resolver, and reports what was actually hit', async () => {
+    const res = await post('/api/input/tap', { entity: { guid: 'g-hero', allowOccluded: true } });
+    expect((res as { status?: number }).status).toBeUndefined(); // 200 (no explicit status = ok)
+    expect((res as { body: unknown }).body).toMatchObject({
+      ok: true, occluded: true, occlusionScope: 'entity',
+      occludedByEntity: { id: 12, name: 'Wall', guid: 'g-wall' },
+      aimedAt: 'centre',
+    });
+    expect(calls).toEqual(['renderer:resolve-entity-point', 'tap(500,250)']); // dispatched this time
   });
 });
 
@@ -525,7 +751,7 @@ describe('panel-targeted input (focus-scope P7)', () => {
   it('sets the keyboard scope BEFORE dispatching the key', async () => {
     // Order matters: a panel-scoped chord resolves against the focused panel at dispatch
     // time, so focusing after the press would be useless.
-    const r = await post('/api/input/key', { key: 'w', panel: 'scene' });
+    const r = await post('/api/input/key', { key: 'w', panel: 'scene' }) as { body: unknown };
     expect(r.body).toMatchObject({ ok: true, focusedPanel: 'scene' });
     expect(calls).toEqual(['renderer:set-focus-scope', 'key(w)']);
   });
@@ -533,14 +759,14 @@ describe('panel-targeted input (focus-scope P7)', () => {
   it('FAILS LOUDLY when the panel is not open, and does NOT press the key', async () => {
     // The silent-failure this exists to prevent: a panel-scoped chord sent at the wrong
     // panel is simply yielded by the dispatcher, so it looks like a successful no-op.
-    const r = await post('/api/input/key', { key: 'w', panel: 'not-open' });
+    const r = await post('/api/input/key', { key: 'w', panel: 'not-open' }) as { status: number; body: { error: string } };
     expect(r.status).toBe(400);
     expect(String(r.body.error)).toContain('could not focus panel "not-open"');
     expect(ops.pressKey).not.toHaveBeenCalled();
   });
 
   it('leaves the key path untouched when no panel is given', async () => {
-    const r = await post('/api/input/key', { key: 'z', modifiers: ['meta'] });
+    const r = await post('/api/input/key', { key: 'z', modifiers: ['meta'] }) as { body: unknown };
     expect(r.body).toMatchObject({ ok: true, pressed: { key: 'z' } });
     expect(r.body).not.toHaveProperty('focusedPanel');
     expect(calls).toEqual(['key(z)']);
@@ -549,7 +775,7 @@ describe('panel-targeted input (focus-scope P7)', () => {
   it('focus accepts a panel WITHOUT touching DOM focus', async () => {
     // Keyboard scope and document.activeElement are different questions — clicking a
     // Hierarchy row moves the scope but leaves activeElement on <body>.
-    const r = await post('/api/input/focus', { panel: 'hierarchy' });
+    const r = await post('/api/input/focus', { panel: 'hierarchy' }) as { body: unknown };
     expect(r.body).toMatchObject({ ok: true, focusedPanel: 'hierarchy' });
     expect(ops.focusElement).not.toHaveBeenCalled();
   });
@@ -560,7 +786,7 @@ describe('panel-targeted input (focus-scope P7)', () => {
   });
 
   it('focus with no args still blurs (unchanged)', async () => {
-    const r = await post('/api/input/focus', {});
+    const r = await post('/api/input/focus', {}) as { body: unknown };
     expect(r.body).toMatchObject({ ok: true });
     expect(ops.focusElement).toHaveBeenCalledWith(undefined);
   });

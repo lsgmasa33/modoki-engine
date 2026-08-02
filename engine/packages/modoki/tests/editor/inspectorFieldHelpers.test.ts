@@ -102,3 +102,24 @@ describe('UNIT_FIELD_MAPS / UNIT_COMPANION_FIELDS (F2 — single source of truth
     expect(UNIT_COMPANION_FIELDS.Transform).toBeUndefined();
   });
 });
+
+const { inertSizeTooltip } = await import('../../src/editor/panels/Inspector');
+
+describe('inertSizeTooltip (#16 — say WHY a greyed size field is greyed)', () => {
+  it('names the offsets that actually size the axis', () => {
+    expect(inertSizeTooltip('width', 'bottom-stretch')).toContain('left/right');
+    expect(inertSizeTooltip('height', 'left-stretch')).toContain('top/bottom');
+  });
+
+  it('quotes the specific anchor responsible, not a generic "a stretched anchor"', () => {
+    // The user is looking at ONE element; naming its anchor is what makes the
+    // message actionable rather than a restatement of the docs.
+    expect(inertSizeTooltip('width', 'h-stretch')).toContain("'h-stretch'");
+  });
+
+  it('offers the two ways out: edit the offsets, or change the anchor', () => {
+    const t = inertSizeTooltip('width', 'stretch');
+    expect(t).toMatch(/offsets/);
+    expect(t).toMatch(/non-stretched anchor/);
+  });
+});

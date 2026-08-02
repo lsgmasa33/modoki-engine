@@ -147,6 +147,56 @@ parent (`UIAnchor.ts`):
 An anchored element is rendered with `position: absolute`; pivot is applied as a CSS
 `translate(-pivotX%, -pivotY%)`. Stretched axes ignore pivot (both edges are pinned).
 
+**An offset means a different thing per axis, and the axis decides — not the field.**
+On a **non-stretched** axis the anchor is a single *point*, so an offset **moves** the
+box and leaves its size alone: `left`/`top` push away from that point, `right`/`bottom`
+push *inward from the far edge* (i.e. they subtract from the same near edge). On a
+**stretched** axis both edges are pinned, so each offset **insets its own edge** and the
+box **shrinks** — `left: 5%` + `right: 5%` on a `bottom-stretch` bar is a pair of side
+margins, giving a 90%-wide band. (Folding `right` back into the near edge there would
+make the two cancel to a full-bleed box — the bug fixed 2026-07-31.) A stretched axis
+also **clears any authored `width`/`height`**, so the two offsets fully govern that axis.
+
+That last clause is a trap worth stating twice, because the authored value is still
+*stored and displayed*: on a stretched axis `UIElement.width`/`height` can never take
+effect, and the two offsets are the ONLY way to size it. The axes are independent — a
+`top-stretch` element has an inert width but a perfectly live height. Three places agree
+on this via the one predicate `isSizeInert` (`runtime/ui/anchorLayout.ts`), so none of
+them can drift from the layout that does the clearing:
+- **the layout** — `applyAnchorStyle` clears the CSS size, `resolveAnchorRect` overwrites
+  the pixel extent;
+- **the Inspector** — greys the field out per-axis (read-only input + disabled unit
+  dropdown; across a multi-selection only when it is unanimous — see below) and, on
+  hover, names the responsible anchor and the offsets to edit instead.
+  The `AnchorLayoutNote` banner atop the Layout section says the same thing generically
+  for the whole section; the per-field tooltip is the specific half — *which* axis, and
+  what to reach for. It deliberately **supersedes** the field's own hint, because
+  "0 = auto (sized by content/flexbox)" is false once the axis is stretched;
+- **the scene validator** — warns on an authored size the anchor makes inert, so a scene
+  read as JSON gets the same signal the Inspector gives, including for a prefab
+  instance's overridden fields when a prefab resolver is available. Its noise budget
+  (why `0` and `100%` are excluded) and the prefab-instance resolver contract are in
+  [scene-loading.md](./scene-loading.md#scene-validation-warn-but-load).
+
+**Across a multi-selection the gate is unanimous-or-nothing.** Because it *disables* the
+control rather than merely dimming it, resolving it from the primary entity alone is wrong in
+both directions: a stretched primary makes the field read-only on siblings where the value
+genuinely takes effect, and an un-stretched primary lets a write land on siblings that
+silently discard it — the very trap the gate exists for, re-entered through the selection.
+So both gates read EVERY selected entity (`selectionSizeGate` / `selectionAnchorGate`,
+`editor/uiAuthoring.ts`) and yield one of three verdicts: **inert** (dead on all → read-only
++ dimmed), **live** (dead on none → untouched), or **mixed** — which stays **editable**,
+half-dimmed, its tooltip stating how much of the write will be discarded. Blocking the mixed
+case would strand the entities where the value works, which is why "some are inert" may not
+disable anything. The same rule governs the self-placement props and the `AnchorLayoutNote`,
+which carries a "partly anchored" wording rather than claiming fields are disabled when they
+are not. One distinction the two gates deliberately disagree on: an anchor with an unreadable
+mode kills self-placement (any anchor does) but stretches nothing, so it leaves the size live.
+
+The failure mode this guards: `games/court`'s `NarrationBand` carries `width: 90%` on a
+`bottom-stretch` anchor whose `left: 5%` + `right: 5%` offsets independently produce 90%.
+It looks deliberate and correct, and editing that field to `50%` would change nothing.
+
 ---
 
 ## `UIRenderer` — ECS → DOM
@@ -214,7 +264,14 @@ truth for anchor math: the runtime DOM path in `UINode` mirrors it with CSS
 `top/left/right/bottom` + `translate`, and the editor's `SceneView` uses it directly to
 draw the device-space gizmo over the simulated viewport. Keeping both paths on one
 function avoids the runtime and editor drifting on edge cases (pivot on stretched axes,
-right/bottom offsets subtracting inward, etc.).
+far-edge offsets subtracting inward on a point axis but insetting on a stretched one,
+etc. — see the offset rules under `UIAnchor` above).
+
+The parity test (`uiAnchorParity.test.ts`) feeds identical anchor data to both paths and
+asserts they agree. **Agreement is not correctness** — it pins consistency, and the two
+implementations can be wrong in the *same* way, which is exactly how the stretched-axis
+offset bug survived. So that suite also asserts the resolved rect outright (a 5%/5%
+`bottom-stretch` band must measure x=5%, w=90%), not just that the two paths match.
 
 ---
 

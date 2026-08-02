@@ -111,7 +111,7 @@ describe('syncParticles', () => {
 
     // A child added by the backend AFTER creation (sub-emitter) must also inherit
     // the layer — the per-frame re-tag covers it.
-    const root = backend.getObject3D({ id: 1 });
+    const root = backend.getObject3D({ id: 1 })!; // just created above by syncParticles
     const child = new THREE.Object3D();
     root.add(child);
     sync.syncParticles(world, makeScene(), state, 0.016);

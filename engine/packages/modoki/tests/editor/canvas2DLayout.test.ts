@@ -13,11 +13,12 @@ import {
   type UISizeSpec, type Canvas2DSpec,
 } from '../../src/editor/scene/canvas2DLayout';
 import type { AnchorData } from '../../src/runtime/ui/anchorLayout';
+import type { AnchorMode } from '../../src/runtime/traits/UIAnchor';
 import type { Canvas2DScaleMode } from '../../src/runtime/traits/Canvas2D';
 import { DEVICE_PRESETS, resolveLogicalSize } from '../../src/editor/scene/devicePresets';
 
 // ── helpers ──────────────────────────────────────────────
-function anchor(name: string, o: Partial<AnchorData> = {}): AnchorData {
+function anchor(name: AnchorMode, o: Partial<AnchorData> = {}): AnchorData {
   return {
     anchor: name,
     top: 0, topUnit: 'px', right: 0, rightUnit: 'px',
@@ -194,7 +195,7 @@ describe('computeCanvas2DLayout — exact hand-computed cases', () => {
 describe('computeCanvas2DLayout — invariants across devices × anchors × modes', () => {
   const matrixDevices = ['iPhone 16 Pro', 'iPad Pro 11"', '16:9 (1080p)', '1:1']
     .map((n) => devices.find((d) => d.name === n)!);
-  const anchors = ['stretch', 'center', 'top-left', 'bottom-right'];
+  const anchors: AnchorMode[] = ['stretch', 'center', 'top-left', 'bottom-right'];
   const sizes: Array<[string, UISizeSpec]> = [
     ['100%×100%', size(100, '%', 100, '%')],
     ['200×300px', size(200, 'px', 300, 'px')],

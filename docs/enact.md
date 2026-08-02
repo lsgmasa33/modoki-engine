@@ -13,6 +13,116 @@ is the uncurated escape hatch; `data-ui-id` handles are the curated, enumerable 
 the same way through the same DOM→point resolver, so the zero-rect guard, the invalid-selector
 guard, and occlusion reporting live in exactly one place.
 
+**Aimed input has THREE target surfaces**, and for a long time only two were covered:
+
+| Target | Aim mode | Resolved in-call? |
+|---|---|---|
+| Editor chrome (DOM) | `selector` / `data-ui-id` handle | ✅ |
+| Canvas-editor geometry (bones, keyframes, collider verts, gizmo axes) | `modoki_handles` → `tap_handle`/`drag_handle` | ✅ |
+| **Scene entities in a viewport** | **`entity: {guid\|name\|id}`** — see below | ✅ (added 2026-07-29) |
+
+The entity row was the last read-then-act race in the surface: before it, tapping a mesh meant
+reading `get_scene_state?bounds=1` in one round-trip and clicking those coordinates in the next —
+and `modoki_tap`'s own description recommended exactly that. `entity` closes it, and the same
+single-resolver discipline applies: a **UI** entity IS a DOM node, so it goes through
+`resolveElementPoint`/`occlusionAt` — the selector path's own recipe, not a copy of it — while 2D/3D
+entities take their rect from the registered **bounds providers** (`collectScreenBounds`, the same
+data `layout-bounds` reports) rather than a second projection that could drift from it.
+Implementation: `engine/app/debug/entityResolve.ts` + the `resolve-entity-point` op, wired into the
+one `resolvePoint` seam in `engine/electron/inputRoutes.ts` so all five aimed routes get it at once.
+
+**`occlusionScope` — the honest half, and the part to actually read.** An entity aim reports how far
+the occlusion check could see, because `occluded:false` does not mean the same thing on every path:
+
+- **`'element'`** (UI) — a real DOM comparison. Anything covering the entity, including another UI
+  entity, is detected. Trustworthy.
+- **`'entity'`** (2D/3D, a surface with a registered **pick provider** —
+  `registerPickProvider`/`pickAt`, `engine/packages/modoki/src/runtime/core/screenPick.ts`) — the
+  surface's OWN hit-test was asked what a click at the aim point would actually select, so
+  entity-vs-entity occlusion inside the canvas IS checked: a mesh in front of the target is
+  detected. This is a **prediction** of that surface's picking, not a second opinion beside it —
+  the provider is wired to the SAME code path the surface's pointer handler runs (`screenPick.ts`'s
+  header states the rule), never an independently-written raycast that merely happens to agree
+  today. On this scope an **occluded entity aim is a REFUSAL** (`ok:false`, HTTP 400), not a flag:
+  `entity` aiming expresses intent about an ENTITY — "click the character" — so if the surface
+  would not select that character, the intent has failed, and dispatching anyway would land on the
+  blocker (or nothing) while still reporting success. The refusal names the blocking entity the way
+  `hitTarget` names a covering DOM element. Pass `entity.allowOccluded:true` to dispatch anyway and
+  see what was actually hit — the escape hatch stays available, it just is not the default.
+- **`'canvas'`** (2D/3D, a surface with **no** pick provider) — the entity is pixels inside a
+  canvas, not a DOM node, so this only answers *"does the click reach the rendering surface"*. A
+  panel or dialog over the canvas is caught; **a mesh directly in front of the target is NOT** — it
+  reports `occluded:false`. This is the honest fallback, not a bug: the engine ships no default
+  picker for the runtime GameView surfaces (`game-2d`/`game-3d`) on purpose — selection policy is
+  GAME code (a physics scene query, PixiJS events, a custom raycast, or nothing at all), and the
+  engine has no business deciding what a game considers clickable. A game registers its own
+  provider to opt in; only the editor's `scene-view` surface ships one today (its SceneView
+  pointer-handler picking, hoisted into a shared function both the handler and the provider call).
+  `scene-view` registers **two** — the 2D canvas overlay and the 3D viewport, which overlap on
+  screen — so `registerPickProvider` takes an explicit `priority` (higher consulted first,
+  registration order breaking ties) and the 2D overlay declares that it sits on top. Before #80
+  this could not bite, because a 2D `scene-view` aim was refused for want of bounds before any
+  picker ran; the order it fell back on was React effect mount order, which is not guaranteed to
+  match z-order. State the priority rather than relying on mount timing.
+
+Reporting the scope is what stops the weaker check from being read as the stronger one; a bare
+`occluded:false` on `'canvas'` would be a false clean bill of health. The `'entity'` scope also
+reports **`aimedAt`** (`'centre'` | `'sampled'`): the aim point starts at the centre of the
+entity's projected rect, which for a torus, an L-shape, a crescent — any concave or hollow mesh —
+is not on the entity at all. When the picker confirms the centre misses, the rect is searched (a
+small grid, closest-to-centre first, capped and reported as `samplesTried`) for a point that DOES
+pick the target; `aimedAt:'sampled'` marks that this happened, so a sampled aim is never mistaken
+for a clean centre hit.
+
+**Everything ambiguous is refused, never approximated** — an ambiguous `name`, an off-screen entity,
+a zero-size projection, a UI entity with no mounted node, and the subtle one: a rect that *overlaps*
+the viewport while its CENTRE sits outside the window. Clamping that to the viewport edge would
+produce a successful-looking click on the border.
+
+### `surface` — WHICH on-screen copy of the entity
+
+One entity often has **several** on-screen rects, and in the editor that is the norm rather than an
+edge case: with the Scene and Game panels both open, `Scene3D` and `SceneView` each measure every 3D
+entity through their own camera. Measured on `games/3d-test`, one entity id, `get_layout_bounds`:
+
+| surface | rect |
+|---|---|
+| `game-3d` | `{x:755, y:312, w:47, h:45}` |
+| `scene-view` | `{x:76, y:-63, w:496, h:372}` |
+
+Both `onScreen: true`, and — until 2026-07-30 — both **unlabelled**, so resolution took the first
+one the provider `Set` happened to yield. When that was the panel not on top, the click landed in
+the wrong viewport and reported success: the exact failure mode `entity` aiming exists to remove.
+
+So every provider labels its rects (`surface: 'game-3d' | 'game-2d' | 'scene-view'`), and **a 2D/3D
+entity aim REQUIRES `surface`** — including when only one viewport has the entity.
+
+That last part is the whole point, and it is not about disambiguation. Refusing only the *ambiguous*
+case (the first version of this) left the dangerous half open: a single-surface aim **succeeds
+without the caller ever stating what it meant**, so there is nothing to check the intent against. An
+agent that believed it was clicking the GameView, while only the SceneView had the entity aimable,
+got `ok:true` and a wrong belief — recorded solely in a `surface` field it had no reason to re-read.
+Requiring the parameter turns that into a refusal that **names what is actually on screen**, which
+corrects the belief instead of confirming the wrong one. A refusal is not a confusion; it is the good
+outcome. The cost is one parameter on every mesh aim; the gain is that the call means the same thing
+regardless of which panels the human happens to have open.
+
+- A successful aim **always** reports the `surface` it used — "I tapped the cube" is not checkable
+  without knowing which on-screen cube.
+- **A UI entity refuses `surface`.** It *is* a single DOM node, so there is nothing to choose and no
+  surface name describes it. Refused rather than ignored: accepting a parameter and not using it
+  would let the caller believe it had constrained an aim that was never constrained — the same lie
+  in the other direction.
+- When the chosen surface is not aimable, the reason names **that** surface (`game-3d: off-screen`).
+  Reporting the other panel's reason would answer a question the caller did not ask.
+- **`get_editor_state.surfaces`** lists the surfaces mounted right now, so a caller — especially a
+  batch, which cannot read a response to recover from a refusal — can get it right first time
+  instead of guessing at the very thing the requirement exists to stop it guessing about.
+
+`get_layout_bounds` returns one row per surface, each labelled. `get_scene_state?bounds=1` has one
+row per *entity*, so it reports the winning rect's `surface` plus `otherSurfaces: […]` — it still
+answers with one rect, but no longer presents one of several answers as the answer.
+
 ## The original gap
 
 Percept can locate ECS entities via bounds providers, but those providers are only three —
@@ -39,8 +149,9 @@ Three compounding papercuts motivated the fix, all now addressed by the pieces b
 
 ## Selector-aware raw input
 
-`modoki_tap` / `drag` / `hover` / `scroll` accept an optional `selector` alongside `{x,y}`,
-resolved **server-side** so there's no race between reading a position and acting on it.
+`modoki_tap` / `drag` / `hover` / `scroll` / `pointer` accept an optional `selector` (and an
+`entity`, above) alongside `{x,y}`, resolved **server-side** so there's no race between reading a
+position and acting on it. Precedence is `entity` → `selector` → `{x,y}`.
 
 - `resolveEndpoint` lives in `engine/app/debug/domResolve.ts` (extracted from the DnD path in
   `engine/app/debug/domDnd.ts`).
@@ -81,6 +192,12 @@ The handle shape carries three fields that make chrome addressing robust:
 - **`occludedBy`**, computed via `document.elementFromPoint(cx, cy)`: when the topmost element at
   the handle's center isn't the handle or a descendant, the report names what covers it. This
   finds the "`⋮`-covered-by-its-own-open-menu" bug in a single query.
+  The `tap_handle` / `drag_handle` RESPONSES report it the same way every other aimed route does
+  (S3.17): `occluded` is a **boolean, always present**, with the covering element in `occludedBy`.
+  They used to emit `occluded` as the string itself and omit it when clean, so "not occluded" and
+  "this route does not report occlusion" were indistinguishable. `drag_handle` reports per ENDPOINT
+  (`fromTarget` / `toTarget`, mirroring `/api/input/drag`), because a covered source and a covered
+  destination need different fixes.
 
 ### What's tagged today
 
@@ -160,9 +277,21 @@ supposedly already hardened against.
   `drag_handle {delta:{dx:0,dy:0}}` — a truthy object that sails past the "did you give me a
   destination?" guard. Both routes now refuse it and name `tap`/`tap_handle` instead. A *one-pixel*
   drag is still dispatched: sub-threshold gestures are app semantics, not this layer's policy.
+  **The same class, found later on SCROLL (S3.15):** a scroll with no delta dispatched a zero-delta
+  wheel and answered `ok:true, scrolled:{deltaX:0,deltaY:0}` — nothing moved, reported as success, in
+  the one input family whose siblings already refused the analogous no-op. Now refused, naming
+  `deltaY` (~120 ≈ one wheel tick). Its device twin `device_scroll` refuses too, and took the
+  opportunity to adopt `deltaX`/`deltaY` (it had `dx`/`dy` — same operation, two names).
 - **`type_text` reported success typing into a `readOnly` field.** `{ok:true, typed:3}` into the
   Inspector's readOnly name input, whose value was provably unchanged (`"пальма_1"` before and
   after, read via CDP). `typed` was only ever `text.length` — the op never reads back.
+  **Fully closed by S3.18:** `typed` is now the MEASURED value delta of the focused element and
+  `valueAfter` echoes the field, so a short insert is `ok:false` naming what landed. This matters
+  beyond `readOnly`: Chromium's synthetic `char` path can only insert what it expresses as a
+  `keyCode`, so **non-ASCII text (CJK, emoji, accented letters) is silently dropped** — set such a
+  value through the app's own UI instead. Pinned by
+  `engine/tests/electron/typeTextMeasured.test.ts` (mutation-tested: replacing the delta with
+  `text.length` fails it).
 - **`press_key`'s warning over-claimed.** It said a focused field "will swallow this key" on a
   press where `f` demonstrably framed the selection (camera `[12,15,20]` → `[-0.1,1.4,1.8]`).
 
@@ -209,9 +338,29 @@ gives `committed:true` (136 → 141 entities, `undoLabel: 'Instantiate "Cone"'`)
 really was accepted; some legitimate drops make no undoable edit (a file move writes to disk), so
 downgrading them would trade a false success for a false failure across drop targets nobody has
 enumerated. The warning says exactly what is known and no more.
-- [ ] Apply the same question to the **device twin** (`device_tap`/`device_drag`/
-      `device_press_key`/`device_hover`/`device_scroll`), which dispatches SYNTHETIC DOM events
-      rather than trusted input — a strictly weaker fidelity position.
+- [x] Apply the same question to the **device twin** (`device_tap`/`device_drag`/`device_pointer`/
+      `device_press_key`/`device_hover`/`device_scroll`/`device_type_text`) — it dispatches SYNTHETIC
+      DOM events (plus a private-API PixiJS v8 poke for canvas ops), never OS-level trusted input,
+      a strictly weaker fidelity position than the editor twins above. Full route research +
+      phased plan: **[docs/plans/trusted-device-input-plan.md](plans/trusted-device-input-plan.md)**
+      (issue #32). Phase 0 (make the gap HONEST — every reply states the mechanism it used) has
+      landed; Phase 1 (Android CDP) and Phase 2 (iOS WebDriverAgent) are still open.
+      *Partly advanced earlier by the MCP audit's Phase 8:* a table-driven sweep over all 20
+      `device_*` tools asserts each reports a failure as an envelope naming itself and treats the
+      device's `Error: …` STRING reply as a failure. That found `device_console_logs` feeding the
+      string to `result.map(...)` — the throw was then classified as a TRANSPORT failure, so a
+      device-side refusal was reported as "the app may have been backgrounded — relaunch it". The
+      false-success question is closed for all 20; the FIDELITY question is what the linked plan
+      now tracks.
+
+**`modoki_dnd` is the one input tool that cannot be aimed by `entity` (S3.6).** HTML5 DnD is a
+DOM-element protocol — the source element's own `dragstart` handler fills the `DataTransfer`, which is
+the whole reason this tool exists rather than a synthesized payload — so an endpoint is a DOM
+`selector` or raw viewport `{x,y}`, and there is no scene-entity endpoint to resolve. It is also the
+only input tool that carries none of the shared `matched`/`hitTarget`/`occluded` provenance, because it
+runs through the editor-action relay rather than `/api/input/*`. Both facts are now in the tool
+description instead of being discoverable only by trying. Its endpoints are strict + refined, so `to:{}`
+and a misspelled `selecter` are refused rather than reaching the relay as "no aim at all".
 ### Agent-input provenance: the actor lease (fixed 2026-07-22)
 
 `withEditorActor` can only attribute code the agent **calls**. Trusted input is the opposite

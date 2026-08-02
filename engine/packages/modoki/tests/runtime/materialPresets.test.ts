@@ -46,7 +46,7 @@ describe('materialPresets — customBuilder dispatch', () => {
     const { builder } = await customBuilder();
     const mat = await builder.build({ color: 0x123456 });
     expect(isPbr(mat)).toBe(true);
-    expect((mat as { color: { getHex(): number } }).color.getHex()).toBe(0x123456);
+    expect((mat as unknown as { color: { getHex(): number } }).color.getHex()).toBe(0x123456);
     expect(console.warn).toHaveBeenCalled();
   });
 
@@ -104,7 +104,7 @@ describe('materialPresets — customBuilder dispatch', () => {
     });
     const mat = await builder.build({ shader: 'guid-2', color: 0xabcdef });
     expect(isPbr(mat)).toBe(true);
-    expect((mat as { color: { getHex(): number } }).color.getHex()).toBe(0xabcdef);
+    expect((mat as unknown as { color: { getHex(): number } }).color.getHex()).toBe(0xabcdef);
   });
 
   it('falls back to PBR for a shader that is neither registered nor a .shader.json', async () => {

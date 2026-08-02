@@ -8,7 +8,14 @@
  *  truth fix this design replaced (previously `pointerDrag` scaled but `pointer(world).dragX`
  *  didn't, so the same field had two meanings depending on which accessor you used). This
  *  catches a future double-scale (source pre-scaling) or a regression back to scaling only in
- *  the accessor, which a pure-accessor unit test cannot. */
+ *  the accessor, which a pure-accessor unit test cannot.
+ *
+ *  Samples the down and the move as TWO separate `inputSystem` ticks (not one sample after both
+ *  DOM events have already fired): `pointerSource`'s edge-latching FIFO (see its header comment)
+ *  reports a queued down transition's OWN coordinates on the frame that drains it, then falls
+ *  back to level state on the next sample — so collapsing a down+move into one un-ticked sample
+ *  would misreport the move's position as the press point, which is the coordinate-space bug
+ *  this fix closes (docs/todo.md), not what this test is pinning. */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createWorld, type World } from 'koota';
 import { pointerSource } from '../../src/runtime/input/pointerSource';
@@ -36,8 +43,11 @@ afterEach(() => { pointerSource.detach(); setDpr(1); __setBaseDprForTest(1); });
 describe('pointerDrag presentation-invariant end-to-end', () => {
   it('the same physical drag yields the same pointerDrag magnitude at zoom 0 and zoomed in', () => {
     // At zoom 1: a 100px drag reads 100 both via the accessor and the raw field — they now
-    // agree, because inputSystem is the ONLY place that writes dragX/dragY.
+    // agree, because inputSystem is the ONLY place that writes dragX/dragY. Sample the down
+    // and the move as two separate ticks — the FIFO drains the down transition (its own point,
+    // drag 0) on the first, then falls back to level state (the move) on the second.
     firePointer('pointerdown', 200, 300);
+    inputSystem(world);
     firePointer('pointermove', 300, 300);
     inputSystem(world);
     expect(pointerDrag(world).x).toBeCloseTo(100, 6);
@@ -51,6 +61,7 @@ describe('pointerDrag presentation-invariant end-to-end', () => {
     setDpr(1.44);
     const rawUnderZoom = 100 / 1.44;
     firePointer('pointerdown', 200, 300);
+    inputSystem(w2);
     firePointer('pointermove', 200 + rawUnderZoom, 300);
     inputSystem(w2);
     expect(pointerDrag(w2).x).toBeCloseTo(100, 2);          // normalized back to ~100

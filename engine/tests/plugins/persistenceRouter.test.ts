@@ -1,17 +1,35 @@
-/** /api/persistence + the Phase 1 additions to existing routes (mcp-persistence-
- *  unification.md): the session mode knob, `persistenceMode` on /api/editor-state, and
- *  `saved` on the file-direct write routes. Phase 1's ship gate is "auto mode, no save
- *  param ⇒ byte-identical to today" — these tests pin the ADDITIVE fields, not a
- *  behaviour change. */
+/** /api/persistence, `persistenceMode` on /api/editor-state, and `saved` on the write routes.
+ *
+ *  **Persistence is MANUAL-ONLY** (owner decision 2026-07-30). The old `auto` mode — in which a
+ *  live mutation ALSO saved to disk — is gone, so a mutating tool now behaves exactly one way and
+ *  its effect never depends on session state set in some earlier turn. These tests pin that:
+ *  a live apply does NOT save, `mode` cannot be set, and the one place a write still happens
+ *  (file-direct, where there is no live world to hold the edit) is unchanged. */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterAll } from 'vitest';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import {
-  handleBackendRequest, type BackendContext, type Manifest,
-  getPersistenceMode, setPersistenceMode, _resetPersistenceMode,
+  handleBackendRequest, type BackendContext, type Manifest, getPersistenceMode,
 } from '../../plugins/backend/editorBackendRouter';
+
+/** A PRIVATE temp dir per run, removed afterwards.
+ *
+ *  These tests used to name their scratch files `<os.tmpdir()>/modoki-…-${process.pid}-${seq}` and
+ *  never delete them. Two consequences, and the second is why this changed:
+ *
+ *   • the LEAK — 1536 stale files had accumulated in this machine's temp dir; and
+ *   • a real FLAKE, because `pid` is reused by the OS. `/api/create-asset` refuses with a 409 when
+ *     the destination already exists (correctly — it must not clobber), so a run that drew a pid
+ *     whose leftovers were still on disk failed `create-asset: saved:true on a successful scaffold`
+ *     with nothing in the test itself having changed. It failed once in ~5 full runs here.
+ *
+ *  `mkdtempSync` makes the name unique BY CONSTRUCTION rather than by hoping pid+seq is, and the
+ *  teardown means a name can never be seen twice. Note the audit's own lesson: a test whose fixture
+ *  outlives the run is a test that can be poisoned by its own history. */
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-persistence-'));
+afterAll(() => { fs.rmSync(TMP, { recursive: true, force: true }); });
 
 function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
   const base = {
@@ -30,36 +48,39 @@ function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
 
 const post = (urlPath: string, body: unknown, ctx: BackendContext) =>
   handleBackendRequest(ctx, { method: 'POST', urlPath, query: new URLSearchParams(), body });
+/** Vite's `/@fs/<abs>` form — how the renderer reports the active scene. The identity
+ *  resolveAssetPath/absToAssetUrl in makeCtx means normalization must still reduce this to the
+ *  same value as the plain path, which is exactly what the fix does. */
+const toFsUrl = (abs: string) => path.posix.join('/@fs/', abs.replace(/\\/g, '/'));
+
 const get = (urlPath: string, ctx: BackendContext) =>
   handleBackendRequest(ctx, { method: 'GET', urlPath, query: new URLSearchParams(), body: undefined });
 
-afterEach(() => { _resetPersistenceMode(); });
-
-describe('/api/persistence', () => {
-  it('defaults to auto', () => {
-    expect(getPersistenceMode()).toBe('auto');
-  });
-
-  it('bare call (no mode) reads without changing anything', async () => {
-    const r = (await post('/api/persistence', {}, makeCtx())) as { body: { mode: string; unsavedChanges: boolean | null } };
-    expect(r.body.mode).toBe('auto');
-    expect(r.body.unsavedChanges).toBeNull(); // no editor connected (default requestBrowser resolves {})
-    expect(getPersistenceMode()).toBe('auto');
-  });
-
-  it('sets the mode and it is readable on a later call (shared across calls in the session)', async () => {
-    const r1 = (await post('/api/persistence', { mode: 'manual' }, makeCtx())) as { body: { mode: string } };
-    expect(r1.body.mode).toBe('manual');
+describe('/api/persistence — manual-only', () => {
+  it('reports manual, with no way to change it', async () => {
     expect(getPersistenceMode()).toBe('manual');
-    const r2 = (await post('/api/persistence', {}, makeCtx())) as { body: { mode: string } };
-    expect(r2.body.mode).toBe('manual'); // persisted across the "session" (module state)
+    const r = (await post('/api/persistence', {}, makeCtx())) as { body: { mode: string } };
+    expect(r.body.mode).toBe('manual');
   });
 
-  it('400s on an invalid mode, leaving the current mode untouched', async () => {
-    setPersistenceMode('manual');
+  it("REFUSES mode:'auto' with a 400 instead of ignoring it", async () => {
+    // Silently accepting it would let a caller believe auto-save was back on and then lose work
+    // when nothing saved. The refusal has to name the replacement.
+    const r = (await post('/api/persistence', { mode: 'auto' }, makeCtx())) as { status?: number; body: { error?: string } };
+    expect(r.status).toBe(400);
+    expect(r.body.error).toContain('manual-only');
+    expect(r.body.error).toContain('modoki_save_all');
+  });
+
+  it("accepts an explicit mode:'manual' as a no-op (a caller stating the status quo is not an error)", async () => {
+    const r = (await post('/api/persistence', { mode: 'manual' }, makeCtx())) as { status?: number; body: { mode: string } };
+    expect(r.status).toBeUndefined();
+    expect(r.body.mode).toBe('manual');
+  });
+
+  it('rejects any other value too', async () => {
     const r = (await post('/api/persistence', { mode: 'bogus' }, makeCtx())) as { status?: number };
     expect(r.status).toBe(400);
-    expect(getPersistenceMode()).toBe('manual');
   });
 
   it('reports the renderer unsavedChanges when an editor is connected', async () => {
@@ -77,7 +98,6 @@ describe('/api/persistence', () => {
 
 describe('/api/editor-state reports persistenceMode alongside the renderer state', () => {
   it('merges persistenceMode into whatever the renderer returns', async () => {
-    setPersistenceMode('manual');
     const ctx = makeCtx({ requestBrowser: vi.fn(async () => ({ scenePath: '/x.json', unsavedChanges: false })) });
     const r = (await get('/api/editor-state', ctx)) as { body: { scenePath?: string; persistenceMode?: string } };
     expect(r.body.scenePath).toBe('/x.json');
@@ -88,7 +108,7 @@ describe('/api/editor-state reports persistenceMode alongside the renderer state
 describe('Phase 1: file-direct routes report `saved` (additive, no behaviour change)', () => {
   let seq = 0;
   function tempScene(): string {
-    const p = path.join(os.tmpdir(), `modoki-persistence-saved-${process.pid}-${seq++}.json`);
+    const p = path.join(TMP, `saved-${seq++}.json`);
     fs.writeFileSync(p, JSON.stringify({
       entities: [{ id: 1, name: 'Box', traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Box', guid: 'g-box' } } }],
     }));
@@ -116,7 +136,7 @@ describe('Phase 1: file-direct routes report `saved` (additive, no behaviour cha
   });
 
   it('asset-write: saved:true on a successful write', async () => {
-    const assetPath = path.join(os.tmpdir(), `modoki-persistence-asset-${process.pid}-${seq++}.particle.json`);
+    const assetPath = path.join(TMP, `asset-${seq++}.particle.json`);
     const r = (await post('/api/asset-write', {
       path: assetPath, type: 'particle', data: { emitter: { shape: 'point' }, particle: { lifetime: 1 } },
     }, makeCtx())) as { body: { ok: boolean; saved?: boolean } };
@@ -125,7 +145,7 @@ describe('Phase 1: file-direct routes report `saved` (additive, no behaviour cha
   });
 
   it('create-asset: saved:true on a successful scaffold', async () => {
-    const assetPath = path.join(os.tmpdir(), `modoki-persistence-create-${process.pid}-${seq++}.particle.json`);
+    const assetPath = path.join(TMP, `create-${seq++}.particle.json`);
     const r = (await post('/api/create-asset', { type: 'particle', path: assetPath }, makeCtx())) as { body: { ok: boolean; saved?: boolean } };
     expect(r.body.ok).toBe(true);
     expect(r.body.saved).toBe(true);
@@ -135,7 +155,7 @@ describe('Phase 1: file-direct routes report `saved` (additive, no behaviour cha
 describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the matching scene', () => {
   let seq = 0;
   function tempScene(): string {
-    const p = path.join(os.tmpdir(), `modoki-live-mutate-${process.pid}-${seq++}.json`);
+    const p = path.join(TMP, `live-mutate-${seq++}.json`);
     fs.writeFileSync(p, JSON.stringify({
       entities: [{ id: 1, name: 'Box', traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Box', guid: 'g-box' } } }],
     }));
@@ -143,40 +163,138 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
   }
   const setX = (scenePath: string) => ({ path: scenePath, ops: [{ op: 'setTrait', entity: { id: 1 }, trait: 'Transform', fields: { x: 5 } }] });
 
-  it('goes live and does NOT write the file itself when the active scene matches (auto mode: save-all does that instead)', async () => {
+  it('goes live, does NOT write the file, and does NOT save — manual-only', async () => {
+    // The core of removing `auto`: a live apply touches the live world and NOTHING else. It used
+    // to fire save-all here, so `saved` was true and the scene reached disk on every mutate.
     const scenePath = tempScene();
     const before = fs.readFileSync(scenePath, 'utf-8');
     const requestBrowser = vi.fn(async (op: string) => {
       if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
       if (op === 'apply-scene-ops') return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [] };
-      if (op === 'save-all') return { ok: true, scenePath };
-      throw new Error(`unexpected op ${op}`);
+      throw new Error(`unexpected op ${op} — a live apply must not save`);
     });
     const ctx = makeCtx({ requestBrowser });
-    const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { body: { ok: boolean; changed: number; saved?: boolean; mode?: string } };
+    const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { body: { ok: boolean; changed: number; saved?: boolean; mode?: string; hint?: string } };
     expect(r.body.ok).toBe(true);
     expect(r.body.changed).toBe(1);
-    expect(r.body.saved).toBe(true); // auto mode: save-all ran and reported ok
-    expect(r.body.mode).toBe('auto');
-    expect(requestBrowser).toHaveBeenCalledWith('apply-scene-ops', { ops: setX(scenePath).ops }, expect.any(Number));
-    expect(requestBrowser).toHaveBeenCalledWith('save-all', {}, expect.any(Number));
-    // The route itself never touched the file — the LIVE apply + save-all did the work.
+    expect(r.body.saved).toBe(false);
+    expect(r.body.mode).toBe('manual');
+    // The response must SAY how to persist — `saved:false` alone reads like a failure.
+    expect(r.body.hint).toContain('modoki_save_all');
+    expect(requestBrowser).not.toHaveBeenCalledWith('save-all', expect.anything(), expect.any(Number));
     expect(fs.readFileSync(scenePath, 'utf-8')).toBe(before);
   });
 
-  it('manual mode: goes live but does NOT save — saved:false, no save-all call', async () => {
-    setPersistenceMode('manual');
+  it('goes live when the renderer reports the SAME scene as a /@fs URL — normalized comparison', async () => {
+    // The regression this exists for: the check was `st.scenePath === scenePath`, a raw string
+    // compare between the renderer's Vite `/@fs/<abs>` URL and the ASSET-ROOT path this route
+    // requires. No value satisfied both — `resolveAssetPath` 403s the /@fs form before it gets
+    // here, and an asset-root path never equalled it — so the live path was UNREACHABLE and every
+    // call silently wrote the file instead. Nothing failed loudly, which is why it survived.
+    const scenePath = tempScene();
+    const before = fs.readFileSync(scenePath, 'utf-8');
+    const requestBrowser = vi.fn(async (op: string) => {
+      // The renderer's form: /@fs/<abs>. Different string, same file.
+      if (op === 'editor-state') return { playState: 'stopped', scenePath: toFsUrl(scenePath), unsavedChanges: false };
+      if (op === 'apply-scene-ops') return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [] };
+      throw new Error(`unexpected op ${op}`);
+    });
+    const r = (await post('/api/scene-mutate', setX(scenePath), makeCtx({ requestBrowser }))) as { body: { changed: number; saved?: boolean } };
+    expect(requestBrowser).toHaveBeenCalledWith('apply-scene-ops', expect.anything(), expect.any(Number));
+    expect(r.body.saved).toBe(false);          // live, so nothing written
+    expect(fs.readFileSync(scenePath, 'utf-8')).toBe(before);
+  });
+
+  it('omits the save hint when nothing changed (no pending work to persist)', async () => {
     const scenePath = tempScene();
     const requestBrowser = vi.fn(async (op: string) => {
       if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
-      if (op === 'apply-scene-ops') return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [] };
-      throw new Error(`unexpected op ${op} in manual mode`);
+      if (op === 'apply-scene-ops') return { ok: true, changed: 0, errors: [], warnings: [], unresolved: [] };
+      throw new Error(`unexpected op ${op}`);
     });
-    const ctx = makeCtx({ requestBrowser });
-    const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { body: { saved?: boolean; mode?: string } };
-    expect(r.body.saved).toBe(false);
-    expect(r.body.mode).toBe('manual');
-    expect(requestBrowser).not.toHaveBeenCalledWith('save-all', expect.anything(), expect.any(Number));
+    const r = (await post('/api/scene-mutate', setX(scenePath), makeCtx({ requestBrowser }))) as { body: { hint?: string } };
+    expect(r.body.hint).toBeUndefined();
+  });
+
+  // ── S3.12 parity: `created` must come back from BOTH branches ────────────────────────────────
+  //
+  // S3.12 gave `addEntity` a `created:[{op,id,guid,name}]` receipt so an agent never has to re-find
+  // its own new entity by name — which this surface refuses outright when the name is ambiguous, so
+  // "create then edit" could dead-end on the second step. It landed in `applyOps` (file) AND
+  // `applySceneOpsLive` (live), and both were unit-tested… but the ROUTE's live branch never
+  // forwarded it, so the receipt existed on the fallback path and was missing on the path almost
+  // every agent edit takes. Measured against a real editor on 2026-07-30 (file → `created`, live →
+  // absent).
+  //
+  // The general lesson is the audit's own #4, recurring: a capability with two backends chosen by
+  // ambient state gets "verified live" against whichever branch the ambient state happened to pick.
+  // So this asserts the CONTRACT on both branches in one place, rather than each applier in
+  // isolation — that is what the isolated unit tests already did while the route dropped the field.
+  const addBox = (scenePath: string) => ({
+    path: scenePath,
+    ops: [{ op: 'addEntity', name: 'Made', traits: { Transform: { x: 1 } } }],
+  });
+  const CREATED_KEYS = ['guid', 'id', 'name', 'op'];
+
+  it('LIVE branch forwards `created` from apply-scene-ops', async () => {
+    const scenePath = tempScene();
+    const created = [{ op: 0, id: 42, guid: 'g-made', name: 'Made' }];
+    const requestBrowser = vi.fn(async (op: string) => {
+      if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
+      if (op === 'apply-scene-ops') return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [], created };
+      throw new Error(`unexpected op ${op}`);
+    });
+    const r = (await post('/api/scene-mutate', addBox(scenePath), makeCtx({ requestBrowser }))) as {
+      body: { created?: Array<Record<string, unknown>> };
+    };
+    expect(r.body.created, 'the live branch dropped the created receipt the op returned').toEqual(created);
+  });
+
+  it('…and omits it (absent, not []) when the live apply created nothing', async () => {
+    // Same rule as `applyOps`: an empty array would read as "the add produced nothing" rather than
+    // "there were no adds in this batch".
+    const scenePath = tempScene();
+    const requestBrowser = vi.fn(async (op: string) => {
+      if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
+      if (op === 'apply-scene-ops') return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [], created: [] };
+      throw new Error(`unexpected op ${op}`);
+    });
+    const r = (await post('/api/scene-mutate', setX(scenePath), makeCtx({ requestBrowser }))) as { body: Record<string, unknown> };
+    expect('created' in r.body).toBe(false);
+  });
+
+  it('BOTH branches report the same created SHAPE for the same addEntity op', async () => {
+    // The parity check proper. The live side is stubbed at the relay (the defect was the route, not
+    // the applier); the file side runs the real `applyOps`, so its receipt is genuine — including a
+    // freshly minted guid, which is the field an agent actually needs.
+    const liveScene = tempScene();
+    const liveBrowser = vi.fn(async (op: string) => {
+      if (op === 'editor-state') return { playState: 'stopped', scenePath: liveScene, unsavedChanges: false };
+      if (op === 'apply-scene-ops') {
+        return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [], created: [{ op: 0, id: 7, guid: 'g-live', name: 'Made' }] };
+      }
+      throw new Error(`unexpected op ${op}`);
+    });
+    const liveBody = ((await post('/api/scene-mutate', addBox(liveScene), makeCtx({ requestBrowser: liveBrowser }))) as {
+      body: { created?: Array<Record<string, unknown>> };
+    }).body;
+
+    const fileScene = tempScene();
+    const fileBrowser = vi.fn(async (op: string) => {
+      if (op === 'editor-state') return { playState: 'stopped', scenePath: '/some/other/scene.json', unsavedChanges: false };
+      throw new Error(`unexpected op ${op} — should have stayed file-direct`);
+    });
+    const fileBody = ((await post('/api/scene-mutate', addBox(fileScene), makeCtx({ requestBrowser: fileBrowser }))) as {
+      body: { created?: Array<Record<string, unknown>> };
+    }).body;
+
+    expect(fileBody.created, 'the file branch lost its created receipt').toHaveLength(1);
+    expect(liveBody.created, 'the live branch lost its created receipt').toHaveLength(1);
+    expect(Object.keys(fileBody.created![0]).sort()).toEqual(CREATED_KEYS);
+    expect(Object.keys(liveBody.created![0]).sort()).toEqual(CREATED_KEYS);
+    // The file branch's guid is real (minted by applyOps), not an empty string — the receipt is
+    // only useful if the agent can address the entity with it.
+    expect(String(fileBody.created![0].guid).length).toBeGreaterThan(0);
   });
 
   it('does NOT go live when the requested scene is not the one currently loaded — stays file-direct', async () => {

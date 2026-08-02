@@ -14,6 +14,17 @@ import { execSync } from 'node:child_process';
 import { writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { isProjectDir } from './projectRoots.mjs';
+import { parseBuildTarget } from './buildTarget.mjs';
+import { scopedTsconfigContent } from './scopedTsconfig.mjs';
+
+// --target parsing lives in buildTarget.mjs (pure, unit-tested) — see its header comment for
+// WHY there is no default in either direction (#40).
+const parsed = parseBuildTarget(process.argv.slice(2), process.env);
+if (!parsed.ok) {
+  console.error(parsed.message);
+  process.exit(1);
+}
+const { target, childEnv } = parsed;
 
 const repoRoot = process.cwd();
 const engineDir = path.join(repoRoot, 'engine');
@@ -32,8 +43,11 @@ if (proj) {
   }
 }
 
+// The scoped-config SHAPE (extends + exclude restatement) is shared with
+// typecheck-projects.mjs (#24's per-project CI sweep) via scopedTsconfig.mjs — see
+// that module's header comment for why `exclude` has to be restated here at all.
 const scopedPath = path.join(engineDir, 'tsconfig.app.scoped.json');
-writeFileSync(scopedPath, JSON.stringify({ extends: './tsconfig.app.json', include }, null, 2) + '\n');
+writeFileSync(scopedPath, JSON.stringify(scopedTsconfigContent(include), null, 2) + '\n');
 
 // Invoke tsc/vite via their resolved JS entrypoints with THIS node (process.execPath),
 // not via a bare `tsc`/`vite` on PATH. Reasons: the packaged editor runs this as
@@ -42,7 +56,11 @@ writeFileSync(scopedPath, JSON.stringify({ extends: './tsconfig.app.json', inclu
 // node_modules/.bin is still prepended to PATH for any grandchild that shells out.
 const binDir = path.join(repoRoot, 'node_modules', '.bin');
 const sep = process.platform === 'win32' ? ';' : ':';
-const runEnv = { ...process.env, PATH: `${binDir}${sep}${process.env.PATH ?? ''}` };
+const runEnv = {
+  ...process.env,
+  PATH: `${binDir}${sep}${process.env.PATH ?? ''}`,
+  ...childEnv,
+};
 const node = process.execPath;
 const q = (s) => JSON.stringify(s);
 const run = (cmd) => execSync(cmd, { stdio: 'inherit', cwd: repoRoot, env: runEnv });

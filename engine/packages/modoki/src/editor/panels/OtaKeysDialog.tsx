@@ -98,6 +98,11 @@ export default function OtaKeysDialog() {
     setError(null);
     setNotice(null);
     try {
+      // A PARTIAL post: it relies on /api/project-settings deep-merging onto the
+      // on-disk config and leaving every other section alone. It used to merge onto
+      // the DEFAULTS instead, so this button reset the whole project config (app
+      // identity, signing) as a side effect of saving one key. Don't "simplify" the
+      // route back to a full replace without fixing this caller too.
       const res = await backendPostJson('/api/project-settings', { ota: { publicKey: status.publicKey } });
       const j = await res.json() as { ok?: boolean; error?: string };
       if (!res.ok || !j.ok) throw new Error(j.error || `save failed (${res.status})`);

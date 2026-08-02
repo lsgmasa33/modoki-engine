@@ -236,9 +236,17 @@ GPU:
 `setActiveRenderer(renderer)` must be called after `renderer.init()` (both at
 renderer creation and in the editor SceneView) so `KTX2Loader.detectSupport()`
 can read GPU formats — otherwise the first ASTC-variant load throws "Missing
-initialization with .detectSupport()". The first call resolves the exported
-`rendererReady` promise, which the editor bootstrap awaits before
-`loadScene()`.
+initialization with .detectSupport()". This dependency is **narrower than a
+whole scene load**: it only gates the three-side call sites that actually
+touch `KTX2Loader` (`loadTexture3D`, rigged-GLB loading, 2D-skinning billboard
+pages), each via `ensureKtx2Caps()` (`runtime/loaders/textureResolver.ts`).
+`ensureKtx2Caps()` resolves immediately once a real viewport registers a
+renderer; if none ever does, it stands up a throwaway probe renderer after a
+short delay, runs `detectSupport` on it, and disposes it. The editor's scene
+load itself does **not** wait on any of this (it once did — a `rendererReady`
+gate before `loadScene()` — which is why a layout with no 3D viewport used to
+fail the scene load outright on a 2D-only project; see
+[Editor](./editor.md#createeditor--host-configuration)).
 
 `invalidateTexture(ref)` evicts the cached bytes for every variant from
 `THREE.Cache` so a re-import re-fetches the freshly-converted files.
@@ -246,7 +254,10 @@ initialization with .detectSupport()". The first call resolves the exported
 ### 2D KTX2 sprites (PixiJS)
 
 The 2D path decodes `.ktx2` sprites/atlas-pages through PixiJS's own KTX2 parser,
-not `KTX2Loader`. `runtime/rendering/pixiKtxTranscoder.ts`
+not `KTX2Loader` — so 2D has **zero** dependency on `detectSupport`/GPU caps:
+`selectVariant(settings, '2d', caps)` ignores the `caps` argument entirely (the
+ASTC capability only affects the `'3d'` branch), and `ensureKtx2Caps()` above is
+never on a 2D/UI-only project's load path. `runtime/rendering/pixiKtxTranscoder.ts`
 `ensurePixiKtxTranscoder()` (idempotent, called during 2D startup by
 `Scene2D.tsx` and `pixiParticleBackend.ts`) does two things PixiJS v8 does **not**
 do on its own:

@@ -56,7 +56,7 @@ vi.mock('../../src/runtime/core/ecs/entityUtils', async (importOriginal) => {
 
 const rowFor = (c: HTMLElement, id: number) => c.querySelector(`[data-entity-row="${id}"]`);
 
-let scrollSpy: ReturnType<typeof vi.fn>;
+let scrollSpy: ReturnType<typeof vi.fn<(arg?: boolean | ScrollIntoViewOptions) => void>>;
 let Hierarchy: typeof import('../../src/editor/panels/Hierarchy').default;
 let useEditorStore: typeof import('../../src/editor/store/editorStore').useEditorStore;
 

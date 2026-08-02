@@ -3,6 +3,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createWorld, trait } from 'koota';
 import { SCENE_FORMAT_VERSION } from '../../src/runtime/core/version';
+import type { SceneData } from '../../src/runtime/loaders/loadSceneFile';
 
 // We need to mock the world and traitRegistry modules that loadSceneFile imports
 
@@ -54,6 +55,11 @@ vi.mock('../../src/runtime/core/ecs/world', () => {
 // name-check on 'parentId' (Phase 15).
 const LinkedRef = trait({ targetId: 0 as number });
 
+// Animator-shaped: `clips`/`clip` PERSIST (koota schema) but carry no Inspector
+// metadata — a custom section (AnimatorClipsSection) renders them. Stands in for
+// every SoA field that is absent from `meta.fields` yet must round-trip.
+const Animator = trait({ clips: '[]' as string, clip: '' as string, speed: 1 });
+
 vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
   const traits = [
     { name: 'Transform', trait: Transform, category: 'component', fields: {} },
@@ -70,6 +76,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
       name: 'LinkedRef', trait: LinkedRef, category: 'component',
       fields: { targetId: { type: 'number', entityId: { onMissing: 'root' } } },
     },
+    { name: 'Animator', trait: Animator, category: 'component', fields: { speed: { type: 'number' } } },
   ];
   return {
     getAllTraits: () => traits,
@@ -90,7 +97,7 @@ afterEach(() => {
 });
 
 async function getLoader() {
-  return import('../../../src/runtime/loaders/loadSceneFile');
+  return import('../../src/runtime/loaders/loadSceneFile');
 }
 
 describe('loadSceneFile', () => {
@@ -708,6 +715,50 @@ describe('loadSceneFile', () => {
       });
       expect(rootInstanceId).toBe(e.id()); // self-reference resolved to its own fresh id
     });
+
+    it('resolves a self-referencing rootInstanceId when entry.traits has NO EntityAttributes key at all', async () => {
+      // This is the MORE common real-world shape than the sibling test above: a
+      // captured prefab-instance root sitting at the SCENE ROOT with no editorFolder
+      // tag writes entry.traits.EntityAttributes only `if (Object.keys(minimalEa).length)`
+      // (serialize.ts) — for a top-level, unfoldered instance that's always empty, so
+      // the key is omitted from entry.traits ENTIRELY (not merely guid-less). Observed
+      // 2026-07-28 on games/3d-test's "2D Animation" scene (its Island prefab root) via
+      // a routine Play→Stop: pass 1's per-trait-iteration guid stamp
+      // (`traitName === 'EntityAttributes'`) never fires because 'EntityAttributes' is
+      // never a key of entry.traits here, so the placeholder spawns with NO
+      // EntityAttributes trait at all — undiscoverable via findEntityByGuid — and pass
+      // 2's self-reference lookup misses, stripping PrefabInstance and warning on every
+      // Stop for any top-level, unfoldered prefab instance.
+      const { loadSceneFile } = await getLoader();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const data = {
+        version: SCENE_FORMAT_VERSION,
+        entities: [{
+          id: 1,
+          guid: 'g-root',
+          traits: {
+            Transform: true,
+            // NO EntityAttributes key — the true captured-root, scene-root, no-folder shape.
+            PrefabInstance: { source: 'prefabs/island.prefab.json', rootInstanceId: 'g-root' },
+          },
+        }],
+      };
+      const spawnedEntities: { entity: any; oldId: number }[] = [];
+      await loadSceneFile(data, {
+        fetchPrefab: async () => null, // no onInstantiatePrefab — isolates pass 1 + pass 2
+        onEntitySpawned: (entity: any, oldId: number) => { spawnedEntities.push({ entity, oldId }); },
+        loadModels: false,
+      });
+      warn.mockRestore();
+      const e = spawnedEntities[0].entity;
+      expect(e.has(PrefabInstance)).toBe(true); // NOT stripped
+      expect(warn).not.toHaveBeenCalled();
+      let rootInstanceId = -1;
+      testWorld.query(PrefabInstance).updateEach(([pi]: any[], ent: any) => {
+        if (ent.id() === e.id()) rootInstanceId = pi.rootInstanceId;
+      });
+      expect(rootInstanceId).toBe(e.id()); // self-reference resolved to its own fresh id
+    });
   });
 
   // Phase 15 — the remap loop is REGISTRY-driven: any trait field flagged
@@ -718,7 +769,7 @@ describe('loadSceneFile', () => {
   describe('declarative entityId remap (Phase 15)', () => {
     it('remaps a non-parentId/rootInstanceId field flagged entityId', async () => {
       const { loadSceneFile } = await getLoader();
-      const data = {
+      const data: SceneData = {
         version: SCENE_FORMAT_VERSION,
         entities: [
           { id: 10, traits: { EntityAttributes: { name: 'Target' } } },
@@ -954,7 +1005,7 @@ describe('collectResourceRefsFromEntities', () => {
   it('collects Renderable3D mesh and material refs', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { Renderable3D: { mesh: MESH_GUID, material: MAT_GUID } } },
+      { traits: { Renderable3D: { mesh: MESH_GUID, material: MAT_GUID } } },
     ]);
     expect(refs).toContainEqual({ type: 'mesh', path: MESH_GUID });
     expect(refs).toContainEqual({ type: 'material', path: MAT_GUID });
@@ -963,7 +1014,7 @@ describe('collectResourceRefsFromEntities', () => {
   it('collects SkinnedModel GLB as a riggedModel ref', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { SkinnedModel: { model: MODEL_GUID, isActive: true } } },
+      { traits: { SkinnedModel: { model: MODEL_GUID, isActive: true } } },
     ]);
     expect(refs).toContainEqual({ type: 'riggedModel', path: MODEL_GUID });
   });
@@ -971,7 +1022,7 @@ describe('collectResourceRefsFromEntities', () => {
   it('collects Renderable3DPrimitive material ref', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { Renderable3DPrimitive: { mesh: 'cube', color: 0xffffff, size: 1, material: PRIM_MAT_GUID } } },
+      { traits: { Renderable3DPrimitive: { mesh: 'cube', color: 0xffffff, size: 1, material: PRIM_MAT_GUID } } },
     ]);
     expect(refs).toContainEqual({ type: 'material', path: PRIM_MAT_GUID });
   });
@@ -979,7 +1030,7 @@ describe('collectResourceRefsFromEntities', () => {
   it('ignores Renderable3DPrimitive without material', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { Renderable3DPrimitive: { mesh: 'cube', color: 0xffffff, size: 1 } } },
+      { traits: { Renderable3DPrimitive: { mesh: 'cube', color: 0xffffff, size: 1 } } },
     ]);
     expect(refs.filter(r => r.type === 'material')).toHaveLength(0);
   });
@@ -987,7 +1038,7 @@ describe('collectResourceRefsFromEntities', () => {
   it('collects Environment HDR path', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { Environment: { hdrPath: ENV_GUID, intensity: 1 } } },
+      { traits: { Environment: { hdrPath: ENV_GUID, intensity: 1 } } },
     ]);
     expect(refs).toContainEqual({ type: 'environment', path: ENV_GUID });
   });
@@ -995,7 +1046,7 @@ describe('collectResourceRefsFromEntities', () => {
   it('collects PrefabInstance source', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { PrefabInstance: { source: PREFAB_GUID } } },
+      { traits: { PrefabInstance: { source: PREFAB_GUID } } },
     ]);
     expect(refs).toContainEqual({ type: 'prefab', path: PREFAB_GUID });
   });
@@ -1003,7 +1054,7 @@ describe('collectResourceRefsFromEntities', () => {
   it('collects Renderable2D sprite (texture) ref by GUID', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { Renderable2D: { sprite: SPRITE_GUID } } },
+      { traits: { Renderable2D: { sprite: SPRITE_GUID } } },
     ]);
     expect(refs).toContainEqual({ type: 'texture', path: SPRITE_GUID });
   });
@@ -1013,7 +1064,7 @@ describe('collectResourceRefsFromEntities', () => {
     // field — it must still land in resources[] so the build tree-shaker keeps it (prod-404 guard).
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { MaterialInstance: { overrides: [{ target: 'uReveal', kind: 'texture', ref: SPRITE_GUID }] } } },
+      { traits: { MaterialInstance: { overrides: [{ target: 'uReveal', kind: 'texture', ref: SPRITE_GUID }] } } },
     ]);
     expect(refs).toContainEqual({ type: 'texture', path: SPRITE_GUID });
   });
@@ -1021,7 +1072,7 @@ describe('collectResourceRefsFromEntities', () => {
   it('does not collect a ref from a scalar-driver (uniform/prop) MaterialInstance override', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { MaterialInstance: { overrides: [{ target: 'uMix', kind: 'uniform', source: { type: 'time' } }] } } },
+      { traits: { MaterialInstance: { overrides: [{ target: 'uMix', kind: 'uniform', source: { type: 'time' } }] } } },
     ]);
     expect(refs).toHaveLength(0);
   });
@@ -1029,7 +1080,7 @@ describe('collectResourceRefsFromEntities', () => {
   it('ignores a kind:texture override whose ref is empty or a non-GUID/URL', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { MaterialInstance: { overrides: [
+      { traits: { MaterialInstance: { overrides: [
         { target: 'uReveal', kind: 'texture', ref: '' },
         { target: 'uReveal', kind: 'texture', ref: 'circle' },
       ] } } },
@@ -1040,7 +1091,7 @@ describe('collectResourceRefsFromEntities', () => {
   it('collects Renderable2D sprite starting with http', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { Renderable2D: { sprite: 'https://cdn.example.com/img.png' } } },
+      { traits: { Renderable2D: { sprite: 'https://cdn.example.com/img.png' } } },
     ]);
     expect(refs).toContainEqual({ type: 'texture', path: 'https://cdn.example.com/img.png' });
   });
@@ -1048,7 +1099,7 @@ describe('collectResourceRefsFromEntities', () => {
   it('ignores Renderable2D primitive sprite keywords', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { Renderable2D: { sprite: 'circle' } } },
+      { traits: { Renderable2D: { sprite: 'circle' } } },
     ]);
     expect(refs).toHaveLength(0);
   });
@@ -1056,7 +1107,7 @@ describe('collectResourceRefsFromEntities', () => {
   it('collects UIElement imageSrc and fontFamily', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { UIElement: { imageSrc: IMG_GUID, fontFamily: 'Roboto' } } },
+      { traits: { UIElement: { imageSrc: IMG_GUID, fontFamily: 'Roboto' } } },
     ]);
     expect(refs).toContainEqual({ type: 'texture', path: IMG_GUID });
     expect(refs).toContainEqual({ type: 'font', path: 'Roboto' });
@@ -1065,7 +1116,7 @@ describe('collectResourceRefsFromEntities', () => {
   it('collects ModelSource glbPath with postprocessor', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { ModelSource: { glbPath: MODEL_GUID, postprocessor: 'tropical-island' } } },
+      { traits: { ModelSource: { glbPath: MODEL_GUID, postprocessor: 'tropical-island' } } },
     ]);
     expect(refs).toContainEqual({ type: 'model', path: MODEL_GUID, postprocessor: 'tropical-island' });
   });
@@ -1073,7 +1124,7 @@ describe('collectResourceRefsFromEntities', () => {
   it('falls back to "none" when ModelSource.postprocessor is empty', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { ModelSource: { glbPath: MODEL_GUID, postprocessor: '' } } },
+      { traits: { ModelSource: { glbPath: MODEL_GUID, postprocessor: '' } } },
     ]);
     expect(refs).toContainEqual({ type: 'model', path: MODEL_GUID, postprocessor: 'none' });
   });
@@ -1082,7 +1133,7 @@ describe('collectResourceRefsFromEntities', () => {
     // Regression: glbPath is GUID-only; a literal path must not reach resources[].
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { ModelSource: { glbPath: '/games/x/assets/island.glb', postprocessor: 'none' } } },
+      { traits: { ModelSource: { glbPath: '/games/x/assets/island.glb', postprocessor: 'none' } } },
     ]);
     expect(refs).toHaveLength(0);
   });
@@ -1090,7 +1141,7 @@ describe('collectResourceRefsFromEntities', () => {
   it('collects entry.prefab field', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, prefab: PREFAB_GUID, traits: {} },
+      { prefab: PREFAB_GUID, traits: {} },
     ]);
     expect(refs).toContainEqual({ type: 'prefab', path: PREFAB_GUID });
   });
@@ -1099,7 +1150,7 @@ describe('collectResourceRefsFromEntities', () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const EFFECT_GUID = 'b1000000-0000-4000-8000-000000000020';
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { ParticleEmitter: { effect: EFFECT_GUID } } },
+      { traits: { ParticleEmitter: { effect: EFFECT_GUID } } },
     ]);
     // Runtime SceneManager must preload particle effects, not pop them in.
     expect(refs).toContainEqual({ type: 'particle', path: EFFECT_GUID });
@@ -1108,7 +1159,7 @@ describe('collectResourceRefsFromEntities', () => {
   it('skips a literal (non-GUID) ParticleEmitter.effect', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { ParticleEmitter: { effect: '/games/x/assets/fx/spark.particle.json' } } },
+      { traits: { ParticleEmitter: { effect: '/games/x/assets/fx/spark.particle.json' } } },
     ]);
     expect(refs).toHaveLength(0);
   });
@@ -1116,9 +1167,9 @@ describe('collectResourceRefsFromEntities', () => {
   it('sorts output by type then path', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { Renderable3D: { mesh: '/z.mesh.json', material: '/b.mat.json' } } },
-      { id: 2, traits: { Environment: { hdrPath: '/sky.hdr' } } },
-      { id: 3, traits: { Renderable3D: { mesh: '/a.mesh.json', material: '' } } },
+      { traits: { Renderable3D: { mesh: '/z.mesh.json', material: '/b.mat.json' } } },
+      { traits: { Environment: { hdrPath: '/sky.hdr' } } },
+      { traits: { Renderable3D: { mesh: '/a.mesh.json', material: '' } } },
     ]);
     for (let i = 1; i < refs.length; i++) {
       const cmp = refs[i - 1].type.localeCompare(refs[i].type) || refs[i - 1].path.localeCompare(refs[i].path);
@@ -1134,8 +1185,8 @@ describe('collectResourceRefsFromEntities', () => {
   it('deduplicates refs', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { Renderable3D: { mesh: MESH_GUID, material: SHARED_MAT_GUID } } },
-      { id: 2, traits: { Renderable3DPrimitive: { mesh: 'cube', material: SHARED_MAT_GUID } } },
+      { traits: { Renderable3D: { mesh: MESH_GUID, material: SHARED_MAT_GUID } } },
+      { traits: { Renderable3DPrimitive: { mesh: 'cube', material: SHARED_MAT_GUID } } },
     ]);
     const matRefs = refs.filter(r => r.type === 'material' && r.path === SHARED_MAT_GUID);
     expect(matRefs).toHaveLength(1);
@@ -1146,7 +1197,7 @@ describe('collectResourceRefsFromEntities', () => {
     const meshGuid = 'a1b2c3d4-e5f6-4789-9abc-def012345678';
     const matGuid = '11111111-2222-4333-8444-555555555555';
     const refs = collectResourceRefsFromEntities([
-      { id: 1, traits: { Renderable3D: { mesh: meshGuid, material: matGuid } } },
+      { traits: { Renderable3D: { mesh: meshGuid, material: matGuid } } },
     ]);
     expect(refs).toContainEqual({ type: 'mesh', path: meshGuid });
     expect(refs).toContainEqual({ type: 'material', path: matGuid });
@@ -1499,5 +1550,45 @@ describe('migrateV11toV12 + assignSyntheticEntityIds (scene-loading.md, Phase 3)
     let found = false;
     testWorld.query(EntityAttributes).updateEach(([ea]: any[]) => { if ((ea as any).name === 'Solo') found = true; });
     expect(found).toBe(true);
+  });
+});
+
+/** A prefab-instance override over a SoA field with NO Inspector metadata.
+ *
+ *  This is the LOAD half of the reported data loss: a load→save on
+ *  `games/3d-test/runtime/assets/scenes/skinned-test.json` dropped a populated
+ *  `Animator.clips` override. The guard here read `field in meta.fields` — the
+ *  Inspector-rendering list — as "does this field persist", so `clips`/`clip`
+ *  were neither applied NOR marked; the unmarked field then failed
+ *  `captureInstanceOverrides`'s mark-gate and the next save deleted it.
+ *  The predicate is now the koota schema (runtime/core/ecs/traitSchema.ts). */
+describe('overrides over persistent fields absent from meta.fields', () => {
+  const BANK = JSON.stringify([{ name: 'skin', clip: 'f1cc3b85-2c23-457b-938a-3470ada21b36' }]);
+
+  async function applyTo(fields: Record<string, unknown>) {
+    const { applyOverridesByLocalToEcs } = await getLoader();
+    const { clearAllOverrideMarks, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
+    clearAllOverrideMarks();
+    const entity = testWorld.spawn(Animator({ clips: '[]', clip: '', speed: 1 }));
+    applyOverridesByLocalToEcs(testWorld, new Map([[1, entity.id()]]), { 1: { Animator: fields } });
+    return { live: entity.get(Animator) as Record<string, unknown>, marks: getOverrideMarkSet(entity.id()) };
+  }
+
+  it('APPLIES clips/clip rather than skipping them as unknown fields', async () => {
+    const { live } = await applyTo({ clips: BANK, clip: 'skin' });
+    expect(live.clips).toBe(BANK);
+    expect(live.clip).toBe('skin');
+  });
+
+  it('MARKS them, so a later capture keeps them instead of mark-gating them away', async () => {
+    const { marks } = await applyTo({ clips: BANK, clip: 'skin' });
+    expect(marks?.has('Animator.clips')).toBe(true);
+    expect(marks?.has('Animator.clip')).toBe(true);
+  });
+
+  it('still skips a field the schema does not declare (renamed/stale)', async () => {
+    const { live, marks } = await applyTo({ retiredField: 7 });
+    expect(live).not.toHaveProperty('retiredField');
+    expect(marks?.has('Animator.retiredField')).not.toBe(true);
   });
 });

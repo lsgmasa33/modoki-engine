@@ -56,7 +56,7 @@ describe('deleteEntityWithUndo', () => {
   it('deletes entity and pushes undo action', () => {
     const entity = getCurrentWorld().spawn(
       Transform({ x: 5, y: 0, z: 0 }),
-      Renderable3D({ mesh: 'del-test', color: 0xff0000, size: 1 }),
+      Renderable3D({ mesh: 'del-test' }),
       EntityAttributes({ name: 'UndoDelTest', layer: '3d' }),
     );
     const id = entity.id();
@@ -70,7 +70,7 @@ describe('deleteEntityWithUndo', () => {
   it('undo restores entity with all traits', async () => {
     const entity = getCurrentWorld().spawn(
       Transform({ x: 7, y: 8, z: 9 }),
-      Renderable3D({ mesh: 'restore-test', color: 0x00ff00, size: 2 }),
+      Renderable3D({ mesh: 'restore-test' }),
       EntityAttributes({ name: 'RestoreMe', layer: '3d' }),
     );
     const id = entity.id();

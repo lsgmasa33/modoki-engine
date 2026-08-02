@@ -49,13 +49,18 @@ import {
   type SceneData,
   invalidateAnimationClip,
   invalidateTimeline,
+  invalidateParticleEffect,
+  invalidateSpriteAnim,
+  invalidateRig2D,
   findEntityByGuid,
+  getCachedPrefab,
 } from '@modoki/engine/runtime';
-import { computeLayoutBounds, type LayoutBoundsParams } from './layoutDump';
+import { computeLayoutBounds, type LayoutBoundsParams, type LayoutEntry } from './layoutDump';
 import { tailWithCounts, tailHint, CONSOLE_TAIL_DEFAULT, JOURNAL_TAIL_DEFAULT } from './streamSummary';
 import { roundFloats, resolvePrecision } from './roundFloats';
 import { computeHandles, type HandlesDumpParams } from './handlesDump';
 import { resolveDomPointReport, type DomPointSpec } from './domResolve';
+import { resolveEntityPointReport, type EntityPointSpec } from './entityResolve';
 import { chromeHandles } from './chromeHandles';
 import { computeDiagnostics } from './diagnose';
 import { startWatch, readWatch, listWatches, clearWatch, type StartWatchParams } from './watch';
@@ -322,8 +327,31 @@ export function dumpSceneState(params: SceneStateParams = {}) {
     truncated = true;
   }
   // Screen-space geometry (S6) — projected once for the wanted set, keyed by id.
+  // A `new Map()` here would keep the LAST rect per id and silently drop the rest — and one
+  // entity routinely has several: with the editor's Scene and Game panels both open, every 3D
+  // entity is measured by two providers through two cameras (MEASURED: 47x45 at (755,312) in the
+  // GameView vs 496x372 at (76,-63) in the SceneView, same id, both onScreen). This payload has
+  // one row per entity, so it still reports ONE rect — but it names the surface it came from and
+  // lists the others, instead of presenting one of several answers as the answer.
   const boundsById = params.bounds
-    ? new Map((computeLayoutBounds({ ids: wanted.map((e) => e.id) }).entities ?? []).map((e) => [e.id, e] as const))
+    ? (() => {
+        const m = new Map<number, LayoutEntry & { otherSurfaces?: string[] }>();
+        for (const e of computeLayoutBounds({ ids: wanted.map((w) => w.id) }).entities ?? []) {
+          const prev = m.get(e.id);
+          if (!prev) { m.set(e.id, e); continue; }
+          const others = prev.otherSurfaces ?? [];
+          // Record the dropped rect UNCONDITIONALLY. Gating on `prev.surface` meant an unlabelled
+          // rect vanished leaving `otherSurfaces` empty — and since the field is omitted when
+          // empty, the response looked like there had only ever been one. That is exactly the
+          // "keep the LAST, silently drop the rest" behaviour the comment above says was fixed; it
+          // was true for 3D (always labelled) and false for UI (never labelled) until UI rects
+          // gained a surface. An unlabelled host still has to be visible, so it gets a placeholder
+          // rather than silence. (independent review, 2026-07-30)
+          others.push(prev.surface ?? `unlabelled-${prev.layer}`);
+          m.set(e.id, { ...e, otherSurfaces: others });
+        }
+        return m;
+      })()
     : undefined;
 
   // Contact roll-up (Percept): resolve a contacted body's runtime id → its stable GUID
@@ -340,6 +368,21 @@ export function dumpSceneState(params: SceneStateParams = {}) {
     return g;
   };
   const contactWorld = params.contacts ? getCurrentWorld() : null;
+  // An unknown or WRONG-CASE `trait=` was applied silently: every entity came back with
+  // `traits:{}` and no warning, which reads as "nothing in this scene has that trait" rather than
+  // "there is no such trait". The two call for opposite next moves — add the component, versus fix
+  // the spelling — so the answer must distinguish them. `where=` already warns on an unknown
+  // trait/field (line above); this is the same rule for the simpler filter. (§6: never silently
+  // ignore a parameter.)
+  if (params.trait && !metaByName.has(params.trait)) {
+    const near = [...metaByName.keys()].filter((t) => t.toLowerCase() === params.trait!.toLowerCase()
+      || t.toLowerCase().includes(params.trait!.toLowerCase())).slice(0, 6);
+    warnings.push(
+      `trait "${params.trait}" is not a REGISTERED trait, so every entity below shows traits:{} — ` +
+      `that means the FILTER matched nothing, NOT that the scene lacks the component.` +
+      (near.length ? ` Did you mean: ${near.join(', ')}? (names are case-sensitive)` : ' List them with modoki_list_traits.'),
+    );
+  }
 
   const entities = wanted.map((info) => {
     // Index mode: trait NAMES, no values. Plus the GUID — the only hot-reload-stable way to
@@ -363,7 +406,12 @@ export function dumpSceneState(params: SceneStateParams = {}) {
       }
       traits[name] = data;
     }
-    const out: Record<string, unknown> = { id: info.id, name: info.name, parentId: info.parentId, layer: info.layer ?? null, traits };
+    // `guid` on EVERY row, not just the index (S3.9). In targeted/trait-filtered mode the guid
+    // used to live only inside `traits.EntityAttributes` — which a `trait=` filter EXCLUDES, so the
+    // tool that tells agents "address entities by guid, ids are reassigned on every hot-reload"
+    // handed back id-only rows in its most common drill-down (the live smoke suite's own shape).
+    // One memoized lookup, already implemented.
+    const out: Record<string, unknown> = { id: info.id, guid: guidOf(info.id), name: info.name, parentId: info.parentId, layer: info.layer ?? null, traits };
     if (params.world) {
       // Resolved world TRS + effective active state (S3). worldTransforms is empty
       // until transformPropagationSystem has run a frame; omit `world` if so.
@@ -377,6 +425,10 @@ export function dumpSceneState(params: SceneStateParams = {}) {
       const b = boundsById?.get(info.id);
       out.screen = b?.screen ?? null;
       out.onScreen = b?.onScreen ?? false;
+      // WHICH surface this rect belongs to, and which others also measured this entity. Both
+      // omitted in the common single-surface case, so the payload only grows when it must.
+      if (b?.surface) out.surface = b.surface;
+      if (b?.otherSurfaces?.length) out.otherSurfaces = b.otherSurfaces;
       // V5: true world-space AABB size/center (3D only), when the provider reported it.
       if (b?.worldAABB) out.worldAABB = b.worldAABB;
     }
@@ -471,10 +523,20 @@ registerAgentOp('console-logs', (params) => {
   // Filter here, tail here: pass no `limit` to the producer so the histogram sees everything.
   const { logs } = dumpConsoleLogs({ level: p.level, since: p.since });
   const r = tailWithCounts(logs, (e) => e.level, { limit: p.limit, defaultLimit: CONSOLE_TAIL_DEFAULT });
+  // S3.8 — `byLevel`/`ringTotal` describe the WHOLE ring, `total` describes what MATCHED the
+  // filter. The histogram used to be built over the already-filtered array, so `level:'warn'`
+  // answered `byLevel:{warn:N}` — an agent using it to decide "are there errors?" concluded no
+  // from a filtered read. Same three-number contract as modoki_journal (count/total/ringTotal),
+  // because two tools answering the same question must answer it the same way (§8).
+  const ring = p.level || p.since ? dumpConsoleLogs({}).logs : logs;
+  const byLevel: Record<string, number> = {};
+  for (const e of ring) byLevel[e.level] = (byLevel[e.level] ?? 0) + 1;
   return {
     logs: r.items,
+    count: r.items.length,
     total: r.total,
-    byLevel: r.byType,
+    ringTotal: ring.length,
+    byLevel,
     ...(r.truncated ? { truncated: true, hint: tailHint('console entries', r.items.length, r.total, ', or narrow with level=/since=') } : {}),
   };
 });
@@ -496,20 +558,51 @@ registerAgentOp('journal-events', (params) => {
     setVerboseCapture(t, p.action === 'start');
     return { ok: true, action: p.action, type: t, captures: verboseCaptureState() };
   }
-  const events = (p.type || p.level) ? journalEvents({ type: p.type, level: p.level }) : journalEvents();
+  const filtered = !!(p.type || p.level);
+  const all = journalEvents();
+  const events = filtered ? journalEvents({ type: p.type, level: p.level }) : all;
+  // `clear` used to wipe the ENTIRE 10,000-event ring even when the read was FILTERED — so
+  // `journal {type:'match', clear:true}` returned 100 match events and silently destroyed every
+  // @contact / score / win event alongside them, including the human's. There is no selective
+  // clear (the journal is a flat ring), so the honest move is to refuse rather than to
+  // over-delete: destroying data the caller did not ask about, and did not see, is not something
+  // to do on a best guess. An UNFILTERED clear is unchanged — that one really does mean "all".
+  if (p.clear && filtered) {
+    return {
+      ok: false,
+      error:
+        `REFUSED: clear:true with a filter (${[p.type && `type=${p.type}`, p.level && `level=${p.level}`].filter(Boolean).join(', ')}) ` +
+        'would clear the WHOLE journal, not just the events returned — the ring has no selective ' +
+        'clear. Nothing was cleared and the events were NOT returned.',
+      hint: 'Read with the filter and no clear, then clear deliberately with a bare clear:true (which means ALL events); or clear first and re-read from a known-empty ring.',
+    };
+  }
   if (p.clear) clearJournal();
   // Tail at the op. `journalEvents()` stays whole for JournalTab, which slices its own view.
   // A busy physics Play session fills the 10,000-event ring with ~226-byte `@contact` events
   // — ~582k tokens if returned entire.
   const r = tailWithCounts(events, (e) => String((e as { type?: string }).type ?? '?'), { limit: p.limit, defaultLimit: JOURNAL_TAIL_DEFAULT });
+  // `byType`/`ringTotal` describe the WHOLE RING, which is what the tool description and
+  // docs/debug-tools-mcp.md both promise. They used to be computed over the FILTERED slice, so
+  // `journal {type:'match'}` answered `byType:{match:N}` — indistinguishable from "this ring
+  // contains nothing but match events", which is the opposite of a histogram's purpose (§2: one
+  // name, one meaning).
+  const ring = filtered
+    ? tailWithCounts(all, (e) => String((e as { type?: string }).type ?? '?'), { limit: 0, defaultLimit: 0 })
+    : r;
   // Surface Tier-2 capture state so a reader knows a diagnostic (@contact) is OFF unless it
   // opened a watch — otherwise an empty @contact result reads as "no contacts" not "not capturing".
   const captures = verboseCaptureState();
   const idle = captures.types.filter((t) => !captures.active.includes(t));
   return {
     count: r.items.length,
+    /** Events MATCHING the filter (the whole ring when unfiltered). */
     total: r.total,
-    byType: r.byType,
+    /** Every event in the ring, and the histogram over ALL of them — unchanged by a filter, so
+     *  a filtered read still shows what else is in there. */
+    ringTotal: ring.total,
+    byType: ring.byType,
+    ...(filtered ? { filter: { ...(p.type ? { type: p.type } : {}), ...(p.level ? { level: p.level } : {}) } } : {}),
     events: r.items,
     captures,
     ...(idle.length ? { captureHint: `${idle.join(', ')} ${idle.length > 1 ? 'are' : 'is'} watch-gated and NOT capturing — start with action:'start', type:'${idle[0]}' before the moment you want to trace.` } : {}),
@@ -663,6 +756,12 @@ import.meta.hot?.dispose(() => unregisterChromeHandles());
 // race. Renderer-side because only the renderer has the DOM. ──
 registerAgentOp('resolve-dom-point', (params) => resolveDomPointReport((params ?? {}) as DomPointSpec));
 
+// ── Entity-aware input: the same idea one layer in — resolve {guid}/{name}/{id} to the
+// entity's LIVE screen rect so a viewport tap never has to be aimed from coordinates read in
+// an earlier round-trip. Renderer-side because only the renderer holds the camera, the
+// PixiJS bounds, and the DOM. ──
+registerAgentOp('resolve-entity-point', (params) => resolveEntityPointReport((params ?? {}) as EntityPointSpec));
+
 // ── Phase F: structured render/scene health (causes, not a black screenshot) ──
 // Only errors from the last 30s gate `ok` (F14): a stale load-time / prior-scene error otherwise
 // pins ok:false forever. Date.now() is fine here — app/debug is outside the runtime determinism
@@ -733,32 +832,71 @@ const handleOp = runAgentOp;
  *  in `engine/plugins/vite-asset-scanner.ts` (the producer) — kept as a local union rather than
  *  a type import because the plugin is a Node module and the app tsconfig has no node types.
  *  Keep the two in sync; a new kind that lands here without a branch below is simply ignored. */
-type SceneChangedKind = 'scene' | 'prefab' | 'animation' | 'timeline';
+type SceneChangedKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d';
+
+/**
+ * Kinds whose ONLY stale thing is a cached asset definition → drop that entry and stop. Never a
+ * scene reload: the cache is all that went stale, and reloading would throw away unsaved live work.
+ *
+ * A TABLE, not a chain of `if`s, and that is the actual fix for #74. This had five instances of one
+ * defect — `invalidateAnimationClip`, `invalidateTimeline`, `invalidateParticleEffect`,
+ * `invalidateSpriteAnim`, `invalidateRig2D` each shipped exported, tested, and with ZERO production
+ * callers — because a new kind needed a hand-written branch here AND a hand-written member in
+ * `LiveReloadKind` over in the plugin, with nothing checking either. Three of them were fixed one
+ * at a time, each with a comment explaining the class, and the fourth and fifth still happened.
+ *
+ * With a table, adding a kind is one entry, and
+ * `engine/tests/architecture/liveReloadKinds.test.ts` fails when the two unions disagree or when a
+ * kind has neither a table entry nor an explicit scene-reload branch. The symptom this prevents is
+ * nasty precisely because it is not a crash: the asset keeps working with its old contents, so it
+ * reads as "my edit was ignored" rather than as a stale cache.
+ */
+const ASSET_CACHE_INVALIDATORS: Partial<Record<SceneChangedKind, (urlPath: string) => void>> = {
+  animation: invalidateAnimationClip,
+  timeline: invalidateTimeline,
+  particle: invalidateParticleEffect,
+  spriteanim: invalidateSpriteAnim,
+  rig2d: invalidateRig2D,
+};
+
+/** The file on disk for `urlPath` just changed, so its cached def is being dropped — any
+ *  PARKED write for that same path is now stale and must go with it.
+ *
+ *  WHY (independent review, 2026-07-30). `/api/asset-write` writes from the Node process and
+ *  never told the renderer, so an explicit `modoki_write_asset` to a path that still had a
+ *  parked particle/anim/timeline doc was silently reverted by the next `save_all` — it flushed
+ *  the stale parked doc straight over the freshly written file. Dropping the parked write with
+ *  the cache is the only coherent outcome: once the cache is invalidated the pending doc has no
+ *  live counterpart, and disk becomes the truth for that asset.
+ *
+ *  Dynamic import on purpose: `agentBridge` ships in device debug builds, and the dirty-asset
+ *  registry is editor-only. The branch only ever runs where a file watcher exists.
+ *
+ *  Loud, never silent — this discards pending work, so it says exactly what it dropped. */
+async function dropParkedWriteFor(urlPath: string): Promise<void> {
+  try {
+    const { peekDirtyAsset, discardDirtyAssets } = await import('@modoki/engine/editor');
+    if (!peekDirtyAsset(urlPath)) return;
+    discardDirtyAssets([urlPath]);
+    console.warn(
+      `[agentBridge] ${urlPath} changed on disk — DISCARDED the pending unsaved edit parked for it. ` +
+      'The file on disk is now authoritative; the parked write would have overwritten it at the next save_all.',
+    );
+  } catch { /* not an editor context — no registry to clear */ }
+}
 
 /** Hot-reload the active scene when its file (or any prefab) changes on disk.
  *  Shared by the Vite HMR path and the Electron IPC path. */
 async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind }): Promise<void> {
-  // An .anim.json changed on disk → drop the cached clip. NOT a scene reload: the clip cache
-  // is the only thing stale, and reloading would throw away unsaved live work.
-  //
-  // Without this the cache held the pre-edit clip forever — `invalidateAnimationClip` was
-  // exported, tested, and had ZERO production callers. Any read-modify-write on a clip
-  // (anim_add_key) then re-read the STALE copy and wrote it back, silently REVERTING the
-  // file. Hits modoki_write_asset AND the headline case for this whole feature: the user's
-  // own Claude Code editing a .anim.json with a plain file Write. (C7)
-  if (msg.kind === 'animation') {
-    invalidateAnimationClip(msg.urlPath);
-    return;
-  }
-  // A .timeline.json changed on disk → drop the cached definition. Same shape as the clip
-  // above, and the same defect it fixed: `invalidateTimeline` was exported and tested with ZERO
-  // production callers, so `timelineCache` keyed a parsed timeline by path and never let go —
-  // not on a file write, not on load_scene, not on a Stop/Play cycle (all three measured). A
-  // running Director kept firing the OLD markers on schedule, which reads as "the new marker
-  // params are being ignored" rather than as a stale cache. NOT a scene reload: the cache is
-  // the only stale thing, and reloading would throw away unsaved live work.
-  if (msg.kind === 'timeline') {
-    invalidateTimeline(msg.urlPath);
+  // An asset-def change (.anim/.timeline/.particle/.spriteanim/.rig2d) invalidates just that
+  // cache entry and returns — see ASSET_CACHE_INVALIDATORS above for why this is a table and what
+  // it prevents. The parked write goes with the cache entry: once the cached def is dropped the
+  // pending doc has no live counterpart, and disk becomes the truth for that asset (otherwise the
+  // next save_all flushes the stale parked doc over the file that was just written).
+  const invalidateCachedAsset = ASSET_CACHE_INVALIDATORS[msg.kind];
+  if (invalidateCachedAsset) {
+    invalidateCachedAsset(msg.urlPath);
+    await dropParkedWriteFor(msg.urlPath);
     return;
   }
   const current = sceneManager.getCurrent()?.path;
@@ -804,7 +942,10 @@ async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind
         const res = await fetch(current, { cache: 'no-store' });
         if (res.ok) {
           preloaded = await res.json();
-          const { warnings } = validateSceneData(preloaded, buildSceneSchema());
+          // Best-effort resolver over the runtime's already-loaded prefab cache (#35) — no
+          // fetch: an unloaded prefab (not yet acquired by any scene) resolves to undefined,
+          // which is the documented conservative "stay silent" behaviour, not a bug.
+          const { warnings } = validateSceneData(preloaded, buildSceneSchema(), getCachedPrefab);
           if (warnings.length) {
             console.warn(`[agentBridge] ${warnings.length} validation warning(s) in ${current}:`);
             for (const w of warnings) console.warn(`  • ${w}`);

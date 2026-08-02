@@ -270,7 +270,7 @@ entity a private, parameter-overridable view of its material whose params can be
 frame** — by `Time`, gameplay/store state, or a curve — or simply tweaked per-instance. It's the
 general, dependable replacement for one-off "drive a uniform from a bespoke system" hacks. Pure
 data: a list of `overrides`, each `{ target, kind, source }`. Reference game: `space-console`'s
-stripe shader; worked demo: `games/3d-test/assets/scenes/material-instance-demo.json`.
+stripe shader; worked demo: `games/3d-test/assets/scenes/material-instance-demo.scene.json`.
 
 **The core problem it solves.** A plain ECS system runs with only `world` — it can't reach an
 entity's live THREE material (materials live in per-renderer `RenderState.ecsObjects`, and the
@@ -740,7 +740,116 @@ Reclaiming only when both clear stops mount/unmount churn from leaking slots AND
 
 - **Layout** — `text/layoutText.ts` (`layoutText`) is pure + headless: a string + a synchronous glyph source → positioned textured quads in px, Y-down, block-local space (origin = top-left of the text box). Handles hard `\n` breaks + greedy word wrap (`maxWidth`), per-line kerning, `align` (left/center/right), `lineSpacing`, `letterSpacing`, and a fallback advance for a not-yet-generated glyph. Each quad carries its atlas `page`, so the geometry builder groups quads by page. It's the single geometry source BOTH text paths feed.
 - **Shader** — `text/mtsdfPixiShader.ts` (`makeMtsdfPixiShader`) composes Pixi's own high-shader BITS (`localUniformBit` transform, `textureBit` atlas sampler, `roundPixelsBit`) with ONE custom `mtsdfBit` that overrides the fragment colour — reusing Pixi's per-backend transform boilerplate and shipping BOTH WGSL and GLSL programs (Pixi v8 is WebGPU-preferred). The fragment maths mirrors the 3D TSL graph 1:1: median (sharp) fill, outline via the median, alpha-SDF glow, offset-sample shadow, `screenPxRange` AA via `fwidth`, composited straight-alpha. Style uniforms (`weight` / outline / glow / shadow) update in place (`updateMtsdfPixiStyle`); a per-glyph `aTextColor` vertex attribute (for rainbow/fade colour animation) premultiplies onto Pixi's built-in `vColor`.
+- **The default font is ENGINE-provided** — `DEFAULT_FONT_GUID` (`runtime/assets/builtinAssets.ts`, exported from `@modoki/engine/runtime`) is the engine's Arimo, baked mtsdf/ascii. A game does NOT need a font in its own assets to render `Text2D`; point `Text2D.font` at that GUID. It exists because fonts are otherwise referenced by CSS **family name** and stay guid-less — the asset scanner deliberately skips GUID healing for them — while a `Text2D` ref must be a GUID, so before it, getting MSDF text meant copying a font into the project (Court shipped a byte-identical 500 KB duplicate for exactly this reason, #52). It is the one engine font with a committed `.meta.json`; the other bundled families stay family-name-only, and the tree-shaker keeps a font only if something names it (measured: Court's build keeps **1 of 9** engine font files). A code-only reference still needs an `asset-keep.json` entry — the path is under `/modoki/assets/`, which is keep-listable like any project path.
 - **Per-page meshes + dynamic packing** — one Pixi `Mesh` per atlas PAGE the text touches (a dynamic CJK provider spills glyphs across pages; a baked / single-page font is one mesh), all children of the slot `Container` so the anchor pivot + transform apply to the whole block. Geometry rebuilds only when the layout hash changes (text/font/size/wrap/spacing/`atlasVersion`); the shader updates only on a style-hash change; placement writes only when the transform moves. Atlas textures are FONT-owned (freed on scene teardown), never disposed by the slot. Per-glyph animation recomputes page positions from the base quads each frame while the sim runs (frozen when stopped, like skeletal animation).
+
+## Shipped web build: canvas sizing (`rendering.web.sizeMode`)
+
+How the STANDALONE web game's layer container (`App.tsx`'s `.game-wrapper`) is sized in the
+browser. Project Settings → **Screen / Canvas Size**; geometry in
+`runtime/rendering/webCanvasSizing.ts` (pure, unit-tested). Editor viewports are unaffected —
+they size themselves / use device presets.
+
+| `sizeMode` | Container | Drawing buffer |
+|---|---|---|
+| `free` (default) | fills the viewport | full CSS size |
+| `fixed` | letterboxed to the `width`×`height` ASPECT, centred on black | fills that (smaller) container |
+| `max` | fills the viewport | clamped to ≤ `width`×`height` **device px** (after devicePixelRatio), upscaled to fill — a literal ≤`width`×`height` buffer on every device, retina included; saves fill-rate on 4K/high-DPR |
+
+`width`/`height` are read only by `fixed`/`max`. `max`'s buffer clamp applies to BOTH
+render layers — the 3D layer (`Scene3D`, via a scaled pixel ratio) and the 2D layer
+(`Canvas2DMount`, via `canvas2DSizing.computeBackingSize`), opt-in per surface
+(`applyWebSizeMode`) so the editor viewport is excluded. Worked example: `games/sling` ships
+`fixed` 1080×1920, so on a desktop window it presents as a phone-shaped portrait box with
+bars either side.
+
+**How each layer reaches the clamped buffer** — the two renderers size their buffers
+differently, so `max` cannot be applied the same way to both:
+
+- **2D** sizes its backing directly. `canvas2DSizing.computeBackingSize` is the whole
+  pipeline: `rect` (CSS, already including any editor CSS-transform zoom) → × the backing
+  ratio, capped at `pixi.pixelRatioCap` on the auto path only (a pinned `pixi.resolution` is
+  never capped) → the `max` clamp → a uniform 8192 longer-axis cap (GPU max-texture guard). It
+  returns `0×0` for an unmeasured (0×0) box *before* clamping, deliberately — `clampBufferSize`
+  floors at 1×1, which would look "measured" and defeat `retrySizeUntilMeasured`'s bounded
+  retry.
+- **3D** cannot. three computes `canvas.width = floor(cssWidth × pixelRatio)`, so shrinking
+  the CSS size it is handed just gets re-multiplied by the ratio. `clampPixelRatio` therefore
+  rides the clamp on the RATIO instead, reaching the same buffer through three's own maths.
+  It is applied in TWO places, and both are load-bearing: `makeWebGPURenderer`'s initial
+  `setPixelRatio`/`setSize` pair (the FIRST buffer — same `applyWebSizeMode` opt-in as the 2D
+  side, since that function is shared with SceneView / ParticleEditor / ModelPreview / the caps
+  probe) and `Scene3D`'s `ResizeObserver` (every resize after). Clamping only on resize left a
+  one-frame full-resolution allocation at mount — the exact peak `max` exists to avoid (#56).
+  **The two must compute the same ratio for the same container**, base included (`min(
+  devicePixelRatio, three.pixelRatioCap)`) — if they disagree, the observer's first fire
+  reallocates the buffer one frame after mount and you have traded a spike for a churn. Pinned
+  by a test that compares the creation-time `setPixelRatio` against `clampPixelRatio` directly.
+
+> **GOTCHA — `max` was a no-op on every retina display until #38, for exactly that reason.**
+> The clamp was applied to the CSS box and three multiplied it straight back out. A logical
+> viewport rarely exceeds the `width`×`height` target (a phone is ~393×852 CSS px), so the
+> mode silently did nothing on the high-DPR hardware it exists for. If you touch this, assert
+> on `canvas.width` — the real drawing buffer — never on the CSS size or on `setSize`'s
+> arguments. `Scene3D` also recomputes its base ratio from `devicePixelRatio` on every
+> resize rather than reading `renderer.getPixelRatio()` back: the getter returns the
+> already-clamped value, which cannot climb again when the container shrinks.
+
+> **GOTCHA — `pixi.resolution` is applied by the ENGINE, not handed to Pixi.** `0` = auto
+> (use `devicePixelRatio`), a positive value pins the backing multiplier; either way it is
+> folded into `computeBackingSize` and Pixi is left at its own default resolution of **1**,
+> so `renderer.resize(w, h)` means literally `w`×`h` backing pixels. Passing it to
+> `Application.init()` instead double-counts (the DPR is already applied before `resize` is
+> called) and `autoDensity: true` writes inline canvas styles that fight `Canvas2DMount`'s
+> `width/height: 100%`. Note Pixi's default is 1 and **not** `devicePixelRatio`, which the
+> code comments claimed for a while.
+
+**Both layers cap devicePixelRatio by default** (issue #55) — 3D via `three.pixelRatioCap`,
+2D via its own `rendering.pixi.pixelRatioCap`, each defaulting to **2** so a DPR-3 phone
+renders both layers at the same backing ratio out of the box instead of the 2D HUD running
+sharper (and 2.25× the fill-rate) than the 3D scene under it. There are two separate knobs
+rather than one shared value — the owner chose per-layer flexibility (a game may want the
+two layers capped differently) over renaming a shipped `three.*` field to something
+layer-neutral. `pixi.pixelRatioCap` applies to EVERY 2D surface unconditionally, editor
+viewports included (unlike the `max` sizeMode clamp above, which is opt-in via
+`applyWebSizeMode`) — mirroring how `three.pixelRatioCap` applies at renderer creation with
+no opt-out. The cap only binds on the AUTO path: a pinned `pixi.resolution` (see the GOTCHA
+above) is an explicit "I want exactly N" and is never capped — capping a pin would make the
+pin a lie. Implemented in `canvas2DSizing.computeBackingSize` (`BackingSizeInput.pixelRatioCap`);
+the 3D base ratio comes from the shared `webCanvasSizing.basePixelRatio`, which both 3D sites
+call so they cannot drift.
+
+> **GOTCHA — on EITHER knob, a cap of `0` (or negative) means UNCAPPED, not "ratio 0".** Taken
+> literally, 0 is a 0×0 drawing buffer: a blank 3D canvas, and on 2D a `0×0` backing that
+> `retrySizeUntilMeasured` reads as "not laid out yet" — so the canvas retries every frame and
+> then warns about a `display:none` ancestor, blaming the DOM for a config value. A negative cap
+> produced a negative backing size. This is not defensive padding: `pixi.resolution` sits
+> directly above `pixi.pixelRatioCap` in Project Settings and uses `0` for "auto", so `0` is
+> exactly what a human types here, and numeric config is unvalidated (only string unions are —
+see below). Both fields'
+> placeholders say `2 (0 = uncapped)`.
+
+**Two failure modes this field has actually hit — both were SILENT, and both are now
+guarded:**
+
+- **An out-of-union value falls through to `free`.** Every consumer guards with
+  `!== 'fixed'` / `!== 'max'`, so an unrecognised string means "fill the viewport" and the
+  neighbouring `width`/`height` are quietly ignored. `games/sling` carried
+  `sizeMode: "portrait"` — the native `capacitor.orientation` vocabulary, which does not
+  exist here — for months (issue #25); it also showed as an unmatched blank in the Project
+  Settings dropdown. `mergeProjectConfig` now coerces an out-of-union value to the default and
+  **warns** (`oneOf` in `engine/project-config.ts`), and a guard test rejects one in any
+  committed `project.config.json`. Originally this covered only `sizeMode` and the two
+  `backend`s; #39 extended it to EVERY string-union field in the config, and made a bad value
+  FAIL THE BUILD (coercing keeps the project openable; the build is where it ships). The
+  read-coerces / write-round-trips rule that governs it is owned by
+  [docs/editor.md](editor.md) § "Project Settings — the save contract".
+- **Reading the settings too early yields the DEFAULTS.** The project's render settings are
+  injected mid-boot (`initWorldSync()` → `setRenderSettings()`), which lands *after* a
+  mount-time read — so `useWebCanvasSizing` (`engine/app/useWebCanvasSizing.ts`) takes
+  `configReady` as an effect dependency. Without it a `fixed` project renders full-bleed
+  until some later window resize happens to recompute the box. Anything else reading
+  `getRenderSettings()` from a `[]`-deps effect has the same bug.
 
 ## Related
 

@@ -323,7 +323,15 @@ export class DeviceConnectionManager {
    *  the controlled-comms path: Claude's device_* tools go through Modoki, not their own socket. */
   async proxy(method: string, params: Record<string, unknown>): Promise<unknown> {
     if (this.state !== 'connected' || !this.transport) {
-      throw new Error(`no device connected (state: ${this.state}) — connect in the AI panel first`);
+      // Keep the "no device connected" prefix: the device MCP's caughtFailure() matches on it to
+      // build the NOT_AVAILABLE_HERE envelope that names device_connect/device_status. The advice
+      // here is the fallback an agent sees when it reads the raw message (curl, logs), so it names
+      // the tool path too — "the AI panel" alone was stale advice once device_connect shipped.
+      throw new Error(
+        `no device connected (state: ${this.state}) — open the lease with device_connect `
+        + `{ip:"<device IP from the game's debug menu>"} or {useAdb:true}, or the editor AI panel → `
+        + `"Connect a Device"; device_status reports the current state`,
+      );
     }
     return this.transport.send(method, params);
   }

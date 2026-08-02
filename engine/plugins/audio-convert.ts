@@ -195,7 +195,7 @@ export async function convertAudio(opts: AudioConvertOptions): Promise<AudioConv
     // Clean up a partial output so a later cache-hit check doesn't see a truncated file.
     try { fs.rmSync(outPath, { force: true }); } catch { /* noop */ }
     const stderr = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
-    throw new Error(`ffmpeg failed for ${sourceUrlPath}: ${stderr}`);
+    throw new Error(`ffmpeg failed for ${sourceUrlPath}: ${stderr}`, { cause: e });
   }
   return { hash, ext, cached: false, bytes: fs.statSync(outPath).size, ...probeStats(outPath) };
 }

@@ -32,6 +32,7 @@ import { SCENE_FORMAT_VERSION } from '../core/version';
 
 import { Persistent } from '../traits/Persistent';
 import { Time } from '../core/traits/Time';
+import { Transient } from '../traits/Transient';
 import { Input } from '../traits/Input';
 import {
   acquireMaterial, acquireMesh, acquireModel, acquirePrefab, acquireEnvironment,
@@ -708,7 +709,23 @@ class SceneManagerImpl implements SceneManager {
       let hasTime = false;
       stagingWorld.query(Time).updateEach(() => { hasTime = true; });
       if (!hasTime) {
-        const ent = stagingWorld.spawn(Time());
+        // Transient: this singleton is MATERIALIZED here, not authored — so it must
+        // never be written back to whichever scene happens to be saved next. Without
+        // the tag a save silently GREW any scene lacking a Time entity by one
+        // (measured on ui-focus-demo.json, 9 → 10 entities, docs/todo.md), which is a
+        // counter-example to the A10 "a no-op save is a no-op" invariant. Worse for a
+        // BASE scene: the foreign-entity filter in serialize.ts skips any entity
+        // without EntityAttributes, and this one has none, so it lands in EVERY file
+        // saved while it exists rather than being confined to the primary.
+        //
+        // This does NOT stop a scene from AUTHORING its own Time (that's the point of
+        // `timeScale` not being marked runtimeOnly, and of hosting the resource in a
+        // shared BASE scene): a Time that came from a file has no Transient tag and
+        // serializes normally. The tag distinguishes PROVENANCE, which is the only
+        // thing that can tell the two apart — an authored Time sitting at the default
+        // timeScale is byte-identical to this one, so no value-based rule could.
+        // Re-materialized on every chain load that needs it, so nothing is lost.
+        const ent = stagingWorld.spawn(Time(), Transient);
         registerEntity(ent, stagingWorld);
       }
 

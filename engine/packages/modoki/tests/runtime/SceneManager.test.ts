@@ -369,7 +369,7 @@ describe('SceneManager — persistent entities', () => {
     let foundAfter = 0;
     let preservedScore = 0;
     let preservedName = '';
-    newWorld.query(PlayerProfile).updateEach(([p]: any[], entity: { id(): number }) => {
+    newWorld.query(PlayerProfile).updateEach(([p]: any[], entity: any) => {
       foundAfter++;
       preservedScore = (p as any).score;
       // Cross-check name from EntityAttributes

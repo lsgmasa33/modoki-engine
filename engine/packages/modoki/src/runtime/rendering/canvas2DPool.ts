@@ -27,6 +27,7 @@
 import { Application, Container } from 'pixi.js';
 import { getWebGPUSupported } from './gpuDetect';
 import { getRenderSettings } from './renderSettings';
+import { registerPointerPassthrough } from '../core/pointerBlockers';
 
 /** Resolve the PixiJS renderer backend the Canvas2D layer will actually use:
  *  honor an explicit `pixi.backend` render-setting ('webgpu'/'webgl'), else fall
@@ -86,6 +87,10 @@ export interface Canvas2DSlot {
   /** Consecutive frames this slot's renderer threw — distinguishes a one-frame
    *  teardown blip (swallowed silently) from a genuinely stuck renderer. */
   renderFailFrames?: number;
+  /** Disposer for this canvas's pointer-PASSTHROUGH registration (`core/pointerBlockers.ts`).
+   *  Held per slot so it is dropped when the slot is destroyed rather than leaking a registration
+   *  for a dead canvas. */
+  unpassthrough?: () => void;
 }
 
 const MAX_SLOTS = 6;
@@ -119,12 +124,23 @@ export class Canvas2DPool {
     if (!this.preferenceResolved) await this.initPool();
 
     const pixi = getRenderSettings().pixi;
+    // Deliberately do NOT pass `resolution`/`autoDensity` here — Pixi stays at its default
+    // resolution of 1, so `renderer.resize(w, h)` (called from Canvas2DMount via
+    // canvas2DSizing.computeBackingSize) means literally "w×h backing pixels", and the
+    // ENGINE owns the whole backing-size computation in one place instead of splitting it
+    // between here and Canvas2DMount. Three reasons:
+    //  - it makes `pixi.resolution` mean ONE thing (a DPR override folded into
+    //    computeBackingSize) instead of ALSO multiplying with the DPR already applied in
+    //    Canvas2DMount.measure() — that double-count was latent (resolution>0 today only
+    //    happens to be inert because no project sets it, per #38's audit).
+    //  - Pixi's `autoDensity: true` also wrote inline canvas style width/height, fighting
+    //    Canvas2DMount's `style.width = '100%'` / `style.height = '100%'`.
+    //  - keeping Pixi at resolution 1 preserves today's stage coordinate space (device px),
+    //    which `canvas2DScaler` maps design→canvas pixels against.
     await slot.app.init({
       preference: this.preference,
       canvas: slot.canvas,
       antialias: pixi.antialias,
-      // resolution 0 = auto (Pixi's default: devicePixelRatio). A positive value pins it.
-      ...(pixi.resolution > 0 ? { resolution: pixi.resolution, autoDensity: true } : {}),
       backgroundAlpha: 0,
       // LOAD-BEARING for F1's idle/skip render — do NOT drop. Scene2D skips
       // renderer.render on idle/unchanged canvases (renderAll(dirtyIds)); a non-preserved
@@ -151,6 +167,12 @@ export class Canvas2DPool {
     const canvas = document.createElement('canvas');
     canvas.width = 1;
     canvas.height = 1;
+    // This canvas is the GAME's own render surface, so a press on it is never a press on chrome —
+    // even though the standard scene shape puts `Canvas2D` on a `UIElement`, which makes it a
+    // DESCENDANT of the UIRenderer's block root. Without this, every 2D game's pointer input is
+    // dead (see `core/pointerBlockers.ts`'s PASSTHROUGH SURFACES note). Registered on the CANVAS
+    // ELEMENT itself, never a wrapper: a UI element can never be a canvas's DOM descendant, so UI
+    // over the canvas still blocks correctly.
     const container = new Container();
     // Stack children by hierarchy paint order (zIndex). Set ONCE here, not every
     // frame — Pixi only re-sorts when a child's zIndex changes or a child is
@@ -158,6 +180,7 @@ export class Canvas2DPool {
     container.sortableChildren = true;
     const app = new Application();
     const slot: Canvas2DSlot = { canvas, container, app, entityId: null, ready: Promise.resolve(), initialized: false, boundBySim: false, mounted: false };
+    slot.unpassthrough = registerPointerPassthrough(canvas);
     // Start async init immediately — `ready` tracks completion
     slot.ready = this.initSlotApp(slot);
     return slot;
@@ -322,6 +345,7 @@ export class Canvas2DPool {
       for (let i = this.slots.length - 1; i >= 0 && this.slots.length - allocated > 1; i--) {
         const s = this.slots[i];
         if (s.entityId === null && s.canvas.parentElement === null) {
+          s.unpassthrough?.();
           s.container.destroy();
           if (s.initialized) { s.app.destroy(true); noteContextDestroyed(); }
           this.slots.splice(i, 1);
@@ -352,6 +376,7 @@ export class Canvas2DPool {
   destroyPool(): void {
     this.releaseAll();
     for (const slot of this.slots) {
+      slot.unpassthrough?.();
       slot.container.destroy();
       if (slot.initialized) { slot.app.destroy(true); noteContextDestroyed(); }
     }

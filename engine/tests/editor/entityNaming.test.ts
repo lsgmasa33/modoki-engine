@@ -15,7 +15,7 @@ describe('entity naming', () => {
     const entity = getCurrentWorld().spawn(
       Transform({ x: 0, y: 0, z: 0 }),
       Camera(),
-      Renderable3D({ mesh: 'camera', color: 0xff0000, size: 0.3 }),
+      Renderable3D({ mesh: 'camera' }),
     );
     const entities = getAllEntities();
     const found = entities.find((e) => e.id === entity.id());
@@ -32,7 +32,7 @@ describe('entity naming', () => {
   it('uses mesh name for renderable 3D entities', () => {
     const entity = getCurrentWorld().spawn(
       Transform({ x: 0, y: 0, z: 0 }),
-      Renderable3D({ mesh: 'my-custom-mesh', color: 0x00ff00, size: 1 }),
+      Renderable3D({ mesh: 'my-custom-mesh' }),
     );
     const entities = getAllEntities();
     const found = entities.find((e) => e.id === entity.id());

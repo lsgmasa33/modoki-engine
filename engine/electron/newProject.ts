@@ -77,7 +77,7 @@ export function scaffoldProject(targetDir: string, opts: ScaffoldOptions): Scaff
   // Fresh GUIDs for the starting scene so two projects from the template don't
   // share entity identity. parentId references a parent's guid (a string), so a
   // global old→new string remap over the file text keeps the hierarchy intact.
-  const scenePath = path.join(dest, 'runtime', 'assets', 'scenes', 'main.json');
+  const scenePath = path.join(dest, 'runtime', 'assets', 'scenes', 'main.scene.json');
   if (fs.existsSync(scenePath)) {
     let sceneText = fs.readFileSync(scenePath, 'utf8');
     const scene = JSON.parse(sceneText) as {

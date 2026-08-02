@@ -12,6 +12,7 @@ function recorder() {
     rect: (x, y, w, h) => (ops.push(`rect ${x} ${y} ${w} ${h}`), g),
     moveTo: (x, y) => (ops.push(`moveTo ${x} ${y}`), g),
     lineTo: (x, y) => (ops.push(`lineTo ${x} ${y}`), g),
+    arc: (cx, cy, radius, startAngle, endAngle, ccw) => (ops.push(`arc ${cx} ${cy} ${radius} ${startAngle} ${endAngle} ${ccw ?? false}`), g),
     closePath: () => (ops.push('close'), g),
     ellipse: (x, y, rw, rh) => (ops.push(`ellipse ${x} ${y} ${rw} ${rh}`), g),
     fill: (c) => (ops.push(`fill ${c}`), g),

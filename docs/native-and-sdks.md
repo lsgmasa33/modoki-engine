@@ -255,12 +255,12 @@ dir**, where its config + native folders live). Essentials:
 
 **Web**
 ```bash
-MODOKI_PROJECT=games/<id> npm run build     # TypeScript check + Vite build → games/<id>/dist
+MODOKI_PROJECT=games/<id> npm run build -- --target web     # TypeScript check + Vite build → games/<id>/dist
 ```
 
 **iOS (Simulator or Device)**
 ```bash
-MODOKI_PROJECT=games/<id> npm run build
+MODOKI_PROJECT=games/<id> npm run build -- --target native
 (cd games/<id> && npx cap sync ios)
 # SPM-only game (e.g. 3d-test, Firebase via SPM) → build -project App.xcodeproj.
 # A game pulling CocoaPods mediation adapters gets App.xcworkspace → build -workspace.
@@ -270,7 +270,7 @@ Notes: first build is slow (SPM downloads all SDK frameworks); use exact device 
 
 **Android**
 ```bash
-MODOKI_PROJECT=games/<id> npm run build
+MODOKI_PROJECT=games/<id> npm run build -- --target native
 (cd games/<id> && npx cap sync android)
 JAVA_HOME=$(/usr/libexec/java_home -v 21) games/<id>/android/gradlew -p games/<id>/android assembleDebug
 adb install games/<id>/android/app/build/outputs/apk/debug/app-debug.apk

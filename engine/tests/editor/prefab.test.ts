@@ -24,7 +24,7 @@ describe('PrefabInstance trait', () => {
   it('can be spawned on an entity', () => {
     const entity = getCurrentWorld().spawn(
       Transform({ x: 5, y: 0, z: 0 }),
-      Renderable3D({ mesh: 'prefab-test', color: 0xff0000, size: 1 }),
+      Renderable3D({ mesh: 'prefab-test' }),
       EntityAttributes({ name: 'prefab-test', layer: '3d' }),
       PrefabInstance({ source: 'prefabs/boat.prefab.json', localId: 1, rootInstanceId: 0 }),
     );
@@ -82,12 +82,12 @@ describe('serializePrefab', () => {
   it('serializes an entity tree with localIds', () => {
     const parent = getCurrentWorld().spawn(
       Transform({ x: 10, y: 0, z: 0 }),
-      Renderable3D({ mesh: 'prefab-root', color: 0xff0000, size: 1 }),
+      Renderable3D({ mesh: 'prefab-root' }),
       EntityAttributes({ name: 'prefab-root', layer: '3d' }),
     );
     getCurrentWorld().spawn(
       Transform({ x: 11, y: 0, z: 0 }),
-      Renderable3D({ mesh: 'prefab-child', color: 0x00ff00, size: 0.5 }),
+      Renderable3D({ mesh: 'prefab-child' }),
       EntityAttributes({ name: 'prefab-child', layer: '3d', parentId: parent.id() }),
     );
 
@@ -168,5 +168,54 @@ describe('instantiatePrefab', () => {
     const eaMeta = getTraitByName('EntityAttributes')!;
     const childEa = readTraitData(childId, eaMeta);
     expect(childEa!['parentId']).toBe(rootId);
+  });
+});
+
+/** Create Prefab (`serializePrefab`) must write what a trait PERSISTS — the koota
+ *  schema — not the `meta.fields` Inspector subset. Real trait registry, so a
+ *  field a custom Inspector section owns (Animator.clips/clip) is genuinely
+ *  outside meta.fields here rather than by a mock's say-so.
+ *
+ *  Two rules pull in opposite directions and both are asserted: a persistent
+ *  field belongs in the template, but a SCENE-only one does not. See
+ *  runtime/core/ecs/traitSchema.ts and docs/prefabs.md. */
+describe('serializePrefab — what reaches the template', () => {
+  const BANK = JSON.stringify([{ name: 'skin', clip: 'f1cc3b85-2c23-457b-938a-3470ada21b36' }]);
+
+  function spawnAuthoredEntity(extra: Record<string, unknown> = {}) {
+    const animator = getTraitByName('Animator')!;
+    return getCurrentWorld().spawn(
+      Transform({ x: 1, y: 2, z: 3 }),
+      EntityAttributes({ name: 'Rigged', layer: '3d', editorFolder: 'Enemies/Ranged', ...extra }),
+      animator.trait({ clips: BANK, clip: 'skin', speed: 1 }),
+    );
+  }
+
+  it('KEEPS a schema field that has no Inspector row (the clip bank)', () => {
+    const e = spawnAuthoredEntity();
+    const prefab = serializePrefab(e.id())!;
+    const root = prefab.entities.find((x) => x.name === 'Rigged')!;
+    const animator = root.traits.Animator as Record<string, unknown>;
+    expect(animator.clips).toBe(BANK);   // pre-fix: '[]' — Create Prefab emptied the bank
+    expect(animator.clip).toBe('skin');
+  });
+
+  it('DROPS EntityAttributes.editorFolder — a template must not inherit one scene\'s Hierarchy folder', () => {
+    const e = spawnAuthoredEntity();
+    const prefab = serializePrefab(e.id())!;
+    const root = prefab.entities.find((x) => x.name === 'Rigged')!;
+    expect(root.traits.EntityAttributes as Record<string, unknown>).not.toHaveProperty('editorFolder');
+  });
+
+  it('DROPS runtimeOnly read-back, so an animating entity bakes no frame in', () => {
+    const animator = getTraitByName('Animator')!;
+    const e = spawnAuthoredEntity();
+    // Mid-crossfade state, as a live entity would carry.
+    getCurrentWorld().entities.find((x) => x.id() === e.id())!
+      .set(animator.trait, { ...(e.get(animator.trait) as object), activeClip: 'skin', fadeElapsed: 0.4 });
+    const prefab = serializePrefab(e.id())!;
+    const bag = (prefab.entities.find((x) => x.name === 'Rigged')!.traits.Animator) as Record<string, unknown>;
+    expect(bag).not.toHaveProperty('activeClip');
+    expect(bag).not.toHaveProperty('fadeElapsed');
   });
 });

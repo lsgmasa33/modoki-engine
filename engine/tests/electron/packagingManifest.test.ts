@@ -124,6 +124,63 @@ describe('electron-builder packaging manifest', () => {
 });
 
 /**
+ * PACKAGING GUARD — the OSS release workflows must attach their update MANIFEST.
+ *
+ * The public repo's electron-builder.yml uses the `github` provider (rewritten by
+ * scripts/publish-engine-oss.sh), so electron-updater discovers a new version by
+ * fetching a manifest from the Release ASSETS: latest.yml on Windows,
+ * latest-mac.yml on macOS. Attaching the installer WITHOUT its manifest yields a
+ * release that looks complete on the Releases page but that no installed editor can
+ * ever find — every update check 404s, silently, forever.
+ *
+ * That shipped: the Windows workflow attached only *.exe + *.blockmap on a tag while
+ * its own win-nightly step attached latest.yml, so the nightly channel updated and
+ * every STABLE release (v0.3.0 → v0.3.5) stranded users on whatever they had. It
+ * surfaced as a user on v0.3.4 who could not update to the v0.3.5 that fixed his bug.
+ *
+ * Asserted as a PAIR — the two workflows are twins and the bug was exactly one of
+ * them drifting from the other, which a single-platform test cannot catch.
+ */
+describe('OSS release workflows attach the electron-updater manifest', () => {
+  const cases = [
+    { file: 'release-windows.yml', manifest: 'release/latest.yml', installer: 'release/*.exe' },
+    { file: 'release.yml', manifest: 'release/latest-mac.yml', installer: 'release/*.dmg' },
+  ];
+
+  for (const { file, manifest, installer } of cases) {
+    it(`${file} attaches ${path.basename(manifest)} on a version tag`, () => {
+      const wf = yaml.load(
+        readFileSync(path.join(repoRoot, 'oss', '.github', 'workflows', file), 'utf8'),
+      ) as { jobs?: Record<string, { steps?: Array<Record<string, unknown>> }> };
+
+      // The tag-gated publish step — the one that builds a real versioned Release.
+      const steps = Object.values(wf.jobs ?? {}).flatMap((j) => j.steps ?? []);
+      const tagged = steps.filter((s) => {
+        const uses = String(s.uses ?? '');
+        const cond = String(s.if ?? '');
+        const withBlock = (s.with ?? {}) as { tag_name?: string };
+        // Exclude the rolling win-nightly prerelease: it pins its own tag_name and
+        // already attaches the manifest, which is what masked the bug.
+        return uses.includes('action-gh-release') && cond.includes('refs/tags/v') && !withBlock.tag_name;
+      });
+      expect(tagged.length).toBe(1);
+
+      const withBlock = (tagged[0].with ?? {}) as { files?: string; fail_on_unmatched_files?: boolean };
+      const files = String(withBlock.files ?? '')
+        .split('\n').map((l) => l.trim()).filter(Boolean);
+      expect(files).toContain(installer); // sanity: this is the installer-publishing step
+      expect(files).toContain(manifest);  // …and it must carry the update manifest
+
+      // Listing the manifest is not enough on its own: softprops WARNS (not fails) on an
+      // unmatched pattern by default, so if the build stopped emitting it the release would
+      // silently ship without it again — the exact recurrence this pair of asserts exists
+      // to prevent.
+      expect(withBlock.fail_on_unmatched_files).toBe(true);
+    });
+  }
+});
+
+/**
  * PACKAGING GUARD — the starter template ships in the installer.
  *
  * New Project (File → New Project) AND the packaged first-run scaffold both copy

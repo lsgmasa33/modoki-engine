@@ -157,6 +157,7 @@ export default function ProjectSettingsDialog() {
   const schema = getProjectSettings();
   const [draft, setDraft] = useState<Values | null>(null);
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState(0);
 
   useEffect(() => {
@@ -175,13 +176,38 @@ export default function ProjectSettingsDialog() {
   const apply = async () => {
     if (!draft) return;
     setSaving(true);
-    const ok = await schema.save(draft);
+    setSaveError(null);
+    const res = await schema.save(draft);
     setSaving(false);
-    if (ok) close();
-    else console.error('[Editor] Failed to save project settings');
+    if (res === true) { close(); return; }
+    // Keep the dialog open AND say why: the draft is still in the fields, so the
+    // user can fix the offending value in place. Failing silently here meant a
+    // refused save looked identical to a click that did nothing.
+    const msg = typeof res === 'string' ? res : 'Failed to save project settings';
+    setSaveError(msg);
+    console.error('[Editor]', msg);
   };
 
   const tab = schema.tabs[Math.min(activeTab, schema.tabs.length - 1)];
+
+  // A config file that EXISTS but doesn't parse: the backend read falls back to the
+  // ENGINE DEFAULTS so the editor still opens, which means every field below is a
+  // plausible-looking lie (measured on games/sling: Bundle ID "com.modokiengine.prototype",
+  // App name "Puzzle Prototype" — an identity that project retired). Saving is already
+  // refused server-side, so the file is safe; the danger is purely that someone READS
+  // these values and believes them. Say so, and take editing away until it's repaired —
+  // a value you cannot act on is better than one you can't tell is wrong.
+  const configErrors = (draft?.configErrors ?? []) as { file: string; message: string }[];
+  const inert = configErrors.length > 0;
+
+  // One notch down from the banner above: the file PARSED, but a field holds a value no
+  // consumer handles, so what you see is a substituted default. Editing stays ENABLED —
+  // unlike a malformed file, the rest of these values are the project's real ones, and
+  // the fix is usually to pick the right entry in the very dropdown this is warning about.
+  // Worth saying out loud because the coercion made the wrong value INVISIBLE: before it,
+  // `sizeMode: "portrait"` showed as an unmatched blank; now the dropdown reads "Free" and
+  // looks perfectly correct while the file still says portrait.
+  const configWarnings = (draft?.configWarnings ?? []) as { path: string; message: string }[];
 
   return (
     // Close ONLY when the press STARTS on the scrim itself. Using onMouseDown +
@@ -200,6 +226,42 @@ export default function ProjectSettingsDialog() {
           <div style={{ color: '#888', fontSize: 12 }}>Loading…</div>
         ) : (
           <>
+            {inert && (
+              <div style={{
+                marginBottom: 12, padding: '8px 10px', background: '#3a2e1e', border: '1px solid #a80',
+                color: '#f0d0a0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.5,
+              }}>
+                {/* Name the FILES rather than claiming the whole screen is defaults: only
+                    project.user.json failing leaves app identity perfectly real, and the two
+                    files own different fields. Overclaiming here would be the same sin the
+                    banner exists to fix. Editing is off wholesale regardless, because the
+                    save refuses on either file — it is one Apply for both. */}
+                <b>{configErrors.map((e) => e.file).join(' and ')} could not be read. The fields
+                  {configErrors.length > 1 ? ' those files define' : ' that file defines'} are
+                  showing ENGINE DEFAULTS, not this project's values.</b>
+                {configErrors.map((e) => <div key={e.file} style={{ marginTop: 4 }}>{e.message}</div>)}
+                <div style={{ marginTop: 4 }}>Editing is disabled until it is valid JSON again.</div>
+              </div>
+            )}
+
+            {!inert && configWarnings.length > 0 && (
+              <div data-testid="config-warnings" style={{
+                marginBottom: 12, padding: '8px 10px', background: '#2e2a1e', border: '1px solid #776',
+                color: '#e0d8b0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.5,
+              }}>
+                <b>project.config.json holds {configWarnings.length === 1 ? 'a value' : 'values'} this
+                  engine does not recognise. {configWarnings.length === 1 ? 'That field is' : 'Those fields are'} showing
+                  a default instead.</b>
+                {configWarnings.map((w) => <div key={w.path} style={{ marginTop: 4 }}>{w.message}</div>)}
+                {/* Say what the save does, because it is deliberately NOT what you'd assume:
+                    the file keeps its own word until this field is edited (see the write-path
+                    note in project-config.ts) — so the disagreement persists on purpose. */}
+                <div style={{ marginTop: 4 }}>
+                  Saving other settings leaves the file&apos;s value as-is; set this field to change it.
+                </div>
+              </div>
+            )}
+
             {/* Tab bar */}
             <div style={{ display: 'flex', gap: 2, borderBottom: '1px solid #333', marginBottom: 12, flexWrap: 'wrap' }}>
               {schema.tabs.map((t, i) => (
@@ -212,8 +274,20 @@ export default function ProjectSettingsDialog() {
               ))}
             </div>
 
-            {/* Active tab's groups */}
-            <div style={{ overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {/* Active tab's groups. A <fieldset disabled> is what makes the whole form
+                inert in ONE place: it disables every descendant control natively,
+                including the ones inside the sub-editors (physics layers, scene list,
+                module toggles) that never took a disabled prop. Tab switching stays
+                live on purpose — reading around is fine, editing a lie is not.
+                `display:contents` so the fieldset generates NO box: as a real flex item
+                it does not shrink (fieldset ignores min-height:0), which pushed the
+                scroll area past the dialog and put the footer on top of the fields —
+                measured. The scrolling div below stays the layout box it always was. */}
+            <fieldset disabled={inert} style={{ display: 'contents' }}>
+            <div style={{
+              overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 16,
+              opacity: inert ? 0.5 : 1,
+            }}>
               {tab.groups.map((group) => (
                 <div key={group.title}>
                   {group.title && (
@@ -233,13 +307,22 @@ export default function ProjectSettingsDialog() {
                 </div>
               ))}
             </div>
+            </fieldset>
           </>
+        )}
+
+        {saveError && (
+          <div style={{
+            marginTop: 12, padding: '8px 10px', background: '#3a1e1e', border: '1px solid #a33',
+            color: '#f2b8b8', fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+          }}>{saveError}</div>
         )}
 
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
           <button onClick={close} disabled={saving} style={footerBtn}>Cancel</button>
-          <button onClick={apply} disabled={saving || draft === null}
-            style={{ ...footerBtn, background: '#2d6cdf', borderColor: '#2d6cdf', color: '#fff' }}>
+          <button onClick={apply} disabled={saving || draft === null || inert}
+            title={inert ? 'Repair the config file first — a save onto a file that could not be read is refused.' : undefined}
+            style={{ ...footerBtn, background: '#2d6cdf', borderColor: '#2d6cdf', color: '#fff', opacity: inert ? 0.4 : 1 }}>
             {saving ? 'Applying…' : 'Apply'}
           </button>
         </div>

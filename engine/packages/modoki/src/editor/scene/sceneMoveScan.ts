@@ -77,10 +77,15 @@ export async function preflightSceneMove(entityId: number, targetScene: string):
 
   const currentPath = getCurrentScenePath() || '';
   const guidSet = new Set(subtreeGuids);
-  const sceneAssets = getAllAssets().filter((a) => a.type === 'scene' && a.path !== currentPath && a.guid !== targetScene);
+  // `a.type === 'scene'` is trustworthy on its own now: scenes are positively
+  // identified by the `.scene.json` suffix (or the legacy `/scenes/` directory
+  // convention) — issue #54's migration removed the catch-all that used to type
+  // ANY uncategorized .json under an asset root as 'scene'.
+  const sceneAssets = getAllAssets().filter((a) =>
+    a.type === 'scene' && a.path !== currentPath && a.guid !== targetScene);
 
   for (const asset of sceneAssets) {
-    let data: { baseScene?: string; entities?: unknown[] } | null = null;
+    let data: { baseScene?: string; entities?: unknown[] } | null;
     try {
       const res = await fetch(assetUrl(asset.path), ASSET_FETCH_INIT);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);

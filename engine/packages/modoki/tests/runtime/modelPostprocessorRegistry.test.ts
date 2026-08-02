@@ -3,7 +3,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 async function getRegistry() {
-  return import('../../../src/runtime/loaders/modelPostprocessorRegistry');
+  return import('../../src/runtime/loaders/modelPostprocessorRegistry');
 }
 
 beforeEach(() => {

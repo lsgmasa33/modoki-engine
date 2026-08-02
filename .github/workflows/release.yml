@@ -255,6 +255,11 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           body_path: release-notes.md
+          # Default is a WARNING on an unmatched pattern, which is how a release can look
+          # complete while missing an asset nothing notices until users can't update (the
+          # Windows latest.yml case). A release publishing fewer assets than listed should
+          # fail loudly and be re-run, not ship silently.
+          fail_on_unmatched_files: true
           files: |
             release/*.dmg
             release/*.zip

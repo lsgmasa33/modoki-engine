@@ -7,7 +7,7 @@ import { type Rig2DFile } from '../../src/runtime/loaders/rig2dCache';
 
 // root → mid → tip; one vertex split 0.2/0.3/0.5 across them.
 const rig = (): Rig2DFile => ({
-  id: 'g', version: 1, sprite: 's',
+  id: 'g', sprite: 's',
   bones: [
     { name: 'root', parent: -1, x: 0, y: 0, rot: 0 },
     { name: 'mid', parent: 0, x: 0, y: 10, rot: 0 },

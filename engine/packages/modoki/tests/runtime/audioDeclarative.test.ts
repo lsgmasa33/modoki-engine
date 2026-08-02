@@ -60,7 +60,7 @@ describe('reconcile — playing gates playback', () => {
     const e = world!.spawn(AudioSource({ clip, autoplay: true }), EntityAttributes({ guid: newGuid() }));
     audioSystem(world!);            // autoplay starts it
     expect(plays()).toHaveLength(1);
-    dispatchUIAction('audio.stop', { target: e, world });
+    dispatchUIAction('audio.stop', { target: e });
     expect(e.get(AudioSource)!.playing).toBe(false);
     audioSystem(world!);           // must NOT restart via autoplay
     audioSystem(world!);
@@ -147,7 +147,7 @@ describe('built-in audio.* actions', () => {
       AudioSource({ clip: '', bus: 'sfx', playing: false, clips: JSON.stringify([{ key: 'click', ref: click }]) }),
       EntityAttributes({ guid: newGuid() }),
     );
-    dispatchUIAction('audio.playOneShot', { target: bank, params: { key: 'click', bus: 'ui' }, world });
+    dispatchUIAction('audio.playOneShot', { target: bank, params: { key: 'click', bus: 'ui' } });
     audioSystem(world!);
     expect(getAudioLog().some((e) => e.op === 'play' && e.clip === click && e.bus === 'ui')).toBe(true);
   });
@@ -161,7 +161,7 @@ describe('built-in audio.* actions', () => {
   });
 
   it('audio.setBusVolume updates the mixer store + logs the bus change', () => {
-    dispatchUIAction('audio.setBusVolume', { params: { bus: 'music' }, payload: 40, world });
+    dispatchUIAction('audio.setBusVolume', { params: { bus: 'music' }, payload: 40 });
     expect(useAudioMixStore.getState().audioMusic).toBe(40);
     expect(useAudioMixStore.getState().audioMusicPct).toBe('40%');
     expect(getAudioLog().some((e) => e.op === 'setBusVolume' && e.bus === 'music' && e.volume === 0.4)).toBe(true);
@@ -170,7 +170,7 @@ describe('built-in audio.* actions', () => {
   it('audio.playOneShot fires a one-shot cue on the given bus', () => {
     const clip = mintClip();
     // Cues are drained by audioSystem — dispatch, then tick.
-    dispatchUIAction('audio.playOneShot', { params: { clip, bus: 'ui' }, world });
+    dispatchUIAction('audio.playOneShot', { params: { clip, bus: 'ui' } });
     audioSystem(world!);
     expect(getAudioLog().some((e) => e.op === 'play' && e.clip === clip && e.bus === 'ui')).toBe(true);
   });

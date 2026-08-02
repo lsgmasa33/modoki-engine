@@ -74,6 +74,36 @@ describe('console-logs: the op tails, the producer does not', () => {
     expect(r.byLevel.error).toBe(1);                              // but visible in the counts
   });
 
+  it('a FILTERED read still counts the whole ring — byLevel is not the filtered subset (S3.8)', async () => {
+    // The defect: the histogram was built over the already-filtered array, so `level:'warn'`
+    // answered `byLevel:{warn:N}` with no error count at all. An agent asking "any warnings?" and
+    // then reading byLevel to decide "any errors?" concluded NO from a read that had excluded them.
+    const { runAgentOp } = await freshBridge();
+    console.error('boom');
+    console.warn('careful');
+    for (let i = 0; i < 5; i++) console.log(`m${i}`);
+
+    const r = await runAgentOp('console-logs', { level: 'warn' }) as {
+      logs: Array<{ level: string }>; count: number; total: number; ringTotal: number; byLevel: Record<string, number>;
+    };
+    // What came back is filtered…
+    expect(r.logs.every((l) => l.level === 'warn')).toBe(true);
+    expect(r.count).toBe(1);
+    expect(r.total).toBe(1);
+    // …but the ring-wide numbers are not.
+    expect(r.ringTotal).toBe(7);
+    expect(r.byLevel.error).toBe(1);
+    expect(r.byLevel.log).toBe(5);
+    expect(r.byLevel.warn).toBe(1);
+  });
+
+  it('an unfiltered read reports ringTotal === total (the two agree when nothing is excluded)', async () => {
+    const { runAgentOp } = await freshBridge();
+    for (let i = 0; i < 4; i++) console.log(`m${i}`);
+    const r = await runAgentOp('console-logs', {}) as { total: number; ringTotal: number };
+    expect(r.ringTotal).toBe(r.total);
+  });
+
   it('an explicit limit overrides the default', async () => {
     const { runAgentOp } = await freshBridge();
     for (let i = 0; i < 30; i++) console.log(`m${i}`);

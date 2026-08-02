@@ -13,7 +13,7 @@ import { DEFAULT_FONT_SETTINGS } from '../../packages/modoki/src/runtime/core/fo
 
 const FONT = path.resolve(
   __dirname,
-  '../../packages/modoki/src/runtime/assets/fonts/Geologica/static/Geologica-Light.ttf',
+  '../../packages/modoki/src/runtime/assets/fonts/Geologica/Geologica-VariableFont_CRSV,SHRP,slnt,wght.ttf',
 );
 
 let cliAvailable = false;
@@ -28,7 +28,7 @@ describe('convertFont (real msdf-atlas-gen)', () => {
 
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-font-it-'));
     try {
-      const sourceUrlPath = '/fonts/Geologica-Light.ttf';
+      const sourceUrlPath = '/fonts/Geologica-VariableFont.ttf';
       const settings = { ...DEFAULT_FONT_SETTINGS, charset: 'ascii' as const };
       const result = await convertFont({ projectRoot, sourceUrlPath, absSource: FONT, settings });
 

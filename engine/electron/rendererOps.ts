@@ -22,6 +22,23 @@ const MAX_SIDE = 1568;
 const JPEG_QUALITY = 70;
 let captureSeq = 0;
 
+/** JPEG quality, ONE UNIT: 1–100 (S3.13). Electron's `NativeImage.toJPEG()` wants an INTEGER
+ *  1–100; a legacy 0..1 fraction (what `render_scene`'s `canvas.toDataURL` used to take) is
+ *  converted rather than passed through, which would otherwise crash the native binding with a
+ *  "conversion failure" — or, on the toDataURL side, be silently ignored.
+ *
+ *  MIRRORS `normalizeJpegQuality` in
+ *  `engine/packages/modoki/src/runtime/rendering/offscreenCapture.ts` — the Electron main process
+ *  cannot import the runtime package (it would drag three.js into the main bundle), so the rule
+ *  exists twice ON PURPOSE, with `engine/tests/electron/captureScale.test.ts` asserting the two
+ *  agree over a sample so they cannot drift (conventions §9). Change both, or neither. */
+export function normalizeJpegQuality(raw: number | undefined, fallback = 85): { pct: number; fraction: number } {
+  const n = typeof raw === 'number' && Number.isFinite(raw) ? raw : fallback;
+  const pct = n > 0 && n <= 1 ? n * 100 : n;
+  const clamped = Math.max(1, Math.min(100, Math.round(pct)));
+  return { pct: clamped, fraction: clamped / 100 };
+}
+
 export interface CaptureResult {
   path: string;
   /** Dimensions of the JPEG on disk (post-downscale). */
@@ -51,52 +68,216 @@ export function fitToMaxSide(width: number, height: number, maxSide: number): { 
   return { width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale)), scale };
 }
 
+/** What the RENDERER believes it is drawing, fetched ONLY on the failure path (one IPC
+ *  round-trip is free when the alternative is an opaque error, and unaffordable on every
+ *  successful capture). Shapes mirror `frameLoop` / `rendererGate` in
+ *  `modoki_get_editor_state` — the same two liveness signals a human would go read by hand. */
+export interface RenderSurfaceFacts {
+  frameLoop?: { status?: string; refCount?: number; callbacks?: number; fps?: number; detail?: string } | null;
+  rendererGate?: { status?: string; detail?: string } | null;
+  /** GPU device loss / uncaptured errors (`activeRenderer.ts`'s `GpuFaultState`, mirrored here
+   *  the same way `frameLoop`/`rendererGate` are). Checked BEFORE `frameLoop` below — a lost
+   *  device is the CAUSE of a stalled loop, not a sibling fact, so it must win the sentence. */
+  gpu?: { deviceLost?: boolean; reason?: string; message?: string; uncapturedErrors?: number } | null;
+}
+/** Injected by main.ts (`requestRenderer('editor-state')`). Must never throw — a probe that
+ *  fails just means the explanation loses a paragraph, not that capture loses its error. */
+export type SurfaceProbe = () => Promise<RenderSurfaceFacts | null>;
+
+/** Window/page facts, snapshotted from the BrowserWindow. Separated from the message so the
+ *  message is a pure function and can be unit-tested without an Electron window. */
+export interface CaptureWindowFacts {
+  destroyed: boolean;
+  wcDestroyed?: boolean;
+  crashed?: boolean | null;
+  visible?: boolean;
+  minimized?: boolean;
+  focused?: boolean;
+  width?: number;
+  height?: number;
+  url?: string;
+}
+
+/** Turn a compositor refusal into a sentence that names the actual cause.
+ *
+ *  History, because the previous wording cost real debugging time: when no window-level fault
+ *  was found this said the renderer "is most likely wedged". That reads as a diagnosis, and it
+ *  was WRONG for a fully-supported state — a layout with no Scene/Game panel open (a 2D-only
+ *  project with both closed) has an `idle` frame loop by design, and the message sent the
+ *  reader chasing a renderer fault that did not exist. See `docs/todo.md`.
+ *
+ *  So: assert a wedge ONLY when the frame loop actually reports `stalled`, and otherwise report
+ *  what the renderer says. `idle` and `hidden` get their own actionable text; a `running` loop
+ *  is stated as evidence AGAINST a wedge rather than being silently ignored. */
+export function explainCaptureFailure(
+  w: CaptureWindowFacts | null,
+  s: RenderSurfaceFacts | null,
+): string {
+  const reasons: string[] = [];
+  let ctx = '';
+  if (w) {
+    if (w.destroyed) reasons.push('the editor window has been destroyed');
+    else {
+      if (w.wcDestroyed) reasons.push('the editor webContents has been destroyed');
+      if (w.crashed) reasons.push('the renderer process has CRASHED');
+      if (w.visible === false) reasons.push('the window is not visible (hidden or on another Space)');
+      if (w.minimized) reasons.push('the window is minimized');
+      if (w.width === 0 || w.height === 0) reasons.push('the window has a zero-sized bounds');
+      ctx = ` [visible=${w.visible} minimized=${w.minimized} focused=${w.focused} ` +
+        `bounds=${w.width}x${w.height} crashed=${w.crashed ?? 'n/a'} url=${w.url}`;
+    }
+  }
+  const loop = s?.frameLoop?.status;
+  const gate = s?.rendererGate?.status;
+  if (ctx) ctx += `${loop ? ` frameLoop=${loop}` : ''}${gate ? ` rendererGate=${gate}` : ''}]`;
+
+  if (reasons.length) return `Likely cause: ${reasons.join('; ')}.${ctx}`;
+
+  // GPU device loss, checked BEFORE `frameLoop` below (including `stalled`) ON PURPOSE: a lost
+  // device is the CAUSE of a stalled loop, not a sibling fact alongside it. Reporting the stall
+  // instead told a reader to relaunch because "the renderer is wedged" when the real, more
+  // specific answer was sitting in `gpu` the whole time — see activeRenderer.ts's GPU fault
+  // channel. Does not self-recover; the editor must be relaunched.
+  if (s?.gpu?.deviceLost) {
+    return `THE GPU DEVICE WAS LOST (reason=${s.gpu.reason ?? 'unknown'}${s.gpu.message ? `: ${s.gpu.message}` : ''}), ` +
+      'which is why nothing is rendering — this is not a wedged frame loop that will recover on ' +
+      'its own; the editor must be relaunched.' + ctx;
+  }
+
+  // Window is fine — so the answer, if there is one, is in the renderer.
+  if (loop === 'idle') {
+    return 'NOTHING IS RENDERING TO CAPTURE: the frame loop is idle (no viewport holds a ' +
+      `frame-driver start ref${typeof s?.frameLoop?.refCount === 'number' ? `, refCount=${s.frameLoop.refCount}` : ''}), ` +
+      'so no scene content is being drawn. That is a LEGAL, supported state for a layout with ' +
+      'no Scene or Game panel open — it is NOT a wedged renderer, and the window itself is ' +
+      'healthy. Open a Scene/Game panel and retry, or use modoki_render_scene, which renders ' +
+      'offscreen and needs no mounted viewport.' + ctx;
+  }
+  if (loop === 'hidden') {
+    return 'The renderer document is HIDDEN, so the browser throttles requestAnimationFrame and ' +
+      'the compositor has no fresh frame to hand over. Not a fault: bring the editor window to ' +
+      'the front (or off the occluded Space) and retry.' + ctx;
+  }
+  if (loop === 'stalled') {
+    return 'The frame loop is STALLED — the renderer is wedged, which is why the compositor has ' +
+      `nothing to composite.${s?.frameLoop?.detail ? ` ${s.frameLoop.detail}` : ''}` + ctx;
+  }
+  if (gate && gate !== 'ready') {
+    return `The 3D renderer gate is '${gate}', so the viewport's renderer is not up yet` +
+      `${s?.rendererGate?.detail ? ` — ${s.rendererGate.detail}` : ''}. A 'failed' gate never ` +
+      'self-recovers (relaunch the editor); a \'pending\' one may just need another moment.' + ctx;
+  }
+  // `loop === 'running'` OR the probe answered and simply OMITTED frameLoop — which is the
+  // healthy case, not a missing one (independent review, 2026-07-30). `readEditorState`'s
+  // `frameLoopFields()` returns `{}` when the loop is running with no recoveries ("a running loop
+  // is the norm and needs no words"), so `s.frameLoop` is undefined in exactly the situation this
+  // branch was written for: window fine, loop fine, compositor still refused. It therefore fell
+  // through to the final "the IPC probe failed — the renderer may be gone" paragraph and told the
+  // reader a healthy renderer was missing. The unit tests passed because they hand-build
+  // `{frameLoop:{status:'running'}}`, a shape the real probe never produces.
+  //
+  // `s` being a non-null object IS the evidence the probe answered; only a null `s` means it did
+  // not. So an answered probe with no frameLoop and no bad gate means running-and-healthy.
+  if (loop === 'running' || (s && !loop && (!gate || gate === 'ready'))) {
+    return 'The window is alive and the frame loop IS running' +
+      `${typeof s?.frameLoop?.fps === 'number' ? ` (${s.frameLoop.fps}fps)` : ''}, so the renderer ` +
+      'is NOT wedged — the compositor refused a frame for a reason outside the page (a window ' +
+      'just shown/resized/moved between displays, or GPU-process churn). Retrying usually works; ' +
+      'if it never does, use CDP Page.captureScreenshot or modoki_render_scene.' + ctx;
+  }
+  // No renderer facts at all (the probe failed, or the bridge is down) — describe the gap
+  // instead of inventing a cause.
+  return 'The window looks alive and visible, but the compositor produced no frame and the ' +
+    'renderer could not be asked why (the IPC probe failed — the editor renderer may be gone). ' +
+    'Read `frameLoop.status` in modoki_get_editor_state: "idle" means no viewport is mounted ' +
+    '(nothing to capture), "hidden" means the window is occluded, "stalled" means a real wedge.' + ctx;
+}
+
 /** `webContents.capturePage()` asks Chromium's compositor (Viz) for a frame. When the
  *  compositor cannot produce one it rejects with a bare `UnknownVizError` — no window
  *  state, no page state, nothing pointing at WHY. That opaque string is what agents have
  *  been left holding while the real story (a minimised/occluded window, a destroyed
- *  webContents, or a renderer whose frame loop has died) sat one property lookup away.
- *  Re-throw with the window/page facts that actually identify the cause. */
-async function capturePageOrExplain(win: BrowserWindow) {
+ *  webContents, an unmounted viewport, or a renderer whose frame loop has died) sat one
+ *  property lookup away. Re-throw with the facts that actually identify the cause. */
+async function capturePageOrExplain(win: BrowserWindow, probe?: SurfaceProbe) {
   try {
     return await win.webContents.capturePage();
   } catch (e) {
-    const reasons: string[] = [];
-    let ctx = '';
+    let facts: CaptureWindowFacts | null = null;
     try {
-      if (win.isDestroyed()) reasons.push('the editor window has been destroyed');
+      if (win.isDestroyed()) facts = { destroyed: true };
       else {
         const wc = win.webContents;
         const bounds = win.getBounds();
-        if (wc.isDestroyed()) reasons.push('the editor webContents has been destroyed');
-        if (wc.isCrashed?.()) reasons.push('the renderer process has CRASHED');
-        if (!win.isVisible()) reasons.push('the window is not visible (hidden or on another Space)');
-        if (win.isMinimized()) reasons.push('the window is minimized');
-        if (bounds.width === 0 || bounds.height === 0) reasons.push('the window has a zero-sized bounds');
-        ctx = ` [visible=${win.isVisible()} minimized=${win.isMinimized()} focused=${win.isFocused()} ` +
-          `bounds=${bounds.width}x${bounds.height} crashed=${wc.isCrashed?.() ?? 'n/a'} url=${wc.getURL()}]`;
+        facts = {
+          destroyed: false,
+          wcDestroyed: wc.isDestroyed(),
+          crashed: wc.isCrashed?.() ?? null,
+          visible: win.isVisible(),
+          minimized: win.isMinimized(),
+          focused: win.isFocused(),
+          width: bounds.width,
+          height: bounds.height,
+          url: wc.getURL(),
+        };
       }
     } catch { /* the window died mid-inspection — the raw cause below still stands */ }
-    const why = reasons.length
-      ? `Likely cause: ${reasons.join('; ')}.`
-      : 'The window looks alive and visible, so the compositor produced no frame — the renderer ' +
-        'is most likely wedged (check `frameLoop.status` in modoki_get_editor_state: a "stalled" ' +
-        'frame loop means nothing is being drawn to composite).';
-    throw new Error(`capture_viewport failed: ${String(e)}. ${why}${ctx}`, { cause: e });
+    let surface: RenderSurfaceFacts | null = null;
+    try { surface = (await probe?.()) ?? null; } catch { /* explanation loses a paragraph, not the error */ }
+    throw new Error(`capture_viewport failed: ${String(e)}. ${explainCaptureFailure(facts, surface)}`, { cause: e });
   }
 }
 
 /** Capture the visible editor window → downscaled JPEG on disk. Returns the path
  *  Claude reads, the final dimensions, AND the CSS size + scale it was reduced from —
  *  without which an agent measuring a button in the image has no way to tap it. */
-export async function captureViewport(win: BrowserWindow, opts?: { maxSide?: number; quality?: number }): Promise<CaptureResult> {
+/** Pixel dimensions of an encoded JPEG, read from its SOF marker — or null if the buffer is not
+ *  a JPEG we can parse.
+ *
+ *  WHY THIS EXISTS (S3.5): `captureViewport` reported `NativeImage.getSize()`, which is DIP, as the
+ *  size of the FILE. When a downscale happens the resize makes the two agree, but with
+ *  `maxSide` ≥ the window size no resize occurs and `toJPEG()` writes the underlying bitmap — so on
+ *  a HiDPI display the reported `width`/`scale` could be off by the device pixel ratio, and the
+ *  documented conversion "image px ÷ scale = DIP px" would mis-place an eyeballed coordinate by 2×.
+ *
+ *  Rather than reason about which representation Electron encodes (it varies by platform and by how
+ *  the image was created — and this repo's own attempt to verify it stalled on having no HiDPI
+ *  window available), read the answer out of the bytes that were actually written. That is correct
+ *  in every branch, on every display, and it doubles as a check that the encode produced a real
+ *  JPEG. Falls back to the DIP size when the buffer cannot be parsed, which is what the code did
+ *  everywhere before. */
+export function jpegSize(buf: Uint8Array): { width: number; height: number } | null {
+  if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) return null;   // not SOI
+  let i = 2;
+  while (i + 3 < buf.length) {
+    if (buf[i] !== 0xff) { i++; continue; }                                // resync on fill bytes
+    const marker = buf[i + 1];
+    if (marker === 0xff) { i++; continue; }
+    // Standalone markers carry no length payload.
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { i += 2; continue; }
+    const len = (buf[i + 2] << 8) | buf[i + 3];
+    // SOF0/1/2/3/5/6/7/9/10/11/13/14/15 — every frame header carries height then width.
+    // 0xc4 (DHT), 0xc8 (JPG) and 0xcc (DAC) are NOT frame headers despite sitting in the range.
+    const isSOF = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+    if (isSOF) {
+      if (i + 9 >= buf.length) return null;
+      const height = (buf[i + 5] << 8) | buf[i + 6];
+      const width = (buf[i + 7] << 8) | buf[i + 8];
+      return width > 0 && height > 0 ? { width, height } : null;
+    }
+    if (len < 2) return null;                                              // malformed
+    i += 2 + len;
+  }
+  return null;
+}
+
+export async function captureViewport(
+  win: BrowserWindow,
+  opts?: { maxSide?: number; quality?: number; probe?: SurfaceProbe },
+): Promise<CaptureResult> {
   const maxSide = opts?.maxSide ?? MAX_SIDE;
-  // Electron's NativeImage.toJPEG() wants an INTEGER 0–100. Tolerate a 0–1
-  // fraction too (the scale `render-scene`'s canvas.toDataURL uses) so a caller
-  // passing e.g. 0.9 can't crash the native binding with a "conversion failure".
-  const rawQuality = opts?.quality ?? JPEG_QUALITY;
-  const quality = Math.max(1, Math.min(100, Math.round(rawQuality <= 1 ? rawQuality * 100 : rawQuality)));
-  let image = await capturePageOrExplain(win);
+  const quality = normalizeJpegQuality(opts?.quality, JPEG_QUALITY).pct;
+  let image = await capturePageOrExplain(win, opts?.probe);
   // `NativeImage.getSize()` reports DIP (CSS) px, not device px — so this IS the
   // coordinate space `tap`/`drag` take, and it is worth returning verbatim.
   const { width: cssWidth, height: cssHeight } = image.getSize();
@@ -104,9 +285,12 @@ export async function captureViewport(win: BrowserWindow, opts?: { maxSide?: num
   if (fit.scale !== 1) image = image.resize({ width: fit.width, height: fit.height, quality: 'best' });
   pruneOldTempFiles('modoki-capture-'); // drop stale captures from prior sessions
   const out = path.join(os.tmpdir(), `modoki-capture-${Date.now()}-${captureSeq++}.jpg`);
-  fs.writeFileSync(out, image.toJPEG(quality));
-  // Trust the encoder's own idea of the final size over our arithmetic.
-  const finalSize = image.getSize();
+  const jpeg = image.toJPEG(quality);
+  fs.writeFileSync(out, jpeg);
+  // The size of the FILE, read from the file's own header (S3.5) — not `getSize()`, which is DIP
+  // and can differ from the encoded bitmap when no downscale happened on a HiDPI display. Falls
+  // back to the DIP size if the buffer is unparseable.
+  const finalSize = jpegSize(jpeg) ?? image.getSize();
   return {
     path: out,
     width: finalSize.width, height: finalSize.height,
@@ -189,6 +373,10 @@ export async function drag(
   const n = Math.max(2, opts.steps ?? 10);
   const button = opts.button ?? 'left';
   const modifiers = opts.modifiers;
+  // Intermediate moves must re-assert the held-button modifier — same reason as
+  // `pointerMove` (see `buttonHeldModifier`): without it Chromium reports `buttons:0`
+  // on each move, so a listener gating on `e.buttons` sees the gesture as released.
+  const heldModifiers = [...(modifiers ?? []), buttonHeldModifier(button)];
   wc.sendInputEvent({ type: 'mouseMove', x: from.x, y: from.y, modifiers } as Electron.MouseInputEvent);
   wc.sendInputEvent({ type: 'mouseDown', x: from.x, y: from.y, button, clickCount: 1, modifiers } as Electron.MouseInputEvent);
   await sleep(16);
@@ -196,7 +384,7 @@ export async function drag(
     const t = i / n;
     const x = Math.round(from.x + (to.x - from.x) * t);
     const y = Math.round(from.y + (to.y - from.y) * t);
-    wc.sendInputEvent({ type: 'mouseMove', x, y, button, modifiers } as Electron.MouseInputEvent);
+    wc.sendInputEvent({ type: 'mouseMove', x, y, button, modifiers: heldModifiers } as unknown as Electron.MouseInputEvent);
     await sleep(16);
   }
   wc.sendInputEvent({ type: 'mouseUp', x: to.x, y: to.y, button, clickCount: 1, modifiers } as Electron.MouseInputEvent);
@@ -357,31 +545,51 @@ export async function pressKey(win: BrowserWindow, key: string, modifiers?: Inpu
 export async function focusElement(
   win: BrowserWindow,
   selector?: string,
-): Promise<{ view: boolean; focused: string | null; blurred: string | null; ok: boolean }> {
+): Promise<{ view: boolean; focused: string | null; blurred: string | null; ok: boolean; error?: string; activeElement?: string | null }> {
   const wc = win.webContents;
   wc.focus(); // window/view-level focus — required for keyboard sendInputEvent to land
   const sel = selector ? JSON.stringify(selector) : 'null';
   try {
+    // S3.7 — a failure here used to come back as a bare `{ok:false}`, which the route passed
+    // through with no error string, so the tool reported "the operation reported ok:false": no
+    // cause, no fix, and no way to tell "no element matched" from "the element refused focus".
+    // Every other Enact aim path returns a NAMED miss (see `domResolve.ts`), so this one names
+    // its three distinct failures too, and echoes where focus actually ended up.
     const dom = await wc.executeJavaScript(
       `(() => {
         const sel = ${sel};
         const tag = (el) => !el ? null : (el.tagName ? el.tagName.toLowerCase() : String(el)) + (el.id ? '#' + el.id : '');
+        const active = () => tag(document.activeElement);
         if (!sel) {
           const a = document.activeElement;
-          if (a && a !== document.body) { const t = tag(a); a.blur(); return { focused: null, blurred: t, ok: true }; }
-          return { focused: null, blurred: null, ok: true };
+          if (a && a !== document.body) { const t = tag(a); a.blur(); return { focused: null, blurred: t, ok: true, activeElement: active() }; }
+          return { focused: null, blurred: null, ok: true, activeElement: active() };
         }
-        const el = document.querySelector(sel);
-        if (!el) return { focused: null, blurred: null, ok: false };
+        let el;
+        try { el = document.querySelector(sel); }
+        catch (e) {
+          return { focused: null, blurred: null, ok: false, activeElement: active(),
+            error: 'selector is not valid CSS: ' + sel + ' (' + (e && e.message ? e.message : e) + ')' };
+        }
+        if (!el) {
+          return { focused: null, blurred: null, ok: false, activeElement: active(),
+            error: 'no element matches ' + sel + ' — re-read the DOM (get_layout_bounds / a screenshot) and aim at a selector that exists' };
+        }
         if (el.tabIndex < 0 && !/^(input|textarea|select|a|button)$/i.test(el.tagName)) el.setAttribute('tabindex', '-1');
         el.focus();
-        return { focused: tag(el), blurred: null, ok: document.activeElement === el };
+        if (document.activeElement !== el) {
+          return { focused: null, blurred: null, ok: false, activeElement: active(),
+            error: tag(el) + ' matched ' + sel + ' but REFUSED focus (disabled, hidden, or inside an inert/aria-hidden subtree); focus is on ' + (active() || 'body') };
+        }
+        return { focused: tag(el), blurred: null, ok: true, activeElement: active() };
       })()`,
       true,
     );
     return { view: true, ...dom };
-  } catch {
-    return { view: true, focused: null, blurred: null, ok: false };
+  } catch (e) {
+    // The evaluate itself failed (renderer navigating/destroyed) — distinct from a DOM miss.
+    return { view: true, focused: null, blurred: null, ok: false, activeElement: null,
+      error: `could not evaluate in the renderer: ${e instanceof Error ? e.message : String(e)}` };
   }
 }
 
@@ -429,11 +637,37 @@ async function readActiveElement(wc: Electron.WebContents): Promise<{ typable: b
     .catch(() => ({ typable: false, gameSwallows: false, descriptor: null }));
 }
 
+/** Read the focused element's current text — the MEASUREMENT `typed` is derived from (S3.18).
+ *
+ *  `typed: text.length` was a restatement of the request, not an observation: `sendInputEvent`
+ *  cannot fail, and Chromium's synthetic `char` path only inserts characters it can express as a
+ *  `keyCode`, so non-ASCII (CJK, emoji, accented) input was reported as typed under ok:true while
+ *  the field was unchanged. Same false-success class `enact.md` records for the readOnly case,
+ *  which was only closed for "nothing typable is focused". */
+const FOCUSED_VALUE_PROBE = `(() => {
+  const a = document.activeElement;
+  if (!a) return null;
+  if (a.isContentEditable === true) return a.textContent ?? '';
+  if (typeof a.value === 'string') return a.value;
+  return null;
+})()`;
+
+async function readFocusedValue(wc: Electron.WebContents): Promise<string | null> {
+  return wc.executeJavaScript(FOCUSED_VALUE_PROBE, true).catch(() => null);
+}
+
 export async function typeText(
   win: BrowserWindow,
   text: string,
   opts?: { clearFirst?: boolean; submitKey?: string },
-): Promise<{ typed: number; editable: boolean; activeElement: string | null }> {
+): Promise<{
+  typed: number; editable: boolean; activeElement: string | null;
+  /** The focused element's text AFTER typing, when it could be read (null for a canvas/div or a
+   *  submitKey that blurred the field). Present so `typed` is checkable rather than asserted. */
+  valueAfter?: string | null;
+  /** Set when the measured insert is shorter than the requested text — see S3.18. */
+  error?: string;
+}> {
   const wc = win.webContents;
   // A trusted `char` event only INSERTS text when an editable element holds focus. With nothing
   // (or a non-editable div/canvas) focused, the chars land nowhere yet `sendInputEvent` can't
@@ -444,6 +678,8 @@ export async function typeText(
   // focus and all reject characters, so typing into them is a NO-OP that used to report
   // {ok:true, typed:N}. Measured against the Inspector's readOnly name field.
   if (!active.typable) return { typed: 0, editable: false, activeElement: active.descriptor };
+  // Read BEFORE `clearFirst` runs? No — after it, so the delta measures what THIS call inserted
+  // rather than counting the cleared text as a negative.
   if (opts?.clearFirst) {
     // Cmd+A (macOS) / Ctrl+A elsewhere, then Backspace — empty the field first.
     const mod = process.platform === 'darwin' ? 'meta' : 'control';
@@ -454,6 +690,7 @@ export async function typeText(
     wc.sendInputEvent({ type: 'keyUp', keyCode: 'Backspace' } as Electron.KeyboardInputEvent);
     await sleep(8);
   }
+  const before: string | null = await readFocusedValue(wc);
   for (const ch of text) {
     // Only the `char` event inserts text; keyDown/keyUp bracket it so key handlers
     // (shortcut guards, Enter-to-commit) still see a real press.
@@ -462,12 +699,46 @@ export async function typeText(
     wc.sendInputEvent({ type: 'keyUp', keyCode: ch } as Electron.KeyboardInputEvent);
     await sleep(8);
   }
+  // MEASURE before the submitKey: 'Tab'/'Escape' blur the field, after which there is nothing
+  // left to read (and 'Enter' may commit + reformat the value).
+  const after = await readFocusedValue(wc);
   if (opts?.submitKey) {
     wc.sendInputEvent({ type: 'keyDown', keyCode: opts.submitKey } as Electron.KeyboardInputEvent);
     wc.sendInputEvent({ type: 'keyUp', keyCode: opts.submitKey } as Electron.KeyboardInputEvent);
     await sleep(8);
   }
-  return { typed: text.length, editable: true, activeElement: active.descriptor };
+  // The measured insert. `before` is null for an unreadable target (a contentEditable canvas
+  // wrapper, say) — then there is nothing to measure and `typed` falls back to the request, which
+  // is at least no worse than before and is not dressed up as an observation.
+  if (before === null || after === null) {
+    return { typed: text.length, editable: true, activeElement: active.descriptor, valueAfter: after };
+  }
+  // WHAT LANDED, not how much the length grew (independent review, 2026-07-30). A length delta is
+  // the insert count only when typing APPENDS — but Chromium replaces the current SELECTION, so
+  // any flow that leaves text selected (the documented `clickCount:2` rename, or `clearFirst`)
+  // under-counts, and when the replaced selection was longer than the new text the delta is
+  // negative and clamps to 0. A correct rename therefore reported `ok:false, typed:0` and blamed
+  // non-ASCII — a cause that is simply false for a plain ASCII rename, sending the reader off to
+  // work around a limitation they had not hit.
+  //
+  // Containment answers the real question ("did the requested text reach the field?") for both
+  // append and replace, and needs no knowledge of what was selected.
+  const landed = text.length === 0 || after.includes(text);
+  const inserted = landed ? text.length : Math.max(0, after.length - before.length);
+  return {
+    typed: inserted,
+    editable: true,
+    activeElement: active.descriptor,
+    valueAfter: after,
+    ...(landed ? {} : {
+      error: `the requested text is NOT in the field after typing — ${inserted} of ${text.length} `
+        + `character(s) appear to have reached it (before: ${JSON.stringify(before)}, after: `
+        + `${JSON.stringify(after)}). The usual cause is that Chromium's synthetic char path can `
+        + `only insert what it can express as a keyCode, so non-ASCII text (CJK, emoji, accented `
+        + `letters) is dropped; a field that reformats or rejects input as you type does the same. `
+        + `Set the value through the app's own UI, or use modoki_eval for a non-input-driven write.`,
+    }),
+  };
 }
 
 export interface GestureFrame { t: number; x: number; y: number; sample: unknown }

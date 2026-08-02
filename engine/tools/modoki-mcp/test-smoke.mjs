@@ -17,6 +17,9 @@ console.log('TOOLS:', tools.tools.map((t) => t.name).join(', '));
 
 const text = (r) => r.content.map((c) => c.text).join('\n');
 
+/** Cases that did NOT run. The final verdict accounts for these (F12) — see the exit below. */
+const skipped = [];
+
 const assets = await client.callTool({ name: 'modoki_list_assets', arguments: { type: 'scene' } });
 console.log('list_assets(scene) →', text(assets).slice(0, 120).replace(/\n/g, ' '));
 
@@ -48,6 +51,603 @@ if (sj.elided) {
   console.log('get_scene_state → scenePath:', sj.scenePath, ' entityCount:', sj.entityCount);
 }
 
+/** Run `check`, then ALWAYS run `cleanup` — and report `check`'s failure in preference to
+ *  `cleanup`'s. A bare `finally { throw }` (which is what these were) lets a cleanup failure MASK
+ *  the assertion failure that caused it, i.e. it hides the finding this harness exists to produce.
+ *  A cleanup failure with no primary failure still throws: leaving test entities in the human's
+ *  scene is itself a bug. */
+/** UC9's created guids, shared with its cleanup (which must undo exactly as many creates as
+ *  landed, even when the check failed part-way). */
+let smokeGuids = [];
+
+async function withCleanup(check, cleanup) {
+  let failure = null;
+  try { await check(); } catch (e) { failure = e; }
+  try {
+    await cleanup();
+  } catch (e) {
+    if (failure) console.log(`  (cleanup ALSO failed: ${e.message})`);
+    else failure = e;
+  }
+  if (failure) throw failure;
+}
+
+// ── modoki_batch (plan Phase 5) ──────────────────────────────────────────────
+// Unit tests drive the executor over a FAKE registry, which cannot prove the batch
+// actually reaches the editor, and cannot prove ORDER — a fake registry would happily
+// pass with steps executed backwards. So the checks below are the ones only a live
+// editor can answer. They are deliberately READ-ONLY: this runs against whatever
+// project the human has open, and a smoke test must never write to it.
+
+// 1. Pre-flight rejects BEFORE anything runs — asserted here too because the refusal
+//    text is what an agent has to act on, and it must survive schema/wording drift.
+for (const [label, steps, expect] of [
+  ['unknown tool', [{ tool: 'modoki_nope' }], 'unknown tool'],
+  ['denied build', [{ tool: 'modoki_build', args: {} }], 'its own call'],
+  ['raw x/y', [{ tool: 'modoki_tap', args: { x: 1, y: 2 } }], 'not allowed inside a batch'],
+]) {
+  const r = await client.callTool({ name: 'modoki_batch', arguments: { steps } });
+  if (!r.isError || !text(r).includes(expect)) throw new Error(`batch pre-flight (${label}) did not reject: ${text(r)}`);
+  console.log(`batch pre-flight rejects ${label} ✓`);
+}
+
+// 2. Ordering + the `wait` pseudo-step over the real HTTP path.
+const chain = await client.callTool({ name: 'modoki_batch', arguments: { steps: [
+  { tool: 'modoki_get_editor_state', args: {} },
+  { tool: 'wait', args: { ms: 100 } },
+  { tool: 'modoki_list_scenes', args: {} },
+] } });
+const cj = JSON.parse(text(chain));
+if (!cj.ok || cj.ran !== 3) throw new Error(`batch chain did not run 3 steps: ${text(chain)}`);
+if (cj.steps.map((s) => s.i).join() !== '0,1,2') throw new Error('batch steps came back out of order');
+console.log('batch runs an ordered chain (incl. wait) →', cj.ran, 'steps ✓');
+
+// 3. `resultDefault:'none'` suppresses clean steps into `quiet` — the token saving.
+const quiet = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: {
+  steps: [{ tool: 'modoki_get_editor_state', args: {} }, { tool: 'modoki_list_scenes', args: {} }, { tool: 'modoki_list_traits', args: {} }],
+  resultDefault: 'none',
+} })));
+if (quiet.quiet?.length !== 2 || quiet.steps?.length !== 1) throw new Error(`result:none did not suppress: ${JSON.stringify(quiet)}`);
+console.log('batch resultDefault:none → quiet:', quiet.quiet.map((q) => q.i).join(), '+ terminal read ✓');
+
+// 4. A FAILURE un-suppresses the steps before it. This is the invariant that makes
+//    `result:'none'` safe to offer: steps 0-1 already APPLIED and are not rolled back,
+//    so an envelope that mentioned only the failure would describe a state that does
+//    not exist. Only a live backend produces a genuine mid-batch failure.
+const failed = await client.callTool({ name: 'modoki_batch', arguments: { steps: [
+  { tool: 'modoki_get_editor_state', args: {}, result: 'none' },
+  { tool: 'modoki_list_scenes', args: {}, result: 'none' },
+  { tool: 'modoki_validate_scene', args: { path: '/assets/scenes/does-not-exist.json' }, result: 'none' },
+  { tool: 'modoki_list_traits', args: {} },
+] } });
+if (!failed.isError) throw new Error('a failing batch must surface as isError (C7)');
+// The failure is a §5 envelope now (conventions §5): the batch report lives at `error.got`, and
+// `code` says WHICH kind of failure it was — PARTIAL means "some of it applied", as against the
+// pre-flight REFUSED_BY_OP above where nothing ran. That distinction is the whole point.
+const fe = JSON.parse(text(failed)).error;
+if (fe?.code !== 'PARTIAL') throw new Error(`expected code PARTIAL, got ${fe?.code}: ${text(failed)}`);
+if (fe.tool !== 'modoki_batch') throw new Error(`the envelope must name the tool, got ${fe.tool}`);
+// `got` must be a STRUCTURED object, not JSON nested inside JSON. It was the latter on the first
+// cut of the envelope — `error.got.failedAt` needed a second JSON.parse to reach, which is how a
+// well-shaped error ends up harder to read than the free text it replaced.
+if (typeof fe.got !== 'object') throw new Error('error.got must be structured, not a JSON string');
+const fj = fe.got;
+if (fj.ok !== false || fj.failedAt !== 2) throw new Error(`expected failedAt=2: ${text(failed)}`);
+if (fj.quiet) throw new Error('a failed batch must NOT leave steps suppressed in `quiet`');
+if (fj.steps.filter((s) => s.i < 2).length !== 2) throw new Error("the 'none' steps before the failure were not promoted");
+if (!fj.notRun?.length) throw new Error('the un-run tail was not reported');
+// The FAILING step's own error is an envelope too, and its code must describe what really went
+// wrong. A missing SCENE is NOT_FOUND; the first cut of `httpFailure` mapped every 404 onto
+// "the route is absent — relaunch the editor", which sent the reader after a phantom editor
+// problem over a typo'd path. "Could not look" is never reported as "nothing is there" (§5).
+const inner = fj.steps.find((s) => s.i === 2)?.error?.error;
+if (inner?.code !== 'NOT_FOUND') throw new Error(`a missing scene must be NOT_FOUND, got ${inner?.code}`);
+if (!/does-not-exist/.test(inner.why)) throw new Error('the failing step must name WHICH scene was missing');
+console.log('batch failure → code:', fe.code, ' failedAt:', fj.failedAt, ' step2:', inner.code, '✓');
+
+// ── Case preconditions (Issue #41) ───────────────────────────────────────────
+// UC3/UC5/UC6/UC8 below depend on state that only games/3d-test provides — a scene, a prefab, a
+// particle def, an entity named 'cube'. Probed ONCE up front via the TOOL SURFACE (never the
+// filesystem: the harness may be pointed at a remote/packaged editor), so an unmet precondition
+// reports itself as one instead of failing case-by-case with errors that read like BROKEN TOOLS —
+// `load-scene FAILED for …skinned-test.scene.json`, `tap: no entity named "cube"`. That misread is the
+// bug this block exists to fix: per CLAUDE.md the repo owner never drives MCP tools, so the agent
+// is the only one who ever runs this gate, and a wrong-state failure costs a debugging detour
+// every time — plus the opposite error, "fixing" a tool that was fine.
+//
+// Gated PER CASE, not on one shared boolean. Two of these preconditions read the CURRENTLY OPEN
+// SCENE, not the project, so a shared gate would disable cases that need nothing from it. That is
+// not hypothetical: measured on games/3d-test with skinned-test.scene.json open, only UC3's precondition
+// fails — a shared gate would have silently dropped UC5/UC6/UC8 too, and the tempting "fix" for
+// that is to delete the probe. Each case declares exactly what it uses.
+const FIXTURE_SCENE = '/assets/scenes/skinned-test.scene.json';
+const FIXTURE_PREFAB = '/assets/models/skinned-test/cone.prefab.json';
+const FIXTURE_PARTICLE = '/assets/particles/confetti.particle.json';
+const [scenesR, prefabsR, particlesR, cubeR, coneR, identityR] = await Promise.all([
+  client.callTool({ name: 'modoki_list_scenes', arguments: {} }),
+  client.callTool({ name: 'modoki_list_assets', arguments: { type: 'prefab' } }),
+  client.callTool({ name: 'modoki_list_assets', arguments: { type: 'particle' } }),
+  client.callTool({ name: 'modoki_get_scene_state', arguments: { name: 'cube' } }),
+  client.callTool({ name: 'modoki_get_scene_state', arguments: { name: 'Cone' } }),
+  // get_editor_state carries no project-identifying field (only the open SCENE path) — the open
+  // PROJECT's root comes from modoki_identity instead.
+  client.callTool({ name: 'modoki_identity', arguments: {} }),
+]);
+const OPEN_PROJECT = JSON.parse(text(identityR)).projectRoot ?? '(unknown)';
+const cubeState = JSON.parse(text(cubeR));
+// UC3 frames the cube before aiming at it (see the batch below) — focus_entity addresses by
+// guid/id, not by name, so capture the guid here off the probe we already ran.
+const CUBE_GUID = (cubeState.entities ?? [])[0]?.guid;
+const OPEN_SCENE = cubeState.scenePath ?? '(unknown)';
+const conesAlready = (JSON.parse(text(coneR)).entities ?? []).length;
+
+/** Each precondition: is it met, and how to describe it when it is not. Keyed so a case can
+ *  declare only what it actually uses — a case gated on a precondition it does not need is the
+ *  over-skipping this table exists to prevent. */
+const PRECOND = {
+  scene: { ok: (JSON.parse(text(scenesR)).scenes ?? []).some((s) => s.path === FIXTURE_SCENE), need: `the scene ${FIXTURE_SCENE}` },
+  prefab: { ok: (JSON.parse(text(prefabsR)).assets ?? []).some((a) => a.path === FIXTURE_PREFAB), need: `the prefab ${FIXTURE_PREFAB}` },
+  particle: { ok: (JSON.parse(text(particlesR)).assets ?? []).some((a) => a.path === FIXTURE_PARTICLE), need: `the particle def ${FIXTURE_PARTICLE}` },
+  cube: { ok: (cubeState.entities ?? []).length > 0, need: "an entity named 'cube' in the OPEN scene" },
+  // UC5 aims by NAME on purpose (the ergonomic form is what finds bugs), so it needs 'Cone' to be
+  // unambiguous AFTER its instantiate adds one. Any pre-existing Cone makes the name ambiguous,
+  // and an ambiguous name is REFUSED everywhere by design — so the case cannot run, and the
+  // refusal is the tool being right. Found by running this gate against skinned-test.scene.json, which
+  // ships 3 Cones: without this probe UC5 failed with a wall of REFUSED_BY_OP that reads exactly
+  // like modoki_set_transform being broken. Rewriting UC5 to aim by guid would "fix" the failure
+  // by deleting the coverage — the by-name path is the thing under test.
+  coneFree: { ok: conesAlready === 0, need: `NO pre-existing entity named 'Cone' in the OPEN scene (found ${conesAlready}; UC5 aims by name, and an ambiguous name is correctly refused)` },
+};
+const CASE_NEEDS = { UC3: ['cube'], UC5: ['prefab', 'coneFree'], UC6: ['particle'], UC8: ['scene'] };
+
+/** True when `uc`'s preconditions all hold. Otherwise pushes ONE skip reason — naming the open
+ *  project AND scene, since either can be the cause — and logs it, so the F12 verdict at the end
+ *  of this file turns the run into `SMOKE INCOMPLETE` + exit 1. A skipped case can never pass. */
+function preconditionsFor(uc) {
+  const unmet = CASE_NEEDS[uc].filter((k) => !PRECOND[k].ok).map((k) => PRECOND[k].need);
+  if (!unmet.length) return true;
+  const reason = `unmet precondition in the open editor (project ${OPEN_PROJECT}, scene ${OPEN_SCENE}) — needs: ${unmet.join('; ')}`;
+  skipped.push(`${uc} — ${reason}`);
+  console.log(`${uc} SKIPPED — ${reason}`);
+  return false;
+}
+const canUC3 = preconditionsFor('UC3'), canUC5 = preconditionsFor('UC5'),
+      canUC6 = preconditionsFor('UC6'), canUC8 = preconditionsFor('UC8');
+
+// ── Real use cases (plan Usability 1) ────────────────────────────────────────
+// Each of these is a workflow written the way an agent would naturally write it, and each one
+// FOUND a bug in that form. They are here so the bug cannot come back quietly. Two rules they
+// obey deliberately: no hand-written scene `path` (the ergonomic form is the one that gets used,
+// and `set_transform`/`mutate_scene` both had a broken-or-absent default that only the explicit
+// form hid), and any mutation is undone before the next case runs.
+
+// UC8 — a SCENE SWAP mid-batch. The hypothesis going in was that a reload reassigns runtime ids,
+// so later steps would break; addressed by NAME/PATH they do not, and the swap-back works too.
+// What it actually found was worse and unrelated: an unknown arg KEY was silently dropped, so
+// `set_selection {name:'Capsule'}` (there is no `name` param) parsed to `{}` — which that tool
+// documents as "no refs = clear" — and it CLEARED the selection while reporting ok.
+// Runs FIRST of the mutating cases, and only against a CLEAN editor. `load_scene` refuses while
+// the live world has unsaved changes (correctly — a swap destroys them), and the later cases here
+// leave the world dirty by design (manual persistence: they mutate live and never save). Forcing
+// past it is not an option for a harness pointed at a live editor: the unsaved work might be the
+// human's. So: check, and skip out loud rather than either failing or discarding.
+const pre = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+// Whatever scene is open RIGHT NOW, so the harness restores the human's editor rather than
+// assuming a particular project's default.
+const SCENE = pre.scenePathRef;
+if (!canUC8 || pre.unsavedChanges || !SCENE) {
+  // `canUC8` already pushed its own reason (missing fixture) above — only push the
+  // unsaved-changes/no-scene reason here, so one case never contributes two skip entries.
+  if (canUC8) {
+    skipped.push(`UC8 — ${pre.unsavedChanges ? 'the editor has unsaved live-world changes (a scene swap would destroy them)' : 'no resolvable scenePathRef to restore'}`);
+    console.log(`UC8 SKIPPED — ${skipped[skipped.length - 1]}`);
+  }
+} else {
+const uc8 = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: { steps: [
+  { tool: 'modoki_load_scene', args: { path: FIXTURE_SCENE }, result: 'none' },
+  { tool: 'modoki_get_editor_state', args: {} },
+  { tool: 'modoki_get_scene_state', args: { name: 'Cylinder' } },
+] } })));
+await withCleanup(() => {
+  if (!uc8.ok) throw new Error(`UC8 scene swap failed: ${JSON.stringify(uc8)}`);
+  const st = uc8.steps.find((s2) => s2.tool === 'modoki_get_editor_state')?.result;
+  if (st?.scenePathRef !== FIXTURE_SCENE) {
+    throw new Error(`UC8 later step did not see the swapped scene: ${JSON.stringify(st)}`);
+  }
+  // A NAME resolved AFTER the swap: this is what proves the reload did not invalidate the step.
+  // `name` is a SUBSTRING filter, so the rig's children match too — assert on what it means (every
+  // hit is a Cylinder, and there is at least one), not on a count that depends on the rig.
+  const found = uc8.steps.at(-1).result.entities ?? [];
+  if (!found.length || !found.every((e) => e.name.includes('Cylinder'))) {
+    throw new Error(`UC8 name lookup after the swap returned ${JSON.stringify(found.map((e) => e.name))}`);
+  }
+  console.log('UC8 scene swap mid-batch → later steps see the new scene, names still resolve ✓');
+}, async () => {
+  const back = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: { steps: [
+    { tool: 'modoki_load_scene', args: { path: SCENE }, result: 'none' },
+    { tool: 'modoki_get_editor_state', args: {} },
+  ] } })));
+  const now = back.steps?.at(-1)?.result?.scenePathRef;
+  if (now !== SCENE) throw new Error(`UC8 failed to restore ${SCENE} (now ${now})`);
+  console.log('UC8 restores the original scene ✓');
+});
+}
+
+// UC2 — lay out several entities in ONE batch, then verify, then clean up.
+// The `path`-less form is load-bearing: a batch cannot read a step's response, so a tool that
+// demands a path an agent has to look up first is not batchable at all.
+const uc2 = (ops, extra = []) => ({
+  resultDefault: 'none',
+  steps: [{ tool: 'modoki_mutate_scene', args: { ops } }, ...extra],
+});
+const UC2 = ['UC2_a', 'UC2_b', 'UC2_c'];
+const placed = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: {
+  resultDefault: 'none',
+  steps: [
+    ...UC2.map((name) => ({ tool: 'modoki_mutate_scene', args: { ops: [{ op: 'addEntity', name, parentId: 0,
+      traits: { Transform: { x: 0, y: 0, z: 0 }, EntityAttributes: { layer: '3d' } } }] } })),
+    ...UC2.map((name, i) => ({ tool: 'modoki_set_transform', args: { entity: { name }, space: 'local', position: [i + 1, 2, 3] } })),
+    { tool: 'modoki_get_scene_state', args: { name: 'UC2_', trait: 'Transform' }, result: 'full' },
+  ],
+} })));
+await withCleanup(() => {
+  if (!placed.ok || placed.ran !== 7) throw new Error(`UC2 did not run 7 steps: ${JSON.stringify(placed)}`);
+  if (placed.quiet?.length !== 6) throw new Error(`UC2 should suppress 6 steps: ${JSON.stringify(placed.quiet)}`);
+  const got = placed.steps.at(-1).result.entities;
+  if (got?.length !== 3) throw new Error(`UC2 expected 3 entities, got ${got?.length}`);
+  // The ORDER matters: each set_transform must have found the entity its earlier sibling added.
+  const xs = got.map((e) => e.traits.Transform.x).join();
+  if (xs !== '1,2,3') throw new Error(`UC2 transforms did not apply in order: x = ${xs}`);
+  console.log('UC2 places 3 entities in one path-less batch →', got.length, 'placed in order ✓');
+}, async () => {
+  const cleaned = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: uc2(
+    UC2.map((name) => ({ op: 'removeEntity', entity: { name } })),
+    [{ tool: 'modoki_get_scene_state', args: { name: 'UC2_' }, result: 'full' }],
+  ) })));
+  const left = cleaned.steps?.at(-1)?.result?.entities?.length;
+  if (left !== 0) throw new Error(`UC2 left ${left} entities behind`);
+  console.log('UC2 cleans up after itself ✓');
+});
+
+// UC3 — the input macro: focus a panel, click a scene ENTITY by name, let a frame land, look.
+// `surface` is REQUIRED for a 2D/3D aim — even when one viewport has it. Without it the call would
+// succeed without ever stating which viewport was meant, so a wrong assumption would be confirmed
+// rather than corrected. `get_editor_state.surfaces` is how you know what's mounted.
+if (canUC3) {
+const uc3 = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: { steps: [
+  { tool: 'modoki_focus', args: { panel: 'scene' }, result: 'none' },
+  // Frame the target FIRST. Without this the tap aims through whatever camera pose the human
+  // last left in this project, and the SceneView camera is remembered per project per clone —
+  // so whether `cube` is clickable varied by clone, and the gate failed for a reason that had
+  // nothing to do with the tools. MEASURED on games/3d-test: at one remembered pose the pick
+  // legitimately returns "Boat Hull" for every one of the 25 sampled points, and #15's
+  // occlusion check correctly REFUSES. That is the tool being right and the fixture being
+  // unreproducible. focus_entity makes the precondition something this suite controls.
+  { tool: 'modoki_focus_entity', args: { guid: CUBE_GUID }, result: 'none' },
+  { tool: 'wait', args: { ms: 200 }, result: 'none' },
+  { tool: 'modoki_tap', args: { entity: { name: 'cube', surface: 'scene-view' } } },
+  { tool: 'wait', args: { ms: 200 }, result: 'none' },
+  { tool: 'modoki_capture_viewport', args: {} },
+  { tool: 'modoki_get_editor_state', args: {} },
+] } })));
+if (!uc3.ok) throw new Error(`UC3 input macro failed: ${JSON.stringify(uc3)}`);
+const tapped = uc3.steps.find((s) => s.tool === 'modoki_tap')?.result;
+if (tapped?.surface !== 'scene-view') throw new Error(`UC3 tap did not report its surface: ${JSON.stringify(tapped)}`);
+if (tapped?.occluded !== false) throw new Error(`UC3 tap was occluded: ${JSON.stringify(tapped)}`);
+// The click must have LANDED, not merely been dispatched — the editor selecting the entity is
+// the only evidence of that, and it is what distinguishes this from a plausible no-op.
+const sel = uc3.steps.find((s) => s.tool === 'modoki_get_editor_state')?.result?.selection;
+if (sel?.entityId !== tapped.entity.id) {
+  throw new Error(`UC3 tap did not select the entity it aimed at: selection=${JSON.stringify(sel)}`);
+}
+if (!uc3.steps.find((s) => s.tool === 'modoki_capture_viewport')?.result?.path) {
+  throw new Error('UC3 capture returned no path');
+}
+console.log('UC3 focus → tap by entity → wait → capture, and the tap SELECTED the target ✓');
+
+// …and the same aim WITHOUT `surface` must be refused, naming the mounted surfaces. This is the
+// half that matters: it is refused even when only one viewport has the entity.
+const noSurface = await client.callTool({ name: 'modoki_tap', arguments: { entity: { name: 'cube' } } });
+if (!noSurface.isError || !/must say WHICH on-screen surface/.test(text(noSurface))) {
+  throw new Error(`a 2D/3D aim without \`surface\` must be refused: ${text(noSurface)}`);
+}
+if (!/scene-view/.test(text(noSurface))) throw new Error('the refusal must name the mounted surfaces');
+// And the editor must publish the mounted set, so a batch can be authored right the first time.
+const mounted = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} }))).surfaces;
+if (!Array.isArray(mounted) || !mounted.includes('scene-view')) {
+  throw new Error(`get_editor_state must list the mounted surfaces, got ${JSON.stringify(mounted)}`);
+}
+console.log('a 2D/3D aim without `surface` is refused; editor_state lists', mounted.join(', '), '✓');
+}
+
+// UC4 — can a batch DRIVE gameplay and verify it? play → fast-forward → let it run → read the
+// journal → put everything back. The teardown tail is the realistic shape, and it is what showed
+// that a mid-batch read is summarized by default (hence `result:'full'` on the journal, and the
+// `summarized`/`summarizedHint` fields that now say so).
+const uc4 = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: { steps: [
+  { tool: 'modoki_play_control', args: { action: 'play' }, result: 'none' },
+  { tool: 'modoki_set_timescale', args: { scale: 2 } },
+  { tool: 'wait', args: { ms: 500 }, result: 'none' },
+  { tool: 'modoki_journal', args: {}, result: 'full' },
+  { tool: 'modoki_set_timescale', args: { scale: 1 }, result: 'none' },
+  { tool: 'modoki_play_control', args: { action: 'stop' }, result: 'none' },
+] } })));
+if (!uc4.ok) throw new Error(`UC4 play-mode batch failed: ${JSON.stringify(uc4)}`);
+const ts = uc4.steps.find((st) => st.tool === 'modoki_set_timescale')?.result;
+if (ts?.timeScale !== 2) throw new Error(`UC4 timescale did not apply: ${JSON.stringify(ts)}`);
+// The journal at FULL detail is the deliverable: a batch that drives play but cannot report what
+// happened is not a verification loop. `events` must be a real array, not a shape summary.
+const jr = uc4.steps.find((st) => st.tool === 'modoki_journal')?.result;
+if (!Array.isArray(jr?.events)) throw new Error(`UC4 journal was not readable: ${JSON.stringify(jr)}`);
+if (uc4.summarized) throw new Error(`UC4 should not have summarized anything: ${uc4.summarizedHint}`);
+console.log('UC4 drives play + timescale and reads the journal in one batch →', jr.events.length, 'events ✓');
+
+// …and a mid-batch read WITHOUT `result:'full'`: the envelope must volunteer why the payload is
+// missing. This is the self-fixing half — the trap is fine, silence about it is not.
+// `list_traits({all})` and not `journal`: the journal's size depends on what has happened this
+// session (measured 1579 chars mid-play, 620 after a stop), so asserting on it would pass or fail
+// by run order. Every trait SCHEMA is fixed by the project and comfortably over the ack ceiling
+// (the names-only form is ~1.4k — under it, which is how this assertion first failed).
+const uc4b = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: { steps: [
+  { tool: 'modoki_list_traits', args: { all: true } },
+  { tool: 'modoki_get_editor_state', args: {}, result: 'none' },
+] } })));
+if (uc4b.summarized?.[0] !== 0 || !/result:'full'/.test(uc4b.summarizedHint ?? '')) {
+  throw new Error(`a summarized mid-batch read must say how to get it: ${JSON.stringify(uc4b)}`);
+}
+console.log('a summarized mid-batch read reports `summarized` + the fix ✓');
+
+// UC5 — prefab: instantiate → override a field → verify the override took. This one found that
+// `modoki_prefab` was broken for ALL THREE of its actions: it spread its args over
+// `editorAction`'s routing key, so `action:'instantiate'` replaced the op name `'prefab'` and the
+// backend answered 400 with a list of valid ops. Nothing in the batch had run.
+if (canUC5) {
+const CONE = '/assets/models/skinned-test/cone.prefab.json';
+const uc5 = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: { steps: [
+  { tool: 'modoki_prefab', args: { action: 'instantiate', path: CONE } },
+  { tool: 'modoki_set_transform', args: { entity: { name: 'Cone' }, space: 'local', position: [5, 6, 7] } },
+  { tool: 'modoki_get_scene_state', args: { name: 'Cone', trait: 'Transform' } },
+] } })));
+const spawned = uc5.steps?.[0]?.result?.guid;
+await withCleanup(() => {
+  if (!uc5.ok) throw new Error(`UC5 prefab batch failed: ${JSON.stringify(uc5)}`);
+  if (!spawned) throw new Error(`UC5 instantiate returned no guid: ${JSON.stringify(uc5.steps?.[0])}`);
+  const root = uc5.steps.at(-1).result.entities.find((e) => e.name === 'Cone');
+  const tr = root?.traits?.Transform;
+  if (!tr || tr.x !== 5 || tr.y !== 6 || tr.z !== 7) throw new Error(`UC5 override did not apply: ${JSON.stringify(tr)}`);
+  // The prefab's own authored scale must SURVIVE the override — that is the difference between
+  // routing an edit into the instance's overrides and overwriting its Transform wholesale.
+  if (Math.abs(tr.sx - 2 / 3) > 1e-6) throw new Error(`UC5 clobbered the prefab's authored scale: sx=${tr.sx}`);
+  console.log('UC5 instantiate → override → verify, prefab scale preserved ✓');
+}, async () => {
+  if (spawned) {
+    const cleaned = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: { steps: [
+      { tool: 'modoki_delete_entities', args: { guid: spawned }, result: 'none' },
+      { tool: 'modoki_get_scene_state', args: { name: 'Cone' }, result: 'full' },
+    ] } })));
+    const left = cleaned.steps?.at(-1)?.result?.entities?.length;
+    if (left !== 0) throw new Error(`UC5 left ${left} prefab entities behind`);
+    console.log('UC5 cleans up after itself ✓');
+  }
+});
+}
+
+// UC6 — an ASSET edit in a batch: change a particle def, confirm it applied LIVE, confirm the file
+// write was PARKED (manual persistence) rather than silently hitting disk. This one found that the
+// asset surface was WRITE-ONLY: `particle_set` demands a full def, and nothing returned one — so a
+// one-field tweak meant reading the .particle.json off disk (impossible for a packaged/remote
+// editor) and the edit could not be verified by data at all. `modoki_read_asset_def` is the fix,
+// and this case is now expressible entirely inside the tool surface.
+if (canUC6) {
+const PART = '/assets/particles/confetti.particle.json';
+const asset0 = JSON.parse(text(await client.callTool({ name: 'modoki_read_asset_def', arguments: { path: PART } })));
+if (!asset0.ok || typeof asset0.def?.maxParticles !== 'number') {
+  throw new Error(`UC6 could not read the particle def: ${JSON.stringify(asset0).slice(0, 300)}`);
+}
+await withCleanup(async () => {
+  const uc6 = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: { steps: [
+    { tool: 'modoki_particle_set', args: { path: PART, def: { ...asset0.def, maxParticles: 137 } } },
+    { tool: 'modoki_read_asset_def', args: { path: PART } },
+  ] } })));
+  if (!uc6.ok) throw new Error(`UC6 particle edit failed: ${JSON.stringify(uc6)}`);
+  const wrote = uc6.steps.find((s2) => s2.tool === 'modoki_particle_set')?.result;
+  // Persistence is manual: the write must be PARKED, never silently on disk.
+  if (wrote?.saved !== false) throw new Error(`UC6 particle_set reported saved=${wrote?.saved} — manual persistence must park the write`);
+  const readBack = uc6.steps.at(-1).result;
+  if (readBack?.def?.maxParticles !== 137) throw new Error(`UC6 edit did not apply live: ${JSON.stringify(readBack?.def?.maxParticles)}`);
+  // The pending write must be VISIBLE, or an unsaved asset edit is a silent loss waiting to happen.
+  if (readBack?.unsaved !== true) throw new Error('UC6 read-back did not report the pending write as unsaved');
+  console.log('UC6 read def → edit → read back (137), write parked not saved ✓');
+}, async () => {
+  // Restore the LIVE def…
+  await client.callTool({ name: 'modoki_particle_set', arguments: { path: PART, def: asset0.def } });
+  const now = JSON.parse(text(await client.callTool({ name: 'modoki_read_asset_def', arguments: { path: PART } })));
+  if (now?.def?.maxParticles !== asset0.def.maxParticles) {
+    throw new Error(`UC6 failed to restore maxParticles=${asset0.def.maxParticles} (now ${now?.def?.maxParticles})`);
+  }
+  // …and then DISCARD the write that restoring just re-parked. This used to be the whole cleanup,
+  // and it was not enough — it was cleanup in the live cache only:
+  //
+  //   • the restore re-marks the asset dirty, so the suite ended with a PENDING WRITE against a
+  //     committed game asset. Nothing had touched disk yet, which is what made it look clean —
+  //     but the next `save_all` by anyone (a human, a later UC, the next session) committed it.
+  //   • and that write is not the file that was there: the def readable through this surface is
+  //     the MIGRATED one, so `confetti.particle.json`'s legacy `"gravity": 6` came back as
+  //     `[0,-6,0]`. Measured 2026-07-30 — the check above could not see it, because it compared
+  //     the one field the test had changed.
+  //   • meanwhile `hasUnsavedChanges()` stayed true, so every file-direct route (load_scene,
+  //     new_scene, a file-path mutate_scene) 409'd for whatever ran next.
+  //
+  // A harness that reports "cleans up after itself" has to mean the WORKING TREE, the way the e2e
+  // suite does (docs/build.md) — not just the value it happened to assert on.
+  const dropped = JSON.parse(text(await client.callTool({
+    name: 'modoki_discard_asset_edits', arguments: { paths: [PART] },
+  })));
+  if (!dropped.ok || !dropped.discarded?.includes(PART)) {
+    throw new Error(`UC6 failed to discard the parked write for ${PART}: ${JSON.stringify(dropped).slice(0, 300)}`);
+  }
+  const st = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+  if (st.dirtyAssetPaths?.includes(PART)) {
+    throw new Error(`UC6 left ${PART} pending a save: dirtyAssetPaths=${JSON.stringify(st.dirtyAssetPaths)}`);
+  }
+  console.log('UC6 restores the def and discards the parked write — no asset left dirty ✓');
+});
+}
+
+// UC7 — a batch that fails MID-WAY, on real tools, after a MUTATING step already applied. The
+// harness's earlier failure check uses read tools against a fixture-ish path; this one proves the
+// contract against real state: the applied prefix is reported (even though it was marked
+// `result:'none'`), the un-run tail is named, and the entity is genuinely THERE afterwards.
+const uc7 = await client.callTool({ name: 'modoki_batch', arguments: { steps: [
+  { tool: 'modoki_mutate_scene', args: { ops: [{ op: 'addEntity', name: 'UC7_probe', parentId: 0,
+    traits: { Transform: { x: 9, y: 0, z: 0 }, EntityAttributes: { layer: '3d' } } }] }, result: 'none' },
+  { tool: 'modoki_set_transform', args: { entity: { name: 'UC7_nonexistent' }, space: 'local', position: [1, 1, 1] } },
+  { tool: 'modoki_save_all', args: {} },
+] } });
+await withCleanup(async () => {
+  if (!uc7.isError) throw new Error('UC7: a failing batch must surface as isError (C7)');
+  const j = JSON.parse(text(uc7)).error?.got;   // §5 envelope; the report is at error.got
+  if (j?.ok !== false || j.failedAt !== 1) throw new Error(`UC7 expected failedAt=1: ${text(uc7)}`);
+  // The failing step must say WHICH entity was missing, by name — a refusal that lists the real
+  // problem is what turns the dead end into the next move.
+  const why = j.steps.find((st) => st.i === 1)?.error?.error?.why ?? '';
+  if (!/UC7_nonexistent/.test(why)) throw new Error(`UC7 step 1 must name the missing entity: ${why}`);
+  // The mutating step was marked 'none' and MUST still be reported — it applied and is not rolled
+  // back, so an envelope that hid it would describe a scene that does not exist.
+  if (j.quiet) throw new Error('UC7: a failed batch must not leave steps suppressed');
+  if (!j.steps.some((st) => st.i === 0 && st.ok)) throw new Error(`UC7 applied prefix not promoted: ${text(uc7)}`);
+  // save_all must NOT have run: the half-applied state must not have reached disk.
+  if (!j.notRun?.some((n) => n.tool === 'modoki_save_all')) throw new Error('UC7: save_all should be in notRun');
+  // "ALREADY APPLIED" has to be literally true, not just a warning. This is the assertion that
+  // makes the hint trustworthy.
+  const live = JSON.parse(text(await client.callTool({ name: 'modoki_get_scene_state', arguments: { name: 'UC7_', trait: 'Transform' } })));
+  const probe = live.entities?.find((e) => e.name === 'UC7_probe');
+  if (probe?.traits?.Transform?.x !== 9) throw new Error(`UC7 the "already applied" prefix is not actually there: ${JSON.stringify(live.entities)}`);
+  console.log('UC7 mid-batch failure → prefix promoted + verified live, save_all not run ✓');
+}, async () => {
+  const cleaned = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: {
+    resultDefault: 'none',
+    steps: [
+      { tool: 'modoki_mutate_scene', args: { ops: [{ op: 'removeEntity', entity: { name: 'UC7_probe' } }] } },
+      { tool: 'modoki_get_scene_state', args: { name: 'UC7_' }, result: 'full' },
+    ],
+  } })));
+  const left = cleaned.steps?.at(-1)?.result?.entities?.length;
+  if (left !== 0) throw new Error(`UC7 left ${left} entities behind`);
+  console.log('UC7 cleans up after itself ✓');
+});
+
+// An AMBIGUOUS entity name must be refused, not first-matched. Duplicate names are ordinary (three
+// entities called "Enemy"), and this was a live-path-only gap: the FILE resolver always refused it,
+// and the live path was unreachable until the canGoLive fix earlier the same day — so un-deadening
+// that path surfaced the bug it had been hiding. Mutating, so it cleans up by GUID (the only
+// addressing that works when the name is ambiguous — which is the point).
+const DUP = 'DUP_probe';
+const mkDup = () => client.callTool({ name: 'modoki_mutate_scene', arguments: { ops: [0, 1].map((i) => ({
+  op: 'addEntity', name: DUP, parentId: 0,
+  traits: { Transform: { x: i + 1, y: 0, z: 0 }, EntityAttributes: { layer: '3d' } },
+})) } });
+await mkDup();
+await withCleanup(async () => {
+  const amb = await client.callTool({ name: 'modoki_set_transform', arguments: { entity: { name: DUP }, space: 'local', position: [7, 7, 7] } });
+  if (!amb.isError || !/2 LIVE entities are named/.test(text(amb))) {
+    throw new Error(`an ambiguous name must be refused: ${text(amb)}`);
+  }
+  if (!/address by guid/.test(text(amb))) throw new Error('the refusal must name the way out');
+  // Neither entity may have moved — a partial application is what this is protecting against.
+  const after = JSON.parse(text(await client.callTool({ name: 'modoki_get_scene_state', arguments: { name: DUP, trait: 'Transform' } })));
+  const xs = after.entities.map((e) => e.traits.Transform.x).sort().join();
+  if (xs !== '1,2') throw new Error(`an ambiguous ref moved something: x = ${xs}`);
+  console.log('an ambiguous entity name is refused, and nothing moves ✓');
+}, async () => {
+  const st = JSON.parse(text(await client.callTool({ name: 'modoki_get_scene_state', arguments: { name: DUP } })));
+  const guids = st.entities.map((e) => e.traits?.EntityAttributes?.guid).filter(Boolean);
+  if (guids.length) {
+    await client.callTool({ name: 'modoki_mutate_scene', arguments: { ops: guids.map((g) => ({ op: 'removeEntity', entity: { guid: g } })) } });
+  }
+  const left = JSON.parse(text(await client.callTool({ name: 'modoki_get_scene_state', arguments: { name: DUP } }))).entities?.length;
+  if (left !== 0) throw new Error(`ambiguity case left ${left} entities behind`);
+  console.log('ambiguity case cleans up after itself ✓');
+});
+
+// ── UC9 (Phase 7) — UNDO IS PER STEP, not per batch ──────────────────────────
+// The tool description and docs/debug-tools-mcp.md both promise this, and an agent plans its
+// cleanup around it ("I'll just undo the batch" is WRONG advice if it is per step). Nothing could
+// verify it: the unit tests drive a fake registry, which has no undo stack at all. Only a live
+// editor can answer, and it is a read-then-restore case — every entity it creates is undone again.
+await withCleanup(async () => {
+  const mk = { tool: 'modoki_create_entity', args: { kind: 'empty' }, result: 'full' };
+  const b = await client.callTool({ name: 'modoki_batch', arguments: { steps: [mk, mk] } });
+  if (b.isError) throw new Error(`the 2-step create batch failed: ${text(b)}`);
+  const guids = (JSON.parse(text(b)).steps ?? []).map((st) => st.result?.guid);
+  if (guids.length !== 2 || guids.some((g) => !g)) throw new Error(`expected two created guids, got ${JSON.stringify(guids)}`);
+  const alive = async () => {
+    const out = [];
+    for (const g of guids) {
+      const r = JSON.parse(text(await client.callTool({ name: 'modoki_get_scene_state', arguments: { guid: g } })));
+      out.push((r.entities ?? []).length > 0);
+    }
+    return out;
+  };
+  const j = (a) => a.join(',');
+  if (j(await alive()) !== 'true,true') throw new Error('the batch did not create both entities');
+  // ONE undo must remove exactly the LAST step's entity. A per-BATCH undo would remove both here,
+  // which is precisely the wrong mental model the docs are protecting the caller from.
+  await client.callTool({ name: 'modoki_history', arguments: { action: 'undo' } });
+  const afterOne = j(await alive());
+  if (afterOne !== 'true,false') throw new Error(`undo is not per step — after ONE undo, alive = ${afterOne} (expected true,false)`);
+  await client.callTool({ name: 'modoki_history', arguments: { action: 'undo' } });
+  if (j(await alive()) !== 'false,false') throw new Error('the second undo did not remove the first step\'s entity');
+  // …and redo restores them one at a time, in order — the same property from the other side.
+  await client.callTool({ name: 'modoki_history', arguments: { action: 'redo' } });
+  if (j(await alive()) !== 'true,false') throw new Error('redo is not per step either');
+  await client.callTool({ name: 'modoki_history', arguments: { action: 'redo' } });
+  if (j(await alive()) !== 'true,true') throw new Error('the second redo did not restore the second entity');
+  smokeGuids = guids;
+  console.log('UC9 undo/redo inside a batch is PER STEP (2 creates, one undo removes one) ✓');
+}, async () => {
+  // Undo both creates back off the stack — the scene ends as it started.
+  for (const _ of smokeGuids) await client.callTool({ name: 'modoki_history', arguments: { action: 'undo' } });
+  for (const g of smokeGuids) {
+    const r = JSON.parse(text(await client.callTool({ name: 'modoki_get_scene_state', arguments: { guid: g } })));
+    if ((r.entities ?? []).length > 0) throw new Error(`UC9 left ${g} in the scene`);
+  }
+  console.log('UC9 cleans up after itself ✓');
+});
+
+// An unknown arg KEY must be REFUSED, not dropped. All-optional schemas are the dangerous case:
+// nothing is missing, so a typo parses clean and the tool does something else. Pre-flight, so
+// nothing in the batch runs.
+const typo = await client.callTool({ name: 'modoki_batch', arguments: { steps: [
+  { tool: 'modoki_set_selection', args: { name: 'Capsule' } },
+] } });
+if (!typo.isError || !/Unrecognized key/.test(text(typo))) {
+  throw new Error(`an unknown arg key must be refused: ${text(typo)}`);
+}
+if (!/accepted params:/.test(text(typo))) throw new Error('the refusal must name the accepted params');
+console.log('batch pre-flight refuses an unknown arg key and lists the real ones ✓');
+
 await client.close();
+
+// F12 — a SKIPPED case used to leave the verdict at a cheerful `SMOKE OK`, so the run reported
+// success for coverage it never had. UC8 (the mid-batch scene swap) skips whenever the editor has
+// unsaved work, which is most of the time in practice — the one case most likely to be silently
+// absent was the one whose absence was invisible. UC3/UC5/UC6/UC8 each skip independently when the
+// fixture THAT case needs is absent — which is what happens when the open project isn't
+// games/3d-test (see the precondition block above; #41). A suite that can quietly test less than it
+// claims is worse than no suite, because it is trusted. Relaunch on games/3d-test with no unsaved
+// changes and re-run for a full pass.
+if (skipped.length) {
+  console.error(`\nSMOKE INCOMPLETE — ${skipped.length} case(s) did not run:`);
+  for (const s of skipped) console.error(`  • ${s}`);
+  console.error("\nRelaunch this clone's editor on games/3d-test / tropical-island, with no unsaved changes, then re-run:");
+  console.error('  engine/scripts/launch-editor.sh games/3d-test --scene tropical-island   # set MODOKI_BACKEND_PORT on a worker clone');
+  // The scene is named explicitly (via #43's `--scene`) rather than left to whatever the editor
+  // remembered, because some preconditions above are about the OPEN SCENE, not the project.
+  // Measured: tropical-island.json satisfies all of them (1 'cube', 0 'Cone'), while
+  // skinned-test.scene.json — also in this project — fails two: no 'cube' (UC3) and 3 pre-existing
+  // 'Cone's (UC5). "Open the right project" was never a sufficient instruction.
+  process.exit(1);
+}
 console.log('SMOKE OK');
 process.exit(0);

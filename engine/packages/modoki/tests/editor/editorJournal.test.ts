@@ -1,8 +1,8 @@
 /** Editor Percept (Phase 7) — the human-activity buffer + the undoManager taps that
  *  feed it (!edit / !select / !undo / !redo). */
 
-import { describe, it, expect, beforeEach } from 'vitest';
-import { editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled, withEditorActor } from '../../src/editor/editorJournal';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled, withEditorActor, waitForEditorJournal } from '../../src/editor/editorJournal';
 import { pushAction, pushSelectionChange, undo, redo, clearHistory, _setUndoClock } from '../../src/editor/undo/undoManager';
 import { nextCaptureSeq, _resetCaptureSeq } from '../../src/runtime/core/journal';
 
@@ -179,5 +179,106 @@ describe('editorJournal — structured !edit detail (Percept V1)', () => {
     expect(d.entities.length).toBe(d.old.length);
     expect(d.old.length).toBe(d.new.length);
     expect(d).toEqual({ trait: 'UIAction', field: 'bindings', entities: ['gA'], old: ['oA'], new: ['nA1'] });
+  });
+});
+
+describe('waitForEditorJournal (#28 — long-poll)', () => {
+  it('returns immediately with EVERY matching event already pending past `since`, not just one', async () => {
+    editorEmit('!edit');
+    editorEmit('!select');
+    const since = readEditorJournal()[0].seq - 1; // "before" both pending events
+    const r = await waitForEditorJournal({ since }, 5000);
+    expect(r.timedOut).toBe(false);
+    expect(r.events.map((e) => e.type)).toEqual(['!edit', '!select']);
+    expect(r.nextSeq).toBe(readEditorJournal()[1].seq);
+  });
+
+  it('parks, then wakes and resolves when a matching event is appended', async () => {
+    const p = waitForEditorJournal({ since: 0 }, 5000); // no events yet — baseline 0
+    let settled = false;
+    p.then(() => { settled = true; });
+    await Promise.resolve(); // let the promise executor + microtasks run
+    expect(settled).toBe(false); // still parked — nothing emitted yet
+
+    editorEmit('!select');
+    const r = await p;
+    expect(r.timedOut).toBe(false);
+    expect(r.events.map((e) => e.type)).toEqual(['!select']);
+    expect(r.nextSeq).toBe(readEditorJournal()[0].seq);
+  });
+
+  it('times out with an empty, non-error result and a leaked-waiter-free cleanup', async () => {
+    vi.useFakeTimers();
+    try {
+      const p = waitForEditorJournal({ since: 0 }, 1000);
+      vi.advanceTimersByTime(1000);
+      const r = await p;
+      expect(r).toEqual({ events: [], timedOut: true, nextSeq: 0 });
+
+      // The waiter unsubscribed on timeout — a LATER emit must not retroactively affect a
+      // result that already resolved (would be observable via an unhandled double-resolve
+      // or a stale listener still firing; neither happens here).
+      editorEmit('!edit');
+      expect(readEditorJournal()).toHaveLength(1); // just the one we emitted post-timeout
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('source filter excludes agent events — a human-only waiter is not woken by an agent edit', async () => {
+    vi.useFakeTimers();
+    try {
+      const p = waitForEditorJournal({ source: 'human', since: 0 }, 2000);
+      withEditorActor('agent', () => editorEmit('!edit')); // must NOT wake the waiter
+      vi.advanceTimersByTime(2000);
+      const r = await p;
+      expect(r.timedOut).toBe(true);
+      expect(r.events).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a human event DOES wake a source:"human" waiter', async () => {
+    const p = waitForEditorJournal({ source: 'human', since: 0 }, 5000);
+    withEditorActor('agent', () => editorEmit('!edit')); // ignored
+    editorEmit('!select'); // human (default actor) — wakes it
+    const r = await p;
+    expect(r.timedOut).toBe(false);
+    expect(r.events.map((e) => e.type)).toEqual(['!select']);
+  });
+
+  it('cursor is contiguous across two consecutive waits — no gap, no duplicate', async () => {
+    const first = waitForEditorJournal({ since: 0 }, 5000);
+    editorEmit('!edit');
+    const r1 = await first;
+    expect(r1.events.map((e) => e.type)).toEqual(['!edit']);
+
+    // A second wait started with since:r1.nextSeq must not re-deliver !edit...
+    const second = waitForEditorJournal({ since: r1.nextSeq }, 5000);
+    editorEmit('!select');
+    const r2 = await second;
+    expect(r2.events.map((e) => e.type)).toEqual(['!select']);
+    expect(r2.nextSeq).toBeGreaterThan(r1.nextSeq);
+
+    // ...and a third wait started from r2.nextSeq picks up the NEXT event with no gap.
+    const third = waitForEditorJournal({ since: r2.nextSeq }, 5000);
+    editorEmit('!create');
+    const r3 = await third;
+    expect(r3.events.map((e) => e.type)).toEqual(['!create']);
+  });
+
+  it('a clearEditorJournal() while parked does not wake or corrupt the waiter', async () => {
+    const p = waitForEditorJournal({ since: 0 }, 5000);
+    clearEditorJournal(); // not an edit — must not resolve the wait
+    let settled = false;
+    p.then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    editorEmit('!edit'); // the real wake
+    const r = await p;
+    expect(r.timedOut).toBe(false);
+    expect(r.events.map((e) => e.type)).toEqual(['!edit']);
   });
 });

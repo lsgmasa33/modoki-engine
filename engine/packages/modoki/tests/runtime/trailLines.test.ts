@@ -27,12 +27,12 @@ describe('createTrail', () => {
     expect(t.mesh.visible).toBe(false);
     expect(t.mesh.geometry.drawRange.count).toBe(0);
 
-    const v0 = t.mesh.geometry.getAttribute('position').version;
+    const v0 = (t.mesh.geometry.getAttribute('position') as THREE.BufferAttribute).version;
     t.commit(3);
     expect(t.mesh.visible).toBe(true);
     expect(t.mesh.geometry.drawRange.count).toBe(3 * 6); // aliveCount * vPer
     // needsUpdate is a write-only setter in THREE (bumps version) — assert the upload was flagged.
-    expect(t.mesh.geometry.getAttribute('position').version).toBeGreaterThan(v0);
+    expect((t.mesh.geometry.getAttribute('position') as THREE.BufferAttribute).version).toBeGreaterThan(v0);
   });
 
   it('maps blend mode (additive vs normal)', () => {

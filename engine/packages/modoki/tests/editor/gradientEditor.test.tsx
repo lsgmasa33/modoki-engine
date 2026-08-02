@@ -32,7 +32,7 @@ const isSorted = (arr: { t: number }[]) => arr.every((s, i) => i === 0 || arr[i 
 
 function setup(initial: Gradient) {
   let current = initial;
-  const onChange = vi.fn((g: Gradient) => { current = g; });
+  const onChange = vi.fn((g: Gradient, _group?: string) => { current = g; });
   const utils = render(<GradientEditor value={current} onChange={onChange} />);
   const rerender = () => utils.rerender(<GradientEditor value={current} onChange={onChange} />);
   const colorHandles = () =>

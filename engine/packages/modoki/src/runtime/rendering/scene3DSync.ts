@@ -15,7 +15,7 @@ import { getTextDirtyVersion } from './text/textDirty';
 import { getCurrentSceneId } from '../scene/SceneManager';
 import { computeFrameFit, boxCornersFromMatrix, type FrameMode, type FrameAnchorV, type FrameAnchorH } from './cameraFraming';
 import { getSkin2DBuffer, frameSkin2DUVs, type Skin2DPartBuffer } from '../skinning/skin2DBuffers';
-import { getKTX2Loader, getEnvFormat } from '../loaders/textureResolver';
+import { getKTX2Loader, getEnvFormat, ensureKtx2Caps } from '../loaders/textureResolver';
 import { ULTRAHDR_INTENSITY_BOOST } from '../core/environmentSettings';
 import { runLateUpdates, hasLateUpdates, type IdempotencyProbe } from '../core/lateUpdate';
 import { EntityAttributes } from '../core/traits/EntityAttributes';
@@ -37,6 +37,7 @@ import {
 } from '../loaders/meshTemplateCache';
 import { getRiggedModel, ensureRiggedModelLoaded } from '../loaders/riggedModelCache';
 import { getRenderSettings, resolveToneMapping } from './renderSettings';
+import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
 import { resolveAnimSetParams, ANIMSET_DEFAULTS, getAnimSet } from '../loaders/animSetCache';
 import { clone as cloneSkeleton, retargetClip } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { resolveRef } from '../loaders/assetManifest';
@@ -2311,8 +2312,13 @@ function disposeBillboardEntry(entry: BillboardEntry, scene: THREE.Scene): void 
  *  match. Both are forced BOTTOM-origin: KTX2 is inherently bottom-origin (flipY ignored),
  *  and we set flipY=false on plain textures so a single UV convention works for both with
  *  no per-part V flip. */
-function loadBillboardPage(url: string): Promise<THREE.Texture> {
+async function loadBillboardPage(url: string): Promise<THREE.Texture> {
   const isKtx = /\.ktx2(\?|$)/.test(url);
+  // KTX2Loader.loadAsync throws "Missing initialization with `.detectSupport()`" if it runs
+  // before GPU caps are known. This used to be guaranteed by the editor's up-front renderer
+  // gate; now that scene load no longer waits on a viewport, this is the one KTX2-touching site
+  // that must gate itself explicitly (see docs/textures.md, "Runtime resolution").
+  if (isKtx) await ensureKtx2Caps();
   const loader = isKtx ? getKTX2Loader() : new THREE.TextureLoader();
   return (loader.loadAsync(url) as Promise<THREE.Texture>).then((tex) => {
     tex.colorSpace = THREE.SRGBColorSpace;
@@ -2934,10 +2940,24 @@ export function applyRendererColorConfig(r: {
   r.outputColorSpace = THREE.SRGBColorSpace;
 }
 
-export async function makeWebGPURenderer(container: HTMLDivElement): Promise<WebGPURenderer> {
+export interface MakeRendererOptions {
+  /** Honour the shipped web build's `rendering.web.sizeMode` when sizing the FIRST
+   *  buffer. Opt-in per surface — exactly like `Canvas2DMount`'s prop of the same
+   *  name — because `makeWebGPURenderer` is shared with the editor SceneView,
+   *  ParticleEditor, ModelPreview and the caps probe, none of which should inherit a
+   *  game's `max` clamp. Only `createRenderer` (the game / GameView 3D surface, whose
+   *  ResizeObserver applies the same clamp on every later resize) passes it. */
+  applyWebSizeMode?: boolean;
+}
+
+export async function makeWebGPURenderer(
+  container: HTMLDivElement,
+  opts: MakeRendererOptions = {},
+): Promise<WebGPURenderer> {
   const { getWebGPUSupported } = await import('./gpuDetect');
   const webgpuSupported = await getWebGPUSupported();
-  const three = getRenderSettings().three;
+  const settings = getRenderSettings();
+  const three = settings.three;
   // Backend selection: 'webgl' forces the WebGL2 backend outright; 'webgpu'/'auto'
   // use native WebGPU when the device supports it, else fall back to WebGL2. (Both
   // run the same TSL/node pipeline — see the createRenderer doc comment.)
@@ -2950,8 +2970,17 @@ export async function makeWebGPURenderer(container: HTMLDivElement): Promise<Web
       antialias: three.antialias,
       forceWebGL,
     } as ConstructorParameters<typeof WebGPURendererMod>[0]);
-    r.setPixelRatio(Math.min(window.devicePixelRatio, three.pixelRatioCap));
-    r.setSize(container.clientWidth, container.clientHeight);
+    const w = container.clientWidth;
+    const h = container.clientHeight;
+    // The `max` clamp has to land HERE, not after init(): this setPixelRatio+setSize
+    // pair is what allocates the first drawing buffer, and a `max`-mode game exists
+    // precisely to never allocate the full-resolution one (#56). Scene3D's
+    // ResizeObserver re-applies it on every later resize, computing basePR the same
+    // way — the two must agree or the first fire would reallocate. Why the clamp
+    // rides the RATIO rather than the size: see clampPixelRatio's doc.
+    const basePR = basePixelRatio(window.devicePixelRatio, three.pixelRatioCap);
+    r.setPixelRatio(opts.applyWebSizeMode ? clampPixelRatio(w, h, basePR, settings.web) : basePR);
+    r.setSize(w, h);
     // Global shadow gate. Per-light `castShadow` still applies; this master switch
     // lets a project disable all shadow-map work for perf.
     (r as unknown as { shadowMap: { enabled: boolean } }).shadowMap.enabled = three.shadows;
@@ -2989,7 +3018,10 @@ export async function createRenderer(
   // `preferWebGPU` is retained for API/signature compatibility — both 'auto' and
   // 'force' now use WebGPURenderer (with WebGL2 fallback).
   void preferWebGPU;
-  const r = await makeWebGPURenderer(container);
+  // applyWebSizeMode: this is the shipped-game / GameView 3D surface, so its FIRST
+  // buffer honours `rendering.web.sizeMode` — the editor's own viewports call
+  // makeWebGPURenderer directly and stay unclamped.
+  const r = await makeWebGPURenderer(container, { applyWebSizeMode: true });
   setActiveRenderer(r); // KTX2Loader format detection (needs an initialized renderer)
   return r;
 }

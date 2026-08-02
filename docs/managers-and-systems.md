@@ -79,6 +79,20 @@ registerManager(def)      // mirrors registerSystem
 unregisterManager(name)   // drops owned actions, calls dispose()
 ```
 
+**On `ctx`, and narrowing it away.** `init` receives a `ctx` because the registry always
+has one to give, but most managers read nothing from it — they call `getCurrentWorld()`
+themselves. It is not dead weight: `dispose(ctx?)` is where it earns its keep, since on a
+scene swap it carries the OLD world (still alive until just after dispose runs), which is
+what the zone / physics / timeline event buses use to clear their per-world state.
+
+If a manager exports a **public interface** — `export interface Foo extends ManagerDef` —
+and its implementation takes no `ctx`, redeclare `init(): void` / `dispose(): void` on that
+interface. The exported singleton is typed as the *interface*, not the `Impl` class, so the
+inherited wide signature is what every caller sees, and a direct `foo.init()` would have to
+fabricate a `ManagerContext` that is then ignored (#37). `TimeManager` and `NavigationManager`
+both do this. The registry is unaffected — it keeps calling through `ManagerDef` and keeps
+passing a real `ctx`.
+
 ### Scope: three tiers — scene by default, game and app opt-in
 
 Scene-default makes the safe choice the default — a Manager's state can't leak

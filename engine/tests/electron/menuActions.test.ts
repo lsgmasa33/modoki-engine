@@ -57,8 +57,11 @@ describe('serializeMenu', () => {
     expect(zoomIn.actionable).toBe(true);
     // separator dropped, hidden dropped
     expect(view.submenu!.some((n) => n.label === 'Hidden Thing')).toBe(false);
+    // The input has 3 entries (New Project, a separator, Close) — MenuNode has no `type` field
+    // at all (a separator isn't serialized as an untyped node, it's omitted outright), so the
+    // only way to pin "dropped" is a count: 2 survivors, not 3.
     const file = tree.find((n) => n.label === 'File')!;
-    expect(file.submenu!.some((n) => n.type === 'separator')).toBe(false);
+    expect(file.submenu).toHaveLength(2);
   });
 });
 

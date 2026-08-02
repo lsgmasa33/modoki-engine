@@ -136,7 +136,7 @@ describe('managerRegistry', () => {
 
   it('scene-scoped manager disposes on swap away (and its actions drop)', async () => {
     const dispose = vi.fn();
-    registerManager({ name: 's', actions: { 's.do': vi.fn() }, dispose });
+    registerManager({ name: 's', actions: { 's.do': vi.fn<() => void>() }, dispose });
     await initSceneManagersFor('/games/x/scenes/Menu.json');
     expect(getUIActionNames()).toContain('s.do');
 

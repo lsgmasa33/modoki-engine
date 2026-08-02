@@ -16,7 +16,7 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit -p tsconfig.check.json"
+    "typecheck": "tsc --noEmit -p tsconfig.check.json && tsc -p tsconfig.test.json"
   },
   "peerDependencies": {
     "koota": ">=0.1.0",

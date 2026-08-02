@@ -176,7 +176,7 @@ describe('instantiatePrefabIntoWorld — nested prefabs', () => {
     const innerGuids: string[] = [];
     testWorld.query(PrefabInstance, EntityAttributes).updateEach(([pi, ea], _e) => {
       if ((pi as Record<string, unknown>).source === 'Inner') {
-        innerGuids.push((ea as Record<string, string>).guid);
+        innerGuids.push(ea.guid);
       }
     });
 
@@ -191,7 +191,7 @@ describe('instantiatePrefabIntoWorld — nested prefabs', () => {
     deriveInstanceMemberGuids(testWorld);
     const again: string[] = [];
     testWorld.query(PrefabInstance, EntityAttributes).updateEach(([pi, ea], _e) => {
-      if ((pi as Record<string, unknown>).source === 'Inner') again.push((ea as Record<string, string>).guid);
+      if ((pi as Record<string, unknown>).source === 'Inner') again.push(ea.guid);
     });
     expect(again.sort()).toEqual(innerGuids.sort());
   });
@@ -224,7 +224,7 @@ describe('instantiatePrefabIntoWorld — nested prefabs', () => {
     // Members derive off each unique root, so every member guid is unique too.
     const memberGuids: string[] = [];
     testWorld.query(PrefabInstance, EntityAttributes).updateEach(([_pi, ea]) => {
-      const g = (ea as Record<string, string>).guid;
+      const g = ea.guid;
       if (g) memberGuids.push(g);
     });
     expect(memberGuids.length).toBe(new Set(memberGuids).size); // no duplicate guids anywhere

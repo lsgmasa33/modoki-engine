@@ -70,7 +70,12 @@ describe('animSetCache.resolveAnimSetParams', () => {
 describe('animSetCache lazy fetch', () => {
   it('loads + parses an animset from fetch, then resolves per-clip params', async () => {
     const def = { id: 'x', source: 'model.glb', clips: [{ name: 'Run', speed: 1.25, loop: true }] };
-    const fetchMock = vi.fn(() => Promise.resolve({ ok: true, json: () => Promise.resolve(def) } as any));
+    const fetchMock = vi.fn(() => Promise.resolve({
+      ok: true,
+      // text() too — the loader reads the body as TEXT to spot Vite's index.html SPA fallback.
+      text: () => Promise.resolve(JSON.stringify(def)),
+      json: () => Promise.resolve(def),
+    } as any));
     vi.stubGlobal('fetch', fetchMock);
 
     expect(getAnimSet('run.animset.json')).toBeNull(); // kicks off the fetch

@@ -3,7 +3,7 @@
 import { describe, it, expect } from 'vitest';
 
 async function getTraits() {
-  return import('../../../src/runtime/traits');
+  return import('../../src/runtime/traits');
 }
 
 describe('Transform', () => {

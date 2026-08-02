@@ -87,6 +87,41 @@ scene uniquely changed on top of what the nested row already overrides. On load,
 `applyOverridesByLocalToEcs`; the round-trip is covered in
 [prefab-structural-overrides.md](./prefab-structural-overrides.md).
 
+**Which fields an override may carry is decided by the trait's koota SCHEMA, never by
+`meta.fields`** (`runtime/core/ecs/traitSchema.ts` — `isPersistentTraitField`).
+`meta.fields` is the Inspector-rendering list: a field is in it because the generic
+renderer should draw a row for it. A field can persist and still be absent from it —
+`Animator.clips`/`clip` (the custom `AnimatorClipsSection` owns them),
+`EntityAttributes.editorFolder` (no row at all). All three override paths — capture
+(`captureInstanceOverrides`), the editor apply (`applyOverridesByRootInstance`), and the
+loader apply (`applyOverridesByLocalToEcs`) — used to treat `field in meta.fields` as
+"does this field persist", which lost data twice over: the loader **dropped** such a
+field instead of applying it (and so never seeded its override mark), and capture never
+**read** it, so the next save deleted it from the file. Measured on `skinned-test.json`: a load→save removed a populated
+`Animator.clips` bank naming a real clip guid. A field the schema does not declare is
+still ignored — that is the genuinely renamed/retired case. Capture additionally skips
+`runtimeOnly` fields at the READ, mirroring `serializeScene`, so live read-back
+(`Animator.activeClip`, a crossfade's progress) can never be frozen into a file.
+
+The same predicate governs **`applyToPrefabSelective`** ("Apply to Prefab"), which had the
+bug in the write direction: it skipped such a field and reported success, so applying a
+`clips` override changed nothing. Because it now admits AoS object/array fields
+(`AnimationLibrary.animSets`) that the old gate excluded, it **deep-copies** the live bag
+before writing — `readTraitDataFull` returns live references, and storing one would alias
+the cached template to one instance, so editing that instance would rewrite the template.
+`engine/tests/editor/traitPersistencePredicateGuard.test.ts` fails the build if any of
+these files goes back to testing `field in meta.fields`.
+
+**Writing a TEMPLATE excludes two things a scene keeps** (`isTemplateExcludedField`, shared
+by `serializePrefab` and `applyToPrefabSelective`): `runtimeOnly` read-back, and the
+scene-only fields in `SCENE_ONLY_TEMPLATE_FIELDS` — today just
+`EntityAttributes.editorFolder`, the Hierarchy grouping tag. A template inheriting a folder
+would file every future instance under one author's folder. Note the asymmetry is
+deliberate: **capture into a SCENE keeps `editorFolder`** (a foldered instance must stay
+foldered — that is what the field is for); only templates drop it. It is now excluded
+BY NAME, where it used to be excluded as accidental collateral of the `meta.fields` gate
+that was also losing `Animator.clips`.
+
 ## Core operations (`editor/scene/prefab.ts`)
 
 - **`serializePrefab(selectedEntityId, existingId?)`** — collects the selected

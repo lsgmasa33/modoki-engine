@@ -152,7 +152,7 @@ skeleton, the SAME `.anim.json` clips drive it. `Scene2D` SKIPS any entity that 
   animated foot-lift still leaves the ground instead of the anchor chasing the pose.
 - **`pixelsPerUnit`** converts rig pixels → world units (lives on the `flip` scale, so a
   change never rebuilds geometry). Demo scene:
-  `games/skin-test/runtime/assets/scenes/billboard-2_5d.json` — dark-assassin (cylindrical
+  `games/skin-test/runtime/assets/scenes/billboard-2_5d.scene.json` — dark-assassin (cylindrical
   + spherical) and a zombie between two occluder boxes proving depth both ways. Tests:
   `packages/modoki/tests/runtime/billboard3DSync.test.ts`.
 

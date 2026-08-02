@@ -115,7 +115,7 @@ export function mergeMcpConfig(
     try {
       parsed = JSON.parse(existing);
     } catch (e) {
-      throw new Error(`existing .mcp.json is not valid JSON (${e instanceof Error ? e.message : e}) — not overwriting it`);
+      throw new Error(`existing .mcp.json is not valid JSON (${e instanceof Error ? e.message : e}) — not overwriting it`, { cause: e });
     }
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
       config = parsed as McpConfig;

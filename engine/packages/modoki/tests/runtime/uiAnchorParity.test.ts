@@ -9,11 +9,11 @@
 import { describe, it, expect } from 'vitest';
 import type { CSSProperties } from 'react';
 import { applyAnchorStyle, type AnchorCssData } from '../../src/runtime/ui/anchorCss';
-import { resolveAnchorRect, type AnchorData } from '../../src/runtime/ui/anchorLayout';
+import { resolveAnchorRect, isSizeInert, type AnchorData } from '../../src/runtime/ui/anchorLayout';
 
 const VPW = 400, VPH = 800, ELW = 100, ELH = 40;
 
-const MODES = [
+const MODES: AnchorData['anchor'][] = [
   'stretch', 'center', 'top', 'bottom', 'left', 'right',
   'top-left', 'top-right', 'bottom-left', 'bottom-right',
   'top-stretch', 'bottom-stretch', 'left-stretch', 'right-stretch',
@@ -63,7 +63,12 @@ function resolveLen(v: string | number | undefined, total: number): number {
 function resolveCssRect(style: CSSProperties): { x: number; y: number; w: number; h: number } {
   const s = style as Record<string, string | number | undefined>;
   let left = s.left, right = s.right, top = s.top, bottom = s.bottom;
-  if (s.inset === 0 || s.inset === '0') { left = 0; right = 0; top = 0; bottom = 0; }
+  // applyAnchorStyle emits four LONGHANDS for `stretch`, never the `inset` shorthand —
+  // precisely so an offset longhand cannot depend on declaration order to override it.
+  // This branch is therefore expected to be dead; it stays as a tripwire so that
+  // re-introducing the shorthand keeps the oracle honest rather than silently
+  // discarding the offsets. `??=`, not `=`: a longhand always wins over a shorthand.
+  if (s.inset === 0 || s.inset === '0') { left ??= 0; right ??= 0; top ??= 0; bottom ??= 0; }
 
   // Horizontal: left+right with auto width → stretch; else natural width at left.
   let x: number, rw: number;
@@ -132,6 +137,61 @@ describe('UIAnchor CSS ↔ pixel-rect parity (F4)', () => {
     it('offsets on a stretched mode (top-stretch with top offset)', () => {
       expectAgree(anchorData({ anchor: 'top-stretch', top: 16, topUnit: 'px', pivotY: 0.5 }));
     });
+    // Offsets on BOTH edges of a stretched axis — the case that had no coverage at all.
+    it('bottom-stretch with % offsets on both stretched edges', () => {
+      expectAgree(anchorData({ anchor: 'bottom-stretch', left: 5, leftUnit: '%', right: 5, rightUnit: '%' }));
+    });
+    it('left-stretch with px offsets on both stretched edges', () => {
+      expectAgree(anchorData({ anchor: 'left-stretch', top: 12, topUnit: 'px', bottom: 20, bottomUnit: 'px' }));
+    });
+    it('full stretch with offsets on all four edges', () => {
+      expectAgree(anchorData({
+        anchor: 'stretch',
+        top: 10, topUnit: 'px', bottom: 30, bottomUnit: 'px',
+        left: 5, leftUnit: '%', right: 15, rightUnit: 'px',
+      }));
+    });
+    it('full stretch with a NEGATIVE single-sided offset (widens past the edge)', () => {
+      expectAgree(anchorData({ anchor: 'stretch', left: -346, leftUnit: 'px' }));
+    });
+    it('stretched axis with a vw/vh offset on each edge', () => {
+      expectAgree(anchorData({ anchor: 'h-stretch', left: 4, leftUnit: 'vw', right: 6, rightUnit: 'vmin', pivotY: 0.5 }));
+    });
+  });
+
+  /** Parity pins CONSISTENCY, not correctness — the two implementations can agree
+   *  precisely because both are wrong the same way, which is exactly what happened to
+   *  stretched-axis offsets (a `right` offset was folded back into the NEAR edge, so
+   *  `left: 5%` + `right: 5%` cancelled to a full-bleed box). These assert the
+   *  semantics outright so agreement alone can never be mistaken for a green light. */
+  describe('stretched-axis offsets INSET their own edge (they do not shift the box)', () => {
+    it('left+right on a stretched axis are side margins, and do NOT cancel', () => {
+      const a = anchorData({ anchor: 'bottom-stretch', left: 5, leftUnit: '%', right: 5, rightUnit: '%' });
+      const r = resolveAnchorRect(ELW, ELH, VPW, VPH, a);
+      expect(r.x).toBeCloseTo(20, 5);   // 5% of 400
+      expect(r.w).toBeCloseTo(360, 5);  // 400 − 20 − 20 — NOT 400 (the cancelling bug)
+      expectAgree(a);
+    });
+    it('top+bottom on a stretched axis inset vertically', () => {
+      const a = anchorData({ anchor: 'left-stretch', top: 12, topUnit: 'px', bottom: 20, bottomUnit: 'px' });
+      const r = resolveAnchorRect(ELW, ELH, VPW, VPH, a);
+      expect(r.y).toBeCloseTo(12, 5);
+      expect(r.h).toBeCloseTo(768, 5);  // 800 − 12 − 20
+      expectAgree(a);
+    });
+    it('a far-edge offset alone shrinks the box without moving the near edge', () => {
+      const r = resolveAnchorRect(ELW, ELH, VPW, VPH,
+        anchorData({ anchor: 'top-stretch', right: 40, rightUnit: 'px' }));
+      expect(r.x).toBeCloseTo(0, 5);
+      expect(r.w).toBeCloseTo(360, 5);
+    });
+    it('a NON-stretched axis still SHIFTS — a far-edge offset moves the box', () => {
+      // bottom-stretch stretches X only, so `bottom` must keep its point semantics.
+      const r = resolveAnchorRect(ELW, ELH, VPW, VPH,
+        anchorData({ anchor: 'bottom-stretch', bottom: 30, bottomUnit: 'px' }));
+      expect(r.y).toBeCloseTo(770, 5);  // 800 − 30
+      expect(r.h).toBeCloseTo(ELH, 5);  // height untouched
+    });
   });
 
   describe('with viewport-unit offsets (vw/vh/vmin/vmax)', () => {
@@ -150,5 +210,33 @@ describe('UIAnchor CSS ↔ pixel-rect parity (F4)', () => {
     it('mixed vw left + vh top on center', () => {
       expectAgree(anchorData({ anchor: 'center', left: 4, leftUnit: 'vw', top: 7, topUnit: 'vh', pivotX: 0.5, pivotY: 0.5 }));
     });
+  });
+});
+
+/** The THIRD path: `isSizeInert` is the predicate the Inspector greys a field on and
+ *  the scene validator warns from. Both are claims about what these two layout paths
+ *  do, so the predicate has to agree with the CODE that actually discards the authored
+ *  size — not merely with the STRETCH_X/Y constants it happens to be built from. This
+ *  drives all 16 modes through applyAnchorStyle and asserts the equivalence directly,
+ *  so moving a mode between the stretch lists can never silently un-gate a field. */
+describe('isSizeInert agrees with the CSS path that clears the authored size', () => {
+  it.each(MODES)("'%s': width inert ⇔ applyAnchorStyle drops the CSS width", (mode) => {
+    const style: CSSProperties = { width: ELW, height: ELH };
+    applyAnchorStyle(style, anchorData({ anchor: mode }) as AnchorCssData);
+    expect(isSizeInert(mode, 'width')).toBe(style.width === undefined);
+  });
+
+  it.each(MODES)("'%s': height inert ⇔ applyAnchorStyle drops the CSS height", (mode) => {
+    const style: CSSProperties = { width: ELW, height: ELH };
+    applyAnchorStyle(style, anchorData({ anchor: mode }) as AnchorCssData);
+    expect(isSizeInert(mode, 'height')).toBe(style.height === undefined);
+  });
+
+  it('is not vacuous — the 16 modes cover both outcomes on both axes', () => {
+    // Guards against the equivalence passing because every mode landed on one side.
+    const w = MODES.map((m) => isSizeInert(m, 'width'));
+    const h = MODES.map((m) => isSizeInert(m, 'height'));
+    expect(new Set(w).size).toBe(2);
+    expect(new Set(h).size).toBe(2);
   });
 });

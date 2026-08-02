@@ -27,6 +27,10 @@ function makeWin() {
   const win = {
     isDestroyed: () => false,
     webContents: {
+      // A window can outlive its renderer, so `applyZoom` guards the WEBCONTENTS as well as the
+      // window (see the comment there). The stub has to model that or it stands for an object the
+      // real code cannot exist alongside — which is how a mock silently drifts from what it mocks.
+      isDestroyed: () => false,
       setZoomLevel: (l: number) => { calls.push(l); level = l; },
       // applyZoom pushes the authoritative page-zoom factor to the renderer; the real
       // webContents derives it from the zoom level (factor = 1.2^level).

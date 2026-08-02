@@ -43,13 +43,27 @@ function walk(dir: string, out: string[] = []): string[] {
   return out;
 }
 
+/** The scaffolder template is NOT a discovered project, so it sat outside this guard —
+ *  yet `scaffold-project.mjs` (and the editor's File → New Project) mints EVERY new game
+ *  from it, so a relative escape added here would propagate into every future project
+ *  UNGUARDED and only fail once that game was opened standalone or copied out. Same blind
+ *  spot #53 closed for `codeAssetRefs.test.ts`; found sweeping for siblings of it.
+ *  Currently clean — this keeps it that way.
+ *
+ *  Only the escaping-import check walks it: the template has no `ios/` and no per-project
+ *  tsconfig, so the pbxproj and node-types tests below stay on real projects. */
+const TEMPLATE_ROOT = path.join(repoRoot, 'engine', 'templates', 'starter');
+const importScanRoots: string[] = [
+  ...projects.map((p: { dir: string }) => p.dir),
+  ...(fs.existsSync(TEMPLATE_ROOT) ? [TEMPLATE_ROOT] : []),
+];
+
 /** Every relative import (static or dynamic) in a game file that resolves OUTSIDE
  *  that game's own folder, as `<repo-rel file> :: <specifier>`. */
 function escapingImports(): string[] {
   const out: string[] = [];
   const importRe = /(?:from|import\()\s*['"](\.[^'"]+)['"]/g;
-  for (const proj of projects) {
-    const gameRoot = proj.dir;
+  for (const gameRoot of importScanRoots) {
     for (const file of walk(gameRoot)) {
       const src = fs.readFileSync(file, 'utf8');
       let m: RegExpExecArray | null;
@@ -81,6 +95,41 @@ describe.skipIf(projects.length === 0)('game project portability (self-contained
     const escapes = new Set(escapingImports());
     const stale = [...KNOWN_ESCAPES].filter((e) => !escapes.has(e));
     expect(stale, `KNOWN_ESCAPES lists escapes that no longer exist — remove them:\n${stale.join('\n')}`).toEqual([]);
+  });
+
+  // A game must TYPECHECK standalone too, not just resolve its imports. Game code is typed
+  // browser-only (`engine/tsconfig.app.json` sets `types: ["vite/client"]`), so a file that
+  // imports a node builtin needs an explicit `/// <reference types="node" />` — which is
+  // program-global, so ONE per project covers that project's files.
+  //
+  // Why a guard rather than trusting `npm run typecheck`: the root typecheck compiles app + ALL
+  // projects as ONE program, so a single `/// <reference types="node" />` anywhere makes every
+  // other project's node usage resolve. A per-game build (`engine/scripts/build-web.mjs` writes a
+  // tsconfig scoped to the ONE game) has no such donor and fails with `Cannot find module
+  // 'node:fs'`. The root typecheck therefore CANNOT catch this class — only a build can, and we
+  // don't build 25 projects in CI. Regression: games/court/tests/corpus.test.ts, which passed
+  // `npm run typecheck` and broke the Court iOS build.
+  //
+  // `tools/` is skipped: it's build-time Node code, excluded from the app tsconfig on purpose.
+  it('a project using node builtins declares the node types itself (build scopes to ONE project)', () => {
+    const nodeImport = /(?:from|import\()\s*['"](?:node:[a-z_/]+|fs|path|os|url|child_process|crypto)['"]/;
+    const offenders: string[] = [];
+    for (const proj of projects) {
+      const files = walk(proj.dir).filter((f) => !f.includes(`${path.sep}tools${path.sep}`));
+      const users = files.filter((f) => nodeImport.test(fs.readFileSync(f, 'utf8')));
+      if (users.length === 0) continue;
+      const declares = files.some((f) => /\/\/\/\s*<reference\s+types="node"\s*\/>/.test(fs.readFileSync(f, 'utf8')));
+      if (!declares) {
+        offenders.push(
+          `${proj.root}/${proj.name}: ${users.map((f) => path.relative(repoRoot, f).replace(/\\/g, '/')).join(', ')}`,
+        );
+      }
+    }
+    expect(
+      offenders,
+      'Add `/// <reference types="node" />` to one of these files (see games/sling/tests/sling-assets.test.ts);\n' +
+      `otherwise the per-game build fails on "Cannot find module 'node:fs'":\n${offenders.join('\n')}`,
+    ).toEqual([]);
   });
 
   // Native projects must be self-contained too: the iOS pbxproj once referenced

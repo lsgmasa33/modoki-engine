@@ -6,6 +6,7 @@
  *  in the widgets themselves. */
 
 import { useSyncExternalStore, type CSSProperties } from 'react';
+import { scrollRootStyle } from '../tabLayout';
 import { getStatWidgets, toggleWidget, isWidgetOpen, subscribeWidgets, getWidgetVersion } from '../widgetStore';
 import { useInterval } from '../useSampled';
 import { getFps, readRenderer, getEntityCount } from '../perfSources';
@@ -17,7 +18,7 @@ export function StatsTab() {
   const rend = readRenderer();
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+    <div style={scrollRootStyle(16)}>
       <section>
         <div style={headingStyle}>Performance monitors</div>
         <div style={hintStyle}>Spawn a floating widget to watch while playing — drag it anywhere; it stays on screen when this menu is closed.</div>

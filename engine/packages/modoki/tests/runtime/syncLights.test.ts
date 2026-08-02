@@ -49,10 +49,10 @@ describe('syncLights — create per type', () => {
   it('instantiates the matching THREE subclass for each lightType and adds it to the scene', async () => {
     const { world, Light, sync, scene } = await setup();
     const map = new Map<number, THREE.Light>();
-    const a = world.spawn(Light({ lightType: 'ambient', color: 0x111111, intensity: 0.5, isActive: true })).id();
-    const d = world.spawn(Light({ lightType: 'directional', color: 0x222222, intensity: 1, isActive: true })).id();
-    const p = world.spawn(Light({ lightType: 'point', color: 0x333333, intensity: 2, distance: 10, isActive: true })).id();
-    const s = world.spawn(Light({ lightType: 'spot', color: 0x444444, intensity: 3, angle: 0.4, penumbra: 0.2, isActive: true })).id();
+    const a = world.spawn(Light({ lightType: 'ambient', color: 0x111111, intensity: 0.5 })).id();
+    const d = world.spawn(Light({ lightType: 'directional', color: 0x222222, intensity: 1 })).id();
+    const p = world.spawn(Light({ lightType: 'point', color: 0x333333, intensity: 2, distance: 10 })).id();
+    const s = world.spawn(Light({ lightType: 'spot', color: 0x444444, intensity: 3, angle: 0.4, penumbra: 0.2 })).id();
 
     sync.syncLights(world, scene, map);
 
@@ -69,12 +69,12 @@ describe('syncLights — create per type', () => {
   it('re-applies per-frame fields without recreating (idempotent)', async () => {
     const { world, Light, sync, scene } = await setup();
     const map = new Map<number, THREE.Light>();
-    const e = world.spawn(Light({ lightType: 'point', color: 0xff0000, intensity: 1, isActive: true }));
+    const e = world.spawn(Light({ lightType: 'point', color: 0xff0000, intensity: 1 }));
 
     sync.syncLights(world, scene, map);
     const first = map.get(e.id());
 
-    e.set(Light, { lightType: 'point', color: 0x00ff00, intensity: 4, distance: 0, angle: 0.5, penumbra: 0, castShadow: false, isActive: true });
+    e.set(Light, { lightType: 'point', color: 0x00ff00, intensity: 4, distance: 0, angle: 0.5, penumbra: 0, castShadow: false });
     sync.syncLights(world, scene, map);
 
     expect(map.get(e.id())).toBe(first);                       // same instance, not recreated
@@ -87,13 +87,13 @@ describe('syncLights — type-switch recreate + dispose', () => {
   it('disposes the old light and builds the new subclass when lightType changes', async () => {
     const { world, Light, sync, scene } = await setup();
     const map = new Map<number, THREE.Light>();
-    const e = world.spawn(Light({ lightType: 'ambient', color: 0xffffff, intensity: 1, isActive: true }));
+    const e = world.spawn(Light({ lightType: 'ambient', color: 0xffffff, intensity: 1 }));
 
     sync.syncLights(world, scene, map);
     const oldLight = map.get(e.id())!;
     const disposeSpy = vi.spyOn(oldLight, 'dispose');
 
-    e.set(Light, { lightType: 'spot', color: 0xffffff, intensity: 1, distance: 0, angle: 0.5, penumbra: 0, castShadow: false, isActive: true });
+    e.set(Light, { lightType: 'spot', color: 0xffffff, intensity: 1, distance: 0, angle: 0.5, penumbra: 0, castShadow: false });
     sync.syncLights(world, scene, map);
 
     expect(disposeSpy).toHaveBeenCalledTimes(1);
@@ -109,8 +109,8 @@ describe('syncLights — reap on removal', () => {
   it('removes + disposes the light and clears the map when the entity is deactivated', async () => {
     const { world, Light, sync, scene } = await setup();
     const map = new Map<number, THREE.Light>();
-    const keep = world.spawn(Light({ lightType: 'point', isActive: true })).id();
-    const drop = world.spawn(Light({ lightType: 'point', isActive: true })).id();
+    const keep = world.spawn(Light({ lightType: 'point' })).id();
+    const drop = world.spawn(Light({ lightType: 'point' })).id();
 
     sync.syncLights(world, scene, map);
     const dropLight = map.get(drop)!;
@@ -128,7 +128,7 @@ describe('syncLights — reap on removal', () => {
   it('reaps a light whose entity was destroyed', async () => {
     const { world, Light, sync, scene } = await setup();
     const map = new Map<number, THREE.Light>();
-    const e = world.spawn(Light({ lightType: 'directional', isActive: true }));
+    const e = world.spawn(Light({ lightType: 'directional' }));
 
     sync.syncLights(world, scene, map);
     const light = map.get(e.id())!;
@@ -145,7 +145,7 @@ describe('syncLights — F6 orphaned-target regression', () => {
   it('removes a spot light\'s target from the scene when the light is reaped (no orphan)', async () => {
     const { world, Light, sync, scene } = await setup();
     const map = new Map<number, THREE.Light>();
-    const e = world.spawn(Light({ lightType: 'spot', isActive: true }));
+    const e = world.spawn(Light({ lightType: 'spot' }));
     // A world transform makes syncLights add the spot's target to the scene graph.
     worldTransforms.set(e.id(), wt(1, 2, 3));
 
@@ -165,14 +165,14 @@ describe('syncLights — F6 orphaned-target regression', () => {
   it('removes the old spot target on a spot→ambient type switch', async () => {
     const { world, Light, sync, scene } = await setup();
     const map = new Map<number, THREE.Light>();
-    const e = world.spawn(Light({ lightType: 'spot', isActive: true }));
+    const e = world.spawn(Light({ lightType: 'spot' }));
     worldTransforms.set(e.id(), wt(0, 5, 0));
 
     sync.syncLights(world, scene, map);
     const oldSpot = map.get(e.id())! as THREE.SpotLight;
     expect(scene.children).toContain(oldSpot.target);
 
-    e.set(Light, { lightType: 'ambient', color: 0xffffff, intensity: 1, distance: 0, angle: 0.5, penumbra: 0, castShadow: false, isActive: true });
+    e.set(Light, { lightType: 'ambient', color: 0xffffff, intensity: 1, distance: 0, angle: 0.5, penumbra: 0, castShadow: false });
     sync.syncLights(world, scene, map);
 
     expect(map.get(e.id())).toBeInstanceOf(THREE.AmbientLight);
@@ -193,7 +193,7 @@ describe('syncLights — aim uses the renderer\'s euler order (XYZ)', () => {
   it('aims a spot light along its XYZ-euler forward, not the legacy YXZ one', async () => {
     const { world, Light, sync, scene } = await setup();
     const map = new Map<number, THREE.Light>();
-    const e = world.spawn(Light({ lightType: 'spot', isActive: true }));
+    const e = world.spawn(Light({ lightType: 'spot' }));
     worldTransforms.set(e.id(), { ...wt(0, 5, 0), rx: RX, ry: RY });
 
     sync.syncLights(world, scene, map);
@@ -216,7 +216,7 @@ describe('syncLights — aim uses the renderer\'s euler order (XYZ)', () => {
   it('matches the orientation a mesh with the same euler would take', async () => {
     const { world, Light, sync, scene } = await setup();
     const map = new Map<number, THREE.Light>();
-    const e = world.spawn(Light({ lightType: 'directional', isActive: true }));
+    const e = world.spawn(Light({ lightType: 'directional' }));
     worldTransforms.set(e.id(), { ...wt(0, 0, 0), rx: RX, ry: RY });
 
     sync.syncLights(world, scene, map);
@@ -237,7 +237,7 @@ describe('syncLights — aim uses the renderer\'s euler order (XYZ)', () => {
   it('ignores roll — rotating about Z cannot change the -Z forward', async () => {
     const { world, Light, sync, scene } = await setup();
     const map = new Map<number, THREE.Light>();
-    const e = world.spawn(Light({ lightType: 'spot', isActive: true }));
+    const e = world.spawn(Light({ lightType: 'spot' }));
     worldTransforms.set(e.id(), { ...wt(0, 0, 0), rx: RX, ry: RY, rz: 0.9 });
 
     sync.syncLights(world, scene, map);
@@ -263,7 +263,7 @@ describe('syncLights — authored Light.target* aim', () => {
   it('aims a spot at the authored target in WORLD space, ignoring rotation', async () => {
     const { world, Light, sync, scene } = await setup();
     const map = new Map<number, THREE.Light>();
-    const e = world.spawn(Light({ lightType: 'spot', isActive: true, ...target }));
+    const e = world.spawn(Light({ lightType: 'spot', ...target }));
     // A rotation that would aim somewhere else entirely — the target must win.
     worldTransforms.set(e.id(), { ...wt(2, 4, 1), rx: -0.6, ry: 1.2 });
 
@@ -280,7 +280,7 @@ describe('syncLights — authored Light.target* aim', () => {
   it('aims a directional light at the authored target too', async () => {
     const { world, Light, sync, scene } = await setup();
     const map = new Map<number, THREE.Light>();
-    const e = world.spawn(Light({ lightType: 'directional', isActive: true, ...target }));
+    const e = world.spawn(Light({ lightType: 'directional', ...target }));
     worldTransforms.set(e.id(), wt(0, 10, 0));
 
     sync.syncLights(world, scene, map);
@@ -295,7 +295,7 @@ describe('syncLights — authored Light.target* aim', () => {
     const { world, Light, sync, scene } = await setup();
     const map = new Map<number, THREE.Light>();
     // targetX/Y/Z default to 0 — exactly what every scene authored before the fix serializes.
-    const e = world.spawn(Light({ lightType: 'spot', isActive: true }));
+    const e = world.spawn(Light({ lightType: 'spot' }));
     worldTransforms.set(e.id(), { ...wt(0, 5, 0), rx: RX, ry: RY });
 
     sync.syncLights(world, scene, map);
@@ -314,7 +314,7 @@ describe('syncLights — authored Light.target* aim', () => {
   it('a SINGLE non-zero axis is enough to count as set', async () => {
     const { world, Light, sync, scene } = await setup();
     const map = new Map<number, THREE.Light>();
-    const e = world.spawn(Light({ lightType: 'spot', isActive: true, targetY: 2 }));
+    const e = world.spawn(Light({ lightType: 'spot', targetY: 2 }));
     worldTransforms.set(e.id(), { ...wt(0, 5, 0), rx: RX, ry: RY });
 
     sync.syncLights(world, scene, map);
@@ -328,13 +328,13 @@ describe('syncLights — authored Light.target* aim', () => {
   it('follows a live target edit without recreating the light', async () => {
     const { world, Light, sync, scene } = await setup();
     const map = new Map<number, THREE.Light>();
-    const e = world.spawn(Light({ lightType: 'spot', isActive: true, targetX: 1 }));
+    const e = world.spawn(Light({ lightType: 'spot', targetX: 1 }));
     worldTransforms.set(e.id(), wt(0, 5, 0));
 
     sync.syncLights(world, scene, map);
     const spot = map.get(e.id())! as THREE.SpotLight;
 
-    e.set(Light, { lightType: 'spot', color: 0xffffff, intensity: 1, targetX: 1, targetY: 0, targetZ: -9, distance: 0, angle: 0.5, penumbra: 0, castShadow: false, isActive: true });
+    e.set(Light, { lightType: 'spot', color: 0xffffff, intensity: 1, targetX: 1, targetY: 0, targetZ: -9, distance: 0, angle: 0.5, penumbra: 0, castShadow: false });
     sync.syncLights(world, scene, map);
 
     expect(map.get(e.id())).toBe(spot);                        // same instance

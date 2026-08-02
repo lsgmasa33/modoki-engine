@@ -116,7 +116,7 @@ describe('ensureCapacitorDeps', () => {
 });
 
 describe('ensureCapacitorConfig', () => {
-  const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game' } });
+  const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
 
   it('creates capacitor.config.json from project config', () => {
     const r = ensureCapacitorConfig(root, cfg);

@@ -18,8 +18,12 @@ import {
   type TextureImportSettings, type TextureWrap,
 } from './textureSettings';
 import { envVariantSuffix, type EnvFormat } from '../core/environmentSettings';
-import { setActiveRendererHandle, isRendererReadyFired, rendererReady } from '../core/activeRenderer';
-export { getActiveRenderer, onRendererReady, rendererReady } from '../core/activeRenderer';
+import {
+  setActiveRendererHandle, ktx2CapsReady, areKtx2CapsReady, markKtx2CapsReady,
+} from '../core/activeRenderer';
+import { warnVocabOnce } from '../core/warnVocab';
+export { getActiveRenderer, onRendererReady, rendererReady, getRendererGateHealth } from '../core/activeRenderer';
+export type { RendererGateHealth } from '../core/activeRenderer';
 export type { ResolvedSprite } from '../core/textureProvider';
 import type { ResolvedSprite } from '../core/textureProvider';
 
@@ -58,6 +62,72 @@ export function setActiveRenderer(renderer: WebGPURenderer | THREE.WebGLRenderer
     console.warn('[textureResolver] detectSupport failed:', e);
   }
   setActiveRendererHandle(renderer);
+}
+
+/** Default delay before `ensureKtx2Caps` gives up waiting for a real viewport and stands up a
+ *  throwaway probe renderer instead. Anchored on the ~1.0s a viewport normally takes to mount
+ *  (see `NO_VIEWPORT_TIMEOUT_MS` in `editor/createEditor.tsx`) — ~2x headroom before a probe ever
+ *  races a real one, and well under the old 12s editor fast-fail. Decided value, not a knob to
+ *  re-tune without a fresh measurement. */
+export const KTX2_PROBE_DELAY_MS = 2000;
+
+// Single-flight — concurrent `ensureKtx2Caps` callers must trigger exactly ONE probe.
+let probePromise: Promise<void> | null = null;
+
+async function runCapsProbe(
+  probeFactory: () => Promise<WebGPURenderer | THREE.WebGLRenderer>,
+): Promise<void> {
+  if (areKtx2CapsReady()) return; // a viewport won the race between the timer firing and here
+  if (!probePromise) {
+    probePromise = (async () => {
+      let probe: WebGPURenderer | THREE.WebGLRenderer | undefined;
+      try {
+        probe = await probeFactory();
+        getKTX2Loader().detectSupport(probe as never);
+      } catch (e) {
+        // Resolve anyway: a per-texture rejection with a clear cause beats an eternal hang for
+        // every future KTX2 load. `detectSupport` copies capability booleans synchronously and
+        // keeps no renderer reference (verified against KTX2Loader.js), so disposing right after
+        // — or never having created one — is always safe.
+        console.error('[textureResolver] KTX2 caps probe failed — KTX2 texture loads may reject:', e);
+      } finally {
+        probe?.dispose();
+      }
+      markKtx2CapsReady('probe');
+    })();
+  }
+  return probePromise;
+}
+
+/** The ONE place anything waits for KTX2 transcoder caps. Resolves immediately if a real
+ *  viewport (or an earlier probe) already registered them; otherwise waits briefly for a
+ *  viewport to show up on its own, and if none does, stands up a throwaway probe renderer
+ *  (`capsProbeRenderer.ts`, dynamically imported so `runtime/loaders` never statically depends
+ *  on `runtime/rendering` — see `docs/architecture-layers.md`'s cycle guard) purely to run
+ *  `detectSupport`. Never rejects — a probe failure still resolves the gate (see `runCapsProbe`)
+ *  so a dead GPU degrades to per-texture errors instead of hanging every future KTX2 load. */
+export async function ensureKtx2Caps(opts?: {
+  delayMs?: number;
+  probeFactory?: () => Promise<WebGPURenderer | THREE.WebGLRenderer>;
+  timers?: { setTimeout: typeof setTimeout; clearTimeout: typeof clearTimeout };
+}): Promise<void> {
+  if (areKtx2CapsReady()) return;
+  const delayMs = opts?.delayMs ?? KTX2_PROBE_DELAY_MS;
+  const timers = opts?.timers ?? {
+    setTimeout: globalThis.setTimeout.bind(globalThis),
+    clearTimeout: globalThis.clearTimeout.bind(globalThis),
+  };
+  const probeFactory = opts?.probeFactory ?? (async () => {
+    const { createCapsProbeRenderer } = await import('../rendering/capsProbeRenderer');
+    return createCapsProbeRenderer();
+  });
+
+  let timerId: ReturnType<typeof setTimeout> | undefined;
+  const delayThenProbe = new Promise<void>((resolve) => {
+    timerId = timers.setTimeout(() => { void runCapsProbe(probeFactory).then(resolve, resolve); }, delayMs);
+  });
+  await Promise.race([ktx2CapsReady, delayThenProbe]);
+  if (timerId !== undefined) timers.clearTimeout(timerId);
 }
 
 /** The texture's baked import settings, or defaults when unconverted. */
@@ -211,8 +281,17 @@ export function resolveBrowserImageUrl(ref: string, warnKtx = false): string | u
 }
 
 function applyTextureSettings(tex: THREE.Texture, s: TextureImportSettings, isKtx: boolean, flipY?: boolean): void {
+  // Unrecognised wrapS/wrapT falls through to `undefined` (not three's own ClampToEdgeWrapping
+  // default — verified they differ, see #73) — preserved as-is, just warned once.
+  if (!(s.wrapS in WRAP)) warnVocabOnce('texture', 'wrapS', s.wrapS, 'wrapS left unset (undefined)');
+  if (!(s.wrapT in WRAP)) warnVocabOnce('texture', 'wrapT', s.wrapT, 'wrapT left unset (undefined)');
   tex.wrapS = WRAP[s.wrapS];
   tex.wrapT = WRAP[s.wrapT];
+  // Only 'linear' and 'srgb' are valid TextureColorspace values — anything else silently keeps
+  // today's fallback (SRGBColorSpace), same as a legitimate 'srgb'.
+  if (s.colorspace !== 'linear' && s.colorspace !== 'srgb') {
+    warnVocabOnce('texture', 'colorspace', s.colorspace, "treated as 'srgb' (SRGBColorSpace)");
+  }
   tex.colorSpace = s.colorspace === 'linear' ? THREE.NoColorSpace : THREE.SRGBColorSpace;
   if (isKtx) {
     // KTX2/Basis is bottom-origin and carries baked mip levels.
@@ -270,19 +349,18 @@ export async function loadTexture3D(ref: string, opts?: { flipY?: boolean }): Pr
   const settings = getTextureSettings(ref);
   const loader = isKtx ? getKTX2Loader() : getTextureLoader();
   const entry: TexCacheEntry = { promise: undefined as never, texture: null, refCount: 1, url };
-  // Gate KTX2 loads on renderer readiness: KTX2Loader.loadAsync throws
-  // "Missing initialization with `.detectSupport( renderer )`" if it runs before
-  // `setActiveRenderer` wires the loader's GPU-format caps. In the EDITOR, scene
-  // load is gated on `rendererReady` up front — but the game runtime creates the
-  // renderer (async WebGPU `init()`) and loads the scene concurrently, so on
-  // slower GPUs (e.g. Android/Adreno WebGPU) the island's first material textures
-  // race ahead of `detectSupport` and fail permanently. This is the single 3D
-  // texture chokepoint, so gating here covers every caller with no deadlock risk
-  // (a 2D-only game never reaches loadTexture3D, so it never awaits a renderer).
-  // The synchronous cache check above is preserved, so concurrent acquires of the
-  // same texture still dedup to one load. Non-KTX sources (TextureLoader) need no
-  // renderer and aren't gated.
-  const gate = isKtx && !isRendererReadyFired() ? rendererReady : Promise.resolve();
+  // Gate KTX2 loads on transcoder caps: KTX2Loader.loadAsync throws "Missing
+  // initialization with `.detectSupport( renderer )`" if it runs before caps are known.
+  // The game runtime creates the renderer (async WebGPU `init()`) and loads the scene
+  // concurrently, so on slower GPUs (e.g. Android/Adreno WebGPU) the island's first
+  // material textures can race ahead of `detectSupport` and fail permanently. This is
+  // the single 3D texture chokepoint, so gating here covers every caller with no
+  // deadlock risk — `ensureKtx2Caps` resolves via a real viewport when one exists, or a
+  // throwaway probe when none ever does (a 2D-only game never reaches loadTexture3D, so
+  // it never triggers a probe either). The synchronous cache check above is preserved,
+  // so concurrent acquires of the same texture still dedup to one load. Non-KTX sources
+  // (TextureLoader) need no caps and aren't gated.
+  const gate = isKtx && !areKtx2CapsReady() ? ensureKtx2Caps() : Promise.resolve();
   // Cast unifies the KTX2Loader/TextureLoader loadAsync union (CompressedTexture
   // extends Texture) so the extra `.then` gate doesn't break inference.
   entry.promise = gate.then(() => loader.loadAsync(url) as Promise<THREE.Texture>).then((loaded) => {

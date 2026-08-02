@@ -119,9 +119,12 @@ function encode(data: unknown): string {
   return JSON.stringify({
     elided: true,
     bytes: text.length,
+    // S3.21: the hint names the CALLED TOOL's own filters, read from `contracts.ts` and
+    // intersected with its schema — one hardcoded list was `get_scene_state`'s, so a capped
+    // `get_console_logs` was told to narrow with `trait=`, which its strict schema then refuses.
+    // A hint naming a dead end reads as the agent's mistake.
     hint: `Response was ${text.length} chars (cap ${MAX_PAYLOAD_CHARS}). Narrow it: ` +
-          `pass a filter (trait=/id=/name=/where=/layer=/ids=) or limit=N, or call without ` +
-          `full=1. See the tool description for this tool's filters.`,
+          `this tool's filters are level=/limit=/since=.`,   // ← per-tool, not a fixed list
     preview: summarize(data),                   // counts + top-level keys, never the payload
   });
 }
@@ -233,6 +236,56 @@ applied **server-side** (previously it fetched all 320 and filtered in `index.ts
 one trait's full field schema. The usage pattern is: know what exists, then fetch one schema before
 a `setTrait`.
 
+## `modoki_batch` — the one place suppressing a payload is CORRECT
+
+Every other rule in this doc is about making a payload *smaller*. `modoki_batch` is the one place a
+payload can legitimately be dropped **entirely**, and the licence comes from the tool's contract
+rather than from a size measurement: a batch is only valid when no step's response is needed to
+decide a later step, so a non-terminal step's payload is *by definition* unread. The only question it
+answers is "did it work".
+
+Per-step `result` mode (`engine/tools/modoki-mcp/src/batchReport.ts`):
+
+| mode | emits | when |
+|---|---|---|
+| `'none'` | index + tool in a `quiet` list; no payload | the caller has declared it will not read this |
+| `'ack'` | payload verbatim if ≤ **1 500 chars**, else `summarize()` (shapes/counts, never values) | default |
+| `'full'` | the whole payload | explicit, and automatic for the **last** step |
+
+Measured: a 10-step macro whose steps each return 20 KB reports in **<1 000 chars** instead of
+~180 000. `resultDefault` sets the mode for all non-terminal steps in one place.
+
+⚠️ **A batch that ends in TEARDOWN has its interesting read in the middle**, where `'ack'` trims it
+to a shape summary — only the *last* step gets `'full'` automatically. Found running use case 4
+(`play` → `set_timescale` → `wait` → `journal` → restore timescale → `stop`): the journal came back
+as `{elided:true, bytes:1579, preview:…}`, so the batch drove the game correctly and reported
+nothing about what happened. Mark such a step `result:'full'` explicitly. The envelope now says so
+itself — a successful batch that summarized anything reports **`summarized: [i, …]`** plus
+`summarizedHint`, so the trap is self-fixing rather than silent. (Not emitted on a failed batch: the
+fail-fast hint is the story there, and two hints would bury it.)
+
+**Three rules stop that from becoming a lie**, and they are the reason the mode is safe to offer:
+
+1. **A FAILED step is always reported in full**, whatever its mode. Silence means success and nothing
+   else — otherwise `'none'` is a mechanism for swallowing errors.
+2. **A failure cancels `'none'` retroactively** for the steps *before* it. They already applied and
+   there is no cross-call rollback, so an envelope naming only the failure and the un-run tail would
+   describe a scene state that does not exist. Promoted steps report at **ack** detail, not full — the
+   caller needs to know it *ran*, and full detail would undo the saving on exactly the path where the
+   envelope is already largest.
+   - Consequence for implementers: **`result` is a PRESENTATION choice, decided once at the end — not
+     a capture choice made as you go.** The executor buffers every step's payload and `reportBatch`
+     alone decides visibility. The obvious streaming loop gets this wrong, and only on the failure
+     path.
+3. **ONE `encode()` over the whole envelope**, so `MAX_PAYLOAD_CHARS` bounds the *batch* rather than
+   each step (eight `'full'` steps would otherwise be eight times the ceiling). Do **not** implement
+   that as a length check on `encode`'s output: that output is short exactly when it elided, so the
+   check is false in the only case that matters. Round-trip through `encode` unconditionally.
+
+The identity banner (`result.ts`) is stripped from each step by **exact prefix** and re-attached once
+by `ok()`/`err()` — repeating "you are driving the other clone's editor" twenty times is noise, but
+dropping it entirely would be invisible until someone silently edits the wrong checkout.
+
 ## Ring buffers, summarized at the boundary
 
 Six surfaces each have a bounded ring buffer whose full contents can reach absurd sizes, and each has
@@ -241,7 +294,7 @@ never in the producer. The ceilings below are **measured** (bytes/entry × ring 
 
 | Tool | Producer (untouched) | Seam | Boundary default | Measured ceiling |
 |---|---|---|---|---|
-| `get_console_logs` | `dumpConsoleLogs` over the 500-entry `consoleBuffer` (`agentBridge.ts:153`) — `diagnose` reads it directly | `console-logs` op | last 50 + `byLevel` over the whole ring | ~162 B/entry → **20–27k tok** |
+| `get_console_logs` | `dumpConsoleLogs` over the 500-entry `consoleBuffer` (`agentBridge.ts:153`) — `diagnose` reads it directly | `console-logs` op | last 50 + `count`/`total`/`ringTotal`/`byLevel`, where `byLevel`+`ringTotal` cover the WHOLE ring even under a filter (S3.8) | ~162 B/entry → **20–27k tok** |
 | `watch` (`read`) | `readWatch()` — `WatchTab.tsx:89` renders `samples` | `watch-read` op | stats-only; `samples:true` opts in | 39.8 B/sample × 512 series × 600–5000 → **3.1M–25.8M tok** |
 | `journal` | `journalEvents()` — cap `10_000` (`journal.ts:58`) — `JournalTab` reads it | `journal-events` op | last 100 + `byType` | 102–226 B/ev → **257k–582k tok** |
 | `editor_journal` | `readEditorJournal()` — cap `2000` (`editorJournal.ts:36`) | `editor-journal` op | last 100 + `byType`; `merged` tails `game` + `timeline` too | 130–253 B/ev → **54k–126k tok** |

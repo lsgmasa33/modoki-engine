@@ -102,7 +102,7 @@ describe('keyboardSource key→action mapping', () => {
 
   it('ignores keys while a text field is focused (editing guard)', () => {
     (globalThis as Record<string, unknown>).document = {
-      ...(globalThis as Record<string, { document: object }>).document,
+      ...(globalThis as Record<string, unknown>).document as object,
       addEventListener: () => {}, removeEventListener: () => {},
       activeElement: { tagName: 'INPUT', isContentEditable: false },
       visibilityState: 'visible',

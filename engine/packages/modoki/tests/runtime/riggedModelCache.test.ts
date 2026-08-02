@@ -100,11 +100,12 @@ import { setActiveRenderer, getKTX2Loader } from '../../src/runtime/loaders/text
 const REF = 'alien.glb';
 const PATH = '/models/alien.glb';
 
-// fetchRiggedModel now gates its GLTFLoader.load on `rendererReady` (an optimized
+// fetchRiggedModel gates its GLTFLoader.load on `ensureKtx2Caps()` (an optimized
 // rigged GLB carries embedded KTX2, decoded by the shared KTX2Loader, which needs
-// setActiveRenderer's detectSupport first — the Android renderer-init race fix).
-// Prime that ready state once so the load-path tests here don't hang waiting for a
-// renderer. Stub detectSupport so a {} renderer doesn't warn.
+// GPU caps from detectSupport first — the Android renderer-init race fix). Priming
+// via setActiveRenderer marks KTX2 caps ready too (a real renderer implies caps —
+// see activeRenderer.ts), so the load-path tests here don't hang waiting on a probe.
+// Stub detectSupport so a {} renderer doesn't warn.
 beforeAll(() => {
   const detect = vi.spyOn(getKTX2Loader(), 'detectSupport').mockImplementation(function (this: { workerConfig?: { astcSupported?: boolean } }) {
     this.workerConfig = { astcSupported: false }; return this as never;
@@ -220,7 +221,7 @@ describe('riggedModelCache', () => {
 
   describe('cache-bust (?v=) via modelGlbUrl', () => {
     it('requests the .processed.glb variant with ?v=<hash> in production', async () => {
-      vi.stubEnv('PROD', 'true');
+      vi.stubEnv('PROD', true);
       manifest.entry = { modelCache: {}, hash: 'cafe1234' };
       try {
         await acquireRiggedModel(1, REF);

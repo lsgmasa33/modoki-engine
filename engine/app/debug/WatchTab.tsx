@@ -11,7 +11,7 @@
 import { useEffect, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { registerDebugTab } from '@modoki/engine/runtime';
-import { Sparkline } from '@modoki/engine/runtime/debug';
+import { Sparkline, fillRootStyle, fillRegionStyle } from '@modoki/engine/runtime/debug';
 import { startWatch, readWatch, listWatches, clearWatch } from './watch';
 
 const REFRESH_MS = 300;
@@ -48,7 +48,7 @@ function WatchTab() {
   };
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+    <div style={fillRootStyle(10)}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
         <div style={{ display: 'flex', gap: 4 }}>
           <input style={inputStyle} placeholder="component (e.g. Transform)" value={component} onChange={(e) => setComponent(e.target.value)} />
@@ -58,11 +58,13 @@ function WatchTab() {
         {error && <div style={errorStyle}>{error}</div>}
       </div>
 
-      {watches.length === 0 ? (
-        <div style={mutedStyle}>No active watches. Start one above to chart a numeric trait field over time.</div>
-      ) : (
-        watches.map((w) => <WatchCard key={w.id} id={w.id} />)
-      )}
+      <div style={cardListStyle}>
+        {watches.length === 0 ? (
+          <div style={mutedStyle}>No active watches. Start one above to chart a numeric trait field over time.</div>
+        ) : (
+          watches.map((w) => <WatchCard key={w.id} id={w.id} />)
+        )}
+      </div>
     </div>
   );
 }
@@ -111,6 +113,7 @@ registerDebugTab({ id: 'watch', title: 'Watch', order: 25, Component: WatchTab }
 const inputStyle: CSSProperties = { flex: 1, background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.15)', borderRadius: 4, color: '#e6e6ff', fontSize: 12, padding: '3px 6px' };
 const btnStyle: CSSProperties = { background: 'rgba(99,102,241,0.2)', border: '1px solid rgba(99,102,241,0.4)', color: '#c7d2fe', cursor: 'pointer', fontSize: 12, padding: '3px 10px', borderRadius: 4 };
 const smallBtnStyle: CSSProperties = { background: 'transparent', border: 'none', color: '#8b8ba7', cursor: 'pointer', fontSize: 12, padding: 0 };
+const cardListStyle: CSSProperties = { ...fillRegionStyle, display: 'flex', flexDirection: 'column', gap: 10 };
 const cardStyle: CSSProperties = { border: '1px solid rgba(255,255,255,0.1)', borderRadius: 6, padding: 8 };
 const cardHeaderStyle: CSSProperties = { display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12 };
 const seriesLabelStyle: CSSProperties = { display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#8b8ba7', marginBottom: 2 };

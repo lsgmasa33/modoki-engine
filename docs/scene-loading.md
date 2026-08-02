@@ -1,8 +1,11 @@
 # Scene Loading
 
-A scene is a single plain `.json` file under a `scenes/` dir (not `.scene.json`)
-that is the **sole source of truth** for what exists in the world. Scenes load asynchronously into an isolated staging
-world, then swap in atomically so no system ever observes a half-built scene.
+A scene is a single `*.scene.json` file — positively identified by that suffix, like every
+other JSON asset kind (issue #54) — that is the **sole source of truth** for what exists in
+the world. (A plain `.json` under a `scenes/` dir is still accepted as a LEGACY fallback, for
+an externally-authored project or an already-published demo snapshot predating the suffix.)
+Scenes load asynchronously into an isolated staging world, then swap in atomically so no
+system ever observes a half-built scene.
 
 See also: [Architecture](./architecture.md) · [Prefabs](./prefabs.md) · [Visual Editor](./editor.md)
 
@@ -91,6 +94,53 @@ interface SceneFile {
 `SerializedEntity.id` is now optional and, since v12, never written — see "Entity-id
 stability on disk" below.
 
+### Only NON-DEFAULT trait fields are written
+
+A trait field still holding its koota schema default is **omitted** from the file
+(`isTraitDefault` in `serialize.ts`); the loader rebuilds it, because it constructs each
+trait as `meta.trait(partialData)` and koota fills every absent key from the same schema.
+So the round trip is lossless, and a file records only what was actually *authored*.
+
+The point is that **defaults stay live**. Writing every field out freezes a scene at the
+defaults of the day it was saved, so a later change to a trait default silently stops
+reaching it — a semantic change, not diff noise. (This is what kept the repo-wide
+legacy-scene migration on hold; owner's decision to omit, 2026-07-31.)
+
+Three deliberate limits:
+
+- **Scalars only.** A non-scalar default (array/object) in an SoA schema is one shared
+  instance handed to every entity, so "equals the default" is not safely decidable — a deep
+  compare would drop a live array that merely happens to match, and an identity compare
+  would drop one the entity is *aliasing*. Non-scalars are always written.
+- **AoS traits are exempt wholesale** — their `schema` is a *factory*, so there is no
+  default to compare against.
+- **`parentId` and every other `FieldHint.entityId` field are always written**, since a
+  later pass rewrites them as GUIDs. Omitting them would only move them to the end of the
+  object — pure diff noise.
+
+A trait whose fields are *all* default still serializes, as `{}`: the trait's **presence**
+is meaningful. Consumers that read a scene file directly need the defaults to compute an
+effective value — they are published per field on `GET /api/trait-schema`, and so through
+the `modoki_list_traits` MCP tool.
+
+Note this is a *serializer* rule, not a format version: it changes what a save writes, not
+what a load accepts, so no migration is involved and older fully-populated files keep
+loading unchanged. It applies to scene files only — prefab files go through a separate
+path in `prefab.ts` and still write every field.
+
+**Which fields persist is decided by the koota `.schema`, never by `meta.fields`.**
+`meta.fields` is the *Inspector's* curated list: a persistent field owned by a custom
+Inspector section is deliberately absent from it (`Animator.clips`/`clip`,
+`SpriteAnimator.clip`, `AudioSource.clips`, `UIElement.flexWrap`,
+`EntityAttributes.editorFolder`, `Time.timeScale`, …). Every persistence path therefore
+reads through `readTraitDataFull` and gates stored fields with `traitDefinesField`
+(both in `runtime/core/ecs/entityUtils.ts`) — the scene serializer, `serializePrefab`,
+`captureInstanceOverrides`, and both override-apply paths. `meta.fields` is consulted
+only for the `runtimeOnly` flag (which fields to *drop*). Getting this wrong is silent
+data loss, not a warning: the prefab paths once used `meta.fields` and a load→save
+erased a populated `Animator.clips` bank. Same lesson as the persistent-snapshot field
+union below.
+
 A `ResourceRef` has `{ type, path, loader?, postprocessor? }` where `type` is one
 of `model | riggedModel | mesh | material | texture | prefab | font | environment | particle | animation`.
 `collectResourceRefsFromEntities()` (runtime, in `loadSceneFile.ts`) walks every
@@ -103,6 +153,19 @@ single ref-walking implementation rather than two that can drift.
 the entities (and every referenced prefab's nested entities, iteratively) so a
 stale manifest missing an entry — e.g. an HDR added after first serialization —
 still preloads everything and avoids first-view pop-in.
+
+It follows that **a save REGENERATES `resources` rather than preserving it** —
+`serializeScene` discards the loaded array and rebuilds from the entities. So a file
+whose array was written by an older, less complete walk gets *upgraded* on its first
+save, and the array can grow without anything being wrong (issue #17 saw 2 → 3+ on
+`material-instance-demo.json`). The walk is deterministic — same entities, same array,
+same order (`resourceRefsStability.test.ts` pins this, including dedupe of a ref two
+entities share) — so the second save produces the same bytes as the first.
+
+**Consequence for anything comparing a scene before and after a save:** normalize by
+saving once first, or compare `resources` as a set rather than as a byte range. Treating
+the growth as churn to eliminate is the wrong reading — the newer array is a superset,
+and `resources` is regenerated by design.
 
 ### Migrations
 
@@ -241,9 +304,24 @@ same scene saved after a **cold** load — different ids throughout, different e
 order, and a regenerated `createdAt` — with zero actual edits. Two further fixes closed
 that:
 
-- **`createdAt` is preserved** — captured from the raw parsed JSON into
-  `SceneManager`'s per-scene `loadedScenes` bookkeeping at load time and reused on
-  save; a fresh stamp only when there is none.
+- **`createdAt` and the scene's own `id` are preserved** — both are facts about the
+  ASSET, not the format, so a save (or a version migration) must carry them forward.
+  Both come from `SceneManager`'s per-scene `loadedScenes` bookkeeping, captured at load
+  time from the raw parsed JSON; a fresh id + stamp only for a scene that was never
+  loaded (`newScene()`).
+
+  The primary is looked up **by path**, a named base **by guid** (which its caller already
+  has). Keying the primary by guid was circular — it needed the id it was computing — and
+  the id itself used to come from a reverse path lookup in the global asset manifest
+  (`getGuidForPath(path) ?? newGuid()`). That misses whenever `registerAsset` re-registers
+  the same guid under a different path string, since it evicts the stale `pathToGuid` entry
+  — an ordinary manifest rescan is enough. A miss **mints**, which silently dangles every
+  reference to the scene: measured on `tropical-island.json`, whose `project.config.json`
+  entry and a unit test both named the old guid (2026-07-30). The manifest lookup survives
+  only as a fallback for a serialize with no live load behind it.
+
+  Gate: `engine/packages/modoki/tests/editor/sceneIdStability.test.ts` — including a v9→v12
+  migration that must change *only* the format, and a reproduction of the manifest eviction.
 - **Entity order for a carried scene now matches a cold load** — the carry snapshot's
   respawn order used to be its subtree-descent (BFS) order;
   `snapshotPersistentEntities` now sorts its entries by ecs id, which on a cold load
@@ -252,7 +330,7 @@ that:
 
 The regression gate is `engine/packages/modoki/tests/editor/scenePathIndependence.test.ts`:
 with real `sceneManager.loadScene` + real `serializeScene`, a scene's serialized output
-— entities, `rootInstanceId`s and `createdAt` — must be **identical** whether it
+— entities, `rootInstanceId`s, `id` and `createdAt` — must be **identical** whether it
 arrived via a cold chain load or a carried swap, for the base and the primary alike,
 and repeated cycles must be deterministic.
 
@@ -395,6 +473,22 @@ Two consumers:
   is a live bug (`getTime` is `queryFirst` while `timeSystem` is
   `query().updateEach`, so every read gets an arbitrary winner and `setJournalTick`
   fires twice a frame).
+- **The materialized Time singleton is tagged `Transient`, so it is never saved.** It has
+  to exist in the world (systems reading delta are no-ops without it) but it was never
+  authored, so writing it back would GROW whatever scene is saved next by one entity —
+  measured on `ui-focus-demo.json`, 9 → 10, a direct counter-example to "a no-op save is a
+  no-op". It was not even confined to the primary: serialize's foreign-entity filter skips
+  any entity without `EntityAttributes`, and this one has none, so it landed in a shared
+  **base** just as readily.
+
+  A scene may still **author** its own Time — hosting the resource in a shared base scene
+  is a supported setup, and it is why `timeScale` is deliberately not marked `runtimeOnly`.
+  A Time that came from a file carries no `Transient` tag and serializes normally.
+  **Provenance is the only workable discriminator**: an authored Time sitting at the
+  default `timeScale` is byte-identical to the materialized one, so no value-based rule
+  could tell them apart without deleting the authored one. (`Input` needs no tag — it is
+  simply not in the trait registry.) Gate:
+  `engine/packages/modoki/tests/editor/timeResourceProvenance.test.ts`.
 - **Override marks are WORLD-scoped, not per-`loadSceneFile`-call.** A chain loads N
   scene files into ONE staging world, so a per-call `clearAllOverrideMarks()` has the
   primary wipe the marks the base just seeded — on *every* chain load, carry or not.
@@ -519,9 +613,10 @@ subset) — otherwise a field absent from the Inspector's curated set (e.g.
 
 ## Scene validation (warn-but-load)
 
-`runtime/scene/sceneValidation.ts` (`validateSceneData(data, schema?)`) is a
+`runtime/loaders/sceneValidation.ts` (`validateSceneData(data, schema?)`) is a
 **pure, dependency-light** validator — it imports only the predicate helpers
-from `runtime/loaders/assetRefRules.ts` (which have zero imports), so it runs
+from `runtime/core/assetRefRules.ts` (which have zero imports) and `isSizeInert`
+from `runtime/ui/anchorLayout.ts` (whose only import is a type), so it runs
 unchanged in the browser AND in Node (the dev server). It **never throws and
 never blocks**: it returns `{ warnings: string[], schemaApplied: boolean }` and
 the loader always continues. The design is deliberately forgiving — a single
@@ -551,7 +646,7 @@ type checks (`schemaAvailable:false`). A `TraitSchema` is `{ category:
 field whose `type` is omitted is *known* (won't be flagged as unknown) but is not
 type-checked — used for object/array fields the registry can't confidently type.
 
-Findings come from three passes:
+Findings come from four passes:
 
 1. **Schema-dependent trait/field checks** — unknown trait, unknown field, type
    mismatch (`number`/`string`/`boolean`/`color`/`enum`/`entityRef`/`bindings`/`materialOverrides`),
@@ -571,6 +666,59 @@ Findings come from three passes:
    numeric file id; `''`/`0` = root), dangling `UIAction.bindings[].target`
    entity refs, and a `PrefabInstance` whose `source` is its own guid
    (self-recursion).
+4. **Cross-trait semantic checks** (schema-independent) — a trait value that is
+   well-formed on its own but can never take effect given a SIBLING trait. Today
+   that is `UIElement.width`/`height` on an axis the entity's `UIAnchor`
+   stretches: the offsets size that axis and overwrite the authored value, so it
+   is stored, displayed, and inert (the rule itself lives in
+   [ui-system.md](./ui-system.md); the shared predicate is `isSizeInert`).
+
+   This pass is where a **noise budget** matters most, because unlike the passes
+   above it flags data that is not malformed. Two values are excluded as neutral:
+   `0` (the unset default every `UIElement` carries) and `100%` ("fill the
+   parent", which agrees with what stretch does and is what the editor writes for
+   a stretched element). Measured before narrowing it: without those exclusions
+   the check fired **102 times across `games/` + `demos/` against 3 real
+   findings** — a ratio that trains people to ignore the channel. A new check
+   here should be held to the same bar. Known limit: `100%` is let through even
+   under insetting offsets, where the true extent is smaller; tightening that
+   needs viewport math the validator does not have.
+
+   **Three places it can be authored, and each reports from a different entry point** — the trap
+   is one rule but the *attribution* differs, which is why there is no single pass for it:
+
+   | Shape | Reported by |
+   |---|---|
+   | A plain scene entity carrying both traits | this pass, against the scene |
+   | A prefab instance's scene-side `overrides` | this pass, against the scene |
+   | **Inside the `.prefab.json` itself** | `validatePrefabData` — *not* this pass |
+
+   The third is separate on purpose. A size authored in the prefab file belongs to the prefab and
+   every instance inherits it, so reporting it from the scene side would name the wrong file
+   (`main.json` for a value in `thing.prefab.json`) and then repeat it per instance — one bad
+   prefab in 6 scenes at 4 instances each is 24 warnings for a single mistake. It is reported
+   instead at prefab **write** time (Apply-to-Prefab / Save-as-Prefab, via
+   `warnInertPrefabSizes`), which reaches the person who just authored it, and by a repo-wide
+   guard (`engine/tests/assets/prefabInertSize.test.ts`) that also covers prefabs written by hand
+   or by an agent — which no editor hook can see. `GET /api/validate-prefab?path=…` exposes the
+   same check so an agent editing prefab JSON can verify its own edit. All four share the one
+   `inertSizeWarnings` predicate, so the rule and its noise budget cannot drift between them.
+
+   The write-time hook deliberately does NOT live in `writePrefabFile`: that is also the undo/redo
+   restore path (`installPrefabSnapshot`), and warning there would fire while someone *reverts*
+   the value.
+
+   The same check also covers a **prefab instance's overridden fields**, which
+   live in the serialized entity's sibling `overrides` object (keyed by prefab
+   `localId` → trait → field), not in `traits` — so it needs the `.prefab.json`
+   the instance's `PrefabInstance.source` points at to see an anchor or size that
+   comes from the prefab rather than the override itself. Because
+   `validateSceneData` stays I/O-free, that lookup is an optional third
+   `getPrefab` parameter the CALLER injects (the dev-server routes read the file
+   off disk; the browser hot-reload path reads the runtime's already-loaded
+   prefab cache). Omitted, or the prefab can't be resolved, the check simply
+   stays silent on that instance — a conservative false negative, never a wrong
+   claim.
 
 `REF_FIELDS_BY_TRAIT` is the **single source of truth for scalar ref fields** —
 `editor/scene/serialize.ts` imports it for its save-time guard and the build

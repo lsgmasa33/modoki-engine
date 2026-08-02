@@ -465,7 +465,7 @@ export default function SkinEditor() {
     if (!sel) return;
     const guid = getGuidForPath(sel.path);
     if (!guid) return;
-    let dims: { width: number; height: number } | null = null;
+    let dims: { width: number; height: number } | null;
     let maskUrl = assetUrl(sel.path);
     let rect: { x: number; y: number; w: number; h: number } | undefined;
     const entry = getAssetEntry(guid);

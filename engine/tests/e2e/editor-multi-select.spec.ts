@@ -24,7 +24,7 @@ test('⌘/Ctrl-click builds a multi-selection and the Inspector shows shared tra
   // Modifier-click adds the second entity to the set.
   await page.getByText('OffsetSphere', { exact: true }).click({ modifiers: ['ControlOrMeta'] });
   await expect.poll(async () => (await selectedIds(page)).slice().sort((a, b) => a - b))
-    .toEqual([cube, sphere].sort((a, b) => a - b));
+    .toEqual([cube!, sphere!].sort((a, b) => a - b));
 
   // Header reflects the count, and the shared Transform renders — with y (0 vs 8)
   // shown as the mixed placeholder (the trait read lands a tick after the header).

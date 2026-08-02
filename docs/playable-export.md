@@ -3,8 +3,9 @@
 A `VITE_PLAYABLE=1` build that collapses one game into a single self-contained `index.html`
 (≤ `build.playableMaxBytes`, default 5 MB) for ad networks (AppLovin/ironSource) — fully **offline**
 (no network), loaded in a strict ad webview, gated by an injected `window.mraid`. Trigger it from the
-editor's **Build → Playable Ad**, or `MODOKI_PROJECT=games/<id> VITE_PLAYABLE=1 npm run build` →
-`games/<id>/ads/index.html`. (Grew out of the `advideo-playable-export-plan` tracker, now landed.)
+editor's **Build → Playable Ad**, or `MODOKI_PROJECT=games/<id> npm run build -- --target playable` →
+`games/<id>/ads/index.html` (`--target` sets `VITE_PLAYABLE=1` itself — passing it directly instead
+of `--target playable` is refused, #40). (Grew out of the `advideo-playable-export-plan` tracker, now landed.)
 
 ## Key files
 
@@ -60,6 +61,12 @@ web builds too), but its headline win is fitting a game under the playable's 5 M
   DCEs the excluded SDK — the same mechanism the debug menu + journal use.
 - **UI**: **Project Settings → Rendering & Physics → Engine Modules** — a tri-state **Auto | On | Off** per
   module (`ModuleTogglesEditor`, the `'module-toggles'` field), persisted through `/api/project-settings`.
+- **Also readable at runtime, by the editor itself.** `resolveModules` isn't build-only anymore: the running
+  editor's dev-server backend exposes `GET /api/build-modules`, which reuses this exact resolution (real
+  `projectRoot`, not the always-all-true `null` the editor's own Vite build passes) so the browser-side
+  editor can ask "does this project actually render 3D?" — used to suppress a renderer-health warning for
+  2D/UI-only projects that never mount a 3D viewport (see
+  [editor.md](./editor.md#createeditor--host-configuration)).
 
 ## Gotchas (the load-bearing, hard-won ones)
 

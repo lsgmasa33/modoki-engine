@@ -21,7 +21,7 @@ describe('SCENE_FORMAT_VERSION sync', () => {
     if (!m) throw new Error('SCENE_FORMAT_VERSION not found in version.ts');
     const engine = Number(m[1]);
 
-    const scene = JSON.parse(readFileSync(path.join(root, 'templates/starter/runtime/assets/scenes/main.json'), 'utf8'));
+    const scene = JSON.parse(readFileSync(path.join(root, 'templates/starter/runtime/assets/scenes/main.scene.json'), 'utf8'));
     expect(scene.version).toBe(engine);
   });
 });

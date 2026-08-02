@@ -10,6 +10,7 @@
  *  on a slow interval so live gameplay changes show without a per-frame cost. */
 
 import { useEffect, useMemo, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react';
+import { fillRootStyle } from '../tabLayout';
 import { getAllEntities, buildEntityTree, onStructureDirty, getStructureVersion, readTraitData, writeTraitField, type EntityInfo } from '../../core/ecs/entityUtils';
 import { getTraitByName, type TraitMeta, type FieldHint } from '../../core/ecs/traitRegistry';
 
@@ -47,8 +48,11 @@ export function WorldTab() {
     });
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-      <div style={treeBoxStyle}>
+    <div style={fillRootStyle()}>
+      {/* Tree and inspector SPLIT the body: tree-only takes the whole height, and with
+          a selection each half scrolls independently — so the inspector never pushes
+          the tree off-screen and neither sits in a fixed-height box. */}
+      <div style={{ ...treeBoxStyle, flex: selectedId != null ? '1 1 45%' : 1 }}>
         {tree.length === 0 ? (
           <div style={mutedStyle}>No entities in the world.</div>
         ) : (
@@ -241,7 +245,7 @@ export function formatValue(v: unknown): string {
 // --- styles ----------------------------------------------------------------
 
 const treeBoxStyle: CSSProperties = {
-  maxHeight: 200,
+  minHeight: 0,
   overflowY: 'auto',
   border: '1px solid rgba(255,255,255,0.08)',
   borderRadius: 6,
@@ -252,7 +256,7 @@ const rowStyle: CSSProperties = { display: 'flex', alignItems: 'center', gap: 4,
 const rowSelectedStyle: CSSProperties = { background: 'rgba(99,102,241,0.35)' };
 const caretStyle: CSSProperties = { width: 12, color: '#8b8ba7', flexShrink: 0, textAlign: 'center' };
 const layerBadge: CSSProperties = { fontSize: 9, textTransform: 'uppercase', letterSpacing: 0.4, flexShrink: 0 };
-const inspectorBoxStyle: CSSProperties = { display: 'flex', flexDirection: 'column', gap: 8 };
+const inspectorBoxStyle: CSSProperties = { display: 'flex', flexDirection: 'column', gap: 8, flex: '1 1 55%', minHeight: 0, overflowY: 'auto' };
 const inspectorHeaderStyle: CSSProperties = { fontSize: 13, fontWeight: 600, color: '#e6e6ff', paddingBottom: 2, borderBottom: '1px solid rgba(255,255,255,0.08)' };
 const traitStyle: CSSProperties = { display: 'flex', flexDirection: 'column', gap: 3 };
 const traitNameStyle: CSSProperties = { fontSize: 11, fontWeight: 700, color: '#a5b4fc', textTransform: 'uppercase', letterSpacing: 0.4 };

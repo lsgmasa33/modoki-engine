@@ -42,7 +42,7 @@ function spawnNested(w: TestWorld) {
   return { parent, child };
 }
 
-const phasesOf = (evs: { payload: unknown }[]) => evs.map((e) => (e.payload as { phase: string }).phase);
+const phasesOf = (evs: { payload?: unknown }[]) => evs.map((e) => (e.payload as { phase: string }).phase);
 const bySeq = (w: TestWorld, guid: string) => w.events({ type: '@sequence' }).filter((e) => (e.payload as { director: string }).director === guid);
 
 describe('sub-directors (nested timelines)', () => {

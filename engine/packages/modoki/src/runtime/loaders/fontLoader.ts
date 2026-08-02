@@ -20,6 +20,13 @@ const loadedPaths = new Set<string>();
  *  Rejected loads are evicted (not cached permanently) so a failure can be retried. */
 const loading = new Map<string, Promise<string>>();
 
+/** Filename without its directory. Hand-rolled rather than `node:path` — this module runs in the
+ *  BROWSER, and it is called with native fs paths at build time too, so both separators count
+ *  (same reasoning as `parseFontFilename`). */
+function basename(path: string): string {
+  return path.slice(Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\')) + 1);
+}
+
 async function doLoadFont(path: string): Promise<string> {
   const info = parseFontFilename(path);
   // QUOTE the CSS url() — an unquoted url() breaks on a SPACE (or other CSS-special
@@ -39,13 +46,31 @@ async function doLoadFont(path: string): Promise<string> {
   if (!variants) {
     loadedFonts.set(info.family, [info]);
   } else {
-    // Warn on a (weight, style) collision within the same family: a second file
-    // normalizing to identical CSS coordinates means last-added wins in the browser.
-    if (variants.some(v => v.weight === info.weight && v.style === info.style)) {
-      console.warn(
-        `[FontLoader] Family "${info.family}" already has a ${info.weight} ${info.style} variant; ` +
-          `"${path}" collides and the browser will use the last-added one`,
-      );
+    // A (weight, style) collision within the same family means last-added wins in the browser.
+    // TWO KINDS, and only one is a problem:
+    //   - DIFFERENT files normalizing to the same CSS coordinates — a real ambiguity, because which
+    //     typeface you get depends on load order. Worth a warning.
+    //   - THE SAME font file shipped twice under different paths — most often a game carrying its own
+    //     copy of one of the engine's bundled families. `loadAllFonts` loads every `font` asset in
+    //     the manifest, engine and game alike, so this is expected rather than wrong: identical bytes
+    //     mean last-added-wins picks the same typeface either way. Warning here trained people to
+    //     ignore a warning that CAN matter.
+    // Basename is the discriminator: same filename => same font shipped twice.
+    const clash = variants.find(v => v.weight === info.weight && v.style === info.style);
+    if (clash) {
+      const sameFile = basename(clash.path) === basename(path);
+      const detail = `Family "${info.family}" already has a ${info.weight} ${info.style} variant`;
+      if (sameFile) {
+        console.log(
+          `[FontLoader] ${detail}; "${path}" is the SAME font file as "${clash.path}" ` +
+            `(a duplicate copy — harmless, but the game could drop its own and use the engine's)`,
+        );
+      } else {
+        console.warn(
+          `[FontLoader] ${detail}; "${path}" is a DIFFERENT file that collides — which typeface ` +
+            `wins depends on load order. Rename one so they resolve to distinct families.`,
+        );
+      }
     }
     variants.push(info);
   }

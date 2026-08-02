@@ -44,6 +44,17 @@ const Library = trait(() => ({
   boneMaps: {} as Record<string, Record<string, string>>,
 }));
 
+// SoA trait with persistent fields the Inspector does NOT list — mirrors Animator,
+// whose `clips` bank + active `clip` belong to a custom Inspector section and so are
+// absent from meta.fields BY DESIGN. The old `field in meta.fields` gate here dropped
+// them on every load, and the next save then wrote the schema default back over the
+// authored value (`skinned-test.json`, 2026-07-31).
+const Player = trait({
+  clips: '[]' as string,
+  clip: '' as string,
+  speed: 1,
+});
+
 let testWorld: ReturnType<typeof createWorld>;
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
@@ -61,6 +72,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
     { name: 'Rotate3D', trait: Rotate3D, category: 'component', fields: { axis: 'y', speed: 1 } },
     { name: 'Disabled', trait: Disabled, category: 'tag', fields: {} },
     { name: 'Library', trait: Library, category: 'component', fields: { retarget: false } },
+    { name: 'Player', trait: Player, category: 'component', fields: { speed: 1 } },
   ];
   return {
     getAllTraits: () => traits,
@@ -232,6 +244,64 @@ describe('instantiatePrefabIntoWorld with overrides', () => {
     expect(lib.retarget).toBe(true);
     expect(lib.animSets).toEqual(['s1']);
     expect(lib.boneMaps).toEqual({ s1: { joint1: 'bone1' } });
+  });
+
+  it('applies an ADDED SoA trait override whose fields are absent from meta.fields', async () => {
+    const { instantiatePrefabIntoWorld } = await getLoader();
+    const prefab = {
+      rootLocalId: 1,
+      entities: [
+        { localId: 1, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Cone', parentId: 0 } } },
+      ],
+    };
+    const BANK = '[{"name":"skin","clip":"f1cc3b85"}]';
+    instantiatePrefabIntoWorld(testWorld, prefab, 0, undefined, 'pkg/test.prefab.json', {
+      1: { Player: { clips: BANK, clip: 'skin', speed: 2 } },
+    });
+
+    const root = findEntityByLocalId(testWorld, 1) as unknown as { has(t: unknown): boolean; get(t: unknown): Record<string, unknown> };
+    expect(root.has(Player)).toBe(true);
+    const p = root.get(Player);
+    expect(p.clips).toBe(BANK);   // NOT dropped as "unknown field"
+    expect(p.clip).toBe('skin');
+    expect(p.speed).toBe(2);
+  });
+
+  it('applies SoA fields absent from meta.fields onto an EXISTING trait override', async () => {
+    const { instantiatePrefabIntoWorld } = await getLoader();
+    const prefab = {
+      rootLocalId: 1,
+      entities: [
+        // The prefab DOES define Player (with its own bank); the instance overrides it.
+        { localId: 1, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Cone', parentId: 0 }, Player: { clips: '[{"name":"idle"}]', clip: 'idle', speed: 1 } } },
+      ],
+    };
+    instantiatePrefabIntoWorld(testWorld, prefab, 0, undefined, 'pkg/test.prefab.json', {
+      1: { Player: { clip: 'skin' } },
+    });
+
+    const root = findEntityByLocalId(testWorld, 1) as unknown as { get(t: unknown): Record<string, unknown> };
+    const p = root.get(Player);
+    expect(p.clip).toBe('skin');                    // overridden
+    expect(p.clips).toBe('[{"name":"idle"}]');      // untouched prefab base
+  });
+
+  it('still skips a SoA key the schema does not define (stale field in an old file)', async () => {
+    const { instantiatePrefabIntoWorld } = await getLoader();
+    const prefab = {
+      rootLocalId: 1,
+      entities: [
+        { localId: 1, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Cone', parentId: 0 }, Player: { clip: 'idle' } } },
+      ],
+    };
+    instantiatePrefabIntoWorld(testWorld, prefab, 0, undefined, 'pkg/test.prefab.json', {
+      1: { Player: { clip: 'skin', wasRenamedAway: 7 } },
+    });
+
+    const root = findEntityByLocalId(testWorld, 1) as unknown as { get(t: unknown): Record<string, unknown> };
+    const p = root.get(Player);
+    expect(p.clip).toBe('skin');            // the real field still lands
+    expect(p.wasRenamedAway).toBeUndefined(); // the stale one is dropped, as before
   });
 
   it('ADDS a tag trait the prefab child lacks (added-tag override)', async () => {

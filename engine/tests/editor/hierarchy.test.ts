@@ -12,7 +12,7 @@ describe('entity hierarchy', () => {
   it('entities with parentId=0 are roots', () => {
     const parent = getCurrentWorld().spawn(
       Transform({ x: 0, y: 0, z: 0 }),
-      Renderable3D({ mesh: 'root-entity', color: 0xffffff, size: 1 }),
+      Renderable3D({ mesh: 'root-entity' }),
       EntityAttributes({ name: 'root-entity', parentId: 0, layer: '3d' }),
     );
 
@@ -24,12 +24,12 @@ describe('entity hierarchy', () => {
   it('child entities reference parent via parentId', () => {
     const parent = getCurrentWorld().spawn(
       Transform({ x: 0, y: 0, z: 0 }),
-      Renderable3D({ mesh: 'parent-mesh', color: 0xff0000, size: 1 }),
+      Renderable3D({ mesh: 'parent-mesh' }),
       EntityAttributes({ name: 'parent-mesh', layer: '3d' }),
     );
     const child = getCurrentWorld().spawn(
       Transform({ x: 1, y: 0, z: 0 }),
-      Renderable3D({ mesh: 'child-mesh', color: 0x00ff00, size: 0.5 }),
+      Renderable3D({ mesh: 'child-mesh' }),
       EntityAttributes({ name: 'child-mesh', layer: '3d', parentId: parent.id() }),
     );
 
@@ -41,17 +41,17 @@ describe('entity hierarchy', () => {
   it('buildEntityTree nests children under parents', () => {
     const parent = getCurrentWorld().spawn(
       Transform({ x: 0, y: 0, z: 0 }),
-      Renderable3D({ mesh: 'tree-parent', color: 0xff0000, size: 1 }),
+      Renderable3D({ mesh: 'tree-parent' }),
       EntityAttributes({ name: 'tree-parent', layer: '3d' }),
     );
     const child1 = getCurrentWorld().spawn(
       Transform({ x: 1, y: 0, z: 0 }),
-      Renderable3D({ mesh: 'tree-child-1', color: 0x00ff00, size: 0.5 }),
+      Renderable3D({ mesh: 'tree-child-1' }),
       EntityAttributes({ name: 'tree-child-1', layer: '3d', parentId: parent.id() }),
     );
     const child2 = getCurrentWorld().spawn(
       Transform({ x: 2, y: 0, z: 0 }),
-      Renderable3D({ mesh: 'tree-child-2', color: 0x0000ff, size: 0.5 }),
+      Renderable3D({ mesh: 'tree-child-2' }),
       EntityAttributes({ name: 'tree-child-2', layer: '3d', parentId: parent.id() }),
     );
 
@@ -72,7 +72,7 @@ describe('entity hierarchy', () => {
   it('buildEntityTree: orphaned children (invalid parentId) become roots', () => {
     const orphan = getCurrentWorld().spawn(
       Transform({ x: 0, y: 0, z: 0 }),
-      Renderable3D({ mesh: 'orphan-entity', color: 0xaaaaaa, size: 1 }),
+      Renderable3D({ mesh: 'orphan-entity' }),
       EntityAttributes({ name: 'orphan-entity', layer: '3d', parentId: 999999 }),
     );
 
@@ -87,17 +87,17 @@ describe('entity hierarchy', () => {
   it('buildEntityTree: deep nesting (grandchildren)', () => {
     const root = getCurrentWorld().spawn(
       Transform({ x: 0, y: 0, z: 0 }),
-      Renderable3D({ mesh: 'deep-root', color: 0xff0000, size: 1 }),
+      Renderable3D({ mesh: 'deep-root' }),
       EntityAttributes({ name: 'deep-root', layer: '3d' }),
     );
     const child = getCurrentWorld().spawn(
       Transform({ x: 1, y: 0, z: 0 }),
-      Renderable3D({ mesh: 'deep-child', color: 0x00ff00, size: 0.5 }),
+      Renderable3D({ mesh: 'deep-child' }),
       EntityAttributes({ name: 'deep-child', layer: '3d', parentId: root.id() }),
     );
     const grandchild = getCurrentWorld().spawn(
       Transform({ x: 2, y: 0, z: 0 }),
-      Renderable3D({ mesh: 'deep-grandchild', color: 0x0000ff, size: 0.25 }),
+      Renderable3D({ mesh: 'deep-grandchild' }),
       EntityAttributes({ name: 'deep-grandchild', layer: '3d', parentId: child.id() }),
     );
 

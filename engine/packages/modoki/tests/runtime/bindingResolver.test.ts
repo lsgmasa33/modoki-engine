@@ -3,7 +3,7 @@
 import { describe, it, expect } from 'vitest';
 
 async function getBindingResolver() {
-  return import('../../../src/runtime/ui/bindingResolver');
+  return import('../../src/runtime/ui/bindingResolver');
 }
 
 describe('bindingResolver', () => {

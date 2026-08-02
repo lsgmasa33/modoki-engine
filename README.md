@@ -105,7 +105,7 @@ npm run dev            # Vite dev server; the editor opens your last / a new pro
 - **Editor:** http://localhost:5173/#/editor
 - **New project:** File → New Project scaffolds a runnable hello-world from the built-in starter
   template (`engine/templates/starter`).
-- **Build a game to web:** `MODOKI_PROJECT=path/to/project npm run build`
+- **Build a game to web:** `MODOKI_PROJECT=path/to/project npm run build -- --target web`
 - **Native iOS/Android** builds run from a project directory via the editor's Build menu.
 
 Full documentation: **https://modoki-engine.com/docs**

@@ -7,7 +7,7 @@
 
 import { resolveRef, isGuid, registerAsset } from './assetManifest';
 import { assetUrl } from './assetUrl';
-import { ASSET_FETCH_INIT } from './assetFetch';
+import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { normalizeAnimationClip, type AnimationClipDef } from '../animation/types';
 
 const cache = new Map<string, AnimationClipDef>();
@@ -23,19 +23,24 @@ function clipCacheKey(refOrPath: string): string | undefined {
 }
 
 /** Resolve a clip ref to its parsed definition, or null if not yet loaded. */
-export function getAnimationClip(ref: string): AnimationClipDef | null {
+export function getAnimationClip(ref: string, opts?: { load?: boolean }): AnimationClipDef | null {
   if (!ref) return null;
   const path = clipCacheKey(ref);
   if (!path) return null;
   const hit = cache.get(path);
   if (hit) return hit;
   if (failed.has(path)) return null;
+  // `load:false` — PEEK the cache without starting a fetch. For callers whose contract is "what is
+  // in the live cache right now" (the `read-asset-def` agent op): the default getter treats a miss
+  // as "not loaded YET" and kicks off a background load, so asking about an absent asset queued a
+  // fetch that could only fail, and logged a warning into the human's console for a question the
+  // caller had already decided to answer with a refusal.
+  if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const gen = generation;
     const p = fetch(assetUrl(path), ASSET_FETCH_INIT)
       .then((r) => {
-        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-        return r.json();
+        return parseAssetJson(r, path);
       })
       .then((json) => {
         if (gen !== generation) return;       // scene swap mid-flight

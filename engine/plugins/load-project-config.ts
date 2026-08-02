@@ -10,8 +10,91 @@ import {
   PROJECT_CONFIG_FILENAME,
   PROJECT_USER_CONFIG_FILENAME,
   type ProjectConfig,
+  type ProjectConfigIssue,
   type ProjectUserConfig,
+  type RawProjectConfig,
 } from '../project-config';
+
+/** Thrown by the raw readers when a config file EXISTS but does not parse. The
+ *  loaders treat that as "use defaults" and carry on, which is right for reading —
+ *  but a WRITE must not: the raw read is the base a patch merges onto, so treating
+ *  a malformed file as `{}` would quietly replace the author's whole config with
+ *  whatever section they happened to be editing. These files are committed JSON a
+ *  human edits by hand, so a typo + a later Save is a real path to losing it. */
+export class MalformedProjectConfigError extends Error {
+  // Explicit fields, not constructor parameter properties — the build runs with
+  // `erasableSyntaxOnly`, which rejects those.
+  readonly file: string;
+  readonly detail: unknown;
+  constructor(file: string, detail: unknown) {
+    super(`${path.basename(file)} exists but is not valid JSON (${String(detail)}). ` +
+      'Fix the file by hand — refusing to save, because saving would overwrite it.');
+    this.name = 'MalformedProjectConfigError';
+    this.file = file;
+    this.detail = detail;
+  }
+}
+
+/** Read a config file as RAW parsed JSON — the subset the project actually
+ *  recorded, NOT merged over the defaults. This is what a write-time merge must
+ *  start from, so an edit that omits a section leaves that section as the file had
+ *  it (absent stays absent) instead of resurrecting it as a default.
+ *
+ *  A MISSING file is `{}` (a project that never had one). A file that exists but is
+ *  malformed THROWS — see {@link MalformedProjectConfigError}. */
+function readRawConfig(root: string, filename: string): RawProjectConfig {
+  const file = path.join(root, filename);
+  if (!fs.existsSync(file)) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    throw new MalformedProjectConfigError(file, e);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new MalformedProjectConfigError(file, 'top-level value is not a JSON object');
+  }
+  return parsed as RawProjectConfig;
+}
+
+/** Raw (unmerged) <root>/project.config.json — see {@link readRawConfig}. Throws
+ *  {@link MalformedProjectConfigError} if the file exists but does not parse. */
+export function readRawProjectConfig(root: string = process.cwd()): RawProjectConfig {
+  return readRawConfig(root, PROJECT_CONFIG_FILENAME);
+}
+
+/** Raw (unmerged) <root>/project.user.json — see {@link readRawProjectConfig}. */
+export function readRawProjectUserConfig(root: string = process.cwd()): RawProjectConfig {
+  return readRawConfig(root, PROJECT_USER_CONFIG_FILENAME);
+}
+
+/** Which of the two config files EXIST but do not parse, as display-ready
+ *  messages. Empty = both are fine (or absent, which is fine too).
+ *
+ *  This exists because the read and write paths disagree ON PURPOSE — reading a
+ *  malformed file falls back to the defaults so the editor still opens, while
+ *  writing refuses (see {@link MalformedProjectConfigError}). Individually right;
+ *  together they hand the Project Settings dialog a screen full of engine defaults
+ *  that LOOK like the project's values (measured on games/sling: Bundle ID read
+ *  `com.modokiengine.prototype`, the retired pre-#29 shared identity). The save
+ *  refusal protects the file, but only once you press Apply — someone can read
+ *  those fields, believe them, and act on them without ever saving. So the READ
+ *  path has to say it fell back, which is what this reports. */
+export function readProjectConfigParseErrors(root: string = process.cwd()): { file: string; message: string }[] {
+  const errors: { file: string; message: string }[] = [];
+  for (const [filename, read] of [
+    [PROJECT_CONFIG_FILENAME, readRawProjectConfig],
+    [PROJECT_USER_CONFIG_FILENAME, readRawProjectUserConfig],
+  ] as const) {
+    try {
+      read(root);
+    } catch (e) {
+      if (e instanceof MalformedProjectConfigError) errors.push({ file: filename, message: e.message });
+      else throw e;
+    }
+  }
+  return errors;
+}
 
 /** Read <root>/project.config.json and merge it over the defaults. A missing
  *  file or unparseable JSON falls back to the defaults. */
@@ -27,8 +110,40 @@ export function loadProjectConfig(root: string = process.cwd()): ProjectConfig {
   return mergeProjectConfig(null);
 }
 
-/** Write the config to <root>/project.config.json as pretty JSON. */
-export function writeProjectConfig(config: ProjectConfig, root: string = process.cwd()): void {
+/**
+ * Out-of-union values in `<root>/project.config.json`, as build-blocking error strings (#39).
+ *
+ * Why this exists as a SEPARATE pass from `validateBuildConfig`: that function receives the
+ * already-RESOLVED config, and resolution has by then coerced every bad value to its default —
+ * so the offending value is simply not there to complain about. The only way to report it is to
+ * re-resolve from the raw file with an issue collector attached, which is what this does.
+ *
+ * Load stays forgiving on purpose (coerce + warn) so a typo cannot make a project un-openable in
+ * the editor; the BUILD is where it becomes fatal. That split is the point: the failure mode this
+ * closes is a `capacitor.orientation` typo shipping rotation unlocked to the store, and the build
+ * is the last moment anyone can catch it. Owner's call, #39.
+ */
+export function projectConfigUnionErrors(root: string = process.cwd()): string[] {
+  const file = path.join(root, PROJECT_CONFIG_FILENAME);
+  let raw: unknown;
+  try {
+    if (!fs.existsSync(file)) return [];
+    raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    // An unparseable file is not THIS check's business — loadProjectConfig already warns and
+    // falls back, and reporting it here would duplicate that as a build error with worse wording.
+    return [];
+  }
+  const issues: ProjectConfigIssue[] = [];
+  mergeProjectConfig(raw as Partial<ProjectConfig>, { issues });
+  return issues.map((i) => `${i.path} is ${JSON.stringify(i.value)} — must be one of `
+    + `${i.allowed.map((a) => JSON.stringify(a)).join(' | ')}`);
+}
+
+/** Write the config to <root>/project.config.json as pretty JSON. Takes a PARTIAL
+ *  (pruned) config on purpose — the file records only what the project chose; see
+ *  the file-stays-minimal invariant in project-config.ts. */
+export function writeProjectConfig(config: RawProjectConfig | ProjectConfig, root: string = process.cwd()): void {
   const file = path.join(root, PROJECT_CONFIG_FILENAME);
   fs.writeFileSync(file, JSON.stringify(config, null, 2) + '\n');
 }
@@ -48,8 +163,9 @@ export function loadProjectUserConfig(root: string = process.cwd()): ProjectUser
   return mergeProjectUserConfig(null);
 }
 
-/** Write the per-machine settings to <root>/project.user.json. */
-export function writeProjectUserConfig(user: ProjectUserConfig, root: string = process.cwd()): void {
+/** Write the per-machine settings to <root>/project.user.json. Partial, same
+ *  rationale as {@link writeProjectConfig}. */
+export function writeProjectUserConfig(user: RawProjectConfig | ProjectUserConfig, root: string = process.cwd()): void {
   const file = path.join(root, PROJECT_USER_CONFIG_FILENAME);
   fs.writeFileSync(file, JSON.stringify(user, null, 2) + '\n');
 }
