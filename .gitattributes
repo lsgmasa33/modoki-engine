@@ -1,0 +1,46 @@
+# Public-repo .gitattributes — line-ending pins ONLY.
+#
+# The private repo's .gitattributes is deliberately NOT shipped by
+# scripts/publish-engine-oss.sh: it git-LFS-tracks binaries (*.png, *.glb, *.hdr, *.ttf, …), and the
+# public CI does not fetch LFS, so shipping it would make every test read pointer text instead of a
+# binary. Public binaries are stored inline instead — simpler, and no LFS quota.
+#
+# But dropping the whole file also dropped the EOL normalisation, and that half matters on its own.
+# Without it the public repo falls back to `* text=auto`, so a Windows checkout (autocrlf=true is
+# the GitHub runner default) gets CRLF while our generators emit \n — and every
+# generated-vs-committed comparison fails with two strings that look IDENTICAL in the diff.
+#
+# That is not hypothetical: it is exactly how the private Windows CI leg failed on its first run
+# (the generated .codex/config.toml read as permanently stale), and it is how the PUBLIC Windows leg
+# failed on ITS first run — engine/tests/tools/toolCatalogSync.test.ts, comparing the generated MCP
+# tool catalog against docs/debug-tools-mcp.md.
+#
+# So: the EOL pins ship, the LFS filters do not. Keep this file free of `filter=lfs` lines.
+
+# Force LF for source files
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.mts text eol=lf
+*.cts text eol=lf
+*.json text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.md text eol=lf
+*.swift text eol=lf
+*.java text eol=lf
+*.kt text eol=lf
+*.kts text eol=lf
+*.podspec text eol=lf
+*.gradle text eol=lf
+*.rb text eol=lf
+*.xml text eol=lf
+*.plist text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Small binaries (kept in-tree, not LFS)
+*.ico binary

@@ -31,14 +31,15 @@ copyright: Copyright © 2026 Modoki
 
 # Auto-update feed (electron-updater). Generates app-update.yml (bundled into the
 # app, read at runtime to locate the feed) + latest-mac.yml (the feed manifest).
-# The feed is a PUBLIC GCS path (generic provider) — NOT GitHub Releases — because
-# the repo is private and electron-updater can't authenticate from a distributed
-# app against a private repo (every feed/asset request 404s, silently). The bucket
-# `modoki-www-site` is public-read; the release workflow gsutil-uploads
-# latest-mac.yml + the zip/blockmap here on a v* tag. The dmg for a FIRST install
-# is still attached to the GitHub Release (humans download it there); updates of an
-# already-installed editor come from this GCS feed. `npm run dist` uses `--publish
-# never`, so this only bakes WHERE to look into app-update.yml — it never uploads.
+# The feed is the PUBLIC repo's GitHub Releases. It used to be a public GCS bucket
+# (`generic` provider, gs://modoki-www-site/editor) for a reason that has since
+# expired: electron-updater cannot authenticate from a distributed app against a
+# PRIVATE repo, so while modoki was private every feed request would have 404'd
+# silently. `lsgmasa33/modoki-engine` is public now and IS the release source — the
+# site's Download button already points at its /releases/latest — so the bucket was
+# a second, hand-fed copy of what GitHub serves for free. It was deleted 2026-08-03.
+# `npm run dist` uses `--publish never`, so this only bakes WHERE to look into
+# app-update.yml — it never uploads.
 publish:
   provider: github
   owner: lsgmasa33

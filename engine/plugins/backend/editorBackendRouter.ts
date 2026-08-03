@@ -170,6 +170,10 @@ import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type Muta
 import { getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData, type AssetSchemaType } from '../../packages/modoki/src/runtime/assets/assetSchemas';
 import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
+import { tryDeviceCdpInput, isDeviceCdpAvailable, synthFallbackBanner, TRUSTED_CDP_MECHANISM } from './deviceCdp';
+import { tryDeviceWdaInput, isDeviceWdaAvailable, resetDeviceWdaSession, tryDeviceWdaScreenshot, TRUSTED_WDA_MECHANISM } from './deviceWda';
+import { isDeviceFailureReply } from './deviceAim';
+import { stopWda } from './wdaLauncher';
 import { resolveModules } from '../detect-modules';
 // Type-only — erased at runtime, so it does NOT pull the tree-shaker (and its
 // vite-asset-scanner import) into this host-agnostic router.
@@ -661,7 +665,25 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // pings + auto-reconnects; Claude's device_* tools proxy through the backend once connected.
   // See docs/debug-tools-mcp.md.
   if (urlPath === '/api/device/status' && method === 'GET') {
-    return json(deviceConnection.status());
+    const status = deviceConnection.status();
+    // The mechanism is a LIVE probe (#32 Phase 1), not a constant: only reported when a lease is
+    // actually connected (a disconnected lease has nothing to report a mechanism FOR — "a refusal
+    // carries no mechanism", the same rule the input handlers themselves follow). Android with a
+    // reachable CDP session → trusted-cdp; anything else (iOS, no adb, socket not found) →
+    // synthetic, the fallback every device_* input call still has.
+    if (status.state !== 'connected') return json(status);
+    // Pass the lease proxy so the probe exercises the WHOLE chain (CDP session AND an app build
+    // that answers `resolve-aim`), not just the half that is cheap to check — see the measured
+    // false claim documented on `isDeviceCdpAvailable`.
+    const proxy = (m: string, p: Record<string, unknown>) => deviceConnection.proxy(m, p);
+    if (await isDeviceCdpAvailable({ proxy })) return json({ ...status, inputMechanism: TRUSTED_CDP_MECHANISM });
+    // #32 Phase 2 — an iOS device has no CDP route but may have WebDriverAgent. Reported honestly:
+    // `trusted-wda` covers tap and drag ONLY, which is why the mechanism line names them rather than
+    // implying every op is trusted (press_key/scroll/hover stay synthetic on iOS — see deviceWda.ts).
+    if (await isDeviceWdaAvailable({ proxy, host: status.target?.host })) {
+      return json({ ...status, inputMechanism: TRUSTED_WDA_MECHANISM, trustedOps: ['tap', 'drag'] });
+    }
+    return json({ ...status, inputMechanism: 'synthetic' });
   }
   if (urlPath === '/api/device/connect' && method === 'POST') {
     const b = (body ?? {}) as ConnectRequest;
@@ -669,14 +691,108 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 500); }
   }
   if (urlPath === '/api/device/disconnect' && method === 'POST') {
+    // Decision 2 — WDA is attached UNDER the lease and torn down with it, so exactly one thing
+    // answers "who holds this device", and disconnecting can never strand a signed agent running
+    // on the phone. Done before the lease drops so a failure here still leaves the lease closable.
+    stopWda();
+    resetDeviceWdaSession();
     try { return json(await deviceConnection.disconnect()); }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 500); }
   }
   // Data plane: proxy a device request (eval/screenshot/tap/…) through Modoki's held lease socket.
+  // #32 Phase 1: for the five input methods CDP can route, try trusted injection FIRST — it
+  // resolves the aim through the page's `resolve-aim` op (over this SAME proxy) then dispatches
+  // host-side via CDP. `tryDeviceCdpInput` returns `null` for "not routable here" (wrong method,
+  // no CDP session, a genuine CDP failure) and the existing synthetic proxy path runs unchanged;
+  // it never throws, so this is purely an extra branch, not a new failure mode.
   if (urlPath === '/api/device/request' && method === 'POST') {
     const b = (body ?? {}) as { method?: string; params?: Record<string, unknown> };
     if (!b.method) return json({ error: 'method required' }, 400);
-    try { return json({ result: await deviceConnection.proxy(b.method, b.params ?? {}) }); }
+    try {
+      const proxy = (m: string, p: Record<string, unknown>) => deviceConnection.proxy(m, p);
+      // #102 — iOS out-of-app capture. The native path is the APP'S OWN capture, so a system dialog
+      // or springboard is invisible to it (it returns the app underneath, which reads as a fine
+      // screenshot of the wrong thing). WDA sees the whole screen. Two triggers, each covering what
+      // the other misses: an explicit `source:'wda'` (the only way to reach the dialog case, since
+      // that case does not make the native capture FAIL), and an automatic fallback when it errors.
+      if (b.method === 'screenshot') {
+        const wantsWda = (b.params as { source?: string } | undefined)?.source === 'wda';
+        const st = deviceConnection.status();
+        // The device's ADDRESS. `target` outlives the CONNECTED state — it is retained while the
+        // lease is merely `reconnecting` (measured) — which is exactly the window this feature
+        // needs. Deliberately NOT `lastTarget`: that survives an explicit `disconnect`, and
+        // reaching for a device the user has RELEASED is a different act from photographing one
+        // whose app happens to be suspended. (Tried it; it also broke the no-lease test by leaking
+        // a previous connection's address, which is the same bug wearing a test failure.)
+        const host = st.target?.host;
+        if (wantsWda) {
+          // GATE ON AN ADDRESS, NOT ON THE LEASE. MEASURED on the iPhone Air (2026-08-03): pressing
+          // home SUSPENDS the app, so the lease drops to 'reconnecting' and the native capture 502s
+          // — and that is precisely when you want the springboard picture. WDA needs no lease at
+          // all (it answers host-side on :8100), so gating this on `state === 'connected'` refused
+          // the feature in its motivating case. An earlier revision did exactly that; only a live
+          // run could show it, which is why this route is not unit-tests-only.
+          //
+          // With NO address, no device was ever connected — and there the canonical error is right:
+          // the WDA reason ("install it from Build Support") sends the reader to the wrong place,
+          // and the MCP's `caughtFailure` matches the "no device connected" PREFIX to build its
+          // device_connect/device_status envelope, which a WDA-flavoured message would lose.
+          if (!host) await deviceConnection.proxy('screenshot', {});
+          // Explicit ask pays the agent spin-up; a refusal must say why rather than quietly
+          // handing back a native capture the caller specifically did not want.
+          const shot = await tryDeviceWdaScreenshot({ host }, { autoLaunch: true });
+          return shot.handled ? json({ result: shot.reply }) : json({ error: shot.reason }, 409);
+        }
+        // The native capture fails two ways, and BOTH mean "the app could not photograph itself":
+        // the device answers an error string, or the lease is gone and the proxy throws (a crashed
+        // or suspended app — measured above). Neither auto-launches: a screenshot that silently
+        // costs a ~30s agent spin-up because the app died is worse than one that says why.
+        let native: unknown;
+        try {
+          native = await deviceConnection.proxy('screenshot', b.params ?? {});
+          if (!isDeviceFailureReply(native)) return json({ result: native });
+        } catch (e) {
+          const shot = await tryDeviceWdaScreenshot({ host });
+          if (shot.handled) return json({ result: { ...shot.reply, nativeCaptureFailed: String(e instanceof Error ? e.message : e) } });
+          throw e;   // nothing to add: the canonical lease error IS the right answer
+        }
+        const shot = await tryDeviceWdaScreenshot({ host });
+        if (shot.handled) return json({ result: { ...shot.reply, nativeCaptureFailed: String(native) } });
+        // Both paths failed: return the NATIVE error, which is the one the caller asked for. The
+        // WDA reason rides along so "why didn't the fallback save me" is answerable without a
+        // second call.
+        return json({ result: native, wdaFallbackUnavailable: shot.reason });
+      }
+      let outcome = await tryDeviceCdpInput(b.method, b.params ?? {}, { proxy });
+      // #32 Phase 2: no CDP route (an iOS device, or an Android one without adb) ⇒ try
+      // WebDriverAgent before giving up on trusted input. Only tap/drag are routable on iOS — the
+      // other ops have no faithful trusted equivalent there (see deviceWda.ts's header), so they
+      // fall through to synthetic WITH the banner, exactly as before.
+      if (!outcome.handled) {
+        const wda = await tryDeviceWdaInput(b.method, b.params ?? {}, {
+          proxy, host: deviceConnection.status().target?.host,
+        });
+        // Keep the CDP reason when WDA has nothing to add (`reason: null` = not an op it routes):
+        // the caller's banner should name the cause, and "not a WDA op" is not the cause.
+        if (wda.handled || wda.reason) outcome = wda;
+      }
+      if (outcome.handled) return json({ result: outcome.reply });
+      const synthetic = await deviceConnection.proxy(b.method, b.params ?? {});
+      // An INPUT op that could have been trusted but wasn't: front the reply with a loud banner
+      // naming the cause, instead of relying on the ` [input:synthetic]` suffix at the end of the
+      // line. `reason: null` means this was never an input op (eval/screenshot/…) — stay silent.
+      if (outcome.reason) {
+        const banner = synthFallbackBanner(outcome.reason);
+        // Two reply shapes to carry it on: the string handlers get a PREFIX; `type-text` returns an
+        // object, so it gets a field. Without the object case that op would warn about nothing —
+        // the same silent-synthetic gap, just hidden behind a different return type.
+        if (typeof synthetic === 'string') return json({ result: `${banner}\n${synthetic}` });
+        if (synthetic && typeof synthetic === 'object') {
+          return json({ result: { ...(synthetic as Record<string, unknown>), inputFidelityWarning: banner } });
+        }
+      }
+      return json({ result: synthetic });
+    }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 502); }
   }
 
@@ -2205,7 +2321,15 @@ async function describeUnresolvedAgainstLiveWorld(
   // matching install STREAM (`/api/toolchain/install`) is host-owned SSE, kept in
   // vite-asset-scanner.ts alongside /api/build (not part of this JSON router).
   if (urlPath === '/api/toolchain' && method === 'GET') {
-    return json(toolchainStatus());
+    // Report the OPEN PROJECT's Apple team so `autoInstall` can be true for WebDriverAgent on a
+    // machine that has never installed it: the machine-level `wdaTeamId` only exists after the
+    // first install seeds it, so without this WDA could never auto-install on a fresh checkout
+    // even with a perfectly good team configured. The toolchain module deliberately has no project
+    // context of its own — this is the layer that does.
+    let wdaTeamAvailable = false;
+    try { wdaTeamAvailable = !!loadProjectConfig(ctx.projectRoot).build.appleTeamId.trim(); }
+    catch { /* no/!readable project config — leave false, WDA just stays a manual install */ }
+    return json(toolchainStatus({ wdaTeamAvailable }));
   }
 
   // ── POST /api/toolchain/settings {allowSystemToolchain} (M) ── the "Use system-

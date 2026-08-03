@@ -256,8 +256,10 @@ userData/vite-cache location, and the reap mechanism (`pkill -f` vs a `Win32_Pro
 `ExecutablePath`). Believing it was macOS-only is part of why a *packaged Windows* bug — the editor
 being unable to extract any provisioned toolchain — survived undetected; see "Never assume `tar` is
 bsdtar" in [editor-toolchain.md](editor-toolchain.md). Its release-time sibling
-`assert-app-renders.sh` genuinely WAS macOS-only until the same date, and `release-windows.yml`
-still has no render gate wired up (#94).
+`assert-app-renders.sh` genuinely WAS macOS-only until the same date, and the public repo's
+`oss/.github/workflows/release-windows.yml` (the private `.github/workflows/release-windows.yml`
+was deleted 2026-08-03 — releases are cut from the public repo now, see
+docs/engine-oss-publishing.md) still has no render gate wired up (#94).
 
 It stops the local dev editor and builds a throwaway `.app` on a **per-clone port outside the
 5179/5180/5181 human-editor range** — the block and its override live in the harness port table in
@@ -289,6 +291,62 @@ thing it was watching was broken:
    unrelated to the commit. `shouldOverrideUserData()` stands down for that switch precisely so a
    harness can isolate itself. `assert-app-renders.sh` (the release gate) does the same.
    Guarded by `engine/tests/architecture/packagedLaunchIsolation.test.ts`.
+
+### Two packaged-boot flakes, both closed unreproduced (#21, #68)
+
+Both were rare, neither was ever reproduced on demand, and both are **closed** — recorded here
+because a closed ticket is where this kind of knowledge goes to die, and because the next person
+to see either symptom should not restart the investigation from zero.
+
+They are **different defects** despite a similar smell. Do not merge them in your head: one
+*crashes* with a module error, the other *exits 0* without crashing.
+
+**Cold-boot crash (#21)** — the first boot after an install/upgrade could crash the renderer with
+`… does not provide an export named …`. Seen 1-in-6 on a real Windows install, never on a warm
+relaunch. Two things came out of it:
+
+- **Root-caused and fixed:** Vite keys its dep-optimize cache on the **lockfile**, not on
+  `@modoki/engine` source (a symlinked workspace dep), so after an app update the old pre-bundled
+  chunk was reused and every import of a newly-added export failed. `main.ts` now busts the cache on
+  a build-signature change. That signature must hash the **bytes** of `main.cjs` — never an
+  `fs.stat` mtime, because `__filename` lives inside `app.asar` and Electron's asar shim fabricates
+  stat times, so an mtime-keyed signature never matches itself and wipes on *every* boot. Guarded by
+  `engine/tests/architecture/viteCacheBustSignature.test.ts`.
+- **Not root-caused:** a residual crash on a genuinely *cold* cache (the wipe fired on the same boot
+  that then crashed) — i.e. not staleness but a race during the cold optimize. Mitigated only:
+  `EditorBootBoundary` does one capped, logged reload on that error signature, so it degrades to a
+  ~1s delay instead of the red error screen. `main.log` carries `retryCount=` /
+  `staleDepOptimizeSignature=` / `willRetry=` on every catch — that is the trail to pull.
+
+Measured 2026-08-03 (v0.3.6, macOS): **30/30 cold boots clean** via
+`engine/scripts/repro-cold-boot.sh` — no crash, no boundary fire, no console errors. At the observed
+Windows rate that outcome has p≈0.4%, so the rate really is **materially lower on macOS**, which is
+consistent with the leading theory (one-time Defender/SmartScreen read latency over a freshly
+extracted `app.asar.unpacked` — something a Mac cannot exercise). The same run positively confirmed
+the build-signature fix against the real packaged binary: a reused profile wiped on boot 1 and
+**not** on boot 2. **So run that loop on the Windows clone, not here.**
+
+Two traps that script encodes, both of which cost a wrong answer while writing it:
+
+- **Cold means a fresh `--user-data-dir`**, not a cache wipe. `vite-cache` lives under userData, so a
+  throwaway profile is colder *and* leaves the shared `Modoki Editor` profile alone —
+  `clean-packaged-cache.mjs` would have destroyed a human's recents, layouts, and prefs.
+- **`$TMPDIR` is not `/tmp` on macOS.** Defaulting the build dir to `${TMPDIR:-/tmp}` resolved a
+  *different, day-old* app than the one just built, and reported it green. The script now derives the
+  path from `packagedAppPaths.mjs tmpdir` (the same helper `smoke-packaged.sh` uses) and warns when
+  the packaged binary is older than `engine/electron/dist/main.cjs`.
+
+**Smoke CSP flake (#68)** — `smoke:packaged` failed its CSP leg once in three runs on identical code:
+the app **exited cleanly (code 0)** before the editor page appeared, so there was nothing to
+diagnose. Both of its suspects were addressed in `5a663d56`: `assert-app-csp.mjs` now keeps a rolling
+tail of the child's stdout/stderr and reports it with the exit code/signal on failure, and
+`smoke-packaged.sh` no longer races teardown with a fixed `sleep 1` — it **polls for the first
+instance's actual death** (bounded, so a genuinely stuck process still fails loud). Never recurred
+in 15+ runs afterwards. If it returns, the failure now self-reports instead of printing `code 0`.
+
+The one thread genuinely shared with #21 — a suspected teardown race on the packaged `userData` /
+Vite dep-cache — is a *hypothesis overlap*, not an established common cause. Worth checking both if
+either recurs.
 
 ## CLI recipes
 

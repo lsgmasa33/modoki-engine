@@ -60,6 +60,30 @@ export async function clickUntilSelected(page: Page, x: number, y: number, expec
   }, { timeout: 15_000, intervals: [150, 300, 500, 800] }).toBe(expected);
 }
 
+/** Read a locator's box, retrying until it HAS one. `boundingBox()` — unlike an action — does
+ *  NOT auto-wait: it returns null the instant the element is detached, and the caller's
+ *  `box!.height` then throws a bare `TypeError: Cannot read properties of null`.
+ *
+ *  The obvious guard, `await expect(loc).toBeVisible()` before the read, does not work and was
+ *  already tried: it is a check-then-act race, and the element can remount in the gap between
+ *  the assertion resolving and the read landing. That is precisely how it failed again on the
+ *  public gate (ci/main, 2026-08-03) after being "fixed" — passing locally, and passing on CI
+ *  until a loaded runner widened the gap.
+ *
+ *  Retrying the READ closes the window, because the poll re-measures rather than trusting an
+ *  earlier observation. Only needed for elements that genuinely remount (Hierarchy rows during
+ *  a re-parent); a canvas is stable and can be read directly. */
+export async function stableBoundingBox(loc: import('@playwright/test').Locator) {
+  let box: Awaited<ReturnType<typeof loc.boundingBox>> = null;
+  await expect
+    .poll(async () => {
+      box = await loc.boundingBox();
+      return box?.height ?? 0;
+    }, { timeout: 10_000 })
+    .toBeGreaterThan(0);
+  return box!;
+}
+
 export const selectedName = (page: Page) =>
   page.evaluate(() => (window as any).__modokiEditorTest?.selectedEntityName() ?? null);
 

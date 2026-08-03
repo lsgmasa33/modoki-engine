@@ -45,7 +45,7 @@ import { acquireFont } from '../loaders/fontAtlasLoader';
 import { registerAsset, isGuid, resolveRef, resolveGuidToPath, getAudioLoadType } from '../loaders/assetManifest';
 import { loadTimelineNow } from '../loaders/timelineCache';
 import { collectTimelineAudioRefs, collectTimelineControlRefs } from '../timeline/types';
-import { ASSET_FETCH_INIT } from '../loaders/assetFetch';
+import { ASSET_FETCH_INIT, parseAssetJson } from '../loaders/assetFetch';
 import { assetUrl } from '../loaders/assetUrl';
 import {
   loadSceneFile,
@@ -300,7 +300,14 @@ class SceneManagerImpl implements SceneManager {
         // hosting, and resolves to the inlined blob: URL in a playable single-file build.
         const res = await fetch(assetUrl(path), { signal: controller.signal, ...ASSET_FETCH_INIT });
         if (!res.ok) throw new Error(`Failed to fetch scene "${path}": HTTP ${res.status}`);
-        data = await res.json();
+        // parseAssetJson, not res.json(): the dev server answers an unknown path with a 200 OK
+        // `index.html` (its SPA fallback), so `res.ok` is true, there is no 404, and `.json()`
+        // throws `Unexpected token '<', "<!doctype "…` — which reads as a CORRUPT scene when the
+        // truth is "no scene at this path" (#91). The editor's boot walks a candidate list, so
+        // this fires on a perfectly healthy boot whose first candidate is a stale remembered
+        // path, and the resulting red console error is indistinguishable from a real failure to
+        // `smoke-packaged.sh` / `assert-app-renders.sh`, both of which fail on ANY console error.
+        data = await parseAssetJson(res, path) as SceneData;
       }
       // Register scene id in the manifest so the editor can recover it on save
       const sceneGuid = (data as { id?: string }).id;
@@ -330,7 +337,11 @@ class SceneManagerImpl implements SceneManager {
           try {
             const res = await fetch(assetUrl(basePath), { signal: controller.signal, ...ASSET_FETCH_INIT });
             if (!res.ok) return null;
-            cached = await res.json();
+            // Same SPA-fallback trap as the primary fetch above (#91): a base scene whose path no
+            // longer resolves comes back as 200 OK index.html. parseAssetJson throws on it, and
+            // the catch below turns that into "no such base" — the honest answer — instead of
+            // caching an HTML string as if it were a scene.
+            cached = await parseAssetJson(res, basePath) as SceneData;
           } catch {
             return null;
           }

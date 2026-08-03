@@ -13,6 +13,7 @@ import {
   type AssetManifestFile,
 } from '../../src/runtime/loaders/assetManifest';
 import { ASSET_FETCH_INIT } from '../../src/runtime/loaders/assetFetch';
+import { completeResponse } from '../stubs/assetResponse';
 
 beforeEach(() => clearManifest());
 
@@ -232,10 +233,10 @@ describe('ensureManifestLoaded', () => {
 
   it('fetches, merges into the map, and returns the parsed manifest', async () => {
     const g = newGuid();
-    const fetchMock = vi.fn().mockResolvedValue({
+    const fetchMock = vi.fn().mockImplementation(async () => completeResponse({
       ok: true,
       json: async () => ({ version: 2, assets: [{ guid: g, path: '/x.mesh.json', type: 'mesh' }] }),
-    });
+    }));
     globalThis.fetch = fetchMock as never;
     const data = await ensureManifestLoaded('/assets.manifest.json');
     expect(fetchMock).toHaveBeenCalledWith('/assets.manifest.json', ASSET_FETCH_INIT);
@@ -244,7 +245,7 @@ describe('ensureManifestLoaded', () => {
   });
 
   it('memoizes — a second call does not re-fetch', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ version: 2, assets: [] }) });
+    const fetchMock = vi.fn().mockImplementation(async () => completeResponse({ ok: true, json: async () => ({ version: 2, assets: [] }) }));
     globalThis.fetch = fetchMock as never;
     await ensureManifestLoaded('/m.json');
     await ensureManifestLoaded('/m.json');
@@ -262,7 +263,7 @@ describe('ensureManifestLoaded', () => {
   });
 
   it('clearManifest resets memoization so a later call re-fetches', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ version: 2, assets: [] }) });
+    const fetchMock = vi.fn().mockImplementation(async () => completeResponse({ ok: true, json: async () => ({ version: 2, assets: [] }) }));
     globalThis.fetch = fetchMock as never;
     await ensureManifestLoaded('/m.json');
     clearManifest();
@@ -278,7 +279,7 @@ describe('ensureManifestLoaded', () => {
     const g = newGuid();
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: false, status: 503 })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ version: 2, assets: [{ guid: g, path: '/y.mesh.json', type: 'mesh' }] }) });
+      .mockImplementationOnce(async () => completeResponse({ ok: true, json: async () => ({ version: 2, assets: [{ guid: g, path: '/y.mesh.json', type: 'mesh' }] }) }));
     globalThis.fetch = fetchMock as never;
     expect(await ensureManifestLoaded('/m.json')).toBeNull();   // first attempt fails, not cached
     const data = await ensureManifestLoaded('/m.json');          // second attempt retries
@@ -291,7 +292,7 @@ describe('ensureManifestLoaded', () => {
     const g = newGuid();
     const fetchMock = vi.fn()
       .mockRejectedValueOnce(new Error('network down'))
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ version: 2, assets: [{ guid: g, path: '/z.mesh.json', type: 'mesh' }] }) });
+      .mockImplementationOnce(async () => completeResponse({ ok: true, json: async () => ({ version: 2, assets: [{ guid: g, path: '/z.mesh.json', type: 'mesh' }] }) }));
     globalThis.fetch = fetchMock as never;
     expect(await ensureManifestLoaded('/m.json')).toBeNull();
     const data = await ensureManifestLoaded('/m.json');
@@ -303,7 +304,7 @@ describe('ensureManifestLoaded', () => {
   it('still memoizes a SUCCESS that follows a failure (no infinite re-fetch on a healthy server)', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: false, status: 500 })
-      .mockResolvedValue({ ok: true, json: async () => ({ version: 2, assets: [] }) });
+      .mockImplementation(async () => completeResponse({ ok: true, json: async () => ({ version: 2, assets: [] }) }));
     globalThis.fetch = fetchMock as never;
     await ensureManifestLoaded('/m.json'); // fails → not memoized
     await ensureManifestLoaded('/m.json'); // succeeds → memoized

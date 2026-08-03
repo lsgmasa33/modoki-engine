@@ -1,8 +1,19 @@
 import '@testing-library/jest-dom/vitest';
 
+// jsdom implements no layout, and therefore no `document.elementFromPoint` AT ALL — it is
+// `undefined`, not a stub that returns a miss. bridge.ts hit-tests with it to pick the canvas under
+// an aim point (#93) and to spot a DOM button, so without this every device-input test throws
+// rather than failing on behaviour. Default to a miss (`null`): with one canvas mounted — what
+// nearly every such test does — the pick falls through to "the only canvas", which is both correct
+// and what those tests already assert. A test that cares about the choice overrides this per case
+// (see tests/framework/bridgeCanvasTargeting.test.ts).
+if (typeof document !== 'undefined' && typeof document.elementFromPoint !== 'function') {
+  document.elementFromPoint = () => null;
+}
+
 // jsdom has no PointerEvent constructor at all (only MouseEvent) — bridge.ts's device-side input
-// dispatch (tap/drag/pointer) constructs real `PointerEvent`s to feed PixiJS's federated event
-// system and the canvas. `button`/`buttons` are already part of MouseEventInit, so the base
+// dispatch (tap/drag/pointer) constructs real `PointerEvent`s to feed the canvas under the aim
+// point. `button`/`buttons` are already part of MouseEventInit, so the base
 // class handles those; this only needs to add the pointer-specific fields the init dictionary
 // carries (`pointerId`/`pointerType`/`isPrimary`) so a test can exercise that dispatch path.
 if (typeof globalThis.PointerEvent === 'undefined' && typeof MouseEvent !== 'undefined') {

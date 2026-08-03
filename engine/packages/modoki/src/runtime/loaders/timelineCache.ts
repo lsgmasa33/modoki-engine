@@ -72,8 +72,8 @@ export async function loadTimelineNow(refOrPath: string): Promise<TimelineDef | 
   const gen = generation;
   try {
     const r = await fetch(assetUrl(path), ASSET_FETCH_INIT);
-    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-    const json = (await r.json()) as Partial<TimelineDef>;
+    // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
+    const json = (await parseAssetJson(r, path)) as Partial<TimelineDef>;
     if (gen !== generation) return null;
     const existing = cache.get(path);
     if (existing) return existing;

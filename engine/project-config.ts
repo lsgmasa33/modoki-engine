@@ -138,7 +138,7 @@ export interface ProjectConfig {
      *  author wrote). */
     webDeployCommand: string;
     /** Apple Developer Team ID for iOS signing (the 10-char team, e.g.
-     *  KQ6FQ2BS8H). Org-level (shared across the team's builds) so it lives in the
+     *  ABCDE12345). Org-level (shared across the team's builds) so it lives in the
      *  committed config, not project.user.json. The editor's heal-on-open syncs it
      *  into the iOS project's DEVELOPMENT_TEAM. Empty = leave the pbxproj as-is. */
     appleTeamId: string;
@@ -369,13 +369,17 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   },
 };
 
-/** Defaults for the per-machine user config. The device/SDK values here mirror
- *  the repo owner's machine so a build works out-of-the-box without a
- *  project.user.json; a real per-machine file (gitignored) overrides them. */
+/** Defaults for the per-machine user config. Every field is EMPTY on purpose:
+ *  these describe THIS developer's hardware, and this file ships publicly (the
+ *  OSS snapshot), so a real value here would both leak the author's device and
+ *  silently aim a stranger's build at hardware that is not theirs (#103). A
+ *  per-machine project.user.json (gitignored) supplies them; an empty id is an
+ *  expected, handled state — validateBuildConfig allows it, and the iOS build
+ *  step turns it into an actionable "set iosDeviceId in Project Settings". */
 export const DEFAULT_PROJECT_USER_CONFIG: ProjectUserConfig = {
   device: {
-    iosDeviceId: '00008150-00041CAA3AB8401C',
-    iosDevicectlId: '796DC698-BD9D-529F-B068-D14867813680',
+    iosDeviceId: '',
+    iosDevicectlId: '',
     androidDeviceId: '',
   },
   sdk: {

@@ -21,9 +21,13 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
+import { hasPrivateTooling } from '../helpers/repoLayout';
 
 const REPO = path.resolve(__dirname, '../../..');
 const read = (rel: string) => readFileSync(path.join(REPO, rel), 'utf8');
+// The public engine snapshot ships neither the committed agent-CLI configs
+// (.mcp.json/.cursor/.codex) nor engine/scripts/** — both are private-repo-only.
+const skip = !hasPrivateTooling();
 
 /** Every committed file that configures an MCP server for an agent CLI. The root `.mcp.json` is the
  *  source; the other two are GENERATED from it by `npm run sync:agent-configs` — included here so a
@@ -41,7 +45,7 @@ function stripEnvExpansions(src: string): string {
   return src.replace(/\$\{[A-Za-z_][A-Za-z0-9_]*:-[^}]*\}/g, '${…}');
 }
 
-describe('committed MCP configs do not hardcode a per-clone port (#68 sibling)', () => {
+describe.skipIf(skip)('committed MCP configs do not hardcode a per-clone port (#68 sibling)', () => {
   for (const rel of MCP_CONFIGS) {
     it(`${rel} names a clone port only as an env-expansion default`, () => {
       const bare = stripEnvExpansions(read(rel));
@@ -57,7 +61,7 @@ describe('committed MCP configs do not hardcode a per-clone port (#68 sibling)',
   }
 });
 
-describe('every harness that SPAWNS the packaged app pins a per-clone backend port (#68)', () => {
+describe.skipIf(skip)('every harness that SPAWNS the packaged app pins a per-clone backend port (#68)', () => {
   /** Scripts that launch the packaged binary. Found by the marker every such script needs — it must
    *  resolve the executable inside the app dir — rather than by a hand-listed set, so a NEW spawner
    *  is covered the day it is written. */

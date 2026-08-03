@@ -9,7 +9,7 @@
  *  refactor of the drop handler can't silently regress the fix jsdom/unit tests can't see. */
 
 import { test, expect } from '@playwright/test';
-import { gotoEditorWithScene, idByName } from './helpers';
+import { gotoEditorWithScene, idByName, stableBoundingBox } from './helpers';
 
 // `EntityAttributes.editorFolder` isn't in the curated Inspector field subset `traitField`
 // reads (entityUtils.ts's readTraitData) — it's surfaced on getAllEntities()'s EntityInfo
@@ -38,7 +38,10 @@ test('Hierarchy: dropping a folder member next to an ungrouped sibling clears it
 
   const source = page.locator(`[data-entity-row="${offsetId}"]`);
   const target = page.locator(`[data-entity-row="${centerId}"]`);
-  const targetBox = await target.boundingBox();
+  // Retry the geometry READ — folding re-parents rows, so there is a real window where they are
+  // remounting and `boundingBox()` returns null. A `toBeVisible()` gate before the read is NOT
+  // enough (check-then-act); see stableBoundingBox.
+  const targetBox = await stableBoundingBox(target);
   // Bottom ~90% of the row → the "after" zone (detectZone: bottom 25% = after). CenterCube
   // is ungrouped, so this is the "drag out of a folder by dropping near an ungrouped
   // sibling" gesture — the one the original bug report actually meant.
@@ -61,7 +64,11 @@ test('Hierarchy: dropping next to a folder member adopts that folder', async ({ 
   // adopts the same folder, the inverse of the case above.
   const source = page.locator(`[data-entity-row="${centerId}"]`);
   const target = page.locator(`[data-entity-row="${offsetId}"]`);
-  const targetBox = await target.boundingBox();
+  // See the sibling test above. This is the case that actually flaked — twice, and the second
+  // time (ci/main, 2026-08-03) THROUGH the `toBeVisible()` gate that was added for the first:
+  // the target here is the row that was just folded, so it is the one remounting when the
+  // geometry read lands.
+  const targetBox = await stableBoundingBox(target);
   await source.dragTo(target, { targetPosition: { x: 20, y: Math.floor(targetBox!.height * 0.9) } });
 
   await expect.poll(() => editorFolderOf(page, centerId!)).toBe('New Folder');

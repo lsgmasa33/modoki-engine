@@ -32,14 +32,67 @@ import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, type L
 const BACKEND = (process.env.MODOKI_BACKEND ?? 'http://127.0.0.1:5179').replace(/\/$/, '');
 
 // ── Input fidelity (#32) ──────────────────────────────────────────────────
-// Mirrors `INPUT_MECHANISM` in `engine/app/debug/bridge.ts` — necessarily a SECOND copy, not an
-// import: this MCP server and the in-page device bridge are separate runtimes/builds (Node vs a
-// bundled browser script shipped inside the game) with no shared module graph between them. What
-// they must agree on is the STATEMENT, not the binding: every device_* input tool dispatches a
-// synthetic DOM event today (never OS-level trusted input). Phases 1-2 of
-// docs/plans/trusted-device-input-plan.md will change this per platform; until a live probe can
-// report otherwise, device_status states it unconditionally.
-const DEVICE_INPUT_MECHANISM = 'synthetic' as const;
+// The two literals a device_* reply/device_status line can report. Kept as named constants
+// (rather than inline string literals) so `deviceInputMechanismParity.test.ts` can regex-match
+// them by name — this MCP server, the in-page device bridge (`engine/app/debug/bridge.ts`, a
+// bundled browser script shipped inside the game), and the backend's Android CDP route
+// (`engine/plugins/backend/deviceCdp.ts`) are three separate runtimes/packages with no shared
+// module graph, so the values are necessarily duplicated rather than imported. What all three
+// must agree on is the STATEMENT: 'synthetic' is bridge.ts's `INPUT_MECHANISM` (the in-page
+// dispatch every input handler falls back to), 'trusted-cdp' is deviceCdp.ts's
+// `TRUSTED_CDP_MECHANISM` (Phase 1's Android route). Phase 0 shipped this file with a single
+// hardcoded 'synthetic' reported unconditionally; Phase 1 replaces that with a LIVE probe (the
+// backend's `/api/device/status` reports which mechanism is actually available right now) — see
+// device_status below.
+const SYNTHETIC_MECHANISM = 'synthetic' as const;
+const TRUSTED_CDP_MECHANISM = 'trusted-cdp' as const;
+const TRUSTED_WDA_MECHANISM = 'trusted-wda' as const;
+
+// ── The device eval surface's BOUNDARY (#101) ────────────────────────────────
+// Input and screenshot are NOT agent ops: they are bridge-level switch cases
+// (`engine/app/debug/bridge.ts`), and trusted input is dispatched HOST-SIDE by the backend
+// (deviceCdp.ts / deviceWda.ts) because a page cannot dispatch a trusted event to itself. So
+// `modoki.call('tap')` inside device_eval hits the router's `Unknown method:` default — and with
+// no `api()` on the device surface there is no escape hatch either.
+//
+// The trap this text exists to close: `resolve-dom-point` / `resolve-entity-point` ARE ops, so a
+// script can compute exactly where to tap and is then unable to tap. Today you learn that by
+// writing the script and watching it fail.
+//
+// WHY THIS TEXT LIVES HERE rather than in the device's own `deviceEvalApi.ts` (whose editor twin
+// carries its usage lines in the `eval-api` op): the editor renderer is always the current build,
+// but the device app is a SHIPPED ARTIFACT that can be older than this server. Guidance kept
+// on-device would report the old build's wording, and probing for a newer method (`modoki.describe()`)
+// would hard-fail against every already-installed build. The ops LIST still comes from the device —
+// it must, being generated from that build's registry — and only the guidance is composed here.
+const DEVICE_EVAL_UNREACHABLE_OPS = ['tap', 'drag', 'pointer', 'press-key', 'hover', 'scroll', 'type-text', 'screenshot'] as const;
+const DEVICE_EVAL_UNREACHABLE_SUMMARY =
+  'NOT reachable from eval: input (tap/drag/pointer/press-key/hover/scroll/type-text) and screenshot are '
+  + 'bridge-level methods, not agent ops — `modoki.call(\'tap\')` fails with `Unknown method:`. Use the '
+  + 'device_* tools for those; they route trusted input host-side (CDP on Android, WebDriverAgent on iOS), '
+  + 'which is exactly what an in-page call could not do.';
+
+/** The guidance `device_eval_api` wraps around the device's own op list. */
+function deviceEvalApiGuidance(): {
+  usage: string[];
+  absent: Record<string, string>;
+  notReachable: { methods: string[]; why: string };
+  note: string;
+} {
+  return {
+    usage: [
+      'modoki.call(op, params) — invoke any op above by its raw kebab-case name',
+      'modoki.<camelCaseName>(params) — generated shortcut for each op above',
+      'modoki.ops() — the same {op, method} listing, from inside eval code',
+    ],
+    absent: {
+      'modoki.api(path, init)': 'editor-only — there is no editor backend for the device page to fetch; every device op already funnels through the lease',
+      'modoki.composite(label, fn)': 'editor-only — there is no undo stack on device',
+    },
+    notReachable: { methods: [...DEVICE_EVAL_UNREACHABLE_OPS], why: DEVICE_EVAL_UNREACHABLE_SUMMARY },
+    note: 'The op list comes from the CONNECTED BUILD\'s registry, so an older app reports fewer ops. Call device_eval_api again any time.',
+  };
+}
 
 // ── WHICH editor is this pointed at? (S2.39) ─────────────────────────────────
 // `.mcp.json` defaults MODOKI_BACKEND to 5179 for EVERY clone, and this server had no identity
@@ -302,6 +355,32 @@ async function backendPost(path: string, payload: unknown): Promise<unknown> {
   return body;
 }
 
+/** Save a decoded capture, open it in Preview (macOS), and render the tool reply.
+ *
+ *  Shared by the native path and the WDA path (#102) so both save, name and size-report a capture
+ *  identically. `aimHint` is a PARAMETER rather than baked in, because it is the one line the two
+ *  paths must not share: a native capture's pixels ARE the aim space for `device_tap`, and a WDA
+ *  capture's are the whole device screen and must never be used that way. */
+function renderScreenshot(
+  decoded: { dataUrl: string; info: string },
+  opts: { savePath?: string; inline?: boolean; prefix?: string; aimHint?: string },
+): DeviceToolResult {
+  const base64 = decoded.dataUrl.includes(',') ? decoded.dataUrl.split(',')[1] : decoded.dataUrl;
+  const mimeType = decoded.dataUrl.startsWith('data:image/jpeg') ? 'image/jpeg' : 'image/png';
+  const info = decoded.info + (opts.aimHint ?? '');
+  const buf = Buffer.from(base64, 'base64');
+  const outPath = opts.savePath ?? join(tmpdir(), `device-screenshot.${extFor(mimeType)}`);
+  writeFileSync(outPath, buf);
+  // fire-and-forget (macOS). `VITEST` guard: this is the first code path a test drives end-to-end,
+  // and a suite that opens a GUI app on the developer's machine is a suite people stop running —
+  // same reason autoUpdate.ts and native-dynamic-import.ts check it.
+  if (process.platform === 'darwin' && !process.env.VITEST) void pExecFile('open', ['-a', 'Preview', outPath]).catch(() => {});
+  const prefix = opts.prefix ?? '';
+  return opts.inline
+    ? { content: [{ type: 'image' as const, data: base64, mimeType }, { type: 'text' as const, text: prefix + info }] }
+    : { content: [{ type: 'text' as const, text: prefix + describeScreenshot(info, outPath, buf.length) }] };
+}
+
 /** Proxy one data-plane request through Modoki's held lease. Returns the device's `result`
  *  (usually a JSON string — the device `safeStringify`s its replies). */
 async function deviceRequest(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
@@ -344,9 +423,23 @@ export function registerTools(server: McpServer) {
     try {
       const status = (await backendGet('/api/device/status')) as LeaseStatus;
       const lease = describeLease(status);
-      // No live probe reports the mechanism yet (Phase 1/2 of #32 are what would add one), so this
-      // is unconditional today — see DEVICE_INPUT_MECHANISM above.
-      const fidelity = `Input mechanism: ${DEVICE_INPUT_MECHANISM} (device_tap/drag/pointer/press_key/hover/scroll/type_text dispatch synthetic DOM events, not OS-level trusted input — see #32).`;
+      // #32: the backend LIVE-PROBES this whenever a lease is connected — Android CDP
+      // reachability, then iOS WebDriverAgent. `status.inputMechanism` is absent for a
+      // disconnected lease (nothing to report a mechanism FOR, same rule the input handlers
+      // follow: a refusal never claims a mechanism). `pointer`/`type_text` stay synthetic-only
+      // regardless of the probe — neither is routed through a trusted path on either platform.
+      const fidelity = status.inputMechanism === TRUSTED_CDP_MECHANISM
+        ? `Input mechanism: ${TRUSTED_CDP_MECHANISM} for device_tap/drag/press_key/hover/scroll (OS-level trusted input via CDP — #32 Phase 1). device_pointer/type_text are still ${SYNTHETIC_MECHANISM}.`
+        // #32 Phase 2 (iOS/WebDriverAgent) routes a NARROWER set than Android — only tap and drag,
+        // because a trusted key reaches just a focused element, WDA has no wheel action, and a
+        // touchscreen has no hover (all measured on the iPhone Air). So the ops are named from the
+        // backend's own `trustedOps` rather than assumed: reporting "trusted" for the whole surface
+        // when three of its ops are synthetic is the false-fidelity claim this line exists to stop.
+        : status.inputMechanism === TRUSTED_WDA_MECHANISM
+          ? `Input mechanism: ${TRUSTED_WDA_MECHANISM} for ${(status.trustedOps ?? ['tap', 'drag']).map((o) => `device_${o}`).join('/')} (OS-level trusted input via WebDriverAgent — #32 Phase 2). Every OTHER input op is still ${SYNTHETIC_MECHANISM} on iOS, and says so in its reply.`
+        : status.inputMechanism === SYNTHETIC_MECHANISM
+          ? `Input mechanism: ${SYNTHETIC_MECHANISM} (device_tap/drag/pointer/press_key/hover/scroll/type_text dispatch synthetic DOM events, not OS-level trusted input — see #32).`
+          : `Input mechanism: unknown — no device is connected, so there is nothing to probe (connect first; device_connect).`;
       // App identity (#88): asked of the device itself, over the SAME lease socket every other
       // device_* call proxies through — so the answer comes from whichever app actually holds the
       // socket, and cannot lie the way a locally-derived value could. Only probed when a lease is
@@ -451,7 +544,7 @@ export function registerTools(server: McpServer) {
       'scripting object (#83) — the device\'s live agent-op registry as `modoki.call(op, params)` ' +
       'plus a generated `modoki.<camelCase>(params)` method per op (see device_eval_api for the ' +
       'full list). Narrower than the editor\'s: no `modoki.api()`/`modoki.composite()` (device has ' +
-      'no editor backend to fetch and no undo stack).',
+      'no editor backend to fetch and no undo stack). ' + DEVICE_EVAL_UNREACHABLE_SUMMARY,
     { code: z.string().describe('JavaScript code. Use `return` for a value.') },
     async ({ code }) => {
       try {
@@ -481,7 +574,8 @@ export function registerTools(server: McpServer) {
   tool('device_eval_api',
     'Discovery for device_eval: lists every op the injected `modoki` scripting object exposes, as ' +
       'its generated `modoki.<camelCase>(params)` method — plus `modoki.call(op, params)` and ' +
-      '`modoki.ops()`. Device-only surface (no `api`/`composite` — see device_eval).',
+      '`modoki.ops()`, what is deliberately ABSENT (no `api`/`composite`), and what cannot be ' +
+      'reached from eval at all (input + screenshot). Read this before writing a device_eval script.',
     {},
     async () => {
       try {
@@ -495,7 +589,16 @@ export function registerTools(server: McpServer) {
             options: ['confirm a device is connected (device_status)'],
           });
         }
-        return { content: [{ type: 'text' as const, text: encodeEvalResult(result) }] };
+        // The ops come from the device (that build's registry); the guidance is composed here — see
+        // DEVICE_EVAL_UNREACHABLE_SUMMARY's header for why it is not shipped on-device. `parseReply`
+        // returns the raw value unchanged if it is not JSON, so an unexpected reply is REPORTED as
+        // `ops` rather than being dropped on the floor by a parse this tool could not do.
+        return {
+          content: [{
+            type: 'text' as const,
+            text: encodeStructuredResult({ ops: parseReply<unknown>(result), ...deviceEvalApiGuidance() }),
+          }],
+        };
       } catch (e) {
         return caughtFailure('device_eval_api', 'list the device eval scripting surface', e);
       }
@@ -721,22 +824,56 @@ export function registerTools(server: McpServer) {
 
   tool('device_screenshot',
     'Take a screenshot of the connected device. Saves it to a file, opens it in Preview, and ' +
-      'returns the PATH + dimensions as text. Use those pixel coordinates for device_tap/device_drag. ' +
+      'returns the PATH + dimensions as text. Those pixel coordinates are aimable with ' +
+      'device_tap/device_drag — EXCEPT on a wda capture, see below. ' +
       'The image is NOT inlined by default (a full-res base64 blob crowds out the task). Pass ' +
-      'inline:true if you actually need to look at it.',
+      'inline:true if you actually need to look at it. ' +
+      'iOS only: `source:"wda"` captures the WHOLE DEVICE SCREEN via WebDriverAgent instead of the ' +
+      'app\'s own capture — the only way to see a system permission/ATT dialog, springboard, or ' +
+      'anything outside the app. Its pixels are DEVICE-screen coordinates and must NOT be fed to ' +
+      'device_tap/device_drag (aim by selector/entity instead).',
     {
       savePath: z.string().optional().describe('Where to save (e.g., /tmp/screenshot.jpg). Defaults to a temp file.'),
       inline: z.boolean().optional().describe('Also embed the image in the response. Large — only when you need to SEE it.'),
+      source: z.enum(['auto', 'wda']).optional().describe('auto (default): adb framebuffer / the app\'s native capture, falling back to WebDriverAgent only if that errors. wda: force the iOS full-device capture — use it when the thing you need to see is OUTSIDE the app, which does not make the native capture fail.'),
     },
-    async ({ savePath, inline }) => {
+    async ({ savePath, inline, source }) => {
       try {
+        // #102 — an explicit `source:'wda'` skips BOTH normal paths. It is an iOS-only capability
+        // (the backend refuses when the lease has no WiFi host), and it must not be quietly
+        // downgraded to an adb or native capture: the caller asked for it precisely because those
+        // two cannot see what they are looking for.
+        if (source === 'wda') {
+          // Deliberately NOT clearing `adbScreenInfo`: a WDA capture is no evidence about the adb
+          // screen mapping either way, and a stale-mapping tap is guarded by the loud coordinate
+          // warning this reply carries — not by silently dropping state a later native capture
+          // would still want.
+          const decoded = decodeScreenshotReply(await deviceRequest('screenshot', { source: 'wda' }));
+          if ('error' in decoded) {
+            return deviceFail({
+              code: 'REFUSED_BY_OP',
+              tool: 'device_screenshot',
+              what: 'capture the full device screen via WebDriverAgent',
+              why: decoded.error,
+              options: [
+                'WDA is iOS-only and needs a WiFi lease — an adb/USB lease is Android (device_status)',
+                'install WebDriverAgent from Build Support (iOS); it runs only while its xcodebuild test process is alive',
+                'drop source:"wda" for the app\'s own capture, which cannot see outside the app',
+              ],
+            });
+          }
+          return renderScreenshot(decoded, { savePath, inline, prefix: decoded.warning ? `${decoded.warning}\n\n` : '' });
+        }
         // Android over adb: full framebuffer via adb (captures the WebGL/WebGPU canvas the native path
         // can't). ONLY when the LEASE itself is the adb device (F2) — never just because some Android
         // is on USB, which would screenshot the wrong device when the lease is a WiFi iPhone.
         if (await leaseUsesAdb() && await adbAvailable()) {
           const cap = await adbScreencap(savePath, inline);
           adbScreenInfo = { imgW: cap.imgW, imgH: cap.imgH, nativeW: cap.nativeW, nativeH: cap.nativeH, lease: (await leaseKey()) ?? 'adb' };
-          if (process.platform === 'darwin') void pExecFile('open', ['-a', 'Preview', cap.path]).catch(() => {}); // fire-and-forget (macOS)
+          // Same VITEST guard as `renderScreenshot` — this branch needs adb + an adb lease, so no
+          // test reaches it TODAY, but it is the identical defect and one adb-path test away from
+          // opening Preview windows during `npm test`.
+          if (process.platform === 'darwin' && !process.env.VITEST) void pExecFile('open', ['-a', 'Preview', cap.path]).catch(() => {}); // fire-and-forget (macOS)
           const info = `[adb] ${cap.imgW}x${cap.imgH} (from ${cap.nativeW}x${cap.nativeH}). Use these pixel coordinates for device_tap/device_drag.`;
           return inline
             ? { content: [{ type: 'image' as const, data: cap.base64, mimeType: cap.mimeType }, { type: 'text' as const, text: info }] }
@@ -774,20 +911,14 @@ export function registerTools(server: McpServer) {
             ],
           });
         }
-        const imageDataUrl = decoded.dataUrl;
-        const base64 = imageDataUrl.includes(',') ? imageDataUrl.split(',')[1] : imageDataUrl;
-        const mimeType = imageDataUrl.startsWith('data:image/jpeg') ? 'image/jpeg' : 'image/png';
-        const info = decoded.info + ' Use these pixel coordinates for device_tap/device_drag.';
-
-        const buf = Buffer.from(base64, 'base64');
-        const outPath = savePath ?? join(tmpdir(), `device-screenshot.${extFor(mimeType)}`);
-        writeFileSync(outPath, buf);
-        if (process.platform === 'darwin') void pExecFile('open', ['-a', 'Preview', outPath]).catch(() => {}); // fire-and-forget (macOS)
-
-        const text = describeScreenshot(info, outPath, buf.length);
-        return inline
-          ? { content: [{ type: 'image' as const, data: base64, mimeType }, { type: 'text' as const, text: blackCanvasWarning + info }] }
-          : { content: [{ type: 'text' as const, text: blackCanvasWarning + text }] };
+        // The backend falls back to a WDA capture when the native one ERRORS (#102). That image is
+        // the whole device screen, so the aim hint below would be a lie — and this is the path
+        // where nobody ASKED for a WDA capture, which is exactly when a wrong hint gets believed.
+        return renderScreenshot(decoded, {
+          savePath, inline,
+          prefix: (decoded.warning ? `${decoded.warning}\n\n` : '') + blackCanvasWarning,
+          aimHint: decoded.isWholeDevice ? '' : ' Use these pixel coordinates for device_tap/device_drag.',
+        });
       } catch (e) {
         return caughtFailure('device_screenshot', 'capture the device screen', e);
       }
@@ -801,7 +932,9 @@ export function registerTools(server: McpServer) {
       'button) and the device resolves it to the element center, occlusion-checked, with NO ' +
       'screenshot needed (the fix for tapping DOM chrome like a debug-menu close button). Otherwise ' +
       'pass screenshot pixel `x`/`y` (take a device_screenshot first). Selector wins if both are given. ' +
-      'Dispatches a synthetic DOM/PixiJS event, not OS-level trusted input — see #32.',
+      'TRUSTED OS-level input when a route is available — CDP on Android, WebDriverAgent on iOS ' +
+      '(#32) — else a synthetic DOM event, which is fronted by a loud banner saying so. Check ' +
+      'device_status\'s input-mechanism line to know which you will get.',
     {
       selector: z.string().optional().describe('CSS selector to aim at (resolved on-device to the element center; refuses if occluded). Preferred for DOM targets.'),
       x: z.number().optional().describe('X (screenshot pixels) — used when no selector.'),
@@ -861,7 +994,9 @@ export function registerTools(server: McpServer) {
     'Drag between two points on the connected device. Aim each end by CSS selector ' +
       '(`fromSelector`/`toSelector`, resolved + occlusion-checked on-device) or by screenshot pixel ' +
       'coords (`fromX/fromY`→`toX/toY`; take a device_screenshot first). A selector wins over coords ' +
-      'for that endpoint. Dispatches synthetic DOM/PixiJS events, not OS-level trusted input — see #32.',
+      'for that endpoint. TRUSTED OS-level input when a route is available — CDP on Android, ' +
+      'WebDriverAgent on iOS (#32) — else synthetic DOM events, fronted by a loud banner. Check ' +
+      'device_status\'s input-mechanism line to know which you will get.',
     {
       fromSelector: z.string().optional().describe('CSS selector for the start point.'),
       toSelector: z.string().optional().describe('CSS selector for the end point.'),
@@ -929,7 +1064,8 @@ export function registerTools(server: McpServer) {
       'or screenshot pixel `x`/`y` (take a device_screenshot first) — same aiming as device_tap, no ' +
       '`entity` addressing on this surface. move/up reuse the button from the down; a move/up with ' +
       'nothing held, or a down while already held, is REFUSED rather than silently re-pressing/re-aiming. ' +
-      'Dispatches synthetic DOM/PixiJS events, not OS-level trusted input — see #32.',
+      'Always dispatches synthetic DOM events, never OS-level trusted input — this op is not ' +
+      'routed through the trusted paths on either platform (#32), and says so on every reply.',
     {
       action: z.enum(['down', 'move', 'up']).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),
       selector: z.string().optional().describe('CSS selector to aim at (resolved on-device; refuses if occluded). Preferred.'),
@@ -1037,8 +1173,9 @@ export function registerTools(server: McpServer) {
     'Press a key chord (keydown, brief hold, keyup) on the connected device — open the debug menu ' +
       '(key "F12"), Escape a modal, or drive gameplay keys. Dispatched on the focused element and ' +
       'bubbles to window, where the menu and input sources listen. The hold lets per-frame input ' +
-      'sampling catch the down edge. Dispatches a synthetic KeyboardEvent, not OS-level trusted ' +
-      'input — see #32.',
+      'sampling catch the down edge. Trusted-CDP on Android when a session is reachable; on iOS this ' +
+      'stays SYNTHETIC by design — a WebDriverAgent key reaches only a FOCUSED element, so it would ' +
+      'do nothing with a game canvas focused (#32). Check device_status\'s input-mechanism line.',
     {
       key: z.string().describe('KeyboardEvent.key, e.g. "F12", "Escape", "ArrowLeft", "a".'),
       modifiers: z.array(z.enum(['ctrl', 'shift', 'alt', 'meta'])).optional().describe('Held modifiers, e.g. ["meta"] for Cmd+key.'),
@@ -1050,7 +1187,9 @@ export function registerTools(server: McpServer) {
 
   /** The shape `handleType` (bridge.ts) returns — the device's local twin of `typeText`'s
    *  return type in `rendererOps.ts` (`engine/electron/rendererOps.ts`), plus an explicit `ok`. */
-  interface TypeTextReply { ok: boolean; typed: number; activeElement: string | null; valueAfter?: string | null; error?: string; inputMechanism?: typeof DEVICE_INPUT_MECHANISM }
+  // type-text is synthetic-only on BOTH platforms (never routed through CDP or WebDriverAgent), so
+  // its reply's `inputMechanism` field is always SYNTHETIC_MECHANISM.
+  interface TypeTextReply { ok: boolean; typed: number; activeElement: string | null; valueAfter?: string | null; error?: string; inputMechanism?: typeof SYNTHETIC_MECHANISM }
 
   tool('device_type_text',
     'Type text into the CURRENTLY-FOCUSED element on the connected device. FOCUS THE TARGET FIRST ' +
@@ -1135,7 +1274,9 @@ async function coordScaleOrRefusal(
   tool('device_hover',
     'Hover the pointer over a target on the device (pointerover/enter/move) so :hover styles, ' +
       'tooltips, and hover-gated UI activate. Aim by CSS `selector` (resolved on-device) or ' +
-      'screenshot pixel `x`/`y`. Dispatches synthetic pointer events, not OS-level trusted input — see #32.',
+      'screenshot pixel `x`/`y`. Trusted-CDP on Android when a session is reachable; on iOS this ' +
+      'stays SYNTHETIC by design — a touchscreen has no hover state to deliver (#32). Check ' +
+      'device_status\'s input-mechanism line to know which.',
     {
       selector: z.string().optional().describe('CSS selector to hover (preferred).'),
       x: z.number().optional().describe('X (screenshot pixels) — used when no selector.'),
@@ -1172,8 +1313,9 @@ async function coordScaleOrRefusal(
       '`x`/`y` (defaults to viewport center). Positive `deltaY` scrolls down, positive `deltaX` ' +
       'scrolls right; ~120 ≈ one wheel tick. `dx`/`dy` are accepted aliases (the editor twin ' +
       'modoki_scroll uses deltaX/deltaY, so those are canonical here too). A call whose deltas both ' +
-      'resolve to 0 is REFUSED rather than dispatched as a silent no-op. Dispatches a synthetic ' +
-      'WheelEvent, not OS-level trusted input — see #32.',
+      'resolve to 0 is REFUSED rather than dispatched as a silent no-op. Trusted-CDP on Android when ' +
+      'a session is reachable; on iOS this stays SYNTHETIC by design — WebDriverAgent has no wheel ' +
+      'action at all (#32). Check device_status\'s input-mechanism line to know which.',
     {
       deltaX: z.number().optional().describe('Horizontal wheel delta (default 0). Canonical name — same as modoki_scroll.'),
       deltaY: z.number().optional().describe('Vertical wheel delta (default 0; positive = down). Canonical name — same as modoki_scroll.'),

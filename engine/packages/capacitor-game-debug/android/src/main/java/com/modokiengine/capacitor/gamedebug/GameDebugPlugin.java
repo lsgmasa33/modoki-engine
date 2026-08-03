@@ -90,8 +90,19 @@ public class GameDebugPlugin extends Plugin {
     private void startListener(int port, boolean allowFallback, PluginCall call) {
         ServerSocket socket;
         try {
-            socket = new ServerSocket(port);
+            // SO_REUSEADDR must be set BEFORE the bind, so the socket is created UNBOUND and bound
+            // explicitly. `new ServerSocket(port)` binds in the constructor, which made the old
+            // `setReuseAddress(true)` on the next line a silent no-op (Java ignores it post-bind).
+            //
+            // That was harmless while the server only started once per process — SO_REUSEADDR does
+            // not let two LIVE listeners share a port, so it never affected the #88 collision. It
+            // became load-bearing when the bridge started releasing the port on pause and
+            // re-binding on resume (#95): a just-closed listener leaves the port in TIME_WAIT, and
+            // without SO_REUSEADDR the re-bind fails, falls back to an OS-assigned port, and
+            // recreates the very unreachability that change exists to remove.
+            socket = new ServerSocket();
             socket.setReuseAddress(true);
+            socket.bind(new java.net.InetSocketAddress(port));
         } catch (java.net.BindException e) {
             if (allowFallback) {
                 Log.w(TAG, "port " + port + " in use (previous instance?) — retrying on an OS-assigned port");

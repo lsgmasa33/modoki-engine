@@ -7,6 +7,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { trait } from 'koota';
+import { completeResponse } from '../stubs/assetResponse';
 
 // ── Test traits ──────────────────────────────────────────────────────────
 
@@ -83,12 +84,14 @@ const M = (path: string) => MAT_GUIDS[path];
 // @ts-expect-error mocking global
 global.fetch = vi.fn(async (url: string) => {
   fetchCalls[url] = (fetchCalls[url] || 0) + 1;
+  // completeResponse fills in text() — the stubs below only supply json(), and the loaders read
+  // the body as text so they can spot Vite's index.html SPA fallback. See tests/stubs/assetResponse.ts.
   for (const [key, body] of Object.entries(fetchResponses)) {
     if (url.endsWith(key) || url === key) {
-      return { ok: true, json: async () => body } as Response;
+      return completeResponse({ ok: true, json: async () => body });
     }
   }
-  return { ok: false, status: 404, json: async () => ({}) } as Response;
+  return completeResponse({ ok: false, status: 404, json: async () => ({}) });
 });
 
 // ── Test fixtures ──────────────────────────────────────────────────────
@@ -185,6 +188,31 @@ describe('SceneManager — basic load', () => {
     expect(current).not.toBeNull();
     expect(current!.path).toBe('/sceneA.json');
     expect(current!.state).toBe('active');
+  });
+
+  /** #91 — the dev server answers an unknown path with a 200 OK `index.html` (its SPA fallback),
+   *  so `res.ok` is true, there is no 404, and a bare `res.json()` throws
+   *  `SyntaxError: Unexpected token '<', "<!doctype "…` — which reads as a CORRUPT scene when the
+   *  truth is "no scene at this path". The editor's boot walks a candidate list, so this fired on
+   *  a healthy self-healing boot and left a red console error that `smoke-packaged.sh` /
+   *  `assert-app-renders.sh` (both fail on ANY console error) could not tell from a real break. */
+  it('reports an HTML SPA-fallback body as a MISSING scene, not as invalid JSON', async () => {
+    const { sceneManager } = await getSceneManager();
+    // A 200 OK whose body is index.html — exactly what Vite serves for a path it does not know.
+    // Swap the module-level mock for this one case and put it back, so the shared `fetch` double
+    // the rest of this file relies on is not left replaced.
+    const realFetch = global.fetch;
+    global.fetch = vi.fn(async () => completeResponse({
+      ok: true,
+      text: async () => '<!doctype html>\n<html><body><div id="root"></div></body></html>',
+    }));
+    try {
+      await expect(sceneManager.loadScene('/gone.json')).rejects.toThrow(/no asset at \/gone\.json/);
+      // The old, misleading message must NOT be what surfaces.
+      await expect(sceneManager.loadScene('/gone.json')).rejects.not.toThrow(/Unexpected token/);
+    } finally {
+      global.fetch = realFetch;
+    }
   });
 
   it('loads from opts.preloaded without fetching the scene path', async () => {

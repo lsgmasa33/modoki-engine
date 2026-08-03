@@ -148,6 +148,16 @@ versions** (gltfpack / gltf-transform / meshoptimizer). A tool upgrade therefore
 silently invalidates everything — intentional, so a simplifier bump never ships
 stale geometry.
 
+That same hash is written back into the **committed** `.meta.json` `modelCache`
+block, so a toolchain bump shows up as tracked-file churn across every affected
+model — expected, not noise. (Seen 2026-08-03: merging a dependency wave rewrote
+8 sidecars across two games, which looked like a stray editor write until the
+cause was traced.) The versions come from whatever `detect()` RESOLVED, so clones
+installing from the lockfile agree (`gltf-transform-cli` and `gltfpack` are in
+`PINNED_TOOL_VERSIONS`); a clone with **"Use system-installed SDKs" ON** and a
+different CLI on PATH will churn these sidecars against everyone else. If that
+ever happens, that is the cause — not a bug in the cache.
+
 `cacheHit()` validates each LOD by GLB magic bytes + non-zero size, so a
 SIGKILL'd partial write doesn't read back as a hit. Derived GLBs are
 **LOCAL-ONLY and gitignored**; `vite build` regenerates them into `dist/` and

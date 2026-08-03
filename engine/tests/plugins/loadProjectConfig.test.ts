@@ -8,6 +8,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
+import { hasAnyProject } from '../helpers/repoLayout';
 import {
   loadProjectConfig,
   writeProjectConfig,
@@ -144,7 +145,7 @@ describe('deepMergeConfigPatch (the WRITE-time merge — patch onto disk, not on
   });
 
   it('a key PRESENT in the patch wins even when falsy — "" / false / 0 clear a field', () => {
-    const disk = { build: { appleTeamId: 'KQ6FQ2BS8H', debugBuild: true, playableMaxBytes: 99 } };
+    const disk = { build: { appleTeamId: 'ABCDE12345', debugBuild: true, playableMaxBytes: 99 } };
     const out = deepMergeConfigPatch(disk, { build: { appleTeamId: '', debugBuild: false, playableMaxBytes: 0 } });
     expect(out).toEqual({ build: { appleTeamId: '', debugBuild: false, playableMaxBytes: 0 } });
   });
@@ -244,8 +245,8 @@ describe('pruneProjectConfig (the file stays MINIMAL — only what the project c
   });
 
   it('emits a non-default value even when the file never had the key', () => {
-    const out = prune({ build: { appleTeamId: 'KQ6FQ2BS8H' } }) as { build: Record<string, unknown> };
-    expect(out.build.appleTeamId).toBe('KQ6FQ2BS8H');
+    const out = prune({ build: { appleTeamId: 'ABCDE12345' } }) as { build: Record<string, unknown> };
+    expect(out.build.appleTeamId).toBe('ABCDE12345');
   });
 
   it('INVARIANT: pruning never changes what the project resolves to', () => {
@@ -253,7 +254,7 @@ describe('pruneProjectConfig (the file stays MINIMAL — only what the project c
     for (const onDisk of [
       {},
       { app: { appName: 'Court' } },
-      { build: { debugBuild: false, appleTeamId: 'KQ6FQ2BS8H' } },
+      { build: { debugBuild: false, appleTeamId: 'ABCDE12345' } },
       { rendering: { three: { exposure: 2 }, web: { sizeMode: 'fixed', width: 900 } } },
       { physics: { layers: ['Default', 'Player'], collisionMatrix: [0xffff, 0xffff] } },
       { postprocessors: { island: { recipeVersion: 3, file: 'runtime/pp.ts' } } },
@@ -379,7 +380,7 @@ describe('validateBuildConfig', () => {
     expect(validateBuildConfig(
       withCfg({ webBucket: 'gs://modoki-www-site/demo' }),
       withUser(
-        { androidDeviceId: '192.168.1.5:5555', iosDeviceId: '00008150-00041CAA3AB8401C' },
+        { androidDeviceId: '192.168.1.5:5555', iosDeviceId: 'DEADBEEF-0123456789ABCDEF' },
         { javaHome: '/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home' },
       ),
     )).toEqual([]);
@@ -514,7 +515,11 @@ describe('every committed project.config.json uses in-union values', () => {
     .map((p) => ({ ...p, file: path.join(p.dir, 'project.config.json') }))
     .filter((p) => fs.existsSync(p.file));
 
-  it('found projects to check', () => {
+  // The RELEASE snapshot on the public repo's `main` ships no projects at all (the CI snapshot
+  // on `ci/main` ships two demos, which is why this only ever went red on `main`), so the
+  // non-vacuity check has to gate on the loose predicate: the question here is purely "is there
+  // anything to scan?". docs/engine-oss-publishing.md.
+  it.skipIf(!hasAnyProject())('found projects to check', () => {
     expect(projects.length).toBeGreaterThan(0);
   });
 

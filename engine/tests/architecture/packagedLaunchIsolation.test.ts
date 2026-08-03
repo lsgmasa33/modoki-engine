@@ -35,7 +35,15 @@ const scriptsDir = path.resolve(__dirname, '../../scripts');
  *  shapes differ (bash `"$BIN" …` vs node `spawn(bin, …)`), and a regex loose enough to
  *  catch both would also catch every mention of the variable. A NEW launcher is caught by
  *  the completeness check below, not by this list. */
-const LAUNCHERS = ['smoke-packaged.sh', 'assert-app-renders.sh', 'assert-app-csp.mjs'] as const;
+const LAUNCHERS = [
+  'smoke-packaged.sh',
+  'assert-app-renders.sh',
+  'assert-app-csp.mjs',
+  // #21's cold-boot loop. Isolation is not incidental here — it is the MECHANISM: a fresh
+  // profile is what makes the boot cold (vite-cache lives under userData), so this script
+  // could not do its job with the shared one even if the rule allowed it.
+  'repro-cold-boot.sh',
+] as const;
 
 function read(name: string): string {
   return fs.readFileSync(path.join(scriptsDir, name), 'utf8');

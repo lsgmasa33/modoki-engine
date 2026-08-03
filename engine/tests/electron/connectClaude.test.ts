@@ -66,8 +66,8 @@ describe('buildMcpServerEntry', () => {
   });
 
   it('forward-slashes a Windows dist path (clean JSON, Node runs it either way)', () => {
-    const e = buildMcpServerEntry('C:\\Users\\shois\\AppData\\app.asar.unpacked', true, 'darwin');
-    expect(e.args[0]).toBe('C:/Users/shois/AppData/app.asar.unpacked/engine/tools/modoki-mcp/dist/index.js');
+    const e = buildMcpServerEntry('C:\\Users\\winuser\\AppData\\app.asar.unpacked', true, 'darwin');
+    expect(e.args[0]).toBe('C:/Users/winuser/AppData/app.asar.unpacked/engine/tools/modoki-mcp/dist/index.js');
     expect(e.args[0]).not.toContain('\\');
   });
 });

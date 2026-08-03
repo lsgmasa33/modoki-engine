@@ -4,13 +4,40 @@
 # steps (there is no games/ here) and git-LFS fetch (the LFS-tracked skinned-test GLBs live with a
 # game, so those tests skip). The root `npm ci` postinstall installs the MCP tool deps + builds the
 # workspace plugins, so no separate tool/game install step is needed.
+#
+# ── WHY THIS RUNS WINDOWS, AND WHY IT RUNS *HERE* (#96) ─────────────────────────────────────────
+# GitHub Actions is UNBILLED on standard runners for PUBLIC repositories — windows-latest included.
+# Privately, Windows is the single most expensive leg (2x multiplier), which is why the private
+# ci.yml is `workflow_dispatch`-only after the Actions budget was exhausted on 2026-07-31. So the
+# economics invert: the coverage that costs ~47 billed minutes in the private repo is free here.
+#
+# And Windows is not a redundant leg. This repo has a recurring class of Windows-only path bugs —
+# drive letters, separators, `/@fs/` URLs, POSIX-only assumptions like a ':'-joined PATH or
+# `chmod 0600`, an fs path used as an ESM specifier — five such fixes in six months, EVERY one
+# found by hand on the Windows clone because the gate could not see them. Most recently, Git's tar
+# on Windows is GNU tar, not bsdtar: it cannot read zips and reads `C:\...` as a remote host, which
+# silently broke ALL packaged toolchain provisioning while the smoke gate still passed.
+#
+# The code where that class lives (engine/scripts/**, engine/toolchain/**, path handling) is
+# ENTIRELY inside this snapshot, so public coverage is real coverage rather than a proxy for it.
+#
+# ⚠️ Run logs here are WORLD-READABLE and permanent — including failure output and artifacts. The
+# pre-publish safety scan covers SOURCE, not run output: a test that prints an env var or a
+# machine-specific absolute path publishes it for good. Keep that in mind when adding a step.
+#
+# This is a SUBSET gate, not a replacement for the private one: no games/, no LFS. Anything
+# game-dependent still has to run in the private repo. What it does buy that nothing else does is
+# the Windows leg on every push, for free.
 
 name: CI
 
 on:
   pull_request:
   push:
-    branches: [main]
+    # `ci/**` is the CI-snapshot branch pushed by the private repo's oss-ci-snapshot.yml on every
+    # push to private main (scripts/publish-engine-oss.sh --branch). Without it, a snapshot pushed
+    # to a throwaway branch would trigger nothing at all and the whole mechanism would be silent.
+    branches: [main, 'ci/**']
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -18,15 +45,28 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Never cancel the other OS on one failure — when a change breaks exactly one platform,
+      # seeing BOTH results is the whole diagnostic signal.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: '1'   # gate never launches Electron
     steps:
+      # Deep node_modules nesting can exceed Windows' legacy 260-char MAX_PATH and fail the
+      # checkout/install with confusing ENOENTs. Must precede checkout.
+      - name: Enable long paths (Windows)
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+
       - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: '24'   # Node 24 Active LTS — matches package.json engines + PINNED_NODE (the runtime the editor SHIPS)
           cache: npm
 
       - name: Install
@@ -41,7 +81,11 @@ jobs:
       - name: Typecheck (app + engine)
         run: npm run typecheck
 
+      # Linux only: lint is OS-invariant (the no-raw-fetch('/api/...') parity rule plus the usual
+      # ESLint pass), so a second run buys nothing even when the minutes are free — it only adds
+      # another place for the same failure to surface.
       - name: Lint (incl. the no-/api parity gate)
+        if: runner.os == 'Linux'
         run: npm run lint
 
       - name: App tests
@@ -49,3 +93,153 @@ jobs:
 
       - name: Engine tests
         run: npm --prefix engine/packages/modoki test
+
+  # ── Playwright e2e — the ONLY end-to-end coverage of editor interaction that exists ────────────
+  # It has never had a CI counterpart anywhere, private or public, and that is exactly how two
+  # specs rotted silently for months: `editor-2d-ui` waited on a DOM canvas the PixiJS cutover had
+  # deleted, and `editor-assets` clicked a button title a refactor had removed. Nothing was
+  # watching, so nothing complained.
+  #
+  # Runs here because it is free, and because the private repo deliberately runs it only on the
+  # hub clone before a push — one machine, one person remembering.
+  #
+  # ubuntu ONLY, on purpose. The value is "e2e runs at all"; a Windows browser leg is a different
+  # question (different GPU/ANGLE stack, different flake profile) and would double the wall-clock
+  # to re-prove mostly the same thing. Revisit if a Windows-only editor-input bug ever appears.
+  #
+  # Separate job, not another step in `check`: it needs a browser download the unit gate does not,
+  # and keeping it separate means a red e2e is legible at a glance instead of hidden inside a
+  # matrix leg that also runs typecheck.
+  e2e:
+    name: e2e (editor, chromium)
+    runs-on: ubuntu-latest
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'   # e2e drives the Vite dev server in a browser, not Electron
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build native plugin packages
+        run: npm run build:plugins
+
+      # `--with-deps` installs the system libraries headless Chromium needs on a bare runner.
+      # Only chromium: the suite declares no `projects`, so it runs the default browser alone —
+      # installing all three would cost a download for nothing.
+      - name: Install Playwright chromium
+        run: npx playwright install --with-deps chromium
+
+      # The suite runs SERIAL (workers: 1) and retries: 0, both deliberate — see
+      # engine/playwright.config.ts. A flake here is meant to be indistinguishable from a
+      # regression precisely so neither gets ignored; do not add retries to quiet it.
+      - name: e2e
+        run: npm run test:e2e
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-traces
+          # Repo ROOT, not engine/ — Playwright resolves outputDir against the process cwd, and
+          # `npm run test:e2e` runs from the root. Verified on disk; a wrong path here would fail
+          # silently as "no artifacts found" exactly when you need the trace.
+          path: test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ── Packaged editor: DMG + Windows installer, as ARTIFACTS ────────────────────────────────────
+  # NOT a release. No tag, no signing, no publish, nothing uploaded to Releases — the real release
+  # pipelines (release.yml / release-windows.yml) stay the only things that ship. These exist to
+  # catch PACKAGING breaks, which is a class the unit gate structurally cannot see: everything here
+  # can be green while the packaged app fails to build or start, because packaging exercises
+  # electron-builder, the beforePack stagers, asar layout and native deps — none of which `npm test`
+  # touches.
+  #
+  # Free on public runners, and macos-14 is where that matters most: privately macOS carries a 10x
+  # multiplier, so this is the leg that could never be afforded on a per-push basis. Windows is 2x
+  # and is where this repo's packaging bugs actually live (the GNU-tar-vs-bsdtar bug broke ALL
+  # packaged toolchain provisioning while the smoke gate stayed green).
+  #
+  # UNSIGNED on purpose. The public repo has no signing material for these, and it should not:
+  # an unsigned artifact proves the BUILD, which is what is being gated. CSC_IDENTITY_AUTO_DISCOVERY
+  # is off so electron-builder does not go hunting for a keychain identity and fail the job on its
+  # absence.
+  #
+  # ⚠️ These artifacts are NOT shippable, and not only because they are unsigned. The release
+  # workflows INSTALL toktx + msdf-atlas-gen before packing, because the beforePack stagers
+  # (stage-toktx.cjs / stage-msdf.cjs) copy whatever is on the build machine into
+  # Resources/bin — and when the tools are absent they degrade SILENTLY (log + skip). These jobs
+  # skip those installs to keep a per-push gate cheap, so the app they produce ships toolless:
+  # fine for proving the build, wrong for handing to anyone. Download them to debug packaging,
+  # never to distribute.
+  #
+  # Deliberately NOT wired here: `assert-app-renders.sh`, the render gate. That is #94's job and
+  # its own change — a build gate and a render gate fail for different reasons and should be
+  # legible apart.
+  package:
+    name: package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14        # Apple Silicon — matches the shipped build target
+            script: dist:mac
+            artifact: modoki-editor-dmg
+            path: release/*.dmg
+          - os: windows-latest
+            script: dist:win
+            artifact: modoki-editor-installer
+            path: release/*.exe
+    steps:
+      - name: Enable long paths (Windows)
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build native plugin packages
+        run: npm run build:plugins
+
+      - name: Build the packaged editor
+        env:
+          # No keychain/cert on these runners, and none wanted — see the header.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run ${{ matrix.script }}
+
+      # A silent electron-builder no-op would otherwise upload nothing and still go green, which
+      # is the failure mode this whole job exists to avoid. Fail loudly on an empty output.
+      - name: Verify an artifact was actually produced
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(${{ matrix.path }})
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no artifact matched '${{ matrix.path }}' — electron-builder produced nothing."
+            ls -la release/ || echo "(no release/ directory at all)"
+            exit 1
+          fi
+          printf 'built: %s\n' "${files[@]}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.path }}
+          # Short on purpose: these rebuild on every push to main, so they are a rolling
+          # build check, not an archive. The real releases are the durable artifacts.
+          retention-days: 5
+          if-no-files-found: error

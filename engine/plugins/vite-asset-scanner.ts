@@ -15,7 +15,7 @@ import { loadProjectConfig, loadProjectUserConfig, validateBuildConfig, projectC
 import { findGamesEntry } from './findGamesEntry';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './backend/gcloud';
 import { projectAssetRoots } from '../scripts/projectRoots.mjs';
-import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, type BuildTarget, type ToolId } from '../toolchain';
+import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, wdaTeamId, writeToolchainSettings, type BuildTarget, type ToolId } from '../toolchain';
 import { registerReimportHandler, type ReimportContext } from './reimport-registry';
 import { textureReimportHandler } from './reimport-texture';
 import { modelReimportHandler, resolvePostprocessorForId, validatePostprocessorRegistry, isRiggedMeta } from './reimport-model';
@@ -1627,6 +1627,20 @@ export function assetScannerPlugin(): Plugin {
               const stepEnv = await buildStepEnv();
               if (stepEnv.MODOKI_NODE) process.env.MODOKI_NODE = stepEnv.MODOKI_NODE;
               if (stepEnv.MODOKI_NPM_CLI) process.env.MODOKI_NPM_CLI = stepEnv.MODOKI_NPM_CLI;
+              // WebDriverAgent is signed per MACHINE, but the Team ID is only ever authored
+              // per PROJECT — so seed the machine setting from the open project the first time,
+              // HERE rather than inside install(). install() deliberately takes no project
+              // context (no other installer does, and threading it through would widen the
+              // toolchain contract for one tool); this route already knows the project.
+              // Only seeds when unset, so a team chosen in Build Support is never overwritten
+              // by whichever project happens to be open.
+              if (id === 'webdriveragent' && !wdaTeamId()) {
+                const team = loadProjectConfig(projectRoot).build.appleTeamId.trim();
+                if (team) {
+                  writeToolchainSettings({ wdaTeamId: team });
+                  send(`Signing WebDriverAgent with Apple Team ${team} (from this project; it is now the machine default).`);
+                }
+              }
               sendStatus(`Installing ${id}…`);
               const result = await installTool(id, { toolchainDir, onLog: (line) => send(line) });
               sendStatus('DONE');
@@ -2144,13 +2158,26 @@ export function assetScannerPlugin(): Plugin {
             if (platform === 'ios' || platform === 'android') {
               const depHeal = ensureCapacitorDeps(projectRoot, platform as NativePlatform, buildCwd);
               for (const n of depHeal.notes) send(`[heal] ${n}`);
-              if (depHeal.changed) {
-                const v = vendorEnginePlugins(projectRoot, buildCwd);
-                if (v.vendored.length) send(`[heal] vendored engine plugin(s): ${v.vendored.join(', ')}`);
-                if (!(await runScaffoldShell('npm install (healed Capacitor plugins)', 'npm install', projectRoot))) {
+              // Re-vendor UNCONDITIONALLY (#90). This used to be gated on `depHeal.changed`, but
+              // `ensureCapacitorDeps` only adds MISSING deps — a plugin already depended on is
+              // never missing, so editing `engine/packages/capacitor-*/**` had NO path into an
+              // existing native game. The build succeeded, the APK installed, and it silently
+              // contained the PREVIOUS native code: a failure in the direction that looks like
+              // success. Measured 2026-08-02 while fixing #88 — the first build compiled the old
+              // Java, caught only by hand-checking the tarball hash.
+              //
+              // Running it every build is safe by design: `vendorEnginePlugins` is idempotent and
+              // content-addressed, so an unchanged plugin maps to the SAME committed tarball and
+              // re-packs nothing. Only a real content change yields a new filename, and only then
+              // does `needsInstall` force the (slow) install.
+              const v = vendorEnginePlugins(projectRoot, buildCwd);
+              if (v.vendored.length) send(`[heal] vendored engine plugin(s): ${v.vendored.join(', ')}`);
+              if (depHeal.changed || v.needsInstall) {
+                const why = depHeal.changed ? 'healed Capacitor plugins' : 'engine plugin changed';
+                if (!(await runScaffoldShell(`npm install (${why})`, 'npm install', projectRoot))) {
                   if (aborted) return;
-                  sendStatus('FAILED:npm install (healed Capacitor plugins)');
-                  send('Build failed — could not install the added Capacitor plugin(s).');
+                  sendStatus(`FAILED:npm install (${why})`);
+                  send('Build failed — could not install the added/updated Capacitor plugin(s).');
                   res.end();
                   return;
                 }

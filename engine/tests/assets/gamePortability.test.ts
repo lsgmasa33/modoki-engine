@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
+import { hasInternalGames } from '../helpers/repoLayout';
 
 /**
  * PORTABILITY GUARD — a game project must be SELF-CONTAINED (#29): it's opened
@@ -82,7 +83,7 @@ function escapingImports(): string[] {
 
 // Skip when NO project root exists (the OSS public repo ships engine-only — nothing to
 // check portability of). docs/engine-oss-publishing.md.
-describe.skipIf(projects.length === 0)('game project portability (self-contained — no relative escapes)', () => {
+describe.skipIf(!hasInternalGames())('game project portability (self-contained — no relative escapes)', () => {
   it('no game imports outside its own folder except the known tracked coupling', () => {
     const unexpected = escapingImports().filter((e) => !KNOWN_ESCAPES.has(e));
     expect(

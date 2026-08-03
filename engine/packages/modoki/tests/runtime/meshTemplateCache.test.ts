@@ -1,6 +1,7 @@
 /** meshTemplateCache unit tests — synchronous cache lookups on an empty/fresh cache. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { completeResponse } from '../stubs/assetResponse';
 
 // Reset module cache before each test so the caches are fresh
 beforeEach(() => {
@@ -240,7 +241,9 @@ describe('meshTemplateCache', () => {
 
       // Minimal textureless pbr material so the build is synchronous (no KTX2 decode).
       const matDoc = { id: 'test-guid', type: 'pbr', color: 0xffffff, roughness: 0.5 };
-      vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => matDoc })));
+      // completeResponse fills in text() — parseAssetJson reads the body as text so it can spot
+      // Vite's index.html SPA fallback (see tests/stubs/assetResponse.ts).
+      vi.stubGlobal('fetch', vi.fn(async () => completeResponse({ ok: true, json: async () => matDoc })));
       const dirty = vi.fn();
       const unsub = addDirtyListener(dirty);
       try {

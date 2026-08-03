@@ -23,11 +23,24 @@ import path from 'path';
 import sharp from 'sharp';
 import { gotoEmptyEditor } from './helpers';
 import { makeTestGlb } from '../plugins/fixtures/makeTestGlb';
+import { discoverProjects } from '../../scripts/projectRoots.mjs';
 
-// Asset dir served by the dev server: games/3d-test/runtime/assets/__e2e_model__
-// maps to URL /games/3d-test/assets/__e2e_model__ (see vite-asset-scanner roots).
-const ABS_DIR = path.join(process.cwd(), 'games/3d-test/runtime/assets/__e2e_model__');
-const URL_GLB = '/games/3d-test/assets/__e2e_model__/test-model.glb';
+// The GLB is GENERATED below, so this spec needs only *a* served project asset root — never
+// 3d-test's content. It used to hardcode `games/3d-test`, which meant it could not run anywhere
+// games/ is absent (the public OSS snapshot), so pick a host project at runtime instead: a
+// `<root>/<name>/runtime/assets` dir maps to the URL `/<root>/<name>/assets` (vite-asset-scanner).
+//
+// games/ is PREFERRED over demos/ deliberately. Both work, but demos/ is the published set — a
+// crash between beforeAll and afterAll would strand `__e2e_model__` inside a project that gets
+// snapshotted to a public repo. Where there is a private project to use, use it.
+const HOST = (() => {
+  const projects = discoverProjects(process.cwd()) as { root: string; name: string; dir: string }[];
+  const host = projects.find((p) => p.root === 'games') ?? projects[0];
+  if (!host) throw new Error('editor-model-import: no project found to host the generated GLB');
+  return host;
+})();
+const ABS_DIR = path.join(HOST.dir, 'runtime/assets/__e2e_model__');
+const URL_GLB = `/${HOST.root}/${HOST.name}/assets/__e2e_model__/test-model.glb`;
 
 test.beforeAll(async () => {
   fs.rmSync(ABS_DIR, { recursive: true, force: true });

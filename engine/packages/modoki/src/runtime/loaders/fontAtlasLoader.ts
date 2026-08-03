@@ -14,6 +14,7 @@
 
 import { resolveRef, getAssetEntry, isGuid, onFontInvalidated } from './assetManifest';
 import { assetUrl, withCacheBust } from './assetUrl';
+import { parseAssetJson } from './assetFetch';
 import { FONT_ATLAS_SUFFIX, FONT_METRICS_SUFFIX } from '../core/fontSettings';
 import { parseChlumskyJson } from '../rendering/text/glyphAtlas';
 import { BakedFontProvider, type FontProvider } from '../rendering/text/fontProvider';
@@ -87,7 +88,8 @@ export async function acquireFont(sceneId: SceneId, guid: string): Promise<FontP
       } else {
         const res = await fetch(urls.metricsUrl);
         if (!res.ok) throw new Error(`metrics fetch ${res.status}`);
-        const atlas = parseChlumskyJson(await res.json());
+        // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
+        const atlas = parseChlumskyJson(await parseAssetJson(res, urls.metricsUrl));
         provider = new BakedFontProvider(guid, atlas, urls.atlasUrl);
       }
       // The scene that requested this may have been released while the fetch/gen was

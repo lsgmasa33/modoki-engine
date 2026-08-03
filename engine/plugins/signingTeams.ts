@@ -1,5 +1,5 @@
 /** Discover the Apple developer *teams* usable for iOS signing on this machine,
- *  so the editor can offer a "Nomura Masaki (KQ6FQ2BS8H)" dropdown instead of a
+ *  so the editor can offer a "Example Team (ABCDE12345)" dropdown instead of a
  *  raw 10-char Team ID text box, and the build can turn Xcode's cryptic
  *  "No Account for Team X" into an actionable list.
  *
@@ -22,7 +22,7 @@ import { execFileSync } from 'node:child_process';
 export interface SigningTeam {
   /** 10-char Apple Team ID — the value written to DEVELOPMENT_TEAM. */
   id: string;
-  /** Human team name (e.g. "Nomura Masaki") — for display only. */
+  /** Human team name (e.g. "Example Team") — for display only. */
   name: string;
   /** Where we found it: a provisioning profile and/or a signing cert. */
   sources: ('profile' | 'cert')[];
@@ -41,7 +41,7 @@ export function parseProvisioningPlist(xml: string): { id: string; name: string 
 }
 
 /** Parse `security find-identity -v -p codesigning` output into team {id,name}.
- *  Lines look like: `  2) ABC…DEF "Apple Development: Nomura Masaki (R8UF373395)"`.
+ *  Lines look like: `  2) ABC…DEF "Apple Development: Example Team (KLMNO13579)"`.
  *  Only development/distribution identities carry a usable team id in parens. */
 export function parseSigningIdentities(output: string): { id: string; name: string }[] {
   const out: { id: string; name: string }[] = [];

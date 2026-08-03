@@ -27,9 +27,9 @@ import { findGamesEntry } from '../../plugins/findGamesEntry';
 
 // engine/tests/plugins/ → repo root (games/ + engine/packages/modoki live there).
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
-// Skip the game-directory-discovery cases when games/ is absent (engine-only OSS repo).
-// docs/engine-oss-publishing.md.
-const hasGames = fs.existsSync(path.join(PROJECT_ROOT, 'games'));
+// No project-presence gate here any more: the game-directory-discovery cases used to skip when
+// games/ was absent, which meant zero coverage of that path in the CI snapshot. They now build a
+// monorepo-shaped tree in tmpdir and run everywhere (#98).
 
 describe('detectType', () => {
   it('classifies a .shader.json as a shader asset', () => {
@@ -98,8 +98,8 @@ describe('gamesModuleSource (virtual:modoki-games — Windows separator safety)'
   // Windows editor's web/native build (and baked game module) broke. Assert the fix from
   // macOS/Linux CI by feeding a Windows path.
   it('forward-slashes a Windows game.ts path in the import specifier', () => {
-    const src = gamesModuleSource({ kind: 'single', path: 'C:\\Users\\shois\\proj\\game.ts' });
-    expect(src).toContain('import { game } from "C:/Users/shois/proj/game"');
+    const src = gamesModuleSource({ kind: 'single', path: 'C:\\Users\\winuser\\proj\\game.ts' });
+    expect(src).toContain('import { game } from "C:/Users/winuser/proj/game"');
     expect(src).not.toContain('\\'); // no backslash survives into the emitted module
   });
   it('leaves a POSIX path clean and strips the extension', () => {
@@ -472,16 +472,39 @@ describe('findAssetRoots (real project)', () => {
     expect(modoki!.absDir.replace(/\\/g, '/')).toContain('packages/modoki/src/runtime/assets');
   });
 
-  it.skipIf(!hasGames)('discovers game asset directories', () => {
-    const roots = findAssetRoots(PROJECT_ROOT);
-    const game3d = roots.find(r => r.urlPrefix === '/games/3d-test/assets');
-    expect(game3d).toBeDefined();
-    expect(game3d!.absDir.replace(/\\/g, '/')).toContain('games/3d-test/runtime/assets');
+  // These two assert ENGINE behaviour — that a monorepo-shaped root yields a `/games/<id>/assets`
+  // entry, and that discovery returns the engine root plus each project — so they build their own
+  // monorepo-shaped tree instead of leaning on games/3d-test. They used to be `skipIf(!hasGames)`,
+  // which meant ZERO coverage of this path in the CI snapshot; now they run everywhere (#98).
+  //
+  // The 3d-test-specific versions proved nothing extra: what makes them pass is the SHAPE
+  // (`<root>/games/<id>/runtime/assets`), not that particular game's content.
+  it('discovers game asset directories under a monorepo-shaped root', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-mono-'));
+    try {
+      fs.mkdirSync(path.join(tmp, 'games/probe-game/runtime/assets/scenes'), { recursive: true });
+      const roots = findAssetRoots(tmp);
+      const game = roots.find(r => r.urlPrefix === '/games/probe-game/assets');
+      expect(game).toBeDefined();
+      expect(game!.absDir.replace(/\\/g, '/')).toContain('games/probe-game/runtime/assets');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
-  it.skipIf(!hasGames)('returns at least 2 roots (modoki + at least one game)', () => {
-    const roots = findAssetRoots(PROJECT_ROOT);
-    expect(roots.length).toBeGreaterThanOrEqual(2);
+  it('returns at least 2 roots (modoki + at least one game)', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-mono2-'));
+    try {
+      fs.mkdirSync(path.join(tmp, 'games/probe-game/runtime/assets'), { recursive: true });
+      const roots = findAssetRoots(tmp);
+      expect(roots.length).toBeGreaterThanOrEqual(2);
+      // Name both, so a regression that drops one and duplicates the other cannot pass a
+      // bare count.
+      expect(roots.some(r => r.urlPrefix === '/modoki/assets')).toBe(true);
+      expect(roots.some(r => r.urlPrefix === '/games/probe-game/assets')).toBe(true);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   it('serves a flat one-game project\'s assets at /assets (no /games/<id>/ segment)', () => {

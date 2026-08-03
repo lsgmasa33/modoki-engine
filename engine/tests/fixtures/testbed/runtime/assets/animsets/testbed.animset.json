@@ -1,0 +1,27 @@
+{
+  "id": "97331add-daee-4ae3-83ce-ee75ba4e1387",
+  "clips": [
+    {
+      "name": "Loop-Fast",
+      "speed": 1.2,
+      "loop": true,
+      "fadeDuration": 0.2
+    },
+    {
+      "name": "OneShot",
+      "speed": 1,
+      "loop": false,
+      "fadeDuration": 0.1
+    },
+    {
+      "name": "Idle",
+      "speed": 1,
+      "loop": true,
+      "fadeDuration": 0.3
+    },
+    {
+      "name": "PartiallyAuthored",
+      "speed": 0.5
+    }
+  ]
+}

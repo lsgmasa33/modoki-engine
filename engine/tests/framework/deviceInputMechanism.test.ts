@@ -1,4 +1,4 @@
-/** Phase 0 of #32 (docs/plans/trusted-device-input-plan.md): every device input handler in
+/** Phase 0 of #32 (docs/trusted-device-input.md): every device input handler in
  *  `app/debug/bridge.ts` must report the mechanism it actually used, so an agent is never misled
  *  about input fidelity. Today that mechanism is `INPUT_MECHANISM` ('synthetic') for all seven
  *  ops — the six string-returning handlers (tap/drag/pointer/press-key/hover/scroll) get a

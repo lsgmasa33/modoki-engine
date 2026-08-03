@@ -35,7 +35,7 @@ Grouped:
   `device_connect` (open the lease — `ip`/`useAdb`, or bare to reconnect the last target) ·
   `device_disconnect` · `device_eval` (compact, size-capped JSON; survives a circular result;
   `code` sees an injected `modoki` scripting object — the live agent-op registry, generated per op)
-  · `device_eval_api` (discovery: what that object exposes) ·
+  · `device_eval_api` (discovery: what that object exposes — **and what it does not**) ·
   `device_screenshot` ·
   `device_console_logs` · `device_native_logs` (both default `limit:50`).
 - **Percept (read-by-data):** `device_get_scene_state` · `device_diagnose` · `device_journal` ·
@@ -43,11 +43,65 @@ Grouped:
 - **Enact (input):** `device_tap` · `device_drag` · `device_pointer` (sustained/HELD
   press, split into down/move/up — the stateful twin of `device_drag`) · `device_dispatch_action` ·
   `device_press_key` · `device_hover` · `device_scroll` · `device_type_text`.
-  ⚠️ **Device input is SYNTHETIC, not trusted** — unlike the editor's `modoki_*` twins, which go
-  through Electron's real `sendInputEvent`. Every reply says so (` [input:synthetic]`, or an
-  `inputMechanism` field on `device_type_text`), and `device_status` reports it so you can ask
-  before you act. What that costs you, and the plan to close it per platform, is
-  [docs/enact.md](enact.md) § input fidelity → `docs/plans/trusted-device-input-plan.md` (#32).
+  **Input fidelity is now PER PLATFORM AND PER OP (#32 Phases 1–2) — check, do not assume.** On
+  **Android**, `tap`/`drag`/`press_key`/`hover`/`scroll` are delivered as REAL trusted input
+  (`isTrusted: true`) by injecting host-side over the WebView's CDP socket; replies say
+  ` [input:trusted-cdp]`. On **iOS**, `tap` and `drag` are trusted via WebDriverAgent
+  (` [input:trusted-wda]`) — **but only those two**: WDA has no `wheel` action, a touchscreen has no
+  hover, and a trusted key reaches only a focused element, so `press_key`/`hover`/`scroll` stay
+  synthetic there by design. WDA is a Build Support item and starts **lazily on the first iOS input
+  op** (~6s), then is torn down with the lease. When no trusted route exists, ops fall back to a
+  SYNTHETIC DOM event —
+  and that fallback is **loud**: the reply is fronted by a banner naming the cause and its
+  consequences, because a trailing ` [input:synthetic]` on a long line is too easy to skim past.
+  `device_pointer` and `device_type_text` are NOT routed in Phase 1 and stay synthetic on every
+  platform — they carry the same banner, since a `tap` coming back trusted on the same device makes
+  silence there actively misleading. `device_status` live-probes the mechanism (the WHOLE chain: a
+  CDP session AND an app build that answers `resolve-aim`), so you can ask before you act. Detail:
+  [docs/enact.md](enact.md) § input fidelity; iOS is `docs/trusted-device-input.md`
+  Phase 2 (#32).
+
+  **Synthetic input: which canvas gets it** (#93). A synthetic canvas dispatch has to CHOOSE a
+  target element — a trusted injection does not, because the browser hit-tests for it. That choice
+  used to be `document.querySelector('canvas')`, i.e. the first canvas in the document regardless of
+  the aim. Measured on `games/3d-test` (full-screen Three.js canvas at index 0, a 200x300 PixiJS
+  canvas at index 1): an aim at (130,503), inside the Pixi canvas, was dispatched on canvas 0 — and
+  the reply still said `ok` with the right coordinates, so it read as a hit. Any project layering 2D
+  over 3D was affected, and only on the synthetic path.
+  It now hit-tests, and **says how it chose** in the reply so a guess cannot pass for a hit:
+
+  | marker | meaning |
+  |---|---|
+  | `canvas:hit` | `elementFromPoint` landed on a canvas. The honest answer. |
+  | `canvas:only` | not over a canvas, but the document has exactly one — nothing to disambiguate. |
+  | `canvas:contains` | an overlay won the hit-test; fell back to the topmost canvas whose rect contains the point. |
+  | `canvas:ambiguous` | several canvases, the point in none. Picks the first — **this one is a guess.** |
+
+  A gesture (`device_drag`, and `device_pointer`'s down→move→up) picks the canvas ONCE at the grab
+  point and keeps it for the whole sequence, mirroring pointer capture: a drag that leaves the
+  canvas still delivers its moves and its `up` there, rather than switching mid-gesture to an
+  element that never saw the `down`.
+
+  **The `contains` tier is load-bearing, not a corner case.** Measured on the Samsung
+  (`com.modokiengine.tropicalisland`, two canvases): a tap at (130,503) resolved `canvas:contains`,
+  not `canvas:hit`, because `document.elementFromPoint(130,503)` returned **null** at a point a
+  canvas visibly covers. Cause not established — it is not the marker overlay (`pointer-events:none`)
+  and the same call returns the canvas for a centre-of-screen aim on a single-canvas scene. So do
+  not treat hit-testing as sufficient on device: geometry is what produced the right target here,
+  and without that tier the aim would have fallen through to `ambiguous` — i.e. straight back to the
+  first-canvas bug.
+
+**What `device_eval` CANNOT do, and why it is not an oversight** (#101). The injected `modoki`
+object covers the device's **agent ops**. Input (`tap`/`drag`/`pointer`/`press-key`/`hover`/
+`scroll`/`type-text`) and `screenshot` are **not** ops — they are bridge-level methods, and trusted
+input is dispatched HOST-SIDE by the backend precisely because *a page cannot dispatch a trusted
+event to itself*. So `modoki.call('tap')` answers `Unknown method:`, and unlike the editor there is
+no `modoki.api()` to route around it (nor `composite()` — no undo stack on device). The trap worth
+knowing: `resolve-dom-point`/`resolve-entity-point` ARE ops, so a script can compute exactly where
+to tap and then be unable to tap. Use the `device_*` input tools for that half — each MCP call
+keeps its full trusted routing. `device_eval_api` states this boundary in its reply; the guidance
+lives in the MCP server rather than on-device because **the app is a shipped artifact that can be
+older than the server**, and on-device text would report the old build's wording.
 
 ⚠️ **Which APP is answering? The bridge port (9095) is a FIXED default shared by every Modoki
 game**, and Android keeps a backgrounded app resident. If another Modoki app already owns 9095, the
@@ -77,12 +131,19 @@ Two limits on that check, both measured on the Samsung 2026-08-02 — know them 
   `App: UNKNOWN — … predates #88 …` rather than swallowing it. An old bridge on the socket is
   itself the signal: it is not the app you just launched. The named identity only appears once the
   squatter is also on a post-#88 build, which is why all nine projects were re-vendored together.
-- **The EADDRINUSE fallback buys honesty, not reachability.** The app rebinds to an OS-assigned
-  port and logs the true one, but the lease dials a fixed `DEVICE_PORT = 9095`
-  (`engine/plugins/backend/deviceConnection.ts`) and `adb forward` maps `tcp:9095 → tcp:9095`.
-  Nothing discovers the fallback port, so a fallen-back app is not reachable over the lease at all —
-  the connection still lands on the squatter. The fix stops the *lie*; the remedy is still to
-  force-stop the other app so your app gets 9095.
+- **The EADDRINUSE fallback buys honesty, not reachability — so #95 removed the collision at its
+  source instead.** The app rebinds to an OS-assigned port and logs the true one, but the lease
+  dials a fixed `DEVICE_PORT = 9095` (`engine/plugins/backend/deviceConnection.ts`) and
+  `adb forward` maps `tcp:9095 → tcp:9095`; nothing discovers the fallback port, so a fallen-back
+  app is not reachable over the lease at all. Rather than teach the host to chase a moving port,
+  **the bridge now RELEASES the port when the app backgrounds and re-binds when it returns**, making
+  *at most one Modoki app listens, and it is the one on screen* an invariant. Consequences worth
+  knowing: a **backgrounded Android app can no longer be driven** (deliberate — the tools drive what
+  is on screen, and iOS suspends background apps anyway), and the lease drops on background and
+  reconnects on return. This NARROWS the app-switch race rather than closing it (resume can precede
+  the other app's pause), and an app built before #95 still squats — so when a connect fails on
+  9095, closing the other Modoki apps remains the fix, and `device_connect` accepts an explicit
+  `port` for the case where you can read the real one from the log or the in-game debug menu.
 
 **How the Percept/Enact tools work — one delegation, zero duplication.** The device runs the SAME game
 ECS + renderer + DOM as the editor, and the Percept/Enact op registry (`engine/app/debug/agentBridge.ts`
@@ -101,6 +162,11 @@ renders a WebGPU (Dawn/Vulkan) canvas **black** — only the DOM HUD survives �
 uses `adb screencap` for an adb lease (full framebuffer) but has nothing to fall back on over WiFi.
 `device_diagnose` (render/scene health as data) and `device_get_scene_state` are the reliable channel.
 `device_screenshot` returns a **PATH, not an image** (`inline:true` only when you must see pixels).
+On **iOS**, `device_screenshot {source:'wda'}` captures the WHOLE DEVICE SCREEN via WebDriverAgent —
+the only way to see a system permission/ATT dialog or springboard, which the app's own capture
+cannot (it returns the app *underneath* the dialog, looking like a fine screenshot of the wrong
+thing). ⚠️ Its pixels are device-screen coordinates and must **not** be fed to `device_tap`. Detail:
+[docs/trusted-device-input.md](trusted-device-input.md) § "WDA also captures the screen" (#102).
 
 **Enact aiming — prefer a `selector`.** `device_tap`/`device_drag` resolve a CSS `selector` on-device
 (occlusion-checked, no screenshot round-trip — the fix for tapping DOM chrome like a debug-menu ✕), or

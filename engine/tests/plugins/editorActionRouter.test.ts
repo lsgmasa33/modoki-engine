@@ -9,7 +9,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
-import { DEFAULT_PROJECT_CONFIG, DEFAULT_PROJECT_USER_CONFIG } from '../../project-config';
+import { DEFAULT_PROJECT_CONFIG } from '../../project-config';
 
 function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
   const base = {
@@ -663,14 +663,14 @@ describe('/api/project-settings is a non-destructive PATCH', () => {
   it('a partial second set does NOT revert the sections it omits (the reported scenario)', async () => {
     await settings({
       app: { appId: 'com.modokiengine.court', appName: 'Court' },
-      build: { appleTeamId: 'KQ6FQ2BS8H', debugBuild: true },
+      build: { appleTeamId: 'ABCDE12345', debugBuild: true },
     });
     await settings({ build: { debugBuild: false } });
 
     const cfg = readCfg();
     expect(cfg.app.appId).toBe('com.modokiengine.court');
     expect(cfg.app.appName).toBe('Court');
-    expect(cfg.build.appleTeamId).toBe('KQ6FQ2BS8H');
+    expect(cfg.build.appleTeamId).toBe('ABCDE12345');
     expect(cfg.build.debugBuild).toBe(false);
   });
 
@@ -711,7 +711,7 @@ describe('/api/project-settings is a non-destructive PATCH', () => {
   });
 
   it('a full-object save (the Project Settings dialog) can still BLANK a field', async () => {
-    await settings({ app: { appId: 'com.x.y', appName: 'Y' }, build: { appleTeamId: 'KQ6FQ2BS8H', webCdnUrlMap: 'static-lb' } });
+    await settings({ app: { appId: 'com.x.y', appName: 'Y' }, build: { appleTeamId: 'ABCDE12345', webCdnUrlMap: 'static-lb' } });
     const full = (await get('/api/project-settings', makeCtx({ projectRoot: root }))) as { body: Record<string, never> };
     // Post the whole GET response back with one field blanked, exactly as the dialog does.
     await settings({ ...full.body, build: { ...(full.body as never as { build: object }).build, appleTeamId: '' } });
@@ -793,13 +793,19 @@ describe('/api/project-settings is a non-destructive PATCH', () => {
     expect(fs.readFileSync(cfgPath(), 'utf8')).toBe(before);
   });
 
-  it('does NOT leak the default device UDID into a user file that never set one', async () => {
-    // DEFAULT_PROJECT_USER_CONFIG carries the repo owner's real iPhone UDID, so the
-    // old write-the-resolved-config behaviour stamped it into every dev's machine file.
-    await settings({ user: { device: { androidDeviceId: 'RFCTB0EV83K' } } });
+  it('writes ONLY the fields that were set — never the defaults for the rest', async () => {
+    // The old write-the-resolved-config behaviour stamped every DEFAULT_PROJECT_USER_CONFIG
+    // value into each dev's machine file. That leaked the repo owner's real iPhone UDID
+    // until #103 blanked those defaults; the defaults are empty now, so asserting on the
+    // literal id would be vacuous (`not.toContain('')` can never pass). Assert the BEHAVIOUR
+    // instead — an unset field must be ABSENT — which still catches the stamping regression
+    // and keeps working if a default ever becomes non-empty again.
+    await settings({ user: { device: { androidDeviceId: 'EXAMPLESERIAL1' } } });
     const raw = fs.readFileSync(path.join(root, 'project.user.json'), 'utf8');
-    expect(raw).toContain('RFCTB0EV83K');
-    expect(raw).not.toContain(DEFAULT_PROJECT_USER_CONFIG.device.iosDeviceId);
+    expect(raw).toContain('EXAMPLESERIAL1');
+    const written = JSON.parse(raw) as { device?: Record<string, unknown>; sdk?: unknown };
+    expect(written.device).toEqual({ androidDeviceId: 'EXAMPLESERIAL1' });
+    expect(written.sdk).toBeUndefined();
   });
 
   it('routes the `user` subtree to project.user.json, also as a patch', async () => {

@@ -34,12 +34,16 @@ let initialized = false;
 // --- Input fidelity (#32) ---
 
 /** What mechanism EVERY device input handler below actually uses to deliver a tap/drag/pointer/
- *  key/hover/scroll/type. Today that is a synthetic DOM event (+ a private-API PixiJS v8 poke for
- *  the canvas ops) — never OS-level trusted input. This is the SINGLE place that fact lives; every
- *  handler reads this constant rather than a per-handler literal, so Phase 1 (Android CDP) and
- *  Phase 2 (iOS WebDriverAgent) in docs/plans/trusted-device-input-plan.md change ONLY this one
- *  spot (eventually replacing the constant with per-platform detection) as each trusted route
- *  lands. See also `docs/enact.md` § "Input fidelity".
+ *  key/hover/scroll/type. Today that is a synthetic DOM event — never OS-level trusted input. (It
+ *  once also poked PixiJS v8's private event system for the canvas ops; that was inert and is gone
+ *  — see `pickCanvasAt` and #93.) This is the SINGLE place that fact lives; every
+ *  handler reads this constant rather than a per-handler literal.
+ *
+ *  Note this is the IN-PAGE mechanism only, and it stays 'synthetic' permanently: trusted input is
+ *  injected HOST-SIDE (a page cannot dispatch a trusted event to itself), so neither the Android
+ *  CDP route nor the iOS WebDriverAgent route runs through this bundle at all. What a device_* reply
+ *  reports is chosen by the router; this constant is what the FALLBACK path uses. See
+ *  docs/trusted-device-input.md and `docs/enact.md` § "Input fidelity".
  *  Wire format: appended to a successful string reply as ` [input:synthetic]`; the object-shaped
  *  type-text reply carries it as a real `inputMechanism` field instead (see handleType).
  *  Exported so `deviceInputMechanism.test.ts` asserts against THIS value rather than a duplicated
@@ -91,14 +95,6 @@ export async function handleEval(params: Record<string, unknown>): Promise<unkno
  *  lives in bridgeHelpers so it's unit-tested directly. */
 function screenshotToCSS(sx: number, sy: number, screenInfo?: ScreenInfoParam): { x: number; y: number } {
   return toCSS(sx, sy, { screenInfo, lastScreenInfo, dpr: window.devicePixelRatio || 1 });
-}
-
-/** Create a PointerEvent for PixiJS */
-function mkPointerEvent(type: string, x: number, y: number): PointerEvent {
-  return new PointerEvent(type, {
-    clientX: x, clientY: y, bubbles: true,
-    pointerId: 1, pointerType: 'touch', isPrimary: true, button: 0,
-  });
 }
 
 // --- Visual Debug Markers ---
@@ -155,15 +151,44 @@ function showDragLine(fromX: number, fromY: number, toX: number, toY: number) {
   scheduleMarkerTimeout(() => svg.remove(), 4000);
 }
 
-/**
- * Dispatch pointer event through PixiJS's internal EventSystem.
- * Synthetic DOM events (canvas.dispatchEvent) don't reach PixiJS v8 —
- * we must call _onPointerDown/_onPointerMove/_onPointerUp directly.
- */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function getPixiEventSystem(): any | null {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (window as any).__pixiApp?.renderer?.events ?? null;
+/** Which canvas is under the aim point (#93).
+ *
+ *  This USED to be `document.querySelector('canvas')` — the first canvas in the document,
+ *  regardless of where the call aimed. Measured on `games/3d-test`, which mounts a full-screen
+ *  Three.js canvas (index 0) and a 200x300 PixiJS canvas at (30,353) (index 1): a synthetic aim at
+ *  (130,503), squarely inside the Pixi canvas, was dispatched on canvas 0 — while the trusted CDP
+ *  path at the same point correctly reached canvas 1. The reply still said `ok` and echoed the
+ *  coordinates, so it read as a hit. Any project with a 2D layer over a 3D one was affected.
+ *
+ *  `how` is reported back in the reply so the caller can tell a real hit from a guess:
+ *  - `hit`       — `elementFromPoint` landed on a canvas (or inside one). The honest answer.
+ *  - `only`      — the point is not over a canvas, but the document has exactly one, so there is
+ *                  nothing to disambiguate. (Also the jsdom case: no layout, so every rect is 0x0.)
+ *  - `contains`  — several canvases and the point missed them all per hit-testing (an overlay is on
+ *                  top), so pick the LAST one whose rect contains the point — DOM order approximates
+ *                  paint order, so the last is the topmost.
+ *  - `ambiguous` — several canvases and none contains the point. Falls back to the first, i.e. the
+ *                  OLD behaviour, but now says so instead of reporting a clean hit.
+ *
+ *  Note the marker overlay cannot skew the hit test: `ensureMarkerContainer` sets
+ *  `pointer-events:none`, which is also why the DOM-button check above already trusts
+ *  `elementFromPoint` after drawing a marker. */
+type CanvasPick = { canvas: HTMLCanvasElement | null; how: 'hit' | 'only' | 'contains' | 'ambiguous' };
+
+function pickCanvasAt(x: number, y: number): CanvasPick {
+  const hit = document.elementFromPoint(x, y);
+  const hitCanvas = hit instanceof HTMLCanvasElement ? hit : (hit?.closest('canvas') ?? null);
+  if (hitCanvas) return { canvas: hitCanvas as HTMLCanvasElement, how: 'hit' };
+
+  const all = Array.from(document.querySelectorAll('canvas'));
+  if (all.length === 0) return { canvas: null, how: 'ambiguous' };
+  if (all.length === 1) return { canvas: all[0], how: 'only' };
+
+  for (let i = all.length - 1; i >= 0; i--) {
+    const r = all[i].getBoundingClientRect();
+    if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return { canvas: all[i], how: 'contains' };
+  }
+  return { canvas: all[0], how: 'ambiguous' };
 }
 
 // --- Aim resolution (Enact: selector OR screenshot pixels → a CSS viewport point) ---
@@ -204,6 +229,33 @@ async function resolveAim(params: Record<string, unknown>, selKey: string, xKey:
   return { x, y, label: `css(${Math.round(x)},${Math.round(y)})` };
 }
 
+/** Resolve-ONLY twin of `resolveAim`, for the trusted-CDP route (#32 Phase 1): the backend needs a
+ *  CSS point to feed `Input.dispatchTouchEvent`/etc, but a page can't dispatch a TRUSTED event to
+ *  itself, so injection has to happen host-side — while aim resolution (selector lookup, occlusion
+ *  check, screenshot-pixel→CSS conversion) is in-page state only this bridge has. This splits the
+ *  two: same `resolveAim` logic, no dispatch. `selKey`/`xKey`/`yKey` default to 'selector'/'x'/'y'
+ *  (a plain tap/hover) but the caller can point them at 'fromSelector'/'fromX'/'fromY' or
+ *  'toSelector'/'toX'/'toY' for a drag's two ends.
+ *
+ *  `center:true` replicates the ONE piece of pre-processing `handleScroll` does before calling
+ *  `resolveAim` — defaulting to the viewport center when no selector/x/y was given — so a
+ *  host-side scroll route gets the same "no aim ⇒ center" behavior without the backend having to
+ *  know the device's viewport size (only the page does). This is NOT duplicated aim logic, just
+ *  the same default `handleScroll` already applies, generalized to whichever key names the caller
+ *  is resolving. */
+export async function handleResolveAim(params: Record<string, unknown>): Promise<Aim> {
+  const selKey = (params.selKey as string) || 'selector';
+  const xKey = (params.xKey as string) || 'x';
+  const yKey = (params.yKey as string) || 'y';
+  let p = params;
+  if (params.center === true) {
+    const hasAim = typeof params[selKey] === 'string' && params[selKey]
+      || (typeof params[xKey] === 'number' && typeof params[yKey] === 'number');
+    if (!hasAim) p = { ...params, [xKey]: window.innerWidth / 2, [yKey]: window.innerHeight / 2 };
+  }
+  return resolveAim(p, selKey, xKey, yKey);
+}
+
 /** A window-bubbling pointer event init at (x,y) — the mouse-pointer shape a real tap/drag carries. */
 function ptrInit(x: number, y: number): PointerEventInit {
   return { clientX: x, clientY: y, bubbles: true, pointerId: 1, pointerType: 'mouse', isPrimary: true };
@@ -232,17 +284,13 @@ async function dispatchTapAt(x: number, y: number): Promise<string> {
     return msg;
   }
 
-  const canvas = document.querySelector('canvas');
-  const es = getPixiEventSystem();
-  if (!canvas && !es) return 'Error: No canvas element found';
-  if (canvas) canvas.dispatchEvent(new PointerEvent('pointerdown', ptrInit(x, y)));
-  if (es) es._onPointerDown(mkPointerEvent('pointerdown', x, y));
+  const { canvas, how } = pickCanvasAt(x, y);
+  if (!canvas) return 'Error: No canvas element found';
+  canvas.dispatchEvent(new PointerEvent('pointerdown', ptrInit(x, y)));
   await new Promise((r) => setTimeout(r, 50)); // hold ~1–2 frames so per-frame Input sampling sees the down edge
-  if (canvas) canvas.dispatchEvent(new PointerEvent('pointerup', ptrInit(x, y)));
-  if (es) es._onPointerUp(mkPointerEvent('pointerup', x, y));
-  const via = [canvas && 'window', es && 'pixi'].filter(Boolean).join('+');
-  _log(`[debug-bridge] TAP → ${via} css(${x.toFixed(1)},${y.toFixed(1)})`);
-  return `ok (${via}) css(${Math.round(x)},${Math.round(y)})`;
+  canvas.dispatchEvent(new PointerEvent('pointerup', ptrInit(x, y)));
+  _log(`[debug-bridge] TAP → canvas:${how} css(${x.toFixed(1)},${y.toFixed(1)})`);
+  return `ok (canvas:${how}) css(${Math.round(x)},${Math.round(y)})`;
 }
 
 export async function handleTap(params: Record<string, unknown>): Promise<string> {
@@ -282,30 +330,27 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
     return withMechanismSuffix(await domDrag(grabEl, from, to, steps, delayMs));
   }
 
-  // World-space drag: dispatch a real pointer sequence ON the canvas so it bubbles to `window` and
-  // feeds the source-agnostic pointer source (the sanctioned Input seam a game reads via
-  // Input.pointerDrag), AND drive PixiJS's federated EventSystem directly when present (synthetic DOM
-  // events don't reach Pixi v8). Doing BOTH mirrors a real finger — window + Pixi's canvas listener
-  // both see it — so the drag works whether the game reads the Input seam or Pixi sprite interaction.
-  // (The old code returned after the Pixi branch, so a Pixi game never fed the seam.)
-  const canvas = document.querySelector('canvas');
-  const es = getPixiEventSystem();
-  if (!canvas && !es) return 'Error: No canvas element found';
-  if (canvas) canvas.dispatchEvent(new PointerEvent('pointerdown', ptrInit(from.x, from.y)));
-  if (es) es._onPointerDown(mkPointerEvent('pointerdown', from.x, from.y));
+  // World-space drag: dispatch a real pointer sequence ON the canvas under the GRAB point so it
+  // bubbles to `window` and feeds the source-agnostic pointer source (the sanctioned Input seam a
+  // game reads via Input.pointerDrag), and so the canvas's own listeners — Pixi's federated
+  // EventSystem, Three's raycast handlers — see the same sequence a real finger would produce.
+  // The whole gesture goes to the canvas picked at `from`, not re-picked per step: a real pointer
+  // capture stays with the element it grabbed, so a drag that leaves the canvas still delivers its
+  // moves and its up there. (#93 — this used to be the FIRST canvas in the document, so a grab on a
+  // 2D layer over a 3D one dragged the 3D canvas instead.)
+  const { canvas, how } = pickCanvasAt(from.x, from.y);
+  if (!canvas) return 'Error: No canvas element found';
+  canvas.dispatchEvent(new PointerEvent('pointerdown', ptrInit(from.x, from.y)));
   for (let i = 1; i <= steps; i++) {
     const t = i / steps;
     const x = from.x + (to.x - from.x) * t;
     const y = from.y + (to.y - from.y) * t;
     await new Promise((r) => setTimeout(r, delayMs));
-    if (canvas) canvas.dispatchEvent(new PointerEvent('pointermove', ptrInit(x, y)));
-    if (es) es._onPointerMove(mkPointerEvent('pointermove', x, y));
+    canvas.dispatchEvent(new PointerEvent('pointermove', ptrInit(x, y)));
   }
-  if (canvas) canvas.dispatchEvent(new PointerEvent('pointerup', ptrInit(to.x, to.y)));
-  if (es) es._onPointerUp(mkPointerEvent('pointerup', to.x, to.y));
-  const via = [canvas && 'window', es && 'pixi'].filter(Boolean).join('+');
-  _log(`[debug-bridge] DRAG → ${via}`);
-  return withMechanismSuffix(`ok (${via}) css(${Math.round(from.x)},${Math.round(from.y)})→(${Math.round(to.x)},${Math.round(to.y)})`);
+  canvas.dispatchEvent(new PointerEvent('pointerup', ptrInit(to.x, to.y)));
+  _log(`[debug-bridge] DRAG → canvas:${how}`);
+  return withMechanismSuffix(`ok (canvas:${how}) css(${Math.round(from.x)},${Math.round(from.y)})→(${Math.round(to.x)},${Math.round(to.y)})`);
 }
 
 function handleConsoleLogs(params: Record<string, unknown>): ReturnType<typeof consoleRing.query> {
@@ -336,6 +381,58 @@ export async function handleAppIdentity(): Promise<{ platform: string; appId: st
   }
 }
 
+/** Build the `appStateChange` handler that makes THE FOREGROUND APP OWN THE PORT (#95).
+ *
+ *  Port 9095 is a fixed default shared by every Modoki game, and a backgrounded app kept its
+ *  listener alive — so a stale app silently owned the socket and answered for the one you had just
+ *  launched (#88), or forced it onto an OS-assigned port nothing on the host could discover (#95).
+ *  Releasing on pause makes "at most one Modoki app is listening, and it is the one on screen" an
+ *  invariant, which removes the collision at its source instead of teaching the host to chase a
+ *  moving port.
+ *
+ *  Extracted from `initNativeBridge` so it is unit-testable without Capacitor: the behaviour was
+ *  verified on hardware, but hardware cannot re-run in CI, and the parts most likely to rot are
+ *  exactly the ones a device run makes invisible — that each state maps to the right call, and that
+ *  a slow rebind cannot stack with the next state flip. If the pause branch stops calling `stop`,
+ *  nothing fails loudly: the port just stays held and the #88 wrong-app hazard quietly returns.
+ *
+ *  Deliberately accepted: a BACKGROUNDED Android app can no longer be driven. The device tools
+ *  drive what is on screen, and on iOS a backgrounded app is suspended and could not answer anyway.
+ *  This NARROWS the app-switch race rather than closing it (resume can precede the other app's
+ *  pause), so the EADDRINUSE fallback and its loud reporting stay. */
+export function createPortLifecycleHandler(deps: {
+  start: () => Promise<{ port: number }>;
+  stop: () => Promise<{ ok: boolean }>;
+  log: (...args: unknown[]) => void;
+}): (state: { isActive: boolean }) => void {
+  let busy = false;
+  return ({ isActive }) => {
+    void (async () => {
+      if (busy) return; // a slow rebind must not stack with the next state flip
+      busy = true;
+      try {
+        if (!isActive) {
+          await deps.stop();
+          deps.log('[debug-bridge] backgrounded — released the port so the next app can bind it (#95)');
+        } else {
+          // Idempotent natively (startServer early-returns when already running), so a resume with
+          // no preceding pause is harmless. Logs the ACTUAL bound port, which is not necessarily
+          // the default if something else got there first.
+          const r = await deps.start();
+          deps.log('[debug-bridge] foregrounded — TCP server listening on port', r.port);
+        }
+      } catch (e) {
+        // Never let debug-bridge plumbing break the app's lifecycle handling. A failed release just
+        // means the old behaviour (the port stays held); a failed rebind surfaces host-side as an
+        // unreachable lease, which is the pre-existing failure mode, not a new one.
+        deps.log('[debug-bridge] appStateChange handling failed:', (e as Error).message);
+      } finally {
+        busy = false;
+      }
+    })();
+  };
+}
+
 // --- Sustained pointer (held across calls): down / move / up (#31) ---
 
 /** The currently-HELD sustained pointer, or null between gestures.
@@ -350,7 +447,7 @@ export async function handleAppIdentity(): Promise<{ platform: string; appId: st
  *  that owns the gesture", not a workaround. A held press does NOT currently survive a page
  *  navigation/reload on the device (unlike the editor, which explicitly persists across one);
  *  that asymmetry is inherent to there being no separate backend process here. */
-let heldPointer: { button: number; x: number; y: number } | null = null;
+let heldPointer: { button: number; x: number; y: number; canvas: HTMLCanvasElement; how: CanvasPick['how'] } | null = null;
 
 /** Test-only reset — a held gesture left by one test would otherwise leak into the next
  *  (module state persists for the life of the imported module, and vitest does not re-import
@@ -360,8 +457,8 @@ export function _resetHeldPointerForTests(): void { heldPointer = null; }
 const POINTER_BUTTON_CODE: Record<string, number> = { left: 0, middle: 1, right: 2 };
 const POINTER_BUTTON_NAME = ['left', 'middle', 'right'];
 
-/** A pointer event carrying a real button/buttons state (unlike `mkPointerEvent`, which is
- *  hardcoded to button 0 for the atomic tap). `buttons` is the CURRENTLY-held mask — 0 on
+/** A pointer event carrying a real button/buttons state (unlike the atomic tap's `ptrInit`, which
+ *  is hardcoded to button 0). `buttons` is the CURRENTLY-held mask — 0 on
  *  pointerup, the bit for the pressed button otherwise — so a held move reads as a drag, not a
  *  hover, mirroring the `buttonHeldModifier` re-assertion `rendererOps.pointerMove` does for the
  *  Electron path. */
@@ -415,25 +512,30 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
   const buttonName = action === 'down' ? ((params.button as string) ?? 'left') : POINTER_BUTTON_NAME[heldPointer!.button];
   const button = POINTER_BUTTON_CODE[buttonName] ?? 0;
 
-  const canvas = document.querySelector('canvas');
-  const es = getPixiEventSystem();
-  if (!canvas && !es) return 'Error: No canvas element found';
+  // The canvas is picked ONCE, at `down`, and reused for every move/up of that gesture (#93).
+  // Re-picking per call would let a drag that crosses onto another canvas switch mid-gesture and
+  // deliver its `up` to an element that never saw the `down` — the same pointer-capture break the
+  // held button and held position already exist to avoid.
+  let canvas: HTMLCanvasElement;
+  let how: CanvasPick['how'];
+  if (action === 'down') {
+    const picked = pickCanvasAt(aim.x, aim.y);
+    if (!picked.canvas) return 'Error: No canvas element found';
+    canvas = picked.canvas;
+    how = picked.how;
+  } else {
+    canvas = heldPointer!.canvas;
+    how = heldPointer!.how;
+  }
 
   const type = action === 'down' ? 'pointerdown' : action === 'move' ? 'pointermove' : 'pointerup';
-  if (canvas) canvas.dispatchEvent(mkButtonedPointerEvent(type, aim.x, aim.y, button));
-  if (es) {
-    const ev = mkButtonedPointerEvent(type, aim.x, aim.y, button);
-    if (action === 'down') es._onPointerDown(ev);
-    else if (action === 'move') es._onPointerMove(ev);
-    else es._onPointerUp(ev);
-  }
+  canvas.dispatchEvent(mkButtonedPointerEvent(type, aim.x, aim.y, button));
   showMarker(aim.x, aim.y, action === 'down' ? 'orange' : action === 'move' ? 'yellow' : 'purple', `pointer${action}(${Math.round(aim.x)},${Math.round(aim.y)})`);
-  heldPointer = action === 'up' ? null : { button, x: aim.x, y: aim.y };
+  heldPointer = action === 'up' ? null : { button, x: aim.x, y: aim.y, canvas, how };
   await new Promise((r) => setTimeout(r, 16)); // let per-frame Input sampling see the edge, same as tap/drag
 
-  const via = [canvas && 'window', es && 'pixi'].filter(Boolean).join('+');
-  _log(`[debug-bridge] POINTER ${action} → ${via} @ ${aim.label}`);
-  return withMechanismSuffix(`ok (${action} ${via}, button ${buttonName}, held:${heldPointer !== null}) @ ${aim.label}`);
+  _log(`[debug-bridge] POINTER ${action} → canvas:${how} @ ${aim.label}`);
+  return withMechanismSuffix(`ok (${action} canvas:${how}, button ${buttonName}, held:${heldPointer !== null}) @ ${aim.label}`);
 }
 
 // --- Type text into the focused element (#31) ---
@@ -638,6 +740,9 @@ async function handleMessage(req: Request): Promise<unknown> {
     case 'eval': return handleEval(p);
     // 'screenshot' is intercepted natively in initNativeBridge (GameDebug.captureScreen) before it
     // reaches here; the old in-page canvas-extract path was dead and has been removed (D4).
+    // Resolve-only twin of the dispatch ops below (#32 Phase 1) — used by the backend's
+    // trusted-CDP route, which resolves the aim in-page then dispatches host-side.
+    case 'resolve-aim': return await handleResolveAim(p);
     case 'tap': return await handleTap(p);
     case 'drag': return await handleDrag(p);
     case 'pointer': return await handlePointer(p);
@@ -694,6 +799,25 @@ async function initNativeBridge() {
     _log('[debug-bridge] startServer failed:', (e as Error).message);
     throw e;
   }
+
+  // THE FOREGROUND APP OWNS THE PORT (#95). Port 9095 is a fixed default shared by every Modoki
+  // game, and a backgrounded app keeps its listener alive — so a stale app silently owned the
+  // socket and answered for the one you had just launched (#88), or forced it onto an
+  // OS-assigned port the host had no way to discover. Releasing on pause makes "at most one
+  // Modoki app is listening, and it is the one on screen" an INVARIANT, which removes the
+  // collision at its source rather than teaching the host to chase a moving port.
+  //
+  // Cost, accepted deliberately: a BACKGROUNDED Android app can no longer be driven. The device
+  // tools drive what is on screen, and on iOS a backgrounded app is suspended and could not
+  // answer anyway, so this only gives up something Android alone ever had.
+  //
+  // This narrows the race, it does NOT close it: two apps switching can interleave resume-before-
+  // pause, so the EADDRINUSE fallback and its loud reporting stay exactly as they are.
+  void CapacitorApp.addListener('appStateChange', createPortLifecycleHandler({
+    start: () => GameDebug.startServer(),
+    stop: () => GameDebug.stopServer(),
+    log: _log,
+  }));
 
   GameDebug.addListener('request', async (data) => {
     const id = data.id;

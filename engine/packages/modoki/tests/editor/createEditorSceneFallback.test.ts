@@ -304,6 +304,58 @@ describe('loadFirstScene (boot loop: canonicalize → load, raw fallback)', () =
     expect(load).toHaveBeenCalledTimes(2);
   });
 
+  /** #91 — a boot that RECOVERS on a later candidate must leave no console.error behind.
+   *  `smoke-packaged.sh` and `assert-app-renders.sh` both fail on ANY renderer console error,
+   *  so a stale remembered scene path could fail a packaging gate for a reason that has
+   *  nothing to do with the commit under test. Misses are `warn`; only a total failure is an
+   *  `error`. */
+  it('logs NO console.error when a later candidate recovers the boot', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const canonicalize = vi.fn(async (p: string) => p);
+      const load = vi.fn(async (p: string) => p === CANON);
+      expect(await loadFirstScene([BUNDLE, CANON], { canonicalize, load })).toBe(CANON);
+      expect(err).not.toHaveBeenCalled();
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  /** ZERO candidates means "no scene configured/remembered" (a fresh project, or the e2e
+   *  harness — measured: every e2e spec boots this way), not a failure. Nothing was tried, so
+   *  an error here would recreate the very false-failure #91 is about, given both packaging
+   *  gates fail on ANY console error. */
+  it('logs NOTHING when there are no candidates at all', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const canonicalize = vi.fn(async (p: string) => p);
+      const load = vi.fn(async () => true);
+      expect(await loadFirstScene([], { canonicalize, load })).toBeNull();
+      expect(load).not.toHaveBeenCalled();
+      expect(err).not.toHaveBeenCalled();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      err.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it('logs exactly ONE console.error, naming every candidate, when they all miss', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const canonicalize = vi.fn(async (p: string) => p);
+      const load = vi.fn(async () => false);
+      expect(await loadFirstScene([BUNDLE, CANON], { canonicalize, load })).toBeNull();
+      expect(err).toHaveBeenCalledTimes(1);
+      const msg = String(err.mock.calls[0]?.[0]);
+      expect(msg).toContain(BUNDLE);
+      expect(msg).toContain(CANON);
+    } finally {
+      err.mockRestore();
+    }
+  });
+
   it('falls back to the RAW candidate when the CANONICAL one throws', async () => {
     const canonicalize = vi.fn(async () => CANON);
     const load = vi.fn(async (p: string) => {

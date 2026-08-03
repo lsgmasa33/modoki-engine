@@ -130,7 +130,7 @@ describe('healNativeConfig — android/local.properties', () => {
     // A project built by editor ≤0.2.8 has a broken local.properties; heal must repair it, not skip.
     fs.mkdirSync(path.join(root, 'android'));
     const lp = path.join(root, 'android', 'local.properties');
-    fs.writeFileSync(lp, 'sdk.dir=C:\\Users\\shois\\AppData\\Roaming\\modoki-app\\toolchain\\android-sdk\n');
+    fs.writeFileSync(lp, 'sdk.dir=C:\\Users\\winuser\\AppData\\Roaming\\modoki-app\\toolchain\\android-sdk\n');
     const sdk = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-sdk-'));
     fs.mkdirSync(path.join(sdk, 'platform-tools')); // the toolchain probe requires this marker to accept an SDK — without it detectAndroidSdk returns null on a host with no other discoverable SDK (e.g. Windows CI), so the repair never runs
     process.env.ANDROID_HOME = sdk;
@@ -145,8 +145,8 @@ describe('healNativeConfig — android/local.properties', () => {
   it('sdk.dir forward-slashes a Windows path (a .properties file escapes backslashes)', () => {
     // Regression: a raw `C:\Users\…\toolchain\android-sdk` in local.properties mangled (\t → TAB,
     // \U/\A dropped) → Gradle "The filename, directory name, or volume label syntax is incorrect".
-    expect(androidSdkDirValue('C:\\Users\\shois\\AppData\\Roaming\\modoki-app\\toolchain\\android-sdk'))
-      .toBe('C:/Users/shois/AppData/Roaming/modoki-app/toolchain/android-sdk');
+    expect(androidSdkDirValue('C:\\Users\\winuser\\AppData\\Roaming\\modoki-app\\toolchain\\android-sdk'))
+      .toBe('C:/Users/winuser/AppData/Roaming/modoki-app/toolchain/android-sdk');
     expect(androidSdkDirValue('C:\\a\\b')).not.toContain('\\');
     expect(androidSdkDirValue('/home/x/Android/Sdk')).toBe('/home/x/Android/Sdk'); // POSIX unchanged
   });
@@ -161,27 +161,27 @@ describe('healNativeConfig — android/local.properties', () => {
 describe('healNativeConfig — iOS DEVELOPMENT_TEAM', () => {
   it('inserts DEVELOPMENT_TEAM into every block that lacks it', () => {
     writePbxproj(pbxproj());
-    writeConfig('KQ6FQ2BS8H');
+    writeConfig('ABCDE12345');
     healNativeConfig(root);
     const out = readPbxproj();
-    const count = (out.match(/DEVELOPMENT_TEAM = KQ6FQ2BS8H;/g) || []).length;
+    const count = (out.match(/DEVELOPMENT_TEAM = ABCDE12345;/g) || []).length;
     expect(count).toBe(2); // Debug + Release
     // Inserted right after PRODUCT_NAME.
-    expect(out).toMatch(/PRODUCT_NAME = "\$\(TARGET_NAME\)";\n\s*DEVELOPMENT_TEAM = KQ6FQ2BS8H;/);
+    expect(out).toMatch(/PRODUCT_NAME = "\$\(TARGET_NAME\)";\n\s*DEVELOPMENT_TEAM = ABCDE12345;/);
   });
 
   it('corrects a stale team value without duplicating', () => {
     writePbxproj(pbxproj({ team: 'OLDTEAM123' }));
-    writeConfig('KQ6FQ2BS8H');
+    writeConfig('ABCDE12345');
     healNativeConfig(root);
     const out = readPbxproj();
     expect(out).not.toContain('OLDTEAM123');
-    expect((out.match(/DEVELOPMENT_TEAM = KQ6FQ2BS8H;/g) || []).length).toBe(2);
+    expect((out.match(/DEVELOPMENT_TEAM = ABCDE12345;/g) || []).length).toBe(2);
   });
 
   it('is idempotent — a second pass changes nothing', () => {
     writePbxproj(pbxproj());
-    writeConfig('KQ6FQ2BS8H');
+    writeConfig('ABCDE12345');
     healNativeConfig(root);
     const once = readPbxproj();
     healNativeConfig(root);
@@ -198,27 +198,27 @@ describe('healNativeConfig — iOS DEVELOPMENT_TEAM', () => {
   it('does NOT flatten a separate target\'s team (D2)', () => {
     // App target has no team (heal inserts), a second target carries its own.
     writePbxproj(pbxproj({ ext: { team: 'EXTTEAM123' } }));
-    writeConfig('KQ6FQ2BS8H');
+    writeConfig('ABCDE12345');
     healNativeConfig(root);
     const out = readPbxproj();
-    expect((out.match(/DEVELOPMENT_TEAM = KQ6FQ2BS8H;/g) || []).length).toBe(2); // App Debug+Release only
+    expect((out.match(/DEVELOPMENT_TEAM = ABCDE12345;/g) || []).length).toBe(2); // App Debug+Release only
     expect((out.match(/DEVELOPMENT_TEAM = EXTTEAM123;/g) || []).length).toBe(2); // extension untouched
   });
 
   it('corrects the empty-quoted DEVELOPMENT_TEAM = ""; form (D2)', () => {
     writePbxproj(pbxproj({ team: '""' }));
-    writeConfig('KQ6FQ2BS8H');
+    writeConfig('ABCDE12345');
     healNativeConfig(root);
     const out = readPbxproj();
     expect(out).not.toContain('DEVELOPMENT_TEAM = "";');
-    expect((out.match(/DEVELOPMENT_TEAM = KQ6FQ2BS8H;/g) || []).length).toBe(2);
+    expect((out.match(/DEVELOPMENT_TEAM = ABCDE12345;/g) || []).length).toBe(2);
   });
 
   it('bails safely when the App target config list is absent (no flatten)', () => {
     // A pbxproj with build configs but no "PBXNativeTarget \"App\"" list.
     const noList = `// !$*UTF8*$!\n{${cfgBlock(U.appDebug, 'Debug', 'SOMETEAM01')}\n}\n`;
     writePbxproj(noList);
-    writeConfig('KQ6FQ2BS8H');
+    writeConfig('ABCDE12345');
     healNativeConfig(root);
     expect(readPbxproj()).toContain('SOMETEAM01'); // untouched — couldn't identify App target
   });

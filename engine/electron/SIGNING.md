@@ -8,7 +8,7 @@ machine (and/or in CI secrets); after that `npm run dist:mac` produces a signed,
 notarized, stapled `.dmg` + `.zip`.
 
 > **Account / Team ID:** use whichever Apple Developer account ships the desktop
-> editor — it does **not** have to be the iOS app's team (`KQ6FQ2BS8H`). With the
+> editor — it does **not** have to be the iOS app's team (`ABCDE12345`). With the
 > API-key notarization method below, the **issuer ID identifies the account**, so no
 > team ID is needed for notarization; for *signing*, electron-builder picks the
 > "Developer ID Application" cert in the keychain (if more than one account's cert

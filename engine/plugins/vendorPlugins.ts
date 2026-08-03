@@ -94,7 +94,7 @@ function pluginInstallStale(projectRoot: string, name: string): boolean {
   return st.isSymbolicLink();
 }
 
-interface EnginePlugin {
+export interface EnginePlugin {
   name: string;
   dir: string;
   version: string;
@@ -104,7 +104,7 @@ interface EnginePlugin {
  *  package.json declares a `capacitor` field (i.e. they're cap plugins, not
  *  plain libs like @modoki/engine). Discovered dynamically so a new plugin is
  *  picked up without editing this list. */
-function listEnginePlugins(engineRoot: string): EnginePlugin[] {
+export function listEnginePlugins(engineRoot: string): EnginePlugin[] {
   const pkgDir = path.join(engineRoot, 'engine', 'packages');
   if (!fs.existsSync(pkgDir)) return [];
   const out: EnginePlugin[] = [];
@@ -292,7 +292,7 @@ export function pluginHashInputs(pluginDir: string): string[] {
  *  A read error is NOT swallowed (D10): a listed file that fails to read would
  *  contribute only its path → a different hash than a clean read → a spurious
  *  re-pack. Let it throw so vendoring fails loudly (the caller logs + continues). */
-function pluginContentHash(pluginDir: string): string {
+export function pluginContentHash(pluginDir: string): string {
   const h = createHash('sha256');
   for (const rel of pluginHashInputs(pluginDir)) {
     h.update(rel);

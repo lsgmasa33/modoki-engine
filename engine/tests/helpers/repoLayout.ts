@@ -1,0 +1,91 @@
+/**
+ * Repo-layout predicates for tests that depend on something the PUBLIC engine snapshot
+ * (lsgmasa33/modoki-engine) does not ship — private agent tooling, the `oss/` publish
+ * overlay, or real `games/`/`demos/` project content.
+ *
+ * A test that assumes one of these is present must gate on the matching predicate here
+ * (`describe.skipIf`/`it.skipIf`) rather than hand-rolling its own `fs.existsSync` check —
+ * ONE implementation means a broken predicate breaks loudly in ONE place
+ * (`repoLayoutGuard.test.ts`) instead of silently going wrong in every test that copied it.
+ *
+ * CRITICAL: a predicate that is accidentally always false disables its guarded tests in
+ * THIS (private) repo too, and a test that never runs looks exactly like a test that
+ * passes. `repoLayoutGuard.test.ts` is the tripwire against exactly that.
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { discoverProjects } from '../../scripts/projectRoots.mjs';
+
+/** Walk up from this file's own location (not `process.cwd()`, which varies with how the
+ *  test runner was invoked) until we find the repo root: a directory holding BOTH a
+ *  `package.json` and the `engine/` tree.
+ *
+ *  Deliberately does NOT key on the package NAME. `scripts/publish-engine-oss.sh` rewrites
+ *  it from `modoki-app` to `modoki-engine` when it assembles the public snapshot, so a name
+ *  check resolves here and throws there — which is exactly what happened on the public CI's
+ *  first run with this helper. The structural marker holds in both repos.
+ *
+ *  Throws rather than guessing: a helper that silently resolved to the wrong root would make
+ *  every predicate below lie, and a predicate that lies switches tests off without a word. */
+function findRepoRoot(): string {
+  const start = path.dirname(fileURLToPath(import.meta.url));
+  let dir = start;
+  for (let i = 0; i < 12; i++) {
+    if (fs.existsSync(path.join(dir, 'package.json')) && fs.existsSync(path.join(dir, 'engine'))) {
+      return dir;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  throw new Error(`repoLayout: could not locate the repo root by walking up from ${start}`);
+}
+
+export const REPO_ROOT = findRepoRoot();
+
+/** True when this checkout has the private agent-CLI configs (`.mcp.json` and its
+ *  generated siblings) — i.e. this is a developer clone, not the public engine snapshot. */
+export function hasPrivateTooling(): boolean {
+  return fs.existsSync(path.join(REPO_ROOT, '.mcp.json'));
+}
+
+/** True when the `oss/` publish overlay (the workflows rewritten onto the public repo by
+ *  `scripts/publish-engine-oss.sh`) is present in this checkout. */
+export function hasOssOverlay(): boolean {
+  return fs.existsSync(path.join(REPO_ROOT, 'oss', '.github', 'workflows'));
+}
+
+/** True when the INTERNAL `games/` root exists and holds at least one project.
+ *
+ *  Deliberately NOT "any project under any root". `discoverProjects()` also enumerates
+ *  `demos/`, and the CI snapshot DOES ship two demos — so a `length > 0` check reads TRUE
+ *  there and the guarded test runs anyway, against content that cannot satisfy it. That is
+ *  not hypothetical: it is how this failed twice. `assetRefIntegrity`'s own `hasGames` guard
+ *  went true once demos shipped and the test failed instead of skipping; then the first
+ *  version of THIS helper repeated the mistake, and four audits kept failing on the public
+ *  gate for exactly the same reason.
+ *
+ *  Every caller polices `games/` content specifically — baselines of blank asset refs,
+ *  the pending-migration backlog, KNOWN_ESCAPES, a minimum game-`.ts` count. Two published
+ *  demos satisfy "a project exists" without satisfying any of those premises.
+ *
+ *  The lesson, worth keeping: gate on the thing the test actually needs, not on a proxy that
+ *  happens to correlate with it today. */
+export function hasInternalGames(): boolean {
+  return discoverProjects(REPO_ROOT).some((p) => p.root === 'games');
+}
+
+/** True when ANY project exists under ANY root — `games/` OR `demos/`.
+ *
+ *  The honest name for the loose check. Use it ONLY where "is there something to scan?" is
+ *  genuinely the question — e.g. a sanity assertion that a walk found assets at all. If the
+ *  test needs internal game CONTENT (a baseline, an allowlist, a specific asset), it wants
+ *  `hasInternalGames()` instead; the two are NOT interchangeable, and the CI snapshot is the
+ *  case that separates them (it ships demos, no games).
+ *
+ *  This exists as a named export rather than an inline `discoverProjects(...).length > 0`
+ *  precisely so the choice between loose and strict is visible at the call site. */
+export function hasAnyProject(): boolean {
+  return discoverProjects(REPO_ROOT).length > 0;
+}

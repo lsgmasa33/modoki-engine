@@ -528,6 +528,41 @@ await sceneManager.loadScene(path, {
 });
 ```
 
+### A missing scene arrives as `200 OK` HTML, not a 404
+
+The dev server answers an unknown path with its SPA fallback — `index.html`, status **200**, so
+`res.ok` is `true` and nothing in the fetch path can tell it apart from a real hit. A bare
+`res.json()` on that body throws `SyntaxError: Unexpected token '<', "<!doctype "…`, which reads as
+a *corrupt scene* when the truth is *no scene at this path* (#91).
+
+So **every asset-JSON fetch in `runtime/**` goes through `parseAssetJson`**
+(`runtime/loaders/assetFetch.ts`) rather than `res.json()` — scene, base-chain hop, mesh, material,
+prefab, asset manifest, shader manifest, font metrics, timeline, particle, clip, animset, rig2d,
+sprite-anim. It reads the body as text, recognises the fallback, and throws
+`no asset at <path> — the dev server answered with index.html…`.
+
+**Enforced by `engine/tests/architecture/assetJsonGuard.test.ts`**, not by convention. The helper
+was introduced with six loaders converted and the remaining eight call sites simply stayed as they
+were — which is what #91 turned out to be. `timelineCache.ts` is the sharpest illustration: it
+*imported* `parseAssetJson`, used it in `getTimeline`, and left `loadTimelineNow` three functions
+below parsing raw. A rule that holds for the function that was audited and not the one beside it is
+a coincidence, not a rule. The guard's allowlist has exactly one entry — `runtime/ota/otaClient.ts`,
+which fetches a remote OTA server rather than the dev server, so there is no SPA fallback to mistake
+for an asset — and a second test keeps that allowlist from rotting into a silent hole.
+
+Two consequences worth knowing:
+
+- **Test doubles must have `text()`.** A hand-rolled `{ ok: true, json: async () => body }` is not a
+  `Response` — a real one always has `text()`. Wrap fetch stubs in `completeResponse`
+  (`tests/stubs/assetResponse.ts`), which derives `text()` from `json()`.
+- **A missed boot candidate is a `warn`, not an `error`.** The editor boots by walking a candidate
+  list (override → remembered last-scene → `config.scenePath`), so a miss on the first candidate is
+  a normal step of a healthy boot. `loadScene(path, gameId, { probing: true })` downgrades the miss
+  to `warn`; `loadFirstScene` raises a single `error` naming every candidate only if they ALL miss.
+  This matters beyond tidiness: `smoke-packaged.sh` and `assert-app-renders.sh` fail on **any**
+  renderer console error, so a stale remembered scene path used to be able to fail a packaging gate
+  for a reason unrelated to the commit under test.
+
 `loadScene` flow — a scene may declare `baseScene`, so this is a **chain** load, not a
 single-scene one (see [Base scenes](#base-scenes-nestable-cross-scene-persistence)):
 
