@@ -221,13 +221,32 @@ describe('/api/device/request screenshot with NO lease (#102)', () => {
 // gated source:'wda' on `state === 'connected'` and therefore refused the feature in its motivating
 // case. WDA needs no lease at all: it answers host-side on :8100.
 /** Poll `/api/device/status` until the lease state satisfies `pred`. The socket drop is async, so
- *  asserting immediately after `device.close()` races it. */
-async function waitForLeaseState(pred: (s: string) => boolean, timeoutMs = 2000): Promise<unknown> {
+ *  asserting immediately after `device.close()` races it.
+ *
+ *  THROWS on timeout — it must not return the last-seen state. The earlier version did, which made
+ *  a timeout indistinguishable from the behaviour under test failing: on the public Windows runner
+ *  the drop took longer than the old 2s budget, so this returned `connected` and the caller's
+ *  `expect(state).not.toBe('connected')` failed. That reads as "WDA was short-circuited by the lease
+ *  gate" — a product bug in the feature this test guards — when in fact the PRECONDITION never
+ *  happened and the real assertion below never ran. A helper that gives up must say so, not hand
+ *  back a value the caller will misread.
+ *
+ *  The budget is Windows-shaped: socket-close propagation there is slower than on ubuntu/macOS,
+ *  and 10s sits well inside the suite's 20s `testTimeout` (engine/vite.config.ts). */
+async function waitForLeaseState(pred: (s: string) => boolean, timeoutMs = 10_000): Promise<unknown> {
   const deadline = Date.now() + timeoutMs;
+  let last = 'unknown';
   for (;;) {
     const st = await get('/api/device/status');
-    if (pred(String(bodyOf(st).state))) return st;
-    if (Date.now() > deadline) return st;
+    last = String(bodyOf(st).state);
+    if (pred(last)) return st;
+    if (Date.now() > deadline) {
+      throw new Error(
+        `waitForLeaseState: lease never left state "${last}" within ${timeoutMs}ms. `
+        + 'This is the WAIT failing, not the assertion that follows it — the precondition for the '
+        + 'test never happened, so nothing about the device-request behaviour was proven.',
+      );
+    }
     await new Promise((r) => setTimeout(r, 25));
   }
 }
