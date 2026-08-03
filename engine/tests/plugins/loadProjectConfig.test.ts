@@ -379,7 +379,7 @@ describe('validateBuildConfig', () => {
     expect(validateBuildConfig(
       withCfg({ webBucket: 'gs://modoki-www-site/demo' }),
       withUser(
-        { androidDeviceId: '192.168.1.5:5555', iosDeviceId: '00008150-00041CAA3AB8401C' },
+        { androidDeviceId: '192.168.1.5:5555', iosDeviceId: 'DEADBEEF-0123456789ABCDEF' },
         { javaHome: '/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home' },
       ),
     )).toEqual([]);

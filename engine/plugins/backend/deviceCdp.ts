@@ -1,7 +1,7 @@
 /**
  * Android trusted input via Chrome DevTools Protocol (#32 Phase 1).
  *
- * The mechanism, proven on hardware BEFORE this module existed (Samsung RFCTB0EV83K, see
+ * The mechanism, proven on hardware BEFORE this module existed (on a physical Samsung handset, see
  * docs/trusted-device-input.md):
  *   1. The debug WebView exposes an abstract socket `webview_devtools_remote_<pid>`
  *      (`adb shell cat /proc/net/unix`).

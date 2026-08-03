@@ -6,12 +6,34 @@
 # Usage:
 #   engine/scripts/relaunch-ios-app.sh [bundle-id] [device-name-or-id]
 #
-# Defaults: bundle-id = com.example.otatest (games/ota-test), device = "Masaki iPhone Air"
+# Defaults: bundle-id = com.example.otatest (games/ota-test); device = this machine's
+# project.user.json `device.iosDevicectlId` (then `iosDeviceId`). There is deliberately
+# NO baked-in device default — this script ships in the public OSS snapshot, so a real
+# device name here would leak the author's hardware AND silently aim a stranger's
+# relaunch at it. Same defect as #103; see docs/engine-oss-publishing.md § "Device ids".
 
 set -euo pipefail
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUNDLE_ID="${1:-com.example.otatest}"
-DEVICE="${2:-Masaki iPhone Air}"
+DEVICE="${2:-}"
+
+if [[ -z "$DEVICE" && -f "$HERE/project.user.json" ]]; then
+  DEVICE="$(node -e '
+    let j = {};
+    try { j = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); } catch {}
+    const d = j.device ?? {};
+    process.stdout.write(String(d.iosDevicectlId || d.iosDeviceId || "").trim());
+  ' "$HERE/project.user.json" 2>/dev/null || true)"
+fi
+
+if [[ -z "$DEVICE" ]]; then
+  echo "✖ no iOS device given and none found in project.user.json." >&2
+  echo "  Pass one:  $0 $BUNDLE_ID \"My iPhone\"" >&2
+  echo "  Or set device.iosDevicectlId in project.user.json (Project Settings → Build)." >&2
+  echo "  List candidates with: xcrun devicectl list devices" >&2
+  exit 1
+fi
 
 echo "Device: $DEVICE"
 echo "Bundle: $BUNDLE_ID"

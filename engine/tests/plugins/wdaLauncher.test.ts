@@ -49,8 +49,8 @@ describe('parseIosDevices', () => {
 
   it('reports the HARDWARE udid, which is the only form xcodebuild accepts', () => {
     // devicectl's top-level `identifier` is a different GUID; `-destination id=<that>` does not work.
-    const [d] = parseIosDevices(listing([{ udid: '00008150-00041CAA3AB8401C', name: 'Air' }]));
-    expect(d.udid).toBe('00008150-00041CAA3AB8401C');
+    const [d] = parseIosDevices(listing([{ udid: 'DEADBEEF-0123456789ABCDEF', name: 'Air' }]));
+    expect(d.udid).toBe('DEADBEEF-0123456789ABCDEF');
     expect(d.udid).not.toMatch(/^GUID-/);
   });
 

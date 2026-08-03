@@ -369,13 +369,17 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   },
 };
 
-/** Defaults for the per-machine user config. The device/SDK values here mirror
- *  the repo owner's machine so a build works out-of-the-box without a
- *  project.user.json; a real per-machine file (gitignored) overrides them. */
+/** Defaults for the per-machine user config. Every field is EMPTY on purpose:
+ *  these describe THIS developer's hardware, and this file ships publicly (the
+ *  OSS snapshot), so a real value here would both leak the author's device and
+ *  silently aim a stranger's build at hardware that is not theirs (#103). A
+ *  per-machine project.user.json (gitignored) supplies them; an empty id is an
+ *  expected, handled state — validateBuildConfig allows it, and the iOS build
+ *  step turns it into an actionable "set iosDeviceId in Project Settings". */
 export const DEFAULT_PROJECT_USER_CONFIG: ProjectUserConfig = {
   device: {
-    iosDeviceId: '00008150-00041CAA3AB8401C',
-    iosDevicectlId: '796DC698-BD9D-529F-B068-D14867813680',
+    iosDeviceId: '',
+    iosDevicectlId: '',
     androidDeviceId: '',
   },
   sdk: {
