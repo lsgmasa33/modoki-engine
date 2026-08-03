@@ -24,6 +24,7 @@ import path from 'path';
 import fs from 'fs';
 import { validatePrefabData } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
+import { hasAnyProject } from '../helpers/repoLayout';
 
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
 
@@ -48,7 +49,11 @@ const prefabs = (discoverProjects(PROJECT_ROOT) as { dir: string }[])
   .concat([...walk(path.join(PROJECT_ROOT, 'engine', 'templates'))]);
 
 describe('committed prefabs author no inert UI size (#42)', () => {
-  it('found prefabs to scan (sanity: the guard is not passing vacuously)', () => {
+  // Gated on the LOOSE predicate: the prefabs come from whatever projects exist (engine/templates
+  // alone contributes none), so "is there anything to scan?" is exactly the question. The public
+  // RELEASE snapshot on `main` ships no projects at all — unlike the `ci/main` snapshot, which
+  // ships two demos, which is why this only ever went red on `main`.
+  it.skipIf(!hasAnyProject())('found prefabs to scan (sanity: the guard is not passing vacuously)', () => {
     // Without this, a broken walk or a moved project root turns the whole file into a silent
     // pass — the failure mode that makes a coverage guard worse than none.
     expect(prefabs.length).toBeGreaterThan(0);

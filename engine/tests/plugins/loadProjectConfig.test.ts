@@ -8,6 +8,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
+import { hasAnyProject } from '../helpers/repoLayout';
 import {
   loadProjectConfig,
   writeProjectConfig,
@@ -514,7 +515,11 @@ describe('every committed project.config.json uses in-union values', () => {
     .map((p) => ({ ...p, file: path.join(p.dir, 'project.config.json') }))
     .filter((p) => fs.existsSync(p.file));
 
-  it('found projects to check', () => {
+  // The RELEASE snapshot on the public repo's `main` ships no projects at all (the CI snapshot
+  // on `ci/main` ships two demos, which is why this only ever went red on `main`), so the
+  // non-vacuity check has to gate on the loose predicate: the question here is purely "is there
+  // anything to scan?". docs/engine-oss-publishing.md.
+  it.skipIf(!hasAnyProject())('found projects to check', () => {
     expect(projects.length).toBeGreaterThan(0);
   });
 
