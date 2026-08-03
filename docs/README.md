@@ -81,6 +81,7 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 | [ota-subgame-modules.md](./ota-subgame-modules.md) | Sub-game modules — `globalThis` shared-singleton registry (not import maps), per-sub-game Vite build target, dynamic `GAMES` discovery, `ENGINE_API_VERSION` contract |
 | [playable-export.md](./playable-export.md) | The `VITE_PLAYABLE` single-file "playable ad" build — asset profile + single-chunk inliner (gzip/base64 + fflate fallback → `__PLAYABLE_ASSETS__` blob map), MRAID gate + CTA overlay, buffer-audio, the hard-won gotchas, and `npm run smoke:playable` |
 | [electron-signing-optimization.md](./plans/electron-signing-optimization.md) | Proposal to cut Electron-editor codesign time by shipping Vite's dep cache inside one asar |
+| [site-hosting.md](./site-hosting.md) | How modoki-engine.com is served — the Cloudflare Worker in front of the public GCS bucket, why it replaced a GCP load balancer (~$18.25/mo → ~$0.02/mo), the legacy redirects it must keep working, caching/TTL behavior, and DNS/email gotchas |
 
 ## Plans & Trackers (active)
 
