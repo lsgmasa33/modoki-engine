@@ -144,7 +144,12 @@ describe('buildPixiShaderProgram (WebGPU backend, mocked fetch)', () => {
     vi.doMock('../../src/runtime/rendering/canvas2DPool', () => ({ resolvePixiBackend: () => Promise.resolve('webgpu') }));
     // assetUrl passthrough + a fetch that serves the in-memory file map.
     vi.doMock('../../src/runtime/loaders/assetUrl', () => ({ assetUrl: (p: string) => p }));
-    vi.doMock('../../src/runtime/loaders/assetFetch', () => ({ ASSET_FETCH_INIT: {} }));
+    // Keep the real parseAssetJson (fetchShaderManifest now routes through it to catch the dev
+    // server's SPA-fallback 200 — see assetFetch.ts) and only override ASSET_FETCH_INIT.
+    vi.doMock('../../src/runtime/loaders/assetFetch', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../src/runtime/loaders/assetFetch')>();
+      return { ...actual, ASSET_FETCH_INIT: {} };
+    });
     // pixiShaderBuilder now reaches fetchShaderManifest/assetUrl/fetchInit via the
     // core/assetPlumbing provider slot (P7 C10) rather than importing loaders/ directly —
     // wire it to the real fetchShaderManifest, which itself picks up the mocked

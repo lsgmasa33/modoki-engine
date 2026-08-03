@@ -21,7 +21,7 @@
  */
 
 import { assetUrl } from './assetUrl';
-import { ASSET_FETCH_INIT } from './assetFetch';
+import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import type { TextureImportSettings, TextureType } from './textureSettings';
 import type { AudioImportSettings, AudioCacheInfo } from './audioSettings';
 import type { EnvManifestBlock } from '../core/environmentSettings';
@@ -515,7 +515,8 @@ export function ensureManifestLoaded(url: string): Promise<AssetManifestFile | n
         console.warn(`[assetManifest] manifest fetch failed: ${url} (${res.status})`);
         return null;
       }
-      const data = (await res.json()) as AssetManifestFile;
+      // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
+      const data = (await parseAssetJson(res, url)) as AssetManifestFile;
       loadManifestJson(data);
       return data;
     } catch (e) {

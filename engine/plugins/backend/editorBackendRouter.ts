@@ -171,7 +171,8 @@ import { getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData
 import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
 import { tryDeviceCdpInput, isDeviceCdpAvailable, synthFallbackBanner, TRUSTED_CDP_MECHANISM } from './deviceCdp';
-import { tryDeviceWdaInput, isDeviceWdaAvailable, resetDeviceWdaSession, TRUSTED_WDA_MECHANISM } from './deviceWda';
+import { tryDeviceWdaInput, isDeviceWdaAvailable, resetDeviceWdaSession, tryDeviceWdaScreenshot, TRUSTED_WDA_MECHANISM } from './deviceWda';
+import { isDeviceFailureReply } from './deviceAim';
 import { stopWda } from './wdaLauncher';
 import { resolveModules } from '../detect-modules';
 // Type-only — erased at runtime, so it does NOT pull the tree-shaker (and its
@@ -709,6 +710,59 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     if (!b.method) return json({ error: 'method required' }, 400);
     try {
       const proxy = (m: string, p: Record<string, unknown>) => deviceConnection.proxy(m, p);
+      // #102 — iOS out-of-app capture. The native path is the APP'S OWN capture, so a system dialog
+      // or springboard is invisible to it (it returns the app underneath, which reads as a fine
+      // screenshot of the wrong thing). WDA sees the whole screen. Two triggers, each covering what
+      // the other misses: an explicit `source:'wda'` (the only way to reach the dialog case, since
+      // that case does not make the native capture FAIL), and an automatic fallback when it errors.
+      if (b.method === 'screenshot') {
+        const wantsWda = (b.params as { source?: string } | undefined)?.source === 'wda';
+        const st = deviceConnection.status();
+        // The device's ADDRESS. `target` outlives the CONNECTED state — it is retained while the
+        // lease is merely `reconnecting` (measured) — which is exactly the window this feature
+        // needs. Deliberately NOT `lastTarget`: that survives an explicit `disconnect`, and
+        // reaching for a device the user has RELEASED is a different act from photographing one
+        // whose app happens to be suspended. (Tried it; it also broke the no-lease test by leaking
+        // a previous connection's address, which is the same bug wearing a test failure.)
+        const host = st.target?.host;
+        if (wantsWda) {
+          // GATE ON AN ADDRESS, NOT ON THE LEASE. MEASURED on the iPhone Air (2026-08-03): pressing
+          // home SUSPENDS the app, so the lease drops to 'reconnecting' and the native capture 502s
+          // — and that is precisely when you want the springboard picture. WDA needs no lease at
+          // all (it answers host-side on :8100), so gating this on `state === 'connected'` refused
+          // the feature in its motivating case. An earlier revision did exactly that; only a live
+          // run could show it, which is why this route is not unit-tests-only.
+          //
+          // With NO address, no device was ever connected — and there the canonical error is right:
+          // the WDA reason ("install it from Build Support") sends the reader to the wrong place,
+          // and the MCP's `caughtFailure` matches the "no device connected" PREFIX to build its
+          // device_connect/device_status envelope, which a WDA-flavoured message would lose.
+          if (!host) await deviceConnection.proxy('screenshot', {});
+          // Explicit ask pays the agent spin-up; a refusal must say why rather than quietly
+          // handing back a native capture the caller specifically did not want.
+          const shot = await tryDeviceWdaScreenshot({ host }, { autoLaunch: true });
+          return shot.handled ? json({ result: shot.reply }) : json({ error: shot.reason }, 409);
+        }
+        // The native capture fails two ways, and BOTH mean "the app could not photograph itself":
+        // the device answers an error string, or the lease is gone and the proxy throws (a crashed
+        // or suspended app — measured above). Neither auto-launches: a screenshot that silently
+        // costs a ~30s agent spin-up because the app died is worse than one that says why.
+        let native: unknown;
+        try {
+          native = await deviceConnection.proxy('screenshot', b.params ?? {});
+          if (!isDeviceFailureReply(native)) return json({ result: native });
+        } catch (e) {
+          const shot = await tryDeviceWdaScreenshot({ host });
+          if (shot.handled) return json({ result: { ...shot.reply, nativeCaptureFailed: String(e instanceof Error ? e.message : e) } });
+          throw e;   // nothing to add: the canonical lease error IS the right answer
+        }
+        const shot = await tryDeviceWdaScreenshot({ host });
+        if (shot.handled) return json({ result: { ...shot.reply, nativeCaptureFailed: String(native) } });
+        // Both paths failed: return the NATIVE error, which is the one the caller asked for. The
+        // WDA reason rides along so "why didn't the fallback save me" is answerable without a
+        // second call.
+        return json({ result: native, wdaFallbackUnavailable: shot.reason });
+      }
       let outcome = await tryDeviceCdpInput(b.method, b.params ?? {}, { proxy });
       // #32 Phase 2: no CDP route (an iOS device, or an Android one without adb) ⇒ try
       // WebDriverAgent before giving up on trusted input. Only tap/drag are routable on iOS — the

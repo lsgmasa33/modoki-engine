@@ -902,7 +902,11 @@ export async function saveScene(opts: {
  *  See the epoch guard inside loadScene. */
 let _loadEpoch = 0;
 
-export async function loadScene(scenePath: string, gameId?: string): Promise<boolean> {
+export async function loadScene(
+  scenePath: string,
+  gameId?: string,
+  opts?: { probing?: boolean },
+): Promise<boolean> {
   // Epoch guard: SceneManager cancels an in-flight load when a newer one starts
   // (boot autoload vs an agent/menu open, or rapid scene switches). The aborted
   // load's `finally` must NOT clear the progress modal the WINNING load is
@@ -941,7 +945,18 @@ export async function loadScene(scenePath: string, gameId?: string): Promise<boo
   } catch (e) {
     // An AbortError means a newer load superseded this one (by design — see the
     // epoch guard above); it's expected, not a failure worth a red console error.
-    if ((e as Error)?.name !== 'AbortError') console.error(`[Editor] Failed to load scene: ${e}`);
+    if ((e as Error)?.name !== 'AbortError') {
+      // `probing`: the caller is walking a CANDIDATE LIST (editor boot) and a miss here is a
+      // normal step, not a failure — the next candidate is expected to load. Logging it at
+      // `error` made a healthy self-healing boot look broken, and because
+      // `smoke-packaged.sh` / `assert-app-renders.sh` fail on ANY renderer console error, a
+      // stale remembered scene path could fail a packaging gate for a reason unrelated to the
+      // commit under test (#91). The genuine "nothing loaded at all" error is raised ONCE by
+      // loadFirstScene after every candidate has missed.
+      const msg = `[Editor] Failed to load scene: ${e}`;
+      if (opts?.probing) console.warn(`${msg} (trying the next boot candidate…)`);
+      else console.error(msg);
+    }
     return false;
   } finally {
     // Only the latest load owns the modal — a superseded load must not hide the

@@ -138,7 +138,7 @@ export interface ProjectConfig {
      *  author wrote). */
     webDeployCommand: string;
     /** Apple Developer Team ID for iOS signing (the 10-char team, e.g.
-     *  KQ6FQ2BS8H). Org-level (shared across the team's builds) so it lives in the
+     *  ABCDE12345). Org-level (shared across the team's builds) so it lives in the
      *  committed config, not project.user.json. The editor's heal-on-open syncs it
      *  into the iOS project's DEVELOPMENT_TEAM. Empty = leave the pbxproj as-is. */
     appleTeamId: string;

@@ -3,6 +3,7 @@ import {
   resolveWdaPort, DEFAULT_WDA_PORT, makeWdaSession, wdaTap, wdaDrag,
   getDeviceWdaSession, tryDeviceWdaInput, isDeviceWdaAvailable, isWdaRoutableMethod,
   _resetDeviceWdaStateForTests, TRUSTED_WDA_MECHANISM,
+  tryDeviceWdaScreenshot, pngDimensions, WDA_SHOT_NO_SESSION_REASON, WDA_SHOT_COORDINATE_WARNING,
   WDA_NOT_RUNNING_REASON, WDA_SESSION_LOST_REASON,
   type WdaFetch, type WdaSession,
 } from '../../plugins/backend/deviceWda';
@@ -127,6 +128,7 @@ function sessionStub(): WdaSession & { sent: unknown[]; released: number } {
     get released() { return released; },
     actions: async (p: unknown) => { sent.push(p); },
     releaseActions: async () => { released++; },
+    screenshot: async () => pngBase64(390, 844),
   };
   return s as WdaSession & { sent: unknown[]; released: number };
 }
@@ -230,5 +232,105 @@ describe('isDeviceWdaAvailable — the WHOLE chain, not the cheap half', () => {
       getSession: async () => sessionStub(), proxy: async () => { throw new Error('lease dropped'); },
     });
     expect(ok).toBe(false);
+  });
+});
+
+// ── Screenshot (#102) ────────────────────────────────────────────────────────
+//
+// The iOS native capture is the APP'S OWN, so it can only ever show the app: a system permission
+// dialog is a different window and comes back with the app UNDERNEATH it — a fine-looking
+// screenshot of the wrong thing. WDA sees the whole screen. These tests pin the two properties
+// that make that safe to ship: a WDA reply is decoded from its BODY (WDA answers failures with
+// HTTP 200), and every capture carries the coordinate-space warning, because its pixels are the
+// device screen and feeding them to device_tap would be silently wrong.
+
+/** A real PNG header (signature + IHDR) — enough for `pngDimensions`, which reads bytes 16..24. */
+function pngBase64(width: number, height: number): string {
+  const buf = Buffer.alloc(24);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(buf, 0);
+  buf.writeUInt32BE(13, 8);
+  buf.write('IHDR', 12);
+  buf.writeUInt32BE(width, 16);
+  buf.writeUInt32BE(height, 20);
+  return buf.toString('base64');
+}
+
+describe('pngDimensions', () => {
+  it('reads width/height out of the IHDR chunk', () => {
+    expect(pngDimensions(pngBase64(1170, 2532))).toEqual({ width: 1170, height: 2532 });
+  });
+
+  it('returns null for anything that is not a PNG — no confident nonsense', () => {
+    // Degrading to "no dimensions" keeps a surprise payload from being reported as a real size.
+    for (const junk of ['', 'bm90IGEgcG5n', Buffer.alloc(24).toString('base64')]) {
+      expect(pngDimensions(junk)).toBeNull();
+    }
+  });
+});
+
+describe('session.screenshot', () => {
+  it('GETs the session screenshot endpoint and returns the base64 body', async () => {
+    const png = pngBase64(390, 844);
+    const f = fakeFetch({ '/screenshot': { value: png } });
+    const s = makeWdaSession(f, 'http://d:8100', 'S1');
+    expect(await s.screenshot()).toBe(png);
+    expect(f.calls[0].url).toBe('http://d:8100/session/S1/screenshot');
+    expect(f.calls[0].method).toBe('GET');
+  });
+
+  it('THROWS on an error carried in a 200 body', async () => {
+    // Measured on the iPhone: WDA answers a bad endpoint with HTTP 200 + {value:{error}}. Trusting
+    // the status code is what silently reported success for taps that never landed.
+    const f = fakeFetch({ '/screenshot': { value: { error: 'unknown command', message: 'no such route' } } });
+    const s = makeWdaSession(f, 'http://d:8100', 'S1');
+    await expect(s.screenshot()).rejects.toThrow(/unknown command/);
+  });
+
+  it('THROWS rather than passing off a non-string value as an image', async () => {
+    const f = fakeFetch({ '/screenshot': { value: null } });
+    const s = makeWdaSession(f, 'http://d:8100', 'S1');
+    await expect(s.screenshot()).rejects.toThrow(/no image data/);
+  });
+});
+
+describe('tryDeviceWdaScreenshot', () => {
+  it('returns the image with its source, dimensions and the coordinate warning', async () => {
+    const r = await tryDeviceWdaScreenshot({ getSession: async () => sessionStub() });
+    expect(r.handled).toBe(true);
+    if (!r.handled) return;
+    expect(r.reply.image).toMatch(/^data:image\/png;base64,/);
+    expect(r.reply.source).toBe(TRUSTED_WDA_MECHANISM);
+    expect(r.reply).toMatchObject({ imageWidth: 390, imageHeight: 844 });
+    // The whole risk of this feature in one field: these pixels are NOT page coordinates.
+    expect(r.reply.warning).toBe(WDA_SHOT_COORDINATE_WARNING);
+    expect(String(r.reply.warning)).toMatch(/device_tap/);
+  });
+
+  it('refuses with an actionable reason when there is no session', async () => {
+    const r = await tryDeviceWdaScreenshot({ getSession: async () => null });
+    expect(r).toEqual({ handled: false, reason: WDA_SHOT_NO_SESSION_REASON });
+    expect(WDA_SHOT_NO_SESSION_REASON).toMatch(/Build Support/);
+  });
+
+  it('does NOT auto-launch by default, and does when asked', async () => {
+    // A screenshot that silently takes ~6s starting an agent — on the AUTOMATIC fallback path,
+    // where nobody asked for WDA — is worse than one that says why it could not help. An explicit
+    // source:'wda' is a different bargain: the caller wants that capture and can pay for it.
+    const seen: Array<boolean | undefined> = [];
+    const getSession = async (o: { autoLaunch?: boolean }) => { seen.push(o.autoLaunch); return sessionStub(); };
+    await tryDeviceWdaScreenshot({ getSession });
+    await tryDeviceWdaScreenshot({ getSession }, { autoLaunch: true });
+    expect(seen).toEqual([false, true]);
+  });
+
+  it('reports a capture failure instead of throwing, and drops the cached session', async () => {
+    // The usual cause is a dead agent (its xcodebuild test process exited); a stale session id
+    // would then fail every later call the same way.
+    const s = sessionStub();
+    s.screenshot = async () => { throw new Error('socket hang up'); };
+    const r = await tryDeviceWdaScreenshot({ getSession: async () => s });
+    expect(r).toMatchObject({ handled: false });
+    if (r.handled) return;
+    expect(r.reason).toMatch(/socket hang up/);
   });
 });

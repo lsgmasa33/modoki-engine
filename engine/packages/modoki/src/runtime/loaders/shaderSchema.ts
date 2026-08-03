@@ -2,7 +2,7 @@
  *  moved to `core/shaderSchema.ts` (P7 C10); re-exported here for existing callers. */
 
 import { assetUrl } from './assetUrl';
-import { ASSET_FETCH_INIT } from './assetFetch';
+import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { warnUnknownParamTypes, type ShaderManifest } from '../core/shaderSchema';
 
 export {
@@ -17,7 +17,8 @@ export async function fetchShaderManifest(manifestPath: string): Promise<ShaderM
   try {
     const res = await fetch(assetUrl(manifestPath), ASSET_FETCH_INIT);
     if (!res.ok) return null;
-    const json = (await res.json()) as ShaderManifest;
+    // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
+    const json = (await parseAssetJson(res, manifestPath)) as ShaderManifest;
     if (!json.params) json.params = {};
     warnUnknownParamTypes(manifestPath, json.params);
     return json;

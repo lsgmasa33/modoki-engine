@@ -62,9 +62,11 @@ export function resolveWdaPort(env: NodeJS.ProcessEnv = process.env): number {
   return Number.isInteger(n) && n > 0 && n < 65536 ? n : DEFAULT_WDA_PORT;
 }
 
-/** A WDA reply. `value` is null on success; a FAILED call still returns HTTP 200 with an error
- *  object here, which is why every response is decoded rather than status-checked. */
-interface WdaReply { value?: { error?: string; message?: string } | null; sessionId?: string }
+/** A WDA reply. `value` is null on success for the action endpoints; a FAILED call still returns
+ *  HTTP 200 with an error object here, which is why every response is decoded rather than
+ *  status-checked. `/screenshot` is the one endpoint whose `value` is a payload — a base64 PNG
+ *  string — so the union carries it rather than forcing a cast at that callsite. */
+interface WdaReply { value?: { error?: string; message?: string } | string | null; sessionId?: string }
 
 /** Minimal HTTP surface, injectable so routing tests never open a socket. */
 export type WdaFetch = (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string }) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
@@ -89,8 +91,10 @@ async function wdaCall(
   let reply: WdaReply;
   try { reply = JSON.parse(text) as WdaReply; }
   catch { throw new Error(`WDA ${path} → unparseable reply: ${text.slice(0, 200)}`); }
-  const err = reply.value && typeof reply.value === 'object' ? reply.value.error : undefined;
-  if (err) throw new Error(`WDA ${path} → ${err}: ${String(reply.value?.message ?? '').slice(0, 200)}`);
+  // Only an OBJECT `value` can carry an error; `/screenshot` answers with a plain base64 string,
+  // which is a payload, not a failure.
+  const errValue = reply.value && typeof reply.value === 'object' ? reply.value : undefined;
+  if (errValue?.error) throw new Error(`WDA ${path} → ${errValue.error}: ${String(errValue.message ?? '').slice(0, 200)}`);
   return reply;
 }
 
@@ -102,12 +106,22 @@ export interface WdaSession {
   actions(payload: unknown): Promise<void>;
   /** Release any pointers left down (W3C `DELETE /actions`). Best-effort. */
   releaseActions(): Promise<void>;
+  /** Capture the WHOLE DEVICE SCREEN as base64 PNG (W3C `GET /screenshot`). Not the app's own
+   *  capture — see `tryDeviceWdaScreenshot` for what that difference buys and what it costs. */
+  screenshot(): Promise<string>;
 }
 
 export function makeWdaSession(fetchImpl: WdaFetch, baseUrl: string, sessionId: string): WdaSession {
   return {
     baseUrl, sessionId,
     async actions(payload: unknown) { await wdaCall(fetchImpl, baseUrl, `/session/${sessionId}/actions`, { body: payload }); },
+    async screenshot() {
+      const reply = await wdaCall(fetchImpl, baseUrl, `/session/${sessionId}/screenshot`, { method: 'GET' });
+      // `wdaCall` has already raised on a body-carried error; anything but a string here means WDA
+      // answered a shape we do not understand, which must not be passed off as an image.
+      if (typeof reply.value !== 'string' || !reply.value) throw new Error('WDA /screenshot returned no image data');
+      return reply.value;
+    },
     async releaseActions() {
       try { await wdaCall(fetchImpl, baseUrl, `/session/${sessionId}/actions`, { method: 'DELETE' }); }
       catch { /* best-effort: this runs on a path that already failed */ }
@@ -263,6 +277,89 @@ export async function tryDeviceWdaInput(method: string, params: Record<string, u
     await session.releaseActions();
     resetDeviceWdaSession();
     return { handled: false, reason: WDA_SESSION_LOST_REASON };
+  }
+}
+
+// ── Screenshot (#102) ─────────────────────────────────────────────────────────
+
+/** Why a WDA capture could not be taken. Actionable, and distinct from the INPUT reasons above so a
+ *  reader is not sent to Build Support for a problem that is really "no WiFi lease". */
+export const WDA_SHOT_NO_SESSION_REASON =
+  'WebDriverAgent is not answering on the phone, so the out-of-app capture is unavailable — install '
+  + 'it from Build Support (iOS) and make sure the lease is a WiFi one (adb/USB leases are Android)';
+
+/** The coordinate-space warning every WDA capture carries.
+ *
+ *  THIS IS THE POINT OF THE FEATURE'S RISK, not boilerplate. Screenshot pixels are an AIM SPACE:
+ *  the device sets `lastScreenInfo` on its NATIVE capture and `device_tap {x,y}` scales through it.
+ *  A WDA capture is the whole DEVICE screen — status bar, letterboxing, possibly a system dialog
+ *  over the app — so its pixels are not page pixels, and a stale mapping from an earlier native
+ *  capture would silently mis-scale a tap aimed off this image. Loud text is the mitigation,
+ *  because the failure is quiet by construction: wrong coordinates still "work". */
+export const WDA_SHOT_COORDINATE_WARNING =
+  '⚠️  DEVICE-SCREEN pixels, not page coordinates. This is WebDriverAgent\'s full-screen capture '
+  + '(status bar and any system UI included), so these x/y do NOT map to device_tap/device_drag — '
+  + 'aim by selector/entity instead, or take a normal (native) screenshot first.';
+
+/** Width/height straight out of a PNG's IHDR chunk — bytes 16..24 of the file.
+ *
+ *  WDA reports no dimensions with the image, and the reply shape the MCP decodes wants them. Read
+ *  from the header rather than decoding the image: dependency-free, and a handful of bytes. Returns
+ *  null for anything that is not a PNG, so a surprise payload degrades to "no dimensions" instead
+ *  of confidently reporting nonsense. */
+export function pngDimensions(base64: string): { width: number; height: number } | null {
+  try {
+    const buf = Buffer.from(base64.slice(0, 64), 'base64');
+    const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    if (buf.length < 24 || !buf.subarray(0, 8).equals(PNG_SIGNATURE)) return null;
+    return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+  } catch { return null; }
+}
+
+/** The outcome of trying to capture through WDA. Mirrors `RouteOutcome`'s split, but carries an
+ *  object reply (the screenshot envelope) rather than a status line. */
+export type WdaShotOutcome =
+  | { handled: true; reply: Record<string, unknown> }
+  | { handled: false; reason: string };
+
+/** Capture the device screen via WebDriverAgent (#102).
+ *
+ *  WHY THIS EXISTS AT ALL, given the native iOS capture is faithful: the native path is the APP'S
+ *  OWN capture, so it can only ever show the app. A system permission/ATT prompt is a different
+ *  window — the native capture comes back showing the app UNDERNEATH it, which looks like a
+ *  perfectly good screenshot of the wrong thing. Same for springboard after a background or a
+ *  crash. Those are the moments a picture is worth most, and there was no way to get one.
+ *
+ *  `autoLaunch` is deliberately the caller's choice: an explicit `source:'wda'` request may pay the
+ *  ~6s agent spin-up, but the automatic fallback from a failed native capture must NOT — a
+ *  screenshot that silently takes six seconds because the app crashed is a worse experience than
+ *  one that says why it could not help. */
+export async function tryDeviceWdaScreenshot(
+  deps: { host?: string; getSession?: WdaRouteDeps['getSession'] },
+  opts: { autoLaunch?: boolean } = {},
+): Promise<WdaShotOutcome> {
+  const getSession = deps.getSession ?? getDeviceWdaSession;
+  const session = await getSession({ host: deps.host, autoLaunch: opts.autoLaunch ?? false });
+  if (!session) return { handled: false, reason: lastLaunchFailure ?? WDA_SHOT_NO_SESSION_REASON };
+  try {
+    const base64 = await session.screenshot();
+    const dims = pngDimensions(base64);
+    return {
+      handled: true,
+      reply: {
+        image: `data:image/png;base64,${base64}`,
+        source: TRUSTED_WDA_MECHANISM,
+        warning: WDA_SHOT_COORDINATE_WARNING,
+        ...(dims
+          ? { imageWidth: dims.width, imageHeight: dims.height, screenWidth: dims.width, screenHeight: dims.height }
+          : {}),
+      },
+    };
+  } catch (e) {
+    // Drop the cached session: the usual cause is that the agent died (its xcodebuild test process
+    // is not running), and a stale session id would fail every later call the same way.
+    resetDeviceWdaSession();
+    return { handled: false, reason: `the WebDriverAgent capture failed: ${e instanceof Error ? e.message : String(e)}` };
   }
 }
 

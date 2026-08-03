@@ -163,7 +163,7 @@ describe('ensureWda', () => {
   it('is IDEMPOTENT — a present, unexpired build runs no npm and no xcodebuild', async () => {
     seedBuild(base)
     const run = vi.fn<CommandRunner>(async () => { throw new Error('must not run anything') })
-    const r = await ensureWda(base, { teamId: 'KQ6FQ2BS8H', npm: NPM, run })
+    const r = await ensureWda(base, { teamId: 'ABCDE12345', npm: NPM, run })
     expect(run).not.toHaveBeenCalled()
     expect(r.xctestrun).toMatch(/\.xctestrun$/)
   })
@@ -174,7 +174,7 @@ describe('ensureWda', () => {
     seedSource(base)
     seedBuild(base, { expiresAt: new Date('2020-01-01') })
     const run = buildingRunner()
-    await ensureWda(base, { teamId: 'KQ6FQ2BS8H', npm: NPM, run, now: new Date('2026-08-02') })
+    await ensureWda(base, { teamId: 'ABCDE12345', npm: NPM, run, now: new Date('2026-08-02') })
     expect(run).toHaveBeenCalledWith('xcodebuild', expect.anything(), expect.anything())
   })
 
@@ -183,13 +183,13 @@ describe('ensureWda', () => {
     // one checkout serves any signing identity (WDA is per-machine, not per-project).
     seedSource(base)
     const run = buildingRunner()
-    await ensureWda(base, { teamId: 'KQ6FQ2BS8H', npm: NPM, run })
+    await ensureWda(base, { teamId: 'ABCDE12345', npm: NPM, run })
     const args = (run as ReturnType<typeof vi.fn>).mock.calls.find((c) => c[0] === 'xcodebuild')![1] as string[]
-    expect(args).toContain('DEVELOPMENT_TEAM=KQ6FQ2BS8H')
+    expect(args).toContain('DEVELOPMENT_TEAM=ABCDE12345')
     expect(args).toContain('-allowProvisioningUpdates')
     expect(args).toContain('build-for-testing')
     expect(fs.readFileSync(path.join(wdaSourceDir(base), 'WebDriverAgent.xcodeproj', 'project.pbxproj'), 'utf8'))
-      .not.toContain('KQ6FQ2BS8H')
+      .not.toContain('ABCDE12345')
   })
 
   it('rewrites the bundle ids before building', async () => {
@@ -290,7 +290,7 @@ describe('registry wiring — the seam production actually takes', () => {
     // since the machine-level setting only exists after the first manual install seeds it.
     expect(autoInstallable('webdriveragent', { wdaTeamAvailable: true })).toBe(detect('xcodebuild').present)
     // A machine-level team is equally sufficient.
-    process.env.MODOKI_WDA_TEAM_ID = 'KQ6FQ2BS8H'
+    process.env.MODOKI_WDA_TEAM_ID = 'ABCDE12345'
     expect(autoInstallable('webdriveragent')).toBe(detect('xcodebuild').present)
   })
 

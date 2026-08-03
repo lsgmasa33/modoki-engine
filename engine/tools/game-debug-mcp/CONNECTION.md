@@ -102,7 +102,7 @@ WebGPU screenshot is black:
 | `device_connect` | Open the lease — `ip` (WiFi) or `useAdb:true` (USB); bare = reconnect the last target. Same action as the AI panel's *Connect a Device* |
 | `device_disconnect` | Close the lease (release the device for another editor) |
 | `device_eval` | Execute JavaScript in the game page context |
-| `device_screenshot` | Capture the screen → saves file, opens Preview, returns **path + dimensions** (image inlined only with `inline:true`). Android: full framebuffer via `adb screencap`; iOS: native via the lease |
+| `device_screenshot` | Capture the screen → saves file, opens Preview, returns **path + dimensions** (image inlined only with `inline:true`). Android: full framebuffer via `adb screencap`; iOS: native via the lease, or `source:"wda"` for the whole device screen (a system dialog / springboard the app's own capture cannot see — its pixels are NOT aimable) |
 | `device_console_logs` | Return captured `console.log/warn/error/info` |
 | `device_native_logs` | Return native logs (Android logcat / iOS `os_log`) |
 

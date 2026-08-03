@@ -20,6 +20,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { trait } from 'koota';
+import { completeResponse } from '../stubs/assetResponse';
 
 const EntityAttributes = trait({
   name: '', isActive: true, sortOrder: 0, parentId: 0,
@@ -62,10 +63,12 @@ let fetchResponses: Record<string, unknown> = {};
 
 // @ts-expect-error mocking global
 global.fetch = vi.fn(async (url: string) => {
+  // completeResponse fills in text() — the stubs below only supply json(), and the loaders read
+  // the body as text so they can spot Vite's index.html SPA fallback. See tests/stubs/assetResponse.ts.
   for (const [key, body] of Object.entries(fetchResponses)) {
-    if (url.endsWith(key) || url === key) return { ok: true, json: async () => structuredClone(body) } as Response;
+    if (url.endsWith(key) || url === key) return completeResponse({ ok: true, json: async () => structuredClone(body) });
   }
-  return { ok: false, status: 404, json: async () => ({}) } as Response;
+  return completeResponse({ ok: false, status: 404, json: async () => ({}) });
 });
 
 function installLocalStorage() {

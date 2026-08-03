@@ -46,7 +46,7 @@ describe('autoUpdate', () => {
     // A locally-built unsigned DMG: `codesign -dvv` reports Signature=adhoc.
     expect(m.isAdhocSignature('Executable=/Applications/Modoki Editor.app\nSignature=adhoc\n')).toBe(true);
     // A real signed release: a Developer ID authority, no adhoc marker.
-    expect(m.isAdhocSignature('Authority=Developer ID Application: Modoki (KQ6FQ2BS8H)\nTeamIdentifier=KQ6FQ2BS8H\n')).toBe(false);
+    expect(m.isAdhocSignature('Authority=Developer ID Application: Modoki (ABCDE12345)\nTeamIdentifier=ABCDE12345\n')).toBe(false);
     expect(m.isAdhocSignature('')).toBe(false);
   });
 

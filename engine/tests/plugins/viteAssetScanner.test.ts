@@ -98,8 +98,8 @@ describe('gamesModuleSource (virtual:modoki-games — Windows separator safety)'
   // Windows editor's web/native build (and baked game module) broke. Assert the fix from
   // macOS/Linux CI by feeding a Windows path.
   it('forward-slashes a Windows game.ts path in the import specifier', () => {
-    const src = gamesModuleSource({ kind: 'single', path: 'C:\\Users\\shois\\proj\\game.ts' });
-    expect(src).toContain('import { game } from "C:/Users/shois/proj/game"');
+    const src = gamesModuleSource({ kind: 'single', path: 'C:\\Users\\winuser\\proj\\game.ts' });
+    expect(src).toContain('import { game } from "C:/Users/winuser/proj/game"');
     expect(src).not.toContain('\\'); // no backslash survives into the emitted module
   });
   it('leaves a POSIX path clean and strips the extension', () => {

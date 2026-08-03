@@ -4,6 +4,7 @@
  *  flagged). manifest + assetUrl + fetch are mocked so it's pure. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { completeResponse } from '../stubs/assetResponse';
 
 vi.mock('../../src/runtime/loaders/assetManifest', () => ({
   resolveRef: (g: string) => (g.startsWith('font-') ? `/fonts/${g}.ttf` : undefined),
@@ -31,7 +32,9 @@ function mockFetchOnce(json: unknown, deferred?: { resolve: () => void }) {
   const gate = deferred ? new Promise<void>((r) => { deferred.resolve = r; }) : Promise.resolve();
   vi.stubGlobal('fetch', vi.fn(async () => {
     await gate;
-    return { ok: true, json: async () => json } as Response;
+    // completeResponse fills in text() — parseAssetJson reads the body as text so it can spot
+    // Vite's index.html SPA fallback (see tests/stubs/assetResponse.ts).
+    return completeResponse({ ok: true, json: async () => json });
   }));
 }
 

@@ -48,6 +48,52 @@ const SYNTHETIC_MECHANISM = 'synthetic' as const;
 const TRUSTED_CDP_MECHANISM = 'trusted-cdp' as const;
 const TRUSTED_WDA_MECHANISM = 'trusted-wda' as const;
 
+// ── The device eval surface's BOUNDARY (#101) ────────────────────────────────
+// Input and screenshot are NOT agent ops: they are bridge-level switch cases
+// (`engine/app/debug/bridge.ts`), and trusted input is dispatched HOST-SIDE by the backend
+// (deviceCdp.ts / deviceWda.ts) because a page cannot dispatch a trusted event to itself. So
+// `modoki.call('tap')` inside device_eval hits the router's `Unknown method:` default — and with
+// no `api()` on the device surface there is no escape hatch either.
+//
+// The trap this text exists to close: `resolve-dom-point` / `resolve-entity-point` ARE ops, so a
+// script can compute exactly where to tap and is then unable to tap. Today you learn that by
+// writing the script and watching it fail.
+//
+// WHY THIS TEXT LIVES HERE rather than in the device's own `deviceEvalApi.ts` (whose editor twin
+// carries its usage lines in the `eval-api` op): the editor renderer is always the current build,
+// but the device app is a SHIPPED ARTIFACT that can be older than this server. Guidance kept
+// on-device would report the old build's wording, and probing for a newer method (`modoki.describe()`)
+// would hard-fail against every already-installed build. The ops LIST still comes from the device —
+// it must, being generated from that build's registry — and only the guidance is composed here.
+const DEVICE_EVAL_UNREACHABLE_OPS = ['tap', 'drag', 'pointer', 'press-key', 'hover', 'scroll', 'type-text', 'screenshot'] as const;
+const DEVICE_EVAL_UNREACHABLE_SUMMARY =
+  'NOT reachable from eval: input (tap/drag/pointer/press-key/hover/scroll/type-text) and screenshot are '
+  + 'bridge-level methods, not agent ops — `modoki.call(\'tap\')` fails with `Unknown method:`. Use the '
+  + 'device_* tools for those; they route trusted input host-side (CDP on Android, WebDriverAgent on iOS), '
+  + 'which is exactly what an in-page call could not do.';
+
+/** The guidance `device_eval_api` wraps around the device's own op list. */
+function deviceEvalApiGuidance(): {
+  usage: string[];
+  absent: Record<string, string>;
+  notReachable: { methods: string[]; why: string };
+  note: string;
+} {
+  return {
+    usage: [
+      'modoki.call(op, params) — invoke any op above by its raw kebab-case name',
+      'modoki.<camelCaseName>(params) — generated shortcut for each op above',
+      'modoki.ops() — the same {op, method} listing, from inside eval code',
+    ],
+    absent: {
+      'modoki.api(path, init)': 'editor-only — there is no editor backend for the device page to fetch; every device op already funnels through the lease',
+      'modoki.composite(label, fn)': 'editor-only — there is no undo stack on device',
+    },
+    notReachable: { methods: [...DEVICE_EVAL_UNREACHABLE_OPS], why: DEVICE_EVAL_UNREACHABLE_SUMMARY },
+    note: 'The op list comes from the CONNECTED BUILD\'s registry, so an older app reports fewer ops. Call device_eval_api again any time.',
+  };
+}
+
 // ── WHICH editor is this pointed at? (S2.39) ─────────────────────────────────
 // `.mcp.json` defaults MODOKI_BACKEND to 5179 for EVERY clone, and this server had no identity
 // check whatsoever — so a `device_*` call from the work-ai2 clone drove the MAIN clone's editor,
@@ -309,6 +355,32 @@ async function backendPost(path: string, payload: unknown): Promise<unknown> {
   return body;
 }
 
+/** Save a decoded capture, open it in Preview (macOS), and render the tool reply.
+ *
+ *  Shared by the native path and the WDA path (#102) so both save, name and size-report a capture
+ *  identically. `aimHint` is a PARAMETER rather than baked in, because it is the one line the two
+ *  paths must not share: a native capture's pixels ARE the aim space for `device_tap`, and a WDA
+ *  capture's are the whole device screen and must never be used that way. */
+function renderScreenshot(
+  decoded: { dataUrl: string; info: string },
+  opts: { savePath?: string; inline?: boolean; prefix?: string; aimHint?: string },
+): DeviceToolResult {
+  const base64 = decoded.dataUrl.includes(',') ? decoded.dataUrl.split(',')[1] : decoded.dataUrl;
+  const mimeType = decoded.dataUrl.startsWith('data:image/jpeg') ? 'image/jpeg' : 'image/png';
+  const info = decoded.info + (opts.aimHint ?? '');
+  const buf = Buffer.from(base64, 'base64');
+  const outPath = opts.savePath ?? join(tmpdir(), `device-screenshot.${extFor(mimeType)}`);
+  writeFileSync(outPath, buf);
+  // fire-and-forget (macOS). `VITEST` guard: this is the first code path a test drives end-to-end,
+  // and a suite that opens a GUI app on the developer's machine is a suite people stop running —
+  // same reason autoUpdate.ts and native-dynamic-import.ts check it.
+  if (process.platform === 'darwin' && !process.env.VITEST) void pExecFile('open', ['-a', 'Preview', outPath]).catch(() => {});
+  const prefix = opts.prefix ?? '';
+  return opts.inline
+    ? { content: [{ type: 'image' as const, data: base64, mimeType }, { type: 'text' as const, text: prefix + info }] }
+    : { content: [{ type: 'text' as const, text: prefix + describeScreenshot(info, outPath, buf.length) }] };
+}
+
 /** Proxy one data-plane request through Modoki's held lease. Returns the device's `result`
  *  (usually a JSON string — the device `safeStringify`s its replies). */
 async function deviceRequest(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
@@ -472,7 +544,7 @@ export function registerTools(server: McpServer) {
       'scripting object (#83) — the device\'s live agent-op registry as `modoki.call(op, params)` ' +
       'plus a generated `modoki.<camelCase>(params)` method per op (see device_eval_api for the ' +
       'full list). Narrower than the editor\'s: no `modoki.api()`/`modoki.composite()` (device has ' +
-      'no editor backend to fetch and no undo stack).',
+      'no editor backend to fetch and no undo stack). ' + DEVICE_EVAL_UNREACHABLE_SUMMARY,
     { code: z.string().describe('JavaScript code. Use `return` for a value.') },
     async ({ code }) => {
       try {
@@ -502,7 +574,8 @@ export function registerTools(server: McpServer) {
   tool('device_eval_api',
     'Discovery for device_eval: lists every op the injected `modoki` scripting object exposes, as ' +
       'its generated `modoki.<camelCase>(params)` method — plus `modoki.call(op, params)` and ' +
-      '`modoki.ops()`. Device-only surface (no `api`/`composite` — see device_eval).',
+      '`modoki.ops()`, what is deliberately ABSENT (no `api`/`composite`), and what cannot be ' +
+      'reached from eval at all (input + screenshot). Read this before writing a device_eval script.',
     {},
     async () => {
       try {
@@ -516,7 +589,16 @@ export function registerTools(server: McpServer) {
             options: ['confirm a device is connected (device_status)'],
           });
         }
-        return { content: [{ type: 'text' as const, text: encodeEvalResult(result) }] };
+        // The ops come from the device (that build's registry); the guidance is composed here — see
+        // DEVICE_EVAL_UNREACHABLE_SUMMARY's header for why it is not shipped on-device. `parseReply`
+        // returns the raw value unchanged if it is not JSON, so an unexpected reply is REPORTED as
+        // `ops` rather than being dropped on the floor by a parse this tool could not do.
+        return {
+          content: [{
+            type: 'text' as const,
+            text: encodeStructuredResult({ ops: parseReply<unknown>(result), ...deviceEvalApiGuidance() }),
+          }],
+        };
       } catch (e) {
         return caughtFailure('device_eval_api', 'list the device eval scripting surface', e);
       }
@@ -742,22 +824,56 @@ export function registerTools(server: McpServer) {
 
   tool('device_screenshot',
     'Take a screenshot of the connected device. Saves it to a file, opens it in Preview, and ' +
-      'returns the PATH + dimensions as text. Use those pixel coordinates for device_tap/device_drag. ' +
+      'returns the PATH + dimensions as text. Those pixel coordinates are aimable with ' +
+      'device_tap/device_drag — EXCEPT on a wda capture, see below. ' +
       'The image is NOT inlined by default (a full-res base64 blob crowds out the task). Pass ' +
-      'inline:true if you actually need to look at it.',
+      'inline:true if you actually need to look at it. ' +
+      'iOS only: `source:"wda"` captures the WHOLE DEVICE SCREEN via WebDriverAgent instead of the ' +
+      'app\'s own capture — the only way to see a system permission/ATT dialog, springboard, or ' +
+      'anything outside the app. Its pixels are DEVICE-screen coordinates and must NOT be fed to ' +
+      'device_tap/device_drag (aim by selector/entity instead).',
     {
       savePath: z.string().optional().describe('Where to save (e.g., /tmp/screenshot.jpg). Defaults to a temp file.'),
       inline: z.boolean().optional().describe('Also embed the image in the response. Large — only when you need to SEE it.'),
+      source: z.enum(['auto', 'wda']).optional().describe('auto (default): adb framebuffer / the app\'s native capture, falling back to WebDriverAgent only if that errors. wda: force the iOS full-device capture — use it when the thing you need to see is OUTSIDE the app, which does not make the native capture fail.'),
     },
-    async ({ savePath, inline }) => {
+    async ({ savePath, inline, source }) => {
       try {
+        // #102 — an explicit `source:'wda'` skips BOTH normal paths. It is an iOS-only capability
+        // (the backend refuses when the lease has no WiFi host), and it must not be quietly
+        // downgraded to an adb or native capture: the caller asked for it precisely because those
+        // two cannot see what they are looking for.
+        if (source === 'wda') {
+          // Deliberately NOT clearing `adbScreenInfo`: a WDA capture is no evidence about the adb
+          // screen mapping either way, and a stale-mapping tap is guarded by the loud coordinate
+          // warning this reply carries — not by silently dropping state a later native capture
+          // would still want.
+          const decoded = decodeScreenshotReply(await deviceRequest('screenshot', { source: 'wda' }));
+          if ('error' in decoded) {
+            return deviceFail({
+              code: 'REFUSED_BY_OP',
+              tool: 'device_screenshot',
+              what: 'capture the full device screen via WebDriverAgent',
+              why: decoded.error,
+              options: [
+                'WDA is iOS-only and needs a WiFi lease — an adb/USB lease is Android (device_status)',
+                'install WebDriverAgent from Build Support (iOS); it runs only while its xcodebuild test process is alive',
+                'drop source:"wda" for the app\'s own capture, which cannot see outside the app',
+              ],
+            });
+          }
+          return renderScreenshot(decoded, { savePath, inline, prefix: decoded.warning ? `${decoded.warning}\n\n` : '' });
+        }
         // Android over adb: full framebuffer via adb (captures the WebGL/WebGPU canvas the native path
         // can't). ONLY when the LEASE itself is the adb device (F2) — never just because some Android
         // is on USB, which would screenshot the wrong device when the lease is a WiFi iPhone.
         if (await leaseUsesAdb() && await adbAvailable()) {
           const cap = await adbScreencap(savePath, inline);
           adbScreenInfo = { imgW: cap.imgW, imgH: cap.imgH, nativeW: cap.nativeW, nativeH: cap.nativeH, lease: (await leaseKey()) ?? 'adb' };
-          if (process.platform === 'darwin') void pExecFile('open', ['-a', 'Preview', cap.path]).catch(() => {}); // fire-and-forget (macOS)
+          // Same VITEST guard as `renderScreenshot` — this branch needs adb + an adb lease, so no
+          // test reaches it TODAY, but it is the identical defect and one adb-path test away from
+          // opening Preview windows during `npm test`.
+          if (process.platform === 'darwin' && !process.env.VITEST) void pExecFile('open', ['-a', 'Preview', cap.path]).catch(() => {}); // fire-and-forget (macOS)
           const info = `[adb] ${cap.imgW}x${cap.imgH} (from ${cap.nativeW}x${cap.nativeH}). Use these pixel coordinates for device_tap/device_drag.`;
           return inline
             ? { content: [{ type: 'image' as const, data: cap.base64, mimeType: cap.mimeType }, { type: 'text' as const, text: info }] }
@@ -795,20 +911,14 @@ export function registerTools(server: McpServer) {
             ],
           });
         }
-        const imageDataUrl = decoded.dataUrl;
-        const base64 = imageDataUrl.includes(',') ? imageDataUrl.split(',')[1] : imageDataUrl;
-        const mimeType = imageDataUrl.startsWith('data:image/jpeg') ? 'image/jpeg' : 'image/png';
-        const info = decoded.info + ' Use these pixel coordinates for device_tap/device_drag.';
-
-        const buf = Buffer.from(base64, 'base64');
-        const outPath = savePath ?? join(tmpdir(), `device-screenshot.${extFor(mimeType)}`);
-        writeFileSync(outPath, buf);
-        if (process.platform === 'darwin') void pExecFile('open', ['-a', 'Preview', outPath]).catch(() => {}); // fire-and-forget (macOS)
-
-        const text = describeScreenshot(info, outPath, buf.length);
-        return inline
-          ? { content: [{ type: 'image' as const, data: base64, mimeType }, { type: 'text' as const, text: blackCanvasWarning + info }] }
-          : { content: [{ type: 'text' as const, text: blackCanvasWarning + text }] };
+        // The backend falls back to a WDA capture when the native one ERRORS (#102). That image is
+        // the whole device screen, so the aim hint below would be a lie — and this is the path
+        // where nobody ASKED for a WDA capture, which is exactly when a wrong hint gets believed.
+        return renderScreenshot(decoded, {
+          savePath, inline,
+          prefix: (decoded.warning ? `${decoded.warning}\n\n` : '') + blackCanvasWarning,
+          aimHint: decoded.isWholeDevice ? '' : ' Use these pixel coordinates for device_tap/device_drag.',
+        });
       } catch (e) {
         return caughtFailure('device_screenshot', 'capture the device screen', e);
       }

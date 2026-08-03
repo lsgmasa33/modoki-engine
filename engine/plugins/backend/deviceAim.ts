@@ -26,6 +26,18 @@ export const STALE_APP_REASON =
   'the app installed on the device predates trusted input (its debug bridge has no `resolve-aim` op) '
   + '— rebuild and reinstall it to get trusted input';
 
+/** Does this device reply signal FAILURE?
+ *
+ *  The bridge never throws across the transport — a failed handler RETURNS `Error: …`, and an
+ *  unrouted method returns `Unknown method: …`, both of which arrive as an ordinary successful
+ *  reply. Encoded here (backend-side) for the same reason `isDeviceError` encodes it in the MCP
+ *  package: they are separate module graphs, so the convention is duplicated rather than imported —
+ *  but it must be stated identically in both. Callers that treat a reply as data without this check
+ *  report an error string as their result. */
+export function isDeviceFailureReply(raw: unknown): raw is string {
+  return typeof raw === 'string' && (raw.startsWith('Error:') || raw.startsWith('Unknown method:'));
+}
+
 /** What an aim resolution needs from the caller: the device-lease proxy to reach the page. */
 export interface AimProxyDeps {
   proxy(method: string, params: Record<string, unknown>): Promise<unknown>;

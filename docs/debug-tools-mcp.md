@@ -35,7 +35,7 @@ Grouped:
   `device_connect` (open the lease — `ip`/`useAdb`, or bare to reconnect the last target) ·
   `device_disconnect` · `device_eval` (compact, size-capped JSON; survives a circular result;
   `code` sees an injected `modoki` scripting object — the live agent-op registry, generated per op)
-  · `device_eval_api` (discovery: what that object exposes) ·
+  · `device_eval_api` (discovery: what that object exposes — **and what it does not**) ·
   `device_screenshot` ·
   `device_console_logs` · `device_native_logs` (both default `limit:50`).
 - **Percept (read-by-data):** `device_get_scene_state` · `device_diagnose` · `device_journal` ·
@@ -90,6 +90,18 @@ Grouped:
   not treat hit-testing as sufficient on device: geometry is what produced the right target here,
   and without that tier the aim would have fallen through to `ambiguous` — i.e. straight back to the
   first-canvas bug.
+
+**What `device_eval` CANNOT do, and why it is not an oversight** (#101). The injected `modoki`
+object covers the device's **agent ops**. Input (`tap`/`drag`/`pointer`/`press-key`/`hover`/
+`scroll`/`type-text`) and `screenshot` are **not** ops — they are bridge-level methods, and trusted
+input is dispatched HOST-SIDE by the backend precisely because *a page cannot dispatch a trusted
+event to itself*. So `modoki.call('tap')` answers `Unknown method:`, and unlike the editor there is
+no `modoki.api()` to route around it (nor `composite()` — no undo stack on device). The trap worth
+knowing: `resolve-dom-point`/`resolve-entity-point` ARE ops, so a script can compute exactly where
+to tap and then be unable to tap. Use the `device_*` input tools for that half — each MCP call
+keeps its full trusted routing. `device_eval_api` states this boundary in its reply; the guidance
+lives in the MCP server rather than on-device because **the app is a shipped artifact that can be
+older than the server**, and on-device text would report the old build's wording.
 
 ⚠️ **Which APP is answering? The bridge port (9095) is a FIXED default shared by every Modoki
 game**, and Android keeps a backgrounded app resident. If another Modoki app already owns 9095, the
@@ -150,6 +162,11 @@ renders a WebGPU (Dawn/Vulkan) canvas **black** — only the DOM HUD survives �
 uses `adb screencap` for an adb lease (full framebuffer) but has nothing to fall back on over WiFi.
 `device_diagnose` (render/scene health as data) and `device_get_scene_state` are the reliable channel.
 `device_screenshot` returns a **PATH, not an image** (`inline:true` only when you must see pixels).
+On **iOS**, `device_screenshot {source:'wda'}` captures the WHOLE DEVICE SCREEN via WebDriverAgent —
+the only way to see a system permission/ATT dialog or springboard, which the app's own capture
+cannot (it returns the app *underneath* the dialog, looking like a fine screenshot of the wrong
+thing). ⚠️ Its pixels are device-screen coordinates and must **not** be fed to `device_tap`. Detail:
+[docs/trusted-device-input.md](trusted-device-input.md) § "WDA also captures the screen" (#102).
 
 **Enact aiming — prefer a `selector`.** `device_tap`/`device_drag` resolve a CSS `selector` on-device
 (occlusion-checked, no screenshot round-trip — the fix for tapping DOM chrome like a debug-menu ✕), or

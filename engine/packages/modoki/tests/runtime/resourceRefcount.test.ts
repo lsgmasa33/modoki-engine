@@ -5,6 +5,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as THREE from 'three';
+import { completeResponse } from '../stubs/assetResponse';
 
 // ── Mock HDRLoader (for HDR environment preload) ──
 
@@ -108,7 +109,9 @@ global.fetch = vi.fn(async (url: string) => {
   fetchCalls[url] = (fetchCalls[url] || 0) + 1;
   for (const [suffix, body] of Object.entries(fetchResponses)) {
     if (url.endsWith(suffix)) {
-      return { ok: true, json: async () => body } as Response;
+      // completeResponse fills in text() — parseAssetJson reads the body as text so it can spot
+      // Vite's index.html SPA fallback (see tests/stubs/assetResponse.ts).
+      return completeResponse({ ok: true, json: async () => body }) as Promise<Response>;
     }
   }
   return { ok: false, json: async () => ({}) } as Response;

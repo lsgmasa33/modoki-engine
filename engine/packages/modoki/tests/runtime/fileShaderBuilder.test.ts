@@ -5,6 +5,7 @@
  *  builder's pure logic + control flow without a WebGPU/TSL context. `three` (Color)
  *  and `shaderSchema` (coerceParamValue/fetchShaderManifest) stay real. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { completeResponse } from '../stubs/assetResponse';
 
 // Tagged TSL stubs — every node-builder returns a recognizable plain object so we
 // can assert which conversion ran without a real render context.
@@ -93,8 +94,10 @@ describe('buildFileShaderMaterial — control flow', () => {
     globalThis.fetch = vi.fn(async (url: unknown) => {
       const u = String(url);
       if (u.endsWith('.shader.json')) {
+        // completeResponse fills in text() — parseAssetJson reads the body as text so it can
+        // spot Vite's index.html SPA fallback (see tests/stubs/assetResponse.ts).
         return manifest
-          ? ({ ok: true, json: async () => manifest } as Response)
+          ? (await completeResponse({ ok: true, json: async () => manifest }) as Response)
           : ({ ok: false, json: async () => ({}) } as Response);
       }
       if (u.endsWith('.wgsl') || u.endsWith('.glsl')) {

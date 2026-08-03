@@ -663,14 +663,14 @@ describe('/api/project-settings is a non-destructive PATCH', () => {
   it('a partial second set does NOT revert the sections it omits (the reported scenario)', async () => {
     await settings({
       app: { appId: 'com.modokiengine.court', appName: 'Court' },
-      build: { appleTeamId: 'KQ6FQ2BS8H', debugBuild: true },
+      build: { appleTeamId: 'ABCDE12345', debugBuild: true },
     });
     await settings({ build: { debugBuild: false } });
 
     const cfg = readCfg();
     expect(cfg.app.appId).toBe('com.modokiengine.court');
     expect(cfg.app.appName).toBe('Court');
-    expect(cfg.build.appleTeamId).toBe('KQ6FQ2BS8H');
+    expect(cfg.build.appleTeamId).toBe('ABCDE12345');
     expect(cfg.build.debugBuild).toBe(false);
   });
 
@@ -711,7 +711,7 @@ describe('/api/project-settings is a non-destructive PATCH', () => {
   });
 
   it('a full-object save (the Project Settings dialog) can still BLANK a field', async () => {
-    await settings({ app: { appId: 'com.x.y', appName: 'Y' }, build: { appleTeamId: 'KQ6FQ2BS8H', webCdnUrlMap: 'static-lb' } });
+    await settings({ app: { appId: 'com.x.y', appName: 'Y' }, build: { appleTeamId: 'ABCDE12345', webCdnUrlMap: 'static-lb' } });
     const full = (await get('/api/project-settings', makeCtx({ projectRoot: root }))) as { body: Record<string, never> };
     // Post the whole GET response back with one field blanked, exactly as the dialog does.
     await settings({ ...full.body, build: { ...(full.body as never as { build: object }).build, appleTeamId: '' } });

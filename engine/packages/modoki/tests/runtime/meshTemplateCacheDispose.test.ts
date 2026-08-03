@@ -11,6 +11,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as THREE from 'three';
+import { completeResponse } from '../stubs/assetResponse';
 
 // ── Mock HDRLoader (environment acquire) ──
 vi.mock('three/examples/jsm/loaders/HDRLoader.js', () => ({
@@ -44,7 +45,9 @@ const fetchResponses: Record<string, any> = {
 // @ts-expect-error mocking global
 global.fetch = vi.fn(async (url: string) => {
   for (const [suffix, body] of Object.entries(fetchResponses)) {
-    if (url.endsWith(suffix)) return { ok: true, json: async () => body } as Response;
+    // completeResponse fills in text() — parseAssetJson reads the body as text so it can spot
+    // Vite's index.html SPA fallback (see tests/stubs/assetResponse.ts).
+    if (url.endsWith(suffix)) return completeResponse({ ok: true, json: async () => body }) as Promise<Response>;
   }
   return { ok: false, json: async () => ({}) } as Response;
 });

@@ -11,7 +11,7 @@ import { getMaterialBuilder } from './materialTypes';
 import { registerBuiltinMaterialTypes } from './materialPresets';
 import { isGuid, isExternalUrl, resolveGuidToPath, resolveRef, registerAsset, getAssetEntry } from './assetManifest';
 import { assetUrl } from './assetUrl';
-import { ASSET_FETCH_INIT } from './assetFetch';
+import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { modelGlbUrl, resolveRefWarnOnce } from './modelGlbUrl';
 import { takeParsedGltf, clearParsedGltfHandoff } from './parsedGltfHandoff';
 import { addToOwnerSet, removeFromOwnerSet } from './ownerSet';
@@ -903,7 +903,8 @@ function fetchMeshAsset(meshPath: string): Promise<void> {
         meshAssetCache.set(meshPath, MESH_FAILED); // cache failure — don't retry
         return;
       }
-      const asset = await res.json() as { id?: string } & MeshAsset;
+      // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
+      const asset = await parseAssetJson(res, meshPath) as { id?: string } & MeshAsset;
       meshAssetCache.set(meshPath, asset);
       // Self-register so future ref-by-guid resolves to this path
       if (asset.id) registerAsset(asset.id, meshPath, 'mesh');
@@ -1015,7 +1016,9 @@ function fetchMaterial(matPath: string): Promise<void> {
         materialCache.set(matPath, MATERIAL_FAILED); // cache failure — don't retry
         return;
       }
-      const data = await res.json();
+      // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches the untyped `res.json()` this replaces
+      const data = await parseAssetJson(res, matPath) as any;
       // Self-register so future ref-by-guid resolves to this path
       if (typeof data.id === 'string') registerAsset(data.id, matPath, 'material');
 
@@ -1600,7 +1603,8 @@ function fetchPrefab(prefabPath: string): Promise<void> {
     try {
       const res = await fetch(assetUrl(prefabPath), ASSET_FETCH_INIT);
       if (!res.ok) return;
-      const data = await res.json() as { id?: string };
+      // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
+      const data = await parseAssetJson(res, prefabPath) as { id?: string };
       prefabCache.set(prefabPath, data);
       if (typeof data.id === 'string') registerAsset(data.id, prefabPath, 'prefab');
     } catch (e) {

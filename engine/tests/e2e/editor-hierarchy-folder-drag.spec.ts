@@ -38,6 +38,13 @@ test('Hierarchy: dropping a folder member next to an ungrouped sibling clears it
 
   const source = page.locator(`[data-entity-row="${offsetId}"]`);
   const target = page.locator(`[data-entity-row="${centerId}"]`);
+  // Gate on the DOM before reading geometry. The poll above waits on the editor STORE, and
+  // `boundingBox()` — unlike an action — does NOT auto-wait: it returns null the instant the
+  // row is detached, and `targetBox!.height` then throws a bare
+  // `TypeError: Cannot read properties of null`. Folding re-parents rows, so there is a real
+  // window where they are remounting. (Observed once in 3 full serial runs, on the sibling
+  // test below; same shape here.)
+  await expect(target).toBeVisible();
   const targetBox = await target.boundingBox();
   // Bottom ~90% of the row → the "after" zone (detectZone: bottom 25% = after). CenterCube
   // is ungrouped, so this is the "drag out of a folder by dropping near an ungrouped
@@ -61,6 +68,9 @@ test('Hierarchy: dropping next to a folder member adopts that folder', async ({ 
   // adopts the same folder, the inverse of the case above.
   const source = page.locator(`[data-entity-row="${centerId}"]`);
   const target = page.locator(`[data-entity-row="${offsetId}"]`);
+  // See the sibling test above. This is the case that actually flaked: the target here is the
+  // row that was just folded, so it is the one remounting when the geometry read lands.
+  await expect(target).toBeVisible();
   const targetBox = await target.boundingBox();
   await source.dragTo(target, { targetPosition: { x: 20, y: Math.floor(targetBox!.height * 0.9) } });
 

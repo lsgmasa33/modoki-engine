@@ -396,7 +396,7 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
             {
               title: 'Signing',
               fields: [
-                { key: 'build.appleTeamId', label: 'Apple Team ID', type: 'combo', options: teamOptions, placeholder: 'e.g. KQ6FQ2BS8H', help: 'pick a team found on this Mac (or type an ID) — synced into iOS DEVELOPMENT_TEAM on every iOS build' },
+                { key: 'build.appleTeamId', label: 'Apple Team ID', type: 'combo', options: teamOptions, placeholder: 'e.g. ABCDE12345', help: 'pick a team found on this Mac (or type an ID) — synced into iOS DEVELOPMENT_TEAM on every iOS build' },
               ],
             },
             {

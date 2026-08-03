@@ -2,6 +2,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { coerceParamValue, mergeParamDefaults, fetchShaderManifest, type ShaderParamSchema } from '../../src/runtime/loaders/shaderSchema';
+import { completeResponse } from '../stubs/assetResponse';
 
 describe('coerceParamValue', () => {
   it('keeps a valid float, falls back to default otherwise', () => {
@@ -58,7 +59,9 @@ describe('mergeParamDefaults', () => {
 });
 
 describe('fetchShaderManifest — param-type validation (F10)', () => {
-  const okJson = (body: unknown) => ({ ok: true, json: async () => body });
+  // completeResponse fills in text() — parseAssetJson reads the body as text so it can spot
+  // Vite's index.html SPA fallback (see tests/stubs/assetResponse.ts).
+  const okJson = (body: unknown) => completeResponse({ ok: true, json: async () => body });
   let warn: ReturnType<typeof vi.spyOn>;
   beforeEach(() => { warn = vi.spyOn(console, 'warn').mockImplementation(() => {}); });
   afterEach(() => { warn.mockRestore(); vi.restoreAllMocks(); });

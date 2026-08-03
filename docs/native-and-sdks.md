@@ -244,7 +244,7 @@ and its OWN `games/<id>/ios` + `games/<id>/android` native folders. Examples:
 of its `games/<id>/project.config.json` (empty on games not yet signed, e.g. `particle`,
 `skin-test`, `text_demo`); healed into the iOS project's `DEVELOPMENT_TEAM` on open + before
 each build, then Xcode auto-signs (`-allowProvisioningUpdates`). The signed-in games happen to
-share Team ID **`KQ6FQ2BS8H`** (Nomura Masaki), but the mechanism is per-game. (The old single
+share a single Team ID, but the mechanism is per-game. (The old single
 `com.modokiengine.prototype` / "Puzzle Prototype" / App Store ID `6761316443` was the
 pre-#29 identity, retained only for historical reference.)
 

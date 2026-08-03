@@ -92,6 +92,47 @@ build, the per-machine signing, and the expiry rule.
   Windows/Linux editor can drive an agent a Mac started — which is why the reachability probe runs
   before the platform check.
 
+## WDA also captures the screen — the out-of-app screenshot (#102)
+
+The iOS **native** capture (`GameDebug.captureScreen`, the default path) is faithful, but it is the
+**app's own** capture, so it can only ever show the app. A system permission/ATT prompt is a
+different window: the native capture returns the app *underneath* it, which reads as a perfectly
+good screenshot of the wrong thing. Same for springboard after a background or a crash.
+
+`device_screenshot {source:'wda'}` takes `GET /session/{id}/screenshot` instead — the whole device
+screen. Two triggers, because each covers what the other misses:
+
+- **explicit `source:'wda'`** — the only way to reach the dialog case, since that case does not make
+  the native capture *fail*. Pays the lazy agent launch if WDA is not up yet (**measured: ~28s
+  cold**, on a Mac with the agent provisioned).
+- **automatic fallback** when the native capture fails — *either* way it can fail: the device answers
+  an error string, **or** the lease is gone and the proxy throws. Deliberately does **not**
+  auto-launch: a screenshot that silently costs a ~30s spin-up because the app died is worse than one
+  that says why it could not help. The reply then carries `nativeCaptureFailed`; if WDA is unreachable
+  too, the NATIVE error is returned (it is what the caller asked for) with `wdaFallbackUnavailable`.
+
+**It is gated on having the device's ADDRESS, not on the lease being `connected`** — and that
+distinction is the whole feature. Measured on the iPhone Air (2026-08-03): **pressing home SUSPENDS
+the app, so the lease drops to `reconnecting` and the native capture 502s** — which is exactly when
+the springboard picture is wanted. WDA needs no lease at all (it answers host-side on `:8100`), and
+`target` is retained while reconnecting, so the capture still works. A first revision gated on
+`state === 'connected'` and therefore refused the feature in its motivating case; **only a live run
+could show that**, which is why this route is not unit-tests-only. Deliberately NOT falling back to
+`lastTarget`: that survives an explicit `disconnect`, and reaching for a device the user has
+*released* is a different act from photographing one whose app is merely suspended.
+
+Verified end-to-end on the iPhone Air against `games/sling` (2026-08-03): the app-foreground capture
+came back **1260×2736** — the full device screen — against the native path's **600×1303** page
+capture of the same moment, and with the app backgrounded it returned the springboard while
+`device_screenshot` with no `source` 502'd.
+
+⚠️ **Its pixels are DEVICE-SCREEN coordinates, not page coordinates.** Screenshot pixels are an aim
+space — `device_tap {x,y}` scales through the mapping a *native* capture establishes — and a WDA
+image includes the status bar and any system UI. So every WDA capture carries a loud coordinate
+warning **and** drops the "use these pixel coordinates for device_tap" hint the native path prints.
+Aim by `selector`/`entity`, or take a normal capture first. A tap aimed off a WDA image would be
+wrong in the quiet, plausible way this whole document exists to prevent.
+
 ## Measured facts — do not re-derive these
 
 Each was established on hardware, and several contradict the obvious implementation.

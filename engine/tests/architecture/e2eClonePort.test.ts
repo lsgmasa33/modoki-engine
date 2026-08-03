@@ -50,7 +50,7 @@ describe('e2e clone port derivation (#20)', () => {
     // birthday odds for 4 clones are ~30%, and the first attempt at #69 really did map
     // two clones on this machine to the SAME port — a per-clone scheme that isn't.
     // 200 slots is what every caller passes; this fails if someone shrinks it.
-    const parents = ['/Users/dev/Projects', '/Users/Masaki_1/Projects', '/home/x/src', 'C:\\dev'];
+    const parents = ['/Users/dev/Projects', '/Users/dev2/Projects', '/home/x/src', 'C:\\dev'];
     const names = ['modoki', 'modoki-ai', 'modoki-ai2', 'modoki-win'];
     for (const parent of parents) {
       const ports = names.map((n) => clonePort(`${parent}/${n}`));

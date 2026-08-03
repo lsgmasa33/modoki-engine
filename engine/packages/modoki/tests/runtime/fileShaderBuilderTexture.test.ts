@@ -12,6 +12,7 @@
  *  `textureResolver.loadTexture3D` is the unit under assertion. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { completeResponse } from '../stubs/assetResponse';
 
 // A sentinel for the resolved variant texture (what loadTexture3D returns).
 const RESOLVED_TEXTURE = { __resolved: true, isTexture: true };
@@ -81,11 +82,13 @@ const MANIFEST = {
 
 /** Serve the `.shader.json` manifest and the `.wgsl` body for any fetch. */
 function stubFetch(manifest: unknown = MANIFEST) {
-  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string): Promise<Partial<Response>> => {
     if (String(url).endsWith('.wgsl') || String(url).endsWith('.glsl')) {
       return { ok: true, text: async () => 'fn main() -> vec4 { return vec4(1.0); }' };
     }
-    return { ok: true, json: async () => manifest };
+    // completeResponse fills in text() — parseAssetJson reads the body as text so it can spot
+    // Vite's index.html SPA fallback (see tests/stubs/assetResponse.ts).
+    return completeResponse({ ok: true, json: async () => manifest });
   }));
 }
 

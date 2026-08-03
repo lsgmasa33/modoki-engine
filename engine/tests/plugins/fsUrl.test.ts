@@ -12,7 +12,7 @@ import { toFsUrl, fromFsUrl } from '../../plugins/backend/editorBackendRouter';
  */
 describe('toFsUrl — Vite /@fs/ URL for an absolute path', () => {
   it('turns a Windows drive path into forward-slashed /@fs/C:/…', () => {
-    expect(toFsUrl('C:\\Users\\shois\\proj\\game.ts')).toBe('/@fs/C:/Users/shois/proj/game.ts');
+    expect(toFsUrl('C:\\Users\\winuser\\proj\\game.ts')).toBe('/@fs/C:/Users/winuser/proj/game.ts');
   });
   it('keeps a POSIX path clean (no doubled slash)', () => {
     expect(toFsUrl('/Users/x/proj/game.ts')).toBe('/@fs/Users/x/proj/game.ts');

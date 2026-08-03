@@ -244,6 +244,22 @@ export async function loadFirstScene(
     if (canonical !== candidate && (await tryLoad(candidate))) return candidate;
     console.warn(`[Editor] Scene not found at ${candidate}, trying next fallback…`);
   }
+  // EVERY candidate missed — that IS a real failure, and it is the only one worth an `error`.
+  // Individual misses log at `warn` (loadScene's `probing` flag), because a boot that recovers
+  // on a later candidate is healthy and must not leave red in the console (#91).
+  //
+  // ZERO candidates is NOT that failure: it means no scene was configured or remembered at all
+  // (a fresh project, or the e2e harness), and the caller's initWorld/empty-camera path handles
+  // it by design. Nothing was tried, so nothing failed — and logging it as an error here would
+  // recreate the exact false-failure this issue is about, since `smoke-packaged.sh` and
+  // `assert-app-renders.sh` fail on ANY renderer console error. (Measured: the e2e suite boots
+  // with 0 candidates on every spec.)
+  if (candidates.length > 0) {
+    console.error(
+      `[Editor] Failed to load a scene: all ${candidates.length} boot candidate(s) missed `
+      + `(${candidates.join(', ')}). Booting an empty world.`,
+    );
+  }
   return null;
 }
 
@@ -624,7 +640,9 @@ export function createEditor(options: EditorOptions): React.ComponentType {
     // path carries no `/games/<id>/` segment to derive it from).
     const loadedPath = await loadFirstScene(candidates, {
       canonicalize: (p) => canonicalBootScenePath(p, fetch, projectRoot),
-      load: (p) => loadScene(p, options.gameId),
+      // `probing`: a miss on one candidate is a normal step of the fallback walk, not an error
+      // (#91) — loadFirstScene raises the single real error if they ALL miss.
+      load: (p) => loadScene(p, options.gameId, { probing: true }),
     });
     if (loadedPath) {
       // Don't clobber the remembered scene with a one-off override (#43) — a `--scene` launch
