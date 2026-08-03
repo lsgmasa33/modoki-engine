@@ -235,7 +235,7 @@ describe('/api/device/request screenshot with NO lease (#102)', () => {
  *  and 10s sits well inside the suite's 20s `testTimeout` (engine/vite.config.ts). */
 async function waitForLeaseState(pred: (s: string) => boolean, timeoutMs = 10_000): Promise<unknown> {
   const deadline = Date.now() + timeoutMs;
-  let last = 'unknown';
+  let last: string;
   for (;;) {
     const st = await get('/api/device/status');
     last = String(bodyOf(st).state);

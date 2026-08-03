@@ -92,6 +92,24 @@ build, the per-machine signing, and the expiry rule.
   Windows/Linux editor can drive an agent a Mac started — which is why the reachability probe runs
   before the platform check.
 
+  **MEASURED end-to-end, 2026-08-03 (#99), not merely reasoned.** This was written down as a
+  capability for months with nobody having tried it, so it is worth recording exactly what was
+  observed. A Mac started the agent with `xcodebuild test-without-building` against the iPhone Air;
+  the **Windows** clone then reached `http://<device-ip>:8100/status` in **227 ms (HTTP 200)** and a
+  `device_tap` came back `[input:trusted-wda]`, with a capture listener in the page confirming
+  `isTrusted: true` on `pointerdown`/`touchstart`/`mousedown` at the requested coordinates. It is a
+  genuine LAN path, **not** a usbmuxd forward: the Mac had no local forwarder (`127.0.0.1:8100`
+  refused there), and WDA announced its Wi-Fi IP. USB only started the agent; it does not carry it.
+  So the probe ordering is load-bearing and must not be "simplified" away.
+
+  ⚠️ **The probe is unbounded, and that is a real cost off macOS.** `defaultProbe` calls `fetch(url)`
+  with no `AbortSignal`, and when no agent is running, iOS *drops* the SYN rather than refusing it —
+  so on Windows every input op pays the OS connect timeout. Measured: **~2.5 s per tap** with no
+  agent (2534/2675/2527 ms, vs 145 ms for a non-input device op and 660-827 ms once WDA is up). The
+  `lastFailure` latch cannot save it: the latch check sits *after* the probe, so every op re-probes.
+  That is correct by design — a Mac may start an agent at any moment and this editor must notice —
+  which is why the fix is to bound the probe, not to latch it. Tracked in #99.
+
 ## WDA also captures the screen — the out-of-app screenshot (#102)
 
 The iOS **native** capture (`GameDebug.captureScreen`, the default path) is faithful, but it is the

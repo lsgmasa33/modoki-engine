@@ -256,10 +256,13 @@ userData/vite-cache location, and the reap mechanism (`pkill -f` vs a `Win32_Pro
 `ExecutablePath`). Believing it was macOS-only is part of why a *packaged Windows* bug — the editor
 being unable to extract any provisioned toolchain — survived undetected; see "Never assume `tar` is
 bsdtar" in [editor-toolchain.md](editor-toolchain.md). Its release-time sibling
-`assert-app-renders.sh` genuinely WAS macOS-only until the same date, and the public repo's
-`oss/.github/workflows/release-windows.yml` (the private `.github/workflows/release-windows.yml`
-was deleted 2026-08-03 — releases are cut from the public repo now, see
-docs/engine-oss-publishing.md) still has no render gate wired up (#94).
+`assert-app-renders.sh` genuinely WAS macOS-only until the same date, which is why the Windows
+release shipped without a render gate for as long as it did. It is wired in now (#94): the public
+repo's `oss/.github/workflows/release-windows.yml` scaffolds a throwaway starter project and runs
+`assert-app-renders.sh release/win-unpacked "$RUNNER_TEMP/smoke"` as a **fatal** step, matching
+macOS. (The private `.github/workflows/release-windows.yml` was deleted 2026-08-03 — releases are
+cut from the public repo now, see docs/engine-oss-publishing.md.) The explicit project argument is
+load-bearing: the script defaults to `$REPO/games/3d-test`, and the public snapshot has no `games/`.
 
 It stops the local dev editor and builds a throwaway `.app` on a **per-clone port outside the
 5179/5180/5181 human-editor range** — the block and its override live in the harness port table in
