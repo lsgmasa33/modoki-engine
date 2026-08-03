@@ -170,6 +170,9 @@ import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type Muta
 import { getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData, type AssetSchemaType } from '../../packages/modoki/src/runtime/assets/assetSchemas';
 import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
+import { tryDeviceCdpInput, isDeviceCdpAvailable, synthFallbackBanner, TRUSTED_CDP_MECHANISM } from './deviceCdp';
+import { tryDeviceWdaInput, isDeviceWdaAvailable, resetDeviceWdaSession, TRUSTED_WDA_MECHANISM } from './deviceWda';
+import { stopWda } from './wdaLauncher';
 import { resolveModules } from '../detect-modules';
 // Type-only — erased at runtime, so it does NOT pull the tree-shaker (and its
 // vite-asset-scanner import) into this host-agnostic router.
@@ -661,7 +664,25 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // pings + auto-reconnects; Claude's device_* tools proxy through the backend once connected.
   // See docs/debug-tools-mcp.md.
   if (urlPath === '/api/device/status' && method === 'GET') {
-    return json(deviceConnection.status());
+    const status = deviceConnection.status();
+    // The mechanism is a LIVE probe (#32 Phase 1), not a constant: only reported when a lease is
+    // actually connected (a disconnected lease has nothing to report a mechanism FOR — "a refusal
+    // carries no mechanism", the same rule the input handlers themselves follow). Android with a
+    // reachable CDP session → trusted-cdp; anything else (iOS, no adb, socket not found) →
+    // synthetic, the fallback every device_* input call still has.
+    if (status.state !== 'connected') return json(status);
+    // Pass the lease proxy so the probe exercises the WHOLE chain (CDP session AND an app build
+    // that answers `resolve-aim`), not just the half that is cheap to check — see the measured
+    // false claim documented on `isDeviceCdpAvailable`.
+    const proxy = (m: string, p: Record<string, unknown>) => deviceConnection.proxy(m, p);
+    if (await isDeviceCdpAvailable({ proxy })) return json({ ...status, inputMechanism: TRUSTED_CDP_MECHANISM });
+    // #32 Phase 2 — an iOS device has no CDP route but may have WebDriverAgent. Reported honestly:
+    // `trusted-wda` covers tap and drag ONLY, which is why the mechanism line names them rather than
+    // implying every op is trusted (press_key/scroll/hover stay synthetic on iOS — see deviceWda.ts).
+    if (await isDeviceWdaAvailable({ proxy, host: status.target?.host })) {
+      return json({ ...status, inputMechanism: TRUSTED_WDA_MECHANISM, trustedOps: ['tap', 'drag'] });
+    }
+    return json({ ...status, inputMechanism: 'synthetic' });
   }
   if (urlPath === '/api/device/connect' && method === 'POST') {
     const b = (body ?? {}) as ConnectRequest;
@@ -669,14 +690,55 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 500); }
   }
   if (urlPath === '/api/device/disconnect' && method === 'POST') {
+    // Decision 2 — WDA is attached UNDER the lease and torn down with it, so exactly one thing
+    // answers "who holds this device", and disconnecting can never strand a signed agent running
+    // on the phone. Done before the lease drops so a failure here still leaves the lease closable.
+    stopWda();
+    resetDeviceWdaSession();
     try { return json(await deviceConnection.disconnect()); }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 500); }
   }
   // Data plane: proxy a device request (eval/screenshot/tap/…) through Modoki's held lease socket.
+  // #32 Phase 1: for the five input methods CDP can route, try trusted injection FIRST — it
+  // resolves the aim through the page's `resolve-aim` op (over this SAME proxy) then dispatches
+  // host-side via CDP. `tryDeviceCdpInput` returns `null` for "not routable here" (wrong method,
+  // no CDP session, a genuine CDP failure) and the existing synthetic proxy path runs unchanged;
+  // it never throws, so this is purely an extra branch, not a new failure mode.
   if (urlPath === '/api/device/request' && method === 'POST') {
     const b = (body ?? {}) as { method?: string; params?: Record<string, unknown> };
     if (!b.method) return json({ error: 'method required' }, 400);
-    try { return json({ result: await deviceConnection.proxy(b.method, b.params ?? {}) }); }
+    try {
+      const proxy = (m: string, p: Record<string, unknown>) => deviceConnection.proxy(m, p);
+      let outcome = await tryDeviceCdpInput(b.method, b.params ?? {}, { proxy });
+      // #32 Phase 2: no CDP route (an iOS device, or an Android one without adb) ⇒ try
+      // WebDriverAgent before giving up on trusted input. Only tap/drag are routable on iOS — the
+      // other ops have no faithful trusted equivalent there (see deviceWda.ts's header), so they
+      // fall through to synthetic WITH the banner, exactly as before.
+      if (!outcome.handled) {
+        const wda = await tryDeviceWdaInput(b.method, b.params ?? {}, {
+          proxy, host: deviceConnection.status().target?.host,
+        });
+        // Keep the CDP reason when WDA has nothing to add (`reason: null` = not an op it routes):
+        // the caller's banner should name the cause, and "not a WDA op" is not the cause.
+        if (wda.handled || wda.reason) outcome = wda;
+      }
+      if (outcome.handled) return json({ result: outcome.reply });
+      const synthetic = await deviceConnection.proxy(b.method, b.params ?? {});
+      // An INPUT op that could have been trusted but wasn't: front the reply with a loud banner
+      // naming the cause, instead of relying on the ` [input:synthetic]` suffix at the end of the
+      // line. `reason: null` means this was never an input op (eval/screenshot/…) — stay silent.
+      if (outcome.reason) {
+        const banner = synthFallbackBanner(outcome.reason);
+        // Two reply shapes to carry it on: the string handlers get a PREFIX; `type-text` returns an
+        // object, so it gets a field. Without the object case that op would warn about nothing —
+        // the same silent-synthetic gap, just hidden behind a different return type.
+        if (typeof synthetic === 'string') return json({ result: `${banner}\n${synthetic}` });
+        if (synthetic && typeof synthetic === 'object') {
+          return json({ result: { ...(synthetic as Record<string, unknown>), inputFidelityWarning: banner } });
+        }
+      }
+      return json({ result: synthetic });
+    }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 502); }
   }
 
@@ -2205,7 +2267,15 @@ async function describeUnresolvedAgainstLiveWorld(
   // matching install STREAM (`/api/toolchain/install`) is host-owned SSE, kept in
   // vite-asset-scanner.ts alongside /api/build (not part of this JSON router).
   if (urlPath === '/api/toolchain' && method === 'GET') {
-    return json(toolchainStatus());
+    // Report the OPEN PROJECT's Apple team so `autoInstall` can be true for WebDriverAgent on a
+    // machine that has never installed it: the machine-level `wdaTeamId` only exists after the
+    // first install seeds it, so without this WDA could never auto-install on a fresh checkout
+    // even with a perfectly good team configured. The toolchain module deliberately has no project
+    // context of its own — this is the layer that does.
+    let wdaTeamAvailable = false;
+    try { wdaTeamAvailable = !!loadProjectConfig(ctx.projectRoot).build.appleTeamId.trim(); }
+    catch { /* no/!readable project config — leave false, WDA just stays a manual install */ }
+    return json(toolchainStatus({ wdaTeamAvailable }));
   }
 
   // ── POST /api/toolchain/settings {allowSystemToolchain} (M) ── the "Use system-

@@ -32,14 +32,21 @@ import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, type L
 const BACKEND = (process.env.MODOKI_BACKEND ?? 'http://127.0.0.1:5179').replace(/\/$/, '');
 
 // ── Input fidelity (#32) ──────────────────────────────────────────────────
-// Mirrors `INPUT_MECHANISM` in `engine/app/debug/bridge.ts` — necessarily a SECOND copy, not an
-// import: this MCP server and the in-page device bridge are separate runtimes/builds (Node vs a
-// bundled browser script shipped inside the game) with no shared module graph between them. What
-// they must agree on is the STATEMENT, not the binding: every device_* input tool dispatches a
-// synthetic DOM event today (never OS-level trusted input). Phases 1-2 of
-// docs/plans/trusted-device-input-plan.md will change this per platform; until a live probe can
-// report otherwise, device_status states it unconditionally.
-const DEVICE_INPUT_MECHANISM = 'synthetic' as const;
+// The two literals a device_* reply/device_status line can report. Kept as named constants
+// (rather than inline string literals) so `deviceInputMechanismParity.test.ts` can regex-match
+// them by name — this MCP server, the in-page device bridge (`engine/app/debug/bridge.ts`, a
+// bundled browser script shipped inside the game), and the backend's Android CDP route
+// (`engine/plugins/backend/deviceCdp.ts`) are three separate runtimes/packages with no shared
+// module graph, so the values are necessarily duplicated rather than imported. What all three
+// must agree on is the STATEMENT: 'synthetic' is bridge.ts's `INPUT_MECHANISM` (the in-page
+// dispatch every input handler falls back to), 'trusted-cdp' is deviceCdp.ts's
+// `TRUSTED_CDP_MECHANISM` (Phase 1's Android route). Phase 0 shipped this file with a single
+// hardcoded 'synthetic' reported unconditionally; Phase 1 replaces that with a LIVE probe (the
+// backend's `/api/device/status` reports which mechanism is actually available right now) — see
+// device_status below.
+const SYNTHETIC_MECHANISM = 'synthetic' as const;
+const TRUSTED_CDP_MECHANISM = 'trusted-cdp' as const;
+const TRUSTED_WDA_MECHANISM = 'trusted-wda' as const;
 
 // ── WHICH editor is this pointed at? (S2.39) ─────────────────────────────────
 // `.mcp.json` defaults MODOKI_BACKEND to 5179 for EVERY clone, and this server had no identity
@@ -344,9 +351,23 @@ export function registerTools(server: McpServer) {
     try {
       const status = (await backendGet('/api/device/status')) as LeaseStatus;
       const lease = describeLease(status);
-      // No live probe reports the mechanism yet (Phase 1/2 of #32 are what would add one), so this
-      // is unconditional today — see DEVICE_INPUT_MECHANISM above.
-      const fidelity = `Input mechanism: ${DEVICE_INPUT_MECHANISM} (device_tap/drag/pointer/press_key/hover/scroll/type_text dispatch synthetic DOM events, not OS-level trusted input — see #32).`;
+      // #32: the backend LIVE-PROBES this whenever a lease is connected — Android CDP
+      // reachability, then iOS WebDriverAgent. `status.inputMechanism` is absent for a
+      // disconnected lease (nothing to report a mechanism FOR, same rule the input handlers
+      // follow: a refusal never claims a mechanism). `pointer`/`type_text` stay synthetic-only
+      // regardless of the probe — neither is routed through a trusted path on either platform.
+      const fidelity = status.inputMechanism === TRUSTED_CDP_MECHANISM
+        ? `Input mechanism: ${TRUSTED_CDP_MECHANISM} for device_tap/drag/press_key/hover/scroll (OS-level trusted input via CDP — #32 Phase 1). device_pointer/type_text are still ${SYNTHETIC_MECHANISM}.`
+        // #32 Phase 2 (iOS/WebDriverAgent) routes a NARROWER set than Android — only tap and drag,
+        // because a trusted key reaches just a focused element, WDA has no wheel action, and a
+        // touchscreen has no hover (all measured on the iPhone Air). So the ops are named from the
+        // backend's own `trustedOps` rather than assumed: reporting "trusted" for the whole surface
+        // when three of its ops are synthetic is the false-fidelity claim this line exists to stop.
+        : status.inputMechanism === TRUSTED_WDA_MECHANISM
+          ? `Input mechanism: ${TRUSTED_WDA_MECHANISM} for ${(status.trustedOps ?? ['tap', 'drag']).map((o) => `device_${o}`).join('/')} (OS-level trusted input via WebDriverAgent — #32 Phase 2). Every OTHER input op is still ${SYNTHETIC_MECHANISM} on iOS, and says so in its reply.`
+        : status.inputMechanism === SYNTHETIC_MECHANISM
+          ? `Input mechanism: ${SYNTHETIC_MECHANISM} (device_tap/drag/pointer/press_key/hover/scroll/type_text dispatch synthetic DOM events, not OS-level trusted input — see #32).`
+          : `Input mechanism: unknown — no device is connected, so there is nothing to probe (connect first; device_connect).`;
       // App identity (#88): asked of the device itself, over the SAME lease socket every other
       // device_* call proxies through — so the answer comes from whichever app actually holds the
       // socket, and cannot lie the way a locally-derived value could. Only probed when a lease is
@@ -801,7 +822,9 @@ export function registerTools(server: McpServer) {
       'button) and the device resolves it to the element center, occlusion-checked, with NO ' +
       'screenshot needed (the fix for tapping DOM chrome like a debug-menu close button). Otherwise ' +
       'pass screenshot pixel `x`/`y` (take a device_screenshot first). Selector wins if both are given. ' +
-      'Dispatches a synthetic DOM/PixiJS event, not OS-level trusted input — see #32.',
+      'TRUSTED OS-level input when a route is available — CDP on Android, WebDriverAgent on iOS ' +
+      '(#32) — else a synthetic DOM event, which is fronted by a loud banner saying so. Check ' +
+      'device_status\'s input-mechanism line to know which you will get.',
     {
       selector: z.string().optional().describe('CSS selector to aim at (resolved on-device to the element center; refuses if occluded). Preferred for DOM targets.'),
       x: z.number().optional().describe('X (screenshot pixels) — used when no selector.'),
@@ -861,7 +884,9 @@ export function registerTools(server: McpServer) {
     'Drag between two points on the connected device. Aim each end by CSS selector ' +
       '(`fromSelector`/`toSelector`, resolved + occlusion-checked on-device) or by screenshot pixel ' +
       'coords (`fromX/fromY`→`toX/toY`; take a device_screenshot first). A selector wins over coords ' +
-      'for that endpoint. Dispatches synthetic DOM/PixiJS events, not OS-level trusted input — see #32.',
+      'for that endpoint. TRUSTED OS-level input when a route is available — CDP on Android, ' +
+      'WebDriverAgent on iOS (#32) — else synthetic DOM events, fronted by a loud banner. Check ' +
+      'device_status\'s input-mechanism line to know which you will get.',
     {
       fromSelector: z.string().optional().describe('CSS selector for the start point.'),
       toSelector: z.string().optional().describe('CSS selector for the end point.'),
@@ -929,7 +954,8 @@ export function registerTools(server: McpServer) {
       'or screenshot pixel `x`/`y` (take a device_screenshot first) — same aiming as device_tap, no ' +
       '`entity` addressing on this surface. move/up reuse the button from the down; a move/up with ' +
       'nothing held, or a down while already held, is REFUSED rather than silently re-pressing/re-aiming. ' +
-      'Dispatches synthetic DOM/PixiJS events, not OS-level trusted input — see #32.',
+      'Always dispatches synthetic DOM events, never OS-level trusted input — this op is not ' +
+      'routed through the trusted paths on either platform (#32), and says so on every reply.',
     {
       action: z.enum(['down', 'move', 'up']).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),
       selector: z.string().optional().describe('CSS selector to aim at (resolved on-device; refuses if occluded). Preferred.'),
@@ -1037,8 +1063,9 @@ export function registerTools(server: McpServer) {
     'Press a key chord (keydown, brief hold, keyup) on the connected device — open the debug menu ' +
       '(key "F12"), Escape a modal, or drive gameplay keys. Dispatched on the focused element and ' +
       'bubbles to window, where the menu and input sources listen. The hold lets per-frame input ' +
-      'sampling catch the down edge. Dispatches a synthetic KeyboardEvent, not OS-level trusted ' +
-      'input — see #32.',
+      'sampling catch the down edge. Trusted-CDP on Android when a session is reachable; on iOS this ' +
+      'stays SYNTHETIC by design — a WebDriverAgent key reaches only a FOCUSED element, so it would ' +
+      'do nothing with a game canvas focused (#32). Check device_status\'s input-mechanism line.',
     {
       key: z.string().describe('KeyboardEvent.key, e.g. "F12", "Escape", "ArrowLeft", "a".'),
       modifiers: z.array(z.enum(['ctrl', 'shift', 'alt', 'meta'])).optional().describe('Held modifiers, e.g. ["meta"] for Cmd+key.'),
@@ -1050,7 +1077,9 @@ export function registerTools(server: McpServer) {
 
   /** The shape `handleType` (bridge.ts) returns — the device's local twin of `typeText`'s
    *  return type in `rendererOps.ts` (`engine/electron/rendererOps.ts`), plus an explicit `ok`. */
-  interface TypeTextReply { ok: boolean; typed: number; activeElement: string | null; valueAfter?: string | null; error?: string; inputMechanism?: typeof DEVICE_INPUT_MECHANISM }
+  // type-text is synthetic-only on BOTH platforms (never routed through CDP or WebDriverAgent), so
+  // its reply's `inputMechanism` field is always SYNTHETIC_MECHANISM.
+  interface TypeTextReply { ok: boolean; typed: number; activeElement: string | null; valueAfter?: string | null; error?: string; inputMechanism?: typeof SYNTHETIC_MECHANISM }
 
   tool('device_type_text',
     'Type text into the CURRENTLY-FOCUSED element on the connected device. FOCUS THE TARGET FIRST ' +
@@ -1135,7 +1164,9 @@ async function coordScaleOrRefusal(
   tool('device_hover',
     'Hover the pointer over a target on the device (pointerover/enter/move) so :hover styles, ' +
       'tooltips, and hover-gated UI activate. Aim by CSS `selector` (resolved on-device) or ' +
-      'screenshot pixel `x`/`y`. Dispatches synthetic pointer events, not OS-level trusted input — see #32.',
+      'screenshot pixel `x`/`y`. Trusted-CDP on Android when a session is reachable; on iOS this ' +
+      'stays SYNTHETIC by design — a touchscreen has no hover state to deliver (#32). Check ' +
+      'device_status\'s input-mechanism line to know which.',
     {
       selector: z.string().optional().describe('CSS selector to hover (preferred).'),
       x: z.number().optional().describe('X (screenshot pixels) — used when no selector.'),
@@ -1172,8 +1203,9 @@ async function coordScaleOrRefusal(
       '`x`/`y` (defaults to viewport center). Positive `deltaY` scrolls down, positive `deltaX` ' +
       'scrolls right; ~120 ≈ one wheel tick. `dx`/`dy` are accepted aliases (the editor twin ' +
       'modoki_scroll uses deltaX/deltaY, so those are canonical here too). A call whose deltas both ' +
-      'resolve to 0 is REFUSED rather than dispatched as a silent no-op. Dispatches a synthetic ' +
-      'WheelEvent, not OS-level trusted input — see #32.',
+      'resolve to 0 is REFUSED rather than dispatched as a silent no-op. Trusted-CDP on Android when ' +
+      'a session is reachable; on iOS this stays SYNTHETIC by design — WebDriverAgent has no wheel ' +
+      'action at all (#32). Check device_status\'s input-mechanism line to know which.',
     {
       deltaX: z.number().optional().describe('Horizontal wheel delta (default 0). Canonical name — same as modoki_scroll.'),
       deltaY: z.number().optional().describe('Vertical wheel delta (default 0; positive = down). Canonical name — same as modoki_scroll.'),

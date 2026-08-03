@@ -23,6 +23,16 @@ export interface LeaseStatus {
   target: { host: string; port: number; useAdb: boolean } | null;
   lastTarget: { ip: string; useAdb: boolean } | null;
   detail?: string;
+  /** LIVE probe result (#32) — present only when `state === 'connected'` (a disconnected lease has
+   *  no mechanism to report). 'trusted-cdp' when Android CDP injection is reachable right now,
+   *  'trusted-wda' when iOS WebDriverAgent is (Phase 2), 'synthetic' otherwise (no adb, no matching
+   *  webview socket, WDA not running, …). Never a hardcoded constant — see
+   *  `deviceInputMechanismParity.test.ts`. */
+  inputMechanism?: 'synthetic' | 'trusted-cdp' | 'trusted-wda';
+  /** Which ops the reported mechanism actually covers. Only the WDA route sets it, because iOS
+   *  routes a NARROWER set than Android (tap/drag only) — naming them is what keeps `device_status`
+   *  from implying every input op is trusted when three of them are not. */
+  trustedOps?: string[];
 }
 
 /** One-line human summary of the lease status — shared by device_status / device_connect /

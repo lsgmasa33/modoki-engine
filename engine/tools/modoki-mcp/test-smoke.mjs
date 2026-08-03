@@ -180,6 +180,9 @@ const cubeState = JSON.parse(text(cubeR));
 const CUBE_GUID = (cubeState.entities ?? [])[0]?.guid;
 const OPEN_SCENE = cubeState.scenePath ?? '(unknown)';
 const conesAlready = (JSON.parse(text(coneR)).entities ?? []).length;
+// Which viewports are actually mounted right now. Read once, here, because it gates a precondition
+// below AND is asserted on later — one read, one truth.
+const mountedSurfaces = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} }))).surfaces;
 
 /** Each precondition: is it met, and how to describe it when it is not. Keyed so a case can
  *  declare only what it actually uses — a case gated on a precondition it does not need is the
@@ -197,8 +200,19 @@ const PRECOND = {
   // like modoki_set_transform being broken. Rewriting UC5 to aim by guid would "fix" the failure
   // by deleting the coverage — the by-name path is the thing under test.
   coneFree: { ok: conesAlready === 0, need: `NO pre-existing entity named 'Cone' in the OPEN scene (found ${conesAlready}; UC5 aims by name, and an ambiguous name is correctly refused)` },
+  // UC3 aims at `surface: 'scene-view'`, so the SceneView must actually be MOUNTED. FlexLayout only
+  // mounts the SELECTED tab, so a perfectly healthy editor booted with the Game panel in front has
+  // surfaces ['game-2d','game-3d'] and no scene-view — measured on BOTH games/3d-test and
+  // games/sling from a default launch. Without this probe UC3 ran anyway and died on
+  // `focus_entity`'s "no SceneView viewport is mounted", which reads like modoki_focus_entity being
+  // broken; it is the tool correctly refusing an impossible request. The suite already comments
+  // that `get_editor_state.surfaces` is how you know what is mounted — this makes it act on it.
+  sceneView: {
+    ok: Array.isArray(mountedSurfaces) && mountedSurfaces.includes('scene-view'),
+    need: `the SceneView tab to be MOUNTED (open/select it in the editor) — mounted now: ${(mountedSurfaces ?? []).join(', ') || 'none'}`,
+  },
 };
-const CASE_NEEDS = { UC3: ['cube'], UC5: ['prefab', 'coneFree'], UC6: ['particle'], UC8: ['scene'] };
+const CASE_NEEDS = { UC3: ['cube', 'sceneView'], UC5: ['prefab', 'coneFree'], UC6: ['particle'], UC8: ['scene'] };
 
 /** True when `uc`'s preconditions all hold. Otherwise pushes ONE skip reason — naming the open
  *  project AND scene, since either can be the cause — and logs it, so the F12 verdict at the end

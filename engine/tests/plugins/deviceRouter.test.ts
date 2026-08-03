@@ -103,4 +103,43 @@ describe('/api/device/* routes', () => {
       await device.close();
     }
   });
+
+  // #32 close-out: everything above proves the lease round-trip, and the CDP/WDA modules are unit
+  // tested in isolation — but NOTHING drove the router's actual CDP → WDA → synthetic fallback
+  // CHAIN, which is the path every real device_* input call takes. That seam is where a routing
+  // change silently stops warning, or starts warning about the wrong thing.
+  it('an INPUT op with no trusted route falls back to synthetic AND says so (the chain)', async () => {
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority);
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      // No adb session and no WebDriverAgent here, so both trusted routes decline and the router
+      // runs the synthetic proxy — fronted by the loud banner naming the cause.
+      const req = await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      // The warning rides on BOTH reply shapes. This mock echoes an object, so it takes the
+      // `inputFidelityWarning` FIELD branch — the one that exists because `type_text` returns an
+      // object and would otherwise warn about nothing, i.e. the silent-synthetic gap wearing a
+      // different return type. The string branch prefixes the same banner.
+      const result = bodyOf(req).result as { inputFidelityWarning?: string };
+      expect(result.inputFidelityWarning).toMatch(/SYNTHETIC INPUT \(NOT TRUSTED\)/);
+      expect(result.inputFidelityWarning).toMatch(/isTrusted/);
+    } finally {
+      await device.close();
+    }
+  });
+
+  it('a NON-input op gets NO banner — there is no mechanism to report for `eval`', async () => {
+    // The other half of the rule, and the one a careless "warn on everything" change breaks: a
+    // Percept read or a screenshot has no input fidelity to talk about, so prefixing it would be
+    // noise on every call.
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority);
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const req = await post('/api/device/request', { method: 'eval', params: { x: 7 } });
+      expect(bodyOf(req)).toEqual({ result: { x: 7 } });   // untouched, no banner
+    } finally {
+      await device.close();
+    }
+  });
 });

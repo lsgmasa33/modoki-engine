@@ -24,8 +24,9 @@ import path from 'node:path'
 import { ensureJdk, discoverJavaHome, jdkVersionDir } from './jdkProvision'
 import { ensureCmdlineTools, runSdkmanager, ANDROID_SDK_PACKAGES } from './androidSdkProvision'
 import { ensureRuby, rubyDirFor } from './rubyProvision'
+import { ensureWda, wdaBuildStatus, PINNED_WDA, type CommandRunner as WdaCommandRunner } from './wdaProvision'
 
-export type ToolId = 'toktx' | 'android-sdk' | 'npm' | 'java' | 'xcodebuild' | 'gltf-transform-cli' | 'gltfpack' | 'cocoapods' | 'ffmpeg' | 'ffprobe' | 'msdf-atlas-gen'
+export type ToolId = 'toktx' | 'android-sdk' | 'npm' | 'java' | 'xcodebuild' | 'gltf-transform-cli' | 'gltfpack' | 'cocoapods' | 'ffmpeg' | 'ffprobe' | 'msdf-atlas-gen' | 'webdriveragent'
 
 /** How a resolved tool is located. `env` = an env override; `path` = a bare binary found on PATH;
  *  `probe` = a candidate directory that exists (directory tools like the Android SDK). */
@@ -50,7 +51,14 @@ export interface DetectResult {
  *  small JSON in the toolchain dir so BOTH processes that resolve tools — Electron
  *  main (the `/api/toolchain` status) and the Vite plugin (preflight/build) — read
  *  the same LIVE value without env propagation (each `detect()` re-probes). */
-export interface ToolchainSettings { allowSystemToolchain: boolean }
+export interface ToolchainSettings {
+  allowSystemToolchain: boolean
+  /** Apple Team ID that signs the provisioned WebDriverAgent (#32 Phase 2). MACHINE-level, not
+   *  per-project: WDA is a separate app from the game and needs only *a* valid identity to install
+   *  on the phone, so one build serves every project. Seeded from the open project's
+   *  `build.appleTeamId` on first install; changing it forces a re-sign. */
+  wdaTeamId?: string
+}
 
 function toolchainSettingsPath(): string | null {
   const dir = process.env.MODOKI_TOOLCHAIN_DIR
@@ -62,7 +70,7 @@ export function readToolchainSettings(): ToolchainSettings {
   if (p) {
     try {
       const j = JSON.parse(fs.readFileSync(p, 'utf8')) as Partial<ToolchainSettings>
-      return { allowSystemToolchain: !!j.allowSystemToolchain }
+      return { allowSystemToolchain: !!j.allowSystemToolchain, wdaTeamId: j.wdaTeamId || undefined }
     } catch { /* no file / unreadable → default below */ }
   }
   return { allowSystemToolchain: false }
@@ -275,6 +283,24 @@ const REGISTRY: Record<ToolId, ToolDescriptor> = {
     missingMsg:
       'CocoaPods (pod) not found — needed ONLY for iOS mediation-adapter games. On macOS, install it ' +
       'from the Build Support dialog (the editor provisions its own Ruby + CocoaPods; no Homebrew needed).',
+  },
+  webdriveragent: {
+    // The XCUITest agent that makes TRUSTED iOS device input possible (#32 Phase 2) — without it,
+    // device_tap/drag/press_key/hover/scroll fall back to synthetic DOM events on iOS and say so.
+    // NOT a build prerequisite: absent WDA degrades agent input fidelity, it never blocks a build,
+    // so this is a dialog row and never a preflight blocker.
+    //
+    // Unlike every other directory tool, there is no SYSTEM install to fall back to: WDA has to be
+    // signed with a team we know, so only OUR build counts. Hence an empty `candidates` and no
+    // `envVars` — detection is fully custom (see detectWda), because "present" also has to mean
+    // "signature still valid".
+    kind: 'directory',
+    bundled: () => (process.env.MODOKI_TOOLCHAIN_DIR ? [path.join(process.env.MODOKI_TOOLCHAIN_DIR, 'wda')] : []),
+    candidates: () => [],
+    marker: '.',
+    missingMsg:
+      'WebDriverAgent is not provisioned — iOS device input falls back to SYNTHETIC DOM events ' +
+      '(no isTrusted). Install it from the Build Support dialog (macOS + Xcode + an Apple Team ID).',
   },
   'gltf-transform-cli': {
     kind: 'binary',
@@ -724,8 +750,40 @@ function detectCocoapods(): DetectResult {
   return detectBinary('cocoapods', REGISTRY.cocoapods as BinaryDescriptor)
 }
 
+/** Where install('webdriveragent') provisions its source + build. */
+export function wdaBaseDir(): string | null {
+  return process.env.MODOKI_TOOLCHAIN_DIR ? path.join(process.env.MODOKI_TOOLCHAIN_DIR, 'wda') : null
+}
+
+/** The Apple Team ID WDA is signed with: an env override, else the machine-level toolchain setting.
+ *  Deliberately NOT the open project's team — see ToolchainSettings.wdaTeamId. Null ⇒ not chosen
+ *  yet, and install() refuses with an actionable message rather than starting a doomed build. */
+export function wdaTeamId(): string | null {
+  return process.env.MODOKI_WDA_TEAM_ID || readToolchainSettings().wdaTeamId || null
+}
+
+/** Detect the provisioned WebDriverAgent. Custom because `present` must mean BUILT **and still
+ *  signable-onto-a-device** — an expired build sits on disk looking installed while every iOS input
+ *  op silently degrades to synthetic, which is precisely the lie #32 exists to remove. An expired or
+ *  soon-to-expire build reports its state in `version` so the dialog can show it. */
+function detectWda(): DetectResult {
+  const base = wdaBaseDir()
+  if (!base) return { id: 'webdriveragent', present: false, source: 'missing' }
+  const s = wdaBuildStatus(base)
+  if (!s.present || s.expired) return { id: 'webdriveragent', present: false, source: 'missing' }
+  const expiry = s.expiresAt
+    ? ` (signature ${s.expiringSoon ? 'expires soon' : 'valid'} — ${s.expiresAt.toISOString().slice(0, 10)})`
+    : ' (signature expiry unknown)'
+  return {
+    id: 'webdriveragent', present: true, source: 'probe',
+    path: s.xctestrun!, dir: path.dirname(s.xctestrun!),
+    version: `${PINNED_WDA.version}${expiry}`,
+  }
+}
+
 export function detect(id: ToolId): DetectResult {
   const d = REGISTRY[id]
+  if (id === 'webdriveragent') return detectWda()
   if (d.kind === 'directory') return detectDirectory(id, d)
   const cached = cache.get(id)
   if (cached) return cached
@@ -971,6 +1029,21 @@ export function guide(id: ToolId): GuideDoc {
       links: [{ label: 'Xcode on the Mac App Store', url: 'https://apps.apple.com/app/xcode/id497799835' }],
     }
   }
+  if (id === 'webdriveragent') {
+    return {
+      id,
+      title: 'Install WebDriverAgent (trusted iOS device input)',
+      canAutoInstall: isInstallable(id),
+      steps: [
+        'OPTIONAL — this only affects AI/agent device testing. Without it, iOS device input still works, but as synthetic DOM events (no isTrusted), and every reply says so. Builds are unaffected.',
+        'Needs Xcode and an Apple Team ID (the same signed-in account iOS builds use). WebDriverAgent is signed once per MACHINE, not per project — one build serves every project.',
+        'Use the Install button above: the editor fetches a pinned WebDriverAgent, re-namespaces its bundle ids so your team can sign them, and builds it. This takes a few minutes.',
+        'THEN, ONCE PER DEVICE, on the iPhone itself: enable UI Automation (Settings → Developer → Enable UI Automation) and accept the passcode/Face ID prompt the first time it runs. No CLI can bypass this — without it the agent fails to start and input falls back to synthetic.',
+        'The signature EXPIRES (a year on a paid team, ~a week on a free one). When it does, this row goes back to "not installed" — reinstall to re-sign.',
+        'macOS-only, like every other Xcode-dependent tool.',
+      ],
+    }
+  }
   if (id === 'cocoapods') {
     return {
       id,
@@ -998,6 +1071,10 @@ export interface ToolStatus {
   path?: string
   /** True ⇒ the dialog shows an Install button (drives the SSE install stream); false ⇒ a Guide link. */
   installable: boolean
+  /** True ⇒ the editor may install this UNPROMPTED when Build Support opens. Strictly narrower than
+   *  `installable`: a tool the user can choose to install is not automatically one we should install
+   *  for them. See `autoInstallable`. */
+  autoInstall: boolean
   /** True ⇒ present, but our-toolchain install is a different version than the current pin — an
    *  Update is due (the dialog shows "Update" + auto-updates it). */
   stale: boolean
@@ -1021,7 +1098,30 @@ export interface ToolchainStatus {
   preflight: Record<BuildTarget, PreflightReport>
 }
 
-export function toolchainStatus(): ToolchainStatus {
+/** Tools the editor installs UNPROMPTED when Build Support opens, so model/audio import just works.
+ *  All four are cross-platform, dependency-free, and cannot fail for environmental reasons — which
+ *  is what makes installing them without asking safe. */
+const AUTO_INSTALL: ReadonlySet<ToolId> = new Set<ToolId>(['gltf-transform-cli', 'gltfpack', 'ffmpeg', 'ffprobe'])
+
+/** Whether the editor should install `id` on its own.
+ *
+ *  Separate from `isInstallable` because the question is different: *can* the user install this vs.
+ *  *should we* do it unasked. WebDriverAgent is the case that forced the split — it is installable
+ *  on any Mac, but it also needs Xcode and a signing team, and auto-installing without those
+ *  produces a failing install, on open, for a tool that only affects agent input fidelity on iOS.
+ *  So it auto-installs ONLY once it can actually succeed; otherwise it stays a deliberate button.
+ *
+ *  `wdaTeamAvailable` lets the caller report a team the toolchain cannot see itself — the OPEN
+ *  PROJECT's `build.appleTeamId`, which the install route seeds the machine setting from. Without
+ *  it, a fresh machine could never auto-install WDA even with a perfectly good team configured,
+ *  because the machine setting only exists after the first manual install. */
+export function autoInstallable(id: ToolId, opts: { wdaTeamAvailable?: boolean } = {}): boolean {
+  if (!isInstallable(id)) return false
+  if (id === 'webdriveragent') return detect('xcodebuild').present && (!!wdaTeamId() || !!opts.wdaTeamAvailable)
+  return AUTO_INSTALL.has(id)
+}
+
+export function toolchainStatus(opts: { wdaTeamAvailable?: boolean } = {}): ToolchainStatus {
   // Always re-probe: a status read is a "current truth" request, and it's the ONLY
   // safe answer to the process split. An `install()` runs in the Vite-plugin process
   // (the SSE handler) and resets ITS cache — but the status endpoint is served by the
@@ -1032,7 +1132,11 @@ export function toolchainStatus(): ToolchainStatus {
   resetToolchainCache()
   const tools: ToolStatus[] = TOOL_IDS.map((id) => {
     const d = detect(id)
-    return { id, present: d.present, source: d.source, version: d.version, path: d.path, installable: isInstallable(id), stale: isToolStale(id, d), guide: guide(id) }
+    return {
+      id, present: d.present, source: d.source, version: d.version, path: d.path,
+      installable: isInstallable(id), autoInstall: autoInstallable(id, opts),
+      stale: isToolStale(id, d), guide: guide(id),
+    }
   })
   return {
     platform: process.platform,
@@ -1058,6 +1162,9 @@ export interface InstallResult {
  *  iOS/CocoaPods is macOS-only). So it's installable on darwin, guided elsewhere. */
 export function isInstallable(id: ToolId): boolean {
   if (id === 'cocoapods') return process.platform === 'darwin'
+  // WDA is BUILT by xcodebuild, so it is macOS-only for the same reason CocoaPods is — and, unlike
+  // every other installable tool, it also needs a signing identity, which install() checks.
+  if (id === 'webdriveragent') return process.platform === 'darwin'
   return INSTALLABLE.has(id)
 }
 
@@ -1066,6 +1173,19 @@ export function isInstallable(id: ToolId): boolean {
  *  GEM_HOME (<toolchainDir>/cocoapods-gems) on that Ruby, streaming progress. `pod` then resolves
  *  from there via detect('cocoapods') + cocoapodsEnv(). Native gem extensions compile against the
  *  system clang, which ships with Xcode — already required for any iOS build. */
+/** Spawn a command to completion, streaming stdout+stderr line-wise to `onLog`; reject on a non-zero
+ *  exit. This is the shape `wdaProvision` injects (its npm fetch and its xcodebuild), kept here
+ *  because that module must not import this one — the dependency points one way. */
+const runStreaming: WdaCommandRunner = (command, args, o) =>
+  new Promise<void>((resolve, reject) => {
+    const log = o.onLog ?? (() => {})
+    const p = spawn(command, args, { cwd: o.cwd, env: o.env ?? process.env, shell: o.shell ?? false })
+    p.stdout?.on('data', (d: Buffer) => log(d.toString().trimEnd()))
+    p.stderr?.on('data', (d: Buffer) => log(d.toString().trimEnd()))
+    p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`${command} exited with code ${code}`))))
+    p.on('error', reject)
+  })
+
 async function installCocoapods(opts: { toolchainDir: string; onLog?: (line: string) => void }): Promise<InstallResult> {
   const log = opts.onLog ?? (() => {})
   const { rubyBin, gemBin, binDir } = await ensureRuby(path.join(opts.toolchainDir, 'ruby'), { onLog: log })
@@ -1098,6 +1218,26 @@ export async function install(id: ToolId, opts: { toolchainDir: string; onLog?: 
   if (id === 'ffmpeg') return installNpmBinaryTool('ffmpeg-static', FFMPEG_NPM_VERSION, ffmpegToolBin, opts)
   if (id === 'ffprobe') return installNpmBinaryTool('@ffprobe-installer/ffprobe', FFPROBE_NPM_VERSION, ffprobeToolBin, opts)
   if (id === 'cocoapods') return installCocoapods(opts)
+  if (id === 'webdriveragent') {
+    // Fetch the pinned WDA source and build+sign it for THIS machine. Only the build lives here;
+    // launching it against a device is a per-lease lifecycle owned by the device code (plan
+    // Decisions 1-2), which is why this returns a .xctestrun path rather than anything runnable.
+    const team = wdaTeamId()
+    if (!team) {
+      throw new Error(
+        'WebDriverAgent needs an Apple Team ID to sign with, and none is configured. Open a project ' +
+        'with a Team ID set (Project Settings → iOS → Signing) and install again, or set ' +
+        'MODOKI_WDA_TEAM_ID.')
+    }
+    const { xctestrun } = await ensureWda(path.join(opts.toolchainDir, 'wda'), {
+      teamId: team,
+      npm: npmSpawnSpec(),
+      run: runStreaming,
+      onLog: opts.onLog,
+    })
+    resetToolchainCache()
+    return { path: xctestrun }
+  }
   if (id === 'java') {
     // Download a pinned Temurin JDK 21 into <toolchainDir>/jdk. detect('java') then finds this
     // JAVA_HOME (userData candidate). Also the bootstrap for install('android-sdk') (sdkmanager needs Java).
@@ -1135,6 +1275,9 @@ function toolOwnedDirs(id: ToolId, toolchainDir: string): string[] {
     case 'java': return [path.join(toolchainDir, 'jdk')]
     case 'android-sdk': return [path.join(toolchainDir, 'android-sdk')]
     case 'cocoapods': return [path.join(toolchainDir, 'cocoapods-gems'), path.join(toolchainDir, 'ruby')]
+    // Both the fetched source and our DerivedData live under here, which is why the build is kept
+    // out of the user's ~/Library DerivedData: "Remove all tools" must actually remove it.
+    case 'webdriveragent': return [path.join(toolchainDir, 'wda')]
     default: return []
   }
 }

@@ -339,12 +339,45 @@ really was accepted; some legitimate drops make no undoable edit (a file move wr
 downgrading them would trade a false success for a false failure across drop targets nobody has
 enumerated. The warning says exactly what is known and no more.
 - [x] Apply the same question to the **device twin** (`device_tap`/`device_drag`/`device_pointer`/
-      `device_press_key`/`device_hover`/`device_scroll`/`device_type_text`) — it dispatches SYNTHETIC
-      DOM events (plus a private-API PixiJS v8 poke for canvas ops), never OS-level trusted input,
-      a strictly weaker fidelity position than the editor twins above. Full route research +
-      phased plan: **[docs/plans/trusted-device-input-plan.md](plans/trusted-device-input-plan.md)**
+      `device_press_key`/`device_hover`/`device_scroll`/`device_type_text`) — it dispatched SYNTHETIC
+      DOM events, never OS-level trusted input, a strictly weaker fidelity position than the editor
+      twins above. (It also carried a private-API PixiJS v8 poke for canvas ops; that was **inert** —
+      the global it read was never assigned — and is now deleted. See #93 and
+      [docs/debug-tools-mcp.md](debug-tools-mcp.md) § "Synthetic input: which canvas gets it".) Full
+      route research + phased plan:
+      **[docs/trusted-device-input.md](trusted-device-input.md)**
       (issue #32). Phase 0 (make the gap HONEST — every reply states the mechanism it used) has
-      landed; Phase 1 (Android CDP) and Phase 2 (iOS WebDriverAgent) are still open.
+      landed. **Phase 1 (Android CDP) has landed and is hardware-verified** (2026-08-02, on the
+      Samsung — see the plan doc): `device_tap`/`drag`/`press_key`/`hover`/`scroll` now route
+      through `Input.dispatchTouchEvent`/`dispatchKeyEvent`/`dispatchMouseEvent` over a CDP session
+      to the device's debug WebView when one is reachable (reported `[input:trusted-cdp]`), falling
+      back to the original synthetic path otherwise (`[input:synthetic]`) — `device_pointer` and
+      `device_type_text` are unchanged, still synthetic-only. `device_status` now live-probes which
+      mechanism is available rather than stating a constant. Phase 2 (iOS WebDriverAgent) is still
+      open.
+
+      **Capability matrix (op × platform × mechanism), current as of Phase 1:**
+
+      | Op | Android | iOS |
+      |---|---|---|
+      | `device_tap` / `drag` | `trusted-cdp` when a CDP session to the debug WebView is reachable, else `synthetic` | **`trusted-wda`** when WebDriverAgent is provisioned + reachable, else `synthetic` |
+      | `device_press_key` / `hover` / `scroll` | `trusted-cdp` when reachable, else `synthetic` | `synthetic` — **by design, not by omission** (see below) |
+      | `device_pointer` | `synthetic` | `synthetic` |
+      | `device_type_text` | `synthetic` | `synthetic` |
+
+      **iOS routes a NARROWER set than Android, and that is measured.** WebDriverAgent supports only
+      `pointer` and `key` W3C actions — it rejects `wheel` outright — a touchscreen has no hover
+      state, and a trusted key reaches only a FOCUSED element (with the game canvas focused, WDA
+      returns `ok` and the page receives nothing). Routing those three would stamp `trusted` on
+      something weaker or dead, so they stay synthetic and say so. Detail + the measurements:
+      `engine/plugins/backend/deviceWda.ts` and
+      [docs/trusted-device-input.md](trusted-device-input.md).
+
+      Check `device_status`'s input-mechanism line before relying on fidelity for a specific test —
+      it reports the mechanism actually available RIGHT NOW (nothing when no lease is connected),
+      never a hardcoded claim. On a `synthetic` row, also read the reply's `canvas:` marker: the
+      synthetic path must CHOOSE a target element where a trusted injection is hit-tested by the
+      browser, and `canvas:ambiguous` means that choice was a guess (#93).
       *Partly advanced earlier by the MCP audit's Phase 8:* a table-driven sweep over all 20
       `device_*` tools asserts each reports a failure as an envelope naming itself and treats the
       device's `Error: …` STRING reply as a failure. That found `device_console_logs` feeding the

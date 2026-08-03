@@ -17,7 +17,7 @@ interface GuideLink { label: string; url: string }
 interface GuideDoc { id: string; title: string; steps: string[]; links?: GuideLink[]; canAutoInstall: boolean }
 interface ToolStatus {
   id: string; present: boolean; source: string; version?: string; path?: string;
-  installable: boolean; stale?: boolean; guide: GuideDoc;
+  installable: boolean; autoInstall?: boolean; stale?: boolean; guide: GuideDoc;
 }
 interface PreflightReport { target: string; ready: boolean; tools: { id: string; present: boolean; message?: string }[] }
 interface ToolchainStatus {
@@ -38,6 +38,7 @@ const TOOL_LABEL: Record<string, string> = {
   'adb': 'adb (platform-tools)',
   'xcodebuild': 'Xcode',
   'cocoapods': 'CocoaPods (adapter games only)',
+  'webdriveragent': 'WebDriverAgent (trusted iOS input)',
   'toktx': 'KTX-Software (toktx)',
   'gltf-transform-cli': 'glTF-Transform CLI',
   'ffmpeg': 'ffmpeg',
@@ -46,16 +47,17 @@ const TOOL_LABEL: Record<string, string> = {
 };
 const label = (id: string) => TOOL_LABEL[id] ?? id;
 
-/** Cross-platform asset CLIs auto-installed on first launch (like Node) so model +
- *  audio import just works. Everything EXCEPT the mobile build modules (Android/iOS)
- *  auto-installs; toktx is bundled, so it's not listed here. */
-const AUTO_INSTALL_IDS = ['gltf-transform-cli', 'gltfpack', 'ffmpeg', 'ffprobe'];
+// Which tools auto-install is decided SERVER-SIDE (`autoInstallable` in engine/toolchain), not by a
+// list here: WebDriverAgent auto-installs only when Xcode and a signing team are actually present,
+// and that is a question only the backend can answer. `t.autoInstall` is the answer.
 
 /** Which registry tools each module box lists. `adb` is derived (from the SDK), so
  *  it rides in the Android box as an extra status row without its own action. */
 const GROUPS: { title: string; subtitle: string; ids: string[]; adb?: boolean; iosOnly?: boolean }[] = [
   { title: 'Android Build Support', subtitle: 'Build & deploy Android APKs', ids: ['java', 'android-sdk'], adb: true },
-  { title: 'iOS Build Support', subtitle: 'Build & deploy iOS apps (macOS only)', ids: ['xcodebuild', 'cocoapods'], iosOnly: true },
+  // `webdriveragent` is NOT a build prerequisite — it only affects AI/agent device-input fidelity.
+  // It rides in the iOS box because it needs the same Xcode + signing setup as everything else here.
+  { title: 'iOS Build Support', subtitle: 'Build & deploy iOS apps (macOS only)', ids: ['xcodebuild', 'cocoapods', 'webdriveragent'], iosOnly: true },
   { title: 'Model Tools', subtitle: 'GLB import / KTX2 compression', ids: ['toktx', 'gltf-transform-cli'] },
   { title: 'Text Tools', subtitle: 'MTSDF font-atlas baking (dynamic / CJK text) — bundled', ids: ['msdf-atlas-gen'] },
   { title: 'Audio Tools', subtitle: 'Audio import — auto-installed by the editor', ids: ['ffmpeg', 'ffprobe'] },
@@ -146,7 +148,7 @@ export default function BuildSupportDialog() {
     if (!open || !data?.toolchainDir || installing) return;
     if (localStorage.getItem('modoki.buildSupportDismissed')) return; // user manages installs
     const next = (data.tools ?? []).find(
-      (t) => AUTO_INSTALL_IDS.includes(t.id) && t.installable && (!t.present || t.stale) && !autoInstalledRef.current.has(t.id),
+      (t) => t.autoInstall && t.installable && (!t.present || t.stale) && !autoInstalledRef.current.has(t.id),
     );
     if (next) {
       autoInstalledRef.current.add(next.id);

@@ -80,6 +80,7 @@ tool that must be installed by hand. The dialog shows an **Install** button for 
 | **`android-sdk`** | `androidSdkProvision.ts` — bootstrap the pinned **cmdline-tools** zip (**sha1** from Google's `repository2-3.xml`) → run `sdkmanager` for the games' packages (`platform-tools`, `platforms;android-36`, `build-tools;36.0.0` — matching every game's `variables.gradle` compileSdk 36) with non-interactive license accept. **Ensures the pinned Temurin JDK first** (sdkmanager is a Java program — the chicken-and-egg), NEVER an arbitrary system JDK, so provisioning is reproducible. | cmdline-tools `15641748` |
 | **`xcodebuild` (Xcode)** | **Guided only** — multi-GB, App-Store-gated, macOS-only. `guide('xcodebuild')` gives the App Store link + `xcode-select`/license/Apple-ID steps. | — |
 | **`cocoapods`** | **Auto-installed on macOS** (`isInstallable` returns true on `darwin`, guided elsewhere) — `installCocoapods()` provisions an **isolated portable Ruby** into `<toolchainDir>/ruby` (`rubyProvision.ts`), then `gem install cocoapods` into an isolated `GEM_HOME` (`<toolchainDir>/cocoapods-gems`) — no Homebrew, no system Ruby. Native gem extensions compile against Xcode's clang (already required for iOS). `guide('cocoapods')` points at the one-click Install button. Not a `preflight('ios')` blocker — most iOS games are SPM-only and never need it. | `1.17.0` |
+| **`webdriveragent`** | **Auto-installed on macOS** — `wdaProvision.ts` `ensureWda()` fetches the pinned Appium WDA source via `npm pack`, re-namespaces its bundle ids, and `xcodebuild build-for-testing`s it into `<toolchainDir>/wda`. Enables **trusted iOS device input** (#32 Phase 2); absent, `device_*` input falls back to synthetic DOM events and says so. Never a build blocker. See § "WebDriverAgent — the one BUILT tool" below. | `appium-webdriveragent@16.1.1` |
 
 ⚠️ **`tar` does NOT mean bsdtar on Windows — never spawn a bare `tar`.** Every provisioner above
 extracts through one shared `extractArchive()`, and that one code path only works because **bsdtar**
@@ -110,6 +111,67 @@ exists but a dependency is half-written (seen in the wild: `@gltf-transform/core
 `package.json` → `ERR_MODULE_NOT_FOUND`). With the old existsSync check that install "succeeded" while
 detection said missing, and clicking **Install** again was a no-op because npm saw the dependency
 already satisfied — an unbreakable "not found" loop.
+
+### WebDriverAgent — the one BUILT tool, and the three rules it breaks
+
+Every other provisioned tool downloads a pinned artifact and verifies it against a checksum, so
+`dev == packaged` byte for byte. WDA cannot: it is **compiled and code-signed on the user's machine**,
+so no two developers' builds are identical and there is no hash to pin. It is worth understanding
+exactly which invariants that costs, because each one is load-bearing elsewhere.
+
+**1. The pin is on the SOURCE, not the artifact.** Appium publishes WDA to npm, so
+`npm pack appium-webdriveragent@<version>` gets a version-pinned, registry-integrity-checked source
+tree — the same reproducibility level `ffmpeg`/`gltfpack` already rely on. `npm pack`, not
+`npm install`: we want a tree to compile, so pulling WDA's dependency graph would be cost with no
+benefit.
+
+**2. Bundle ids are rewritten in the SOURCE; the team is passed on the COMMAND LINE.** WDA ships its
+targets under `com.facebook.*`, which no other team can sign. Each target needs a *distinct* id, so a
+single `xcodebuild PRODUCT_BUNDLE_IDENTIFIER=` override cannot do it — one value would collapse every
+target onto one id. Hence `renamespaceBundleIds()` (scoped to `PRODUCT_BUNDLE_IDENTIFIER` assignments
+— a blanket `com.facebook.` replace would corrupt unrelated project references). `DEVELOPMENT_TEAM`
+goes on the command line instead, precisely so the extracted tree stays team-agnostic.
+
+**3. Signed PER MACHINE, not per project.** WDA is a separate app from the game under test and needs
+only *a* valid identity to install on the phone — it does **not** have to share the game's team. So
+one build serves every project, `install()` keeps the signature every other installer has (no project
+context threaded through the toolchain contract), and switching projects never forces a rebuild. The
+team lives in `ToolchainSettings.wdaTeamId`, seeded from the open project's `build.appleTeamId` by the
+`/api/toolchain/install` route — the seeding happens *there* because that is where project context
+already exists. This **amends** plan Decision 3 ("signed with the project's own `build.appleTeamId`"),
+which was recorded before the contract cost was weighed.
+
+⚠️ **"Present" does not mean "usable" — a signed build EXPIRES.** A provisioning profile dies after a
+year on a paid team (about a week on a free one), and an expired WDA sits on disk looking installed
+while failing to install on the device. A plain existence check would therefore report it healthy
+while every iOS input op silently degraded to synthetic — the exact class of lie #32 exists to remove.
+So `detect('webdriveragent')` is custom: it reads the built runner's embedded `ExpirationDate` and
+reports an expired build as **ABSENT**, and `ensureWda()` rebuilds rather than returning it. An
+unreadable profile is treated as *unknown*, never as valid.
+
+**One step no CLI can perform**: iOS requires UI Automation to be enabled and a passcode/Face ID
+prompt accepted **on the phone**, once per device. It is in `guide('webdriveragent')` so it surfaces
+in the dialog at the moment the user installs, rather than in a doc they would have to know to open.
+
+**It auto-installs — but only when it can succeed.** A from-scratch install measured **15.3s**
+(npm pack + a full `xcodebuild build-for-testing`) on a warm Xcode, which is cheap enough to do
+unasked. So `autoInstallable()` splits the question `isInstallable()` used to answer alone: *can the
+user install this* vs *should we do it for them*. WDA is installable on any Mac, but auto-installing
+it without Xcode or a signing team would produce a failing install, on every dialog open, for a tool
+that only affects agent input fidelity on iOS. It therefore auto-installs only once `xcodebuild` is
+present **and** a team is available — either `ToolchainSettings.wdaTeamId` or, reported by the
+`/api/toolchain` route, the open project's `build.appleTeamId`. That second source matters: the
+machine setting only exists after the first install seeds it, so without it a fresh machine could
+never auto-install WDA even with a perfectly good team configured. Which tools auto-install is now
+decided **server-side** (`ToolStatus.autoInstall`) rather than by a list in the dialog, because only
+the backend can see those preconditions.
+
+Building it is all this module does. **Launching** WDA against a device (`xcodebuild
+test-without-building`, whose HTTP server lives only while that process runs) is a per-lease,
+per-device lifecycle owned by the device code — see
+[docs/trusted-device-input.md](trusted-device-input.md) Decisions 1–2. Every
+other toolchain item conflates "provisioned" with "usable"; WDA genuinely has two lifecycles, and
+keeping them apart is deliberate.
 
 ## Bundled-only vs system tools — the "Use system-installed tools" toggle
 
@@ -178,12 +240,23 @@ goes through `spawnable()` so a `.cmd` shim and a path with spaces both survive.
 
 1. Add the id to `ToolId` and a descriptor to `REGISTRY` (binary or directory; give installable ones an
    `extraCandidates`/userData candidate keyed off `MODOKI_TOOLCHAIN_DIR`).
-2. If auto-installable: add it to `INSTALLABLE` and an `install()` branch (reuse `installNpmTool` for an
-   npm CLI, or a `*Provision.ts` module for a download+verify+extract). Pin the version + checksum.
-3. If guided: add a `guide()` branch.
-4. Surface it in `BuildSupportDialog`'s `GROUPS`, and in `preflight()` if it's a hard build requirement.
-5. Deterministic tests mock the network (see `nodeProvision.test.ts` / `jdkProvision.test.ts` /
-   `androidSdkProvision.test.ts`); validate the real download/install manually.
+2. If installable: add it to `INSTALLABLE` (or a dynamic branch in `isInstallable` when it is
+   platform- or precondition-gated, like `cocoapods`/`webdriveragent`) and an `install()` branch
+   (reuse `installNpmTool` for an npm CLI, or a `*Provision.ts` module for a
+   download+verify+extract). Pin the version + checksum.
+3. Decide **separately** whether it should install UNASKED — `autoInstallable()`, not `isInstallable`.
+   Only add it to `AUTO_INSTALL` if it cannot fail for environmental reasons; anything needing a
+   toolchain, a signing identity, or a specific OS gets a precondition branch instead, or it will
+   fail on every dialog open for users who never wanted it.
+4. If guided: add a `guide()` branch. Put any step the user must do OUTSIDE the editor here (WDA's
+   on-device UI Automation prompt), not only in a doc — this is what the dialog shows.
+5. Surface it in `BuildSupportDialog`'s `GROUPS` + `TOOL_LABEL`, and in `preflight()` if it's a hard
+   build requirement (an agent/tooling nicety is NOT — it must never block a build).
+6. Deterministic tests mock the network (see `nodeProvision.test.ts` / `jdkProvision.test.ts` /
+   `androidSdkProvision.test.ts`), or inject a command runner when the tool is BUILT rather than
+   downloaded (`wdaProvision.test.ts`). **Also assert the REGISTRY wiring**, not just the module:
+   the dialog reaches a tool through `TOOL_IDS`/`detect()`/`guide()`, and that indirection is where
+   a new tool silently fails to appear. Validate the real install manually.
 
 ## Platform scope
 

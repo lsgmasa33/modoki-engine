@@ -23,12 +23,38 @@ import { DeviceLeaseClient, type LeaseTransport, type LeaseRequest, type LeaseRe
 /** The device plugin's TCP port (matches `GameDebugPlugin` default). */
 export const DEVICE_PORT = 9095;
 
+/** Turn a bare `ECONNREFUSED` on the DEFAULT port into the answer to the question it actually
+ *  raises (#95).
+ *
+ *  `ECONNREFUSED` reads as "the app isn't running" or "the debug bridge is off". On this surface
+ *  that is frequently WRONG, and misleadingly so: 9095 is a fixed default shared by every Modoki
+ *  game, so if another one already holds it the app you just launched binds an OS-assigned port
+ *  instead (#88) and is perfectly healthy — just not here. Nothing discovers that port, so the
+ *  session dead-ends on a message pointing the wrong way. Measured 2026-08-02: this cost about an
+ *  hour on the iPhone Air, where a resident Modoki app held 9095 through repeated relaunches, and
+ *  the fix was to read the real port out of the device console and pass it explicitly.
+ *
+ *  Apps built after #95 release the port when they background, so the common case resolves itself.
+ *  This message is for the rest: an older build, or two apps racing on a switch. Left as a pure
+ *  string transform so it is trivially testable. */
+export function explainConnectFailure(detail: string | undefined, port: number): string | undefined {
+  if (!detail || !/ECONNREFUSED/i.test(detail) || port !== DEVICE_PORT) return detail;
+  return `${detail} — nothing is listening on the default port ${DEVICE_PORT}. The app may be `
+    + 'running FINE on another port: 9095 is shared by every Modoki game, so if a second one still '
+    + 'holds it, the app you just launched falls back to an OS-assigned port (#88). Close the other '
+    + 'Modoki apps (`adb shell ps -A | grep modoki`, or swipe them away on iOS) and relaunch — or, '
+    + 'if you can see the real port in the device log or the in-game debug menu, pass it directly: '
+    + 'device_connect {ip:"…", port:<actual>}.';
+}
+
 /** Resolve the adb binary the editor PROVISIONS (Android SDK platform-tools), NOT a bare `adb` on
  *  PATH: the packaged editor's adb lives under its toolchain dir and is NOT on the system PATH, so
  *  `execFileSync('adb', …)` ENOENTs there (this is why USB failed while WiFi — a direct TCP connect
  *  needing no adb — worked). `detectAdb()` derives `<sdk>/platform-tools/adb(.exe)` from the resolved
  *  Android SDK (env → provisioned userData SDK). */
-function adbBinary(): string {
+// Exported so deviceCdp.ts (#32 Phase 1's Android CDP discovery) resolves adb the SAME way —
+// never a bare `adb` on PATH, for the reason above.
+export function adbBinary(): string {
   const d = detectAdb();
   if (!d.present || !d.path) {
     throw new Error(
@@ -291,7 +317,7 @@ export class DeviceConnectionManager {
     this.client = new DeviceLeaseClient({
       guid: this.guid,
       transport: this.transport,
-      onState: (s, d) => { this.state = s; this.detail = d; },
+      onState: (s, d) => { this.state = s; this.detail = explainConnectFailure(d, port); },
     });
     this.target = { host, port, useAdb };
     await this.client.connect();

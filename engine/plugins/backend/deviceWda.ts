@@ -1,0 +1,289 @@
+/**
+ * iOS trusted input via WebDriverAgent (#32 Phase 2).
+ *
+ * The Android sibling is `deviceCdp.ts`; this is the same idea over a different transport. A page
+ * cannot dispatch a TRUSTED event to itself, so injection happens HOST-SIDE while aim resolution
+ * stays in-page (`resolve-aim`) — both routes share that seam via `deviceAim.ts`.
+ *
+ * ## Everything below was MEASURED on the iPhone Air against games/sling, 2026-08-02
+ *
+ * Do not re-derive these; re-run the probe if you doubt one.
+ *
+ *  - **A W3C Actions touch delivers `isTrusted: true`.** A tap produced the full native sequence —
+ *    `pointerdown` → `touchstart` → `pointerup` → `touchend` → `click` — all trusted, on the CANVAS.
+ *  - **The coordinate transform is IDENTITY.** Requested (210,473) arrived as `clientX:210,
+ *    clientY:473` on a 420×912 dpr:3 viewport. No DPR, safe-area or letterbox math. Same conclusion
+ *    as the CDP route. Do NOT add a transform.
+ *  - **WDA supports ONLY `pointer` and `key` action types.** A `wheel` action is rejected outright:
+ *    *"Only actions of '(pointer, key)' types are supported."* So there is no trusted `wheel` on iOS.
+ *  - **WDA interpolates a drag itself.** One `pointerMove` with a duration produced 14 intermediate
+ *    trusted `pointermove` events — finer than the synthetic path's stepping.
+ *  - **A session created with NO `bundleId` does not restart the app.** (The spike's note that
+ *    "creating a session activates the target app" applies only when one is passed.) That matters
+ *    because a restart would rebind the debug bridge's port and invalidate the lease mid-run.
+ *  - **A wrong endpoint returns HTTP 200 with the error in the BODY.** `/wda/tap/0` — the endpoint
+ *    every older guide names — answers `unknown command` with a 200. So every reply is inspected
+ *    for `value.error`; trusting the status code alone silently reports success for input that was
+ *    never delivered. This cost three no-op taps during the spike before the body was read.
+ *
+ * ## Why only tap and drag are routed
+ *
+ * The five ops Android routes do NOT map 1:1 onto iOS, and the owner's call (2026-08-02) was to
+ * route only what iOS can genuinely deliver AS THAT OP, rather than stamp `trusted` on something
+ * weaker:
+ *  - `press_key` — WDA accepts it and it IS trusted, but only reaches a FOCUSED element. Measured:
+ *    with the canvas focused WDA answered `ok` and the page received nothing; with an input focused
+ *    the same call delivered trusted `keydown`s and the field's value became "hi". Routing it would
+ *    silently break agent workflows that use `device_press_key` for debug shortcuts, so it stays
+ *    synthetic (where it reaches `window` regardless of focus).
+ *  - `scroll` — there is no `wheel` action type. A trusted scroll could only be a touch DRAG, which
+ *    fires touch events rather than `wheel`, and on a game canvas would be a real gameplay gesture
+ *    (on sling, a drag flings the puck). Stays synthetic.
+ *  - `hover` — a touchscreen has no hover state. Nothing to route to.
+ * Each of those still gets the loud synthetic banner, so the weaker mechanism is never quiet.
+ */
+
+import { decodeAimReply, resolveAimViaDevice, STALE_APP_REASON, type RouteOutcome } from './deviceAim';
+
+/** The literal this module reports for input actually delivered via WebDriverAgent. Third member of
+ *  the mechanism set alongside `trusted-cdp` (Android) and `synthetic` (the in-page fallback). */
+export const TRUSTED_WDA_MECHANISM = 'trusted-wda' as const;
+
+/** WebDriverAgent's fixed HTTP port. It binds `0.0.0.0:8100` on the device, so the editor reaches it
+ *  over the SAME Wi-Fi address the debug lease already uses — no `iproxy`/libimobiledevice, and no
+ *  Mac-side install (measured: `devicectl` has no port-forward subcommand, so USB would have needed
+ *  one). Overridable for an unusual setup; there is no per-clone derivation because the port lives
+ *  on the DEVICE, and two clones driving one phone is already serialized by the lease. */
+export const DEFAULT_WDA_PORT = 8100;
+
+export function resolveWdaPort(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.MODOKI_WDA_PORT;
+  const n = raw != null && raw !== '' ? Number(raw) : NaN;
+  return Number.isInteger(n) && n > 0 && n < 65536 ? n : DEFAULT_WDA_PORT;
+}
+
+/** A WDA reply. `value` is null on success; a FAILED call still returns HTTP 200 with an error
+ *  object here, which is why every response is decoded rather than status-checked. */
+interface WdaReply { value?: { error?: string; message?: string } | null; sessionId?: string }
+
+/** Minimal HTTP surface, injectable so routing tests never open a socket. */
+export type WdaFetch = (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string }) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
+
+/** POST/GET a WDA endpoint and RAISE on an error carried in the body.
+ *
+ *  The whole point of this helper: `res.ok` is not evidence. WDA answers a bad endpoint or a
+ *  rejected action type with 200 + `{"value":{"error":…}}`, so a fire-and-forget call looks like it
+ *  worked. Every caller goes through here. */
+async function wdaCall(
+  fetchImpl: WdaFetch, baseUrl: string, path: string,
+  opts: { method?: string; body?: unknown } = {},
+): Promise<WdaReply> {
+  const url = `${baseUrl}${path}`;
+  const res = await fetchImpl(url, {
+    method: opts.method ?? (opts.body !== undefined ? 'POST' : 'GET'),
+    headers: { 'Content-Type': 'application/json' },
+    ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`WDA ${path} → HTTP ${res.status}: ${text.slice(0, 200)}`);
+  let reply: WdaReply;
+  try { reply = JSON.parse(text) as WdaReply; }
+  catch { throw new Error(`WDA ${path} → unparseable reply: ${text.slice(0, 200)}`); }
+  const err = reply.value && typeof reply.value === 'object' ? reply.value.error : undefined;
+  if (err) throw new Error(`WDA ${path} → ${err}: ${String(reply.value?.message ?? '').slice(0, 200)}`);
+  return reply;
+}
+
+/** A live WDA session: the device's agent URL plus the session id every actions call needs. */
+export interface WdaSession {
+  baseUrl: string;
+  sessionId: string;
+  /** Send a W3C Actions payload. */
+  actions(payload: unknown): Promise<void>;
+  /** Release any pointers left down (W3C `DELETE /actions`). Best-effort. */
+  releaseActions(): Promise<void>;
+}
+
+export function makeWdaSession(fetchImpl: WdaFetch, baseUrl: string, sessionId: string): WdaSession {
+  return {
+    baseUrl, sessionId,
+    async actions(payload: unknown) { await wdaCall(fetchImpl, baseUrl, `/session/${sessionId}/actions`, { body: payload }); },
+    async releaseActions() {
+      try { await wdaCall(fetchImpl, baseUrl, `/session/${sessionId}/actions`, { method: 'DELETE' }); }
+      catch { /* best-effort: this runs on a path that already failed */ }
+    },
+  };
+}
+
+/** One touch pointer's action list, wrapped in the W3C envelope. */
+function pointerActions(actions: unknown[]): unknown {
+  return { actions: [{ type: 'pointer', id: 'finger1', parameters: { pointerType: 'touch' }, actions }] };
+}
+
+/** A trusted tap: move → down → hold → up, as ONE actions call.
+ *
+ *  The hold mirrors the synthetic path's ~90ms so per-frame Input sampling sees the down edge. */
+export async function wdaTap(session: WdaSession, x: number, y: number, holdMs = 90): Promise<void> {
+  await session.actions(pointerActions([
+    { type: 'pointerMove', duration: 0, x: Math.round(x), y: Math.round(y) },
+    { type: 'pointerDown', button: 0 },
+    { type: 'pause', duration: holdMs },
+    { type: 'pointerUp', button: 0 },
+  ]));
+}
+
+/** A trusted drag. WDA interpolates the move over `durationMs` itself (measured: 14 intermediate
+ *  trusted `pointermove`s), so no manual stepping is needed — unlike the synthetic path, which must
+ *  emit each step. `steps` is therefore accepted-and-ignored by the caller, not passed on. */
+export async function wdaDrag(
+  session: WdaSession,
+  from: { x: number; y: number }, to: { x: number; y: number },
+  durationMs = 300,
+): Promise<void> {
+  await session.actions(pointerActions([
+    { type: 'pointerMove', duration: 0, x: Math.round(from.x), y: Math.round(from.y) },
+    { type: 'pointerDown', button: 0 },
+    { type: 'pointerMove', duration: Math.max(1, Math.round(durationMs)), x: Math.round(to.x), y: Math.round(to.y) },
+    { type: 'pointerUp', button: 0 },
+  ]));
+}
+
+// ── Session discovery ─────────────────────────────────────────────────────────
+
+let cached: WdaSession | null = null;
+/** Why the last auto-launch attempt failed, so the fallback banner names the REAL cause ("no iOS
+ *  device is connected", "not built — install it from Build Support") instead of the generic
+ *  "WDA is not answering", which would send the reader looking in the wrong place. */
+let lastLaunchFailure: string | null = null;
+
+/** Reach WDA on the device and open a session, reusing a live one.
+ *
+ *  `platformName` alone, deliberately NO `bundleId`: passing one makes WDA ACTIVATE that app, which
+ *  restarts it and rebinds the debug bridge's port out from under the lease. Measured — omitting it
+ *  attaches without touching the foreground app. */
+export async function getDeviceWdaSession(
+  opts: { host?: string; port?: number; fetchImpl?: WdaFetch; autoLaunch?: boolean } = {},
+): Promise<WdaSession | null> {
+  if (cached) return cached;
+  const host = opts.host;
+  if (!host) return null;   // no WiFi lease target ⇒ nothing to reach (adb/USB leases are Android)
+  const fetchImpl = opts.fetchImpl ?? (fetch as unknown as WdaFetch);
+  const port = opts.port ?? resolveWdaPort();
+  const baseUrl = `http://${host}:${port}`;
+  // Lazy launch (Phase 2b, Decision 1) — only on the INPUT path. `device_status` passes
+  // autoLaunch:false because a status READ must not start a multi-second agent as a side effect;
+  // it reports what is true now, and the first tap is what pays the spin-up.
+  if (opts.autoLaunch) {
+    const { ensureWdaRunning } = await import('./wdaLauncher');
+    const r = await ensureWdaRunning({ host, port });
+    if (!r.running) { lastLaunchFailure = r.reason ?? null; return null; }
+    lastLaunchFailure = null;
+  }
+  try {
+    await wdaCall(fetchImpl, baseUrl, '/status');
+    const reply = await wdaCall(fetchImpl, baseUrl, '/session', {
+      body: { capabilities: { alwaysMatch: { platformName: 'iOS' }, firstMatch: [{}] } },
+    });
+    const sessionId = reply.sessionId ?? (reply.value as unknown as { sessionId?: string })?.sessionId;
+    if (!sessionId) return null;
+    cached = makeWdaSession(fetchImpl, baseUrl, sessionId);
+    return cached;
+  } catch {
+    return null;   // WDA not running / unreachable — the caller falls back and says why
+  }
+}
+
+export function resetDeviceWdaSession(): void { cached = null; }
+
+/** Test seam — drop any cached session so one test cannot leak into the next. */
+export function _resetDeviceWdaStateForTests(): void { resetDeviceWdaSession(); lastLaunchFailure = null; }
+
+// ── Routing ───────────────────────────────────────────────────────────────────
+
+/** The ops WDA can genuinely deliver AS THAT OP on iOS. See the module header for why press_key,
+ *  scroll and hover are excluded — each was measured, not assumed. */
+const WDA_ROUTABLE_METHODS = new Set(['tap', 'drag']);
+
+export function isWdaRoutableMethod(method: string): boolean { return WDA_ROUTABLE_METHODS.has(method); }
+
+/** Why no WDA route exists. Actionable: the fix is to install/start the agent. */
+export const WDA_NOT_RUNNING_REASON =
+  'no trusted input route to this device — WebDriverAgent is not answering on the phone. Install it '
+  + 'from Build Support (iOS), then start it; it runs only while its xcodebuild test process is alive';
+
+/** Abandoned before dispatching anything. */
+export const WDA_SESSION_LOST_REASON =
+  'the trusted WebDriverAgent route failed before dispatching (session dropped); it will be re-established on the next call';
+
+export interface WdaRouteDeps {
+  proxy(method: string, params: Record<string, unknown>): Promise<unknown>;
+  /** The device's LAN address, from the lease target. Absent ⇒ no WDA route (adb/USB is Android). */
+  host?: string;
+  getSession?: (opts: { host?: string; autoLaunch?: boolean }) => Promise<WdaSession | null>;
+}
+
+/** Route ONE device-input method through WebDriverAgent. Same contract as `tryDeviceCdpInput`.
+ *
+ *  Failure handling differs from CDP in one deliberate way. A CDP gesture is several sends, so a
+ *  mid-gesture failure can leave a finger down and falling back would double-dispatch — CDP has to
+ *  REFUSE. A WDA gesture is ONE actions call carrying the whole sequence, and W3C defines
+ *  `DELETE /actions` to release any pointers left down. So here we release first and then fall back
+ *  safely, which is strictly better than refusing: the user still gets their input. */
+export async function tryDeviceWdaInput(method: string, params: Record<string, unknown>, deps: WdaRouteDeps): Promise<RouteOutcome> {
+  if (!isWdaRoutableMethod(method)) return { handled: false, reason: null };
+
+  const getSession = deps.getSession ?? getDeviceWdaSession;
+  // autoLaunch: this IS the "first input op" Decision 1 starts the agent on.
+  const session = await getSession({ host: deps.host, autoLaunch: true });
+  if (!session) return { handled: false, reason: lastLaunchFailure ?? WDA_NOT_RUNNING_REASON };
+
+  try {
+    if (method === 'tap') {
+      const r = await resolveAimViaDevice(deps, params, 'selector', 'x', 'y');
+      if (r.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
+      if (r.kind === 'refusal') return { handled: true, reply: r.error };
+      await wdaTap(session, r.aim.x, r.aim.y);
+      return { handled: true, reply: `ok (wda touch) css(${Math.round(r.aim.x)},${Math.round(r.aim.y)}) @ ${r.aim.label} [input:${TRUSTED_WDA_MECHANISM}]` };
+    }
+    // drag
+    const from = await resolveAimViaDevice(deps, params, 'fromSelector', 'fromX', 'fromY');
+    if (from.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
+    if (from.kind === 'refusal') return { handled: true, reply: from.error };
+    const to = await resolveAimViaDevice(deps, params, 'toSelector', 'toX', 'toY');
+    if (to.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
+    if (to.kind === 'refusal') return { handled: true, reply: to.error };
+    // The synthetic path expresses a drag as steps×delay; WDA interpolates from a DURATION. Convert
+    // rather than ignore, so a caller that slowed a drag down still gets a slow drag.
+    const steps = (params.steps as number) || 5;
+    const delayMs = (params.delayMs as number) || 20;
+    await wdaDrag(session, from.aim, to.aim, steps * delayMs);
+    return { handled: true, reply: `ok (wda touch) css(${Math.round(from.aim.x)},${Math.round(from.aim.y)})→(${Math.round(to.aim.x)},${Math.round(to.aim.y)}) [input:${TRUSTED_WDA_MECHANISM}]` };
+  } catch {
+    // Release any pointer the failed gesture may have left down, THEN let the caller fall back.
+    await session.releaseActions();
+    resetDeviceWdaSession();
+    return { handled: false, reason: WDA_SESSION_LOST_REASON };
+  }
+}
+
+/** "Is a trusted iOS route available right now" probe for `device_status`, dispatching nothing.
+ *
+ *  Exercises the WHOLE chain like its CDP twin: a WDA session AND an app build whose page answers
+ *  `resolve-aim`. Checking only the session is what made `device_status` claim `trusted-cdp` on
+ *  Android while every tap came back synthetic. */
+export async function isDeviceWdaAvailable(
+  opts: { host?: string; getSession?: WdaRouteDeps['getSession']; proxy?: WdaRouteDeps['proxy'] } = {},
+): Promise<boolean> {
+  const getSession = opts.getSession ?? getDeviceWdaSession;
+  // Explicitly NO autoLaunch: a status read reports what is true right now. Starting a 30-second
+  // agent because someone asked a question would make `device_status` an action with a side effect.
+  const session = await getSession({ host: opts.host, autoLaunch: false });
+  if (!session) return false;
+  if (!opts.proxy) return true;
+  try {
+    const outcome = decodeAimReply(await opts.proxy('resolve-aim', { selKey: 'selector', xKey: 'x', yKey: 'y', x: 0, y: 0 }));
+    return outcome.kind !== 'unsupported';
+  } catch {
+    return false;
+  }
+}
