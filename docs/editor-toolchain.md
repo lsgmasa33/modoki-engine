@@ -273,7 +273,10 @@ The two **bundled** tools (`toktx`, `msdf-atlas-gen`) ship on BOTH platforms, st
 the `beforePack` stage hooks (`engine/scripts/stage-*.cjs`), which branch per platform and copy whatever
 the build machine has installed (macOS: relocate the Homebrew binary + its dylibs; Windows: copy the
 installed `.exe` + sibling DLL) — so a local `dist:mac` AND `dist:win` both bundle. CI additionally
-pre-stages the Windows release via a verified download in `release-windows.yml` (a runner has nothing
+pre-stages the Windows release via a verified download in the public repo's
+`oss/.github/workflows/release-windows.yml` (there is no `.github/workflows/release-windows.yml`
+in this private repo anymore — it was deleted 2026-08-03, releases are cut from the public repo
+per the `/release-version` runbook; see docs/engine-oss-publishing.md) (a runner has nothing
 installed); the `win32` stager branch is idempotent and no-ops there.
 The playbook for adding a new tool on both is [bundle-new-tools.md](./bundle-new-tools.md).
 Remaining Windows gap: **code signing** (Azure Trusted Signing) is not yet wired, so SmartScreen warns.

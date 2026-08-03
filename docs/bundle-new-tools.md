@@ -34,7 +34,9 @@ whatever the build machine has **installed** — so a LOCAL `dist:mac` AND a loc
 - **other platforms** → no-op.
 
 **CI is the exception that still downloads.** A CI runner has nothing installed, so
-`.github/workflows/release-windows.yml` pre-stages `build/bin/` via a pinned, sha256-verified DOWNLOAD
+`oss/.github/workflows/release-windows.yml` (the public repo's release workflow, authored here and
+shipped by `scripts/publish-engine-oss.sh` — the private `.github/workflows/release-windows.yml`
+was deleted 2026-08-03, see docs/engine-oss-publishing.md) pre-stages `build/bin/` via a pinned, sha256-verified DOWNLOAD
 of each tool's Windows release BEFORE `npm run dist:win`. The stager's `win32` branch is **idempotent**
 (it skips when `build/bin/<tool>` already exists), so it no-ops on top of the CI download. Two fill
 mechanisms — local: copy-installed · CI: verified-download — one destination.
@@ -75,7 +77,9 @@ Runtime resolution is shared: `engine/electron/main.ts` `resolveBundled(envVar, 
      machine without `foo` must still build; the app degrades to a manual-install hint).
    - Register it in `engine/scripts/before-pack.cjs` (`await stageFoo(context)`).
 
-5. **Add the CI download step** — a `Stage foo` step in `.github/workflows/release-windows.yml`, before
+5. **Add the CI download step** — a `Stage foo` step in `oss/.github/workflows/release-windows.yml`
+   (the public repo's workflow — there is no `.github/workflows/release-windows.yml` in this repo
+   anymore, it was deleted 2026-08-03), before
    the build step, mirroring `Stage toktx` / `Stage msdf-atlas-gen`. A CI runner has nothing installed,
    so it DOWNLOADS the Windows release (the `win32` stager branch above then no-ops via idempotency):
    ```yaml
@@ -108,8 +112,9 @@ Runtime resolution is shared: `engine/electron/main.ts` `resolveBundled(envVar, 
    - macOS: `npm run dist:mac`, mount the DMG, confirm `Contents/Resources/bin/foo` runs and Build Support
      shows it present. (`npm run verify:packaged` covers the mac `--dir` smoke.)
    - Windows: `npm run dist:win` LOCALLY (bundles the tool you installed) — confirm `foo.exe` lands in
-     `release\win-unpacked\resources\bin` and runs; OR push a `v*` tag / run `release-windows.yml` manually
-     for the CI-downloaded release artifact.
+     `release\win-unpacked\resources\bin` and runs; OR, on the PUBLIC repo (`lsgmasa33/modoki-engine`,
+     where releases are cut per the `/release-version` runbook), push a `v*` tag / run
+     `oss/.github/workflows/release-windows.yml` manually for the CI-downloaded release artifact.
    - Extend `engine/tests/plugins/toolchainResolve.test.ts` for the per-platform `.exe` resolution and
      `engine/tests/electron/packagingManifest.test.ts` for the extraResources manifest.
 
@@ -165,7 +170,7 @@ tool, follow the checklist above.
   set `MODOKI_MSDF_ATLAS_GEN`) — exactly symmetric to `brew install …` before `dist:mac`. The macOS
   code path is untouched (Mac never enters the branch), so this is safe on `main` for both platforms.
   - **Idempotent, so CI is unaffected.** The branch skips when `build/bin/<tool>` already exists.
-    `release-windows.yml` still pre-stages via its verified **download** steps (a CI runner has nothing
+    `oss/.github/workflows/release-windows.yml` (public repo) still pre-stages via its verified **download** steps (a CI runner has nothing
     installed), and the beforePack branch then no-ops. CI keeps downloading (reproducible, pinned +
     sha256); a local dev box copies what it installed. Two fill mechanisms, one destination.
   - Not installed on the dev box → the branch warns + skips (source-texture / install-hint fallback),

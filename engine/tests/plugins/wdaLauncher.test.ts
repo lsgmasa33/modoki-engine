@@ -147,15 +147,21 @@ describe('ensureWdaRunning', () => {
     expect(r).toEqual({ running: true });
   });
 
+  // `platform: 'darwin'` is pinned on every call below that expects to reach the MACOS path.
+  // Omitting it inherits `process.platform`, which is darwin on a Mac clone and passes locally —
+  // but on CI's ubuntu/windows legs `ensureWdaRunning` short-circuits with "needs macOS + Xcode",
+  // so all six of these assertions failed there while `npm test` stayed green here. The two tests
+  // above deliberately omit it: their probe answers first, and the reachability check runs BEFORE
+  // the platform gate (a non-Mac editor can still drive an agent someone else started).
   it('REMEMBERS a permanent failure instead of retrying a 60s spin-up on every tap', async () => {
     // "No device connected" cannot fix itself between two taps. Without this latch, every input op
     // pays the full timeout — which reads as the tool hanging.
     const listDevices = vi.fn(() => listing([]));
-    const first = await ensureWdaRunning({ host: 'd', port: 8100, probe: deadProbe, listDevices, sleep: fastSleep, xctestrun: '/fake/WDA.xctestrun' });
+    const first = await ensureWdaRunning({ host: 'd', port: 8100, probe: deadProbe, listDevices, sleep: fastSleep, xctestrun: '/fake/WDA.xctestrun', platform: 'darwin' });
     expect(first.running).toBe(false);
     expect(first.reason).toMatch(/no iOS device is paired/);
 
-    const second = await ensureWdaRunning({ host: 'd', port: 8100, probe: deadProbe, listDevices, sleep: fastSleep, xctestrun: '/fake/WDA.xctestrun' });
+    const second = await ensureWdaRunning({ host: 'd', port: 8100, probe: deadProbe, listDevices, sleep: fastSleep, xctestrun: '/fake/WDA.xctestrun', platform: 'darwin' });
     expect(second).toEqual(first);
     expect(listDevices).toHaveBeenCalledTimes(1);   // not re-probed — the answer was latched
   });
@@ -164,6 +170,7 @@ describe('ensureWdaRunning', () => {
     const r = await ensureWdaRunning({
       host: 'd', port: 8100, probe: deadProbe, sleep: fastSleep, xctestrun: '/fake/WDA.xctestrun',
       listDevices: () => listing([{ udid: 'A', name: 'Air' }, { udid: 'B', name: 'Mini' }]),
+      platform: 'darwin',
     });
     expect(r.running).toBe(false);
     expect(r.reason).toMatch(/MODOKI_IOS_DEVICE_UDID/);
@@ -173,6 +180,7 @@ describe('ensureWdaRunning', () => {
     const r = await ensureWdaRunning({
       host: 'd', port: 8100, probe: deadProbe, sleep: fastSleep, xctestrun: '/fake/WDA.xctestrun',
       listDevices: () => { throw new Error('xcrun missing'); },
+      platform: 'darwin',
     });
     expect(r.running).toBe(false);
     expect(r.reason).toMatch(/could not list iOS devices/);
@@ -187,6 +195,7 @@ describe('ensureWdaRunning', () => {
       host: 'd', port: 8100, probe: deadProbe, sleep: fastSleep, xctestrun: '/fake/WDA.xctestrun',
       listDevices: () => listing([{ udid: 'A', name: 'Air' }]),
       spawnImpl: spawnImpl as never,
+      platform: 'darwin' as NodeJS.Platform,
       timeoutMs: 3000,
       now: (() => { let t = 0; return () => (t += 1500); })(),
     };
@@ -207,6 +216,7 @@ describe('ensureWdaRunning', () => {
       probe: async () => { const v = ready; ready = true; return v; },   // down first, up on the poll
       listDevices: () => listing([{ udid: 'UDID-1', name: 'Air' }]),
       spawnImpl: spawnImpl as never,
+      platform: 'darwin',
     });
     expect(r).toEqual({ running: true });
     const [cmd, args] = spawnImpl.mock.calls[0] as unknown as [string, string[]];
@@ -224,6 +234,7 @@ describe('ensureWdaRunning', () => {
       probe: async () => { const v = ready; ready = true; return v; },
       listDevices: () => listing([{ udid: 'A', name: 'Air' }]),
       spawnImpl: (() => proc) as never,
+      platform: 'darwin',
     });
     expect(isWdaProcessRunning()).toBe(true);
     stopWda();
