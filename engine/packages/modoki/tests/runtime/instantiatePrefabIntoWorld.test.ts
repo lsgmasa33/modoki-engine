@@ -60,6 +60,7 @@ let testWorld: ReturnType<typeof createWorld>;
 vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
   registerEntity: vi.fn(),
+  spawnEntity: (world: any, ...traits: any[]) => world.spawn(...traits),
   setStructureCallback: vi.fn(),
 }));
 

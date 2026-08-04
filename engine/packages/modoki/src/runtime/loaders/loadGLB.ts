@@ -5,7 +5,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
-import { getCurrentWorld, registerEntity } from '../core/ecs/world';
+import { getCurrentWorld, spawnEntity } from '../core/ecs/world';
 import { Transform, Renderable3D, EntityAttributes } from '../traits';
 import { getModelPostprocessor } from './modelPostprocessorRegistry';
 import { getModelHierarchy, findNearestMeshAncestor, decomposeLocalTransform, modelGlbUrl, sanitizeGeometryAttributes, type MeshHierarchyEntry } from './meshTemplateCache';
@@ -145,7 +145,7 @@ export function loadGLB(
         }
 
         // Spawn entity with parentId in EntityAttributes + auto-increment sortOrder
-        const entity = getCurrentWorld().spawn(
+        const entity = spawnEntity(getCurrentWorld(),
           Transform({
             x: pos.x, y: pos.y, z: pos.z,
             rx: euler.x, ry: euler.y, rz: euler.z,
@@ -154,7 +154,6 @@ export function loadGLB(
           Renderable3D(renderableData as any),
           EntityAttributes({ name: meshName, sortOrder: entityMap.size, parentId, layer: '3d' }),
         );
-        registerEntity(entity);
 
         const entityId = entity.id();
         entityMap.set(entityId, spriteName);
@@ -219,7 +218,7 @@ function spawnFromHierarchy(
       renderableData.material = preferGuid(`${options.materialDir}/${safeMeshName}.mat.json`, 'material');
     }
 
-    const entity = getCurrentWorld().spawn(
+    const entity = spawnEntity(getCurrentWorld(),
       Transform({
         x: entry.position[0], y: entry.position[1], z: entry.position[2],
         rx: entry.rotation[0], ry: entry.rotation[1], rz: entry.rotation[2],
@@ -228,7 +227,6 @@ function spawnFromHierarchy(
       Renderable3D(renderableData as any),
       EntityAttributes({ name: meshName, sortOrder: entityMap.size, parentId, layer: '3d' }),
     );
-    registerEntity(entity);
 
     const entityId = entity.id();
     entityMap.set(entityId, spriteName);

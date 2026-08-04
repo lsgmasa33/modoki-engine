@@ -3,7 +3,7 @@
 
 import { getAllEntities, readTraitData, findEntity, deleteEntities, subtreeIds } from '../../runtime/core/ecs/entityUtils';
 import { Transient } from '../../runtime/traits/Transient';
-import { getCurrentWorld, registerEntity } from '../../runtime/core/ecs/world';
+import { getCurrentWorld, spawnEntity } from '../../runtime/core/ecs/world';
 import { Camera } from '../../runtime/traits/Camera';
 import { Transform } from '../../runtime/core/traits/Transform';
 import { EntityAttributes } from '../../runtime/core/traits/EntityAttributes';
@@ -979,21 +979,21 @@ export async function loadScene(
 export function newScene(): void {
   deleteEntities(getAllEntities().map((e) => e.id));
   const world = getCurrentWorld();
-  registerEntity(world.spawn(
+  spawnEntity(world,
     Transform({ x: 0, y: 5, z: 10 }), Camera({ fov: 60 }), EntityAttributes({ name: 'Camera', sortOrder: 0 }),
-  ));
-  registerEntity(world.spawn(
+  );
+  spawnEntity(world,
     Environment({ hdrPath: WHITE_HDR_GUID }), EntityAttributes({ name: 'HDR Environment', sortOrder: 1 }),
-  ));
-  registerEntity(world.spawn(
+  );
+  spawnEntity(world,
     Transform({ x: 5, y: 10, z: 7 }),
     Light({ lightType: 'directional', color: 0xffffff, intensity: 2 }),
     EntityAttributes({ name: 'Directional Light', sortOrder: 2 }),
-  ));
-  registerEntity(world.spawn(
+  );
+  spawnEntity(world,
     Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.6 }),
     EntityAttributes({ name: 'Ambient Light', sortOrder: 3 }),
-  ));
+  );
   setCurrentScenePath(null);
   setCurrentBaseScene(undefined);
   swapHistory('');

@@ -1,6 +1,6 @@
 /** Prefab system — save, load, and instantiate prefab entity trees. */
 
-import { getCurrentWorld, registerEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
+import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { validatePrefabData } from '../../runtime/loaders/sceneValidation';
 import { backendFetch } from '../backend/editorBackend';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
@@ -489,8 +489,7 @@ export function instantiatePrefab(
       }));
     }
 
-    const entity = getCurrentWorld().spawn(...traitArgs);
-    registerEntity(entity);
+    const entity = spawnEntity(getCurrentWorld(), ...traitArgs);
     clearOverrideMarks(entity.id()); // fresh member — drop stale marks on a reused id
     localToEcs.set(pe.localId, entity.id());
     ownMemberIds.push(entity.id());
@@ -1221,8 +1220,7 @@ export function applyStructureByRootInstance(
       deleteEntities: (ecsIds) => deleteEntities(ecsIds),
       findEntity: (ecsId) => findEntity(ecsId) ?? undefined,
       spawnAdded: (traitArgs) => {
-        const entity = getCurrentWorld().spawn(...(traitArgs as Parameters<ReturnType<typeof getCurrentWorld>['spawn']>));
-        registerEntity(entity);
+        const entity = spawnEntity(getCurrentWorld(), ...(traitArgs as Parameters<ReturnType<typeof getCurrentWorld>['spawn']>));
         return entity.id();
       },
       // Editor nested-instance expansion: instantiate → tag source → replay

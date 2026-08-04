@@ -1,7 +1,7 @@
 /** Load a scene JSON file into an ECS world. Shared between editor and runtime. */
 
 import { type World } from 'koota';
-import { getCurrentWorld, registerEntity, indexEntityGuid, findEntityByGuid } from '../core/ecs/world';
+import { getCurrentWorld, spawnEntity, indexEntityGuid, findEntityByGuid } from '../core/ecs/world';
 import { getAllTraits, getTraitByName } from '../core/ecs/traitRegistry';
 import { loadModelTemplates, getCachedPrefab } from './meshTemplateCache';
 import { isGuid, isExternalUrl, resolveRef, getAssetType, deriveGuid, newGuid, getAssetEntry } from './assetManifest';
@@ -693,8 +693,7 @@ export function applyStructureByLocalToEcs(
       },
       findEntity: (ecsId) => handleById().get(ecsId),
       spawnAdded: (traitArgs) => {
-        const entity = world.spawn(...(traitArgs as Parameters<typeof world.spawn>));
-        registerEntity(entity, world);
+        const entity = spawnEntity(world, ...(traitArgs as Parameters<typeof world.spawn>));
         return entity.id();
       },
       spawnNestedInstance: (node, parentEcsId) => {
@@ -858,8 +857,7 @@ export function instantiatePrefabIntoWorld(
       }));
     }
     if (traitArgs.length > 0) {
-      const entity = world.spawn(...traitArgs as Parameters<typeof world.spawn>);
-      registerEntity(entity, world);
+      const entity = spawnEntity(world, ...traitArgs as Parameters<typeof world.spawn>);
       clearOverrideMarks(entity.id()); // fresh member — drop stale marks on a reused id
       const localId = entry.localId ?? 0;
       if (localId) localToEcs.set(localId, entity.id());
@@ -1325,8 +1323,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
       if (eaMeta) traitArgs.push(eaMeta.trait({ guid: entry.guid }));
     }
     if (traitArgs.length > 0) {
-      const entity = world.spawn(...traitArgs);
-      registerEntity(entity, world);
+      const entity = spawnEntity(world, ...traitArgs);
       onEntitySpawned?.(entity, entry.id);
       idMap.set(entry.id, entity.id());
       spawnedByEntryId.set(entry.id, entity);

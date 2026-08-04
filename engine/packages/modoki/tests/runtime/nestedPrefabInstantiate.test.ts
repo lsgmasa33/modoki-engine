@@ -17,6 +17,7 @@ const cachedPrefabs = new Map<string, unknown>();
 vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
   registerEntity: vi.fn(),
+  spawnEntity: (world: any, ...traits: any[]) => world.spawn(...traits),
   setStructureCallback: vi.fn(),
   indexEntityGuid: () => {},
   findEntityById: (_id: number) => undefined,

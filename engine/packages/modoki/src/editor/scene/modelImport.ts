@@ -3,7 +3,7 @@
 
 import * as THREE from 'three';
 import { backendFetch } from '../backend/editorBackend';
-import { getCurrentWorld, registerEntity } from '../../runtime/core/ecs/world';
+import { getCurrentWorld, spawnEntity } from '../../runtime/core/ecs/world';
 import { Transform, EntityAttributes, ModelSource, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, Bone, type MeshAsset, type MaterialAsset } from '../../runtime/traits';
 import { loadModelTemplates, getTemplatesForModel, invalidateModel, invalidateMaterial } from '../../runtime/loaders/meshTemplateCache';
 import { ensureRiggedModelLoaded, invalidateRiggedModel } from '../../runtime/loaders/riggedModelCache';
@@ -659,23 +659,21 @@ async function importRiggedModel(
 
   const world = getCurrentWorld();
   const rootName = prefix.charAt(0).toUpperCase() + prefix.slice(1);
-  const root = world.spawn(
+  const root = spawnEntity(world,
     Transform({ x: 0, y: 0, z: 0, sx: scale, sy: scale, sz: scale }),
     SkinnedModel({ model: glbGuid, isVisible: true }),
     SkeletalAnimator({ clip: rig.clipNames[0] ?? '', playing: true, speed: 1, loop: true, fadeDuration: 0 }),
     EntityAttributes({ name: rootName }),
   );
-  registerEntity(root);
 
   // One SkinnedMeshRenderer child per mesh node (Unity's per-renderer materials),
   // pre-wired to the `.mat.json` GUIDs extracted above (slot-name → guid).
   for (const mn of rig.meshNodes) {
-    const child = world.spawn(
+    spawnEntity(world,
       Transform({ x: 0, y: 0, z: 0, sx: 1, sy: 1, sz: 1 }),
       SkinnedMeshRenderer({ node: mn.node, materials: nodeMaterials.get(mn.node) ?? {}, visible: true }),
       EntityAttributes({ name: mn.node, parentId: root.id() }),
     );
-    registerEntity(child);
   }
   console.log(`[Import] Imported rigged "${prefix}" — ${rig.meshNodes.length} mesh node(s): ${rig.meshNodes.map((n) => n.node).join(', ')}`);
 
@@ -686,12 +684,11 @@ async function importRiggedModel(
   if (expandSkeleton && rig.bones.length) {
     const boneEntityByName = new Map<string, number>();
     for (const b of rig.bones) {
-      const e = world.spawn(
+      const e = spawnEntity(world,
         Transform({ x: b.pos[0], y: b.pos[1], z: b.pos[2], rx: b.rot[0], ry: b.rot[1], rz: b.rot[2], sx: b.scale[0], sy: b.scale[1], sz: b.scale[2] }),
         Bone({ name: b.name }),
         EntityAttributes({ name: b.name }),
       );
-      registerEntity(e);
       boneEntityByName.set(b.name, e.id());
     }
     const idToParent = new Map<number, number>();
@@ -954,12 +951,11 @@ export async function importModel(
   // path here baked a literal into both entities[] and resources[] on save,
   // failing the GUID-only resolver on the next load.
   const world = getCurrentWorld();
-  const rootEntity = world.spawn(
+  const rootEntity = spawnEntity(world,
     Transform({ x: 0, y: 0, z: 0 }),
     EntityAttributes({ name: prefix.charAt(0).toUpperCase() + prefix.slice(1) }),
     ModelSource({ glbPath: glbGuid, postprocessor: postprocessorId, prefix }),
   );
-  registerEntity(rootEntity);
   const rootId = rootEntity.id();
 
   // Parent all mesh entities under the root (parentId is in EntityAttributes).

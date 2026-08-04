@@ -28,6 +28,7 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
     },
   }),
   registerEntity: vi.fn(),
+  spawnEntity: (world: any, ...traits: any[]) => world.spawn(...traits),
 }));
 
 // Tag each trait so the merged spawn object exposes the ref fields by name.

@@ -38,6 +38,7 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => entityIndex.set(e.id(), e),
   unregisterEntity: (e: any) => entityIndex.delete(e.id()),
+  destroyEntity: (e: any) => { ((e: any) => entityIndex.delete(e.id()))(e); e.destroy(); },
 }));
 
 vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({

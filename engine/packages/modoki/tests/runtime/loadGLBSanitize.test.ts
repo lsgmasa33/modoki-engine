@@ -15,6 +15,7 @@ const geometries: { dispose: ReturnType<typeof vi.fn> }[] = [];
 vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => ({ spawn: () => ({ id: () => 1 }) }),
   registerEntity: vi.fn(),
+  spawnEntity: (world: any, ...traits: any[]) => world.spawn(...traits),
 }));
 vi.mock('../../src/runtime/traits', () => ({
   Transform: (d: any) => ({ Transform: d }),

@@ -1,7 +1,7 @@
 /** Tests for the prefab system. */
 
 import { describe, it, expect } from 'vitest';
-import { getCurrentWorld } from '@modoki/engine/runtime';
+import { getCurrentWorld, spawnEntity } from '@modoki/engine/runtime';
 import { Transform, Renderable3D, PrefabInstance, EntityAttributes } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { getEntityTraits, readTraitData, getAllEntities } from '@modoki/engine/runtime';
@@ -22,7 +22,7 @@ describe('PrefabInstance trait', () => {
   });
 
   it('can be spawned on an entity', () => {
-    const entity = getCurrentWorld().spawn(
+    const entity = spawnEntity(getCurrentWorld(), 
       Transform({ x: 5, y: 0, z: 0 }),
       Renderable3D({ mesh: 'prefab-test' }),
       EntityAttributes({ name: 'prefab-test', layer: '3d' }),
@@ -37,7 +37,7 @@ describe('PrefabInstance trait', () => {
   });
 
   it('reads PrefabInstance data via introspect', () => {
-    const entity = getCurrentWorld().spawn(
+    const entity = spawnEntity(getCurrentWorld(), 
       Transform({ x: 0, y: 0, z: 0 }),
       PrefabInstance({ source: 'prefabs/test.prefab.json', localId: 3, rootInstanceId: 42 }),
     );
@@ -58,14 +58,14 @@ describe('PrefabInstance trait', () => {
   });
 
   it('rootInstanceId links children to root', () => {
-    const root = getCurrentWorld().spawn(
+    const root = spawnEntity(getCurrentWorld(), 
       Transform({ x: 0, y: 0, z: 0 }),
       PrefabInstance({ source: 'prefabs/boat.prefab.json', localId: 1, rootInstanceId: 0 }),
     );
     // Set rootInstanceId to self
     const rootId = root.id();
 
-    const child = getCurrentWorld().spawn(
+    const child = spawnEntity(getCurrentWorld(), 
       Transform({ x: 1, y: 0, z: 0 }),
       EntityAttributes({ parentId: rootId }),
       PrefabInstance({ source: 'prefabs/boat.prefab.json', localId: 2, rootInstanceId: rootId }),
@@ -80,12 +80,12 @@ describe('PrefabInstance trait', () => {
 
 describe('serializePrefab', () => {
   it('serializes an entity tree with localIds', () => {
-    const parent = getCurrentWorld().spawn(
+    const parent = spawnEntity(getCurrentWorld(), 
       Transform({ x: 10, y: 0, z: 0 }),
       Renderable3D({ mesh: 'prefab-root' }),
       EntityAttributes({ name: 'prefab-root', layer: '3d' }),
     );
-    getCurrentWorld().spawn(
+    spawnEntity(getCurrentWorld(), 
       Transform({ x: 11, y: 0, z: 0 }),
       Renderable3D({ mesh: 'prefab-child' }),
       EntityAttributes({ name: 'prefab-child', layer: '3d', parentId: parent.id() }),
@@ -184,7 +184,7 @@ describe('serializePrefab — what reaches the template', () => {
 
   function spawnAuthoredEntity(extra: Record<string, unknown> = {}) {
     const animator = getTraitByName('Animator')!;
-    return getCurrentWorld().spawn(
+    return spawnEntity(getCurrentWorld(), 
       Transform({ x: 1, y: 2, z: 3 }),
       EntityAttributes({ name: 'Rigged', layer: '3d', editorFolder: 'Enemies/Ranged', ...extra }),
       animator.trait({ clips: BANK, clip: 'skin', speed: 1 }),

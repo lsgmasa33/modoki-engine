@@ -1,7 +1,7 @@
 /** Tests for deleteEntityWithUndo — recursive delete with undo/redo snapshot */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { getCurrentWorld } from '@modoki/engine/runtime';
+import { getCurrentWorld, spawnEntity } from '@modoki/engine/runtime';
 import { Transform, Renderable3D, EntityAttributes } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { deleteEntity, getAllEntities, getEntityTraits } from '@modoki/engine/runtime';
@@ -13,16 +13,16 @@ setActionCallback(pushAction);
 
 describe('deleteEntity (recursive)', () => {
   it('deletes an entity and all its children', () => {
-    const parent = getCurrentWorld().spawn(
+    const parent = spawnEntity(getCurrentWorld(), 
       Transform({ x: 0, y: 0, z: 0 }),
       EntityAttributes({ name: 'DelParent' }),
     );
     const pid = parent.id();
-    const child = getCurrentWorld().spawn(
+    const child = spawnEntity(getCurrentWorld(), 
       Transform({ x: 1, y: 0, z: 0 }),
       EntityAttributes({ name: 'DelChild', parentId: pid }),
     );
-    const grandchild = getCurrentWorld().spawn(
+    const grandchild = spawnEntity(getCurrentWorld(), 
       Transform({ x: 2, y: 0, z: 0 }),
       EntityAttributes({ name: 'DelGrandchild', parentId: child.id() }),
     );
@@ -35,13 +35,13 @@ describe('deleteEntity (recursive)', () => {
   });
 
   it('deleting a leaf does not affect siblings', () => {
-    const parent = getCurrentWorld().spawn(
+    const parent = spawnEntity(getCurrentWorld(), 
       Transform({ x: 0, y: 0, z: 0 }),
       EntityAttributes({ name: 'SibParent' }),
     );
     const pid = parent.id();
-    const a = getCurrentWorld().spawn(Transform({ x: 0, y: 0, z: 0 }), EntityAttributes({ name: 'SibA', parentId: pid }));
-    const b = getCurrentWorld().spawn(Transform({ x: 0, y: 0, z: 0 }), EntityAttributes({ name: 'SibB', parentId: pid }));
+    const a = spawnEntity(getCurrentWorld(), Transform({ x: 0, y: 0, z: 0 }), EntityAttributes({ name: 'SibA', parentId: pid }));
+    const b = spawnEntity(getCurrentWorld(), Transform({ x: 0, y: 0, z: 0 }), EntityAttributes({ name: 'SibB', parentId: pid }));
 
     deleteEntity(a.id());
 
@@ -54,7 +54,7 @@ describe('deleteEntityWithUndo', () => {
   beforeEach(() => clearHistory());
 
   it('deletes entity and pushes undo action', () => {
-    const entity = getCurrentWorld().spawn(
+    const entity = spawnEntity(getCurrentWorld(), 
       Transform({ x: 5, y: 0, z: 0 }),
       Renderable3D({ mesh: 'del-test' }),
       EntityAttributes({ name: 'UndoDelTest', layer: '3d' }),
@@ -68,7 +68,7 @@ describe('deleteEntityWithUndo', () => {
   });
 
   it('undo restores entity with all traits', async () => {
-    const entity = getCurrentWorld().spawn(
+    const entity = spawnEntity(getCurrentWorld(), 
       Transform({ x: 7, y: 8, z: 9 }),
       Renderable3D({ mesh: 'restore-test' }),
       EntityAttributes({ name: 'RestoreMe', layer: '3d' }),
@@ -88,16 +88,16 @@ describe('deleteEntityWithUndo', () => {
   });
 
   it('undo restores entity tree (parent + children)', async () => {
-    const parent = getCurrentWorld().spawn(
+    const parent = spawnEntity(getCurrentWorld(), 
       Transform({ x: 0, y: 0, z: 0 }),
       EntityAttributes({ name: 'TreeRoot' }),
     );
     const pid = parent.id();
-    getCurrentWorld().spawn(
+    spawnEntity(getCurrentWorld(), 
       Transform({ x: 1, y: 0, z: 0 }),
       EntityAttributes({ name: 'TreeChild1', parentId: pid }),
     );
-    getCurrentWorld().spawn(
+    spawnEntity(getCurrentWorld(), 
       Transform({ x: 2, y: 0, z: 0 }),
       EntityAttributes({ name: 'TreeChild2', parentId: pid }),
     );
@@ -118,7 +118,7 @@ describe('deleteEntityWithUndo', () => {
   });
 
   it('redo re-deletes the entity', async () => {
-    const entity = getCurrentWorld().spawn(
+    const entity = spawnEntity(getCurrentWorld(), 
       Transform({ x: 0, y: 0, z: 0 }),
       EntityAttributes({ name: 'RedoDelTest' }),
     );

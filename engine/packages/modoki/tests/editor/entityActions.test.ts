@@ -30,7 +30,9 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
   findEntityById: (id: number) => entityIndex.get(id),
   registerEntity: (entity: any) => entityIndex.set(entity.id(), entity),
+  spawnEntity: (world: any, ...traits: any[]) => { const e = world.spawn(...traits); entityIndex.set(e.id(), e); return e; },
   unregisterEntity: (entity: any) => entityIndex.delete(entity.id()),
+  destroyEntity: (e: any) => { ((entity: any) => entityIndex.delete(entity.id()))(e); e.destroy(); },
   setStructureCallback: vi.fn(),
   findEntityByGuid: (guid: string, world: any = testWorld) => {
     let found: any;

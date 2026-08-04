@@ -22,7 +22,7 @@
  */
 
 import { createWorld, type World, type Entity } from 'koota';
-import { setCurrentWorld, getCurrentWorld, registerEntity } from '../core/ecs/world';
+import { setCurrentWorld, getCurrentWorld, spawnEntity } from '../core/ecs/world';
 import { getAllTraits } from '../core/ecs/traitRegistry';
 import { resolveKootaSchema } from './sceneSchema';
 import { resolveSceneChain, type SceneRef, type FetchSceneMeta } from './sceneChain';
@@ -736,8 +736,7 @@ class SceneManagerImpl implements SceneManager {
         // thing that can tell the two apart — an authored Time sitting at the default
         // timeScale is byte-identical to this one, so no value-based rule could.
         // Re-materialized on every chain load that needs it, so nothing is lost.
-        const ent = stagingWorld.spawn(Time(), Transient);
-        registerEntity(ent, stagingWorld);
+        spawnEntity(stagingWorld, Time(), Transient);
       }
 
       // Input is likewise a global resource — ensure the combined world has the
@@ -747,8 +746,7 @@ class SceneManagerImpl implements SceneManager {
       let hasInput = false;
       stagingWorld.query(Input).updateEach(() => { hasInput = true; });
       if (!hasInput) {
-        const ent = stagingWorld.spawn(Input());
-        registerEntity(ent, stagingWorld);
+        spawnEntity(stagingWorld, Input());
       }
 
       // Prewarm: let renderers compile shaders against the staging world BEFORE

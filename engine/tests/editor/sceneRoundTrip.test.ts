@@ -10,7 +10,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
 import {
   getCurrentWorld, setCurrentWorld, getAllEntities, readTraitData, readTraitDataFull,
-  findEntity, getTraitByName,
+  findEntity, getTraitByName, spawnEntity,
   writeTraitField, deleteEntity, loadSceneFile, instantiatePrefabIntoWorld, markOverride, type SceneData,
   SCENE_FORMAT_VERSION,
 } from '@modoki/engine/runtime';
@@ -65,11 +65,11 @@ beforeEach(() => {
 
 describe('scene serialization round-trip', () => {
   it('preserves trait values, hierarchy, and layers across serialize → load', async () => {
-    const root = getCurrentWorld().spawn(
+    const root = spawnEntity(getCurrentWorld(), 
       getTraitByName('Transform')!.trait({ x: 1, y: 2, z: 3 }),
       getTraitByName('EntityAttributes')!.trait({ name: 'Root', layer: '3d' }),
     );
-    getCurrentWorld().spawn(
+    spawnEntity(getCurrentWorld(), 
       getTraitByName('Transform')!.trait({ x: 4, y: 5, z: 6 }),
       getTraitByName('Renderable3DPrimitive')!.trait({ mesh: 'cube', color: 0x00ff00, size: 2 }),
       getTraitByName('EntityAttributes')!.trait({ name: 'Child', parentId: root.id(), layer: '3d' }),
@@ -104,12 +104,12 @@ describe('scene serialization round-trip', () => {
   });
 
   it('round-trips a 2D entity and a UI element', async () => {
-    getCurrentWorld().spawn(
+    spawnEntity(getCurrentWorld(), 
       getTraitByName('Transform')!.trait({ x: 10, y: 20 }),
       getTraitByName('Renderable2D')!.trait({ sprite: 'circle', width: 30, height: 40, color: 0x3498db }),
       getTraitByName('EntityAttributes')!.trait({ name: 'Sprite2D', layer: '2d' }),
     );
-    getCurrentWorld().spawn(
+    spawnEntity(getCurrentWorld(), 
       getTraitByName('RenderableUI')!.trait(),
       getTraitByName('UIElement')!.trait({ width: 120, height: 40, text: 'Hello', fontSize: 14 }),
       getTraitByName('EntityAttributes')!.trait({ name: 'UIButton', layer: 'ui' }),
@@ -190,7 +190,7 @@ describe('prefab instance round-trip', () => {
   it('a prefab instance REPARENTED under a plain entity keeps its instance link + parent on reload', async () => {
     // Regression: a captured prefab root writes no EntityAttributes, so its placement
     // parentId used to be dropped — a reparented instance re-spawned at the scene ROOT.
-    const holder = getCurrentWorld().spawn(
+    const holder = spawnEntity(getCurrentWorld(), 
       getTraitByName('Transform')!.trait({ x: 0, y: 0, z: 0 }),
       getTraitByName('EntityAttributes')!.trait({ name: 'Holder', layer: '3d' }),
     );

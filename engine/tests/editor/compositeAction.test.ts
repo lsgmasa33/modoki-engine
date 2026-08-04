@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   getCurrentWorld, getAllEntities, getTraitByName, readTraitData, findEntity,
-  EntityAttributes, Transform,
+  EntityAttributes, Transform, spawnEntity as engineSpawnEntity,
 } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import {
@@ -32,7 +32,7 @@ async function drainUndo(): Promise<number> {
 }
 
 function spawnEntity(name: string, x = 0): number {
-  const e = getCurrentWorld().spawn(Transform({ x, y: 0, z: 0 }), EntityAttributes({ name }));
+  const e = engineSpawnEntity(getCurrentWorld(), Transform({ x, y: 0, z: 0 }), EntityAttributes({ name }));
   return e.id();
 }
 

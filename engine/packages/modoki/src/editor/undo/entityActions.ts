@@ -2,7 +2,7 @@
  *  Wraps runtime entityUtils with undo/redo tracking. */
 
 import * as THREE from 'three';
-import { getCurrentWorld, registerEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
+import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import {
   findEntity, readTraitData, readTraitDataFull, writeTraitField,
@@ -446,8 +446,7 @@ export function respawnFromSnapshot(snapshot: EntitySnapshot, newParentId: numbe
       traitArgs.push(meta.trait(patched as Record<string, unknown>));
     }
   }
-  const entity = getCurrentWorld().spawn(...traitArgs);
-  registerEntity(entity);
+  const entity = spawnEntity(getCurrentWorld(), ...traitArgs);
   const newId = entity.id();
   for (const child of snapshot.children) { respawnFromSnapshot(child, newId); }
   return newId;
@@ -494,8 +493,7 @@ export function createEntityWithUndo(
       : spec.data;
     traitInits.push(data !== undefined ? meta.trait(data) : meta.trait());
   }
-  const entity = getCurrentWorld().spawn(...traitInits);
-  registerEntity(entity);
+  const entity = spawnEntity(getCurrentWorld(), ...traitInits);
   let currentId = entity.id();
   // Mint+persist a guid BEFORE snapshotting so the snapshot carries it: respawn
   // restores the same guid and the Play snapshot serializes it, so undo/redo can
@@ -547,8 +545,7 @@ export function spawnEntitySubtree(parentId: number, root: SubtreeSpec): number 
       }
       inits.push(data !== undefined ? meta.trait(data) : meta.trait());
     }
-    const ent = getCurrentWorld().spawn(...inits);
-    registerEntity(ent);
+    const ent = spawnEntity(getCurrentWorld(), ...inits);
     const id = ent.id();
     ensureGuid(id);
     for (const child of node.children ?? []) spawnNode(child, id);

@@ -38,7 +38,9 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   onWorldSwap: () => () => {},
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => entityIndex.set(e.id(), e),
+  spawnEntity: (world: any, ...traits: any[]) => { const e = world.spawn(...traits); entityIndex.set(e.id(), e); return e; },
   unregisterEntity: (e: any) => entityIndex.delete(e.id()),
+  destroyEntity: (e: any) => { ((e: any) => entityIndex.delete(e.id()))(e); e.destroy(); },
 }));
 
 vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({

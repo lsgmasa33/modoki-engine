@@ -39,6 +39,7 @@ vi.mock('../../src/runtime/core/ecs/world', () => {
   return {
     getCurrentWorld: () => testWorld,
     registerEntity: vi.fn(),
+    spawnEntity: (world: any, ...traits: any[]) => world.spawn(...traits),
     setStructureCallback: vi.fn(),
     indexEntityGuid: () => {},
     findEntityById: (_id: number) => undefined,

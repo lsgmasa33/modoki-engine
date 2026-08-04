@@ -19,7 +19,9 @@ const TRAITS = [
 vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => createWorld(),
   registerEntity: vi.fn(),
+  spawnEntity: (world: any, ...traits: any[]) => world.spawn(...traits),
   unregisterEntity: vi.fn(),
+  destroyEntity: (e: any) => { e.destroy(); },
   setStructureCallback: vi.fn(),
 }));
 vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({

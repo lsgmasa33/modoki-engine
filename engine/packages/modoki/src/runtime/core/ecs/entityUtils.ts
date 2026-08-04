@@ -2,7 +2,7 @@
  *  Pure runtime functions with no undo or Three.js dependency. */
 
 import type { Trait, TraitRecord, ExtractSchema, TraitValue } from 'koota';
-import { getCurrentWorld, findEntityById, unregisterEntity, setStructureCallback } from './world';
+import { getCurrentWorld, findEntityById, destroyEntity, setStructureCallback } from './world';
 import { getAllTraits, transformName, type TraitMeta } from './traitRegistry';
 import { EntityAttributes } from '../traits/EntityAttributes';
 
@@ -504,8 +504,7 @@ export function deleteEntities(entityIds: number[]) {
     seen.add(id);
     const entity = findEntity(id);
     if (entity) {
-      unregisterEntity(entity);
-      entity.destroy();
+      destroyEntity(entity);
     }
   }
   fireDirtyListeners();

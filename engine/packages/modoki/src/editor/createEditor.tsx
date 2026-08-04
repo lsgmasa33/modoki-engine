@@ -16,7 +16,7 @@ import type { TraitMeta } from '../runtime/core/ecs/traitRegistry';
 import { registerModelPostprocessor, type ModelPostprocessor } from '../runtime/loaders/modelPostprocessorRegistry';
 import { registerTrait } from '../runtime/core/ecs/traitRegistry';
 import { setGameConfig } from '../runtime/core/config';
-import { getCurrentWorld, registerEntity } from '../runtime/core/ecs/world';
+import { getCurrentWorld, spawnEntity } from '../runtime/core/ecs/world';
 import { Camera } from '../runtime/traits/Camera';
 import { Transform } from '../runtime/core/traits/Transform';
 import { EntityAttributes } from '../runtime/core/traits/EntityAttributes';
@@ -683,12 +683,11 @@ export function createEditor(options: EditorOptions): React.ComponentType {
     }
 
     // Empty scene: just a camera
-    const cameraEntity = getCurrentWorld().spawn(
+    spawnEntity(getCurrentWorld(),
       Transform({ x: 0, y: 5, z: 10 }),
       Camera({ fov: 60 }),
       EntityAttributes({ name: 'Camera', sortOrder: 0 }),
     );
-    registerEntity(cameraEntity);
     console.log('[Editor] Created empty scene with default camera');
   })();
 

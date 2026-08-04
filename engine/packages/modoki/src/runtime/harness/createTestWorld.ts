@@ -20,7 +20,7 @@
 
 import { createWorld, type World } from 'koota';
 import { Time } from '../core/traits/Time';
-import { getCurrentWorld, setCurrentWorld, registerEntity } from '../core/ecs/world';
+import { getCurrentWorld, setCurrentWorld, spawnEntity } from '../core/ecs/world';
 import { registerSystem, unregisterSystem, SYSTEM_PRIORITY } from '../core/pipeline';
 import { timeSystem } from '../core/timeSystem';
 import { setManualNow, restoreRealClock } from '../core/clock';
@@ -100,7 +100,7 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
   // `findEntity(1)` (this Time singleton) came to flood CI with thousands of lines. Doing
   // it before the clear keeps the resulting `@spawn` out of the journal, so a test that
   // asserts on events() still sees only what its own run produced.
-  registerEntity(world.spawn(Time), world);
+  spawnEntity(world, Time);
 
   clearJournal(world);
   // Headless playtests want FULL observability, so open every Tier-2 (watch-gated)
@@ -131,11 +131,7 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
     // entity index, or engine code under test takes a different (O(n), warning) path than
     // it does in the running game. The `@spawn` this journals is correct and wanted: the
     // harness advertises full observability, and a runtime spawn journals one too.
-    spawn: (...traits) => {
-      const e = world.spawn(...(traits as Parameters<World['spawn']>));
-      registerEntity(e, world);
-      return e;
-    },
+    spawn: (...traits) => spawnEntity(world, ...(traits as Parameters<World['spawn']>)),
     step(ticks = 1, dt = defaultDt) {
       // Play-state + manual clock + baseline were set once above; just advance.
       // Shared loop with stepSimulation so the two can't drift.

@@ -1,7 +1,7 @@
 /** Tests for reparentEntity — reparenting with world-preserving transforms + sort order */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { getCurrentWorld } from '@modoki/engine/runtime';
+import { getCurrentWorld, spawnEntity } from '@modoki/engine/runtime';
 import { Transform, EntityAttributes } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { readTraitData, getAllEntities, buildEntityTree } from '@modoki/engine/runtime';
@@ -20,19 +20,19 @@ describe('reparentEntity', () => {
 
   beforeEach(() => {
     clearHistory();
-    const parent = getCurrentWorld().spawn(
+    const parent = spawnEntity(getCurrentWorld(), 
       Transform({ x: 10, y: 0, z: 0 }),
       EntityAttributes({ name: 'Parent', sortOrder: 0 }),
     );
     parentId = parent.id();
 
-    const child = getCurrentWorld().spawn(
+    const child = spawnEntity(getCurrentWorld(), 
       Transform({ x: 5, y: 0, z: 0 }),
       EntityAttributes({ name: 'Child', sortOrder: 0, parentId: parentId }),
     );
     childId = child.id();
 
-    const sibling = getCurrentWorld().spawn(
+    const sibling = spawnEntity(getCurrentWorld(), 
       Transform({ x: 0, y: 0, z: 0 }),
       EntityAttributes({ name: 'Sibling', sortOrder: 1 }),
     );
@@ -91,7 +91,7 @@ describe('reparentEntity', () => {
   });
 
   it('reorders within same parent (sort only, no transform change)', () => {
-    const child2 = getCurrentWorld().spawn(
+    const child2 = spawnEntity(getCurrentWorld(), 
       Transform({ x: 1, y: 0, z: 0 }),
       EntityAttributes({ name: 'Child2', sortOrder: 5, parentId: parentId }),
     );
@@ -135,15 +135,15 @@ describe('reparentEntity', () => {
 
 describe('buildEntityTree sortOrder', () => {
   it('sorts children by sortOrder', () => {
-    const parent = getCurrentWorld().spawn(
+    const parent = spawnEntity(getCurrentWorld(), 
       Transform({ x: 0, y: 0, z: 0 }),
       EntityAttributes({ name: 'TreeParent', sortOrder: 0 }),
     );
     const pid = parent.id();
 
-    getCurrentWorld().spawn(Transform({ x: 0, y: 0, z: 0 }), EntityAttributes({ name: 'C', sortOrder: 3, parentId: pid }));
-    getCurrentWorld().spawn(Transform({ x: 0, y: 0, z: 0 }), EntityAttributes({ name: 'A', sortOrder: 1, parentId: pid }));
-    getCurrentWorld().spawn(Transform({ x: 0, y: 0, z: 0 }), EntityAttributes({ name: 'B', sortOrder: 2, parentId: pid }));
+    spawnEntity(getCurrentWorld(), Transform({ x: 0, y: 0, z: 0 }), EntityAttributes({ name: 'C', sortOrder: 3, parentId: pid }));
+    spawnEntity(getCurrentWorld(), Transform({ x: 0, y: 0, z: 0 }), EntityAttributes({ name: 'A', sortOrder: 1, parentId: pid }));
+    spawnEntity(getCurrentWorld(), Transform({ x: 0, y: 0, z: 0 }), EntityAttributes({ name: 'B', sortOrder: 2, parentId: pid }));
 
     const tree = buildEntityTree(getAllEntities());
     const parentNode = tree.find(n => n.name === 'TreeParent');

@@ -118,7 +118,7 @@ export {
   onStructureDirty, markStructureDirty, getStructureVersion,
   type EntityInfo,
 } from './core/ecs/entityUtils';
-export { findEntityById, findEntityByGuid, registerEntity, unregisterEntity } from './core/ecs/world';
+export { findEntityById, findEntityByGuid, registerEntity, spawnEntity, unregisterEntity, destroyEntity } from './core/ecs/world';
 export {
   registerModelPostprocessor, getModelPostprocessor, getAllModelPostprocessors, getModelPostprocessorIds,
   type ModelPostprocessor,
