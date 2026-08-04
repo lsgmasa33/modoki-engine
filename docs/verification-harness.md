@@ -60,9 +60,9 @@ not "build a harness from scratch."
 | Single-step | `Paused` trait + `stepOneFrame` (editor step button) | `runtime/rendering/frameDriver.ts`, `timeSystem.ts` |
 | Sim on/off gate | `playState` — `getPlayState/setPlayState/isSimRunning` | `runtime/core/playState.ts` |
 | System ordering / registry | `registerSystem(name, fn, priority, {actions})`, `runPipeline(world)` (skips TIME/GAME/ANIMATION when `!isSimRunning()`) | `runtime/core/pipeline.ts` |
-| Named-input dispatch (spine for intents) | `dispatchUIAction(name, {targetGuid,...})`, `actionRegistry` | `runtime/ui/actionRegistry.ts` |
+| Named-input dispatch (spine for intents) | `dispatchUIAction(name, {targetGuid,...})`, `actionRegistry` | `runtime/core/actionRegistry.ts` |
 | Headless scene load | `loadSceneFile({ world })` — already takes a target world | `runtime/loaders/loadSceneFile.ts` |
-| World management | `getCurrentWorld`, `registerEntity` | `runtime/ecs/world.ts` |
+| World management | `getCurrentWorld`, `spawnEntity` | `runtime/core/ecs/world.ts` |
 | Logic/render split | logic = koota systems; render = `Renderable*` + `Scene3D`/`Scene2D` | — |
 
 What's **missing**: (1) an injectable clock + a **`timeScale`** concept (today

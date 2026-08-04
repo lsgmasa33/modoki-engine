@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   getCurrentWorld, getAllEntities, getTraitByName, readTraitData, findEntity,
-  EntityAttributes, Transform, spawnEntity as engineSpawnEntity,
+  EntityAttributes, Transform, spawnEntity,
 } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import {
@@ -31,8 +31,10 @@ async function drainUndo(): Promise<number> {
   return n;
 }
 
-function spawnEntity(name: string, x = 0): number {
-  const e = engineSpawnEntity(getCurrentWorld(), Transform({ x, y: 0, z: 0 }), EntityAttributes({ name }));
+/** Test-local convenience: spawn a named entity at x and hand back its id. Named
+ *  `spawnNamed`, not `spawnEntity`, so it cannot be mistaken for the engine helper. */
+function spawnNamed(name: string, x = 0): number {
+  const e = spawnEntity(getCurrentWorld(), Transform({ x, y: 0, z: 0 }), EntityAttributes({ name }));
   return e.id();
 }
 
@@ -51,8 +53,8 @@ beforeEach(() => {
 
 describe('runAsCompositeAction — one batch, one entry', () => {
   it('collapses a heterogeneous 3-op batch into ONE undo entry that reverts ALL of it', async () => {
-    const a = spawnEntity('CompA', 1);
-    const b = spawnEntity('CompB', 2);
+    const a = spawnNamed('CompA', 1);
+    const b = spawnNamed('CompB', 2);
     const tf = getTraitByName('Transform')!;
     let created: number | null = null;
 
@@ -83,7 +85,7 @@ describe('runAsCompositeAction — one batch, one entry', () => {
   });
 
   it('redo re-applies every sub-op, in FORWARD order', async () => {
-    const a = spawnEntity('RedoA', 0);
+    const a = spawnNamed('RedoA', 0);
     const tf = getTraitByName('Transform')!;
 
     await runAsCompositeAction({ label: 'Batch' }, () => {
@@ -135,8 +137,8 @@ describe('runAsCompositeAction — one batch, one entry', () => {
   });
 
   it('deletes inside a batch undo back into existence along with the rest', async () => {
-    const keep = spawnEntity('BatchKeep', 3);
-    const doomed = spawnEntity('BatchDoomed', 9);
+    const keep = spawnNamed('BatchKeep', 3);
+    const doomed = spawnNamed('BatchDoomed', 9);
     const tf = getTraitByName('Transform')!;
 
     await runAsCompositeAction({ label: 'Delete + edit' }, () => {
@@ -151,7 +153,7 @@ describe('runAsCompositeAction — one batch, one entry', () => {
   });
 
   it('pushes exactly ONE entry per batch, not one per sub-op', async () => {
-    const a = spawnEntity('CountA');
+    const a = spawnNamed('CountA');
     const tf = getTraitByName('Transform')!;
     await runAsCompositeAction({ label: 'Batch1' }, () => {
       for (let i = 0; i < 5; i++) writeTraitFieldWithUndo(a, tf, 'x', i);
@@ -163,7 +165,7 @@ describe('runAsCompositeAction — one batch, one entry', () => {
   });
 
   it('bumps the edit version ONCE per batch (one dirty commit, not N)', async () => {
-    const a = spawnEntity('VersionA');
+    const a = spawnNamed('VersionA');
     const tf = getTraitByName('Transform')!;
     const before = getEditVersion();
     await runAsCompositeAction({ label: 'Batch' }, () => {
@@ -182,7 +184,7 @@ describe('runAsCompositeAction — one batch, one entry', () => {
   });
 
   it('clears the redo stack, like any normal push', async () => {
-    const a = spawnEntity('RedoClear');
+    const a = spawnNamed('RedoClear');
     const tf = getTraitByName('Transform')!;
     pushAction({ label: 'Prior', undo: () => {}, redo: () => {} });
     await undo();
@@ -194,7 +196,7 @@ describe('runAsCompositeAction — one batch, one entry', () => {
 
 describe('runAsCompositeAction — failure aborts the whole batch', () => {
   it('rolls back applied sub-ops and pushes NOTHING when a later op throws', async () => {
-    const a = spawnEntity('FailA', 4);
+    const a = spawnNamed('FailA', 4);
     const tf = getTraitByName('Transform')!;
     let created: number | null = null;
 
@@ -276,7 +278,7 @@ describe('runAsCompositeAction — re-entrancy and the _executing guard', () => 
 
 describe('composite journal event', () => {
   it('emits ONE batch event carrying every sub-action payload, not N events', async () => {
-    const a = spawnEntity('JournalA', 0);
+    const a = spawnNamed('JournalA', 0);
     const tf = getTraitByName('Transform')!;
     clearEditorJournal();
 

@@ -29,7 +29,7 @@ The engine is consumed through two entry points: `@modoki/engine/runtime` and
 
 ## ECS Core (koota)
 
-The ECS core lives under `packages/modoki/src/runtime/ecs/`:
+The ECS core lives under `packages/modoki/src/runtime/core/ecs/`:
 
 - **`worldRegistry.ts`** — owns the active koota `World`. There is **no singleton
   `world` export**. Consumers call `getCurrentWorld()` *inside* callbacks/functions
@@ -39,9 +39,9 @@ The ECS core lives under `packages/modoki/src/runtime/ecs/`:
   notified. Each world has its own number→Entity index stored in a `WeakMap`
   (`getEntityIndex(world)`), so disposing a world GCs its index.
 - **`world.ts`** — re-exports the registry functions and adds entity-index helpers:
-  `findEntityById()`, `findEntityByGuid()`, `registerEntity()`, `unregisterEntity()`,
-  `indexEntityGuid()`, `rebuildGuidIndexSync()`. In dev it exposes `window.__ecsWorld`
-  as a live getter.
+  `spawnEntity()`, `destroyEntity()`, `findEntityById()`, `findEntityByGuid()`,
+  `registerEntity()`, `unregisterEntity()`, `indexEntityGuid()`, `rebuildGuidIndexSync()`.
+  In dev it exposes `window.__ecsWorld` as a live getter.
 - **`entityUtils.ts`** — editor/runtime entity helpers: `getAllEntities()`,
   `buildEntityTree()`, `findEntity()`, `readTraitData()`, `writeTraitField()`,
   `deleteEntity()`, plus dirty-tracking (`fireDirtyListeners()`, `markStructureDirty()`).
@@ -54,11 +54,34 @@ Each world carries **two** per-world indexes, both `WeakMap<World, Map<…>>` in
 `worldRegistry.ts` so disposing a world GCs its indexes:
 
 - **`getEntityIndex(world)`** — `number → Entity`, keyed by koota's numeric id.
-  `registerEntity()`/`unregisterEntity()` (called around `world.spawn()`/`.destroy()`)
-  maintain it; `findEntityById()` reads it O(1). `findEntity()` (entityUtils) adds an
-  O(n) fallback scan of `world.entities` for entities that never went through
-  `registerEntity()` (mostly test fixtures) — it `console.warn`s in dev so the missing
+  `registerEntity()`/`unregisterEntity()` maintain it; `findEntityById()` reads it O(1).
+  `findEntity()` (entityUtils) adds an O(n) fallback scan of `world.entities` for entities
+  that never went through `registerEntity()` — it `console.warn`s in dev (capped at 3 per
+  process, with a stack, so one unregistered entity can't flood a CI log) so the missing
   registration gets fixed.
+
+  **Always create and remove entities with `spawnEntity(world, ...traits)` and
+  `destroyEntity(entity, world)`** — never a bare `world.spawn()` / `entity.destroy()`.
+  koota owns `spawn()`, so index maintenance could never be automatic; it was a second call
+  you had to remember, and the destroy half was forgotten in three game systems. An ESLint
+  rule now bans the bare calls in production source (see below for its deliberate scope).
+
+  The two halves fail differently, which is why the destroy half matters more:
+
+  | Forgotten | Symptom | Loud? |
+  |---|---|---|
+  | `registerEntity` after spawn | lookups degrade to the O(n) fallback | yes — dev warning |
+  | `unregisterEntity` before destroy | index keeps a live entry pointing at a **destroyed** entity, so `findEntityById()` returns a corpse and the caller reads traits off it | **no** — an index hit looks like success |
+
+  The lint rule is scoped, not blanket. Bare `.spawn(` is banned across production source
+  (`engine/app`, `engine/packages/*/src`, `games/**`, `demos/**`) but **not** in test files,
+  where `.spawn(` is overwhelmingly the `createTestWorld` handle — which registers already —
+  and no selector can distinguish `tw.spawn()` from `world.spawn()` by shape. Bare
+  `.destroy()` is narrower still: only `games/*/runtime`, `demos/*/runtime`, and the ECS
+  core, because elsewhere it is legitimately a PixiJS/three object (`Scene2D` alone has 16).
+  Coverage lives in `tests/runtime/world.test.ts` (the pairing) and
+  `tests/runtime/entityIndexIntegrity.test.ts` (the same thing driven through
+  `deleteEntities`, against the real index rather than a mock).
 - **`getGuidIndex(world)`** — `guid → Entity`, symmetric to the asset manifest's
   `guidToEntry` map. This makes an entity's stable `guid` a **first-class O(1)
   identity** (not an O(n) world scan), which matters because numeric ids are reassigned

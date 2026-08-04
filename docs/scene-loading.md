@@ -11,7 +11,7 @@ See also: [Architecture](./architecture.md) · [Prefabs](./prefabs.md) · [Visua
 
 ## Two-world architecture
 
-There is **no singleton world**. `runtime/ecs/worldRegistry.ts` owns the active
+There is **no singleton world**. `runtime/core/ecs/worldRegistry.ts` owns the active
 koota `World` and exposes:
 
 - `getCurrentWorld()` — the active "main" world (created lazily on first call).
@@ -24,9 +24,9 @@ koota `World` and exposes:
 
 Consumers must call `getCurrentWorld()` **inside** callbacks/functions, never
 capture it at module load — otherwise a swap wouldn't take effect for them.
-`runtime/ecs/world.ts` re-exports these and adds entity-index helpers
-(`registerEntity`, `findEntityById`, `unregisterEntity`, `findEntityByGuid`,
-`guidOf`) — the guid lookup is load-bearing for resolving a guid-form `parentId` /
+`runtime/core/ecs/world.ts` re-exports these and adds entity-index helpers
+(`spawnEntity`, `destroyEntity`, `registerEntity`, `findEntityById`,
+`unregisterEntity`, `findEntityByGuid`, `guidOf`) — the guid lookup is load-bearing for resolving a guid-form `parentId` /
 `rootInstanceId` on load (see "Entity-id stability on disk" below).
 
 During a load, `SceneManager` builds a fresh staging world with koota's
@@ -299,7 +299,7 @@ representation.
 ### `FieldHint.entityId` — the registry mechanism
 
 A trait field that holds a **live entity id** declares it in the trait registry
-(`runtime/ecs/traitRegistry.ts`):
+(`runtime/core/ecs/traitRegistry.ts`):
 
 ```ts
 entityId?: { onMissing: 'root' | 'stripTrait' };
@@ -468,7 +468,7 @@ Two consumers:
   `sourceScene` is "foreign" to the scene being saved, mirroring the existing
   `Transient` exclusion. A level's file therefore never absorbs base rig, and a
   non-chained scene's save is byte-identical to pre-base-scene behaviour.
-- **Editor grouping/ghosting** — `EntityInfo.sourceScene` (`runtime/ecs/entityUtils.ts`)
+- **Editor grouping/ghosting** — `EntityInfo.sourceScene` (`runtime/core/ecs/entityUtils.ts`)
   drives the Hierarchy's scene groups and the ghost styling.
 
 ### Editor authoring surface

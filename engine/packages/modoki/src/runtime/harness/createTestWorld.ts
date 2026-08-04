@@ -94,12 +94,9 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
   setPlayState('playing');           // sim tiers run; dispatchUIAction is live
   seedRng(opts.seed ?? 1, world);    // reproducible; world-scoped (F1)
 
-  // Spawned + registered BEFORE clearJournal on purpose. Registering is what keeps the
-  // harness honest: an unregistered entity is invisible to the O(1) entity index, so any
-  // engine code the playtest calls falls back to an O(n) scan and warns — which is how
-  // `findEntity(1)` (this Time singleton) came to flood CI with thousands of lines. Doing
-  // it before the clear keeps the resulting `@spawn` out of the journal, so a test that
-  // asserts on events() still sees only what its own run produced.
+  // BEFORE clearJournal on purpose: spawnEntity journals an `@spawn`, and clearing after it keeps
+  // that out of the stream, so a test asserting on events() sees only what its own run produced.
+  // (Why spawning and registering are one call at all: see spawnEntity in core/ecs/world.ts.)
   spawnEntity(world, Time);
 
   clearJournal(world);
@@ -127,10 +124,9 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
 
   const handle: TestWorld = {
     world,
-    // Registered like a real spawn — a playtest entity must be reachable through the
-    // entity index, or engine code under test takes a different (O(n), warning) path than
-    // it does in the running game. The `@spawn` this journals is correct and wanted: the
-    // harness advertises full observability, and a runtime spawn journals one too.
+    // Goes through spawnEntity so a playtest entity is indexed exactly as it would be in the
+    // running game — otherwise engine code under test takes a path production never takes. The
+    // `@spawn` this journals is wanted here: a real runtime spawn emits one too.
     spawn: (...traits) => spawnEntity(world, ...(traits as Parameters<World['spawn']>)),
     step(ticks = 1, dt = defaultDt) {
       // Play-state + manual clock + baseline were set once above; just advance.

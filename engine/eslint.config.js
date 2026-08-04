@@ -241,7 +241,11 @@ export default tseslint.config(
   },
   // Browser-side code: app, games, and the engine/editor source.
   {
-    files: ['engine/app/**/*.{ts,tsx}', 'games/**/*.{ts,tsx}', 'engine/packages/*/src/**/*.{ts,tsx}'],
+    // `demos/**` sits alongside `games/**` deliberately: a demo is the same kind of thing (a
+    // self-contained project) and is the MORE exposed of the two — each one is published to its
+    // own public repo, so an ungated defect ships. Its absence here was not a decision; the
+    // test-file carve-out below was already written for `demos/*/tests/**` in anticipation.
+    files: ['engine/app/**/*.{ts,tsx}', 'games/**/*.{ts,tsx}', 'demos/**/*.{ts,tsx}', 'engine/packages/*/src/**/*.{ts,tsx}'],
     languageOptions: { globals: globals.browser },
     plugins: { 'react-hooks': reactHooks, 'react-refresh': reactRefresh },
     rules: {
@@ -343,7 +347,7 @@ export default tseslint.config(
   // re-lists the fetch/EventSource/spawn selectors too, so games/*/runtime/** keeps every gate the
   // wide zone above set for it.
   {
-    files: ['games/*/runtime/**/*.{ts,tsx}', 'engine/packages/*/src/runtime/core/ecs/**/*.ts'],
+    files: ['games/*/runtime/**/*.{ts,tsx}', 'demos/*/runtime/**/*.{ts,tsx}', 'engine/packages/*/src/runtime/core/ecs/**/*.ts'],
     rules: {
       'no-restricted-syntax': [
         'error',
