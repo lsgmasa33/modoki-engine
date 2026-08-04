@@ -145,3 +145,22 @@ export function partAngle(verts: number[][], uvs: number[][], tris: number[]): n
   const a = uvToPosAffine(verts, uvs, tris);
   return a ? Math.atan2(a.m10, a.m00) : null;
 }
+
+/** Bounding-box centre of a texture-space vertex list, or null for an empty mesh.
+ *
+ *  ONE copy for the Skin editor and its canvas (#105 Phase 4). Both had a private
+ *  bbox-centre helper with identical bodies that had ALREADY diverged in the empty
+ *  case — `SkinCanvas.centerOfVerts` returned null, `SkinEditor.centerOf` returned
+ *  {0,0}. That divergence is meaningful, so it is preserved at the CALL SITES
+ *  rather than flattened here: the canvas needs null ("there is no gizmo to place
+ *  on an empty mesh"), while the editor wants a usable origin fallback for
+ *  placement-preserving ops (`bboxCenter(v) ?? { x: 0, y: 0 }`).
+ *
+ *  Returning the stricter of the two (null) is deliberate — a caller that wants the
+ *  fallback must say so, whereas the reverse would silently hand {0,0} to the gizmo. */
+export function bboxCenter(verts: number[][]): { x: number; y: number } | null {
+  let mnx = Infinity, mny = Infinity, mxx = -Infinity, mxy = -Infinity;
+  for (const p of verts) { if (p[0] < mnx) mnx = p[0]; if (p[0] > mxx) mxx = p[0]; if (p[1] < mny) mny = p[1]; if (p[1] > mxy) mxy = p[1]; }
+  if (!Number.isFinite(mnx)) return null;
+  return { x: (mnx + mxx) / 2, y: (mny + mxy) / 2 };
+}

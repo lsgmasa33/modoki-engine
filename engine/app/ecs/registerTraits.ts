@@ -7,7 +7,7 @@ import {
   UIElement, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, Animator, SpriteAnimator,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
-  AudioSource, AudioListener,
+  AudioSource, AudioListener, VideoPlayer,
 } from './traits';
 import { getModelPostprocessorIds } from './loaders/modelPostprocessorRegistry';
 
@@ -699,6 +699,35 @@ export function registerAllTraits() {
       maxDistance: { type: 'number', min: 0, step: 1, section: 'Spatial', showWhen: { spatial: ['true'] }, tooltip: 'Distance beyond which volume stops dropping.' },
       rolloff: { type: 'number', min: 0, step: 0.1, section: 'Spatial', showWhen: { spatial: ['true'] }, tooltip: 'How quickly volume falls with distance.' },
       playing: { type: 'boolean', readOnly: true, runtimeOnly: true },
+    },
+  });
+
+  registerTrait({
+    name: 'VideoPlayer', trait: VideoPlayer, category: 'component', componentCategory: 'Audio',
+    priority: 72,
+    fields: {
+      clip: {
+        type: 'string', accept: ['.mp4', '.mov', '.m4v', '.webm', '.mkv'],
+        tooltip: 'Video clip (GUID). Converted to H.264/mp4 on import — the only codec the iOS WebView plays.',
+      },
+      loop: { type: 'boolean' },
+      autoplay: { type: 'boolean', tooltip: 'Play automatically when the game starts.' },
+      muted: {
+        type: 'boolean',
+        tooltip: 'Muted video is exempt from the browser autoplay rule; a clip WITH sound needs a user gesture first.',
+      },
+      volume: { type: 'number', min: 0, max: 1, step: 0.05 },
+      bus: { type: 'enum', options: ['master', 'music', 'sfx', 'ui'], tooltip: 'Mix bus for the video\'s audio track.' },
+      rate: { type: 'number', min: 0.1, max: 4, step: 0.05, tooltip: 'Playback rate before timeScale (1 = normal).' },
+      timeMode: {
+        type: 'enum', options: ['diegetic', 'presentation'],
+        tooltip: 'diegetic: a screen in the world — slow-mo slows it. presentation: a cutscene — slow-mo does NOT drag it. Both freeze when time is stopped.',
+      },
+      playing: { type: 'boolean', readOnly: true, runtimeOnly: true },
+      loadProgress: {
+        type: 'number', readOnly: true, runtimeOnly: true,
+        tooltip: 'Download progress 0-1 for a remote clip on the download policy. 1 for bundled/streamed.',
+      },
     },
   });
 

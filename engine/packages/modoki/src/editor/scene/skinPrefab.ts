@@ -8,25 +8,18 @@
  *  mesh/material); the prefab is the placeable thing (mirrors mesh ↔ prefab in 3D). */
 
 import { registerAsset, getGuidForPath } from '../../runtime/loaders/assetManifest';
-import { type Rig2DFile, type Rig2DBone } from '../../runtime/loaders/rig2dCache';
+import { type Rig2DFile } from '../../runtime/loaders/rig2dCache';
+import { coerceRigBones } from '../../runtime/skinning/rig2dTypes';
 import { spawnEntitySubtree, type SubtreeSpec } from '../undo/entityActions';
 import { deleteEntity } from '../../runtime/core/ecs/entityUtils';
 import { serializePrefab, setPrefabCache } from './prefab';
 import { writeAssetFile, deleteAssetFile } from '../panels/assetOps';
 import { pushAction, type UndoAction } from '../undo/undoManager';
 
-function coerceBones(raw: Rig2DFile['bones']): Rig2DBone[] {
-  return (raw ?? []).map((b, i) => ({
-    name: typeof b.name === 'string' && b.name ? b.name : `bone${i}`,
-    parent: Number.isInteger(b.parent) ? (b.parent as number) : -1,
-    x: b.x ?? 0, y: b.y ?? 0, rot: b.rot ?? 0,
-  }));
-}
-
 /** Build the SkinnedSprite2D + Bone2D subtree spec for a rig. The root sits at its
  *  local origin — a prefab is placed relative to its instantiation parent. */
 export function buildRigSubtree(rigGuid: string, bonesRaw: Rig2DFile['bones'], rootName: string): SubtreeSpec {
-  const bones = coerceBones(bonesRaw);
+  const bones = coerceRigBones(bonesRaw);
   const boneNode = (i: number): SubtreeSpec => ({
     traits: [
       { name: 'Transform', data: { x: bones[i].x, y: bones[i].y, rz: bones[i].rot } },
@@ -63,7 +56,7 @@ export async function makeRigPrefabAsset(
 ): Promise<{ path: string; updated: boolean } | null> {
   const rigGuid = getGuidForPath(rigPath) ?? rigDef.id;
   if (!rigGuid) return null;
-  const bones = coerceBones(rigDef.bones);
+  const bones = coerceRigBones(rigDef.bones);
   if (!bones.length) { console.warn('[skinPrefab] rig has no bones to prefab'); return null; }
 
   // Reuse the existing prefab's IDENTITY so placed instances stay linked (update in

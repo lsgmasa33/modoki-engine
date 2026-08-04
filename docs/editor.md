@@ -180,6 +180,69 @@ explicit key list (unknown keys nested inside a declared section survive).
 
 ## Panels
 
+### Where a panel's LOGIC belongs (and what is tested)
+
+A panel `.tsx` holds JSX, hooks and imperative wiring. **Its decisions belong in a
+plain `.ts` module beside it, and that module is where the tests go** — never a jsdom
+mount of the panel, which asserts the mock. The split is three layers: the `.tsx`
+keeps the DOM wiring, the `.ts` holds the decision as a pure function, and one e2e
+spec covers the real browser gesture.
+
+Measured (2026-08-04, `npm run coverage`): editor `.ts` is **79.8%** line-covered against
+editor `.tsx` at **12.9%**. Six large panels are at literal 0% — `SceneView` (2,304 lines),
+`Assets` (781), `AnimationEditor` (469), `EditorApp` (451), `ParticleEditor` (317),
+`TimelineEditor` (258). That gap is the strategy working, not failing: extraction moves
+decisions somewhere testable and leaves the JSX behind.
+
+The three that are *not* at zero — `SkinCanvas` 6.2%, `SkinEditor` 7.25%, `SpriteEditor`
+7.63% — are the ones whose already-pure helpers were exported and tested in place (see
+below). Exporting from a `.tsx` raises that `.tsx`'s own number; extracting *out* of one
+does not. Neither figure is a target.
+
+Extracted decision modules:
+
+| module | what it decides |
+|---|---|
+| `panels/assetListing.ts` | Assets filtering, sprite/type grouping, the visible-order walk that drives keyboard nav |
+| `panels/assetKeyCommands.ts` | every Assets keystroke → a command (platform-dependent delete chord, type-ahead) |
+| `panels/assetSelection.ts` | Assets click + drag selection policy |
+| `panels/assetOps.ts` | import/re-import planning, the delete sidecar rule, rename validation |
+| `panels/skinParts.ts` | rig part geometry + `bboxCenter` |
+| `scene/marqueeSelect.ts` | SceneView 2D box-selection: threshold, enclosure, selection merge |
+| `scene/pickSelection.ts` | the shared 2D + 3D viewport pick rule |
+| `scene/multiTransform.ts` | group-transform math, incl. which Transform fields each gizmo mode writes |
+
+All are unit-tested, but "has a test file" is not "is covered": `assetOps.ts` sits at 56%
+(the rest is `/api/*` IO wrappers) and `skinParts.ts` at 58% (4 exports no test executes).
+Check `npm run coverage` rather than the presence of a test file.
+
+Some panel logic is **already pure and at module scope but not exported**, so nothing
+can import it and nothing tests it (SkinCanvas's skinning math, SpriteEditor's slice
+geometry). Exporting it is the cheapest coverage in the editor: no refactor, so no
+behaviour risk. Prefer it over restructuring a component.
+
+**Two traps this work hit, both worth knowing before you add a panel helper:**
+
+1. **Duplicated private helpers — and deleting the original is NOT enough.** `.rig2d.json`
+   bone coercion existed in **four** places: `SkinEditor`, `SkinCanvas`, `scene/skinPrefab.ts`,
+   and inline in `runtime/skinning/rig2dTypes.ts`. The first pass unified two and declared
+   the class closed; a body-identity sweep found the rest, and the runtime's copy had
+   **already diverged** (it coerced numerically and preserved `noScale`; the editor's three
+   did neither). Testing one copy while others survive is the failure mode that makes this
+   work negative-value. So: look for a twin before writing a panel-local helper, put the one
+   copy in the layer that **owns the format** rather than in an editor-local module, and
+   **sweep the whole layer before claiming a duplication is resolved** — a scan for identical
+   top-level function bodies across `editor/**` takes a minute. (Same shape, different empty
+   case: `centerOfVerts`/`centerOf` → `skinParts.bboxCenter`, where the divergence was
+   meaningful and was preserved at the call sites instead of flattened.)
+2. **Not every panel yields to extraction.** SceneView is ~2,300 lines of *event
+   orchestration* — state spanning `pointerdown`/`move`/`up`, `stopPropagation`,
+   imperative renderer calls — and three seams moved only seven executable lines out
+   of it, where a similar effort on `Assets.tsx` moved 76. Extracting orchestration
+   re-expresses control flow, which is where behaviour quietly changes. "Honestly
+   untestable without an integration harness" is an acceptable answer for parts of
+   SceneView and `EditorApp.tsx`.
+
 Panels live in `editor/panels/`:
 
 - **Hierarchy** (`Hierarchy.tsx`) — the entity tree. Supports drag-to-reparent and

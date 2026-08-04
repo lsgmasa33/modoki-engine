@@ -22,6 +22,7 @@ import path from 'path';
 import { readMetaSidecar } from '../meta-sidecar';
 import { getCacheDir, cachePathFor } from '../texture-cache';
 import { getAudioCacheDir, audioCachePathFor } from '../audio-cache';
+import { getVideoCacheDir, videoCachePathFor } from '../video-cache';
 import { getEnvCacheDir, envCachePathFor } from '../env-cache';
 import { getFontCacheDir, atlasCachePath, metricsCachePath } from '../font-cache';
 import { getModelCacheDir, lodCachePath } from '../model-cache';
@@ -117,7 +118,7 @@ function dedupeBake(absSource: string, run: () => Promise<void>): Promise<void> 
  *  visible rather than masking the source. */
 async function autoBakeThenServe(
   ctx: Pick<BackendContext, 'projectRoot' | 'resolveAssetPath'> & AutoConvertCaps,
-  assetType: 'model' | 'texture' | 'atlas' | 'audio' | 'font' | 'environment',
+  assetType: 'model' | 'texture' | 'atlas' | 'audio' | 'video' | 'font' | 'environment',
   sourceUrl: string,
   absSource: string,
   resolveCached: () => BackendResult | null,
@@ -312,6 +313,37 @@ export async function serveProjectAsset(
         if (!fs.existsSync(c)) return null;
         console.log(`[asset-scanner] auto-converted audio variant for ${sourceUrl} (hash ${h})`);
         return file(ctFor[ext] || 'application/octet-stream', c, revalidate(h));
+      });
+      if (auto) return auto;
+    }
+    return raw('application/json', Buffer.from('not found'), 404);
+  }
+
+  // 3c-bis. A converted VIDEO variant from the local cache. URL form:
+  //     <sourceUrl>~video.mp4 — the source's meta carries the cache hash. Same
+  //     placement rule as the audio branch: BEFORE the texture-variant branch, whose
+  //     `.+` would swallow the suffix. Without this route the runtime resolves a
+  //     `~video.mp4` URL that 404s, and the element reports the genuinely unhelpful
+  //     DEMUXER_ERROR_COULD_NOT_OPEN (it demuxed the 404 body).
+  const vid = urlPath.match(/^(.+)~video\.mp4$/);
+  if (vid) {
+    const sourceUrl = decodeURIComponent(vid[1]);
+    const absSource = ctx.resolveAssetPath(sourceUrl);
+    if (absSource) {
+      const hash = (readMetaSidecar(absSource).videoCache as { hash?: string } | undefined)?.hash;
+      if (hash) {
+        const cached = videoCachePathFor(getVideoCacheDir(ctx.projectRoot), sourceUrl, hash);
+        if (fs.existsSync(cached)) return file('video/mp4', cached, revalidate(hash));
+      }
+      // Cache miss — auto-import (dev/editor only): re-convert from the meta settings,
+      // healing a checkout that has the committed videoCache hash but no local bytes.
+      const auto = await autoBakeThenServe(ctx, 'video', sourceUrl, absSource, () => {
+        const h = (readMetaSidecar(absSource).videoCache as { hash?: string } | undefined)?.hash;
+        if (!h) return null;
+        const c = videoCachePathFor(getVideoCacheDir(ctx.projectRoot), sourceUrl, h);
+        if (!fs.existsSync(c)) return null;
+        console.log(`[asset-scanner] auto-converted video variant for ${sourceUrl} (hash ${h})`);
+        return file('video/mp4', c, revalidate(h));
       });
       if (auto) return auto;
     }

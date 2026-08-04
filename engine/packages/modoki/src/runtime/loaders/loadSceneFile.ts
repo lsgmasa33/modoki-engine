@@ -72,7 +72,7 @@ export interface SceneEntityEntry {
 }
 
 export interface SceneResourceRef {
-  type: 'model' | 'riggedModel' | 'mesh' | 'material' | 'texture' | 'prefab' | 'font' | 'environment' | 'particle' | 'animation' | 'animset' | 'spriteanim' | 'rig2d' | 'audio' | 'shader' | 'timeline';
+  type: 'model' | 'riggedModel' | 'mesh' | 'material' | 'texture' | 'video' | 'prefab' | 'font' | 'environment' | 'particle' | 'animation' | 'animset' | 'spriteanim' | 'rig2d' | 'audio' | 'shader' | 'timeline';
   path: string;
   postprocessor?: string;
 }
@@ -1021,7 +1021,7 @@ const SCALAR_RESOURCE_TYPE_BY_FIELD: Record<string, SceneResourceRef['type']> = 
   'Renderable3D.material': 'material',
   'SkinnedModel.model': 'riggedModel',
   'SkeletalAnimator.animSet': 'animset',
-  'Renderable2D.sprite': 'texture',
+  'VideoPlayer.clip': 'video',
   'Renderable2D.material': 'shader', // 2D custom material (.shader.json) — lazy-loaded by Scene2D
   'Text3D.font': 'font',
   'Text2D.font': 'font',
@@ -1035,6 +1035,7 @@ const SCALAR_RESOURCE_TYPE_BY_FIELD: Record<string, SceneResourceRef['type']> = 
   'Director.timeline': 'timeline',
   // Registry fields intentionally NOT here (handled explicitly in the loop below):
   //   Renderable3DPrimitive.material — dynamic texture-or-material via getAssetType
+  //   Renderable2D.sprite            — dynamic texture-or-video via getAssetType
   //   ModelSource.glbPath            — carries a postprocessor payload
 };
 
@@ -1130,6 +1131,18 @@ export function collectResourceRefsFromEntities(
     const animator = entry.traits['Animator'] as Record<string, unknown> | undefined;
     if (animator && typeof animator !== 'boolean') {
       for (const c of parseAnimClipBank(animator.clips)) if (looksFetchable(c.clip)) add('animation', c.clip);
+    }
+    // Renderable2D.sprite is USUALLY a texture, but a video GUID is legal there too
+    // (a moving picture on a 2D sprite). Type it by what the asset actually IS, not by
+    // the field it sits in — a video filed as a texture is a ref the manifest describes
+    // wrongly, and the next reader to trust that type is the one who pays.
+    const r2d = entry.traits['Renderable2D'] as Record<string, unknown> | undefined;
+    if (r2d && typeof r2d !== 'boolean') {
+      const sprite = r2d.sprite as string | undefined;
+      if (looksFetchable(sprite)) {
+        const t = isGuid(sprite!) ? getAssetType(sprite!) : undefined;
+        add(t === 'video' ? 'video' : 'texture', sprite!);
+      }
     }
     const r3dp = entry.traits['Renderable3DPrimitive'] as Record<string, unknown> | undefined;
     if (r3dp && typeof r3dp !== 'boolean') {

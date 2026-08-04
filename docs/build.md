@@ -90,6 +90,35 @@ git ls-files 'games/*/ios/**' 'games/*/android/**' | git check-ignore --stdin
 # must print nothing — no tracked source should be ignored
 ```
 
+### App icons + splash are GENERATED, but still tracked
+
+`res/` counts as tracked source above, yet its icons and splashes are produced by
+`@capacitor/assets` during the native build. That combination is only safe because the build
+**skips regeneration when nothing changed** (`engine/plugins/iconAssets.ts`).
+
+Two things went wrong before it did:
+
+- The step ran on **every** native build, rewriting every tracked mipmap/splash PNG each time,
+  so any game that had been built carried a permanently dirty working tree — 95 such files
+  across two games in one day, burying real diffs in re-encoded binaries.
+- The generator was invoked as a bare `npx --yes @capacitor/assets` beneath a comment claiming
+  it was "verified against 3.0.5". `npx --yes` installs **latest**, so the comment described a
+  version the build never used; a newer release started emitting extra density buckets
+  (`drawable-night-*`, `*-ldpi`, `mipmap-ldpi`) that surfaced as mystery untracked directories.
+
+Now: the tool version is **pinned** (`ICON_TOOL`), and a stamp under the project's gitignored
+`.cache/` records the tool version + platform + colour flags + the **content hash** of the
+source image. Regeneration happens when any of those change, or when the generated output has
+been deleted (a sentinel file is checked, so a wiped `res/` still comes back). Content-hashing
+means repointing `app.iconSource` at a byte-identical file is correctly a no-op, while editing
+an image in place is not.
+
+**Why not just gitignore the icons?** Generation is deliberately non-fatal (`|| echo '[icon]
+generation skipped'`) and needs `npx` to reach the network. Untracked icons would let an
+offline or upstream-broken build ship an app with no icon and no committed fallback — trading
+visible churn for an invisible release defect. To force a rebuild, delete
+`<project>/.cache/icon-stamp-<platform>`.
+
 ## The canonical path: build from the editor
 
 Open the project, then **Build → iOS Device / Android Device / Web**. `/api/build` runs the
@@ -446,6 +475,90 @@ JAVA_HOME=$(/usr/libexec/java_home -v 21) games/<id>/android/gradlew -p games/<i
 adb install games/<id>/android/app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n <appId>/.MainActivity
 ```
+
+## Converted assets: the manifest points at the SOURCE, the build ships the VARIANT
+
+A sibling of the section above, and the same "fine in dev, broken when built" shape. Five asset
+kinds go through a converter — **textures, audio, environment HDRs, models, fonts** — and on a
+successful conversion the shaker ships only the derived variant and **drops the source**. But a
+manifest entry's `path` is still the SOURCE path. So a consumer that does `assetUrl(entry.path)`
+gets a URL that resolves in dev (Vite serves everything off disk) and 404s in production.
+
+Every consumer must therefore go through its variant resolver — `resolveTextureVariantUrl` /
+`servedAudioUrl` / `modelGlbUrl` — each of which falls back to the bare source **only when the
+asset is unconverted**, which is exactly the case where the source *is* shipped.
+
+**Fonts are the exception that proves it**, and the one that shipped broken. A font has two
+independent consumers needing different files:
+
+| consumer | authored as | needs |
+|---|---|---|
+| canvas text (`Text2D.font`) | a **GUID** | `~atlas.png` + `~metrics.json` |
+| DOM text (`UIElement.fontFamily`, CSS) | a **family NAME** | the source `.ttf`/`.otf`, via FontFace |
+
+`loadAllFonts` FontFace-loads the manifest path directly, so dropping the source 404'd every baked
+font at boot in every game — visible only as `[FontLoader] N/N fonts failed to load`, with the
+canvas text still rendering perfectly. It took an iPhone 7 to notice.
+
+The source now ships **iff** a DOM consumer needs it:
+`shipTtf = shipSource === 'always' || (shipSource !== 'never' && domUsed)`, where `domUsed` reuses
+the tree-shaker's font-family walk (`TreeShakeResult.domFontFiles`). The build logs the decision
+per font, and the manifest records `font.sourceShipped`, which `loadAllFonts` reads so a
+deliberately-dropped font is skipped rather than fetched-and-warned.
+
+⚠️ **`shipSource: 'auto'` cannot see a family named in CSS or assigned from game code** — a static
+scan only reaches scene/prefab `fontFamily`. A game that styles DOM text from a stylesheet must set
+`shipSource: 'always'` in the font's `.meta.json`, or its text silently falls back to a system face.
+This is the one known blind spot in the rule.
+
+## The shipped platform floors (`build.iosMinVersion` / `build.androidMinSdk`)
+
+**Never let the bundler pick this.** Vite 8's default `build.target` is
+`'baseline-widely-available'`, which resolves to `["chrome111","edge111","firefox114",
+"safari16.4","ios16.4"]` — silently making **iOS 16.4 the minimum for every game we ship**. esbuild
+then emits ES2022 static class blocks (three.js uses them), which are a **parse** error on older
+WebKit: the chunk never parses, the eager module graph dies, and the app hangs on the splash screen
+with *zero* JavaScript console output. `three.core` is on the eager boot path
+(`index → renderSettings → three.core`), so it takes down 2D-only games too.
+
+`build.iosMinVersion` (default **`16.4`**, raised from `15.4` on 2026-08-04 by owner decision —
+deliberately dropping the iPhone 7 / 6s / SE1 era) is the single source of truth, with two
+consumers that must never disagree.
+
+⚠️ That the floor now *equals* the `ios16.4` the bundler default would have picked is a
+coincidence, not a regression. The bug above was never the number — it was the floor being
+**implicit**: inherited from a default that moves between bundler majors, and disagreeing with the
+native deployment target. A deliberate, pinned 16.4 driving both consumers is the opposite of that.
+
+The two consumers:
+
+- **`vite.config.ts`** → `build.target` gets `ios<v>` / `safari<v>`
+- **`healNativeConfig`** → `healIosDeploymentTarget` rewrites `IPHONEOS_DEPLOYMENT_TARGET` in the
+  pbxproj (every build configuration — patching only the first leaves Release on the old floor)
+
+They were previously independent literals that DID disagree — pbxproj `15.0` vs a bundle needing
+`15.4` — so the App Store would offer the game to a device that installs it and then dies on a
+missing API.
+
+**15.4 remains the hard LOWER bound, not a round number.** esbuild lowers *syntax* but cannot
+polyfill *runtime APIs*; scanning a built bundle for APIs it can't reach finds exactly
+`structuredClone`, `Array.at` and `Object.hasOwn` — all three shipped in iOS 15.4. Lowering the
+floor below 15.4 therefore needs polyfills, not just a smaller number; `16.4` sits comfortably
+above that line, so no polyfills are needed at the current floor.
+
+Guarded by `engine/tests/architecture/buildTargetFloor.test.ts`, which fails if the pin is removed,
+replaced by a moving alias, if the two consumers are decoupled, or if the pinned floor value moves
+without someone deliberately updating the test.
+
+`build.androidMinSdk` (default **`31`**, Android 12 — reviewed alongside the iOS raise) is the
+Android sibling, with the same shape:
+
+- **`healNativeConfig`** → `healAndroidMinSdk` rewrites `minSdkVersion` in
+  `android/variables.gradle` (every occurrence, `/g`, on open/build)
+
+`cap add` scaffolds `minSdkVersion = 24` and nothing else ever revisits it, so without the heal a
+newly-scaffolded project silently ships API 24 and the floor drifts per-project — the same drift
+`iosMinVersion` was introduced to close on iOS. Same test file adds parallel Android coverage.
 
 ## iOS build notes
 

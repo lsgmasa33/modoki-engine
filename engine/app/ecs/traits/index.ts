@@ -4,7 +4,7 @@ export { Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAni
   Animator, SpriteAnimator, clampAngle,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
-  AudioSource, AudioListener,
+  AudioSource, AudioListener, VideoPlayer,
 } from '@modoki/engine/runtime';
 
 // Three.js traits — re-export from @modoki/engine

@@ -39,8 +39,9 @@ export const PINNED_CMDLINE_TOOLS = {
   } as Record<string, { url: string; sha1: string }>,
 }
 
-/** The SDK packages Modoki games build against — compileSdk/targetSdk 36, minSdk 24 (from every
- *  game's `android/variables.gradle`). Keep in sync with that gradle config. */
+/** The SDK packages Modoki games build against — compileSdk/targetSdk 36, minSdk 31 (from
+ *  `build.androidMinSdk`, synced into every game's `android/variables.gradle` by
+ *  `healAndroidMinSdk`). Keep in sync with that gradle config. */
 export const ANDROID_SDK_PACKAGES = ['platform-tools', 'platforms;android-36', 'build-tools;36.0.0']
 
 /** Google's cmdline-tools host key from the Node platform. */

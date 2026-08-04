@@ -13,6 +13,7 @@ import { computeDeviceLetterbox } from '../scene/sceneViewMath';
 import { FREE_PRESET, resolveLogicalSize, type DevicePreset } from '../scene/devicePresets';
 import DevicePicker from './DevicePicker';
 import { DebugMenu } from '../../runtime/debug';
+import { VideoOverlay } from '../../runtime/video/VideoOverlay';
 
 // ── Main GameView ───────────────────────────────────────
 
@@ -171,6 +172,12 @@ export default function GameView({ uiLayer }: GameViewProps) {
               {uiLayer}
             </div>
           )}
+          {/* Cutscene layer. Mounted HERE as well as in the app shell because the
+              editor's Game panel does not render App.tsx's wrapper — a cutscene that
+              only appeared in a shipped build would be untestable in the editor,
+              which is where it gets authored. Renders nothing unless a
+              presentation-mode clip is playing. */}
+          <VideoOverlay />
           {/* Stopped: the game sim is frozen and UI actions don't dispatch, so
               clicking buttons/sliders does nothing. Make that explicit with a
               click-to-play call-to-action overlaying the game. */}

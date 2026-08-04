@@ -255,6 +255,15 @@ describe('sprites-only 2D references (real assets)', () => {
   const { textures, sprites } = textureAndSpriteGuids();
   const rig2ds = assets.filter((a) => a.type === 'rig2d');
   const sceneLike = assets.filter((a) => a.type === 'scene' || a.type === 'prefab');
+  // A `Renderable2D.sprite` may legally hold a VIDEO guid: the sprite shows a moving
+  // picture, its texture supplied by videoTextureSync2D from the element videoService
+  // owns rather than by the still-image pipeline. Such a ref is neither a raw texture
+  // nor a sprite slice, so both checks below would otherwise flag every video sprite.
+  const videos = new Set(
+    assets.filter((a) => a.type === 'video')
+      .map((a) => readAssetGuid(a.abs, 'video')?.toLowerCase())
+      .filter((g): g is string => !!g),
+  );
 
   it('no 2D sprite field references a raw texture GUID (must be a sprite)', () => {
     const offenders: string[] = [];
@@ -268,6 +277,7 @@ describe('sprites-only 2D references (real assets)', () => {
     }
     for (const r of refs) {
       if (!isGuid(r.ref)) continue; // primitive keyword / URL / empty
+      if (videos.has(r.ref.toLowerCase())) continue;  // a video sprite — see `videos` above
       if (textures.has(r.ref.toLowerCase())) offenders.push(`${r.url} ${r.at} → raw texture ${r.ref}`);
     }
     expect(offenders).toEqual([]);
@@ -285,6 +295,7 @@ describe('sprites-only 2D references (real assets)', () => {
     }
     for (const r of refs) {
       if (!isGuid(r.ref)) continue;
+      if (videos.has(r.ref.toLowerCase())) continue;  // a video sprite — see `videos` above
       if (!sprites.has(r.ref.toLowerCase())) dangling.push(`${r.url} ${r.at} → unknown sprite ${r.ref}`);
     }
     expect(dangling).toEqual([]);

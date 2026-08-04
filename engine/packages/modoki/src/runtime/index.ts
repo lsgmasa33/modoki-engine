@@ -37,7 +37,7 @@ export {
   Animator, SpriteAnimator, defaultSpriteClip, clampAngle,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
-  AudioSource, AudioListener,
+  AudioSource, AudioListener, VideoPlayer,
   type MeshAsset, type MaterialAsset, type SpriteClip, type BodyType2D, type ColliderShape2D, type JointType2D,
   type BodyType3D, type ColliderShape3D, type JointType3D,
 } from './traits';
@@ -72,8 +72,9 @@ export {
   type TimelineDef, type TrackDef, type TrackKind, type TrackBase,
   type AnimationTrackDef, type AnimationClipBlock, type SignalTrackDef, type SignalMarker,
   type AudioTrackDef, type AudioCueBlock, type ActivationTrackDef, type ActivationSpan,
-  type ControlTrackDef, type ControlClipBlock,
+  type ControlTrackDef, type ControlClipBlock, type VideoTrackDef, type VideoClipBlock,
   defaultTimeline, normalizeTimeline, collectTimelineAudioRefs, collectTimelineControlRefs,
+  collectTimelineVideoRefs,
 } from './timeline/types';
 export {
   getTimeline, setTimeline, invalidateTimeline, clearTimelineCache, loadTimelineNow,
@@ -325,6 +326,13 @@ export { characterInput3DSystem } from './input/characterInput3DSystem';
 export { characterAnimationSystem } from './animation/characterAnimationSystem';
 export { audioSystem, stopWorldAudio, stopEntityAudio, setAudioWorldPositionResolver } from './audio/audioSystem';
 export { registerAudioControls, useAudioMixStore } from './actions/audioControls';
+export { registerVideoControls } from './actions/videoControls';
+// Fullscreen cutscene layer. React + DOM only (no THREE), so exporting it here does
+// not pull the 3D graph into a 2D game — see the rendering-entry note below.
+export { VideoOverlay, type VideoOverlayProps } from './video/VideoOverlay';
+export {
+  videoEvents, clearVideoEventHandlers, emitVideoSkip, type VideoEventPayload,
+} from './video/VideoEvents';
 // Audio subsystem — service (playback backend), cue bus, context, buffer cache.
 export {
   play as audioPlay, stopAll as audioStopAll, resume as audioResume, dispose as audioDispose,
@@ -334,6 +342,25 @@ export {
   getAudioLog, clearAudioLog, setAudioRecordMode,
   type BusName, type AudioPlaySpec, type AudioHandle, type AudioLogEntry,
 } from './audio/audioService';
+// Video subsystem — playback core (HTMLVideoElement lifetime, timeScale coupling,
+// autoplay-block recovery). Its SOUND routes onto the audio bus above.
+export {
+  playVideo, applyTimeScale as applyVideoTimeScale, disposeAllVideo, liveVideoCount,
+  type VideoHandle, type VideoPlaySpec, type VideoTimeMode,
+} from './video/videoService';
+export {
+  videoSystem, stopWorldVideo, setVideoUrlResolver, videoElementFor, seekEntityVideo,
+  setVideoSourceResolver, setVideoDownloader, type ResolvedVideoSource,
+} from './video/videoSystem';
+export { resolveVideoUrl, resolveVideoSource, type VideoSource } from './loaders/videoUrl';
+export {
+  VideoCache, CacheApiBackend, hasCacheStorage,
+  type CacheBackend, type VideoCacheOptions, type DownloadProgress,
+} from './video/videoCache';
+export {
+  planAdmission, explainRefusal, totalBytes as videoCacheTotalBytes,
+  type CacheEntry, type AdmissionResult,
+} from './video/videoCachePolicy';
 export { cueSound, cueClip, drainAudioCues, clearAudioCues, type AudioCue } from './audio/audioCues';
 export { parseClipBank, stringifyClipBank, clipRefForKey, type ClipBankEntry } from './audio/clipBank';
 export { getAudioContext, hasAudioSupport, disposeAudioContext } from './audio/audioContext';

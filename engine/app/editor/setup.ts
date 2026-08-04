@@ -397,6 +397,7 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
               title: 'Signing',
               fields: [
                 { key: 'build.appleTeamId', label: 'Apple Team ID', type: 'combo', options: teamOptions, placeholder: 'e.g. ABCDE12345', help: 'pick a team found on this Mac (or type an ID) — synced into iOS DEVELOPMENT_TEAM on every iOS build' },
+                { key: 'build.iosMinVersion', label: 'Minimum iOS version', type: 'text', placeholder: '16.4', help: 'the ONE floor — sets both the JS bundle target and the native IPHONEOS_DEPLOYMENT_TARGET. Below 15.4 needs polyfills (structuredClone / Array.at / Object.hasOwn land in 15.4), not just a smaller number' },
               ],
             },
             {
@@ -417,6 +418,12 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
         {
           title: 'Android',
           groups: [
+            {
+              title: 'Build',
+              fields: [
+                { key: 'build.androidMinSdk', label: 'Minimum Android SDK', type: 'number', placeholder: '31', help: 'API level, not the marketing version — 31 = Android 12. Synced into android/variables.gradle minSdkVersion on open. Capacitor scaffolds 24, so without this the floor drifts per-project.' },
+              ],
+            },
             {
               title: 'This Machine (project.user.json — not committed)',
               fields: [

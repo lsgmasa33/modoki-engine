@@ -169,6 +169,9 @@ function mockDeps() {
   //    GUID→path divergence) — used to pin the F3 keying bug below.
   // getWorldTransform2D / resolvePrimitiveShape mirror the real (pure) logic.
   vi.doMock('../../src/runtime/rendering/renderUtils', () => ({
+    // A 'vid:' ref stands in for a video-asset GUID: a Sprite slot that skips the
+    // still-image pipeline entirely (no resolve, no Assets.load, no url retain).
+    isVideoRef: (ref: string) => typeof ref === 'string' && ref.startsWith('vid:'),
     isImagePath: (ref: string) =>
       typeof ref === 'string' && (ref.startsWith('sheet:') || ref.startsWith('img:') || ref.startsWith('http') || ref.startsWith('/')),
     resolveImageUrl: (ref: string) => {
@@ -278,6 +281,39 @@ describe('Scene2D.renderFrame', () => {
     expect(obj.texture.width).toBe(64);            // resolved synchronously from cache
     expect(obj.tint).toBe(0x00ff00);
     expect(obj._ax).toBe(0.5);                     // anchor.set(pivotX, pivotY)
+  });
+
+  // A VIDEO ref is a Sprite on screen but must never enter the still-image pipeline.
+  // PixiJS's asset loader WILL happily load an .mp4 — by minting its own second
+  // HTMLVideoElement for a clip videoService is already driving (two decoders, two audio
+  // paths, playback the engine's timeScale cannot reach). The slot is therefore an empty
+  // shell that videoTextureSync2D fills from the element the engine owns.
+  it('creates an EMPTY Sprite for a video ref — no load, no texture retain', async () => {
+    const { pixi, traits, pool, scene2d, world } = await setup();
+    const load = vi.spyOn(pixi.Assets, 'load');
+    const canvas = spawnCanvas(world, traits);
+    spawnChild(world, traits, canvas.id(), { sprite: 'vid:clip-guid', width: 32, height: 18 });
+
+    scene2d.renderFrame();
+
+    const obj = pool.getSlot(canvas.id())!.container.children[0] as any;
+    expect(obj.kind).toBe('sprite');              // NOT a graphics primitive
+    expect(obj.texture).toBe(pixi.Texture.EMPTY); // waiting on the video element
+    expect(load).not.toHaveBeenCalled();
+  });
+
+  it('releases nothing when a video slot is disposed', async () => {
+    // The slot never retained a url (textureUrl ''), so an unload here would be
+    // unbalanced — it would evict some OTHER entity's texture from the shared cache.
+    const { pixi, traits, scene2d, world } = await setup();
+    const canvas = spawnCanvas(world, traits);
+    const child = spawnChild(world, traits, canvas.id(), { sprite: 'vid:clip-guid' });
+    scene2d.renderFrame();
+
+    child.destroy();
+    scene2d.renderFrame();
+
+    expect(pixi.Assets.__unloaded).toHaveLength(0);
   });
 
   // Phase 0 (2D materials): Renderable2D.blendMode maps onto the Pixi view's blendMode

@@ -20,7 +20,9 @@ import {
   writeAssetFile as writeFile, deleteAssetFile as deleteAsset, deleteAssetFiles as deleteAssets,
   duplicateAssetFile as duplicateAsset, createFolderApi, moveFileTo, createPrefabFromEntity,
   reimportTargets, planImports, refreshHandlerTypes, HANDLER_TYPES,
+  deletionPathsFor, planRename,
 } from './assetOps';
+import { resolveClickSelection, dragPathsFor } from './assetSelection';
 import { isTextAsset, makeDeleteUndo, makeDuplicateUndo, type Snapshot, type DeleteResult, type DupResult } from './assetUndo';
 import { newGuid, registerAsset, type AssetType } from '../../runtime/loaders/assetManifest';
 import { getCreatableAssets, type CreatableAssetDef } from './creatableAssets';
@@ -35,7 +37,6 @@ function assetDisplayName(p: string, ext: string): string {
 }
 import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu';
 import RenameInput from '../components/RenameInput';
-import { rangeBetween } from './hierarchySelection';
 import { startDragGhost, endDragGhost, setAssetDragPayload, completeAssetDrop, armGrabCursor } from '../utils/dragGhost';
 import {
   splitAssetPath, duplicatePathFor, pastePathIn, remapPrefix, buildFolderTree, planAutoImports,
@@ -43,13 +44,15 @@ import {
   type AssetEntry, type FolderNode,
 } from '../utils/assetPaths';
 import { ASSET_TYPE_COLORS, AssetTypeGlyph, compareAssetTypes } from './assetTypeIcons';
+import {
+  spritesByTexture as spritesByTextureOf, filterAssets, flatAssetTotal, groupByType, visibleOrder,
+  ASSETS_SECTION, type ViewMode,
+} from './assetListing';
+import { resolveAssetKey } from './assetKeyCommands';
 import ScriptTree from './ScriptTree';
 import { SectionHeader, TreeFolderRow, TreeSearchInput, TypeFilterMenu } from './treeChrome';
 import { useExpandedSet } from './useExpandedSet';
 
-// Toggle key for the top-level "Assets" section header. Kept out of the folder
-// path-space (which the real folders use) so it never collides with one.
-const ASSETS_SECTION = '@@assets-section';
 
 async function instantiatePrefabFromPath(prefabPath: string, _name: string) {
   try {
@@ -534,8 +537,6 @@ function countAll(node: FolderNode): number {
 
 // ─── Main component ──────────────────────────────────────────────────
 
-type ViewMode = 'category' | 'folder';
-
 const LS_VIEW_MODE = 'editor:assets:viewMode';
 // v2: the top-level tree gained an "Assets" section header (ASSETS_SECTION key),
 // so bump the key to seed it open by default over any older saved set.
@@ -900,24 +901,20 @@ export default function Assets() {
 
   // Finder-style click selection: plain = replace, ⌘/Ctrl = toggle, Shift =
   // range from the anchor through the visible order.
+  // The click policy lives in assetSelection.ts (#105 Phase 3) — pure, unit-tested.
   const handleSelect = useCallback((a: AssetEntry, e?: React.MouseEvent) => {
-    const toggle = !!e && (e.metaKey || e.ctrlKey);
-    const range = !!e && e.shiftKey;
-    if (range && anchorRef.current) {
-      // Shares rangeBetween with the Hierarchy panel (generic over item type).
-      const span = rangeBetween(visiblePathsRef.current, anchorRef.current, a.path);
-      setSelection(new Set(span ?? [a.path]));
-    } else if (toggle) {
-      setSelection((prev) => {
-        const next = new Set(prev);
-        if (next.has(a.path)) next.delete(a.path); else next.add(a.path);
-        return next;
+    setSelection((prev) => {
+      const { paths, anchor } = resolveClickSelection({
+        path: a.path,
+        current: prev,
+        anchor: anchorRef.current,
+        order: visiblePathsRef.current,
+        toggle: !!e && (e.metaKey || e.ctrlKey),
+        range: !!e && e.shiftKey,
       });
-      anchorRef.current = a.path;
-    } else {
-      setSelection(new Set([a.path]));
-      anchorRef.current = a.path;
-    }
+      if (anchor !== undefined) anchorRef.current = anchor;
+      return paths;
+    });
     activate(a);
   }, [activate]);
 
@@ -999,43 +996,26 @@ export default function Assets() {
       } catch { /* unreachable read — leave it out of the undo set */ }
     };
 
-    const deletePaths: string[] = [];
-    // Snapshot a path for undo (if it exists) AND queue it for deletion. The
-    // backend skips paths that no longer exist, so queuing a maybe-absent
-    // sidecar is harmless.
-    const mark = async (filePath: string): Promise<void> => {
-      await snapshot(filePath);
-      deletePaths.push(filePath);
-    };
-
-    // Primary asset first (so the undo restore order matches the original
-    // existence order in case anything cares).
-    await mark(asset.path);
-    // The asset's sidecar (binary assets only — JSON assets carry their id
-    // inline). It holds the asset's GUID + texture/model import settings, both
-    // of which dangle if lost across a delete-undo. Previously this was
-    // snapshotted for undo but NEVER trashed → an orphaned `.meta.json` was
-    // left on disk after every binary/model delete; now it's trashed too.
-    if (!isTextAsset(asset.path)) await mark(asset.path + '.meta.json');
-
-    // For model assets: also remove every generated mesh.json / mat.json /
-    // texture (plus the textures' sidecars), snapshotting each for undo.
+    // For a model, the set also covers everything the import generated — read the
+    // sidecar to find out what that was. A missing/unreadable meta just means the
+    // bare model delete.
+    let generated: { meshes?: string[]; materials?: string[]; textures?: string[] } | null = null;
     if (asset.type === 'model') {
       try {
         const metaRes = await backendFetch(`/api/read-meta?path=${encodeURIComponent(asset.path)}`);
-        if (metaRes.ok) {
-          const meta = await metaRes.json();
-          const generated = meta.generated || {};
-          const generatedFiles: string[] = [...(generated.meshes || []), ...(generated.materials || []), ...(generated.textures || [])];
-          for (const f of generatedFiles) {
-            await mark(f);
-            // Texture sidecars carry the texture's stable guid + import settings.
-            if (!isTextAsset(f)) await mark(f + '.meta.json');
-          }
-          if (generatedFiles.length > 0) console.log(`[Assets] Will clean up ${generatedFiles.length} generated files for ${asset.name}`);
-        }
+        if (metaRes.ok) generated = (await metaRes.json()).generated || null;
       } catch { /* no meta or read failed — proceed with the bare model delete */ }
     }
+
+    // WHICH paths a delete covers is decided by assetOps.deletionPathsFor (pure,
+    // unit-tested); this only performs the undo snapshots. The backend skips paths
+    // that no longer exist, so a maybe-absent sidecar in the list is harmless.
+    const deletePaths = deletionPathsFor(asset.path, asset.type, generated);
+    // Counts the generated FILES, not the sidecars they drag along — matches what
+    // the meta actually lists.
+    const generatedCount = (generated?.meshes?.length ?? 0) + (generated?.materials?.length ?? 0) + (generated?.textures?.length ?? 0);
+    if (generatedCount > 0) console.log(`[Assets] Will clean up ${generatedCount} generated files for ${asset.name}`);
+    for (const p of deletePaths) await snapshot(p);
 
     return { asset, snapshots, deletePaths };
   }, []);
@@ -1099,11 +1079,12 @@ export default function Assets() {
   // moves the .meta.json sidecar alongside it, so the asset's GUID + import
   // settings survive — only the on-disk filename changes.
   const handleRename = useCallback(async (asset: AssetEntry, newBase: string) => {
-    const { dir, base, ext } = splitAssetPath(asset.path);
-    const safe = newBase.trim().replace(/[/\\]/g, '_');
-    if (!safe || safe === base) return;
-    const toPath = `${dir}/${safe}${ext}`;
-    if (assets.some((a) => a.path === toPath)) { console.warn(`[Assets] Rename target exists: ${toPath}`); return; }
+    const plan = planRename(asset.path, newBase, assets.map((a) => a.path));
+    if (!plan.ok) {
+      if (plan.reason === 'exists') console.warn(`[Assets] Rename target exists: ${plan.toPath}`);
+      return;
+    }
+    const { toPath, base: safe } = plan;
     const ok = await moveFileTo(asset.path, toPath);
     if (!ok) { console.error(`[Assets] Failed to rename ${asset.path}`); return; }
     console.log(`[Assets] Renamed ${asset.path} → ${toPath}`);
@@ -1128,10 +1109,7 @@ export default function Assets() {
   // The drag set for a row, resolved lazily at dragstart from the live selection
   // (via the ref) so AssetRow needn't take the selection Set as a prop. The whole
   // selection when this row is part of a multi-select, otherwise just this asset.
-  const getDragPaths = useCallback((asset: AssetEntry): string[] => {
-    const sel = selectionRef.current;
-    return sel.has(asset.path) && sel.size > 1 ? [...sel] : [asset.path];
-  }, []);
+  const getDragPaths = useCallback((asset: AssetEntry): string[] => dragPathsFor(asset.path, selectionRef.current), []);
 
   const clearSelection = useCallback(() => {
     setSelection(new Set());
@@ -1313,80 +1291,62 @@ export default function Assets() {
   // Keyboard handling is scoped to the (focusable) asset list container, so it
   // only fires when the Assets panel is the active pane — no global listener
   // that would clash with the Hierarchy's Cmd+D / Delete / F2.
+  // WHAT each key means is decided by `resolveAssetKey` (assetKeyCommands.ts, #105
+  // Phase 3) — pure, and unit-tested there. This handler only reads the event and
+  // performs the resulting command.
+  //
+  // This handler is ELEMENT-scoped (on the focusable list container), so unlike the
+  // other panels it was already correctly scoped by DOM focus and did not need
+  // migrating into the keymap registry (focus-scope refactor P6) — the Hierarchy's
+  // document-level rival listener it was written to deny is now gone.
+  //
+  // stopPropagation still matters: it keeps a claimed key from ALSO reaching the
+  // window-level keymap dispatcher. Non-handled keys (e.g. Cmd+Z undo) fall through
+  // to it untouched — which is what makes "let unhandled keys pass" work. Note that
+  // type-ahead deliberately does NOT claim its key; that is why the resolver reports
+  // `preventDefault` separately from the command.
+  //
+  // TODO(P8): register these in the keymap under the `assets` scope anyway, purely so
+  // they are INTROSPECTABLE (Shortcuts panel, menu generation, MCP). Behaviour is
+  // already right; only discoverability is missing.
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
-    const tag = (e.target as HTMLElement).tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA') return; // e.g. inline rename field
-    const isMac = navigator.platform.includes('Mac');
-    const mod = isMac ? e.metaKey : e.ctrlKey;
-    const order = visiblePathsRef.current;
+    const { command, preventDefault, typeAhead } = resolveAssetKey({
+      key: e.key,
+      metaKey: e.metaKey, ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey,
+      targetTag: (e.target as HTMLElement).tagName,
+      isMac: navigator.platform.includes('Mac'),
+      order: visiblePathsRef.current,
+      selected,
+      anchor: anchorRef.current,
+      assets,
+      typeAhead: typeAheadRef.current,
+      now: performance.now(),
+    });
+    if (typeAhead) typeAheadRef.current = typeAhead;
+    if (preventDefault) { e.preventDefault(); e.stopPropagation(); }
+
     const find = (p: string | null) => assets.find((x) => x.path === p);
-    // Claim the key. This handler is ELEMENT-scoped (on the focusable list container),
-    // so unlike the other panels it was already correctly scoped by DOM focus and did
-    // not need migrating into the keymap registry (focus-scope refactor P6) — the
-    // Hierarchy's document-level rival listener it was written to deny is now gone.
-    //
-    // stopPropagation still matters: it keeps a claimed key from ALSO reaching the
-    // window-level keymap dispatcher. Non-handled keys (e.g. Cmd+Z undo) fall through
-    // to it untouched — which is what makes "let unhandled keys pass" work.
-    //
-    // TODO(P8): register these in the keymap under the `assets` scope anyway, purely so
-    // they are INTROSPECTABLE (Shortcuts panel, menu generation, MCP). Behaviour is
-    // already right; only discoverability is missing.
-    const stop = () => { e.preventDefault(); e.stopPropagation(); };
-
-    if (mod && e.shiftKey && (e.key === 'n' || e.key === 'N')) {
-      stop();
-      createFolder(defaultTargetFolder());
-      return;
-    }
-    if (mod && (e.key === 'a' || e.key === 'A')) { stop(); setSelection(new Set(order)); return; }
-    if (mod && (e.key === 'c' || e.key === 'C')) { stop(); copySelection('copy'); return; }
-    if (mod && (e.key === 'x' || e.key === 'X')) { stop(); copySelection('cut'); return; }
-    if (mod && (e.key === 'v' || e.key === 'V')) { stop(); pasteClipboard(); return; }
-    if (mod && (e.key === 'd' || e.key === 'D')) { stop(); duplicateSelection(); return; }
-    if (e.key === 'F2') { stop(); if (selected) setRenamingPath(selected); return; }
-    const isDelete = isMac ? (e.key === 'Backspace' && e.metaKey) : e.key === 'Delete';
-    if (isDelete) { stop(); deleteSelection(); return; }
-    if (e.key === 'Enter') { stop(); const a = find(selected); if (a) handleDoubleClick(a); return; }
-
-    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-      stop();
-      if (order.length === 0) return;
-      const idx = selected ? order.indexOf(selected) : -1;
-      const ni = e.key === 'ArrowDown'
-        ? (idx < 0 ? 0 : Math.min(order.length - 1, idx + 1))
-        : (idx < 0 ? 0 : Math.max(0, idx - 1));
-      const np = order[ni];
-      const a = find(np);
-      if (!a) return;
-      if (e.shiftKey && anchorRef.current) {
-        const i0 = order.indexOf(anchorRef.current);
-        if (i0 >= 0) { const [lo, hi] = i0 <= ni ? [i0, ni] : [ni, i0]; setSelection(new Set(order.slice(lo, hi + 1))); }
-      } else {
-        setSelection(new Set([np])); anchorRef.current = np;
-      }
-      activate(a); scrollToPath(np);
-      return;
-    }
-
-    // Type-ahead: jump to the first visible item whose name starts with the
-    // recently-typed string (resets after 700ms of no typing).
-    if (e.key.length === 1 && !mod && !e.altKey) {
-      const now = performance.now();
-      const ta = typeAheadRef.current;
-      if (now - ta.t > 700) ta.str = '';
-      ta.str += e.key.toLowerCase();
-      ta.t = now;
-      const match = order.find((p) => {
-        const a = assets.find((x) => x.path === p);
-        return !!a && (a.name.toLowerCase().startsWith(ta.str) || splitAssetPath(p).base.toLowerCase().startsWith(ta.str));
-      });
-      if (match) {
-        const a = assets.find((x) => x.path === match)!;
-        setSelection(new Set([match])); anchorRef.current = match; activate(a); scrollToPath(match);
+    switch (command.kind) {
+      case 'none':
+      case 'handled':
+        return;
+      case 'new-folder': createFolder(defaultTargetFolder()); return;
+      case 'clipboard':
+        if (command.op === 'paste') pasteClipboard(); else copySelection(command.op);
+        return;
+      case 'duplicate': duplicateSelection(); return;
+      case 'delete': deleteSelection(); return;
+      case 'rename': if (command.path) setRenamingPath(command.path); return;
+      case 'open': { const a = find(command.path); if (a) handleDoubleClick(a); return; }
+      case 'select': {
+        if (command.paths) setSelection(new Set(command.paths));
+        if (command.anchor !== undefined) anchorRef.current = command.anchor;
+        const a = find(command.activate); if (a) activate(a);
+        if (command.scrollTo) scrollToPath(command.scrollTo);
+        return;
       }
     }
-  }, [selected, assets, createFolder, copySelection, pasteClipboard, duplicateSelection, deleteSelection, handleDoubleClick, activate, scrollToPath]);
+  }, [selected, assets, createFolder, defaultTargetFolder, copySelection, pasteClipboard, duplicateSelection, deleteSelection, handleDoubleClick, activate, scrollToPath]);
 
   const ctxMenuItems = useCallback((asset: AssetEntry): ContextMenuItem[] => {
     const items: ContextMenuItem[] = [];
@@ -1573,46 +1533,12 @@ export default function Assets() {
 
   // Sliced sprites are nested UNDER their source texture (Unity-style sub-assets),
   // not shown as standalone rows — index them by parent texture GUID.
-  const spritesByTexture = useMemo(() => {
-    const m = new Map<string, AssetEntry[]>();
-    for (const a of assets) {
-      if (a.type !== 'sprite' || !a.sprite?.texture) continue;
-      const arr = m.get(a.sprite.texture); if (arr) arr.push(a); else m.set(a.sprite.texture, [a]);
-    }
-    return m;
-  }, [assets]);
-
-  // Filtered assets — search text AND (when any chip is active) the type filter.
-  // Sprites are always excluded from the flat lists (they render as texture children).
-  const filtered = useMemo(() => {
-    const q = filter.toLowerCase();
-    const hasType = typeFilter.size > 0;
-    return assets.filter((a) => {
-      if (a.type === 'sprite') return false;
-      if (hasType && !typeFilter.has(a.type)) return false;
-      if (q && !a.name.toLowerCase().includes(q) && !a.path.toLowerCase().includes(q)) return false;
-      return true;
-    });
-  }, [assets, filter, typeFilter]);
-
-  // Total assets that CAN appear in the flat list. Sliced sprites are nested under
-  // their source texture (never listed standalone), so they're excluded here too —
-  // otherwise the footer compares `filtered` (no sprites) against a sprite-inflated
-  // `assets.length` and is stuck on "N of M assets" forever once any texture is sliced.
-  const flatTotal = useMemo(() => assets.reduce((n, a) => n + (a.type === 'sprite' ? 0 : 1), 0), [assets]);
-
-  // Category view: group by type, ordered by the shared canonical type order (so
-  // the section order matches the type-filter menu). A Map preserves insertion
-  // order, so inserting sorted keys makes both the render and visiblePaths (which
-  // iterate `grouped`) walk the sections in canonical order.
-  const grouped = useMemo(() => {
-    const m = new Map<string, AssetEntry[]>();
-    for (const a of filtered) {
-      if (!m.has(a.type)) m.set(a.type, []);
-      m.get(a.type)!.push(a);
-    }
-    return new Map([...m.entries()].sort((x, y) => compareAssetTypes(x[0], y[0])));
-  }, [filtered]);
+  // The list-shaping decisions live in assetListing.ts (#105 Phase 3) — pure, and
+  // unit-tested there rather than only through e2e.
+  const spritesByTexture = useMemo(() => spritesByTextureOf(assets), [assets]);
+  const filtered = useMemo(() => filterAssets(assets, filter, typeFilter), [assets, filter, typeFilter]);
+  const flatTotal = useMemo(() => flatAssetTotal(assets), [assets]);
+  const grouped = useMemo(() => groupByType(filtered), [filtered]);
 
   // Folder view: build tree (seeded with empty pending folders)
   const folderTree = useMemo(() => buildFolderTree(filtered, [...pendingFolders, ...diskFolders]), [filtered, pendingFolders, diskFolders]);
@@ -1621,28 +1547,11 @@ export default function Assets() {
   const assetsRoot = useMemo(() => effectiveAssetsRoot(folderTree), [folderTree]);
 
   // Visible asset paths in on-screen order — drives shift-range + arrow-key
-  // navigation and Cmd+A. Mirrors the render: category groups in insertion
-  // order (only expanded ones), or a DFS of the folder tree (children before
-  // files, only under expanded nodes).
-  const visiblePaths = useMemo(() => {
-    const out: string[] = [];
-    if (viewMode === 'category') {
-      for (const [type, items] of grouped) {
-        if (expanded.has(type)) for (const a of items) out.push(a.path);
-      }
-    } else if (expanded.has(ASSETS_SECTION)) {
-      // The "Assets" section header sits above the tree; its children render at
-      // depth 1, so nav walks the collapsed root's children/files directly.
-      const walk = (node: FolderNode) => {
-        if (!expanded.has(node.path)) return;
-        for (const c of node.children) walk(c);
-        for (const f of node.files) out.push(f.path);
-      };
-      for (const c of assetsRoot.children) walk(c);
-      for (const f of assetsRoot.files) out.push(f.path);
-    }
-    return out;
-  }, [viewMode, grouped, assetsRoot, expanded]);
+  // navigation and Cmd+A. Must mirror the render; see assetListing.visibleOrder.
+  const visiblePaths = useMemo(
+    () => visibleOrder({ viewMode, grouped, assetsRoot, expanded }),
+    [viewMode, grouped, assetsRoot, expanded],
+  );
   useEffect(() => { visiblePathsRef.current = visiblePaths; }, [visiblePaths]);
 
   return (

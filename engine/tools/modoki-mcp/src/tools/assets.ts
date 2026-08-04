@@ -170,12 +170,15 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     'Add ONE item to a timeline track (creates the track if absent) — the granular way to build a ' +
       'cutscene. `trackType` picks the lane; `item` is the per-kind body: animation → ' +
       '{start,duration?,clip(NAME in the target animator bank),scrub?} · signal → {t,action(UIAction),params?} · ' +
-      'audio → {t,clip(audio GUID),bus?,volume?,pitch?} · activation → {start,end}. Applies live; saves ' +
+      'audio → {t,clip(audio GUID),bus?,volume?,pitch?} · activation → {start,end} · ' +
+      'control → {start,duration?,prefab(GUID)|particle:true|subdirector:true} · ' +
+      'video → {start,duration?,clip(video GUID)} (the target needs a VideoPlayer; a video clip is ' +
+      'started at `start` and paused at start+duration, never scrubbed). Applies live; saves ' +
       'the write PARKED in the dirty-asset registry (persistence is manual) until ' +
       'modoki_save_all.',
     {
       timelinePath: z.string().describe("Asset-root URL of the .timeline.json, e.g. '/assets/timelines/intro.timeline.json'."),
-      trackType: z.enum(['animation', 'signal', 'audio', 'activation']),
+      trackType: z.enum(['animation', 'signal', 'audio', 'activation', 'control', 'video']),
       target: z.string().optional().describe('Relative name-path from the Director root (default "" = root).'),
       item: z.record(z.any()).describe('The per-kind item body (see description).'),
       save: SAVE_PARAM,

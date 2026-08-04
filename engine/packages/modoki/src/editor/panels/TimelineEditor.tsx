@@ -55,6 +55,7 @@ function newTrack(kind: TrackKind): TrackDef {
     case 'audio': return { ...base, type: 'audio', cues: [] };
     case 'activation': return { ...base, type: 'activation', spans: [] };
     case 'control': return { ...base, type: 'control', clips: [] };
+    case 'video': return { ...base, type: 'video', clips: [] };
   }
 }
 

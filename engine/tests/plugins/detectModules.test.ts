@@ -147,6 +147,36 @@ describe('resolveModules', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('render3d'));
   });
 
+  it("detects video from a VideoPlayer trait — the one signal every video path needs", () => {
+    // A 2D sprite or a 3D screen showing video, and a Timeline video track's target, all
+    // require the trait to have an element at all. So one signal covers every surface.
+    const root = makeProject({ 'main.json': { entities: [ent({ VideoPlayer: { clip: 'g' } })] } });
+    expect(resolveModules(DEFAULT_PROJECT_CONFIG.build.modules, root).video).toBe(true);
+  });
+
+  it("'auto' resolves video OFF on a playable build even when the scenes use it", () => {
+    // A ≤5 MB MRAID bundle and a video file are close to mutually exclusive, so video has to
+    // be opted INTO for a playable rather than detected into it.
+    const root = makeProject({ 'main.json': { entities: [ent({ VideoPlayer: { clip: 'g' } })] } });
+    const cfg = DEFAULT_PROJECT_CONFIG.build.modules;
+    expect(resolveModules(cfg, root).video).toBe(true);                        // web
+    expect(resolveModules(cfg, root, { playable: true }).video).toBe(false);   // playable
+  });
+
+  it('an explicit video:true still wins on a playable — defaulted off, not removed', () => {
+    // A 400 KB stinger is a legitimate thing to want in an ad.
+    const root = makeProject({ 'main.json': { entities: [ent({ Renderable3D: {} })] } });
+    const flags = resolveModules({ ...DEFAULT_PROJECT_CONFIG.build.modules, video: true }, root, { playable: true });
+    expect(flags.video).toBe(true);
+  });
+
+  it('the playable default touches ONLY video, not every auto module', () => {
+    const root = makeProject({ 'main.json': { entities: [ent({ Renderable3D: {}, EntityAttributes: { layer: '3d' } })] } });
+    const flags = resolveModules(DEFAULT_PROJECT_CONFIG.build.modules, root, { playable: true });
+    expect(flags.render3d).toBe(true);
+    expect(flags.video).toBe(false);
+  });
+
   it('does NOT warn when a forced-off module is genuinely unused', () => {
     const root = makeProject({ 'main.json': { entities: [ent({ Renderable3D: {} })] } });
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -160,7 +190,7 @@ describe('mergeProjectConfig — build.modules', () => {
     const cfg = mergeProjectConfig(null);
     expect(cfg.build.modules).toEqual({
       render3d: 'auto', render2d: 'auto', physics2d: 'auto',
-      physics3d: 'auto', npr: 'auto', gpuParticles: 'auto',
+      physics3d: 'auto', npr: 'auto', gpuParticles: 'auto', video: 'auto',
     });
   });
 

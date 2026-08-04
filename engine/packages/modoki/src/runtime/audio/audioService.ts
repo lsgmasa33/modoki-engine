@@ -167,7 +167,69 @@ const busVolumes: Record<BusName, number> = { master: 1, music: 1, sfx: 1, ui: 1
  *  any streaming source whose `HTMLMediaElement.play()` was gesture-rejected — a
  *  buffer source scheduled while suspended sounds on resume, but a paused media
  *  element must be re-kicked or it stays silent forever. */
+/** Subsystems that also need the first-user-gesture signal (video: an
+ *  `HTMLVideoElement` whose `play()` was autoplay-blocked needs exactly the same
+ *  re-kick as a streamed audio clip). They register here rather than each hooking
+ *  the DOM themselves, so there is ONE definition of "the user has now interacted"
+ *  — App.tsx calls `audioResume()` and everything unlocks together. */
+type GestureUnlockListener = () => void;
+const gestureUnlockListeners = new Set<GestureUnlockListener>();
+
+/** Register a listener fired on the first user gesture. Returns an unregister fn. */
+export function onGestureUnlock(fn: GestureUnlockListener): () => void {
+  gestureUnlockListeners.add(fn);
+  return () => { gestureUnlockListeners.delete(fn); };
+}
+
+/** Route a caller-owned media element's audio through the engine's bus graph.
+ *
+ *  For VIDEO: the picture is the caller's, the sound is ours. Without this a video's
+ *  audio bypasses the mix entirely — a player who muted SFX in settings would still
+ *  hear the cutscene. Returns a detach fn plus a volume setter.
+ *
+ *  ⚠️ `createMediaElementSource` may be called ONCE per element, ever. Call this once
+ *  per element and keep the returned handle; re-attaching throws.
+ *
+ *  Returns null when there is no audio graph (headless/inert) — callers MUST treat
+ *  that as "play anyway, unrouted", never as a failure to play. Video playback does
+ *  not depend on the audio subsystem existing. */
+export function attachMediaElementToBus(
+  el: HTMLMediaElement, bus: BusName = 'sfx', volume = 1,
+): { setVolume(v: number): void; detach(): void } | null {
+  const g = graphOrNull();
+  if (!g) return null;
+  try {
+    const gain = g.ctx.createGain();
+    gain.gain.value = volume;
+    const src = g.ctx.createMediaElementSource(el);
+    src.connect(gain);
+    gain.connect(busNode(g, bus));
+    return {
+      setVolume(v: number) { gain.gain.value = v; },
+      detach() {
+        try { src.disconnect(); } catch { /* already gone */ }
+        try { gain.disconnect(); } catch { /* already gone */ }
+      },
+    };
+  } catch {
+    // Already-attached element, or an unsupported context — unrouted audio still
+    // plays through the element itself, which beats not playing at all.
+    return null;
+  }
+}
+
 export function resume(): void {
+  // Fire the gesture listeners FIRST, and unconditionally.
+  //
+  // "The user has interacted" is not an audio fact — it is a document fact. This used
+  // to sit at the bottom of the function, below the `recording()` early-return, which
+  // meant that on any platform WITHOUT Web Audio (`recording()` is true when
+  // `hasAudioSupport()` is false) the signal never fired at all. Harmless for audio,
+  // since there is nothing to unlock — but VIDEO does not need Web Audio to play, so
+  // it would have sat behind the autoplay block forever on exactly those devices.
+  for (const fn of gestureUnlockListeners) {
+    try { fn(); } catch { /* a subsystem's retry must not break the unlock */ }
+  }
   if (recording()) { log.push({ op: 'resume' }); return; }
   const g = graphOrNull();
   if (g && g.ctx.state === 'suspended') {

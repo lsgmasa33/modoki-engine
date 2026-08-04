@@ -67,6 +67,15 @@ const MIME: Record<string, string> = {
   '.wav': 'audio/wav',
   '.ogg': 'audio/ogg',
   '.flac': 'audio/flac',
+  // Video (mirror the scanner's VIDEO_EXTS). Video is DCE'd out of a playable build by
+  // default (build.modules), but if a game opts it in the MIME must be right for the
+  // same reason as `stream` audio: the bytes become a `blob:` fed to a media element,
+  // and a strict WKWebView rejects an `application/octet-stream` blob outright.
+  '.mp4': 'video/mp4',
+  '.mov': 'video/quicktime',
+  '.m4v': 'video/x-m4v',
+  '.webm': 'video/webm',
+  '.mkv': 'video/x-matroska',
 };
 const mimeFor = (p: string): string => MIME[path.extname(p).toLowerCase()] || 'application/octet-stream';
 

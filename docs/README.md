@@ -30,6 +30,7 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 | [animation.md](./animation.md) | Animation runtime — keyframe clips (`.anim.json`), 3D skeletal + mixer, hand-posable bones, `SkinnedMeshRenderer`, animsets, 2D flipbook |
 | [2d-skinning.md](./2d-skinning.md) | 2D sprite skinning — `Bone2D` rigs, `.rig2d.json` meshes, CPU LBS deform, 2.5D billboard/flat rendering, auto-rig |
 | [particles.md](./particles.md) | Particle runtime — `.particle.json` schema, CPU/TSL + GPU-compute Three.js backends, PixiJS 2D backend, shared sim math |
+| [video.md](./video.md) | Video playback — H.264/mp4 asset kind, 3D/2D/fullscreen surfaces, `timeScale` coupling, remote delivery + LRU cache, Timeline video track |
 
 ## Gameplay Systems
 
@@ -87,6 +88,7 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 
 | Doc | What it is |
 |---|---|
+| [low-end-device-support.md](./plans/low-end-device-support.md) | Make a game DEGRADE on weak hardware instead of going black — GPU context-loss recovery (today it's detected, logged, and permanent), a device-capability probe, auto quality tiers, and the draw-call/CPU work that is the actual framerate. Evidence measured on a 1.8 GB Android (sling, 2026-08-04): context lost during boot, and the texture pass that fixed memory changed fps by exactly nothing |
 | [api-reference-usability-plan.md](./plans/api-reference-usability-plan.md) | Make the generated TypeDoc API reference usable — kind-subgrouped sidebar, manager interfaces documenting their methods, and an editorial "Essential" whitelist that ranks the 877-symbol surface without hiding any of it |
 | [editor-shipping-plan.md](./plans/editor-shipping-plan.md) | Ship the editor as a consumer DMG/Windows installer — keep bundled Vite, end users build iOS+Android via a Unity-Hub-style Build Support dialog, dev/prod toolchain parity, phased roadmap (5 demos published, Windows NSIS installer built + tested; native-prebuild audit + code signing still open) |
 | [engine-oss-publishing.md](./engine-oss-publishing.md) | Reference (graduated, private) — how the engine is published as the Apache-2.0 `modoki-engine` public mirror: curated one-way snapshots, the blocking secret/brand safety scan, Harmony CLA, signed mac/Windows release CI. Cited by `publish-engine-oss.sh`, `scan-publish-safety.mjs`, `vite.config.ts` |

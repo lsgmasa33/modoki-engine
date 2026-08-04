@@ -5,6 +5,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { healNativeConfig, androidSdkDirValue } from '../../plugins/healNativeConfig';
+// Read the floors from the schema rather than hardcoding them: this file asserts the WIRING
+// (the default reaches the heal at all). The floor VALUES are pinned, deliberately and with
+// their rationale, in tests/architecture/buildTargetFloor.test.ts — duplicating them here
+// would mean a reviewed floor change had to be edited in two places.
+import { DEFAULT_PROJECT_CONFIG } from '../../project-config';
 
 let root: string;
 let savedToolchainDir: string | undefined;
@@ -533,5 +538,239 @@ describe('healNativeConfig — orientation + status bar', () => {
     const out = fs.readFileSync(manifestPath(), 'utf8');
     expect(out).toContain('android:screenOrientation="portrait"');
     expect(out).not.toContain('android:screenOrientation="landscape"');
+  });
+
+  // `statusBarHidden` was honoured ONLY on iOS, so every Android game shipped with the clock bar
+  // AND the back/home/recents bar drawn over it — the config field's own contract promised an
+  // Android fullscreen flag that nothing implemented. Observed on a real device (sling, 2026-08-04).
+  describe('Android immersive fullscreen', () => {
+    const SCAFFOLD = [
+      'package com.example.app;',
+      '',
+      'import com.getcapacitor.BridgeActivity;',
+      '',
+      'public class MainActivity extends BridgeActivity {}',
+      '',
+    ].join('\n');
+    function activityPath() {
+      return path.join(root, 'android', 'app', 'src', 'main', 'java', 'com', 'example', 'app', 'MainActivity.java');
+    }
+    function writeActivity(src = SCAFFOLD) {
+      fs.mkdirSync(path.dirname(activityPath()), { recursive: true });
+      fs.writeFileSync(activityPath(), src);
+    }
+
+    it('hides BOTH bars — the nav bar too, not just the status bar', () => {
+      writeActivity();
+      writeCapConfig({ statusBarHidden: true });
+      healNativeConfig(root);
+      const out = fs.readFileSync(activityPath(), 'utf8');
+      // systemBars() covers status + navigation; a status-bar-only fix would leave the nav bar up.
+      expect(out).toContain('WindowInsetsCompat.Type.systemBars()');
+      expect(out).toContain('BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE');
+      expect(out).toContain('import androidx.core.view.WindowInsetsControllerCompat;');
+    });
+
+    // Hiding once in onCreate is not enough: the bars return on every focus regain.
+    it('re-applies on focus regain', () => {
+      writeActivity();
+      writeCapConfig({ statusBarHidden: true });
+      healNativeConfig(root);
+      const out = fs.readFileSync(activityPath(), 'utf8');
+      expect(out).toContain('public void onWindowFocusChanged(boolean hasFocus)');
+      expect(out).toContain('if (hasFocus) applyImmersiveMode();');
+    });
+
+    it('is idempotent — a second heal is a byte-for-byte no-op', () => {
+      writeActivity();
+      writeCapConfig({ statusBarHidden: true });
+      healNativeConfig(root);
+      const once = fs.readFileSync(activityPath(), 'utf8');
+      healNativeConfig(root);
+      expect(fs.readFileSync(activityPath(), 'utf8')).toBe(once);
+      // and the imports were not duplicated by the second pass
+      expect(once.match(/import androidx\.core\.view\.WindowCompat;/g)).toHaveLength(1);
+    });
+
+    it('removes the block (and its imports) when statusBarHidden goes false', () => {
+      writeActivity();
+      writeCapConfig({ statusBarHidden: true });
+      healNativeConfig(root);
+      writeCapConfig({ statusBarHidden: false });
+      healNativeConfig(root);
+      const out = fs.readFileSync(activityPath(), 'utf8');
+      expect(out).not.toContain('applyImmersiveMode');
+      expect(out).not.toContain('androidx.core.view.WindowCompat');
+      expect(out).toContain('public class MainActivity extends BridgeActivity {}');
+    });
+
+    // A game may legitimately own its MainActivity; a regex rewrite must never eat that.
+    it('leaves a hand-edited MainActivity ALONE and says so', () => {
+      const custom = SCAFFOLD.replace(
+        'public class MainActivity extends BridgeActivity {}',
+        'public class MainActivity extends BridgeActivity {\n    // my own code\n}',
+      );
+      writeActivity(custom);
+      writeCapConfig({ statusBarHidden: true });
+      const { notes } = healNativeConfig(root);
+      expect(fs.readFileSync(activityPath(), 'utf8')).toBe(custom);
+      expect(notes.join(' ')).toMatch(/SKIPPED/);
+    });
+
+    it('does nothing when the project has no android/ folder', () => {
+      writeCapConfig({ statusBarHidden: true });
+      expect(() => healNativeConfig(root)).not.toThrow();
+    });
+  });
+
+  // The native floor and the JS bundle floor were independent hardcoded numbers that
+  // DISAGREED (pbxproj 15.0 vs a bundle needing 15.4), so a 15.0-15.3 device could install
+  // the app and then die on a missing runtime API. One config value now drives both.
+  describe('iOS deployment target', () => {
+    const PBX = [
+      '// !$*UTF8*$!',
+      '{ objects = {',
+      '  AAA /* Debug */ = { buildSettings = { IPHONEOS_DEPLOYMENT_TARGET = 15.0; }; };',
+      '  BBB /* Release */ = { buildSettings = { IPHONEOS_DEPLOYMENT_TARGET = 15.0; }; };',
+      '}; }',
+      '',
+    ].join('\n');
+    function pbxPath() { return path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj'); }
+    function writePbx() {
+      fs.mkdirSync(path.dirname(pbxPath()), { recursive: true });
+      fs.writeFileSync(pbxPath(), PBX);
+    }
+    function writeBuildCfg(build: Record<string, unknown>) {
+      fs.writeFileSync(path.join(root, 'project.config.json'), JSON.stringify({ build, capacitor: {} }));
+    }
+
+    it('syncs the deployment target from build.iosMinVersion', () => {
+      writePbx();
+      writeBuildCfg({ appleTeamId: '', iosMinVersion: '15.4' });
+      healNativeConfig(root);
+      expect(fs.readFileSync(pbxPath(), 'utf8')).toContain('IPHONEOS_DEPLOYMENT_TARGET = 15.4;');
+    });
+
+    // Release is the configuration that actually ships — healing only the first occurrence
+    // would leave it on the old floor.
+    it('rewrites EVERY build configuration, not just the first', () => {
+      writePbx();
+      writeBuildCfg({ appleTeamId: '', iosMinVersion: '15.4' });
+      healNativeConfig(root);
+      const out = fs.readFileSync(pbxPath(), 'utf8');
+      expect(out.match(/IPHONEOS_DEPLOYMENT_TARGET = 15\.4;/g)).toHaveLength(2);
+      expect(out).not.toContain('15.0');
+    });
+
+    it('is idempotent', () => {
+      writePbx();
+      writeBuildCfg({ appleTeamId: '', iosMinVersion: '15.4' });
+      healNativeConfig(root);
+      const once = fs.readFileSync(pbxPath(), 'utf8');
+      healNativeConfig(root);
+      expect(fs.readFileSync(pbxPath(), 'utf8')).toBe(once);
+    });
+
+    // Nothing validates numeric config (#39); junk must not become `IPHONEOS_DEPLOYMENT_TARGET = banana;`
+    it('leaves the project ALONE on a junk version', () => {
+      writePbx();
+      writeBuildCfg({ appleTeamId: '', iosMinVersion: 'banana' });
+      healNativeConfig(root);
+      expect(fs.readFileSync(pbxPath(), 'utf8')).toBe(PBX);
+    });
+  });
+
+  // The Android sibling of 'iOS deployment target' above — cap add scaffolds minSdkVersion 24
+  // and nothing revisits it, so without this heal the floor drifts per-project.
+  describe('Android minSdk', () => {
+    const GRADLE = [
+      'ext {',
+      '    minSdkVersion = 24',
+      '    compileSdkVersion = 36',
+      '}',
+      '',
+    ].join('\n');
+    function gradlePath() { return path.join(root, 'android', 'variables.gradle'); }
+    function writeGradle() {
+      fs.mkdirSync(path.dirname(gradlePath()), { recursive: true });
+      fs.writeFileSync(gradlePath(), GRADLE);
+    }
+    function writeBuildCfg(build: Record<string, unknown>) {
+      fs.writeFileSync(path.join(root, 'project.config.json'), JSON.stringify({ build, capacitor: {} }));
+    }
+
+    it('syncs minSdkVersion from build.androidMinSdk', () => {
+      writeGradle();
+      writeBuildCfg({ appleTeamId: '', androidMinSdk: 31 });
+      healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('minSdkVersion = 31');
+    });
+
+    it('is idempotent', () => {
+      writeGradle();
+      writeBuildCfg({ appleTeamId: '', androidMinSdk: 31 });
+      healNativeConfig(root);
+      const once = fs.readFileSync(gradlePath(), 'utf8');
+      healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(once);
+    });
+
+    // Nothing validates numeric config (#39); junk must not become `minSdkVersion = banana`.
+    it('leaves the project ALONE on a junk (non-numeric) value', () => {
+      writeGradle();
+      writeBuildCfg({ appleTeamId: '', androidMinSdk: 'banana' });
+      healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(GRADLE);
+    });
+
+    it('leaves the project ALONE on an out-of-range value (0)', () => {
+      writeGradle();
+      writeBuildCfg({ appleTeamId: '', androidMinSdk: 0 });
+      healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(GRADLE);
+    });
+
+    it('does nothing when the project has no android/variables.gradle', () => {
+      writeBuildCfg({ appleTeamId: '', androidMinSdk: 31 });
+      expect(() => healNativeConfig(root)).not.toThrow();
+      expect(fs.existsSync(gradlePath())).toBe(false);
+    });
+  });
+
+  // THE PATH PRODUCTION ACTUALLY TAKES. Every test above hands the heal an explicit floor,
+  // but no project on disk sets `iosMinVersion`/`androidMinSdk` at all — all 22 inherit the
+  // schema default through `loadProjectConfig`. That makes the default-merge a load-bearing
+  // seam with a SILENT failure mode: if the field stopped being merged, the heal would receive
+  // `undefined`, fail its own `Number.isInteger` / regex validation, and return "leave the
+  // project alone" — indistinguishable from a healthy no-op. Nothing would throw, no test
+  // above would fail, and every project would quietly ship the Capacitor-scaffolded floor.
+  describe('schema defaults reach the heal (config that sets NO floor)', () => {
+    const PBX = [
+      '// !$*UTF8*$!',
+      '{ objects = {',
+      '  AAA /* Debug */ = { buildSettings = { IPHONEOS_DEPLOYMENT_TARGET = 15.0; }; };',
+      '}; }',
+      '',
+    ].join('\n');
+    const GRADLE = 'ext {\n    minSdkVersion = 24\n}\n';
+
+    it('applies BOTH floors from the schema when the project config omits them', () => {
+      const pbx = path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+      const gradle = path.join(root, 'android', 'variables.gradle');
+      fs.mkdirSync(path.dirname(pbx), { recursive: true });
+      fs.writeFileSync(pbx, PBX);
+      fs.mkdirSync(path.dirname(gradle), { recursive: true });
+      fs.writeFileSync(gradle, GRADLE);
+      // No build.iosMinVersion, no build.androidMinSdk — exactly what every real project ships.
+      fs.writeFileSync(path.join(root, 'project.config.json'), JSON.stringify({ build: {}, capacitor: {} }));
+
+      healNativeConfig(root);
+
+      expect(fs.readFileSync(pbx, 'utf8')).toContain(`IPHONEOS_DEPLOYMENT_TARGET = ${DEFAULT_PROJECT_CONFIG.build.iosMinVersion};`);
+      expect(fs.readFileSync(gradle, 'utf8')).toContain(`minSdkVersion = ${DEFAULT_PROJECT_CONFIG.build.androidMinSdk}`);
+      // Assert the scaffolded values are actually GONE, not merely co-present.
+      expect(fs.readFileSync(pbx, 'utf8')).not.toContain('15.0');
+      expect(fs.readFileSync(gradle, 'utf8')).not.toContain('minSdkVersion = 24');
+    });
   });
 });

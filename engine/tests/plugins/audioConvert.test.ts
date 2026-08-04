@@ -9,7 +9,10 @@ vi.mock('child_process', () => {
   return { execFileSync, default: { execFileSync } };
 });
 
-import { buildFfmpegArgs, ensureFfmpeg, __resetFfmpegCheck } from '../../plugins/audio-convert';
+import { buildFfmpegArgs } from '../../plugins/audio-convert';
+// ensureFfmpeg moved to the shared ffmpeg-tool.ts when the video converter landed —
+// both converters resolve the CLI the same way.
+import { ensureFfmpeg, __resetFfmpegCheck } from '../../plugins/ffmpeg-tool';
 import { DEFAULT_AUDIO_SETTINGS } from '../../packages/modoki/src/runtime/loaders/audioSettings';
 
 const S = DEFAULT_AUDIO_SETTINGS;

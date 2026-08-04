@@ -1,726 +1,364 @@
 {
- "id": "25a9aa9b-bd05-4403-b474-f28a5502afd0",
- "version": 9,
- "createdAt": "2026-07-02T06:00:00.000Z",
- "resources": [],
- "entities": [
-  {
-   "id": 1,
-   "name": "Camera",
-   "traits": {
-    "Transform": {
-     "x": 0,
-     "y": 0,
-     "z": 0,
-     "rx": 0,
-     "ry": 0,
-     "rz": 0,
-     "sx": 1,
-     "sy": 1,
-     "sz": 1
+  "id": "25a9aa9b-bd05-4403-b474-f28a5502afd0",
+  "version": 12,
+  "createdAt": "2026-07-02T06:00:00.000Z",
+  "resources": [],
+  "entities": [
+    {
+      "name": "Camera",
+      "traits": {
+        "Transform": {},
+        "Camera": {
+          "fov": 50,
+          "far": 1000,
+          "overlayDistance": 10,
+          "clearColor": 921114
+        },
+        "EntityAttributes": {
+          "name": "Camera",
+          "parentId": "",
+          "layer": "3d",
+          "guid": "e6996373-44f0-447c-92fd-79a513697a35"
+        }
+      }
     },
-    "Camera": {
-     "fov": 50,
-     "near": 0.1,
-     "far": 1000,
-     "overlayDistance": 10,
-     "clearColor": 921114
+    {
+      "name": "Physics2D",
+      "traits": {
+        "Physics2D": {
+          "gravityY": 15
+        },
+        "EntityAttributes": {
+          "name": "Physics2D",
+          "parentId": "",
+          "guid": "a5ebb8b4-6486-46a5-a0c6-38b90cd20bec"
+        }
+      }
     },
-    "EntityAttributes": {
-     "name": "Camera",
-     "isActive": true,
-     "sortOrder": 0,
-     "parentId": "",
-     "layer": "3d",
-     "guid": "e6996373-44f0-447c-92fd-79a513697a35"
+    {
+      "name": "Playground",
+      "traits": {
+        "RenderableUI": true,
+        "EntityAttributes": {
+          "name": "Playground",
+          "parentId": "",
+          "layer": "ui",
+          "guid": "41591727-2384-43e2-9665-ef48d0905c4e"
+        },
+        "UIElement": {
+          "width": 100,
+          "height": 100,
+          "overflow": "hidden",
+          "backgroundColor": 1315880,
+          "backgroundOpacity": 1,
+          "borderColor": 3359829
+        },
+        "Canvas2D": {
+          "referenceWidth": 1000,
+          "referenceHeight": 1000,
+          "scaleMode": "contain"
+        },
+        "UIAnchor": {
+          "safeArea": false
+        }
+      }
+    },
+    {
+      "name": "Floor",
+      "traits": {
+        "Transform": {
+          "x": 500,
+          "y": 880
+        },
+        "Renderable2D": {
+          "sprite": "square",
+          "color": 5923954,
+          "width": 460
+        },
+        "RigidBody2D": {
+          "bodyType": "static",
+          "angularDamping": 0.05
+        },
+        "Collider2D": {
+          "radius": 0,
+          "halfW": 460,
+          "halfH": 20,
+          "friction": 0.8,
+          "restitution": 0.1,
+          "physicsLayer": "Ground"
+        },
+        "EntityAttributes": {
+          "name": "Floor",
+          "parentId": "41591727-2384-43e2-9665-ef48d0905c4e",
+          "layer": "2d",
+          "guid": "7d87b283-617f-422c-a6b8-ca9b2e3d838f"
+        }
+      }
+    },
+    {
+      "name": "Table",
+      "traits": {
+        "Transform": {
+          "x": 230,
+          "y": 220
+        },
+        "RigidBody2D": {
+          "angularDamping": 0.4
+        },
+        "EntityAttributes": {
+          "name": "Table",
+          "parentId": "41591727-2384-43e2-9665-ef48d0905c4e",
+          "guid": "be8be74d-04d0-4784-bb19-c959fd887eb6"
+        }
+      }
+    },
+    {
+      "name": "Table · top",
+      "traits": {
+        "Transform": {
+          "y": -60
+        },
+        "Renderable2D": {
+          "sprite": "square",
+          "color": 15105570,
+          "width": 90,
+          "height": 12
+        },
+        "Collider2D": {
+          "radius": 0,
+          "halfW": 90,
+          "halfH": 12,
+          "friction": 0.6,
+          "restitution": 0.1
+        },
+        "EntityAttributes": {
+          "name": "Table · top",
+          "parentId": "be8be74d-04d0-4784-bb19-c959fd887eb6",
+          "layer": "2d",
+          "guid": "8f341453-23b6-4c25-9902-8f0ac35966d0"
+        }
+      }
+    },
+    {
+      "name": "Table · leg L",
+      "traits": {
+        "Transform": {
+          "x": -70,
+          "y": 20
+        },
+        "Renderable2D": {
+          "sprite": "square",
+          "color": 15105570,
+          "width": 12,
+          "height": 60
+        },
+        "Collider2D": {
+          "radius": 0,
+          "halfW": 12,
+          "halfH": 60,
+          "friction": 0.6,
+          "restitution": 0.1
+        },
+        "EntityAttributes": {
+          "name": "Table · leg L",
+          "parentId": "be8be74d-04d0-4784-bb19-c959fd887eb6",
+          "layer": "2d",
+          "guid": "003d7537-de8e-496c-8864-e620ba315455"
+        }
+      }
+    },
+    {
+      "name": "Table · leg R",
+      "traits": {
+        "Transform": {
+          "x": 70,
+          "y": 20
+        },
+        "Renderable2D": {
+          "sprite": "square",
+          "color": 15105570,
+          "width": 12,
+          "height": 60
+        },
+        "Collider2D": {
+          "radius": 0,
+          "halfW": 12,
+          "halfH": 60,
+          "friction": 0.6,
+          "restitution": 0.1
+        },
+        "EntityAttributes": {
+          "name": "Table · leg R",
+          "parentId": "be8be74d-04d0-4784-bb19-c959fd887eb6",
+          "layer": "2d",
+          "guid": "03187cc3-5cc6-4c79-a8a8-7235467c34fd"
+        }
+      }
+    },
+    {
+      "name": "Cross",
+      "traits": {
+        "Transform": {
+          "x": 500,
+          "y": 160
+        },
+        "RigidBody2D": {
+          "angularDamping": 0.4
+        },
+        "EntityAttributes": {
+          "name": "Cross",
+          "parentId": "41591727-2384-43e2-9665-ef48d0905c4e",
+          "guid": "7e7ab43e-c596-425d-9abb-6789955f39e2"
+        }
+      }
+    },
+    {
+      "name": "Cross · horizontal",
+      "traits": {
+        "Transform": {},
+        "Renderable2D": {
+          "sprite": "square",
+          "color": 10181046,
+          "width": 80,
+          "height": 18
+        },
+        "Collider2D": {
+          "radius": 0,
+          "halfW": 80,
+          "halfH": 18,
+          "friction": 0.6,
+          "restitution": 0.1
+        },
+        "EntityAttributes": {
+          "name": "Cross · horizontal",
+          "parentId": "7e7ab43e-c596-425d-9abb-6789955f39e2",
+          "layer": "2d",
+          "guid": "b94abc3c-c056-4f5c-ab7c-481e3ab8ae04"
+        }
+      }
+    },
+    {
+      "name": "Cross · vertical",
+      "traits": {
+        "Transform": {},
+        "Renderable2D": {
+          "sprite": "square",
+          "color": 10181046,
+          "width": 18,
+          "height": 80
+        },
+        "Collider2D": {
+          "radius": 0,
+          "halfW": 18,
+          "halfH": 80,
+          "friction": 0.6,
+          "restitution": 0.1
+        },
+        "EntityAttributes": {
+          "name": "Cross · vertical",
+          "parentId": "7e7ab43e-c596-425d-9abb-6789955f39e2",
+          "layer": "2d",
+          "guid": "d93f7a9d-22d2-4a99-93cd-09e7bbbc4072"
+        }
+      }
+    },
+    {
+      "name": "Dumbbell",
+      "traits": {
+        "Transform": {
+          "x": 780,
+          "y": 150
+        },
+        "RigidBody2D": {
+          "angularDamping": 0.4
+        },
+        "EntityAttributes": {
+          "name": "Dumbbell",
+          "parentId": "41591727-2384-43e2-9665-ef48d0905c4e",
+          "guid": "7e9fb453-9456-40b9-b9d4-959ee2fb6b8d"
+        }
+      }
+    },
+    {
+      "name": "Dumbbell · bar",
+      "traits": {
+        "Transform": {},
+        "Renderable2D": {
+          "sprite": "square",
+          "color": 2600544,
+          "width": 70,
+          "height": 12
+        },
+        "Collider2D": {
+          "radius": 0,
+          "halfW": 70,
+          "halfH": 12,
+          "friction": 0.6,
+          "restitution": 0.1
+        },
+        "EntityAttributes": {
+          "name": "Dumbbell · bar",
+          "parentId": "7e9fb453-9456-40b9-b9d4-959ee2fb6b8d",
+          "layer": "2d",
+          "guid": "78f65468-20e6-401b-8d37-62ed16f9edd6"
+        }
+      }
+    },
+    {
+      "name": "Dumbbell · weight L",
+      "traits": {
+        "Transform": {
+          "x": -80
+        },
+        "Renderable2D": {
+          "sprite": "circle",
+          "color": 2600544,
+          "width": 30,
+          "height": 30
+        },
+        "Collider2D": {
+          "shape": "circle",
+          "radius": 30,
+          "halfW": 0,
+          "halfH": 0,
+          "friction": 0.6,
+          "restitution": 0.1
+        },
+        "EntityAttributes": {
+          "name": "Dumbbell · weight L",
+          "parentId": "7e9fb453-9456-40b9-b9d4-959ee2fb6b8d",
+          "layer": "2d",
+          "guid": "eef406cd-62f1-471e-93bd-ea31a070771c"
+        }
+      }
+    },
+    {
+      "name": "Dumbbell · weight R",
+      "traits": {
+        "Transform": {
+          "x": 80
+        },
+        "Renderable2D": {
+          "sprite": "circle",
+          "color": 2600544,
+          "width": 30,
+          "height": 30
+        },
+        "Collider2D": {
+          "shape": "circle",
+          "radius": 30,
+          "halfW": 0,
+          "halfH": 0,
+          "friction": 0.6,
+          "restitution": 0.1
+        },
+        "EntityAttributes": {
+          "name": "Dumbbell · weight R",
+          "parentId": "7e9fb453-9456-40b9-b9d4-959ee2fb6b8d",
+          "layer": "2d",
+          "guid": "70cff295-8fae-4a36-8031-987e68bf683b"
+        }
+      }
     }
-   }
-  },
-  {
-   "id": 2,
-   "name": "Physics2D",
-   "traits": {
-    "Physics2D": {
-     "gravityX": 0,
-     "gravityY": 15,
-     "pixelsPerMeter": 100
-    },
-    "EntityAttributes": {
-     "name": "Physics2D",
-     "isActive": true,
-     "sortOrder": 0,
-     "parentId": "",
-     "layer": "",
-     "guid": "a5ebb8b4-6486-46a5-a0c6-38b90cd20bec"
-    }
-   }
-  },
-  {
-   "id": 3,
-   "name": "Playground",
-   "traits": {
-    "RenderableUI": true,
-    "UIElement": {
-     "width": 100,
-     "height": 100,
-     "widthUnit": "%",
-     "heightUnit": "%",
-     "flexDirection": "column",
-     "flexWrap": "nowrap",
-     "justifyContent": "flex-start",
-     "alignItems": "stretch",
-     "gap": 0,
-     "flexGrow": 0,
-     "flexShrink": 1,
-     "paddingTop": 0,
-     "paddingTopUnit": "%",
-     "paddingLeft": 0,
-     "paddingLeftUnit": "%",
-     "paddingRight": 0,
-     "paddingRightUnit": "%",
-     "paddingBottom": 0,
-     "paddingBottomUnit": "%",
-     "marginTop": 0,
-     "marginTopUnit": "%",
-     "marginRight": 0,
-     "marginRightUnit": "%",
-     "marginBottom": 0,
-     "marginBottomUnit": "%",
-     "marginLeft": 0,
-     "marginLeftUnit": "%",
-     "minWidth": 0,
-     "minWidthUnit": "px",
-     "maxWidth": 0,
-     "maxWidthUnit": "px",
-     "minHeight": 0,
-     "minHeightUnit": "px",
-     "maxHeight": 0,
-     "maxHeightUnit": "px",
-     "alignSelf": "auto",
-     "zIndex": 0,
-     "overflow": "hidden",
-     "isVisible": true,
-     "backgroundColor": 1315880,
-     "backgroundOpacity": 1,
-     "borderRadius": 0,
-     "borderWidth": 0,
-     "borderColor": 3359829,
-     "opacity": 1,
-     "text": "",
-     "fontFamily": "",
-     "fontSize": 16,
-     "fontWeight": "normal",
-     "fontStyle": "normal",
-     "textColor": 16777215,
-     "textAlign": "left",
-     "lineHeight": 0,
-     "letterSpacing": 0,
-     "textShadowColor": 0,
-     "textShadowOffsetX": 0,
-     "textShadowOffsetY": 0,
-     "textShadowBlur": 0,
-     "textStrokeColor": 0,
-     "textStrokeWidth": 0,
-     "textOverflow": "clip",
-     "maxLines": 0,
-     "imageSrc": "",
-     "imageMode": "cover",
-     "elementType": "div",
-     "placeholder": "",
-     "rangeMin": 0,
-     "rangeMax": 100,
-     "rangeStep": 1
-    },
-    "Canvas2D": {
-     "referenceWidth": 1000,
-     "referenceHeight": 1000,
-     "scaleMode": "contain"
-    },
-    "UIAnchor": {
-     "anchor": "stretch",
-     "top": 0,
-     "topUnit": "px",
-     "left": 0,
-     "leftUnit": "px",
-     "right": 0,
-     "rightUnit": "px",
-     "bottom": 0,
-     "bottomUnit": "px",
-     "pivotX": 0,
-     "pivotY": 0,
-     "safeArea": false,
-     "zIndex": 0
-    },
-    "EntityAttributes": {
-     "name": "Playground",
-     "isActive": true,
-     "sortOrder": 0,
-     "parentId": "",
-     "layer": "ui",
-     "guid": "41591727-2384-43e2-9665-ef48d0905c4e"
-    }
-   }
-  },
-  {
-   "id": 4,
-   "name": "Floor",
-   "traits": {
-    "Transform": {
-     "x": 500,
-     "y": 880,
-     "z": 0,
-     "rx": 0,
-     "ry": 0,
-     "rz": 0,
-     "sx": 1,
-     "sy": 1,
-     "sz": 1
-    },
-    "Renderable2D": {
-     "sprite": "square",
-     "color": 5923954,
-     "opacity": 1.0,
-     "width": 460,
-     "height": 20,
-     "pivotX": 0.5,
-     "pivotY": 0.5,
-     "keepAspect": false,
-     "isVisible": true
-    },
-    "RigidBody2D": {
-     "bodyType": "static",
-     "linearDamping": 0,
-     "angularDamping": 0.05,
-     "gravityScale": 1.0,
-     "fixedRotation": false,
-     "ccd": false,
-     "canSleep": true
-    },
-    "Collider2D": {
-     "shape": "box",
-     "radius": 0,
-     "halfW": 460,
-     "halfH": 20,
-     "points": "",
-     "density": 1,
-     "friction": 0.8,
-     "restitution": 0.1,
-     "isSensor": false,
-     "physicsLayer": "Ground",
-     "collisionGroups": 65535,
-     "collisionMask": 65535
-    },
-    "EntityAttributes": {
-     "name": "Floor",
-     "isActive": true,
-     "sortOrder": 0,
-     "parentId": "41591727-2384-43e2-9665-ef48d0905c4e",
-     "layer": "2d",
-     "guid": "7d87b283-617f-422c-a6b8-ca9b2e3d838f"
-    }
-   }
-  },
-  {
-   "id": 5,
-   "name": "Table",
-   "traits": {
-    "Transform": {
-     "x": 230,
-     "y": 220,
-     "z": 0,
-     "rx": 0,
-     "ry": 0,
-     "rz": 0,
-     "sx": 1,
-     "sy": 1,
-     "sz": 1
-    },
-    "RigidBody2D": {
-     "bodyType": "dynamic",
-     "linearDamping": 0,
-     "angularDamping": 0.4,
-     "gravityScale": 1.0,
-     "fixedRotation": false,
-     "ccd": false,
-     "canSleep": true
-    },
-    "EntityAttributes": {
-     "name": "Table",
-     "isActive": true,
-     "sortOrder": 0,
-     "parentId": "41591727-2384-43e2-9665-ef48d0905c4e",
-     "layer": "",
-     "guid": "be8be74d-04d0-4784-bb19-c959fd887eb6"
-    }
-   }
-  },
-  {
-   "id": 6,
-   "name": "Table \u00b7 top",
-   "traits": {
-    "Transform": {
-     "x": 0,
-     "y": -60,
-     "z": 0,
-     "rx": 0,
-     "ry": 0,
-     "rz": 0,
-     "sx": 1,
-     "sy": 1,
-     "sz": 1
-    },
-    "Renderable2D": {
-     "sprite": "square",
-     "color": 15105570,
-     "opacity": 1.0,
-     "width": 90,
-     "height": 12,
-     "pivotX": 0.5,
-     "pivotY": 0.5,
-     "keepAspect": false,
-     "isVisible": true
-    },
-    "Collider2D": {
-     "shape": "box",
-     "radius": 0,
-     "halfW": 90,
-     "halfH": 12,
-     "points": "",
-     "density": 1,
-     "friction": 0.6,
-     "restitution": 0.1,
-     "isSensor": false,
-     "physicsLayer": "Default",
-     "collisionGroups": 65535,
-     "collisionMask": 65535
-    },
-    "EntityAttributes": {
-     "name": "Table \u00b7 top",
-     "isActive": true,
-     "sortOrder": 0,
-     "parentId": "be8be74d-04d0-4784-bb19-c959fd887eb6",
-     "layer": "2d",
-     "guid": "8f341453-23b6-4c25-9902-8f0ac35966d0"
-    }
-   }
-  },
-  {
-   "id": 7,
-   "name": "Table \u00b7 leg L",
-   "traits": {
-    "Transform": {
-     "x": -70,
-     "y": 20,
-     "z": 0,
-     "rx": 0,
-     "ry": 0,
-     "rz": 0,
-     "sx": 1,
-     "sy": 1,
-     "sz": 1
-    },
-    "Renderable2D": {
-     "sprite": "square",
-     "color": 15105570,
-     "opacity": 1.0,
-     "width": 12,
-     "height": 60,
-     "pivotX": 0.5,
-     "pivotY": 0.5,
-     "keepAspect": false,
-     "isVisible": true
-    },
-    "Collider2D": {
-     "shape": "box",
-     "radius": 0,
-     "halfW": 12,
-     "halfH": 60,
-     "points": "",
-     "density": 1,
-     "friction": 0.6,
-     "restitution": 0.1,
-     "isSensor": false,
-     "physicsLayer": "Default",
-     "collisionGroups": 65535,
-     "collisionMask": 65535
-    },
-    "EntityAttributes": {
-     "name": "Table \u00b7 leg L",
-     "isActive": true,
-     "sortOrder": 0,
-     "parentId": "be8be74d-04d0-4784-bb19-c959fd887eb6",
-     "layer": "2d",
-     "guid": "003d7537-de8e-496c-8864-e620ba315455"
-    }
-   }
-  },
-  {
-   "id": 8,
-   "name": "Table \u00b7 leg R",
-   "traits": {
-    "Transform": {
-     "x": 70,
-     "y": 20,
-     "z": 0,
-     "rx": 0,
-     "ry": 0,
-     "rz": 0,
-     "sx": 1,
-     "sy": 1,
-     "sz": 1
-    },
-    "Renderable2D": {
-     "sprite": "square",
-     "color": 15105570,
-     "opacity": 1.0,
-     "width": 12,
-     "height": 60,
-     "pivotX": 0.5,
-     "pivotY": 0.5,
-     "keepAspect": false,
-     "isVisible": true
-    },
-    "Collider2D": {
-     "shape": "box",
-     "radius": 0,
-     "halfW": 12,
-     "halfH": 60,
-     "points": "",
-     "density": 1,
-     "friction": 0.6,
-     "restitution": 0.1,
-     "isSensor": false,
-     "physicsLayer": "Default",
-     "collisionGroups": 65535,
-     "collisionMask": 65535
-    },
-    "EntityAttributes": {
-     "name": "Table \u00b7 leg R",
-     "isActive": true,
-     "sortOrder": 0,
-     "parentId": "be8be74d-04d0-4784-bb19-c959fd887eb6",
-     "layer": "2d",
-     "guid": "03187cc3-5cc6-4c79-a8a8-7235467c34fd"
-    }
-   }
-  },
-  {
-   "id": 9,
-   "name": "Cross",
-   "traits": {
-    "Transform": {
-     "x": 500,
-     "y": 160,
-     "z": 0,
-     "rx": 0,
-     "ry": 0,
-     "rz": 0,
-     "sx": 1,
-     "sy": 1,
-     "sz": 1
-    },
-    "RigidBody2D": {
-     "bodyType": "dynamic",
-     "linearDamping": 0,
-     "angularDamping": 0.4,
-     "gravityScale": 1.0,
-     "fixedRotation": false,
-     "ccd": false,
-     "canSleep": true
-    },
-    "EntityAttributes": {
-     "name": "Cross",
-     "isActive": true,
-     "sortOrder": 0,
-     "parentId": "41591727-2384-43e2-9665-ef48d0905c4e",
-     "layer": "",
-     "guid": "7e7ab43e-c596-425d-9abb-6789955f39e2"
-    }
-   }
-  },
-  {
-   "id": 10,
-   "name": "Cross \u00b7 horizontal",
-   "traits": {
-    "Transform": {
-     "x": 0,
-     "y": 0,
-     "z": 0,
-     "rx": 0,
-     "ry": 0,
-     "rz": 0,
-     "sx": 1,
-     "sy": 1,
-     "sz": 1
-    },
-    "Renderable2D": {
-     "sprite": "square",
-     "color": 10181046,
-     "opacity": 1.0,
-     "width": 80,
-     "height": 18,
-     "pivotX": 0.5,
-     "pivotY": 0.5,
-     "keepAspect": false,
-     "isVisible": true
-    },
-    "Collider2D": {
-     "shape": "box",
-     "radius": 0,
-     "halfW": 80,
-     "halfH": 18,
-     "points": "",
-     "density": 1,
-     "friction": 0.6,
-     "restitution": 0.1,
-     "isSensor": false,
-     "physicsLayer": "Default",
-     "collisionGroups": 65535,
-     "collisionMask": 65535
-    },
-    "EntityAttributes": {
-     "name": "Cross \u00b7 horizontal",
-     "isActive": true,
-     "sortOrder": 0,
-     "parentId": "7e7ab43e-c596-425d-9abb-6789955f39e2",
-     "layer": "2d",
-     "guid": "b94abc3c-c056-4f5c-ab7c-481e3ab8ae04"
-    }
-   }
-  },
-  {
-   "id": 11,
-   "name": "Cross \u00b7 vertical",
-   "traits": {
-    "Transform": {
-     "x": 0,
-     "y": 0,
-     "z": 0,
-     "rx": 0,
-     "ry": 0,
-     "rz": 0,
-     "sx": 1,
-     "sy": 1,
-     "sz": 1
-    },
-    "Renderable2D": {
-     "sprite": "square",
-     "color": 10181046,
-     "opacity": 1.0,
-     "width": 18,
-     "height": 80,
-     "pivotX": 0.5,
-     "pivotY": 0.5,
-     "keepAspect": false,
-     "isVisible": true
-    },
-    "Collider2D": {
-     "shape": "box",
-     "radius": 0,
-     "halfW": 18,
-     "halfH": 80,
-     "points": "",
-     "density": 1,
-     "friction": 0.6,
-     "restitution": 0.1,
-     "isSensor": false,
-     "physicsLayer": "Default",
-     "collisionGroups": 65535,
-     "collisionMask": 65535
-    },
-    "EntityAttributes": {
-     "name": "Cross \u00b7 vertical",
-     "isActive": true,
-     "sortOrder": 0,
-     "parentId": "7e7ab43e-c596-425d-9abb-6789955f39e2",
-     "layer": "2d",
-     "guid": "d93f7a9d-22d2-4a99-93cd-09e7bbbc4072"
-    }
-   }
-  },
-  {
-   "id": 12,
-   "name": "Dumbbell",
-   "traits": {
-    "Transform": {
-     "x": 780,
-     "y": 150,
-     "z": 0,
-     "rx": 0,
-     "ry": 0,
-     "rz": 0,
-     "sx": 1,
-     "sy": 1,
-     "sz": 1
-    },
-    "RigidBody2D": {
-     "bodyType": "dynamic",
-     "linearDamping": 0,
-     "angularDamping": 0.4,
-     "gravityScale": 1.0,
-     "fixedRotation": false,
-     "ccd": false,
-     "canSleep": true
-    },
-    "EntityAttributes": {
-     "name": "Dumbbell",
-     "isActive": true,
-     "sortOrder": 0,
-     "parentId": "41591727-2384-43e2-9665-ef48d0905c4e",
-     "layer": "",
-     "guid": "7e9fb453-9456-40b9-b9d4-959ee2fb6b8d"
-    }
-   }
-  },
-  {
-   "id": 13,
-   "name": "Dumbbell \u00b7 bar",
-   "traits": {
-    "Transform": {
-     "x": 0,
-     "y": 0,
-     "z": 0,
-     "rx": 0,
-     "ry": 0,
-     "rz": 0,
-     "sx": 1,
-     "sy": 1,
-     "sz": 1
-    },
-    "Renderable2D": {
-     "sprite": "square",
-     "color": 2600544,
-     "opacity": 1.0,
-     "width": 70,
-     "height": 12,
-     "pivotX": 0.5,
-     "pivotY": 0.5,
-     "keepAspect": false,
-     "isVisible": true
-    },
-    "Collider2D": {
-     "shape": "box",
-     "radius": 0,
-     "halfW": 70,
-     "halfH": 12,
-     "points": "",
-     "density": 1,
-     "friction": 0.6,
-     "restitution": 0.1,
-     "isSensor": false,
-     "physicsLayer": "Default",
-     "collisionGroups": 65535,
-     "collisionMask": 65535
-    },
-    "EntityAttributes": {
-     "name": "Dumbbell \u00b7 bar",
-     "isActive": true,
-     "sortOrder": 0,
-     "parentId": "7e9fb453-9456-40b9-b9d4-959ee2fb6b8d",
-     "layer": "2d",
-     "guid": "78f65468-20e6-401b-8d37-62ed16f9edd6"
-    }
-   }
-  },
-  {
-   "id": 14,
-   "name": "Dumbbell \u00b7 weight L",
-   "traits": {
-    "Transform": {
-     "x": -80,
-     "y": 0,
-     "z": 0,
-     "rx": 0,
-     "ry": 0,
-     "rz": 0,
-     "sx": 1,
-     "sy": 1,
-     "sz": 1
-    },
-    "Renderable2D": {
-     "sprite": "circle",
-     "color": 2600544,
-     "opacity": 1.0,
-     "width": 30,
-     "height": 30,
-     "pivotX": 0.5,
-     "pivotY": 0.5,
-     "keepAspect": false,
-     "isVisible": true
-    },
-    "Collider2D": {
-     "shape": "circle",
-     "radius": 30,
-     "halfW": 0,
-     "halfH": 0,
-     "points": "",
-     "density": 1,
-     "friction": 0.6,
-     "restitution": 0.1,
-     "isSensor": false,
-     "physicsLayer": "Default",
-     "collisionGroups": 65535,
-     "collisionMask": 65535
-    },
-    "EntityAttributes": {
-     "name": "Dumbbell \u00b7 weight L",
-     "isActive": true,
-     "sortOrder": 0,
-     "parentId": "7e9fb453-9456-40b9-b9d4-959ee2fb6b8d",
-     "layer": "2d",
-     "guid": "eef406cd-62f1-471e-93bd-ea31a070771c"
-    }
-   }
-  },
-  {
-   "id": 15,
-   "name": "Dumbbell \u00b7 weight R",
-   "traits": {
-    "Transform": {
-     "x": 80,
-     "y": 0,
-     "z": 0,
-     "rx": 0,
-     "ry": 0,
-     "rz": 0,
-     "sx": 1,
-     "sy": 1,
-     "sz": 1
-    },
-    "Renderable2D": {
-     "sprite": "circle",
-     "color": 2600544,
-     "opacity": 1.0,
-     "width": 30,
-     "height": 30,
-     "pivotX": 0.5,
-     "pivotY": 0.5,
-     "keepAspect": false,
-     "isVisible": true
-    },
-    "Collider2D": {
-     "shape": "circle",
-     "radius": 30,
-     "halfW": 0,
-     "halfH": 0,
-     "points": "",
-     "density": 1,
-     "friction": 0.6,
-     "restitution": 0.1,
-     "isSensor": false,
-     "physicsLayer": "Default",
-     "collisionGroups": 65535,
-     "collisionMask": 65535
-    },
-    "EntityAttributes": {
-     "name": "Dumbbell \u00b7 weight R",
-     "isActive": true,
-     "sortOrder": 0,
-     "parentId": "7e9fb453-9456-40b9-b9d4-959ee2fb6b8d",
-     "layer": "2d",
-     "guid": "70cff295-8fae-4a36-8031-987e68bf683b"
-    }
-   }
-  }
- ]
+  ]
 }

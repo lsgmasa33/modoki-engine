@@ -103,8 +103,10 @@ So the round trip is lossless, and a file records only what was actually *author
 
 The point is that **defaults stay live**. Writing every field out freezes a scene at the
 defaults of the day it was saved, so a later change to a trait default silently stops
-reaching it — a semantic change, not diff noise. (This is what kept the repo-wide
-legacy-scene migration on hold; owner's decision to omit, 2026-07-31.)
+reaching it — a semantic change, not diff noise. (Owner's decision to omit, 2026-07-31.)
+
+The repo-wide legacy-scene migration this decision had held up **was carried out on
+2026-08-04** — see "Re-saving legacy scenes" below.
 
 Three deliberate limits:
 
@@ -192,6 +194,67 @@ Migrations chain in `loadSceneFile.ts` and run before any entity spawns:
   `id` field entirely. This is the terminal step — it stamps `data.version =
   SCENE_FORMAT_VERSION`, so bumping the constant without chaining a new migration
   can't silently mislabel a freshly-migrated file as under-versioned
+
+### Re-saving legacy scenes (the sha-churn migration)
+
+A scene committed before the migrations above stays on disk in its old, verbose shape until
+something re-saves it — the loader migrates in memory, so nothing forces the issue. The cost is
+**sha churn**: the first incidental save rewrites the whole file (compaction, the `id` drop, the
+`rootInstanceId` GUID rewrite, a rebuilt `resources`), and a one-line edit arrives as a
+700-line diff that no reviewer can read.
+
+Carried out repo-wide on **2026-08-04**: 48 scenes across 20 projects. The pass **converges** —
+re-saving an already-migrated scene is byte-identical, verified across *fresh editor processes*
+(not merely within one session, which would not have proven the `rootInstanceId` GUID is
+persisted rather than re-minted per launch).
+
+Tooling, for the next time a serializer change makes the committed files stale:
+
+```bash
+engine/scripts/resave-scenes.sh games/sling demos/forest-camp   # load -> save every scene
+node engine/scripts/check-scene-churn.mjs games/sling demos/forest-camp   # REVIEW GATE
+```
+
+The check script is not optional. `save-all` persists the **live world**, so the pass is only
+safe where loading a scene is side-effect-free, and two projects proved it is not:
+
+- **`games/chess` — excluded (#124).** Its game code spawns on load; the save baked ~70 runtime
+  entities (move highlights, rank/file labels, pieces) plus a live progress-bar value into
+  `chess.scene.json`. This is the general hazard, not a chess quirk: **any** project whose
+  systems create entities before the first save is unsafe to sweep, because nothing distinguishes
+  an authored entity from a runtime-spawned one at save time. `games/llm-test` hit the smaller
+  half of it (live progress-bar values only, no spawned entities) and was kept, with the authored
+  values restored by hand.
+- **`games/space-invader` — excluded (#123).** The `resources` rebuild *dropped* a still-referenced
+  asset, because the ref lives on a game-specific trait (`SpaceInvaderAssets.catvaderAnim`), and
+  `collectResourceRefsFromEntities` walks refs from `REF_FIELDS_BY_TRAIT` — a closed, engine-only
+  map with no registration API, so a game trait's asset field is structurally invisible to it.
+  A shrinking manifest is a regression: the dropped asset becomes one the production build cannot
+  see ([build.md](build.md) "Assets the build cannot see"). A *growing* manifest is normally a fix
+  — the pass added genuinely-referenced assets that had been missing from several scenes.
+
+**The scaffolder template must stay canonical, and is guarded.** Migrating the existing scenes
+fixes the past; `engine/templates/starter` fixes the future, because it seeds every project made
+by `scaffold-project.mjs` and the editor's File → New Project. It was stamped `"version": 12`
+while still holding v11-era per-entity `id` fields, so every project ever scaffolded from it
+started life needing a re-save. Regenerate it the same way it was fixed — scaffold a throwaway
+project, re-save it through the editor, copy the scene back (the scaffolder re-mints the GUIDs
+on each use, so the committed ones are only placeholders).
+
+`engine/tests/assets/sceneFormatCanonical.test.ts` now fails on any scene — template included —
+that carries the legacy markers, with the two known exceptions baselined against #123/#124.
+Note what it does **not** do: it checks markers, not byte-exactness. A true check would
+re-serialize and diff, which needs the trait schemas and a world; `check-scene-churn.mjs` is
+what verifies a real re-save. It also parses `entities[].traits` rather than scanning text,
+because prefab `added[]` subtrees legitimately carry full trait data (defaults and blank refs
+included) and a text scan flags an already-migrated scene as legacy.
+
+**Prefabs are NOT migrated (#125).** All 69 `.prefab.json` files still carry the legacy shape and
+will churn on their first editor save. They were out of scope because `resave-scenes.sh` drives
+`load-scene`, which has no prefab equivalent — a prefab is only re-serialized by editing it.
+Expect the same one-time diff there, and expect the blank-ref exemptions in
+`tests/assets/authoredAssetRefs.test.ts` to go stale in the same way when it happens (that guard
+only sees values that are *present*, so compaction removes the blanks it was pinning).
 
 ## Entity-id stability on disk
 

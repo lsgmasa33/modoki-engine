@@ -44,7 +44,7 @@ import { acquireAudio } from '../loaders/audioBufferCache';
 import { acquireFont } from '../loaders/fontAtlasLoader';
 import { registerAsset, isGuid, resolveRef, resolveGuidToPath, getAudioLoadType } from '../loaders/assetManifest';
 import { loadTimelineNow } from '../loaders/timelineCache';
-import { collectTimelineAudioRefs, collectTimelineControlRefs } from '../timeline/types';
+import { collectTimelineAudioRefs, collectTimelineControlRefs, collectTimelineVideoRefs } from '../timeline/types';
 import { ASSET_FETCH_INIT, parseAssetJson } from '../loaders/assetFetch';
 import { assetUrl } from '../loaders/assetUrl';
 import {
@@ -898,7 +898,8 @@ class SceneManagerImpl implements SceneManager {
     for (const ref of collectResourceRefsFromEntities(sceneData.entities)) addRef(ref);
 
     // Fetch timelines and add their transitively-referenced inner GUIDs — invisible to the
-    // entity collector. AUDIO cues (audio tracks) and PREFABS (control tracks) need adding;
+    // entity collector. AUDIO cues (audio tracks), PREFABS (control tracks) and VIDEO clips
+    // (video tracks) need adding;
     // animation-track clips are NAMES resolved via the target Animator's own bank (already
     // collected above), so those already have an owner. This runs BEFORE the prefab walk below
     // so a control track's prefab is seeded into `prefabQueue` and its own nested resources
@@ -918,6 +919,12 @@ class SceneManagerImpl implements SceneManager {
       // carries the resolved path; the two resource kinds differ by convention.)
       for (const prefabRef of collectTimelineControlRefs(def)) {
         if (prefabRef) addRef({ type: 'prefab', path: prefabRef });
+      }
+      // Video clips carry the GUID, like prefabs — the acquire is a no-op (video is streamed or
+      // downloaded on demand, never preloaded), so this exists purely to give the clip an owner
+      // in the scene manifest and therefore a reason for the prod tree-shaker to keep it.
+      for (const videoRef of collectTimelineVideoRefs(def)) {
+        if (videoRef) addRef({ type: 'video', path: videoRef });
       }
     }
 
@@ -1310,6 +1317,13 @@ async function acquireResource(sceneId: SceneId, ref: SceneResourceRef): Promise
       // 2D sprites + UI images. Lazy-loaded by the 2D/DOM renderer (PixiJS
       // texture cache / CSS background), not preloaded here. Listed as a
       // resource so the build tree-shaker keeps the file.
+      return;
+    case 'video':
+      // Clips referenced by VideoPlayer entities (and by a 2D sprite showing video).
+      // Never preloaded: a video is STREAMED or downloaded on demand by videoSystem —
+      // pulling whole clips into memory at scene load is the opposite of what the
+      // delivery policy exists to do. Listed as a resource for the build tree-shaker,
+      // same as texture/particle/animation.
       return;
     case 'prefab':   return acquirePrefab(sceneId, ref.path);
     case 'particle':

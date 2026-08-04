@@ -44,7 +44,21 @@ function mtsdfBody(lang: 'wgsl' | 'glsl'): string {
   // below has an unambiguous initializer). `d(type)` = immutable `let`, `d(type,true)`
   // = mutable `var`. (Constructor calls like `vec4<f32>(...)` still use v2/v3/v4.)
   const d = (type: string, mutable = false) => (gpu ? (mutable ? 'var ' : 'let ') : `${type} `);
-  const F = (n: number) => (gpu ? `${f}(${n})` : n.toFixed(1)); // float literal
+  /** Float literal.
+   *
+   *  ⚠️ GLSL needs a DECIMAL POINT (`1` is an int, `1.0` is a float), but it must not be
+   *  produced with `toFixed(1)` — that ROUNDS TO ONE DECIMAL PLACE and silently destroys
+   *  every constant finer than 0.1. It emitted `max(cA, 0.0001)` as `max(cA, 0.0)`, turning
+   *  all three composite divide-by-zero guards below into divide-by-zero: a fully
+   *  transparent pixel (cA == 0) then divides 0/0 → NaN → the glyph colour is destroyed.
+   *  Measured on an iPhone 7: the board labels drew at #141321 against a #100e23
+   *  background — present, laid out, and ~4/255 from invisible. It also rounded the
+   *  `insideGate` threshold 0.55 → 0.6, shifting the corner-clash AA gate.
+   *
+   *  WGSL was never affected (`f32(0.0001)` keeps the value), which is exactly why this
+   *  survived: every WebGPU device renders it correctly, and only the WebGL fallback —
+   *  i.e. older hardware — gets the broken program. */
+  const F = (n: number) => (gpu ? `${f}(${n})` : (Number.isInteger(n) ? n.toFixed(1) : String(n)));
   const sample = gpu
     ? 'textureSample(uTexture, uSampler, vUV)'
     : 'texture(uTexture, vUV)';
@@ -121,6 +135,10 @@ function mtsdfBody(lang: 'wgsl' | 'glsl'): string {
 
 /** The custom high-shader bit (WGSL). Declares the mtsdf uniform block at the first
  *  free group (3 — global=0, local=1, texture=2) and overrides `outColor`. */
+/** Exported for tests only — `mtsdfShaderBitsForTest` lets a test assert on the REAL
+ *  generated shader source (both backends) rather than re-deriving it. The GLSL float
+ *  formatter silently rounded every epsilon to 0.0 for months precisely because nothing
+ *  ever looked at the emitted program. */
 const mtsdfBit = {
   name: 'mtsdf-bit',
   // Per-glyph colour: an extra vertex attribute (aTextColor, STRAIGHT rgba — shared
@@ -204,6 +222,44 @@ function mtsdfUniformValues(style: MtsdfStyle, atlasW: number, atlasH: number, d
   };
 }
 
+/** GLSL ES 1.00 needs `OES_standard_derivatives` declared before `fwidth` is legal, and Pixi's
+ *  high-shader assembly emits version-less (ES 1.00) GLSL — it only takes the ES 3.00 path when
+ *  the source literally contains `#version 300 es` (`GlProgram`: `indexOf('#version 300 es')`).
+ *  So the MTSDF `screenPxRange` line failed to compile with
+ *
+ *      ERROR: 0:67: 'GL_OES_standard_derivatives' : extension is disabled
+ *
+ *  and every glyph silently vanished (iPhone 7 / iOS 15.8.2 — the board's row/column letters).
+ *  Desktop and Android never saw it: their WebGL2 drivers accept `fwidth` in ES 1.00 source
+ *  without the pragma, so this is a spec-strictness difference, not a capability one.
+ *
+ *  ⚠️ The pragma MUST land before `precision` — measured on the device, all four variants:
+ *    no pragma                 → 'extension is disabled'          (the shipped bug)
+ *    pragma AFTER precision    → 'must occur before any non-preprocessor tokens'
+ *    pragma at the TOP         → compiles
+ *    `#version 300 es`         → compiles (fwidth is core there)
+ *  Adding it to this file's `fragment.header` bit — the obvious fix — is the SECOND row: Pixi
+ *  injects that bit after the precision line, so it fails just as loudly. Hence rewriting the
+ *  assembled source here instead. `enable` (not `require`) so a device without the extension
+ *  gets a warning and a working program rather than a hard failure.
+ *
+ *  Not done as `#version 300 es`: that would hard-fail on a genuinely WebGL1-only device, and
+ *  the pragma keeps one program source valid on both. */
+function withDerivativesExtension<T extends { fragment?: string; vertex?: string }>(program: T): T {
+  const src = program.fragment;
+  if (!src || src.includes('GL_OES_standard_derivatives') || src.includes('#version 300 es')) return program;
+  // After any leading #define lines (preprocessor tokens are fine before it), before everything
+  // else — `precision` is what must come after.
+  const lines = src.split('\n');
+  let i = 0;
+  while (i < lines.length && /^\s*(#define|#extension|\/\/|\s*$)/.test(lines[i])) i++;
+  lines.splice(i, 0, '#extension GL_OES_standard_derivatives : enable');
+  // `fragment` is declared readonly on GlProgram; this is a deliberate post-assembly rewrite of
+  // a string Pixi has no API to influence.
+  (program as { fragment: string }).fragment = lines.join('\n');
+  return program;
+}
+
 /** The atlas geometry a shader is built against — needed to re-derive the shadow
  *  UV offset when the style changes. */
 export interface MtsdfPixiAtlas { width: number; height: number; distanceRange: number; size: number }
@@ -213,7 +269,9 @@ export interface MtsdfPixiAtlas { width: number; height: number; distanceRange: 
  *  `resources.uTexture`, WebGPU rebinds group 2 from `mesh.texture`. Callers must
  *  therefore ALSO set `mesh.texture = <same atlas>`. */
 export function makeMtsdfPixiShader(texture: Texture, atlas: MtsdfPixiAtlas, style: MtsdfStyle): Shader {
-  const glProgram = compileHighShaderGlProgram({ name: 'mtsdf-text', bits: [localUniformBitGl, textureBitGl, roundPixelsBitGl, mtsdfBitGl] });
+  const glProgram = withDerivativesExtension(
+    compileHighShaderGlProgram({ name: 'mtsdf-text', bits: [localUniformBitGl, textureBitGl, roundPixelsBitGl, mtsdfBitGl] }),
+  );
   const gpuProgram = compileHighShaderGpuProgram({ name: 'mtsdf-text', bits: [localUniformBit, textureBit, roundPixelsBit, mtsdfBit] });
   const mtsdfUniforms = new UniformGroup(mtsdfUniformValues(style, atlas.width, atlas.height, atlas.distanceRange, atlas.size) as any);
   const shader = new Shader({
@@ -245,3 +303,6 @@ export function updateMtsdfPixiStyle(shader: Shader, style: MtsdfStyle): void {
   u.uGlowStrength = style.glowStrength ?? 0;
   u.uShadowSoftness = style.shadowSoftness ?? 0;
 }
+
+/** Test-only accessor for the two generated shader bits (see the note above `mtsdfBit`). */
+export const mtsdfShaderBitsForTest = () => ({ wgsl: mtsdfBit, glsl: mtsdfBitGl });

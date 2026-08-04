@@ -4,6 +4,7 @@
 
 import { parseFontFilename, type FontInfo } from './fontNaming';
 import { assetUrl } from './assetUrl';
+import type { FontManifestBlock } from './assetManifest';
 
 export { parseFontFilename, type FontInfo };
 
@@ -98,15 +99,26 @@ export function loadFont(path: string): Promise<string> {
   return promise;
 }
 
-/** Load all font assets from an asset list. Typically called with the result of /api/scan-assets. */
-export async function loadAllFonts(assets: { path: string; type: string }[]): Promise<void> {
-  const fontAssets = assets.filter(a => a.type === 'font');
+/** Load all font assets from an asset list. Typically called with the result of /api/scan-assets.
+ *  Skips any manifest entry whose baked `font` block has `sourceShipped === false` — a
+ *  build-time decision (see the asset-shaker's `shipSource` logic) that the source
+ *  `.ttf`/`.otf` wasn't shipped because no DOM/PixiJS consumer named its family. Loading
+ *  it anyway would 404 and pad the failure summary below with a "failure" that is
+ *  actually working as designed; absent/`true` (always true in dev, which serves
+ *  everything off disk) loads as before. */
+export async function loadAllFonts(assets: { path: string; type: string; font?: FontManifestBlock }[]): Promise<void> {
+  const fontAssets = assets.filter(a => a.type === 'font' && a.font?.sourceShipped !== false);
   if (fontAssets.length === 0) return;
 
   const results = await Promise.allSettled(fontAssets.map(a => loadFont(a.path)));
-  const failed = results.filter(r => r.status === 'rejected');
+  const failed = results
+    .map((r, i) => ({ result: r, path: fontAssets[i].path }))
+    .filter((x): x is { result: PromiseRejectedResult; path: string } => x.result.status === 'rejected');
   if (failed.length > 0) {
-    console.warn(`[FontLoader] ${failed.length}/${fontAssets.length} fonts failed to load`);
+    const detail = failed
+      .map(f => `${f.path}: ${f.result.reason instanceof Error ? f.result.reason.message : String(f.result.reason)}`)
+      .join('; ');
+    console.warn(`[FontLoader] ${failed.length}/${fontAssets.length} fonts failed to load — ${detail}`);
   }
 }
 

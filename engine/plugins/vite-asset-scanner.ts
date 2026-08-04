@@ -12,6 +12,7 @@ import type { Plugin } from 'vite';
 import { computeKeptAssets, formatBytes } from './asset-tree-shaker';
 import { assertNoConversionFallback, type ConversionFailure } from './asset-conversion-strict';
 import { loadProjectConfig, loadProjectUserConfig, validateBuildConfig, projectConfigUnionErrors } from './load-project-config';
+import { resolveModules } from './detect-modules';
 import { findGamesEntry } from './findGamesEntry';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './backend/gcloud';
 import { projectAssetRoots } from '../scripts/projectRoots.mjs';
@@ -33,6 +34,13 @@ import { getAudioCacheDir, audioCachePathFor } from './audio-cache';
 import { convertAudio } from './audio-convert';
 import { resolveAudioSettings, audioFormatExtension, audioVariantSuffix, type AudioImportSettings } from '../packages/modoki/src/runtime/loaders/audioSettings';
 import type { AudioCacheInfo } from '../packages/modoki/src/runtime/loaders/audioSettings';
+import { videoReimportHandler } from './reimport-video';
+import { getVideoCacheDir, videoCachePathFor } from './video-cache';
+import { convertVideo } from './video-convert';
+import {
+  resolveVideoSettings, videoVariantSuffix, VIDEO_EXTENSION,
+  type VideoImportSettings, type VideoCacheInfo,
+} from '../packages/modoki/src/runtime/loaders/videoSettings';
 import { resolveEnvSettings, ENV_VARIANT_SUFFIX, ULTRAHDR_VARIANT_SUFFIX, envVariantSuffix, type EnvImportSettings, type EnvManifestBlock, type EnvCacheInfo } from '../packages/modoki/src/runtime/core/environmentSettings';
 import { convertEnvironment } from './env-convert';
 import { getEnvCacheDir, envCachePathFor } from './env-cache';
@@ -52,6 +60,7 @@ import { handleBackendRequest, type BackendContext, type BackendResult } from '.
 import { vendorEnginePlugins, writeVendorMarker } from './vendorPlugins';
 import { spawnBuildCommand, resolveBuildStep, type BuildStep } from './buildStepShell';
 import { healNativeConfig } from './healNativeConfig';
+import { ICON_TOOL, ICON_COLORS, iconIsUpToDate, iconStampValue } from './iconAssets';
 import { ensureCapacitorDeps, ensureCapacitorConfig, detectMissingFirebase, type NativePlatform } from './addNativeTarget';
 import { discoverSigningTeams, type SigningTeam } from './signingTeams';
 import { serveProjectAsset } from './backend/staticAssets';
@@ -189,6 +198,23 @@ interface AssetEntry {
    *  always, plus the converted variant's `ext` once the clip has been through the
    *  ffmpeg converter (so the runtime resolver can build the `~audio.<ext>` URL). */
   audio?: { loadType?: 'buffer' | 'stream'; format?: string; ext?: string };
+  /** Baked video block (`'video'` assets) — the delivery fork (`delivery`/`policy`)
+   *  always, plus the converted variant's `ext` + measured `bytes`/`durationSec` once
+   *  the clip has been through the ffmpeg converter. `bytes` is load-bearing, not
+   *  cosmetic: it resolves `policy: 'auto'` and feeds the per-game remote-footprint
+   *  budget, so the runtime must not have to fetch the file to learn its size. */
+  video?: {
+    delivery?: 'bundled' | 'remote';
+    policy?: 'stream' | 'download' | 'auto';
+    /** Where a remote clip's bytes live. Host MUST send CORS — see videoSettings. */
+    remoteUrl?: string;
+    ext?: string;
+    bytes?: number;
+    durationSec?: number;
+    width?: number;
+    height?: number;
+    hasAudio?: boolean;
+  };
   /** Baked font block (`'font'` assets) — mode/fieldType/distanceRange + atlas dims,
    *  written at build time once the font has been through msdf-atlas-gen (so the
    *  runtime resolves the `~atlas.png`/`~metrics.json` variants + picks a provider). */
@@ -701,6 +727,10 @@ function scanDir(dir: string, base: string, urlPrefix: string): AssetEntry[] {
       // Baked audio block — loadType always (drives the runtime buffer/stream fork,
       // even for unconverted source clips); format+ext only once converted.
       let audio: { loadType?: 'buffer' | 'stream'; format?: string; ext?: string } | undefined;
+      // Baked video block — delivery/policy always (they drive the runtime
+      // bundled-vs-fetched and stream-vs-download forks even for an unconverted
+      // source); ext + measured size only once converted.
+      let video: AssetEntry['video'] | undefined;
       // Baked font block — mode (baked/dynamic) drives runtime provider selection;
       // fieldType/distanceRange/atlas dims feed the shader + variant URLs.
       let font: FontManifestBlock | undefined;
@@ -774,6 +804,32 @@ function scanDir(dir: string, base: string, urlPrefix: string): AssetEntry[] {
             hash = cache.hash;
           }
         }
+      } else if (type === 'video') {
+        // Bake the delivery fork always; the converted-variant ext + measured size
+        // only once the clip has been through the ffmpeg converter (videoCache set).
+        const meta = readMetaSidecar(fullPath);
+        const v = (meta as { video?: Partial<VideoImportSettings> }).video;
+        const cache = (meta as { videoCache?: VideoCacheInfo }).videoCache;
+        if (v || cache) {
+          const settings = resolveVideoSettings(meta as { video?: Partial<VideoImportSettings> });
+          video = {
+            delivery: settings.delivery, policy: settings.policy,
+            // Carried for a remote clip only — it's where the bytes come from, and
+            // without it "remote" silently degrades to the local path.
+            ...(settings.delivery === 'remote' && settings.remoteUrl ? { remoteUrl: settings.remoteUrl } : {}),
+          };
+          if (cache) {
+            video.ext = cache.ext ?? VIDEO_EXTENSION;
+            // Size/duration are what let `policy: 'auto'` decide without a network
+            // round-trip, so carry them even though they read as "stats".
+            if (cache.bytes != null) video.bytes = cache.bytes;
+            if (cache.durationSec != null) video.durationSec = cache.durationSec;
+            if (cache.width != null) video.width = cache.width;
+            if (cache.height != null) video.height = cache.height;
+            if (cache.hasAudio != null) video.hasAudio = cache.hasAudio;
+            hash = cache.hash;
+          }
+        }
       } else if (type === 'font') {
         // Font `mode` (baked vs dynamic) selects the runtime provider — without this
         // the manifest entry has no `font` block and every font loads baked. Always
@@ -818,6 +874,7 @@ function scanDir(dir: string, base: string, urlPrefix: string): AssetEntry[] {
         ...(hash ? { hash } : {}),
         ...(atlas ? { atlas } : {}),
         ...(audio ? { audio } : {}),
+        ...(video ? { video } : {}),
         ...(font ? { font } : {}),
         ...(environment ? { environment } : {}),
       });
@@ -1290,6 +1347,7 @@ export function assetScannerPlugin(): Plugin {
       registerReimportHandler('model', modelReimportHandler);
       registerReimportHandler('atlas', atlasReimportHandler);
       registerReimportHandler('audio', audioReimportHandler);
+      registerReimportHandler('video', videoReimportHandler);
       registerReimportHandler('font', fontReimportHandler);
       registerReimportHandler('environment', environmentReimportHandler);
       cachedManifest = buildManifest(scanAllAssets(assetRoots), true); // dev: auto-heal id collisions
@@ -1778,18 +1836,32 @@ export function assetScannerPlugin(): Plugin {
             : path.join(buildCwd, 'build/icon.png');
           // `--<plat>` (a FLAG, not the positional arg) makes the platform list
           // exclusive — the positional form still tries PWA and fails on a missing
-          // www/manifest.json. Verified against @capacitor/assets 3.0.5. Colors are
-          // double-quoted (portable across bash + cmd.exe; `#` isn't a comment inside
-          // quotes on either). The mkdir+copy prep differs per shell (posix `mkdir -p`/
-          // `cp` vs cmd `mkdir`/`copy`); the `|| echo` non-fatal fallback works on both.
+          // www/manifest.json. Colors are double-quoted (portable across bash +
+          // cmd.exe; `#` isn't a comment inside quotes on either). The mkdir+copy prep
+          // differs per shell (posix `mkdir -p`/`cp` vs cmd `mkdir`/`copy`); the
+          // `|| echo` non-fatal fallback works on both.
+          //
+          // VERSION IS PINNED. This used to be a bare `@capacitor/assets` under a comment
+          // claiming it was "verified against 3.0.5" — but `npx --yes` installs LATEST, so
+          // the comment documented a version the build did not actually use. A newer
+          // release then started emitting extra density buckets (drawable-night-*, *-ldpi,
+          // mipmap-ldpi), which showed up as mystery untracked dirs in games that had done
+          // nothing but build. The generated icons are committed release artifacts; the
+          // tool that generates them cannot be a moving target.
           const iconGen = (plat: 'ios' | 'android') =>
-            `npx --yes @capacitor/assets generate --${plat} --iconBackgroundColor "#ffffff" --iconBackgroundColorDark "#111111" --splashBackgroundColor "#ffffff" --splashBackgroundColorDark "#111111"`;
-          const iconStep = (plat: 'ios' | 'android'): BuildStep => ({
-            label: 'Generating app icons...',
-            cmd: `mkdir -p assets && cp ${JSON.stringify(iconSrcAbs)} assets/icon.png && ${iconGen(plat)} || echo '[icon] generation skipped (source missing or @capacitor/assets error)'`,
-            winCmd: `(if not exist assets mkdir assets) && copy /y "${iconSrcAbs}" assets\\icon.png && ${iconGen(plat)} || echo [icon] generation skipped`,
-            cwd: plat === 'ios' ? iosCwd : androidCwd,
-          });
+            `npx --yes ${ICON_TOOL} generate --${plat} ${ICON_COLORS}`;
+          const iconStampRel = (plat: 'ios' | 'android', win: boolean) =>
+            win ? `.cache\\icon-stamp-${plat}` : `.cache/icon-stamp-${plat}`;
+          const iconStep = (plat: 'ios' | 'android'): BuildStep | null => {
+            if (iconIsUpToDate(projectRoot, iconSrcAbs, plat)) return null;
+            const stamp = iconStampValue(iconSrcAbs, plat);
+            return {
+              label: 'Generating app icons...',
+              cmd: `mkdir -p assets .cache && cp ${JSON.stringify(iconSrcAbs)} assets/icon.png && ${iconGen(plat)} && printf '%s' ${stamp} > ${JSON.stringify(iconStampRel(plat, false))} || echo '[icon] generation skipped (source missing or @capacitor/assets error)'`,
+              winCmd: `(if not exist assets mkdir assets) && (if not exist .cache mkdir .cache) && copy /y "${iconSrcAbs}" assets\\icon.png && ${iconGen(plat)} && (echo ${stamp}>"${iconStampRel(plat, true)}") || echo [icon] generation skipped`,
+              cwd: plat === 'ios' ? iosCwd : androidCwd,
+            };
+          };
           // OTA Phase 5a: embed this build's own manifest into dist so the very FIRST
           // OTA check on a fresh install has something local to diff against (see
           // engine/scripts/ota-embed-manifest.mjs's header). Must run AFTER the web
@@ -1804,22 +1876,34 @@ export function assetScannerPlugin(): Plugin {
             cmd: `node engine/scripts/ota-embed-manifest.mjs --dist ${JSON.stringify(projectDist)} --name ${JSON.stringify(cfg.ota.bundleName)} --engine-api ${cfg.ota.engineApi}`,
             cwd: buildCwd,
           } : null;
+          // Resolved once: `null` means the icons are already current for that platform,
+          // and the step is dropped from the plan entirely rather than run as a no-op.
+          const iosIconStep = iconStep('ios');
+          const androidIconStep = iconStep('android');
           const stepsByPlatform: Record<string, BuildStep[]> = {
             // iOS is macOS-only (preflight blocks it off-darwin), so its bash-only steps
             // (`$(…)`, `~`, xcodebuild/xcrun) never run on Windows — no winCmd needed.
             ios: [
               { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', cwd: buildCwd },
               ...(otaEmbedStep ? [otaEmbedStep] : []),
-              iconStep('ios'),
+              ...(iosIconStep ? [iosIconStep] : []),
               { label: 'Syncing Capacitor iOS...', cmd: 'npx cap sync ios', cwd: iosCwd },
               { label: 'Building Xcode project...', cmd: `xcodebuild ${iosXcodeTarget} -scheme App -configuration Debug -destination 'id=${IOS_DEST}' -allowProvisioningUpdates build`, cwd: iosCwd },
-              { label: 'Installing on device...', cmd: `APP_PATH=$(ls -dt ~/Library/Developer/Xcode/DerivedData/App-*/Build/Products/Debug-iphoneos/App.app 2>/dev/null | head -1) && xcrun devicectl device install app --device ${IOS_DEVICECTL} "$APP_PATH"`, cwd: iosCwd },
+              // `devicectl` is CoreDevice-only — it REFUSES anything below iOS 17 with
+              // "This device does not support acquiring a usage assertion" (error 1010) or a
+              // bare "device was not found". The xcodebuild step above works fine on an old
+              // device, so the build genuinely succeeded and only the CLI handoff is
+              // impossible; failing with a raw CoreDeviceError there reads as "your build is
+              // broken" when the only thing missing is a way to push it. So fall back to
+              // handing the project to Xcode, which can still deploy to iOS 15. Measured on an
+              // iPhone 7 / iOS 15.8.2, where devicectl cannot install but Xcode's Run does.
+              { label: 'Installing on device...', cmd: `APP_PATH=$(ls -dt ~/Library/Developer/Xcode/DerivedData/App-*/Build/Products/Debug-iphoneos/App.app 2>/dev/null | head -1) && { xcrun devicectl device install app --device ${IOS_DEVICECTL} "$APP_PATH" || { echo ""; echo "⚠️  devicectl could not install to this device — it requires iOS 17+."; echo "   The app BUILT fine; only the command-line install is unavailable."; echo "   Opening the Xcode project — press Run (⌘R) there to deploy."; open "${iosXcodeTarget.replace(/^-(workspace|project) /, '')}" 2>/dev/null || true; exit 1; }; }`, cwd: iosCwd },
               { label: 'Launching app...', cmd: `xcrun devicectl device process launch --device ${IOS_DEVICECTL} ${APP_ID}`, cwd: iosCwd },
             ],
             android: [
               { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', cwd: buildCwd },
               ...(otaEmbedStep ? [otaEmbedStep] : []),
-              iconStep('android'),
+              ...(androidIconStep ? [androidIconStep] : []),
               { label: 'Syncing Capacitor Android...', cmd: 'npx cap sync android', cwd: androidCwd },
               // gradlew wrapper: posix `android/gradlew` vs Windows `android\gradlew.bat`.
               // JAVA_HOME/ANDROID_HOME are injected via env (not a bash export prefix).
@@ -2513,10 +2597,19 @@ export function assetScannerPlugin(): Plugin {
         return;
       }
 
-      const result = computeKeptAssets(projectRoot, assetRoots);
+      // Resolve the module flags the same way vite.config.ts does, so the shaker and the
+      // bundle agree on what is in this build. `video: false` drops the clips — the toggle's
+      // real payload, since video's JS is engine code the runtime barrel keeps alive anyway.
+      const buildModules = resolveModules(
+        loadProjectConfig(projectRoot).build.modules,
+        projectRoot,
+        { playable: process.env.VITE_PLAYABLE === '1' },
+      );
+      const result = computeKeptAssets(projectRoot, assetRoots, { excludeVideo: !buildModules.video });
       const CONVERTIBLE = new Set(['.png', '.jpg', '.jpeg']);
       const MODEL_EXTS = new Set(['.glb', '.gltf']);
       const AUDIO_EXTS = new Set(['.mp3', '.m4a', '.aac', '.wav', '.ogg', '.flac']);
+      const VIDEO_EXTS = new Set(['.mp4', '.mov', '.m4v', '.webm', '.mkv']);
       const FONT_EXTS = new Set(['.ttf', '.otf', '.woff', '.woff2']);
 
       // Copy kept non-texture, non-converted-model files verbatim. Textures
@@ -2535,6 +2628,7 @@ export function assetScannerPlugin(): Plugin {
         if (CONVERTIBLE.has(ext)) continue;
         if (MODEL_EXTS.has(ext)) continue; // handled by the model branch below
         if (AUDIO_EXTS.has(ext)) continue; // handled by the audio branch below
+        if (VIDEO_EXTS.has(ext)) continue; // handled by the video branch below
         if (FONT_EXTS.has(ext)) continue; // handled by the font branch below
         if (ext === '.hdr') continue; // handled by the environment branch below (it
         //   ships the downscaled ~env.hdr variant + drops the multi-MB source, or
@@ -2624,6 +2718,60 @@ export function assetScannerPlugin(): Plugin {
       }
       if (audioVariantCount) console.log(`[asset-shaker] converted ${audioVariantCount} audio clip(s).`);
 
+      // Convert each kept video that has been through the ffmpeg converter (its meta
+      // has a `videoCache` block) and copy the single variant into dist/ at
+      // `<src>~video.mp4` — the source is NOT shipped. Unconverted video is copied
+      // verbatim so it still plays. On conversion FAILURE we ship the source + record
+      // it so the strict gate fails the build — parity with audio/textures.
+      //
+      // A `delivery: 'remote'` clip is NOT shipped: it lives on a CDN and the runtime
+      // streams or downloads it (see docs/video.md § "Remote delivery"). Its SOURCE stays
+      // in the project so the asset is importable, previewable and probeable like any
+      // other — but the build emits only the manifest entry, which is the whole point of
+      // the delivery mode. The manifest-vs-disk check skips remote entries for the same
+      // reason. (This shipped remote clips verbatim while P2 was unbuilt; that note is
+      // now stale and the behaviour with it.)
+      const convertedVideo = new Map<string, { settings: VideoImportSettings; ext: string; hash: string; bytes: number; durationSec?: number; width?: number; height?: number; hasAudio?: boolean }>();
+      let videoVariantCount = 0;
+      for (const virtualPath of result.kept) {
+        if (!VIDEO_EXTS.has(path.extname(virtualPath).toLowerCase())) continue;
+        const srcAbs = resolveAssetPath(virtualPath, assetRoots);
+        if (!srcAbs || !fs.existsSync(srcAbs)) continue;
+        const meta = readMetaSidecar(srcAbs);
+        const hasCache = !!(meta as { videoCache?: VideoCacheInfo }).videoCache;
+        const settings = resolveVideoSettings(meta as { video?: Partial<VideoImportSettings> });
+        // Remote: emit nothing at all. Checked BEFORE the unconverted fallback, or a
+        // remote clip that had never been through the converter would ship verbatim —
+        // which is exactly how it slipped through the first time.
+        if (settings.delivery === 'remote') continue;
+        const shipSource = () => {
+          const destPath = path.join(distDir, virtualPath.replace(/^\//, ''));
+          fs.mkdirSync(path.dirname(destPath), { recursive: true });
+          fs.copyFileSync(srcAbs, destPath);
+          copiedCount++;
+        };
+        if (!hasCache) { shipSource(); continue; } // unconverted — ship source verbatim
+        try {
+          const conv = await convertVideo({ projectRoot, sourceUrlPath: virtualPath, absSource: srcAbs, settings });
+          const cacheFile = videoCachePathFor(getVideoCacheDir(projectRoot), virtualPath, conv.hash);
+          const destPath = path.join(distDir, (virtualPath + videoVariantSuffix()).replace(/^\//, ''));
+          fs.mkdirSync(path.dirname(destPath), { recursive: true });
+          fs.copyFileSync(cacheFile, destPath);
+          videoVariantCount++;
+          convertedVideo.set(virtualPath.normalize('NFC'), {
+            settings, ext: conv.ext, hash: conv.hash, bytes: conv.bytes,
+            durationSec: conv.durationSec, width: conv.width, height: conv.height,
+            hasAudio: conv.hasAudio,
+          });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          console.warn(`[asset-shaker] video convert failed for ${virtualPath} — shipping source. ${msg}`);
+          conversionFailures.push({ virtualPath, kind: 'video', error: msg });
+          shipSource();
+        }
+      }
+      if (videoVariantCount) console.log(`[asset-shaker] converted ${videoVariantCount} video clip(s).`);
+
       // Downscale each kept environment HDR that has been through the converter (its
       // meta has an `environmentCache` block, written by the Environment Inspector
       // Apply / reimport) and copy the single variant into dist/ at `<src>~env.hdr`
@@ -2684,12 +2832,31 @@ export function assetScannerPlugin(): Plugin {
 
       // Bake each kept font that has been through the msdf-atlas-gen importer (its
       // meta has a `font` block, written by the Font Inspector Apply / reimport) and
-      // copy the two derived files into dist/ at `<src>~atlas.png` + `<src>~metrics.json`
-      // — the source .ttf is NOT shipped. A plain CSS-family-name font (no `font`
+      // copy the two derived files into dist/ at `<src>~atlas.png` + `<src>~metrics.json`.
+      //
+      // The source `.ttf`/`.otf` ships ONLY when something needs it. There are two
+      // distinct consumers, and only one needs the real outlines: CANVAS text
+      // (`Text2D.font`, a GUID) renders from the atlas alone, while DOM/PixiJS text
+      // (`UIElement.fontFamily`, a CSS family NAME) goes through the browser's
+      // FontFace API — and the manifest entry for a font IS its source path, so
+      // `loadAllFonts` FontFace-loads exactly that. Shipping it unconditionally wastes
+      // ~300KB/font on a canvas-only game; never shipping it 404s at boot
+      // ("[FontLoader] N/N fonts failed to load") for a DOM-using one. So: ship the
+      // source iff `result.domFontFiles` (computed by the shaker's font-family walk —
+      // see resolveFontsByFamily in asset-tree-shaker.ts) says a scene/prefab named
+      // this font's family in `fontFamily`, UNLESS `shipSource` overrides the call —
+      // `'always'` for a family named from CODE (a runtime string, not a scene field,
+      // which the static scan can't see) or `'never'` to force-drop despite detected
+      // DOM usage. The decision is recorded as `sourceShipped` on the manifest's `font`
+      // block so `loadAllFonts` knows not to fetch a path that was never shipped.
+      //
+      // A plain CSS-family-name font (no `font`
       // block) is copied verbatim so `fontFamily` still resolves. On bake FAILURE
       // (msdf-atlas-gen missing/crash) we ship the source + record it so the strict
-      // gate fails the build (unless MODOKI_ALLOW_ASSET_FALLBACK=1) — parity with audio.
-      const convertedFonts = new Map<string, { settings: FontImportSettings; hash: string; atlasWidth?: number; atlasHeight?: number }>(); // NFC virtualPath → blocks
+      // gate fails the build (unless MODOKI_ALLOW_ASSET_FALLBACK=1) — parity with audio:
+      // a failed bake means no atlas, so the source is the ONLY way the font renders
+      // at all, regardless of the shipSource decision.
+      const convertedFonts = new Map<string, { settings: FontImportSettings; hash: string; atlasWidth?: number; atlasHeight?: number; sourceShipped: boolean }>(); // NFC virtualPath → blocks
       let fontVariantCount = 0;
       for (const virtualPath of result.kept) {
         if (!FONT_EXTS.has(path.extname(virtualPath).toLowerCase())) continue;
@@ -2716,7 +2883,17 @@ export function assetScannerPlugin(): Plugin {
             fs.copyFileSync(cacheFile, destPath);
             fontVariantCount++;
           }
-          convertedFonts.set(virtualPath.normalize('NFC'), { settings, hash: conv.hash, atlasWidth: conv.atlasWidth, atlasHeight: conv.atlasHeight });
+          const domUsed = result.domFontFiles.has(virtualPath.normalize('NFC'));
+          const shipTtf = settings.shipSource === 'always' || (settings.shipSource !== 'never' && domUsed);
+          if (shipTtf) shipSource();
+          if (settings.shipSource === 'always') {
+            console.log(`[asset-shaker] font ${virtualPath}: atlas + source (shipSource:'always')`);
+          } else if (domUsed) {
+            console.log(`[asset-shaker] font ${virtualPath}: atlas + source (DOM fontFamily usage)`);
+          } else {
+            console.log(`[asset-shaker] font ${virtualPath}: atlas only (no DOM fontFamily usage found)`);
+          }
+          convertedFonts.set(virtualPath.normalize('NFC'), { settings, hash: conv.hash, atlasWidth: conv.atlasWidth, atlasHeight: conv.atlasHeight, sourceShipped: shipTtf });
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           console.warn(`[asset-shaker] font bake failed for ${virtualPath} — shipping source. ${msg}`);
@@ -2861,6 +3038,7 @@ export function assetScannerPlugin(): Plugin {
               __MODOKI_MODULE_PHYSICS3D__: 'true',
               __MODOKI_MODULE_NPR__: 'true',
               __MODOKI_MODULE_GPU_PARTICLES__: 'true',
+              __MODOKI_MODULE_VIDEO__: 'true',
             },
             resolve: {
               alias: [
@@ -3020,11 +3198,44 @@ export function assetScannerPlugin(): Plugin {
           entry.audio = { loadType: entry.audio.loadType };
           entry.hash = undefined;
         }
+        // Video: bake the converted variant's ext + measured size + build-time hash so
+        // the runtime resolves `<src>~video.mp4?v=<hash>` (source dropped from dist).
+        const vid = convertedVideo.get(entry.path.normalize('NFC'));
+        if (vid) {
+          entry.video = {
+            delivery: vid.settings.delivery,
+            policy: vid.settings.policy,
+            ...(vid.settings.delivery === 'remote' && vid.settings.remoteUrl
+              ? { remoteUrl: vid.settings.remoteUrl } : {}),
+            ext: vid.ext,
+            bytes: vid.bytes,
+            ...(vid.durationSec != null ? { durationSec: vid.durationSec } : {}),
+            ...(vid.width != null ? { width: vid.width } : {}),
+            ...(vid.height != null ? { height: vid.height } : {}),
+            ...(vid.hasAudio != null ? { hasAudio: vid.hasAudio } : {}),
+          };
+          entry.hash = vid.hash;
+        } else if (entry.video?.ext) {
+          // Conversion did NOT run/succeed this build (ffmpeg missing +
+          // MODOKI_ALLOW_ASSET_FALLBACK=1 shipped the raw source): drop the
+          // sidecar-baked variant fields so the manifest advertises the raw source
+          // that was actually shipped, not a `~video.mp4` that was never written.
+          // `bytes` goes too — a stale size would make `policy: 'auto'` decide against
+          // a file that isn't there.
+          entry.video = {
+            delivery: entry.video.delivery, policy: entry.video.policy,
+            ...(entry.video.remoteUrl ? { remoteUrl: entry.video.remoteUrl } : {}),
+          };
+          entry.hash = undefined;
+        }
         // Font: bake the manifest block (mode/fieldType/distanceRange/atlas dims) +
         // the build-time hash so the runtime resolves `<src>~atlas.png?v=<hash>` +
-        // `~metrics.json` (source .ttf dropped from dist). A font that fell back to
-        // raw source (bake failed + fallback allowed) keeps no `font` block, so the
-        // verifier below checks the shipped source instead.
+        // `~metrics.json`, plus `sourceShipped` recording whether the source `.ttf`
+        // was ALSO shipped this build (see the ship-source decision above) — absent
+        // that flag `loadAllFonts` can't tell a dropped-on-purpose source from a
+        // real 404. A font that fell back to raw source (bake failed + fallback
+        // allowed) keeps no `font` block, so the verifier below checks the shipped
+        // source instead.
         const f = convertedFonts.get(entry.path.normalize('NFC'));
         if (f) {
           const block: FontManifestBlock = {
@@ -3033,6 +3244,7 @@ export function assetScannerPlugin(): Plugin {
             distanceRange: f.settings.pxRange,
             ...(f.atlasWidth != null ? { atlasWidth: f.atlasWidth } : {}),
             ...(f.atlasHeight != null ? { atlasHeight: f.atlasHeight } : {}),
+            sourceShipped: f.sourceShipped,
           };
           entry.font = block;
           entry.hash = f.hash;
@@ -3096,8 +3308,20 @@ export function assetScannerPlugin(): Plugin {
           } else if (entry.audio?.ext) {
             // Converted audio — the source was dropped; verify the single variant.
             checkFile(entry.path + `~audio.${entry.audio.ext}`, 'audio variant');
+          } else if (entry.video?.delivery === 'remote') {
+            // Nothing on disk BY DESIGN: a remote clip lives on the CDN and is streamed or
+            // downloaded at runtime. Checked before the `ext` case below because a remote
+            // entry never HAS an ext — it is never converted — so gating on ext alone let it
+            // fall through to the plain-copy check and fail the build.
+          } else if (entry.video?.ext) {
+            // Converted video — the source was dropped, so the SOURCE path in `entry.path` is
+            // never on disk; verify the emitted variant instead. Without this branch the entry
+            // fell through to the plain-copy check below and every video failed the build.
+            checkFile(entry.path + `~video.${entry.video.ext}`, 'video variant');
           } else if (entry.font) {
-            // Baked font — the source .ttf was dropped; verify both derived files.
+            // Baked font — verify both derived files. The source .ttf may or may not
+            // have shipped too (`entry.font.sourceShipped`); either way it isn't what
+            // the atlas/dynamic-gen path resolves, so it's not checked here.
             checkFile(entry.path + FONT_ATLAS_SUFFIX, 'font atlas');
             checkFile(entry.path + FONT_METRICS_SUFFIX, 'font metrics');
           } else if (entry.environment) {

@@ -25,6 +25,7 @@ import { Fog } from '../../three/traits/Fog';
 import { fog as fogTsl, exponentialHeightFogFactor, uniform, renderGroup } from 'three/tsl';
 import { worldTransforms, deactivatedEntities, transformPropagationSystem } from '../core/ecs/transformPropagationSystem';
 import { updateSceneLightUniforms } from './sceneLightUniforms';
+import { syncVideoTextures } from './videoTextureSync';
 import { setEntityMeshCollector } from './materialBroker';
 import { getAnimationClip } from '../loaders/animationClipCache';
 import { resolveActiveClip, resolveClipByName } from '../animation/animClipBank';
@@ -2781,6 +2782,10 @@ export function syncSceneRenderables3D(
   // own camera). Uses the gizmo-aware renderables callback for consistent transform skip.
   syncBillboardSprites(world, scene, state, callbacks?.renderables);
   syncText3D(world, scene, state, callbacks?.renderables);
+  // Video screens — binds a VideoPlayer entity's live element onto its material as a
+  // VideoTexture. Runs LAST because it reads the objects the syncs above create, and
+  // lives in its own module (an additive concern; this file is big enough).
+  if (__MODOKI_MODULE_VIDEO__) syncVideoTextures(world, state);
 }
 
 /** Clear all owned-material tracking. Call on world swap alongside clearing

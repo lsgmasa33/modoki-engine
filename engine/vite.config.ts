@@ -39,6 +39,14 @@ const buildProjectRoot = process.env.MODOKI_PROJECT ? path.resolve(process.env.M
 // there and the __MODOKI_EDITOR__ OR turns it on.
 const debugBuildFlag = loadProjectConfig(buildProjectRoot).build.debugBuild === true
 
+// The shipped browser floor — see the `target:` note in `build` below for why it is pinned
+// at all. Sanitized here rather than trusted: nothing validates numeric config (#39), and a
+// junk value would silently become an esbuild target string like `iosbanana`, which esbuild
+// rejects with an error far from its cause. Falls back to the schema default (16.4 — lowering
+// below 15.4 needs polyfills; esbuild lowers syntax, it does not add missing runtime APIs).
+const rawIosMin = loadProjectConfig(buildProjectRoot).build.iosMinVersion
+const iosMinVersion = /^\d+(\.\d+)?$/.test(String(rawIosMin ?? '')) ? String(rawIosMin) : '16.4'
+
 // Absolute dir of @zappar/msdf-generator, pinned so its bare import resolves even when the
 // dep-optimize cache is relocated out of the tree in a packaged editor (see resolve.alias
 // below). Hoisting puts it at <repoRoot>/node_modules in both the dev clone AND the packaged
@@ -213,6 +221,7 @@ export default defineConfig(({ command }) => {
   const moduleFlags = resolveModules(
     loadProjectConfig(buildProjectRoot).build.modules,
     isEditorBuild || !process.env.MODOKI_PROJECT ? null : buildProjectRoot,
+    { playable: process.env.VITE_PLAYABLE === '1' },
   )
   // Playable single-file target (Phase 4). VITE_PLAYABLE=1 ⇒ (a) run the asset profile
   // (MODOKI_PLAYABLE) so assets shrink, (b) emit ONE JS chunk (inlineDynamicImports) so
@@ -280,6 +289,7 @@ export default defineConfig(({ command }) => {
     __MODOKI_MODULE_PHYSICS3D__: JSON.stringify(moduleFlags.physics3d),
     __MODOKI_MODULE_NPR__: JSON.stringify(moduleFlags.npr),
     __MODOKI_MODULE_GPU_PARTICLES__: JSON.stringify(moduleFlags.gpuParticles),
+    __MODOKI_MODULE_VIDEO__: JSON.stringify(moduleFlags.video),
     // Playable (Phase 5): the app boots the MRAID/CTA layer only in a playable build,
     // and the CTA routes to this store URL. False/'' in every other build → the whole
     // playable-overlay import DCEs out.
@@ -296,6 +306,34 @@ export default defineConfig(({ command }) => {
   ],
   publicDir: false, // No public/ — assets served via convention-based assets/ folders
   build: {
+    // ⚠️ PIN THE TARGET — do not delete this and fall back to Vite's default.
+    //
+    // Vite 8's default `build.target` is 'baseline-widely-available', which resolves to
+    // ["chrome111","edge111","firefox114","safari16.4","ios16.4"]. That silently makes
+    // **iOS 16.4 the minimum for every game we ship**: esbuild sees ios16.4 as the floor,
+    // decides ES2022 static class blocks are supported, and emits three.js's
+    // `class e { static { e.prototype.isVector2 = true } }` verbatim.
+    //
+    // A static block is a PARSE error on older WebKit, so the failure is maximally silent:
+    // the whole chunk fails to parse, the module graph dies, and the app hangs on the splash
+    // with ZERO JavaScript console output — nothing to grep for. And three.core is on the
+    // EAGER boot path (index → renderSettings → three.core), so it takes down 2D-only games
+    // too, which have no reason to care about three at all. Found on an iPhone 7 (iOS 15,
+    // Court, 2026-08-04); it would equally have hit every other game.
+    //
+    // The floor is therefore an explicit, reviewed decision rather than whatever the
+    // bundler's default drifts to on the next major. It comes from the PROJECT's
+    // `build.iosMinVersion` (default 16.4 — raised from 15.4 on 2026-08-04 by owner
+    // decision, deliberately dropping the iPhone 7 / 6s / SE1 era), which is the same
+    // value that drives the native IPHONEOS_DEPLOYMENT_TARGET — one source of truth, so
+    // the bundle's floor and the floor the App Store enforces cannot disagree. They
+    // previously did: every pbxproj said 15.0 while the bundle needed 15.4. NOTE this
+    // governs SYNTAX only — esbuild lowers syntax, it does not polyfill missing runtime
+    // APIs, so lowering `iosMinVersion` below 15.4 needs polyfills (structuredClone /
+    // Array.at / Object.hasOwn all land in 15.4 — the hard lower bound regardless of
+    // where the floor is currently set).
+    // The desktop entries stay pinned: the editor is Electron/Chromium, not a shipped floor.
+    target: [`safari${iosMinVersion}`, `ios${iosMinVersion}`, 'chrome87', 'edge88', 'firefox78'],
     // Emit to the open project's dist/ (games/<id>/dist for a flat project; repo
     // root when MODOKI_PROJECT is unset). The asset-shaker follows Rollup's
     // output dir, and Capacitor webDir + /api/build resolve the same path. A
@@ -421,6 +459,40 @@ export default defineConfig(({ command }) => {
   test: {
     // Paths are relative to root (engineDir): tests/ and packages/ live under engine/.
     globals: true,
+    // Coverage is OFF unless --coverage is passed; this block only says what to measure
+    // when it is. It exists because every coverage number this repo had acted on came
+    // from a `grep`-for-imports proxy (docs/plans/editor-panel-logic-tests-plan.md), which
+    // over-counts transitively-exercised modules and under-counts assertion depth.
+    // `all` is deliberately on: an untested file must appear at 0%, not be absent — the
+    // whole question here is "what does NO test reach", which a tested-files-only report
+    // cannot answer. It costs a transform of every included file, which is why the
+    // include list is the shipped source we actually gate on, not the whole tree.
+    coverage: {
+      provider: 'v8',
+      all: true,
+      // The SECOND of two legs (see the engine package's vitest.config.ts for the mechanism
+      // and for the two merge strategies that failed silently). This leg emits raw per-file
+      // data only; engine/scripts/merge-coverage.mjs turns both legs into the real report.
+      // Its include paths all live under engine/, which is why the MERGED report is
+      // attributed from this leg's root — a glob cannot reach up out of a run's root.
+      reportsDirectory: './coverage/.legs/root', // engine/coverage — gitignored
+      reporter: ['json'],
+      include: [
+        'packages/modoki/src/editor/**/*.{ts,tsx}',
+        'packages/modoki/src/runtime/**/*.{ts,tsx}',
+        'packages/modoki/src/three/**/*.{ts,tsx}',
+        'app/**/*.{ts,tsx}',
+        'plugins/**/*.ts',
+        'electron/**/*.ts',
+      ],
+      exclude: [
+        '**/*.d.ts',
+        '**/*.test.{ts,tsx}',
+        '**/__mocks__/**',
+        // Type-only barrels and generated files carry no decisions to cover.
+        '**/index.ts',
+      ],
+    },
     environment: 'jsdom',
     setupFiles: './tests/setup.ts',
     // The default 5s per-test timeout is too tight for the FIRST test in a file that cold-imports a
@@ -452,12 +524,24 @@ export default defineConfig(({ command }) => {
       // matches nothing when that root is absent (the public repo has neither).
       // KEEP IN SYNC with PROJECT_ROOT_DIRS in engine/scripts/projectRoots.mjs — static
       // config can't import it.
-      '../games/*/tests/**/*.test.ts',
-      '../games/*/tests/**/*.test.tsx',
-      '../games/*/packages/*/**/*.test.ts',
-      '../demos/*/tests/**/*.test.ts',
-      '../demos/*/tests/**/*.test.tsx',
-      '../demos/*/packages/*/**/*.test.ts',
+      //
+      // Dropped from a COVERAGE run only (`npm run coverage`). V8's precise-coverage mode
+      // deoptimizes hot functions, measured at 3.6x on Court's solver (13.6s → 48.6s of test
+      // time for hintIntegration+corpus on the Windows clone) — enough to blow both the 20s
+      // default timeout and hintAudit's 900s budget, so the run died before emitting a report.
+      // Excluding them is not just expedient: these tests exercise GAME code, and no game
+      // source is in the coverage include list, so instrumenting them buys nothing here.
+      // The honest cost is that engine `runtime/**` coverage becomes a LOWER bound (a game
+      // test reaching engine runtime no longer counts); editor coverage — what this run
+      // exists to measure — is unaffected, since no game test can reach editor source.
+      ...(process.env.MODOKI_COVERAGE_ENGINE_ONLY === '1' ? [] : [
+        '../games/*/tests/**/*.test.ts',
+        '../games/*/tests/**/*.test.tsx',
+        '../games/*/packages/*/**/*.test.ts',
+        '../demos/*/tests/**/*.test.ts',
+        '../demos/*/tests/**/*.test.tsx',
+        '../demos/*/packages/*/**/*.test.ts',
+      ]),
     ],
     exclude: [
       '**/node_modules/**',

@@ -71,7 +71,7 @@ content hash, so tampering with a file changes its address and fails verificatio
 Ed25519. The private key lives outside the repo; the public key is baked into the app
 binary. **Verification happens in JS** (`@noble/curves`), not native code — deliberately:
 this JS is already running and already trusted (it shipped in a signed binary, or is itself
-a previously-verified update), and Android's minSdk 24 predates native EdDSA (API 33), so
+a previously-verified update), and Android's minSdk 31 predates native EdDSA (API 33), so
 native verification would need a minSdk bump or a second hand-rolled curve implementation.
 One audited library shared by both platforms is strictly better.
 

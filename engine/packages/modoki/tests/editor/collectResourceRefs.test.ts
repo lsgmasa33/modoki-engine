@@ -70,6 +70,34 @@ describe('collectResourceRefs', () => {
     expect(refs).toContainEqual({ type: 'texture', path: SPRITE_GUID });
   });
 
+  it('collects a Renderable2D sprite as VIDEO when the GUID is a video asset', async () => {
+    // A 2D sprite showing a video is a legal authoring shape (the picture moves), but
+    // filing it as a 'texture' would describe the asset wrongly in the scene manifest —
+    // and the next reader to trust that type is the one who pays. Type by what the
+    // asset IS, mirroring Renderable3DPrimitive.material's texture-vs-material split.
+    const manifest = await import('../../src/runtime/loaders/assetManifest');
+    const VID_GUID = 'a0000000-0000-4000-8000-0000000000b1';
+    manifest.registerAsset(VID_GUID, '/games/x/assets/video/loop.mp4', 'video');
+    const { collectResourceRefs } = await getModule();
+    const refs = collectResourceRefs([
+      entity('screen', { Renderable2D: { sprite: VID_GUID } }),
+    ]);
+    expect(refs).toContainEqual({ type: 'video', path: VID_GUID });
+    expect(refs).not.toContainEqual({ type: 'texture', path: VID_GUID });
+  });
+
+  it('extracts the scalar VideoPlayer.clip by GUID', async () => {
+    // Without this the clip is absent from the scene `resources` manifest entirely —
+    // survivable today only because the tree-shaker probes trait GUIDs generically,
+    // which is a different mechanism that could stop covering it.
+    const { collectResourceRefs } = await getModule();
+    const CLIP_GUID = 'a0000000-0000-4000-8000-0000000000b2';
+    const refs = collectResourceRefs([
+      entity('screen', { VideoPlayer: { clip: CLIP_GUID, loop: true } }),
+    ]);
+    expect(refs).toContainEqual({ type: 'video', path: CLIP_GUID });
+  });
+
   it('extracts sprite refs from Renderable2D starting with http', async () => {
     const { collectResourceRefs } = await getModule();
     const refs = collectResourceRefs([

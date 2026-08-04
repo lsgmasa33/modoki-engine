@@ -1,35 +1,21 @@
 {
   "id": "f060328d-a0b1-4015-80d7-4f997b8fb858",
-  "version": 9,
+  "version": 12,
   "createdAt": "2026-07-04T08:29:29.144Z",
   "resources": [],
   "entities": [
     {
-      "id": 1,
       "name": "Camera",
       "traits": {
-        "Transform": {
-          "x": 0,
-          "y": 0,
-          "z": 0,
-          "rx": 0,
-          "ry": 0,
-          "rz": 0,
-          "sx": 1,
-          "sy": 1,
-          "sz": 1
-        },
+        "Transform": {},
         "Camera": {
           "fov": 50,
-          "near": 0.1,
           "far": 1000,
           "overlayDistance": 10,
           "clearColor": 921114
         },
         "EntityAttributes": {
           "name": "Camera",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "",
           "layer": "3d",
           "guid": "d331b383-a514-47a2-aed4-775fd058e57e"
@@ -37,33 +23,22 @@
       }
     },
     {
-      "id": 2,
       "name": "Physics2D",
       "traits": {
-        "Physics2D": {
-          "gravityX": 0,
-          "gravityY": 9.81,
-          "pixelsPerMeter": 100
-        },
+        "Physics2D": {},
         "EntityAttributes": {
           "name": "Physics2D",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "",
-          "layer": "",
           "guid": "f5269e82-411d-49b7-9a5a-ddde631ac053"
         }
       }
     },
     {
-      "id": 3,
       "name": "Playground",
       "traits": {
         "RenderableUI": true,
         "EntityAttributes": {
           "name": "Playground",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "",
           "layer": "ui",
           "guid": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9"
@@ -71,77 +46,10 @@
         "UIElement": {
           "width": 100,
           "height": 100,
-          "widthUnit": "%",
-          "heightUnit": "%",
-          "flexDirection": "column",
-          "flexWrap": "nowrap",
-          "justifyContent": "flex-start",
-          "alignItems": "stretch",
-          "gap": 0,
-          "flexGrow": 0,
-          "flexShrink": 1,
-          "paddingTop": 0,
-          "paddingTopUnit": "%",
-          "paddingLeft": 0,
-          "paddingLeftUnit": "%",
-          "paddingRight": 0,
-          "paddingRightUnit": "%",
-          "paddingBottom": 0,
-          "paddingBottomUnit": "%",
-          "marginTop": 0,
-          "marginTopUnit": "%",
-          "marginRight": 0,
-          "marginRightUnit": "%",
-          "marginBottom": 0,
-          "marginBottomUnit": "%",
-          "marginLeft": 0,
-          "marginLeftUnit": "%",
-          "minWidth": 0,
-          "minWidthUnit": "px",
-          "maxWidth": 0,
-          "maxWidthUnit": "px",
-          "minHeight": 0,
-          "minHeightUnit": "px",
-          "maxHeight": 0,
-          "maxHeightUnit": "px",
-          "alignSelf": "auto",
-          "zIndex": 0,
           "overflow": "hidden",
-          "isVisible": true,
           "backgroundColor": 1315880,
           "backgroundOpacity": 1,
-          "borderRadius": 0,
-          "borderWidth": 0,
-          "borderColor": 3359829,
-          "borderOpacity": 1,
-          "opacity": 1,
-          "text": "",
-          "fontFamily": "",
-          "fontSize": 16,
-          "fontWeight": "normal",
-          "fontStyle": "normal",
-          "textColor": 16777215,
-          "textOpacity": 1,
-          "textAlign": "left",
-          "lineHeight": 0,
-          "letterSpacing": 0,
-          "textShadowColor": 0,
-          "textShadowOpacity": 1,
-          "textShadowOffsetX": 0,
-          "textShadowOffsetY": 0,
-          "textShadowBlur": 0,
-          "textStrokeColor": 0,
-          "textStrokeOpacity": 1,
-          "textStrokeWidth": 0,
-          "textOverflow": "clip",
-          "maxLines": 0,
-          "imageSrc": "",
-          "imageMode": "cover",
-          "elementType": "div",
-          "placeholder": "",
-          "rangeMin": 0,
-          "rangeMax": 100,
-          "rangeStep": 1
+          "borderColor": 3359829
         },
         "Canvas2D": {
           "referenceWidth": 1000,
@@ -149,78 +57,36 @@
           "scaleMode": "contain"
         },
         "UIAnchor": {
-          "anchor": "stretch",
-          "top": 0,
-          "topUnit": "px",
-          "left": 0,
-          "leftUnit": "px",
-          "right": 0,
-          "rightUnit": "px",
-          "bottom": 0,
-          "bottomUnit": "px",
-          "pivotX": 0,
-          "pivotY": 0,
-          "safeArea": false,
-          "zIndex": 0
+          "safeArea": false
         }
       }
     },
     {
-      "id": 4,
       "name": "Floor",
       "traits": {
         "Transform": {
           "x": 500,
-          "y": 965,
-          "z": 0,
-          "rx": 0,
-          "ry": 0,
-          "rz": 0,
-          "sx": 1,
-          "sy": 1,
-          "sz": 1
+          "y": 965
         },
         "Renderable2D": {
           "sprite": "square",
           "color": 5596791,
-          "opacity": 1,
-          "width": 470,
-          "height": 20,
-          "pivotX": 0.5,
-          "pivotY": 0.5,
-          "keepAspect": false,
-          "flipX": false,
-          "flipY": false,
-          "isVisible": true,
-          "orderInLayer": 0
+          "width": 470
         },
         "RigidBody2D": {
           "bodyType": "static",
-          "linearDamping": 0,
-          "angularDamping": 0.05,
-          "gravityScale": 1,
-          "fixedRotation": false,
-          "ccd": false,
-          "canSleep": true
+          "angularDamping": 0.05
         },
         "Collider2D": {
-          "shape": "box",
           "radius": 0,
           "halfW": 470,
           "halfH": 20,
-          "points": "",
-          "density": 1,
           "friction": 0.6,
           "restitution": 0.4,
-          "isSensor": false,
-          "physicsLayer": "Ground",
-          "collisionGroups": 65535,
-          "collisionMask": 65535
+          "physicsLayer": "Ground"
         },
         "EntityAttributes": {
           "name": "Floor",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
           "layer": "2d",
           "guid": "25eb2ba6-c1e1-475e-8ac8-6975e0f50962"
@@ -228,61 +94,31 @@
       }
     },
     {
-      "id": 5,
       "name": "Left Wall",
       "traits": {
         "Transform": {
           "x": 20,
-          "y": 500,
-          "z": 0,
-          "rx": 0,
-          "ry": 0,
-          "rz": 0,
-          "sx": 1,
-          "sy": 1,
-          "sz": 1
+          "y": 500
         },
         "Renderable2D": {
           "sprite": "square",
           "color": 5596791,
-          "opacity": 1,
-          "width": 20,
-          "height": 470,
-          "pivotX": 0.5,
-          "pivotY": 0.5,
-          "keepAspect": false,
-          "flipX": false,
-          "flipY": false,
-          "isVisible": true,
-          "orderInLayer": 0
+          "height": 470
         },
         "RigidBody2D": {
           "bodyType": "static",
-          "linearDamping": 0,
-          "angularDamping": 0.05,
-          "gravityScale": 1,
-          "fixedRotation": false,
-          "ccd": false,
-          "canSleep": true
+          "angularDamping": 0.05
         },
         "Collider2D": {
-          "shape": "box",
           "radius": 0,
           "halfW": 20,
           "halfH": 470,
-          "points": "",
-          "density": 1,
           "friction": 0.6,
           "restitution": 0.3,
-          "isSensor": false,
-          "physicsLayer": "Ground",
-          "collisionGroups": 65535,
-          "collisionMask": 65535
+          "physicsLayer": "Ground"
         },
         "EntityAttributes": {
           "name": "Left Wall",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
           "layer": "2d",
           "guid": "2bc56c57-e34e-40da-ab51-e345cdfada1c"
@@ -290,61 +126,31 @@
       }
     },
     {
-      "id": 6,
       "name": "Right Wall",
       "traits": {
         "Transform": {
           "x": 980,
-          "y": 500,
-          "z": 0,
-          "rx": 0,
-          "ry": 0,
-          "rz": 0,
-          "sx": 1,
-          "sy": 1,
-          "sz": 1
+          "y": 500
         },
         "Renderable2D": {
           "sprite": "square",
           "color": 5596791,
-          "opacity": 1,
-          "width": 20,
-          "height": 470,
-          "pivotX": 0.5,
-          "pivotY": 0.5,
-          "keepAspect": false,
-          "flipX": false,
-          "flipY": false,
-          "isVisible": true,
-          "orderInLayer": 0
+          "height": 470
         },
         "RigidBody2D": {
           "bodyType": "static",
-          "linearDamping": 0,
-          "angularDamping": 0.05,
-          "gravityScale": 1,
-          "fixedRotation": false,
-          "ccd": false,
-          "canSleep": true
+          "angularDamping": 0.05
         },
         "Collider2D": {
-          "shape": "box",
           "radius": 0,
           "halfW": 20,
           "halfH": 470,
-          "points": "",
-          "density": 1,
           "friction": 0.6,
           "restitution": 0.3,
-          "isSensor": false,
-          "physicsLayer": "Ground",
-          "collisionGroups": 65535,
-          "collisionMask": 65535
+          "physicsLayer": "Ground"
         },
         "EntityAttributes": {
           "name": "Right Wall",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
           "layer": "2d",
           "guid": "9bd0063d-53a0-41e3-a764-1b7317409a0f"
@@ -352,61 +158,29 @@
       }
     },
     {
-      "id": 7,
       "name": "Box A",
       "traits": {
         "Transform": {
           "x": 250,
-          "y": 760,
-          "z": 0,
-          "rx": 0,
-          "ry": 0,
-          "rz": 0,
-          "sx": 1,
-          "sy": 1,
-          "sz": 1
+          "y": 760
         },
         "Renderable2D": {
           "sprite": "square",
           "color": 15158332,
-          "opacity": 1,
           "width": 40,
-          "height": 40,
-          "pivotX": 0.5,
-          "pivotY": 0.5,
-          "keepAspect": false,
-          "flipX": false,
-          "flipY": false,
-          "isVisible": true,
-          "orderInLayer": 0
+          "height": 40
         },
         "RigidBody2D": {
-          "bodyType": "dynamic",
-          "linearDamping": 0,
-          "angularDamping": 0.05,
-          "gravityScale": 1,
-          "fixedRotation": false,
-          "ccd": false,
-          "canSleep": true
+          "angularDamping": 0.05
         },
         "Collider2D": {
-          "shape": "box",
           "radius": 0,
           "halfW": 40,
           "halfH": 40,
-          "points": "",
-          "density": 1,
-          "friction": 0.5,
-          "restitution": 0.2,
-          "isSensor": false,
-          "physicsLayer": "Default",
-          "collisionGroups": 65535,
-          "collisionMask": 65535
+          "restitution": 0.2
         },
         "EntityAttributes": {
           "name": "Box A",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
           "layer": "2d",
           "guid": "a1cce1ac-ce0f-4a34-94c8-5d8388b403eb"
@@ -414,61 +188,29 @@
       }
     },
     {
-      "id": 8,
       "name": "Box B",
       "traits": {
         "Transform": {
           "x": 258,
-          "y": 560,
-          "z": 0,
-          "rx": 0,
-          "ry": 0,
-          "rz": 0,
-          "sx": 1,
-          "sy": 1,
-          "sz": 1
+          "y": 560
         },
         "Renderable2D": {
           "sprite": "square",
           "color": 15965202,
-          "opacity": 1,
           "width": 40,
-          "height": 40,
-          "pivotX": 0.5,
-          "pivotY": 0.5,
-          "keepAspect": false,
-          "flipX": false,
-          "flipY": false,
-          "isVisible": true,
-          "orderInLayer": 0
+          "height": 40
         },
         "RigidBody2D": {
-          "bodyType": "dynamic",
-          "linearDamping": 0,
-          "angularDamping": 0.05,
-          "gravityScale": 1,
-          "fixedRotation": false,
-          "ccd": false,
-          "canSleep": true
+          "angularDamping": 0.05
         },
         "Collider2D": {
-          "shape": "box",
           "radius": 0,
           "halfW": 40,
           "halfH": 40,
-          "points": "",
-          "density": 1,
-          "friction": 0.5,
-          "restitution": 0.2,
-          "isSensor": false,
-          "physicsLayer": "Default",
-          "collisionGroups": 65535,
-          "collisionMask": 65535
+          "restitution": 0.2
         },
         "EntityAttributes": {
           "name": "Box B",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
           "layer": "2d",
           "guid": "daf05f86-d8e6-447d-954b-1bdef005a53b"
@@ -476,61 +218,29 @@
       }
     },
     {
-      "id": 9,
       "name": "Box C",
       "traits": {
         "Transform": {
           "x": 242,
-          "y": 360,
-          "z": 0,
-          "rx": 0,
-          "ry": 0,
-          "rz": 0,
-          "sx": 1,
-          "sy": 1,
-          "sz": 1
+          "y": 360
         },
         "Renderable2D": {
           "sprite": "square",
           "color": 10181046,
-          "opacity": 1,
           "width": 40,
-          "height": 40,
-          "pivotX": 0.5,
-          "pivotY": 0.5,
-          "keepAspect": false,
-          "flipX": false,
-          "flipY": false,
-          "isVisible": true,
-          "orderInLayer": 0
+          "height": 40
         },
         "RigidBody2D": {
-          "bodyType": "dynamic",
-          "linearDamping": 0,
-          "angularDamping": 0.05,
-          "gravityScale": 1,
-          "fixedRotation": false,
-          "ccd": false,
-          "canSleep": true
+          "angularDamping": 0.05
         },
         "Collider2D": {
-          "shape": "box",
           "radius": 0,
           "halfW": 40,
           "halfH": 40,
-          "points": "",
-          "density": 1,
-          "friction": 0.5,
-          "restitution": 0.2,
-          "isSensor": false,
-          "physicsLayer": "Default",
-          "collisionGroups": 65535,
-          "collisionMask": 65535
+          "restitution": 0.2
         },
         "EntityAttributes": {
           "name": "Box C",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
           "layer": "2d",
           "guid": "75353351-ea1e-4ce7-a22c-52bcb1e4d5ac"
@@ -538,61 +248,33 @@
       }
     },
     {
-      "id": 10,
       "name": "Ghost Ball",
       "traits": {
         "Transform": {
           "x": 272.1246911037891,
-          "y": 140,
-          "z": 0,
-          "rx": 0,
-          "ry": 0,
-          "rz": 0,
-          "sx": 1,
-          "sy": 1,
-          "sz": 1
+          "y": 140
         },
         "Renderable2D": {
           "sprite": "circle",
           "color": 10181046,
           "opacity": 0.4,
           "width": 30,
-          "height": 30,
-          "pivotX": 0.5,
-          "pivotY": 0.5,
-          "keepAspect": false,
-          "flipX": false,
-          "flipY": false,
-          "isVisible": true,
-          "orderInLayer": 0
+          "height": 30
         },
         "RigidBody2D": {
-          "bodyType": "dynamic",
-          "linearDamping": 0,
-          "angularDamping": 0.05,
-          "gravityScale": 1,
-          "fixedRotation": false,
-          "ccd": false,
-          "canSleep": true
+          "angularDamping": 0.05
         },
         "Collider2D": {
           "shape": "circle",
           "radius": 30,
           "halfW": 0,
           "halfH": 0,
-          "points": "",
-          "density": 1,
           "friction": 0.4,
           "restitution": 0.3,
-          "isSensor": false,
-          "physicsLayer": "Ghost",
-          "collisionGroups": 65535,
-          "collisionMask": 65535
+          "physicsLayer": "Ghost"
         },
         "EntityAttributes": {
           "name": "Ghost Ball",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
           "layer": "2d",
           "guid": "c9e7a1b4-3f2d-4a6e-8b1c-2d5f9e0a7c31"
@@ -600,61 +282,31 @@
       }
     },
     {
-      "id": 11,
       "name": "Bouncy Ball",
       "traits": {
         "Transform": {
           "x": 500,
-          "y": 250,
-          "z": 0,
-          "rx": 0,
-          "ry": 0,
-          "rz": 0,
-          "sx": 1,
-          "sy": 1,
-          "sz": 1
+          "y": 250
         },
         "Renderable2D": {
           "sprite": "circle",
           "color": 3066993,
-          "opacity": 1,
           "width": 45,
-          "height": 45,
-          "pivotX": 0.5,
-          "pivotY": 0.5,
-          "keepAspect": false,
-          "flipX": false,
-          "flipY": false,
-          "isVisible": true,
-          "orderInLayer": 0
+          "height": 45
         },
         "RigidBody2D": {
-          "bodyType": "dynamic",
-          "linearDamping": 0,
-          "angularDamping": 0.05,
-          "gravityScale": 1,
-          "fixedRotation": false,
-          "ccd": false,
-          "canSleep": true
+          "angularDamping": 0.05
         },
         "Collider2D": {
           "shape": "circle",
           "radius": 45,
           "halfW": 0,
           "halfH": 0,
-          "points": "",
-          "density": 1,
           "friction": 0.3,
-          "restitution": 0.9,
-          "isSensor": false,
-          "physicsLayer": "Default",
-          "collisionGroups": 65535,
-          "collisionMask": 65535
+          "restitution": 0.9
         },
         "EntityAttributes": {
           "name": "Bouncy Ball",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
           "layer": "2d",
           "guid": "ed229002-cd09-4c7c-8bdf-8f2d040d1b6e"
@@ -662,61 +314,32 @@
       }
     },
     {
-      "id": 12,
       "name": "Pendulum Anchor",
       "traits": {
         "Transform": {
           "x": 250,
-          "y": 220,
-          "z": 0,
-          "rx": 0,
-          "ry": 0,
-          "rz": 0,
-          "sx": 1,
-          "sy": 1,
-          "sz": 1
+          "y": 220
         },
         "Renderable2D": {
           "sprite": "circle",
           "color": 8947848,
-          "opacity": 1,
           "width": 10,
-          "height": 10,
-          "pivotX": 0.5,
-          "pivotY": 0.5,
-          "keepAspect": false,
-          "flipX": false,
-          "flipY": false,
-          "isVisible": true,
-          "orderInLayer": 0
+          "height": 10
         },
         "RigidBody2D": {
           "bodyType": "static",
-          "linearDamping": 0,
-          "angularDamping": 0.05,
-          "gravityScale": 1,
-          "fixedRotation": false,
-          "ccd": false,
-          "canSleep": true
+          "angularDamping": 0.05
         },
         "Collider2D": {
           "shape": "circle",
           "radius": 10,
           "halfW": 0,
           "halfH": 0,
-          "points": "",
-          "density": 1,
           "friction": 0.4,
-          "restitution": 0.3,
-          "isSensor": false,
-          "physicsLayer": "Default",
-          "collisionGroups": 65535,
-          "collisionMask": 65535
+          "restitution": 0.3
         },
         "EntityAttributes": {
           "name": "Pendulum Anchor",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
           "layer": "2d",
           "guid": "d585385a-cc71-404c-a9e8-e96bee458f7a"
@@ -724,61 +347,31 @@
       }
     },
     {
-      "id": 13,
       "name": "Pendulum Bob",
       "traits": {
         "Transform": {
           "x": 450,
-          "y": 220,
-          "z": 0,
-          "rx": 0,
-          "ry": 0,
-          "rz": 0,
-          "sx": 1,
-          "sy": 1,
-          "sz": 1
+          "y": 220
         },
         "Renderable2D": {
           "sprite": "circle",
           "color": 3447003,
-          "opacity": 1,
           "width": 30,
-          "height": 30,
-          "pivotX": 0.5,
-          "pivotY": 0.5,
-          "keepAspect": false,
-          "flipX": false,
-          "flipY": false,
-          "isVisible": true,
-          "orderInLayer": 0
+          "height": 30
         },
         "RigidBody2D": {
-          "bodyType": "dynamic",
-          "linearDamping": 0,
-          "angularDamping": 0.05,
-          "gravityScale": 1,
-          "fixedRotation": false,
-          "ccd": false,
-          "canSleep": true
+          "angularDamping": 0.05
         },
         "Collider2D": {
           "shape": "circle",
           "radius": 30,
           "halfW": 0,
           "halfH": 0,
-          "points": "",
-          "density": 1,
           "friction": 0,
-          "restitution": 0.3,
-          "isSensor": false,
-          "physicsLayer": "Default",
-          "collisionGroups": 65535,
-          "collisionMask": 65535
+          "restitution": 0.3
         },
         "EntityAttributes": {
           "name": "Pendulum Bob",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
           "layer": "2d",
           "guid": "addc1d7c-85f1-4bca-a10c-8ce66606558b"
@@ -786,97 +379,48 @@
       }
     },
     {
-      "id": 14,
       "name": "Pendulum Joint",
       "traits": {
         "Joint2D": {
           "type": "revolute",
           "entityA": "d585385a-cc71-404c-a9e8-e96bee458f7a",
           "entityB": "addc1d7c-85f1-4bca-a10c-8ce66606558b",
-          "anchorAX": 0,
-          "anchorAY": 0,
-          "anchorBX": -200,
-          "anchorBY": 0,
-          "length": 100,
-          "stiffness": 50,
-          "damping": 5,
-          "axisX": 1,
-          "axisY": 0,
-          "limitsEnabled": false,
-          "limitMin": 0,
-          "limitMax": 0,
-          "motorEnabled": false,
-          "motorTargetVel": 0,
-          "motorTargetPos": 0,
-          "motorStiffness": 0,
-          "motorDamping": 1
+          "anchorBX": -200
         },
         "EntityAttributes": {
           "name": "Pendulum Joint",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "",
-          "layer": "",
           "guid": "3f727e26-9c14-485f-ae65-85f79f9a695d"
         }
       }
     },
     {
-      "id": 15,
       "name": "Spring Anchor",
       "traits": {
         "Transform": {
           "x": 780,
-          "y": 150,
-          "z": 0,
-          "rx": 0,
-          "ry": 0,
-          "rz": 0,
-          "sx": 1,
-          "sy": 1,
-          "sz": 1
+          "y": 150
         },
         "Renderable2D": {
           "sprite": "circle",
           "color": 8947848,
-          "opacity": 1,
           "width": 10,
-          "height": 10,
-          "pivotX": 0.5,
-          "pivotY": 0.5,
-          "keepAspect": false,
-          "flipX": false,
-          "flipY": false,
-          "isVisible": true,
-          "orderInLayer": 0
+          "height": 10
         },
         "RigidBody2D": {
           "bodyType": "static",
-          "linearDamping": 0,
-          "angularDamping": 0.05,
-          "gravityScale": 1,
-          "fixedRotation": false,
-          "ccd": false,
-          "canSleep": true
+          "angularDamping": 0.05
         },
         "Collider2D": {
           "shape": "circle",
           "radius": 10,
           "halfW": 0,
           "halfH": 0,
-          "points": "",
-          "density": 1,
           "friction": 0.4,
-          "restitution": 0.3,
-          "isSensor": false,
-          "physicsLayer": "Default",
-          "collisionGroups": 65535,
-          "collisionMask": 65535
+          "restitution": 0.3
         },
         "EntityAttributes": {
           "name": "Spring Anchor",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
           "layer": "2d",
           "guid": "07d36d40-a148-4f64-b4e2-4f8292de6b23"
@@ -884,61 +428,32 @@
       }
     },
     {
-      "id": 16,
       "name": "Spring Bob",
       "traits": {
         "Transform": {
           "x": 780,
-          "y": 500,
-          "z": 0,
-          "rx": 0,
-          "ry": 0,
-          "rz": 0,
-          "sx": 1,
-          "sy": 1,
-          "sz": 1
+          "y": 500
         },
         "Renderable2D": {
           "sprite": "circle",
           "color": 1752220,
-          "opacity": 1,
           "width": 28,
-          "height": 28,
-          "pivotX": 0.5,
-          "pivotY": 0.5,
-          "keepAspect": false,
-          "flipX": false,
-          "flipY": false,
-          "isVisible": true,
-          "orderInLayer": 0
+          "height": 28
         },
         "RigidBody2D": {
-          "bodyType": "dynamic",
-          "linearDamping": 0,
           "angularDamping": 0.05,
-          "gravityScale": 1,
-          "fixedRotation": false,
-          "ccd": true,
-          "canSleep": true
+          "ccd": true
         },
         "Collider2D": {
           "shape": "circle",
           "radius": 28,
           "halfW": 0,
           "halfH": 0,
-          "points": "",
-          "density": 1,
           "friction": 0.4,
-          "restitution": 0.4,
-          "isSensor": false,
-          "physicsLayer": "Default",
-          "collisionGroups": 65535,
-          "collisionMask": 65535
+          "restitution": 0.4
         },
         "EntityAttributes": {
           "name": "Spring Bob",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
           "layer": "2d",
           "guid": "008b5be1-dcb2-4f85-aac2-72fbdfd9e35e"
@@ -946,92 +461,46 @@
       }
     },
     {
-      "id": 17,
       "name": "Spring Joint",
       "traits": {
         "Joint2D": {
-          "type": "spring",
           "entityA": "07d36d40-a148-4f64-b4e2-4f8292de6b23",
           "entityB": "008b5be1-dcb2-4f85-aac2-72fbdfd9e35e",
-          "anchorAX": 0,
-          "anchorAY": 0,
-          "anchorBX": 0,
-          "anchorBY": 0,
           "length": 120,
           "stiffness": 70,
-          "damping": 0.2,
-          "axisX": 1,
-          "axisY": 0,
-          "limitsEnabled": false,
-          "limitMin": 0,
-          "limitMax": 0,
-          "motorEnabled": false,
-          "motorTargetVel": 0,
-          "motorTargetPos": 0,
-          "motorStiffness": 0,
-          "motorDamping": 1
+          "damping": 0.2
         },
         "EntityAttributes": {
           "name": "Spring Joint",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "",
-          "layer": "",
           "guid": "9bd2ba6a-3270-490d-a318-a183ddf592ec"
         }
       }
     },
     {
-      "id": 18,
       "name": "Sensor Zone",
       "traits": {
         "Transform": {
           "x": 500,
-          "y": 620,
-          "z": 0,
-          "rx": 0,
-          "ry": 0,
-          "rz": 0,
-          "sx": 1,
-          "sy": 1,
-          "sz": 1
+          "y": 620
         },
         "Renderable2D": {
           "sprite": "square",
           "color": 15844367,
           "opacity": 0.25,
           "width": 400,
-          "height": 15,
-          "pivotX": 0.5,
-          "pivotY": 0.5,
-          "keepAspect": false,
-          "flipX": false,
-          "flipY": false,
-          "isVisible": true,
-          "orderInLayer": 0
+          "height": 15
         },
         "RigidBody2D": {
           "bodyType": "static",
-          "linearDamping": 0,
-          "angularDamping": 0.05,
-          "gravityScale": 1,
-          "fixedRotation": false,
-          "ccd": false,
-          "canSleep": true
+          "angularDamping": 0.05
         },
         "Collider2D": {
-          "shape": "box",
           "radius": 0,
           "halfW": 170,
           "halfH": 15,
-          "points": "",
-          "density": 1,
-          "friction": 0.5,
           "restitution": 0.2,
-          "isSensor": true,
-          "physicsLayer": "Default",
-          "collisionGroups": 65535,
-          "collisionMask": 65535
+          "isSensor": true
         },
         "OnCollision2D": {
           "onEnter": "sensorZone/enter",
@@ -1039,8 +508,6 @@
         },
         "EntityAttributes": {
           "name": "Sensor Zone",
-          "isActive": true,
-          "sortOrder": 0,
           "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
           "layer": "2d",
           "guid": "31dea4a2-f407-420e-a8a6-1b070d7ac099"
@@ -1048,12 +515,9 @@
       }
     },
     {
-      "id": 19,
       "name": "Time (resource)",
       "traits": {
-        "Time": {
-          "timeScale": 1
-        }
+        "Time": {}
       }
     }
   ]

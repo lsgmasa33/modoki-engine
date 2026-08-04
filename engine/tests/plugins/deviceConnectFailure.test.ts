@@ -6,6 +6,8 @@
  *  perfectly healthy. Measured on the iPhone Air 2026-08-02; it cost about an hour. */
 
 import { describe, it, expect } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
 import { explainConnectFailure, DEVICE_PORT } from '../../plugins/backend/deviceConnection';
 
 describe('explainConnectFailure', () => {
@@ -28,5 +30,26 @@ describe('explainConnectFailure', () => {
     const raw = 'adb forward failed: device offline';
     expect(explainConnectFailure(raw, DEVICE_PORT)).toBe(raw);
     expect(explainConnectFailure(undefined, DEVICE_PORT)).toBeUndefined();
+  });
+
+  // The message ends by telling the reader to `device_connect {ip:"…", port:<actual>}`. That advice
+  // was UNACTIONABLE for months: the backend, the lease and this message all supported `port`, but
+  // the MCP tool's schema declared only {ip, useAdb}, so following the instruction returned
+  // "unrecognized parameter" and the session dead-ended on the very error written to rescue it
+  // (#122, found on an iPhone 7 where three consecutive launches fell back off 9095).
+  //
+  // Asserting the SCHEMA from here — rather than in the MCP package — is deliberate: the advice and
+  // the parameter it names live in different packages, and it is the DRIFT between them that broke.
+  it('advertises a `port` option the device_connect tool actually accepts', () => {
+    const advice = explainConnectFailure('connect ECONNREFUSED 192.168.1.181:9095', DEVICE_PORT)!;
+    expect(advice).toContain('port:<actual>');
+
+    const toolSrc = fs.readFileSync(
+      path.resolve(__dirname, '../../tools/game-debug-mcp/src/mcp-tools.ts'), 'utf8');
+    const schema = toolSrc.slice(toolSrc.indexOf("tool('device_connect'"), toolSrc.indexOf('async ({ ip, useAdb'));
+    expect(schema).toMatch(/\bport:\s*z\.number\(\)/);
+    // …and that it is threaded through to the backend, not merely declared.
+    const body = toolSrc.slice(toolSrc.indexOf("tool('device_connect'"), toolSrc.indexOf("tool('device_disconnect'"));
+    expect(body).toContain('port !== undefined ? { port } : {}');
   });
 });

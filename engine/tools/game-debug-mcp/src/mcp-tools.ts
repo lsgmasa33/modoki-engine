@@ -486,13 +486,22 @@ export function registerTools(server: McpServer) {
     'Connect the editor to a device (open the Modoki lease) — the same action as the AI panel\'s ' +
       '"Connect a Device". Pass `ip` (WiFi — the IP shown in the game\'s debug menu → Device tab) or ' +
       '`useAdb:true` (Android over USB via `adb forward`). With NEITHER, reconnects to the last target ' +
-      'this clone used. Bounded (~6s); on failure it reports why (wrong IP / not same WiFi / not a Debug ' +
+      'this clone used. `port` overrides the fixed 9095 when the app fell back to an OS-assigned one. ' +
+      'Bounded (~6s); on failure it reports why (wrong IP / not same WiFi / not a Debug ' +
       'build / firewalled). Then device_* tools proxy through the lease.',
     {
       ip: z.string().optional().describe('Device LAN IP (WiFi). Omit when useAdb, or to reuse the last IP.'),
       useAdb: z.boolean().optional().describe('Android over USB via adb forward (ignores ip).'),
+      // The device port is a FIXED 9095 by design; this is the escape hatch for the fallback case.
+      // When another Modoki app already holds 9095 the app you just launched binds an OS-assigned
+      // port instead (#88) and is perfectly healthy — just unreachable at the default. The lease,
+      // `/api/device/connect` and `explainConnectFailure`'s own advice ("pass it directly:
+      // device_connect {ip:"…", port:<actual>}") all supported this already; only THIS schema did
+      // not, so the error message dead-ended the session it was written to rescue (#122).
+      port: z.number().int().positive().optional()
+        .describe('Bound TCP port, when the app fell back off the default 9095 — read it from the device log ("TCP server listening on port N") or the in-game debug menu.'),
     },
-    async ({ ip, useAdb }) => {
+    async ({ ip, useAdb, port }) => {
       try {
         // A new lease means the old device's screenshot scale is meaningless. `currentScreenInfo`
         // also catches this lazily (the human can reconnect from the AI panel without telling us),
@@ -501,6 +510,7 @@ export function registerTools(server: McpServer) {
         const s = (await backendPost('/api/device/connect', {
           ...(ip ? { ip } : {}),
           ...(useAdb !== undefined ? { useAdb } : {}),
+          ...(port !== undefined ? { port } : {}),
         })) as LeaseStatus;
         if (s.state !== 'connected') {
           return deviceFail({

@@ -39,6 +39,17 @@ export interface FontImportSettings {
   atlasMax: number;
   /** How glyphs are sourced at runtime (baked-only vs baked-seeded dynamic gen). */
   mode: FontMode;
+  /** Whether the build ships the source `.ttf`/`.otf` alongside the baked atlas.
+   *  `auto` (default) ships it only when the static asset-shaker finds a DOM
+   *  consumer — a `UIElement.fontFamily` (or `resources[]` `type:'font'`) naming
+   *  this font's CSS family — since DOM/PixiJS text goes through the browser's
+   *  FontFace API and needs the real outlines; CANVAS text (`Text2D.font`, a GUID)
+   *  renders from the atlas alone. `always` forces shipping even with no detected
+   *  DOM usage — the escape hatch for a family named from CODE (a runtime string,
+   *  not a scene field) or from a stylesheet the static scan can't see. `never`
+   *  forces dropping it even if DOM usage IS detected (accepting a fallback face)
+   *  when the payload isn't worth it. */
+  shipSource?: 'auto' | 'always' | 'never';
 }
 
 export const DEFAULT_FONT_SETTINGS: FontImportSettings = {
@@ -60,6 +71,7 @@ export const DEFAULT_FONT_SETTINGS: FontImportSettings = {
   // still packs into 1024²; the packer uses only what it needs).
   atlasMax: 2048,
   mode: 'baked',
+  shipSource: 'auto',
 };
 
 /** Cache bookkeeping persisted in the font's meta sidecar (`fontCache` block).
@@ -134,4 +146,11 @@ export interface FontManifestBlock {
   /** Baked atlas page dimensions in px. */
   atlasWidth?: number;
   atlasHeight?: number;
+  /** Whether the build shipped the source `.ttf`/`.otf` next to the atlas.
+   *  `false` means the shaker dropped it (`shipSource:'auto'` + no DOM usage
+   *  found, or an explicit `'never'`) — `loadAllFonts` must NOT FontFace-load
+   *  this entry's path, or it 404s and pads the "N/N fonts failed" warning with
+   *  a failure that isn't one. Absent/`true` means the source is available
+   *  (always the case in dev, which serves everything off disk). */
+  sourceShipped?: boolean;
 }

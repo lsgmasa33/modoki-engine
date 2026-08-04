@@ -135,14 +135,32 @@ const EMPTY_PART_ALIASES = {
   skinIndices: new Uint32Array(0), skinWeights: new Float32Array(0),
 };
 
-/** Coerce arbitrary JSON into a well-formed parsed rig (fill defaults, normalize
- *  weights, derive inverse-bind) so the deform system never sees a malformed rig.
- *  A v1 rig (top-level sprite/mesh/skinIndices/skinWeights) is normalized into a single
- *  `parts` entry; a v2 rig lists `parts` explicitly. The top-level mesh fields are kept
- *  as back-compat aliases pointing at `parts[0]`. */
-export function normalizeRig2D(json: Rig2DFile | undefined): ParsedRig2D {
-  const rawBones = Array.isArray(json?.bones) ? json!.bones! : [];
-  const bones: Rig2DBone[] = rawBones.map((b, i) => ({
+/** Coerce a raw `.rig2d.json` bone list into concrete bones with defaults.
+ *
+ *  **THE one copy** (#128). This lived inline in `normalizeRig2D` while the editor
+ *  carried three hand-copied siblings — `SkinEditor.concreteBones`,
+ *  `SkinCanvas.coerceBones` and `skinPrefab.coerceBones`. #105 Phase 4 unified the
+ *  first two into an editor-local module and declared the class closed; a body-identity
+ *  sweep found the other two. It lives HERE, in the layer that owns the format, because
+ *  the editor's copies had already drifted from this one in two ways nobody noticed:
+ *  they skipped the numeric coercion, and they dropped `noScale` entirely.
+ *
+ *  The file is hand-editable and every field is optional, so this is defensive by
+ *  design. Four guards are load-bearing and easy to "simplify" wrongly:
+ *
+ *   - `Array.isArray` — a `bones` that is present but not an array yields an empty
+ *     rig rather than throwing inside `.map`.
+ *   - `Number.isInteger(parent)` — NOT truthiness and NOT `typeof number`. Parent is an
+ *     INDEX; a float or numeric string would silently address the wrong bone in the
+ *     weight solver, and index **0** is a real bone a falsy check would reparent to root.
+ *   - `+(v ?? 0) || 0` on the transform fields — coerces a hand-typed `"10"` to a number
+ *     and collapses `NaN` to 0. The `?? 0` (not `|| 0`) is what lets a bone legitimately
+ *     at x:0, rot:0 keep those values before the coercion runs.
+ *   - `noScale` is carried through. It opts the bone out of inheriting its parent's
+ *     scale (`skin2DSystem` composes it via `removeScale2D`); dropping it silently
+ *     changes how an animated ancestor cascades. */
+export function coerceRigBones(raw: Rig2DFile['bones']): Rig2DBone[] {
+  return (Array.isArray(raw) ? raw : []).map((b, i) => ({
     name: typeof b?.name === 'string' && b.name ? b.name : `bone${i}`,
     parent: Number.isInteger(b?.parent) ? (b!.parent as number) : -1,
     x: +(b?.x ?? 0) || 0,
@@ -150,6 +168,15 @@ export function normalizeRig2D(json: Rig2DFile | undefined): ParsedRig2D {
     rot: +(b?.rot ?? 0) || 0,
     ...(b?.noScale ? { noScale: true } : {}),
   }));
+}
+
+/** Coerce arbitrary JSON into a well-formed parsed rig (fill defaults, normalize
+ *  weights, derive inverse-bind) so the deform system never sees a malformed rig.
+ *  A v1 rig (top-level sprite/mesh/skinIndices/skinWeights) is normalized into a single
+ *  `parts` entry; a v2 rig lists `parts` explicitly. The top-level mesh fields are kept
+ *  as back-compat aliases pointing at `parts[0]`. */
+export function normalizeRig2D(json: Rig2DFile | undefined): ParsedRig2D {
+  const bones = coerceRigBones(json?.bones);
   const boneIndexByName = new Map<string, number>();
   bones.forEach((b, i) => boneIndexByName.set(b.name, i));
   const { invBind } = deriveBindMatrices(bones);

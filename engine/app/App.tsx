@@ -14,6 +14,7 @@ import { GAMES } from 'virtual:modoki-games';
 import type { GameDefinition } from '@modoki/engine/runtime';
 import { setActiveResetPhase } from './ui/components/ErrorBoundary';
 import { audioDispose, audioResume } from '@modoki/engine/runtime';
+import { VideoOverlay } from '@modoki/engine/runtime';
 import { useKeyboardShift } from './hooks/useKeyboardShift';
 import { checkAppOtaUpdate, subscribeOtaGate, type OtaGateState } from './ota';
 import OtaRestartGate from './ui/components/OtaRestartGate';
@@ -346,6 +347,10 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
           ) : (
             <DefaultGameUILayer />
           )}
+          {/* Cutscene layer — above the game + UI, below the loading/OTA gates (a
+              download prompt must still win over a movie). Renders nothing unless a
+              presentation-mode clip is playing. */}
+          {__MODOKI_MODULE_VIDEO__ && <VideoOverlay />}
           <LoadingOverlay
             visible={!initialized || transitioning}
             progress={otaGate?.phase === 'downloading' ? {

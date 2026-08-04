@@ -65,4 +65,5 @@ export { OnCollision3D } from './OnCollision3D';
 export { Joint3D, type JointType3D } from './Joint3D';
 export { CharacterController3D } from './CharacterController3D';
 export { AudioSource } from './AudioSource';
+export { VideoPlayer } from './VideoPlayer';
 export { AudioListener } from './AudioListener';

@@ -43,6 +43,7 @@ function result(over: Partial<TreeShakeResult>): TreeShakeResult {
     warnings: [],
     orphans: [],
     orphanDetails: [],
+    domFontFiles: new Set(),
     ...over,
   };
 }

@@ -524,6 +524,165 @@ function healAndroidOrientation(projectRoot: string, cap: ProjectConfig['capacit
   return `synced Android screenOrientation=${value} (AndroidManifest)`;
 }
 
+/** Sync the iOS deployment target from `build.iosMinVersion`.
+ *
+ *  This is the NATIVE half of the same floor the JS bundle is built against (vite.config.ts
+ *  `build.target`). They were two independent hardcoded numbers and they disagreed: every
+ *  project's pbxproj said `IPHONEOS_DEPLOYMENT_TARGET = 15.0` while the bundle required 15.4,
+ *  so the App Store would happily offer the game to a 15.0–15.3 device — which installs it,
+ *  boots, and dies on `structuredClone`/`Array.at`/`Object.hasOwn`. Driving both from one
+ *  config value is what stops that reappearing.
+ *
+ *  Rewrites EVERY occurrence (`replace_all`): a Capacitor pbxproj carries the key once per
+ *  build configuration, and healing only the first leaves Release on the old floor — the
+ *  configuration that actually ships. */
+function healIosDeploymentTarget(projectRoot: string, minVersion: string): string | undefined {
+  if (!/^\d+(\.\d+)?$/.test(minVersion)) return undefined; // junk config → leave the project alone
+  const pbx = path.join(projectRoot, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+  if (!fs.existsSync(pbx)) return undefined;
+  const orig = fs.readFileSync(pbx, 'utf8');
+  const text = orig.replace(/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;/g, `IPHONEOS_DEPLOYMENT_TARGET = ${minVersion};`);
+  if (text === orig) return undefined;
+  fs.writeFileSync(pbx, text);
+  return `synced iOS deployment target = ${minVersion} (from build.iosMinVersion)`;
+}
+
+/** Sync the Android minSdkVersion from `build.androidMinSdk` — the Android sibling of
+ *  {@link healIosDeploymentTarget}.
+ *
+ *  `cap add` scaffolds `android/variables.gradle` with `minSdkVersion = 24` and nothing
+ *  ever revisits it, so without this heal every newly-scaffolded project silently ships
+ *  API 24 and the floor drifts per-project — exactly the class of drift `iosMinVersion`
+ *  was introduced to close on iOS.
+ *
+ *  Rewrites EVERY occurrence (`replace_all`): mirrors the pbxproj reasoning — heal every
+ *  match rather than just the first, so a duplicated/aliased assignment can't be left on
+ *  the old floor. */
+function healAndroidMinSdk(projectRoot: string, minSdk: number): string | undefined {
+  if (!Number.isInteger(minSdk) || minSdk < 21 || minSdk > 99) return undefined; // junk config → leave the project alone
+  const gradle = path.join(projectRoot, 'android', 'variables.gradle');
+  if (!fs.existsSync(gradle)) return undefined;
+  const orig = fs.readFileSync(gradle, 'utf8');
+  const text = orig.replace(/minSdkVersion\s*=\s*\d+/g, `minSdkVersion = ${minSdk}`);
+  if (text === orig) return undefined;
+  fs.writeFileSync(gradle, text);
+  return `synced Android minSdkVersion = ${minSdk} (from build.androidMinSdk)`;
+}
+
+/** The generated immersive-mode block in MainActivity.java. Fenced by marker comments so the
+ *  heal can find, replace, or remove exactly its own code and never touch a hand edit. */
+const IMMERSIVE_BEGIN = '    // modoki:immersive-begin — generated from project.config.json (capacitor.statusBarHidden)';
+const IMMERSIVE_END = '    // modoki:immersive-end';
+const IMMERSIVE_IMPORTS = [
+  'import android.os.Bundle;',
+  'import androidx.core.view.WindowCompat;',
+  'import androidx.core.view.WindowInsetsCompat;',
+  'import androidx.core.view.WindowInsetsControllerCompat;',
+];
+const IMMERSIVE_BODY = [
+  IMMERSIVE_BEGIN,
+  '    @Override',
+  '    public void onCreate(Bundle savedInstanceState) {',
+  '        super.onCreate(savedInstanceState);',
+  '        applyImmersiveMode();',
+  '    }',
+  '',
+  '    // The bars re-appear whenever the window loses and regains focus (notification shade, a',
+  '    // permission dialog, task switch), so hiding once in onCreate is NOT enough — re-apply.',
+  '    @Override',
+  '    public void onWindowFocusChanged(boolean hasFocus) {',
+  '        super.onWindowFocusChanged(hasFocus);',
+  '        if (hasFocus) applyImmersiveMode();',
+  '    }',
+  '',
+  '    private void applyImmersiveMode() {',
+  '        WindowCompat.setDecorFitsSystemWindows(getWindow(), false);',
+  '        WindowInsetsControllerCompat c =',
+  '            WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());',
+  '        if (c != null) {',
+  '            c.hide(WindowInsetsCompat.Type.systemBars());',
+  '            c.setSystemBarsBehavior(',
+  '                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);',
+  '        }',
+  '    }',
+  IMMERSIVE_END,
+].join('\n');
+
+/** Locate the generated `MainActivity.java` (its package dir mirrors the appId, so glob for it). */
+function findMainActivity(projectRoot: string): string | undefined {
+  const javaRoot = path.join(projectRoot, 'android', 'app', 'src', 'main', 'java');
+  if (!fs.existsSync(javaRoot)) return undefined;
+  const stack = [javaRoot];
+  while (stack.length) {
+    const dir = stack.pop()!;
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else if (e.name === 'MainActivity.java') return p;
+    }
+  }
+  return undefined;
+}
+
+/** Hide BOTH Android system bars (status + navigation) when `capacitor.statusBarHidden` is set.
+ *
+ *  Why this exists: `statusBarHidden` was honoured ONLY on iOS (Info.plist UIStatusBarHidden) even
+ *  though the config field's own contract promises an Android fullscreen flag too — so every
+ *  Android game shipped with the clock bar and the back/home/recents bar on top of it, silently.
+ *
+ *  Why BOTH bars, under a flag named for the status bar: on iOS `statusBarHidden` already means
+ *  "the OS chrome is gone, the game owns the screen" — there is no second bar to leave behind.
+ *  Hiding only Android's status bar would honour the field's letter and miss its intent, leaving
+ *  the navigation bar occupying the bottom of a portrait game.
+ *
+ *  Why Java and not a theme: `android:windowFullscreen` hides the status bar only; the navigation
+ *  bar needs WindowInsetsController. Idempotent — the block is marker-fenced, so re-running
+ *  replaces it exactly, and turning the flag off removes it. A MainActivity that has been hand-
+ *  edited (a non-empty class body with no marker) is left ALONE and reported, never clobbered. */
+function healAndroidFullscreen(projectRoot: string, cap: ProjectConfig['capacitor']): string | undefined {
+  const file = findMainActivity(projectRoot);
+  if (!file) return undefined;
+  const orig = fs.readFileSync(file, 'utf8');
+  const hasBlock = orig.includes(IMMERSIVE_BEGIN);
+  let text = orig;
+
+  if (!cap.statusBarHidden) {
+    if (!hasBlock) return undefined;
+    // Remove our block + the imports it needed, restoring the empty-body scaffold.
+    text = text.replace(new RegExp(`\\n?${escapeRe(IMMERSIVE_BEGIN)}[\\s\\S]*?${escapeRe(IMMERSIVE_END)}\\n?`), '\n');
+    for (const imp of IMMERSIVE_IMPORTS) text = text.replace(`${imp}\n`, '');
+    text = text.replace(/\{\s*\n\s*\}/, '{}');
+    if (text === orig) return undefined;
+    fs.writeFileSync(file, text);
+    return 'removed Android immersive fullscreen (statusBarHidden=false)';
+  }
+
+  if (hasBlock) {
+    // Refresh in place — keeps a stale generated block in sync with this engine version.
+    text = text.replace(new RegExp(`${escapeRe(IMMERSIVE_BEGIN)}[\\s\\S]*?${escapeRe(IMMERSIVE_END)}`), IMMERSIVE_BODY);
+  } else {
+    // Only inject into the untouched Capacitor scaffold (`class MainActivity ... {}`), so a game
+    // that has added its own onCreate is never silently rewritten.
+    const emptyBody = /(class\s+MainActivity\s+extends\s+BridgeActivity\s*)\{\s*\}/;
+    if (!emptyBody.test(text)) {
+      return 'Android immersive fullscreen SKIPPED — MainActivity.java has custom code; add the immersive block by hand';
+    }
+    text = text.replace(emptyBody, `$1{\n${IMMERSIVE_BODY}\n}`);
+  }
+  // Ensure imports (idempotent), inserted after the BridgeActivity import. REVERSED, because
+  // each insert goes directly after that same anchor line — walking the list forwards would
+  // emit it backwards. Order is cosmetic to javac, but generated code that doesn't match its
+  // own declared list reads like a bug the next time someone diffs it.
+  for (const imp of [...IMMERSIVE_IMPORTS].reverse()) {
+    if (!text.includes(imp)) text = text.replace(/(import com\.getcapacitor\.BridgeActivity;\n)/, `$1${imp}\n`);
+  }
+  if (text === orig) return undefined;
+  fs.writeFileSync(file, text);
+  return 'synced Android immersive fullscreen (status + navigation bars hidden)';
+}
+
+function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
 /** Run the native-config heal for a project. Safe to call on every open. */
 export function healNativeConfig(projectRoot: string): HealResult {
   const notes: string[] = [];
@@ -533,11 +692,17 @@ export function healNativeConfig(projectRoot: string): HealResult {
     if (a) notes.push(a);
     const i = healIosDevelopmentTeam(projectRoot, cfg.build.appleTeamId);
     if (i) notes.push(i);
+    const dt = healIosDeploymentTarget(projectRoot, cfg.build.iosMinVersion);
+    if (dt) notes.push(dt);
+    const ams = healAndroidMinSdk(projectRoot, cfg.build.androidMinSdk);
+    if (ams) notes.push(ams);
     // Orientation + status bar → native Info.plist / AndroidManifest.
     const io = healIosOrientationStatusBar(projectRoot, cfg.capacitor);
     if (io) notes.push(io);
     const ao = healAndroidOrientation(projectRoot, cfg.capacitor);
     if (ao) notes.push(ao);
+    const af = healAndroidFullscreen(projectRoot, cfg.capacitor);
+    if (af) notes.push(af);
     // game-debug heals — only for a project that depends on the bridge.
     if (usesGameDebug(projectRoot)) {
       const n = healIosLocalNetwork(projectRoot);

@@ -70,6 +70,13 @@ export const BINARY_EXT_TYPE: Readonly<Record<string, string>> = {
   // Audio: any cross-platform-safe source is a valid runtime asset. The converter
   // (later) defaults to MP3 but the runtime is format-agnostic — see docs/audio-plan.md.
   '.mp3': 'audio', '.m4a': 'audio', '.aac': 'audio', '.wav': 'audio', '.ogg': 'audio', '.flac': 'audio',
+  // Video: follows AUDIO's shape, not the model one — the SOURCE keeps the GUID and
+  // the converter emits a `~video.mp4` variant beside it, so every accepted source
+  // container is itself a runtime asset. (Contrast `.obj`/`.dae`, excluded above
+  // because import NORMALIZES them into a different file that scenes reference.)
+  // Output is always H.264/mp4 regardless of input — the only codec the iOS
+  // WKWebView plays. See docs/video.md.
+  '.mp4': 'video', '.mov': 'video', '.m4v': 'video', '.webm': 'video', '.mkv': 'video',
 };
 
 /** Asset types whose GUID lives in the file's OWN top-level `id` (JSON assets),

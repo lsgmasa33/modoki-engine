@@ -1448,15 +1448,17 @@ export function registerEditorAgentOps(): void {
         : p.trackType === 'signal' ? { ...base, type: 'signal', markers: [] }
         : p.trackType === 'audio' ? { ...base, type: 'audio', cues: [] }
         : p.trackType === 'control' ? { ...base, type: 'control', clips: [] }
+        : p.trackType === 'video' ? { ...base, type: 'video', clips: [] }
         : { ...base, type: 'activation', spans: [] }) as TrackDef;
       clone.tracks.push(track);
     }
     // Push the item into the track's per-kind array.
-    const arrKey = p.trackType === 'animation' || p.trackType === 'control' ? 'clips' : p.trackType === 'signal' ? 'markers' : p.trackType === 'audio' ? 'cues' : 'spans';
+    const arrKey = p.trackType === 'animation' || p.trackType === 'control' || p.trackType === 'video' ? 'clips' : p.trackType === 'signal' ? 'markers' : p.trackType === 'audio' ? 'cues' : 'spans';
     if (track.type === 'animation') track.clips.push(p.item as unknown as (typeof track.clips)[number]);
     else if (track.type === 'signal') track.markers.push(p.item as unknown as (typeof track.markers)[number]);
     else if (track.type === 'audio') track.cues.push(p.item as unknown as (typeof track.cues)[number]);
     else if (track.type === 'control') track.clips.push(p.item as unknown as (typeof track.clips)[number]);
+    else if (track.type === 'video') track.clips.push(p.item as unknown as (typeof track.clips)[number]);
     else track.spans.push(p.item as unknown as (typeof track.spans)[number]);
     const wantCount = (track as unknown as Record<string, unknown[]>)[arrKey].length;
     const norm = normalizeTimeline(clone);
@@ -1465,7 +1467,7 @@ export function registerEditorAgentOps(): void {
     const normTrack = norm.tracks.find((t) => t.type === p.trackType && (t.target ?? '') === target);
     const gotCount = normTrack ? (normTrack as unknown as Record<string, unknown[]>)[arrKey].length : 0;
     if (gotCount < wantCount) {
-      throw new Error('timeline-add-clip: item rejected by normalization — malformed for a ' + p.trackType + ' track (need: animation clip name non-empty · signal action non-empty · audio clip GUID non-empty · activation end > start · control prefab GUID non-empty OR particle:true OR subdirector:true)');
+      throw new Error('timeline-add-clip: item rejected by normalization — malformed for a ' + p.trackType + ' track (need: animation clip name non-empty · signal action non-empty · audio clip GUID non-empty · activation end > start · control prefab GUID non-empty OR particle:true OR subdirector:true \u00b7 video clip GUID non-empty)');
     }
     const tlClipPath = String(p.timelinePath);
     const applyTlClip = (t: typeof norm) => useEditorStore.getState().applyTimelineDoc(tlClipPath, t);

@@ -1,0 +1,266 @@
+# Video playback
+
+Play an H.264/mp4 clip on a 3D surface, a 2D sprite, or as a fullscreen cutscene — shipped inside
+the game or streamed/downloaded from the web with the downloaded footprint actively managed.
+
+## What it is
+
+A video is a first-class **asset kind**, not a URL a game passes at play time. It gets a GUID and a
+`.meta.json` sidecar exactly like a texture, so it is manifest-visible, tree-shakeable,
+editor-previewable, and reportable ("this game will download 84 MB"). The alternative — game code
+handing a URL to a player at runtime — was rejected because then the editor could never tell you
+what a game downloads.
+
+One trait drives it. A `VideoPlayer` entity owns a clip; **where the picture goes is decided by the
+entity's other traits**, not by a field on `VideoPlayer`:
+
+| The entity also has… | …and the clip renders as |
+|---|---|
+| `Renderable3D` / `Renderable3DPrimitive` | a `THREE.VideoTexture` on the material's `map` — a screen in the world |
+| `Renderable2D` with `sprite` = the video GUID | the texture of a PixiJS sprite |
+| `timeMode: 'presentation'` | a fullscreen DOM overlay above the game (`VideoOverlay`) |
+
+All three wrap the **same `HTMLVideoElement`** — one decoder, one audio path, one set of playback
+state. Two viewports showing the same clip get two GPU textures over that one decoder, which is
+what the per-surface binding tables exist to make possible.
+
+**Codec is deliberately limited to H.264/mp4.** It is the only format the iOS WKWebView plays;
+VP9/WebM does not. Shipping one format is a constraint accepted on purpose, not a gap — which is
+why `VideoImportSettings` has no format knob.
+
+## Key files
+
+| File | Role |
+|---|---|
+| `runtime/traits/VideoPlayer.ts` | The trait: clip, loop, autoplay, muted, volume, bus, `timeMode`, rate, playing, loadProgress |
+| `runtime/video/videoService.ts` | Element lifetime, bus routing, autoplay retry, `timeScale` coupling |
+| `runtime/video/videoSystem.ts` | Declarative reconcile — trait state → live elements; download orchestration |
+| `runtime/video/videoCache{,Policy}.ts` | LRU cache against a budget; `videoCachePolicy` is the pure admission/eviction planner |
+| `runtime/video/VideoOverlay.tsx` | Fullscreen cutscene layer — **adopts** the element, never creates one |
+| `runtime/video/VideoEvents.ts` | `@video.start` / `@video.end` / `@video.skip` on the journal + an event bus |
+| `runtime/rendering/videoTextureSync.ts` | 3D binding — `THREE.VideoTexture` onto a material, per `RenderState` |
+| `runtime/rendering/videoTextureSync2D.ts` | 2D binding — a Pixi `VideoSource` texture onto a Sprite, per renderer |
+| `runtime/actions/videoControls.ts` | Declarative `video.play/pause/toggle/stop/skip/seek/setClip` |
+| `runtime/loaders/videoSettings.ts` | Import settings + delivery-policy resolution — the single source of truth |
+| `plugins/video-convert.ts` · `video-cache.ts` · `reimport-video.ts` | ffmpeg transcode, content cache, re-import |
+
+## Authoring
+
+Drop an `.mp4` (or `.mov`/`.m4v`/`.webm`/`.mkv` — all transcode to H.264/mp4) into a project's
+assets. Import mints a GUID and writes a `.meta.json` sidecar:
+
+```jsonc
+{
+  "id": "7265857a-…",
+  "video": {
+    "delivery": "bundled",      // or "remote" — ships on a CDN instead of in the build
+    "policy": "auto",           // "stream" | "download" | "auto" (remote only)
+    "quality": 23,              // CRF
+    "preset": "veryfast",
+    "maxWidth": 1920, "maxHeight": 1080, "maxFps": 0,
+    "keyframeIntervalSec": 2,
+    "audio": "keep",            // or "strip"
+    "audioBitrate": 128,
+    "remoteUrl": "https://…"    // delivery: "remote" only
+  }
+}
+```
+
+Then put a `VideoPlayer` on an entity and set `clip` to the GUID.
+
+**A 2D sprite showing video** sets `Renderable2D.sprite` to the *video* GUID. That is a legal value
+there alongside texture GUIDs and primitive keywords; the sprite slot is built as an empty shell and
+`videoTextureSync2D` supplies the texture.
+
+## Time and determinism
+
+`play()`, `pause()`, `currentTime` and `playbackRate` are all available, so a game has plenty of
+control — *"the player pressed Play Level, now play the cutscene"* is fully supported. What is **not**
+possible is advancing a video by an exact `dt` per frame: assigning `currentTime` is a **seek**, which
+on H.264 decodes from the nearest keyframe and resolves asynchronously.
+
+So **video cannot participate in `stepSimulation`** and is quarantined from the verification harness
+exactly as audio is, for exactly the same reason — it runs on the browser's media clock, not ours.
+Anything a game's *logic* depends on must not be derived from video playback position. This is
+identical for 3D, 2D and UI, because all three wrap the same element: the surface differs, the clock
+does not.
+
+### `timeMode` — the one opinionated field
+
+| Mode | `timeScale` 0 | `timeScale` 0.3 |
+|---|---|---|
+| `diegetic` (default) — a screen inside the world | paused | `playbackRate` 0.3 |
+| `presentation` — a cutscene | paused | `playbackRate` 1 (exempt) |
+
+Both freeze at a time-stop, because a time-stop should stop everything. Only slow-mo distinguishes
+them: dragging a screen in the world to 0.3× is right, and dragging cutscene dialogue to 0.3× is
+almost certainly not.
+
+## Remote delivery
+
+A `delivery: "remote"` clip lives on a CDN and never enters the build. `policy` decides what happens
+at play time:
+
+- **`stream`** — point the element at the URL. Nothing is stored.
+- **`download`** — fetch into the cache, then play from a local `blob:` URL. Survives offline.
+- **`auto`** — download below `AUTO_DOWNLOAD_MAX_BYTES` (8 MB), stream above it.
+
+`VideoPlayer.loadProgress` (0..1) is bindable to a progress bar.
+
+The cache is LRU against a byte budget, with pinning. Admission **refuses** rather than evicting
+everything to fit one oversized clip, and it refuses *before* downloading where `content-length`
+allows — then re-plans against the real size, because a server that under-declares its length would
+otherwise make the budget advisory. Backends are swappable behind a `CacheBackend` interface; the
+web backend is the Cache API (already excluded from iCloud backup on iOS, which is an App Store
+review requirement).
+
+**CORS is load-bearing, not a nicety.** A clip that becomes a GPU texture needs
+`crossOrigin='anonymous'`, so the host must send `Access-Control-Allow-Origin` **on the final
+response**. Measured, because this is easy to get wrong:
+
+| Host | Ranges | CORS | Usable |
+|---|---|---|---|
+| GitHub Releases | yes | **no** | no |
+| archive.org | yes | on the **302** only, not the storage node | no |
+| jsDelivr | yes (206) | `*` | **yes** |
+
+The archive.org row is the trap: a casual `curl -I` follows the redirect and shows a header that
+the response actually serving the bytes does not have.
+
+## Sequencing a cutscene
+
+A Timeline `video` track lets a `Director` sequence video alongside animation, audio and activation:
+
+```jsonc
+{ "id": "vid", "name": "Screen", "target": "", "type": "video",
+  "clips": [
+    { "start": 1, "duration": 3, "clip": "b03ba4b4-…" },
+    { "start": 5, "clip": "7265857a-…" }          // no duration → runs on
+  ] }
+```
+
+The clip is rewound and started at `start`, and paused at `start + duration`. **Omitting `duration`
+means "let the clip's own length decide"** — the track will not invent an end for it.
+
+Video clips are **start-and-run, never scrubbed** (there is deliberately no `scrub` field, unlike an
+animation clip) — see Time and determinism above. The span boundaries are authoritative for
+start/stop; between them the element runs on its own clock.
+
+## Excluding video from a build
+
+`build.modules.video` (Project Settings → Engine Modules) is `'auto' | true | false`. `'auto'` detects
+a `VideoPlayer` trait in the included scenes — **except on a `--target playable` build, where 'auto'
+resolves OFF**: a ≤5 MB MRAID bundle and a video file are close to mutually exclusive. An explicit
+`true` still wins there, because a 400 KB stinger is a legitimate thing to want; the capability is
+defaulted off, not removed.
+
+**What the toggle actually buys is the clips, not the code.** Unlike Rapier or PixiJS, video has no
+vendor SDK behind it — it is ~25 KB of engine source reached through the runtime barrel, and a
+flag-gated dynamic import (the shape `materialInstanceSystem` uses for its 2D broker) was measured
+at 3 KB saved of that 25 KB, because the barrel's static graph keeps it alive regardless. So the flag
+does two useful things and one it does not: it stops video *running*, and it tells the asset shaker
+to drop the `.mp4`s — which is what actually fits a playable under its cap. It does not strip the JS.
+
+Dropped clips are always logged by name. A build that quietly ships a game minus its cutscenes is
+indistinguishable from one that shipped fine until someone plays it.
+
+## Gotchas
+
+**`playsInline` and `crossOrigin` are both mandatory, and both fail silently.** Without
+`playsInline`, iOS hijacks playback into a native fullscreen player. Without
+`crossOrigin='anonymous'`, a remote clip taints the canvas and cannot become a texture at all.
+
+**PixiJS `Assets.load` will happily accept an `.mp4`** — by minting its own second
+`HTMLVideoElement`. That means two decoders, two autoplay negotiations, two audio paths, and
+playback the engine's `timeScale` cannot reach. A video ref therefore bypasses the still-image path
+entirely (`isVideoRef` in `runtime/core/textureRefs.ts`), leaving an empty Sprite for
+`videoTextureSync2D` to fill from the element the engine owns.
+
+**`VideoSource.destroy()` ends with `pause(); src = ''; load()` on its resource.** Called on the
+shared element it blacks out the 3D texture and the fullscreen overlay along with the sprite.
+`release()` detaches the resource first, and that ordering is asserted directly.
+
+**Neither renderer's default upload cadence is right.** Three's `VideoTexture` marks itself dirty
+every frame — 60 GPU uploads for a 24 fps clip. Pixi's `VideoSource` only self-drives via a `load()`
+path that both awaits an alpha probe (whose continuation dereferences a resource we may have
+detached) and can call `load()` on an element that is already playing. Both surfaces therefore pump
+uploads from `requestVideoFrameCallback` themselves: once per *presented* frame, and naturally idle
+while a `timeScale 0` freeze holds the element paused.
+
+**A playing clip must hold its own canvas dirty.** Video changes every frame with no ECS write to
+notice, so on the editor's render-on-demand 2D surface the loop settles and the picture freezes on
+frame one — which looks exactly like a decode failure.
+
+**Autoplay is narrower than it looks.** Only the first *audible* playback needs a prior user gesture;
+muted video autoplays everywhere. A tap on "Play Level" **is** that gesture. Only cold-boot
+autoplay-with-sound is genuinely constrained, and that is a constraint on cutscene placement rather
+than a bug to fix.
+
+**A skip must also fire the end event.** `emitVideoSkip` emits `@video.skip` **and** `@video.end`,
+so a game waiting on "the cutscene is over" fires exactly once whether the player watched it or
+dismissed it. Without that, a skip hangs the listener — the classic way a skippable cutscene
+softlocks a game.
+
+**The overlay binds no keyboard handler, on purpose.** Which key skips a cutscene (or whether any
+key does) is a game's call, not the engine's; a game binds its key to the `video.skip` action. Raw
+DOM input reads also belong in `runtime/input/` sources rather than scattered through components —
+the input-source guard enforces this.
+
+**The dev server needs a `~video.mp4` variant route.** Without it the demuxer parses a 404 body and
+reports `DEMUXER_ERROR_COULD_NOT_OPEN`, which reads as a codec problem rather than a missing file.
+
+**A video clip has no other owner than the thing referencing it,** so ref collection has to be
+right in two independent places: `collectTimelineVideoRefs` (SceneManager's transitive walk, giving
+the clip an owner in the scene manifest) and the tree-shaker's `processTimeline` (which is what
+actually keeps the file). A cutscene reachable only through a Director → timeline → clip GUID chain
+otherwise ships as a 404 that appears only in a real production build.
+
+**A `remote` clip has no local file at all**, so the build's manifest-vs-disk check must skip it
+rather than report it missing.
+
+## Android: what is actually known
+
+Everything above is verified on desktop and on iOS. **Android is the platform where video-to-texture
+historically breaks**, and this section exists so that silence is not mistaken for a clean bill of
+health.
+
+The weak path is specifically the one this feature depends on: getting decoded frames *into a GPU
+texture*, not playback itself. `<video>` playing into a page is well-trodden; uploading it every
+frame as a WebGL/WebGPU texture is where vendors diverge, and reports of black or stalled video
+textures on Android recur across engines and years (there is a live 2024 three.js report of exactly
+this). Treat a working Android device as evidence about *that device*.
+
+**Concurrent decoders are a hard, device-specific limit.** MediaCodec caps how many video decoders
+exist at once, and on some devices that cap is **1**. Several `VideoPlayer` entities alive
+simultaneously is therefore not a free composition the way several textures would be — it is the
+first thing to suspect when one surface plays and another stays black. The demo tours its surfaces
+one at a time, which sidesteps this; a game that shows two at once should verify it on hardware.
+
+**One measured data point.** On a Huawei Y6 (MRD-LX3, 2018, PowerVR GE8320, Android 9, Chrome 138
+WebView, WebGPU) the bundled clip decoded and played correctly. The app ran at ~10 fps, and that was
+**not** video's cost — single-variable measurement from a fresh reload attributed 31 ms of an 86 ms
+frame to shadow *receiving* (per-fragment PCF), which scales with neither shadow-map size (2048² and
+512² measure identically) nor backing resolution (dpr 2 → 1 changed nothing). ~52 ms remained
+unexplained with shadows off; the hypothesis is WebGPU driver overhead on that GPU, and it is
+**untested**. The engine-wide lesson is separate from video: `shadows: true` with a 2048² map is a
+poor default for low-end mobile.
+
+**`maxFps` is an unused lever.** Every clip in the demo is `maxFps: 0`. Capping the encode frame rate
+is the cheapest thing to try first on a device that decodes too slowly, before touching resolution.
+
+## ffmpeg is provisioned, never bundled
+
+Transcoding uses the toolchain's `ffmpeg`/`ffprobe`, auto-provisioned on demand from npm
+(`ffmpeg-static`). **The binary is never shipped inside the editor**, and that is a licence
+requirement rather than a size decision: every `ffmpeg-static` build is `--enable-gpl`, and the
+darwin-arm64 build is additionally `--enable-nonfree`, which is not redistributable under any
+licence. Compliance depends on the binary being provisioned onto the user's own machine.
+
+## Related
+
+- [textures.md](./textures.md) — the import-settings/variant/content-cache pattern video mirrors
+- [audio-plan.md](./audio-plan.md) — the bus routing and gesture-unlock machinery video reuses
+- [timeline.md](./timeline.md) — the track model the video track joins
+- [rendering.md](./rendering.md) — the three rendering layers video binds into
+- [playable-export.md](./playable-export.md) — the size cap that makes `build.modules.video` matter
+- [verification-harness.md](./verification-harness.md) — what "quarantined from determinism" means

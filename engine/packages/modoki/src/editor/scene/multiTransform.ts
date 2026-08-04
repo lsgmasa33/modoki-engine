@@ -185,6 +185,46 @@ export function selectionCentroid2D(members: Transform2D[]): { x: number; y: num
 /** A 2D multi-select member's WORLD transform + box half-extents, as needed to place the
  *  group gizmo (a subset of SceneView's `Group2DMember` — no local/parent fields, since this
  *  is pure geometry, not the undo/write-back bookkeeping). */
+/** The drag delta a virtual gizmo produced, as `applyGroupTransform2D` wants it:
+ *  translation/rotation as DIFFERENCES, scale as a RATIO.
+ *
+ *  Extracted from `SceneView.tsx` (#105 Phase 2). The `|| 1` guards are the reason
+ *  this is worth pinning: a member whose start scale is 0 would otherwise divide by
+ *  zero and propagate Infinity/NaN into every member's transform, which is
+ *  unrecoverable by undo because the NaN is what gets written to the trait. */
+export function virtualDragDelta(start: Transform2D, next: Transform2D): {
+  dx: number; dy: number; dRz: number; dSx: number; dSy: number;
+} {
+  return {
+    dx: next.x - start.x,
+    dy: next.y - start.y,
+    dRz: next.rz - start.rz,
+    dSx: next.sx / (start.sx || 1),
+    dSy: next.sy / (start.sy || 1),
+  };
+}
+
+/** Which Transform fields a 2D group drag WRITES, for a given gizmo mode.
+ *
+ *  The surprising part, and why this is a named rule rather than an inline
+ *  conditional: **rotate and scale write POSITION too.** A rigid group transform
+ *  orbits/spreads members around the shared pivot, so their positions move even
+ *  though the user is "only rotating". Omitting x/y here makes a group rotation
+ *  spin every member in place instead of orbiting — which looks almost right, and
+ *  is wrong.
+ *
+ *  `clamp` is passed in (rather than imported) to keep this module closure-free and
+ *  free of a runtime-trait dependency, matching the rest of the file. */
+export function groupMemberFields(
+  mode: GizmoMode,
+  next: Transform2D,
+  clamp: (a: number) => number,
+): Partial<Transform2D> {
+  if (mode === 'translate') return { x: next.x, y: next.y };
+  if (mode === 'rotate') return { x: next.x, y: next.y, rz: clamp(next.rz) };
+  return { x: next.x, y: next.y, sx: next.sx, sy: next.sy };
+}
+
 export interface Group2DPivotMember { id: number; x: number; y: number; rz: number; sx: number; sy: number; halfW: number; halfH: number }
 
 export interface Group2DPivotResult { pivotX: number; pivotY: number; pivotRz: number; gw: number; gh: number }

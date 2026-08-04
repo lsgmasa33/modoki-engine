@@ -16,7 +16,7 @@
 export interface ConversionFailure {
   /** The asset's URL/virtual path (e.g. `/assets/models/x.glb`). */
   virtualPath: string;
-  kind: 'texture' | 'rigged model' | 'model' | 'atlas' | 'audio' | 'font' | 'environment';
+  kind: 'texture' | 'rigged model' | 'model' | 'atlas' | 'audio' | 'video' | 'font' | 'environment';
   /** The converter's error message. */
   error: string;
 }

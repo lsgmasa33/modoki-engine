@@ -54,6 +54,11 @@ import { boneWeightField, dominantBoneField, paintWeights } from '../../runtime/
 import { deriveBindMatrices } from '../../runtime/skinning/rig2dMath';
 import { computeCanvasScale, screenToReference2D } from '../../runtime/rendering/canvas2DScaler';
 import { findCanvasAncestor } from '../../runtime/rendering/canvas2DRouting';
+import {
+  marqueeExceededThreshold, marqueeOverlayBox, marqueeRect, enclosedByMarquee, mergeMarqueeSelection,
+  type MarqueeCandidate,
+} from '../scene/marqueeSelect';
+import { resolvePickSelection, type PickModifiers } from '../scene/pickSelection';
 import { computePaintOrder } from '../../runtime/rendering/paintOrder';
 import { UIRenderer } from '../../runtime/ui/UIRenderer';
 import { useEditorStore } from '../store/editorStore';
@@ -71,7 +76,7 @@ import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, PREFAB_EDIT_ROOT_GUID } from '../scene/prefabEdit';
 import { pushAction, subscribeUndo } from '../undo/undoManager';
 import { buildTransformUndoAction, buildGroupTransformUndoAction } from '../scene/gizmoUndo';
-import { applyGroupTransform3D, applyGroupTransform2D, filterOutDescendants, resolveGroupPivot2D } from '../scene/multiTransform';
+import { applyGroupTransform3D, applyGroupTransform2D, filterOutDescendants, resolveGroupPivot2D, virtualDragDelta, groupMemberFields } from '../scene/multiTransform';
 import { entityRef } from '../undo/entityRef';
 import { notifyFieldEdited } from '../animation/recording';
 import {
@@ -163,20 +168,20 @@ function objectReachesScene(obj: THREE.Object3D, scene: THREE.Scene): boolean {
   }
   return false;
 }
-/** Apply a viewport pick to the selection, honouring multi-select modifiers — mirrors the
- *  Hierarchy panel so 2D and 3D picking behave the same. Ctrl/Cmd = toggle the picked entity
- *  in/out; Shift = add it (and make it primary); plain = select just it. A plain click on empty
- *  space deselects; a MODIFIED empty-space click preserves the current selection (so a
- *  shift/ctrl marquee or mis-click doesn't clear it). */
-function applyPickSelection(entityId: number | null, mods: { additive: boolean; toggle: boolean }) {
+/** Apply a viewport pick to the selection. WHAT a pick means is decided by
+ *  `resolvePickSelection` (scene/pickSelection.ts, #105 Phase 2) — pure and
+ *  unit-tested, and shared by the 2D pointer path and the 3D raycast path. This
+ *  only performs the resulting command against the store. */
+function applyPickSelection(entityId: number | null, mods: PickModifiers) {
   const st = useEditorStore.getState();
-  if (entityId === null) {
-    if (!mods.additive && !mods.toggle) st.selectEntity(null);
-    return;
+  const cmd = resolvePickSelection(entityId, mods, st.selectedEntityIds);
+  switch (cmd.kind) {
+    case 'keep': return;
+    case 'clear': st.selectEntity(null); return;
+    case 'toggle': st.toggleEntitySelection(cmd.id); return;
+    case 'set': st.setSelectedEntities(cmd.ids, cmd.primary); return;
+    case 'select': st.selectEntity(cmd.id); return;
   }
-  if (mods.toggle) st.toggleEntitySelection(entityId);
-  else if (mods.additive) st.setSelectedEntities([...st.selectedEntityIds, entityId], entityId);
-  else st.selectEntity(entityId);
 }
 
 /** Shared gizmo mode + space toggle buttons used in both 3D and 2D modes. */
@@ -960,16 +965,17 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
     const marqueeEl2d = document.createElement('div');
     marqueeEl2d.style.cssText = 'position:fixed;border:1px solid #5a9fd4;background:rgba(90,159,212,0.15);pointer-events:none;z-index:9999;display:none;';
     document.body.appendChild(marqueeEl2d);
+    // Geometry + policy live in scene/marqueeSelect.ts (#105 Phase 2); what stays
+    // here is the DOM overlay, the client→game mapping, and the ECS query.
     const marquee2dMove = (ev: PointerEvent) => {
       if (!marquee2d) return;
-      if (!marquee2d.moved && Math.hypot(ev.clientX - marquee2d.x0, ev.clientY - marquee2d.y0) > 4) {
+      if (!marquee2d.moved && marqueeExceededThreshold(marquee2d.x0, marquee2d.y0, ev.clientX, ev.clientY)) {
         marquee2d.moved = true; marqueeEl2d.style.display = 'block';
       }
       if (marquee2d.moved) {
-        const x = Math.min(marquee2d.x0, ev.clientX), y = Math.min(marquee2d.y0, ev.clientY);
-        marqueeEl2d.style.left = `${x}px`; marqueeEl2d.style.top = `${y}px`;
-        marqueeEl2d.style.width = `${Math.abs(ev.clientX - marquee2d.x0)}px`;
-        marqueeEl2d.style.height = `${Math.abs(ev.clientY - marquee2d.y0)}px`;
+        const box = marqueeOverlayBox(marquee2d.x0, marquee2d.y0, ev.clientX, ev.clientY);
+        marqueeEl2d.style.left = `${box.left}px`; marqueeEl2d.style.top = `${box.top}px`;
+        marqueeEl2d.style.width = `${box.width}px`; marqueeEl2d.style.height = `${box.height}px`;
       }
     };
     const marquee2dUp = (ev: PointerEvent) => {
@@ -977,25 +983,21 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       const m = marquee2d; marquee2d = null;
       marqueeEl2d.style.display = 'none';
       if (!m.moved) return;
-      const a = toGame(m.x0, m.y0), b = toGame(ev.clientX, ev.clientY);
-      const minX = Math.min(a.x, b.x), maxX = Math.max(a.x, b.x);
-      const minY = Math.min(a.y, b.y), maxY = Math.max(a.y, b.y);
+      const rect = marqueeRect(toGame(m.x0, m.y0), toGame(ev.clientX, ev.clientY));
       const allTraits = getAllTraits();
       const transformMeta = allTraits.find((t) => t.name === 'Transform');
       const r2dMeta = allTraits.find((t) => t.name === 'Renderable2D');
       if (!transformMeta || !r2dMeta) return;
       const { parentOf, canvasIds } = getCanvas2DRouting();
-      const inside: number[] = [];
+      const candidates: MarqueeCandidate[] = [];
       getCurrentWorld().query(transformMeta.trait, r2dMeta.trait).updateEach(([tf, rend]: any[], entity: any) => {
         const id = entity.id();
-        if (!rend.isVisible || deactivatedEntities.has(id)) return;
-        if (findCanvasAncestor(id, parentOf, canvasIds) !== canvasEntityId) return;
         const w = getWorldTransform2D(id, tf);
-        if (w.x >= minX && w.x <= maxX && w.y >= minY && w.y <= maxY) inside.push(id);
+        candidates.push({ id, x: w.x, y: w.y, visible: !!rend.isVisible, canvasId: findCanvasAncestor(id, parentOf, canvasIds) });
       });
-      if (inside.length === 0) return;
-      const cur = useEditorStore.getState().selectedEntityIds;
-      useEditorStore.getState().setSelectedEntities(Array.from(new Set([...cur, ...inside])), inside[inside.length - 1]);
+      const inside = enclosedByMarquee(candidates, rect, deactivatedEntities, canvasEntityId);
+      const next = mergeMarqueeSelection(useEditorStore.getState().selectedEntityIds, inside);
+      if (next) useEditorStore.getState().setSelectedEntities(next.ids, next.primary);
     };
     window.addEventListener('pointermove', marquee2dMove);
     window.addEventListener('pointerup', marquee2dUp);
@@ -1433,19 +1435,15 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
         if (e.shiftKey) worldDelta = snapDragResult(worldDelta, DEFAULT_GIZMO_SNAP);
         const wv = { ...g.startVirtual, ...worldDelta };
         const mode = useEditorStore.getState().gizmoMode;
-        const delta = {
-          dx: wv.x - g.startVirtual.x, dy: wv.y - g.startVirtual.y, dRz: wv.rz - g.startVirtual.rz,
-          dSx: wv.sx / (g.startVirtual.sx || 1), dSy: wv.sy / (g.startVirtual.sy || 1),
-        };
+        const delta = virtualDragDelta(g.startVirtual, wv);
         const news = applyGroupTransform2D({ memberStart: g.members.map((m) => m.world), pivot: g.pivot, mode, delta });
         g.members.forEach((m, i) => {
           const me = findEntity(m.id);
           if (!me || !me.has(Transform)) return;
           const localNew = worldToLocal2D(news[i], m.parentWorld);
-          const cur = me.get(Transform);
-          if (mode === 'translate') me.set(Transform, { ...cur, x: localNew.x, y: localNew.y });
-          else if (mode === 'rotate') me.set(Transform, { ...cur, x: localNew.x, y: localNew.y, rz: clampAngle(localNew.rz) });
-          else me.set(Transform, { ...cur, x: localNew.x, y: localNew.y, sx: localNew.sx, sy: localNew.sy });
+          // WHICH fields each mode writes is groupMemberFields' rule — rotate/scale
+          // write position too, because a rigid group transform orbits the members.
+          me.set(Transform, { ...me.get(Transform), ...groupMemberFields(mode, localNew, clampAngle) });
         });
         mark2DDirty();
         return;

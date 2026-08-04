@@ -87,6 +87,12 @@ export interface BuildModules {
   npr: ModuleToggle;
   /** GPU-compute particle backend (requires render3d + native WebGPU). */
   gpuParticles: ModuleToggle;
+  /** Video playback (HTMLVideoElement decode, video textures, the remote-clip cache).
+   *  `'auto'` detects a `VideoPlayer` trait, EXCEPT on a `--target playable` build, where
+   *  'auto' resolves OFF: a ≤5 MB MRAID bundle and a video file are close to mutually
+   *  exclusive. Set it to `true` to keep video in a playable anyway — a 400 KB stinger is a
+   *  legitimate thing to want, so the capability is defaulted off rather than removed. */
+  video: ModuleToggle;
 }
 
 /** One engine-module key (a field of {@link BuildModules}). */
@@ -142,6 +148,29 @@ export interface ProjectConfig {
      *  committed config, not project.user.json. The editor's heal-on-open syncs it
      *  into the iOS project's DEVELOPMENT_TEAM. Empty = leave the pbxproj as-is. */
     appleTeamId: string;
+    /** Minimum iOS version this project supports — the SINGLE source of truth for the
+     *  floor, driving BOTH halves of it:
+     *   - the JS bundle's syntax target (`build.target` in vite.config.ts → `ios<x>`/`safari<x>`)
+     *   - the native `IPHONEOS_DEPLOYMENT_TARGET`, synced by `healIosDeploymentTarget`
+     *
+     *  They were two independent hardcoded numbers that DISAGREED: every project's pbxproj
+     *  said 15.0 while the bundle required 15.4, so the App Store would offer the game to a
+     *  15.0–15.3 device that installs it and then dies on `structuredClone`/`Array.at`/
+     *  `Object.hasOwn`. One value, two consumers, so they cannot drift again.
+     *
+     *  ⚠️ Lowering this below 15.4 needs POLYFILLS, not just a smaller number. esbuild lowers
+     *  syntax; it does not add missing runtime APIs, and those three land in exactly 15.4. */
+    iosMinVersion: string;
+    /** Minimum Android SDK (API LEVEL, not the marketing version — 31 = Android 12) this
+     *  project supports — the Android sibling of `iosMinVersion`. The SINGLE source of
+     *  truth for the floor, synced into every project's `android/variables.gradle`
+     *  `minSdkVersion` by `healAndroidMinSdk` on project open/build.
+     *
+     *  It exists for the same reason `iosMinVersion` does: `cap add` generates
+     *  `minSdkVersion = 24`, and without a heal that number just sits there uninspected —
+     *  every newly-scaffolded project silently reverts to API 24 and the floor drifts
+     *  per-project, exactly the drift `iosMinVersion` was introduced to stop on iOS. */
+    androidMinSdk: number;
     /** Debug build — ships the event journal (`emit`/`modoki_journal`), the in-game
      *  debug menu (F12 / 3-finger tap: stats, world inspector, cheats, …), AND the
      *  on-device debug server (native TCP + UDP beacon / web-WS) that every
@@ -195,8 +224,12 @@ export interface ProjectConfig {
     /** Supported device orientation → iOS UISupportedInterfaceOrientations +
      *  Android android:screenOrientation. 'auto' = allow both portrait+landscape. */
     orientation: 'auto' | 'portrait' | 'landscape';
-    /** Hide the OS status bar (clock/wifi/battery) → iOS UIStatusBarHidden +
-     *  Android fullscreen flag. */
+    /** Hide the OS status bar (clock/wifi/battery) → iOS UIStatusBarHidden, and on Android
+     *  IMMERSIVE fullscreen: both the status bar AND the navigation (back/home/recents) bar,
+     *  re-hidden on every focus regain. Android is the asymmetric one on purpose — iOS has no
+     *  second bar, so "status bar hidden" there already means "the game owns the screen"; leaving
+     *  Android's nav bar up would honour the name and miss the intent. Applied by
+     *  `healAndroidFullscreen` (healNativeConfig.ts), which patches MainActivity.java. */
     statusBarHidden: boolean;
     /** Status-bar content style → iOS UIStatusBarStyle. 'default' = OS decides,
      *  'light' = light text (dark bg), 'dark' = dark text (light bg). */
@@ -330,10 +363,17 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     webCdnBackendBucket: '',
     webDeployCommand: '',
     appleTeamId: '',
+    // 16.4 by owner decision (2026-08-04), deliberately dropping the iPhone 7 / 6s / SE1
+    // era. Comfortably above the 15.4 runtime-API line (structuredClone / Array.at /
+    // Object.hasOwn all land in 15.4), so no polyfills are needed at this floor.
+    iosMinVersion: '16.4',
+    // 31 = Android 12. cap add scaffolds minSdkVersion 24; healAndroidMinSdk syncs this
+    // value into android/variables.gradle so the floor can't drift per-project.
+    androidMinSdk: 31,
     debugBuild: false,
     modules: {
       render3d: 'auto', render2d: 'auto', physics2d: 'auto',
-      physics3d: 'auto', npr: 'auto', gpuParticles: 'auto',
+      physics3d: 'auto', npr: 'auto', gpuParticles: 'auto', video: 'auto',
     },
     playableMaxBytes: 5_242_880, // 5 MB (AppLovin)
     playableClickUrl: '',
