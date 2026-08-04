@@ -20,7 +20,7 @@
 
 import { createWorld, type World } from 'koota';
 import { Time } from '../core/traits/Time';
-import { getCurrentWorld, setCurrentWorld } from '../core/ecs/world';
+import { getCurrentWorld, setCurrentWorld, registerEntity } from '../core/ecs/world';
 import { registerSystem, unregisterSystem, SYSTEM_PRIORITY } from '../core/pipeline';
 import { timeSystem } from '../core/timeSystem';
 import { setManualNow, restoreRealClock } from '../core/clock';
@@ -93,6 +93,15 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
   setCurrentWorld(world);
   setPlayState('playing');           // sim tiers run; dispatchUIAction is live
   seedRng(opts.seed ?? 1, world);    // reproducible; world-scoped (F1)
+
+  // Spawned + registered BEFORE clearJournal on purpose. Registering is what keeps the
+  // harness honest: an unregistered entity is invisible to the O(1) entity index, so any
+  // engine code the playtest calls falls back to an O(n) scan and warns — which is how
+  // `findEntity(1)` (this Time singleton) came to flood CI with thousands of lines. Doing
+  // it before the clear keeps the resulting `@spawn` out of the journal, so a test that
+  // asserts on events() still sees only what its own run produced.
+  registerEntity(world.spawn(Time), world);
+
   clearJournal(world);
   // Headless playtests want FULL observability, so open every Tier-2 (watch-gated)
   // diagnostic capture (@contact, …) — in a real runtime these default off to keep the
@@ -100,8 +109,6 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
   for (const t of verboseCaptureState().types) setVerboseCapture(t, true);
   setManualNow(0);
   resetTimeBaseline();
-
-  world.spawn(Time);
 
   // Register timeSystem first, then the game's systems. Track names for teardown.
   const systemNames: string[] = [];
@@ -120,7 +127,15 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
 
   const handle: TestWorld = {
     world,
-    spawn: (...traits) => world.spawn(...(traits as Parameters<World['spawn']>)),
+    // Registered like a real spawn — a playtest entity must be reachable through the
+    // entity index, or engine code under test takes a different (O(n), warning) path than
+    // it does in the running game. The `@spawn` this journals is correct and wanted: the
+    // harness advertises full observability, and a runtime spawn journals one too.
+    spawn: (...traits) => {
+      const e = world.spawn(...(traits as Parameters<World['spawn']>));
+      registerEntity(e, world);
+      return e;
+    },
     step(ticks = 1, dt = defaultDt) {
       // Play-state + manual clock + baseline were set once above; just advance.
       // Shared loop with stepSimulation so the two can't drift.
