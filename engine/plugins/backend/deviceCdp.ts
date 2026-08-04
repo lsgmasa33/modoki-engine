@@ -115,8 +115,21 @@ interface JsonVersion { 'Android-Package'?: string }
 /** One entry of `GET /json/list` — the page target we dispatch input to. */
 interface JsonListEntry { type?: string; webSocketDebuggerUrl?: string }
 
+/** Budget for ONE discovery HTTP call. Matches the 4s the `adb` calls in `deviceCdpAdb` already
+ *  use — they are halves of the same discovery step, so one budget covers it.
+ *
+ *  It MUST be bounded. Found sweeping for siblings of #99's unbounded WDA probe: every other I/O
+ *  boundary in this module is deliberately capped (three `execFileSync` at 4s, the WebSocket
+ *  connect on a timer, `send()` on the pending-map timer) and this was the one that was not. That
+ *  asymmetry is the tell. The calls go to `127.0.0.1` through an `adb forward`, which looks safe
+ *  and is not: the forward LISTENS whether or not anything is behind it, so with WiFi-adb or a
+ *  sleeping device the socket can accept and then never answer — and this sits on the input path
+ *  via `getDeviceCdpSession`, so an unbounded wait there hangs `device_tap` outright rather than
+ *  merely making it slow. */
+const CDP_DISCOVERY_TIMEOUT_MS = 4000;
+
 async function httpGetJson<T>(url: string): Promise<T> {
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(CDP_DISCOVERY_TIMEOUT_MS) });
   if (!res.ok) throw new Error(`GET ${url} → HTTP ${res.status}`);
   return (await res.json()) as T;
 }

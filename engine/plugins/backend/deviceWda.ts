@@ -225,6 +225,24 @@ export const WDA_NOT_RUNNING_REASON =
   'no trusted input route to this device — WebDriverAgent is not answering on the phone. Install it '
   + 'from Build Support (iOS), then start it; it runs only while its xcodebuild test process is alive';
 
+/** The device holding the lease is not an iPhone/iPad, so there is no agent to reach (#99).
+ *
+ *  A DISTINCT reason on purpose. Without the platform gate, a non-iOS device fell into the iOS
+ *  path and was told "cannot start WebDriverAgent — cannot tell which iPhone to use — 4 are
+ *  paired… set MODOKI_IOS_DEVICE_UDID", which is advice an Android user cannot act on and that
+ *  points at the wrong machine entirely. Measured on a Samsung reached by IP, 2026-08-03.
+ *
+ *  For INPUT this reason is never the one shown — the CDP layer's `NO_SESSION_REASON` already
+ *  names the real fix for Android ("needs adb + a debug build") and is kept instead. This is for
+ *  the screenshot route, where an explicit `source:'wda'` deserves a direct answer. */
+export const WDA_NOT_IOS_REASON =
+  'WebDriverAgent is an iOS agent and this lease is not holding an iOS device, so there is no '
+  + 'out-of-app capture route here — use the ordinary device_screenshot (native capture)';
+
+/** The pre-built "no agent on this device" outcome, so the non-iOS branches read as a value rather
+ *  than a call that has to be skipped. */
+export const NO_WDA_ON_THIS_DEVICE: WdaShotOutcome = { handled: false, reason: WDA_NOT_IOS_REASON };
+
 /** Abandoned before dispatching anything. */
 export const WDA_SESSION_LOST_REASON =
   'the trusted WebDriverAgent route failed before dispatching (session dropped); it will be re-established on the next call';

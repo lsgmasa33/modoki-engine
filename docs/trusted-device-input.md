@@ -82,33 +82,74 @@ build, the per-machine signing, and the expiry rule.
 
 - **Lazy launch** — the FIRST iOS input op starts the agent (~6s cold, ~0.6s once cached).
   `device_status` deliberately does **not**: a status read must not start a 30-second agent.
+- **At most ONE launch at a time, and a slow one is left to finish** (#109). If a launch we started
+  is still running but not yet answering, a later input op reports that — *"has been starting for
+  Ns"* — rather than starting a second agent. A launch that exceeds the 60s timeout is **not
+  killed**: it keeps going and a later call picks it up.
+
+  The previous behaviour killed it and then advised *"it may still be starting; retry shortly"* —
+  advice whose premise the kill had just destroyed. So a slow first install could never finish, and
+  because a timeout is deliberately not latched, **every** subsequent tap paid the full 60s to
+  spawn-then-kill another signed agent on the phone, with no backoff. Not killing it is only safe
+  together with the one-launch guard, or an abandoned agent would simply be joined by a rival on
+  the next tap. Nothing is stranded either way: the agent is still owned by the lease, so
+  disconnecting stops it. A launch whose **process exits** is reported differently (a signing
+  failure looks like that), and there the next call does start fresh.
 - **Torn down with the lease** — one lease owns both channels, so there is exactly one answer to
   "who holds this device", and disconnecting can never strand a signed agent on the phone. Losing WDA
   **degrades input; it does not drop the lease** — screenshots and Percept reads keep working.
 - **One-time config on a Mac with several paired iPhones**: set `MODOKI_IOS_DEVICE_UDID`. Auto-launch
   refuses to guess which phone to run a signed agent on.
-- **STARTING one is macOS-only** (it is an `xcodebuild` run, matching
-  `isInstallable('webdriveragent')`). **USING one is not**: the agent answers over the LAN, so a
-  Windows/Linux editor can drive an agent a Mac started — which is why the reachability probe runs
-  before the platform check.
+- **iOS-ONLY, and gated on it** — the route is only attempted when the lease's device actually
+  reports `platform: 'ios'` (`DeviceConnectionManager.devicePlatform()`, asked once per lease via
+  the bridge's `app-identity` op and cached).
 
-  **MEASURED end-to-end, 2026-08-03 (#99), not merely reasoned.** This was written down as a
-  capability for months with nobody having tried it, so it is worth recording exactly what was
-  observed. A Mac started the agent with `xcodebuild test-without-building` against the iPhone Air;
-  the **Windows** clone then reached `http://<device-ip>:8100/status` in **227 ms (HTTP 200)** and a
-  `device_tap` came back `[input:trusted-wda]`, with a capture listener in the page confirming
-  `isTrusted: true` on `pointerdown`/`touchstart`/`mousedown` at the requested coordinates. It is a
-  genuine LAN path, **not** a usbmuxd forward: the Mac had no local forwarder (`127.0.0.1:8100`
-  refused there), and WDA announced its Wi-Fi IP. USB only started the agent; it does not carry it.
-  So the probe ordering is load-bearing and must not be "simplified" away.
+  This gate is not defensive tidiness; it closes a measured bug (#99, 2026-08-03). "No CDP route"
+  is **not** the same as "iOS": CDP discovery needs adb, so an **Android** device reached by IP has
+  no CDP route either, and it fell straight through into the iOS agent path. Every `device_tap` on
+  a Samsung then probed port 8100 on the *Android* phone and answered *"cannot start WebDriverAgent
+  — cannot tell which iPhone to use — 4 are paired… Set `MODOKI_IOS_DEVICE_UDID`"* — advice an
+  Android user cannot act on, pointing at the wrong machine entirely. That Mac only escaped worse
+  by accident: with **exactly one** paired iPhone, `resolveIosDevice` would have *resolved* instead
+  of refusing, launching a signed agent on an unrelated phone and polling the Android address for
+  the full 60s launch timeout — and a launch timeout is deliberately not latched, so every tap
+  would repeat it. `useAdb` cannot stand in for the gate: it proves Android when true and proves
+  nothing when false. An **unknown** platform (an old bridge with no `app-identity`) is treated as
+  not-iOS, never as "assume iOS".
 
-  ⚠️ **The probe is unbounded, and that is a real cost off macOS.** `defaultProbe` calls `fetch(url)`
-  with no `AbortSignal`, and when no agent is running, iOS *drops* the SYN rather than refusing it —
-  so on Windows every input op pays the OS connect timeout. Measured: **~2.5 s per tap** with no
-  agent (2534/2675/2527 ms, vs 145 ms for a non-input device op and 660-827 ms once WDA is up). The
-  `lastFailure` latch cannot save it: the latch check sits *after* the probe, so every op re-probes.
-  That is correct by design — a Mac may start an agent at any moment and this editor must notice —
-  which is why the fix is to bound the probe, not to latch it. Tracked in #99.
+- **macOS-only, to start AND to use** — it is an `xcodebuild` run, matching
+  `isInstallable('webdriveragent')`. Off macOS `ensureWdaRunning` refuses immediately, before any
+  network, and iOS input from that editor is synthetic with the usual loud banner.
+
+  **This reverses an earlier decision, and the measurement that reversed it is worth keeping.** The
+  probe used to run *before* the platform check, on the reasoning that starting an agent is
+  macOS-only but *using* one is not. That capability is **real, and was measured end-to-end on
+  2026-08-03 (#99)** after sitting in this doc untested for months: a Mac started the agent with
+  `xcodebuild test-without-building` against the iPhone Air, and the **Windows** clone then reached
+  `http://<device-ip>:8100/status` in **227 ms (HTTP 200)** and got `[input:trusted-wda]` from a
+  `device_tap`, with a capture listener in the page confirming `isTrusted: true` on
+  `pointerdown`/`touchstart`/`mousedown`. It is a genuine LAN path, **not** a usbmuxd forward: the
+  Mac had no local forwarder (`127.0.0.1:8100` refused there), WDA announced its own Wi-Fi IP, and
+  the phone's xcodebuild tunnel was *wired* — USB started the agent, it does not carry it.
+
+  It was removed anyway, because **the product cannot produce the precondition.** The agent is torn
+  down with the LEASE (above), and the lease is exclusive — so a Mac editor cannot both hold a lease
+  (which is what triggers its lazy launch) and leave that lease free for the other machine to take.
+  The only way to get a Windows-drivable agent is a hand-run `xcodebuild` outside the editor
+  entirely, which is not a workflow we ship. Charging every non-macOS input op a probe to serve it
+  was the wrong trade: measured at **~2.5 s per tap** on Windows (2534/2675/2527 ms, vs 145 ms for a
+  non-input device op), because a dead `:8100` on iOS *drops* the SYN rather than refusing it and
+  the unbounded `fetch` waited out the OS connect timeout. Note the `lastFailure` latch could never
+  have saved it — the latch check sat *after* the probe, so every op re-probed regardless.
+
+  If the two-machine setup is ever wanted again, it should come back as an **explicit opt-in**
+  (a configured agent URL), not as a probe every editor pays for on the off chance.
+
+- **The probe is bounded** (`WDA_PROBE_TIMEOUT_MS`, 1.5s). It has to be: the same unbounded `fetch`
+  cost **~2.5 s** from Windows, **~1.0 s** from macOS against an iPhone (which silently drops), and
+  **~0.4 s** against an Android phone (which sends RST) — three prices for one line, none of them
+  chosen. A live agent answers in **72-227 ms** over the same LAN, so the budget is an order of
+  magnitude above the real thing while capping the failure case.
 
 ## WDA also captures the screen — the out-of-app screenshot (#102)
 
@@ -174,6 +215,14 @@ Every one of these looked like success:
 
 - **A wrong WDA endpoint returns HTTP 200 with the error in the BODY.** `res.ok` is not evidence —
   decode every reply. This cost three no-op taps before the body was read.
+- **`127.0.0.1` does NOT mean "cannot hang", so an adb-forwarded fetch still needs a timeout.** An
+  `adb forward` LISTENS whether or not anything is behind it, so with WiFi-adb or a sleeping device
+  the socket accepts and then never answers. CDP discovery's two GETs (`/json/version`, `/json/list`)
+  were unbounded for exactly this reason — they *look* local — while every other I/O boundary in
+  `deviceCdp.ts` was capped. Since discovery sits on the input path via `getDeviceCdpSession`, that
+  hung `device_tap` outright rather than merely slowing it. Both channels' probes are bounded now
+  (`CDP_DISCOVERY_TIMEOUT_MS` 4s, `WDA_PROBE_TIMEOUT_MS` 1.5s); found by sweeping #99's WDA fix for
+  siblings, which is the only reason it surfaced at all.
 - **WDA silently CLAMPS out-of-viewport coordinates** rather than erroring (a drag aimed off-screen
   landed at 86,795).
 - **`devicectl --json-output /dev/stdout` never parses** — devicectl writes its human-readable table

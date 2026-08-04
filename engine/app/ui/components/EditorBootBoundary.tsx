@@ -2,12 +2,25 @@ import { Component, type ErrorInfo, type ReactNode } from 'react';
 
 // A packaged editor's Vite dep-optimizer pre-bundles `@modoki/engine` subpaths (and, for a game
 // with its own `packages/app-services`, that game's native-SDK deps too) cold at startup
-// (vite.config.ts optimizeDeps.include) to avoid a mid-session re-optimize. That cold scan has a
-// rare race — first observed on a fresh per-machine Windows install — where the renderer's first
-// request lands before esbuild's scan has discovered every reachable export, and the served chunk
-// is missing one. The browser reports this as a SyntaxError naming the missing export; a bare
-// reload against the by-then-finished pre-bundle always clears it. See docs/todo.md for the open
-// investigation into the scan race itself.
+// (vite.config.ts optimizeDeps.include) to avoid a mid-session re-optimize. When the renderer
+// imports an export the served chunk doesn't have, the browser reports a SyntaxError naming it.
+//
+// This header used to blame an esbuild SCAN RACE and assert that "a bare reload against the
+// by-then-finished pre-bundle always clears it". Measurement on packaged Windows 0.3.7 (#110)
+// refuted both halves for the dominant cause — a STALE HTTP CACHE after an app update:
+//   · the on-disk optimized dep was written BEFORE the crash and DID contain the export, so
+//     nothing raced — the pre-bundle was complete and correct;
+//   · its browserHash matched the failing URL's `?v=` byte for byte, and 4 Chromium HTTP-cache
+//     entries held that exact URL;
+//   · deleting the BROWSER caches (`Cache/` + `Code Cache/`) — vite-cache untouched and
+//     browserHash unchanged — fixed it.
+// Vite serves `/deps/*.js?v=<browserHash>` as `immutable` and browserHash keys on the lockfile,
+// not on engine source, so an engine-only update leaves the URL identical and Chromium replays
+// the pre-update body from a cache that survives the update. A bare `location.reload()` re-requests
+// that same immutable URL and gets the same stale body — which is exactly why the old retry
+// burned its one attempt and painted the error anyway. So the retry now asks main to drop the
+// browser caches FIRST (main also does this at startup whenever the app build signature changes).
+// Root cause + measurements: docs/build.md § "Packaged editor loop".
 export const STALE_DEP_OPTIMIZE_RE = /does not provide an export named/i;
 export const BOOT_RETRY_SESSION_KEY = 'modoki:bootRetryCount';
 export const MAX_BOOT_RETRIES = 1;
@@ -45,10 +58,29 @@ export class EditorBootBoundary extends Component<{ children: ReactNode }, { err
       const nextCount = retryCount + 1;
       sessionStorage.setItem(BOOT_RETRY_SESSION_KEY, String(nextCount));
       console.warn(
-        `[EditorBootBoundary] stale dep-optimize chunk signature — reloading ` +
-        `(attempt ${nextCount}/${MAX_BOOT_RETRIES}) instead of painting the error`,
+        `[EditorBootBoundary] stale dep-optimize chunk signature — clearing the browser caches and ` +
+        `reloading (attempt ${nextCount}/${MAX_BOOT_RETRIES}) instead of painting the error`,
       );
-      window.location.reload();
+      // Drop the browser caches BEFORE reloading, or the reload just re-reads the same immutable
+      // stale chunk (#110 — see the header). The retry count is already persisted above, so
+      // the cap holds no matter how this resolves. Electron-only; on a plain browser (dev, or a
+      // non-Electron host) there is no such IPC and a bare reload is the best available action.
+      void (async () => {
+        const invoke = (window as unknown as {
+          __modokiElectron?: { invoke?: (c: string, p?: unknown) => Promise<unknown> };
+        }).__modokiElectron?.invoke;
+        if (invoke) {
+          try {
+            const res = await invoke('modoki:clear-browser-caches') as { ok?: boolean; error?: string };
+            if (!res?.ok) console.warn(`[EditorBootBoundary] browser-cache clear reported failure: ${res?.error ?? 'unknown'} — reloading anyway`);
+          } catch (e) {
+            // Never let a failed clear strand the editor on the "Recovering…" screen — a reload
+            // without it is exactly the old behaviour, which is strictly better than hanging.
+            console.warn(`[EditorBootBoundary] browser-cache clear threw (${e instanceof Error ? e.message : String(e)}) — reloading anyway`);
+          }
+        }
+        window.location.reload();
+      })();
       return;
     }
     if (isStaleDepOptimize) {

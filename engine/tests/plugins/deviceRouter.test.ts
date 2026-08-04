@@ -9,6 +9,8 @@ import os from 'os';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { deviceConnection } from '../../plugins/backend/deviceConnection';
 import { DeviceLeaseAuthority } from '../../plugins/backend/deviceLease';
+import { WDA_NOT_IOS_REASON, _resetDeviceWdaStateForTests } from '../../plugins/backend/deviceWda';
+import { _resetWdaLauncherForTests } from '../../plugins/backend/wdaLauncher';
 
 /** Minimal lease-speaking device that also echoes a data method.
  *  `dataMethods` adds canned answers for other methods (e.g. `screenshot`). */
@@ -286,5 +288,125 @@ describe('/api/device/request screenshot while the lease is RECONNECTING (#102)'
     const r = (await post('/api/device/request', { method: 'screenshot', params: {} })) as { status?: number };
     expect(r.status).toBe(502);
     expect(String(bodyOf(r).error)).toMatch(/^no device connected/);
+  });
+});
+
+// #99 — the WebDriverAgent route is iOS-only, but nothing enforced it before this. An Android
+// device connected by IP has no CDP route (CDP discovery needs adb), so it fell through into the
+// iOS agent path: every device_tap probed port 8100 on the ANDROID phone and answered "cannot
+// start WebDriverAgent — cannot tell which iPhone to use — 4 are paired… Set
+// MODOKI_IOS_DEVICE_UDID". Measured on a Samsung reached by IP, 2026-08-03. `devicePlatform()`
+// (deviceConnection.ts) closes the gap by asking the bridge's `app-identity` op once per lease and
+// gating both WDA entry points (input + all three screenshot sites in editorBackendRouter.ts) on
+// the answer being `'ios'`.
+describe('/api/device/request WDA gated on device platform (#99)', () => {
+  afterEach(async () => {
+    await deviceConnection.disconnect();
+    // wdaLauncher/deviceWda hold MODULE-LEVEL state (a latched lastFailure, a cached session) that
+    // otherwise leaks into the NEXT test and makes these order-dependent — the same trap #102's
+    // WDA tests already had to account for.
+    _resetWdaLauncherForTests();
+    _resetDeviceWdaStateForTests();
+  });
+
+  it('an Android device gets NO iOS wording in the fallback banner — the regression itself', async () => {
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority, { 'app-identity': { platform: 'android', appId: 'x', appName: 'y' } });
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const req = await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      const result = bodyOf(req).result as { inputFidelityWarning?: string };
+      const warning = result.inputFidelityWarning ?? '';
+      // Before the fix this string named an iPhone and told the reader to set an env var that
+      // does not exist on this device — the exact wrong-machine diagnostic that was measured live.
+      expect(warning).not.toMatch(/iPhone/i);
+      expect(warning).not.toContain('MODOKI_IOS_DEVICE_UDID');
+      expect(warning).toMatch(/SYNTHETIC INPUT \(NOT TRUSTED\)/);
+      // The reason it DOES carry is the CDP one (unchanged by this fix) — Android's real advice.
+      expect(warning).toMatch(/adb/);
+    } finally {
+      await device.close();
+    }
+  });
+
+  it('an iOS device still gets the WDA path attempted', async () => {
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority, { 'app-identity': { platform: 'ios', appId: 'x', appName: 'y' } });
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const req = await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      const result = bodyOf(req).result as { inputFidelityWarning?: string };
+      // No real WDA agent answers in this test (no toolchain dir), so it fails to find one and
+      // falls back to synthetic — that is fine and expected. What this pins is that the branch is
+      // still REACHED for iOS: the gate is `=== 'ios'`, not merely "not confirmed Android".
+      expect(result.inputFidelityWarning ?? '').toMatch(/WebDriverAgent/);
+    } finally {
+      await device.close();
+    }
+  });
+
+  it('an old bridge with no app-identity handler is treated as NOT-confirmed-iOS, never assumed', async () => {
+    // Deliberate: an unknown answer must never be read as "iOS" (the whole reason `platform` and
+    // `platformResolved` are separate fields on the manager). This mock has no 'app-identity'
+    // canned reply at all, so the device answers the generic `{ok:false,reason:'not-owner'}` —
+    // exactly what an old bridge without the op would send.
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority);
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const req = await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      const result = bodyOf(req).result as { inputFidelityWarning?: string };
+      const warning = result.inputFidelityWarning ?? '';
+      expect(warning).not.toMatch(/iPhone/i);
+      expect(warning).not.toContain('MODOKI_IOS_DEVICE_UDID');
+      expect(warning).toMatch(/SYNTHETIC INPUT \(NOT TRUSTED\)/);
+      expect(warning).toMatch(/adb/);
+    } finally {
+      await device.close();
+    }
+  });
+
+  it('app-identity is asked exactly ONCE per lease, even across several input ops', async () => {
+    // `startMockDevice`'s `dataMethods` is a plain lookup table with no counting of its own.
+    // Wrapping it in a counting Proxy here — rather than teaching the shared helper about counting
+    // — is enough to see how many times the bridge was actually asked for its identity.
+    const counts: Record<string, number> = {};
+    const dataMethods: Record<string, unknown> = new Proxy<Record<string, unknown>>(
+      { 'app-identity': { platform: 'android', appId: 'x', appName: 'y' } },
+      {
+        get(target, prop) {
+          const key = String(prop);
+          counts[key] = (counts[key] ?? 0) + 1;
+          return target[key];
+        },
+      },
+    );
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority, dataMethods);
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      await post('/api/device/request', { method: 'tap', params: { x: 3, y: 4 } });
+      await post('/api/device/request', { method: 'tap', params: { x: 5, y: 6 } });
+      // Resolved eagerly in connect() and latched (`platformResolved`) — three more taps must not
+      // ask again. This is the whole point of the cache: the answer cannot change without a
+      // reconnect, and this sits on the input hot path.
+      expect(counts['app-identity']).toBe(1);
+    } finally {
+      await device.close();
+    }
+  });
+
+  it('screenshot source:"wda" on Android 409s naming the non-iOS reason', async () => {
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority, { 'app-identity': { platform: 'android', appId: 'x', appName: 'y' } });
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const req = (await post('/api/device/request', { method: 'screenshot', params: { source: 'wda' } })) as { status?: number };
+      expect(req.status).toBe(409);
+      expect(bodyOf(req).error).toBe(WDA_NOT_IOS_REASON);
+    } finally {
+      await device.close();
+    }
   });
 });

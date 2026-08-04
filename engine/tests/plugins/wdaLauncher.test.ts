@@ -3,16 +3,23 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import {
   parseIosDevices, resolveIosDevice, ensureWdaRunning, stopWda,
-  isWdaProcessRunning, _resetWdaLauncherForTests,
+  isWdaProcessRunning, _resetWdaLauncherForTests, WDA_PROBE_TIMEOUT_MS,
 } from '../../plugins/backend/wdaLauncher';
 
 /**
  * Lazy WebDriverAgent launch (#32 Phase 2b). No Xcode, no phone — `spawn`, the device listing and
  * the readiness probe are all injected.
  *
- * The two behaviours worth guarding both fail QUIETLY in production: picking the wrong phone (a
- * signed agent launches somewhere surprising), and re-running a doomed 60-second spin-up on every
- * single tap because a permanent failure was not remembered.
+ * What every test here has in common: the failure it guards is SILENT in production. Nothing
+ * crashes, input just quietly stops being trusted — or a signed 60-second process starts on
+ * someone's phone and nobody is told. Specifically:
+ *
+ *   - picking the WRONG phone (a signed agent launches somewhere surprising);
+ *   - re-running a doomed spin-up on every tap because a permanent failure was not remembered;
+ *   - spending a network probe off macOS, where nothing can be started or used (#99);
+ *   - killing a slow launch and then advising the caller to wait for it (#109);
+ *   - starting a SECOND agent because the first had not answered yet (#109) — including the
+ *     concurrent case, which rests on an invariant no type checker enforces.
  */
 
 /** A devicectl listing. Every phone ever paired stays listed forever, and `tunnelState` says which
@@ -139,12 +146,52 @@ describe('ensureWdaRunning', () => {
     expect(spawnImpl).not.toHaveBeenCalled();
   });
 
-  it('but a REMOTE agent already running is still usable off macOS', async () => {
-    // The probe runs BEFORE the platform check on purpose: WDA is reached over the LAN, so a
-    // Windows editor can drive an agent a Mac started. Refusing outright would remove a capability
-    // that actually works.
-    const r = await ensureWdaRunning({ host: 'd', port: 8100, probe: okProbe, platform: 'win32' });
-    expect(r).toEqual({ running: true });
+  it('off macOS it does not even PROBE — the refusal costs no network (#99)', async () => {
+    // This inverts what the previous revision asserted, and the reversal is the point.
+    //
+    // The probe used to run BEFORE the platform check so a Windows editor could drive an agent a
+    // Mac had started. That capability is REAL — measured end-to-end from the Windows clone on
+    // 2026-08-03 (`[input:trusted-wda]`, `isTrusted:true`, 227ms `/status`). It is also
+    // unreachable through the product: the agent is torn down with the LEASE and the lease is
+    // exclusive, so a Mac cannot both hold one (which is what launches the agent) and leave it
+    // free for Windows. Only a hand-run xcodebuild outside the editor can, which is not a
+    // workflow we ship.
+    //
+    // So the cost had to go: an unbounded probe on EVERY input op, measured at ~2.5s per tap on
+    // Windows. Asserting the probe is never CALLED — not merely that the result is false — is what
+    // pins that, because a reordering that still probes would pass a result-only assertion.
+    const probe = vi.fn(async () => true);   // an agent IS answering, and it still must not be used
+    const r = await ensureWdaRunning({ host: 'd', port: 8100, probe, platform: 'win32' });
+    expect(r.running).toBe(false);
+    expect(r.reason).toMatch(/macOS \+ Xcode/);
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  it('bounds the real probe with a timeout — an unbounded fetch was the whole per-op cost (#99)', async () => {
+    // The default probe is the one that shipped the cost: a bare `fetch` waits out the OS connect
+    // timeout, which is 2.5s on Windows, ~1.0s on macOS against an iPhone that silently drops, and
+    // ~0.4s against an Android phone that sends RST — three prices for one line, none chosen. A
+    // live agent answered in 72-227ms, so the budget is an order of magnitude above the real thing.
+    expect(WDA_PROBE_TIMEOUT_MS).toBeGreaterThanOrEqual(1000);
+    expect(WDA_PROBE_TIMEOUT_MS).toBeLessThanOrEqual(3000);
+    const seen: RequestInit[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (_u: string, init: RequestInit) => {
+      seen.push(init);
+      throw new Error('connect timeout');   // what a dead :8100 looks like
+    }) as unknown as typeof fetch;
+    try {
+      // No `probe` override ⇒ exercises the REAL defaultProbe, which is the thing under test.
+      const r = await ensureWdaRunning({
+        host: 'd', port: 8100, platform: 'darwin', sleep: fastSleep,
+        xctestrun: null, listDevices: () => listing([]),
+      });
+      expect(r.running).toBe(false);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.signal).toBeInstanceOf(AbortSignal);
   });
 
   // `platform: 'darwin'` is pinned on every call below that expects to reach the MACOS path.
@@ -186,24 +233,95 @@ describe('ensureWdaRunning', () => {
     expect(r.reason).toMatch(/could not list iOS devices/);
   });
 
-  it('does NOT latch a timeout — a slow first install must not disable WDA for the session', async () => {
-    // The distinction from the permanent-failure latch above: a timeout can simply mean the agent
-    // is still installing onto the phone, and the next call may well find it up.
+  it('a timeout neither latches, nor kills, nor re-spawns — the slow install gets to finish (#109)', async () => {
+    // REPLACES a test that asserted `spawnImpl` was called TWICE. That expectation was wrong, and
+    // it was actively defending the bug: it read "do not latch a timeout" as "start another agent
+    // next time", when what it should mean is "notice the agent that is STILL COMING UP". The old
+    // code called stopWda() on timeout and then advised "it may still be starting; retry shortly" —
+    // advice whose premise the kill had just destroyed — so every later input op paid the whole 60s
+    // again to spawn-then-kill another signed agent on the phone, forever, with no backoff.
     const proc = { exitCode: null, killed: false, kill() { this.killed = true; }, on() {} };
+    const spawnImpl = vi.fn(() => proc);
+    const ticker = () => { let t = 0; return () => (t += 1500); };
+    const base = {
+      host: 'd', port: 8100, sleep: fastSleep, xctestrun: '/fake/WDA.xctestrun',
+      listDevices: () => listing([{ udid: 'A', name: 'Air' }]),
+      spawnImpl: spawnImpl as never,
+      platform: 'darwin' as NodeJS.Platform,
+      timeoutMs: 3000,
+    };
+
+    const first = await ensureWdaRunning({ ...base, probe: deadProbe, now: ticker() });
+    expect(first.running).toBe(false);
+    expect(first.reason).toMatch(/has been starting for \d+s/);
+    // The whole point: the launch is left ALIVE so it can finish.
+    expect(proc.killed).toBe(false);
+
+    // A second op must NOT start a rival agent — it reports the one already coming up, cheaply.
+    const second = await ensureWdaRunning({ ...base, probe: deadProbe, now: ticker() });
+    expect(second.running).toBe(false);
+    expect(second.reason).toMatch(/has been starting for/);
+    expect(spawnImpl).toHaveBeenCalledTimes(1);
+
+    // And it is still not LATCHED — the original property this test existed to protect. Once the
+    // slow install answers, the very next call reports trusted input with no new launch.
+    const third = await ensureWdaRunning({ ...base, probe: okProbe, now: ticker() });
+    expect(third).toEqual({ running: true });
+    expect(spawnImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('two CONCURRENT input ops spawn exactly ONE agent (#109 close-out sweep)', async () => {
+    // The already-launching guard covers the SEQUENTIAL case (op 2 after op 1 returned). Nothing
+    // covered two ops in flight at once, and this module carries no `inFlight` promise-guard even
+    // though its neighbours do (getDeviceCdpSession, inFlightBakes, platformInFlight). It is
+    // currently safe for one reason only: there is no `await` between the guard and the spawn, so
+    // check-and-set is atomic on the event loop.
+    //
+    // That is an invariant no type or lint rule enforces — adding an await in that window (an
+    // async device listing, say) silently reintroduces the double-spawn. Asserting on CONCURRENT
+    // calls rather than on the source layout means this fails on the rearrangement itself.
+    const proc = { exitCode: null, killed: false, kill() {}, on() {} };
     const spawnImpl = vi.fn(() => proc);
     const opts = {
       host: 'd', port: 8100, probe: deadProbe, sleep: fastSleep, xctestrun: '/fake/WDA.xctestrun',
       listDevices: () => listing([{ udid: 'A', name: 'Air' }]),
       spawnImpl: spawnImpl as never,
       platform: 'darwin' as NodeJS.Platform,
-      timeoutMs: 3000,
-      now: (() => { let t = 0; return () => (t += 1500); })(),
+      timeoutMs: 0,
     };
-    const r = await ensureWdaRunning(opts);
+    const [a, b] = await Promise.all([ensureWdaRunning(opts), ensureWdaRunning(opts)]);
+    expect(spawnImpl).toHaveBeenCalledTimes(1);
+    // Neither caller is told it has trusted input, since the agent never answered.
+    expect(a.running).toBe(false);
+    expect(b.running).toBe(false);
+  });
+
+  it('a launch whose PROCESS DIES says so, and the next call starts a fresh one (#109)', async () => {
+    // The other half of not-killing: "still starting" must not be said about a process that is
+    // gone. These two outcomes need different advice — one is "wait", the other is "your build is
+    // probably unsigned" — and the old single message covered both with the wrong one.
+    let exitCb: (() => void) | null = null;
+    const proc = {
+      exitCode: null, killed: false, kill() {},
+      on(ev: string, cb: () => void) { if (ev === 'exit') exitCb = cb; },
+    };
+    const spawnImpl = vi.fn(() => proc);
+    const base = {
+      host: 'd', port: 8100, sleep: fastSleep, xctestrun: '/fake/WDA.xctestrun',
+      listDevices: () => listing([{ udid: 'A', name: 'Air' }]),
+      spawnImpl: spawnImpl as never,
+      platform: 'darwin' as NodeJS.Platform,
+    };
+    // xcodebuild exits during the first poll — a signing failure looks exactly like this.
+    const dyingProbe = async () => { exitCb?.(); exitCb = null; return false; };
+
+    const r = await ensureWdaRunning({ ...base, probe: dyingProbe });
     expect(r.running).toBe(false);
-    expect(r.reason).toMatch(/retry shortly/);
-    // Latching would have short-circuited this second attempt without spawning again.
-    await ensureWdaRunning({ ...opts, now: (() => { let t = 0; return () => (t += 1500); })() });
+    expect(r.reason).toMatch(/exited/);
+    expect(r.reason).not.toMatch(/has been starting/);
+
+    // Nothing is alive to join, so the next call is free to try again from scratch.
+    await ensureWdaRunning({ ...base, probe: deadProbe, timeoutMs: 0 });
     expect(spawnImpl).toHaveBeenCalledTimes(2);
   });
 

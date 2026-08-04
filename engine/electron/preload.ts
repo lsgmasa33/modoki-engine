@@ -14,11 +14,13 @@ import { contextBridge, ipcRenderer } from 'electron';
 
 // Renderer → main request/response channels the editor may `invoke`. Whitelisted so
 // the bridge never exposes arbitrary ipcRenderer.invoke to the renderer. These back
-// the "Connect Claude Code" AI panel (docs/connect-claude-code.md).
+// the "Connect Claude Code" AI panel (docs/connect-claude-code.md) — except
+// `clear-browser-caches`, which backs EditorBootBoundary's stale-chunk recovery (#110).
 const INVOKE_CHANNELS = new Set<string>([
   'modoki:connect-claude',
   'modoki:connect-claude-status',
   'modoki:set-cdp-enabled',
+  'modoki:clear-browser-caches',
 ]);
 
 // Backend base handed in via additionalArguments (`--modoki-backend-base=...`).

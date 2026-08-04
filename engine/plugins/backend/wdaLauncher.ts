@@ -13,9 +13,13 @@
  * banner. Losing WDA degrades INPUT, it does not drop the lease — screenshots, Percept reads and
  * everything else that never needed WDA keep working (Decision 2).
  *
- * STARTING one is macOS-only (it is an xcodebuild run), matching `isInstallable('webdriveragent')`.
- * USING one is not: the agent answers over the LAN, so a Windows/Linux editor can drive an agent a
- * Mac started — which is why the reachability probe runs before the platform check.
+ * macOS-ONLY, both to start and to use (#99). Starting one is an `xcodebuild` run, matching
+ * `isInstallable('webdriveragent')`. Using one from elsewhere is technically possible — the agent
+ * answers over the LAN and a Windows editor really did drive one end-to-end (measured 2026-08-03)
+ * — but it is unreachable through the product: this module tears the agent down with the LEASE,
+ * and the lease is exclusive, so a Mac cannot both hold one (which is what triggers the launch)
+ * and leave it free for another machine. So the platform check runs FIRST and a non-macOS editor
+ * pays nothing. docs/trusted-device-input.md carries the measurement and the reasoning.
  */
 
 import { spawn, execFileSync, type ChildProcess } from 'child_process';
@@ -122,6 +126,9 @@ let child: ChildProcess | null = null;
 /** Why the last launch attempt failed. Kept so a repeated input op reports the SAME actionable
  *  cause instead of silently re-running a doomed 45-second spin-up on every tap. */
 let lastFailure: string | null = null;
+/** When the current launch was spawned, for the elapsed time in `launchInProgressReason`. Cleared
+ *  with the child so a later launch never reports the previous one's age. */
+let launchStartedAt: number | null = null;
 
 /** True when we have a live agent process we started. */
 export function isWdaProcessRunning(): boolean { return !!child && child.exitCode === null && !child.killed; }
@@ -131,6 +138,7 @@ export function isWdaProcessRunning(): boolean { return !!child && child.exitCod
 export function stopWda(): void {
   if (child && child.exitCode === null) { try { child.kill(); } catch { /* already gone */ } }
   child = null;
+  launchStartedAt = null;
   lastFailure = null;
 }
 
@@ -165,9 +173,19 @@ function provisionedXctestrun(): { path: string } | { error: string } {
  *  extra headroom covers a first run that also has to install the runner onto the phone. */
 const DEFAULT_LAUNCH_TIMEOUT_MS = 60_000;
 
+/** How long a single `/status` probe may take before we call it "not answering".
+ *
+ *  MUST be bounded, and this is the whole of #99's Claim-1 cost. An unbounded `fetch` waits out the
+ *  OS connect timeout, which differs per platform AND per how the phone refuses — measured
+ *  2026-08-03 against a dead :8100: **2.5s from Windows** and ~1.0s from macOS against an iPhone
+ *  (which silently drops), ~0.4s against an Android phone (which sends RST). Three prices for the
+ *  same line, none of them chosen. A live agent answered in **72–227ms** over the same LAN, so this
+ *  budget is an order of magnitude above the real thing while capping the failure case. */
+export const WDA_PROBE_TIMEOUT_MS = 1500;
+
 async function defaultProbe(url: string): Promise<boolean> {
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, { signal: AbortSignal.timeout(WDA_PROBE_TIMEOUT_MS) });
     if (!res.ok) return false;
     const body = await res.json() as { value?: { ready?: boolean } };
     return body?.value?.ready === true;
@@ -185,20 +203,46 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
   const probe = opts.probe ?? defaultProbe;
   const statusUrl = `http://${opts.host}:${opts.port}/status`;
 
-  // Already up — including a WDA someone started by hand, which must not be duplicated. Probed
-  // BEFORE the platform check on purpose: a Windows/Linux editor can still USE an agent someone
-  // started on a Mac (it is reached over the LAN, not locally), it just cannot start one.
-  if (await probe(statusUrl)) return { running: true };
-
-  // Building and launching WDA both need Xcode, so off macOS this can only ever fail. `xcrun`
-  // does not exist there, and `isInstallable('webdriveragent')` is already darwin-gated — leaving
-  // the LAUNCH ungated made the two disagree, and shelled out on every first input op to a binary
-  // that cannot be there. Latched like any other permanent cause.
+  // Off macOS there is NOTHING to reach and nothing to start, so refuse FIRST — before spending a
+  // network probe (#99).
+  //
+  // This ordering was the other way round, deliberately: starting an agent is macOS-only but USING
+  // one is not, so a Windows editor probed first in case a Mac on the LAN had one running. That
+  // capability is real — measured end-to-end from the Windows clone on 2026-08-03, `[input:
+  // trusted-wda]` with `isTrusted:true` and a 227ms `/status`. It is nonetheless UNREACHABLE
+  // through the product, which is why the ordering is now gone: the Mac editor tears its agent
+  // down WITH the lease (Decision 2) and the device lease is EXCLUSIVE, so a Mac cannot both hold
+  // a lease (what triggers its lazy launch) and leave that lease free for Windows to take. The
+  // only way to produce a Windows-drivable agent is a hand-run `xcodebuild test-without-building`
+  // outside the editor entirely. Charging every non-macOS input op an unbounded probe to serve a
+  // workflow the product cannot produce was the wrong trade — measured at ~2.5s per tap on
+  // Windows. See docs/trusted-device-input.md for the full measurement and the reasoning.
+  //
+  // Latched like any other permanent cause: the platform cannot change mid-session.
   if ((opts.platform ?? process.platform) !== 'darwin') {
-    lastFailure = 'WebDriverAgent needs macOS + Xcode, so it cannot be started from this editor '
-      + '(it can still be used if a Mac on the network is running one)';
+    lastFailure = 'WebDriverAgent needs macOS + Xcode, so it cannot be started or used from this '
+      + 'editor — iOS input here is synthetic. Drive the device from a Mac editor for trusted input';
     return { running: false, reason: lastFailure };
   }
+
+  // Already up — including a WDA someone started by hand, which must not be duplicated.
+  if (await probe(statusUrl)) return { running: true };
+
+  // ⚠️ INVARIANT: from this guard down to `child = spawnFn(...)` there must be NO `await`. That
+  // synchronous window is the ONLY thing making check-and-set atomic, and it is what lets this
+  // module skip the `inFlight` promise-guard its neighbours carry (`getDeviceCdpSession`,
+  // `inFlightBakes`, `platformInFlight`). Add an await in here — making the device listing async,
+  // say — and two concurrent input ops both pass the guard and BOTH spawn a signed 60-second
+  // agent, which is the bug #109 fixed wearing a different hat. Pinned by the concurrency test in
+  // wdaLauncher.test.ts, which fails on the rearrangement rather than on the symptom.
+  //
+  // A launch WE started is still running but not answering yet (#109). Report that and return —
+  // never spawn a second one. This is the half that makes "do not kill it on timeout" safe: the
+  // launcher is otherwise not idempotent w.r.t. an in-flight launch, so an agent left running would
+  // simply be joined by another on the next tap, which is worse than the bug being fixed. Cheap by
+  // construction: the caller pays one bounded probe rather than a fresh 60s spin-up.
+  const nowFn = opts.now ?? Date.now;
+  if (isWdaProcessRunning()) return { running: false, reason: launchInProgressReason(nowFn()) };
 
   // A previous attempt failed for a reason that will not fix itself between two taps (no device,
   // not provisioned, ambiguous device). Report it again rather than burn another spin-up per call.
@@ -236,24 +280,48 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
     '-xctestrun', xctestrun,
     '-destination', `id=${resolved.device.udid}`,
   ], { stdio: 'ignore' });
-  child.on('exit', () => { child = null; });
+  child.on('exit', () => { child = null; launchStartedAt = null; });
+  launchStartedAt = nowFn();
 
   // Poll rather than parse the log: readiness is a property of the SERVER, and `/status` answering
   // `ready:true` is the only thing that actually matters to the next input op.
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  const now = opts.now ?? Date.now;
-  const deadline = now() + (opts.timeoutMs ?? DEFAULT_LAUNCH_TIMEOUT_MS);
-  while (now() < deadline) {
+  const deadline = nowFn() + (opts.timeoutMs ?? DEFAULT_LAUNCH_TIMEOUT_MS);
+  while (nowFn() < deadline) {
     await sleep(1000);
     if (await probe(statusUrl)) return { running: true };
     if (!child) break;   // the test process died — no point waiting out the clock
   }
 
-  // Do NOT latch this one: a timeout can be a slow first install, and the next call may well find
-  // it up. Latching would turn a transient into a permanent synthetic fallback for the session.
-  stopWda();
-  return { running: false, reason: 'WebDriverAgent did not become ready in time — it may still be starting; retry shortly' };
+  // Do NOT latch this one: a timeout can be a slow first install, and a later call may well find it
+  // up. Latching would turn a transient into a permanent synthetic fallback for the session.
+  //
+  // And do NOT kill it either (#109). The previous revision called `stopWda()` here and then said
+  // "it may still be starting; retry shortly" — advice whose premise the kill had just destroyed.
+  // It could not still be starting, so "a later call may find it up" could never happen, and the
+  // next input op paid the whole 60s again to spawn-then-kill another signed agent on the phone,
+  // indefinitely, with no backoff. Leaving it running costs nothing: it is still owned by the lease
+  // and `stopWda()` on disconnect still guarantees nothing is stranded (Decision 2). A slow install
+  // now gets to FINISH, and the guard above turns every later call into one bounded probe.
+  if (!child) {
+    return { running: false, reason: 'the WebDriverAgent process exited before the agent answered — check the build is still signed (Build Support → iOS), then try again' };
+  }
+  return { running: false, reason: launchInProgressReason(nowFn()) };
+}
+
+/** The "still coming up" reason, shared by the timeout return and the already-launching guard.
+ *
+ *  Reports the ELAPSED time rather than a bare "retry shortly", because that is what makes the
+ *  message self-diagnosing without inventing a give-up policy: 20s reads as normal, 5 minutes reads
+ *  as wedged, and the reader can tell which without knowing our timeouts. The escape hatch is named
+ *  for the same reason — reconnecting the lease runs `stopWda()`, so there IS a way to start over,
+ *  and a message that admits no way out invites someone to invent one. */
+function launchInProgressReason(nowMs: number): string {
+  const secs = launchStartedAt === null ? 0 : Math.max(0, Math.round((nowMs - launchStartedAt) / 1000));
+  return `WebDriverAgent has been starting for ${secs}s and is not answering yet — the launch is still `
+    + 'running, so it will be picked up by a later call without starting another one. If it never '
+    + 'comes up, reconnect the device lease to start over';
 }
 
 /** Test seam — forget any process handle and latched failure. */
-export function _resetWdaLauncherForTests(): void { child = null; lastFailure = null; }
+export function _resetWdaLauncherForTests(): void { child = null; launchStartedAt = null; lastFailure = null; }

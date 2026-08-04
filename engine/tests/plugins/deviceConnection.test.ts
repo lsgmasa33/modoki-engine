@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, beforeEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import net from 'net';
 import os from 'os';
 import fs from 'fs';
@@ -245,5 +245,81 @@ describe('device persistence helpers', () => {
   it('returns null (not a throw) for a corrupt device-target.json', () => {
     fs.writeFileSync(path.join(dir, 'device-target.json'), '{not valid json');
     expect(loadLastTarget(dir)).toBeNull();
+  });
+});
+
+/** #99 — `devicePlatform()` gates the iOS-only WebDriverAgent route. The router tests cover the
+ *  happy paths (ios / android / old-bridge / asked-once); what lives here is the distinction the
+ *  two fields exist for, because it is the one a later "simplification" would quietly destroy.
+ *
+ *  A null answer means two different things. The bridge ANSWERING without a platform (an old build
+ *  with no `app-identity`) is a stable fact for the life of the lease, so it latches — re-asking on
+ *  every input op would be a round trip that can never change its mind. Failing to ASK at all (the
+ *  lease dropped mid-probe) is transient and must NOT latch: collapsing the two would permanently
+ *  disable trusted iOS input for the rest of a session because of one dropped packet. */
+describe('DeviceConnectionManager.devicePlatform — what latches and what does not (#99)', () => {
+  let stateDir: string;
+  beforeEach(() => { stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-plat-')); });
+  afterEach(() => { fs.rmSync(stateDir, { recursive: true, force: true }); });
+
+  it('a FAILED ask is retried — one dropped probe must not disable iOS input for the session', async () => {
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority);
+    const mgr = new DeviceConnectionManager('guid-plat-1', stateDir);
+    // The spy is installed BEFORE connect on purpose: connect() resolves the platform eagerly, so
+    // the first (throwing) call is the one connect itself makes.
+    const proxy = vi.spyOn(mgr, 'proxy')
+      .mockRejectedValueOnce(new Error('lease dropped mid-probe'))
+      .mockResolvedValueOnce({ platform: 'ios', appId: 'a', appName: 'b' });
+    try {
+      await mgr.connect({ ip: '127.0.0.1', port: device.port });
+      expect(proxy).toHaveBeenCalledTimes(1);          // the eager ask, which threw
+      expect(await mgr.devicePlatform()).toBe('ios');  // retried, and now succeeds
+      expect(proxy).toHaveBeenCalledTimes(2);
+    } finally {
+      proxy.mockRestore();
+      await mgr.disconnect();
+      await device.close();
+    }
+  });
+
+  it('an ANSWERED null latches — an old bridge is not re-asked on every op', async () => {
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority);
+    const mgr = new DeviceConnectionManager('guid-plat-2', stateDir);
+    // What a bridge with no `app-identity` handler actually returns: a reply, carrying no platform.
+    const proxy = vi.spyOn(mgr, 'proxy').mockResolvedValue({ ok: false, reason: 'not-owner' });
+    try {
+      await mgr.connect({ ip: '127.0.0.1', port: device.port });
+      expect(await mgr.devicePlatform()).toBeNull();
+      expect(await mgr.devicePlatform()).toBeNull();
+      expect(proxy).toHaveBeenCalledTimes(1);
+    } finally {
+      proxy.mockRestore();
+      await mgr.disconnect();
+      await device.close();
+    }
+  });
+
+  it('disconnect clears it, so a reconnect to a DIFFERENT phone cannot inherit the old answer', async () => {
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority);
+    const mgr = new DeviceConnectionManager('guid-plat-3', stateDir);
+    const proxy = vi.spyOn(mgr, 'proxy').mockResolvedValue({ platform: 'ios', appId: 'a', appName: 'b' });
+    try {
+      await mgr.connect({ ip: '127.0.0.1', port: device.port });
+      expect(await mgr.devicePlatform()).toBe('ios');
+      await mgr.disconnect();
+      // Stale-cache check: without the reset in disconnect(), an Android phone connected next would
+      // still be reported as iOS and would take the WDA path this gate exists to keep it out of.
+      expect(await mgr.devicePlatform()).toBeNull();   // disconnected ⇒ nothing to report
+      proxy.mockResolvedValue({ platform: 'android', appId: 'a', appName: 'b' });
+      await mgr.connect({ ip: '127.0.0.1', port: device.port });
+      expect(await mgr.devicePlatform()).toBe('android');
+    } finally {
+      proxy.mockRestore();
+      await mgr.disconnect();
+      await device.close();
+    }
   });
 });
