@@ -70,6 +70,25 @@ function safeQuery(trait: any) {
   try { return getCurrentWorld().query(trait); } catch { return null; }
 }
 
+/** Warn about the O(n) fallback at most WARN_CAP times per process, then once more to say
+ *  the rest are hidden. Exported only so a test can reset it. */
+const FALLBACK_WARN_CAP = 3;
+let _fallbackWarnings = 0;
+export function resetFallbackWarnings() { _fallbackWarnings = 0; }
+function warnFallbackCapped(entityId: number) {
+  _fallbackWarnings++;
+  if (_fallbackWarnings <= FALLBACK_WARN_CAP) {
+    // The message alone never said WHO called, which is the only thing that identifies the
+    // spawn site that skipped registerEntity — and with the message capped there is now room
+    // to print it. Drop this function + findEntity from the top so the first frame is the caller.
+    const stack = (new Error().stack ?? '').split('\n').slice(3).join('\n');
+    console.warn(`[entityUtils] findEntity(${entityId}) hit O(n) fallback — entity was not registered via registerEntity()\n${stack}`);
+  } else if (_fallbackWarnings === FALLBACK_WARN_CAP + 1) {
+    console.warn('[entityUtils] further O(n)-fallback warnings suppressed for this process — the first '
+      + `${FALLBACK_WARN_CAP} are enough to act on, and one unregistered entity repeats per lookup`);
+  }
+}
+
 /** Find an entity by ID. O(1) via entity index, with fallback scan for
  *  entities not registered via registerEntity (e.g. in tests). */
 export function findEntity(entityId: number) {
@@ -81,10 +100,20 @@ export function findEntity(entityId: number) {
   for (const e of (world as any).entities ?? []) {
     if ((e as any).id?.() === entityId) {
       // Production code should always go through registerEntity so this O(n)
-      // fallback never fires. In dev, warn so missing registrations get fixed.
-      if (import.meta.env?.DEV) {
-        console.warn(`[entityUtils] findEntity(${entityId}) hit O(n) fallback — entity was not registered via registerEntity()`);
-      }
+      // fallback never fires. In dev, warn so missing registrations get fixed —
+      // but CAPPED and with a STACK, because the interesting information is "this
+      // happens at all, from here", and it otherwise repeats per lookup per entity:
+      // uncapped it put 21,906 lines into a single CI run (2026-08-04), which is the
+      // log you then have to read to find a real failure.
+      //
+      // It fires from TEST worlds, which spawn directly and skip registerEntity by
+      // design. It looked platform-specific — thousands of lines on the ubuntu and
+      // windows CI legs, none on macOS — but that is only vitest's reporter: console
+      // output from a PASSING test is hidden locally and printed in CI. The warnings
+      // were always there. Hence a cap rather than a test-env mute: the behaviour is
+      // unchanged, only the volume is, and the stack makes the one surviving line
+      // actionable instead of merely alarming.
+      if (import.meta.env?.DEV) warnFallbackCapped(entityId);
       return e;
     }
   }

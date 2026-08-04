@@ -123,9 +123,12 @@ describe('ensureWdaRunning', () => {
   const okProbe = async () => true;
   const deadProbe = async () => false;
 
+  // `platform` is pinned on every case that expects to get PAST the darwin gate below. Without it
+  // these read as "WDA behaviour" but silently assert "…on a Mac", and every one of them failed on
+  // the ubuntu + windows CI legs — where the gate correctly refuses before the probe ever runs.
   it('does NOT spawn when WDA is already answering — including one started by hand', async () => {
     const spawnImpl = vi.fn();
-    const r = await ensureWdaRunning({ host: 'd', port: 8100, probe: okProbe, spawnImpl: spawnImpl as never });
+    const r = await ensureWdaRunning({ host: 'd', port: 8100, platform: 'darwin', probe: okProbe, spawnImpl: spawnImpl as never });
     expect(r).toEqual({ running: true });
     expect(spawnImpl).not.toHaveBeenCalled();
   });

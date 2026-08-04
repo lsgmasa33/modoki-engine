@@ -145,7 +145,15 @@ describe('test files reach the filesystem through os.tmpdir(), not a literal POS
     // A root that silently stops matching turns this whole block into a cheerful no-op — the
     // failure mode `testTypecheckCoverage.test.ts` exists to catch for tsconfig programs.
     expect(files.length).toBeGreaterThan(100);
-    expect(files.some((f) => f.startsWith('games/'))).toBe(true);
+    // Every root `testRoots()` DISCOVERED must contribute a file. This used to demand a `games/`
+    // one specifically, which reads as the same guarantee but is really an assumption about the
+    // tree: the OSS CI snapshot ships engine + two demos and no `games/` at all, so it failed
+    // there for months on a scan that was working perfectly. Pinning to the discovered roots is
+    // also strictly stronger — it catches a root that stops matching, which is the actual fear,
+    // and it catches it for `demos/` and the engine suites too, not just `games/`.
+    for (const root of testRoots()) {
+      expect(files.some((f) => f.startsWith(`${root}/`)), `no test files under ${root}`).toBe(true);
+    }
   });
 
   it('no POSIX-absolute path literal reaches an fs call', () => {
