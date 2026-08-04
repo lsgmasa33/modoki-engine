@@ -35,7 +35,7 @@
     "build": "node engine/scripts/build-web.mjs",
     "typecheck": "tsc -b engine && tsc -p engine/tsconfig.test.json && npm --prefix engine/packages/modoki run typecheck && npm --prefix engine/tools/modoki-mcp run typecheck && npm --prefix engine/tools/game-debug-mcp run typecheck",
     "typecheck:projects": "node engine/scripts/typecheck-projects.mjs",
-    "lint": "eslint --config engine/eslint.config.js .",
+    "lint": "eslint --config engine/eslint.config.js --cache --cache-strategy content --cache-location node_modules/.tmp/.eslintcache .",
     "verify": "npm run typecheck && npm run lint && npm test && npm --prefix engine/packages/modoki test",
     "verify:all": "npm run verify && npm run test:e2e",
     "verify:packaged": "npm run verify && npm run smoke:packaged",

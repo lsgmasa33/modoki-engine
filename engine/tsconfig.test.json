@@ -24,6 +24,13 @@
     "verbatimModuleSyntax": true,
     "moduleDetection": "force",
     "noEmit": true,
+    // `incremental` works alongside `noEmit` (TS 4.0+): it persists the type graph without
+    // emitting JS. Without it this config is a FULL cold recheck of all of tests/ on every
+    // `npm run typecheck` — measured at 16.5s warm, vs 18.2s for the whole `tsc -b engine`
+    // project graph, which does cache. The buildinfo sits beside tsconfig.app's in
+    // node_modules/.tmp (gitignored via *.tsbuildinfo).
+    "incremental": true,
+    "tsBuildInfoFile": "../node_modules/.tmp/tsconfig.test.tsbuildinfo",
     "jsx": "react-jsx",
 
     /* Linting */
