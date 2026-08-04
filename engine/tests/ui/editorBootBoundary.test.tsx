@@ -1,13 +1,18 @@
 /** EditorBootBoundary — last-resort boundary around the editor route.
  *
- *  Regression guard for the packaged-editor cold-start dep-optimizer race: a rare mismatch
- *  between what Vite's cold scan pre-bundled and what the renderer actually requests surfaces as
- *  a SyntaxError naming a missing export, and a bare reload against the by-then-finished
- *  pre-bundle always clears it. This boundary gets ONE such reload, capped via sessionStorage so
- *  it can never loop, before falling back to the original "paint the error, never go blank"
- *  behavior — which is itself load-bearing (see the class doc comment): a silently-blank window
- *  is what made the original wedged-editor bug cost four debugging sessions.
- */
+ *  Regression guard for the packaged editor serving a dep chunk that is missing an export the
+ *  renderer imports, which surfaces as a SyntaxError naming that export. This boundary gets ONE
+ *  recovery attempt, capped via sessionStorage so it can never loop, before falling back to the
+ *  original "paint the error, never go blank" behavior — which is itself load-bearing (see the
+ *  class doc comment): a silently-blank window is what made the original wedged-editor bug cost
+ *  four debugging sessions.
+ *
+ *  The recovery is NOT a bare reload. It was, and #110 measured why that could never work for the
+ *  dominant cause (stale Chromium browser caches after an app update): Vite serves the dep URL
+ *  `immutable` and its browserHash doesn't move on an engine-only update, so a reload re-requests
+ *  the identical URL and gets the identical stale body — burning the one retry for nothing. So the
+ *  cache clear must happen BEFORE the reload, and the tests below pin that ORDER, not just that
+ *  both happened. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, cleanup } from '@testing-library/react';
@@ -52,7 +57,15 @@ describe('EditorBootBoundary', () => {
     vi.restoreAllMocks();
     sessionStorage.clear();
     Object.defineProperty(window, 'location', { configurable: true, value: realLocation });
+    delete (window as unknown as { __modokiElectron?: unknown }).__modokiElectron;
   });
+
+  /** Install the Electron preload bridge the packaged editor has (absent in a plain browser). */
+  function stubElectron(invoke: (c: string, p?: unknown) => Promise<unknown>) {
+    (window as unknown as { __modokiElectron?: unknown }).__modokiElectron = { invoke };
+  }
+
+  const STALE = "The requested module '/@fs/.../@modoki_engine_editor.js?v=d000db2e' does not provide an export named 'waitForEditorJournal'";
 
   it('renders children normally when nothing throws', () => {
     const { getByText } = render(
@@ -107,6 +120,66 @@ describe('EditorBootBoundary', () => {
     expect(reloadSpy).not.toHaveBeenCalled();
     // The retry count must not climb past the cap.
     expect(sessionStorage.getItem(BOOT_RETRY_SESSION_KEY)).toBe(String(MAX_BOOT_RETRIES));
+  });
+
+  it('under Electron, clears the browser caches BEFORE reloading — the order is the whole fix (#110)', async () => {
+    // A bare reload re-requests the same `immutable` dep URL and gets the same stale body back,
+    // so a clear that lands AFTER the reload is indistinguishable from no clear at all.
+    const order: string[] = [];
+    const invoke = vi.fn(async (channel: string) => { order.push(`invoke:${channel}`); return { ok: true }; });
+    stubElectron(invoke);
+    reloadSpy.mockImplementation(() => { order.push('reload'); });
+
+    render(
+      <EditorBootBoundary>
+        <Bomb shouldThrow message={STALE} />
+      </EditorBootBoundary>,
+    );
+
+    // The clear is awaited, so the reload lands a microtask later than the synchronous path.
+    await vi.waitFor(() => expect(reloadSpy).toHaveBeenCalledTimes(1));
+    expect(invoke).toHaveBeenCalledWith('modoki:clear-browser-caches');
+    expect(order).toEqual(['invoke:modoki:clear-browser-caches', 'reload']);
+    expect(sessionStorage.getItem(BOOT_RETRY_SESSION_KEY)).toBe('1');
+  });
+
+  it('still reloads when the cache clear throws — a failed clear must not strand the editor on "Recovering…"', async () => {
+    stubElectron(vi.fn(async () => { throw new Error('no session'); }));
+
+    const { getByText } = render(
+      <EditorBootBoundary>
+        <Bomb shouldThrow message={STALE} />
+      </EditorBootBoundary>,
+    );
+
+    expect(getByText(/Recovering from a startup glitch/)).toBeTruthy();
+    await vi.waitFor(() => expect(reloadSpy).toHaveBeenCalledTimes(1));
+  });
+
+  it('still reloads when the cache clear reports failure rather than throwing', async () => {
+    stubElectron(vi.fn(async () => ({ ok: false, error: 'clearCache unavailable' })));
+
+    render(
+      <EditorBootBoundary>
+        <Bomb shouldThrow message={STALE} />
+      </EditorBootBoundary>,
+    );
+
+    await vi.waitFor(() => expect(reloadSpy).toHaveBeenCalledTimes(1));
+  });
+
+  it('the retry cap is spent even if the clear never resolves — a hung IPC cannot buy extra retries', () => {
+    // The count is persisted BEFORE the async work, so a wedged clearCache can't loop the boundary.
+    stubElectron(vi.fn(() => new Promise<unknown>(() => {})));
+
+    render(
+      <EditorBootBoundary>
+        <Bomb shouldThrow message={STALE} />
+      </EditorBootBoundary>,
+    );
+
+    expect(sessionStorage.getItem(BOOT_RETRY_SESSION_KEY)).toBe(String(MAX_BOOT_RETRIES));
+    expect(reloadSpy).not.toHaveBeenCalled(); // still awaiting the clear — deliberately not reloaded yet
   });
 
   it('logs a diagnostic on every catch, matching-signature or not, so main.log has a trail', () => {

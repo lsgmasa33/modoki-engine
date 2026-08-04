@@ -13,7 +13,8 @@ import {
   synthFallbackBanner,
   resolveDeviceCdpPort, DEFAULT_DEVICE_CDP_PORT, parseWebviewSockets, isCdpRoutableMethod,
   tryDeviceCdpInput, cdpTap, cdpDrag, cdpPressKey, cdpHover, cdpScroll, isDeviceCdpAvailable,
-  TRUSTED_CDP_MECHANISM, type CdpSender, type CdpRouteDeps, type DeviceCdpSession,
+  TRUSTED_CDP_MECHANISM, discoverDeviceCdpTarget, deviceCdpAdb,
+  type CdpSender, type CdpRouteDeps, type DeviceCdpSession,
 } from '../../plugins/backend/deviceCdp';
 
 describe('resolveDeviceCdpPort — per-clone derivation', () => {
@@ -305,5 +306,39 @@ describe('isDeviceCdpAvailable — the device_status probe', () => {
   });
   it('false when no session is available (refusal carries no mechanism)', async () => {
     expect(await isDeviceCdpAvailable({ getSession: async () => null })).toBe(false);
+  });
+});
+
+/** Found sweeping for siblings of #99's unbounded WebDriverAgent probe. Every other I/O boundary in
+ *  deviceCdp.ts is deliberately capped — three `execFileSync` at 4s, the WebSocket connect on a
+ *  timer, `send()` on the pending-map timer — and discovery's two HTTP GETs were not. The 127.0.0.1
+ *  address makes them look safe and does not make them safe: an `adb forward` LISTENS whether or
+ *  not anything is behind it, so with WiFi-adb or a sleeping device the socket accepts and then
+ *  never answers. Discovery is on the input path via `getDeviceCdpSession`, so an unbounded wait
+ *  there hangs `device_tap` outright rather than merely making it slow. */
+describe('discoverDeviceCdpTarget — discovery I/O is bounded (#99 sweep)', () => {
+  it('passes an AbortSignal to every discovery GET, and a hanging endpoint yields null not a hang', async () => {
+    const sockets = vi.spyOn(deviceCdpAdb, 'listUnixSockets')
+      .mockReturnValue('0000 0002 0001 @webview_devtools_remote_1234\n');
+    const forward = vi.spyOn(deviceCdpAdb, 'forward').mockImplementation(() => {});
+    const inits: (RequestInit | undefined)[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (_u: string, init?: RequestInit) => {
+      inits.push(init);
+      throw new Error('aborted');   // what a bounded wait on a dead forward looks like
+    }) as unknown as typeof fetch;
+    try {
+      // Must RESOLVE (to null) rather than reject: discovery's contract is "null = no trusted
+      // route", which is the fallback-to-synthetic signal, not an error to surface.
+      expect(await discoverDeviceCdpTarget({ localPort: 9333 })).toBeNull();
+    } finally {
+      globalThis.fetch = realFetch;
+      sockets.mockRestore();
+      forward.mockRestore();
+    }
+    // Asserting the SIGNAL is passed, not merely that the call failed: a regression that drops the
+    // timeout still fails this way against a dead endpoint, and would pass a result-only check.
+    expect(inits).toHaveLength(1);
+    expect(inits[0]?.signal).toBeInstanceOf(AbortSignal);
   });
 });

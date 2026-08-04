@@ -179,6 +179,35 @@ jobs:
           fi
           echo "[verify-tools] all bundled tools present in resources/bin."
 
+      # Gate the release on the packaged editor actually RENDERING — the "blank editor
+      # window" class (a dep-cache resolution failure, a file excluded from the package)
+      # that the build AND the tools guard above both pass cleanly. macOS has had this
+      # gate for many releases (release.yml); Windows shipped without it until #94 — not
+      # by choice, but because assert-app-renders.sh was macOS-only in four independent
+      # ways (.app/Contents/MacOS, pkill, a ~/Library cache path, BSD `mktemp -t`) until
+      # 560a4c47 made it cross-platform. It now resolves the executable itself via
+      # packagedAppPaths.mjs, so it takes the app DIR — on Windows that is the
+      # win-unpacked folder, not a bundle.
+      #
+      # The project arg is NOT optional here: the script defaults to $REPO/games/3d-test,
+      # and the public snapshot has no games/. Scaffold a throwaway starter instead — the
+      # same thing the macOS job does, and the leg 560a4c47 never exercised (it validated
+      # against a real games/3d-test).
+      - name: Scaffold a smoke project (starter)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node engine/scripts/scaffold-project.mjs "$RUNNER_TEMP/smoke" "Smoke"
+          npm --prefix "$RUNNER_TEMP/smoke" install
+      # FATAL, deliberately — matching macOS and the bundled-tools guard directly above.
+      # An installer whose editor does not render must not publish, and a warn-only gate
+      # on the platform with no human tester is a gate nobody reads.
+      - name: Smoke — packaged editor renders (no blank window)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash engine/scripts/assert-app-renders.sh release/win-unpacked "$RUNNER_TEMP/smoke"
+
       # Run-scoped artifact — the simplest download when Actions artifact storage has
       # room. continue-on-error: the account's artifact-storage quota is currently
       # exhausted, and a quota failure here must NOT fail the run or block the

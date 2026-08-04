@@ -256,10 +256,13 @@ userData/vite-cache location, and the reap mechanism (`pkill -f` vs a `Win32_Pro
 `ExecutablePath`). Believing it was macOS-only is part of why a *packaged Windows* bug — the editor
 being unable to extract any provisioned toolchain — survived undetected; see "Never assume `tar` is
 bsdtar" in [editor-toolchain.md](editor-toolchain.md). Its release-time sibling
-`assert-app-renders.sh` genuinely WAS macOS-only until the same date, and the public repo's
-`oss/.github/workflows/release-windows.yml` (the private `.github/workflows/release-windows.yml`
-was deleted 2026-08-03 — releases are cut from the public repo now, see
-docs/engine-oss-publishing.md) still has no render gate wired up (#94).
+`assert-app-renders.sh` genuinely WAS macOS-only until the same date, which is why the Windows
+release shipped without a render gate for as long as it did. It is wired in now (#94): the public
+repo's `oss/.github/workflows/release-windows.yml` scaffolds a throwaway starter project and runs
+`assert-app-renders.sh release/win-unpacked "$RUNNER_TEMP/smoke"` as a **fatal** step, matching
+macOS. (The private `.github/workflows/release-windows.yml` was deleted 2026-08-03 — releases are
+cut from the public repo now, see docs/engine-oss-publishing.md.) The explicit project argument is
+load-bearing: the script defaults to `$REPO/games/3d-test`, and the public snapshot has no `games/`.
 
 It stops the local dev editor and builds a throwaway `.app` on a **per-clone port outside the
 5179/5180/5181 human-editor range** — the block and its override live in the harness port table in
@@ -312,11 +315,59 @@ relaunch. Two things came out of it:
   `fs.stat` mtime, because `__filename` lives inside `app.asar` and Electron's asar shim fabricates
   stat times, so an mtime-keyed signature never matches itself and wipes on *every* boot. Guarded by
   `engine/tests/architecture/viteCacheBustSignature.test.ts`.
-- **Not root-caused:** a residual crash on a genuinely *cold* cache (the wipe fired on the same boot
-  that then crashed) — i.e. not staleness but a race during the cold optimize. Mitigated only:
-  `EditorBootBoundary` does one capped, logged reload on that error signature, so it degrades to a
-  ~1s delay instead of the red error screen. `main.log` carries `retryCount=` /
-  `staleDepOptimizeSignature=` / `willRetry=` on every catch — that is the trail to pull.
+- **Not root-caused *at the time*:** a residual crash on a genuinely *cold* cache (the wipe fired on
+  the same boot that then crashed) — read then as a race during the cold optimize rather than
+  staleness. **#110 later explained this shape** (see below) and, in doing so, showed the mitigation
+  could not work. `main.log` carries `retryCount=` / `staleDepOptimizeSignature=` / `willRetry=` on
+  every catch — that is still the trail to pull.
+
+**Stale HTTP cache across an update (#110)** — the same `does not provide an export named …` crash,
+on packaged Windows 0.3.7 opening `demos/postfx-demo`, *with the dep-cache wipe working correctly*.
+
+Wiping `vite-cache` is necessary but **not sufficient**. Vite serves `/deps/*.js?v=<browserHash>`
+with `Cache-Control: immutable`, and `browserHash` keys on the **lockfile + optimizeDeps config**,
+not on `@modoki/engine` source. An engine-only update therefore leaves the dep URL **byte-identical**,
+and Chromium replays the **pre-update body** from its own disk cache — which lives in `userData` and
+survives the update exactly like the dep-cache does. The freshly re-optimized, *correct* chunk sits
+on disk unread.
+
+What was measured, on the running failed instance:
+
+| Observation | Value |
+|---|---|
+| `waitForEditorJournal` in the on-disk dep (written **before** the crash) | **present** |
+| `browserHash` on disk vs the failing URL's `?v=` | `d000db2e` — **identical** |
+| Chromium HTTP-cache entries for that exact URL | **4** |
+| Delete the **browser** caches — `Cache/` + `Code Cache/` (vite-cache untouched, same browserHash) | **boots clean** |
+
+⚠️ That repair deleted **both** browser cache dirs, so the evidence does not isolate the HTTP cache
+from V8's compiled-code cache. `session.clearCache()` and `session.clearCodeCaches()` are separate
+APIs over separate dirs. In principle V8 revalidates its entry against the source it compiled, so
+the code cache alone should not resurrect a stale chunk — but that is reasoning, not measurement,
+so `clearBrowserCaches()` clears both rather than shipping something narrower than what was proven.
+
+Two things follow, and both were wrong in the code before:
+
+- **The cold-scan-race theory did not fit this failure.** The pre-bundle was complete and correct
+  before the renderer ever asked for it — nothing raced. (This does *not* retire the race as an
+  explanation for #21's *fresh-install* 1-in-6 rate: a fresh profile has no stale HTTP cache to
+  replay. It does explain the "cold cache, still crashed" shape.)
+- **`EditorBootBoundary`'s bare `location.reload()` could never clear it** — the reload re-requests
+  the same immutable URL and receives the same stale body, so the one capped retry was spent for
+  nothing and the red screen was painted anyway. That is exactly what `willRetry=false` after
+  `retryCount=1` recorded.
+
+Fixed by clearing the browser caches on a build-signature change (`clearBrowserCaches()` alongside
+the `vite-cache` wipe), and by making the boundary's retry clear them over IPC *before* reloading.
+Guarded by `viteCacheBustSignature.test.ts` (the clears must stay together, and the helper must
+cover the code cache as well as the HTTP one)
+and `editorBootBoundary.test.tsx` (which pins the clear-then-reload **order** — a clear that lands
+after the reload is indistinguishable from no clear at all).
+
+⚠️ **Why no gate caught it, and still won't:** this only bites on **update-over-install**, where
+`userData` carries forward. `smoke:packaged` and `repro-cold-boot.sh` both start from a fresh
+profile, so neither exercises the path. Testing an upgrade means installing the *previous* version,
+running it once, then installing the new one over it.
 
 Measured 2026-08-03 (v0.3.6, macOS): **30/30 cold boots clean** via
 `engine/scripts/repro-cold-boot.sh` — no crash, no boundary fire, no console errors. At the observed

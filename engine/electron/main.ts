@@ -17,7 +17,7 @@
  * only the backend (/api) is main-hosted. Opening a project re-roots that server.
  */
 
-import { app, BrowserWindow, ipcMain, shell, dialog, nativeImage, Menu } from 'electron';
+import { app, BrowserWindow, ipcMain, shell, dialog, nativeImage, Menu, session } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -1148,6 +1148,20 @@ function showAboutDialog(): void {
   aboutWindow.on('closed', () => { aboutWindow = null; });
 }
 
+/** Drop BOTH renderer-side caches that outlive an app update (#110).
+ *
+ *  `clearCache()` and `clearCodeCaches()` are SEPARATE Electron APIs over separate userData dirs
+ *  (`Cache/` and `Code Cache/`) — clearing the HTTP cache does not clear V8's compiled-code cache.
+ *  In principle V8 revalidates its entry against the source it was compiled from, so the code cache
+ *  alone should not be able to resurrect a stale chunk. But the #110 repair that was actually
+ *  MEASURED deleted both directories, so clearing only one ships something narrower than what was
+ *  demonstrated to work. Both is cheap and costs a claim we'd otherwise be making without evidence.
+ *  `urls: []` means "every entry". */
+async function clearBrowserCaches(): Promise<void> {
+  await session.defaultSession.clearCache();
+  await session.defaultSession.clearCodeCaches({ urls: [] });
+}
+
 app.whenReady().then(async () => {
   // About is a custom cross-platform dialog (showAboutDialog) wired via the app
   // menu — no native about panel (setAboutPanelOptions) is used anymore.
@@ -1687,6 +1701,22 @@ app.whenReady().then(async () => {
     }
   });
 
+  // EditorBootBoundary's last-resort recovery from a stale dep chunk (#110). Its retry used to be
+  // a bare `location.reload()`, which CANNOT clear this class: Vite's `/deps/*.js?v=<browserHash>`
+  // is served `immutable`, so the reload re-requests the same URL and Chromium returns the same
+  // pre-update body from disk. The renderer therefore has to ask main to drop the caches first.
+  // Normally the buildSig branch in whenReady has already done this at startup — this covers the
+  // case where the caches went stale WITHOUT the build signature changing.
+  ipcMain.handle('modoki:clear-browser-caches', async (e) => {
+    if (!fromMainFrame(e)) return { ok: false, error: 'untrusted frame' };
+    try {
+      await clearBrowserCaches();
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
   ipcMain.handle('modoki:set-cdp-enabled', (e, enabled: boolean) => {
     if (!fromMainFrame(e)) return { ok: false, error: 'untrusted frame' };
     // The remote-debugging switch is applied at STARTUP only (cdp.ts), so a change
@@ -1738,7 +1768,27 @@ app.whenReady().then(async () => {
         fs.rmSync(cacheDir, { recursive: true, force: true });
         fs.mkdirSync(app.getPath('userData'), { recursive: true });
         fs.writeFileSync(sigFile, buildSig);
-        console.log(`[modoki-electron] app build changed — cleared stale Vite dep-cache (${buildSig})`);
+        // …AND the renderer's browser caches, or wiping the dep-cache above achieves NOTHING (#110).
+        // Vite serves `/deps/*.js?v=<browserHash>` as `Cache-Control: immutable`, and browserHash
+        // keys on the LOCKFILE + optimizeDeps config — NOT on @modoki/engine source. So an
+        // engine-only app update leaves the dep URL BYTE-IDENTICAL, and Chromium happily replays
+        // the PRE-UPDATE body out of its own disk cache, which lives in userData and therefore
+        // survives the update exactly like the dep-cache does. The freshly re-optimized (correct)
+        // chunk sits on disk unread, and the renderer dies with "does not provide an export named
+        // '<a newly-added export>'".
+        //
+        // Measured on packaged Windows 0.3.7 (#110): the on-disk dep contained the export and its
+        // browserHash MATCHED the failing URL's `?v=`, 4 HTTP-cache entries held that exact URL,
+        // and deleting the BROWSER caches — `Cache/` + `Code Cache/`, with vite-cache untouched and
+        // browserHash unchanged — fixed it. This is why the boot boundary's bare `location.reload()`
+        // can never clear this class: the reload re-requests the same immutable URL and gets the
+        // same stale body back.
+        //
+        // Scoped to the same buildSig trigger as the wipe above, so a normal relaunch keeps its
+        // warm cache. The cost is one cold refetch of localhost assets after an update — the same
+        // trade the dep re-optimize already makes, and far cheaper than a dead editor.
+        await clearBrowserCaches();
+        console.log(`[modoki-electron] app build changed — cleared stale Vite dep-cache + browser caches (${buildSig})`);
       }
     } catch (e) {
       console.warn(`[modoki-electron] vite-cache build check failed (continuing): ${e instanceof Error ? e.message : e}`);

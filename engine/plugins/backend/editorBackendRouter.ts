@@ -171,7 +171,7 @@ import { getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData
 import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
 import { tryDeviceCdpInput, isDeviceCdpAvailable, synthFallbackBanner, TRUSTED_CDP_MECHANISM } from './deviceCdp';
-import { tryDeviceWdaInput, isDeviceWdaAvailable, resetDeviceWdaSession, tryDeviceWdaScreenshot, TRUSTED_WDA_MECHANISM } from './deviceWda';
+import { tryDeviceWdaInput, isDeviceWdaAvailable, resetDeviceWdaSession, tryDeviceWdaScreenshot, TRUSTED_WDA_MECHANISM, WDA_NOT_IOS_REASON, NO_WDA_ON_THIS_DEVICE } from './deviceWda';
 import { isDeviceFailureReply } from './deviceAim';
 import { stopWda } from './wdaLauncher';
 import { resolveModules } from '../detect-modules';
@@ -680,7 +680,11 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     // #32 Phase 2 — an iOS device has no CDP route but may have WebDriverAgent. Reported honestly:
     // `trusted-wda` covers tap and drag ONLY, which is why the mechanism line names them rather than
     // implying every op is trusted (press_key/scroll/hover stay synthetic on iOS — see deviceWda.ts).
-    if (await isDeviceWdaAvailable({ proxy, host: status.target?.host })) {
+    // Gated on the device being iOS for the same reason the input path is (#99): otherwise a status
+    // READ spends a :8100 probe on an Android phone, and would report `trusted-wda` for it if
+    // anything at all answered there.
+    if (await deviceConnection.devicePlatform() === 'ios'
+        && await isDeviceWdaAvailable({ proxy, host: status.target?.host })) {
       return json({ ...status, inputMechanism: TRUSTED_WDA_MECHANISM, trustedOps: ['tap', 'drag'] });
     }
     return json({ ...status, inputMechanism: 'synthetic' });
@@ -725,6 +729,10 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         // whose app happens to be suspended. (Tried it; it also broke the no-lease test by leaking
         // a previous connection's address, which is the same bug wearing a test failure.)
         const host = st.target?.host;
+        // WDA is an iOS agent (#99). Resolved from the lease's cached `app-identity`, so it still
+        // answers while the app is suspended — see `devicePlatform()`, which is why it is learned
+        // at connect time rather than here.
+        const isIos = await deviceConnection.devicePlatform() === 'ios';
         if (wantsWda) {
           // GATE ON AN ADDRESS, NOT ON THE LEASE. MEASURED on the iPhone Air (2026-08-03): pressing
           // home SUSPENDS the app, so the lease drops to 'reconnecting' and the native capture 502s
@@ -738,6 +746,10 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
           // and the MCP's `caughtFailure` matches the "no device connected" PREFIX to build its
           // device_connect/device_status envelope, which a WDA-flavoured message would lose.
           if (!host) await deviceConnection.proxy('screenshot', {});
+          // An explicit ask on a non-iOS device is a mistake worth NAMING, not a slow probe: the
+          // agent only exists on iOS, so answer immediately instead of spending a :8100 probe (and,
+          // on a Mac, a doomed xcodebuild) on a phone that can never host one.
+          if (!isIos) return json({ error: WDA_NOT_IOS_REASON }, 409);
           // Explicit ask pays the agent spin-up; a refusal must say why rather than quietly
           // handing back a native capture the caller specifically did not want.
           const shot = await tryDeviceWdaScreenshot({ host }, { autoLaunch: true });
@@ -752,11 +764,13 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
           native = await deviceConnection.proxy('screenshot', b.params ?? {});
           if (!isDeviceFailureReply(native)) return json({ result: native });
         } catch (e) {
-          const shot = await tryDeviceWdaScreenshot({ host });
+          // Non-iOS has no agent to fall back TO, so skip straight to the canonical lease error
+          // rather than probing the phone's :8100 first.
+          const shot = isIos ? await tryDeviceWdaScreenshot({ host }) : NO_WDA_ON_THIS_DEVICE;
           if (shot.handled) return json({ result: { ...shot.reply, nativeCaptureFailed: String(e instanceof Error ? e.message : e) } });
           throw e;   // nothing to add: the canonical lease error IS the right answer
         }
-        const shot = await tryDeviceWdaScreenshot({ host });
+        const shot = isIos ? await tryDeviceWdaScreenshot({ host }) : NO_WDA_ON_THIS_DEVICE;
         if (shot.handled) return json({ result: { ...shot.reply, nativeCaptureFailed: String(native) } });
         // Both paths failed: return the NATIVE error, which is the one the caller asked for. The
         // WDA reason rides along so "why didn't the fallback save me" is answerable without a
@@ -768,7 +782,13 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // WebDriverAgent before giving up on trusted input. Only tap/drag are routable on iOS — the
       // other ops have no faithful trusted equivalent there (see deviceWda.ts's header), so they
       // fall through to synthetic WITH the banner, exactly as before.
-      if (!outcome.handled) {
+      //
+      // GATED ON THE DEVICE BEING iOS (#99). "No CDP route" is NOT the same as "iOS": an Android
+      // device reached by IP has no CDP route either (discovery needs adb), and without this gate
+      // it fell straight into the iOS agent path — probing :8100 on the Android phone and then
+      // reporting "cannot tell which iPhone to use". Asked once per lease, and only here, so a
+      // CDP-handled op pays nothing for it. See `devicePlatform()` for the measurement.
+      if (!outcome.handled && await deviceConnection.devicePlatform() === 'ios') {
         const wda = await tryDeviceWdaInput(b.method, b.params ?? {}, {
           proxy, host: deviceConnection.status().target?.host,
         });

@@ -21,7 +21,8 @@ PATHS="$(cd "$(dirname "$0")" && pwd)/packagedAppPaths.mjs"
 # The executable inside the app dir we were HANDED differs per platform (.app bundle vs the
 # unpacked dir that directly contains the .exe) — resolved by packagedAppPaths.mjs so this script
 # carries no platform table. It used to hardcode Contents/MacOS, which made the release-time render
-# gate macOS-only; see release-windows.yml, which still has no render gate at all.
+# gate macOS-only — which is why the Windows release shipped ungated until #94. Both release jobs
+# now call this: macOS hands it the .app, Windows hands it release/win-unpacked.
 BIN="$(node "$PATHS" binIn "$APP")"
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 # `pwd -W` (MSYS native form), not bare `pwd` — the SAME trap smoke-packaged.sh documents at its

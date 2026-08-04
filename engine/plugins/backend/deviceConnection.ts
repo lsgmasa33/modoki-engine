@@ -240,6 +240,13 @@ export function saveLastTarget(t: LastTarget, dir: string = path.join(process.cw
   } catch { /* non-fatal */ }
 }
 
+/** Parse a bridge reply that MAY be a JSON string, returning null rather than throwing. The device
+ *  bridge answers some ops with a raw string (including its `Error: …` failure convention), so a
+ *  bare `JSON.parse` on the hot path would turn an old bridge into an exception. */
+function safeJsonParse(raw: string): unknown {
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
 // ── Connection manager (the singleton the routes drive) ───────────────────────
 
 export interface DeviceConnectStatus {
@@ -266,6 +273,12 @@ export class DeviceConnectionManager {
   private detail?: string;
   private target: { host: string; port: number; useAdb: boolean } | null = null;
   private lastTarget: LastTarget | null;
+  /** The connected device's Capacitor platform, asked once per lease. See `devicePlatform()`. */
+  private platform: string | null = null;
+  /** The bridge ANSWERED the identity probe — including answering "I have no platform" (an old
+   *  bridge). Separate from `platform` so a stable null latches but a failed ASK does not. */
+  private platformResolved = false;
+  private platformInFlight: Promise<string | null> | null = null;
   private readonly guid: string;
   private readonly stateDir: string;
 
@@ -321,6 +334,11 @@ export class DeviceConnectionManager {
     });
     this.target = { host, port, useAdb };
     await this.client.connect();
+    // Learn the platform NOW, while the lease is healthy, rather than on first use. The WDA
+    // screenshot path is reached precisely when the app has been SUSPENDED (lease 'reconnecting',
+    // native capture 502s) — asking then would fail and refuse the feature in its motivating case.
+    // Best-effort by construction: `devicePlatform` swallows its own errors and returns null.
+    await this.devicePlatform();
     return this.status();
   }
 
@@ -338,7 +356,51 @@ export class DeviceConnectionManager {
     this.state = 'disconnected';
     this.detail = undefined;
     this.target = null;
+    this.platform = null;
+    this.platformResolved = false;
+    this.platformInFlight = null;
     return this.status();
+  }
+
+  /** Which PLATFORM the app holding this lease runs on (`'ios'` / `'android'` / `'web'`), or null
+   *  when it cannot be determined.
+   *
+   *  Exists because the lease's own fields cannot answer it and a WRONG guess is expensive: the
+   *  WebDriverAgent route is iOS-only, and without this gate an Android device reached by IP (no
+   *  adb ⇒ no CDP route) fell through to it. What that cost, as measured, is in
+   *  docs/trusted-device-input.md § "WebDriverAgent lifecycle" (#99) — not restated here, so the
+   *  two cannot drift. `useAdb` cannot stand in for this: it proves Android when true, but proves
+   *  nothing when false.
+   *
+   *  Asked ONCE per lease and cached — the answer cannot change without a reconnect, and this sits
+   *  on the input hot path. Concurrent callers share one in-flight request rather than each firing
+   *  their own.
+   *
+   *  A null answer is latched only when the bridge ANSWERED with one (an old bridge that has no
+   *  `app-identity` — a stable fact for the life of the lease, so re-asking on every call would be
+   *  a round trip that can never change its mind). A failure to ASK at all (lease dropped mid-probe)
+   *  is transient and is retried. Either way the caller sees null and must treat it as "not
+   *  confirmed iOS", never as "assume iOS". */
+  async devicePlatform(): Promise<string | null> {
+    if (this.platformResolved) return this.platform;
+    if (this.state !== 'connected') return null;
+    if (this.platformInFlight) return this.platformInFlight;
+    this.platformInFlight = (async () => {
+      try {
+        const raw = await this.proxy('app-identity', {});
+        // The bridge signals a failed/unknown handler by RETURNING a string, not throwing, so a
+        // non-object reply is "unknown", never a platform.
+        const info = (typeof raw === 'string' ? safeJsonParse(raw) : raw) as { platform?: unknown } | null;
+        this.platform = info && typeof info.platform === 'string' && info.platform ? info.platform : null;
+        this.platformResolved = true;
+        return this.platform;
+      } catch {
+        return null;   // could not ask (lease dropped) — transient, so deliberately NOT latched
+      } finally {
+        this.platformInFlight = null;
+      }
+    })();
+    return this.platformInFlight;
   }
 
   status(): DeviceConnectStatus {

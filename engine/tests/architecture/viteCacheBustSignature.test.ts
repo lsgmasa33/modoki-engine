@@ -68,4 +68,49 @@ describe('packaged Vite dep-cache bust signature (#21)', () => {
         + 'build does — and not otherwise',
     ).toBe(true);
   });
+
+  /** #110: wiping `vite-cache` alone accomplishes NOTHING across an app update. Vite serves
+   *  `/deps/*.js?v=<browserHash>` as `Cache-Control: immutable`, and browserHash keys on the
+   *  lockfile — not on @modoki/engine source — so an engine-only update leaves the dep URL
+   *  byte-identical and Chromium replays the PRE-UPDATE body out of its own disk cache, which
+   *  lives in userData and survives the update just like the dep-cache does. The freshly
+   *  re-optimized chunk is never read and the renderer dies with "does not provide an export
+   *  named '<newly-added export>'".
+   *
+   *  Measured on packaged Windows 0.3.7: the on-disk dep contained the export, its browserHash
+   *  matched the failing URL's `?v=`, and clearing the browser caches (`Cache/` + `Code Cache/`)
+   *  fixed it. The clears are therefore ONE fix, and this guard exists because dropping the
+   *  browser half is invisible locally — it only bites on update-over-install, a path
+   *  `smoke:packaged` never takes (it starts from a fresh profile).
+   *
+   *  Matches the `clearBrowserCaches()` helper OR a direct call, so the block can be refactored
+   *  without tripping this — what must not happen is the browser cache going unclaimed entirely. */
+  it('clears the renderer browser caches alongside the dep-cache wipe', () => {
+    const block = signatureBlock();
+    expect(
+      /clearBrowserCaches\(|clearCache\(|clearData\(/.test(block),
+      'the buildSig branch must ALSO clear the renderer\'s browser caches (clearBrowserCaches() '
+        + '— session.clearCache() + session.clearCodeCaches()). Without it the vite-cache wipe is '
+        + 'a no-op across an app update: the dep URL is unchanged and served immutable, so the '
+        + 'renderer re-reads the stale pre-update chunk from disk and crashes on a newly-added '
+        + 'export (#110).',
+    ).toBe(true);
+  });
+
+  /** The helper must clear BOTH caches. They are separate Electron APIs over separate userData
+   *  dirs, and the measured #110 repair deleted both — clearing only the HTTP cache would ship
+   *  something narrower than what was demonstrated to work. */
+  it('clearBrowserCaches clears the V8 code cache as well as the HTTP cache', () => {
+    const src = fs.readFileSync(mainTs, 'utf8');
+    const start = src.indexOf('async function clearBrowserCaches');
+    expect(start, 'clearBrowserCaches() not found in engine/electron/main.ts — if it was renamed, '
+      + 'retarget this guard rather than deleting it').toBeGreaterThan(-1);
+    const body = src.slice(start, src.indexOf('\n}', start));
+    expect(/clearCache\(/.test(body), 'must clear the HTTP cache').toBe(true);
+    expect(
+      /clearCodeCaches\(/.test(body),
+      'must ALSO clear V8\'s compiled-code cache — a separate Electron API over a separate '
+        + 'userData dir (Code Cache/). clearCache() does not touch it.',
+    ).toBe(true);
+  });
 });
