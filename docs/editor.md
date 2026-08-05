@@ -796,6 +796,29 @@ Three things make it worth reading rather than just writing:
 
 Logging is best-effort throughout: it must never take down a launch.
 
+### Stopping an editor
+
+`npm run editor:stop` (`engine/scripts/stop-editor.sh`) is the counterpart to the launcher. It
+SIGTERMs this clone's Electron main process first — the editor owns the Vite it spawned and
+stops it on quit, so quitting the app is what produces a clean teardown *and* lets the launch
+log's background waiter write its `EXIT` line. A straggler Vite is swept only if the editor died
+uncleanly. Every match is anchored to this repo's absolute paths, so a sibling clone's editor is
+never touched (#69); the matcher itself is shared with the launcher in
+`engine/scripts/lib/repo-reap.sh`.
+
+Two things that look like they should stop an editor and do not (#129):
+
+- **`npm run dev:stop`** is for a standalone `npm run dev`. It used to kill the editor's Vite as
+  well — leaving the app window up with a dead dev server behind it, which presents as *"the game
+  is broken"* rather than *"something was stopped"*, and once cost a debugging session chasing a
+  phantom game bug. It now identifies an editor-owned Vite by the `--configLoader runner` flag
+  `devServer.ts` passes, skips it, and says so. (Guarded by
+  `engine/tests/architecture/devStopEditorCarveOut.test.ts`, because that flag exists for a
+  packaging reason and nothing else would notice if it went away.)
+- **`POST <backend>/api/exit`** 404s. `/api/exit` is a *Vite dev-server* route, so it answers on
+  the Vite port (5175), not on the backend port that `MODOKI_BACKEND` and the launch banner
+  advertise — aiming it at the port you were told to use cannot work.
+
 ### UI Zoom (VS Code–style)
 
 App-wide UI zoom via Electron `webContents` zoom (`engine/electron/zoom.ts`) — Cmd/Ctrl+wheel

@@ -155,6 +155,24 @@ single ref-walking implementation rather than two that can drift.
 the entities (and every referenced prefab's nested entities, iteratively) so a
 stale manifest missing an entry — e.g. an HDR added after first serialization —
 still preloads everything and avoids first-view pop-in.
+`collectSceneResourceRefs` unions the stored array with a fresh
+`collectResourceRefsFromEntities` call, and dedupes.
+
+**The corollary is the one that bites: the safety net is only as good as the WALKER.**
+Both halves of that union come from the same function, so a ref *it* cannot see is missing
+from both — and no re-save can repair it, because the re-save calls the same walker. Two such
+blind spots were found and fixed in Aug 2026, and neither showed up as a build failure (the
+tree-shaker walks entities independently, so shipping was never affected):
+
+- **Asset GUIDs on GAME-defined traits** (#123) — the walk was driven by `REF_FIELDS_BY_TRAIT`,
+  an engine-only registry with no registration API. Now also swept generically: a GUID that
+  resolves in the asset manifest *is* an asset ref, which needs no per-game registration and
+  matches what the tree-shaker already does ([build.md](build.md) § "Assets the build cannot see").
+- **Refs introduced by a prefab-instance OVERRIDE** — `overrides`, `nestedOverrides`, and the
+  same two on a reference-style `added` node. Ordinary editor work ("instantiate, then swap this
+  instance's mesh") produced a ref nothing collected: `games/space-console/Station.scene.json`
+  had **31** override-only `Renderable3D.mesh`/`.material` GUIDs, both acquiring types, so they
+  were neither preloaded nor scene-refcounted at runtime.
 
 It follows that **a save REGENERATES `resources` rather than preserving it** —
 `serializeScene` discards the loaded array and rebuilds from the entities. So a file
@@ -216,7 +234,14 @@ node engine/scripts/check-scene-churn.mjs games/sling demos/forest-camp   # REVI
 ```
 
 The check script is not optional. `save-all` persists the **live world**, so the pass is only
-safe where loading a scene is side-effect-free, and two projects proved it is not:
+safe where loading a scene is side-effect-free, and two projects proved it is not.
+
+It compares the `resources` manifest by **identity**, and for any dropped ref scans the new scene
+body to answer the question a human used to be asked to answer by hand — a drop that is *still
+referenced* is reported as `⚠️ REGRESSION` and exits non-zero. It previously compared only the
+manifest's LENGTH, which is silent on a 1-for-1 swap: the space-invader re-save below swapped a
+legacy page-texture GUID for the sprite GUID the scene actually references, and the gate reported
+"0 semantic changes". A count is the one property a dropped ref can preserve while still being a drop.
 
 - **`games/chess` — excluded (#124).** Its game code spawns on load; the save baked ~70 runtime
   entities (move highlights, rank/file labels, pieces) plus a live progress-bar value into
@@ -225,13 +250,19 @@ safe where loading a scene is side-effect-free, and two projects proved it is no
   an authored entity from a runtime-spawned one at save time. `games/llm-test` hit the smaller
   half of it (live progress-bar values only, no spawned entities) and was kept, with the authored
   values restored by hand.
-- **`games/space-invader` — excluded (#123).** The `resources` rebuild *dropped* a still-referenced
-  asset, because the ref lives on a game-specific trait (`SpaceInvaderAssets.catvaderAnim`), and
-  `collectResourceRefsFromEntities` walks refs from `REF_FIELDS_BY_TRAIT` — a closed, engine-only
-  map with no registration API, so a game trait's asset field is structurally invisible to it.
-  A shrinking manifest is a regression: the dropped asset becomes one the production build cannot
-  see ([build.md](build.md) "Assets the build cannot see"). A *growing* manifest is normally a fix
-  — the pass added genuinely-referenced assets that had been missing from several scenes.
+- **`games/space-invader` — was excluded (#123), now fixed and swept.** The `resources` rebuild
+  *dropped* a still-referenced asset, because the ref lives on a game-specific trait
+  (`SpaceInvaderAssets.catvaderAnim`) and `collectResourceRefsFromEntities` walked refs from
+  `REF_FIELDS_BY_TRAIT` — a closed, engine-only map with no registration API, so a game trait's
+  asset field was structurally invisible to it. Fixed by a generic sweep: a GUID that resolves in
+  the asset manifest **is** an asset ref, so no game registers anything. A *growing* manifest is
+  normally a fix — the pass added genuinely-referenced assets missing from several scenes.
+
+  Note what a shrinking manifest does and does not cost, because #123 was filed on a stronger
+  claim that does not hold: the build tree-shaker walks scene **entities** and never reads this
+  manifest (measured — a web build from a manifest with both refs deleted still shipped them), so
+  this is *not* an "asset the build cannot see". Nor is a stale FILE the problem, per the union
+  above. What cost anything was the walker's blind spot, described there.
 
 **The scaffolder template must stay canonical, and is guarded.** Migrating the existing scenes
 fixes the past; `engine/templates/starter` fixes the future, because it seeds every project made

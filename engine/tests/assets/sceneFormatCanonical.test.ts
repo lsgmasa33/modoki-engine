@@ -61,11 +61,6 @@ const BASELINE: { file: string; why: string }[] = [
     why: 'spawns entities on load, so save-all bakes ~70 runtime entities into the file (#124). '
       + 'Cannot be re-saved until save-all distinguishes authored from runtime-spawned.',
   },
-  {
-    file: 'games/space-invader/runtime/assets/scenes/main.scene.json',
-    why: 'the resources rebuild DROPS a still-referenced asset held on a game-specific trait '
-      + '(#123), because REF_FIELDS_BY_TRAIT is engine-only. Re-saving would lose the ref.',
-  },
 ];
 
 /** The markers the current serializer never writes.

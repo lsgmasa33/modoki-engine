@@ -115,27 +115,12 @@ EDITOR_LOG="/tmp/modoki-editor-${LOG_TAG}.log"
 #    pinned port (main then refuses to drift → a modal "port already in use"
 #    error). Match on the real command line via CIM there instead; still scoped to
 #    THIS repo's absolute path, so a sibling clone's editor is never touched.
-kill_repo_process() { # $1 = absolute path fragment identifying this repo's process
-  case "$(uname -s)" in
-    MINGW*|MSYS*|CYGWIN*)
-      local pat_m pat_w
-      # MSYS converts a unix path to a MIXED-mode path (E:/a/b) when it hands an
-      # argument to a native exe, so that is the form that actually appears in
-      # electron's command line — NOT the backslash form `cygpath -w` returns.
-      # Match BOTH so either spelling is caught. (`\` is not a -like wildcard.)
-      pat_m="$(cygpath -m "$1" 2>/dev/null || echo "$1")"
-      pat_w="$(cygpath -w "$1" 2>/dev/null || echo "$1")"
-      # Exclude THIS powershell process: the pattern is part of its own command
-      # line, so an unfiltered query matches itself and kills the killer.
-      powershell.exe -NoProfile -NonInteractive -Command \
-        "Get-CimInstance Win32_Process | Where-Object { \$_.ProcessId -ne \$PID -and (\$_.CommandLine -like '*$pat_m*' -or \$_.CommandLine -like '*$pat_w*') } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" \
-        >/dev/null 2>&1 || true
-      ;;
-    *)
-      pkill -f "$1" 2>/dev/null || true
-      ;;
-  esac
-}
+#    The matcher itself now lives in lib/repo-reap.sh, shared with `stop-editor.sh` —
+#    which needs exactly the same scoping, and the Windows branch is subtle enough that
+#    a second copy would drift.
+# shellcheck source=lib/repo-reap.sh
+. "$REPO/engine/scripts/lib/repo-reap.sh"
+kill_repo_process() { reap_repo_process "$1"; }
 
 if [ -z "$MULTI" ]; then
   kill_repo_process "$REPO/engine/electron/dist/main.cjs"

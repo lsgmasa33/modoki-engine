@@ -20,10 +20,12 @@
 #    `save-all` persists the LIVE world, so anything the game created while the scene
 #    sat open is baked into the scene file. Measured on games/chess: ~70 runtime entities
 #    (highlights, rank labels, pieces) plus a live progress-bar value written into
-#    chess.scene.json. games/space-invader is excluded for a different reason (#123) — the
-#    manifest rebuild DROPPED a still-referenced asset held on a game-specific trait
-#    (SpaceInvaderAssets.catvaderAnim), which the build then cannot see.
-#    check-scene-churn.mjs catches both classes; run it before you stage anything.
+#    chess.scene.json. (games/space-invader was also excluded, for #123 — the manifest
+#    rebuild dropped an asset ref held on a game-specific trait. Fixed by the generic guid
+#    sweep in collectResourceRefsFromEntities; it is re-saved and no longer excluded.)
+#    check-scene-churn.mjs catches the runtime-entity class, and compares the resource
+#    manifest by IDENTITY — a dropped ref the scene still references fails it (exit 1).
+#    Run it before you stage anything.
 #    Prefabs are not covered at all (#125): load-scene has no prefab equivalent.
 set -uo pipefail
 

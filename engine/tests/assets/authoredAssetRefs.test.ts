@@ -85,7 +85,6 @@ const BASELINE: { key: string; why: string }[] = [
   { key: '/games/sling/assets/prefabs/green-enemy.prefab.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
   { key: '/games/sling/assets/prefabs/puck.prefab.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
   { key: '/games/sling/assets/prefabs/puck.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/games/space-invader/assets/scenes/main.scene.json:AudioSource.clip', why: 'clip is resolved per-cue from SFXBank/Music elsewhere, not a single fixed clip on this trait' },
   { key: '/games/timeline-demo/assets/models/alien-animal.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
   { key: '/games/timeline-demo/assets/prefabs/spark.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
   { key: '/demos/forest-camp/assets/models/char_Ranger.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },

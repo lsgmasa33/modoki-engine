@@ -12,24 +12,29 @@
 //                         the scene; that project cannot be swept (measured: games/chess).
 //   CHANGED <live value>  runtime state leaked into the file, same cause as above (#124;
 //                         measured: a progress bar's width/text in games/chess + games/llm-test).
-//   RESOURCES n -> m      m > n is normally a FIX: the committed manifest was missing assets
-//                         the scene references, which the production build then cannot see
-//                         (docs/build.md "Assets the build cannot see"). m < n is a
-//                         REGRESSION — check whether a dropped GUID is still referenced in
-//                         the scene body before accepting it. Measured on games/space-invader:
-//                         a ref held on a game-specific trait was dropped from the manifest,
-//                         because REF_FIELDS_BY_TRAIT is engine-only and games cannot register
-//                         their own asset-ref fields (#123).
+//   RESOURCE ADDED        normally a FIX: the committed manifest was missing an asset the
+//                         scene references, so nothing preloaded or scene-refcounted it.
+//   RESOURCE DROPPED      benign ONLY if the scene no longer references it. This script now
+//                         answers that itself by scanning the new scene body for the ref, and
+//                         calls the still-referenced case ⚠️ REGRESSION (exit 1).
+//   RESOURCE RETYPED      same ref, different resource type — the acquire path changes with it.
 //   parentId 0 -> ""      benign: a legacy numeric "no parent" normalizing to the GUID-era "".
+//
+// Resources are compared by IDENTITY, not by count. It used to report only `RESOURCES n -> m`,
+// which is silent on a 1-for-1 swap — and that is not hypothetical: the games/space-invader
+// re-save that closed #123 swapped a legacy page-texture GUID for the sprite GUID the scene
+// actually references, and this gate said "0 semantic changes". A count is the one property a
+// dropped ref can preserve while still being a drop.
 import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { diffResources, sceneBodyText } from './lib/resourceDiff.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const key = (e) => e.traits?.EntityAttributes?.guid ?? 'name:' + e.name;
 
-let totalScenes = 0, totalChanged = 0, problems = 0;
+let totalScenes = 0, totalChanged = 0, problems = 0, regressions = 0;
 
 for (const proj of process.argv.slice(2)) {
   const dir = path.join(ROOT, proj, 'runtime/assets/scenes');
@@ -63,11 +68,23 @@ for (const proj of process.argv.slice(2)) {
         }
       }
     }
-    const ra = (a.resources || []).length, rb = (b.resources || []).length;
-    if (ra !== rb) notes.push(`RESOURCES ${ra} -> ${rb}`);
+    // Resource manifest, compared by IDENTITY (see lib/resourceDiff.mjs for why not by count).
+    for (const r of diffResources(a.resources, b.resources, sceneBodyText(b))) {
+      notes.push(r.note);
+      if (r.regression) regressions++;
+    }
+
     // rootInstanceId runtime-id -> GUID is the EXPECTED A10 stability migration.
     const real = notes.filter((n) => !/CHANGED .*\.PrefabInstance\.rootInstanceId \d+ -> "/.test(n));
     if (real.length) { problems++; console.log(`  ${rel}:`); for (const n of real) console.log(`    ${n}`); }
   }
 }
 console.log(`\nscenes: ${totalScenes}  rewritten: ${totalChanged}  with semantic changes: ${problems}`);
+// Exit non-zero ONLY for a dropped-but-still-referenced ref. Everything else this prints is
+// for a human to weigh (an added resource is usually the re-save doing its job), but that one
+// case is unambiguous: the file still points at an asset its own manifest no longer lists.
+// Safe to fail: nothing invokes this programmatically — it is a hand-run review gate.
+if (regressions) {
+  console.error(`\n⚠️  ${regressions} dropped resource ref(s) still referenced by the scene — do NOT stage this.`);
+  process.exit(1);
+}

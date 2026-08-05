@@ -28,6 +28,7 @@
     "dist:win": "npm run build:electron && electron-builder --win --publish never",
     "dist:dir": "npm run build:electron && electron-builder --dir",
     "dev:stop": "bash engine/scripts/stop-dev.sh",
+    "editor:stop": "bash engine/scripts/stop-editor.sh",
     "clean:texture-cache": "node engine/scripts/clean-texture-cache.mjs",
     "clean:packaged-cache": "node engine/scripts/clean-packaged-cache.mjs",
     "sync:agent-configs": "node engine/scripts/sync-agent-configs.mjs",
