@@ -69,6 +69,58 @@ export function parseIosDevices(devicectlJson: string): IosDevice[] {
   return out;
 }
 
+/** Pull iOS devices out of `xcrun xctrace list devices` — the LEGACY listing, and the only one
+ *  that can see iOS 16 and older (#143).
+ *
+ *  `devicectl` is CoreDevice, which is iOS 17+. An older device appears in its JSON as a stub with
+ *  no `udid` and no name (measured on an iPhone 8 / iOS 16.7.16:
+ *  `{"platform":"iOS","model":"iPhone10,1","tunnel":"unavailable"}`), so `parseIosDevices` drops it
+ *  — correctly, given what it was handed. The device was therefore unselectable for trusted input,
+ *  and NOT EVEN `MODOKI_IOS_DEVICE_UDID` could reach it, because the pin is matched against that
+ *  same list. That is every pre-iPhone-X handset, not one phone.
+ *
+ *  Format, which the parse depends on:
+ *    == Devices ==
+ *    Dev's MacBook Pro (98C84BED-…)           ← the Mac itself: NO OS version, so it cannot match
+ *    iPhone8 (16.7.16) (deadbeef…)            ← name (os) (udid)
+ *    == Devices Offline ==                    ← same shape, but not connected
+ *    == Simulators ==                         ← skipped entirely
+ *
+ *  Requiring the `(os) (udid)` pair is what excludes the Mac without special-casing its name, and
+ *  the section header decides `connected`. Note pre-iPhone-X UDIDs are 40 hex chars rather than the
+ *  `00008xxx-…` form — `resolveIosDevice` compares UDIDs as opaque strings, so nothing downstream
+ *  needed to change. PURE, so the parse is testable without Xcode. */
+export function parseXctraceDevices(xctraceOutput: string): IosDevice[] {
+  const out: IosDevice[] = [];
+  let connected = false;
+  let inDevices = false;
+  for (const raw of xctraceOutput.split('\n')) {
+    const line = raw.trim();
+    if (line.startsWith('==')) {
+      // Anything that is not a device section (notably `== Simulators ==`) turns collection OFF,
+      // so a future section cannot start silently feeding simulators into the device list.
+      inDevices = /^==\s*Devices(\s+Offline)?\s*==$/.test(line);
+      connected = inDevices && !/Offline/i.test(line);
+      continue;
+    }
+    if (!inDevices || !line) continue;
+    const m = /^(.*?)\s+\(([0-9]+(?:\.[0-9]+)*)\)\s+\(([0-9A-Fa-f][0-9A-Fa-f-]{7,})\)$/.exec(line);
+    if (!m) continue;   // the Mac (no OS version), or a shape we do not recognise
+    out.push({ udid: m[3], name: m[1], connected });
+  }
+  return out;
+}
+
+/** The devicectl list, plus any device only the legacy listing can see (#143). devicectl stays
+ *  AUTHORITATIVE — it carries richer fields and is the only source for iOS 17+ — so a UDID present
+ *  in both keeps the devicectl entry; the legacy parse only ADDS. Dedupe is exact rather than
+ *  heuristic: where the two overlap they report byte-identical UDIDs (verified on hardware — the
+ *  same phone's id came back character-for-character identical from both listings). */
+export function mergeIosDevices(primary: IosDevice[], legacy: IosDevice[]): IosDevice[] {
+  const seen = new Set(primary.map((d) => d.udid));
+  return [...primary, ...legacy.filter((d) => !seen.has(d.udid))];
+}
+
 /** Overridable seam so tests never shell out.
  *
  *  ⚠️ `--json-output` MUST be a real file, never `/dev/stdout`. devicectl writes its human-readable
@@ -87,6 +139,16 @@ export const wdaLauncherExec = {
     } finally {
       try { fs.rmSync(out, { force: true }); } catch { /* best-effort */ }
     }
+  },
+  /** The legacy listing (#143). Failure returns '' rather than throwing: this is an ADDITIVE
+   *  source, so an Xcode without `xctrace` must leave the devicectl path working exactly as
+   *  before, not break device selection outright. Bounded like every other exec here. */
+  listLegacyDevices(): string {
+    try {
+      return execFileSync('xcrun', ['xctrace', 'list', 'devices'], {
+        timeout: 20000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch { return ''; }
   },
 };
 
@@ -152,6 +214,8 @@ export interface EnsureWdaRunningOpts {
   probe?: (url: string) => Promise<boolean>;
   spawnImpl?: typeof spawn;
   listDevices?: () => string;
+  /** The legacy `xctrace` listing (#143) — injected separately so a test can prove the union. */
+  listLegacyDevices?: () => string;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   /** Injected so the non-macOS refusal is testable from a Mac (and vice versa). */
@@ -266,7 +330,19 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
     lastFailure = `could not list iOS devices (${e instanceof Error ? e.message : String(e)})`;
     return { running: false, reason: lastFailure };
   }
-  const resolved = resolveIosDevice(parseIosDevices(listing));
+  // Union with the legacy listing so an iOS 16-or-older device is selectable at all (#143). Kept
+  // outside the try above deliberately: this source is ADDITIVE and swallows its own failure, so it
+  // must not turn a working devicectl listing into "could not list iOS devices".
+  //
+  // Note what the default is tied to: injecting `listDevices` (a test) implies a HERMETIC device
+  // listing, so the legacy source defaults to empty there rather than to the real `xctrace`.
+  // Without that, every existing test that injected only the primary listing silently shelled out
+  // to this Mac's actual hardware and merged it in — six of them failed, one after 61 REAL seconds.
+  // A seam that is injectable only halfway is worse than none: it makes unit tests depend on which
+  // phones happen to be plugged in.
+  const legacyDefault = opts.listDevices ? () => '' : wdaLauncherExec.listLegacyDevices;
+  const legacy = (opts.listLegacyDevices ?? legacyDefault)();
+  const resolved = resolveIosDevice(mergeIosDevices(parseIosDevices(listing), parseXctraceDevices(legacy)));
   if ('error' in resolved) {
     lastFailure = `cannot start WebDriverAgent — ${resolved.error}`;
     return { running: false, reason: lastFailure };

@@ -236,6 +236,19 @@ node engine/scripts/check-scene-churn.mjs games/sling demos/forest-camp   # REVI
 The check script is not optional. `save-all` persists the **live world**, so the pass is only
 safe where loading a scene is side-effect-free, and two projects proved it is not.
 
+**You no longer have to run the sweep to LEARN that a manifest has drifted** (#135, which was
+found by accident during an unrelated prefab pass, on a tree that had been swept 2 days earlier).
+`engine/tests/assets/sceneResourceManifest.test.ts` compares every committed scene's stored
+`resources` against the live collector, by `(type, path)` and in BOTH directions — so a MISSING
+entry and a stale/mistyped one both fail `npm test`. The sweep is still what FIXES it; the test is
+what notices. Two things to know before reading a failure there:
+- It is blind to #123's class by construction — it compares the file against the same walker, so a
+  ref the walker cannot see is missing from both sides and looks like agreement.
+- Sub-sprite GUIDs live in the parent texture's `.meta.json` `sprites[]`, not as any file's own
+  `id`, and an unsliced 2D/UI texture also owns an auto `deriveGuid('sprite:' + guid)`. A manifest
+  populated without those makes the collector skip real refs, which surfaces as a false STALE on a
+  correct entry — measured on `games/space-invader`, and the reason that test mirrors the scanner.
+
 It compares the `resources` manifest by **identity**, and for any dropped ref scans the new scene
 body to answer the question a human used to be asked to answer by hand — a drop that is *still
 referenced* is reported as `⚠️ REGRESSION` and exits non-zero. It previously compared only the

@@ -341,6 +341,9 @@ export async function cdpScroll(sender: CdpSender, x: number, y: number, dx = 0,
 // ── Session lifecycle: lazy connect, reuse, clean teardown ─────────────────
 
 let cachedSession: DeviceCdpSession | null = null;
+/** The `Android-Package` the cached session was discovered FOR — the cache key that makes
+ *  `preferPackage` meaningful across calls (#142). Null when discovery reported no package. */
+let cachedPackage: string | null = null;
 let inFlight: Promise<DeviceCdpSession | null> | null = null;
 
 /** Get a live CDP session — reusing the cached one when it's still open, else discovering +
@@ -348,8 +351,26 @@ let inFlight: Promise<DeviceCdpSession | null> | null = null;
  *  reason: no adb, no device, no matching webview socket, ambiguous sockets with no preference, a
  *  connect failure. `null` is the fallback-to-synthetic signal, not an error. Concurrent callers
  *  share one in-flight discovery/connect rather than racing separate `adb forward`s. */
+/** Test-only stand-in for discovery+connect. Set by `_setDeviceCdpSessionProbeForTests`, consulted
+ *  HERE rather than injected per call site because the router deliberately does not thread a
+ *  `getSession` through — and the thing #142's tests must observe is precisely whether the router
+ *  reaches this function at all, and with which `preferPackage`. Never set in production. */
+let sessionProbeForTests: ((opts: { preferPackage?: string }) => Promise<DeviceCdpSession | null>) | null = null;
+
+/** Test-only. Pass null to restore real discovery. */
+export function _setDeviceCdpSessionProbeForTests(
+  fn: ((opts: { preferPackage?: string }) => Promise<DeviceCdpSession | null>) | null,
+): void { sessionProbeForTests = fn; }
+
 export async function getDeviceCdpSession(opts: { preferPackage?: string } = {}): Promise<DeviceCdpSession | null> {
-  if (cachedSession && !cachedSession.isClosed()) return cachedSession;
+  if (sessionProbeForTests) return sessionProbeForTests(opts);
+  // A cache hit must still satisfy the CALLER's package requirement (#142). The cache used to be
+  // consulted before `preferPackage` was looked at, so a session discovered by an earlier
+  // unconstrained call was handed to a later constrained one — silently defeating the identity
+  // check that exists to stop input reaching the wrong app/device. Mismatch ⇒ drop and rediscover.
+  if (cachedSession && !cachedSession.isClosed()
+      && (!opts.preferPackage || cachedPackage === opts.preferPackage)) return cachedSession;
+  if (cachedSession && opts.preferPackage && cachedPackage !== opts.preferPackage) resetDeviceCdpSession();
   if (!inFlight) {
     inFlight = (async () => {
       try {
@@ -357,8 +378,9 @@ export async function getDeviceCdpSession(opts: { preferPackage?: string } = {})
         const target = await discoverDeviceCdpTarget({ localPort, preferPackage: opts.preferPackage });
         if (!target) return null;
         const session = await DeviceCdpSession.connect(target.webSocketDebuggerUrl);
-        session.onClose(() => { if (cachedSession === session) cachedSession = null; });
+        session.onClose(() => { if (cachedSession === session) { cachedSession = null; cachedPackage = null; } });
         cachedSession = session;
+        cachedPackage = target.androidPackage ?? null;
         return session;
       } catch {
         return null;
@@ -375,6 +397,7 @@ export async function getDeviceCdpSession(opts: { preferPackage?: string } = {})
 export function resetDeviceCdpSession(): void {
   cachedSession?.close();
   cachedSession = null;
+  cachedPackage = null;
   inFlight = null;
 }
 

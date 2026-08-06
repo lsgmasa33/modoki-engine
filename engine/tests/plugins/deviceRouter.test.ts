@@ -10,6 +10,7 @@ import { handleBackendRequest, type BackendContext, type Manifest } from '../../
 import { deviceConnection } from '../../plugins/backend/deviceConnection';
 import { DeviceLeaseAuthority } from '../../plugins/backend/deviceLease';
 import { WDA_NOT_IOS_REASON, _resetDeviceWdaStateForTests } from '../../plugins/backend/deviceWda';
+import { _resetDeviceCdpStateForTests, _setDeviceCdpSessionProbeForTests } from '../../plugins/backend/deviceCdp';
 import { _resetWdaLauncherForTests } from '../../plugins/backend/wdaLauncher';
 
 /** Minimal lease-speaking device that also echoes a data method.
@@ -406,6 +407,100 @@ describe('/api/device/request WDA gated on device platform (#99)', () => {
       expect(req.status).toBe(409);
       expect(bodyOf(req).error).toBe(WDA_NOT_IOS_REASON);
     } finally {
+      await device.close();
+    }
+  });
+});
+
+// #142 — the MIRROR of the #99 gate above, and it was missing. CDP discovery runs entirely through
+// adb (`/proc/net/unix` → `adb forward`) and knows nothing about the lease, so "a CDP route exists"
+// is NOT "the leased device is the one adb sees". Measured on hardware 2026-08-06: an iPhone leased
+// over WiFi (app `com.modokiengine.court`, platform `ios`) with a Samsung on USB — `device_tap`
+// dispatched into the SAMSUNG and returned `ok (cdp touch) … [input:trusted-cdp]` while the
+// iPhone's page received zero events, with the coordinates resolved through the LEASE (computed on
+// the iPhone's 375x667 layout, injected into a different screen).
+//
+// These tests inject `getSession` so no adb/hardware is needed: a session that WOULD have been
+// used proves the gate by never being asked for.
+describe('/api/device/request CDP gated on device platform + app identity (#142)', () => {
+  afterEach(async () => {
+    await deviceConnection.disconnect();
+    _resetWdaLauncherForTests();
+    _resetDeviceWdaStateForTests();
+    _resetDeviceCdpStateForTests();
+  });
+
+  it('an iOS lease never reaches the CDP route, even with a session available', async () => {
+    // The regression itself. Before the gate this returned a trusted-cdp reply for an iOS lease.
+    let asked = 0;
+    const spy = async () => { asked++; return null; };
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority, {
+      'app-identity': { platform: 'ios', appId: 'com.modokiengine.court', appName: 'Court' },
+    });
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      _setDeviceCdpSessionProbeForTests(spy);
+      const req = await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      const result = bodyOf(req).result as { inputFidelityWarning?: string } | string;
+      expect(asked, 'CDP discovery must not even be attempted for an iOS lease').toBe(0);
+      expect(JSON.stringify(result)).not.toContain('trusted-cdp');
+    } finally {
+      _setDeviceCdpSessionProbeForTests(null);
+      await device.close();
+    }
+  });
+
+  it('an Android lease still reaches the CDP route, and asks for ITS OWN package', async () => {
+    // Strictly `=== 'android'`, so this pins that the gate did not simply disable CDP everywhere —
+    // and that the lease's appId is what gets handed to discovery as the identity to match.
+    let seenPreferPackage: string | undefined | symbol = Symbol('never asked');
+    const spy = async (opts: { preferPackage?: string }) => { seenPreferPackage = opts.preferPackage; return null; };
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority, {
+      'app-identity': { platform: 'android', appId: 'com.modokiengine.invader', appName: 'Invader' },
+    });
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      _setDeviceCdpSessionProbeForTests(spy);
+      await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      expect(seenPreferPackage).toBe('com.modokiengine.invader');
+    } finally {
+      _setDeviceCdpSessionProbeForTests(null);
+      await device.close();
+    }
+  });
+
+  it('an old bridge with no app-identity is NOT assumed Android — same rule as the iOS gate', async () => {
+    let asked = 0;
+    const spy = async () => { asked++; return null; };
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority);
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      _setDeviceCdpSessionProbeForTests(spy);
+      await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      expect(asked, 'an unconfirmed platform must never be read as Android').toBe(0);
+    } finally {
+      _setDeviceCdpSessionProbeForTests(null);
+      await device.close();
+    }
+  });
+
+  it('GET /api/device/status does not claim trusted-cdp for an iOS lease', async () => {
+    // The status route had the same asymmetry, and it is the one an agent reads BEFORE deciding
+    // whether to trust its input — so a lie here is consulted first.
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority, {
+      'app-identity': { platform: 'ios', appId: 'com.modokiengine.court', appName: 'Court' },
+    });
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      _setDeviceCdpSessionProbeForTests(async () => null);
+      const r = await get('/api/device/status');
+      expect(bodyOf(r).inputMechanism).not.toBe('trusted-cdp');
+    } finally {
+      _setDeviceCdpSessionProbeForTests(null);
       await device.close();
     }
   });

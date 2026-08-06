@@ -27,26 +27,16 @@ import {
   encodeEvalResult, encodeStructuredResult, extFor, describeScreenshot, isFailureBody,
   deviceFail, caughtFailure, deviceReplyFailure,
 } from './result.js';
-import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, type LeaseStatus } from './reply.js';
+import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, describeInputFidelity, SYNTHETIC_MECHANISM, type LeaseStatus } from './reply.js';
 
 const BACKEND = (process.env.MODOKI_BACKEND ?? 'http://127.0.0.1:5179').replace(/\/$/, '');
 
 // ── Input fidelity (#32) ──────────────────────────────────────────────────
-// The two literals a device_* reply/device_status line can report. Kept as named constants
-// (rather than inline string literals) so `deviceInputMechanismParity.test.ts` can regex-match
-// them by name — this MCP server, the in-page device bridge (`engine/app/debug/bridge.ts`, a
-// bundled browser script shipped inside the game), and the backend's Android CDP route
-// (`engine/plugins/backend/deviceCdp.ts`) are three separate runtimes/packages with no shared
-// module graph, so the values are necessarily duplicated rather than imported. What all three
-// must agree on is the STATEMENT: 'synthetic' is bridge.ts's `INPUT_MECHANISM` (the in-page
-// dispatch every input handler falls back to), 'trusted-cdp' is deviceCdp.ts's
-// `TRUSTED_CDP_MECHANISM` (Phase 1's Android route). Phase 0 shipped this file with a single
-// hardcoded 'synthetic' reported unconditionally; Phase 1 replaces that with a LIVE probe (the
-// backend's `/api/device/status` reports which mechanism is actually available right now) — see
-// device_status below.
-const SYNTHETIC_MECHANISM = 'synthetic' as const;
-const TRUSTED_CDP_MECHANISM = 'trusted-cdp' as const;
-const TRUSTED_WDA_MECHANISM = 'trusted-wda' as const;
+// The literals + the line that renders them live in `reply.ts` (with `describeLease`, the other
+// half of what device_status prints), because a pure module is testable by RENDERING it and this
+// file is not. That move is #107's actual fix: the constants were always guarded for parity, but
+// nothing ever asserted what the reporter DOES with a given value, which is the layer the bug
+// was in. See `describeInputFidelity` there.
 
 // ── The device eval surface's BOUNDARY (#101) ────────────────────────────────
 // Input and screenshot are NOT agent ops: they are bridge-level switch cases
@@ -424,22 +414,10 @@ export function registerTools(server: McpServer) {
       const status = (await backendGet('/api/device/status')) as LeaseStatus;
       const lease = describeLease(status);
       // #32: the backend LIVE-PROBES this whenever a lease is connected — Android CDP
-      // reachability, then iOS WebDriverAgent. `status.inputMechanism` is absent for a
-      // disconnected lease (nothing to report a mechanism FOR, same rule the input handlers
-      // follow: a refusal never claims a mechanism). `pointer`/`type_text` stay synthetic-only
+      // reachability, then iOS WebDriverAgent. `pointer`/`type_text` stay synthetic-only
       // regardless of the probe — neither is routed through a trusted path on either platform.
-      const fidelity = status.inputMechanism === TRUSTED_CDP_MECHANISM
-        ? `Input mechanism: ${TRUSTED_CDP_MECHANISM} for device_tap/drag/press_key/hover/scroll (OS-level trusted input via CDP — #32 Phase 1). device_pointer/type_text are still ${SYNTHETIC_MECHANISM}.`
-        // #32 Phase 2 (iOS/WebDriverAgent) routes a NARROWER set than Android — only tap and drag,
-        // because a trusted key reaches just a focused element, WDA has no wheel action, and a
-        // touchscreen has no hover (all measured on the iPhone Air). So the ops are named from the
-        // backend's own `trustedOps` rather than assumed: reporting "trusted" for the whole surface
-        // when three of its ops are synthetic is the false-fidelity claim this line exists to stop.
-        : status.inputMechanism === TRUSTED_WDA_MECHANISM
-          ? `Input mechanism: ${TRUSTED_WDA_MECHANISM} for ${(status.trustedOps ?? ['tap', 'drag']).map((o) => `device_${o}`).join('/')} (OS-level trusted input via WebDriverAgent — #32 Phase 2). Every OTHER input op is still ${SYNTHETIC_MECHANISM} on iOS, and says so in its reply.`
-        : status.inputMechanism === SYNTHETIC_MECHANISM
-          ? `Input mechanism: ${SYNTHETIC_MECHANISM} (device_tap/drag/pointer/press_key/hover/scroll/type_text dispatch synthetic DOM events, not OS-level trusted input — see #32).`
-          : `Input mechanism: unknown — no device is connected, so there is nothing to probe (connect first; device_connect).`;
+      // Rendering lives in reply.ts so it can be tested by rendering it (#107).
+      const fidelity = describeInputFidelity(status);
       // App identity (#88): asked of the device itself, over the SAME lease socket every other
       // device_* call proxies through — so the answer comes from whichever app actually holds the
       // socket, and cannot lie the way a locally-derived value could. Only probed when a lease is

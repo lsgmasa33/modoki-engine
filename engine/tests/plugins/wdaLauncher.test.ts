@@ -4,6 +4,7 @@ import path from 'node:path';
 import {
   parseIosDevices, resolveIosDevice, ensureWdaRunning, stopWda,
   isWdaProcessRunning, _resetWdaLauncherForTests, WDA_PROBE_TIMEOUT_MS,
+  parseXctraceDevices, mergeIosDevices,
 } from '../../plugins/backend/wdaLauncher';
 
 /**
@@ -361,5 +362,92 @@ describe('ensureWdaRunning', () => {
     stopWda();
     expect(proc.killed).toBe(true);
     expect(isWdaProcessRunning()).toBe(false);
+  });
+});
+
+
+/** #143 — `devicectl` is CoreDevice (iOS 17+), so an iOS 16-or-older device appears in its JSON as
+ *  a stub with no `udid` and is dropped. That made every pre-iPhone-X handset unselectable for
+ *  trusted input — and NOT EVEN `MODOKI_IOS_DEVICE_UDID` could reach it, since the pin is matched
+ *  against that same list. Measured on an iPhone 8 / iOS 16.7.16 holding a live lease.
+ *
+ *  The fixture below is REAL output from `xcrun xctrace list devices` on the Mac where this was
+ *  found, trimmed only in the simulator list — every LINE SHAPE is preserved (the version-less Mac
+ *  line, the 40-hex legacy UDID, the curly vs straight apostrophe), because invented fixtures are
+ *  what let the shape drift. Only the ids and owner names are replaced: a real UDID or a real
+ *  person's device name in a file that ships to the public mirror is #103's leak, and it has now
+ *  aborted the OSS snapshot twice (see `PLACEHOLDER_UDIDS` in scripts/scan-publish-safety.mjs). */
+const XCTRACE_REAL = [
+  '== Devices ==',
+  'Dev’s MacBook Pro (98C84BED-A4A8-50F3-9873-8F3BE2862EE4)',
+  'iPhone8 (16.7.16) (deadbeefdeadbeefdeadbeefdeadbeefdeadbeef)',
+  '',
+  '== Devices Offline ==',
+  'Test iPhone Air (26.5.2) (DEADBEEF-0123456789ABCDEF)',
+  "Someone's iPhone (26.6) (DEADBEEF-1123456789ABCDEF)",
+  'Unknown (B0FE9C9A-513C-56FA-B5A2-80952F941F3B)',
+  'iPhone 13 mini (26.5.2) (DEADBEEF-2123456789ABCDEF)',
+  '',
+  '== Simulators ==',
+  'iPhone 17 Simulator (26.5) (EFED8E7C-2BC4-429F-8BF7-451E49EC84E5)',
+  'iPhone Air Simulator (26.5) (CCABD5E9-2E82-4944-9033-BB15560B13E7)',
+].join('\n');
+
+describe('parseXctraceDevices — the legacy listing, the only one that sees iOS <= 16 (#143)', () => {
+  it('finds the iOS 16 device devicectl cannot describe, with its 40-hex legacy UDID', () => {
+    const d = parseXctraceDevices(XCTRACE_REAL).find((x) => x.name === 'iPhone8');
+    expect(d).toEqual({ udid: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', name: 'iPhone8', connected: true });
+  });
+
+  it('excludes the Mac itself — by shape, not by name', () => {
+    // The Mac's line carries a UDID but NO OS version, which is why the pattern requires the
+    // `(os) (udid)` pair. Matching on the name would break on a renamed machine.
+    const names = parseXctraceDevices(XCTRACE_REAL).map((d) => d.name);
+    expect(names.some((n) => n.includes('MacBook'))).toBe(false);
+    expect(names.some((n) => n === 'Unknown')).toBe(false);   // also version-less
+  });
+
+  it('excludes simulators — a simulator is not a phone to run a signed agent on', () => {
+    expect(parseXctraceDevices(XCTRACE_REAL).some((d) => d.name.includes('Simulator'))).toBe(false);
+  });
+
+  it('reads `connected` from the section, so Offline devices are candidates but not preferred', () => {
+    const byName = Object.fromEntries(parseXctraceDevices(XCTRACE_REAL).map((d) => [d.name, d.connected]));
+    expect(byName['iPhone8']).toBe(true);
+    expect(byName['Test iPhone Air']).toBe(false);
+  });
+
+  it('returns [] for empty/garbage rather than throwing — the source is additive and may be absent', () => {
+    expect(parseXctraceDevices('')).toEqual([]);
+    expect(parseXctraceDevices('not a listing at all')).toEqual([]);
+  });
+});
+
+describe('mergeIosDevices — devicectl stays authoritative, legacy only ADDS (#143)', () => {
+  it('adds a device only the legacy listing can see', () => {
+    const merged = mergeIosDevices(
+      [{ udid: 'DEADBEEF-0123456789ABCDEF', name: 'Test iPhone Air', connected: false }],
+      parseXctraceDevices(XCTRACE_REAL),
+    );
+    expect(merged.map((d) => d.name)).toContain('iPhone8');
+  });
+
+  it('does not duplicate a device both listings report', () => {
+    // The two agree byte-for-byte on overlapping UDIDs (verified on hardware), so the dedupe is
+    // exact rather than heuristic. A duplicate would make resolveIosDevice refuse as "ambiguous"
+    // for a single phone — the failure this guards.
+    const primary = [{ udid: 'DEADBEEF-0123456789ABCDEF', name: 'Test iPhone Air', connected: true }];
+    const merged = mergeIosDevices(primary, parseXctraceDevices(XCTRACE_REAL));
+    expect(merged.filter((d) => d.udid === 'DEADBEEF-0123456789ABCDEF')).toHaveLength(1);
+    // and the devicectl entry WINS (it carries the richer fields + the live tunnel state)
+    expect(merged.find((d) => d.udid === 'DEADBEEF-0123456789ABCDEF')!.connected).toBe(true);
+  });
+
+  it('the merged list makes MODOKI_IOS_DEVICE_UDID able to reach an iOS 16 device at all', () => {
+    // The end-to-end point of #143: before the merge this pin answered "matches none of this
+    // Mac's paired iOS devices", leaving the device unselectable by ANY means.
+    const merged = mergeIosDevices(parseIosDevices('{"result":{"devices":[]}}'), parseXctraceDevices(XCTRACE_REAL));
+    const r = resolveIosDevice(merged, { MODOKI_IOS_DEVICE_UDID: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' } as NodeJS.ProcessEnv);
+    expect(r).toEqual({ device: { udid: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', name: 'iPhone8', connected: true } });
   });
 });

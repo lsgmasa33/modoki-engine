@@ -275,10 +275,13 @@ export class DeviceConnectionManager {
   private lastTarget: LastTarget | null;
   /** The connected device's Capacitor platform, asked once per lease. See `devicePlatform()`. */
   private platform: string | null = null;
+  /** The leased app's package/bundle id, latched by the same probe as `platform` — see
+   *  `deviceAppId()`. Guards the CDP route against driving a different device (#142). */
+  private appId: string | null = null;
   /** The bridge ANSWERED the identity probe — including answering "I have no platform" (an old
    *  bridge). Separate from `platform` so a stable null latches but a failed ASK does not. */
   private platformResolved = false;
-  private platformInFlight: Promise<string | null> | null = null;
+  private platformInFlight: Promise<{ platform: string | null; appId: string | null }> | null = null;
   private readonly guid: string;
   private readonly stateDir: string;
 
@@ -382,20 +385,40 @@ export class DeviceConnectionManager {
    *  is transient and is retried. Either way the caller sees null and must treat it as "not
    *  confirmed iOS", never as "assume iOS". */
   async devicePlatform(): Promise<string | null> {
-    if (this.platformResolved) return this.platform;
-    if (this.state !== 'connected') return null;
+    return (await this.deviceIdentity()).platform;
+  }
+
+  /** The leased app's package/bundle id, from the SAME `app-identity` probe as `devicePlatform()`
+   *  — so asking for it costs no extra round trip, and the two answers can never describe
+   *  different moments.
+   *
+   *  Needed because the CDP route discovers its target through adb, which knows nothing about this
+   *  lease: with an iPhone leased over WiFi and any Android plugged into the same Mac, input was
+   *  dispatched into the ANDROID and reported success (#142). `discoverDeviceCdpTarget` can already
+   *  match a `preferPackage` against CDP's `Android-Package`; this is the value to give it, so the
+   *  route can prove the webview it found is the app the lease is actually holding. */
+  async deviceAppId(): Promise<string | null> {
+    return (await this.deviceIdentity()).appId;
+  }
+
+  /** One probe, both facts. Latching rules are unchanged (see `devicePlatform`'s doc): a null is
+   *  latched only when the bridge ANSWERED with one; a failure to ASK is transient and retried. */
+  private async deviceIdentity(): Promise<{ platform: string | null; appId: string | null }> {
+    if (this.platformResolved) return { platform: this.platform, appId: this.appId };
+    if (this.state !== 'connected') return { platform: null, appId: null };
     if (this.platformInFlight) return this.platformInFlight;
     this.platformInFlight = (async () => {
       try {
         const raw = await this.proxy('app-identity', {});
         // The bridge signals a failed/unknown handler by RETURNING a string, not throwing, so a
         // non-object reply is "unknown", never a platform.
-        const info = (typeof raw === 'string' ? safeJsonParse(raw) : raw) as { platform?: unknown } | null;
+        const info = (typeof raw === 'string' ? safeJsonParse(raw) : raw) as { platform?: unknown; appId?: unknown } | null;
         this.platform = info && typeof info.platform === 'string' && info.platform ? info.platform : null;
+        this.appId = info && typeof info.appId === 'string' && info.appId ? info.appId : null;
         this.platformResolved = true;
-        return this.platform;
+        return { platform: this.platform, appId: this.appId };
       } catch {
-        return null;   // could not ask (lease dropped) — transient, so deliberately NOT latched
+        return { platform: null, appId: null };   // could not ask (lease dropped) — deliberately NOT latched
       } finally {
         this.platformInFlight = null;
       }

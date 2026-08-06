@@ -42,7 +42,10 @@ const REPO = path.resolve(__dirname, '../../..');
 const BRIDGE = path.join(REPO, 'engine/app/debug/bridge.ts');
 const DEVICE_CDP = path.join(REPO, 'engine/plugins/backend/deviceCdp.ts');
 const DEVICE_WDA = path.join(REPO, 'engine/plugins/backend/deviceWda.ts');
-const MCP_TOOLS = path.join(REPO, 'engine/tools/game-debug-mcp/src/mcp-tools.ts');
+// #107 moved the literals + the line that renders them out of `mcp-tools.ts` into `reply.ts`
+// (same package), so the reporter could be tested by RENDERING it — see `deviceInputFidelity.test.ts`.
+// This guard follows the declarations; its subject is unchanged.
+const MCP_TOOLS = path.join(REPO, 'engine/tools/game-debug-mcp/src/reply.ts');
 
 /** Pull `const NAME = 'value' as const;` (optionally `export`ed) → 'value'. Returns undefined when
  *  the declaration is gone or was reshaped, which the tests below treat as a failure rather than
@@ -107,9 +110,13 @@ describe('device input mechanism — every surface states the SAME set of mechan
 
   it('a mechanism the MCP cannot NAME is a mechanism device_status will mis-report', () => {
     // Found live, not by a test: the backend answered `trusted-wda` while device_status printed
-    // "synthetic", because mcp-tools.ts only knew two literals and fell through to its else-branch.
+    // "synthetic", because the MCP only knew two literals and fell through to its else-branch.
     // A literal declared on a backend surface but absent from the MCP's own `fidelity` reporting is
     // exactly that bug, so assert every known mechanism is actually mentioned there.
+    //
+    // Note what this can and cannot see, since #107 was reported against a green suite: it proves
+    // the reporter MENTIONS each literal, never what it says about one. That is a source-text
+    // check on the vocabulary; the sentence is `deviceInputFidelity.test.ts`'s job. Keep both.
     const mcpSrc = readFileSync(MCP_TOOLS, 'utf8');
     for (const name of ['SYNTHETIC_MECHANISM', 'TRUSTED_CDP_MECHANISM', 'TRUSTED_WDA_MECHANISM']) {
       const uses = mcpSrc.split(name).length - 1;

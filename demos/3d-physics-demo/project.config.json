@@ -14,7 +14,8 @@
     "webCdnUrlMap": "",
     "webCdnBackendBucket": "",
     "webDeployCommand": "",
-    "appleTeamId": ""
+    "appleTeamId": "",
+    "debugBuild": false
   },
   "capacitor": {
     "webDir": "dist",

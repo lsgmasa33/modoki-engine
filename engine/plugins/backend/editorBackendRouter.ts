@@ -676,7 +676,13 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     // that answers `resolve-aim`), not just the half that is cheap to check — see the measured
     // false claim documented on `isDeviceCdpAvailable`.
     const proxy = (m: string, p: Record<string, unknown>) => deviceConnection.proxy(m, p);
-    if (await isDeviceCdpAvailable({ proxy })) return json({ ...status, inputMechanism: TRUSTED_CDP_MECHANISM });
+    // Gated on the device being ANDROID and on the CDP target being THIS lease's app, exactly as
+    // the input route is (#142) — a status read that says `trusted-cdp` for an iOS lease is the
+    // same lie, and it is the one an agent consults BEFORE deciding whether to trust its input.
+    if (await deviceConnection.devicePlatform() === 'android'
+        && await isDeviceCdpAvailable({ proxy, preferPackage: (await deviceConnection.deviceAppId()) ?? undefined })) {
+      return json({ ...status, inputMechanism: TRUSTED_CDP_MECHANISM });
+    }
     // #32 Phase 2 — an iOS device has no CDP route but may have WebDriverAgent. Reported honestly:
     // `trusted-wda` covers tap and drag ONLY, which is why the mechanism line names them rather than
     // implying every op is trusted (press_key/scroll/hover stay synthetic on iOS — see deviceWda.ts).
@@ -777,7 +783,27 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         // second call.
         return json({ result: native, wdaFallbackUnavailable: shot.reason });
       }
-      let outcome = await tryDeviceCdpInput(b.method, b.params ?? {}, { proxy });
+      // GATED ON THE DEVICE BEING ANDROID, and on the CDP target being THIS lease's app (#142).
+      // The mirror of the iOS gate below, and it was missing: CDP discovery runs entirely through
+      // adb (`/proc/net/unix` → `adb forward`) and knows nothing about the lease, so "a CDP route
+      // exists" is NOT "the leased device is the one adb sees". Measured with an iPhone leased over
+      // WiFi and a Samsung on USB: the tap was dispatched into the SAMSUNG and reported
+      // `ok (cdp touch) … [input:trusted-cdp]`, while the iPhone's page received nothing — with the
+      // coordinates resolved through the LEASE, i.e. computed on the iPhone's layout and injected
+      // into a different screen. Strict `=== 'android'`: an unconfirmed platform must never be read
+      // as Android, the same rule the iOS gate follows.
+      //
+      // Expressed as "no session" rather than as an early return on purpose: falling back to
+      // synthetic is ALLOWED but never QUIET (this module's header), and an early return with
+      // `reason: null` silently dropped the SYNTHETIC INPUT (NOT TRUSTED) banner for every
+      // non-Android device — caught by two existing tests. Routing the gate through `getSession`
+      // reuses tryDeviceCdpInput's reason logic verbatim instead of restating it here.
+      const isAndroid = await deviceConnection.devicePlatform() === 'android';
+      let outcome = await tryDeviceCdpInput(b.method, b.params ?? {}, {
+        proxy,
+        preferPackage: (await deviceConnection.deviceAppId()) ?? undefined,
+        ...(isAndroid ? {} : { getSession: async () => null }),
+      });
       // #32 Phase 2: no CDP route (an iOS device, or an Android one without adb) ⇒ try
       // WebDriverAgent before giving up on trusted input. Only tap/drag are routable on iOS — the
       // other ops have no faithful trusted equivalent there (see deviceWda.ts's header), so they

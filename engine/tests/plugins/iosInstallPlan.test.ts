@@ -20,7 +20,7 @@ describe('planIosInstall', () => {
   });
 
   it('allows the build with NO devicectl id, handing off to Xcode (the iOS-16 case)', () => {
-    expect(planIosInstall({ iosDeviceId: '30afceaf31f81f6329553e538482b2c433e9e844', iosDevicectlId: '' }))
+    expect(planIosInstall({ iosDeviceId: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', iosDevicectlId: '' }))
       .toEqual({ ok: true, mode: 'xcode-handoff' });
   });
 

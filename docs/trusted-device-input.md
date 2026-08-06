@@ -117,6 +117,63 @@ build, the per-machine signing, and the expiry rule.
   nothing when false. An **unknown** platform (an old bridge with no `app-identity`) is treated as
   not-iOS, never as "assume iOS".
 
+  **The CDP route needed the mirror of this gate, and did not have it until #142 (2026-08-06).**
+  The reasoning above has a symmetric half that went unwritten for three days: *"a CDP route
+  exists" is not the same as "the leased device is the one adb sees."* CDP discovery is pure adb
+  (`/proc/net/unix` → `adb forward`) and never consults the lease, while the router tried it
+  **first and unconditionally**. Measured on hardware: an **iPhone** leased over WiFi (app
+  `com.modokiengine.court`, `platform: 'ios'`) with a **Samsung on USB** — `device_tap` dispatched
+  the touch into the *Samsung* and returned `ok (cdp touch) … [input:trusted-cdp]` while the
+  iPhone's page received **zero** events. Worse than a mislabel: `resolveAimViaDevice` resolves the
+  target through the **lease**, so the coordinates were computed on the iPhone's 375×667 layout and
+  injected into a different screen — cross-device coordinate injection, reported as a clean success
+  with a trusted stamp. After the fix, the same configuration delivers 4 events to the iPhone at
+  the resolved point, with the honest synthetic banner.
+
+  Two properties of that fix are load-bearing:
+  - **The platform gate is expressed as "no session", not as an early return.** Falling back is
+    ALLOWED but never QUIET; an early return with `reason: null` silently dropped the
+    `SYNTHETIC INPUT (NOT TRUSTED)` banner for every non-Android device. Routing the gate through
+    `getSession` reuses `tryDeviceCdpInput`'s reason logic instead of restating it.
+  - **Platform alone is not enough** — it still lets one Android lease drive a *different*
+    adb-visible Android. The lease's `appId` is therefore passed as `preferPackage`, which
+    `discoverDeviceCdpTarget` already matches against CDP's `Android-Package`; and the session
+    cache is keyed by that package, because a cache hit used to be returned *before*
+    `preferPackage` was looked at — handing a constrained caller a session discovered by an
+    unconstrained one, silently defeating the check.
+
+- **iOS 16 devices: selectable, but WDA still cannot RUN on them (measured 2026-08-07).** Two
+  separate things, and only the first was a Modoki bug. Device SELECTION was broken — `devicectl`
+  is CoreDevice/iOS 17+, so an older device appears in its JSON as a stub with no `udid` and was
+  dropped entirely, making it unreachable even via `MODOKI_IOS_DEVICE_UDID` (#143, fixed by
+  unioning in `xcrun xctrace list devices`). But once selectable, the launch fails anyway on the
+  owner's **iPhone 8 / iOS 16.7.16**:
+
+  ```
+  Cannot test target "WebDriverAgentRunner" on "iPhone8": Logic Testing Unavailable
+  ```
+
+  `xcodebuild -showdestinations` omits it for EVERY scheme in the WDA project while listing four
+  iOS-26 phones — **two of which are disconnected** — so destination eligibility tracks OS
+  version, not connection. Xcode will build and run ordinary apps on it (that is how the game gets
+  deployed), it just will not accept it as a TEST destination, and XCUITest is how WDA starts.
+  Confirmed identically from `xcodebuild` AND the Xcode GUI, so it is not a CLI limitation.
+
+  **Do not re-diagnose this.** Six theories were tested and disproved, in this order: a missing
+  iOS 16.7 developer disk image (a `16.7 → 16.4` symlink changed nothing — a DDI is
+  signature-checked, so renaming one gets it rejected, which also means that test was weaker than
+  it looked); the phone not being on USB (`ioreg` found it; failure identical on USB); wrong
+  architecture (runner, xctest bundle and lib are all arm64); absence from the provisioning profile
+  (a real gap — the device is registered now — same error afterwards); Developer Mode off or the
+  device unprepared (Xcode shows it Connected with apps installed); and the deployment target
+  (`IPHONEOS_DEPLOYMENT_TARGET = 15.0`). The one measurement that settled it was a CONTROL: the
+  same xctestrun launches WDA on the iPhone Air first try, isolating the variable to the OS.
+
+  Consequence for testing: **the iPhone 8 is a synthetic-input-only device.** Use the Air for any
+  trusted-input verification. The only avenue that could change this is a third-party XCUITest
+  launcher (e.g. `go-ios`) that bypasses Xcode's test machinery — a new toolchain dependency, so
+  an owner decision rather than an agent one.
+
 - **macOS-only, to start AND to use** — it is an `xcodebuild` run, matching
   `isInstallable('webdriveragent')`. Off macOS `ensureWdaRunning` refuses immediately, before any
   network, and iOS input from that editor is synthetic with the usual loud banner.
