@@ -340,7 +340,17 @@ export {
   // Pointer / tap / drag accessors (already unambiguous, no prefix needed).
   pointer as inputPointer, pointerDown, pointerPressed, pointerReleased,
   pointerPos, pointerDrag, getWheelDelta, setPointer as setInputPointer,
+  // Latency compensation — `pointerPredictedPos` is RENDERING-only; hit-tests read `pointerPos`.
+  pointerPredictedPos, pointerVelocity, setPointerLeadMs, getPointerLeadMs,
+  POINTER_LEAD_MS_DEFAULT, POINTER_LEAD_MS_ANDROID_60HZ,
+  setPointerLeadGate, getPointerLeadGate, pointerLeadGateFactor, POINTER_LEAD_GATE_DEFAULTS,
 } from './traits/Input';
+export {
+  setPointerFilterParams, getPointerFilterParams,
+} from './input/pointerSource';
+export {
+  createOneEuroFilter, oneEuroAlpha, POINTER_FILTER_DEFAULTS, type OneEuroParams,
+} from './input/oneEuroFilter';
 export { rawNow, setManualNow, advanceManual, restoreRealClock, isManualClock } from './core/clock';
 export { stepSimulation, type StepOptions } from './core/stepSimulation';
 export { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';

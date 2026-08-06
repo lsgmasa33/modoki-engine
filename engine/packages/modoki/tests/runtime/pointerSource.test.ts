@@ -389,4 +389,121 @@ describe('pointerSource', () => {
       expect(f.pointer.down).toBe(false);
     });
   });
+
+  /** Pointer VELOCITY — the input half of touch-to-photon latency compensation.
+   *
+   *  A touch reaches the screen ~83 ms late on an A23 (five frames), measured against a bare
+   *  DOM control ring, so the only remaining lever is to draw where the finger is heading.
+   *  `vx/vy` is what makes that possible; `pointerPredictedPos` applies the lead.
+   *
+   *  ⚠️ `timeStamp` is set explicitly here. jsdom stamps every synthetic event with a coarse
+   *  clock, so two dispatched back-to-back can carry the SAME timestamp — the estimator then
+   *  sees dt=0, correctly refuses it, and every velocity assertion would read 0 while looking
+   *  like the feature is broken. */
+  describe('velocity (latency compensation)', () => {
+    /** Fire a pointer event at an exact timeStamp — `Event.timeStamp` is readonly, so it is
+     *  defined on the instance rather than passed to the constructor. */
+    function fireAt(type: string, x: number, y: number, t: number, pointerId = 1): void {
+      const ev = new MouseEvent(type, { clientX: x, clientY: y, bubbles: true }) as MouseEvent;
+      Object.defineProperty(ev, 'pointerId', { value: pointerId });
+      Object.defineProperty(ev, 'timeStamp', { value: t });
+      window.dispatchEvent(ev);
+    }
+
+    it('is zero before any input, and while the pointer is up', () => {
+      pointerSource.attach();
+      const f = sampleFrame({ down: false });
+      expect(f.pointer.vx).toBe(0);
+      expect(f.pointer.vy).toBe(0);
+    });
+
+    it('is zero on the frame the pointer goes down — a just-landed finger has no heading', () => {
+      pointerSource.attach();
+      const prev = { down: false };
+      fireAt('pointerdown', 100, 100, 1000);
+      const f = sampleFrame(prev);
+      expect(f.pointer.down).toBe(true);
+      expect(f.pointer.vx).toBe(0);
+      expect(f.pointer.vy).toBe(0);
+    });
+
+    it('estimates px/ms, converging toward the true speed as samples arrive', () => {
+      // The velocity comes from the 1€ filter's own low-passed derivative, so it APPROACHES the
+      // true speed rather than jumping to it — exact values belong to oneEuroFilter.test.ts.
+      // What matters at this seam is the sign, the units, and that it converges.
+      pointerSource.attach();
+      const prev = { down: false };
+      fireAt('pointerdown', 100, 100, 1000);
+      sampleFrame(prev);
+      let last = 0;
+      for (let i = 1; i <= 20; i++) {
+        fireAt('pointermove', 100 + i * 32, 100, 1000 + i * 16);   // a true 2 px/ms
+        const f = sampleFrame(prev);
+        expect(f.pointer.vx).toBeGreaterThanOrEqual(last);          // monotone approach
+        expect(f.pointer.vy).toBeCloseTo(0, 6);                     // no cross-axis leakage
+        last = f.pointer.vx;
+      }
+      expect(last).toBeGreaterThan(0.5);
+      expect(last).toBeLessThanOrEqual(2.0001);                     // never overshoots the truth
+    });
+
+    it('leaves x/y RAW — only the velocity is filtered', () => {
+      // The filter's smoothed POSITION is discarded on purpose: extrapolating from it subtracts
+      // the filter's lag from the lead, which measured as prediction drawing BEHIND the finger.
+      // So `x/y` must remain exactly what the DOM reported, for hit-tests and for the
+      // prediction base alike.
+      pointerSource.attach();
+      const prev = { down: false };
+      fireAt('pointerdown', 100, 100, 1000);
+      sampleFrame(prev);
+      fireAt('pointermove', 140, 100, 1016);
+      const f = sampleFrame(prev);
+      expect(f.pointer.x).toBe(140);
+      expect(f.pointer.y).toBe(100);
+      expect(f.pointer.vx).toBeGreaterThan(0);    // ...while the heading is being estimated
+    });
+
+    it('ignores a sample gap outside the usable band', () => {
+      pointerSource.attach();
+      const prev = { down: false };
+      fireAt('pointerdown', 100, 100, 1000);
+      sampleFrame(prev);
+      // dt = 500ms — the samples straddle a stall, so the "velocity" between them is fiction.
+      fireAt('pointermove', 600, 100, 1500);
+      let f = sampleFrame(prev);
+      expect(f.pointer.vx).toBe(0);
+      // dt = 0 — a duplicate timestamp would divide by ~zero and explode.
+      fireAt('pointermove', 700, 100, 1500);
+      f = sampleFrame(prev);
+      expect(f.pointer.vx).toBe(0);
+    });
+
+    it('drops to zero on release, so the picture cannot coast past the finger', () => {
+      pointerSource.attach();
+      const prev = { down: false };
+      fireAt('pointerdown', 100, 100, 1000);
+      sampleFrame(prev);
+      fireAt('pointermove', 132, 100, 1016);
+      expect(sampleFrame(prev).pointer.vx).toBeGreaterThan(0);
+      // A FLICK release: still moving fast at the moment the finger lifts.
+      fireAt('pointerup', 164, 100, 1032);
+      expect(sampleFrame(prev).pointer.vx).toBe(0);
+    });
+
+    it('does not carry velocity from one gesture into the next', () => {
+      pointerSource.attach();
+      const prev = { down: false };
+      fireAt('pointerdown', 100, 100, 1000);
+      sampleFrame(prev);
+      fireAt('pointermove', 132, 100, 1016);
+      expect(sampleFrame(prev).pointer.vx).toBeGreaterThan(0);
+      fireAt('pointerup', 132, 100, 1032);
+      sampleFrame(prev);
+      // A new press elsewhere starts from rest, however fast the previous gesture ended.
+      fireAt('pointerdown', 500, 500, 1100);
+      const f = sampleFrame(prev);
+      expect(f.pointer.vx).toBe(0);
+      expect(f.pointer.vy).toBe(0);
+    });
+  });
 });

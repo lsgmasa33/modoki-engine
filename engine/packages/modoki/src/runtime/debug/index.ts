@@ -26,6 +26,7 @@ import { CheatsTab } from './tabs/CheatsTab';
 import { ConsoleTab } from './tabs/ConsoleTab';
 import { DeviceTab } from './tabs/DeviceTab';
 import { ProfilerTab } from './tabs/ProfilerTab';
+import { InputTab } from './tabs/InputTab';
 
 // Start capturing console.* as soon as the (enabled) debug-menu chunk loads.
 installConsoleCapture();
@@ -53,6 +54,7 @@ registerDebugTab({ id: 'prefs', title: 'Prefs', order: 45, Component: PlayerPref
 registerDebugTab({ id: 'cheats', title: 'Cheats', order: 50, Component: CheatsTab });
 registerDebugTab({ id: 'console', title: 'Console', order: 60, Component: ConsoleTab });
 registerDebugTab({ id: 'device', title: 'Device', order: 70, Component: DeviceTab });
+registerDebugTab({ id: 'input', title: 'Input', order: 75, Component: InputTab });
 
 export { DebugMenu } from './DebugMenu';
 export { Sparkline, sparkPoints, type SparklineProps } from './Sparkline';

@@ -66,6 +66,7 @@ import { getPlayState, onPlayStateChange } from '../core/playState';
 import { isPointerBlocked } from '../core/pointerBlockers';
 import { peekCurrentWorld } from '../core/ecs/worldRegistry';
 import { emit } from '../core/journal';
+import { createOneEuroFilter, POINTER_FILTER_DEFAULTS, type OneEuroParams } from './oneEuroFilter';
 
 /** One press or release event, captured with the exact coordinates it occurred at
  *  (not the coordinates by the time it's sampled). `startX/startY` snapshot the
@@ -86,6 +87,42 @@ let startX = 0;
 let startY = 0;
 let activeId: number | null = null;
 let active = false;         // saw activity since last sample → sets lastDevice='pointer'
+// Smoothed pointer position + velocity, published for latency extrapolation
+// (`pointerPredictedPos`). Both come from a 1€ filter per axis rather than a fixed EMA: a fixed
+// smoothing constant has to choose between killing jitter (heavy) and tracking a fast movement
+// (light), and every constant is wrong somewhere. Measured on an A23 — an 83 ms lead felt right
+// with one constant and 33 ms trembled with the same constant once extrapolation resampled to
+// absolute time, because a velocity error becomes a per-sample SAWTOOTH once the position is
+// advanced between samples. See `oneEuroFilter.ts`.
+//
+// ⚠️ Only the VELOCITY is filtered. The smoothed POSITION the filter also produces is
+// deliberately discarded: extrapolating from it subtracts the filter's lag from the lead and,
+// at conservative settings, exceeds it — prediction then draws BEHIND the finger. See
+// `pointerPredictedPos`.
+let vx = 0;
+let vy = 0;
+let lastMoveT = 0;
+/** Live tunables, shared by both axes. Mutated IN PLACE by `setPointerFilterParams`, and the
+ *  filters below close over this very object — so the debug tuner's edits take effect on the next
+ *  SAMPLE rather than the next gesture, and without rebuilding the filters and losing history. */
+const filterParams: OneEuroParams = { ...POINTER_FILTER_DEFAULTS };
+const filterX = createOneEuroFilter(filterParams);
+const filterY = createOneEuroFilter(filterParams);
+/** Ignore a dt outside this band: below it the derivative explodes on near-duplicate
+ *  timestamps, above it the samples straddle a stall and the "velocity" is fiction. */
+const VEL_MIN_DT_MS = 1;
+const VEL_MAX_DT_MS = 64;
+
+/** Retune the 1€ filter live (debug menu → Input). `minCutoff` first — lower it until a
+ *  stationary pointer stops trembling — then `beta`, raised until a fast drag stops lagging. */
+export function setPointerFilterParams(next: Partial<OneEuroParams>): void {
+  if (Number.isFinite(next.minCutoff)) filterParams.minCutoff = Math.max(1e-3, next.minCutoff!);
+  if (Number.isFinite(next.beta)) filterParams.beta = Math.max(0, next.beta!);
+  if (Number.isFinite(next.dCutoff)) filterParams.dCutoff = Math.max(1e-3, next.dCutoff!);
+}
+
+/** The live 1€ parameters (a copy — the caller must not mutate the filters' own state). */
+export function getPointerFilterParams(): OneEuroParams { return { ...filterParams }; }
 let attached = false;
 let offPlayState: (() => void) | null = null;
 // Accumulated scroll-notch delta since the last sample (+down / −up), one unit per
@@ -95,7 +132,11 @@ let wheelAccum = 0;
 // Queued down/up transitions awaiting drain by `sample()`, oldest first.
 const pending: PointerTransition[] = [];
 
-function reset(): void { down = false; activeId = null; wheelAccum = 0; pending.length = 0; }
+function reset(): void {
+  down = false; activeId = null; wheelAccum = 0; pending.length = 0;
+  vx = 0; vy = 0; lastMoveT = 0;
+  filterX.reset(); filterY.reset();
+}
 
 function pushTransition(t: PointerTransition): void {
   // Drop the NEWEST on overflow, not the oldest: dropping the oldest can leave an
@@ -127,6 +168,15 @@ function onPointerDown(e: PointerEvent): void {
   x = e.clientX; y = e.clientY;
   startX = x; startY = y;
   active = true;
+  // A new gesture inherits NO velocity or smoothing history from the last one — carrying either
+  // over would fling the extrapolated point away from a finger that has only just landed, or
+  // sweep it across the screen from wherever the previous gesture ended.
+  vx = 0; vy = 0; lastMoveT = e.timeStamp;
+  filterX.reset(); filterY.reset();
+  // SEED at the press point, don't just reset: an unseeded filter spends the gesture's first
+  // move establishing itself and reports no heading, so prediction would engage one sample late
+  // — exactly at the moment the finger starts to travel and the lag is most visible.
+  filterX.seed(x); filterY.seed(y);
   pushTransition({ down: true, x, y, startX, startY });
   // Keep receiving moves even if the finger/cursor leaves the original element.
   const el = e.target as Element | null;
@@ -135,6 +185,19 @@ function onPointerDown(e: PointerEvent): void {
 
 function onPointerMove(e: PointerEvent): void {
   if (e.pointerId !== activeId) return;
+  const dt = e.timeStamp - lastMoveT;
+  if (dt > VEL_MIN_DT_MS && dt < VEL_MAX_DT_MS) {
+    const dtSec = dt / 1000;
+    // The filter's smoothed VALUE is discarded on purpose (see the declaration above); only its
+    // low-passed derivative is kept. The 1€ derivative is per SECOND; the pointer frame
+    // publishes px/ms to match `lastMoveT`.
+    const sx = filterX.filter(e.clientX, dtSec);
+    const sy = filterY.filter(e.clientY, dtSec);
+    vx = sx.derivative / 1000; vy = sy.derivative / 1000;
+  }
+  // Outside the usable dt band the derivative is fiction — hold the last heading rather than
+  // invent one.
+  lastMoveT = e.timeStamp;
   x = e.clientX; y = e.clientY;
   active = true;
 }
@@ -148,6 +211,11 @@ function onPointerUp(e: PointerEvent): void {
   down = false;
   activeId = null;
   active = true;
+  // Kill the velocity on release so the extrapolated point collapses onto the true one. A
+  // flick-and-lift would otherwise leave the picture coasting past the finger on the very
+  // frame the gesture is being resolved.
+  vx = 0; vy = 0;
+  filterX.reset(); filterY.reset();
   pushTransition({ down: false, x, y, startX, startY });
 }
 
@@ -216,6 +284,10 @@ export const pointerSource: InputSource = {
       p.dragX = down ? x - startX : 0;
       p.dragY = down ? y - startY : 0;
     }
+    // Velocity is level state like x/y, not an edge: published every frame, and already
+    // zeroed by press/release/reset so it can only be non-zero mid-gesture. `t` travels with
+    // them so a consumer can tell how STALE this position already is — see `pointerPredictedPos`.
+    p.vx = vx; p.vy = vy; p.t = lastMoveT;
     p.wheel = wheelAccum; wheelAccum = 0; // transient per-frame delta, consumed here
     if (active) { out.lastDevice = 'pointer'; active = false; }
   },
