@@ -19,6 +19,7 @@ import { registerBoundsProvider, projectAABBToScreen, type EntityScreenBounds } 
 import { readbackToRGBA, type ReadbackBackend } from './readbackToRGBA';
 import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, prewarmShadersForWorld, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
 import { registerRenderSurface } from './materialBroker';
+import { beginProfilerSample, endProfilerSample } from '../core/profilerMarkers';
 import { getRenderSettings } from './renderSettings';
 import { onForceResize } from './resizeBus';
 import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
@@ -258,20 +259,33 @@ export default function Scene3D() {
         if (!isSimRunning() && !isSkeletalPreviewing() && dirtyFrames <= 0) return;
         if (dirtyFrames > 0) dirtyFrames--;
         const world = getCurrentWorld();
+        // Profiler-plan P2, second pass. `render3d-0` used to be ONE opaque span, which is how a
+        // 170ms frame on the A23 could report only 37.9ms of engine CPU with no interior to
+        // inspect. These sub-spans split the ECS->three sync from the actual submit, so the next
+        // capture can say WHICH of them the time is in — or prove it is in neither, which is the
+        // answer that sends us to GPU timestamps (P7) instead of more markers.
+        beginProfilerSample('sync');
         activeCamera = syncCamera(world, scene, camera, orthoCamera);
         applyFraming(world, activeCamera, camera.aspect, activeCamera === orthoCamera);
         syncEnvironment(world, scene);
         syncFog(world, scene);
+        beginProfilerSample('lights');
         syncLights(world, scene, ecsLights);
+        endProfilerSample();
+        beginProfilerSample('renderables');
         syncSceneRenderables3D(world, scene, renderState);
+        endProfilerSample();
         orientBillboards(renderState, activeCamera); // face billboards toward the live camera
         // Inside the editor PREVIEW envelope the SceneView owns particle preview (it supplies its
         // own wall-clock delta + drains the timeline's one-shot restart/pause requests). If this
         // runtime renderer ALSO drained them it would consume the request first and, with the sim
         // clock frozen (getVisualDelta 0 in preview), show a stuck-at-frame-0 burst. So skip here
         // during scrub/preview; real Play (isSimRunning) is unaffected. (preview-mode-refactor Phase 5.)
+        beginProfilerSample('particles');
         if (!inPreviewSession()) syncParticles(world, scene, particleState);
         syncFlameMeshes(world, scene, flameState);
+        endProfilerSample();
+        endProfilerSample(); // 'sync'
 
         // Read NPR singleton — first entity with NPRPostFX, if any. The trait→config
         // mapping + signature are the pure `nprConfigFromTrait`/`nprConfigSignature`
@@ -445,9 +459,13 @@ export default function Scene3D() {
               if (cfgScale === liveSs) lastStackSig = sig;
             }
           }
+          beginProfilerSample('submit-postfx');
           postfxStack.render();
+          endProfilerSample();
         } else {
+          beginProfilerSample('submit');
           renderer.render(scene, activeCamera);
+          endProfilerSample();
         }
       }
       // Prewarm the already-current scene before the first render. The runtime

@@ -3,6 +3,11 @@
  *  ECS pipeline (0) → Three.js render (10) → PixiJS render (20). */
 
 import { rawNow } from '../core/clock';
+import { recordFrame } from '../core/frameProfiler';
+import { beginProfilerFrame, endProfilerFrame, profileScope } from '../core/profilerMarkers';
+import { recordMarkerFrame } from '../core/profilerAggregate';
+import { captureFrame } from '../core/profilerCapture';
+import { recordCounterFrame } from '../core/profilerCounters';
 
 type FrameCallback = () => void;
 
@@ -117,9 +122,16 @@ function runFrame(now: DOMHighResTimeStamp, gen: number, self: FrameRequestCallb
     _fpsLastSample = now;
   }
   if (dirty) rebuildSorted();
+  // Profiler-plan P2 — attribute the frame to its named units of work. The callbacks are ALREADY
+  // named and priority-ordered ('ecs', the Scene3D/Scene2D/SceneView keys, …), so this is what
+  // turns "48ms of an 83ms frame was CPU" into "31ms ECS, 12ms 3D, 5ms 2D" for one wrapper call.
+  // No-ops to a single branch when markers are disabled.
+  beginProfilerFrame();
   for (const entry of sorted) {
     try {
-      entry.cb();
+      // profileScope is exception-safe (try/finally), so a callback that throws — which the
+      // catch below treats as routine — still closes its span and cannot unbalance the stack.
+      profileScope(entry.key, entry.cb);
       if (errorCounts.has(entry.key)) errorCounts.delete(entry.key);
     } catch (err) {
       const n = (errorCounts.get(entry.key) ?? 0) + 1;
@@ -131,6 +143,23 @@ function runFrame(now: DOMHighResTimeStamp, gen: number, self: FrameRequestCallb
       }
     }
   }
+  // #121 P2 — frame-time profiling. `lastFrameAt` is this frame's start (read through the same
+  // `rawNow()` clock above), so CPU cost is that to HERE: the end of every engine callback, which
+  // is exactly the span the low-end investigation measured at ~48 ms of an 83 ms frame. Two
+  // clock reads and a ring write, deliberately unconditional — an intermittent boot-time hitch
+  // is not reproducible on demand after flipping a flag. A throwing callback is already caught
+  // above, so its cost is still counted rather than skipping the frame entirely.
+  endProfilerFrame();
+  // Fold this frame's tree into the aggregation window (P3). No-ops when markers are off.
+  recordMarkerFrame();
+  // Counters share the marker frame boundary so a counter and a timing read on the same
+  // screen describe the same span (P9). Rate counters reset here; levels persist.
+  recordCounterFrame();
+  // Frame capture (P6) reuses the timings recordFrame just computed rather than keeping its own
+  // `prevFrameStart` — two copies of that state would drift the moment either side changed its
+  // discontinuity handling, and a capture would then silently disagree with the live profile.
+  const { frameMs, cpuMs } = recordFrame(lastFrameAt, rawNow());
+  captureFrame(frameMs, cpuMs); // no-ops unless someone pressed record
 }
 
 /** Arm a fresh rAF chain, superseding any previous one. Idempotent in effect: the old

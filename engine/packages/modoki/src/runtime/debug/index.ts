@@ -12,6 +12,7 @@ import { registerDebugTab } from './debugMenuRegistry';
 import { registerStatWidget } from './widgetStore';
 import { installConsoleCapture } from './consoleCapture';
 import { installDrawCallProbe } from './drawCallProbe';
+import { setProfilerEnabled } from '../core/profilerMarkers';
 import { FpsWidget } from './widgets/FpsWidget';
 import { MemoryWidget } from './widgets/MemoryWidget';
 import { GpuWidget } from './widgets/GpuWidget';
@@ -24,11 +25,17 @@ import { PlayerPrefsTab } from './tabs/PlayerPrefsTab';
 import { CheatsTab } from './tabs/CheatsTab';
 import { ConsoleTab } from './tabs/ConsoleTab';
 import { DeviceTab } from './tabs/DeviceTab';
+import { ProfilerTab } from './tabs/ProfilerTab';
 
 // Start capturing console.* as soon as the (enabled) debug-menu chunk loads.
 installConsoleCapture();
 // Make per-frame draw-call/triangle stats accurate under multi-pass rendering.
 installDrawCallProbe();
+// Profiler markers follow the SAME gate as the probe above: this chunk is lazy-imported behind
+// the debugBuild flag, so a release game tree-shakes it out and never pays for them. That is
+// also why enabling here (rather than in the marker module) is right — the module stays a
+// neutral primitive with markers off by default, and the debug build is what opts in.
+setProfilerEnabled(true);
 
 // Built-in floating stat widgets (spawned from the Stats launcher). Cascade their
 // default positions so stacked widgets don't perfectly overlap.
@@ -37,6 +44,7 @@ registerStatWidget({ id: 'memory', title: 'Memory', order: 10, Component: Memory
 registerStatWidget({ id: 'gpu', title: 'GPU', order: 20, Component: GpuWidget, defaultPos: { x: 16, y: 176 } });
 
 registerDebugTab({ id: 'stats', title: 'Stats', order: 0, Component: StatsTab });
+registerDebugTab({ id: 'profiler', title: 'Profiler', order: 5, Component: ProfilerTab });
 registerDebugTab({ id: 'world', title: 'World', order: 10, Component: WorldTab });
 registerDebugTab({ id: 'time', title: 'Time', order: 20, Component: TimeTab });
 registerDebugTab({ id: 'journal', title: 'Journal', order: 30, Component: JournalTab });

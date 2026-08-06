@@ -49,11 +49,20 @@ import { getPlayState } from '../core/playState';
 import { isSkeletalPreviewing, skeletalPreviewDelta } from '../core/skeletalPreview';
 import { getSkeletalSeek, hasSkeletalSeeks, clearSkeletalSeeks } from '../core/skeletalSeek';
 import { createPrimitiveMesh } from '../loaders/primitives';
+import {
+  beginLightMaskFrame, getMaskedMaterial, isLightMaskingActive, maskNeedsVariant, baseOf,
+  DEFAULT_RENDERING_LAYER_MASK, type MaskedLight, type LightingFactory,
+} from './lightMaskVariants';
+import { getActiveRenderer } from '../core/activeRenderer';
 import { setActiveRenderer } from '../loaders/textureResolver';
 import { PARTICLE_LAYER } from './layers';
 
 // Reused across frames to avoid per-frame allocations
 const _activeLightIds = new Set<number>();
+/** This frame's lights + their rendering-layer masks (#136), filled by `syncLights` and
+ *  consumed by the renderable pass that follows it. Reused across frames — `beginLightMaskFrame`
+ *  copies what it keeps. */
+const _maskedLights: MaskedLight[] = [];
 const _activeRenderIds = new Set<number>();
 const _defaultMaterial = new THREE.MeshStandardMaterial({ color: 0xcccccc, roughness: 0.5, metalness: 0 });
 
@@ -652,6 +661,7 @@ const _lightForward = new THREE.Vector3();
 
 export function syncLights(world: World, scene: THREE.Scene, ecsLights: Map<number, THREE.Light>) {
   _activeLightIds.clear();
+  _maskedLights.length = 0;
   world.query(Light).updateEach(([light], entity) => {
     if (deactivatedEntities.has(entity.id())) return;
     const id = entity.id();
@@ -732,6 +742,11 @@ export function syncLights(world: World, scene: THREE.Scene, ecsLights: Map<numb
         if (!l.target.parent) scene.add(l.target);
       }
     }
+
+    // Rendering-layer mask (#136) — published for the renderable pass, which runs after this
+    // one (see `syncSceneRenderables3D`). Collected HERE because this is the only place the
+    // ECS `Light` trait and its THREE.Light are both in hand.
+    _maskedLights.push({ light: l, mask: light.renderingLayerMask });
   });
   for (const [id, l] of ecsLights) {
     if (!_activeLightIds.has(id)) {
@@ -1037,6 +1052,7 @@ function syncMaterial(
   state: RenderState,
   isTinted = false,
   isInstanced = false,
+  isMasked = false,
 ): void {
   const targets = materialTargetsOf(obj);
   const prevMat = state.ecsMaterials.get(id);
@@ -1056,13 +1072,17 @@ function syncMaterial(
       }
       if (newMat) { t.material = newMat; t.castShadow = !newMat.transparent; }
     }
-  } else if (!isTinted && !isInstanced && curMat) {
+  } else if (!isTinted && !isInstanced && !isMasked && curMat) {
     // .mat.json path unchanged but the async load may have finished since
     // last frame — check if the resolved material is now available.
     // Skipped for tinted meshes AND for entities with a MaterialInstance prop
     // override: those bind a per-entity CLONE of the resolved material (the Tint
     // block / materialInstanceSystem own the binding), so resetting to the base
     // here would fight that clone every frame.
+    // Skipped for light-masked entities (#136) for the same reason — `applyLightMask` binds a
+    // shared (material, mask) variant afterwards. NOTE the branch ABOVE still runs for them, so
+    // a genuine material-ref change is still picked up and the variant rebuilds from the new
+    // base; only the per-frame re-bind is suppressed.
     const resolved = resolveMaterial(curMat);
     if (resolved) {
       for (const t of targets) {
@@ -1070,6 +1090,36 @@ function syncMaterial(
         t.castShadow = !resolved.transparent; // keep in sync even once the ref settles
       }
     }
+  }
+}
+
+/** Swap an entity's meshes onto the light-mask variant of whatever material they ended up with
+ *  (#136). Runs LAST, after `syncMaterial`, Tint and MaterialInstance have settled the material,
+ *  so it composes with them instead of competing: the variant is derived FROM the material the
+ *  entity actually has, whether that is the shared base, a tint clone, or a per-entity clone.
+ *
+ *  No-op unless masking is active AND the entity's mask sees fewer than every light — so an
+ *  unauthored scene walks this and allocates nothing.
+ *
+ *  The `!==` guard makes it a genuine no-op once applied. That matters more than usual here:
+ *  reassigning `.material` every frame is what `syncRenderablesChurn` exists to catch, and the
+ *  first hand-patched device test of this feature measured NO improvement precisely because
+ *  `syncMaterial` was reassigning the base underneath a per-mesh override every frame. */
+function applyLightMask(obj: THREE.Object3D, mask: number): void {
+  if (!isLightMaskingActive()) return;
+  const factory = getActiveRenderer() as unknown as LightingFactory | null;
+  // No renderer yet (first frames / headless): leave the material alone rather than caching a
+  // variant we cannot build — masking picks up on a later frame.
+  if (!factory?.lighting) return;
+  for (const t of materialTargetsOf(obj)) {
+    const cur = t.material as THREE.Material | THREE.Material[];
+    // Multi-material meshes are not covered yet: each slot would need its own variant, and no
+    // authored content uses one with a mask. Skipped here rather than silently mis-lit.
+    if (Array.isArray(cur) || !cur) continue;
+    // `baseOf` — by frame 2 `t.material` IS last frame's variant, and cloning that would clone
+    // the clone every frame (measured: variants growing 1, 2, 3, … with nothing looking wrong).
+    const variant = getMaskedMaterial(baseOf(cur), mask, factory);
+    if (variant && t.material !== variant) t.material = variant;
   }
 }
 
@@ -2058,6 +2108,25 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
   const { ecsObjects, ecsSprites, ecsMaterials, ecsColors, ecsSizes, ownsGeometry } = state;
   _activeRenderIds.clear();
 
+  // Rendering-layer light masks (#136). Publish the light set BEFORE the renderable loops so
+  // `applyLightMask` can look variants up as each entity's material settles.
+  //
+  // The renderable side is scanned separately rather than folded into the loop below because
+  // masking has to be armed BEFORE the first entity is processed: a renderable whose mask
+  // excludes the default layer must stop being lit by default-layer lights, and discovering
+  // that mid-loop would leave every entity before it lit wrongly for a frame. The scan reads
+  // one number per renderable and is skipped entirely once a masked light has already armed it.
+  let anyRenderableMasked = false;
+  world.query(Renderable3D).updateEach(([rend]) => {
+    if (rend.renderingLayerMask !== DEFAULT_RENDERING_LAYER_MASK) anyRenderableMasked = true;
+  });
+  if (!anyRenderableMasked) {
+    world.query(Renderable3DPrimitive).updateEach(([rend]) => {
+      if (rend.material && rend.renderingLayerMask !== DEFAULT_RENDERING_LAYER_MASK) anyRenderableMasked = true;
+    });
+  }
+  beginLightMaskFrame(_maskedLights, anyRenderableMasked);
+
   // ── GLB meshes (Renderable3D) ─────────────────────────
   world.query(Transform, Renderable3D).updateEach(([tf, rend], entity) => {
     if (!rend.isVisible || deactivatedEntities.has(entity.id())) return;
@@ -2110,7 +2179,8 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       // MaterialInstance (a per-entity material clone driven by materialInstanceSystem) takes
       // precedence over Tint — both would otherwise claim mesh.material and fight each frame.
       const tinted = !instanced && entity.has(Tint);
-      syncMaterial(obj, id, rend.material || '', state, tinted, instanced);
+      const masked = maskNeedsVariant(rend.renderingLayerMask);
+      syncMaterial(obj, id, rend.material || '', state, tinted, instanced, masked);
       // Per-entity Tint: bind a tinted clone of the resolved material. Passing
       // isTinted above stops syncMaterial from re-binding the base each frame, so
       // this block owns the material — the clone cache + `!==` guard then make it
@@ -2125,6 +2195,8 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
           }
         }
       }
+      // Last, so it derives from the settled material (base / tint clone / instance clone).
+      applyLightMask(obj, rend.renderingLayerMask);
     }
 
     if (obj) applyTransform(obj, id, tf, callbacks);
@@ -2181,7 +2253,11 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
 
     // Material override — a .mat.json material GUID (empty = engine default).
     const instanced = isMaterialInstanced(entity);
-    syncMaterial(obj as THREE.Mesh, id, rend.material || '', state, false, instanced);
+    // Masks apply only to explicit-material primitives — see the trait's field comment: a
+    // default-material primitive owns a per-entity material that the colour block below writes
+    // into, and a shared (material, mask) variant would fight it.
+    const masked = !!rend.material && maskNeedsVariant(rend.renderingLayerMask);
+    syncMaterial(obj as THREE.Mesh, id, rend.material || '', state, false, instanced, masked);
 
     // Update color when changed (only applies to the default material, not a .mat.json). A
     // single default-material primitive is NOT a supported MaterialInstance prop base (its
@@ -2194,6 +2270,9 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
         ((obj as THREE.Mesh).material as THREE.MeshStandardMaterial).color.setHex(rend.color);
       }
     }
+    // After the colour block, and only for explicit materials (the colour path above owns the
+    // default-material case outright).
+    if (rend.material) applyLightMask(obj, rend.renderingLayerMask);
 
     applyTransform(obj, id, tf, callbacks);
   });

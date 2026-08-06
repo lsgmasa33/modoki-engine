@@ -154,7 +154,65 @@ export {
   getRendererGateHealth,
   invalidateTexture, getSharedTextureStats, disposeAllSharedTextures,
 } from './loaders/textureResolver';
-export { getGpuFaultState, MAX_REPORTED_GPU_ERRORS, type GpuFaultState } from './core/activeRenderer';
+export {
+  getGpuFaultState, MAX_REPORTED_GPU_ERRORS, type GpuFaultState,
+  // GPU context-loss recovery (#121 P1). `onRendererLost` is how a VIEWPORT subscribes to
+  // "your renderer is dead, build a new one" — this is the only route back, because a lost
+  // three renderer cannot be revived (its `_isDeviceLost` gate is never cleared).
+  onRendererLost, isRecoveryAbandoned, resetRecoveryState,
+  MAX_RECOVERY_ATTEMPTS, RECOVERY_WINDOW_MS, type RendererLostInfo,
+} from './core/activeRenderer';
+// Device capability probe (#121 P0). Safe in this SHARED barrel — it pulls no three/webgpu
+// (gpuDetect probes `navigator.gpu` natively and activeRenderer's three imports are type-only),
+// so a 2D-only game importing this barrel still tree-shakes the 3D stack out.
+export {
+  getDeviceCaps, getDeviceCapsSync, resetDeviceCaps,
+  type DeviceCaps, type CompressedTextureSupport,
+} from './rendering/deviceCaps';
+// Frame-time profiler (#121 P2) — the instrument the per-project 30fps work depends on.
+// Frame TIME, not fps: fps saturates at the vsync ceiling and reports 3ms and 16ms frames
+// identically as 60.
+export {
+  getFrameProfile, resetFrameProfile, BUDGET_30FPS_MS, PROFILE_WINDOW_FRAMES,
+  type FrameProfile, type FrameStat,
+} from './core/frameProfiler';
+export { readPerfProfile } from './debug/perfSources';
+// Profiler markers — the data model the Profiler panel and the MCP surface are both views of.
+// `profileScope` is public API: game code can name its own spans and they rank alongside the
+// engine's. See docs/plans/profiler.md.
+export {
+  profileScope, beginProfilerSample, endProfilerSample, setProfilerEnabled, isProfilerEnabled,
+  getMarkerTree, getMarkerFaults, getMarkerNodeCount, resetProfilerMarkers,
+  MAX_MARKER_DEPTH, MAX_MARKER_NODES,
+  type MarkerSample, type MarkerFaults,
+} from './core/profilerMarkers';
+export {
+  getMarkerAggregate, getMarkerRanking, resetMarkerAggregate, MARKER_WINDOW_FRAMES,
+  type MarkerAggregate, type MarkerStat,
+} from './core/profilerAggregate';
+// Frame capture (P6) — record N frames of trees and step through them. Exported as plain JSON
+// so a capture taken on a phone can be reasoned about without anyone holding the phone.
+export {
+  startCapture, stopCapture, isCapturing, getCapture, clearCapture, exportCapture,
+  getWorstCapturedFrame, MAX_CAPTURE_FRAMES,
+  type CapturedFrame, type CaptureState,
+} from './core/profilerCapture';
+// Counters (P9) — game-authored numeric series charted alongside the engine's timings.
+// setCounter for a LEVEL (persists), countEvent for a RATE (resets each frame).
+export {
+  setCounter, countEvent, getCounters, resetCounters,
+  COUNTER_WINDOW_FRAMES, MAX_COUNTERS,
+  type CounterStat, type CounterReport,
+} from './core/profilerCounters';
+// Quality tiers (#121 P3) — two tiers, measurement as ground truth, allowlist as a shortcut.
+// The allowlist ships EMPTY and `auto` is NOT the default: see the module header, both are
+// deliberate states pending P5 calibration on real hardware, not unfinished work.
+export {
+  resolveTier, evaluateTierChange, freshTierChangeState, tierShadowMapSize,
+  TIER_SETTINGS, TIER_ALLOWLIST, DEFAULT_TIER_SETTING,
+  type QualityTier, type QualityTierSetting, type TierResolution, type TierSource,
+  type TierRenderOverrides, type TierResolveInput, type TierChangeState, type TierDecision,
+} from './rendering/qualityTier';
 export { registerMaterialType, getMaterialBuilder, getRegisteredMaterialTypes, type MaterialBuilder } from './loaders/materialTypes';
 export { registerCustomShader, unregisterCustomShader, getCustomShader, getCustomShaderSchema, getRegisteredShaderNames, type CustomShaderBuild } from './loaders/customShaders';
 export { mergeParamDefaults, coerceParamValue, fetchShaderManifest, type ShaderParam, type ShaderParamType, type ShaderParamSchema, type ShaderManifest } from './loaders/shaderSchema';

@@ -68,6 +68,10 @@ import { resolveDomPointReport, type DomPointSpec } from './domResolve';
 import { resolveEntityPointReport, type EntityPointSpec } from './entityResolve';
 import { chromeHandles } from './chromeHandles';
 import { computeDiagnostics } from './diagnose';
+import {
+  startCapture, stopCapture, clearCapture, getCapture, readPerfProfile,
+  resetProfilerMarkers, resetMarkerAggregate, resetFrameProfile, type MarkerSample,
+} from '@modoki/engine/runtime';
 import { startWatch, readWatch, listWatches, clearWatch, type StartWatchParams } from './watch';
 // Percept S3: resolved world transforms + hierarchy-deactivation set, both computed
 // each frame by transformPropagationSystem. Same module instance the renderers read.
@@ -777,6 +781,67 @@ registerAgentOp('diagnose', () => computeDiagnostics({
   now: Date.now(),
   errorWindowMs: DIAGNOSE_ERROR_WINDOW_MS,
 }));
+
+// ── profiler (profiler plan P4/P6) ────────────────────────────────────────────────────────
+// The capture was HUMAN-ONLY until this: the Profiler panel has a Record button and an agent
+// had no way to start one at all. On a device that is exactly backwards — the agent is the
+// consumer that can be on a phone without anyone holding it, which is the whole reason the
+// marker tree was built as data first. Verified missing by listing the device's op registry.
+//
+// Summary-first, like every other read here: `capture-read` returns the WORST frames by total
+// frame time, not every frame. A 300-frame capture with a full marker tree each is far past any
+// response budget, and "which frames were slow, and what did they spend it on" is the question —
+// the whole capture is still exportable as JSON for the cases that genuinely need it.
+registerAgentOp('profiler', (raw: unknown) => {
+  const params = (raw ?? {}) as Record<string, unknown>;
+  const action = String(params.action ?? 'read');
+  switch (action) {
+    case 'capture-start':
+      startCapture();
+      return { capturing: true };
+    case 'capture-stop':
+      stopCapture();
+      return { capturing: false, frames: getCapture().frames.length };
+    case 'capture-clear':
+      clearCapture();
+      return { cleared: true };
+    case 'capture-read': {
+      const cap = getCapture();
+      const limit = Math.max(1, Math.min(20, Number(params.limit ?? 5)));
+      // Sorted by cost, so the interesting frames come first regardless of when they happened.
+      const worst = [...cap.frames].sort((a, b) => b.frameMs - a.frameMs).slice(0, limit);
+      return {
+        capturing: cap.capturing,
+        frameCount: cap.frames.length,
+        stoppedByCap: cap.stoppedByCap,
+        worst: worst.map((f) => ({
+          index: f.index, atMs: +f.atMs.toFixed(1), frameMs: +f.frameMs.toFixed(1),
+          cpuMs: +f.cpuMs.toFixed(1),
+          // Only the costly branches — a full tree per frame is what blows the budget.
+          top: flattenTree(f.tree).sort((a, b) => b.selfMs - a.selfMs).slice(0, 6),
+        })),
+      };
+    }
+    case 'reset':
+      resetProfilerMarkers();
+      resetMarkerAggregate();
+      resetFrameProfile();
+      clearCapture();
+      return { reset: true };
+    case 'read':
+    default:
+      return readPerfProfile({ markers: Number(params.markers ?? 12) });
+  }
+});
+
+/** Flatten a captured tree to `{path, selfMs, calls}` rows so one frame can be ranked the same
+ *  way the live aggregate is — the question ("what owned this frame?") is identical. */
+function flattenTree(node: MarkerSample, parent = ''): Array<{ path: string; selfMs: number; calls: number }> {
+  const path = parent ? `${parent}/${node.name}` : node.name;
+  const rows = [{ path, selfMs: +node.selfMs.toFixed(2), calls: node.calls }];
+  for (const c of node.children) rows.push(...flattenTree(c, path));
+  return rows;
+}
 
 // ── Percept Watch: standing numeric time-series (how a NUMBER moved over time) ──
 registerAgentOp('watch-start', (params) => startWatch((params ?? {}) as StartWatchParams));

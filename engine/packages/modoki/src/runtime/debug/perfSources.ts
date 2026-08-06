@@ -4,6 +4,10 @@
 import { getCurrentFPS } from '../rendering/frameDriver';
 import { getActiveRenderer } from '../loaders/textureResolver';
 import { getAllEntities } from '../core/ecs/entityUtils';
+import { getFrameProfile } from '../core/frameProfiler';
+import { isProfilerEnabled, getMarkerFaults, type MarkerFaults } from '../core/profilerMarkers';
+import { getMarkerAggregate, type MarkerStat } from '../core/profilerAggregate';
+import { getCounters, type CounterStat } from '../core/profilerCounters';
 
 export const MB = 1024 * 1024;
 
@@ -59,4 +63,74 @@ export function readRenderer(): RendererStats | null {
 
 export function getEntityCount(): number {
   return getAllEntities().length;
+}
+
+/** One read answering "is this device coping, and if not, with what?" (#121 P2).
+ *
+ *  Joins the three sources that have to be read TOGETHER to be interpretable — timings, draw
+ *  load, and memory. Read apart they mislead: 83 ms frames say a device is struggling but not
+ *  why; 237 draw calls is only alarming next to the CPU cost of submitting them; and a texture
+ *  figure on its own already caused one fix to ship against the wrong bottleneck (see
+ *  `core/frameProfiler`'s header).
+ *
+ *  Renderer/memory fields are null when unavailable — no renderer mounted yet, or a non-Chromium
+ *  engine with no `performance.memory` (i.e. all of iOS). Absent, never faked. */
+export function readPerfProfile(opts: { markers?: number } = {}): {
+  frame: ReturnType<typeof getFrameProfile>;
+  renderer: RendererStats | null;
+  memoryMB: { used: number; limit: number } | null;
+  entities: number;
+  markers?: {
+    framesRecorded: number;
+    /** Worst `n` by median SELF time — "what do I fix?". */
+    top: MarkerStat[];
+    /** Present only when non-zero: an incomplete tree must announce itself, since a silently
+     *  truncated profile reads exactly like a complete one. */
+    faults?: MarkerFaults;
+    truncated?: boolean;
+  };
+  /** Game-authored counters (P9). Omitted when none are registered — an empty array would
+   *  imply a game that declared none, which is the same thing but reads as a finding. */
+  counters?: CounterStat[];
+} {
+  const mem = readMemory();
+  return {
+    frame: getFrameProfile(),
+    renderer: readRenderer(),
+    memoryMB: mem
+      ? { used: +(mem.usedJSHeapSize / MB).toFixed(1), limit: +(mem.jsHeapSizeLimit / MB).toFixed(1) }
+      : null,
+    entities: getEntityCount(),
+    ...markerFields(opts.markers ?? DEFAULT_MARKER_ROWS),
+    ...counterFields(),
+  };
+}
+
+function counterFields(): { counters?: CounterStat[] } {
+  if (!isProfilerEnabled()) return {};
+  const { counters } = getCounters();
+  return counters.length ? { counters } : {};
+}
+
+/** Rows returned before any filter is applied. **Summary-first**
+ *  ([docs/debug-tools-mcp.md](../../../../../docs/debug-tools-mcp.md)): the full marker tree in
+ *  every response would blow the budget on a payload nobody read, and the worst handful by self
+ *  time is what answers the question anyway. Ask `getMarkerAggregate()` for the whole thing. */
+export const DEFAULT_MARKER_ROWS = 8;
+
+/** Omitted ENTIRELY when profiling is off, rather than reported as an empty ranking — "no
+ *  markers recorded" and "markers not running" are different facts and must not look alike. */
+function markerFields(n: number): { markers?: ReturnType<typeof readPerfProfile>['markers'] } {
+  if (!isProfilerEnabled()) return {};
+  const agg = getMarkerAggregate();
+  const faults = getMarkerFaults();
+  const anyFault = faults.unbalancedEnds > 0 || faults.depthTruncated > 0 || faults.nodeCapHit > 0;
+  return {
+    markers: {
+      framesRecorded: agg.framesRecorded,
+      top: agg.ranking.slice(0, n),
+      ...(anyFault ? { faults } : {}),
+      ...(agg.truncated ? { truncated: true } : {}),
+    },
+  };
 }

@@ -10,6 +10,7 @@
 import {
   getAllEntities, getAllTraits, readTraitData, readTraitDataFull,
   REF_FIELDS_BY_TRAIT, isGuid, isExternalUrl, isInternalAssetPath, resolveGuidToPath,
+  getDeviceCaps, getDeviceCapsSync, readPerfProfile,
 } from '@modoki/engine/runtime';
 import { computeLayoutBounds } from './layoutDump';
 
@@ -94,8 +95,25 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
   // issues detected" (the contradiction the audit flagged). off-screen stays soft + unlisted. (C7 re-audit.)
   const ok = refIssues.length === 0 && nan.length === 0 && !cameraMissing && consoleErrors.length === 0;
   const zeroScaleNote = zeroScale.length ? `${zeroScale.length} zero-scale (invisible) entit(ies)` : '';
+  // ── Device capabilities (#121 P0) ──
+  // What hardware this is and what it can do — so "why is it slow / black on that phone?" is
+  // answerable as DATA rather than by asking the human to read a device log. Read from the
+  // cache: the probe is async (a WebGPU adapter request + a native plugin call) and this op is
+  // sync, so the FIRST diagnose after boot omits it and arms the probe for every later call.
+  // Deliberately fire-and-forget rather than coupling this to renderer bring-up.
+  const deviceCaps = getDeviceCapsSync();
+  if (!deviceCaps) void getDeviceCaps().catch(() => { /* a probe failure must never fail diagnose */ });
+
+  // ── Performance (#121 P2) ──
+  // ALWAYS present, unlike the fault channels above, because "is it fast enough?" has no
+  // healthy-means-silent answer — the 30fps target is a number that must be readable at any
+  // time, not only once something has already gone wrong.
+  const perf = readPerfProfile();
+
   return {
     ok,
+    ...(deviceCaps ? { deviceCaps } : {}),
+    perf,
     refs: { issues: refIssues, count: refIssues.length },
     transforms: { nan, zeroScale },
     camera: { count: cameraCount, ok: !cameraMissing, needed: has3DContent },

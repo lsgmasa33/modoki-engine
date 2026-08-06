@@ -32,4 +32,13 @@ export const Light = trait({
   // Editor-only: outline the shadow-camera coverage box in the SceneView so you
   // can see whether the scene fits inside `shadowCameraSize` (runtime ignores it).
   showShadowFrustum: false as boolean,
+  // Rendering-layer mask (#136) — this light affects a renderer only when their masks
+  // INTERSECT (bitwise AND non-zero). Defaults to layer 0 on both sides, so an unauthored
+  // scene has every light hitting every renderer and the whole path stays inert. Use it to
+  // give an object its own key light instead of paying for every light in the scene: forward
+  // shading evaluates ALL lights per fragment, and the cost is superlinear on mobile (measured
+  // 689 ms → 98 ms on a Galaxy A23 by restricting materials to 2 lights). Note a light kept by
+  // even ONE renderer still renders its full shadow map. See runtime/rendering/
+  // lightMaskVariants.ts.
+  renderingLayerMask: 1 as number,
 });

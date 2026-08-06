@@ -7,6 +7,12 @@ export const Renderable3D = trait({
    *  on/off (`EntityAttributes.isActive`, which also cascades to children); both must be
    *  true to draw. */
   isVisible: true as boolean,
+  /** Rendering-layer mask (#136) — a light lights this renderer only when their masks
+   *  INTERSECT (bitwise AND non-zero). Pairs with `Light.renderingLayerMask`; both default to
+   *  layer 0, so masks are opt-in and an unauthored scene renders identically. Set it to give
+   *  this object its own key light rather than paying for every light in the scene — forward
+   *  shading evaluates ALL lights per fragment. See runtime/rendering/lightMaskVariants.ts. */
+  renderingLayerMask: 1 as number,
 });
 
 /** Mesh asset file format (*.mesh.json). `model` and `material` accept either

@@ -1,8 +1,8 @@
 /** GPU fault recording in `runtime/core/activeRenderer.ts` — WebGPU device.lost, WebGPU
  *  uncapturederror, and the WebGL `webglcontextlost` fallback. This is the CAUSE channel that
  *  used to not exist at all: a lost/hung GPU device made the frame loop stall, and the stall
- *  watchdog reported only the symptom ("wedged, relaunch") with no idea why. Log-only — no
- *  recovery attempt is exercised or expected here.
+ *  watchdog reported only the symptom ("wedged, relaunch") with no idea why. Recovery policy
+ *  (#121 P1) is exercised in the third describe block below.
  *
  *  Every test does `vi.resetModules()` + a fresh dynamic import so the module-level
  *  `gpuFaultState`/`attachedRenderer` singletons start clean — this file's own state would
@@ -35,13 +35,18 @@ function makeRenderer(device?: ReturnType<typeof makeGpuDevice>, domElement?: un
 }
 
 let errSpy: ReturnType<typeof vi.spyOn>;
+/** A RECOVERABLE loss logs `warn`, not `error` — the severity now carries meaning: `warn` is
+ *  "rebuilding, expect a hitch", `error` is "recovery abandoned, nothing will render". */
+let warnSpy: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {
   errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
 
 afterEach(() => {
   errSpy.mockRestore();
+  warnSpy.mockRestore();
 });
 
 describe('activeRenderer GPU fault channel', () => {
@@ -62,6 +67,7 @@ describe('activeRenderer GPU fault channel', () => {
 
     expect(getGpuFaultState()).toEqual({
       deviceLost: true, reason: 'unknown', message: 'driver reset', uncapturedErrors: 0,
+      losses: 1, unrecoverable: false,
     });
   });
 
@@ -113,7 +119,10 @@ describe('activeRenderer GPU fault channel', () => {
 
     handler?.();
 
-    expect(getGpuFaultState()).toEqual({ deviceLost: true, reason: 'webglcontextlost', uncapturedErrors: 0 });
+    expect(getGpuFaultState()).toEqual({
+      deviceLost: true, reason: 'webglcontextlost', uncapturedErrors: 0,
+      losses: 1, unrecoverable: false,
+    });
   });
 
   it('NEVER throws for a bare {} renderer (no backend, no device, no domElement)', async () => {
@@ -185,6 +194,188 @@ describe('activeRenderer GPU fault channel — false-positive filters', () => {
     await flush();
 
     expect(getGpuFaultState()).toMatchObject({ deviceLost: true, reason: 'unknown' });
-    expect(errSpy).toHaveBeenCalled();
+    // A first loss is RECOVERABLE, so it warns rather than errors. The filters are still not a
+    // mute button — the point of this test — but the severity moved with the behaviour.
+    expect(warnSpy).toHaveBeenCalled();
+  });
+});
+
+/**
+ * RECOVERY POLICY (#121 P1). A lost context used to be permanent — measured on a Huawei Y6 2019,
+ * where the WebGL2 context died ~4s into boot and the game stayed black for the process lifetime.
+ *
+ * This module cannot rebuild a renderer (it has no container and no render loop) and three cannot
+ * revive one (`_isDeviceLost` gates `render()` and is never cleared). So the contract under test
+ * is narrow and exact: decide whether a loss is worth recovering from, and ASK. The rebuild
+ * itself belongs to the viewport that owns the renderer.
+ */
+describe('activeRenderer recovery policy', () => {
+  const load = async () => {
+    vi.resetModules();
+    return await import('../../src/runtime/core/activeRenderer');
+  };
+
+  it('asks a subscriber to rebuild on the first loss, with the backend that died', async () => {
+    const { setActiveRendererHandle, onRendererLost } = await load();
+    const seen: unknown[] = [];
+    onRendererLost((info) => seen.push(info));
+
+    const device = makeGpuDevice();
+    setActiveRendererHandle(makeRenderer(device) as never);
+    device.resolveLost({ reason: 'unknown', message: 'driver reset' });
+    await flush();
+
+    expect(seen).toEqual([{ api: 'WebGPU', reason: 'unknown', message: 'driver reset', attempt: 1 }]);
+  });
+
+  it('reports a WebGL context loss as api:WebGL — the path a low-end phone actually takes', async () => {
+    const { setActiveRendererHandle, onRendererLost } = await load();
+    const seen: Array<{ api: string }> = [];
+    onRendererLost((info) => seen.push(info));
+
+    let handler: (() => void) | undefined;
+    const domElement = { addEventListener: vi.fn((t: string, cb: () => void) => { if (t === 'webglcontextlost') handler = cb; }) };
+    setActiveRendererHandle(makeRenderer(undefined, domElement) as never);
+    handler?.();
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0].api).toBe('WebGL');
+  });
+
+  it('COUNTS LOSSES ACROSS RENDERER REPLACEMENTS — the whole basis of loop detection', async () => {
+    // The subtle one. Every recovery installs a NEW renderer, and `attachGpuFaultListeners`
+    // deliberately clears `gpuFaultState` so the new renderer reports cleanly. If the loss
+    // HISTORY were cleared on the same path, a hard rebuild loop would present as an endless
+    // series of "first" losses and the budget would never trip. The history must outlive the
+    // renderer; the reported state must not.
+    const { setActiveRendererHandle, onRendererLost, getGpuFaultState } = await load();
+    const attempts: number[] = [];
+    onRendererLost((info) => attempts.push(info.attempt));
+
+    const a = makeGpuDevice();
+    setActiveRendererHandle(makeRenderer(a) as never);
+    a.resolveLost({ reason: 'unknown' });
+    await flush();
+
+    // The rebuild the listener would have performed: a fresh renderer registers.
+    const b = makeGpuDevice();
+    setActiveRendererHandle(makeRenderer(b) as never);
+    expect(getGpuFaultState()).toBeNull();      // reporting state IS reset for the new renderer
+    b.resolveLost({ reason: 'unknown' });
+    await flush();
+
+    expect(attempts).toEqual([1, 2]);            // ...but the loss history is NOT
+  });
+
+  it('abandons recovery past MAX_RECOVERY_ATTEMPTS and stops asking', async () => {
+    const { setActiveRendererHandle, onRendererLost, isRecoveryAbandoned, getGpuFaultState, MAX_RECOVERY_ATTEMPTS } = await load();
+    const attempts: number[] = [];
+    onRendererLost((info) => attempts.push(info.attempt));
+
+    for (let i = 0; i < MAX_RECOVERY_ATTEMPTS + 2; i++) {
+      const d = makeGpuDevice();
+      setActiveRendererHandle(makeRenderer(d) as never);
+      d.resolveLost({ reason: 'unknown' });
+      await flush();
+    }
+
+    // Asked exactly up to the budget, then went quiet — no rebuild request on the 4th or 5th.
+    expect(attempts).toEqual([1, 2, 3]);
+    expect(isRecoveryAbandoned()).toBe(true);
+    expect(getGpuFaultState()).toMatchObject({ unrecoverable: true, deviceLost: true });
+    expect(errSpy).toHaveBeenCalled(); // giving up is an ERROR, unlike a recoverable loss
+  });
+
+  it('a loss OUTSIDE the window does not count toward the budget', async () => {
+    const { setActiveRendererHandle, onRendererLost, RECOVERY_WINDOW_MS } = await load();
+    const { setManualNow, advanceManual } = await import('../../src/runtime/core/clock');
+    setManualNow(0);
+    const attempts: number[] = [];
+    onRendererLost((info) => attempts.push(info.attempt));
+
+    const a = makeGpuDevice();
+    setActiveRendererHandle(makeRenderer(a) as never);
+    a.resolveLost({ reason: 'unknown' });
+    await flush();
+
+    // Two unrelated transient faults an hour apart are not a loop; the window must forget.
+    advanceManual(RECOVERY_WINDOW_MS + 1);
+    const b = makeGpuDevice();
+    setActiveRendererHandle(makeRenderer(b) as never);
+    b.resolveLost({ reason: 'unknown' });
+    await flush();
+
+    expect(attempts).toEqual([1, 1]);
+  });
+
+  it('a listener that THROWS cannot stop the other subscribers from rebuilding', async () => {
+    const { setActiveRendererHandle, onRendererLost } = await load();
+    const survived: number[] = [];
+    onRendererLost(() => { throw new Error('bad subscriber'); });
+    onRendererLost((info) => survived.push(info.attempt));
+
+    const d = makeGpuDevice();
+    setActiveRendererHandle(makeRenderer(d) as never);
+    d.resolveLost({ reason: 'unknown' });
+    await flush();
+
+    expect(survived).toEqual([1]);
+  });
+
+  it('unsubscribing stops delivery (a remounted viewport must not be asked twice)', async () => {
+    const { setActiveRendererHandle, onRendererLost } = await load();
+    const seen: number[] = [];
+    const off = onRendererLost((info) => seen.push(info.attempt));
+    off();
+
+    const d = makeGpuDevice();
+    setActiveRendererHandle(makeRenderer(d) as never);
+    d.resolveLost({ reason: 'unknown' });
+    await flush();
+
+    expect(seen).toEqual([]);
+  });
+
+  it('a SUPERSEDED renderer\'s canvas losing its context does not request a rebuild', async () => {
+    // The WebGL twin of the existing device.lost false-positive filter. A replaced renderer's
+    // canvas is torn down as a matter of course, and that must not read as a live fault — this
+    // module's whole credibility problem was crying wolf on orderly teardown.
+    const { setActiveRendererHandle, onRendererLost, getGpuFaultState } = await load();
+    const seen: unknown[] = [];
+    onRendererLost((info) => seen.push(info));
+
+    let oldHandler: (() => void) | undefined;
+    const oldEl = { addEventListener: vi.fn((t: string, cb: () => void) => { if (t === 'webglcontextlost') oldHandler = cb; }) };
+    setActiveRendererHandle(makeRenderer(undefined, oldEl) as never);
+    setActiveRendererHandle(makeRenderer(undefined, { addEventListener: vi.fn() }) as never);
+
+    oldHandler?.(); // the corpse's canvas fires
+
+    expect(seen).toEqual([]);
+    expect(getGpuFaultState()).toBeNull();
+  });
+
+  it('resetRecoveryState() clears the history and re-enables recovery', async () => {
+    const { setActiveRendererHandle, onRendererLost, resetRecoveryState, isRecoveryAbandoned, MAX_RECOVERY_ATTEMPTS } = await load();
+    const attempts: number[] = [];
+    onRendererLost((info) => attempts.push(info.attempt));
+
+    for (let i = 0; i < MAX_RECOVERY_ATTEMPTS + 1; i++) {
+      const d = makeGpuDevice();
+      setActiveRendererHandle(makeRenderer(d) as never);
+      d.resolveLost({ reason: 'unknown' });
+      await flush();
+    }
+    expect(isRecoveryAbandoned()).toBe(true);
+
+    resetRecoveryState();
+    expect(isRecoveryAbandoned()).toBe(false);
+
+    const d = makeGpuDevice();
+    setActiveRendererHandle(makeRenderer(d) as never);
+    d.resolveLost({ reason: 'unknown' });
+    await flush();
+
+    expect(attempts.at(-1)).toBe(1); // counting starts over
   });
 });

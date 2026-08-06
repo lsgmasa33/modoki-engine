@@ -18,6 +18,7 @@ import SceneView from './panels/SceneView';
 import Hierarchy from './panels/Hierarchy';
 import Inspector from './panels/Inspector';
 import Console from './panels/Console';
+import Profiler from './panels/Profiler';
 import Assets from './panels/Assets';
 import ParticleEditor from './panels/ParticleEditor';
 import AnimationEditor from './panels/AnimationEditor';
@@ -118,6 +119,7 @@ const PANELS: Record<string, React.ComponentType> = {
   'spriteanim-editor': SpriteAnimEditor,
   'skin-editor': SkinEditor,
   ai: AIPanel,
+  profiler: Profiler,
   // Game-specific panels injected via createEditor()
   ...Object.fromEntries(getCustomPanels().map(p => [p.id, p.component])),
 };
@@ -125,7 +127,7 @@ const PANELS: Record<string, React.ComponentType> = {
 // Human-readable labels for the Window menu (built-in name, else custom panel name).
 const PANEL_LABELS: Record<string, string> = {
   scene: 'Scene', game: 'Game', hierarchy: 'Hierarchy', inspector: 'Inspector',
-  console: 'Console', assets: 'Assets', 'particle-editor': 'Particle Editor', 'animation-editor': 'Animation', 'timeline-editor': 'Timeline', 'spriteanim-editor': 'Sprite Animation', 'skin-editor': '2D Skin', ai: 'AI',
+  console: 'Console', assets: 'Assets', 'particle-editor': 'Particle Editor', 'animation-editor': 'Animation', 'timeline-editor': 'Timeline', 'spriteanim-editor': 'Sprite Animation', 'skin-editor': '2D Skin', ai: 'AI', profiler: 'Profiler',
 };
 const panelLabel = (id: string): string =>
   PANEL_LABELS[id] ?? getCustomPanels().find((p) => p.id === id)?.name ?? id;

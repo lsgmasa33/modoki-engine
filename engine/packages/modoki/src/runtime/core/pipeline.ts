@@ -4,6 +4,7 @@
 
 import type { World } from 'koota';
 import { isSimRunning } from './playState';
+import { beginProfilerSample, endProfilerSample } from './profilerMarkers';
 import { registerUIAction, unregisterUIAction, type UIActionHandler, type UIActionDef } from './actionRegistry';
 import { beginSystemTick, endSystemTick } from './systemTick';
 
@@ -131,7 +132,22 @@ export function runPipeline(world: World) {
   try {
     for (const sys of systems) {
       if (!simRunning && sys.priority < SYSTEM_PRIORITY.TRANSFORM) continue;
-      sys.fn(world);
+      // Profiler-plan P2 — per-system attribution, the highest-resolution win available for the
+      // least work: the systems are already named and priority-ordered, so the profiler gets a
+      // real breakdown of the ECS tier for free.
+      //
+      // begin/end + try/finally rather than `profileScope(sys.name, () => sys.fn(world))`: the
+      // closure form would allocate one closure PER SYSTEM PER FRAME, which is exactly the
+      // instrument-distorts-the-measurement cost the plan's overhead rule forbids. try/finally
+      // allocates nothing and still survives a throwing system (which propagates to frameDriver's
+      // per-callback catch, so it is a normal path, not a theoretical one). It nests INSIDE the
+      // system-tick scope so a throwing system unwinds both, in order.
+      beginProfilerSample(sys.name);
+      try {
+        sys.fn(world);
+      } finally {
+        endProfilerSample();
+      }
     }
   } finally {
     endSystemTick();
