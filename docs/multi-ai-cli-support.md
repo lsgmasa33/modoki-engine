@@ -82,14 +82,21 @@ writes a correct `.mcp.json` into the open project. There is no equivalent "Conn
 "Connect Codex" / "Connect Antigravity" — a user has to hand-write `.cursor/mcp.json` /
 `.codex/config.toml` / `mcp_config.json` themselves, by copying `.mcp.json`'s server definition.
 
-This was confirmed by a real shakedown test: `games/agy` (Antigravity CLI) built a complete game
-using `AGENTS.md` alone with no MCP config at all — fine, since Antigravity doesn't need MCP to be
-useful. `games/codex` (Codex CLI) had a hand-authored `.codex/config.toml` mirroring `.mcp.json`'s
-absolute-path pattern correctly (schema verified against Codex's current config reference), yet
-"struggled to connect" — the likely cause is **Codex's per-project trust prompt**: it will not
-activate a project-scoped `.codex/config.toml`'s MCP servers until the human explicitly trusts
-that directory, and skips them silently (no error) until then. Both projects were also confirmed to
-make zero changes outside their own `games/<id>` folder — the self-containment guard held.
+This was confirmed by a real shakedown test using two throwaway scaffolds, `games/agy`
+(Antigravity CLI) and `games/codex` (Codex CLI). **Both have since been deleted** — they were
+shakedown projects, not games we keep — so the findings below are the durable record; the
+projects themselves are in git history (added in `1be8ac38`, removed 2026-08-05) if either is
+ever wanted back.
+
+- **Antigravity** built a complete game from `AGENTS.md` alone with no MCP config at all — fine,
+  since Antigravity doesn't need MCP to be useful.
+- **Codex** had a hand-authored `.codex/config.toml` mirroring `.mcp.json`'s absolute-path pattern
+  correctly (schema verified against Codex's current config reference), yet "struggled to
+  connect" — the likely cause is **Codex's per-project trust prompt**: it will not activate a
+  project-scoped `.codex/config.toml`'s MCP servers until the human explicitly trusts that
+  directory, and skips them silently (no error) until then.
+- Both projects made **zero changes outside their own `games/<id>` folder** — the
+  self-containment guard held.
 
 Decision (2026-07-25): **documentation only for now** — the public guide
 (`site/docs/guide/ai-assistants.md`) spells out the manual per-project MCP setup and the Codex

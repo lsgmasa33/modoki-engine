@@ -115,17 +115,33 @@ function containing(set: Map<ContainerLike, number>, target: unknown): Container
  *     contains → BLOCKED (the requirement that UI never leaks into canvas/Pixi/3D);
  *   - chrome deliberately registered INSIDE a passthrough surface → the blocker is nearer → blocked. */
 export function isPointerBlocked(target: unknown): boolean {
-  if (target == null) return false;
+  return nearestPointerBlocker(target) !== null;
+}
+
+/** WHICH root blocked the press — the innermost blocking registration, or null when the press is
+ *  not blocked. `isPointerBlocked` is defined in terms of this rather than beside it: the
+ *  nearest-ancestor rule above is subtle enough that two implementations of it would drift, and a
+ *  drifted copy here would attribute a block to the wrong element while the real decision stayed
+ *  correct — a wrong answer stated authoritatively, which is worse than no answer at all.
+ *
+ *  Added for the input watch (#134): `input.pointer.blocked` records the POINT but not the culprit,
+ *  so a swallowed press told you where the finger was and nothing about what ate it. */
+export function nearestPointerBlocker(target: unknown): ContainerLike | null {
+  if (target == null) return null;
   const blocking = containing(blockers, target);
-  if (blocking.length === 0) return false;
+  if (blocking.length === 0) return null;
   for (const surface of containing(passthrough, target)) {
     // This surface only wins if EVERY blocker that contains the target also contains the surface —
     // i.e. the surface is strictly nearer than all of them. A blocker nested inside the surface
     // (which `surface.contains(b)` would report, and `b.contains(surface)` would not) keeps the
     // press blocked.
-    if (blocking.every((b) => b.contains(surface))) return false;
+    if (blocking.every((b) => b.contains(surface))) return null;
   }
-  return true;
+  // The innermost blocker is the one every other blocker contains — that is the registration whose
+  // decision actually stands, and the one a reader wants named.
+  let inner = blocking[0];
+  for (const b of blocking) if (inner.contains(b)) inner = b;
+  return inner;
 }
 
 /** Test/teardown escape hatch — drop every registration without calling disposers. */

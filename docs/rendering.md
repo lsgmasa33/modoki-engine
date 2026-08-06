@@ -401,8 +401,18 @@ All 3D post-processing runs through **one composable chain**, `rendering/postfx/
 Effects are **not** mutually exclusive: `NPRPostFX` + `BloomPostFX` + `VignettePostFX` +
 `DepthOfFieldPostFX` + `AmbientOcclusionPostFX` can all be on at once. (Before the stack landed,
 `Scene3D` had two exclusive branches and "NPR wins, bloom is skipped" — that is gone.)
-**WebGPU-only**; on a WebGL2 fallback every effect is skipped and the render falls through to a
-plain `renderer.render`.
+**Runs on WebGL2 as well as WebGPU — every stage except FXAA.** (This doc long claimed the
+opposite: "WebGPU-only; on a WebGL2 fallback every effect is skipped". That was wrong, and an
+iPhone 8 on iOS 16.7 — no WebGPU whatsoever — visibly rendering the `postfx-demo` stack is what
+caught it.) `createRenderer` (`scene3DSync.ts`) ALWAYS constructs a `WebGPURenderer`
+(`preferWebGPU` is vestigial — `void preferWebGPU`), and three falls back to a **WebGL2 backend
+inside that same class**. The stack's gate is `isWebGPURenderer === true` (`Scene3D.tsx`), which
+stays true on that fallback, so the chain builds and renders normally. The ONE stage dropped is
+**FXAA** — `planFxaaEnabled` returns false when `isWebGLBackend` (`postfx/stackPlan.ts`), since
+it's a raw-WGSL `wgslFn` the WebGL backend's GLSL parser cannot compile.
+
+⚠️ **`isWebGPU` names the renderer CLASS, not the API in use.** To branch on the actual backend,
+read `renderer.backend.isWebGLBackend` — that is the distinction the wrong claim above rested on.
 
 ```
 scenePass  ── MRT: { output, [normal], [lineColor] }   + depth (free)
@@ -592,8 +602,8 @@ The reload is now decided **by path on the dev server**: `isShaderGraphFile` (`e
 ## Bloom Post-Process
 
 A reusable whole-scene HDR bloom, added for `demos/particle-demo`'s dark-VFX showreel but not
-specific to it — any 3D scene can add the trait. **WebGPU-only**, off by default, toggled by the
-`BloomPostFX` ECS trait. It is a **stage of the post-FX stack**, so it composes with NPR,
+specific to it — any 3D scene can add the trait. Off by default, toggled by the
+`BloomPostFX` ECS trait (and it renders on the WebGL2 backend too — see the stack's gate above). It is a **stage of the post-FX stack**, so it composes with NPR,
 vignette and DOF rather than being an alternative to them.
 
 ### Control trait — `runtime/traits/BloomPostFX.ts`
@@ -622,8 +632,9 @@ bloom still sees them.
 
 - **NPR + bloom compose.** Bloom operates on the working-space stylized color, so a stylized scene
   gets a real glow. (This was the exclusivity the post-FX stack existed to remove.)
-- **WebGL fallback**: gated on `isWebGPU`; on a WebGL2 fallback the render falls through to the
-  plain path (no bloom, no error).
+- **WebGL fallback**: gated on `isWebGPU`, which is the renderer CLASS and stays true on the
+  WebGL2 backend — so bloom still renders there. (This bullet used to say the render "falls
+  through to the plain path (no bloom, no error)". Wrong — see the stack's gate above.)
 - Same shader-HMR / prewarm-race caveats as NPR (see above) — TSL bakes into WGSL, so the stack is
   disposed on camera-projection swap and never hot-reloaded in place; editing anything under
   `postfx/` forces a full reload from the dev server.
@@ -632,7 +643,8 @@ bloom still sees them.
 
 Two more stack stages, each with its own singleton trait
 (`VignettePostFX` `{enabled, intensity, smoothness}`, `DepthOfFieldPostFX`
-`{enabled, focusDistance, focalLength, bokehScale}`), both WebGPU-only and off by default.
+`{enabled, focusDistance, focalLength, bokehScale}`), both off by default and, like every stack
+stage bar FXAA, working on the WebGL2 backend too (see the stack's gate above).
 
 - **Vignette** uses `vignette()` from `three/examples/jsm/tsl/display/CRT.js`, which is a bare TSL
   `Fn`, **not** a Node class — so the stage must pass `uniform()` nodes for `intensity`/
@@ -644,7 +656,8 @@ Two more stack stages, each with its own singleton trait
 
 ## Ambient Occlusion (GTAO)
 
-`AmbientOcclusionPostFX` `{enabled, radius, intensity}`, WebGPU-only, off by default. Uses
+`AmbientOcclusionPostFX` `{enabled, radius, intensity}`, off by default, WebGL2 backend included
+(see the stack's gate above). Uses
 `ao(depthNode, normalNode, camera)` from `three/examples/jsm/tsl/display/GTAONode.js`, which
 returns a `GTAONode`; its output texture's `.r` (raw 0..1 occlusion) is lerped toward `1` by
 `intensity` (GTAO has no strength knob of its own) and multiplied into the incoming color.

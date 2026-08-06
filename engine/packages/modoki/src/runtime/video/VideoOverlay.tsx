@@ -15,6 +15,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { VideoPlayer } from '../traits/VideoPlayer';
+import { RenderableUI } from '../traits/RenderableUI';
 import { EntityAttributes } from '../core/traits/EntityAttributes';
 import { peekCurrentWorld } from '../core/ecs/world';
 import { videoElementFor } from './videoSystem';
@@ -47,6 +48,12 @@ function useActiveCutscene(): ActiveClip | null {
         for (const e of world.query(VideoPlayer)) {
           const vp = e.get(VideoPlayer);
           if (!vp || vp.timeMode !== 'presentation' || !vp.playing) continue;
+          // A UI entity already HAS a surface — `UIVideoMount` puts the picture in its
+          // own box. Claiming it here too would adopt the one shared element away from
+          // that node and slam it fullscreen over the game, which is the opposite of
+          // what a video authored as scenery is for. So `presentation` means "fullscreen
+          // cutscene" only for an entity with no surface trait of its own.
+          if (e.has(RenderableUI)) continue;
           // First wins — two fullscreen cutscenes at once is meaningless, so they do
           // not stack.
           found = { id: e.id(), guid: e.get(EntityAttributes)?.guid, clip: vp.clip };

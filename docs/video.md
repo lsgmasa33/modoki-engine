@@ -1,7 +1,8 @@
 # Video playback
 
-Play an H.264/mp4 clip on a 3D surface, a 2D sprite, or as a fullscreen cutscene — shipped inside
-the game or streamed/downloaded from the web with the downloaded footprint actively managed.
+Play an H.264/mp4 clip on a 3D surface, a 2D sprite, inside a UI element, or as a fullscreen
+cutscene — shipped inside the game or streamed/downloaded from the web with the downloaded
+footprint actively managed.
 
 ## What it is
 
@@ -18,11 +19,37 @@ entity's other traits**, not by a field on `VideoPlayer`:
 |---|---|
 | `Renderable3D` / `Renderable3DPrimitive` | a `THREE.VideoTexture` on the material's `map` — a screen in the world |
 | `Renderable2D` with `sprite` = the video GUID | the texture of a PixiJS sprite |
-| `timeMode: 'presentation'` | a fullscreen DOM overlay above the game (`VideoOverlay`) |
+| `RenderableUI` / `UIElement` | the element mounted **inside that UI node's box** (`UIVideoMount`), cropped by `imageMode` |
+| `timeMode: 'presentation'` **and no surface trait of its own** | a fullscreen DOM overlay above the game (`VideoOverlay`) |
 
-All three wrap the **same `HTMLVideoElement`** — one decoder, one audio path, one set of playback
+The UI row is what makes video usable as **scenery** — a full-bleed animated backdrop *behind*
+the game, laid out and stacked by the UI tree like any other node — as opposed to the cutscene
+overlay, which covers everything and swallows input. A UI entity is therefore skipped by
+`VideoOverlay` even at `timeMode: 'presentation'`: it already has a surface, and claiming it
+twice would adopt the one shared element away from its own box.
+
+An `imageSrc` authored on the same UI element acts as the **poster**: video only runs while the
+game is Playing, so the still is what shows in a stopped editor, before the first frame decodes,
+and if the clip fails to load. Author a frame *from the clip* and the transition is invisible.
+
+⚠️ **The UI node must be a plain `div`.** `UIElement.elementType` of `input` or `range` renders a
+VOID element, which cannot carry the video layer — so the clip decodes, its audio plays on the bus,
+and no picture ever appears. `UINode` dev-warns on that combination (the same class as the
+`Canvas2D`-plus-`elementType` warning beside it); put the `VideoPlayer` on its own child entity.
+
+All of them wrap the **same `HTMLVideoElement`** — one decoder, one audio path, one set of playback
 state. Two viewports showing the same clip get two GPU textures over that one decoder, which is
 what the per-surface binding tables exist to make possible.
+
+⚠️ **The DOM surfaces are the exception: they cannot be duplicated.** A texture surface COPIES
+frames off the element, so any number of viewports can show the clip; a DOM `<video>` IS the
+element, and a DOM node exists in exactly one place. So with the editor's Game and Scene panels
+both open, only ONE of them shows a UI-mounted clip. `UIVideoMount` decides which by an explicit
+`priority` — the running game wins, the editor's authoring viewport gets the poster still —
+because before that rule the last host to tick won by accident, which surfaced as "the video
+plays only on Scene view, not on the game view". A shipped game has one UI host, so this is an
+editor-only compromise; showing it in both would mean either a second decoder (rejected — see
+above) or mirroring frames into a per-host `<canvas>`, which nothing has asked for yet.
 
 **Codec is deliberately limited to H.264/mp4.** It is the only format the iOS WKWebView plays;
 VP9/WebM does not. Shipping one format is a constraint accepted on purpose, not a gap — which is
@@ -32,22 +59,32 @@ why `VideoImportSettings` has no format knob.
 
 | File | Role |
 |---|---|
-| `runtime/traits/VideoPlayer.ts` | The trait: clip, loop, autoplay, muted, volume, bus, `timeMode`, rate, playing, loadProgress |
+| `runtime/traits/VideoPlayer.ts` | The trait: clip, loop, autoplay, muted, volume, `fadeOutSec`, bus, `timeMode`, rate, playing, loadProgress |
 | `runtime/video/videoService.ts` | Element lifetime, bus routing, autoplay retry, `timeScale` coupling |
 | `runtime/video/videoSystem.ts` | Declarative reconcile — trait state → live elements; download orchestration |
 | `runtime/video/videoCache{,Policy}.ts` | LRU cache against a budget; `videoCachePolicy` is the pure admission/eviction planner |
 | `runtime/video/VideoOverlay.tsx` | Fullscreen cutscene layer — **adopts** the element, never creates one |
+| `runtime/video/UIVideoMount.tsx` | UI binding — the element mounted into a UI node's box, with the host-priority rule |
 | `runtime/video/VideoEvents.ts` | `@video.start` / `@video.end` / `@video.skip` on the journal + an event bus |
 | `runtime/rendering/videoTextureSync.ts` | 3D binding — `THREE.VideoTexture` onto a material, per `RenderState` |
 | `runtime/rendering/videoTextureSync2D.ts` | 2D binding — a Pixi `VideoSource` texture onto a Sprite, per renderer |
 | `runtime/actions/videoControls.ts` | Declarative `video.play/pause/toggle/stop/skip/seek/setClip` |
 | `runtime/loaders/videoSettings.ts` | Import settings + delivery-policy resolution — the single source of truth |
 | `plugins/video-convert.ts` · `video-cache.ts` · `reimport-video.ts` | ffmpeg transcode, content cache, re-import |
+| `editor/panels/assetViews/VideoAssetView.tsx` · `videoAssetLogic.ts` | The Inspector for a video asset — settings form, preview, Re-import |
 
 ## Authoring
 
 Drop an `.mp4` (or `.mov`/`.m4v`/`.webm`/`.mkv` — all transcode to H.264/mp4) into a project's
-assets. Import mints a GUID and writes a `.meta.json` sidecar:
+assets. Import mints a GUID and writes a `.meta.json` sidecar.
+
+**Select the clip in the Assets panel to edit all of this in the Inspector** — delivery,
+policy, remote URL, CRF, preset, max dimensions, frame-rate cap, keyframe interval and audio,
+with a preview of the *converted* clip, a plain-English line saying what will happen at play
+time (`auto` already resolved against the measured size), and a **Re-import** button that runs
+the ffmpeg convert. Every control writes the sidecar immediately; only the encode waits for
+Re-import. The sidecar is documented below because it is what the settings *are* — not
+because hand-editing is the expected route:
 
 ```jsonc
 {
@@ -57,7 +94,10 @@ assets. Import mints a GUID and writes a `.meta.json` sidecar:
     "policy": "auto",           // "stream" | "download" | "auto" (remote only)
     "quality": 23,              // CRF
     "preset": "veryfast",
-    "maxWidth": 1920, "maxHeight": 1080, "maxFps": 0,
+    "resizeMode": "bounds",     // or "percent" — see below
+    "maxWidth": 1920, "maxHeight": 1080,   // resizeMode: "bounds"
+    "scalePercent": 100,        // resizeMode: "percent" — 10..100, no upscale
+    "maxFps": 0,
     "keyframeIntervalSec": 2,
     "audio": "keep",            // or "strip"
     "audioBitrate": 128,
@@ -65,6 +105,37 @@ assets. Import mints a GUID and writes a `.meta.json` sidecar:
   }
 }
 ```
+
+### Output size is a MODE, not two knobs
+
+`resizeMode` picks which sizing control is in force, and the other is ignored entirely:
+
+- **`bounds`** (default) — *"no bigger than W×H"*. `maxWidth`/`maxHeight` bound the output;
+  aspect is preserved and a smaller source is **never upscaled**. Reach for it when a
+  hardware or texture budget is the real constraint.
+- **`percent`** — *"half the source"*. `scalePercent` scales both axes together, so aspect is
+  preserved by construction. Reach for it when the source resolution is the thing you are
+  reasoning about. There is no percentage above 100: enlarging spends bytes on detail that is
+  not in the source.
+
+  `scalePercent` is **clamped to 10–100** by `resolveScalePercent`, which both the ffmpeg
+  filter and the cache key read so they cannot disagree. The clamp earns its place on the low
+  end specifically: `0` means *"keep the source"* for `maxWidth`, `maxHeight` and `maxFps`, so
+  it is an inviting thing to hand-author here — where it would instead mean a zero-pixel
+  encode and fail with an ffmpeg error that never mentions percentages.
+
+They are a mode rather than composable because a percentage *and* a pixel bound applied
+together give a size that is neither the one you asked for nor obviously wrong — and the
+result does not tell you which of the two won.
+
+**Both paths round down to even dimensions**, because H.264 with `yuv420p` rejects an odd
+width or height and the encode aborts outright. In percent mode this is folded into the same
+expression (`trunc(iw*p/200)*2`), so even `100%` emits a scale filter — that is deliberate,
+and it is what lets an odd-dimensioned source import at all.
+
+**A `bounds` clip's cache key is byte-identical to its pre-`resizeMode` form**, so adding
+percentage scaling did not re-encode a single existing clip. Anything touching
+`stableSettings` in `video-cache.ts` must preserve that.
 
 Then put a `VideoPlayer` on an entity and set `clip` to the GUID.
 
@@ -95,6 +166,26 @@ does not.
 Both freeze at a time-stop, because a time-stop should stop everything. Only slow-mo distinguishes
 them: dragging a screen in the world to 0.3× is right, and dragging cutscene dialogue to 0.3× is
 almost certainly not.
+
+### Ending a clip: the last frame, and `fadeOutSec`
+
+A non-looping clip **holds its last frame**. Nothing extra is needed for that — the element ends,
+`onEnded` pauses the handle, and `playing` flips false in the trait; the picture simply stays.
+Only a teardown (Stop, scene swap, clearing `clip`) removes it. So "play it once, then leave the
+final frame up" is the default behaviour, not a feature to switch on.
+
+`fadeOutSec` ramps the audio to silence over the last N seconds so the clip does not stop with a
+click. It is a **multiplier** computed from the element's own clock, never a tween written back
+into `volume`: the authored value stays readable in the Inspector as the level the ramp descends
+from, and a replay or a backwards seek gets its volume back instead of staying silent forever.
+The curve is linear in amplitude (`videoFadeGain`, pure and unit-tested) — an equal-power curve
+holds near full volume for most of the ramp, which is the opposite of what a fade is asked for.
+
+⚠️ **Audible autoplay is blocked until the player interacts.** An `autoplay` clip with sound does
+not start on its own in a browser; `videoService` records the rejection and retries on the first
+gesture (sharing the audio subsystem's unlock signal), so the clip shows its first frame until
+then. A clip that must move immediately has to be `muted: true` — which also makes `fadeOutSec`
+moot. This is browser policy, not an engine choice.
 
 ## Remote delivery
 

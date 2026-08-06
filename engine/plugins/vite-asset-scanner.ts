@@ -477,6 +477,28 @@ export function isValidBuildPlatform(p: string | null | undefined): p is BuildPl
   return p != null && (BUILD_PLATFORMS as readonly string[]).includes(p);
 }
 
+/** How an iOS build gets its freshly-built `.app` onto the phone.
+ *  - `devicectl`    — `xcrun devicectl device install|launch`, hands-free. iOS 17+ ONLY.
+ *  - `xcode-handoff`— open the Xcode project and let the human press Run (⌘R). */
+export type IosInstallMode = 'devicectl' | 'xcode-handoff';
+
+/** The single decision behind an iOS device build: may it run, and how does it install?
+ *
+ *  ⚠️ **Only `iosDeviceId` is required**; `iosDevicectlId` is optional because `devicectl` is
+ *  CoreDevice-only (iOS 17+) and a legacy device has no such id in existence. The two ids,
+ *  where they live, and the Xcode-handoff fallback are documented in
+ *  docs/build.md § "iOS Device" — don't restate them here.
+ *
+ *  Kept as one pure function, and exported, because these two answers must not drift apart:
+ *  when the preflight required more than the step plan consumed, the guard rejected the very
+ *  case the plan's own Xcode-handoff branch existed to serve. */
+export function planIosInstall(o: { iosDeviceId: string; iosDevicectlId: string }):
+  | { ok: false; missing: 'iosDeviceId' }
+  | { ok: true; mode: IosInstallMode } {
+  if (!o.iosDeviceId.trim()) return { ok: false, missing: 'iosDeviceId' };
+  return { ok: true, mode: o.iosDevicectlId.trim() ? 'devicectl' : 'xcode-handoff' };
+}
+
 /** /api/ota/publish only ever builds+publishes the CURRENTLY OPEN project as ITSELF — see
  *  the route's own comment and ota-updates.md's Gotchas for why an override to a different
  *  bundleName used to be a silent publish-corruption risk (it would ship this project's
@@ -1759,6 +1781,9 @@ export function assetScannerPlugin(): Plugin {
           const APP_ID = cfg.app.appId;
           const IOS_DEST = user.device.iosDeviceId;
           const IOS_DEVICECTL = user.device.iosDevicectlId;
+          // ONE decision, consumed by both the step plan (below) and the preflight guard
+          // (further down) — see planIosInstall for why they must not diverge.
+          const iosInstall = planIosInstall({ iosDeviceId: IOS_DEST, iosDevicectlId: IOS_DEVICECTL });
           // adb: an absolute path resolved from the SHARED toolchain (<android-sdk>/platform-tools/
           // adb) so it works even when platform-tools isn't on PATH (a packaged/no-PATH machine);
           // bare `adb` only as a fallback. -s <id> targets the configured device.
@@ -1897,8 +1922,18 @@ export function assetScannerPlugin(): Plugin {
               // broken" when the only thing missing is a way to push it. So fall back to
               // handing the project to Xcode, which can still deploy to iOS 15. Measured on an
               // iPhone 7 / iOS 15.8.2, where devicectl cannot install but Xcode's Run does.
-              { label: 'Installing on device...', cmd: `APP_PATH=$(ls -dt ~/Library/Developer/Xcode/DerivedData/App-*/Build/Products/Debug-iphoneos/App.app 2>/dev/null | head -1) && { xcrun devicectl device install app --device ${IOS_DEVICECTL} "$APP_PATH" || { echo ""; echo "⚠️  devicectl could not install to this device — it requires iOS 17+."; echo "   The app BUILT fine; only the command-line install is unavailable."; echo "   Opening the Xcode project — press Run (⌘R) there to deploy."; open "${iosXcodeTarget.replace(/^-(workspace|project) /, '')}" 2>/dev/null || true; exit 1; }; }`, cwd: iosCwd },
-              { label: 'Launching app...', cmd: `xcrun devicectl device process launch --device ${IOS_DEVICECTL} ${APP_ID}`, cwd: iosCwd },
+              // A pre-iOS-17 device has NO devicectl id to configure (it isn't a CoreDevice,
+              // so `xcrun devicectl list devices` reports it `unavailable`). That is a known,
+              // expected state — not a misconfiguration — so when the id is empty we skip
+              // straight to the Xcode handoff and report SUCCESS: the build did succeed, and
+              // only the CLI push is unavailable. Exiting non-zero here would label a healthy
+              // legacy-device build "failed".
+              iosInstall.ok && iosInstall.mode === 'devicectl'
+                ? { label: 'Installing on device...', cmd: `APP_PATH=$(ls -dt ~/Library/Developer/Xcode/DerivedData/App-*/Build/Products/Debug-iphoneos/App.app 2>/dev/null | head -1) && { xcrun devicectl device install app --device ${IOS_DEVICECTL} "$APP_PATH" || { echo ""; echo "⚠️  devicectl could not install to this device — it requires iOS 17+."; echo "   The app BUILT fine; only the command-line install is unavailable."; echo "   Opening the Xcode project — press Run (⌘R) there to deploy."; open "${iosXcodeTarget.replace(/^-(workspace|project) /, '')}" 2>/dev/null || true; exit 1; }; }`, cwd: iosCwd }
+                : { label: 'Handing off to Xcode (device predates devicectl)...', cmd: `echo "ℹ️  No iOS devicectl id set — devicectl requires iOS 17+, so this device can only be deployed from Xcode."; echo "   The app BUILT fine. Opening the Xcode project — press Run (⌘R) there to deploy."; open "${iosXcodeTarget.replace(/^-(workspace|project) /, '')}" 2>/dev/null || true`, cwd: iosCwd },
+              ...(iosInstall.ok && iosInstall.mode === 'devicectl'
+                ? [{ label: 'Launching app...', cmd: `xcrun devicectl device process launch --device ${IOS_DEVICECTL} ${APP_ID}`, cwd: iosCwd }]
+                : []),
             ],
             android: [
               { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', cwd: buildCwd },
@@ -2035,20 +2070,26 @@ export function assetScannerPlugin(): Plugin {
           const needsNativeScaffold =
             (platform === 'ios' || platform === 'android') && !fs.existsSync(path.join(projectRoot, platform));
 
-          // iOS device builds need a target device: the xcodebuild -destination AND the
-          // install/launch steps all interpolate the configured id. An empty id yields a
+          // iOS device builds need a target device: the xcodebuild -destination interpolates
+          // the configured id (the devicectl install/launch steps interpolate the SEPARATE,
+          // optional devicectl id). An empty id yields a
           // cryptic `-destination 'id='` → `xcodebuild: error: missing value for key 'id'`
           // + a full usage dump (not an obvious "set your device" hint) — so fail fast with
           // guidance instead. (Android's `adb` degrades to auto-selecting the one device, so
           // it needs no such check.) The simulator isn't a target of this device pipeline.
-          if (platform === 'ios' && (!IOS_DEST || !IOS_DEVICECTL)) {
-            const missing = !IOS_DEST && !IOS_DEVICECTL ? 'iosDeviceId + iosDevicectlId'
-              : !IOS_DEST ? 'iosDeviceId (xcodebuild -destination)' : 'iosDevicectlId (device install/launch)';
-            const msg = `[build] No iOS device configured — ${missing} is empty in ` +
-              `${path.relative(buildCwd, path.join(projectRoot, 'project.config.json'))}. ` +
+          // Which ids are required, and why devicectl's is not, is documented once on
+          // `planIosInstall` — this guard only reports its verdict.
+          if (platform === 'ios' && !iosInstall.ok) {
+            // project.USER.json, not project.config.json: these are per-MACHINE device ids
+            // (gitignored, never committed). The message named the committed file until this
+            // close-out caught it — sending anyone who hit it to edit the wrong file.
+            const msg = `[build] No iOS device configured — iosDeviceId (xcodebuild -destination) is empty in ` +
+              `${path.relative(buildCwd, path.join(projectRoot, 'project.user.json'))}. ` +
               `Set it in Project Settings → Build: iosDeviceId = the xcodebuild UDID from ` +
-              `\`xcrun xctrace list devices\`, iosDevicectlId = the id from \`xcrun devicectl list devices\`. ` +
-              `Without it the build can't target or install on your iPhone.`;
+              `\`xcrun xctrace list devices\`. Without it the build can't target your iPhone. ` +
+              `(iosDevicectlId is optional — set it from \`xcrun devicectl list devices\` for a ` +
+              `hands-free install/launch on iOS 17+; leave it empty on older devices and the ` +
+              `build hands off to Xcode instead.)`;
             send(msg);
             // A DELIBERATE REFUSAL must be `FAILED:…`, not a bare status. `consumeBuildStream`
             // pushes any non-DONE/non-FAILED status into the log and, when the stream then closes,

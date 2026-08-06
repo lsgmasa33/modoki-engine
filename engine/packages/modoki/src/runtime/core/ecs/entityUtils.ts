@@ -5,6 +5,10 @@ import type { Trait, TraitRecord, ExtractSchema, TraitValue } from 'koota';
 import { getCurrentWorld, findEntityById, destroyEntity, setStructureCallback } from './world';
 import { getAllTraits, transformName, type TraitMeta } from './traitRegistry';
 import { EntityAttributes } from '../traits/EntityAttributes';
+import { Transient } from '../traits/Transient';
+import { isSimRunning } from '../playState';
+import { inSystemTick } from '../systemTick';
+import { noteAuthoredWriteWhileStopped } from './authoredWrites';
 
 // Pluggable dirty listeners — multiple systems (uiTreeStore, the editor's
 // Canvas2DLayer) register callbacks to be notified on any ECS trait write.
@@ -186,6 +190,27 @@ export function cloneTraitValues(values: Record<string, unknown>): Record<string
   }
 }
 
+/** #124 warn-only probe: a SYSTEM writing an AUTHORED entity while the sim is stopped is a
+ *  write that a save will bake into the scene file. `Transient` covers system-SPAWNED entities
+ *  (the serializer skips them); this covers the mutation of an entity the human authored, which
+ *  transience cannot reach. Records only — the write itself always proceeds.
+ *
+ *  All three conditions matter. `inSystemTick()` excludes the human's own inspector/gizmo edits
+ *  and load-time writes; `!isSimRunning()` excludes Play (whose mutations are reverted at Stop);
+ *  the `Transient` check excludes generated content that is never serialized anyway. */
+function noteIfAuthoredWriteWhileStopped(
+  entity: ReturnType<typeof findEntity>,
+  entityId: number,
+  traitName: string,
+  field: string,
+) {
+  if (!entity || !inSystemTick() || isSimRunning() || entity.has(Transient)) return;
+  const attrs = entity.has(EntityAttributes)
+    ? (entity.get(EntityAttributes) as { name?: string } | undefined)
+    : undefined;
+  noteAuthoredWriteWhileStopped(entityId, attrs?.name ?? `#${entityId}`, traitName, field);
+}
+
 /** Write a field value to a trait on an entity */
 export function writeTraitField(entityId: number, meta: TraitMeta, field: string, value: unknown) {
   if (meta.category === 'tag') {
@@ -193,6 +218,7 @@ export function writeTraitField(entityId: number, meta: TraitMeta, field: string
     if (!entity) return;
     if (value) entity.add(meta.trait);
     else entity.remove(meta.trait);
+    noteIfAuthoredWriteWhileStopped(entity, entityId, meta.name, field);
     fireDirtyListeners();
     return;
   }
@@ -200,6 +226,7 @@ export function writeTraitField(entityId: number, meta: TraitMeta, field: string
   if (!entity || !entity.has(meta.trait)) return;
   const current = entity.get(meta.trait) as Record<string, unknown>;
   entity.set(meta.trait, { ...current, [field]: value });
+  noteIfAuthoredWriteWhileStopped(entity, entityId, meta.name, field);
   fireDirtyListeners();
   // EntityAttributes fields that the Hierarchy displays/orders by (name, layer,
   // parentId, sortOrder) must also bump the structure version — otherwise the

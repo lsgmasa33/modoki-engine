@@ -7,7 +7,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createWorld, trait } from 'koota';
-import { Transient } from '../../src/runtime/traits/Transient';
+import { Transient } from '../../src/runtime/core/traits/Transient';
 
 const Transform = trait({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
 const EntityAttributes = trait({ name: '' as string, isActive: true, sortOrder: 0, parentId: 0, guid: '' as string, layer: '' as '' | '3d' | '2d' | 'ui' });

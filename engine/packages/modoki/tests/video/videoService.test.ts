@@ -185,3 +185,56 @@ describe('seek', () => {
     expect(h.element.currentTime).toBe(0);
   });
 });
+
+describe('a clip that reaches its end (#the iPhone 8 loop)', () => {
+  /** Put the element where a finished clip really is, WITHOUT dispatching `ended`. That is not
+   *  a contrived state: measured on an iPhone 8, a `loop:false` backdrop restarted every 8s
+   *  forever and the journal recorded exactly ONE `@video.start` and never an `@video.end` —
+   *  the event had not fired once. jsdom's element has no decoder, so both the position and the
+   *  `ended` property are stubbed here to model it. */
+  function atEnd(el: HTMLVideoElement, paused = true): void {
+    Object.defineProperty(el, 'duration', { value: 8, configurable: true });
+    Object.defineProperty(el, 'currentTime', { value: 8, writable: true, configurable: true });
+    Object.defineProperty(el, 'ended', { value: true, configurable: true });
+    Object.defineProperty(el, 'paused', { value: paused, configurable: true });
+  }
+
+  it('reports ended from the ELEMENT, not only from the event', () => {
+    const h = playVideo({ url: 'a.mp4' });
+    expect(h.ended).toBe(false);
+    atEnd(h.element);
+    expect(h.ended).toBe(true);
+  });
+
+  it('refuses to re-play it — play() at the end REWINDS, which is what looped the backdrop', () => {
+    const h = playVideo({ url: 'a.mp4' });
+    atEnd(h.element);
+    const before = playCalls;
+    h.play();          // videoSystem calls this every frame while the trait says `playing`
+    h.play();
+    expect(playCalls).toBe(before);
+  });
+
+  it('does NOT report ended for a LOOPING clip, which is meant to run round again', () => {
+    const h = playVideo({ url: 'a.mp4', loop: true });
+    atEnd(h.element, false);
+    expect(h.ended).toBe(false);
+  });
+
+  it('does not re-issue play() for an element that is already running', () => {
+    // The same call the loop rode in on, in its ordinary form: re-playing a playing element
+    // buys nothing, and is only ever a chance to hit the rewind case above.
+    const h = playVideo({ url: 'a.mp4' });
+    const before = playCalls;
+    h.play();
+    expect(playCalls).toBe(before);
+  });
+
+  it('un-ends on a seek back into the clip, so a replay is still possible', () => {
+    const h = playVideo({ url: 'a.mp4' });
+    atEnd(h.element);
+    Object.defineProperty(h.element, 'ended', { value: false, configurable: true });
+    h.seek(0);
+    expect(h.ended).toBe(false);
+  });
+});

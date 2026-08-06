@@ -93,7 +93,29 @@ let currentTimeScale = 1;
 class LiveVideoHandle implements VideoHandle {
   readonly element: HTMLVideoElement;
   readonly timeMode: VideoTimeMode;
-  ended = false;
+  /** Set by the element's `ended` EVENT. Never read directly — see the `ended` getter. */
+  private endedEvent = false;
+
+  /** Has this clip finished?
+   *
+   *  ⚠️ Derived from the ELEMENT's own state as well as the event, because the event alone is
+   *  not trustworthy enough to hang "stop playing" on. Measured on an iPhone 8: exactly ONE
+   *  `@video.start`, never an `@video.end`, and a non-looping backdrop restarting every 8s
+   *  forever. The element had `loop:false` and was mid-playback every time it was sampled.
+   *
+   *  The mechanism is a race the slow device loses. `videoSystem` reconciles every frame and
+   *  calls `play()` while `playing` is true; per spec, `play()` when the playback position is
+   *  the end SEEKS BACK TO THE START. So a frame that lands while the element sits at its end,
+   *  before `ended` has dispatched, rewinds it — and `ended` then never fires at all, because
+   *  the element is no longer at the end. A desktop browser dispatches in time and looks fine.
+   *
+   *  `HTMLMediaElement.ended` is a plain spec property with no event timing to lose, so reading
+   *  it closes the window. `attemptPlay` refusing to re-play a running element closes the other
+   *  half — either fix alone is sufficient; both are correct independently. */
+  get ended(): boolean {
+    if (this.endedEvent) return true;
+    return !this.element.loop && this.element.ended;
+  }
   /** Base rate the game asked for, before timeScale is folded in. */
   private baseRate = 1;
   /** True when a `play()` was rejected by the autoplay policy and is awaiting a gesture. */
@@ -131,7 +153,7 @@ class LiveVideoHandle implements VideoHandle {
 
     el.addEventListener('ended', () => {
       if (el.loop) return;
-      this.ended = true;
+      this.endedEvent = true;
       spec.onEnded?.();
     });
     el.addEventListener('error', () => {
@@ -175,6 +197,10 @@ class LiveVideoHandle implements VideoHandle {
   }
 
   private attemptPlay(): Promise<void> {
+    // Already running → do nothing. `videoSystem` calls play() EVERY FRAME while the trait says
+    // `playing`, and play() is not the harmless no-op it looks like: at the end of a clip it
+    // rewinds (see the `ended` getter). Re-playing a running element buys nothing in any case.
+    if (!this.element.paused) { this.blocked = false; return Promise.resolve(); }
     const p = this.element.play();
     // Older engines return undefined rather than a promise.
     if (!p || typeof p.catch !== 'function') { this.blocked = false; return Promise.resolve(); }
@@ -211,7 +237,9 @@ class LiveVideoHandle implements VideoHandle {
     const dur = Number.isFinite(this.element.duration) ? this.element.duration : undefined;
     const t = Math.max(0, dur != null ? Math.min(seconds, dur) : seconds);
     try { this.element.currentTime = t; } catch { /* not seekable yet */ }
-    if (this.ended && t < (dur ?? Infinity)) this.ended = false;
+    // Only the EVENT flag needs clearing — `element.ended` clears itself once the position moves
+    // back off the end, which is exactly the property that makes the getter above trustworthy.
+    if (t < (dur ?? Infinity)) this.endedEvent = false;
   }
 
   setVolume(v: number): void {
@@ -243,6 +271,29 @@ class LiveVideoHandle implements VideoHandle {
       this.element.load();
     } catch { /* noop */ }
   }
+}
+
+/** Multiplier (0..1) applied to a clip's volume so it fades out over the LAST
+ *  `fadeOutSec` seconds. Pure, so the ramp is testable without a media element.
+ *
+ *  Returns 1 whenever the fade cannot be computed — no fade asked for, a duration the
+ *  element has not reported yet (`NaN` before metadata loads, `Infinity` on a live
+ *  stream), or a clip shorter than the fade. Silence is the failure that would be
+ *  noticed and blamed on the engine; a missed fade is not. A fade longer than the clip
+ *  is CLAMPED to the clip rather than refused, so it starts at t=0 and still lands on 0.
+ *
+ *  Linear in amplitude on purpose. An 8-second beach loop is ambience, and an
+ *  equal-power curve holds it near full volume for most of the ramp — which is exactly
+ *  what "it should fade as the video ends" is asking not to happen. */
+export function videoFadeGain(currentTime: number, duration: number, fadeOutSec: number): number {
+  if (!(fadeOutSec > 0)) return 1;
+  if (!Number.isFinite(duration) || duration <= 0) return 1;
+  const fade = Math.min(fadeOutSec, duration);
+  const remaining = duration - currentTime;
+  if (!Number.isFinite(remaining)) return 1;
+  if (remaining <= 0) return 0;
+  if (remaining >= fade) return 1;
+  return remaining / fade;
 }
 
 /** Create and (by default) start a video handle. */

@@ -228,6 +228,27 @@ It is called explicitly on open — **not** buried inside `ensureProjectDeps` �
 
 `ensureProjectDeps(projectRoot)` makes "Open Project" work for a project opened from **outside** the repo (or an in-repo game never installed). The repo root install only links in-repo game workspaces via `bootstrap-game-deps.mjs`; a standalone project needs its own `npm install` to create `node_modules` + workspace symlinks (e.g. `@<game>/app-services`), else Vite 500s on the unresolved import. It also **vendors engine-provided Capacitor plugins** (`capacitor-game-debug`, …) into the project as tarball COPIES packed from the editor's own engine (no symlink → DMG-safe), which can rewrite `package.json` (migrating off the old `file:../../engine` dir-symlink) and regenerate the gitignored tarball. It reinstalls only when `node_modules` is absent or the vendored plugin copies are stale, preferring `npm ci` unless vendoring just rewrote `package.json` (then `npm install`, since the lockfile is behind). Skips the editor's own tree and projects with nothing to install.
 
+### Pinned transitive deps — `overrides.uuid` in every Capacitor project
+
+Every project that depends on `@capacitor/cli` carries `"overrides": { "uuid": "^11.1.1" }` in its
+`package.json` (all of `games/*`, `demos/*`, and the repo root). It is **not** a dep the project
+uses — it exists to pin a transitive one, and in most of those projects it is currently **inert**.
+
+`@capacitor/cli` **8.5.0** added a dependency on `xcode@^3.0.1`, which depends on `uuid@^7.0.3` —
+vulnerable (GitHub Dependabot, medium; fixed in 11.1.1). Upstream will not resolve it: `xcode@latest`
+still pins `uuid ^7`. The `xcode` dep did not exist in 8.4.x, so only projects whose lockfile has
+floated to 8.5.0 actually resolve `uuid` today; the rest inherit it the moment their lockfile is
+refreshed, since they all declare a floating `^8.x` range. The override is applied everywhere so
+that refresh is a non-event rather than a new alert.
+
+Safe because `xcode` calls `require('uuid').v4()` and takes the string result
+(`pbxProject.generateUuid`); `uuid@11` still ships a CJS build, and the call site uses no removed
+API. Adding an override that matches nothing in the tree does **not** desync `npm ci`
+(npm does not record `overrides` in the lockfile root), so the inert copies cost no lockfile churn.
+
+Re-check the whole set with `npm ls uuid` in a project, or audit every lockfile at once by grepping
+`git ls-files '*package-lock.json'` for a `node_modules/uuid` entry below 11.1.1.
+
 Full build/deploy commands live in [build.md](./build.md) and the project `CLAUDE.md`.
 
 ## App Identity & Build

@@ -35,8 +35,15 @@
  * simply absent — and this guard only sees values that are present. Nothing actionable was lost:
  * every one of those entries was already an accepted exemption whose reason was "blank means use
  * the default, not a missing ref", which is exactly what an absent field means. The PREFAB entries
- * below still fire because prefabs were not part of that pass. If prefabs are ever re-saved the
- * same way, expect the same shrink for the same reason — do not treat it as the guard breaking.
+ * below still fire because prefabs were not part of that pass.
+ *
+ * NOTE (2026-08-06): prefabs HAVE now been re-saved (`engine/scripts/resave-prefabs.sh`, #125), and
+ * the prediction the previous paragraph ended on — "expect the same shrink for the same reason" —
+ * was WRONG, in the opposite direction. The prefab writer does not compact: `serializePrefab` reads
+ * each trait's FULL persisted schema (`readTraitDataFull`) and writes every field, so a re-save
+ * ADDS default-valued fields rather than removing them. Nothing shrank; two blank refs APPEARED
+ * (`Renderable2D.material` on Game_Canvas + GreenSlim), pinned below. The scene and prefab writers
+ * genuinely differ here, so do not reason about one from the other.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -73,6 +80,10 @@ const BASELINE: { key: string; why: string }[] = [
   // (The SCENE blanks that came with it are gone for the reason in the 2026-08-04 note above —
   // the re-save compacted them out of the file.)
   { key: '/games/3d-test/assets/prefabs/Game_Canvas.prefab.json:Renderable2D.sprite', why: 'blank sprite = flat coloured primitive quad (Renderable2D.color + width/height), not a missing image' },
+  // Both of these appeared in the 2026-08-06 PREFAB re-save (#125), for the reason in the note
+  // above: the prefab writer emits the trait's FULL schema, so `material` — previously absent —
+  // is now written as "". Same exemption as the Renderable3DPrimitive.material entries below.
+  { key: '/games/3d-test/assets/prefabs/Game_Canvas.prefab.json:Renderable2D.material', why: 'optional 2D material override slot — blank means "use the default sprite material," not a forgotten material asset' },
   { key: '/games/alien-animal/assets/models/alien-animal.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
   { key: '/games/sling/assets/prefabs/bumper.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
   { key: '/games/sling/assets/prefabs/bumper.prefab.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
@@ -81,6 +92,9 @@ const BASELINE: { key: string; why: string }[] = [
   { key: '/games/sling/assets/prefabs/enemy.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
   { key: '/games/sling/assets/prefabs/enemy.prefab.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
   { key: '/games/sling/assets/prefabs/goal-point.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
+  // Appeared in the 2026-08-06 prefab re-save (#125) — see the Game_Canvas.Renderable2D.material
+  // entry above: the prefab writer emits the full trait schema, so this optional slot is now present.
+  { key: '/games/sling/assets/prefabs/GreenSlim.prefab.json:Renderable2D.material', why: 'optional 2D material override slot — blank means "use the default sprite material," not a forgotten material asset' },
   { key: '/games/sling/assets/prefabs/green-enemy.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
   { key: '/games/sling/assets/prefabs/green-enemy.prefab.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
   { key: '/games/sling/assets/prefabs/puck.prefab.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },

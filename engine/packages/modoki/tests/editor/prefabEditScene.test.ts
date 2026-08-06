@@ -5,7 +5,7 @@
 
 import { describe, it, expect, beforeAll } from 'vitest';
 import {
-  buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID, PREFAB_EDIT_HDR_GUID, SCAFFOLD_PREFIX,
+  buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID, PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_HDR_GUID, SCAFFOLD_PREFIX,
 } from '../../src/editor/scene/prefabEdit';
 import { registerAsset, clearManifest } from '../../src/runtime/loaders/assetManifest';
 import type { SceneData } from '../../src/runtime/loaders/loadSceneFile';
@@ -49,11 +49,17 @@ describe('buildPrefabEditScene', () => {
     expect(scaffolds).toHaveLength(3);
   });
 
-  it('stamps the sentinel guid on the root only (so save can locate it)', () => {
+  // Was "on the root only" until #125. The root sentinel still locates the root for save, but
+  // every OTHER member now carries `__prefab_edit_local__<its localId>` — the loader reassigns
+  // ECS ids densely, so without this the file's own numbering is gone by the time the edit world
+  // exists, and the save renumbers. localIds are the address space a scene's prefab-instance
+  // overrides are keyed in, so a renumber silently repoints them. See docs/prefabs.md
+  // § "localId stability".
+  it('stamps the root sentinel on the root and a localId sentinel on every other member', () => {
     const root = scene.entities.find((e) => e.id === 1)!;
     const hull = scene.entities.find((e) => e.id === 2)!;
     expect((root.traits.EntityAttributes as Record<string, unknown>).guid).toBe(PREFAB_EDIT_ROOT_GUID);
-    expect((hull.traits.EntityAttributes as Record<string, unknown>).guid).toBe('');
+    expect((hull.traits.EntityAttributes as Record<string, unknown>).guid).toBe(`${PREFAB_EDIT_LOCAL_GUID_PREFIX}2`);
   });
 
   it('does NOT mutate the source prefab (root guid stays empty in the file)', () => {

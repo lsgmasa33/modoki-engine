@@ -273,4 +273,66 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       return postJson('/api/watch/clear', { id });
     },
   );
+
+  // ── Input WATCH: what the pointer actually did (#134) ──
+  tool(
+    'modoki_input_watch',
+    'Input WATCH — a bounded record of what the POINTER actually did, and what it resolved to. ' +
+      'The journal answers "what did the game do"; this answers "what did the finger do" — the ' +
+      'question with the LEAST evidence when a gesture fails (a press that resolves to nothing ' +
+      'emits no journal event, no commit, no coordinates). action:start opens the window; it ' +
+      'RECORDS NOTHING BEFORE THAT CALL — no history, same contract as journal @contact capture. ' +
+      'action:read returns the most-recent presses (down/up points, distance travelled, hold time, ' +
+      'move-sample count, and what — if anything — the press resolved to). This is the ONLY tool ' +
+      'that can tell "the press hit nothing" (`resolved.by:\'none\'` — an authority looked and found ' +
+      'nothing there) apart from "nothing could answer" (`resolved.by:\'unknown\'` — nobody who ' +
+      'could look was asked); everything else either infers from absence or conflates the two. ' +
+      'action:stop closes the window but KEEPS what was recorded, so you can stop then read without ' +
+      'racing your own probe. action:clear drops recorded presses without closing the window. ' +
+      'Params are per-ACTION: a read-time filter on a START call (or `max` on anything but start) is ' +
+      'REFUSED naming the right action rather than silently dropped.',
+    {
+      action: z.enum(['start', 'read', 'stop', 'clear']).describe('open the window | read presses | close (keeps presses) | drop recorded presses (window stays open if it was)'),
+      max: z.number().int().positive().optional().describe('(start) Ring capacity — most recent N presses kept (default 40, ceiling 500).'),
+      limit: z.number().int().positive().optional().describe('(read) Most-recent N presses to return (default 20).'),
+      unresolvedOnly: z.boolean().optional().describe("(read) Keep only presses whose resolved.by is 'none' or 'unknown' — presses NOTHING could explain. THE diagnostic filter: this is the one question this tool exists to answer, so start here when a reported gesture apparently did nothing."),
+      precision: z.number().int().nonnegative().optional().describe('(read) Significant digits for float fields (x/y/upX/upY/maxD/heldMs). Default 9; 0 = exact.'),
+    },
+    async (args) => {
+      const { action, max, limit, unresolvedOnly, precision } = args;
+      // Per-action allowlist (mirrors modoki_watch's S3.19 fix) — a key belonging to a DIFFERENT
+      // action is refused BY NAME, never silently dropped (which would either widen a start to the
+      // default ring size unexpectedly or ignore a read-time narrow).
+      const ACCEPTS: Record<string, readonly string[]> = {
+        start: ['max'],
+        read: ['limit', 'unresolvedOnly', 'precision'],
+        stop: [],
+        clear: [],
+      };
+      const accepted = new Set<string>([...(ACCEPTS[action] ?? []), 'action']);
+      const stray = Object.keys(args).filter((k) => (args as Record<string, unknown>)[k] !== undefined && !accepted.has(k));
+      if (stray.length) {
+        return ctx.fail({
+          code: 'UNKNOWN_PARAM',
+          what: `${action} the input watch`,
+          why: `${stray.join(', ')} ${stray.length > 1 ? 'are' : 'is'} not accepted by action:'${action}'.`,
+          got: Object.fromEntries(stray.map((k) => [k, (args as Record<string, unknown>)[k]])),
+          expected: `action:'${action}' accepts: ${ACCEPTS[action]?.length ? ACCEPTS[action].join(', ') : '(no params beyond action)'}`,
+          options: stray.map((k) => {
+            const other = Object.entries(ACCEPTS).filter(([a, keys]) => a !== action && keys.includes(k)).map(([a]) => `action:'${a}'`);
+            return other.length ? `${k} — pass it on ${other.join(' or ')} instead` : `${k} — not a parameter of this action`;
+          }),
+        });
+      }
+      if (action === 'start') return postJson('/api/input-watch/start', { max });
+      if (action === 'stop') return postJson('/api/input-watch/stop', {});
+      if (action === 'clear') return postJson('/api/input-watch/clear', {});
+      const q = new URLSearchParams();
+      if (limit != null) q.set('limit', String(limit));
+      if (unresolvedOnly) q.set('unresolvedOnly', '1');
+      if (precision != null) q.set('precision', String(precision));
+      const qs = q.toString();
+      return getJson(`/api/input-watch/read${qs ? `?${qs}` : ''}`);
+    },
+  );
 }

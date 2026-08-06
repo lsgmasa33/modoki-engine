@@ -830,6 +830,56 @@ export function registerTools(server: McpServer) {
     },
   );
 
+  tool('device_input_watch',
+    'Input WATCH on the device — a bounded record of what the POINTER actually did, and what it ' +
+      'resolved to. The one tool that can tell "the press hit nothing" (an authority looked and ' +
+      'found nothing there) apart from "nothing could answer" (nobody who could look was asked), ' +
+      'which is the whole evidence gap a failed gesture otherwise leaves (no journal event, no ' +
+      'commit, no coordinates). action:start opens the window and RECORDS NOTHING BEFORE THAT CALL. ' +
+      'action:read returns the most-recent presses; action:stop closes the window but KEEPS what was ' +
+      'recorded; action:clear drops recorded presses without closing the window.',
+    {
+      action: z.enum(['start', 'read', 'stop', 'clear']).describe('open the window | read presses | close (keeps presses) | drop recorded presses'),
+      max: z.number().optional().describe('(start) Ring capacity — most recent N presses kept (default 40, ceiling 500).'),
+      limit: z.number().optional().describe('(read) Most-recent N presses to return (default 20).'),
+      unresolvedOnly: z.boolean().optional().describe("(read) Keep only presses whose resolved.by is 'none' or 'unknown' — presses NOTHING could explain. THE diagnostic filter."),
+      precision: z.number().optional().describe('(read) Significant digits for float fields (default 9; 0 = exact).'),
+    },
+    async (args) => {
+      const { action } = args;
+      // PER-ACTION ALLOWLIST, mirroring the editor twin and device_watch above — a key belonging
+      // to a different action is refused by name, never silently dropped.
+      const ACCEPTS: Record<string, readonly string[]> = {
+        start: ['max'],
+        read: ['limit', 'unresolvedOnly', 'precision'],
+        stop: [],
+        clear: [],
+      };
+      const accepted = new Set<string>([...(ACCEPTS[action] ?? []), 'action']);
+      const stray = Object.keys(args).filter((k) => (args as Record<string, unknown>)[k] !== undefined && !accepted.has(k));
+      if (stray.length) {
+        return deviceFail({
+          code: 'UNKNOWN_PARAM',
+          tool: 'device_input_watch',
+          what: `${action} the device input watch`,
+          why: `${stray.join(', ')} ${stray.length > 1 ? 'are' : 'is'} not accepted by action:'${action}'.`,
+          got: Object.fromEntries(stray.map((k) => [k, (args as Record<string, unknown>)[k]])),
+          expected: `action:'${action}' accepts: ${ACCEPTS[action]?.length ? ACCEPTS[action].join(', ') : '(no params beyond action)'}`,
+          options: stray.map((k) => {
+            const other = Object.entries(ACCEPTS).filter(([a, keys]) => a !== action && keys.includes(k)).map(([a]) => `action:'${a}'`);
+            return other.length ? `${k} — pass it on ${other.join(' or ')} instead` : `${k} — not a parameter of this action`;
+          }),
+        });
+      }
+      const forward = (keys: readonly string[]) => Object.fromEntries(
+        keys.map((k) => [k, (args as Record<string, unknown>)[k]]).filter(([, v]) => v !== undefined));
+      if (action === 'stop') return perceptCall('device_input_watch', 'input-watch-stop');
+      if (action === 'clear') return perceptCall('device_input_watch', 'input-watch-clear');
+      if (action === 'read') return perceptCall('device_input_watch', 'input-watch-read', forward(ACCEPTS.read));
+      return perceptCall('device_input_watch', 'input-watch-start', forward(ACCEPTS.start));
+    },
+  );
+
   // ── Screenshot ─────────────────────────────────────────────
 
   tool('device_screenshot',

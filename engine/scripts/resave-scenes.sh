@@ -16,17 +16,24 @@
 # Afterwards ALWAYS review with:
 #   node engine/scripts/check-scene-churn.mjs <same projects>
 #
-# ⚠️ DO NOT sweep a project whose game code SPAWNS ENTITIES OR MUTATES STATE ON LOAD (#124).
-#    `save-all` persists the LIVE world, so anything the game created while the scene
-#    sat open is baked into the scene file. Measured on games/chess: ~70 runtime entities
-#    (highlights, rank labels, pieces) plus a live progress-bar value written into
-#    chess.scene.json. (games/space-invader was also excluded, for #123 — the manifest
+# ⚠️ DO NOT sweep a project whose game code MUTATES AUTHORED STATE ON LOAD (#124).
+#    `save-all` persists the LIVE world. The SPAWN half of this is fixed — an entity spawned
+#    from inside a system tick is tagged Transient at the spawn site and never serialized
+#    (docs/scene-loading.md, the provenance rule) — so games/chess no longer bakes its ~70
+#    runtime entities. The MUTATION half — a stopped-mode system writing to an AUTHORED
+#    entity, which no tag can reach — is fixed too, but only for a projection that opts in
+#    with `pauseWhileStopped` (chess + llm-test do; verified live, their load→save is now
+#    semantically a no-op). The hazard therefore remains OPEN for any other project: a save
+#    now WARNS, naming each authored field a system rewrote while stopped, so read the
+#    editor console before trusting a sweep. (games/space-invader was also excluded, for #123 — the manifest
 #    rebuild dropped an asset ref held on a game-specific trait. Fixed by the generic guid
 #    sweep in collectResourceRefsFromEntities; it is re-saved and no longer excluded.)
 #    check-scene-churn.mjs catches the runtime-entity class, and compares the resource
 #    manifest by IDENTITY — a dropped ref the scene still references fails it (exit 1).
 #    Run it before you stage anything.
-#    Prefabs are not covered at all (#125): load-scene has no prefab equivalent.
+#    Prefabs are covered by a sibling script, not this one: engine/scripts/resave-prefabs.sh
+#    (#125) — load-scene has no prefab equivalent, so prefabs round-trip through prefab-edit
+#    mode instead.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)

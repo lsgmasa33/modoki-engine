@@ -80,6 +80,18 @@ export type ToolContract = {
   /** Params that NARROW the response. A `read` tool with a large payload must have at least one
    *  (`docs/mcp-response-budget.md`: summary-first, and the hint names the filter to reach for). */
   filters: string[];
+  /** Declared exceptions to the "a boolean filter always EXPANDS the response" heuristic that
+   *  `mcpToolContracts.test.ts` guards `filters` with.
+   *
+   *  That heuristic held for the whole surface until `modoki_input_watch.unresolvedOnly` — every
+   *  narrowing param carried a value (an id, a name, a cap) and every boolean added something, so
+   *  "boolean ⇒ expanding" was a reliable tell rather than a rule. It is a heuristic, and this is
+   *  where an exception is DECLARED rather than dodged by omitting the filter: leaving the flag out
+   *  of `filters` would have kept the guard green while removing the tool's most useful narrowing
+   *  param from the over-cap hint — a silently worse answer for the agent, which is the outcome
+   *  §6 exists to prevent. Listing one here is a deliberate act that shows up in review; it is not
+   *  a way to bless an expanding flag. */
+  narrowingFlags?: string[];
   /** Smallest VALID call. `{}` when every param is optional. */
   minimalArgs: Record<string, unknown>;
   /** Does the `minimalArgs` form ITSELF mutate? Defaults to `mutating`.
@@ -362,7 +374,12 @@ const DECLS: Record<string, Decl> = {
     notes: 'Sends `prefabAction` on the wire: the relay STRIPS a param named `action`. '
       + "persists:'both' because action:'create' WRITES the .prefab.json (writePrefabFile) while "
       + 'instantiate/detach/apply/revert are live-only; the undo entry covers the live tagging only, '
-      + 'never the file write (undoing an overwrite would destroy an asset the agent never created).',
+      + 'never the file write (undoing an overwrite would destroy an asset the agent never created). '
+      + "The edit-* actions drive PREFAB-EDIT MODE: 'edit-open' swaps the world for a synthetic "
+      + 'prefab scene (world-destructive, so it takes `force` like load-scene, and it saves the '
+      + "current scene on the way in), 'edit-save' re-serializes the .prefab.json, 'edit-exit' "
+      + 'reloads the return scene. None of the three is undoable — they are scene swaps and a '
+      + 'file write, matching load-scene and create respectively.',
   },
   modoki_gizmo: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-gizmo', mutating: true, persists: 'session',
@@ -495,6 +512,21 @@ const DECLS: Record<string, Decl> = {
     notes: "Three tools under one name: action start→POST /api/watch/start (creates a watcher), " +
       "read→samples, list→GET /api/watch/list, clear→POST /api/watch/clear (destroys watchers). " +
       "Declared kind is 'control', not 'read', because start/clear change watcher state.",
+  },
+  modoki_input_watch: {
+    kind: 'control', method: 'GET', route: '/api/input-watch/read', varies: 'both',
+    mutating: true, persists: 'session', requires: ['editor', 'renderer'],
+    filters: ['limit', 'unresolvedOnly', 'precision'],
+    // `unresolvedOnly` is the surface's first NARROWING boolean — it keeps only the presses that
+    // resolved to nothing, which is the whole diagnostic question here. See `narrowingFlags`.
+    narrowingFlags: ['unresolvedOnly'],
+    minimalArgs: { action: 'read' },
+    minimalArgsMutates: false, // action:'read' only reads; start/stop/clear are the mutating halves
+    notes: "Four ops under one name: action start→POST /api/input-watch/start (opens the recorder, " +
+      "records nothing before this call), read→GET /api/input-watch/read (default action), " +
+      "stop→POST /api/input-watch/stop (closes it, KEEPS recorded presses), clear→POST " +
+      "/api/input-watch/clear (drops recorded presses, window stays open if it was). Declared kind " +
+      "is 'control', not 'read', because start/stop/clear change recorder state.",
   },
 
   // ── asset schema + authoring ──

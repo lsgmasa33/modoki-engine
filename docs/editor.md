@@ -513,6 +513,50 @@ consecutive same-field edits **coalesce** into one undo entry within a ~500 ms w
 persistence is a **debounced `/api/write-file`** (~400 ms) that also re-seeds the relevant
 runtime cache so any live entity referencing the asset updates next frame.
 
+### The asset Inspector — two rules that have each failed three times
+
+The Inspector's asset view (`Inspector.tsx`) is the door to everything above: it renders a
+per-kind branch, and for any kind it does not recognise it prints "No actions for `<type>`
+assets". Both halves of that sentence have gone wrong repeatedly, in ways nothing failed on,
+so both are now enforced rather than remembered.
+
+**1. Every `AssetType` gets an action.** The recognised-kinds list used to be a string array
+written inline in the JSX, kept in step with the branches above it by hand. It drifted three
+times — `video` and `timeline` each shipped a working backend and editor with no Inspector
+entry at all, and `shader` drifted the other way, rendering `ShaderAssetView` *and* a cheerful
+"No actions for shader assets" underneath it. Every instance was found by a human reading the
+type union, never by a test. So `AssetType` is now **derived from the runtime `ASSET_TYPES`
+array** (`runtime/loaders/assetManifest.ts`) — making the set enumerable is the whole point —
+and the list lives in `assetViews/assetActions.ts` as `ASSET_TYPES_WITH_ACTIONS`, beside the
+views where a unit test can import it without mounting a panel.
+`packages/modoki/tests/editor/assetInspectorCoverage.test.ts` pins the two against each other
+**in both directions**; only one direction shows up as an empty panel, which is exactly why
+the shader case survived a sweep that was looking for empty panels.
+
+**2. A preset `<select>` must splice in the value it is bound to.** An HTML `<select>` whose
+`value` matches none of its `<option>`s does not render empty and does not warn — it displays
+its **first** option. A `.meta.json` holding a legal but non-preset number therefore renders
+as a *different* setting than the asset has, with nothing in the UI to say so (measured:
+`video.quality: 24`, an ordinary CRF, displaying as "18 — near-lossless"). Wrap the list in
+**`withCurrentValue(list, boundValue)`** (`assetViews/importSettingOptions.ts`), which splices
+the bound value in and keeps it editable — the tempting alternative, snapping to the nearest
+preset, silently rewrites an authored file. Skip the splice only while a multi-select is
+showing its "mixed" placeholder, where there is no single value to be honest about.
+
+The second rule is guarded **statically**, and the reason is worth keeping: the helper was
+already written, correct and unit-tested when the fix was declared done against the two views
+that had been reported. A close-out sweep then found **seven** more unspliced numeric selects
+— atlas page size, model texture max-size and UASTC level, three font controls, and a *second*
+UASTC select in the very file the fix had just edited. Testing a helper proves nothing about
+its call sites, and the call sites are where every instance of this bug has lived. So
+`tests/architecture/importSettingSelectsSpliced.test.ts` requires every option-producing
+`.map()` under `assetViews/**` to either splice or name itself in a documented exemption list
+(the exemptions are all string-valued or dynamically-built lists).
+
+Complementary, not redundant: `tests/assets/importSettingsOptions.test.ts` separately asserts
+every import-setting **default** appears in its own option list. Splicing can never reveal a
+bad default — a spliced default looks perfectly correct in the dropdown.
+
 ### Animation Editor
 
 `editor/panels/AnimationEditor.tsx` — a Unity-style keyframe timeline for `.anim.json`

@@ -34,6 +34,7 @@ import { defaultForHint, FieldValueWidget, EntityRefField, useWorldDirtyTick } f
 import { AddComponentPicker } from './AddComponentPicker';
 import { UIActionBindingsField } from './UIActionBindingsField';
 import { MaterialOverridesField } from './MaterialOverridesField';
+import { ASSET_TYPES_WITH_ACTIONS } from './assetViews/assetActions';
 import { MeshAssetView } from './assetViews/MeshAssetView';
 import { MaterialAssetView } from './assetViews/MaterialAssetView';
 import { AnimSetAssetView } from './assetViews/AnimSetAssetView';
@@ -44,6 +45,7 @@ import { ModelBatchView } from './assetViews/ModelBatchView';
 import { SpriteAssetView } from './assetViews/SpriteAssetView';
 import { AtlasAssetView } from './assetViews/AtlasAssetView';
 import { AudioAssetView } from './assetViews/AudioAssetView';
+import { VideoAssetView } from './assetViews/VideoAssetView';
 import { EnvironmentAssetView } from './assetViews/EnvironmentAssetView';
 import { FontAssetView } from './assetViews/FontAssetView';
 import { ModelAssetView } from './assetViews/ModelAssetView';
@@ -1387,6 +1389,7 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
 
         {asset.type === 'particle' && (
           <button
+            data-ui-id="asset.open-particle"
             onClick={() => openAssetInEditor({ path: asset.path, type: 'particle', name: asset.name })}
             style={reimportBtnStyle}
           >
@@ -1396,6 +1399,7 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
 
         {asset.type === 'animation' && (
           <button
+            data-ui-id="asset.open-animation"
             onClick={() => openAssetInEditor({ path: asset.path, type: 'animation', name: asset.name })}
             style={reimportBtnStyle}
           >
@@ -1405,6 +1409,7 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
 
         {asset.type === 'rig2d' && (
           <button
+            data-ui-id="asset.open-rig2d"
             onClick={() => openAssetInEditor({ path: asset.path, type: 'rig2d', name: asset.name })}
             style={reimportBtnStyle}
           >
@@ -1414,6 +1419,7 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
 
         {asset.type === 'spriteanim' && (
           <button
+            data-ui-id="asset.open-spriteanim"
             onClick={() => openAssetInEditor({ path: asset.path, type: 'spriteanim', name: asset.name })}
             style={reimportBtnStyle}
           >
@@ -1421,10 +1427,25 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
           </button>
         )}
 
+        {/* A timeline has no import settings, so the Inspector's whole job here is the door
+            into the dockable Timeline Editor — same as every other editable kind. The open
+            call resolves the Director that references this asset, so its tracks' relative
+            name-paths bind (see `resolveDirectorRootForTimeline`). */}
+        {asset.type === 'timeline' && (
+          <button
+            data-ui-id="asset.open-timeline"
+            onClick={() => openAssetInEditor({ path: asset.path, type: 'timeline', name: asset.name })}
+            style={reimportBtnStyle}
+          >
+            Open in Timeline Editor
+          </button>
+        )}
+
         {asset.type === 'scene' && (
           <>
             <button
-              onClick={() => openAssetInEditor({ path: asset.path, type: 'scene', name: asset.name })}
+            data-ui-id="asset.open-scene"
+            onClick={() => openAssetInEditor({ path: asset.path, type: 'scene', name: asset.name })}
               style={reimportBtnStyle}
             >
               Open Scene
@@ -1441,11 +1462,16 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
 
         {asset.type === 'audio' && <AudioAssetView path={asset.path} name={asset.name} />}
 
+        {asset.type === 'video' && <VideoAssetView path={asset.path} name={asset.name} />}
+
         {asset.type === 'environment' && <EnvironmentAssetView path={asset.path} name={asset.name} />}
 
         {asset.type === 'font' && <FontAssetView path={asset.path} name={asset.name} />}
 
-        {!['model', 'prefab', 'texture', 'sprite', 'atlas', 'mesh', 'material', 'particle', 'animation', 'rig2d', 'spriteanim', 'scene', 'animset', 'audio', 'environment', 'font'].includes(asset.type) && (
+        {/* `SelectedAsset.type` is deliberately a loose `string` (editorStore), so widen for
+            the lookup rather than narrowing it here — an unrecognised type is exactly the
+            case this branch exists to report. */}
+        {!(ASSET_TYPES_WITH_ACTIONS as readonly string[]).includes(asset.type) && (
           <div style={{ color: '#555', fontSize: '11px' }}>No actions for {asset.type} assets</div>
         )}
       </div>

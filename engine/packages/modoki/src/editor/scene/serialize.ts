@@ -2,7 +2,8 @@
  *  Uses the trait registry — no hardcoded trait knowledge. */
 
 import { getAllEntities, readTraitData, findEntity, deleteEntities, subtreeIds } from '../../runtime/core/ecs/entityUtils';
-import { Transient } from '../../runtime/traits/Transient';
+import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
+import { Transient } from '../../runtime/core/traits/Transient';
 import { getCurrentWorld, spawnEntity } from '../../runtime/core/ecs/world';
 import { Camera } from '../../runtime/traits/Camera';
 import { Transform } from '../../runtime/core/traits/Transform';
@@ -197,7 +198,7 @@ export async function serializeScene(opts?: {
   // scrub/preview/play (a `Transient` root) AND its whole subtree from serialization — a
   // preview/scrub mutation must never reach disk. Exclude the subtree up front so ALL passes
   // below (guid pre-pass, prefab-child collection, the main loop) simply never see them, which
-  // avoids orphaning a transient prefab-instance's members. See runtime/traits/Transient.ts.
+  // avoids orphaning a transient prefab-instance's members. See runtime/core/traits/Transient.ts.
   const allInfos = getAllEntities();
   const transientIds = new Set<number>();
   for (const e of allInfos) {
@@ -1002,6 +1003,29 @@ export function newScene(): void {
   console.log('[Editor] New scene created');
 }
 
+/** Report (and reset) the #124 probe: authored entity fields that a SYSTEM rewrote while the
+ *  editor was stopped, and which this save therefore just persisted.
+ *
+ *  One grouped warning, never a refusal. The engine cannot tell a rogue write from an intended
+ *  one — a game may legitimately drive an authored entity from a projection — so the honest
+ *  move is to name it and let the human judge. The fix on the game's side is usually
+ *  `registerProjection(..., { pauseWhileStopped: true })`, which is why the message says so.
+ *
+ *  Exported for tests; `saveAll` is the only production caller. */
+export function warnAuthoredWritesWhileStopped(): void {
+  const { records, dropped } = getAuthoredWritesWhileStopped();
+  if (records.length === 0) return;
+  const lines = records.map(r => `  • ${r.name}.${r.trait}.${r.field}${r.count > 1 ? ` (${r.count}x)` : ''}`);
+  if (dropped > 0) lines.push(`  • …and ${dropped} more field(s) not listed`);
+  console.warn(
+    `[Editor] ${records.length} authored field(s) were changed by a running system while the editor was `
+    + `stopped, and this save wrote those values to disk:\n${lines.join('\n')}\n`
+    + `  If that is not intended, the projection driving them should be registered with `
+    + `{ pauseWhileStopped: true } (see docs/scene-loading.md § Authored vs runtime).`,
+  );
+  clearAuthoredWritesWhileStopped();
+}
+
 /** Save all editor-managed assets: the primary scene file (via `saveScene`), THEN
  *  every OTHER dirty scene in the loaded chain — a base edited in place (Phase 12,
  *  M3, scene-loading.md) — to ITS OWN file. Per-material edits are
@@ -1018,6 +1042,10 @@ export function newScene(): void {
 export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {}): Promise<SaveResult> {
   const primaryResult = await saveScene(opts);
   if (!primaryResult.saved) return primaryResult;
+  // #124, warn-only: name any authored field a system rewrote while the editor was stopped —
+  // those values were just written to disk. Reported AFTER the save succeeds so a refused save
+  // (playing/previewing) doesn't warn about a file nothing wrote.
+  warnAuthoredWritesWhileStopped();
 
   const extraSaved: { path: string; guid: string }[] = [];
   const failed: { path: string; guid: string; reason: string }[] = [];

@@ -7,6 +7,12 @@ import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { getEntityTraits, readTraitData, getAllEntities } from '@modoki/engine/runtime';
 import { getTraitByName } from '@modoki/engine/runtime';
 import { serializePrefab, instantiatePrefab, type PrefabFile } from '@modoki/engine/editor';
+import {
+  buildPrefabEditScene,
+  PREFAB_EDIT_ROOT_GUID,
+  PREFAB_EDIT_LOCAL_GUID_PREFIX,
+  collectPreservedLocalIds,
+} from '../../packages/modoki/src/editor/scene/prefabEdit';
 
 registerAllTraits();
 
@@ -217,5 +223,153 @@ describe('serializePrefab — what reaches the template', () => {
     const bag = (prefab.entities.find((x) => x.name === 'Rigged')!.traits.Animator) as Record<string, unknown>;
     expect(bag).not.toHaveProperty('activeClip');
     expect(bag).not.toHaveProperty('fadeElapsed');
+  });
+});
+
+/** `serializePrefab`'s `opts.preserveLocalIds` / `opts.name`, and `buildPrefabEditScene`'s
+ *  sentinel-guid stamping — added so a prefab-edit RE-SAVE keeps each member's existing
+ *  localId (the address space a scene's prefab-instance `overrides`/`removed`/
+ *  `removedTraits` are keyed in) instead of renumbering positionally, and keeps the
+ *  prefab's own `name` instead of taking it from the root entity. Without this, a prefab
+ *  authored with a gap in its numbering (a deleted member) silently compacted on the next
+ *  save and repointed/dropped every instance override — measured on sling's
+ *  `FieldCorner.prefab.json` (`drip` 4 → 2) and `cover-enemy.prefab.json` /
+ *  `green-enemy.prefab.json` (both renamed to "Enemy", the root entity's name). See
+ *  prefab.ts `serializePrefab` and prefabEdit.ts. */
+describe('serializePrefab — preserveLocalIds / name (prefab-edit re-save)', () => {
+  /** root + two children, in spawn order (root, child1, child2) — matches the order
+   *  `collectTree`'s BFS walk over `getAllEntities()` will produce. */
+  function spawnTree() {
+    const root = spawnEntity(getCurrentWorld(),
+      Transform({ x: 0, y: 0, z: 0 }),
+      EntityAttributes({ name: 'PLRoot', layer: '3d' }),
+    );
+    const child1 = spawnEntity(getCurrentWorld(),
+      Transform({ x: 1, y: 0, z: 0 }),
+      EntityAttributes({ name: 'PLChildUnmapped', layer: '3d', parentId: root.id() }),
+    );
+    const child2 = spawnEntity(getCurrentWorld(),
+      Transform({ x: 2, y: 0, z: 0 }),
+      EntityAttributes({ name: 'PLChildGapped', layer: '3d', parentId: root.id() }),
+    );
+    return { root, child1, child2 };
+  }
+
+  it('with NO opts, numbers positionally from 1 with rootLocalId 1 (regression guard)', () => {
+    const { root } = spawnTree();
+    const prefab = serializePrefab(root.id())!;
+    expect(prefab.rootLocalId).toBe(1);
+    const localIds = prefab.entities.map((e) => e.localId).sort((a, b) => a - b);
+    expect(localIds).toEqual([1, 2, 3]);
+  });
+
+  it('with preserveLocalIds, keeps a gapped id intact and allocates the unmapped member ABOVE the highest preserved id', () => {
+    const { root, child2 } = spawnTree();
+    // child2 keeps its original gapped id (4, as if localId 2-3 were deleted since
+    // the file was last saved); child1 is left out of the map (added during the edit).
+    const preserve = new Map<number, number>([[root.id(), 1], [child2.id(), 4]]);
+    const prefab = serializePrefab(root.id(), undefined, { preserveLocalIds: preserve })!;
+
+    const rootEntry = prefab.entities.find((e) => e.name === 'PLRoot')!;
+    const gapped = prefab.entities.find((e) => e.name === 'PLChildGapped')!;
+    const unmapped = prefab.entities.find((e) => e.name === 'PLChildUnmapped')!;
+
+    expect(rootEntry.localId).toBe(1);
+    expect(gapped.localId).toBe(4); // NOT compacted to 2
+    expect(unmapped.localId).toBe(5); // allocated above 4, not into the freed gap (2 or 3)
+  });
+
+  it('rootLocalId follows the preserved root id when it is not 1', () => {
+    const { root } = spawnTree();
+    const preserve = new Map<number, number>([[root.id(), 3]]);
+    const prefab = serializePrefab(root.id(), undefined, { preserveLocalIds: preserve })!;
+
+    expect(prefab.rootLocalId).toBe(3);
+    const rootEntry = prefab.entities.find((e) => e.name === 'PLRoot')!;
+    expect(rootEntry.localId).toBe(3);
+    // The unmapped children are allocated above the preserved root id.
+    const others = prefab.entities.filter((e) => e.name !== 'PLRoot').map((e) => e.localId).sort((a, b) => a - b);
+    expect(others).toEqual([4, 5]);
+  });
+
+  it('opts.name overrides the prefab name; without it, the root entity name is used', () => {
+    const { root } = spawnTree();
+    const named = serializePrefab(root.id(), undefined, { name: 'Custom Prefab Name' })!;
+    expect(named.name).toBe('Custom Prefab Name');
+
+    const unnamed = serializePrefab(root.id())!;
+    expect(unnamed.name).toBe('PLRoot'); // falls back to the root entity's name
+  });
+});
+
+/** `buildPrefabEditScene` stamps a sentinel guid on every entity of the synthetic
+ *  prefab-edit scene so `savePrefabEdit` can read back each member's ORIGINAL localId
+ *  after the loader reassigns dense ECS ids (see `collectPreservedLocalIds` in
+ *  prefabEdit.ts). Pure data transform — no live world / ECS ids involved. */
+describe('buildPrefabEditScene — sentinel guid stamping', () => {
+  it('stamps the root with PREFAB_EDIT_ROOT_GUID and non-root members with the prefix + their localId, including a rootLocalId that is not 1 and a gap in numbering', () => {
+    const prefab: PrefabFile = {
+      version: 1,
+      name: 'EditFixture',
+      rootLocalId: 3,
+      entities: [
+        { localId: 1, name: 'Leaf', traits: { EntityAttributes: { name: 'Leaf', parentId: 3 } } },
+        { localId: 3, name: 'Root', traits: { EntityAttributes: { name: 'Root', parentId: 0 } } },
+        // gap: no localId 2 or 4 — a member was deleted since the last save.
+        { localId: 5, name: 'Gappy', traits: { EntityAttributes: { name: 'Gappy', parentId: 3 } } },
+      ],
+    };
+
+    const scene = buildPrefabEditScene(prefab);
+    const byId = new Map(scene.entities.map((e) => [e.id, e]));
+
+    const rootGuid = (byId.get(3)!.traits.EntityAttributes as Record<string, unknown>).guid;
+    const leafGuid = (byId.get(1)!.traits.EntityAttributes as Record<string, unknown>).guid;
+    const gapGuid = (byId.get(5)!.traits.EntityAttributes as Record<string, unknown>).guid;
+
+    expect(rootGuid).toBe(PREFAB_EDIT_ROOT_GUID);
+    expect(leafGuid).toBe(`${PREFAB_EDIT_LOCAL_GUID_PREFIX}1`);
+    expect(gapGuid).toBe(`${PREFAB_EDIT_LOCAL_GUID_PREFIX}5`);
+  });
+});
+
+/** `collectPreservedLocalIds` — the READ-BACK half of the localId-preservation fix, and the
+ *  half that production alone exercises: `buildPrefabEditScene` writes the sentinel guids, a
+ *  real scene load reassigns the ECS ids densely, and only then is this called. Nothing but a
+ *  live editor round-trip covered it, which is exactly the seam the sweep found bugs in. The
+ *  ECS-id reassignment is simulated here by spawning in an order that does NOT match the
+ *  localIds — the whole point is that the two spaces are independent. */
+describe('collectPreservedLocalIds — sentinel read-back', () => {
+  it('maps ecsId → original localId, takes the root from rootLocalId, and ignores non-members', () => {
+    const world = getCurrentWorld();
+    // Spawned in an order unrelated to their localIds (4 before 2), as a real load would.
+    const root = spawnEntity(world, EntityAttributes({ name: 'CPRoot', guid: PREFAB_EDIT_ROOT_GUID }));
+    const gapped = spawnEntity(world, EntityAttributes({ name: 'CPGapped', guid: `${PREFAB_EDIT_LOCAL_GUID_PREFIX}4` }));
+    const mid = spawnEntity(world, EntityAttributes({ name: 'CPMid', guid: `${PREFAB_EDIT_LOCAL_GUID_PREFIX}2` }));
+    // A member the user ADDED during the edit: no sentinel, so it must be ABSENT from the map
+    // (serializePrefab then allocates it above the preserved ids rather than into a gap).
+    const added = spawnEntity(world, EntityAttributes({ name: 'CPAdded', guid: '' }));
+    // Scaffolding / an unrelated entity carrying a guid that is not a sentinel — must be ignored.
+    const scaffold = spawnEntity(world, EntityAttributes({ name: 'CPScaffold', guid: 'not-a-sentinel' }));
+
+    const map = collectPreservedLocalIds(7, root.id());
+
+    expect(map.get(root.id())).toBe(7);   // root's localId comes from rootLocalId, not its guid
+    expect(map.get(gapped.id())).toBe(4);
+    expect(map.get(mid.id())).toBe(2);
+    expect(map.has(added.id())).toBe(false);
+    expect(map.has(scaffold.id())).toBe(false);
+  });
+
+  it('a malformed sentinel is ignored rather than mapped to NaN/0', () => {
+    const world = getCurrentWorld();
+    const bad = spawnEntity(world, EntityAttributes({ name: 'CPBad', guid: `${PREFAB_EDIT_LOCAL_GUID_PREFIX}abc` }));
+    const zero = spawnEntity(world, EntityAttributes({ name: 'CPZero', guid: `${PREFAB_EDIT_LOCAL_GUID_PREFIX}0` }));
+
+    const map = collectPreservedLocalIds(1, 0);
+
+    // A NaN or 0 entry would collide in serializePrefab's allocator and silently renumber.
+    expect(map.has(bad.id())).toBe(false);
+    expect(map.has(zero.id())).toBe(false);
   });
 });

@@ -13,7 +13,7 @@ import { REF_FIELDS_BY_TRAIT } from './sceneValidation';
 import { parseClipBank } from '../audio/clipBank';
 import { parseAnimClipBank } from '../animation/animClipBank';
 import { getRunMode } from '../core/playState';
-import { Transient } from '../traits/Transient';
+import { Transient } from '../core/traits/Transient';
 
 /** A child subtree an instance adds beyond what its prefab defines. Anchored to
  *  an existing prefab member by `parentLocalId`; nested adds live in `children`

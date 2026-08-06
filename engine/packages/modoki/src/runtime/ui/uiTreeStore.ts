@@ -53,6 +53,10 @@ export interface UINodeData {
   textOverflow: string; maxLines: number;
   // ── Image ──
   imageSrc: string; imageMode: string;
+  /** This UI entity also carries a `VideoPlayer` — UINode mounts the clip into its box
+   *  (`UIVideoMount`), cropped by `imageMode`. Video as SCENERY, distinct from the
+   *  fullscreen `VideoOverlay` cutscene, which sits above everything. */
+  hasVideo: boolean;
   // ── Element type ──
   elementType: string; placeholder: string;
   // ── Range (slider) ──
@@ -181,7 +185,7 @@ function reconcileNode(node: UINodeData, nextPrev: Map<number, UINodeData>): UIN
 
 // Cache trait lookups (resolve once, reuse across frames)
 let _traitsCached = false;
-let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any;
+let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any, _videoMeta: any;
 
 function cacheTraits() {
   const allTraits = getAllTraits();
@@ -193,6 +197,7 @@ function cacheTraits() {
   _anchorMeta = allTraits.find(m => m.name === 'UIAnchor');
   _canvas2dMeta = allTraits.find(m => m.name === 'Canvas2D');
   _textAnimMeta = allTraits.find(m => m.name === 'TextAnimation');
+  _videoMeta = allTraits.find(m => m.name === 'VideoPlayer');
   _traitsCached = !!(_renderUIMeta && _uiElMeta);
 }
 
@@ -274,6 +279,12 @@ function buildTree(world: World): UINodeData[] {
         imageSrc: ui.imageSrc || '', imageMode: ui.imageMode || 'cover',
         elementType: ui.elementType || 'div', placeholder: ui.placeholder || '',
         rangeMin: ui.rangeMin ?? 0, rangeMax: ui.rangeMax ?? 100, rangeStep: ui.rangeStep ?? 1,
+        // A PLAIN SCALAR, always written, never an optional nested block: `_scalarKeys`
+        // is derived once from whichever node happens to be built first, so an
+        // only-sometimes-present key can be missed entirely — and a node whose video
+        // appeared or vanished would then keep its old object reference and never
+        // re-render (the same trap the textAnim play-gate comment below records).
+        hasVideo: !!(_videoMeta && entity.has(_videoMeta.trait)),
         children: [],
       };
 

@@ -10,6 +10,7 @@ import { loadProjectConfig } from './plugins/load-project-config'
 import { resolveModules } from './plugins/detect-modules'
 import { inlinePlayablePlugin } from './plugins/inlinePlayable'
 import { subgameBuildPlugin, SUBGAME_ENTRY_VIRTUAL_ID, subgameOutDir } from './plugins/subgameBuild'
+import { perfCoreWorkers } from './testWorkers'
 
 // C3: engine/ is the vite root (this config + index.html + app/ live here). The
 // npm root + node_modules stay at the repo root (Capacitor needs them there), so
@@ -17,6 +18,7 @@ import { subgameBuildPlugin, SUBGAME_ENTRY_VIRTUAL_ID, subgameOutDir } from './p
 // the repo root (engine/'s parent) — see the plugin's configResolved.
 const engineDir = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(engineDir, '..')
+
 
 // #29: build output goes to the OPEN PROJECT's dist/ — a flat one-game project
 // owns its own build output (games/<id>/dist), so building game A never clobbers
@@ -459,6 +461,24 @@ export default defineConfig(({ command }) => {
   test: {
     // Paths are relative to root (engineDir): tests/ and packages/ live under engine/.
     globals: true,
+    // ── WORKER COUNT: PERFORMANCE cores, not all cores (2026-08-06) ──
+    //
+    // Vitest defaults to `availableParallelism() - 1`, which on Apple Silicon counts EFFICIENCY
+    // cores as if they were performance ones. They are not: measured on this 12P+4E box, the same
+    // suite ran 179s at the default 15 workers and 84s at 12 — a 2.1x difference from nothing but
+    // the cap. The mechanism is that a CPU-bound test file scheduled onto an E core takes ~4x
+    // longer, and since vitest's wall-clock is set by its SLOWEST FILE, one unlucky placement
+    // becomes the whole run's critical path. Oversubscribing guarantees those placements.
+    //
+    // This got much worse when Court's hint sweeps were sharded across 19 files: with only 4 heavy
+    // files they almost always landed on P cores, so the problem was invisible. More parallelism
+    // exposed it rather than causing it.
+    //
+    // 8 workers measured 101s — undersubscribed — so this is a real optimum, not "smaller is
+    // better". Non-Apple-Silicon platforms fall through to vitest's default, which is correct for a
+    // homogeneous CPU; the sysctl simply does not exist there (Intel Macs included) and we keep the
+    // old behaviour rather than guessing.
+    ...perfCoreWorkers(),
     // Coverage is OFF unless --coverage is passed; this block only says what to measure
     // when it is. It exists because every coverage number this repo had acted on came
     // from a `grep`-for-imports proxy (docs/plans/editor-panel-logic-tests-plan.md), which

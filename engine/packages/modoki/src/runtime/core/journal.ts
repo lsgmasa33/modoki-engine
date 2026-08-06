@@ -23,7 +23,7 @@
  *  all journaling overhead in shipped games), not per-world state. */
 
 import { type World } from 'koota';
-import { getCurrentWorld } from './ecs/worldRegistry';
+import { getCurrentWorld, peekCurrentWorld } from './ecs/worldRegistry';
 import { EntityAttributes } from './traits/EntityAttributes';
 
 /** Triage severity for a journal event — the axis Claude filters on first when hunting
@@ -171,6 +171,19 @@ function liveEvents(s: JournalState): GameEvent[] {
  *  (`Time.frame`); tests/headless can set it directly. */
 export function setJournalTick(tick: number, world: World = getCurrentWorld()): void {
   journalStateFor(world).tick = tick;
+}
+
+/** The tick subsequent emits WILL be stamped with — so a non-journal observer can stamp its own
+ *  records on the same clock and correlate them by integer comparison. Added for the input watch
+ *  (`input/pointerRecorder.ts`), where lining a press up against what the game did next was
+ *  otherwise guesswork against wall-clock timestamps from two different sources (#134).
+ *
+ *  Uses `peek`, not `getCurrentWorld()`: an observer can run before a world exists (a press on a
+ *  loading screen is still evidence), and throwing there would make the recorder's own robustness
+ *  depend on scene lifecycle. 0 is the honest answer when nothing is keeping time yet. */
+export function journalTick(world: World | null = peekCurrentWorld()): number {
+  if (!world) return 0;
+  return journalStates.get(world)?.tick ?? 0;
 }
 
 // ── Entity → GUID references (Percept identity) ──────────────────────────────

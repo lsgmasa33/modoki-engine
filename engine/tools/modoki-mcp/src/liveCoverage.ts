@@ -73,4 +73,5 @@ export const LIVE_UNCOVERED: Readonly<Record<string, string>> = {
   modoki_menu: 'opens a native menu — modal, and only a human can dismiss one',
   modoki_eval: 'arbitrary code in the renderer',
   modoki_watch: "start leaves a standing watcher on the human's editor",
+  modoki_input_watch: "start leaves a standing pointer-capture window open on the human's editor",
 };

@@ -57,6 +57,11 @@ deterministic sim free of live DOM reads.
 - `runtime/core/pointerBlockers.ts` — the pointer-block-root registry (`registerPointerBlocker`/
   `isPointerBlocked`), consulted by `pointerSource.ts` at ingestion. Lives in `core/` (L0), not
   `input/` or `ui/` (both L2), because both need to reach it and there is no `ui → input` zone edge.
+- `runtime/input/pointerRecorder.ts` — the **input watch** (#134): a bounded, agent-readable record
+  of what the pointer actually did. Separate capture-phase listeners on `window`, attached only
+  while a watch window is open, so it sees a press regardless of what any layer downstream does
+  with it — blocked, `stopPropagation`'d, or a second finger `pointerSource` deliberately ignores.
+  See "The input watch" below.
 - `runtime/input/characterInputSystem.ts` / `characterInput3DSystem.ts` — GAME-tier bridges copying
   `Input` actions onto `CharacterController2D`/`3D` move/jump fields.
 - `runtime/input/inputPrompts.ts` / `inputPromptSources.ts` — the pure `promptFor(device, action)`
@@ -202,6 +207,71 @@ tables are plain read-only consts (a rebindable table is a later phase). Sources
 contributions and OR their held flags, which is why `clampAxes` exists. The `Input` resource is spawned
 automatically by `SceneManager` for every scene (like `Time`) — it's runtime-only, never authored into
 a scene file, and intentionally not an editor-inspectable trait.
+
+## The input watch — evidence for a gesture that did nothing
+
+The journal answers *"what did the game do"*. It cannot answer *"what did the player's finger do"*,
+and those become different questions the moment a gesture fails: a press that resolves to nothing
+emits nothing — no event, no commit, no coordinates. So the failure mode with the least evidence is
+the one players report most often ("I tried to drag it and nothing happened"). `pointerRecorder.ts`
+is the instrument for that class; the agent-facing tool over it is documented in
+[debug-tools-mcp.md](./debug-tools-mcp.md).
+
+Per press it records the down/up points, **travel distance and move-sample count**, hold duration,
+which pointer-block root swallowed it (if any), and what it resolved to. Travel and sample count are
+not padding: on the Galaxy A23 bug that produced this, *64 move samples over 1216 ms* is what killed
+the competing "the device dropped pointer samples so the drag never passed the slop threshold"
+hypothesis, and the measured 27.6 px miss is what showed the fix about to ship — a 1.2x grab
+forgiveness giving 27.31 px — would have failed by 0.3 px and looked like a different bug.
+
+Two properties are load-bearing:
+
+- **Gated, and genuinely free when closed.** No listener is even attached until a window opens, and
+  nothing is captured retroactively — same contract as the journal's `@contact` Tier-2 gating. Raw
+  pointer traffic is high-frequency; an always-armed recorder would cost every shipped game a
+  listener it never reads.
+- **On DEVICE it is the only blocked-press evidence there is.** `input.pointer.blocked`
+  (`pointerSource.ts`) is emitted under `import.meta.env.DEV` only, so in a debugBuild running on
+  a phone — the surface where touch targets are actually missed — that event does not exist. The
+  gating is deliberate and stays: a blocked press is *common* (every tap on chrome is one), and
+  un-gating it would let blocked presses dominate the 10,000-event journal ring. The watch is the
+  device answer instead, because it is gated on a window nobody opens by accident, and it records
+  the blocking root's identity, which the event never carried.
+- **"Could not look" is never reported as "nothing is there."** `resolved` is a three-way answer —
+  deliberately the same three-way [`screenPick.pickAt`](../engine/packages/modoki/src/runtime/core/screenPick.ts)
+  already makes. Something was hit (`by:'game'|'ui'|'pick'`), an authority looked and found nothing
+  (`by:'none'`, naming who), or **nobody could look** (`by:'unknown'`, with the reason). Collapsing
+  the last two would answer the one question the tool exists for with a confident lie.
+
+### A canvas game must publish its own hit-test
+
+The engine cannot hit-test a canvas game. No game surface registers a pick provider (that is
+deliberate — see `screenPick.ts`'s header: selection policy is game code), so a game whose targets
+live in its own `hitTest` records `by:'unknown'` for every press until it opts in:
+
+```ts
+import { noteInputResolution } from '@modoki/engine/runtime';
+
+press.target = hitTest(x, y);
+noteInputResolution(press.target && { kind: press.target.kind, id: cellName(...) });
+// …and at release, for the drop target:
+noteInputResolution(dropTarget && { kind: dropTarget.kind, id: … }, 'drop');
+```
+
+- **Call it from the hit-test itself**, not from a second implementation that agrees today — the
+  same rule `screenPick` states for pick providers.
+- **Passing `null` is meaningful**: "my hit-test ran and found nothing" is a different, far more
+  useful answer than staying silent.
+- **It is a no-op when no window is open**, so it stays unguarded at the call site.
+- **`phase` is explicit, not inferred from timing.** A game hit-tests from a SYSTEM, a frame or more
+  after the DOM event — a quick tap is finished and recorded before the game ever looks at it. So
+  presses are claimed in gesture order from a FIFO and a `'drop'` note names the gesture whose press
+  was claimed last. Inferring the phase from "which press is in flight" mis-assigns under exactly
+  the rapid input a missed-gesture investigation involves.
+
+Worked example: `games/court/runtime/systems.ts` (`noteHit`), with the wiring pinned by
+`games/court/tests/inputWatch.test.ts` — a suite that exists because nothing else in Court would
+notice if those three calls were deleted.
 
 ## Gotchas
 

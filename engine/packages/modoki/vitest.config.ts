@@ -1,5 +1,6 @@
 import { defineConfig } from 'vitest/config';
 import path from 'path';
+import { perfCoreWorkers } from '../../testWorkers';
 
 export default defineConfig({
   root: __dirname,
@@ -21,6 +22,10 @@ export default defineConfig({
   },
   test: {
     globals: true,
+    // Performance-core cap, shared with the app suite — see `engine/testWorkers.ts` for the
+    // measurement. `engine/scripts/verify.mjs` overrides it per lane so its concurrent vitest
+    // pools do not oversubscribe each other.
+    ...perfCoreWorkers(),
     include: ['tests/**/*.test.{ts,tsx}'],
     // The first test in a file cold-importing three.js / PixiJS + the engine can exceed the 5s
     // default on Windows under full-suite parallel load, so renderer tests (Scene2D, scene3DSync,

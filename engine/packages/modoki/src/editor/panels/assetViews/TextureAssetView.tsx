@@ -11,6 +11,7 @@ import { invalidateTexture } from '../../../runtime/loaders/textureResolver';
 import { registerSprite, isGuid, deriveGuid } from '../../../runtime/loaders/assetManifest';
 import { markUIDirty } from '../../../runtime/ui/uiTreeStore';
 import { inputStyle, BufferedNumberInput, MIXED_PLACEHOLDER } from '../fields';
+import { withCurrentValue } from './importSettingOptions';
 import { DropdownField, SubSection, formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';
 import { SpriteEditor } from '../SpriteEditor';
 import { NineSliceEditor } from '../NineSliceEditor';
@@ -96,7 +97,12 @@ export function TextureSettingsControls({ type, settings, mixed, onChangeType, o
           <span style={labelStyle}>Max Size</span>
           <select value={isMixed('maxSize') ? '' : String(settings.maxSize)} onChange={(e) => { if (e.target.value) onChange({ maxSize: Number(e.target.value) as TextureImportSettings['maxSize'] }); }} style={{ ...inputStyle, flex: 1 }}>
             {isMixed('maxSize') && <option value="">{MIXED_PLACEHOLDER}</option>}
-            {TEXTURE_MAX_SIZES.map((s) => <option key={s} value={s}>{s}</option>)}
+            {/* Splice a hand-authored off-list size in, or the select would display its
+                FIRST option (256) and misreport the texture's actual max size (#131). Skipped
+                while mixed — there is no single bound value to be honest about, and the
+                placeholder already says so. */}
+            {(isMixed('maxSize') ? TEXTURE_MAX_SIZES : withCurrentValue(TEXTURE_MAX_SIZES, settings.maxSize))
+              .map((s) => <option key={s} value={s}>{s}</option>)}
           </select>
         </div>
         <div style={rowStyle}>
@@ -146,7 +152,8 @@ export function TextureSettingsControls({ type, settings, mixed, onChangeType, o
                 style={{ ...inputStyle, flex: 1 }}
               >
                 {isMixed('uastcLevel') && <option value="">{MIXED_PLACEHOLDER}</option>}
-                {UASTC_LEVELS.map((l) => <option key={l} value={l}>{l}{l === DEFAULT_UASTC_LEVEL ? ' (default)' : ''}</option>)}
+                {(isMixed('uastcLevel') ? UASTC_LEVELS : withCurrentValue(UASTC_LEVELS, settings.uastcLevel ?? DEFAULT_UASTC_LEVEL))
+                  .map((l) => <option key={l} value={l}>{l}{l === DEFAULT_UASTC_LEVEL ? ' (default)' : ''}</option>)}
               </select>
             </div>
             <div style={rowStyle}>

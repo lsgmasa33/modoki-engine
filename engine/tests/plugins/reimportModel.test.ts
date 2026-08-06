@@ -198,7 +198,8 @@ describe('modelReimportHandler', () => {
     const committed = JSON.parse(fs.readFileSync(glbPath + '.meta.json', 'utf-8'));
     expect(committed.modelCache).not.toHaveProperty('triCounts');
     expect(committed.modelCache).not.toHaveProperty('lodBytes');
-    expect(committed.modelCache.hash).toBe('abc123'); // …but structural fields stay committed
+    expect(committed.modelCache).not.toHaveProperty('hash'); // machine-dependent by construction (#127) — peeled too
+    expect(committed.modelCache.processedPath).toBe('/games/g/assets/models/thing.glb.processed.glb'); // …but structural fields stay committed
   });
 
   it('defaults to postprocessor "none" + recipeVersion 0 when the sidecar omits it', async () => {

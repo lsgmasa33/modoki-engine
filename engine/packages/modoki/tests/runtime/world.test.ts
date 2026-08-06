@@ -122,6 +122,7 @@ describe('world entity index', () => {
       // failing to register: an unregistered spawn still resolves via the O(n) fallback and warns,
       // whereas a stale entry is a silent index HIT — findEntityById hands back a corpse and the
       // caller reads traits off it. games/agy did this per-frame on gem pickup; games/codex once.
+      // (Both scaffolds have since been deleted — those names are the bug's, not live paths.)
       const { spawnEntity, destroyEntity, findEntityById } = await getModule();
       const { world } = fakeWorld();
 

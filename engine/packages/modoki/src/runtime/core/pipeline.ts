@@ -5,6 +5,7 @@
 import type { World } from 'koota';
 import { isSimRunning } from './playState';
 import { registerUIAction, unregisterUIAction, type UIActionHandler, type UIActionDef } from './actionRegistry';
+import { beginSystemTick, endSystemTick } from './systemTick';
 
 type SystemFn = (world: World) => void;
 
@@ -122,9 +123,18 @@ export function runPipeline(world: World) {
     sorted = true;
   }
   const simRunning = isSimRunning();
-  for (const sys of systems) {
-    if (!simRunning && sys.priority < SYSTEM_PRIORITY.TRANSFORM) continue;
-    sys.fn(world);
+  // Wrap the loop (not each system individually — the flag just needs to be true for the
+  // duration of "a system might be spawning") in try/finally so a throwing system can't leave
+  // inSystemTick() stuck on for every frame after. See systemTick.ts + the spawnEntity comment
+  // in ecs/world.ts for why this exists (marking runtime-spawned entities Transient, #124).
+  beginSystemTick();
+  try {
+    for (const sys of systems) {
+      if (!simRunning && sys.priority < SYSTEM_PRIORITY.TRANSFORM) continue;
+      sys.fn(world);
+    }
+  } finally {
+    endSystemTick();
   }
 }
 

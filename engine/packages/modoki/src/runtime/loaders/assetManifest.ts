@@ -37,7 +37,19 @@ export type { SpriteAssetRef } from './spriteSheet';
 // here so runtime consumers keep importing them from the manifest.
 export type { AtlasPackedFrame, AtlasCacheBlock } from './spriteAtlas';
 
-export type AssetType = 'mesh' | 'material' | 'prefab' | 'scene' | 'model' | 'environment' | 'texture' | 'sprite' | 'atlas' | 'font' | 'shader' | 'particle' | 'animation' | 'animset' | 'spriteanim' | 'rig2d' | 'audio' | 'timeline' | 'video';
+/** Every asset kind the manifest can hold. A runtime ARRAY rather than a bare type union so
+ *  the set is enumerable — a guard can then assert that a consumer covers all of it. That is
+ *  not hypothetical bookkeeping: `video` (#130) and `timeline` (#132) each shipped a working
+ *  backend while the Inspector's hand-maintained list quietly omitted them, and both were
+ *  found by a human sweeping the union by eye rather than by anything failing. `AssetType` is
+ *  derived from this, so adding a kind here is still the only edit a new kind needs. */
+export const ASSET_TYPES = [
+  'mesh', 'material', 'prefab', 'scene', 'model', 'environment', 'texture', 'sprite', 'atlas',
+  'font', 'shader', 'particle', 'animation', 'animset', 'spriteanim', 'rig2d', 'audio',
+  'timeline', 'video',
+] as const;
+
+export type AssetType = typeof ASSET_TYPES[number];
 
 export interface AssetEntry {
   guid: string;

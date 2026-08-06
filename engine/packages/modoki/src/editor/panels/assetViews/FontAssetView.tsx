@@ -14,6 +14,7 @@ import {
 import { assetUrl } from '../../../runtime/loaders/assetUrl';
 import { inputStyle } from '../fields';
 import { DropdownField, formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';
+import { withCurrentValue } from './importSettingOptions';
 
 const CHARSET_OPTIONS: { value: FontCharsetPreset; label: string }[] = [
   { value: 'ascii', label: 'ASCII (printable, 95 glyphs)' },
@@ -32,6 +33,11 @@ const FIELD_TYPE_OPTIONS: { value: FontFieldType; label: string }[] = [
 ];
 
 const ATLAS_MAX_OPTIONS = [512, 1024, 2048, 4096];
+/** Hoisted out of the JSX so `withCurrentValue` can splice an off-list authored value in
+ *  without rebuilding the array on every render (it returns the same reference when nothing
+ *  needs adding, which an inline literal would defeat). See #131. */
+const FONT_SIZES = [32, 40, 48, 64, 96, 128];
+const FONT_PX_RANGES = [2, 4, 6, 8];
 
 export function FontAssetView({ path, name }: { path: string; name: string }) {
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
@@ -111,13 +117,13 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
       <div style={rowStyle}>
         <span style={labelStyle}>Glyph size (px/em)</span>
         <select value={String(settings.size)} onChange={(e) => update({ size: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
-          {[32, 40, 48, 64, 96, 128].map((s) => <option key={s} value={s}>{s}{s >= 96 ? ' (sharp corners)' : ''}</option>)}
+          {withCurrentValue(FONT_SIZES, settings.size).map((s) => <option key={s} value={s}>{s}{s >= 96 ? ' (sharp corners)' : ''}</option>)}
         </select>
       </div>
       <div style={rowStyle}>
         <span style={labelStyle}>Distance range (px)</span>
         <select value={String(settings.pxRange)} onChange={(e) => update({ pxRange: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
-          {[2, 4, 6, 8].map((s) => <option key={s} value={s}>{s}</option>)}
+          {withCurrentValue(FONT_PX_RANGES, settings.pxRange).map((s) => <option key={s} value={s}>{s}</option>)}
         </select>
       </div>
 
@@ -161,7 +167,7 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
           <div style={rowStyle}>
             <span style={labelStyle}>Runtime page size (px)</span>
             <select value={String(settings.atlasMax)} onChange={(e) => update({ atlasMax: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
-              {ATLAS_MAX_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
+              {withCurrentValue(ATLAS_MAX_OPTIONS, settings.atlasMax).map((s) => <option key={s} value={s}>{s}</option>)}
             </select>
           </div>
           <div style={{ color: '#666', fontSize: 10, marginTop: 2 }}>

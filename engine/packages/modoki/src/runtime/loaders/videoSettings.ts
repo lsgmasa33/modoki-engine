@@ -40,6 +40,16 @@ export type VideoPreset = 'ultrafast' | 'veryfast' | 'fast' | 'medium' | 'slow';
 /** What happens to the source audio track. */
 export type VideoAudioMode = 'keep' | 'strip';
 
+/** How the output size is chosen. The two are a MODE, not two knobs that compose:
+ *  a percentage and a pixel bound applied together produce a size that is neither
+ *  the one you asked for nor obviously wrong, and you cannot tell from the result
+ *  which of them won.
+ *  - `bounds`  — "no bigger than W×H". Aspect preserved, never upscaled. The default,
+ *                and the right answer when a hardware/texture budget is the constraint.
+ *  - `percent` — "half the source". The right answer when the source resolution is the
+ *                thing you are reasoning about and you just want less of it. */
+export type VideoResizeMode = 'bounds' | 'percent';
+
 export interface VideoImportSettings {
   delivery: VideoDelivery;
   policy: VideoDeliveryPolicy;
@@ -48,10 +58,22 @@ export interface VideoImportSettings {
    *  encoding gives a predictable *look* and lets simple footage cost fewer bytes. */
   quality: number;
   preset: VideoPreset;
+  /** Which of the two sizing controls below is in force. Absent in sidecars written
+   *  before percentage scaling existed, and `resolveVideoSettings` defaults it to
+   *  `'bounds'` — so an old clip keeps encoding to exactly the same bytes. */
+  resizeMode: VideoResizeMode;
   /** Downscale so neither dimension exceeds these. `0` keeps the source size.
-   *  Aspect ratio is always preserved; this is a bound, not a resize. */
+   *  Aspect ratio is always preserved; this is a bound, not a resize.
+   *  Ignored when `resizeMode` is `'percent'`. */
   maxWidth: number;
   maxHeight: number;
+  /** Output size as a percentage of the source, 10–100. Both axes scale together, so
+   *  aspect ratio is preserved by construction.
+   *
+   *  Capped at 100 on purpose — there is no upscale option, for the same reason
+   *  `bounds` never upscales: enlarging a source spends bytes on detail that is not
+   *  there. Ignored when `resizeMode` is `'bounds'`. */
+  scalePercent: number;
   /** Cap the frame rate. `0` keeps the source rate. */
   maxFps: number;
   /** Keyframe interval in SECONDS. Load-bearing for `policy: 'stream'` — seeking
@@ -78,8 +100,10 @@ export const DEFAULT_VIDEO_SETTINGS: VideoImportSettings = {
   policy: 'auto',
   quality: 23,
   preset: 'veryfast',
+  resizeMode: 'bounds',
   maxWidth: 1920,
   maxHeight: 1080,
+  scalePercent: 100,
   maxFps: 0,
   keyframeIntervalSec: 2,
   audio: 'keep',
@@ -96,11 +120,41 @@ export const VIDEO_QUALITIES: number[] = [18, 20, 23, 26, 30];
 
 export const VIDEO_PRESETS: VideoPreset[] = ['ultrafast', 'veryfast', 'fast', 'medium', 'slow'];
 
-/** Selectable max-dimension bounds (px). `0` = keep the source size. */
-export const VIDEO_MAX_DIMENSIONS: number[] = [0, 640, 1280, 1920, 3840];
+/** Selectable max-dimension bounds (px). `0` = keep the source size.
+ *
+ *  1080 is in the list because it is `DEFAULT_VIDEO_SETTINGS.maxHeight` — a default that
+ *  is not offered cannot be shown by the control that edits it, and a `<select>` given a
+ *  value none of its options carry silently displays its FIRST option instead. Every
+ *  unconfigured clip therefore reported its height bound as "Source". Keep this list and
+ *  the defaults in sync. */
+export const VIDEO_MAX_DIMENSIONS: number[] = [0, 640, 1080, 1280, 1920, 3840];
 
 /** Selectable frame-rate caps. `0` = keep the source rate. */
 export const VIDEO_MAX_FPS: number[] = [0, 24, 30, 60];
+
+/** Selectable output percentages. 100 = source size (still re-encoded, just not
+ *  resized). Nothing above 100 — see `scalePercent`. These are the PRESETS offered in
+ *  the inspector; a hand-authored sidecar may hold any value in the clamp range below. */
+export const VIDEO_SCALE_PERCENTS: number[] = [25, 33, 50, 66, 75, 100];
+
+export const VIDEO_SCALE_PERCENT_MIN = 10;
+export const VIDEO_SCALE_PERCENT_MAX = 100;
+
+/** The effective, integral scale percentage — the ONE reading of `scalePercent` that
+ *  both the ffmpeg filter and the cache key use, so they can never disagree.
+ *
+ *  The clamp is not defensive tidiness. Every other size field in this object treats
+ *  `0` as "keep the source" (`maxWidth`, `maxHeight`, `maxFps`), so `scalePercent: 0`
+ *  is a genuinely inviting thing to hand-author — and it would mean the opposite here,
+ *  emitting `scale=0:0` and failing the encode with an ffmpeg error that says nothing
+ *  about percentages. Anything at or below the floor is read as the floor; anything
+ *  above 100 as 100, since there is no upscale. NaN reads as 100 (source size) rather
+ *  than propagating into the filter expression. */
+export function resolveScalePercent(s: VideoImportSettings): number {
+  const raw = Math.round(s.scalePercent);
+  if (!Number.isFinite(raw)) return VIDEO_SCALE_PERCENT_MAX;
+  return Math.min(VIDEO_SCALE_PERCENT_MAX, Math.max(VIDEO_SCALE_PERCENT_MIN, raw));
+}
 
 /** The one and only container/codec. */
 export const VIDEO_EXTENSION = 'mp4';

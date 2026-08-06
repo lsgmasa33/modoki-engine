@@ -10,7 +10,12 @@ export { ENGINE_VERSION, SCENE_FORMAT_VERSION, ENGINE_API_VERSION } from './core
 export { WHITE_HDR_GUID, DEFAULT_FONT_GUID } from './assets/builtinAssets';
 export { getCurrentWorld, setCurrentWorld, onWorldSwap } from './core/ecs/world';
 export { hostCanvases, hostCanvasUnder } from './ui/hostCanvas';
-export { clientToDesign2D, designToClient2D } from './rendering/canvas2DScaler';
+// `computeCanvasScale` alongside the two point-mappers because a game that draws a FULL-SCREEN
+// quad in design space needs the same scale the mappers use internally: with a letterboxing
+// scaleMode the design box is smaller than the host element, so "cover the screen" is an extent
+// the game can only compute from that scale. Court re-derived it by hand and shipped a constant
+// that was 25% short on a wide host — exactly the drift `clientToDesign2D` exists to prevent.
+export { clientToDesign2D, designToClient2D, computeCanvasScale } from './rendering/canvas2DScaler';
 export type { World } from 'koota';
 export {
   registerTrait, getAllTraits, getTraitByName, getTraitMeta, inferFields,
@@ -282,7 +287,7 @@ export { rawNow, setManualNow, advanceManual, restoreRealClock, isManualClock } 
 export { stepSimulation, type StepOptions } from './core/stepSimulation';
 export { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';
 export {
-  emit, entityRef, journalEvents, drainJournal, clearJournal, setJournalTick, setJournalEnabled,
+  emit, entityRef, journalEvents, drainJournal, clearJournal, setJournalTick, journalTick, setJournalEnabled,
   resolveRefName, setVerboseCapture, verboseCaptureState, isVerboseType,
   isJournalEnabled,
   type GameEvent, type JournalLevel,
@@ -385,6 +390,16 @@ export { registerInputPromptSources } from './input/inputPromptSources';
 // sibling of the game canvas) claims exclusive ownership of pointer gestures that
 // start on it, so `pointerSource` never latches them as a game gesture.
 export { registerPointerBlocker, registerPointerPassthrough, isPointerBlocked } from './core/pointerBlockers';
+// Input WATCH (#134) — a game publishes what its OWN hit-test resolved a press to, which is the
+// one thing no engine-side observer can compute for a canvas game. Safe to call unconditionally:
+// it is a no-op until an agent opens a watch window.
+// The control half is consumed by `engine/app/debug/agentBridge.ts`, which reaches this package
+// only through its declared `exports` map — so an agent op cannot register without these.
+export {
+  noteInputResolution,
+  startInputWatch, stopInputWatch, clearInputPresses, readInputPresses, isInputWatchOpen,
+  type InputPressRecord, type InputResolution,
+} from './input/pointerRecorder';
 export {
   AXES, DIGITAL, applyDeadzone, clampAxes, computeEdges, computePointerEdge, createInputFrame, beginSample,
   makeAxes, makeFlags, makePointer,
@@ -410,7 +425,7 @@ export {
 } from './core/pipeline';
 export type { SystemOptions } from './core/pipeline';
 export { registerLateUpdate, unregisterLateUpdate, runLateUpdates, clearLateUpdates, type LateUpdateFn } from './core/lateUpdate';
-export { registerProjection, unregisterProjection, type SubscribableStore } from './core/projection';
+export { registerProjection, unregisterProjection, type SubscribableStore, type ProjectionOptions } from './core/projection';
 // ── Managers (event-driven counterpart to Systems) ──
 export {
   registerManager, registerManagers, unregisterManager, unregisterManagers,

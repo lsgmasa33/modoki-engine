@@ -1103,7 +1103,7 @@ export function registerAllTraits() {
   registerTrait({
     name: 'BloomPostFX', trait: BloomPostFX, category: 'resource',
     fields: {
-      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s bloom stage. WebGPU only; composes with NPR/Vignette/DOF/AO.' },
+      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s bloom stage. Runs on WebGPU and its WebGL2 fallback alike (only FXAA is WebGPU-only); composes with NPR/Vignette/DOF/AO.' },
       strength: { type: 'number', step: 0.05, min: 0, max: 3, tooltip: 'Bloom intensity / glow brightness. Typical 0.3–1.5.' },
       radius: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: 'Glow blur spread (softness/width). 0..1.' },
       threshold: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: 'Luminance threshold — only pixels brighter than this bloom. 0 = whole scene (good on a near-black void).' },
@@ -1113,7 +1113,7 @@ export function registerAllTraits() {
   registerTrait({
     name: 'VignettePostFX', trait: VignettePostFX, category: 'resource',
     fields: {
-      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s vignette stage. WebGPU only; composes with NPR/Bloom/DOF/AO.' },
+      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s vignette stage. Runs on WebGPU and its WebGL2 fallback alike (only FXAA is WebGPU-only); composes with NPR/Bloom/DOF/AO.' },
       intensity: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: 'Darkening strength at the screen edge. 0 = no vignette, 1 = edges go black.' },
       smoothness: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: 'Falloff softness of the radial mask. Higher spreads the darkening further toward the center.' },
     },
@@ -1122,7 +1122,7 @@ export function registerAllTraits() {
   registerTrait({
     name: 'DepthOfFieldPostFX', trait: DepthOfFieldPostFX, category: 'resource',
     fields: {
-      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s depth-of-field stage. WebGPU only; composes with NPR/Bloom/Vignette/AO.' },
+      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s depth-of-field stage. Runs on WebGPU and its WebGL2 fallback alike (only FXAA is WebGPU-only); composes with NPR/Bloom/Vignette/AO.' },
       focusDistance: { type: 'number', step: 0.5, min: 0, tooltip: 'Distance along the camera\'s look direction (world units) that stays in focus.' },
       focalLength: { type: 'number', step: 0.1, min: 0.01, tooltip: 'How far (world units) from the focus distance before it\'s fully out of focus. Smaller = shallower depth of field.' },
       bokehScale: { type: 'number', step: 0.1, min: 0, max: 5, tooltip: 'Unitless artistic multiplier on bokeh circle size.' },
@@ -1132,7 +1132,7 @@ export function registerAllTraits() {
   registerTrait({
     name: 'AmbientOcclusionPostFX', trait: AmbientOcclusionPostFX, category: 'resource',
     fields: {
-      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s GTAO stage. WebGPU only; composes with NPR/Bloom/Vignette/DOF. Adds a normal buffer to the scene pass (same one NPR uses) — a custom-shader material combined with AO must emit both MRT targets or its draw is dropped.' },
+      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s GTAO stage. Runs on WebGPU and its WebGL2 fallback alike (only FXAA is WebGPU-only); composes with NPR/Bloom/Vignette/DOF. Adds a normal buffer to the scene pass (same one NPR uses) — a custom-shader material combined with AO must emit both MRT targets or its draw is dropped.' },
       radius: { type: 'number', step: 0.05, min: 0.01, max: 2, tooltip: 'World-space sample radius for the occlusion horizon search.' },
       intensity: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: '0 = no darkening, 1 = full raw occlusion.' },
     },

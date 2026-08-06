@@ -83,8 +83,27 @@ function mtsdfBody(lang: 'wgsl' | 'glsl'): string {
     ${d(f)}insideGate = smoothstep(${F(0.4)}, ${F(0.55)}, rawSd);
     ${d(f)}sd = rawSd + clashUp * insideGate;
     ${d(v2)}unitRange = ${v2}(${M}uDistanceRange) / ${M}uTexSize;
-    ${d(v2)}screenTexSize = ${v2}(${F(1)}) / fwidth(vUV);
-    ${d(f)}spr = max(${F(0.5)} * dot(unitRange, screenTexSize), ${F(1)});
+${gpu ? `    ${d(v2)}screenTexSize = ${v2}(${F(1)}) / fwidth(vUV);
+    ${d(f)}spr = max(${F(0.5)} * dot(unitRange, screenTexSize), ${F(1)});`
+      : `    // ⚠️ fwidth() is NOT universally available. In GLSL ES 1.00 it needs
+    // OES_standard_derivatives, and some WebGL1 devices simply DO NOT HAVE that extension —
+    // iPhone 8 / iOS reports 'extension is not supported' and then
+    // 'fwidth: no matching overloaded function found', so the program fails to COMPILE and
+    // every glyph in the game disappears. Declaring the pragma with \`enable\` (see
+    // withDerivativesExtension) fixes the spec-strictness case but NOT this one: it downgrades
+    // the directive to a warning while fwidth stays undefined, so the failure just moves from
+    // the pragma line to the call site.
+    //
+    // So the derivative path is now compile-time OPTIONAL. \`GL_OES_standard_derivatives\` is
+    // defined only when the extension is both requested AND supported; __VERSION__ >= 300 covers
+    // WebGL2, where fwidth is core and the macro is absent. Everything else takes the CPU-supplied
+    // range — the standard msdfgen fallback, screenPxRange = fontSize / atlasSize * distanceRange.
+    #if defined(GL_OES_standard_derivatives) || __VERSION__ >= 300
+    vec2 screenTexSize = vec2(1.0) / fwidth(vUV);
+    float spr = max(0.5 * dot(unitRange, screenTexSize), 1.0);
+    #else
+    float spr = max(uScreenPxRange, 1.0);
+    #endif`}
     ${d(f)}edge = ${F(0.5)} - ${M}uWeight;
     ${d(f)}fill = clamp((sd - edge) * spr + ${F(0.5)}, ${F(0)}, ${F(1)});
 
@@ -164,6 +183,7 @@ const mtsdfBit = {
         uGlowStrength: f32,
         uShadowSoftness: f32,
         uDistanceRange: f32,
+        uScreenPxRange: f32,
       };
       @group(3) @binding(0) var<uniform> mtsdfUniforms: MtsdfUniforms;
     `,
@@ -193,6 +213,8 @@ const mtsdfBitGl = {
       uniform float uGlowStrength;
       uniform float uShadowSoftness;
       uniform float uDistanceRange;
+      // Only READ on the no-derivatives path; declared always so the std140 layout mirrors WGSL.
+      uniform float uScreenPxRange;
     `,
     main: mtsdfBody('glsl'),
   },
@@ -205,7 +227,7 @@ const mtsdfBitGl = {
 function toColorVec(hex: number, a: number): Float32Array {
   return new Float32Array([((hex >> 16) & 255) / 255, ((hex >> 8) & 255) / 255, (hex & 255) / 255, a]);
 }
-function mtsdfUniformValues(style: MtsdfStyle, atlasW: number, atlasH: number, distanceRange: number, atlasSize: number) {
+function mtsdfUniformValues(style: MtsdfStyle, atlasW: number, atlasH: number, distanceRange: number, atlasSize: number, fontSize: number) {
   return {
     uTextColor: { value: toColorVec(style.color >>> 0, style.opacity ?? 1), type: 'vec4<f32>' },
     uOutlineColor: { value: toColorVec((style.outlineColor ?? 0) >>> 0, style.outlineOpacity ?? 1), type: 'vec4<f32>' },
@@ -219,6 +241,11 @@ function mtsdfUniformValues(style: MtsdfStyle, atlasW: number, atlasH: number, d
     uGlowStrength: { value: style.glowStrength ?? 0, type: 'f32' },
     uShadowSoftness: { value: style.shadowSoftness ?? 0, type: 'f32' },
     uDistanceRange: { value: distanceRange, type: 'f32' },
+    // Used ONLY where fwidth is unavailable (see the shader body). Design-space, because the
+    // canvas scale is not known here — so on a downscaled canvas this over-estimates the range,
+    // which errs toward a crisper edge rather than a blurry one. Anything is an improvement on
+    // the alternative, which is a shader that does not compile and text that does not exist.
+    uScreenPxRange: { value: Math.max(1, (fontSize / Math.max(1, atlasSize)) * distanceRange), type: 'f32' },
   };
 }
 
@@ -268,12 +295,12 @@ export interface MtsdfPixiAtlas { width: number; height: number; distanceRange: 
  *  ways because the mesh adaptor differs per backend: WebGL reads
  *  `resources.uTexture`, WebGPU rebinds group 2 from `mesh.texture`. Callers must
  *  therefore ALSO set `mesh.texture = <same atlas>`. */
-export function makeMtsdfPixiShader(texture: Texture, atlas: MtsdfPixiAtlas, style: MtsdfStyle): Shader {
+export function makeMtsdfPixiShader(texture: Texture, atlas: MtsdfPixiAtlas, style: MtsdfStyle, fontSize: number): Shader {
   const glProgram = withDerivativesExtension(
     compileHighShaderGlProgram({ name: 'mtsdf-text', bits: [localUniformBitGl, textureBitGl, roundPixelsBitGl, mtsdfBitGl] }),
   );
   const gpuProgram = compileHighShaderGpuProgram({ name: 'mtsdf-text', bits: [localUniformBit, textureBit, roundPixelsBit, mtsdfBit] });
-  const mtsdfUniforms = new UniformGroup(mtsdfUniformValues(style, atlas.width, atlas.height, atlas.distanceRange, atlas.size) as any);
+  const mtsdfUniforms = new UniformGroup(mtsdfUniformValues(style, atlas.width, atlas.height, atlas.distanceRange, atlas.size, fontSize) as any);
   const shader = new Shader({
     glProgram, gpuProgram,
     resources: {

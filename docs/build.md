@@ -467,6 +467,30 @@ xcrun devicectl device process launch --device <DEVICE_ID> <appId>
 First device install requires trusting the developer profile: Settings → General →
 VPN & Device Management → Trust.
 
+**Two DIFFERENT ids, and only the first is required.** Both live in the project's gitignored
+`project.user.json` (per-machine, never committed — Project Settings → Build → "This Machine"):
+
+| Field | From | Required? | Used by |
+|---|---|---|---|
+| `iosDeviceId` | `xcrun xctrace list devices` — the hardware UDID | **Yes** | `xcodebuild -destination 'id=…'` |
+| `iosDevicectlId` | `xcrun devicectl list devices` — a different GUID | No | `devicectl` install + launch |
+
+They are not interchangeable: `xcodebuild` rejects the devicectl GUID (see
+`wdaLauncher.parseIosDevices`, which reads `hardwareProperties.udid` for exactly this reason).
+
+⚠️ **`devicectl` is CoreDevice-only — iOS 17+.** A pre-iOS-17 device has no devicectl id *in
+existence*: `xcrun devicectl list devices` lists it `unavailable`, with no
+`hardwareProperties.udid` at all. So leave `iosDevicectlId` **empty** for such a device and the
+build plans an **Xcode handoff** instead — it builds, opens the `.xcodeproj`, and reports
+success; you press Run (⌘R) to deploy. The decision is `planIosInstall`
+(`engine/plugins/vite-asset-scanner.ts`), deliberately one exported pure function so the
+preflight guard and the step plan cannot disagree.
+
+That disagreement is exactly what shipped for a while: the preflight demanded BOTH ids, so a
+build that `xcodebuild` handles perfectly was refused before it started, and the refusal named
+`project.config.json` — the wrong file. Caught on an iPhone 8 / iOS 16.7.16, whose build then
+succeeded unchanged once the demand was dropped.
+
 ### Android Device
 ```bash
 MODOKI_PROJECT=games/<id> npm run build -- --target native

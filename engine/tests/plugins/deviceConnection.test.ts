@@ -103,9 +103,9 @@ describe('DeviceConnectionManager (real TCP)', () => {
     const status = await mgr.disconnect();
     expect(status.state).toBe('disconnected');
     expect(status.target).toBeNull();
-    // Give the server's close handler a tick, then confirm the lease is free.
-    await new Promise((r) => setTimeout(r, 20));
-    expect(authority.status(Date.now()).leased).toBe(false);
+    // POLL for the server's close handler, never a fixed sleep — see the note on the reconnect
+    // waits below for why this whole class was converted.
+    await vi.waitFor(() => expect(authority.status(Date.now()).leased).toBe(false));
   });
 
   it('errors (not throws) when neither IP nor adb is provided', async () => {
@@ -151,12 +151,21 @@ describe('DeviceConnectionManager (real TCP)', () => {
     expect(mgr.status().state).toBe('connected');
 
     device.dropClient();                                   // socket dies (WiFi blip)
-    await new Promise((r) => setTimeout(r, 60));
-    expect(mgr.status().state).toBe('reconnecting');
+    // ⚠️ POLL, never a fixed sleep. These were `setTimeout(r, 60)` and `setTimeout(r, 1400)` —
+    // bets that a state transition completes inside a hardcoded window, which is true on an idle
+    // machine and false under load. That is the same defect that made `riggedModelCache`'s
+    // `setTimeout(r, 5)` a recurring spurious red in `npm run verify`, and it got sharper when
+    // verify started running its legs concurrently (2026-08-06): the point of that change is to
+    // keep every core busy, which is exactly the condition these raced under.
+    //
+    // Polling is also FASTER here. The 1400ms wait was sized to clear `reconnectDelayMs` (1000)
+    // plus slack and was paid in full on every run; `vi.waitFor` returns the moment the state
+    // actually flips, so it costs the real reconnect time instead of the worst case.
+    await vi.waitFor(() => expect(mgr.status().state).toBe('reconnecting'));
 
     // Same device still listening; the client re-presents the same guid within grace.
-    await new Promise((r) => setTimeout(r, 1400));         // > reconnectDelayMs (1000)
-    expect(mgr.status().state).toBe('connected');
+    // Timeout must clear reconnectDelayMs (1000) with room, or the poll itself becomes the flake.
+    await vi.waitFor(() => expect(mgr.status().state).toBe('connected'), { timeout: 5000 });
     expect(authority.status(Date.now()).guid).toBe('guid-recon');
   });
 

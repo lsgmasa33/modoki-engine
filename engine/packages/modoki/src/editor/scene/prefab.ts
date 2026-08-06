@@ -5,7 +5,7 @@ import { validatePrefabData } from '../../runtime/loaders/sceneValidation';
 import { backendFetch } from '../backend/editorBackend';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, readTraitDataFull, writeTraitField, findEntity, subtreeIds, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
-import { Transient } from '../../runtime/traits/Transient';
+import { Transient } from '../../runtime/core/traits/Transient';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
@@ -103,7 +103,29 @@ function collectTree(entityId: number, allEntities: EntityInfo[]): EntityInfo[] 
  *  child `prefab` GUID + captured overrides/structure — and their members are
  *  excluded from the flat output. The selection root itself is never collapsed
  *  this way (so "save instance as prefab" still flattens the instance). */
-export function serializePrefab(selectedEntityId: number, existingId?: string): PrefabFile | null {
+export function serializePrefab(
+  selectedEntityId: number,
+  existingId?: string,
+  opts?: {
+    /** ecsId → the localId that entity ALREADY had in the prefab being re-saved.
+     *
+     *  Only prefab-edit can supply this, and only prefab-edit needs it: localIds are the
+     *  address space a SCENE's `overrides` / `removed` / `removedTraits` are keyed in, so
+     *  renumbering them on a re-save silently repoints or drops every override on every
+     *  instance. Positional numbering does renumber — a prefab whose members were authored
+     *  with a gap (a deleted sibling) compacts on the next save (measured on sling's
+     *  FieldCorner: `drip` 4 → 2). Members with no entry here (the user added them during
+     *  the edit) are allocated ABOVE every preserved id, never into a freed gap. */
+    preserveLocalIds?: Map<number, number>;
+    /** Keep this as the prefab's `name` instead of taking the ROOT ENTITY's name.
+     *
+     *  The two are independent: the asset is named by its file, the root entity by the
+     *  author. Defaulting to the root's name silently renames the asset on any re-save —
+     *  measured on sling, where "Cover Enemy" and "Green Enemy" both became "Enemy"
+     *  because that is what their root entity is called. */
+    name?: string;
+  },
+): PrefabFile | null {
   const allEntities = getAllEntities();
   const tree = collectTree(selectedEntityId, allEntities);
   if (tree.length === 0) return null;
@@ -144,10 +166,24 @@ export function serializePrefab(selectedEntityId: number, existingId?: string): 
     }
   }
 
-  // Assign stable localIds (1-based, root = 1) over the surviving tree.
+  // Assign localIds over the surviving tree. Without a preserve map this is the original
+  // positional numbering (1-based, root = 1) — the create-a-prefab-from-an-entity path, where
+  // there is no prior numbering to honour. With one (a prefab-edit RE-save) every member keeps
+  // the id it already had, so a scene's localId-keyed overrides keep pointing at the same
+  // member; only genuinely new members are allocated, above the highest preserved id.
   const flatTree = tree.filter((e) => !skip.has(e.id));
   const ecsToLocal = new Map<number, number>();
-  flatTree.forEach((e, i) => ecsToLocal.set(e.id, i + 1));
+  const preserve = opts?.preserveLocalIds;
+  if (preserve) {
+    let next = 0;
+    for (const e of flatTree) next = Math.max(next, preserve.get(e.id) ?? 0);
+    for (const e of flatTree) {
+      const kept = preserve.get(e.id);
+      ecsToLocal.set(e.id, kept ?? ++next);
+    }
+  } else {
+    flatTree.forEach((e, i) => ecsToLocal.set(e.id, i + 1));
+  }
 
   const allTraits = getAllTraits();
   const prefabEntities: PrefabEntity[] = [];
@@ -245,8 +281,11 @@ export function serializePrefab(selectedEntityId: number, existingId?: string): 
     // v2 only when the prefab actually nests another — keeps flat prefabs at v1
     // (no churn). Both versions share the same shape (nested fields are optional).
     version: nestedRefs.size > 0 ? 2 : 1,
-    name: tree[0].name,
-    rootLocalId: 1,
+    name: opts?.name ?? tree[0].name,
+    // The root's ASSIGNED id, not a hardcoded 1 — with a preserve map it keeps whatever the
+    // file already used, and every `parentId: <root>` in the entity rows is remapped through
+    // the same table, so the two can't disagree.
+    rootLocalId: ecsToLocal.get(selectedEntityId) ?? 1,
     entities: prefabEntities,
   };
 }

@@ -45,6 +45,7 @@ const MINIMAL: Record<string, Record<string, unknown>> = {
   device_diagnose: {},
   device_journal: {},
   device_watch: { action: 'list' },
+  device_input_watch: { action: 'read' },
   device_layout_bounds: {},
   device_resolve_refs: { refs: ['g-1'] },
   device_introspect: {},

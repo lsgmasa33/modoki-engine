@@ -28,6 +28,11 @@ export const VideoPlayer = trait({
   autoplay: false as boolean, // play on spawn / scene load (when the game is playing)
   muted: false as boolean,    // a muted clip is exempt from the autoplay gesture rule
   volume: 1 as number,        // 0..1, multiplied into the bus gain
+  // Seconds of audio fade at the END of a non-looping clip. 0 (default) = a hard cut.
+  // A ramp on the ELEMENT's own clock, not a tween on `volume`: the authored value is
+  // the target the fade descends FROM, so it stays readable in the Inspector and a
+  // seek backwards restores it instead of leaving the clip permanently silenced.
+  fadeOutSec: 0 as number,
   bus: 'sfx' as 'master' | 'music' | 'sfx' | 'ui',
   // How playback rate follows the engine timeScale. See the trait doc above.
   timeMode: 'diegetic' as 'diegetic' | 'presentation',

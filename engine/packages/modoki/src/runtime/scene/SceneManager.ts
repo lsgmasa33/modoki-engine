@@ -28,11 +28,12 @@ import { resolveKootaSchema } from './sceneSchema';
 import { resolveSceneChain, type SceneRef, type FetchSceneMeta } from './sceneChain';
 import { emit } from '../core/journal';
 import { clearAllOverrideMarks, getOverrideMarkSet, markOverride } from '../loaders/overrideMarks';
+import { clearAuthoredWritesWhileStopped } from '../core/ecs/authoredWrites';
 import { SCENE_FORMAT_VERSION } from '../core/version';
 
 import { Persistent } from '../traits/Persistent';
 import { Time } from '../core/traits/Time';
-import { Transient } from '../traits/Transient';
+import { Transient } from '../core/traits/Transient';
 import { Input } from '../traits/Input';
 import {
   acquireMaterial, acquireMesh, acquireModel, acquirePrefab, acquireEnvironment,
@@ -507,6 +508,12 @@ class SceneManagerImpl implements SceneManager {
       // loadSceneFile.ts). Every loadSceneFile call below therefore passes
       // `clearMarks: false`.
       clearAllOverrideMarks();
+      // Same reasoning, different bookkeeping: the #124 authored-write probe is keyed by raw ecs
+      // id too, and its records describe the scene being replaced — a save must never warn about
+      // an entity name from a scene that is no longer loaded. (Cleared here rather than from an
+      // `onWorldSwap` subscription at entityUtils import time: a module-scope side effect there
+      // breaks every test that mocks `core/ecs/world`.)
+      clearAuthoredWritesWhileStopped();
       const stagingWorld = nextWorld; // captured for closures so TS narrows from null
       const eaMeta = getAllTraits().find((m) => m.name === 'EntityAttributes');
       const piMeta = getAllTraits().find((m) => m.name === 'PrefabInstance');

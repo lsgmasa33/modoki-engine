@@ -171,6 +171,40 @@ variants into `dist/` and **drops the source PNG**; per-texture settings are
 baked into the dist `assets.manifest.json` so the runtime resolves variant URLs
 without a per-file fetch.
 
+## Committed vs machine-local sidecar fields
+
+`plugins/meta-sidecar.ts` (`readMetaSidecar`/`writeMetaSidecar`, used by every
+asset type's `.meta.json`, not just textures) splits each write into two files:
+the committed `<asset>.meta.json` and a gitignored `<asset>.meta.local.json`
+sibling holding this host's regenerated values, merged back on read (local
+wins). What's committed: the GUID, import **settings** (the `texture`/`model`/
+`font`/... block an editor authors), and the STRUCTURAL cache fields the
+runtime/build actually consume (`lodPaths`, `lodDistances`, `variants`, `width`/
+`height`, `glyphCount`, ...) — these are stable across a shared provisioned
+toolchain. What's NOT committed: the volatile byte-SIZE stats
+(`variantBytes`/`lodBytes`/`triCounts`/`bytes` — Inspector-display only, a
+native encoder like `toktx`/`msdf-atlas-gen`/`ffmpeg` emits a slightly
+different-sized file per host from identical input) and, as of #127,
+**`modelCache.hash`** specifically. That hash is machine-dependent BY
+CONSTRUCTION, not merely volatile: `hashKey()` (`plugins/model-cache.ts`) mixes
+in local gltfpack/gltf-transform/meshopt CLI versions, and `riggedHash`
+(`plugins/rigged-model-optimize.ts`) additionally encodes whether `toktx`
+exists on PATH at all — a manual, per-machine install. With four+ clones the
+hash never converges: each rewrites it back on its own next build (measured:
+commit 471ca0cf's entire GLB-sidecar diff was 7 `"hash"` lines and nothing
+else). The other cache blocks' hashes (`textureCache.hash`, `fontCache.hash`,
+...) stay committed — they mix only source bytes + settings + an in-repo
+encoder version, so they ARE reproducible across machines.
+
+A fresh checkout has no `.meta.local.json` (gitignored), so it self-heals for
+free: the serving path already treats a missing/stale model hash as a cache
+miss and re-bakes (`autoBakeThenServe`, `plugins/backend/staticAssets.ts`,
+written for the same "fresh checkout, no local cache" case). Existing
+committed sidecars with a stale `modelCache.hash` are cleaned up by
+`engine/scripts/migrate-meta-sidecars.mjs`, which round-trips every tracked
+`.meta.json` through the real read/write functions; `engine/tests/assets/
+metaSidecarChurn.test.ts` guards against a regression re-introducing one.
+
 ## Sprite atlas packing
 
 An `.atlas.json` names an explicit set of member sprite GUIDs (Phase-1 slices

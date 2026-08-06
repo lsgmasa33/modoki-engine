@@ -43,6 +43,18 @@ vi.mock('../../src/runtime/rendering/Canvas2DMount', () => ({
     }),
 }));
 
+vi.mock('../../src/runtime/video/UIVideoMount', () => ({
+  // Surfaces `fit` and `priority` so the game-outranks-the-authoring-viewport rule is
+  // assertable from the CALL SITE — UIVideoMount's own tests can only see what it is handed.
+  UIVideoMount: ({ entityId, fit, priority }: { entityId: number; fit?: string; priority?: number }) =>
+    React.createElement('div', {
+      'data-testid': 'uivideomount',
+      'data-entity-id': entityId,
+      'data-fit': fit,
+      'data-priority': String(priority),
+    }),
+}));
+
 import { UINode, cssVal, hexToRgba, hexToColor } from '../../src/runtime/ui/UINode';
 import { NineSliceImage } from '../../src/runtime/ui/NineSliceImage';
 import type { UINodeData } from '../../src/runtime/ui/uiTreeStore';
@@ -77,7 +89,7 @@ function makeNode(over: Partial<UINodeData> = {}): UINodeData {
     textColor: 0xffffff, textOpacity: 1, textAlign: 'left', lineHeight: 0, letterSpacing: 0,
     textShadowColor: 0, textShadowOpacity: 1, textShadowOffsetX: 0, textShadowOffsetY: 0, textShadowBlur: 0,
     textStrokeColor: 0, textStrokeOpacity: 1, textStrokeWidth: 0, textOverflow: 'clip', maxLines: 0,
-    imageSrc: '', imageMode: 'cover', elementType: 'div', placeholder: '',
+    imageSrc: '', imageMode: 'cover', hasVideo: false, elementType: 'div', placeholder: '',
     rangeMin: 0, rangeMax: 100, rangeStep: 1,
     children: [],
     ...over,
@@ -494,6 +506,70 @@ describe('UINode canvas2D branch', () => {
     render(<UINode node={node} storeState={{}} />);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('entity 12'));
     expect(warn.mock.calls[0][0]).toMatch(/will NOT mount/);
+    warn.mockRestore();
+  });
+
+  // ── Video in a UI node ──────────────────────────────────────────────────────────────
+  // The other half of the `hasVideo` seam (uiTreeReuse.test.ts drives the projection half).
+  it('mounts the video into the node box when hasVideo, carrying imageMode as the fit', async () => {
+    const node = makeNode({ entityId: 21, hasVideo: true, imageMode: 'contain' });
+    const { findByTestId } = render(<UINode node={node} storeState={{}} />);
+    const mount = await findByTestId('uivideomount');
+    expect(mount.getAttribute('data-entity-id')).toBe('21');
+    expect(mount.getAttribute('data-fit')).toBe('contain');
+  });
+
+  it('mounts the video from the Canvas2D branch too (a separate early return)', async () => {
+    // `videoLayer` is injected into TWO returns. Mutation-testing the plain-div one leaves the
+    // canvas2D one green, so it needs its own case: a 2D-canvas node over a video backdrop is
+    // exactly Court's shape.
+    const node = makeNode({
+      entityId: 25, hasVideo: true,
+      canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH' },
+    });
+    const { findByTestId } = render(<UINode node={node} storeState={{}} />);
+    expect((await findByTestId('uivideomount')).getAttribute('data-entity-id')).toBe('25');
+  });
+
+  it('does not mount a video when hasVideo is false', () => {
+    const { queryByTestId } = render(<UINode node={makeNode({ hasVideo: false })} storeState={{}} />);
+    expect(queryByTestId('uivideomount')).toBeNull();
+  });
+
+  it('the running game outranks the editor authoring viewport for the one element', async () => {
+    // There is ONE <video> per clip and a DOM node exists in one place, so with the editor's
+    // Game and Scene panels both mounting the UI tree, priority is what stops the last host to
+    // tick from winning ("the video plays only on Scene view, not on the game view").
+    // `onSelectEntity` is the discriminator — set only on SceneView.
+    const node = makeNode({ entityId: 22, hasVideo: true });
+    const game = render(<UINode node={node} storeState={{}} />);
+    expect((await game.findByTestId('uivideomount')).getAttribute('data-priority')).toBe('1');
+    cleanup();
+    const editor = render(<UINode node={node} storeState={{}} onSelectEntity={vi.fn()} />);
+    expect((await editor.findByTestId('uivideomount')).getAttribute('data-priority')).toBe('0');
+  });
+
+  it('suppresses the video with the other UI visuals (uiVisualsHidden)', () => {
+    const { queryByTestId } = render(
+      <UINode node={makeNode({ hasVideo: true })} storeState={{}} uiVisualsHidden />,
+    );
+    expect(queryByTestId('uivideomount')).toBeNull();
+  });
+
+  it('dev-warns when a VideoPlayer sits on a non-div elementType (picture would not mount)', () => {
+    // Same class as F8: an <input> is a void element, so `videoLayer` has nowhere to go and
+    // the clip decodes with audio on the bus and no picture at all.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    render(<UINode node={makeNode({ entityId: 23, hasVideo: true, elementType: 'input' })} storeState={{}} />);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('entity 23'));
+    expect(warn.mock.calls[0][0]).toMatch(/cannot host a video/);
+    warn.mockRestore();
+  });
+
+  it('does NOT warn for a video on a plain div', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    render(<UINode node={makeNode({ entityId: 24, hasVideo: true })} storeState={{}} />);
+    expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();
   });
 

@@ -18,6 +18,7 @@ import { TEXTURE_MAX_SIZES } from '../../../runtime/loaders/textureSettings';
 import { AssetRefField } from '../AssetRefField';
 import { inputStyle } from '../fields';
 import { reimportBtnStyle } from './widgets';
+import { withCurrentValue } from './importSettingOptions';
 
 interface AtlasSourceDoc {
   id?: string;
@@ -124,7 +125,7 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
       <div style={rowStyle}>
         <span style={labelStyle}>Page size</span>
         <select value={String(doc.pageSize)} onChange={(e) => update({ pageSize: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
-          {TEXTURE_MAX_SIZES.map((s) => <option key={s} value={s}>{s}</option>)}
+          {withCurrentValue(TEXTURE_MAX_SIZES, doc.pageSize).map((s) => <option key={s} value={s}>{s}</option>)}
         </select>
       </div>
       <div style={rowStyle}><span style={labelStyle}>Padding</span>{num(doc.padding, (n) => update({ padding: n }))}</div>

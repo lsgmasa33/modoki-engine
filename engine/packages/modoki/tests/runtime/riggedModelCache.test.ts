@@ -183,8 +183,13 @@ describe('riggedModelCache', () => {
 
   it('ensureRiggedModelLoaded loads without a scene owner (editor convenience)', async () => {
     ensureRiggedModelLoaded(REF);
-    await new Promise((r) => setTimeout(r, 5));
-    expect(getRiggedModel(REF)).toBeDefined();
+    // POLL, never a fixed sleep. This was `setTimeout(r, 5)`, which is a bet that the stubbed
+    // loader's `setTimeout(..., 0)` resolves within 5ms of wall-clock — true on an idle machine and
+    // false under load, so this test was a known spurious red in `npm run verify`. It got worse
+    // when verify started running its legs CONCURRENTLY (2026-08-06): the whole point of that
+    // change is to keep every core busy, which is exactly the condition this raced under. A gate
+    // you have to re-run to believe is worth less than a slow one.
+    await vi.waitFor(() => expect(getRiggedModel(REF)).toBeDefined());
     // A real scene release must NOT evict a lazily-held model.
     releaseRiggedModelsForScene(1);
     expect(getRiggedModel(REF)).toBeDefined();

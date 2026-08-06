@@ -879,6 +879,31 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
   }
 
+  // ── Input WATCH (#134, M→R) ── what the pointer actually did, and what it resolved to. ──
+  if (urlPath === '/api/input-watch/start' && method === 'POST') {
+    try { return json(await ctx.requestBrowser('input-watch-start', body ?? {})); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+  if (urlPath === '/api/input-watch/read' && method === 'GET') {
+    const limit = query.get('limit');
+    const precision = query.get('precision');
+    const params = {
+      unresolvedOnly: query.get('unresolvedOnly') === '1' || query.get('unresolvedOnly') === 'true',
+      ...(limit != null && limit !== '' && !Number.isNaN(Number(limit)) ? { limit: Number(limit) } : {}),
+      ...(precision != null && precision !== '' && !Number.isNaN(Number(precision)) ? { precision: Number(precision) } : {}),
+    };
+    try { return json(await ctx.requestBrowser('input-watch-read', params)); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+  if (urlPath === '/api/input-watch/stop' && method === 'POST') {
+    try { return json(await ctx.requestBrowser('input-watch-stop', {})); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+  if (urlPath === '/api/input-watch/clear' && method === 'POST') {
+    try { return json(await ctx.requestBrowser('input-watch-clear', {})); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+
   // ── POST /api/render-scene (M→R) ── deterministic offscreen render of the live
   // scene (caller-chosen size + camera), relayed to the renderer, decoded to a
   // temp file. Window-independent + reproducible (vs capture_viewport's window

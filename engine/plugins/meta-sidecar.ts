@@ -20,9 +20,25 @@
  *  stats out into a gitignored `<asset>.meta.local.json` and `readMetaSidecar`
  *  merges them back (local wins) — the committed `.meta.json` stays stable across
  *  hosts while the inspector still shows the live sizes. The STRUCTURAL cache
- *  fields (hash, variants, lodPaths, lodDistances, dims, glyphCount, ...) — which
- *  the serving/build/runtime DO consume and which are stable across a shared
+ *  fields (variants, lodPaths, lodDistances, dims, glyphCount, ...) — which the
+ *  serving/build/runtime DO consume and which are stable across a shared
  *  provisioned toolchain — remain in the committed sidecar.
+ *
+ *  `modelCache.hash` is the ONE structural field that fails that "stable across
+ *  hosts" test, so it is peeled too (#127). It is the validity key for a cache
+ *  that is itself gitignored, and it is machine-dependent BY CONSTRUCTION: both
+ *  `hashKey` (model-cache.ts) and `riggedHash` (rigged-model-optimize.ts) mix in
+ *  local CLI versions, and `riggedHash` additionally encodes whether `toktx`
+ *  exists at all — and KTX-Software is a manual install, so some clones have it
+ *  and some do not. Identical source bytes + identical settings therefore hash
+ *  DIFFERENTLY per machine, and with four clones it can never converge: each
+ *  rewrites the sidecar when it builds and the next rewrites it back. Measured:
+ *  commit 471ca0cf's entire GLB-sidecar diff was 7 hash lines and nothing else.
+ *  Nothing breaks without it — the serving path already treats a missing/stale
+ *  hash as a cache miss and re-bakes (see `autoBakeThenServe` in
+ *  backend/staticAssets.ts, written for the sibling "fresh checkout" case).
+ *  The OTHER blocks' hashes stay committed: they mix only source bytes, settings
+ *  and an in-repo encoder version, so they ARE reproducible across machines.
  */
 
 import fs from 'fs';
@@ -37,9 +53,19 @@ function localSidecarPath(absPath: string): string {
 
 /** Content-cache blocks that carry byte-size stats. */
 const CACHE_BLOCKS = ['textureCache', 'modelCache', 'fontCache', 'audioCache', 'environmentCache', 'atlasCache'] as const;
-/** Machine-local, inspector-only size fields peeled out of the committed sidecar.
- *  Everything else in a cache block (hash + structural fields) stays committed. */
+type CacheBlock = (typeof CACHE_BLOCKS)[number];
+/** Machine-local, inspector-only size fields peeled out of EVERY cache block. */
 const VOLATILE_STAT_KEYS = ['variantBytes', 'lodBytes', 'triCounts', 'bytes'] as const;
+/** Extra per-block keys that are host-dependent rather than merely volatile, so
+ *  committing them churns the tree between clones. See the module note for why
+ *  `modelCache.hash` is the only one. */
+const HOST_LOCAL_KEYS: Partial<Record<CacheBlock, readonly string[]>> = { modelCache: ['hash'] };
+
+/** Every key peeled out of `block` into the gitignored local sidecar. */
+function localKeysFor(block: CacheBlock): readonly string[] {
+  const extra = HOST_LOCAL_KEYS[block];
+  return extra ? [...VOLATILE_STAT_KEYS, ...extra] : VOLATILE_STAT_KEYS;
+}
 
 /** Read the sidecar JSON — the committed `.meta.json` with this machine's local
  *  byte-size stats merged back in (local values WIN, since they reflect what this
@@ -57,7 +83,7 @@ export function readMetaSidecar(absPath: string): Record<string, unknown> {
         const localBlock = local[block];
         if (!localBlock || typeof localBlock !== 'object') continue;
         const target = (meta[block] ??= {}) as Record<string, unknown>;
-        for (const k of VOLATILE_STAT_KEYS) if (k in localBlock) target[k] = localBlock[k];
+        for (const k of localKeysFor(block)) if (k in localBlock) target[k] = localBlock[k];
       }
     } catch { /* unreadable local stats → whatever the committed sidecar has stands */ }
   }
@@ -73,7 +99,7 @@ export function writeMetaSidecar(absPath: string, meta: Record<string, unknown>)
   for (const block of CACHE_BLOCKS) {
     const b = committed[block] as Record<string, unknown> | undefined;
     if (!b || typeof b !== 'object') continue;
-    for (const k of VOLATILE_STAT_KEYS) {
+    for (const k of localKeysFor(block)) {
       if (k in b) {
         (local[block] ??= {})[k] = b[k];
         delete b[k];

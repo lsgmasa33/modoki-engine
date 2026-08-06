@@ -1296,7 +1296,7 @@ export class Scene2DRenderer {
               buffer: new Buffer({ data: geo.colors, label: 'attribute-text-color', usage: BufferUsage.VERTEX | BufferUsage.COPY_DST }),
               format: 'float32x4', stride: 4 * 4, offset: 0,
             });
-            const shader = makeMtsdfPixiShader(ptex, atlas, style);
+            const shader = makeMtsdfPixiShader(ptex, atlas, style, t.fontSize);
             const mesh = new Mesh({ geometry, texture: ptex, shader });
             container.addChild(mesh);
             slot.pageMeshes.push(mesh); slot.textShaders.push(shader); slot.pageNums!.push(page);

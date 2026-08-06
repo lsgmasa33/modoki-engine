@@ -54,6 +54,11 @@ import {
   invalidateRig2D,
   findEntityByGuid,
   getCachedPrefab,
+  startInputWatch,
+  stopInputWatch,
+  clearInputPresses,
+  readInputPresses,
+  type InputPressRecord,
 } from '@modoki/engine/runtime';
 import { computeLayoutBounds, type LayoutBoundsParams, type LayoutEntry } from './layoutDump';
 import { tailWithCounts, tailHint, CONSOLE_TAIL_DEFAULT, JOURNAL_TAIL_DEFAULT } from './streamSummary';
@@ -805,6 +810,67 @@ registerAgentOp('watch-read', (params) => {
 });
 registerAgentOp('watch-list', () => listWatches());
 registerAgentOp('watch-clear', (params) => clearWatch((params as { id?: string })?.id));
+
+// ── Input WATCH (#134): what the POINTER actually did, and what it resolved to — the
+// evidence a failed gesture otherwise leaves NOTHING behind (no journal event, no commit, no
+// coordinates). Response shaping (limit/unresolvedOnly/precision) lives HERE, in the op, same
+// split as watch-read: `readInputPresses()` (the producer, `runtime/input/pointerRecorder.ts`)
+// stays a pure ring-buffer read with no agent-surface concerns. ──
+registerAgentOp('input-watch-start', (params) => startInputWatch((params ?? {}) as { max?: number }));
+
+const DEFAULT_INPUT_WATCH_LIMIT = 20;
+function isUnresolvedPress(p: InputPressRecord): boolean {
+  return p.resolved.by === 'none' || p.resolved.by === 'unknown';
+}
+/** Shared by `read` and `stop` (stop reports what was captured, same shape as a read). */
+function shapeInputWatchRead(params: unknown): unknown {
+  const p = (params ?? {}) as { limit?: number; unresolvedOnly?: boolean; precision?: number };
+  const out = readInputPresses();
+  const sig = resolvePrecision(p.precision);
+  const matched = p.unresolvedOnly ? out.presses.filter(isUnresolvedPress) : out.presses;
+  const limit = typeof p.limit === 'number' && Number.isFinite(p.limit) && p.limit > 0
+    ? Math.floor(p.limit) : DEFAULT_INPUT_WATCH_LIMIT;
+  // The ring is oldest-first; the MOST RECENT N is the tail.
+  const presses = matched.slice(Math.max(0, matched.length - limit));
+  const result: Record<string, unknown> = {
+    open: out.open,
+    max: out.max,
+    // Recomputed against what THIS call actually returns (post-filter, post-limit) — `totalCount`
+    // stays the producer's true all-time count, per §2 ("both present whenever a filter applied").
+    returnedCount: presses.length,
+    totalCount: out.totalCount,
+    dropped: out.dropped,
+    presses,
+  };
+  // "Could not look" must never read as "nothing is there" (§5): an empty list from a window that
+  // has never been opened is not evidence the gesture produced no presses — nobody was watching.
+  if (!out.open && out.totalCount === 0) {
+    result.hint = "No presses recorded — this input watch has never been opened (or was cleared). "
+      + "Call action:'start' BEFORE the gesture you want to capture, then read again.";
+  } else if (presses.length < matched.length) {
+    result.hint = `${matched.length} press(es) matched; showing the most recent ${presses.length}. Raise limit= to see more.`;
+  }
+  return roundFloats(result, sig);
+}
+registerAgentOp('input-watch-read', (params) => shapeInputWatchRead(params));
+/** `stop` is a CONTROL action, so it answers with control state and not with a truncated read.
+ *  It used to return `shapeInputWatchRead({})` — which took the DEFAULT limit of 20 and, past
+ *  that, emitted "Raise limit= to see more" on the one action whose param allowlist REFUSES
+ *  `limit`. That is the dead-end hint §6 forbids by name: it reads as the agent's mistake and
+ *  there is no call that satisfies it. The documented flow (stop, then read, without racing your
+ *  own probe) is unaffected — and now it is the only flow, rather than one of two shapes. */
+registerAgentOp('input-watch-stop', () => {
+  const before = readInputPresses();
+  stopInputWatch();
+  return {
+    ok: true,
+    open: false,
+    retained: before.returnedCount,
+    totalCount: before.totalCount,
+    hint: `Window closed; ${before.returnedCount} press(es) kept. Read them with action:'read'.`,
+  };
+});
+registerAgentOp('input-watch-clear', () => ({ ok: true, cleared: clearInputPresses() }));
 
 // ── Phase E: time-scale control (0=pause, 0.3=slow-mo, 2=fast) — inspect fast motion ──
 registerAgentOp('set-timescale', (params) => {

@@ -98,23 +98,27 @@ describe('writeMetaSidecar — committed / machine-local byte-stat split', () =>
     fontCache: { hash: 'h3', atlasWidth: 2048, glyphCount: 95, bytes: 627701 },
   });
 
-  it('keeps structural fields committed but peels byte-stats into <asset>.meta.local.json', () => {
+  it('keeps structural fields committed but peels byte-stats (and modelCache.hash) into <asset>.meta.local.json', () => {
     writeMetaSidecar(absPath, metaWithStats());
     const committed = JSON.parse(fs.readFileSync(absPath + '.meta.json', 'utf-8'));
-    // hash + structural fields stay in the committed sidecar…
-    expect(committed.modelCache.hash).toBe('h1');
+    // structural fields stay in the committed sidecar…
     expect(committed.modelCache.lodDistances).toEqual([0]);
     expect(committed.textureCache.variants).toEqual(['uastc']);
     expect(committed.fontCache.glyphCount).toBe(95);
-    // …byte-size stats do NOT.
+    // …other blocks' hashes stay committed (source bytes + settings + in-repo encoder version — reproducible)…
+    expect(committed.textureCache.hash).toBe('h2');
+    expect(committed.fontCache.hash).toBe('h3');
+    // …byte-size stats do NOT…
     expect(committed.modelCache).not.toHaveProperty('lodBytes');
     expect(committed.modelCache).not.toHaveProperty('triCounts');
     expect(committed.textureCache).not.toHaveProperty('variantBytes');
     expect(committed.fontCache).not.toHaveProperty('bytes');
-    // The stats live in the gitignored local sidecar.
+    // …and modelCache.hash does NOT (#127 — machine-dependent by construction).
+    expect(committed.modelCache).not.toHaveProperty('hash');
+    // The stats (and the model hash) live in the gitignored local sidecar.
     const local = JSON.parse(fs.readFileSync(absPath + '.meta.local.json', 'utf-8'));
     expect(local).toEqual({
-      modelCache: { triCounts: [150775], lodBytes: [3628528] },
+      modelCache: { hash: 'h1', triCounts: [150775], lodBytes: [3628528] },
       textureCache: { variantBytes: { uastc: 223651 } },
       fontCache: { bytes: 627701 },
     });

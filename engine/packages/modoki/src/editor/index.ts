@@ -73,4 +73,6 @@ export { hasUnsavedChanges, unsavedChangeCauses, markSceneSaved, type SaveResult
 
 // C7: the agent save-all path must honour prefab-edit mode like the human paths do —
 // otherwise an explicit `path` writes the SYNTHETIC prefab-edit world over a real scene.
-export { isEditingPrefab } from './scene/prefabEdit';
+// #125: prefab-edit is also the only round-trip that re-serializes a .prefab.json, so the
+// bulk re-save sweep (engine/scripts/resave-prefabs.sh) drives these three as agent ops.
+export { isEditingPrefab, openPrefabForEditing, savePrefabEdit, exitPrefabEditing } from './scene/prefabEdit';

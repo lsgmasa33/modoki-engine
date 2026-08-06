@@ -506,7 +506,7 @@ Two things the table is worth reading FOR, not just referring to:
 
 <!-- BEGIN GENERATED TOOL CATALOG -->
 
-*80 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
+*81 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
 run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fails `npm test`.*
 
 #### Read — answer a question about state (never changes anything)
@@ -593,6 +593,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_focus_entity` | POST `/api/editor-action` `focus-entity` | no persistence | editor + scene | entity | *(no args)* |
 | `modoki_gizmo` | POST `/api/editor-action` `set-gizmo` | session | editor | — | *(no args)* |
 | `modoki_history` | POST `/api/editor-action` *(op = your `action`)* | live | editor | — | `{"action":"undo"}` |
+| `modoki_input_watch` | GET `/api/input-watch/read` *(both varies)* | session | editor + renderer | — | `{"action":"read"}` |
 | `modoki_load_scene` | POST `/api/editor-action` `load-scene` | live | editor + project | asset | `{"path":"/assets/scenes/main.scene.json"}` |
 | `modoki_menu` | POST `/api/menu` | session | editor + electron | — | *(no args)* |
 | `modoki_new_scene` | POST `/api/editor-action` `new-scene` | live | editor + project | — | *(no args)* |
@@ -734,6 +735,19 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   (auto-expire). `read` returns per-series stats `first/last/min/max/delta/settled` + each series'
   entity `name`; narrow a broad watch with `name=`/`guids=`/`limit=` (`seriesTotal`/`seriesTruncated`
   report the full match count). Editor-side observer — zero shipped-game cost. (`app/debug/watch.ts`.)
+- **Input watch (what the finger did):** `modoki_input_watch`/`device_input_watch {start|read|stop|clear}`
+  — a bounded record of what the POINTER actually did and what it resolved to, for the failure mode
+  with the least evidence: a press that resolves to nothing emits no journal event, no commit, no
+  coordinates. `start` opens the window (records nothing before that call — no history, like `@contact`
+  capture); `read` returns the most-recent presses (down/up points, distance travelled, hold time,
+  move-sample count) plus what each one `resolved` to. `resolved.by` is the one field that tells "the
+  press hit nothing" (`'none'` — an authority looked and found nothing there) apart from "nothing could
+  answer" (`'unknown'` — nobody who could look was asked) — pass `unresolvedOnly:true` to isolate
+  exactly those. `stop` closes the window but KEEPS what was recorded; `clear` drops recorded presses
+  without closing it. Capture-phase on `window`, so it sees a press regardless of what any downstream
+  layer did with it (blocked, `stopPropagation`'d, a second finger the engine ignores). A game closes
+  the "nobody could look" gap by calling `noteInputResolution()` from its own hit-test.
+  (`runtime/input/pointerRecorder.ts`.)
 - **Editor session (perceive the human):** `modoki_editor_journal {type,source,since,sinceCap,merged,limit,clear}`
   — the human-authoring stream (`!` sigil: `!select`/`!edit`/`!transform`/`!create`/`!duplicate`/`!delete`/
   `!reparent`/`!play`/`!pause`/`!stop`/`!gizmo`/`!scene-load`/`!save`/`!undo`/`!redo`), GUID-addressed with

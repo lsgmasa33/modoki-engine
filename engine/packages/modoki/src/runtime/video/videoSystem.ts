@@ -23,7 +23,7 @@ import { VideoPlayer } from '../traits/VideoPlayer';
 import { EntityAttributes } from '../core/traits/EntityAttributes';
 import { getPlayState } from '../core/playState';
 import { onWorldSwap } from '../core/ecs/world';
-import { playVideo, applyTimeScale, type VideoHandle } from './videoService';
+import { playVideo, applyTimeScale, videoFadeGain, type VideoHandle } from './videoService';
 import { emitVideoStart, emitVideoEnd } from './VideoEvents';
 import { getTimeScale } from '../core/getTime';
 
@@ -37,6 +37,11 @@ interface Live {
   /** `@video.start` is emitted on the first frame the clip actually plays — not at
    *  handle creation, which can precede playback by a whole download. */
   startEmitted: boolean;
+  /** `@video.end` is emitted from the RECONCILE, when the handle is first observed to have
+   *  ended — not from the element's `ended` event. The event is a promptness hint that can be
+   *  missed entirely (see `LiveVideoHandle.ended`); a game listening for `@video.end` to
+   *  advance a cutscene must not be able to hang on a lost DOM event. */
+  endEmitted: boolean;
 }
 
 /** A clip being downloaded before it can play. Tracked separately from `live` so the
@@ -223,7 +228,6 @@ export function videoSystem(world: World): void {
       // Either a just-finished download's local URL, or the direct/streamed one.
       const url = localUrl ?? resolveSource?.(vp.clip)?.url ?? resolveUrl(vp.clip);
       if (!url) return; // unresolvable GUID — the manifest layer logs it
-      const clipAtCreate = vp.clip;
       const handle = playVideo({
         url,
         loop: vp.loop,
@@ -235,14 +239,13 @@ export function videoSystem(world: World): void {
         // clip authored with autoplay=false would play for one frame on spawn.
         autoplay: false,
         onEnded: () => {
-          const cur = live.get(id);
-          if (cur) cur.handle.pause();
-          // Fired from the ELEMENT's own ended event, so it reflects the clip really
-          // finishing rather than the reconcile noticing a frame later.
-          emitVideoEnd({ entity: entityGuid, clip: clipAtCreate });
+          // Pause promptly, from the element's own event. The `@video.end` EVENT is emitted by
+          // the reconcile below instead, so it cannot be lost with this callback (measured: an
+          // iPhone 8 played a clip to the end repeatedly and never once fired `ended`).
+          live.get(id)?.handle.pause();
         },
       });
-      l = { handle, clip: vp.clip, autoplayed: false, startEmitted: false };
+      l = { handle, clip: vp.clip, autoplayed: false, startEmitted: false, endEmitted: false };
       live.set(id, l);
       // A bundled/streamed clip never downloads, so it is loaded by definition.
       // Without this it would report 0 forever and any bound progress bar would stick.
@@ -261,14 +264,23 @@ export function videoSystem(world: World): void {
       if (!l.startEmitted) { l.startEmitted = true; emitVideoStart({ entity: entityGuid, clip: vp.clip }); }
     } else l.handle.pause();
 
-    // Live-applied fields.
-    l.handle.setVolume(vp.volume);
+    // Live-applied fields. The end-fade is a MULTIPLIER computed from the element's own
+    // clock, never a write back into `vp.volume` — that field is the authored target the
+    // ramp descends from, and tweening it would make the fade permanent (a replay or a
+    // seek backwards would start silent) as well as unreadable in the Inspector.
+    l.handle.setVolume(vp.volume * videoFadeGain(
+      l.handle.element.currentTime, l.handle.element.duration, vp.fadeOutSec,
+    ));
     l.handle.setMuted(vp.muted);
     l.handle.setRate(vp.rate);
 
-    // Reflect a finished non-looping clip back into the trait, so game logic and the
-    // Inspector can see it stopped without polling the element.
-    if (l.handle.ended && vp.playing) vp.playing = false;
+    // A finished non-looping clip: reflect it into the trait so game logic and the Inspector
+    // see it stopped without polling the element, and journal `@video.end` exactly once.
+    // Both keyed off `handle.ended`, which reads the ELEMENT rather than trusting the event.
+    if (l.handle.ended) {
+      if (vp.playing) vp.playing = false;
+      if (!l.endEmitted) { l.endEmitted = true; emitVideoEnd({ entity: entityGuid, clip: l.clip }); }
+    }
   });
 
   // Entities that lost the trait (or were despawned) leak their decoder otherwise.

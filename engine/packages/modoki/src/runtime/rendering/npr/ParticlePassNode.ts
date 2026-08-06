@@ -16,9 +16,13 @@
  *  The pass output (stylized + particles, in working space) is tone-mapped + encoded
  *  to the swapchain by stage 2's RenderPipeline (outputColorTransform = true).
  *
- *  WebGPU only (extends three's node PassNode). `scene.background` is nulled during
- *  the particle render — otherwise `renderer.render` repaints the background over the
- *  prefilled stylized color (the bug the spike chased down).
+ *  Node-pipeline only — it extends three's node `PassNode`, so it needs the
+ *  `WebGPURenderer` CLASS, NOT the WebGPU API: it runs on that renderer's WebGL2
+ *  backend too. (Said "WebGPU only" here until an iPhone 8 with no WebGPU at all
+ *  rendered the stack fine; see docs/rendering.md § Post-FX stack.)
+ *
+ *  `scene.background` is nulled during the particle render — otherwise `renderer.render`
+ *  repaints the background over the prefilled stylized color (the bug the spike chased down).
  */
 
 import * as THREE from 'three';

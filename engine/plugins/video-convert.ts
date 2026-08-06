@@ -14,7 +14,7 @@ import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
 import {
-  VIDEO_EXTENSION,
+  VIDEO_EXTENSION, resolveScalePercent,
   type VideoImportSettings,
 } from '../packages/modoki/src/runtime/loaders/videoSettings';
 import {
@@ -26,7 +26,22 @@ import { ensureFfmpeg, ffprobeBinary } from './ffmpeg-tool';
 function buildFilters(settings: VideoImportSettings): string[] {
   const filters: string[] = [];
   const { maxWidth, maxHeight } = settings;
-  if (maxWidth > 0 || maxHeight > 0) {
+  if (settings.resizeMode === 'percent') {
+    // Percentage of the source, both axes together — aspect is preserved by
+    // construction, so there is no force_original_aspect_ratio to apply.
+    //
+    // The even-dimension requirement (H.264 + yuv420p) is folded into the SAME
+    // expression rather than chained as a second scale: `trunc(iw*p/200)*2` is
+    // `trunc(iw*p/100 / 2) * 2`, i.e. the scaled width rounded down to a multiple of
+    // 2. Doing it in one pass keeps the arithmetic integer — a `scale=iw*0.33` with a
+    // float literal is where rounding disagreements between ffmpeg builds come from.
+    //
+    // At 100% this degenerates to `trunc(iw/2)*2`, which is exactly the even-rounding
+    // an odd-dimensioned source needs anyway. So "100%" is not a no-op filter, and
+    // that is deliberate: without it an odd source aborts the encode.
+    const p = resolveScalePercent(settings);
+    filters.push(`scale=trunc(iw*${p}/200)*2:trunc(ih*${p}/200)*2`);
+  } else if (maxWidth > 0 || maxHeight > 0) {
     // Bound, don't resize: scale down to fit the box, preserve aspect, and NEVER
     // upscale (`force_original_aspect_ratio=decrease` + `min(iw,…)`) — enlarging a
     // small source just costs bytes for no detail.

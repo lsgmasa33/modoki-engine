@@ -10,7 +10,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createWorld, trait } from 'koota';
 import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { Transform } from '../../src/runtime/core/traits/Transform';
-import { Transient } from '../../src/runtime/traits/Transient';
+import { Transient } from '../../src/runtime/core/traits/Transient';
 import { setCurrentWorld, registerEntity, indexEntityGuid } from '../../src/runtime/core/ecs/world';
 import { registerTrait } from '../../src/runtime/core/ecs/traitRegistry';
 import { serializeScene } from '../../src/editor/scene/serialize';

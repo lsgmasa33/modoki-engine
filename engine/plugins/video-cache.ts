@@ -17,7 +17,7 @@ import fs from 'fs';
 import path from 'path';
 import { createHash } from 'crypto';
 import {
-  VIDEO_EXTENSION,
+  VIDEO_EXTENSION, resolveScalePercent,
   type VideoImportSettings,
 } from '../packages/modoki/src/runtime/loaders/videoSettings';
 
@@ -30,13 +30,19 @@ export function getVideoCacheDir(projectRoot: string): string {
 }
 
 /** The conversion-affecting subset of the settings (delivery/policy excluded — see
- *  file header). `audioBitrate` is only meaningful when the audio track is kept, so
- *  it is excluded for `strip` — otherwise a bitrate left over from toggling audio
- *  off would needlessly re-hash a clip whose bytes are identical. */
+ *  file header). Only what changes the BYTES is hashed: `audioBitrate` is excluded
+ *  for `audio: 'strip'`, and the inactive half of the resize mode is excluded too —
+ *  otherwise a maxWidth left over from before switching to percentage would re-hash a
+ *  clip whose output is identical.
+ *
+ *  The `'bounds'` branch reproduces the pre-percentage string EXACTLY (`…|maxWidth|
+ *  maxHeight|…`, no mode marker). That is load-bearing, not tidiness: every clip
+ *  converted before percentage scaling existed defaults to `resizeMode: 'bounds'`, and
+ *  inserting a marker would change its key and silently re-encode every video in every
+ *  project on the next build. `'percent'` gets its own distinguishable `p<n>` segment. */
 function stableSettings(s: VideoImportSettings): string {
-  const base = [
-    s.quality, s.preset, s.maxWidth, s.maxHeight, s.maxFps, s.keyframeIntervalSec, s.audio,
-  ].join('|');
+  const size = s.resizeMode === 'percent' ? `p${resolveScalePercent(s)}` : `${s.maxWidth}|${s.maxHeight}`;
+  const base = [s.quality, s.preset, size, s.maxFps, s.keyframeIntervalSec, s.audio].join('|');
   return s.audio === 'keep' ? `${base}|ab${s.audioBitrate}` : base;
 }
 

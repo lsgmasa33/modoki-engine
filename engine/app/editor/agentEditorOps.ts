@@ -27,7 +27,8 @@ import {
   useEditorStore, type SelectedAsset,
   enterPlay, stopPlay, pausePlay,
   undo, redo, canUndo, canRedo, undoLabel, redoLabel, getEditVersion,
-  loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses, isEditingPrefab,
+  loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses,
+  isEditingPrefab, openPrefabForEditing, savePrefabEdit, exitPrefabEditing,
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, reparentEntity, ensureGuid, type TraitSpec,
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
@@ -207,6 +208,12 @@ function readViewport() {
 
 interface SetSelectionParams { entityId?: number | null; entityIds?: number[]; guid?: string; guids?: string[]; asset?: SelectedAsset | null }
 interface CreateEntityParams { spec: CreateEntitySpec; parentId?: number; parentGuid?: string }
+/** The prefab operations. The three `edit-*` actions drive PREFAB-EDIT MODE — opening a
+ *  `.prefab.json` in isolation, saving the edited template back, and returning to the scene
+ *  it was opened from. They are the only route that re-serializes a prefab file, which is why
+ *  the bulk re-save sweep (#125, engine/scripts/resave-prefabs.sh) is built on them. */
+type PrefabAction = 'instantiate' | 'create' | 'detach' | 'edit-open' | 'edit-save' | 'edit-exit';
+
 interface PrefabParams {
   /** Which prefab operation. Callers reaching this op DIRECTLY (`runAgentOp`, `modoki_eval`) may
    *  use `action`; anything arriving via `POST /api/editor-action` MUST use `prefabAction`.
@@ -216,10 +223,12 @@ interface PrefabParams {
    *  unreachable through it — and `modoki_prefab`, which spread its args over the routing key,
    *  sent `action:'instantiate'` as the op name and got a 400 listing the valid ops. Every
    *  prefab call through the MCP failed that way. */
-  prefabAction?: 'instantiate' | 'create' | 'detach';
-  action?: 'instantiate' | 'create' | 'detach';
-  /** instantiate: prefab asset path. create: source path to write. */
+  prefabAction?: PrefabAction;
+  action?: PrefabAction;
+  /** instantiate / edit-open: prefab asset path. create: destination path to write. */
   path?: string;
+  /** edit-open: discard unsaved live work instead of refusing (mirrors load-scene). */
+  force?: boolean;
   /** instantiate: parent entity id (default root). */
   parentId?: number;
   /** instantiate: parent entity guid (stable; wins over parentId). */
@@ -1305,8 +1314,71 @@ export function registerEditorAgentOps(): void {
       });
       return { ok: true, detached: snapshot.length, saved: false };
     }
+    // ── Prefab-edit mode (#125) ──
+    // The only path that re-SERIALIZES an existing .prefab.json. `create` writes a prefab FROM a
+    // scene entity; these open the template itself in an isolated synthetic world, so a save
+    // round-trips the file through the current serializer. That is what makes a bulk format
+    // migration possible (engine/scripts/resave-prefabs.sh) — and what makes an agent able to
+    // edit a prefab at all without instantiating, mutating and re-applying it.
+    if (which === 'edit-open') {
+      if (!p.path) throw new Error("prefab edit-open requires { path } — the prefab's served path, e.g. '/assets/prefabs/tree.prefab.json'.");
+      // Opening SWAPS the world exactly as load-scene does, so it destroys unsaved live work the
+      // same way and must refuse for the same reason. It additionally SAVES the current scene on
+      // the way in (prefabEdit.ts does this deliberately, so the return trip's reload-from-disk
+      // is non-destructive) — which is a write the caller should not discover afterwards.
+      guardUnsaved('prefab edit-open', p.force);
+      const scenePathBefore = getCurrentScenePath();
+      const name = p.path.split('/').pop()?.replace(/\.prefab\.json$/, '') ?? p.path;
+      await openPrefabForEditing({ path: p.path, name });
+      // openPrefabForEditing reports failure by console.error + early return (it is a UI path).
+      // An agent needs it to FAIL, not to report ok:true having done nothing — a bad path would
+      // otherwise leave the editor in the previous scene and the next edit-save would write the
+      // WRONG prefab, or nothing at all.
+      const editing = useEditorStore.getState().editingPrefab;
+      if (!editing || !isEditingPrefab()) {
+        throw new Error(
+          `prefab edit-open FAILED for ${p.path} — the editor is not in prefab-edit mode. The file was ` +
+          'not fetched or not parseable as a prefab (check the served path exists and is a .prefab.json). ' +
+          'See the editor console for the [PrefabEdit] error.',
+        );
+      }
+      return {
+        ok: true,
+        editing: { path: editing.path, guid: editing.guid, name: editing.name },
+        /** The scene saved + remembered on the way in; 'edit-exit' reloads it. */
+        returnScene: scenePathBefore,
+        savedReturnScene: scenePathBefore != null,
+        ...readEditorState(),
+      };
+    }
+    if (which === 'edit-save') {
+      if (!isEditingPrefab()) {
+        throw new Error(
+          "prefab edit-save: the editor is NOT in prefab-edit mode, so there is no prefab to write. " +
+          "Open one first (prefabAction:'edit-open' with the .prefab.json path).",
+        );
+      }
+      const editing = useEditorStore.getState().editingPrefab!;
+      const ok = await savePrefabEdit();
+      if (!ok) {
+        throw new Error(
+          `prefab edit-save FAILED for ${editing.path} — NOTHING was written. Either the prefab root ` +
+          'was not found in the edit world, serialization produced no prefab, or the file write was ' +
+          'rejected. See the editor console for the [PrefabEdit] error.',
+        );
+      }
+      return { ok: true, path: editing.path, guid: editing.guid, saved: true };
+    }
+    if (which === 'edit-exit') {
+      // Report not-editing rather than throwing: leaving a mode you are not in is a legitimate
+      // no-op, and an agent recovering from a failed edit-save should be able to call it blindly.
+      if (!isEditingPrefab()) return { ok: true, wasEditing: false, ...readEditorState() };
+      const returned = await exitPrefabEditing();
+      return { ok: true, wasEditing: true, returnedTo: returned, ...readEditorState() };
+    }
     throw new Error(
       `unknown prefab action '${which}' — pass prefabAction: 'instantiate' | 'create' | 'detach' ` +
+      "| 'edit-open' | 'edit-save' | 'edit-exit' " +
       "(the name is `prefabAction`, not `action`: /api/editor-action spends `action` on the op name).",
     );
   });

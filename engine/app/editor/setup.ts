@@ -403,8 +403,11 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
             {
               title: 'This Machine (project.user.json — not committed)',
               fields: [
-                { key: 'user.device.iosDeviceId', label: 'iOS device UDID', type: 'text', help: "xcodebuild -destination 'id=…'" },
-                { key: 'user.device.iosDevicectlId', label: 'iOS devicectl id', type: 'text', help: 'xcrun devicectl --device …' },
+                { key: 'user.device.iosDeviceId', label: 'iOS device UDID', type: 'text', help: "Required for an iOS build — xcodebuild -destination 'id=…'" },
+                // Optional on purpose: devicectl is CoreDevice-only (iOS 17+), so a legacy
+                // device has no id to put here and the build hands off to Xcode instead.
+                // Saying so here keeps this panel agreeing with the build's own preflight.
+                { key: 'user.device.iosDevicectlId', label: 'iOS devicectl id', type: 'text', help: 'Optional (iOS 17+ only) — enables hands-free install/launch. Empty ⇒ the build opens Xcode for ⌘R. xcrun devicectl --device …' },
               ],
             },
             {

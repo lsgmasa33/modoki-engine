@@ -59,6 +59,78 @@ assigned on the live entity at instantiation, not baked into the file (otherwise
 every instance would start with the same stale guid). The prefab file never
 carries `PrefabInstance` traits; those are added programmatically on spawn.
 
+## localId stability — an external address space
+
+A prefab's `localId`s are not an implementation detail: they are the address space a **scene's**
+`overrides` / `removed` / `removedTraits` are keyed in (see "Scene-instance format" below). A
+re-save must therefore never renumber a surviving member — doing so silently repoints or drops
+every override on every instance of that prefab.
+
+The address space outlives the file, so the blast radius is wider than the scene JSON. Every
+consumer below resolves a member BY localId, and each is a place a renumber goes wrong quietly:
+
+- **`runtime/loaders/loadSceneFile.ts`** — matches each prefab member to its scene row on load.
+- **`runtime/scene/sceneMutate.ts`** — writes a mutation into `overrides[localId]`.
+- **`runtime/scene/transformSpace.ts`** — reads a prefab-instance ancestor's Transform out of
+  `overrides[localId]` rather than its `traits`.
+- **`editor/panels/ApplyPrefabDialog.tsx`** — pairs a live instance entity to its template row.
+- The live **`PrefabInstance.localId`** trait, which carries the id on every spawned entity.
+
+`serializePrefab`'s default numbering (no `opts`) is **positional** (`i + 1` over the BFS-ordered
+tree) — correct for "create a prefab from an entity", where there is no prior numbering to
+honour, but wrong for re-saving an existing file authored with a gap (a member deleted earlier
+compacts every id after it on the next save). Measured on sling's `FieldCorner.prefab.json`:
+`drip` moved localId 4 → 2.
+
+**`serializePrefab(selectedEntityId, existingId, opts)` takes two options that fix this for a
+re-save:**
+- **`preserveLocalIds: Map<ecsId, localId>`** — every surviving member keeps the id it already
+  had; a member with no entry (added during the edit) is allocated **above the highest preserved
+  id**, never into a freed gap.
+- **`name: string`** — keep this as the file's `name` instead of defaulting to the root entity's
+  name (see "renaming the root" below).
+
+Prefab-edit mode is the only caller that supplies them today. It is **not** the only path that
+re-serializes an existing file, so the other three are worth knowing:
+
+| Path | Passes `existingId` | localId behaviour |
+|---|---|---|
+| **prefab-edit save** (`savePrefabEdit`) | yes | **preserved** — the mechanism below |
+| **rigged model re-import** (`ModelAssetView`) | yes | preserved by a *different* mechanism: serialize positionally, then `mergeRiggedPrefab` matches bones by NAME so their localIds stay stable and user-added children stay attached |
+| **2D skin rig write** (`skinPrefab.ts`) | yes | **renumbered** — the subtree is rebuilt from `rigDef.bones`, so ids follow the rig definition, not the file |
+| **`prefab` agent op, `create` over an existing path** | yes (`resolveExistingPrefabId`) | **renumbered** — it replaces the template with a scene entity tree, which is the intent |
+
+The last two are the same hazard this section describes, left as-is because both *regenerate* a
+template from a source of truth rather than round-tripping the authored file. Overrides keyed to
+a prefab written by either path can still be repointed by a structural change to its source.
+
+The preserving mechanism, in `prefabEdit.ts`:
+
+- **Sentinel guids carry the file's numbering through the edit world.** The loader reassigns ECS
+  ids densely on load, so by the time the synthetic edit world exists the file's own numbering is
+  already lost (measured: `FieldCorner`'s localId-4 `drip` loads as ecsId 2).
+  `buildPrefabEditScene` stamps `EntityAttributes.guid` on every member — the root gets
+  `PREFAB_EDIT_ROOT_GUID` (`__prefab_edit_root__`), every other member gets
+  `PREFAB_EDIT_LOCAL_GUID_PREFIX` + its original localId (`__prefab_edit_local__7`) — and
+  `savePrefabEdit` reads them back via `collectPreservedLocalIds` before calling
+  `serializePrefab`. Riding on `guid` is safe because `serializePrefab` clears
+  `EntityAttributes.guid` on every row it writes (a template carries no per-instance identity),
+  so the sentinel can never reach the file.
+- **`savePrefabEdit` REFUSES to save — rather than falling back to renumbering — when the opened
+  file is no longer in the editor's prefab cache** (`getCachedPrefabSync` returns null). That
+  cache is where the previous numbering and name come from; silently renumbering instead would
+  break every scene override keyed to this prefab.
+- **`rootLocalId` is the root's assigned id**, not a hardcoded `1` — with a preserve map it keeps
+  whatever the file already used, and every `parentId: <root>` in the entity rows is remapped
+  through the same table.
+
+**Behaviour change worth knowing:** because `name` now comes from the previously-opened file
+rather than the root entity, **renaming the root entity in prefab-edit no longer renames the
+prefab asset.** It used to, by accident — `serializePrefab` defaulted `name` to `tree[0].name`,
+which is why `cover-enemy.prefab.json` and `green-enemy.prefab.json` both became "Enemy" on a
+re-save (their root entity is literally named "Enemy"). Rename the asset itself (file rename /
+Assets panel) to rename a prefab going forward.
+
 ## Scene-instance format — how overrides are marked
 
 In the scene file a whole instance collapses to **one entry** — an ordinary
@@ -124,10 +196,12 @@ that was also losing `Animator.clips`.
 
 ## Core operations (`editor/scene/prefab.ts`)
 
-- **`serializePrefab(selectedEntityId, existingId?)`** — collects the selected
+- **`serializePrefab(selectedEntityId, existingId?, opts?)`** — collects the selected
   tree (`collectTree`, BFS), assigns `localId`s, snapshots each trait, remaps
   parent links to localIds, and rewrites asset path refs to GUIDs. Pass
-  `existingId` to preserve a prefab's UUID on re-save.
+  `existingId` to preserve a prefab's UUID on re-save. `opts.preserveLocalIds` /
+  `opts.name` keep a re-save from renumbering members or renaming the file — see
+  "localId stability" above.
 - **`instantiatePrefab(prefab, parentId?)`** — editor-side spawn into the current
   world: spawns entities, remaps `parentId`s, adds the `PrefabInstance` trait,
   sets `rootInstanceId`, returns the root ECS id. `setPrefabSource(rootEcsId,
@@ -233,6 +307,19 @@ shows there in normal mode too.
   re-instantiates every instance of the just-saved prefab.
 - Right-click → **Instantiate** still adds a copy to the current scene (the old
   double-click behavior).
+- **Re-saving preserves the file's `localId` numbering and `name`** — see "localId
+  stability" above; this is what makes prefab-edit safe to drive as a scripted
+  round-trip rather than only a human UI action.
+
+**Reachable headlessly.** `openPrefabForEditing` / `savePrefabEdit` / `exitPrefabEditing` are
+exposed as the `prefab` agent op / `modoki_prefab` MCP tool's `prefabAction: 'edit-open' |
+'edit-save' | 'edit-exit'` — full tool contract (params, refusals, minimal call) in
+[debug-tools-mcp.md](./debug-tools-mcp.md)'s generated tool catalog. `edit-open` swaps the world
+exactly as `load-scene` does (refuses on unsaved work, takes `force`) and additionally saves the
+current scene on the way in, deliberately, so the return trip's reload-from-disk is
+non-destructive; `modoki_save_all` refuses outright while in prefab-edit mode. This is what
+`engine/scripts/resave-prefabs.sh` drives to bulk-migrate prefabs to the current serializer
+format — see [scene-loading.md](./scene-loading.md) § "Re-saving legacy prefabs".
 
 ## Nested prefabs (v2)
 

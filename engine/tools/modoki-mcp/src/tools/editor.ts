@@ -340,11 +340,18 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'Persistence: instantiate/detach are LIVE-world only. create writes the .prefab.json to disk ' +
       'AND tags the source entities as a PrefabInstance in the LIVE world (unsaved) — run ' +
       'modoki_save_all to persist that linkage into the scene, or a reload discards it. ' +
-      'Address the entity/parent by guid (PREFER — stable) or id.',
+      'Address the entity/parent by guid (PREFER — stable) or id. ' +
+      'PREFAB-EDIT MODE (edit-open / edit-save / edit-exit) is how you edit the TEMPLATE itself: ' +
+      'edit-open swaps the world for a synthetic scene holding the prefab in isolation (so it ' +
+      'refuses on unsaved work like load_scene does, and SAVES the current scene on the way in), ' +
+      'you mutate its entities with the normal tools, edit-save re-serializes the .prefab.json, ' +
+      'and edit-exit reloads the scene you came from so its instances re-expand from the new file. ' +
+      'While in that mode modoki_save_all REFUSES — edit-save is the save.',
     {
-      action: z.enum(['instantiate', 'create', 'detach'])
-        .describe("instantiate: spawn a prefab into the scene. create: turn an existing entity INTO a prefab asset. detach: break an instance's link to its prefab. Sent on the wire as `prefabAction` — the relay strips a param named `action`."),
-      path: z.string().optional().describe('instantiate: prefab asset path. create: destination .prefab.json path.'),
+      action: z.enum(['instantiate', 'create', 'detach', 'edit-open', 'edit-save', 'edit-exit'])
+        .describe("instantiate: spawn a prefab into the scene. create: turn an existing entity INTO a prefab asset. detach: break an instance's link to its prefab. edit-open/edit-save/edit-exit: enter, write, and leave prefab-edit mode on the template itself. Sent on the wire as `prefabAction` — the relay strips a param named `action`."),
+      path: z.string().optional().describe('instantiate / edit-open: prefab asset path. create: destination .prefab.json path.'),
+      force: z.boolean().optional().describe('edit-open: discard unsaved live work instead of refusing (edit-open swaps the world, like load_scene).'),
       parentId: z.number().optional().describe('instantiate: parent entity id (default root). Prefer parentGuid.'),
       parentGuid: z.string().optional().describe('instantiate: parent entity guid (preferred; wins over parentId).'),
       entityId: z.number().optional().describe('create/detach: the entity id. Prefer entityGuid.'),
