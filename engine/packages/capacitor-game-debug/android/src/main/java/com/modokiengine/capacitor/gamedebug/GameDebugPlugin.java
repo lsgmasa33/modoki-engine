@@ -53,12 +53,41 @@ public class GameDebugPlugin extends Plugin {
     private Runnable leaseGraceRunnable = null;
     private static final long LEASE_GRACE_MS = 5000;
 
+    /** AndroidManifest {@code <meta-data>} carrying the project's {@code build.debugBuild}.
+     *  Written by {@code healAndroidDebugBuildMetaData} (engine/plugins/healNativeConfig.ts) —
+     *  the NAME is the contract between the two; keep them in sync. */
+    private static final String META_DEBUG_BUILD = "com.modokiengine.gamedebug.DEBUG_BUILD";
+
+    /** Is the debug bridge enabled for this app? Reads {@code build.debugBuild} out of the
+     *  manifest, NOT the APK's debuggable flag (#112).
+     *
+     *  It used to be {@code FLAG_DEBUGGABLE} — i.e. the Gradle build type — which made the build
+     *  type a second, competing answer to "is this a debug build". A project with
+     *  {@code debugBuild: true} assembled as a release variant shipped the JS bridge with a
+     *  plugin that refused to start, and the only explanation was a reject string blaming
+     *  "release builds". {@code build.debugBuild} is now the one answer; the build type means
+     *  optimization and shrinking.
+     *
+     *  Absent meta-data → FALSE. Fail closed: a project not reopened since #112 (so never
+     *  healed) loses the bridge rather than silently keeping a TCP server that can eval
+     *  arbitrary JS. The reject message says exactly how to turn it back on. */
+    private boolean isDebugBuildEnabled() {
+        try {
+            android.content.pm.ApplicationInfo ai = getContext().getPackageManager().getApplicationInfo(
+                    getContext().getPackageName(), android.content.pm.PackageManager.GET_META_DATA);
+            return ai.metaData != null && ai.metaData.getBoolean(META_DEBUG_BUILD, false);
+        } catch (Exception e) {
+            Log.w(TAG, "could not read " + META_DEBUG_BUILD + " — treating as disabled", e);
+            return false;
+        }
+    }
+
     @PluginMethod
     public void startServer(PluginCall call) {
-        // Only run in debug builds — no TCP server or network listener in release
-        boolean isDebug = (getContext().getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
-        if (!isDebug) {
-            call.reject("Debug bridge disabled in release builds");
+        // One gate, one flag: build.debugBuild. NOT the APK's debuggable flag — see above.
+        if (!isDebugBuildEnabled()) {
+            call.reject("Debug bridge disabled: build.debugBuild is off for this project "
+                    + "(Project Settings → Developer → \"Debug build\"). Rebuild after enabling it.");
             return;
         }
 

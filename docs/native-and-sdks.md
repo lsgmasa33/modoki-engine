@@ -155,9 +155,14 @@ The core AppLovin MAX SDK comes from SPM (`capacitor-applovin-max/Package.swift`
 | Screenshot | `captureScreen` via `drawHierarchy` (captures WebGL) | `adb screencap` |
 | Tap/Drag | PixiJS EventSystem calls | PixiJS EventSystem calls |
 | Native logs | OSLogStore (iOS 15+) | logcat |
-| Debug gate | `#if DEBUG` | `FLAG_DEBUGGABLE` runtime check |
+| Debug gate | `modoki:game-debug-*` fenced registration in `MyViewController.swift` | `com.modokiengine.gamedebug.DEBUG_BUILD` manifest `<meta-data>` |
 
-The plugin is automatically disabled in release builds.
+**Both gates are written from the ONE project flag `build.debugBuild`** (Project Settings →
+Developer) by `healNativeConfig`, not from the Xcode/Gradle configuration (#112) — so
+`debugBuild: true` + a Release configuration is a *working* debug build, which is what a TestFlight
+QA build is. Reopen the project after flipping the flag so the heal runs. Absent Android meta-data
+reads as false. Detail:
+[debug-tools-mcp.md](./debug-tools-mcp.md) § "Debug vs Release".
 
 ### MCP tools
 
@@ -220,7 +225,7 @@ Opening a project in the Electron editor runs two idempotent "make it just work"
 - **iOS `DEVELOPMENT_TEAM`** → synced from `project.config.json` `build.appleTeamId`, scoped to the **App target's** build configs only (via `appBuildConfigUUIDs` — never flattens a separate extension/widget/watch target's team). Corrects any existing value, including the empty `DEVELOPMENT_TEAM = "";` a fresh `cap add ios` leaves.
 - **iOS orientation + status bar** and **Android `screenOrientation`** → patched into `Info.plist` / `AndroidManifest.xml` to match `capacitor.orientation` / status-bar settings.
 - **Android immersive fullscreen** → when `capacitor.statusBarHidden` is set, a marker-fenced block is patched into **`MainActivity.java`** hiding `systemBars()` via `WindowInsetsControllerCompat`, re-applied in `onWindowFocusChanged`. Three things about this are load-bearing. It hides **both** bars (status *and* navigation) even though the flag is named for the status bar: iOS has no second bar, so `statusBarHidden` there already means "the game owns the screen", and leaving Android's nav bar up would honour the name while missing the intent. It has to be **Java, not a theme** — `android:windowFullscreen` reaches the status bar only. And it must re-apply on focus regain, because the bars return after a notification shade / permission dialog / task switch, so hiding once in `onCreate` silently decays. A MainActivity with custom code (non-empty class body, no marker) is left alone and reported rather than rewritten; clearing the flag removes the block and its imports.
-- **game-debug wiring** (only when the project depends on `capacitor-game-debug`): adds the `NSLocalNetworkUsageDescription` + `NSBonjourServices` Info.plist keys (iOS 14+ gates the device's inbound-LAN TCP listener behind the **Local Network permission**, prompted via these keys). *(`NSBonjourServices` predates the Bonjour removal and is likely now vestigial — the lease connects by direct IP, no mDNS — but it hasn't been re-verified on-device, so it's left in for now.)* Also writes `MyViewController.swift` + points the storyboard's bridge VC at it + adds the pbxproj file-refs that compile `MyViewController.swift` and the engine's `GameDebugPlugin.swift` into the App target (the SPM static-linking workaround — see the [iOS SPM static-linking gotcha](#ios-spm-static-linking-gotcha)), and adds a Release-only build phase that strips the debug-only Local Network keys so App Store builds ship without a Local Network prompt.
+- **game-debug wiring** (only when the project depends on `capacitor-game-debug`): adds the `NSLocalNetworkUsageDescription` + `NSBonjourServices` Info.plist keys (iOS 14+ gates the device's inbound-LAN TCP listener behind the **Local Network permission**, prompted via these keys). *(`NSBonjourServices` predates the Bonjour removal and is likely now vestigial — the lease connects by direct IP, no mDNS — but it hasn't been re-verified on-device, so it's left in for now.)* Also writes `MyViewController.swift` + points the storyboard's bridge VC at it + adds the pbxproj file-refs that compile `MyViewController.swift` and the engine's `GameDebugPlugin.swift` into the App target (the SPM static-linking workaround — see the [iOS SPM static-linking gotcha](#ios-spm-static-linking-gotcha)). The Local Network keys and the plugin registration both track `build.debugBuild` **in both directions** — flip it off and the next heal removes them, so an App Store build ships without a Local Network prompt. (Pre-#112 the keys were added unconditionally and stripped from the BUILT plist by a `CONFIGURATION == Release` build phase; that phase is retired, and the heal deletes it from any project that still carries it.)
 
 It is called explicitly on open — **not** buried inside `ensureProjectDeps` — so it runs even for a flat game with native folders but no `package.json`, can't be silently skipped by a dep-install refactor, and always logs (a "already up to date" line included).
 

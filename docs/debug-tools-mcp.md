@@ -1058,20 +1058,60 @@ Standalone Capacitor plugin at `engine/packages/capacitor-game-debug/`. Runs a T
 - **Android:** ServerSocket (TCP, first-wins single client) + native lease handshake + `captureScreen` + `getNativeLogs` (logcat)
 - **No Bonjour/mDNS on either platform** — advertising was removed from the plugin; the backend connects by IP/adb.
 
-**Debug vs Release (two layers):**
-- **Native plugin** — iOS: `#if DEBUG` gates plugin registration in MyViewController; Android:
-  `FLAG_DEBUGGABLE` runtime check rejects in release. So a store/release-signed build has no native
-  TCP server.
-- **JS bridge** (`app/main.tsx` → `./debug/bridge`, which carries `handleEval` = arbitrary JS) —
-  gated by the single `build.debugBuild` project flag (Project Settings → Developer — the same flag
-  that also gates the event journal and the in-game debug menu; the `debug|profile|release` mode enum
-  once floated to replace this boolean is deliberately deferred, see "Percept" above), baked as
-  `__MODOKI_DEBUG_BUILD__`. Default **false** → the whole `./debug/bridge` import
-  tree-shakes out of a shipped game build (native AND web), so there is no eval-capable JS server at
-  all; the editor + dev keep it always-on. This is the layer that also covers the web
-  (`VITE_DEBUG_BRIDGE`) path and closes the pre-existing gap where the JS bridge was ungated on
-  native even though the native plugin was `#if DEBUG`-gated. Turn it ON per-game to debug on-device
-  (the 6 internal native testbeds already set it).
+**Debug vs Release — ONE flag decides, on every layer (#112).** `build.debugBuild` (Project
+Settings → Developer) is the single source of truth. **The Xcode/Gradle configuration is
+orthogonal: it means optimization and symbols, NOT debug surfaces.** That distinction is worth
+holding onto — "Debug" is an overloaded word and this is exactly where a reader conflates the two.
+
+- **JS bridge** (`app/main.tsx` → `./debug/bridge`, which carries `handleEval` = arbitrary JS),
+  the event journal, and the in-game debug menu — baked as `__MODOKI_DEBUG_BUILD__`
+  (`vite.config.ts`). Default **false** → the whole `./debug/bridge` import tree-shakes out of a
+  shipped game build (native AND web), so there is no eval-capable JS server at all; the editor +
+  dev keep it always-on. (The `debug|profile|release` mode enum once floated to replace this
+  boolean is deliberately deferred — see "Percept" above.)
+- **iOS native plugin registration** — the `modoki:game-debug-*` fenced block in the generated
+  `MyViewController.swift`, written by `healNativeConfig` from the flag.
+- **iOS Local Network / Bonjour Info.plist keys** — added *and removed* by `healNativeConfig` from
+  the flag, in the SOURCE plist.
+- **Android native plugin** — the `com.modokiengine.gamedebug.DEBUG_BUILD` AndroidManifest
+  `<meta-data>`, healed from the flag and read by `GameDebugPlugin.startServer`. Absent reads as
+  false (fail closed).
+
+Each of those used to key on something *else* — `#if DEBUG`, `CONFIGURATION == Release`,
+`FLAG_DEBUGGABLE` — and they could disagree. The combination that broke was one you would normally
+want: `debugBuild: true` + a Release configuration (debugging an optimized build, or a TestFlight
+QA build) shipped the JS bridge with no plugin registered and the plist keys stripped — a debug
+build that could not debug, with nothing explaining why. Turn the flag ON per-game to debug
+on-device (the internal native testbeds already set it), then **reopen the project** so the heal
+runs.
+
+⚠️ **The flag is a SOFT gate, and deliberately so.** `#if DEBUG` was hard — a Release build
+physically could not carry a live native server. Nothing now prevents archiving and submitting a
+build with the flag on. **This repo's TestFlight builds run with `debugBuild: true`**, and a
+TestFlight archive is bit-identical to a store archive — same `xcodebuild archive`, same
+`method: app-store-connect` export; release-to-store is a button in App Store Connect *afterwards*.
+So there is no build-time signal to refuse on that would not also block the workflow in daily use,
+and an env-var escape hatch set on every TestFlight build is no gate at all. Do not "restore" a
+refusal without first solving that distinction; it has no build-time solution.
+The mitigation is therefore a loud
+archive-time warning rather than a refusal — an Xcode build phase gated on `ACTION == install`
+(so it does NOT fire on an ordinary Release-configuration build) and a Gradle `taskGraph.whenReady`
+warning on `:app:*Release`, both healed in/out with the flag.
+
+What IS verified is the other direction — that flag-off genuinely strips every surface above.
+`engine/tests/architecture/debugBuildGates.test.ts` (in `npm run verify`) holds it for the native
+surfaces, including that every committed project agrees with its own flag; `npm run smoke:debug-flag`
+holds it for the JS bundle by building a project twice and grepping `dist/` (measured on
+`games/sling`: `app-identity` 1 → 0, `GameDebug` 9 → 0). Both carry a flag-ON control, so a green
+run cannot mean "the grep found nothing".
+
+The one honest limit on "stripped": `GameDebugPlugin.swift` is compiled into the iOS App target
+**unconditionally** — its pbxproj file-ref is not flag-gated — so the class is in the binary either
+way. What the flag removes is the *registration*, and since JS is the only caller, an unregistered
+plugin has no way in: Capacitor never exposes it, so `startServer` can never be called and no
+socket is ever bound. That is why the guard asserts registration rather than symbol absence
+(asserting absence would fail for a correct build). Gating the file-ref too is possible but is a
+larger, riskier pbxproj edit than #112 needed.
 
 **Known issues:**
 - iOS SPM static linking strips the plugin class — requires manual registration in MyViewController + Xcode file reference from App target to `engine/packages/capacitor-game-debug/ios/Sources/GameDebugPlugin/GameDebugPlugin.swift` (project-relative path in pbxproj, no copy). Edit the package source only.

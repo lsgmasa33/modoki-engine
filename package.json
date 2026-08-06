@@ -53,6 +53,7 @@
     "test:packaged": "bash engine/scripts/test-packaged.sh",
     "smoke:packaged": "bash engine/scripts/smoke-packaged.sh",
     "smoke:playable": "node engine/scripts/smoke-playable.mjs",
+    "smoke:debug-flag": "node engine/scripts/smoke-debug-build-flag.mjs",
     "smoke:mcp": "npm --prefix engine/tools/modoki-mcp run smoke",
     "editor": "bash engine/scripts/relaunch-editor.sh",
     "editor:main": "MODOKI_BACKEND_PORT=5179 bash engine/scripts/launch-editor.sh games/3d-test",

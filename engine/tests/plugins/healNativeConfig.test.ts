@@ -29,10 +29,14 @@ afterEach(() => {
   else process.env.MODOKI_TOOLCHAIN_DIR = savedToolchainDir;
 });
 
-function writeConfig(teamId: string) {
+/** `debugBuild` defaults to TRUE here, unlike the product default (false) — the
+ *  game-debug heals only DO anything in the on direction, so an on-by-default helper
+ *  keeps every pre-#112 test asserting what it was written to assert. Tests that care
+ *  about the gate pass it explicitly, in both directions. */
+function writeConfig(teamId: string, debugBuild = true) {
   fs.writeFileSync(
     path.join(root, 'project.config.json'),
-    JSON.stringify({ build: { appleTeamId: teamId } }),
+    JSON.stringify({ build: { appleTeamId: teamId, debugBuild } }),
   );
 }
 
@@ -261,6 +265,39 @@ describe('healNativeConfig — iOS Local Network / Bonjour keys', () => {
     expect((readPlist().match(/NSBonjourServices/g) || []).length).toBe(1);
   });
 
+  // #112 — the keys now follow build.debugBuild in BOTH directions. Before, they were
+  // added unconditionally and stripped from the BUILT plist by a `CONFIGURATION ==
+  // Release` build phase, so debugBuild:true + a Release configuration shipped a bridge
+  // with no Local Network permission and no explanation.
+  it('does NOT add the keys when build.debugBuild is off', () => {
+    writePlist('\t<key>CFBundleName</key>\n\t<string>x</string>');
+    writeConfig('', false);
+    writeGameDebugDep();
+    healNativeConfig(root);
+    expect(readPlist()).not.toContain('NSBonjourServices');
+    expect(readPlist()).not.toContain('NSLocalNetworkUsageDescription');
+  });
+
+  it('REMOVES the keys when build.debugBuild is turned off', () => {
+    writePlist('\t<key>CFBundleName</key>\n\t<string>x</string>');
+    writeConfig('', true);
+    writeGameDebugDep();
+    healNativeConfig(root);
+    expect(readPlist()).toContain('NSBonjourServices');
+
+    writeConfig('', false);
+    healNativeConfig(root);
+    const off = readPlist();
+    expect(off).not.toContain('NSBonjourServices');
+    expect(off).not.toContain('NSLocalNetworkUsageDescription');
+    expect(off).not.toContain('_game-debug._tcp'); // the <array> value went too, not just the <key>
+    expect(off).toContain('<key>CFBundleName</key>'); // unrelated keys untouched
+    // and back on again — the toggle is not one-way
+    writeConfig('', true);
+    healNativeConfig(root);
+    expect(readPlist()).toContain('NSBonjourServices');
+  });
+
   it('does NOT add the keys for a project that lacks the game-debug dep', () => {
     writePlist('\t<key>CFBundleName</key>\n\t<string>x</string>');
     writeConfig(''); // no package.json / no capacitor-game-debug
@@ -393,26 +430,349 @@ describe('healNativeConfig — iOS game-debug wiring (Task 3)', () => {
     expect(readPbx()).not.toContain('MyViewController.swift');
   });
 
-  it('adds the Release Info.plist-strip build phase (Task 4)', () => {
+  // #112 — the Release Info.plist-strip phase is RETIRED, not merely re-keyed. It
+  // derived the plist keys from CONFIGURATION, which is the second source of truth this
+  // issue removes; healIosLocalNetwork now writes the SOURCE plist from the flag instead.
+  it('never adds a Release Info.plist-strip build phase', () => {
     scaffoldIos(); writeConfig(''); writeGameDebugDep(); writeEngineGameDebugSwift();
     healNativeConfig(root);
     const pbx = readPbx();
-    expect(pbx).toContain('PBXShellScriptBuildPhase');
-    expect(pbx).toContain('Strip debug-only Info.plist keys (Release)');
-    expect(pbx).toContain('PlistBuddy -c \\"Delete :NSBonjourServices\\"');
-    // referenced in the App target buildPhases (once) + defined (once) = 2 mentions of the UUID
-    expect((pbx.match(/DD0000000000000000000005/g) || []).length).toBe(2);
-    // gated on Release
-    expect(pbx).toContain('if [ \\"${CONFIGURATION}\\" = \\"Release\\" ]');
+    expect(pbx).not.toContain('Strip debug-only Info.plist keys');
+    expect(pbx).not.toContain('PlistBuddy');
+    expect(pbx).not.toContain('CONFIGURATION'); // no build-configuration gate survives at all
   });
 
-  it('Release-strip phase is idempotent', () => {
+  it('REMOVES a legacy Release-strip phase from a project that still carries one', () => {
     scaffoldIos(); writeConfig(''); writeGameDebugDep(); writeEngineGameDebugSwift();
+    // Re-create the pre-#112 shape by hand: the buildPhases reference + the object.
+    const legacyPhase = [
+      '/* Begin PBXShellScriptBuildPhase section */',
+      '\t\tDD0000000000000000000005 /* Strip debug-only Info.plist keys (Release) */ = {',
+      '\t\t\tisa = PBXShellScriptBuildPhase;',
+      '\t\t\tname = "Strip debug-only Info.plist keys (Release)";',
+      '\t\t\tshellScript = "if [ \\\\"${CONFIGURATION}\\\\" = \\\\"Release\\\\" ]; then PlistBuddy; fi";',
+      '\t\t};',
+      '/* End PBXShellScriptBuildPhase section */',
+      '',
+    ].join('\n');
+    let seeded = fs.readFileSync(path.join(root, ...PBX), 'utf8');
+    seeded = seeded.replace(/(\t\t\t\t504EC3021 \/\* Resources \*\/,\n)/,
+      '$1\t\t\t\tDD0000000000000000000005 /* Strip debug-only Info.plist keys (Release) */,\n');
+    seeded = seeded.replace('/* Begin PBXSourcesBuildPhase section */', legacyPhase + '\n/* Begin PBXSourcesBuildPhase section */');
+    fs.writeFileSync(path.join(root, ...PBX), seeded);
+    expect(seeded).toContain('Strip debug-only Info.plist keys');
+
     healNativeConfig(root);
-    const once = readPbx();
+    const pbx = readPbx();
+    expect(pbx).not.toContain('Strip debug-only Info.plist keys');
+    expect(pbx).not.toContain('DD0000000000000000000005'); // BOTH the reference and the object
+    expect(pbx).not.toContain('PlistBuddy');
+    // The section itself survives here because the flag is ON, so the Phase-2 archive
+    // warning now occupies it — exactly one shell-script phase, and not the retired one.
+    expect((pbx.match(/isa = PBXShellScriptBuildPhase;/g) || []).length).toBe(1);
+    expect(pbx).toContain("Warn: Modoki 'Debug build' is ON");
+    // the rest of the project survived
+    expect(pbx).toContain('504EC3021 /* Resources */,');
+    expect(pbx).toContain('/* Begin PBXSourcesBuildPhase section */');
+    // idempotent
     healNativeConfig(root);
-    expect((readPbx().match(/Strip debug-only Info\.plist keys/g) || []).length)
-      .toBe((once.match(/Strip debug-only Info\.plist keys/g) || []).length);
+    expect(readPbx()).toBe(pbx);
+  });
+});
+
+describe('healNativeConfig — iOS GameDebugPlugin registration follows build.debugBuild (#112)', () => {
+  const MVC = ['ios', 'App', 'App', 'MyViewController.swift'];
+  const readMvc = () => fs.readFileSync(path.join(root, ...MVC), 'utf8');
+  function scaffoldMvc(body: string) {
+    const dir = path.join(root, 'ios', 'App', 'App');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(root, ...MVC), body);
+  }
+  /** The pre-#112 generated file, verbatim — this is what every existing project has. */
+  const LEGACY_MVC = `import UIKit
+import Capacitor
+
+/// Custom bridge VC so we can register plugins that SPM won't auto-discover.
+///
+/// registering the instance here keeps the class alive and wires it into the bridge.
+/// DEBUG-only: the TCP debug server + Bonjour never ship in a release build.
+class MyViewController: CAPBridgeViewController {
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        #if DEBUG
+        let plugin = GameDebugPlugin()
+        bridge?.registerPluginInstance(plugin)
+        print("[MyViewController] DEBUG — GameDebugPlugin registered: \\(plugin)")
+        #else
+        print("[MyViewController] RELEASE — GameDebugPlugin skipped")
+        #endif
+    }
+}
+`;
+
+  it('a freshly scaffolded file registers the plugin when the flag is on', () => {
+    fs.mkdirSync(path.join(root, 'ios', 'App', 'App.xcodeproj'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'ios', 'App', 'App'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj'),
+      '// !$*UTF8*$!\n{ objects = { }; }\n');
+    writeConfig('', true); writeGameDebugDep(); writeEngineGameDebugSwift();
+    healNativeConfig(root);
+    const mvc = readMvc();
+    expect(mvc).toContain('modoki:game-debug-begin');
+    expect(mvc).toContain('bridge?.registerPluginInstance(gameDebugPlugin)');
+    expect(mvc).not.toContain('#if DEBUG'); // the Xcode configuration no longer decides
+  });
+
+  it('a freshly scaffolded file does NOT register the plugin when the flag is off', () => {
+    fs.mkdirSync(path.join(root, 'ios', 'App', 'App.xcodeproj'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'ios', 'App', 'App'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj'),
+      '// !$*UTF8*$!\n{ objects = { }; }\n');
+    writeConfig('', false); writeGameDebugDep(); writeEngineGameDebugSwift();
+    healNativeConfig(root);
+    const mvc = readMvc();
+    expect(mvc).toContain('modoki:game-debug-begin');
+    expect(mvc).not.toContain('registerPluginInstance');
+  });
+
+  it('migrates a pre-#112 `#if DEBUG` block to the markers exactly once', () => {
+    scaffoldMvc(LEGACY_MVC);
+    writeConfig('', true); writeGameDebugDep();
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(notes).toContain('migrated iOS GameDebugPlugin registration off #if DEBUG');
+    const mvc = readMvc();
+    expect(mvc).not.toContain('#if DEBUG');
+    expect(mvc).not.toContain('#endif');
+    expect(mvc).toContain('bridge?.registerPluginInstance(gameDebugPlugin)');
+    // the stale doc sentence asserting the old guarantee is corrected
+    expect(mvc).not.toContain('never ship in a release build');
+    // and the surrounding hand-owned text is untouched
+    expect(mvc).toContain('import Capacitor');
+    expect(mvc).toContain('class MyViewController: CAPBridgeViewController {');
+    // second pass migrates nothing further
+    const once = readMvc();
+    expect(healNativeConfig(root).notes.join(' ')).not.toContain('migrated');
+    expect(readMvc()).toBe(once);
+  });
+
+  it('toggles both ways without touching anything outside the markers', () => {
+    scaffoldMvc(LEGACY_MVC);
+    writeConfig('', true); writeGameDebugDep();
+    healNativeConfig(root);
+    const on = readMvc();
+    expect(on).toContain('registerPluginInstance');
+
+    writeConfig('', false);
+    healNativeConfig(root);
+    const off = readMvc();
+    expect(off).not.toContain('registerPluginInstance');
+    expect(off).toContain('modoki:game-debug-end'); // markers survive, so it can come back
+
+    writeConfig('', true);
+    healNativeConfig(root);
+    expect(readMvc()).toBe(on);
+  });
+
+  it('preserves hand-added code in the same file (games/ota-test shape)', () => {
+    scaffoldMvc(LEGACY_MVC.replace(
+      '    override func viewDidLoad() {',
+      '    override func instanceDescriptor() -> InstanceDescriptor {\n' +
+      '        OtaBootHook.run(name: otaShellBundleName)\n' +
+      '        return super.instanceDescriptor()\n' +
+      '    }\n\n' +
+      '    override func viewDidLoad() {',
+    ).replace('    }\n}\n', '        let otaPlugin = ModokiOtaPlugin()\n        bridge?.registerPluginInstance(otaPlugin)\n    }\n}\n'));
+    writeConfig('', false); writeGameDebugDep();
+    healNativeConfig(root);
+    const mvc = readMvc();
+    expect(mvc).toContain('OtaBootHook.run(name: otaShellBundleName)');
+    expect(mvc).toContain('bridge?.registerPluginInstance(otaPlugin)'); // OTA plugin still registered
+    expect(mvc).not.toContain('GameDebugPlugin()'); // only the game-debug one went
+  });
+
+  it('notes — rather than silently skips — a file with neither markers nor the legacy block', () => {
+    scaffoldMvc('import UIKit\nclass MyViewController: CAPBridgeViewController {}\n');
+    writeConfig('', true); writeGameDebugDep();
+    const notes = healNativeConfig(root).notes.join(' ');
+    // The flag genuinely does not apply here, so the note is the ONLY signal — a silent
+    // skip would be the same class of failure #112 exists to remove.
+    expect(notes).toContain('no modoki:game-debug markers');
+    expect(notes).toContain('build.debugBuild NOT applied');
+  });
+});
+
+describe('healNativeConfig — archive-time warning (#112 Phase 2)', () => {
+  const PBX = ['ios', 'App', 'App.xcodeproj', 'project.pbxproj'];
+  const GRADLE = ['android', 'app', 'build.gradle'];
+  const readPbx = () => fs.readFileSync(path.join(root, ...PBX), 'utf8');
+  const readGradle = () => fs.readFileSync(path.join(root, ...GRADLE), 'utf8');
+  function scaffold() {
+    fs.mkdirSync(path.join(root, 'ios', 'App', 'App.xcodeproj'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'ios', 'App', 'App'), { recursive: true });
+    fs.writeFileSync(path.join(root, ...PBX), [
+      '// !$*UTF8*$!', '{', '\tobjects = {',
+      '/* Begin PBXNativeTarget section */',
+      '\t\t504EC3031 /* App */ = {', '\t\t\tisa = PBXNativeTarget;', '\t\t\tbuildPhases = (',
+      '\t\t\t\t504EC3001 /* Sources */,', '\t\t\t\t504EC3021 /* Resources */,',
+      '\t\t\t);', '\t\t\tname = App;', '\t\t};',
+      '/* End PBXNativeTarget section */', '',
+      '/* Begin PBXSourcesBuildPhase section */',
+      '\t\t504EC3001 /* Sources */ = {', '\t\t\tisa = PBXSourcesBuildPhase;', '\t\t};',
+      '/* End PBXSourcesBuildPhase section */',
+      '\t};', '}', '',
+    ].join('\n'));
+    fs.mkdirSync(path.join(root, 'android', 'app'), { recursive: true });
+    fs.writeFileSync(path.join(root, ...GRADLE), "apply plugin: 'com.android.application'\n\nandroid {\n}\n");
+    writeGameDebugDep();
+  }
+
+  it('adds an iOS warning phase gated on ACTION, not CONFIGURATION, when the flag is on', () => {
+    scaffold(); writeConfig('', true);
+    healNativeConfig(root);
+    const pbx = readPbx();
+    // No DOUBLE quotes anywhere in the generated name/message: it is embedded in a pbxproj
+    // quoted string, inside which it lands in a shell `echo "…"` — three levels of quoting.
+    expect(pbx).toContain("Warn: Modoki 'Debug build' is ON");
+    expect(pbx).toContain('name = "Warn: Modoki \'Debug build\' is ON";');
+    // The load-bearing detail: debugBuild:true + a Release CONFIGURATION is the exact
+    // combination #112 makes work, so gating on CONFIGURATION would re-break it.
+    expect(pbx).toContain('if [ \\"${ACTION}\\" = \\"install\\" ]');
+    expect(pbx).not.toContain('CONFIGURATION');
+    // It WARNS — a non-zero exit would be a refusal, which TestFlight rules out.
+    expect(pbx).toContain('echo \\"warning: ');
+    expect(pbx).not.toContain('exit 1');
+    // referenced in buildPhases (once) + defined (once)
+    expect((pbx.match(/DD0000000000000000000006/g) || []).length).toBe(2);
+    // the message names the setting a human can act on, not the internal constant
+    expect(pbx).toContain('Project Settings -> Developer');
+    expect(pbx).not.toContain('__MODOKI_DEBUG_BUILD__');
+  });
+
+  it('adds a Gradle release-build warning when the flag is on', () => {
+    scaffold(); writeConfig('', true);
+    healNativeConfig(root);
+    const g = readGradle();
+    expect(g).toContain('modoki:debug-build-warning-begin');
+    expect(g).toContain('gradle.taskGraph.whenReady');
+    expect(g).toContain('(assemble|bundle).*Release');
+    expect(g).toContain('logger.warn');
+    expect(g).not.toContain('throw new'); // warns, never fails the build
+    expect(g).toContain("apply plugin: 'com.android.application'"); // original content kept
+  });
+
+  it('removes both when the flag goes off, and restores them when it comes back', () => {
+    scaffold(); writeConfig('', true);
+    healNativeConfig(root);
+    const onPbx = readPbx(); const onGradle = readGradle();
+
+    writeConfig('', false);
+    healNativeConfig(root);
+    expect(readPbx()).not.toContain('Warn: Modoki');
+    expect(readPbx()).not.toContain('DD0000000000000000000006'); // reference AND object
+    expect(readPbx()).not.toContain('PBXShellScriptBuildPhase'); // emptied section removed
+    expect(readGradle()).not.toContain('modoki:debug-build-warning');
+    expect(readGradle()).toContain("apply plugin: 'com.android.application'");
+
+    writeConfig('', true);
+    healNativeConfig(root);
+    expect(readPbx()).toBe(onPbx);
+    expect(readGradle()).toBe(onGradle);
+  });
+
+  it('is idempotent in both states', () => {
+    scaffold(); writeConfig('', true);
+    healNativeConfig(root); const on = [readPbx(), readGradle()];
+    healNativeConfig(root);
+    expect([readPbx(), readGradle()]).toEqual(on);
+
+    writeConfig('', false);
+    healNativeConfig(root); const off = [readPbx(), readGradle()];
+    healNativeConfig(root);
+    expect([readPbx(), readGradle()]).toEqual(off);
+  });
+
+  it('RE-DERIVES the phase rather than trusting its presence (a stale message must heal)', () => {
+    scaffold(); writeConfig('', true);
+    healNativeConfig(root);
+    const fresh = readPbx();
+    // Simulate a project healed by an OLDER editor whose warning text has since changed.
+    // A presence check ("the phase is already there, done") would leave this forever.
+    fs.writeFileSync(path.join(root, ...PBX), fresh.replace(/warning: [^\\]*/, 'warning: OLD STALE TEXT'));
+    expect(readPbx()).toContain('OLD STALE TEXT');
+    healNativeConfig(root);
+    expect(readPbx()).not.toContain('OLD STALE TEXT');
+    expect(readPbx()).toBe(fresh);
+  });
+
+  it('does not open a SECOND PBXShellScriptBuildPhase section next to an existing one', () => {
+    scaffold(); writeConfig('', true);
+    // Seed a project that already has a shell-script phase (a CocoaPods game, say).
+    const seeded = readPbx().replace('/* Begin PBXSourcesBuildPhase section */', [
+      '/* Begin PBXShellScriptBuildPhase section */',
+      '\t\tAA0000000000000000000001 /* [CP] Embed Pods */ = {',
+      '\t\t\tisa = PBXShellScriptBuildPhase;',
+      '\t\t};',
+      '/* End PBXShellScriptBuildPhase section */',
+      '',
+      '/* Begin PBXSourcesBuildPhase section */',
+    ].join('\n'));
+    fs.writeFileSync(path.join(root, ...PBX), seeded);
+    healNativeConfig(root);
+    const pbx = readPbx();
+    expect((pbx.match(/\/\* Begin PBXShellScriptBuildPhase section \*\//g) || []).length).toBe(1);
+    expect((pbx.match(/\/\* End PBXShellScriptBuildPhase section \*\//g) || []).length).toBe(1);
+    expect(pbx).toContain('Warn: Modoki');
+    expect(pbx).toContain('[CP] Embed Pods'); // the existing phase survives
+  });
+});
+
+describe('healNativeConfig — Android debugBuild meta-data (#112)', () => {
+  const MANIFEST = ['android', 'app', 'src', 'main', 'AndroidManifest.xml'];
+  const readManifest = () => fs.readFileSync(path.join(root, ...MANIFEST), 'utf8');
+  function writeManifest() {
+    fs.mkdirSync(path.join(root, 'android', 'app', 'src', 'main'), { recursive: true });
+    fs.writeFileSync(path.join(root, ...MANIFEST),
+      '<?xml version="1.0" encoding="utf-8"?>\n<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n\n' +
+      '    <application android:label="@string/app_name">\n' +
+      '        <activity android:name=".MainActivity" android:exported="true" />\n' +
+      '    </application>\n\n' +
+      '    <uses-permission android:name="android.permission.INTERNET" />\n</manifest>\n');
+  }
+  const NAME = 'com.modokiengine.gamedebug.DEBUG_BUILD';
+
+  it('writes the flag as meta-data inside <application>', () => {
+    writeManifest(); writeConfig('', true); writeGameDebugDep();
+    healNativeConfig(root);
+    const m = readManifest();
+    expect(m).toContain(`<meta-data android:name="${NAME}" android:value="true" />`);
+    expect(m.indexOf(NAME)).toBeLessThan(m.indexOf('</application>'));
+    expect(m.indexOf('<application')).toBeLessThan(m.indexOf(NAME));
+    expect(m).toContain('<activity android:name=".MainActivity"'); // existing children intact
+  });
+
+  it('tracks the flag in both directions and is idempotent', () => {
+    writeManifest(); writeConfig('', false); writeGameDebugDep();
+    healNativeConfig(root);
+    expect(readManifest()).toContain('android:value="false"');
+    const once = readManifest();
+    healNativeConfig(root);
+    expect(readManifest()).toBe(once);
+
+    writeConfig('', true);
+    healNativeConfig(root);
+    expect(readManifest()).toContain('android:value="true"');
+    expect((readManifest().match(new RegExp(NAME, 'g')) || []).length).toBe(1); // rewritten, not duplicated
+  });
+
+  it('is skipped for a project without the game-debug dep', () => {
+    writeManifest(); writeConfig('', true); // no package.json dep
+    healNativeConfig(root);
+    expect(readManifest()).not.toContain(NAME);
+  });
+
+  it('no-op when the project has no android/ folder', () => {
+    writeConfig('', true); writeGameDebugDep();
+    expect(() => healNativeConfig(root)).not.toThrow();
   });
 });
 

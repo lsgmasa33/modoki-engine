@@ -26,13 +26,57 @@ export interface HealResult {
   notes: string[];
 }
 
+/** The GameDebugPlugin registration inside MyViewController.viewDidLoad, fenced by
+ *  marker comments so the heal can rewrite exactly its own code and never touch a
+ *  hand edit around it (games/ota-test extends the same file with an OTA boot hook).
+ *  Generated from `build.debugBuild` — see {@link healIosGameDebugRegistration}. */
+const GD_REG_BEGIN = '        // modoki:game-debug-begin — generated from project.config.json (build.debugBuild)';
+const GD_REG_END = '        // modoki:game-debug-end';
+
+/** The ON form: register the plugin, so its TCP server is reachable from JS. */
+const GD_REG_ON = [
+  GD_REG_BEGIN,
+  '        let gameDebugPlugin = GameDebugPlugin()',
+  '        bridge?.registerPluginInstance(gameDebugPlugin)',
+  '        print("[MyViewController] GameDebugPlugin registered: \\(gameDebugPlugin)")',
+  GD_REG_END,
+].join('\n');
+
+/** The OFF form: markers kept (so re-enabling finds its anchor) with no registration.
+ *  Unregistered means JS can never call `startServer`, so the TCP server never binds
+ *  and `handleEval` is unreachable — the class is still linked into the binary (its
+ *  pbxproj file-ref is unconditional), it simply has no way in. */
+const GD_REG_OFF = [
+  GD_REG_BEGIN,
+  '        // build.debugBuild is OFF — GameDebugPlugin is deliberately NOT registered, so',
+  '        // Capacitor exposes no way to reach its TCP server or handleEval. Turn it on in',
+  '        // Project Settings → Developer ("Debug build") and reopen the project.',
+  GD_REG_END,
+].join('\n');
+
+/** The pre-#112 registration block: gated on `#if DEBUG` (the XCODE CONFIGURATION)
+ *  rather than on the project flag. Matched so the heal can migrate an existing
+ *  project's file to the fenced form exactly once. Anchored on `GameDebugPlugin()`
+ *  so it can never swallow an unrelated `#if DEBUG` a game has added. */
+const LEGACY_GD_REG_RE = /[ \t]*#if DEBUG\r?\n[\s\S]*?GameDebugPlugin\(\)[\s\S]*?[ \t]*#endif[ \t]*\r?\n/;
+
+/** The stale doc sentence that asserted the OLD guarantee ("never ship in a release
+ *  build"), which stops being true once the gate is the project flag. Replaced in place
+ *  so an existing project's generated file stops claiming it. */
+const STALE_DEBUG_ONLY_DOC = /^\/\/\/ DEBUG-only: the TCP debug server \+ Bonjour never ship in a release build\.$/m;
+const FRESH_DEBUG_ONLY_DOC = [
+  '/// The registration below is GENERATED from `project.config.json` `build.debugBuild`,',
+  "/// NOT from the Xcode configuration — so a Release-configuration build CAN carry the",
+  '/// bridge when the flag is on (debugging an optimized build / a TestFlight QA build).',
+].join('\n');
+
 /** The custom bridge VC that keeps GameDebugPlugin alive. A fresh `cap add ios`
  *  scaffolds no such file — SPM static linking strips a plugin class with no
  *  external SDK dependency, so Capacitor never sees it ("GameDebug plugin is not
  *  implemented on ios"). Compiling the plugin straight into the App target (via a
  *  pbxproj file-ref) + registering the instance here keeps it discoverable.
- *  DEBUG-only: the TCP debug server + Bonjour never ship in a release build. */
-const MY_VIEW_CONTROLLER_SWIFT = `import UIKit
+ *  The registration itself is gated on `build.debugBuild`, not on `#if DEBUG`. */
+const myViewControllerSwift = (debugBuild: boolean) => `import UIKit
 import Capacitor
 
 /// Custom bridge VC so we can register plugins that SPM won't auto-discover.
@@ -42,17 +86,11 @@ import Capacitor
 /// SPM static linker strips a plugin class that has no external SDK dependency, so
 /// Capacitor never sees it ("GameDebug plugin is not implemented on ios"). Manually
 /// registering the instance here keeps the class alive and wires it into the bridge.
-/// DEBUG-only: the TCP debug server + Bonjour never ship in a release build.
+${FRESH_DEBUG_ONLY_DOC}
 class MyViewController: CAPBridgeViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
-        #if DEBUG
-        let plugin = GameDebugPlugin()
-        bridge?.registerPluginInstance(plugin)
-        print("[MyViewController] DEBUG — GameDebugPlugin registered: \\(plugin)")
-        #else
-        print("[MyViewController] RELEASE — GameDebugPlugin skipped")
-        #endif
+${debugBuild ? GD_REG_ON : GD_REG_OFF}
     }
 }
 `;
@@ -65,35 +103,99 @@ const GD_UUID = {
   mvcBuildFile: 'DD0000000000000000000002',
   pluginFileRef: 'DD0000000000000000000003',
   pluginBuildFile: 'DD0000000000000000000004',
+  /** RETIRED (#112) — the Release Info.plist-strip phase. Kept reserved rather than
+   *  recycled: `healIosRemoveReleaseStripPhase` deletes the phase by NAME, and a
+   *  project that has not been reopened since still carries this UUID. */
   stripPhase: 'DD0000000000000000000005',
+  /** The archive-time "Debug build is ON" warning phase (#112 Phase 2). */
+  archiveWarnPhase: 'DD0000000000000000000006',
 } as const;
 
-/** The Release Info.plist-strip build phase (Task 4). Runs last so the processed
- *  Info.plist exists, gates on CONFIGURATION=Release, and deletes the two
- *  debug-only Local Network keys the heal adds (see healIosLocalNetwork). Debug
- *  builds keep them; App Store builds ship without a Local Network prompt. */
-const RELEASE_STRIP_PHASE_BLOCK = [
+/** RETIRED (#112) — the Release Info.plist-strip build phase. It deleted the two
+ *  debug-only Local Network keys from the BUILT Info.plist whenever
+ *  `CONFIGURATION == Release`, which made the Xcode configuration a second, competing
+ *  answer to "is this a debug build?": with `debugBuild: true` and a Release
+ *  configuration the bridge shipped but its plist keys were stripped, so it could not
+ *  reach the LAN and nothing said why.
+ *
+ *  The keys are now a pure function of `build.debugBuild`, written into the SOURCE
+ *  plist by {@link healIosLocalNetwork} in both directions — so a build-time script
+ *  that re-derives them from the configuration is exactly the duplicate source of
+ *  truth #112 removes. This matcher exists only to DELETE the phase from a project
+ *  that still carries it; it can go once every native project has been reopened. */
+const LEGACY_STRIP_PHASE_NAME = 'Strip debug-only Info.plist keys';
+
+/** The archive-time warning phase name — also the matcher used to add/remove it.
+ *  ⚠️ NO DOUBLE QUOTES in this or {@link ARCHIVE_WARN_TEXT}: both are embedded inside
+ *  pbxproj quoted strings, and the inner one lands inside a shell `echo "…"` inside
+ *  that — three levels of quoting, where an unescaped `"` silently corrupts the
+ *  project file. Single quotes read the same to a human and cannot bite. */
+const ARCHIVE_WARN_PHASE_NAME = "Warn: Modoki 'Debug build' is ON";
+
+/** The one-line message both platforms print. Names the SETTING a human can act on,
+ *  never the internal constant, and does not claim to have prevented anything. */
+const ARCHIVE_WARN_TEXT =
+  "Modoki: this build has 'Debug build' ON (Project Settings -> Developer). " +
+  'It ships the debug bridge, which can eval arbitrary JS on the device. ' +
+  'That is expected for a TestFlight/QA build - turn it OFF for a store release.';
+
+/** The archive-time warning build phase (#112 Phase 2). Present only while the flag is
+ *  ON; `healIosArchiveWarning` removes it when the flag goes off, so its mere presence
+ *  is itself a signal.
+ *
+ *  ⚠️ Gated on `ACTION == install` (archive/export), NOT on `CONFIGURATION == Release`.
+ *  `debugBuild:true` + a Release configuration is the exact combination #112 exists to
+ *  make WORK — debugging an optimized build — so a CONFIGURATION gate would re-break it
+ *  in a new place.
+ *
+ *  ⚠️ And it is a WARNING, not a failure. TestFlight builds here run with the flag on,
+ *  and a TestFlight archive is bit-identical to a store archive (same `xcodebuild
+ *  archive`, same `method: app-store-connect` export — release-to-store is a button in
+ *  App Store Connect afterwards). There is no build-time signal to refuse on that would
+ *  not also block the workflow in daily use. See
+ *  docs/debug-tools-mcp.md § "Debug vs Release". */
+const ARCHIVE_WARN_PHASE_BLOCK = [
   '/* Begin PBXShellScriptBuildPhase section */',
-  `\t\t${GD_UUID.stripPhase} /* Strip debug-only Info.plist keys (Release) */ = {`,
+  `\t\t${GD_UUID.archiveWarnPhase} /* ${ARCHIVE_WARN_PHASE_NAME} */ = {`,
   '\t\t\tisa = PBXShellScriptBuildPhase;',
   '\t\t\tbuildActionMask = 2147483647;',
-  // Runs every build by design (gated internally on CONFIGURATION). This is the
-  // pbxproj form of unchecking "Based on dependency analysis" — silences Xcode's
-  // "will be run during every build because it does not specify any outputs" warning.
+  // Runs every build by design (gated internally on ACTION). The pbxproj form of
+  // unchecking "Based on dependency analysis" — silences Xcode's "will be run during
+  // every build because it does not specify any outputs" warning.
   '\t\t\talwaysOutOfDate = 1;',
   '\t\t\tfiles = (',
   '\t\t\t);',
   '\t\t\tinputPaths = (',
   '\t\t\t);',
-  '\t\t\tname = "Strip debug-only Info.plist keys (Release)";',
+  `\t\t\tname = "${ARCHIVE_WARN_PHASE_NAME}";`,
   '\t\t\toutputPaths = (',
   '\t\t\t);',
   '\t\t\trunOnlyForDeploymentPostprocessing = 0;',
   '\t\t\tshellPath = /bin/sh;',
-  '\t\t\tshellScript = "if [ \\"${CONFIGURATION}\\" = \\"Release\\" ]; then\\n  PLIST=\\"${TARGET_BUILD_DIR}/${INFOPLIST_PATH}\\"\\n  /usr/libexec/PlistBuddy -c \\"Delete :NSLocalNetworkUsageDescription\\" \\"$PLIST\\" || true\\n  /usr/libexec/PlistBuddy -c \\"Delete :NSBonjourServices\\" \\"$PLIST\\" || true\\n  echo \\"Stripped debug-only Local Network keys for Release build\\"\\nfi\\n";',
+  // `warning:` on stdout is what puts it in Xcode's Issue navigator, not just the log.
+  `\t\t\tshellScript = "if [ \\"$\{ACTION}\\" = \\"install\\" ]; then\\n  echo \\"warning: ${ARCHIVE_WARN_TEXT}\\"\\nfi\\n";`,
   '\t\t};',
   '/* End PBXShellScriptBuildPhase section */',
   '',
+].join('\n');
+
+/** The Gradle sibling of the iOS archive warning, fenced so the heal owns only its own
+ *  lines in the hand-editable `android/app/build.gradle`. Warns when the task graph
+ *  contains a release assemble/bundle for `:app:` — Play's internal-testing track is
+ *  the Android TestFlight, so this is a warning for the same reason. */
+const ANDROID_WARN_BEGIN = '// modoki:debug-build-warning-begin — generated from project.config.json (build.debugBuild)';
+const ANDROID_WARN_END = '// modoki:debug-build-warning-end';
+const ANDROID_WARN_BLOCK = [
+  ANDROID_WARN_BEGIN,
+  'gradle.taskGraph.whenReady { graph ->',
+  '    def shipping = graph.allTasks.any {',
+  "        it.path.startsWith(':app:') && it.name ==~ /(assemble|bundle).*Release/",
+  '    }',
+  '    if (shipping) {',
+  `        logger.warn("${ARCHIVE_WARN_TEXT}")`,
+  '    }',
+  '}',
+  ANDROID_WARN_END,
 ].join('\n');
 
 /** Does this project depend on the game-debug bridge? Gates every game-debug
@@ -254,18 +356,34 @@ function healIosDevelopmentTeam(projectRoot: string, teamId: string): string | u
   return `synced iOS DEVELOPMENT_TEAM = ${teamId} (App target)`;
 }
 
-/** Ensure the iOS Info.plist declares Local Network usage + the game-debug Bonjour
- *  service. Since iOS 14, an app that publishes/browses Bonjour needs
+/** Sync the iOS Info.plist's Local Network keys to `build.debugBuild` — BOTH ways.
+ *
+ *  Since iOS 14, an app that publishes/browses Bonjour needs
  *  `NSLocalNetworkUsageDescription` + `NSBonjourServices` or iOS SILENTLY drops the
  *  outgoing mDNS (the service "publishes" but never reaches the LAN), so the
  *  game-debug MCP can't discover the device — the exact regression a fresh
- *  `cap add ios` reintroduces (it scaffolds an Info.plist without them). Idempotent:
- *  inserts before the root `</dict>` only when absent; never clobbers. */
-function healIosLocalNetwork(projectRoot: string): string | undefined {
+ *  `cap add ios` reintroduces (it scaffolds an Info.plist without them).
+ *
+ *  #112: the REMOVAL half is the new part. These keys used to be added
+ *  unconditionally and stripped from the built plist by a `CONFIGURATION == Release`
+ *  build phase, which is why `debugBuild: true` + a Release configuration produced a
+ *  bridge with no Local Network permission. Keying both directions on the flag makes
+ *  the source plist itself the answer, and lets the strip phase be deleted. */
+function healIosLocalNetwork(projectRoot: string, debugBuild: boolean): string | undefined {
   const plist = path.join(projectRoot, 'ios', 'App', 'App', 'Info.plist');
   if (!fs.existsSync(plist)) return undefined;
   const text = fs.readFileSync(plist, 'utf8');
-  if (text.includes('NSBonjourServices')) return undefined; // already present
+  const present = text.includes('NSBonjourServices');
+
+  if (!debugBuild) {
+    if (!present) return undefined;
+    const stripped = removePlistKey(removePlistKey(text, 'NSLocalNetworkUsageDescription'), 'NSBonjourServices');
+    if (stripped === text) return undefined;
+    fs.writeFileSync(plist, stripped);
+    return 'removed iOS Local Network + Bonjour keys from Info.plist (build.debugBuild is off)';
+  }
+
+  if (present) return undefined;
   const idx = text.lastIndexOf('</dict>');
   if (idx === -1) return undefined; // malformed plist — bail safely
   const block =
@@ -279,6 +397,170 @@ function healIosLocalNetwork(projectRoot: string): string | undefined {
   return 'added iOS Local Network + Bonjour keys to Info.plist (game-debug discovery)';
 }
 
+/** Sync the GameDebugPlugin registration in the generated MyViewController.swift to
+ *  `build.debugBuild` (#112).
+ *
+ *  This is the iOS half of "one flag decides". The registration used to be fenced by
+ *  `#if DEBUG` — the XCODE CONFIGURATION — so `debugBuild: true` + a Release
+ *  configuration shipped the JS bridge with no native plugin behind it: a debug build
+ *  that could not debug, with nothing explaining why.
+ *
+ *  Edits only between the `modoki:game-debug-{begin,end}` markers, migrating a
+ *  pre-#112 `#if DEBUG` block to them exactly once. A file carrying NEITHER (someone
+ *  took ownership of it) is left alone WITH A NOTE rather than rewritten — but note
+ *  that also means the flag silently doesn't apply there, so the note is the only
+ *  signal. `games/ota-test` is why this is fenced and not whole-file generated: it
+ *  hand-extends the same file with the OTA boot hook. */
+function healIosGameDebugRegistration(projectRoot: string, debugBuild: boolean): string | undefined {
+  const mvc = path.join(projectRoot, 'ios', 'App', 'App', 'MyViewController.swift');
+  if (!fs.existsSync(mvc)) return undefined;
+  const orig = fs.readFileSync(mvc, 'utf8');
+  const want = debugBuild ? GD_REG_ON : GD_REG_OFF;
+
+  let text = orig;
+  let migrated = false;
+  const fenceRe = new RegExp(`[ \\t]*${escapeRe(GD_REG_BEGIN.trim())}[\\s\\S]*?${escapeRe(GD_REG_END.trim())}`);
+  if (fenceRe.test(text)) {
+    text = text.replace(fenceRe, want);
+  } else if (LEGACY_GD_REG_RE.test(text)) {
+    text = text.replace(LEGACY_GD_REG_RE, want + '\n');
+    migrated = true;
+  } else {
+    return `MyViewController.swift has no modoki:game-debug markers — build.debugBuild NOT applied to the iOS plugin registration (hand-owned file?)`;
+  }
+
+  // The doc comment asserted the old guarantee; correct it in the same pass.
+  if (STALE_DEBUG_ONLY_DOC.test(text)) text = text.replace(STALE_DEBUG_ONLY_DOC, FRESH_DEBUG_ONLY_DOC);
+
+  if (text === orig) return undefined;
+  fs.writeFileSync(mvc, text);
+  return `${migrated ? 'migrated iOS GameDebugPlugin registration off #if DEBUG; ' : ''}` +
+    `synced iOS GameDebugPlugin registration = ${debugBuild ? 'ON' : 'OFF'} (from build.debugBuild)`;
+}
+
+/** Delete the retired `CONFIGURATION == Release` Info.plist-strip build phase from a
+ *  project that still carries it (#112) — both its `buildPhases` reference and its
+ *  `PBXShellScriptBuildPhase` object. See {@link LEGACY_STRIP_PHASE_NAME} for why it
+ *  is retired. Idempotent: a project without it is a no-op. */
+function healIosRemoveReleaseStripPhase(projectRoot: string): string | undefined {
+  const pbxPath = path.join(projectRoot, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+  if (!fs.existsSync(pbxPath)) return undefined;
+  const orig = fs.readFileSync(pbxPath, 'utf8');
+  if (!orig.includes(LEGACY_STRIP_PHASE_NAME)) return undefined;
+
+  const lines = orig.split('\n');
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // The one-line `buildPhases` reference.
+    if (/^\s*[0-9A-Fa-f]{24} \/\* Strip debug-only Info\.plist keys[^*]*\*\/,\s*$/.test(line)) continue;
+    // The object definition — skip through its closing `};`.
+    if (/^\s*[0-9A-Fa-f]{24} \/\* Strip debug-only Info\.plist keys[^*]*\*\/ = \{\s*$/.test(line)) {
+      while (i < lines.length && !/^\s*\};\s*$/.test(lines[i])) i++;
+      continue;
+    }
+    out.push(line);
+  }
+  let text = out.join('\n');
+  // Drop a now-empty PBXShellScriptBuildPhase section (the phase was its only member).
+  text = text.replace(/\/\* Begin PBXShellScriptBuildPhase section \*\/\n\/\* End PBXShellScriptBuildPhase section \*\/\n\n?/, '');
+  if (text === orig) return undefined;
+  fs.writeFileSync(pbxPath, text);
+  return 'removed the retired Release Info.plist-strip build phase (build.debugBuild now decides — #112)';
+}
+
+/** Add (flag on) or remove (flag off) the iOS archive-time warning build phase —
+ *  #112 Phase 2. See {@link ARCHIVE_WARN_PHASE_BLOCK} for why it warns rather than
+ *  refuses, and why it keys on `ACTION` rather than `CONFIGURATION`. Idempotent. */
+function healIosArchiveWarning(projectRoot: string, debugBuild: boolean): string | undefined {
+  const pbxPath = path.join(projectRoot, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+  if (!fs.existsSync(pbxPath)) return undefined;
+  const orig = fs.readFileSync(pbxPath, 'utf8');
+
+  // Always strip first, then re-add from the CURRENT constants. A presence check ("it's
+  // already there, done") would pin whatever text the project was healed with, so editing
+  // ARCHIVE_WARN_TEXT later would leave every existing project on the old message — the
+  // generated-content-goes-stale failure this whole issue is about. Re-deriving is still
+  // idempotent: identical output means `text === orig` and nothing is written.
+  const stripped = removeArchiveWarnPhase(orig);
+  const text = debugBuild ? insertArchiveWarnPhase(stripped) : stripped;
+  if (text === undefined || text === orig) return undefined;
+  fs.writeFileSync(pbxPath, text);
+  return debugBuild
+    ? "synced the archive-time 'Debug build is ON' warning build phase (#112)"
+    : "removed the archive-time 'Debug build is ON' warning (build.debugBuild is off)";
+}
+
+/** Drop the warning phase's `buildPhases` reference AND its object, plus the
+ *  `PBXShellScriptBuildPhase` section if that emptied it. Pure. */
+function removeArchiveWarnPhase(pbx: string): string {
+  if (!pbx.includes(ARCHIVE_WARN_PHASE_NAME)) return pbx;
+  const lines = pbx.split('\n');
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].includes(ARCHIVE_WARN_PHASE_NAME)) { out.push(lines[i]); continue; }
+    if (/,\s*$/.test(lines[i])) continue;                       // the buildPhases reference
+    if (/= \{\s*$/.test(lines[i])) {                            // the object — skip to its `};`
+      while (i < lines.length && !/^\s*\};\s*$/.test(lines[i])) i++;
+      continue;
+    }
+    out.push(lines[i]);
+  }
+  return out.join('\n').replace(
+    /\/\* Begin PBXShellScriptBuildPhase section \*\/\n\/\* End PBXShellScriptBuildPhase section \*\/\n\n?/, '');
+}
+
+/** Add the warning phase's reference + object. Returns undefined (bail, no partial
+ *  edit) when either anchor is missing. Pure. */
+function insertArchiveWarnPhase(pbx: string): string | undefined {
+  const lines = pbx.split('\n');
+  const resIdx = lines.findIndex((l) => /^\s*[0-9A-Fa-f]{6,} \/\* Resources \*\/,$/.test(l));
+  if (resIdx < 0) return undefined; // can't find the App target's buildPhases list
+  lines.splice(resIdx + 1, 0, `\t\t\t\t${GD_UUID.archiveWarnPhase} /* ${ARCHIVE_WARN_PHASE_NAME} */,`);
+  const text = lines.join('\n');
+
+  // Merge into an EXISTING PBXShellScriptBuildPhase section (a CocoaPods game has one)
+  // rather than opening a second — two sections of the same name is not valid pbxproj.
+  const sectionOpen = '/* Begin PBXShellScriptBuildPhase section */';
+  if (text.includes(sectionOpen)) {
+    return text.replace(sectionOpen,
+      sectionOpen + '\n' + ARCHIVE_WARN_PHASE_BLOCK.split('\n').slice(1, -2).join('\n'));
+  }
+  const anchor = '/* Begin PBXSourcesBuildPhase section */';
+  if (!text.includes(anchor)) return undefined;
+  return text.replace(anchor, ARCHIVE_WARN_PHASE_BLOCK + '\n' + anchor);
+}
+
+/** The Gradle sibling of {@link healIosArchiveWarning}. Appends (flag on) or removes
+ *  (flag off) a fenced `taskGraph.whenReady` warning in `android/app/build.gradle`. */
+function healAndroidArchiveWarning(projectRoot: string, debugBuild: boolean): string | undefined {
+  const gradle = path.join(projectRoot, 'android', 'app', 'build.gradle');
+  if (!fs.existsSync(gradle)) return undefined;
+  const orig = fs.readFileSync(gradle, 'utf8');
+  const fenceRe = new RegExp(`\\n*${escapeRe(ANDROID_WARN_BEGIN)}[\\s\\S]*?${escapeRe(ANDROID_WARN_END)}\\n?`);
+
+  let text: string;
+  if (fenceRe.test(orig)) {
+    text = debugBuild ? orig.replace(fenceRe, '\n\n' + ANDROID_WARN_BLOCK + '\n') : orig.replace(fenceRe, '\n');
+  } else {
+    if (!debugBuild) return undefined;
+    text = orig.replace(/\n*$/, '\n') + '\n' + ANDROID_WARN_BLOCK + '\n';
+  }
+  if (text === orig) return undefined;
+  fs.writeFileSync(gradle, text);
+  return `${debugBuild ? 'added' : 'removed'} the Gradle release-build "Debug build is ON" warning (#112)`;
+}
+
+/** Remove a top-level Info.plist key AND its value element. Inverse of
+ *  {@link setPlistKey}; no-op when the key is absent. */
+function removePlistKey(text: string, key: string): string {
+  const re = new RegExp(
+    `[ \\t]*<key>${key}</key>[ \\t]*\\r?\\n` +
+    `[ \\t]*(?:<array>[\\s\\S]*?</array>|<dict>[\\s\\S]*?</dict>|<[A-Za-z]+\\s*/>|<[A-Za-z]+>[\\s\\S]*?</[A-Za-z]+>)[ \\t]*\\r?\\n`,
+  );
+  return text.replace(re, '');
+}
+
 /** Wire the iOS App target so Capacitor discovers GameDebugPlugin (Task 3). A
  *  fresh `cap add ios` doesn't compile the plugin in — SPM strips the class — so
  *  we (1) drop a MyViewController.swift that registers the instance in DEBUG,
@@ -287,7 +569,7 @@ function healIosLocalNetwork(projectRoot: string): string | undefined {
  *  target. Idempotent (skips whatever's already present); only for a project that
  *  depends on capacitor-game-debug AND lives inside the modoki repo. Bails without
  *  writing if any pbxproj anchor is missing (never leaves a partial edit). */
-function healIosGameDebugWiring(projectRoot: string): string | undefined {
+function healIosGameDebugWiring(projectRoot: string, debugBuild: boolean): string | undefined {
   if (!usesGameDebug(projectRoot)) return undefined;
   const iosApp = path.join(projectRoot, 'ios', 'App');
   const pbxPath = path.join(iosApp, 'App.xcodeproj', 'project.pbxproj');
@@ -300,7 +582,7 @@ function healIosGameDebugWiring(projectRoot: string): string | undefined {
   // 1. MyViewController.swift (registers the plugin) — write if missing.
   const mvcPath = path.join(iosApp, 'App', 'MyViewController.swift');
   if (!fs.existsSync(mvcPath)) {
-    fs.writeFileSync(mvcPath, MY_VIEW_CONTROLLER_SWIFT);
+    fs.writeFileSync(mvcPath, myViewControllerSwift(debugBuild));
     notes.push('wrote ios MyViewController.swift');
   }
 
@@ -398,35 +680,6 @@ function healIosGameDebugWiring(projectRoot: string): string | undefined {
   return notes.length ? notes.join('; ') : undefined;
 }
 
-/** Add a Release-only build phase that strips the debug-only Local Network keys
- *  from the built Info.plist (Task 4). The GameDebugPlugin is already #if DEBUG
- *  gated, but healIosLocalNetwork adds the plist keys unconditionally — this keeps
- *  them out of App Store builds. Idempotent; scoped to a game-debug project. */
-function healIosReleaseStripDebugKeys(projectRoot: string): string | undefined {
-  if (!usesGameDebug(projectRoot)) return undefined;
-  const pbxPath = path.join(projectRoot, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
-  if (!fs.existsSync(pbxPath)) return undefined;
-  let text = fs.readFileSync(pbxPath, 'utf8');
-  if (text.includes('Strip debug-only Info.plist keys')) return undefined; // already present
-
-  // The phase must be referenced in the App target's buildPhases AND defined as an
-  // object. Add the reference after the Resources phase (runs last), then the block.
-  const refLine = `\t\t\t\t${GD_UUID.stripPhase} /* Strip debug-only Info.plist keys (Release) */,`;
-  const lines = text.split('\n');
-  const resIdx = lines.findIndex((l) => /^\s*[0-9A-Fa-f]{6,} \/\* Resources \*\/,$/.test(l));
-  if (resIdx < 0) return undefined; // can't find the buildPhases list — bail
-  lines.splice(resIdx + 1, 0, refLine);
-  text = lines.join('\n');
-
-  // Define the phase object as its own section, before the Sources phase section.
-  const anchor = '/* Begin PBXSourcesBuildPhase section */';
-  if (!text.includes(anchor)) return undefined;
-  text = text.replace(anchor, RELEASE_STRIP_PHASE_BLOCK + '\n' + anchor);
-
-  fs.writeFileSync(pbxPath, text);
-  return 'added Release Info.plist-strip build phase (debug-only Local Network keys)';
-}
-
 /** Replace (or insert before the root `</dict>`) a top-level Info.plist key's
  *  value. `valueXml` is the raw value element (e.g. `<true/>` or an `<array>…`).
  *  Idempotent: re-running with the same value is a no-op-equivalent rewrite. */
@@ -522,6 +775,53 @@ function healAndroidOrientation(projectRoot: string, cap: ProjectConfig['capacit
   if (tag === m[0]) return undefined;
   fs.writeFileSync(manifest, text.replace(tagRe, tag));
   return `synced Android screenOrientation=${value} (AndroidManifest)`;
+}
+
+/** The generated `<meta-data>` that carries `build.debugBuild` into the Android app,
+ *  fenced by XML comments so the heal rewrites only its own element. */
+const ANDROID_DEBUG_META_BEGIN = '        <!-- modoki:debug-build-begin — generated from project.config.json (build.debugBuild) -->';
+const ANDROID_DEBUG_META_END = '        <!-- modoki:debug-build-end -->';
+/** Must match `GameDebugPlugin.META_DEBUG_BUILD`. */
+const ANDROID_DEBUG_META_NAME = 'com.modokiengine.gamedebug.DEBUG_BUILD';
+
+/** Sync `build.debugBuild` into the Android app as an AndroidManifest `<meta-data>`
+ *  the game-debug plugin reads (#112).
+ *
+ *  Android's gate used to be `ApplicationInfo.FLAG_DEBUGGABLE` — the APK's own debuggable
+ *  flag, i.e. the Gradle build type. Same defect as iOS's `#if DEBUG`: a `debugBuild:true`
+ *  project assembled as a release variant shipped the JS bridge with a native plugin that
+ *  refuses to start, and said only "Debug bridge disabled in release builds".
+ *
+ *  Why meta-data and not `BuildConfig`: the plugin is a LIBRARY module, so it cannot
+ *  reference the app module's generated `BuildConfig` class by name. Manifest meta-data is
+ *  the standard way an app hands a value to a library, and this file is already healed
+ *  (orientation, fullscreen). Absent meta-data reads as FALSE in the plugin — fail closed,
+ *  so a project that has not been reopened since this change loses the bridge rather than
+ *  silently keeping it. */
+function healAndroidDebugBuildMetaData(projectRoot: string, debugBuild: boolean): string | undefined {
+  const manifest = path.join(projectRoot, 'android', 'app', 'src', 'main', 'AndroidManifest.xml');
+  if (!fs.existsSync(manifest)) return undefined;
+  const orig = fs.readFileSync(manifest, 'utf8');
+  const block = [
+    ANDROID_DEBUG_META_BEGIN,
+    `        <meta-data android:name="${ANDROID_DEBUG_META_NAME}" android:value="${debugBuild}" />`,
+    ANDROID_DEBUG_META_END,
+  ].join('\n');
+
+  const fenceRe = new RegExp(`[ \\t]*${escapeRe(ANDROID_DEBUG_META_BEGIN.trim())}[\\s\\S]*?${escapeRe(ANDROID_DEBUG_META_END.trim())}`);
+  let text: string;
+  if (fenceRe.test(orig)) {
+    text = orig.replace(fenceRe, block);
+  } else {
+    // Insert as the last child of <application>.
+    const close = orig.lastIndexOf('</application>');
+    if (close === -1) return undefined; // not a Capacitor manifest — bail safely
+    const lineStart = orig.lastIndexOf('\n', close) + 1;
+    text = orig.slice(0, lineStart) + block + '\n' + orig.slice(lineStart);
+  }
+  if (text === orig) return undefined;
+  fs.writeFileSync(manifest, text);
+  return `synced Android ${ANDROID_DEBUG_META_NAME}=${debugBuild} (from build.debugBuild)`;
 }
 
 /** Sync the iOS deployment target from `build.iosMinVersion`.
@@ -703,14 +1003,27 @@ export function healNativeConfig(projectRoot: string): HealResult {
     if (ao) notes.push(ao);
     const af = healAndroidFullscreen(projectRoot, cfg.capacitor);
     if (af) notes.push(af);
-    // game-debug heals — only for a project that depends on the bridge.
+    // game-debug heals — only for a project that depends on the bridge. Every one of
+    // these keys on build.debugBuild and NOTHING else (#112): the Xcode/Gradle
+    // configuration means optimization + symbols, never "is this a debug build".
     if (usesGameDebug(projectRoot)) {
-      const n = healIosLocalNetwork(projectRoot);
+      const debugBuild = cfg.build.debugBuild === true;
+      const n = healIosLocalNetwork(projectRoot, debugBuild);
       if (n) notes.push(n);
-      const w = healIosGameDebugWiring(projectRoot);
+      const w = healIosGameDebugWiring(projectRoot, debugBuild);
       if (w) notes.push(w);
-      const s = healIosReleaseStripDebugKeys(projectRoot);
+      // AFTER the wiring — it may have just scaffolded MyViewController.swift.
+      const r = healIosGameDebugRegistration(projectRoot, debugBuild);
+      if (r) notes.push(r);
+      const s = healIosRemoveReleaseStripPhase(projectRoot);
       if (s) notes.push(s);
+      const am = healAndroidDebugBuildMetaData(projectRoot, debugBuild);
+      if (am) notes.push(am);
+      // Phase 2 — a WARNING, never a refusal (TestFlight ships with the flag on).
+      const iw = healIosArchiveWarning(projectRoot, debugBuild);
+      if (iw) notes.push(iw);
+      const aw = healAndroidArchiveWarning(projectRoot, debugBuild);
+      if (aw) notes.push(aw);
     }
   } catch (e) {
     notes.push(`native-config heal skipped: ${e instanceof Error ? e.message : String(e)}`);
