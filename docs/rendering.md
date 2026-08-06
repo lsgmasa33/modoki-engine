@@ -108,6 +108,67 @@ Applied each frame while `castShadow` is on and the light is directional/spot. `
 
 The shadow camera near/far are fixed at `0.1` / `200`; the directional light's ortho frustum is set from `shadowCameraSize`. Casters/receivers are flagged via `applyShadowFlags` (traverses the object, setting `castShadow` + `receiveShadow` on every mesh) — inert unless a light casts AND the renderer's shadow map is enabled.
 
+### Rendering-layer light masks — per-object light selection (`lightMaskVariants.ts`)
+
+A light affects a renderer when their `renderingLayerMask` bitmasks INTERSECT (Unity's Rendering
+Layers, Godot's `light_mask`, Unreal's lighting channels). The field is on `Light`, `Renderable3D`
+and `Renderable3DPrimitive`, defaults to `1` on all three, and an unauthored scene is completely
+inert — no variant is allocated and the code path is skipped entirely.
+
+**Why**: forward shading evaluates EVERY scene light for EVERY fragment, superlinearly on mobile.
+Masking is the highest-value low-tier knob there is — bigger than the entire post-FX stack. The
+numbers, and the two measurement traps that produced three retracted figures, are in
+[plans/low-end-device-support.md](plans/low-end-device-support.md).
+
+**Mechanism**: three's `NodeMaterial.lightsNode` overrides the scene's global light list for one
+material, in a single pass. It works on a classic `MeshStandardMaterial` because
+`NodeLibrary.fromMaterial` copies properties with a `for…in`. So a masked mesh renders with a
+CLONE of its material carrying a restricted lights node.
+
+Two caches, deliberately keyed differently — **both keys are load-bearing, and getting either wrong
+renders a correct-looking scene wrong**:
+
+- **The material variant** is keyed by `(base material, light selection)`. Not per entity:
+  materials are shared (13 across 33 meshes in postfx-demo), so a per-entity variant would trade a
+  fragment-cost problem for a pipeline-count one.
+- **The lights node** is keyed by the **selection alone** and shared across base materials. A
+  `LightsNode` builds a `ShadowNode` per shadow-casting light it references, and each ShadowNode
+  renders its own shadow map — so one node per material means one shadow PASS per material.
+
+⚠️ **A variant of a CLASSIC material MUST override `customProgramCacheKey()`.** This is not an
+optimisation; without it masked objects render **pitch black while their data is perfect**. three's
+`RenderObject.getMaterialCacheKey()` decides which compiled PIPELINE a material reuses by walking
+its properties, and it cannot see a lights node: a non-texture object property contributes the
+literal string `"{}"`, and `uuid`/`name`/`userData` are skipped outright. So N clones of one base
+that differ ONLY in their light set hash to the SAME key and all share whichever pipeline compiled
+first — each rendering with another variant's lights.
+
+**A real `NodeMaterial` is already safe and must be left alone.** `NodeMaterial` overrides
+`customProgramCacheKey()` to hash its node graph — `_getNodeChildren()` walks every own property
+whose value `isNode`, which an assigned `lightsNode` is. Overriding it *there* would REPLACE that
+graph hash with just the light selection, so two different node graphs (two file shaders on the
+same material class) would share one pipeline: the identical defect one layer up. Hence the
+`isNodeMaterial` guard — the classic material is the only one whose key is blind to nodes, so it is
+the only one touched, and even then the base's own key is composed with rather than replaced.
+
+The failure hides behind material SHARING, which is what made it hard: postfx-demo's six plinths
+are one shared `.mat.json`, so their variants collide with each other; several selections were
+empty (those spots were off), the empty-lights pipeline won, and every plinth went black. The horse
+statue's material is its own — one variant, no collision, correctly lit. A cache collision
+therefore looked exactly like a per-object lighting fault. It also needs a SECOND light before any
+variant exists at all (a mask that already sees every light returns `null` and uses the global
+path), so the trigger reads as "enable a second spot and an unrelated object goes dark".
+
+Wrong theories that cost time, recorded so they are not re-derived: it is *not* the two render
+surfaces (SceneView and GameView own separate `THREE.Light` instances — real, and handled by keying
+on light identity, but not this bug); it is *not* shadow-map contention; and it is *not* cloning.
+Note the confound that produced the second wrong fix — **toggling `castShadow` off→on forces a
+shadow rebuild**, so "changing X lit it" may only mean "rebuilding lit it". Isolate with
+`shadow.intensity`, which changes no build state.
+
+Not yet masked: skinned meshes, billboards and text have no mask field, and multi-material meshes
+are skipped.
+
 ### Scene lights in custom shaders (`sceneLightUniforms.ts`)
 
 Standard `MeshStandardMaterial`s get scene lights for free through Three's `LightsNode`. A **custom shader** (a `.shader.json` file shader, or a code-registered TSL builder) assigns its own `fragmentNode`, which BYPASSES that lighting pipeline — so historically each custom shader baked in a fixed sun direction/colour. `sceneLightUniforms.ts` closes that: it picks a small set of the scene's actual `Light` traits each frame and exposes them to custom shaders as uniforms.

@@ -21,7 +21,7 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 
 | Doc | What it is |
 |---|---|
-| [rendering.md](./rendering.md) | The three rendering layers (3d/2d/ui), the WebGPU renderer, and the NPR outline post-process pipeline |
+| [rendering.md](./rendering.md) | The three rendering layers (3d/2d/ui), the WebGPU renderer, lights & shadows incl. rendering-layer light masks, and the NPR outline post-process pipeline |
 | [textures.md](./textures.md) | Per-texture import — `.meta.json` settings, KTX2/WebP conversion, content cache, GPU-aware runtime variant resolution |
 | [model-pipeline.md](./model-pipeline.md) | GLB model import — postprocessor fixups, two-stage LOD baking, caching, runtime `THREE.LOD` |
 | [art-tools-3daistudio.md](./art-tools-3daistudio.md) | External art generation via 3D AI Studio — the 2D Image Studio (models, inpainting, style converters, **style reference + character sheet** for set consistency), the 3D/texturing/mesh tools, the OAuth **MCP connector** Claude Code can drive, credits, and the three things to verify before relying on it |

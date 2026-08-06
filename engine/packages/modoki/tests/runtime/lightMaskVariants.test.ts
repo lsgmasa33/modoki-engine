@@ -233,6 +233,173 @@ describe('TWO SURFACES — the editor bug that shipped', () => {
   });
 });
 
+describe('ONE lights node per selection — the shadow bug that shipped', () => {
+  // A LightsNode builds a ShadowNode per shadow-casting light, and that ShadowNode owns the
+  // shadow-map render target its material samples. Two nodes over the same light means two
+  // ShadowNodes fighting over one LightShadow, and the loser samples a map nothing rendered
+  // into — it reads as fully in shadow, i.e. a PITCH-BLACK object with perfectly correct data.
+  // Live repro: the horse plinth (shared plinth .mat.json) and the horse statue (its own GLB
+  // material) both select only SpotHorse. Statue lit, plinth black.
+  it('shares one node across DIFFERENT base materials selecting the same lights', () => {
+    const f = stubFactory();
+    const key = new THREE.SpotLight();
+    const other = new THREE.SpotLight();
+    beginLightMaskFrame([{ light: key, mask: 0b01 }, { light: other, mask: 0b10 }], true);
+
+    const plinth = getMaskedMaterial(new THREE.MeshStandardMaterial(), 0b01, f) as THREE.Material & { lightsNode?: unknown };
+    const statue = getMaskedMaterial(new THREE.MeshStandardMaterial(), 0b01, f) as THREE.Material & { lightsNode?: unknown };
+
+    expect(plinth).not.toBe(statue);                  // distinct materials — they carry different props
+    expect(plinth.lightsNode).toBe(statue.lightsNode); // ...over ONE lights node
+    expect(f.calls).toHaveLength(1);                   // built once, so ONE ShadowNode per light
+    expect(getLightMaskStats().variants).toBe(2);
+  });
+
+  it('still builds a distinct node per distinct selection', () => {
+    const f = stubFactory();
+    const a = new THREE.SpotLight();
+    const b = new THREE.SpotLight();
+    const held = new THREE.PointLight();
+    beginLightMaskFrame(
+      [{ light: a, mask: 0b01 }, { light: b, mask: 0b10 }, { light: held, mask: 0b100 }],
+      true,
+    );
+    const base = new THREE.MeshStandardMaterial();
+
+    const onA = getMaskedMaterial(base, 0b01, f) as THREE.Material & { lightsNode?: unknown };
+    const onB = getMaskedMaterial(base, 0b10, f) as THREE.Material & { lightsNode?: unknown };
+
+    expect(onA.lightsNode).not.toBe(onB.lightsNode);
+    expect(f.calls).toEqual([[a], [b]]);
+  });
+
+  it('gives each render SURFACE its own node — they hold different THREE.Light instances', () => {
+    // Sharing must key off light IDENTITY, not the mask: SceneView and GameView own separate
+    // THREE.Light objects, and a node holding the other surface's lights lights nothing.
+    const f = stubFactory();
+    const base = new THREE.MeshStandardMaterial();
+    const surfaceA = [{ light: new THREE.SpotLight(), mask: 0b01 }, { light: new THREE.PointLight(), mask: 0b10 }];
+    const surfaceB = [{ light: new THREE.SpotLight(), mask: 0b01 }, { light: new THREE.PointLight(), mask: 0b10 }];
+
+    beginLightMaskFrame(surfaceA, true);
+    const a = getMaskedMaterial(base, 0b01, f) as THREE.Material & { lightsNode?: unknown };
+    beginLightMaskFrame(surfaceB, true);
+    const b = getMaskedMaterial(base, 0b01, f) as THREE.Material & { lightsNode?: unknown };
+
+    expect(a.lightsNode).not.toBe(b.lightsNode);
+    expect(f.calls).toEqual([[surfaceA[0].light], [surfaceB[0].light]]);
+  });
+});
+
+describe('PIPELINE CACHE KEY — the black-object bug', () => {
+  // three's RenderObject.getMaterialCacheKey() decides which compiled pipeline to reuse by
+  // walking the material's properties, and a lightsNode is invisible to it: a non-texture object
+  // contributes the literal "{}", and uuid/name/userData are skipped. So clones of ONE base that
+  // differ only in their light set hash identically and share whichever pipeline compiled first.
+  // postfx-demo's six plinths share one .mat.json; several selections were empty, the empty
+  // pipeline won, and every plinth rendered BLACK while its data was perfect.
+  const keyOf = (m: THREE.Material | null) =>
+    (m as (THREE.Material & { customProgramCacheKey?: () => string }) | null)?.customProgramCacheKey?.();
+
+  it('gives variants of the SAME base different keys when their light sets differ', () => {
+    const f = stubFactory();
+    const a = new THREE.SpotLight();
+    const b = new THREE.SpotLight();
+    const held = new THREE.PointLight();
+    beginLightMaskFrame(
+      [{ light: a, mask: 0b01 }, { light: b, mask: 0b10 }, { light: held, mask: 0b100 }],
+      true,
+    );
+    const base = new THREE.MeshStandardMaterial();
+
+    const onA = getMaskedMaterial(base, 0b01, f);
+    const onB = getMaskedMaterial(base, 0b10, f);
+
+    expect(keyOf(onA)).toBeTruthy();
+    expect(keyOf(onA)).not.toBe(keyOf(onB));
+  });
+
+  it('distinguishes an EMPTY selection from a non-empty one — the exact plinth collision', () => {
+    const f = stubFactory();
+    const lit = new THREE.SpotLight();
+    const other = new THREE.PointLight();
+    beginLightMaskFrame([{ light: lit, mask: 0b01 }, { light: other, mask: 0b10 }], true);
+    const plinthMat = new THREE.MeshStandardMaterial(); // ONE .mat.json, six plinths
+
+    const litPlinth = getMaskedMaterial(plinthMat, 0b01, f);   // sees the spot
+    const darkPlinth = getMaskedMaterial(plinthMat, 0b100, f); // sees nothing
+
+    expect(lightsForMask(0b100)).toEqual([]);
+    expect(keyOf(litPlinth)).not.toBe(keyOf(darkPlinth));
+  });
+
+  it('separates a variant from its own unmasked base material', () => {
+    const f = stubFactory();
+    beginLightMaskFrame([{ light: new THREE.SpotLight(), mask: 0b01 }, { light: new THREE.PointLight(), mask: 0b10 }], true);
+    const base = new THREE.MeshStandardMaterial();
+    const variant = getMaskedMaterial(base, 0b01, f);
+
+    expect(keyOf(variant)).not.toBe(base.customProgramCacheKey());
+  });
+
+  it('leaves a NodeMaterial ALONE — three already hashes its node graph', () => {
+    // NodeMaterial.customProgramCacheKey() hashes _getNodeChildren(), which picks up every own
+    // property whose value isNode — including an assigned lightsNode. Overriding it there would
+    // REPLACE that graph hash with just the light selection, so two different node graphs (two
+    // file shaders) would share one pipeline. That is this same defect one layer up.
+    //
+    // A REAL node material cannot be built here: `three/webgpu` resolves to an EMPTY module under
+    // vitest (0 exports — verified). So this is a genuine THREE.Material subclass carrying the one
+    // property the branch actually reads, which survives clone() (`new this.constructor().copy()`)
+    // exactly as a real NodeMaterial's would.
+    class FakeNodeMaterial extends THREE.MeshStandardMaterial {
+      isNodeMaterial = true;
+      override customProgramCacheKey(): string { return 'node-graph-hash'; }
+    }
+    const f = stubFactory();
+    const key = new THREE.SpotLight();
+    const other = new THREE.PointLight();
+    beginLightMaskFrame([{ light: key, mask: 0b01 }, { light: other, mask: 0b10 }], true);
+
+    const variant = getMaskedMaterial(new FakeNodeMaterial(), 0b01, f) as THREE.Material & {
+      isNodeMaterial?: boolean;
+      customProgramCacheKey: () => string;
+    };
+
+    expect(variant.isNodeMaterial).toBe(true);
+    // We must not have shadowed it: three's own graph-derived key still answers.
+    expect(Object.prototype.hasOwnProperty.call(variant, 'customProgramCacheKey')).toBe(false);
+    expect(variant.customProgramCacheKey()).toBe('node-graph-hash');
+  });
+
+  it('COMPOSES with a classic base that customises its own key, rather than replacing it', () => {
+    class KeyedMaterial extends THREE.MeshStandardMaterial {
+      override customProgramCacheKey(): string { return 'base-own-key'; }
+    }
+    const f = stubFactory();
+    beginLightMaskFrame([{ light: new THREE.SpotLight(), mask: 0b01 }, { light: new THREE.PointLight(), mask: 0b10 }], true);
+
+    const variant = getMaskedMaterial(new KeyedMaterial(), 0b01, f) as THREE.Material & {
+      customProgramCacheKey: () => string;
+    };
+
+    expect(variant.customProgramCacheKey()).toContain('base-own-key');
+    expect(variant.customProgramCacheKey()).toContain('lightmask:');
+  });
+
+  it('lets variants sharing a light set share a key — the cache must not fragment needlessly', () => {
+    const f = stubFactory();
+    const key = new THREE.SpotLight();
+    const other = new THREE.PointLight();
+    beginLightMaskFrame([{ light: key, mask: 0b01 }, { light: other, mask: 0b10 }], true);
+
+    const plinth = getMaskedMaterial(new THREE.MeshStandardMaterial(), 0b01, f);
+    const statue = getMaskedMaterial(new THREE.MeshStandardMaterial(), 0b01, f);
+
+    expect(keyOf(plinth)).toBe(keyOf(statue));
+  });
+});
+
 describe('teardown', () => {
   it('disposes every variant and clears state', () => {
     const f = stubFactory();

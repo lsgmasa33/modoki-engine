@@ -18,7 +18,9 @@
  *  material, in a SINGLE pass (`NodeMaterial.js` — `this.lightsNode || builder.lightsNode`). It
  *  works on a classic `MeshStandardMaterial` too, because `NodeLibrary.fromMaterial` copies
  *  properties across with a `for…in` and an assigned `lightsNode` is own+enumerable. So this
- *  needs no material-class migration.
+ *  needs no material-class migration — but a classic material's PIPELINE CACHE KEY is blind to
+ *  the node it now carries, which is why `customProgramCacheKey` below is mandatory rather than
+ *  cosmetic. Full account: docs/rendering.md § "Rendering-layer light masks".
  *
  *  FREE BONUS: in three's WebGPU path a shadow map is rendered by `ShadowNode.updateBefore`,
  *  and that node only exists if `AnalyticLightNode.setupShadow` ran — which happens only for
@@ -28,12 +30,14 @@
  *  referenced by even ONE material still pays its full shadow-map render, so masking a 1024²
  *  shadow-casting spot down to a single statue saves the fragment cost but not the pass.
  *
- *  KEYED BY (base material, mask) — NOT per entity. Materials are shared (13 across 33 meshes in
- *  postfx-demo); a per-entity variant would trade a fragment-cost problem for a pipeline-count
- *  one, since every distinct material means another shader compile and another pipeline. Keying
- *  by the light set means every mesh sharing a mask shares one variant. This is the whole reason
- *  the module exists rather than reusing `materialInstanceClones` (which is deliberately
- *  per-entity, for per-instance PROPERTY overrides).
+ *  TWO CACHES, KEYED DIFFERENTLY ON PURPOSE — and neither key is arbitrary:
+ *    - the material variant by **(base material, light selection)**, NOT per entity. Materials are
+ *      shared (13 across 33 meshes in postfx-demo); a per-entity variant would trade a
+ *      fragment-cost problem for a pipeline-count one, since every distinct material means another
+ *      shader compile and another pipeline. This is the whole reason the module exists rather than
+ *      reusing `materialInstanceClones` (deliberately per-entity, for PROPERTY overrides).
+ *    - the lights node by the **selection alone**, shared across base materials, so a light gets
+ *      one `ShadowNode` — and so one shadow pass — instead of one per material.
  *
  *  Lifecycle mirrors the other material caches: variants are created lazily and freed on world
  *  swap — the scene is the unit of memory management. */
@@ -53,7 +57,12 @@ export interface MaskedLight {
 
 /** Anything with a `lightsNode`. Classic materials accept the assignment too (see header), so
  *  this is deliberately structural rather than `NodeMaterial`. */
-type LightsNodeMaterial = THREE.Material & { lightsNode?: unknown };
+type LightsNodeMaterial = THREE.Material & {
+  lightsNode?: unknown;
+  /** three calls this to seed the pipeline cache key; overriding it per variant is what keeps
+   *  two clones that differ only in `lightsNode` from sharing one compiled shader. */
+  customProgramCacheKey?: () => string;
+};
 
 /** The renderer surface we need. Passed IN rather than read from a global: this module is
  *  `rendering/` (L2) and the active-renderer accessor lives in `loaders/` (L3), so importing it
@@ -86,6 +95,36 @@ function lightId(l: THREE.Light): number {
   return id;
 }
 
+/** `${selected light ids}` → ONE shared lights node for that exact selection.
+ *
+ *  SEPARATE from the material cache on purpose, and load-bearing. A `LightsNode` builds a
+ *  `ShadowNode` per shadow-casting light it references, and a ShadowNode owns its own shadow-map
+ *  render target which its material samples. Build TWO nodes over the same light and you get two
+ *  ShadowNodes competing for one `LightShadow` — `ShadowNode.setup` assigns `shadow.map` to
+ *  whichever built last — and the losing material samples a map nothing rendered into, i.e. it
+ *  reads as FULLY IN SHADOW. On screen that is a pitch-black object, in a scene whose data is
+ *  entirely correct.
+ *
+ *  It bit exactly where materials differ but lighting does not: the horse plinth (a primitive on
+ *  the shared plinth `.mat.json`) and the horse statue (its own GLB material) both select only
+ *  SpotHorse, so keying the node by (material, lights) gave them a node each — statue lit, plinth
+ *  black. Keying the NODE by the light selection alone gives one ShadowNode per light, exactly as
+ *  the unmasked global path has always had.
+ *
+ *  So the two caches are keyed differently and both keys are right: a material variant is per
+ *  (base material, selection) because it carries that material's own properties, while the lights
+ *  node is per selection because it owns shadow state that must not be duplicated. */
+const lightsNodes = new Map<string, unknown>();
+
+function lightsNodeFor(sel: string, selected: THREE.Light[], factory: LightingFactory): unknown {
+  let node = lightsNodes.get(sel);
+  if (node === undefined) {
+    node = factory.lighting.createNode(selected);
+    lightsNodes.set(sel, node);
+  }
+  return node;
+}
+
 interface Variant {
   material: LightsNodeMaterial;
 }
@@ -104,6 +143,12 @@ function disposeAll(): void {
   for (const m of owned) m.dispose();
   owned.clear();
   variants.clear();
+  // The nodes own shadow render targets, so they leak GPU memory if merely dropped.
+  for (const n of lightsNodes.values()) {
+    const d = (n as { dispose?: () => void } | null)?.dispose;
+    if (typeof d === 'function') d.call(n);
+  }
+  lightsNodes.clear();
   currentLights = [];
   active = false;
 }
@@ -178,12 +223,44 @@ export function getMaskedMaterial(
   // Sees everything anyway — the scene's global lights node is already correct and cheaper.
   if (selected.length === currentLights.length) return null;
 
-  const key = `${base.uuid}|${selected.map(lightId).join(',')}`;
+  const sel = selected.map(lightId).join(',');
+  const key = `${base.uuid}|${sel}`;
   const existing = variants.get(key);
   if (existing) return existing.material;
 
   const material = base.clone() as LightsNodeMaterial;
-  material.lightsNode = factory.lighting.createNode(selected);
+  // Shared per selection, NOT built per material — see `lightsNodes` for why a second node over
+  // the same shadow-casting light duplicates that light's shadow pass.
+  material.lightsNode = lightsNodeFor(sel, selected, factory);
+  // MANDATORY, and the whole reason masked objects rendered black. three's
+  // `RenderObject.getMaterialCacheKey()` walks the material's properties to decide which compiled
+  // PIPELINE to reuse, and it cannot see a lightsNode: an object-valued property that is not a
+  // texture contributes the literal string "{}", and uuid/name/userData are skipped outright. So
+  // N clones of one base material differing ONLY in their lights node hash to the SAME key and
+  // all share whichever pipeline compiled first — every one of them lit by another variant's
+  // light list. `customProgramCacheKey` is three's sanctioned escape hatch (it is the first
+  // component of that key), so this is what makes the variants distinct to the pipeline cache.
+  //
+  // It hid behind material SHARING. postfx-demo's six plinths are one shared plinth .mat.json, so
+  // they collide with each other; several of their selections were empty (those exhibit spots were
+  // off), the empty pipeline won, and every plinth went black. The horse statue's material is its
+  // own, so it had exactly one variant, no collision, and rendered correctly — which made it look
+  // like a per-object lighting fault rather than a cache collision.
+  //
+  // Keyed by the SELECTION only, not by `key`: the base uuid is already covered by the rest of
+  // three's key, and this way two materials that genuinely match can still share a pipeline.
+  //
+  // ONLY for a classic material. A real `NodeMaterial` already hashes its own node graph into
+  // `customProgramCacheKey` (`_getNodeChildren()` walks every own property whose value `isNode`,
+  // which an assigned `lightsNode` is), so it needs nothing from us — and overriding there would
+  // REPLACE that graph hash with just the light selection, letting two different node graphs (two
+  // file shaders, say) share one pipeline. That is this very defect one layer up. The classic
+  // material is the only one whose key is blind to nodes, so it is the only one we touch.
+  if (!(material as { isNodeMaterial?: boolean }).isNodeMaterial) {
+    // Compose rather than replace, so a base that customises its own key keeps that distinction.
+    const inherited = base.customProgramCacheKey?.() ?? '';
+    material.customProgramCacheKey = () => `${inherited}|lightmask:${sel}`;
+  }
   material.needsUpdate = true;
   // Record the material this was derived FROM. The caller re-reads a mesh's current material
   // each frame, and by frame 2 that IS this variant — deriving from it would clone the clone
