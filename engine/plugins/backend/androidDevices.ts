@@ -65,6 +65,46 @@ export interface AndroidDevice {
   transportId?: string;
 }
 
+/** One line of `adb forward --list`: `<serial> tcp:<local> <remote>`, where remote is `tcp:<port>`
+ *  for the debug bridge and `localabstract:webview_devtools_remote_<pid>` for a CDP tunnel. */
+export interface ForwardRule { serial: string; local: string; remote: string }
+
+/** Parse `adb forward --list`. PURE.
+ *
+ *  Format:
+ *    RFCTB0EV83K tcp:9095 tcp:9095
+ *    RFCTA14CMRF tcp:9333 localabstract:webview_devtools_remote_12345
+ *
+ *  A cold daemon prepends its `* daemon …` banner on the same stream, dropped EXPLICITLY here the
+ *  way `parseAdbDevices` drops it — not left to the shape check below. Both known banner lines
+ *  happen to fail that check anyway (their second field carries no colon), but "happens to" is not
+ *  a property: a banner whose second token contained a `:` would be parsed as a rule, and a rule
+ *  fabricated from a banner is a wrong answer to "who owns this port", which is the one question
+ *  this parser exists to answer. Cheap to make structural, so it is. */
+export function parseForwardList(out: string): ForwardRule[] {
+  const rules: ForwardRule[] = [];
+  for (const raw of out.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('*')) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length < 3) continue;
+    const [serial, local, remote] = parts;
+    if (!/^[a-z]+:.+/i.test(local)) continue;
+    rules.push({ serial, local, remote });
+  }
+  return rules;
+}
+
+/** Which device owns the forward rule listening on host `port`, or undefined if none does.
+ *
+ *  Exists because `adb forward --remove` matches on the HOST PORT SPEC and ignores `-s` (#158): a
+ *  serial-targeted removal will happily delete a rule belonging to a DIFFERENT phone. Callers use
+ *  this to refuse that rather than reach across. `--list` is daemon-wide and takes no `-s`, which is
+ *  exactly what makes the question answerable. */
+export function forwardOwner(out: string, port: number): string | undefined {
+  return parseForwardList(out).find((r) => r.local === `tcp:${port}`)?.serial;
+}
+
 /** True when adb will actually talk to this device. Everything else is listed (so a refusal can
  *  name it and say what is wrong with it) but never auto-picked. */
 export function isUsable(d: AndroidDevice): boolean {

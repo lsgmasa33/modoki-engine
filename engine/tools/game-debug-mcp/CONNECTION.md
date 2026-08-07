@@ -50,7 +50,11 @@ main 5179 / work-ai 5180 / work-ai2 5181). No `target` param, no platform in the
 ### Android (adb over USB — recommended)
 1. Connect over USB; `adb devices` shows it as `device`.
 2. AI panel → *Connect a Device* → check **Use adb (USB)** → **Connect**. The backend runs
-   `adb forward tcp:9095 tcp:9095` and connects to `127.0.0.1:9095`.
+   `adb -s <serial> forward tcp:<hostPort> tcp:9095` and connects to `127.0.0.1:<hostPort>`.
+   The **device** side is always 9095 (the app's port); the **host** side is derived per clone —
+   `9095 + (backend − 5179)`, so 9095 / 9096 / 9097 / 9098 (#158). Two clones can therefore hold
+   two different phones at once; before that derivation they silently fought over one forward and
+   each editor showed a device it did not have.
    (WiFi by IP also works if the router doesn't isolate AP clients; adb is the reliable path.)
 
 The editor remembers the last IP / adb choice per clone (`.modoki/device-target.json`) and
@@ -132,7 +136,8 @@ any WiFi lease) captures natively through the lease.
 }
 ```
 Point a session at its clone with `MODOKI_BACKEND=http://127.0.0.1:<port>`. Ports: **9095** is the
-device's TCP server (owned by the backend, not this MCP).
+device's TCP server (owned by the backend, not this MCP); the HOST end of the adb tunnel is derived
+per clone from the backend port, 9095/9096/9097/9098 (#158).
 
 ---
 

@@ -18,13 +18,56 @@ import path from 'path';
 import crypto from 'crypto';
 import { execFileSync } from 'child_process';
 import {
-  adbArgs, adbBinary, describeAndroidDevice, listAndroidDevices, resolveAndroidSerial, withFriendlyNames,
+  adbArgs, adbBinary, describeAndroidDevice, forwardOwner, listAndroidDevices, resolveAndroidSerial,
+  withFriendlyNames,
 } from './androidDevices';
 import { adbDeviceId, claimDevice, releaseDevice, wifiDeviceId } from './deviceClaims';
 import { DeviceLeaseClient, type LeaseTransport, type LeaseRequest, type LeaseReply, type LeaseState } from './deviceLease';
 
-/** The device plugin's TCP port (matches `GameDebugPlugin` default). */
+/** The device plugin's TCP port (matches `GameDebugPlugin` default). This is the port ON THE PHONE
+ *  — it is a property of the app, shared by every Modoki game, and deliberately NOT per-clone. */
 export const DEVICE_PORT = 9095;
+
+/** Base of the derived band for the HOST side of the adb tunnel. See {@link resolveDeviceHostPort}. */
+export const DEVICE_HOST_PORT_BASE = 9095;
+
+function isValidPort(raw: unknown): boolean {
+  const n = raw != null && raw !== '' ? Number(raw) : NaN;
+  return Number.isInteger(n) && n > 0 && n < 65536;
+}
+
+/** Resolve the LOCAL port this clone forwards the device bridge to — `9095 + (backendPort − 5179)`,
+ *  the repo's per-clone port idiom (backend 5179+, Vite 5173+, editor CDP 9222+, device CDP 9333+;
+ *  see root CLAUDE.md's Clones table). `MODOKI_DEVICE_HOST_PORT` overrides; a missing/invalid
+ *  `MODOKI_BACKEND_PORT` falls back to the hub's 5179, same as `launch-editor.sh`.
+ *
+ *  WHY (#158). The device CLAIM (#149) arbitrates the phone; it cannot arbitrate the host port, and
+ *  that port used to be a hardcoded machine-wide 9095. So two clones leasing two DIFFERENT phones
+ *  both passed the claim — correctly, different `deviceId`s — and then silently fought over one
+ *  forward. Measured 2026-08-07: the second `adb forward` won, and the first clone's lease was
+ *  pointed at the wrong handset with no error on either side, while its editor still displayed
+ *  `connected` to the phone it thought it held. The failure the claim exists to prevent, reached by
+ *  a path it structurally cannot see.
+ *
+ *  Only the HOST side varies — the device side stays {@link DEVICE_PORT}, so nothing on the phone
+ *  changes and two clones can hold two phones at once:
+ *  `adb -s <serial> forward tcp:<hostPort> tcp:9095`.
+ *
+ *  ⚠️ KNOWN GAP, shared with `resolveDeviceCdpPort` and inherited deliberately rather than
+ *  half-fixed: under `MODOKI_MULTI=1` the backend auto-picks its port and `MODOKI_BACKEND_PORT` is
+ *  unset, so every editor in that clone derives the same 9095. Two MULTI editors leasing two phones
+ *  would collide exactly as two clones used to. It needs the backend's ACTUALLY-BOUND port threaded
+ *  in rather than read from env, which both derivations would have to adopt together.
+ *
+ *  Until then, `removeForward`'s ownership check NARROWS that case but does not close it: `--list`
+ *  and `--remove` are two adb calls, not one atomic operation, so a sibling can re-forward the same
+ *  host port in the window between them and still lose its rule. Per-clone ports are the real fix;
+ *  the check is a backstop, and describing it as more than that would be wrong. */
+export function resolveDeviceHostPort(env: NodeJS.ProcessEnv = process.env): number {
+  if (isValidPort(env.MODOKI_DEVICE_HOST_PORT)) return Number(env.MODOKI_DEVICE_HOST_PORT);
+  const backendPort = isValidPort(env.MODOKI_BACKEND_PORT) ? Number(env.MODOKI_BACKEND_PORT) : 5179;
+  return DEVICE_HOST_PORT_BASE + (backendPort - 5179);
+}
 
 /** Turn a bare `ECONNREFUSED` on the DEFAULT port into the answer to the question it actually
  *  raises (#95).
@@ -65,11 +108,47 @@ export { adbBinary } from './androidDevices';
  *  and both calls would report success. Undefined means "no serial known" and reproduces the old
  *  un-targeted behaviour, which is correct only when adb has exactly one device. */
 export const adbRunner = {
-  forward(port: number, serial?: string): void {
-    execFileSync(adbBinary(), adbArgs(serial, ['forward', `tcp:${port}`, `tcp:${port}`]), { timeout: 4000, stdio: 'pipe' });
+  /** `hostPort` is this clone's derived local port; `devicePort` is the app's own (9095 unless it
+   *  fell back). They are separate because only the host side is per-clone — see
+   *  {@link resolveDeviceHostPort}. */
+  forward(hostPort: number, serial?: string, devicePort: number = DEVICE_PORT): void {
+    execFileSync(adbBinary(), adbArgs(serial, ['forward', `tcp:${hostPort}`, `tcp:${devicePort}`]), { timeout: 4000, stdio: 'pipe' });
   },
-  removeForward(port: number, serial?: string): void {
-    execFileSync(adbBinary(), adbArgs(serial, ['forward', '--remove', `tcp:${port}`]), { timeout: 4000, stdio: 'pipe' });
+  /** Every forward rule adb currently holds, across ALL devices — `--list` is daemon-wide and takes
+   *  no `-s`, which is precisely why {@link forwardOwner} can answer "whose rule is this?". */
+  listForwards(): string {
+    return execFileSync(adbBinary(), ['forward', '--list'], { timeout: 4000, encoding: 'utf8' });
+  },
+  /** Remove the rule on `hostPort` — but ONLY if it belongs to `serial`.
+   *
+   *  ⚠️ `adb forward --remove` matches on the HOST PORT SPEC, not on `-s` (#158). Measured: with two
+   *  phones leased by two clones, `adb -s RFCTB0EV83K forward --remove tcp:9095` deleted the rule
+   *  owned by `RFCTA14CMRF`, leaving that clone's live lease with no tunnel and no error — the same
+   *  cross-clone reach the `pkill -f` scoping rule exists to prevent, in a different mechanism.
+   *  Per-clone host ports make the collision unreachable; this check means a mismatched removal
+   *  refuses rather than reaches across even if something else ever re-introduces one. */
+  removeForward(hostPort: number, serial?: string): void {
+    if (serial) {
+      // FAIL CLOSED when the ownership question cannot be answered. This `catch` used to set
+      // `owner = undefined` and fall through to the removal, which reproduced #158 exactly under a
+      // narrower trigger: `adb forward --list` timing out on a cold-daemon start (4s budget) or
+      // erroring transiently leaves `owner` undefined, the guard short-circuits, and the
+      // un-targeted `--remove` deletes whatever rule holds that port — including a sibling clone's.
+      // The costs are asymmetric, which is what decides it: skipping leaks a rule that is benign
+      // and self-healing (`connect()` re-forwards idempotently, and per #160 nothing reaps these
+      // anyway), while proceeding can strip a live lease from another clone.
+      let owner: string | undefined;
+      try { owner = forwardOwner(adbRunner.listForwards(), hostPort); }
+      catch (e) {
+        console.warn(`[device] skipping \`adb forward --remove tcp:${hostPort}\`: could not verify the rule's owner (${e instanceof Error ? e.message : String(e)}) — refusing to delete a rule that may belong to another clone (#158)`);
+        return;
+      }
+      if (owner && owner !== serial) {
+        console.warn(`[device] skipping \`adb forward --remove tcp:${hostPort}\`: that rule belongs to ${owner}, not ${serial} (#158)`);
+        return;
+      }
+    }
+    execFileSync(adbBinary(), adbArgs(serial, ['forward', '--remove', `tcp:${hostPort}`]), { timeout: 4000, stdio: 'pipe' });
   },
 };
 const REQUEST_TIMEOUT_MS = 5000;
@@ -373,7 +452,11 @@ export class DeviceConnectionManager {
     // Keep the last typed IP across an adb connect (so toggling back to WiFi re-fills).
     this.lastTarget = { ip: ip || this.lastTarget?.ip || '', useAdb, ...(wantSerial ? { serial: wantSerial } : {}) };
     saveLastTarget(this.lastTarget, this.stateDir);
-    const port = req.port ?? DEVICE_PORT;
+    // `req.port` is the port ON THE PHONE (the #88/#95 escape hatch for an app that fell back off
+    // 9095). Over adb the port we CONNECT to is this clone's derived host end of the tunnel; over
+    // WiFi the two are the same port, because there is no tunnel.
+    const devicePort = req.port ?? DEVICE_PORT;
+    let port = devicePort;
     let host: string;
     let serial: string | undefined;
     if (useAdb) {
@@ -400,8 +483,9 @@ export class DeviceConnectionManager {
         return this.status();
       }
       this.claimedDeviceId = adbDeviceId(serial);
+      port = resolveDeviceHostPort();
       try {
-        adbRunner.forward(port, serial);
+        adbRunner.forward(port, serial, devicePort);
       } catch (e) {
         // Give the claim straight back: we never got as far as using the device, and a claim left
         // behind by a failed connect blocks hardware until the TTL — the exact stale-lock failure
@@ -439,7 +523,9 @@ export class DeviceConnectionManager {
     this.client = new DeviceLeaseClient({
       guid: this.guid,
       transport: this.transport,
-      onState: (s, d) => { this.state = s; this.detail = explainConnectFailure(d, port); },
+      // The advice keys off the DEVICE port, not the host end of the tunnel: an ECONNREFUSED on a
+      // derived 127.0.0.1:9097 still means "nothing is listening on 9095 over there".
+      onState: (s, d) => { this.state = s; this.detail = explainConnectFailure(d, devicePort); },
     });
     this.target = { host, port, useAdb, ...(serial ? { serial } : {}) };
     await this.client.connect();

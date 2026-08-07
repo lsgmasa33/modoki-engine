@@ -206,9 +206,9 @@ spec covers the real browser gesture.
 
 Measured (2026-08-04, `npm run coverage`): editor `.ts` is **79.8%** line-covered against
 editor `.tsx` at **12.9%**. Six large panels are at literal 0% — `SceneView` (2,304 lines),
-`Assets` (781), `AnimationEditor` (469), `EditorApp` (451), `ParticleEditor` (317),
-`TimelineEditor` (258). That gap is the strategy working, not failing: extraction moves
-decisions somewhere testable and leaves the JSX behind.
+`Assets` (781), `AnimationEditor` (469), `EditorApp` (393 — 451 before #126),
+`ParticleEditor` (317), `TimelineEditor` (258). That gap is the strategy working, not
+failing: extraction moves decisions somewhere testable and leaves the JSX behind.
 
 The three that are *not* at zero — `SkinCanvas` 6.2%, `SkinEditor` 7.25%, `SpriteEditor`
 7.63% — are the ones whose already-pure helpers were exported and tested in place (see
@@ -227,6 +227,8 @@ Extracted decision modules:
 | `scene/marqueeSelect.ts` | SceneView 2D box-selection: threshold, enclosure, selection merge |
 | `scene/pickSelection.ts` | the shared 2D + 3D viewport pick rule |
 | `scene/multiTransform.ts` | group-transform math, incl. which Transform fields each gizmo mode writes |
+| `utils/layoutStore.ts` | layout persistence — the restore precedence ladder, corrupt-layout self-heal, stale-tab retitling, the Load-Layout ordering rule |
+| `utils/layoutNames.ts` | layout name sanitising + the reserved autosave name |
 
 All are unit-tested, but "has a test file" is not "is covered": `assetOps.ts` sits at 56%
 (the rest is `/api/*` IO wrappers) and `skinParts.ts` at 58% (4 exports no test executes).
@@ -258,6 +260,33 @@ behaviour risk. Prefer it over restructuring a component.
    re-expresses control flow, which is where behaviour quietly changes. "Honestly
    untestable without an integration harness" is an acceptable answer for parts of
    SceneView and `EditorApp.tsx`.
+
+**The `EditorApp.tsx` verdict (#126), for the record — it was NOT "no".** The plan expected
+the editor shell to be the hardest case and allowed the phase to end in a written decline.
+It did not need to. `EditorApp.tsx` sat at 0/451 lines, but ~58 of those were the
+**layout-persistence block: already pure, already at module scope, merely unexported** — the
+cheap category, not the SceneView one. Moved verbatim to `utils/layoutStore.ts` (34 tests,
+100% covered), which is the same move `utils/layoutNames.ts` made earlier for the same reason.
+The measurement that settles the argument: those two modules sit at 100% while the `.tsx` they
+came out of sits at 0.
+
+Two signature changes were needed and both are dependency injection, not redesign:
+`panelLabel(id, customPanels)` takes the custom-panel list instead of calling
+`getCustomPanels()` (importing `createEditor` into `utils/` would drag the whole editor back
+in, defeating the move), and `resetLayout` split into a testable `clearStoredLayout()` plus the
+`window.location.reload()` that stays in the component.
+
+**What genuinely remains untestable there is the other ~393 lines, and the reason is
+structural**: they are one 650-line React component plus six modal components — 34 hooks, the
+menu tree built from live callbacks, the Electron OS-menu bridge, project open/close, HMR-epoch
+wiring. There is no decision in it that is separable from the hook that owns its state; every
+candidate is orchestration, which is the Phase-2 shape. That part needs an integration harness,
+and one e2e spec is the honest coverage for it — which the suite already has.
+
+**The transferable lesson**: before declaring a `.tsx` untestable, grep it for module-scope
+`function`/`const` declarations that take no hooks. "Most Electron-entangled panel in the
+editor" was true of `EditorApp.tsx` as a whole and false of a seventh of it, and the plan's
+prediction was made from the file's reputation rather than from reading it.
 
 Panels live in `editor/panels/`:
 

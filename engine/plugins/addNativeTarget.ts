@@ -59,6 +59,33 @@ function capDepRange(editorRoot: string, name: string, coreRange: string): strin
   return coreRange;
 }
 
+/** Capacitor plugins the ENGINE RUNTIME calls on every platform, so every native target must
+ *  carry them. Not opt-in — an engine contract, which is why they sit beside `@capacitor/core`
+ *  in the always-added set:
+ *   - `@capacitor/preferences` → PlayerPrefs (`runtime/storage/backends.ts`)
+ *   - `@capacitor/app`         → App.tsx lifecycle / back-button
+ *   - `@capacitor/keyboard`    → `useKeyboardShift`
+ *   - `@capacitor/splash-screen` → App.tsx's `SplashScreen.hide()` once the game can be shown
+ *     (docs/ota-updates.md Phase 3b). Its call is try/caught, so this one heals in lazily.
+ *
+ *  Omit one and the failure is SILENT until launch: the web build inlines the plugin's JS proxy
+ *  from the EDITOR's node_modules, so the build succeeds, but `cap sync` runs in the project dir
+ *  and registers no native impl → `"<Plugin>" plugin is not implemented on <platform>` at
+ *  runtime. Pinned to the editor's OWN versions so the inlined proxy matches the registered
+ *  native plugin.
+ *
+ *  EXPORTED so the guard test asserts against this list rather than a copy of it
+ *  (`engine/tests/architecture/nativeProjectDeps.test.ts`). Four committed projects had drifted
+ *  off it — including a PUBLISHED demo, whose snapshot therefore shipped a `package.json` that
+ *  dies at launch for anyone building it without the Modoki editor in the loop. A second copy of
+ *  the list in the guard would have been free to drift the same way. */
+export const ENGINE_REQUIRED_CAP_PLUGINS = [
+  '@capacitor/app',
+  '@capacitor/keyboard',
+  '@capacitor/preferences',
+  '@capacitor/splash-screen',
+] as const;
+
 export interface ScaffoldResult {
   changed: boolean;
   notes: string[];
@@ -100,27 +127,13 @@ export function ensureCapacitorDeps(projectRoot: string, platform: NativePlatfor
   const range = capacitorRange(editorRoot);
   const notes: string[] = [...notesPre];
 
-  // capacitor-game-debug gets a placeholder spec; vendorEnginePlugins rewrites it
-  // to file:plugins/<name>-<ver>.tgz (a copy) before install.
   const want: Record<string, string> = {
     '@capacitor/core': range,
     '@capacitor/cli': range,
     [platformPkg(platform)]: range,
-    // Engine-RUNTIME native plugins: the shipped game shell/runtime calls these on EVERY
-    // platform, so a native target that omits them ships a JS proxy with no native impl and
-    // throws `"<Plugin>" plugin is not implemented on <platform>` at LAUNCH. PlayerPrefs
-    // (runtime/storage/backends.ts) → @capacitor/preferences; App.tsx (lifecycle/back-button)
-    // → @capacitor/app; useKeyboardShift → @capacitor/keyboard. These are an engine contract,
-    // not opt-in — so they belong in the always-added set beside @capacitor/core. Pinned to
-    // the editor's OWN versions so the inlined JS proxy matches the registered native plugin.
-    '@capacitor/app': capDepRange(editorRoot, '@capacitor/app', range),
-    '@capacitor/keyboard': capDepRange(editorRoot, '@capacitor/keyboard', range),
-    '@capacitor/preferences': capDepRange(editorRoot, '@capacitor/preferences', range),
-    // App.tsx calls SplashScreen.hide() once the game is actually ready to show
-    // (docs/ota-updates.md, Phase 3b) — without the plugin the call is a harmless
-    // no-op (wrapped in try/catch), so this heals in lazily rather than needing a
-    // version bump elsewhere.
-    '@capacitor/splash-screen': capDepRange(editorRoot, '@capacitor/splash-screen', range),
+    ...Object.fromEntries(ENGINE_REQUIRED_CAP_PLUGINS.map((n) => [n, capDepRange(editorRoot, n, range)])),
+    // capacitor-game-debug gets a placeholder spec; vendorEnginePlugins rewrites it
+    // to file:plugins/<name>-<ver>.tgz (a copy) before install.
     'capacitor-game-debug': '*',
   };
   let changed = false;

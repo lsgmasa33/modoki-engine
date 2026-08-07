@@ -32,6 +32,13 @@ const ALLOWED_UNTARGETED: Record<string, string> = {
     'The device LISTING itself. `adb devices -l` enumerates every attached device, so targeting it '
     + 'at one would defeat its entire purpose — this is the call whose OUTPUT the serial is chosen '
     + 'from, so it cannot already know the serial.',
+  'deviceConnection.ts:listForwards':
+    'The forward LISTING (#158). `adb forward --list` is daemon-wide and accepts no `-s` at all — '
+    + 'and being global is exactly what makes it useful here: it is the only way to ask "which '
+    + 'device owns the rule on host port N?", which is the question a serial-scoped removal has to '
+    + 'answer before deleting anything (`--remove` matches on the port spec and IGNORES `-s`).',
+  'deviceCdp.ts:listForwards':
+    'Same call, same reason, for the webview CDP tunnel — see deviceConnection.ts:listForwards.',
 };
 
 /** Every `execFileSync(adbBinary(), …)` with the source window that builds its argv.

@@ -61,8 +61,17 @@ export interface LeaseStatus {
  *  device_disconnect so they report the lease identically. */
 export function describeLease(s: LeaseStatus): string {
   if (s.state === 'connected' && s.target) {
-    const how = s.target.useAdb ? 'adb (USB)' : `WiFi ${s.target.host}`;
-    return `Device connected via ${how}:${s.target.port}. device_* tools proxy through Modoki's lease.`;
+    // ⚠️ On adb the port is the HOST end of the tunnel, derived per clone since #158
+    // (`9095 + (backend−5179)`), NOT the port the app listens on — those were the same number
+    // until then, and this string still read as if they were. The label matters because
+    // `device_connect {port}` means the DEVICE port: an agent that read `adb (USB):9097` here and
+    // passed 9097 back would forward `tcp:9097 → tcp:9097` on the phone, where nothing is
+    // listening — and `explainConnectFailure`'s advice stays silent, because it only fires on the
+    // default 9095. Naming the side is what stops the round trip.
+    const where = s.target.useAdb
+      ? `adb (USB) — host tunnel 127.0.0.1:${s.target.port}`
+      : `WiFi ${s.target.host}:${s.target.port}`;
+    return `Device connected via ${where}. device_* tools proxy through Modoki's lease.`;
   }
   if (s.state === 'disconnected' || s.state === 'error') {
     const hint = s.lastTarget?.ip ? ` (last: ${s.lastTarget.useAdb ? 'adb' : s.lastTarget.ip})` : '';

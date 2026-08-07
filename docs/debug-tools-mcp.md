@@ -144,7 +144,7 @@ Two limits on that check, both measured on the Samsung 2026-08-02 — know them 
 - **The EADDRINUSE fallback buys honesty, not reachability — so #95 removed the collision at its
   source instead.** The app rebinds to an OS-assigned port and logs the true one, but the lease
   dials a fixed `DEVICE_PORT = 9095` (`engine/plugins/backend/deviceConnection.ts`) and
-  `adb forward` maps `tcp:9095 → tcp:9095`; nothing discovers the fallback port, so a fallen-back
+  `adb forward` maps `tcp:<hostPort> → tcp:9095`; nothing discovers the fallback port, so a fallen-back
   app is not reachable over the lease at all. Rather than teach the host to chase a moving port,
   **the bridge now RELEASES the port when the app backgrounds and re-binds when it returns**, making
   *at most one Modoki app listens, and it is the one on screen* an invariant. Consequences worth
@@ -259,6 +259,27 @@ claim is taken by the lease (`connect`) and by the WDA launch, released on `disc
 expired by **pid liveness plus a 12h TTL** — a dead session must never hold hardware hostage. A
 refusal names the clone, branch, pid and time. Rationale in `engine/plugins/backend/deviceClaims.ts`;
 this replaces the unenforced "serialize on-device builds" convention in the root `CLAUDE.md`.
+
+**The claim arbitrates the PHONE; the derived host port arbitrates the TUNNEL (#158).** These are two
+different questions, and the claim structurally cannot answer the second: two clones leasing two
+*different* phones both pass it — correctly, different `deviceId`s — and then fight over one host
+port, because that port used to be a hardcoded machine-wide 9095. Measured 2026-08-07: the second
+`adb forward` won, and the first clone's lease was pointed at the wrong handset with **no error on
+either side** — one editor reporting `connected` to a phone it did not have, the other reporting
+`refused` from a phone that never saw its request. So the host end is now derived per clone, the same
+idiom as backend/Vite/CDP: `9095 + (backend − 5179)` → 9095 / 9096 / 9097 / 9098
+(`resolveDeviceHostPort`, `MODOKI_DEVICE_HOST_PORT` overrides). The **device** side stays 9095 —
+`adb -s <serial> forward tcp:<hostPort> tcp:9095` — so nothing on the phone changes.
+
+Two consequences worth carrying. **`status.target.port` is the HOST port**, not the app's — over WiFi
+they are the same number, over adb they are not. And **`adb forward --remove` matches on the host port
+spec and ignores `-s`**: a serial-targeted removal *will* delete another phone's rule (observed —
+`adb -s RFCTB0EV83K forward --remove tcp:9095` stripped `RFCTA14CMRF`'s live tunnel). Both
+`adbRunner.removeForward` and the CDP tunnel's now verify ownership against `adb forward --list`
+first and skip with a log on a mismatch — the same cross-clone reach the `pkill -f` scoping rule
+exists to prevent, in a different mechanism. One gap remains, documented on `resolveDeviceHostPort`:
+under `MODOKI_MULTI=1` there is no `MODOKI_BACKEND_PORT` to derive from, so every editor in that
+clone lands on 9095 and only the ownership check stands between them.
 
 ## Editor debugging — DEFAULT to Electron (modoki MCP)
 

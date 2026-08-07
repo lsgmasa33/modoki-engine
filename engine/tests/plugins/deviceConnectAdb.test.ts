@@ -34,9 +34,16 @@ beforeEach(() => {
   // un-stubbed it asks the machine's REAL attached phones for their names (#149).
   androidDevicesExec.deviceName = () => '';
   _clearFriendlyNameCache();
+  // Pin the HOST end of the tunnel (#158) to a port nothing can be listening on, so a test that
+  // only cares about the forward ARGS gets a fast, deterministic connect refusal. Un-pinned it
+  // would derive the real 9095 — a machine-wide port a running editor on this box may genuinely
+  // hold, which would make these tests pass or fail by what else is plugged in. Same hazard as the
+  // un-stubbed device listing above. Tests that need a live socket override it.
+  process.env.MODOKI_DEVICE_HOST_PORT = '1';
   stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-adb-'));
 });
 afterEach(() => {
+  delete process.env.MODOKI_DEVICE_HOST_PORT;
   adbRunner.forward = realForward; adbRunner.removeForward = realRemove;
   androidDevicesExec.list = realList;
   androidDevicesExec.deviceName = realDeviceName;
@@ -84,7 +91,7 @@ describe('DeviceConnectionManager — useAdb branch', () => {
     const status = await mgr.connect({ useAdb: true });
     expect(status.state).toBe('error');
     expect(status.detail).toMatch(/adb forward failed/i);
-    expect(adbRunner.forward).toHaveBeenCalledWith(9095, 'TESTSERIAL1');
+    expect(adbRunner.forward).toHaveBeenCalledWith(1, 'TESTSERIAL1', 9095);
   });
 
   // ── Bare reconnect reuses the saved useAdb; supplying an ip is all-or-nothing (never inherits adb) ──
@@ -95,7 +102,7 @@ describe('DeviceConnectionManager — useAdb branch', () => {
     await mgr.connect({ useAdb: true, port: 1 });
     (adbRunner.forward as ReturnType<typeof vi.fn>).mockClear();
     const status = await mgr.connect({});                       // bare
-    expect(adbRunner.forward).toHaveBeenCalledWith(9095, 'TESTSERIAL1'); // reused useAdb:true (default port)
+    expect(adbRunner.forward).toHaveBeenCalledWith(1, 'TESTSERIAL1', 9095); // reused useAdb:true (default port)
     expect(status.detail ?? '').not.toMatch(/no IP/i);
     await mgr.disconnect();
   });
@@ -114,14 +121,21 @@ describe('DeviceConnectionManager — useAdb branch', () => {
     const authority = new DeviceLeaseAuthority();
     const device = await startMockDevice(authority);
     const mgr = new DeviceConnectionManager('g-adbok', stateDir);
+    // The mock stands in for the HOST end of the tunnel (adb itself is stubbed, so nothing actually
+    // forwards) — so the host port is pinned to it via the same override production uses (#158),
+    // while `port` keeps its real meaning: the port the app listens on ON THE PHONE.
+    process.env.MODOKI_DEVICE_HOST_PORT = String(device.port);
     try {
-      const status = await mgr.connect({ useAdb: true, port: device.port });
-      expect(adbRunner.forward).toHaveBeenCalledWith(device.port, 'TESTSERIAL1');
+      const status = await mgr.connect({ useAdb: true, port: 9095 });
+      expect(adbRunner.forward).toHaveBeenCalledWith(device.port, 'TESTSERIAL1', 9095);
       expect(status.state).toBe('connected');
       // The resolved serial rides on the lease (#149) — every later adb call reuses THIS, rather
       // than re-picking a device of its own.
       expect(status.target).toMatchObject({ host: '127.0.0.1', useAdb: true, serial: 'TESTSERIAL1' });
+      // The status carries the HOST port, because that is what a later call would have to dial.
+      expect(status.target?.port).toBe(device.port);
     } finally {
+      delete process.env.MODOKI_DEVICE_HOST_PORT;
       await mgr.disconnect();
       await device.close();
     }
@@ -149,7 +163,7 @@ describe('DeviceConnectionManager — useAdb branch', () => {
       androidDevicesExec.list = () => TWO;
       const mgr = new DeviceConnectionManager('g-pick', stateDir);
       const status = await mgr.connect({ useAdb: true, port: 1, serial: 'BBB222' });
-      expect(adbRunner.forward).toHaveBeenCalledWith(1, 'BBB222');
+      expect(adbRunner.forward).toHaveBeenCalledWith(1, 'BBB222', 1);
       expect(status.target?.serial).toBe('BBB222');
       await mgr.disconnect();
     });
@@ -170,7 +184,7 @@ describe('DeviceConnectionManager — useAdb branch', () => {
       await mgr.disconnect();
       (adbRunner.forward as ReturnType<typeof vi.fn>).mockClear();
       await mgr.connect({});                                   // bare
-      expect(adbRunner.forward).toHaveBeenCalledWith(9095, 'BBB222');
+      expect(adbRunner.forward).toHaveBeenCalledWith(1, 'BBB222', 9095);
       await mgr.disconnect();
     });
 
@@ -185,7 +199,7 @@ describe('DeviceConnectionManager — useAdb branch', () => {
       androidDevicesExec.list = () => ONE_DEVICE;              // BBB222 unplugged; one left
       (adbRunner.forward as ReturnType<typeof vi.fn>).mockClear();
       const status = await mgr.connect({});
-      expect(adbRunner.forward).toHaveBeenCalledWith(9095, 'TESTSERIAL1');
+      expect(adbRunner.forward).toHaveBeenCalledWith(1, 'TESTSERIAL1', 9095);
       expect(status.detail ?? '').not.toMatch(/matches none/i);
       await mgr.disconnect();
     });

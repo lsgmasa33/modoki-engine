@@ -22,11 +22,20 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { hasPublishScripts } from '../helpers/repoLayout';
 
 const SCRIPT = path.resolve(__dirname, '../../../scripts/publish-engine-oss.sh');
 
-describe('publish-engine-oss.sh owns the .git it deletes', () => {
-  const src = fs.readFileSync(SCRIPT, 'utf8');
+// THIS FILE SHIPS; THE SCRIPT IT READS DOES NOT. `publish-engine-oss.sh`'s manifest ships
+// `engine build docs` + root configs, so root `scripts/` is absent from the public snapshot —
+// and step 4b now runs the shipped guards INSIDE that snapshot, where the unconditional
+// readFileSync above was an ENOENT before a single assertion ran. Read lazily and skip, rather
+// than assert on a file the snapshot is never supposed to contain.
+// The private-repo tripwire (`repoLayoutGuard.test.ts`) is what stops this skip going silent here.
+const SRC = hasPublishScripts() ? fs.readFileSync(SCRIPT, 'utf8') : '';
+
+describe.skipIf(!hasPublishScripts())('publish-engine-oss.sh owns the .git it deletes', () => {
+  const src = SRC;
 
   it('refuses to touch a staging dir that already contains a .git', () => {
     // The branch itself must exist. Without it the script has no way to tell "my temp dir" from

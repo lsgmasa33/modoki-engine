@@ -43,7 +43,7 @@
  */
 
 import { execFileSync } from 'child_process';
-import { adbArgs, adbBinary } from './androidDevices';
+import { adbArgs, adbBinary, forwardOwner } from './androidDevices';
 
 import {
   decodeAimReply, resolveAimViaDevice, STALE_APP_REASON,
@@ -150,7 +150,32 @@ export const deviceCdpAdb = {
   forward(localPort: number, socketName: string, serial?: string): void {
     execFileSync(adbBinary(), adbArgs(serial, ['forward', `tcp:${localPort}`, `localabstract:${socketName}`]), { timeout: 4000, stdio: 'pipe' });
   },
+  listForwards(): string {
+    return execFileSync(adbBinary(), ['forward', '--list'], { timeout: 4000, encoding: 'utf8' });
+  },
+  /** Remove this clone's CDP tunnel — but ONLY if the rule on `localPort` belongs to `serial`.
+   *  `adb forward --remove` matches on the host port spec and ignores `-s`, so a serial-targeted
+   *  removal can delete a SIBLING clone's live rule (#158). `localPort` is already per-clone
+   *  (`resolveDeviceCdpPort`), which makes that unreachable here; this mirrors
+   *  `adbRunner.removeForward` in deviceConnection.ts, including its FAIL-CLOSED handling of a
+   *  list that cannot be read.
+   *
+   *  ⚠️ CURRENTLY UNREFERENCED — nothing in production calls this, so the CDP tunnel is never torn
+   *  down at all (#160). It is guarded here so the teardown, when it lands, is safe to call; do not
+   *  read this function's existence as evidence that a CDP forward is ever released. */
   removeForward(localPort: number, serial?: string): void {
+    if (serial) {
+      let owner: string | undefined;
+      try { owner = forwardOwner(deviceCdpAdb.listForwards(), localPort); }
+      catch (e) {
+        console.warn(`[device-cdp] skipping \`adb forward --remove tcp:${localPort}\`: could not verify the rule's owner (${e instanceof Error ? e.message : String(e)}) — refusing to delete a rule that may belong to another clone (#158)`);
+        return;
+      }
+      if (owner && owner !== serial) {
+        console.warn(`[device-cdp] skipping \`adb forward --remove tcp:${localPort}\`: that rule belongs to ${owner}, not ${serial} (#158)`);
+        return;
+      }
+    }
     execFileSync(adbBinary(), adbArgs(serial, ['forward', '--remove', `tcp:${localPort}`]), { timeout: 4000, stdio: 'pipe' });
   },
 };

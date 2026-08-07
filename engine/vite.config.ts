@@ -481,7 +481,7 @@ export default defineConfig(({ command }) => {
     ...perfCoreWorkers(),
     // Coverage is OFF unless --coverage is passed; this block only says what to measure
     // when it is. It exists because every coverage number this repo had acted on came
-    // from a `grep`-for-imports proxy (docs/plans/editor-panel-logic-tests-plan.md), which
+    // from a `grep`-for-imports proxy (see docs/editor.md § Panels), which
     // over-counts transitively-exercised modules and under-counts assertion depth.
     // `all` is deliberately on: an untested file must appear at 0%, not be absent — the
     // whole question here is "what does NO test reach", which a tested-files-only report

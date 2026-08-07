@@ -446,32 +446,66 @@ the SAME command run for an iOS/Android pre-`cap sync` build must say `--target 
 (base `"/"`, since Capacitor serves the dist from the app root). There is no default in either
 direction: defaulting would be silently wrong for one of the two callers.
 
-#### `--target native` re-vendors the engine Capacitor plugins first (#148)
+#### `--target native` runs the same three in-process heals as the editor (#148, #150)
 
-Games don't build `engine/packages/capacitor-*` from source — they depend on a content-addressed
-tarball committed into the project (`"capacitor-game-debug": "file:plugins/…-<hash>.tgz"`). So a
-plugin edit only reaches a device once that tarball is re-packed and installed. `build-web.mjs`
-now does that on `--target native`, and runs `npm install` in the project when the content actually
-changed; on `web`/`playable` it does nothing (a vendored plugin is a native artifact).
-
-It did NOT until #148 — only the editor's `/api/build` re-vendored — so following the recipes below
-after a plugin edit produced an IPA/APK containing the PREVIOUS native code while every signal
-reported success.
-
-⚠️ **The CLI recipes are still NOT fully equivalent to Build → iOS/Android Device.** Before its
-shell steps the editor path runs THREE in-process heals; the CLI runs one:
+Before its shell steps, `build-web.mjs` now runs the SAME three in-process heals as the editor's
+`/api/build`, in the same order, for the same reason each exists:
 
 | In-process heal | Editor `/api/build` | CLI `--target native` |
 |---|---|---|
-| `vendorEnginePlugins` — re-pack + install a changed engine plugin | ✅ | ✅ *(since #148)* |
-| `healNativeConfig` — sync `build.appleTeamId` → iOS `DEVELOPMENT_TEAM`, Android `local.properties` | ✅ | ❌ |
-| `ensureCapacitorDeps` — add engine-REQUIRED Capacitor plugins the project predates | ✅ | ❌ |
+| `healNativeConfig` — sync `build.appleTeamId` → iOS `DEVELOPMENT_TEAM`, Android `local.properties` | ✅ | ✅ |
+| `ensureCapacitorDeps` — add engine-REQUIRED Capacitor plugins the project predates | ✅ | ✅ |
+| `vendorEnginePlugins` — re-pack + install a changed engine plugin | ✅ | ✅ |
 
-The second fails LOUDLY (`xcodebuild`: *"Signing … requires a development team"*). The third fails
-in the same silent way #148 did: the web build inlines the plugin's JS proxy from the editor's
-`node_modules` so the build SUCCEEDS, but `cap sync` never registers a native impl and the app dies
-at LAUNCH with `"<Plugin>" plugin is not implemented on <platform>`. Until that closes, open the
-project in the editor once (which heals both on open) before relying on a CLI native build.
+Games don't build `engine/packages/capacitor-*` from source — they depend on a content-addressed
+tarball committed into the project (`"capacitor-game-debug": "file:plugins/…-<hash>.tgz"`). So a
+plugin edit only reaches a device once that tarball is re-packed and installed; a project that
+predates an engine-required Capacitor plugin (`@capacitor/preferences`, `@capacitor/app`, …) never
+gets one just by building; and `build.appleTeamId` only reaches a device build once it's synced
+into the generated native project. On `web`/`playable` none of this runs (every heal here is a
+native-artifact concern; a web build has nothing to keep fresh and must not pay for it).
+
+Landed in two steps: #148 added only the third heal, which meant following the CLI recipes after a
+plugin edit produced an IPA/APK containing the PREVIOUS native code while every signal reported
+success; #150 closed the remaining two, using the exact editor semantics — same ordering, same
+install condition — rather than re-deriving them:
+
+- **Order is load-bearing.** `ensureCapacitorDeps` runs BEFORE `vendorEnginePlugins`: when it adds
+  `capacitor-game-debug`, it writes a placeholder dep spec (`'*'`), and `vendorEnginePlugins`
+  rewrites that placeholder to the real `file:plugins/<name>-<ver>.tgz`. Vendoring first would
+  leave the placeholder unrewritten — a project stuck depending on a spec npm can't install.
+- **Install is conditioned on EITHER heal changing something** (`depHeal.changed ||
+  v.needsInstall`), not just the vendor step — a newly-added dep spec is just as inert until
+  installed as a fresh tarball.
+- `ensureCapacitorDeps` needs a platform, and `--target native` covers both; the CLI heals
+  whichever of `ios/`/`android/` the project already has on disk (a project with neither yet is
+  the editor's scaffold-then-build path, which the CLI has no equivalent entry point for).
+
+#### The engine-required Capacitor plugins must be COMMITTED, not just healed
+
+`ENGINE_REQUIRED_CAP_PLUGINS` (`engine/plugins/addNativeTarget.ts`) is the list the engine runtime
+calls on every platform — `@capacitor/preferences` (PlayerPrefs), `@capacitor/app` (lifecycle /
+back-button), `@capacitor/keyboard`, `@capacitor/splash-screen`. Every project with a native target
+must carry them in its own `package.json`.
+
+**A heal is not a substitute for committing them, and the reason is not obvious.** Because
+`ensureCapacitorDeps` adds them on every native build, a project that has drifted off the list still
+builds fine here — the editor heals on the way past, and the tree it writes is never the tree that
+gets committed. That is precisely how four projects drifted unnoticed (`alien-animal`,
+`audio-demo`, `chess`, `demos/2d-physics-demo` — each missing all four).
+
+The one that mattered was the demo. `publish-demo.sh` exports **committed** content, and it strips
+only `file:` deps and `workspaces` from the staged `package.json` — registry deps are retained. So
+the published snapshot shipped a manifest with no `@capacitor/preferences`, and anyone building
+from that snapshot (`npm install` → `npx cap add` → `cap sync`, with no Modoki editor anywhere in
+the loop) never runs the heal and gets `"Preferences" plugin is not implemented on <platform>` at
+launch, the first time PlayerPrefs is touched. **A heal that only runs on our machines cannot
+protect someone building from the snapshot; only the committed file can.**
+
+Guarded by `engine/tests/architecture/nativeProjectDeps.test.ts`, which asserts committed state and
+reads the list from `ENGINE_REQUIRED_CAP_PLUGINS` rather than restating it. If it fails: run a
+native build for the named project, then `npm install` in it, and **commit the `package.json` +
+`package-lock.json`** — committing is the part that matters.
 
 Two notes worth carrying:
 - **`npm` ships `README.md` regardless of the `files` field**, so editing a plugin's DOCS re-hashes
