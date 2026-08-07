@@ -162,7 +162,12 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
     'Structured render/scene health report — turns "it renders black / looks wrong" into concrete ' +
       'causes: dangling/illegal asset refs, NaN or zero-scale transforms, missing camera, off-screen ' +
       'entities, and recent console errors. Run this FIRST when something is visually broken (before ' +
-      'capture_viewport). Returns {ok, summary, refs, transforms, camera, offScreen, consoleErrors}.',
+      'capture_viewport). Returns {ok, summary, refs, transforms, camera, offScreen, consoleErrors, ' +
+      'errorWindowMs, olderErrors}. `consoleErrors` is NOT an absolute: it holds only the errors ' +
+      'inside `errorWindowMs` (the ones that gate `ok`, so a fixed error stops failing the verdict). ' +
+      'Everything older is COUNTED in `olderErrors {count, oldestTs, newestTs}` — read those with ' +
+      'modoki_get_console_logs level=error. So an empty `consoleErrors` means "none recently", and ' +
+      'the summary never claims "No issues detected" while older errors exist.',
     {},
     async () => getJson('/api/diagnose'),
   );

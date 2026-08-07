@@ -73,6 +73,12 @@ export const adbRunner = {
   },
 };
 const REQUEST_TIMEOUT_MS = 5000;
+/** Hard ceiling on a PER-REQUEST deadline (#153). The per-request override exists so a slow op can
+ *  outlive the connection default, not so a caller can wedge the socket: a device that never
+ *  answers must still fail in bounded time, or a hung request holds the link open past the point
+ *  where reconnect logic would have noticed the phone was gone. Generous enough that every real op
+ *  budget (the 25s editor eval ceiling and anything the device is likely to grow) fits under it. */
+const MAX_REQUEST_TIMEOUT_MS = 60_000;
 /** Fail a hung TCP connect fast instead of waiting ~75s for the OS to time out — a silent packet
  *  drop (wrong IP / not same WiFi / server not listening / firewall) otherwise looks "stuck". */
 const CONNECT_TIMEOUT_MS = 6000;
@@ -148,15 +154,32 @@ export class TcpLeaseTransport implements LeaseTransport {
     }
   }
 
+  /** Resolve the deadline for one request: the caller's, clamped, or the connection default.
+   *
+   *  WHY PER-REQUEST (#153). `requestTimeoutMs` was fixed per CONNECTION and nothing in production
+   *  ever passed it, so every device op — a heavy `get_scene_state`, a big-screen `screenshot`, an
+   *  eval — shared one 5000ms budget. Worse, that clock starts HOST-side, before the request even
+   *  reaches the phone, so a device-side op budget equal to it could never be the deadline that
+   *  fires: you got `device request timed out after 5000ms` instead of the op's own, far more
+   *  useful message ("the code did not finish"). That is why `DEVICE_EVAL_MAX_TIMEOUT_MS` sat at
+   *  4500 with a comment telling you not to raise it. Raising the CONNECTION default instead would
+   *  have slowed dead-device detection for every op, which is the wrong trade — this is the right
+   *  shape: the op that needs longer asks for longer, and nothing else changes. */
+  private deadlineFor(timeoutMs?: number): number {
+    if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) return this.requestTimeoutMs;
+    return Math.max(this.requestTimeoutMs, Math.min(MAX_REQUEST_TIMEOUT_MS, Math.floor(timeoutMs)));
+  }
+
   /** Low-level RPC over the socket — one `{id, method, params}` → `{id, result|error}` round-trip. */
-  private rpc(method: string, params: Record<string, unknown>): Promise<unknown> {
+  private rpc(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<unknown> {
     return new Promise<unknown>((resolve, reject) => {
       if (!this.socket || this.socket.destroyed) { reject(new Error('not connected')); return; }
       const id = String(++this.nextId);
+      const deadline = this.deadlineFor(timeoutMs);
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`device request timed out after ${this.requestTimeoutMs}ms`));
-      }, this.requestTimeoutMs);
+        reject(new Error(`device request timed out after ${deadline}ms`));
+      }, deadline);
       this.pending.set(id, { resolve, reject, timer });
       try {
         this.socket.write(JSON.stringify({ id, method, params }) + '\n');
@@ -168,15 +191,19 @@ export class TcpLeaseTransport implements LeaseTransport {
     });
   }
 
-  /** Control-plane lease message (connect/ping/disconnect). */
-  request(msg: LeaseRequest): Promise<LeaseReply> {
-    return this.rpc(msg.type, { guid: msg.guid }) as Promise<LeaseReply>;
+  /** Control-plane lease message (connect/ping/disconnect). `timeoutMs` overrides the connection
+   *  default for this one request; it can only EXTEND it (see `deadlineFor`) — shortening has no
+   *  caller and would quietly fail ops that were fine. */
+  request(msg: LeaseRequest, timeoutMs?: number): Promise<LeaseReply> {
+    return this.rpc(msg.type, { guid: msg.guid }, timeoutMs) as Promise<LeaseReply>;
   }
 
   /** Data-plane request proxied on behalf of Claude (eval/screenshot/tap/…) — reuses the same
-   *  owned socket, so the device's existing JS bridge handles it and replies on this socket. */
-  send(method: string, params: Record<string, unknown>): Promise<unknown> {
-    return this.rpc(method, params);
+   *  owned socket, so the device's existing JS bridge handles it and replies on this socket.
+   *  `timeoutMs` is the per-request deadline (#153): the op that legitimately takes longer than
+   *  5s asks for longer, instead of every op sharing one budget sized for the fastest. */
+  send(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<unknown> {
+    return this.rpc(method, params, timeoutMs);
   }
 
   close(): void {
@@ -565,8 +592,13 @@ export class DeviceConnectionManager {
   }
 
   /** Proxy a data-plane request (eval/screenshot/tap/console-logs/…) through the held socket —
-   *  the controlled-comms path: Claude's device_* tools go through Modoki, not their own socket. */
-  async proxy(method: string, params: Record<string, unknown>): Promise<unknown> {
+   *  the controlled-comms path: Claude's device_* tools go through Modoki, not their own socket.
+   *
+   *  `timeoutMs` sizes THIS request's transport deadline (#153). The caller supplies it from the
+   *  op's OWN budget plus headroom — the same nested-deadline discipline `/api/eval` follows — so
+   *  the deadline that fires is the innermost one, and the error names what the code was doing
+   *  rather than reporting a dead link. Omit it and the connection default (5s) applies. */
+  async proxy(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<unknown> {
     if (this.state !== 'connected' || !this.transport) {
       // Keep the "no device connected" prefix: the device MCP's caughtFailure() matches on it to
       // build the NOT_AVAILABLE_HERE envelope that names device_connect/device_status. The advice
@@ -578,7 +610,7 @@ export class DeviceConnectionManager {
         + `"Connect a Device"; device_status reports the current state`,
       );
     }
-    return this.transport.send(method, params);
+    return this.transport.send(method, params, timeoutMs);
   }
 }
 

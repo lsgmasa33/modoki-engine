@@ -505,3 +505,49 @@ describe('/api/device/request CDP gated on device platform + app identity (#142)
     }
   });
 });
+
+/** #153 — the per-request deadline is WIRED, not merely available.
+ *
+ *  `TcpLeaseTransport` gained an optional per-request timeout; the deadline that actually matters
+ *  is the one the ROUTE passes. That is the failure this repo keeps rediscovering: a mechanism
+ *  that exists and compiles, with no production caller (`requestTimeoutMs` itself was exactly
+ *  that — a constructor option only `deviceConnection.test.ts` ever passed, for years).
+ *
+ *  Asserted by spying on `proxy` rather than by timing a real socket: a test that WAITS for a
+ *  deadline pays it in wall-clock, and the deadline floors at the 5000ms connection default, so
+ *  observing it end-to-end costs 5s per assertion for no extra evidence — the transport's own
+ *  tests already prove the deadline is honoured. */
+describe('/api/device/request sizes the transport deadline from the op (#153)', () => {
+  const original = deviceConnection.proxy;
+  afterEach(() => { deviceConnection.proxy = original; });
+
+  function captureDeadlines(): Array<number | undefined> {
+    const seen: Array<number | undefined> = [];
+    deviceConnection.proxy = (async (_m: string, _p: Record<string, unknown>, timeoutMs?: number) => {
+      seen.push(timeoutMs);
+      return 'ok';
+    }) as typeof deviceConnection.proxy;
+    return seen;
+  }
+
+  it("an op carrying its own timeoutMs lifts the transport deadline above it", async () => {
+    const seen = captureDeadlines();
+    await post('/api/device/request', { method: 'eval', params: { code: '1', timeoutMs: 20_000 } });
+    // Headroom for the round trip in both directions — the op's own budget must be the INNER
+    // deadline, or its message ("the code did not finish") is unreachable again.
+    expect(seen).toContain(25_000);
+  });
+
+  it('an op with no budget of its own leaves the connection default alone', async () => {
+    const seen = captureDeadlines();
+    await post('/api/device/request', { method: 'console-logs', params: {} });
+    expect(seen.every((d) => d === undefined)).toBe(true);
+  });
+
+  it('a nonsense timeoutMs is ignored rather than turned into a deadline', async () => {
+    const seen = captureDeadlines();
+    await post('/api/device/request', { method: 'eval', params: { code: '1', timeoutMs: 'soon' } });
+    await post('/api/device/request', { method: 'eval', params: { code: '1', timeoutMs: -5 } });
+    expect(seen.every((d) => d === undefined)).toBe(true);
+  });
+});

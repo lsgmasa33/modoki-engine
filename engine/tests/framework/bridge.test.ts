@@ -11,6 +11,28 @@ describe('safeStringify', () => {
   it('JSON-stringifies numbers', () => expect(safeStringify(42)).toBe('42'));
   it('JSON-stringifies objects', () => expect(safeStringify({ a: 1 })).toBe('{"a":1}'));
   it('JSON-stringifies arrays', () => expect(safeStringify([1, 2, 3])).toBe('[1,2,3]'));
+  // An Error JSON-stringifies to `{}` (no own enumerable props) — the empty-looking-result trap
+  // that made a real device boot error reach `diagnose` as a literal `{}` (#157). `console.error(err)`
+  // is how failures are usually reported, so this is the common path, not an edge case.
+  it('serializes an Error to its stack, never a bare {}', () => {
+    const out = safeStringify(new Error('boom'));
+    expect(out).not.toBe('{}');
+    expect(out).toContain('boom');
+  });
+  it('falls back to the message when an Error carries no stack', () => {
+    const e = new Error('no-stack'); e.stack = '';
+    expect(safeStringify(e)).toBe('no-stack');
+  });
+  // NESTED too — the thenable case beside it is nested-aware, and a rejection value or a `cause`
+  // arrives wrapped. The first cut fixed only the top level, leaving `{"cause":{}}`.
+  it('serializes an Error nested in an object', () => {
+    const out = safeStringify({ cause: new Error('boom') });
+    expect(out).not.toContain('{}');
+    expect(out).toContain('boom');
+  });
+  it('serializes an Error nested in an array', () => {
+    expect(safeStringify([new Error('boom')])).toContain('boom');
+  });
   it('JSON-stringifies null', () => expect(safeStringify(null)).toBe('null'));
   it('JSON-stringifies booleans', () => expect(safeStringify(true)).toBe('true'));
   it('falls back to String() for circular references', () => {
@@ -162,15 +184,24 @@ describe('handleEval', () => {
     }, EVAL_ASYNC_TIMEOUT_MS + 2000);
   });
 
-  /** Ordering invariant, asserted as data because the layers cannot see each other: the device
-   *  ceiling MUST stay under the transport's fixed 5000ms request deadline, or the eval's own
-   *  message is unreachable again — which is the exact bug this replaced. */
+  /** Ordering invariant, asserted as data because the layers cannot see each other.
+   *
+   *  The device ceiling used to be pinned UNDER the transport's fixed 5000ms request deadline —
+   *  above it, the eval's own timeout message was unreachable, which was the bug that shape
+   *  replaced. #153 made the transport deadline per-request and sized from the op's own budget, so
+   *  the constraint that remains is a DEFAULT one: an eval that names no budget must still finish
+   *  inside the 5000ms connection default, or it goes back to reporting a dead link. The ceiling
+   *  itself is free to exceed that, because reaching it requires asking — and asking is what
+   *  raises the transport deadline too. */
   describe('the ceilings encode their transports', () => {
-    it('the device ceiling leaves room under the 5000ms TCP request deadline', () => {
-      expect(DEVICE_EVAL_MAX_TIMEOUT_MS).toBeLessThan(5000);
+    it('the device DEFAULT still finishes inside the 5000ms connection deadline', () => {
+      expect(DEVICE_EVAL_TIMEOUT_MS).toBeLessThan(5000);
       expect(DEVICE_EVAL_TIMEOUT_MS).toBeLessThanOrEqual(DEVICE_EVAL_MAX_TIMEOUT_MS);
     });
-    it('the editor ceiling is far larger — its relay takes an explicit deadline', () => {
+    it('the device ceiling is no longer capped by the transport (#153)', () => {
+      expect(DEVICE_EVAL_MAX_TIMEOUT_MS).toBeGreaterThan(5000);
+    });
+    it('the editor ceiling stays larger — the device pays a network hop the editor does not', () => {
       expect(EDITOR_EVAL_MAX_TIMEOUT_MS).toBeGreaterThan(DEVICE_EVAL_MAX_TIMEOUT_MS);
     });
   });

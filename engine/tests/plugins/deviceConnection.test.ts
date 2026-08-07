@@ -216,6 +216,58 @@ describe('TcpLeaseTransport timeouts', () => {
     }
   });
 
+  /** #153 — the per-request deadline. The connection default used to be the ONLY deadline, and it
+   *  starts host-side (before the request reaches the phone), so an op whose own budget approached
+   *  it could never produce its own error message: you got `device request timed out after 5000ms`
+   *  instead of what the code was doing. These pin the two halves that make the override safe —
+   *  it EXTENDS (a longer op survives the connection default) and it is BOUNDED (a hung device
+   *  still fails, rather than holding the link open indefinitely). */
+  it('a per-request timeout EXTENDS the connection default — the slow op is not cut short', async () => {
+    let serverSock: net.Socket | null = null;
+    // Replies after 120ms: longer than the 60ms connection default, shorter than the 400ms ask.
+    const server = net.createServer((s) => {
+      serverSock = s;
+      s.on('data', (chunk: Buffer) => {
+        const id = JSON.parse(String(chunk).trim()).id;
+        setTimeout(() => s.write(JSON.stringify({ id, result: 'slow-but-fine' }) + '\n'), 120);
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const port = (server.address() as net.AddressInfo).port;
+    const t = new TcpLeaseTransport('127.0.0.1', port, { requestTimeoutMs: 60 });
+    try {
+      await t.open();
+      // Without the override this rejects at 60ms — that was the whole bug, one layer down.
+      await expect(t.send('echo', {}, 400)).resolves.toBe('slow-but-fine');
+      // And the default still applies to a request that does NOT ask for more.
+      await expect(t.send('echo', {})).rejects.toThrow(/timed out after 60ms/);
+    } finally {
+      t.close();
+      (serverSock as net.Socket | null)?.destroy();
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  it('a per-request timeout is BOUNDED — it names the deadline it actually used', async () => {
+    let serverSock: net.Socket | null = null;
+    const server = net.createServer((s) => { serverSock = s; }); // never responds
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const port = (server.address() as net.AddressInfo).port;
+    const t = new TcpLeaseTransport('127.0.0.1', port, { requestTimeoutMs: 60 });
+    try {
+      await t.open();
+      // The message must name the EFFECTIVE deadline, not the connection default: a caller that
+      // asked for 150ms and is told "timed out after 60ms" would go looking for the wrong bug.
+      await expect(t.send('echo', {}, 150)).rejects.toThrow(/timed out after 150ms/);
+      // A nonsense ask falls back to the connection default rather than disabling the deadline.
+      await expect(t.send('echo', {}, Number.NaN)).rejects.toThrow(/timed out after 60ms/);
+    } finally {
+      t.close();
+      (serverSock as net.Socket | null)?.destroy();
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
   it('rejects open() on a silent (black-holed) connect via the connect-timeout', async () => {
     // 192.0.2.1 is TEST-NET-1 (RFC 5737) — non-routable, so the SYN is dropped.
     const t = new TcpLeaseTransport('192.0.2.1', 9, { connectTimeoutMs: 150 });

@@ -154,7 +154,9 @@ export class DeviceLeaseAuthority {
  *  does one control round-trip; `onDrop` fires when the link closes unexpectedly. */
 export interface LeaseTransport {
   open(): Promise<void>;
-  request(msg: LeaseRequest): Promise<LeaseReply>;
+  /** One control round-trip. `timeoutMs` is an optional PER-REQUEST deadline (#153) — omitted, the
+   *  implementation's connection default applies, which is what every lease-control call wants. */
+  request(msg: LeaseRequest, timeoutMs?: number): Promise<LeaseReply>;
   close(): void;
   onDrop(cb: () => void): void;
 }

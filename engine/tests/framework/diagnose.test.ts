@@ -27,6 +27,43 @@ describe('computeDiagnostics: console-error recency window (F14)', () => {
     expect(d.ok).toBe(none.ok);
   });
 
+  // #152: windowed out of the VERDICT is not windowed out of the REPORT. A stale error used to
+  // vanish entirely, so `consoleErrors: []` + "No issues detected." was reachable while the ring
+  // held a real boot error — the shape that made me report "zero console errors" on three devices.
+  it('a STALE error is still COUNTED and TIMESTAMPED — never silently dropped', () => {
+    game = createTestWorld({});
+    const d = computeDiagnostics({ consoleErrors: stale, now, errorWindowMs: win });
+    expect(d.olderErrors).toEqual({ count: 1, oldestTs: stale[0].ts, newestTs: stale[0].ts });
+  });
+
+  it('a clean-looking verdict can NEVER say "No issues detected" while older errors exist', () => {
+    game = createTestWorld({});
+    game.spawn(Transform({}), Camera({}), EntityAttributes({ name: 'Camera' }));
+    const d = computeDiagnostics({ consoleErrors: stale, now, errorWindowMs: win });
+    expect(d.ok).toBe(true);                              // the verdict is still windowed
+    expect(d.summary).not.toMatch(/No issues detected/);  // but the summary tells the truth
+    expect(d.summary).toMatch(/1 older console error/);
+    // Names BOTH tools: this string is built in the renderer, which serves the editor AND the
+    // device, so it cannot know which surface reads it. Caught on a phone, where it advised
+    // `modoki_get_console_logs` — a tool that does not exist there (#151's failure in miniature).
+    expect(d.summary).toMatch(/modoki_get_console_logs/);
+    expect(d.summary).toMatch(/device_console_logs/);
+  });
+
+  it('names the window, so `consoleErrors: []` cannot be read as an absolute', () => {
+    game = createTestWorld({});
+    const d = computeDiagnostics({ consoleErrors: [], now, errorWindowMs: win });
+    expect(d.errorWindowMs).toBe(win);
+    expect(d.olderErrors).toBeNull();
+  });
+
+  it('with no window applied it reports neither field — nothing was filtered, nothing to explain', () => {
+    game = createTestWorld({});
+    const d = computeDiagnostics({ consoleErrors: stale });
+    expect(d).not.toHaveProperty('errorWindowMs');
+    expect(d).not.toHaveProperty('olderErrors');
+  });
+
   it('a RECENT error is kept and forces ok:false', () => {
     game = createTestWorld({});
     const d = computeDiagnostics({ consoleErrors: recent, now, errorWindowMs: win });

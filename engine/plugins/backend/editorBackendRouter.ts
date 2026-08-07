@@ -771,7 +771,19 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     const b = (body ?? {}) as { method?: string; params?: Record<string, unknown> };
     if (!b.method) return json({ error: 'method required' }, 400);
     try {
-      const proxy = (m: string, p: Record<string, unknown>) => deviceConnection.proxy(m, p);
+      // NESTED DEADLINES (#153), the same rule `/api/eval` follows one layer up: the transport
+      // deadline is sized from the OP'S OWN budget plus headroom, so the innermost timeout is the
+      // one that fires and the error names what the code was doing. Without it every device op
+      // shared `TcpLeaseTransport`'s fixed 5000ms — whose clock starts HOST-side, before the
+      // request reaches the phone — so a device-side budget at or near 5000 was unreachable and
+      // reported as a dead link. Read generically off `params.timeoutMs` rather than special-cased
+      // to `eval`: any op that grows a budget gets the same treatment for free, and an op without
+      // one passes `undefined` and keeps the connection default.
+      const opTimeout = Number((b.params as { timeoutMs?: unknown } | undefined)?.timeoutMs);
+      // Headroom for the round trip in BOTH directions. Deliberately smaller than /api/eval's
+      // 10s — that one crosses an HMR websocket relay; this is one LAN/USB hop.
+      const deadline = Number.isFinite(opTimeout) && opTimeout > 0 ? opTimeout + 5_000 : undefined;
+      const proxy = (m: string, p: Record<string, unknown>) => deviceConnection.proxy(m, p, deadline);
       // #102 — iOS out-of-app capture. The native path is the APP'S OWN capture, so a system dialog
       // or springboard is invisible to it (it returns the app underneath, which reads as a fine
       // screenshot of the wrong thing). WDA sees the whole screen. Two triggers, each covering what
@@ -886,7 +898,8 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         if (wda.handled || wda.reason) outcome = wda;
       }
       if (outcome.handled) return json({ result: outcome.reply });
-      const synthetic = await deviceConnection.proxy(b.method, b.params ?? {});
+      // The op's own deadline applies here too — this is the path a `device_eval` actually takes.
+      const synthetic = await deviceConnection.proxy(b.method, b.params ?? {}, deadline);
       // An INPUT op that could have been trusted but wasn't: front the reply with a loud banner
       // naming the cause, instead of relying on the ` [input:synthetic]` suffix at the end of the
       // line. `reason: null` means this was never an input op (eval/screenshot/…) — stay silent.

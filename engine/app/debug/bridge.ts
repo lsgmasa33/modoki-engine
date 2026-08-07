@@ -10,6 +10,7 @@
  */
 
 import { makeDeviceEvalApi } from './deviceEvalApi';
+import { setConsoleSource } from './consoleSource';
 import { Capacitor } from '@capacitor/core';
 import { App as CapacitorApp } from '@capacitor/app';
 import { setJournalEnabled } from '@modoki/engine/runtime';
@@ -81,6 +82,42 @@ function patchConsole() {
       consoleRing.push(level, args);
     };
   }
+  // An uncaught error or a rejected promise never reaches `console.*`, so the patch above cannot
+  // see it — and a failed dynamic import or a throw deep in scene/resource loading is exactly the
+  // kind of thing worth diagnosing on a phone. `agentBridge` records these for the editor; the
+  // device had no equivalent, so its ring was silent on the whole class (#157).
+  // Each wrapped in try/catch for the same reason `agentBridge`'s twin is ("never let capture break
+  // logging"), and it matters MORE here: this handler runs INSIDE the window error handler, so a
+  // throw while describing an error becomes another error event. `e.error` is attacker-shaped in the
+  // general case — a value whose `stack` getter throws, or a Proxy — and `String(e.message)` can
+  // throw on an object with a hostile `toString`. Without the guard the entry is lost AND an
+  // exception escapes into the host, at precisely the moment something is already going wrong.
+  if (typeof window !== 'undefined') {
+    window.addEventListener('error', (e) => {
+      try {
+        const where = e.filename ? ` (${e.filename}:${e.lineno}:${e.colno})` : '';
+        const msg = e.error instanceof Error ? (e.error.stack || e.error.message) : String(e.message);
+        consoleRing.push('error', [`[uncaught] ${msg}${where}`]);
+      } catch { /* ignore — a capture failure must never amplify the error it is reporting */ }
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      try {
+        const r = (e as PromiseRejectionEvent).reason;
+        const msg = r instanceof Error ? (r.stack || r.message) : String(r);
+        consoleRing.push('error', [`[unhandledrejection] ${msg}`]);
+      } catch { /* ignore */ }
+    });
+  }
+  // Publish the ring so `diagnose` / the `console-logs` op can READ what this surface captured.
+  // Without this the device captured faithfully and nothing could reach it — see consoleSource.ts.
+  setConsoleSource(() => consoleRing.entries.map((e) => ({
+    // The ring carries 'info' as a distinct level; the reader's vocabulary has three. Fold it into
+    // 'log' rather than dropping the entry — losing a line to a vocabulary mismatch is the same
+    // class of silent omission this whole seam exists to end.
+    level: e.level === 'info' ? 'log' : e.level,
+    ts: e.timestamp,
+    text: e.args.join(' '),
+  })));
 }
 
 // --- Command Handlers ---
@@ -90,9 +127,11 @@ function patchConsole() {
  *  function stops passing the object it builds. This is the seam production actually takes
  *  (`case 'eval'` → here → `evalCode(code, api)`), so it is the one worth asserting. */
 export async function handleEval(params: Record<string, unknown>): Promise<unknown> {
-  // The ceiling here is NOT a policy choice — `TcpLeaseTransport` fixes its request deadline at
-  // 5000ms per CONNECTION (host-side, and its clock starts before the request even reaches us), so
-  // a device budget at or above that can never be the one that fires. See DEVICE_EVAL_MAX_TIMEOUT_MS.
+  // The ceiling here USED to be dictated by the transport — `TcpLeaseTransport` fixed its request
+  // deadline at 5000ms per CONNECTION (host-side, its clock starting before the request even
+  // reached us), so a device budget at or above that could never be the one that fires. #153 made
+  // that deadline per-request and sized from this budget, so the ceiling is a policy choice again.
+  // See DEVICE_EVAL_MAX_TIMEOUT_MS.
   const timeoutMs = clampEvalTimeout(params.timeoutMs, DEVICE_EVAL_TIMEOUT_MS, DEVICE_EVAL_MAX_TIMEOUT_MS);
   return evalCode((params.code as string) ?? '', await makeDeviceEvalApi(), timeoutMs);
 }

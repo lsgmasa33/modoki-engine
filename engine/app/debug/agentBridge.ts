@@ -66,6 +66,7 @@ import { roundFloats, resolvePrecision } from './roundFloats';
 import { computeHandles, type HandlesDumpParams } from './handlesDump';
 import { resolveDomPointReport, type DomPointSpec } from './domResolve';
 import { resolveEntityPointReport, type EntityPointSpec } from './entityResolve';
+import { readConsoleSource } from './consoleSource';
 import { chromeHandles } from './chromeHandles';
 import { computeDiagnostics } from './diagnose';
 import {
@@ -228,7 +229,13 @@ export function installConsoleCapture(): void {
 }
 
 function dumpConsoleLogs(p: ConsoleLogsParams = {}): { logs: ConsoleEntry[]; total: number } {
-  let logs = consoleBuffer;
+  // Read whatever surface ACTUALLY captured (#157). `consoleHooked` is the honest test: it is true
+  // exactly when `installConsoleCapture()` ran, i.e. when this module's own buffer is the live one
+  // (editor, and dev). On a shipped device build `initAgentBridge()` returns before that call, so
+  // the buffer is permanently empty and the device's own ring — published through `consoleSource`
+  // — is the real one. Preferring the native buffer whenever it is hooked keeps the editor path
+  // byte-identical, including the uncaught-error entries only it records.
+  let logs: ConsoleEntry[] = consoleHooked ? consoleBuffer : (readConsoleSource() ?? consoleBuffer);
   if (p.level) logs = logs.filter((e) => e.level === p.level);
   if (p.since != null) logs = logs.filter((e) => e.ts > p.since!);
   const total = logs.length;
@@ -772,10 +779,17 @@ registerAgentOp('resolve-dom-point', (params) => resolveDomPointReport((params ?
 registerAgentOp('resolve-entity-point', (params) => resolveEntityPointReport((params ?? {}) as EntityPointSpec));
 
 // ── Phase F: structured render/scene health (causes, not a black screenshot) ──
-// Only errors from the last 30s gate `ok` (F14): a stale load-time / prior-scene error otherwise
+// Only errors inside this window gate `ok` (F14): a stale load-time / prior-scene error otherwise
 // pins ok:false forever. Date.now() is fine here — app/debug is outside the runtime determinism
 // guard, and the console ring already stamps entries with Date.now().
-const DIAGNOSE_ERROR_WINDOW_MS = 30_000;
+//
+// FIVE MINUTES, not the original 30s (#152). The window has to be longer than the time it takes a
+// human to notice something, connect a device, attach an agent and ask a question — at 30s it was
+// shorter than that on every real investigation, so boot errors aged out before anyone could look.
+// It is a VERDICT window, not a reporting window: `computeDiagnostics` counts and timestamps
+// everything older as `olderErrors` and names the window as `errorWindowMs`, so widening it trades
+// "how long a fixed error keeps failing ok" against nothing — the older ones are visible either way.
+const DIAGNOSE_ERROR_WINDOW_MS = 300_000;
 registerAgentOp('diagnose', () => computeDiagnostics({
   consoleErrors: dumpConsoleLogs({ level: 'error' }).logs,
   now: Date.now(),

@@ -675,11 +675,11 @@ export function registerTools(server: McpServer) {
     {
       code: z.string().describe('JavaScript code. Use `return` for a value.'),
       timeoutMs: z.number().int().positive().optional().describe(
-        'How long the body may run before it is abandoned. Default 4000, max 4500 (clamped, not ' +
-        'refused). The ceiling is LOWER than the editor twin\'s 25000 and is not a policy choice: ' +
-        'the device TCP transport has a fixed 5s per-REQUEST deadline whose clock starts host-side, ' +
-        'so a larger budget could never be the deadline that fires — you would get a generic ' +
-        'transport error instead of what the code was doing.',
+        'How long the body may run before it is abandoned. Default 4000, max 20000 (clamped, not ' +
+        'refused). Anything ABOVE the 4000 default also lifts the transport deadline with it — the ' +
+        "backend sizes the device request's deadline from this number + 5s of headroom (#153), so " +
+        'the timeout that fires is the eval\'s own and the error names what the code was doing. ' +
+        'Still below the editor twin\'s 25000: the device pays a real network hop the editor does not.',
       ),
     },
     async ({ code, timeoutMs }) => {
@@ -822,7 +822,10 @@ export function registerTools(server: McpServer) {
   tool('device_diagnose',
     'Structured render/scene health on the connected device — the CAUSES behind a black or wrong ' +
       'frame, as data (recent console errors, off-screen entities, missing renderers, …). Use this ' +
-      'instead of a screenshot on Android, where the native screenshot is black on WebGPU.',
+      'instead of a screenshot on Android, where the native screenshot is black on WebGPU. ' +
+      '`consoleErrors` covers only the last `errorWindowMs` (the window that gates `ok`); anything ' +
+      'older is counted in `olderErrors` — BOOT errors live there, since nobody connects a device ' +
+      'and attaches an agent inside the window. Read them with device_console_logs level=error.',
     {},
     async () => perceptCall('device_diagnose', 'diagnose'),
   );

@@ -35,10 +35,29 @@ function isThenable(v: unknown): boolean {
 
 export function safeStringify(value: unknown): string {
   if (isThenable(value)) return PENDING_PROMISE_MARKER;
+  // An Error has NO own enumerable properties, so `JSON.stringify(new Error('boom'))` is `{}` —
+  // the same empty-looking-RESULT-rather-than-a-mistake trap as the pending promise above, and it
+  // bit the same way: `console.error(err)` is how half the codebase reports a failure, so a real
+  // device boot error reached `diagnose` as a literal `{}` (measured on a Samsung, #157). Visible
+  // but useless is not fixed. `agentBridge`'s capture already special-cased this; the ring reached
+  // it through here and did not, which is exactly the kind of divergence one shared helper exists
+  // to prevent.
+  //
+  // Handled at BOTH depths, like the thenable case beside it: the top-level branch returns the raw
+  // stack (so a captured console arg reads as text, matching `agentBridge`'s capture), and the
+  // replacer below catches Errors NESTED in an object or array. The first cut of this fix did only
+  // the top level — `{cause: err}` and `[err]` still serialized to `{"cause":{}}` / `[{}]`, which is
+  // the same defect one level down, and a rejection value is exactly the kind of thing that arrives
+  // wrapped. Caught in close-out review by asking why the thenable directly above was nested-aware
+  // and this was not.
+  if (value instanceof Error) return value.stack || value.message;
   try {
     return typeof value === 'string'
       ? value
-      : JSON.stringify(value, (_k, v) => (isThenable(v) ? PENDING_PROMISE_MARKER : v));
+      : JSON.stringify(value, (_k, v) => (
+        isThenable(v) ? PENDING_PROMISE_MARKER
+          : v instanceof Error ? (v.stack || v.message)
+            : v));
   } catch {
     return String(value);
   }
@@ -89,14 +108,21 @@ export const EVAL_ASYNC_TIMEOUT_MS = 5000;
  *  parks (`modoki.waitForEdit()`), and the old effective 3s made that impossible. */
 export const EDITOR_EVAL_MAX_TIMEOUT_MS = 25_000;
 
-/** Device ceiling — **imposed from outside this file**. `TcpLeaseTransport` fixes its request
- *  deadline at 5000ms PER CONNECTION (`request()` takes no timeout), so anything at or above that
- *  is fiction: the host gives up first and reports `device request timed out after 5000ms`
- *  instead of the eval's own, far more useful message. 4500 leaves ~500ms for the reply to travel
- *  back. Raising this REQUIRES plumbing a per-request timeout through that transport first —
- *  tracked separately; until then, do not "just increase" it. */
-export const DEVICE_EVAL_MAX_TIMEOUT_MS = 4500;
-/** Device default. Below the transport's 5000 so the eval's own timeout is the one that fires. */
+/** Device ceiling. This used to be **4500, imposed from outside this file**: `TcpLeaseTransport`
+ *  fixed its request deadline at 5000ms PER CONNECTION (`request()` took no timeout), so anything
+ *  at or above that was fiction — the host gave up first and reported `device request timed out
+ *  after 5000ms` instead of the eval's own, far more useful message, and 4500 was a workaround
+ *  leaving ~500ms for the reply to travel back.
+ *
+ *  #153 plumbed a PER-REQUEST deadline through that transport, and `/api/device/request` now sizes
+ *  it from this op's own budget + 5s of headroom, so the innermost timeout is the one that fires.
+ *  Kept strictly BELOW `EDITOR_EVAL_MAX_TIMEOUT_MS` rather than raised to meet it: the device pays
+ *  a real network hop the editor does not, so its op budget should always leave more room under
+ *  the outer deadlines than the editor's does. That ordering is asserted in `bridge.test.ts`. */
+export const DEVICE_EVAL_MAX_TIMEOUT_MS = 20_000;
+/** Device default. Left at 4000 — below the transport's 5000 CONNECTION default, so an eval that
+ *  does not ask for a budget still gets its own timeout message rather than a transport one. Only
+ *  a caller that names `timeoutMs` lifts the transport deadline with it (#153). */
 export const DEVICE_EVAL_TIMEOUT_MS = 4000;
 
 /** Clamp a caller-supplied eval budget into `[50, max]`, falling back to `def` for anything

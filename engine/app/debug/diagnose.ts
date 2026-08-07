@@ -83,11 +83,29 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
   // fixed-scene-A error sits in the 500-entry ring and forces ok:false FOREVER — and "recent console
   // error(s)" mislabels a minutes-old error. Windowing is opt-in (needs `now`, supplied by the op via
   // Date.now()); without it — the unit tests that pass a fixed list — behavior is unchanged. (F14)
+  //
+  // #152: the window may gate the VERDICT but must never gate REPORTING. Errors outside it used to
+  // be dropped silently — not summarised, not counted — so `consoleErrors: []` read as "this app
+  // has logged no errors" when it only ever meant "none in the last N seconds". Boot errors are the
+  // ones that pay for this: nobody connects a device, attaches an agent and runs diagnose inside
+  // 30s, so a real 4-second frame-loop stall at startup was reported as `ok:true, "No issues
+  // detected."` on a Huawei Y6 while the owner watched the freeze happen. Everything outside the
+  // window is now COUNTED and TIMESTAMPED (`olderErrors`), and the window itself is named in the
+  // payload (`errorWindowMs`) so `0` cannot be read as an absolute. The load-bearing property:
+  // a diagnose that SAYS it is clean must not be reachable while unread errors exist.
   const raw = opts.consoleErrors ?? [];
-  const windowed = (opts.now != null && opts.errorWindowMs != null)
-    ? raw.filter((e) => e.ts >= opts.now! - opts.errorWindowMs!)
-    : raw;
+  const windowing = opts.now != null && opts.errorWindowMs != null;
+  const cutoff = windowing ? opts.now! - opts.errorWindowMs! : -Infinity;
+  const windowed = windowing ? raw.filter((e) => e.ts >= cutoff) : raw;
+  const older = windowing ? raw.filter((e) => e.ts < cutoff) : [];
   const consoleErrors = windowed.slice(-20);
+  const olderErrors = older.length
+    ? {
+        count: older.length,
+        oldestTs: Math.min(...older.map((e) => e.ts)),
+        newestTs: Math.max(...older.map((e) => e.ts)),
+      }
+    : null;
 
   // Hard problems fail `ok`. zeroScale is a SOFT signal — an entity can be intentionally scaled to
   // 0 (hidden, or a pop-in animation at t=0), so it does NOT fail `ok`; but it must still be
@@ -95,6 +113,18 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
   // issues detected" (the contradiction the audit flagged). off-screen stays soft + unlisted. (C7 re-audit.)
   const ok = refIssues.length === 0 && nan.length === 0 && !cameraMissing && consoleErrors.length === 0;
   const zeroScaleNote = zeroScale.length ? `${zeroScale.length} zero-scale (invisible) entit(ies)` : '';
+  // Older errors do NOT fail `ok` — that is what pinned the verdict forever and is why the window
+  // exists. They do get SAID, in every branch, because a summary reading "No issues detected."
+  // above a ring holding a boot error is the exact overclaim #152 is about.
+  const olderNote = olderErrors
+    ? `${olderErrors.count} older console error(s) outside the ${Math.round((opts.errorWindowMs ?? 0) / 1000)}s ` +
+      `window (newest ${Math.round(((opts.now ?? olderErrors.newestTs) - olderErrors.newestTs) / 1000)}s ago) ` +
+      // NAME BOTH TOOLS. This string is built in the renderer, which serves the editor AND the
+      // device, so it cannot know which surface is reading it — and a hint that names the wrong
+      // one is the #151 failure in miniature: advice the reader cannot act on. Caught on a real
+      // phone, where the payload said "modoki_get_console_logs", a tool that does not exist there.
+      '— read them with modoki_get_console_logs (editor) / device_console_logs (device), level=error'
+    : '';
   // ── Device capabilities (#121 P0) ──
   // What hardware this is and what it can do — so "why is it slow / black on that phone?" is
   // answerable as DATA rather than by asking the human to read a device log. Read from the
@@ -127,14 +157,23 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
     camera: { count: cameraCount, ok: !cameraMissing, needed: has3DContent },
     offScreen: { ids: offScreen, count: offScreen.length },
     consoleErrors,
+    // Named so `consoleErrors: []` cannot be read as an absolute — it always means "none in the
+    // last errorWindowMs", and now says so. Omitted (with olderErrors) when no window was applied.
+    ...(windowing ? { errorWindowMs: opts.errorWindowMs, olderErrors } : {}),
     summary: ok
-      ? (zeroScaleNote ? `No blocking issues. Note: ${zeroScaleNote}.` : 'No issues detected.')
+      ? (() => {
+          const notes = [zeroScaleNote, olderNote].filter(Boolean).join('; ');
+          return notes ? `No blocking issues. Note: ${notes}.` : 'No issues detected.';
+        })()
       : [
           refIssues.length && `${refIssues.length} bad asset ref(s)`,
           nan.length && `${nan.length} NaN transform field(s)`,
           zeroScaleNote,
           cameraMissing && 'no Camera entity (3D renders black)',
-          consoleErrors.length && `${consoleErrors.length} recent console error(s)`,
+          consoleErrors.length && (windowing
+            ? `${consoleErrors.length} console error(s) in the last ${Math.round(opts.errorWindowMs! / 1000)}s`
+            : `${consoleErrors.length} recent console error(s)`),
+          olderNote,
         ].filter(Boolean).join('; '),
   };
 }

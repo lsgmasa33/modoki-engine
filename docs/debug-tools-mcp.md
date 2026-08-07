@@ -341,8 +341,9 @@ same actions + state a person has in the editor. They relay to the renderer over
     silently ate real debugging calls. The top-level `return modoki.foo()` is unaffected: that one is
     awaited.
   - **`timeoutMs` bounds the whole body, and the two surfaces cap DIFFERENTLY** — `modoki_eval`
-    default 5000 / max 25000, `device_eval` default 4000 / **max 4500**. Out-of-range is clamped,
-    not refused. The asymmetry is not a policy choice: see the nested-deadline rule below.
+    default 5000 / max 25000, `device_eval` default 4000 / **max 20000**. Out-of-range is clamped,
+    not refused. Asking for more than the default also lifts the device's transport deadline with it
+    (#153); the remaining asymmetry is the device's extra network hop. See the nested-deadline rule below.
 - **Play/test the game:** `modoki_play_control {play|stop|pause|resume|step}` — press Play, exercise
   with `modoki_tap`/`modoki_drag`, read `get_scene_state`, then stop (reverts the authored snapshot).
 - **Edit like a human (undoable):** `modoki_create_entity` (empty/primitive/2d/ui/camera/light/
@@ -709,7 +710,7 @@ on both now, with `dx`/`dy` kept as aliases. **Editor-only by nature** (no game 
 `render_scene`, `play_control` / `set_timescale` / `history`, `identity`. **Known device gaps**, logged
 as features rather than audit fixes: no `device_type_text`, no `device_pointer` (sustained press).
 
-#### Nested deadlines — why `device_eval` caps at 4500ms and `modoki_eval` at 25000ms
+#### Nested deadlines — why `device_eval` caps at 20000ms and `modoki_eval` at 25000ms
 
 **A timeout is only real if it is the SHORTEST one in its chain.** Both eval surfaces violated that,
 so `EVAL_ASYNC_TIMEOUT_MS = 5000` — the one number anybody could see — was unreachable on each, and a
@@ -717,19 +718,32 @@ slow eval reported a dead transport instead of what the code was doing:
 
 | Layer | Editor (`modoki_eval`) | Device (`device_eval`) |
 |---|---|---|
-| the eval's own budget | `timeoutMs` — default 5000, **max 25000** | `timeoutMs` — default 4000, **max 4500** |
-| transport | HMR relay `requestBrowser` — was a fixed **3000**, now `op + 10s` | `TcpLeaseTransport` — fixed **5000**, per CONNECTION |
-| outermost | MCP client abort — was a fixed **30000**, now `op + 15s` | (the lease request is the ceiling) |
+| the eval's own budget | `timeoutMs` — default 5000, **max 25000** | `timeoutMs` — default 4000, **max 20000** |
+| transport | HMR relay `requestBrowser` — was a fixed **3000**, now `op + 10s` | `TcpLeaseTransport` — was a fixed **5000** per CONNECTION, now `op + 5s` per REQUEST |
+| outermost | MCP client abort — was a fixed **30000**, now `op + 15s` | (the device MCP sets no client deadline) |
 
 The editor's relay took an explicit deadline all along (`/api/wait-for-edit` already passed one), so
-its layers are now sized from the op's budget and each is strictly larger than the one inside it. The
-**device cannot do that**: `TcpLeaseTransport.request()` takes no per-request timeout, so its 5000ms
-is fixed for the whole connection *and its clock starts host-side, before the request reaches the
-device* — which is why an equal 5000 always lost. 4500 leaves ~500ms for the reply.
+its layers are sized from the op's budget and each is strictly larger than the one inside it.
 
-**So the device cap is imposed from outside the eval code and must not simply be raised.** Lifting it
-means plumbing a per-request timeout through that transport first. Until then, budget a device eval
-under 4.5s or split it across calls.
+**The device could not do that until #153.** `TcpLeaseTransport.request()` took no per-request
+timeout, so its 5000ms was fixed for the whole connection *and its clock starts host-side, before the
+request reaches the device* — which is why an equal 5000 always lost, and why the device cap sat at
+4500 with a comment telling you not to raise it. The transport now takes an optional deadline per
+request, `/api/device/request` sizes it from the op's own `timeoutMs` + 5s, and the cap is a policy
+choice again. Two properties keep the override safe: it can only EXTEND the connection default (a
+caller cannot shorten one into a spurious failure), and it is bounded by a 60s ceiling (a hung device
+still fails, instead of holding the link open past the point reconnect would have noticed).
+
+Note the constraint that remains: the **default** (4000) still sits under the 5000ms connection
+default, so an eval that names no budget gets its own timeout message rather than a transport one.
+Only a caller that asks for more lifts the transport deadline with it. And the device ceiling stays
+strictly below the editor's on purpose — the device pays a real network hop the editor does not.
+
+Three files restate this rule with hand-kept constants, deliberately and with comments saying so:
+`bridgeHelpers.ts` (renderer, ships in the game), `editorBackendRouter.ts` (cannot import the
+renderer bundle), and the MCP's `context.ts`. A shared module would be better, but the only place all
+three could import from is `engine/tools/shared/`, which the shipped renderer has no business
+depending on — so the restatement is guarded by tests rather than removed.
 
 ## Response budget (read this before adding a tool)
 
@@ -850,6 +864,35 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   `runtime/rendering/screenBounds.ts`, `app/debug/layoutDump.ts`.)
 - **Diagnose:** `modoki_diagnose` → structured causes (bad refs, NaN/zero-scale transforms, no camera,
   off-screen, console errors) — run FIRST when something renders wrong. (`app/debug/diagnose.ts`.)
+  **`consoleErrors` is windowed, and the window is a VERDICT window, not a reporting one (#152).**
+  Only errors inside `errorWindowMs` (5 min) gate `ok` — otherwise one benign load-time error sits
+  in the 500-entry ring and pins `ok:false` forever. But everything older is COUNTED and timestamped
+  in `olderErrors {count, oldestTs, newestTs}`, and the summary names it, because for a while the
+  window silently DROPPED them: at 30s, boot errors could never be seen (nobody connects a device,
+  attaches an agent and asks a question that fast), and `consoleErrors: []` + `ok:true` + "No issues
+  detected." was reachable while the ring held a real ~4s frame-loop stall on a Huawei Y6 that the
+  owner was watching happen. `0` never means "this app has logged no errors" — it means "none in the
+  last `errorWindowMs`". Read the rest with `modoki_get_console_logs level=error`.
+
+  **On DEVICE it read the wrong buffer entirely, and the window was never what hid boot errors
+  (#157).** There are two console rings — `bridge.ts`'s `consoleRing` (populated on device by
+  `patchConsole()`) and `agentBridge.ts`'s `consoleBuffer` (populated in the editor by
+  `installConsoleCapture()`) — and `diagnose` read the second. That call sits *after*
+  `initAgentBridge()`'s `if (!hot && !bridge) return;`, and a shipped build has no
+  `import.meta.hot` while a phone has no Electron bridge, so on every real device the buffer stayed
+  empty for the life of the process. Measured on a Samsung SM-S901U1: the ring held 5 errors
+  including a `[frameDriver]` stall, and `device_diagnose` answered `ok:true, consoleErrors:0,
+  "No issues detected."` A clean device diagnose was **structurally guaranteed, not observed** — on
+  the one surface CLAUDE.md tells you to run it first, because the Android screenshot is black on
+  WebGPU. The writer now publishes its ring through `app/debug/consoleSource.ts` and the reader asks
+  for it, preferring its own buffer whenever `consoleHooked` (so the editor path is unchanged).
+  Deliberately a seam and NOT a second `installConsoleCapture()`: hoisting that call would patch
+  `console.*` twice on device and carry a second copy of every line, on exactly the low-end hardware
+  whose frame budget is #154. Two things fixed alongside it, both required before a device boot error
+  is actually *readable*: the device now captures `[uncaught]` errors and `[unhandledrejection]`s
+  (those listeners lived only in the skipped block, so a failed dynamic import or a throw in scene
+  loading was silent), and `safeStringify` no longer renders an `Error` as `{}` — `console.error(err)`
+  is the usual way to report a failure, and it was reaching `diagnose` as an empty object.
 - **Console:** `modoki_get_console_logs` returns the **last 50** plus three numbers that do NOT mean the
   same thing: `count` (what came back), `total` (what matched `level=`/`since=`), and
   `ringTotal`+`byLevel` (the WHOLE 500-entry ring, regardless of the filter). That last part is the
