@@ -141,11 +141,15 @@ export default function GameView({ uiLayer }: GameViewProps) {
         <button onClick={toggleMute} style={{ ...iconBtnStyle, color: muted ? '#e74c3c' : '#888' }}
           title={muted ? 'Unmute audio' : 'Mute audio'}>{muted ? '🔇' : '🔊'}</button>
         <span style={{ flex: 1 }} />
-        <span style={{ color: isStopped ? '#888' : isPaused ? '#f1c40f' : '#2ecc71', fontSize: '11px' }}>
+        <span style={{ color: isStopped ? '#888' : isPaused ? '#f1c40f' : '#2ecc71', fontSize: '11px', whiteSpace: 'nowrap', flexShrink: 0 }}>
           {isStopped ? 'STOPPED' : isPaused ? 'PAUSED' : 'PLAYING'}
         </span>
-        <span style={{ color: '#555', fontSize: '11px' }}>|</span>
-        <span style={{ color: '#888', fontSize: '11px' }}>{isFree ? 'Free' : `${preset.name} ${deviceW}x${deviceH}`}</span>
+        <span style={{ color: '#555', fontSize: '11px', flexShrink: 0 }}>|</span>
+        {/* The device readout is the least important thing here: in a narrow Game panel
+            it ellipsizes away rather than wrapping out of the 32px toolbar. */}
+        <span style={{ color: '#888', fontSize: '11px', minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+          {isFree ? 'Free' : `${preset.name} ${deviceW}x${deviceH}`}
+        </span>
       </div>
 
       {/* Game area */}
