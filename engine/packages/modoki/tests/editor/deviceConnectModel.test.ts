@@ -3,7 +3,12 @@ import {
   deviceSummary,
   deviceButtonLabel,
   looksLikeIp,
+  androidRowLabel,
+  androidRowNote,
+  androidRowSelectable,
   type DeviceStatus,
+  type AndroidDeviceRow,
+  type DeviceClaim,
 } from '../../src/editor/panels/deviceConnectModel';
 
 const mk = (over: Partial<DeviceStatus>): DeviceStatus =>
@@ -68,5 +73,91 @@ describe('looksLikeIp', () => {
     expect(looksLikeIp('1.2.3')).toBe(false);
     expect(looksLikeIp('hello')).toBe(false);
     expect(looksLikeIp('')).toBe(false);
+  });
+});
+
+// ── #149 — adb device picker helpers ──────────────────────────────────────────
+
+const mkClaim = (over: Partial<DeviceClaim> = {}): DeviceClaim =>
+  ({ deviceId: 'adb:RFCTB0EV83K', clone: 'work-ai', branch: 'work-ai', pid: 8123, at: 0, ...over });
+
+const mkRow = (over: Partial<AndroidDeviceRow> = {}): AndroidDeviceRow =>
+  ({ serial: 'RFCTB0EV83K', state: 'device', usable: true, claim: null, ...over });
+
+describe('androidRowLabel', () => {
+  it('shows model + serial when adb read a model', () => {
+    expect(androidRowLabel(mkRow({ model: 'SC_56C', serial: 'RFCTA14CMRF' }))).toBe('SC_56C — RFCTA14CMRF');
+  });
+
+  it('falls back to the serial alone with no model (e.g. unauthorized)', () => {
+    expect(androidRowLabel(mkRow({ model: undefined, serial: 'RFCTA14CMRF' }))).toBe('RFCTA14CMRF');
+  });
+});
+
+describe('androidRowNote', () => {
+  it('is null for a free, usable device', () => {
+    expect(androidRowNote(mkRow())).toBeNull();
+  });
+
+  it('names the holder for a claimed device', () => {
+    expect(androidRowNote(mkRow({ claim: mkClaim({ clone: 'work-ai2', pid: 555 }) })))
+      .toBe('held by work-ai2 (pid 555)');
+  });
+
+  it('surfaces the raw adb state for a non-device row (unauthorized/offline)', () => {
+    expect(androidRowNote(mkRow({ state: 'unauthorized', usable: false }))).toBe('unauthorized');
+    expect(androidRowNote(mkRow({ state: 'offline', usable: false }))).toBe('offline');
+  });
+
+  it('a claim takes precedence over an unusable state in the note', () => {
+    expect(androidRowNote(mkRow({ state: 'unauthorized', usable: false, claim: mkClaim() })))
+      .toBe('held by work-ai (pid 8123)');
+  });
+
+  // The common case is that THIS editor holds the device it is connected to. Naming your own clone
+  // path back at you reads as a collision that isn't one — and paired with `androidRowSelectable`
+  // below, it would refuse to select the very phone you are already using.
+  it('says "this editor" rather than naming you, for your OWN claim', () => {
+    expect(androidRowNote(mkRow({ claim: mkClaim({ clone: '/Users/x/modoki' }) }), '/Users/x/modoki'))
+      .toBe('in use by this editor');
+  });
+
+  it('still names a SIBLING clone when a thisClone is supplied', () => {
+    expect(androidRowNote(mkRow({ claim: mkClaim({ clone: '/Users/x/modoki-ai2', pid: 42 }) }), '/Users/x/modoki'))
+      .toBe('held by modoki-ai2 (pid 42)');
+  });
+
+  // The panel row is a ~250px strip: the absolute path wraps and pushes the device name out of
+  // view, and every clone on the machine shares the leading directories anyway.
+  it('shortens a clone path to its last segment, on both separators', () => {
+    expect(androidRowNote(mkRow({ claim: mkClaim({ clone: '/Users/x/Projects/modoki-ai3', pid: 7 }) })))
+      .toBe('held by modoki-ai3 (pid 7)');
+    expect(androidRowNote(mkRow({ claim: mkClaim({ clone: 'C:\\dev\\modoki-win', pid: 7 }) })))
+      .toBe('held by modoki-win (pid 7)');
+    // A bare name (no separator at all) is left exactly as-is.
+    expect(androidRowNote(mkRow({ claim: mkClaim({ clone: 'work-ai', pid: 7 }) })))
+      .toBe('held by work-ai (pid 7)');
+  });
+});
+
+describe('androidRowSelectable', () => {
+  it('is selectable when usable and unclaimed', () => {
+    expect(androidRowSelectable(mkRow())).toBe(true);
+  });
+
+  it('is not selectable when adb reports a non-device state', () => {
+    expect(androidRowSelectable(mkRow({ state: 'unauthorized', usable: false }))).toBe(false);
+  });
+
+  it('is not selectable when a DIFFERENT clone holds it', () => {
+    expect(androidRowSelectable(mkRow({ claim: mkClaim({ clone: 'work-ai2' }) }), 'main')).toBe(false);
+  });
+
+  it('is still selectable when THIS clone holds it', () => {
+    expect(androidRowSelectable(mkRow({ claim: mkClaim({ clone: 'main' }) }), 'main')).toBe(true);
+  });
+
+  it('with no clone name given, any claim blocks selection', () => {
+    expect(androidRowSelectable(mkRow({ claim: mkClaim() }))).toBe(false);
   });
 });

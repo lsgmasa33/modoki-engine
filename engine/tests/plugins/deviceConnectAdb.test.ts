@@ -1,6 +1,13 @@
 /** The `useAdb` connect branch (code-review T9 / #45) — previously untested. Overrides the
  *  `adbRunner` seam so the real `adb` binary is never invoked (and no `child_process` module mock,
- *  which fights vitest's per-file module cache in the full suite). */
+ *  which fights vitest's per-file module cache in the full suite).
+ *
+ *  ⚠️ `androidDevicesExec.list` is stubbed for the SAME reason, and it is not optional (#149). The
+ *  connect path now resolves WHICH Android before forwarding, and an un-stubbed listing shells out
+ *  to `adb devices -l` — so these tests would pass or fail according to how many phones happen to be
+ *  plugged into the machine running them. Measured: on a Mac with three attached, every adb-branch
+ *  test failed with the ambiguity refusal instead of the behaviour under test. Exactly the
+ *  half-injectable-seam trap `wdaLauncher.ts` documents for its legacy device listing. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import net from 'net';
@@ -8,18 +15,32 @@ import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import { DeviceConnectionManager, adbRunner } from '../../plugins/backend/deviceConnection';
+import { androidDevicesExec, _clearFriendlyNameCache } from '../../plugins/backend/androidDevices';
 import { DeviceLeaseAuthority } from '../../plugins/backend/deviceLease';
 
 const realForward = adbRunner.forward;
 const realRemove = adbRunner.removeForward;
+const realList = androidDevicesExec.list;
+const realDeviceName = androidDevicesExec.deviceName;
+/** One attached, usable phone — the unambiguous case, so these tests exercise the adb branch rather
+ *  than the device-selection rule (which has its own tests in androidDevices.test.ts). */
+const ONE_DEVICE = 'List of devices attached\nTESTSERIAL1  device usb:1-1 model:Test_Phone\n';
 // Per-test `.modoki` so the persisted last-target never touches the real repo and can't leak between tests.
 let stateDir: string;
 beforeEach(() => {
   adbRunner.forward = vi.fn(); adbRunner.removeForward = vi.fn();
+  androidDevicesExec.list = () => ONE_DEVICE;
+  // The friendly-name lookup is a second adb shell — stubbed for the same reason as the listing:
+  // un-stubbed it asks the machine's REAL attached phones for their names (#149).
+  androidDevicesExec.deviceName = () => '';
+  _clearFriendlyNameCache();
   stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-adb-'));
 });
 afterEach(() => {
   adbRunner.forward = realForward; adbRunner.removeForward = realRemove;
+  androidDevicesExec.list = realList;
+  androidDevicesExec.deviceName = realDeviceName;
+  _clearFriendlyNameCache();
   fs.rmSync(stateDir, { recursive: true, force: true });
 });
 
@@ -63,7 +84,7 @@ describe('DeviceConnectionManager — useAdb branch', () => {
     const status = await mgr.connect({ useAdb: true });
     expect(status.state).toBe('error');
     expect(status.detail).toMatch(/adb forward failed/i);
-    expect(adbRunner.forward).toHaveBeenCalledWith(9095);
+    expect(adbRunner.forward).toHaveBeenCalledWith(9095, 'TESTSERIAL1');
   });
 
   // ── Bare reconnect reuses the saved useAdb; supplying an ip is all-or-nothing (never inherits adb) ──
@@ -74,7 +95,7 @@ describe('DeviceConnectionManager — useAdb branch', () => {
     await mgr.connect({ useAdb: true, port: 1 });
     (adbRunner.forward as ReturnType<typeof vi.fn>).mockClear();
     const status = await mgr.connect({});                       // bare
-    expect(adbRunner.forward).toHaveBeenCalledWith(9095);       // reused useAdb:true (default port)
+    expect(adbRunner.forward).toHaveBeenCalledWith(9095, 'TESTSERIAL1'); // reused useAdb:true (default port)
     expect(status.detail ?? '').not.toMatch(/no IP/i);
     await mgr.disconnect();
   });
@@ -95,12 +116,88 @@ describe('DeviceConnectionManager — useAdb branch', () => {
     const mgr = new DeviceConnectionManager('g-adbok', stateDir);
     try {
       const status = await mgr.connect({ useAdb: true, port: device.port });
-      expect(adbRunner.forward).toHaveBeenCalledWith(device.port);
+      expect(adbRunner.forward).toHaveBeenCalledWith(device.port, 'TESTSERIAL1');
       expect(status.state).toBe('connected');
-      expect(status.target).toMatchObject({ host: '127.0.0.1', useAdb: true });
+      // The resolved serial rides on the lease (#149) — every later adb call reuses THIS, rather
+      // than re-picking a device of its own.
+      expect(status.target).toMatchObject({ host: '127.0.0.1', useAdb: true, serial: 'TESTSERIAL1' });
     } finally {
       await mgr.disconnect();
       await device.close();
     }
+  });
+
+  // ── Which phone (#149) ──────────────────────────────────────────────────────
+  describe('device selection', () => {
+    const TWO = 'List of devices attached\n'
+      + 'AAA111  device usb:1-1 model:Phone_A\n'
+      + 'BBB222  device usb:1-2 model:Phone_B\n';
+
+    it('refuses — without forwarding — when several are attached and none was chosen', async () => {
+      androidDevicesExec.list = () => TWO;
+      const mgr = new DeviceConnectionManager('g-ambig', stateDir);
+      const status = await mgr.connect({ useAdb: true });
+      expect(status.state).toBe('error');
+      // The refusal must NAME the candidates: "more than one device/emulator" is what this replaced.
+      expect(status.detail).toContain('AAA111');
+      expect(status.detail).toContain('BBB222');
+      // Nothing was touched — a refusal that had already forwarded would leave a stray rule behind.
+      expect(adbRunner.forward).not.toHaveBeenCalled();
+    });
+
+    it('forwards to the serial the caller asked for', async () => {
+      androidDevicesExec.list = () => TWO;
+      const mgr = new DeviceConnectionManager('g-pick', stateDir);
+      const status = await mgr.connect({ useAdb: true, port: 1, serial: 'BBB222' });
+      expect(adbRunner.forward).toHaveBeenCalledWith(1, 'BBB222');
+      expect(status.target?.serial).toBe('BBB222');
+      await mgr.disconnect();
+    });
+
+    it('refuses a serial that matches nothing attached, rather than using another phone', async () => {
+      androidDevicesExec.list = () => TWO;
+      const mgr = new DeviceConnectionManager('g-typo', stateDir);
+      const status = await mgr.connect({ useAdb: true, serial: 'NOPE' });
+      expect(status.state).toBe('error');
+      expect(status.detail).toContain('NOPE');
+      expect(adbRunner.forward).not.toHaveBeenCalled();
+    });
+
+    it('remembers the chosen serial and reuses it on a bare reconnect', async () => {
+      androidDevicesExec.list = () => TWO;
+      const mgr = new DeviceConnectionManager('g-remember', stateDir);
+      await mgr.connect({ useAdb: true, port: 1, serial: 'BBB222' });
+      await mgr.disconnect();
+      (adbRunner.forward as ReturnType<typeof vi.fn>).mockClear();
+      await mgr.connect({});                                   // bare
+      expect(adbRunner.forward).toHaveBeenCalledWith(9095, 'BBB222');
+      await mgr.disconnect();
+    });
+
+    // A REMEMBERED serial is a preference, not a pin: the overwhelmingly likely reason it no longer
+    // matches is that the phone was unplugged, and refusing a single-phone reconnect over a stale
+    // memory the user never typed would be worse than falling back to the normal rule.
+    it('falls back to the normal rule when the remembered serial is no longer attached', async () => {
+      androidDevicesExec.list = () => TWO;
+      const mgr = new DeviceConnectionManager('g-unplugged', stateDir);
+      await mgr.connect({ useAdb: true, port: 1, serial: 'BBB222' });
+      await mgr.disconnect();
+      androidDevicesExec.list = () => ONE_DEVICE;              // BBB222 unplugged; one left
+      (adbRunner.forward as ReturnType<typeof vi.fn>).mockClear();
+      const status = await mgr.connect({});
+      expect(adbRunner.forward).toHaveBeenCalledWith(9095, 'TESTSERIAL1');
+      expect(status.detail ?? '').not.toMatch(/matches none/i);
+      await mgr.disconnect();
+    });
+
+    it('refuses an attached-but-unauthorized device with the fix that happens ON THE PHONE', async () => {
+      androidDevicesExec.list = () => 'List of devices attached\nCCC333  unauthorized usb:1-1\n';
+      const mgr = new DeviceConnectionManager('g-unauth', stateDir);
+      const status = await mgr.connect({ useAdb: true });
+      expect(status.state).toBe('error');
+      expect(status.detail).toMatch(/UNAUTHORIZED/i);
+      expect(status.detail).toMatch(/allow usb debugging/i);
+      expect(adbRunner.forward).not.toHaveBeenCalled();
+    });
   });
 });

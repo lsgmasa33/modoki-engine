@@ -155,14 +155,45 @@ let adbScreenInfo: { imgW: number; imgH: number; nativeW: number; nativeH: numbe
 type DeviceStatusReply = {
   state?: string;
   guid?: string;
-  target?: { host?: string; port?: number; useAdb?: boolean } | null;
+  // `serial` (#149): the adb serial the LEASE resolved at connect time — present only for an
+  // adb-connected target. It exists so a screenshot can be targeted at the SAME phone the lease is
+  // driving (see `adbScreencap`'s `-s` argv below) without this file resolving or guessing one of
+  // its own; guessing would risk photographing a DIFFERENT attached Android while still reporting
+  // success (the same failure class as #142).
+  target?: { host?: string; port?: number; useAdb?: boolean; serial?: string } | null;
   lastTarget?: { ip?: string; port?: number; useAdb?: boolean } | null;
   detail?: string;
 };
 
 /** The `target` keys the mirror above claims. Exported so the drift guard can compare them against
  *  the real interface without re-parsing this file's type declaration. */
-export const DEVICE_STATUS_TARGET_FIELDS = ['host', 'port', 'useAdb'] as const;
+export const DEVICE_STATUS_TARGET_FIELDS = ['host', 'port', 'useAdb', 'serial'] as const;
+
+// ── GET /api/device/list (#149) ───────────────────────────────────────────
+// A local mirror of the route's reply shape (`editorBackendRouter.ts`'s `/api/device/list` handler,
+// `DeviceClaim` from `deviceConnection.ts` § deviceClaims.ts) — same reason as `DeviceStatusReply`
+// above: this package cannot import backend types, so the fields are typed here rather than read
+// through an inline `as {…}` cast that could invent one.
+
+/** Who holds a device — machine-wide, across every clone on this Mac, read from
+ *  `~/.modoki/device-claims.json`. `clone` is the claiming checkout's absolute path (branch alone
+ *  repeats across machines); `deviceId` is namespaced (`adb:<serial>` / `ios:<udid>` / `ip:<host>`). */
+type DeviceListClaim = { deviceId: string; clone: string; branch: string; pid: number; guid?: string; at: number; label?: string; purpose?: string };
+
+type DeviceListReply = {
+  /** `name` is what the PHONE calls itself ("Galaxy A23 5G"); `model` is only ever the model CODE
+   *  ("SC_56C"), which is the string a human cannot match to a handset on the desk. Prefer `name`
+   *  wherever one is shown, and fall back to `model` — a device that would not answer has neither. */
+  android: Array<{ serial: string; state: string; model?: string; name?: string; transportId?: string; usable: boolean; claim: DeviceListClaim | null }>;
+  ios: Array<{ udid: string; name: string; connected: boolean; productType?: string; osVersion?: string; claim: DeviceListClaim | null }>;
+  /** Claims keyed by WiFi address (`ip:<host>`) — no hardware row exists for these, so they would be
+   *  invisible in either list above without being surfaced separately. */
+  otherClaims: DeviceListClaim[];
+  adb: { present: boolean; path?: string };
+  /** Present only when adb is absent — "no adb" and "no Android devices" are different problems
+   *  with different fixes, so this is a field, not folded into an empty `android` array. */
+  note?: string;
+};
 
 /** Which device the lease currently points at, as a comparable key ("adb" / "192.168.1.5:8095"),
  *  or null when nothing is connected.
@@ -219,10 +250,16 @@ async function resolveAdb(): Promise<string> {
   return 'adb'; // uncached: a later probe (once the SDK resolves) can still find the provisioned path
 }
 
-async function adbAvailable(): Promise<boolean> {
+/** True when adb will actually talk to the target device. With no `serial`, "some device is in the
+ *  usable `device` state" (the pre-#149 behaviour). With a `serial`, narrowed to THAT device —
+ *  otherwise a leased phone that was unplugged, with a DIFFERENT Android still attached, would read
+ *  as available and the capture below would silently photograph the wrong one. */
+async function adbAvailable(serial?: string): Promise<boolean> {
   try {
     const { stdout } = await pExecFile(await resolveAdb(), ['devices'], { timeout: 2000 });
-    return stdout.split('\n').some((l) => l.includes('\tdevice'));
+    return serial
+      ? stdout.split('\n').some((l) => l.startsWith(`${serial}\t`) && l.includes('\tdevice'))
+      : stdout.split('\n').some((l) => l.includes('\tdevice'));
   } catch { return false; }
 }
 
@@ -250,8 +287,15 @@ let capCounter = 0;
  *  `adb shell`). On macOS we downscale to a light JPEG with `sips`; elsewhere (Windows/Linux — no
  *  `sips`) we ship the full-resolution PNG straight from screencap, reading dims from the PNG header so
  *  no external image tool is needed. `base64` is computed only when `inline` is set (P2). */
-async function adbScreencap(savePath?: string, inline = false): Promise<{ path: string; base64: string; mimeType: string; bytes: number; imgW: number; imgH: number; nativeW: number; nativeH: number }> {
-  const { stdout: pngBuf } = (await pExecFile(await resolveAdb(), ['exec-out', 'screencap', '-p'],
+async function adbScreencap(savePath?: string, inline = false, serial?: string): Promise<{ path: string; base64: string; mimeType: string; bytes: number; imgW: number; imgH: number; nativeW: number; nativeH: number }> {
+  // `-s <serial>` (#149): with two Androids on USB a bare `adb exec-out` refuses outright
+  // ("more than one device/emulator") — but the FIX is not "pick one that answers", it is "target
+  // the one the LEASE is actually driving". `serial` therefore always comes from the caller reading
+  // `/api/device/status`'s `target.serial`, never resolved here (see the `DeviceStatusReply.target`
+  // comment above) — a locally-guessed serial could capture a different phone than the one every
+  // other device_* call is proxying through, and report success while doing it.
+  const argv = [...(serial ? ['-s', serial] : []), 'exec-out', 'screencap', '-p'];
+  const { stdout: pngBuf } = (await pExecFile(await resolveAdb(), argv,
     { timeout: 8000, encoding: 'buffer', maxBuffer: 32 * 1024 * 1024 })) as unknown as { stdout: Buffer };
   const native = pngDims(pngBuf);
 
@@ -305,6 +349,18 @@ async function leaseUsesAdb(): Promise<boolean> {
     const s = (await backendGet('/api/device/status')) as DeviceStatusReply;
     return s?.target?.useAdb === true;
   } catch { return false; }
+}
+
+/** `leaseUsesAdb()` plus the serial that goes with it (#149) — ONE status read rather than two,
+ *  because a lease that changed between two separate fetches (the human reconnecting mid-call)
+ *  could answer the two questions inconsistently. Used only by `device_screenshot`'s adb branch,
+ *  which is the one place that needs to hand a serial down to `adbAvailable`/`adbScreencap`; every
+ *  other adb gate in this file only needs the boolean and keeps using `leaseUsesAdb()` above. */
+async function leaseAdbTarget(): Promise<{ useAdb: boolean; serial?: string }> {
+  try {
+    const s = (await backendGet('/api/device/status')) as DeviceStatusReply;
+    return { useAdb: s?.target?.useAdb === true, serial: s?.target?.serial };
+  } catch { return { useAdb: false }; }
 }
 
 // ── Backend HTTP helpers ─────────────────────────────────────
@@ -481,13 +537,21 @@ export function registerTools(server: McpServer) {
   tool('device_connect',
     'Connect the editor to a device (open the Modoki lease) — the same action as the AI panel\'s ' +
       '"Connect a Device". Pass `ip` (WiFi — the IP shown in the game\'s debug menu → Device tab) or ' +
-      '`useAdb:true` (Android over USB via `adb forward`). With NEITHER, reconnects to the last target ' +
+      '`useAdb:true` (Android over USB via `adb forward`) — add `serial` when several Androids are ' +
+      'attached (device_list names them). With NEITHER ip nor useAdb, reconnects to the last target ' +
       'this clone used. `port` overrides the fixed 9095 when the app fell back to an OS-assigned one. ' +
       'Bounded (~6s); on failure it reports why (wrong IP / not same WiFi / not a Debug ' +
       'build / firewalled). Then device_* tools proxy through the lease.',
     {
       ip: z.string().optional().describe('Device LAN IP (WiFi). Omit when useAdb, or to reuse the last IP.'),
       useAdb: z.boolean().optional().describe('Android over USB via adb forward (ignores ip).'),
+      // #149: with only one Android attached the lease could already resolve it unambiguously, so
+      // this stays optional. Once a SECOND is plugged in, `useAdb:true` alone is no longer enough
+      // information to know which phone is meant — and the answer must be "refuse", never "pick
+      // one and hope", because a wrong pick would drive a device the caller never named while
+      // reporting success.
+      serial: z.string().optional()
+        .describe('Which Android when SEVERAL are attached over USB — the adb serial as listed by device_list. Only meaningful with useAdb:true (ignored otherwise). A serial matching nothing attached is an error, never a silent fall-through to a different phone.'),
       // The device port is a FIXED 9095 by design; this is the escape hatch for the fallback case.
       // When another Modoki app already holds 9095 the app you just launched binds an OS-assigned
       // port instead (#88) and is perfectly healthy — just unreachable at the default. The lease,
@@ -497,7 +561,7 @@ export function registerTools(server: McpServer) {
       port: z.number().int().positive().optional()
         .describe('Bound TCP port, when the app fell back off the default 9095 — read it from the device log ("TCP server listening on port N") or the in-game debug menu.'),
     },
-    async ({ ip, useAdb, port }) => {
+    async ({ ip, useAdb, serial, port }) => {
       try {
         // A new lease means the old device's screenshot scale is meaningless. `currentScreenInfo`
         // also catches this lazily (the human can reconnect from the AI panel without telling us),
@@ -506,6 +570,7 @@ export function registerTools(server: McpServer) {
         const s = (await backendPost('/api/device/connect', {
           ...(ip ? { ip } : {}),
           ...(useAdb !== undefined ? { useAdb } : {}),
+          ...(serial ? { serial } : {}),
           ...(port !== undefined ? { port } : {}),
         })) as LeaseStatus;
         if (s.state !== 'connected') {
@@ -519,6 +584,7 @@ export function registerTools(server: McpServer) {
               'the device app must be RUNNING and on the same network — check the IP in its debug menu',
               'for Android over USB pass useAdb:true instead of an ip',
               'another clone may already hold the lease — device_status says who',
+              'several devices attached — pass serial (device_list names them)',
             ],
           });
         }
@@ -539,6 +605,61 @@ export function registerTools(server: McpServer) {
         return { content: [{ type: 'text' as const, text: describeLease((await backendPost('/api/device/disconnect', {})) as LeaseStatus) }] };
       } catch (e) {
         return caughtFailure('device_disconnect', 'release the Modoki device lease', e);
+      }
+    },
+  );
+
+  // ── List (#149) ──────────────────────────────────────────────
+  // Answers what device_status cannot: what ELSE is attached (device_status only ever describes the
+  // ONE device the lease holds, if any), and who else on this machine already claims it. A claim is
+  // machine-wide across all four clones — reading only this MCP's own lease would miss a device
+  // another session is mid-connect to, or mid-install on, with no socket held yet to show up as a
+  // lease at all.
+
+  tool('device_list',
+    'Enumerate every Android/iOS device this Mac can currently see (adb + xcrun devicectl), and who ' +
+      'already CLAIMS each one — a claim is machine-wide across every clone, not just this session\'s ' +
+      'lease, so a serial that looks free in device_status may already be someone\'s. Use this before ' +
+      'device_connect when more than one device of a platform is attached, and pass the serial it ' +
+      'names to device_connect\'s `serial` param to pick the right one.',
+    {},
+    async () => {
+      try {
+        const r = (await backendGet('/api/device/list')) as DeviceListReply;
+        const claimSuffix = (c: DeviceListClaim | null) =>
+          c ? ` — CLAIMED by ${c.clone} (${c.branch})${c.purpose ? `, ${c.purpose}` : ''}` : '';
+        const lines: string[] = [];
+        if (!r.adb.present) {
+          lines.push(`adb: not found${r.note ? ` — ${r.note}` : ''}. Android devices below cannot be listed.`);
+        }
+        if (r.android.length) {
+          lines.push('Android:');
+          for (const d of r.android) {
+            const state = d.usable ? '' : ` [${d.state}]`; // only 'device' is usable — say WHY when it isn't
+            const label = d.name ?? d.model;
+            lines.push(`  ${d.serial}${label ? ` (${label})` : ''}${state}${claimSuffix(d.claim)}`);
+          }
+        }
+        if (r.ios.length) {
+          lines.push('iOS:');
+          for (const d of r.ios) {
+            const conn = d.connected ? '' : ' [not connected]';
+            lines.push(`  ${d.name} (${d.udid})${d.productType ? ` — ${d.productType}` : ''}${conn}${claimSuffix(d.claim)}`);
+          }
+        }
+        if (r.otherClaims.length) {
+          lines.push('WiFi claims (no hardware attached to this Mac — claimed by address):');
+          for (const c of r.otherClaims) lines.push(`  ${c.deviceId}${claimSuffix(c)}`);
+        }
+        // Say it plainly rather than leaving the reader to infer "nothing" from a run of headers
+        // that never printed — three empty sections in a row reads like a broken tool, not a quiet
+        // desk.
+        if (r.android.length === 0 && r.ios.length === 0 && r.otherClaims.length === 0) {
+          lines.push(r.adb.present ? 'No devices attached, and no claims on record.' : 'No devices could be checked, and no claims on record.');
+        }
+        return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+      } catch (e) {
+        return caughtFailure('device_list', 'enumerate attached devices and their claims', e);
       }
     },
   );
@@ -932,8 +1053,13 @@ export function registerTools(server: McpServer) {
         // Android over adb: full framebuffer via adb (captures the WebGL/WebGPU canvas the native path
         // can't). ONLY when the LEASE itself is the adb device (F2) — never just because some Android
         // is on USB, which would screenshot the wrong device when the lease is a WiFi iPhone.
-        if (await leaseUsesAdb() && await adbAvailable()) {
-          const cap = await adbScreencap(savePath, inline);
+        // `serial` (#149) is the lease's OWN resolved serial, read off the same status reply that
+        // decides `useAdb` — targeting the capture at it is what keeps two Androids on USB from
+        // erroring outright ("more than one device/emulator") or, worse, silently capturing whichever
+        // one adb feels like answering with.
+        const adbTarget = await leaseAdbTarget();
+        if (adbTarget.useAdb && await adbAvailable(adbTarget.serial)) {
+          const cap = await adbScreencap(savePath, inline, adbTarget.serial);
           adbScreenInfo = { imgW: cap.imgW, imgH: cap.imgH, nativeW: cap.nativeW, nativeH: cap.nativeH, lease: (await leaseKey()) ?? 'adb' };
           // Same VITEST guard as `renderScreenshot` — this branch needs adb + an adb lease, so no
           // test reaches it TODAY, but it is the identical defect and one adb-path test away from

@@ -43,7 +43,7 @@
  */
 
 import { execFileSync } from 'child_process';
-import { adbBinary } from './deviceConnection';
+import { adbArgs, adbBinary } from './androidDevices';
 
 import {
   decodeAimReply, resolveAimViaDevice, STALE_APP_REASON,
@@ -144,14 +144,14 @@ export interface DeviceCdpTarget {
 /** adb calls behind an overridable seam (mirrors `adbRunner` in deviceConnection.ts) so discovery
  *  is unit-testable without a real device. */
 export const deviceCdpAdb = {
-  listUnixSockets(): string {
-    return execFileSync(adbBinary(), ['shell', 'cat', '/proc/net/unix'], { timeout: 4000, encoding: 'utf8' });
+  listUnixSockets(serial?: string): string {
+    return execFileSync(adbBinary(), adbArgs(serial, ['shell', 'cat', '/proc/net/unix']), { timeout: 4000, encoding: 'utf8' });
   },
-  forward(localPort: number, socketName: string): void {
-    execFileSync(adbBinary(), ['forward', `tcp:${localPort}`, `localabstract:${socketName}`], { timeout: 4000, stdio: 'pipe' });
+  forward(localPort: number, socketName: string, serial?: string): void {
+    execFileSync(adbBinary(), adbArgs(serial, ['forward', `tcp:${localPort}`, `localabstract:${socketName}`]), { timeout: 4000, stdio: 'pipe' });
   },
-  removeForward(localPort: number): void {
-    execFileSync(adbBinary(), ['forward', '--remove', `tcp:${localPort}`], { timeout: 4000, stdio: 'pipe' });
+  removeForward(localPort: number, serial?: string): void {
+    execFileSync(adbBinary(), adbArgs(serial, ['forward', '--remove', `tcp:${localPort}`]), { timeout: 4000, stdio: 'pipe' });
   },
 };
 
@@ -164,9 +164,9 @@ export const deviceCdpAdb = {
  *  on any failure (no adb, no device, no matching socket, port already in another use): the
  *  caller (`getDeviceCdpSession`) treats `null` as "no trusted route available", which is exactly
  *  the fallback-to-synthetic signal, not an error to surface. */
-export async function discoverDeviceCdpTarget(opts: { localPort: number; preferPackage?: string }): Promise<DeviceCdpTarget | null> {
+export async function discoverDeviceCdpTarget(opts: { localPort: number; preferPackage?: string; serial?: string }): Promise<DeviceCdpTarget | null> {
   try {
-    const sockets = parseWebviewSockets(deviceCdpAdb.listUnixSockets());
+    const sockets = parseWebviewSockets(deviceCdpAdb.listUnixSockets(opts.serial));
     if (sockets.length === 0) return null;
 
     // With a preference, try every candidate (in discovery order) until one's package matches;
@@ -176,7 +176,7 @@ export async function discoverDeviceCdpTarget(opts: { localPort: number; preferP
 
     for (const sock of sockets) {
       try {
-        deviceCdpAdb.forward(opts.localPort, sock.name);
+        deviceCdpAdb.forward(opts.localPort, sock.name, opts.serial);
         const version = await httpGetJson<JsonVersion>(`http://127.0.0.1:${opts.localPort}/json/version`);
         const pkg = version['Android-Package'];
         if (opts.preferPackage && pkg !== opts.preferPackage) continue;
@@ -344,6 +344,12 @@ let cachedSession: DeviceCdpSession | null = null;
 /** The `Android-Package` the cached session was discovered FOR — the cache key that makes
  *  `preferPackage` meaningful across calls (#142). Null when discovery reported no package. */
 let cachedPackage: string | null = null;
+/** The adb SERIAL the cached session was discovered through (#149) — a second cache key, for the
+ *  same reason `cachedPackage` is one. The `Android-Package` cannot stand in for it: two phones
+ *  running the SAME app (the ordinary case when testing a build on two handsets) report an identical
+ *  package, so a session discovered against phone A would satisfy a `preferPackage` check made by a
+ *  lease holding phone B and drive the wrong device while reporting trusted input. */
+let cachedSerial: string | null = null;
 let inFlight: Promise<DeviceCdpSession | null> | null = null;
 
 /** Get a live CDP session — reusing the cached one when it's still open, else discovering +
@@ -355,32 +361,40 @@ let inFlight: Promise<DeviceCdpSession | null> | null = null;
  *  HERE rather than injected per call site because the router deliberately does not thread a
  *  `getSession` through — and the thing #142's tests must observe is precisely whether the router
  *  reaches this function at all, and with which `preferPackage`. Never set in production. */
-let sessionProbeForTests: ((opts: { preferPackage?: string }) => Promise<DeviceCdpSession | null>) | null = null;
+let sessionProbeForTests: ((opts: CdpSessionOpts) => Promise<DeviceCdpSession | null>) | null = null;
 
 /** Test-only. Pass null to restore real discovery. */
 export function _setDeviceCdpSessionProbeForTests(
-  fn: ((opts: { preferPackage?: string }) => Promise<DeviceCdpSession | null>) | null,
+  fn: ((opts: CdpSessionOpts) => Promise<DeviceCdpSession | null>) | null,
 ): void { sessionProbeForTests = fn; }
 
-export async function getDeviceCdpSession(opts: { preferPackage?: string } = {}): Promise<DeviceCdpSession | null> {
+/** What identifies the session a caller needs: WHICH app (`preferPackage`, #142) and WHICH phone
+ *  (`serial`, #149). Both are cache keys — see `cachedSerial` for why the package alone is not
+ *  enough once two handsets run the same build. */
+export interface CdpSessionOpts { preferPackage?: string; serial?: string }
+
+export async function getDeviceCdpSession(opts: CdpSessionOpts = {}): Promise<DeviceCdpSession | null> {
   if (sessionProbeForTests) return sessionProbeForTests(opts);
   // A cache hit must still satisfy the CALLER's package requirement (#142). The cache used to be
   // consulted before `preferPackage` was looked at, so a session discovered by an earlier
   // unconstrained call was handed to a later constrained one — silently defeating the identity
   // check that exists to stop input reaching the wrong app/device. Mismatch ⇒ drop and rediscover.
-  if (cachedSession && !cachedSession.isClosed()
-      && (!opts.preferPackage || cachedPackage === opts.preferPackage)) return cachedSession;
-  if (cachedSession && opts.preferPackage && cachedPackage !== opts.preferPackage) resetDeviceCdpSession();
+  // The serial (#149) is keyed the same way and for the same reason, one device down.
+  const satisfies = (!opts.preferPackage || cachedPackage === opts.preferPackage)
+    && (!opts.serial || cachedSerial === opts.serial);
+  if (cachedSession && !cachedSession.isClosed() && satisfies) return cachedSession;
+  if (cachedSession && !satisfies) resetDeviceCdpSession();
   if (!inFlight) {
     inFlight = (async () => {
       try {
         const localPort = resolveDeviceCdpPort();
-        const target = await discoverDeviceCdpTarget({ localPort, preferPackage: opts.preferPackage });
+        const target = await discoverDeviceCdpTarget({ localPort, preferPackage: opts.preferPackage, serial: opts.serial });
         if (!target) return null;
         const session = await DeviceCdpSession.connect(target.webSocketDebuggerUrl);
-        session.onClose(() => { if (cachedSession === session) { cachedSession = null; cachedPackage = null; } });
+        session.onClose(() => { if (cachedSession === session) { cachedSession = null; cachedPackage = null; cachedSerial = null; } });
         cachedSession = session;
         cachedPackage = target.androidPackage ?? null;
+        cachedSerial = opts.serial ?? null;
         return session;
       } catch {
         return null;
@@ -398,6 +412,7 @@ export function resetDeviceCdpSession(): void {
   cachedSession?.close();
   cachedSession = null;
   cachedPackage = null;
+  cachedSerial = null;
   inFlight = null;
 }
 
@@ -471,8 +486,12 @@ export function synthFallbackBanner(reason: string): string {
 export interface CdpRouteDeps {
   proxy(method: string, params: Record<string, unknown>): Promise<unknown>;
   preferPackage?: string;
+  /** The adb serial the LEASE resolved (#149) — so discovery targets the phone the lease is holding
+   *  rather than whichever one adb lists first. Undefined reproduces the old behaviour and is only
+   *  correct with exactly one device attached. */
+  serial?: string;
   /** Overridable for tests. Defaults to the real `getDeviceCdpSession`. */
-  getSession?: (opts: { preferPackage?: string }) => Promise<DeviceCdpSession | null>;
+  getSession?: (opts: CdpSessionOpts) => Promise<DeviceCdpSession | null>;
 }
 
 /** Route ONE device-input method through CDP. Returns the same string shape the in-page synthetic
@@ -492,7 +511,7 @@ export async function tryDeviceCdpInput(method: string, params: Record<string, u
     return { handled: false, reason: DEVICE_INPUT_METHODS.has(method) ? NOT_ROUTED_REASON : null };
   }
   const getSession = deps.getSession ?? getDeviceCdpSession;
-  const session = await getSession({ preferPackage: deps.preferPackage });
+  const session = await getSession({ preferPackage: deps.preferPackage, serial: deps.serial });
   if (!session) return { handled: false, reason: NO_SESSION_REASON };
 
   // How many CDP events actually LANDED. The distinction matters and a boolean set before the call
@@ -587,10 +606,10 @@ export async function tryDeviceCdpInput(method: string, params: Record<string, u
  *  `proxy` is optional so a caller with no lease can still ask the cheap question; without it this
  *  reports only whether a SESSION exists, and callers that can reach the device should pass it. */
 export async function isDeviceCdpAvailable(
-  opts: { preferPackage?: string; getSession?: CdpRouteDeps['getSession']; proxy?: CdpRouteDeps['proxy'] } = {},
+  opts: { preferPackage?: string; serial?: string; getSession?: CdpRouteDeps['getSession']; proxy?: CdpRouteDeps['proxy'] } = {},
 ): Promise<boolean> {
   const getSession = opts.getSession ?? getDeviceCdpSession;
-  const session = await getSession({ preferPackage: opts.preferPackage });
+  const session = await getSession({ preferPackage: opts.preferPackage, serial: opts.serial });
   if (!session) return false;
   if (!opts.proxy) return true;
   try {

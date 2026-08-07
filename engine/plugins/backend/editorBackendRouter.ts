@@ -170,10 +170,12 @@ import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type Muta
 import { getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData, type AssetSchemaType } from '../../packages/modoki/src/runtime/assets/assetSchemas';
 import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
+import { adbBinary, isUsable, listAndroidDevices, withFriendlyNames } from './androidDevices';
+import { adbDeviceId, iosDeviceId, listClaims, type DeviceClaim } from './deviceClaims';
 import { tryDeviceCdpInput, isDeviceCdpAvailable, synthFallbackBanner, TRUSTED_CDP_MECHANISM } from './deviceCdp';
 import { tryDeviceWdaInput, isDeviceWdaAvailable, resetDeviceWdaSession, tryDeviceWdaScreenshot, TRUSTED_WDA_MECHANISM, WDA_NOT_IOS_REASON, NO_WDA_ON_THIS_DEVICE } from './deviceWda';
 import { isDeviceFailureReply } from './deviceAim';
-import { stopWda } from './wdaLauncher';
+import { listIosDevicesForSelection, stopWda } from './wdaLauncher';
 import { resolveModules } from '../detect-modules';
 // Type-only — erased at runtime, so it does NOT pull the tree-shaker (and its
 // vite-asset-scanner import) into this host-agnostic router.
@@ -680,7 +682,14 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     // the input route is (#142) — a status read that says `trusted-cdp` for an iOS lease is the
     // same lie, and it is the one an agent consults BEFORE deciding whether to trust its input.
     if (await deviceConnection.devicePlatform() === 'android'
-        && await isDeviceCdpAvailable({ proxy, preferPackage: (await deviceConnection.deviceAppId()) ?? undefined })) {
+        && await isDeviceCdpAvailable({
+          proxy,
+          preferPackage: (await deviceConnection.deviceAppId()) ?? undefined,
+          // The phone the LEASE resolved (#149). Without it, discovery on a two-handset Mac can
+          // find a webview on the OTHER device and report `trusted-cdp` for a lease that is not
+          // holding it — the same class as #142, one device down instead of one app.
+          ...(status.target?.serial ? { serial: status.target.serial } : {}),
+        })) {
       return json({ ...status, inputMechanism: TRUSTED_CDP_MECHANISM });
     }
     // #32 Phase 2 — an iOS device has no CDP route but may have WebDriverAgent. Reported honestly:
@@ -695,9 +704,52 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     }
     return json({ ...status, inputMechanism: 'synthetic' });
   }
+  // ── GET /api/device/list ── which devices could this Mac drive, and who already holds them (#149).
+  // Answers the two questions the device surface could not answer before: "which phone do you mean?"
+  // (several of the same platform attached) and "is anyone else already using it?" (four clones on
+  // one machine). Read-only — listing never claims anything.
+  //
+  // Both platforms in ONE reply because the caller's question is "what can I connect to", not "what
+  // Androids are there": an agent choosing a target should see that the iPhone it wants is held by
+  // a sibling clone without having to know to ask a second endpoint.
+  if (urlPath === '/api/device/list' && method === 'GET') {
+    const claims = listClaims();
+    const claimFor = (id: string): DeviceClaim | undefined => claims.find((c) => c.deviceId === id);
+    // adb absence is reported as a FIELD, not an error: "no Android devices" and "no adb installed"
+    // are different problems with different fixes, and collapsing them sends the human to look at
+    // the cable when the SDK is what is missing.
+    let adbPath: string | null = null;
+    try { adbPath = adbBinary(); } catch { /* not installed — reported below */ }
+    const android = (adbPath ? withFriendlyNames(listAndroidDevices()) : []).map((d) => ({
+      ...d,
+      usable: isUsable(d),
+      claim: claimFor(adbDeviceId(d.serial)) ?? null,
+    }));
+    // iOS listing is macOS-only and can be slow (two `xcrun` shell-outs, each bounded at 20s), so it
+    // is skipped entirely off-Mac rather than failing — the same platform gate the WDA launcher uses.
+    const ios = process.platform === 'darwin'
+      ? listIosDevicesForSelection().map((d) => ({ ...d, claim: claimFor(iosDeviceId(d.udid)) ?? null }))
+      : [];
+    // A WiFi lease claims by ADDRESS, so its claim matches no hardware entry above. Surfaced
+    // separately rather than dropped: "someone holds 192.168.1.42" is exactly the collision a
+    // second session needs to see, and it is invisible in either hardware list.
+    const otherClaims = claims.filter((c) => c.deviceId.startsWith('ip:'));
+    return json({
+      android,
+      ios,
+      otherClaims,
+      adb: { present: !!adbPath, ...(adbPath ? { path: adbPath } : {}) },
+      // WHO IS ASKING. Without it a reader cannot tell its OWN claim from a sibling clone's — and
+      // the reader's own claim is the common case (this editor is holding the lease right now), so
+      // a picker would render the very device you are connected to as "held by someone" and refuse
+      // to select it. `clone`+`pid` are the two fields a claim carries that identify a holder.
+      self: { clone: process.cwd(), pid: process.pid },
+      ...(adbPath ? {} : { note: 'adb is not installed, so Android devices cannot be listed — install the Android SDK from Build Support (or set ANDROID_HOME).' }),
+    });
+  }
   if (urlPath === '/api/device/connect' && method === 'POST') {
     const b = (body ?? {}) as ConnectRequest;
-    try { return json(await deviceConnection.connect({ ip: b.ip, useAdb: b.useAdb, port: b.port })); }
+    try { return json(await deviceConnection.connect({ ip: b.ip, useAdb: b.useAdb, port: b.port, serial: b.serial })); }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 500); }
   }
   if (urlPath === '/api/device/disconnect' && method === 'POST') {
@@ -801,9 +853,14 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // non-Android device — caught by two existing tests. Routing the gate through `getSession`
       // reuses tryDeviceCdpInput's reason logic verbatim instead of restating it here.
       const isAndroid = await deviceConnection.devicePlatform() === 'android';
+      // ONE status read, not one per field: `status()` is a snapshot, and reading it twice inside a
+      // single dispatch could straddle a reconnect and answer the two halves from different leases.
+      const leasedSerial = deviceConnection.status().target?.serial;
       let outcome = await tryDeviceCdpInput(b.method, b.params ?? {}, {
         proxy,
         preferPackage: (await deviceConnection.deviceAppId()) ?? undefined,
+        // Target the leased phone, not whichever adb lists first (#149).
+        ...(leasedSerial ? { serial: leasedSerial } : {}),
         ...(isAndroid ? {} : { getSession: async () => null }),
       });
       // #32 Phase 2: no CDP route (an iOS device, or an Android one without adb) ⇒ try

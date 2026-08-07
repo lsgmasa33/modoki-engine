@@ -49,7 +49,13 @@ describe('device MCP status mirror vs DeviceConnectStatus', () => {
 
   it('does not claim the fields two dead guards used to invent', () => {
     // Named explicitly so a re-introduction is unmistakable rather than just an array diff.
-    for (const invented of ['platform', 'serial', 'deviceId']) {
+    //
+    // `serial` used to be on this list and is deliberately OFF it now (#149): the payload really
+    // carries `target.serial` — the adb device the lease resolved at connect time — so a helper
+    // reading it is no longer inventing anything. It is exactly the field `leaseKey()` wished for
+    // in this file's header, finally made real rather than assumed. The structural check above is
+    // what keeps that honest; this list stays for the two fields that are still fiction.
+    for (const invented of ['platform', 'deviceId']) {
       expect(
         [...DEVICE_STATUS_TARGET_FIELDS],
         `target.${invented} does not exist on DeviceConnectStatus — a guard reading it can never fire`,

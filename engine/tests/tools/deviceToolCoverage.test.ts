@@ -30,9 +30,19 @@ const NOT_DATA_PLANE: Record<string, string> = {
   device_status: 'control plane — reads the lease itself via /api/device/status',
   device_connect: 'control plane — opens the lease via /api/device/connect',
   device_disconnect: 'control plane — closes the lease via /api/device/disconnect',
+  device_list: 'control plane — enumerates ATTACHED hardware (and who claims it) via /api/device/list, which is answerable with no lease open at all; it is the tool you call precisely because you do not yet know which device to lease (#149)',
   device_screenshot: 'may use the adb side channel: an Android WebView composites WebGPU in a separate GPU surface, so the device-side captureScreen returns a BLACK frame and only `adb screencap` sees the real one',
-  device_native_logs: 'reads logcat/idevicesyslog through adb — there is no device-side op for it',
 };
+// `device_native_logs` USED to be exempted here, with the reason "reads logcat/idevicesyslog
+// through adb — there is no device-side op for it". That was false in both halves: it calls
+// `deviceRequest('nativeLogs', …)`, and the device reads logcat IN-PROCESS (`app/debug/bridge.ts`
+// § nativeLogs), so it is ordinary data plane and always was. Found sweeping for un-targeted adb
+// call sites (#149): the exemption described a seventh adb site that does not exist.
+//
+// The cost was not the wrong sentence, it was the exemption it justified — being outside the loop,
+// NOTHING asserted that this tool proxies through the lease, so it could have quietly grown a real
+// adb side channel (bypassing the lease's device identity, the exact #142 class) and no test would
+// have objected. A guard weakened by a premise nobody rechecks is this repo's recurring failure.
 
 /** The smallest VALID call per tool — the ergonomic form, same rule as the editor table's
  *  `minimalArgs`. Explicit rather than synthesized: a synthesized aim (`{x:1,y:2}`) would trip the
@@ -41,6 +51,7 @@ const MINIMAL: Record<string, Record<string, unknown>> = {
   device_status: {},
   device_connect: { useAdb: true },
   device_disconnect: {},
+  device_list: {},
   device_get_scene_state: {},
   device_diagnose: {},
   device_journal: {},
@@ -131,8 +142,8 @@ describe('device tool surface — every tool, table-driven', () => {
   });
 
   it('device_native_logs also fails on an `Error: …` reply (it is outside the loop above)', async () => {
-    // Exempt from the data-plane loop because it can take the adb side channel — so it needs its own
-    // assertion, or the fix that gave it `isDeviceError` would have nothing watching it. Without the
+    // Kept as its OWN assertion even now that the loop covers this tool's routing: the loop proves
+    // it reaches the lease, and this proves it treats an `Error: …` REPLY as a failure. Without the
     // check the error string was String()'d straight into the payload and read as log CONTENT.
     const s = (surface = await loadDeviceSurface((req) =>
       req.path === '/api/device/request' ? deviceReply('Error: logcat unavailable') : undefined));

@@ -221,6 +221,45 @@ now covers device ops too, and manual IP deletes discovery entirely — nothing 
 reliable path; IP field disabled) vs. the typed IP over WiFi. iOS is always WiFi/IP. Same lease/GUID
 protocol rides either transport — only the socket target differs.
 
+### Several phones attached: which one, and who has it (#149)
+
+Two questions, one mechanism each. `device_list` answers both in one call — attached Androids
+(`adb devices -l`), paired iPhones (`devicectl` + the legacy `xctrace` listing), and who holds each.
+
+**Which one — the serial is resolved ONCE, at connect, and carried on the lease.** Every adb call on
+this surface used to be un-targeted, which is fine with one phone and fails outright with two: adb
+answers `more than one device/emulator` and refuses, taking out `device_connect {useAdb:true}`,
+trusted Android input (CDP discovery is an adb call) and `device_screenshot` together. Now
+`device_connect {useAdb:true, serial:"…"}` — or the AI panel's device picker — resolves one serial and
+puts it on `status.target.serial`; the CDP tunnel and the adb screenshot **reuse that**, and must
+never resolve one of their own. That ordering is the load-bearing part: two calls in one session that
+each picked a device could drive two different phones and both report success (the #142 failure, one
+device down). Precedence, and the refusal that names every candidate, is documented on
+`resolveAndroidSerial` in `engine/plugins/backend/androidDevices.ts`; `MODOKI_ANDROID_SERIAL` (and
+adb's own `ANDROID_SERIAL`) pin it, and the panel remembers your last pick per clone.
+
+**Devices are named by what the PHONE calls itself, not by its model code.** `adb devices -l` reports
+only `model:` — `SC_56C`, `SM_S901U1`, `MRD_LX3` — which is precisely the string that fails to tell
+three handsets on a desk apart. So the listing asks each phone once (one `adb shell`, memoized per
+serial for the process): `settings get global device_name` → `secure bluetooth_name` →
+`ro.config.marketing_name` → `ro.product.marketname`, taking the first answer that is not the model
+code again. Measured on this Mac's three, and each step earns its place: the Samsungs answer
+`Galaxy A23 5G` / `Masaki Android` from `device_name` with **every marketing-name prop empty** (so
+"just read the marketing prop" does not work), while the Huawei's `device_name` IS its model code and
+only `bluetooth_name` gives `HUAWEI Y6 2019`. A renamed phone reports the owner's own name for it,
+which is better than the marketing one. It is a LABEL, never an identity — the serial addresses
+everything.
+
+**Who has it — a machine-wide claim, because the lease cannot reach this.** The lease arbitrates the
+SOCKET and does it well, but adb is one machine-wide daemon, an `xcodebuild` install needs no socket,
+and a WDA launch targets a phone by UDID — so two clones could (and did) drive one phone unimpeded.
+`~/.modoki/device-claims.json` sits beside `editor-launches.log`, machine-wide **for the same reason
+that log is**: the sibling that caused the collision is exactly what a per-clone file cannot see. A
+claim is taken by the lease (`connect`) and by the WDA launch, released on `disconnect`/`stopWda`, and
+expired by **pid liveness plus a 12h TTL** — a dead session must never hold hardware hostage. A
+refusal names the clone, branch, pid and time. Rationale in `engine/plugins/backend/deviceClaims.ts`;
+this replaces the unenforced "serialize on-device builds" convention in the root `CLAUDE.md`.
+
 ## Editor debugging — DEFAULT to Electron (modoki MCP)
 
 **The editor is shipped as the Electron desktop app, so debug it there by default.** Use the

@@ -26,6 +26,7 @@ import { spawn, execFileSync, type ChildProcess } from 'child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { claimDevice, iosDeviceId, releaseDevice } from './deviceClaims';
 import { wdaBaseDir } from '../../toolchain';
 import { findXctestrun, wdaDerivedDataDir } from '../../toolchain/wdaProvision';
 
@@ -170,6 +171,40 @@ export const wdaLauncherExec = {
   },
 };
 
+/** Every iOS device this Mac could target, both listings merged (#149) — the read behind
+ *  `/api/device/list`'s iOS half and the AI panel's device picker.
+ *
+ *  Shares `mergeIosDevices` + both parses with the launcher's own selection so the list a human
+ *  picks from and the list `resolveIosDevice` chooses within can never disagree — a picker offering
+ *  a device the launcher would then refuse to use is worse than no picker. Shells out twice
+ *  (`devicectl`, then `xctrace`), each already bounded; returns `[]` rather than throwing, since a
+ *  listing that cannot be produced is "none visible", not an error the caller can act on.
+ *
+ *  macOS-only in practice — both commands are `xcrun`. The caller gates on the platform. */
+export function listIosDevicesForSelection(): IosDevice[] {
+  const now = Date.now();
+  if (iosListCache && now - iosListCache.at < IOS_LIST_TTL_MS) return iosListCache.devices;
+  let primary: IosDevice[] = [];
+  try { primary = parseIosDevices(wdaLauncherExec.listDevices()); } catch { /* no Xcode / devicectl */ }
+  const devices = mergeIosDevices(primary, parseXctraceDevices(wdaLauncherExec.listLegacyDevices()));
+  iosListCache = { at: now, devices };
+  return devices;
+}
+
+/** Briefly cached, because this is TWO `xcrun` shell-outs and the AI panel's device picker polls
+ *  the listing every 2.5s — measured at ~1.6-2.9s per uncached call, i.e. the poll would never stop
+ *  paying for itself and would keep two `xcrun` processes almost permanently resident.
+ *
+ *  Short (10s), not memoized like the Android name cache: the set of PAIRED iPhones genuinely
+ *  changes when someone plugs a phone in, and a picker that cannot see a just-connected device is
+ *  the same "why isn't it listed" confusion this whole feature exists to remove. Ten seconds is
+ *  below the threshold where a human re-checks, and four polls out of five now cost nothing. */
+const IOS_LIST_TTL_MS = 10_000;
+let iosListCache: { at: number; devices: IosDevice[] } | null = null;
+
+/** Test seam — drop the cached listing so a test can change what `xcrun` reports. */
+export function _clearIosListCache(): void { iosListCache = null; }
+
 /** What the LEASED device reports about its own hardware, for tying the launch to it (#146).
  *  Either field may be null — see `resolveIosDevice` for what that means.
  *
@@ -301,6 +336,9 @@ let stderrTail: string[] = [];
  *  message about this launch, because "we guessed which phone" stays true for as long as the agent
  *  runs — and a launch that then works would otherwise never mention it again. */
 let launchWarning: string | null = null;
+/** The machine-wide hardware claim this launch holds (#149), so `stopWda` hands back exactly what
+ *  the launch took. Null when no agent is running. */
+let claimedUdid: string | null = null;
 
 /** How much of the child's stderr to keep. Both bounds matter: a test runner can emit megabytes,
  *  and one line of it can itself be enormous. */
@@ -382,6 +420,14 @@ export function stopWda(): void {
   child = null;
   launchStartedAt = null;
   lastFailure = null;
+  // Hand the phone back (#149). Done here rather than on the child's `exit` because THIS is the
+  // point the device is genuinely free: an agent that exited on its own is about to be relaunched
+  // by the next input op, and releasing the claim in between would let a sibling clone take the
+  // device out from under a live session.
+  if (claimedUdid) {
+    try { releaseDevice(claimedUdid); } catch { /* an unwritable claims file must never block a stop */ }
+    claimedUdid = null;
+  }
   // The warning describes the launch we just ended; carrying it into the NEXT one would attach a
   // stale "could not verify" caveat to a launch that may well be verified. Same reasoning as
   // `launchStartedAt`. `stderrTail` is deliberately NOT cleared: the diagnosis is wanted after the
@@ -546,6 +592,25 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
       + 'If input is landing on the wrong phone, set MODOKI_IOS_DEVICE_UDID.'
     : null;
   if (launchWarning) console.warn(`[wda] ${launchWarning}`);
+
+  // Claim the PHONE before spawning an agent on it (#149 part 2). `wdaLauncher` already guards
+  // against a second launch by THIS process (`child` above); what it could not see is a second
+  // CLONE spawning a rival signed agent on the same device — two agents fighting over port 8100 on
+  // one phone, with neither session aware of the other. The claim is machine-wide, so it can.
+  //
+  // Refusing here is safe by construction: a failed launch is never fatal on this surface (the
+  // module header — input degrades to synthetic with the loud banner), so the caller already
+  // handles "no agent" and now gets a reason that names the clone holding the device.
+  const claim = claimDevice({
+    deviceId: iosDeviceId(resolved.device.udid),
+    label: resolved.device.name,
+    purpose: 'running WebDriverAgent',
+  });
+  if (!claim.ok) {
+    lastFailure = `cannot start WebDriverAgent — ${claim.message}`;
+    return { running: false, reason: lastFailure };
+  }
+  claimedUdid = iosDeviceId(resolved.device.udid);
 
   // Spawn detached-ish: we keep the handle so `stopWda` can end it with the lease. stdout stays
   // discarded — a test runner's log is not something an input op should stream — but stderr is

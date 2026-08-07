@@ -16,6 +16,7 @@ import { resolveModules } from './detect-modules';
 import { findGamesEntry } from './findGamesEntry';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './backend/gcloud';
 import { projectAssetRoots } from '../scripts/projectRoots.mjs';
+import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
 import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, wdaTeamId, writeToolchainSettings, type BuildTarget, type ToolId } from '../toolchain';
 import { registerReimportHandler, type ReimportContext } from './reimport-registry';
 import { textureReimportHandler } from './reimport-texture';
@@ -1793,7 +1794,21 @@ export function assetScannerPlugin(): Plugin {
           // word-splits → `bash: /Users/…/Library/Application: No such file or directory`. The
           // `-s <serial>` flag stays outside the quotes (serials are [A-Za-z0-9._:-], no spaces).
           const adbBin = JSON.stringify(detectAdb().path ?? 'adb');
-          const adb = user.device.androidDeviceId ? `${adbBin} -s ${user.device.androidDeviceId}` : adbBin;
+          // WHICH phone, when several are attached (#149). The project pin still wins — it is
+          // explicit config the human typed in Project Settings — but an UNPINNED project no longer
+          // falls through to a bare `adb`: with two handsets on USB that install failed with adb's
+          // own `more than one device/emulator` and no hint that a pin even existed. `androidSerialError`
+          // is carried to the Android preflight gate below rather than thrown here, so it surfaces
+          // as a friendly named-candidates failure alongside every other missing-prerequisite, and
+          // so it can never break a WEB or iOS build that has no business consulting adb at all.
+          let androidSerialError: string | null = null;
+          let androidSerial = user.device.androidDeviceId;
+          if (platform === 'android') {
+            const picked = resolveBuildAndroidSerial(listAndroidDevices(), { projectPin: user.device.androidDeviceId });
+            if ('error' in picked) androidSerialError = picked.error;
+            else androidSerial = picked.serial;
+          }
+          const adb = androidSerial ? `${adbBin} -s ${androidSerial}` : adbBin;
           // JAVA_HOME / ANDROID_HOME come from the SHARED toolchain (an explicit user.sdk override,
           // else `detect()`), resolved in JS and injected into the gradle step's spawn `env` (NOT a
           // bash `export` prefix — that's bash-only, and would SHADOW the shared detection with a
@@ -2163,6 +2178,16 @@ export function assetScannerPlugin(): Plugin {
           if (missingTools.length) {
             send(`[build] Missing build tool(s) for ${platform}:\n${missingTools.map((t) => `  • ${t.id}: ${t.message}`).join('\n')}`);
             sendStatus(`FAILED:Missing ${platform} build tool(s) — see log`);
+            res.end();
+            return;
+          }
+          // Which Android to install onto (#149) — refused HERE, in the same place as every other
+          // unmet prerequisite, so it costs no gradle build first. The message names the attached
+          // candidates and how to pin one; see `resolveBuildAndroidSerial`.
+          if (androidSerialError) {
+            send(`[build] Cannot choose an Android device: ${androidSerialError}\n`
+              + '  • Pin one in Project Settings → Device → "Android serial", or unplug the others.');
+            sendStatus('FAILED:Cannot choose an Android device — see log');
             res.end();
             return;
           }

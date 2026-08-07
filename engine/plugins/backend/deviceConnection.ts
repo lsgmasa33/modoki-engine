@@ -17,7 +17,10 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { execFileSync } from 'child_process';
-import { detectAdb } from '../../toolchain';
+import {
+  adbArgs, adbBinary, describeAndroidDevice, listAndroidDevices, resolveAndroidSerial, withFriendlyNames,
+} from './androidDevices';
+import { adbDeviceId, claimDevice, releaseDevice, wifiDeviceId } from './deviceClaims';
 import { DeviceLeaseClient, type LeaseTransport, type LeaseRequest, type LeaseReply, type LeaseState } from './deviceLease';
 
 /** The device plugin's TCP port (matches `GameDebugPlugin` default). */
@@ -47,32 +50,26 @@ export function explainConnectFailure(detail: string | undefined, port: number):
     + 'device_connect {ip:"…", port:<actual>}.';
 }
 
-/** Resolve the adb binary the editor PROVISIONS (Android SDK platform-tools), NOT a bare `adb` on
- *  PATH: the packaged editor's adb lives under its toolchain dir and is NOT on the system PATH, so
- *  `execFileSync('adb', …)` ENOENTs there (this is why USB failed while WiFi — a direct TCP connect
- *  needing no adb — worked). `detectAdb()` derives `<sdk>/platform-tools/adb(.exe)` from the resolved
- *  Android SDK (env → provisioned userData SDK). */
-// Exported so deviceCdp.ts (#32 Phase 1's Android CDP discovery) resolves adb the SAME way —
-// never a bare `adb` on PATH, for the reason above.
-export function adbBinary(): string {
-  const d = detectAdb();
-  if (!d.present || !d.path) {
-    throw new Error(
-      'adb not found. USB tunneling needs the Android SDK platform-tools — install the Android SDK ' +
-      'from Build Support (or set ANDROID_HOME), then reconnect. WiFi (device IP) works without adb.',
-    );
-  }
-  return d.path;
-}
+// `adbBinary()` moved to `androidDevices.ts` (#149) — one module now owns "how to talk to adb",
+// because the serial resolution needs to run adb itself and importing it from here would have made
+// the two modules import each other. Re-exported so the several call sites that resolve adb the
+// SAME way (never a bare `adb` on PATH) keep one import path.
+export { adbBinary } from './androidDevices';
 
 /** The `adb forward` calls behind an overridable seam, so tests can inject a spy without mocking the
- *  `child_process` module (which fights vitest's per-file module cache in the full suite). */
+ *  `child_process` module (which fights vitest's per-file module cache in the full suite).
+ *
+ *  `serial` targets a specific device with `-s` (#149). It is REQUIRED to be passed by the caller
+ *  rather than resolved here, and the caller is the lease: with two phones on USB, a forward that
+ *  picks its own device could tunnel to a different handset than the one the lease then talks to,
+ *  and both calls would report success. Undefined means "no serial known" and reproduces the old
+ *  un-targeted behaviour, which is correct only when adb has exactly one device. */
 export const adbRunner = {
-  forward(port: number): void {
-    execFileSync(adbBinary(), ['forward', `tcp:${port}`, `tcp:${port}`], { timeout: 4000, stdio: 'pipe' });
+  forward(port: number, serial?: string): void {
+    execFileSync(adbBinary(), adbArgs(serial, ['forward', `tcp:${port}`, `tcp:${port}`]), { timeout: 4000, stdio: 'pipe' });
   },
-  removeForward(port: number): void {
-    execFileSync(adbBinary(), ['forward', '--remove', `tcp:${port}`], { timeout: 4000, stdio: 'pipe' });
+  removeForward(port: number, serial?: string): void {
+    execFileSync(adbBinary(), adbArgs(serial, ['forward', '--remove', `tcp:${port}`]), { timeout: 4000, stdio: 'pipe' });
   },
 };
 const REQUEST_TIMEOUT_MS = 5000;
@@ -216,8 +213,13 @@ export function loadOrCreateGuid(dir: string = path.join(process.cwd(), '.modoki
 }
 
 /** The last connect target the user chose, remembered across editor restarts (per clone). The IP
- *  persists even across an adb connect, so switching back to WiFi re-fills it. */
-export interface LastTarget { ip: string; useAdb: boolean }
+ *  persists even across an adb connect, so switching back to WiFi re-fills it.
+ *
+ *  `serial` is remembered for the same reason the IP is (#149): on a machine with several phones,
+ *  re-picking the right one every session is the friction the device picker exists to remove. It is
+ *  a PREFERENCE, not a pin — a remembered serial that is no longer attached must not hard-fail the
+ *  reconnect, because the common cause is simply that the phone was unplugged. See `connect()`. */
+export interface LastTarget { ip: string; useAdb: boolean; serial?: string }
 
 function lastTargetFile(dir: string): string {
   return path.join(dir, 'device-target.json');
@@ -252,7 +254,10 @@ function safeJsonParse(raw: string): unknown {
 export interface DeviceConnectStatus {
   state: LeaseState;
   guid: string;
-  target: { host: string; port: number; useAdb: boolean } | null;
+  /** `serial` is the adb device this lease resolved at connect time (#149). It is on the STATUS,
+   *  not re-derived per call, so every later adb call — the CDP tunnel, `device_screenshot` —
+   *  targets the phone the lease actually holds. Absent for a WiFi lease. */
+  target: { host: string; port: number; useAdb: boolean; serial?: string } | null;
   /** Last chosen IP/adb, remembered across restarts, so the panel can pre-fill the field. */
   lastTarget: LastTarget | null;
   detail?: string;
@@ -279,6 +284,10 @@ export interface ConnectRequest {
   /** Tunnel over USB via `adb forward` and connect to 127.0.0.1 (Android only). */
   useAdb?: boolean;
   port?: number;
+  /** WHICH Android, when several are attached (#149). adb serial, as listed by `device_list` /
+   *  `adb devices`. Only meaningful with `useAdb`; a serial that matches nothing attached is an
+   *  error, never a fall-through to another phone. */
+  serial?: string;
 }
 
 export class DeviceConnectionManager {
@@ -286,8 +295,12 @@ export class DeviceConnectionManager {
   private transport: TcpLeaseTransport | null = null;
   private state: LeaseState = 'disconnected';
   private detail?: string;
-  private target: { host: string; port: number; useAdb: boolean } | null = null;
+  private target: { host: string; port: number; useAdb: boolean; serial?: string } | null = null;
   private lastTarget: LastTarget | null;
+  /** The machine-wide hardware claim this lease holds (#149), so `disconnect` can hand back exactly
+   *  what `connect` took. Kept separately from `target` because it must survive the same failure
+   *  paths that clear `target` — a claim that outlives the thing that released it blocks a phone. */
+  private claimedDeviceId: string | null = null;
   /** The connected device's Capacitor platform, asked once per lease. See `devicePlatform()`. */
   private platform: string | null = null;
   /** The leased app's package/bundle id, latched by the same probe as `platform` — see
@@ -323,16 +336,50 @@ export class DeviceConnectionManager {
     const bareReconnect = !reqIp && req.useAdb === undefined && !!this.lastTarget;
     const useAdb = bareReconnect ? !!this.lastTarget!.useAdb : !!req.useAdb;
     const ip = reqIp || (bareReconnect ? this.lastTarget!.ip : undefined);
+    // The serial the CALLER asked for, else the one this clone used last. Remembered rather than
+    // re-picked, so a two-phone machine does not ask again every session — but only as a preference:
+    // `resolveSerial` below downgrades a remembered-and-now-unplugged serial to "no preference"
+    // instead of failing, because a phone being unplugged is not a typo (see its doc).
+    const reqSerial = req.serial?.trim();
+    const wantSerial = reqSerial || (req.serial === undefined ? this.lastTarget?.serial : undefined);
     // Remember what we chose (even if the connect then fails), so the panel pre-fills it next time.
     // Keep the last typed IP across an adb connect (so toggling back to WiFi re-fills).
-    this.lastTarget = { ip: ip || this.lastTarget?.ip || '', useAdb };
+    this.lastTarget = { ip: ip || this.lastTarget?.ip || '', useAdb, ...(wantSerial ? { serial: wantSerial } : {}) };
     saveLastTarget(this.lastTarget, this.stateDir);
     const port = req.port ?? DEVICE_PORT;
     let host: string;
+    let serial: string | undefined;
     if (useAdb) {
+      // WHICH phone, decided ONCE — before any adb call, so the forward and everything that later
+      // reuses this lease's serial cannot disagree (#149). A refusal here names the candidates.
+      const resolved = this.resolveSerial(wantSerial, !!reqSerial);
+      if ('error' in resolved) {
+        this.state = 'error';
+        this.detail = resolved.error;
+        return this.status();
+      }
+      serial = resolved.serial;
+      // Claim the HARDWARE before touching it — the socket lease cannot arbitrate adb, which is one
+      // machine-wide daemon a sibling clone shares (#149 part 2). Refuse naming the holder.
+      const claim = claimDevice({
+        deviceId: adbDeviceId(serial),
+        guid: this.guid,
+        label: resolved.label,
+        purpose: 'holding a device lease over USB',
+      });
+      if (!claim.ok) {
+        this.state = 'error';
+        this.detail = claim.message;
+        return this.status();
+      }
+      this.claimedDeviceId = adbDeviceId(serial);
       try {
-        adbRunner.forward(port);
+        adbRunner.forward(port, serial);
       } catch (e) {
+        // Give the claim straight back: we never got as far as using the device, and a claim left
+        // behind by a failed connect blocks hardware until the TTL — the exact stale-lock failure
+        // this design set out to avoid.
+        this.releaseClaim();
         this.state = 'error';
         this.detail = `adb forward failed: ${e instanceof Error ? e.message : String(e)}`;
         return this.status();
@@ -344,6 +391,20 @@ export class DeviceConnectionManager {
         this.detail = 'no IP provided (uncheck "Use adb" and enter the device IP, or check it for USB)';
         return this.status();
       }
+      // A WiFi lease can only be claimed by ADDRESS — the phone reports its model over the bridge,
+      // but not until the lease is already open, and a model is not unique anyway. Weaker than a
+      // serial, and namespaced so nothing mistakes it for one; see `wifiDeviceId`.
+      const claim = claimDevice({
+        deviceId: wifiDeviceId(ip),
+        guid: this.guid,
+        purpose: 'holding a device lease over WiFi',
+      });
+      if (!claim.ok) {
+        this.state = 'error';
+        this.detail = claim.message;
+        return this.status();
+      }
+      this.claimedDeviceId = wifiDeviceId(ip);
       host = ip;
     }
 
@@ -353,7 +414,7 @@ export class DeviceConnectionManager {
       transport: this.transport,
       onState: (s, d) => { this.state = s; this.detail = explainConnectFailure(d, port); },
     });
-    this.target = { host, port, useAdb };
+    this.target = { host, port, useAdb, ...(serial ? { serial } : {}) };
     await this.client.connect();
     // Learn the platform NOW, while the lease is healthy, rather than on first use. The WDA
     // screenshot path is reached precisely when the app has been SUSPENDED (lease 'reconnecting',
@@ -363,15 +424,48 @@ export class DeviceConnectionManager {
     return this.status();
   }
 
+  /** Which adb device this lease means, and a human label for the claim/message.
+   *
+   *  `strict` distinguishes the two ways a serial arrives, which must fail differently:
+   *   - the caller ASKED for one (`device_connect {serial}`, the panel's picker) — a value matching
+   *     nothing attached is an ERROR, since silently using another phone is the bug this prevents;
+   *   - it came from `lastTarget` — a REMEMBERED preference. The overwhelmingly likely reason it no
+   *     longer matches is that the phone was unplugged, so falling back to the normal rule (which
+   *     still refuses if it is genuinely ambiguous) beats refusing a single-phone reconnect over a
+   *     stale memory the user never typed. */
+  private resolveSerial(want: string | undefined, strict: boolean): { serial: string; label?: string } | { error: string } {
+    // Named, so a refusal says "Galaxy A23 5G" rather than "SC_56C" — the names are memoized, so
+    // this is one extra shell per phone per process, not per connect.
+    const devices = withFriendlyNames(listAndroidDevices());
+    let picked = resolveAndroidSerial(devices, { explicit: want });
+    if ('error' in picked && want && !strict && !devices.some((d) => d.serial === want)) {
+      picked = resolveAndroidSerial(devices, { explicit: undefined });
+    }
+    if ('error' in picked) return picked;
+    const hit = devices.find((d) => d.serial === picked.serial);
+    return { serial: picked.serial, ...(hit ? { label: describeAndroidDevice(hit) } : {}) };
+  }
+
+  /** Hand back the hardware claim, if this lease holds one. Idempotent — a second call after the
+   *  claim is gone is a no-op, which matters because `disconnect()` is called on every connect. */
+  private releaseClaim(): void {
+    if (!this.claimedDeviceId) return;
+    try { releaseDevice(this.claimedDeviceId); } catch { /* a claims file we cannot write must never block a disconnect */ }
+    this.claimedDeviceId = null;
+  }
+
   async disconnect(): Promise<DeviceConnectStatus> {
     if (this.client) { try { await this.client.disconnect(); } catch { /* */ } }
     // Reclaim the adb-forward rule this connection created (L10) — an un-removed `tcp:<port>`
     // forward outlives the editor and can mask a device swap (127.0.0.1 keeps answering the old
-    // tunnel). Best-effort; a re-connect re-adds the idempotent rule anyway.
+    // tunnel). Best-effort; a re-connect re-adds the idempotent rule anyway. Targeted at the SAME
+    // serial the forward was created with (#149): un-targeted, this errors out on a two-phone Mac
+    // and leaves the rule behind — the mask it exists to prevent.
     if (this.target?.useAdb) {
-      try { adbRunner.removeForward(this.target.port); }
+      try { adbRunner.removeForward(this.target.port, this.target.serial); }
       catch { /* forward may already be gone / adb absent — non-fatal */ }
     }
+    this.releaseClaim();
     this.client = null;
     this.transport = null;
     this.state = 'disconnected';

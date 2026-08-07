@@ -95,6 +95,15 @@ build, the per-machine signing, and the expiry rule.
   the next tap. Nothing is stranded either way: the agent is still owned by the lease, so
   disconnecting stops it. A launch whose **process exits** is reported differently (a signing
   failure looks like that), and there the next call does start fresh.
+- **At most one launch PER MACHINE, not merely per process** (#149). The one-launch guard above is a
+  module-level `child` handle, so it could only ever see launches this backend started — and with
+  four clones running concurrent sessions, the rival agent came from a *sibling clone*, which that
+  handle cannot see. So the launch now takes a machine-wide claim on the phone
+  (`~/.modoki/device-claims.json`, keyed `ios:<udid>`) before spawning, released by `stopWda`. A
+  second clone is refused with the holder named, and — because a failed launch is never fatal here —
+  that refusal degrades to synthetic with the usual banner rather than breaking the session. Expiry
+  is pid-liveness + a 12h TTL, so a crashed editor never leaves a phone locked. See
+  [debug-tools-mcp.md](debug-tools-mcp.md) § "Several phones attached".
 - **Torn down with the lease** — one lease owns both channels, so there is exactly one answer to
   "who holds this device", and disconnecting can never strand a signed agent on the phone. Losing WDA
   **degrades input; it does not drop the lease** — screenshots and Percept reads keep working.

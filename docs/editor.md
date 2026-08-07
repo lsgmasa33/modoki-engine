@@ -180,6 +180,22 @@ explicit key list (unknown keys nested inside a declared section survive).
 
 ## Panels
 
+### A new dropdown in editor chrome must be DOM, not a native `<select>` (#149)
+
+A native `<select>` renders its popup in a separate OS layer that `sendInputEvent` cannot reach —
+`docs/debug-tools-mcp.md` already lists it among the things trusted input needs an opener tool to
+work around. So a `<select>` added to editor chrome is a control **neither the agent surface nor the
+Playwright specs can open**, and since the agent owns live verification of this surface (nobody else
+drives it), that means it ships unverified.
+
+Build the affordance out of ordinary DOM instead: a `role="combobox"` button plus a `role="listbox"`
+of `role="option"` rows, closing on Escape and outside-click, each row carrying a stable
+`data-testid` to aim at. The AI panel's device picker (`DeviceConnectSection.tsx`) is the worked
+example — it looks and behaves like a pull-down and is fully drivable by `modoki_tap {selector}`.
+
+This applies to NEW chrome. The existing `<select>`s (Inspector enum fields, device presets) are not
+worth a sweep on their own; convert one when you are already changing it and it blocks a check.
+
 ### Where a panel's LOGIC belongs (and what is tested)
 
 A panel `.tsx` holds JSX, hooks and imperative wiring. **Its decisions belong in a
