@@ -6,6 +6,7 @@ import {
   parseIosDevices, resolveIosDevice, ensureWdaRunning, stopWda,
   isWdaProcessRunning, _resetWdaLauncherForTests, WDA_PROBE_TIMEOUT_MS,
   parseXctraceDevices, mergeIosDevices, pickWdaFailureLine, describeExecFailure,
+  _devicectlOutPath,
 } from '../../plugins/backend/wdaLauncher';
 
 /**
@@ -243,6 +244,24 @@ describe('describeExecFailure — prefer what the tool said over Node\'s "Comman
 });
 
 describe('the real devicectl invocation', () => {
+  it('writes each listing to its OWN temp file', () => {
+    // ⚠️ The path was `modoki-devicectl-<pid>.json` — ONE file per process — and that was safe only
+    // by accident: `execFileSync` blocked the single JS thread for the whole spawn→read→unlink
+    // cycle, so two listings could not interleave. #168 made the POLLED listing async and left
+    // `ensureWdaRunning` on the sync twin, so they can now overlap and write the same file: an
+    // `/api/device/list` poll is mid-flight (its OS process still writing) when a `device_tap`
+    // runs `listDevicesSync`. A torn or already-unlinked read makes `parseIosDevices` return `[]`,
+    // which `ensureWdaRunning` LATCHES into `lastFailure` as "no iOS device is paired with this
+    // Mac" for the rest of the session — trusted input silently degraded, looking like an
+    // unplugged phone.
+    //
+    // Asserting UNIQUENESS rather than a format: the fix is that no two calls can collide, and a
+    // format assertion would pass for a constant that merely looked unique.
+    const paths = [_devicectlOutPath(), _devicectlOutPath(), _devicectlOutPath()];
+    expect(new Set(paths).size, `two listings share a temp file: ${paths.join(', ')}`).toBe(3);
+    for (const p of paths) expect(p).toContain(String(process.pid));
+  });
+
   it('never writes its JSON to /dev/stdout', () => {
     // Found LIVE, not here: `--json-output /dev/stdout` interleaves devicectl's human-readable
     // table with the JSON, so it never parses — and the failure presents as "no iOS device is
@@ -250,14 +269,23 @@ describe('the real devicectl invocation', () => {
     // real command is only exercised on a Mac with a device attached; this asserts the shape of
     // the command itself, which is the part they cannot reach.
     const src = readFileSync(path.join(__dirname, '../../plugins/backend/wdaLauncher.ts'), 'utf8');
-    // The window has to cover the whole function BODY, comments included — it was 600 chars and
-    // silently stopped covering the call when the #144 stderr comment was added, failing on
-    // "contains --json-output" rather than on anything about /dev/stdout. Slice to the closing
-    // brace instead of guessing a length, so a future comment cannot move the goalposts again.
-    const start = src.indexOf('listDevices()');
-    const call = src.slice(start, src.indexOf('\n  },', start));
-    expect(call).toContain('--json-output');
-    expect(call).not.toMatch(/--json-output'?,?\s*'\/dev\/stdout'/);
+    // ⚠️ Read the shared `DEVICECTL_ARGV`, not a function body. #168 split the listing into an
+    // async seam (the POLLED route, which must not block the Electron main process) and a sync
+    // twin (`ensureWdaRunning`, whose critical section must stay await-free), and slicing one
+    // function's body would leave the other's invocation unguarded — while still passing.
+    const argvLine = /const DEVICECTL_ARGV = [^\n]*\n/.exec(src)?.[0];
+    expect(argvLine, 'DEVICECTL_ARGV is gone — this test no longer guards the real command').toBeDefined();
+    expect(argvLine!).toContain('--json-output');
+    expect(argvLine!).not.toMatch(/--json-output'?,?\s*'\/dev\/stdout'/);
+    // And there is exactly ONE of them in CODE: a seam that builds its own argv inline would escape
+    // the check above, which is the only way this guard can be true and useless at the same time.
+    // Comment lines are excluded — the module banner and `parseIosDevices`' doc both name the flag
+    // while invoking nothing, and counting those made this assert 3 and fail on prose.
+    const codeMentions = src.split('\n')
+      .filter((l) => l.includes('--json-output') && !/^\s*(\/\/|\*|\/\*)/.test(l));
+    expect(codeMentions.length,
+      `--json-output appears in ${codeMentions.length} code lines — a seam is building its own ` +
+      'argv, so the assertions above no longer cover every devicectl invocation').toBe(1);
   });
 });
 

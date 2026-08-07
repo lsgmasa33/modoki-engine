@@ -1403,6 +1403,267 @@ export function registerTools(server: McpServer) {
     },
   );
 
+  tool('device_mutate_scene',
+    'Set trait fields on live entities ON THE DEVICE (#166) — the write the device surface was ' +
+      'missing, so a "what if X were hidden/smaller/off?" experiment costs one call instead of a ' +
+      'rebuild+reinstall cycle. Select with ONE of where (a filter — matching many is the point) / ' +
+      'guid (one or an array) / name (exact; ambiguous names are REFUSED) / id. `set` keys are ' +
+      '"Trait.field", the same addressing `where` uses, or a bare "TagTrait": true|false to add/remove ' +
+      'a tag. LIVE WORLD ONLY: nothing is written to disk and there is no undo stack — a relaunch is ' +
+      'the undo. An unknown trait/field refuses the WHOLE call with nothing applied; a selector ' +
+      'matching zero entities is an error, not a silent success. Verify with device_get_scene_state ' +
+      '(the reply already includes per-entity before/after). For a selection too complex for one ' +
+      'where-clause, device_eval can filter in JS and pass the guid array here.',
+    {
+      where: z.string().optional().describe('Filter: "Trait.field <op> value" (ops = != > >= < <= ~), the same grammar device_get_scene_state takes. Matching MANY entities is intended.'),
+      guid: z.union([z.string(), z.array(z.string())]).optional().describe('Stable guid, or an array of them. The array form is what lets device_eval read → filter in JS → write in one body.'),
+      name: z.string().optional().describe('Exact entity name. A name matching several entities is REFUSED (never first-matched) — use guid or where instead.'),
+      id: z.number().optional().describe('Live entity id. Reassigned on every scene reload — prefer guid.'),
+      set: z.record(z.string(), z.any()).describe('{"Trait.field": value} to write a field, or {"TagTrait": true|false} to add/remove a tag trait. e.g. {"Renderable3D.isVisible": false}'),
+      dryRun: z.boolean().optional().describe('Report what WOULD change and change nothing — use it to confirm a broad `where` selects what you meant.'),
+      limit: z.number().optional().describe('Cap on per-entity before/after detail rows (default 20). The matched/changed COUNTS are always exact.'),
+    },
+    async ({ where, guid, name, id, set, dryRun, limit }) => {
+      const what = 'set trait fields on live entities on the device';
+      try {
+        const sent = {
+          ...(where !== undefined ? { where } : {}), ...(guid !== undefined ? { guid } : {}),
+          ...(name !== undefined ? { name } : {}), ...(id !== undefined ? { id } : {}),
+          set, ...(dryRun !== undefined ? { dryRun } : {}), ...(limit !== undefined ? { limit } : {}),
+        };
+        const parsed = parseReply<{ ok?: boolean; error?: string; options?: string[]; matched?: number }>(await deviceRequest('set-traits', sent));
+        if (isDeviceError(parsed)) {
+          return deviceReplyFailure('device_mutate_scene', what, parsed, [
+            'device_get_scene_state with the SAME where= shows what the selector matches',
+          ]);
+        }
+        // The op reports every "did not happen" as {ok:false, error} at a 200 — a refusal, not a
+        // transport failure. Surface it as a failed call with the op's own options (conventions §5),
+        // never as a phantom success.
+        if (parsed && typeof parsed === 'object' && parsed.ok === false) {
+          return deviceFail({
+            code: 'REFUSED_BY_OP',
+            tool: 'device_mutate_scene',
+            what,
+            why: parsed.error ?? 'the device refused the mutation and gave no reason. Nothing was applied.',
+            got: parsed,
+            options: parsed.options ?? [
+              'check the selection first: device_get_scene_state with the same where=',
+              'an unknown trait or field refuses the whole call — the reply lists the real names',
+            ],
+          });
+        }
+        return { content: [{ type: 'text' as const, text: encodeStructuredResult(parsed) }] };
+      } catch (e) {
+        return caughtFailure('device_mutate_scene', what, e);
+      }
+    },
+  );
+
+  /** A device WRITE op: every "did not happen" comes back as `{ok:false, error}` at a 200, which is
+   *  a refusal, not a transport failure — surface it as a failed call carrying the op's own
+   *  options (conventions §5), never as a phantom success. */
+  async function writeCall(tool: string, method: string, params: Record<string, unknown>, what: string, options: string[]) {
+    try {
+      const parsed = parseReply<{ ok?: boolean; error?: string; options?: string[] }>(await deviceRequest(method, params));
+      if (isDeviceError(parsed)) return deviceReplyFailure(tool, what, parsed, options);
+      if (parsed && typeof parsed === 'object' && parsed.ok === false) {
+        return deviceFail({
+          code: 'REFUSED_BY_OP', tool, what,
+          why: parsed.error ?? 'the device refused and gave no reason. Nothing happened.',
+          got: parsed,
+          options: parsed.options ?? options,
+        });
+      }
+      return { content: [{ type: 'text' as const, text: encodeStructuredResult(parsed) }] };
+    } catch (e) {
+      return caughtFailure(tool, what, e);
+    }
+  }
+
+  tool('device_create_entity',
+    'Spawn an entity in the LIVE world on the device (#166) — no rebuild, no reinstall. Builds the ' +
+      'SAME entity the editor would (shared spec builders), so a device experiment and an editor ' +
+      'one are comparable. An unknown primitive/shape name is refused with the valid list rather ' +
+      'than producing an entity whose renderer resolves to nothing. Live only: nothing is written ' +
+      'to disk and a relaunch is the undo. Verify with device_get_scene_state.',
+    {
+      spec: z.record(z.string(), z.any()).describe('What to create, e.g. {kind:"primitive", mesh:"sphere"} or {kind:"2d", shape:"square"} or {kind:"ui", preset:"button"}. kind:"primitive" defaults mesh to "sphere"; kind:"2d" defaults shape to "square".'),
+      parentGuid: z.string().optional().describe('Stable guid of the parent. Preferred over parentId — a stale id would orphan the new entity.'),
+      parentId: z.number().optional().describe('Live parent id (0 = root). Validated; reassigned on scene reload, so prefer parentGuid.'),
+    },
+    async ({ spec, parentGuid, parentId }) => writeCall('device_create_entity', 'create-entity', {
+      spec, ...(parentGuid !== undefined ? { parentGuid } : {}), ...(parentId !== undefined ? { parentId } : {}),
+    }, 'create an entity in the live world on the device', [
+      'device_get_scene_state shows what exists now',
+      'kind:"primitive" needs a valid mesh name — the refusal lists them',
+    ]),
+  );
+
+  tool('device_duplicate_entity',
+    'Copy a live entity ON THE DEVICE, optionally many times (#166) — this is the "spawn N more of ' +
+      'THIS and watch the frame" perf experiment, which previously cost a full rebuild+reinstall ' +
+      'per question. DESCENDANTS ARE INCLUDED: a copy of a parent brings its children, each with a ' +
+      'FRESH guid (two entities answering to one address would break every read tool). Live only — ' +
+      'a relaunch is the undo. Measure the effect with device_profiler or device_diagnose.',
+    {
+      guid: z.string().optional().describe('Stable guid of the entity to copy. Preferred — an id can be recycled by a scene reload and name a different entity.'),
+      id: z.number().optional().describe('Live id of the entity to copy. Prefer guid.'),
+      count: z.number().optional().describe('How many copies to make (default 1, max 1000). This is the knob for a load test.'),
+    },
+    async ({ guid, id, count }) => writeCall('device_duplicate_entity', 'duplicate-entity', {
+      ...(guid !== undefined ? { guid } : {}), ...(id !== undefined ? { id } : {}), ...(count !== undefined ? { count } : {}),
+    }, 'duplicate a live entity on the device', [
+      'a stale guid is the usual cause — re-read it with device_get_scene_state',
+    ]),
+  );
+
+  tool('device_delete_entities',
+    'Delete live entities ON THE DEVICE (#166) — the other half of a "does this cost anything?" ' +
+      'experiment. Takes guids (preferred) or ids. If ANY ref does not resolve, NOTHING is deleted ' +
+      'and the reply names the misses: a partial delete would leave you unable to tell which ' +
+      'entities are now gone. Live only — a relaunch restores the scene.',
+    {
+      guids: z.array(z.string()).optional().describe('Stable guids to delete. Preferred over ids.'),
+      guid: z.string().optional().describe('A single stable guid to delete.'),
+      ids: z.array(z.number()).optional().describe('Live ids to delete. Reassigned on scene reload — a recycled id can name a DIFFERENT entity, so prefer guids.'),
+      id: z.number().optional().describe('A single live id to delete.'),
+    },
+    async ({ guids, guid, ids, id }) => writeCall('device_delete_entities', 'delete-entities', {
+      ...(guids !== undefined ? { guids } : {}), ...(guid !== undefined ? { guid } : {}),
+      ...(ids !== undefined ? { ids } : {}), ...(id !== undefined ? { id } : {}),
+    }, 'delete live entities on the device', [
+      'device_get_scene_state gives current guids',
+    ]),
+  );
+
+  tool('device_step',
+    'Advance a PAUSED device game by N frames, then re-freeze (#166) — what makes a before/after ' +
+      'measurement comparable instead of sampled off a moving world. Pause first with ' +
+      'device_set_timescale {scale:0}; stepping a running world is refused rather than silently ' +
+      'pausing it. ⚠️ A step here is one REAL frame (however long the phone took, ~16-33ms), NOT a ' +
+      'fixed dt — this is a measurement aid, not a deterministic repro (the deterministic route ' +
+      'would have to suspend the live render loop). If the frame loop is stopped or the app is ' +
+      'backgrounded, that is reported as a failure with the count that did run, and the world is ' +
+      're-frozen either way.',
+    {
+      frames: z.number().optional().describe('How many real frames to advance (default 1, max 600).'),
+      scale: z.number().optional().describe('timeScale to run at during the step (default 1). Use <1 to advance less sim time per frame.'),
+      timeoutMs: z.number().optional().describe('Give up if the frames do not arrive. Default is DERIVED from frames (40ms each + margin, min 3000, max 20000) so the max frames:600 fits its own budget; max 20000. The world is always re-frozen, including on timeout.'),
+    },
+    async ({ frames, scale, timeoutMs }) => writeCall('device_step', 'sim-step', {
+      ...(frames !== undefined ? { frames } : {}), ...(scale !== undefined ? { scale } : {}),
+      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    }, 'step the paused device game by N frames', [
+      'pause first: device_set_timescale {scale:0}',
+    ]),
+  );
+
+  tool('device_load_scene',
+    'Swap the scene running ON THE DEVICE (#166) — test another level with no rebuild and no ' +
+      'reinstall. The reply reads the active scene back after the swap, so a path that does not ' +
+      'exist in this build is reported as a failure rather than resolving quietly; the previous ' +
+      'scene stays loaded when it fails. Note the device has no unsaved-work guard because it has ' +
+      'no project on disk — but any LIVE edits you made (device_mutate_scene, spawns) are lost on ' +
+      'the swap, exactly as a relaunch would lose them.',
+    { path: z.string().describe('Scene path to load, as it appears in this build (device_get_scene_state reports the current one).') },
+    async ({ path }) => writeCall('device_load_scene', 'load-scene', { path },
+      `load the scene "${path}" on the device`, [
+        'device_get_scene_state reports the currently-loaded scene path',
+      ]),
+  );
+
+  tool('device_read_asset_def',
+    'Read an asset definition AS THE RUNNING BUILD RESOLVED IT (#166 P7) — a particle/animation/' +
+      'timeline/spriteanim/rig2d def straight out of the live cache on the phone. This is not a ' +
+      'file read: it answers "what did THIS build actually load", which is the observe-don\'t-infer ' +
+      'rule applied to assets, and it is the only way to tell a shipped/OTA build apart from the ' +
+      'source on your disk. PEEKS ONLY — it never triggers a fetch, so asking about an absent asset ' +
+      'cannot queue a load that fails. An asset nothing has loaded is reported as such, never as an ' +
+      'empty def.',
+    {
+      path: z.string().describe('Asset path, e.g. /games/x/assets/fx/spark.particle.json'),
+      type: z.enum(['particle', 'animation', 'timeline', 'spriteanim', 'rig2d']).optional()
+        .describe('Override the kind. Inferred from the filename suffix when omitted.'),
+    },
+    async ({ path, type }) => writeCall('device_read_asset_def', 'read-asset-def',
+      { path, ...(type !== undefined ? { type } : {}) },
+      `read the live asset def for "${path}" on the device`, [
+        'the asset must already be loaded by the running scene — nothing is fetched on demand',
+        'pass `type` when the filename does not carry a known suffix',
+      ]),
+  );
+
+  // ── Reachability (#166 P4) — ops that existed on device but had no typed tool, so they were
+  // reachable only by an agent who already knew to eval them. An eval-only op skips the whole
+  // convention layer: no strict schema, no §5 refusal envelope, no coverage tier.
+
+  tool('device_profiler',
+    'Where did the frame go, ON THE DEVICE — the profiler surface (#138). Bare = read the live ' +
+      'marker aggregate. capture-start/-stop/-read record real frames and rank the WORST ones by ' +
+      'cost (not the most recent), so a hitch is findable after the fact. gpu-on/gpu-off enable GPU ' +
+      'timestamp queries, which have a real cost and so must be deliberate; on a backend without ' +
+      'timer-query support the status comes back "unsupported" with a reason and NO number is ' +
+      'fabricated. This is the tool for a phone-only perf question — the editor runs on a desktop ' +
+      'GPU where the frame is fast regardless.',
+    {
+      action: z.enum(['read', 'capture-start', 'capture-stop', 'capture-read', 'capture-clear', 'gpu-on', 'gpu-off', 'reset'])
+        .optional().describe('Default "read" (the live aggregate). capture-* records/reads frames; gpu-* toggles GPU timestamps; reset clears markers + captures.'),
+      markers: z.number().optional().describe('action:read — how many marker rows to return (default 12).'),
+      limit: z.number().optional().describe('action:capture-read — how many of the WORST frames to return (default 5, max 20).'),
+    },
+    async ({ action, markers, limit }) => perceptCall('device_profiler', 'profiler', {
+      ...(action !== undefined ? { action } : {}),
+      ...(markers !== undefined ? { markers } : {}),
+      ...(limit !== undefined ? { limit } : {}),
+    }),
+  );
+
+  tool('device_set_timescale',
+    'Set the running game\'s timeScale on the device — 0 pauses (instantly: it applies AFTER delta ' +
+      'smoothing, so there is no EMA coast), 0.3 is slow-mo, 2 is fast-forward. The one time-control ' +
+      'knob. Freezing the world is what makes a before/after measurement comparable instead of ' +
+      'sampled off a moving target. The reply reads the applied value back.',
+    { scale: z.number().describe('New timeScale. 0 = pause, 1 = normal, >1 = faster. Must be finite and >= 0.') },
+    async ({ scale }) => writeCall('device_set_timescale', 'set-timescale', { scale },
+      'set the device game\'s timeScale', ['scale must be a finite number >= 0']),
+  );
+
+  tool('device_handles',
+    'List the draggable/clickable HANDLES on the device RIGHT NOW, in viewport CSS px — the device ' +
+      'twin of modoki_handles and the input twin of device_layout_bounds. Called BARE it returns ' +
+      'counts (byEditor/byKind); pass a filter to get geometry. A filtered call that matches nothing ' +
+      'names what IS live rather than returning a bare empty list, so a typo cannot read as a ' +
+      'correct negative answer.',
+    {
+      editor: z.string().optional().describe('Filter to one editor/provider, e.g. "collider2d", "skin".'),
+      kind: z.string().optional().describe('Filter to one handle kind, e.g. "collider-vertex", "keyframe".'),
+      ids: z.array(z.string()).optional().describe('Restrict to these handle ids.'),
+    },
+    async ({ editor, kind, ids }) => perceptCall('device_handles', 'enact-handles', {
+      ...(editor !== undefined ? { editor } : {}),
+      ...(kind !== undefined ? { kind } : {}),
+      ...(ids !== undefined ? { ids } : {}),
+    }),
+  );
+
+  tool('device_invalidate_assets',
+    'Drop cached models/textures on the device so the next frame re-resolves them — the on-device ' +
+      'half of an asset iteration loop. ⚠️ The returned `models`/`textures` counts are the items ' +
+      'ACCEPTED, not the cache entries actually evicted: the underlying invalidate is a void call ' +
+      'that no-ops silently on a path nothing has cached, so a typo\'d path still counts. Treat a ' +
+      'count as "what I asked for", never as proof something was cached — confirm the effect with ' +
+      'device_get_scene_state or device_diagnose. (An item with no path is skipped and NOT counted.)',
+    {
+      items: z.array(z.object({
+        path: z.string().describe('Asset path to invalidate.'),
+        type: z.enum(['model', 'texture']).describe('Which cache to drop it from.'),
+      })).describe('The assets to invalidate.'),
+    },
+    async ({ items }) => writeCall('device_invalidate_assets', 'invalidate-assets', { items },
+      'invalidate cached assets on the device', ['device_get_scene_state confirms what the world resolves now']),
+  );
+
   // ── Enact: keyboard / hover / scroll ───────────────────────
 
   /** Send a device method whose reply is a bare `ok …` / `Error: …` string, flagging errors. */

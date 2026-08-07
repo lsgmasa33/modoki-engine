@@ -63,47 +63,11 @@ import { vendorEnginePlugins, writeVendorMarker } from './vendorPlugins';
 import { spawnBuildCommand, resolveBuildStep, type BuildStep } from './buildStepShell';
 import { healNativeConfig } from './healNativeConfig';
 import { ICON_TOOL, ICON_COLORS, iconIsUpToDate, iconStampValue } from './iconAssets';
-import { ensureCapacitorDeps, ensureCapacitorConfig, detectMissingFirebase, type NativePlatform } from './addNativeTarget';
+import { ensureCapacitorDeps, scaffoldNativeTarget, type NativePlatform } from './addNativeTarget';
 import { discoverSigningTeams, type SigningTeam } from './signingTeams';
 import { serveProjectAsset } from './backend/staticAssets';
 import { writeBackendResult } from './backend/writeResult';
-import type { ProjectConfig } from '../project-config';
 
-/** The scaffold half of "Add Native Target": the in-process edits (Capacitor
- *  deps + capacitor.config.json + vendored engine plugins) followed by the shell
- *  steps (install → web build → `npx cap add` → heal native config). Shared by
- *  the explicit /api/add-native-target action AND the auto-scaffold that runs on
- *  the first native /api/build for a project with no ios/android folder yet.
- *
- *  `runShell(label, cmd, cwd)` is the caller's spawn wrapper (each SSE handler
- *  owns its own, wired to its abort/disconnect handling); a false return throws.
- *  Returns the missing-Firebase warnings the caller should surface — the build
- *  path pauses on a non-empty list so the user can supply the config first. */
-async function scaffoldNativeTarget(opts: {
-  projectRoot: string;
-  platform: NativePlatform;
-  buildCwd: string;
-  cfg: ProjectConfig;
-  send: (msg: string) => void;
-  runShell: (label: string, cmd: string, cwd: string) => Promise<boolean>;
-}): Promise<{ warnings: string[] }> {
-  const { projectRoot, platform, buildCwd, cfg, send, runShell } = opts;
-  // 1. In-process scaffold: deps + capacitor.config.json + vendor plugins.
-  for (const n of ensureCapacitorDeps(projectRoot, platform, buildCwd).notes) send(n);
-  for (const n of ensureCapacitorConfig(projectRoot, cfg).notes) send(n);
-  const v = vendorEnginePlugins(projectRoot, buildCwd);
-  if (v.vendored.length) send(`vendored engine plugin(s): ${v.vendored.join(', ')}`);
-  // 2. Install (project) — needs the cap CLI + plugin copies present.
-  if (!(await runShell('npm install', 'npm install', projectRoot))) throw new Error('npm install failed');
-  writeVendorMarker(projectRoot, v.expectedVendor); // record installed tarballs (D3)
-  // 3. Web build → games/<id>/dist (cap add needs webDir to exist).
-  if (!(await runShell('Building web assets', 'node engine/scripts/build-web.mjs --target native', buildCwd))) throw new Error('web build failed');
-  // 4. cap add (project) — generates the native project with the capacitor.config identity baked in.
-  if (!(await runShell(`cap add ${platform}`, `npx cap add ${platform}`, projectRoot))) throw new Error(`cap add ${platform} failed`);
-  // 5. Heal native config (local.properties / DEVELOPMENT_TEAM) + flag missing Firebase.
-  for (const n of healNativeConfig(projectRoot).notes) send(n);
-  return { warnings: detectMissingFirebase(projectRoot, platform) };
-}
 
 
 // The editor's OWN built-in engine assets (fonts, favicon). Resolved from this

@@ -1,15 +1,26 @@
-/** Pure helpers for the "Add Native Target" editor action — make a flat game
- *  project Capacitor-ready (deps + capacitor.config.json) before `npx cap add`,
- *  and flag user-supplied configs the editor can't synthesize (Firebase).
+/** "Add Native Target" — make a flat game project Capacitor-ready (deps +
+ *  capacitor.config.json), run `npx cap add`, and flag user-supplied configs the
+ *  editor can't synthesize (Firebase).
  *
- *  The orchestration (npm install → web build → cap add → heal) lives in the
- *  Vite middleware's /api/add-native-target SSE handler; these helpers are the
- *  in-process, deterministic edits it runs first. Kept here (engine/plugins) so
- *  they're transport-agnostic and unit-testable. */
+ *  The deterministic in-process edits are the pure helpers below; `scaffoldNativeTarget`
+ *  is the orchestration around them (deps → install → web build → cap add → heal).
+ *  Kept here (engine/plugins) so both are transport-agnostic and unit-testable.
+ *
+ *  ── WHY THE ORCHESTRATION MOVED HERE ─────────────────────────────────────────────────
+ *  It used to live inside `vite-asset-scanner.ts`, reachable ONLY through the editor's
+ *  `/api/add-native-target` + `/api/build` SSE routes — which act on whatever project the
+ *  editor has OPEN. Scaffolding N projects therefore meant opening N projects in the editor,
+ *  and a terminal had no way in at all. The obvious workaround — a script that re-runs the
+ *  five steps itself — is the #159 mistake in a new costume: a SECOND implementation of a
+ *  sequence that must not diverge from the one that ships. So the sequence moved next to the
+ *  helpers it calls, the scanner imports it, and `engine/scripts/add-native-targets.mjs`
+ *  drives the SAME function from the CLI. One implementation, two transports. */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import type { ProjectConfig } from '../project-config';
+import { vendorEnginePlugins, writeVendorMarker } from './vendorPlugins';
+import { healNativeConfig } from './healNativeConfig';
 
 export type NativePlatform = 'ios' | 'android';
 
@@ -209,4 +220,42 @@ export function detectMissingFirebase(projectRoot: string, platform: NativePlatf
     }
   }
   return warnings;
+}
+
+/** Scaffold one native target end-to-end: deps + capacitor.config.json + vendored engine
+ *  plugins (in-process), then install → web build → `npx cap add` → heal native config.
+ *
+ *  `runShell(label, cmd, cwd)` is the CALLER's spawn wrapper — each transport owns its own,
+ *  wired to its own abort/disconnect handling and output streaming (the editor streams over
+ *  SSE; the CLI inherits stdio). A false return throws. Returns the missing-Firebase warnings
+ *  the caller should surface; the editor's build path PAUSES on a non-empty list so the user
+ *  can supply the config before the build runs against it.
+ *
+ *  Step 3 builds the web assets because `cap add` requires `webDir` to exist — it is not an
+ *  optimisation and cannot be skipped for a project that has never been built. */
+export async function scaffoldNativeTarget(opts: {
+  projectRoot: string;
+  platform: NativePlatform;
+  /** The ENGINE root the web build runs from (the monorepo root), not the project. */
+  buildCwd: string;
+  cfg: ProjectConfig;
+  send: (msg: string) => void;
+  runShell: (label: string, cmd: string, cwd: string) => Promise<boolean>;
+}): Promise<{ warnings: string[] }> {
+  const { projectRoot, platform, buildCwd, cfg, send, runShell } = opts;
+  // 1. In-process scaffold: deps + capacitor.config.json + vendor plugins.
+  for (const n of ensureCapacitorDeps(projectRoot, platform, buildCwd).notes) send(n);
+  for (const n of ensureCapacitorConfig(projectRoot, cfg).notes) send(n);
+  const v = vendorEnginePlugins(projectRoot, buildCwd);
+  if (v.vendored.length) send(`vendored engine plugin(s): ${v.vendored.join(', ')}`);
+  // 2. Install (project) — needs the cap CLI + plugin copies present.
+  if (!(await runShell('npm install', 'npm install', projectRoot))) throw new Error('npm install failed');
+  writeVendorMarker(projectRoot, v.expectedVendor); // record installed tarballs (D3)
+  // 3. Web build → <project>/dist (cap add needs webDir to exist).
+  if (!(await runShell('Building web assets', 'node engine/scripts/build-web.mjs --target native', buildCwd))) throw new Error('web build failed');
+  // 4. cap add (project) — generates the native project with the capacitor.config identity baked in.
+  if (!(await runShell(`cap add ${platform}`, `npx cap add ${platform}`, projectRoot))) throw new Error(`cap add ${platform} failed`);
+  // 5. Heal native config (local.properties / DEVELOPMENT_TEAM) + flag missing Firebase.
+  for (const n of healNativeConfig(projectRoot).notes) send(n);
+  return { warnings: detectMissingFirebase(projectRoot, platform) };
 }

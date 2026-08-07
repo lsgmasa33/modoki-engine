@@ -17,7 +17,7 @@
 
 import * as THREE from 'three';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor, inferAssetDefType } from '../debug/agentBridge';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
 import { getGameBootFaults } from './gameBootFaults';
@@ -1622,17 +1622,6 @@ export function registerEditorAgentOps(): void {
   });
 }
 
-/** Guess an asset-def kind from its filename. The three write ops each take a fixed type, so the
- *  read one is the only place that has to work it out — and the suffixes are the project's own
- *  convention (`docs/doc-conventions.md`), not a heuristic. */
-function inferAssetDefType(path: string): 'particle' | 'animation' | 'timeline' | 'spriteanim' | 'rig2d' | null {
-  if (path.endsWith('.particle.json')) return 'particle';
-  if (path.endsWith('.anim.json')) return 'animation';
-  if (path.endsWith('.timeline.json')) return 'timeline';
-  if (path.endsWith('.spriteanim.json')) return 'spriteanim';
-  if (path.endsWith('.rig2d.json')) return 'rig2d';
-  return null;
-}
 
 /** Park an asset edit in the dirty-asset registry. Applied LIVE by the caller; reaches disk only
  *  via `save-all`.

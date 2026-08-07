@@ -4,6 +4,7 @@
 import * as THREE from 'three';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
+import { reparentRefusal } from '../../runtime/core/ecs/hierarchy';
 import {
   findEntity, readTraitData, readTraitDataFull, writeTraitField,
   getAllEntities, deleteEntity, markStructureDirty, cloneTraitValues, subtreeIds,
@@ -468,7 +469,10 @@ function findByRootGuid(guid: string): number | null {
 
 // ── Create with undo ──
 
-export interface TraitSpec { name: string; data?: Record<string, unknown> }
+// TraitSpec moved to runtime/scene/entityCreateSpecs.ts (#166) so the device's undo-free create
+// path and this undoable one cannot drift apart. Re-exported here for existing importers.
+export type { TraitSpec } from '../../runtime/scene/entityCreateSpecs';
+import type { TraitSpec } from '../../runtime/scene/entityCreateSpecs';
 
 /** Spawn an entity from trait specs, select it, and push a create/delete undo action.
  *  `selectEntity` is injected so this stays free of the editor store and unit-testable.
@@ -757,17 +761,6 @@ export function deleteEntityWithUndo(entityId: number): void {
 
 // ── Reparent with undo ──
 
-function isAncestorOf(ancestorId: number, entityId: number): boolean {
-  const entities = getAllEntities();
-  const byId = new Map(entities.map(e => [e.id, e]));
-  let current = byId.get(entityId);
-  while (current && current.parentId !== 0) {
-    if (current.parentId === ancestorId) return true;
-    current = byId.get(current.parentId);
-  }
-  return false;
-}
-
 function matrixFromTransform(tf: { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number }): THREE.Matrix4 {
   const pos = new THREE.Vector3(tf.x, tf.y, tf.z);
   const quat = new THREE.Quaternion().setFromEuler(new THREE.Euler(tf.rx, tf.ry, tf.rz));
@@ -795,8 +788,9 @@ function isWithinInstanceSubtree(nodeId: number, rootId: number): boolean {
 }
 
 export function reparentEntity(entityId: number, newParentId: number, newSortOrder?: number): boolean {
-  if (entityId === newParentId) return false;
-  if (newParentId !== 0 && isAncestorOf(entityId, newParentId)) return false;
+  // Self-parent + cycle now live in runtime/core/ecs/hierarchy.ts, shared with the device's
+  // set-traits guard — the same rule in two places is what #166 P7 found diverging (§9).
+  if (reparentRefusal(entityId, newParentId)) return false;
 
   const allTraits = getAllTraits();
   const transformMeta = allTraits.find(m => m.name === 'Transform');

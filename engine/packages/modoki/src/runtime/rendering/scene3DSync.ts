@@ -42,6 +42,7 @@ import {
   getActiveQualityTier, setActiveQualityTier, getActiveTierOrDefault,
 } from './renderSettings';
 import { resolveTier, tierShadowMapSize, type QualityTierSetting } from './qualityTier';
+import { applyInstancedBatching } from './instancedBatching';
 import { getDeviceCaps } from './deviceCaps';
 import { getPlayerQualityTier } from './playerQualityTier';
 import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
@@ -2859,7 +2860,14 @@ export function syncSceneRenderables3D(
   world: World,
   scene: THREE.Scene,
   state: RenderState,
-  callbacks?: { renderables?: SyncCallbacks; skinned?: SyncCallbacks },
+  callbacks?: {
+    renderables?: SyncCallbacks;
+    skinned?: SyncCallbacks;
+    /** Collapse repeated (geometry, material) draws into InstancedMesh (#154 P4b). Opt-in:
+     *  the editor SceneView must NOT enable it, because it picks entities by raycasting the
+     *  individual meshes a batch hides. See instancedBatching.ts. */
+    batchDrawCalls?: boolean;
+  },
 ) {
   syncRenderables(world, scene, state, callbacks?.renderables);
   syncSkinnedModels(world, scene, state, callbacks?.skinned);
@@ -2874,6 +2882,15 @@ export function syncSceneRenderables3D(
   // VideoTexture. Runs LAST because it reads the objects the syncs above create, and
   // lives in its own module (an additive concern; this file is big enough).
   if (__MODOKI_MODULE_VIDEO__) syncVideoTextures(world, state);
+
+  // Draw-call batching (#154 P4b) — LAST, and opt-in per caller. It reads the geometry,
+  // material and world transform the syncs above settled, and decides none of them; running it
+  // earlier would key off half-resolved materials and merge things that are about to diverge.
+  //
+  // OPT-IN because it hides the individual meshes it replaces, and the editor SceneView picks
+  // entities by raycasting those meshes — batching them there would break selection. The game
+  // runtime, which has no picking, is where the 237-draw-call frame lives.
+  if (callbacks?.batchDrawCalls) applyInstancedBatching(scene, state.ecsObjects.values());
 }
 
 /** Clear all owned-material tracking. Call on world swap alongside clearing

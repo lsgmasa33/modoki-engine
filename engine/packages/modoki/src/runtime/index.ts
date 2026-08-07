@@ -254,6 +254,15 @@ export { sceneManager, gameIdFromScenePath, type Scene, type SceneState, type Lo
 export { validateSceneData, typeMismatch, REF_FIELDS_BY_TRAIT, type SceneSchema, type ValidationResult } from './loaders/sceneValidation';
 export { buildSceneSchema } from './scene/sceneSchema';
 export { applyOps, type MutateOp, type MutableScene, type MutableEntity, type EntityRef as MutateEntityRef, type ApplyResult } from './scene/sceneMutate';
+// Entity-creation spec builders + the anchor-first UI authoring rules. In runtime (not editor)
+// since #166 so the DEVICE create-entity op can build the SAME entities the editor does — the
+// editor half of the package is stripped from a shipped game build. See
+// docs/plans/device-authoring-parity-plan.md.
+export { buildEntityCreateSpecs, type CreateEntitySpec, type CreateSpecs, type TraitSpec, type LightKind } from './scene/entityCreateSpecs';
+export { buildUiCreateSpecs, type UiPreset, type UiTraitSpec } from './ui/uiAuthoring';
+// Hierarchy legality (#166 P7) — the ONE self-parent/cycle rule, shared by the editor's undoable
+// reparent and the device's direct parentId write. See runtime/core/ecs/hierarchy.ts.
+export { isAncestorOf, reparentRefusal, type ReparentRefusal } from './core/ecs/hierarchy';
 /** LOCAL↔WORLD Transform authoring (`set_transform {space}`) — the FILE-path conversion.
  *  The live path uses `worldToLocal3D`/`getWorldTransform3D` from core/ecs/worldTransform. */
 export { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes, type TRS } from './scene/transformSpace';

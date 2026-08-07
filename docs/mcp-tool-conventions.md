@@ -110,13 +110,25 @@ Therefore:
 
 > **No mutating operation is reachable by GET.**
 
-Because such an operation's failure is structurally unchecked. Five tools violate this today —
+Because such an operation's failure is structurally unchecked. **Six** tools violate this today —
 `modoki_build`, `add_native_target`, `ota_publish`, and (found only by reading query params, not
-routes) `modoki_journal` and `editor_journal`, which mutate via `?action=start` and `?clear=1`
-(F3). A failed clear of the 10,000-event ring reports success.
+routes) `modoki_journal`, `editor_journal` — which mutate via `?action=start` and `?clear=1` (F3) —
+and **`modoki_hit_regions`**, whose `action:'show'|'hide'` flips the overlay through a GET-only
+route (`setHitRegionOverlayVisible`, `agentBridge.ts:1011`; the route has exactly one branch,
+`editorBackendRouter.ts:1050`). A failed clear of the 10,000-event ring reports success.
+
+⚠️ `hit_regions` was added AFTER the audit that produced this list, and the list said "five" until
+the #166 close-out re-derived it from the contract table instead of re-reading this sentence. **A
+count in prose goes stale silently; the re-runnable query does not** — every violator is
+`mutating:true && method:'GET'` in `contracts.ts`, minus the ones that genuinely split by method
+(`modoki_profiler`, `modoki_watch`, `modoki_input_watch`, `modoki_project_settings`).
+
+**The fix pattern, if you close one:** `modoki_profiler` (#166 P6) is the worked example — the read
+actions stay GET, the state-changing ones move to POST on the same route, and a mutating action
+arriving by GET gets a **405 naming the right method** rather than being served.
 
 **Inventory the query params, not just the route and the method.** A scan of route methods was blind
-to two of the five.
+to three of the six — the two journals and `hit_regions`.
 
 Two more consequences:
 - **A missing route must 404, not 200.** On the default backend (the Vite dev server) an absent

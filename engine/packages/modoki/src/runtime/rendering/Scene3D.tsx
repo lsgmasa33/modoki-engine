@@ -44,6 +44,22 @@ import type { BloomStageConfig, VignetteStageConfig, DofStageConfig, AoStageConf
 import { SuperSampleRebuildDebouncer } from './npr/ssRebuildDebounce';
 import { nprConfigFromTrait, type NprTraitSnapshot } from './npr/nprConfigFromTrait';
 
+/** Draw-call batching (#154 P4b) — built, correct, tested, and DEFAULT OFF because it was
+ *  measured to be worthless on the project it was built for.
+ *
+ *  On `games/sling` / Huawei Y6 it does exactly what it claims: 235 draw calls collapse to 38
+ *  (`drawCallsSaved: 197`). The frame does not move — 81-86 ms before, 85-86 ms after, inside a
+ *  +/-2.5% noise floor — because `submit` stays ~13 ms with 38 calls just as it was with 235. So
+ *  per-call driver overhead was never the cost, and the P4b premise was wrong. Worse, the batching
+ *  pass itself adds ~2.6 ms to `renderables`.
+ *
+ *  Kept rather than reverted because the mechanism is sound and the census says other projects are
+ *  far more repeated (forest-camp 554 entities on repeated pairs, 3d-test 456) — but it must not
+ *  ship enabled on the strength of a hypothesis its own measurement refuted. Flip this ON only
+ *  behind a before/after `renderer.calls` AND frame-time reading on the target device.
+ *  Full write-up: docs/plans/draw-call-instancing-plan.md. */
+const BATCH_DRAW_CALLS = false;
+
 let nextInstanceId = 0;
 
 export default function Scene3D() {
@@ -327,7 +343,7 @@ export default function Scene3D() {
         syncLights(world, scene, ecsLights);
         endProfilerSample();
         beginProfilerSample('renderables');
-        syncSceneRenderables3D(world, scene, renderState);
+        syncSceneRenderables3D(world, scene, renderState, { batchDrawCalls: BATCH_DRAW_CALLS });
         endProfilerSample();
         orientBillboards(renderState, activeCamera); // face billboards toward the live camera
         // Inside the editor PREVIEW envelope the SceneView owns particle preview (it supplies its
@@ -604,7 +620,7 @@ export default function Scene3D() {
           // syncBoneAttachments a skeletal scene captured absent or frozen at a
           // stale pose, breaking the "same ECS state ⇒ same framing" contract of
           // the agent-verification path (modoki_render_scene).
-          syncSceneRenderables3D(world, scene, renderState);
+          syncSceneRenderables3D(world, scene, renderState, { batchDrawCalls: BATCH_DRAW_CALLS });
           syncParticles(world, scene, particleState);
           syncFlameMeshes(world, scene, flameState);
 

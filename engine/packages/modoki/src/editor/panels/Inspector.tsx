@@ -52,7 +52,7 @@ import { ModelAssetView } from './assetViews/ModelAssetView';
 import { ShaderAssetView } from './assetViews/ShaderAssetView';
 import { SceneAssetView } from './assetViews/SceneAssetView';
 import { openAssetInEditor } from './openAssetInEditor';
-import { isSelfPlacementDisabled, selectionAnchorGate, selectionSizeGate } from '../uiAuthoring';
+import { isSelfPlacementDisabled, selectionAnchorGate, selectionSizeGate } from '../../runtime/ui/uiAuthoring';
 import { onEditorDirty } from '../../runtime/ui/uiTreeStore';
 import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { getPhysicsLayerNames } from '../../runtime/physics/physicsLayers';

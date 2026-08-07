@@ -44,6 +44,25 @@ const NOT_DATA_PLANE: Record<string, string> = {
 // adb side channel (bypassing the lease's device identity, the exact #142 class) and no test would
 // have objected. A guard weakened by a premise nobody rechecks is this repo's recurring failure.
 
+/** Tools whose device op does NOT answer with a `{ok, …}` JSON envelope, so a structured
+ *  `{ok:false}` is not their refusal shape and asserting it would test a protocol they never speak.
+ *  Named with reasons rather than skipped silently — a blanket skip is how a real gap hides.
+ *
+ *  Every one of these still has to pass the `Error: …` loop above, which IS their refusal shape. */
+const NOT_A_JSON_ENVELOPE: Record<string, string> = {
+  device_diagnose: 'ok:false IS the answer here (your scene is unhealthy), not a failed call — it is the one entry in OK_IS_A_VERDICT',
+  device_eval: 'returns whatever the evaluated code returned; an eval body may legitimately produce {ok:false} as DATA',
+  device_eval_api: 'returns a discovery document (the injected object\'s op list), not a status envelope',
+  device_console_logs: 'returns a log payload; its failures arrive as `Error: …`',
+  device_native_logs: 'returns a log payload; its failures arrive as `Error: …`',
+  device_tap: 'input tools reply with a bare `ok …` / `Error: …` STRING, not JSON',
+  device_drag: 'bare-string input reply',
+  device_pointer: 'bare-string input reply',
+  device_hover: 'bare-string input reply',
+  device_scroll: 'bare-string input reply',
+  device_press_key: 'bare-string input reply',
+};
+
 /** The smallest VALID call per tool — the ergonomic form, same rule as the editor table's
  *  `minimalArgs`. Explicit rather than synthesized: a synthesized aim (`{x:1,y:2}`) would trip the
  *  unscaled-coordinate refusal and test that instead of the tool. */
@@ -62,6 +81,17 @@ const MINIMAL: Record<string, Record<string, unknown>> = {
   device_resolve_refs: { refs: ['g-1'] },
   device_introspect: {},
   device_dispatch_action: { name: 'engine.playClip' },
+  device_mutate_scene: { guid: 'g-1', set: { 'Renderable3D.isVisible': false } },
+  device_create_entity: { spec: { kind: 'primitive', mesh: 'sphere' } },
+  device_duplicate_entity: { guid: 'g-1' },
+  device_delete_entities: { guids: ['g-1'] },
+  device_step: {},
+  device_load_scene: { path: '/games/x/main.scene.json' },
+  device_read_asset_def: { path: '/games/x/fx.particle.json' },
+  device_profiler: {},
+  device_set_timescale: { scale: 0 },
+  device_handles: {},
+  device_invalidate_assets: { items: [{ path: '/a.glb', type: 'model' }] },
   device_console_logs: {},
   device_native_logs: {},
   device_eval: { code: 'return 1' },
@@ -137,6 +167,27 @@ describe('device tool surface — every tool, table-driven', () => {
           req.path === '/api/device/request' ? deviceReply('Error: the op refused') : undefined));
         const r = await s.call(name, MINIMAL[name]);
         expect(r.isError, `${name} reported a device refusal as success`).toBe(true);
+        expect(s.text(r)).toMatch(/refused/);
+      });
+    }
+  });
+
+  describe('every data-plane tool fails when the device refuses with a STRUCTURED body', () => {
+    // The `Error: …` loop above covers only the STRING refusal shape. An op can also refuse with a
+    // 200 carrying `{ok:false, error}` — which is the shape EVERY write op added in #166 uses, and
+    // the one `isFailureBody` exists for. That path was spot-checked for two tools in another file
+    // and table-driven for none, so the doc's "table-driven over the registry, so it cannot miss a
+    // tool" claim (§10) did not actually hold for it. Concrete mutation this now catches: adding an
+    // op to `OK_IS_A_VERDICT` in mcp-tools.ts turns a genuine refusal into a reported success.
+    for (const name of Object.keys(MINIMAL)) {
+      if (name in NOT_DATA_PLANE || name in NOT_A_JSON_ENVELOPE) continue;
+      it(`${name} treats a 200 {ok:false} as a failure`, async () => {
+        const s = (surface = await loadDeviceSurface((req) =>
+          req.path === '/api/device/request'
+            ? deviceReply({ ok: false, error: 'the op refused: structured body' })
+            : undefined));
+        const r = await s.call(name, MINIMAL[name]);
+        expect(r.isError, `${name} reported a structured {ok:false} refusal as success`).toBe(true);
         expect(s.text(r)).toMatch(/refused/);
       });
     }

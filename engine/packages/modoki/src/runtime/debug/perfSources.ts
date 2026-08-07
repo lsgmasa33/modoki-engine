@@ -10,6 +10,7 @@ import { isProfilerEnabled, getMarkerFaults, type MarkerFaults } from '../core/p
 import { getMarkerAggregate, type MarkerStat } from '../core/profilerAggregate';
 import { getCounters, type CounterStat } from '../core/profilerCounters';
 import { getGpuProfile, getRestBreakdown, isGpuTimingEnabled, type GpuProfile, type RestBreakdown } from '../core/gpuTimings';
+import { getBatchStats, type BatchStats } from '../rendering/instancedBatching';
 
 export const MB = 1024 * 1024;
 
@@ -106,6 +107,11 @@ export function readPerfProfile(opts: { markers?: number } = {}): {
   /** `restMs` split into measured GPU-busy versus present+idle. Present only when real samples
    *  exist. This is the field that gives `frame.vsyncBound` evidence instead of an inference. */
   restBreakdown?: RestBreakdown;
+  /** Draw-call batching (#154 P4b). ALWAYS present, even all-zero: "batching ran and found
+   *  nothing" and "batching never ran" are different facts, and `renderer.calls` alone cannot
+   *  tell them apart — which is exactly how the first on-device attempt looked like a null
+   *  result instead of an unfired mechanism. `skipped` says WHY anything was excluded. */
+  batching: BatchStats;
 } {
   const mem = readMemory();
   const frame = getFrameProfile();
@@ -119,6 +125,7 @@ export function readPerfProfile(opts: { markers?: number } = {}): {
     ...markerFields(opts.markers ?? DEFAULT_MARKER_ROWS),
     ...counterFields(),
     ...gpuFields(frame.restMs.median),
+    batching: getBatchStats(),
   };
 }
 

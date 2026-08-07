@@ -22,10 +22,11 @@
  * pays nothing. docs/trusted-device-input.md carries the measurement and the reasoning.
  */
 
-import { spawn, execFileSync, type ChildProcess } from 'child_process';
+import { spawn, execFile, execFileSync, type ChildProcess } from 'child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { claimDevice, iosDeviceId, releaseDevice } from './deviceClaims';
 import { wdaBaseDir } from '../../toolchain';
 import { findXctestrun, wdaDerivedDataDir } from '../../toolchain/wdaProvision';
@@ -141,9 +142,47 @@ export function mergeIosDevices(primary: IosDevice[], legacy: IosDevice[]): IosD
  *  parses — which surfaces as "no iOS device is connected" with a phone sitting right there.
  *  Measured 2026-08-03; the unit tests could not catch it because they inject the listing string,
  *  so the real command is only ever exercised on a Mac with a device attached. */
+// Promisified rather than `execFileSync`: this backend runs INSIDE the Electron main process, so a
+// SYNC spawn here blocks the whole editor's input for as long as the command takes — measured
+// 1.3-1.4s per call, freezing drags mid-gesture every ~10s while the AI panel polled the cache
+// (#168). Do not "simplify" these back to execFileSync; that is the exact regression #168 fixed.
+const execFileAsync = promisify(execFile);
+
+/** The argv for both listings, named ONCE so the sync and async seams below cannot drift apart.
+ *  They are two ways to run the SAME command, and a divergence here would make the picker and the
+ *  launcher disagree about what is attached — the one thing `listIosDevicesForSelection`'s banner
+ *  says must never happen. */
+const DEVICECTL_ARGV = (out: string): string[] => ['devicectl', 'list', 'devices', '--json-output', out];
+const XCTRACE_ARGV = ['xctrace', 'list', 'devices'];
+/**
+ * Where devicectl is told to write its JSON — a fresh path PER CALL.
+ *
+ * ⚠️ It was `modoki-devicectl-<pid>.json`, one path for the whole process, and that was safe only
+ * by accident: `execFileSync` blocked the single JS thread for the entire spawn→read→unlink cycle,
+ * so two listings could not interleave. #168 made the POLLED listing async and removed that
+ * accident — while leaving `ensureWdaRunning` on the sync twin — so the two can now overlap:
+ *
+ *   1. `/api/device/list` (polled every 2.5s) cache-misses, spawns devicectl, yields.
+ *   2. A `device_tap` calls `ensureWdaRunning` → `listDevicesSync()`, which computes the SAME path
+ *      and spawns a second devicectl. Blocking the JS thread does not stop the first OS process,
+ *      which is still writing to that file.
+ *   3. Either read can see a torn or already-unlinked file. `parseIosDevices` swallows a JSON
+ *      failure and returns `[]`, so `resolveIosDevice` reports "no iOS device is paired with this
+ *      Mac" — and `ensureWdaRunning` LATCHES that into `lastFailure`, which short-circuits every
+ *      later call until the lease is dropped. A one-off file race becomes "trusted iOS input is
+ *      degraded for the rest of the session", looking exactly like an unplugged phone.
+ *
+ * A per-call suffix makes the whole class unrepresentable, which is cheaper than serializing the
+ * two seams. A COUNTER, not `Math.random()`: this file is bounded by the process, and a counter
+ * keeps the name reproducible in a log.
+ */
+let devicectlSeq = 0;
+const devicectlOutPath = (): string =>
+  path.join(os.tmpdir(), `modoki-devicectl-${process.pid}-${++devicectlSeq}.json`);
+
 export const wdaLauncherExec = {
-  listDevices(): string {
-    const out = path.join(os.tmpdir(), `modoki-devicectl-${process.pid}.json`);
+  async listDevices(): Promise<string> {
+    const out = devicectlOutPath();
     try {
       // stderr is PIPED, not ignored, for the same reason the launch pipes it (#144): the caller
       // turns a throw here into "could not list iOS devices (<message>)", and with stderr
@@ -151,9 +190,7 @@ export const wdaLauncherExec = {
       // naming nothing. devicectl's own line (no Xcode, xcrun refusing, a broken CoreDevice) is
       // the only thing that says what to DO. stdout stays ignored: the JSON goes to a file, and
       // the human-readable table there is exactly what must not be read (see above).
-      execFileSync('xcrun', ['devicectl', 'list', 'devices', '--json-output', out], {
-        timeout: 20000, stdio: ['ignore', 'ignore', 'pipe'],
-      });
+      await execFileAsync('xcrun', DEVICECTL_ARGV(out), { timeout: 20000 });
       return fs.readFileSync(out, 'utf8');
     } finally {
       try { fs.rmSync(out, { force: true }); } catch { /* best-effort */ }
@@ -162,11 +199,42 @@ export const wdaLauncherExec = {
   /** The legacy listing (#143). Failure returns '' rather than throwing: this is an ADDITIVE
    *  source, so an Xcode without `xctrace` must leave the devicectl path working exactly as
    *  before, not break device selection outright. Bounded like every other exec here. */
-  listLegacyDevices(): string {
+  async listLegacyDevices(): Promise<string> {
     try {
-      return execFileSync('xcrun', ['xctrace', 'list', 'devices'], {
-        timeout: 20000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
-      });
+      const { stdout } = await execFileAsync('xcrun', XCTRACE_ARGV, { timeout: 20000, encoding: 'utf8' });
+      return stdout;
+    } catch { return ''; }
+  },
+
+  // ── The SYNC twins, for `ensureWdaRunning` only ──────────────────────────────────────────────
+  //
+  // ⚠️ These are not leftovers, and they are not the thing #168 removed. #168 is about the POLLED
+  // read: the AI panel hits `/api/device/list` every 2.5s, so a sync exec there froze the editor's
+  // input every ~10s. `ensureWdaRunning` is the opposite case — a human-initiated launch that then
+  // spends 60s spinning WebDriverAgent up, where 1.4s of sync exec costs nothing anyone can feel.
+  //
+  // What it DOES cost, if made async, is the await-free window documented at that call site: the
+  // check-and-set from `isWdaProcessRunning()` down to `spawnFn(...)` is atomic only because no
+  // `await` interleaves it, which is what lets this module skip the in-flight promise-guard its
+  // neighbours carry. Awaiting the listing inside that window makes two concurrent input ops both
+  // spawn a signed 60-second agent — #109 wearing a different hat, and `wdaLauncher.test.ts`'s
+  // "two CONCURRENT input ops spawn exactly ONE agent" catches it (measured: 2 spawns, not 1).
+  //
+  // So the split is deliberate: async where it is polled, sync where it must be atomic. Both go
+  // through the SAME argv above and the same parse+merge below, so the picker's list and the
+  // launcher's list still cannot disagree.
+  listDevicesSync(): string {
+    const out = devicectlOutPath();
+    try {
+      execFileSync('xcrun', DEVICECTL_ARGV(out), { timeout: 20000, stdio: ['ignore', 'ignore', 'pipe'] });
+      return fs.readFileSync(out, 'utf8');
+    } finally {
+      try { fs.rmSync(out, { force: true }); } catch { /* best-effort */ }
+    }
+  },
+  listLegacyDevicesSync(): string {
+    try {
+      return execFileSync('xcrun', XCTRACE_ARGV, { timeout: 20000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
     } catch { return ''; }
   },
 };
@@ -180,13 +248,19 @@ export const wdaLauncherExec = {
  *  (`devicectl`, then `xctrace`), each already bounded; returns `[]` rather than throwing, since a
  *  listing that cannot be produced is "none visible", not an error the caller can act on.
  *
+ *  **`async`, not sync (#168).** This backend runs inside the Electron MAIN process, and the AI
+ *  panel's device picker polls the route this feeds every 2.5s — a sync `execFileSync` here froze
+ *  ALL editor input (mouse/keyboard forwarding to the renderer) for the ~1.4s the command took,
+ *  every ~10s once the cache lapsed. Measured: 6 freezes of 1326-1425ms in 75s; zero once async.
+ *  Do not revert this to a sync seam "for simplicity" — that reintroduces #168.
+ *
  *  macOS-only in practice — both commands are `xcrun`. The caller gates on the platform. */
-export function listIosDevicesForSelection(): IosDevice[] {
+export async function listIosDevicesForSelection(): Promise<IosDevice[]> {
   const now = Date.now();
   if (iosListCache && now - iosListCache.at < IOS_LIST_TTL_MS) return iosListCache.devices;
   let primary: IosDevice[] = [];
-  try { primary = parseIosDevices(wdaLauncherExec.listDevices()); } catch { /* no Xcode / devicectl */ }
-  const devices = mergeIosDevices(primary, parseXctraceDevices(wdaLauncherExec.listLegacyDevices()));
+  try { primary = parseIosDevices(await wdaLauncherExec.listDevices()); } catch { /* no Xcode / devicectl */ }
+  const devices = mergeIosDevices(primary, parseXctraceDevices(await wdaLauncherExec.listLegacyDevices()));
   iosListCache = { at: now, devices };
   return devices;
 }
@@ -204,6 +278,10 @@ let iosListCache: { at: number; devices: IosDevice[] } | null = null;
 
 /** Test seam — drop the cached listing so a test can change what `xcrun` reports. */
 export function _clearIosListCache(): void { iosListCache = null; }
+
+/** Test seam for the per-call temp path (see `devicectlOutPath`) — the ONLY way to assert the
+ *  uniqueness that keeps a concurrent sync + async listing from sharing a file. */
+export function _devicectlOutPath(): string { return devicectlOutPath(); }
 
 /** What the LEASED device reports about its own hardware, for tying the launch to it (#146).
  *  Either field may be null — see `resolveIosDevice` for what that means.
@@ -447,6 +525,9 @@ export interface EnsureWdaRunningOpts {
   /** Injected for tests. */
   probe?: (url: string) => Promise<boolean>;
   spawnImpl?: typeof spawn;
+  /** Sync in tests (a plain string-returning function) is fine — `await` on a non-promise is a
+   *  no-op — but the real seam (`wdaLauncherExec.listDevices`) is async (#168): this runs in the
+   *  Electron main process, so a sync spawn here would freeze the whole editor's input. */
   listDevices?: () => string;
   /** The legacy `xctrace` listing (#143) — injected separately so a test can prove the union. */
   listLegacyDevices?: () => string;
@@ -527,12 +608,19 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
   if (await probe(statusUrl)) return { running: true };
 
   // ⚠️ INVARIANT: from this guard down to `child = spawnFn(...)` there must be NO `await`. That
-  // synchronous window is the ONLY thing making check-and-set atomic, and it is what lets this
-  // module skip the `inFlight` promise-guard its neighbours carry (`getDeviceCdpSession`,
+  // synchronous window is the ONLY thing making check-and-set atomic, which is what lets this
+  // module skip the in-flight promise-guard its neighbours carry (`getDeviceCdpSession`,
   // `inFlightBakes`, `platformInFlight`). Add an await in here — making the device listing async,
   // say — and two concurrent input ops both pass the guard and BOTH spawn a signed 60-second
   // agent, which is the bug #109 fixed wearing a different hat. Pinned by the concurrency test in
-  // wdaLauncher.test.ts, which fails on the rearrangement rather than on the symptom.
+  // `wdaLauncher.test.ts`.
+  //
+  // ⚠️ #168 is exactly that temptation, and it was tried: making these two seams async reopened the
+  // double-spawn and the test caught it (2 spawns, not 1 — measured, not assumed). The listing here
+  // therefore uses the SYNC twins on `wdaLauncherExec` while the POLLED read
+  // (`listIosDevicesForSelection`) uses the async ones. See the twins' banner for why that split is
+  // right rather than a leftover: sync exec is free in a 60s human-initiated launch and ruinous in
+  // a route polled every 2.5s from the Electron main process.
   //
   // A launch WE started is still running but not answering yet (#109). Report that and return —
   // never spawn a second one. This is the half that makes "do not kill it on timeout" safe: the
@@ -559,7 +647,7 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
   }
 
   let listing: string;
-  try { listing = (opts.listDevices ?? wdaLauncherExec.listDevices)(); }
+  try { listing = (opts.listDevices ?? wdaLauncherExec.listDevicesSync)(); }
   catch (e) {
     lastFailure = `could not list iOS devices (${describeExecFailure(e)})`;
     return { running: false, reason: lastFailure };
@@ -574,7 +662,7 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
   // to this Mac's actual hardware and merged it in — six of them failed, one after 61 REAL seconds.
   // A seam that is injectable only halfway is worse than none: it makes unit tests depend on which
   // phones happen to be plugged in.
-  const legacyDefault = opts.listDevices ? () => '' : wdaLauncherExec.listLegacyDevices;
+  const legacyDefault = opts.listDevices ? () => '' : wdaLauncherExec.listLegacyDevicesSync;
   const legacy = (opts.listLegacyDevices ?? legacyDefault)();
   const resolved = resolveIosDevice(
     mergeIosDevices(parseIosDevices(listing), parseXctraceDevices(legacy)), process.env, opts.lease,

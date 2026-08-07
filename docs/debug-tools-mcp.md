@@ -39,7 +39,27 @@ Grouped:
   `device_screenshot` ·
   `device_console_logs` · `device_native_logs` (both default `limit:50`).
 - **Percept (read-by-data):** `device_get_scene_state` · `device_diagnose` · `device_journal` ·
-  `device_resolve_refs` · `device_introspect` · `device_layout_bounds` · `device_watch`.
+  `device_resolve_refs` · `device_introspect` · `device_layout_bounds` · `device_watch` ·
+  `device_profiler` (where did the frame go — the phone is the only place that question is real) ·
+  `device_handles`.
+- **Authoring (live-world WRITES, #166):** `device_mutate_scene` (set trait fields over a
+  `where` filter / `guid[]` / `name` / `id` — `dryRun` first if the selector is broad) ·
+  `device_create_entity` · `device_duplicate_entity` (**includes descendants**, `count` up to 1000 —
+  the "spawn N more and watch the frame" experiment) · `device_delete_entities` ·
+  `device_load_scene` (swap level, no rebuild) · `device_set_timescale` (0 = pause) ·
+  `device_step` (advance a PAUSED world N frames, then re-freeze) · `device_invalidate_assets` ·
+  `device_read_asset_def` (what the RUNNING build resolved — not what the file on your disk says;
+  peeks the live cache, never fetches).
+  ⚠️ **Put a frame boundary between a write and a renderer read.** `diagnose`'s renderer stats
+  (`calls`/`triangles`) describe the LAST RENDERED frame, so reading them in the same `device_eval`
+  body as the mutation reports the PRE-mutation numbers — measured: restoring 114 renderables and
+  reading in the same body returned the old `calls:4`, which reads exactly like a failed write.
+  `device_step` is that boundary; a separate call also works.
+
+  **All of it is live-world only** — a device has no project on disk, there is no undo stack, and a
+  relaunch is the undo. Every reply says so rather than leaving persistence unstated. `device_step`
+  advances REAL frames (~16-33ms each), not a fixed dt: a measurement aid, not a deterministic
+  repro. Why these exist and what is still missing: [plans/device-authoring-parity-plan.md](plans/device-authoring-parity-plan.md).
 - **Enact (input):** `device_tap` · `device_drag` · `device_pointer` (sustained/HELD
   press, split into down/move/up — the stateful twin of `device_drag`) · `device_dispatch_action` ·
   `device_press_key` · `device_hover` · `device_scroll` · `device_type_text`.
@@ -289,6 +309,32 @@ claim is taken by the lease (`connect`) and by the WDA launch, released on `disc
 expired by **pid liveness plus a 12h TTL** — a dead session must never hold hardware hostage. A
 refusal names the clone, branch, pid and time. Rationale in `engine/plugins/backend/deviceClaims.ts`;
 this replaces the unenforced "serialize on-device builds" convention in the root `CLAUDE.md`.
+
+**⚠️ Listing devices must never be SYNCHRONOUS — the backend runs inside the Electron main process
+(#168).** `/api/device/list` resolved its iOS half with `execFileSync('xcrun', ['xctrace', 'list',
+'devices'])`, measured at **1.379s**. The AI panel's device picker polls that route every 2.5s and the
+iOS listing is cached for 10s, so every ~10s the main process blocked for ~1.4s. A blocked main
+process stops forwarding input to the renderer: macOS keeps drawing the cursor (the window server
+owns that) and the renderer keeps compositing at 60fps, so the symptom is not "the editor froze" but
+**a drag that stops tracking your hand for a second or two while everything else looks alive**. That
+is how it was reported, and it sent the first three investigations into the game's own drag code.
+
+Measured with a CDP `Browser.getVersion` ping — answered by the browser (main) process, touching no
+project JavaScript — with the AI panel open: **6 spikes of 1326–1425ms in 75s, p50 0ms**; with the
+route stubbed, **0 spikes, max 2ms in 45s**; after the fix, **0 spikes, max 13ms in 75s**. Spike
+spacing was exactly 10.0s or 12.5s, the signature of a 10s TTL polled at 2.5s. `sample(1)` on the
+main process put the time inside `node::SyncProcessRunner::Spawn` under an HTTP request handler.
+
+The rule that generalises: **a sync spawn is free on a user-initiated route and ruinous on a polled
+one.** `ensureWdaRunning` keeps sync twins of the same seams deliberately — it is a human-initiated
+60s WDA launch, and its check-and-set from the `isWdaProcessRunning()` guard to `spawnFn(...)` must
+stay await-free or two concurrent input ops both spawn an agent (#109; making it async reopened that,
+caught by the concurrency test). So the split is async-where-polled, sync-where-atomic, both through
+one shared argv. Siblings that match the pattern and are NOT yet async, each measured cheap on this
+Mac rather than assumed: `/api/device/list`'s Android half (`adb devices -l`, **13ms** warm) and the
+AI panel's `modoki:connect-claude-status` IPC (`git ls-files` per poll; a login-shell `command -v
+claude` behind a 15s TTL, only when `claude` is off the inherited PATH — a Finder-launched DMG). Both
+would bite on a cold adb server or a slow repo.
 
 **The claim arbitrates the PHONE; the derived host port arbitrates the TUNNEL (#158).** These are two
 different questions, and the claim structurally cannot answer the second: two clones leasing two
@@ -621,7 +667,7 @@ Two things the table is worth reading FOR, not just referring to:
 
 <!-- BEGIN GENERATED TOOL CATALOG -->
 
-*82 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
+*83 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
 run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fails `npm test`.*
 
 #### Read — answer a question about state (never changes anything)
@@ -719,6 +765,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_persistence` | POST `/api/persistence` | no persistence | editor | — | *(no args)* |
 | `modoki_play_clip` | POST `/api/editor-action` `dispatch-action` | no persistence | editor + renderer | entity | `{"guid":"00000000-0000-0000-0000-000000000000","clip":"Idle"}` |
 | `modoki_play_control` | POST `/api/editor-action` *(op = your `action`)* | session | editor | — | `{"action":"stop"}` |
+| `modoki_profiler` | GET `/api/profiler` *(both varies)* | session | editor + renderer | — | *(no args)* |
 | `modoki_project_settings` | GET `/api/project-settings` *(method varies)* | file | project | — | `{"action":"get"}` |
 | `modoki_scene_view_mode` | POST `/api/editor-action` `set-scene-view-mode` | session | editor | — | `{"mode":"3d"}` |
 | `modoki_set_playhead` | POST `/api/editor-action` `set-playhead` | session | editor | — | `{"t":0}` |
@@ -740,6 +787,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | Tool | Endpoint | Effect | Needs | Aim | Smallest call |
 |---|---|---|---|---|---|
 | `modoki_batch` | — | live | editor | — | `{"steps":[{"tool":"wait","args":{"ms":1}}]}` |
+
 <!-- END GENERATED TOOL CATALOG -->
 
 ### `device_*` vs `modoki_*` — the naming asymmetries, stated once
@@ -758,9 +806,21 @@ existing agent call for a cosmetic win. Read across:
 Where the two DO share a param name, they now mean the same thing — `device_scroll` took `dx`/`dy`
 against the editor's `deltaX`/`deltaY` until the Phase-8 device sweep; `deltaX`/`deltaY` are canonical
 on both now, with `dx`/`dy` kept as aliases. **Editor-only by nature** (no game equivalent exists):
-`handles` / `tap_handle` / `drag_handle` / `dnd` / `focus` (editor chrome + Canvas2D authoring),
-`render_scene`, `play_control` / `set_timescale` / `history`, `identity`. **Known device gaps**, logged
-as features rather than audit fixes: no `device_type_text`, no `device_pointer` (sustained press).
+`tap_handle` / `drag_handle` / `dnd` / `focus` (editor chrome + Canvas2D authoring),
+`play_control` / `history`, `identity`.
+
+**The device is no longer read-only (#166).** It used to be: of ~20 registered ops every one was a
+read except `dispatch-action` (which the game must implement) and `set-timescale`, so any "what if X
+were hidden/smaller/absent?" question cost an engine edit + web build + `cap sync` + native build +
+install + cold launch — ~3 minutes per question. The write ops now live in `agentBridge.ts`
+(**runtime**), not `agentEditorOps.ts`, which is what puts them on the device AND in both eval APIs
+at once: `modoki.setTraits(…)`, `modoki.duplicateEntity(…)`, `modoki.simStep(…)` are callable from
+inside a `device_eval` body, so a read → filter-in-JS → write → measure loop runs in ONE lease round
+trip. That composition — not the typed tool — is the thing that replaces the rebuild cycle.
+
+**Remaining device gaps**, logged as features rather than audit fixes: no device `render_scene` (it
+returns a JPEG data URL and needs the decode-to-path handling `device_screenshot` has, or it blows
+the response budget), and no fixed-dt stepping (see `device_step` above).
 
 #### Nested deadlines — why `device_eval` caps at 20000ms and `modoki_eval` at 25000ms
 

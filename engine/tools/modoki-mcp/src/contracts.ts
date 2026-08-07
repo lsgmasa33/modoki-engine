@@ -505,6 +505,13 @@ const DECLS: Record<string, Decl> = {
     kind: 'read', method: 'GET', route: '/api/diagnose', requires: ['editor', 'scene'],
     notes: 'C7: `ok:false` is an ANSWER (your scene is unhealthy), not a failed call.',
   },
+  modoki_profiler: {
+    kind: 'control', method: 'GET', route: '/api/profiler', varies: 'both',
+    mutating: true, persists: 'session', requires: ['editor', 'renderer'],
+    filters: ['markers'],
+    minimalArgs: {},
+    notes: 'Read actions (read / capture-read) are GET; the state-changing ones (capture-*, gpu-*, reset) are POST, so §4 holds per action. A read-side filter passed to a mutating action is REFUSED, not dropped (the `watch` S3.19 hazard).',
+  },
   modoki_watch: {
     kind: 'control', method: 'GET', route: '/api/watch/list', varies: 'both',
     mutating: true, persists: 'session', requires: ['editor', 'renderer'],

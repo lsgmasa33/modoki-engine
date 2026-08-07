@@ -15,7 +15,7 @@
  *      an anchored panel stacking a runtime-variable list) → stays live.
  *  Only the first set lives in SELF_PLACEMENT_PROPS. */
 
-import { isSizeInert } from '../runtime/ui/anchorLayout';
+import { isSizeInert } from './anchorLayout';
 
 export type UiPreset = 'view' | 'text' | 'image' | 'button' | 'input' | 'slider';
 

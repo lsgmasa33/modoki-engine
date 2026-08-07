@@ -10,7 +10,7 @@ import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 
 export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
-  const { getJson, postJson, editorAction } = ctx;
+  const { getJson, postJson, editorAction, fail } = ctx;
 
   // ════════════════════════════════════════════════════════════════════════════
   // Enable-Claude-more tools (semantic verification, numeric layout, asset authoring,
@@ -170,6 +170,59 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'the summary never claims "No issues detected" while older errors exist.',
     {},
     async () => getJson('/api/diagnose'),
+  );
+
+  // ── Profiler (#166 P6) — the editor half of a gap that existed on BOTH surfaces ──
+  tool(
+    'modoki_profiler',
+    'Where did the frame go? — the Profiler surface (#138), which until now had NO typed tool on ' +
+      'EITHER surface and was reachable only by an agent who knew to eval the op. Called bare it ' +
+      'reads the live marker aggregate (the per-marker self-ms breakdown of a frame). ' +
+      'capture-start/-stop/-read record real frames and rank the WORST by cost, not the most recent, ' +
+      'so a hitch stays findable after it happened. gpu-on/gpu-off enable GPU timestamp queries — ' +
+      'deliberately opt-in because enabling costs real time (two timestamps per pass) and the ' +
+      'profiler must not change what it measures; where the backend cannot support them the status ' +
+      'comes back "unsupported" with a reason and NO number is invented. reset clears markers and ' +
+      'captures. ⚠️ A desktop editor frame is fast almost regardless — for a REAL perf question use ' +
+      'device_profiler on the target phone; this is for finding which marker owns the frame, and for ' +
+      'editor-side regressions. Read actions are GET, state-changing ones POST.',
+    {
+      action: z.enum(['read', 'capture-start', 'capture-stop', 'capture-read', 'capture-clear', 'gpu-on', 'gpu-off', 'reset'])
+        .optional().describe('Default "read" (the live aggregate). capture-* record/read frames; gpu-* toggle GPU timestamps; reset clears markers + captures.'),
+      markers: z.number().optional().describe('action:read only — how many marker rows to return (default 12).'),
+      limit: z.number().optional().describe('action:capture-read only — how many of the WORST frames to return (default 5, max 20).'),
+    },
+    async ({ action, markers, limit }) => {
+      const act = action ?? 'read';
+      // A read-only filter passed to a state-changing action is REFUSED, not silently dropped —
+      // the cross-action hazard the conventions doc closed for `watch` (S3.19) rather than splitting
+      // the tool name. Silently ignoring `markers` on `reset` would read as "12 markers kept".
+      // Collect ALL stray filters, not just the first: an if/else chain named only one, so an agent
+      // that followed `expected` literally would omit it, resubmit, and hit a second unwarned
+      // refusal for the other. A refusal's job is to be the caller's next move, once.
+      const stray = [
+        ...(act !== 'read' && markers !== undefined ? [{ param: 'markers', belongsTo: 'read' }] : []),
+        ...(act !== 'capture-read' && limit !== undefined ? [{ param: 'limit', belongsTo: 'capture-read' }] : []),
+      ];
+      if (stray.length) {
+        const names = stray.map((s) => `\`${s.param}\``).join(' and ');
+        return fail({
+          code: 'UNKNOWN_PARAM',
+          tool: 'modoki_profiler',
+          what: `run profiler action '${act}' with ${names}`,
+          why: `${names} ${stray.length > 1 ? 'are read-side filters' : `is a read-side filter for action:'${stray[0].belongsTo}'`} and mean${stray.length > 1 ? '' : 's'} nothing for '${act}'. Silently dropping ${stray.length > 1 ? 'them' : 'it'} would read as though ${stray.length > 1 ? 'they had' : 'it had'} been applied.`,
+          expected: `omit ${names}${stray.length > 1 ? '' : `, or use action:'${stray[0].belongsTo}'`}`,
+          options: stray.map((s) => `${s.param} applies only to action:'${s.belongsTo}'`),
+        });
+      }
+      if (act === 'read' || act === 'capture-read') {
+        const qs = new URLSearchParams({ action: act });
+        if (markers !== undefined) qs.set('markers', String(markers));
+        if (limit !== undefined) qs.set('limit', String(limit));
+        return getJson(`/api/profiler?${qs.toString()}`);
+      }
+      return postJson('/api/profiler', { action: act });
+    },
   );
 
   // ── Percept Watch: numeric time-series over the live world ──

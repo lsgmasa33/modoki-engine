@@ -21,7 +21,7 @@ export const COVERED_BY_SMOKE: readonly string[] = [
   'modoki_discard_asset_edits',
   'modoki_load_scene', 'modoki_set_selection', 'modoki_play_control', 'modoki_history',
   'modoki_tap', 'modoki_focus', 'modoki_dispatch_action', 'modoki_set_timescale', 'modoki_journal',
-  'modoki_hit_regions',
+  'modoki_hit_regions', 'modoki_profiler',
 ];
 
 /** MUTATING tools no live tier reaches, each with the reason it cannot be swept.

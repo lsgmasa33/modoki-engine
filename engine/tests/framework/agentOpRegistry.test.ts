@@ -17,7 +17,10 @@ describe('agent op registry', () => {
   it('registers the enable-Claude-more runtime ops (journal/dispatch/layout/diagnose/time)', () => {
     const ops = listAgentOps();
     for (const op of ['journal-events', 'dispatch-action', 'game-introspect', 'clear-journal',
-      'layout-bounds', 'diagnose', 'set-timescale']) {
+      'layout-bounds', 'diagnose', 'set-timescale', 'set-traits',
+      // #166 — the WRITE half, registered in agentBridge (runtime) so the device has it too.
+      'create-entity', 'duplicate-entity', 'delete-entities', 'sim-step', 'load-scene',
+      'read-asset-def']) {
       expect(ops).toContain(op);
     }
   });

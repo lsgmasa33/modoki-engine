@@ -727,8 +727,11 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     }));
     // iOS listing is macOS-only and can be slow (two `xcrun` shell-outs, each bounded at 20s), so it
     // is skipped entirely off-Mac rather than failing — the same platform gate the WDA launcher uses.
+    // `await`ed, not fired sync: this route runs inside the Electron main process and the AI panel
+    // polls it every 2.5s, so a sync exec here froze the whole editor's input for ~1.4s every ~10s
+    // (#168) — `listIosDevicesForSelection`/`wdaLauncherExec` now shell out via async `execFile`.
     const ios = process.platform === 'darwin'
-      ? listIosDevicesForSelection().map((d) => ({ ...d, claim: claimFor(iosDeviceId(d.udid)) ?? null }))
+      ? (await listIosDevicesForSelection()).map((d) => ({ ...d, claim: claimFor(iosDeviceId(d.udid)) ?? null }))
       : [];
     // A WiFi lease claims by ADDRESS, so its claim matches no hardware entry above. Surfaced
     // separately rather than dropped: "someone holds 192.168.1.42" is exactly the collision a
@@ -988,6 +991,41 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   }
   if (urlPath === '/api/watch/clear' && method === 'POST') {
     try { return json(await ctx.requestBrowser('watch-clear', body ?? {})); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+
+  // ── Profiler (#166 P6) ── "where did the frame go?" for the EDITOR surface.
+  //
+  // The op shipped with #138 and had no typed tool on EITHER surface — it was reachable only by an
+  // agent who knew to eval it, which skips strict validation, the §5 envelope, and every coverage
+  // tier. Split by METHOD, not by a single route taking an action: the read actions are GET, and
+  // the ones that change profiler state (capture control, GPU timestamps, reset) are POST, so
+  // conventions §4 — "no mutating operation is reachable by GET", because a GET's ok is never
+  // failure-checked — holds per action rather than on average.
+  if (urlPath === '/api/profiler' && method === 'GET') {
+    const markers = query.get('markers');
+    const limit = query.get('limit');
+    const action = query.get('action') ?? 'read';
+    const MUTATING = ['capture-start', 'capture-stop', 'capture-clear', 'gpu-on', 'gpu-off', 'reset'];
+    if (action !== 'read' && action !== 'capture-read') {
+      // A mutating action arriving by GET is refused rather than served: obeying it here is exactly
+      // the unchecked-failure hole §4 describes. An UNKNOWN action is a DIFFERENT error and must not
+      // be told it "mutates" — `?action=Read` (wrong case) used to get that sentence, which is
+      // simply false and sends the reader looking for the wrong fix.
+      return MUTATING.includes(action)
+        ? json({ error: `profiler action "${action}" MUTATES profiler state, so it must be POSTed to /api/profiler — GET serves only read / capture-read.` }, 405)
+        : json({ error: `unknown profiler action "${action}". GET serves read / capture-read; POST /api/profiler takes ${MUTATING.join(' / ')}.` }, 400);
+    }
+    const params = {
+      action,
+      ...(markers != null && markers !== '' && !Number.isNaN(Number(markers)) ? { markers: Number(markers) } : {}),
+      ...(limit != null && limit !== '' && !Number.isNaN(Number(limit)) ? { limit: Number(limit) } : {}),
+    };
+    try { return json(await ctx.requestBrowser('profiler', params)); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+  if (urlPath === '/api/profiler' && method === 'POST') {
+    try { return json(await ctx.requestBrowser('profiler', body ?? {})); }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
   }
 

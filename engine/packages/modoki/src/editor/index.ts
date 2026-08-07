@@ -15,8 +15,8 @@ export {
 export {
   emptySpecs, primitiveSpecs, shape2DSpecs, canvas2DSpecs, uiSpecs, cameraSpecs, lightSpecs, environmentSpecs, particleSpecs,
   buildEntityCreateSpecs, type CreateEntitySpec, type CreateSpecs, type LightKind,
-} from './entityCreateSpecs';
-export { buildUiCreateSpecs, type UiPreset } from './uiAuthoring';
+} from '../runtime/scene/entityCreateSpecs';
+export { buildUiCreateSpecs, type UiPreset } from '../runtime/ui/uiAuthoring';
 export { enterPlay, stopPlay, pausePlay, resetPlayMode } from './scene/playMode';
 export {
   editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled,

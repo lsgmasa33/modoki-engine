@@ -97,6 +97,73 @@ afterEach(() => { surface?.restore(); surface = undefined; });
 
 type Row = { tool: string; route: string; sent: string[]; unread: string[] };
 
+/** modoki_profiler cannot be measured by the generic sweep above, and the reason is worth stating:
+ *  the synth strategy fills EVERY param, producing `{action:'read', markers:1, limit:1}` — and the
+ *  tool's own (correct) cross-action guard refuses `limit` on action:'read' before any HTTP request
+ *  happens. So it lands in `notReached` and `/api/profiler`'s query parsing is exercised by nothing.
+ *
+ *  A correct guard silently disabling a different guard is exactly the interaction this file exists
+ *  to catch, so the per-action combinations are asserted explicitly here. Without this, a typo'd
+ *  `query.get('makrers')` in the route would sail through `npm test`, `getParamParity`, AND the live
+ *  smoke run (which asserts the shape of `worst`, not its length). Found in the #166 P6 close-out. */
+describe('modoki_profiler: the route READS the params the tool sends (the sweep cannot reach it)', () => {
+  for (const [label, args, expectRead] of [
+    ['action:read + markers', { action: 'read', markers: 3 }, ['action', 'markers']],
+    ['action:capture-read + limit', { action: 'capture-read', limit: 2 }, ['action', 'limit']],
+    ['bare (defaults)', {}, ['action']],
+  ] as Array<[string, Record<string, unknown>, string[]]>) {
+    it(`${label}`, async () => {
+      const s = (surface = loadSurface());
+      s.requests.length = 0;
+      await s.call('modoki_profiler', args);
+      const req = realRequests(s).find((r) => r.path.split('?')[0] === '/api/profiler');
+      expect(req, `modoki_profiler ${label} never reached /api/profiler`).toBeDefined();
+
+      const qs = req!.path.split('?')[1] ?? '';
+      const { proxy, read } = recordingQuery(qs);
+      await handleBackendRequest(routerCtx(), { method: 'GET', urlPath: '/api/profiler', query: proxy, body: undefined });
+
+      for (const k of expectRead) {
+        expect(read.has(k), `the route never read \`${k}\` — the tool sends it, so it is silently dropped`).toBe(true);
+      }
+    });
+  }
+
+  it('a refusal names EVERY stray filter, so one fix is enough', async () => {
+    // The refusal used to be an if/else chain naming only the first. An agent that follows
+    // `expected` literally would omit `markers`, resubmit, and hit a second unwarned refusal for
+    // `limit` — a refusal's job is to be the next move, once.
+    const s = (surface = loadSurface());
+    const r = await s.call('modoki_profiler', { action: 'reset', markers: 5, limit: 3 });
+    const text = s.text(r);
+    expect(r.isError).toBe(true);
+    expect(text).toMatch(/markers/);
+    expect(text, 'the second stray param was not named').toMatch(/limit/);
+  });
+
+  it('an UNKNOWN action is a 400 that does NOT claim the action mutates', async () => {
+    // `?action=Read` (wrong case) used to be told it "MUTATES profiler state" — false, and it sends
+    // the reader hunting the wrong fix. Unknown and mutating are different errors (§0/§5).
+    const { proxy } = recordingQuery('action=Read');
+    const res = await handleBackendRequest(routerCtx(), { method: 'GET', urlPath: '/api/profiler', query: proxy, body: undefined });
+    expect(res?.status).toBe(400);
+    // BackendResult is a discriminated union — narrow before reading `body`, or the assertion
+    // compiles only by accident. (Test files ARE typechecked here; #23.)
+    expect(res?.kind).toBe('json');
+    const body = res?.kind === 'json' ? (res.body as { error?: string }) : undefined;
+    expect(body?.error).toMatch(/unknown profiler action/i);
+    expect(body?.error, 'an unknown action must not be described as mutating').not.toMatch(/MUTATES/);
+  });
+
+  it('a MUTATING action is refused by the route with 405, not served', async () => {
+    // The §4 split is per-action here, so it has to be asserted per-action rather than inferred
+    // from the contract's declared method.
+    const { proxy } = recordingQuery('action=reset');
+    const res = await handleBackendRequest(routerCtx(), { method: 'GET', urlPath: '/api/profiler', query: proxy, body: undefined });
+    expect(res?.status).toBe(405);
+  });
+});
+
 async function measure(): Promise<{ rows: Row[]; skipped: string[]; notReached: string[] }> {
   const s = (surface = loadSurface());
   const rows: Row[] = [];
