@@ -533,6 +533,21 @@ const DECLS: Record<string, Decl> = {
       "is 'control', not 'read', because start/stop/clear change recorder state.",
   },
 
+  modoki_hit_regions: {
+    kind: 'control', method: 'GET', route: '/api/hit-regions', varies: 'both',
+    mutating: true, persists: 'session', requires: ['editor', 'renderer'],
+    filters: ['provider', 'kind', 'ids', 'limit', 'precision'],
+    minimalArgs: { action: 'read' },
+    // action:'read' only reads; show/hide flip the on-screen overlay, which is session state.
+    minimalArgsMutates: false,
+    notes: "Three actions under one name: action read (default) returns the regions as DATA, " +
+      "action show/hide toggles the on-screen SVG overlay. Declared kind is 'control', not 'read', " +
+      "because show/hide change overlay state. `at:{x,y}` answers the miss question directly — it " +
+      "reports which regions contain that point and, when none do, the NEAREST region with its " +
+      "distance in px. Returns `providers` alongside `regions` so an empty list can be read " +
+      "correctly: no provider registered is 'nobody could answer', not 'nothing is there'.",
+  },
+
   // ── asset schema + authoring ──
   modoki_asset_schema: {
     kind: 'read', method: 'GET', route: '/api/asset-schema', minimalArgs: { type: 'particle' },

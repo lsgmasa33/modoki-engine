@@ -1016,6 +1016,28 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
   }
 
+  // ── Hit REGIONS (#139, M→R) ── the shapes a game's hitTest uses, which are authored nowhere. ──
+  if (urlPath === '/api/hit-regions' && method === 'GET') {
+    const num = (k: string): number | undefined => {
+      const v = query.get(k);
+      return v != null && v !== '' && !Number.isNaN(Number(v)) ? Number(v) : undefined;
+    };
+    const ids = query.get('ids');
+    const atX = num('atX'), atY = num('atY');
+    const params = {
+      action: query.get('action') || 'read',
+      ...(query.get('provider') ? { provider: query.get('provider') } : {}),
+      ...(query.get('kind') ? { kind: query.get('kind') } : {}),
+      ...(ids ? { ids: ids.split(',').map((s) => s.trim()).filter(Boolean) } : {}),
+      ...(num('limit') !== undefined ? { limit: num('limit') } : {}),
+      ...(num('precision') !== undefined ? { precision: num('precision') } : {}),
+      // Both or neither — a half-specified point would silently probe (x, 0).
+      ...(atX !== undefined && atY !== undefined ? { at: { x: atX, y: atY } } : {}),
+    };
+    try { return json(await ctx.requestBrowser('hit-regions', params)); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+
   // ── POST /api/render-scene (M→R) ── deterministic offscreen render of the live
   // scene (caller-chosen size + camera), relayed to the renderer, decoded to a
   // temp file. Window-independent + reproducible (vs capture_viewport's window

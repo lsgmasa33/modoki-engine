@@ -392,6 +392,14 @@ the competing "the device dropped pointer samples so the drag never passed the s
 hypothesis, and the measured 27.6 px miss is what showed the fix about to ship — a 1.2x grab
 forgiveness giving 27.31 px — would have failed by 0.3 px and looked like a different bug.
 
+**Its companion is the hit-region overlay** (`runtime/rendering/hitRegions.ts`, #139), which draws
+the shapes `hitTest` uses and plots recorded presses on top. The watch measures a miss; the overlay
+shows what was missed. Both halves came out of the same Court session, and the picture said at a
+glance what the number said only once someone thought to measure — it also killed a wrong theory
+outright (the `(i)` badge's real hit circle is visibly *smaller* than the ring drawn on screen), and
+revealed a 4.8 px dead ring between two controls that reading `hitTest` line by line does not show.
+A game publishes its geometry by calling `registerHitRegionProvider()` from the code that owns it.
+
 Two properties are load-bearing:
 
 - **Gated, and genuinely free when closed.** No listener is even attached until a window opens, and

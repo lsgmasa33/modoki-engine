@@ -41,6 +41,7 @@ import {
 // cannot silently measure against a different clock than the runtime it is tuning.
 import { rawNow } from '../../core/clock';
 import { setPointerFilterParams, getPointerFilterParams } from '../../input/pointerSource';
+import { isHitRegionOverlayVisible, setHitRegionOverlayVisible } from '../../rendering/hitRegions';
 import { createOneEuroFilter } from '../../input/oneEuroFilter';
 
 /** Ladder of leads to audition. 0 is the control — it must look identical to the pink ring, and
@@ -125,6 +126,7 @@ function mountRings(getLead: () => number): () => void {
 export function InputTab() {
   const [lead, setLead] = useState(() => getPointerLeadMs());
   const [rings, setRings] = useState(false);
+  const [regionsOn, setRegionsOn] = useState(() => isHitRegionOverlayVisible());
   const [minCutoff, setMinCutoff] = useState(() => getPointerFilterParams().minCutoff);
   const [beta, setBeta] = useState(() => getPointerFilterParams().beta);
   const [gateMin, setGateMin] = useState(() => getPointerLeadGate().minSpeed);
@@ -161,6 +163,26 @@ export function InputTab() {
 
   return (
     <div style={scrollRootStyle(12)}>
+      {/* Hit regions (#139) — FIRST, above the lead tuner, because it answers the question people
+          arrive at this tab with ("my press did nothing") while the lead is a tuning session. */}
+      <section>
+        <div style={rowStyle}>
+          <span style={labelStyle}>Hit regions</span>
+          <button
+            style={{ ...btnStyle, ...(regionsOn ? btnActiveStyle : null) }}
+            onClick={() => { const next = !regionsOn; setHitRegionOverlayVisible(next); setRegionsOn(next); }}
+          >
+            {regionsOn ? 'on' : 'off'}
+          </button>
+        </div>
+        <div style={{ fontSize: 10, opacity: 0.6, lineHeight: 1.45, marginTop: 4 }}>
+          Draws the shapes the game&apos;s hit-test actually uses — authored nowhere, so no
+          inspector or screenshot can show them. Solid = hit shape, dashed = drawn shape where they
+          differ. Open an input watch too and the last few presses plot on top, green inside a
+          region and red outside.
+        </div>
+      </section>
+
       <section>
         <div style={rowStyle}>
           <span style={labelStyle}>Pointer lead</span>

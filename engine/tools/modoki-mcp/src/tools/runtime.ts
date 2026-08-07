@@ -340,4 +340,60 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       return getJson(`/api/input-watch/read${qs ? `?${qs}` : ''}`);
     },
   );
+
+  // ── Hit REGIONS: the shapes the hit-test uses (#139) ──
+  tool(
+    'modoki_hit_regions',
+    'Hit REGIONS — the shapes a game\'s hitTest actually uses, which are AUTHORED NOWHERE: they are ' +
+      'computed inside the hit-test from config, so no inspector, scene view or screenshot can show ' +
+      'them. The companion to modoki_input_watch: that one says a press hit nothing, this one says ' +
+      'WHAT it missed and BY HOW MUCH. action:read returns the regions as data (viewport CSS px — ' +
+      'the same space the input watch records presses in, so they compare with no transform). ' +
+      'action:show/hide toggles an on-screen overlay that draws the shapes AND plots the last few ' +
+      'recorded presses, green inside a region and red outside — the two failure classes made ' +
+      'visually distinct (a press outside every shape = targeting; a press inside the right shape ' +
+      'that still did nothing = latching/frame-rate). Pass at:{x,y} to ask the question directly: ' +
+      'it reports which regions contain that point, and when none do, the NEAREST region and its ' +
+      'distance in px. A region may carry `drawnShape` when the game DRAWS a different shape than ' +
+      'it hit-tests (a forgiving grab radius, a badge smaller than its ring) — that difference is ' +
+      'usually the bug. READ `providers`: an empty region list with no provider registered means ' +
+      'NOBODY COULD ANSWER, which is not the same as "there is nothing there".',
+    {
+      action: z.enum(['read', 'show', 'hide']).optional().describe("read the regions as data (default) | show the on-screen overlay | hide it"),
+      provider: z.string().optional().describe('(read) Only this provider\'s regions (a game id, e.g. "court").'),
+      kind: z.string().optional().describe('(read) Only this region kind — usually the same string the game\'s own hit-test reports, so it lines up with an input_watch record\'s resolved.kind.'),
+      ids: z.array(z.string()).optional().describe('(read) Only these region ids.'),
+      at: z.object({ x: z.number(), y: z.number() }).optional().describe('(read) A viewport CSS point to test. Returns hitsAt (regions containing it) and, when empty, nearest {id, kind, label, distancePx}. Feed a press coordinate straight from modoki_input_watch.'),
+      limit: z.number().int().positive().optional().describe('(read) Max regions returned (default 60). A full board is many cells; filter by kind= first.'),
+      precision: z.number().int().nonnegative().optional().describe('(read) Significant digits for float fields. Default 9; 0 = exact.'),
+    },
+    async (args) => {
+      const { action = 'read', provider, kind, ids, at, limit, precision } = args;
+      // Per-action allowlist, matching modoki_input_watch: a read-time filter on show/hide is
+      // refused by name rather than silently dropped, which would read as "the filter applied".
+      if (action !== 'read') {
+        const stray = ['provider', 'kind', 'ids', 'at', 'limit', 'precision']
+          .filter((k) => (args as Record<string, unknown>)[k] !== undefined);
+        if (stray.length) {
+          return ctx.fail({
+            code: 'UNKNOWN_PARAM',
+            what: `${action} the hit-region overlay`,
+            why: `${stray.join(', ')} ${stray.length > 1 ? 'are' : 'is'} not accepted by action:'${action}' — it only toggles the overlay.`,
+            got: Object.fromEntries(stray.map((k) => [k, (args as Record<string, unknown>)[k]])),
+            expected: `action:'${action}' accepts no params beyond action`,
+            options: [`pass ${stray.join(', ')} on action:'read' instead`],
+          });
+        }
+      }
+      const q = new URLSearchParams();
+      q.set('action', action);
+      if (provider) q.set('provider', provider);
+      if (kind) q.set('kind', kind);
+      if (ids?.length) q.set('ids', ids.join(','));
+      if (at) { q.set('atX', String(at.x)); q.set('atY', String(at.y)); }
+      if (limit != null) q.set('limit', String(limit));
+      if (precision != null) q.set('precision', String(precision));
+      return getJson(`/api/hit-regions?${q.toString()}`);
+    },
+  );
 }

@@ -641,6 +641,33 @@ if (!typo.isError || !/Unrecognized key/.test(text(typo))) {
 if (!/accepted params:/.test(text(typo))) throw new Error('the refusal must name the accepted params');
 console.log('batch pre-flight refuses an unknown arg key and lists the real ones ✓');
 
+// ── modoki_hit_regions (#139) ────────────────────────────────────────────────
+// The mutating half is show/hide — an SVG overlay on the human's editor. Fully restorable, so
+// this is smoke-covered rather than declared un-sweepable: it flips the overlay on, proves the
+// tool actually reached the renderer (`visible:true` read back, not just a cheerful ok), and
+// restores whatever the overlay was set to before. The read half is swept by the per-tool sweep.
+//
+// Deliberately does NOT assert that regions were RETURNED: whether any exist depends entirely on
+// the open project (a game with no provider correctly reports none), and asserting on it would
+// make this case fail for the honest answer. What is asserted is the contract that holds for every
+// project — `providers` is present, so an empty list can be read correctly.
+{
+  const before = JSON.parse(text(await client.callTool({ name: 'modoki_hit_regions', arguments: { action: 'read' } })));
+  if (!Array.isArray(before.providers)) throw new Error('hit_regions read must always report `providers` — it is what tells "nobody could answer" from "nothing is there"');
+  await withCleanup(async () => {
+    await client.callTool({ name: 'modoki_hit_regions', arguments: { action: 'show' } });
+    const shown = JSON.parse(text(await client.callTool({ name: 'modoki_hit_regions', arguments: { action: 'read' } })));
+    if (shown.visible !== true) throw new Error(`hit_regions show did not take: visible=${shown.visible}`);
+    // A read-time filter on show/hide must be REFUSED by name, not silently dropped — the same
+    // per-action allowlist modoki_input_watch enforces.
+    const stray = await client.callTool({ name: 'modoki_hit_regions', arguments: { action: 'hide', limit: 5 } });
+    if (!/UNKNOWN_PARAM/.test(text(stray))) throw new Error('hit_regions must refuse a read-time param on action:hide');
+    console.log(`hit_regions show/hide reaches the overlay ✓ (providers: ${before.providers.join(', ') || 'none'}, regions: ${before.totalCount})`);
+  }, async () => {
+    await client.callTool({ name: 'modoki_hit_regions', arguments: { action: before.visible ? 'show' : 'hide' } });
+  });
+}
+
 await client.close();
 
 // F12 — a SKIPPED case used to leave the verdict at a cheerful `SMOKE OK`, so the run reported

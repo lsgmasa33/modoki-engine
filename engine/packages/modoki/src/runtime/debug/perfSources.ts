@@ -9,6 +9,7 @@ import { getFrameProfile } from '../core/frameProfiler';
 import { isProfilerEnabled, getMarkerFaults, type MarkerFaults } from '../core/profilerMarkers';
 import { getMarkerAggregate, type MarkerStat } from '../core/profilerAggregate';
 import { getCounters, type CounterStat } from '../core/profilerCounters';
+import { getGpuProfile, getRestBreakdown, isGpuTimingEnabled, type GpuProfile, type RestBreakdown } from '../core/gpuTimings';
 
 export const MB = 1024 * 1024;
 
@@ -99,10 +100,17 @@ export function readPerfProfile(opts: { markers?: number } = {}): {
   /** Game-authored counters (P9). Omitted when none are registered — an empty array would
    *  imply a game that declared none, which is the same thing but reads as a finding. */
   counters?: CounterStat[];
+  /** Measured GPU time (P7). Omitted entirely when GPU timing has never been enabled — the
+   *  default — so its absence reads as "not asked for" rather than as "the GPU did nothing". */
+  gpu?: GpuProfile;
+  /** `restMs` split into measured GPU-busy versus present+idle. Present only when real samples
+   *  exist. This is the field that gives `frame.vsyncBound` evidence instead of an inference. */
+  restBreakdown?: RestBreakdown;
 } {
   const mem = readMemory();
+  const frame = getFrameProfile();
   return {
-    frame: getFrameProfile(),
+    frame,
     renderer: readRenderer(),
     memoryMB: mem
       ? { used: +(mem.usedJSHeapSize / MB).toFixed(1), limit: +(mem.jsHeapSizeLimit / MB).toFixed(1) }
@@ -110,7 +118,19 @@ export function readPerfProfile(opts: { markers?: number } = {}): {
     entities: getEntityCount(),
     ...markerFields(opts.markers ?? DEFAULT_MARKER_ROWS),
     ...counterFields(),
+    ...gpuFields(frame.restMs.median),
   };
+}
+
+/** Same convention as `markerFields`: omitted while GPU timing is off, because "off" and
+ *  "measured nothing" are different facts and must not look alike. Once enabled the profile is
+ *  ALWAYS included even when unsupported — at that point the reader has asked the question, and
+ *  `status: 'unsupported'` with its `detail` is the answer they need. */
+function gpuFields(restMedianMs: number): { gpu?: GpuProfile; restBreakdown?: RestBreakdown } {
+  if (!isGpuTimingEnabled()) return {};
+  const gpu = getGpuProfile();
+  const breakdown = getRestBreakdown(restMedianMs);
+  return { gpu, ...(breakdown ? { restBreakdown: breakdown } : {}) };
 }
 
 function counterFields(): { counters?: CounterStat[] } {

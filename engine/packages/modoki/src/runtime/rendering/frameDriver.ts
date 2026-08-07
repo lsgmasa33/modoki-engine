@@ -8,6 +8,7 @@ import { beginProfilerFrame, endProfilerFrame, profileScope } from '../core/prof
 import { recordMarkerFrame } from '../core/profilerAggregate';
 import { captureFrame } from '../core/profilerCapture';
 import { recordCounterFrame } from '../core/profilerCounters';
+import { pollGpuTimings } from '../core/gpuTimings';
 
 type FrameCallback = () => void;
 
@@ -160,6 +161,11 @@ function runFrame(now: DOMHighResTimeStamp, gen: number, self: FrameRequestCallb
   // discontinuity handling, and a capture would then silently disagree with the live profile.
   const { frameMs, cpuMs } = recordFrame(lastFrameAt, rawNow());
   captureFrame(frameMs, cpuMs); // no-ops unless someone pressed record
+  // P7 — kick a GPU timestamp resolve. Placed AFTER the frame's work and deliberately never
+  // awaited: the results are asynchronous by nature (a buffer map), and awaiting one on the frame
+  // loop would introduce exactly the stall this instrument was built to find. No-ops to one
+  // boolean test when GPU timing is off, which is the default.
+  pollGpuTimings();
 }
 
 /** Arm a fresh rAF chain, superseding any previous one. Idempotent in effect: the old

@@ -221,6 +221,36 @@ now covers device ops too, and manual IP deletes discovery entirely — nothing 
 reliable path; IP field disabled) vs. the typed IP over WiFi. iOS is always WiFi/IP. Same lease/GUID
 protocol rides either transport — only the socket target differs.
 
+#### `busy` / `refused` over adb does NOT mean another Modoki has it (#164)
+
+**Over a tunnel there is no `ECONNREFUSED`.** `adb forward` accepts the connection on this clone's
+local port and only *then* discovers the device end is dead — so `transport.open()` succeeds and it
+is the lease **handshake** that gets no reply. `DeviceLeaseClient.connect` reads that, correctly for
+WiFi, as "reachable but owned" and reports `busy` / `refused`. On USB the same signal has a second,
+commoner cause: **nothing is listening on 9095 at all.** The two are indistinguishable from the
+host — a first-wins plugin refuses an extra client by dropping the socket without a reply, which is
+byte-for-byte what a dead device end looks like through a forward — so `explainConnectFailure` names
+both rather than guessing, and the connect no longer keeps its hardware claim when it fails.
+
+Which one it is, settled in one command (**hex** — `/proc/net/tcp` is hex, and hand-converting 9095
+to `0x238F` instead of `0x2387` is a mistake that has already voided one investigation):
+
+```bash
+adb -s <serial> shell "cat /proc/net/tcp" | grep -i 2387    # no row → nothing is bound
+```
+
+No row means the app is running with its debug server off, and the overwhelmingly likely reason is
+that only ONE of the two `build.debugBuild` gates is on: the JS define is baked at build time, while
+the native plugin reads the manifest meta-data / plist that `healNativeConfig` writes — see
+[Debug vs Release — ONE flag decides](#native-debug-bridge-capacitor-game-debug) below. **A project
+whose native folder was scaffolded without a heal has the first and not the second**, and every
+symptom points at the first: the bundle contains the bridge, the gated branch runs, and nothing
+listens. Reopen the project in the editor (heal-on-open) and rebuild.
+
+The bridge now says so itself, at **error** level and carrying both `GameDebug` and
+`TCP server listening` so one grep finds it — it previously reported this at log level, worded to
+match neither, which is why the failure read as "the branch never ran".
+
 ### Several phones attached: which one, and who has it (#149)
 
 Two questions, one mechanism each. `device_list` answers both in one call — attached Androids
@@ -591,7 +621,7 @@ Two things the table is worth reading FOR, not just referring to:
 
 <!-- BEGIN GENERATED TOOL CATALOG -->
 
-*81 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
+*82 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
 run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fails `npm test`.*
 
 #### Read — answer a question about state (never changes anything)
@@ -678,6 +708,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_focus_entity` | POST `/api/editor-action` `focus-entity` | no persistence | editor + scene | entity | *(no args)* |
 | `modoki_gizmo` | POST `/api/editor-action` `set-gizmo` | session | editor | — | *(no args)* |
 | `modoki_history` | POST `/api/editor-action` *(op = your `action`)* | live | editor | — | `{"action":"undo"}` |
+| `modoki_hit_regions` | GET `/api/hit-regions` *(both varies)* | session | editor + renderer | — | `{"action":"read"}` |
 | `modoki_input_watch` | GET `/api/input-watch/read` *(both varies)* | session | editor + renderer | — | `{"action":"read"}` |
 | `modoki_load_scene` | POST `/api/editor-action` `load-scene` | live | editor + project | asset | `{"path":"/assets/scenes/main.scene.json"}` |
 | `modoki_menu` | POST `/api/menu` | session | editor + electron | — | *(no args)* |
@@ -868,6 +899,29 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   layer did with it (blocked, `stopPropagation`'d, a second finger the engine ignores). A game closes
   the "nobody could look" gap by calling `noteInputResolution()` from its own hit-test.
   (`runtime/input/pointerRecorder.ts`.)
+- **Hit regions (what it MISSED):** `modoki_hit_regions {read|show|hide}` — the companion half of the
+  input watch. **A hit region is authored nowhere**: it is computed inside a game's `hitTest` from
+  config, so no inspector, scene view or screenshot can show it. The watch says a press hit nothing;
+  this says *what* it missed and *by how much*. `read` returns the shapes as data in **viewport CSS
+  px** — the same space presses are recorded in, so they compare with no transform. **Pass
+  `at:{x,y}`** (a press coordinate straight from the watch) and it answers directly: `hitsAt` for the
+  regions containing it, and when empty, `nearest {id, kind, label, distancePx}` — the number the
+  Court investigation that produced #134/#139 had to derive by hand. `distancePx` is to the nearest
+  **edge** (0 inside) and is exact for all three shape kinds, poly included: a point-to-*vertex*
+  approximation does not merely round badly, it picks the WRONG REGION for anything elongated (a
+  1000x10 lane with a press 5 px off its edge scores ~500, handing "nearest" to whatever else is
+  within 500 px). A region may carry
+  **`drawnShape`** where the game DRAWS something different from what it hit-tests (a forgiving grab
+  radius, a badge smaller than its ring); that difference is usually the bug. `show` draws an
+  overlay — solid = hit shape, dashed = drawn shape — and plots the last few recorded presses,
+  **green inside a region, red outside**, which is what makes the two failure classes visually
+  distinct (outside every shape = targeting; inside the right shape and still nothing = latching or
+  frame-rate). It also makes visible the thing no amount of reading `hitTest` reveals: **the GAPS
+  between regions.** ⚠️ Read `providers`: an empty region list with none registered means *nobody
+  could answer*, not *there is nothing there*. A game publishes its geometry with
+  `registerHitRegionProvider()`, from the code that OWNS it — never a second copy, which would agree
+  today and drift on the first retune. (`runtime/rendering/hitRegions.ts`; Court is the worked
+  example, `games/court/runtime/systems.ts`.)
 - **Editor session (perceive the human):** `modoki_editor_journal {type,source,since,sinceCap,merged,limit,clear}`
   — the human-authoring stream (`!` sigil: `!select`/`!edit`/`!transform`/`!create`/`!duplicate`/`!delete`/
   `!reparent`/`!play`/`!pause`/`!stop`/`!gizmo`/`!scene-load`/`!save`/`!undo`/`!redo`), GUID-addressed with

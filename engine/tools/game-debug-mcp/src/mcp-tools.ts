@@ -1009,6 +1009,65 @@ export function registerTools(server: McpServer) {
     },
   );
 
+  // ── Hit regions (#139) ─────────────────────────────────────
+  // The device twin matters MORE than the editor one here: touch targets are missed by fingers on
+  // phones, not by a mouse in a desktop editor, and the bug that produced this feature was on a
+  // Galaxy A23. A hit region is authored nowhere, so on device there is otherwise NOTHING that can
+  // show where the targets are — a screenshot shows only what was drawn, which is the shape that
+  // was already proven not to be the hit shape.
+  tool('device_hit_regions',
+    'Hit REGIONS on the device — the shapes the game\'s hitTest actually uses, which are AUTHORED ' +
+      'NOWHERE (computed inside the hit-test from config, so no inspector and no screenshot can ' +
+      'show them). The companion to device_input_watch: that says a press hit nothing, this says ' +
+      'WHAT it missed and BY HOW MUCH. THIS IS THE SURFACE THAT MATTERS ON A PHONE — touch targets ' +
+      'are missed by fingers, and a device screenshot can only show what was DRAWN, which is often ' +
+      'not the shape that is hit-tested. action:read returns the regions as data (viewport CSS px, ' +
+      'the same space device_input_watch records presses in). action:show/hide toggles an on-screen ' +
+      'overlay that also plots the last few recorded presses, green inside a region and red ' +
+      'outside. Pass at:{x,y} — a press coordinate straight from device_input_watch — to get ' +
+      'hitsAt, and when empty, nearest {id, kind, label, distancePx}. A region may carry ' +
+      '`drawnShape` where the game draws a different shape than it hit-tests; that difference is ' +
+      'usually the bug. READ `providers`: an empty list with none registered means NOBODY COULD ' +
+      'ANSWER, not "there is nothing there" — a game publishes its geometry with ' +
+      'registerHitRegionProvider().',
+    {
+      action: z.enum(['read', 'show', 'hide']).optional().describe('read the regions as data (default) | show the overlay | hide it'),
+      provider: z.string().optional().describe("(read) Only this provider's regions (a game id)."),
+      kind: z.string().optional().describe("(read) Only this region kind — usually the same string the game's hit-test reports."),
+      ids: z.array(z.string()).optional().describe('(read) Only these region ids.'),
+      at: z.object({ x: z.number(), y: z.number() }).optional().describe('(read) A viewport CSS point to test — returns hitsAt, and nearest when nothing contains it.'),
+      limit: z.number().optional().describe('(read) Max regions returned (default 60).'),
+      precision: z.number().optional().describe('(read) Significant digits for float fields (default 9; 0 = exact).'),
+    },
+    async (args) => {
+      const action = args.action ?? 'read';
+      // Per-action allowlist, mirroring device_input_watch above.
+      const READ_KEYS = ['provider', 'kind', 'ids', 'at', 'limit', 'precision'] as const;
+      if (action !== 'read') {
+        const stray = READ_KEYS.filter((k) => (args as Record<string, unknown>)[k] !== undefined);
+        if (stray.length) {
+          return deviceFail({
+            code: 'UNKNOWN_PARAM',
+            tool: 'device_hit_regions',
+            what: `${action} the device hit-region overlay`,
+            why: `${stray.join(', ')} ${stray.length > 1 ? 'are' : 'is'} not accepted by action:'${action}' — it only toggles the overlay.`,
+            got: Object.fromEntries(stray.map((k) => [k, (args as Record<string, unknown>)[k]])),
+            expected: `action:'${action}' accepts no params beyond action`,
+            options: [`pass ${stray.join(', ')} on action:'read' instead`],
+          });
+        }
+      }
+      const params: Record<string, unknown> = { action };
+      if (action === 'read') {
+        for (const k of READ_KEYS) {
+          const v = (args as Record<string, unknown>)[k];
+          if (v !== undefined) params[k] = v;
+        }
+      }
+      return perceptCall('device_hit_regions', 'hit-regions', params);
+    },
+  );
+
   // ── Screenshot ─────────────────────────────────────────────
 
   tool('device_screenshot',

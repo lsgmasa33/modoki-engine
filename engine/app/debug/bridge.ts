@@ -64,6 +64,20 @@ function withMechanismSuffix(reply: string): string {
 
 // Original console for bridge's own logging (avoids feedback loop)
 const _log = console.log.bind(console);
+/** The ERROR twin of `_log`. Separate because a bridge that failed to start must not report it at
+ *  `log` level: on a device the only readable channel is logcat/OSLog, and a `console.log` line
+ *  there is indistinguishable from ordinary chatter — see `initDebugBridge`'s note on #164 for the
+ *  hour that cost.
+ *
+ *  LATE-bound (a wrapper, not a `.bind()` like `_log`) on purpose: `patchConsole` replaces
+ *  `console.error` with a wrapper that ALSO pushes into `consoleRing`, and every `_err` call site
+ *  fires after that runs. A `.bind()` captures the pre-patch function and so reaches logcat only.
+ *  That distinction is invisible for a boot failure — if the server never binds, nothing can read
+ *  the ring anyway — but it is not for the port-lifecycle failure, which is RECOVERABLE: a later
+ *  foreground can succeed, and then `device_console_logs` is reachable again with a gap it cannot
+ *  explain. Late-bound, the failure is in the ring waiting. No recursion risk: the wrapper calls the
+ *  original and appends to an array, it does not log. */
+const _err = (...args: unknown[]) => console.error(...args);
 
 // Screen info from the last native screenshot — used for iOS tap coordinate mapping.
 let lastScreenInfo: LastScreenInfo | null = null;
@@ -494,7 +508,13 @@ export function createPortLifecycleHandler(deps: {
   start: () => Promise<{ port: number }>;
   stop: () => Promise<{ ok: boolean }>;
   log: (...args: unknown[]) => void;
+  /** Where a failure goes, when it is one that leaves the bridge UNREACHABLE. Defaults to `log`,
+   *  which is what every existing caller got — but a failed re-bind deserves better than that, see
+   *  the catch below. Injected rather than reaching for `console.error` directly so this stays as
+   *  testable as the rest of the handler. */
+  logError?: (...args: unknown[]) => void;
 }): (state: { isActive: boolean }) => void {
+  const logError = deps.logError ?? deps.log;
   let busy = false;
   return ({ isActive }) => {
     void (async () => {
@@ -512,10 +532,25 @@ export function createPortLifecycleHandler(deps: {
           deps.log('[debug-bridge] foregrounded — TCP server listening on port', r.port);
         }
       } catch (e) {
-        // Never let debug-bridge plumbing break the app's lifecycle handling. A failed release just
-        // means the old behaviour (the port stays held); a failed rebind surfaces host-side as an
-        // unreachable lease, which is the pre-existing failure mode, not a new one.
-        deps.log('[debug-bridge] appStateChange handling failed:', (e as Error).message);
+        // Never let debug-bridge plumbing break the app's lifecycle handling — hence swallowing at
+        // all. But the two failures are NOT equally serious, and reporting them identically is the
+        // #164 mistake in miniature (found sweeping for its pattern, not its symptom):
+        //   • a failed STOP restores the old behaviour — the port stays held. Benign, stays at log.
+        //   • a failed START means nothing is listening on 9095 after a foreground, so every
+        //     device_* tool is unreachable for the rest of the session. That is byte-for-byte the
+        //     symptom #164 was filed about, and at log level it is just as unfindable: the app runs
+        //     fine, the lease refuses, and the one line explaining it reads like ordinary chatter.
+        // The message carries the same greppable tokens as `initDebugBridge`'s, so ONE grep finds
+        // this whether the bridge died at boot or on a later resume.
+        if (isActive) {
+          logError(
+            '[debug-bridge] FAILED to re-bind on foreground — the GameDebug TCP server is NOT '
+            + 'listening, so every device_* tool is unreachable until the app is backgrounded and '
+            + 'brought forward again. Reason:', (e as Error).message,
+          );
+        } else {
+          deps.log('[debug-bridge] appStateChange handling failed:', (e as Error).message);
+        }
       } finally {
         busy = false;
       }
@@ -884,9 +919,9 @@ async function initNativeBridge() {
 
   try {
     const result = await GameDebug.startServer();
-    _log('[debug-bridge] Native TCP server started on port', result.port);
+    _log('[debug-bridge] Native TCP server listening on port', result.port);
   } catch (e) {
-    _log('[debug-bridge] startServer failed:', (e as Error).message);
+    _err('[debug-bridge] GameDebug.startServer failed:', (e as Error).message);
     throw e;
   }
 
@@ -907,6 +942,7 @@ async function initNativeBridge() {
     start: () => GameDebug.startServer(),
     stop: () => GameDebug.stopServer(),
     log: _log,
+    logError: _err,
   }));
 
   GameDebug.addListener('request', async (data) => {
@@ -997,7 +1033,27 @@ export function initDebugBridge() {
   if (Capacitor.isNativePlatform()) {
     _log('[debug-bridge] Initializing native bridge');
     initNativeBridge().catch((e) => {
-      _log('[debug-bridge] Native bridge init failed:', (e as Error).message);
+      // LOUD, and self-explaining (#164). This used to be a `console.log` reading "Native bridge
+      // init failed", which is the worst possible shape for the failure it reports: the app runs
+      // fine, nothing listens on 9095, and the ONE line explaining why is (a) at log level, where a
+      // device log is pure chatter, and (b) worded so that neither `GameDebug` nor `TCP server
+      // listening` — the two things anyone actually greps for — matches it. A session lost an hour
+      // concluding the branch had never run, while this line was sitting in logcat all along.
+      //
+      // So: error level, both greppable tokens in the text, and the two flags NAMED. There are two
+      // independent answers to "is this a debug build" and only one of them is the JS define —
+      // `__MODOKI_DEBUG_BUILD__` gates whether this code runs at all, while the native plugin gates
+      // `startServer` on the AndroidManifest meta-data / Info.plist that `healNativeConfig` writes
+      // from the same `build.debugBuild` (#112). A project scaffolded without a heal has the first
+      // and not the second, and every symptom points at the first.
+      _err(
+        '[debug-bridge] FAILED to start — the GameDebug TCP server is NOT listening, so every '
+        + 'device_* tool is unreachable for this app. Reason:', (e as Error).message,
+        '\n  If that says the debug bridge is disabled, or the plugin is not implemented: the JS '
+        + 'side is on (this ran) but the NATIVE gate is off. Reopen the project in the editor, or '
+        + 'run healNativeConfig(projectRoot), to sync build.debugBuild into the native project — '
+        + 'then rebuild.',
+      );
     });
   } else {
     _log('[debug-bridge] Web mode — use Chrome with --remote-debugging-port=9222 for MCP debugging');

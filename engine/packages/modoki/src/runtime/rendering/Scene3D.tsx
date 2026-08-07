@@ -23,6 +23,7 @@ import { onRendererLost } from '../core/activeRenderer';
 import { createRendererRecovery } from './rendererRecovery';
 import { tickTierCalibration, applyPendingTierPromotion } from './tierCalibration';
 import { beginProfilerSample, endProfilerSample } from '../core/profilerMarkers';
+import { gpuPassScope } from '../core/gpuTimings';
 import { getRenderSettings, getEffectiveThreeSettings, getActiveTierOrDefault } from './renderSettings';
 import { tierAllowsPostFX } from './qualityTier';
 import { onForceResize } from './resizeBus';
@@ -528,12 +529,18 @@ export default function Scene3D() {
               if (cfgScale === liveSs) lastStackSig = sig;
             }
           }
+          // The CPU span and the GPU span are separate measurements of the same call and both are
+          // wanted: `submit-postfx` is how long the main thread spent HERE (on postfx-demo that
+          // was a median 37 ms — CPU blocking on GPU backpressure), while `gpuPassScope` claims
+          // the render-call ordinals so the GPU's own time lands under this name instead of an
+          // anonymous `pass[n]`. A post-FX chain is one scope over many internal three passes, so
+          // it reports as `postfx#0`, `postfx#1`, … — see `gpuPassScope`.
           beginProfilerSample('submit-postfx');
-          postfxStack.render();
+          gpuPassScope('postfx', () => postfxStack!.render());
           endProfilerSample();
         } else {
           beginProfilerSample('submit');
-          renderer.render(scene, activeCamera);
+          gpuPassScope('scene', () => renderer.render(scene, activeCamera));
           endProfilerSample();
         }
       }

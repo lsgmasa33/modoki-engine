@@ -17,6 +17,7 @@ import path from 'path';
 import { DeviceConnectionManager, adbRunner, releaseDeviceResourcesOnExit, reclaimStaleForwardsAtStartup } from '../../plugins/backend/deviceConnection';
 import { androidDevicesExec, _clearFriendlyNameCache } from '../../plugins/backend/androidDevices';
 import { DeviceLeaseAuthority } from '../../plugins/backend/deviceLease';
+import { listClaims } from '../../plugins/backend/deviceClaims';
 import { deviceCdpAdb, discoverDeviceCdpTarget, resetDeviceCdpSession } from '../../plugins/backend/deviceCdp';
 
 const realForward = adbRunner.forward;
@@ -29,7 +30,17 @@ const realDeviceName = androidDevicesExec.deviceName;
 const ONE_DEVICE = 'List of devices attached\nTESTSERIAL1  device usb:1-1 model:Test_Phone\n';
 // Per-test `.modoki` so the persisted last-target never touches the real repo and can't leak between tests.
 let stateDir: string;
+// …and a per-test MODOKI_HOME, for the reason deviceClaims.test.ts calls non-optional: the adb
+// branch takes a machine-wide HARDWARE claim (#149) before it forwards, so without this every test
+// below wrote `TESTSERIAL1` into the developer's REAL ~/.modoki/device-claims.json. Un-caught until
+// #164, because the claim was also LEAKED there (the connect to port 1 fails, and the failure path
+// did not release) — the suite was quietly reproducing the very bug it now guards against.
+let home: string;
+let prevHome: string | undefined;
 beforeEach(() => {
+  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-'));
+  prevHome = process.env.MODOKI_HOME;
+  process.env.MODOKI_HOME = home;
   adbRunner.forward = vi.fn(); adbRunner.removeForward = vi.fn();
   androidDevicesExec.list = () => ONE_DEVICE;
   // The friendly-name lookup is a second adb shell — stubbed for the same reason as the listing:
@@ -45,6 +56,9 @@ beforeEach(() => {
   stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-adb-'));
 });
 afterEach(() => {
+  if (prevHome === undefined) delete process.env.MODOKI_HOME;
+  else process.env.MODOKI_HOME = prevHome;
+  fs.rmSync(home, { recursive: true, force: true });
   delete process.env.MODOKI_DEVICE_HOST_PORT;
   adbRunner.forward = realForward; adbRunner.removeForward = realRemove; adbRunner.listForwards = realListForwards;
   androidDevicesExec.list = realList;
@@ -340,5 +354,51 @@ describe('DeviceConnectionManager — useAdb branch', () => {
         expect(adbRunner.removeForward).not.toHaveBeenCalled();
       } finally { cdpRemove.mockRestore(); }
     });
+  });
+});
+
+/** #164 — the claim a FAILED connect leaves behind.
+ *
+ *  The adb branch claims the hardware machine-wide BEFORE it forwards (#149), and the
+ *  forward-failure path hands it straight back. The handshake-failure path did not — so the single
+ *  commonest failure on USB (the app is not listening) left a claim standing under this clone's
+ *  name. The symptom is worse than a leak: the RETRY is refused as busy, naming this very clone, so
+ *  the caller's own dead attempt is indistinguishable from a sibling clone hogging the phone. Only
+ *  an explicit `device_disconnect` cleared it, which nobody runs after a connect that failed.
+ *
+ *  Asserted against the CLAIMS FILE rather than a spy: what blocks the next connect is the file's
+ *  content, and a released-in-memory claim that still has a row on disk would pass a spy test and
+ *  fail in the only way that matters. */
+describe('a connect that fails releases the hardware claim (#164)', () => {
+  it('leaves no claim behind when the lease handshake never lands', async () => {
+    // MODOKI_DEVICE_HOST_PORT is pinned to 1 by the suite, so this connect cannot succeed: the
+    // forward is stubbed, nothing is listening, and the lease gives up. Exactly the shape of the
+    // reported failure (the app is running; its debug server is not).
+    const mgr = new DeviceConnectionManager('g-claim-leak', stateDir);
+    const status = await mgr.connect({ useAdb: true });
+    expect(status.state).not.toBe('connected');
+
+    expect(listClaims(), 'a failed connect must not hold hardware — the retry would be refused as '
+      + 'busy by this clone\'s own dead attempt').toEqual([]);
+  });
+
+  /** THE CONTROL. Without it, "no claim after a failure" would also pass if the connect path had
+   *  stopped claiming altogether, or released unconditionally — a guard that holds for the wrong
+   *  reason. A lease that DID land must keep its hold, which is the entire point of #149. */
+  it('but a connect that SUCCEEDS keeps its claim — the release is scoped to failure', async () => {
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority);
+    const mgr = new DeviceConnectionManager('g-claim-ok', stateDir);
+    process.env.MODOKI_DEVICE_HOST_PORT = String(device.port);
+    try {
+      const status = await mgr.connect({ useAdb: true, port: 9095 });
+      expect(status.state).toBe('connected');
+      expect(listClaims().map((c) => c.deviceId)).toEqual(['adb:TESTSERIAL1']);
+    } finally {
+      delete process.env.MODOKI_DEVICE_HOST_PORT;
+      await mgr.disconnect();
+      await device.close();
+    }
+    expect(listClaims(), 'disconnect hands the hardware back too').toEqual([]);
   });
 });

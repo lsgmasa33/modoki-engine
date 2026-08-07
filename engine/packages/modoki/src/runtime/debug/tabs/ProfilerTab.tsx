@@ -19,6 +19,7 @@ import { getMarkerAggregate, MARKER_WINDOW_FRAMES } from '../../core/profilerAgg
 import { startCapture, stopCapture, getCapture, clearCapture, exportCapture, getWorstCapturedFrame } from '../../core/profilerCapture';
 import { getCounters } from '../../core/profilerCounters';
 import { readRenderer, readMemory, MB } from '../perfSources';
+import { getGpuProfile, getRestBreakdown, setGpuTimingEnabled, isGpuTimingEnabled } from '../../core/gpuTimings';
 
 const ms = (v: number) => `${v.toFixed(2)}ms`;
 
@@ -37,6 +38,7 @@ export function ProfilerTab() {
   const faults = getMarkerFaults();
   const rend = readRenderer();
   const mem = readMemory();
+  const breakdown = getRestBreakdown(frame.restMs.median);
   const anyFault = faults.unbalancedEnds || faults.depthTruncated || faults.nodeCapHit;
 
   return (
@@ -57,11 +59,29 @@ export function ProfilerTab() {
           <Stat k="Backend" v={rend?.backend ?? '—'} />
           <Stat k="JS heap" v={mem ? `${(mem.usedJSHeapSize / MB).toFixed(0)}MB` : 'n/a'} />
         </div>
-        {frame.vsyncBound && (
+        {/* Prefer MEASURED evidence over the vsync inference when GPU timing is on. `vsyncBound`
+            is a guess from the shape of the frame time; a resolved timestamp is the answer it was
+            standing in for, and showing both would invite the reader to average an inference with
+            a measurement. */}
+        {breakdown ? (
+          <div style={noteStyle}>
+            <b>{breakdown.verdict === 'gpu' ? 'GPU-bound.' : breakdown.verdict === 'idle' ? 'Idle-bound.' : 'Mixed.'}</b>{' '}
+            Of {ms(breakdown.restMs)} outside engine CPU, <b>{ms(breakdown.gpuMs)}</b> is measured
+            GPU work and {ms(breakdown.presentIdleMs)} is present + idle.{' '}
+            {breakdown.verdict === 'gpu'
+              ? 'Optimising CPU will not move this frame — the GPU is the bottleneck.'
+              : breakdown.verdict === 'idle'
+                ? 'The frame is finishing early and waiting; there is headroom.'
+                : 'Neither dominates.'}{' '}
+            <i>Two medians over overlapping windows, not a per-frame subtraction — rAF frames and
+            three render calls are not the same sequence.</i>
+          </div>
+        ) : frame.vsyncBound && (
           <div style={noteStyle}>
             <b>Vsync-bound.</b> The frame is finishing early, so the non-CPU remainder
             ({ms(frame.restMs.median)}) is mostly the browser <i>waiting</i> — not GPU cost. Judge
-            headroom by CPU here.
+            headroom by CPU here. <i>Inferred from the frame time; turn on GPU timing below to
+            measure it.</i>
           </div>
         )}
         {frame.discontinuities > 0 && (
@@ -110,9 +130,86 @@ export function ProfilerTab() {
         )}
       </section>
 
+      <GpuSection />
       <CountersSection />
       <CaptureSection />
     </div>
+  );
+}
+
+/** GPU timing (P7). Always visible, unlike Counters — the whole point is that a reader arriving
+ *  with "where did my 100ms go?" can find the switch. Off by default: enabling makes three
+ *  allocate a query set and write two timestamps per pass, and the plan's overhead rule says the
+ *  profiler must not change the thing it measures. */
+function GpuSection() {
+  useInterval(500);
+  const gpu = getGpuProfile();
+  const on = isGpuTimingEnabled();
+  return (
+    <section>
+      <div style={headingStyle}>
+        GPU
+        <span style={{ float: 'right', display: 'flex', gap: 4 }}>
+          <button style={tabBtn(on)} onClick={() => setGpuTimingEnabled(!on)}>
+            {on ? '■ Stop' : '● Measure'}
+          </button>
+        </span>
+      </div>
+      {!on ? (
+        <div style={hintStyle}>
+          Off. Frame time minus engine CPU is GPU + present + <i>idle</i>, all three at once —
+          this separates them with real timestamp queries. Costs a query set and two timestamps
+          per pass while running, so it is not left on.
+        </div>
+      ) : gpu.status === 'unsupported' || gpu.status === 'no-renderer' ? (
+        // Never a zero, and never a blank table: the reason IS the answer on these devices.
+        <div style={{ ...noteStyle, color: '#ffb4a2' }}>
+          <b>Unavailable{gpu.backend ? ` (${gpu.backend})` : ''}.</b> {gpu.detail}
+        </div>
+      ) : gpu.status === 'pending' || !gpu.passes?.length ? (
+        <div style={hintStyle}>Waiting for the first timestamps to resolve…</div>
+      ) : (
+        <>
+          <div style={hintStyle}>
+            Measured GPU time per pass over the last {gpu.samples} frame(s) via{' '}
+            {gpu.backend} timestamp queries. Results arrive {gpu.lagFrames} frame(s) behind — GPU
+            timings are resolved asynchronously and always trail.
+            {gpu.errors ? ` ${gpu.errors} resolve(s) failed.` : ''}
+            {gpu.resolutionMs ? (
+              <> Adapter resolution ≈ <b>{gpu.resolutionMs.toFixed(3)}ms</b> — browsers coarsen GPU
+              timestamps deliberately, so a pass near that value is one significant figure, not
+              three.</>
+            ) : null}
+          </div>
+          <div style={gridStyle}>
+            <Stat k="GPU (median)" v={ms(gpu.gpuMs!.median)} />
+            <Stat k="GPU (p95)" v={ms(gpu.gpuMs!.p95)} />
+            <Stat k="GPU (max)" v={ms(gpu.gpuMs!.max)} />
+            <Stat k="Passes" v={gpu.passes.length} />
+          </div>
+          <table style={tableStyle}>
+            <thead>
+              <tr>
+                <th style={thStyle}>Pass</th>
+                <th style={thNumStyle}>Median</th>
+                <th style={thNumStyle}>p95</th>
+                <th style={thNumStyle}>Max</th>
+              </tr>
+            </thead>
+            <tbody>
+              {gpu.passes.map((p) => (
+                <tr key={p.name}>
+                  <td style={tdStyle}>{p.name}</td>
+                  <td style={tdNumStyle}>{ms(p.ms.median)}</td>
+                  <td style={tdNumStyle}>{ms(p.ms.p95)}</td>
+                  <td style={tdNumStyle}>{ms(p.ms.max)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+    </section>
   );
 }
 

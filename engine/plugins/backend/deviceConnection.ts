@@ -83,8 +83,39 @@ export function resolveDeviceHostPort(env: NodeJS.ProcessEnv = process.env): num
  *
  *  Apps built after #95 release the port when they background, so the common case resolves itself.
  *  This message is for the rest: an older build, or two apps racing on a switch. Left as a pure
- *  string transform so it is trivially testable. */
-export function explainConnectFailure(detail: string | undefined, port: number): string | undefined {
+ *  string transform so it is trivially testable.
+ *
+ *  **`useAdb` exists because over a tunnel there IS no ECONNREFUSED** (#164). `adb forward` accepts
+ *  the connection on this clone's local port and only then discovers the device end is dead, so
+ *  `transport.open()` SUCCEEDS and it is the handshake that gets no reply — which
+ *  `DeviceLeaseClient.connect` reads, correctly for WiFi, as "reachable but owned" and reports as
+ *  `busy` / `refused`. The result is that the single most common failure on USB (nothing listening,
+ *  because the native debug gate is off) is reported as the one thing it is NOT: another Modoki
+ *  holding the lease. The advice above — the one message that would have said "nothing is
+ *  listening" — is unreachable on that path by construction, since its ECONNREFUSED never arrives.
+ *
+ *  This does NOT try to tell the two apart, because from here they are genuinely
+ *  indistinguishable: a first-wins plugin refuses an extra client by dropping the socket without a
+ *  reply, which is byte-for-byte what a dead device end looks like through a forward. It names both
+ *  and gives the one command that settles it. Reporting two candidates honestly beats reporting one
+ *  confidently and wrongly. */
+export function explainConnectFailure(detail: string | undefined, port: number, useAdb = false): string | undefined {
+  // `refused` is the sentinel `DeviceLeaseClient.connect` sets when the socket opened but the
+  // handshake produced nothing (deviceLease.ts). A GENUINE busy reply from the device always names
+  // its reason — `busy` / `no-lease` / `not-owner` — so this branch cannot swallow a real lease
+  // conflict; it only catches the case the device never answered at all.
+  if (useAdb && detail === 'refused') {
+    return `refused — the adb tunnel opened but the app never answered the lease handshake, which `
+      + `over USB has TWO causes and this end cannot tell them apart:\n`
+      + `  1. Nothing is listening on the device's port ${port} at all. Most likely the native `
+      + `debug gate is off for this build — the JS bridge and the native plugin read build.debugBuild `
+      + `through SEPARATE channels, and a project scaffolded without a heal has the first, not the `
+      + `second (#112/#164). Check: \`adb shell cat /proc/net/tcp | grep -i ${port.toString(16)}\` `
+      + `(hex, uppercase or lower) — no row means nothing is bound. Then reopen the project in the `
+      + `editor (heal-on-open) and rebuild.\n`
+      + `  2. Another Modoki genuinely owns the lease — it refuses an extra client by dropping the `
+      + `socket, which looks identical from here. Disconnect it there, or relaunch the app.`;
+  }
   if (!detail || !/ECONNREFUSED/i.test(detail) || port !== DEVICE_PORT) return detail;
   return `${detail} — nothing is listening on the default port ${DEVICE_PORT}. The app may be `
     + 'running FINE on another port: 9095 is shared by every Modoki game, so if a second one still '
@@ -420,6 +451,14 @@ export class DeviceConnectionManager {
    *  bridge). Separate from `platform` so a stable null latches but a failed ASK does not. */
   private platformResolved = false;
   private platformInFlight: Promise<DeviceIdentity> | null = null;
+  /** Bumped at the head of every `connect()`. Nothing serializes `POST /api/device/connect` — a
+   *  double-clicked Connect button, or an agent retrying a slow `device_connect`, can put two calls
+   *  in flight on this one manager — and `claimedDeviceId`/`client`/`target` are all SHARED state,
+   *  so the loser's continuation resumes into the winner's session. That reentrancy gap predates
+   *  this field and is wider than it (`disconnect()` operates on whatever `this.client` currently
+   *  is); what the counter closes is the one place a stale continuation can do real DAMAGE rather
+   *  than merely return a stale status — see its use after `client.connect()` below. */
+  private connectGeneration = 0;
   private readonly guid: string;
   private readonly stateDir: string;
 
@@ -435,6 +474,7 @@ export class DeviceConnectionManager {
    *  new IP is clean. `useAdb` runs `adb forward` and targets 127.0.0.1; otherwise the typed IP.
    *  With NEITHER `ip` nor `useAdb` (a "bare" reconnect), reuse the last target this clone used. */
   async connect(req: ConnectRequest): Promise<DeviceConnectStatus> {
+    const generation = ++this.connectGeneration;
     await this.disconnect();
     // A bare call (no ip, no explicit useAdb) reconnects the last target — all-or-nothing, so that
     // supplying just an ip still means WiFi (never adb) and supplying useAdb still means USB. Capture
@@ -526,10 +566,31 @@ export class DeviceConnectionManager {
       transport: this.transport,
       // The advice keys off the DEVICE port, not the host end of the tunnel: an ECONNREFUSED on a
       // derived 127.0.0.1:9097 still means "nothing is listening on 9095 over there".
-      onState: (s, d) => { this.state = s; this.detail = explainConnectFailure(d, devicePort); },
+      onState: (s, d) => { this.state = s; this.detail = explainConnectFailure(d, devicePort, useAdb); },
     });
     this.target = { host, port, useAdb, ...(serial ? { serial } : {}) };
-    await this.client.connect();
+    const landed = await this.client.connect();
+    // A connect that did NOT land must hand the hardware back (#164). The adb-forward failure above
+    // already does this; the handshake failure did not, so the commonest failure of all — the app
+    // is not listening — left a machine-wide claim standing. The visible symptom is the nastiest
+    // kind: the RETRY is refused as busy, naming this very clone as the holder, so the caller's own
+    // dead attempt looks like a sibling clone hogging the phone, and only an explicit
+    // device_disconnect (which nobody thinks to run after a failed connect) clears it.
+    //
+    // Deliberately keyed on "not connected" rather than on a specific state: `connect()` is
+    // one-shot and returns 'error' or 'busy' with no retry behind it, so any non-connected outcome
+    // means this lease holds nothing and is entitled to nothing. (The reconnect loop only ever runs
+    // from a lease that DID connect, and that one keeps its claim, correctly.)
+    //
+    // Guarded on the generation because `claimedDeviceId` is manager state, not this call's: with
+    // two connects in flight, the LOSER resumes here holding a `landed` of its own but pointing at
+    // the WINNER's claim (same deviceId string, so `releaseClaim` cannot tell them apart), and would
+    // free the hardware out from under a live, connected session — a sibling clone could then claim
+    // a phone this editor is actively driving, which is the exact collision #149 exists to stop.
+    // Whether the event loop really orders it that way is delicate and I did not reproduce it; the
+    // guard costs one integer compare and makes the question moot, which is the right trade for a
+    // failure whose blast radius is "two clones drive one phone".
+    if (landed !== 'connected' && generation === this.connectGeneration) this.releaseClaim();
     // Learn the platform NOW, while the lease is healthy, rather than on first use. The WDA
     // screenshot path is reached precisely when the app has been SUSPENDED (lease 'reconnecting',
     // native capture 502s) — asking then would fail and refuse the feature in its motivating case.

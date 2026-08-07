@@ -27,6 +27,7 @@ import {
   type DebugCommandDef,
 } from './debugMenuRegistry';
 import { FloatingWidgetLayer } from './FloatingWidgetLayer';
+import { HitRegionOverlay } from './HitRegionOverlay';
 import { ErrorToaster } from './ErrorToaster';
 import { registerPointerBlocker } from '../core/pointerBlockers';
 import { scrollRootStyle } from './tabLayout';
@@ -154,6 +155,10 @@ export function DebugMenu({ anchor = 'viewport' }: DebugMenuProps) {
           modal, so they're visible while playing. */}
       <FloatingWidgetLayer anchor={anchor} />
       <ErrorToaster anchor={anchor} />
+      {/* Hit regions (#139) — outside the modal for the same reason the widgets are: the shapes
+          are only useful while you are PLAYING and missing them. Renders nothing until toggled,
+          and never takes a pointer event. */}
+      <HitRegionOverlay anchor={anchor} />
 
       {/* Fullscreen tabbed modal. */}
       {open && (

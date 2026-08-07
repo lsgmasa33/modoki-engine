@@ -115,7 +115,11 @@ function pct(sorted: number[], p: number): number {
   return sorted[i];
 }
 
-function summarize(values: number[]): FrameStat {
+/** Median/p95/min/max of a sample set. Exported because `gpuTimings` summarises its own window
+ *  the same way, and two implementations of "what p95 means" would drift the moment either was
+ *  touched — the GPU panel and the CPU panel sit side by side, so a disagreement there would read
+ *  as a measurement difference rather than as the bug it is. */
+export function summarizeStat(values: number[]): FrameStat {
   if (values.length === 0) return EMPTY_STAT;
   const sorted = [...values].sort((a, b) => a - b);
   return {
@@ -125,6 +129,8 @@ function summarize(values: number[]): FrameStat {
     max: sorted[sorted.length - 1],
   };
 }
+
+const summarize = summarizeStat;
 
 /** Plausible display refresh intervals, ms. A median frameMs sitting just above one of these
  *  means the renderer is finishing early and waiting — not that it is GPU-bound. */

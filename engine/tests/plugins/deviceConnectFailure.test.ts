@@ -53,3 +53,37 @@ describe('explainConnectFailure', () => {
     expect(body).toContain('port !== undefined ? { port } : {}');
   });
 });
+
+/** The USB half (#164). Over `adb forward` the local end ACCEPTS, so nothing ever raises
+ *  ECONNREFUSED and every message above is unreachable — the failure arrives as the lease client's
+ *  `refused` sentinel instead, which reads as "another Modoki owns it". A session chasing a phantom
+ *  lease conflict is the cost; the real cause was that nothing was listening at all. */
+describe('explainConnectFailure over adb (#164)', () => {
+  it('names BOTH causes of a handshake with no reply, rather than only the lease conflict', () => {
+    const out = explainConnectFailure('refused', DEVICE_PORT, true)!;
+    expect(out).toMatch(/nothing is listening/i);        // the cause the old message could not reach
+    expect(out).toMatch(/another modoki/i);              // …without dropping the one it did
+    expect(out).toMatch(/debugBuild/);                   // the actual gate, named
+    expect(out).toMatch(/proc\/net\/tcp/);               // the command that settles which it is
+  });
+
+  it('states the device port in HEX, because that is what /proc/net/tcp shows', () => {
+    // The issue's own A/B was voided by hand-converting 9095 and getting 0x238F (=9103). A grep
+    // recipe that makes the reader do that conversion is a recipe for the same void result.
+    expect(explainConnectFailure('refused', 9095, true)).toContain('2387');
+  });
+
+  it('leaves a GENUINE busy reply alone — the device named its reason, so do not second-guess it', () => {
+    // `busy` / `no-lease` / `not-owner` come from the plugin itself (GameDebugPlugin.java/.swift);
+    // only `refused` is this end giving up without an answer. Widening the branch to any busy state
+    // would bury a real lease conflict under speculation about a gate that is demonstrably fine.
+    for (const reason of ['busy', 'no-lease', 'not-owner']) {
+      expect(explainConnectFailure(reason, DEVICE_PORT, true)).toBe(reason);
+    }
+  });
+
+  it('does not fire over WiFi, where a dead port really does raise ECONNREFUSED', () => {
+    expect(explainConnectFailure('refused', DEVICE_PORT, false)).toBe('refused');
+    expect(explainConnectFailure('refused', DEVICE_PORT)).toBe('refused');
+  });
+});

@@ -72,6 +72,9 @@ import { computeDiagnostics } from './diagnose';
 import {
   startCapture, stopCapture, clearCapture, getCapture, readPerfProfile,
   resetProfilerMarkers, resetMarkerAggregate, resetFrameProfile, type MarkerSample,
+  setGpuTimingEnabled, resetGpuTimings,
+  collectHitRegions, hitRegionProviders, isHitRegionOverlayVisible, setHitRegionOverlayVisible,
+  regionsAt, nearestRegionTo,
 } from '@modoki/engine/runtime';
 import { startWatch, readWatch, listWatches, clearWatch, type StartWatchParams } from './watch';
 // Percept S3: resolved world transforms + hierarchy-deactivation set, both computed
@@ -836,10 +839,23 @@ registerAgentOp('profiler', (raw: unknown) => {
         })),
       };
     }
+    // P7 — GPU timestamp queries. Separate actions rather than a flag on `read` because enabling
+    // has a real cost and must be a deliberate act: three allocates a query set and writes two
+    // timestamps per render pass, and the plan's overhead rule says the profiler must not change
+    // the thing it measures. The returned status is the honest answer for THIS device — on a
+    // WebGL2 backend without EXT_disjoint_timer_query_webgl2 (most low-end Android) it comes back
+    // 'unsupported' with a reason, and no number is ever fabricated to fill the gap.
+    case 'gpu-on': {
+      const status = setGpuTimingEnabled(true);
+      return { gpuTiming: status, ...(status === 'pending' ? { note: 'Samples resolve asynchronously — read again in a few frames.' } : {}) };
+    }
+    case 'gpu-off':
+      return { gpuTiming: setGpuTimingEnabled(false) };
     case 'reset':
       resetProfilerMarkers();
       resetMarkerAggregate();
       resetFrameProfile();
+      resetGpuTimings();
       clearCapture();
       return { reset: true };
     case 'read':
@@ -950,6 +966,66 @@ registerAgentOp('input-watch-stop', () => {
   };
 });
 registerAgentOp('input-watch-clear', () => ({ ok: true, cleared: clearInputPresses() }));
+
+// ── Hit REGIONS (#139): the shapes a game's hitTest uses, which are authored NOWHERE — computed
+// inside the hit-test from config, so no inspector, scene view or screenshot can show them. The
+// companion to the input watch above: that one measures a miss, this one says what it missed and
+// by how much. `show`/`hide` drive the on-screen overlay (which also plots the last few recorded
+// presses); `read` returns the geometry as data, which is what an agent actually reasons over. ──
+const DEFAULT_HIT_REGION_LIMIT = 60;
+registerAgentOp('hit-regions', (raw: unknown) => {
+  const p = (raw ?? {}) as {
+    action?: string; provider?: string; kind?: string; ids?: string[];
+    limit?: number; precision?: number; at?: { x: number; y: number };
+  };
+  const action = String(p.action ?? 'read');
+  if (action === 'show' || action === 'hide') {
+    setHitRegionOverlayVisible(action === 'show');
+    return { ok: true, visible: action === 'show', providers: hitRegionProviders() };
+  }
+  const providers = hitRegionProviders();
+  const all = collectHitRegions({ provider: p.provider, kind: p.kind, ids: p.ids });
+  const limit = typeof p.limit === 'number' && Number.isFinite(p.limit) && p.limit > 0
+    ? Math.floor(p.limit) : DEFAULT_HIT_REGION_LIMIT;
+  const regions = all.slice(0, limit);
+  const result: Record<string, unknown> = {
+    visible: isHitRegionOverlayVisible(),
+    providers,
+    returnedCount: regions.length,
+    totalCount: all.length,
+    regions,
+  };
+  // The question a miss investigation actually asks, answered here rather than by making the
+  // caller re-implement point-in-shape against the returned geometry — which is where a second,
+  // subtly different containment test would creep in and disagree with the overlay.
+  if (p.at && Number.isFinite(p.at.x) && Number.isFinite(p.at.y)) {
+    const hits = regionsAt(all, p.at!.x, p.at!.y);
+    result.at = p.at;
+    result.hitsAt = hits.map((r) => ({ id: r.id, kind: r.kind, label: r.label }));
+    if (hits.length === 0) {
+      // A MISS is the interesting answer, so it comes with the nearest edge — the number the
+      // Court investigation had to derive by hand (27.6 px against a 22.76 px radius).
+      const near = nearestRegionTo(all, p.at.x, p.at.y);
+      result.nearest = near
+        ? { id: near.region.id, kind: near.region.kind, label: near.region.label, distancePx: +near.distance.toFixed(2) }
+        : null;
+    }
+  }
+  // "Could not look" must never read as "nothing is there" (§5): no provider is a different fact
+  // from no regions, and they produce identical empty lists.
+  if (providers.length === 0) {
+    result.hint = 'No hit-region provider is registered, so this is NOT evidence that the surface '
+      + 'has no hit regions — nobody was able to answer. A game publishes them by calling '
+      + 'registerHitRegionProvider() from the code that owns its hitTest geometry.';
+  } else if (all.length === 0) {
+    result.hint = `Provider(s) [${providers.join(', ')}] registered but reported no regions — the `
+      + 'surface is not hit-testable right now (no level loaded, or a modal is swallowing input).';
+  } else if (regions.length < all.length) {
+    result.hint = `${all.length} region(s) matched; showing the first ${regions.length}. Raise limit=, or filter by kind=/provider=.`;
+  }
+  return roundFloats(result, resolvePrecision(p.precision));
+});
+
 
 // ── Phase E: time-scale control (0=pause, 0.3=slow-mo, 2=fast) — inspect fast motion ──
 registerAgentOp('set-timescale', (params) => {

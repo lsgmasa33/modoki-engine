@@ -204,6 +204,23 @@ export {
   COUNTER_WINDOW_FRAMES, MAX_COUNTERS,
   type CounterStat, type CounterReport,
 } from './core/profilerCounters';
+// GPU timing (P7) — the real per-pass GPU ms that `restMs` cannot be. OFF by default and
+// runtime-toggleable (three already enables the device feature, so nothing is paid until asked).
+// Unavailable reports as `status: 'unsupported'` with the numbers ABSENT, never as zero.
+export {
+  setGpuTimingEnabled, isGpuTimingEnabled, getGpuProfile, getRestBreakdown, gpuPassScope,
+  pollGpuTimings, resetGpuTimings, getNewestGpuFrameId, MAX_GPU_PASS_LABELS,
+  type GpuProfile, type GpuPassStat, type GpuTimingStatus, type RestBreakdown,
+} from './core/gpuTimings';
+// Hit regions (#139) — the shapes a game's hitTest uses, which are authored NOWHERE and so cannot
+// be seen in an inspector, a scene view or a screenshot. A game publishes them from the code that
+// OWNS the geometry (never a second copy of it) via registerHitRegionProvider.
+export {
+  registerHitRegionProvider, collectHitRegions, hitRegionProviders,
+  isHitRegionOverlayVisible, setHitRegionOverlayVisible, subscribeHitRegionOverlay,
+  hitShapeContains, hitShapeDistance, regionsAt, nearestRegionTo,
+  type HitRegion, type HitShape, type HitRegionFilter, type HitRegionProvider,
+} from './rendering/hitRegions';
 // Quality tiers (#121 P3) — two tiers, measurement as ground truth, allowlist as a shortcut.
 // The allowlist ships EMPTY and `auto` is NOT the default: see the module header, both are
 // deliberate states pending P5 calibration on real hardware, not unfinished work.
