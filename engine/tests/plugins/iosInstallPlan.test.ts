@@ -36,11 +36,11 @@ describe('planIosInstall', () => {
     // ⚠️ BOTH fields are that class — `iosDevicectlId` too, which this file got wrong for longer.
     // It carried a real devicectl identifier straight THROUGH the #103 sweep (15e8e032, "stop
     // shipping the owner's real device ids"), because no guard can see it: a devicectl id is a
-    // plain UUID, indistinguishable by shape from every asset GUID in the repo, so the scan has no
-    // rule for it — and the one leg that greps for it by VALUE was itself broken, looking for a
-    // repo-root `project.user.json` when the editor writes `games/<id>/project.user.json`. It has
-    // been repointed, so this class IS guarded now on any clone that has built to hardware (and
-    // still is not on CI, which has no device config at all). See
+    // plain UUID, indistinguishable by shape from every asset GUID, so no SHAPE rule can exist —
+    // and the one leg that grepped for it by value was itself broken, looking for a repo-root
+    // `project.user.json` when the editor writes `games/<id>/project.user.json`. Both are fixed:
+    // that leg is repointed, and `KNOWN_DEVICE_IDS` in scan-publish-safety.mjs now matches this
+    // class by exact value (safe there — `scripts/` never ships). See
     // docs/engine-oss-publishing.md § "Device ids".
     expect(planIosInstall({
       iosDeviceId: 'DEADBEEF-0123456789ABCDEF',
