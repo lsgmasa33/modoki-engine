@@ -205,6 +205,33 @@ committed sidecars with a stale `modelCache.hash` are cleaned up by
 `.meta.json` through the real read/write functions; `engine/tests/assets/
 metaSidecarChurn.test.ts` guards against a regression re-introducing one.
 
+### Reproducible is not the same as up to date (#161)
+
+`textureCache.hash` being pure buys nothing if the committed value was written under *different*
+settings and never regenerated. That is the failure this section did not anticipate: a `maxSize`
+reduction pass over `games/sling` left all 25 of its texture sidecars recording an artifact the
+pipeline had stopped producing — one of them claiming `2048×2048 / 12 mips` under a `maxSize: 512`
+block three lines above it.
+
+Nothing caught it, because a `textureCache` record is only ever consulted as a **cache key**: a
+wrong one costs a re-encode, never a failure. It surfaces instead as **tree churn** — opening the
+project serves the textures, misses the cache on the stale hash, auto-bakes
+(`autoBakeThenServe`), and rewrites the sidecars. That is the worst place for it to show up: a tree
+that is dirty before you have typed anything is what makes `git diff -- games/ demos/` — the manual
+stand-in for #18's declined pre-commit hook — stop being a signal, so a genuine stray edit rides
+along unnoticed.
+
+The guard is in the same file (`metaSidecarChurn.test.ts`) and is **exact, not heuristic**,
+precisely because the hash is pure: it recomputes every tracked texture sidecar's hash from the
+committed source bytes + the committed settings and fails on a mismatch, naming the file and both
+values. It subsumes the dimension case — a record cannot be stale in its `width`/`mipLevels` while
+its hash still reproduces. Measured at 211 sidecars in ~220 ms, and it imports `hashKey` /
+`resolveTextureSettings` rather than restating them, so an `ENCODER_VERSION` bump or a new key
+ingredient cannot leave it checking a formula the pipeline no longer uses.
+
+The fix when it fires is always the same: reimport the named assets (editor, or
+`POST /api/reimport {path, recursive:true}`) and commit the sidecars.
+
 ## Sprite atlas packing
 
 An `.atlas.json` names an explicit set of member sprite GUIDs (Phase-1 slices

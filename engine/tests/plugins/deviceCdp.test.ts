@@ -13,7 +13,7 @@ import {
   synthFallbackBanner,
   resolveDeviceCdpPort, DEFAULT_DEVICE_CDP_PORT, parseWebviewSockets, isCdpRoutableMethod,
   tryDeviceCdpInput, cdpTap, cdpDrag, cdpPressKey, cdpHover, cdpScroll, isDeviceCdpAvailable,
-  TRUSTED_CDP_MECHANISM, discoverDeviceCdpTarget, deviceCdpAdb,
+  TRUSTED_CDP_MECHANISM, discoverDeviceCdpTarget, deviceCdpAdb, resetDeviceCdpSession,
   type CdpSender, type CdpRouteDeps, type DeviceCdpSession,
 } from '../../plugins/backend/deviceCdp';
 
@@ -340,5 +340,100 @@ describe('discoverDeviceCdpTarget — discovery I/O is bounded (#99 sweep)', () 
     // timeout still fails this way against a dead endpoint, and would pass a result-only check.
     expect(inits).toHaveLength(1);
     expect(inits[0]?.signal).toBeInstanceOf(AbortSignal);
+  });
+});
+
+/** #160 — the CDP tunnel's LIFETIME. `deviceCdpAdb.removeForward` had exactly one definition and
+ *  zero call sites, so nothing ever removed the `adb forward` discovery creates: rules outlived the
+ *  editor, survived unplugging the phone, and pointed at dead webview pids.
+ *
+ *  These tests assert the two ends of the lifetime — that a REJECTED candidate takes its rule with
+ *  it, and that teardown removes the one that was kept, with the SERIAL it was created with (which
+ *  `removeForward`'s #158 ownership check needs and which is gone from scope by teardown time).
+ *  They stub the adb seam, so they are necessary and NOT sufficient: what proves the fix is the
+ *  live check in the issue — `adb forward --list` after a real disconnect. The seam being stubbed
+ *  everywhere is precisely how the dead function went unnoticed. */
+describe('CDP forward lifecycle — the tunnel is torn down (#160)', () => {
+  /** Discovery over one socket, with `fetch` faked to whatever the probe should see. */
+  function stubDiscovery(opts: { sockets: string; version?: unknown; list?: unknown; fail?: boolean }) {
+    const sockets = vi.spyOn(deviceCdpAdb, 'listUnixSockets').mockReturnValue(opts.sockets);
+    const forward = vi.spyOn(deviceCdpAdb, 'forward').mockImplementation(() => {});
+    const remove = vi.spyOn(deviceCdpAdb, 'removeForward').mockImplementation(() => {});
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (u: string) => {
+      if (opts.fail) throw new Error('dead endpoint');
+      const body = String(u).endsWith('/json/version') ? opts.version : opts.list;
+      return { ok: true, json: async () => body } as unknown as Response;
+    }) as unknown as typeof fetch;
+    return {
+      forward, remove,
+      restore() { globalThis.fetch = realFetch; sockets.mockRestore(); forward.mockRestore(); remove.mockRestore(); },
+    };
+  }
+
+  const PAGE = [{ type: 'page', webSocketDebuggerUrl: 'ws://127.0.0.1:9335/devtools/page/1' }];
+
+  it('a candidate that fails its probe does not leave its rule behind', async () => {
+    const s = stubDiscovery({ sockets: '0000 0002 0001 @webview_devtools_remote_1234\n', fail: true });
+    try {
+      expect(await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFCTB0EV83K' })).toBeNull();
+      // The bug: `forward` ran, discovery declined the candidate, and the rule survived the call.
+      expect(s.forward).toHaveBeenCalledTimes(1);
+      expect(s.remove).toHaveBeenCalledWith(9335, 'RFCTB0EV83K');
+    } finally { s.restore(); resetDeviceCdpSession(); }
+  });
+
+  it('a candidate rejected on PACKAGE (not an error) is cleaned up too — the `continue` path', async () => {
+    const s = stubDiscovery({
+      sockets: '0000 0002 0001 @webview_devtools_remote_1234\n',
+      version: { 'Android-Package': 'com.other.app' }, list: PAGE,
+    });
+    try {
+      expect(await discoverDeviceCdpTarget({ localPort: 9335, preferPackage: 'com.modokiengine.sling', serial: 'RFCTB0EV83K' })).toBeNull();
+      expect(s.remove).toHaveBeenCalledWith(9335, 'RFCTB0EV83K');
+    } finally { s.restore(); resetDeviceCdpSession(); }
+  });
+
+  it('the WINNING candidate keeps its rule — that tunnel IS the session\'s route', async () => {
+    const s = stubDiscovery({
+      sockets: '0000 0002 0001 @webview_devtools_remote_1234\n',
+      version: { 'Android-Package': 'com.modokiengine.sling' }, list: PAGE,
+    });
+    try {
+      const target = await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFCTB0EV83K' });
+      expect(target?.androidPackage).toBe('com.modokiengine.sling');
+      expect(s.remove).not.toHaveBeenCalled();
+    } finally { s.restore(); resetDeviceCdpSession(); }
+  });
+
+  it('teardown removes the kept rule, with the port AND serial it was forwarded with', async () => {
+    const s = stubDiscovery({
+      sockets: '0000 0002 0001 @webview_devtools_remote_1234\n',
+      version: { 'Android-Package': 'com.modokiengine.sling' }, list: PAGE,
+    });
+    try {
+      await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFCTB0EV83K' });
+      resetDeviceCdpSession();
+      expect(s.remove).toHaveBeenCalledWith(9335, 'RFCTB0EV83K');
+      // Latch cleared: a second teardown must not re-issue a removal for a rule already gone —
+      // with a sibling clone's rule potentially now on that port, that is the #158 hazard.
+      s.remove.mockClear();
+      resetDeviceCdpSession();
+      expect(s.remove).not.toHaveBeenCalled();
+    } finally { s.restore(); }
+  });
+
+  it('teardown never throws when adb cannot remove the rule — a leak must not fail the cleanup', async () => {
+    const s = stubDiscovery({
+      sockets: '0000 0002 0001 @webview_devtools_remote_1234\n',
+      version: { 'Android-Package': 'com.modokiengine.sling' }, list: PAGE,
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFCTB0EV83K' });
+      s.remove.mockImplementation(() => { throw new Error('adb: device not found'); });
+      expect(() => resetDeviceCdpSession()).not.toThrow();
+      expect(warn).toHaveBeenCalled();
+    } finally { warn.mockRestore(); s.restore(); }
   });
 });

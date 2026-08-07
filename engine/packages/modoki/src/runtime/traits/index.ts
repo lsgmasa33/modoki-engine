@@ -33,7 +33,7 @@ export { Persistent, markPersistent } from './Persistent';
 export { Transient } from '../core/traits/Transient';
 export { Time } from '../core/traits/Time';
 export { Input } from './Input';
-export { UIElement } from './UIElement';
+export { UIElement, type UILengthUnit } from './UIElement';
 export { UIBinding } from './UIBinding';
 export { UIAction } from './UIAction';
 export { UIFocusable } from './UIFocusable';

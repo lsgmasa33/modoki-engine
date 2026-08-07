@@ -34,7 +34,13 @@ element-type properties. There is no separate "label" vs "panel" vs "button" tra
 
 Field groups (representative fields, verified against `UIElement.ts`):
 
-- **Layout** — `width`/`height` (+ `widthUnit`/`heightUnit`, `'px' | '%'`, `0` = auto),
+- **Layout** — `width`/`height` (+ `widthUnit`/`heightUnit`, `0` = auto). ⚠️ **Every `*Unit` field
+  is the SIX-member `UILengthUnit`** — `'px' | '%' | 'vw' | 'vh' | 'vmin' | 'vmax'` — exported from
+  `@modoki/engine/runtime`, and every one of them is selectable from the Inspector dropdown. This
+  line read `'px' | '%'` until 2026-08-07, contradicting the viewport-units paragraph below and the
+  type itself; a game had already written a three-way unit resolver that silently treated `vw` and
+  `vmax` as `vmin`, which is wrong on any non-square host. **Resolve units through a map that is
+  total over the union, not a ternary chain with a fall-through.** Also:
   `flexDirection`, `flexWrap`, `justifyContent`, `alignItems`, `gap` + `gapUnit`, `flexGrow`,
   `flexShrink`, per-edge `padding*`/`margin*` (each with its own `*Unit`),
   `minWidth`/`maxWidth`/`minHeight`/`maxHeight`, `alignSelf`, `zIndex`, `overflow`

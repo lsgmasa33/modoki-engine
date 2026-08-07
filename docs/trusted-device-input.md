@@ -72,6 +72,59 @@ fronts the synthetic reply with the banner when a trusted route was possible in 
 - **WDA**: a gesture is ONE actions call, and W3C defines `DELETE /actions` to release stuck
   pointers. So it releases, then **allows** the synthetic fallback — the user still gets their input.
 
+### The CDP tunnel has a lifetime, and it ends at `resetDeviceCdpSession`
+
+The Android channel rides an `adb forward tcp:<port> → localabstract:webview_devtools_remote_<pid>`
+that discovery creates. `<port>` is per-clone (`resolveDeviceCdpPort` = `9333 + (backend − 5179)`),
+so clones never contend — which is exactly why a leaked rule here is a *lifecycle* bug and not a
+collision, and why it stayed invisible: `deviceCdpAdb.removeForward` shipped with **zero call sites**
+and nothing ever removed a CDP forward at all (#160). Three dangling rules were found on this Mac
+pointing at webview pids of processes that were long gone.
+
+The rule now:
+
+- **`resetDeviceCdpSession()` is the single teardown**, and it removes the forward as well as
+  closing the socket. Closing the socket alone is half a teardown.
+- **A lease `disconnect()` calls it** — unconditionally, not gated on `useAdb`. The session cache is
+  process-global and keyed by serial (#149), so a lease that swaps phones must not inherit the
+  previous device's route. `disconnect()` also runs at the head of every `connect()`.
+- **Discovery cleans up after a candidate it declines.** Each probe `forward`s onto the same port, so
+  a rejected candidate is invisible while another follows it — but the last one to fail used to
+  survive the whole call, leaving a rule for a socket discovery had just declined.
+- **Removal is best-effort and never throws.** The failure being fixed is a rule *left standing*;
+  throwing out of the cleanup would strand the teardown that follows it. It warns instead.
+
+#### …but that teardown is the SECOND line of defence. Startup reclamation is the first.
+
+Everything above runs only when the session ends *politely*. `disconnect()`'s one production caller
+is the explicit `/api/device/disconnect` route, so the resources come back when a human clicks
+Disconnect — and leak on the far more common ending: quitting the editor with a device connected.
+That is exactly the state #160 was reported from ("no editor was running for any of the three"), and
+the first fix did not reach it.
+
+**A process-exit hook is NOT the answer, and that is measured rather than assumed.**
+`process.on('exit')` / `SIGINT` / `SIGTERM` handlers registered in the backend are installed under
+Electron and then never fire — Chromium's browser process takes the signal and terminates. Probed
+directly: the log shows the install line, no handler line after it, `Electron exited with signal
+SIGTERM`, and both rules still standing. Even if it did fire, `kill -9`, an OOM and a crash all skip
+it — the three ways an editor most often dies badly.
+
+So the lifetime is closed at **startup** instead — `reclaimStaleForwardsAtStartup()`, called by both
+backend hosts (`startBackendServer` in Electron, the Vite plugin's `configureServer` under a bare
+`npm run dev`), which no manner of dying can skip. Same shape the device-claims file already uses: a
+claim is expired by pid-liveness **on read**, not by a polite release. Safe because both ports are
+derived per clone, so a rule on one of our own ports at startup can only be our own leftover — this
+is not a sweep of "stale-looking" rules in general, which would be #158.
+
+⚠️ **The unit tests stub the adb seam, so they are necessary and not sufficient** — that stub is how
+the dead `removeForward` went unnoticed in the first place. The check that proves it end to end:
+
+```
+1. connect + one trusted input   → tcp:<host> and tcp:<cdp> both present
+2. kill the editor (SIGTERM)     → both STILL present   ← the exit hook does not save you
+3. start the next editor         → both gone, one `[device] reclaimed …` line each
+```
+
 ## WebDriverAgent lifecycle
 
 **Provisioned** (`engine/toolchain/wdaProvision.ts`) and **running** (`wdaLauncher.ts`) are different

@@ -21,8 +21,9 @@ import {
   adbArgs, adbBinary, describeAndroidDevice, forwardOwner, listAndroidDevices, resolveAndroidSerial,
   withFriendlyNames,
 } from './androidDevices';
-import { adbDeviceId, claimDevice, releaseDevice, wifiDeviceId } from './deviceClaims';
+import { adbDeviceId, claimDevice, releaseDevice, releaseAllForThisProcess, wifiDeviceId } from './deviceClaims';
 import { DeviceLeaseClient, type LeaseTransport, type LeaseRequest, type LeaseReply, type LeaseState } from './deviceLease';
+import { resetDeviceCdpSession, resolveDeviceCdpPort } from './deviceCdp';
 
 /** The device plugin's TCP port (matches `GameDebugPlugin` default). This is the port ON THE PHONE
  *  — it is a property of the app, shared by every Modoki game, and deliberately NOT per-clone. */
@@ -559,6 +560,16 @@ export class DeviceConnectionManager {
     return { serial: picked.serial, ...(hit ? { label: describeAndroidDevice(hit) } : {}) };
   }
 
+  /** Remove ONLY this lease's own adb forward, without the async `disconnect()` around it — the
+   *  exit path needs the machine-wide resource back but cannot await a lease round trip. Leaves
+   *  `this.target` intact: on the exit path nothing reads it afterwards, and a half-cleared lease
+   *  would be worse than a stale one if the process somehow continues. */
+  releaseAdbForwardSync(): void {
+    if (!this.target?.useAdb) return;
+    try { adbRunner.removeForward(this.target.port, this.target.serial); }
+    catch { /* forward may already be gone / adb absent — non-fatal */ }
+  }
+
   /** Hand back the hardware claim, if this lease holds one. Idempotent — a second call after the
    *  claim is gone is a no-op, which matters because `disconnect()` is called on every connect. */
   private releaseClaim(): void {
@@ -578,6 +589,13 @@ export class DeviceConnectionManager {
       try { adbRunner.removeForward(this.target.port, this.target.serial); }
       catch { /* forward may already be gone / adb absent — non-fatal */ }
     }
+    // The CDP session is reached through a SECOND, separate adb forward (its own per-clone port),
+    // and the lease used to leave both it and its socket standing — so releasing the phone left a
+    // cached session and a tunnel still aimed at it (#160). Unconditional, not gated on `useAdb`:
+    // the cache is process-global and keyed by serial (#149), so a lease that swaps to another
+    // phone — or to one reached by IP — must not inherit the previous device's route. Cheap when
+    // there is nothing to drop, and `disconnect()` runs at the head of every connect.
+    resetDeviceCdpSession();
     this.releaseClaim();
     this.client = null;
     this.transport = null;
@@ -702,3 +720,71 @@ export class DeviceConnectionManager {
 
 /** Process-global device connection (one per backend → one per clone). */
 export const deviceConnection = new DeviceConnectionManager();
+
+// NOTE: `reclaimStaleForwardsAtStartup()` is deliberately NOT called at module scope. It shells out
+// to `adb forward --list`, and module load happens before any test's `beforeEach` can stub the
+// seam — so every suite that merely imports this file would run a real adb command whose result
+// depends on what is plugged into the machine. That is precisely the half-injectable-seam trap
+// `deviceConnectAdb.test.ts` documents. The two real backend hosts call it explicitly instead.
+
+/** Give back every MACHINE-WIDE resource this process holds on a device: both adb forwards (the
+ *  lease's own, and the CDP tunnel's) and this pid's device claims.
+ *
+ *  Exists because `disconnect()` is not enough, which the #160 fix missed. Its only production
+ *  caller is the explicit `/api/device/disconnect` route — so the resources were released when a
+ *  human clicked Disconnect, and leaked on the far more common ending: quitting the editor with a
+ *  device still connected. That is exactly the state #160 was reported from ("no editor was running
+ *  for any of the three"), and it survived the fix that closed it. Re-measured after the fix:
+ *  connect, one trusted tap, quit — `tcp:9097` and `tcp:9335` both still standing, claim still held.
+ *
+ *  SYNCHRONOUS on purpose, and that is the whole design constraint. `process.on('exit')` cannot
+ *  await, and Electron's `before-quit` does not reliably run for a signal (see devServer.ts, which
+ *  reaps its Vite child the same way and for the same reason). Every step here is sync underneath —
+ *  `execFileSync` for adb, a lock+`writeFileSync` for the claims file — so all of it survives that
+ *  constraint. What is deliberately SKIPPED is the polite lease-protocol `disconnect()` round trip:
+ *  it is async and the device times the lease out on its own, whereas an adb rule has no expiry at
+ *  all and outlives the machine's session.
+ *
+ *  Best-effort and never throws: this runs on the exit path, where a throw would abort the steps
+ *  after it and could take the exit code with it. */
+export function releaseDeviceResourcesOnExit(conn: DeviceConnectionManager = deviceConnection): void {
+  // `conn` is a seam for tests only — production has exactly one manager (the singleton below), and
+  // the exit hooks pass nothing. Without it a test can only assert against process-global state.
+  // Order matters only in that each step must not be able to prevent the next.
+  try { conn.releaseAdbForwardSync(); } catch { /* adb gone / rule already removed */ }
+  try { resetDeviceCdpSession(); } catch { /* already torn down */ }
+  try { releaseAllForThisProcess(); } catch { /* an unwritable claims file must never block exit */ }
+}
+
+/** Reclaim any adb forward left on THIS clone's ports by a previous run — called once when the
+ *  backend starts.
+ *
+ *  This, not an exit hook, is what actually fixes the dangling rules #160 was reported from, and
+ *  the reason is measured rather than assumed. A process-exit teardown looked like the obvious
+ *  answer and does not work here: `process.on('exit')` / `SIGINT` / `SIGTERM` handlers installed in
+ *  the backend DO get registered under Electron and then never fire — Chromium's browser process
+ *  takes the signal and terminates. Probed directly on this Mac: connect a device, one trusted tap,
+ *  `stop-editor.sh` (a SIGTERM), and the log shows `[hooks installed]` with no handler line after
+ *  it, `Electron exited with signal SIGTERM`, and both rules still standing. And even if it did
+ *  fire, `kill -9`, an OOM and a crash all skip it — the three ways an editor most often dies badly.
+ *
+ *  So the lifetime is closed at STARTUP instead, which no manner of dying can skip. It is the same
+ *  shape the claims file already uses (a claim is expired by pid-liveness ON READ rather than by a
+ *  polite release), applied to the resource that had no expiry at all: an adb rule outlives the
+ *  machine's session entirely, with nothing to sweep it.
+ *
+ *  Safe because both ports are DERIVED PER CLONE — the lease host port (`resolveDeviceHostPort`)
+ *  and the CDP port (`resolveDeviceCdpPort`) are `base + (backend − 5179)`. At startup this process
+ *  holds no lease, so a rule sitting on one of our own ports can only be our own leftover. It is
+ *  emphatically not a sweep of "stale-looking" rules in general: reaching across to a port we do
+ *  not own is #158, and this never does. */
+export function reclaimStaleForwardsAtStartup(): void {
+  for (const port of [resolveDeviceHostPort(), resolveDeviceCdpPort()]) {
+    try {
+      const owner = forwardOwner(adbRunner.listForwards(), port);
+      if (!owner) continue;                       // nothing there — the normal case
+      adbRunner.removeForward(port, owner);
+      console.log(`[device] reclaimed a stale adb forward on tcp:${port} (${owner}) left by a previous run`);
+    } catch { /* no adb, no device, unreadable list — never block startup over a cleanup */ }
+  }
+}

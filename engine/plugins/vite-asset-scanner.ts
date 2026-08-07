@@ -58,6 +58,7 @@ import { type SpriteSlice, type SpriteAssetRef } from '../packages/modoki/src/ru
 import { type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
 import { type SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { handleBackendRequest, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
+import { reclaimStaleForwardsAtStartup } from './backend/deviceConnection';
 import { vendorEnginePlugins, writeVendorMarker } from './vendorPlugins';
 import { spawnBuildCommand, resolveBuildStep, type BuildStep } from './buildStepShell';
 import { healNativeConfig } from './healNativeConfig';
@@ -1394,6 +1395,8 @@ export function assetScannerPlugin(): Plugin {
     },
 
     configureServer(server) {
+      // The OTHER backend host — see startBackendServer in electron/backendServer.ts (#160).
+      reclaimStaleForwardsAtStartup();
       viteServer = server as unknown as { ws: { send: (m: object) => void } };
 
       // Agent bridge: cache the trait schema the browser pushes, and resolve

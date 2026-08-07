@@ -160,9 +160,9 @@ export const deviceCdpAdb = {
    *  `adbRunner.removeForward` in deviceConnection.ts, including its FAIL-CLOSED handling of a
    *  list that cannot be read.
    *
-   *  ⚠️ CURRENTLY UNREFERENCED — nothing in production calls this, so the CDP tunnel is never torn
-   *  down at all (#160). It is guarded here so the teardown, when it lands, is safe to call; do not
-   *  read this function's existence as evidence that a CDP forward is ever released. */
+   *  Called via `releaseCdpForward` — from `resetDeviceCdpSession` (which every teardown path,
+   *  including a lease `disconnect()`, now goes through) and from `discoverDeviceCdpTarget` for a
+   *  candidate that failed its probe (#160). */
   removeForward(localPort: number, serial?: string): void {
     if (serial) {
       let owner: string | undefined;
@@ -179,6 +179,26 @@ export const deviceCdpAdb = {
     execFileSync(adbBinary(), adbArgs(serial, ['forward', '--remove', `tcp:${localPort}`]), { timeout: 4000, stdio: 'pipe' });
   },
 };
+
+/** The forward this module currently owns, latched when one is left standing so teardown can name
+ *  the port AND serial it was created with — `removeForward`'s ownership check needs the serial,
+ *  and by teardown time the caller's `opts` are long gone (#160). Null when no tunnel is open. */
+let ownedForward: { port: number; serial?: string } | null = null;
+
+/** Drop the forward this module owns, if any. Best-effort and never throws: a tunnel that is
+ *  already gone (phone unplugged, adb dead) must not fail the teardown that was cleaning it up —
+ *  the failure mode this closes is a rule LEFT standing, and throwing here would strand the
+ *  callers that follow. Clears the latch either way, since a rule we cannot remove is not one we
+ *  can keep claiming to own. */
+function releaseCdpForward(): void {
+  const owned = ownedForward;
+  ownedForward = null;
+  if (!owned) return;
+  try { deviceCdpAdb.removeForward(owned.port, owned.serial); }
+  catch (e) {
+    console.warn(`[device-cdp] could not remove the CDP forward on tcp:${owned.port}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
 
 /** Discover the ONE Modoki webview's CDP target on the connected Android device: enumerate
  *  `webview_devtools_remote_<pid>` sockets, forward each candidate to `localPort` in turn, and
@@ -200,17 +220,34 @@ export async function discoverDeviceCdpTarget(opts: { localPort: number; preferP
     if (!opts.preferPackage && sockets.length > 1) return null;
 
     for (const sock of sockets) {
+      // A candidate that does NOT pan out must take its forward with it (#160). Each `forward`
+      // overwrites the rule on `localPort`, so a rejected candidate is invisible while another
+      // follows it — but the LAST one to fail used to survive the whole discovery, leaving a rule
+      // pointing at a socket this function just declined. `keep` is what distinguishes the
+      // returned tunnel (deliberately left standing — it IS the session's route) from every other
+      // exit; `finally` runs on `continue` and on the `return` alike, which is the point.
+      let forwarded = false;
+      let keep = false;
       try {
         deviceCdpAdb.forward(opts.localPort, sock.name, opts.serial);
+        forwarded = true;
         const version = await httpGetJson<JsonVersion>(`http://127.0.0.1:${opts.localPort}/json/version`);
         const pkg = version['Android-Package'];
         if (opts.preferPackage && pkg !== opts.preferPackage) continue;
         const list = await httpGetJson<JsonListEntry[]>(`http://127.0.0.1:${opts.localPort}/json/list`);
         const page = list.find((e) => e.type === 'page' && e.webSocketDebuggerUrl);
         if (!page?.webSocketDebuggerUrl) continue;
+        keep = true;
+        ownedForward = { port: opts.localPort, ...(opts.serial ? { serial: opts.serial } : {}) };
         return { webSocketDebuggerUrl: page.webSocketDebuggerUrl, androidPackage: pkg };
       } catch {
         continue; // this candidate didn't pan out — try the next, or fall through to null
+      } finally {
+        if (forwarded && !keep) {
+          // Not `releaseCdpForward()`: this rule is not the latched one, and clearing a latch that
+          // belongs to a still-live session would strand ITS tunnel.
+          try { deviceCdpAdb.removeForward(opts.localPort, opts.serial); } catch { /* already gone / adb absent */ }
+        }
       }
     }
     return null;
@@ -415,7 +452,14 @@ export async function getDeviceCdpSession(opts: CdpSessionOpts = {}): Promise<De
         const localPort = resolveDeviceCdpPort();
         const target = await discoverDeviceCdpTarget({ localPort, preferPackage: opts.preferPackage, serial: opts.serial });
         if (!target) return null;
-        const session = await DeviceCdpSession.connect(target.webSocketDebuggerUrl);
+        let session: DeviceCdpSession;
+        try { session = await DeviceCdpSession.connect(target.webSocketDebuggerUrl); }
+        catch (e) {
+          // Discovery left a forward standing for a session that never opened — nothing else will
+          // ever reference it, so release it here rather than leaking it until the next reset.
+          releaseCdpForward();
+          throw e;
+        }
         session.onClose(() => { if (cachedSession === session) { cachedSession = null; cachedPackage = null; cachedSerial = null; } });
         cachedSession = session;
         cachedPackage = target.androidPackage ?? null;
@@ -432,13 +476,20 @@ export async function getDeviceCdpSession(opts: CdpSessionOpts = {}): Promise<De
 }
 
 /** Drop the cached session (closing it first) — used after a dispatch throws, so a session that
- *  went bad mid-call doesn't wedge every subsequent one behind the same broken socket. */
+ *  went bad mid-call doesn't wedge every subsequent one behind the same broken socket.
+ *
+ *  It also removes the `adb forward` the session was reached through (#160). This is the ONE place
+ *  that already means "this session is over", so it is where the tunnel's lifetime ends: for a long
+ *  time nothing removed a CDP forward at all, and stale rules outlived the editor pointing at dead
+ *  webview pids — the same *mask a device swap* hazard the lease's own forward-removal exists to
+ *  prevent. Closing the socket without removing the forward is half a teardown. */
 export function resetDeviceCdpSession(): void {
   cachedSession?.close();
   cachedSession = null;
   cachedPackage = null;
   cachedSerial = null;
   inFlight = null;
+  releaseCdpForward();
 }
 
 /** Test-only reset — module state otherwise leaks between test files (vitest keeps the module

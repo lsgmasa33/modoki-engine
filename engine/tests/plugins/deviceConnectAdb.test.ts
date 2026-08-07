@@ -14,12 +14,14 @@ import net from 'net';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
-import { DeviceConnectionManager, adbRunner } from '../../plugins/backend/deviceConnection';
+import { DeviceConnectionManager, adbRunner, releaseDeviceResourcesOnExit, reclaimStaleForwardsAtStartup } from '../../plugins/backend/deviceConnection';
 import { androidDevicesExec, _clearFriendlyNameCache } from '../../plugins/backend/androidDevices';
 import { DeviceLeaseAuthority } from '../../plugins/backend/deviceLease';
+import { deviceCdpAdb, discoverDeviceCdpTarget, resetDeviceCdpSession } from '../../plugins/backend/deviceCdp';
 
 const realForward = adbRunner.forward;
 const realRemove = adbRunner.removeForward;
+const realListForwards = adbRunner.listForwards;
 const realList = androidDevicesExec.list;
 const realDeviceName = androidDevicesExec.deviceName;
 /** One attached, usable phone — the unambiguous case, so these tests exercise the adb branch rather
@@ -44,7 +46,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   delete process.env.MODOKI_DEVICE_HOST_PORT;
-  adbRunner.forward = realForward; adbRunner.removeForward = realRemove;
+  adbRunner.forward = realForward; adbRunner.removeForward = realRemove; adbRunner.listForwards = realListForwards;
   androidDevicesExec.list = realList;
   androidDevicesExec.deviceName = realDeviceName;
   _clearFriendlyNameCache();
@@ -212,6 +214,131 @@ describe('DeviceConnectionManager — useAdb branch', () => {
       expect(status.detail).toMatch(/UNAUTHORIZED/i);
       expect(status.detail).toMatch(/allow usb debugging/i);
       expect(adbRunner.forward).not.toHaveBeenCalled();
+    });
+  });
+
+  /** #160 — releasing the phone must release EVERYTHING pointing at it. The CDP session rides a
+   *  second, separate `adb forward` on its own per-clone port, and the lease's `disconnect()` used
+   *  to reclaim only its own tunnel: `resetDeviceCdpSession` had two production callers (a
+   *  cache-key mismatch and a dispatch failure), neither of them the lease. So a disconnect left a
+   *  cached session and a live tunnel aimed at a device the editor no longer holds. */
+  describe('disconnect() also tears down the CDP tunnel (#160)', () => {
+    it('drops the CDP forward the session was reached through', async () => {
+      const listSockets = vi.spyOn(deviceCdpAdb, 'listUnixSockets')
+        .mockReturnValue('0000 0002 0001 @webview_devtools_remote_1234\n');
+      const cdpForward = vi.spyOn(deviceCdpAdb, 'forward').mockImplementation(() => {});
+      const cdpRemove = vi.spyOn(deviceCdpAdb, 'removeForward').mockImplementation(() => {});
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = (async (u: string) => ({
+        ok: true,
+        json: async () => (String(u).endsWith('/json/version')
+          ? { 'Android-Package': 'com.modokiengine.sling' }
+          : [{ type: 'page', webSocketDebuggerUrl: 'ws://127.0.0.1:9335/devtools/page/1' }]),
+      }) as unknown as Response) as unknown as typeof fetch;
+      try {
+        // Open a tunnel the way the input path does, then release the phone.
+        await discoverDeviceCdpTarget({ localPort: 9335, serial: 'TESTSERIAL1' });
+        expect(cdpForward).toHaveBeenCalledTimes(1);
+        expect(cdpRemove).not.toHaveBeenCalled();
+
+        const mgr = new DeviceConnectionManager('g-cdp-teardown', stateDir);
+        await mgr.disconnect();
+
+        expect(cdpRemove).toHaveBeenCalledWith(9335, 'TESTSERIAL1');
+      } finally {
+        globalThis.fetch = realFetch;
+        listSockets.mockRestore(); cdpForward.mockRestore(); cdpRemove.mockRestore();
+        resetDeviceCdpSession();
+      }
+    });
+
+    /** Found in the #160 close-out, by attacking the paths the fix did NOT touch.
+     *
+     *  `disconnect()` has exactly one production caller — the explicit `/api/device/disconnect`
+     *  route. So the resources came back when a human clicked Disconnect, and leaked on the far
+     *  more common ending: quitting the editor with a device still connected. That is precisely
+     *  the state #160 was reported from ("no editor was running for any of the three"), which
+     *  means the fix that closed it did not reach the path its own evidence came from.
+     *
+     *  Measured after the fix, before this one: connect, one trusted tap, quit the editor —
+     *  `tcp:9097` and `tcp:9335` both still standing and the claim still held by a dead pid. */
+    it('releases BOTH forwards and this pid\'s claims on process exit, without a disconnect()', async () => {
+      const listSockets = vi.spyOn(deviceCdpAdb, 'listUnixSockets')
+        .mockReturnValue('0000 0002 0001 @webview_devtools_remote_1234\n');
+      const cdpForward = vi.spyOn(deviceCdpAdb, 'forward').mockImplementation(() => {});
+      const cdpRemove = vi.spyOn(deviceCdpAdb, 'removeForward').mockImplementation(() => {});
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = (async (u: string) => ({
+        ok: true,
+        json: async () => (String(u).endsWith('/json/version')
+          ? { 'Android-Package': 'com.modokiengine.sling' }
+          : [{ type: 'page', webSocketDebuggerUrl: 'ws://127.0.0.1:9335/devtools/page/1' }]),
+      }) as unknown as Response) as unknown as typeof fetch;
+      try {
+        const mgr = new DeviceConnectionManager('g-exit', stateDir);
+        await mgr.connect({ useAdb: true });
+        (adbRunner.removeForward as ReturnType<typeof vi.fn>).mockClear();
+        await discoverDeviceCdpTarget({ localPort: 9335, serial: 'TESTSERIAL1' });
+
+        // The exit path — NOT disconnect(). Nothing is awaited: it must be sync all the way
+        // down, because `process.on('exit')` cannot await and a signal may skip before-quit.
+        releaseDeviceResourcesOnExit(mgr);
+
+        expect(cdpRemove).toHaveBeenCalledWith(9335, 'TESTSERIAL1');   // the CDP tunnel
+        expect(adbRunner.removeForward).toHaveBeenCalled();            // the lease's own forward
+      } finally {
+        globalThis.fetch = realFetch;
+        listSockets.mockRestore(); cdpForward.mockRestore(); cdpRemove.mockRestore();
+        resetDeviceCdpSession();
+      }
+    });
+
+    /** Startup reclamation — the part that actually closes #160's observed symptom.
+     *
+     *  The exit-path teardown above is real but insufficient, and that was MEASURED rather than
+     *  reasoned: `process.on('exit')`/`SIGINT`/`SIGTERM` handlers registered in the backend are
+     *  installed under Electron and then never fire (Chromium takes the signal), and `kill -9`,
+     *  an OOM and a crash would skip them anyway. Startup is the one teardown point nothing can
+     *  skip — the same shape the claims file already uses, where a claim is expired by pid-liveness
+     *  ON READ rather than by a polite release. */
+    it('reclaims a leftover rule on THIS clone\'s ports at startup, and leaves other ports alone', () => {
+      // The suite pins MODOKI_DEVICE_HOST_PORT (see beforeEach); drop it HERE so the real per-clone
+      // derivation runs, which is the thing under test — reclaiming the wrong port is the whole risk.
+      delete process.env.MODOKI_DEVICE_HOST_PORT;
+      // 9095 = this clone's derived lease host port under the default backend; 9333 = its CDP port.
+      // The third rule is a SIBLING's — a different port entirely, and touching it would be #158.
+      adbRunner.listForwards = () => [
+        'TESTSERIAL1 tcp:9095 tcp:9095',
+        'TESTSERIAL1 tcp:9333 localabstract:webview_devtools_remote_777',
+        'OTHERSERIAL tcp:9334 localabstract:webview_devtools_remote_888',
+      ].join('\n');
+      (adbRunner.removeForward as ReturnType<typeof vi.fn>).mockClear();
+
+      reclaimStaleForwardsAtStartup();
+
+      const ports = (adbRunner.removeForward as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+      expect(ports.sort()).toEqual([9095, 9333]);
+      expect(ports).not.toContain(9334);          // the sibling clone's lane, never ours to reclaim
+    });
+
+    it('reclaims nothing when the ports are clear — the normal startup, and it must stay silent', () => {
+      adbRunner.listForwards = () => 'OTHERSERIAL tcp:9334 localabstract:webview_devtools_remote_888';
+      (adbRunner.removeForward as ReturnType<typeof vi.fn>).mockClear();
+      reclaimStaleForwardsAtStartup();
+      expect(adbRunner.removeForward).not.toHaveBeenCalled();
+    });
+
+    it('is a no-op when nothing is held — a bare import must not touch adb on exit', () => {
+      const cdpRemove = vi.spyOn(deviceCdpAdb, 'removeForward').mockImplementation(() => {});
+      (adbRunner.removeForward as ReturnType<typeof vi.fn>).mockClear();
+      try {
+        // No lease, no latched CDP forward, no claim for this pid. This is every test process that
+        // merely imports the module — the exit hook is installed at module scope, so "harmless
+        // when idle" is what makes that safe rather than a suite-wide adb side effect.
+        expect(() => releaseDeviceResourcesOnExit()).not.toThrow();
+        expect(cdpRemove).not.toHaveBeenCalled();
+        expect(adbRunner.removeForward).not.toHaveBeenCalled();
+      } finally { cdpRemove.mockRestore(); }
     });
   });
 });
