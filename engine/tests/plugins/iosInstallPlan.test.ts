@@ -15,7 +15,7 @@ describe('planIosInstall', () => {
       .toEqual({ ok: false, missing: 'iosDeviceId' });
     // Having a devicectl id does NOT substitute: xcodebuild cannot accept it (it is a
     // different GUID from the hardware UDID — see wdaLauncher.parseIosDevices).
-    expect(planIosInstall({ iosDeviceId: '', iosDevicectlId: '796DC698-BD9D-529F' }))
+    expect(planIosInstall({ iosDeviceId: '', iosDevicectlId: 'FACEFEED-0000-0000' }))
       .toEqual({ ok: false, missing: 'iosDeviceId' });
   });
 
@@ -32,9 +32,19 @@ describe('planIosInstall', () => {
     // BLOCKING finding (#103 — it leaks the owner's hardware and aims a stranger's install at it).
     // This file carried one and killed the `main` snapshot for two days, and with it the free
     // public CI that runs ubuntu + windows + the whole e2e suite. Keep the shape, not the device.
+    //
+    // ⚠️ BOTH fields are that class — `iosDevicectlId` too, which this file got wrong for longer.
+    // It carried a real devicectl identifier straight THROUGH the #103 sweep (15e8e032, "stop
+    // shipping the owner's real device ids"), because no guard can see it: a devicectl id is a
+    // plain UUID, indistinguishable by shape from every asset GUID in the repo, so the scan has no
+    // rule for it — and the one leg that greps for it by VALUE was itself broken, looking for a
+    // repo-root `project.user.json` when the editor writes `games/<id>/project.user.json`. It has
+    // been repointed, so this class IS guarded now on any clone that has built to hardware (and
+    // still is not on CI, which has no device config at all). See
+    // docs/engine-oss-publishing.md § "Device ids".
     expect(planIosInstall({
       iosDeviceId: 'DEADBEEF-0123456789ABCDEF',
-      iosDevicectlId: '796DC698-BD9D-529F-B068-D14867813680',
+      iosDevicectlId: 'FACEFEED-0000-0000-0000-000000000000',
     })).toEqual({ ok: true, mode: 'devicectl' });
   });
 

@@ -38,7 +38,7 @@ export interface IosDevice { udid: string; name: string; connected: boolean }
  *  Two things this gets right that a naive parse does not:
  *   - **`hardwareProperties.udid`, not the top-level `identifier`.** `xcodebuild -destination id=`
  *     wants the hardware UDID (`00008150-…`); devicectl's own `identifier` is a different GUID
- *     (`796DC698-…`) and xcodebuild does not accept it.
+ *     (`FACEFEED-…`) and xcodebuild does not accept it.
  *   - **`tunnelState` is a PREFERENCE, not a filter.** The obvious rule — keep only
  *     `tunnelState: 'connected'` — is too strict, and measured wrong: with the iPhone Air reporting
  *     `disconnected`, `xcodebuild test-without-building` still launched WDA fine (it establishes its
