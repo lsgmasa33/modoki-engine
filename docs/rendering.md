@@ -452,6 +452,60 @@ export const spaceConsoleConfig: GameConfig = {
 
 The `GameConfig.preferWebGPU` JSDoc in `runtime/config.ts` is likewise stale (still describes an `'auto'` → legacy `WebGLRenderer` fallback).
 
+### Quality tiers — `low` / `high` (#121 P3)
+
+A project sets `rendering.three.qualityTier: 'auto' | 'low' | 'high'` (Project Settings → Three.js).
+Two tiers, not three: three would demand evidence for two boundaries and we had it for zero.
+
+**A TIER CLAMPS; IT NEVER RAISES.** `high` is provably a no-op — a project that deliberately
+authored `pixelRatioCap: 1` or `shadows: false` keeps it, because landing on the high tier is not a
+reason to do MORE work than the author asked for. That property is what made wiring tiers up safe
+for every existing project, and `DEFAULT_TIER_SETTING` is `'high'`, i.e. today's behaviour.
+
+| knob | `low` | `high` | live-changeable? |
+|---|---|---|---|
+| `pixelRatioCap` | 1 | 2 | ✅ via the resize bus |
+| `shadows` | off | on | ✅ `shadowMap.enabled` |
+| `Light.shadowMapSize` ceiling | 512 | none | ✅ re-read each frame by `syncLights` |
+| post-FX stack | **dropped** | on | ✅ stack disposed |
+| `antialias` | off | on | ❌ **constructor-only** |
+
+**`antialias` cannot change live** — it is a `WebGPURenderer` constructor option baked into the
+swapchain, so it applies at the next renderer creation. We deliberately do not rebuild the renderer
+for it: a rebuild costs the ~316 ms hitch measured above, which is a lot to pay during a DEMOTION,
+the one moment the device is already struggling.
+
+**Read the tier through `getEffectiveThreeSettings()` — never `getRenderSettings().three`.**
+`pixelRatioCap` is read twice, by `makeWebGPURenderer` when it allocates the first buffer and by
+Scene3D's `ResizeObserver` on every resize. If one applied the tier and the other read the raw
+setting, the first resize would silently undo it.
+
+**Precedence: player > project > allowlist > calibration.** The player wins outright because they
+can see the screen and we cannot; their choice persists via `PlayerPrefs` (behind the
+`playerTierStore` provider slot, since `rendering/` may not import `storage/`) and **stops
+calibration**, or the engine would override an explicit human decision with an inference.
+
+**`auto` starts LOW and promotes on measured evidence.** The failure is asymmetric: booting high
+and guessing wrong is a lost context and a permanent black screen; booting low and guessing wrong
+costs a beat of uglier rendering. Two rules that are easy to get backwards:
+
+- **Demotion is IMMEDIATE, promotion waits for a scene boundary.** A tier switch recompiles
+  shaders; a mid-play promotion can freeze longer than the low tier it escapes, while a deferred
+  demotion leaves a struggling device struggling until a scene load — which for a one-scene game is
+  never. Demotion is also **sticky**: never promote again after one, or the tier oscillates.
+- **Headroom is judged by `cpuMs` while vsync-bound, by `frameMs` only once frames run long.**
+  While vsync-capped, `frameMs` is pinned at the display interval and reports "barely making 60"
+  and "trivially making 60" identically — judging by it would promote a device with no headroom.
+
+**Seeing it:** the resolved tier, its `source`, and a one-line `reason` appear in `diagnose` and in
+the debug menu's **Device tab**, which also has low/high buttons that apply a tier LIVE so a
+low-end look can be authored without owning the phone. The reason is the point — "low" alone is
+unexplainable, and project-pinned / failed-calibration / player-chosen want different responses.
+
+The device allowlist (`TIER_ALLOWLIST`) ships **empty on purpose**: an unvalidated threshold in code
+is what ossifies. Measured, neither an iPhone 8 nor a Galaxy A23 qualifies for `high`, so both
+correctly calibrate.
+
 ### GPU context loss is recoverable — and bring-up must stay self-contained
 
 A lost GPU context used to be **permanent**: detected, logged, nothing rendered again for the
@@ -529,6 +583,14 @@ it's a raw-WGSL `wgslFn` the WebGL backend's GLSL parser cannot compile.
 
 ⚠️ **`isWebGPU` names the renderer CLASS, not the API in use.** To branch on the actual backend,
 read `renderer.backend.isWebGLBackend` — that is the distinction the wrong claim above rested on.
+To **report** it (a label, a caps payload, a HUD), call **`readRendererBackend(renderer)`**
+(`runtime/core/activeRenderer.ts`), the single place that decides — `deviceCaps.backend` and the
+profiler's `readRenderer` both go through it, so the two labels cannot disagree. Both derived it
+from the class flag independently until #147, and both were therefore unable to report `'WebGL'`
+at all: an iPhone 8 with no adapter reported `backend: 'WebGPU'` next to `webgpu: false` in the
+same payload. `Scene3D.tsx` reads `isWebGLBackend` directly because it is *branching* (planning
+FXAA away), not labelling — that stays correct, and its `isWebGPU` gate is deliberately the CLASS,
+since the post-FX stack needs the node pipeline, which runs on both backends.
 
 ```
 scenePass  ── MRT: { output, [normal], [lineColor] }   + depth (free)

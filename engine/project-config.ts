@@ -507,6 +507,9 @@ export function projectConfigIssues(partial: Partial<ProjectConfig> | null | und
  *  a guard test instead of by an import. */
 export const WEB_SIZE_MODES = ['free', 'fixed', 'max'] as const;
 export const GPU_BACKENDS = ['auto', 'webgpu', 'webgl'] as const;
+/** Quality tiers a project may select (#121 P3). 'auto' delegates to the device allowlist +
+ *  on-device calibration; 'low'/'high' pin it. */
+export const QUALITY_TIERS = ['auto', 'low', 'high'] as const;
 export const WEB_DEPLOY_MODES = ['none', 'gcs', 'custom'] as const;
 /** Ad-network MRAID/CTA conventions for the playable export. */
 export const PLAYABLE_NETWORKS = ['applovin', 'unity', 'ironsource', 'facebook', 'mintegral', 'generic'] as const;

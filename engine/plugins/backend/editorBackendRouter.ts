@@ -856,9 +856,19 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // in `result` (the MCP tool flags that as isError). Editor-only: this router is stripped
   // from shipped game builds.
   if (urlPath === '/api/eval' && method === 'POST') {
-    const b = (body ?? {}) as { code?: string };
+    const b = (body ?? {}) as { code?: string; timeoutMs?: number };
     if (typeof b.code !== 'string' || !b.code) return json({ error: 'code (string) required' }, 400);
-    try { return json({ result: await ctx.requestBrowser('eval', { code: b.code }) }); }
+    // Size the RELAY deadline from the op's own, exactly as /api/wait-for-edit does. Without this
+    // the relay's 3000ms default was strictly SMALLER than the eval's 5000ms budget, so the eval's
+    // timeout message was unreachable and a legitimately-slow eval reported as a dead renderer.
+    // The clamp is restated rather than imported — this file cannot import the renderer bundle —
+    // and must stay in step with `clampEvalTimeout(..., EVAL_ASYNC_TIMEOUT_MS,
+    // EDITOR_EVAL_MAX_TIMEOUT_MS)` in bridgeHelpers.ts (same pattern, same reason, as wait-for-edit).
+    const opTimeout = Number.isFinite(b.timeoutMs) && (b.timeoutMs as number) > 0
+      ? Math.max(50, Math.min(25_000, Math.floor(b.timeoutMs as number)))
+      : 5000;
+    const relayTimeoutMs = opTimeout + 10_000; // headroom over the op's own deadline
+    try { return json({ result: await ctx.requestBrowser('eval', { code: b.code, timeoutMs: opTimeout }, relayTimeoutMs) }); }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
   }
 

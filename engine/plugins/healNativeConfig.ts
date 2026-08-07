@@ -847,6 +847,47 @@ function healIosDeploymentTarget(projectRoot: string, minVersion: string): strin
   return `synced iOS deployment target = ${minVersion} (from build.iosMinVersion)`;
 }
 
+/** Sync the SPM package's iOS floor — the SECOND native deployment floor, and the one nothing
+ *  healed until now.
+ *
+ *  `ios/App/CapApp-SPM/Package.swift` declares `platforms: [.iOS(.vNN)]` independently of the
+ *  pbxproj's `IPHONEOS_DEPLOYMENT_TARGET`. {@link healIosDeploymentTarget} rewrote only the
+ *  latter, so raising `build.iosMinVersion` moved one floor and left the other — exactly the
+ *  per-project drift that config value exists to prevent, reintroduced one file over. Measured
+ *  after the 15.4 → 16.4 raise (2026-08-04): every project's pbxproj read 16.4 while SIX of nine
+ *  `Package.swift` files still said `.v15`. Only the three that happened to get a later
+ *  `cap sync` had moved, which is the tell — the floor was tracking *who ran what*, not config.
+ *
+ *  **Coarser than the pbxproj floor, deliberately.** SPM's `SupportedPlatform` enumerates MAJOR
+ *  versions (`.v16`), so 16.4 floors to `.v16` and the package permits 16.0–16.3 while the app
+ *  requires 16.4. That is harmless (a package minimum below the app's target always builds) and
+ *  it is exactly what Capacitor's own generator emits from the same pbxproj value — so this heal
+ *  AGREES with `cap sync` rather than fighting it, which matters for a file whose header reads
+ *  "DO NOT MODIFY THIS FILE - managed by Capacitor CLI commands". We rewrite it for the same
+ *  reason we rewrite the equally Capacitor-generated pbxproj: regeneration is occasional and
+ *  manual, and the floor must not wait for it.
+ *
+ *  Scoped to the FIRST `platforms:` array rather than replacing `.iOS(.vNN)` file-wide — a
+ *  dependency clause could legitimately carry its own platform requirement, and stamping the app's
+ *  floor onto that would be wrong. This relies on the package's own `platforms:` preceding any
+ *  dependency's (it sits directly under `name:` in every Capacitor-generated layout), not on
+ *  parsing Swift — a deliberate trade, since the alternative is a Swift parser for one integer. */
+function healIosSpmPlatform(projectRoot: string, minVersion: string): string | undefined {
+  if (!/^\d+(\.\d+)?$/.test(minVersion)) return undefined; // junk config → leave the project alone
+  const major = parseInt(minVersion, 10);
+  if (!Number.isInteger(major) || major <= 0) return undefined;
+  const pkg = path.join(projectRoot, 'ios', 'App', 'CapApp-SPM', 'Package.swift');
+  if (!fs.existsSync(pkg)) return undefined;
+  const orig = fs.readFileSync(pkg, 'utf8');
+  const text = orig.replace(
+    /(platforms:\s*\[)([^\]]*)\]/,
+    (_m, head: string, body: string) => head + body.replace(/\.iOS\(\.v\d+(?:_\d+)?\)/g, `.iOS(.v${major})`) + ']',
+  );
+  if (text === orig) return undefined;
+  fs.writeFileSync(pkg, text);
+  return `synced iOS SPM platform = .v${major} (from build.iosMinVersion ${minVersion})`;
+}
+
 /** Sync the Android minSdkVersion from `build.androidMinSdk` — the Android sibling of
  *  {@link healIosDeploymentTarget}.
  *
@@ -992,8 +1033,12 @@ export function healNativeConfig(projectRoot: string): HealResult {
     if (a) notes.push(a);
     const i = healIosDevelopmentTeam(projectRoot, cfg.build.appleTeamId);
     if (i) notes.push(i);
+    // BOTH iOS deployment floors from the one config value — the pbxproj target and the SPM
+    // package's `platforms:`. Healing only the first is what let them drift apart.
     const dt = healIosDeploymentTarget(projectRoot, cfg.build.iosMinVersion);
     if (dt) notes.push(dt);
+    const sp = healIosSpmPlatform(projectRoot, cfg.build.iosMinVersion);
+    if (sp) notes.push(sp);
     const ams = healAndroidMinSdk(projectRoot, cfg.build.androidMinSdk);
     if (ams) notes.push(ams);
     // Orientation + status bar → native Info.plist / AndroidManifest.

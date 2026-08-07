@@ -191,8 +191,9 @@ evaluating, not for producing committed assets.
 
 ## 6. What we would actually use it for in Court
 
-Mapping to `docs/plans/court-art-direction.md`, which is the authority on *what* to make; this
-section only says *which tool*:
+Mapping to `docs/plans/court-art-direction.md`, which holds the brief and the prompts for *what* to
+make; this section only says *which tool*. ⚠️ That doc is REFERENCE, not a queue — the art pass is
+run iteratively (#58), so take the next item from the owner, not from its order of work:
 
 | Brief item | Route |
 |---|---|
@@ -220,9 +221,10 @@ section only says *which tool*:
 
 ## 8. Related
 
-- [plans/court-art-direction.md](./plans/court-art-direction.md) — **the authority** on what Court's
+- [plans/court-art-direction.md](./plans/court-art-direction.md) — the **reference** for what Court's
   art should be: the three registers, the validated palette, the camera/light convention, the
   technical constraints, and every per-asset prompt. This doc is only the tool reference beside it.
+  ⚠️ Not an execution plan and not up to date on what has landed — see its own header.
 - [textures.md](./textures.md) — how a generated PNG becomes a shipped texture: `.meta.json`,
   KTX2/WebP, the multiple-of-4 rule, and the `ui`-vs-`3d` type trap that silently draws a circle.
 - [model-pipeline.md](./model-pipeline.md) — GLB import + LOD, if a generated mesh ever ships as a

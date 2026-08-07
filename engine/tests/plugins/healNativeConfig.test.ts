@@ -1038,6 +1038,79 @@ describe('healNativeConfig — orientation + status bar', () => {
       healNativeConfig(root);
       expect(fs.readFileSync(pbxPath(), 'utf8')).toBe(PBX);
     });
+
+    /** The SECOND iOS floor. `ios/App/CapApp-SPM/Package.swift` declares `platforms: [.iOS(.vNN)]`
+     *  independently of the pbxproj, and only the pbxproj was healed — so raising
+     *  `build.iosMinVersion` moved one and left the other. Measured after the 15.4 → 16.4 raise:
+     *  every pbxproj read 16.4 while SIX of nine Package.swift files still said `.v15`, tracking
+     *  who had last run `cap sync` rather than the config. */
+    describe('SPM package platform (the second floor)', () => {
+      const PKG = [
+        '// swift-tools-version: 5.9',
+        'import PackageDescription',
+        '// DO NOT MODIFY THIS FILE - managed by Capacitor CLI commands',
+        'let package = Package(',
+        '    name: "CapApp-SPM",',
+        '    platforms: [.iOS(.v15)],',
+        '    products: [',
+        '        .library(name: "CapApp-SPM", targets: ["CapApp-SPM"]),',
+        '    ],',
+        ')',
+        '',
+      ].join('\n');
+      function pkgPath() { return path.join(root, 'ios', 'App', 'CapApp-SPM', 'Package.swift'); }
+      function writePkg(text = PKG) {
+        fs.mkdirSync(path.dirname(pkgPath()), { recursive: true });
+        fs.writeFileSync(pkgPath(), text);
+      }
+
+      it('floors the SPM platform to the MAJOR of build.iosMinVersion', () => {
+        // SPM's SupportedPlatform enumerates majors, so 16.4 → .v16. Coarser than the pbxproj
+        // floor by design, and exactly what Capacitor's own generator emits from the same value.
+        writePkg();
+        writeBuildCfg({ appleTeamId: '', iosMinVersion: '16.4' });
+        healNativeConfig(root);
+        expect(fs.readFileSync(pkgPath(), 'utf8')).toContain('platforms: [.iOS(.v16)]');
+      });
+
+      it('is idempotent', () => {
+        writePkg();
+        writeBuildCfg({ appleTeamId: '', iosMinVersion: '16.4' });
+        healNativeConfig(root);
+        const once = fs.readFileSync(pkgPath(), 'utf8');
+        healNativeConfig(root);
+        expect(fs.readFileSync(pkgPath(), 'utf8')).toBe(once);
+      });
+
+      it('leaves the project ALONE on a junk version', () => {
+        writePkg();
+        writeBuildCfg({ appleTeamId: '', iosMinVersion: 'banana' });
+        healNativeConfig(root);
+        expect(fs.readFileSync(pkgPath(), 'utf8')).toBe(PKG);
+      });
+
+      it('is a no-op when the project has no iOS target', () => {
+        writeBuildCfg({ appleTeamId: '', iosMinVersion: '16.4' });
+        expect(() => healNativeConfig(root)).not.toThrow();
+        expect(fs.existsSync(pkgPath())).toBe(false);
+      });
+
+      // Scoped to the FIRST `platforms:` array — which is the package's own in every Capacitor
+      // layout (it sits directly under `name:`). A dependency clause may carry its own platform
+      // requirement, and stamping the app's floor onto that would be wrong. Precisely: this
+      // relies on the package's `platforms:` preceding any dependency's, not on parsing Swift.
+      it('does not touch a later .iOS(...) belonging to a dependency', () => {
+        writePkg(PKG.replace(
+          '    products: [',
+          '    dependencies: [ .package(name: "Other", platforms: [.iOS(.v13)]) ],\n    products: [',
+        ));
+        writeBuildCfg({ appleTeamId: '', iosMinVersion: '16.4' });
+        healNativeConfig(root);
+        const out = fs.readFileSync(pkgPath(), 'utf8');
+        expect(out).toContain('platforms: [.iOS(.v16)],');   // the app's own floor, healed
+        expect(out).toContain('.package(name: "Other", platforms: [.iOS(.v13)])'); // the dep's, untouched
+      });
+    });
   });
 
   // The Android sibling of 'iOS deployment target' above — cap add scaffolds minSdkVersion 24

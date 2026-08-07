@@ -551,10 +551,19 @@ export function registerTools(server: McpServer) {
       'plus a generated `modoki.<camelCase>(params)` method per op (see device_eval_api for the ' +
       'full list). Narrower than the editor\'s: no `modoki.api()`/`modoki.composite()` (device has ' +
       'no editor backend to fetch and no undo stack). ' + DEVICE_EVAL_UNREACHABLE_SUMMARY,
-    { code: z.string().describe('JavaScript code. Use `return` for a value.') },
-    async ({ code }) => {
+    {
+      code: z.string().describe('JavaScript code. Use `return` for a value.'),
+      timeoutMs: z.number().int().positive().optional().describe(
+        'How long the body may run before it is abandoned. Default 4000, max 4500 (clamped, not ' +
+        'refused). The ceiling is LOWER than the editor twin\'s 25000 and is not a policy choice: ' +
+        'the device TCP transport has a fixed 5s per-REQUEST deadline whose clock starts host-side, ' +
+        'so a larger budget could never be the deadline that fires — you would get a generic ' +
+        'transport error instead of what the code was doing.',
+      ),
+    },
+    async ({ code, timeoutMs }) => {
       try {
-        const result = await deviceRequest('eval', { code });
+        const result = await deviceRequest('eval', timeoutMs == null ? { code } : { code, timeoutMs });
         // A device-side eval failure comes back as an `Error: …` string, not a thrown error — flag
         // it so the caller sees a tool error, not a success with error text (F15).
         if (isDeviceError(result)) {

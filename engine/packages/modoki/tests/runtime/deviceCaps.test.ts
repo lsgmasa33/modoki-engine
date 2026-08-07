@@ -55,7 +55,11 @@ async function load(opts: { webgpu?: boolean; renderer?: unknown } = {}) {
     getWebGPUSupported: () => Promise.resolve(opts.webgpu ?? false),
     getWebGPUSupportedSync: () => opts.webgpu ?? false,
   }));
-  vi.doMock('../../src/runtime/core/activeRenderer', () => ({
+  // Stub only the handle — `readRendererBackend` (the #147 single source of truth for
+  // "which API is this drawing through") must stay REAL, or these tests would assert a
+  // reimplementation of exactly the logic they exist to pin.
+  vi.doMock('../../src/runtime/core/activeRenderer', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../../src/runtime/core/activeRenderer')>()),
     getActiveRenderer: () => opts.renderer ?? null,
   }));
   return await import('../../src/runtime/rendering/deviceCaps');
@@ -204,7 +208,9 @@ describe('deviceCaps — backend vs capability', () => {
     // A project can force the WebGL backend on a WebGPU-capable device, so these two fields
     // genuinely disagree — conflating them would misreport the machine.
     stubCanvas(makeGl());
-    const { getDeviceCaps } = await load({ webgpu: true, renderer: { isWebGPURenderer: false } });
+    const { getDeviceCaps } = await load({
+      webgpu: true, renderer: { isWebGPURenderer: true, backend: { isWebGLBackend: true } },
+    });
     const caps = await getDeviceCaps();
     expect(caps.webgpu).toBe(true);
     expect(caps.backend).toBe('WebGL');
@@ -212,8 +218,42 @@ describe('deviceCaps — backend vs capability', () => {
 
   it('reports a live WebGPU renderer as WebGPU', async () => {
     stubCanvas(makeGl());
-    const { getDeviceCaps } = await load({ webgpu: true, renderer: { isWebGPURenderer: true } });
+    const { getDeviceCaps } = await load({
+      webgpu: true, renderer: { isWebGPURenderer: true, backend: { isWebGLBackend: false } },
+    });
     expect((await getDeviceCaps()).backend).toBe('WebGPU');
+  });
+
+  /** #147: the label names the API in use, NOT the renderer class. `makeWebGPURenderer` always
+   *  constructs a `WebGPURenderer` and three runs WebGL2 inside it, so `isWebGPURenderer` is true
+   *  on every device we ship to — reading it made `'WebGL'` unreachable and reported `'WebGPU'`
+   *  on an iPhone 8 whose `navigator.gpu` is literally absent.
+   *
+   *  These mocks carry `isWebGPURenderer: true` DELIBERATELY. The old tests set it `false` to mean
+   *  "on WebGL", a shape no real renderer ever has — which is why they passed throughout the bug. */
+  it('reports WebGL on the shipping shape: a WebGPURenderer running the WebGL2 backend', async () => {
+    stubCanvas(makeGl());
+    const { getDeviceCaps } = await load({
+      webgpu: false, renderer: { isWebGPURenderer: true, backend: { isWebGLBackend: true } },
+    });
+    const caps = await getDeviceCaps();
+    expect(caps.webgpu).toBe(false);
+    // The exact iPhone 8 payload from the issue: these two must not contradict each other.
+    expect(caps.backend).toBe('WebGL');
+  });
+
+  it('treats a backend that omits isWebGLBackend as WebGPU', async () => {
+    // three's WebGPUBackend simply has no such flag — absent means "not the WebGL one".
+    stubCanvas(makeGl());
+    const { getDeviceCaps } = await load({ renderer: { isWebGPURenderer: true, backend: {} } });
+    expect((await getDeviceCaps()).backend).toBe('WebGPU');
+  });
+
+  it('falls back to the class flag for a renderer-like with no backend at all', async () => {
+    // A test double, or a classic WebGLRenderer someone registers — nothing better to read.
+    stubCanvas(makeGl());
+    const { getDeviceCaps } = await load({ renderer: { isWebGPURenderer: false } });
+    expect((await getDeviceCaps()).backend).toBe('WebGL');
   });
 
   it('survives the WebGPU probe rejecting', async () => {
@@ -222,7 +262,10 @@ describe('deviceCaps — backend vs capability', () => {
       getWebGPUSupported: () => Promise.reject(new Error('adapter exploded')),
       getWebGPUSupportedSync: () => null,
     }));
-    vi.doMock('../../src/runtime/core/activeRenderer', () => ({ getActiveRenderer: () => null }));
+    vi.doMock('../../src/runtime/core/activeRenderer', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('../../src/runtime/core/activeRenderer')>()),
+      getActiveRenderer: () => null,
+    }));
     stubCanvas(makeGl());
     const { getDeviceCaps } = await import('../../src/runtime/rendering/deviceCaps');
     expect((await getDeviceCaps()).webgpu).toBe(false);

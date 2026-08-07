@@ -17,7 +17,7 @@ import { readRenderer } from '../../packages/modoki/src/runtime/debug/perfSource
 describe('readRenderer draw-call selection', () => {
   it('prefers per-frame drawCalls over the cumulative calls (WebGPU)', () => {
     state.renderer = {
-      isWebGPURenderer: true,
+      isWebGPURenderer: true, backend: {},
       info: { render: { calls: 999999, drawCalls: 150, triangles: 1200 }, memory: { geometries: 44, textures: 19 } },
     };
     const r = readRenderer()!;
@@ -27,7 +27,12 @@ describe('readRenderer draw-call selection', () => {
   });
 
   it('falls back to calls when drawCalls is absent (WebGL, per-frame)', () => {
-    state.renderer = { isWebGPURenderer: false, info: { render: { calls: 120, triangles: 3000 }, memory: {} } };
+    // NOTE `isWebGPURenderer: true` alongside a WebGL backend — that IS the shipping shape (#147):
+    // three runs its WebGL2 backend inside the same WebGPURenderer object.
+    state.renderer = {
+      isWebGPURenderer: true, backend: { isWebGLBackend: true },
+      info: { render: { calls: 120, triangles: 3000 }, memory: {} },
+    };
     const r = readRenderer()!;
     expect(r.backend).toBe('WebGL');
     expect(r.calls).toBe(120);
@@ -36,5 +41,21 @@ describe('readRenderer draw-call selection', () => {
   it('returns null when no renderer is active', () => {
     state.renderer = null;
     expect(readRenderer()).toBeNull();
+  });
+
+  /** #147: the HUD reported the renderer CLASS, so it could never say WebGL — the same defect as
+   *  `deviceCaps.backend`, in a second place. Both now go through `readRendererBackend`. */
+  it('reports the API in use, not the renderer class', () => {
+    state.renderer = {
+      isWebGPURenderer: true, backend: { isWebGLBackend: true },
+      info: { render: { drawCalls: 10 }, memory: {} },
+    };
+    expect(readRenderer()!.backend).toBe('WebGL');
+
+    state.renderer = {
+      isWebGPURenderer: true, backend: {},   // three's WebGPUBackend has no isWebGLBackend flag
+      info: { render: { drawCalls: 10 }, memory: {} },
+    };
+    expect(readRenderer()!.backend).toBe('WebGPU');
   });
 });

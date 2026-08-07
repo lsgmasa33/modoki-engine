@@ -15,7 +15,7 @@ import type { GameConfig, EditorPanelDef } from '@modoki/engine/runtime';
 import projectConfig from 'virtual:modoki-project-config';
 import {
   CAPACITOR_ORIENTATIONS, STATUS_BAR_STYLES, KEYBOARD_RESIZE_MODES, WEB_DEPLOY_MODES, WEB_SIZE_MODES,
-  PLAYABLE_NETWORKS, IOS_CONTENT_MODES, ANDROID_SCHEMES, GPU_BACKENDS, TONE_MAPPINGS,
+  PLAYABLE_NETWORKS, IOS_CONTENT_MODES, ANDROID_SCHEMES, GPU_BACKENDS, QUALITY_TIERS, TONE_MAPPINGS,
 } from '../../project-config';
 import { loadProjectGames } from '../projectGames';
 import { registerAll } from '../ecs/register';
@@ -463,6 +463,7 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
               title: 'Three.js (3D)',
               fields: [
                 { key: 'rendering.three.backend', label: 'GPU backend', type: 'select', options: GPU_BACKENDS.map((v) => ({ value: v, label: v })), help: 'auto = detect, prefer WebGPU' },
+                { key: 'rendering.three.qualityTier', label: 'Quality tier', type: 'select', options: QUALITY_TIERS.map((v) => ({ value: v, label: v })), help: 'auto = measure the device and pick; low clamps the four fields below. Takes effect on the next renderer bring-up — use the debug menu Device tab to preview it live' },
                 { key: 'rendering.three.antialias', label: 'Antialias', type: 'checkbox' },
                 { key: 'rendering.three.shadows', label: 'Shadows', type: 'checkbox' },
                 { key: 'rendering.three.pixelRatioCap', label: 'Pixel-ratio cap', type: 'number', placeholder: '2 (0 = uncapped)' },

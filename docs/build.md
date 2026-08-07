@@ -443,6 +443,40 @@ the SAME command run for an iOS/Android pre-`cap sync` build must say `--target 
 (base `"/"`, since Capacitor serves the dist from the app root). There is no default in either
 direction: defaulting would be silently wrong for one of the two callers.
 
+#### `--target native` re-vendors the engine Capacitor plugins first (#148)
+
+Games don't build `engine/packages/capacitor-*` from source — they depend on a content-addressed
+tarball committed into the project (`"capacitor-game-debug": "file:plugins/…-<hash>.tgz"`). So a
+plugin edit only reaches a device once that tarball is re-packed and installed. `build-web.mjs`
+now does that on `--target native`, and runs `npm install` in the project when the content actually
+changed; on `web`/`playable` it does nothing (a vendored plugin is a native artifact).
+
+It did NOT until #148 — only the editor's `/api/build` re-vendored — so following the recipes below
+after a plugin edit produced an IPA/APK containing the PREVIOUS native code while every signal
+reported success.
+
+⚠️ **The CLI recipes are still NOT fully equivalent to Build → iOS/Android Device.** Before its
+shell steps the editor path runs THREE in-process heals; the CLI runs one:
+
+| In-process heal | Editor `/api/build` | CLI `--target native` |
+|---|---|---|
+| `vendorEnginePlugins` — re-pack + install a changed engine plugin | ✅ | ✅ *(since #148)* |
+| `healNativeConfig` — sync `build.appleTeamId` → iOS `DEVELOPMENT_TEAM`, Android `local.properties` | ✅ | ❌ |
+| `ensureCapacitorDeps` — add engine-REQUIRED Capacitor plugins the project predates | ✅ | ❌ |
+
+The second fails LOUDLY (`xcodebuild`: *"Signing … requires a development team"*). The third fails
+in the same silent way #148 did: the web build inlines the plugin's JS proxy from the editor's
+`node_modules` so the build SUCCEEDS, but `cap sync` never registers a native impl and the app dies
+at LAUNCH with `"<Plugin>" plugin is not implemented on <platform>`. Until that closes, open the
+project in the editor once (which heals both on open) before relying on a CLI native build.
+
+Two notes worth carrying:
+- **`npm` ships `README.md` regardless of the `files` field**, so editing a plugin's DOCS re-hashes
+  its tarball. Expect a re-vendor after a docs-only plugin edit.
+- To re-vendor **without** building: `node engine/scripts/vendor-plugins.mjs games/<id>`, then
+  `npm install` in the project. `engine/tests/architecture/vendoredPluginFreshness.test.ts` fails
+  `npm test` on a project whose pin has gone stale.
+
 ### iOS Simulator
 ```bash
 MODOKI_PROJECT=games/<id> npm run build -- --target native
@@ -554,15 +588,35 @@ coincidence, not a regression. The bug above was never the number — it was the
 **implicit**: inherited from a default that moves between bundler majors, and disagreeing with the
 native deployment target. A deliberate, pinned 16.4 driving both consumers is the opposite of that.
 
-The two consumers:
+The **three** consumers:
 
 - **`vite.config.ts`** → `build.target` gets `ios<v>` / `safari<v>`
 - **`healNativeConfig`** → `healIosDeploymentTarget` rewrites `IPHONEOS_DEPLOYMENT_TARGET` in the
   pbxproj (every build configuration — patching only the first leaves Release on the old floor)
+- **`healNativeConfig`** → `healIosSpmPlatform` rewrites `platforms: [.iOS(.vNN)]` in
+  `ios/App/CapApp-SPM/Package.swift` — the SPM package's own floor, **floored to the MAJOR**
+  (16.4 → `.v16`), because SPM's `SupportedPlatform` enumerates majors. Coarser than the pbxproj
+  target on purpose: a package minimum below the app's target always builds, and this is exactly
+  what Capacitor's generator emits from the same value, so the heal agrees with `cap sync` rather
+  than fighting it.
 
 They were previously independent literals that DID disagree — pbxproj `15.0` vs a bundle needing
 `15.4` — so the App Store would offer the game to a device that installs it and then dies on a
 missing API.
+
+⚠️ **The SPM floor was the third consumer, and it was unhealed until 2026-08-07** — so the "single
+source of truth" reached two of three places. Raising the default from 15.4 to 16.4 moved the
+pbxproj and the bundle and left `Package.swift` behind: **six of nine projects still declared
+`.v15`** while every pbxproj read `16.4`. The three that had moved were simply the three someone
+had run `cap sync` on since, which is the tell — the floor was tracking *who ran what*, not the
+config. Not a build break (SPM tolerates a package minimum under the app target), but precisely
+the per-project drift this config value exists to prevent. Both the heal and a
+**committed-state** guard now exist; the mechanism-only guard could not see it, since the heal
+runs on project open / native build and a project nobody opens stays stale on disk.
+
+Note both files carry `// DO NOT MODIFY THIS FILE - managed by Capacitor CLI commands`. We rewrite
+them anyway, for the same reason in both cases: regeneration is occasional and manual, and the
+floor must not wait for someone to remember.
 
 **15.4 remains the hard LOWER bound, not a round number.** esbuild lowers *syntax* but cannot
 polyfill *runtime APIs*; scanning a built bundle for APIs it can't reach finds exactly

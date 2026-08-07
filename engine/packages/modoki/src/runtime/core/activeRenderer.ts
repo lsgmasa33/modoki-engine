@@ -31,6 +31,27 @@ export function getActiveRenderer(): WebGPURenderer | THREE.WebGLRenderer | null
   return activeRenderer;
 }
 
+/** Which GRAPHICS API a renderer is actually drawing through — the single source of truth for
+ *  that question (#147). `deviceCaps` and the perf HUD both report it, and both used to derive it
+ *  independently from the same wrong signal.
+ *
+ *  ⚠️ **`isWebGPURenderer` is the renderer CLASS, not the API.** `makeWebGPURenderer` always
+ *  constructs a `WebGPURenderer`, and three runs its WebGL2 backend *inside that same class* when
+ *  there is no adapter or the project set `rendering.three.backend: 'webgl'`. So that flag is
+ *  `true` on every device we ship to, and reading it made `'WebGL'` unreachable: an iPhone 8
+ *  reported `'WebGPU'` next to `webgpu: false` in the same payload while genuinely running WebGL2.
+ *  `backend.isWebGLBackend` is the real signal — `Scene3D.tsx` already plans FXAA off it.
+ *
+ *  three assigns `.backend` in the renderer CONSTRUCTOR (it picks the class from `forceWebGL` /
+ *  adapter availability), so this is safe to read before `init()`. The class fall-through covers
+ *  only a renderer-like with no `.backend` at all: a test double, or a classic `WebGLRenderer`. */
+export function readRendererBackend(renderer: unknown): 'WebGPU' | 'WebGL' | null {
+  const r = renderer as { isWebGPURenderer?: boolean; backend?: { isWebGLBackend?: boolean } } | null;
+  if (!r) return null;
+  if (r.backend) return r.backend.isWebGLBackend === true ? 'WebGL' : 'WebGPU';
+  return r.isWebGPURenderer ? 'WebGPU' : 'WebGL';
+}
+
 /** True once the renderer has been activated at least once. Callers that need to run a
  *  detection side effect exactly once on first activation gate on this. */
 export function isRendererReadyFired(): boolean {

@@ -13,7 +13,7 @@ import {
   TIER_ALLOWLIST, TIER_SETTINGS, DEFAULT_TIER_SETTING,
   PROMOTION_HOLD_MS, DEMOTION_HOLD_MS, MIN_SAMPLES_TO_JUDGE,
   type QualityTier,
-  applyTierToThree,
+  applyTierToThree, tierAllowsPostFX,
 } from '../../src/runtime/rendering/qualityTier';
 import { BUDGET_30FPS_MS, type FrameProfile } from '../../src/runtime/core/frameProfiler';
 
@@ -231,6 +231,13 @@ describe('tier settings', () => {
 
   it('every tier has settings', () => {
     for (const t of ['low', 'high'] as QualityTier[]) expect(TIER_SETTINGS[t]).toBeDefined();
+  });
+
+  it('low drops the post-FX stack; high allows it (#121 P3c)', () => {
+    // Post-FX is screen-space, so its cost is paid per pixel however simple the scene is — the
+    // dominant remaining cost on a weak device (iPhone 8: 27ms baseline -> 56ms with NPR alone).
+    expect(tierAllowsPostFX('low')).toBe(false);
+    expect(tierAllowsPostFX('high')).toBe(true);
   });
 
   // ── applyTierToThree (#121 P3a) ─────────────────────────────────────────────────────────

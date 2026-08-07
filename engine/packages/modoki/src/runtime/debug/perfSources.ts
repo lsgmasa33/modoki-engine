@@ -3,6 +3,7 @@
 
 import { getCurrentFPS } from '../rendering/frameDriver';
 import { getActiveRenderer } from '../loaders/textureResolver';
+import { readRendererBackend } from '../core/activeRenderer';
 import { getAllEntities } from '../core/ecs/entityUtils';
 import { getFrameProfile } from '../core/frameProfiler';
 import { isProfilerEnabled, getMarkerFaults, type MarkerFaults } from '../core/profilerMarkers';
@@ -48,7 +49,13 @@ export function readRenderer(): RendererStats | null {
   const render = r.info?.render ?? {};
   const memory = r.info?.memory ?? {};
   return {
-    backend: r.isWebGPURenderer ? 'WebGPU' : 'WebGL',
+    // The API in use, not the renderer CLASS (#147) — `isWebGPURenderer` is true even when three
+    // is running its WebGL2 backend inside the same object, which is the case on every device
+    // without an adapter. Shared with `deviceCaps.backend` so the two can't disagree.
+    // `readRendererBackend` returns null ONLY for a null renderer, and `r` is non-null by here
+    // (early-returned above) — so 'unknown' is unreachable rather than a default. Saying that
+    // out loud beats `?? 'WebGL'`, which would silently answer WebGL if the invariant ever moved.
+    backend: readRendererBackend(r) ?? 'unknown',
     // PER-FRAME draw calls. WebGPU's Info keeps `render.calls` as a LIFETIME
     // cumulative counter (climbs forever — looks like a leak) and exposes the
     // per-frame count as `render.drawCalls`; WebGL only has `render.calls` (which it

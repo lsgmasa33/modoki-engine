@@ -21,7 +21,7 @@ import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloa
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
 import { getGameBootFaults } from './gameBootFaults';
-import { handleEval } from '../debug/bridgeHelpers';
+import { handleEval, clampEvalTimeout, EVAL_ASYNC_TIMEOUT_MS, EDITOR_EVAL_MAX_TIMEOUT_MS } from '../debug/bridgeHelpers';
 import { makeEvalApi } from './evalApi';
 import {
   useEditorStore, type SelectedAsset,
@@ -684,11 +684,25 @@ export function registerEditorAgentOps(): void {
   // window.innerWidth, devicePixelRatio, dispatching a bridge event) without a raw CDP client.
   // Editor-only: this whole module is stripped from shipped game builds.
   // Registered UNWRAPPED (_registerAgentOp) on purpose. The shadow above holds ambient
-  // actor='agent' for a handler's whole lifetime, and an eval body runs for an UNBOUNDED
-  // time — it can loop, await, or call modoki.waitForEdit() and park for two minutes. Holding
-  // the ambient actor across that would tag every concurrent HUMAN edit as 'agent'. Attribution
-  // is instead applied PER CALL inside makeEvalApi(), which is both accurate and bounded.
-  _registerAgentOp('eval', (params) => handleEval(((params ?? {}) as { code?: string }).code ?? '', makeEvalApi()));
+  // actor='agent' for a handler's whole lifetime, and an eval body runs LONG — it can loop, await,
+  // or call modoki.waitForEdit() and park. Holding the ambient actor across that would tag every
+  // concurrent HUMAN edit as 'agent'. Attribution is instead applied PER CALL inside makeEvalApi(),
+  // which is both accurate and bounded.
+  //
+  // `timeoutMs` bounds the WHOLE body (since #145 made `await` parse, the body is what runs), not
+  // just a returned promise. The route sizes the relay deadline from the same number — see
+  // `/api/eval` in editorBackendRouter.ts; the two must stay ordered or the relay wins the race
+  // and reports a dead backend instead of this op's own message.
+  //
+  // ⚠️ "UNBOUNDED … park for two minutes", as this comment used to read, was never true and is
+  // still not. An eval body has ALWAYS been raced against a deadline; what changed is that the
+  // deadline is now reachable and adjustable. The ceiling is EDITOR_EVAL_MAX_TIMEOUT_MS (25s), so a
+  // `modoki.waitForEdit({timeoutMs: 120_000})` nested in an eval CANNOT run its full park — budget
+  // the inner op under the outer one, or call waitForEdit as its own tool.
+  _registerAgentOp('eval', (params) => {
+    const p = (params ?? {}) as { code?: string; timeoutMs?: unknown };
+    return handleEval(p.code ?? '', makeEvalApi(), clampEvalTimeout(p.timeoutMs, EVAL_ASYNC_TIMEOUT_MS, EDITOR_EVAL_MAX_TIMEOUT_MS));
+  });
 
   // Discovery for `eval`: lists the generated `modoki` scripting surface (op list + camelCase
   // method names + the fixed call/ops/api/composite helpers) so an agent never has to read

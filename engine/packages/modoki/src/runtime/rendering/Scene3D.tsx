@@ -21,8 +21,10 @@ import { createRenderer, createRenderState, disposeRenderState, syncCamera, appl
 import { registerRenderSurface } from './materialBroker';
 import { onRendererLost } from '../core/activeRenderer';
 import { createRendererRecovery } from './rendererRecovery';
+import { tickTierCalibration, applyPendingTierPromotion } from './tierCalibration';
 import { beginProfilerSample, endProfilerSample } from '../core/profilerMarkers';
-import { getRenderSettings, getEffectiveThreeSettings } from './renderSettings';
+import { getRenderSettings, getEffectiveThreeSettings, getActiveTierOrDefault } from './renderSettings';
+import { tierAllowsPostFX } from './qualityTier';
 import { onForceResize } from './resizeBus';
 import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
 import { createParticleSyncState, syncParticles, disposeParticleSyncState } from './particleSync';
@@ -292,6 +294,12 @@ export default function Scene3D() {
 
       function renderFrame() {
         if (capturing) return;
+        // Judge the frame profile and promote/demote the quality tier (#121 P3b). Self-throttling
+        // (CALIBRATION_INTERVAL_MS) and a no-op unless the project asked for 'auto', so this costs
+        // a comparison on the overwhelming majority of frames. Placed BEFORE the idle-gate return
+        // deliberately — a paused/stopped surface stops rendering but the profile it already
+        // gathered is still the evidence a demotion acts on.
+        tickTierCalibration();
         // Idle gate: while paused/stopped only dirty events + the grace window
         // need a redraw; while playing — or while the Animation editor is previewing
         // skeletal animation (mixer advancing) — render unconditionally.
@@ -461,7 +469,23 @@ export default function Scene3D() {
         // scenes / MCP writes only.)
         const liveSs = nprSnap ? Math.max(1, nprSnap.superSampleScale) : 1;
         const liveReq = buildReq(liveSs);
-        if (planStages(liveReq).length > 0 && isWebGPU) {
+        // The `low` tier drops the post-process stack outright (#121 P3c). It is the dominant
+        // remaining cost on a weak device and it is SCREEN-SPACE, so it is paid per pixel however
+        // simple the scene is — on an iPhone 8 a 27ms baseline became 56ms with NPR alone.
+        //
+        // Tearing down an EXISTING stack matters as much as not building one: a live demotion
+        // happens on a device that is already struggling, and a retained stack would keep its
+        // render targets (several full-resolution buffers) resident for nothing. This is the one
+        // place a tier change frees memory rather than just doing less work.
+        const postfxAllowed = tierAllowsPostFX(getActiveTierOrDefault());
+        if (!postfxAllowed && postfxStack) {
+          postfxStack.dispose();
+          postfxStack = null;
+          postfxCamera = null;
+          ssRebuild = null;
+          lastStackSig = null;
+        }
+        if (postfxAllowed && planStages(liveReq).length > 0 && isWebGPU) {
           // Rebuild on camera-object swap (perspective <-> ortho): the stack
           // baked the old camera object, incl. its depth-reconstruction path.
           const cameraChanged = postfxStack != null && postfxCamera !== activeCamera;
@@ -712,6 +736,11 @@ export default function Scene3D() {
       // new scene doesn't compile shaders on the main thread. SceneManager awaits
       // this hook between staging-world population and setCurrentWorld.
       const prewarmHook = async (stagingWorld: import('koota').World) => {
+        // A queued tier PROMOTION lands here, before the prewarm (#121 P3b): this is the scene
+        // boundary the deferral was waiting for, and applying the tier first means the prewarm
+        // that follows compiles the shaders the NEW tier actually needs, inside a stall the
+        // player has already accepted.
+        applyPendingTierPromotion();
         try {
           await prewarmShadersForWorld(stagingWorld, renderer, camera);
         } catch (e) {

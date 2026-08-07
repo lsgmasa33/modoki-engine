@@ -54,12 +54,49 @@ export interface TierRenderOverrides {
   /** Ceiling on `Light.shadowMapSize`. The trait has no global cap today, so a tier saying
    *  "shadows at 1024" could not otherwise enforce it. 0 = no ceiling. */
   shadowMapCeiling: number;
+  /** May the post-process stack run at all?
+   *
+   *  `low` says NO — the whole stack, not a selection. Post-FX is the dominant remaining cost on
+   *  a weak device and it is screen-space, so its price is paid per pixel regardless of how
+   *  simple the scene is. Measured on an iPhone 8 at one frozen shot: a 27 ms baseline goes to
+   *  56 ms with NPR alone.
+   *
+   *  Dropping ALL of it is deliberately blunter than the measurements strictly require — bloom
+   *  costs only ~4 ms there and vignette ~6 ms, so a project could afford those and still clear
+   *  30 fps. A per-effect tier policy is a real future refinement (the interesting knob is NPR
+   *  specifically, at ~7x bloom); this is the simple, guaranteed win, and a project that wants
+   *  its effects on a weak device can still pin `qualityTier: 'high'`. */
+  postFX: boolean;
+  /** Most DIRECTIONAL lights an object may be lit by. 0 = unlimited.
+   *
+   *  Directional is where our actual light cost lives: a census of every project found 3d-test
+   *  running SEVEN directional lights and zero point/spot, and forward shading pays the full BRDF
+   *  per light per fragment — a directional only skips distance attenuation. Capping point/spot
+   *  alone (the usual mobile rule) would have been a no-op on every project we have. */
+  maxDirectional: number;
+  /** Most POINT+SPOT ("local") lights an object may be lit by. 0 = unlimited. */
+  maxLocal: number;
 }
 
+/** Ambient is deliberately NOT capped: three sums every `AmbientLight` into one constant term, so
+ *  N of them cost the same as one and none of them run a BRDF. Capping them would buy nothing and
+ *  visibly flatten the scene. */
 export const TIER_SETTINGS: Record<QualityTier, TierRenderOverrides> = {
-  low: { pixelRatioCap: 1, antialias: false, shadows: false, shadowMapCeiling: 512 },
-  high: { pixelRatioCap: 2, antialias: true, shadows: true, shadowMapCeiling: 0 },
+  low: {
+    pixelRatioCap: 1, antialias: false, shadows: false, shadowMapCeiling: 512, postFX: false,
+    maxDirectional: 1, maxLocal: 1,
+  },
+  high: {
+    pixelRatioCap: 2, antialias: true, shadows: true, shadowMapCeiling: 0, postFX: true,
+    maxDirectional: 0, maxLocal: 0,
+  },
 };
+
+/** May the post-process stack run on this tier? A named accessor rather than a raw
+ *  `TIER_SETTINGS[t].postFX` at the call site, so the render loop reads as intent. */
+export function tierAllowsPostFX(tier: QualityTier): boolean {
+  return TIER_SETTINGS[tier].postFX;
+}
 
 /** The subset of `ThreeRenderSettings` a tier touches. Declared STRUCTURALLY rather than
  *  imported so this module keeps its one-way dependency (`renderSettings` imports here, never the

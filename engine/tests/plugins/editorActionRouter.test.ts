@@ -169,11 +169,35 @@ describe('/api/eval', () => {
     expect(((await post('/api/eval', { code: '' }, makeCtx())) as { status?: number }).status).toBe(400);
   });
 
-  it('relays code to the renderer `eval` op and returns the result', async () => {
+  /** This used to assert `requestBrowser('eval', { code })` — a TWO-argument call, i.e. the relay
+   *  left on its 3000ms default. That expectation was defending the bug: the eval's own budget was
+   *  5000ms, so the relay always gave up FIRST and reported a dead renderer where the eval would
+   *  have said what the code was doing. The relay deadline must now be sized from the op's. */
+  it('relays code + the op budget, and gives the relay headroom over it', async () => {
     const requestBrowser = vi.fn(async () => '42');
     const r = (await post('/api/eval', { code: 'return 40 + 2' }, makeCtx({ requestBrowser }))) as { body: unknown };
-    expect(requestBrowser).toHaveBeenCalledWith('eval', { code: 'return 40 + 2' });
+    expect(requestBrowser).toHaveBeenCalledWith('eval', { code: 'return 40 + 2', timeoutMs: 5000 }, 15_000);
     expect(r.body).toEqual({ result: '42' });
+  });
+
+  it('honours an explicit timeoutMs and keeps the relay strictly larger', async () => {
+    const requestBrowser = vi.fn(async () => 'ok');
+    await post('/api/eval', { code: 'return 1', timeoutMs: 20_000 }, makeCtx({ requestBrowser }));
+    const [, params, relay] = requestBrowser.mock.calls[0] as unknown as [string, { timeoutMs: number }, number];
+    expect(params.timeoutMs).toBe(20_000);
+    expect(relay).toBeGreaterThan(params.timeoutMs);
+  });
+
+  it('clamps an over-cap timeoutMs rather than refusing it', async () => {
+    const requestBrowser = vi.fn(async () => 'ok');
+    await post('/api/eval', { code: 'return 1', timeoutMs: 999_999 }, makeCtx({ requestBrowser }));
+    expect(requestBrowser).toHaveBeenCalledWith('eval', { code: 'return 1', timeoutMs: 25_000 }, 35_000);
+  });
+
+  it('falls back to the default for a junk timeoutMs', async () => {
+    const requestBrowser = vi.fn(async () => 'ok');
+    await post('/api/eval', { code: 'return 1', timeoutMs: -3 }, makeCtx({ requestBrowser }));
+    expect(requestBrowser).toHaveBeenCalledWith('eval', { code: 'return 1', timeoutMs: 5000 }, 15_000);
   });
 
   it('504 when the renderer relay throws (no editor connected)', async () => {

@@ -42,7 +42,7 @@
  *  production, fails silently. A probe validated only in dev would have missed every one. */
 
 import { getWebGPUSupported } from './gpuDetect';
-import { getActiveRenderer } from '../core/activeRenderer';
+import { getActiveRenderer, readRendererBackend } from '../core/activeRenderer';
 
 export interface CompressedTextureSupport {
   /** ASTC — the mobile target format for KTX2. */
@@ -58,8 +58,10 @@ export interface DeviceCaps {
   platform: string;
   /** A WebGPU adapter AND device resolved. **Not a tier input** — see the module header. */
   webgpu: boolean;
-  /** What the LIVE renderer is actually using, or null before one registers. A `webgpu: true`
-   *  device can still be on `'WebGL'` if the project forced the backend. */
+  /** The API the LIVE renderer is actually drawing through, or null before one registers — NOT
+   *  the renderer class (#147). A `webgpu: true` device can still read `'WebGL'` if the project
+   *  forced the backend, and a `webgpu: false` device ALWAYS does: three runs its WebGL2 backend
+   *  inside the same `WebGPURenderer` class. */
   backend: 'WebGPU' | 'WebGL' | null;
   /** iOS/Android hardware identifier (`iPhone10,1`). Native builds only — `undefined` on web,
    *  where no reliable equivalent exists on iOS at all. */
@@ -163,11 +165,15 @@ function readGlFacts(): Pick<DeviceCaps, 'gpuRenderer' | 'maxTextureSize' | 'com
 }
 
 /** Which backend the LIVE renderer settled on — null until a viewport registers one. Distinct
- *  from `webgpu` (what the device COULD do): a project may force WebGL via render settings. */
+ *  from `webgpu` (what the device COULD do): a project may force WebGL via render settings, and
+ *  a device with no adapter falls back to WebGL2 at init.
+ *
+ *  ⚠️ It derived this from `isWebGPURenderer` until #147 — the renderer CLASS, not the API, which
+ *  made the `'WebGL'` branch unreachable and reported `backend: 'WebGPU'` alongside `webgpu: false`
+ *  in the same payload on an iPhone 8. That is exactly the low-end case #121's quality tiers exist
+ *  to catch, so the field mattered. `readRendererBackend` is now the one place that decides. */
 function readBackend(): 'WebGPU' | 'WebGL' | null {
-  const r = getActiveRenderer() as unknown as { isWebGPURenderer?: boolean } | null;
-  if (!r) return null;
-  return r.isWebGPURenderer ? 'WebGPU' : 'WebGL';
+  return readRendererBackend(getActiveRenderer());
 }
 
 /** Probe the device once and cache it. Safe to call from anywhere, any number of times;

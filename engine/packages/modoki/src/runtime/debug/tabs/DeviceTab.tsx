@@ -4,7 +4,9 @@
 
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { scrollRootStyle } from '../tabLayout';
-import { getRenderSettings, setRenderSettings } from '../../rendering/renderSettings';
+import { getRenderSettings, setRenderSettings, getActiveQualityTier } from '../../rendering/renderSettings';
+import { applyQualityTier } from '../../rendering/tierCalibration';
+import type { QualityTier } from '../../rendering/qualityTier';
 import { forceResizeAllSurfaces } from '../../rendering/resizeBus';
 
 interface Insets { top: string; right: string; bottom: string; left: string }
@@ -153,6 +155,20 @@ export function DeviceTab() {
     });
   }
 
+  /** Preview a tier LIVE (#121 P3d) — the point of the control.
+   *
+   *  A project can already pin `rendering.three.qualityTier`, but that resolves at renderer
+   *  BRING-UP, so changing it shows nothing until a relaunch — useless for authoring a low-end
+   *  look. This applies it now, through the same `applyQualityTier` the calibration loop uses, so
+   *  what you see is what a device on that tier renders. Two honest limits, both inherited:
+   *  ANTIALIAS will not change until the next renderer creation (constructor option), and this is
+   *  a live override, not a saved setting — it does not write project.config.json. */
+  function previewTier(tier: QualityTier) {
+    applyQualityTier(tier, 'project', 'previewed from the debug menu');
+    bumpCapsTick((n) => n + 1);
+  }
+
+  const activeTier = getActiveQualityTier();
   const nav = navigator as Navigator & { deviceMemory?: number };
   const rows: Array<[string, string]> = [
     ['Platform', platform()],
@@ -205,6 +221,38 @@ export function DeviceTab() {
         <div style={sectionTitleStyle}>Backing resolution</div>
         <CapButtonRow label="2D" current={liveCaps.pixi.pixelRatioCap} onPick={(v) => setCap('pixi', v)} />
         <CapButtonRow label="3D" current={liveCaps.three.pixelRatioCap} onPick={(v) => setCap('three', v)} />
+        <div style={{ ...rowStyle, marginTop: 6 }}>
+          <span style={keyStyle}>Quality tier</span>
+          <span style={valStyle}>{activeTier ? `${activeTier.tier} (${activeTier.source})` : '—'}</span>
+        </div>
+        {activeTier && (
+          <div style={{ ...uaStyle, marginBottom: 4 }}>{activeTier.reason}</div>
+        )}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+          <span style={{ ...keyStyle, width: 18 }}>Tier</span>
+          <div style={{ display: 'flex', gap: 4 }}>
+            {(['low', 'high'] as QualityTier[]).map((t) => {
+              const active = activeTier?.tier === t;
+              return (
+                <button
+                  key={t}
+                  onClick={() => previewTier(t)}
+                  style={{
+                    fontSize: 11,
+                    padding: '2px 8px',
+                    borderRadius: 4,
+                    border: `1px solid ${active ? '#7ec8ff' : '#2d5a8a'}`,
+                    background: active ? '#16223a' : 'transparent',
+                    color: active ? '#7ec8ff' : '#8b8ba7',
+                    cursor: 'pointer',
+                  }}
+                >
+                  {t}
+                </button>
+              );
+            })}
+          </div>
+        </div>
         <div style={{ ...rowStyle, marginTop: 4 }}>
           <span style={keyStyle}>Caps (2D/3D)</span>
           <span style={valStyle}>{liveCaps.pixi.pixelRatioCap} / {liveCaps.three.pixelRatioCap}</span>

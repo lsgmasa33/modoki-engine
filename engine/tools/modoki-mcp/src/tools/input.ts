@@ -135,9 +135,19 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'function body: use `return` to yield a value. The result is safe-stringified in the renderer, ' +
       'so return a PROJECTION for anything large/circular (e.g. `return {w: innerWidth, h: innerHeight}` ' +
       '— a bare `window` or DOM node serializes poorly). A thrown error is reported as a tool error. ' +
-      'Requires the Electron editor.',
-    { code: z.string().describe('JavaScript to run in the editor renderer. Use `return` for a value.') },
-    async ({ code }) => evalRenderer(code),
+      '`await` is allowed (the body is an async function), so several promise-returning modoki.* ops ' +
+      'compose in ONE call; an un-awaited promise nested in the result reports itself rather than ' +
+      'serializing to {}. Requires the Electron editor.',
+    {
+      code: z.string().describe('JavaScript to run in the editor renderer. Use `return` for a value.'),
+      timeoutMs: z.number().int().positive().optional().describe(
+        'How long the body may run before it is abandoned. Default 5000, max 25000 (clamped, not ' +
+        'refused). Raise it when the code awaits something slow — e.g. modoki.waitForEdit(), which ' +
+        'parks by design and could never outlive the old fixed budget. The device twin caps LOWER ' +
+        '(4500): its TCP transport has a fixed 5s per-request deadline it cannot exceed.',
+      ),
+    },
+    async ({ code, timeoutMs }) => evalRenderer(code, timeoutMs),
   );
 
   // ── eval-api — discovery for modoki_eval's injected `modoki` object ──

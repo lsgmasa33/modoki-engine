@@ -18,6 +18,9 @@ import {
   handleEval as evalCode,
   screenshotToCSS as toCSS,
   createConsoleRing,
+  clampEvalTimeout,
+  DEVICE_EVAL_TIMEOUT_MS,
+  DEVICE_EVAL_MAX_TIMEOUT_MS,
   MAX_CONSOLE_LOGS,
   type LastScreenInfo,
   type ScreenInfoParam,
@@ -87,7 +90,11 @@ function patchConsole() {
  *  function stops passing the object it builds. This is the seam production actually takes
  *  (`case 'eval'` → here → `evalCode(code, api)`), so it is the one worth asserting. */
 export async function handleEval(params: Record<string, unknown>): Promise<unknown> {
-  return evalCode((params.code as string) ?? '', await makeDeviceEvalApi());
+  // The ceiling here is NOT a policy choice — `TcpLeaseTransport` fixes its request deadline at
+  // 5000ms per CONNECTION (host-side, and its clock starts before the request even reaches us), so
+  // a device budget at or above that can never be the one that fires. See DEVICE_EVAL_MAX_TIMEOUT_MS.
+  const timeoutMs = clampEvalTimeout(params.timeoutMs, DEVICE_EVAL_TIMEOUT_MS, DEVICE_EVAL_MAX_TIMEOUT_MS);
+  return evalCode((params.code as string) ?? '', await makeDeviceEvalApi(), timeoutMs);
 }
 
 /** Convert screenshot pixel coords → CSS, reading the bridge's live `lastScreenInfo` + device dpr.

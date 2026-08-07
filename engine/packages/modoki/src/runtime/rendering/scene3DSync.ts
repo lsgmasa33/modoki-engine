@@ -43,6 +43,7 @@ import {
 } from './renderSettings';
 import { resolveTier, tierShadowMapSize, type QualityTierSetting } from './qualityTier';
 import { getDeviceCaps } from './deviceCaps';
+import { getPlayerQualityTier } from './playerQualityTier';
 import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
 import { resolveAnimSetParams, ANIMSET_DEFAULTS, getAnimSet } from '../loaders/animSetCache';
 import { clone as cloneSkeleton, retargetClip } from 'three/examples/jsm/utils/SkeletonUtils.js';
@@ -3042,8 +3043,11 @@ export function applyRendererColorConfig(r: {
  *  capability probe it would ignore. */
 async function resolveActiveTier(setting: QualityTierSetting): Promise<void> {
   if (getActiveQualityTier()) return;
-  if (setting !== 'auto') {
-    setActiveQualityTier(resolveTier({ platform: '', projectSetting: setting }));
+  // The player's stored choice outranks everything, including a pinned project setting — see
+  // playerQualityTier.ts. Read before the early-out so a pin cannot hide it.
+  const playerChoice = getPlayerQualityTier();
+  if (playerChoice || setting !== 'auto') {
+    setActiveQualityTier(resolveTier({ platform: '', playerChoice, projectSetting: setting }));
     return;
   }
   let caps: Awaited<ReturnType<typeof getDeviceCaps>> | null = null;
@@ -3055,6 +3059,7 @@ async function resolveActiveTier(setting: QualityTierSetting): Promise<void> {
   }
   setActiveQualityTier(resolveTier({
     platform: caps?.platform ?? '',
+    playerChoice,
     deviceModel: caps?.deviceModel,
     gpuRenderer: caps?.gpuRenderer,
     projectSetting: setting,

@@ -7,7 +7,7 @@
  *  back to `modoki === undefined` — the exact bug #83 was filed for.
  *
  *  So this file drives the real chain instead: `handleEval(params)` → `handleEval(code, arg)` in
- *  bridgeHelpers → `new Function('modoki', code)`. That is what the bridge's `case 'eval':` dispatch
+ *  bridgeHelpers → `new AsyncFunction('modoki', code)`. That is what the bridge's `case 'eval':` dispatch
  *  calls, one hop above. Asserted from INSIDE the evaluated code, because that is the only vantage
  *  point that can tell "the object was built" apart from "the object was handed to the caller's code".
  *
@@ -20,6 +20,7 @@
 import { describe, it, expect } from 'vitest';
 import { registerAgentOp } from '../../app/debug/agentBridge';
 import { handleEval } from '../../app/debug/bridge';
+import { DEVICE_EVAL_TIMEOUT_MS, DEVICE_EVAL_MAX_TIMEOUT_MS } from '../../app/debug/bridgeHelpers';
 
 /** `handleEval` safe-stringifies whatever the code returns (that is the documented device_eval
  *  contract — "compact, size-capped JSON; survives a circular result"), so a non-scalar comes back
@@ -54,5 +55,31 @@ describe('device_eval wiring — the injected object reaches the evaluated code 
   it('the device object stays NARROWER than the editor\'s, as seen from the code (#83)', async () => {
     const result = await evalObject('return { api: typeof modoki.api, composite: typeof modoki.composite };');
     expect(result).toEqual({ api: 'undefined', composite: 'undefined' });
+  });
+});
+
+/** The DEVICE's timeout ceiling, asserted through the same seam as everything above — the
+ *  `handleEval(params)` in `bridge.ts` that the `case 'eval':` dispatch actually calls.
+ *
+ *  `bridge.test.ts` pins `clampEvalTimeout` and the constants directly, but nothing there proves
+ *  this caller passes the DEVICE pair rather than the editor's. That distinction is the whole
+ *  point: the device ceiling is imposed by `TcpLeaseTransport`'s fixed 5000ms request deadline
+ *  (whose clock starts host-side), so a device eval that inherited the editor's 25000 would be
+ *  fiction — the host would abandon it at 5s and report a transport error instead of what the code
+ *  was doing. Exactly the failure the ceiling exists to prevent. */
+describe('device_eval applies the DEVICE budget, not the editor one', () => {
+  it('clamps an over-cap request to the device ceiling and names it', async () => {
+    const out = await handleEval({ code: 'await new Promise(() => {}); return 1;', timeoutMs: 60_000 });
+    expect(out).toBe(`Error: eval timed out after ${DEVICE_EVAL_MAX_TIMEOUT_MS}ms (the code did not finish — an unresolved Promise, or a budget too small for what it awaits)`);
+  }, DEVICE_EVAL_MAX_TIMEOUT_MS + 2000);
+
+  it('defaults to the device budget when timeoutMs is omitted', async () => {
+    const out = await handleEval({ code: 'return new Promise(() => {});' });
+    expect(out).toContain(`after ${DEVICE_EVAL_TIMEOUT_MS}ms`);
+  }, DEVICE_EVAL_TIMEOUT_MS + 2000);
+
+  it('honours a SHORTER explicit budget', async () => {
+    const out = await handleEval({ code: 'await new Promise(() => {}); return 1;', timeoutMs: 80 });
+    expect(out).toContain('after 80ms');
   });
 });

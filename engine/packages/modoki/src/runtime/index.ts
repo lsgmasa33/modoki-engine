@@ -208,7 +208,7 @@ export {
 // The allowlist ships EMPTY and `auto` is NOT the default: see the module header, both are
 // deliberate states pending P5 calibration on real hardware, not unfinished work.
 export {
-  resolveTier, evaluateTierChange, freshTierChangeState, tierShadowMapSize,
+  resolveTier, evaluateTierChange, freshTierChangeState, tierShadowMapSize, tierAllowsPostFX,
   TIER_SETTINGS, TIER_ALLOWLIST, DEFAULT_TIER_SETTING,
   type QualityTier, type QualityTierSetting, type TierResolution, type TierSource,
   type TierRenderOverrides, type TierResolveInput, type TierChangeState, type TierDecision,
@@ -295,6 +295,14 @@ export {
   setRenderSettings, getRenderSettings, resetRenderSettings, resolveToneMapping,
   setActiveQualityTier, getActiveQualityTier, getEffectiveThreeSettings, getActiveTierOrDefault,
 } from './rendering/renderSettings';
+export {
+  tickTierCalibration, applyPendingTierPromotion, resetTierCalibration,
+  getPendingTierPromotion, CALIBRATION_INTERVAL_MS,
+} from './rendering/tierCalibration';
+export {
+  getPlayerQualityTier, setPlayerQualityTier, hasPlayerQualityTier, choosePlayerQualityTier,
+} from './rendering/playerQualityTier';
+export { playerTierStore, type PlayerTierStore } from './core/playerTierStore';
 export type { RenderSettings, ThreeRenderSettings, PixiRenderSettings, WebRenderSettings } from './rendering/renderSettings';
 export { getWorldTransform3D, getWorldMatrix3D, getParentWorldMatrix3D, worldToLocal3D, hasParent } from './core/ecs/worldTransform';
 export type { WorldTransform3D } from './core/ecs/worldTransform';

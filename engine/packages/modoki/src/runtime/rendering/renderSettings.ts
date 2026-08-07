@@ -94,10 +94,19 @@ const cloneDefaults = (): RenderSettings => ({
 
 let settings: RenderSettings = cloneDefaults();
 
+/** A patch: any sub-block may be partial, matching what the merge below actually does.
+ *
+ *  `Partial<RenderSettings>` would only make the three BLOCKS optional, not their fields — so
+ *  `{three:{qualityTier:'low'}}` failed to typecheck even though the merge handles it, and every
+ *  such caller had to cast. The type now says what the function does. */
+export type PartialRenderSettings = {
+  [K in keyof RenderSettings]?: Partial<RenderSettings[K]>;
+};
+
 /** Inject the project's rendering config. Called once at app boot (register.ts).
  *  Partial input is deep-merged over the current settings so a missing sub-block
  *  keeps its default. */
-export function setRenderSettings(next: Partial<RenderSettings> | undefined): void {
+export function setRenderSettings(next: PartialRenderSettings | undefined): void {
   if (!next) return;
   settings = {
     three: { ...settings.three, ...next.three },

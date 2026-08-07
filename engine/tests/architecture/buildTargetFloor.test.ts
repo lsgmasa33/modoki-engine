@@ -82,6 +82,39 @@ describe('shipped iOS floor', () => {
     expect(fn).toMatch(/IPHONEOS_DEPLOYMENT_TARGET = \[0-9\.\]\+;\/g/);
   });
 
+  // There are TWO native iOS floors, and this guard knew about only one — which is how the
+  // second drifted unseen. `ios/App/CapApp-SPM/Package.swift` declares `platforms: [.iOS(.vNN)]`
+  // independently of the pbxproj, and nothing healed it: after the 15.4 → 16.4 raise, six of
+  // nine projects still said `.v15` while every pbxproj read 16.4.
+  it('drives the SPM package floor from the same value too', () => {
+    expect(HEAL).toMatch(/healIosSpmPlatform\(projectRoot,\s*cfg\.build\.iosMinVersion\)/);
+  });
+
+  // Every project's COMMITTED state, not just the mechanism — the heal only runs on project
+  // open / native build, so a project nobody has opened since a floor change stays stale on
+  // disk. This is the half that would have caught the drift.
+  it('every project on disk carries the SPM floor the config asks for', () => {
+    const major = Math.trunc(defaultIosMinVersion());
+    const stale: string[] = [];
+    for (const root of ['games', 'demos']) {
+      const abs = path.join(ROOT, '..', root);
+      if (!fs.existsSync(abs)) continue; // the OSS snapshot ships neither
+      for (const entry of fs.readdirSync(abs, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const pkg = path.join(abs, entry.name, 'ios', 'App', 'CapApp-SPM', 'Package.swift');
+        if (!fs.existsSync(pkg)) continue; // no iOS target — nothing to be stale
+        const m = fs.readFileSync(pkg, 'utf8').match(/platforms:\s*\[[^\]]*\.iOS\(\.v(\d+)/);
+        if (m && parseInt(m[1], 10) !== major) stale.push(`${root}/${entry.name}: .v${m[1]} (want .v${major})`);
+      }
+    }
+    expect(stale, stale.length
+      ? `Stale SPM iOS floor — build.iosMinVersion says ${defaultIosMinVersion()} but these declare `
+        + `something else:\n  ${stale.join('\n  ')}\n\nFix: open each project in the editor (heal runs `
+        + `on open), or run a native build for it.`
+      : '',
+    ).toEqual([]);
+  });
+
   // The floor was raised from 15.4 to 16.4 on 2026-08-04 by owner decision, deliberately
   // dropping the iPhone 7 / 6s / SE1 era (the iPhone 7 tops out at iOS 15.8). That is a
   // reviewed, one-time move — this test pins the CURRENT value so the floor cannot drift

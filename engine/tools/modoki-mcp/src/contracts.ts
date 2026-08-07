@@ -276,9 +276,13 @@ const DECLS: Record<string, Decl> = {
   modoki_eval: {
     kind: 'control', method: 'POST', route: '/api/eval', mutating: true, requires: ['editor', 'renderer'],
     minimalArgs: { code: 'return 1 + 1;' },
-    notes: '#19: code runs as `new Function("modoki", code)` — the injected `modoki` object gives full op-registry + '
+    notes: '#19: code runs as an ASYNC function body (`await` is allowed, #145) with the injected `modoki` object as its '
+      + 'sole parameter — that object gives full op-registry + '
       + 'backendFetch access (see modoki_eval_api for the surface). Escape hatch, unvalidated by design; the older '
-      + '"dynamic import yields 19 of 55 ops" half-support this replaced is gone.',
+      + '"dynamic import yields 19 of 55 ops" half-support this replaced is gone. `timeoutMs` bounds the whole body '
+      + '(default 5000, max 25000, clamped): the route sizes the relay deadline from it and the client sizes its abort '
+      + 'from that, so all three stay ordered. Until they did, the relay\'s 3000ms default was SMALLER than the eval\'s '
+      + 'own 5000ms budget and capped every editor eval at 3s.',
   },
   modoki_eval_api: {
     kind: 'read', method: 'GET', route: '/api/eval-api', requires: ['editor', 'renderer'],

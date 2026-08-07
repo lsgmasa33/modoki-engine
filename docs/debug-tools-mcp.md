@@ -288,8 +288,22 @@ same actions + state a person has in the editor. They relay to the renderer over
 - **Eval live renderer state:** `modoki_eval` — run JS in the editor RENDERER and get the value back
   (the editor twin of `device_eval`). For reading/poking live state a file read can't see — a global
   (`window.__3d`), `devicePixelRatio`, a React fiber value, WGSL validation, dispatching a bridge
-  event. Runs as a function body (`return x`); return a PROJECTION for anything large/circular. This
+  event. Runs as an **async** function body (`return x`; `await` is allowed — see below); return a
+  PROJECTION for anything large/circular. This
   is what removed most of the "stand up a raw CDP client" cases below. *(Electron editor only.)*
+  - **`await` works on BOTH eval surfaces** (`modoki_eval` and `device_eval`) — the body is compiled
+    with the async function constructor, so composing several promise-returning `modoki.*` ops in one
+    call is the normal thing to write. It was a SYNTAX error until #145, reported as *"Unexpected
+    identifier 'modoki'"*, which named neither `await` nor async and sent readers to a one-eval-per-read
+    workaround. A returned promise is still awaited too, bounded by `EVAL_ASYNC_TIMEOUT_MS` (5s).
+  - **An un-awaited promise NESTED in the result serializes as `[unresolved Promise — did you forget
+    \`await\`?]`.** A pending thenable has no own enumerable properties, so `return { a: modoki.foo() }`
+    used to come back `{"a":{}}` — an empty-looking *result* rather than a mistake, which is how it
+    silently ate real debugging calls. The top-level `return modoki.foo()` is unaffected: that one is
+    awaited.
+  - **`timeoutMs` bounds the whole body, and the two surfaces cap DIFFERENTLY** — `modoki_eval`
+    default 5000 / max 25000, `device_eval` default 4000 / **max 4500**. Out-of-range is clamped,
+    not refused. The asymmetry is not a policy choice: see the nested-deadline rule below.
 - **Play/test the game:** `modoki_play_control {play|stop|pause|resume|step}` — press Play, exercise
   with `modoki_tap`/`modoki_drag`, read `get_scene_state`, then stop (reverts the authored snapshot).
 - **Edit like a human (undoable):** `modoki_create_entity` (empty/primitive/2d/ui/camera/light/
@@ -655,6 +669,28 @@ on both now, with `dx`/`dy` kept as aliases. **Editor-only by nature** (no game 
 `handles` / `tap_handle` / `drag_handle` / `dnd` / `focus` (editor chrome + Canvas2D authoring),
 `render_scene`, `play_control` / `set_timescale` / `history`, `identity`. **Known device gaps**, logged
 as features rather than audit fixes: no `device_type_text`, no `device_pointer` (sustained press).
+
+#### Nested deadlines — why `device_eval` caps at 4500ms and `modoki_eval` at 25000ms
+
+**A timeout is only real if it is the SHORTEST one in its chain.** Both eval surfaces violated that,
+so `EVAL_ASYNC_TIMEOUT_MS = 5000` — the one number anybody could see — was unreachable on each, and a
+slow eval reported a dead transport instead of what the code was doing:
+
+| Layer | Editor (`modoki_eval`) | Device (`device_eval`) |
+|---|---|---|
+| the eval's own budget | `timeoutMs` — default 5000, **max 25000** | `timeoutMs` — default 4000, **max 4500** |
+| transport | HMR relay `requestBrowser` — was a fixed **3000**, now `op + 10s` | `TcpLeaseTransport` — fixed **5000**, per CONNECTION |
+| outermost | MCP client abort — was a fixed **30000**, now `op + 15s` | (the lease request is the ceiling) |
+
+The editor's relay took an explicit deadline all along (`/api/wait-for-edit` already passed one), so
+its layers are now sized from the op's budget and each is strictly larger than the one inside it. The
+**device cannot do that**: `TcpLeaseTransport.request()` takes no per-request timeout, so its 5000ms
+is fixed for the whole connection *and its clock starts host-side, before the request reaches the
+device* — which is why an equal 5000 always lost. 4500 leaves ~500ms for the reply.
+
+**So the device cap is imposed from outside the eval code and must not simply be raised.** Lifting it
+means plumbing a per-request timeout through that transport first. Until then, budget a device eval
+under 4.5s or split it across calls.
 
 ## Response budget (read this before adding a tool)
 
