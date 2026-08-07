@@ -13,6 +13,7 @@ import {
   TIER_ALLOWLIST, TIER_SETTINGS, DEFAULT_TIER_SETTING,
   PROMOTION_HOLD_MS, DEMOTION_HOLD_MS, MIN_SAMPLES_TO_JUDGE,
   type QualityTier,
+  applyTierToThree,
 } from '../../src/runtime/rendering/qualityTier';
 import { BUDGET_30FPS_MS, type FrameProfile } from '../../src/runtime/core/frameProfiler';
 
@@ -230,5 +231,41 @@ describe('tier settings', () => {
 
   it('every tier has settings', () => {
     for (const t of ['low', 'high'] as QualityTier[]) expect(TIER_SETTINGS[t]).toBeDefined();
+  });
+
+  // ── applyTierToThree (#121 P3a) ─────────────────────────────────────────────────────────
+  // A TIER CLAMPS, IT NEVER RAISES. This is what makes wiring tiers up a no-op for every
+  // existing project, and what stops `high` from overriding a deliberate authoring choice.
+  describe('applyTierToThree', () => {
+    const authored = { backend: 'auto', antialias: true, pixelRatioCap: 2, shadows: true, extra: 'kept' };
+
+    it('high leaves default settings byte-identical — today\'s behaviour, unchanged', () => {
+      expect(applyTierToThree(authored, 'high')).toEqual(authored);
+    });
+
+    it('low takes everything away', () => {
+      expect(applyTierToThree(authored, 'low')).toMatchObject({
+        pixelRatioCap: 1, antialias: false, shadows: false,
+      });
+    });
+
+    it('NEVER raises a value the project deliberately lowered', () => {
+      // A project that authored a DPR cap of 1 / shadows off is not asking for more work just
+      // because it landed on the high tier. Regression guard: `replace` semantics would silently
+      // undo hand-tuned settings like sling's Y6 workaround (8e85b7b3).
+      const lean = { ...authored, pixelRatioCap: 1, antialias: false, shadows: false };
+      expect(applyTierToThree(lean, 'high')).toMatchObject({
+        pixelRatioCap: 1, antialias: false, shadows: false,
+      });
+    });
+
+    it('preserves fields it does not own, and does not mutate the input', () => {
+      const input = { ...authored };
+      const out = applyTierToThree(input, 'low');
+      expect(out.extra).toBe('kept');
+      expect(out.backend).toBe('auto');
+      expect(input).toEqual(authored); // untouched
+      expect(out).not.toBe(input);
+    });
   });
 });

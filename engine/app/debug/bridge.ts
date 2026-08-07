@@ -370,15 +370,59 @@ function handleConsoleLogs(params: Record<string, unknown>): ReturnType<typeof c
  *
  *  `@capacitor/app`'s `getInfo()` is unimplemented on web (throws) — this bridge only runs the
  *  native path in practice (`initNativeBridge`, gated on `Capacitor.isNativePlatform()`), but the
- *  fallback keeps this handler total rather than a rejection the router would have to translate. */
-export async function handleAppIdentity(): Promise<{ platform: string; appId: string; appName: string }> {
+ *  fallback keeps this handler total rather than a rejection the router would have to translate.
+ *
+ *  It also reports the HARDWARE the app is running on (#146), because the host cannot otherwise
+ *  tell which phone the lease is holding. See `readDeviceHardware` for why those two fields and
+ *  not a device id.
+ *
+ *  Additive on purpose: an older bridge answers without `deviceModel`/`osVersion`, and the host
+ *  treats their absence as "unknown", never as a mismatch. */
+export async function handleAppIdentity(): Promise<{
+  platform: string; appId: string; appName: string; deviceModel?: string; osVersion?: string;
+}> {
   const platform = Capacitor.getPlatform();
+  const hardware = await readDeviceHardware();
   try {
     const info = await CapacitorApp.getInfo();
-    return { platform, appId: info.id, appName: info.name };
+    return { platform, appId: info.id, appName: info.name, ...hardware };
   } catch {
-    return { platform, appId: '', appName: '' };
+    return { platform, appId: '', appName: '', ...hardware };
   }
+}
+
+/** The two hardware facts that let the HOST identify which paired iPhone this lease is holding
+ *  (#146), so it does not launch a signed WebDriverAgent on someone else's phone.
+ *
+ *  **Why these two and not a device id.** iOS forbids an app reading the hardware UDID, and
+ *  `identifierForVendor` is a per-vendor GUID that appears in no `xcrun` listing — so no id the app
+ *  can see is comparable with anything the Mac knows. `model` and `osVersion` are, exactly: the
+ *  plugin reads `model` from `hw.machine`, which is byte-identical to devicectl's
+ *  `hardwareProperties.productType` (`iPhone18,4`), and `osVersion` matches its `osVersionNumber`.
+ *  Two phones can share both, which is why the host REFUSES on an ambiguous match rather than
+ *  picking — this narrows the candidates honestly, it does not pretend to be a serial number.
+ *
+ *  **Read from `capacitor-game-debug`, NOT `@capacitor/device`.** The first version of #146 read
+ *  `Capacitor.Plugins.Device`, which looked safe — `deviceCaps.ts` reads the same global — but that
+ *  plugin is OPTIONAL and **no Modoki project installs it** (checked across all 22 games + demos:
+ *  none has the dependency, none has `CapacitorDevice` in its iOS `Package.swift`). So the probe
+ *  returned `{}` on every real device and the host silently fell back to guessing which phone to
+ *  launch on — the fix was inert in production while every test passed. `capacitor-game-debug` is
+ *  present by construction instead: #146 only matters while a device holds a lease, and holding one
+ *  REQUIRES this plugin. Precedent is not evidence; presence is.
+ *
+ *  Dynamically imported like the rest of this module's plugin use, so the web build does not pull
+ *  it into the initial chunk. Total by design — a plugin older than #146 has no such method and
+ *  rejects, which lands in the same `{}` as the web stub. */
+async function readDeviceHardware(): Promise<{ deviceModel?: string; osVersion?: string }> {
+  try {
+    const { GameDebug } = await import('capacitor-game-debug');
+    const info = await GameDebug.getDeviceHardware();
+    return {
+      ...(info?.model ? { deviceModel: info.model } : {}),
+      ...(info?.osVersion ? { osVersion: info.osVersion } : {}),
+    };
+  } catch { return {}; }
 }
 
 /** Build the `appStateChange` handler that makes THE FOREGROUND APP OWN THE PORT (#95).

@@ -293,6 +293,7 @@ export type { FrameLoopHealth } from './rendering/frameDriver';
 // ── Render settings (project-configured renderer knobs) ──
 export {
   setRenderSettings, getRenderSettings, resetRenderSettings, resolveToneMapping,
+  setActiveQualityTier, getActiveQualityTier, getEffectiveThreeSettings, getActiveTierOrDefault,
 } from './rendering/renderSettings';
 export type { RenderSettings, ThreeRenderSettings, PixiRenderSettings, WebRenderSettings } from './rendering/renderSettings';
 export { getWorldTransform3D, getWorldMatrix3D, getParentWorldMatrix3D, worldToLocal3D, hasParent } from './core/ecs/worldTransform';

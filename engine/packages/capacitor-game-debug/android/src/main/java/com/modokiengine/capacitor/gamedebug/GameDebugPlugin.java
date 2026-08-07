@@ -235,6 +235,25 @@ public class GameDebugPlugin extends Plugin {
         call.resolve(result);
     }
 
+    /**
+     * WHICH DEVICE this lease is holding (#146). The iOS twin is what the feature exists for —
+     * there the model is compared against `xcrun devicectl`'s productType so a WebDriverAgent
+     * launch cannot start on the wrong phone. Android has no such launch, so this is reported for
+     * PARITY (docs/mcp-tool-conventions.md §9): device_status names the hardware on both platforms,
+     * and a capability present on one surface but not the other is a finding, not a default.
+     *
+     * `Build.MODEL` is the marketing model ("SC-56C"), which is what an Android host tool sees in
+     * `adb shell getprop ro.product.model` — the analogous host-comparable string. Never null:
+     * the empty string reads as "unknown" on the host and is treated as unverified.
+     */
+    @PluginMethod
+    public void getDeviceHardware(PluginCall call) {
+        JSObject result = new JSObject();
+        result.put("model", android.os.Build.MODEL != null ? android.os.Build.MODEL : "");
+        result.put("osVersion", android.os.Build.VERSION.RELEASE != null ? android.os.Build.VERSION.RELEASE : "");
+        call.resolve(result);
+    }
+
     private String getWifiIpv4() {
         try {
             String fallback = null;

@@ -452,6 +452,61 @@ export const spaceConsoleConfig: GameConfig = {
 
 The `GameConfig.preferWebGPU` JSDoc in `runtime/config.ts` is likewise stale (still describes an `'auto'` → legacy `WebGLRenderer` fallback).
 
+### GPU context loss is recoverable — and bring-up must stay self-contained
+
+A lost GPU context used to be **permanent**: detected, logged, nothing rendered again for the
+process lifetime. That is how a Huawei Y6 2019 died ~4 s into boot with `games/sling` (#121 P1).
+
+**A lost three renderer cannot be revived.** `WebGLBackend` already calls `preventDefault()` on
+`webglcontextlost` (so the browser *will* restore the underlying context) and routes to
+`renderer.onDeviceLost()`, which sets a private `_isDeviceLost` that gates `render()` and is never
+cleared anywhere in three. So recovery means **building a new renderer**, not restoring one.
+
+Detection and policy live in `runtime/core/activeRenderer.ts` — one funnel for both backends, a
+sliding budget (`MAX_RECOVERY_ATTEMPTS` in `RECOVERY_WINDOW_MS`), then abandon loudly. It
+*asks*; it cannot rebuild. Viewports subscribe via `onRendererLost` and rebuild themselves.
+Scheduling (defer out of the loss event, one rebuild at a time, coalesce a loss that lands
+mid-rebuild) is `rendering/rendererRecovery.ts`.
+
+**THE INVARIANT: a viewport's bring-up must stay self-contained.** Recovery works because
+everything built against the renderer — scene, cameras, render state, particles, the post-FX
+stack, the frame callback, and the capture/bounds/broker registrations — is created inside one
+bring-up closure and torn down by one cleanup, so a rebuild is `teardown(); bringUp();` and
+re-points nothing. Hoist anything renderer-touching *out* of that closure and recovery silently
+breaks. Three consequences that are easy to get wrong:
+
+- **Teardown runs against a DEAD context**, so every step is individually guarded. Unguarded, one
+  throw skips the rest and the rebuild double-registers on top of the leftovers.
+- **`RendererLostInfo.renderer` says WHICH renderer died** — the notification is a broadcast and
+  the editor mounts two viewports. Compare by identity and ignore a loss that is not yours, or you
+  tear down a healthy renderer in sympathy.
+- **A render-on-demand viewport must be re-marked dirty after a rebuild**, or it completes
+  recovery and stays black until the user nudges the camera — indistinguishable from failure.
+  `SceneView`'s dirty gate is created at mount, so a rebuild inherits it already spent.
+
+**It is a re-UPLOAD, not a re-download.** Bring-up never calls `loadScene`; it rebuilds the three
+objects from the ECS world through the scene-scoped caches (the same path a world swap uses), so
+the cached `BufferGeometry`/`Texture` objects simply re-upload to the new device. Measured: after
+a rebuild the new renderer drew the real scene at 68 draw calls / 137,443 triangles with 41
+geometries + 39 textures resident on it.
+
+**Recovery is a visible hitch, not seamless** — shader prewarm re-runs. Measured **~316 ms**
+(iPhone 8 / WebGL2) and **~235 ms** (Galaxy A23). That is the honest cost behind the `warn` log's
+"expect a visible hitch", and it is the right trade against a permanently black surface.
+
+**Testing it:** on a WebGL backend, `canvas.getContext('webgl2').getExtension('WEBGL_lose_context')
+.loseContext()` produces a genuinely dead context. On a **WebGPU** backend you cannot easily force
+one — the only way to kill the device is `device.destroy()`, and that reports
+`reason: 'destroyed'`, which the detection layer deliberately filters as orderly teardown. So a
+WebGPU device is best exercised by dispatching a synthetic `webglcontextlost` on the canvas, which
+drives the same rebuild path but is not a real loss.
+
+⚠️ **Do not "simplify" the two detection paths into three's single `renderer.onDeviceLost(info)`
+hook without preserving the false-positive filters.** Unifying them is a real and worthwhile
+simplification, but those two filters (superseded-renderer, and `reason === 'destroyed'`) were
+paid for by shipping a diagnostic that declared a healthy 61 fps editor dead. They are the
+acceptance criteria for any such refactor.
+
 ### No custom GLSL
 
 Materials are standard Three.js materials (`MeshStandardMaterial`, GLB-imported materials, etc.). `WebGPURenderer` auto-converts them to TSL/WGSL — there is no hand-written shader source in the standard render path. The NPR post-process is the one place that authors node graphs, and it does so through TSL (plus one small raw-WGSL `wgslFn` for FXAA).

@@ -61,6 +61,35 @@ export const TIER_SETTINGS: Record<QualityTier, TierRenderOverrides> = {
   high: { pixelRatioCap: 2, antialias: true, shadows: true, shadowMapCeiling: 0 },
 };
 
+/** The subset of `ThreeRenderSettings` a tier touches. Declared STRUCTURALLY rather than
+ *  imported so this module keeps its one-way dependency (`renderSettings` imports here, never the
+ *  reverse) and stays pure + trivially testable. */
+export interface TierClampableThree {
+  pixelRatioCap: number;
+  antialias: boolean;
+  shadows: boolean;
+}
+
+/** Apply a tier to the project's authored three settings.
+ *
+ *  A TIER CLAMPS, IT DOES NOT REPLACE. `high` must be exactly today's behaviour, so a project
+ *  that deliberately authored `pixelRatioCap: 1` or `shadows: false` keeps it — being on the high
+ *  tier is not a reason to start doing MORE work than the project asked for. Only `low` can take
+ *  things away. (This is also what makes wiring the tier up a no-op for every existing game until
+ *  it opts in: with `DEFAULT_TIER_SETTING = 'high'`, clamping against `high`'s preset — the same
+ *  values as the engine defaults — changes nothing.)
+ *
+ *  Returns a NEW object; the caller's settings are never mutated. */
+export function applyTierToThree<T extends TierClampableThree>(three: T, tier: QualityTier): T {
+  const t = TIER_SETTINGS[tier];
+  return {
+    ...three,
+    pixelRatioCap: Math.min(three.pixelRatioCap, t.pixelRatioCap),
+    antialias: three.antialias && t.antialias,
+    shadows: three.shadows && t.shadows,
+  };
+}
+
 /** Devices known to be fine at `high`, so they skip calibration.
  *
  *  Keyed per platform because the two hide opposite things (see `deviceCaps`): iOS by hardware

@@ -217,15 +217,21 @@ describe('activeRenderer recovery policy', () => {
 
   it('asks a subscriber to rebuild on the first loss, with the backend that died', async () => {
     const { setActiveRendererHandle, onRendererLost } = await load();
-    const seen: unknown[] = [];
-    onRendererLost((info) => seen.push(info));
+    const seen: Array<Record<string, unknown>> = [];
+    onRendererLost((info) => seen.push(info as unknown as Record<string, unknown>));
 
     const device = makeGpuDevice();
-    setActiveRendererHandle(makeRenderer(device) as never);
+    const renderer = makeRenderer(device);
+    setActiveRendererHandle(renderer as never);
     device.resolveLost({ reason: 'unknown', message: 'driver reset' });
     await flush();
 
-    expect(seen).toEqual([{ api: 'WebGPU', reason: 'unknown', message: 'driver reset', attempt: 1 }]);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ api: 'WebGPU', reason: 'unknown', message: 'driver reset', attempt: 1 });
+    // WHICH renderer died, by identity. The editor mounts two viewports and this notification is
+    // a broadcast, so without this a healthy viewport cannot tell that the loss wasn't its own —
+    // and would tear its own working renderer down in sympathy.
+    expect(seen[0].renderer).toBe(renderer);
   });
 
   it('reports a WebGL context loss as api:WebGL — the path a low-end phone actually takes', async () => {

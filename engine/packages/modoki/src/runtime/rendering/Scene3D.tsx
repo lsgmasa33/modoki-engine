@@ -19,8 +19,10 @@ import { registerBoundsProvider, projectAABBToScreen, type EntityScreenBounds } 
 import { readbackToRGBA, type ReadbackBackend } from './readbackToRGBA';
 import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, prewarmShadersForWorld, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
 import { registerRenderSurface } from './materialBroker';
+import { onRendererLost } from '../core/activeRenderer';
+import { createRendererRecovery } from './rendererRecovery';
 import { beginProfilerSample, endProfilerSample } from '../core/profilerMarkers';
-import { getRenderSettings } from './renderSettings';
+import { getRenderSettings, getEffectiveThreeSettings } from './renderSettings';
 import { onForceResize } from './resizeBus';
 import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
 import { createParticleSyncState, syncParticles, disposeParticleSyncState } from './particleSync';
@@ -53,11 +55,48 @@ export default function Scene3D() {
     let renderer: WebGPURenderer | THREE.WebGLRenderer;
     let disposed = false;
 
-    createRenderer(container, config.preferWebGPU).then(r => {
+    // ── GPU context-loss recovery (#121 P1) ────────────────────────────────────────────────
+    // Everything this viewport owns — scene, cameras, renderState, particles, the post-FX
+    // stack, the frame callback, and the capture/bounds/broker registrations — is built inside
+    // `startRenderLoop()` and torn down by the `cleanupRef` it installs. So recovery does NOT
+    // need to re-point anything at a new renderer: it is a teardown plus a second bring-up, an
+    // in-place remount without React. That is only true while bring-up stays self-contained —
+    // anything hoisted OUT of startRenderLoop that touches the renderer breaks it.
+    //
+    // A lost three renderer cannot be revived (`_isDeviceLost` is never cleared anywhere in
+    // three), which is why this rebuilds rather than restores. See `core/activeRenderer.ts`.
+    const bringUp = async () => {
+      const r = await createRenderer(container, config.preferWebGPU);
       if (disposed) { r.dispose(); r.domElement.remove(); return; }
       renderer = r;
       startRenderLoop();
-    }).catch(e => {
+    };
+
+    /** Run the installed teardown exactly once, then forget it — so a bring-up that fails
+     *  before installing a new one can't leave the unmount path calling a stale closure over
+     *  an already-disposed renderer. */
+    const teardown = () => {
+      const fn = cleanupRef.current;
+      cleanupRef.current = null;
+      fn?.();
+    };
+
+    const recovery = createRendererRecovery({
+      rebuild: async () => { teardown(); await bringUp(); },
+      isDisposed: () => disposed,
+      onError: (e) => console.error(
+        '[Scene3D] renderer rebuild after context loss FAILED — this surface stays black ' +
+        'until another loss is reported or the game reloads:', e,
+      ),
+    });
+    // Only OUR renderer's death is ours to act on — the editor mounts a second viewport with
+    // its own renderer, and rebuilding a healthy one costs a prewarm stall for nothing.
+    const unsubRendererLost = onRendererLost((info) => {
+      if (info.renderer && renderer && info.renderer !== renderer) return;
+      recovery.request();
+    });
+
+    bringUp().catch(e => {
       console.error('[Scene3D] Renderer creation failed (no WebGPU or WebGL2):', e);
     });
 
@@ -698,8 +737,11 @@ export default function Scene3D() {
         // free/fixed, making this identical to the pre-clamp setSize path. basePR is
         // recomputed here every resize — never renderer.getPixelRatio(), which is the
         // already-clamped value and so can't climb back when the container shrinks.
+        // Tier-ADJUSTED (#121 P3) — `makeWebGPURenderer` sized the first buffer through the same
+        // accessor. Reading the RAW `pixelRatioCap` here would let the first resize silently undo
+        // the tier's cap, which on a low-end device is the whole point of the tier.
         const rs = getRenderSettings();
-        const basePR = basePixelRatio(window.devicePixelRatio, rs.three.pixelRatioCap);
+        const basePR = basePixelRatio(window.devicePixelRatio, getEffectiveThreeSettings().pixelRatioCap);
         renderer.setPixelRatio(clampPixelRatio(w, h, basePR, rs.web));
         renderer.setSize(w, h, false);
         renderer.domElement.style.width = `${w}px`;
@@ -715,35 +757,45 @@ export default function Scene3D() {
       const unregisterForceResize = onForceResize(applyResize);
 
       cleanupRef.current = () => {
-        unregisterSceneRenderer(offscreenRender);
-        unregBounds();
-        captureRT?.dispose();
+        // EVERY step is guarded (#121 P1). This teardown now runs on the RECOVERY path too,
+        // where the renderer's context is already dead — and three's dispose() paths touch the
+        // GPU. Unguarded, one throw would skip every later step: the frame callback left
+        // registered, `registerSceneRenderer`/`registerBoundsProvider`/`registerBeforeSwap`
+        // left holding closures over a dead renderer, and the rebuild double-registering on
+        // top of them. On the unmount path a throw was merely a leak; here it corrupts the
+        // thing recovery is trying to fix, so failures are logged and stepped over.
+        const step = (what: string, fn: () => void) => {
+          try { fn(); } catch (e) { console.warn(`[Scene3D] teardown step "${what}" failed`, e); }
+        };
+        step('unregisterSceneRenderer', () => unregisterSceneRenderer(offscreenRender));
+        step('unregBounds', unregBounds);
+        step('captureRT.dispose', () => captureRT?.dispose());
         captureRT = null;
         captureCanvas = null;
         captureCtx = null;
         captureCam = null;
         captureOrthoCam = null;
-        unsubSwap();
-        unsubInvalidation();
-        unregisterSurface();
-        for (const unsub of dirtyUnsubs) unsub();
-        sceneManager.unregisterBeforeSwap(prewarmHook);
-        resizeObserver.disconnect();
-        unregisterForceResize();
-        unregisterFrameCallback(frameKey);
-        disposeParticleSyncState(particleState, scene);
-        disposeFlameMeshSyncState(flameState, scene);
-        postfxStack?.dispose();
+        step('unsubSwap', unsubSwap);
+        step('unsubInvalidation', unsubInvalidation);
+        step('unregisterSurface', unregisterSurface);
+        for (const unsub of dirtyUnsubs) step('dirtyUnsub', unsub);
+        step('unregisterBeforeSwap', () => sceneManager.unregisterBeforeSwap(prewarmHook));
+        step('resizeObserver.disconnect', () => resizeObserver.disconnect());
+        step('unregisterForceResize', unregisterForceResize);
+        step('unregisterFrameCallback', () => unregisterFrameCallback(frameKey));
+        step('disposeParticleSyncState', () => disposeParticleSyncState(particleState, scene));
+        step('disposeFlameMeshSyncState', () => disposeFlameMeshSyncState(flameState, scene));
+        step('postfxStack.dispose', () => postfxStack?.dispose());
         postfxStack = null;
         ssRebuild = null;
         // Tear down skinned entries (stop mixers, dispose per-clone skeleton
         // boneTextures) — consistent with the world-swap path. Without this,
         // unmount relied on renderer.dispose() reclaiming the GPU context.
-        disposeRenderState(renderState, scene);
+        step('disposeRenderState', () => disposeRenderState(renderState, scene));
         // Don't dispose scene.environment — it's owned by meshTemplateCache's
         // envCache (refcounted by SceneManager). Just detach.
         scene.environment = null;
-        scene.clear();
+        step('scene.clear', () => scene.clear());
         // SHARED module-level material caches (_defaultMaterial, inline-texture
         // mats, tint clones, and the _ownedMaterials tracking set) are
         // intentionally NOT disposed on a single panel's unmount. The editor
@@ -754,14 +806,16 @@ export default function Scene3D() {
         // onWorldSwap listener in scene3DSync.ts), when all loops rebuild
         // together, or reclaimed with the GPU context on final teardown. See
         // engine-review/runtime-rendering-3d.md F2.
-        renderer.dispose();
-        renderer.domElement.remove();
+        step('renderer.dispose', () => renderer.dispose());
+        step('domElement.remove', () => renderer.domElement.remove());
       };
     }
 
     return () => {
       disposed = true;
-      cleanupRef.current?.();
+      unsubRendererLost();
+      recovery.dispose();
+      teardown();
     };
   }, []);
 

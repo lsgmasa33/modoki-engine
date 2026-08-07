@@ -247,6 +247,10 @@ export interface ProjectConfig {
       /** Upper bound on devicePixelRatio (perf vs sharpness). */
       pixelRatioCap: number;
       shadows: boolean;
+      /** Quality tier (#121): 'auto' delegates to the device allowlist + on-device calibration;
+       *  'low'/'high' pin it. A tier CLAMPS the settings above — it never raises them — so
+       *  'high' is exactly today's behaviour and the fields beside it stay authoritative. */
+      qualityTier: 'auto' | 'low' | 'high';
       /** Tone-mapping operator ('ACESFilmic' | 'AgX' | 'Neutral' | 'Linear' | 'None'). */
       toneMapping: (typeof TONE_MAPPINGS)[number];
       exposure: number;
@@ -391,7 +395,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   },
   rendering: {
     targetFps: 60, // matches the frame driver's historical default cap
-    three: { backend: 'auto', antialias: true, pixelRatioCap: 2, shadows: true, toneMapping: 'ACESFilmic', exposure: 1.2 },
+    three: { backend: 'auto', antialias: true, pixelRatioCap: 2, shadows: true, qualityTier: 'high', toneMapping: 'ACESFilmic', exposure: 1.2 },
     pixi: { backend: 'auto', antialias: true, resolution: 0, pixelRatioCap: 2 },
     web: { sizeMode: 'free', width: 1280, height: 720 },
   },

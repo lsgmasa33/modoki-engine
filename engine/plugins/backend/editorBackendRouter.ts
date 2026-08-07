@@ -758,7 +758,9 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
           if (!isIos) return json({ error: WDA_NOT_IOS_REASON }, 409);
           // Explicit ask pays the agent spin-up; a refusal must say why rather than quietly
           // handing back a native capture the caller specifically did not want.
-          const shot = await tryDeviceWdaScreenshot({ host }, { autoLaunch: true });
+          // The only screenshot path that LAUNCHES, so the only one that needs the lease's
+          // hardware to pick the right phone (#146). The two fallbacks below never auto-launch.
+          const shot = await tryDeviceWdaScreenshot({ host, lease: await deviceConnection.deviceHardware() }, { autoLaunch: true });
           return shot.handled ? json({ result: shot.reply }) : json({ error: shot.reason }, 409);
         }
         // The native capture fails two ways, and BOTH mean "the app could not photograph itself":
@@ -815,8 +817,12 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // reporting "cannot tell which iPhone to use". Asked once per lease, and only here, so a
       // CDP-handled op pays nothing for it. See `devicePlatform()` for the measurement.
       if (!outcome.handled && await deviceConnection.devicePlatform() === 'ios') {
+        // `lease` is what stops the lazy launch picking a phone by what is plugged into this Mac
+        // (#146). Same probe as `devicePlatform()` just above, so it costs no extra round trip.
         const wda = await tryDeviceWdaInput(b.method, b.params ?? {}, {
-          proxy, host: deviceConnection.status().target?.host,
+          proxy,
+          host: deviceConnection.status().target?.host,
+          lease: await deviceConnection.deviceHardware(),
         });
         // Keep the CDP reason when WDA has nothing to add (`reason: null` = not an op it routes):
         // the caller's banner should name the cause, and "not a WDA op" is not the cause.

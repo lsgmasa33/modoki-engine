@@ -139,6 +139,19 @@ export interface RendererLostInfo {
   message?: string;
   /** 1-based index of this loss within the window — i.e. which rebuild attempt this asks for. */
   attempt: number;
+  /** WHICH renderer died. Present so a subscriber can ignore a loss that isn't its own.
+   *
+   *  This matters because the notification is a BROADCAST and the editor mounts TWO viewports
+   *  (SceneView + GameView), each owning its own renderer. Without this, one viewport's context
+   *  loss would tear down and rebuild the other viewport's perfectly healthy renderer — a
+   *  gratuitous shader-prewarm stall, and a fresh chance to fail, on a surface that never had a
+   *  problem. Compare by identity and return early when it isn't yours.
+   *
+   *  Note what this does NOT fix: only the renderer that most recently called
+   *  `setActiveRendererHandle` is watched at all (both detection paths guard on
+   *  `attachedRenderer`), so a loss in the OTHER viewport is never reported in the first place.
+   *  That is a pre-existing limit of the detection layer, not something this field introduces. */
+  renderer: WebGPURenderer | THREE.WebGLRenderer | null;
 }
 
 /** Loss timestamps inside the current window.
@@ -210,7 +223,9 @@ function reportRendererLoss(api: 'WebGL' | 'WebGPU', reason?: string, message?: 
   for (const fn of lostListeners) {
     // A listener that throws must not prevent the others from rebuilding. Reported, not swallowed
     // silently: a viewport that cannot rebuild is exactly the fault worth seeing.
-    try { fn({ api, reason, message, attempt }); }
+    // `attachedRenderer` IS the renderer that died: both detection paths refuse to report for
+    // any renderer we are no longer attached to (the superseded-renderer guards).
+    try { fn({ api, reason, message, attempt, renderer: attachedRenderer }); }
     catch (e) { console.error('[activeRenderer] a renderer-lost listener threw', e); }
   }
 }

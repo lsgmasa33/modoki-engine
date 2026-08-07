@@ -29,8 +29,18 @@ import path from 'node:path';
 import { wdaBaseDir } from '../../toolchain';
 import { findXctestrun, wdaDerivedDataDir } from '../../toolchain/wdaProvision';
 
-/** One iOS device `xcodebuild` could target. `connected` = a live tunnel right now. */
-export interface IosDevice { udid: string; name: string; connected: boolean }
+/** One iOS device `xcodebuild` could target. `connected` = a live tunnel right now.
+ *
+ *  `productType`/`osVersion` exist to be compared with what the LEASED device says about itself
+ *  (#146) — see `resolveIosDevice`. Both optional: the legacy `xctrace` listing reports no model at
+ *  all, so a pre-iPhone-X device carries only a version. */
+export interface IosDevice {
+  udid: string; name: string; connected: boolean;
+  /** `hw.machine`, e.g. `iPhone18,4` — devicectl's `hardwareProperties.productType`. */
+  productType?: string;
+  /** e.g. `26.5.2`. ⚠️ devicectl reports this as of the LAST CONNECTION, so it can be stale. */
+  osVersion?: string;
+}
 
 /** Pull the PAIRED iOS devices out of `xcrun devicectl list devices --json-output`, flagging which
  *  have a live tunnel. PURE, so the selection rule is testable without a phone.
@@ -53,8 +63,8 @@ export function parseIosDevices(devicectlJson: string): IosDevice[] {
   for (const raw of devices) {
     const d = raw as {
       connectionProperties?: { tunnelState?: string };
-      hardwareProperties?: { udid?: string; platform?: string };
-      deviceProperties?: { name?: string };
+      hardwareProperties?: { udid?: string; platform?: string; productType?: string };
+      deviceProperties?: { name?: string; osVersionNumber?: string };
     };
     if (d.hardwareProperties?.platform !== 'iOS') continue;
     const udid = d.hardwareProperties?.udid;
@@ -63,6 +73,8 @@ export function parseIosDevices(devicectlJson: string): IosDevice[] {
         udid,
         name: d.deviceProperties?.name ?? udid,
         connected: d.connectionProperties?.tunnelState === 'connected',
+        ...(d.hardwareProperties?.productType ? { productType: d.hardwareProperties.productType } : {}),
+        ...(d.deviceProperties?.osVersionNumber ? { osVersion: d.deviceProperties.osVersionNumber } : {}),
       });
     }
   }
@@ -106,7 +118,7 @@ export function parseXctraceDevices(xctraceOutput: string): IosDevice[] {
     if (!inDevices || !line) continue;
     const m = /^(.*?)\s+\(([0-9]+(?:\.[0-9]+)*)\)\s+\(([0-9A-Fa-f][0-9A-Fa-f-]{7,})\)$/.exec(line);
     if (!m) continue;   // the Mac (no OS version), or a shape we do not recognise
-    out.push({ udid: m[3], name: m[1], connected });
+    out.push({ udid: m[3], name: m[1], connected, osVersion: m[2] });
   }
   return out;
 }
@@ -132,8 +144,14 @@ export const wdaLauncherExec = {
   listDevices(): string {
     const out = path.join(os.tmpdir(), `modoki-devicectl-${process.pid}.json`);
     try {
+      // stderr is PIPED, not ignored, for the same reason the launch pipes it (#144): the caller
+      // turns a throw here into "could not list iOS devices (<message>)", and with stderr
+      // discarded that message is `Command failed: xcrun devicectl …` — the command echoed back,
+      // naming nothing. devicectl's own line (no Xcode, xcrun refusing, a broken CoreDevice) is
+      // the only thing that says what to DO. stdout stays ignored: the JSON goes to a file, and
+      // the human-readable table there is exactly what must not be read (see above).
       execFileSync('xcrun', ['devicectl', 'list', 'devices', '--json-output', out], {
-        timeout: 20000, stdio: 'ignore',
+        timeout: 20000, stdio: ['ignore', 'ignore', 'pipe'],
       });
       return fs.readFileSync(out, 'utf8');
     } finally {
@@ -152,34 +170,119 @@ export const wdaLauncherExec = {
   },
 };
 
+/** What the LEASED device reports about its own hardware, for tying the launch to it (#146).
+ *  Either field may be null — see `resolveIosDevice` for what that means.
+ *
+ *  **Structurally identical to `DeviceHardware` in `deviceConnection.ts`, which produces it, and
+ *  deliberately NOT imported from there.** This module is pure — no import, so its rules are
+ *  testable without the lease manager — and one type-only import in either direction would be a
+ *  new module edge to carry two fields. The pairing is still enforced where it matters: the router
+ *  passes `deviceHardware()` straight into `lease`, so ADDING a required field here fails that
+ *  call's typecheck until the producer supplies it. (Adding one to the producer only is harmless —
+ *  this side ignores what it does not read.) */
+export interface LeaseHardware { deviceModel: string | null; osVersion: string | null }
+
+/** Does this paired device contradict / confirm / say nothing about the leased one?
+ *
+ *  **`productType` decides; `osVersion` only breaks ties.** The model is immutable and both sides
+ *  spell it identically (`hw.machine` on the phone, `hardwareProperties.productType` in devicectl),
+ *  so a disagreement there is real. A version disagreement is NOT: devicectl reports the OS as of
+ *  the device's LAST CONNECTION, so a phone that updated since would be excluded by its own
+ *  freshness — a false "wrong phone" refusal, which is worse than the guess it replaced.
+ *
+ *  A device the listing knows no model for (every pre-iPhone-X handset, which only `xctrace` can
+ *  see) is therefore always `'unknown'`: it can never be confirmed, and must never be contradicted
+ *  on version alone. */
+function leaseMatch(device: IosDevice, lease: LeaseHardware): 'confirms' | 'contradicts' | 'unknown' {
+  if (!lease.deviceModel || !device.productType) return 'unknown';
+  return device.productType === lease.deviceModel ? 'confirms' : 'contradicts';
+}
+
+/** The chosen device, plus a warning when the choice could not be tied to the lease. */
+export interface IosDeviceChoice { device: IosDevice; unverified?: string }
+
 /** Which iOS device to run WDA on, in strict precedence order:
  *
  *   1. `MODOKI_IOS_DEVICE_UDID` — explicit always wins, and a value that matches nothing is an
  *      ERROR rather than silently ignored (a typo must not fall through to "some other phone").
- *   2. The device with a live tunnel, if exactly one has one.
- *   3. The only paired device, if there is exactly one.
- *   4. Otherwise REFUSE, naming the candidates. Launching a signed agent on the wrong phone is
+ *   2. **The device the LEASE is holding**, when the phone reported hardware we can match (#146).
+ *      Exactly one match ⇒ that one, verified. No match at all, with a model to compare against,
+ *      is an ERROR: the leased phone is not among the ones this Mac can drive, so every candidate
+ *      is the wrong phone. Several matches narrow the pool and fall through.
+ *   3. The device with a live tunnel, if exactly one has one.
+ *   4. The only paired device, if there is exactly one.
+ *   5. Otherwise REFUSE, naming the candidates. Launching a signed agent on the wrong phone is
  *      surprising and slow to undo, so ambiguity is never resolved by a coin flip.
  *
- *  Step 4 is the common case on a Mac that has ever paired several iPhones — which is why the
- *  message names the env var: it is one-time config, not a bug. */
+ *  Step 5 is the common case on a Mac that has ever paired several iPhones — which is why the
+ *  message names the env var: it is one-time config, not a bug.
+ *
+ *  **Why step 2 exists.** Steps 3 and 4 pick on evidence that has NOTHING to do with the lease: an
+ *  iOS lease is a WiFi address, and the phone at that address need not be the one plugged in — so
+ *  with a single non-leased iPhone connected, step 3 would confidently start a signed 60-second
+ *  agent on it (#146). It fails safe for INPUT (the readiness probe targets the lease host, so the
+ *  stray agent never answers and the caller falls back to synthetic with the usual banner), but a
+ *  surprise agent on someone else's phone is not something to resolve by guessing.
+ *
+ *  **Steps 3-5 are still reached, and still guess** — deliberately. A bridge older than #146
+ *  reports no hardware, and refusing there would break every setup that works today until the game
+ *  on the phone is redeployed. So the guess is kept and SAID: `unverified` carries the reason, the
+ *  caller surfaces it, and the pin remains the way to make it certain. */
 export function resolveIosDevice(
-  devices: IosDevice[], env: NodeJS.ProcessEnv = process.env,
-): { device: IosDevice } | { error: string } {
+  devices: IosDevice[], env: NodeJS.ProcessEnv = process.env, lease?: LeaseHardware,
+): IosDeviceChoice | { error: string } {
   const pinned = env.MODOKI_IOS_DEVICE_UDID?.trim();
   if (pinned) {
     const hit = devices.find((d) => d.udid === pinned);
     return hit ? { device: hit } : { error: `MODOKI_IOS_DEVICE_UDID=${pinned} matches none of this Mac's paired iOS devices` };
   }
   if (devices.length === 0) return { error: 'no iOS device is paired with this Mac' };
-  const connected = devices.filter((d) => d.connected);
-  if (connected.length === 1) return { device: connected[0] };
-  if (devices.length === 1) return { device: devices[0] };
-  const pool = connected.length > 1 ? connected : devices;
+
+  let pool = devices;
+  let unverified: string | undefined;
+  if (lease?.deviceModel) {
+    const confirmed = devices.filter((d) => leaseMatch(d, lease) === 'confirms');
+    if (confirmed.length === 1) return { device: confirmed[0] };
+    if (confirmed.length === 0) {
+      const unknown = devices.filter((d) => leaseMatch(d, lease) === 'unknown');
+      if (unknown.length === 0) {
+        return {
+          error: `the leased device reports itself as ${describeLease(lease)}, which matches none of this Mac's `
+            + `paired iPhones (${devices.map((d) => `${d.name} ${d.productType ?? '?'}`).join(', ')}). `
+            + 'Refusing rather than starting a signed agent on the wrong phone — pair the leased device with this '
+            + 'Mac, or set MODOKI_IOS_DEVICE_UDID if it really is one of these.',
+        };
+      }
+      // Only devices we know nothing about are left (a pre-iPhone-X handset the modern listing
+      // cannot describe). Not a contradiction — but not a match either, so say so.
+      pool = unknown;
+      unverified = `no paired iPhone reports the leased device's model (${describeLease(lease)}), so the choice below could not be verified`;
+    } else {
+      // Several phones of the SAME model. The version is allowed to break that tie, since here it
+      // can only narrow a set that already agrees on the immutable fact.
+      const byVersion = lease.osVersion ? confirmed.filter((d) => !d.osVersion || d.osVersion === lease.osVersion) : confirmed;
+      pool = byVersion.length === 1 ? byVersion : confirmed;
+      if (pool.length === 1) return { device: pool[0] };
+      unverified = `${pool.length} paired iPhones are a ${describeLease(lease)}, so the lease cannot say which is the leased one`;
+    }
+  } else {
+    unverified = 'the device did not report its hardware (an app older than this editor), so the choice '
+      + 'below is a guess from what is plugged into this Mac, not from the lease';
+  }
+
+  const warn = unverified ? { unverified } : {};
+  const connected = pool.filter((d) => d.connected);
+  if (connected.length === 1) return { device: connected[0], ...warn };
+  if (pool.length === 1) return { device: pool[0], ...warn };
+  const ambiguous = connected.length > 1 ? connected : pool;
   return {
-    error: `cannot tell which iPhone to use — ${pool.length} are paired (${pool.map((d) => `${d.name} ${d.udid}`).join(', ')}). `
+    error: `cannot tell which iPhone to use — ${ambiguous.length} are paired (${ambiguous.map((d) => `${d.name} ${d.udid}`).join(', ')}). `
       + 'Set MODOKI_IOS_DEVICE_UDID to the one you want (one-time).',
   };
+}
+
+function describeLease(lease: LeaseHardware): string {
+  return [lease.deviceModel, lease.osVersion ? `iOS ${lease.osVersion}` : null].filter(Boolean).join(' / ');
 }
 
 // ── The running agent ─────────────────────────────────────────────────────────
@@ -191,6 +294,83 @@ let lastFailure: string | null = null;
 /** When the current launch was spawned, for the elapsed time in `launchInProgressReason`. Cleared
  *  with the child so a later launch never reports the previous one's age. */
 let launchStartedAt: number | null = null;
+/** The tail of the last launch's stderr, kept so a failure can report the REASON rather than a
+ *  guess (#144). Survives the child, since the diagnosis is wanted precisely once it has exited. */
+let stderrTail: string[] = [];
+/** Set when the launched device could NOT be tied to the lease (#146). Carried into every later
+ *  message about this launch, because "we guessed which phone" stays true for as long as the agent
+ *  runs — and a launch that then works would otherwise never mention it again. */
+let launchWarning: string | null = null;
+
+/** How much of the child's stderr to keep. Both bounds matter: a test runner can emit megabytes,
+ *  and one line of it can itself be enormous. */
+const STDERR_TAIL_LINES = 20;
+const STDERR_TAIL_LINE_CHARS = 400;
+
+/** Keep the last few stderr lines of the launch, WITHOUT streaming them.
+ *
+ *  "Do not stream a test runner's log" and "keep nothing at all" are different decisions and only
+ *  the first was intended (#144). Keeping nothing meant a launch failure could only ever be
+ *  reported as a guess — and on #143's iPhone 8 the guess ("check the build is still signed") was
+ *  simply wrong: the real cause was `Cannot test target "WebDriverAgentRunner" … Logic Testing
+ *  Unavailable`, visible only by re-running the command by hand. That is the one error path an
+ *  agent cannot investigate for itself, so whatever this message says IS the diagnosis.
+ *
+ *  Tolerates a child with no `stderr` (every injected test double, and a `stdio:'ignore'` spawn),
+ *  because losing the diagnostic must never break the launch it is describing. */
+function captureStderr(proc: ChildProcess): void {
+  stderrTail = [];
+  const stream = proc.stderr;
+  if (!stream) return;
+  let partial = '';
+  stream.setEncoding?.('utf8');
+  stream.on('data', (chunk: string) => {
+    partial += chunk;
+    const lines = partial.split('\n');
+    partial = lines.pop() ?? '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed) stderrTail.push(trimmed.slice(0, STDERR_TAIL_LINE_CHARS));
+    }
+    if (stderrTail.length > STDERR_TAIL_LINES) stderrTail = stderrTail.slice(-STDERR_TAIL_LINES);
+  });
+  stream.on('error', () => { /* the pipe died — we simply have no diagnostic */ });
+}
+
+/** The xcodebuild lines worth quoting, most specific first. Ordered rather than "last line wins"
+ *  because the tail of a failed `xcodebuild` run is usually a summary (`** TEST EXECUTE FAILED **`)
+ *  that names nothing, while the actionable line sits further up. */
+const DIAGNOSTIC_PATTERNS: RegExp[] = [
+  /^xcodebuild: error:/i,
+  /^error:/i,
+  /Cannot test target/i,
+  /Unable to find a destination|IDERunDestination|Supported platforms/i,
+  /code ?sign|provisioning profile|not registered|Developer Mode/i,
+  /DVTDevice|DVTBuildVersion|Logic Testing Unavailable/i,
+];
+
+/** What a failed `execFileSync` actually said, preferring its stderr over its message (#144).
+ *
+ *  Node's message for a non-zero exit is `Command failed: <the command>` — the command echoed
+ *  back, which the caller already knows. The tool's own line is the only part that says what to
+ *  do about it. PURE and exported so the preference is testable without shelling out. */
+export function describeExecFailure(e: unknown): string {
+  const stderr = (e as { stderr?: unknown } | null)?.stderr;
+  const text = typeof stderr === 'string' ? stderr : Buffer.isBuffer(stderr) ? stderr.toString('utf8') : '';
+  const line = pickWdaFailureLine(text.split('\n').map((l) => l.trim()).filter(Boolean));
+  if (line) return line;
+  return e instanceof Error ? e.message : String(e);
+}
+
+/** The most specific captured line, or null when nothing was captured. PURE, so the ranking is
+ *  testable without spawning anything. */
+export function pickWdaFailureLine(lines: string[]): string | null {
+  for (const pattern of DIAGNOSTIC_PATTERNS) {
+    const hit = lines.find((l) => pattern.test(l));
+    if (hit) return hit;
+  }
+  return lines.length > 0 ? lines[lines.length - 1] : null;
+}
 
 /** True when we have a live agent process we started. */
 export function isWdaProcessRunning(): boolean { return !!child && child.exitCode === null && !child.killed; }
@@ -202,6 +382,11 @@ export function stopWda(): void {
   child = null;
   launchStartedAt = null;
   lastFailure = null;
+  // The warning describes the launch we just ended; carrying it into the NEXT one would attach a
+  // stale "could not verify" caveat to a launch that may well be verified. Same reasoning as
+  // `launchStartedAt`. `stderrTail` is deliberately NOT cleared: the diagnosis is wanted after the
+  // process is gone, and `captureStderr` resets it at the next spawn anyway.
+  launchWarning = null;
 }
 
 export interface EnsureWdaRunningOpts {
@@ -210,6 +395,9 @@ export interface EnsureWdaRunningOpts {
   port: number;
   /** Poll for readiness this long before giving up and letting the caller fall back. */
   timeoutMs?: number;
+  /** What the LEASED device says its own hardware is, so the launch can be tied to that phone
+   *  rather than to whatever is plugged into this Mac (#146). Absent/null fields ⇒ unverified. */
+  lease?: LeaseHardware;
   /** Injected for tests. */
   probe?: (url: string) => Promise<boolean>;
   spawnImpl?: typeof spawn;
@@ -327,7 +515,7 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
   let listing: string;
   try { listing = (opts.listDevices ?? wdaLauncherExec.listDevices)(); }
   catch (e) {
-    lastFailure = `could not list iOS devices (${e instanceof Error ? e.message : String(e)})`;
+    lastFailure = `could not list iOS devices (${describeExecFailure(e)})`;
     return { running: false, reason: lastFailure };
   }
   // Union with the legacy listing so an iOS 16-or-older device is selectable at all (#143). Kept
@@ -342,20 +530,33 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
   // phones happen to be plugged in.
   const legacyDefault = opts.listDevices ? () => '' : wdaLauncherExec.listLegacyDevices;
   const legacy = (opts.listLegacyDevices ?? legacyDefault)();
-  const resolved = resolveIosDevice(mergeIosDevices(parseIosDevices(listing), parseXctraceDevices(legacy)));
+  const resolved = resolveIosDevice(
+    mergeIosDevices(parseIosDevices(listing), parseXctraceDevices(legacy)), process.env, opts.lease,
+  );
   if ('error' in resolved) {
     lastFailure = `cannot start WebDriverAgent — ${resolved.error}`;
     return { running: false, reason: lastFailure };
   }
+  // An unverified choice is REPORTED, not refused (#146) — see `resolveIosDevice`'s last paragraph
+  // for why. Latched onto the launch so every later message about it carries the caveat too: the
+  // agent may well come up and answer, in which case nothing else would ever mention that the
+  // phone it is running on was picked by guesswork.
+  launchWarning = resolved.unverified
+    ? `⚠️  WebDriverAgent was started on ${resolved.device.name} (${resolved.device.udid}), but ${resolved.unverified}. `
+      + 'If input is landing on the wrong phone, set MODOKI_IOS_DEVICE_UDID.'
+    : null;
+  if (launchWarning) console.warn(`[wda] ${launchWarning}`);
 
-  // Spawn detached-ish: we keep the handle so `stopWda` can end it with the lease, but its output
-  // is discarded — a test runner's log is not something an input op should stream.
+  // Spawn detached-ish: we keep the handle so `stopWda` can end it with the lease. stdout stays
+  // discarded — a test runner's log is not something an input op should stream — but stderr is
+  // PIPED into a small ring buffer so a failure can name its own cause (#144, `captureStderr`).
   const spawnFn = opts.spawnImpl ?? spawn;
   child = spawnFn('xcodebuild', [
     'test-without-building',
     '-xctestrun', xctestrun,
     '-destination', `id=${resolved.device.udid}`,
-  ], { stdio: 'ignore' });
+  ], { stdio: ['ignore', 'ignore', 'pipe'] });
+  captureStderr(child);
   child.on('exit', () => { child = null; launchStartedAt = null; });
   launchStartedAt = nowFn();
 
@@ -379,10 +580,30 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
   // indefinitely, with no backoff. Leaving it running costs nothing: it is still owned by the lease
   // and `stopWda()` on disconnect still guarantees nothing is stranded (Decision 2). A slow install
   // now gets to FINISH, and the guard above turns every later call into one bounded probe.
-  if (!child) {
-    return { running: false, reason: 'the WebDriverAgent process exited before the agent answered — check the build is still signed (Build Support → iOS), then try again' };
-  }
+  if (!child) return { running: false, reason: wdaExitedReason() };
   return { running: false, reason: launchInProgressReason(nowFn()) };
+}
+
+/** Why the launch process died, quoting xcodebuild where it said something (#144).
+ *
+ *  The signing hint is kept, but DEMOTED to what it always was — a guess — and used only when
+ *  nothing was captured. It was previously stated unconditionally as though it were the diagnosis,
+ *  and on an iOS 16 device it was actively misleading: re-signing could never have helped, and the
+ *  hour spent trying is what this function exists to prevent. */
+function wdaExitedReason(): string {
+  const line = pickWdaFailureLine(stderrTail);
+  const why = line
+    ? `the WebDriverAgent process exited before the agent answered — xcodebuild said: ${line}`
+    : 'the WebDriverAgent process exited before the agent answered, and said nothing on stderr '
+      + '— check the build is still signed (Build Support → iOS), then try again';
+  return withLaunchWarning(why);
+}
+
+/** Append the "we could not verify which phone" caveat to a reason, when there is one (#146). It
+ *  belongs on EVERY message about this launch: a failure whose real cause is "that agent went to
+ *  the other phone" is otherwise indistinguishable from one that did not. */
+function withLaunchWarning(reason: string): string {
+  return launchWarning ? `${reason}\n${launchWarning}` : reason;
 }
 
 /** The "still coming up" reason, shared by the timeout return and the already-launching guard.
@@ -394,10 +615,14 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
  *  and a message that admits no way out invites someone to invent one. */
 function launchInProgressReason(nowMs: number): string {
   const secs = launchStartedAt === null ? 0 : Math.max(0, Math.round((nowMs - launchStartedAt) / 1000));
-  return `WebDriverAgent has been starting for ${secs}s and is not answering yet — the launch is still `
+  return withLaunchWarning(
+    `WebDriverAgent has been starting for ${secs}s and is not answering yet — the launch is still `
     + 'running, so it will be picked up by a later call without starting another one. If it never '
-    + 'comes up, reconnect the device lease to start over';
+    + 'comes up, reconnect the device lease to start over',
+  );
 }
 
 /** Test seam — forget any process handle and latched failure. */
-export function _resetWdaLauncherForTests(): void { child = null; launchStartedAt = null; lastFailure = null; }
+export function _resetWdaLauncherForTests(): void {
+  child = null; launchStartedAt = null; lastFailure = null; launchWarning = null; stderrTail = [];
+}

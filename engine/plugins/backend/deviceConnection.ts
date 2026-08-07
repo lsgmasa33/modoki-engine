@@ -258,6 +258,21 @@ export interface DeviceConnectStatus {
   detail?: string;
 }
 
+/** What the leased device's own hardware reports about itself. `deviceModel` is the product type
+ *  (`hw.machine` — `iPhone18,4`), `osVersion` the system version (`26.5.2`). Null = the bridge did
+ *  not say, which is "unknown" and never a mismatch.
+ *
+ *  The CONSUMER is `LeaseHardware` in `wdaLauncher.ts`, declared separately on purpose (that module
+ *  is import-free so its selection rule stays testable in isolation) — its doc carries the full
+ *  reasoning and how the two are kept in step. Semantics live THERE, with the rule that reads them;
+ *  do not restate them here. */
+export interface DeviceHardware { deviceModel: string | null; osVersion: string | null }
+
+/** Everything one `app-identity` probe answers. */
+interface DeviceIdentity extends DeviceHardware { platform: string | null; appId: string | null }
+
+const UNKNOWN_IDENTITY: DeviceIdentity = { platform: null, appId: null, deviceModel: null, osVersion: null };
+
 export interface ConnectRequest {
   /** Device LAN IP (WiFi). Ignored when `useAdb` is true. */
   ip?: string;
@@ -278,10 +293,13 @@ export class DeviceConnectionManager {
   /** The leased app's package/bundle id, latched by the same probe as `platform` — see
    *  `deviceAppId()`. Guards the CDP route against driving a different device (#142). */
   private appId: string | null = null;
+  /** The leased device's hardware model + OS version, latched by the same probe — see
+   *  `deviceHardware()`. Ties the WDA launch to the leased phone (#146). */
+  private hardware: DeviceHardware = { deviceModel: null, osVersion: null };
   /** The bridge ANSWERED the identity probe — including answering "I have no platform" (an old
    *  bridge). Separate from `platform` so a stable null latches but a failed ASK does not. */
   private platformResolved = false;
-  private platformInFlight: Promise<{ platform: string | null; appId: string | null }> | null = null;
+  private platformInFlight: Promise<DeviceIdentity> | null = null;
   private readonly guid: string;
   private readonly stateDir: string;
 
@@ -360,6 +378,8 @@ export class DeviceConnectionManager {
     this.detail = undefined;
     this.target = null;
     this.platform = null;
+    this.appId = null;
+    this.hardware = { deviceModel: null, osVersion: null };
     this.platformResolved = false;
     this.platformInFlight = null;
     return this.status();
@@ -401,24 +421,44 @@ export class DeviceConnectionManager {
     return (await this.deviceIdentity()).appId;
   }
 
-  /** One probe, both facts. Latching rules are unchanged (see `devicePlatform`'s doc): a null is
+  /** The leased device's HARDWARE, from the same `app-identity` probe — `deviceModel` is the
+   *  product type (`iPhone18,4`) and `osVersion` the system version (`26.5.2`). Either may be null.
+   *
+   *  Exists so a WebDriverAgent launch can be tied to the phone the lease is actually holding
+   *  (#146): the device list comes from `xcrun`, which knows nothing about this lease, and with one
+   *  non-leased iPhone connected it would confidently start a signed agent on THAT phone. These two
+   *  strings are the only facts an iOS app is allowed to report that also appear in devicectl's
+   *  listing (`hardwareProperties.productType` / `deviceProperties.osVersionNumber`) — a UDID is
+   *  not, and `identifierForVendor` appears in no listing at all. See `resolveIosDevice`.
+   *
+   *  Null when the bridge is older than #146 and does not report them, which the caller must treat
+   *  as "unverified", never as a mismatch. */
+  async deviceHardware(): Promise<DeviceHardware> {
+    const { deviceModel, osVersion } = await this.deviceIdentity();
+    return { deviceModel, osVersion };
+  }
+
+  /** One probe, every fact. Latching rules are unchanged (see `devicePlatform`'s doc): a null is
    *  latched only when the bridge ANSWERED with one; a failure to ASK is transient and retried. */
-  private async deviceIdentity(): Promise<{ platform: string | null; appId: string | null }> {
-    if (this.platformResolved) return { platform: this.platform, appId: this.appId };
-    if (this.state !== 'connected') return { platform: null, appId: null };
+  private async deviceIdentity(): Promise<DeviceIdentity> {
+    if (this.platformResolved) return { platform: this.platform, appId: this.appId, ...this.hardware };
+    if (this.state !== 'connected') return UNKNOWN_IDENTITY;
     if (this.platformInFlight) return this.platformInFlight;
     this.platformInFlight = (async () => {
       try {
         const raw = await this.proxy('app-identity', {});
         // The bridge signals a failed/unknown handler by RETURNING a string, not throwing, so a
         // non-object reply is "unknown", never a platform.
-        const info = (typeof raw === 'string' ? safeJsonParse(raw) : raw) as { platform?: unknown; appId?: unknown } | null;
-        this.platform = info && typeof info.platform === 'string' && info.platform ? info.platform : null;
-        this.appId = info && typeof info.appId === 'string' && info.appId ? info.appId : null;
+        const info = (typeof raw === 'string' ? safeJsonParse(raw) : raw) as
+          { platform?: unknown; appId?: unknown; deviceModel?: unknown; osVersion?: unknown } | null;
+        const str = (v: unknown): string | null => (typeof v === 'string' && v ? v : null);
+        this.platform = str(info?.platform);
+        this.appId = str(info?.appId);
+        this.hardware = { deviceModel: str(info?.deviceModel), osVersion: str(info?.osVersion) };
         this.platformResolved = true;
-        return { platform: this.platform, appId: this.appId };
+        return { platform: this.platform, appId: this.appId, ...this.hardware };
       } catch {
-        return { platform: null, appId: null };   // could not ask (lease dropped) — deliberately NOT latched
+        return UNKNOWN_IDENTITY;   // could not ask (lease dropped) — deliberately NOT latched
       } finally {
         this.platformInFlight = null;
       }

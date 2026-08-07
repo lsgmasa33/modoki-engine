@@ -42,9 +42,10 @@ import { PARTICLE_LAYER } from '../../runtime/rendering/layers';
 import { getWorldTransform2D, getWorldTransform2DInto } from '../../runtime/rendering/renderUtils';
 import { setActiveRenderer } from '../../runtime/loaders/textureResolver';
 import {
-  noteRendererProgress, reportRendererInitFailure, clearRendererInitFailure,
+  noteRendererProgress, reportRendererInitFailure, clearRendererInitFailure, onRendererLost,
 } from '../../runtime/core/activeRenderer';
-import { acquireRenderer, releaseRenderer } from './rendererLease';
+import { createRendererRecovery } from '../../runtime/rendering/rendererRecovery';
+import { acquireRenderer, releaseRenderer, discardRenderer } from './rendererLease';
 import { drawColliderOutline, drawSkinnedMeshFlat2D, drawSkinnedMeshWireframe2D, drawWeightHeatmap2D, drawDominantBoneMap2D, computePivotOffset, COLLIDER_SPRITE } from '../../runtime/rendering/render2DUtils';
 import { getSkin2DBuffer } from '../../runtime/skinning/skin2DBuffers';
 import { getRig2D, type ParsedRig2D } from '../../runtime/loaders/rig2dCache';
@@ -4514,6 +4515,56 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     };
     }; // end setup
 
+    // ── GPU context-loss recovery (#121 P1) ────────────────────────────────────────────────
+    // Same shape as the runtime viewport (`runtime/rendering/Scene3D.tsx`): `setup()` builds
+    // everything and installs one `cleanup`, so recovery is teardown + a second `setup()`
+    // rather than re-pointing a renderer through ~2000 lines of wiring. A lost three renderer
+    // cannot be revived — see `core/activeRenderer.ts` for why this rebuilds instead.
+    //
+    // `discardRenderer` is LOAD-BEARING and not obvious. `cleanup` ends in
+    // `releaseRenderer(container)`, which defers teardown to a macrotask precisely so a
+    // StrictMode remount can re-acquire the SAME renderer. This rebuild is `cleanup(); setup();`
+    // in one task, so without the discard its `acquireRenderer` would cancel that timer and be
+    // handed the DEAD renderer straight back — recovery silently doing nothing, no error
+    // anywhere, viewport black forever. A dead renderer must never be leasable.
+    //
+    // The editor is the lower-stakes half of this phase (a human can relaunch it; a player on a
+    // phone cannot), but it is the surface where a context loss is most likely to be SEEN.
+    const teardownViewport = () => {
+      const fn = cleanup;
+      cleanup = undefined; // a failed re-setup must not leave the unmount path on a stale closure
+      fn?.();
+    };
+    const recovery = createRendererRecovery({
+      rebuild: async () => {
+        teardownViewport();
+        discardRenderer(container);
+        initedRef.current = true; // cleanup released the latch; this viewport is still live
+        await setup();
+        // RE-ARM THE DIRTY GATE — without this the rebuild completes and the viewport stays
+        // BLACK. Measured, not theorised: after a live rebuild the Scene panel rendered nothing
+        // until the camera was nudged. This surface is render-on-demand, and the gate is a
+        // component-level `useRef` created at MOUNT, so a rebuild inherits it with its grace
+        // window already decayed to 0 — every event that would normally re-arm it (scene load,
+        // world swap) belongs to a mount that already happened. The runtime viewport does not
+        // have this bug because its counter is re-initialised inside the bring-up closure.
+        // A black viewport after recovery is indistinguishable from recovery having failed.
+        gateRef.current.markDirty();
+      },
+      isDisposed: () => outerDisposed,
+      onError: (e) => console.error(
+        '[SceneView] renderer rebuild after context loss FAILED — the 3D viewport stays black. ' +
+        'Relaunch the editor once the cause below is addressed:', e,
+      ),
+    });
+    // Only OUR renderer's death is ours to act on — GameView mounts a second viewport with its
+    // own renderer, and rebuilding a healthy one costs a prewarm stall for nothing.
+    const unsubRendererLost = onRendererLost((info) => {
+      const mine = rendererRef.current;
+      if (info.renderer && mine && info.renderer !== mine) return;
+      recovery.request();
+    });
+
     // Fire-and-forget; the async body guards on `outerDisposed` after its await.
     // The `.catch` is load-bearing, not hygiene: `setup()` registers the frame callback and
     // calls startFrameDriver() at its very END, after ~2000 lines of synchronous scene/gizmo
@@ -4532,7 +4583,9 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
     return () => {
       outerDisposed = true;
-      cleanup?.();
+      unsubRendererLost();
+      recovery.dispose();
+      teardownViewport();
       initedRef.current = false;
     };
   }, []);

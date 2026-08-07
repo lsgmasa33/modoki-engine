@@ -44,6 +44,9 @@
  */
 
 import { decodeAimReply, resolveAimViaDevice, STALE_APP_REASON, type RouteOutcome } from './deviceAim';
+// TYPE-ONLY, and it must stay that way: `wdaLauncher` is loaded through a dynamic import below so
+// an iOS-free session never pays for it. A type import is erased, so this costs nothing at runtime.
+import type { LeaseHardware } from './wdaLauncher';
 
 /** The literal this module reports for input actually delivered via WebDriverAgent. Third member of
  *  the mechanism set alongside `trusted-cdp` (Android) and `synthetic` (the in-page fallback). */
@@ -176,7 +179,12 @@ let lastLaunchFailure: string | null = null;
  *  restarts it and rebinds the debug bridge's port out from under the lease. Measured — omitting it
  *  attaches without touching the foreground app. */
 export async function getDeviceWdaSession(
-  opts: { host?: string; port?: number; fetchImpl?: WdaFetch; autoLaunch?: boolean } = {},
+  opts: {
+    host?: string; port?: number; fetchImpl?: WdaFetch; autoLaunch?: boolean;
+    /** What the leased device says its own hardware is, so the lazy launch below targets THAT
+     *  phone rather than whatever is plugged into this Mac (#146). */
+    lease?: LeaseHardware;
+  } = {},
 ): Promise<WdaSession | null> {
   if (cached) return cached;
   const host = opts.host;
@@ -189,7 +197,7 @@ export async function getDeviceWdaSession(
   // it reports what is true now, and the first tap is what pays the spin-up.
   if (opts.autoLaunch) {
     const { ensureWdaRunning } = await import('./wdaLauncher');
-    const r = await ensureWdaRunning({ host, port });
+    const r = await ensureWdaRunning({ host, port, ...(opts.lease ? { lease: opts.lease } : {}) });
     if (!r.running) { lastLaunchFailure = r.reason ?? null; return null; }
     lastLaunchFailure = null;
   }
@@ -251,7 +259,9 @@ export interface WdaRouteDeps {
   proxy(method: string, params: Record<string, unknown>): Promise<unknown>;
   /** The device's LAN address, from the lease target. Absent ⇒ no WDA route (adb/USB is Android). */
   host?: string;
-  getSession?: (opts: { host?: string; autoLaunch?: boolean }) => Promise<WdaSession | null>;
+  /** The leased device's own hardware report, so a lazy launch can be tied to it (#146). */
+  lease?: LeaseHardware;
+  getSession?: (opts: { host?: string; autoLaunch?: boolean; lease?: LeaseHardware }) => Promise<WdaSession | null>;
 }
 
 /** Route ONE device-input method through WebDriverAgent. Same contract as `tryDeviceCdpInput`.
@@ -266,7 +276,7 @@ export async function tryDeviceWdaInput(method: string, params: Record<string, u
 
   const getSession = deps.getSession ?? getDeviceWdaSession;
   // autoLaunch: this IS the "first input op" Decision 1 starts the agent on.
-  const session = await getSession({ host: deps.host, autoLaunch: true });
+  const session = await getSession({ host: deps.host, autoLaunch: true, ...(deps.lease ? { lease: deps.lease } : {}) });
   if (!session) return { handled: false, reason: lastLaunchFailure ?? WDA_NOT_RUNNING_REASON };
 
   try {
@@ -353,11 +363,13 @@ export type WdaShotOutcome =
  *  screenshot that silently takes six seconds because the app crashed is a worse experience than
  *  one that says why it could not help. */
 export async function tryDeviceWdaScreenshot(
-  deps: { host?: string; getSession?: WdaRouteDeps['getSession'] },
+  deps: { host?: string; lease?: LeaseHardware; getSession?: WdaRouteDeps['getSession'] },
   opts: { autoLaunch?: boolean } = {},
 ): Promise<WdaShotOutcome> {
   const getSession = deps.getSession ?? getDeviceWdaSession;
-  const session = await getSession({ host: deps.host, autoLaunch: opts.autoLaunch ?? false });
+  const session = await getSession({
+    host: deps.host, autoLaunch: opts.autoLaunch ?? false, ...(deps.lease ? { lease: deps.lease } : {}),
+  });
   if (!session) return { handled: false, reason: lastLaunchFailure ?? WDA_SHOT_NO_SESSION_REASON };
   try {
     const base64 = await session.screenshot();

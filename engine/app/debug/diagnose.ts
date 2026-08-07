@@ -10,7 +10,7 @@
 import {
   getAllEntities, getAllTraits, readTraitData, readTraitDataFull,
   REF_FIELDS_BY_TRAIT, isGuid, isExternalUrl, isInternalAssetPath, resolveGuidToPath,
-  getDeviceCaps, getDeviceCapsSync, readPerfProfile,
+  getDeviceCaps, getDeviceCapsSync, readPerfProfile, getActiveQualityTier,
 } from '@modoki/engine/runtime';
 import { computeLayoutBounds } from './layoutDump';
 
@@ -110,9 +110,17 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
   // time, not only once something has already gone wrong.
   const perf = readPerfProfile();
 
+  // ── Quality tier (#121 P3) ──
+  // The tier AND why it was chosen. Without the reason a surprising tier is unexplainable
+  // without an eval: "low" could mean the project pinned it, the device failed calibration, or
+  // the player picked it, and those want completely different responses. Omitted entirely until
+  // a renderer has resolved one, matching the healthy-means-silent convention above.
+  const tier = getActiveQualityTier();
+
   return {
     ok,
     ...(deviceCaps ? { deviceCaps } : {}),
+    ...(tier ? { qualityTier: tier } : {}),
     perf,
     refs: { issues: refIssues, count: refIssues.length },
     transforms: { nan, zeroScale },

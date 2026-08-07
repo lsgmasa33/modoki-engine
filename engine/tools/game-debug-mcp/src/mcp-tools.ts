@@ -432,10 +432,22 @@ export function registerTools(server: McpServer) {
       // the shared port — so it predates this handler and cannot answer. Swallowing that left
       // device_status silent in the exact scenario the probe exists for. An old bridge on the
       // socket is itself the strongest available signal that it is not the app you just launched.
+      // WHICH PHONE, reported as its own line (#146). Kept separate from the app line on purpose
+      // (conventions §2, one name one meaning): that line answers "which app holds this socket",
+      // this one answers "which handset is it running on" — a wrong-device session and a wrong-app
+      // session are different failures with different fixes, and merging them would hide that.
+      //
+      // It is the same string the host compares against `xcrun devicectl` to decide where to launch
+      // WebDriverAgent, so showing it turns "the agent went to the wrong phone" from an inference
+      // into a one-call read. Absent for a bridge/plugin older than #146 — omitted rather than
+      // guessed, since "could not look" is never reported as an answer (§5).
+      let deviceLine: string | null = null;
       let appLine: string | null = null;
       if (status.state === 'connected') {
         try {
-          const info = parseReply<{ platform?: string; appId?: string; appName?: string }>(await deviceRequest('app-identity'));
+          const info = parseReply<{
+            platform?: string; appId?: string; appName?: string; deviceModel?: string; osVersion?: string;
+          }>(await deviceRequest('app-identity'));
           if (isDeviceError(info)) {
             appLine = 'App: UNKNOWN — the app holding this socket runs a debug bridge that predates '
               + '#88, so it cannot report its identity. That is itself a warning: a stale backgrounded '
@@ -445,9 +457,15 @@ export function registerTools(server: McpServer) {
             const label = info.appName ? `${info.appName} (${info.appId})` : info.appId;
             appLine = `App: ${label}${info.platform ? ` [${info.platform}]` : ''} — reported by the device holding the socket.`;
           }
+          if (!isDeviceError(info) && info && typeof info.deviceModel === 'string' && info.deviceModel) {
+            const os = typeof info.osVersion === 'string' && info.osVersion ? ` / ${info.osVersion}` : '';
+            deviceLine = `Device: ${info.deviceModel}${os} — the hardware this lease is holding, `
+              + 'self-reported over the lease. On iOS this is what selects the phone a WebDriverAgent '
+              + 'launch targets (it matches `xcrun devicectl`\'s productType).';
+          }
         } catch { /* older bridge without app-identity, or the lease dropped mid-probe */ }
       }
-      const text = [lease, backendIdentityLine, appLine, fidelity].filter(Boolean).join('\n');
+      const text = [lease, backendIdentityLine, appLine, deviceLine, fidelity].filter(Boolean).join('\n');
       return { content: [{ type: 'text' as const, text }] };
     } catch (e) {
       return caughtFailure('device_status', 'read the Modoki device lease state', e);

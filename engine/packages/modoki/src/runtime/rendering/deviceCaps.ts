@@ -79,7 +79,7 @@ export interface DeviceCaps {
 let cached: DeviceCaps | null = null;
 let pending: Promise<DeviceCaps> | null = null;
 
-/** Read the Capacitor global rather than importing `@capacitor/core` / `@capacitor/device`.
+/** Read the Capacitor global rather than importing `@capacitor/core`.
  *
  *  Deliberate, and it matches the debug menu's `DeviceTab`: this module ships inside every
  *  game, and the published demos are **web-only**. A hard import would make a native plugin a
@@ -90,14 +90,33 @@ function readPlatform(): string {
   try { return cap?.getPlatform?.() ?? 'web'; } catch { return 'web'; }
 }
 
-/** Hardware model via the Capacitor Device plugin global. Resolves `undefined` when the plugin
- *  is absent (web, or a native build that never installed it) — never throws, never rejects. */
+/** Hardware model via the **debug-bridge** plugin global. Resolves `undefined` when it is absent
+ *  (web) — never throws, never rejects.
+ *
+ *  **It read `@capacitor/device` until #146's close-out swept for that pattern, and that made the
+ *  iOS half of the tier allowlist DEAD IN PRODUCTION.** No Modoki project installs that plugin
+ *  (checked across all 22 games + demos: not a dependency, no `CapacitorDevice` in any iOS
+ *  `Package.swift`), so this resolved `undefined` on every real device — and per the module header
+ *  above, `deviceModel` is the ONLY usable discriminator on iOS, because the GPU string is masked
+ *  to `Apple GPU`. So `qualityTier`'s `TIER_ALLOWLIST.iosModels` branch could never fire on any
+ *  phone. It failed the safe way (fall through to the fallback tiering) which is exactly why it
+ *  went unnoticed.
+ *
+ *  `GameDebug` is the right source for the same reason it was for the lease (#146): it is present
+ *  in every build that can be debugged, whereas `@capacitor/device` is optional and universally
+ *  absent. Read off the GLOBAL rather than imported — this module ships inside every game,
+ *  including the web-only published demos, where a hard import would make a native plugin a
+ *  build-time requirement. Same pattern as `DeviceTab.tsx`.
+ *
+ *  ⚠️ A build older than #146 has no `getDeviceHardware`, so Capacitor rejects and this stays
+ *  `undefined` — i.e. the allowlist keeps not firing until the game is redeployed. That is the
+ *  pre-existing behaviour, not a regression. */
 async function readDeviceModel(): Promise<string | undefined> {
-  const dev = (globalThis as unknown as {
-    Capacitor?: { Plugins?: { Device?: { getInfo?: () => Promise<{ model?: string }> } } };
-  }).Capacitor?.Plugins?.Device;
-  if (!dev?.getInfo) return undefined;
-  try { return (await dev.getInfo())?.model || undefined; } catch { return undefined; }
+  const dbg = (globalThis as unknown as {
+    Capacitor?: { Plugins?: { GameDebug?: { getDeviceHardware?: () => Promise<{ model?: string }> } } };
+  }).Capacitor?.Plugins?.GameDebug;
+  if (!dbg?.getDeviceHardware) return undefined;
+  try { return (await dbg.getDeviceHardware())?.model || undefined; } catch { return undefined; }
 }
 
 /** GL-side facts: renderer string, max texture size, compressed-format support.

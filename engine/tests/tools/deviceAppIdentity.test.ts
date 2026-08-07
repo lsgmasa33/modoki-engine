@@ -18,9 +18,13 @@
  *  hardware — and that is a Capacitor guarantee, not ours. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { readFileSync, readdirSync } from 'node:fs';
+import path from 'node:path';
 
 const getInfo = vi.fn();
 vi.mock('@capacitor/app', () => ({ App: { getInfo: () => getInfo() } }));
+const getDeviceHardware = vi.fn();
+vi.mock('capacitor-game-debug', () => ({ GameDebug: { getDeviceHardware: () => getDeviceHardware() } }));
 
 const { handleAppIdentity } = await import('../../app/debug/bridge');
 
@@ -51,5 +55,89 @@ describe('handleAppIdentity', () => {
     expect(info.appId).toBe('');
     expect(info.appName).toBe('');
     expect(typeof info.platform).toBe('string'); // still reports the platform it DID know
+  });
+});
+
+/** The hardware half (#146). These two strings are how the HOST tells which of its paired iPhones
+ *  the lease is holding — the phone's `hw.machine` against devicectl's `productType` — so the
+ *  handler failing to report them is a silent regression: the launcher simply falls back to
+ *  guessing from what is plugged into the Mac, exactly as before the fix.
+ *
+ *  **It is read from `capacitor-game-debug`, and that source is the point.** The first version read
+ *  `Capacitor.Plugins.Device` (`@capacitor/device`) — which NO Modoki project installs, so it
+ *  returned nothing on every real device and the whole mechanism was inert while these tests
+ *  passed against a mocked global. Mocking proves the handler asks; it cannot prove the thing it
+ *  asks is there. Hence the guard below, which is about presence rather than behaviour. */
+describe('handleAppIdentity — the leased device\'s hardware', () => {
+  beforeEach(() => {
+    getInfo.mockResolvedValue({ id: 'com.modokiengine.court', name: 'Court' });
+    getDeviceHardware.mockReset();
+  });
+
+  it('reports the model and OS version the debug plugin gives it', async () => {
+    // The shape from an iPhone Air: `model` is `hw.machine`, byte-identical to what devicectl
+    // calls `hardwareProperties.productType`. That identity is the whole mechanism.
+    getDeviceHardware.mockResolvedValue({ model: 'iPhone18,4', osVersion: '26.5.2' });
+
+    const info = await handleAppIdentity();
+
+    expect(info.deviceModel).toBe('iPhone18,4');
+    expect(info.osVersion).toBe('26.5.2');
+  });
+
+  it('omits them when the plugin answers empty — never invents a model', async () => {
+    // The web stub, and any platform that cannot read its own hardware. A fabricated model would
+    // be worse than none: the host would refuse the launch as "wrong phone" on evidence nobody
+    // produced, which is a confident wrong answer (conventions §0).
+    getDeviceHardware.mockResolvedValue({ model: '', osVersion: '' });
+
+    const info = await handleAppIdentity();
+
+    expect(info.deviceModel).toBeUndefined();
+    expect(info.osVersion).toBeUndefined();
+    expect(info.appId).toBe('com.modokiengine.court');   // and the rest of the answer survives
+  });
+
+  it('survives a plugin OLDER than #146, which has no such method', async () => {
+    // Capacitor rejects an unknown method rather than returning undefined. Every installed app is
+    // in this state until it is redeployed, so this is the common case for a while, not an edge.
+    getDeviceHardware.mockRejectedValue(new Error('getDeviceHardware is not implemented on ios'));
+
+    const info = await handleAppIdentity();
+
+    expect(info.deviceModel).toBeUndefined();
+    expect(info.appId).toBe('com.modokiengine.court');
+  });
+});
+
+/** The presence guard the mocked tests structurally cannot be: `capacitor-game-debug` ships in
+ *  every leasable build, `@capacitor/device` ships in none. Reading source rather than behaviour is
+ *  the only way to assert WHICH plugin is asked, since a mock answers either name happily. */
+describe('the hardware probe reads a plugin that is actually present (#146)', () => {
+  it('asks capacitor-game-debug, never @capacitor/device', () => {
+    const src = readFileSync(path.join(__dirname, '../../app/debug/bridge.ts'), 'utf8');
+    const fn = src.slice(src.indexOf('async function readDeviceHardware'));
+    const body = fn.slice(0, fn.indexOf('\n}'));
+    expect(body).toContain("import('capacitor-game-debug')");
+    // The original bug, pinned by name: `@capacitor/device` is optional and no project installs it.
+    expect(body).not.toMatch(/Plugins\?\.Device|@capacitor\/device/);
+  });
+
+  it('no Modoki project depends on @capacitor/device — the reason the first version was inert', () => {
+    // If this ever fails, someone added the dependency to a project and the reasoning above needs
+    // revisiting — not the code. Asserting the FACT keeps the comment honest.
+    const withDevicePlugin: string[] = [];
+    for (const root of ['games', 'demos']) {
+      const dir = path.join(__dirname, '../../../', root);
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        try {
+          const pkg = JSON.parse(readFileSync(path.join(dir, entry.name, 'package.json'), 'utf8'));
+          const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+          if ('@capacitor/device' in deps) withDevicePlugin.push(`${root}/${entry.name}`);
+        } catch { /* no package.json — not a workspace project */ }
+      }
+    }
+    expect(withDevicePlugin).toEqual([]);
   });
 });

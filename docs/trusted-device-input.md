@@ -98,8 +98,81 @@ build, the per-machine signing, and the expiry rule.
 - **Torn down with the lease** — one lease owns both channels, so there is exactly one answer to
   "who holds this device", and disconnecting can never strand a signed agent on the phone. Losing WDA
   **degrades input; it does not drop the lease** — screenshots and Percept reads keep working.
-- **One-time config on a Mac with several paired iPhones**: set `MODOKI_IOS_DEVICE_UDID`. Auto-launch
-  refuses to guess which phone to run a signed agent on.
+- **A launch failure QUOTES xcodebuild rather than guessing** (#144). The child's stdout is still
+  discarded — a test runner's log is not something an input op should stream — but its **stderr**
+  is piped into a 20-line ring buffer, and on a non-zero exit the most specific line is what the
+  caller is told (`xcodebuild: error: …`, `Cannot test target …`, and the signing/provisioning
+  lines, ranked; see `pickWdaFailureLine`). The old message stated *"check the build is still
+  signed (Build Support → iOS)"* unconditionally, as though it were the diagnosis — and on the
+  iPhone 8 it was simply wrong: re-signing could never have helped, and the hour spent trying is
+  what this buys back. The hint survives only as the fallback for when nothing was captured.
+  "Do not stream the log" and "keep nothing at all" were always different decisions; only the first
+  was intended. This is the one error path an agent cannot investigate for itself — it cannot
+  re-run `xcodebuild` and read the output — so whatever this message says *is* the diagnosis.
+
+  The **device listing** had the same defect one call earlier and was fixed with it: `listDevices`
+  ran devicectl with stderr discarded, so a failure surfaced as *"could not list iOS devices
+  (Command failed: xcrun devicectl …)"* — the command echoed back, naming nothing. `describeExecFailure`
+  now prefers the tool's own line over Node's `Command failed:` message. Found by sweeping the
+  pattern rather than the reported symptom; a grep for `stdio: 'ignore'` across `engine/` returns
+  those two plus existence-probes and `pkill`s, where there is genuinely no output to want.
+- **The launch is tied to the LEASED phone, not to what is plugged into this Mac** (#146). The
+  device list comes from `xcrun`, which knows nothing about the lease, so `resolveIosDevice` takes
+  the leased device's own hardware report (`DeviceConnectionManager.deviceHardware()`) and matches
+  it against the listing **between** the env pin and the connected-tunnel heuristic.
+
+  Without it, the sole-live-tunnel rule picked a phone on evidence with no relation to the lease:
+  an iOS lease is a WiFi address, and the phone at that address need not be the one on the cable —
+  so with one non-leased iPhone connected, the editor would confidently start a signed 60-second
+  agent on **that** phone. Milder than #142's cross-device *input*: the readiness probe targets the
+  lease host, so the stray agent never answers and the caller falls back to synthetic with the
+  usual banner. The cost is a surprise agent on someone else's phone and a launch failure that
+  names nothing about the mismatch.
+
+  **What is compared, and why those two fields.** iOS forbids an app reading its own hardware UDID,
+  and `identifierForVendor` appears in no `xcrun` listing — so no id the phone can see is
+  comparable with anything the Mac knows. Two strings are: `hw.machine` is byte-identical to
+  devicectl's `hardwareProperties.productType` (`iPhone18,4`), and the system version matches
+  `deviceProperties.osVersionNumber`. **The model decides; the version only
+  breaks ties** — devicectl reports the OS as of the device's *last connection*, so a phone that
+  has updated since would otherwise be excluded by its own freshness and the launch would refuse
+  as "wrong phone". A device the listing knows no model for (every pre-iPhone-X handset, visible
+  only to `xctrace`, which reports no model) is therefore always "unknown": never confirmed, never
+  contradicted.
+
+  Also measured and rejected: correlating the lease IP with devicectl's `potentialHostnames` over
+  mDNS (`Masaki-iPhone-Air.coredevice.local`). Those records exist only while a CoreDevice tunnel
+  is up — `ENOTFOUND` after a 5s timeout per name against every phone paired with this Mac.
+
+  **The phone reports it through `capacitor-game-debug`'s `getDeviceHardware`, and WHICH PLUGIN is
+  load-bearing.** The first version of this fix read `@capacitor/device` via `Capacitor.Plugins.Device`,
+  following `deviceCaps.ts`'s precedent — and was **inert on every real device**: that plugin is
+  optional and **no Modoki project installs it** (checked across all 22 games + demos: no
+  dependency, no `CapacitorDevice` in any iOS `Package.swift`). The probe returned nothing, the
+  lease reported `null`, and the launcher silently fell through to the guess it was written to
+  replace, with the entire unit suite green. The lesson generalises past this bug: **a fact the
+  lease needs belongs in the lease's own plugin.** `capacitor-game-debug` is present by
+  construction — #146 only matters while a device holds a lease, and holding one requires that
+  plugin — whereas anything optional is a fact you *hope* is there. Mocks cannot catch this class:
+  they answer to whichever plugin name the code asks for. `deviceAppIdentity.test.ts` therefore
+  carries two source-level guards — that the probe imports `capacitor-game-debug`, and that no
+  project has picked up `@capacitor/device` (which would quietly invalidate the reasoning).
+
+  Android reports the same shape (`Build.MODEL` / `Build.VERSION.RELEASE`) for **parity**
+  ([mcp-tool-conventions.md](mcp-tool-conventions.md) §9), not because anything launches there —
+  `device_status` names the hardware on both platforms rather than leaving one surface silent.
+
+  **An unverifiable choice guesses and SAYS SO, rather than refusing.** An app older than #146
+  reports no hardware, and refusing there would break every setup that works today until the game
+  on the phone is redeployed. So the old heuristic still runs, `resolveIosDevice` returns an
+  `unverified` reason with the device, and that reason is logged at launch **and appended to every
+  later message about that launch** — a failure whose real cause is "the agent went to the other
+  phone" is otherwise indistinguishable from one that did not. A **contradiction** is different and
+  is refused outright: if the lease names a model no paired iPhone has, every candidate is the
+  wrong phone.
+- **One-time config on a Mac with several paired iPhones**: set `MODOKI_IOS_DEVICE_UDID`. It
+  outranks everything, including the lease match — an explicit human decision is not second-guessed
+  by a heuristic. Needed less often since #146, which resolves the common case from the lease.
 - **iOS-ONLY, and gated on it** — the route is only attempted when the lease's device actually
   reports `platform: 'ios'` (`DeviceConnectionManager.devicePlatform()`, asked once per lease via
   the bridge's `app-identity` op and cached).
@@ -152,6 +225,10 @@ build, the per-machine signing, and the expiry rule.
   ```
   Cannot test target "WebDriverAgentRunner" on "iPhone8": Logic Testing Unavailable
   ```
+
+  That line is now what the editor actually reports (#144). At the time it was found it was
+  visible only by re-running the command by hand — the launcher discarded the child's output and
+  reported a guess about signing instead, which is a large part of why this took as long as it did.
 
   `xcodebuild -showdestinations` omits it for EVERY scheme in the WDA project while listing four
   iOS-26 phones — **two of which are disconnected** — so destination eligibility tracks OS

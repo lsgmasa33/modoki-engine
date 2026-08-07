@@ -86,33 +86,56 @@ describe('deviceCaps — identity', () => {
     expect((await getDeviceCaps()).platform).toBe('ios');
   });
 
-  it('reads deviceModel from the Device plugin — the iOS tier key', async () => {
+  // ⚠️ These three asserted a read from `Plugins.Device` (`@capacitor/device`) until #146's
+  // close-out. The old expectation was WRONG, and wrong in the way that is hardest to see: the
+  // suite was green while the behaviour was DEAD IN PRODUCTION. No Modoki project installs that
+  // plugin — not a dependency in any of the 22 games + demos, no `CapacitorDevice` in any iOS
+  // `Package.swift` — so `deviceModel` was `undefined` on every real device, and since the module
+  // header explains it is the ONLY usable iOS discriminator (the GPU string is masked to
+  // `Apple GPU`), `qualityTier`'s `TIER_ALLOWLIST.iosModels` branch could never fire on any phone.
+  // A mock answers to whichever plugin name the code asks for, which is precisely why mocking
+  // could not catch it and why the presence guard below exists.
+  it('reads deviceModel from the DEBUG BRIDGE plugin — the iOS tier key', async () => {
     (globalThis as { Capacitor?: unknown }).Capacitor = {
       getPlatform: () => 'ios',
-      Plugins: { Device: { getInfo: () => Promise.resolve({ model: 'iPhone10,1' }) } },
+      Plugins: { GameDebug: { getDeviceHardware: () => Promise.resolve({ model: 'iPhone10,1' }) } },
     };
     stubCanvas(makeGl());
     const { getDeviceCaps } = await load();
     expect((await getDeviceCaps()).deviceModel).toBe('iPhone10,1');
   });
 
-  it('leaves deviceModel undefined when the Device plugin is absent — the web-build case', async () => {
+  it('leaves deviceModel undefined when the plugin is absent — the web-build case', async () => {
     // Published demos are web-only, so this is the NORMAL path for them on iOS, not an error.
     stubCanvas(makeGl());
     const { getDeviceCaps } = await load();
     expect((await getDeviceCaps()).deviceModel).toBeUndefined();
   });
 
-  it('survives a Device plugin whose getInfo rejects', async () => {
+  it('survives a plugin whose getDeviceHardware rejects — including one older than #146', async () => {
+    // Capacitor rejects an unknown native method, so every build predating #146 lands here.
     (globalThis as { Capacitor?: unknown }).Capacitor = {
       getPlatform: () => 'android',
-      Plugins: { Device: { getInfo: () => Promise.reject(new Error('no bridge')) } },
+      Plugins: { GameDebug: { getDeviceHardware: () => Promise.reject(new Error('not implemented')) } },
     };
     stubCanvas(makeGl());
     const { getDeviceCaps } = await load();
     const caps = await getDeviceCaps();
     expect(caps.deviceModel).toBeUndefined();
     expect(caps.platform).toBe('android');
+  });
+
+  it('does NOT read @capacitor/device — the plugin no project installs (#146 close-out)', async () => {
+    // The regression this pair of bugs shares: a plugin that is merely PLAUSIBLE rather than
+    // present. Asserting the negative because the positive test above cannot — a mock supplied
+    // under either name would satisfy it.
+    (globalThis as { Capacitor?: unknown }).Capacitor = {
+      getPlatform: () => 'ios',
+      Plugins: { Device: { getInfo: () => Promise.resolve({ model: 'iPhone-should-not-be-read' }) } },
+    };
+    stubCanvas(makeGl());
+    const { getDeviceCaps } = await load();
+    expect((await getDeviceCaps()).deviceModel).toBeUndefined();
   });
 
   it('reads the unmasked GPU renderer — the Android tier key', async () => {

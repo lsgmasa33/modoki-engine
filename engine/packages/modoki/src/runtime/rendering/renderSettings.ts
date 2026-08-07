@@ -23,12 +23,20 @@
  *  backend, free canvas sizing. */
 
 import * as THREE from 'three';
+import {
+  DEFAULT_TIER_SETTING, applyTierToThree,
+  type QualityTier, type QualityTierSetting, type TierResolution,
+} from './qualityTier';
 
 export interface ThreeRenderSettings {
   backend: 'auto' | 'webgpu' | 'webgl';
   antialias: boolean;
   pixelRatioCap: number;
   shadows: boolean;
+  /** Quality tier (#121 P3). `'auto'` delegates to the allowlist + on-device calibration;
+   *  `'low'`/`'high'` pin it. Defaults to `DEFAULT_TIER_SETTING` (`'high'` — today's behaviour),
+   *  so wiring the tier up changes nothing until a project opts in. See `qualityTier.ts`. */
+  qualityTier: QualityTierSetting;
   /** 'ACESFilmic' | 'AgX' | 'Neutral' | 'Linear' | 'None' */
   toneMapping: string;
   exposure: number;
@@ -70,6 +78,7 @@ const DEFAULTS: Readonly<RenderSettings> = Object.freeze({
     antialias: true,
     pixelRatioCap: 2,
     shadows: true,
+    qualityTier: DEFAULT_TIER_SETTING,
     toneMapping: 'ACESFilmic',
     exposure: 1.2,
   },
@@ -104,6 +113,46 @@ export function getRenderSettings(): RenderSettings {
 /** Reset to hardcoded defaults — for test isolation. */
 export function resetRenderSettings(): void {
   settings = cloneDefaults();
+  activeTier = null;
+}
+
+// ── Active quality tier (#121 P3) ──────────────────────────────────────────────────────────
+// The RESOLVED tier lives here, beside the settings it modifies, for one reason: every consumer
+// must read the tier-adjusted value from the SAME place. `pixelRatioCap` in particular is read
+// twice — once by `makeWebGPURenderer` when it allocates the first drawing buffer, and again by
+// Scene3D's ResizeObserver on every resize. If one applied the tier and the other read the raw
+// setting, the first resize would silently undo the tier. That is exactly the
+// code-shadows-the-source-of-truth failure this repo warns about, so there is one accessor and
+// both call it.
+
+let activeTier: TierResolution | null = null;
+
+/** Publish the resolved tier. Called once at renderer bring-up, and again by the calibration
+ *  loop on a promote/demote (P3b). */
+export function setActiveQualityTier(res: TierResolution | null): void {
+  activeTier = res;
+}
+
+/** The resolved tier + WHY, or null before a renderer has brought one up. Surfaced in
+ *  `diagnose` so a surprising tier is explainable without an eval. */
+export function getActiveQualityTier(): TierResolution | null {
+  return activeTier;
+}
+
+/** The project's three settings with the active tier applied — what every renderer-side
+ *  consumer should read instead of `getRenderSettings().three`.
+ *
+ *  Falls back to the raw settings when no tier has been resolved yet, so a call before bring-up
+ *  behaves exactly as it did before tiers existed. */
+export function getEffectiveThreeSettings(): ThreeRenderSettings {
+  const three = settings.three;
+  return activeTier ? applyTierToThree(three, activeTier.tier) : three;
+}
+
+/** The tier a caller should assume when none has been resolved. Keeps "no tier yet" from
+ *  meaning "no ceiling" at the `Light.shadowMapSize` call site. */
+export function getActiveTierOrDefault(): QualityTier {
+  return activeTier?.tier ?? 'high';
 }
 
 /** Map a tone-mapping name to the THREE constant. Unknown → ACESFilmic. */

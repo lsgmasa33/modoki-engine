@@ -331,4 +331,33 @@ describe('DeviceConnectionManager.devicePlatform — what latches and what does 
       await device.close();
     }
   });
+
+  it('carries the device HARDWARE on the SAME probe, and forgets it on disconnect (#146)', async () => {
+    // The launcher uses these to tie a WebDriverAgent launch to the leased phone rather than to
+    // whatever is plugged into this Mac. Two properties matter, and both are silent when broken:
+    // it must cost no extra round trip (this sits on the input hot path), and it must NOT survive
+    // a disconnect — a stale model would make the next lease's launch refuse as "wrong phone".
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority);
+    const mgr = new DeviceConnectionManager('guid-plat-4', stateDir);
+    const proxy = vi.spyOn(mgr, 'proxy')
+      .mockResolvedValue({ platform: 'ios', appId: 'a', appName: 'b', deviceModel: 'iPhone18,4', osVersion: '26.5.2' });
+    try {
+      await mgr.connect({ ip: '127.0.0.1', port: device.port });
+      expect(await mgr.deviceHardware()).toEqual({ deviceModel: 'iPhone18,4', osVersion: '26.5.2' });
+      expect(await mgr.devicePlatform()).toBe('ios');
+      expect(proxy).toHaveBeenCalledTimes(1);   // one probe answers everything
+
+      await mgr.disconnect();
+      // An app older than #146 answers without them — "unknown", which the launcher treats as
+      // unverified, never as a mismatch.
+      proxy.mockResolvedValue({ platform: 'ios', appId: 'a', appName: 'b' });
+      await mgr.connect({ ip: '127.0.0.1', port: device.port });
+      expect(await mgr.deviceHardware()).toEqual({ deviceModel: null, osVersion: null });
+    } finally {
+      proxy.mockRestore();
+      await mgr.disconnect();
+      await device.close();
+    }
+  });
 });

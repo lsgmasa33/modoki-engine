@@ -122,6 +122,16 @@ one-call check for this that used to take a logcat hunt. **If a device answer lo
 `device_status` first; failing that, check `adb shell ps -A | grep modoki` and force-stop the
 others.**
 
+`device_status` also names **which HANDSET** the lease is holding, on its own line —
+`Device: iPhone18,4 / 26.5.2 — the hardware this lease is holding` — from
+`capacitor-game-debug`'s `getDeviceHardware` (#146). Kept separate from the app line deliberately
+([mcp-tool-conventions.md](mcp-tool-conventions.md) §2): a wrong-**app** session and a
+wrong-**device** session are different failures with different fixes. On iOS it is the same string
+that decides which phone a WebDriverAgent launch targets (it matches `xcrun devicectl`'s
+`productType`), so a wrong-phone launch becomes a one-call read instead of an inference — see
+[trusted-device-input.md](trusted-device-input.md). Absent for a build older than #146: omitted
+rather than guessed, since "could not look" is never reported as an answer (§5).
+
 Two limits on that check, both measured on the Samsung 2026-08-02 — know them before you trust it:
 
 - **The squatter is usually the app that CANNOT answer.** Whichever app won the port is by

@@ -37,7 +37,12 @@ import {
   getCachedEnvironment, acquireEnvironment, onModelInvalidated, getMeshAsset,
 } from '../loaders/meshTemplateCache';
 import { getRiggedModel, ensureRiggedModelLoaded } from '../loaders/riggedModelCache';
-import { getRenderSettings, resolveToneMapping } from './renderSettings';
+import {
+  getRenderSettings, resolveToneMapping, getEffectiveThreeSettings,
+  getActiveQualityTier, setActiveQualityTier, getActiveTierOrDefault,
+} from './renderSettings';
+import { resolveTier, tierShadowMapSize, type QualityTierSetting } from './qualityTier';
+import { getDeviceCaps } from './deviceCaps';
 import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
 import { resolveAnimSetParams, ANIMSET_DEFAULTS, getAnimSet } from '../loaders/animSetCache';
 import { clone as cloneSkeleton, retargetClip } from 'three/examples/jsm/utils/SkeletonUtils.js';
@@ -613,7 +618,10 @@ function configureLightShadow(
   light: { shadowMapSize: number; shadowCameraSize: number; shadowBias: number; shadowNormalBias: number; shadowRadius: number },
 ): void {
   const s = l.shadow;
-  const size = light.shadowMapSize || 2048;
+  // Clamp to the tier's ceiling (#121 P3). `Light.shadowMapSize` is a per-light trait field with
+  // no global cap, so without this a tier could say "shadows, but smaller" and nothing would
+  // enforce it — a scene authoring 2048 across 150 casters would ignore the tier entirely.
+  const size = tierShadowMapSize(light.shadowMapSize || 2048, getActiveTierOrDefault());
   if (s.mapSize.width !== size || s.mapSize.height !== size) {
     s.mapSize.set(size, size);
     if (s.map) { s.map.dispose(); (s as unknown as { map: unknown }).map = null; }
@@ -3024,6 +3032,35 @@ export function applyRendererColorConfig(r: {
   r.outputColorSpace = THREE.SRGBColorSpace;
 }
 
+/** Resolve the quality tier once, before the first drawing buffer is allocated (#121 P3).
+ *
+ *  Idempotent: a second viewport (the editor mounts SceneView + GameView) reuses the resolution
+ *  rather than re-probing, so both surfaces are guaranteed the same tier.
+ *
+ *  The device probe is only awaited for `'auto'`. A pinned `'low'`/`'high'` — which includes the
+ *  default — resolves synchronously from the setting alone, so the common path pays nothing for a
+ *  capability probe it would ignore. */
+async function resolveActiveTier(setting: QualityTierSetting): Promise<void> {
+  if (getActiveQualityTier()) return;
+  if (setting !== 'auto') {
+    setActiveQualityTier(resolveTier({ platform: '', projectSetting: setting }));
+    return;
+  }
+  let caps: Awaited<ReturnType<typeof getDeviceCaps>> | null = null;
+  try {
+    caps = await getDeviceCaps();
+  } catch {
+    // A probe failure must not block rendering. resolveTier with no facts falls through to
+    // "unrecognised device → start low", which is the safe direction (see its doc).
+  }
+  setActiveQualityTier(resolveTier({
+    platform: caps?.platform ?? '',
+    deviceModel: caps?.deviceModel,
+    gpuRenderer: caps?.gpuRenderer,
+    projectSetting: setting,
+  }));
+}
+
 export interface MakeRendererOptions {
   /** Honour the shipped web build's `rendering.web.sizeMode` when sizing the FIRST
    *  buffer. Opt-in per surface — exactly like `Canvas2DMount`'s prop of the same
@@ -3041,7 +3078,10 @@ export async function makeWebGPURenderer(
   const { getWebGPUSupported } = await import('./gpuDetect');
   const webgpuSupported = await getWebGPUSupported();
   const settings = getRenderSettings();
-  const three = settings.three;
+  await resolveActiveTier(settings.three.qualityTier);
+  // Tier-ADJUSTED, not raw: this is where the first drawing buffer is allocated, and Scene3D's
+  // ResizeObserver reads the same accessor on every later resize so the two cannot disagree.
+  const three = getEffectiveThreeSettings();
   // Backend selection: 'webgl' forces the WebGL2 backend outright; 'webgpu'/'auto'
   // use native WebGPU when the device supports it, else fall back to WebGL2. (Both
   // run the same TSL/node pipeline — see the createRenderer doc comment.)
