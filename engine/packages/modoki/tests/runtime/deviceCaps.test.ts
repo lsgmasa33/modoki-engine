@@ -76,6 +76,86 @@ afterEach(() => {
   delete (globalThis as { Capacitor?: unknown }).Capacitor;
 });
 
+/** Set/clear the browser-side desktop signals `readFormFactor` consults. jsdom supplies neither
+ *  `userAgentData` nor a real `matchMedia`, so both are installed explicitly per test. */
+function stubHostSignals(opts: { uaMobile?: boolean; finePointer?: boolean; touchPoints?: number }) {
+  if (opts.uaMobile === undefined) {
+    delete (navigator as unknown as { userAgentData?: unknown }).userAgentData;
+  } else {
+    Object.defineProperty(navigator, 'userAgentData', {
+      value: { mobile: opts.uaMobile }, configurable: true,
+    });
+  }
+  Object.defineProperty(navigator, 'maxTouchPoints', {
+    value: opts.touchPoints ?? 0, configurable: true,
+  });
+  vi.stubGlobal('matchMedia', (q: string) => ({ matches: q.includes('pointer: fine') && opts.finePointer === true }));
+}
+
+/** #155 — the ONE carve-out from "unrecognised device launches low", so the cost of getting it
+ *  wrong is asymmetric: a desktop called mobile boots low and calibration promotes it, while a
+ *  phone called desktop boots high and can lose its context before demotion fires. Every case
+ *  that is not a POSITIVE desktop answer must therefore come back 'mobile'. */
+describe('deviceCaps — formFactor', () => {
+  afterEach(() => {
+    delete (navigator as unknown as { userAgentData?: unknown }).userAgentData;
+    vi.unstubAllGlobals();
+  });
+
+  for (const platform of ['ios', 'android']) {
+    it(`calls a native ${platform} build mobile whatever the browser signals say`, async () => {
+      (globalThis as { Capacitor?: unknown }).Capacitor = { getPlatform: () => platform };
+      stubHostSignals({ uaMobile: false, finePointer: true }); // would read desktop on web
+      stubCanvas(makeGl());
+      const { getDeviceCaps } = await load();
+      expect((await getDeviceCaps()).formFactor).toBe('mobile');
+    });
+  }
+
+  it('believes userAgentData.mobile === false — the browser telling us, not an inference', async () => {
+    stubHostSignals({ uaMobile: false });
+    stubCanvas(makeGl());
+    const { getDeviceCaps } = await load();
+    expect((await getDeviceCaps()).formFactor).toBe('desktop');
+  });
+
+  it('believes userAgentData.mobile === true even with a fine pointer', async () => {
+    stubHostSignals({ uaMobile: true, finePointer: true });
+    stubCanvas(makeGl());
+    const { getDeviceCaps } = await load();
+    expect((await getDeviceCaps()).formFactor).toBe('mobile');
+  });
+
+  it('falls back to fine-pointer AND no-touch where userAgentData is absent (Safari/Firefox)', async () => {
+    stubHostSignals({ finePointer: true, touchPoints: 0 });
+    stubCanvas(makeGl());
+    const { getDeviceCaps } = await load();
+    expect((await getDeviceCaps()).formFactor).toBe('desktop');
+  });
+
+  it('calls a TOUCHSCREEN laptop mobile — strict on purpose, calibration promotes it', async () => {
+    stubHostSignals({ finePointer: true, touchPoints: 5 });
+    stubCanvas(makeGl());
+    const { getDeviceCaps } = await load();
+    expect((await getDeviceCaps()).formFactor).toBe('mobile');
+  });
+
+  it('calls a coarse-pointer web host mobile — this is the phone-browser case the demos ship to', async () => {
+    stubHostSignals({ finePointer: false, touchPoints: 5 });
+    stubCanvas(makeGl());
+    const { getDeviceCaps } = await load();
+    expect((await getDeviceCaps()).formFactor).toBe('mobile');
+  });
+
+  it('lands on mobile when a signal THROWS rather than taking the game down', async () => {
+    stubHostSignals({});
+    vi.stubGlobal('matchMedia', () => { throw new Error('blocked'); });
+    stubCanvas(makeGl());
+    const { getDeviceCaps } = await load();
+    expect((await getDeviceCaps()).formFactor).toBe('mobile');
+  });
+});
+
 describe('deviceCaps — identity', () => {
   it('reports platform web when no Capacitor global exists', async () => {
     stubCanvas(makeGl());

@@ -129,8 +129,11 @@ manual equivalent.
 The editor build path **resolves (and, in a packaged editor, downloads) its toolchain
 automatically** — Node, the JDK 21, and the Android SDK — and preflight-gates a build on the tools
 it needs, pointing you at **Build → Build Support…** to install anything missing. It exports
-`JAVA_HOME`/`ANDROID_HOME` from that shared, version-strict detection, so you don't set them by hand
-the way the manual CLI recipes below do. Full detail: [editor-toolchain.md](./editor-toolchain.md).
+`JAVA_HOME`/`ANDROID_HOME` from that shared, version-strict detection. **The CLI recipes below reach
+the SAME resolution** via `eval "$(node engine/scripts/print-toolchain-env.mjs)"` — that script
+bundles and calls `engine/toolchain`'s own `detect()` rather than probing for itself, because a
+second probe is precisely what this module was consolidated to remove (#159). Full detail:
+[editor-toolchain.md](./editor-toolchain.md).
 
 ## Assets the build cannot see — why an asset ref never belongs in code
 
@@ -529,7 +532,8 @@ succeeded unchanged once the demand was dropped.
 ```bash
 MODOKI_PROJECT=games/<id> npm run build -- --target native
 (cd games/<id> && npx cap sync android)
-JAVA_HOME=$(/usr/libexec/java_home -v 21) games/<id>/android/gradlew -p games/<id>/android assembleDebug
+eval "$(node engine/scripts/print-toolchain-env.mjs)"   # JAVA_HOME + ANDROID_HOME, resolved as the editor does
+games/<id>/android/gradlew -p games/<id>/android assembleDebug
 adb install games/<id>/android/app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n <appId>/.MainActivity
 ```
@@ -656,8 +660,13 @@ newly-scaffolded project silently ships API 24 and the floor drifts per-project 
 
 ## Android build notes
 
-- Requires **JDK 21** (Capacitor 8 / AGP). Set `JAVA_HOME=$(/usr/libexec/java_home -v 21)` before
-  Gradle commands.
+- Requires **JDK 21** (Capacitor 8 / AGP) — get it, and `ANDROID_HOME`, from
+  `eval "$(node engine/scripts/print-toolchain-env.mjs)"`, which resolves through the same
+  version-strict `detect()` the editor build uses (provisioned toolchain first).
+  ⚠️ **Do NOT use `$(/usr/libexec/java_home -v 21)`** — it does not fail when no SYSTEM JDK 21 is
+  registered, it returns the newest one it knows. Measured on this Mac: it answered with **25.0.3**
+  while the provisioned Temurin 21 sat unused, and Gradle died with `Unsupported class file major
+  version 69`, which reads as an AGP bug rather than a wrong-Java one (#159).
 - Stock Gradle heap is `-Xmx1536m`; raise it (e.g. `-Xmx4096m`) only when a game bundles the 12
   AppLovin mediation adapters — none do yet.
 - Device must show as `device` (not `unauthorized`) in `adb devices`.

@@ -142,7 +142,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     flexWrap: node.flexWrap as any,
     justifyContent: node.justifyContent,
     alignItems: node.alignItems,
-    gap: node.gap || undefined,
+    gap: node.gap ? cssVal(node.gap, node.gapUnit) : undefined,
     flexGrow: node.flexGrow,
     flexShrink: node.flexShrink,
     width: cssVal(node.width, node.widthUnit),
@@ -304,6 +304,29 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // inherits none and the user can't scroll (the scrollbar even ignores drags).
   if (node.overflow === 'scroll') style.pointerEvents = 'auto';
 
+  // The author's explicit "this element is decoration — let taps through to what is behind it".
+  // LAST on purpose, so it wins over both rules above: the container default (`auto`, so events
+  // reach children) and the scroll force (`auto`, so the box can be scrolled). Those are defaults
+  // inferred from structure; this is a statement of intent, and inference must not outrank it.
+  //
+  // ⚠️ It does NOT disarm the children — CSS `pointer-events: none` on a parent leaves a child
+  // that sets `auto` fully clickable, which is the entire point: a decorative panel that still
+  // holds a working button. The cursor is cleared with it, so nothing paints a finger over an
+  // element that will not receive the click.
+  //
+  // ⚠️ Opting a `scroll` container into this gives up SCROLLING it (that is what the line above
+  // was for) — correct only when the box is sized never to overflow.
+  //
+  // ⚠️ NOT in the editor's click-to-select mode. `onSelectEntity` deliberately makes every element
+  // clickable so it can be SELECTED (see the branch above), and that is authoring, not gameplay —
+  // an element the game must not receive taps on is still one the author has to be able to pick in
+  // the viewport. Ungated, this made a decorative container selectable only from the hierarchy
+  // panel, which is exactly the element type the field exists for (Court's narration band).
+  if (node.pointerThrough && !onSelectEntity) {
+    style.pointerEvents = 'none';
+    style.cursor = undefined;
+  }
+
   // Editor 2D-only layer: strip UI visuals but keep layout, so nested Canvas2D
   // canvases still mount and position while the UI layer is hidden. The canvas
   // itself renders regardless (its own pointerEvents stay 'auto').
@@ -387,7 +410,9 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         />
       );
     }
-    style.pointerEvents = 'auto';
+    // `!node.pointerThrough` because this line runs AFTER the pointerThrough block and would
+    // otherwise silently undo it — the field would read as supported on an input and do nothing.
+    if (!node.pointerThrough) style.pointerEvents = 'auto';
     return (
       <input
         style={style}
@@ -419,7 +444,8 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       ? Number(storeState[node.binding.inputBinding] ?? node.rangeMin)
       : node.rangeMin;
     const sliderValue = Number.isFinite(rawValue) ? rawValue : node.rangeMin;
-    style.pointerEvents = 'auto';
+    // Same reason as the input above: this would silently undo `pointerThrough`.
+    if (!node.pointerThrough) style.pointerEvents = 'auto';
     style.accentColor = hexToColor(node.textColor);
     if (onSelectEntity) {
       return (

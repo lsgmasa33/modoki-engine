@@ -4552,9 +4552,13 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         gateRef.current.markDirty();
       },
       isDisposed: () => outerDisposed,
-      onError: (e) => console.error(
-        '[SceneView] renderer rebuild after context loss FAILED — the 3D viewport stays black. ' +
-        'Relaunch the editor once the cause below is addressed:', e,
+      // `description` first, then the raw value — see the twin in Scene3D.tsx for why both.
+      onError: (e, { description, attempt, willRetry }) => console.error(
+        `[SceneView] renderer rebuild after context loss FAILED (attempt ${attempt}) — ` +
+        (willRetry
+          ? 'retrying after a backoff:'
+          : 'giving up; the 3D viewport stays black. Relaunch the editor once the cause below is addressed:'),
+        description, e,
       ),
     });
     // Only OUR renderer's death is ours to act on — GameView mounts a second viewport with its

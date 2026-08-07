@@ -76,6 +76,20 @@ export interface DeviceCaps {
   deviceMemory?: number;
   /** **Reporting only, never a tier input** — does not discriminate. */
   hardwareConcurrency?: number;
+  /** Desktop-class host, or a handheld? **A tier input** (#155) — the ONE case where the
+   *  low-by-default rule must not apply, because the failure it guards against (a mobile GPU
+   *  losing its context under a desktop-grade load) is not a thing desktops do.
+   *
+   *  ⚠️ **`platform` cannot answer this and it is the trap here.** `platform` is Capacitor's, so
+   *  a PHONE BROWSER reports `'web'` exactly like a desktop does — and the demos publish
+   *  **web-only**, so "web means desktop" would put every phone that opens a demo back on the
+   *  tier this issue exists to stop. That is the demos' entire iOS audience.
+   *
+   *  So this answers on a POSITIVE desktop signal only, and defaults to `'mobile'` when it
+   *  cannot tell. The asymmetry is the same one `resolveTier` is built on: a desktop wrongly
+   *  called mobile boots low and calibration promotes it seconds later, while a phone wrongly
+   *  called desktop boots high and can lose its context before demotion ever fires. */
+  formFactor: 'mobile' | 'desktop';
 }
 
 let cached: DeviceCaps | null = null;
@@ -90,6 +104,29 @@ let pending: Promise<DeviceCaps> | null = null;
 function readPlatform(): string {
   const cap = (globalThis as unknown as { Capacitor?: { getPlatform?: () => string } }).Capacitor;
   try { return cap?.getPlatform?.() ?? 'web'; } catch { return 'web'; }
+}
+
+/** Desktop-class host? See `DeviceCaps.formFactor` for why this is not `platform`.
+ *
+ *  Ordered by how much each signal actually knows, and every branch that is not a POSITIVE
+ *  desktop answer falls through to `'mobile'`:
+ *  1. A native iOS/Android build is a handheld, full stop.
+ *  2. `userAgentData.mobile` is the browser TELLING us (Chromium, incl. Electron) — believed in
+ *     both directions because it is an answer, not an inference.
+ *  3. Otherwise (Safari, Firefox — no `userAgentData`): a fine pointer AND no touch points. A
+ *     touchscreen laptop fails this and boots low; calibration promotes it. That is the cheap
+ *     side of the error, which is why the test is written to be strict rather than clever. */
+function readFormFactor(platform: string): 'mobile' | 'desktop' {
+  if (platform === 'ios' || platform === 'android') return 'mobile';
+  try {
+    const uaData = (navigator as unknown as { userAgentData?: { mobile?: boolean } }).userAgentData;
+    if (typeof uaData?.mobile === 'boolean') return uaData.mobile ? 'mobile' : 'desktop';
+    const finePointer = globalThis.matchMedia?.('(pointer: fine)').matches === true;
+    const noTouch = (navigator.maxTouchPoints ?? 0) === 0;
+    return finePointer && noTouch ? 'desktop' : 'mobile';
+  } catch {
+    return 'mobile'; // cannot tell → the safe side
+  }
 }
 
 /** Hardware model via the **debug-bridge** plugin global. Resolves `undefined` when it is absent
@@ -192,8 +229,10 @@ export function getDeviceCaps(): Promise<DeviceCaps> {
         getWebGPUSupported().catch(() => false),
         readDeviceModel(),
       ]);
+      const platform = readPlatform();
       cached = {
-        platform: readPlatform(),
+        platform,
+        formFactor: readFormFactor(platform),
         webgpu,
         backend: readBackend(),
         deviceModel,

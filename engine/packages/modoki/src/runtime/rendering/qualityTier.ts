@@ -17,14 +17,27 @@
  *  the correct state until a real iPhone 8 and Galaxy A23 5G have been measured. Everything
  *  still works: every device simply calibrates.
  *
- *  ── WHY `auto` IS NOT YET THE DEFAULT ─────────────────────────────────────────────────────
- *  `resolveTier` starts an unknown device at `low` (booting high and guessing wrong is a lost
- *  context and a permanent black screen; booting low and guessing wrong is a beat of uglier
- *  rendering — see `core/activeRenderer`). With an EMPTY allowlist that means `auto` would put
- *  every device on `low`, including desktops, which would visibly downgrade every existing game
- *  and demo. So `DEFAULT_TIER_SETTING` stays `'high'` — today's behaviour — and `auto` is
- *  opt-in until P5 has calibrated on real hardware. **This default is a placeholder, not a
- *  decision**; flipping it is part of closing P5. */
+ *  ── `auto` IS THE DEFAULT, AND UNRECOGNISED MEANS `low` (#155) ────────────────────────────
+ *  Owner decision, 2026-08-07: **a game launches in low-end spec unless the device is
+ *  allowlisted.** `resolveTier` always started an unknown device at `low`; nothing supplied
+ *  `auto`, because `DEFAULT_TIER_SETTING` was pinned `'high'` as an explicit placeholder.
+ *
+ *  What the placeholder cost, measured on a Huawei Y6 2019 (#156): booting `'high'` gave one
+ *  `submit-postfx` of **6388 ms**, the GPU watchdog killed the WebGL context, and recovery
+ *  failed — blank for the process lifetime. The SAME device holds 27–33 fps under `auto`, which
+ *  resolves `low` and drops the post-FX stack. That is the whole distance between "runs" and
+ *  "bricked", and it is the asymmetry this resolver was designed around: booting high and
+ *  guessing wrong is a lost context and a permanent black screen; booting low and guessing wrong
+ *  is a beat of uglier rendering (see `core/activeRenderer`).
+ *
+ *  **Desktops are the one carve-out**, and they are identified by `formFactor`, NOT by platform
+ *  — see `DeviceCaps.formFactor` for why `platform === 'web'` cannot mean "desktop" (a phone
+ *  browser says exactly that, and the demos publish web-only). A desktop keeps today's `high`;
+ *  everything else starts low and measures. The editor's own viewports are desktop by this test,
+ *  so authoring is unaffected.
+ *
+ *  Note what this does NOT claim: that `low` is right for every phone. It claims only that
+ *  starting low is the recoverable mistake. Calibration promotes anything with the headroom. */
 
 import { BUDGET_30FPS_MS, type FrameProfile } from '../core/frameProfiler';
 
@@ -32,11 +45,11 @@ export type QualityTier = 'low' | 'high';
 /** What a PROJECT may ask for. `'auto'` delegates to the allowlist + calibration. */
 export type QualityTierSetting = 'auto' | QualityTier;
 
-/** See "WHY `auto` IS NOT YET THE DEFAULT". Placeholder pending P5 calibration. */
-export const DEFAULT_TIER_SETTING: QualityTierSetting = 'high';
+/** See "`auto` IS THE DEFAULT". A project may still pin `'low'`/`'high'` to opt out. */
+export const DEFAULT_TIER_SETTING: QualityTierSetting = 'auto';
 
 /** How a tier was arrived at — reported so a surprising tier is explainable without an eval. */
-export type TierSource = 'player' | 'project' | 'allowlist' | 'calibrating' | 'measured';
+export type TierSource = 'player' | 'project' | 'allowlist' | 'desktop' | 'calibrating' | 'measured';
 
 export interface TierResolution {
   tier: QualityTier;
@@ -112,9 +125,9 @@ export interface TierClampableThree {
  *  A TIER CLAMPS, IT DOES NOT REPLACE. `high` must be exactly today's behaviour, so a project
  *  that deliberately authored `pixelRatioCap: 1` or `shadows: false` keeps it — being on the high
  *  tier is not a reason to start doing MORE work than the project asked for. Only `low` can take
- *  things away. (This is also what makes wiring the tier up a no-op for every existing game until
- *  it opts in: with `DEFAULT_TIER_SETTING = 'high'`, clamping against `high`'s preset — the same
- *  values as the engine defaults — changes nothing.)
+ *  things away. (`high` clamps against the same values as the engine defaults, so it changes
+ *  nothing — which is what keeps the desktop carve-out and any allowlisted device on exactly
+ *  today's behaviour. Before #155 that was true of every device, because the default was `high`.)
  *
  *  Returns a NEW object; the caller's settings are never mutated. */
 export function applyTierToThree<T extends TierClampableThree>(three: T, tier: QualityTier): T {
@@ -152,6 +165,9 @@ export interface TierResolveInput {
   playerChoice?: QualityTier | null;
   /** The project's `rendering.three.qualityTier`. */
   projectSetting?: QualityTierSetting;
+  /** Desktop-class host, or a handheld? Absent = treat as a handheld, which is the safe side
+   *  (see `DeviceCaps.formFactor`). A probe that failed therefore lands on `low`, not `high`. */
+  formFactor?: 'mobile' | 'desktop';
 }
 
 /** Decide the starting tier. Pure.
@@ -176,6 +192,15 @@ export function resolveTier(input: TierResolveInput): TierResolution {
   if (input.gpuRenderer
       && TIER_ALLOWLIST.androidGpuPatterns.some((re) => re.test(input.gpuRenderer!))) {
     return { tier: 'high', source: 'allowlist', reason: `${input.gpuRenderer} is allowlisted` };
+  }
+
+  // The one carve-out (#155). A desktop is not the hardware this guard exists for: the failure
+  // it prevents is a mobile GPU losing its context under a desktop-grade load. Identified by
+  // `formFactor` and NEVER by `platform` — a phone browser reports `platform: 'web'` exactly
+  // like a desktop does, and the demos publish web-only, so keying on platform would hand the
+  // demos' whole mobile-web audience the tier that bricked the Y6.
+  if (input.formFactor === 'desktop') {
+    return { tier: 'high', source: 'desktop', reason: 'desktop-class host — not the hardware the low default guards' };
   }
 
   // Unknown hardware: start conservative and let measurement promote. Booting high and being

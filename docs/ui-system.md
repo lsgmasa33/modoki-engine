@@ -35,10 +35,18 @@ element-type properties. There is no separate "label" vs "panel" vs "button" tra
 Field groups (representative fields, verified against `UIElement.ts`):
 
 - **Layout** — `width`/`height` (+ `widthUnit`/`heightUnit`, `'px' | '%'`, `0` = auto),
-  `flexDirection`, `flexWrap`, `justifyContent`, `alignItems`, `gap`, `flexGrow`,
+  `flexDirection`, `flexWrap`, `justifyContent`, `alignItems`, `gap` + `gapUnit`, `flexGrow`,
   `flexShrink`, per-edge `padding*`/`margin*` (each with its own `*Unit`),
   `minWidth`/`maxWidth`/`minHeight`/`maxHeight`, `alignSelf`, `zIndex`, `overflow`
-  (`visible | hidden | scroll`), `isVisible`.
+  (`visible | hidden | scroll`), `isVisible`, `pointerThrough` (see below).
+
+  ⚠️ **Match `gapUnit` to the unit the CHILDREN are sized in.** `gap` was px-only until
+  2026-08-07, and a `flexWrap: 'wrap'` container whose items scale (`vh`/`vmin`/`%`) while its
+  gaps do not has a viewport size below which an item silently reflows onto the next row — the
+  items shrink, the gaps do not, and eventually one stops fitting. It is silent because nothing
+  is wrong with the data: Court's 5x5 attack reference (five 5vh cells, four 4px gaps, a 29.6vh
+  row) needed 98.95px of a 98.26px row on a short window and drew 4-wide by 7 rows deep. Mixed
+  units are only safe where the row COUNT carries no meaning.
 - **Style (box visuals)** — `backgroundColor` (packed hex int, `0` = transparent),
   `backgroundOpacity`, `borderRadius`, `borderWidth`, `borderColor`, `borderOpacity`
   (border color alpha, folded into the `borderColor` picker), `opacity`.
@@ -213,6 +221,35 @@ It looks deliberate and correct, and editing that field to `50%` would change no
 The container is `position: absolute; inset: 0; pointerEvents: none` — only interactive
 leaves (buttons, inputs, scroll containers) re-enable `pointerEvents`, so the UI never
 blocks the 3D/2D canvases underneath.
+
+#### `pointerThrough` — the escape hatch those rules cannot express
+
+The rules above are inferred from STRUCTURE: an element with a click binding is interactive, a
+LEAF with none is transparent, and a **container stays `auto` because it must pass events to its
+children**. `overflow: 'scroll'` separately forces `auto` so the box can be scrolled.
+
+That leaves one shape unrepresentable: **a decorative container drawn over something that must
+stay tappable.** `UIElement.pointerThrough` is the author's explicit "let taps through to what is
+behind me". It is applied last, so it outranks both inferences — inference must not beat a
+statement of intent.
+
+- It does **not** disarm children. CSS `pointer-events: none` on a parent leaves a child that sets
+  `auto` fully clickable, which is the entire point: a decorative panel that still holds a working
+  button.
+- It is **ignored in the editor's click-to-select mode** (`onSelectEntity`). Selecting an element
+  in the viewport is authoring, not gameplay — an element the game must not receive taps on is
+  still one the author has to be able to pick.
+- On an `overflow: 'scroll'` box it gives up **scrolling** (that is what the force was for), so it
+  is correct only when the box is sized never to overflow.
+- A child `Canvas2D` re-enables `auto` on its own mount, so a `pointerThrough` container wrapping
+  one still delivers taps to the canvas. That is the "children keep their own" rule, not an
+  exception to it.
+
+Worked example — Court's narration band: a panel holding a Skip button, drawn above a full-screen
+tap-catcher. Being a container (and a `scroll` one) it swallowed every tap meant for the catcher;
+putting the catcher on top instead buried Skip inside the band's stacking context and made it
+silently unclickable. Neither ordering works, because the two controls need opposite answers —
+`pointerThrough` is what breaks the tie.
 
 `UINode` (`runtime/ui/UINode.tsx`) translates one `UINodeData` into a styled DOM
 element, applying the trait fields in order (layout → box style → image → text →

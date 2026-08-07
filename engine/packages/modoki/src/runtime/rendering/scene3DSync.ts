@@ -2884,10 +2884,33 @@ export function clearOwnedMaterials() {
 
 // ── Shader prewarm ──────────────────────────────────────
 
-/** Build a throwaway THREE.Scene containing placeholder meshes for every
- *  Renderable3D + Renderable3DPrimitive in the given world, and run
- *  renderer.compileAsync against it. This compiles all shader programs the
- *  new scene will need BEFORE the world swap, eliminating first-frame stutter.
+/** Build a throwaway THREE.Scene containing placeholder meshes for every DISTINCT
+ *  (mesh, material) pair among the world's Renderable3D + Renderable3DPrimitive
+ *  entities, and run renderer.compileAsync against it. This compiles all shader
+ *  programs the new scene will need BEFORE the world swap, eliminating
+ *  first-frame stutter.
+ *
+ *  **One placeholder per PAIR, not per entity** (#154 P4a). Deduping is sound because
+ *  both refs resolve deterministically: the same (mesh, material) pair always yields
+ *  the same geometry + material object, hence the same program. Size/colour are
+ *  deliberately NOT part of the key — they are uniforms, and a primitive's size
+ *  changes vertex VALUES, not the attribute layout the program is built from.
+ *
+ *  ⚠️ **This is a redundant-work cleanup, NOT the fix for the boot stall — measured.**
+ *  It looked like the fix: `compileAsync` walks its render list object-by-object, and a
+ *  warm sweep on the Y6 2019 read a clean ~65 ms per DISTINCT object (1→51 objects,
+ *  181→3548 ms). But an A/B/A in one app run on a Galaxy A23 (SC-56C), toggling the
+ *  dedupe between scene reloads, put 33 placeholders at 1326/1131/1174/1182 ms against
+ *  14 at 920/1132/1326/1226 ms — **no difference outside the noise**. The warm sweep
+ *  varied distinct programs; deduping only removes DUPLICATES, and a duplicate is
+ *  already nearly free. What the stall actually is: **cold shader compilation**,
+ *  ~1.2 s per distinct program on the Y6 (postfx-demo's 14 distinct pairs = **16.5 s**
+ *  of boot prewarm there, against 2.9 s on the A23). Cutting the object count cannot
+ *  touch that; cutting the number of distinct MATERIALS would.
+ *
+ *  What this still buys: 19 fewer render-list objects and, for postfx-demo, 18 skipped
+ *  `createPrimitiveMesh` calls — each of which mints a geometry + material only to
+ *  dispose it below. Keep it for that; do not credit it with a framerate or boot win.
  *
  *  The geometries + materials come from the world-independent mesh/material
  *  caches (already populated by SceneManager's resource acquire), so no
@@ -2905,6 +2928,11 @@ export async function prewarmShadersForWorld(
   // GLB template geometries/materials are shared and must NOT be disposed.
   const primitiveMeshes: THREE.Mesh[] = [];
   const prewarmLights: THREE.Light[] = [];
+
+  // Distinct (mesh, material) pairs already placed — see the header note. Prefixed
+  // per renderer kind so a GLB mesh ref can never collide with a primitive keyword.
+  const seenPairs = new Set<string>();
+  const skip = (k: string) => { if (seenPairs.has(k)) return true; seenPairs.add(k); return false; };
 
   // Mirror the staging world's Environment so compileAsync produces the correct
   // PBR shader variant (with envMap sampling). Without this, the first real
@@ -2930,6 +2958,7 @@ export async function prewarmShadersForWorld(
 
   world.query(Renderable3D).updateEach(([rend]: [{ isVisible: boolean; mesh: string; material: string }]) => {
     if (!rend.isVisible || !rend.mesh) return;
+    if (skip(`g|${rend.mesh}|${rend.material}`)) return;
     const template = resolveMeshTemplate(rend.mesh);
     if (!template) return;
     const material = resolveMaterialForMesh(rend.material, rend.mesh) || template.material;
@@ -2940,6 +2969,7 @@ export async function prewarmShadersForWorld(
 
   world.query(Renderable3DPrimitive).updateEach(([rend]: [{ isVisible: boolean; mesh: string; size: number; color: number; material: string }]) => {
     if (!rend.isVisible) return;
+    if (skip(`p|${rend.mesh}|${rend.material}`)) return;
     const obj = createPrimitiveMesh(rend.mesh, rend.size, rend.color);
     if (obj) {
       // Apply .mat.json override if set (mirrors runtime sync behaviour)
@@ -3038,15 +3068,24 @@ export function applyRendererColorConfig(r: {
  *  Idempotent: a second viewport (the editor mounts SceneView + GameView) reuses the resolution
  *  rather than re-probing, so both surfaces are guaranteed the same tier.
  *
- *  The device probe is only awaited for `'auto'`. A pinned `'low'`/`'high'` — which includes the
- *  default — resolves synchronously from the setting alone, so the common path pays nothing for a
- *  capability probe it would ignore. */
+ *  The device probe is only awaited for `'auto'`. A pinned `'low'`/`'high'` resolves synchronously
+ *  from the setting alone, so it pays nothing for a capability probe it would ignore.
+ *
+ *  ⚠️ Since #155 made `'auto'` the DEFAULT, the probe is on the common path rather than the opt-in
+ *  one — an unpinned project now awaits `getDeviceCaps()` before the first drawing buffer. That is
+ *  the cost of deciding the tier before a buffer is allocated, and it cannot be deferred: the
+ *  knobs the tier clamps (`antialias` especially) are baked into the buffer at creation. */
 async function resolveActiveTier(setting: QualityTierSetting): Promise<void> {
   if (getActiveQualityTier()) return;
   // The player's stored choice outranks everything, including a pinned project setting — see
   // playerQualityTier.ts. Read before the early-out so a pin cannot hide it.
   const playerChoice = getPlayerQualityTier();
   if (playerChoice || setting !== 'auto') {
+    // No caps, and that is SOUND HERE — unlike the identical-looking call in playerQualityTier.ts,
+    // which was a bug (#155). This branch runs only when a player choice or a project pin exists,
+    // and both are decided by `resolveTier` BEFORE it ever consults `formFactor`/`gpuRenderer`. So
+    // the facts omitted here cannot change the answer. Add a resolver branch above those two and
+    // this becomes wrong — feed it `getDeviceCapsSync()` then.
     setActiveQualityTier(resolveTier({ platform: '', playerChoice, projectSetting: setting }));
     return;
   }
@@ -3062,6 +3101,8 @@ async function resolveActiveTier(setting: QualityTierSetting): Promise<void> {
     playerChoice,
     deviceModel: caps?.deviceModel,
     gpuRenderer: caps?.gpuRenderer,
+    // Absent on a failed probe, which resolveTier reads as "handheld" — the safe side.
+    formFactor: caps?.formFactor,
     projectSetting: setting,
   }));
 }

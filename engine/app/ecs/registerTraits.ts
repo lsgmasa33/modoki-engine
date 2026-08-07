@@ -877,6 +877,7 @@ export function registerAllTraits() {
       alignSelf: { type: 'enum', options: ['auto', 'flex-start', 'center', 'flex-end', 'stretch'], tooltip: 'Override parent alignItems for this element', ...S('Layout') },
       overflow: { type: 'enum', options: ['visible', 'hidden', 'scroll'], tooltip: 'What happens when children exceed bounds.\nvisible = no clipping, hidden = clip, scroll = scrollbar', ...S('Layout') },
       zIndex: { type: 'number', step: 1, tooltip: 'Stacking order among siblings', ...S('Layout') },
+      pointerThrough: { type: 'boolean', tooltip: 'Never take the pointer — taps fall through to whatever is BEHIND this element.\nChildren keep their own (a button inside stays clickable).\nFor a decorative container drawn over something that must stay tappable.\nNOTE: on an overflow:scroll box this gives up scrolling it.', ...S('Layout') },
 
       // ── Child Layout section (Unity LayoutGroup — arranges THIS element's children) ──
       // Container-level flexbox. Independent of this element's own anchor, so it
@@ -885,7 +886,8 @@ export function registerAllTraits() {
       flexDirection: { type: 'enum', options: ['row', 'column'], tooltip: 'Layout direction for children.\nrow = horizontal, column = vertical', ...S('Child Layout', { sectionDivider: true }) },
       justifyContent: { type: 'enum', options: ['flex-start', 'center', 'flex-end', 'space-between', 'space-around'], tooltip: 'How children are distributed along the main axis', ...S('Child Layout') },
       alignItems: { type: 'enum', options: ['flex-start', 'center', 'flex-end', 'stretch'], tooltip: 'How children are aligned on the cross axis', ...S('Child Layout') },
-      gap: { type: 'number', step: 1, tooltip: 'Space (px) between children', ...S('Child Layout') },
+      gap: { type: 'number', step: 1, tooltip: 'Space between children', ...S('Child Layout') },
+      gapUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for gap.\nMatch it to the CHILDREN\u2019s unit: scaling items with px gaps reflow at small sizes.', ...S('Child Layout') },
 
       // ── Padding section (collapsed by default) ──
       paddingTop: { type: 'number', step: 1, tooltip: 'Inner spacing top', ...S('Padding', { sectionDefaultOpen: false }) },

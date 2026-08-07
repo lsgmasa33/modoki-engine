@@ -19,6 +19,14 @@ export const UIElement = trait({
   justifyContent: 'flex-start' as 'flex-start' | 'center' | 'flex-end' | 'space-between' | 'space-around',
   alignItems: 'stretch' as 'flex-start' | 'center' | 'flex-end' | 'stretch',
   gap: 0,
+  /** Unit for `gap`. Defaults to 'px', which is what gap silently WAS before this existed.
+   *
+   *  ⚠️ Every other length on this trait carries a unit; gap did not, and a wrap-based grid whose
+   *  items scale (vh/%) while its gaps do not has a viewport size below which an item silently
+   *  reflows onto the next row. Court's 5x5 attack reference did exactly that: 5 cells of 5vh plus
+   *  4 gaps of 4px needed 98.95px of a 98.26px row once the window got short enough, so it drew as
+   *  4-wide and 7 rows deep. Nothing was wrong with the data — only with mixing the two units. */
+  gapUnit: 'px' as UILengthUnit,
   flexGrow: 0,
   flexShrink: 1,
   paddingTop: 0,
@@ -49,6 +57,24 @@ export const UIElement = trait({
   zIndex: 0,
   overflow: 'visible' as 'visible' | 'hidden' | 'scroll',
   isVisible: true,
+  /**
+   * Never take the pointer: taps fall through to whatever is BEHIND this element, while its
+   * children keep whatever they had (CSS `pointer-events: none` on a parent does not disarm a
+   * child that sets `auto`).
+   *
+   * Default false = the renderer decides, which is the pre-existing behaviour and the right one
+   * almost always: an element with a click binding is interactive, a LEAF with none is
+   * transparent, and a container stays `auto` because it must pass events down to its children.
+   *
+   * This exists for the case those rules cannot express — **a container that is pure decoration**,
+   * sitting over something that must still be tappable. Court's narration band is the worked
+   * example: it is a panel with a Skip button inside it, drawn above a full-screen tap-catcher.
+   * The band has no binding of its own, but being a container (and a `scroll` one, which is
+   * separately forced to `auto` so it can be scrolled) it swallowed every tap aimed at the catcher
+   * underneath. The only alternative was to put the catcher ON TOP, which buried the Skip button
+   * in the band's stacking context and made it silently unclickable.
+   */
+  pointerThrough: false,
 
   // ── Style (box visuals) ──
   backgroundColor: 0 as number,   // 0 = transparent

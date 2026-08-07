@@ -460,7 +460,10 @@ Two tiers, not three: three would demand evidence for two boundaries and we had 
 **A TIER CLAMPS; IT NEVER RAISES.** `high` is provably a no-op — a project that deliberately
 authored `pixelRatioCap: 1` or `shadows: false` keeps it, because landing on the high tier is not a
 reason to do MORE work than the author asked for. That property is what made wiring tiers up safe
-for every existing project, and `DEFAULT_TIER_SETTING` is `'high'`, i.e. today's behaviour.
+for every existing project when the default was `high`. As of #155, `DEFAULT_TIER_SETTING` is
+`'auto'`: a project that does not pin `qualityTier` no longer resolves to `high` outright — it goes
+through the allowlist/desktop-carve-out/calibration precedence below, and an unrecognised device
+starts `low`. A project that wants exactly today's behaviour must pin `qualityTier: 'high'`.
 
 | knob | `low` | `high` | live-changeable? |
 |---|---|---|---|
@@ -480,14 +483,30 @@ the one moment the device is already struggling.
 Scene3D's `ResizeObserver` on every resize. If one applied the tier and the other read the raw
 setting, the first resize would silently undo it.
 
-**Precedence: player > project > allowlist > calibration.** The player wins outright because they
-can see the screen and we cannot; their choice persists via `PlayerPrefs` (behind the
-`playerTierStore` provider slot, since `rendering/` may not import `storage/`) and **stops
-calibration**, or the engine would override an explicit human decision with an inference.
+**Precedence: player > project pin > allowlist > desktop > calibrating (low).** The player wins
+outright because they can see the screen and we cannot; their choice persists via `PlayerPrefs`
+(behind the `playerTierStore` provider slot, since `rendering/` may not import `storage/`) and
+**stops calibration**, or the engine would override an explicit human decision with an inference.
 
-**`auto` starts LOW and promotes on measured evidence.** The failure is asymmetric: booting high
-and guessing wrong is a lost context and a permanent black screen; booting low and guessing wrong
-costs a beat of uglier rendering. Two rules that are easy to get backwards:
+**Desktops are the one carve-out (`TierSource: 'desktop'`), and it is keyed on `formFactor`, never
+on `platform`.** `DeviceCaps.formFactor` decides `'mobile'` vs `'desktop'` from a POSITIVE desktop
+signal only — a native iOS/Android build is mobile; `navigator.userAgentData.mobile` is believed in
+both directions when the browser reports it; otherwise a fine pointer AND zero touch points reads
+as desktop. It deliberately does not derive from `platform`: `platform` is Capacitor's, so a phone
+browser reports `'web'` exactly like a desktop does, and the demos publish web-only — keying on
+platform would put the demos' entire mobile-web audience back on `high`. Unresolvable cases default
+to `'mobile'`, the safe side: a desktop wrongly called mobile boots low and calibration promotes it
+seconds later, while a phone wrongly called desktop boots high and can lose its context before
+demotion ever fires.
+
+One consequence of `auto` being the default: an unpinned project now awaits `getDeviceCaps()`
+before the first drawing buffer is created, because the knobs a tier clamps — `antialias` above all
+— are baked into that buffer at creation and cannot be applied later.
+
+**`auto` starts LOW (outside the desktop carve-out) and promotes on measured evidence.** The
+failure is asymmetric: booting high and guessing wrong is a lost context and a permanent black
+screen; booting low and guessing wrong costs a beat of uglier rendering. Two rules that are easy to
+get backwards:
 
 - **Demotion is IMMEDIATE, promotion waits for a scene boundary.** A tier switch recompiles
   shaders; a mid-play promotion can freeze longer than the low tier it escapes, while a deferred
@@ -521,6 +540,23 @@ sliding budget (`MAX_RECOVERY_ATTEMPTS` in `RECOVERY_WINDOW_MS`), then abandon l
 *asks*; it cannot rebuild. Viewports subscribe via `onRendererLost` and rebuild themselves.
 Scheduling (defer out of the loss event, one rebuild at a time, coalesce a loss that lands
 mid-rebuild) is `rendering/rendererRecovery.ts`.
+
+**A rebuild that REJECTS is now retried (#156), not dropped.** It used to be reported and abandoned,
+which was terminal by construction: the only thing that can ask for another attempt is a further
+`onRendererLost`, and once a rebuild has failed there is no live renderer left to lose — so that
+event can never arrive. `rendererRecovery.ts` now retries bring-up itself, bounded by
+`DEFAULT_MAX_REBUILD_ATTEMPTS` (3) with a doubling backoff (250ms, then 500ms, then 1000ms) on the
+theory that a rejection moments after a loss usually means the driver is still resetting. **This is
+a separate budget from `activeRenderer`'s `MAX_RECOVERY_ATTEMPTS`** — that one counts context
+*losses*; this one counts bring-up *rejections* — and the two must not be conflated. `onError` now
+receives `(e, { description, attempt, willRetry })` so a viewport can say "retrying" instead of
+announcing a permanent black screen a retry may be about to disprove. `description` comes from the
+new exported `describeRebuildFailure`: the observed symptom was a rejection logging as `{}`, and the
+device console capture already special-cases `instanceof Error` (it would have sent the stack), so
+an empty `{}` proves the rejection was a non-Error object with no enumerable properties, not a
+serialization bug. Evidence for the retry: a Huawei Y6 2019 lost its context **during boot** (every
+prior validation here was steady-state loss on a settled scene) and, without the retry, stayed blank
+for the process lifetime.
 
 **THE INVARIANT: a viewport's bring-up must stay self-contained.** Recovery works because
 everything built against the renderer — scene, cameras, render state, particles, the post-FX

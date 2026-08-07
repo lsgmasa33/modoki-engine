@@ -9,7 +9,10 @@
  *  this module only ever hears about losses that are still worth acting on. */
 
 import { describe, expect, it, vi } from 'vitest';
-import { createRendererRecovery, DEFAULT_REBUILD_DELAY_MS } from '../../src/runtime/rendering/rendererRecovery';
+import {
+  createRendererRecovery, describeRebuildFailure,
+  DEFAULT_REBUILD_DELAY_MS, DEFAULT_MAX_REBUILD_ATTEMPTS,
+} from '../../src/runtime/rendering/rendererRecovery';
 
 /** A hand-driven clock: collects scheduled callbacks so a test fires them explicitly. */
 function fakeTimers() {
@@ -167,5 +170,128 @@ describe('rendererRecovery', () => {
     const { t, recovery } = harness({ delayMs: 1000 });
     recovery.request();
     expect(t.delays).toEqual([1000]);
+  });
+});
+
+
+/** #156 — rule 4. A failed rebuild used to be reported and dropped, which was TERMINAL BY
+ *  CONSTRUCTION: only a further `onRendererLost` could ask for another attempt, and after a
+ *  failed rebuild there is no live renderer left to lose. Reproduced on a Y6 2019 as a
+ *  boot-time loss that left the surface blank for the process lifetime. */
+describe('rendererRecovery — a failed rebuild is retried (#156)', () => {
+  it('retries after a rejection instead of leaving the viewport black forever', async () => {
+    const rebuild = vi.fn()
+      .mockRejectedValueOnce(new Error('init failed'))
+      .mockResolvedValueOnce(undefined);
+    const { t, recovery } = harness({ rebuild });
+
+    recovery.request();
+    await t.fire();                       // attempt 1 — rejects
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    expect(t.scheduled).toBe(1);          // the retry the old code never armed
+
+    await t.fire();                       // attempt 2 — succeeds
+    expect(rebuild).toHaveBeenCalledTimes(2);
+    expect(t.scheduled).toBe(0);          // success stops the chain
+  });
+
+  it('backs off — a retry at the interval that just failed mostly fails again', async () => {
+    const rebuild = vi.fn().mockRejectedValue(new Error('still resetting'));
+    const { t, recovery } = harness({ rebuild });
+
+    recovery.request();
+    for (let i = 0; i < DEFAULT_MAX_REBUILD_ATTEMPTS; i++) await t.fire();
+
+    expect(t.delays).toEqual([
+      DEFAULT_REBUILD_DELAY_MS,
+      DEFAULT_REBUILD_DELAY_MS * 2,
+      DEFAULT_REBUILD_DELAY_MS * 4,
+    ]);
+  });
+
+  it('gives up after maxAttempts — a hot loop is worse than a black screen', async () => {
+    const rebuild = vi.fn().mockRejectedValue(new Error('dead'));
+    const { t, recovery } = harness({ rebuild, maxAttempts: 2 });
+
+    recovery.request();
+    await t.fire();
+    await t.fire();
+    await t.fire();   // nothing left scheduled — this is a no-op
+
+    expect(rebuild).toHaveBeenCalledTimes(2);
+    expect(t.scheduled).toBe(0);
+  });
+
+  it('tells the viewport whether a retry is coming, so it cannot cry permanent too early', async () => {
+    const onError = vi.fn();
+    const rebuild = vi.fn().mockRejectedValue(new Error('dead'));
+    const { t, recovery } = harness({ rebuild, onError, maxAttempts: 2 });
+
+    recovery.request();
+    await t.fire();
+    await t.fire();
+
+    expect(onError.mock.calls[0][1]).toMatchObject({ attempt: 1, willRetry: true });
+    expect(onError.mock.calls[1][1]).toMatchObject({ attempt: 2, willRetry: false });
+  });
+
+  it('gives a FRESH loss the full budget rather than an exhausted one', async () => {
+    const rebuild = vi.fn().mockRejectedValue(new Error('dead'));
+    const { t, recovery } = harness({ rebuild, maxAttempts: 1 });
+
+    recovery.request();
+    await t.fire();
+    expect(t.scheduled).toBe(0);   // budget spent
+
+    recovery.request();            // a NEW fault
+    expect(t.scheduled).toBe(1);
+  });
+
+  it('does not retry into a viewport that unmounted during the backoff', async () => {
+    let disposed = false;
+    const rebuild = vi.fn().mockRejectedValue(new Error('dead'));
+    const { t, recovery } = harness({ rebuild, isDisposed: () => disposed });
+
+    recovery.request();
+    await t.fire();
+    expect(t.scheduled).toBe(1);
+
+    disposed = true;
+    recovery.dispose();
+    await t.fire();
+    expect(rebuild).toHaveBeenCalledTimes(1);
+  });
+});
+
+/** The reporting half of #156. The symptom was `… FAILED — …: {}`; blaming Error serialization
+ *  is WRONG (the device console capture special-cases Error and would have sent a stack), so an
+ *  empty `{}` proves a NON-Error rejection with no enumerable properties. */
+describe('describeRebuildFailure', () => {
+  it('keeps an Error stack — the case that already worked', () => {
+    const e = new Error('boom');
+    expect(describeRebuildFailure(e)).toContain('boom');
+  });
+
+  it('salvages something from the {} that started this — an object with no enumerable props', () => {
+    const opaque = Object.create({}, { name: { value: 'GPUError', enumerable: false } });
+    const out = describeRebuildFailure(opaque);
+    expect(out).not.toBe('{}');
+    expect(out).toContain('GPUError');
+  });
+
+  it('names the shape when there is genuinely nothing to read', () => {
+    expect(describeRebuildFailure({})).toContain('no readable properties');
+  });
+
+  it('reports undefined and null distinctly — "rejected with nothing" is itself a clue', () => {
+    expect(describeRebuildFailure(undefined)).toBe('rejected with undefined');
+    expect(describeRebuildFailure(null)).toBe('rejected with null');
+  });
+
+  it('never throws while describing why something else failed', () => {
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    expect(() => describeRebuildFailure(circular)).not.toThrow();
+    expect(() => describeRebuildFailure(Symbol('x'))).not.toThrow();
   });
 });

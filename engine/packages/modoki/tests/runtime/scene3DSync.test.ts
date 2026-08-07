@@ -400,10 +400,15 @@ describe('scene3DSync', () => {
         vi.doMock('../../src/runtime/rendering/gpuDetect', () => ({ getWebGPUSupported: async () => true }));
         mockSceneSyncDeps();
         vi.stubGlobal('window', { devicePixelRatio: dpr });
-        const { setRenderSettings, resetRenderSettings } =
+        const { setRenderSettings, resetRenderSettings, getRenderSettings } =
           await import('../../src/runtime/rendering/renderSettings');
         resetRenderSettings();
-        setRenderSettings({ web });
+        // Pin the tier. These assert the sizeMode RATIO clamp, and a tier clamps
+        // `pixelRatioCap` too — so riding the ambient default would make them a joint
+        // assertion about tiering. Since #155 that default is `'auto'`, which resolves LOW
+        // under jsdom (no `userAgentData`, no `matchMedia` → `formFactor: 'mobile'`) and
+        // caps the ratio at 1, quietly turning every expectation here into a tier test.
+        setRenderSettings({ web, three: { ...getRenderSettings().three, qualityTier: 'high' } });
         const { makeWebGPURenderer } = await import('../../src/runtime/rendering/scene3DSync');
         const container: any = { clientWidth: 393, clientHeight: 852, appendChild: vi.fn() };
         const r: any = await makeWebGPURenderer(container, opts);

@@ -58,12 +58,13 @@ describe('resolveTier — precedence', () => {
     }, ['iPhone10,1']);
   });
 
-  it('DEFAULTS TO high, so an existing game does not silently downgrade', () => {
-    // The empty allowlist means `auto` would put EVERY device on low, desktops included. The
-    // default therefore stays at today's behaviour until P5 calibrates on real hardware.
-    expect(DEFAULT_TIER_SETTING).toBe('high');
+  it('DEFAULTS TO auto, so an unrecognised phone launches in low-end spec (#155)', () => {
+    // Owner decision: a game launches low unless the device is allowlisted. Measured cost of the
+    // old `'high'` placeholder — a Y6 2019 took a 6388 ms post-FX submit, lost its GPU context,
+    // and stayed blank; the same device holds 27-33 fps under auto.
+    expect(DEFAULT_TIER_SETTING).toBe('auto');
     const r = resolveTier({ platform: 'web' });
-    expect(r).toMatchObject({ tier: 'high', source: 'project' });
+    expect(r).toMatchObject({ tier: 'low', source: 'calibrating' });
   });
 });
 
@@ -73,6 +74,28 @@ describe('resolveTier — auto', () => {
     // low and guessing wrong costs a beat of ugliness. The asymmetry decides the default.
     const r = resolveTier({ platform: 'android', projectSetting: 'auto', gpuRenderer: 'Mali-G57' });
     expect(r).toMatchObject({ tier: 'low', source: 'calibrating' });
+  });
+
+  it('keeps a DESKTOP on high — it is not the hardware the low default guards (#155)', () => {
+    const r = resolveTier({ platform: 'web', projectSetting: 'auto', formFactor: 'desktop' });
+    expect(r).toMatchObject({ tier: 'high', source: 'desktop' });
+  });
+
+  it('does NOT infer desktop from platform "web" — a phone browser reports exactly that', () => {
+    // The trap #155 was nearly built on. The demos publish web-only, so `platform === 'web'`
+    // meaning "desktop" would hand their whole mobile-web audience the tier that bricked the Y6.
+    const r = resolveTier({ platform: 'web', projectSetting: 'auto', formFactor: 'mobile' });
+    expect(r).toMatchObject({ tier: 'low', source: 'calibrating' });
+  });
+
+  it('treats an ABSENT formFactor as a handheld — a failed probe lands on the safe side', () => {
+    const r = resolveTier({ platform: '', projectSetting: 'auto' });
+    expect(r).toMatchObject({ tier: 'low', source: 'calibrating' });
+  });
+
+  it('lets a project pin high, outranking the desktop/calibrating fall-through', () => {
+    const r = resolveTier({ platform: 'android', projectSetting: 'high', formFactor: 'mobile' });
+    expect(r).toMatchObject({ tier: 'high', source: 'project' });
   });
 
   it('ships with an EMPTY allowlist — an unmeasured entry is what ossifies', () => {

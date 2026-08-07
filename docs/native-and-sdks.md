@@ -299,7 +299,8 @@ Notes: first build is slow (SPM downloads all SDK frameworks); use exact device 
 ```bash
 MODOKI_PROJECT=games/<id> npm run build -- --target native
 (cd games/<id> && npx cap sync android)
-JAVA_HOME=$(/usr/libexec/java_home -v 21) games/<id>/android/gradlew -p games/<id>/android assembleDebug
+eval "$(node engine/scripts/print-toolchain-env.mjs)"   # JAVA_HOME + ANDROID_HOME, resolved as the editor does
+games/<id>/android/gradlew -p games/<id>/android assembleDebug
 adb install games/<id>/android/app/build/outputs/apk/debug/app-debug.apk
 ```
 Notes: requires **JDK 21** (Capacitor 8 / AGP); Gradle heap is the stock **`-Xmx1536m`** (raise it, e.g. to 4GB, only when a game bundles the 12 mediation adapters); the device must show as `device` (not `unauthorized`) in `adb devices`. A game with no `ios/`/`android/` yet must scaffold it first (`cd games/<id> && npx cap add ios|android`).

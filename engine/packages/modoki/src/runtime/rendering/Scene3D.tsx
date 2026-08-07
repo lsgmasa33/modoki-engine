@@ -86,9 +86,15 @@ export default function Scene3D() {
     const recovery = createRendererRecovery({
       rebuild: async () => { teardown(); await bringUp(); },
       isDisposed: () => disposed,
-      onError: (e) => console.error(
-        '[Scene3D] renderer rebuild after context loss FAILED — this surface stays black ' +
-        'until another loss is reported or the game reloads:', e,
+      // `description` first (it is what survives the device bridge — a bare non-Error logged
+      // straight to the console is the `{}` that started #156), then the raw value, so a desktop
+      // devtools reader keeps an inspectable object with whatever custom fields it carries.
+      onError: (e, { description, attempt, willRetry }) => console.error(
+        `[Scene3D] renderer rebuild after context loss FAILED (attempt ${attempt}) — ` +
+        (willRetry
+          ? 'retrying after a backoff:'
+          : 'giving up; this surface stays black until the game reloads:'),
+        description, e,
       ),
     });
     // Only OUR renderer's death is ours to act on — the editor mounts a second viewport with

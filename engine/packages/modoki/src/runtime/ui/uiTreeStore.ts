@@ -26,7 +26,7 @@ export interface UINodeData {
   width: number; height: number;
   widthUnit: string; heightUnit: string;
   flexDirection: string; flexWrap: string; justifyContent: string; alignItems: string;
-  gap: number; flexGrow: number; flexShrink: number;
+  gap: number; gapUnit: string; flexGrow: number; flexShrink: number;
   paddingTop: number; paddingTopUnit: string;
   paddingLeft: number; paddingLeftUnit: string;
   paddingRight: number; paddingRightUnit: string;
@@ -38,7 +38,7 @@ export interface UINodeData {
   minWidth: number; minWidthUnit: string; maxWidth: number; maxWidthUnit: string;
   minHeight: number; minHeightUnit: string; maxHeight: number; maxHeightUnit: string;
   alignSelf: string; zIndex: number;
-  overflow: string; isVisible: boolean;
+  overflow: string; isVisible: boolean; pointerThrough: boolean;
   // ── Style ──
   backgroundColor: number; backgroundOpacity: number;
   borderRadius: number; borderWidth: number; borderColor: number; borderOpacity: number;
@@ -248,7 +248,7 @@ function buildTree(world: World): UINodeData[] {
         width: ui.width, height: ui.height,
         widthUnit: ui.widthUnit || 'px', heightUnit: ui.heightUnit || 'px',
         flexDirection: ui.flexDirection, flexWrap: ui.flexWrap || 'nowrap', justifyContent: ui.justifyContent,
-        alignItems: ui.alignItems, gap: ui.gap,
+        alignItems: ui.alignItems, gap: ui.gap, gapUnit: ui.gapUnit || 'px',
         flexGrow: ui.flexGrow, flexShrink: ui.flexShrink,
         paddingTop: ui.paddingTop, paddingTopUnit: ui.paddingTopUnit || 'px',
         paddingLeft: ui.paddingLeft, paddingLeftUnit: ui.paddingLeftUnit || 'px',
@@ -264,6 +264,7 @@ function buildTree(world: World): UINodeData[] {
         maxHeight: ui.maxHeight || 0, maxHeightUnit: ui.maxHeightUnit || 'px',
         alignSelf: ui.alignSelf || 'auto', zIndex: ui.zIndex || 0,
         overflow: ui.overflow, isVisible: ui.isVisible,
+        pointerThrough: ui.pointerThrough === true,
         backgroundColor: ui.backgroundColor || 0, backgroundOpacity: ui.backgroundOpacity || 0,
         borderRadius: ui.borderRadius || 0, borderWidth: ui.borderWidth || 0,
         borderColor: ui.borderColor || 0x333333, borderOpacity: ui.borderOpacity ?? 1, opacity: ui.opacity ?? 1,

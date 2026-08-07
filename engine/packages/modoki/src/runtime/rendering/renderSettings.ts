@@ -34,8 +34,11 @@ export interface ThreeRenderSettings {
   pixelRatioCap: number;
   shadows: boolean;
   /** Quality tier (#121 P3). `'auto'` delegates to the allowlist + on-device calibration;
-   *  `'low'`/`'high'` pin it. Defaults to `DEFAULT_TIER_SETTING` (`'high'` — today's behaviour),
-   *  so wiring the tier up changes nothing until a project opts in. See `qualityTier.ts`. */
+   *  `'low'`/`'high'` pin it. Defaults to `DEFAULT_TIER_SETTING`, which is **`'auto'` since
+   *  #155** — so an unpinned project resolves LOW on anything not allowlisted (desktops
+   *  excepted, by `formFactor`). This used to read "`'high'` — today's behaviour, so wiring the
+   *  tier up changes nothing until a project opts in", and both halves are now false: the
+   *  default IS the behaviour change. See `qualityTier.ts`. */
   qualityTier: QualityTierSetting;
   /** 'ACESFilmic' | 'AgX' | 'Neutral' | 'Linear' | 'None' */
   toneMapping: string;

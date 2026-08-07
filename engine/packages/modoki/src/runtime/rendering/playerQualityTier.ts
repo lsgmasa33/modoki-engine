@@ -21,6 +21,7 @@
  *  as storing it — the player is sitting in a settings menu and expects to see the result now. */
 
 import { playerTierStore } from '../core/playerTierStore';
+import { getDeviceCapsSync } from './deviceCaps';
 import { resolveTier, type QualityTier } from './qualityTier';
 import { getRenderSettings } from './renderSettings';
 import { applyQualityTier } from './tierCalibration';
@@ -66,6 +67,18 @@ export function choosePlayerQualityTier(tier: QualityTier | null): void {
     return;
   }
   const setting = getRenderSettings().three.qualityTier;
-  const resolved = resolveTier({ platform: '', projectSetting: setting });
+  // Feed the CACHED probe, never a bare `{platform:''}` (#155). Since `'auto'` became the default,
+  // an input with no facts resolves `low` — so passing none would downgrade a desktop the moment
+  // its player picked "Auto", which is the opposite of what Auto means. Sync by design: the probe
+  // ran at renderer bring-up, so by the time a settings menu exists it is cached; `null` (it
+  // somehow did not) falls through to the same safe side as a failed probe.
+  const caps = getDeviceCapsSync();
+  const resolved = resolveTier({
+    platform: caps?.platform ?? '',
+    deviceModel: caps?.deviceModel,
+    gpuRenderer: caps?.gpuRenderer,
+    formFactor: caps?.formFactor,
+    projectSetting: setting,
+  });
   applyQualityTier(resolved.tier, resolved.source, `player chose Auto — ${resolved.reason}`);
 }

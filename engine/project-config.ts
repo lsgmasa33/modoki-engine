@@ -249,7 +249,12 @@ export interface ProjectConfig {
       shadows: boolean;
       /** Quality tier (#121): 'auto' delegates to the device allowlist + on-device calibration;
        *  'low'/'high' pin it. A tier CLAMPS the settings above — it never raises them — so
-       *  'high' is exactly today's behaviour and the fields beside it stay authoritative. */
+       *  'high' is exactly today's behaviour and the fields beside it stay authoritative.
+       *
+       *  **Defaults to 'auto' since #155**, which resolves LOW on anything not allowlisted (a
+       *  desktop excepted). Pin 'high' to opt a project out — but note what that opts into: a
+       *  Y6 2019 booting 'high' took a 6388 ms post-FX submit, lost its GPU context and stayed
+       *  blank, where 'auto' holds 27-33 fps on the same phone. */
       qualityTier: 'auto' | 'low' | 'high';
       /** Tone-mapping operator ('ACESFilmic' | 'AgX' | 'Neutral' | 'Linear' | 'None'). */
       toneMapping: (typeof TONE_MAPPINGS)[number];
@@ -395,7 +400,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   },
   rendering: {
     targetFps: 60, // matches the frame driver's historical default cap
-    three: { backend: 'auto', antialias: true, pixelRatioCap: 2, shadows: true, qualityTier: 'high', toneMapping: 'ACESFilmic', exposure: 1.2 },
+    three: { backend: 'auto', antialias: true, pixelRatioCap: 2, shadows: true, qualityTier: 'auto', toneMapping: 'ACESFilmic', exposure: 1.2 },
     pixi: { backend: 'auto', antialias: true, resolution: 0, pixelRatioCap: 2 },
     web: { sizeMode: 'free', width: 1280, height: 720 },
   },
