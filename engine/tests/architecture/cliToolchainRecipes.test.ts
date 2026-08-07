@@ -23,6 +23,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { hasPrivateTooling } from '../helpers/repoLayout';
 
 const REPO = path.resolve(__dirname, '../../..');
 const DOCS = path.join(REPO, 'docs');
@@ -110,14 +111,22 @@ describe('CLI build recipes resolve the toolchain the way the editor does (#159)
     // commands would turn the guard above green while re-opening the exact hole it was widened
     // to close. Named files, so the failure says WHICH surface stopped being watched.
     const seen = new Set(allMarkdown());
-    for (const f of [
-      'README.md',
-      '.claude/skills/deploy-android/SKILL.md',
-      '.claude/skills/deploy-all/SKILL.md',
-      '.claude/skills/deploy-ios/SKILL.md',
-      'docs/build.md',
-      'docs/native-and-sdks.md',
-    ]) expect(seen, `${f} is no longer scanned`).toContain(f);
+    for (const f of ['README.md', 'docs/build.md', 'docs/native-and-sdks.md']) {
+      expect(seen, `${f} is no longer scanned`).toContain(f);
+    }
+
+    // The slash commands are PRIVATE agent tooling — `publish-engine-oss.sh`'s manifest ships
+    // `engine build docs` + root configs, so `.claude/` is absent from the public snapshot while
+    // THIS test file ships. Asserting them unconditionally therefore fails on the public gate for
+    // a file the snapshot is never supposed to contain, which is what it did on `ci/main`.
+    // Gated on the shared predicate rather than a local existsSync, per repoLayout's own rule.
+    if (hasPrivateTooling()) {
+      for (const f of [
+        '.claude/skills/deploy-android/SKILL.md',
+        '.claude/skills/deploy-all/SKILL.md',
+        '.claude/skills/deploy-ios/SKILL.md',
+      ]) expect(seen, `${f} is no longer scanned`).toContain(f);
+    }
 
     // …and never generated output. `site/docs/reference/` is gitignored and re-derived from
     // `docs/` by `site/sync-reference.mjs`, so a stale copy there is not a doc anyone can fix.
