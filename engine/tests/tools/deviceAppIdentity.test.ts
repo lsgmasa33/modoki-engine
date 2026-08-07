@@ -18,8 +18,10 @@
  *  hardware — and that is a Capacitor guarantee, not ours. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { discoverProjects } from '../../scripts/projectRoots.mjs';
+import { REPO_ROOT } from '../helpers/repoLayout';
 
 const getInfo = vi.fn();
 vi.mock('@capacitor/app', () => ({ App: { getInfo: () => getInfo() } }));
@@ -126,17 +128,17 @@ describe('the hardware probe reads a plugin that is actually present (#146)', ()
   it('no Modoki project depends on @capacitor/device — the reason the first version was inert', () => {
     // If this ever fails, someone added the dependency to a project and the reasoning above needs
     // revisiting — not the code. Asserting the FACT keeps the comment honest.
+    // Enumerate via the shared helper rather than walking `['games','demos']` by hand: the OSS
+    // snapshot ships demos but NO `games/`, so a hand-rolled walk threw ENOENT there while every
+    // dev clone stayed green — a red public `ci/main` for a tree-shape difference, not a bug.
+    // `discoverProjects` skips absent roots by contract (see `scripts/projectRoots.mjs`).
     const withDevicePlugin: string[] = [];
-    for (const root of ['games', 'demos']) {
-      const dir = path.join(__dirname, '../../../', root);
-      for (const entry of readdirSync(dir, { withFileTypes: true })) {
-        if (!entry.isDirectory()) continue;
-        try {
-          const pkg = JSON.parse(readFileSync(path.join(dir, entry.name, 'package.json'), 'utf8'));
-          const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-          if ('@capacitor/device' in deps) withDevicePlugin.push(`${root}/${entry.name}`);
-        } catch { /* no package.json — not a workspace project */ }
-      }
+    for (const proj of discoverProjects(REPO_ROOT)) {
+      try {
+        const pkg = JSON.parse(readFileSync(path.join(proj.dir, 'package.json'), 'utf8'));
+        const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+        if ('@capacitor/device' in deps) withDevicePlugin.push(`${proj.root}/${proj.name}`);
+      } catch { /* no package.json — not a workspace project */ }
     }
     expect(withDevicePlugin).toEqual([]);
   });
