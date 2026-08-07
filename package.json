@@ -41,6 +41,7 @@
     "verify:serial": "npm run typecheck && npm run lint && npm test && npm --prefix engine/packages/modoki test",
     "verify:all": "npm run verify && npm run test:e2e",
     "verify:packaged": "npm run verify && npm run smoke:packaged",
+    "verify:publish": "scripts/publish-engine-oss.sh --with-demos=3d-physics-demo,2d-physics-demo",
     "hooks:install": "node engine/scripts/install-git-hooks.mjs",
     "prepare": "node engine/scripts/install-git-hooks.mjs",
     "preview": "vite preview --config engine/vite.config.ts",
