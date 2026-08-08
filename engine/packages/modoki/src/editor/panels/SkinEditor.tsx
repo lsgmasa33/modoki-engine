@@ -32,7 +32,7 @@ import { AssetRefField, assetDisplayName } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
 import { makeRigPrefabAsset } from '../scene/skinPrefab';
 import { removeBone } from '../../runtime/skinning/rig2dEdit';
-import { activePartOf, withActivePart, partsOf, addPart, removePart, movePart, reorderPart, reorderActiveIndex, renamePart, uvToPosAffine, partAngle, bboxCenter } from './skinParts';
+import { activePartOf, withActivePart, partsOf, partCount, addPart, removePart, reorderPart, reorderActiveIndex, renamePart, uvToPosAffine, partAngle, bboxCenter } from './skinParts';
 import { pushAction, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
 import { BufferedNumberInput, inputStyle } from './fields';
 
@@ -424,7 +424,7 @@ export default function SkinEditor() {
     if (!d || from === to) return;
     partAction(reorderPart(d, from, to), 'reorder part');
     const active = useEditorStore.getState().activeSkinPart;
-    const na = reorderActiveIndex(active, from, to);
+    const na = reorderActiveIndex(active, from, to, partCount(d));
     if (na !== active) useEditorStore.getState().setActiveSkinPart(na);
   }, [partAction]);
   const addPartAction = useCallback(() => {
@@ -692,8 +692,16 @@ export default function SkinEditor() {
                   <span onDoubleClick={(e) => { e.stopPropagation(); setEditingPart(i); }}
                     style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: i === activePart ? '#cde' : (previewHidden.includes(i) ? '#666' : '#bbb') }} title={`${p.name} — double-click to rename`}>{p.name}</span>
                 )}
-                <button onClick={(e) => { e.stopPropagation(); partAction(movePart(def!, i, -1), 'move part'); }} title="Move back" disabled={i === 0} style={{ ...eyeBtn, opacity: i === 0 ? 0.3 : 1 }}>↑</button>
-                <button onClick={(e) => { e.stopPropagation(); partAction(movePart(def!, i, 1), 'move part'); }} title="Move front" disabled={i === parts.length - 1} style={{ ...eyeBtn, opacity: i === parts.length - 1 ? 0.3 : 1 }}>↓</button>
+                {/* ↑/↓ go through `reorderParts`, the SAME entry point as drag-reorder, because it is
+                    the one that also moves the selection. They used to call `movePart` directly and
+                    update nothing: moving the SELECTED part left `activeSkinPart` pointing at its old
+                    slot, so the selection silently jumped to the part that swapped into it — and
+                    since tessellate / auto-weight / sprite-assign all write through
+                    `withActivePart(def, activeSkinPart)`, the next edit landed on the wrong part's
+                    mesh. A move by one IS `reorderPart(i, i±1)`, so there is nothing left for a
+                    separate helper to do. */}
+                <button onClick={(e) => { e.stopPropagation(); reorderParts(i, i - 1); }} title="Move back" disabled={i === 0} style={{ ...eyeBtn, opacity: i === 0 ? 0.3 : 1 }}>↑</button>
+                <button onClick={(e) => { e.stopPropagation(); reorderParts(i, i + 1); }} title="Move front" disabled={i === parts.length - 1} style={{ ...eyeBtn, opacity: i === parts.length - 1 ? 0.3 : 1 }}>↓</button>
                 <button onClick={(e) => { e.stopPropagation(); if (parts.length > 1) { partAction(removePart(def!, i), 'remove part'); const na = i < activePart ? activePart - 1 : activePart; useEditorStore.getState().setActiveSkinPart(Math.min(na, parts.length - 2)); } }} title="Remove part" disabled={parts.length <= 1} style={{ ...eyeBtn, color: '#c66', opacity: parts.length <= 1 ? 0.3 : 1 }}>✕</button>
               </div>
             ))}

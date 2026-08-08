@@ -312,7 +312,7 @@ Extracted decision modules:
 | `panels/assetKeyCommands.ts` | every Assets keystroke → a command (platform-dependent delete chord, type-ahead) |
 | `panels/assetSelection.ts` | Assets click + drag selection policy |
 | `panels/assetOps.ts` | import/re-import planning, the delete sidecar rule, rename validation |
-| `panels/skinParts.ts` | rig part geometry + `bboxCenter` |
+| `panels/skinParts.ts` | rig part list edits (add/remove/reorder/rename/visibility), part geometry (`uvToPosAffine`, `partAngle`, `bboxCenter`), and the selection remap that must agree with them |
 | `scene/marqueeSelect.ts` | SceneView 2D box-selection: threshold, enclosure, selection merge |
 | `scene/pickSelection.ts` | the shared 2D + 3D viewport pick rule |
 | `scene/multiTransform.ts` | group-transform math, incl. which Transform fields each gizmo mode writes |
@@ -320,8 +320,11 @@ Extracted decision modules:
 | `utils/layoutNames.ts` | layout name sanitising + the reserved autosave name |
 
 All are unit-tested, but "has a test file" is not "is covered": `assetOps.ts` sits at 56%
-(the rest is `/api/*` IO wrappers) and `skinParts.ts` at 58% (4 exports no test executes).
-Check `npm run coverage` rather than the presence of a test file.
+(the rest is `/api/*` IO wrappers), and `skinParts.ts` sat at 58% with **five** exports no test
+executed — the issue that recorded it (#163) said four, having counted by reading the issue rather
+than the file. Check `npm run coverage`, and check it against the SOURCE, not against a list
+someone wrote down: those five are covered now, and the way the miscount survived into a ticket is
+the argument for measuring.
 
 Some panel logic is **already pure and at module scope but not exported**, so nothing
 can import it and nothing tests it (SkinCanvas's skinning math, SpriteEditor's slice
@@ -349,6 +352,21 @@ behaviour risk. Prefer it over restructuring a component.
    re-expresses control flow, which is where behaviour quietly changes. "Honestly
    untestable without an integration harness" is an acceptable answer for parts of
    SceneView and `EditorApp.tsx`.
+3. **A list edit and the selection index are ONE decision — give them one entry point.** A
+   panel that edits a list (parts, tracks, slices) almost always keeps the selected item's
+   INDEX in separate state, and the two must be remapped together. Split them and they drift,
+   silently: `reorderPart` no-opped on an out-of-range index while its partner
+   `reorderActiveIndex` returned the raw target, so a reorder that changed nothing could still
+   move the selection (#163). Worse, the Parts ↑/↓ buttons called `movePart` and remapped
+   **nothing** — moving the SELECTED part left `activeSkinPart` on its old slot, so the
+   selection jumped to whatever swapped into it, and because `withActivePart(def,
+   activeSkinPart)` backs tessellate / auto-weight / sprite-assign, the next edit wrote to the
+   wrong part's mesh. The shape of the fix generalises: **one callback owns "edit the list AND
+   move the selection"** (`SkinEditor.reorderParts`), every gesture routes through it, and any
+   precondition the two halves share lives in ONE predicate they both call
+   (`reorderIsNoop`) — never two copies that must be kept in step. A move-by-one is just a
+   reorder, so the separate `movePart` helper was deleted rather than left beside the correct
+   path as the easier thing to reach for.
 
 **The `EditorApp.tsx` verdict (#126), for the record — it was NOT "no".** The plan expected
 the editor shell to be the hardest case and allowed the phase to end in a written decline.

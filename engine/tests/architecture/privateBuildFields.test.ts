@@ -30,8 +30,17 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { PRIVATE_BUILD_FIELDS } from '../../project-config';
+import { REPO_ROOT, hasInternalGames } from '../helpers/repoLayout';
 
-const repoRoot = join(__dirname, '..', '..', '..');
+const repoRoot = REPO_ROOT;
+
+/** The non-vacuity floor is LAYOUT-DEPENDENT, and getting that wrong is this repo's
+ *  best-documented test trap. A dev clone has ~24 committed project configs; the public
+ *  snapshot ships no `games/` at all and only the selected demos, so it has 4 — a flat
+ *  `>= 10` passes here and fails there, which is exactly what it did on the first
+ *  `verify:publish` after this file was committed. Gate on the shared predicate rather than
+ *  hand-rolling a presence check (`projectPresencePredicate.test.ts` enforces that). */
+const CONFIG_FLOOR = hasInternalGames() ? 10 : 3;
 
 const tracked = (...args: string[]): string[] =>
   execFileSync('git', ['ls-files', ...args], { cwd: repoRoot, encoding: 'utf8' })
@@ -44,9 +53,9 @@ describe('private build fields never reach a committed file (#172)', () => {
   it('finds project configs to check — a vacuous pass is a failure', () => {
     // Not a formality. This guard's whole value is that it ran; if the glob stops matching
     // (a rename, a layout change) every assertion below passes by checking nothing, and the
-    // green tick is indistinguishable from an honest one. The floor is deliberately well under
-    // the real count (24 at the time of writing) so a project being deleted is not a false red.
-    expect(configs.length).toBeGreaterThanOrEqual(10);
+    // green tick is indistinguishable from an honest one. Each floor sits well under its real
+    // count (24 here, 4 in the snapshot) so deleting a project is not a false red.
+    expect(configs.length).toBeGreaterThanOrEqual(CONFIG_FLOOR);
   });
 
   it.each(PRIVATE_BUILD_FIELDS)('no committed project.config.json sets build.%s', (field) => {

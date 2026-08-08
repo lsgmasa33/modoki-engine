@@ -75,13 +75,11 @@ export function removePart(def: Rig2DFile, idx: number): Rig2DFile {
   return { ...d, parts: reindex(d.parts!.filter((_, i) => i !== idx)) };
 }
 
-/** Move a part earlier (dir -1 = behind) or later (dir +1 = front) in draw order. */
-export function movePart(def: Rig2DFile, idx: number, dir: -1 | 1): Rig2DFile {
-  const d = ensurePartsArray(def);
-  const parts = [...d.parts!], j = idx + dir;
-  if (j < 0 || j >= parts.length) return d;
-  [parts[idx], parts[j]] = [parts[j], parts[idx]];
-  return { ...d, parts: reindex(parts) };
+/** True when a `reorderPart`/`reorderActiveIndex(from → to)` would not change anything (an
+ *  out-of-range index, or from === to). Shared by the pair specifically so they cannot drift —
+ *  a reorder that does not move the list must not move the selection either. */
+export function reorderIsNoop(count: number, from: number, to: number): boolean {
+  return from < 0 || from >= count || to < 0 || to >= count || from === to;
 }
 
 /** Move a part from index `from` to index `to` (drag-reorder in the Parts list). The moved
@@ -89,7 +87,7 @@ export function movePart(def: Rig2DFile, idx: number, dir: -1 | 1): Rig2DFile {
 export function reorderPart(def: Rig2DFile, from: number, to: number): Rig2DFile {
   const d = ensurePartsArray(def);
   const parts = [...d.parts!];
-  if (from < 0 || from >= parts.length || to < 0 || to >= parts.length || from === to) return d;
+  if (reorderIsNoop(parts.length, from, to)) return d;
   const [moved] = parts.splice(from, 1);
   parts.splice(to, 0, moved);
   return { ...d, parts: reindex(parts) };
@@ -97,7 +95,8 @@ export function reorderPart(def: Rig2DFile, from: number, to: number): Rig2DFile
 
 /** Where `activePart` lands after a `reorderPart(from → to)`, so the same logical part stays
  *  selected as indices shift. */
-export function reorderActiveIndex(active: number, from: number, to: number): number {
+export function reorderActiveIndex(active: number, from: number, to: number, count: number): number {
+  if (reorderIsNoop(count, from, to)) return active;
   if (active === from) return to;
   if (from < active && active <= to) return active - 1;
   if (to <= active && active < from) return active + 1;
