@@ -204,6 +204,16 @@ export default tseslint.config(
       // local `npm run dist*`; a fresh CI checkout never has it, so this only
       // matters for local lint runs (e.g. the test-clean skill).
       'release/**',
+      // Playable-ad export output (games/<id>/ads/) — gitignored like dist/, and this list
+      // has to agree with .gitignore or the local gate breaks for a reason nobody wrote.
+      // A COMPLETED playable build inlines everything into one HTML and leaves no JS to
+      // lint, which is why this went unnoticed: it is an ABORTED one that strands a
+      // minified `ads/assets/index-*.js`, and `npm run lint` then reports tens of thousands
+      // of errors in bundled vendor code. Measured: 33,482 errors from one interrupted
+      // build, turning the pre-push gate red with nothing wrong in the source tree.
+      // (`subgame-dist/` and `.vite/` are gitignored build outputs of the same shape; they
+      // carry no lintable JS today, so they are deliberately not listed yet.)
+      '**/ads/**',
       '**/*.tsbuildinfo',
       '**/.cache/**',
       // VitePress generated dependency cache (docs site) — minified vendor

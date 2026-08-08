@@ -171,14 +171,47 @@ times, and one release rule cannot serve both:
   reloads the page, tearing down the EventSource mid-build, and a retry then writes the same dist
   from two processes. Exactly the bug the lock exists to prevent, re-entered through the back door.
 
-⚠️ **The guarantee is bounded by what "the pipeline stopped" can observe** — the step's `bash`
-exiting. `spawnBuildCommand` runs `bash -c <cmd>` un-detached, so `kill('SIGTERM')` signals that one
-pid: bash *exec-replaces* itself for a simple command (vite, xcodebuild and gradlew do get the
-signal), but *forks* for a compound one — and the iOS `Installing on device...` step is compound
-(`APP_PATH=$(…) && { … }`), so its `xcrun devicectl` grandchild survives, orphaned, holding no slot.
-Verified empirically; pre-existing (the `(D6)` comments long claimed a disconnect left nothing that
-"can't conflict with a retry", which was never true). Closing it means killing the process **group**,
-which changes every build step on both platforms — a build-runner change, not a lock change (#176).
+**Aborting a step kills the process GROUP, not the shell (#176).** For a long time the slot's
+guarantee was bounded by what "the pipeline stopped" could observe — the step's `bash` exiting — and
+that is weaker than it sounds. `bash -c` *exec-replaces* itself for a simple command (so vite,
+xcodebuild and gradlew did get the signal) but *forks* for a compound one, and three real steps are
+compound: the iOS `Installing on device...` (`APP_PATH=$(…) && { xcrun devicectl … }`), icon
+generation (`mkdir && cp && … && printf`), and the web deploy's `for ext in glb ktx2 webp; do gcloud
+storage objects update …; done`. `kill('SIGTERM')` on that one pid killed the shell and left
+`devicectl`/`gcloud` running, orphaned, holding no slot — free to race the retry the freed slot
+immediately admits. The `(D6)` comments claimed a disconnect left nothing that "can't conflict with
+a retry"; that was never true, and #173's slot only narrowed the window.
+
+The fix lives entirely in `engine/plugins/buildStepShell.ts`: posix steps spawn `detached` (their
+own process group) and every abort path calls `killBuildProcess`, which signals `-pid` — SIGTERM,
+then SIGKILL to the group after a 5s grace. Two things fall out for free: a group signal reaches a
+tool's own workers (xcodebuild's `clang`/`swift-frontend`, gradle's `--no-daemon` single-use JVM)
+without depending on that tool to forward it, and the backend kills what it still owns on
+`SIGINT`/`SIGTERM`/`exit` — necessary, because a detached child no longer receives the Ctrl-C that
+stops `npm run dev`, so detaching without that hook would have opened a new orphan path while closing
+this one.
+
+The shutdown path gives an in-flight child **2s to honour the SIGTERM** before `exit`'s SIGKILL
+lands, and pays that delay only when a build is actually running. The first version skipped it —
+SIGTERM with no grace, `process.exit` on the next line, so the SIGKILL arrived in the *same tick*.
+That is not "graceful then forceful", it is just forceful, and a gradle or xcodebuild killed
+mid-write leaves a lock file or a torn artifact for the next build to trip over.
+
+Windows takes the other road: no `detached` (there it allocates a new **console**, which the GUI
+editor would flash per step) and `taskkill /T /F /PID <pid>`, which walks the tree by parent pid.
+⚠️ Like the `winCmd` step forms, that path is **UNVALIDATED against a real Windows box** — verify it
+on the `win` clone (#182).
+
+⚠️ **Two residual holes, both about a handler that never runs:**
+
+- **A SIGKILL'd backend** executes no hook and orphans whatever was mid-step. Unchanged by #176,
+  and not closable in-process.
+- **Quitting the editor mid-build orphans the tree on Windows.** `devServer.ts` stops its Vite with
+  `child.kill('SIGTERM')`, and on Windows Node has no signals — that is a `TerminateProcess`, so the
+  backend's `SIGTERM` handler never runs and never reaps the build children. On macOS/Linux the same
+  call delivers a real signal and the tree comes down with it. Also unchanged by #176 (nothing reaped
+  them there before either), but it is the reason the Windows story is weaker than the posix one, not
+  merely unvalidated. Reasoned from Node's documented Windows signal behaviour — **not measured**.
 
 **Known gap, deliberate:** the slot is per backend **process**, so two editor processes on one
 project (a packaged editor beside a dev one) are still unguarded. That needs a cross-process claim on

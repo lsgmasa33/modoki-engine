@@ -62,7 +62,7 @@ import { type SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneVa
 import { handleBackendRequest, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
 import { reclaimStaleForwardsAtStartup } from './backend/deviceConnection';
 import { vendorEnginePlugins, writeVendorMarker } from './vendorPlugins';
-import { spawnBuildCommand, resolveBuildStep, type BuildStep } from './buildStepShell';
+import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
 import { healNativeConfig } from './healNativeConfig';
 import { ICON_TOOL, ICON_COLORS, iconIsUpToDate, iconStampValue } from './iconAssets';
 import { ensureCapacitorDeps, scaffoldNativeTarget, type NativePlatform } from './addNativeTarget';
@@ -1608,9 +1608,12 @@ export function assetScannerPlugin(): Plugin {
 
           // Kill the in-flight child if the client disconnects (closed the dialog /
           // reloaded the renderer) so a long npm install / cap add isn't orphaned. (D6)
+          // `killBuildProcess` signals the process GROUP, so a compound step's grandchildren
+          // die with the shell rather than outliving it (#176) — this comment used to claim
+          // that outcome while `proc.kill()` delivered only the shell.
           let activeProc: ReturnType<typeof spawn> | null = null;
           let aborted = false;
-          req.on('close', () => { aborted = true; try { activeProc?.kill('SIGTERM'); } catch { /* gone */ } });
+          req.on('close', () => { aborted = true; killBuildProcess(activeProc); });
 
           // Provision Node ONCE so the scaffold's npm install / cap add run on it (no system npm).
           const buildEnv = await buildStepEnv({ MODOKI_PROJECT: projectRoot });
@@ -1776,15 +1779,18 @@ export function assetScannerPlugin(): Plugin {
           //    EventSource mid-build). So once started, the pipeline owns the release and gives it
           //    back when it actually stops.
           //
-          // ⚠️ "When the pipeline stops" means when the step's `bash` exits — which is NOT always
-          // when the WORK stops. `spawnBuildCommand` runs `bash -c <cmd>` un-detached, so
-          // `kill('SIGTERM')` signals that one pid: bash exec-replaces itself for a SIMPLE command
-          // (so vite/xcodebuild/gradlew do get the signal), but FORKS for a compound one, and the
-          // iOS `Installing on device...` step is compound (`APP_PATH=$(…) && { … }`) — its
-          // `xcrun devicectl` grandchild survives, orphaned, holding no slot. Verified empirically,
-          // pre-existing (the `(D6)` comment below has always over-claimed this), and tracked as
-          // #176: closing it means killing the process GROUP, which changes every build step on both
-          // platforms and is not a lock change. See docs/build.md § "One build at a time".
+          // "When the pipeline stops" means when the step's `bash` exits — which USED to be a
+          // weaker statement than "when the WORK stops". `bash -c` exec-replaces itself for a
+          // SIMPLE command but FORKS for a compound one (the iOS `Installing on device...` step,
+          // icon generation, the web deploy's per-extension loop), so the old `proc.kill()` hit
+          // the shell and left `devicectl`/`gcloud` running, orphaned, holding no slot. Closed in
+          // #176: steps spawn `detached` and abort via `killBuildProcess`, which signals the
+          // process GROUP — grandchildren included, plus a tool's own workers (xcodebuild's
+          // clang, gradle's `--no-daemon` JVM) without relying on that tool to forward a signal.
+          //
+          // ⚠️ Still bounded by the backend being ALIVE to run a handler. A SIGKILL'd backend
+          // orphans whatever was mid-step; nothing in-process can close that.
+          // See docs/build.md § "One build at a time".
           const slotRelease = releasePolicy(slot.release);
           res.on('close', slotRelease.onResponseClose);
 
@@ -2229,14 +2235,15 @@ export function assetScannerPlugin(): Plugin {
           // Kill the in-flight build child + stop launching steps if the client
           // disconnects (closed the Build dialog / reloaded), so gradle/xcodebuild/
           // gcloud aren't left running for minutes. (D6)
-          // ⚠️ "can't conflict with a retry" is what this used to claim, and it is not true: `bash -c`
-          // FORKS for a compound command (the iOS `Installing on device...` step is one), so SIGTERM
-          // kills the shell and orphans the real child. The build slot (#173) papers over the common
-          // case by holding until this loop settles, but an orphan still outlives it — closing that
-          // means killing the process GROUP (#176). docs/build.md § "One build at a time".
+          // "Can't conflict with a retry" is what this claimed for a long time while `proc.kill()`
+          // could not deliver it: `bash -c` FORKS for a compound command (the iOS `Installing on
+          // device...` step is one), so the signal killed the shell and orphaned the real child.
+          // The build slot (#173) narrowed the window by holding until this loop settles; #176
+          // closed it — `killBuildProcess` signals the process GROUP, so the orphan can no longer
+          // outlive the slot. docs/build.md § "One build at a time".
           let activeProc: ReturnType<typeof spawn> | null = null;
           let aborted = false;
-          req.on('close', () => { aborted = true; try { activeProc?.kill('SIGTERM'); } catch { /* gone */ } });
+          req.on('close', () => { aborted = true; killBuildProcess(activeProc); });
 
           // Provision Node ONCE for this build so every step's bash `npm`/`npx`/`node` runs on the
           // toolchain-provisioned Node (packaged: no system npm). Shared by scaffold + build steps.
@@ -2570,7 +2577,7 @@ export function assetScannerPlugin(): Plugin {
 
           let activeProc: ReturnType<typeof spawn> | null = null;
           let aborted = false;
-          req.on('close', () => { aborted = true; try { activeProc?.kill('SIGTERM'); } catch { /* gone */ } });
+          req.on('close', () => { aborted = true; killBuildProcess(activeProc); });
 
           const runStep = (label: string, cmd: string, cwd: string, env: NodeJS.ProcessEnv) => new Promise<{ ok: boolean; output: string }>((resolve) => {
             send(`\n── ${label} ──`);
