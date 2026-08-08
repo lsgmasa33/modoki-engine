@@ -91,6 +91,16 @@ function toFloat2Packed(pairs: number[][] | undefined, n: number): Float32Array 
 
 /** Coerce one raw part (mesh + weights + sprite) into a render-ready `ParsedRig2DPart`,
  *  filling defaults, clamping bone indices, and renormalizing weights so LBS is affine. */
+/** Parts we have already reported as having weights outside the skeleton, keyed
+ *  `name|boneCount|badCount` — see the warn below for why once-per-call is wrong. */
+const _warnedStaleRigParts = new Set<string>();
+
+/** Test-only: forget what has been warned about, so one test's corrupt rig cannot silence the
+ *  next one's. Not called by production code — the dedupe is meant to last a session. */
+export function resetRig2DWarningsForTests(): void {
+  _warnedStaleRigParts.clear();
+}
+
 function normalizePart(raw: Rig2DPart, index: number, boneCount: number): ParsedRig2DPart {
   const verts2d = raw?.mesh?.verts;
   const vertCount = Array.isArray(verts2d) ? verts2d.length : 0;
@@ -105,6 +115,7 @@ function normalizePart(raw: Rig2DPart, index: number, boneCount: number): Parsed
   const skinIndices = new Uint32Array(vertCount * 4);
   const skinWeights = new Float32Array(vertCount * 4);
   const srcIdx = raw?.skinIndices, srcWgt = raw?.skinWeights;
+  let outOfRange = 0;
   for (let v = 0; v < vertCount; v++) {
     let sum = 0;
     for (let i = 0; i < 4; i++) {
@@ -112,12 +123,46 @@ function normalizePart(raw: Rig2DPart, index: number, boneCount: number): Parsed
       const bi = Array.isArray(srcIdx) && Number.isInteger(srcIdx[o]) ? srcIdx[o] | 0 : 0;
       let w = Array.isArray(srcWgt) && Number.isFinite(srcWgt[o]) ? +srcWgt[o] : (i === 0 && !Array.isArray(srcWgt) ? 1 : 0);
       if (w < 0) w = 0;
+      // An index past the end of the skeleton is CLAMPED to bone 0 (the rig still has to render),
+      // but it is counted and reported once below. It used to be clamped in silence, and that
+      // silence is why #179 went unnoticed: `removeBone` renumbered the skeleton without
+      // renumbering a v2 rig's per-part indices, so parts referenced bones that no longer existed
+      // and the only symptom was geometry snapping to the root. A rig whose weights outrun its
+      // bones is always a data bug — nothing legitimately authors one.
+      if (bi >= boneCount || bi < 0) outOfRange++;
       skinIndices[o] = bi >= 0 && bi < boneCount ? bi : 0;
       skinWeights[o] = w;
       sum += w;
     }
     if (sum > 0) { for (let i = 0; i < 4; i++) skinWeights[v * 4 + i] /= sum; }
     else { skinWeights[v * 4] = 1; } // degenerate → fully bind to bone 0
+  }
+
+  // ONE line per part, not per vertex — a corrupted rig has thousands of bad indices and a
+  // per-vertex warn would bury the very message it exists to deliver.
+  //
+  // And once per (part, shape), not once per CALL. `normalizeRig2D` is not load-only: the editor's
+  // `applySkinDef` re-normalizes on every edit, and its own comment says it is "safe to call per
+  // paint move" — so an un-deduped warn fires tens of times a second while someone drags the weight
+  // brush across the very rig it is complaining about. Same reason (and same shape) as
+  // `_warnedMissingClip` in scene3DSync. The key includes the count so a rig that gets WORSE says
+  // so again, rather than being silenced by the first report.
+  // `boneCount > 0`: a rig with NO bones yet is a normal authoring state (tessellate the mesh, then
+  // add the skeleton), and every vertex defaults to index 0 — which is out of range against an empty
+  // bone list. Warning there would fire on an unrigged mesh and tell its author to "undo the bone
+  // edit that renumbered them", advice for a thing that never happened.
+  if (outOfRange && boneCount > 0) {
+    const name = typeof raw?.name === 'string' && raw.name ? raw.name : `part${index}`;
+    const key = `${name}|${boneCount}|${outOfRange}`;
+    if (!_warnedStaleRigParts.has(key)) {
+      _warnedStaleRigParts.add(key);
+      console.warn(
+        `[rig2d] part "${name}": ${outOfRange} vertex weight(s) reference a bone index outside the ` +
+        `skeleton (${boneCount} bone${boneCount === 1 ? '' : 's'}) — clamped to bone 0, so this part ` +
+        `will deform wrongly. The rig's weights and its bone list disagree; re-bind the part, or undo ` +
+        `the bone edit that renumbered them.`,
+      );
+    }
   }
 
   return {

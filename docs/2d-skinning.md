@@ -233,3 +233,50 @@ an optional alpha coverage predicate; these return a ready `.rig2d.json` payload
   stale. Verify editor-render changes in a fresh editor build, not via HMR.
 - **`resolveRef` rejects literal asset paths** — the `rig` field (and `sprite` inside
   the rig) must be GUIDs, guarded by `assetRefIntegrity`.
+- **Anything that renumbers bones must renumber EVERY part's `skinIndices` — a v2 rig
+  has one weight set per part, not one per rig** (#179). `removeBone` shifts every bone
+  index down to close the gap, and it used to rewrite only the *top-level*
+  `skinIndices`/`skinWeights`. Those are the **v1** fields, and `ensurePartsArray`
+  strips them the moment a rig becomes multi-part — so on a v2 rig the remap loop read an
+  absent `def.mesh`, saw zero vertices, did nothing, and left every part pointing at the
+  old numbering. The result is silent: `normalizePart` **clamps** an index past the end of
+  the skeleton to bone 0, so a stale part either deforms with whatever bone shifted into
+  its slot, or snaps to the root — and `commit()` writes it to disk either way.
+  A third rule, from reviewing that fix: **a structural edit's output must NORMALIZE TO
+  ITSELF.** The editor deforms from the RAW def (`SkinCanvas.deformMesh` reads
+  `activePartOf`, with no `normalizeRig2D` in between), so any repair that only the load
+  path performs makes the live preview and the reloaded rig disagree about the same file.
+  A vertex bound *entirely* to the deleted bone used to end up with all four weights at
+  zero; `normalizePart`'s degenerate branch quietly rebound it to bone 0 on load, while
+  `deformMesh` — which skips every zero-weight term — collapsed it to the local origin for
+  the rest of the session. `removeBone` now applies the same fallback the loader would.
+  Two more rules follow. Structural edits iterate `def.parts` and use **each part's own**
+  `mesh.verts.length` (parts do not share a vertex count), and they leave the v1
+  top-level fields alone on a v2 rig rather than overwriting them with an empty array —
+  `normalizeRig2D` ignores those whenever `parts` is present, so writing them is
+  inventing data, and it is what made the bug invisible. `addBone` (appends) and
+  `reparentBone` (rewrites a parent field only) shift no indices and need none of this.
+- **A weight that outruns the skeleton now warns at load, once per part** — the clamp
+  above still happens (the rig has to render), but `normalizePart` counts the bad indices
+  and reports them with the part name and bone count. Nothing legitimately authors a rig
+  whose weights reference a missing bone, so treat the warning as data corruption and
+  find the edit that renumbered them. Deliberately once per PART, and once per SESSION per
+  `name|boneCount|badCount`: a corrupted rig has thousands of bad indices, so a per-vertex
+  warning buries its own message — and `normalizeRig2D` is **not load-only** (the editor's
+  `applySkinDef` re-normalizes on every edit, "safe to call per paint move"), so an
+  un-deduped one fires tens of times a second while you drag the brush across the very rig
+  it is complaining about. The count is in the key so a rig that gets WORSE reports again
+  instead of being silenced by the first report. Same shape as `_warnedMissingClip` in
+  `scene3DSync`.
+  **The 3D skeletal path is immune to this class by construction, and it is worth knowing
+  why rather than re-deriving it** (swept after #179): Modoki owns no indexed bone table
+  there at all. Bones, bone attachments, skinned-mesh nodes and clip tracks all resolve by
+  NAME and fail CLOSED — `entry.bones.get(name)` then `if (!bone) return`, skipping that
+  one entity instead of clamping to bone 0. The GLB's own `JOINTS_0` indices live inside
+  `THREE.Skeleton`/geometry that nothing here renumbers: the rigged converter only
+  `joinPrimitives`-merges same-material submeshes, and the weld/simplify pipeline that
+  could damage weights is reachable only by a static model — the split is decided at
+  import by `inspectGLBRig().hasSkinned` (a skinned MESH, not the presence of clips), so a
+  skinned-but-unanimated GLB still takes the rigged path. That is the defence the 2D side
+  lacked: an index table is only safe if every consumer is updated together, and a name is
+  safe on its own.

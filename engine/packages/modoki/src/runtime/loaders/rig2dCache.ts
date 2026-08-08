@@ -16,7 +16,7 @@ import { parseAssetJson } from './assetFetch';
 
 export {
   type Rig2DBone, type Rig2DPart, type Rig2DFile, type ParsedRig2DPart, type ParsedRig2D,
-  normalizeRig2D, coerceRigBones,
+  normalizeRig2D, coerceRigBones, resetRig2DWarningsForTests,
 } from '../skinning/rig2dTypes';
 
 const cache = new Map<string, ParsedRig2D>();
