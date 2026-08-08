@@ -14,6 +14,7 @@ import { backendFetch } from '../backend/editorBackend';
 import { saveAssetDialog } from '../utils/saveDialog';
 import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { sceneManager } from '../../runtime/scene/SceneManager';
+import { isPrefabEditWorld } from './prefabEditWorld';
 import { useEditorStore } from '../store/editorStore';
 import { setPlayState, getRunMode } from '../../runtime/core/playState';
 import { swapHistory, getEditVersion } from '../undo/undoManager';
@@ -789,7 +790,7 @@ export function unsavedChangeCauses(): { sceneDirty: boolean; dirtyAssetPaths: s
 export interface SaveResult {
   saved: boolean;
   path: string | null;
-  reason: 'ok' | 'cancelled' | 'write-failed' | 'needs-path' | 'playing';
+  reason: 'ok' | 'cancelled' | 'write-failed' | 'needs-path' | 'playing' | 'prefab-edit';
   /** Other loaded scenes (Phase 12, M3 — a dirty BASE, edited in place) written in
    *  the SAME `saveAll` call, alongside the primary. Absent/empty when nothing else
    *  was dirty. A base is only ever written once the primary's own save succeeded —
@@ -820,6 +821,26 @@ export async function saveScene(opts: {
   allowDialog?: boolean;
 } = {}): Promise<SaveResult> {
   const { path: explicitPath, allowDialog = true } = opts;
+  // ⚠️ NEVER serialize the prefab-edit world. Its entities are the prefab PLUS throwaway scaffolding
+  // (key light, ambient, HDR, and the 2D `Canvas2D` host + centring stage), and its scene path is
+  // deliberately null so a normal save cannot target a real file. But "no path" then fell into the
+  // Save-As branch below — so Cmd+S offered a native "Save Scene As" panel and, if accepted, would
+  // have written the SCAFFOLDING into a brand-new scene file.
+  //
+  // Observed, not theorised: an exit whose scene reload failed left the world synthetic with the
+  // `editingPrefab` flag cleared, `isEditingPrefab()` therefore returned false, and Cmd+S fell
+  // through to exactly that dialog ("prefab cannot be saved — it opens a new file dialog").
+  //
+  // The guard asks the WORLD (`isPrefabEditWorld`) rather than the store flag, which is the whole
+  // point: the flag is what was out of sync. `savePrefabEdit()` is the save for this world, and the
+  // Cmd+S callers route to it — this refusal is the backstop for every path that does not.
+  // ⚠️ Conjunction, not `isPrefabEditWorld()` alone. `newScene()` wipes the ECS world and sets
+  // `_currentScenePath` WITHOUT touching sceneManager, so the live path stays SYNTHETIC after
+  // "Create Scene" is used from the Assets panel during prefab-edit — and the bare guard then
+  // refused to write the brand-new scene, silently (neither `create()` nor `runCreate` checks the
+  // result). `_currentScenePath` is the discriminator: prefab-edit deliberately nulls it, while a
+  // real save target means the world is no longer the prefab's. Refusing needs BOTH.
+  if (isPrefabEditWorld() && !_currentScenePath) return { saved: false, path: null, reason: 'prefab-edit' };
   // TRANSIENCE guard (preview-mode-refactor, Phase 2): only ever WRITE authored data. While
   // scrub/preview/play is live the world holds preview mutations (a signal action moved the
   // camera, `isActive` toggled, a control prefab spawned) — the Transient skip drops spawns, but

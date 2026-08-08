@@ -41,7 +41,7 @@ import {
   getRenderSettings, resolveToneMapping, getEffectiveThreeSettings,
   getActiveQualityTier, setActiveQualityTier, getActiveTierOrDefault,
 } from './renderSettings';
-import { resolveTier, tierShadowMapSize, tierAllowsIBL, tierAmbientBoost, tierExposureBoost, type QualityTierSetting } from './qualityTier';
+import { resolveTier, tierShadowMapSize, tierAllowsIBL, tierAmbientBoost, tierExposureBoost, shadowBiasScale, type QualityTierSetting } from './qualityTier';
 import { applyInstancedBatching } from './instancedBatching';
 import { getDeviceCaps } from './deviceCaps';
 import { getPlayerQualityTier } from './playerQualityTier';
@@ -650,13 +650,19 @@ function configureLightShadow(
   // Clamp to the tier's ceiling (#121 P3). `Light.shadowMapSize` is a per-light trait field with
   // no global cap, so without this a tier could say "shadows, but smaller" and nothing would
   // enforce it — a scene authoring 2048 across 150 casters would ignore the tier entirely.
-  const size = tierShadowMapSize(light.shadowMapSize || 2048, getActiveTierOrDefault());
+  const authoredSize = light.shadowMapSize || 2048;
+  const size = tierShadowMapSize(authoredSize, getActiveTierOrDefault());
   if (s.mapSize.width !== size || s.mapSize.height !== size) {
     s.mapSize.set(size, size);
     if (s.map) { s.map.dispose(); (s as unknown as { map: unknown }).map = null; }
   }
-  s.bias = light.shadowBias;
-  s.normalBias = light.shadowNormalBias;
+  // Bias is texel-footprint-relative — a map clamped smaller than authored needs a scaled bias
+  // or it self-shadows (see `shadowBiasScale` in qualityTier.ts, and §0b "Shadows on `low`
+  // would render ACNE" for why a matching extent-shrink was tried and reverted: it silently
+  // dropped distant casters' shadows rather than fixing the sampling).
+  const scale = shadowBiasScale(authoredSize, size);
+  s.bias = light.shadowBias * scale;
+  s.normalBias = light.shadowNormalBias * scale;
   (s as unknown as { radius: number }).radius = light.shadowRadius;
   s.camera.near = 0.1;
   s.camera.far = 200;

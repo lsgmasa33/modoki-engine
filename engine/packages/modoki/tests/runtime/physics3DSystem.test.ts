@@ -118,4 +118,69 @@ describe('physics3DSystem — raycast', () => {
     // Cast well to the side, away from the unit sphere at the origin.
     expect(raycast3D(tw.world, 50, 10, 0, 0, -1, 0, { maxDistance: 100 })).toBeNull();
   });
+
+  // opts.exclude — a ground probe that starts INSIDE its own caster's collider (the
+  // BlobShadow bug: the caster's own world position sits inside its own capsule/box, so
+  // `solid: true` reports a distance-0 self-hit unless that body is excluded).
+  describe('opts.exclude', () => {
+    /** Floor top at y=1 (box at y=0, halfH=1), plus a "caster" static box straddling
+     *  y=[3,5] (center y=4, halfH=1) whose own collider the ray origin (y=4) sits inside. */
+    function excludeScene(t: TestWorld) {
+      t.spawn(Physics3D({ gravityX: 0, gravityY: -9.81, gravityZ: 0 }));
+      const floor = t.spawn(
+        Transform({ x: 0, y: 0, z: 0 }),
+        RigidBody3D({ bodyType: 'static' }),
+        Collider3D({ shape: 'box', halfW: 100, halfH: 1, halfD: 100 }),
+      );
+      const caster = t.spawn(
+        Transform({ x: 0, y: 4, z: 0 }),
+        RigidBody3D({ bodyType: 'static' }),
+        Collider3D({ shape: 'box', halfW: 1, halfH: 1, halfD: 1 }),
+      );
+      return { floor, caster };
+    }
+
+    it('without exclude, a ray from inside the caster self-hits at distance 0', () => {
+      tw = createTestWorld({ systems: [PHYS] });
+      const { caster } = excludeScene(tw);
+      tw.step(1);
+      const hit = raycast3D(tw.world, 0, 4, 0, 0, -1, 0, { maxDistance: 100 });
+      expect(hit).not.toBeNull();
+      expect(hit!.entityId).toBe(caster.id());
+      expect(hit!.distance).toBeCloseTo(0, 6);
+    });
+
+    it('with exclude, the ray skips the caster and reports the next surface below', () => {
+      tw = createTestWorld({ systems: [PHYS] });
+      const { floor, caster } = excludeScene(tw);
+      tw.step(1);
+      const hit = raycast3D(tw.world, 0, 4, 0, 0, -1, 0, { maxDistance: 100, exclude: caster.id() });
+      expect(hit).not.toBeNull();
+      expect(hit!.entityId).toBe(floor.id());
+      expect(hit!.distance).toBeCloseTo(3, 1); // y=4 down to floor top y=1
+      expect(hit!.ny).toBeCloseTo(1, 1);
+    });
+
+    it('with exclude and nothing else below, returns null rather than the excluded self-hit', () => {
+      tw = createTestWorld({ systems: [PHYS] });
+      tw.spawn(Physics3D({ gravityX: 0, gravityY: -9.81, gravityZ: 0 }));
+      const caster = tw.spawn(
+        Transform({ x: 0, y: 4, z: 0 }),
+        RigidBody3D({ bodyType: 'static' }),
+        Collider3D({ shape: 'box', halfW: 1, halfH: 1, halfD: 1 }),
+      );
+      tw.step(1);
+      expect(raycast3D(tw.world, 0, 4, 0, 0, -1, 0, { maxDistance: 100, exclude: caster.id() })).toBeNull();
+    });
+
+    it('an exclude id that resolves to no live body behaves as if omitted', () => {
+      tw = createTestWorld({ systems: [PHYS] });
+      const { caster } = excludeScene(tw);
+      tw.step(1);
+      const hit = raycast3D(tw.world, 0, 4, 0, 0, -1, 0, { maxDistance: 100, exclude: 999999 });
+      expect(hit).not.toBeNull();
+      expect(hit!.entityId).toBe(caster.id());
+      expect(hit!.distance).toBeCloseTo(0, 6);
+    });
+  });
 });

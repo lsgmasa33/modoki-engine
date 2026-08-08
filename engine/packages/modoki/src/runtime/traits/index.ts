@@ -49,6 +49,7 @@ export { Tint } from './Tint';
 export { MaterialInstance, hasPropOverride, isMaterialInstanced, type MaterialParamOverride, type MaterialParamSource } from './MaterialInstance';
 export { ParticleEmitter } from './ParticleEmitter';
 export { FlameMesh } from './FlameMesh';
+export { BlobShadow } from './BlobShadow';
 export { Animator } from './Animator';
 export { SpriteAnimator, defaultSpriteClip, type SpriteClip } from './SpriteAnimator';
 export { RigidBody2D, type BodyType2D } from './RigidBody2D';

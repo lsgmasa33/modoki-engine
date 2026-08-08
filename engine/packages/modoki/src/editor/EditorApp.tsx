@@ -273,7 +273,17 @@ export default function EditorApp() {
             useEditorStore.getState().showToast(msg, 'warn');
             return;
           }
-          if (isEditingPrefab()) { savePrefabEdit(); useEditorStore.getState().showToast('Prefab saved', 'success'); }
+          // ⚠️ AWAIT it and report what happened. This fired the green toast unconditionally, without
+          // awaiting — so a refused save (prefab root not found, the opened prefab gone from the
+          // editor cache, a failed write) told the human their work was safe when nothing had been
+          // written. Exactly the C7 class fixed for scenes three lines below, still live here.
+          if (isEditingPrefab()) {
+            void savePrefabEdit().then((ok) => {
+              const t = useEditorStore.getState().showToast;
+              if (ok) t('Prefab saved', 'success');
+              else t('Prefab save FAILED — nothing written to disk (see console)', 'warn');
+            });
+          }
           // Report what actually happened. This showed a green "Scene saved" unconditionally —
           // not even awaiting saveAll — so a Save-As CANCEL or a failed write (project moved,
           // disk full, permissions) told the HUMAN their work was safe when it was not. (C7)
@@ -282,7 +292,12 @@ export default function EditorApp() {
               const t = useEditorStore.getState().showToast;
               if (r.saved) t('Scene saved', 'success');
               else if (r.reason === 'cancelled') t('Save cancelled — nothing written', 'info');
-              else t(`Save FAILED (${r.reason}) — nothing written to disk`, 'warn');
+              // Reachable only when the prefab-edit world is loaded but the editingPrefab flag is
+              // gone, so the branch above did not claim the keystroke. Say which save is missing
+              // rather than "Save FAILED (prefab-edit)", which reads like a bug in the prefab.
+              else if (r.reason === 'prefab-edit') {
+                t('This is a prefab-edit world — re-open the prefab to save it (nothing written)', 'warn');
+              } else t(`Save FAILED (${r.reason}) — nothing written to disk`, 'warn');
             });
           }
         },
@@ -626,10 +641,23 @@ export default function EditorApp() {
       // New Scene → Assets panel context menu (Create Scene), so it makes a scene
       // FILE. Save Scene As → rename the scene in the Assets window. Both dropped here.
       { label: 'Save All', shortcut: 'Cmd+S', action: () => {
-        if (isEditingPrefab()) { savePrefabEdit(); return; }
+        // ⚠️ This is the NATIVE File-menu twin of the `app.saveAll` keymap handler above, reachable
+        // without the shortcut, and it must report failures the same way. It did not: the prefab
+        // branch was fire-and-forget with no toast at all, so a refused prefab save (root not
+        // found, prefab evicted from the editor cache, write rejected) told the user nothing. The
+        // keymap handler was fixed first and this duplicate 360 lines away was missed — the exact
+        // hazard of having two entry points for one command.
+        if (isEditingPrefab()) {
+          void savePrefabEdit().then((ok) => {
+            const t = useEditorStore.getState().showToast;
+            t(ok ? 'Prefab saved' : 'Prefab save FAILED — nothing written to disk (see console)', ok ? 'success' : 'warn');
+          });
+          return;
+        }
         void saveAll().then((r) => { // never claim a save that didn't land (C7)
           const t = useEditorStore.getState().showToast;
           if (r.saved) t('Scene saved', 'success');
+          else if (r.reason === 'prefab-edit') t('This is a prefab-edit world — re-open the prefab to save it (nothing written)', 'warn');
           else if (r.reason !== 'cancelled') t(`Save FAILED (${r.reason}) — nothing written to disk`, 'warn');
         });
       } },

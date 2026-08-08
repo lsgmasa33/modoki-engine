@@ -1,7 +1,9 @@
 /** getOverrideValues unit tests — same diff logic as getOverrides, but
  *  emits the actual override VALUES so they can round-trip into scene files. */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll } from 'vitest';
+import { trait } from 'koota';
+import { registerTrait } from '../../src/runtime/core/ecs/traitRegistry';
 
 async function getModule() {
   return import('../../src/editor/scene/prefab');
@@ -247,5 +249,53 @@ describe('getOverrideValues', () => {
     const fromValues = new Set<string>();
     for (const [t, fields] of Object.entries(values)) for (const f of Object.keys(fields)) fromValues.add(`${t}.${f}`);
     expect(fromValues).toEqual(keys);
+  });
+});
+
+/** A field ABSENT from the prefab base means the trait's schema DEFAULT — not "unknown".
+ *
+ *  ⚠️ The gate used to be `origValue !== undefined`, so a base missing the field skipped the
+ *  comparison entirely and a real instance override was never reported. That was latent for as long
+ *  as prefab files wrote every field, and became REACHABLE on 2026-08-08 when `serializePrefab`
+ *  started dropping BLANK asset refs (a prefab with no material stopped writing `material: ""`).
+ *
+ *  The save path survives it — `captureInstanceOverrides` folds marked fields back in — but the RAW
+ *  callers do not: the Inspector's "overridden" highlight, and the Apply-to-Prefab / Revert-Overrides
+ *  dialogs, which build their checkbox tree from these diffs. A field missing from the diff has no
+ *  checkbox at all, so it cannot be applied or reverted. */
+describe('getOverrideValues — a base field that is ABSENT falls back to the schema default', () => {
+  const R2D = trait({ sprite: '', material: '', width: 1, height: 1 });
+
+  beforeAll(() => {
+    registerTrait({
+      name: 'Renderable2DTestDouble', trait: R2D, category: 'component',
+      fields: { sprite: { type: 'string' }, material: { type: 'string' }, width: { type: 'number' }, height: { type: 'number' } },
+    });
+  });
+
+  it('reports a real GUID as an override even though the base omits the field', async () => {
+    const { getOverrideValues } = await getModule();
+    // Exactly what a stripped prefab looks like: no `material` key at all.
+    const prefab = makePrefab([{ localId: 1, traits: { Renderable2DTestDouble: { sprite: 'circle', width: 80 } } }]);
+    const out = getOverrideValues(1, {
+      Renderable2DTestDouble: { sprite: 'circle', material: 'a026fcb5-eceb-463c-8afb-feed81965326', width: 80 },
+    }, prefab);
+    expect(out, 'the instance set a material the base does not have — that IS an override')
+      .toEqual({ Renderable2DTestDouble: { material: 'a026fcb5-eceb-463c-8afb-feed81965326' } });
+  });
+
+  it('does NOT report an override when the instance also holds the default', async () => {
+    // The other direction: absent base + default instance value are the same thing, so a diff here
+    // would spam a spurious override onto every instance of every stripped prefab.
+    const { getOverrideValues } = await getModule();
+    const prefab = makePrefab([{ localId: 1, traits: { Renderable2DTestDouble: { sprite: 'circle', width: 80 } } }]);
+    const out = getOverrideValues(1, { Renderable2DTestDouble: { sprite: 'circle', material: '', width: 80 } }, prefab);
+    expect(out).toEqual({});
+  });
+
+  it('an UNREGISTERED trait still degrades safely (no schema to consult, no crash)', async () => {
+    const { getOverrideValues } = await getModule();
+    const prefab = makePrefab([{ localId: 1, traits: { NotRegisteredAnywhere: { a: 1 } } }]);
+    expect(() => getOverrideValues(1, { NotRegisteredAnywhere: { a: 1, b: 2 } }, prefab)).not.toThrow();
   });
 });

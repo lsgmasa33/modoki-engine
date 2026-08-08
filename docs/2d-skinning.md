@@ -105,7 +105,11 @@ Two renderers read the same `skin2DBuffers` entry:
   overlays via `render2DUtils`: `drawSkinnedMeshWireframe2D` (tessellation wireframe),
   `drawWeightHeatmap2D` (selected-bone influence, grayscale) / `drawDominantBoneMap2D`
   (whole-rig dominant-bone segmentation) for the weight view, and `drawSkinnedMeshFlat2D`
-  (flat-tint fallback while the texture loads). Plus a `Bone2D`
+  (flat-tint fallback while the texture loads). Those weight overlays are **read-only and
+  per-part**: `overlayPartIndices` (`editor/panels/skinWeightOverlay.ts`) pairs each
+  visible part's deformed positions with **that part's own** weights, skipping hidden
+  parts and any part whose buffer/rig vertex counts disagree (see the Gotcha below for
+  why both the per-part pairing and the fail-closed check are load-bearing). Plus a `Bone2D`
   overlay (child→parent joint lines + screen-constant handle dots). Bones are
   click-selectable (dots hit-tested first; skinned bodies by mesh AABB) and gizmo-
   poseable (the 2D gizmo gate was generalized off the Renderable2D-only check to any
@@ -203,6 +207,8 @@ an optional alpha coverage predicate; these return a ready `.rig2d.json` payload
   auto-place bones (Rig mode), Re-tessellate the mesh at a chosen grid density,
   Auto-weight, paint weights with a heatmap overlay, and a one-click Auto-rig that runs
   the whole `autoRig2D` pipeline on the active part. Rigs can also be hand-authored JSON.
+  **Weight painting lives ONLY in the Skin panel** — SceneView shows the heatmap but has
+  no brush (see the Gotcha below).
   Once a rig exists, open a scene with a `SkinnedSprite2D` + `Bone2D` children; select a
   bone in the Hierarchy or by clicking its joint in SceneView; pose it with the gizmo
   (works while stopped) and the mesh deforms live in both viewports.
@@ -280,3 +286,35 @@ an optional alpha coverage predicate; these return a ready `.rig2d.json` payload
   skinned-but-unanimated GLB still takes the rigged path. That is the defence the 2D side
   lacked: an index table is only safe if every consumer is updated together, and a name is
   safe on its own.
+- **Weight painting is a SKIN-PANEL-only gesture, deliberately — SceneView shows weights
+  and never edits them** (#180). SceneView used to carry a second weight brush: with the
+  Skin panel open in Weights mode and a `Bone2D` selected, dragging in the scene painted
+  that bone's influence on the posed character. It read the **v1 top-level** `def.mesh` /
+  `skinIndices` in all three of its halves (the guard, the paint, and the undo entry), and
+  `ensurePartsArray` strips those the moment a rig gains a second part — so it had been a
+  complete no-op on every multi-part rig since parts landed, with no message and no log,
+  and nobody noticed. It was **removed rather than made parts-aware**, for reasons that
+  outlive the bug:
+  - It contradicted the editor-surface convention in CLAUDE.md — *asset editors are
+    panels; the viewport is for instance/spatial editing.* A weight stroke edits the
+    `.rig2d.json` **asset**, so it belongs to the Skin panel.
+  - It was a **hidden shared-asset edit**. In SceneView you appear to be editing the
+    entity under the cursor; you were in fact mutating a file shared by every entity using
+    that rig, in every scene, with nothing on screen saying so.
+  - It duplicated no capability. `SkinCanvas.paintAt` already paints against a test pose,
+    so "paint on the bent limb" was never unique to the viewport.
+  - Fixing it would have required inventing a targeting rule the panel already owns
+    (it paints every non-hidden part; SceneView has no parts list to scope a stroke with),
+    plus a per-part buffer lookup its hardcoded `parts[0]` never had.
+  What SURVIVES is the read-only heatmap, which is safe by the same reasoning — looking is
+  not editing. It was fixed in the same change to shade **every visible part with its own
+  weights** (`overlayPartIndices`): it too had read the `parts[0]` back-compat aliases, so
+  it showed part 0's influence over the whole rig while the magenta wireframe beside it
+  outlined every part. The pairing `buffer.parts[i] ↔ rig.parts[i]` is sound because
+  `skin2DSystem` builds the buffer as `parsed.parts.map(...)` and rebuilds on any
+  part-count/vertex-count change — but **it does not extend to the authoring def**, since
+  `normalizeRig2D` SORTS parts by `order`; anything pairing against `Rig2DFile.parts` must
+  map by NAME. The overlay still verifies the vertex counts agree and skips the part for a
+  frame when they don't: a frame can land between a rig edit and the reskin, and drawing
+  through it would index one part's weights into another part's positions — #179's exact
+  failure mode, in a read path.

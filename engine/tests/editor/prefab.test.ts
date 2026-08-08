@@ -9,9 +9,12 @@ import { getTraitByName } from '@modoki/engine/runtime';
 import { serializePrefab, instantiatePrefab, type PrefabFile } from '@modoki/engine/editor';
 import {
   buildPrefabEditScene,
+  SCAFFOLD_PREFIX,
   PREFAB_EDIT_ROOT_GUID,
   PREFAB_EDIT_LOCAL_GUID_PREFIX,
+  PREFAB_EDIT_SCENE_PREFIX,
   collectPreservedLocalIds,
+  resolveReturnScene,
 } from '../../packages/modoki/src/editor/scene/prefabEdit';
 
 registerAllTraits();
@@ -330,6 +333,119 @@ describe('buildPrefabEditScene — sentinel guid stamping', () => {
     expect(rootGuid).toBe(PREFAB_EDIT_ROOT_GUID);
     expect(leafGuid).toBe(`${PREFAB_EDIT_LOCAL_GUID_PREFIX}1`);
     expect(gapGuid).toBe(`${PREFAB_EDIT_LOCAL_GUID_PREFIX}5`);
+  });
+});
+
+/** A 2D prefab needs a `Canvas2D` HOST or it renders NOTHING.
+ *
+ *  ⚠️ Prefab-edit mode scaffolded a 3D world only — a key light, an ambient light and an HDR — so
+ *  opening a prefab made of `Renderable2D`/`Text2D` gave a completely blank viewport: every entity
+ *  present, every trait correct, nothing drawn, because `Renderable2D` is rendered by a `Canvas2D`
+ *  host and by nothing else. Reported against Court's tray-badge prefab (the whole point of which was
+ *  hand-tuning a layout you can see), and it would hit any 2D prefab in any project.
+ *
+ *  The injection is CONDITIONAL, and both directions matter: a 2D prefab must get the host, and a 3D
+ *  prefab's world must be exactly what it was before. */
+describe('buildPrefabEditScene — 2D prefabs get a Canvas2D host', () => {
+  // `name` is optional on a scene entry, so narrow before matching — the prefix test would
+  // otherwise be a typecheck error the vitest run cannot see (it transpiles without checking).
+  const scaffoldNames = (scene: { entities: Array<{ name?: string }> }): string[] =>
+    scene.entities.map((e) => e.name ?? '').filter((n) => n.startsWith(SCAFFOLD_PREFIX));
+
+  const prefab2D: PrefabFile = {
+    version: 1, name: 'Badge2D', rootLocalId: 1,
+    entities: [
+      { localId: 1, name: 'Root', traits: { EntityAttributes: { name: 'Root', parentId: 0 }, Transform: { x: 0, y: 0 } } },
+      { localId: 2, name: 'Disc', traits: { EntityAttributes: { name: 'Disc', parentId: 1 }, Transform: { x: 0, y: 0 }, Renderable2D: { sprite: 'circle', width: 80, height: 80 } } },
+      { localId: 3, name: 'Label', traits: { EntityAttributes: { name: 'Label', parentId: 1 }, Transform: { x: 0, y: 40 }, Text2D: { text: 'x1', fontSize: 40 } } },
+    ],
+  };
+
+  it('injects a Canvas2D host + a centring stage, and parents the ROOT into the stage', () => {
+    const scene = buildPrefabEditScene(prefab2D);
+    const names = scaffoldNames(scene);
+    expect(names, 'the 2D host is added alongside the 3D lighting scaffold')
+      .toContain(`${SCAFFOLD_PREFIX}Canvas2D`);
+    expect(names).toContain(`${SCAFFOLD_PREFIX}Stage`);
+    const canvas = scene.entities.find((e) => e.name === `${SCAFFOLD_PREFIX}Canvas2D`)!;
+    const stage = scene.entities.find((e) => e.name === `${SCAFFOLD_PREFIX}Stage`)!;
+    // A host is a UIElement carrying Canvas2D — the trait's own doc: "must also have
+    // RenderableUI + UIElement". Missing either is the blank-viewport bug again.
+    expect(canvas.traits.Canvas2D, 'the host carries Canvas2D').toBeTruthy();
+    expect(canvas.traits.RenderableUI, 'and RenderableUI, or the DOM node never mounts').toBe(true);
+    expect(canvas.traits.UIElement, 'and UIElement, for DOM positioning').toBeTruthy();
+    // The ROOT is re-parented, its descendants are NOT — the subtree's internal layout is the thing
+    // being edited and must not move.
+    const root = scene.entities.find((e) => e.id === 1)!;
+    const disc = scene.entities.find((e) => e.id === 2)!;
+    expect((root.traits.EntityAttributes as Record<string, unknown>).parentId).toBe(stage.id);
+    expect((disc.traits.EntityAttributes as Record<string, unknown>).parentId, 'children keep their authored parent').toBe(1);
+  });
+
+  it('frames the canvas to the CONTENT rather than leaving the 1080x1920 default', () => {
+    // A badge ~160 design px across inside a 1080-wide box is 15% of the view — visible, and useless
+    // to tune. This is the 2D equivalent of the 3D preview aiming its camera at the model.
+    const scene = buildPrefabEditScene(prefab2D);
+    const c2d = scene.entities.find((e) => e.name === `${SCAFFOLD_PREFIX}Canvas2D`)!
+      .traits.Canvas2D as Record<string, number>;
+    expect(c2d.referenceWidth, 'framed to content, not the 1080 default').toBeLessThan(1080);
+    expect(c2d.referenceWidth).toBeGreaterThan(0);
+    expect(c2d.referenceHeight).toBeGreaterThan(0);
+  });
+
+  it('adds NOTHING for a 3D prefab — the world stays exactly what it was', () => {
+    const prefab3D: PrefabFile = {
+      version: 1, name: 'Mesh3D', rootLocalId: 1,
+      entities: [{ localId: 1, name: 'Root', traits: { EntityAttributes: { name: 'Root', parentId: 0 }, Renderable: { mesh: '' } } }],
+    };
+    const names = scaffoldNames(buildPrefabEditScene(prefab3D));
+    expect(names, 'no 2D host for a prefab that does not draw in 2D')
+      .not.toContain(`${SCAFFOLD_PREFIX}Canvas2D`);
+    expect(names).not.toContain(`${SCAFFOLD_PREFIX}Stage`);
+    // And the root is left at the top level, as a 3D prefab has always been.
+    const root = buildPrefabEditScene(prefab3D).entities.find((e) => e.id === 1)!;
+    expect((root.traits.EntityAttributes as Record<string, unknown>).parentId).toBe(0);
+  });
+});
+
+/** Leaving prefab-edit must land on a REAL scene — never on the synthetic edit world.
+ *
+ *  ⚠️ The bug: `openPrefabForEditing` recorded the return scene from `sceneManager.getCurrent()
+ *  ?.path`, which is `/__prefab-edit__/<guid>` when a prefab is opened from INSIDE prefab-edit — a
+ *  nested prefab, or just double-clicking another prefab in the Assets panel. Exit then tried to
+ *  LOAD that path, which is not a file: `[Editor] Failed to load scene: no asset at
+ *  /__prefab-edit__/… — the dev server answered with index.html`, leaving the editor in the prefab
+ *  world with a null scene path and no way back but opening a scene by hand. Observed live.
+ *
+ *  The same function one line above already asked `getCurrentScenePath()` (null in prefab-edit) and
+ *  got it right — two sources for one question, disagreeing. */
+describe('resolveReturnScene — exit never targets the synthetic prefab-edit world', () => {
+  const REAL = '/assets/scenes/main.scene.json';
+  const SYNTH = `${PREFAB_EDIT_SCENE_PREFIX}320bf1fc-b607-451b-928a-570b0112d8d6`;
+
+  it('takes the current scene when it is a real one', () => {
+    expect(resolveReturnScene(REAL, null)).toBe(REAL);
+  });
+
+  it('opening a prefab from INSIDE prefab-edit keeps the OUTER return scene', () => {
+    // The regression. A chain of opens must still land on the scene the chain started from,
+    // not on the edit world of whichever prefab was open when the next one was clicked.
+    expect(resolveReturnScene(SYNTH, REAL)).toBe(REAL);
+  });
+
+  it('a real current scene WINS over a stale recorded return', () => {
+    // Otherwise exiting after a scene switch would reopen wherever the last chain began.
+    expect(resolveReturnScene(REAL, '/assets/scenes/other.scene.json')).toBe(REAL);
+  });
+
+  it('returns null rather than the synthetic path when there is nothing real to go back to', () => {
+    // Entering prefab-edit with no scene open at all. Null is handled (exit just clears the flag);
+    // the synthetic path is NOT — it 404s.
+    expect(resolveReturnScene(SYNTH, null)).toBeNull();
+    expect(resolveReturnScene(null, null)).toBeNull();
+    // Both candidates are filtered, so a synthetic path already banked in the store by an older
+    // session cannot be laundered back out through the recorded slot.
+    expect(resolveReturnScene(SYNTH, SYNTH)).toBeNull();
   });
 });
 

@@ -4,7 +4,7 @@
 import { registerTrait, type FieldHint } from '@modoki/engine/runtime';
 import {
   Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
-  UIElement, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, Animator, SpriteAnimator,
+  UIElement, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, BlobShadow, Animator, SpriteAnimator,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
   AudioSource, AudioListener, VideoPlayer,
@@ -257,6 +257,18 @@ export function registerAllTraits() {
       innerTipColor: { type: 'color', tooltip: 'Inner flame color at the tip', section: 'Inner Flame' },
       innerAlpha: { type: 'number', min: 0, max: 1, step: 0.05, tooltip: 'Inner flame opacity', section: 'Inner Flame' },
       innerIntensity: { type: 'number', min: 0, step: 0.05, tooltip: 'Inner flame brightness', section: 'Inner Flame' },
+    },
+  });
+
+  registerTrait({
+    name: 'BlobShadow', trait: BlobShadow, category: 'component', componentCategory: 'Rendering', priority: 37,
+    fields: {
+      radius: { type: 'number', min: 0, step: 0.05, tooltip: 'World-space radius of the blob' },
+      opacity: { type: 'number', min: 0, max: 1, step: 0.05, tooltip: 'Peak darkness at ground contact' },
+      groundOffset: { type: 'number', min: 0, step: 0.01, tooltip: 'Lift above the found surface, along its normal, to avoid z-fighting' },
+      maxDrop: { type: 'number', min: 0, step: 0.5, tooltip: 'How far straight down to search for ground before giving up' },
+      fadeStart: { type: 'number', min: 0, step: 0.1, tooltip: 'Distance from the entity\'s origin (not its feet) to the ground at full opacity — e.g. ~1 for a standing capsule character' },
+      fadeHeight: { type: 'number', min: 0, step: 0.1, tooltip: 'Opacity fades linearly to 0 as the entity rises this far beyond fadeStart' },
     },
   });
 

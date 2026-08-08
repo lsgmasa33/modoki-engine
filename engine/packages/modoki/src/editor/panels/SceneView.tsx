@@ -38,6 +38,7 @@ import { registerBoundsProvider, projectAABBToScreen, type EntityScreenBounds } 
 import { registerPickProvider } from '../../runtime/core/screenPick';
 import { registerHandleProvider, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
 import { createFlameMeshSyncState, syncFlameMeshes, disposeFlameMeshSyncState } from '../../runtime/rendering/flameMeshSync';
+import { createBlobShadowSyncState, syncBlobShadows, disposeBlobShadowSyncState } from '../../runtime/rendering/blobShadowSync';
 import { PARTICLE_LAYER } from '../../runtime/rendering/layers';
 import { getWorldTransform2D, getWorldTransform2DInto } from '../../runtime/rendering/renderUtils';
 import { setActiveRenderer } from '../../runtime/loaders/textureResolver';
@@ -49,10 +50,9 @@ import { acquireRenderer, releaseRenderer, discardRenderer } from './rendererLea
 import { drawColliderOutline, drawSkinnedMeshFlat2D, drawSkinnedMeshWireframe2D, drawWeightHeatmap2D, drawDominantBoneMap2D, computePivotOffset, COLLIDER_SPRITE } from '../../runtime/rendering/render2DUtils';
 import { getSkin2DBuffer } from '../../runtime/skinning/skin2DBuffers';
 import { getRig2D, type ParsedRig2D } from '../../runtime/loaders/rig2dCache';
-import { getGuidForPath } from '../../runtime/loaders/assetManifest';
 import { resolveMeshTemplate } from '../../runtime/loaders/meshTemplateCache';
-import { boneWeightField, dominantBoneField, paintWeights } from '../../runtime/skinning/rig2dWeightPaint';
-import { deriveBindMatrices } from '../../runtime/skinning/rig2dMath';
+import { boneWeightField, dominantBoneField } from '../../runtime/skinning/rig2dWeightPaint';
+import { overlayPartIndices } from './skinWeightOverlay';
 import { computeCanvasScale, screenToReference2D } from '../../runtime/rendering/canvas2DScaler';
 import { findCanvasAncestor } from '../../runtime/rendering/canvas2DRouting';
 import {
@@ -84,6 +84,7 @@ import {
   nearestEdgeInsertion, minPointsForShape, type Pt,
 } from '../../runtime/core/colliderPoints';
 import { colliderEditInfo, worldPointToLocal, localToWorld, pickVertex, colliderPickHalfExtents } from './colliderEdit2D';
+import { descendantUnionGizmoBox2D } from './gizmoBounds';
 import { drawGizmo2D, hitTestGizmo2D, cursorForHandle, applyGizmoDrag2D, snapDragResult, DEFAULT_GIZMO_SNAP, worldToLocal2D, type GizmoHandle } from './Gizmo2D';
 import { layoutText } from '../../runtime/rendering/text/layoutText';
 import { getLoadedFont } from '../../runtime/loaders/fontAtlasLoader';
@@ -139,18 +140,23 @@ const _svCamPos = new THREE.Vector3();
 // which is REPLACED whenever the rig's weights change (setRig2D reseeds the cache), so the
 // WeakMap invalidates automatically — a re-weight misses and recomputes, a static rig reuses
 // the field instead of allocating new Array(vertCount) + rescanning every redraw.
-const boneWeightFieldCache = new WeakMap<object, Map<number, number[]>>();
-const dominantBoneFieldCache = new WeakMap<object, number[]>();
-function boneWeightFieldCached(rig: ParsedRig2D, bi: number): number[] {
+// Keyed per PART as well as per bone (#180): every part of a rig carries its own weight set,
+// so one field per (rig, bone) would serve part 0's influence for the whole rig.
+const boneWeightFieldCache = new WeakMap<object, Map<string, number[]>>();
+const dominantBoneFieldCache = new WeakMap<object, Map<number, number[]>>();
+function boneWeightFieldCached(rig: ParsedRig2D, partIndex: number, bi: number): number[] {
   let m = boneWeightFieldCache.get(rig);
   if (!m) { m = new Map(); boneWeightFieldCache.set(rig, m); }
-  let f = m.get(bi);
-  if (!f) { f = boneWeightField(rig.skinIndices, rig.skinWeights, bi, rig.vertCount); m.set(bi, f); }
+  const key = `${partIndex}:${bi}`;
+  let f = m.get(key);
+  if (!f) { const p = rig.parts[partIndex]; f = boneWeightField(p.skinIndices, p.skinWeights, bi, p.vertCount); m.set(key, f); }
   return f;
 }
-function dominantBoneFieldCached(rig: ParsedRig2D): number[] {
-  let f = dominantBoneFieldCache.get(rig);
-  if (!f) { f = dominantBoneField(rig.skinIndices, rig.skinWeights, rig.vertCount); dominantBoneFieldCache.set(rig, f); }
+function dominantBoneFieldCached(rig: ParsedRig2D, partIndex: number): number[] {
+  let m = dominantBoneFieldCache.get(rig);
+  if (!m) { m = new Map(); dominantBoneFieldCache.set(rig, m); }
+  let f = m.get(partIndex);
+  if (!f) { const p = rig.parts[partIndex]; f = dominantBoneField(p.skinIndices, p.skinWeights, p.vertCount); m.set(partIndex, f); }
   return f;
 }
 
@@ -776,7 +782,7 @@ function pickUnderlyingUIEntity(clientX: number, clientY: number): number | null
  *  by hierarchy/zIndex exactly like the runtime's Canvas2DMount — no separate
  *  overlay, no letterbox math, no z-index of its own. Still owns 2D entity
  *  drawing, picking, and the 2D transform gizmo. */
-// ── 2D SceneView interaction (picking + gizmo/collider/paint drag) ──
+// ── 2D SceneView interaction (picking + gizmo/collider drag) ──
 // Extracted from Canvas2DLayer so BOTH the legacy DOM canvas AND the Pixi-migration pick overlay
 // (Scene2DPickOverlay) install the SAME capture-phase handlers. The pick math is renderer-independent
 // (ECS-driven); only the coordinate source differs (DOM draw-loop refs vs on-demand compute over the
@@ -791,8 +797,6 @@ type Gizmo2DDragState = {
   entityCenter: { x: number; y: number };
 };
 type Collider2DVertexDrag = { entityId: number; index: number; min: number; beforePoints: string; dirtied: boolean };
-type SkinPaintStrokeState = { rigPath: string; beforeIdx: number[]; beforeW: number[] };
-type PaintCursorState = { rootId: number; lx: number; ly: number; radius: number };
 /** A member of a 2D group (multi-select) gizmo drag: its WORLD 2D transform + box half-extents,
  *  its LOCAL transform at drag start (for undo), and its parent's world transform (for the
  *  world→local write-back). */
@@ -818,8 +822,6 @@ interface Scene2DInteractionRefs {
   groupDragRef: { current: Group2DDragState | null };
   hoveredRef: { current: GizmoHandle | null };
   vertexDragRef: { current: Collider2DVertexDrag | null };
-  skinPaintStrokeRef: { current: SkinPaintStrokeState | null };
-  paintCursorRef: { current: PaintCursorState | null };
   lastEditClickRef: { current: { t: number; x: number; y: number } };
 }
 
@@ -927,11 +929,10 @@ function readCanvas2DRefDims(canvasEntityId: number, fallbackW: number, fallback
 // reading `canvasRef.current` / `canvasScaleRef.current` / `gizmoScreenScaleRef.current` unchanged.
 function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteractionOpts): () => void {
   const { getScale, getTargetEl, refs, markDirty } = opts;
-  const { dragRef, groupDragRef, hoveredRef, vertexDragRef, skinPaintStrokeRef, paintCursorRef, lastEditClickRef } = refs;
+  const { dragRef, groupDragRef, hoveredRef, vertexDragRef, lastEditClickRef } = refs;
   const selectEntity = useEditorStore.getState().selectEntity;
   const mark2DDirty = markDirty;
   const canvasRef = { get current(): HTMLElement | null { return getTargetEl(); } };
-  const canvasScaleRef = { get current() { return getScale().cs; } };
   const gizmoScreenScaleRef = { get current() { return getScale().gizmoScreenScale; } };
 
   const container = getTargetEl();
@@ -941,7 +942,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
     // deferred gesture as the 3D handler. The 2D canvas sits ABOVE the Three.js canvas, so
     // an empty click here does NOT bubble to the 3D onPointerDown that would otherwise
     // deselect — this canvas must clear the selection itself. (Armed only on a total miss
-    // below; a gizmo/collider/paint interaction leaves it disarmed, so release() is a no-op.)
+    // below; a gizmo/collider interaction leaves it disarmed, so release() is a no-op.)
     const deselectGesture = createSelectGesture();
     // Multi-select modifiers for the 2D pick, captured at press (mirrors the 3D path).
     let pendingMods2D = { additive: false, toggle: false };
@@ -1039,75 +1040,6 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
         undo: () => { const id = ref.resolve(); if (id != null) setPointsLive(id, colMeta, beforeStr); },
         redo: () => { const id = ref.resolve(); if (id != null) { setPointsLive(id, colMeta, afterStr); markOverrideIfInstance(id, 'Collider2D', 'points'); } },
       });
-    }
-
-    // ── Weight-paint brush (skin authoring) ──
-    // Resolve the paint target: paint mode ON + a Bone2D selected + its rig-owner
-    // SkinnedSprite2D uses the rig OPEN in the Skin panel. Returns the data to turn a
-    // pointer position into a mesh-local brush + the bone index to paint.
-    function resolveSkinPaint(): { rootId: number; rigPath: string; boneIndex: number; wt: { x: number; y: number; rz: number; sx: number; sy: number }; comp: { x: number; y: number }; flipX: boolean; flipY: boolean; bonePositions: number[][] } | null {
-      const st = useEditorStore.getState();
-      if (st.skinMode !== 'weights' || !st.editingSkinDef || !st.editingSkinAsset || st.selectedEntityId == null) return null;
-      const allT = getAllTraits();
-      const boneMeta = allT.find((t) => t.name === 'Bone2D');
-      const ssM = allT.find((t) => t.name === 'SkinnedSprite2D');
-      const eaM = allT.find((t) => t.name === 'EntityAttributes');
-      const tfM = allT.find((t) => t.name === 'Transform');
-      if (!boneMeta || !ssM || !eaM || !tfM) return null;
-      const sel = findEntity(st.selectedEntityId);
-      if (!sel?.has(boneMeta.trait)) return null;
-      const boneName = (sel.get(boneMeta.trait) as { name: string }).name;
-      let rootId = 0, cur = st.selectedEntityId;
-      for (let g = 0; cur && g < 4096; g++) {
-        const ent = findEntity(cur); if (!ent) break;
-        if (ent.has(ssM.trait)) { rootId = cur; break; }
-        cur = ent.has(eaM.trait) ? ((ent.get(eaM.trait) as { parentId: number }).parentId) : 0;
-      }
-      if (!rootId) return null;
-      const rootEnt = findEntity(rootId)!;
-      const ss = rootEnt.get(ssM.trait) as { rig: string; flipX: boolean; flipY: boolean };
-      const openGuid = getGuidForPath(st.editingSkinAsset.path) ?? st.editingSkinDef.id;
-      if (!openGuid || ss.rig !== openGuid) return null; // only paint the rig that's open
-      const rig = getRig2D(ss.rig);
-      const boneIndex = rig?.boneIndexByName.get(boneName);
-      if (rig == null || boneIndex == null || boneIndex < 0) return null;
-      const wt = getWorldTransform2D(rootId, rootEnt.get(tfM.trait) as never);
-      const cs = canvasScaleRef.current;
-      const bonePositions = deriveBindMatrices(rig.bones).rootLocal.map((m) => [m.e, m.f]);
-      return { rootId, rigPath: st.editingSkinAsset.path, boneIndex, wt: { x: wt.x, y: wt.y, rz: wt.rz, sx: wt.sx, sy: wt.sy }, comp: { x: cs.compensateX || 1, y: cs.compensateY || 1 }, flipX: !!ss.flipX, flipY: !!ss.flipY, bonePositions };
-    }
-
-    // Pointer (game coords) → mesh-local (texture space): inverse of the entity draw transform.
-    function paintLocalPos(px: number, py: number, target: NonNullable<ReturnType<typeof resolveSkinPaint>>): { x: number; y: number } | null {
-      const dx = px - target.wt.x, dy = py - target.wt.y;
-      const c = Math.cos(target.wt.rz), s = Math.sin(target.wt.rz);
-      const rx = dx * c + dy * s, ry = -dx * s + dy * c;
-      const sxTot = target.comp.x * target.wt.sx * (target.flipX ? -1 : 1);
-      const syTot = target.comp.y * target.wt.sy * (target.flipY ? -1 : 1);
-      if (!sxTot || !syTot) return null;
-      return { x: rx / sxTot, y: ry / syTot };
-    }
-
-    function applyPaintStroke(px: number, py: number, target: ReturnType<typeof resolveSkinPaint>, brushMode: 'add' | 'subtract' | 'set') {
-      if (!target) return;
-      const lp = paintLocalPos(px, py, target);
-      if (!lp) return;
-      const lx = lp.x, ly = lp.y;
-      const st = useEditorStore.getState();
-      paintCursorRef.current = { rootId: target.rootId, lx, ly, radius: st.skinPaint.radius };
-      const def = st.editingSkinDef;
-      if (!def?.mesh?.verts?.length) return;
-      const pb = getSkin2DBuffer(target.rootId)?.parts[0];
-      const n = def.mesh.verts.length;
-      const verts: number[][] = new Array(n);
-      for (let v = 0; v < n; v++) verts[v] = pb ? [pb.positions[v * 2], pb.positions[v * 2 + 1]] : def.mesh.verts[v];
-      const result = paintWeights({
-        verts, skinIndices: def.skinIndices ?? [], skinWeights: def.skinWeights ?? [],
-        boneIndex: target.boneIndex, center: [lx, ly], radius: st.skinPaint.radius, strength: st.skinPaint.strength,
-        falloff: 'smooth', mode: brushMode, bonePositions: target.bonePositions,
-      });
-      st.applySkinDef(target.rigPath, { ...def, skinIndices: result.skinIndices, skinWeights: result.skinWeights });
-      mark2DDirty();
     }
 
     // Predicts what a real click at a viewport point would select on THIS 2D canvas — the exact
@@ -1214,15 +1146,6 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       pendingMods2D = { additive: e.shiftKey, toggle: e.metaKey || e.ctrlKey };
       const { x: px, y: py } = toGame(e.clientX, e.clientY);
 
-      // Weight-paint brush takes precedence when active (before collider/gizmo/selection).
-      const paintTarget = resolveSkinPaint();
-      if (paintTarget) {
-        const def = useEditorStore.getState().editingSkinDef!;
-        skinPaintStrokeRef.current = { rigPath: paintTarget.rigPath, beforeIdx: [...(def.skinIndices ?? [])], beforeW: [...(def.skinWeights ?? [])] };
-        applyPaintStroke(px, py, paintTarget, e.altKey ? 'subtract' : useEditorStore.getState().skinPaint.brush);
-        e.stopPropagation(); e.preventDefault(); return;
-      }
-
       // Collider vertex editing takes precedence over gizmo/selection when active.
       const cc = selectedColliderCtx();
       if (cc) {
@@ -1313,8 +1236,15 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
           } else if (boneMetaG && entity.has(boneMetaG.trait)) {
             gw = 4; gh = 4; canGizmo = true;
           } else {
-            const tbox = text2DGizmoBox(entity, allTraits.find((t) => t.name === 'Text2D'));
+            const t2d = allTraits.find((t) => t.name === 'Text2D');
+            const tbox = text2DGizmoBox(entity, t2d);
             if (tbox) { gw = tbox.halfW; gh = tbox.halfH; canGizmo = true; }
+            else {
+              // No visual of its own -> the union of its descendants' visuals, so a Transform-only
+              // GROUP is grabbable at all. See gizmoBounds.ts.
+              const ubox = descendantUnionGizmoBox2D(selectedId, { findEntity, parentOf, transformTrait: transformMeta.trait, r2dTrait: r2dMeta.trait, measureText: (e) => text2DGizmoBox(e, t2d) });
+              if (ubox) { gw = ubox.halfW; gh = ubox.halfH; canGizmo = true; }
+            }
           }
           if (canGizmo) {
             const tf = entity.get(transformMeta.trait);
@@ -1388,20 +1318,6 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
     function onPointerMove(e: PointerEvent) {
       deselectGesture.move(e.clientX, e.clientY); // a drag past the threshold cancels a pending deselect
       const { x: px, y: py } = toGame(e.clientX, e.clientY);
-
-      // Active weight-paint stroke — paint the selected bone's influence at the cursor.
-      if (skinPaintStrokeRef.current) {
-        e.stopPropagation(); e.preventDefault();
-        applyPaintStroke(px, py, resolveSkinPaint(), e.altKey ? 'subtract' : useEditorStore.getState().skinPaint.brush);
-        return;
-      }
-      // Paint-mode hover: track the brush cursor for the SceneView overlay (no paint yet).
-      if (useEditorStore.getState().skinMode === 'weights') {
-        const target = resolveSkinPaint();
-        const lp = target ? paintLocalPos(px, py, target) : null;
-        if (lp && target) { paintCursorRef.current = { rootId: target.rootId, lx: lp.x, ly: lp.y, radius: useEditorStore.getState().skinPaint.radius }; mark2DDirty(); }
-        else if (paintCursorRef.current) { paintCursorRef.current = null; mark2DDirty(); }
-      }
 
       // Active collider-vertex drag — move the vertex to the cursor (in collider-local
       // space) and preview live; the undo entry is pushed on pointer-up.
@@ -1487,7 +1403,12 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
             const tf = entity.get(transformMeta.trait);
             let ghw = 0, ghh = 0, ok = false;
             if (entity.has(r2dMeta.trait)) { const rend = entity.get(r2dMeta.trait); ghw = rend.width; ghh = rend.height; ok = true; }
-            else { const tbox = text2DGizmoBox(entity, allTraits.find((t) => t.name === 'Text2D')); if (tbox) { ghw = tbox.halfW; ghh = tbox.halfH; ok = true; } }
+            else {
+              const t2d = allTraits.find((t) => t.name === 'Text2D');
+              const tbox = text2DGizmoBox(entity, t2d)
+                ?? descendantUnionGizmoBox2D(selectedId, { findEntity, parentOf, transformTrait: transformMeta.trait, r2dTrait: r2dMeta.trait, measureText: (e) => text2DGizmoBox(e, t2d) });
+              if (tbox) { ghw = tbox.halfW; ghh = tbox.halfH; ok = true; }
+            }
             if (ok) {
               const { gizmoMode, gizmoSpace } = useEditorStore.getState();
               const handle = hitTestGizmo2D(
@@ -1508,29 +1429,10 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
 
     function onPointerUp(e: PointerEvent) {
       // Empty-canvas click (armed on a total miss, not cancelled by a drag) → deselect.
-      // Only true when nothing else claimed this gesture, so it can't fire mid-drag/paint.
+      // Only true when nothing else claimed this gesture, so it can't fire mid-drag.
       // A modified click (shift/ctrl) preserves the selection, matching the 3D path.
       if (deselectGesture.release().clicked) {
         if (!pendingMods2D.additive && !pendingMods2D.toggle) selectEntity(null);
-        return;
-      }
-
-      // Finish a weight-paint stroke → one undo entry (before→after weights).
-      if (skinPaintStrokeRef.current) {
-        e.stopPropagation(); e.preventDefault();
-        const stroke = skinPaintStrokeRef.current;
-        skinPaintStrokeRef.current = null;
-        const def = useEditorStore.getState().editingSkinDef;
-        if (def) {
-          const afterIdx = [...(def.skinIndices ?? [])], afterW = [...(def.skinWeights ?? [])];
-          const { rigPath, beforeIdx, beforeW } = stroke;
-          const changed = afterW.length !== beforeW.length || afterW.some((w, i) => w !== beforeW[i]) || afterIdx.some((v, i) => v !== beforeIdx[i]);
-          if (changed) pushAction({
-            label: 'Paint weights',
-            undo: () => { const d = useEditorStore.getState().editingSkinDef; if (d) useEditorStore.getState().applySkinDef(rigPath, { ...d, skinIndices: beforeIdx, skinWeights: beforeW }); },
-            redo: () => { const d = useEditorStore.getState().editingSkinDef; if (d) useEditorStore.getState().applySkinDef(rigPath, { ...d, skinIndices: afterIdx, skinWeights: afterW }); },
-          });
-        }
         return;
       }
 
@@ -1637,17 +1539,16 @@ interface Scene2DDrawOpts {
   refW: number; refH: number;
   gizmoScreenScaleRef: { current: number };
   showBoundaryRef: { current: boolean };
-  paintCursorRef: { current: PaintCursorState | null };
   hoveredRef: { current: GizmoHandle | null };
   gizmo2DHandleStateRef: { current: { tf: { x: number; y: number; rz: number; sx: number; sy: number }; w: number; h: number; mode: 'translate' | 'rotate' | 'scale'; space: 'world' | 'local'; s: number } | null };
 }
 
 // Draw one Canvas2D's editor OVERLAYS (boundary, bones, selection outline, gizmo, collider outline/
-// handles, skin-debug wireframe/heatmap/paint-cursor) into a ctx already sized to backing + cleared.
+// handles, skin-debug wireframe/heatmap) into a ctx already sized to backing + cleared.
 // The 2D CONTENT (sprites, skinned mesh) is drawn by the Pixi Scene2DRenderer underneath; this chrome
 // canvas stacks the editor-only overlays on top. (Was shared with the now-deleted DOM Canvas2DLayer.)
 function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: Scene2DDrawOpts): void {
-  const { cs, refW, refH, gizmoScreenScaleRef, showBoundaryRef, paintCursorRef, hoveredRef, gizmo2DHandleStateRef } = o;
+  const { cs, refW, refH, gizmoScreenScaleRef, showBoundaryRef, hoveredRef, gizmo2DHandleStateRef } = o;
   const allTraits = getAllTraits();
   const transformMeta = allTraits.find((t) => t.name === 'Transform');
   const r2dMeta = allTraits.find((t) => t.name === 'Renderable2D');
@@ -1777,8 +1678,9 @@ function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: S
           if (!ss.isVisible || deactivatedEntities.has(eid)) return;
           if (findCanvasAncestor(eid, parentOf, canvasIds) !== canvasEntityId) return;
           const buf = getSkin2DBuffer(eid);
-          const p0 = buf?.parts[0];
-          if (!buf || !p0 || p0.positions.length === 0) return;
+          // "Rig ready?" — ANY part with geometry, not just parts[0]: this pass now draws
+          // every visible part, so a rig whose first part is empty still has overlays to draw.
+          if (!buf || !buf.parts.some((p) => p.positions.length > 0)) return;
           const wt = getWorldTransform2D(eid, tf);
           const color = '#' + (ss.color & 0xffffff).toString(16).padStart(6, '0');
           ctx.save();
@@ -1787,29 +1689,39 @@ function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: S
           ctx.rotate(wt.rz);
           ctx.scale(cs.compensateX * wt.sx * (ss.flipX ? -1 : 1), cs.compensateY * wt.sy * (ss.flipY ? -1 : 1));
           const weightView = eid === wireframeRootId && useEditorStore.getState().skinWeightView;
+          // EVERY visible part is shaded, each against its OWN weights (#180) — the rig's
+          // top-level skinIndices/skinWeights are `parts[0]` aliases, so reading them drew
+          // part 0's influence and left the rest of a multi-part rig blank under a wireframe
+          // that outlined all of it. `overlayPartIndices` owns which parts qualify.
+          const rig = getRig2D(ss.rig);
+          const overlayParts = weightView || (eid === wireframeRootId && heatmapBoneName)
+            ? overlayPartIndices(rig?.parts, buf.parts) : [];
           if (weightView) {
             // Weight view: opaque heatmap (selected bone) / dominant-bone map (no bone),
-            // NO texture — the clear way to read weights. Authoring aid on the primary part
-            // (multi-part per-part weight editing is a follow-up).
-            const rig = getRig2D(ss.rig);
-            if (rig && rig.vertCount > 0) {
-              const bi = heatmapBoneName ? rig.boneIndexByName.get(heatmapBoneName) : undefined;
-              if (bi != null && bi >= 0) {
-                drawWeightHeatmap2D(ctx, p0.positions, p0.indices, boneWeightFieldCached(rig, bi), 1);
-              } else {
-                drawDominantBoneMap2D(ctx, p0.positions, p0.indices, dominantBoneFieldCached(rig), 1);
+            // NO texture — the clear way to read weights.
+            const bi = rig && heatmapBoneName ? rig.boneIndexByName.get(heatmapBoneName) : undefined;
+            if (rig && overlayParts.length) {
+              for (const pi of overlayParts) {
+                const bp = buf.parts[pi];
+                if (bi != null && bi >= 0) {
+                  drawWeightHeatmap2D(ctx, bp.positions, bp.indices, boneWeightFieldCached(rig, pi, bi), 1);
+                } else {
+                  drawDominantBoneMap2D(ctx, bp.positions, bp.indices, dominantBoneFieldCached(rig, pi), 1);
+                }
               }
             } else {
-              drawSkinnedMeshFlat2D(ctx, p0.positions, p0.indices, color);
+              // No usable rig data (or the buffer is mid-rebuild) — flat fill, so the mesh
+              // still reads as present rather than vanishing out of the weight view.
+              for (const part of buf.parts) drawSkinnedMeshFlat2D(ctx, part.positions, part.indices, color);
             }
           } else {
             // The textured mesh is drawn by the Pixi renderer; this chrome pass draws only the overlays.
-            // Semi-transparent heatmap overlay for the selected bone (over the primary part).
-            if (eid === wireframeRootId && heatmapBoneName) {
-              const rig = getRig2D(ss.rig);
-              const bi = rig?.boneIndexByName.get(heatmapBoneName);
-              if (rig && bi != null && bi >= 0) {
-                drawWeightHeatmap2D(ctx, p0.positions, p0.indices, boneWeightFieldCached(rig, bi));
+            // Semi-transparent heatmap overlay for the selected bone, over every visible part.
+            const bi = rig && heatmapBoneName ? rig.boneIndexByName.get(heatmapBoneName) : undefined;
+            if (rig && bi != null && bi >= 0) {
+              for (const pi of overlayParts) {
+                const bp = buf.parts[pi];
+                drawWeightHeatmap2D(ctx, bp.positions, bp.indices, boneWeightFieldCached(rig, pi, bi));
               }
             }
           }
@@ -1819,18 +1731,6 @@ function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: S
             // collider outline and, crucially, distinct from the rotate gizmo's teal ring
             // (#1abc9c), which is near-identical in hue and made the two hard to tell apart.
             for (const part of buf.parts) drawSkinnedMeshWireframe2D(ctx, part.positions, part.indices, 'rgba(255,64,180,0.85)', lw);
-          }
-          // Weight-paint brush cursor (in mesh-local space, so it scales with the mesh).
-          const pc = paintCursorRef.current;
-          if (pc && pc.rootId === eid) {
-            ctx.save();
-            ctx.globalAlpha = 1;
-            ctx.beginPath();
-            ctx.arc(pc.lx, pc.ly, pc.radius, 0, Math.PI * 2);
-            ctx.lineWidth = gizmoScreenScaleRef.current / Math.max(0.01, Math.abs(cs.compensateX * wt.sx));
-            ctx.strokeStyle = 'rgba(255,255,255,0.9)';
-            ctx.stroke();
-            ctx.restore();
           }
           ctx.restore();
           if (eid === currentSelectedId) {
@@ -1905,7 +1805,8 @@ function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: S
         const selEnt = t2dMeta ? findEntity(currentSelectedId) : null;
         if (selEnt && selEnt.has(transformMeta.trait)
             && findCanvasAncestor(currentSelectedId, parentOf, canvasIds) === canvasEntityId) {
-          const tbox = text2DGizmoBox(selEnt, t2dMeta);
+          const tbox = text2DGizmoBox(selEnt, t2dMeta)
+            ?? descendantUnionGizmoBox2D(currentSelectedId, { findEntity, parentOf, transformTrait: transformMeta.trait, r2dTrait: r2dMeta.trait, measureText: (e) => text2DGizmoBox(e, t2dMeta) });
           if (tbox) {
             const wt = getWorldTransform2D(currentSelectedId, selEnt.get(transformMeta.trait) as never);
             selectedTf = { x: wt.x, y: wt.y, rz: wt.rz, sx: wt.sx, sy: wt.sy };
@@ -2143,7 +2044,7 @@ function registerScene2DGizmoHandles(getCanvas: () => HTMLCanvasElement | null, 
 // Phase 3 (SceneView-Pixi migration): a chrome CANVAS over the Pixi Canvas2DMount. It (1) DRAWS the
 // editor overlays — boundary, bones, selection outline, gizmo, collider outline/handles, and the
 // skin-debug views — via the SHARED drawScene2D with drawContent:false (Pixi owns the content), and
-// (2) CAPTURES 2D picking + gizmo/collider/paint interaction (installScene2DInteraction, same handlers
+// (2) CAPTURES 2D picking + gizmo/collider interaction (installScene2DInteraction, same handlers
 // as the DOM Canvas2DLayer). Its backing tracks the pooled Pixi canvas so overlays pixel-align with
 // content, and it registers the SAME Enact handle providers so modoki_handles keeps resolving.
 function Scene2DChromeOverlay({ canvasEntityId, showBoundary = false, viewZoom = 1 }: { canvasEntityId: number; showBoundary?: boolean; viewZoom?: number }) {
@@ -2152,8 +2053,6 @@ function Scene2DChromeOverlay({ canvasEntityId, showBoundary = false, viewZoom =
   const groupDragRef = useRef<Group2DDragState | null>(null);
   const hoveredRef = useRef<GizmoHandle | null>(null);
   const vertexDragRef = useRef<Collider2DVertexDrag | null>(null);
-  const skinPaintStrokeRef = useRef<SkinPaintStrokeState | null>(null);
-  const paintCursorRef = useRef<PaintCursorState | null>(null);
   const lastEditClickRef = useRef<{ t: number; x: number; y: number }>({ t: 0, x: 0, y: 0 });
   const gizmo2DHandleStateRef = useRef<Scene2DDrawOpts['gizmo2DHandleStateRef']['current']>(null);
   const canvasScaleRef = useRef(computeCanvasScale(1080, 1920, 1080, 1920, 'fitH'));
@@ -2209,7 +2108,7 @@ function Scene2DChromeOverlay({ canvasEntityId, showBoundary = false, viewZoom =
       gizmoScreenScaleRef.current = (rectW > 0 && cs.scale > 0) ? pw / (cs.scale * rectW) : 1;
       drawScene2D(ctx, canvasEntityId, {
         cs, refW, refH,
-        gizmoScreenScaleRef, showBoundaryRef, paintCursorRef, hoveredRef, gizmo2DHandleStateRef,
+        gizmoScreenScaleRef, showBoundaryRef, hoveredRef, gizmo2DHandleStateRef,
       });
     };
     registerFrameCallback(frameKey, draw, PRIORITY_EDITOR_2D);
@@ -2222,9 +2121,9 @@ function Scene2DChromeOverlay({ canvasEntityId, showBoundary = false, viewZoom =
   useEffect(() => registerScene2DColliderHandles(canvasEntityId, () => canvasRef.current, canvasScaleRef), [canvasEntityId]);
   useEffect(() => registerScene2DGizmoHandles(() => canvasRef.current, canvasScaleRef, gizmo2DHandleStateRef), [canvasEntityId]);
 
-  // Pick + gizmo/collider/paint interaction — same handlers, now targeting this chrome canvas.
+  // Pick + gizmo/collider interaction — same handlers, now targeting this chrome canvas.
   useEffect(() => {
-    const refs: Scene2DInteractionRefs = { dragRef, groupDragRef, hoveredRef, vertexDragRef, skinPaintStrokeRef, paintCursorRef, lastEditClickRef };
+    const refs: Scene2DInteractionRefs = { dragRef, groupDragRef, hoveredRef, vertexDragRef, lastEditClickRef };
     return installScene2DInteraction(canvasEntityId, {
       getTargetEl: () => canvasRef.current,
       getScale: () => {
@@ -2233,7 +2132,7 @@ function Scene2DChromeOverlay({ canvasEntityId, showBoundary = false, viewZoom =
         return { cs: canvasScaleRef.current, gizmoScreenScale: gizmoScreenScaleRef.current, backingW, backingH };
       },
       refs,
-      // Interaction redraws (gizmo/collider/paint drags do direct ECS .set writes) must wake BOTH gates:
+      // Interaction redraws (gizmo/collider drags do direct ECS .set writes) must wake BOTH gates:
       // mark2DDirty bumps get2DDirtyVersion — the channel THIS chrome overlay's own draw gate reads (so
       // the overlays follow the drag) — and editorMarkScene2DDirty wakes the Pixi renderer (so the CONTENT
       // follows). Passing only the latter froze the overlays mid-drag until an unrelated dirty bump.
@@ -3427,6 +3326,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // Particle emitter gizmo icons + opt-in in-scene effect preview.
     const particleState = createParticleSyncState();
     const flameState = createFlameMeshSyncState();
+    const blobShadowState = createBlobShadowSyncState();
     // F10: persistent "seen this frame" / "seen last frame" Set pairs, swapped
     // each frame instead of allocating a fresh Set per pass per frame (GC churn
     // that scaled with frame count). Each pass fills `*ScratchIds`, reaps gizmos
@@ -3470,6 +3370,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       frameScratchIds.clear();
       disposeParticleSyncState(particleState, scene);
       disposeFlameMeshSyncState(flameState, scene);
+      disposeBlobShadowSyncState(blobShadowState, scene);
       lastPreviewT = 0;
       for (const [, l] of ecsLights) { scene.remove(l); l.dispose(); }
       ecsLights.clear();
@@ -4379,6 +4280,11 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       if (!isUI) syncFlameMeshes(getCurrentWorld(), scene, flameState);
       else if (flameState.recs.size) disposeFlameMeshSyncState(flameState, scene);
 
+      // Blob shadows are persistent scene geometry too (a ground-contact raycast, not a
+      // simulated effect) — render always, gated only by 3D mode.
+      if (!isUI) syncBlobShadows(getCurrentWorld(), scene, blobShadowState);
+      else if (blobShadowState.recs.size) disposeBlobShadowSyncState(blobShadowState, scene);
+
       // Layer visibility. In collider-only mode (3D), regular meshes are hidden entirely so
       // the purple collider wireframes read cleanly — including for entities whose collider
       // shape (convex/trimesh) is derived from this same mesh's geometry (see drawCollider
@@ -4492,6 +4398,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       disposeRenderState(renderState, scene, true);
       disposeParticleSyncState(particleState, scene);
       disposeFlameMeshSyncState(flameState, scene);
+      disposeBlobShadowSyncState(blobShadowState, scene);
       for (const [, outline] of outlineMeshes) {
         outline.geometry.dispose();
         (outline.material as THREE.Material).dispose();

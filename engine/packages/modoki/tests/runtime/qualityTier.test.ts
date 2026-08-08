@@ -9,7 +9,7 @@
 
 import { describe, it, expect } from 'vitest';
 import {
-  resolveTier, evaluateTierChange, freshTierChangeState, tierShadowMapSize,
+  resolveTier, evaluateTierChange, freshTierChangeState, tierShadowMapSize, shadowBiasScale,
   TIER_ALLOWLIST, TIER_SETTINGS, DEFAULT_TIER_SETTING,
   PROMOTION_HOLD_MS, DEMOTION_HOLD_MS, MIN_SAMPLES_TO_JUDGE,
   type QualityTier,
@@ -250,6 +250,34 @@ describe('tier settings', () => {
 
   it('high imposes no shadow ceiling', () => {
     expect(tierShadowMapSize(4096, 'high')).toBe(4096);
+  });
+
+  // §0b "Shadows on `low` would render ACNE" (docs/plans/low-end-device-support.md) — a
+  // clamped shadow map without a matching bias adjustment self-shadows. Bias scaling alone was
+  // MEASURED on a Huawei Y6 not to make a clamped map look good (still dithered/under-sampled —
+  // see the comment on `shadowBiasScale`); this is a texel-correctness fix, not a quality one.
+  describe('shadowBiasScale — bias compensation for a clamped shadow map', () => {
+    it('is exactly 1 when unclamped (high tier)', () => {
+      expect(shadowBiasScale(2048, 2048)).toBe(1);
+      // Even if the "actual" size is LARGER than authored (never happens in practice, but the
+      // >= branch must not require exact equality).
+      expect(shadowBiasScale(2048, 4096)).toBe(1);
+    });
+
+    it('scales by the clamp ratio — forest-camp\'s 2048 -> 512 repro', () => {
+      expect(shadowBiasScale(2048, 512)).toBe(4);
+    });
+
+    it('scales by the clamp ratio — a milder 2048 -> 1024 clamp', () => {
+      expect(shadowBiasScale(2048, 1024)).toBe(2);
+    });
+
+    it('falls back to 1 (no scaling) on degenerate inputs', () => {
+      expect(shadowBiasScale(0, 512)).toBe(1);
+      expect(shadowBiasScale(2048, 0)).toBe(1);
+      expect(shadowBiasScale(-2048, 512)).toBe(1);
+      expect(shadowBiasScale(2048, -512)).toBe(1);
+    });
   });
 
   it('every tier has settings', () => {

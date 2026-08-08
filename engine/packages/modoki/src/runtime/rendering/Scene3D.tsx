@@ -30,6 +30,7 @@ import { onForceResize } from './resizeBus';
 import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
 import { createParticleSyncState, syncParticles, disposeParticleSyncState } from './particleSync';
 import { createFlameMeshSyncState, syncFlameMeshes, disposeFlameMeshSyncState } from './flameMeshSync';
+import { createBlobShadowSyncState, syncBlobShadows, disposeBlobShadowSyncState } from './blobShadowSync';
 import { PARTICLE_LAYER } from './layers';
 import { areDebugHandlesEnabled } from '../core/debugHandles';
 import { NPRPostFX } from '../traits/NPRPostFX';
@@ -242,6 +243,7 @@ export default function Scene3D() {
       const renderState = createRenderState(true); // primary surface — journals @anim-* (Percept J3)
       const particleState = createParticleSyncState();
       const flameState = createFlameMeshSyncState();
+      const blobShadowState = createBlobShadowSyncState();
       const unsubInvalidation = attachInvalidationListener(renderState, scene);
       // Publish this surface so the material broker (MaterialInstance) can reach
       // this world's live materials + object userData. getCurrentWorld follows swaps.
@@ -366,6 +368,7 @@ export default function Scene3D() {
         beginProfilerSample('particles');
         if (!inPreviewSession()) syncParticles(world, scene, particleState);
         syncFlameMeshes(world, scene, flameState);
+        syncBlobShadows(world, scene, blobShadowState);
         endProfilerSample();
         endProfilerSample(); // 'sync'
 
@@ -636,6 +639,7 @@ export default function Scene3D() {
           syncSceneRenderables3D(world, scene, renderState, { batchDrawCalls: BATCH_DRAW_CALLS });
           syncParticles(world, scene, particleState);
           syncFlameMeshes(world, scene, flameState);
+          syncBlobShadows(world, scene, blobShadowState);
 
           // Deterministic camera: copy the live pose into the pooled capture cam,
           // then apply overrides. Mirror the live active projection so an ortho
@@ -758,6 +762,7 @@ export default function Scene3D() {
         disposeRenderState(renderState, scene);
         disposeParticleSyncState(particleState, scene);
         disposeFlameMeshSyncState(flameState, scene);
+        disposeBlobShadowSyncState(blobShadowState, scene);
         // clearOwnedMaterials MUST run after disposeRenderState (which consults
         // _ownedMaterials). The SHARED inline-texture/tint material caches are
         // freed by the module-level onWorldSwap listener in scene3DSync.ts, not
@@ -856,6 +861,7 @@ export default function Scene3D() {
         step('unregisterFrameCallback', () => unregisterFrameCallback(frameKey));
         step('disposeParticleSyncState', () => disposeParticleSyncState(particleState, scene));
         step('disposeFlameMeshSyncState', () => disposeFlameMeshSyncState(flameState, scene));
+        step('disposeBlobShadowSyncState', () => disposeBlobShadowSyncState(blobShadowState, scene));
         step('postfxStack.dispose', () => postfxStack?.dispose());
         postfxStack = null;
         ssRebuild = null;

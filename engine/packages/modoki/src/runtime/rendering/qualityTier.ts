@@ -372,3 +372,32 @@ export function tierShadowMapSize(authored: number, tier: QualityTier): number {
   if (!ceiling) return authored;
   return Math.min(authored, ceiling);
 }
+
+/** Bias multiplier for a shadow map that a tier clamped smaller than authored. See
+ *  docs/plans/low-end-device-support.md §0b "Shadows on `low` would render ACNE":
+ *  `tierShadowMapSize` shrinks `Light.shadowMapSize` to fit a tier's ceiling but leaves
+ *  `shadowBias`/`shadowNormalBias` untouched, and bias is TEXEL-FOOTPRINT-relative (a fixed
+ *  bias is calibrated against `(2 * cameraSize) / mapSize`, the world-space size of one
+ *  shadow-map texel). Shrinking the map without scaling the bias grows that footprint —
+ *  forest-camp's 2048→512 clamp grows it 15.6mm to 62.5mm — so the same bias under-covers the
+ *  new, coarser texels and the surface self-shadows.
+ *
+ *  ⚠️ MEASURED ON A HUAWEI Y6: scaling the bias alone does NOT make a 512 map usable. At 2048
+ *  the scene renders clean, correct, soft shadows. At 512 with the AUTHORED bias it renders
+ *  real but catastrophically under-sampled — a dithered/speckled mess (this light also runs
+ *  `shadowRadius` 4 soft filtering) with self-shadowing mixed in. Applying this ×4 scale
+ *  improved that only marginally — a darkened test region went from -33.0% to -27.5% against a
+ *  -34.9% reference — and it still looks dithered: bias was never the dominant term, MAP
+ *  RESOLUTION is. (An earlier version of this fix also shrank `shadowCameraSize` to recover
+ *  density; that removed the artifact by removing the shadow — distant casters simply fell
+ *  outside the shrunk box — which is a coverage trade we won't ship silently. See §0b.)
+ *  So treat this as a CORRECTNESS fix (the bias that ships is texel-correct for whatever map
+ *  size actually renders), not a quality fix — a genuinely usable `mid` tier needs a shadow
+ *  map size floor, not a bias multiplier. */
+export function shadowBiasScale(authoredMapSize: number, actualMapSize: number): number {
+  if (authoredMapSize <= 0 || actualMapSize <= 0) return 1;
+  // No clamp (the common case, and always true on `high`) — exactly 1 so `high` is provably a
+  // no-op.
+  if (actualMapSize >= authoredMapSize) return 1;
+  return authoredMapSize / actualMapSize;
+}

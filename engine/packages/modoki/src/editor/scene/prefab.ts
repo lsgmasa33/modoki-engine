@@ -1,7 +1,7 @@
 /** Prefab system — save, load, and instantiate prefab entity trees. */
 
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
-import { validatePrefabData } from '../../runtime/loaders/sceneValidation';
+import { validatePrefabData, REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { backendFetch } from '../backend/editorBackend';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, readTraitDataFull, writeTraitField, findEntity, subtreeIds, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
@@ -241,6 +241,27 @@ export function serializePrefab(
         // in) and scene-only organizational fields.
         for (const key of Object.keys(traitData)) {
           if (isTemplateExcludedField(meta, key)) delete (traitData as Record<string, unknown>)[key];
+        }
+        // ⚠️ Drop BLANK asset refs. `readTraitDataFull` writes every schema field, so a
+        // `Renderable2D` with no material serialized `material: ""` — a blank ref, which
+        // `tests/assets/authoredAssetRefs.test.ts` correctly fails (#53: an unset ref is invisible
+        // to every other test — neither dangling nor a literal path — and surfaces only in a
+        // production build).
+        //
+        // This USED to be a manual cleanup after `modoki_prefab create`. That is untenable now that
+        // prefabs are hand-tuned in the editor: every Cmd+S in prefab-edit re-adds them, so a human
+        // repositioning a badge turns `npm run verify` red and has to know to go and strip eight
+        // keys out of the JSON. Measured: one save of Court's tray-badge prefab reintroduced 8.
+        //
+        // Dropping the key is a semantic NO-OP — the loader rebuilds each trait with
+        // `meta.trait(partialData)` and koota fills every absent field from the same schema, so ''
+        // and absent load identically. Deliberately narrow: only `''`, and only on fields the ref
+        // registry already names, rather than omitting every default-valued field the way SCENES do.
+        // Full omission would also drop an authored number that happens to equal its default, and
+        // at least one consumer reads prefab fields BY NAME and treats a missing one as "no layout"
+        // (Court's layoutFromPrefabDoc → a silent fallback to code constants).
+        for (const field of REF_FIELDS_BY_TRAIT[meta.name] ?? []) {
+          if ((traitData as Record<string, unknown>)[field] === '') delete (traitData as Record<string, unknown>)[field];
         }
         // Remap parentId from ECS IDs to localIds (parentId is in EntityAttributes).
         // Clear `guid` — prefab files are templates; per-instance identity lives on
@@ -751,6 +772,18 @@ export function getOverrideValues(
     if (prefabData === true) continue;
 
     const original = prefabData as Record<string, unknown>;
+    // ⚠️ A field ABSENT from the base is not "unknown" — it is the trait's schema DEFAULT, because
+    // that is exactly what the loader rebuilds it as (`meta.trait(partialData)`, koota fills the
+    // rest). Skipping it instead (the old `origValue !== undefined` gate alone) makes a real
+    // instance override invisible to every RAW caller of this function: the Inspector's
+    // "overridden" highlight, and the Apply-to-Prefab / Revert-Overrides dialogs, which build their
+    // checkbox tree from these diffs — so the field cannot be applied or reverted at all. The SAVE
+    // path escapes it only because `captureInstanceOverrides` folds marked fields back in.
+    //
+    // This became reachable when `serializePrefab` started dropping BLANK asset refs (a prefab with
+    // no material no longer writes `material: ""`), but it was always latent: any prefab authored
+    // without a field hits it.
+    const baseSchema = (getTraitByName(traitName)?.trait as { schema?: Record<string, unknown> } | undefined)?.schema;
     for (const [field, value] of Object.entries(currentData)) {
       if (field === 'parentId') continue; // parentId is remapped, skip
       // guid is per-instance identity — minted when the instance is created/saved,
@@ -759,7 +792,7 @@ export function getOverrideValues(
       // back would write one instance's guid into the prefab base and make every
       // future instance collide on the same guid.
       if (traitName === 'EntityAttributes' && field === 'guid') continue;
-      const origValue = original[field];
+      const origValue = field in original ? original[field] : baseSchema?.[field];
       if (origValue !== undefined && !valuesEqual(value, origValue)) {
         if (!result[traitName]) result[traitName] = {};
         result[traitName][field] = value;

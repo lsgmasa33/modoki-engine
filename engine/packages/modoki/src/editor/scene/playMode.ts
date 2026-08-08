@@ -17,6 +17,7 @@
 import type { SceneData } from '../../runtime/loaders/loadSceneFile';
 import { getPlayState, setPlayState, getRunMode, setRunMode } from '../../runtime/core/playState';
 import { sceneManager } from '../../runtime/scene/SceneManager';
+import { PREFAB_EDIT_SCENE_PREFIX } from './prefabEditWorld';
 import { serializeScene, getCurrentScenePath, type SceneFile, type SerializedEntity } from './serialize';
 import { undoDepth, truncateUndoTo } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
@@ -54,6 +55,38 @@ let _undoBarrier = 0;
  *  this, the process-global capture would leak past Stop into edit mode + later worlds. */
 let _autoOpenedContact = false;
 
+/**
+ * Which SCENE the Play snapshot belongs to, and the path the Stop-revert reloads it under.
+ *
+ * ⚠️ **Not `getCurrentScenePath()`, and the difference is the whole bug.** That is the editor's
+ * *file* path, and prefab-edit deliberately sets it to **null** so a normal save cannot target a
+ * real file. The Stop-revert therefore reloaded the world under `path ?? ''` — an empty path — so
+ * after Play→Stop the live scene silently stopped being the prefab-edit world. Reported as: *"when
+ * I press play, and stop, the prefab edit mode loses the prefab name, and cmd+s ends up the new
+ * file dialog."* Both symptoms are that one empty string:
+ *
+ *  - the SceneView breadcrumb ground-truths on `sceneManager.getCurrent()?.path` starting with the
+ *    prefab-edit prefix, so it stops showing the prefab;
+ *  - `isEditingPrefab()` fails the same check and runs its self-heal, CLEARING `editingPrefab` —
+ *    after which Cmd+S no longer routes to `savePrefabEdit()` and falls through to a scene save with
+ *    a null path, i.e. the native "Save Scene As" panel.
+ *
+ * So the SYNTHETIC path has to round-trip, and only the live identity carries it. See the body for
+ * why that preference is narrowed to the synthetic case rather than applied blanket. Both the
+ * capture and the compare go through here, so they cannot disagree.
+ */
+function currentSceneKey(): string | null {
+  // ⚠️ Prefer the live path ONLY when it is the synthetic one. A blanket
+  // `sceneManager.getCurrent()?.path ?? getCurrentScenePath()` looks equivalent and is not:
+  // `newScene()` wipes the ECS world and sets `_currentScenePath` WITHOUT touching sceneManager,
+  // so after an untitled new scene the live path is still the PREVIOUS scene's. Preferring it
+  // there made Stop reload the blank world under the old scene's identity — impersonating a real
+  // file. Narrowing to the synthetic prefix fixes the prefab-edit case (the bug this exists for)
+  // and leaves every other case exactly as it was before.
+  const live = sceneManager.getCurrent()?.path ?? null;
+  return live?.startsWith(PREFAB_EDIT_SCENE_PREFIX) ? live : getCurrentScenePath();
+}
+
 /** Enter Play: snapshot the authored world, then start the simulation. */
 export async function enterPlay(): Promise<void> {
   if (getPlayState() === 'playing') return;
@@ -67,7 +100,7 @@ export async function enterPlay(): Promise<void> {
   // contract is that Stop discards every play-mode mutation); minted guids land in
   // the snapshot JSON, not the live world. Do not pass { assignGuids: true } here.
   _snapshot = await serializeScene();
-  _snapshotPath = getCurrentScenePath();
+  _snapshotPath = currentSceneKey();
   // A5: snapshot every base in the chain too, so Stop can restore authored base
   // state (see `_baseSnapshots`'s own doc comment). No-op cost when there is no
   // base (the common case, and every project before this plan) — empty map.
@@ -138,7 +171,7 @@ export async function stopPlay(): Promise<void> {
   if (!snap) return;
   // Guard: if the active scene changed since Play, the snapshot is for a
   // different scene — reverting it would clobber the current one. Skip.
-  const path = getCurrentScenePath();
+  const path = currentSceneKey();
   if (snapPath !== path) return;
   // Reload the captured authored scene in place. preloaded skips the fetch, so
   // disk is never touched; the swap reuses already-resident resources via the
