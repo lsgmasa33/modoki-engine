@@ -42,6 +42,17 @@ export interface IosDevice {
   productType?: string;
   /** e.g. `26.5.2`. ⚠️ devicectl reports this as of the LAST CONNECTION, so it can be stale. */
   osVersion?: string;
+  /** True when `devicectl` itself listed this device — i.e. it is CoreDevice-reachable (iOS 17+),
+   *  so `xcrun devicectl device install|launch` can drive it hands-free. An entry that only the
+   *  legacy `xctrace` listing could see (#143 — every pre-iPhone-X handset) omits this.
+   *
+   *  It exists because a device PICKER has to decide `iosDevicectlId`, and that id is exactly what
+   *  flips `planIosInstall` from an Xcode handoff (build, open Xcode, press ⌘R) to a hands-free
+   *  install. Nothing else in the listing distinguishes the two sources: the obvious proxy is
+   *  `productType`, which devicectl alone supplies today — but that is a coincidence of the two
+   *  parsers, not a fact about the device, and a future xctrace parse that learns the model would
+   *  silently start promising devicectl installs on an iOS 16 phone that cannot do them. */
+  devicectl?: true;
 }
 
 /** Pull the PAIRED iOS devices out of `xcrun devicectl list devices --json-output`, flagging which
@@ -75,6 +86,7 @@ export function parseIosDevices(devicectlJson: string): IosDevice[] {
         udid,
         name: d.deviceProperties?.name ?? udid,
         connected: d.connectionProperties?.tunnelState === 'connected',
+        devicectl: true,
         ...(d.hardwareProperties?.productType ? { productType: d.hardwareProperties.productType } : {}),
         ...(d.deviceProperties?.osVersionNumber ? { osVersion: d.deviceProperties.osVersionNumber } : {}),
       });

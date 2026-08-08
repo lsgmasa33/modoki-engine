@@ -341,3 +341,142 @@ describe('syncLights — authored Light.target* aim', () => {
     expect(spot.target.position.z).toBeCloseTo(-9, 6);
   });
 });
+
+// ── The IBL-off compensation is gated on ACTUAL suppression, not on the tier (#154) ──
+//
+// A tier CLAMPS, never RAISES. Suppression is conditional — the tier says no IBL AND the scene
+// owns a loaded HDR `Environment` to lose — so the compensation has to carry the same condition.
+// Keying it on the tier alone brightened every low-tier scene with an AmbientLight and no
+// environment (several shipped demos), and since an unrecognised device resolves `low`, that
+// meant every phone. These pin BOTH directions; the boost-applies case is what stops the fix
+// from being "delete the compensation".
+
+describe('syncLights — IBL-off ambient compensation', () => {
+  /** Same as setup(), but with a loaded HDR in the environment cache so an `Environment`
+   *  entity actually reaches syncEnvironment's suppression branch. */
+  async function setupWithEnvCache() {
+    vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
+      worldTransforms, deactivatedEntities, transformPropagationSystem: {},
+    }));
+    vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+      resolveMeshTemplate: vi.fn(), resolveMeshLodInfo: vi.fn(() => null),
+      resolveMaterialForMesh: vi.fn(() => null), resolveMaterial: vi.fn(),
+      getCachedEnvironment: vi.fn(() => ({ isTexture: true })), acquireEnvironment: vi.fn(),
+    }));
+    vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
+    vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: vi.fn(() => false) }));
+    vi.doMock('../../src/runtime/loaders/textureResolver', () => ({
+      loadTexture3D: vi.fn(async () => ({})), releaseTexture3D: vi.fn(), setActiveRenderer: vi.fn(),
+      getEnvFormat: vi.fn(() => undefined),   // unregistered path → no UltraHDR boost
+    }));
+
+    const { createWorld } = await import('koota');
+    const { Light } = await import('../../src/three/traits/Light');
+    const { Environment } = await import('../../src/three/traits/Environment');
+    const settings = await import('../../src/runtime/rendering/renderSettings');
+    const { TIER_SETTINGS } = await import('../../src/runtime/rendering/qualityTier');
+    const sync = await import('../../src/runtime/rendering/scene3DSync');
+    settings.setActiveQualityTier({ tier: 'low', source: 'measured', reason: 'test' });
+    return { world: createWorld(), Light, Environment, sync, settings, TIER_SETTINGS, scene: new THREE.Scene() };
+  }
+
+  it('leaves ambient UNTOUCHED on the low tier when the scene has no Environment to lose', async () => {
+    const { world, Light, sync, settings, scene } = await setupWithEnvCache();
+    try {
+      const map = new Map<number, THREE.Light>();
+      const e = world.spawn(Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.5 }));
+
+      sync.syncEnvironment(world, scene);   // no Environment entity → nothing suppressed
+      expect(sync.isIblSuppressed()).toBe(false);
+      sync.syncLights(world, scene, map);
+
+      // The authored value, NOT authored × iblOffAmbientBoost.
+      expect((map.get(e.id()) as THREE.AmbientLight).intensity).toBeCloseTo(0.5, 6);
+    } finally {
+      settings.setActiveQualityTier(null);
+      world.destroy();  // koota caps at 16 live worlds; this describe adds four more
+    }
+  });
+
+  it('boosts ambient on the low tier when an Environment WAS suppressed', async () => {
+    const { world, Light, Environment, sync, settings, TIER_SETTINGS, scene } = await setupWithEnvCache();
+    try {
+      const map = new Map<number, THREE.Light>();
+      const e = world.spawn(Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.5 }));
+      world.spawn(Environment({ hdrPath: '/sky.hdr', intensity: 1 }));
+
+      sync.syncEnvironment(world, scene);
+      expect(sync.isIblSuppressed()).toBe(true);
+      expect(scene.environment).toBe(null);  // the thing being compensated for
+      sync.syncLights(world, scene, map);
+
+      expect((map.get(e.id()) as THREE.AmbientLight).intensity)
+        .toBeCloseTo(0.5 * TIER_SETTINGS.low.iblOffAmbientBoost, 6);
+    } finally {
+      settings.setActiveQualityTier(null);
+      world.destroy();  // koota caps at 16 live worlds; this describe adds four more
+    }
+  });
+
+  it('drops the boost again on the frame the Environment goes away', async () => {
+    const { world, Light, Environment, sync, settings, scene } = await setupWithEnvCache();
+    try {
+      const map = new Map<number, THREE.Light>();
+      const e = world.spawn(Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.5 }));
+      const env = world.spawn(Environment({ hdrPath: '/sky.hdr', intensity: 1 }));
+      sync.syncEnvironment(world, scene);
+      sync.syncLights(world, scene, map);
+
+      env.destroy();                        // scene swap into a scene with no environment
+      sync.syncEnvironment(world, scene);
+      expect(sync.isIblSuppressed()).toBe(false);
+      sync.syncLights(world, scene, map);
+
+      expect((map.get(e.id()) as THREE.AmbientLight).intensity).toBeCloseTo(0.5, 6);
+    } finally {
+      settings.setActiveQualityTier(null);
+      world.destroy();  // koota caps at 16 live worlds; this describe adds four more
+    }
+  });
+
+  it('applyRendererColorConfig leaves the AUTHORED exposure — the compensation is not baked in', async () => {
+    // It also serves the asset-preview renderers (ModelPreview, previewScene), which never sync
+    // an Environment and so can never reconcile the flag back. Baking the boost in at renderer
+    // construction meant a material thumbnail rendered 1.25x brighter because a game panel
+    // elsewhere had set the module flag — a surface inheriting a compensation it cannot own.
+    const { world, Environment, sync, settings, scene } = await setupWithEnvCache();
+    try {
+      const base = settings.getRenderSettings().three.exposure;
+      world.spawn(Environment({ hdrPath: '/sky.hdr', intensity: 1 }));
+      sync.syncEnvironment(world, scene);
+      expect(sync.isIblSuppressed()).toBe(true);           // flag is set…
+
+      const preview = { toneMapping: 0 as never, toneMappingExposure: 0, outputColorSpace: '' };
+      sync.applyRendererColorConfig(preview);
+      expect(preview.toneMappingExposure).toBeCloseTo(base, 6);   // …and this surface ignores it
+    } finally {
+      settings.setActiveQualityTier(null);
+      world.destroy();
+    }
+  });
+
+  it('reconcileToneExposure carries the SAME predicate as the ambient boost', async () => {
+    const { world, Environment, sync, settings, TIER_SETTINGS, scene } = await setupWithEnvCache();
+    try {
+      const base = settings.getRenderSettings().three.exposure;
+      const r = { toneMappingExposure: 0 };
+
+      sync.syncEnvironment(world, scene);   // no Environment
+      sync.reconcileToneExposure(r);
+      expect(r.toneMappingExposure).toBeCloseTo(base, 6);
+
+      world.spawn(Environment({ hdrPath: '/sky.hdr', intensity: 1 }));
+      sync.syncEnvironment(world, scene);
+      sync.reconcileToneExposure(r);
+      expect(r.toneMappingExposure).toBeCloseTo(base * TIER_SETTINGS.low.iblOffExposure, 6);
+    } finally {
+      settings.setActiveQualityTier(null);
+      world.destroy();  // koota caps at 16 live worlds; this describe adds four more
+    }
+  });
+});

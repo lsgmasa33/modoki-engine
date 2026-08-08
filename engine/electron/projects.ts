@@ -232,6 +232,10 @@ export interface RendererMenuItem {
   disabled?: boolean;
   checked?: boolean;
   separator?: boolean;
+  /** Nested items, ONE level deep (the renderer never sends deeper — see `BarMenuItem`). Electron
+   *  ignores a submenu parent's own click, so a parent's `id` is never dispatched: everything that
+   *  must stay reachable is inside the submenu. */
+  submenu?: RendererMenuItem[];
 }
 /** The editor renderer's menu structure, pushed to main so the OS-level menu
  *  carries the editor's own actions (the in-window menu bar is dropped under
@@ -286,6 +290,12 @@ export function installAppMenu(opts: {
   const toItem = (it: RendererMenuItem): Electron.MenuItemConstructorOptions => {
     if (it.separator || !it.id) return { type: 'separator' };
     const label = it.checked != null ? `${it.checked ? '✓ ' : ''}${it.label ?? ''}` : (it.label ?? '');
+    // A submenu parent gets NO click handler — Electron ignores one, and attaching it would
+    // suggest the parent acts. Its children are mapped through this same function, so one level
+    // of nesting is all the spec can express (which is all the renderer sends).
+    if (it.submenu?.length) {
+      return { label, enabled: !it.disabled, submenu: it.submenu.map(toItem) };
+    }
     return { label, accelerator: toAccelerator(it.shortcut), enabled: !it.disabled, click: () => opts.onMenuAction?.(it.id!) };
   };
 

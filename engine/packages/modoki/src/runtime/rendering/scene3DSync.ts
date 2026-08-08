@@ -41,7 +41,7 @@ import {
   getRenderSettings, resolveToneMapping, getEffectiveThreeSettings,
   getActiveQualityTier, setActiveQualityTier, getActiveTierOrDefault,
 } from './renderSettings';
-import { resolveTier, tierShadowMapSize, type QualityTierSetting } from './qualityTier';
+import { resolveTier, tierShadowMapSize, tierAllowsIBL, tierAmbientBoost, tierExposureBoost, type QualityTierSetting } from './qualityTier';
 import { applyInstancedBatching } from './instancedBatching';
 import { getDeviceCaps } from './deviceCaps';
 import { getPlayerQualityTier } from './playerQualityTier';
@@ -386,8 +386,25 @@ export function setActiveCameraFrame(world: World, ref: { name?: string; guid?: 
 
 // ── Environment sync ────────────────────────────────────
 
+/** Did the LAST {@link syncEnvironment} actually take IBL away from this scene?
+ *
+ *  The compensation (`iblOffAmbientBoost` / `iblOffExposure`) must key off THIS, not off the
+ *  tier — suppression is conditional (the tier says no IBL *and* the scene has a loaded HDR
+ *  `Environment` to lose), while a tier check alone is unconditional. Keying the compensation
+ *  on the tier brightened every low-tier scene that never had an environment at all, which is
+ *  a tier RAISING its output — the one thing `docs/rendering.md` § "Quality tiers" says a tier
+ *  must never do. And since an unrecognised device resolves `low` (see `resolveTier`), that was
+ *  every phone running any project with an `AmbientLight` and no `Environment`. */
+let iblSuppressed = false;
+
+/** Test/diagnostic read of the flag above. */
+export function isIblSuppressed(): boolean {
+  return iblSuppressed;
+}
+
 export function syncEnvironment(world: World, scene: THREE.Scene) {
   let envActive = false;
+  let suppressed = false;
   world.query(Environment).updateEach(([env], entity) => {
     if (deactivatedEntities.has(entity.id())) return;
     envActive = true;
@@ -405,8 +422,15 @@ export function syncEnvironment(world: World, scene: THREE.Scene) {
       // Change-gate every write (F5): this runs every frame, but the env texture +
       // its scalars rarely change, and reassigning `scene.background`/intensity flags
       // the three render state dirty on some backends → redundant work.
-      if (scene.environment !== cached) scene.environment = cached;
-      if (scene.environmentIntensity !== envIntensity) scene.environmentIntensity = envIntensity;
+      // Tier gate (#154): IBL costs ~26 ms of a ~53 ms frame on a Huawei Y6 — half of it. The
+      // BACKGROUND below is left alone (measured not to be the cost); only the lighting
+      // contribution is suppressed, and syncLights/applyRendererColorConfig compensate.
+      const iblOn = tierAllowsIBL(getActiveTierOrDefault());
+      if (!iblOn) suppressed = true; // this scene HAS an env and the tier is taking it away
+      const wantEnv = iblOn ? cached : null;
+      const wantEnvIntensity = iblOn ? envIntensity : 1;
+      if (scene.environment !== wantEnv) scene.environment = wantEnv;
+      if (scene.environmentIntensity !== wantEnvIntensity) scene.environmentIntensity = wantEnvIntensity;
       if (env.showAsBackground) {
         if (scene.background !== cached) scene.background = cached;
         if (scene.backgroundIntensity !== bgIntensity) scene.backgroundIntensity = bgIntensity;
@@ -426,6 +450,9 @@ export function syncEnvironment(world: World, scene: THREE.Scene) {
     scene.environment = null;
     scene.environmentIntensity = 1;
   }
+  // Recomputed from scratch each frame, so a scene swap into a no-environment scene (or a tier
+  // promotion) drops the compensation on the very next frame rather than leaving it stuck on.
+  iblSuppressed = suppressed;
 }
 
 /** Force a NodeMaterialObserver refresh across the scene so a change to
@@ -701,7 +728,13 @@ export function syncLights(world: World, scene: THREE.Scene, ecsLights: Map<numb
     // Per-frame: re-apply every field the trait carries. Light subclasses
     // ignore irrelevant fields (e.g. AmbientLight has no `distance`).
     l.color.setHex(light.color);
-    l.intensity = light.intensity;
+    // Ambient carries the IBL-off compensation (#154) — a scene whose IBL was suppressed would
+    // otherwise render visibly dark and flat. Gated on `isIblSuppressed()`, NOT on the tier: a
+    // scene that never had an environment has nothing to compensate for, and boosting it anyway
+    // is a tier raising its output. Always 1 unless this frame actually lost an environment, so
+    // the authored value passes through untouched everywhere else.
+    l.intensity = light.intensity
+      * (iblSuppressed && l instanceof THREE.AmbientLight ? tierAmbientBoost(getActiveTierOrDefault()) : 1);
     l.castShadow = light.castShadow;
     if (light.castShadow && (l instanceof THREE.DirectionalLight || l instanceof THREE.SpotLight)) {
       configureLightShadow(l, light);
@@ -2954,14 +2987,23 @@ export async function prewarmShadersForWorld(
   // Mirror the staging world's Environment so compileAsync produces the correct
   // PBR shader variant (with envMap sampling). Without this, the first real
   // render recompiles shaders and stutters.
-  world.query(Environment).updateEach(([env]: [{ hdrPath: string; intensity: number }]) => {
-    if (!env.hdrPath) return;
-    const cached = getCachedEnvironment(env.hdrPath);
-    if (cached) {
-      prewarmScene.environment = cached;
-      prewarmScene.environmentIntensity = env.intensity;
-    }
-  });
+  //
+  // GATED ON THE TIER, for the same reason the mirror exists at all (#154): a tier with `ibl`
+  // false renders with `scene.environment` null, so mirroring the env here would compile the
+  // envMap variant that the real render never uses — and the first frame would then compile the
+  // NON-env variant synchronously, which is precisely the cold-compile stutter this mirror is
+  // here to prevent (measured at 3926 ms on the Y6, P4a). The prewarm must model the scene the
+  // tier will actually draw, not the scene as authored.
+  if (tierAllowsIBL(getActiveTierOrDefault())) {
+    world.query(Environment).readEach(([env]: [{ hdrPath: string; intensity: number }]) => {
+      if (!env.hdrPath) return;
+      const cached = getCachedEnvironment(env.hdrPath);
+      if (cached) {
+        prewarmScene.environment = cached;
+        prewarmScene.environmentIntensity = env.intensity;
+      }
+    });
+  }
 
   // Mirror the staging world's lights so compileAsync produces the correct
   // shader variants (otherwise Three.js's LightsNode warns + skips compile).
@@ -3076,8 +3118,34 @@ export function applyRendererColorConfig(r: {
 }): void {
   const { toneMapping, exposure } = getRenderSettings().three;
   r.toneMapping = resolveToneMapping(toneMapping);
-  r.toneMappingExposure = exposure;
   r.outputColorSpace = THREE.SRGBColorSpace;
+  // The AUTHORED exposure, with no IBL-off compensation on it. The compensation belongs to a
+  // surface that syncs an `Environment` and can therefore know whether one was suppressed —
+  // this function also serves the asset-preview renderers (ModelPreview, previewScene), which
+  // never sync one, so baking it in here would light a material thumbnail 1.25x brighter
+  // because a game panel elsewhere happened to be on the low tier.
+  r.toneMappingExposure = exposure;
+}
+
+/** The exposure half of the IBL-off compensation (#154), split out because it is the one part of
+ *  the color config that is NOT fixed at renderer creation.
+ *
+ *  `applyRendererColorConfig` runs once, when the renderer is made — before any scene has loaded,
+ *  so it cannot yet know whether this scene owns an `Environment` to lose. The compensation must
+ *  follow the same "was IBL actually suppressed" predicate as the ambient boost (otherwise the
+ *  two halves disagree and the tier raises exposure on scenes that never had IBL), so the render
+ *  loop calls this after `syncEnvironment` each frame. Change-gated: the assignment is skipped
+ *  when the value already matches, so the steady state writes nothing.
+ *
+ *  **Call it immediately after your OWN `syncEnvironment`, on every surface that has one.**
+ *  `isIblSuppressed()` is module state describing what the LAST `syncEnvironment` saw, and the
+ *  editor mounts two surfaces that each call it. A surface that sets the flag and never reads it
+ *  back keeps whatever exposure it was constructed with — which is how the Scene panel came to
+ *  bake in a compensation belonging to the Game panel. */
+export function reconcileToneExposure(r: { toneMappingExposure: number }): void {
+  const { exposure } = getRenderSettings().three;
+  const want = exposure * (iblSuppressed ? tierExposureBoost(getActiveTierOrDefault()) : 1);
+  if (r.toneMappingExposure !== want) r.toneMappingExposure = want;
 }
 
 /** Resolve the quality tier once, before the first drawing buffer is allocated (#121 P3).

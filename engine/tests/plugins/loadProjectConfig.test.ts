@@ -31,6 +31,9 @@ import {
   pruneProjectConfig,
   findNullPatchPaths,
   projectConfigIssues,
+  overlayPrivateBuildFields,
+  stripPrivateBuildFields,
+  PRIVATE_BUILD_FIELDS,
   type ProjectConfig,
   type ProjectUserConfig,
   type RawProjectConfig,
@@ -123,9 +126,140 @@ describe('loadProjectUserConfig', () => {
     const next: ProjectUserConfig = {
       device: { iosDeviceId: 'ABC-123', iosDevicectlId: 'DEF-456', androidDeviceId: '192.168.1.5:5555' },
       sdk: { javaHome: '/opt/jdk', androidHome: '/opt/sdk', gcloudPath: '/opt/homebrew/bin/gcloud' },
+      build: { appleTeamId: 'ABCDE12345', webBucket: 'gs://b/y', webCdnUrlMap: 'lb', webCdnBackendBucket: 'bb', webDeployCommand: 'echo hi' },
     };
     writeProjectUserConfig(next, root);
     expect(loadProjectUserConfig(root)).toEqual(next);
+  });
+});
+
+describe('#172: stripPrivateBuildFields — the CLIENT bundle must not carry them', () => {
+  // The seam nothing was watching. `virtual:modoki-project-config` (vite-asset-scanner.ts) inlines
+  // the RESOLVED config into every built game's JS, and a built game is deployed to a public URL —
+  // so before this, a real web build of games/sling contained
+  // the owner's real `appleTeamId` and the internal bucket/CDN names, downloadable by anyone.
+  // (Verified by building games/sling and grepping dist/ — before and after.) That is a
+  // WIDER exposure than the committed-file one #172 set out to fix, and it predates it.
+  it('blanks every private field and leaves the rest of the config untouched', () => {
+    const cfg = mergeProjectConfig({
+      app: { appId: 'com.x.y', appName: 'Y' },
+      build: {
+        appleTeamId: 'REALTEAM99', webBucket: 'gs://internal/x', webCdnUrlMap: 'static-lb',
+        webCdnBackendBucket: 'static-backend', webDeployCommand: 'deploy.sh',
+        webBasePath: '/sub/', webDeployMode: 'gcs', debugBuild: true,
+      },
+    } as Parameters<typeof mergeProjectConfig>[0]);
+
+    const stripped = stripPrivateBuildFields(cfg);
+
+    for (const field of PRIVATE_BUILD_FIELDS) expect(stripped.build[field]).toBe('');
+    // the three that legitimately ship survive — blanking them would break the client
+    expect(stripped.build.webBasePath).toBe('/sub/');
+    expect(stripped.build.webDeployMode).toBe('gcs');
+    expect(stripped.build.debugBuild).toBe(true);
+    expect(stripped.app.appId).toBe('com.x.y');
+    // no private value survives anywhere in the serialized module body
+    expect(JSON.stringify(stripped)).not.toContain('REALTEAM99');
+    expect(JSON.stringify(stripped)).not.toContain('gs://internal/x');
+  });
+
+  it('does not mutate the config it was given', () => {
+    const cfg = mergeProjectConfig({ build: { appleTeamId: 'REALTEAM99' } } as Parameters<typeof mergeProjectConfig>[0]);
+    stripPrivateBuildFields(cfg);
+    expect(cfg.build.appleTeamId).toBe('REALTEAM99');
+  });
+
+  it('keeps the fields PRESENT as empty strings, not deleted', () => {
+    // A consumer that reads one gets the already-handled "not set" state instead of an
+    // undefined that throws on .trim().
+    const stripped = stripPrivateBuildFields(mergeProjectConfig(null));
+    for (const field of PRIVATE_BUILD_FIELDS) expect(stripped.build).toHaveProperty(field, '');
+  });
+});
+
+describe('#172 mergeProjectUserConfig build section', () => {
+  it('round-trips all five private fields', () => {
+    const next: ProjectUserConfig = {
+      ...DEFAULT_PROJECT_USER_CONFIG,
+      build: {
+        appleTeamId: 'ABCDE12345', webBucket: 'gs://b/y', webCdnUrlMap: 'lb',
+        webCdnBackendBucket: 'bb', webDeployCommand: 'echo hi',
+      },
+    };
+    expect(mergeProjectUserConfig(next)).toEqual(next);
+  });
+
+  it('defaults `build` to all-empty when absent, same as an unmigrated device/sdk', () => {
+    expect(mergeProjectUserConfig({ device: DEFAULT_PROJECT_USER_CONFIG.device }).build)
+      .toEqual(DEFAULT_PROJECT_USER_CONFIG.build);
+    expect(mergeProjectUserConfig(null).build).toEqual(DEFAULT_PROJECT_USER_CONFIG.build);
+    for (const field of PRIVATE_BUILD_FIELDS) expect(DEFAULT_PROJECT_USER_CONFIG.build[field]).toBe('');
+  });
+});
+
+describe('#172 overlayPrivateBuildFields', () => {
+  // Partial<ProjectConfig> is shallow — `build` still needs every field — so these
+  // spread the defaults first and override just what the test cares about, same as
+  // the withCfg/withUser helpers in the validateBuildConfig describe below.
+  const cfgWith = (build: Partial<ProjectConfig['build']>): ProjectConfig =>
+    mergeProjectConfig({ build: { ...DEFAULT_PROJECT_CONFIG.build, ...build } });
+  const userWith = (build: Partial<ProjectUserConfig['build']>): ProjectUserConfig =>
+    mergeProjectUserConfig({ build: { ...DEFAULT_PROJECT_USER_CONFIG.build, ...build } });
+
+  it('a non-empty user value wins over the committed value', () => {
+    const cfg = cfgWith({ appleTeamId: 'COMMITTED123' });
+    const user = userWith({ appleTeamId: 'USERVALUE99' });
+    expect(overlayPrivateBuildFields(cfg, user).build.appleTeamId).toBe('USERVALUE99');
+  });
+
+  it('an empty user value falls through to the committed value unchanged', () => {
+    const cfg = cfgWith({ webBucket: 'gs://still-committed/x' });
+    expect(overlayPrivateBuildFields(cfg, DEFAULT_PROJECT_USER_CONFIG).build.webBucket).toBe('gs://still-committed/x');
+  });
+
+  it('applies the rule to every field in PRIVATE_BUILD_FIELDS, independently', () => {
+    const cfg = cfgWith({ appleTeamId: 'C1', webBucket: 'C2', webCdnUrlMap: 'C3', webCdnBackendBucket: 'C4', webDeployCommand: 'C5' });
+    const user = userWith({ appleTeamId: 'U1', webBucket: '', webCdnUrlMap: 'U3', webCdnBackendBucket: '', webDeployCommand: 'U5' });
+    const out = overlayPrivateBuildFields(cfg, user).build;
+    expect(out.appleTeamId).toBe('U1');       // user wins (non-empty)
+    expect(out.webBucket).toBe('C2');         // falls through (user empty)
+    expect(out.webCdnUrlMap).toBe('U3');      // user wins
+    expect(out.webCdnBackendBucket).toBe('C4'); // falls through
+    expect(out.webDeployCommand).toBe('U5');  // user wins
+  });
+
+  it('leaves the non-private build fields (debugBuild/webDeployMode/webBasePath) untouched', () => {
+    const cfg = cfgWith({ webDeployMode: 'custom', webBasePath: '/x/', debugBuild: true });
+    const out = overlayPrivateBuildFields(cfg, DEFAULT_PROJECT_USER_CONFIG).build;
+    expect(out.webDeployMode).toBe('custom');
+    expect(out.webBasePath).toBe('/x/');
+    expect(out.debugBuild).toBe(true);
+  });
+
+  it('mutates neither argument, and returns a NEW config object', () => {
+    const cfg = cfgWith({ appleTeamId: 'A' });
+    const user = userWith({ appleTeamId: 'B' });
+    const cfgSnapshot = JSON.parse(JSON.stringify(cfg)) as unknown;
+    const userSnapshot = JSON.parse(JSON.stringify(user)) as unknown;
+    const out = overlayPrivateBuildFields(cfg, user);
+    expect(cfg).toEqual(cfgSnapshot);
+    expect(user).toEqual(userSnapshot);
+    expect(out).not.toBe(cfg);
+    expect(out.build).not.toBe(cfg.build);
+  });
+});
+
+describe('#172 loadProjectConfig overlays the private build fields from project.user.json', () => {
+  it('a non-empty project.user.json build field wins over the committed one', () => {
+    fs.writeFileSync(configPath(), JSON.stringify({ build: { appleTeamId: 'COMMITTED123' } }));
+    fs.writeFileSync(userConfigPath(), JSON.stringify({ build: { appleTeamId: 'PRIVATE999' } }));
+    expect(loadProjectConfig(root).build.appleTeamId).toBe('PRIVATE999');
+  });
+
+  it('falls through to the committed value when project.user.json has not migrated the field', () => {
+    fs.writeFileSync(configPath(), JSON.stringify({ build: { webBucket: 'gs://still-committed' } }));
+    // no project.user.json at all
+    expect(loadProjectConfig(root).build.webBucket).toBe('gs://still-committed');
   });
 });
 
@@ -391,6 +525,20 @@ describe('validateBuildConfig', () => {
       DEFAULT_PROJECT_CONFIG,
       withUser(undefined, { javaHome: '/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home' }),
     )).toEqual([]);
+  });
+
+  it('#172: rejects a shell-unsafe private field that lives in the USER file — would have PASSED before the overlay', () => {
+    // The committed config is the safe default; the overlay is what surfaces a bad
+    // value in the private (gitignored) file.
+    const user = mergeProjectUserConfig({ build: { ...DEFAULT_PROJECT_USER_CONFIG.build, webBucket: 'gs://x; rm -rf ~' } });
+    const errors = validateBuildConfig(DEFAULT_PROJECT_CONFIG, user);
+    expect(errors.length).toBeGreaterThan(0);
+    expect(errors.join(';')).toContain('Web GCS bucket');
+  });
+
+  it('#172: an empty private user field does not mask a bad COMMITTED value (unmigrated project keeps validating)', () => {
+    const cfg = withCfg({ appleTeamId: 'not valid!' });
+    expect(validateBuildConfig(cfg, DEFAULT_PROJECT_USER_CONFIG).length).toBeGreaterThan(0);
   });
 });
 

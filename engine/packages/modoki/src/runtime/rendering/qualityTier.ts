@@ -89,6 +89,24 @@ export interface TierRenderOverrides {
   maxDirectional: number;
   /** Most POINT+SPOT ("local") lights an object may be lit by. 0 = unlimited. */
   maxLocal: number;
+  /** May image-based lighting (an HDR `Environment`) light the scene on this tier?
+   *
+   *  MEASURED on a Huawei Y6 2019 (#154): IBL costs **~26 ms of a ~53 ms frame** — half of it,
+   *  and entirely GPU (`restMs` 36.7 -> 4.6). Switching it off takes sling 18.7 -> 36.5 fps.
+   *
+   *  It is the env LOOKUP that costs, not the texture: downsampling the source HDR from
+   *  2048x1024 to 256x128 (16 MB -> 0.25 MB) moved the frame 53.4 -> 53.2 ms, i.e. nothing,
+   *  because three's PMREM converts the source once into a fixed-size CubeUV cubemap and the
+   *  fragment shader samples THAT. So this cannot be fixed by shrinking the asset — the only
+   *  lever is not doing it. Scene BACKGROUND is left alone; it was measured not to be the cost. */
+  ibl: boolean;
+  /** Multiplier applied to AMBIENT light intensity when `ibl` is false, to put back the fill
+   *  light the environment was providing. Without it the scene goes visibly dark and flat. */
+  iblOffAmbientBoost: number;
+  /** Multiplier applied to tone-mapping exposure when `ibl` is false — the second half of the
+   *  same compensation. Measured together: 30.4 ms / 32.9 fps, against 27.4 / 36.5 uncompensated
+   *  and 53.4 / 18.7 shipped. Clears the 33.3 ms budget WITH the lighting put back. */
+  iblOffExposure: number;
 }
 
 /** Ambient is deliberately NOT capped: three sums every `AmbientLight` into one constant term, so
@@ -96,12 +114,23 @@ export interface TierRenderOverrides {
  *  visibly flatten the scene. */
 export const TIER_SETTINGS: Record<QualityTier, TierRenderOverrides> = {
   low: {
+    // pixelRatioCap STAYS 1 — spending the IBL saving on resolution was TRIED AND MEASURED, and
+    // it does not fit. On the Huawei Y6 (#154), with IBL already suppressed:
+    //     1x   (360x753)    22 ms   45 fps
+    //     1.4x (503x1054)   72 ms   14 fps
+    //     2x   (720x1506)   69 ms   14 fps
+    // A fill-bound GPU pays ~4x for 2x DPR, which the ~11 ms of headroom cannot come close to
+    // covering — and 1.4x is no cheaper, its odd 503x1054 buffer being worse for a tile-based
+    // renderer than the aligned 2x one. So the low tier keeps the resolution guard and spends the
+    // IBL saving on FRAME RATE, which is where it actually lands.
     pixelRatioCap: 1, antialias: false, shadows: false, shadowMapCeiling: 512, postFX: false,
     maxDirectional: 1, maxLocal: 1,
+    ibl: false, iblOffAmbientBoost: 4, iblOffExposure: 1.25,
   },
   high: {
     pixelRatioCap: 2, antialias: true, shadows: true, shadowMapCeiling: 0, postFX: true,
     maxDirectional: 0, maxLocal: 0,
+    ibl: true, iblOffAmbientBoost: 1, iblOffExposure: 1,
   },
 };
 
@@ -321,6 +350,23 @@ export function evaluateTierChange(
 
 /** Clamp an authored shadow-map size to the tier's ceiling. `Light.shadowMapSize` is a per-light
  *  trait field with no global cap, so without this a tier cannot enforce "shadows, but smaller". */
+/** May IBL light the scene on this tier? A named accessor rather than a raw
+ *  `TIER_SETTINGS[t].ibl` at the call site, mirroring {@link tierAllowsPostFX}. */
+export function tierAllowsIBL(tier: QualityTier): boolean {
+  return TIER_SETTINGS[tier].ibl;
+}
+
+/** Ambient intensity multiplier that compensates for IBL being off on this tier (1 when IBL is on,
+ *  so the authored value passes through untouched). */
+export function tierAmbientBoost(tier: QualityTier): number {
+  return TIER_SETTINGS[tier].ibl ? 1 : TIER_SETTINGS[tier].iblOffAmbientBoost;
+}
+
+/** Exposure multiplier that compensates for IBL being off on this tier (1 when IBL is on). */
+export function tierExposureBoost(tier: QualityTier): number {
+  return TIER_SETTINGS[tier].ibl ? 1 : TIER_SETTINGS[tier].iblOffExposure;
+}
+
 export function tierShadowMapSize(authored: number, tier: QualityTier): number {
   const ceiling = TIER_SETTINGS[tier].shadowMapCeiling;
   if (!ceiling) return authored;

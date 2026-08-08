@@ -20,14 +20,14 @@ beforeEach(() => {
   worldTransforms.clear();
 });
 
-async function setup(opts: { primitives?: boolean } = {}) {
+async function setup(opts: { primitives?: boolean; env?: unknown } = {}) {
   vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
     worldTransforms, deactivatedEntities, transformPropagationSystem: {},
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
     resolveMeshTemplate: vi.fn(() => null), resolveMeshLodInfo: vi.fn(() => null),
     resolveMaterialForMesh: vi.fn(() => null), resolveMaterial: vi.fn(() => null),
-    getCachedEnvironment: vi.fn(() => null), acquireEnvironment: vi.fn(),
+    getCachedEnvironment: vi.fn(() => opts.env ?? null), acquireEnvironment: vi.fn(),
   }));
   // A primitive factory that returns a REAL mesh, so the dedupe test can count the
   // placeholders that actually reached the compile. Each call yields a fresh object,
@@ -53,9 +53,13 @@ async function setup(opts: { primitives?: boolean } = {}) {
 function makeRendererStub() {
   const compiledScenes: THREE.Scene[] = [];
   const standardMeshCounts: number[] = [];
+  /** Captured AT compile time for the same reason as the counts: prewarm detaches the shared
+   *  environment before clearing, so reading `.environment` after the call always sees null. */
+  const compiledEnvironments: (THREE.Texture | null)[] = [];
   const renderer = {
     compileAsync: vi.fn(async (scene: THREE.Scene) => {
       compiledScenes.push(scene);
+      compiledEnvironments.push(scene.environment);
       standardMeshCounts.push(
         scene.children.filter(
           (o) => (o as THREE.Mesh).isMesh && (o as THREE.Mesh).material instanceof THREE.MeshStandardMaterial,
@@ -63,7 +67,7 @@ function makeRendererStub() {
       );
     }),
   };
-  return { renderer, compiledScenes, standardMeshCounts };
+  return { renderer, compiledScenes, standardMeshCounts, compiledEnvironments };
 }
 
 const camera = new THREE.PerspectiveCamera();
@@ -127,5 +131,38 @@ describe('prewarmShadersForWorld — one placeholder per distinct (mesh, materia
     await sync.prewarmShadersForWorld(world, renderer as never, camera);
 
     expect(standardMeshCounts[0]).toBe(3);
+  });
+});
+
+/** #154. The prewarm mirrors `scene.environment` so `compileAsync` produces the envMap PBR
+ *  variant. The low tier SUPPRESSES IBL, so mirroring it there would compile a variant the real
+ *  render never uses AND leave the first real frame to compile the non-env one synchronously —
+ *  reintroducing the very cold-compile stall the mirror exists to prevent (3926 ms on a Y6).
+ *  The prewarm must model the scene the tier will actually DRAW. */
+describe('prewarmShadersForWorld — the environment mirror follows the TIER', () => {
+  const LOW = { tier: 'low', source: 'test', reason: 'test' } as never;
+  const HIGH = { tier: 'high', source: 'test', reason: 'test' } as never;
+
+  async function prewarmWithEnv(tier: unknown) {
+    const envTexture = { isTexture: true, name: 'fake-hdr' };
+    const { world, sync } = await setup({ env: envTexture });
+    const { Environment } = await import('../../src/three/traits/Environment');
+    const { setActiveQualityTier } = await import('../../src/runtime/rendering/renderSettings');
+    setActiveQualityTier(tier as never);
+    world.spawn(Environment({ hdrPath: 'hdr-guid', intensity: 0.4 }));
+    const { renderer, compiledEnvironments } = makeRendererStub();
+    await sync.prewarmShadersForWorld(world, renderer as never, camera);
+    setActiveQualityTier(null);
+    return { compiledEnv: compiledEnvironments[0], envTexture };
+  }
+
+  it('mirrors the environment on HIGH — the variant the render will use', async () => {
+    const { compiledEnv, envTexture } = await prewarmWithEnv(HIGH);
+    expect(compiledEnv).toBe(envTexture);
+  });
+
+  it('does NOT mirror it on LOW, where syncEnvironment suppresses IBL', async () => {
+    const { compiledEnv } = await prewarmWithEnv(LOW);
+    expect(compiledEnv).toBeNull();
   });
 });

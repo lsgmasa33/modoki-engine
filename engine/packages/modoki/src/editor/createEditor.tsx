@@ -479,9 +479,21 @@ export interface EditorOptions {
   /** Game View component (renders the live game preview) */
   gameView?: React.ComponentType;
   /** Extra menus to add to the editor menu bar (e.g., Build) */
-  extraMenus?: Record<string, { label: string; action?: () => void; separator?: boolean; disabled?: boolean; shortcut?: string }[]>;
+  extraMenus?: Record<string, ExtraMenuItem[]>;
   /** Project Settings window schema + persistence (adds File → Project Settings). */
   projectSettings?: ProjectSettingsSchema;
+}
+
+/** One host-provided menu item. `submenu` is one level deep — see `BarMenuItem`, whose shape this
+ *  mirrors minus the fields only the bar itself sets. */
+export interface ExtraMenuItem {
+  label: string;
+  action?: () => void;
+  separator?: boolean;
+  disabled?: boolean;
+  shortcut?: string;
+  checked?: boolean;
+  submenu?: ExtraMenuItem[];
 }
 
 /** Registry of custom panels added by the game */
@@ -493,6 +505,30 @@ let _projectSettings: ProjectSettingsSchema | null = null;
 export function getCustomPanels() { return _customPanels; }
 export function getGameViewComponent() { return _gameView; }
 export function getExtraMenus() { return _extraMenus; }
+
+// ── Updatable extra menus ────────────────────────────────────────────────────────────────────
+// `createEditor` runs ONCE, so anything a menu label depends on that is not known at setup time
+// (the Build menu's device listing — two `xcrun` shell-outs we must not block boot on) can never
+// reach the menu without a way to replace the registry afterwards. A version counter + external
+// store, rather than React state, because the producer is the app-level setup module, which is
+// outside the component tree entirely.
+let _extraMenusVersion = 0;
+const _extraMenuListeners = new Set<() => void>();
+
+/** Replace the host's extra menus and notify the menu bar. Whole-registry, not a patch: the caller
+ *  owns the shape it registered, and a merge here would make "remove an item" unexpressible. */
+export function setExtraMenus(menus: NonNullable<EditorOptions['extraMenus']>): void {
+  _extraMenus = menus;
+  _extraMenusVersion++;
+  for (const l of _extraMenuListeners) l();
+}
+
+export function subscribeExtraMenus(cb: () => void): () => void {
+  _extraMenuListeners.add(cb);
+  return () => { _extraMenuListeners.delete(cb); };
+}
+
+export function getExtraMenusVersion(): number { return _extraMenusVersion; }
 export function getProjectSettings() { return _projectSettings; }
 
 export function createEditor(options: EditorOptions): React.ComponentType {

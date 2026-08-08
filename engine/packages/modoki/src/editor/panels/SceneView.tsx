@@ -22,7 +22,7 @@ import { markOverrideIfInstance } from '../undo/entityActions';
 import { Transform, EntityAttributes, Collider3D, clampAngle, Bone2D, Billboard3D, CameraFrame, Zone3D } from '../../runtime/traits';
 import { colliderWireframeGeometry, colliderOutlineSig3D, colliderWorldScale3D, type ColliderOutline3DParams } from '../../runtime/rendering/colliderOutline3D';
 import {
-  syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards,
+  syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, reconcileToneExposure,
   refreshEnvIntensityObserver,
   createRenderState, disposeRenderState, attachInvalidationListener,
   makeWebGPURenderer, computeActiveFrameFit, applyOrthoFrustum,
@@ -3644,6 +3644,13 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
       // Sync ECS environment (shared runtime logic)
       syncEnvironment(getCurrentWorld(), scene);
+      // EVERY surface that calls syncEnvironment must reconcile its OWN exposure right after it:
+      // the IBL-off compensation is gated on module state that syncEnvironment overwrites, so a
+      // surface that only sets it and never reads it back keeps whatever exposure it was created
+      // with. This panel's renderer took its exposure once, at makeWebGPURenderer — with a project
+      // that pins `qualityTier: 'low'`, a Game-panel frame could set the flag before this panel
+      // was ever created and bake a 1.25x exposure in permanently. See reconcileToneExposure.
+      reconcileToneExposure(renderer);
       syncFog(getCurrentWorld(), scene);
       // WebGPU render-on-demand: a change to scene.environmentIntensity isn't monitored
       // by three's NodeMaterialObserver, so on this static-camera surface the env uniform

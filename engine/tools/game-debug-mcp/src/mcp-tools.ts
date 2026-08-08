@@ -185,7 +185,10 @@ type DeviceListReply = {
    *  ("SC_56C"), which is the string a human cannot match to a handset on the desk. Prefer `name`
    *  wherever one is shown, and fall back to `model` — a device that would not answer has neither. */
   android: Array<{ serial: string; state: string; model?: string; name?: string; transportId?: string; usable: boolean; claim: DeviceListClaim | null }>;
-  ios: Array<{ udid: string; name: string; connected: boolean; productType?: string; osVersion?: string; claim: DeviceListClaim | null }>;
+  /** `devicectl` is set when `xcrun devicectl` itself listed the device (iOS 17+/CoreDevice) —
+   *  absent for one only the legacy `xctrace` listing can see (#143). It is what the editor's
+   *  Build-menu target picker reads to decide a hands-free install vs an Xcode handoff (#170). */
+  ios: Array<{ udid: string; name: string; connected: boolean; productType?: string; osVersion?: string; devicectl?: boolean; claim: DeviceListClaim | null }>;
   /** Claims keyed by WiFi address (`ip:<host>`) — no hardware row exists for these, so they would be
    *  invisible in either list above without being surfaced separately. */
   otherClaims: DeviceListClaim[];

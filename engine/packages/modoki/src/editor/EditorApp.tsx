@@ -40,7 +40,7 @@ import { useEditorStore } from './store/editorStore';
 import { setActionCallback } from './undo/entityActions';
 import { pushAction, undo, redo, canUndo, canRedo, undoLabel, redoLabel, subscribeUndo, getUndoVersion } from './undo/undoManager';
 
-import { getGameViewComponent, getCustomPanels, getExtraMenus, getProjectSettings } from './createEditor';
+import { getGameViewComponent, getCustomPanels, getExtraMenus, getExtraMenusVersion, subscribeExtraMenus, getProjectSettings } from './createEditor';
 import { dockPanel, toDockLocation } from './panelDock';
 import { AUTOSAVE_NAME, isLayoutJson, sanitizeLayoutName, deriveLayoutBaseName } from './utils/layoutNames';
 import {
@@ -87,6 +87,7 @@ function resetLayout() {
 // ── Menu definitions ────────────────────────────────────
 
 import MenuBar, { type BarMenuItem } from './components/MenuBar';
+import { buildMenuSpec } from './menuSpec';
 
 // ── Main Editor ─────────────────────────────────────────
 
@@ -608,6 +609,10 @@ export default function EditorApp() {
   // Play/Stop transitions (undo is disabled while Playing — see the Cmd+Z guard).
   const playState = useSyncExternalStore(onPlayStateChange, getPlayState, getPlayState);
   const canEdit = playState === 'stopped';
+  // Host-owned menus (Build) can be REPLACED after boot — the device pickers are filled from an
+  // async listing that must not block editor start. Bump → rebuild the tree AND re-push the
+  // Electron spec, or the OS menu keeps the boot-time labels forever.
+  const extraMenusVersion = useSyncExternalStore(subscribeExtraMenus, getExtraMenusVersion, getExtraMenusVersion);
 
   // Build the menu tree + its serializable Electron spec ONCE per relevant input
   // change (layout name, undo/redo state) instead of on every render. Recomputing
@@ -615,6 +620,7 @@ export default function EditorApp() {
   // `menu-structure` send on most renders (toasts, import progress, nonces). (F3)
   const { menus, menuSpecJson, menuActionMap } = useMemo(() => {
     void undoVersion; // dep: undo labels/enabled are read via canUndo()/undoLabel() below
+    void extraMenusVersion; // dep: getExtraMenus() below is a module registry, read imperatively
     const menus: Record<string, BarMenuItem[]> = {
     File: [
       // New Scene → Assets panel context menu (Create Scene), so it makes a scene
@@ -664,20 +670,12 @@ export default function EditorApp() {
     // Under Electron, mirror `menus` into the OS-level application menu instead of
     // the in-window bar: build a serializable spec (no functions cross IPC) + an
     // id → action map, push the spec to main, and dispatch clicks relayed back.
-    const menuActionMap: Record<string, () => void> = {};
-    const menuSpec = {
-      menus: Object.entries(menus).map(([name, items]) => ({
-        name,
-        items: items.map((it, i) => {
-          if (it.separator) return { separator: true };
-          const id = `${name}#${i}`;
-          if (it.action) menuActionMap[id] = it.action;
-          return { id, label: it.label, shortcut: it.shortcut, disabled: it.disabled, checked: it.checked };
-        }),
-      })),
-    };
+    // Spec + action map are built together by `menuSpec.ts` — they must agree on ids, and the id
+    // scheme is load-bearing enough to be unit-tested (see `menuItemId` for why an id carries its
+    // label, not just its position).
+    const { menuSpec, menuActionMap } = buildMenuSpec(menus);
     return { menus, menuSpecJson: JSON.stringify(menuSpec), menuActionMap };
-  }, [layoutName, undoVersion, canEdit, handleSaveLayout, handleSaveLayoutAs, showPanel, isPanelVisible, layoutVersion]);
+  }, [layoutName, undoVersion, extraMenusVersion, canEdit, handleSaveLayout, handleSaveLayoutAs, showPanel, isPanelVisible, layoutVersion]);
 
   // Keep the click-relay's action map current with the latest memoized spec.
   menuActionRef.current = menuActionMap;
@@ -688,7 +686,14 @@ export default function EditorApp() {
   // Register the click relay once.
   useEffect(() => {
     if (!electronBridge) return;
-    return electronBridge.on('menu-action', (id) => { menuActionRef.current[id as string]?.(); });
+    return electronBridge.on('menu-action', (id) => {
+      const action = menuActionRef.current[id as string];
+      // A miss means the click came from a menu that has since been rebuilt (see the id scheme
+      // above) — doing nothing is correct, but it must not be SILENT: to the user their click
+      // simply did not work, and this line is the only evidence of why.
+      if (!action) { console.warn(`[editor] ignoring a menu click for "${id}" — the menu was rebuilt since it was opened; reopen it and click again`); return; }
+      action();
+    });
   }, []);
   // Cmd/Ctrl+wheel → whole-app UI zoom (VS Code–style). Forward the intent to main,
   // which owns the webContents zoom (clamp + persist). Capture phase + non-passive so

@@ -323,10 +323,45 @@ export interface ProjectConfig {
   };
 }
 
+/** The `build.*` fields that must never reach a PUBLIC repo — Apple's Team ID,
+ *  internal GCS bucket/CDN names, and a deploy command that can embed either.
+ *  Anything we do not want to ship to a public repo belongs in the per-machine
+ *  local config (`project.user.json`, gitignored), not the committed
+ *  `project.config.json` — the publish-time scrub (`SCRUBBED_BUILD_FIELDS` in
+ *  `scripts/lib/scrub-project-config.mjs`, which cannot import this TS file and
+ *  so is kept in step by a guard test instead) is the BACKSTOP, not the primary
+ *  defense; the primary defense is that the value was never committed in the
+ *  first place. See {@link overlayPrivateBuildFields}.
+ *
+ *  Deliberately does NOT include `debugBuild`, `webDeployMode`, or `webBasePath`
+ *  — those three DO ship publicly, just with a different (public-safe) value for
+ *  a published project; they are a publish-time RESET, not a leak, and stay
+ *  scrubbed-in-place in the committed file. */
+export const PRIVATE_BUILD_FIELDS = [
+  'appleTeamId',
+  'webBucket',
+  'webCdnUrlMap',
+  'webCdnBackendBucket',
+  'webDeployCommand',
+] as const;
+
+/** One of {@link PRIVATE_BUILD_FIELDS}. */
+export type PrivateBuildField = (typeof PRIVATE_BUILD_FIELDS)[number];
+
 /** Per-machine settings kept OUT of the committed config (gitignored
  *  project.user.json). These are about THIS developer's machine/hardware — the
  *  same iPhone/SDK regardless of which game is open — so they must never be
- *  committed. Merged over the committed config at build time. */
+ *  committed. Merged over the committed config at build time.
+ *
+ *  The `build` section (below) widens what this file MEANS: it is no longer only
+ *  "this developer's hardware" — it is also "private to this checkout," a
+ *  broader idea that happens to share the same gitignored, per-machine home. The
+ *  five fields in {@link PRIVATE_BUILD_FIELDS} (Apple Team ID, GCS bucket, CDN
+ *  names, deploy command) are ORG-shared in principle — the same value across
+ *  everyone's build of a given project — but they must never reach a PUBLIC repo,
+ *  and `project.config.json` is exactly the file that gets published. Rather than
+ *  invent a third file for "shared-but-private," they overlay onto the same
+ *  gitignored home `device`/`sdk` already use; see {@link overlayPrivateBuildFields}. */
 export interface ProjectUserConfig {
   device: {
     /** iOS hardware UDID for `xcodebuild -destination 'id=...'`. */
@@ -348,6 +383,18 @@ export interface ProjectUserConfig {
      *  install dirs, then the login shell). Needed because a Finder-launched packaged
      *  editor has a minimal PATH without the Google Cloud SDK. */
     gcloudPath: string;
+  };
+  /** Overlay values for the {@link PRIVATE_BUILD_FIELDS} of `ProjectConfig.build`
+   *  — see that constant for the rule. Empty string = "not set here," which falls
+   *  through to whatever `project.config.json` has (see
+   *  {@link overlayPrivateBuildFields}), so a project that has not migrated yet
+   *  keeps working unchanged. */
+  build: {
+    appleTeamId: string;
+    webBucket: string;
+    webCdnUrlMap: string;
+    webCdnBackendBucket: string;
+    webDeployCommand: string;
   };
 }
 
@@ -435,6 +482,16 @@ export const DEFAULT_PROJECT_USER_CONFIG: ProjectUserConfig = {
     javaHome: '',
     androidHome: '',
     gcloudPath: '',
+  },
+  // Same all-empty rationale as `device`/`sdk` above: empty means "not set here,"
+  // which overlayPrivateBuildFields falls through to project.config.json for —
+  // load-bearing for every project that hasn't migrated a given field yet.
+  build: {
+    appleTeamId: '',
+    webBucket: '',
+    webCdnUrlMap: '',
+    webCdnBackendBucket: '',
+    webDeployCommand: '',
   },
 };
 
@@ -614,7 +671,49 @@ export function mergeProjectUserConfig(partial: Partial<ProjectUserConfig> | nul
   return {
     device: { ...d.device, ...p.device },
     sdk: { ...d.sdk, ...p.sdk },
+    build: { ...d.build, ...p.build },
   };
+}
+
+/** Overlay the private `build.*` fields (see {@link PRIVATE_BUILD_FIELDS}) from
+ *  the per-machine user config onto a committed config, for READING. A NON-EMPTY
+ *  value in `user.build` wins over whatever `config.build` has; an EMPTY user
+ *  value falls through to the committed value unchanged. That fallthrough is
+ *  load-bearing: it is what keeps every project that has not yet migrated a given
+ *  field (its value still sitting in `project.config.json`) working exactly as
+ *  before — the overlay only takes over a field once the private value has moved.
+ *
+ *  Returns a NEW object; mutates neither argument. Callers pass the RESULT
+ *  wherever `config.build.<field>` used to be read directly — the canonical key
+ *  path is unchanged, only where the value physically lives has moved. */
+export function overlayPrivateBuildFields(config: ProjectConfig, user: ProjectUserConfig): ProjectConfig {
+  const build = { ...config.build };
+  for (const field of PRIVATE_BUILD_FIELDS) {
+    const userValue = user.build[field];
+    if (userValue !== '') build[field] = userValue;
+  }
+  return { ...config, build };
+}
+
+/** The inverse of {@link overlayPrivateBuildFields}, for the CLIENT-visible config: blank every
+ *  {@link PRIVATE_BUILD_FIELDS} value. Used by the `virtual:modoki-project-config` module
+ *  (`engine/plugins/vite-asset-scanner.ts`), which inlines the RESOLVED config into the browser
+ *  bundle — so without this the Apple Team ID and the internal bucket/CDN names ship inside every
+ *  built game's JavaScript, downloadable by anyone who can load the page. That is a WIDER
+ *  exposure than the committed-file one #172 set out to fix (a public URL, no repo access needed),
+ *  and it predates it: the values used to reach the same bundle from `project.config.json`.
+ *
+ *  All five are BUILD-time concerns — signing, deploy target, deploy command — and nothing in
+ *  `engine/app/**` or the runtime reads any of them (the editor's Project Settings dialog gets its
+ *  values from `GET /api/project-settings`, not this module, so editing is unaffected).
+ *
+ *  Blanks rather than deletes: the fields stay present and typed `string`, so a consumer that
+ *  someday reads one gets `''` — the same already-handled "not set" state an unmigrated project
+ *  produces — instead of an `undefined` that throws on `.trim()`. */
+export function stripPrivateBuildFields(config: ProjectConfig): ProjectConfig {
+  const build = { ...config.build };
+  for (const field of PRIVATE_BUILD_FIELDS) build[field] = '';
+  return { ...config, build };
 }
 
 /** The on-disk shape of either config file: whatever subset of the config the

@@ -472,6 +472,59 @@ starts `low`. A project that wants exactly today's behaviour must pin `qualityTi
 | `Light.shadowMapSize` ceiling | 512 | none | ✅ re-read each frame by `syncLights` |
 | post-FX stack | **dropped** | on | ✅ stack disposed |
 | `antialias` | off | on | ❌ **constructor-only** |
+| **IBL** (`scene.environment`) | **dropped** | on | ✅ `syncEnvironment` re-reads each frame |
+| ambient compensation | ×4 | ×1 | ✅ `syncLights`, gated on `isIblSuppressed()` |
+| exposure compensation | ×1.25 | ×1 | ✅ `reconcileToneExposure`, same gate, per frame |
+
+**IBL is the single most expensive thing the low tier drops — by a wide margin.** Measured on a
+Huawei Y6 2019 (#154): **~26 ms of a ~53 ms frame**, entirely GPU. Suppressing it took `games/sling`
+from 18.7 to 36.5 fps, and with the whole tier applied the game runs at **22 ms / 45 fps**.
+
+Three things about it are worth knowing before touching it:
+
+- **It cannot be fixed by shrinking the asset.** Downsampling the source HDR from 2048×1024 to
+  256×128 (16 MB → 0.25 MB) moved the frame 53.4 → 53.2 ms — nothing. three's PMREM converts the
+  source ONCE into a fixed-size CubeUV cubemap and the fragment shader samples that, so the source
+  resolution never reaches the shader. The cost is the per-fragment env lookup itself.
+- **The scene BACKGROUND is deliberately left alone.** It was measured not to be the cost, and it
+  is what keeps a sky/ocean looking right — so only the lighting contribution is suppressed.
+- **The compensation exists because IBL is fill light.** Without it the scene renders visibly dark
+  and flat. Both multipliers are 1 whenever `ibl` is true, so a tier that keeps IBL passes the
+  authored lighting through untouched and cannot double-light the scene.
+- **The compensation is gated on ACTUAL suppression, not on the tier** — `isIblSuppressed()`, set
+  by `syncEnvironment` each frame, is true only when the tier says no IBL *and* the scene owns a
+  loaded HDR `Environment` to lose. Keying it on the tier alone (as it first shipped) brightened
+  every low-tier scene that had an `AmbientLight` and no environment — several shipped demos — and
+  since an unrecognised device resolves `low`, that meant every phone. **A tier CLAMPS, never
+  RAISES**, and a compensation whose condition is broader than the thing it compensates for is a
+  raise. This is also why the exposure half moved out of `applyRendererColorConfig`, which runs
+  once at renderer creation, before any scene has loaded: it cannot know yet whether there is an
+  environment, so `reconcileToneExposure` re-derives it per frame (change-gated, so the steady
+  state writes nothing).
+- **Every surface that calls `syncEnvironment` must call `reconcileToneExposure` right after it.**
+  The flag is module state describing what the LAST `syncEnvironment` saw, and the editor mounts
+  two surfaces that each call it (the Game panel's `Scene3D`, the Scene panel's `SceneView`). One
+  that sets the flag and never reads it back keeps whatever exposure its renderer was built with —
+  which is how the Scene panel briefly baked in a compensation belonging to the Game panel.
+  Enforced by `engine/tests/architecture/iblCompensationSurfaces.test.ts`. `applyRendererColorConfig`
+  is deliberately outside this: it sets the AUTHORED exposure with no compensation, because it also
+  serves the asset-preview renderers (`ModelPreview`, `previewScene`), which never sync an
+  environment and are correct by having no compensation rather than by reconciling one.
+
+**The low tier does NOT spend that saving on resolution — that was tried and measured.** With IBL
+off: 1× (360×753) = 22 ms / 45 fps, 1.4× (503×1054) = 72 ms / 14 fps, 2× (720×1506) = 69 ms /
+14 fps. A fill-bound GPU pays ~4× for 2× DPR, far past the ~11 ms of headroom, and an odd-sized
+1.4× buffer is worse for a tile-based renderer than the aligned 2× one.
+
+⚠️ **`syncEnvironment`, `syncLights` and `syncRenderables` re-apply their state EVERY FRAME.**
+Setting `scene.environment`, a material, or `obj.visible` from the console is silently reverted
+within a frame or two, so a live A/B measures the same thing twice and reports a clean null. This
+cost most of a session and produced several confidently wrong conclusions. To probe live, either
+change the authored source or defeat the re-sync and verify it held:
+```js
+Object.defineProperty(scene, 'environment', { configurable: true, get: () => null, set: () => {} });
+// …then re-read after 10+ s and assert it is still off BEFORE measuring.
+```
 
 **`antialias` cannot change live** — it is a `WebGPURenderer` constructor option baked into the
 swapchain, so it applies at the next renderer creation. We deliberately do not rebuild the renderer

@@ -13,7 +13,7 @@ import {
   TIER_ALLOWLIST, TIER_SETTINGS, DEFAULT_TIER_SETTING,
   PROMOTION_HOLD_MS, DEMOTION_HOLD_MS, MIN_SAMPLES_TO_JUDGE,
   type QualityTier,
-  applyTierToThree, tierAllowsPostFX,
+  applyTierToThree, tierAllowsPostFX, tierAllowsIBL, tierAmbientBoost, tierExposureBoost,
 } from '../../src/runtime/rendering/qualityTier';
 import { BUDGET_30FPS_MS, type FrameProfile } from '../../src/runtime/core/frameProfiler';
 
@@ -231,9 +231,9 @@ describe('evaluateTierChange — demotion', () => {
 });
 
 describe('tier settings', () => {
-  it('low mirrors the sling hand-tune this phase exists to replace', () => {
+  it('low strips AA + shadows + resolution, and drops IBL (#154)', () => {
     expect(TIER_SETTINGS.low).toMatchObject({
-      pixelRatioCap: 1, antialias: false, shadows: false,
+      pixelRatioCap: 1, antialias: false, shadows: false, ibl: false,
     });
   });
 
@@ -273,7 +273,7 @@ describe('tier settings', () => {
       expect(applyTierToThree(authored, 'high')).toEqual(authored);
     });
 
-    it('low takes everything away', () => {
+    it('low takes everything away, resolution included (#154: 2x measured at 14 fps)', () => {
       expect(applyTierToThree(authored, 'low')).toMatchObject({
         pixelRatioCap: 1, antialias: false, shadows: false,
       });
@@ -297,5 +297,51 @@ describe('tier settings', () => {
       expect(input).toEqual(authored); // untouched
       expect(out).not.toBe(input);
     });
+  });
+});
+
+describe('IBL tier gate (#154) — the single biggest render cost on a low-end device', () => {
+  it('allows IBL on high and suppresses it on low', () => {
+    expect(tierAllowsIBL('high')).toBe(true);
+    expect(tierAllowsIBL('low')).toBe(false);
+  });
+
+  it('leaves the authored lighting completely untouched on high', () => {
+    // Boosts are multipliers, so 1 means "pass the authored value through". A tier that keeps IBL
+    // must not also brighten the scene — that would double-light it.
+    expect(tierAmbientBoost('high')).toBe(1);
+    expect(tierExposureBoost('high')).toBe(1);
+  });
+
+  it('compensates on low, where IBL is off — otherwise the scene renders dark and flat', () => {
+    expect(tierAmbientBoost('low')).toBeGreaterThan(1);
+    expect(tierExposureBoost('low')).toBeGreaterThan(1);
+  });
+
+  it('keeps the compensation tied to the gate, not hardcoded per tier', () => {
+    // The accessors must return 1 whenever `ibl` is true, for ANY tier — so flipping a tier's
+    // `ibl` back on cannot leave a stale brightening multiplier behind.
+    for (const tier of ['low', 'high'] as QualityTier[]) {
+      if (TIER_SETTINGS[tier].ibl) {
+        expect(tierAmbientBoost(tier)).toBe(1);
+        expect(tierExposureBoost(tier)).toBe(1);
+      } else {
+        expect(tierAmbientBoost(tier)).toBe(TIER_SETTINGS[tier].iblOffAmbientBoost);
+        expect(tierExposureBoost(tier)).toBe(TIER_SETTINGS[tier].iblOffExposure);
+      }
+    }
+  });
+});
+
+describe('the prewarm must model the tier it will DRAW, not the scene as authored (#154)', () => {
+  it('a tier with IBL off must not mirror the environment into the prewarm scene', () => {
+    // Regression guard for a real bug in the IBL gate's first version. `prewarmShadersForWorld`
+    // mirrors scene.environment so compileAsync produces the envMap shader variant; with IBL
+    // suppressed the real render has NO environment, so mirroring it compiles a variant that is
+    // never used AND leaves the first real frame to compile the non-env one synchronously —
+    // reintroducing exactly the cold-compile boot stall the mirror exists to prevent (measured at
+    // 3926 ms on the Y6). The gate and the mirror must read the SAME predicate.
+    expect(tierAllowsIBL('low')).toBe(false);
+    expect(tierAllowsIBL('high')).toBe(true);
   });
 });

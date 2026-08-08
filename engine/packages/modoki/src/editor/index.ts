@@ -1,7 +1,7 @@
 /** @modoki/editor — Visual editor, dev-only. Not shipped in production builds. */
 
 export { backendFetch, backendPostJson, backendEventSource, backendBase, backendUrl } from './backend/editorBackend';
-export { createEditor, type EditorOptions, getResolvedRender3d } from './createEditor';
+export { createEditor, setExtraMenus, type EditorOptions, type ExtraMenuItem, getResolvedRender3d } from './createEditor';
 export {
   pushAction, undo, redo, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion,
   beginActionCapture, endActionCapture, isCapturingActions, type UndoAction,
@@ -31,6 +31,12 @@ export {
   applyWheelStep, useWheelStep,
 } from './panels/fields';
 export { useDebouncedSave } from './panels/useDebouncedSave';
+// Device listing — shared by the AI panel's connect picker and the app shell's Build-menu target
+// picker (#170), which is why it leaves the package rather than staying panel-private.
+export {
+  fetchDeviceList, androidRowLabel, androidRowNote,
+  type DeviceListReply, type AndroidDeviceRow, type IosDeviceRow, type DeviceClaim,
+} from './panels/deviceConnectModel';
 export {
   serializePrefab, instantiatePrefab, instantiatePrefabAsync, setPrefabSource,
   getPrefabSource, setPrefabCache, getOverrides, getOverrideValues,

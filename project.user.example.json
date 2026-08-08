@@ -8,5 +8,13 @@
   "sdk": {
     "javaHome": "",
     "androidHome": ""
+  },
+  "//build": "Private build.* overlay — Apple Team ID / GCS bucket / CDN names / deploy command. Non-empty here wins over project.config.json; empty falls through to it.",
+  "build": {
+    "appleTeamId": "",
+    "webBucket": "",
+    "webCdnUrlMap": "",
+    "webCdnBackendBucket": "",
+    "webDeployCommand": ""
   }
 }

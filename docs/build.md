@@ -70,7 +70,9 @@ the scaffold. Manual CLI equivalent: `cd games/<id> && npx cap add ios|android`.
 
 `healNativeConfig` (`engine/plugins/healNativeConfig.ts`) runs on project open **and** at the
 start of every iOS/Android build — it syncs the project's `build.appleTeamId` into the iOS
-project's `DEVELOPMENT_TEAM` (so a Team ID edited after `cap add` still lands) and repairs
+project's `DEVELOPMENT_TEAM` (so a Team ID edited after `cap add` still lands; the VALUE lives in
+the gitignored `project.user.json` — see [engine-oss-publishing.md](./engine-oss-publishing.md)
+§ "Private build fields") and repairs
 other drift. `add-native-target` (`engine/plugins/addNativeTarget.ts`) and the vendor plugin
 wire in per-game native plugins. Restart the editor after pulling build-pipeline changes — the
 Vite plugin loads once at dev-server start.
@@ -134,6 +136,55 @@ the SAME resolution** via `eval "$(node engine/scripts/print-toolchain-env.mjs)"
 bundles and calls `engine/toolchain`'s own `detect()` rather than probing for itself, because a
 second probe is precisely what this module was consolidated to remove (#159). Full detail:
 [editor-toolchain.md](./editor-toolchain.md).
+
+### One build at a time (#173)
+
+**Three routes compile into the same `<project>/dist`, so they share ONE slot** — not one lock each.
+`/api/build`, `/api/ota/publish`, and `/api/add-native-target` all run the byte-identical
+`node engine/scripts/build-web.mjs --target native` from the same cwd into the same `dist`
+(`vite-asset-scanner.ts` build steps · the publish route's step 1 · `addNativeTarget.ts`). Whichever
+starts second rewrites that dist while the first is still copying it, and the failure is quiet:
+
+- **build ↔ build** → `cap sync` copies a half-written dist into `ios/`, and the build then
+  *succeeds*. A signed app with a torn JS bundle, surfacing on the device hours later.
+- **publish ↔ build** → the worst one, and the reason the slot is shared. `/api/ota/publish`
+  uploads that dist to the OTA bucket, so the torn bundle reaches **every installed device that
+  checks for an update**, with no local artifact to inspect first. One human doing two ordinary
+  things in one window (start Build → iOS, then Publish OTA while it runs) reaches it.
+- **scaffold ↔ anything** → `npm install` + `cap add` into the project on top of the dist race;
+  two scaffolds for one platform also race the `existsSync(nativeDir)` gate that is supposed to
+  make the route a no-op.
+
+Refused, not queued: these run for minutes and nothing cancels one, so a queued SSE stream would sit
+silent and read as a wedged editor. The refusal is a `FAILED:` status naming what holds the slot
+(`ios build`, `OTA publish`, `android native scaffold`) and how long it has been running.
+
+**Which signal gives the slot back is the subtle part** (`releasePolicy` in
+`engine/plugins/backend/buildLock.ts`). Each of these handlers has two halves that stop at different
+times, and one release rule cannot serve both:
+
+- The **preflight gates** (invalid config, no iOS device, no Team ID, no `webBucket`, missing
+  toolchain) return synchronously and spawn nothing → released on the response closing.
+- The **pipeline** owns its own release once started. Releasing it on `close` — which the first
+  version did — frees the slot the instant the client disconnects, while the step loop is still
+  awaiting a spawned child. The editor's own force-reload reaches that: editing a game `.ts`
+  reloads the page, tearing down the EventSource mid-build, and a retry then writes the same dist
+  from two processes. Exactly the bug the lock exists to prevent, re-entered through the back door.
+
+⚠️ **The guarantee is bounded by what "the pipeline stopped" can observe** — the step's `bash`
+exiting. `spawnBuildCommand` runs `bash -c <cmd>` un-detached, so `kill('SIGTERM')` signals that one
+pid: bash *exec-replaces* itself for a simple command (vite, xcodebuild and gradlew do get the
+signal), but *forks* for a compound one — and the iOS `Installing on device...` step is compound
+(`APP_PATH=$(…) && { … }`), so its `xcrun devicectl` grandchild survives, orphaned, holding no slot.
+Verified empirically; pre-existing (the `(D6)` comments long claimed a disconnect left nothing that
+"can't conflict with a retry", which was never true). Closing it means killing the process **group**,
+which changes every build step on both platforms — a build-runner change, not a lock change (#176).
+
+**Known gap, deliberate:** the slot is per backend **process**, so two editor processes on one
+project (a packaged editor beside a dev one) are still unguarded. That needs a cross-process claim on
+the filesystem, the shape `backend/deviceClaims.ts` implements for hardware — note its
+same-pid-is-a-no-op rule means the claim machinery alone would *not* have caught the agent-vs-human
+case, so that work needs both mechanisms. Left open on #173.
 
 ## Assets the build cannot see — why an asset ref never belongs in code
 
@@ -538,6 +589,16 @@ xcrun devicectl device process launch --device <DEVICE_ID> <appId>
 First device install requires trusting the developer profile: Settings → General →
 VPN & Device Management → Trust.
 
+**Normally you never type either of these — pick the phone from the Build menu.** `Build → iOS
+Device` names its current target in the label and lists every device this Mac can see in a
+submenu; picking one writes BOTH ids below into `project.user.json` **and starts the build**, so
+the menu and Project Settings stay one source of truth. (`Set target without building…` in the
+same submenu is the way to change the target without committing to a build — a started build
+cannot be cancelled.) The submenu also says which install each device will get
+("hands-free install" vs "Xcode handoff, ⌘R") — see [editor.md](./editor.md) § "Build → picking
+the target device". The fields stay editable by hand for a device no listing can see (remote/WiFi,
+an unusual setup).
+
 **Two DIFFERENT ids, and only the first is required.** Both live in the project's gitignored
 `project.user.json` (per-machine, never committed — Project Settings → Build → "This Machine"):
 
@@ -546,8 +607,11 @@ VPN & Device Management → Trust.
 | `iosDeviceId` | `xcrun xctrace list devices` — the hardware UDID | **Yes** | `xcodebuild -destination 'id=…'` |
 | `iosDevicectlId` | `xcrun devicectl list devices` — a different GUID | No | `devicectl` install + launch |
 
-They are not interchangeable: `xcodebuild` rejects the devicectl GUID (see
-`wdaLauncher.parseIosDevices`, which reads `hardwareProperties.udid` for exactly this reason).
+They are not interchangeable **in that direction**: `xcodebuild` rejects the devicectl GUID (see
+`wdaLauncher.parseIosDevices`, which reads `hardwareProperties.udid` for exactly this reason). The
+reverse is fine — `devicectl` accepts the hardware UDID as well as its own GUID (measured
+2026-08-08: `xcrun devicectl device info details --device <id>` resolves the same phone for either
+form), which is why the Build-menu picker can fill both fields from the one id it parses.
 
 ⚠️ **`devicectl` is CoreDevice-only — iOS 17+.** A pre-iOS-17 device has no devicectl id *in
 existence*: `xcrun devicectl list devices` lists it `unavailable`, with no

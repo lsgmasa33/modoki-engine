@@ -12,11 +12,13 @@ import type { Plugin } from 'vite';
 import { computeKeptAssets, formatBytes } from './asset-tree-shaker';
 import { assertNoConversionFallback, type ConversionFailure } from './asset-conversion-strict';
 import { loadProjectConfig, loadProjectUserConfig, validateBuildConfig, projectConfigUnionErrors } from './load-project-config';
+import { stripPrivateBuildFields } from '../project-config';
 import { resolveModules } from './detect-modules';
 import { findGamesEntry } from './findGamesEntry';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './backend/gcloud';
 import { projectAssetRoots } from '../scripts/projectRoots.mjs';
 import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
+import { acquireBuild, releasePolicy } from './backend/buildLock';
 import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, wdaTeamId, writeToolchainSettings, type BuildTarget, type ToolId } from '../toolchain';
 import { registerReimportHandler, type ReimportContext } from './reimport-registry';
 import { textureReimportHandler } from './reimport-texture';
@@ -1349,7 +1351,12 @@ export function assetScannerPlugin(): Plugin {
     },
     load(id) {
       if (id === PROJECT_CONFIG_RESOLVED_ID) {
-        return `export default ${JSON.stringify(loadProjectConfig(projectRoot))};`;
+        // stripPrivateBuildFields, NOT the raw resolved config: this string is inlined into the
+        // browser bundle of every built game, and a built game is deployed to a public URL — so
+        // the Apple Team ID and the internal bucket/CDN names would be downloadable by anyone who
+        // can load the page. Nothing client-side reads them (they are signing/deploy inputs), so
+        // blanking costs nothing. See stripPrivateBuildFields in project-config.ts.
+        return `export default ${JSON.stringify(stripPrivateBuildFields(loadProjectConfig(projectRoot)))};`;
       }
       if (id === GAMES_RESOLVED_ID) {
         // Expose the open project's game (one project = one game, #29) — see
@@ -1583,6 +1590,22 @@ export function assetScannerPlugin(): Plugin {
           const buildCwd = editorRoot || projectRoot;
           const nativeDir = path.join(projectRoot, platform);
 
+          // The SAME slot /api/build and /api/ota/publish take (#173 close-out). The scaffold runs
+          // the identical `build-web.mjs --target native` into the identical `<project>/dist`
+          // (addNativeTarget.ts), and additionally `npm install`s and `cap add`s into the project —
+          // so racing a build corrupts dist, and racing ITSELF corrupts node_modules or leaves a
+          // half-written ios/ that this route's own `existsSync(nativeDir)` gate then reads as
+          // "already scaffolded". Nothing deduped two calls for the same platform before this.
+          const scaffoldSlot = acquireBuild(`${platform} native scaffold`);
+          if (!scaffoldSlot.ok) {
+            send(`[native] ${scaffoldSlot.message}`);
+            sendStatus(`FAILED:Another job is already running\n${scaffoldSlot.message}`);
+            res.end();
+            return;
+          }
+          const scaffoldRelease = releasePolicy(scaffoldSlot.release);
+          res.on('close', scaffoldRelease.onResponseClose);
+
           // Kill the in-flight child if the client disconnects (closed the dialog /
           // reloaded the renderer) so a long npm install / cap add isn't orphaned. (D6)
           let activeProc: ReturnType<typeof spawn> | null = null;
@@ -1604,6 +1627,7 @@ export function assetScannerPlugin(): Plugin {
             proc.on('error', (e) => { activeProc = null; send(`ERROR: ${e.message}`); resolve(false); });
           });
 
+          scaffoldRelease.onPipelineStart();
           (async () => {
             const TOTAL = 5;
             try {
@@ -1627,7 +1651,7 @@ export function assetScannerPlugin(): Plugin {
               sendStatus(`FAILED:${e instanceof Error ? e.message : String(e)}`);
               res.end();
             }
-          })();
+          })().finally(scaffoldRelease.onPipelineEnd);
           return;
         }
 
@@ -1720,6 +1744,49 @@ export function assetScannerPlugin(): Plugin {
           const send = (data: string) => { try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch { /* client disconnected */ } };
           const sendStatus = (status: string) => { try { res.write(`event: status\ndata: ${JSON.stringify(status)}\n\n`); } catch { /* client disconnected */ } };
           const sendStep = (step: number, total: number) => { try { res.write(`event: step\ndata: ${JSON.stringify({ step, total })}\n\n`); } catch { /* client disconnected */ } };
+
+          // ONE build at a time (#173). #170's client guard covers the Build MENU; it cannot cover
+          // `modoki_build`, which arrives here directly while a human's build is mid-flight. Taken
+          // AFTER the SSE headers so the refusal reaches the client as a `FAILED:` status (the
+          // route's convention for a deliberate refusal — a bare status is pushed into the log by
+          // `consumeBuildStream` and then surfaces as "stream ended without a final status", i.e. an
+          // actionable refusal disguised as a protocol anomaly), and BEFORE any config load or
+          // preflight so a refused build does nothing at all.
+          const slot = acquireBuild(`${platform} build`);
+          if (!slot.ok) {
+            send(`[build] ${slot.message}`);
+            sendStatus(`FAILED:Another job is already running\n${slot.message}`);
+            res.end();
+            return;
+          }
+          // Releasing the slot has TWO owners, because the handler has two halves and only one of
+          // them is the build.
+          //
+          //  - Everything above the pipeline (config validation, the iOS device/team gates, the
+          //    webBucket gate, the toolchain preflight) returns SYNCHRONOUSLY with a `res.end()`.
+          //    Those paths spawn nothing, so `close` is the right release: it fires on a normal end
+          //    AND on a client disconnect, covering all six of them (and a throw) without a
+          //    `finally` around each.
+          //  - Once the PIPELINE starts, `close` is the WRONG signal, and the first version of this
+          //    used it anyway. A disconnect fires `close` immediately while the step loop is still
+          //    awaiting a spawned child — so the slot went free with `npm run build` mid-flush into
+          //    `<project>/dist`, and a retry starting right then wrote the same dist from two
+          //    processes: exactly the interleaving the lock exists to prevent, reachable through the
+          //    editor's own force-reload (a game `.ts` edit reloads the page, tearing down the
+          //    EventSource mid-build). So once started, the pipeline owns the release and gives it
+          //    back when it actually stops.
+          //
+          // ⚠️ "When the pipeline stops" means when the step's `bash` exits — which is NOT always
+          // when the WORK stops. `spawnBuildCommand` runs `bash -c <cmd>` un-detached, so
+          // `kill('SIGTERM')` signals that one pid: bash exec-replaces itself for a SIMPLE command
+          // (so vite/xcodebuild/gradlew do get the signal), but FORKS for a compound one, and the
+          // iOS `Installing on device...` step is compound (`APP_PATH=$(…) && { … }`) — its
+          // `xcrun devicectl` grandchild survives, orphaned, holding no slot. Verified empirically,
+          // pre-existing (the `(D6)` comment below has always over-claimed this), and tracked as
+          // #176: closing it means killing the process GROUP, which changes every build step on both
+          // platforms and is not a lock change. See docs/build.md § "One build at a time".
+          const slotRelease = releasePolicy(slot.release);
+          res.on('close', slotRelease.onResponseClose);
 
           // Web deploy target: a game-only build served under modoki-engine.com/demo
           // from the GCS bucket gs://modoki-www-site/demo. Assets are fetched at
@@ -2161,7 +2228,12 @@ export function assetScannerPlugin(): Plugin {
 
           // Kill the in-flight build child + stop launching steps if the client
           // disconnects (closed the Build dialog / reloaded), so gradle/xcodebuild/
-          // gcloud aren't left running for minutes and can't conflict with a retry. (D6)
+          // gcloud aren't left running for minutes. (D6)
+          // ⚠️ "can't conflict with a retry" is what this used to claim, and it is not true: `bash -c`
+          // FORKS for a compound command (the iOS `Installing on device...` step is one), so SIGTERM
+          // kills the shell and orphans the real child. The build slot (#173) papers over the common
+          // case by holding until this loop settles, but an orphan still outlives it — closing that
+          // means killing the process GROUP (#176). docs/build.md § "One build at a time".
           let activeProc: ReturnType<typeof spawn> | null = null;
           let aborted = false;
           req.on('close', () => { aborted = true; try { activeProc?.kill('SIGTERM'); } catch { /* gone */ } });
@@ -2220,6 +2292,10 @@ export function assetScannerPlugin(): Plugin {
             proc.on('error', (e) => { activeProc = null; send(`ERROR: ${e.message}`); resolve(false); });
           });
 
+          // From here the pipeline owns the build slot (see the two-owners note above) — set
+          // SYNCHRONOUSLY, before the first `await`, so a disconnect can never observe a started
+          // pipeline as un-started and release the slot out from under it.
+          slotRelease.onPipelineStart();
           (async () => {
             // First native build with no ios/android folder → scaffold it inline,
             // then PAUSE if it flags something the user must supply (missing
@@ -2352,7 +2428,10 @@ export function assetScannerPlugin(): Plugin {
             // "built" for the playable (nothing is deployed — the one HTML file IS the artifact); "deployed" for the rest.
             send(`\n✅ ${label} ${platform === 'playable' ? 'built' : 'build deployed'} successfully!`);
             res.end();
-          })();
+            // `finally`, not a tail call: the body has ~9 early `return`s (an aborted step, a failed
+            // step, a paused scaffold) and can reject, and every one of them must give the slot
+            // back — a leaked slot refuses every future build until the editor restarts.
+          })().finally(slotRelease.onPipelineEnd);
           return;
         }
 
@@ -2468,6 +2547,23 @@ export function assetScannerPlugin(): Plugin {
           // `node: command not found`, i.e. the publish was impossible in the one build where the
           // editor is most likely to be used and the failure said nothing about why. (§9: the
           // build family should not have two different notions of "the environment a step runs in".)
+          // The SAME slot the build takes (#173 close-out). This route runs the byte-identical
+          // `build-web.mjs --target native` into the byte-identical `<project>/dist` as
+          // /api/build's web step — and then UPLOADS that dist. So a publish racing a build does not
+          // merely corrupt a local artifact: it ships the torn bundle to every installed device that
+          // checks for an update, with no review step in between. Strictly worse than the case the
+          // lock was written for, and reachable by one human doing two ordinary things in one window
+          // (start Build → iOS, then open Publish OTA while it runs).
+          const otaSlot = acquireBuild('OTA publish');
+          if (!otaSlot.ok) {
+            send(`[ota] ${otaSlot.message}`);
+            sendStatus(`FAILED:Another job is already running\n${otaSlot.message}`);
+            res.end();
+            return;
+          }
+          const otaRelease = releasePolicy(otaSlot.release);
+          res.on('close', otaRelease.onResponseClose);
+
           const baseEnv = await buildStepEnv({ MODOKI_PROJECT: projectRoot });
           const gcloudEnv = { ...baseEnv, PATH: `${gcloudDir}:${baseEnv.PATH ?? ''}` };
           const distDir = path.join(projectRoot, 'dist');
@@ -2487,6 +2583,9 @@ export function assetScannerPlugin(): Plugin {
             proc.on('error', (e) => { activeProc = null; send(`ERROR: ${e.message}`); resolve({ ok: false, output: e.message }); });
           });
 
+          // From here the publish pipeline owns the slot, not the socket — see the two-owners note
+          // on /api/build's acquire. Set synchronously, before the first `await`.
+          otaRelease.onPipelineStart();
           (async () => {
             // Step 1: build FRESH from the CURRENTLY OPEN project's project.config.json.
             // Never publish an arbitrary pre-built dist/ — that's how a stale pre-fix
@@ -2580,7 +2679,7 @@ export function assetScannerPlugin(): Plugin {
               `Verify with modoki_ota_status.`,
             );
             res.end();
-          })();
+          })().finally(otaRelease.onPipelineEnd);
           return;
         }
 

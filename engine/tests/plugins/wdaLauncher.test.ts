@@ -53,7 +53,9 @@ describe('parseIosDevices', () => {
       { udid: 'B', name: 'Old', state: 'disconnected' },
       { udid: 'C', name: 'Older', state: 'disconnected' },
     ]));
-    expect(out.filter((d) => d.connected)).toEqual([{ udid: 'A', name: 'Air', connected: true }]);
+    // `devicectl: true` on every row here is the point of the flag: this parse IS the devicectl
+    // listing, so anything it returns can be installed to hands-free (#170).
+    expect(out.filter((d) => d.connected)).toEqual([{ udid: 'A', name: 'Air', connected: true, devicectl: true }]);
     expect(out).toHaveLength(3);   // all three are CANDIDATES; only the tunnel state differs
   });
 
@@ -718,5 +720,17 @@ describe('mergeIosDevices — devicectl stays authoritative, legacy only ADDS (#
     const merged = mergeIosDevices(parseIosDevices('{"result":{"devices":[]}}'), parseXctraceDevices(XCTRACE_REAL));
     const r = resolveIosDevice(merged, { MODOKI_IOS_DEVICE_UDID: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' } as NodeJS.ProcessEnv);
     expect(r).toEqual({ device: { udid: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', name: 'iPhone8', connected: true, osVersion: '16.7.16' } });
+  });
+
+  it('a devicectl-listed device carries devicectl:true; a legacy-xctrace-only device carries no such field (#170)', () => {
+    // The Build-menu device picker (buildTargetMenu.ts) writes `iosDevicectlId` from exactly this
+    // field: present -> a hands-free `xcrun devicectl` install; absent -> an Xcode handoff, because
+    // an xctrace-only device is pre-iOS-17 and `devicectl install` cannot drive it at all.
+    const primary = parseIosDevices(listing([{ udid: 'DEADBEEF-0123456789ABCDEF', name: 'Test iPhone Air' }]));
+    const merged = mergeIosDevices(primary, parseXctraceDevices(XCTRACE_REAL));
+    const devicectlDevice = merged.find((d) => d.udid === 'DEADBEEF-0123456789ABCDEF');
+    const legacyOnlyDevice = merged.find((d) => d.name === 'iPhone8');
+    expect(devicectlDevice?.devicectl).toBe(true);
+    expect(legacyOnlyDevice?.devicectl).toBeUndefined();
   });
 });

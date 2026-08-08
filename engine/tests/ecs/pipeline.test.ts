@@ -20,8 +20,12 @@ describe('pipeline', () => {
     // Since systems are statically imported, we test by passing a mock world
     // and checking that systems don't throw.
     const mockWorld: any = {
+      // Mirror koota's QueryResult surface. `readEach` is the read-only twin of `updateEach`
+      // (no per-entity snapshot / change-detection / writeback); a mock carrying only one of
+      // them silently fails any system that reads rather than mutates.
       query: vi.fn(() => ({
         updateEach: vi.fn(),
+        readEach: vi.fn(),
       })),
       queryFirst: vi.fn(() => undefined), // singleton lookups (e.g. getTime) use this
       spawn: vi.fn(() => ({ id: vi.fn(() => 1) })),

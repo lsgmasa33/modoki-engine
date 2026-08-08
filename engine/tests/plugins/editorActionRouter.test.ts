@@ -9,7 +9,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
-import { DEFAULT_PROJECT_CONFIG } from '../../project-config';
+import { DEFAULT_PROJECT_CONFIG, PRIVATE_BUILD_FIELDS } from '../../project-config';
 
 function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
   const base = {
@@ -694,7 +694,15 @@ describe('/api/project-settings is a non-destructive PATCH', () => {
     const cfg = readCfg();
     expect(cfg.app.appId).toBe('com.modokiengine.court');
     expect(cfg.app.appName).toBe('Court');
-    expect(cfg.build.appleTeamId).toBe('ABCDE12345');
+    // appleTeamId is a PRIVATE build field (#172) — the first save already moved it
+    // out of the committed file into project.user.json (see the #172 tests below). It
+    // was never on disk BEFORE that save and now equals its own default (''), so prune
+    // drops the key entirely rather than recording an explicit '' — the committed file
+    // has no appleTeamId key at all. The RESOLVED value survived the second, unrelated
+    // save, just in the other file.
+    expect(cfg.build.appleTeamId).toBeUndefined();
+    const userCfg = JSON.parse(fs.readFileSync(path.join(root, 'project.user.json'), 'utf8'));
+    expect(userCfg.build.appleTeamId).toBe('ABCDE12345');
     expect(cfg.build.debugBuild).toBe(false);
   });
 
@@ -705,25 +713,38 @@ describe('/api/project-settings is a non-destructive PATCH', () => {
     expect(raw).not.toContain('webDeployMode');
   });
 
-  it('a FULL-object save still does not bake engine defaults in, and leaves a no-op save a no-op diff', async () => {
+  it('a FULL-object save still does not bake UNRELATED engine defaults in', async () => {
     // The Project Settings dialog GETs the resolved config and POSTs the whole thing
     // back. Prune must therefore measure "was already recorded" against the PRE-EDIT
     // file — measuring against the patched body makes every key trivially present,
     // prunes nothing, and silently restores the write-the-resolved-config bug on the
     // most common human path. (Caught exactly that way while implementing this.)
+    //
+    // #172 changed this test's other promise: a full round-trip is NO LONGER a no-op
+    // diff for `build`, because GET always resolves (and therefore POST always
+    // "carries") every private field — even ones this project never set — so a save
+    // now migrates ALL FIVE out of the committed file every time. That is the intended
+    // "Apply is an automatic migration" behaviour, not a defaults-baking regression:
+    // the migrated values are blank because they were blank (or absent) already.
     fs.writeFileSync(cfgPath(), JSON.stringify({
-      build: { webBucket: 'gs://modoki-www-site/skin-test', webBasePath: '/skin-test/' },
+      build: { webBasePath: '/skin-test/', playableClickUrl: 'https://example.com/app' },
       app: { appId: 'com.modokiengine.skintest', appName: 'Skin Test' },
     }, null, 2) + '\n');
-    const before = fs.readFileSync(cfgPath(), 'utf8');
 
     const full = (await get('/api/project-settings', makeCtx({ projectRoot: root }))) as { body: unknown };
     await settings(full.body);
 
     const raw = fs.readFileSync(cfgPath(), 'utf8');
+    const cfg = readCfg();
     expect(raw).not.toContain('playableNetwork');       // an untouched engine default
     expect(raw).not.toContain('statusBarStyle');        // a whole untouched default section
-    expect(raw).toBe(before);                           // …and key ORDER survives too
+    expect(cfg.build.webBasePath).toBe('/skin-test/');            // the edit that WAS made survived
+    expect(cfg.build.playableClickUrl).toBe('https://example.com/app');
+    // Migrated, not baked-in defaults. A field whose own DEFAULT happens to be ''
+    // (e.g. appleTeamId) and was never on disk before is dropped entirely by prune
+    // (the file-stays-minimal rule) rather than recorded as an explicit '' — either
+    // way, nothing NON-EMPTY survives in the committed file.
+    for (const field of PRIVATE_BUILD_FIELDS) expect(cfg.build[field] ?? '').toBe('');
   });
 
   it('an OtaKeysDialog-shaped partial (ota.publicKey alone) leaves app identity intact', async () => {
@@ -735,11 +756,13 @@ describe('/api/project-settings is a non-destructive PATCH', () => {
   });
 
   it('a full-object save (the Project Settings dialog) can still BLANK a field', async () => {
-    await settings({ app: { appId: 'com.x.y', appName: 'Y' }, build: { appleTeamId: 'ABCDE12345', webCdnUrlMap: 'static-lb' } });
+    // playableClickUrl, not appleTeamId — appleTeamId is a PRIVATE field (#172) and
+    // is covered by its own blank/migrate behaviour in the #172 tests below.
+    await settings({ app: { appId: 'com.x.y', appName: 'Y' }, build: { playableClickUrl: 'https://example.com/app' } });
     const full = (await get('/api/project-settings', makeCtx({ projectRoot: root }))) as { body: Record<string, never> };
     // Post the whole GET response back with one field blanked, exactly as the dialog does.
-    await settings({ ...full.body, build: { ...(full.body as never as { build: object }).build, appleTeamId: '' } });
-    expect(readCfg().build.appleTeamId).toBe('');
+    await settings({ ...full.body, build: { ...(full.body as never as { build: object }).build, playableClickUrl: '' } });
+    expect(readCfg().build.playableClickUrl).toBe('');
   });
 
   it('rejects a shell-unsafe value in a PARTIAL body and writes NOTHING', async () => {
@@ -839,6 +862,90 @@ describe('/api/project-settings is a non-destructive PATCH', () => {
     expect(userCfg.device.androidDeviceId).toBe('serial-2');
     expect(userCfg.sdk.javaHome).toBe('/jdk');
     expect(fs.readFileSync(cfgPath(), 'utf8')).not.toContain('serial-2');
+  });
+
+  const readUserCfg = () => JSON.parse(fs.readFileSync(path.join(root, 'project.user.json'), 'utf8'));
+
+  describe('#172: private build.* fields (appleTeamId/webBucket/webCdnUrlMap/webCdnBackendBucket/webDeployCommand)', () => {
+    it('a private field posted under `build` moves to project.user.json, not the committed file', async () => {
+      const r = (await settings({ app: { appId: 'com.x.y', appName: 'Y' }, build: { appleTeamId: 'ABCDE12345' } })) as { status?: number };
+      expect(r.status ?? 200).toBe(200);
+      // Blanked to '' (its own default) and never previously on disk, so prune drops
+      // the key entirely — the committed file has no appleTeamId key at all.
+      expect(readCfg().build?.appleTeamId).toBeUndefined();
+      expect(readUserCfg().build.appleTeamId).toBe('ABCDE12345');
+    });
+
+    it('a pre-existing COMMITTED private value is cleared by a full-object save (Apply is an automatic migration)', async () => {
+      // Simulates a project that predates #172: the value still sits in the committed
+      // file. The Project Settings dialog GETs (resolved/overlaid) then POSTs the whole
+      // object back — that round-trip alone must migrate it.
+      fs.writeFileSync(cfgPath(), JSON.stringify({
+        build: { appleTeamId: 'LEGACY99999' },
+        app: { appId: 'com.x.y', appName: 'Y' },
+      }, null, 2) + '\n');
+
+      const full = (await get('/api/project-settings', makeCtx({ projectRoot: root }))) as { body: unknown };
+      await settings(full.body);
+
+      expect(readCfg().build.appleTeamId).toBe('');
+      expect(readUserCfg().build.appleTeamId).toBe('LEGACY99999');
+    });
+
+    it('`build.<field>` in the body WINS over a stale round-tripped user.build value', async () => {
+      // The precedence that makes the Project Settings dialog work at all. The dialog
+      // edits `build.appleTeamId` (app/editor/setup.ts) and posts the WHOLE object, so
+      // the `user` subtree it sends is whatever it LOADED — never the edit. Deferring to
+      // it would silently discard every change. Alphanumeric only: BUILD_FIELD_RULES
+      // rejects a hyphen, and this is about precedence, not validation.
+      const r = (await settings({
+        app: { appId: 'com.x.y', appName: 'Y' },
+        build: { appleTeamId: 'EDITEDVALUE' },
+        user: { build: { appleTeamId: 'STALELOADED' } },
+      })) as { status?: number };
+      expect(r.status ?? 200).toBe(200);
+      expect(readCfg().build?.appleTeamId).toBeUndefined();
+      expect(readUserCfg().build.appleTeamId).toBe('EDITEDVALUE');
+    });
+
+    it('editing an ALREADY-migrated field through a full round-trip persists the new value', async () => {
+      // The regression the precedence rule above exists for, driven end to end: migrate
+      // once, then GET → change the field → POST, exactly as the dialog does. Under the
+      // earlier "explicit user.build wins" rule this silently kept OLDTEAM1234.
+      await settings({ app: { appId: 'com.x.y', appName: 'Y' }, build: { appleTeamId: 'OLDTEAM1234' } });
+      expect(readUserCfg().build.appleTeamId).toBe('OLDTEAM1234');
+
+      const full = (await get('/api/project-settings', makeCtx({ projectRoot: root }))) as { body: Record<string, unknown> };
+      const edited = { ...full.body, build: { ...(full.body.build as object), appleTeamId: 'NEWTEAM9999' } };
+      await settings(edited);
+
+      expect(readUserCfg().build.appleTeamId).toBe('NEWTEAM9999');
+      expect(readCfg().build?.appleTeamId).toBeUndefined();
+    });
+
+    it('CLEARING a migrated field through a full round-trip actually clears it', async () => {
+      // Same shape, the other direction: blanking the box must not be undone by the
+      // stale `user` subtree the dialog posts alongside it.
+      await settings({ app: { appId: 'com.x.y', appName: 'Y' }, build: { appleTeamId: 'OLDTEAM1234' } });
+
+      const full = (await get('/api/project-settings', makeCtx({ projectRoot: root }))) as { body: Record<string, unknown> };
+      const cleared = { ...full.body, build: { ...(full.body.build as object), appleTeamId: '' } };
+      await settings(cleared);
+
+      expect(readUserCfg().build.appleTeamId).toBe('');
+    });
+
+    it('does not disturb non-private build fields (debugBuild/webDeployMode/webBasePath ship publicly)', async () => {
+      await settings({
+        app: { appId: 'com.x.y', appName: 'Y' },
+        build: { appleTeamId: 'ABCDE12345', debugBuild: true, webDeployMode: 'custom', webBasePath: '/sub/' },
+      });
+      const cfg = readCfg();
+      expect(cfg.build.debugBuild).toBe(true);
+      expect(cfg.build.webDeployMode).toBe('custom');
+      expect(cfg.build.webBasePath).toBe('/sub/');
+      expect(readUserCfg().build.debugBuild).toBeUndefined(); // never a user.build field
+    });
   });
 });
 

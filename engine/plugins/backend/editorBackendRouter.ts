@@ -161,7 +161,7 @@ import {
 } from '../load-project-config';
 import {
   mergeProjectConfig, mergeProjectUserConfig, deepMergeConfigPatch, pruneProjectConfig, projectConfigIssues,
-  PROJECT_CONFIG_FILENAME,
+  PROJECT_CONFIG_FILENAME, PRIVATE_BUILD_FIELDS,
   findNullPatchPaths, DEFAULT_PROJECT_CONFIG, DEFAULT_PROJECT_USER_CONFIG, type RawProjectConfig,
 } from '../../project-config';
 import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, type PrefabResolver } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
@@ -254,6 +254,12 @@ const ASSET_SCHEMA_TYPES = ['material', 'particle', 'animation', 'spriteanim', '
 const json = (body: unknown, status?: number): BackendResult => ({ kind: 'json', status, body });
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** Plain-object check for an untrusted patch body value (mirrors the private
+ *  `isPlainObject` in project-config.ts, which is not exported). Used by the
+ *  POST /api/project-settings private-build-field split below. */
+const isPlainObjectLocal = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
 
 // ── MCP persistence: MANUAL ONLY (owner decision, 2026-07-30) ──────────
 // There used to be an 'auto' mode (the default) in which every live mutation ALSO saved the
@@ -2078,7 +2084,44 @@ async function describeUnresolvedAgainstLiveWorld(
       // back here and trip the unknown-section 400 below — a confusing refusal for
       // something the caller never authored. Drop it before anything else looks.
       const { configErrors: _configErrors, ...bodyIn } = (body ?? {}) as Record<string, unknown>;
-      const { user: userPart, ...configPart } = bodyIn;
+      const { user: userPartIn, ...configPart } = bodyIn;
+      let userPart = userPartIn;
+      // Private build.* fields (see PRIVATE_BUILD_FIELDS) must never land in
+      // project.config.json — the Project Settings dialog posts back the WHOLE
+      // resolved object (which is the OVERLAID config, see loadProjectConfig), so
+      // without this split a private value would round-trip straight back into the
+      // committed file on the very next save and undo the migration. Move each
+      // private field present in `configPart.build` into the user patch, and force
+      // it to '' in the committed patch so Apply also CLEARS any pre-existing
+      // committed value: a save becomes an automatic migration off the committed file.
+      //
+      // `build.<field>` present in the patch WINS over anything in `user.build` —
+      // it is the field the Project Settings dialog actually edits (see the
+      // `build.appleTeamId` / `build.webBucket` entries in app/editor/setup.ts), and
+      // the dialog posts the WHOLE object, so the `user` subtree it sends back is
+      // whatever it LOADED, never the edit. Deferring to it instead would silently
+      // discard every change: type a new Team ID, press Apply, and the stale
+      // round-tripped `user.build.appleTeamId` would win and the dialog would reload
+      // showing the old value — and clearing a field would be impossible. A caller
+      // that means to write the user file directly simply omits `build.<field>`
+      // (`modoki_project_settings action=set` can post either section alone).
+      if (isPlainObjectLocal(configPart.build)) {
+        const configBuild: Record<string, unknown> = { ...configPart.build };
+        const userRec: Record<string, unknown> = isPlainObjectLocal(userPart) ? { ...userPart } : {};
+        const userBuild: Record<string, unknown> = isPlainObjectLocal(userRec.build) ? { ...userRec.build } : {};
+        let touchedUserBuild = false;
+        for (const field of PRIVATE_BUILD_FIELDS) {
+          if (!Object.prototype.hasOwnProperty.call(configBuild, field)) continue;
+          userBuild[field] = configBuild[field];
+          touchedUserBuild = true;
+          configBuild[field] = '';
+        }
+        configPart.build = configBuild;
+        if (touchedUserBuild) {
+          userRec.build = userBuild;
+          userPart = userRec;
+        }
+      }
       // No config field is nullable, so a null is the caller reaching for "clear
       // this" with the wrong value. Writing it through poisons a typed field and
       // dropping it would be a silent no-op reported as success — reject instead.

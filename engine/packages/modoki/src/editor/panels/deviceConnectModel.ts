@@ -67,6 +67,11 @@ export interface IosDeviceRow {
   connected: boolean;
   productType?: string;
   osVersion?: string;
+  /** `devicectl` itself listed this device (iOS 17+/CoreDevice) — so it can be installed to
+   *  hands-free. Absent for a device only the legacy `xctrace` listing sees (#143), which builds
+   *  via an Xcode handoff instead. The Build-menu picker writes `iosDevicectlId` from exactly this
+   *  (#170); see the field's note in `wdaLauncher.ts` for why it isn't inferred from `productType`. */
+  devicectl?: boolean;
   claim: DeviceClaim | null;
 }
 

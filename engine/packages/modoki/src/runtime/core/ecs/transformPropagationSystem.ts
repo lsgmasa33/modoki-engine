@@ -96,7 +96,12 @@ export function transformPropagationSystem(world: World) {
   const selfInactive = _selfInactive;
   const parentIdMap = _parentIdMap;
   const allEntityIds = _allEntityIds;
-  world.query(EntityAttributes).updateEach(([ea], entity) => {
+  // readEach, NOT updateEach: this system only READS. koota's updateEach defaults to
+  // `changeDetection: 'auto'`, which per entity snapshots each trait, re-checks `world.has`,
+  // diffs every tracked trait against the snapshot and writes it back — all of it wasted when
+  // the callback never mutates. This pass runs over EVERY entity, twice per frame
+  // (TRANSFORM_PREPASS and TRANSFORM), so the waste is paid 4x per frame per entity.
+  world.query(EntityAttributes).readEach(([ea], entity) => {
     const id = entity.id();
     allEntityIds.push(id);
     if (!ea.isActive) selfInactive.add(id);
@@ -131,7 +136,7 @@ export function transformPropagationSystem(world: World) {
   // ── 2. Collect transforms for world-space propagation ──
   _entities.length = 0;
   const entities = _entities;
-  world.query(Transform).updateEach(([tf], entity) => {
+  world.query(Transform).readEach(([tf], entity) => {
     entities.push({
       id: entity.id(),
       parentId: parentIdMap.get(entity.id()) || 0,

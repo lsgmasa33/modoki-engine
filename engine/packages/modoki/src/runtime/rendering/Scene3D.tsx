@@ -17,7 +17,7 @@ import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_3D } fr
 import { registerSceneRenderer, unregisterSceneRenderer, normalizeJpegQuality, type SceneRenderer } from './offscreenCapture';
 import { registerBoundsProvider, projectAABBToScreen, type EntityScreenBounds } from '../core/screenBounds';
 import { readbackToRGBA, type ReadbackBackend } from './readbackToRGBA';
-import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, prewarmShadersForWorld, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
+import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, reconcileToneExposure, prewarmShadersForWorld, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
 import { registerRenderSurface } from './materialBroker';
 import { onRendererLost } from '../core/activeRenderer';
 import { createRendererRecovery } from './rendererRecovery';
@@ -31,6 +31,7 @@ import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
 import { createParticleSyncState, syncParticles, disposeParticleSyncState } from './particleSync';
 import { createFlameMeshSyncState, syncFlameMeshes, disposeFlameMeshSyncState } from './flameMeshSync';
 import { PARTICLE_LAYER } from './layers';
+import { areDebugHandlesEnabled } from '../core/debugHandles';
 import { NPRPostFX } from '../traits/NPRPostFX';
 import { BloomPostFX } from '../traits/BloomPostFX';
 import { VignettePostFX } from '../traits/VignettePostFX';
@@ -287,7 +288,15 @@ export default function Scene3D() {
       let captureCam: THREE.PerspectiveCamera | null = null;
       let captureOrthoCam: THREE.OrthographicCamera | null = null;
 
-      if (import.meta.env.DEV) (window as any).__3d = { camera, scene, renderer };
+      // Exposed in DEV *and* in a debugBuild game (project.config.json
+      // `build.debugBuild` — the same gate as the debug menu and the device bridge).
+      // Without the second half, a shipped-but-debuggable native build has no handle
+      // on the live scene, so every on-device rendering experiment costs a full
+      // build+install+launch cycle (~3 min) instead of one `device_eval` (#166).
+      // A release build still gets nothing: the gate is off there.
+      if (import.meta.env.DEV || areDebugHandlesEnabled()) {
+        (window as any).__3d = { camera, scene, renderer };
+      }
 
       const frameKey = `render3d-${nextInstanceId++}`;
 
@@ -338,6 +347,9 @@ export default function Scene3D() {
         activeCamera = syncCamera(world, scene, camera, orthoCamera);
         applyFraming(world, activeCamera, camera.aspect, activeCamera === orthoCamera);
         syncEnvironment(world, scene);
+        // Must follow syncEnvironment: it is what decides whether this scene lost its IBL, and
+        // the exposure compensation is gated on that (#154). See reconcileToneExposure.
+        reconcileToneExposure(renderer);
         syncFog(world, scene);
         beginProfilerSample('lights');
         syncLights(world, scene, ecsLights);
@@ -613,6 +625,7 @@ export default function Scene3D() {
           const world = getCurrentWorld();
           const activeForCapture = syncCamera(world, scene, camera, orthoCamera);
           syncEnvironment(world, scene);
+          reconcileToneExposure(renderer);
           syncFog(world, scene);
           syncLights(world, scene, ecsLights);
           // Same unconditional renderable+skeletal core as the live renderFrame

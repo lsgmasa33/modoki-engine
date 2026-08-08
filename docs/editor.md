@@ -78,6 +78,95 @@ viewport does begin** — a 2D project on which the user opens a Scene panel any
 normal renderer-health reporting. A definitive renderer-init FAILURE is never suppressed:
 a viewport that tried and threw is a real error whatever `render3d` says.
 
+### Menus, and how a host menu changes after boot
+
+A host registers menus through `createEditor({extraMenus})`, and `EditorApp` renders them into the
+in-window `MenuBar` **and** mirrors them into the OS application menu under Electron (a
+serializable spec pushed over IPC, whose click ids relay back). An item may carry a `submenu`,
+**one level deep** — deeper nesting is dropped by both renderers on purpose. Electron ignores a
+click on a submenu parent, so anything that must stay actionable belongs INSIDE the submenu too;
+that is why the Build menu repeats "Build now" there.
+
+`createEditor()` runs once, so a menu whose labels depend on something discovered later cannot be
+built at setup time. `setExtraMenus()` replaces the whole registry and bumps a version an external
+store publishes; `EditorApp` subscribes to it, rebuilds the tree and re-pushes the Electron spec.
+Whole-registry rather than a patch: the host owns the shape it registered, and a merge would make
+"remove an item" unexpressible.
+
+**An item's id carries its LABEL, not just its position** (`menuSpec.ts` — `Build#0#2:build-now`),
+and that is what makes a rebuildable menu safe. Electron's `MenuItem` click closure captures the id
+when the template is built, macOS keeps displaying an already-open menu after
+`setApplicationMenu` replaces it, and the renderer swaps its action map immediately — so a click on
+a stale item dispatches an OLD id into a NEW map. With purely positional ids that *resolves*, to
+whatever now sits at that index: at boot the Build menu's iOS submenu is a single placeholder row,
+so `Build#0#2` is "Build now"; ~2s later the device listing lands and index 2 is the third iPhone,
+whose action picks that phone and starts a build to it. Including the label makes the stale id miss
+instead, and the relay logs the miss rather than failing silently. The index stays in the id
+because two rows can share a label — device names repeat.
+
+### Build → picking the target device
+
+`Build → iOS Device` / `Android Device` name the device they will build for, and their submenus
+switch it (#170). Each row says what picking it means — a devicectl-reachable iPhone reads
+"hands-free install", a pre-iOS-17 one "Xcode handoff, ⌘R", because that is the consequence the
+old menu could not tell you and it is decided by whether `iosDevicectlId` ends up set
+(`planIosInstall`). Picking writes `user.device.*` into the gitignored `project.user.json` through
+the same `/api/project-settings` route Project Settings saves to, as a partial patch — so the two
+surfaces can never disagree, and hand-typed values this menu does not offer survive.
+
+**Picking a device also STARTS the build**, once the write has landed (a build against a target
+that failed to save would go to the previous device while the menu claimed otherwise). That is the
+motion the picker exists for — you open it to put this build on that phone, and a
+select-then-confirm split makes the common case two trips through a menu. `Build now → <device>`
+below it builds the CURRENT target without changing it.
+
+The cost is that a single menu click starts something that **cannot be stopped**: the build
+progress modal's only control dismisses its own UI, while the backend SSE build runs to
+completion. Hence `Set target without building…`, which routes to Project Settings rather than
+duplicating the device list — a second copy is where the two would drift apart, and both menu
+renderers cap nesting at one level on purpose.
+
+Three things the shape encodes:
+
+- **The listing is fetched once after boot, never on the click path.** Its iOS half is two `xcrun`
+  shell-outs (~1.6-2.9s uncached, 10s-cached server-side); Electron exposes no will-open event for
+  an application menu, so the alternatives were a poll or a stale menu. Hence the explicit
+  **Refresh devices** row.
+- **A device another clone is debugging is annotated, not disabled.** The claim (#149) is the
+  *debug lease*; installing a build does not need it, so `debugged by modoki-ai3` is information,
+  not a refusal. Same for an `unauthorized` Android — that state is fixed ON THE PHONE, and
+  blocking the pick would just send you back through the menu afterwards.
+- **Android keeps an explicit "Default (first adb device)" row.** An empty `androidDeviceId` means
+  "whatever adb picks", and a picker that could only set a concrete serial would quietly destroy
+  that meaning.
+
+A configured device the listing cannot see (unplugged, or hand-typed) still gets a checked
+`— not attached` row rather than vanishing: it is what the next build would use, and a menu with
+nothing checked would be lying about that. A listing that could not be READ says so separately
+("Device list not loaded yet") — "no answer from the listing" and "no phone attached" have
+different fixes, and the second sends you to check a cable that was never the problem.
+
+**Two refusals guard the pick**, both pure and unit-tested (`buildRefusal`, `pickRefusal`):
+
+- **A second concurrent build is refused.** `/api/build` takes no lock, `runBuild` fires an SSE
+  request per call, and a native OS menu is not covered by the DOM progress modal — so the modal
+  only *looks* like it is holding the door. Before every device row was a build this took a
+  deliberate second trip through the menu; now "wrong phone — click the right one" is the natural
+  gesture, and it would put two `xcodebuild`/gradle pipelines on one project dir, both reporting
+  into the single shared `buildStatus`. A build that already FAILED does not count as running: its
+  modal is merely still up, and refusing there would make "dismiss a dialog" a prerequisite for
+  retrying.
+- **A pick is refused while Project Settings is open.** `user.device.*` has two writers, and they
+  write differently: this menu sends a partial patch, while the dialog snapshots the whole config
+  when it OPENS and posts that snapshot on Save. So a pick made while it sits open is silently
+  written back to the old device — even when the user only meant to edit the app name — and the
+  menu then re-reads disk and quietly agrees with the stale value. A lost update nobody is told
+  about is worse than a refusal naming the reason.
+
+The pure row-building and both refusals are `engine/app/editor/buildTargetMenu.ts` (unit-tested
+without a phone); the fetching, the patch POST and a generation guard against out-of-order
+listings live in `engine/app/editor/setup.ts`.
+
 ### Project Settings — the save contract
 
 `ProjectSettingsDialog` edits the schema `createEditor()` registered; it `GET`s

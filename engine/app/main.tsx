@@ -7,7 +7,7 @@ import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.tsx'
 import { Capacitor } from '@capacitor/core'
-import { setJournalEnabled, setDebugMenuEnabled } from '@modoki/engine/runtime'
+import { setJournalEnabled, setDebugMenuEnabled, setDebugHandlesEnabled, readPerfProfile, setProfilerEnabled } from '@modoki/engine/runtime'
 
 // Debug build — event-journal recording gate. ON in the editor (dev + the packaged
 // Electron editor, __MODOKI_EDITOR__) and in a game build that opts in via
@@ -21,6 +21,25 @@ setJournalEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
 // lazy import is gated on the same OR, so a release build with the flag off
 // tree-shakes the whole debug-menu chunk out. See docs/debug-menu-plan.md.
 setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
+
+// Live-inspection handles (`window.__3d` — camera/scene/renderer) — same gate again. Without
+// them an on-device rendering experiment costs a full build+install+launch (~3 min) instead of
+// one `device_eval`; a release build with the flag off publishes nothing. Deliberately its own
+// switch rather than riding the journal's, so a game can drop journal cost without going blind.
+setDebugHandlesEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
+
+// Profiler reachable on a DEVICE build. `readPerfProfile()` already separates main-thread
+// engine work (`cpuMs`) from everything else (`restMs` = GPU + present + idle), and names the
+// worst marker spans — but nothing published it outside the editor, so on-device the only
+// available signal was total frame time. That is how a 54 ms frame could be argued to be CPU-
+// or GPU-bound with equal confidence and no evidence either way.
+// Read `vsyncBound` before calling `restMs` GPU time: idle-waiting and GPU-busy are the same
+// number when a frame finishes early (#138 — GPU timestamp queries are the real fix). Well
+// over budget, as here, that ambiguity does not arise.
+if (__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__) {
+  setProfilerEnabled(true)
+  ;(window as unknown as Record<string, unknown>).__perf = readPerfProfile
+}
 
 // OTA Phase 4 — "Games" debug-menu tab, letting a player jump to a dynamically-loaded
 // sub-game (gameRegistry.ts). Not editor-only: it needs to work in a shipped debug

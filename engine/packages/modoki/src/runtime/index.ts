@@ -130,6 +130,10 @@ export {
 } from './loaders/modelPostprocessorRegistry';
 export {
   loadModelTemplates, getMeshTemplate, resolveMeshTemplate,
+  // Exposed so a GAME can merge kit pieces at a chosen LOD level rather than always L0 —
+  // sling's field welds its per-cell drip meshes into one object and must weld the level the
+  // camera actually shows, or the merge would undo the LOD chain.
+  resolveMeshLodInfo,
   registerRuntimeMeshTemplate, unregisterRuntimeMeshTemplate,
   resolveMaterial, resolveMaterialForMesh,
   getTemplatesForModel,
@@ -305,6 +309,10 @@ export {
   isDebugMenuEnabled,
   setDebugMenuEnabled,
 } from './debug/debugMenuRegistry';
+export {
+  setDebugHandlesEnabled,
+  areDebugHandlesEnabled,
+} from './core/debugHandles';
 export type { DebugTabDef, DebugCommandDef } from './debug/debugMenuRegistry';
 
 // ── Frame Driver (no heavy deps — safe for all importers) ──
