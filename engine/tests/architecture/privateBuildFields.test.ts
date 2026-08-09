@@ -30,17 +30,27 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { PRIVATE_BUILD_FIELDS } from '../../project-config';
-import { REPO_ROOT, hasInternalGames } from '../helpers/repoLayout';
+import { REPO_ROOT, hasAnyProject, hasInternalGames } from '../helpers/repoLayout';
 
 const repoRoot = REPO_ROOT;
 
 /** The non-vacuity floor is LAYOUT-DEPENDENT, and getting that wrong is this repo's
- *  best-documented test trap. A dev clone has ~24 committed project configs; the public
- *  snapshot ships no `games/` at all and only the selected demos, so it has 4 — a flat
- *  `>= 10` passes here and fails there, which is exactly what it did on the first
- *  `verify:publish` after this file was committed. Gate on the shared predicate rather than
- *  hand-rolling a presence check (`projectPresencePredicate.test.ts` enforces that). */
-const CONFIG_FLOOR = hasInternalGames() ? 10 : 3;
+ *  best-documented test trap. Gate on the shared predicates rather than hand-rolling a
+ *  presence check (`projectPresencePredicate.test.ts` enforces that).
+ *
+ *  There are THREE layouts, not two — the distinction that cost the v0.4.0 release its first
+ *  publish attempt, exactly as docs/engine-oss-publishing.md warns:
+ *
+ *    dev clone   games/ + demos/   ~24 configs   floor 10
+ *    `ci/main`   demos only          4 configs   floor  3   (2 demos + the two engine-owned ones)
+ *    `main`      neither             2 configs   floor  2   (release snapshot — no projects at all)
+ *
+ *  The two that survive every layout are `engine/templates/starter/` and the testbed fixture:
+ *  engine-owned, so no project deletion can drop the count below 2. That makes 2 a real floor
+ *  rather than a slack one — an engine-side rename WILL trip it, which is the review this guard
+ *  is for. A two-branch floor read `>= 3` on the release layout and could not be satisfied by a
+ *  snapshot that ships no projects by design. */
+const CONFIG_FLOOR = hasInternalGames() ? 10 : hasAnyProject() ? 3 : 2;
 
 const tracked = (...args: string[]): string[] =>
   execFileSync('git', ['ls-files', ...args], { cwd: repoRoot, encoding: 'utf8' })
@@ -53,8 +63,8 @@ describe('private build fields never reach a committed file (#172)', () => {
   it('finds project configs to check — a vacuous pass is a failure', () => {
     // Not a formality. This guard's whole value is that it ran; if the glob stops matching
     // (a rename, a layout change) every assertion below passes by checking nothing, and the
-    // green tick is indistinguishable from an honest one. Each floor sits well under its real
-    // count (24 here, 4 in the snapshot) so deleting a project is not a false red.
+    // green tick is indistinguishable from an honest one. Each floor sits at or under its real
+    // count (24 dev / 4 ci-main / 2 release) so deleting a project is not a false red.
     expect(configs.length).toBeGreaterThanOrEqual(CONFIG_FLOOR);
   });
 
