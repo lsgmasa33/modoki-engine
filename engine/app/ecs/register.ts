@@ -4,7 +4,7 @@
 import projectConfig from 'virtual:modoki-project-config';
 import { registerAllTraits } from './registerTraits';
 import { setNameTransform } from '@modoki/engine/runtime';
-import { getGameConfig, registerEngineActions, registerAudioControls, registerVideoControls, registerManager, timeManager, navigationManager, physics2DEventsManager, physics3DEventsManager, zone2DEventsManager, zone3DEventsManager, timelineEventsManager, inputSourcesManager, setPhysicsLayers, setTargetFPS, setRenderSettings } from '@modoki/engine/runtime';
+import { getGameConfig, registerEngineActions, registerAudioControls, registerHapticControls, registerVideoControls, registerManager, timeManager, navigationManager, physics2DEventsManager, physics3DEventsManager, zone2DEventsManager, zone3DEventsManager, timelineEventsManager, inputSourcesManager, setPhysicsLayers, setTargetFPS, setRenderSettings } from '@modoki/engine/runtime';
 
 let registered = false;
 
@@ -19,6 +19,7 @@ export function registerAll() {
   // toggleCrossfade/setBusVolume/playOneShot) + the mixer store hook so sliders'
   // inputBinding resolves bus volumes. Lets games control audio declaratively.
   registerAudioControls();
+  registerHapticControls();
   // Skipped entirely when video is excluded — the `video.*` actions would have nothing to
   // drive, and registering them would pull the subsystem back into the bundle.
   if (__MODOKI_MODULE_VIDEO__) registerVideoControls();

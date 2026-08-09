@@ -92,6 +92,11 @@ function capDepRange(editorRoot: string, name: string, coreRange: string): strin
  *  the list in the guard would have been free to drift the same way. */
 export const ENGINE_REQUIRED_CAP_PLUGINS = [
   '@capacitor/app',
+  // The engine's haptics subsystem (runtime/haptics/) imports this unconditionally, so a native
+  // project without it dies the moment a game plays a moment. Required rather than opt-in for
+  // exactly the reason @capacitor/preferences is: the import is static, so "the game does not use
+  // haptics" is not a state the bundle can be in.
+  '@capacitor/haptics',
   '@capacitor/keyboard',
   '@capacitor/preferences',
   '@capacitor/splash-screen',

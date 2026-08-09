@@ -60,10 +60,13 @@ describe('ensureCapacitorDeps', () => {
     const r = ensureCapacitorDeps(root, 'ios', editorRoot);
     expect(r.changed).toBe(true);
     const deps = readDeps();
-    // Includes the engine-runtime native plugins (app/keyboard/preferences) — omitting them
-    // ships a JS proxy with no native impl → "plugin is not implemented on <platform>" at launch.
+    // Includes the engine-runtime native plugins (app/haptics/keyboard/preferences) — omitting
+    // one ships a JS proxy with no native impl → "plugin is not implemented on <platform>" at
+    // launch. `@capacitor/haptics` joined the list when runtime/haptics/ landed, because the
+    // engine imports it statically: "this game does not use haptics" is not a state the bundle
+    // can be in.
     expect(Object.keys(deps).sort()).toEqual(
-      ['@capacitor/app', '@capacitor/cli', '@capacitor/core', '@capacitor/ios', '@capacitor/keyboard', '@capacitor/preferences', '@capacitor/splash-screen', 'capacitor-game-debug'],
+      ['@capacitor/app', '@capacitor/cli', '@capacitor/core', '@capacitor/haptics', '@capacitor/ios', '@capacitor/keyboard', '@capacitor/preferences', '@capacitor/splash-screen', 'capacitor-game-debug'],
     );
   });
 

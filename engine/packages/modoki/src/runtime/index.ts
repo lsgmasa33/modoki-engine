@@ -35,6 +35,22 @@ export {
   PlayerPrefs, InMemoryBackend, LocalStorageBackend, PreferencesBackend, selectDefaultBackend,
   type JsonValue, type PlayerPrefsInitOptions, type PrefsBackend,
 } from './storage';
+export { hapticsSystem } from './haptics/hapticsSystem';
+export { registerHapticControls } from './actions/hapticControls';
+export {
+  playHaptic, configureHaptics, areHapticsEnabled, canDeviceVibrate,
+  hapticLatencyMean, hapticLatencySamples, clearHapticLatency,
+  cancelPendingHaptics, disposeHaptics, setHapticBackend,
+} from './haptics/hapticsService';
+export {
+  registerHapticPatterns, clearHapticPatterns, resolveHapticPattern, hapticPatternNames,
+  ENGINE_HAPTIC_PATTERNS,
+  type HapticPreset, type HapticStep, type HapticPattern,
+} from './haptics/patterns';
+export {
+  NoopHapticBackend, CapacitorHapticBackend, pickHapticBackend, type HapticBackend,
+} from './haptics/backends';
+export { HapticSettings } from './traits/HapticSettings';
 export {
   Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, EntityAttributes, Camera, CameraFrame,
   PrefabInstance, ModelSource, Paused, Persistent, markPersistent, Transient, Time, Input,

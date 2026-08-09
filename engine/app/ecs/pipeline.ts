@@ -4,7 +4,7 @@
 import {
   registerSystem, runPipeline as modokiRunPipeline,
   timeSystem, uiTreeProjection, rotate3DSystem, timelineSystem, animationSystem, spriteAnimationSystem,
-  physics2DSystem, physics3DSystem, zone2DSystem, zone3DSystem, inputSystem, characterInputSystem, characterInput3DSystem, characterAnimationSystem, uiFocusSystem, skin2DSystem, audioSystem, setAudioWorldPositionResolver, materialInstanceSystem, SYSTEM_PRIORITY,
+  physics2DSystem, physics3DSystem, zone2DSystem, zone3DSystem, inputSystem, characterInputSystem, characterInput3DSystem, characterAnimationSystem, uiFocusSystem, hapticsSystem, skin2DSystem, audioSystem, setAudioWorldPositionResolver, materialInstanceSystem, SYSTEM_PRIORITY,
   videoSystem, setVideoUrlResolver, resolveVideoUrl,
   setVideoSourceResolver, setVideoDownloader, resolveVideoSource,
   VideoCache, CacheApiBackend, hasCacheStorage,
@@ -42,6 +42,10 @@ registerSystem('rotate3D', rotate3DSystem, SYSTEM_PRIORITY.GAME);
 // after inputSystem (INPUT tier) has this frame's edges. App-pipeline only — the
 // activation itself is drained by UIRenderer outside the tick (applyBindings F10).
 registerSystem('uiFocus', uiFocusSystem, SYSTEM_PRIORITY.GAME);
+// Haptics settings → service. Copies two booleans; never plays anything (a haptic on a per-frame
+// path buzzes forever — moments fire from state transitions). INPUT tier so the gates are current
+// before this frame's gestures can raise a moment.
+registerSystem('haptics', hapticsSystem, SYSTEM_PRIORITY.INPUT);
 // Timeline / cutscene sequencer — one tick BEFORE animation (149) so a keyframe-scrub
 // Animation track sets Animator.{clip,time} and animationSystem samples that exact pose the
 // same frame. Playhead advances on the deterministic sim delta; sim-gated (149 < TRANSFORM),

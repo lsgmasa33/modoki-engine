@@ -44,6 +44,7 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 | [audio-plan.md](./audio-plan.md) | The engine-native Web Audio subsystem — `AudioSource`/`AudioListener` traits, cue bus, converter, declarative `audio.*` actions |
 | [input.md](./input.md) | The input system — `Input` trait + action vocabulary, keyboard/gamepad/pointer(tap+drag) sources, `inputSystem` frame bridge, character-controller bridges, device prompts |
 | [ui-system.md](./ui-system.md) | The ECS-driven UI system — `UIElement`/binding/action/anchor traits, the DOM `UIRenderer`, focus nav, text animation, nine-slice, per-game custom React UI |
+| [haptics.md](./haptics.md) | Device haptics — named preset patterns (engine defaults + game-registered), `HapticSettings`, declarative `haptics.*` actions, journal event; why presets rather than a custom-waveform plugin |
 | [player-prefs.md](./player-prefs.md) | Runtime persistence — the Unity-`PlayerPrefs`-style atomic per-key JSON store (localStorage / `@capacitor/preferences`), flush-on-background, per-game namespace |
 | [verification-harness.md](./verification-harness.md) | The deterministic headless logic-verification harness — injectable clock, `timeScale`, seeded RNG, event journal (Phase 4 scene-file loading open) |
 
