@@ -165,7 +165,16 @@ describe.skipIf(process.platform === 'win32')('buildStepShell — killBuildProce
 describe.runIf(process.platform === 'win32')('buildStepShell — killBuildProcess kills the whole tree on Windows (#182)', () => {
   // A SIMPLE command on purpose — see the header. `ping -n 30` is the measured shape: it runs
   // long enough to observe and needs no shell builtins.
-  const SIMPLE = 'ping -n 30 127.0.0.1'
+  //
+  // ⚠️ `> NUL` is load-bearing, not tidiness. Without it the CONTROL failed on the GitHub
+  // Windows runner ("expected [] to deeply equal [ 1292 ]" — the tool was found, then gone):
+  // `ping` writes a line per second into a pipe NODE owns, `proc.kill()` tears that pipe down,
+  // and PING's next write hits a broken pipe and exits. Windows has no automatic tree kill, so
+  // that write is the only thing that could have killed it. The header's "survivors 4/4" was
+  // measured by hand, where the tool inherits a CONSOLE rather than a pipe and nothing breaks —
+  // which is exactly why the manual box and CI disagreed on identical code. Redirecting to NUL
+  // removes the tool's dependency on node's pipe, so the control tests parent-death alone.
+  const SIMPLE = 'ping -n 30 127.0.0.1 > NUL'
 
   // The same PowerShell queries the #182 step-1 measurement used, so the test exercises the
   // mechanism through the same lens the manual run did.
