@@ -665,6 +665,77 @@ consecutive same-field edits **coalesce** into one undo entry within a ~500 ms w
 persistence is a **debounced `/api/write-file`** (~400 ms) that also re-seeds the relevant
 runtime cache so any live entity referencing the asset updates next frame.
 
+#### The binding is a PATH, so every file move must update it (#186)
+
+The five binding editors — Particle, SpriteAnim, Skin, Animation, Timeline — each hold
+`editing<X>Asset`, and the debounced write above targets **that path**. So any operation
+that moves or removes the file without telling the panel makes the next edit write to the
+*old* location, and because a write SUCCEEDS, nothing reports it:
+
+- **Delete** → the file you moved to the trash comes back on the next edit.
+- **Rename / move** → the asset **forks**. Measured on `games/timeline-demo`: renaming a
+  bound timeline and then editing it re-created the old file with the new content while the
+  renamed file kept the old. Your edits go to a zombie; the renamed asset silently stops
+  receiving them.
+
+`panels/assetEditorBindings.ts` owns the repair, and the rule is **delete unbinds, move
+repoints** — a moved asset survives (its GUID and `.meta.json` sidecar travel with it), so
+the binding is repointed via `remapEditingAssetPath` rather than reopened: reopening
+re-fetches from disk and would discard the in-memory doc, which after a rename is the newer
+of the two.
+
+**Six call sites, and they are the whole contract** — asset delete (`executeDeletion`),
+folder delete (`handleDeleteFolder`, which deliberately does *not* route through
+`executeDeletion`), asset rename, cut/paste move, folder rename, and drag-drop into a folder
+(`handleFilesDrop`). The four move sites remap in their **undo/redo closures** too, since
+those move the file back — and each closure gates the remap on the move actually succeeding:
+`/api/move-file` 409s when the destination exists, and repointing a binding at a path the
+file is *not* at is the forking bug itself.
+
+Two sweep lessons are baked into that list. The first version wired only `executeDeletion`
+and missed four; a follow-up sweep for `moveFileTo` call sites still missed `handleFilesDrop`,
+which uses the sibling helper **`moveFile`** (folder target) instead. Grep for the *behaviour*
+— "what changes an asset's path?" — not for one helper's name. A copy/paste is deliberately
+absent: it creates a new file and leaves the original in place, so nothing bound has moved.
+
+Folder matching is **segment-boundary**, not `startsWith`: renaming `/assets/anim` must not
+capture `/assets/animations/…`. Adding a sixth binding editor means adding a row to
+`ASSET_EDITOR_BINDINGS`; a panel that forgets it gets this bug back with no new symptom.
+
+**Known gap, accepted:** `useDebouncedSave` cancels a pending write on unmount, so closing a
+panel within ~400 ms of an edit drops that write. Because closing a tab keeps the binding
+(below), the store holds the newer doc and the next edit re-saves it — the loss only
+materializes across an editor restart.
+
+#### Closing a panel KEEPS its binding, but drops the flags it owns
+
+Deliberate, and the opposite of the delete case above: reopening an asset editor lands back
+on what you were editing. (FlexLayout renders a tab lazily but keeps it mounted once shown,
+so merely *switching* tabs never unmounts a panel — only a real close does.)
+
+What a closed panel must **not** keep is state naming a live recorder or preview that no
+longer exists. `AnimationEditor` already dropped the record HOOK on unmount but left
+`isRecording` true, and `TimelineEditor` already tore down its preview SESSION but left
+`isPreviewPlaying` true — a toolbar reading "recording" for a panel you closed, and
+`get_editor_state` reporting it to agents as truth. Both now clear in the unmount cleanup
+that was already there, with **empty deps** so dragging a tab between tabsets re-mounts with
+the flags down rather than tearing out the binding.
+
+#### Guard: an editor-store action with no caller is a dead feature
+
+`tests/architecture/editorStoreActionsReachable.test.ts` fails when any function-typed
+`EditorState` member is never called outside the store. This is the repo's dominant
+"unreachable mechanism" shape (see [CLAUDE.md](../CLAUDE.md)) caught at the cheapest possible
+place, because *"was this ever called?"* is statically answerable.
+
+It exists because `skinWeightView`/`setSkinWeightView` had **zero** callers for their whole
+life, so the SceneView weight view could not be turned on at all (#181 — the branch was
+correct, the button simply did not exist). On its first run the guard found three more
+(`closeAnimationEditor` / `closeTimelineEditor` / `closeParticleEditor`), which is how the
+asset-binding bug above was found. The check is permissive on purpose — any reference
+outside `editorStore.ts` counts, including from a test — and it excludes its own file from
+the corpus, since naming an orphan in an allowlist would otherwise launder it.
+
 ### The asset Inspector — two rules that have each failed three times
 
 The Inspector's asset view (`Inspector.tsx`) is the door to everything above: it renders a

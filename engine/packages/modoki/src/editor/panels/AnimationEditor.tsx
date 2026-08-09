@@ -416,6 +416,20 @@ export default function AnimationEditor() {
     return () => setRecordHook(null);
   }, [recording, commit, mutateTrack]);
 
+  // ── Panel gone (tab closed) → drop the flags this panel OWNS ── (#186)
+  // The BINDING is deliberately kept, so reopening the tab lands back on the same clip.
+  // What must not survive is state describing a live recorder/preview that no longer
+  // exists: the effect above already drops the record HOOK, but `isRecording` is the flag
+  // that NAMES it, and it stayed true with no panel and no hook — a toolbar that reads
+  // "recording" for a panel you closed, and `get_editor_state` reporting it to agents as
+  // truth. Empty deps → real unmount only, so moving the tab between tabsets just
+  // re-mounts with the flags down rather than tearing the binding out.
+  useEffect(() => () => {
+    const s = useEditorStore.getState();
+    if (s.isRecording) s.setRecording(false);
+    if (s.isPreviewPlaying) s.setPreviewPlaying(false);
+  }, []);
+
   // ── Add Property (one or many) ──
   // The picker can select several fields and add them in a single commit (one undo).
   const addProperties = useCallback((cs: PropertyCandidate[]) => {

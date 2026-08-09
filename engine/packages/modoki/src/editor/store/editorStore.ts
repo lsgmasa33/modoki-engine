@@ -328,6 +328,17 @@ interface EditorState {
    *  entity). Clears the live clip so the panel re-fetches. */
   openAnimationEditor: (asset: SelectedAsset, rootEntityId: number | null) => void;
   closeAnimationEditor: () => void;
+  /** Repoint an open asset editor at a new PATH after its file was renamed/moved, WITHOUT
+   *  reloading it (#186). Deliberately not `open<X>Editor(newPath)`: that re-fetches from
+   *  disk and would discard the in-memory doc, which after a rename is the newer of the
+   *  two. The doc is the truth here — only its location changed. A no-op if that editor is
+   *  unbound, so a stale move can never conjure a binding out of nothing. */
+  remapEditingAssetPath: (
+    field: 'editingParticleAsset' | 'editingSpriteAnimAsset' | 'editingSkinAsset'
+      | 'editingAnimationAsset' | 'editingTimelineAsset',
+    path: string,
+    name?: string,
+  ) => void;
   /** Seed the open clip from a freshly-loaded asset (updates the live cache, no undo). */
   loadAnimationClip: (clip: AnimationClipDef) => void;
   /** Apply a clip to an asset by path: refreshes the runtime cache + the editor form when
@@ -678,6 +689,11 @@ export const useEditorStore = create<EditorState>((set, get) => {
     isPreviewPlaying: false,
   })),
   closeAnimationEditor: () => set({ editingAnimationAsset: null, editingAnimationClip: null, animatorRootEntityId: null, isRecording: false, isPreviewPlaying: false }),
+  remapEditingAssetPath: (field, path, name) => set((s) => {
+    const cur = s[field];
+    if (!cur) return {}; // unbound → nothing to repoint
+    return { [field]: { ...cur, path, name: name ?? cur.name } } as Partial<EditorState>;
+  }),
   loadAnimationClip: (clip) => {
     const { editingAnimationAsset } = get();
     if (editingAnimationAsset) setAnimationClip(editingAnimationAsset.path, clip);

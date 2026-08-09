@@ -109,7 +109,19 @@ Two renderers read the same `skin2DBuffers` entry:
   per-part**: `overlayPartIndices` (`editor/panels/skinWeightOverlay.ts`) pairs each
   visible part's deformed positions with **that part's own** weights, skipping hidden
   parts and any part whose buffer/rig vertex counts disagree (see the Gotcha below for
-  why both the per-part pairing and the fail-closed check are load-bearing). Plus a `Bone2D`
+  why both the per-part pairing and the fail-closed check are load-bearing).
+  **Two overlay strengths, and the toolbar picks between them**: by default the selected
+  bone's heatmap is drawn semi-transparent OVER the texture. The **`◍ Weights` toggle** in
+  the SceneView toolbar (2D mode, `data-ui-id="sceneView.toolbar.skin-weights"`) switches to
+  the **weight view** — the same heatmap at full strength with the texture completely
+  covered, which is the readable way to judge a weight. With no bone selected it becomes the
+  whole-rig dominant-bone map. The toggle appears only when the selection is a
+  `SkinnedSprite2D` or a descendant of one (so selecting a `Bone2D` still shows it) and
+  auto-clears otherwise. It ignores the sprite's authored `opacity`: a diagnostic read
+  blended with the texture underneath is not a weight value. The store flag behind it
+  (`skinWeightView`) had NO caller for its whole life, so the weight view was unreachable
+  until #181 — the branch was correct, the button simply did not exist.
+  Plus a `Bone2D`
   overlay (child→parent joint lines + screen-constant handle dots). Bones are
   click-selectable (dots hit-tested first; skinned bodies by mesh AABB) and gizmo-
   poseable (the 2D gizmo gate was generalized off the Renderable2D-only check to any
@@ -207,8 +219,10 @@ an optional alpha coverage predicate; these return a ready `.rig2d.json` payload
   auto-place bones (Rig mode), Re-tessellate the mesh at a chosen grid density,
   Auto-weight, paint weights with a heatmap overlay, and a one-click Auto-rig that runs
   the whole `autoRig2D` pipeline on the active part. Rigs can also be hand-authored JSON.
-  **Weight painting lives ONLY in the Skin panel** — SceneView shows the heatmap but has
-  no brush (see the Gotcha below).
+  **Weight painting lives ONLY in the Skin panel** — SceneView shows the heatmap (and, via
+  its `◍ Weights` toggle, the full-strength weight view) but has no brush (see the Gotcha
+  below). That asymmetry is deliberate: the toggle survived the #180 cull that removed the
+  SceneView brush precisely because it is read-only.
   Once a rig exists, open a scene with a `SkinnedSprite2D` + `Bone2D` children; select a
   bone in the Hierarchy or by clicking its joint in SceneView; pose it with the gizmo
   (works while stopped) and the mesh deforms live in both viewports.

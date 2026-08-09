@@ -24,6 +24,7 @@ import {
 } from './assetOps';
 import { resolveClickSelection, dragPathsFor } from './assetSelection';
 import { isTextAsset, makeDeleteUndo, makeDuplicateUndo, type Snapshot, type DeleteResult, type DupResult } from './assetUndo';
+import { unbindDeletedAssetEditors, applyAssetPathMoves, type PathMove } from './assetEditorBindings';
 import { newGuid, registerAsset, type AssetType } from '../../runtime/loaders/assetManifest';
 import { getCreatableAssets, type CreatableAssetDef } from './creatableAssets';
 import { reimportPaths } from './assetViews/reimport';
@@ -213,6 +214,13 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
 // ─── Asset row (shared between views) ────────────────────────────────
 
 // Folder-relative move (computes the destination path from a target folder).
+/** Report what an asset move/delete did to the open asset editors (#186). Silent when it
+ *  touched none, which is almost always — but a binding that silently repoints or closes is
+ *  how the original bug stayed invisible, so the one case that matters says so. */
+function logBindingChanges(notes: string[]): void {
+  for (const n of notes) console.log(`[Assets] ${n}`);
+}
+
 // Distinct from assetOps.moveFileTo, which takes an explicit full target path.
 async function moveFile(fromPath: string, toFolder: string): Promise<boolean> {
   const name = fromPath.substring(fromPath.lastIndexOf('/') + 1);
@@ -1042,6 +1050,11 @@ export default function Assets() {
     const removed = new Set(results.map((r) => r.asset.path));
     setAssets((prev) => prev.filter((a) => !removed.has(a.path)));
     if (selected && removed.has(selected)) { setSelected(null); selectAsset(null); }
+    // Same idea as the selection reset above, one layer deeper: an ASSET EDITOR bound to a
+    // deleted file would keep editing it and its debounced autosave would write the file
+    // back (#186). Checked against `allPaths`, not `removed`, so a generated file that a
+    // model delete drags along also unbinds.
+    logBindingChanges(unbindDeletedAssetEditors(allPaths));
     console.log(`[Assets] Moved ${allPaths.length} file(s) to trash`);
     pushDeleteUndo(results); // ONE undo entry for the whole gesture
     if (rescan) refresh();   // ONE rescan, not one per file
@@ -1089,12 +1102,30 @@ export default function Assets() {
     if (!ok) { console.error(`[Assets] Failed to rename ${asset.path}`); return; }
     console.log(`[Assets] Renamed ${asset.path} → ${toPath}`);
     if (selected === asset.path) { setSelected(toPath); selectAsset({ path: toPath, type: asset.type, name: safe }); }
+    // …and an open editor bound to it, or its next autosave FORKS the asset: the write goes
+    // to the old path, re-creating the file you renamed away from, while the renamed file
+    // stops receiving edits (#186). Undo/redo remap back — they move the file too.
+    logBindingChanges(applyAssetPathMoves([{ from: asset.path, to: toPath, name: safe }]));
     refresh();
 
     pushAction({
       label: `Rename ${asset.name}`,
-      undo: async () => { await moveFileTo(toPath, asset.path); refresh(); },
-      redo: async () => { await moveFileTo(asset.path, toPath); refresh(); },
+      // Each direction gates the remap on the move actually happening. Repointing a binding
+      // at a path the file is NOT at is the forking bug itself: /api/move-file 409s when the
+      // destination exists, so an undo after something else took the old name would
+      // otherwise aim the next autosave at a file that isn't there.
+      undo: async () => {
+        if (await moveFileTo(toPath, asset.path)) {
+          logBindingChanges(applyAssetPathMoves([{ from: toPath, to: asset.path, name: asset.name }]));
+        }
+        refresh();
+      },
+      redo: async () => {
+        if (await moveFileTo(asset.path, toPath)) {
+          logBindingChanges(applyAssetPathMoves([{ from: asset.path, to: toPath, name: safe }]));
+        }
+        refresh();
+      },
     });
   }, [assets, selected, selectAsset, refresh]);
 
@@ -1137,6 +1168,10 @@ export default function Assets() {
     setPendingFolders(prune);
     setExpanded(prune);
     setDiskFolders((prev) => prev.filter((x) => x !== folderPath && !x.startsWith(folderPath + '/')));
+    // Folder delete does NOT go through executeDeletion, so it needs its own unbind — an
+    // editor bound to an asset inside would otherwise autosave the file back and RECREATE
+    // the folder along with it (#186).
+    logBindingChanges(applyAssetPathMoves([{ from: folderPath, to: null, prefix: true }]));
     clearSelection();
     refresh();
     if (results.length > 0) {
@@ -1197,21 +1232,30 @@ export default function Assets() {
     if (done.length === 0) return;
     const op = clipboard.op;
     if (op === 'cut') setClipboard(null);
+    // A CUT moves the file, so a bound editor must follow it (#186). A copy/paste creates a
+    // NEW file and leaves the original where it is, so nothing bound has moved.
+    if (op === 'cut') logBindingChanges(applyAssetPathMoves(done.map(({ from, to }) => ({ from, to }))));
     refresh();
     pushAction({
       label: `${op === 'cut' ? 'Move' : 'Paste'} ${done.length} item(s)`,
+      // As in handleRename: only the moves that actually landed may repoint a binding.
       undo: async () => {
+        const back: PathMove[] = [];
         for (const { from, to } of done) {
-          if (op === 'cut') await moveFileTo(to, from);
+          if (op === 'cut') { if (await moveFileTo(to, from)) back.push({ from: to, to: from }); }
           else { await deleteAsset(to); if (!isTextAsset(to)) await deleteAsset(to + '.meta.json'); }
         }
+        if (op === 'cut') logBindingChanges(applyAssetPathMoves(back));
+        else logBindingChanges(unbindDeletedAssetEditors(done.map(({ to }) => to)));
         refresh();
       },
       redo: async () => {
+        const fwd: PathMove[] = [];
         for (const { from, to } of done) {
-          if (op === 'cut') await moveFileTo(from, to);
+          if (op === 'cut') { if (await moveFileTo(from, to)) fwd.push({ from, to }); }
           else await duplicateAsset(from, to);
         }
+        if (op === 'cut') logBindingChanges(applyAssetPathMoves(fwd));
         refresh();
       },
     });
@@ -1271,12 +1315,25 @@ export default function Assets() {
     const oldPath = node.path;
     setPendingFolders((p) => remapPrefix(p, oldPath, newPath));
     setExpanded((p) => remapPrefix(p, oldPath, newPath).add(newPath));
+    // The same prefix remap the two lines above do for folder state, for an open editor
+    // bound to an asset INSIDE the renamed folder (#186) — every one of them just moved.
+    logBindingChanges(applyAssetPathMoves([{ from: oldPath, to: newPath, prefix: true }]));
     clearSelection();
     refresh();
     pushAction({
       label: `Rename folder ${node.name}`,
-      undo: async () => { await moveFileTo(newPath, oldPath); setPendingFolders((p) => remapPrefix(p, newPath, oldPath)); refresh(); },
-      redo: async () => { await moveFileTo(oldPath, newPath); setPendingFolders((p) => remapPrefix(p, oldPath, newPath)); refresh(); },
+      undo: async () => {
+        const ok2 = await moveFileTo(newPath, oldPath);
+        setPendingFolders((p) => remapPrefix(p, newPath, oldPath));
+        if (ok2) logBindingChanges(applyAssetPathMoves([{ from: newPath, to: oldPath, prefix: true }]));
+        refresh();
+      },
+      redo: async () => {
+        const ok2 = await moveFileTo(oldPath, newPath);
+        setPendingFolders((p) => remapPrefix(p, oldPath, newPath));
+        if (ok2) logBindingChanges(applyAssetPathMoves([{ from: oldPath, to: newPath, prefix: true }]));
+        refresh();
+      },
     });
   }, [assets, pendingFolders, diskFolders, clearSelection, refresh]);
 
@@ -1429,7 +1486,13 @@ export default function Assets() {
     refresh();
     pushAction({
       label: imported.length > 1 ? `Import ${imported.length} files` : `Import "${imported[0].path.split('/').pop()}"`,
-      undo: async () => { for (const f of imported) await deleteAsset(f.path); refresh(); },
+      // Undoing an import DELETES the files, and you can have opened one in the meantime
+      // (import a .particle.json → double-click it → ⌘Z), so it unbinds like any delete.
+      undo: async () => {
+        for (const f of imported) await deleteAsset(f.path);
+        logBindingChanges(unbindDeletedAssetEditors(imported.map((f) => f.path)));
+        refresh();
+      },
       redo: async () => { for (const f of imported) await writeFile(f.path, f.content, 'base64'); refresh(); },
     });
   }, [assets, refresh, setImportStatus]);
@@ -1485,12 +1548,26 @@ export default function Assets() {
     }
     if (moves.length === 0) return;
     console.log(`[Assets] Moved ${moves.length} item(s) → ${targetFolder}`);
+    // Drag-drop into a folder is a MOVE like any other, so a bound editor must follow it
+    // (#186). This site uses `moveFile` (folder-target) rather than `moveFileTo`
+    // (explicit-path) — which is exactly why the first sweep for this bug missed it.
+    logBindingChanges(applyAssetPathMoves(moves.map(({ from, to }) => ({ from, to }))));
     refresh();
 
     pushAction({
       label: moves.length > 1 ? `Move ${moves.length} items` : `Move "${moves[0].from.split('/').pop()}"`,
-      undo: async () => { for (const m of moves) await moveFile(m.to, m.originalFolder); refresh(); },
-      redo: async () => { for (const m of moves) await moveFile(m.from, targetFolder); refresh(); },
+      undo: async () => {
+        const back: PathMove[] = [];
+        for (const m of moves) if (await moveFile(m.to, m.originalFolder)) back.push({ from: m.to, to: m.from });
+        logBindingChanges(applyAssetPathMoves(back));
+        refresh();
+      },
+      redo: async () => {
+        const fwd: PathMove[] = [];
+        for (const m of moves) if (await moveFile(m.from, targetFolder)) fwd.push({ from: m.from, to: m.to });
+        logBindingChanges(applyAssetPathMoves(fwd));
+        refresh();
+      },
     });
   }, [refresh]);
 

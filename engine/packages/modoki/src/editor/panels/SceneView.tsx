@@ -277,6 +277,51 @@ function ColliderEditButton() {
   );
 }
 
+/** The rig root the SceneView overlays belong to: the selection itself if it carries
+ *  SkinnedSprite2D, else its nearest such ancestor (so selecting a Bone2D still targets its
+ *  rig). ONE definition, shared by the chrome draw pass and the weight-view toolbar button —
+ *  a button whose visibility disagreed with the draw pass would offer a toggle that does
+ *  nothing, which is the #181 failure mode in miniature. */
+function findSkinnedRootId(selectedId: number | null): number | null {
+  if (selectedId === null) return null;
+  const ssMeta = getAllTraits().find((t) => t.name === 'SkinnedSprite2D');
+  if (!ssMeta) return null;
+  let cur = selectedId;
+  for (let g = 0; cur && g < 4096; g++) {
+    const ent = findEntity(cur);
+    if (!ent) break;
+    if (ent.has(ssMeta.trait)) return cur;
+    cur = ent.has(EntityAttributes) ? (ent.get(EntityAttributes).parentId as number) : 0;
+  }
+  return null;
+}
+
+/** Toolbar toggle for the SceneView weight view (#181): draws the selected rig as an opaque
+ *  weight heatmap (of the selected Bone2D) / dominant-bone map (no bone selected) instead of
+ *  its texture. Read-only — unlike the weight BRUSH, which lives in the Skin panel only.
+ *  Shown only in 2D mode with a rig selected (the chrome overlay that honours the flag is
+ *  mounted only there); auto-clears otherwise, so the flag can't sit true with no way back. */
+function SkinWeightViewButton({ mode }: { mode: '3d' | 'ui' }) {
+  const skinWeightView = useEditorStore((s) => s.skinWeightView);
+  const setSkinWeightView = useEditorStore((s) => s.setSkinWeightView);
+  const selectedId = useEditorStore((s) => s.selectedEntityId);
+  const applicable = mode === 'ui' && findSkinnedRootId(selectedId) !== null;
+  useEffect(() => { if (!applicable && skinWeightView) setSkinWeightView(false); }, [applicable, skinWeightView, setSkinWeightView]);
+  if (!applicable) return null;
+  return (
+    <button onClick={() => setSkinWeightView(!skinWeightView)}
+      data-ui-id="sceneView.toolbar.skin-weights" data-ui-kind="toggle" data-ui-label="skin weights"
+      title="Weight view: draw the rig as an opaque weight heatmap instead of its texture — select a Bone2D for that bone's influence, or none for a dominant-bone map"
+      style={{
+        height: 24, padding: '0 8px', display: 'flex', alignItems: 'center', gap: 4,
+        background: skinWeightView ? '#2a1226' : 'none',
+        border: `1px solid ${skinWeightView ? '#ff40b4' : '#444'}`,
+        borderRadius: 3, color: skinWeightView ? '#ff40b4' : '#888', fontSize: '10px',
+        cursor: 'pointer', fontWeight: 'bold', fontFamily: 'monospace', lineHeight: 1,
+      }}>◍ Weights</button>
+  );
+}
+
 // Static gizmo mode list — hoisted to module scope so its identity is stable
 // (no need to thread it through effect deps).
 const gizmoModes: Array<{ value: 'translate' | 'rotate' | 'scale'; icon: string; key: string }> = [
@@ -605,6 +650,7 @@ export default function SceneView() {
         {/* Gizmo mode + space toggle (shared between 3D and 2D modes) */}
         <GizmoToolbar gizmoModes={gizmoModes} gizmoMode={gizmoMode} setGizmoMode={setGizmoMode} gizmoSpace={gizmoSpace} setGizmoSpace={setGizmoSpace} gizmoPivot={gizmoPivot} setGizmoPivot={setGizmoPivot} multiSelect={multiSelectCount > 1} />
         <ColliderEditButton />
+        <SkinWeightViewButton mode={mode} />
         {mode === '3d' && <>
           <ViewOptionsMenu uiId="sceneView.toolbar.viewOptions3d" items={[
             { key: 'fx', label: 'FX', checked: particlePreview, onToggle: () => setParticlePreview(!particlePreview), title: 'Preview particle effects in the scene (P)', uiId: 'sceneView.toolbar.fx-preview' },
@@ -1656,16 +1702,7 @@ function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: S
       // Which SkinnedSprite2D (if any) shows its mesh wireframe: the selected rig root, or
       // the rig owning the selected Bone2D — an authoring aid so tessellation density +
       // deformation are visible while editing the rig.
-      let wireframeRootId: number | null = null;
-      if (ssMeta && currentSelectedId !== null) {
-        let cur = currentSelectedId;
-        for (let g = 0; cur && g < 4096; g++) {
-          const ent = findEntity(cur);
-          if (!ent) break;
-          if (ent.has(ssMeta.trait)) { wireframeRootId = cur; break; }
-          cur = ent.has(EntityAttributes) ? (ent.get(EntityAttributes).parentId as number) : 0;
-        }
-      }
+      const wireframeRootId = findSkinnedRootId(currentSelectedId);
       // When a Bone2D is selected, overlay ITS influence as a weight heatmap on its rig.
       let heatmapBoneName: string | null = null;
       if (bone2dMeta && currentSelectedId !== null) {
@@ -1683,12 +1720,15 @@ function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: S
           if (!buf || !buf.parts.some((p) => p.positions.length > 0)) return;
           const wt = getWorldTransform2D(eid, tf);
           const color = '#' + (ss.color & 0xffffff).toString(16).padStart(6, '0');
+          const weightView = eid === wireframeRootId && useEditorStore.getState().skinWeightView;
           ctx.save();
-          ctx.globalAlpha = typeof ss.opacity === 'number' ? Math.min(1, Math.max(0, ss.opacity)) : 1;
+          // Weight view is a DIAGNOSTIC read, so it ignores the sprite's authored opacity —
+          // at ss.opacity < 1 the heatmap would blend with the Pixi-drawn texture underneath
+          // and stop being a readable weight value.
+          ctx.globalAlpha = weightView ? 1 : (typeof ss.opacity === 'number' ? Math.min(1, Math.max(0, ss.opacity)) : 1);
           ctx.translate(wt.x, wt.y);
           ctx.rotate(wt.rz);
           ctx.scale(cs.compensateX * wt.sx * (ss.flipX ? -1 : 1), cs.compensateY * wt.sy * (ss.flipY ? -1 : 1));
-          const weightView = eid === wireframeRootId && useEditorStore.getState().skinWeightView;
           // EVERY visible part is shaded, each against its OWN weights (#180) — the rig's
           // top-level skinIndices/skinWeights are `parts[0]` aliases, so reading them drew
           // part 0's influence and left the rest of a multi-part rig blank under a wireframe
