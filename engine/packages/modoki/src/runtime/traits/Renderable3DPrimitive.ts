@@ -19,4 +19,9 @@ export const Renderable3DPrimitive = trait({
    *  (material, mask), so the two would fight over the same object. Explicit-material
    *  primitives have no live colour path, so there is nothing to fight. */
   renderingLayerMask: 1 as number,
+  /** Shadow-cast mode — see `Renderable3D.castShadow`: `'auto'` derives it from the material
+   *  (opaque casts, transparent doesn't), `'on'`/`'off'` force it. */
+  castShadow: 'auto' as 'auto' | 'on' | 'off',
+  /** Receive shadows cast by other objects. Defaults to true — today's unconditional behaviour. */
+  receiveShadow: true as boolean,
 });

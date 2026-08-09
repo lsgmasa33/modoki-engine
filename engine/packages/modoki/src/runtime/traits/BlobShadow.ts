@@ -2,10 +2,13 @@ import { trait } from 'koota';
 
 /**
  * A single soft dark ellipse rendered on the ground beneath the entity — a cheap
- * "contact shadow" grounding cue for entities that don't cast a real shadow (either
- * because the `low` quality tier has real shadows off, or because the entity's material
- * is transparent-flagged and `applyShadowFlags` never sets `castShadow` on it — see
- * `docs/plans/low-end-device-support.md` §0b). `blobShadowSync` raycasts straight down
+ * "contact shadow" grounding cue for entities that don't cast a real shadow — because the
+ * `low` quality tier has real shadows off, or because the entity's material is alpha-blended
+ * (`applyShadowFlags` leaves `castShadow` false for a `transparent` material, since the shadow
+ * map treats blended geometry as opaque). NOTE this comment used to add "and that is why the
+ * forest-camp character has no shadow" — that was WRONG, and the real cause was #183: skinned
+ * models never had `applyShadowFlags` called on them at all. Fixed; don't re-derive the old
+ * theory from this comment. `blobShadowSync` raycasts straight down
  * from the entity's world position to find the ground, places a quad flush against the
  * hit surface (tilted to its normal so it doesn't sink into a slope), and fades it out
  * as the entity rises above the surface. No hit (or no physics world) → hidden, not a

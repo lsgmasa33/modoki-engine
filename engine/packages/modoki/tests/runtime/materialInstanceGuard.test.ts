@@ -39,6 +39,9 @@ function makeMockMesh() {
   let mat: unknown = null;
   const mesh: any = { position: { set: vi.fn() }, rotation: { set: vi.fn() }, scale: { set: vi.fn() } };
   Object.defineProperty(mesh, 'material', { get: () => mat, set: (v) => { mat = v; } });
+  // #183 — applyShadowFlags now re-applies (not just at creation), so a pre-seeded stand-in
+  // needs `.traverse` like every real THREE.Object3D has. No `isMesh` → it's a no-op walk.
+  mesh.traverse = (cb: (o: unknown) => void) => cb(mesh);
   return mesh;
 }
 

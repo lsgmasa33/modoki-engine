@@ -31,6 +31,7 @@ import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
 import { createParticleSyncState, syncParticles, disposeParticleSyncState } from './particleSync';
 import { createFlameMeshSyncState, syncFlameMeshes, disposeFlameMeshSyncState } from './flameMeshSync';
 import { createBlobShadowSyncState, syncBlobShadows, disposeBlobShadowSyncState } from './blobShadowSync';
+import { viewGroundFocus } from './shadowFollow';
 import { PARTICLE_LAYER } from './layers';
 import { areDebugHandlesEnabled } from '../core/debugHandles';
 import { NPRPostFX } from '../traits/NPRPostFX';
@@ -240,6 +241,27 @@ export default function Scene3D() {
       config.sceneSetup(scene);
 
       const ecsLights = new Map<number, THREE.Light>();
+      // Scratch for deriving the shadow-follow ground focus each frame — there's no camera
+      // look-at concept here (unlike SceneView's orbit `controls.target`), so it's derived from
+      // the active camera's own forward ray. Module-closure-scoped so the per-frame sync
+      // allocates nothing.
+      const _shadowFocusDir = new THREE.Vector3();
+      /** Where the active camera is looking, as a ground point, for shadowFollowCamera lights.
+       *  Forward is derived from `cam.rotation` (same technique syncLights uses for a light's
+       *  aim) rather than `matrixWorld` — position/rotation are written directly onto the
+       *  camera each frame and matrixWorld isn't guaranteed fresh until the renderer submits. */
+      function shadowFocusFor(cam: THREE.Camera): { x: number; y: number; z: number } {
+        _shadowFocusDir.set(0, 0, -1).applyEuler(cam.rotation);
+        return viewGroundFocus({
+          camPos: { x: cam.position.x, y: cam.position.y, z: cam.position.z },
+          camForward: { x: _shadowFocusDir.x, y: _shadowFocusDir.y, z: _shadowFocusDir.z },
+          groundY: 0,
+          // No single per-light shadowCameraSize is reachable here — one focus point is shared
+          // across every light in the syncLights call, so this is a fixed bound rather than a
+          // derived one (flagged per the brief: "if it isn't [reachable], use a constant 32").
+          maxDistance: 32,
+        });
+      }
       const renderState = createRenderState(true); // primary surface — journals @anim-* (Percept J3)
       const particleState = createParticleSyncState();
       const flameState = createFlameMeshSyncState();
@@ -354,7 +376,7 @@ export default function Scene3D() {
         reconcileToneExposure(renderer);
         syncFog(world, scene);
         beginProfilerSample('lights');
-        syncLights(world, scene, ecsLights);
+        syncLights(world, scene, ecsLights, shadowFocusFor(activeCamera));
         endProfilerSample();
         beginProfilerSample('renderables');
         syncSceneRenderables3D(world, scene, renderState, { batchDrawCalls: BATCH_DRAW_CALLS });
@@ -630,7 +652,7 @@ export default function Scene3D() {
           syncEnvironment(world, scene);
           reconcileToneExposure(renderer);
           syncFog(world, scene);
-          syncLights(world, scene, ecsLights);
+          syncLights(world, scene, ecsLights, shadowFocusFor(activeForCapture));
           // Same unconditional renderable+skeletal core as the live renderFrame
           // (runtime-rendering-3d.md F1): without syncSkinnedModels/syncBones/
           // syncBoneAttachments a skeletal scene captured absent or frozen at a

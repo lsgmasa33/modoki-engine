@@ -77,6 +77,8 @@ export function registerAllTraits() {
       material: { type: 'string', accept: ['.mat.json'] },
       isVisible: { type: 'boolean', tooltip: 'Show this renderer. Independent of the entity on/off (EntityAttributes.isActive, which also cascades to children).' },
       renderingLayerMask: { type: 'number', step: 1, min: 0, group: 'Lighting', tooltip: 'Rendering-layer bitmask. A light lights this object only when its own mask shares a bit with this one (bitwise AND non-zero). Both default to 1 (layer 0), so every light hits every object until you change one. Use it to give an object its own key light instead of paying for every light in the scene — forward shading evaluates ALL lights per fragment, and on mobile that cost is superlinear (measured 689ms → 98ms on a Galaxy A23).' },
+      castShadow: { type: 'enum', options: ['auto', 'on', 'off'], group: 'Shadows', tooltip: '"auto" casts a shadow only when the material is opaque (a transparent material never casts). "on"/"off" force it regardless of the material. Still gated by the project\'s three.shadows setting and the active quality tier — the "low" tier disables shadows entirely, which makes this field inert there, not broken.' },
+      receiveShadow: { type: 'boolean', group: 'Shadows', tooltip: 'Receive shadows cast by other objects. Still gated by the project\'s three.shadows setting and the active quality tier — the "low" tier disables shadows entirely, which makes this field inert there, not broken.' },
     },
   });
 
@@ -86,6 +88,8 @@ export function registerAllTraits() {
     fields: {
       model: { type: 'string', accept: ['.glb', '.gltf'], tooltip: 'Rigged GLB (keeps skeleton + animation clips). Pair with SkeletalAnimator to play clips.' },
       isVisible: { type: 'boolean', tooltip: 'Show this renderer. Independent of the entity on/off (EntityAttributes.isActive, which also cascades to children).' },
+      castShadow: { type: 'enum', options: ['auto', 'on', 'off'], group: 'Shadows', tooltip: '"auto" casts a shadow only when the material is opaque (a transparent material never casts). "on"/"off" force it regardless of the material. Still gated by the project\'s three.shadows setting and the active quality tier — the "low" tier disables shadows entirely, which makes this field inert there, not broken.' },
+      receiveShadow: { type: 'boolean', group: 'Shadows', tooltip: 'Receive shadows cast by other objects. Still gated by the project\'s three.shadows setting and the active quality tier — the "low" tier disables shadows entirely, which makes this field inert there, not broken.' },
     },
   });
 
@@ -304,6 +308,8 @@ export function registerAllTraits() {
       size: { type: 'number', step: 1 },
       isVisible: { type: 'boolean', tooltip: 'Show this renderer. Independent of the entity on/off (EntityAttributes.isActive, which also cascades to children).' },
       renderingLayerMask: { type: 'number', step: 1, min: 0, group: 'Lighting', tooltip: 'Rendering-layer bitmask — a light lights this object only when its mask shares a bit with this one. Requires an explicit Material: a default-material primitive owns a per-entity material that Color is written into live, and a light-mask variant is shared, so the two would fight. Both masks default to 1, so every light hits every object until you change one.' },
+      castShadow: { type: 'enum', options: ['auto', 'on', 'off'], group: 'Shadows', tooltip: '"auto" casts a shadow only when the material is opaque (a transparent material never casts). "on"/"off" force it regardless of the material. Still gated by the project\'s three.shadows setting and the active quality tier — the "low" tier disables shadows entirely, which makes this field inert there, not broken.' },
+      receiveShadow: { type: 'boolean', group: 'Shadows', tooltip: 'Receive shadows cast by other objects. Still gated by the project\'s three.shadows setting and the active quality tier — the "low" tier disables shadows entirely, which makes this field inert there, not broken.' },
     },
   });
 
@@ -833,6 +839,8 @@ export function registerAllTraits() {
       penumbra: { type: 'number', step: 0.1, min: 0, max: 1 },
       castShadow: { type: 'boolean' },
       showShadowFrustum: { type: 'boolean', group: 'Shadow', tooltip: 'Editor-only: outline this directional light’s shadow-camera coverage box in the viewport. Anything poking outside the box gets no shadow (it clips) — raise Shadow Camera Size until the box encloses the whole scene.' },
+      shadowFollowCamera: { type: 'boolean', group: 'Shadow', tooltip: 'Recentres the shadow box on the view each frame, so a moving subject can’t walk out of it. The authored Shadow Camera Size is unchanged — this buys coverage without costing texel density. Turn off to pin the box to the light’s authored position, for a scene that deliberately wants a fixed box.' },
+      shadowFollowTarget: { type: 'entityRef', group: 'Shadow', tooltip: 'Entity GUID the shadow box centres on (usually the player). Empty = follow whatever the view is looking at. Centring on the subject rather than the view lets you LOWER Shadow Camera Size for the same coverage around it, and a smaller box means smaller texels — the cheapest way to sharpen a soft shadow. A guid that no longer resolves falls back to the view.' },
       renderingLayerMask: { type: 'number', step: 1, min: 0, group: 'Lighting', tooltip: 'Rendering-layer bitmask. This light affects a renderer only when its Renderable3D mask shares a bit with this one (bitwise AND non-zero). Both default to 1 (layer 0), so every light hits every object until you change one. Restricting a light to the objects it actually lights is the single biggest mobile win available — measured 689ms → 98ms on a Galaxy A23. Note a light kept by even ONE object still renders its full shadow map.' },
       shadowCameraSize: { type: 'number', step: 1, min: 1, group: 'Shadow', tooltip: 'Ortho half-extent (world units) the directional shadow covers. Must enclose the scene or shadows clip at the box edge. Bigger = softer/lower-res shadows for a fixed map size.' },
       shadowMapSize: { type: 'number', step: 512, min: 256, group: 'Shadow', tooltip: 'Shadow depth-map resolution (px). Higher = crisper shadow edges but more GPU memory — 2048 is mobile-safe, 4096 is heavy on mobile.' },

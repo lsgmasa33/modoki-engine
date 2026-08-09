@@ -100,13 +100,71 @@ Applied each frame while `castShadow` is on and the light is directional/spot. `
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `shadowMapSize` | `2048` | Depth-map resolution (square). A change reallocs the depth texture — GUARDED so it only regenerates when the size actually changes. |
-| `shadowCameraSize` | `16` | Directional shadow-camera ortho half-extent (world units) — must ENCLOSE the scene. |
+| `shadowCameraSize` | `16` | Directional shadow-camera ortho half-extent (world units). With `shadowFollowCamera` off it must ENCLOSE THE SCENE; with it on (the default) it only has to enclose what is around the subject, which is what lets it be smaller — see below. |
 | `shadowBias` | `-0.0003` | Depth bias (fights acne). |
 | `shadowNormalBias` | `0.008` | Normal-offset bias (fights peter-panning). |
 | `shadowRadius` | `4` | PCF blur radius. |
+| `shadowFollowCamera` | `true` | Recentre the ortho box on the view every frame instead of leaving it anchored at the light's authored position. |
+| `shadowFollowTarget` | `''` | Entity GUID to centre the box on instead of the view (usually the player). Empty = follow the view. |
 | `showShadowFrustum` | `false` | Editor-only: outline the shadow-camera coverage box in SceneView (runtime ignores it). |
 
-The shadow camera near/far are fixed at `0.1` / `200`; the directional light's ortho frustum is set from `shadowCameraSize`. Casters/receivers are flagged via `applyShadowFlags` (traverses the object, setting `castShadow` + `receiveShadow` on every mesh) — inert unless a light casts AND the renderer's shadow map is enabled.
+Casters/receivers come from the RENDERER's own `castShadow` (`'auto'`/`'on'`/`'off'`) + `receiveShadow`
+fields on `Renderable3D` / `Renderable3DPrimitive` / `SkinnedModel`, applied by `applyShadowFlags`.
+`'auto'` derives cast from the material — an alpha-blended (`transparent`) material does NOT cast,
+because the shadow map treats blended geometry as opaque and a translucent surface would throw a
+hard, wrongly-shaped shadow. All of it is inert unless a light casts AND the renderer's shadow map is
+enabled (project `three.shadows`; the `low` tier turns it off outright).
+
+⚠️ **A rig had NO shadow at all until #183** — `applyShadowFlags` was called from three places, all
+inside `syncRenderables` (LOD / GLB mesh / primitive), and never for skinned models, so every rigged
+character in every project kept THREE's defaults and neither cast nor received. **The tell for this
+class is `receiveShadow`**: the function sets it true unconditionally, so a mesh reporting
+`receiveShadow: false` proves it never ran there — whatever the material says. Do not re-derive the
+old "a transparent material explains it" theory; it was measured false.
+
+#### Follow (`shadowFollow.ts`)
+
+A directional shadow camera anchored at the light's authored position covers a FIXED patch of ground,
+so a moving subject walks off it and loses its shadow. Measured in `demos/forest-camp`: the Sun at
+`(5,10,4)` with `shadowCameraSize` 16 put the box's footprint around `(7.8, 12.5)` while the player
+walked near `(5.6, -0.5)` — the player sat at **-0.873 in shadow-camera NDC standing still**, and 9 m
+of walking north took it outside the box entirely.
+
+Each surface supplies the focus point it actually has. The editor passes its orbit `controls.target`
+(a true look-at). The runtime has none — a camera is just a Transform, and a follow target like
+forest-camp's lives in game code the renderer cannot see — so `viewGroundFocus` intersects the camera's
+view axis with the ground plane, which for any camera pointed at the ground IS the look-at, and unlike
+a fixed distance ahead of the camera is stable under zoom and pitch. A miss (level/upward camera) falls
+back to a bounded forward point rather than putting the box at infinity. `shadowFollowTarget` overrides
+all of that with an entity's world position; an unset or STALE guid falls back to the view focus, never
+to the origin (which would silently relocate every shadow in the scene).
+
+**Known bound, accepted**: that fallback distance is a fixed 32 world units, so a camera more than ~32
+units above the ground looking down still gets clamped to a point short of the true intercept — the box
+lands laterally off by the difference. Aerial/top-down setups should author `shadowFollowTarget` (which
+skips the derivation entirely) rather than rely on the ground hit.
+
+`snapShadowCenter` then snaps the centre to whole shadow-texel increments **in the light's own view
+basis**. Without it the shadow edge crawls as the camera moves, because each sub-texel shift of the box
+re-rasterizes the depth map differently.
+
+**Why `shadowFollowTarget` is worth authoring**: the view-derived point trails the character (measured
+2.8–3.7 m in forest-camp, growing while walking, since the camera lags and looks slightly ahead), which
+spends a quarter of the box radius on ground nobody looks at. Centred on the subject, `shadowCameraSize`
+can be SMALLER for the same coverage — and texel size is `2 * size / mapSize`, so shrinking it is the
+cheapest sharpness available. Measured: target + `shadowCameraSize` 16 → 10 put the character at NDC
+`0 / -0.065` (dead centre) and took texels from 15.6 mm to **9.8 mm**.
+
+⚠️ **Near/far are NOT simply `0.1` / `200` any more.** Near is `0.1`; far is `200` widened to
+`back + size*2` when the follow moves the camera, where `back = size*2 + 10`. Without that widening a
+scene authoring `shadowCameraSize >= 95` puts the focus at or beyond far and **every shadow from that
+light silently disappears** — and since `shadowFollowCamera` defaults on, that would hit an outdoor
+level unasked. Pinned by `syncLights.test.ts` § "shadow follow target".
+
+⚠️ **Shadow flags bake into compiled WGSL on the WebGPU/TSL path.** Flipping `castShadow` — or even
+`renderer.shadowMap.enabled` — at runtime over CDP/MCP changes NOTHING on screen. It is not a valid
+instrument; verify after a restart, or on the WebGL path. This cost real time during #183: it made a
+correct diagnosis look like a failed one.
 
 ### Rendering-layer light masks — per-object light selection (`lightMaskVariants.ts`)
 

@@ -13,6 +13,12 @@ export const Renderable3D = trait({
    *  this object its own key light rather than paying for every light in the scene — forward
    *  shading evaluates ALL lights per fragment. See runtime/rendering/lightMaskVariants.ts. */
   renderingLayerMask: 1 as number,
+  /** Shadow-cast mode. `'auto'` (default) derives it from the material: opaque casts, alpha-
+   *  blended (`transparent: true`) does not — a translucent surface throws a hard, wrongly-
+   *  shaped shadow map (see `applyShadowFlags`). `'on'`/`'off'` force it regardless of material. */
+  castShadow: 'auto' as 'auto' | 'on' | 'off',
+  /** Receive shadows cast by other objects. Defaults to true — today's unconditional behaviour. */
+  receiveShadow: true as boolean,
 });
 
 /** Mesh asset file format (*.mesh.json). `model` and `material` accept either

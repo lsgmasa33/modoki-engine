@@ -25,6 +25,7 @@ import { Fog } from '../../three/traits/Fog';
 import { fog as fogTsl, exponentialHeightFogFactor, uniform, renderGroup } from 'three/tsl';
 import { worldTransforms, deactivatedEntities, transformPropagationSystem } from '../core/ecs/transformPropagationSystem';
 import { updateSceneLightUniforms } from './sceneLightUniforms';
+import { snapShadowCenter } from './shadowFollow';
 import { syncVideoTextures } from './videoTextureSync';
 import { setEntityMeshCollector } from './materialBroker';
 import { getAnimationClip } from '../loaders/animationClipCache';
@@ -620,23 +621,42 @@ function createLightFromTrait(light: { lightType: string; color: number; intensi
   }
 }
 
-/** Mark a freshly-created object (and any nested meshes, e.g. LOD levels or a loaded
- *  model graph) as shadow caster + receiver. Inert unless a light casts + the renderer's
- *  shadowMap is enabled (both gated elsewhere), so this is always safe to apply.
- *  A mesh whose material is alpha-blended (`transparent: true` — water, glass, sprite
- *  billboards) does NOT cast: the shadow map treats blended geometry as fully opaque,
- *  so a translucent surface would throw a hard, wrongly-shaped shadow (see the pond
- *  water plane in demos/forest-camp — its shadow read as a ghost duplicate of itself
- *  offset across the grass). It still RECEIVES shadows normally. */
-function applyShadowFlags(obj: THREE.Object3D): void {
+/** Set castShadow/receiveShadow on an object (and any nested meshes, e.g. LOD levels or a
+ *  loaded model graph) from the entity's authored Renderable3D/Renderable3DPrimitive/
+ *  SkinnedModel fields. Inert unless a light casts + the renderer's shadowMap is enabled
+ *  (both gated elsewhere), so this is always safe to apply.
+ *  `castMode: 'auto'` (the default) derives cast from the material: a mesh whose material
+ *  is alpha-blended (`transparent: true` — water, glass, sprite billboards) does NOT cast —
+ *  the shadow map treats blended geometry as fully opaque, so a translucent surface would
+ *  throw a hard, wrongly-shaped shadow (see the pond water plane in demos/forest-camp —
+ *  its shadow read as a ghost duplicate of itself offset across the grass). `'on'`/`'off'`
+ *  force the cast flag regardless of the material. */
+function applyShadowFlags(obj: THREE.Object3D, castMode: 'auto' | 'on' | 'off', receive: boolean): void {
   obj.traverse((o) => {
     const m = o as THREE.Mesh;
     if (!m.isMesh) return;
     const mat = m.material as THREE.Material | THREE.Material[] | undefined;
     const transparent = Array.isArray(mat) ? mat.some((mm) => mm.transparent) : mat?.transparent;
-    m.castShadow = !transparent;
-    m.receiveShadow = true;
+    m.castShadow = castMode === 'auto' ? !transparent : castMode === 'on';
+    m.receiveShadow = receive;
   });
+}
+
+/** Composite cache key for `RenderState.ecsShadowFlags` — cheaper than storing a tuple, and a
+ *  Map<number,string> mirrors the house style of `ecsMaterials`/`ecsColors`/`ecsSizes`. */
+function shadowFlagsKey(castMode: 'auto' | 'on' | 'off', receive: boolean): string {
+  return `${castMode}:${receive}`;
+}
+
+/** World position of a light's authored shadow follow target, or undefined when there is no
+ *  target, the guid is stale, or the entity has no resolved world transform yet. Undefined means
+ *  "fall back to the view focus" — never "centre on the origin". */
+function resolveShadowFocus(guid: string, world: World): { x: number; y: number; z: number } | undefined {
+  if (!guid) return undefined;
+  const e = findEntityByGuid(guid, world);
+  if (!e) return undefined;
+  const wt = worldTransforms.get(e.id());
+  return wt ? { x: wt.x, y: wt.y, z: wt.z } : undefined;
 }
 
 /** Configure a directional/spot light's shadow map + camera + bias from its Light trait.
@@ -644,7 +664,8 @@ function applyShadowFlags(obj: THREE.Object3D): void {
  *  regenerates the depth texture when the size actually changes. */
 function configureLightShadow(
   l: THREE.DirectionalLight | THREE.SpotLight,
-  light: { shadowMapSize: number; shadowCameraSize: number; shadowBias: number; shadowNormalBias: number; shadowRadius: number },
+  light: { shadowMapSize: number; shadowCameraSize: number; shadowBias: number; shadowNormalBias: number; shadowRadius: number; shadowFollowCamera: boolean },
+  focus?: { x: number; y: number; z: number },
 ): void {
   const s = l.shadow;
   // Clamp to the tier's ceiling (#121 P3). `Light.shadowMapSize` is a per-light trait field with
@@ -670,6 +691,36 @@ function configureLightShadow(
     const c = light.shadowCameraSize || 16;
     const cam = s.camera as THREE.OrthographicCamera;
     cam.left = -c; cam.right = c; cam.top = c; cam.bottom = -c;
+
+    // Recentre the box on the view instead of leaving it anchored at the light's authored
+    // position (see shadowFollow.ts for the measured forest-camp footprint this fixes).
+    if (light.shadowFollowCamera && focus) {
+      // Capture the AUTHORED direction before moving anything — position/target for this
+      // frame were already synced by the caller (syncLights runs the world-transform block
+      // before calling here).
+      const dx = l.target.position.x - l.position.x;
+      const dy = l.target.position.y - l.position.y;
+      const dz = l.target.position.z - l.position.z;
+      const dirLen = Math.hypot(dx, dy, dz) || 1;
+      const d = { x: dx / dirLen, y: dy / dirLen, z: dz / dirLen };
+      // `size` (px) here is the TIER-CLAMPED map size computed above, not the authored one —
+      // the snap has to match the map that was actually allocated.
+      const center = snapShadowCenter({ focus, lightDir: d, size: c, mapSize: size });
+      l.target.position.set(center.x, center.y, center.z);
+      // For a directional light only the DIRECTION affects shading — moving position and
+      // target together along that same direction preserves it exactly, so this only moves
+      // the shadow camera, never the light's illumination.
+      const back = c * 2 + 10;
+      l.position.set(center.x - d.x * back, center.y - d.y * back, center.z - d.z * back);
+      // The pull-back has to fit INSIDE the depth range set above, and `far` up there is a flat
+      // 200 chosen when the camera sat at the light's authored position. Recentring puts the
+      // focus `back` away instead, so at shadowCameraSize >= 95 the focus lands at or beyond
+      // far=200 and EVERY shadow from this light silently disappears — a scene-scale box (an
+      // outdoor level authoring 100+) would have been broken by a feature that defaults to on.
+      // Widen rather than replace, so the common small-box case keeps its authored 200.
+      s.camera.far = Math.max(s.camera.far, back + c * 2);
+      l.target.updateMatrixWorld();
+    }
   }
   s.camera.updateProjectionMatrix();
 }
@@ -702,7 +753,12 @@ function lightMatchesType(l: THREE.Light, lightType: string): boolean {
 const _lightEuler = new THREE.Euler();
 const _lightForward = new THREE.Vector3();
 
-export function syncLights(world: World, scene: THREE.Scene, ecsLights: Map<number, THREE.Light>) {
+export function syncLights(
+  world: World,
+  scene: THREE.Scene,
+  ecsLights: Map<number, THREE.Light>,
+  focus?: { x: number; y: number; z: number },
+) {
   _activeLightIds.clear();
   _maskedLights.length = 0;
   world.query(Light).updateEach(([light], entity) => {
@@ -742,9 +798,6 @@ export function syncLights(world: World, scene: THREE.Scene, ecsLights: Map<numb
     l.intensity = light.intensity
       * (iblSuppressed && l instanceof THREE.AmbientLight ? tierAmbientBoost(getActiveTierOrDefault()) : 1);
     l.castShadow = light.castShadow;
-    if (light.castShadow && (l instanceof THREE.DirectionalLight || l instanceof THREE.SpotLight)) {
-      configureLightShadow(l, light);
-    }
     if (l instanceof THREE.PointLight || l instanceof THREE.SpotLight) {
       l.distance = light.distance;
     }
@@ -790,6 +843,31 @@ export function syncLights(world: World, scene: THREE.Scene, ecsLights: Map<numb
         }
         if (!l.target.parent) scene.add(l.target);
       }
+    }
+
+    // Shadow config runs AFTER the position/target sync above — a follow-recentre needs this
+    // frame's authored direction, not last frame's.
+    if (light.castShadow && (l instanceof THREE.DirectionalLight || l instanceof THREE.SpotLight)) {
+      // An authored follow TARGET beats the caller's view-derived focus: measured in
+      // demos/forest-camp, the derived ground point trails the character by 2.8-3.7 m (it grows
+      // while walking, since the camera lags and looks slightly ahead), which spends a quarter of
+      // the box's radius on empty ground. Centred on the subject instead, `shadowCameraSize` can
+      // be SMALLER for the same coverage around it — and texel size is 2*size/mapSize, so that is
+      // the cheapest sharpness available. Falls back to the view focus when unset or unresolvable
+      // (a stale guid must not silently pin the box at the world origin).
+      // Resolve the target ONLY when it can actually be used. `configureLightShadow` consumes
+      // `focus` inside its DirectionalLight branch and behind `shadowFollowCamera`, so without
+      // this gate every spot-light shadow — and every directional that opted OUT of follow —
+      // paid a guid lookup whose result is discarded. That matters because a STALE guid is not
+      // a cheap miss: `findEntityByGuid` self-heals by rescanning the whole world, and since the
+      // entity is genuinely gone the rescan repeats every frame, forever, silently (the fallback
+      // renders correctly, so only a profiler would ever show it). Same self-heal precedent as
+      // `syncBoneAttachments`, but that one only pays it per live BoneAttachment.
+      const wantsFollow = light.shadowFollowCamera && l instanceof THREE.DirectionalLight;
+      const targetFocus = wantsFollow && light.shadowFollowTarget
+        ? resolveShadowFocus(light.shadowFollowTarget, world)
+        : undefined;
+      configureLightShadow(l, light, targetFocus ?? focus);
     }
 
     // Rendering-layer mask (#136) — published for the renderable pass, which runs after this
@@ -925,6 +1003,18 @@ export interface RenderState {
   ecsMaterials: Map<number, string>;
   ecsColors: Map<number, number>;
   ecsSizes: Map<number, number>;
+  /** Last-applied shadow-flags composite key (`shadowFlagsKey`) per entity id, so
+   *  `applyShadowFlags` re-runs only when the authored castShadow/receiveShadow fields
+   *  actually change, not every frame (#183 — covers Renderable3D/Renderable3DPrimitive
+   *  AND SkinnedModel entities, keyed by the same entity id). */
+  ecsShadowFlags: Map<number, string>;
+  /** The SAME cache for the SKINNED pass, and deliberately a SEPARATE map: an entity may carry
+   *  a SkinnedModel AND a Renderable3D/Renderable3DPrimitive at once (nothing declares them
+   *  mutually exclusive), and the two passes own DIFFERENT THREE objects under the one entity
+   *  id. Sharing one map made each pass see the other's key, mismatch, and re-apply — a
+   *  permanent per-frame `traverse` of the whole rig that renders correctly and so is invisible,
+   *  which is exactly the cost this cache exists to avoid. */
+  skinnedShadowFlags: Map<number, string>;
   ownsGeometry: Set<number>;
   /** SkinnedModel entities — clone + mixer per entity id. */
   skinned: Map<number, SkinnedEntry>;
@@ -950,6 +1040,8 @@ export function createRenderState(emitLifecycle = false): RenderState {
     ecsMaterials: new Map(),
     ecsColors: new Map(),
     ecsSizes: new Map(),
+    ecsShadowFlags: new Map(),
+    skinnedShadowFlags: new Map(),
     ownsGeometry: new Set(),
     skinned: new Map(),
     billboards: new Map(),
@@ -999,6 +1091,7 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
       state.ecsObjects.delete(id);
       state.ecsSprites.delete(id);
       state.ecsMaterials.delete(id);
+      state.ecsShadowFlags.delete(id);
       state.ownsGeometry.delete(id);
     }
 
@@ -1015,6 +1108,7 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
       const entry = state.skinned.get(id);
       if (entry) disposeSkinnedEntry(entry, scene);
       state.skinned.delete(id);
+      state.skinnedShadowFlags.delete(id);
     }
   });
 }
@@ -1048,6 +1142,8 @@ export function disposeRenderState(
   state.ecsMaterials.clear();
   state.ecsColors.clear();
   state.ecsSizes.clear();
+  state.ecsShadowFlags.clear();
+  state.skinnedShadowFlags.clear();
   state.ownsGeometry.clear();
 }
 
@@ -1102,6 +1198,7 @@ function syncMaterial(
   isTinted = false,
   isInstanced = false,
   isMasked = false,
+  castMode: 'auto' | 'on' | 'off' = 'auto',
 ): void {
   const targets = materialTargetsOf(obj);
   const prevMat = state.ecsMaterials.get(id);
@@ -1119,7 +1216,9 @@ function syncMaterial(
         _ownedMaterials.delete(oldMat);
         oldMat.dispose();
       }
-      if (newMat) { t.material = newMat; t.castShadow = !newMat.transparent; }
+      // Only 'auto' re-derives cast from the new material's transparency — an explicit
+      // 'on'/'off' override (#183) must survive a material swap, not be clobbered here.
+      if (newMat) { t.material = newMat; if (castMode === 'auto') t.castShadow = !newMat.transparent; }
     }
   } else if (!isTinted && !isInstanced && !isMasked && curMat) {
     // .mat.json path unchanged but the async load may have finished since
@@ -1136,7 +1235,8 @@ function syncMaterial(
     if (resolved) {
       for (const t of targets) {
         if (t.material !== resolved) t.material = resolved;
-        t.castShadow = !resolved.transparent; // keep in sync even once the ref settles
+        // See the 'auto'-only guard above.
+        if (castMode === 'auto') t.castShadow = !resolved.transparent; // keep in sync even once the ref settles
       }
     }
   }
@@ -1354,13 +1454,17 @@ function buildNodes(root: THREE.Object3D): Map<string, NodeRender> {
  *  `.mat.json` guid; an unset slot restores the baked GLB material. Cheap on the
  *  steady state (rebinds only on change). A guid whose material hasn't finished
  *  loading is left baked and retried next frame. Exported + `resolve`-injectable
- *  for unit tests. No-op when the node isn't in this clone (stale node name). */
+ *  for unit tests. No-op when the node isn't in this clone (stale node name).
+ *  Returns whether any MATERIAL was rebound this call (visibility alone doesn't count) —
+ *  the caller uses that to re-derive `castShadow` for an `'auto'` rig, since a swapped-in
+ *  material can differ in transparency from the one the flags were derived from (#183). */
 export function syncNodeMaterials(
   node: NodeRender,
   overrides: Record<string, string> | undefined,
   visible: boolean,
   resolve: (guid: string) => THREE.Material | undefined = resolveMaterial,
-): void {
+): boolean {
+  let changed = false;
   if (node.visibleApplied !== visible) {
     for (const m of node.meshes) m.visible = visible;
     node.visibleApplied = visible;
@@ -1379,6 +1483,7 @@ export function syncNodeMaterials(
         else (t.mesh.material as THREE.Material[])[t.index] = (baked as THREE.Material[])[t.index];
       }
       node.appliedOverrides.delete(slot);
+      changed = true;
       continue;
     }
     const mat = resolve(guid);
@@ -1388,7 +1493,9 @@ export function syncNodeMaterials(
       else (t.mesh.material as THREE.Material[])[t.index] = mat;
     }
     node.appliedOverrides.set(slot, guid);
+    changed = true;
   }
+  return changed;
 }
 
 /** Bind every `SkinnedMeshRenderer` entity to its rig root's clone: resolve the
@@ -1402,7 +1509,12 @@ function syncSkinnedMeshRenderers(world: World, state: RenderState): void {
     if (!entry) return; // rig not built yet, or renderer not a child of a rig root
     const node = entry.nodes.get(r.node);
     if (!node) return; // stale node name (model re-imported with different meshes)
-    syncNodeMaterials(node, r.materials, r.visible);
+    // A rebound material can differ in transparency from the one the rig's shadow flags were
+    // derived from, and this pass runs AFTER the SkinnedModel loop that applies them — so drop
+    // the cached key and let the next frame re-derive. Unconditional rather than 'auto'-only:
+    // re-applying an explicit 'on'/'off' just re-asserts the same value, and reaching the rig's
+    // mode from a child renderer entity would cost more than the one extra traverse it saves.
+    if (syncNodeMaterials(node, r.materials, r.visible)) state.skinnedShadowFlags.delete(parentId);
   });
 }
 
@@ -1619,6 +1731,9 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
     if (entry && (entry.modelRef !== sm.model || entry.libraryKey !== libKey)) {
       disposeSkinnedEntry(entry, scene);
       skinned.delete(id);
+      // A fresh clone is about to be built below, defaulting to no shadow (see the scene.add(root)
+      // comment) — force the next shadow-flags check to re-apply rather than reading a stale key.
+      state.skinnedShadowFlags.delete(id);
       entry = undefined;
     }
 
@@ -1654,6 +1769,13 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
       const bones = new Map<string, THREE.Bone>();
       root.traverse((o) => { if ((o as THREE.Bone).isBone) bones.set(o.name, o as THREE.Bone); });
       scene.add(root);
+      // #183 — this call was MISSING entirely: every rigged character kept THREE's defaults
+      // (castShadow false, receiveShadow false) and never cast OR received a shadow. A
+      // receiveShadow of false is the tell that this function never ran on a mesh — every
+      // OTHER renderer path (LOD/GLB/primitive, below) calls applyShadowFlags and none of
+      // them leaves receiveShadow false, since today's default is unconditional true.
+      applyShadowFlags(root, sm.castShadow, sm.receiveShadow);
+      state.skinnedShadowFlags.set(id, shadowFlagsKey(sm.castShadow, sm.receiveShadow));
       // Cache each ROOT bone's static wrapper prefix (clone-root → bone.parent), so the
       // bone bridge can read/write that bone's entity Transform in clone-root space (the
       // space the import authored it in — see SkinnedEntry.boneWrapperPrefix).
@@ -1679,6 +1801,16 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
 
     if (!entry) return;
     _activeSkinnedIds.add(id);
+
+    // Live-edit path: the clone above already got its shadow flags at creation — this only
+    // re-applies when the authored fields change on an EXISTING entry (#183).
+    {
+      const shadowKey = shadowFlagsKey(sm.castShadow, sm.receiveShadow);
+      if (state.skinnedShadowFlags.get(id) !== shadowKey) {
+        applyShadowFlags(entry.root, sm.castShadow, sm.receiveShadow);
+        state.skinnedShadowFlags.set(id, shadowKey);
+      }
+    }
 
     // Merge any newly-loaded library/animSet clips this frame (lazy + idempotent).
     // Before driveAnimator so a freshly-bound clip can be the requested one.
@@ -1727,6 +1859,7 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
     if (_activeSkinnedIds.has(id)) continue;
     disposeSkinnedEntry(entry, scene);
     skinned.delete(id);
+    state.skinnedShadowFlags.delete(id);
   }
 
   // Apply per-mesh materials + visibility from child SkinnedMeshRenderer entities.
@@ -2154,7 +2287,7 @@ export function syncBones(world: World, _scene: THREE.Scene, state: RenderState)
 }
 
 export function syncRenderables(world: World, scene: THREE.Scene, state: RenderState, callbacks?: SyncCallbacks) {
-  const { ecsObjects, ecsSprites, ecsMaterials, ecsColors, ecsSizes, ownsGeometry } = state;
+  const { ecsObjects, ecsSprites, ecsMaterials, ecsColors, ecsSizes, ecsShadowFlags, ownsGeometry } = state;
   _activeRenderIds.clear();
 
   // Rendering-layer light masks (#136). Publish the light set BEFORE the renderable loops so
@@ -2189,6 +2322,9 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       ecsObjects.delete(id);
       ecsSprites.delete(id);
       ownsGeometry.delete(id);
+      // A fresh THREE object is about to be built below, defaulting to no shadow — force the
+      // next applyShadowFlags check to re-apply rather than reading a stale "unchanged" key.
+      ecsShadowFlags.delete(id);
       obj = undefined;
     }
 
@@ -2203,7 +2339,6 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
           const mesh = new THREE.Mesh(lod.templates[i].geometry, material);
           lodObj.addLevel(mesh, lod.distances[i] ?? 0);
         }
-        applyShadowFlags(lodObj);
         scene.add(lodObj);
         ecsObjects.set(id, lodObj);
         ecsSprites.set(id, rend.mesh);
@@ -2213,12 +2348,21 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
         if (template) {
           const material = resolveMaterialForMesh(rend.material, rend.mesh) || template.material;
           const mesh = new THREE.Mesh(template.geometry, material);
-          applyShadowFlags(mesh);
           scene.add(mesh);
           ecsObjects.set(id, mesh);
           ecsSprites.set(id, rend.mesh);
           obj = mesh;
         }
+      }
+    }
+
+    // Shadow flags — apply on creation and re-apply only when the authored fields change
+    // (the ecsShadowFlags cache holds the last-applied key; #183).
+    if (obj) {
+      const shadowKey = shadowFlagsKey(rend.castShadow, rend.receiveShadow);
+      if (ecsShadowFlags.get(id) !== shadowKey) {
+        applyShadowFlags(obj, rend.castShadow, rend.receiveShadow);
+        ecsShadowFlags.set(id, shadowKey);
       }
     }
 
@@ -2229,7 +2373,7 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       // precedence over Tint — both would otherwise claim mesh.material and fight each frame.
       const tinted = !instanced && entity.has(Tint);
       const masked = maskNeedsVariant(rend.renderingLayerMask);
-      syncMaterial(obj, id, rend.material || '', state, tinted, instanced, masked);
+      syncMaterial(obj, id, rend.material || '', state, tinted, instanced, masked, rend.castShadow);
       // Per-entity Tint: bind a tinted clone of the resolved material. Passing
       // isTinted above stops syncMaterial from re-binding the base each frame, so
       // this block owns the material — the clone cache + `!==` guard then make it
@@ -2274,6 +2418,9 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       ecsColors.delete(id);
       ecsMaterials.delete(id);
       ecsSizes.delete(id);
+      // A fresh mesh is about to be built below, defaulting to no shadow — force the next
+      // applyShadowFlags check to re-apply rather than reading a stale "unchanged" key.
+      ecsShadowFlags.delete(id);
       ownsGeometry.delete(id);
       obj = undefined;
     }
@@ -2290,7 +2437,6 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
         const resolved = resolveMaterial(rend.material);
         if (resolved) (obj as THREE.Mesh).material = resolved;
       }
-      applyShadowFlags(obj);
       scene.add(obj);
       ecsObjects.set(id, obj);
       ecsSprites.set(id, rend.mesh);
@@ -2300,13 +2446,23 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       ownsGeometry.add(id);
     }
 
+    // Shadow flags — apply on creation and re-apply only when the authored fields change
+    // (the ecsShadowFlags cache holds the last-applied key; #183).
+    {
+      const shadowKey = shadowFlagsKey(rend.castShadow, rend.receiveShadow);
+      if (ecsShadowFlags.get(id) !== shadowKey) {
+        applyShadowFlags(obj, rend.castShadow, rend.receiveShadow);
+        ecsShadowFlags.set(id, shadowKey);
+      }
+    }
+
     // Material override — a .mat.json material GUID (empty = engine default).
     const instanced = isMaterialInstanced(entity);
     // Masks apply only to explicit-material primitives — see the trait's field comment: a
     // default-material primitive owns a per-entity material that the colour block below writes
     // into, and a shared (material, mask) variant would fight it.
     const masked = !!rend.material && maskNeedsVariant(rend.renderingLayerMask);
-    syncMaterial(obj as THREE.Mesh, id, rend.material || '', state, false, instanced, masked);
+    syncMaterial(obj as THREE.Mesh, id, rend.material || '', state, false, instanced, masked, rend.castShadow);
 
     // Update color when changed (only applies to the default material, not a .mat.json). A
     // single default-material primitive is NOT a supported MaterialInstance prop base (its
@@ -2347,6 +2503,7 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       ecsSprites.delete(id);
       ecsColors.delete(id);
       ecsMaterials.delete(id);
+      ecsShadowFlags.delete(id);
       ownsGeometry.delete(id);
     }
   }

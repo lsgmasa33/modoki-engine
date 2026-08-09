@@ -3595,7 +3595,9 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // (reuses the persistent preSyncLightIds Set — refilled, not reallocated).
       preSyncLightIds.clear();
       for (const id of ecsLights.keys()) preSyncLightIds.add(id);
-      syncLights(getCurrentWorld(), scene, ecsLights);
+      // A true look-at exists here (the orbit target) — use it rather than deriving a ground
+      // hit, unlike the runtime GameView which has no such concept (see Scene3D.tsx).
+      syncLights(getCurrentWorld(), scene, ecsLights, controls.target);
       // Editor-specific: light gizmo icons + shadow-frustum coverage box
       let sfShown = false; // first directional light with showShadowFrustum wins the (single) box
       if (lightMeta) {

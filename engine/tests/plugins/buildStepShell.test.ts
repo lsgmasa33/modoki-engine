@@ -1,12 +1,12 @@
-import { describe, it, expect } from 'vitest'
-import { execSync } from 'node:child_process'
+import { describe, it, expect, afterEach } from 'vitest'
+import { execSync, execFileSync } from 'node:child_process'
 import { resolveBuildStep, spawnBuildCommand, killBuildProcess, winKillTreeArgs, type BuildStep } from '../../plugins/buildStepShell'
 
 /**
  * Guards the W-6 cross-platform build-step branching WITHOUT spawning anything — the
  * pure `resolveBuildStep` decides which command string + env a step runs with on each
- * platform. (The actual spawn — bash on posix, cmd.exe on Windows — is validated on a
- * real Windows box; see the plan's Phase W checklist.)
+ * platform. (The actual spawn — bash on posix, cmd.exe on Windows — is covered by the two
+ * integration suites at the bottom of this file, one per platform.)
  */
 describe('buildStepShell — resolveBuildStep (platform branching)', () => {
   const baseEnv = { PATH: '/usr/bin', MODOKI_NODE: '/tc/node' } as NodeJS.ProcessEnv
@@ -110,7 +110,14 @@ describe.skipIf(process.platform === 'win32')('buildStepShell — killBuildProce
     // shell nor `sleep` can be killed by the SIGTERM. That is not a contrived shape: a build
     // tool holding a lock is exactly the thing that traps signals, and if the escalation were
     // broken the abort would silently leave the tree running forever while reporting success.
-    const proc = spawnBuildCommand('trap "" TERM; sleep 30', { cwd: process.cwd(), env: process.env })
+    //
+    // ⚠️ COMPOUND, not a bare `sleep 30` — and that is a PORTABILITY fix, not a style choice.
+    // bash 5 (ubuntu CI) exec-replaces itself with the last simple command of a `;` list, so
+    // `trap "" TERM; sleep 30` left NO grandchild and the premise assertion below failed with
+    // `expected 0 to be greater than 0`. bash 3.2 (macOS) lacks that optimization and forks,
+    // which is why this was green on every Mac and red on `ci/main` only. A TERM trap does not
+    // suppress the optimization — only EXIT/ERR traps do.
+    const proc = spawnBuildCommand(`trap "" TERM; ${COMPOUND}`, { cwd: process.cwd(), env: process.env })
     await settle()
     const kids = childrenOf(proc.pid!)
     expect(kids.length).toBeGreaterThan(0)
@@ -130,4 +137,106 @@ describe.skipIf(process.platform === 'win32')('buildStepShell — killBuildProce
     await new Promise((r) => proc.once('close', r))
     expect(() => killBuildProcess(proc)).not.toThrow()
   })
+})
+
+/**
+ * The Windows twin of the suite above (#182). It exists because the posix suite `skipIf`s
+ * itself here, so before this the only Windows coverage was `winKillTreeArgs` — a pure argv
+ * check that cannot see whether the tree actually dies.
+ *
+ * ⚠️ Windows is the WORSE case, and the shape differs enough that this is not a port:
+ *
+ *  - The command is SIMPLE (`ping`), not compound. On posix a simple command is the case bash
+ *    exec-replaces away, so there is no grandchild and nothing to orphan — which is why #176
+ *    was a three-step edge case there. Windows has no exec-replace: `spawn(cmd, {shell:true})`
+ *    is `cmd.exe /d /s /c "<command>"`, and cmd.exe launches the tool as a child and waits.
+ *    So EVERY step has the extra layer, simple or not.
+ *  - The CONTROL asserts something the posix control cannot: `close` FIRES while the tool is
+ *    still alive. `proc.kill()` does kill cmd.exe, so the step loop sees a completed step and
+ *    frees the build slot while `gradlew`/`java` runs on — orphaned, holding no slot, free to
+ *    race the retry. That is the hazard, not merely a leaked process.
+ *  - There is no escalation twin. `taskkill /T /F` has no graceful form to escalate FROM
+ *    (Node's `SIGTERM` on Windows is already a hard `TerminateProcess`), so the posix
+ *    `trap "" TERM` test has no meaning here.
+ *
+ * Measured on a real Windows box before this was written: 4/4 runs, control survivors 4/4,
+ * treatment survivors 0/4, parent dead in every control run.
+ */
+describe.runIf(process.platform === 'win32')('buildStepShell — killBuildProcess kills the whole tree on Windows (#182)', () => {
+  // A SIMPLE command on purpose — see the header. `ping -n 30` is the measured shape: it runs
+  // long enough to observe and needs no shell builtins.
+  const SIMPLE = 'ping -n 30 127.0.0.1'
+
+  // The same PowerShell queries the #182 step-1 measurement used, so the test exercises the
+  // mechanism through the same lens the manual run did.
+  const ps = (script: string): string => {
+    try { return execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8' }) }
+    catch { return '' }
+  }
+  const childrenOf = (pid: number): number[] =>
+    ps(`Get-CimInstance Win32_Process -Filter "ParentProcessId=${pid}" | Select-Object -ExpandProperty ProcessId`)
+      .split(/\s+/).filter(Boolean).map(Number)
+  // Batched into ONE powershell call: each invocation costs ~300-600ms, and polling per-pid
+  // would dominate the test's runtime.
+  const alivePids = (pids: number[]): number[] => {
+    if (pids.length === 0) return []
+    return ps(`Get-Process -Id ${pids.join(',')} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id`)
+      .split(/\s+/).filter(Boolean).map(Number)
+  }
+  const poll = async <T,>(fn: () => T, done: (v: T) => boolean, deadlineMs: number): Promise<T> => {
+    const stop = Date.now() + deadlineMs
+    let v = fn()
+    while (!done(v) && Date.now() < stop) {
+      await new Promise((r) => setTimeout(r, 250))
+      v = fn()
+    }
+    return v
+  }
+
+  // Every spawned tool pid, so a failing assertion cannot leave a 30s ping running.
+  const spawned: number[] = []
+  afterEach(() => {
+    for (const p of alivePids(spawned)) {
+      try { execFileSync('taskkill', ['/F', '/PID', String(p)], { stdio: 'ignore' }) } catch { /* gone */ }
+    }
+    spawned.length = 0
+  })
+
+  const spawnAndFindTool = async (): Promise<{ proc: ReturnType<typeof spawnBuildCommand>; kids: number[] }> => {
+    const proc = spawnBuildCommand(SIMPLE, { cwd: process.cwd(), env: process.env })
+    const kids = await poll(() => childrenOf(proc.pid!), (k) => k.length > 0, 5000)
+    spawned.push(...kids)
+    return { proc, kids }
+  }
+
+  it('CONTROL: a plain proc.kill() kills only cmd.exe, orphaning the tool underneath', async () => {
+    const { proc, kids } = await spawnAndFindTool()
+    expect(kids.length, 'cmd.exe should have launched PING.EXE as a child').toBeGreaterThan(0)
+
+    // Awaiting `close` is the load-bearing part: it is the exact signal the step loop treats as
+    // "this step finished". Asserting the tool is alive AFTER it fires is what proves the runner
+    // is lied to, rather than merely that a process leaked.
+    const closed = new Promise<void>((r) => proc.once('close', () => r()))
+    proc.kill() // the pre-#176 abort: signal the pid we spawned
+    await closed
+    await new Promise((r) => setTimeout(r, 500))
+
+    expect(alivePids(kids), 'the orphan this bug is about — still running after `close`').toEqual(kids)
+  }, 30_000)
+
+  it('killBuildProcess reaches the tool via taskkill /T', async () => {
+    const { proc, kids } = await spawnAndFindTool()
+    expect(kids.length).toBeGreaterThan(0)
+
+    killBuildProcess(proc)
+    // The win32 path is an ASYNC `execFile('taskkill', …)`, so poll rather than sleep a guess.
+    const survivors = await poll(() => alivePids(kids), (s) => s.length === 0, 8000)
+    expect(survivors, 'no survivors of the tree kill').toEqual([])
+  }, 30_000)
+
+  it('is a no-op on an already-exited child (never taskkills a REUSED pid)', async () => {
+    const proc = spawnBuildCommand('exit 0', { cwd: process.cwd(), env: process.env })
+    await new Promise((r) => proc.once('close', r))
+    expect(() => killBuildProcess(proc)).not.toThrow()
+  }, 30_000)
 })

@@ -28,13 +28,18 @@ beforeEach(() => {
 });
 
 /** A primitive-mesh stand-in: real-enough shape for applyTransform / dispose
- *  reaping. Fresh geometry + material per call so dispose() is per-instance. */
-function makeFakeMesh() {
+ *  reaping. Fresh geometry + material per call so dispose() is per-instance.
+ *  `transparent` seeds the material's transparency for the 'auto' shadow-cast tests
+ *  (#183) — castShadow/receiveShadow start false, THREE's own un-set defaults, so a
+ *  test can prove applyShadowFlags actually ran rather than reading a stale true. */
+function makeFakeMesh(transparent = false) {
   const mesh: Record<string, unknown> = {
     position: { set: vi.fn() }, rotation: { set: vi.fn() }, scale: { set: vi.fn() },
     geometry: { dispose: vi.fn() },
-    material: { color: { setHex: vi.fn() }, dispose: vi.fn(), map: undefined as unknown },
+    material: { color: { setHex: vi.fn() }, dispose: vi.fn(), map: undefined as unknown, transparent },
     isMesh: true,
+    castShadow: false,
+    receiveShadow: false,
   };
   // applyShadowFlags() walks the object graph — a single primitive is its own subtree.
   mesh.traverse = (cb: (o: unknown) => void) => cb(mesh);
@@ -56,9 +61,12 @@ async function setup() {
     acquireEnvironment: vi.fn(),
   }));
   // Each spawn gets its OWN mesh instance (so geometry/material dispose is per-entity).
+  // `nextMeshOpts.transparent` lets a test seed the NEXT created mesh's material
+  // transparency before triggering creation (#183 'auto' shadow-cast tests).
   const created: ReturnType<typeof makeFakeMesh>[] = [];
+  const nextMeshOpts = { transparent: false };
   vi.doMock('../../src/runtime/loaders/primitives', () => ({
-    createPrimitiveMesh: vi.fn(() => { const m = makeFakeMesh(); created.push(m); return m; }),
+    createPrimitiveMesh: vi.fn(() => { const m = makeFakeMesh(nextMeshOpts.transparent); created.push(m); return m; }),
   }));
   // isImagePath drives the inline-texture branch; default false, overridden per test.
   const isImagePath = vi.fn(() => false);
@@ -72,7 +80,7 @@ async function setup() {
   const sync = await import('../../src/runtime/rendering/scene3DSync');
   const mtc = await import('../../src/runtime/loaders/meshTemplateCache');
   const scene: any = { add: vi.fn(), remove: vi.fn() };
-  return { world: createWorld(), traits, sync, scene, created, isImagePath, mtc };
+  return { world: createWorld(), traits, sync, scene, created, isImagePath, mtc, nextMeshOpts };
 }
 
 describe('syncRenderables — populate (add path)', () => {
@@ -270,3 +278,107 @@ describe('syncRenderables — GLB mesh-ref swap (Renderable3D)', () => {
 // renderer references a `.mat.json` material only, never a texture directly
 // (textures live on the material). The refcounted inline-texture material cache
 // and its reap test went with it.
+
+describe('syncRenderables — shadow flags (#183)', () => {
+  it('default "auto" + transparent material → castShadow false', async () => {
+    const { world, traits, sync, scene, nextMeshOpts } = await setup();
+    const { Transform, Renderable3DPrimitive } = traits;
+    nextMeshOpts.transparent = true;
+    const id = world.spawn(
+      Transform(),
+      Renderable3DPrimitive({ mesh: 'cube', isVisible: true, castShadow: 'auto', receiveShadow: true }),
+    ).id();
+    const state = sync.createRenderState();
+
+    sync.syncRenderables(world, scene, state);
+
+    const mesh: any = state.ecsObjects.get(id);
+    expect(mesh.castShadow).toBe(false);
+    expect(mesh.receiveShadow).toBe(true);
+  });
+
+  it('default "auto" + opaque material → castShadow true', async () => {
+    const { world, traits, sync, scene } = await setup();
+    const { Transform, Renderable3DPrimitive } = traits;
+    const id = world.spawn(
+      Transform(),
+      Renderable3DPrimitive({ mesh: 'cube', isVisible: true, castShadow: 'auto', receiveShadow: true }),
+    ).id();
+    const state = sync.createRenderState();
+
+    sync.syncRenderables(world, scene, state);
+
+    const mesh: any = state.ecsObjects.get(id);
+    expect(mesh.castShadow).toBe(true);
+  });
+
+  it('explicit "on" with a transparent material → castShadow true (override beats the material rule)', async () => {
+    const { world, traits, sync, scene, nextMeshOpts } = await setup();
+    const { Transform, Renderable3DPrimitive } = traits;
+    nextMeshOpts.transparent = true;
+    const id = world.spawn(
+      Transform(),
+      Renderable3DPrimitive({ mesh: 'cube', isVisible: true, castShadow: 'on', receiveShadow: true }),
+    ).id();
+    const state = sync.createRenderState();
+
+    sync.syncRenderables(world, scene, state);
+
+    const mesh: any = state.ecsObjects.get(id);
+    expect(mesh.castShadow).toBe(true);
+  });
+
+  it('explicit "off" with an opaque material → castShadow false', async () => {
+    const { world, traits, sync, scene } = await setup();
+    const { Transform, Renderable3DPrimitive } = traits;
+    const id = world.spawn(
+      Transform(),
+      Renderable3DPrimitive({ mesh: 'cube', isVisible: true, castShadow: 'off', receiveShadow: true }),
+    ).id();
+    const state = sync.createRenderState();
+
+    sync.syncRenderables(world, scene, state);
+
+    const mesh: any = state.ecsObjects.get(id);
+    expect(mesh.castShadow).toBe(false);
+  });
+
+  it('receiveShadow: false is honoured', async () => {
+    const { world, traits, sync, scene } = await setup();
+    const { Transform, Renderable3DPrimitive } = traits;
+    const id = world.spawn(
+      Transform(),
+      Renderable3DPrimitive({ mesh: 'cube', isVisible: true, castShadow: 'auto', receiveShadow: false }),
+    ).id();
+    const state = sync.createRenderState();
+
+    sync.syncRenderables(world, scene, state);
+
+    const mesh: any = state.ecsObjects.get(id);
+    expect(mesh.receiveShadow).toBe(false);
+  });
+
+  it('re-applies when the authored castShadow/receiveShadow change between two frames (live-edit path)', async () => {
+    const { world, traits, sync, scene } = await setup();
+    const { Transform, Renderable3DPrimitive } = traits;
+    const e = world.spawn(
+      Transform(),
+      Renderable3DPrimitive({ mesh: 'cube', isVisible: true, castShadow: 'auto', receiveShadow: true }),
+    );
+    const id = e.id();
+    const state = sync.createRenderState();
+
+    sync.syncRenderables(world, scene, state);
+    const mesh: any = state.ecsObjects.get(id);
+    expect(mesh.castShadow).toBe(true);    // opaque default material → auto casts
+    expect(mesh.receiveShadow).toBe(true);
+
+    // Same mesh/size — no recreation — only the shadow fields change.
+    e.set(Renderable3DPrimitive, { castShadow: 'off', receiveShadow: false });
+    sync.syncRenderables(world, scene, state);
+
+    expect(state.ecsObjects.get(id)).toBe(mesh);   // proves this is a re-apply, not a rebuild
+    expect(mesh.castShadow).toBe(false);
+    expect(mesh.receiveShadow).toBe(false);
+  });
+});

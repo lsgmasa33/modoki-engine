@@ -68,7 +68,11 @@ async function setup() {
 }
 
 function makeMockMesh() {
-  return { position: { set: vi.fn() }, rotation: { set: vi.fn() }, scale: { set: vi.fn() }, material: null } as any;
+  const mesh: any = { position: { set: vi.fn() }, rotation: { set: vi.fn() }, scale: { set: vi.fn() }, material: null };
+  // #183 — applyShadowFlags now re-applies (not just at creation), so a pre-seeded stand-in
+  // needs `.traverse` like every real THREE.Object3D has. No `isMesh` → it's a no-op walk.
+  mesh.traverse = (cb: (o: unknown) => void) => cb(mesh);
+  return mesh;
 }
 
 describe('syncSceneRenderables3D — functional', () => {
