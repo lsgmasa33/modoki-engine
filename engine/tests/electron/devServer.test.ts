@@ -4,7 +4,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import net from 'node:net';
 import http from 'node:http';
-import { findFreePort, waitForServer } from '../../electron/devServer';
+import { findFreePort, waitForServer, needsWinTreeKill } from '../../electron/devServer';
 
 let occupied: net.Server | null = null;
 
@@ -156,5 +156,41 @@ describe('waitForServer — the foreign-server adoption guard (#67)', () => {
     // Nothing listening here at all — the pre-existing E7 fail-fast path.
     await expect(waitForServer('http://127.0.0.1:1/', 5000, () => true))
       .rejects.toThrow(/exited before becoming reachable/);
+  });
+});
+
+/**
+ * #185 — stopping Vite must take its BUILD TREE with it on Windows.
+ *
+ * `child.kill()` there is a TerminateProcess on the Vite pid ALONE: Vite runs no handler, so
+ * `buildStepShell`'s own shutdown hook never fires and an in-flight build's grandchildren are
+ * orphaned. Measured on the win clone — a `gradlew --no-daemon` JVM outlived a hard-killed parent
+ * by 60s+, while `taskkill /T` cleared the same tree in 1s.
+ *
+ * posix is deliberately NOT switched: a real SIGTERM there runs Vite's handlers, which reap the
+ * build children properly, and this process's group is Electron's own — signalling it would reach
+ * the wrong processes.
+ */
+describe('needsWinTreeKill — when stopping Vite needs a tree kill (#185)', () => {
+  const live = { pid: 4321, exitCode: null, signalCode: null };
+
+  it('is required on win32 for a live child', () => {
+    expect(needsWinTreeKill(live, 'win32')).toBe(true);
+  });
+
+  it('is NOT used on posix — a real signal there runs Vite handlers, which reap the children', () => {
+    expect(needsWinTreeKill(live, 'darwin')).toBe(false);
+    expect(needsWinTreeKill(live, 'linux')).toBe(false);
+  });
+
+  it('refuses a REAPED child — the pid may already belong to something else, and /T takes its tree', () => {
+    expect(needsWinTreeKill({ pid: 4321, exitCode: 0, signalCode: null }, 'win32')).toBe(false);
+    expect(needsWinTreeKill({ pid: 4321, exitCode: null, signalCode: 'SIGTERM' }, 'win32')).toBe(false);
+  });
+
+  it('refuses a null child or one that never got a pid (spawn failed before exec)', () => {
+    expect(needsWinTreeKill(null, 'win32')).toBe(false);
+    expect(needsWinTreeKill(undefined, 'win32')).toBe(false);
+    expect(needsWinTreeKill({ pid: undefined, exitCode: null, signalCode: null }, 'win32')).toBe(false);
   });
 });

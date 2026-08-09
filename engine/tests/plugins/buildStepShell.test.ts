@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest'
 import { execSync, execFileSync } from 'node:child_process'
-import { resolveBuildStep, spawnBuildCommand, killBuildProcess, winKillTreeArgs, type BuildStep } from '../../plugins/buildStepShell'
+import { resolveBuildStep, spawnBuildCommand, killBuildProcess, killBuildProcessSync, winKillTreeArgs, type BuildStep } from '../../plugins/buildStepShell'
 
 /**
  * Guards the W-6 cross-platform build-step branching WITHOUT spawning anything — the
@@ -162,31 +162,18 @@ describe.skipIf(process.platform === 'win32')('buildStepShell — killBuildProce
  * Measured on a real Windows box before this was written: 4/4 runs, control survivors 4/4,
  * treatment survivors 0/4, parent dead in every control run.
  *
- * ⚠️ REAL BOX ONLY — this suite is gated off CI, and the gate is evidence-based, not a dodge.
- * On the GitHub `windows-latest` runner the CONTROL fails: it FINDS a child of cmd.exe, then
- * finds it gone after `close` + 500ms ("expected [] to deeply equal [ 1292 ]", then [ 840 ]).
- * Something there reaps the tool when its parent dies, and the runner disagrees with the
- * hand-measured 4/4 above on identical code.
- *
- * What that costs is not just a red build: if the tool dies on CI regardless of the kill, the
- * TREATMENT case passes for the wrong reason — it was asserting "no survivors" against a child
- * that was already dead. So on that runner this suite was proving nothing about `taskkill /T`
- * while looking green. Gating it is what stops it vouching for coverage it does not have.
- *
- * DISPROVED (ci/main 31287701127): "ping writes to a pipe node owns, `proc.kill()` breaks the
- * pipe, ping dies on the next write." Redirecting the tool's output to `NUL` removes that
- * dependency entirely and the control failed identically. Not the mechanism.
- *
- * STILL OPEN, for whoever picks this up ON A WINDOWS BOX (#182) — all three need a debugger on
- * the runner, none can be settled from a Mac:
- *   1. libuv puts spawned children in a Job Object; something about the runner's job config may
- *      reap the tree when cmd.exe exits.
- *   2. `childrenOf` may be capturing a TRANSIENT child (conhost.exe, a nested cmd.exe) rather
- *      than PING.EXE — a pid that was always going to exit on its own. Filtering by image name
- *      would settle this one, and is the cheapest of the three to try.
- *   3. The runner's session/console teardown differs from an interactive box.
+ * ⚠️ DO NOT re-await `close` in the CONTROL below (#184). The first version did, and it was
+ * unsatisfiable BY CONSTRUCTION rather than merely flaky: the orphan inherits cmd.exe's stdio
+ * pipes, so `close` cannot fire until the orphan is dead — the thing being asserted alive was
+ * always already gone. It failed on `ci/main` twice (31287242205, 31287701127) with the tool
+ * found and then missing, and cost two hypothesis-driven "fixes" from a Mac before a real box
+ * measured it: `exit` at +6ms with the tool running, `close` at +27593ms with it dead. One of
+ * those attempts is worth recording as DISPROVED, since it is the theory anyone re-reading this
+ * will reach for first — "ping dies writing to a pipe node tore down" — redirecting its output
+ * to `NUL` changed nothing, because stderr stays piped either way and the wait was never about
+ * ping's writes at all.
  */
-describe.runIf(process.platform === 'win32' && !process.env.CI)('buildStepShell — killBuildProcess kills the whole tree on Windows (#182)', () => {
+describe.runIf(process.platform === 'win32')('buildStepShell — killBuildProcess kills the whole tree on Windows (#182)', () => {
   // A SIMPLE command on purpose — see the header. `ping -n 30` is the measured shape: it runs
   // long enough to observe and needs no shell builtins.
   const SIMPLE = 'ping -n 30 127.0.0.1'
@@ -237,15 +224,49 @@ describe.runIf(process.platform === 'win32' && !process.env.CI)('buildStepShell 
     const { proc, kids } = await spawnAndFindTool()
     expect(kids.length, 'cmd.exe should have launched PING.EXE as a child').toBeGreaterThan(0)
 
-    // Awaiting `close` is the load-bearing part: it is the exact signal the step loop treats as
-    // "this step finished". Asserting the tool is alive AFTER it fires is what proves the runner
-    // is lied to, rather than merely that a process leaked.
-    const closed = new Promise<void>((r) => proc.once('close', () => r()))
+    // `exit` — NOT `close`. `exit` fires when cmd.exe itself dies, which is the moment that proves
+    // the signal landed on the shell and not on the tool. (This assertion was originally written
+    // against `close` and was unsatisfiable by construction: the orphan INHERITS the stdio pipes,
+    // so `close` cannot fire until the orphan is dead, and the thing being asserted alive was
+    // therefore always gone. See the sibling test below, which pins that half. #184)
+    const exited = new Promise<void>((r) => proc.once('exit', () => r()))
     proc.kill() // the pre-#176 abort: signal the pid we spawned
-    await closed
-    await new Promise((r) => setTimeout(r, 500))
+    await exited
 
-    expect(alivePids(kids), 'the orphan this bug is about — still running after `close`').toEqual(kids)
+    expect(alivePids(kids), 'the orphan this bug is about — still running after `exit`').toEqual(kids)
+  }, 30_000)
+
+  it('CONTROL: `close` is DEFERRED until the orphan dies, because it inherited the stdio pipes', async () => {
+    // The other half of the hazard, and the one that says what the pre-#176 symptom actually WAS.
+    // The step loop resolves a step on `proc.on('close')` (vite-asset-scanner.ts), and the orphan
+    // holds those pipes open — so an aborted build did not free the slot early and race a retry
+    // (the original framing). It HUNG, holding the slot for the tool's full natural runtime.
+    //
+    // We CHOOSE when the orphan dies rather than waiting out a fixed `ping -n N`. That makes the
+    // causal claim exact — `close` fires because the orphan died, not merely after it — and it
+    // removes the timing race: an earlier version asserted the exit->close gap exceeded a
+    // threshold, which held in isolation and failed at 871ms under full-suite load, because the
+    // gap was really just "however much of the ping was left after child discovery".
+    const { proc, kids } = await spawnAndFindTool()
+    expect(kids.length).toBeGreaterThan(0)
+
+    let closeFired = false
+    const closed = new Promise<void>((r) => { proc.once('close', () => { closeFired = true; r() }) })
+    const exited = new Promise<void>((r) => proc.once('exit', () => r()))
+
+    proc.kill()
+    await exited
+    await new Promise((r) => setTimeout(r, 750))
+
+    // The load-bearing assertion: cmd.exe is gone, yet `close` has NOT fired — because the orphan
+    // still holds the pipes. This is the step loop being left hanging.
+    expect(alivePids(kids), 'the orphan is still running').toEqual(kids)
+    expect(closeFired, '`close` must NOT fire while the orphan holds the inherited pipes').toBe(false)
+
+    // Now kill the orphan — and only now can `close` arrive.
+    for (const k of kids) { try { execFileSync('taskkill', ['/F', '/PID', String(k)], { stdio: 'ignore' }) } catch { /* gone */ } }
+    await closed
+    expect(closeFired).toBe(true)
   }, 30_000)
 
   it('killBuildProcess reaches the tool via taskkill /T', async () => {
@@ -262,5 +283,32 @@ describe.runIf(process.platform === 'win32' && !process.env.CI)('buildStepShell 
     const proc = spawnBuildCommand('exit 0', { cwd: process.cwd(), env: process.env })
     await new Promise((r) => proc.once('close', r))
     expect(() => killBuildProcess(proc)).not.toThrow()
+  }, 30_000)
+
+  it('killBuildProcessSync reaps the tree from the `exit` hook — the path that used to skip win32 (#185)', async () => {
+    // `ping` is the deliberate stand-in, not a convenience. The shutdown hole hid because every
+    // real step is a node process that dies of EPIPE when the backend's pipe breaks; `ping` and a
+    // gradle JVM both IGNORE that failed write, so they are the cell that actually orphans.
+    // Measured on the win box: two `gradlew --no-daemon` JVMs outlived a hard-killed parent by
+    // 60s+, and `taskkill /T` cleared the same tree in 1s.
+    const { proc, kids } = await spawnAndFindTool()
+    expect(kids.length).toBeGreaterThan(0)
+
+    killBuildProcessSync(proc)
+
+    // ⚠️ Poll, do NOT assert immediately. What is synchronous here is ISSUING the kill — which is
+    // the whole contract an `exit` handler needs, since it cannot await an execFile. The OS reap is
+    // not: `taskkill /F` calls TerminateProcess, which *initiates* termination and returns, so the
+    // target can still appear in Get-Process for a few ms afterwards. An earlier draft asserted
+    // `toEqual([])` on the next line; it passed in isolation and was a load-dependent flake of
+    // exactly the kind this suite already hit at 871ms.
+    const survivors = await poll(() => alivePids(kids), (s) => s.length === 0, 8000)
+    expect(survivors, 'the sync kill reaps the whole tree').toEqual([])
+  }, 30_000)
+
+  it('killBuildProcessSync is a no-op on an already-exited child', async () => {
+    const proc = spawnBuildCommand('exit 0', { cwd: process.cwd(), env: process.env })
+    await new Promise((r) => proc.once('close', r))
+    expect(() => killBuildProcessSync(proc)).not.toThrow()
   }, 30_000)
 })

@@ -199,29 +199,56 @@ mid-write leaves a lock file or a torn artifact for the next build to trip over.
 
 Windows takes the other road: no `detached` (there it allocates a new **console**, which the GUI
 editor would flash per step) and `taskkill /T /F /PID <pid>`, which walks the tree by parent pid.
-That path was validated by hand on a real Windows box (#182 — 4/4 runs, the tool orphaned in
-every control run and reaped in every treatment run), and `buildStepShell.test.ts` carries a
-Windows suite that pins it.
+**Validated on a real Windows box (#182)**, and the premise turned out to be worse there than on
+posix: `spawn(cmd, {shell:true})` is `cmd.exe /d /s /c "<command>"`, and Windows has no
+exec-replace, so **every** step carries the extra `cmd.exe` layer — where on posix only the three
+compound steps did. Measured: aborting a real build killed a 5-process, 4-level tree
+(`cmd.exe` → `node build-web.mjs` → `cmd.exe` → `tsc`) in **350ms**, against an **11175ms**
+uninterrupted lifetime in the control run. No console window ever appeared (`MainWindowHandle` 0
+for all 7 processes across 11 samples of a full build).
 
-⚠️ **That suite is gated off CI, and the gate is a finding, not a convenience.** On the GitHub
-`windows-latest` runner its CONTROL fails: it finds a child of cmd.exe, then finds it gone after
-`close`. Something on that runner reaps the tool when its parent dies, which the hand-measured
-box does not do. The cost is subtler than a red build — if the tool dies there regardless of the
-kill, the treatment case passes for the wrong reason, so the suite was proving nothing about
-`taskkill /T` while looking green. One theory is already disproved (a broken stdout pipe killing
-`ping`: redirecting to `NUL` changed nothing). **The mechanism is still unknown and needs a
-debugger on a Windows box** — the surviving theories are listed above the suite.
+⚠️ **One residual hole, and one that was closed by measuring it (#185):**
 
-⚠️ **Two residual holes, both about a handler that never runs:**
+- **A SIGKILL'd backend** executes no hook and orphans whatever was mid-step. A process that is
+  not allowed to run code cannot clean up, so this is not closable *in-process* — but it is
+  closable from the PARENT, and on Windows that is now done: `devServer.ts` force-kills its Vite
+  child with a `taskkill /T` tree kill rather than `child.kill()` (#185). There, `kill()` is a
+  `TerminateProcess` on the Vite pid alone — Vite runs no handler, this module's shutdown hook
+  never fires, and an in-flight build's grandchildren are orphaned. So **quitting the editor
+  mid-build** is covered; only main itself being SIGKILL'd is still open. posix is deliberately
+  unchanged: a real signal there runs Vite's handlers, which reap the build children properly.
+- **The graceful-exit hook used to skip Windows entirely — CLOSED (#185).** `process.on('exit')`
+  reaped posix children and took `if (e.platform === 'win32') continue`, commented "no synchronous
+  tree-kill on Windows". Both halves of that were wrong: `execFileSync('taskkill', …)` runs fine
+  inside an `exit` handler, and the gap was real. It now calls **`killBuildProcessSync`**, the
+  synchronous twin of `killBuildProcess`, on every platform.
 
-- **A SIGKILL'd backend** executes no hook and orphans whatever was mid-step. Unchanged by #176,
-  and not closable in-process.
-- **Quitting the editor mid-build orphans the tree on Windows.** `devServer.ts` stops its Vite with
-  `child.kill('SIGTERM')`, and on Windows Node has no signals — that is a `TerminateProcess`, so the
-  backend's `SIGTERM` handler never runs and never reaps the build children. On macOS/Linux the same
-  call delivers a real signal and the tree comes down with it. Also unchanged by #176 (nothing reaped
-  them there before either), but it is the reason the Windows story is weaker than the posix one, not
-  merely unvalidated. Reasoned from Node's documented Windows signal behaviour — **not measured**.
+  **Why it hid for so long is the part worth remembering.** Measured both shutdown paths on a real
+  build and the tree came down within ~900ms — which looked like proof the shutdown worked. It was
+  not. Every step here is a **node** process writing to the stdout pipe it inherited for the SSE
+  log, and node exits when that pipe breaks. A 4-cell probe isolates it: node+piped+writing **dies
+  in 718ms**; node+piped+silent **survives**; node+unpiped+writing **survives**; `ping`+piped
+  **survives**. The tools were covering for the shutdown path, so a *clean* observation was
+  measuring the wrong mechanism.
+
+  A JVM's `PrintStream` swallows the failed write, which puts `gradle` in the `ping` row. Measured
+  with the real step (`android\gradlew.bat -p android assembleDebug --no-daemon`):
+
+  | scenario | gradle JVMs |
+  |---|---|
+  | parent hard-killed, nothing reaping | **2 alive at +62s** |
+  | `taskkill /T` on the tree (the abort path) | both gone in **1s** |
+  | graceful exit, hook as shipped | **2 alive** 6s later |
+  | graceful exit, hook fixed | **0** |
+
+  General lesson: when a guard's success depends on the *tool* rather than the mechanism, a passing
+  observation is not evidence the mechanism works. Vary the tool, not just the input.
+
+  (Note for anyone repeating this on Windows: the toolchain is resolved through
+  `MODOKI_TOOLCHAIN_DIR`, **not** `JAVA_HOME`/`ANDROID_HOME` — those are empty on the `win` box even
+  though a pinned JDK 21 and a full Android SDK are installed. Probing the env vars, or `java` on
+  PATH, reports a false "no toolchain here". Ask the editor instead: `GET /api/toolchain` returns
+  each tool's resolved `path` and `source`.)
 
 **Known gap, deliberate:** the slot is per backend **process**, so two editor processes on one
 project (a packaged editor beside a dev one) are still unguarded. That needs a cross-process claim on

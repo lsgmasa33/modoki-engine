@@ -14,7 +14,7 @@
  * Aborting a build means killing the whole process TREE, not the shell we spawned — see
  * `killBuildProcess` for why a plain `proc.kill()` silently orphans the real work.
  */
-import { spawn, execFile } from 'child_process';
+import { spawn, execFile, execFileSync } from 'child_process';
 
 /** One build/scaffold step: a shell command run from `cwd`. `env` is merged over the
  *  shared build env (replaces bash `export`/`FOO=bar` prefixes). `winCmd` is a
@@ -124,6 +124,41 @@ export function killBuildProcess(
   proc.once('close', () => clearTimeout(escalate));
 }
 
+/**
+ * The synchronous twin of `killBuildProcess`, for the `exit` hook — which cannot await anything,
+ * so it cannot use the async `execFile`/escalation path.
+ *
+ * ⚠️ The win32 branch here used to be a bare `continue`, commented "no synchronous tree-kill on
+ * Windows". That was wrong twice over. `execFileSync('taskkill', …)` is perfectly usable inside an
+ * `exit` handler; and the gap it left was not theoretical — **measured (#185): two real
+ * `gradlew … --no-daemon` JVMs outlived their hard-killed parent by 60s+ with nothing reaping
+ * them, while `taskkill /T` cleared the same tree in 1s.**
+ *
+ * Why that hid for so long: every OTHER build step here is a `node` process writing to the stdout
+ * pipe it inherited for the SSE log, and node exits when that pipe breaks. So a web/playable build
+ * LOOKED like it came down cleanly on shutdown. It was the tool dying of EPIPE, not the shutdown
+ * path doing its job — a JVM's `PrintStream` swallows the failed write and keeps running. Measured
+ * both cells: node+piped+writing dies in 718ms; `ping`+piped survives indefinitely.
+ *
+ * Cost: `execFileSync` blocks the exit for as long as `taskkill` takes (~100ms), and only when a
+ * build is actually in flight. That is the right trade against leaking a gradle JVM.
+ */
+export function killBuildProcessSync(
+  proc: ReturnType<typeof spawn> | null | undefined,
+  opts: { platform?: NodeJS.Platform } = {},
+): void {
+  const platform = opts.platform ?? process.platform;
+  const pid = proc?.pid;
+  // Same reaped-pid guard as `killBuildProcess`, for the same reason: killing a REAPED pid shoots
+  // whatever unrelated process inherited the number, and killing a reaped GROUP/TREE multiplies it.
+  if (!proc || !pid || proc.exitCode !== null || proc.signalCode !== null) return;
+  if (platform === 'win32') {
+    try { execFileSync('taskkill', winKillTreeArgs(pid), { stdio: 'ignore' }); } catch { /* already gone */ }
+    return;
+  }
+  try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ }
+}
+
 /* ── Backend shutdown: don't let detaching CREATE an orphan path ──────────────────────
  * Detaching is not free. A child in the terminal's foreground group used to receive the
  * Ctrl-C that stops `npm run dev`; in its own group it no longer does. So the backend
@@ -147,16 +182,11 @@ function track(proc: ReturnType<typeof spawn>, platform: NodeJS.Platform): void 
   proc.once('error', () => live.delete(entry));
   if (shutdownHookInstalled) return;
   shutdownHookInstalled = true;
-  // `exit` handlers must be synchronous, so that path signals the group directly (SIGKILL,
-  // no grace, no escalation timer that would never fire). The signal paths can afford the
-  // ordinary graceful kill before re-raising.
+  // `exit` handlers must be synchronous, so this path kills outright (SIGKILL / `taskkill /T`,
+  // no grace, no escalation timer that would never fire) via `killBuildProcessSync`. The signal
+  // paths can afford the ordinary graceful kill before re-raising.
   process.on('exit', () => {
-    for (const e of live) {
-      const p = e.proc.pid;
-      if (!p || e.proc.exitCode !== null || e.proc.signalCode !== null) continue;
-      if (e.platform === 'win32') continue; // no synchronous tree-kill on Windows
-      try { process.kill(-p, 'SIGKILL'); } catch { /* gone */ }
-    }
+    for (const e of live) killBuildProcessSync(e.proc, { platform: e.platform });
   });
   // ⚠️ The delay is the point, and the first version of this did not have it: it SIGTERM'd with
   // `graceMs: 0` and called `process.exit` on the next line, so the `exit` hook's SIGKILL landed
