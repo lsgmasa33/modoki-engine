@@ -40,6 +40,7 @@
  *  starting low is the recoverable mistake. Calibration promotes anything with the headroom. */
 
 import { BUDGET_30FPS_MS, type FrameProfile } from '../core/frameProfiler';
+import type { DeviceClass } from './rampProbe';
 
 export type QualityTier = 'low' | 'high';
 /** What a PROJECT may ask for. `'auto'` delegates to the allowlist + calibration. */
@@ -49,7 +50,7 @@ export type QualityTierSetting = 'auto' | QualityTier;
 export const DEFAULT_TIER_SETTING: QualityTierSetting = 'auto';
 
 /** How a tier was arrived at — reported so a surprising tier is explainable without an eval. */
-export type TierSource = 'player' | 'project' | 'allowlist' | 'desktop' | 'calibrating' | 'measured';
+export type TierSource = 'player' | 'project' | 'allowlist' | 'model' | 'desktop' | 'calibrating' | 'measured';
 
 export interface TierResolution {
   tier: QualityTier;
@@ -169,20 +170,84 @@ export function applyTierToThree<T extends TierClampableThree>(three: T, tier: Q
   };
 }
 
-/** Devices known to be fine at `high`, so they skip calibration.
+/** Android devices known to be fine at `high`, so they skip calibration.
  *
- *  Keyed per platform because the two hide opposite things (see `deviceCaps`): iOS by hardware
- *  MODEL (`iPhone10,1` — the GPU string is masked), Android by GPU RENDERER string
- *  (`Adreno (TM) 610` — the model is ambiguous, one name can ship two GPUs).
+ *  ANDROID ONLY since 2026-08-09. It used to carry an `iosModels` list too, which was both empty
+ *  and dead in production (#146 — it read a plugin no project installs, so `deviceModel` was
+ *  always `undefined`); iOS now answers from the model id directly, via
+ *  {@link IOS_HIGH_TIER_MIN_GENERATION}, which is a threshold rather than a list and so cannot
+ *  go stale against hardware that does not exist yet.
+ *
+ *  Keyed by GPU RENDERER string (`Adreno (TM) 610`) because on Android the model name is
+ *  ambiguous — one name can ship two GPUs. See `deviceCaps`.
  *
  *  EMPTY ON PURPOSE — see the module header. Add an entry only after MEASURING that device. */
 export const TIER_ALLOWLIST: {
-  iosModels: readonly string[];
   androidGpuPatterns: readonly RegExp[];
 } = {
-  iosModels: [],
   androidGpuPatterns: [],
 };
+
+// ── iOS: the model id IS the tier (owner, 2026-08-09) ──────────────────────────────────────
+
+/** Lowest hardware GENERATION that gets `high`, per Apple device family.
+ *
+ *  ── WHY iOS GETS A TABLE AND ANDROID GETS A PROBE ─────────────────────────────────────────
+ *  Because the two platforms expose opposite things. Apple's hardware set is small, enumerable,
+ *  and — the property that actually matters — the generation is ENCODED IN THE IDENTIFIER, so
+ *  `iPhone10,1` sorts against `iPhone14,6` without a lookup. Android's only comparable signal is
+ *  the GPU renderer string, which is ambiguous (one name ships two GPUs), is already deprecated
+ *  in Firefox for fingerprinting, and is the model-keyed value this plan predicted would
+ *  ossify. So iOS answers statically and Android has to measure — see `rampProbe.ts`.
+ *
+ *  ── A THRESHOLD, NOT A LIST — AND THAT IS THE WHOLE POINT ─────────────────────────────────
+ *  An enumerated allowlist ossifies in the WORST direction: a phone that does not exist yet is
+ *  absent from it, so next year's hardware is classified `low` by a table written today. A
+ *  `>= N` rule cannot fail that way, because newer Apple silicon is only ever faster. This is
+ *  the same shortcut `TIER_ALLOWLIST` was reaching for, expressed so that being out of date
+ *  makes it conservative on OLD hardware rather than wrong on new.
+ *
+ *  ── WHY THE MAJOR NUMBER IS A SOC BOUNDARY, NOT JUST A YEAR ───────────────────────────────
+ *  It tracks the chip: `iPhone10,x` is A11 — and that covers the iPhone 8 AND the iPhone X, which
+ *  genuinely share the SoC, so grouping them is correct rather than a rounding error.
+ *  `iPhone11,x` is A12, `iPhone12,x` A13, and so on.
+ *
+ *  ⚠️ **`iPhone: 11` IS THE ONE GENUINELY UNMEASURED NUMBER HERE.** What is measured is the
+ *  floor: the iPhone 8 (`iPhone10,1`, A11) goes 27 ms -> 56 ms with NPR alone and misses the
+ *  33.3 ms budget, so A11 belongs on `low`. That A12 clears it is an INFERENCE. It errs in the
+ *  recoverable direction if wrong (see the module header: booting high and guessing wrong is a
+ *  lost context) and should be confirmed on real hardware.
+ *
+ *  ⚠️ **`iPad: 8` is a straight guess** — no iPad has been measured at all. iPad majors run on
+ *  their own sequence (`iPad11,x` is A12), so the iPhone number cannot be borrowed.
+ *
+ *  A family absent from this table resolves `null` and falls through to the normal path. */
+export const IOS_HIGH_TIER_MIN_GENERATION: Readonly<Record<string, number>> = {
+  iPhone: 11,
+  iPad: 8,
+  // iPod is deliberately absent: no iPod touch can run the iOS 16.4 floor, so any that appears
+  // is out of scope and should fall through rather than be classified by a number we invented.
+};
+
+/** `iPhone10,1` -> `{ family: 'iPhone', generation: 10 }`. `null` for anything unrecognised —
+ *  a masked, spoofed or simulator model string must not be coerced into a tier. */
+export function parseAppleModel(model: string): { family: string; generation: number } | null {
+  const m = /^([A-Za-z]+)(\d+),(\d+)$/.exec(model.trim());
+  if (!m) return null;
+  const generation = Number(m[2]);
+  return Number.isFinite(generation) ? { family: m[1], generation } : null;
+}
+
+/** The tier an iOS model id implies, or `null` when the id says nothing usable (unknown family,
+ *  unparseable string). Pure, and exported so the boundary is directly testable. */
+export function iosModelTier(model: string | undefined): QualityTier | null {
+  if (!model) return null;
+  const parsed = parseAppleModel(model);
+  if (!parsed) return null;
+  const min = IOS_HIGH_TIER_MIN_GENERATION[parsed.family];
+  if (min === undefined) return null;
+  return parsed.generation >= min ? 'high' : 'low';
+}
 
 /** Facts `resolveTier` needs. A subset of `DeviceCaps` so this stays pure and trivially
  *  testable — it takes data, not a probe. */
@@ -197,6 +262,10 @@ export interface TierResolveInput {
   /** Desktop-class host, or a handheld? Absent = treat as a handheld, which is the safe side
    *  (see `DeviceCaps.formFactor`). A probe that failed therefore lands on `low`, not `high`. */
   formFactor?: 'mobile' | 'desktop';
+  /** What the boot ramp probe measured, if it ran (#188). Absent means it did not run, could not
+   *  run, or produced nothing usable — all of which must land on today's behaviour, never on a
+   *  guess. See `rampProbe.ts`. */
+  probeClass?: DeviceClass;
 }
 
 /** Decide the starting tier. Pure.
@@ -214,9 +283,26 @@ export function resolveTier(input: TierResolveInput): TierResolution {
     return { tier: setting, source: 'project', reason: `project pinned qualityTier: '${setting}'` };
   }
 
-  if (input.platform === 'ios' && input.deviceModel
-      && TIER_ALLOWLIST.iosModels.includes(input.deviceModel)) {
-    return { tier: 'high', source: 'allowlist', reason: `${input.deviceModel} is allowlisted` };
+  // iOS answers from the model id and never measures — see IOS_HIGH_TIER_MIN_GENERATION for why
+  // that is sound here and is NOT sound on Android. It supersedes `TIER_ALLOWLIST.iosModels`,
+  // which was both empty and (per #146) dead in production: it read `@capacitor/device`, a plugin
+  // no Modoki project installs, so `deviceModel` was `undefined` on every real phone. That is
+  // fixed — the id now comes from the `GameDebug` bridge, which every debuggable build has.
+  //
+  // ⚠️ NATIVE ONLY. Mobile Safari has no such plugin and reports no model, so iOS WEB — which is
+  // how every published demo ships — falls straight through this branch to the measured path.
+  if (input.platform === 'ios') {
+    const modelTier = iosModelTier(input.deviceModel);
+    if (modelTier) {
+      const gen = parseAppleModel(input.deviceModel!)!;
+      const floor = IOS_HIGH_TIER_MIN_GENERATION[gen.family];
+      return {
+        tier: modelTier,
+        source: 'model',
+        reason: `${input.deviceModel} is ${gen.family} generation ${gen.generation}, `
+          + `${modelTier === 'high' ? 'at or past' : 'below'} the high-tier floor of ${floor}`,
+      };
+    }
   }
   if (input.gpuRenderer
       && TIER_ALLOWLIST.androidGpuPatterns.some((re) => re.test(input.gpuRenderer!))) {
@@ -230,6 +316,20 @@ export function resolveTier(input: TierResolveInput): TierResolution {
   // demos' whole mobile-web audience the tier that bricked the Y6.
   if (input.formFactor === 'desktop') {
     return { tier: 'high', source: 'desktop', reason: 'desktop-class host — not the hardware the low default guards' };
+  }
+
+  // The boot ramp probe (#188), if it ran. It sits BELOW the desktop carve-out deliberately —
+  // a desktop already has its answer and there is no reason to pay a launch-blocking probe in
+  // the editor — and below the iOS model id, which answers statically and for free.
+  //
+  // Only `'capable'` promotes. `'weak'` and `'unknown'` both land on `low`, but they are not the
+  // same statement and the reason says which: `weak` is a measurement, `unknown` is the absence
+  // of one. Conflating them would make an inert probe indistinguishable from a probe that ran.
+  if (input.probeClass === 'capable') {
+    return { tier: 'high', source: 'measured', reason: 'boot ramp probe measured this device as capable' };
+  }
+  if (input.probeClass === 'weak') {
+    return { tier: 'low', source: 'measured', reason: 'boot ramp probe measured this device as weak' };
   }
 
   // Unknown hardware: start conservative and let measurement promote. Booting high and being

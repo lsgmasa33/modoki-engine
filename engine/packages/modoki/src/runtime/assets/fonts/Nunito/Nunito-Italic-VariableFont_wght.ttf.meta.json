@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "font": {
+    "fieldType": "mtsdf",
+    "size": 128,
+    "pxRange": 8,
+    "charset": "ascii",
+    "atlasMax": 2048,
+    "mode": "dynamic",
+    "shipSource": "auto",
+    "variationAxes": {
+      "wght": 400
+    }
+  },
+  "id": "cfeba289-2bb6-4e75-a5af-96e503be82d0"
+}

@@ -115,3 +115,30 @@ describe('getFontTexturePixi — concurrent renderers', () => {
     warn.mockRestore();
   });
 });
+
+/** Page 0's IMAGE texture must survive glyph generation.
+ *
+ *  A baked-seeded dynamic font bumps `atlasVersion` on every generated batch while serving page 0
+ *  as the baked atlas IMAGE. Keyed by version, each batch minted a new cache key: the lookup
+ *  missed, the getter returned null while re-loading the SAME url, and every baked glyph vanished
+ *  for those frames — typing CJK made the Latin text flicker, and the superseded Texture leaked
+ *  until the font was released. Counting loads is the assertion: one url, one load, forever. */
+describe('the baked page-0 image is cached independently of atlasVersion', () => {
+  beforeEach(() => { loadCalls = 0; loadPixiTexture.mockClear(); });
+  it('does not re-load the image when a generation bumps the version', async () => {
+    const p = provider('hybrid') as unknown as { atlasVersion: number };
+    const wake = vi.fn();
+    expect(getFontTexturePixi(p as never, 0, wake)).toBeNull();  // starts exactly one load
+    expect(loadCalls).toBe(1);
+
+    const tex = fakeTexture();
+    resolveLoad(tex);
+    await vi.waitFor(() => expect(wake).toHaveBeenCalled());
+    expect(getFontTexturePixi(p as never, 0)).toBe(tex);
+
+    // A glyph batch lands: the generated CANVAS pages changed; the baked image did not.
+    p.atlasVersion = 7;
+    expect(getFontTexturePixi(p as never, 0), 'the baked image must still be cached').toBe(tex);
+    expect(loadCalls, 'a version bump must not re-fetch the immutable baked atlas').toBe(1);
+  });
+});

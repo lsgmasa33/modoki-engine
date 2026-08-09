@@ -20,7 +20,7 @@ import {
   roundPixelsBit, roundPixelsBitGl,
 } from 'pixi.js';
 import type { MtsdfStyle } from './mtsdfStyle';
-import { GLOW_MAX_SPREAD, OUTLINE_MAX_SPREAD } from './mtsdfStyle';
+import { GLOW_MAX_SPREAD, OUTLINE_MAX_SPREAD, clampShadowOffset } from './mtsdfStyle';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -72,7 +72,14 @@ function mtsdfBody(lang: 'wgsl' | 'glsl'): string {
   return `
     ${d(v4)}s = ${sample};
     ${d(f)}rawSd = ${median('s')};
-    ${d(f)}asd = s.a;
+    // The "soft-effect" distance. On an MTSDF atlas that is the alpha channel's true SDF.
+    // On a 3-CHANNEL MSDF atlas there is no alpha SDF — the texture samples a==1 EVERYWHERE
+    // — so reading it made smoothstep(.., asd) saturate over the whole quad: glow and soft
+    // shadow became solid rectangles, and clashUp = max(0, 1 - rawSd) dilated the fill at
+    // every edge. fieldType 'msdf' was offered in the Font Inspector the whole time.
+    // Falling back to the median is exactly what the DYNAMIC path already does (it
+    // synthesizes alpha = median(RGB)), so all three paths now share one behaviour.
+    ${d(f)}asd = ${mix}(rawSd, s.a, ${M}uHasTrueSdf);
     // mtsdf corner-clash correction. At acute corners the fill/outline MEDIAN nicks
     // BELOW the true-SDF alpha (median < alpha) — pull it UP to the alpha there. Gate
     // on the median being at/inside the edge (insideGate) so tight COUNTERS — where
@@ -110,12 +117,27 @@ ${gpu ? `    ${d(v2)}screenTexSize = ${v2}(${F(1)}) / fwidth(vUV);
     ${d(v3, true)}rgb = ${M}uTextColor.rgb;
     ${d(f, true)}alpha = ${M}uTextColor.a * fill;
 
-    // ── OUTLINE (median, masked so width 0 = off): fill OVER outline. The inner
-    // threshold is FLOORED at the field budget (0.5 - OUTLINE_MAX_SPREAD) so a
-    // positive weight (which lowers 'edge') can't push the band past the field's
-    // outer saturation and flood the glyph quad (the black-rect bug).
+    // ── OUTLINE (median, masked so width 0 = off): fill OVER outline.
+    //
+    // The inner threshold is floored TWICE, and the second floor is the load-bearing one:
+    //   · the static field budget (0.5 - OUTLINE_MAX_SPREAD), so a positive weight (which
+    //     lowers 'edge') can't push the band past the field's outer saturation; and
+    //   · 0.5/spr, which is what actually stops the black-rect bug.
+    //
+    // Why the constant alone was not enough: a far-OUTSIDE texel has sd ~ 0, so its
+    // outline coverage is clamp((0 - outlineLo)*spr + 0.5) = 0.5 - outlineLo*spr. That is
+    // zero only when outlineLo >= 0.5/spr. At the shipped floor of 0.1 it needs spr >= 5 —
+    // true when text is large on screen, FALSE as soon as it is scaled down, where every
+    // texel of the quad picks up constant coverage and the glyph gets a filled rectangle
+    // behind it. It reproduced as "fine in the Scene panel, box in the Game panel": same
+    // data, same shader, different on-screen size (measured — see #189).
+    //
+    // 0.5/spr equals 0.1 exactly at spr 5, so this generalizes the old constant rather
+    // than replacing it: unchanged where it was already correct, and it shrinks the band
+    // toward nothing at small sizes instead of flooding the quad. An outline the raster
+    // cannot resolve should vanish, not become a rectangle.
     ${d(f)}outlineMask = step(${F(0.00001)}, ${M}uOutlineWidth);
-    ${d(f)}outlineLo = max(edge - ${M}uOutlineWidth, ${F(0.5 - OUTLINE_MAX_SPREAD)});
+    ${d(f)}outlineLo = max(edge - ${M}uOutlineWidth, max(${F(0.5 - OUTLINE_MAX_SPREAD)}, ${F(0.5)} / spr));
     ${d(f)}outline = clamp((sd - outlineLo) * spr + ${F(0.5)}, ${F(0)}, ${F(1)});
     ${d(f)}oa = ${M}uOutlineColor.a * outline * outlineMask;
     ${d(f)}cA = alpha + oa * (${F(1)} - alpha);
@@ -138,7 +160,7 @@ ${gpu ? `    ${d(v2)}screenTexSize = ${v2}(${F(1)}) / fwidth(vUV);
     ${d(f)}shadowMask = step(${F(0.00001)}, ${M}uShadowColor.a);
     ${d(v4)}shTex = ${shSample};
     ${d(f)}shCrisp = clamp(${median('shTex')} * spr - (edge * spr) + ${F(0.5)}, ${F(0)}, ${F(1)});
-    ${d(f)}shSoft = smoothstep(edge - ${M}uShadowSoftness, edge, shTex.a);
+    ${d(f)}shSoft = smoothstep(edge - ${M}uShadowSoftness, edge, ${mix}(${median('shTex')}, shTex.a, ${M}uHasTrueSdf));
     ${d(f)}shCov = ${mix}(shCrisp, shSoft, step(${F(0.00001)}, ${M}uShadowSoftness));
     ${d(f)}shadowA = ${M}uShadowColor.a * shCov * shadowMask;
 
@@ -184,6 +206,7 @@ const mtsdfBit = {
         uShadowSoftness: f32,
         uDistanceRange: f32,
         uScreenPxRange: f32,
+        uHasTrueSdf: f32,
       };
       @group(3) @binding(0) var<uniform> mtsdfUniforms: MtsdfUniforms;
     `,
@@ -215,6 +238,8 @@ const mtsdfBitGl = {
       uniform float uDistanceRange;
       // Only READ on the no-derivatives path; declared always so the std140 layout mirrors WGSL.
       uniform float uScreenPxRange;
+      // 1 on an mtsdf atlas (alpha carries a true SDF), 0 on a 3-channel msdf one.
+      uniform float uHasTrueSdf;
     `,
     main: mtsdfBody('glsl'),
   },
@@ -227,13 +252,19 @@ const mtsdfBitGl = {
 function toColorVec(hex: number, a: number): Float32Array {
   return new Float32Array([((hex >> 16) & 255) / 255, ((hex >> 8) & 255) / 255, (hex & 255) / 255, a]);
 }
-function mtsdfUniformValues(style: MtsdfStyle, atlasW: number, atlasH: number, distanceRange: number, atlasSize: number, fontSize: number) {
+function mtsdfUniformValues(style: MtsdfStyle, atlasW: number, atlasH: number, distanceRange: number, atlasSize: number, fontSize: number, hasTrueSdf: boolean) {
   return {
     uTextColor: { value: toColorVec(style.color >>> 0, style.opacity ?? 1), type: 'vec4<f32>' },
     uOutlineColor: { value: toColorVec((style.outlineColor ?? 0) >>> 0, style.outlineOpacity ?? 1), type: 'vec4<f32>' },
     uGlowColor: { value: toColorVec((style.glowColor ?? 0) >>> 0, 1), type: 'vec4<f32>' },
     uShadowColor: { value: toColorVec((style.shadowColor ?? 0) >>> 0, style.shadowOpacity ?? 0), type: 'vec4<f32>' },
-    uShadowOffset: { value: new Float32Array([(style.shadowOffsetX ?? 0) * atlasSize / atlasW, (style.shadowOffsetY ?? 0) * atlasSize / atlasH]), type: 'vec2<f32>' },
+    // Clamped to the atlas padding — past it the offset sample reads the NEIGHBOURING
+    // glyph (or, off the atlas edge, a clamp-to-edge band): garbage, silently. See
+    // maxShadowOffsetEm.
+    uShadowOffset: { value: new Float32Array([
+      clampShadowOffset(style.shadowOffsetX ?? 0, distanceRange, atlasSize) * atlasSize / atlasW,
+      clampShadowOffset(style.shadowOffsetY ?? 0, distanceRange, atlasSize) * atlasSize / atlasH,
+    ]), type: 'vec2<f32>' },
     uTexSize: { value: new Float32Array([atlasW, atlasH]), type: 'vec2<f32>' },
     uWeight: { value: Math.max(0, style.weight ?? 0), type: 'f32' }, // negative disabled (nicks corners)
     uOutlineWidth: { value: (style.outlineWidth ?? 0) * OUTLINE_MAX_SPREAD, type: 'f32' },
@@ -246,6 +277,8 @@ function mtsdfUniformValues(style: MtsdfStyle, atlasW: number, atlasH: number, d
     // which errs toward a crisper edge rather than a blurry one. Anything is an improvement on
     // the alternative, which is a shader that does not compile and text that does not exist.
     uScreenPxRange: { value: Math.max(1, (fontSize / Math.max(1, atlasSize)) * distanceRange), type: 'f32' },
+    // Atlas-derived, not style-derived — so updateMtsdfPixiStyle leaves it alone.
+    uHasTrueSdf: { value: hasTrueSdf ? 1 : 0, type: 'f32' },
   };
 }
 
@@ -289,7 +322,17 @@ function withDerivativesExtension<T extends { fragment?: string; vertex?: string
 
 /** The atlas geometry a shader is built against — needed to re-derive the shadow
  *  UV offset when the style changes. */
-export interface MtsdfPixiAtlas { width: number; height: number; distanceRange: number; size: number }
+export interface MtsdfPixiAtlas {
+  width: number; height: number; distanceRange: number; size: number;
+  /** Distance-field kind (`AtlasInfo.type`). Only a 3-channel `'msdf'` bake lacks the true
+   *  SDF in alpha, and the shader must read the median instead — see `uHasTrueSdf`.
+   *
+   *  ⚠️ REQUIRED on purpose. It was optional for one commit, and Scene2D built this object
+   *  from a hand-written four-field literal that predated it — so `type` was silently
+   *  dropped, `hasTrueSdf` stayed true, and an msdf font's glow still rendered as a solid
+   *  rectangle. Required makes that a compile error. Pass `{ ...provider.atlas }`. */
+  type: string;
+}
 
 /** Create the Pixi MTSDF Shader for a font atlas. The atlas texture is bound BOTH
  *  ways because the mesh adaptor differs per backend: WebGL reads
@@ -300,7 +343,7 @@ export function makeMtsdfPixiShader(texture: Texture, atlas: MtsdfPixiAtlas, sty
     compileHighShaderGlProgram({ name: 'mtsdf-text', bits: [localUniformBitGl, textureBitGl, roundPixelsBitGl, mtsdfBitGl] }),
   );
   const gpuProgram = compileHighShaderGpuProgram({ name: 'mtsdf-text', bits: [localUniformBit, textureBit, roundPixelsBit, mtsdfBit] });
-  const mtsdfUniforms = new UniformGroup(mtsdfUniformValues(style, atlas.width, atlas.height, atlas.distanceRange, atlas.size, fontSize) as any);
+  const mtsdfUniforms = new UniformGroup(mtsdfUniformValues(style, atlas.width, atlas.height, atlas.distanceRange, atlas.size, fontSize, atlas.type !== 'msdf') as any);
   const shader = new Shader({
     glProgram, gpuProgram,
     resources: {
@@ -323,7 +366,10 @@ export function updateMtsdfPixiStyle(shader: Shader, style: MtsdfStyle): void {
   u.uOutlineColor = toColorVec((style.outlineColor ?? 0) >>> 0, style.outlineOpacity ?? 1);
   u.uGlowColor = toColorVec((style.glowColor ?? 0) >>> 0, 1);
   u.uShadowColor = toColorVec((style.shadowColor ?? 0) >>> 0, style.shadowOpacity ?? 0);
-  u.uShadowOffset = new Float32Array([(style.shadowOffsetX ?? 0) * atlas.size / atlas.width, (style.shadowOffsetY ?? 0) * atlas.size / atlas.height]);
+  u.uShadowOffset = new Float32Array([
+    clampShadowOffset(style.shadowOffsetX ?? 0, atlas.distanceRange, atlas.size) * atlas.size / atlas.width,
+    clampShadowOffset(style.shadowOffsetY ?? 0, atlas.distanceRange, atlas.size) * atlas.size / atlas.height,
+  ]);
   u.uWeight = Math.max(0, style.weight ?? 0);
   u.uOutlineWidth = (style.outlineWidth ?? 0) * OUTLINE_MAX_SPREAD;
   u.uGlowSize = (style.glowSize ?? 0) * GLOW_MAX_SPREAD;

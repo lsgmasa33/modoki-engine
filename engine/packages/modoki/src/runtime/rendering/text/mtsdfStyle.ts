@@ -20,11 +20,50 @@ export const GLOW_MAX_SPREAD = 0.45;
  *  outlineWidth as 0..1; the shader scales by this. */
 export const OUTLINE_MAX_SPREAD = 0.4;
 
+/** The largest drop-shadow offset (in em, per axis) an atlas can actually represent.
+ *
+ *  The shadow is an OFFSET SAMPLE of the same atlas — there is no second draw — so it can
+ *  only reach as far as the transparent padding baked around each glyph. Past that it
+ *  samples the NEIGHBOURING glyph and paints fragments of unrelated letterforms; where the
+ *  offset drives UV negative, clamp-to-edge smears a constant band instead (the reported
+ *  "shadow renders a box"). Both are silent — nothing errors.
+ *
+ *  The padding is `pxpadding`, which the bake sets equal to `pxRange` (`distanceRange`),
+ *  so the budget is `distanceRange / atlasSize` em. Measured on Geologica-Bold
+ *  (24/128 = 0.1875 em): 0.05 clean, 0.15 fine, 0.30 garbled, 0.50 disconnected fragments
+ *  of other glyphs — the predicted breakpoint. See #189.
+ *
+ *  A larger shadow therefore needs a larger `pxRange` on the FONT, which the Font
+ *  Inspector now states outright rather than leaving to be discovered. */
+export function maxShadowOffsetEm(distanceRange: number, atlasSize: number): number {
+  if (!(atlasSize > 0)) return 0;
+  return Math.max(0, distanceRange) / atlasSize;
+}
+
+/** Clamp one shadow-offset axis into {@link maxShadowOffsetEm}, preserving direction. */
+export function clampShadowOffset(v: number, distanceRange: number, atlasSize: number): number {
+  const lim = maxShadowOffsetEm(distanceRange, atlasSize);
+  return Math.max(-lim, Math.min(lim, v || 0));
+}
+
 /** Text style → shader uniforms. Colors are 0xRRGGBB; opacities 0..1. */
 export interface MtsdfStyle {
   color: number;
   opacity?: number;
-  /** Edge shift: >0 bolder, <0 thinner. Range ~[-0.3, 0.3]. */
+  /** Faux-bold: shifts the fill threshold OUTWARD, in distance-field units. 0 = the
+   *  glyph as drawn; useful range ~[0, 0.25].
+   *
+   *  ⚠️ **NOT resolution-independent, and this is the single most confusing thing about
+   *  the text knobs.** One field unit is `distanceRange / size` em, so the SAME value
+   *  bolds by `weight × pxRange / size` em — three times as much on a pxRange-24 font as
+   *  on a pxRange-8 one at the same glyph size. `outlineWidth`, `glowSize` and the shadow
+   *  offset are budgeted from the same ratio (see {@link maxShadowOffsetEm}); the Font
+   *  Inspector's Effect budget panel is where it is stated to the author.
+   *
+   *  ⚠️ **Negative is CLAMPED TO 0 by both shaders** — eroding a rasterized glyph nicks
+   *  sharp corners, so thinning is a font-import choice (a lighter `variationAxes.wght`,
+   *  or the family's Light weight), not a per-entity one. The Inspector's minimum is 0;
+   *  a scene, prefab or code path can still author a negative and it does nothing. */
   weight?: number;
   outlineColor?: number;
   /** Outline band width, NORMALIZED 0..1 (0 = off, 1 = the max seam-free width).

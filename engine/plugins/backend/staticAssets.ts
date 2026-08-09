@@ -24,7 +24,7 @@ import { getCacheDir, cachePathFor } from '../texture-cache';
 import { getAudioCacheDir, audioCachePathFor } from '../audio-cache';
 import { getVideoCacheDir, videoCachePathFor } from '../video-cache';
 import { getEnvCacheDir, envCachePathFor } from '../env-cache';
-import { getFontCacheDir, atlasCachePath, metricsCachePath } from '../font-cache';
+import { getFontCacheDir, atlasCachePath, metricsCachePath, instanceCachePath } from '../font-cache';
 import { getModelCacheDir, lodCachePath } from '../model-cache';
 import { atlasPageUrlPath } from '../atlas-cache';
 import { getReimportHandler, type ReimportContext, type ReimportAsset } from '../reimport-registry';
@@ -355,15 +355,19 @@ export async function serveProjectAsset(
   //     the source font's meta carries the cache hash. Must run BEFORE the generic
   //     texture-variant branch below — that regex's `.+` would otherwise greedily
   //     match `<font>.ttf~atlas` as a (nonexistent) `png`-variant source.
-  const fm = urlPath.match(/^(.+\.(?:ttf|otf|woff|woff2))~(atlas\.png|metrics\.json)$/i);
+  const fm = urlPath.match(/^(.+\.(?:ttf|otf|woff|woff2))~(atlas\.png|metrics\.json|instance\.ttf)$/i);
   if (fm) {
     const sourceUrl = decodeURIComponent(fm[1]);
     const which = fm[2].toLowerCase();
-    const isAtlas = which === 'atlas.png';
-    const ctFor = isAtlas ? 'image/png' : 'application/json';
-    const cachePathFn = (h: string) => isAtlas
-      ? atlasCachePath(getFontCacheDir(ctx.projectRoot), sourceUrl, h)
-      : metricsCachePath(getFontCacheDir(ctx.projectRoot), sourceUrl, h);
+    const ctFor = which === 'atlas.png' ? 'image/png'
+      : which === 'metrics.json' ? 'application/json'
+      : 'font/ttf';
+    const cacheDirFor = () => getFontCacheDir(ctx.projectRoot);
+    const cachePathFn = (h: string) => which === 'atlas.png'
+      ? atlasCachePath(cacheDirFor(), sourceUrl, h)
+      : which === 'metrics.json'
+        ? metricsCachePath(cacheDirFor(), sourceUrl, h)
+        : instanceCachePath(cacheDirFor(), sourceUrl, h);
     const absSource = ctx.resolveAssetPath(sourceUrl);
     if (absSource) {
       const hash = (readMetaSidecar(absSource).fontCache as { hash?: string } | undefined)?.hash;

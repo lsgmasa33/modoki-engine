@@ -233,7 +233,17 @@ export {
   TIER_SETTINGS, TIER_ALLOWLIST, DEFAULT_TIER_SETTING,
   type QualityTier, type QualityTierSetting, type TierResolution, type TierSource,
   type TierRenderOverrides, type TierResolveInput, type TierChangeState, type TierDecision,
+  iosModelTier, parseAppleModel, IOS_HIGH_TIER_MIN_GENERATION,
 } from './rendering/qualityTier';
+// The boot ramp probe (#188). The PURE half only — the runner pulls in three and is imported
+// dynamically at the one call site that needs it, so a headless or DCE'd build never loads it.
+export {
+  startRamp, rampNextLoad, recordRampFrame, readRamp, estimateIntervalMs, classifyDevice,
+  probeFingerprint, PROBE_THRESHOLDS, PROBE_BUDGET_MS, RAMP_BOUNDS,
+  type DeviceClass, type ProbeMeasurement, type ProbeVerdict, type RampKind, type RampReading,
+  type RampState, type RampStatus, type RampStep, type ThroughputBound,
+} from './rendering/rampProbe';
+export { probeVerdictStore, type ProbeVerdictStore, type CachedProbeVerdict } from './core/probeVerdictStore';
 export { registerMaterialType, getMaterialBuilder, getRegisteredMaterialTypes, type MaterialBuilder } from './loaders/materialTypes';
 export { registerCustomShader, unregisterCustomShader, getCustomShader, getCustomShaderSchema, getRegisteredShaderNames, type CustomShaderBuild } from './loaders/customShaders';
 export { mergeParamDefaults, coerceParamValue, fetchShaderManifest, type ShaderParam, type ShaderParamType, type ShaderParamSchema, type ShaderManifest } from './loaders/shaderSchema';

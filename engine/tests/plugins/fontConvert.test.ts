@@ -29,6 +29,21 @@ describe('buildAtlasGenArgs', () => {
     expect(args).toContain('-potr');
   });
 
+  // REGRESSION GUARD — do not "simplify" the instancing step away by moving axes onto
+  // msdf-atlas-gen. `-varfont <file>?wght=700` is documented in its -help and IS accepted
+  // by our build, but it is a SILENT NO-OP: exit 0, no warning, and a byte-identical
+  // atlas to a plain `-font` bake (Geologica 'H' advance 0.7180 either way; real
+  // instancing gives 0.7730 / md5 1cbd31da vs 2e1a1808). Axes are applied BEFORE the
+  // bake, by font-instance.ts, and this must keep emitting a plain `-font`.
+  it('never emits -varfont, even when axes are authored', () => {
+    const args = buildAtlasGenArgs({ ...S, variationAxes: { wght: 700 } }, '/f.ttf', 'c', 'o', 'j');
+    expect(args).not.toContain('-varfont');
+    expect(args.some((a) => a.includes('?wght'))).toBe(false);
+    // The path it bakes is passed through verbatim — convertFont substitutes the
+    // already-instanced file there.
+    expect(args[args.indexOf('-font') + 1]).toBe('/f.ttf');
+  });
+
   it('honors a non-default fieldType', () => {
     const args = buildAtlasGenArgs({ ...S, fieldType: 'msdf' }, 'f', 'c', 'o', 'j');
     expect(args[args.indexOf('-type') + 1]).toBe('msdf');

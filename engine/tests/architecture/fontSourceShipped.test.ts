@@ -2,12 +2,17 @@
  *
  *  The asset manifest entry for a font is its source path (`…/Arimo-VariableFont_wght.ttf`),
  *  and `fontLoader.loadAllFonts` FontFace-loads exactly that IF the manifest's `font` block
- *  says `sourceShipped !== false`. There are two distinct consumers: CANVAS text
- *  (`Text2D.font`, a GUID) renders from the atlas alone, while DOM/PixiJS text
- *  (`UIElement.fontFamily`, a CSS family NAME) goes through the browser's FontFace API and
- *  needs the real outlines. Shipping the source unconditionally wastes ~300KB/font on a
- *  canvas-only game (Court's case: 2 `Text2D` refs, zero `fontFamily` usage); never shipping
- *  it 404s at boot ("[FontLoader] N/N fonts failed to load") for a DOM-using one.
+ *  says `sourceShipped !== false`. There are THREE consumers, and the third was missed:
+ *    1. BAKED canvas text (`Text2D.font`, a GUID) renders from the atlas alone — no source.
+ *    2. DOM/PixiJS text (`UIElement.fontFamily`, a CSS family NAME) goes through the
+ *       browser's FontFace API and needs the RAW variable source (CSS `font-weight`
+ *       instances it natively, so a pinned instance is not a substitute).
+ *    3. DYNAMIC canvas text generates glyphs at runtime and needs real OUTLINES too —
+ *       the pinned `~instance.ttf` when `variationAxes` is authored, else the source.
+ *  Shipping the source unconditionally wastes ~300KB/font on a baked canvas-only game
+ *  (Court's case: 2 `Text2D` refs, zero `fontFamily` usage); never shipping it 404s at boot
+ *  ("[FontLoader] N/N fonts failed to load") for a DOM-using one, or kills text entirely
+ *  for a dynamic one.
  *
  *  So the shaker ships the source iff the static asset-tree-shaker's font-family walk
  *  (`result.domFontFiles`, from `resolveFontsByFamily`) found a scene/prefab naming this
@@ -78,6 +83,42 @@ describe('baked fonts ship their source file only when something needs it', () =
     expect(successPath).toContain("result.domFontFiles.has(virtualPath.normalize('NFC'))");
     expect(successPath).toContain("settings.shipSource === 'always'");
     expect(successPath).toContain("settings.shipSource !== 'never'");
+  });
+
+  /** A DYNAMIC font generates glyphs at runtime from real OUTLINES, so it needs a font
+   *  file on disk even with zero DOM usage — the atlas alone is not enough for it (that
+   *  is only true of a baked font).
+   *
+   *  This half was missing: `shipTtf` keyed solely on DOM usage, so a dynamic font
+   *  referenced only by `Text2D.font` (a GUID) had its source DROPPED from the build and
+   *  `fontAtlasLoader`'s unconditional source fetch 404'd at boot — no text, in production
+   *  only. Dev never showed it, serving everything off disk. Which file it needs depends
+   *  on axes: the pinned `~instance.ttf` when `variationAxes` is authored (the generator
+   *  cannot apply axes itself), else the source.
+   */
+  it('ships outlines for a DYNAMIC font even with no DOM usage', () => {
+    const successPath = bakedFontSuccessPath();
+    expect(successPath).toContain("settings.mode === 'dynamic'");
+    // The instance replaces the source when axes are pinned; otherwise the source stands in.
+    expect(successPath).toContain('const shipInstance = genWants && !!conv.instanced;');
+    expect(successPath).toContain('const shipTtf = domWants || (genWants && !shipInstance);');
+    expect(successPath).toContain('FONT_INSTANCE_SUFFIX');
+  });
+
+  it('keeps the DOM decision independent of the dynamic one', () => {
+    // A DOM consumer needs the RAW variable source (CSS font-weight instances it
+    // natively), so `instanced` must never be treated as a substitute for it.
+    const successPath = bakedFontSuccessPath();
+    expect(successPath).toContain('const domWants =');
+    expect(successPath).toMatch(/const shipTtf = domWants \|\|/);
+  });
+
+  it('verifies a dynamic font\'s outlines exist in dist, not just its atlas', () => {
+    // The strict build gate checked only atlas+metrics for a font entry, which is exactly
+    // why the dropped-source bug could reach a shipped build without failing anything.
+    const gate = SRC.slice(SRC.indexOf("checkFile(entry.path + FONT_ATLAS_SUFFIX, 'font atlas');"));
+    expect(gate.slice(0, 900)).toContain("entry.font.mode === 'dynamic'");
+    expect(gate.slice(0, 900)).toContain('FONT_INSTANCE_SUFFIX');
   });
 
   it('still calls shipSource() unconditionally on a bake FAILURE', () => {

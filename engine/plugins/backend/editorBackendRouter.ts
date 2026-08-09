@@ -26,6 +26,7 @@ import { execFileSync } from 'child_process';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, isGcsObjectMissing, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './gcloud';
 import { openInOS, revealInOS } from './osOpen';
 import { readMetaSidecar, writeMetaSidecar } from '../meta-sidecar';
+import { readFontAxes } from '../font-instance';
 import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
@@ -1605,6 +1606,30 @@ async function describeUnresolvedAgainstLiveWorld(
     if (!fs.existsSync(resolved)) return json({ error: `asset not found: ${assetPath}` }, 404);
     // The asset exists — an empty `{}` here now unambiguously means "no sidecar", not "bad path".
     return { kind: 'raw', contentType: 'application/json', body: JSON.stringify(readMetaSidecar(resolved)) };
+  }
+
+  // ── GET /api/font-axes?path= (M) ── the variation axes a font actually exposes,
+  // read from its `fvar` table: [{tag, min, def, max}], `[]` for a static font.
+  //
+  // The Font Inspector needs these to offer real per-axis ranges instead of a free-text
+  // guess, and it CANNOT derive them itself: it runs in the renderer, and the answer lives
+  // in bytes on disk — pulling a 9MB CJK .ttf into the browser to read a ~100-byte table
+  // would be absurd. `def` matters as much as the range: it is frequently the axis MINIMUM
+  // (Geologica 100/Thin, Nunito 200/ExtraLight), which is the whole reason authoring an
+  // axis is necessary rather than cosmetic.
+  if (urlPath === '/api/font-axes' && method === 'GET') {
+    const assetPath = query.get('path') || '';
+    if (!assetPath) return json({ error: 'path is required (an asset-root path to a .ttf/.otf)' }, 400);
+    const resolved = ctx.resolveAssetPath(assetPath);
+    if (!resolved) return json({ error: `path outside allowed directories: ${assetPath}` }, 403);
+    if (!fs.existsSync(resolved)) return json({ error: `asset not found: ${assetPath}` }, 404);
+    try {
+      return json({ axes: readFontAxes(fs.readFileSync(resolved)) });
+    } catch (e) {
+      // A malformed/unreadable font is not a server fault — report empty axes so the
+      // Inspector degrades to "no axes" rather than showing an error box.
+      return json({ axes: [], warning: String(e) });
+    }
   }
 
   // ── GET /api/scripts/tree (M) ── source files for the in-browser code editor:

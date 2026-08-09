@@ -23,15 +23,27 @@
 import { describe, it, expect } from 'vitest';
 import { mtsdfShaderBitsForTest } from '../../src/runtime/rendering/text/mtsdfPixiShader';
 
+/** Strip comments before extracting literals.
+ *
+ *  Required for correctness, not tidiness: the two extractors have DIFFERENT blind spots.
+ *  WGSL's only matches `f32(...)` calls, so prose is invisible to it, while GLSL's matches
+ *  any bare decimal — so a comment mentioning a threshold ("the shipped floor of 0.1")
+ *  registered as a GLSL-only constant and failed a parity check on two identical programs.
+ *  This test is about the CODE the backends emit; the shared template's prose is not part
+ *  of it. */
+function stripComments(src: string): string {
+  return src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ');
+}
+
 /** Every `f32(<n>)` literal the WGSL program emits. */
 function wgslNumbers(src: string): number[] {
-  return [...src.matchAll(/\bf32\(([-0-9.eE]+)\)/g)].map(m => Number(m[1]));
+  return [...stripComments(src).matchAll(/\bf32\(([-0-9.eE]+)\)/g)].map(m => Number(m[1]));
 }
 
 /** Every bare float literal the GLSL program emits (`1.0`, `0.0001`, `0.55`, …). Excludes
  *  vector/array indices and swizzles by requiring a decimal point. */
 function glslNumbers(src: string): number[] {
-  return [...src.matchAll(/(?<![\w.])(\d+\.\d+(?:[eE][-+]?\d+)?)/g)].map(m => Number(m[1]));
+  return [...stripComments(src).matchAll(/(?<![\w.])(\d+\.\d+(?:[eE][-+]?\d+)?)/g)].map(m => Number(m[1]));
 }
 
 describe('MTSDF shader float literals', () => {
@@ -73,4 +85,32 @@ describe('MTSDF shader float literals', () => {
     expect(glslSrc).toMatch(/\b1\.0\b/);
     expect(glslSrc).toMatch(/\b0\.0\b/);
   });
+});
+
+/** The soft-effect distance must never read the atlas alpha UNGATED.
+ *
+ *  Glow and the soft drop shadow are `smoothstep(.., asd)` over a "true SDF". Only an
+ *  MTSDF atlas has one: a 3-channel MSDF bake samples a == 1.0 everywhere, so an ungated
+ *  read saturates both effects over the entire glyph quad (solid rectangles) and makes
+ *  `clashUp = max(0, 1 - rawSd)` dilate the fill at every edge. `fieldType: 'msdf'` is a
+ *  Font Inspector option, so this was reachable by authoring alone.
+ *
+ *  The gate is the `uHasTrueSdf` uniform (0/1), since both backends share ONE program.
+ *  Asserting on the emitted SOURCE is the only check available — a unit test cannot run a
+ *  shader, and the Three/TSL twin takes the same decision as a build-time branch. */
+describe('mtsdf soft effects are gated on the atlas actually having a true SDF', () => {
+  const { wgsl, glsl } = mtsdfShaderBitsForTest();
+  for (const [lang, bit] of [['wgsl', wgsl], ['glsl', glsl]] as const) {
+    const src = stripComments(bit.fragment.main);
+    it(`${lang}: derives asd through uHasTrueSdf, not a bare .a`, () => {
+      expect(src).toMatch(/asd\s*=\s*mix\(\s*rawSd\s*,\s*s\.a\s*,\s*[\w.]*uHasTrueSdf\s*\)/);
+    });
+    it(`${lang}: gates the soft shadow the same way`, () => {
+      expect(src).toMatch(/shSoft[\s\S]{0,260}uHasTrueSdf/);
+      expect(src).not.toMatch(/smoothstep\([^)]*edge\s*,\s*shTex\.a\s*\)/);
+    });
+    it(`${lang}: declares the uniform`, () => {
+      expect(bit.fragment.header).toContain('uHasTrueSdf');
+    });
+  }
 });

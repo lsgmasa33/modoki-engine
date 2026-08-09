@@ -102,3 +102,24 @@ describe('gpuDetect', () => {
     });
   });
 });
+
+/** The probe must be BOUNDED — an unreachable GPU process does not reject, it never answers.
+ *
+ *  `requestAdapter` is a call into the GPU process. iOS really does reach a state where that
+ *  process is gone (`CARenderServer failed bootstrap look up` / `Failed to load a device
+ *  context` in a device log). The result is memoized, so ONE unanswered probe would leave
+ *  every caller of getWebGPUSupported() awaiting forever — including Canvas2DPool's backend
+ *  pick, which means the 2D renderer is never constructed and the screen stays blank with no
+ *  error. Same shape as the font worker that hung Court's splash screen. */
+describe('the WebGPU probe cannot hang', () => {
+  it('resolves false when requestAdapter never answers', async () => {
+    vi.useFakeTimers();
+    try {
+      setGpu({ requestAdapter: () => new Promise(() => {}) });   // never settles
+      const { getWebGPUSupported } = await getModule();
+      const probe = getWebGPUSupported();
+      await vi.advanceTimersByTimeAsync(8_001);
+      await expect(probe).resolves.toBe(false);   // falls back to WebGL rather than hanging
+    } finally { vi.useRealTimers(); }
+  });
+});

@@ -137,7 +137,8 @@ function readFormFactor(platform: string): 'mobile' | 'desktop' {
  *  (checked across all 22 games + demos: not a dependency, no `CapacitorDevice` in any iOS
  *  `Package.swift`), so this resolved `undefined` on every real device — and per the module header
  *  above, `deviceModel` is the ONLY usable discriminator on iOS, because the GPU string is masked
- *  to `Apple GPU`. So `qualityTier`'s `TIER_ALLOWLIST.iosModels` branch could never fire on any
+ *  to `Apple GPU`. So `qualityTier`'s iOS branch (an allowlist then, `iosModelTier` now, and it
+ *  carries the WHOLE iOS tier decision since 2026-08-09) could never fire on any
  *  phone. It failed the safe way (fall through to the fallback tiering) which is exactly why it
  *  went unnoticed.
  *

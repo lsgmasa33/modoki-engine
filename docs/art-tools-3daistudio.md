@@ -20,9 +20,12 @@ It is a **browser-based generation suite that is not only a 3D tool** — it wra
 image/video models *and* a set of text-to-3D engines behind one account, one credit balance, and
 one node editor. The 2D half ("Image Studio") is a full image generator/editor in its own right.
 
-That matters for us because Court's brief (`docs/plans/court-art-direction.md`) needs both halves:
-flat 2D icons and tintable tile masters, **and** five chess pieces that must share one camera and
-one light rig — which §A6 solves by going to 3D deliberately.
+That mattered for us because Court's original brief needed both halves: flat 2D icons and tintable
+tile masters, **and** five chess pieces that had to share one camera and one light rig. ⚠️ **That
+brief was retired on 2026-08-08** (owner: *"I don't think we go in the old doc art direction"*) and
+Court's art has since been generated one piece at a time — the icon sheet, the coin faces, the
+counter ribbon — all through the 2D half. The 3D route below has never been used for a shipped
+Court asset; it is kept as a capability note, not as a plan.
 
 ## 2. Three ways in
 
@@ -191,18 +194,18 @@ evaluating, not for producing committed assets.
 
 ## 6. What we would actually use it for in Court
 
-Mapping to `docs/plans/court-art-direction.md`, which holds the brief and the prompts for *what* to
-make; this section only says *which tool*. ⚠️ That doc is REFERENCE, not a queue — the art pass is
-run iteratively (#58), so take the next item from the owner, not from its order of work:
+⚠️ **This section used to map a per-asset brief onto routes; that brief was retired on 2026-08-08
+and is not being followed** (see §1). Court's art pass is now run one piece at a time, and the next
+item comes from the owner, not from a queue — open work is **#58**. What survives is the routing
+advice itself, which is about the tool and not about any particular asset:
 
-| Brief item | Route |
+| Kind of asset | Route |
 |---|---|
-| **§A6 five pieces** | The brief already mandates this path: generate one reference sheet, then image-to-3D, then **render all five from one camera in one scene**. That is the whole reason to touch 3D at all — consistency comes from a shared rig, not from five lucky prompts. |
-| **§B3 icon set** (undo/reset/erase/hint/rules/close/next) | 2D **Generate** as one sheet, then slice. Flat white masters on transparency — the brief explicitly overrides the lighting clause for these. |
-| **§B2 button plate**, §B1 panel | 2D Generate; both are nine-slice. |
-| **§A1 stone tile**, §A4 wall stone | **Seamless Texture AI** — both must tile, and "seamless" is a named feature rather than something to pray for in a prompt. |
-| **§A5 coin, §B4 medallion, §A3 citizen inlay** | 2D Generate. |
-| Style coherence across all of the above | "Approve one keystone, generate the rest against it" — but **via the EDIT tools, not a style-reference field**, if you are working over MCP. See §2a. |
+| **An icon set** | 2D **Generate** as one sheet, then slice. Flat white masters — and see §2a on keeping a set coherent. This is the route every Court icon actually took. |
+| **Anything that must TILE** (a stone tile, a wall) | **Seamless Texture AI** — "seamless" is a named feature there rather than something to pray for in a prompt. Never used in Court; the board is still flat tinted colour. |
+| **A single flat sprite** (a coin face, a ribbon, a pictogram) | 2D Generate. The route the coin faces and the counter ribbon took. |
+| **A set that must share one camera and one light rig** | Generate one reference sheet, then image-to-3D, then **render every member from one camera in one scene**. The only real reason to touch the 3D half: consistency comes from a shared rig, not from N lucky prompts. Unused in Court so far. |
+| Style coherence across any of the above | "Approve one keystone, generate the rest against it" — but **via the EDIT tools, not a style-reference field**, if you are working over MCP. See §2a. |
 
 ## 7. What we still do not know — check these before committing to it
 
@@ -221,10 +224,15 @@ run iteratively (#58), so take the next item from the owner, not from its order 
 
 ## 8. Related
 
-- [plans/court-art-direction.md](./plans/court-art-direction.md) — the **reference** for what Court's
-  art should be: the three registers, the validated palette, the camera/light convention, the
-  technical constraints, and every per-asset prompt. This doc is only the tool reference beside it.
-  ⚠️ Not an execution plan and not up to date on what has landed — see its own header.
+- [plans/court-tray-readability-plan.md](./plans/court-tray-readability-plan.md) — Court's live
+  art-direction record, and the only one since `court-art-direction.md` was retired on 2026-08-08.
+  Its "Absorbed from the retired art-direction doc" section carries the measurements that outlived
+  that brief, plus a ledger of what the brief specified and nobody built.
+- [../games/court/art/README.md](../games/court/art/README.md) — Court's generation **recipes**: the
+  two keying routes (white-on-black for a white subject, magenta for a coloured one), the grading
+  step, and the acceptance test. Start here before generating a Court asset.
+- [../games/court/CLAUDE.md](../games/court/CLAUDE.md) — the import constraints a generated PNG must
+  satisfy (multiple-of-4 dimensions, `ui`/WebP, sprite guid not texture guid, `asset-keep.json`).
 - [textures.md](./textures.md) — how a generated PNG becomes a shipped texture: `.meta.json`,
   KTX2/WebP, the multiple-of-4 rule, and the `ui`-vs-`3d` type trap that silently draws a circle.
 - [model-pipeline.md](./model-pipeline.md) — GLB import + LOD, if a generated mesh ever ships as a

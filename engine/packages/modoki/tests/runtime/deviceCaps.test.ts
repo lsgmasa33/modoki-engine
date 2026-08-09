@@ -176,7 +176,8 @@ describe('deviceCaps — identity', () => {
   // plugin — not a dependency in any of the 22 games + demos, no `CapacitorDevice` in any iOS
   // `Package.swift` — so `deviceModel` was `undefined` on every real device, and since the module
   // header explains it is the ONLY usable iOS discriminator (the GPU string is masked to
-  // `Apple GPU`), `qualityTier`'s `TIER_ALLOWLIST.iosModels` branch could never fire on any phone.
+  // `Apple GPU`), `qualityTier`'s iOS branch could never fire on any phone. That branch now
+  // carries the ENTIRE iOS tier decision (`iosModelTier`), so this source is load-bearing.
   // A mock answers to whichever plugin name the code asks for, which is precisely why mocking
   // could not catch it and why the presence guard below exists.
   it('reads deviceModel from the DEBUG BRIDGE plugin — the iOS tier key', async () => {

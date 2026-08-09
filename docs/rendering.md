@@ -594,7 +594,7 @@ the one moment the device is already struggling.
 Scene3D's `ResizeObserver` on every resize. If one applied the tier and the other read the raw
 setting, the first resize would silently undo it.
 
-**Precedence: player > project pin > allowlist > desktop > calibrating (low).** The player wins
+**Precedence: player > project pin > iOS model id > allowlist > desktop > calibrating (low).** The player wins
 outright because they can see the screen and we cannot; their choice persists via `PlayerPrefs`
 (behind the `playerTierStore` provider slot, since `rendering/` may not import `storage/`) and
 **stops calibration**, or the engine would override an explicit human decision with an inference.
@@ -632,9 +632,26 @@ the debug menu's **Device tab**, which also has low/high buttons that apply a ti
 low-end look can be authored without owning the phone. The reason is the point — "low" alone is
 unexplainable, and project-pinned / failed-calibration / player-chosen want different responses.
 
-The device allowlist (`TIER_ALLOWLIST`) ships **empty on purpose**: an unvalidated threshold in code
-is what ossifies. Measured, neither an iPhone 8 nor a Galaxy A23 qualifies for `high`, so both
-correctly calibrate.
+**iOS answers from the MODEL ID and never measures** (owner, 2026-08-09) — `TierSource: 'model'`,
+via `IOS_HIGH_TIER_MIN_GENERATION`. Apple's hardware set is small and the generation is *encoded in
+the identifier*, so `iPhone10,1` sorts against `iPhone14,6` with no lookup; Android's only
+comparable signal is the GPU renderer string, which is ambiguous (one name, two GPUs) and already
+deprecated in Firefox for fingerprinting. That is why one platform gets a table and the other has
+to measure.
+
+It is a **threshold (`>= N`), not a list**, and that is the whole point: an enumerated allowlist
+ossifies in the *worst* direction — a phone that does not exist yet is absent from it, so next
+year's hardware is classified `low` by a table written today. `>=` cannot fail that way, because
+newer Apple silicon is only ever faster. The major number is a real SoC boundary rather than a
+year: `iPhone10,x` is A11, covering the iPhone 8 **and** the iPhone X, which genuinely share the
+chip. Two caveats: the floor value for `iPhone` is inferred (only the A11 side is measured — 27 ms
+→ 56 ms with NPR, missing the budget), the `iPad` value is a straight guess, and the rule is
+**native-only** — mobile Safari reports no model, so iOS *web*, which is how every published demo
+ships, stays on the measured path.
+
+The Android allowlist (`TIER_ALLOWLIST`) ships **empty on purpose**: an unvalidated threshold in
+code is what ossifies. Measured, a Galaxy A23 does not qualify for `high`, so it correctly
+calibrates.
 
 ### GPU context loss is recoverable — and bring-up must stay self-contained
 

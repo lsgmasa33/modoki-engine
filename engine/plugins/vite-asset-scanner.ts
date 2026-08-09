@@ -28,8 +28,8 @@ import { audioReimportHandler } from './reimport-audio';
 import { fontReimportHandler } from './reimport-font';
 import { environmentReimportHandler } from './reimport-environment';
 import { convertFont } from './font-convert';
-import { getFontCacheDir, atlasCachePath, metricsCachePath } from './font-cache';
-import { resolveFontSettings, FONT_ATLAS_SUFFIX, FONT_METRICS_SUFFIX, type FontImportSettings, type FontManifestBlock, type FontCacheInfo } from '../packages/modoki/src/runtime/core/fontSettings';
+import { getFontCacheDir, atlasCachePath, metricsCachePath, instanceCachePath } from './font-cache';
+import { resolveFontSettings, FONT_ATLAS_SUFFIX, FONT_METRICS_SUFFIX, FONT_INSTANCE_SUFFIX, type FontImportSettings, type FontManifestBlock, type FontCacheInfo } from '../packages/modoki/src/runtime/core/fontSettings';
 import { readMetaSidecar } from './meta-sidecar';
 import { classifyJsonAssetSuffix, ID_BEARING_TYPES, BINARY_EXT_TYPE } from './assetTypes';
 import { getCacheDir, cachePathFor } from './texture-cache';
@@ -834,6 +834,18 @@ function scanDir(dir: string, base: string, urlPrefix: string): AssetEntry[] {
             mode: settings.mode,
             fieldType: settings.fieldType,
             distanceRange: settings.pxRange,
+            // Dev serves every variant off the content cache, so an axis-bearing font
+            // always HAS its `~instance.ttf` here — the flag just tells the dynamic
+            // loader to fetch that rather than the un-instanced source.
+            ...(Object.keys(settings.variationAxes ?? {}).length > 0 ? { instanced: true } : {}),
+            // Dynamic-only: the runtime generator needs the authored knobs the baked
+            // path consumes at build time. Omitted for baked fonts (dead weight).
+            ...(settings.mode === 'dynamic' ? {
+              size: settings.size,
+              atlasMax: settings.atlasMax,
+              charset: settings.charset,
+              ...(settings.customChars ? { customChars: settings.customChars } : {}),
+            } : {}),
             ...(cache?.atlasWidth && cache?.atlasHeight ? { atlasWidth: cache.atlasWidth, atlasHeight: cache.atlasHeight } : {}),
           };
           if (cache?.hash) hash = cache.hash;
@@ -2995,7 +3007,7 @@ export function assetScannerPlugin(): Plugin {
       // gate fails the build (unless MODOKI_ALLOW_ASSET_FALLBACK=1) — parity with audio:
       // a failed bake means no atlas, so the source is the ONLY way the font renders
       // at all, regardless of the shipSource decision.
-      const convertedFonts = new Map<string, { settings: FontImportSettings; hash: string; atlasWidth?: number; atlasHeight?: number; sourceShipped: boolean }>(); // NFC virtualPath → blocks
+      const convertedFonts = new Map<string, { settings: FontImportSettings; hash: string; atlasWidth?: number; atlasHeight?: number; sourceShipped: boolean; instanced: boolean }>(); // NFC virtualPath → blocks
       let fontVariantCount = 0;
       for (const virtualPath of result.kept) {
         if (!FONT_EXTS.has(path.extname(virtualPath).toLowerCase())) continue;
@@ -3022,17 +3034,35 @@ export function assetScannerPlugin(): Plugin {
             fs.copyFileSync(cacheFile, destPath);
             fontVariantCount++;
           }
+          // TWO independent consumers of real outlines, and conflating them drops files:
+          //  - DOM text (`UIElement.fontFamily`) wants the RAW source — the browser's
+          //    FontFace API needs it, and CSS `font-weight` instances a variable font
+          //    natively, so our pinned instance is not a substitute.
+          //  - a DYNAMIC font's runtime generator rasterizes outlines itself, so it needs
+          //    the instance when axes are authored, else the raw source. This half used to
+          //    be missing entirely: the decision keyed only on DOM usage, so a dynamic
+          //    font referenced solely by `Text2D.font` (a GUID) had its source dropped and
+          //    404'd at boot in a production build. Dev never showed it — it serves
+          //    everything off disk.
           const domUsed = result.domFontFiles.has(virtualPath.normalize('NFC'));
-          const shipTtf = settings.shipSource === 'always' || (settings.shipSource !== 'never' && domUsed);
+          const domWants = settings.shipSource === 'always' || (settings.shipSource !== 'never' && domUsed);
+          const genWants = settings.mode === 'dynamic';
+          const shipInstance = genWants && !!conv.instanced;
+          const shipTtf = domWants || (genWants && !shipInstance);
           if (shipTtf) shipSource();
-          if (settings.shipSource === 'always') {
-            console.log(`[asset-shaker] font ${virtualPath}: atlas + source (shipSource:'always')`);
-          } else if (domUsed) {
-            console.log(`[asset-shaker] font ${virtualPath}: atlas + source (DOM fontFamily usage)`);
-          } else {
-            console.log(`[asset-shaker] font ${virtualPath}: atlas only (no DOM fontFamily usage found)`);
+          if (shipInstance) {
+            const destPath = path.join(distDir, (virtualPath + FONT_INSTANCE_SUFFIX).replace(/^\//, ''));
+            fs.mkdirSync(path.dirname(destPath), { recursive: true });
+            fs.copyFileSync(instanceCachePath(getFontCacheDir(projectRoot), virtualPath, conv.hash), destPath);
+            fontVariantCount++;
           }
-          convertedFonts.set(virtualPath.normalize('NFC'), { settings, hash: conv.hash, atlasWidth: conv.atlasWidth, atlasHeight: conv.atlasHeight, sourceShipped: shipTtf });
+          const why = [
+            domWants ? (settings.shipSource === 'always' ? "source (shipSource:'always')" : 'source (DOM fontFamily usage)') : null,
+            shipInstance ? 'instance (dynamic + variationAxes)' : null,
+            !domWants && genWants && !shipInstance ? 'source (dynamic runtime generation)' : null,
+          ].filter(Boolean);
+          console.log(`[asset-shaker] font ${virtualPath}: ${['atlas', ...why].join(' + ')}`);
+          convertedFonts.set(virtualPath.normalize('NFC'), { settings, hash: conv.hash, atlasWidth: conv.atlasWidth, atlasHeight: conv.atlasHeight, sourceShipped: shipTtf, instanced: shipInstance });
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           console.warn(`[asset-shaker] font bake failed for ${virtualPath} — shipping source. ${msg}`);
@@ -3384,6 +3414,15 @@ export function assetScannerPlugin(): Plugin {
             ...(f.atlasWidth != null ? { atlasWidth: f.atlasWidth } : {}),
             ...(f.atlasHeight != null ? { atlasHeight: f.atlasHeight } : {}),
             sourceShipped: f.sourceShipped,
+            ...(f.instanced ? { instanced: true } : {}),
+            // Dynamic-only: the runtime generator needs the authored knobs the baked
+            // path consumes at build time. Omitted for baked fonts (dead weight).
+            ...(f.settings.mode === 'dynamic' ? {
+              size: f.settings.size,
+              atlasMax: f.settings.atlasMax,
+              charset: f.settings.charset,
+              ...(f.settings.customChars ? { customChars: f.settings.customChars } : {}),
+            } : {}),
           };
           entry.font = block;
           entry.hash = f.hash;
@@ -3463,6 +3502,14 @@ export function assetScannerPlugin(): Plugin {
             // the atlas/dynamic-gen path resolves, so it's not checked here.
             checkFile(entry.path + FONT_ATLAS_SUFFIX, 'font atlas');
             checkFile(entry.path + FONT_METRICS_SUFFIX, 'font metrics');
+            // A DYNAMIC font also generates glyphs at runtime from real outlines, so the
+            // file it will fetch must exist: the pinned instance when axes are authored,
+            // else the source itself. (A BAKED font renders from the atlas alone; its
+            // source ships only for DOM consumers, which is not checked here.)
+            if (entry.font.mode === 'dynamic') {
+              if (entry.font.instanced) checkFile(entry.path + FONT_INSTANCE_SUFFIX, 'font instance (dynamic + variationAxes)');
+              else checkFile(entry.path, 'font source (dynamic runtime generation)');
+            }
           } else if (entry.environment) {
             // Converted HDR — the source was dropped; verify the format's variant
             // (`~env.hdr` downscaled, or the committed `~ultrahdr.jpg` gainmap).

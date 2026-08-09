@@ -1,5 +1,5 @@
 /** Three.js atlas-texture cache for SDF fonts. Builds one THREE.Texture per
- *  `${fontId}:${atlasVersion}` from the provider's atlas image URL, and ties its
+ *  `${fontId}:image` from the provider's atlas image URL (immutable), and ties its
  *  disposal to the font's scene-scoped lifetime via provider.addDisposable — so the
  *  GPU texture is freed exactly when the font is released (no leak, no double-free),
  *  without the renderer-agnostic provider importing THREE.
@@ -52,7 +52,16 @@ export function getFontTexture(provider: FontProvider, page = 0): THREE.Texture 
   }
 
   if (page !== 0 || !provider.atlasImageUrl) return null; // baked is single-page
-  const key = `${provider.id}:${provider.atlasVersion}`;
+  /** Page 0's IMAGE is IMMUTABLE, so its key must NOT carry atlasVersion.
+   *
+   *  ⚠️ A baked-seeded dynamic font bumps `atlasVersion` on EVERY generated glyph batch, and
+   *  its page 0 is the baked atlas image. Keyed by version, each batch minted a fresh key:
+   *  the cache missed, `getFontTexture*` returned null while a redundant load of the SAME url
+   *  started, and every baked glyph vanished for those frames — so typing CJK made the Latin
+   *  text flicker. The superseded Texture also stayed in the map under its old key until the
+   *  font was released. Harmless before this existed, because a provider was either all-image
+   *  (version pinned 0) or all-canvas (this path unreachable); the hybrid made both live. */
+  const key = `${provider.id}:image`;
   const existing = cache.get(key);
   if (existing) return existing;
 

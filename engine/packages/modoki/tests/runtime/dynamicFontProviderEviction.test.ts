@@ -86,3 +86,34 @@ describe('DynamicFontProvider eviction', () => {
     expect(p.getGlyph(cp('B'))).toBeDefined();
   });
 });
+
+/** Chunking must not change PLACEMENT semantics.
+ *
+ *  A generation is split into chunks only because the generator's scratch atlas is finite
+ *  (see SCRATCH_SIZE). The eviction shield must therefore cover the whole BATCH: if it
+ *  covered only the current chunk, a later chunk could evict glyphs an earlier one had just
+ *  placed — and eviction drops them from `requested`, so the same relayout re-requests them
+ *  next frame and the batch oscillates instead of settling.
+ *
+ *  With the whole batch shielded, an over-large request degrades the way it always has: the
+ *  glyphs that fit stay, and the surplus is skipped (tofu) because nothing is evictable.
+ *  That is the STABLE outcome, and it is what these assertions pin. */
+describe('a chunked batch is protected as ONE batch', () => {
+  // fontSize 700 ⇒ pessimistic cell ~1068px ⇒ floor(2048/1068) = 1 per axis ⇒ ONE glyph per
+  // chunk, so a 4-glyph request is guaranteed to span four separate generator passes.
+  const CHUNKED = { atlasSize: 100, gap: 0, maxPages: 1, seed: 'A', fontSize: 700 };
+
+  it('lets an over-large batch skip its surplus rather than evict its own earlier chunks', async () => {
+    const p = (await DynamicFontProvider.create('t', new Uint8Array([1]), CHUNKED))!;
+    // Capacity is A(pinned) + 3 slots. Ask for FOUR in one call: B,C,D fill it and E has
+    // nowhere to go. Every chunk bumps atlasVersion (seed = 1, then one per glyph), so
+    // version 5 means all four passes have run.
+    p.ensureGlyphs([...'BCDE'].map(cp));
+    await vi.waitFor(() => { if (p.atlasVersion < 5) throw new Error('generating'); });
+
+    // Per-CHUNK protect would evict B to place E — flipping both of these.
+    for (const ch of 'BCD') expect(p.getGlyph(cp(ch)), `${ch} was evicted by a later chunk`).toBeDefined();
+    expect(p.getGlyph(cp('E')), 'E should be skipped, not placed by evicting a batch-mate').toBeUndefined();
+    expect(p.getGlyph(cp('A'))).toBeDefined();
+  });
+});

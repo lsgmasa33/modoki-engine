@@ -446,16 +446,40 @@ export default defineConfig(({ command }) => {
     // (MODOKI_VITE_CACHEDIR, packaged-only) as the include list — they must move together.
     ...(isPlayable
       ? { alias: [
+          // BEFORE the package stub — array aliases match in order, and that entry is a
+          // PREFIX match, so it would rewrite the runtime's `msdfgen_wasm.wasm?url` import
+          // into `<stub>.ts/msdfgen_wasm.wasm` and fail the build outright (ENOTDIR).
+          // Unanchored on purpose: the id carries a `?url` query, which a `$`-anchored
+          // pattern would not match. Points at an empty 8-byte module so the
+          // playable emits a few bytes instead of the real 1.5 MB wasm against its 5 MB cap;
+          // it is never instantiated, since the stub generator never initializes.
+          { find: /^@zappar\/msdf-generator\/msdfgen_wasm\.wasm/, replacement: path.join(engineDir, 'plugins/playable-msdf-stub.wasm') },
           { find: '@zappar/msdf-generator', replacement: path.join(engineDir, 'plugins/playable-msdf-stub.ts') },
           { find: /^@[^/]+\/app-services$/, replacement: path.join(engineDir, 'plugins/playable-appservices-stub.ts') },
         ] }
       : {
-          alias: {
-            ...(msdfGeneratorDir ? { '@zappar/msdf-generator': msdfGeneratorDir } : {}),
+          // ARRAY form, not an object: order matters and the first entry needs a REGEX.
+          // The runtime imports `@zappar/msdf-generator/msdfgen_wasm.wasm?url` so Vite emits
+          // the wasm as a hashed asset (the worker's own `new URL(...)` fallback is buried in
+          // an emscripten ternary Vite cannot see, so nothing shipped and the worker 404'd —
+          // that is what stuck Court's iOS build on its splash screen). The package-DIR alias
+          // below would rewrite that subpath to <pkg>/msdfgen_wasm.wasm, which does not exist;
+          // a plain STRING find cannot pre-empt it because @rollup/plugin-alias does not match
+          // an id carrying a `?url` query. Hence the unanchored regex, first.
+          //
+          // Import the package's EXPORTED name, never `dist/…`: outside this config (the
+          // engine package's own vitest project has no aliases at all) the exports map is what
+          // resolves it, and it exposes only the exported name. Using `dist/` here failed to
+          // collect 114 engine test files.
+          alias: [
+            ...(msdfGeneratorDir ? [
+              { find: /^@zappar\/msdf-generator\/msdfgen_wasm\.wasm/, replacement: path.join(msdfGeneratorDir, 'dist', 'msdfgen_wasm.wasm') },
+              { find: '@zappar/msdf-generator', replacement: msdfGeneratorDir },
+            ] : []),
             ...(process.env.MODOKI_VITE_CACHEDIR
-              ? Object.fromEntries(projectNativeSdkDeps.map(d => [d.name, d.resolvedPath]))
-              : {}),
-          },
+              ? projectNativeSdkDeps.map(d => ({ find: d.name, replacement: d.resolvedPath }))
+              : []),
+          ],
         }),
   },
   test: {

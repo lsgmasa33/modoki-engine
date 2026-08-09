@@ -11,6 +11,7 @@ import { describe, it, expect } from 'vitest';
 import {
   resolveTier, evaluateTierChange, freshTierChangeState, tierShadowMapSize, shadowBiasScale,
   TIER_ALLOWLIST, TIER_SETTINGS, DEFAULT_TIER_SETTING,
+  iosModelTier, parseAppleModel, IOS_HIGH_TIER_MIN_GENERATION,
   PROMOTION_HOLD_MS, DEMOTION_HOLD_MS, MIN_SAMPLES_TO_JUDGE,
   type QualityTier,
   applyTierToThree, tierAllowsPostFX, tierAllowsIBL, tierAmbientBoost, tierExposureBoost,
@@ -34,13 +35,12 @@ function profile(o: {
   };
 }
 
-/** Temporarily add allowlist entries — the shipped lists are empty on purpose, so matching can
- *  only be exercised by injecting. */
-function withAllowlist(fn: () => void, ios: string[] = [], android: RegExp[] = []) {
-  const i = TIER_ALLOWLIST.iosModels as string[];
+/** Temporarily add allowlist entries — the shipped list is empty on purpose, so matching can
+ *  only be exercised by injecting. Android only; iOS resolves from the model id instead. */
+function withAllowlist(fn: () => void, android: RegExp[] = []) {
   const a = TIER_ALLOWLIST.androidGpuPatterns as RegExp[];
-  i.push(...ios); a.push(...android);
-  try { fn(); } finally { i.length = 0; a.length = 0; }
+  a.push(...android);
+  try { fn(); } finally { a.length = 0; }
 }
 
 describe('resolveTier — precedence', () => {
@@ -51,11 +51,11 @@ describe('resolveTier — precedence', () => {
     expect(r).toMatchObject({ tier: 'low', source: 'player' });
   });
 
-  it('a pinned project setting beats the allowlist', () => {
-    withAllowlist(() => {
-      const r = resolveTier({ platform: 'ios', deviceModel: 'iPhone10,1', projectSetting: 'low' });
-      expect(r).toMatchObject({ tier: 'low', source: 'project' });
-    }, ['iPhone10,1']);
+  it('a pinned project setting beats the iOS model id', () => {
+    // The pin wins because `resolveTier` returns at it before ever consulting the model — which
+    // is what makes "does a pin beat the probe?" answer itself: the probe lives further down.
+    const r = resolveTier({ platform: 'ios', deviceModel: 'iPhone17,1', projectSetting: 'low' });
+    expect(r).toMatchObject({ tier: 'low', source: 'project' });
   });
 
   it('DEFAULTS TO auto, so an unrecognised phone launches in low-end spec (#155)', () => {
@@ -99,15 +99,7 @@ describe('resolveTier — auto', () => {
   });
 
   it('ships with an EMPTY allowlist — an unmeasured entry is what ossifies', () => {
-    expect(TIER_ALLOWLIST.iosModels).toHaveLength(0);
     expect(TIER_ALLOWLIST.androidGpuPatterns).toHaveLength(0);
-  });
-
-  it('matches an allowlisted iOS MODEL (the GPU string is masked on iOS)', () => {
-    withAllowlist(() => {
-      const r = resolveTier({ platform: 'ios', deviceModel: 'iPhone16,2', projectSetting: 'auto' });
-      expect(r).toMatchObject({ tier: 'high', source: 'allowlist' });
-    }, ['iPhone16,2']);
   });
 
   it('matches an allowlisted Android GPU STRING, not a model name', () => {
@@ -117,7 +109,7 @@ describe('resolveTier — auto', () => {
         platform: 'android', gpuRenderer: 'Adreno (TM) 619', projectSetting: 'auto',
       });
       expect(r).toMatchObject({ tier: 'high', source: 'allowlist' });
-    }, [], [/Adreno \(TM\) 6[12]9/]);
+    }, [/Adreno \(TM\) 6[12]9/]);
   });
 
   it('falls through to calibrating when the allowlist does not match', () => {
@@ -126,7 +118,109 @@ describe('resolveTier — auto', () => {
         platform: 'android', gpuRenderer: 'Adreno (TM) 610', projectSetting: 'auto',
       });
       expect(r.source).toBe('calibrating');
-    }, [], [/Adreno \(TM\) 619/]);
+    }, [/Adreno \(TM\) 619/]);
+  });
+});
+
+describe('resolveTier — the boot ramp probe (#188)', () => {
+  const mobile = { platform: 'android', projectSetting: 'auto' as const, formFactor: 'mobile' as const };
+
+  it('promotes a device the probe measured as capable', () => {
+    expect(resolveTier({ ...mobile, probeClass: 'capable' }))
+      .toMatchObject({ tier: 'high', source: 'measured' });
+  });
+
+  it('keeps a measured-weak device low, and SAYS it measured it', () => {
+    // `weak` and `unknown` both land on low, but they are different statements: one is a
+    // measurement, the other is the absence of one. If the reason did not distinguish them, an
+    // inert probe would be indistinguishable from a probe that ran and said no.
+    const weak = resolveTier({ ...mobile, probeClass: 'weak' });
+    const none = resolveTier({ ...mobile });
+    expect(weak).toMatchObject({ tier: 'low', source: 'measured' });
+    expect(none).toMatchObject({ tier: 'low', source: 'calibrating' });
+    expect(weak.reason).not.toBe(none.reason);
+  });
+
+  it('treats an `unknown` verdict as no information — exactly today\'s behaviour', () => {
+    // This is the shipped state (PROBE_THRESHOLDS unset), so it is the case that must not change
+    // any device's tier.
+    expect(resolveTier({ ...mobile, probeClass: 'unknown' }))
+      .toMatchObject({ tier: 'low', source: 'calibrating' });
+  });
+
+  it('never lets the probe override a player choice or a project pin', () => {
+    expect(resolveTier({ ...mobile, probeClass: 'capable', playerChoice: 'low' }))
+      .toMatchObject({ tier: 'low', source: 'player' });
+    expect(resolveTier({ ...mobile, projectSetting: 'low', probeClass: 'capable' }))
+      .toMatchObject({ tier: 'low', source: 'project' });
+  });
+
+  it('sits BELOW the desktop carve-out, so a desktop never pays a launch-blocking probe', () => {
+    const r = resolveTier({ platform: 'web', projectSetting: 'auto', formFactor: 'desktop' });
+    expect(r.source).toBe('desktop');
+    // The caller keys off exactly this: anything other than `calibrating` means "already
+    // answered", so the probe is never run at all.
+    expect(r.source).not.toBe('calibrating');
+  });
+
+  it('sits BELOW the iOS model id, which answers statically and for free', () => {
+    expect(resolveTier({ platform: 'ios', deviceModel: 'iPhone10,1', projectSetting: 'auto' }).source)
+      .toBe('model');
+  });
+});
+
+describe('iOS resolves from the model id (owner, 2026-08-09)', () => {
+  it('parses a model id into family + generation', () => {
+    expect(parseAppleModel('iPhone10,1')).toEqual({ family: 'iPhone', generation: 10 });
+    expect(parseAppleModel(' iPad13,4 ')).toEqual({ family: 'iPad', generation: 13 });
+  });
+
+  it('refuses anything unparseable rather than coercing it to a tier', () => {
+    // A masked, spoofed or simulator string must fall through to the measured path, not be
+    // rounded into a confident answer.
+    for (const junk of ['', 'iPhone', 'x86_64', 'iPhone,1', 'Apple GPU']) {
+      expect(parseAppleModel(junk)).toBeNull();
+      expect(iosModelTier(junk)).toBeNull();
+    }
+    expect(iosModelTier(undefined)).toBeNull();
+  });
+
+  it('puts the iPhone 8 on low — the one boundary that is actually MEASURED', () => {
+    // iPhone10,1 is A11: 27 ms -> 56 ms with NPR alone, missing the 33.3 ms budget.
+    expect(iosModelTier('iPhone10,1')).toBe('low');
+    // ...and the iPhone X is iPhone10,3, the SAME A11 silicon, so grouping them is correct.
+    expect(iosModelTier('iPhone10,3')).toBe('low');
+  });
+
+  it('is a THRESHOLD, so hardware that does not exist yet is never wrongly demoted', () => {
+    // The failure mode of an enumerated list: a phone absent from it gets `low` forever. A
+    // `>= N` rule cannot do that, because newer Apple silicon is only ever faster.
+    expect(iosModelTier('iPhone11,8')).toBe('high');
+    expect(iosModelTier('iPhone99,1')).toBe('high');
+  });
+
+  it('does not borrow the iPhone number for iPads — they run their own sequence', () => {
+    expect(IOS_HIGH_TIER_MIN_GENERATION.iPad).not.toBe(IOS_HIGH_TIER_MIN_GENERATION.iPhone);
+    expect(iosModelTier('iPad11,1')).toBe('high');
+  });
+
+  it('falls through for a family with no floor, rather than inventing one', () => {
+    // No iPod touch can run the iOS 16.4 floor, so one appearing is out of scope.
+    expect(iosModelTier('iPod9,1')).toBeNull();
+    expect(resolveTier({ platform: 'ios', deviceModel: 'iPod9,1', projectSetting: 'auto' }).source)
+      .toBe('calibrating');
+  });
+
+  it('resolves the tier from the model, reporting `model` as the source', () => {
+    const r = resolveTier({ platform: 'ios', deviceModel: 'iPhone16,2', projectSetting: 'auto' });
+    expect(r).toMatchObject({ tier: 'high', source: 'model' });
+    expect(r.reason).toMatch(/iPhone16,2/);
+  });
+
+  it('leaves iOS WEB on the measured path — mobile Safari reports no model', () => {
+    // Every published demo ships web-only, so this is not an edge case: with no `GameDebug`
+    // plugin there is no model id, and the model rule must not fire on its absence.
+    expect(resolveTier({ platform: 'ios', projectSetting: 'auto' }).source).toBe('calibrating');
   });
 });
 

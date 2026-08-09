@@ -1,17 +1,21 @@
 /** MTSDF text shader — the shared distance-field sampling + effect compositing.
  *
- *  Fill uses the median of the RGB channels (sharp corners); soft effects (outline,
- *  glow) use the **alpha channel** (a true SDF, present only in `mtsdf`) so they
- *  stay smooth where the RGB median would ring at corners. `screenPxRange` converts
- *  the field to screen-pixel space for resolution-independent AA via `fwidth` — fed
- *  a `uTexSize` uniform (not GLSL3 `textureSize`) so the exact same fragment body
- *  works in WebGL1/2 AND can be reused for the Pixi 2D path (Phase 5).
+ *  Fill and outline use the median of the RGB channels (sharp corners); glow and a soft
+ *  shadow use the **alpha channel** (a true SDF, present only in `mtsdf`) so they stay
+ *  smooth where the median would ring — falling back to the median when the atlas has no
+ *  alpha SDF (`hasTrueSdf`). `screenPxRange` converts the field to screen-pixel space for
+ *  resolution-independent AA via `fwidth`, fed a `uTexSize` uniform (not GLSL3
+ *  `textureSize`) so the maths is backend-portable.
  *
- *  This module owns the Three.js material; the fragment GLSL is exported for the
- *  Pixi shader to reuse. Effects are threshold bands around the 0.5 edge:
- *    weight  — shifts the edge (bolder/thinner)
+ *  This module owns the THREE material only. Its PixiJS twin is `mtsdfPixiShader.ts`,
+ *  which generates the same maths as WGSL + GLSL source; the two are kept in step by
+ *  hand (there is no shared body — a GLSL constant exported from here for that purpose
+ *  went unimported for months and drifted from both). Effects are threshold bands around
+ *  the 0.5 edge:
+ *    weight  — shifts the edge outward (faux-bold; see MtsdfStyle.weight)
  *    outline — a second band outside the fill, `uOutlineWidth` wide
  *    glow    — a wide soft band, smoothstepped, composited under the glyph
+ *    shadow  — the silhouette re-sampled at an offset UV, behind everything
  */
 
 import * as THREE from 'three';
@@ -21,58 +25,8 @@ import { texture as texNode, uniform, uv, vec2, float, max, min, clamp, mix, smo
 // The style shape + spread budgets live in a three-FREE module so the Pixi 2D text
 // shader can share them without dragging `three/webgpu` into a 2D-only build. Re-export
 // here so existing 3D consumers (scene3DSync) keep their single import site.
-import { GLOW_MAX_SPREAD, OUTLINE_MAX_SPREAD, type MtsdfStyle } from './mtsdfStyle';
+import { GLOW_MAX_SPREAD, OUTLINE_MAX_SPREAD, clampShadowOffset, type MtsdfStyle } from './mtsdfStyle';
 export { GLOW_MAX_SPREAD, OUTLINE_MAX_SPREAD, type MtsdfStyle } from './mtsdfStyle';
-
-/** The MTSDF fragment body (GLSL, WebGL1/2-portable). Reused by the Pixi shader. */
-export const MTSDF_FRAGMENT_GLSL = /* glsl */`
-float mtsdfMedian(vec3 s){ return max(min(s.r, s.g), min(max(s.r, s.g), s.b)); }
-
-vec4 mtsdfResolve(
-  vec4 texel, vec2 uv,
-  vec2 texSize, float distanceRange,
-  vec4 color, float weight,
-  vec4 outlineColor, float outlineWidth,
-  vec4 glowColor, float glowSize, float glowStrength
-){
-  float sd  = mtsdfMedian(texel.rgb); // crisp fill distance
-  float asd = texel.a;                // true SDF for soft effects (mtsdf)
-
-  vec2 unitRange = vec2(distanceRange) / texSize;
-  vec2 screenTexSize = vec2(1.0) / fwidth(uv);
-  float spr = max(0.5 * dot(unitRange, screenTexSize), 1.0);
-
-  float edge = 0.5 - weight;
-  float fill = clamp((sd - edge) * spr + 0.5, 0.0, 1.0);
-
-  vec3 rgb = color.rgb;
-  float alpha = color.a * fill;
-
-  if (outlineWidth > 0.0) {
-    // Straight-alpha 'over' composite: fill OVER outline. (A max()/mix()
-    // approximation forces a translucent fill's interior opaque whenever the
-    // outline is more opaque — breaks fading text with an outline.)
-    float outline = clamp((asd - (edge - outlineWidth)) * spr + 0.5, 0.0, 1.0);
-    float fa = color.a * fill;
-    float oa = outlineColor.a * outline;
-    float outA = fa + oa * (1.0 - fa);
-    vec3 pre = color.rgb * fa + outlineColor.rgb * oa * (1.0 - fa);
-    rgb = outA > 0.0 ? pre / outA : color.rgb;
-    alpha = outA;
-  }
-
-  if (glowSize > 0.0) {
-    float glow = smoothstep(edge - glowSize, edge, asd) * glowStrength;
-    float ga = glowColor.a * glow;
-    float outA = alpha + ga * (1.0 - alpha);
-    vec3 outRgb = rgb * alpha + glowColor.rgb * ga * (1.0 - alpha);
-    rgb = outA > 0.0 ? outRgb / outA : rgb;
-    alpha = outA;
-  }
-
-  return vec4(rgb, alpha);
-}
-`;
 
 // TSL node graphs mix float/vec types freely (a float `.div` a vec2, `dot` of two
 // vec2s, texture swizzles); the strict TSL TS types fight that in glue code, so the
@@ -102,10 +56,12 @@ interface MtsdfUniforms {
 const uni = (v: unknown): TUniform => uniform(v as never);
 /** em→UV scale for the shadow offset — the atlas renders `size` px/em, so 1 em is
  *  `size/atlasDim` in UV. Constant across glyphs (all baked at the same size). */
-function shadowUvOffset(style: MtsdfStyle, atlasSize: number, atlasW: number, atlasH: number): THREE.Vector2 {
+function shadowUvOffset(style: MtsdfStyle, atlasSize: number, atlasW: number, atlasH: number, distanceRange: number): THREE.Vector2 {
+  // Clamped to the atlas padding — see maxShadowOffsetEm. Past it the offset sample reads
+  // the neighbouring glyph, silently.
   return new THREE.Vector2(
-    (style.shadowOffsetX ?? 0) * atlasSize / atlasW,
-    (style.shadowOffsetY ?? 0) * atlasSize / atlasH,
+    clampShadowOffset(style.shadowOffsetX ?? 0, distanceRange, atlasSize) * atlasSize / atlasW,
+    clampShadowOffset(style.shadowOffsetY ?? 0, distanceRange, atlasSize) * atlasSize / atlasH,
   );
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
@@ -124,6 +80,15 @@ export function makeMtsdfMaterial(
   distanceRange: number,
   atlasSize: number,
   style: MtsdfStyle,
+  /** Does the atlas carry a TRUE SDF in alpha? True for `mtsdf`; false for a 3-channel
+   *  `msdf` bake, whose alpha samples as 1.0 everywhere — see the `asd` note below. The
+   *  graph is rebuilt per material, so this is a build-time branch rather than a uniform
+   *  (the Pixi twin shares ONE program and so needs `uHasTrueSdf`).
+   *
+   *  ⚠️ No default, deliberately: the caller must DECIDE. The Pixi twin's equivalent field
+   *  was optional for one commit and its caller quietly dropped it, leaving the fallback
+   *  off and the bug fully intact behind green tests. */
+  hasTrueSdf: boolean,
 ): THREE.Material {
   const u: MtsdfUniforms = {
     color: uni(new THREE.Color(style.color >>> 0)),
@@ -138,7 +103,7 @@ export function makeMtsdfMaterial(
     shadowColor: uni(new THREE.Color((style.shadowColor ?? 0) >>> 0)),
     shadowOpacity: uni(style.shadowOpacity ?? 0),
     shadowSoftness: uni(style.shadowSoftness ?? 0),
-    shadowOffset: uni(shadowUvOffset(style, atlasSize, atlasWidth, atlasHeight)),
+    shadowOffset: uni(shadowUvOffset(style, atlasSize, atlasWidth, atlasHeight, distanceRange)),
   };
   const uTexSize = uni(new THREE.Vector2(atlasWidth, atlasHeight));
   const uDistanceRange = uni(distanceRange);
@@ -152,12 +117,18 @@ export function makeMtsdfMaterial(
   const vUv = uv();
   const median = (t: TUniform) => max(min(t.r, t.g), min(max(t.r, t.g), t.b));
   const s = texNode(tex, vUv);
-  const asd = s.a;        // true SDF (mtsdf) — soft effects
+  const rawSd = median(s);
+  // The "soft-effect" distance: the alpha true-SDF on an mtsdf atlas, the MEDIAN on a
+  // 3-channel msdf one (whose alpha samples as 1.0 everywhere — smoothstep(.., 1) would
+  // saturate the whole quad, turning glow and soft shadow into solid rectangles, and
+  // clashUp = max(0, 1 - rawSd) would dilate the fill at every edge). Falling back to the
+  // median is what the DYNAMIC path already does by synthesizing alpha = median(RGB).
+  const asd = hasTrueSdf ? s.a : rawSd;
   // mtsdf corner-clash correction (see mtsdfPixiShader for the full rationale): at acute
   // corners the fill/outline MEDIAN nicks BELOW the true-SDF alpha — pull it UP to the
   // alpha, gated on being at/inside the edge so tight counters (alpha speckles high /
   // median correctly low) aren't filled and convex corners (median > alpha) stay sharp.
-  const rawSd = median(s);
+  // A no-op whenever asd == rawSd (msdf, and dynamic).
   const clashUp = max(float(0.0), asd.sub(rawSd));
   const insideGate = smoothstep(float(0.4), float(0.55), rawSd);
   const sd = rawSd.add(clashUp.mul(insideGate));
@@ -175,9 +146,13 @@ export function makeMtsdfMaterial(
   // a sharp outline wants the same clash-free field the fill uses (the alpha true-SDF
   // speckles in tight interior corners like the g counter). Masked so width 0 = off.
   const outlineMask = step(float(1e-5), u.outlineWidth);
-  // Inner threshold FLOORED at the field budget so a positive weight (lower 'edge')
-  // can't push the band past the field's outer saturation and flood the glyph quad.
-  const outlineLo = max(edge.sub(u.outlineWidth), float(0.5 - OUTLINE_MAX_SPREAD));
+  // Inner threshold floored TWICE — see the long note in mtsdfPixiShader.ts, which this
+  // must match exactly. The static budget stops a positive weight pushing the band past
+  // the field's outer saturation; the `0.5/spr` term is what stops the black-rect bug,
+  // because an outside texel (sd ~ 0) gets coverage 0.5 - outlineLo*spr, which is only
+  // zero when outlineLo >= 0.5/spr. The old constant satisfied that at spr >= 5 — i.e.
+  // large text — and failed as soon as the text was scaled down (#189).
+  const outlineLo = max(edge.sub(u.outlineWidth), max(float(0.5 - OUTLINE_MAX_SPREAD), float(0.5).div(spr)));
   const outline = clamp(sd.sub(outlineLo).mul(spr).add(0.5), 0.0, 1.0);
   const oa = u.outlineOpacity.mul(outline).mul(outlineMask);
   const contentA = fa.add(oa.mul(float(1.0).sub(fa)));
@@ -198,7 +173,7 @@ export function makeMtsdfMaterial(
   const shUv = vUv.sub(u.shadowOffset);
   const shTex = texNode(tex, shUv);
   const shCrisp = clamp(median(shTex).sub(edge).mul(spr).add(0.5), 0.0, 1.0);
-  const shSoft = smoothstep(edge.sub(u.shadowSoftness), edge, shTex.a);
+  const shSoft = smoothstep(edge.sub(u.shadowSoftness), edge, hasTrueSdf ? shTex.a : median(shTex));
   const shCov = mix(shCrisp, shSoft, step(float(1e-5), u.shadowSoftness));
   const shadowA = u.shadowOpacity.mul(shCov).mul(shadowMask);
 
@@ -219,10 +194,11 @@ export function makeMtsdfMaterial(
   const store = (mat as THREE.Material & { userData: MtsdfUserData }).userData;
   store.mtsdfUniforms = u;
   store.mtsdfShadowScale = new THREE.Vector2(atlasSize / atlasWidth, atlasSize / atlasHeight);
+  store.mtsdfAtlas = { size: atlasSize, distanceRange };
   return mat;
 }
 
-interface MtsdfUserData { mtsdfUniforms?: MtsdfUniforms; mtsdfShadowScale?: THREE.Vector2 }
+interface MtsdfUserData { mtsdfUniforms?: MtsdfUniforms; mtsdfShadowScale?: THREE.Vector2; mtsdfAtlas?: { size: number; distanceRange: number } }
 
 /** Update an existing material's style uniforms in place (renderer calls this when
  *  a Text trait's style fields change — no node-graph rebuild). */
@@ -243,5 +219,11 @@ export function updateMtsdfStyle(mat: THREE.Material, style: MtsdfStyle): void {
   u.shadowOpacity.value = style.shadowOpacity ?? 0;
   u.shadowSoftness.value = style.shadowSoftness ?? 0;
   const scale = store.mtsdfShadowScale;
-  if (scale) (u.shadowOffset.value as THREE.Vector2).set((style.shadowOffsetX ?? 0) * scale.x, (style.shadowOffsetY ?? 0) * scale.y);
+  const at = store.mtsdfAtlas;
+  if (scale && at) {
+    (u.shadowOffset.value as THREE.Vector2).set(
+      clampShadowOffset(style.shadowOffsetX ?? 0, at.distanceRange, at.size) * scale.x,
+      clampShadowOffset(style.shadowOffsetY ?? 0, at.distanceRange, at.size) * scale.y,
+    );
+  }
 }

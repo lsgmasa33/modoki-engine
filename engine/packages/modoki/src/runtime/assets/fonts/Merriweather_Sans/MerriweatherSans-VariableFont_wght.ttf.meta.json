@@ -1,0 +1,12 @@
+{
+  "id": "beef0000-0000-4000-8000-000000000012",
+  "version": 2,
+  "font": {
+    "fieldType": "mtsdf",
+    "size": 128,
+    "pxRange": 8,
+    "charset": "ascii",
+    "atlasMax": 2048,
+    "mode": "baked"
+  }
+}

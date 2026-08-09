@@ -43,6 +43,9 @@ import {
   getActiveQualityTier, setActiveQualityTier, getActiveTierOrDefault,
 } from './renderSettings';
 import { resolveTier, tierShadowMapSize, tierAllowsIBL, tierAmbientBoost, tierExposureBoost, shadowBiasScale, type QualityTierSetting } from './qualityTier';
+import { classifyDevice, probeFingerprint, type DeviceClass } from './rampProbe';
+import { probeVerdictStore } from '../core/probeVerdictStore';
+import { isProbeInFlight, withProbeInFlight } from './probeReentrancy';
 import { applyInstancedBatching } from './instancedBatching';
 import { getDeviceCaps } from './deviceCaps';
 import { getPlayerQualityTier } from './playerQualityTier';
@@ -3005,7 +3008,7 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
         g.setAttribute('aTextColor', new THREE.BufferAttribute(geo.colors, 4)); // per-glyph colour (white ⇒ no tint)
         g.setIndex(new THREE.BufferAttribute(geo.indices, 1));
         g.translate(ax, ay, 0);
-        const mat = makeMtsdfMaterial(ptex, provider.atlas.width, provider.atlas.height, provider.atlas.distanceRange, provider.atlas.size, textStyle(t));
+        const mat = makeMtsdfMaterial(ptex, provider.atlas.width, provider.atlas.height, provider.atlas.distanceRange, provider.atlas.size, textStyle(t), provider.atlas.type !== 'msdf');
         const mesh = new THREE.Mesh(g, mat);
         // Per-glyph animation nudges verts past the static bounds; skip frustum
         // culling (text is cheap) so an animated glyph never pops out at the edge.
@@ -3325,6 +3328,16 @@ export function reconcileToneExposure(r: { toneMappingExposure: number }): void 
  *  knobs the tier clamps (`antialias` especially) are baked into the buffer at creation. */
 async function resolveActiveTier(setting: QualityTierSetting): Promise<void> {
   if (getActiveQualityTier()) return;
+  // ⚠️ RE-ENTRANCY. The probe below builds a renderer, renderer construction lands back here, and
+  // nothing has set a tier yet — so without this the call recurses without bound and the process
+  // dies. It killed an iPhone 13 mini's tab in ~80 ms, and was invisible on every desktop, which
+  // resolves 'desktop' and never reaches the probe. See probeReentrancy.ts.
+  //
+  // Returning without resolving is correct here: the probe's own renderer is throwaway, it is
+  // explicitly clamped to DPR 1 by the runner, and `getEffectiveThreeSettings()` falls back to the
+  // project's authored settings when no tier is active. The tier is resolved by the OUTER call
+  // once the probe returns.
+  if (isProbeInFlight()) return;
   // The player's stored choice outranks everything, including a pinned project setting — see
   // playerQualityTier.ts. Read before the early-out so a pin cannot hide it.
   const playerChoice = getPlayerQualityTier();
@@ -3344,7 +3357,7 @@ async function resolveActiveTier(setting: QualityTierSetting): Promise<void> {
     // A probe failure must not block rendering. resolveTier with no facts falls through to
     // "unrecognised device → start low", which is the safe direction (see its doc).
   }
-  setActiveQualityTier(resolveTier({
+  const facts = {
     platform: caps?.platform ?? '',
     playerChoice,
     deviceModel: caps?.deviceModel,
@@ -3352,7 +3365,70 @@ async function resolveActiveTier(setting: QualityTierSetting): Promise<void> {
     // Absent on a failed probe, which resolveTier reads as "handheld" — the safe side.
     formFactor: caps?.formFactor,
     projectSetting: setting,
-  }));
+  };
+
+  // Resolve WITHOUT the ramp probe first, and only pay for it if nothing cheaper answered.
+  //
+  // This is what gives the plan's "desktop skips it entirely" for free, and it extends the same
+  // courtesy to every other free answer: a player choice, a project pin, an iOS model id, an
+  // allowlisted Android GPU. `'calibrating'` is precisely the state that means "nothing here
+  // decided" — the state in which, before #188, a device sat on `low` forever because the
+  // promotion path never fired on any hardware ever measured.
+  const cheap = resolveTier(facts);
+  if (cheap.source !== 'calibrating') {
+    setActiveQualityTier(cheap);
+    return;
+  }
+
+  const probeClass = await resolveProbeClass(caps);
+  setActiveQualityTier(resolveTier({ ...facts, probeClass }));
+}
+
+/** The boot ramp probe's verdict — from cache when we have one for this hardware, otherwise by
+ *  running it (#188).
+ *
+ *  ⚠️ RUNNING IT BLOCKS THE LAUNCH, by owner decision and by necessity: the knobs a tier clamps —
+ *  `antialias` above all — are baked into the drawing buffer at renderer creation, so a verdict
+ *  that arrives after this point cannot be applied at all. The cache is what keeps that a
+ *  once-per-device cost rather than a once-per-launch one.
+ *
+ *  Never throws: any failure resolves `undefined`, which `resolveTier` reads as "no information"
+ *  and answers exactly as it did before this existed. */
+async function resolveProbeClass(
+  caps: Awaited<ReturnType<typeof getDeviceCaps>> | null,
+): Promise<DeviceClass | undefined> {
+  const fingerprint = probeFingerprint({
+    platform: caps?.platform,
+    deviceModel: caps?.deviceModel,
+    gpuRenderer: caps?.gpuRenderer,
+    viewportPx: typeof window === 'undefined' ? 0 : window.innerWidth * window.innerHeight,
+  });
+
+  const store = probeVerdictStore.get();
+  const cached = store?.read();
+  if (cached && cached.fingerprint === fingerprint) return cached.deviceClass;
+
+  try {
+    const { runBootRampProbe } = await import('./rampProbeRunner');
+    // Guarded: the probe constructs a renderer, which re-enters this very resolution path.
+    const measurement = await withProbeInFlight(() => runBootRampProbe());
+    if (!measurement) return undefined;
+    const verdict = classifyDevice(measurement);
+    console.warn(
+      `[rampProbe] ${verdict.deviceClass} — ${verdict.reason} `
+      + `(blocked launch ${measurement.totalMs.toFixed(0)}ms: renderer `
+      + `${measurement.rendererMs.toFixed(0)}ms + compile ${measurement.compileMs.toFixed(0)}ms + ramps; `
+      + `interval ${measurement.intervalMs.toFixed(1)}ms, `
+      + `fill ${measurement.fill.status}, draw ${measurement.draw.status})`,
+    );
+    // Only a real verdict is worth caching. Caching `'unknown'` would freeze in the state the
+    // probe is in TODAY (thresholds unset), so that filling those thresholds in would never
+    // reach a device that had already launched once.
+    if (verdict.deviceClass !== 'unknown') store?.write({ fingerprint, deviceClass: verdict.deviceClass });
+    return verdict.deviceClass === 'unknown' ? undefined : verdict.deviceClass;
+  } catch {
+    return undefined;
+  }
 }
 
 export interface MakeRendererOptions {

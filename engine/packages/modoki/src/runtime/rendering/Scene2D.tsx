@@ -1259,7 +1259,14 @@ export class Scene2DRenderer {
           disposeSlot(slot); this.slots.delete(id); this.lastTextRender.delete(id); slot = undefined;
         }
 
-        const atlas = { width: provider.atlas.width, height: provider.atlas.height, distanceRange: provider.atlas.distanceRange, size: provider.atlas.size };
+        // SPREAD, never an enumerated field list. A snapshot is wanted (it is stashed on the
+        // shader to re-derive the shadow offset on a style change), but naming the fields
+        // means a new one is silently dropped: `type` was added so the shader could tell an
+        // mtsdf atlas from a 3-channel msdf one, this literal kept omitting it, and the
+        // fallback stayed off — the msdf glow rendered as a solid rectangle exactly as
+        // before the fix, with the unit tests green because they assert on the shader
+        // SOURCE, not on the uniform that reaches it.
+        const atlas = { ...provider.atlas };
 
         // (Re)build geometry only when the layout changed (or the slot is new). One Mesh
         // per atlas PAGE the text touches (dynamic CJK spills across pages); baked text

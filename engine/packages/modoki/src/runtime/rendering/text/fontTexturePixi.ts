@@ -1,6 +1,7 @@
 /** PixiJS atlas-texture cache for SDF fonts — the 2D twin of {@link getFontTexture}
- *  (the Three version). One Pixi Texture per `${fontId}:${atlasVersion}`, loaded via
- *  Assets from the provider's atlas image URL and freed when the font is released
+ *  (the Three version). One Pixi Texture per `${fontId}:image` (the immutable baked
+ *  atlas) plus one per `${fontId}:canvas:${page}` (generated pages), freed when the font
+ *  is released
  *  (provider.addDisposable) — so the GPU texture tracks the font's scene-scoped life
  *  without the renderer-agnostic provider importing Pixi.
  *
@@ -78,9 +79,23 @@ function getDynamicFontTexturePixi(provider: FontProvider, page: number): Textur
  *  no image yet; `onReady` fires once a load completes so the caller can re-render.
  *  Baked fonts are single-page (page 0 → the image URL). */
 export function getFontTexturePixi(provider: FontProvider, page = 0, onReady?: () => void): Texture | null {
-  if (provider.atlasCanvasAt) return getDynamicFontTexturePixi(provider, page);
-  if (page !== 0 || !provider.atlasImageUrl) return null; // baked is single-page
-  const key = `${provider.id}:${provider.atlasVersion}`;
+  // Ask for a CANVAS first, and fall through when there isn't one — do NOT branch on the
+  // method merely existing. A baked-seeded dynamic font has both: page 0 is the baked
+  // IMAGE and generated pages follow it, so branching on `atlasCanvasAt` being defined
+  // would send page 0 down the canvas path and return null forever (no text at all).
+  // Matches getFontTexture (the Three twin), which already did it this way.
+  if (provider.atlasCanvasAt?.(page)) return getDynamicFontTexturePixi(provider, page);
+  if (page !== 0 || !provider.atlasImageUrl) return null; // only page 0 has an image
+  /** Page 0's IMAGE is IMMUTABLE, so its key must NOT carry atlasVersion.
+   *
+   *  ⚠️ A baked-seeded dynamic font bumps `atlasVersion` on EVERY generated glyph batch, and
+   *  its page 0 is the baked atlas image. Keyed by version, each batch minted a fresh key:
+   *  the cache missed, `getFontTexture*` returned null while a redundant load of the SAME url
+   *  started, and every baked glyph vanished for those frames — so typing CJK made the Latin
+   *  text flicker. The superseded Texture also stayed in the map under its old key until the
+   *  font was released. Harmless before this existed, because a provider was either all-image
+   *  (version pinned 0) or all-canvas (this path unreachable); the hybrid made both live. */
+  const key = `${provider.id}:image`;
   const existing = cache.get(key);
   if (existing) return existing;
   // Queue behind an in-flight load rather than dropping this caller's wake-up (see `waiters`).
