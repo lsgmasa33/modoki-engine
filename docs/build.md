@@ -199,8 +199,18 @@ mid-write leaves a lock file or a torn artifact for the next build to trip over.
 
 Windows takes the other road: no `detached` (there it allocates a new **console**, which the GUI
 editor would flash per step) and `taskkill /T /F /PID <pid>`, which walks the tree by parent pid.
-⚠️ Like the `winCmd` step forms, that path is **UNVALIDATED against a real Windows box** — verify it
-on the `win` clone (#182).
+That path was validated by hand on a real Windows box (#182 — 4/4 runs, the tool orphaned in
+every control run and reaped in every treatment run), and `buildStepShell.test.ts` carries a
+Windows suite that pins it.
+
+⚠️ **That suite is gated off CI, and the gate is a finding, not a convenience.** On the GitHub
+`windows-latest` runner its CONTROL fails: it finds a child of cmd.exe, then finds it gone after
+`close`. Something on that runner reaps the tool when its parent dies, which the hand-measured
+box does not do. The cost is subtler than a red build — if the tool dies there regardless of the
+kill, the treatment case passes for the wrong reason, so the suite was proving nothing about
+`taskkill /T` while looking green. One theory is already disproved (a broken stdout pipe killing
+`ping`: redirecting to `NUL` changed nothing). **The mechanism is still unknown and needs a
+debugger on a Windows box** — the surviving theories are listed above the suite.
 
 ⚠️ **Two residual holes, both about a handler that never runs:**
 

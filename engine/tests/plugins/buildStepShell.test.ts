@@ -161,20 +161,35 @@ describe.skipIf(process.platform === 'win32')('buildStepShell — killBuildProce
  *
  * Measured on a real Windows box before this was written: 4/4 runs, control survivors 4/4,
  * treatment survivors 0/4, parent dead in every control run.
+ *
+ * ⚠️ REAL BOX ONLY — this suite is gated off CI, and the gate is evidence-based, not a dodge.
+ * On the GitHub `windows-latest` runner the CONTROL fails: it FINDS a child of cmd.exe, then
+ * finds it gone after `close` + 500ms ("expected [] to deeply equal [ 1292 ]", then [ 840 ]).
+ * Something there reaps the tool when its parent dies, and the runner disagrees with the
+ * hand-measured 4/4 above on identical code.
+ *
+ * What that costs is not just a red build: if the tool dies on CI regardless of the kill, the
+ * TREATMENT case passes for the wrong reason — it was asserting "no survivors" against a child
+ * that was already dead. So on that runner this suite was proving nothing about `taskkill /T`
+ * while looking green. Gating it is what stops it vouching for coverage it does not have.
+ *
+ * DISPROVED (ci/main 31287701127): "ping writes to a pipe node owns, `proc.kill()` breaks the
+ * pipe, ping dies on the next write." Redirecting the tool's output to `NUL` removes that
+ * dependency entirely and the control failed identically. Not the mechanism.
+ *
+ * STILL OPEN, for whoever picks this up ON A WINDOWS BOX (#182) — all three need a debugger on
+ * the runner, none can be settled from a Mac:
+ *   1. libuv puts spawned children in a Job Object; something about the runner's job config may
+ *      reap the tree when cmd.exe exits.
+ *   2. `childrenOf` may be capturing a TRANSIENT child (conhost.exe, a nested cmd.exe) rather
+ *      than PING.EXE — a pid that was always going to exit on its own. Filtering by image name
+ *      would settle this one, and is the cheapest of the three to try.
+ *   3. The runner's session/console teardown differs from an interactive box.
  */
-describe.runIf(process.platform === 'win32')('buildStepShell — killBuildProcess kills the whole tree on Windows (#182)', () => {
+describe.runIf(process.platform === 'win32' && !process.env.CI)('buildStepShell — killBuildProcess kills the whole tree on Windows (#182)', () => {
   // A SIMPLE command on purpose — see the header. `ping -n 30` is the measured shape: it runs
   // long enough to observe and needs no shell builtins.
-  //
-  // ⚠️ `> NUL` is load-bearing, not tidiness. Without it the CONTROL failed on the GitHub
-  // Windows runner ("expected [] to deeply equal [ 1292 ]" — the tool was found, then gone):
-  // `ping` writes a line per second into a pipe NODE owns, `proc.kill()` tears that pipe down,
-  // and PING's next write hits a broken pipe and exits. Windows has no automatic tree kill, so
-  // that write is the only thing that could have killed it. The header's "survivors 4/4" was
-  // measured by hand, where the tool inherits a CONSOLE rather than a pipe and nothing breaks —
-  // which is exactly why the manual box and CI disagreed on identical code. Redirecting to NUL
-  // removes the tool's dependency on node's pipe, so the control tests parent-death alone.
-  const SIMPLE = 'ping -n 30 127.0.0.1 > NUL'
+  const SIMPLE = 'ping -n 30 127.0.0.1'
 
   // The same PowerShell queries the #182 step-1 measurement used, so the test exercises the
   // mechanism through the same lens the manual run did.
