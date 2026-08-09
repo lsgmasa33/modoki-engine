@@ -3,17 +3,17 @@
  * shadow quad — the cheap grounding cue for entities that don't cast a real shadow (see
  * `BlobShadow`'s doc for why). Mirrors `flameMeshSync`'s create/update/reap shape.
  *
- * Each entity gets its OWN Mesh sharing a single module-level `CircleGeometry` — the DISC is
- * the shape; the material just draws it at a uniform opacity. Two softer approaches were built
- * and both rendered fully transparent (a `CanvasTexture` alpha, then a procedural falloff in
- * the node graph); see `buildBlobMaterial` for the bisection. Per frame: raycast straight down
- * from the entity's world position; a hit places the disc flush against the surface (tilted to
- * its normal) and fades opacity by height above it; no hit (or no physics world) hides it.
+ * Each entity gets its OWN Mesh sharing a single module-level `CircleGeometry`. The disc gives
+ * the extent; a shader falloff gives the SOFT EDGE (`softness`, live-tunable — see
+ * `buildBlobMaterial`, which also records why an earlier attempt at that edge rendered fully
+ * transparent and what it was NOT). Per frame: raycast straight down from the entity's world
+ * position; a hit places the disc flush against the surface (tilted to its normal) and fades
+ * opacity by height above it; no hit (or no physics world) hides it.
  */
 
 import * as THREE from 'three';
-import { NodeMaterial } from 'three/webgpu';
-import { uniform, vec3 } from 'three/tsl';
+import { MeshBasicNodeMaterial } from 'three/webgpu';
+import { uniform, vec3, uv } from 'three/tsl';
 import type { World } from 'koota';
 import { Transform } from '../core/traits/Transform';
 import { BlobShadow } from '../traits/BlobShadow';
@@ -83,8 +83,9 @@ export function blobShadowPlacement(
 
 interface BlobRec {
   mesh: THREE.Mesh;
-  mat: NodeMaterial;
+  mat: MeshBasicNodeMaterial;
   opacityUniform: { value: number };
+  edgeUniform: { value: number };
 }
 
 export interface BlobShadowSyncState {
@@ -107,31 +108,88 @@ const _up = new THREE.Vector3(0, 0, 1); // CircleGeometry's face normal (it lies
 const _normalVec = new THREE.Vector3();
 const _quat = new THREE.Quaternion();
 
-/** Unlit black, drawn at a uniform opacity. The shape is the geometry (a disc), NOT a shader
- *  falloff — see the bisection recorded inside. */
-function buildBlobMaterial(): { mat: NodeMaterial; opacityUniform: { value: number } } {
-  const mat = new NodeMaterial();
+/** The normalized radius at which the edge fade STARTS, from a 0..1 `softness`. 0 is a
+ *  hard-edged disc; 1 fades from the very centre outward.
+ *
+ *  The 0.999 cap keeps `edge0 < edge1` strictly, so the shader never relies on what
+ *  `smoothstep(e, e, x)` does: that divides by zero, and the result only lands on a clean hard
+ *  step because +/-Inf clamps to 1/0 — except exactly at `x == e`, where it is 0/0. Cheap to
+ *  avoid, so avoid it. **It does NOT prevent an invisible blob** — an earlier version of this
+ *  comment claimed that, and it was wrong; see {@link buildBlobMaterial}. */
+export function blobEdgeStart(softness: number): number {
+  const s = Number.isFinite(softness) ? Math.min(1, Math.max(0, softness)) : 0;
+  return Math.min(0.999, 1 - s);
+}
+
+/** Unlit black disc whose EDGE is a shader falloff:
+ *  `alpha = opacity x (1 - smoothstep(edgeStart, 1, r))`, `r` being the normalized distance from
+ *  the disc centre. BOTH terms are uniforms, so the height fade and the softness retune per frame
+ *  without rebuilding the material — which is what makes softness tunable by eye on a device.
+ *
+ *  ── WHY THE SOFT EDGE PREVIOUSLY "DID NOT RENDER" — AND IT WAS NEVER THE SHADER ─────────
+ *  An earlier pass concluded that multiplying the opacity uniform by ANY position-derived falloff
+ *  rendered fully transparent, on WebGPU and WebGL both, root cause unknown — so the shape came
+ *  from the geometry and the edge stayed hard.
+ *
+ *  **No spelling of this falloff has ever been the problem.** Measured directly: the descending
+ *  form `r.smoothstep(1, 0.35)` and the ascending `r.smoothstep(0.35, 1).oneMinus()` are
+ *  mathematically identical AND render identically here (radial luminance profiles agree within
+ *  frame-to-frame animation noise). The descending spelling is also what `radialAlpha()` in
+ *  `particles/billboardTsl.ts` has shipped engine-wide all along, on every particle. A prior
+ *  version of this comment blamed `smoothstep`'s edge order; that was WRONG and is recorded
+ *  rather than quietly deleted, because it is exactly the plausible-but-unverified explanation
+ *  this repo keeps paying for.
+ *
+ *  What actually hides the blob is never the falloff — it is one of these, all of which read as
+ *  "the shader renders nothing":
+ *    - the game is STOPPED, so there is no physics world, the ground raycast returns null and
+ *      `blobShadowPlacement` hides the mesh (the single most common false alarm);
+ *    - the editor's panel layout moved the canvas rect, so a screenshot crop aimed by remembered
+ *      pixels is looking at empty space;
+ *    - the DEPTH TEST clipped it (see below).
+ *  **Assert `mesh.visible === true` and project the mesh's screen position IN THE SAME CALL as
+ *  the capture.** Three separate wrong readings here came from skipping that.
+ *
+ *  Also NOT the cause, tested and cleared: the material class (bare `NodeMaterial` and
+ *  `MeshBasicNodeMaterial` behave identically), and the varying pipeline (the generated WGSL
+ *  writes `varyings.nodeVarying4 = uv` in the vertex stage and reads it in the fragment stage).
+ *  **`renderer.debug.getShaderAsync(scene, camera, mesh)` prints that WGSL and settles this whole
+ *  class of question in one call** — reach for it before bisecting a node graph by screenshot.
+ *
+ *  The ascending spelling below is kept as a style choice (it never leans on a spec-undefined
+ *  edge order), NOT as the fix.
+ *
+ *  ⚠️ A LARGE blob on undulating ground is clipped by the DEPTH TEST, not by the shader: the disc
+ *  is flat and sits `groundOffset` above ONE raycast hit, so terrain rising inside the radius
+ *  occludes it. Scale `groundOffset` with `radius`. This is not a shader bug, and mistaking it
+ *  for one is expensive — a debug radius of 2.5 made a working soft edge look broken here. */
+function buildBlobMaterial(): {
+  mat: MeshBasicNodeMaterial;
+  opacityUniform: { value: number };
+  edgeUniform: { value: number };
+} {
+  const mat = new MeshBasicNodeMaterial(); // unlit on purpose — this trait exists to be cheap
   mat.transparent = true;
   mat.depthWrite = false;
   const opacityUniform = uniform(0);
-  // Opacity is the bare uniform, and the SHAPE comes from the geometry (a disc), because a
-  // computed falloff term does not render. Bisected in the editor on WebGPU AND on a Huawei Y6
-  // on WebGL, so it is not backend-specific: `opacityNode = float(0.7)` draws a solid quad, and
-  // the live node graph shows the uniform carrying the right value (0.547), but multiplying it
-  // by ANY position-derived falloff — smoothstep OR a plain clamped linear ramp — renders fully
-  // transparent. Root cause not established; a hard-edged disc is the shippable shape until it
-  // is. See docs/plans/low-end-device-support.md.
+  const edgeUniform = uniform(blobEdgeStart(0.65));
+  const r = uv().sub(0.5).length().mul(2);                 // 0 at the centre -> 1 at the rim
+  const falloff = r.smoothstep(edgeUniform, 1).oneMinus(); // 1 in the core -> 0 at the rim
   mat.colorNode = vec3(0, 0, 0);
-  mat.opacityNode = opacityUniform;
+  mat.opacityNode = opacityUniform.mul(falloff);
   mat.name = 'blob-disc';
-  return { mat, opacityUniform: opacityUniform as unknown as { value: number } };
+  return {
+    mat,
+    opacityUniform: opacityUniform as unknown as { value: number },
+    edgeUniform: edgeUniform as unknown as { value: number },
+  };
 }
 
 export function syncBlobShadows(world: World, scene: THREE.Object3D, state: BlobShadowSyncState): void {
   const seen = new Set<number>();
 
   type TransformData = { x: number; y: number; z: number };
-  type BlobData = { radius: number; opacity: number; groundOffset: number; maxDrop: number; fadeStart: number; fadeHeight: number };
+  type BlobData = { radius: number; opacity: number; groundOffset: number; maxDrop: number; fadeStart: number; fadeHeight: number; softness: number };
 
   world.query(Transform, BlobShadow).updateEach(([tf, bs]: [TransformData, BlobData], entity) => {
     const id = entity.id();
@@ -140,13 +198,13 @@ export function syncBlobShadows(world: World, scene: THREE.Object3D, state: Blob
 
     let rec = state.recs.get(id);
     if (!rec) {
-      const { mat, opacityUniform } = buildBlobMaterial();
+      const { mat, opacityUniform, edgeUniform } = buildBlobMaterial();
       const mesh = new THREE.Mesh(blobGeometry(), mat);
       mesh.frustumCulled = false; // tiny, cheap, and repositions every frame
       mesh.renderOrder = 10; // after opaque geometry
       mesh.layers.set(DEFAULT_LAYER);
       scene.add(mesh);
-      rec = { mesh, mat, opacityUniform };
+      rec = { mesh, mat, opacityUniform, edgeUniform };
       state.recs.set(id, rec);
     }
 
@@ -172,6 +230,10 @@ export function syncBlobShadows(world: World, scene: THREE.Object3D, state: Blob
     rec.mesh.quaternion.copy(_quat);
     rec.mesh.scale.set(bs.radius * 2, bs.radius * 2, 1);
     rec.opacityUniform.value = placement.opacity;
+    // Written every frame, like the opacity — softness is a live-tunable uniform rather than a
+    // per-material constant, so editing it in the Inspector (or the debug menu on a device)
+    // retunes the edge with no material rebuild and no shader recompile.
+    rec.edgeUniform.value = blobEdgeStart(bs.softness);
   });
 
   for (const [id, rec] of state.recs) {

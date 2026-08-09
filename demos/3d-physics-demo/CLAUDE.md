@@ -64,8 +64,16 @@ everything is authored in the scenes — **the scene is the source of truth**
 
 ## Identity & build
 - appId `com.modokiengine.physics3ddemo`, appName "3D Physics Demo".
-- **Web-only.** No `ios/`/`android/` folders, and none should be added — demos ship
-  web-only so no signing identity, Firebase config, or ad ids can travel with them.
+- **Native iOS + Android are committed here** (same arrangement as `demos/2d-physics-demo`):
+  the folders live in the private repo, and `scripts/publish-demo.sh` **drops them from the
+  public snapshot**, so the published demo is still web-only. (This entry used to say
+  "web-only, no `ios/`/`android/` folders, and none should be added" — that is no longer the
+  rule for this demo.)
+- **iOS signing is a per-machine setting, not a repo one.** `build.appleTeamId` is a private
+  build field: the committed `project.config.json` always holds `""`, and a real Team ID
+  lives only in the gitignored `project.user.json`. So a fresh clone has none and iOS
+  signing fails until you set one in **Project Settings → iOS → Signing**. Reading the
+  committed file tells you nothing about whether anyone has signed this demo.
 - Build/run: open in the Modoki Editor (**File → Open Project**), then **Build → Web**.
 
 ## Driving this project

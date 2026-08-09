@@ -32,4 +32,10 @@ export const BlobShadow = trait({
   fadeStart: 0,
   /** opacity fades linearly to 0 as the entity rises this far beyond `fadeStart` (world units) */
   fadeHeight: 2,
+  /** how soft the blob's EDGE is, 0..1 — a shader falloff across the disc, independent of the
+   *  height fade above. 0 is a hard-edged disc (the original shape); 1 fades from the very
+   *  centre outward; the default fades over the outer ~65% of the radius, which reads as a
+   *  contact shadow rather than a decal. Live-tunable — it is a uniform, not baked per material,
+   *  so tuning it by eye on a device costs no rebuild. */
+  softness: 0.65,
 });

@@ -273,6 +273,9 @@ export function registerAllTraits() {
       maxDrop: { type: 'number', min: 0, step: 0.5, tooltip: 'How far straight down to search for ground before giving up' },
       fadeStart: { type: 'number', min: 0, step: 0.1, tooltip: 'Distance from the entity\'s origin (not its feet) to the ground at full opacity — e.g. ~1 for a standing capsule character' },
       fadeHeight: { type: 'number', min: 0, step: 0.1, tooltip: 'Opacity fades linearly to 0 as the entity rises this far beyond fadeStart' },
+      // min/max matter here beyond tidiness: `blobEdgeStart` clamps to 0..1, so an unbounded
+      // field would let the Inspector show a value the shader is not using.
+      softness: { type: 'number', min: 0, max: 1, step: 0.05, tooltip: 'Edge softness: 0 is a hard-edged disc, 1 fades from the centre. Applies live — no rebuild' },
     },
   });
 
