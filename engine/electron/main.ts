@@ -112,6 +112,8 @@ import { modelReimportHandler } from '../plugins/reimport-model';
 import { audioReimportHandler } from '../plugins/reimport-audio';
 import { fontReimportHandler } from '../plugins/reimport-font';
 import { environmentReimportHandler } from '../plugins/reimport-environment';
+import { atlasReimportHandler } from '../plugins/reimport-atlas';
+import { videoReimportHandler } from '../plugins/reimport-video';
 import type { BackendContext } from '../plugins/backend/editorBackendRouter';
 import type { SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { ENGINE_VERSION } from '../packages/modoki/src/runtime/core/version';
@@ -1203,9 +1205,17 @@ app.whenReady().then(async () => {
 
   // Register the per-type reimport handlers (the Vite plugin does this in
   // configResolved; main must do it itself so /api/reimport has handlers).
+  //
+  // THIS LIST MUST MATCH the Vite plugin's — they are two registrations of one registry,
+  // and they drifted silently: `atlas` and `video` were registered only in the plugin, so
+  // the DESKTOP editor (the thing that ships) reported them as having "no import pipeline"
+  // while dev-serving worked. A guard test now asserts the two agree; see
+  // engine/tests/architecture/reimportHandlerParity.test.ts.
   registerReimportHandler('texture', textureReimportHandler);
   registerReimportHandler('model', modelReimportHandler);
+  registerReimportHandler('atlas', atlasReimportHandler);
   registerReimportHandler('audio', audioReimportHandler);
+  registerReimportHandler('video', videoReimportHandler);
   registerReimportHandler('font', fontReimportHandler);
   registerReimportHandler('environment', environmentReimportHandler);
 

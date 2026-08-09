@@ -16,7 +16,7 @@ import {
   selectionSizeGate,
   selectionAnchorGate,
   type UiPreset,
-} from '../../src/editor/uiAuthoring';
+} from '../../src/runtime/ui/uiAuthoring';
 
 const ALL_PRESETS: UiPreset[] = ['view', 'text', 'image', 'button', 'input', 'slider'];
 

@@ -5,10 +5,18 @@
  *  IDENTICAL entities — one source of truth, no drift. UI presets route through
  *  buildUiCreateSpecs (anchor-first authoring); everything else is here. Each
  *  builder returns the display `name` (used in both the label and EntityAttributes)
- *  plus the `specs` to hand to createEntityWithUndo. */
+ *  plus the `specs` to hand to createEntityWithUndo.
+ *
+ *  Lives in `runtime/` (not `editor/`) since #166: the DEVICE `create-entity` op needs these
+ *  builders, and the editor half of the package is stripped from a shipped game build. Nothing
+ *  here touches the editor — it is pure spec construction. See
+ *  docs/plans/device-authoring-parity-plan.md §7. */
 
-import type { TraitSpec } from './undo/entityActions';
-import { buildUiCreateSpecs, type UiPreset } from './uiAuthoring';
+import { buildUiCreateSpecs, type UiPreset } from '../ui/uiAuthoring';
+
+/** One trait to put on a new entity. Defined HERE rather than in the editor's undo layer so both
+ *  the undoable editor path and the undo-free runtime/device path name the same shape. */
+export interface TraitSpec { name: string; data?: Record<string, unknown> }
 
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 

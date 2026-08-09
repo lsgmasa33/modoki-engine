@@ -7,7 +7,7 @@ import {
 
 // We need to test against the real world since entityIntrospect uses it.
 // Import the actual module which depends on world.
-import { getCurrentWorld } from '@modoki/engine/runtime';
+import { getCurrentWorld, spawnEntity } from '@modoki/engine/runtime';
 import {
   getEntityTraits, readTraitData, writeTraitField, getAllEntities, deleteEntity,
 } from '@modoki/engine/runtime';
@@ -45,7 +45,7 @@ describe('entityIntrospect', () => {
 
   beforeEach(() => {
     // Spawn a test entity
-    const entity = getCurrentWorld().spawn(
+    const entity = spawnEntity(getCurrentWorld(), 
       Transform({ x: 1, y: 2, z: 3 }),
       Renderable3D({ mesh: 'test-cube' }),
     );

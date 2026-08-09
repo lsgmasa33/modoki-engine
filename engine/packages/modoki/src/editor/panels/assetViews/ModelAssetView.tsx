@@ -23,6 +23,7 @@ import { decimateMesh, buildCollisionGLB, bytesToBase64, mergeModelGeometry } fr
 import { inputStyle, BufferedNumberInput } from '../fields';
 import { ModelPreview } from '../ModelPreview';
 import { formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';
+import { withCurrentValue } from './importSettingOptions';
 
 /** Cheap rigged-detection: does this GLB declare a skin? Fetches the file and reads
  *  only its glTF JSON chunk (glbDeclaresSkin), so the Model inspector shows
@@ -324,7 +325,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
         <div style={rowStyle}>
           <span style={labelStyle}>Max Size</span>
           <select value={String(texSettings.maxSize)} onChange={(e) => updateTex({ maxSize: Number(e.target.value) as TextureImportSettings['maxSize'] })} style={{ ...inputStyle, flex: 1 }}>
-            {TEXTURE_MAX_SIZES.map((s) => <option key={s} value={s}>{s}</option>)}
+            {withCurrentValue(TEXTURE_MAX_SIZES, texSettings.maxSize).map((s) => <option key={s} value={s}>{s}</option>)}
           </select>
         </div>
         <label style={{ ...rowStyle, cursor: 'pointer' }}>
@@ -335,7 +336,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
           <div style={rowStyle}>
             <span style={labelStyle}>UASTC Level</span>
             <select value={String(texSettings.uastcLevel ?? DEFAULT_UASTC_LEVEL)} onChange={(e) => updateTex({ uastcLevel: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
-              {UASTC_LEVELS.map((l) => <option key={l} value={l}>{l}{l === DEFAULT_UASTC_LEVEL ? ' (default)' : ''}</option>)}
+              {withCurrentValue(UASTC_LEVELS, texSettings.uastcLevel ?? DEFAULT_UASTC_LEVEL).map((l) => <option key={l} value={l}>{l}{l === DEFAULT_UASTC_LEVEL ? ' (default)' : ''}</option>)}
             </select>
           </div>
           <div style={rowStyle}>

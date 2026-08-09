@@ -11,7 +11,7 @@ See also: [Architecture](./architecture.md) · [Prefabs](./prefabs.md) · [Visua
 
 ## Two-world architecture
 
-There is **no singleton world**. `runtime/ecs/worldRegistry.ts` owns the active
+There is **no singleton world**. `runtime/core/ecs/worldRegistry.ts` owns the active
 koota `World` and exposes:
 
 - `getCurrentWorld()` — the active "main" world (created lazily on first call).
@@ -24,9 +24,9 @@ koota `World` and exposes:
 
 Consumers must call `getCurrentWorld()` **inside** callbacks/functions, never
 capture it at module load — otherwise a swap wouldn't take effect for them.
-`runtime/ecs/world.ts` re-exports these and adds entity-index helpers
-(`registerEntity`, `findEntityById`, `unregisterEntity`, `findEntityByGuid`,
-`guidOf`) — the guid lookup is load-bearing for resolving a guid-form `parentId` /
+`runtime/core/ecs/world.ts` re-exports these and adds entity-index helpers
+(`spawnEntity`, `destroyEntity`, `registerEntity`, `findEntityById`,
+`unregisterEntity`, `findEntityByGuid`, `guidOf`) — the guid lookup is load-bearing for resolving a guid-form `parentId` /
 `rootInstanceId` on load (see "Entity-id stability on disk" below).
 
 During a load, `SceneManager` builds a fresh staging world with koota's
@@ -103,8 +103,10 @@ So the round trip is lossless, and a file records only what was actually *author
 
 The point is that **defaults stay live**. Writing every field out freezes a scene at the
 defaults of the day it was saved, so a later change to a trait default silently stops
-reaching it — a semantic change, not diff noise. (This is what kept the repo-wide
-legacy-scene migration on hold; owner's decision to omit, 2026-07-31.)
+reaching it — a semantic change, not diff noise. (Owner's decision to omit, 2026-07-31.)
+
+The repo-wide legacy-scene migration this decision had held up **was carried out on
+2026-08-04** — see "Re-saving legacy scenes" below.
 
 Three deliberate limits:
 
@@ -153,6 +155,24 @@ single ref-walking implementation rather than two that can drift.
 the entities (and every referenced prefab's nested entities, iteratively) so a
 stale manifest missing an entry — e.g. an HDR added after first serialization —
 still preloads everything and avoids first-view pop-in.
+`collectSceneResourceRefs` unions the stored array with a fresh
+`collectResourceRefsFromEntities` call, and dedupes.
+
+**The corollary is the one that bites: the safety net is only as good as the WALKER.**
+Both halves of that union come from the same function, so a ref *it* cannot see is missing
+from both — and no re-save can repair it, because the re-save calls the same walker. Two such
+blind spots were found and fixed in Aug 2026, and neither showed up as a build failure (the
+tree-shaker walks entities independently, so shipping was never affected):
+
+- **Asset GUIDs on GAME-defined traits** (#123) — the walk was driven by `REF_FIELDS_BY_TRAIT`,
+  an engine-only registry with no registration API. Now also swept generically: a GUID that
+  resolves in the asset manifest *is* an asset ref, which needs no per-game registration and
+  matches what the tree-shaker already does ([build.md](build.md) § "Assets the build cannot see").
+- **Refs introduced by a prefab-instance OVERRIDE** — `overrides`, `nestedOverrides`, and the
+  same two on a reference-style `added` node. Ordinary editor work ("instantiate, then swap this
+  instance's mesh") produced a ref nothing collected: `games/space-console/Station.scene.json`
+  had **31** override-only `Renderable3D.mesh`/`.material` GUIDs, both acquiring types, so they
+  were neither preloaded nor scene-refcounted at runtime.
 
 It follows that **a save REGENERATES `resources` rather than preserving it** —
 `serializeScene` discards the loaded array and rebuilds from the entities. So a file
@@ -192,6 +212,150 @@ Migrations chain in `loadSceneFile.ts` and run before any entity spawns:
   `id` field entirely. This is the terminal step — it stamps `data.version =
   SCENE_FORMAT_VERSION`, so bumping the constant without chaining a new migration
   can't silently mislabel a freshly-migrated file as under-versioned
+
+### Re-saving legacy scenes (the sha-churn migration)
+
+A scene committed before the migrations above stays on disk in its old, verbose shape until
+something re-saves it — the loader migrates in memory, so nothing forces the issue. The cost is
+**sha churn**: the first incidental save rewrites the whole file (compaction, the `id` drop, the
+`rootInstanceId` GUID rewrite, a rebuilt `resources`), and a one-line edit arrives as a
+700-line diff that no reviewer can read.
+
+Carried out repo-wide on **2026-08-04**: 48 scenes across 20 projects. The pass **converges** —
+re-saving an already-migrated scene is byte-identical, verified across *fresh editor processes*
+(not merely within one session, which would not have proven the `rootInstanceId` GUID is
+persisted rather than re-minted per launch).
+
+Tooling, for the next time a serializer change makes the committed files stale:
+
+```bash
+engine/scripts/resave-scenes.sh games/sling demos/forest-camp   # load -> save every scene
+node engine/scripts/check-scene-churn.mjs games/sling demos/forest-camp   # REVIEW GATE
+```
+
+The check script is not optional. `save-all` persists the **live world**, so the pass is only
+safe where loading a scene is side-effect-free, and two projects proved it is not.
+
+**You no longer have to run the sweep to LEARN that a manifest has drifted** (#135, which was
+found by accident during an unrelated prefab pass, on a tree that had been swept 2 days earlier).
+`engine/tests/assets/sceneResourceManifest.test.ts` compares every committed scene's stored
+`resources` against the live collector, by `(type, path)` and in BOTH directions — so a MISSING
+entry and a stale/mistyped one both fail `npm test`. The sweep is still what FIXES it; the test is
+what notices. Two things to know before reading a failure there:
+- It is blind to #123's class by construction — it compares the file against the same walker, so a
+  ref the walker cannot see is missing from both sides and looks like agreement.
+- Sub-sprite GUIDs live in the parent texture's `.meta.json` `sprites[]`, not as any file's own
+  `id`, and an unsliced 2D/UI texture also owns an auto `deriveGuid('sprite:' + guid)`. A manifest
+  populated without those makes the collector skip real refs, which surfaces as a false STALE on a
+  correct entry — measured on `games/space-invader`, and the reason that test mirrors the scanner.
+
+It compares the `resources` manifest by **identity**, and for any dropped ref scans the new scene
+body to answer the question a human used to be asked to answer by hand — a drop that is *still
+referenced* is reported as `⚠️ REGRESSION` and exits non-zero. It previously compared only the
+manifest's LENGTH, which is silent on a 1-for-1 swap: the space-invader re-save below swapped a
+legacy page-texture GUID for the sprite GUID the scene actually references, and the gate reported
+"0 semantic changes". A count is the one property a dropped ref can preserve while still being a drop.
+
+- **`games/chess` — was excluded (#124), now fixed on both halves.** Its game code spawns on
+  load; the save baked ~70 runtime entities (move highlights, rank/file labels, pieces) plus a
+  live progress-bar value into `chess.scene.json`. The **spawn** half is fixed by the `Transient`
+  tag at the spawn site; the **mutation** half by `pauseWhileStopped` on its two store→ECS
+  projections (both rules below). Verified live in an editor on `games/chess`: 83 entities in,
+  83 out, and **zero** changed values on any field present in both files — the whole remaining
+  diff is default-field elision from the format migration (version 9 → 12), which is what a
+  re-save is FOR. `games/llm-test` hit only the mutation half and is fixed the same way.
+
+  Worth knowing before trusting a diff on this class: the file diff **understated** it. With the
+  guard temporarily removed, the save-time warning named **8** authored fields being written
+  (status text, both overlay/error visibilities, the new-game + move-counter visibilities, and
+  the progress bar/percent at 448 writes each) — six of which happened to match their authored
+  values, so no diff could ever have shown them. A quiet diff means the values agreed, not that
+  nothing wrote.
+- **`games/space-invader` — was excluded (#123), now fixed and swept.** The `resources` rebuild
+  *dropped* a still-referenced asset, because the ref lives on a game-specific trait
+  (`SpaceInvaderAssets.catvaderAnim`) and `collectResourceRefsFromEntities` walked refs from
+  `REF_FIELDS_BY_TRAIT` — a closed, engine-only map with no registration API, so a game trait's
+  asset field was structurally invisible to it. Fixed by a generic sweep: a GUID that resolves in
+  the asset manifest **is** an asset ref, so no game registers anything. A *growing* manifest is
+  normally a fix — the pass added genuinely-referenced assets missing from several scenes.
+
+  Note what a shrinking manifest does and does not cost, because #123 was filed on a stronger
+  claim that does not hold: the build tree-shaker walks scene **entities** and never reads this
+  manifest (measured — a web build from a manifest with both refs deleted still shipped them), so
+  this is *not* an "asset the build cannot see". Nor is a stale FILE the problem, per the union
+  above. What cost anything was the walker's blind spot, described there.
+
+**The scaffolder template must stay canonical, and is guarded.** Migrating the existing scenes
+fixes the past; `engine/templates/starter` fixes the future, because it seeds every project made
+by `scaffold-project.mjs` and the editor's File → New Project. It was stamped `"version": 12`
+while still holding v11-era per-entity `id` fields, so every project ever scaffolded from it
+started life needing a re-save. Regenerate it the same way it was fixed — scaffold a throwaway
+project, re-save it through the editor, copy the scene back (the scaffolder re-mints the GUIDs
+on each use, so the committed ones are only placeholders).
+
+`engine/tests/assets/sceneFormatCanonical.test.ts` now fails on any scene — template included —
+that carries the legacy markers, with the two known exceptions baselined against #123/#124.
+Note what it does **not** do: it checks markers, not byte-exactness. A true check would
+re-serialize and diff, which needs the trait schemas and a world; `check-scene-churn.mjs` is
+what verifies a real re-save. It also parses `entities[].traits` rather than scanning text,
+because prefab `added[]` subtrees legitimately carry full trait data (defaults and blank refs
+included) and a text scan flags an already-migrated scene as legacy.
+
+**Prefabs needed their own route (#125), and are now swept too** — see "Re-saving legacy
+prefabs" below.
+
+### Re-saving legacy prefabs (#125)
+
+`resave-scenes.sh` drives `load-scene` → `save-all`, and there is no prefab equivalent: a prefab
+is only re-serialized as a *side effect* of editing it. The only path that does that is
+prefab-edit mode (open a `.prefab.json` in isolation, save, exit — see
+[prefabs.md](./prefabs.md) § "Prefab edit mode"), and until now it was reachable only from the
+UI (double-click a prefab → Cmd+S), so there was no scripted equivalent of the scene sweep.
+
+**Made reachable as agent ops.** `openPrefabForEditing` / `savePrefabEdit` / a new
+`exitPrefabEditing` (`editor/scene/prefabEdit.ts`) are exposed through the `prefab` agent op /
+`modoki_prefab` MCP tool as `prefabAction: 'edit-open' | 'edit-save' | 'edit-exit'` (tool
+catalog: [debug-tools-mcp.md](./debug-tools-mcp.md)). `edit-open` swaps the world exactly as
+`load-scene` does — it refuses on unsaved work and takes `force` — and additionally **saves the
+current scene** on the way in; that is pre-existing `prefabEdit.ts` behaviour, kept deliberately,
+because it is what makes the return trip's reload-from-disk non-destructive.
+`modoki_save_all` refuses outright while the editor is in prefab-edit mode; `edit-save` is the
+save for that world.
+
+**`engine/scripts/resave-prefabs.sh`** is the prefab sibling of `resave-scenes.sh`. Per project it
+launches this clone's editor, enumerates prefabs from `/api/scan-assets`, then runs
+edit-open → edit-save → edit-exit on each. Like the scene sweep it **refuses `games/chess` and
+`games/llm-test`** (the #124 exclusion) — entering prefab-edit saves the current scene, and those
+two games' code mutates authored state on load. Review with
+**`node engine/scripts/check-prefab-churn.mjs <same projects>`**, a semantic diff keyed by
+localId (a prefab has no entity GUIDs) reporting entities/traits/values gained or lost and any
+change to a nested-instance row's structure; it exits non-zero on a re-minted prefab `id` or a
+flattened nested instance.
+
+```bash
+engine/scripts/resave-prefabs.sh games/sling demos/forest-camp   # edit-open -> edit-save -> edit-exit every prefab
+node engine/scripts/check-prefab-churn.mjs games/sling demos/forest-camp   # REVIEW GATE
+```
+
+**Two real bugs in `serializePrefab` were found by that review gate** — the reason this sweep is
+not just a reformat. Both are documented as format invariants in [prefabs.md](./prefabs.md) §
+"localId stability": a re-save was renumbering localIds positionally, silently repointing or
+dropping every scene override on a prefab authored with a gap (measured on sling's
+`FieldCorner`: `drip` went localId 4 → 2); and it was overwriting the prefab's `name` with its
+root entity's name (measured: `cover-enemy.prefab.json` and `green-enemy.prefab.json` both became
+"Enemy"). Both are fixed — see prefabs.md for the mechanism.
+
+**Result:** all 69 prefabs across 9 projects were swept — **18 rewritten, 0 semantic changes**
+reported by the churn check, verified idempotent (a second full pass over `games/sling` was
+byte-identical to the first). The 51 unchanged were already on the current format.
+
+**Correcting a premise from the paragraph above:** the prefab writer does **not** compact the way
+the scene writer does. `serializePrefab` reads each trait's full persisted schema
+(`readTraitDataFull`) and writes every field, so a re-save can *add* default-valued fields rather
+than drop blank ones — that is why only 18 of 69 prefabs changed, and why this pass made two
+blank `Renderable2D.material` refs *appear* (now pinned in
+`engine/tests/assets/authoredAssetRefs.test.ts`) instead of the shrink the scene pass caused. The
+scene and prefab writers genuinely differ; don't reason about one from the other.
 
 ## Entity-id stability on disk
 
@@ -236,7 +400,7 @@ representation.
 ### `FieldHint.entityId` — the registry mechanism
 
 A trait field that holds a **live entity id** declares it in the trait registry
-(`runtime/ecs/traitRegistry.ts`):
+(`runtime/core/ecs/traitRegistry.ts`):
 
 ```ts
 entityId?: { onMissing: 'root' | 'stripTrait' };
@@ -405,7 +569,7 @@ Two consumers:
   `sourceScene` is "foreign" to the scene being saved, mirroring the existing
   `Transient` exclusion. A level's file therefore never absorbs base rig, and a
   non-chained scene's save is byte-identical to pre-base-scene behaviour.
-- **Editor grouping/ghosting** — `EntityInfo.sourceScene` (`runtime/ecs/entityUtils.ts`)
+- **Editor grouping/ghosting** — `EntityInfo.sourceScene` (`runtime/core/ecs/entityUtils.ts`)
   drives the Hierarchy's scene groups and the ghost styling.
 
 ### Editor authoring surface
@@ -489,6 +653,62 @@ Two consumers:
   could tell them apart without deleting the authored one. (`Input` needs no tag — it is
   simply not in the trait registry.) Gate:
   `engine/packages/modoki/tests/editor/timeResourceProvenance.test.ts`.
+- **An entity SPAWNED BY A SYSTEM is tagged `Transient` at the spawn site, so it is never
+  saved** (#124). Same provenance principle as the Time singleton, generalized: `spawnEntity`
+  (`runtime/core/ecs/world.ts` — the one sanctioned `world.spawn`, enforced by an ESLint ban
+  everywhere else) adds the tag when `inSystemTick()` is true, a flag `runPipeline` sets around
+  its system loop in a `try/finally`. Every load-time spawn — scene load, GLB import,
+  `SceneManager`, the headless harness — runs OUTSIDE that window and is unaffected.
+
+  Why it is needed at all: `runPipeline` skips a system only when its priority is **below**
+  `TRANSFORM` (200), so a `PROJECTION`-tier (300) system runs in the *stopped* editor. A game
+  that syncs its board there (`games/chess`) therefore spawned ~70 entities — pieces,
+  highlights, rank labels — into a scene nobody was playing, and `save-all` wrote them out as
+  authored content. Deliberate gap: the flag is synchronous, so a spawn in an async
+  continuation a system merely *started* is not tagged. That errs toward saving rather than
+  silently dropping an entity, which is the safe direction for a data-loss-shaped bug.
+
+- **A projection that mirrors RUNTIME state onto AUTHORED entities must declare
+  `pauseWhileStopped`** (#124, second half). Transience covers what a system *spawns*; it cannot
+  reach an entity the human authored and a system merely *mutates*. Measured on chess after the
+  spawn fix, the whole remaining load→save diff was `ProgressBarFill.UIElement.width 100 -> 3`
+  and `ProgressPercent.UIElement.text "100%" -> "3%"` — both genuinely authored entities.
+
+  The chain, which is worth following once because none of it is local: a scene-scoped manager's
+  `init()` runs on scene **load** (`initSceneManagersFor`, with no run-mode gate), so opening
+  chess in a stopped editor starts the LLM model download; the download drives
+  `chessStore.loadProgress`; `chessStateProjection` mirrors that onto the authored progress bar;
+  Cmd+S writes it out. Gating the *download* is not available as a fix — Play does not reload the
+  scene (`playMode.ts` snapshots in place), so a manager that skips init while stopped never
+  initializes in the editor at all.
+
+  So the seam is the projection: `registerProjection(name, store, fn, priority,
+  { pauseWhileStopped: true })` holds it while `!isSimRunning()`. **The hold happens in the
+  wrapper, before the dirty flag is cleared** — deliberately, and this is the part to preserve if
+  the code is ever rearranged. An early `return` inside the sync function instead would consume
+  the flag, so state accumulated while stopped would never project: if the store went quiet
+  before Play (the download finished), the first frame of Play would show authored values rather
+  than live ones. Default is `false`, because a projection normally *should* run while stopped —
+  that is what makes an inspector/gizmo edit reflect immediately. Opted in today:
+  `games/chess` (state + chat) and `games/llm-test` (state + chat). Gate:
+  `engine/packages/modoki/tests/runtime/projection.test.ts`.
+
+  **The class stays open by design, so a save warns instead.** Nothing stops the next game from
+  driving an authored entity from a stopped-mode system, and the alternative — serializing the
+  last *loaded* values instead of the live world — was declined because its failure mode is
+  silently discarding a real edit, which is worse than the bug it fixes. Instead `writeTraitField`
+  records any write landing on a non-`Transient` entity while `inSystemTick() && !isSimRunning()`
+  (`runtime/core/ecs/authoredWrites.ts`), and `saveAll` emits one grouped warning naming
+  `entity.trait.field` for what it just wrote to disk. Warn-only: it never suppresses a write or
+  refuses a save, because the engine cannot tell a rogue mirror from an intended one.
+
+  **What the warning does NOT reach**, stated so nobody reads a silent save as proof: it hooks
+  `writeTraitField`, so a system writing through koota's `entity.set(Trait, {…})` directly
+  bypasses it. Not fixable in the engine — `set` is koota's API, not a funnel. No game hits it
+  today (every `entity.set` under `games/**`/`demos/**` sits in a system below `TRANSFORM`, which
+  is skipped while stopped), but a future one could. Conversely, mutating the object from
+  `entity.get(Trait)` in place is not a write at all — **koota returns a copy** — so that pattern
+  needs no coverage; it silently does nothing, which is its own bug when a game means it as one.
 - **Override marks are WORLD-scoped, not per-`loadSceneFile`-call.** A chain loads N
   scene files into ONE staging world, so a per-call `clearAllOverrideMarks()` has the
   primary wipe the marks the base just seeded — on *every* chain load, carry or not.

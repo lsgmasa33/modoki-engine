@@ -8,17 +8,26 @@
  *  pulls at module load are mocked — Light is kept real so `world.query(Light)` and the
  *  trait fields work. */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as THREE from 'three';
 
 const deactivatedEntities = new Set<number>();
 const worldTransforms = new Map<number, { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number }>();
+
+// koota caps a process at 16 live worlds, and every `setup()` mints one. Releasing them
+// per test keeps that a non-issue as the file grows — without this, ADDING a test to the
+// end of the file makes unrelated ones fail with "Too many worlds created".
+const _worlds: { destroy: () => void }[] = [];
 
 beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
   deactivatedEntities.clear();
   worldTransforms.clear();
+});
+
+afterEach(() => {
+  for (const w of _worlds.splice(0)) { try { w.destroy(); } catch { /* already torn down */ } }
 });
 
 async function setup() {
@@ -39,7 +48,9 @@ async function setup() {
   const { createWorld } = await import('koota');
   const { Light } = await import('../../src/three/traits/Light');
   const sync = await import('../../src/runtime/rendering/scene3DSync');
-  return { world: createWorld(), Light, sync, scene: new THREE.Scene() };
+  const world = createWorld();
+  _worlds.push(world);
+  return { world, Light, sync, scene: new THREE.Scene() };
 }
 
 /** A full set of world-transform fields for a light at a given position. */
@@ -339,5 +350,258 @@ describe('syncLights — authored Light.target* aim', () => {
 
     expect(map.get(e.id())).toBe(spot);                        // same instance
     expect(spot.target.position.z).toBeCloseTo(-9, 6);
+  });
+});
+
+// ── The IBL-off compensation is gated on ACTUAL suppression, not on the tier (#154) ──
+//
+// A tier CLAMPS, never RAISES. Suppression is conditional — the tier says no IBL AND the scene
+// owns a loaded HDR `Environment` to lose — so the compensation has to carry the same condition.
+// Keying it on the tier alone brightened every low-tier scene with an AmbientLight and no
+// environment (several shipped demos), and since an unrecognised device resolves `low`, that
+// meant every phone. These pin BOTH directions; the boost-applies case is what stops the fix
+// from being "delete the compensation".
+
+describe('syncLights — IBL-off ambient compensation', () => {
+  /** Same as setup(), but with a loaded HDR in the environment cache so an `Environment`
+   *  entity actually reaches syncEnvironment's suppression branch. */
+  async function setupWithEnvCache() {
+    vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
+      worldTransforms, deactivatedEntities, transformPropagationSystem: {},
+    }));
+    vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+      resolveMeshTemplate: vi.fn(), resolveMeshLodInfo: vi.fn(() => null),
+      resolveMaterialForMesh: vi.fn(() => null), resolveMaterial: vi.fn(),
+      getCachedEnvironment: vi.fn(() => ({ isTexture: true })), acquireEnvironment: vi.fn(),
+    }));
+    vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
+    vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: vi.fn(() => false) }));
+    vi.doMock('../../src/runtime/loaders/textureResolver', () => ({
+      loadTexture3D: vi.fn(async () => ({})), releaseTexture3D: vi.fn(), setActiveRenderer: vi.fn(),
+      getEnvFormat: vi.fn(() => undefined),   // unregistered path → no UltraHDR boost
+    }));
+
+    const { createWorld } = await import('koota');
+    const { Light } = await import('../../src/three/traits/Light');
+    const { Environment } = await import('../../src/three/traits/Environment');
+    const settings = await import('../../src/runtime/rendering/renderSettings');
+    const { TIER_SETTINGS } = await import('../../src/runtime/rendering/qualityTier');
+    const sync = await import('../../src/runtime/rendering/scene3DSync');
+    settings.setActiveQualityTier({ tier: 'low', source: 'measured', reason: 'test' });
+    return { world: createWorld(), Light, Environment, sync, settings, TIER_SETTINGS, scene: new THREE.Scene() };
+  }
+
+  it('leaves ambient UNTOUCHED on the low tier when the scene has no Environment to lose', async () => {
+    const { world, Light, sync, settings, scene } = await setupWithEnvCache();
+    try {
+      const map = new Map<number, THREE.Light>();
+      const e = world.spawn(Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.5 }));
+
+      sync.syncEnvironment(world, scene);   // no Environment entity → nothing suppressed
+      expect(sync.isIblSuppressed()).toBe(false);
+      sync.syncLights(world, scene, map);
+
+      // The authored value, NOT authored × iblOffAmbientBoost.
+      expect((map.get(e.id()) as THREE.AmbientLight).intensity).toBeCloseTo(0.5, 6);
+    } finally {
+      settings.setActiveQualityTier(null);
+      world.destroy();  // koota caps at 16 live worlds; this describe adds four more
+    }
+  });
+
+  it('boosts ambient on the low tier when an Environment WAS suppressed', async () => {
+    const { world, Light, Environment, sync, settings, TIER_SETTINGS, scene } = await setupWithEnvCache();
+    try {
+      const map = new Map<number, THREE.Light>();
+      const e = world.spawn(Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.5 }));
+      world.spawn(Environment({ hdrPath: '/sky.hdr', intensity: 1 }));
+
+      sync.syncEnvironment(world, scene);
+      expect(sync.isIblSuppressed()).toBe(true);
+      expect(scene.environment).toBe(null);  // the thing being compensated for
+      sync.syncLights(world, scene, map);
+
+      expect((map.get(e.id()) as THREE.AmbientLight).intensity)
+        .toBeCloseTo(0.5 * TIER_SETTINGS.low.iblOffAmbientBoost, 6);
+    } finally {
+      settings.setActiveQualityTier(null);
+      world.destroy();  // koota caps at 16 live worlds; this describe adds four more
+    }
+  });
+
+  it('drops the boost again on the frame the Environment goes away', async () => {
+    const { world, Light, Environment, sync, settings, scene } = await setupWithEnvCache();
+    try {
+      const map = new Map<number, THREE.Light>();
+      const e = world.spawn(Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.5 }));
+      const env = world.spawn(Environment({ hdrPath: '/sky.hdr', intensity: 1 }));
+      sync.syncEnvironment(world, scene);
+      sync.syncLights(world, scene, map);
+
+      env.destroy();                        // scene swap into a scene with no environment
+      sync.syncEnvironment(world, scene);
+      expect(sync.isIblSuppressed()).toBe(false);
+      sync.syncLights(world, scene, map);
+
+      expect((map.get(e.id()) as THREE.AmbientLight).intensity).toBeCloseTo(0.5, 6);
+    } finally {
+      settings.setActiveQualityTier(null);
+      world.destroy();  // koota caps at 16 live worlds; this describe adds four more
+    }
+  });
+
+  it('applyRendererColorConfig leaves the AUTHORED exposure — the compensation is not baked in', async () => {
+    // It also serves the asset-preview renderers (ModelPreview, previewScene), which never sync
+    // an Environment and so can never reconcile the flag back. Baking the boost in at renderer
+    // construction meant a material thumbnail rendered 1.25x brighter because a game panel
+    // elsewhere had set the module flag — a surface inheriting a compensation it cannot own.
+    const { world, Environment, sync, settings, scene } = await setupWithEnvCache();
+    try {
+      const base = settings.getRenderSettings().three.exposure;
+      world.spawn(Environment({ hdrPath: '/sky.hdr', intensity: 1 }));
+      sync.syncEnvironment(world, scene);
+      expect(sync.isIblSuppressed()).toBe(true);           // flag is set…
+
+      const preview = { toneMapping: 0 as never, toneMappingExposure: 0, outputColorSpace: '' };
+      sync.applyRendererColorConfig(preview);
+      expect(preview.toneMappingExposure).toBeCloseTo(base, 6);   // …and this surface ignores it
+    } finally {
+      settings.setActiveQualityTier(null);
+      world.destroy();
+    }
+  });
+
+  it('reconcileToneExposure carries the SAME predicate as the ambient boost', async () => {
+    const { world, Environment, sync, settings, TIER_SETTINGS, scene } = await setupWithEnvCache();
+    try {
+      const base = settings.getRenderSettings().three.exposure;
+      const r = { toneMappingExposure: 0 };
+
+      sync.syncEnvironment(world, scene);   // no Environment
+      sync.reconcileToneExposure(r);
+      expect(r.toneMappingExposure).toBeCloseTo(base, 6);
+
+      world.spawn(Environment({ hdrPath: '/sky.hdr', intensity: 1 }));
+      sync.syncEnvironment(world, scene);
+      sync.reconcileToneExposure(r);
+      expect(r.toneMappingExposure).toBeCloseTo(base * TIER_SETTINGS.low.iblOffExposure, 6);
+    } finally {
+      settings.setActiveQualityTier(null);
+      world.destroy();  // koota caps at 16 live worlds; this describe adds four more
+    }
+  });
+});
+
+// ── Shadow follow (#183) ──────────────────────────────────────────────────────
+//
+// A directional shadow box anchored at the light's authored position covers a fixed
+// patch of ground, so a subject that walks off it loses its shadow (measured in
+// demos/forest-camp: gone after 9 m). The box now recentres — on an authored follow
+// TARGET when there is one, else on the view focus the caller supplies.
+//
+// The cases worth pinning are the FALLBACKS, because each one fails silently: a stale
+// guid that centred the box at the world origin would put every shadow in the scene in
+// the wrong place, and nothing would throw.
+describe('syncLights — shadow follow target', () => {
+  const dirLight = (over: Record<string, unknown> = {}) => ({
+    lightType: 'directional' as const, color: 0xffffff, intensity: 1, castShadow: true,
+    targetX: 0, targetY: -1, targetZ: 0, shadowFollowCamera: true, ...over,
+  });
+
+  it('centres the shadow box on the authored follow target, not the view focus', async () => {
+    const { world, Light, sync, scene } = await setup();
+    const { EntityAttributes } = await import('../../src/runtime/traits');
+    const map = new Map<number, THREE.Light>();
+    const subject = world.spawn(EntityAttributes({ guid: 'subject-guid' }));
+    worldTransforms.set(subject.id(), wt(20, 0, -12));
+    const lid = world.spawn(Light(dirLight({ shadowFollowTarget: 'subject-guid' }))).id();
+    worldTransforms.set(lid, wt(5, 10, 4));
+
+    sync.syncLights(world, scene, map, { x: -100, y: 0, z: -100 }); // view focus far away
+
+    const l = map.get(lid) as THREE.DirectionalLight;
+    // Snapped to a shadow texel, so assert with a tolerance, never ===.
+    expect(l.target.position.x).toBeCloseTo(20, 0);
+    expect(l.target.position.z).toBeCloseTo(-12, 0);
+  });
+
+  it('falls back to the view focus when the target guid no longer resolves', async () => {
+    const { world, Light, sync, scene } = await setup();
+    const map = new Map<number, THREE.Light>();
+    const lid = world.spawn(Light(dirLight({ shadowFollowTarget: 'deleted-entity' }))).id();
+    worldTransforms.set(lid, wt(5, 10, 4));
+
+    sync.syncLights(world, scene, map, { x: 7, y: 0, z: -3 });
+
+    const l = map.get(lid) as THREE.DirectionalLight;
+    // The failure this guards: a stale guid resolving to nothing and centring on (0,0,0),
+    // which silently relocates every shadow in the scene.
+    expect(l.target.position.x).toBeCloseTo(7, 0);
+    expect(l.target.position.z).toBeCloseTo(-3, 0);
+  });
+
+  it('leaves the box at the authored position when shadowFollowCamera is off', async () => {
+    const { world, Light, sync, scene } = await setup();
+    const map = new Map<number, THREE.Light>();
+    const lid = world.spawn(Light(dirLight({ shadowFollowCamera: false }))).id();
+    worldTransforms.set(lid, wt(5, 10, 4));
+
+    sync.syncLights(world, scene, map, { x: 40, y: 0, z: 40 });
+
+    const l = map.get(lid) as THREE.DirectionalLight;
+    expect(l.position.x).toBeCloseTo(5, 5);   // untouched by the follow logic
+    expect(l.position.y).toBeCloseTo(10, 5);
+    expect(l.position.z).toBeCloseTo(4, 5);
+  });
+
+  it('keeps the focus inside the shadow camera depth range for a scene-scale box', async () => {
+    const { world, Light, sync, scene } = await setup();
+    const map = new Map<number, THREE.Light>();
+    // An outdoor level legitimately authors a big ortho box. The follow pulls the camera back by
+    // shadowCameraSize*2+10, so at 100 the focus sits 210 away while `far` was a flat 200 — the
+    // whole scene falls outside the depth range and every shadow from this light vanishes, with
+    // nothing thrown. `shadowFollowCamera` defaults ON, so this would hit such a scene unasked.
+    const lid = world.spawn(Light(dirLight({ shadowCameraSize: 100 }))).id();
+    worldTransforms.set(lid, wt(5, 10, 4));
+
+    sync.syncLights(world, scene, map, { x: 0, y: 0, z: 0 });
+
+    const l = map.get(lid) as THREE.DirectionalLight;
+    const depth = l.position.distanceTo(l.target.position);
+    expect(depth).toBeGreaterThan(l.shadow.camera.near);
+    expect(depth).toBeLessThan(l.shadow.camera.far);
+  });
+
+  it('leaves the authored far plane alone for an ordinary box size', async () => {
+    const { world, Light, sync, scene } = await setup();
+    const map = new Map<number, THREE.Light>();
+    const lid = world.spawn(Light(dirLight({ shadowCameraSize: 16 }))).id();
+    worldTransforms.set(lid, wt(5, 10, 4));
+
+    sync.syncLights(world, scene, map, { x: 0, y: 0, z: 0 });
+
+    // Widened only when the pull-back needs it — the common case keeps its authored depth,
+    // so the fix can't quietly cost precision everywhere by inflating the range.
+    expect((map.get(lid) as THREE.DirectionalLight).shadow.camera.far).toBe(200);
+  });
+
+  it('preserves the authored light DIRECTION while moving the box', async () => {
+    const { world, Light, sync, scene } = await setup();
+    const map = new Map<number, THREE.Light>();
+    const lid = world.spawn(Light(dirLight())).id();
+    worldTransforms.set(lid, wt(5, 10, 4));
+
+    sync.syncLights(world, scene, map);                       // no focus → authored placement
+    const l = map.get(lid) as THREE.DirectionalLight;
+    const authored = new THREE.Vector3().subVectors(l.target.position, l.position).normalize();
+
+    sync.syncLights(world, scene, map, { x: 30, y: 0, z: -25 }); // now follow, far from authored
+    const followed = new THREE.Vector3().subVectors(l.target.position, l.position).normalize();
+
+    // Only the shadow camera may move. A directional light's shading depends solely on
+    // direction, so this is what makes moving its position safe.
+    expect(followed.x).toBeCloseTo(authored.x, 5);
+    expect(followed.y).toBeCloseTo(authored.y, 5);
+    expect(followed.z).toBeCloseTo(authored.z, 5);
   });
 });

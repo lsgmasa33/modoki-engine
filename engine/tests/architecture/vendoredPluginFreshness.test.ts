@@ -79,8 +79,11 @@ describe('vendored engine plugins are not stale (#90)', () => {
     expect(stale, stale.length
       ? `Stale vendored plugin(s) — these projects would build an APK/IPA containing OLD native code, `
         + `while the build reports success:\n  ${stale.join('\n  ')}\n\n`
-        + `Fix: re-vendor them (the native build now does this automatically per #90; to do it by `
-        + `hand, call vendorEnginePlugins(projectRoot, repoRoot) then \`npm install\` in the project).`
+        + `Fix: \`node engine/scripts/vendor-plugins.mjs <projectDir>\` then \`npm install\` in the project. `
+        + `Both native build paths also re-vendor on their own now — the editor's Build → iOS/Android `
+        + `(#90) and the CLI's \`npm run build -- --target native\` (#148). This message used to claim `
+        + `"the native build does this automatically", which was true of the EDITOR path only, and it `
+        + `said so to a reader who had just been burned by the CLI one.`
       : '',
     ).toEqual([]);
   });

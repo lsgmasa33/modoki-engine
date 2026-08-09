@@ -1,5 +1,6 @@
 import { defineConfig } from 'vitest/config';
 import path from 'path';
+import { perfCoreWorkers } from '../../testWorkers';
 
 export default defineConfig({
   root: __dirname,
@@ -17,9 +18,14 @@ export default defineConfig({
     __MODOKI_MODULE_PHYSICS3D__: 'true',
     __MODOKI_MODULE_NPR__: 'true',
     __MODOKI_MODULE_GPU_PARTICLES__: 'true',
+    __MODOKI_MODULE_VIDEO__: 'true',
   },
   test: {
     globals: true,
+    // Performance-core cap, shared with the app suite — see `engine/testWorkers.ts` for the
+    // measurement. `engine/scripts/verify.mjs` overrides it per lane so its concurrent vitest
+    // pools do not oversubscribe each other.
+    ...perfCoreWorkers(),
     include: ['tests/**/*.test.{ts,tsx}'],
     // The first test in a file cold-importing three.js / PixiJS + the engine can exceed the 5s
     // default on Windows under full-suite parallel load, so renderer tests (Scene2D, scene3DSync,
@@ -28,6 +34,42 @@ export default defineConfig({
     // finish these in milliseconds so the higher ceiling never triggers there.
     testTimeout: 20000,
     hookTimeout: 30000,
+    // Coverage is OFF unless --coverage is passed. This suite is the FIRST leg of a
+    // two-leg measurement: the root suite (engine/vite.config.ts) and this one both
+    // exercise packages/modoki/src, so either leg alone understates it — this package
+    // holds 466 of the repo's 742 test files, the root suite the other 276.
+    //
+    // Each leg emits a RAW per-file report into its own dir under engine/coverage/.legs/;
+    // engine/scripts/merge-coverage.mjs then merges them into the real report. Two earlier
+    // mechanisms failed and are recorded so they are not retried:
+    //
+    //   1. Sharing one reportsDirectory so the second leg's report picks up the first
+    //      leg's <dir>/.tmp — vitest DELETES .tmp once it has generated a report, so the
+    //      second leg saw nothing and emitted its own numbers as if they were merged. It
+    //      does not warn; the totals simply come out identical to one leg.
+    //   2. Having this leg emit the merged report — coverage `include` globs resolve
+    //      against the run's own root and a glob reaching UP out of it silently matches
+    //      nothing, so `../../app/**` etc. dropped app//plugins//electron: 34,378 lines
+    //      reported against the root leg's 44,431.
+    //
+    // Hence: this leg claims only its own src/, and nothing here emits a human report.
+    coverage: {
+      provider: 'v8',
+      all: true,
+      reportsDirectory: '../../coverage/.legs/pkg', // engine/coverage — gitignored
+      reporter: ['json'],
+      include: [
+        'src/editor/**/*.{ts,tsx}',
+        'src/runtime/**/*.{ts,tsx}',
+        'src/three/**/*.{ts,tsx}',
+      ],
+      exclude: [
+        '**/*.d.ts',
+        '**/*.test.{ts,tsx}',
+        '**/__mocks__/**',
+        '**/index.ts',
+      ],
+    },
   },
   resolve: {
     // Deps are hoisted to the repo-root node_modules. This package now lives at

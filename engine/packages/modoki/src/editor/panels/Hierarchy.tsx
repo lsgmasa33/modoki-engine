@@ -28,11 +28,11 @@ import { filterEntityTree, collectEntityTypes, normalizeFolderPath, buildHierarc
 import { isSceneDirty } from '../scene/sceneDirty';
 import { startDragGhost, endDragGhost, armGrabCursor } from '../utils/dragGhost';
 import { PRIMITIVE_NAMES } from '../../runtime/loaders/primitives';
-import { type UiPreset } from '../uiAuthoring';
+import { type UiPreset } from '../../runtime/ui/uiAuthoring';
 import {
   emptySpecs, primitiveSpecs, shape2DSpecs, canvas2DSpecs, uiSpecs, cameraSpecs, lightSpecs, environmentSpecs, particleSpecs,
   type LightKind,
-} from '../entityCreateSpecs';
+} from '../../runtime/scene/entityCreateSpecs';
 // Backend-IO + create-prefab flow shared with the Assets panel (editor-panels
 // F6/F7): new prefab files must land under a *real* writable asset root —
 // virtual tree nodes like "/" aren't writable. firstWritableAssetRoot + root

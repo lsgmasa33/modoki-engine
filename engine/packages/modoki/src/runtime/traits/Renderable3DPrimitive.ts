@@ -13,4 +13,15 @@ export const Renderable3DPrimitive = trait({
    *  on/off (`EntityAttributes.isActive`, which also cascades to children); both must be
    *  true to draw. */
   isVisible: true as boolean,
+  /** Rendering-layer mask (#136) — see `Renderable3D.renderingLayerMask`. Honoured only when
+   *  `material` names a `.mat.json`: a primitive with the DEFAULT material owns a per-entity
+   *  material that `color` is written into live, and a light-mask variant is shared by
+   *  (material, mask), so the two would fight over the same object. Explicit-material
+   *  primitives have no live colour path, so there is nothing to fight. */
+  renderingLayerMask: 1 as number,
+  /** Shadow-cast mode — see `Renderable3D.castShadow`: `'auto'` derives it from the material
+   *  (opaque casts, transparent doesn't), `'on'`/`'off'` force it. */
+  castShadow: 'auto' as 'auto' | 'on' | 'off',
+  /** Receive shadows cast by other objects. Defaults to true — today's unconditional behaviour. */
+  receiveShadow: true as boolean,
 });

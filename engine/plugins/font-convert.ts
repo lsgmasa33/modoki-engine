@@ -18,7 +18,8 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import type { FontImportSettings } from '../packages/modoki/src/runtime/core/fontSettings';
 import { expandCharset } from '../packages/modoki/src/runtime/core/fontSettings';
-import { getFontCacheDir, hashKey, atlasCachePath, metricsCachePath, fontCacheHit } from './font-cache';
+import { getFontCacheDir, hashKey, atlasCachePath, metricsCachePath, instanceCachePath, fontCacheHit } from './font-cache';
+import { instanceFont, hasAxes } from './font-instance';
 
 const MSDF_MISSING_MSG =
   'msdf-atlas-gen not found. The packaged editor bundles it (resources/bin, via MODOKI_MSDF_ATLAS_GEN); ' +
@@ -81,6 +82,10 @@ export function buildAtlasGenArgs(
   outJson: string,
 ): string[] {
   return [
+    // Plain `-font`, ALWAYS — `fontPath` is already the axis-pinned instance when the
+    // font has `variationAxes`. Do NOT "simplify" this into `-varfont <src>?wght=N`:
+    // that flag is a SILENT NO-OP in our msdf-atlas-gen build (accepted, exit 0, no
+    // warning, byte-identical atlas — measured). Guarded in fontConvert.test.ts.
     '-font', fontPath,
     '-charset', charsetFile,
     '-type', settings.fieldType,
@@ -124,6 +129,9 @@ export interface FontConvertResult {
   /** Atlas PNG byte size. */
   bytes?: number;
   cached: boolean;
+  /** True when `variationAxes` was set, so an `~instance.ttf` variant exists. The
+   *  dynamic runtime generator must fetch THAT rather than the raw source. */
+  instanced?: boolean;
 }
 
 function readAtlasStats(metricsPath: string, atlasPath: string): Pick<FontConvertResult, 'atlasWidth' | 'atlasHeight' | 'glyphCount' | 'bytes'> {
@@ -151,14 +159,25 @@ export async function convertFont(opts: FontConvertOptions): Promise<FontConvert
   const atlasPath = atlasCachePath(cacheDir, sourceUrlPath, hash);
   const metricsPath = metricsCachePath(cacheDir, sourceUrlPath, hash);
 
-  if (fontCacheHit(cacheDir, sourceUrlPath, hash)) {
-    return { hash, cached: true, ...readAtlasStats(metricsPath, atlasPath) };
+  if (fontCacheHit(cacheDir, sourceUrlPath, hash, settings)) {
+    return { hash, cached: true, instanced: hasAxes(settings.variationAxes), ...readAtlasStats(metricsPath, atlasPath) };
   }
 
   const cli = ensureMsdfAtlasGen();
   fs.mkdirSync(path.dirname(atlasPath), { recursive: true });
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-font-'));
   try {
+    // Axis instancing FIRST — the bake and the runtime generator both consume the
+    // instanced file, because neither can pin an axis itself (see font-instance.ts).
+    // No axes ⇒ bake straight from the source and emit no instance variant.
+    let bakeSource = absSource;
+    const instanced = hasAxes(settings.variationAxes);
+    if (instanced) {
+      const tmpTtf = path.join(tmpDir, 'instance.ttf');
+      fs.writeFileSync(tmpTtf, await instanceFont(srcBytes, settings.variationAxes!));
+      bakeSource = tmpTtf;
+    }
+
     const charsetFilePath = path.join(tmpDir, 'charset.txt');
     fs.writeFileSync(charsetFilePath, buildCharsetFile(settings));
     // Emit to temp then move into the cache so a crash mid-encode never leaves a
@@ -166,14 +185,18 @@ export async function convertFont(opts: FontConvertOptions): Promise<FontConvert
     const tmpPng = path.join(tmpDir, 'atlas.png');
     const tmpJson = path.join(tmpDir, 'metrics.json');
     try {
-      execFileSync(cli, buildAtlasGenArgs(settings, absSource, charsetFilePath, tmpPng, tmpJson), { stdio: 'pipe' });
+      execFileSync(cli, buildAtlasGenArgs(settings, bakeSource, charsetFilePath, tmpPng, tmpJson), { stdio: 'pipe' });
     } catch (e) {
       const stderr = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
       throw new Error(`msdf-atlas-gen failed for ${sourceUrlPath}: ${stderr}`, { cause: e });
     }
     fs.renameSync(tmpPng, atlasPath);
     fs.renameSync(tmpJson, metricsPath);
-    return { hash, cached: false, ...readAtlasStats(metricsPath, atlasPath) };
+    // Publish the instance LAST: fontCacheHit requires it when axes are set, so a crash
+    // before this point leaves an incomplete entry that re-converts rather than one that
+    // reads as complete with a missing variant.
+    if (instanced) fs.renameSync(path.join(tmpDir, 'instance.ttf'), instanceCachePath(cacheDir, sourceUrlPath, hash));
+    return { hash, cached: false, instanced, ...readAtlasStats(metricsPath, atlasPath) };
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

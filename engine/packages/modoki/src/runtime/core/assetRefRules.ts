@@ -9,11 +9,43 @@
  *  always emit lowercase. */
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Managed asset file extensions — the file types the asset pipeline tracks by
- *  GUID. Fonts (.ttf/.woff) are intentionally excluded: `UIElement.fontFamily`
- *  is a CSS family name (or font path), not a manifest-asset GUID. */
-const ASSET_PATH_RE =
-  /\.(?:mesh|mat|prefab|scene|particle|shader|anim)\.json$|\.(?:glb|gltf|fbx|png|jpe?g|webp|hdr|exr)$/i;
+/** Managed asset file suffixes — the file kinds the asset pipeline tracks by GUID, and
+ *  therefore the kinds a literal PATH must be rejected for (a path ref works in dev off
+ *  disk and breaks once the build hashes/relocates the file — docs/build.md, the #53 class).
+ *
+ *  ⚠️ This duplicates `loaders/assetTypeClassifier.ts`'s `JSON_ASSET_SUFFIX_TYPE` +
+ *  `BINARY_EXT_TYPE`, which are the single source of truth for "what is a managed asset".
+ *  The duplication is forced, not sloppy: this file is L0 `core/` and may import NOTHING
+ *  (docs/architecture-layers.md), while the classifier is L3 `loaders/`. So the lists are
+ *  kept honest by a TEST instead of by an import —
+ *  `tests/assets/assetPathPredicate.test.ts` fails if a kind is added there and not here.
+ *
+ *  That guard exists because this list had ALREADY drifted, silently, in both directions:
+ *  it covered `.anim.json` but not `.animset.json` / `.spriteanim.json` / `.timeline.json` /
+ *  `.rig2d.json`, and no audio or video extension at all — so a literal path in
+ *  `SkeletalAnimator.animSet`, `SpriteAnimator.clipSet`, `Director.timeline`,
+ *  `SkinnedSprite2D.rig`, `AudioSource.clip` or `VideoPlayer.clip` fell through every
+ *  rejection site (`resolveRef`, the scene validator, `assertNoPathRefs`, `diagnose`) and
+ *  was passed through as if it were a usable URL. Found by the #123 close-out sweep — the
+ *  same "a ref the guard cannot see" pattern, one layer down.
+ *
+ *  FONTS (.ttf/.otf/.woff/.woff2) stay excluded on purpose: `UIElement.fontFamily` is a CSS
+ *  family name (or font path), not a manifest-asset GUID. */
+const JSON_ASSET_SUFFIXES = [
+  'scene', 'atlas', 'mesh', 'mat', 'prefab', 'shader', 'particle',
+  'animset', 'spriteanim', 'rig2d', 'anim', 'level', 'wave', 'timeline', 'court',
+] as const;
+const BINARY_ASSET_EXTS = [
+  'glb', 'gltf', 'fbx',
+  'png', 'jpg', 'jpeg', 'webp',
+  'hdr', 'exr',
+  'mp3', 'm4a', 'aac', 'wav', 'ogg', 'flac',
+  'mp4', 'mov', 'm4v', 'webm', 'mkv',
+] as const;
+const ASSET_PATH_RE = new RegExp(
+  `\\.(?:${JSON_ASSET_SUFFIXES.join('|')})\\.json$|\\.(?:${BINARY_ASSET_EXTS.join('|')})$`,
+  'i',
+);
 
 /** Returns true if `ref` looks like a UUID (not a path, not a URL, not a sprite name). */
 export function isGuid(ref: string | undefined | null): boolean {

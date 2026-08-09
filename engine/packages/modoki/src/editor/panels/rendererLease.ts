@@ -86,6 +86,34 @@ export function releaseRenderer(container: object): void {
   }, 0);
 }
 
+/**
+ * Force-drop the lease NOW: no defer, no reuse, no refcount. For a renderer that is DEAD —
+ * its GPU context/device was lost — where the deferred, reusable release above is exactly
+ * wrong.
+ *
+ * WHY THIS EXISTS (#121 P1). `releaseRenderer` schedules teardown on a macrotask precisely so
+ * that an `acquireRenderer` arriving first CANCELS it and gets the same renderer back. That is
+ * correct for a StrictMode remount and fatal for context-loss recovery, whose rebuild is
+ * `cleanup(); setup();` in one task: the re-acquire lands before the timer fires, the lease
+ * hands back the corpse, and recovery becomes a silent no-op that logs nothing and never
+ * renders again. A lost renderer must never be leasable — a three renderer cannot be revived
+ * once `_isDeviceLost` is set (see `core/activeRenderer.ts`), so reuse can only ever be wrong.
+ *
+ * Disposal is guarded: `dispose()` on a renderer whose context is already gone may throw, and
+ * a throw here would abort the rebuild it is clearing the way for.
+ */
+export function discardRenderer(container: object): void {
+  const lease = leases.get(container);
+  if (!lease) return;
+  if (lease.releaseTimer !== undefined) {
+    clearTimeout(lease.releaseTimer);
+    lease.releaseTimer = undefined;
+  }
+  leases.delete(container);
+  try { lease.renderer?.dispose(); } catch { /* already-dead renderer — nothing to reclaim */ }
+  try { lease.renderer?.domElement.remove(); } catch { /* detached already */ }
+}
+
 /** Test-only: is a renderer currently leased to this container? */
 export function __hasLease(container: object): boolean {
   return leases.has(container);

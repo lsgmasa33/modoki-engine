@@ -155,9 +155,14 @@ The core AppLovin MAX SDK comes from SPM (`capacitor-applovin-max/Package.swift`
 | Screenshot | `captureScreen` via `drawHierarchy` (captures WebGL) | `adb screencap` |
 | Tap/Drag | PixiJS EventSystem calls | PixiJS EventSystem calls |
 | Native logs | OSLogStore (iOS 15+) | logcat |
-| Debug gate | `#if DEBUG` | `FLAG_DEBUGGABLE` runtime check |
+| Debug gate | `modoki:game-debug-*` fenced registration in `MyViewController.swift` | `com.modokiengine.gamedebug.DEBUG_BUILD` manifest `<meta-data>` |
 
-The plugin is automatically disabled in release builds.
+**Both gates are written from the ONE project flag `build.debugBuild`** (Project Settings →
+Developer) by `healNativeConfig`, not from the Xcode/Gradle configuration (#112) — so
+`debugBuild: true` + a Release configuration is a *working* debug build, which is what a TestFlight
+QA build is. Reopen the project after flipping the flag so the heal runs. Absent Android meta-data
+reads as false. Detail:
+[debug-tools-mcp.md](./debug-tools-mcp.md) § "Debug vs Release".
 
 ### MCP tools
 
@@ -217,15 +222,78 @@ Opening a project in the Electron editor runs two idempotent "make it just work"
 `healNativeConfig(projectRoot)` is deterministic + idempotent — it writes only when something is missing or detectably wrong, never clobbering hand edits. It heals the machine-local / derivable bits that a fresh `cap add` (or a fresh clone) leaves missing:
 
 - **`android/local.properties`** → `sdk.dir` (gitignored, machine-specific; without it Gradle fails "SDK location not found"). Discovered from `$ANDROID_HOME`/`$ANDROID_SDK_ROOT` then the common install dirs.
-- **iOS `DEVELOPMENT_TEAM`** → synced from `project.config.json` `build.appleTeamId`, scoped to the **App target's** build configs only (via `appBuildConfigUUIDs` — never flattens a separate extension/widget/watch target's team). Corrects any existing value, including the empty `DEVELOPMENT_TEAM = "";` a fresh `cap add ios` leaves.
+- **iOS `DEVELOPMENT_TEAM`** → synced from `build.appleTeamId` (the value lives in the gitignored `project.user.json` — [engine-oss-publishing.md](./engine-oss-publishing.md) § "Private build fields"), scoped to the **App target's** build configs only (via `appBuildConfigUUIDs` — never flattens a separate extension/widget/watch target's team). Corrects any existing value, including the empty `DEVELOPMENT_TEAM = "";` a fresh `cap add ios` leaves.
 - **iOS orientation + status bar** and **Android `screenOrientation`** → patched into `Info.plist` / `AndroidManifest.xml` to match `capacitor.orientation` / status-bar settings.
-- **game-debug wiring** (only when the project depends on `capacitor-game-debug`): adds the `NSLocalNetworkUsageDescription` + `NSBonjourServices` Info.plist keys (iOS 14+ gates the device's inbound-LAN TCP listener behind the **Local Network permission**, prompted via these keys). *(`NSBonjourServices` predates the Bonjour removal and is likely now vestigial — the lease connects by direct IP, no mDNS — but it hasn't been re-verified on-device, so it's left in for now.)* Also writes `MyViewController.swift` + points the storyboard's bridge VC at it + adds the pbxproj file-refs that compile `MyViewController.swift` and the engine's `GameDebugPlugin.swift` into the App target (the SPM static-linking workaround — see the [iOS SPM static-linking gotcha](#ios-spm-static-linking-gotcha)), and adds a Release-only build phase that strips the debug-only Local Network keys so App Store builds ship without a Local Network prompt.
+- **Android immersive fullscreen** → when `capacitor.statusBarHidden` is set, a marker-fenced block is patched into **`MainActivity.java`** hiding `systemBars()` via `WindowInsetsControllerCompat`, re-applied in `onWindowFocusChanged`. Three things about this are load-bearing. It hides **both** bars (status *and* navigation) even though the flag is named for the status bar: iOS has no second bar, so `statusBarHidden` there already means "the game owns the screen", and leaving Android's nav bar up would honour the name while missing the intent. It has to be **Java, not a theme** — `android:windowFullscreen` reaches the status bar only. And it must re-apply on focus regain, because the bars return after a notification shade / permission dialog / task switch, so hiding once in `onCreate` silently decays. A MainActivity with custom code (non-empty class body, no marker) is left alone and reported rather than rewritten; clearing the flag removes the block and its imports.
+- **game-debug wiring** (only when the project depends on `capacitor-game-debug`): adds the `NSLocalNetworkUsageDescription` + `NSBonjourServices` Info.plist keys (iOS 14+ gates the device's inbound-LAN TCP listener behind the **Local Network permission**, prompted via these keys). *(`NSBonjourServices` predates the Bonjour removal and is likely now vestigial — the lease connects by direct IP, no mDNS — but it hasn't been re-verified on-device, so it's left in for now.)* Also writes `MyViewController.swift` + points the storyboard's bridge VC at it + adds the pbxproj file-refs that compile `MyViewController.swift` and the engine's `GameDebugPlugin.swift` into the App target (the SPM static-linking workaround — see the [iOS SPM static-linking gotcha](#ios-spm-static-linking-gotcha)). The Local Network keys and the plugin registration both track `build.debugBuild` **in both directions** — flip it off and the next heal removes them, so an App Store build ships without a Local Network prompt. (Pre-#112 the keys were added unconditionally and stripped from the BUILT plist by a `CONFIGURATION == Release` build phase; that phase is retired, and the heal deletes it from any project that still carries it.)
 
 It is called explicitly on open — **not** buried inside `ensureProjectDeps` — so it runs even for a flat game with native folders but no `package.json`, can't be silently skipped by a dep-install refactor, and always logs (a "already up to date" line included).
 
 ### Dep + engine-plugin heal (`ensureProjectDeps` in `main.ts`)
 
 `ensureProjectDeps(projectRoot)` makes "Open Project" work for a project opened from **outside** the repo (or an in-repo game never installed). The repo root install only links in-repo game workspaces via `bootstrap-game-deps.mjs`; a standalone project needs its own `npm install` to create `node_modules` + workspace symlinks (e.g. `@<game>/app-services`), else Vite 500s on the unresolved import. It also **vendors engine-provided Capacitor plugins** (`capacitor-game-debug`, …) into the project as tarball COPIES packed from the editor's own engine (no symlink → DMG-safe), which can rewrite `package.json` (migrating off the old `file:../../engine` dir-symlink) and regenerate the gitignored tarball. It reinstalls only when `node_modules` is absent or the vendored plugin copies are stale, preferring `npm ci` unless vendoring just rewrote `package.json` (then `npm install`, since the lockfile is behind). Skips the editor's own tree and projects with nothing to install.
+
+### Pinned transitive deps — `overrides` for a vulnerability upstream won't fix
+
+When a security alert lands on a **transitive** dep that no upstream release will clear, the fix is
+an npm `overrides` entry in the owning project's `package.json`. Two live cases:
+
+| Pin | Where | Pulled in by |
+|---|---|---|
+| `"uuid": "^11.1.1"` | every project that depends on `@capacitor/cli` — all of `games/*`, `demos/*`, and the repo root | `@capacitor/cli` → `xcode` → `uuid@^7.0.3` |
+| `"nanoid": "^3.3.17"` | the repo root and `site/` | `vite`/`vitest`/`@vitejs/plugin-react`/`@vitest/coverage-v8` (root) and `vitepress` (site), each → `postcss` → `nanoid@^3.3.16` |
+
+**Add the pin as soon as the project exists, not when the alert fires.** Both of these were caught
+by Dependabot *failing*, not by anyone noticing the gap: a `security_update_not_possible` job exits
+1, so the workflow goes red and reads like broken tooling rather than "your tree needs an override".
+Seven projects (`games/{skin-test,space-console,llm-test,text_demo,timeline-demo}`,
+`demos/{forest-camp,particle-demo}`) were missing the `uuid` pin while this section claimed every
+project had it — the drift was invisible because the doc asserted the invariant instead of the
+re-check command below proving it (#177).
+
+#### `uuid`
+
+It is **not** a dep these projects use — it exists to pin a transitive one, and in most of them it
+is currently **inert**.
+
+`@capacitor/cli` **8.5.0** added a dependency on `xcode@^3.0.1`, which depends on `uuid@^7.0.3` —
+vulnerable (GitHub Dependabot, medium; fixed in 11.1.1). Upstream will not resolve it: `xcode@latest`
+still pins `uuid ^7`. The `xcode` dep did not exist in 8.4.x, so only projects whose lockfile has
+floated to 8.5.0 actually resolve `uuid` today; the rest inherit it the moment their lockfile is
+refreshed, since they all declare a floating `^8.x` range. The override is applied everywhere so
+that refresh is a non-event rather than a new alert.
+
+Safe because `xcode` calls `require('uuid').v4()` and takes the string result
+(`pbxProject.generateUuid`); `uuid@11` still ships a CJS build, and the call site uses no removed
+API. Adding an override that matches nothing in the tree does **not** desync `npm ci`
+(npm does not record `overrides` in the lockfile root), so the inert copies cost no lockfile churn.
+
+#### `nanoid`
+
+`postcss@8.5.25` requires `nanoid@^3.3.16`, and 3.3.16 is vulnerable (high — a custom generator can
+loop forever when `size` is 0; fixed in 3.3.17). `^3.3.17` satisfies postcss's own range, so the pin
+is a straight resolution bump with no peer risk. Dependabot could not do it itself: at the root the
+only top-level owners are the test/build toolchain, and in `site/` the sole path npm found was
+**downgrading vitepress 1.6.4 → 0.22.4**, which it correctly refused.
+
+#### Re-checking the set
+
+Do this rather than trusting the table — that is the lesson of #177. Every lockfile at once:
+
+```bash
+for f in $(git ls-files '*package-lock.json'); do
+  node -e 'const j=require("./"+process.argv[1]);
+    for (const [k,v] of Object.entries(j.packages||{})) {
+      const n=k.split("node_modules/").pop();
+      if (n==="uuid"   && v.version && parseInt(v.version) < 11) console.log(process.argv[1], k, v.version);
+      if (n==="nanoid" && /^3\.3\.(?:[0-9]|1[0-6])$/.test(v.version||"")) console.log(process.argv[1], k, v.version);
+    }' "$f"
+done
+```
+
+Silence is a pass. Per project, `npm ls uuid` / `npm ls nanoid` answers the same question. After
+adding a pin, refresh the lock with `npm install --package-lock-only --ignore-scripts` — it rewrites
+only the affected entry (measured: 3 lines per lockfile).
 
 Full build/deploy commands live in [build.md](./build.md) and the project `CLAUDE.md`.
 
@@ -240,8 +308,10 @@ and its OWN `games/<id>/ios` + `games/<id>/android` native folders. Examples:
 | `3d-test` | `com.modokiengine.tropicalisland` | Tropical Island |
 | `alien-animal` | `com.modokiengine.alienanimal` | Alien Animal |
 
-**Per-game signing (#29).** Each game sets its OWN **Apple Team ID** in `build.appleTeamId`
-of its `games/<id>/project.config.json` (empty on games not yet signed, e.g. `particle`,
+**Per-game signing (#29).** Each game sets its OWN **Apple Team ID** at the `build.appleTeamId`
+key path, whose value lives in the gitignored `games/<id>/project.user.json`
+([engine-oss-publishing.md](./engine-oss-publishing.md) § "Private build fields") — empty on games
+not yet signed, e.g. `particle`,
 `skin-test`, `text_demo`); healed into the iOS project's `DEVELOPMENT_TEAM` on open + before
 each build, then Xcode auto-signs (`-allowProvisioningUpdates`). The signed-in games happen to
 share a single Team ID, but the mechanism is per-game. (The old single
@@ -272,7 +342,8 @@ Notes: first build is slow (SPM downloads all SDK frameworks); use exact device 
 ```bash
 MODOKI_PROJECT=games/<id> npm run build -- --target native
 (cd games/<id> && npx cap sync android)
-JAVA_HOME=$(/usr/libexec/java_home -v 21) games/<id>/android/gradlew -p games/<id>/android assembleDebug
+eval "$(node engine/scripts/print-toolchain-env.mjs)"   # JAVA_HOME + ANDROID_HOME, resolved as the editor does
+games/<id>/android/gradlew -p games/<id>/android assembleDebug
 adb install games/<id>/android/app/build/outputs/apk/debug/app-debug.apk
 ```
 Notes: requires **JDK 21** (Capacitor 8 / AGP); Gradle heap is the stock **`-Xmx1536m`** (raise it, e.g. to 4GB, only when a game bundles the 12 mediation adapters); the device must show as `device` (not `unauthorized`) in `adb devices`. A game with no `ios/`/`android/` yet must scaffold it first (`cd games/<id> && npx cap add ios|android`).

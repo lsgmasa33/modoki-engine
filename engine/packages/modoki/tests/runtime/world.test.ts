@@ -74,4 +74,75 @@ describe('world entity index', () => {
       expect(findEntityById(42)).toBe(entity2);
     });
   });
+
+  // The helper pair exists because `world.spawn()` is koota's API, so registering could never be
+  // automatic — it was a second call you had to remember, and three sites in games/ forgot the
+  // destroy half. These assert the pairing itself, against the REAL module (this file mocks
+  // nothing), which is what makes them meaningful: entityUtils.test.ts mocks core/ecs/world, so
+  // its "index" is a stand-in Map that cannot observe a real stale entry.
+  describe('spawnEntity / destroyEntity (the index pairing)', () => {
+    /** Minimal koota-shaped world: spawn hands back an entity with an id and a destroy spy. */
+    function fakeWorld() {
+      let next = 1;
+      const destroyed: number[] = [];
+      const world = {
+        spawn: (..._traits: unknown[]) => {
+          const id = next++;
+          return { id: () => id, destroy: () => { destroyed.push(id); } };
+        },
+      };
+      return { world: world as never, destroyed };
+    }
+
+    it('spawnEntity puts the entity in the index — a bare world.spawn does not', async () => {
+      const { spawnEntity, findEntityById } = await getModule();
+      const { world } = fakeWorld();
+
+      const viaHelper = spawnEntity(world, {} as never);
+      expect(findEntityById(viaHelper.id(), world)).toBe(viaHelper);
+
+      // The contrast is the whole point of the helper: the raw call is invisible to the index.
+      const raw = (world as unknown as { spawn: () => { id: () => number } }).spawn();
+      expect(findEntityById(raw.id(), world)).toBeUndefined();
+    });
+
+    it('destroyEntity removes the index entry AND destroys the entity', async () => {
+      const { spawnEntity, destroyEntity, findEntityById } = await getModule();
+      const { world, destroyed } = fakeWorld();
+
+      const e = spawnEntity(world, {} as never);
+      destroyEntity(e, world);
+
+      expect(destroyed).toEqual([e.id()]);
+      expect(findEntityById(e.id(), world)).toBeUndefined();
+    });
+
+    it('never leaves a live index entry pointing at a destroyed entity (the games/agy bug)', async () => {
+      // The regression this pair exists for. Destroying WITHOUT unregistering is worse than
+      // failing to register: an unregistered spawn still resolves via the O(n) fallback and warns,
+      // whereas a stale entry is a silent index HIT — findEntityById hands back a corpse and the
+      // caller reads traits off it. games/agy did this per-frame on gem pickup; games/codex once.
+      // (Both scaffolds have since been deleted — those names are the bug's, not live paths.)
+      const { spawnEntity, destroyEntity, findEntityById } = await getModule();
+      const { world } = fakeWorld();
+
+      const keep = spawnEntity(world, {} as never);
+      const gone = spawnEntity(world, {} as never);
+      destroyEntity(gone, world);
+
+      expect(findEntityById(gone.id(), world)).toBeUndefined(); // no corpse
+      expect(findEntityById(keep.id(), world)).toBe(keep);      // and its sibling is untouched
+    });
+
+    it('defaults to the current world, like every other function here', async () => {
+      const { spawnEntity, destroyEntity, findEntityById, getCurrentWorld } = await getModule();
+      const world = getCurrentWorld();
+      // koota's real world is fine here — we only need spawn() + destroy() to exist.
+      const e = spawnEntity(world);
+      expect(findEntityById(e.id())).toBe(e);
+
+      destroyEntity(e);
+      expect(findEntityById(e.id())).toBeUndefined();
+    });
+  });
 });

@@ -8,6 +8,10 @@
 
 import type { WebGPURenderer } from 'three/webgpu';
 import type * as THREE from 'three';
+// The sanctioned wall-clock wrapper — a direct `Date.now()`/`performance.now()` here would fail
+// the determinism guard, and routing through it also makes the recovery WINDOW testable
+// (`setManualNow`/`advanceManual`) instead of needing real elapsed seconds in a unit test.
+import { rawNow } from './clock';
 
 let activeRenderer: WebGPURenderer | THREE.WebGLRenderer | null = null;
 
@@ -25,6 +29,27 @@ let rendererReadyFired = false;
  *  ref — it uploads via instanced attributes at render time). */
 export function getActiveRenderer(): WebGPURenderer | THREE.WebGLRenderer | null {
   return activeRenderer;
+}
+
+/** Which GRAPHICS API a renderer is actually drawing through — the single source of truth for
+ *  that question (#147). `deviceCaps` and the perf HUD both report it, and both used to derive it
+ *  independently from the same wrong signal.
+ *
+ *  ⚠️ **`isWebGPURenderer` is the renderer CLASS, not the API.** `makeWebGPURenderer` always
+ *  constructs a `WebGPURenderer`, and three runs its WebGL2 backend *inside that same class* when
+ *  there is no adapter or the project set `rendering.three.backend: 'webgl'`. So that flag is
+ *  `true` on every device we ship to, and reading it made `'WebGL'` unreachable: an iPhone 8
+ *  reported `'WebGPU'` next to `webgpu: false` in the same payload while genuinely running WebGL2.
+ *  `backend.isWebGLBackend` is the real signal — `Scene3D.tsx` already plans FXAA off it.
+ *
+ *  three assigns `.backend` in the renderer CONSTRUCTOR (it picks the class from `forceWebGL` /
+ *  adapter availability), so this is safe to read before `init()`. The class fall-through covers
+ *  only a renderer-like with no `.backend` at all: a test double, or a classic `WebGLRenderer`. */
+export function readRendererBackend(renderer: unknown): 'WebGPU' | 'WebGL' | null {
+  const r = renderer as { isWebGPURenderer?: boolean; backend?: { isWebGLBackend?: boolean } } | null;
+  if (!r) return null;
+  if (r.backend) return r.backend.isWebGLBackend === true ? 'WebGL' : 'WebGPU';
+  return r.isWebGPURenderer ? 'WebGPU' : 'WebGL';
 }
 
 /** True once the renderer has been activated at least once. Callers that need to run a
@@ -54,8 +79,17 @@ export function setActiveRendererHandle(renderer: WebGPURenderer | THREE.WebGLRe
 // CAUSE — the GPU device itself dying, or a driver-level error Chromium couldn't route to a
 // specific pipeline call — went unlogged. A reader saw "the frame loop is STALLED... relaunch the
 // editor" with no way to tell "the renderer is wedged" (recoverable-in-place, sometimes) from "the
-// GPU device is gone" (never self-recovers, and relaunching IS the only fix — now at least the
-// right one). This channel exists to record the cause; it deliberately does NOT attempt recovery.
+// GPU device is gone". This channel records the cause AND drives recovery (see the recovery
+// section below) — it was log-only until #121 P1.
+//
+// WHY THIS DETECTION PATH SURVIVED THE RECOVERY WORK UNCHANGED. three fires both backends'
+// losses through one public hook (`renderer.onDeviceLost(info)`, `info.api` = 'WebGL'|'WebGPU'),
+// which would collapse the two attach functions below into one. It is deliberately NOT used:
+// this module's two false-positive filters (see `attachWebGpuDeviceListeners`) were paid for by
+// shipping a diagnostic that called a healthy 61fps editor dead, and a refactor of the detection
+// path is a chance to lose them. The recovery layer was added ON TOP instead. The unification is
+// a real simplification and worth doing — separately, deliberately, with those filters as the
+// acceptance criteria.
 
 /** How many `uncapturederror` events we LOG before going quiet — mirrors `frameDriver`'s
  *  `MAX_REPORTED_ATTEMPTS`. An uncaptured-error flood (a single bad frame can fire dozens) is
@@ -68,6 +102,13 @@ export interface GpuFaultState {
   reason?: string;
   message?: string;
   uncapturedErrors: number;
+  /** How many losses have been seen inside the current recovery window (§ recovery below).
+   *  1 on a first, expected-recoverable loss. Counts ACROSS renderer replacements, so a
+   *  rebuild that immediately dies again reads 2 — that is the signal loop detection needs. */
+  losses?: number;
+  /** True once loss has repeated past `MAX_RECOVERY_ATTEMPTS` inside the window: recovery has
+   *  been abandoned and no further rebuild will be requested. A permanently-black surface. */
+  unrecoverable?: boolean;
 }
 
 let gpuFaultState: GpuFaultState | null = null;
@@ -81,6 +122,133 @@ let attachedRenderer: WebGPURenderer | THREE.WebGLRenderer | null = null;
  *  `rendererGate` use — omitted entirely while healthy (see those two for the convention). */
 export function getGpuFaultState(): GpuFaultState | null {
   return gpuFaultState;
+}
+
+// ── Recovery (#121 P1) ─────────────────────────────────────────────────────────────────────
+// Before this, a lost context was PERMANENT: detected, logged, and nothing rendered again for
+// the process lifetime. Measured on a Huawei Y6 2019 — the WebGL2 context died ~4s into boot,
+// before any scene mesh had finished uploading, and the game showed a black screen forever.
+//
+// THE LOAD-BEARING FACT, checked against three r0.184 rather than assumed:
+//
+//   A lost three renderer CANNOT be revived. `WebGLBackend.onContextLost` already calls
+//   `event.preventDefault()` (so the browser WILL restore the underlying context) and routes to
+//   `renderer.onDeviceLost()`, whose default sets the private `_isDeviceLost = true`. That flag
+//   gates `render()` at three separate sites and is NEVER cleared anywhere in three. So even a
+//   fully restored GL context renders nothing through the old renderer object.
+//
+// Recovery therefore means BUILDING A NEW RENDERER, and only the viewport that created one can
+// do that — it owns the container, the DOM node, and the render-loop closure. This module owns
+// DETECTION and POLICY and asks; it cannot rebuild, and must not pretend to. Viewports subscribe
+// via `onRendererLost`.
+//
+// The plan's P1 called for `preventDefault()` here. It is already three's, not ours — adding a
+// second one would have been a no-op mistaken for the fix.
+
+/** Losses tolerated inside `RECOVERY_WINDOW_MS` before recovery is abandoned. The 4th loss in a
+ *  window stops asking: a rebuild loop on a device that cannot sustain a context burns battery
+ *  and buries the first real error, and the honest outcome is a visible failure. */
+export const MAX_RECOVERY_ATTEMPTS = 3;
+/** Sliding window for `MAX_RECOVERY_ATTEMPTS`. Long enough that two unrelated transient faults
+ *  minutes apart are each treated as a fresh, recoverable event rather than a "loop". */
+export const RECOVERY_WINDOW_MS = 60_000;
+
+export interface RendererLostInfo {
+  /** Which backend died. Both are recoverable by the same rebuild. */
+  api: 'WebGL' | 'WebGPU';
+  reason?: string;
+  message?: string;
+  /** 1-based index of this loss within the window — i.e. which rebuild attempt this asks for. */
+  attempt: number;
+  /** WHICH renderer died. Present so a subscriber can ignore a loss that isn't its own.
+   *
+   *  This matters because the notification is a BROADCAST and the editor mounts TWO viewports
+   *  (SceneView + GameView), each owning its own renderer. Without this, one viewport's context
+   *  loss would tear down and rebuild the other viewport's perfectly healthy renderer — a
+   *  gratuitous shader-prewarm stall, and a fresh chance to fail, on a surface that never had a
+   *  problem. Compare by identity and return early when it isn't yours.
+   *
+   *  Note what this does NOT fix: only the renderer that most recently called
+   *  `setActiveRendererHandle` is watched at all (both detection paths guard on
+   *  `attachedRenderer`), so a loss in the OTHER viewport is never reported in the first place.
+   *  That is a pre-existing limit of the detection layer, not something this field introduces. */
+  renderer: WebGPURenderer | THREE.WebGLRenderer | null;
+}
+
+/** Loss timestamps inside the current window.
+ *
+ *  DELIBERATELY NOT reset by `attachGpuFaultListeners`. That function clears `gpuFaultState` so a
+ *  new renderer starts clean, which is right for REPORTING and would be fatal here: every
+ *  recovery installs a new renderer, so resetting the history on attach would zero the counter on
+ *  the very event it exists to count, and a hard rebuild loop would look like an unbroken series
+ *  of first-time losses and never trip. Only `resetRecoveryState()` clears it. */
+let lossTimes: number[] = [];
+let recoveryAbandoned = false;
+const lostListeners = new Set<(info: RendererLostInfo) => void>();
+
+/** Subscribe to "your renderer is dead — build a new one". Returns an unsubscribe function.
+ *
+ *  Fires only while recovery is still viable; once `MAX_RECOVERY_ATTEMPTS` is exceeded inside the
+ *  window it goes quiet permanently (`getGpuFaultState().unrecoverable`). A listener must NEVER
+ *  throw — one bad subscriber cannot be allowed to stop the others from rebuilding. */
+export function onRendererLost(fn: (info: RendererLostInfo) => void): () => void {
+  lostListeners.add(fn);
+  return () => { lostListeners.delete(fn); };
+}
+
+/** True once repeated loss has exhausted the recovery budget. */
+export function isRecoveryAbandoned(): boolean {
+  return recoveryAbandoned;
+}
+
+/** Clear loss history + the abandoned flag. For tests, and for a deliberate fresh start (a new
+ *  project/scene session) — NOT for a routine renderer swap, which must keep the history. */
+export function resetRecoveryState(): void {
+  lossTimes = [];
+  recoveryAbandoned = false;
+}
+
+/** Record a real device/context loss and, if the budget allows, ask viewports to rebuild.
+ *  Both detection paths funnel here so the policy exists in exactly one place. */
+function reportRendererLoss(api: 'WebGL' | 'WebGPU', reason?: string, message?: string): void {
+  const now = rawNow();
+  lossTimes = lossTimes.filter((t) => now - t < RECOVERY_WINDOW_MS);
+  lossTimes.push(now);
+  const attempt = lossTimes.length;
+
+  gpuFaultState = {
+    deviceLost: true,
+    reason,
+    message,
+    uncapturedErrors: gpuFaultState?.uncapturedErrors ?? 0,
+    losses: attempt,
+    unrecoverable: attempt > MAX_RECOVERY_ATTEMPTS,
+  };
+
+  if (attempt > MAX_RECOVERY_ATTEMPTS) {
+    recoveryAbandoned = true;
+    console.error(
+      `[activeRenderer] ${api} device lost ${attempt}x within ${RECOVERY_WINDOW_MS / 1000}s — ` +
+      'giving up on recovery. Nothing will render. This usually means the device cannot sustain ' +
+      'this scene; try a lower quality tier.',
+    );
+    return;
+  }
+
+  console.warn(
+    `[activeRenderer] ${api} device/context LOST (${attempt}/${MAX_RECOVERY_ATTEMPTS})` +
+    `${reason ? ` reason=${reason}` : ''}${message ? ` message=${message}` : ''} — ` +
+    'rebuilding the renderer. Expect a visible hitch.',
+  );
+
+  for (const fn of lostListeners) {
+    // A listener that throws must not prevent the others from rebuilding. Reported, not swallowed
+    // silently: a viewport that cannot rebuild is exactly the fault worth seeing.
+    // `attachedRenderer` IS the renderer that died: both detection paths refuse to report for
+    // any renderer we are no longer attached to (the superseded-renderer guards).
+    try { fn({ api, reason, message, attempt, renderer: attachedRenderer }); }
+    catch (e) { console.error('[activeRenderer] a renderer-lost listener threw', e); }
+  }
 }
 
 /** Attach GPU fault listeners to a newly-activated renderer. NEVER throws into the caller — the
@@ -128,18 +296,9 @@ function attachWebGpuDeviceListeners(renderer: WebGPURenderer | THREE.WebGLRende
     //    renderer brings its own device. Only 'unknown' is a REAL loss (driver reset, TDR, the OS
     //    reclaiming the GPU), and only that is worth a word.
     if (info.reason === 'destroyed') return;
-    // A real loss: nothing renders again on THIS device. Recovery would mean re-creating the whole
-    // renderer, which is explicitly out of scope here (log-only).
-    gpuFaultState = {
-      deviceLost: true,
-      reason: info.reason,
-      message: info.message,
-      uncapturedErrors: gpuFaultState?.uncapturedErrors ?? 0,
-    };
-    console.error(
-      `[activeRenderer] WebGPU DEVICE LOST reason=${info.reason} message=${info.message} — ` +
-      'nothing will render again on this device. This does NOT self-recover; relaunch the editor.',
-    );
+    // A real loss: nothing renders again on THIS device, so ask for a rebuild. The policy (window,
+    // budget, give-up) lives in reportRendererLoss — this path only decides that it is real.
+    reportRendererLoss('WebGPU', info.reason, info.message);
   }).catch(() => { /* device.lost rejecting is not itself a fault worth reporting */ });
 
   device.addEventListener?.('uncapturederror', (e: Event) => {
@@ -160,19 +319,25 @@ function attachWebGpuDeviceListeners(renderer: WebGPURenderer | THREE.WebGLRende
 
 /** WebGL fallback: `webglcontextlost` is the WebGL equivalent of a lost GPU device — fired on the
  *  canvas, not a device object. Recorded into the same `GpuFaultState` shape so callers don't
- *  need to know which backend is active. */
+ *  need to know which backend is active.
+ *
+ *  This is the path the Y6 2019 took, and the one that matters most on low-end mobile: a
+ *  `WebGPURenderer` with no adapter falls back to three's WebGL2 backend, so a phone reports its
+ *  death here rather than through `device.lost`.
+ *
+ *  We do NOT call `preventDefault()` — three's own `WebGLBackend` listener already does, which is
+ *  what makes the browser willing to restore the context at all. A second `preventDefault()` on
+ *  the same event changes nothing; believing it was the fix would have been the trap. Note we
+ *  are a SECOND listener on this canvas: three's fires too and flips its private `_isDeviceLost`,
+ *  which is precisely why the old renderer is unusable and a rebuild is the only route back. */
 function attachWebGlContextLostListener(renderer: WebGPURenderer | THREE.WebGLRenderer): void {
   const el = (renderer as unknown as { domElement?: EventTarget })?.domElement;
-  el?.addEventListener?.('webglcontextlost', () => {
-    gpuFaultState = {
-      deviceLost: true,
-      reason: 'webglcontextlost',
-      uncapturedErrors: gpuFaultState?.uncapturedErrors ?? 0,
-    };
-    console.error(
-      '[activeRenderer] WebGL CONTEXT LOST — nothing will render again on this context. ' +
-      'This does NOT self-recover; relaunch the editor.',
-    );
+  el?.addEventListener?.('webglcontextlost', (e: Event) => {
+    // Superseded-renderer guard, matching the WebGPU path: a canvas belonging to a renderer we
+    // have already replaced must not report — its death is expected teardown, not a live fault.
+    if (renderer !== attachedRenderer) return;
+    const message = (e as unknown as { statusMessage?: string })?.statusMessage || undefined;
+    reportRendererLoss('WebGL', 'webglcontextlost', message);
   });
 }
 

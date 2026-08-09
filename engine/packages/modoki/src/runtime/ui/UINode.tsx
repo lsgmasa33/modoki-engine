@@ -13,6 +13,11 @@ import { resolveTemplate, evalVisibility } from './bindingResolver';
 const Canvas2DMount = __MODOKI_MODULE_RENDER2D__
   ? lazy(() => import('../rendering/Canvas2DMount').then((m) => ({ default: m.Canvas2DMount })))
   : null;
+// Same gating for video-in-a-UI-node: a static import would pull the video stack into
+// every game's UI path, and `build.modules` exists to DCE exactly that.
+const UIVideoMount = __MODOKI_MODULE_VIDEO__
+  ? lazy(() => import('../video/UIVideoMount').then((m) => ({ default: m.UIVideoMount })))
+  : null;
 import { resolveDomImageUrl, resolveSprite } from '../core/textureRefs';
 import { isGuid } from '../core/assetRefRules';
 import { applyAnchorStyle } from './anchorCss';
@@ -137,7 +142,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     flexWrap: node.flexWrap as any,
     justifyContent: node.justifyContent,
     alignItems: node.alignItems,
-    gap: node.gap || undefined,
+    gap: node.gap ? cssVal(node.gap, node.gapUnit) : undefined,
     flexGrow: node.flexGrow,
     flexShrink: node.flexShrink,
     width: cssVal(node.width, node.widthUnit),
@@ -299,6 +304,29 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // inherits none and the user can't scroll (the scrollbar even ignores drags).
   if (node.overflow === 'scroll') style.pointerEvents = 'auto';
 
+  // The author's explicit "this element is decoration — let taps through to what is behind it".
+  // LAST on purpose, so it wins over both rules above: the container default (`auto`, so events
+  // reach children) and the scroll force (`auto`, so the box can be scrolled). Those are defaults
+  // inferred from structure; this is a statement of intent, and inference must not outrank it.
+  //
+  // ⚠️ It does NOT disarm the children — CSS `pointer-events: none` on a parent leaves a child
+  // that sets `auto` fully clickable, which is the entire point: a decorative panel that still
+  // holds a working button. The cursor is cleared with it, so nothing paints a finger over an
+  // element that will not receive the click.
+  //
+  // ⚠️ Opting a `scroll` container into this gives up SCROLLING it (that is what the line above
+  // was for) — correct only when the box is sized never to overflow.
+  //
+  // ⚠️ NOT in the editor's click-to-select mode. `onSelectEntity` deliberately makes every element
+  // clickable so it can be SELECTED (see the branch above), and that is authoring, not gameplay —
+  // an element the game must not receive taps on is still one the author has to be able to pick in
+  // the viewport. Ungated, this made a decorative container selectable only from the hierarchy
+  // panel, which is exactly the element type the field exists for (Court's narration band).
+  if (node.pointerThrough && !onSelectEntity) {
+    style.pointerEvents = 'none';
+    style.cursor = undefined;
+  }
+
   // Editor 2D-only layer: strip UI visuals but keep layout, so nested Canvas2D
   // canvases still mount and position while the UI layer is hidden. The canvas
   // itself renders regardless (its own pointerEvents stay 'auto').
@@ -315,6 +343,24 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     nineSliceLayer = null;   // 9-slice background is a UI visual — strip it too
   }
 
+  // Video: mount the clip into this node's own box. Built here — ahead of the input and
+  // Canvas2D branches, which return early — and injected beside `nineSliceLayer` in every
+  // return that can carry one. It sits OVER any image background, so an authored
+  // `imageSrc` doubles as the poster this element shows before Play and after a teardown
+  // (video only runs while the game is playing). Suppressed with the other UI visuals.
+  // `priority`: there is ONE element per clip, and in the editor this same tree is mounted
+  // into BOTH the Game and Scene panels. `onSelectEntity` is set only on the editor's
+  // authoring surface, so it is what distinguishes them — the running game wins, because
+  // that is the picture the human is judging. Without this the last host to tick won, which
+  // was the Scene panel ("the video plays only on Scene view, not on the game view").
+  const videoLayer = node.hasVideo && UIVideoMount && !uiVisualsHidden
+    ? (
+      <Suspense fallback={null}>
+        <UIVideoMount entityId={node.entityId} fit={node.imageMode} priority={onSelectEntity ? 0 : 1} />
+      </Suspense>
+    )
+    : null;
+
   // F8: an input/range elementType returns before the canvas2D branch below, so an
   // entity carrying BOTH a Canvas2D and a non-'div' elementType renders as the input
   // and its 2D canvas silently never mounts. Warn in dev so the misconfig is visible
@@ -322,6 +368,17 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   if (import.meta.env?.DEV && node.canvas2D && node.elementType !== 'div') {
     console.warn(
       `[UINode] entity ${node.entityId}: elementType '${node.elementType}' takes precedence over its Canvas2D — the 2D canvas will NOT mount. Put the Canvas2D on its own child entity.`,
+    );
+  }
+
+  // Same class, same silence: `videoLayer` is injected into the returns that render a
+  // <div>, and an <input>/<range> is a VOID element that cannot carry it. So a
+  // `VideoPlayer` on a node whose elementType is not 'div' plays with no picture — the
+  // clip is decoding, the audio is on the bus, and nothing appears. Warn for the same
+  // reason F8 does above: the misconfig is invisible from the authored data.
+  if (import.meta.env?.DEV && node.hasVideo && node.elementType !== 'div') {
+    console.warn(
+      `[UINode] entity ${node.entityId}: elementType '${node.elementType}' cannot host a video — the VideoPlayer's picture will NOT mount (audio still plays). Put the VideoPlayer on its own child entity.`,
     );
   }
 
@@ -353,7 +410,9 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         />
       );
     }
-    style.pointerEvents = 'auto';
+    // `!node.pointerThrough` because this line runs AFTER the pointerThrough block and would
+    // otherwise silently undo it — the field would read as supported on an input and do nothing.
+    if (!node.pointerThrough) style.pointerEvents = 'auto';
     return (
       <input
         style={style}
@@ -385,7 +444,8 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       ? Number(storeState[node.binding.inputBinding] ?? node.rangeMin)
       : node.rangeMin;
     const sliderValue = Number.isFinite(rawValue) ? rawValue : node.rangeMin;
-    style.pointerEvents = 'auto';
+    // Same reason as the input above: this would silently undo `pointerThrough`.
+    if (!node.pointerThrough) style.pointerEvents = 'auto';
     style.accentColor = hexToColor(node.textColor);
     if (onSelectEntity) {
       return (
@@ -435,6 +495,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     return (
       <div style={style} onClick={handleClick} data-entity-id={node.entityId}>
         {nineSliceLayer}
+        {videoLayer}
         {canvas2DContent}
         {node.children.map(child => (
           <UINode key={child.entityId} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} />
@@ -461,6 +522,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   return (
     <div style={style} onClick={handleClick} data-entity-id={node.entityId}>
       {nineSliceLayer}
+      {videoLayer}
       {textContent}
       {node.children.map(child => (
         <UINode key={child.entityId} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} />

@@ -5,7 +5,7 @@ import { worldTransforms } from '../core/ecs/transformPropagationSystem';
 // (renderUtils) — keeps Scene2D's resolution mockable in one place. Implementation moved to
 // core/textureRefs.ts (P7 C9) — pure ref-classification, never rendering-specific.
 export {
-  resolveSprite, isImagePath, resolveImageUrl, resolveDomImageUrl, resolvePrimitiveShape,
+  resolveSprite, isImagePath, isVideoRef, resolveImageUrl, resolveDomImageUrl, resolvePrimitiveShape,
   type PrimitiveShape,
 } from '../core/textureRefs';
 export type { ResolvedSprite } from '../core/textureProvider';

@@ -7,6 +7,7 @@ import path from 'path';
 import {
   mergeProjectConfig,
   mergeProjectUserConfig,
+  overlayPrivateBuildFields,
   PROJECT_CONFIG_FILENAME,
   PROJECT_USER_CONFIG_FILENAME,
   type ProjectConfig,
@@ -96,18 +97,25 @@ export function readProjectConfigParseErrors(root: string = process.cwd()): { fi
   return errors;
 }
 
-/** Read <root>/project.config.json and merge it over the defaults. A missing
- *  file or unparseable JSON falls back to the defaults. */
+/** Read <root>/project.config.json and merge it over the defaults, then overlay
+ *  the private `build.*` fields (see {@link overlayPrivateBuildFields}) from
+ *  <root>/project.user.json. This is the SINGLE place the overlay happens for
+ *  readers — every existing consumer (healNativeConfig, vite-asset-scanner,
+ *  editorBackendRouter, app/editor/setup.ts) keeps reading `config.build.<field>`
+ *  unchanged and transparently gets the private value once it has migrated.
+ *  A missing file or unparseable JSON falls back to the defaults. */
 export function loadProjectConfig(root: string = process.cwd()): ProjectConfig {
   const file = path.join(root, PROJECT_CONFIG_FILENAME);
+  let config: ProjectConfig;
   try {
-    if (fs.existsSync(file)) {
-      return mergeProjectConfig(JSON.parse(fs.readFileSync(file, 'utf8')));
-    }
+    config = fs.existsSync(file)
+      ? mergeProjectConfig(JSON.parse(fs.readFileSync(file, 'utf8')))
+      : mergeProjectConfig(null);
   } catch (e) {
     console.warn(`[project-config] Failed to read ${file}, using defaults:`, e);
+    config = mergeProjectConfig(null);
   }
-  return mergeProjectConfig(null);
+  return overlayPrivateBuildFields(config, loadProjectUserConfig(root));
 }
 
 /**
@@ -198,13 +206,20 @@ const BUILD_FIELD_RULES: { key: string; label: string; pattern: RegExp; allowEmp
 /** Validate the shell-interpolated build fields (across BOTH the committed config
  *  and the per-machine user config) against {@link BUILD_FIELD_RULES}. Returns a
  *  list of human-readable error messages (empty = valid). Call before
- *  constructing or persisting build commands. */
+ *  constructing or persisting build commands.
+ *
+ *  Overlays the private `build.*` fields internally (see
+ *  {@link overlayPrivateBuildFields}) so every caller validates the OVERLAID
+ *  config without having to remember to do it themselves — including a caller
+ *  that already has an overlaid `config` from {@link loadProjectConfig}, since
+ *  the overlay is idempotent (re-overlaying the same `user` is a no-op). */
 export function validateBuildConfig(config: ProjectConfig, user: ProjectUserConfig): string[] {
+  const overlaid = overlayPrivateBuildFields(config, user);
   const errors: string[] = [];
   const read = (obj: unknown, k: string): unknown =>
     k.split('.').reduce<unknown>((o, p) => (o == null ? undefined : (o as Record<string, unknown>)[p]), obj);
   for (const rule of BUILD_FIELD_RULES) {
-    const v = read(rule.source === 'user' ? user : config, rule.key);
+    const v = read(rule.source === 'user' ? user : overlaid, rule.key);
     const s = v == null ? '' : String(v);
     if (s === '') {
       if (!rule.allowEmpty) errors.push(`${rule.label} (${rule.key}) is required`);

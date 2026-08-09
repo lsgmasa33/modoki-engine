@@ -2,7 +2,7 @@
  *  fixture trees. Each test builds a small asset root under tmpdir, runs
  *  computeKeptAssets, and asserts which virtual paths are kept/dropped. */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -352,6 +352,62 @@ describe('asset-tree-shaker', () => {
     expect(result.kept).not.toContain('/games/test/assets/animations/unused.anim.json');
   });
 
+  // ── Video retention ──────────────────────────────────
+  //
+  // This class of bug has bitten repeatedly: a kind the SCANNER ships but the SHAKER
+  // classifies 'other' is silently dropped from the prod build while working fine in
+  // dev (the `.anim.json` failure recorded in assetTypeClassifier.ts). Video is
+  // registered in the shared BINARY_EXT_TYPE table, which is *supposed* to make both
+  // sides agree — these tests prove it rather than trusting the derivation.
+
+  it('keeps a video referenced by a GUID on an arbitrary trait field', () => {
+    const videoGuid = '11111111-2222-4333-8444-555555555555';
+    fx.writeVirtual('/games/test/assets/video/intro.mp4', 'fake-mp4');
+    fx.writeJson('/games/test/assets/video/intro.mp4.meta.json', { version: 2, id: videoGuid });
+    fx.writeVirtual('/games/test/assets/video/unused.mp4', 'unused-mp4');
+    fx.writeJson('/games/test/assets/video/unused.mp4.meta.json', {
+      version: 2, id: '99999999-8888-4777-8666-555555555555',
+    });
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6,
+      entities: [
+        // A trait the shaker has never heard of, carrying a video GUID — the generic
+        // trait-field walk is what must catch this, since there is no VideoPlayer
+        // entry in any ref registry.
+        { id: 'e1', name: 'Screen', traits: { VideoPlayer: { clip: videoGuid, loop: true } } },
+      ],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/games/test/assets/video/intro.mp4');
+    // The unreferenced one must still be dropped — otherwise "kept" proves nothing.
+    expect(result.kept).not.toContain('/games/test/assets/video/unused.mp4');
+  });
+
+  it('classifies every accepted video container as shippable, not "other"', () => {
+    // A container the table lists but the shaker misclassifies would be dropped from
+    // prod while shipping in dev — the exact silent-divergence failure.
+    const exts = ['.mp4', '.mov', '.m4v', '.webm', '.mkv'];
+    const guids = exts.map((_, i) => `aaaaaaaa-bbbb-4ccc-8ddd-00000000000${i}`);
+    exts.forEach((ext, i) => {
+      fx.writeVirtual(`/games/test/assets/video/clip${i}${ext}`, 'bytes');
+      fx.writeJson(`/games/test/assets/video/clip${i}${ext}.meta.json`, { version: 2, id: guids[i] });
+    });
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6,
+      entities: guids.map((g, i) => ({
+        id: `e${i}`, name: `S${i}`, traits: { VideoPlayer: { clip: g } },
+      })),
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    exts.forEach((ext, i) => {
+      expect(result.kept).toContain(`/games/test/assets/video/clip${i}${ext}`);
+    });
+  });
+
   it('keeps a .timeline.json via Director and follows its audio-cue GUIDs', () => {
     const tlGuid = '11111111-2222-4333-8444-555555555555';
     const sfxGuid = '66666666-7777-4888-8999-aaaaaaaaaaaa';
@@ -405,6 +461,67 @@ describe('asset-tree-shaker', () => {
     // spark.prefab.json is reachable ONLY via the control clip's prefab GUID — proves the follow.
     expect(result.kept).toContain('/games/test/assets/prefabs/spark.prefab.json');
     expect(result.kept).not.toContain('/games/test/assets/prefabs/unused.prefab.json');
+  });
+
+  it('keeps a VIDEO-track clip referenced ONLY through a .timeline.json', () => {
+    // A cutscene's clip has no other owner in the scene: the Director points at the timeline,
+    // and the clip GUID lives inside it. Without the follow it ships as a 404 that only shows
+    // up in a real production build — the failure mode this whole family of tests exists for.
+    const tlGuid = '11111111-2222-4333-8444-777777777777';
+    const vidGuid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    fx.writeVirtual('/games/test/assets/video/intro.mp4', 'fake-mp4');
+    fx.writeJson('/games/test/assets/video/intro.mp4.meta.json', { version: 2, id: vidGuid });
+    fx.writeVirtual('/games/test/assets/video/unused.mp4', 'unused-mp4');
+    fx.writeJson('/games/test/assets/video/unused.mp4.meta.json', {
+      version: 2, id: 'dddddddd-eeee-4fff-8000-111111111111',
+    });
+    fx.writeJson('/games/test/assets/timelines/intro.timeline.json', {
+      id: tlGuid, duration: 6, tracks: [
+        { id: 'v', name: 'Screen', target: '', type: 'video', clips: [{ start: 0, duration: 5, clip: vidGuid }] },
+      ],
+    });
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 9, resources: [], entities: [
+        { traits: { Director: { timeline: tlGuid, playing: true } } },
+      ],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/games/test/assets/timelines/intro.timeline.json');
+    expect(result.kept).toContain('/games/test/assets/video/intro.mp4');
+    expect(result.kept).not.toContain('/games/test/assets/video/unused.mp4');
+  });
+
+  it('drops every video clip when the video module is excluded — and says which', () => {
+    // This is what the `build.modules.video` toggle is actually FOR. Video's JS is engine code
+    // the runtime barrel keeps alive regardless (measured: a flag-gated dynamic import shed
+    // 3 KB of ~25 KB), so the megabytes are the clips — and a playable's 5 MB cap is the whole
+    // reason the module defaults off there.
+    const vidGuid = 'aaaaaaaa-bbbb-4ccc-8ddd-000000000001';
+    const texGuid = 'aaaaaaaa-bbbb-4ccc-8ddd-000000000002';
+    fx.writeVirtual('/games/test/assets/video/intro.mp4', 'fake-mp4');
+    fx.writeJson('/games/test/assets/video/intro.mp4.meta.json', { version: 2, id: vidGuid });
+    fx.writeVirtual('/games/test/assets/textures/hero.png', 'png');
+    fx.writeJson('/games/test/assets/textures/hero.png.meta.json', { version: 2, id: texGuid });
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 9, resources: [], entities: [
+        { traits: { VideoPlayer: { clip: vidGuid }, Renderable2D: { sprite: texGuid } } },
+      ],
+    });
+
+    const kept = computeKeptAssets(fx.projectRoot, fx.roots);
+    expect(kept.kept).toContain('/games/test/assets/video/intro.mp4');
+
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const stripped = computeKeptAssets(fx.projectRoot, fx.roots, { excludeVideo: true });
+    expect(stripped.kept).not.toContain('/games/test/assets/video/intro.mp4');
+    // Only video goes — an excluded module must not take the rest of the scene with it.
+    expect(stripped.kept).toContain('/games/test/assets/textures/hero.png');
+    // Never silent: a build that quietly ships a game minus its cutscenes looks fine until
+    // someone plays it.
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('/games/test/assets/video/intro.mp4'));
+    log.mockRestore();
   });
 
   // ── Generic GUID sweep (2026-07-26) — game-defined traits with no REF_FIELDS_BY_TRAIT

@@ -3,7 +3,14 @@
 
 import { getCurrentFPS } from '../rendering/frameDriver';
 import { getActiveRenderer } from '../loaders/textureResolver';
+import { readRendererBackend } from '../core/activeRenderer';
 import { getAllEntities } from '../core/ecs/entityUtils';
+import { getFrameProfile } from '../core/frameProfiler';
+import { isProfilerEnabled, getMarkerFaults, type MarkerFaults } from '../core/profilerMarkers';
+import { getMarkerAggregate, type MarkerStat } from '../core/profilerAggregate';
+import { getCounters, type CounterStat } from '../core/profilerCounters';
+import { getGpuProfile, getRestBreakdown, isGpuTimingEnabled, type GpuProfile, type RestBreakdown } from '../core/gpuTimings';
+import { getBatchStats, type BatchStats } from '../rendering/instancedBatching';
 
 export const MB = 1024 * 1024;
 
@@ -44,7 +51,13 @@ export function readRenderer(): RendererStats | null {
   const render = r.info?.render ?? {};
   const memory = r.info?.memory ?? {};
   return {
-    backend: r.isWebGPURenderer ? 'WebGPU' : 'WebGL',
+    // The API in use, not the renderer CLASS (#147) — `isWebGPURenderer` is true even when three
+    // is running its WebGL2 backend inside the same object, which is the case on every device
+    // without an adapter. Shared with `deviceCaps.backend` so the two can't disagree.
+    // `readRendererBackend` returns null ONLY for a null renderer, and `r` is non-null by here
+    // (early-returned above) — so 'unknown' is unreachable rather than a default. Saying that
+    // out loud beats `?? 'WebGL'`, which would silently answer WebGL if the invariant ever moved.
+    backend: readRendererBackend(r) ?? 'unknown',
     // PER-FRAME draw calls. WebGPU's Info keeps `render.calls` as a LIFETIME
     // cumulative counter (climbs forever — looks like a leak) and exposes the
     // per-frame count as `render.drawCalls`; WebGL only has `render.calls` (which it
@@ -59,4 +72,99 @@ export function readRenderer(): RendererStats | null {
 
 export function getEntityCount(): number {
   return getAllEntities().length;
+}
+
+/** One read answering "is this device coping, and if not, with what?" (#121 P2).
+ *
+ *  Joins the three sources that have to be read TOGETHER to be interpretable — timings, draw
+ *  load, and memory. Read apart they mislead: 83 ms frames say a device is struggling but not
+ *  why; 237 draw calls is only alarming next to the CPU cost of submitting them; and a texture
+ *  figure on its own already caused one fix to ship against the wrong bottleneck (see
+ *  `core/frameProfiler`'s header).
+ *
+ *  Renderer/memory fields are null when unavailable — no renderer mounted yet, or a non-Chromium
+ *  engine with no `performance.memory` (i.e. all of iOS). Absent, never faked. */
+export function readPerfProfile(opts: { markers?: number } = {}): {
+  frame: ReturnType<typeof getFrameProfile>;
+  renderer: RendererStats | null;
+  memoryMB: { used: number; limit: number } | null;
+  entities: number;
+  markers?: {
+    framesRecorded: number;
+    /** Worst `n` by median SELF time — "what do I fix?". */
+    top: MarkerStat[];
+    /** Present only when non-zero: an incomplete tree must announce itself, since a silently
+     *  truncated profile reads exactly like a complete one. */
+    faults?: MarkerFaults;
+    truncated?: boolean;
+  };
+  /** Game-authored counters (P9). Omitted when none are registered — an empty array would
+   *  imply a game that declared none, which is the same thing but reads as a finding. */
+  counters?: CounterStat[];
+  /** Measured GPU time (P7). Omitted entirely when GPU timing has never been enabled — the
+   *  default — so its absence reads as "not asked for" rather than as "the GPU did nothing". */
+  gpu?: GpuProfile;
+  /** `restMs` split into measured GPU-busy versus present+idle. Present only when real samples
+   *  exist. This is the field that gives `frame.vsyncBound` evidence instead of an inference. */
+  restBreakdown?: RestBreakdown;
+  /** Draw-call batching (#154 P4b). ALWAYS present, even all-zero: "batching ran and found
+   *  nothing" and "batching never ran" are different facts, and `renderer.calls` alone cannot
+   *  tell them apart — which is exactly how the first on-device attempt looked like a null
+   *  result instead of an unfired mechanism. `skipped` says WHY anything was excluded. */
+  batching: BatchStats;
+} {
+  const mem = readMemory();
+  const frame = getFrameProfile();
+  return {
+    frame,
+    renderer: readRenderer(),
+    memoryMB: mem
+      ? { used: +(mem.usedJSHeapSize / MB).toFixed(1), limit: +(mem.jsHeapSizeLimit / MB).toFixed(1) }
+      : null,
+    entities: getEntityCount(),
+    ...markerFields(opts.markers ?? DEFAULT_MARKER_ROWS),
+    ...counterFields(),
+    ...gpuFields(frame.restMs.median),
+    batching: getBatchStats(),
+  };
+}
+
+/** Same convention as `markerFields`: omitted while GPU timing is off, because "off" and
+ *  "measured nothing" are different facts and must not look alike. Once enabled the profile is
+ *  ALWAYS included even when unsupported — at that point the reader has asked the question, and
+ *  `status: 'unsupported'` with its `detail` is the answer they need. */
+function gpuFields(restMedianMs: number): { gpu?: GpuProfile; restBreakdown?: RestBreakdown } {
+  if (!isGpuTimingEnabled()) return {};
+  const gpu = getGpuProfile();
+  const breakdown = getRestBreakdown(restMedianMs);
+  return { gpu, ...(breakdown ? { restBreakdown: breakdown } : {}) };
+}
+
+function counterFields(): { counters?: CounterStat[] } {
+  if (!isProfilerEnabled()) return {};
+  const { counters } = getCounters();
+  return counters.length ? { counters } : {};
+}
+
+/** Rows returned before any filter is applied. **Summary-first**
+ *  ([docs/debug-tools-mcp.md](../../../../../docs/debug-tools-mcp.md)): the full marker tree in
+ *  every response would blow the budget on a payload nobody read, and the worst handful by self
+ *  time is what answers the question anyway. Ask `getMarkerAggregate()` for the whole thing. */
+export const DEFAULT_MARKER_ROWS = 8;
+
+/** Omitted ENTIRELY when profiling is off, rather than reported as an empty ranking — "no
+ *  markers recorded" and "markers not running" are different facts and must not look alike. */
+function markerFields(n: number): { markers?: ReturnType<typeof readPerfProfile>['markers'] } {
+  if (!isProfilerEnabled()) return {};
+  const agg = getMarkerAggregate();
+  const faults = getMarkerFaults();
+  const anyFault = faults.unbalancedEnds > 0 || faults.depthTruncated > 0 || faults.nodeCapHit > 0;
+  return {
+    markers: {
+      framesRecorded: agg.framesRecorded,
+      top: agg.ranking.slice(0, n),
+      ...(anyFault ? { faults } : {}),
+      ...(agg.truncated ? { truncated: true } : {}),
+    },
+  };
 }

@@ -26,6 +26,7 @@ const COLORS: Record<TrackDef['type'], string> = {
   signal: '#b08b3f',
   audio: '#8a4d8a',
   control: '#b0553f',
+  video: '#3f8aa0',
 };
 
 /** The visible end of an animation clip block: its own duration, else up to the next block's

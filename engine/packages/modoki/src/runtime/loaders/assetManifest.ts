@@ -24,6 +24,7 @@ import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import type { TextureImportSettings, TextureType } from './textureSettings';
 import type { AudioImportSettings, AudioCacheInfo } from './audioSettings';
+import type { VideoImportSettings } from './videoSettings';
 import type { EnvManifestBlock } from '../core/environmentSettings';
 export type { AudioImportSettings } from './audioSettings';
 import type { ModelImportSettings, ModelCacheInfo } from './modelSettings';
@@ -36,7 +37,19 @@ export type { SpriteAssetRef } from './spriteSheet';
 // here so runtime consumers keep importing them from the manifest.
 export type { AtlasPackedFrame, AtlasCacheBlock } from './spriteAtlas';
 
-export type AssetType = 'mesh' | 'material' | 'prefab' | 'scene' | 'model' | 'environment' | 'texture' | 'sprite' | 'atlas' | 'font' | 'shader' | 'particle' | 'animation' | 'animset' | 'spriteanim' | 'rig2d' | 'audio' | 'timeline';
+/** Every asset kind the manifest can hold. A runtime ARRAY rather than a bare type union so
+ *  the set is enumerable — a guard can then assert that a consumer covers all of it. That is
+ *  not hypothetical bookkeeping: `video` (#130) and `timeline` (#132) each shipped a working
+ *  backend while the Inspector's hand-maintained list quietly omitted them, and both were
+ *  found by a human sweeping the union by eye rather than by anything failing. `AssetType` is
+ *  derived from this, so adding a kind here is still the only edit a new kind needs. */
+export const ASSET_TYPES = [
+  'mesh', 'material', 'prefab', 'scene', 'model', 'environment', 'texture', 'sprite', 'atlas',
+  'font', 'shader', 'particle', 'animation', 'animset', 'spriteanim', 'rig2d', 'audio',
+  'timeline', 'video',
+] as const;
+
+export type AssetType = typeof ASSET_TYPES[number];
 
 export interface AssetEntry {
   guid: string;
@@ -79,6 +92,7 @@ export interface AssetEntry {
    *  the converted-variant URL at play time. Absent ⇒ unconverted; the runtime
    *  defaults to `loadType: 'buffer'` and serves the source file. */
   audio?: AudioManifestBlock;
+  video?: VideoManifestBlock;
   /** Baked font block (`'font'` assets only), copied from the `.meta.json`
    *  `font` block at scan time. Present only once the font has been through the
    *  MSDF atlas converter (baked `~atlas.png` + `~metrics.json` variants exist).
@@ -101,6 +115,20 @@ export interface AudioManifestBlock extends Partial<AudioImportSettings> {
   ext?: string;
 }
 
+/** Baked `video` block. Like the audio one, `ext` appears only once the clip has been
+ *  through the converter (so the runtime resolver can build the `~video.mp4` variant
+ *  URL without reading the sidecar). Unlike audio's, the measured fields are NOT
+ *  cosmetic: `bytes` is what resolves `policy: 'auto'` and feeds the per-game remote
+ *  footprint, so the runtime must not have to fetch the file to learn its size. */
+export interface VideoManifestBlock extends Partial<VideoImportSettings> {
+  ext?: string;
+  bytes?: number;
+  durationSec?: number;
+  width?: number;
+  height?: number;
+  hasAudio?: boolean;
+}
+
 /** Persisted manifest format. Array-of-entries (not keyed-by-guid) for
  *  compatibility with the existing vite-asset-scanner output, which uses the
  *  same file for font discovery and the asset panel. Entries without a guid
@@ -119,6 +147,7 @@ export interface AssetManifestEntry {
   sprite?: SpriteAssetRef;
   atlas?: AtlasCacheBlock;
   audio?: AudioManifestBlock;
+  video?: VideoManifestBlock;
   font?: FontManifestBlock;
   environment?: EnvManifestBlock;
 }
@@ -214,7 +243,7 @@ export function registerAsset(
   path: string,
   type: AssetType,
   texture?: TextureImportSettings,
-  modelBlocks?: { model?: ModelImportSettings; modelCache?: ModelCacheInfo; postprocessor?: string; sprite?: SpriteAssetRef; atlas?: AtlasCacheBlock; audio?: AudioManifestBlock; font?: FontManifestBlock; environment?: EnvManifestBlock },
+  modelBlocks?: { model?: ModelImportSettings; modelCache?: ModelCacheInfo; postprocessor?: string; sprite?: SpriteAssetRef; atlas?: AtlasCacheBlock; audio?: AudioManifestBlock; video?: VideoManifestBlock; font?: FontManifestBlock; environment?: EnvManifestBlock },
   hash?: string,
 ): void {
   if (!isGuid(guid)) {
@@ -254,6 +283,7 @@ export function registerAsset(
     sprite: modelBlocks?.sprite ?? (typeChanged ? undefined : prior?.sprite),
     atlas: modelBlocks?.atlas ?? (typeChanged ? undefined : prior?.atlas),
     audio: modelBlocks?.audio ?? (typeChanged ? undefined : prior?.audio),
+    video: modelBlocks?.video ?? (typeChanged ? undefined : prior?.video),
     font: modelBlocks?.font ?? (typeChanged ? undefined : prior?.font),
     environment: modelBlocks?.environment ?? (typeChanged ? undefined : prior?.environment),
   });
@@ -490,6 +520,7 @@ export function loadManifestJson(json: AssetManifestFile, opts?: { pathPrefix?: 
       sprite: entry.sprite,
       atlas: entry.atlas,
       audio: entry.audio,
+      video: entry.video,
       font: entry.font,
       environment: entry.environment,
     }, entry.hash);
@@ -551,6 +582,7 @@ export function serializeManifest(): AssetManifestFile {
       sprite: entry.sprite,
       atlas: entry.atlas,
       audio: entry.audio,
+      video: entry.video,
       font: entry.font,
       environment: entry.environment,
     });

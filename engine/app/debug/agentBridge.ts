@@ -1,17 +1,35 @@
-/** Agent bridge — dev-only glue that makes the engine friendly to AI agents
- *  (and any tooling) editing scene JSON on disk via plain `curl`.
+/** Agent bridge — the glue that makes the engine friendly to AI agents (and any tooling).
  *
- *  Three jobs, all over Vite's existing HMR websocket (no extra server):
- *   1. Push the live trait-registry schema to the dev server once, so its
- *      `/api/validate-scene` + `/api/scene-mutate` endpoints can type-check
- *      scene JSON (the registry only exists here, in the browser).
- *   2. Answer `modoki:request` ops from the server (currently `scene-state`),
- *      replying with `modoki:response`. Backs the curl-able `/api/scene-state`.
- *   3. Hot-reload the active scene when its `.scene.json` (or any `.prefab.json`)
- *      changes on disk — no manual browser refresh — and warn on validation
- *      findings so a malformed edit is visible immediately.
+ *  Home of the AGENT-OP REGISTRY: `registerAgentOp` here registers an op on every surface at once
+ *  — the editor, the device, and BOTH eval APIs (`evalApi.ts` / `deviceEvalApi.ts` are generated
+ *  from this registry, so they add composition and no capability of their own). The editor injects
+ *  its extra ops from `../editor/agentEditorOps.ts`, which runs LATER (a function call from
+ *  `setup.ts`, against this module's top-level registrations) and therefore REPLACES a name where
+ *  it has a richer, undoable version. Which half an op belongs in is a rule, not a habit — see
+ *  docs/plans/device-authoring-parity-plan.md §7.
  *
- *  Entirely gated on `import.meta.hot`, so it is stripped from production builds. */
+ *  Three transports reach it: Vite's HMR websocket (dev), Electron IPC (packaged editor), and the
+ *  TCP device lease (a game on a phone). The ops themselves are transport-agnostic.
+ *
+ *  Its jobs, beyond the registry: push the live trait-registry schema to the dev server so
+ *  `/api/validate-scene` + `/api/scene-mutate` can type-check scene JSON (the registry only exists
+ *  here, in the browser), and hot-reload the active scene when its `.scene.json`/`.prefab.json`
+ *  changes on disk.
+ *
+ *  ⚠️ NOT gated on `import.meta.hot` — this docblock said so for a long time and it was WRONG in a
+ *  way that matters. The registrations below are top-level, and a **device** build is a production
+ *  build that runs them. What actually keeps all of this out of a shipped app is
+ *  `project.config.json` `build.debugBuild` (`engine/app/main.tsx:14`), which decides whether the
+ *  bridge is mounted at all. Do not re-derive the safety answer from this file's scope.
+ *
+ *  HMR note (load-bearing, and INCIDENTAL — which is why it is written down): this module has no
+ *  `import.meta.hot.accept` boundary, and it is imported both through `App.tsx` (which self-accepts)
+ *  AND directly from `main.tsx`, which does not. Vite propagates an update only when EVERY importer
+ *  path reaches a boundary, so the `main.tsx` dead end forces a full page RELOAD for any edit here —
+ *  which re-runs the whole boot sequence, editor registrations included. That is what stops a hot
+ *  patch from re-running the top-level registrations and silently reverting the editor's undoable
+ *  ops to the runtime ones. Nobody designed it as a safety mechanism: removing or `@vite-ignore`-ing
+ *  the `main.tsx` import, or adding an accept boundary here, would quietly break it. */
 
 import {
   sceneManager,
@@ -38,6 +56,9 @@ import {
   isSimRunning,
   setTimeScale,
   getTimeScale,
+  getTime,
+  registerFrameCallback,
+  unregisterFrameCallback,
   getCurrentWorld,
   getContactState,
   registerHandleProvider,
@@ -54,15 +75,35 @@ import {
   invalidateRig2D,
   findEntityByGuid,
   getCachedPrefab,
+  getParticleEffect,
+  getAnimationClip,
+  getTimeline,
+  getSpriteAnim,
+  getRig2D,
+  startInputWatch,
+  stopInputWatch,
+  clearInputPresses,
+  readInputPresses,
+  type InputPressRecord,
 } from '@modoki/engine/runtime';
+import { applyLiveMutate } from './liveMutate';
+import { createEntityLive, duplicateEntityLive, deleteEntitiesLive } from './liveLifecycle';
 import { computeLayoutBounds, type LayoutBoundsParams, type LayoutEntry } from './layoutDump';
 import { tailWithCounts, tailHint, CONSOLE_TAIL_DEFAULT, JOURNAL_TAIL_DEFAULT } from './streamSummary';
 import { roundFloats, resolvePrecision } from './roundFloats';
 import { computeHandles, type HandlesDumpParams } from './handlesDump';
 import { resolveDomPointReport, type DomPointSpec } from './domResolve';
 import { resolveEntityPointReport, type EntityPointSpec } from './entityResolve';
+import { readConsoleSource } from './consoleSource';
 import { chromeHandles } from './chromeHandles';
 import { computeDiagnostics } from './diagnose';
+import {
+  startCapture, stopCapture, clearCapture, getCapture, readPerfProfile,
+  resetProfilerMarkers, resetMarkerAggregate, resetFrameProfile, type MarkerSample,
+  setGpuTimingEnabled, resetGpuTimings,
+  collectHitRegions, hitRegionProviders, isHitRegionOverlayVisible, setHitRegionOverlayVisible,
+  regionsAt, nearestRegionTo,
+} from '@modoki/engine/runtime';
 import { startWatch, readWatch, listWatches, clearWatch, type StartWatchParams } from './watch';
 // Percept S3: resolved world transforms + hierarchy-deactivation set, both computed
 // each frame by transformPropagationSystem. Same module instance the renderers read.
@@ -219,7 +260,13 @@ export function installConsoleCapture(): void {
 }
 
 function dumpConsoleLogs(p: ConsoleLogsParams = {}): { logs: ConsoleEntry[]; total: number } {
-  let logs = consoleBuffer;
+  // Read whatever surface ACTUALLY captured (#157). `consoleHooked` is the honest test: it is true
+  // exactly when `installConsoleCapture()` ran, i.e. when this module's own buffer is the live one
+  // (editor, and dev). On a shipped device build `initAgentBridge()` returns before that call, so
+  // the buffer is permanently empty and the device's own ring — published through `consoleSource`
+  // — is the real one. Preferring the native buffer whenever it is hooked keeps the editor path
+  // byte-identical, including the uncaught-error entries only it records.
+  let logs: ConsoleEntry[] = consoleHooked ? consoleBuffer : (readConsoleSource() ?? consoleBuffer);
   if (p.level) logs = logs.filter((e) => e.level === p.level);
   if (p.since != null) logs = logs.filter((e) => e.ts > p.since!);
   const total = logs.length;
@@ -763,15 +810,96 @@ registerAgentOp('resolve-dom-point', (params) => resolveDomPointReport((params ?
 registerAgentOp('resolve-entity-point', (params) => resolveEntityPointReport((params ?? {}) as EntityPointSpec));
 
 // ── Phase F: structured render/scene health (causes, not a black screenshot) ──
-// Only errors from the last 30s gate `ok` (F14): a stale load-time / prior-scene error otherwise
+// Only errors inside this window gate `ok` (F14): a stale load-time / prior-scene error otherwise
 // pins ok:false forever. Date.now() is fine here — app/debug is outside the runtime determinism
 // guard, and the console ring already stamps entries with Date.now().
-const DIAGNOSE_ERROR_WINDOW_MS = 30_000;
+//
+// FIVE MINUTES, not the original 30s (#152). The window has to be longer than the time it takes a
+// human to notice something, connect a device, attach an agent and ask a question — at 30s it was
+// shorter than that on every real investigation, so boot errors aged out before anyone could look.
+// It is a VERDICT window, not a reporting window: `computeDiagnostics` counts and timestamps
+// everything older as `olderErrors` and names the window as `errorWindowMs`, so widening it trades
+// "how long a fixed error keeps failing ok" against nothing — the older ones are visible either way.
+const DIAGNOSE_ERROR_WINDOW_MS = 300_000;
 registerAgentOp('diagnose', () => computeDiagnostics({
   consoleErrors: dumpConsoleLogs({ level: 'error' }).logs,
   now: Date.now(),
   errorWindowMs: DIAGNOSE_ERROR_WINDOW_MS,
 }));
+
+// ── profiler (profiler plan P4/P6) ────────────────────────────────────────────────────────
+// The capture was HUMAN-ONLY until this: the Profiler panel has a Record button and an agent
+// had no way to start one at all. On a device that is exactly backwards — the agent is the
+// consumer that can be on a phone without anyone holding it, which is the whole reason the
+// marker tree was built as data first. Verified missing by listing the device's op registry.
+//
+// Summary-first, like every other read here: `capture-read` returns the WORST frames by total
+// frame time, not every frame. A 300-frame capture with a full marker tree each is far past any
+// response budget, and "which frames were slow, and what did they spend it on" is the question —
+// the whole capture is still exportable as JSON for the cases that genuinely need it.
+registerAgentOp('profiler', (raw: unknown) => {
+  const params = (raw ?? {}) as Record<string, unknown>;
+  const action = String(params.action ?? 'read');
+  switch (action) {
+    case 'capture-start':
+      startCapture();
+      return { capturing: true };
+    case 'capture-stop':
+      stopCapture();
+      return { capturing: false, frames: getCapture().frames.length };
+    case 'capture-clear':
+      clearCapture();
+      return { cleared: true };
+    case 'capture-read': {
+      const cap = getCapture();
+      const limit = Math.max(1, Math.min(20, Number(params.limit ?? 5)));
+      // Sorted by cost, so the interesting frames come first regardless of when they happened.
+      const worst = [...cap.frames].sort((a, b) => b.frameMs - a.frameMs).slice(0, limit);
+      return {
+        capturing: cap.capturing,
+        frameCount: cap.frames.length,
+        stoppedByCap: cap.stoppedByCap,
+        worst: worst.map((f) => ({
+          index: f.index, atMs: +f.atMs.toFixed(1), frameMs: +f.frameMs.toFixed(1),
+          cpuMs: +f.cpuMs.toFixed(1),
+          // Only the costly branches — a full tree per frame is what blows the budget.
+          top: flattenTree(f.tree).sort((a, b) => b.selfMs - a.selfMs).slice(0, 6),
+        })),
+      };
+    }
+    // P7 — GPU timestamp queries. Separate actions rather than a flag on `read` because enabling
+    // has a real cost and must be a deliberate act: three allocates a query set and writes two
+    // timestamps per render pass, and the plan's overhead rule says the profiler must not change
+    // the thing it measures. The returned status is the honest answer for THIS device — on a
+    // WebGL2 backend without EXT_disjoint_timer_query_webgl2 (most low-end Android) it comes back
+    // 'unsupported' with a reason, and no number is ever fabricated to fill the gap.
+    case 'gpu-on': {
+      const status = setGpuTimingEnabled(true);
+      return { gpuTiming: status, ...(status === 'pending' ? { note: 'Samples resolve asynchronously — read again in a few frames.' } : {}) };
+    }
+    case 'gpu-off':
+      return { gpuTiming: setGpuTimingEnabled(false) };
+    case 'reset':
+      resetProfilerMarkers();
+      resetMarkerAggregate();
+      resetFrameProfile();
+      resetGpuTimings();
+      clearCapture();
+      return { reset: true };
+    case 'read':
+    default:
+      return readPerfProfile({ markers: Number(params.markers ?? 12) });
+  }
+});
+
+/** Flatten a captured tree to `{path, selfMs, calls}` rows so one frame can be ranked the same
+ *  way the live aggregate is — the question ("what owned this frame?") is identical. */
+function flattenTree(node: MarkerSample, parent = ''): Array<{ path: string; selfMs: number; calls: number }> {
+  const path = parent ? `${parent}/${node.name}` : node.name;
+  const rows = [{ path, selfMs: +node.selfMs.toFixed(2), calls: node.calls }];
+  for (const c of node.children) rows.push(...flattenTree(c, path));
+  return rows;
+}
 
 // ── Percept Watch: standing numeric time-series (how a NUMBER moved over time) ──
 registerAgentOp('watch-start', (params) => startWatch((params ?? {}) as StartWatchParams));
@@ -806,6 +934,127 @@ registerAgentOp('watch-read', (params) => {
 registerAgentOp('watch-list', () => listWatches());
 registerAgentOp('watch-clear', (params) => clearWatch((params as { id?: string })?.id));
 
+// ── Input WATCH (#134): what the POINTER actually did, and what it resolved to — the
+// evidence a failed gesture otherwise leaves NOTHING behind (no journal event, no commit, no
+// coordinates). Response shaping (limit/unresolvedOnly/precision) lives HERE, in the op, same
+// split as watch-read: `readInputPresses()` (the producer, `runtime/input/pointerRecorder.ts`)
+// stays a pure ring-buffer read with no agent-surface concerns. ──
+registerAgentOp('input-watch-start', (params) => startInputWatch((params ?? {}) as { max?: number }));
+
+const DEFAULT_INPUT_WATCH_LIMIT = 20;
+function isUnresolvedPress(p: InputPressRecord): boolean {
+  return p.resolved.by === 'none' || p.resolved.by === 'unknown';
+}
+/** Shared by `read` and `stop` (stop reports what was captured, same shape as a read). */
+function shapeInputWatchRead(params: unknown): unknown {
+  const p = (params ?? {}) as { limit?: number; unresolvedOnly?: boolean; precision?: number };
+  const out = readInputPresses();
+  const sig = resolvePrecision(p.precision);
+  const matched = p.unresolvedOnly ? out.presses.filter(isUnresolvedPress) : out.presses;
+  const limit = typeof p.limit === 'number' && Number.isFinite(p.limit) && p.limit > 0
+    ? Math.floor(p.limit) : DEFAULT_INPUT_WATCH_LIMIT;
+  // The ring is oldest-first; the MOST RECENT N is the tail.
+  const presses = matched.slice(Math.max(0, matched.length - limit));
+  const result: Record<string, unknown> = {
+    open: out.open,
+    max: out.max,
+    // Recomputed against what THIS call actually returns (post-filter, post-limit) — `totalCount`
+    // stays the producer's true all-time count, per §2 ("both present whenever a filter applied").
+    returnedCount: presses.length,
+    totalCount: out.totalCount,
+    dropped: out.dropped,
+    presses,
+  };
+  // "Could not look" must never read as "nothing is there" (§5): an empty list from a window that
+  // has never been opened is not evidence the gesture produced no presses — nobody was watching.
+  if (!out.open && out.totalCount === 0) {
+    result.hint = "No presses recorded — this input watch has never been opened (or was cleared). "
+      + "Call action:'start' BEFORE the gesture you want to capture, then read again.";
+  } else if (presses.length < matched.length) {
+    result.hint = `${matched.length} press(es) matched; showing the most recent ${presses.length}. Raise limit= to see more.`;
+  }
+  return roundFloats(result, sig);
+}
+registerAgentOp('input-watch-read', (params) => shapeInputWatchRead(params));
+/** `stop` is a CONTROL action, so it answers with control state and not with a truncated read.
+ *  It used to return `shapeInputWatchRead({})` — which took the DEFAULT limit of 20 and, past
+ *  that, emitted "Raise limit= to see more" on the one action whose param allowlist REFUSES
+ *  `limit`. That is the dead-end hint §6 forbids by name: it reads as the agent's mistake and
+ *  there is no call that satisfies it. The documented flow (stop, then read, without racing your
+ *  own probe) is unaffected — and now it is the only flow, rather than one of two shapes. */
+registerAgentOp('input-watch-stop', () => {
+  const before = readInputPresses();
+  stopInputWatch();
+  return {
+    ok: true,
+    open: false,
+    retained: before.returnedCount,
+    totalCount: before.totalCount,
+    hint: `Window closed; ${before.returnedCount} press(es) kept. Read them with action:'read'.`,
+  };
+});
+registerAgentOp('input-watch-clear', () => ({ ok: true, cleared: clearInputPresses() }));
+
+// ── Hit REGIONS (#139): the shapes a game's hitTest uses, which are authored NOWHERE — computed
+// inside the hit-test from config, so no inspector, scene view or screenshot can show them. The
+// companion to the input watch above: that one measures a miss, this one says what it missed and
+// by how much. `show`/`hide` drive the on-screen overlay (which also plots the last few recorded
+// presses); `read` returns the geometry as data, which is what an agent actually reasons over. ──
+const DEFAULT_HIT_REGION_LIMIT = 60;
+registerAgentOp('hit-regions', (raw: unknown) => {
+  const p = (raw ?? {}) as {
+    action?: string; provider?: string; kind?: string; ids?: string[];
+    limit?: number; precision?: number; at?: { x: number; y: number };
+  };
+  const action = String(p.action ?? 'read');
+  if (action === 'show' || action === 'hide') {
+    setHitRegionOverlayVisible(action === 'show');
+    return { ok: true, visible: action === 'show', providers: hitRegionProviders() };
+  }
+  const providers = hitRegionProviders();
+  const all = collectHitRegions({ provider: p.provider, kind: p.kind, ids: p.ids });
+  const limit = typeof p.limit === 'number' && Number.isFinite(p.limit) && p.limit > 0
+    ? Math.floor(p.limit) : DEFAULT_HIT_REGION_LIMIT;
+  const regions = all.slice(0, limit);
+  const result: Record<string, unknown> = {
+    visible: isHitRegionOverlayVisible(),
+    providers,
+    returnedCount: regions.length,
+    totalCount: all.length,
+    regions,
+  };
+  // The question a miss investigation actually asks, answered here rather than by making the
+  // caller re-implement point-in-shape against the returned geometry — which is where a second,
+  // subtly different containment test would creep in and disagree with the overlay.
+  if (p.at && Number.isFinite(p.at.x) && Number.isFinite(p.at.y)) {
+    const hits = regionsAt(all, p.at!.x, p.at!.y);
+    result.at = p.at;
+    result.hitsAt = hits.map((r) => ({ id: r.id, kind: r.kind, label: r.label }));
+    if (hits.length === 0) {
+      // A MISS is the interesting answer, so it comes with the nearest edge — the number the
+      // Court investigation had to derive by hand (27.6 px against a 22.76 px radius).
+      const near = nearestRegionTo(all, p.at.x, p.at.y);
+      result.nearest = near
+        ? { id: near.region.id, kind: near.region.kind, label: near.region.label, distancePx: +near.distance.toFixed(2) }
+        : null;
+    }
+  }
+  // "Could not look" must never read as "nothing is there" (§5): no provider is a different fact
+  // from no regions, and they produce identical empty lists.
+  if (providers.length === 0) {
+    result.hint = 'No hit-region provider is registered, so this is NOT evidence that the surface '
+      + 'has no hit regions — nobody was able to answer. A game publishes them by calling '
+      + 'registerHitRegionProvider() from the code that owns its hitTest geometry.';
+  } else if (all.length === 0) {
+    result.hint = `Provider(s) [${providers.join(', ')}] registered but reported no regions — the `
+      + 'surface is not hit-testable right now (no level loaded, or a modal is swallowing input).';
+  } else if (regions.length < all.length) {
+    result.hint = `${all.length} region(s) matched; showing the first ${regions.length}. Raise limit=, or filter by kind=/provider=.`;
+  }
+  return roundFloats(result, resolvePrecision(p.precision));
+});
+
+
 // ── Phase E: time-scale control (0=pause, 0.3=slow-mo, 2=fast) — inspect fast motion ──
 registerAgentOp('set-timescale', (params) => {
   const { scale } = (params ?? {}) as { scale?: number };
@@ -815,6 +1064,184 @@ registerAgentOp('set-timescale', (params) => {
   setTimeScale(getCurrentWorld(), scale);
   return { ok: true, timeScale: getTimeScale(getCurrentWorld()) };
 });
+
+// ── Live trait mutation (#166) — the write half of the surface, registered HERE (runtime) rather
+// than in agentEditorOps so the DEVICE gets it too, along with both eval APIs (which are generated
+// from this registry). The editor keeps its own richer, UNDOABLE `apply-scene-ops` alongside it;
+// this op is the flat, single-selector twin that works on every surface.
+// See docs/plans/device-authoring-parity-plan.md.
+/** Guess an asset-def kind from its filename. The suffixes are the project's own convention
+ *  (docs/doc-conventions.md), not a heuristic. Exported so the EDITOR op reuses it instead of
+ *  keeping a second copy (#166 P7 — the duplication class §9 warns about). */
+export function inferAssetDefType(path: string): 'particle' | 'animation' | 'timeline' | 'spriteanim' | 'rig2d' | null {
+  if (path.endsWith('.particle.json')) return 'particle';
+  if (path.endsWith('.anim.json')) return 'animation';
+  if (path.endsWith('.timeline.json')) return 'timeline';
+  if (path.endsWith('.spriteanim.json')) return 'spriteanim';
+  if (path.endsWith('.rig2d.json')) return 'rig2d';
+  return null;
+}
+
+// ── read-asset-def (#166 P7) — what the RUNNING build actually resolved.
+//
+// Runtime twin: reads the live cache and nothing else. The editor replaces this with its own
+// version, which additionally reports `unsaved` from the dirty-asset registry — a concept that
+// does not exist on a device (no project on disk). On a phone this answers a question nothing else
+// can: not "what does the file say" (a file read answers that) but "what did THIS build actually
+// load", which is the whole observe-don't-infer rule applied to assets.
+registerAgentOp('read-asset-def', (params) => {
+  const { path, type } = (params ?? {}) as { path?: string; type?: string };
+  if (!path) return { ok: false, error: 'read-asset-def requires { path }.' };
+  const kind = type ?? inferAssetDefType(path);
+  if (!kind) {
+    return {
+      ok: false,
+      error: `cannot tell what kind of asset '${path}' is — pass type explicitly.`,
+      options: ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d'],
+    };
+  }
+  // PEEK, don't load. The plain getters treat a miss as "not loaded YET" and kick off a background
+  // fetch, so asking about an absent asset would queue a load that can only fail and log into the
+  // console — for a question this op then refuses anyway.
+  const peek = { load: false } as const;
+  const def =
+    kind === 'particle' ? getParticleEffect(path, peek)
+    : kind === 'animation' ? getAnimationClip(path, peek)
+    : kind === 'timeline' ? getTimeline(path, peek)
+    : kind === 'spriteanim' ? getSpriteAnim(path, peek)
+    : kind === 'rig2d' ? getRig2D(path, peek)
+    : undefined;
+  if (def === undefined) {
+    return { ok: false, error: `unsupported type '${kind}'.`, options: ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d'] };
+  }
+  if (def === null) {
+    // NOT an empty answer: nothing has loaded this asset into the live cache, so there is no live
+    // def to report. Saying so beats returning null, which reads as "the asset is empty".
+    return { ok: false, error: `'${path}' is not in the live ${kind} cache — nothing in the running scene has loaded it.` };
+  }
+  return { ok: true, path, type: kind, source: 'live', def };
+});
+
+// ── Scene swap (#166 P5) — load another scene on the device with NO rebuild.
+//
+// The editor's `load-scene` guards unsaved editor work and returns editor state; neither exists
+// here. What DOES carry over is the failure discipline: a load that did not happen must never be
+// reported as one, which is why the current path is read back after the swap rather than echoed.
+registerAgentOp('load-scene', async (params) => {
+  const p = (params ?? {}) as { path?: string };
+  if (!p.path) {
+    return {
+      ok: false,
+      error: 'load-scene requires { path } — nothing was loaded.',
+      current: sceneManager.getCurrent()?.path ?? null,
+    };
+  }
+  const before = sceneManager.getCurrent()?.path ?? null;
+  try {
+    await sceneManager.loadScene(p.path);
+  } catch (e) {
+    return { ok: false, error: `load-scene FAILED for "${p.path}": ${(e as Error).message}. The previous scene is still loaded.`, current: sceneManager.getCurrent()?.path ?? null };
+  }
+  const after = sceneManager.getCurrent()?.path ?? null;
+  // loadScene resolves void, so "did it work?" is only answerable by looking. A path that does not
+  // exist would otherwise resolve quietly and report a swap that never happened (conventions §0).
+  if (after !== p.path) {
+    return { ok: false, error: `load-scene did not switch to "${p.path}" — the active scene is ${after ?? 'null'}. Check the path exists in this build.`, current: after, previous: before };
+  }
+  return { ok: true, current: after, previous: before, entityCount: getAllEntities().length };
+});
+
+export const SIM_STEP_MAX_TIMEOUT_MS = 20000;
+
+/** The default budget for `sim-step`, DERIVED from the frame count rather than flat.
+ *
+ *  A flat default could not cover the op's own documented maximum: 600 frames is ~10s at 60fps and
+ *  ~20s at 30fps, so `sim-step {frames:600}` — the max the same handler advertises — timed out
+ *  against its own budget every time. Two limits sized independently with no cross-check is how a
+ *  feature fails on its headline call.
+ *
+ *  Exported so the arithmetic is unit-testable: pinning it through the op itself would mean waiting
+ *  out a real timeout (4.5s+ per assertion), which is why the flat-default regression survived a
+ *  mutation check until this was extracted. */
+export function simStepDefaultTimeout(frames: number): number {
+  return Math.min(SIM_STEP_MAX_TIMEOUT_MS, Math.max(3000, frames * 40 + 500));
+}
+
+// ── Sim control (#166 P3) — step an exact number of FRAMES on the device.
+//
+// NOT stepSimulation(): that is a HEADLESS-only entry point and its own docblock warns that calling
+// it during a live real-clock 'playing' session "will reset the global clock to manual/0,
+// disturbing the live render loop" — which is precisely a game running on a phone. So a device step
+// advances REAL frames instead: unfreeze, let the natural rAF loop run N frames, re-freeze.
+//
+// The consequence is stated rather than hidden: a step here is one REAL frame (~16-33ms, whatever
+// the phone took), not a fixed dt, so this is a measurement aid and NOT a deterministic repro. The
+// deterministic-but-invasive alternative (install the manual clock, suspend the rAF driver) was
+// considered and declined — see docs/plans/device-authoring-parity-plan.md P3.
+registerAgentOp('sim-step', (params) => {
+  const p = (params ?? {}) as { frames?: number; scale?: number; timeoutMs?: number };
+  const world = getCurrentWorld();
+  // Mirrors the editor's `step requires paused state`: stepping a running world is meaningless, and
+  // silently pausing one would be a side effect the caller did not ask for.
+  if (getTimeScale(world) !== 0) {
+    return Promise.resolve({
+      ok: false,
+      error: `sim-step requires a PAUSED world — timeScale is ${getTimeScale(world)}. Pause first with set-timescale {scale:0}.`,
+      timeScale: getTimeScale(world),
+    });
+  }
+  const frames = Math.max(1, Math.min(600, Math.floor(Number(p.frames ?? 1))));
+  const scale = typeof p.scale === 'number' && Number.isFinite(p.scale) && p.scale > 0 ? p.scale : 1;
+  const timeoutMs = Math.max(100, Math.min(SIM_STEP_MAX_TIMEOUT_MS, Number(p.timeoutMs ?? simStepDefaultTimeout(frames))));
+
+  return new Promise((resolve) => {
+    const key = `__agent-sim-step-${Date.now()}`;
+    let seen = 0;
+    let done = false;
+    const elapsedOf = () => (getTime(world) as { elapsed?: number } | undefined)?.elapsed ?? 0;
+    const startElapsed = elapsedOf();
+    const finish = (timedOut: boolean) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      unregisterFrameCallback(key);
+      setTimeScale(world, 0);   // ALWAYS re-freeze, including on the timeout path
+      const advancedMs = Math.round((elapsedOf() - startElapsed) * 1000);
+      if (timedOut) {
+        // A frozen frame loop is the honest answer here. Reporting `stepped: 0` as a success would
+        // tell an agent the world advanced when nothing rendered at all (conventions §8).
+        resolve({
+          ok: false,
+          error: `only ${seen} of ${frames} frame(s) ran within ${timeoutMs}ms — the frame loop may be stopped or the app backgrounded. The world was re-frozen (timeScale 0).`,
+          stepped: seen, requested: frames, advancedMs,
+        });
+        return;
+      }
+      resolve({ ok: true, stepped: seen, advancedMs, timeScale: getTimeScale(world), note: 'real frames, not a fixed dt — a step is however long the device took to render it.' });
+    };
+    const timer = setTimeout(() => finish(true), timeoutMs);
+    // Priority 100: after ECS and both renderers, so a frame is counted only once its work is done.
+    registerFrameCallback(key, () => { if (++seen >= frames) finish(false); }, 100);
+    setTimeScale(world, scale);
+  });
+});
+
+// ── Entity lifecycle (#166 P2) — runtime twins, so the DEVICE can spawn/duplicate/delete. The
+// editor REPLACES all three at startup with its undoable versions (registerAgentOp is a Map keyed
+// by name, and agentEditorOps registers later), so an editor session is unchanged.
+registerAgentOp('create-entity', createEntityLive);
+registerAgentOp('duplicate-entity', duplicateEntityLive);
+registerAgentOp('delete-entities', deleteEntitiesLive);
+
+registerAgentOp('set-traits', (params) =>
+  applyLiveMutate(params, {
+    parseWhere,
+    guidOf: (id) => {
+      const eaMeta = getAllTraits().find((m) => m.name === 'EntityAttributes');
+      const d = eaMeta ? readTraitData(id, eaMeta) : null;
+      return ((d?.guid as string) || '') || String(id);
+    },
+  }));
 
 /** Dispatch a server request op to a result via the registry.
  *

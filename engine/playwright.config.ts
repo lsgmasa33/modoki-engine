@@ -64,9 +64,11 @@ export default defineConfig({
   // when re-run alone — the signature of contention, not of a broken test.
   //
   // That cost real time twice, in separate sessions, because a red e2e run is
-  // indistinguishable from a genuine regression until you re-run it. e2e is also
-  // deliberately NOT CI-gated (see CLAUDE.md), so it is the only thing watching editor
-  // interaction — a gate you have to second-guess is worse than a slow one.
+  // indistinguishable from a genuine regression until you re-run it. Since 2026-08-06 this suite
+  // is no longer run locally as a pre-push gate at all (the free public runner covers it on every
+  // `main` push — see CLAUDE.md), which makes flakiness WORSE, not better: a nondeterministic red
+  // on `ci/main` is now the first and only signal anyone sees. A gate you have to second-guess is
+  // worse than a slow one.
   //
   // And serial costs ~6%: measured 4m51s for all 46 specs here, vs 4.5-4.9m at `workers: 4`.
   // The parallelism was buying almost nothing precisely BECAUSE the workers were contending.

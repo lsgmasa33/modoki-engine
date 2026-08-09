@@ -39,6 +39,7 @@ vi.mock('../../src/runtime/core/ecs/world', () => {
   return {
     getCurrentWorld: () => testWorld,
     registerEntity: vi.fn(),
+    spawnEntity: (world: any, ...traits: any[]) => world.spawn(...traits),
     setStructureCallback: vi.fn(),
     indexEntityGuid: () => {},
     findEntityById: (_id: number) => undefined,
@@ -1229,6 +1230,121 @@ describe('collectResourceRefsFromEntities', () => {
     const collectedPaths = new Set(refs.map((r) => r.path));
     const missing = expected.filter((g) => !collectedPaths.has(g));
     expect(missing, `registry ref fields NOT collected as resources: ${missing.join(', ')}`).toEqual([]);
+  });
+
+  // ── Prefab-instance OVERRIDES (found by the #123 close-out sweep) ─────────
+  //
+  // An override can introduce a ref the base prefab lacks — "instantiate a prefab, then swap
+  // this instance's mesh/material" is ordinary editor work — and the collector walked only
+  // `entry.traits`, so those refs reached the manifest through nothing. Measured on committed
+  // content: games/space-console/Station.scene.json holds 31 override-only Renderable3D
+  // mesh/material GUIDs absent from its `resources`, both ACQUIRING types (not preloaded, not
+  // scene-refcounted). The build was unaffected — the tree-shaker walks overrides itself —
+  // which is exactly why it stayed invisible.
+  describe('prefab-instance overrides', () => {
+    const MESH = 'aaaaaaaa-1111-4111-8111-111111111111';
+    const MAT = 'bbbbbbbb-2222-4222-8222-222222222222';
+
+    it('collects a ref introduced ONLY by a per-localId override', async () => {
+      const { collectResourceRefsFromEntities } = await getLoader();
+      const refs = collectResourceRefsFromEntities([
+        { traits: { PrefabInstance: { source: 'cccccccc-3333-4333-8333-333333333333' } },
+          overrides: { 7: { Renderable3D: { mesh: MESH, material: MAT } } } },
+      ]);
+      expect(refs).toContainEqual({ type: 'mesh', path: MESH });
+      expect(refs).toContainEqual({ type: 'material', path: MAT });
+    });
+
+    it('collects a ref from a path-keyed nestedOverrides bag', async () => {
+      const { collectResourceRefsFromEntities } = await getLoader();
+      const refs = collectResourceRefsFromEntities([
+        { traits: {}, nestedOverrides: { '3/9': { 2: { Renderable3D: { mesh: MESH } } } } },
+      ]);
+      expect(refs).toContainEqual({ type: 'mesh', path: MESH });
+    });
+
+    it('collects a ref from an override on an ADDED reference node', async () => {
+      const { collectResourceRefsFromEntities } = await getLoader();
+      const refs = collectResourceRefsFromEntities([
+        { traits: {}, added: [{
+          parentLocalId: 0, guid: 'g', name: 'n', traits: {}, children: [],
+          overrides: { 4: { Renderable3D: { material: MAT } } },
+        } as any] },
+      ]);
+      expect(refs).toContainEqual({ type: 'material', path: MAT });
+    });
+  });
+
+  // ── Generic GUID sweep: asset refs on GAME-defined traits (#123) ──────────
+  //
+  // REF_FIELDS_BY_TRAIT is engine-only with no registration API, so a guid held on a
+  // game trait used to be invisible to the collector — a re-save rebuilt `resources`
+  // without it and the production build then could not see the asset (docs/build.md,
+  // the #53 class). The sweep types a ref by what the manifest says the asset IS.
+  describe('game-defined trait refs (generic guid sweep)', () => {
+    const GAME_ANIM = 'd4b39fb4-043f-4eca-ac0a-9558e3d49dad';
+    const GAME_TEX = '46fcca1d-6a0c-4804-b548-530805ff1bb8';
+
+    beforeEach(async () => {
+      const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
+      registerAsset(GAME_ANIM, '/games/x/assets/anims/catvader.spriteanim.json', 'spriteanim');
+      registerAsset(GAME_TEX, '/games/x/assets/sprites/catvader.png', 'texture');
+    });
+    afterEach(async () => {
+      const { clearManifest } = await import('../../src/runtime/loaders/assetManifest');
+      clearManifest();
+    });
+
+    it('keeps an asset ref held on a game trait the engine registry cannot know about', async () => {
+      const { collectResourceRefsFromEntities } = await getLoader();
+      const refs = collectResourceRefsFromEntities([
+        { traits: { SpaceInvaderAssets: { catvaderSprite: GAME_TEX, catvaderAnim: GAME_ANIM } } },
+      ]);
+      expect(refs).toContainEqual({ type: 'spriteanim', path: GAME_ANIM });
+      expect(refs).toContainEqual({ type: 'texture', path: GAME_TEX });
+    });
+
+    it('unwraps one level of array, for a guid list on a game trait', async () => {
+      const { collectResourceRefsFromEntities } = await getLoader();
+      const refs = collectResourceRefsFromEntities([
+        { traits: { GameLevels: { anims: [GAME_ANIM] } } },
+      ]);
+      expect(refs).toContainEqual({ type: 'spriteanim', path: GAME_ANIM });
+    });
+
+    it('ignores a guid that is not an asset — an ENTITY ref must not become a resource', async () => {
+      const { collectResourceRefsFromEntities } = await getLoader();
+      const entityGuid = '99999999-8888-4777-8666-555555555555'; // never registered
+      const refs = collectResourceRefsFromEntities([
+        { traits: { GameFollow: { target: entityGuid } } },
+      ]);
+      expect(refs.map((r) => r.path)).not.toContain(entityGuid);
+    });
+
+    it('does not preload a SCENE guid — scenes load through SceneManager, not the resource cache', async () => {
+      const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
+      const { collectResourceRefsFromEntities } = await getLoader();
+      const nextLevel = '77777777-6666-4555-8444-333333333333';
+      registerAsset(nextLevel, '/games/x/assets/scenes/level-2.scene.json', 'scene');
+      const refs = collectResourceRefsFromEntities([
+        { traits: { GameProgress: { nextLevel } } },
+      ]);
+      expect(refs.map((r) => r.path)).not.toContain(nextLevel);
+    });
+
+    // An explicitly-typed field wins over the manifest's own type, and yields ONE entry:
+    // SkinnedModel.model is acquired as `riggedModel` while the .glb's manifest type is
+    // `model`, so a naive sweep would emit the same asset twice under two types.
+    it('does not double-emit a field whose declared type differs from the asset type', async () => {
+      const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
+      const { collectResourceRefsFromEntities } = await getLoader();
+      const rig = '22222222-3333-4444-8555-666666666666';
+      registerAsset(rig, '/games/x/assets/models/hero.glb', 'model');
+      const refs = collectResourceRefsFromEntities([
+        { traits: { SkinnedModel: { model: rig } } },
+      ]);
+      expect(refs.filter((r) => r.path === rig)).toEqual([{ type: 'riggedModel', path: rig }]);
+    });
   });
 });
 

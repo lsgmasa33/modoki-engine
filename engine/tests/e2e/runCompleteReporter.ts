@@ -31,7 +31,7 @@ import type { FullConfig, FullResult, Reporter, Suite, TestCase, TestResult } fr
  * `MODOKI_E2E_MIN_TESTS` overrides it for the rare deliberate subset run (`--grep`, one spec file
  * during development), which would otherwise trip this guard on every invocation.
  */
-const EXPECTED_MIN_TESTS = 47;
+const EXPECTED_MIN_TESTS = 50;
 
 export default class RunCompleteReporter implements Reporter {
   private discovered = 0;

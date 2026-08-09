@@ -47,6 +47,7 @@ import {
   eulerToQuat, eulerToQuatInto, quatToEulerInto, type Vec3, type Quat, type Euler3,
 } from './physics3DConvert';
 import { resolveColliderBits } from './physicsLayers';
+import { registerRaycast3D } from '../core/raycast3DRegistry';
 
 type RWorld = import('@dimforge/rapier3d-compat').World;
 type REventQueue = import('@dimforge/rapier3d-compat').EventQueue;
@@ -975,10 +976,16 @@ function emitContactDetail(st: PhysicsWorldState3D, world: World, upm: number, h
 }
 
 /** A 3D raycast against the physics world, in ECS/world coordinates. Returns the first (nearest)
- *  hit or null. `dx/dy/dz` need not be normalized. `maxDistance` is in world units. Pure query. */
+ *  hit or null. `dx/dy/dz` need not be normalized. `maxDistance` is in world units.
+ *  `opts.exclude` — an ECS entity id whose OWN rigid body (all its colliders, incl. compound
+ *  children) must never be reported as a hit — for a ray that starts inside its caster's own
+ *  collider (e.g. a ground probe from a character's own world position with `solid: true`,
+ *  which would otherwise hit the caster itself at distance 0). Resolved through the same
+ *  entity→body map the rest of this module maintains (`st.bodies`); an id that doesn't resolve
+ *  to a live body behaves exactly as if `exclude` were omitted. Pure query. */
 export function raycast3D(
   world: World, ox: number, oy: number, oz: number, dx: number, dy: number, dz: number,
-  opts: { maxDistance?: number; solid?: boolean } = {},
+  opts: { maxDistance?: number; solid?: boolean; exclude?: number } = {},
 ): { entityId: number; x: number; y: number; z: number; nx: number; ny: number; nz: number; distance: number } | null {
   const st = worlds.get(world);
   if (!st) return null;
@@ -994,8 +1001,17 @@ export function raycast3D(
   const dir = { x: d.x / len, y: d.y / len, z: d.z / len };
   const maxToi = (opts.maxDistance ?? Infinity) / upm;
 
+  let excludeBody: RRigidBody | undefined;
+  if (opts.exclude != null) {
+    const rec = st.bodies.get(opts.exclude);
+    excludeBody = rec ? (st.world.getRigidBody(rec.bodyHandle) ?? undefined) : undefined;
+  }
+
   const ray = new R.Ray(origin, dir);
-  const hit = st.world.castRayAndGetNormal(ray, maxToi, opts.solid ?? true);
+  const hit = st.world.castRayAndGetNormal(
+    ray, maxToi, opts.solid ?? true,
+    undefined, undefined, undefined, excludeBody,
+  );
   if (!hit) return null;
 
   const info = st.colliders.get(hit.collider.handle);
@@ -1170,3 +1186,7 @@ export function wakeBody3D(world: World, entity: Entity): boolean {
 
 // (disposePhysics3D / disposeAllPhysics3D + the Stop/world-swap hooks are provided by the
 // shared `registry` created near the top of this module — see createPhysicsWorldRegistry.)
+
+// Self-register raycast3D for L2 consumers that can't import physics/ directly (e.g.
+// rendering/blobShadowSync's ground-contact shadow) — see raycast3DRegistry.ts.
+registerRaycast3D(raycast3D);

@@ -29,6 +29,22 @@ export interface GameDebugPlugin {
    *  debug menu so the user can type it into Modoki's device Connect field. */
   getDeviceIp(): Promise<{ ip: string }>;
 
+  /** WHICH DEVICE holds this lease (#146) — reported over the lease so the host can tie a
+   *  WebDriverAgent launch to the leased phone instead of guessing from what is plugged into the
+   *  Mac.
+   *
+   *  - `model` — iOS: `hw.machine`, the product type (`iPhone18,4`), which `xcrun devicectl`
+   *    reports byte-identically as `hardwareProperties.productType`, so the two are comparable.
+   *    Android: `Build.MODEL` (`SC-56C`), matching `adb shell getprop ro.product.model`.
+   *  - `osVersion` — iOS `systemVersion` (`26.5.2`) / Android `Build.VERSION.RELEASE`.
+   *
+   *  **Both are `''` when unknown, never a fabricated value** — the host reads empty as "could not
+   *  verify" and keeps its heuristic, which is a different (and safe) outcome from a mismatch.
+   *  A plugin older than #146 has no such method and rejects; callers must treat that as unknown
+   *  too. Deliberately NOT `@capacitor/device`: that plugin is optional and no Modoki project
+   *  installs it, so reading it made the first version of #146 inert on every real device. */
+  getDeviceHardware(): Promise<{ model: string; osVersion: string }>;
+
   /** Listen for incoming requests from MCP */
   addListener(
     eventName: 'request',

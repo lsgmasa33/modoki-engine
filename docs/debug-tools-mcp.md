@@ -39,7 +39,27 @@ Grouped:
   `device_screenshot` ·
   `device_console_logs` · `device_native_logs` (both default `limit:50`).
 - **Percept (read-by-data):** `device_get_scene_state` · `device_diagnose` · `device_journal` ·
-  `device_resolve_refs` · `device_introspect` · `device_layout_bounds` · `device_watch`.
+  `device_resolve_refs` · `device_introspect` · `device_layout_bounds` · `device_watch` ·
+  `device_profiler` (where did the frame go — the phone is the only place that question is real) ·
+  `device_handles`.
+- **Authoring (live-world WRITES, #166):** `device_mutate_scene` (set trait fields over a
+  `where` filter / `guid[]` / `name` / `id` — `dryRun` first if the selector is broad) ·
+  `device_create_entity` · `device_duplicate_entity` (**includes descendants**, `count` up to 1000 —
+  the "spawn N more and watch the frame" experiment) · `device_delete_entities` ·
+  `device_load_scene` (swap level, no rebuild) · `device_set_timescale` (0 = pause) ·
+  `device_step` (advance a PAUSED world N frames, then re-freeze) · `device_invalidate_assets` ·
+  `device_read_asset_def` (what the RUNNING build resolved — not what the file on your disk says;
+  peeks the live cache, never fetches).
+  ⚠️ **Put a frame boundary between a write and a renderer read.** `diagnose`'s renderer stats
+  (`calls`/`triangles`) describe the LAST RENDERED frame, so reading them in the same `device_eval`
+  body as the mutation reports the PRE-mutation numbers — measured: restoring 114 renderables and
+  reading in the same body returned the old `calls:4`, which reads exactly like a failed write.
+  `device_step` is that boundary; a separate call also works.
+
+  **All of it is live-world only** — a device has no project on disk, there is no undo stack, and a
+  relaunch is the undo. Every reply says so rather than leaving persistence unstated. `device_step`
+  advances REAL frames (~16-33ms each), not a fixed dt: a measurement aid, not a deterministic
+  repro. Why these exist and what is still missing: [plans/device-authoring-parity-plan.md](plans/device-authoring-parity-plan.md).
 - **Enact (input):** `device_tap` · `device_drag` · `device_pointer` (sustained/HELD
   press, split into down/move/up — the stateful twin of `device_drag`) · `device_dispatch_action` ·
   `device_press_key` · `device_hover` · `device_scroll` · `device_type_text`.
@@ -122,6 +142,16 @@ one-call check for this that used to take a logcat hunt. **If a device answer lo
 `device_status` first; failing that, check `adb shell ps -A | grep modoki` and force-stop the
 others.**
 
+`device_status` also names **which HANDSET** the lease is holding, on its own line —
+`Device: iPhone18,4 / 26.5.2 — the hardware this lease is holding` — from
+`capacitor-game-debug`'s `getDeviceHardware` (#146). Kept separate from the app line deliberately
+([mcp-tool-conventions.md](mcp-tool-conventions.md) §2): a wrong-**app** session and a
+wrong-**device** session are different failures with different fixes. On iOS it is the same string
+that decides which phone a WebDriverAgent launch targets (it matches `xcrun devicectl`'s
+`productType`), so a wrong-phone launch becomes a one-call read instead of an inference — see
+[trusted-device-input.md](trusted-device-input.md). Absent for a build older than #146: omitted
+rather than guessed, since "could not look" is never reported as an answer (§5).
+
 Two limits on that check, both measured on the Samsung 2026-08-02 — know them before you trust it:
 
 - **The squatter is usually the app that CANNOT answer.** Whichever app won the port is by
@@ -134,7 +164,7 @@ Two limits on that check, both measured on the Samsung 2026-08-02 — know them 
 - **The EADDRINUSE fallback buys honesty, not reachability — so #95 removed the collision at its
   source instead.** The app rebinds to an OS-assigned port and logs the true one, but the lease
   dials a fixed `DEVICE_PORT = 9095` (`engine/plugins/backend/deviceConnection.ts`) and
-  `adb forward` maps `tcp:9095 → tcp:9095`; nothing discovers the fallback port, so a fallen-back
+  `adb forward` maps `tcp:<hostPort> → tcp:9095`; nothing discovers the fallback port, so a fallen-back
   app is not reachable over the lease at all. Rather than teach the host to chase a moving port,
   **the bridge now RELEASES the port when the app backgrounds and re-binds when it returns**, making
   *at most one Modoki app listens, and it is the one on screen* an invariant. Consequences worth
@@ -211,6 +241,122 @@ now covers device ops too, and manual IP deletes discovery entirely — nothing 
 reliable path; IP field disabled) vs. the typed IP over WiFi. iOS is always WiFi/IP. Same lease/GUID
 protocol rides either transport — only the socket target differs.
 
+#### `busy` / `refused` over adb does NOT mean another Modoki has it (#164)
+
+**Over a tunnel there is no `ECONNREFUSED`.** `adb forward` accepts the connection on this clone's
+local port and only *then* discovers the device end is dead — so `transport.open()` succeeds and it
+is the lease **handshake** that gets no reply. `DeviceLeaseClient.connect` reads that, correctly for
+WiFi, as "reachable but owned" and reports `busy` / `refused`. On USB the same signal has a second,
+commoner cause: **nothing is listening on 9095 at all.** The two are indistinguishable from the
+host — a first-wins plugin refuses an extra client by dropping the socket without a reply, which is
+byte-for-byte what a dead device end looks like through a forward — so `explainConnectFailure` names
+both rather than guessing, and the connect no longer keeps its hardware claim when it fails.
+
+Which one it is, settled in one command (**hex** — `/proc/net/tcp` is hex, and hand-converting 9095
+to `0x238F` instead of `0x2387` is a mistake that has already voided one investigation):
+
+```bash
+adb -s <serial> shell "cat /proc/net/tcp" | grep -i 2387    # no row → nothing is bound
+```
+
+No row means the app is running with its debug server off, and the overwhelmingly likely reason is
+that only ONE of the two `build.debugBuild` gates is on: the JS define is baked at build time, while
+the native plugin reads the manifest meta-data / plist that `healNativeConfig` writes — see
+[Debug vs Release — ONE flag decides](#native-debug-bridge-capacitor-game-debug) below. **A project
+whose native folder was scaffolded without a heal has the first and not the second**, and every
+symptom points at the first: the bundle contains the bridge, the gated branch runs, and nothing
+listens. Reopen the project in the editor (heal-on-open) and rebuild.
+
+The bridge now says so itself, at **error** level and carrying both `GameDebug` and
+`TCP server listening` so one grep finds it — it previously reported this at log level, worded to
+match neither, which is why the failure read as "the branch never ran".
+
+### Several phones attached: which one, and who has it (#149)
+
+Two questions, one mechanism each. `device_list` answers both in one call — attached Androids
+(`adb devices -l`), paired iPhones (`devicectl` + the legacy `xctrace` listing), and who holds each.
+
+**Which one — the serial is resolved ONCE, at connect, and carried on the lease.** Every adb call on
+this surface used to be un-targeted, which is fine with one phone and fails outright with two: adb
+answers `more than one device/emulator` and refuses, taking out `device_connect {useAdb:true}`,
+trusted Android input (CDP discovery is an adb call) and `device_screenshot` together. Now
+`device_connect {useAdb:true, serial:"…"}` — or the AI panel's device picker — resolves one serial and
+puts it on `status.target.serial`; the CDP tunnel and the adb screenshot **reuse that**, and must
+never resolve one of their own. That ordering is the load-bearing part: two calls in one session that
+each picked a device could drive two different phones and both report success (the #142 failure, one
+device down). Precedence, and the refusal that names every candidate, is documented on
+`resolveAndroidSerial` in `engine/plugins/backend/androidDevices.ts`; `MODOKI_ANDROID_SERIAL` (and
+adb's own `ANDROID_SERIAL`) pin it, and the panel remembers your last pick per clone.
+
+**Devices are named by what the PHONE calls itself, not by its model code.** `adb devices -l` reports
+only `model:` — `SC_56C`, `SM_S901U1`, `MRD_LX3` — which is precisely the string that fails to tell
+three handsets on a desk apart. So the listing asks each phone once (one `adb shell`, memoized per
+serial for the process): `settings get global device_name` → `secure bluetooth_name` →
+`ro.config.marketing_name` → `ro.product.marketname`, taking the first answer that is not the model
+code again. Measured on this Mac's three, and each step earns its place: the Samsungs answer
+`Galaxy A23 5G` / `Masaki Android` from `device_name` with **every marketing-name prop empty** (so
+"just read the marketing prop" does not work), while the Huawei's `device_name` IS its model code and
+only `bluetooth_name` gives `HUAWEI Y6 2019`. A renamed phone reports the owner's own name for it,
+which is better than the marketing one. It is a LABEL, never an identity — the serial addresses
+everything.
+
+**Who has it — a machine-wide claim, because the lease cannot reach this.** The lease arbitrates the
+SOCKET and does it well, but adb is one machine-wide daemon, an `xcodebuild` install needs no socket,
+and a WDA launch targets a phone by UDID — so two clones could (and did) drive one phone unimpeded.
+`~/.modoki/device-claims.json` sits beside `editor-launches.log`, machine-wide **for the same reason
+that log is**: the sibling that caused the collision is exactly what a per-clone file cannot see. A
+claim is taken by the lease (`connect`) and by the WDA launch, released on `disconnect`/`stopWda`, and
+expired by **pid liveness plus a 12h TTL** — a dead session must never hold hardware hostage. A
+refusal names the clone, branch, pid and time. Rationale in `engine/plugins/backend/deviceClaims.ts`;
+this replaces the unenforced "serialize on-device builds" convention in the root `CLAUDE.md`.
+
+**⚠️ Listing devices must never be SYNCHRONOUS — the backend runs inside the Electron main process
+(#168).** `/api/device/list` resolved its iOS half with `execFileSync('xcrun', ['xctrace', 'list',
+'devices'])`, measured at **1.379s**. The AI panel's device picker polls that route every 2.5s and the
+iOS listing is cached for 10s, so every ~10s the main process blocked for ~1.4s. A blocked main
+process stops forwarding input to the renderer: macOS keeps drawing the cursor (the window server
+owns that) and the renderer keeps compositing at 60fps, so the symptom is not "the editor froze" but
+**a drag that stops tracking your hand for a second or two while everything else looks alive**. That
+is how it was reported, and it sent the first three investigations into the game's own drag code.
+
+Measured with a CDP `Browser.getVersion` ping — answered by the browser (main) process, touching no
+project JavaScript — with the AI panel open: **6 spikes of 1326–1425ms in 75s, p50 0ms**; with the
+route stubbed, **0 spikes, max 2ms in 45s**; after the fix, **0 spikes, max 13ms in 75s**. Spike
+spacing was exactly 10.0s or 12.5s, the signature of a 10s TTL polled at 2.5s. `sample(1)` on the
+main process put the time inside `node::SyncProcessRunner::Spawn` under an HTTP request handler.
+
+The rule that generalises: **a sync spawn is free on a user-initiated route and ruinous on a polled
+one.** `ensureWdaRunning` keeps sync twins of the same seams deliberately — it is a human-initiated
+60s WDA launch, and its check-and-set from the `isWdaProcessRunning()` guard to `spawnFn(...)` must
+stay await-free or two concurrent input ops both spawn an agent (#109; making it async reopened that,
+caught by the concurrency test). So the split is async-where-polled, sync-where-atomic, both through
+one shared argv. Siblings that match the pattern and are NOT yet async, each measured cheap on this
+Mac rather than assumed: `/api/device/list`'s Android half (`adb devices -l`, **13ms** warm) and the
+AI panel's `modoki:connect-claude-status` IPC (`git ls-files` per poll; a login-shell `command -v
+claude` behind a 15s TTL, only when `claude` is off the inherited PATH — a Finder-launched DMG). Both
+would bite on a cold adb server or a slow repo.
+
+**The claim arbitrates the PHONE; the derived host port arbitrates the TUNNEL (#158).** These are two
+different questions, and the claim structurally cannot answer the second: two clones leasing two
+*different* phones both pass it — correctly, different `deviceId`s — and then fight over one host
+port, because that port used to be a hardcoded machine-wide 9095. Measured 2026-08-07: the second
+`adb forward` won, and the first clone's lease was pointed at the wrong handset with **no error on
+either side** — one editor reporting `connected` to a phone it did not have, the other reporting
+`refused` from a phone that never saw its request. So the host end is now derived per clone, the same
+idiom as backend/Vite/CDP: `9095 + (backend − 5179)` → 9095 / 9096 / 9097 / 9098
+(`resolveDeviceHostPort`, `MODOKI_DEVICE_HOST_PORT` overrides). The **device** side stays 9095 —
+`adb -s <serial> forward tcp:<hostPort> tcp:9095` — so nothing on the phone changes.
+
+Two consequences worth carrying. **`status.target.port` is the HOST port**, not the app's — over WiFi
+they are the same number, over adb they are not. And **`adb forward --remove` matches on the host port
+spec and ignores `-s`**: a serial-targeted removal *will* delete another phone's rule (observed —
+`adb -s RFCTB0EV83K forward --remove tcp:9095` stripped `RFCTA14CMRF`'s live tunnel). Both
+`adbRunner.removeForward` and the CDP tunnel's now verify ownership against `adb forward --list`
+first and skip with a log on a mismatch — the same cross-clone reach the `pkill -f` scoping rule
+exists to prevent, in a different mechanism. One gap remains, documented on `resolveDeviceHostPort`:
+under `MODOKI_MULTI=1` there is no `MODOKI_BACKEND_PORT` to derive from, so every editor in that
+clone lands on 9095 and only the ownership check stands between them.
+
 ## Editor debugging — DEFAULT to Electron (modoki MCP)
 
 **The editor is shipped as the Electron desktop app, so debug it there by default.** Use the
@@ -278,8 +424,23 @@ same actions + state a person has in the editor. They relay to the renderer over
 - **Eval live renderer state:** `modoki_eval` — run JS in the editor RENDERER and get the value back
   (the editor twin of `device_eval`). For reading/poking live state a file read can't see — a global
   (`window.__3d`), `devicePixelRatio`, a React fiber value, WGSL validation, dispatching a bridge
-  event. Runs as a function body (`return x`); return a PROJECTION for anything large/circular. This
+  event. Runs as an **async** function body (`return x`; `await` is allowed — see below); return a
+  PROJECTION for anything large/circular. This
   is what removed most of the "stand up a raw CDP client" cases below. *(Electron editor only.)*
+  - **`await` works on BOTH eval surfaces** (`modoki_eval` and `device_eval`) — the body is compiled
+    with the async function constructor, so composing several promise-returning `modoki.*` ops in one
+    call is the normal thing to write. It was a SYNTAX error until #145, reported as *"Unexpected
+    identifier 'modoki'"*, which named neither `await` nor async and sent readers to a one-eval-per-read
+    workaround. A returned promise is still awaited too, bounded by `EVAL_ASYNC_TIMEOUT_MS` (5s).
+  - **An un-awaited promise NESTED in the result serializes as `[unresolved Promise — did you forget
+    \`await\`?]`.** A pending thenable has no own enumerable properties, so `return { a: modoki.foo() }`
+    used to come back `{"a":{}}` — an empty-looking *result* rather than a mistake, which is how it
+    silently ate real debugging calls. The top-level `return modoki.foo()` is unaffected: that one is
+    awaited.
+  - **`timeoutMs` bounds the whole body, and the two surfaces cap DIFFERENTLY** — `modoki_eval`
+    default 5000 / max 25000, `device_eval` default 4000 / **max 20000**. Out-of-range is clamped,
+    not refused. Asking for more than the default also lifts the device's transport deadline with it
+    (#153); the remaining asymmetry is the device's extra network hop. See the nested-deadline rule below.
 - **Play/test the game:** `modoki_play_control {play|stop|pause|resume|step}` — press Play, exercise
   with `modoki_tap`/`modoki_drag`, read `get_scene_state`, then stop (reverts the authored snapshot).
 - **Edit like a human (undoable):** `modoki_create_entity` (empty/primitive/2d/ui/camera/light/
@@ -506,7 +667,7 @@ Two things the table is worth reading FOR, not just referring to:
 
 <!-- BEGIN GENERATED TOOL CATALOG -->
 
-*80 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
+*83 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
 run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fails `npm test`.*
 
 #### Read — answer a question about state (never changes anything)
@@ -593,6 +754,8 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_focus_entity` | POST `/api/editor-action` `focus-entity` | no persistence | editor + scene | entity | *(no args)* |
 | `modoki_gizmo` | POST `/api/editor-action` `set-gizmo` | session | editor | — | *(no args)* |
 | `modoki_history` | POST `/api/editor-action` *(op = your `action`)* | live | editor | — | `{"action":"undo"}` |
+| `modoki_hit_regions` | GET `/api/hit-regions` *(both varies)* | session | editor + renderer | — | `{"action":"read"}` |
+| `modoki_input_watch` | GET `/api/input-watch/read` *(both varies)* | session | editor + renderer | — | `{"action":"read"}` |
 | `modoki_load_scene` | POST `/api/editor-action` `load-scene` | live | editor + project | asset | `{"path":"/assets/scenes/main.scene.json"}` |
 | `modoki_menu` | POST `/api/menu` | session | editor + electron | — | *(no args)* |
 | `modoki_new_scene` | POST `/api/editor-action` `new-scene` | live | editor + project | — | *(no args)* |
@@ -602,6 +765,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_persistence` | POST `/api/persistence` | no persistence | editor | — | *(no args)* |
 | `modoki_play_clip` | POST `/api/editor-action` `dispatch-action` | no persistence | editor + renderer | entity | `{"guid":"00000000-0000-0000-0000-000000000000","clip":"Idle"}` |
 | `modoki_play_control` | POST `/api/editor-action` *(op = your `action`)* | session | editor | — | `{"action":"stop"}` |
+| `modoki_profiler` | GET `/api/profiler` *(both varies)* | session | editor + renderer | — | *(no args)* |
 | `modoki_project_settings` | GET `/api/project-settings` *(method varies)* | file | project | — | `{"action":"get"}` |
 | `modoki_scene_view_mode` | POST `/api/editor-action` `set-scene-view-mode` | session | editor | — | `{"mode":"3d"}` |
 | `modoki_set_playhead` | POST `/api/editor-action` `set-playhead` | session | editor | — | `{"t":0}` |
@@ -623,6 +787,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | Tool | Endpoint | Effect | Needs | Aim | Smallest call |
 |---|---|---|---|---|---|
 | `modoki_batch` | — | live | editor | — | `{"steps":[{"tool":"wait","args":{"ms":1}}]}` |
+
 <!-- END GENERATED TOOL CATALOG -->
 
 ### `device_*` vs `modoki_*` — the naming asymmetries, stated once
@@ -641,9 +806,56 @@ existing agent call for a cosmetic win. Read across:
 Where the two DO share a param name, they now mean the same thing — `device_scroll` took `dx`/`dy`
 against the editor's `deltaX`/`deltaY` until the Phase-8 device sweep; `deltaX`/`deltaY` are canonical
 on both now, with `dx`/`dy` kept as aliases. **Editor-only by nature** (no game equivalent exists):
-`handles` / `tap_handle` / `drag_handle` / `dnd` / `focus` (editor chrome + Canvas2D authoring),
-`render_scene`, `play_control` / `set_timescale` / `history`, `identity`. **Known device gaps**, logged
-as features rather than audit fixes: no `device_type_text`, no `device_pointer` (sustained press).
+`tap_handle` / `drag_handle` / `dnd` / `focus` (editor chrome + Canvas2D authoring),
+`play_control` / `history`, `identity`.
+
+**The device is no longer read-only (#166).** It used to be: of ~20 registered ops every one was a
+read except `dispatch-action` (which the game must implement) and `set-timescale`, so any "what if X
+were hidden/smaller/absent?" question cost an engine edit + web build + `cap sync` + native build +
+install + cold launch — ~3 minutes per question. The write ops now live in `agentBridge.ts`
+(**runtime**), not `agentEditorOps.ts`, which is what puts them on the device AND in both eval APIs
+at once: `modoki.setTraits(…)`, `modoki.duplicateEntity(…)`, `modoki.simStep(…)` are callable from
+inside a `device_eval` body, so a read → filter-in-JS → write → measure loop runs in ONE lease round
+trip. That composition — not the typed tool — is the thing that replaces the rebuild cycle.
+
+**Remaining device gaps**, logged as features rather than audit fixes: no device `render_scene` (it
+returns a JPEG data URL and needs the decode-to-path handling `device_screenshot` has, or it blows
+the response budget), and no fixed-dt stepping (see `device_step` above).
+
+#### Nested deadlines — why `device_eval` caps at 20000ms and `modoki_eval` at 25000ms
+
+**A timeout is only real if it is the SHORTEST one in its chain.** Both eval surfaces violated that,
+so `EVAL_ASYNC_TIMEOUT_MS = 5000` — the one number anybody could see — was unreachable on each, and a
+slow eval reported a dead transport instead of what the code was doing:
+
+| Layer | Editor (`modoki_eval`) | Device (`device_eval`) |
+|---|---|---|
+| the eval's own budget | `timeoutMs` — default 5000, **max 25000** | `timeoutMs` — default 4000, **max 20000** |
+| transport | HMR relay `requestBrowser` — was a fixed **3000**, now `op + 10s` | `TcpLeaseTransport` — was a fixed **5000** per CONNECTION, now `op + 5s` per REQUEST |
+| outermost | MCP client abort — was a fixed **30000**, now `op + 15s` | (the device MCP sets no client deadline) |
+
+The editor's relay took an explicit deadline all along (`/api/wait-for-edit` already passed one), so
+its layers are sized from the op's budget and each is strictly larger than the one inside it.
+
+**The device could not do that until #153.** `TcpLeaseTransport.request()` took no per-request
+timeout, so its 5000ms was fixed for the whole connection *and its clock starts host-side, before the
+request reaches the device* — which is why an equal 5000 always lost, and why the device cap sat at
+4500 with a comment telling you not to raise it. The transport now takes an optional deadline per
+request, `/api/device/request` sizes it from the op's own `timeoutMs` + 5s, and the cap is a policy
+choice again. Two properties keep the override safe: it can only EXTEND the connection default (a
+caller cannot shorten one into a spurious failure), and it is bounded by a 60s ceiling (a hung device
+still fails, instead of holding the link open past the point reconnect would have noticed).
+
+Note the constraint that remains: the **default** (4000) still sits under the 5000ms connection
+default, so an eval that names no budget gets its own timeout message rather than a transport one.
+Only a caller that asks for more lifts the transport deadline with it. And the device ceiling stays
+strictly below the editor's on purpose — the device pays a real network hop the editor does not.
+
+Three files restate this rule with hand-kept constants, deliberately and with comments saying so:
+`bridgeHelpers.ts` (renderer, ships in the game), `editorBackendRouter.ts` (cannot import the
+renderer bundle), and the MCP's `context.ts`. A shared module would be better, but the only place all
+three could import from is `engine/tools/shared/`, which the shipped renderer has no business
+depending on — so the restatement is guarded by tests rather than removed.
 
 ## Response budget (read this before adding a tool)
 
@@ -734,6 +946,42 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   (auto-expire). `read` returns per-series stats `first/last/min/max/delta/settled` + each series'
   entity `name`; narrow a broad watch with `name=`/`guids=`/`limit=` (`seriesTotal`/`seriesTruncated`
   report the full match count). Editor-side observer — zero shipped-game cost. (`app/debug/watch.ts`.)
+- **Input watch (what the finger did):** `modoki_input_watch`/`device_input_watch {start|read|stop|clear}`
+  — a bounded record of what the POINTER actually did and what it resolved to, for the failure mode
+  with the least evidence: a press that resolves to nothing emits no journal event, no commit, no
+  coordinates. `start` opens the window (records nothing before that call — no history, like `@contact`
+  capture); `read` returns the most-recent presses (down/up points, distance travelled, hold time,
+  move-sample count) plus what each one `resolved` to. `resolved.by` is the one field that tells "the
+  press hit nothing" (`'none'` — an authority looked and found nothing there) apart from "nothing could
+  answer" (`'unknown'` — nobody who could look was asked) — pass `unresolvedOnly:true` to isolate
+  exactly those. `stop` closes the window but KEEPS what was recorded; `clear` drops recorded presses
+  without closing it. Capture-phase on `window`, so it sees a press regardless of what any downstream
+  layer did with it (blocked, `stopPropagation`'d, a second finger the engine ignores). A game closes
+  the "nobody could look" gap by calling `noteInputResolution()` from its own hit-test.
+  (`runtime/input/pointerRecorder.ts`.)
+- **Hit regions (what it MISSED):** `modoki_hit_regions {read|show|hide}` — the companion half of the
+  input watch. **A hit region is authored nowhere**: it is computed inside a game's `hitTest` from
+  config, so no inspector, scene view or screenshot can show it. The watch says a press hit nothing;
+  this says *what* it missed and *by how much*. `read` returns the shapes as data in **viewport CSS
+  px** — the same space presses are recorded in, so they compare with no transform. **Pass
+  `at:{x,y}`** (a press coordinate straight from the watch) and it answers directly: `hitsAt` for the
+  regions containing it, and when empty, `nearest {id, kind, label, distancePx}` — the number the
+  Court investigation that produced #134/#139 had to derive by hand. `distancePx` is to the nearest
+  **edge** (0 inside) and is exact for all three shape kinds, poly included: a point-to-*vertex*
+  approximation does not merely round badly, it picks the WRONG REGION for anything elongated (a
+  1000x10 lane with a press 5 px off its edge scores ~500, handing "nearest" to whatever else is
+  within 500 px). A region may carry
+  **`drawnShape`** where the game DRAWS something different from what it hit-tests (a forgiving grab
+  radius, a badge smaller than its ring); that difference is usually the bug. `show` draws an
+  overlay — solid = hit shape, dashed = drawn shape — and plots the last few recorded presses,
+  **green inside a region, red outside**, which is what makes the two failure classes visually
+  distinct (outside every shape = targeting; inside the right shape and still nothing = latching or
+  frame-rate). It also makes visible the thing no amount of reading `hitTest` reveals: **the GAPS
+  between regions.** ⚠️ Read `providers`: an empty region list with none registered means *nobody
+  could answer*, not *there is nothing there*. A game publishes its geometry with
+  `registerHitRegionProvider()`, from the code that OWNS it — never a second copy, which would agree
+  today and drift on the first retune. (`runtime/rendering/hitRegions.ts`; Court is the worked
+  example, `games/court/runtime/systems.ts`.)
 - **Editor session (perceive the human):** `modoki_editor_journal {type,source,since,sinceCap,merged,limit,clear}`
   — the human-authoring stream (`!` sigil: `!select`/`!edit`/`!transform`/`!create`/`!duplicate`/`!delete`/
   `!reparent`/`!play`/`!pause`/`!stop`/`!gizmo`/`!scene-load`/`!save`/`!undo`/`!redo`), GUID-addressed with
@@ -751,6 +999,35 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   `runtime/rendering/screenBounds.ts`, `app/debug/layoutDump.ts`.)
 - **Diagnose:** `modoki_diagnose` → structured causes (bad refs, NaN/zero-scale transforms, no camera,
   off-screen, console errors) — run FIRST when something renders wrong. (`app/debug/diagnose.ts`.)
+  **`consoleErrors` is windowed, and the window is a VERDICT window, not a reporting one (#152).**
+  Only errors inside `errorWindowMs` (5 min) gate `ok` — otherwise one benign load-time error sits
+  in the 500-entry ring and pins `ok:false` forever. But everything older is COUNTED and timestamped
+  in `olderErrors {count, oldestTs, newestTs}`, and the summary names it, because for a while the
+  window silently DROPPED them: at 30s, boot errors could never be seen (nobody connects a device,
+  attaches an agent and asks a question that fast), and `consoleErrors: []` + `ok:true` + "No issues
+  detected." was reachable while the ring held a real ~4s frame-loop stall on a Huawei Y6 that the
+  owner was watching happen. `0` never means "this app has logged no errors" — it means "none in the
+  last `errorWindowMs`". Read the rest with `modoki_get_console_logs level=error`.
+
+  **On DEVICE it read the wrong buffer entirely, and the window was never what hid boot errors
+  (#157).** There are two console rings — `bridge.ts`'s `consoleRing` (populated on device by
+  `patchConsole()`) and `agentBridge.ts`'s `consoleBuffer` (populated in the editor by
+  `installConsoleCapture()`) — and `diagnose` read the second. That call sits *after*
+  `initAgentBridge()`'s `if (!hot && !bridge) return;`, and a shipped build has no
+  `import.meta.hot` while a phone has no Electron bridge, so on every real device the buffer stayed
+  empty for the life of the process. Measured on a Samsung SM-S901U1: the ring held 5 errors
+  including a `[frameDriver]` stall, and `device_diagnose` answered `ok:true, consoleErrors:0,
+  "No issues detected."` A clean device diagnose was **structurally guaranteed, not observed** — on
+  the one surface CLAUDE.md tells you to run it first, because the Android screenshot is black on
+  WebGPU. The writer now publishes its ring through `app/debug/consoleSource.ts` and the reader asks
+  for it, preferring its own buffer whenever `consoleHooked` (so the editor path is unchanged).
+  Deliberately a seam and NOT a second `installConsoleCapture()`: hoisting that call would patch
+  `console.*` twice on device and carry a second copy of every line, on exactly the low-end hardware
+  whose frame budget is #154. Two things fixed alongside it, both required before a device boot error
+  is actually *readable*: the device now captures `[uncaught]` errors and `[unhandledrejection]`s
+  (those listeners lived only in the skipped block, so a failed dynamic import or a throw in scene
+  loading was silent), and `safeStringify` no longer renders an `Error` as `{}` — `console.error(err)`
+  is the usual way to report a failure, and it was reaching `diagnose` as an empty object.
 - **Console:** `modoki_get_console_logs` returns the **last 50** plus three numbers that do NOT mean the
   same thing: `count` (what came back), `total` (what matched `level=`/`since=`), and
   `ringTotal`+`byLevel` (the WHOLE 500-entry ring, regardless of the filter). That last part is the
@@ -1044,20 +1321,60 @@ Standalone Capacitor plugin at `engine/packages/capacitor-game-debug/`. Runs a T
 - **Android:** ServerSocket (TCP, first-wins single client) + native lease handshake + `captureScreen` + `getNativeLogs` (logcat)
 - **No Bonjour/mDNS on either platform** — advertising was removed from the plugin; the backend connects by IP/adb.
 
-**Debug vs Release (two layers):**
-- **Native plugin** — iOS: `#if DEBUG` gates plugin registration in MyViewController; Android:
-  `FLAG_DEBUGGABLE` runtime check rejects in release. So a store/release-signed build has no native
-  TCP server.
-- **JS bridge** (`app/main.tsx` → `./debug/bridge`, which carries `handleEval` = arbitrary JS) —
-  gated by the single `build.debugBuild` project flag (Project Settings → Developer — the same flag
-  that also gates the event journal and the in-game debug menu; the `debug|profile|release` mode enum
-  once floated to replace this boolean is deliberately deferred, see "Percept" above), baked as
-  `__MODOKI_DEBUG_BUILD__`. Default **false** → the whole `./debug/bridge` import
-  tree-shakes out of a shipped game build (native AND web), so there is no eval-capable JS server at
-  all; the editor + dev keep it always-on. This is the layer that also covers the web
-  (`VITE_DEBUG_BRIDGE`) path and closes the pre-existing gap where the JS bridge was ungated on
-  native even though the native plugin was `#if DEBUG`-gated. Turn it ON per-game to debug on-device
-  (the 6 internal native testbeds already set it).
+**Debug vs Release — ONE flag decides, on every layer (#112).** `build.debugBuild` (Project
+Settings → Developer) is the single source of truth. **The Xcode/Gradle configuration is
+orthogonal: it means optimization and symbols, NOT debug surfaces.** That distinction is worth
+holding onto — "Debug" is an overloaded word and this is exactly where a reader conflates the two.
+
+- **JS bridge** (`app/main.tsx` → `./debug/bridge`, which carries `handleEval` = arbitrary JS),
+  the event journal, and the in-game debug menu — baked as `__MODOKI_DEBUG_BUILD__`
+  (`vite.config.ts`). Default **false** → the whole `./debug/bridge` import tree-shakes out of a
+  shipped game build (native AND web), so there is no eval-capable JS server at all; the editor +
+  dev keep it always-on. (The `debug|profile|release` mode enum once floated to replace this
+  boolean is deliberately deferred — see "Percept" above.)
+- **iOS native plugin registration** — the `modoki:game-debug-*` fenced block in the generated
+  `MyViewController.swift`, written by `healNativeConfig` from the flag.
+- **iOS Local Network / Bonjour Info.plist keys** — added *and removed* by `healNativeConfig` from
+  the flag, in the SOURCE plist.
+- **Android native plugin** — the `com.modokiengine.gamedebug.DEBUG_BUILD` AndroidManifest
+  `<meta-data>`, healed from the flag and read by `GameDebugPlugin.startServer`. Absent reads as
+  false (fail closed).
+
+Each of those used to key on something *else* — `#if DEBUG`, `CONFIGURATION == Release`,
+`FLAG_DEBUGGABLE` — and they could disagree. The combination that broke was one you would normally
+want: `debugBuild: true` + a Release configuration (debugging an optimized build, or a TestFlight
+QA build) shipped the JS bridge with no plugin registered and the plist keys stripped — a debug
+build that could not debug, with nothing explaining why. Turn the flag ON per-game to debug
+on-device (the internal native testbeds already set it), then **reopen the project** so the heal
+runs.
+
+⚠️ **The flag is a SOFT gate, and deliberately so.** `#if DEBUG` was hard — a Release build
+physically could not carry a live native server. Nothing now prevents archiving and submitting a
+build with the flag on. **This repo's TestFlight builds run with `debugBuild: true`**, and a
+TestFlight archive is bit-identical to a store archive — same `xcodebuild archive`, same
+`method: app-store-connect` export; release-to-store is a button in App Store Connect *afterwards*.
+So there is no build-time signal to refuse on that would not also block the workflow in daily use,
+and an env-var escape hatch set on every TestFlight build is no gate at all. Do not "restore" a
+refusal without first solving that distinction; it has no build-time solution.
+The mitigation is therefore a loud
+archive-time warning rather than a refusal — an Xcode build phase gated on `ACTION == install`
+(so it does NOT fire on an ordinary Release-configuration build) and a Gradle `taskGraph.whenReady`
+warning on `:app:*Release`, both healed in/out with the flag.
+
+What IS verified is the other direction — that flag-off genuinely strips every surface above.
+`engine/tests/architecture/debugBuildGates.test.ts` (in `npm run verify`) holds it for the native
+surfaces, including that every committed project agrees with its own flag; `npm run smoke:debug-flag`
+holds it for the JS bundle by building a project twice and grepping `dist/` (measured on
+`games/sling`: `app-identity` 1 → 0, `GameDebug` 9 → 0). Both carry a flag-ON control, so a green
+run cannot mean "the grep found nothing".
+
+The one honest limit on "stripped": `GameDebugPlugin.swift` is compiled into the iOS App target
+**unconditionally** — its pbxproj file-ref is not flag-gated — so the class is in the binary either
+way. What the flag removes is the *registration*, and since JS is the only caller, an unregistered
+plugin has no way in: Capacitor never exposes it, so `startServer` can never be called and no
+socket is ever bound. That is why the guard asserts registration rather than symbol absence
+(asserting absence would fail for a correct build). Gating the file-ref too is possible but is a
+larger, riskier pbxproj edit than #112 needed.
 
 **Known issues:**
 - iOS SPM static linking strips the plugin class — requires manual registration in MyViewController + Xcode file reference from App target to `engine/packages/capacitor-game-debug/ios/Sources/GameDebugPlugin/GameDebugPlugin.swift` (project-relative path in pbxproj, no copy). Edit the package source only.

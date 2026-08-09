@@ -1,11 +1,11 @@
 /** Prefab system — save, load, and instantiate prefab entity trees. */
 
-import { getCurrentWorld, registerEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
-import { validatePrefabData } from '../../runtime/loaders/sceneValidation';
+import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
+import { validatePrefabData, REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { backendFetch } from '../backend/editorBackend';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, readTraitDataFull, writeTraitField, findEntity, subtreeIds, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
-import { Transient } from '../../runtime/traits/Transient';
+import { Transient } from '../../runtime/core/traits/Transient';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
@@ -103,7 +103,29 @@ function collectTree(entityId: number, allEntities: EntityInfo[]): EntityInfo[] 
  *  child `prefab` GUID + captured overrides/structure — and their members are
  *  excluded from the flat output. The selection root itself is never collapsed
  *  this way (so "save instance as prefab" still flattens the instance). */
-export function serializePrefab(selectedEntityId: number, existingId?: string): PrefabFile | null {
+export function serializePrefab(
+  selectedEntityId: number,
+  existingId?: string,
+  opts?: {
+    /** ecsId → the localId that entity ALREADY had in the prefab being re-saved.
+     *
+     *  Only prefab-edit can supply this, and only prefab-edit needs it: localIds are the
+     *  address space a SCENE's `overrides` / `removed` / `removedTraits` are keyed in, so
+     *  renumbering them on a re-save silently repoints or drops every override on every
+     *  instance. Positional numbering does renumber — a prefab whose members were authored
+     *  with a gap (a deleted sibling) compacts on the next save (measured on sling's
+     *  FieldCorner: `drip` 4 → 2). Members with no entry here (the user added them during
+     *  the edit) are allocated ABOVE every preserved id, never into a freed gap. */
+    preserveLocalIds?: Map<number, number>;
+    /** Keep this as the prefab's `name` instead of taking the ROOT ENTITY's name.
+     *
+     *  The two are independent: the asset is named by its file, the root entity by the
+     *  author. Defaulting to the root's name silently renames the asset on any re-save —
+     *  measured on sling, where "Cover Enemy" and "Green Enemy" both became "Enemy"
+     *  because that is what their root entity is called. */
+    name?: string;
+  },
+): PrefabFile | null {
   const allEntities = getAllEntities();
   const tree = collectTree(selectedEntityId, allEntities);
   if (tree.length === 0) return null;
@@ -144,10 +166,24 @@ export function serializePrefab(selectedEntityId: number, existingId?: string): 
     }
   }
 
-  // Assign stable localIds (1-based, root = 1) over the surviving tree.
+  // Assign localIds over the surviving tree. Without a preserve map this is the original
+  // positional numbering (1-based, root = 1) — the create-a-prefab-from-an-entity path, where
+  // there is no prior numbering to honour. With one (a prefab-edit RE-save) every member keeps
+  // the id it already had, so a scene's localId-keyed overrides keep pointing at the same
+  // member; only genuinely new members are allocated, above the highest preserved id.
   const flatTree = tree.filter((e) => !skip.has(e.id));
   const ecsToLocal = new Map<number, number>();
-  flatTree.forEach((e, i) => ecsToLocal.set(e.id, i + 1));
+  const preserve = opts?.preserveLocalIds;
+  if (preserve) {
+    let next = 0;
+    for (const e of flatTree) next = Math.max(next, preserve.get(e.id) ?? 0);
+    for (const e of flatTree) {
+      const kept = preserve.get(e.id);
+      ecsToLocal.set(e.id, kept ?? ++next);
+    }
+  } else {
+    flatTree.forEach((e, i) => ecsToLocal.set(e.id, i + 1));
+  }
 
   const allTraits = getAllTraits();
   const prefabEntities: PrefabEntity[] = [];
@@ -206,6 +242,27 @@ export function serializePrefab(selectedEntityId: number, existingId?: string): 
         for (const key of Object.keys(traitData)) {
           if (isTemplateExcludedField(meta, key)) delete (traitData as Record<string, unknown>)[key];
         }
+        // ⚠️ Drop BLANK asset refs. `readTraitDataFull` writes every schema field, so a
+        // `Renderable2D` with no material serialized `material: ""` — a blank ref, which
+        // `tests/assets/authoredAssetRefs.test.ts` correctly fails (#53: an unset ref is invisible
+        // to every other test — neither dangling nor a literal path — and surfaces only in a
+        // production build).
+        //
+        // This USED to be a manual cleanup after `modoki_prefab create`. That is untenable now that
+        // prefabs are hand-tuned in the editor: every Cmd+S in prefab-edit re-adds them, so a human
+        // repositioning a badge turns `npm run verify` red and has to know to go and strip eight
+        // keys out of the JSON. Measured: one save of Court's tray-badge prefab reintroduced 8.
+        //
+        // Dropping the key is a semantic NO-OP — the loader rebuilds each trait with
+        // `meta.trait(partialData)` and koota fills every absent field from the same schema, so ''
+        // and absent load identically. Deliberately narrow: only `''`, and only on fields the ref
+        // registry already names, rather than omitting every default-valued field the way SCENES do.
+        // Full omission would also drop an authored number that happens to equal its default, and
+        // at least one consumer reads prefab fields BY NAME and treats a missing one as "no layout"
+        // (Court's layoutFromPrefabDoc → a silent fallback to code constants).
+        for (const field of REF_FIELDS_BY_TRAIT[meta.name] ?? []) {
+          if ((traitData as Record<string, unknown>)[field] === '') delete (traitData as Record<string, unknown>)[field];
+        }
         // Remap parentId from ECS IDs to localIds (parentId is in EntityAttributes).
         // Clear `guid` — prefab files are templates; per-instance identity lives on
         // the live entity, not in the prefab definition. Otherwise every instance
@@ -245,8 +302,11 @@ export function serializePrefab(selectedEntityId: number, existingId?: string): 
     // v2 only when the prefab actually nests another — keeps flat prefabs at v1
     // (no churn). Both versions share the same shape (nested fields are optional).
     version: nestedRefs.size > 0 ? 2 : 1,
-    name: tree[0].name,
-    rootLocalId: 1,
+    name: opts?.name ?? tree[0].name,
+    // The root's ASSIGNED id, not a hardcoded 1 — with a preserve map it keeps whatever the
+    // file already used, and every `parentId: <root>` in the entity rows is remapped through
+    // the same table, so the two can't disagree.
+    rootLocalId: ecsToLocal.get(selectedEntityId) ?? 1,
     entities: prefabEntities,
   };
 }
@@ -489,8 +549,7 @@ export function instantiatePrefab(
       }));
     }
 
-    const entity = getCurrentWorld().spawn(...traitArgs);
-    registerEntity(entity);
+    const entity = spawnEntity(getCurrentWorld(), ...traitArgs);
     clearOverrideMarks(entity.id()); // fresh member — drop stale marks on a reused id
     localToEcs.set(pe.localId, entity.id());
     ownMemberIds.push(entity.id());
@@ -713,6 +772,18 @@ export function getOverrideValues(
     if (prefabData === true) continue;
 
     const original = prefabData as Record<string, unknown>;
+    // ⚠️ A field ABSENT from the base is not "unknown" — it is the trait's schema DEFAULT, because
+    // that is exactly what the loader rebuilds it as (`meta.trait(partialData)`, koota fills the
+    // rest). Skipping it instead (the old `origValue !== undefined` gate alone) makes a real
+    // instance override invisible to every RAW caller of this function: the Inspector's
+    // "overridden" highlight, and the Apply-to-Prefab / Revert-Overrides dialogs, which build their
+    // checkbox tree from these diffs — so the field cannot be applied or reverted at all. The SAVE
+    // path escapes it only because `captureInstanceOverrides` folds marked fields back in.
+    //
+    // This became reachable when `serializePrefab` started dropping BLANK asset refs (a prefab with
+    // no material no longer writes `material: ""`), but it was always latent: any prefab authored
+    // without a field hits it.
+    const baseSchema = (getTraitByName(traitName)?.trait as { schema?: Record<string, unknown> } | undefined)?.schema;
     for (const [field, value] of Object.entries(currentData)) {
       if (field === 'parentId') continue; // parentId is remapped, skip
       // guid is per-instance identity — minted when the instance is created/saved,
@@ -721,7 +792,7 @@ export function getOverrideValues(
       // back would write one instance's guid into the prefab base and make every
       // future instance collide on the same guid.
       if (traitName === 'EntityAttributes' && field === 'guid') continue;
-      const origValue = original[field];
+      const origValue = field in original ? original[field] : baseSchema?.[field];
       if (origValue !== undefined && !valuesEqual(value, origValue)) {
         if (!result[traitName]) result[traitName] = {};
         result[traitName][field] = value;
@@ -1221,8 +1292,7 @@ export function applyStructureByRootInstance(
       deleteEntities: (ecsIds) => deleteEntities(ecsIds),
       findEntity: (ecsId) => findEntity(ecsId) ?? undefined,
       spawnAdded: (traitArgs) => {
-        const entity = getCurrentWorld().spawn(...(traitArgs as Parameters<ReturnType<typeof getCurrentWorld>['spawn']>));
-        registerEntity(entity);
+        const entity = spawnEntity(getCurrentWorld(), ...(traitArgs as Parameters<ReturnType<typeof getCurrentWorld>['spawn']>));
         return entity.id();
       },
       // Editor nested-instance expansion: instantiate → tag source → replay

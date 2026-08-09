@@ -23,17 +23,28 @@ import { expandCharset } from '../packages/modoki/src/runtime/core/fontSettings'
 
 /** Bump when msdf-atlas-gen flags / the converter pipeline change so stale cache
  *  entries are invalidated automatically. */
-export const FONT_ENCODER_VERSION = 'font-4'; // font-4: errorcorrection distance-full (kill corner clash nicks)
+export const FONT_ENCODER_VERSION = 'font-5'; // font-5: variable-font axis instancing (hb-subset)
 
 export function getFontCacheDir(projectRoot: string): string {
   return path.join(projectRoot, '.cache', 'modoki-fonts');
 }
 
+/** Axis map → a stable string. Key order must not affect the hash, so tags are sorted;
+ *  `{}` and absent hash identically (both mean "the font's default instance"). */
+function stableAxes(axes: FontImportSettings['variationAxes']): string {
+  const entries = Object.entries(axes ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return entries.map(([tag, v]) => `${tag}=${v}`).join(',');
+}
+
 /** The settings that actually affect the baked atlas bytes (mode excluded — see
  *  the module note). Charset is expanded so a preset and an equivalent custom set
- *  hash the same. */
+ *  hash the same.
+ *
+ *  This is an ALLOWLIST, not a spread of the settings object: a new field that changes
+ *  the output must be added here or an edit to it will silently serve the stale cached
+ *  atlas. `variationAxes` changes the glyph OUTLINES, so it is very much one of those. */
 function stableSettings(s: FontImportSettings): string {
-  return [s.fieldType, s.size, s.pxRange, s.atlasMax, expandCharset(s)].join('|');
+  return [s.fieldType, s.size, s.pxRange, s.atlasMax, expandCharset(s), stableAxes(s.variationAxes)].join('|');
 }
 
 /** Stable 16-hex content key for (source bytes, settings, encoder version). */
@@ -58,10 +69,26 @@ export function metricsCachePath(cacheDir: string, sourceUrlPath: string, hash: 
   return path.join(cacheBase(cacheDir, sourceUrlPath, hash), 'metrics.json');
 }
 
-/** True when both derived files already exist for this hash. */
-export function fontCacheHit(cacheDir: string, sourceUrlPath: string, hash: string): boolean {
+/** The instanced (axis-pinned) source font, produced only when `variationAxes` is set.
+ *  Served/copied at the `~instance.ttf` variant URL for the DYNAMIC runtime generator,
+ *  which rasterizes source bytes and so cannot apply axes itself. */
+export function instanceCachePath(cacheDir: string, sourceUrlPath: string, hash: string): string {
+  return path.join(cacheBase(cacheDir, sourceUrlPath, hash), 'instance.ttf');
+}
+
+/** True when every derived file for this hash already exists. The instanced font counts
+ *  only when axes are authored — otherwise nothing produces it and requiring it would
+ *  make every plain font a permanent cache miss. */
+export function fontCacheHit(
+  cacheDir: string,
+  sourceUrlPath: string,
+  hash: string,
+  settings?: FontImportSettings,
+): boolean {
+  const needsInstance = Object.keys(settings?.variationAxes ?? {}).length > 0;
   return (
     fs.existsSync(atlasCachePath(cacheDir, sourceUrlPath, hash)) &&
-    fs.existsSync(metricsCachePath(cacheDir, sourceUrlPath, hash))
+    fs.existsSync(metricsCachePath(cacheDir, sourceUrlPath, hash)) &&
+    (!needsInstance || fs.existsSync(instanceCachePath(cacheDir, sourceUrlPath, hash)))
   );
 }

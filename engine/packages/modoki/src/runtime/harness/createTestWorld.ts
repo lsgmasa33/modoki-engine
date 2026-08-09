@@ -20,7 +20,7 @@
 
 import { createWorld, type World } from 'koota';
 import { Time } from '../core/traits/Time';
-import { getCurrentWorld, setCurrentWorld } from '../core/ecs/world';
+import { getCurrentWorld, setCurrentWorld, spawnEntity } from '../core/ecs/world';
 import { registerSystem, unregisterSystem, SYSTEM_PRIORITY } from '../core/pipeline';
 import { timeSystem } from '../core/timeSystem';
 import { setManualNow, restoreRealClock } from '../core/clock';
@@ -93,6 +93,12 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
   setCurrentWorld(world);
   setPlayState('playing');           // sim tiers run; dispatchUIAction is live
   seedRng(opts.seed ?? 1, world);    // reproducible; world-scoped (F1)
+
+  // BEFORE clearJournal on purpose: spawnEntity journals an `@spawn`, and clearing after it keeps
+  // that out of the stream, so a test asserting on events() sees only what its own run produced.
+  // (Why spawning and registering are one call at all: see spawnEntity in core/ecs/world.ts.)
+  spawnEntity(world, Time);
+
   clearJournal(world);
   // Headless playtests want FULL observability, so open every Tier-2 (watch-gated)
   // diagnostic capture (@contact, …) — in a real runtime these default off to keep the
@@ -100,8 +106,6 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
   for (const t of verboseCaptureState().types) setVerboseCapture(t, true);
   setManualNow(0);
   resetTimeBaseline();
-
-  world.spawn(Time);
 
   // Register timeSystem first, then the game's systems. Track names for teardown.
   const systemNames: string[] = [];
@@ -120,7 +124,10 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
 
   const handle: TestWorld = {
     world,
-    spawn: (...traits) => world.spawn(...(traits as Parameters<World['spawn']>)),
+    // Goes through spawnEntity so a playtest entity is indexed exactly as it would be in the
+    // running game — otherwise engine code under test takes a path production never takes. The
+    // `@spawn` this journals is wanted here: a real runtime spawn emits one too.
+    spawn: (...traits) => spawnEntity(world, ...(traits as Parameters<World['spawn']>)),
     step(ticks = 1, dt = defaultDt) {
       // Play-state + manual clock + baseline were set once above; just advance.
       // Shared loop with stepSimulation so the two can't drift.

@@ -38,6 +38,7 @@ export const REF_FIELDS_BY_TRAIT: Record<string, string[]> = {
   // `.anim.json` GUIDs live inside the JSON-string `clips` bank (parsed explicitly in
   // collectResourceRefsFromEntities + the tree-shaker's probeTraitRefs, like AudioSource.clips).
   AudioSource: ['clip'],
+  VideoPlayer: ['clip'],
   // Director.timeline is a scalar `.timeline.json` GUID ref. The clip/audio GUIDs the timeline
   // references live INSIDE that JSON asset (walked by SceneManager's transitive loop + the
   // tree-shaker's timeline follower), not in trait fields — same shape as an Animator bank.

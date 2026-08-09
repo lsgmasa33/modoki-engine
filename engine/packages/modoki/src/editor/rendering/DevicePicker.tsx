@@ -46,19 +46,27 @@ export default function DevicePicker({ preset, orientation, onSelect, onToggleOr
     .filter(([, list]) => list.length > 0);
 
   return (
-    <div ref={rootRef} style={{ position: 'relative', fontFamily: 'monospace', fontSize: '13px' }}>
+    <div ref={rootRef} style={{ position: 'relative', fontFamily: 'monospace', fontSize: '13px',
+      // Shrinkable in a narrow Game panel, but never below a readable stub — at 0 the
+      // whole device name ellipsizes away and only the 📱 is left.
+      minWidth: 120, flexShrink: 1 }}>
       <button
         onClick={() => setOpen((o) => !o)}
         title="Select device"
         style={{
-          display: 'flex', alignItems: 'center', gap: 6, height: 22, padding: '0 8px',
+          display: 'flex', alignItems: 'center', gap: 6, height: 22, padding: '0 8px', maxWidth: '100%',
           background: open ? '#2a2a40' : '#333', color: '#ddd', border: '1px solid #555',
           borderRadius: 4, cursor: 'pointer', fontFamily: 'monospace', fontSize: '12px',
+          // A narrow Game panel must ellipsize the label, never wrap it: the button is a
+          // fixed 22px tall, so a wrapped 3-line name spills outside its own border.
+          minWidth: 0, overflow: 'hidden', whiteSpace: 'nowrap',
         }}
       >
-        <span>{isFree ? '🖥️' : '📱'}</span>
-        <span>{presetLabel(preset, orientation)}</span>
-        <span style={{ color: '#888' }}>▾</span>
+        <span style={{ flexShrink: 0 }}>{isFree ? '🖥️' : '📱'}</span>
+        <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+          {presetLabel(preset, orientation)}
+        </span>
+        <span style={{ color: '#888', flexShrink: 0 }}>▾</span>
       </button>
 
       {open && (

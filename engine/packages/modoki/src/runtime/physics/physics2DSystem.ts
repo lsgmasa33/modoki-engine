@@ -1003,10 +1003,12 @@ export function physics2DSystem(world: World): void {
 
 /** A 2D raycast against the physics world, in ECS/screen coordinates.
  *  Returns the first hit (nearest along the ray) or null. `dx`/`dy` need not be
- *  normalized. `maxDistance` is in world units. Pure query — no stepping/side effects. */
+ *  normalized. `maxDistance` is in world units. `opts.exclude` — an ECS entity id whose own
+ *  rigid body must never be reported as a hit (mirrors `raycast3D`'s `exclude`; see its doc).
+ *  Pure query — no stepping/side effects. */
 export function raycast2D(
   world: World, ox: number, oy: number, dx: number, dy: number,
-  opts: { maxDistance?: number; solid?: boolean } = {},
+  opts: { maxDistance?: number; solid?: boolean; exclude?: number } = {},
 ): { entityId: number; x: number; y: number; nx: number; ny: number; distance: number } | null {
   const st = worlds.get(world);
   if (!st) return null;
@@ -1022,8 +1024,17 @@ export function raycast2D(
   const dir = { x: d.x / len, y: d.y / len };
   const maxToi = (opts.maxDistance ?? Infinity) / cfg.ppm;
 
+  let excludeBody: RRigidBody2D | undefined;
+  if (opts.exclude != null) {
+    const rec = st.bodies.get(opts.exclude);
+    excludeBody = rec ? (st.world.getRigidBody(rec.bodyHandle) ?? undefined) : undefined;
+  }
+
   const ray = new R.Ray(origin, dir);
-  const hit = st.world.castRayAndGetNormal(ray, maxToi, opts.solid ?? true);
+  const hit = st.world.castRayAndGetNormal(
+    ray, maxToi, opts.solid ?? true,
+    undefined, undefined, undefined, excludeBody,
+  );
   if (!hit) return null;
 
   const info = st.colliders.get(hit.collider.handle);

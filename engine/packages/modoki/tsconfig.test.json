@@ -15,7 +15,12 @@
     "types": ["vite/client", "vitest/globals", "node"],
     // The inherited `rootDir: "./src"` (a real constraint for the emit config) makes every
     // file under tests/ a TS6059 "not under rootDir". Nothing is emitted here, so widen it.
-    "rootDir": "."
+    "rootDir": ".",
+    // MUST be re-stated: `incremental` + `tsBuildInfoFile` are inherited from
+    // tsconfig.check.json, and this is a DIFFERENT program (tests/ vs src/). Sharing one
+    // buildinfo file would make the two configs invalidate each other on every run — worse
+    // than no caching. Distinct path, same gitignored node_modules/.tmp dir.
+    "tsBuildInfoFile": "../../../node_modules/.tmp/modoki-test.tsbuildinfo"
   },
   // `exclude` MUST be re-stated: it is INHERITED through tsconfig.check.json from
   // tsconfig.json, where it lists "tests" — an inherited exclude beats a local include, so

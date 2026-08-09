@@ -43,7 +43,7 @@
  */
 
 import { execFileSync } from 'child_process';
-import { adbBinary } from './deviceConnection';
+import { adbArgs, adbBinary, forwardOwner } from './androidDevices';
 
 import {
   decodeAimReply, resolveAimViaDevice, STALE_APP_REASON,
@@ -144,16 +144,61 @@ export interface DeviceCdpTarget {
 /** adb calls behind an overridable seam (mirrors `adbRunner` in deviceConnection.ts) so discovery
  *  is unit-testable without a real device. */
 export const deviceCdpAdb = {
-  listUnixSockets(): string {
-    return execFileSync(adbBinary(), ['shell', 'cat', '/proc/net/unix'], { timeout: 4000, encoding: 'utf8' });
+  listUnixSockets(serial?: string): string {
+    return execFileSync(adbBinary(), adbArgs(serial, ['shell', 'cat', '/proc/net/unix']), { timeout: 4000, encoding: 'utf8' });
   },
-  forward(localPort: number, socketName: string): void {
-    execFileSync(adbBinary(), ['forward', `tcp:${localPort}`, `localabstract:${socketName}`], { timeout: 4000, stdio: 'pipe' });
+  forward(localPort: number, socketName: string, serial?: string): void {
+    execFileSync(adbBinary(), adbArgs(serial, ['forward', `tcp:${localPort}`, `localabstract:${socketName}`]), { timeout: 4000, stdio: 'pipe' });
   },
-  removeForward(localPort: number): void {
-    execFileSync(adbBinary(), ['forward', '--remove', `tcp:${localPort}`], { timeout: 4000, stdio: 'pipe' });
+  listForwards(): string {
+    return execFileSync(adbBinary(), ['forward', '--list'], { timeout: 4000, encoding: 'utf8' });
+  },
+  /** Remove this clone's CDP tunnel — but ONLY if the rule on `localPort` belongs to `serial`.
+   *  `adb forward --remove` matches on the host port spec and ignores `-s`, so a serial-targeted
+   *  removal can delete a SIBLING clone's live rule (#158). `localPort` is already per-clone
+   *  (`resolveDeviceCdpPort`), which makes that unreachable here; this mirrors
+   *  `adbRunner.removeForward` in deviceConnection.ts, including its FAIL-CLOSED handling of a
+   *  list that cannot be read.
+   *
+   *  Called via `releaseCdpForward` — from `resetDeviceCdpSession` (which every teardown path,
+   *  including a lease `disconnect()`, now goes through) and from `discoverDeviceCdpTarget` for a
+   *  candidate that failed its probe (#160). */
+  removeForward(localPort: number, serial?: string): void {
+    if (serial) {
+      let owner: string | undefined;
+      try { owner = forwardOwner(deviceCdpAdb.listForwards(), localPort); }
+      catch (e) {
+        console.warn(`[device-cdp] skipping \`adb forward --remove tcp:${localPort}\`: could not verify the rule's owner (${e instanceof Error ? e.message : String(e)}) — refusing to delete a rule that may belong to another clone (#158)`);
+        return;
+      }
+      if (owner && owner !== serial) {
+        console.warn(`[device-cdp] skipping \`adb forward --remove tcp:${localPort}\`: that rule belongs to ${owner}, not ${serial} (#158)`);
+        return;
+      }
+    }
+    execFileSync(adbBinary(), adbArgs(serial, ['forward', '--remove', `tcp:${localPort}`]), { timeout: 4000, stdio: 'pipe' });
   },
 };
+
+/** The forward this module currently owns, latched when one is left standing so teardown can name
+ *  the port AND serial it was created with — `removeForward`'s ownership check needs the serial,
+ *  and by teardown time the caller's `opts` are long gone (#160). Null when no tunnel is open. */
+let ownedForward: { port: number; serial?: string } | null = null;
+
+/** Drop the forward this module owns, if any. Best-effort and never throws: a tunnel that is
+ *  already gone (phone unplugged, adb dead) must not fail the teardown that was cleaning it up —
+ *  the failure mode this closes is a rule LEFT standing, and throwing here would strand the
+ *  callers that follow. Clears the latch either way, since a rule we cannot remove is not one we
+ *  can keep claiming to own. */
+function releaseCdpForward(): void {
+  const owned = ownedForward;
+  ownedForward = null;
+  if (!owned) return;
+  try { deviceCdpAdb.removeForward(owned.port, owned.serial); }
+  catch (e) {
+    console.warn(`[device-cdp] could not remove the CDP forward on tcp:${owned.port}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
 
 /** Discover the ONE Modoki webview's CDP target on the connected Android device: enumerate
  *  `webview_devtools_remote_<pid>` sockets, forward each candidate to `localPort` in turn, and
@@ -164,9 +209,9 @@ export const deviceCdpAdb = {
  *  on any failure (no adb, no device, no matching socket, port already in another use): the
  *  caller (`getDeviceCdpSession`) treats `null` as "no trusted route available", which is exactly
  *  the fallback-to-synthetic signal, not an error to surface. */
-export async function discoverDeviceCdpTarget(opts: { localPort: number; preferPackage?: string }): Promise<DeviceCdpTarget | null> {
+export async function discoverDeviceCdpTarget(opts: { localPort: number; preferPackage?: string; serial?: string }): Promise<DeviceCdpTarget | null> {
   try {
-    const sockets = parseWebviewSockets(deviceCdpAdb.listUnixSockets());
+    const sockets = parseWebviewSockets(deviceCdpAdb.listUnixSockets(opts.serial));
     if (sockets.length === 0) return null;
 
     // With a preference, try every candidate (in discovery order) until one's package matches;
@@ -175,17 +220,34 @@ export async function discoverDeviceCdpTarget(opts: { localPort: number; preferP
     if (!opts.preferPackage && sockets.length > 1) return null;
 
     for (const sock of sockets) {
+      // A candidate that does NOT pan out must take its forward with it (#160). Each `forward`
+      // overwrites the rule on `localPort`, so a rejected candidate is invisible while another
+      // follows it — but the LAST one to fail used to survive the whole discovery, leaving a rule
+      // pointing at a socket this function just declined. `keep` is what distinguishes the
+      // returned tunnel (deliberately left standing — it IS the session's route) from every other
+      // exit; `finally` runs on `continue` and on the `return` alike, which is the point.
+      let forwarded = false;
+      let keep = false;
       try {
-        deviceCdpAdb.forward(opts.localPort, sock.name);
+        deviceCdpAdb.forward(opts.localPort, sock.name, opts.serial);
+        forwarded = true;
         const version = await httpGetJson<JsonVersion>(`http://127.0.0.1:${opts.localPort}/json/version`);
         const pkg = version['Android-Package'];
         if (opts.preferPackage && pkg !== opts.preferPackage) continue;
         const list = await httpGetJson<JsonListEntry[]>(`http://127.0.0.1:${opts.localPort}/json/list`);
         const page = list.find((e) => e.type === 'page' && e.webSocketDebuggerUrl);
         if (!page?.webSocketDebuggerUrl) continue;
+        keep = true;
+        ownedForward = { port: opts.localPort, ...(opts.serial ? { serial: opts.serial } : {}) };
         return { webSocketDebuggerUrl: page.webSocketDebuggerUrl, androidPackage: pkg };
       } catch {
         continue; // this candidate didn't pan out — try the next, or fall through to null
+      } finally {
+        if (forwarded && !keep) {
+          // Not `releaseCdpForward()`: this rule is not the latched one, and clearing a latch that
+          // belongs to a still-live session would strand ITS tunnel.
+          try { deviceCdpAdb.removeForward(opts.localPort, opts.serial); } catch { /* already gone / adb absent */ }
+        }
       }
     }
     return null;
@@ -341,6 +403,15 @@ export async function cdpScroll(sender: CdpSender, x: number, y: number, dx = 0,
 // ── Session lifecycle: lazy connect, reuse, clean teardown ─────────────────
 
 let cachedSession: DeviceCdpSession | null = null;
+/** The `Android-Package` the cached session was discovered FOR — the cache key that makes
+ *  `preferPackage` meaningful across calls (#142). Null when discovery reported no package. */
+let cachedPackage: string | null = null;
+/** The adb SERIAL the cached session was discovered through (#149) — a second cache key, for the
+ *  same reason `cachedPackage` is one. The `Android-Package` cannot stand in for it: two phones
+ *  running the SAME app (the ordinary case when testing a build on two handsets) report an identical
+ *  package, so a session discovered against phone A would satisfy a `preferPackage` check made by a
+ *  lease holding phone B and drive the wrong device while reporting trusted input. */
+let cachedSerial: string | null = null;
 let inFlight: Promise<DeviceCdpSession | null> | null = null;
 
 /** Get a live CDP session — reusing the cached one when it's still open, else discovering +
@@ -348,17 +419,51 @@ let inFlight: Promise<DeviceCdpSession | null> | null = null;
  *  reason: no adb, no device, no matching webview socket, ambiguous sockets with no preference, a
  *  connect failure. `null` is the fallback-to-synthetic signal, not an error. Concurrent callers
  *  share one in-flight discovery/connect rather than racing separate `adb forward`s. */
-export async function getDeviceCdpSession(opts: { preferPackage?: string } = {}): Promise<DeviceCdpSession | null> {
-  if (cachedSession && !cachedSession.isClosed()) return cachedSession;
+/** Test-only stand-in for discovery+connect. Set by `_setDeviceCdpSessionProbeForTests`, consulted
+ *  HERE rather than injected per call site because the router deliberately does not thread a
+ *  `getSession` through — and the thing #142's tests must observe is precisely whether the router
+ *  reaches this function at all, and with which `preferPackage`. Never set in production. */
+let sessionProbeForTests: ((opts: CdpSessionOpts) => Promise<DeviceCdpSession | null>) | null = null;
+
+/** Test-only. Pass null to restore real discovery. */
+export function _setDeviceCdpSessionProbeForTests(
+  fn: ((opts: CdpSessionOpts) => Promise<DeviceCdpSession | null>) | null,
+): void { sessionProbeForTests = fn; }
+
+/** What identifies the session a caller needs: WHICH app (`preferPackage`, #142) and WHICH phone
+ *  (`serial`, #149). Both are cache keys — see `cachedSerial` for why the package alone is not
+ *  enough once two handsets run the same build. */
+export interface CdpSessionOpts { preferPackage?: string; serial?: string }
+
+export async function getDeviceCdpSession(opts: CdpSessionOpts = {}): Promise<DeviceCdpSession | null> {
+  if (sessionProbeForTests) return sessionProbeForTests(opts);
+  // A cache hit must still satisfy the CALLER's package requirement (#142). The cache used to be
+  // consulted before `preferPackage` was looked at, so a session discovered by an earlier
+  // unconstrained call was handed to a later constrained one — silently defeating the identity
+  // check that exists to stop input reaching the wrong app/device. Mismatch ⇒ drop and rediscover.
+  // The serial (#149) is keyed the same way and for the same reason, one device down.
+  const satisfies = (!opts.preferPackage || cachedPackage === opts.preferPackage)
+    && (!opts.serial || cachedSerial === opts.serial);
+  if (cachedSession && !cachedSession.isClosed() && satisfies) return cachedSession;
+  if (cachedSession && !satisfies) resetDeviceCdpSession();
   if (!inFlight) {
     inFlight = (async () => {
       try {
         const localPort = resolveDeviceCdpPort();
-        const target = await discoverDeviceCdpTarget({ localPort, preferPackage: opts.preferPackage });
+        const target = await discoverDeviceCdpTarget({ localPort, preferPackage: opts.preferPackage, serial: opts.serial });
         if (!target) return null;
-        const session = await DeviceCdpSession.connect(target.webSocketDebuggerUrl);
-        session.onClose(() => { if (cachedSession === session) cachedSession = null; });
+        let session: DeviceCdpSession;
+        try { session = await DeviceCdpSession.connect(target.webSocketDebuggerUrl); }
+        catch (e) {
+          // Discovery left a forward standing for a session that never opened — nothing else will
+          // ever reference it, so release it here rather than leaking it until the next reset.
+          releaseCdpForward();
+          throw e;
+        }
+        session.onClose(() => { if (cachedSession === session) { cachedSession = null; cachedPackage = null; cachedSerial = null; } });
         cachedSession = session;
+        cachedPackage = target.androidPackage ?? null;
+        cachedSerial = opts.serial ?? null;
         return session;
       } catch {
         return null;
@@ -371,11 +476,20 @@ export async function getDeviceCdpSession(opts: { preferPackage?: string } = {})
 }
 
 /** Drop the cached session (closing it first) — used after a dispatch throws, so a session that
- *  went bad mid-call doesn't wedge every subsequent one behind the same broken socket. */
+ *  went bad mid-call doesn't wedge every subsequent one behind the same broken socket.
+ *
+ *  It also removes the `adb forward` the session was reached through (#160). This is the ONE place
+ *  that already means "this session is over", so it is where the tunnel's lifetime ends: for a long
+ *  time nothing removed a CDP forward at all, and stale rules outlived the editor pointing at dead
+ *  webview pids — the same *mask a device swap* hazard the lease's own forward-removal exists to
+ *  prevent. Closing the socket without removing the forward is half a teardown. */
 export function resetDeviceCdpSession(): void {
   cachedSession?.close();
   cachedSession = null;
+  cachedPackage = null;
+  cachedSerial = null;
   inFlight = null;
+  releaseCdpForward();
 }
 
 /** Test-only reset — module state otherwise leaks between test files (vitest keeps the module
@@ -448,8 +562,12 @@ export function synthFallbackBanner(reason: string): string {
 export interface CdpRouteDeps {
   proxy(method: string, params: Record<string, unknown>): Promise<unknown>;
   preferPackage?: string;
+  /** The adb serial the LEASE resolved (#149) — so discovery targets the phone the lease is holding
+   *  rather than whichever one adb lists first. Undefined reproduces the old behaviour and is only
+   *  correct with exactly one device attached. */
+  serial?: string;
   /** Overridable for tests. Defaults to the real `getDeviceCdpSession`. */
-  getSession?: (opts: { preferPackage?: string }) => Promise<DeviceCdpSession | null>;
+  getSession?: (opts: CdpSessionOpts) => Promise<DeviceCdpSession | null>;
 }
 
 /** Route ONE device-input method through CDP. Returns the same string shape the in-page synthetic
@@ -469,7 +587,7 @@ export async function tryDeviceCdpInput(method: string, params: Record<string, u
     return { handled: false, reason: DEVICE_INPUT_METHODS.has(method) ? NOT_ROUTED_REASON : null };
   }
   const getSession = deps.getSession ?? getDeviceCdpSession;
-  const session = await getSession({ preferPackage: deps.preferPackage });
+  const session = await getSession({ preferPackage: deps.preferPackage, serial: deps.serial });
   if (!session) return { handled: false, reason: NO_SESSION_REASON };
 
   // How many CDP events actually LANDED. The distinction matters and a boolean set before the call
@@ -564,10 +682,10 @@ export async function tryDeviceCdpInput(method: string, params: Record<string, u
  *  `proxy` is optional so a caller with no lease can still ask the cheap question; without it this
  *  reports only whether a SESSION exists, and callers that can reach the device should pass it. */
 export async function isDeviceCdpAvailable(
-  opts: { preferPackage?: string; getSession?: CdpRouteDeps['getSession']; proxy?: CdpRouteDeps['proxy'] } = {},
+  opts: { preferPackage?: string; serial?: string; getSession?: CdpRouteDeps['getSession']; proxy?: CdpRouteDeps['proxy'] } = {},
 ): Promise<boolean> {
   const getSession = opts.getSession ?? getDeviceCdpSession;
-  const session = await getSession({ preferPackage: opts.preferPackage });
+  const session = await getSession({ preferPackage: opts.preferPackage, serial: opts.serial });
   if (!session) return false;
   if (!opts.proxy) return true;
   try {

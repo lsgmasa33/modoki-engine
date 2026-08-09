@@ -206,6 +206,47 @@ describe('device_status reports the app identity the SOCKET actually holds (#88)
     expect(sent?.body).toMatchObject({ method: 'app-identity' });
   });
 
+  it('names the HARDWARE too, on its own line — which phone, not just which app (#146)', async () => {
+    // Same probe, different question. `device_status` is the one-call "what am I connected to",
+    // and on iOS this model is what decides the phone a WebDriverAgent launch targets — so an
+    // agent debugging a wrong-device session can read it instead of inferring it.
+    const s = (surface = await loadDeviceSurface((req) => {
+      if (req.path === '/api/device/status') {
+        return { body: { state: 'connected', target: { host: '10.0.0.5', port: 9095, useAdb: false }, lastTarget: null } };
+      }
+      if (req.path === '/api/device/request' && (req.body as { method?: string })?.method === 'app-identity') {
+        return deviceReply({
+          platform: 'ios', appId: 'com.modokiengine.audiodemo', appName: 'Audio Demo',
+          deviceModel: 'iPhone18,4', osVersion: '26.5.2',
+        });
+      }
+      return undefined;
+    }));
+    const text = s.text(await s.call('device_status'));
+    expect(text).toMatch(/Device: iPhone18,4 \/ 26\.5\.2/);
+    // Kept DISTINCT from the app line (conventions §2): a wrong-app session and a wrong-device
+    // session are different failures with different fixes.
+    expect(text).toMatch(/App: Audio Demo/);
+    expect(text.indexOf('Device:')).toBeGreaterThan(text.indexOf('App:'));
+  });
+
+  it('omits the hardware line for a bridge older than #146 rather than guessing', async () => {
+    // Every installed app is in this state until redeployed. "Could not look" is never reported as
+    // an answer (§5), and a fabricated model would be read by the host as a real one.
+    const s = (surface = await loadDeviceSurface((req) => {
+      if (req.path === '/api/device/status') {
+        return { body: { state: 'connected', target: { host: '10.0.0.5', port: 9095, useAdb: false }, lastTarget: null } };
+      }
+      if (req.path === '/api/device/request' && (req.body as { method?: string })?.method === 'app-identity') {
+        return deviceReply({ platform: 'ios', appId: 'com.modokiengine.audiodemo', appName: 'Audio Demo' });
+      }
+      return undefined;
+    }));
+    const text = s.text(await s.call('device_status'));
+    expect(text).toMatch(/App: Audio Demo/);
+    expect(text).not.toMatch(/Device:/);
+  });
+
   it('a PRE-#88 bridge on the socket is reported as a warning, not swallowed', async () => {
     // Measured on the Samsung during the #88 close-out: with an old build squatting 9095, the
     // probe comes back `Unknown method: app-identity` — the device bridge signals a missing

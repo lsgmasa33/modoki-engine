@@ -249,6 +249,11 @@ describe('tool contracts', () => {
     for (const [name, c] of Object.entries(CONTRACTS)) {
       const shape = getTool(name)!.shape as Record<string, { _def?: { typeName?: string } }>;
       for (const f of c.filters) {
+        // A boolean that NARROWS, declared as such in the contract. The heuristic below is a
+        // heuristic — `modoki_input_watch.unresolvedOnly` is the first param in the surface to
+        // break it — so the exception is declared and reviewable rather than hidden by dropping a
+        // real filter from the contract to keep this green. See `narrowingFlags` in contracts.ts.
+        if (c.narrowingFlags?.includes(f)) continue;
         const def = shape[f];
         if (!def) continue; // covered by the test above
         // Unwrap ZodOptional/ZodDefault to reach the inner type name.

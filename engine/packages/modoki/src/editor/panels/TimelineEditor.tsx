@@ -55,6 +55,7 @@ function newTrack(kind: TrackKind): TrackDef {
     case 'audio': return { ...base, type: 'audio', cues: [] };
     case 'activation': return { ...base, type: 'activation', spans: [] };
     case 'control': return { ...base, type: 'control', clips: [] };
+    case 'video': return { ...base, type: 'video', clips: [] };
   }
 }
 
@@ -410,6 +411,11 @@ export default function TimelineEditor() {
       void endTimelinePreviewSession({ restore: true, rebind: () => (path ? resolveDirectorRootForTimeline(path) : null) });
     }
     exitPreviewMode('timeline'); // panel gone → return the global run-mode to stopped
+    // …and the FLAG that says a preview is running (#186). The session teardown above and
+    // the run-mode reset both happened already, but `isPreviewPlaying` stayed true with no
+    // panel to drive it — the same lie AnimationEditor's `isRecording` told. The binding is
+    // kept on purpose so reopening the tab restores the timeline.
+    useEditorStore.getState().setPreviewPlaying(false);
   }, []);
 
   // A scene load / hot-reload swaps the world out from under the panel. Two things must happen:

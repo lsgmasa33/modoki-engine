@@ -20,6 +20,8 @@ vi.mock('@modoki/engine/runtime', () => ({
   setNameTransform: (...args: any[]) => mockSetNameTransform(...args),
   registerEngineActions: () => {},
   registerAudioControls: () => {},
+  registerHapticControls: () => {},
+  registerVideoControls: () => {},
   registerManager: (...args: any[]) => mockRegisterManager(...args),
   timeManager: { name: 'engine.time' },
   navigationManager: { name: 'engine.navigation' },

@@ -17,7 +17,8 @@ import { backendFetch } from '../backend/editorBackend';
 import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath, getGuidForPath } from '../../runtime/loaders/assetManifest';
 import { deriveGuid } from '../../runtime/core/assetRefRules';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
-import { type Rig2DFile, type Rig2DBone } from '../../runtime/loaders/rig2dCache';
+import { type Rig2DFile } from '../../runtime/loaders/rig2dCache';
+import { coerceRigBones } from '../../runtime/skinning/rig2dTypes';
 import { generateGridMesh } from '../../runtime/skinning/rig2dTessellate';
 import { computeAutoWeights } from '../../runtime/skinning/rig2dAutoWeights';
 import { loadSpriteAlphaMask } from './spriteAlphaMask';
@@ -31,25 +32,15 @@ import { AssetRefField, assetDisplayName } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
 import { makeRigPrefabAsset } from '../scene/skinPrefab';
 import { removeBone } from '../../runtime/skinning/rig2dEdit';
-import { activePartOf, withActivePart, partsOf, addPart, removePart, movePart, reorderPart, reorderActiveIndex, renamePart, uvToPosAffine, partAngle } from './skinParts';
+import { activePartOf, withActivePart, partsOf, partCount, addPart, removePart, reorderPart, reorderActiveIndex, renamePart, uvToPosAffine, partAngle, bboxCenter } from './skinParts';
 import { pushAction, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
 import { BufferedNumberInput, inputStyle } from './fields';
 
 const AUTOSAVE_MS = 400;
 
-/** Coerce a raw `.rig2d.json` bone list (all fields optional) into concrete bones with
- *  defaults, for the weight solver + display. */
-function concreteBones(raw: Rig2DFile['bones']): Rig2DBone[] {
-  return (raw ?? []).map((b, i) => ({
-    name: typeof b.name === 'string' && b.name ? b.name : `bone${i}`,
-    parent: Number.isInteger(b.parent) ? (b.parent as number) : -1,
-    x: b.x ?? 0, y: b.y ?? 0, rot: b.rot ?? 0,
-  }));
-}
-
 /** Derive width/height/pivot in texture space from the current mesh's vertex bounds,
  *  so Re-tessellate can regenerate a grid over the same region without a texture fetch. */
-function meshBounds(verts: number[][]): { width: number; height: number; pivotX: number; pivotY: number } {
+export function meshBounds(verts: number[][]): { width: number; height: number; pivotX: number; pivotY: number } {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const p of verts) {
     if (p[0] < minX) minX = p[0]; if (p[0] > maxX) maxX = p[0];
@@ -61,11 +52,11 @@ function meshBounds(verts: number[][]): { width: number; height: number; pivotX:
 }
 
 /** Bounding-box center of a texture-space vertex list (for placement-preserving ops). */
-function centerOf(verts: number[][]): { x: number; y: number } {
-  let mnx = Infinity, mny = Infinity, mxx = -Infinity, mxy = -Infinity;
-  for (const p of verts) { if (p[0] < mnx) mnx = p[0]; if (p[0] > mxx) mxx = p[0]; if (p[1] < mny) mny = p[1]; if (p[1] > mxy) mxy = p[1]; }
-  if (!Number.isFinite(mnx)) return { x: 0, y: 0 };
-  return { x: (mnx + mxx) / 2, y: (mny + mxy) / 2 };
+export function centerOf(verts: number[][]): { x: number; y: number } {
+  // Shared implementation (skinParts.bboxCenter); the {0,0} fallback is THIS
+  // caller's choice — placement-preserving ops need a usable origin, where the
+  // canvas gizmo needs the null. See bboxCenter's note.
+  return bboxCenter(verts) ?? { x: 0, y: 0 };
 }
 
 /** Load an image's natural pixel dimensions (for auto-rig from a whole texture). */
@@ -218,7 +209,7 @@ export default function SkinEditor() {
       if (dx || dy) mesh.verts = mesh.verts.map((v) => [v[0] + dx, v[1] + dy]);
     }
     const radius = awRadius > 0 ? awRadius : Math.max(dom.width, dom.height) * 0.6;
-    const { skinIndices, skinWeights } = computeAutoWeights(mesh.verts, concreteBones(d.bones), { radius, falloff: awFalloff });
+    const { skinIndices, skinWeights } = computeAutoWeights(mesh.verts, coerceRigBones(d.bones), { radius, falloff: awFalloff });
     commit(withActivePart(d, s.activeSkinPart, { mesh, skinIndices, skinWeights }), `tessellate ${cols}×${rows}`);
   }, [cols, rows, awRadius, awFalloff, trimAlpha, alphaThreshold, commit]);
 
@@ -228,7 +219,7 @@ export default function SkinEditor() {
     if (!d || !ap.mesh?.verts?.length) return;
     const b = meshBounds(ap.mesh.verts);
     const radius = awRadius > 0 ? awRadius : Math.max(b.width, b.height) * 0.6;
-    const { skinIndices, skinWeights } = computeAutoWeights(ap.mesh.verts, concreteBones(d.bones), { radius, falloff: awFalloff });
+    const { skinIndices, skinWeights } = computeAutoWeights(ap.mesh.verts, coerceRigBones(d.bones), { radius, falloff: awFalloff });
     commit(withActivePart(d, s.activeSkinPart, { skinIndices, skinWeights }), 'auto-weight');
   }, [awRadius, awFalloff, commit]);
 
@@ -265,7 +256,7 @@ export default function SkinEditor() {
     const mesh = generateGridMesh({ width: dom.width, height: dom.height, cols, rows, pivotX: dom.pivotX, pivotY: dom.pivotY, isInside });
     if (!mesh.verts.length) { commit(withActivePart(d, partIndex, { sprite }), 'sprite'); return; } // trim killed every cell → just set the ref
     const radius = awRadius > 0 ? awRadius : Math.max(dom.width, dom.height) * 0.6;
-    const { skinIndices, skinWeights } = computeAutoWeights(mesh.verts, concreteBones(d.bones), { radius, falloff: awFalloff });
+    const { skinIndices, skinWeights } = computeAutoWeights(mesh.verts, coerceRigBones(d.bones), { radius, falloff: awFalloff });
     commit(withActivePart(d, partIndex, { sprite, mesh, skinIndices, skinWeights }), 'sprite + mesh');
   }, [commit, cols, rows, awRadius, awFalloff, trimAlpha, alphaThreshold]);
 
@@ -433,7 +424,7 @@ export default function SkinEditor() {
     if (!d || from === to) return;
     partAction(reorderPart(d, from, to), 'reorder part');
     const active = useEditorStore.getState().activeSkinPart;
-    const na = reorderActiveIndex(active, from, to);
+    const na = reorderActiveIndex(active, from, to, partCount(d));
     if (na !== active) useEditorStore.getState().setActiveSkinPart(na);
   }, [partAction]);
   const addPartAction = useCallback(() => {
@@ -523,7 +514,7 @@ export default function SkinEditor() {
   const { markSaved } = useDebouncedSave(def, writeDef, AUTOSAVE_MS);
   savedMarkRef.current = markSaved;
 
-  const bones = concreteBones(def?.bones);
+  const bones = coerceRigBones(def?.bones);
   const parts = partsOf(def);
   // Master checkbox state (canvas-preview visibility, editor-only — NOT the runtime
   // `visible` field): checked when every part is shown, indeterminate when mixed.
@@ -701,8 +692,16 @@ export default function SkinEditor() {
                   <span onDoubleClick={(e) => { e.stopPropagation(); setEditingPart(i); }}
                     style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: i === activePart ? '#cde' : (previewHidden.includes(i) ? '#666' : '#bbb') }} title={`${p.name} — double-click to rename`}>{p.name}</span>
                 )}
-                <button onClick={(e) => { e.stopPropagation(); partAction(movePart(def!, i, -1), 'move part'); }} title="Move back" disabled={i === 0} style={{ ...eyeBtn, opacity: i === 0 ? 0.3 : 1 }}>↑</button>
-                <button onClick={(e) => { e.stopPropagation(); partAction(movePart(def!, i, 1), 'move part'); }} title="Move front" disabled={i === parts.length - 1} style={{ ...eyeBtn, opacity: i === parts.length - 1 ? 0.3 : 1 }}>↓</button>
+                {/* ↑/↓ go through `reorderParts`, the SAME entry point as drag-reorder, because it is
+                    the one that also moves the selection. They used to call `movePart` directly and
+                    update nothing: moving the SELECTED part left `activeSkinPart` pointing at its old
+                    slot, so the selection silently jumped to the part that swapped into it — and
+                    since tessellate / auto-weight / sprite-assign all write through
+                    `withActivePart(def, activeSkinPart)`, the next edit landed on the wrong part's
+                    mesh. A move by one IS `reorderPart(i, i±1)`, so there is nothing left for a
+                    separate helper to do. */}
+                <button onClick={(e) => { e.stopPropagation(); reorderParts(i, i - 1); }} title="Move back" disabled={i === 0} style={{ ...eyeBtn, opacity: i === 0 ? 0.3 : 1 }}>↑</button>
+                <button onClick={(e) => { e.stopPropagation(); reorderParts(i, i + 1); }} title="Move front" disabled={i === parts.length - 1} style={{ ...eyeBtn, opacity: i === parts.length - 1 ? 0.3 : 1 }}>↓</button>
                 <button onClick={(e) => { e.stopPropagation(); if (parts.length > 1) { partAction(removePart(def!, i), 'remove part'); const na = i < activePart ? activePart - 1 : activePart; useEditorStore.getState().setActiveSkinPart(Math.min(na, parts.length - 2)); } }} title="Remove part" disabled={parts.length <= 1} style={{ ...eyeBtn, color: '#c66', opacity: parts.length <= 1 ? 0.3 : 1 }}>✕</button>
               </div>
             ))}

@@ -50,6 +50,18 @@ export function hasPrivateTooling(): boolean {
   return fs.existsSync(path.join(REPO_ROOT, '.mcp.json'));
 }
 
+/** True when the root `scripts/` publish tooling (`publish-engine-oss.sh`, `publish-demo.sh`
+ *  and their helpers) is present in this checkout.
+ *
+ *  Separate from `hasPrivateTooling()` on purpose: that one answers "is `.mcp.json` here",
+ *  which is a PROXY for the publish scripts, not the thing a publish-script guard reads. The
+ *  two happen to coincide today (the snapshot ships neither), and gating on the proxy is
+ *  exactly the mistake `hasInternalGames()`'s comment below was written about. A guard that
+ *  parses `scripts/publish-engine-oss.sh` should say so. */
+export function hasPublishScripts(): boolean {
+  return fs.existsSync(path.join(REPO_ROOT, 'scripts', 'publish-engine-oss.sh'));
+}
+
 /** True when the `oss/` publish overlay (the workflows rewritten onto the public repo by
  *  `scripts/publish-engine-oss.sh`) is present in this checkout. */
 export function hasOssOverlay(): boolean {

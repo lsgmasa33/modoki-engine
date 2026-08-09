@@ -43,6 +43,18 @@ vi.mock('../../src/runtime/rendering/Canvas2DMount', () => ({
     }),
 }));
 
+vi.mock('../../src/runtime/video/UIVideoMount', () => ({
+  // Surfaces `fit` and `priority` so the game-outranks-the-authoring-viewport rule is
+  // assertable from the CALL SITE — UIVideoMount's own tests can only see what it is handed.
+  UIVideoMount: ({ entityId, fit, priority }: { entityId: number; fit?: string; priority?: number }) =>
+    React.createElement('div', {
+      'data-testid': 'uivideomount',
+      'data-entity-id': entityId,
+      'data-fit': fit,
+      'data-priority': String(priority),
+    }),
+}));
+
 import { UINode, cssVal, hexToRgba, hexToColor } from '../../src/runtime/ui/UINode';
 import { NineSliceImage } from '../../src/runtime/ui/NineSliceImage';
 import type { UINodeData } from '../../src/runtime/ui/uiTreeStore';
@@ -64,20 +76,20 @@ function makeNode(over: Partial<UINodeData> = {}): UINodeData {
     entityId: 1, guid: 'g1',
     width: 100, height: 40, widthUnit: 'px', heightUnit: 'px',
     flexDirection: 'row', flexWrap: 'nowrap', justifyContent: 'flex-start', alignItems: 'stretch',
-    gap: 0, flexGrow: 0, flexShrink: 1,
+    gap: 0, gapUnit: 'px', flexGrow: 0, flexShrink: 1,
     paddingTop: 0, paddingTopUnit: 'px', paddingLeft: 0, paddingLeftUnit: 'px',
     paddingRight: 0, paddingRightUnit: 'px', paddingBottom: 0, paddingBottomUnit: 'px',
     marginTop: 0, marginTopUnit: 'px', marginRight: 0, marginRightUnit: 'px',
     marginBottom: 0, marginBottomUnit: 'px', marginLeft: 0, marginLeftUnit: 'px',
     minWidth: 0, minWidthUnit: 'px', maxWidth: 0, maxWidthUnit: 'px',
     minHeight: 0, minHeightUnit: 'px', maxHeight: 0, maxHeightUnit: 'px',
-    alignSelf: 'auto', zIndex: 0, overflow: 'visible', isVisible: true,
+    alignSelf: 'auto', zIndex: 0, overflow: 'visible', isVisible: true, pointerThrough: false,
     backgroundColor: 0, backgroundOpacity: 0, borderRadius: 0, borderWidth: 0, borderColor: 0x333333, borderOpacity: 1, opacity: 1,
     text: '', fontFamily: '', fontSize: 16, fontWeight: 'normal', fontStyle: 'normal',
     textColor: 0xffffff, textOpacity: 1, textAlign: 'left', lineHeight: 0, letterSpacing: 0,
     textShadowColor: 0, textShadowOpacity: 1, textShadowOffsetX: 0, textShadowOffsetY: 0, textShadowBlur: 0,
     textStrokeColor: 0, textStrokeOpacity: 1, textStrokeWidth: 0, textOverflow: 'clip', maxLines: 0,
-    imageSrc: '', imageMode: 'cover', elementType: 'div', placeholder: '',
+    imageSrc: '', imageMode: 'cover', hasVideo: false, elementType: 'div', placeholder: '',
     rangeMin: 0, rangeMax: 100, rangeStep: 1,
     children: [],
     ...over,
@@ -180,6 +192,83 @@ describe('UINode box rendering', () => {
   it('disables pointer events on a non-interactive leaf', () => {
     const el = renderNode(makeNode({ children: [] }));
     expect(el.style.pointerEvents).toBe('none');
+  });
+});
+
+// ── pointerThrough ──
+// The field exists for ONE shape the structural rules cannot express: a decorative CONTAINER
+// drawn over something that must stay tappable. Court's narration band is the worked example —
+// a panel holding a Skip button, over a full-screen tap-catcher. Every test here is a way the
+// field was silently doing nothing, or doing too much, when it first landed.
+describe('UINode pointerThrough', () => {
+  it('wins over the container default, so a decorative panel does not eat taps', () => {
+    // A container (children.length > 0) is `auto` by default so events reach its children — which
+    // is exactly what made the band swallow every tap meant for the catcher underneath it.
+    const el = renderNode(makeNode({ pointerThrough: true, children: [makeNode({ entityId: 2 })] }));
+    expect(el.style.pointerEvents).toBe('none');
+  });
+
+  it('wins over the overflow:scroll force, which is the case that motivated it', () => {
+    // `overflow:'scroll'` pins an element to `auto` so it can be scrolled — and the band is a
+    // scroll container. Without this precedence the field is inert on precisely the element it
+    // was added for.
+    const el = renderNode(makeNode({ pointerThrough: true, overflow: 'scroll' }));
+    expect(el.style.pointerEvents).toBe('none');
+  });
+
+  it('clears the cursor, so nothing paints a finger over an element that cannot be clicked', () => {
+    const el = renderNode(makeNode({
+      pointerThrough: true,
+      action: { bindings: [{ event: 'click', kind: 'call', action: 'x' }] },
+    } as Partial<UINodeData>));
+    expect(el.style.cursor).toBe('');
+  });
+
+  it('does NOT apply in the editor, or the element can only be selected from the hierarchy', () => {
+    // `onSelectEntity` is the editor's click-to-select mode, and it deliberately makes every
+    // element clickable so the author can pick it in the viewport. That is authoring, not
+    // gameplay. Ungated, this made a decorative container unselectable in the SceneView — the
+    // exact element type the field exists for.
+    const el = renderNode(makeNode({ pointerThrough: true }), { onSelectEntity: () => {} });
+    expect(el.style.pointerEvents).toBe('auto');
+  });
+
+  it('is not silently undone by an <input>, which re-enables the pointer after it', () => {
+    // The input branch runs AFTER the pointerThrough block and used to set `auto` unconditionally,
+    // so the field read as supported on an input and did nothing — the silent-no-op class.
+    const el = renderNode(makeNode({ pointerThrough: true, elementType: 'input' } as Partial<UINodeData>));
+    expect(el.style.pointerEvents).toBe('none');
+  });
+
+  it('is not silently undone by a range slider either', () => {
+    const el = renderNode(makeNode({ pointerThrough: true, elementType: 'range' } as Partial<UINodeData>));
+    expect(el.style.pointerEvents).toBe('none');
+  });
+
+  it('leaves everything alone when false — the default is the pre-existing behaviour', () => {
+    expect(renderNode(makeNode({ overflow: 'scroll' })).style.pointerEvents).toBe('auto');
+    expect(renderNode(makeNode({ elementType: 'input' } as Partial<UINodeData>)).style.pointerEvents).toBe('auto');
+  });
+});
+
+// ── gapUnit ──
+// `gap` was the only length on UIElement with no unit. A wrap-based grid whose ITEMS scale (vh)
+// while its GAPS do not has a viewport size below which an item silently reflows onto the next
+// row — which is how Court's 5x5 attack reference started drawing 4-wide and 7 rows deep.
+describe('UINode gapUnit', () => {
+  it('emits a viewport-unit gap through the UI container custom property', () => {
+    const el = renderNode(makeNode({ gap: 1.5, gapUnit: 'vh' }));
+    expect(el.style.gap).toBe('calc(1.5 * var(--ui-vh, 1vh))');
+  });
+
+  it('still emits a bare px gap when the unit is px, which every pre-existing scene relies on', () => {
+    // Scene files authored before this field existed carry `gap` and no `gapUnit`; the trait
+    // default fills it as 'px', so their rendered gap must not move.
+    expect(renderNode(makeNode({ gap: 8, gapUnit: 'px' })).style.gap).toBe('8px');
+  });
+
+  it('emits nothing for a zero gap regardless of unit', () => {
+    expect(renderNode(makeNode({ gap: 0, gapUnit: 'vh' })).style.gap).toBe('');
   });
 });
 
@@ -494,6 +583,70 @@ describe('UINode canvas2D branch', () => {
     render(<UINode node={node} storeState={{}} />);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('entity 12'));
     expect(warn.mock.calls[0][0]).toMatch(/will NOT mount/);
+    warn.mockRestore();
+  });
+
+  // ── Video in a UI node ──────────────────────────────────────────────────────────────
+  // The other half of the `hasVideo` seam (uiTreeReuse.test.ts drives the projection half).
+  it('mounts the video into the node box when hasVideo, carrying imageMode as the fit', async () => {
+    const node = makeNode({ entityId: 21, hasVideo: true, imageMode: 'contain' });
+    const { findByTestId } = render(<UINode node={node} storeState={{}} />);
+    const mount = await findByTestId('uivideomount');
+    expect(mount.getAttribute('data-entity-id')).toBe('21');
+    expect(mount.getAttribute('data-fit')).toBe('contain');
+  });
+
+  it('mounts the video from the Canvas2D branch too (a separate early return)', async () => {
+    // `videoLayer` is injected into TWO returns. Mutation-testing the plain-div one leaves the
+    // canvas2D one green, so it needs its own case: a 2D-canvas node over a video backdrop is
+    // exactly Court's shape.
+    const node = makeNode({
+      entityId: 25, hasVideo: true,
+      canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH' },
+    });
+    const { findByTestId } = render(<UINode node={node} storeState={{}} />);
+    expect((await findByTestId('uivideomount')).getAttribute('data-entity-id')).toBe('25');
+  });
+
+  it('does not mount a video when hasVideo is false', () => {
+    const { queryByTestId } = render(<UINode node={makeNode({ hasVideo: false })} storeState={{}} />);
+    expect(queryByTestId('uivideomount')).toBeNull();
+  });
+
+  it('the running game outranks the editor authoring viewport for the one element', async () => {
+    // There is ONE <video> per clip and a DOM node exists in one place, so with the editor's
+    // Game and Scene panels both mounting the UI tree, priority is what stops the last host to
+    // tick from winning ("the video plays only on Scene view, not on the game view").
+    // `onSelectEntity` is the discriminator — set only on SceneView.
+    const node = makeNode({ entityId: 22, hasVideo: true });
+    const game = render(<UINode node={node} storeState={{}} />);
+    expect((await game.findByTestId('uivideomount')).getAttribute('data-priority')).toBe('1');
+    cleanup();
+    const editor = render(<UINode node={node} storeState={{}} onSelectEntity={vi.fn()} />);
+    expect((await editor.findByTestId('uivideomount')).getAttribute('data-priority')).toBe('0');
+  });
+
+  it('suppresses the video with the other UI visuals (uiVisualsHidden)', () => {
+    const { queryByTestId } = render(
+      <UINode node={makeNode({ hasVideo: true })} storeState={{}} uiVisualsHidden />,
+    );
+    expect(queryByTestId('uivideomount')).toBeNull();
+  });
+
+  it('dev-warns when a VideoPlayer sits on a non-div elementType (picture would not mount)', () => {
+    // Same class as F8: an <input> is a void element, so `videoLayer` has nowhere to go and
+    // the clip decodes with audio on the bus and no picture at all.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    render(<UINode node={makeNode({ entityId: 23, hasVideo: true, elementType: 'input' })} storeState={{}} />);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('entity 23'));
+    expect(warn.mock.calls[0][0]).toMatch(/cannot host a video/);
+    warn.mockRestore();
+  });
+
+  it('does NOT warn for a video on a plain div', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    render(<UINode node={makeNode({ entityId: 24, hasVideo: true })} storeState={{}} />);
+    expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();
   });
 

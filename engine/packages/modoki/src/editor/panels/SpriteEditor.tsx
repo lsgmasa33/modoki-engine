@@ -33,7 +33,7 @@ type DragMode =
   | { kind: 'move'; guid: string; offX: number; offY: number }
   | { kind: 'resize'; guid: string; handle: Handle; fixedX: number; fixedY: number };
 
-type Handle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
+export type Handle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
 const HANDLES: Handle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
 
 const DEFAULT_VIEWPORT_W = 720;
@@ -652,21 +652,21 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
 
 // ── helpers ──
 
-function baseName(name: string): string {
+export function baseName(name: string): string {
   return name.replace(/\.[^.]+$/, '').replace(/\s+/g, '_').toLowerCase() || 'sprite';
 }
 function makeSliceNamed(name: string, rect: SpriteRect): SpriteSlice {
   return makeSlice(name, rect, DEFAULT_PIVOT);
 }
-function clamp(v: number, lo: number, hi: number) { return Math.max(lo, Math.min(v, hi)); }
+export function clamp(v: number, lo: number, hi: number) { return Math.max(lo, Math.min(v, hi)); }
 function tuple(p: { x: number; y: number }): [number, number] { return [p.x, p.y]; }
-function rectFromPoints(x0: number, y0: number, x1: number, y1: number): SpriteRect {
+export function rectFromPoints(x0: number, y0: number, x1: number, y1: number): SpriteRect {
   return { x: Math.min(x0, x1), y: Math.min(y0, y1), w: Math.abs(x1 - x0), h: Math.abs(y1 - y0) };
 }
-function roundRect(r: SpriteRect): SpriteRect {
+export function roundRect(r: SpriteRect): SpriteRect {
   return { x: Math.round(r.x), y: Math.round(r.y), w: Math.max(1, Math.round(r.w)), h: Math.max(1, Math.round(r.h)) };
 }
-function handlePos(r: SpriteRect, h: Handle): { x: number; y: number } {
+export function handlePos(r: SpriteRect, h: Handle): { x: number; y: number } {
   const midX = r.x + r.w / 2, midY = r.y + r.h / 2;
   switch (h) {
     case 'nw': return { x: r.x, y: r.y };
@@ -679,11 +679,11 @@ function handlePos(r: SpriteRect, h: Handle): { x: number; y: number } {
     case 'w': return { x: r.x, y: midY };
   }
 }
-function opposite(h: Handle): Handle {
+export function opposite(h: Handle): Handle {
   const map: Record<Handle, Handle> = { nw: 'se', n: 's', ne: 'sw', e: 'w', se: 'nw', s: 'n', sw: 'ne', w: 'e' };
   return map[h];
 }
-function upsertPreview(prev: SpriteSlice[], guid: string, rect: SpriteRect): SpriteSlice[] {
+export function upsertPreview(prev: SpriteSlice[], guid: string, rect: SpriteRect): SpriteSlice[] {
   const rest = prev.filter((s) => s.guid !== guid);
   return [...rest, { guid, name: 'preview', rect: roundRect(rect), pivot: { ...DEFAULT_PIVOT } }];
 }

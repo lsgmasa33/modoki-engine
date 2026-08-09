@@ -3,11 +3,11 @@
 
 import { registerTrait, type FieldHint } from '@modoki/engine/runtime';
 import {
-  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
-  UIElement, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, Animator, SpriteAnimator,
+  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, HapticSettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
+  UIElement, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, BlobShadow, Animator, SpriteAnimator,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
-  AudioSource, AudioListener,
+  AudioSource, AudioListener, VideoPlayer,
 } from './traits';
 import { getModelPostprocessorIds } from './loaders/modelPostprocessorRegistry';
 
@@ -76,6 +76,9 @@ export function registerAllTraits() {
       mesh: { type: 'string', accept: ['.mesh.json'] },
       material: { type: 'string', accept: ['.mat.json'] },
       isVisible: { type: 'boolean', tooltip: 'Show this renderer. Independent of the entity on/off (EntityAttributes.isActive, which also cascades to children).' },
+      renderingLayerMask: { type: 'number', step: 1, min: 0, group: 'Lighting', tooltip: 'Rendering-layer bitmask. A light lights this object only when its own mask shares a bit with this one (bitwise AND non-zero). Both default to 1 (layer 0), so every light hits every object until you change one. Use it to give an object its own key light instead of paying for every light in the scene — forward shading evaluates ALL lights per fragment, and on mobile that cost is superlinear (measured 689ms → 98ms on a Galaxy A23).' },
+      castShadow: { type: 'enum', options: ['auto', 'on', 'off'], group: 'Shadows', tooltip: '"auto" casts a shadow only when the material is opaque (a transparent material never casts). "on"/"off" force it regardless of the material. Still gated by the project\'s three.shadows setting and the active quality tier — the "low" tier disables shadows entirely, which makes this field inert there, not broken.' },
+      receiveShadow: { type: 'boolean', group: 'Shadows', tooltip: 'Receive shadows cast by other objects. Still gated by the project\'s three.shadows setting and the active quality tier — the "low" tier disables shadows entirely, which makes this field inert there, not broken.' },
     },
   });
 
@@ -85,6 +88,8 @@ export function registerAllTraits() {
     fields: {
       model: { type: 'string', accept: ['.glb', '.gltf'], tooltip: 'Rigged GLB (keeps skeleton + animation clips). Pair with SkeletalAnimator to play clips.' },
       isVisible: { type: 'boolean', tooltip: 'Show this renderer. Independent of the entity on/off (EntityAttributes.isActive, which also cascades to children).' },
+      castShadow: { type: 'enum', options: ['auto', 'on', 'off'], group: 'Shadows', tooltip: '"auto" casts a shadow only when the material is opaque (a transparent material never casts). "on"/"off" force it regardless of the material. Still gated by the project\'s three.shadows setting and the active quality tier — the "low" tier disables shadows entirely, which makes this field inert there, not broken.' },
+      receiveShadow: { type: 'boolean', group: 'Shadows', tooltip: 'Receive shadows cast by other objects. Still gated by the project\'s three.shadows setting and the active quality tier — the "low" tier disables shadows entirely, which makes this field inert there, not broken.' },
     },
   });
 
@@ -260,6 +265,21 @@ export function registerAllTraits() {
   });
 
   registerTrait({
+    name: 'BlobShadow', trait: BlobShadow, category: 'component', componentCategory: 'Rendering', priority: 37,
+    fields: {
+      radius: { type: 'number', min: 0, step: 0.05, tooltip: 'World-space radius of the blob' },
+      opacity: { type: 'number', min: 0, max: 1, step: 0.05, tooltip: 'Peak darkness at ground contact' },
+      groundOffset: { type: 'number', min: 0, step: 0.01, tooltip: 'Lift above the found surface, along its normal, to avoid z-fighting' },
+      maxDrop: { type: 'number', min: 0, step: 0.5, tooltip: 'How far straight down to search for ground before giving up' },
+      fadeStart: { type: 'number', min: 0, step: 0.1, tooltip: 'Distance from the entity\'s origin (not its feet) to the ground at full opacity — e.g. ~1 for a standing capsule character' },
+      fadeHeight: { type: 'number', min: 0, step: 0.1, tooltip: 'Opacity fades linearly to 0 as the entity rises this far beyond fadeStart' },
+      // min/max matter here beyond tidiness: `blobEdgeStart` clamps to 0..1, so an unbounded
+      // field would let the Inspector show a value the shader is not using.
+      softness: { type: 'number', min: 0, max: 1, step: 0.05, tooltip: 'Edge softness: 0 is a hard-edged disc, 1 fades from the centre. Applies live — no rebuild' },
+    },
+  });
+
+  registerTrait({
     name: 'Tint', trait: Tint, category: 'component', componentCategory: 'Rendering',
     priority: 35,
     fields: {
@@ -290,6 +310,9 @@ export function registerAllTraits() {
       color: { type: 'color' },
       size: { type: 'number', step: 1 },
       isVisible: { type: 'boolean', tooltip: 'Show this renderer. Independent of the entity on/off (EntityAttributes.isActive, which also cascades to children).' },
+      renderingLayerMask: { type: 'number', step: 1, min: 0, group: 'Lighting', tooltip: 'Rendering-layer bitmask — a light lights this object only when its mask shares a bit with this one. Requires an explicit Material: a default-material primitive owns a per-entity material that Color is written into live, and a light-mask variant is shared, so the two would fight. Both masks default to 1, so every light hits every object until you change one.' },
+      castShadow: { type: 'enum', options: ['auto', 'on', 'off'], group: 'Shadows', tooltip: '"auto" casts a shadow only when the material is opaque (a transparent material never casts). "on"/"off" force it regardless of the material. Still gated by the project\'s three.shadows setting and the active quality tier — the "low" tier disables shadows entirely, which makes this field inert there, not broken.' },
+      receiveShadow: { type: 'boolean', group: 'Shadows', tooltip: 'Receive shadows cast by other objects. Still gated by the project\'s three.shadows setting and the active quality tier — the "low" tier disables shadows entirely, which makes this field inert there, not broken.' },
     },
   });
 
@@ -703,6 +726,35 @@ export function registerAllTraits() {
   });
 
   registerTrait({
+    name: 'VideoPlayer', trait: VideoPlayer, category: 'component', componentCategory: 'Audio',
+    priority: 72,
+    fields: {
+      clip: {
+        type: 'string', accept: ['.mp4', '.mov', '.m4v', '.webm', '.mkv'],
+        tooltip: 'Video clip (GUID). Converted to H.264/mp4 on import — the only codec the iOS WebView plays.',
+      },
+      loop: { type: 'boolean' },
+      autoplay: { type: 'boolean', tooltip: 'Play automatically when the game starts.' },
+      muted: {
+        type: 'boolean',
+        tooltip: 'Muted video is exempt from the browser autoplay rule; a clip WITH sound needs a user gesture first.',
+      },
+      volume: { type: 'number', min: 0, max: 1, step: 0.05 },
+      bus: { type: 'enum', options: ['master', 'music', 'sfx', 'ui'], tooltip: 'Mix bus for the video\'s audio track.' },
+      rate: { type: 'number', min: 0.1, max: 4, step: 0.05, tooltip: 'Playback rate before timeScale (1 = normal).' },
+      timeMode: {
+        type: 'enum', options: ['diegetic', 'presentation'],
+        tooltip: 'diegetic: a screen in the world — slow-mo slows it. presentation: a cutscene — slow-mo does NOT drag it. Both freeze when time is stopped.',
+      },
+      playing: { type: 'boolean', readOnly: true, runtimeOnly: true },
+      loadProgress: {
+        type: 'number', readOnly: true, runtimeOnly: true,
+        tooltip: 'Download progress 0-1 for a remote clip on the download policy. 1 for bundled/streamed.',
+      },
+    },
+  });
+
+  registerTrait({
     name: 'AudioListener', trait: AudioListener, category: 'component', componentCategory: 'Audio',
     priority: 71,
     fields: {
@@ -721,6 +773,14 @@ export function registerAllTraits() {
       frame: { type: 'number', readOnly: true, runtimeOnly: true },
       smoothedDelta: { type: 'number', readOnly: true, runtimeOnly: true },
       smoothedElapsed: { type: 'number', readOnly: true, runtimeOnly: true },
+    },
+  });
+
+  registerTrait({
+    name: 'HapticSettings', trait: HapticSettings, category: 'resource',
+    fields: {
+      enabled: { type: 'boolean', tooltip: 'Device haptic feedback. A PLAYER preference — a game exposing an on/off control should persist it through PlayerPrefs and write it back here. Authored here so a game can ship with haptics off by default without a code change. No effect off-device (editor, web, headless).' },
+      masterIntensity: { type: 'number', min: 0, max: 1, step: 0.05, tooltip: 'Currently a GATE, not a scale: below 0.05 nothing plays. Presets carry fixed strengths and no platform in range lets us scale one, so anything in between would be a lie. Here so a strength slider does not need a trait migration later.' },
     },
   });
 
@@ -790,6 +850,9 @@ export function registerAllTraits() {
       penumbra: { type: 'number', step: 0.1, min: 0, max: 1 },
       castShadow: { type: 'boolean' },
       showShadowFrustum: { type: 'boolean', group: 'Shadow', tooltip: 'Editor-only: outline this directional light’s shadow-camera coverage box in the viewport. Anything poking outside the box gets no shadow (it clips) — raise Shadow Camera Size until the box encloses the whole scene.' },
+      shadowFollowCamera: { type: 'boolean', group: 'Shadow', tooltip: 'Recentres the shadow box on the view each frame, so a moving subject can’t walk out of it. The authored Shadow Camera Size is unchanged — this buys coverage without costing texel density. Turn off to pin the box to the light’s authored position, for a scene that deliberately wants a fixed box.' },
+      shadowFollowTarget: { type: 'entityRef', group: 'Shadow', tooltip: 'Entity GUID the shadow box centres on (usually the player). Empty = follow whatever the view is looking at. Centring on the subject rather than the view lets you LOWER Shadow Camera Size for the same coverage around it, and a smaller box means smaller texels — the cheapest way to sharpen a soft shadow. A guid that no longer resolves falls back to the view.' },
+      renderingLayerMask: { type: 'number', step: 1, min: 0, group: 'Lighting', tooltip: 'Rendering-layer bitmask. This light affects a renderer only when its Renderable3D mask shares a bit with this one (bitwise AND non-zero). Both default to 1 (layer 0), so every light hits every object until you change one. Restricting a light to the objects it actually lights is the single biggest mobile win available — measured 689ms → 98ms on a Galaxy A23. Note a light kept by even ONE object still renders its full shadow map.' },
       shadowCameraSize: { type: 'number', step: 1, min: 1, group: 'Shadow', tooltip: 'Ortho half-extent (world units) the directional shadow covers. Must enclose the scene or shadows clip at the box edge. Bigger = softer/lower-res shadows for a fixed map size.' },
       shadowMapSize: { type: 'number', step: 512, min: 256, group: 'Shadow', tooltip: 'Shadow depth-map resolution (px). Higher = crisper shadow edges but more GPU memory — 2048 is mobile-safe, 4096 is heavy on mobile.' },
       shadowRadius: { type: 'number', step: 1, min: 0, group: 'Shadow', tooltip: 'Shadow edge softness (PCF blur radius).' },
@@ -845,6 +908,7 @@ export function registerAllTraits() {
       alignSelf: { type: 'enum', options: ['auto', 'flex-start', 'center', 'flex-end', 'stretch'], tooltip: 'Override parent alignItems for this element', ...S('Layout') },
       overflow: { type: 'enum', options: ['visible', 'hidden', 'scroll'], tooltip: 'What happens when children exceed bounds.\nvisible = no clipping, hidden = clip, scroll = scrollbar', ...S('Layout') },
       zIndex: { type: 'number', step: 1, tooltip: 'Stacking order among siblings', ...S('Layout') },
+      pointerThrough: { type: 'boolean', tooltip: 'Never take the pointer — taps fall through to whatever is BEHIND this element.\nChildren keep their own (a button inside stays clickable).\nFor a decorative container drawn over something that must stay tappable.\nNOTE: on an overflow:scroll box this gives up scrolling it.', ...S('Layout') },
 
       // ── Child Layout section (Unity LayoutGroup — arranges THIS element's children) ──
       // Container-level flexbox. Independent of this element's own anchor, so it
@@ -853,7 +917,8 @@ export function registerAllTraits() {
       flexDirection: { type: 'enum', options: ['row', 'column'], tooltip: 'Layout direction for children.\nrow = horizontal, column = vertical', ...S('Child Layout', { sectionDivider: true }) },
       justifyContent: { type: 'enum', options: ['flex-start', 'center', 'flex-end', 'space-between', 'space-around'], tooltip: 'How children are distributed along the main axis', ...S('Child Layout') },
       alignItems: { type: 'enum', options: ['flex-start', 'center', 'flex-end', 'stretch'], tooltip: 'How children are aligned on the cross axis', ...S('Child Layout') },
-      gap: { type: 'number', step: 1, tooltip: 'Space (px) between children', ...S('Child Layout') },
+      gap: { type: 'number', step: 1, tooltip: 'Space between children', ...S('Child Layout') },
+      gapUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for gap.\nMatch it to the CHILDREN\u2019s unit: scaling items with px gaps reflow at small sizes.', ...S('Child Layout') },
 
       // ── Padding section (collapsed by default) ──
       paddingTop: { type: 'number', step: 1, tooltip: 'Inner spacing top', ...S('Padding', { sectionDefaultOpen: false }) },
@@ -1074,7 +1139,7 @@ export function registerAllTraits() {
   registerTrait({
     name: 'BloomPostFX', trait: BloomPostFX, category: 'resource',
     fields: {
-      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s bloom stage. WebGPU only; composes with NPR/Vignette/DOF/AO.' },
+      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s bloom stage. Runs on WebGPU and its WebGL2 fallback alike (only FXAA is WebGPU-only); composes with NPR/Vignette/DOF/AO.' },
       strength: { type: 'number', step: 0.05, min: 0, max: 3, tooltip: 'Bloom intensity / glow brightness. Typical 0.3–1.5.' },
       radius: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: 'Glow blur spread (softness/width). 0..1.' },
       threshold: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: 'Luminance threshold — only pixels brighter than this bloom. 0 = whole scene (good on a near-black void).' },
@@ -1084,7 +1149,7 @@ export function registerAllTraits() {
   registerTrait({
     name: 'VignettePostFX', trait: VignettePostFX, category: 'resource',
     fields: {
-      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s vignette stage. WebGPU only; composes with NPR/Bloom/DOF/AO.' },
+      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s vignette stage. Runs on WebGPU and its WebGL2 fallback alike (only FXAA is WebGPU-only); composes with NPR/Bloom/DOF/AO.' },
       intensity: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: 'Darkening strength at the screen edge. 0 = no vignette, 1 = edges go black.' },
       smoothness: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: 'Falloff softness of the radial mask. Higher spreads the darkening further toward the center.' },
     },
@@ -1093,7 +1158,7 @@ export function registerAllTraits() {
   registerTrait({
     name: 'DepthOfFieldPostFX', trait: DepthOfFieldPostFX, category: 'resource',
     fields: {
-      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s depth-of-field stage. WebGPU only; composes with NPR/Bloom/Vignette/AO.' },
+      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s depth-of-field stage. Runs on WebGPU and its WebGL2 fallback alike (only FXAA is WebGPU-only); composes with NPR/Bloom/Vignette/AO.' },
       focusDistance: { type: 'number', step: 0.5, min: 0, tooltip: 'Distance along the camera\'s look direction (world units) that stays in focus.' },
       focalLength: { type: 'number', step: 0.1, min: 0.01, tooltip: 'How far (world units) from the focus distance before it\'s fully out of focus. Smaller = shallower depth of field.' },
       bokehScale: { type: 'number', step: 0.1, min: 0, max: 5, tooltip: 'Unitless artistic multiplier on bokeh circle size.' },
@@ -1103,7 +1168,7 @@ export function registerAllTraits() {
   registerTrait({
     name: 'AmbientOcclusionPostFX', trait: AmbientOcclusionPostFX, category: 'resource',
     fields: {
-      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s GTAO stage. WebGPU only; composes with NPR/Bloom/Vignette/DOF. Adds a normal buffer to the scene pass (same one NPR uses) — a custom-shader material combined with AO must emit both MRT targets or its draw is dropped.' },
+      enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s GTAO stage. Runs on WebGPU and its WebGL2 fallback alike (only FXAA is WebGPU-only); composes with NPR/Bloom/Vignette/DOF. Adds a normal buffer to the scene pass (same one NPR uses) — a custom-shader material combined with AO must emit both MRT targets or its draw is dropped.' },
       radius: { type: 'number', step: 0.05, min: 0.01, max: 2, tooltip: 'World-space sample radius for the occlusion horizon search.' },
       intensity: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: '0 = no darkening, 1 = full raw occlusion.' },
     },

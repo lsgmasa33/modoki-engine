@@ -14,7 +14,7 @@ const PrefabInstance = trait({ source: '' as string, localId: 0, rootInstanceId:
 let testWorld: ReturnType<typeof createWorld>;
 const cachedPrefabs = new Map<string, unknown>();
 
-vi.mock('../../src/runtime/core/ecs/world', () => ({ getCurrentWorld: () => testWorld, registerEntity: vi.fn(), setStructureCallback: vi.fn() }));
+vi.mock('../../src/runtime/core/ecs/world', () => ({ getCurrentWorld: () => testWorld, registerEntity: vi.fn(), spawnEntity: (world: any, ...traits: any[]) => world.spawn(...traits), setStructureCallback: vi.fn() }));
 vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
   const traits = [
     { name: 'Transform', trait: Transform, category: 'component', fields: { x: 0, y: 0, z: 0 } },

@@ -12,9 +12,10 @@ const KIND_BADGE: Record<TrackDef['type'], { label: string; color: string }> = {
   signal: { label: 'SIG', color: '#b08b3f' },
   audio: { label: 'AUD', color: '#8a4d8a' },
   control: { label: 'CTRL', color: '#b0553f' },
+  video: { label: 'VID', color: '#3f8aa0' },
 };
 
-const ADD_KINDS: TrackKind[] = ['animation', 'signal', 'audio', 'activation', 'control'];
+const ADD_KINDS: TrackKind[] = ['animation', 'signal', 'audio', 'activation', 'control', 'video'];
 
 function TrackLaneList({
   doc, width, selectedTrack, onSelectTrack, onSetTarget, onToggleMute, onRemoveTrack, onAddTrack,

@@ -21,6 +21,7 @@ const BIND = { id: 'UIBinding' };
 const ACT = { id: 'UIAction' };
 const ANC = { id: 'UIAnchor' };
 const CV2 = { id: 'Canvas2D' };
+const VID = { id: 'VideoPlayer' };
 
 const UI_DEFAULTS = {
   width: 100, height: 40, widthUnit: 'px', heightUnit: 'px',
@@ -46,6 +47,10 @@ interface Spec {
   action?: { bindings: unknown[] };
   binding?: { textBinding: string; inputBinding: string };
   canvas2D?: { referenceWidth: number; referenceHeight: number; scaleMode: string };
+  /** Present = the entity also carries a `VideoPlayer`. Its FIELDS are deliberately not
+   *  modelled: `hasVideo` is presence-only, so a spec that carried values would imply
+   *  buildTree reads them. */
+  video?: true;
 }
 
 /** A koota-like world whose entity set is read fresh from `getSpecs()` on every
@@ -62,6 +67,7 @@ function makeWorld(getSpecs: () => Spec[]) {
           if (s.action) data.set(ACT, s.action);
           if (s.binding) data.set(BIND, s.binding);
           if (s.canvas2D) data.set(CV2, s.canvas2D);
+          if (s.video) data.set(VID, {});
           const entity = { id: () => s.id, has: (t: unknown) => data.has(t), get: (t: unknown) => data.get(t) };
           cb([data.get(UIEL)], entity);
         }
@@ -82,6 +88,7 @@ function mockDeps() {
       { name: 'UIAction', trait: ACT, category: 'component', fields: {} },
       { name: 'UIAnchor', trait: ANC, category: 'component', fields: {} },
       { name: 'Canvas2D', trait: CV2, category: 'component', fields: {} },
+      { name: 'VideoPlayer', trait: VID, category: 'component', fields: {} },
     ],
   }));
 }
@@ -228,5 +235,51 @@ describe('uiTreeStore node reuse', () => {
     expect(nodesEqual(base, bMut)).toBe(false);
     const cMut = cloneOf(base); (cMut.canvas2D as any).scaleMode = 'stretch';
     expect(nodesEqual(base, cMut)).toBe(false);
+  });
+});
+
+/** `hasVideo` — the projection seam for video-in-a-UI-node.
+ *
+ *  `UIVideoMount` was covered in isolation and `nodesEqual` covers `hasVideo` as one of the
+ *  scalar keys above, but NOTHING drove the chain production actually takes: a `VideoPlayer`
+ *  on a UI entity → `buildTree` → `node.hasVideo` → `UINode` mounts the clip. Both halves
+ *  could have been green with the projection never setting the flag at all.
+ *
+ *  The re-ref case is the one the field's own comment in `uiTreeStore.ts` argues for: it is a
+ *  PLAIN SCALAR, always written, precisely so a node whose video appeared or vanished does not
+ *  keep its old object reference and never re-render. That claim was an assertion in a comment. */
+describe('uiTreeStore hasVideo', () => {
+  it('is false for a UI entity with no VideoPlayer', async () => {
+    const { uiTreeProjection, useUITreeStore } = await load();
+    uiTreeProjection(makeWorld(() => [{ id: 1, parentId: 0 }]));
+    expect(useUITreeStore.getState().tree[0].hasVideo).toBe(false);
+  });
+
+  it('is true when the entity carries a VideoPlayer', async () => {
+    const { uiTreeProjection, useUITreeStore } = await load();
+    uiTreeProjection(makeWorld(() => [{ id: 1, parentId: 0, video: true }]));
+    expect(useUITreeStore.getState().tree[0].hasVideo).toBe(true);
+  });
+
+  it('re-refs the node when the VideoPlayer is added or removed', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0 }];
+    const { uiTreeProjection, useUITreeStore, markUIDirty } = await load();
+    const world = makeWorld(() => specs);
+
+    uiTreeProjection(world);
+    const before = useUITreeStore.getState().tree[0];
+    expect(before.hasVideo).toBe(false);
+
+    specs[0].video = true;
+    markUIDirty(); uiTreeProjection(world);
+    const added = useUITreeStore.getState().tree[0];
+    expect(added).not.toBe(before);   // a reused ref here = a backdrop that never appears
+    expect(added.hasVideo).toBe(true);
+
+    delete specs[0].video;
+    markUIDirty(); uiTreeProjection(world);
+    const removed = useUITreeStore.getState().tree[0];
+    expect(removed).not.toBe(added);
+    expect(removed.hasVideo).toBe(false);
   });
 });

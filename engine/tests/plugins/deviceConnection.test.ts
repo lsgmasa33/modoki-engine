@@ -103,9 +103,9 @@ describe('DeviceConnectionManager (real TCP)', () => {
     const status = await mgr.disconnect();
     expect(status.state).toBe('disconnected');
     expect(status.target).toBeNull();
-    // Give the server's close handler a tick, then confirm the lease is free.
-    await new Promise((r) => setTimeout(r, 20));
-    expect(authority.status(Date.now()).leased).toBe(false);
+    // POLL for the server's close handler, never a fixed sleep — see the note on the reconnect
+    // waits below for why this whole class was converted.
+    await vi.waitFor(() => expect(authority.status(Date.now()).leased).toBe(false));
   });
 
   it('errors (not throws) when neither IP nor adb is provided', async () => {
@@ -151,12 +151,21 @@ describe('DeviceConnectionManager (real TCP)', () => {
     expect(mgr.status().state).toBe('connected');
 
     device.dropClient();                                   // socket dies (WiFi blip)
-    await new Promise((r) => setTimeout(r, 60));
-    expect(mgr.status().state).toBe('reconnecting');
+    // ⚠️ POLL, never a fixed sleep. These were `setTimeout(r, 60)` and `setTimeout(r, 1400)` —
+    // bets that a state transition completes inside a hardcoded window, which is true on an idle
+    // machine and false under load. That is the same defect that made `riggedModelCache`'s
+    // `setTimeout(r, 5)` a recurring spurious red in `npm run verify`, and it got sharper when
+    // verify started running its legs concurrently (2026-08-06): the point of that change is to
+    // keep every core busy, which is exactly the condition these raced under.
+    //
+    // Polling is also FASTER here. The 1400ms wait was sized to clear `reconnectDelayMs` (1000)
+    // plus slack and was paid in full on every run; `vi.waitFor` returns the moment the state
+    // actually flips, so it costs the real reconnect time instead of the worst case.
+    await vi.waitFor(() => expect(mgr.status().state).toBe('reconnecting'));
 
     // Same device still listening; the client re-presents the same guid within grace.
-    await new Promise((r) => setTimeout(r, 1400));         // > reconnectDelayMs (1000)
-    expect(mgr.status().state).toBe('connected');
+    // Timeout must clear reconnectDelayMs (1000) with room, or the poll itself becomes the flake.
+    await vi.waitFor(() => expect(mgr.status().state).toBe('connected'), { timeout: 5000 });
     expect(authority.status(Date.now()).guid).toBe('guid-recon');
   });
 
@@ -203,6 +212,58 @@ describe('TcpLeaseTransport timeouts', () => {
       // cross (same reason `live?.destroy()` above needs no cast: it's read from inside ANOTHER
       // closure, which resets narrowing back to the declared type instead of over-narrowing).
       (serverSock as net.Socket | null)?.destroy(); // else server.close() waits on the live socket
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  /** #153 — the per-request deadline. The connection default used to be the ONLY deadline, and it
+   *  starts host-side (before the request reaches the phone), so an op whose own budget approached
+   *  it could never produce its own error message: you got `device request timed out after 5000ms`
+   *  instead of what the code was doing. These pin the two halves that make the override safe —
+   *  it EXTENDS (a longer op survives the connection default) and it is BOUNDED (a hung device
+   *  still fails, rather than holding the link open indefinitely). */
+  it('a per-request timeout EXTENDS the connection default — the slow op is not cut short', async () => {
+    let serverSock: net.Socket | null = null;
+    // Replies after 120ms: longer than the 60ms connection default, shorter than the 400ms ask.
+    const server = net.createServer((s) => {
+      serverSock = s;
+      s.on('data', (chunk: Buffer) => {
+        const id = JSON.parse(String(chunk).trim()).id;
+        setTimeout(() => s.write(JSON.stringify({ id, result: 'slow-but-fine' }) + '\n'), 120);
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const port = (server.address() as net.AddressInfo).port;
+    const t = new TcpLeaseTransport('127.0.0.1', port, { requestTimeoutMs: 60 });
+    try {
+      await t.open();
+      // Without the override this rejects at 60ms — that was the whole bug, one layer down.
+      await expect(t.send('echo', {}, 400)).resolves.toBe('slow-but-fine');
+      // And the default still applies to a request that does NOT ask for more.
+      await expect(t.send('echo', {})).rejects.toThrow(/timed out after 60ms/);
+    } finally {
+      t.close();
+      (serverSock as net.Socket | null)?.destroy();
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  it('a per-request timeout is BOUNDED — it names the deadline it actually used', async () => {
+    let serverSock: net.Socket | null = null;
+    const server = net.createServer((s) => { serverSock = s; }); // never responds
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const port = (server.address() as net.AddressInfo).port;
+    const t = new TcpLeaseTransport('127.0.0.1', port, { requestTimeoutMs: 60 });
+    try {
+      await t.open();
+      // The message must name the EFFECTIVE deadline, not the connection default: a caller that
+      // asked for 150ms and is told "timed out after 60ms" would go looking for the wrong bug.
+      await expect(t.send('echo', {}, 150)).rejects.toThrow(/timed out after 150ms/);
+      // A nonsense ask falls back to the connection default rather than disabling the deadline.
+      await expect(t.send('echo', {}, Number.NaN)).rejects.toThrow(/timed out after 60ms/);
+    } finally {
+      t.close();
+      (serverSock as net.Socket | null)?.destroy();
       await new Promise<void>((r) => server.close(() => r()));
     }
   });
@@ -316,6 +377,35 @@ describe('DeviceConnectionManager.devicePlatform — what latches and what does 
       proxy.mockResolvedValue({ platform: 'android', appId: 'a', appName: 'b' });
       await mgr.connect({ ip: '127.0.0.1', port: device.port });
       expect(await mgr.devicePlatform()).toBe('android');
+    } finally {
+      proxy.mockRestore();
+      await mgr.disconnect();
+      await device.close();
+    }
+  });
+
+  it('carries the device HARDWARE on the SAME probe, and forgets it on disconnect (#146)', async () => {
+    // The launcher uses these to tie a WebDriverAgent launch to the leased phone rather than to
+    // whatever is plugged into this Mac. Two properties matter, and both are silent when broken:
+    // it must cost no extra round trip (this sits on the input hot path), and it must NOT survive
+    // a disconnect — a stale model would make the next lease's launch refuse as "wrong phone".
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority);
+    const mgr = new DeviceConnectionManager('guid-plat-4', stateDir);
+    const proxy = vi.spyOn(mgr, 'proxy')
+      .mockResolvedValue({ platform: 'ios', appId: 'a', appName: 'b', deviceModel: 'iPhone18,4', osVersion: '26.5.2' });
+    try {
+      await mgr.connect({ ip: '127.0.0.1', port: device.port });
+      expect(await mgr.deviceHardware()).toEqual({ deviceModel: 'iPhone18,4', osVersion: '26.5.2' });
+      expect(await mgr.devicePlatform()).toBe('ios');
+      expect(proxy).toHaveBeenCalledTimes(1);   // one probe answers everything
+
+      await mgr.disconnect();
+      // An app older than #146 answers without them — "unknown", which the launcher treats as
+      // unverified, never as a mismatch.
+      proxy.mockResolvedValue({ platform: 'ios', appId: 'a', appName: 'b' });
+      await mgr.connect({ ip: '127.0.0.1', port: device.port });
+      expect(await mgr.deviceHardware()).toEqual({ deviceModel: null, osVersion: null });
     } finally {
       proxy.mockRestore();
       await mgr.disconnect();

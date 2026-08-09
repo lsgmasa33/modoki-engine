@@ -19,7 +19,7 @@ import { describe, it, expect } from 'vitest';
 import path from 'path';
 import fs from 'fs';
 import { findAssetRoots, readAssetGuid, detectType, type AssetRoot } from '../../plugins/vite-asset-scanner';
-import { deriveGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { deriveGuid, isInternalAssetPath } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { resolveTextureType } from '../../packages/modoki/src/runtime/loaders/textureSettings';
 import { hasAnyProject } from '../helpers/repoLayout';
 
@@ -34,13 +34,14 @@ const hasProjectAssets = hasAnyProject();
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isGuid = (s: unknown): s is string => typeof s === 'string' && GUID_RE.test(s);
 
-/** A string that looks like an on-disk internal asset reference (the fragile,
- *  now-rejected form). Mirrors assetManifest.isInternalAssetPath. Fonts
- *  (.ttf/.woff) are intentionally excluded — fontFamily is a CSS name/path. */
-function looksLikeAssetPath(s: string): boolean {
-  if (!s.startsWith('/')) return false;
-  return /\.(particle|mesh|mat|prefab|scene|shader|animset|spriteanim|timeline)\.json$|\.(glb|gltf|fbx|png|jpe?g|webp|hdr|exr)$/i.test(s);
-}
+/** A string that looks like an on-disk internal asset reference (the fragile, now-rejected
+ *  form). USES the runtime predicate rather than restating it: this was a hand-copied regex
+ *  claiming to "mirror assetManifest.isInternalAssetPath", and it had drifted from it in BOTH
+ *  directions — it matched `.animset/.spriteanim/.timeline` which the runtime did not, and
+ *  missed `.anim.json` which the runtime did. So the committed-asset guard and the runtime
+ *  rejector disagreed about what a path ref even is. One predicate now; the kinds it must
+ *  cover are guarded separately by `assetPathPredicate.test.ts`. */
+const looksLikeAssetPath = (s: string): boolean => isInternalAssetPath(s);
 
 function* walk(dir: string): Generator<string> {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -255,6 +256,15 @@ describe('sprites-only 2D references (real assets)', () => {
   const { textures, sprites } = textureAndSpriteGuids();
   const rig2ds = assets.filter((a) => a.type === 'rig2d');
   const sceneLike = assets.filter((a) => a.type === 'scene' || a.type === 'prefab');
+  // A `Renderable2D.sprite` may legally hold a VIDEO guid: the sprite shows a moving
+  // picture, its texture supplied by videoTextureSync2D from the element videoService
+  // owns rather than by the still-image pipeline. Such a ref is neither a raw texture
+  // nor a sprite slice, so both checks below would otherwise flag every video sprite.
+  const videos = new Set(
+    assets.filter((a) => a.type === 'video')
+      .map((a) => readAssetGuid(a.abs, 'video')?.toLowerCase())
+      .filter((g): g is string => !!g),
+  );
 
   it('no 2D sprite field references a raw texture GUID (must be a sprite)', () => {
     const offenders: string[] = [];
@@ -268,6 +278,7 @@ describe('sprites-only 2D references (real assets)', () => {
     }
     for (const r of refs) {
       if (!isGuid(r.ref)) continue; // primitive keyword / URL / empty
+      if (videos.has(r.ref.toLowerCase())) continue;  // a video sprite — see `videos` above
       if (textures.has(r.ref.toLowerCase())) offenders.push(`${r.url} ${r.at} → raw texture ${r.ref}`);
     }
     expect(offenders).toEqual([]);
@@ -285,6 +296,7 @@ describe('sprites-only 2D references (real assets)', () => {
     }
     for (const r of refs) {
       if (!isGuid(r.ref)) continue;
+      if (videos.has(r.ref.toLowerCase())) continue;  // a video sprite — see `videos` above
       if (!sprites.has(r.ref.toLowerCase())) dangling.push(`${r.url} ${r.at} → unknown sprite ${r.ref}`);
     }
     expect(dangling).toEqual([]);

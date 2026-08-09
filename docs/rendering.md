@@ -100,13 +100,132 @@ Applied each frame while `castShadow` is on and the light is directional/spot. `
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `shadowMapSize` | `2048` | Depth-map resolution (square). A change reallocs the depth texture — GUARDED so it only regenerates when the size actually changes. |
-| `shadowCameraSize` | `16` | Directional shadow-camera ortho half-extent (world units) — must ENCLOSE the scene. |
+| `shadowCameraSize` | `16` | Directional shadow-camera ortho half-extent (world units). With `shadowFollowCamera` off it must ENCLOSE THE SCENE; with it on (the default) it only has to enclose what is around the subject, which is what lets it be smaller — see below. |
 | `shadowBias` | `-0.0003` | Depth bias (fights acne). |
 | `shadowNormalBias` | `0.008` | Normal-offset bias (fights peter-panning). |
 | `shadowRadius` | `4` | PCF blur radius. |
+| `shadowFollowCamera` | `true` | Recentre the ortho box on the view every frame instead of leaving it anchored at the light's authored position. |
+| `shadowFollowTarget` | `''` | Entity GUID to centre the box on instead of the view (usually the player). Empty = follow the view. |
 | `showShadowFrustum` | `false` | Editor-only: outline the shadow-camera coverage box in SceneView (runtime ignores it). |
 
-The shadow camera near/far are fixed at `0.1` / `200`; the directional light's ortho frustum is set from `shadowCameraSize`. Casters/receivers are flagged via `applyShadowFlags` (traverses the object, setting `castShadow` + `receiveShadow` on every mesh) — inert unless a light casts AND the renderer's shadow map is enabled.
+Casters/receivers come from the RENDERER's own `castShadow` (`'auto'`/`'on'`/`'off'`) + `receiveShadow`
+fields on `Renderable3D` / `Renderable3DPrimitive` / `SkinnedModel`, applied by `applyShadowFlags`.
+`'auto'` derives cast from the material — an alpha-blended (`transparent`) material does NOT cast,
+because the shadow map treats blended geometry as opaque and a translucent surface would throw a
+hard, wrongly-shaped shadow. All of it is inert unless a light casts AND the renderer's shadow map is
+enabled (project `three.shadows`; the `low` tier turns it off outright).
+
+⚠️ **A rig had NO shadow at all until #183** — `applyShadowFlags` was called from three places, all
+inside `syncRenderables` (LOD / GLB mesh / primitive), and never for skinned models, so every rigged
+character in every project kept THREE's defaults and neither cast nor received. **The tell for this
+class is `receiveShadow`**: the function sets it true unconditionally, so a mesh reporting
+`receiveShadow: false` proves it never ran there — whatever the material says. Do not re-derive the
+old "a transparent material explains it" theory; it was measured false.
+
+#### Follow (`shadowFollow.ts`)
+
+A directional shadow camera anchored at the light's authored position covers a FIXED patch of ground,
+so a moving subject walks off it and loses its shadow. Measured in `demos/forest-camp`: the Sun at
+`(5,10,4)` with `shadowCameraSize` 16 put the box's footprint around `(7.8, 12.5)` while the player
+walked near `(5.6, -0.5)` — the player sat at **-0.873 in shadow-camera NDC standing still**, and 9 m
+of walking north took it outside the box entirely.
+
+Each surface supplies the focus point it actually has. The editor passes its orbit `controls.target`
+(a true look-at). The runtime has none — a camera is just a Transform, and a follow target like
+forest-camp's lives in game code the renderer cannot see — so `viewGroundFocus` intersects the camera's
+view axis with the ground plane, which for any camera pointed at the ground IS the look-at, and unlike
+a fixed distance ahead of the camera is stable under zoom and pitch. A miss (level/upward camera) falls
+back to a bounded forward point rather than putting the box at infinity. `shadowFollowTarget` overrides
+all of that with an entity's world position; an unset or STALE guid falls back to the view focus, never
+to the origin (which would silently relocate every shadow in the scene).
+
+**Known bound, accepted**: that fallback distance is a fixed 32 world units, so a camera more than ~32
+units above the ground looking down still gets clamped to a point short of the true intercept — the box
+lands laterally off by the difference. Aerial/top-down setups should author `shadowFollowTarget` (which
+skips the derivation entirely) rather than rely on the ground hit.
+
+`snapShadowCenter` then snaps the centre to whole shadow-texel increments **in the light's own view
+basis**. Without it the shadow edge crawls as the camera moves, because each sub-texel shift of the box
+re-rasterizes the depth map differently.
+
+**Why `shadowFollowTarget` is worth authoring**: the view-derived point trails the character (measured
+2.8–3.7 m in forest-camp, growing while walking, since the camera lags and looks slightly ahead), which
+spends a quarter of the box radius on ground nobody looks at. Centred on the subject, `shadowCameraSize`
+can be SMALLER for the same coverage — and texel size is `2 * size / mapSize`, so shrinking it is the
+cheapest sharpness available. Measured: target + `shadowCameraSize` 16 → 10 put the character at NDC
+`0 / -0.065` (dead centre) and took texels from 15.6 mm to **9.8 mm**.
+
+⚠️ **Near/far are NOT simply `0.1` / `200` any more.** Near is `0.1`; far is `200` widened to
+`back + size*2` when the follow moves the camera, where `back = size*2 + 10`. Without that widening a
+scene authoring `shadowCameraSize >= 95` puts the focus at or beyond far and **every shadow from that
+light silently disappears** — and since `shadowFollowCamera` defaults on, that would hit an outdoor
+level unasked. Pinned by `syncLights.test.ts` § "shadow follow target".
+
+⚠️ **Shadow flags bake into compiled WGSL on the WebGPU/TSL path.** Flipping `castShadow` — or even
+`renderer.shadowMap.enabled` — at runtime over CDP/MCP changes NOTHING on screen. It is not a valid
+instrument; verify after a restart, or on the WebGL path. This cost real time during #183: it made a
+correct diagnosis look like a failed one.
+
+### Rendering-layer light masks — per-object light selection (`lightMaskVariants.ts`)
+
+A light affects a renderer when their `renderingLayerMask` bitmasks INTERSECT (Unity's Rendering
+Layers, Godot's `light_mask`, Unreal's lighting channels). The field is on `Light`, `Renderable3D`
+and `Renderable3DPrimitive`, defaults to `1` on all three, and an unauthored scene is completely
+inert — no variant is allocated and the code path is skipped entirely.
+
+**Why**: forward shading evaluates EVERY scene light for EVERY fragment, superlinearly on mobile.
+Masking is the highest-value low-tier knob there is — bigger than the entire post-FX stack. The
+numbers, and the two measurement traps that produced three retracted figures, are in
+[plans/low-end-device-support.md](plans/low-end-device-support.md).
+
+**Mechanism**: three's `NodeMaterial.lightsNode` overrides the scene's global light list for one
+material, in a single pass. It works on a classic `MeshStandardMaterial` because
+`NodeLibrary.fromMaterial` copies properties with a `for…in`. So a masked mesh renders with a
+CLONE of its material carrying a restricted lights node.
+
+Two caches, deliberately keyed differently — **both keys are load-bearing, and getting either wrong
+renders a correct-looking scene wrong**:
+
+- **The material variant** is keyed by `(base material, light selection)`. Not per entity:
+  materials are shared (13 across 33 meshes in postfx-demo), so a per-entity variant would trade a
+  fragment-cost problem for a pipeline-count one.
+- **The lights node** is keyed by the **selection alone** and shared across base materials. A
+  `LightsNode` builds a `ShadowNode` per shadow-casting light it references, and each ShadowNode
+  renders its own shadow map — so one node per material means one shadow PASS per material.
+
+⚠️ **A variant of a CLASSIC material MUST override `customProgramCacheKey()`.** This is not an
+optimisation; without it masked objects render **pitch black while their data is perfect**. three's
+`RenderObject.getMaterialCacheKey()` decides which compiled PIPELINE a material reuses by walking
+its properties, and it cannot see a lights node: a non-texture object property contributes the
+literal string `"{}"`, and `uuid`/`name`/`userData` are skipped outright. So N clones of one base
+that differ ONLY in their light set hash to the SAME key and all share whichever pipeline compiled
+first — each rendering with another variant's lights.
+
+**A real `NodeMaterial` is already safe and must be left alone.** `NodeMaterial` overrides
+`customProgramCacheKey()` to hash its node graph — `_getNodeChildren()` walks every own property
+whose value `isNode`, which an assigned `lightsNode` is. Overriding it *there* would REPLACE that
+graph hash with just the light selection, so two different node graphs (two file shaders on the
+same material class) would share one pipeline: the identical defect one layer up. Hence the
+`isNodeMaterial` guard — the classic material is the only one whose key is blind to nodes, so it is
+the only one touched, and even then the base's own key is composed with rather than replaced.
+
+The failure hides behind material SHARING, which is what made it hard: postfx-demo's six plinths
+are one shared `.mat.json`, so their variants collide with each other; several selections were
+empty (those spots were off), the empty-lights pipeline won, and every plinth went black. The horse
+statue's material is its own — one variant, no collision, correctly lit. A cache collision
+therefore looked exactly like a per-object lighting fault. It also needs a SECOND light before any
+variant exists at all (a mask that already sees every light returns `null` and uses the global
+path), so the trigger reads as "enable a second spot and an unrelated object goes dark".
+
+Wrong theories that cost time, recorded so they are not re-derived: it is *not* the two render
+surfaces (SceneView and GameView own separate `THREE.Light` instances — real, and handled by keying
+on light identity, but not this bug); it is *not* shadow-map contention; and it is *not* cloning.
+Note the confound that produced the second wrong fix — **toggling `castShadow` off→on forces a
+shadow rebuild**, so "changing X lit it" may only mean "rebuilding lit it". Isolate with
+`shadow.intensity`, which changes no build state.
+
+Not yet masked: skinned meshes, billboards and text have no mask field, and multi-material meshes
+are skipped.
 
 ### Scene lights in custom shaders (`sceneLightUniforms.ts`)
 
@@ -391,6 +510,221 @@ export const spaceConsoleConfig: GameConfig = {
 
 The `GameConfig.preferWebGPU` JSDoc in `runtime/config.ts` is likewise stale (still describes an `'auto'` → legacy `WebGLRenderer` fallback).
 
+### Quality tiers — `low` / `high` (#121 P3)
+
+A project sets `rendering.three.qualityTier: 'auto' | 'low' | 'high'` (Project Settings → Three.js).
+Two tiers, not three: three would demand evidence for two boundaries and we had it for zero.
+
+**A TIER CLAMPS; IT NEVER RAISES.** `high` is provably a no-op — a project that deliberately
+authored `pixelRatioCap: 1` or `shadows: false` keeps it, because landing on the high tier is not a
+reason to do MORE work than the author asked for. That property is what made wiring tiers up safe
+for every existing project when the default was `high`. As of #155, `DEFAULT_TIER_SETTING` is
+`'auto'`: a project that does not pin `qualityTier` no longer resolves to `high` outright — it goes
+through the allowlist/desktop-carve-out/calibration precedence below, and an unrecognised device
+starts `low`. A project that wants exactly today's behaviour must pin `qualityTier: 'high'`.
+
+| knob | `low` | `high` | live-changeable? |
+|---|---|---|---|
+| `pixelRatioCap` | 1 | 2 | ✅ via the resize bus |
+| `shadows` | off | on | ✅ `shadowMap.enabled` |
+| `Light.shadowMapSize` ceiling | 512 | none | ✅ re-read each frame by `syncLights` |
+| post-FX stack | **dropped** | on | ✅ stack disposed |
+| `antialias` | off | on | ❌ **constructor-only** |
+| **IBL** (`scene.environment`) | **dropped** | on | ✅ `syncEnvironment` re-reads each frame |
+| ambient compensation | ×4 | ×1 | ✅ `syncLights`, gated on `isIblSuppressed()` |
+| exposure compensation | ×1.25 | ×1 | ✅ `reconcileToneExposure`, same gate, per frame |
+
+**IBL is the single most expensive thing the low tier drops — by a wide margin.** Measured on a
+Huawei Y6 2019 (#154): **~26 ms of a ~53 ms frame**, entirely GPU. Suppressing it took `games/sling`
+from 18.7 to 36.5 fps, and with the whole tier applied the game runs at **22 ms / 45 fps**.
+
+Three things about it are worth knowing before touching it:
+
+- **It cannot be fixed by shrinking the asset.** Downsampling the source HDR from 2048×1024 to
+  256×128 (16 MB → 0.25 MB) moved the frame 53.4 → 53.2 ms — nothing. three's PMREM converts the
+  source ONCE into a fixed-size CubeUV cubemap and the fragment shader samples that, so the source
+  resolution never reaches the shader. The cost is the per-fragment env lookup itself.
+- **The scene BACKGROUND is deliberately left alone.** It was measured not to be the cost, and it
+  is what keeps a sky/ocean looking right — so only the lighting contribution is suppressed.
+- **The compensation exists because IBL is fill light.** Without it the scene renders visibly dark
+  and flat. Both multipliers are 1 whenever `ibl` is true, so a tier that keeps IBL passes the
+  authored lighting through untouched and cannot double-light the scene.
+- **The compensation is gated on ACTUAL suppression, not on the tier** — `isIblSuppressed()`, set
+  by `syncEnvironment` each frame, is true only when the tier says no IBL *and* the scene owns a
+  loaded HDR `Environment` to lose. Keying it on the tier alone (as it first shipped) brightened
+  every low-tier scene that had an `AmbientLight` and no environment — several shipped demos — and
+  since an unrecognised device resolves `low`, that meant every phone. **A tier CLAMPS, never
+  RAISES**, and a compensation whose condition is broader than the thing it compensates for is a
+  raise. This is also why the exposure half moved out of `applyRendererColorConfig`, which runs
+  once at renderer creation, before any scene has loaded: it cannot know yet whether there is an
+  environment, so `reconcileToneExposure` re-derives it per frame (change-gated, so the steady
+  state writes nothing).
+- **Every surface that calls `syncEnvironment` must call `reconcileToneExposure` right after it.**
+  The flag is module state describing what the LAST `syncEnvironment` saw, and the editor mounts
+  two surfaces that each call it (the Game panel's `Scene3D`, the Scene panel's `SceneView`). One
+  that sets the flag and never reads it back keeps whatever exposure its renderer was built with —
+  which is how the Scene panel briefly baked in a compensation belonging to the Game panel.
+  Enforced by `engine/tests/architecture/iblCompensationSurfaces.test.ts`. `applyRendererColorConfig`
+  is deliberately outside this: it sets the AUTHORED exposure with no compensation, because it also
+  serves the asset-preview renderers (`ModelPreview`, `previewScene`), which never sync an
+  environment and are correct by having no compensation rather than by reconciling one.
+
+**The low tier does NOT spend that saving on resolution — that was tried and measured.** With IBL
+off: 1× (360×753) = 22 ms / 45 fps, 1.4× (503×1054) = 72 ms / 14 fps, 2× (720×1506) = 69 ms /
+14 fps. A fill-bound GPU pays ~4× for 2× DPR, far past the ~11 ms of headroom, and an odd-sized
+1.4× buffer is worse for a tile-based renderer than the aligned 2× one.
+
+⚠️ **`syncEnvironment`, `syncLights` and `syncRenderables` re-apply their state EVERY FRAME.**
+Setting `scene.environment`, a material, or `obj.visible` from the console is silently reverted
+within a frame or two, so a live A/B measures the same thing twice and reports a clean null. This
+cost most of a session and produced several confidently wrong conclusions. To probe live, either
+change the authored source or defeat the re-sync and verify it held:
+```js
+Object.defineProperty(scene, 'environment', { configurable: true, get: () => null, set: () => {} });
+// …then re-read after 10+ s and assert it is still off BEFORE measuring.
+```
+
+**`antialias` cannot change live** — it is a `WebGPURenderer` constructor option baked into the
+swapchain, so it applies at the next renderer creation. We deliberately do not rebuild the renderer
+for it: a rebuild costs the ~316 ms hitch measured above, which is a lot to pay during a DEMOTION,
+the one moment the device is already struggling.
+
+**Read the tier through `getEffectiveThreeSettings()` — never `getRenderSettings().three`.**
+`pixelRatioCap` is read twice, by `makeWebGPURenderer` when it allocates the first buffer and by
+Scene3D's `ResizeObserver` on every resize. If one applied the tier and the other read the raw
+setting, the first resize would silently undo it.
+
+**Precedence: player > project pin > iOS model id > allowlist > desktop > calibrating (low).** The player wins
+outright because they can see the screen and we cannot; their choice persists via `PlayerPrefs`
+(behind the `playerTierStore` provider slot, since `rendering/` may not import `storage/`) and
+**stops calibration**, or the engine would override an explicit human decision with an inference.
+
+**Desktops are the one carve-out (`TierSource: 'desktop'`), and it is keyed on `formFactor`, never
+on `platform`.** `DeviceCaps.formFactor` decides `'mobile'` vs `'desktop'` from a POSITIVE desktop
+signal only — a native iOS/Android build is mobile; `navigator.userAgentData.mobile` is believed in
+both directions when the browser reports it; otherwise a fine pointer AND zero touch points reads
+as desktop. It deliberately does not derive from `platform`: `platform` is Capacitor's, so a phone
+browser reports `'web'` exactly like a desktop does, and the demos publish web-only — keying on
+platform would put the demos' entire mobile-web audience back on `high`. Unresolvable cases default
+to `'mobile'`, the safe side: a desktop wrongly called mobile boots low and calibration promotes it
+seconds later, while a phone wrongly called desktop boots high and can lose its context before
+demotion ever fires.
+
+One consequence of `auto` being the default: an unpinned project now awaits `getDeviceCaps()`
+before the first drawing buffer is created, because the knobs a tier clamps — `antialias` above all
+— are baked into that buffer at creation and cannot be applied later.
+
+**`auto` starts LOW (outside the desktop carve-out) and promotes on measured evidence.** The
+failure is asymmetric: booting high and guessing wrong is a lost context and a permanent black
+screen; booting low and guessing wrong costs a beat of uglier rendering. Two rules that are easy to
+get backwards:
+
+- **Demotion is IMMEDIATE, promotion waits for a scene boundary.** A tier switch recompiles
+  shaders; a mid-play promotion can freeze longer than the low tier it escapes, while a deferred
+  demotion leaves a struggling device struggling until a scene load — which for a one-scene game is
+  never. Demotion is also **sticky**: never promote again after one, or the tier oscillates.
+- **Headroom is judged by `cpuMs` while vsync-bound, by `frameMs` only once frames run long.**
+  While vsync-capped, `frameMs` is pinned at the display interval and reports "barely making 60"
+  and "trivially making 60" identically — judging by it would promote a device with no headroom.
+
+**Seeing it:** the resolved tier, its `source`, and a one-line `reason` appear in `diagnose` and in
+the debug menu's **Device tab**, which also has low/high buttons that apply a tier LIVE so a
+low-end look can be authored without owning the phone. The reason is the point — "low" alone is
+unexplainable, and project-pinned / failed-calibration / player-chosen want different responses.
+
+**iOS answers from the MODEL ID and never measures** (owner, 2026-08-09) — `TierSource: 'model'`,
+via `IOS_HIGH_TIER_MIN_GENERATION`. Apple's hardware set is small and the generation is *encoded in
+the identifier*, so `iPhone10,1` sorts against `iPhone14,6` with no lookup; Android's only
+comparable signal is the GPU renderer string, which is ambiguous (one name, two GPUs) and already
+deprecated in Firefox for fingerprinting. That is why one platform gets a table and the other has
+to measure.
+
+It is a **threshold (`>= N`), not a list**, and that is the whole point: an enumerated allowlist
+ossifies in the *worst* direction — a phone that does not exist yet is absent from it, so next
+year's hardware is classified `low` by a table written today. `>=` cannot fail that way, because
+newer Apple silicon is only ever faster. The major number is a real SoC boundary rather than a
+year: `iPhone10,x` is A11, covering the iPhone 8 **and** the iPhone X, which genuinely share the
+chip. Two caveats: the floor value for `iPhone` is inferred (only the A11 side is measured — 27 ms
+→ 56 ms with NPR, missing the budget), the `iPad` value is a straight guess, and the rule is
+**native-only** — mobile Safari reports no model, so iOS *web*, which is how every published demo
+ships, stays on the measured path.
+
+The Android allowlist (`TIER_ALLOWLIST`) ships **empty on purpose**: an unvalidated threshold in
+code is what ossifies. Measured, a Galaxy A23 does not qualify for `high`, so it correctly
+calibrates.
+
+### GPU context loss is recoverable — and bring-up must stay self-contained
+
+A lost GPU context used to be **permanent**: detected, logged, nothing rendered again for the
+process lifetime. That is how a Huawei Y6 2019 died ~4 s into boot with `games/sling` (#121 P1).
+
+**A lost three renderer cannot be revived.** `WebGLBackend` already calls `preventDefault()` on
+`webglcontextlost` (so the browser *will* restore the underlying context) and routes to
+`renderer.onDeviceLost()`, which sets a private `_isDeviceLost` that gates `render()` and is never
+cleared anywhere in three. So recovery means **building a new renderer**, not restoring one.
+
+Detection and policy live in `runtime/core/activeRenderer.ts` — one funnel for both backends, a
+sliding budget (`MAX_RECOVERY_ATTEMPTS` in `RECOVERY_WINDOW_MS`), then abandon loudly. It
+*asks*; it cannot rebuild. Viewports subscribe via `onRendererLost` and rebuild themselves.
+Scheduling (defer out of the loss event, one rebuild at a time, coalesce a loss that lands
+mid-rebuild) is `rendering/rendererRecovery.ts`.
+
+**A rebuild that REJECTS is now retried (#156), not dropped.** It used to be reported and abandoned,
+which was terminal by construction: the only thing that can ask for another attempt is a further
+`onRendererLost`, and once a rebuild has failed there is no live renderer left to lose — so that
+event can never arrive. `rendererRecovery.ts` now retries bring-up itself, bounded by
+`DEFAULT_MAX_REBUILD_ATTEMPTS` (3) with a doubling backoff (250ms, then 500ms, then 1000ms) on the
+theory that a rejection moments after a loss usually means the driver is still resetting. **This is
+a separate budget from `activeRenderer`'s `MAX_RECOVERY_ATTEMPTS`** — that one counts context
+*losses*; this one counts bring-up *rejections* — and the two must not be conflated. `onError` now
+receives `(e, { description, attempt, willRetry })` so a viewport can say "retrying" instead of
+announcing a permanent black screen a retry may be about to disprove. `description` comes from the
+new exported `describeRebuildFailure`: the observed symptom was a rejection logging as `{}`, and the
+device console capture already special-cases `instanceof Error` (it would have sent the stack), so
+an empty `{}` proves the rejection was a non-Error object with no enumerable properties, not a
+serialization bug. Evidence for the retry: a Huawei Y6 2019 lost its context **during boot** (every
+prior validation here was steady-state loss on a settled scene) and, without the retry, stayed blank
+for the process lifetime.
+
+**THE INVARIANT: a viewport's bring-up must stay self-contained.** Recovery works because
+everything built against the renderer — scene, cameras, render state, particles, the post-FX
+stack, the frame callback, and the capture/bounds/broker registrations — is created inside one
+bring-up closure and torn down by one cleanup, so a rebuild is `teardown(); bringUp();` and
+re-points nothing. Hoist anything renderer-touching *out* of that closure and recovery silently
+breaks. Three consequences that are easy to get wrong:
+
+- **Teardown runs against a DEAD context**, so every step is individually guarded. Unguarded, one
+  throw skips the rest and the rebuild double-registers on top of the leftovers.
+- **`RendererLostInfo.renderer` says WHICH renderer died** — the notification is a broadcast and
+  the editor mounts two viewports. Compare by identity and ignore a loss that is not yours, or you
+  tear down a healthy renderer in sympathy.
+- **A render-on-demand viewport must be re-marked dirty after a rebuild**, or it completes
+  recovery and stays black until the user nudges the camera — indistinguishable from failure.
+  `SceneView`'s dirty gate is created at mount, so a rebuild inherits it already spent.
+
+**It is a re-UPLOAD, not a re-download.** Bring-up never calls `loadScene`; it rebuilds the three
+objects from the ECS world through the scene-scoped caches (the same path a world swap uses), so
+the cached `BufferGeometry`/`Texture` objects simply re-upload to the new device. Measured: after
+a rebuild the new renderer drew the real scene at 68 draw calls / 137,443 triangles with 41
+geometries + 39 textures resident on it.
+
+**Recovery is a visible hitch, not seamless** — shader prewarm re-runs. Measured **~316 ms**
+(iPhone 8 / WebGL2) and **~235 ms** (Galaxy A23). That is the honest cost behind the `warn` log's
+"expect a visible hitch", and it is the right trade against a permanently black surface.
+
+**Testing it:** on a WebGL backend, `canvas.getContext('webgl2').getExtension('WEBGL_lose_context')
+.loseContext()` produces a genuinely dead context. On a **WebGPU** backend you cannot easily force
+one — the only way to kill the device is `device.destroy()`, and that reports
+`reason: 'destroyed'`, which the detection layer deliberately filters as orderly teardown. So a
+WebGPU device is best exercised by dispatching a synthetic `webglcontextlost` on the canvas, which
+drives the same rebuild path but is not a real loss.
+
+⚠️ **Do not "simplify" the two detection paths into three's single `renderer.onDeviceLost(info)`
+hook without preserving the false-positive filters.** Unifying them is a real and worthwhile
+simplification, but those two filters (superseded-renderer, and `reason === 'destroyed'`) were
+paid for by shipping a diagnostic that declared a healthy 61 fps editor dead. They are the
+acceptance criteria for any such refactor.
+
 ### No custom GLSL
 
 Materials are standard Three.js materials (`MeshStandardMaterial`, GLB-imported materials, etc.). `WebGPURenderer` auto-converts them to TSL/WGSL — there is no hand-written shader source in the standard render path. The NPR post-process is the one place that authors node graphs, and it does so through TSL (plus one small raw-WGSL `wgslFn` for FXAA).
@@ -401,8 +735,26 @@ All 3D post-processing runs through **one composable chain**, `rendering/postfx/
 Effects are **not** mutually exclusive: `NPRPostFX` + `BloomPostFX` + `VignettePostFX` +
 `DepthOfFieldPostFX` + `AmbientOcclusionPostFX` can all be on at once. (Before the stack landed,
 `Scene3D` had two exclusive branches and "NPR wins, bloom is skipped" — that is gone.)
-**WebGPU-only**; on a WebGL2 fallback every effect is skipped and the render falls through to a
-plain `renderer.render`.
+**Runs on WebGL2 as well as WebGPU — every stage except FXAA.** (This doc long claimed the
+opposite: "WebGPU-only; on a WebGL2 fallback every effect is skipped". That was wrong, and an
+iPhone 8 on iOS 16.7 — no WebGPU whatsoever — visibly rendering the `postfx-demo` stack is what
+caught it.) `createRenderer` (`scene3DSync.ts`) ALWAYS constructs a `WebGPURenderer`
+(`preferWebGPU` is vestigial — `void preferWebGPU`), and three falls back to a **WebGL2 backend
+inside that same class**. The stack's gate is `isWebGPURenderer === true` (`Scene3D.tsx`), which
+stays true on that fallback, so the chain builds and renders normally. The ONE stage dropped is
+**FXAA** — `planFxaaEnabled` returns false when `isWebGLBackend` (`postfx/stackPlan.ts`), since
+it's a raw-WGSL `wgslFn` the WebGL backend's GLSL parser cannot compile.
+
+⚠️ **`isWebGPU` names the renderer CLASS, not the API in use.** To branch on the actual backend,
+read `renderer.backend.isWebGLBackend` — that is the distinction the wrong claim above rested on.
+To **report** it (a label, a caps payload, a HUD), call **`readRendererBackend(renderer)`**
+(`runtime/core/activeRenderer.ts`), the single place that decides — `deviceCaps.backend` and the
+profiler's `readRenderer` both go through it, so the two labels cannot disagree. Both derived it
+from the class flag independently until #147, and both were therefore unable to report `'WebGL'`
+at all: an iPhone 8 with no adapter reported `backend: 'WebGPU'` next to `webgpu: false` in the
+same payload. `Scene3D.tsx` reads `isWebGLBackend` directly because it is *branching* (planning
+FXAA away), not labelling — that stays correct, and its `isWebGPU` gate is deliberately the CLASS,
+since the post-FX stack needs the node pipeline, which runs on both backends.
 
 ```
 scenePass  ── MRT: { output, [normal], [lineColor] }   + depth (free)
@@ -592,8 +944,8 @@ The reload is now decided **by path on the dev server**: `isShaderGraphFile` (`e
 ## Bloom Post-Process
 
 A reusable whole-scene HDR bloom, added for `demos/particle-demo`'s dark-VFX showreel but not
-specific to it — any 3D scene can add the trait. **WebGPU-only**, off by default, toggled by the
-`BloomPostFX` ECS trait. It is a **stage of the post-FX stack**, so it composes with NPR,
+specific to it — any 3D scene can add the trait. Off by default, toggled by the
+`BloomPostFX` ECS trait (and it renders on the WebGL2 backend too — see the stack's gate above). It is a **stage of the post-FX stack**, so it composes with NPR,
 vignette and DOF rather than being an alternative to them.
 
 ### Control trait — `runtime/traits/BloomPostFX.ts`
@@ -622,8 +974,9 @@ bloom still sees them.
 
 - **NPR + bloom compose.** Bloom operates on the working-space stylized color, so a stylized scene
   gets a real glow. (This was the exclusivity the post-FX stack existed to remove.)
-- **WebGL fallback**: gated on `isWebGPU`; on a WebGL2 fallback the render falls through to the
-  plain path (no bloom, no error).
+- **WebGL fallback**: gated on `isWebGPU`, which is the renderer CLASS and stays true on the
+  WebGL2 backend — so bloom still renders there. (This bullet used to say the render "falls
+  through to the plain path (no bloom, no error)". Wrong — see the stack's gate above.)
 - Same shader-HMR / prewarm-race caveats as NPR (see above) — TSL bakes into WGSL, so the stack is
   disposed on camera-projection swap and never hot-reloaded in place; editing anything under
   `postfx/` forces a full reload from the dev server.
@@ -632,7 +985,8 @@ bloom still sees them.
 
 Two more stack stages, each with its own singleton trait
 (`VignettePostFX` `{enabled, intensity, smoothness}`, `DepthOfFieldPostFX`
-`{enabled, focusDistance, focalLength, bokehScale}`), both WebGPU-only and off by default.
+`{enabled, focusDistance, focalLength, bokehScale}`), both off by default and, like every stack
+stage bar FXAA, working on the WebGL2 backend too (see the stack's gate above).
 
 - **Vignette** uses `vignette()` from `three/examples/jsm/tsl/display/CRT.js`, which is a bare TSL
   `Fn`, **not** a Node class — so the stage must pass `uniform()` nodes for `intensity`/
@@ -644,7 +998,8 @@ Two more stack stages, each with its own singleton trait
 
 ## Ambient Occlusion (GTAO)
 
-`AmbientOcclusionPostFX` `{enabled, radius, intensity}`, WebGPU-only, off by default. Uses
+`AmbientOcclusionPostFX` `{enabled, radius, intensity}`, off by default, WebGL2 backend included
+(see the stack's gate above). Uses
 `ao(depthNode, normalNode, camera)` from `three/examples/jsm/tsl/display/GTAONode.js`, which
 returns a `GTAONode`; its output texture's `.r` (raw 0..1 occlusion) is lerped toward `1` by
 `intensity` (GTAO has no strength knob of its own) and multiplied into the incoming color.
@@ -741,6 +1096,8 @@ Reclaiming only when both clear stops mount/unmount churn from leaking slots AND
 - **Layout** — `text/layoutText.ts` (`layoutText`) is pure + headless: a string + a synchronous glyph source → positioned textured quads in px, Y-down, block-local space (origin = top-left of the text box). Handles hard `\n` breaks + greedy word wrap (`maxWidth`), per-line kerning, `align` (left/center/right), `lineSpacing`, `letterSpacing`, and a fallback advance for a not-yet-generated glyph. Each quad carries its atlas `page`, so the geometry builder groups quads by page. It's the single geometry source BOTH text paths feed.
 - **Shader** — `text/mtsdfPixiShader.ts` (`makeMtsdfPixiShader`) composes Pixi's own high-shader BITS (`localUniformBit` transform, `textureBit` atlas sampler, `roundPixelsBit`) with ONE custom `mtsdfBit` that overrides the fragment colour — reusing Pixi's per-backend transform boilerplate and shipping BOTH WGSL and GLSL programs (Pixi v8 is WebGPU-preferred). The fragment maths mirrors the 3D TSL graph 1:1: median (sharp) fill, outline via the median, alpha-SDF glow, offset-sample shadow, `screenPxRange` AA via `fwidth`, composited straight-alpha. Style uniforms (`weight` / outline / glow / shadow) update in place (`updateMtsdfPixiStyle`); a per-glyph `aTextColor` vertex attribute (for rainbow/fade colour animation) premultiplies onto Pixi's built-in `vColor`.
 - **The default font is ENGINE-provided** — `DEFAULT_FONT_GUID` (`runtime/assets/builtinAssets.ts`, exported from `@modoki/engine/runtime`) is the engine's Arimo, baked mtsdf/ascii. A game does NOT need a font in its own assets to render `Text2D`; point `Text2D.font` at that GUID. It exists because fonts are otherwise referenced by CSS **family name** and stay guid-less — the asset scanner deliberately skips GUID healing for them — while a `Text2D` ref must be a GUID, so before it, getting MSDF text meant copying a font into the project (Court shipped a byte-identical 500 KB duplicate for exactly this reason, #52). It is the one engine font with a committed `.meta.json`; the other bundled families stay family-name-only, and the tree-shaker keeps a font only if something names it (measured: Court's build keeps **1 of 9** engine font files). A code-only reference still needs an `asset-keep.json` entry — the path is under `/modoki/assets/`, which is keep-listable like any project path.
+- **⚠️ The GLSL program declares `OES_standard_derivatives`, and WHERE it declares it is load-bearing.** Pixi's high-shader assembly emits **version-less (GLSL ES 1.00)** source — it only takes the ES 3.00 path when the source literally contains `#version 300 es` (`GlProgram`: `indexOf('#version 300 es')`). In ES 1.00 the `screenPxRange` line's `fwidth` is illegal without the extension declared, so every MTSDF program failed to compile on iOS 15 (`ERROR: 'GL_OES_standard_derivatives' : extension is disabled`) and **every glyph silently vanished**. Not a capability gap — WebGL2 and the extension are both present; desktop and Android drivers simply accept `fwidth` in ES 1.00 source anyway, so only Apple's stricter compiler rejects it, which is why it hid on every machine we test on. The directive **must precede `precision`**: measured on-device, a pragma placed in this file's `fragment.header` bit (where Pixi injects it, i.e. *after* the precision line) fails just as loudly with `extension directive must occur before any non-preprocessor tokens`. Hence `withDerivativesExtension` rewrites the ASSEMBLED source instead. `enable`, not `require`, so a device lacking it degrades to a warning; not switched to `#version 300 es`, which would hard-fail a genuinely WebGL1-only device.
+- **A baked font's SOURCE file is not always shipped.** `Text2D` needs only `~atlas.png` + `~metrics.json`; the `.ttf` ships only when a DOM consumer names the family. See [build.md](./build.md) § "Converted assets" — including the blind spot where a CSS-named family needs `shipSource: 'always'`.
 - **Per-page meshes + dynamic packing** — one Pixi `Mesh` per atlas PAGE the text touches (a dynamic CJK provider spills glyphs across pages; a baked / single-page font is one mesh), all children of the slot `Container` so the anchor pivot + transform apply to the whole block. Geometry rebuilds only when the layout hash changes (text/font/size/wrap/spacing/`atlasVersion`); the shader updates only on a style-hash change; placement writes only when the transform moves. Atlas textures are FONT-owned (freed on scene teardown), never disposed by the slot. Per-glyph animation recomputes page positions from the base quads each frame while the sim runs (frozen when stopped, like skeletal animation).
 
 ## Shipped web build: canvas sizing (`rendering.web.sizeMode`)

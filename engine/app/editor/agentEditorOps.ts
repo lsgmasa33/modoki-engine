@@ -17,17 +17,18 @@
 
 import * as THREE from 'three';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor, inferAssetDefType } from '../debug/agentBridge';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
 import { getGameBootFaults } from './gameBootFaults';
-import { handleEval } from '../debug/bridgeHelpers';
+import { handleEval, clampEvalTimeout, EVAL_ASYNC_TIMEOUT_MS, EDITOR_EVAL_MAX_TIMEOUT_MS } from '../debug/bridgeHelpers';
 import { makeEvalApi } from './evalApi';
 import {
   useEditorStore, type SelectedAsset,
   enterPlay, stopPlay, pausePlay,
   undo, redo, canUndo, canRedo, undoLabel, redoLabel, getEditVersion,
-  loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses, isEditingPrefab,
+  loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses,
+  isEditingPrefab, openPrefabForEditing, savePrefabEdit, exitPrefabEditing,
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, reparentEntity, ensureGuid, type TraitSpec,
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
@@ -207,6 +208,12 @@ function readViewport() {
 
 interface SetSelectionParams { entityId?: number | null; entityIds?: number[]; guid?: string; guids?: string[]; asset?: SelectedAsset | null }
 interface CreateEntityParams { spec: CreateEntitySpec; parentId?: number; parentGuid?: string }
+/** The prefab operations. The three `edit-*` actions drive PREFAB-EDIT MODE — opening a
+ *  `.prefab.json` in isolation, saving the edited template back, and returning to the scene
+ *  it was opened from. They are the only route that re-serializes a prefab file, which is why
+ *  the bulk re-save sweep (#125, engine/scripts/resave-prefabs.sh) is built on them. */
+type PrefabAction = 'instantiate' | 'create' | 'detach' | 'edit-open' | 'edit-save' | 'edit-exit';
+
 interface PrefabParams {
   /** Which prefab operation. Callers reaching this op DIRECTLY (`runAgentOp`, `modoki_eval`) may
    *  use `action`; anything arriving via `POST /api/editor-action` MUST use `prefabAction`.
@@ -216,10 +223,12 @@ interface PrefabParams {
    *  unreachable through it — and `modoki_prefab`, which spread its args over the routing key,
    *  sent `action:'instantiate'` as the op name and got a 400 listing the valid ops. Every
    *  prefab call through the MCP failed that way. */
-  prefabAction?: 'instantiate' | 'create' | 'detach';
-  action?: 'instantiate' | 'create' | 'detach';
-  /** instantiate: prefab asset path. create: source path to write. */
+  prefabAction?: PrefabAction;
+  action?: PrefabAction;
+  /** instantiate / edit-open: prefab asset path. create: destination path to write. */
   path?: string;
+  /** edit-open: discard unsaved live work instead of refusing (mirrors load-scene). */
+  force?: boolean;
   /** instantiate: parent entity id (default root). */
   parentId?: number;
   /** instantiate: parent entity guid (stable; wins over parentId). */
@@ -675,11 +684,25 @@ export function registerEditorAgentOps(): void {
   // window.innerWidth, devicePixelRatio, dispatching a bridge event) without a raw CDP client.
   // Editor-only: this whole module is stripped from shipped game builds.
   // Registered UNWRAPPED (_registerAgentOp) on purpose. The shadow above holds ambient
-  // actor='agent' for a handler's whole lifetime, and an eval body runs for an UNBOUNDED
-  // time — it can loop, await, or call modoki.waitForEdit() and park for two minutes. Holding
-  // the ambient actor across that would tag every concurrent HUMAN edit as 'agent'. Attribution
-  // is instead applied PER CALL inside makeEvalApi(), which is both accurate and bounded.
-  _registerAgentOp('eval', (params) => handleEval(((params ?? {}) as { code?: string }).code ?? '', makeEvalApi()));
+  // actor='agent' for a handler's whole lifetime, and an eval body runs LONG — it can loop, await,
+  // or call modoki.waitForEdit() and park. Holding the ambient actor across that would tag every
+  // concurrent HUMAN edit as 'agent'. Attribution is instead applied PER CALL inside makeEvalApi(),
+  // which is both accurate and bounded.
+  //
+  // `timeoutMs` bounds the WHOLE body (since #145 made `await` parse, the body is what runs), not
+  // just a returned promise. The route sizes the relay deadline from the same number — see
+  // `/api/eval` in editorBackendRouter.ts; the two must stay ordered or the relay wins the race
+  // and reports a dead backend instead of this op's own message.
+  //
+  // ⚠️ "UNBOUNDED … park for two minutes", as this comment used to read, was never true and is
+  // still not. An eval body has ALWAYS been raced against a deadline; what changed is that the
+  // deadline is now reachable and adjustable. The ceiling is EDITOR_EVAL_MAX_TIMEOUT_MS (25s), so a
+  // `modoki.waitForEdit({timeoutMs: 120_000})` nested in an eval CANNOT run its full park — budget
+  // the inner op under the outer one, or call waitForEdit as its own tool.
+  _registerAgentOp('eval', (params) => {
+    const p = (params ?? {}) as { code?: string; timeoutMs?: unknown };
+    return handleEval(p.code ?? '', makeEvalApi(), clampEvalTimeout(p.timeoutMs, EVAL_ASYNC_TIMEOUT_MS, EDITOR_EVAL_MAX_TIMEOUT_MS));
+  });
 
   // Discovery for `eval`: lists the generated `modoki` scripting surface (op list + camelCase
   // method names + the fixed call/ops/api/composite helpers) so an agent never has to read
@@ -1305,8 +1328,71 @@ export function registerEditorAgentOps(): void {
       });
       return { ok: true, detached: snapshot.length, saved: false };
     }
+    // ── Prefab-edit mode (#125) ──
+    // The only path that re-SERIALIZES an existing .prefab.json. `create` writes a prefab FROM a
+    // scene entity; these open the template itself in an isolated synthetic world, so a save
+    // round-trips the file through the current serializer. That is what makes a bulk format
+    // migration possible (engine/scripts/resave-prefabs.sh) — and what makes an agent able to
+    // edit a prefab at all without instantiating, mutating and re-applying it.
+    if (which === 'edit-open') {
+      if (!p.path) throw new Error("prefab edit-open requires { path } — the prefab's served path, e.g. '/assets/prefabs/tree.prefab.json'.");
+      // Opening SWAPS the world exactly as load-scene does, so it destroys unsaved live work the
+      // same way and must refuse for the same reason. It additionally SAVES the current scene on
+      // the way in (prefabEdit.ts does this deliberately, so the return trip's reload-from-disk
+      // is non-destructive) — which is a write the caller should not discover afterwards.
+      guardUnsaved('prefab edit-open', p.force);
+      const scenePathBefore = getCurrentScenePath();
+      const name = p.path.split('/').pop()?.replace(/\.prefab\.json$/, '') ?? p.path;
+      await openPrefabForEditing({ path: p.path, name });
+      // openPrefabForEditing reports failure by console.error + early return (it is a UI path).
+      // An agent needs it to FAIL, not to report ok:true having done nothing — a bad path would
+      // otherwise leave the editor in the previous scene and the next edit-save would write the
+      // WRONG prefab, or nothing at all.
+      const editing = useEditorStore.getState().editingPrefab;
+      if (!editing || !isEditingPrefab()) {
+        throw new Error(
+          `prefab edit-open FAILED for ${p.path} — the editor is not in prefab-edit mode. The file was ` +
+          'not fetched or not parseable as a prefab (check the served path exists and is a .prefab.json). ' +
+          'See the editor console for the [PrefabEdit] error.',
+        );
+      }
+      return {
+        ok: true,
+        editing: { path: editing.path, guid: editing.guid, name: editing.name },
+        /** The scene saved + remembered on the way in; 'edit-exit' reloads it. */
+        returnScene: scenePathBefore,
+        savedReturnScene: scenePathBefore != null,
+        ...readEditorState(),
+      };
+    }
+    if (which === 'edit-save') {
+      if (!isEditingPrefab()) {
+        throw new Error(
+          "prefab edit-save: the editor is NOT in prefab-edit mode, so there is no prefab to write. " +
+          "Open one first (prefabAction:'edit-open' with the .prefab.json path).",
+        );
+      }
+      const editing = useEditorStore.getState().editingPrefab!;
+      const ok = await savePrefabEdit();
+      if (!ok) {
+        throw new Error(
+          `prefab edit-save FAILED for ${editing.path} — NOTHING was written. Either the prefab root ` +
+          'was not found in the edit world, serialization produced no prefab, or the file write was ' +
+          'rejected. See the editor console for the [PrefabEdit] error.',
+        );
+      }
+      return { ok: true, path: editing.path, guid: editing.guid, saved: true };
+    }
+    if (which === 'edit-exit') {
+      // Report not-editing rather than throwing: leaving a mode you are not in is a legitimate
+      // no-op, and an agent recovering from a failed edit-save should be able to call it blindly.
+      if (!isEditingPrefab()) return { ok: true, wasEditing: false, ...readEditorState() };
+      const returned = await exitPrefabEditing();
+      return { ok: true, wasEditing: true, returnedTo: returned, ...readEditorState() };
+    }
     throw new Error(
       `unknown prefab action '${which}' — pass prefabAction: 'instantiate' | 'create' | 'detach' ` +
+      "| 'edit-open' | 'edit-save' | 'edit-exit' " +
       "(the name is `prefabAction`, not `action`: /api/editor-action spends `action` on the op name).",
     );
   });
@@ -1448,15 +1534,17 @@ export function registerEditorAgentOps(): void {
         : p.trackType === 'signal' ? { ...base, type: 'signal', markers: [] }
         : p.trackType === 'audio' ? { ...base, type: 'audio', cues: [] }
         : p.trackType === 'control' ? { ...base, type: 'control', clips: [] }
+        : p.trackType === 'video' ? { ...base, type: 'video', clips: [] }
         : { ...base, type: 'activation', spans: [] }) as TrackDef;
       clone.tracks.push(track);
     }
     // Push the item into the track's per-kind array.
-    const arrKey = p.trackType === 'animation' || p.trackType === 'control' ? 'clips' : p.trackType === 'signal' ? 'markers' : p.trackType === 'audio' ? 'cues' : 'spans';
+    const arrKey = p.trackType === 'animation' || p.trackType === 'control' || p.trackType === 'video' ? 'clips' : p.trackType === 'signal' ? 'markers' : p.trackType === 'audio' ? 'cues' : 'spans';
     if (track.type === 'animation') track.clips.push(p.item as unknown as (typeof track.clips)[number]);
     else if (track.type === 'signal') track.markers.push(p.item as unknown as (typeof track.markers)[number]);
     else if (track.type === 'audio') track.cues.push(p.item as unknown as (typeof track.cues)[number]);
     else if (track.type === 'control') track.clips.push(p.item as unknown as (typeof track.clips)[number]);
+    else if (track.type === 'video') track.clips.push(p.item as unknown as (typeof track.clips)[number]);
     else track.spans.push(p.item as unknown as (typeof track.spans)[number]);
     const wantCount = (track as unknown as Record<string, unknown[]>)[arrKey].length;
     const norm = normalizeTimeline(clone);
@@ -1465,7 +1553,7 @@ export function registerEditorAgentOps(): void {
     const normTrack = norm.tracks.find((t) => t.type === p.trackType && (t.target ?? '') === target);
     const gotCount = normTrack ? (normTrack as unknown as Record<string, unknown[]>)[arrKey].length : 0;
     if (gotCount < wantCount) {
-      throw new Error('timeline-add-clip: item rejected by normalization — malformed for a ' + p.trackType + ' track (need: animation clip name non-empty · signal action non-empty · audio clip GUID non-empty · activation end > start · control prefab GUID non-empty OR particle:true OR subdirector:true)');
+      throw new Error('timeline-add-clip: item rejected by normalization — malformed for a ' + p.trackType + ' track (need: animation clip name non-empty · signal action non-empty · audio clip GUID non-empty · activation end > start · control prefab GUID non-empty OR particle:true OR subdirector:true \u00b7 video clip GUID non-empty)');
     }
     const tlClipPath = String(p.timelinePath);
     const applyTlClip = (t: typeof norm) => useEditorStore.getState().applyTimelineDoc(tlClipPath, t);
@@ -1534,17 +1622,6 @@ export function registerEditorAgentOps(): void {
   });
 }
 
-/** Guess an asset-def kind from its filename. The three write ops each take a fixed type, so the
- *  read one is the only place that has to work it out — and the suffixes are the project's own
- *  convention (`docs/doc-conventions.md`), not a heuristic. */
-function inferAssetDefType(path: string): 'particle' | 'animation' | 'timeline' | 'spriteanim' | 'rig2d' | null {
-  if (path.endsWith('.particle.json')) return 'particle';
-  if (path.endsWith('.anim.json')) return 'animation';
-  if (path.endsWith('.timeline.json')) return 'timeline';
-  if (path.endsWith('.spriteanim.json')) return 'spriteanim';
-  if (path.endsWith('.rig2d.json')) return 'rig2d';
-  return null;
-}
 
 /** Park an asset edit in the dirty-asset registry. Applied LIVE by the caller; reaches disk only
  *  via `save-all`.

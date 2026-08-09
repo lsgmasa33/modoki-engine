@@ -16,7 +16,7 @@ import type { BuildModules, ModuleKey } from '../project-config';
 
 export type { ModuleKey };
 
-export const MODULE_KEYS: ModuleKey[] = ['render3d', 'render2d', 'physics2d', 'physics3d', 'npr', 'gpuParticles'];
+export const MODULE_KEYS: ModuleKey[] = ['render3d', 'render2d', 'physics2d', 'physics3d', 'npr', 'gpuParticles', 'video'];
 
 /** Which module a trait name implies. Matched against the trait keys present on
  *  any entity in any included scene. Intentionally BROAD — a false-positive
@@ -30,6 +30,10 @@ const TRAIT_TO_MODULE: Record<string, ModuleKey> = {
   // zones-only game must still strip Rapier.
   RigidBody2D: 'physics2d', Collider2D: 'physics2d', CharacterController2D: 'physics2d',
   RigidBody3D: 'physics3d', Collider3D: 'physics3d', CharacterController3D: 'physics3d',
+  // A video always reaches a surface through a VideoPlayer — a 2D sprite or a 3D screen showing
+  // one still needs the trait to have an element at all, and so does a Timeline video track's
+  // target. So this single signal covers every video path.
+  VideoPlayer: 'video',
 };
 
 export interface DetectResult {
@@ -41,7 +45,7 @@ export interface DetectResult {
 
 /** All resolved module flags default off; a scan flips the used ones on. */
 function emptyFlags(): Record<ModuleKey, boolean> {
-  return { render3d: false, render2d: false, physics2d: false, physics3d: false, npr: false, gpuParticles: false };
+  return { render3d: false, render2d: false, physics2d: false, physics3d: false, npr: false, gpuParticles: false, video: false };
 }
 
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'ios', 'android', '.git']);
@@ -111,6 +115,12 @@ export function detectModules(projectRoot: string): DetectResult {
   return { used, scenesScanned: files.length };
 }
 
+/** Modules whose `'auto'` resolves to OFF on a `--target playable` build regardless of what the
+ *  scenes use. A playable is a ≤5 MB single-file MRAID bundle, so a module that ships a media
+ *  payload has to be opted INTO rather than detected into. An explicit `true` still wins — the
+ *  capability is defaulted off, not removed (a 400 KB stinger is legitimate). */
+const PLAYABLE_AUTO_OFF: ReadonlySet<ModuleKey> = new Set<ModuleKey>(['video']);
+
 /** Combine a project's `build.modules` config with an 'auto' scan into concrete
  *  booleans for the `__MODOKI_MODULE_*__` defines. `projectRoot` null (the
  *  project-less editor build / dev) → everything on (the editor needs all SDKs).
@@ -118,9 +128,10 @@ export function detectModules(projectRoot: string): DetectResult {
 export function resolveModules(
   modules: BuildModules,
   projectRoot: string | null,
+  opts: { playable?: boolean } = {},
 ): Record<ModuleKey, boolean> {
   if (!projectRoot) {
-    return { render3d: true, render2d: true, physics2d: true, physics3d: true, npr: true, gpuParticles: true };
+    return { render3d: true, render2d: true, physics2d: true, physics3d: true, npr: true, gpuParticles: true, video: true };
   }
 
   const detect = detectModules(projectRoot);
@@ -128,7 +139,7 @@ export function resolveModules(
   for (const key of MODULE_KEYS) {
     const cfg = modules[key] ?? 'auto';
     if (cfg === 'auto') {
-      out[key] = detect.used[key];
+      out[key] = opts.playable && PLAYABLE_AUTO_OFF.has(key) ? false : detect.used[key];
     } else {
       out[key] = cfg;
       if (cfg === false && detect.used[key]) {

@@ -18,7 +18,8 @@ import { entityRef } from '../undo/entityRef';
 import type { UndoAction } from '../undo/undoManager';
 import { registerAsset } from '../../runtime/loaders/assetManifest';
 import { firstAssetRoot } from './assetRoots';
-import { pastePathIn, type AssetEntry } from '../utils/assetPaths';
+import { pastePathIn, splitAssetPath, type AssetEntry } from '../utils/assetPaths';
+import { isTextAsset } from './assetUndo';
 
 // ── Re-import / import planning (pure — unit-testable without IO) ─────
 
@@ -85,6 +86,65 @@ export function planImports(
     taken.add(dest);
     return { name, dest, convert: CONVERTIBLE_RE.test(dest) };
   });
+}
+
+// ── Delete / rename policy (pure — the IO lives in the panel) ─────────
+
+/** Every path a delete of `assetPath` must remove, in restore order.
+ *
+ *  This is the sidecar rule, and it has already been wrong once: the `.meta.json`
+ *  of a binary asset used to be snapshotted for undo but never trashed, leaving an
+ *  orphaned sidecar on disk after every binary/model delete. Extracted from
+ *  `Assets.tsx`'s `collectDeletion` (#105 Phase 3) so the rule is checkable without
+ *  standing up fetch + the backend.
+ *
+ *  - The asset itself always goes first, so an undo restores in the original order.
+ *  - A BINARY asset also drops its `.meta.json` (GUID + import settings — both
+ *    dangle if lost across a delete/undo). Text assets carry their id inline and
+ *    have no sidecar.
+ *  - A MODEL additionally drops everything it generated (meshes / materials /
+ *    textures) and each generated BINARY file's own sidecar.
+ *
+ *  The backend skips paths that no longer exist, so listing a maybe-absent sidecar
+ *  is harmless — which is why this can be a pure list rather than an existence
+ *  check per path. */
+export function deletionPathsFor(
+  assetPath: string,
+  assetType: string,
+  generated?: { meshes?: string[]; materials?: string[]; textures?: string[] } | null,
+): string[] {
+  const paths: string[] = [assetPath];
+  if (!isTextAsset(assetPath)) paths.push(assetPath + '.meta.json');
+  if (assetType === 'model' && generated) {
+    for (const f of [...(generated.meshes ?? []), ...(generated.materials ?? []), ...(generated.textures ?? [])]) {
+      paths.push(f);
+      if (!isTextAsset(f)) paths.push(f + '.meta.json');
+    }
+  }
+  return paths;
+}
+
+/** Decide what a rename means, without performing it.
+ *
+ *  Returns the destination path, or a REASON it is refused — the panel logs and
+ *  bails on each. Slashes are replaced rather than rejected so a pasted path
+ *  cannot silently relocate the asset out of its folder. */
+export type RenamePlan =
+  | { ok: true; toPath: string; base: string }
+  | { ok: false; reason: 'empty' | 'unchanged' | 'exists'; toPath?: string };
+
+export function planRename(
+  assetPath: string,
+  newBase: string,
+  existingPaths: ReadonlyArray<string>,
+): RenamePlan {
+  const { dir, base, ext } = splitAssetPath(assetPath);
+  const safe = newBase.trim().replace(/[/\\]/g, '_');
+  if (!safe) return { ok: false, reason: 'empty' };
+  if (safe === base) return { ok: false, reason: 'unchanged' };
+  const toPath = `${dir}/${safe}${ext}`;
+  if (existingPaths.includes(toPath)) return { ok: false, reason: 'exists', toPath };
+  return { ok: true, toPath, base: safe };
 }
 
 // ── Backend-IO wrappers (shared by Assets + Hierarchy) ───────────────

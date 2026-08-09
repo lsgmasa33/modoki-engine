@@ -85,19 +85,16 @@ const ALLOWED: { file: string; why: string }[] = [];
 const PENDING_MIGRATION: { file: string; note: string; guids: string[] }[] = [
   {
     file: 'games/court/runtime/systems.ts',
-    note: 'PIECE_ICON (5 chess-piece textures) + CIVILIAN_ICON, plus the engine builtin font via '
-      + 'the imported DEFAULT_FONT_GUID identifier. The motivating case: Court is code-spawned, so '
-      + 'nothing authors any of these. Target: a CourtAssets resource trait beside CourtConfig. '
-      + 'The font matters most — a dropped font takes its BAKED MTSDF atlas with it, i.e. no text '
-      + 'at all in the built game.',
+    note: 'The engine builtin font, via the imported DEFAULT_FONT_GUID identifier — an ENGINE '
+      + 'asset reached through an engine constant, so there is no project trait that would '
+      + 'naturally hold it. It matters most of the three that were here: a dropped font takes its '
+      + 'BAKED MTSDF atlas with it, i.e. no text at all in the built game. '
+      + '(PIECE_ICON + CIVILIAN_ICON were migrated 2026-08-05 onto CourtConfig — pieceIconK..N and '
+      + 'civilianIcon, authored in the scene — which also let their asset-keep.json entries go. '
+      + 'The original note proposed a separate CourtAssets trait; CourtConfig already had the same '
+      + 'shape for heartFullTexture/handIcon, so a second trait would have split one concern.)',
     guids: [
       'beef0000-0000-4000-8000-000000000002',
-      'a026fcb5-eceb-463c-8afb-feed81965326',
-      '9f90775e-14d0-4de9-9951-5127e2aedb43',
-      '6cec437e-bf08-4aec-aa0c-ae147dc7d775',
-      'a309b8ca-7e66-4f67-a6d3-56dfe6a6e14d',
-      '55bffb89-1530-460b-9305-a902c8f5c41a',
-      '58b10e31-2e88-4ac7-9f07-df90db635188',
     ],
   },
   {

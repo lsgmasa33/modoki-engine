@@ -43,6 +43,7 @@ declare const __MODOKI_MODULE_PHYSICS2D__: boolean;
 declare const __MODOKI_MODULE_PHYSICS3D__: boolean;
 declare const __MODOKI_MODULE_NPR__: boolean;
 declare const __MODOKI_MODULE_GPU_PARTICLES__: boolean;
+declare const __MODOKI_MODULE_VIDEO__: boolean;
 
 /** Playable (Phase 5) — build-time flags: whether this is a single-file `playable` ad
  *  build (`VITE_PLAYABLE=1`), and the store URL its CTA routes to via `mraid.open`. False/''

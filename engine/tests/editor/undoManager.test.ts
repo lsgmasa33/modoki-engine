@@ -2,7 +2,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { pushAction, undo, redo, canUndo, canRedo, undoLabel, redoLabel, clearHistory } from '@modoki/engine/editor';
-import { getCurrentWorld } from '@modoki/engine/runtime';
+import { getCurrentWorld, spawnEntity } from '@modoki/engine/runtime';
 import { Transform, Renderable3D } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { getTraitByName } from '@modoki/engine/runtime';
@@ -97,7 +97,7 @@ describe('writeTraitFieldWithUndo', () => {
   beforeEach(() => clearHistory());
 
   it('writes value and creates undo entry', () => {
-    const entity = getCurrentWorld().spawn(
+    const entity = spawnEntity(getCurrentWorld(), 
       Transform({ x: 10, y: 0, z: 0 }),
       Renderable3D({ mesh: 'undo-test' }),
     );
@@ -112,7 +112,7 @@ describe('writeTraitFieldWithUndo', () => {
   });
 
   it('undo restores old value', async () => {
-    const entity = getCurrentWorld().spawn(
+    const entity = spawnEntity(getCurrentWorld(), 
       Transform({ x: 5, y: 0, z: 0 }),
     );
 
@@ -125,7 +125,7 @@ describe('writeTraitFieldWithUndo', () => {
   });
 
   it('redo re-applies value', async () => {
-    const entity = getCurrentWorld().spawn(
+    const entity = spawnEntity(getCurrentWorld(), 
       Transform({ x: 5, y: 0, z: 0 }),
     );
 

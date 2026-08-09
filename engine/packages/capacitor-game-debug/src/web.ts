@@ -16,4 +16,7 @@ export class GameDebugWeb extends WebPlugin implements GameDebugPlugin {
   }
   async getNativeLogs(): Promise<{ logs: string[] }> { return { logs: [] }; }
   async getDeviceIp(): Promise<{ ip: string }> { return { ip: '' }; }
+  /** Empty, not invented: the web build has no hardware identity a host could compare against,
+   *  and a fabricated model would be read as a real one (#146). */
+  async getDeviceHardware(): Promise<{ model: string; osVersion: string }> { return { model: '', osVersion: '' }; }
 }

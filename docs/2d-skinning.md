@@ -105,7 +105,23 @@ Two renderers read the same `skin2DBuffers` entry:
   overlays via `render2DUtils`: `drawSkinnedMeshWireframe2D` (tessellation wireframe),
   `drawWeightHeatmap2D` (selected-bone influence, grayscale) / `drawDominantBoneMap2D`
   (whole-rig dominant-bone segmentation) for the weight view, and `drawSkinnedMeshFlat2D`
-  (flat-tint fallback while the texture loads). Plus a `Bone2D`
+  (flat-tint fallback while the texture loads). Those weight overlays are **read-only and
+  per-part**: `overlayPartIndices` (`editor/panels/skinWeightOverlay.ts`) pairs each
+  visible part's deformed positions with **that part's own** weights, skipping hidden
+  parts and any part whose buffer/rig vertex counts disagree (see the Gotcha below for
+  why both the per-part pairing and the fail-closed check are load-bearing).
+  **Two overlay strengths, and the toolbar picks between them**: by default the selected
+  bone's heatmap is drawn semi-transparent OVER the texture. The **`◍ Weights` toggle** in
+  the SceneView toolbar (2D mode, `data-ui-id="sceneView.toolbar.skin-weights"`) switches to
+  the **weight view** — the same heatmap at full strength with the texture completely
+  covered, which is the readable way to judge a weight. With no bone selected it becomes the
+  whole-rig dominant-bone map. The toggle appears only when the selection is a
+  `SkinnedSprite2D` or a descendant of one (so selecting a `Bone2D` still shows it) and
+  auto-clears otherwise. It ignores the sprite's authored `opacity`: a diagnostic read
+  blended with the texture underneath is not a weight value. The store flag behind it
+  (`skinWeightView`) had NO caller for its whole life, so the weight view was unreachable
+  until #181 — the branch was correct, the button simply did not exist.
+  Plus a `Bone2D`
   overlay (child→parent joint lines + screen-constant handle dots). Bones are
   click-selectable (dots hit-tested first; skinned bodies by mesh AABB) and gizmo-
   poseable (the 2D gizmo gate was generalized off the Renderable2D-only check to any
@@ -203,6 +219,10 @@ an optional alpha coverage predicate; these return a ready `.rig2d.json` payload
   auto-place bones (Rig mode), Re-tessellate the mesh at a chosen grid density,
   Auto-weight, paint weights with a heatmap overlay, and a one-click Auto-rig that runs
   the whole `autoRig2D` pipeline on the active part. Rigs can also be hand-authored JSON.
+  **Weight painting lives ONLY in the Skin panel** — SceneView shows the heatmap (and, via
+  its `◍ Weights` toggle, the full-strength weight view) but has no brush (see the Gotcha
+  below). That asymmetry is deliberate: the toggle survived the #180 cull that removed the
+  SceneView brush precisely because it is read-only.
   Once a rig exists, open a scene with a `SkinnedSprite2D` + `Bone2D` children; select a
   bone in the Hierarchy or by clicking its joint in SceneView; pose it with the gizmo
   (works while stopped) and the mesh deforms live in both viewports.
@@ -233,3 +253,82 @@ an optional alpha coverage predicate; these return a ready `.rig2d.json` payload
   stale. Verify editor-render changes in a fresh editor build, not via HMR.
 - **`resolveRef` rejects literal asset paths** — the `rig` field (and `sprite` inside
   the rig) must be GUIDs, guarded by `assetRefIntegrity`.
+- **Anything that renumbers bones must renumber EVERY part's `skinIndices` — a v2 rig
+  has one weight set per part, not one per rig** (#179). `removeBone` shifts every bone
+  index down to close the gap, and it used to rewrite only the *top-level*
+  `skinIndices`/`skinWeights`. Those are the **v1** fields, and `ensurePartsArray`
+  strips them the moment a rig becomes multi-part — so on a v2 rig the remap loop read an
+  absent `def.mesh`, saw zero vertices, did nothing, and left every part pointing at the
+  old numbering. The result is silent: `normalizePart` **clamps** an index past the end of
+  the skeleton to bone 0, so a stale part either deforms with whatever bone shifted into
+  its slot, or snaps to the root — and `commit()` writes it to disk either way.
+  A third rule, from reviewing that fix: **a structural edit's output must NORMALIZE TO
+  ITSELF.** The editor deforms from the RAW def (`SkinCanvas.deformMesh` reads
+  `activePartOf`, with no `normalizeRig2D` in between), so any repair that only the load
+  path performs makes the live preview and the reloaded rig disagree about the same file.
+  A vertex bound *entirely* to the deleted bone used to end up with all four weights at
+  zero; `normalizePart`'s degenerate branch quietly rebound it to bone 0 on load, while
+  `deformMesh` — which skips every zero-weight term — collapsed it to the local origin for
+  the rest of the session. `removeBone` now applies the same fallback the loader would.
+  Two more rules follow. Structural edits iterate `def.parts` and use **each part's own**
+  `mesh.verts.length` (parts do not share a vertex count), and they leave the v1
+  top-level fields alone on a v2 rig rather than overwriting them with an empty array —
+  `normalizeRig2D` ignores those whenever `parts` is present, so writing them is
+  inventing data, and it is what made the bug invisible. `addBone` (appends) and
+  `reparentBone` (rewrites a parent field only) shift no indices and need none of this.
+- **A weight that outruns the skeleton now warns at load, once per part** — the clamp
+  above still happens (the rig has to render), but `normalizePart` counts the bad indices
+  and reports them with the part name and bone count. Nothing legitimately authors a rig
+  whose weights reference a missing bone, so treat the warning as data corruption and
+  find the edit that renumbered them. Deliberately once per PART, and once per SESSION per
+  `name|boneCount|badCount`: a corrupted rig has thousands of bad indices, so a per-vertex
+  warning buries its own message — and `normalizeRig2D` is **not load-only** (the editor's
+  `applySkinDef` re-normalizes on every edit, "safe to call per paint move"), so an
+  un-deduped one fires tens of times a second while you drag the brush across the very rig
+  it is complaining about. The count is in the key so a rig that gets WORSE reports again
+  instead of being silenced by the first report. Same shape as `_warnedMissingClip` in
+  `scene3DSync`.
+  **The 3D skeletal path is immune to this class by construction, and it is worth knowing
+  why rather than re-deriving it** (swept after #179): Modoki owns no indexed bone table
+  there at all. Bones, bone attachments, skinned-mesh nodes and clip tracks all resolve by
+  NAME and fail CLOSED — `entry.bones.get(name)` then `if (!bone) return`, skipping that
+  one entity instead of clamping to bone 0. The GLB's own `JOINTS_0` indices live inside
+  `THREE.Skeleton`/geometry that nothing here renumbers: the rigged converter only
+  `joinPrimitives`-merges same-material submeshes, and the weld/simplify pipeline that
+  could damage weights is reachable only by a static model — the split is decided at
+  import by `inspectGLBRig().hasSkinned` (a skinned MESH, not the presence of clips), so a
+  skinned-but-unanimated GLB still takes the rigged path. That is the defence the 2D side
+  lacked: an index table is only safe if every consumer is updated together, and a name is
+  safe on its own.
+- **Weight painting is a SKIN-PANEL-only gesture, deliberately — SceneView shows weights
+  and never edits them** (#180). SceneView used to carry a second weight brush: with the
+  Skin panel open in Weights mode and a `Bone2D` selected, dragging in the scene painted
+  that bone's influence on the posed character. It read the **v1 top-level** `def.mesh` /
+  `skinIndices` in all three of its halves (the guard, the paint, and the undo entry), and
+  `ensurePartsArray` strips those the moment a rig gains a second part — so it had been a
+  complete no-op on every multi-part rig since parts landed, with no message and no log,
+  and nobody noticed. It was **removed rather than made parts-aware**, for reasons that
+  outlive the bug:
+  - It contradicted the editor-surface convention in CLAUDE.md — *asset editors are
+    panels; the viewport is for instance/spatial editing.* A weight stroke edits the
+    `.rig2d.json` **asset**, so it belongs to the Skin panel.
+  - It was a **hidden shared-asset edit**. In SceneView you appear to be editing the
+    entity under the cursor; you were in fact mutating a file shared by every entity using
+    that rig, in every scene, with nothing on screen saying so.
+  - It duplicated no capability. `SkinCanvas.paintAt` already paints against a test pose,
+    so "paint on the bent limb" was never unique to the viewport.
+  - Fixing it would have required inventing a targeting rule the panel already owns
+    (it paints every non-hidden part; SceneView has no parts list to scope a stroke with),
+    plus a per-part buffer lookup its hardcoded `parts[0]` never had.
+  What SURVIVES is the read-only heatmap, which is safe by the same reasoning — looking is
+  not editing. It was fixed in the same change to shade **every visible part with its own
+  weights** (`overlayPartIndices`): it too had read the `parts[0]` back-compat aliases, so
+  it showed part 0's influence over the whole rig while the magenta wireframe beside it
+  outlined every part. The pairing `buffer.parts[i] ↔ rig.parts[i]` is sound because
+  `skin2DSystem` builds the buffer as `parsed.parts.map(...)` and rebuilds on any
+  part-count/vertex-count change — but **it does not extend to the authoring def**, since
+  `normalizeRig2D` SORTS parts by `order`; anything pairing against `Rig2DFile.parts` must
+  map by NAME. The overlay still verifies the vertex counts agree and skips the part for a
+  frame when they don't: a frame can land between a rig edit and the reskin, and drawing
+  through it would index one part's weights into another part's positions — #179's exact
+  failure mode, in a read path.

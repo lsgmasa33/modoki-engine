@@ -25,9 +25,10 @@ export interface EntityPointSpec {
   guid?: string;
   name?: string;
   id?: number;
-  /** Which on-screen surface to aim in — `'game-3d'` | `'game-2d'` | `'scene-view'`.
+  /** Which on-screen surface to aim in — `'game-3d'` | `'game-2d'` | `'scene-view'` | `'game-ui'`.
    *
-   *  **REQUIRED for a 2D/3D entity, and REFUSED for a UI entity.** Not a style preference:
+   *  **REQUIRED for a 2D/3D entity; for a UI entity, required only when it is mounted more than
+   *  once.** Not a style preference:
    *
    *  - A 2D/3D entity can be measured by several viewports at once, and in the editor usually is
    *    (Scene + Game panels open ⇒ a rect in each, through different cameras). It is a genuine

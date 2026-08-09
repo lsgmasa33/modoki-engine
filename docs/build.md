@@ -70,7 +70,9 @@ the scaffold. Manual CLI equivalent: `cd games/<id> && npx cap add ios|android`.
 
 `healNativeConfig` (`engine/plugins/healNativeConfig.ts`) runs on project open **and** at the
 start of every iOS/Android build — it syncs the project's `build.appleTeamId` into the iOS
-project's `DEVELOPMENT_TEAM` (so a Team ID edited after `cap add` still lands) and repairs
+project's `DEVELOPMENT_TEAM` (so a Team ID edited after `cap add` still lands; the VALUE lives in
+the gitignored `project.user.json` — see [engine-oss-publishing.md](./engine-oss-publishing.md)
+§ "Private build fields") and repairs
 other drift. `add-native-target` (`engine/plugins/addNativeTarget.ts`) and the vendor plugin
 wire in per-game native plugins. Restart the editor after pulling build-pipeline changes — the
 Vite plugin loads once at dev-server start.
@@ -90,6 +92,35 @@ git ls-files 'games/*/ios/**' 'games/*/android/**' | git check-ignore --stdin
 # must print nothing — no tracked source should be ignored
 ```
 
+### App icons + splash are GENERATED, but still tracked
+
+`res/` counts as tracked source above, yet its icons and splashes are produced by
+`@capacitor/assets` during the native build. That combination is only safe because the build
+**skips regeneration when nothing changed** (`engine/plugins/iconAssets.ts`).
+
+Two things went wrong before it did:
+
+- The step ran on **every** native build, rewriting every tracked mipmap/splash PNG each time,
+  so any game that had been built carried a permanently dirty working tree — 95 such files
+  across two games in one day, burying real diffs in re-encoded binaries.
+- The generator was invoked as a bare `npx --yes @capacitor/assets` beneath a comment claiming
+  it was "verified against 3.0.5". `npx --yes` installs **latest**, so the comment described a
+  version the build never used; a newer release started emitting extra density buckets
+  (`drawable-night-*`, `*-ldpi`, `mipmap-ldpi`) that surfaced as mystery untracked directories.
+
+Now: the tool version is **pinned** (`ICON_TOOL`), and a stamp under the project's gitignored
+`.cache/` records the tool version + platform + colour flags + the **content hash** of the
+source image. Regeneration happens when any of those change, or when the generated output has
+been deleted (a sentinel file is checked, so a wiped `res/` still comes back). Content-hashing
+means repointing `app.iconSource` at a byte-identical file is correctly a no-op, while editing
+an image in place is not.
+
+**Why not just gitignore the icons?** Generation is deliberately non-fatal (`|| echo '[icon]
+generation skipped'`) and needs `npx` to reach the network. Untracked icons would let an
+offline or upstream-broken build ship an app with no icon and no committed fallback — trading
+visible churn for an invisible release defect. To force a rebuild, delete
+`<project>/.cache/icon-stamp-<platform>`.
+
 ## The canonical path: build from the editor
 
 Open the project, then **Build → iOS Device / Android Device / Web**. `/api/build` runs the
@@ -100,8 +131,130 @@ manual equivalent.
 The editor build path **resolves (and, in a packaged editor, downloads) its toolchain
 automatically** — Node, the JDK 21, and the Android SDK — and preflight-gates a build on the tools
 it needs, pointing you at **Build → Build Support…** to install anything missing. It exports
-`JAVA_HOME`/`ANDROID_HOME` from that shared, version-strict detection, so you don't set them by hand
-the way the manual CLI recipes below do. Full detail: [editor-toolchain.md](./editor-toolchain.md).
+`JAVA_HOME`/`ANDROID_HOME` from that shared, version-strict detection. **The CLI recipes below reach
+the SAME resolution** via `eval "$(node engine/scripts/print-toolchain-env.mjs)"` — that script
+bundles and calls `engine/toolchain`'s own `detect()` rather than probing for itself, because a
+second probe is precisely what this module was consolidated to remove (#159). Full detail:
+[editor-toolchain.md](./editor-toolchain.md).
+
+### One build at a time (#173)
+
+**Three routes compile into the same `<project>/dist`, so they share ONE slot** — not one lock each.
+`/api/build`, `/api/ota/publish`, and `/api/add-native-target` all run the byte-identical
+`node engine/scripts/build-web.mjs --target native` from the same cwd into the same `dist`
+(`vite-asset-scanner.ts` build steps · the publish route's step 1 · `addNativeTarget.ts`). Whichever
+starts second rewrites that dist while the first is still copying it, and the failure is quiet:
+
+- **build ↔ build** → `cap sync` copies a half-written dist into `ios/`, and the build then
+  *succeeds*. A signed app with a torn JS bundle, surfacing on the device hours later.
+- **publish ↔ build** → the worst one, and the reason the slot is shared. `/api/ota/publish`
+  uploads that dist to the OTA bucket, so the torn bundle reaches **every installed device that
+  checks for an update**, with no local artifact to inspect first. One human doing two ordinary
+  things in one window (start Build → iOS, then Publish OTA while it runs) reaches it.
+- **scaffold ↔ anything** → `npm install` + `cap add` into the project on top of the dist race;
+  two scaffolds for one platform also race the `existsSync(nativeDir)` gate that is supposed to
+  make the route a no-op.
+
+Refused, not queued: these run for minutes and nothing cancels one, so a queued SSE stream would sit
+silent and read as a wedged editor. The refusal is a `FAILED:` status naming what holds the slot
+(`ios build`, `OTA publish`, `android native scaffold`) and how long it has been running.
+
+**Which signal gives the slot back is the subtle part** (`releasePolicy` in
+`engine/plugins/backend/buildLock.ts`). Each of these handlers has two halves that stop at different
+times, and one release rule cannot serve both:
+
+- The **preflight gates** (invalid config, no iOS device, no Team ID, no `webBucket`, missing
+  toolchain) return synchronously and spawn nothing → released on the response closing.
+- The **pipeline** owns its own release once started. Releasing it on `close` — which the first
+  version did — frees the slot the instant the client disconnects, while the step loop is still
+  awaiting a spawned child. The editor's own force-reload reaches that: editing a game `.ts`
+  reloads the page, tearing down the EventSource mid-build, and a retry then writes the same dist
+  from two processes. Exactly the bug the lock exists to prevent, re-entered through the back door.
+
+**Aborting a step kills the process GROUP, not the shell (#176).** For a long time the slot's
+guarantee was bounded by what "the pipeline stopped" could observe — the step's `bash` exiting — and
+that is weaker than it sounds. `bash -c` *exec-replaces* itself for a simple command (so vite,
+xcodebuild and gradlew did get the signal) but *forks* for a compound one, and three real steps are
+compound: the iOS `Installing on device...` (`APP_PATH=$(…) && { xcrun devicectl … }`), icon
+generation (`mkdir && cp && … && printf`), and the web deploy's `for ext in glb ktx2 webp; do gcloud
+storage objects update …; done`. `kill('SIGTERM')` on that one pid killed the shell and left
+`devicectl`/`gcloud` running, orphaned, holding no slot — free to race the retry the freed slot
+immediately admits. The `(D6)` comments claimed a disconnect left nothing that "can't conflict with
+a retry"; that was never true, and #173's slot only narrowed the window.
+
+The fix lives entirely in `engine/plugins/buildStepShell.ts`: posix steps spawn `detached` (their
+own process group) and every abort path calls `killBuildProcess`, which signals `-pid` — SIGTERM,
+then SIGKILL to the group after a 5s grace. Two things fall out for free: a group signal reaches a
+tool's own workers (xcodebuild's `clang`/`swift-frontend`, gradle's `--no-daemon` single-use JVM)
+without depending on that tool to forward it, and the backend kills what it still owns on
+`SIGINT`/`SIGTERM`/`exit` — necessary, because a detached child no longer receives the Ctrl-C that
+stops `npm run dev`, so detaching without that hook would have opened a new orphan path while closing
+this one.
+
+The shutdown path gives an in-flight child **2s to honour the SIGTERM** before `exit`'s SIGKILL
+lands, and pays that delay only when a build is actually running. The first version skipped it —
+SIGTERM with no grace, `process.exit` on the next line, so the SIGKILL arrived in the *same tick*.
+That is not "graceful then forceful", it is just forceful, and a gradle or xcodebuild killed
+mid-write leaves a lock file or a torn artifact for the next build to trip over.
+
+Windows takes the other road: no `detached` (there it allocates a new **console**, which the GUI
+editor would flash per step) and `taskkill /T /F /PID <pid>`, which walks the tree by parent pid.
+**Validated on a real Windows box (#182)**, and the premise turned out to be worse there than on
+posix: `spawn(cmd, {shell:true})` is `cmd.exe /d /s /c "<command>"`, and Windows has no
+exec-replace, so **every** step carries the extra `cmd.exe` layer — where on posix only the three
+compound steps did. Measured: aborting a real build killed a 5-process, 4-level tree
+(`cmd.exe` → `node build-web.mjs` → `cmd.exe` → `tsc`) in **350ms**, against an **11175ms**
+uninterrupted lifetime in the control run. No console window ever appeared (`MainWindowHandle` 0
+for all 7 processes across 11 samples of a full build).
+
+⚠️ **One residual hole, and one that was closed by measuring it (#185):**
+
+- **A SIGKILL'd backend** executes no hook and orphans whatever was mid-step. A process that is
+  not allowed to run code cannot clean up, so this is not closable *in-process* — but it is
+  closable from the PARENT, and on Windows that is now done: `devServer.ts` force-kills its Vite
+  child with a `taskkill /T` tree kill rather than `child.kill()` (#185). There, `kill()` is a
+  `TerminateProcess` on the Vite pid alone — Vite runs no handler, this module's shutdown hook
+  never fires, and an in-flight build's grandchildren are orphaned. So **quitting the editor
+  mid-build** is covered; only main itself being SIGKILL'd is still open. posix is deliberately
+  unchanged: a real signal there runs Vite's handlers, which reap the build children properly.
+- **The graceful-exit hook used to skip Windows entirely — CLOSED (#185).** `process.on('exit')`
+  reaped posix children and took `if (e.platform === 'win32') continue`, commented "no synchronous
+  tree-kill on Windows". Both halves of that were wrong: `execFileSync('taskkill', …)` runs fine
+  inside an `exit` handler, and the gap was real. It now calls **`killBuildProcessSync`**, the
+  synchronous twin of `killBuildProcess`, on every platform.
+
+  **Why it hid for so long is the part worth remembering.** Measured both shutdown paths on a real
+  build and the tree came down within ~900ms — which looked like proof the shutdown worked. It was
+  not. Every step here is a **node** process writing to the stdout pipe it inherited for the SSE
+  log, and node exits when that pipe breaks. A 4-cell probe isolates it: node+piped+writing **dies
+  in 718ms**; node+piped+silent **survives**; node+unpiped+writing **survives**; `ping`+piped
+  **survives**. The tools were covering for the shutdown path, so a *clean* observation was
+  measuring the wrong mechanism.
+
+  A JVM's `PrintStream` swallows the failed write, which puts `gradle` in the `ping` row. Measured
+  with the real step (`android\gradlew.bat -p android assembleDebug --no-daemon`):
+
+  | scenario | gradle JVMs |
+  |---|---|
+  | parent hard-killed, nothing reaping | **2 alive at +62s** |
+  | `taskkill /T` on the tree (the abort path) | both gone in **1s** |
+  | graceful exit, hook as shipped | **2 alive** 6s later |
+  | graceful exit, hook fixed | **0** |
+
+  General lesson: when a guard's success depends on the *tool* rather than the mechanism, a passing
+  observation is not evidence the mechanism works. Vary the tool, not just the input.
+
+  (Note for anyone repeating this on Windows: the toolchain is resolved through
+  `MODOKI_TOOLCHAIN_DIR`, **not** `JAVA_HOME`/`ANDROID_HOME` — those are empty on the `win` box even
+  though a pinned JDK 21 and a full Android SDK are installed. Probing the env vars, or `java` on
+  PATH, reports a false "no toolchain here". Ask the editor instead: `GET /api/toolchain` returns
+  each tool's resolved `path` and `source`.)
+
+**Known gap, deliberate:** the slot is per backend **process**, so two editor processes on one
+project (a packaged editor beside a dev one) are still unguarded. That needs a cross-process claim on
+the filesystem, the shape `backend/deviceClaims.ts` implements for hardware — note its
+same-pid-is-a-no-op rule means the claim machinery alone would *not* have caught the agent-vs-human
+case, so that work needs both mechanisms. Left open on #173.
 
 ## Assets the build cannot see — why an asset ref never belongs in code
 
@@ -414,6 +567,74 @@ the SAME command run for an iOS/Android pre-`cap sync` build must say `--target 
 (base `"/"`, since Capacitor serves the dist from the app root). There is no default in either
 direction: defaulting would be silently wrong for one of the two callers.
 
+#### `--target native` runs the same three in-process heals as the editor (#148, #150)
+
+Before its shell steps, `build-web.mjs` now runs the SAME three in-process heals as the editor's
+`/api/build`, in the same order, for the same reason each exists:
+
+| In-process heal | Editor `/api/build` | CLI `--target native` |
+|---|---|---|
+| `healNativeConfig` — sync `build.appleTeamId` → iOS `DEVELOPMENT_TEAM`, Android `local.properties` | ✅ | ✅ |
+| `ensureCapacitorDeps` — add engine-REQUIRED Capacitor plugins the project predates | ✅ | ✅ |
+| `vendorEnginePlugins` — re-pack + install a changed engine plugin | ✅ | ✅ |
+
+Games don't build `engine/packages/capacitor-*` from source — they depend on a content-addressed
+tarball committed into the project (`"capacitor-game-debug": "file:plugins/…-<hash>.tgz"`). So a
+plugin edit only reaches a device once that tarball is re-packed and installed; a project that
+predates an engine-required Capacitor plugin (`@capacitor/preferences`, `@capacitor/app`, …) never
+gets one just by building; and `build.appleTeamId` only reaches a device build once it's synced
+into the generated native project. On `web`/`playable` none of this runs (every heal here is a
+native-artifact concern; a web build has nothing to keep fresh and must not pay for it).
+
+Landed in two steps: #148 added only the third heal, which meant following the CLI recipes after a
+plugin edit produced an IPA/APK containing the PREVIOUS native code while every signal reported
+success; #150 closed the remaining two, using the exact editor semantics — same ordering, same
+install condition — rather than re-deriving them:
+
+- **Order is load-bearing.** `ensureCapacitorDeps` runs BEFORE `vendorEnginePlugins`: when it adds
+  `capacitor-game-debug`, it writes a placeholder dep spec (`'*'`), and `vendorEnginePlugins`
+  rewrites that placeholder to the real `file:plugins/<name>-<ver>.tgz`. Vendoring first would
+  leave the placeholder unrewritten — a project stuck depending on a spec npm can't install.
+- **Install is conditioned on EITHER heal changing something** (`depHeal.changed ||
+  v.needsInstall`), not just the vendor step — a newly-added dep spec is just as inert until
+  installed as a fresh tarball.
+- `ensureCapacitorDeps` needs a platform, and `--target native` covers both; the CLI heals
+  whichever of `ios/`/`android/` the project already has on disk (a project with neither yet is
+  the editor's scaffold-then-build path, which the CLI has no equivalent entry point for).
+
+#### The engine-required Capacitor plugins must be COMMITTED, not just healed
+
+`ENGINE_REQUIRED_CAP_PLUGINS` (`engine/plugins/addNativeTarget.ts`) is the list the engine runtime
+calls on every platform — `@capacitor/preferences` (PlayerPrefs), `@capacitor/app` (lifecycle /
+back-button), `@capacitor/keyboard`, `@capacitor/splash-screen`. Every project with a native target
+must carry them in its own `package.json`.
+
+**A heal is not a substitute for committing them, and the reason is not obvious.** Because
+`ensureCapacitorDeps` adds them on every native build, a project that has drifted off the list still
+builds fine here — the editor heals on the way past, and the tree it writes is never the tree that
+gets committed. That is precisely how four projects drifted unnoticed (`alien-animal`,
+`audio-demo`, `chess`, `demos/2d-physics-demo` — each missing all four).
+
+The one that mattered was the demo. `publish-demo.sh` exports **committed** content, and it strips
+only `file:` deps and `workspaces` from the staged `package.json` — registry deps are retained. So
+the published snapshot shipped a manifest with no `@capacitor/preferences`, and anyone building
+from that snapshot (`npm install` → `npx cap add` → `cap sync`, with no Modoki editor anywhere in
+the loop) never runs the heal and gets `"Preferences" plugin is not implemented on <platform>` at
+launch, the first time PlayerPrefs is touched. **A heal that only runs on our machines cannot
+protect someone building from the snapshot; only the committed file can.**
+
+Guarded by `engine/tests/architecture/nativeProjectDeps.test.ts`, which asserts committed state and
+reads the list from `ENGINE_REQUIRED_CAP_PLUGINS` rather than restating it. If it fails: run a
+native build for the named project, then `npm install` in it, and **commit the `package.json` +
+`package-lock.json`** — committing is the part that matters.
+
+Two notes worth carrying:
+- **`npm` ships `README.md` regardless of the `files` field**, so editing a plugin's DOCS re-hashes
+  its tarball. Expect a re-vendor after a docs-only plugin edit.
+- To re-vendor **without** building: `node engine/scripts/vendor-plugins.mjs games/<id>`, then
+  `npm install` in the project. `engine/tests/architecture/vendoredPluginFreshness.test.ts` fails
+  `npm test` on a project whose pin has gone stale.
+
 ### iOS Simulator
 ```bash
 MODOKI_PROJECT=games/<id> npm run build -- --target native
@@ -438,14 +659,156 @@ xcrun devicectl device process launch --device <DEVICE_ID> <appId>
 First device install requires trusting the developer profile: Settings → General →
 VPN & Device Management → Trust.
 
+**Normally you never type either of these — pick the phone from the Build menu.** `Build → iOS
+Device` names its current target in the label and lists every device this Mac can see in a
+submenu; picking one writes BOTH ids below into `project.user.json` **and starts the build**, so
+the menu and Project Settings stay one source of truth. (`Set target without building…` in the
+same submenu is the way to change the target without committing to a build — a started build
+cannot be cancelled.) The submenu also says which install each device will get
+("hands-free install" vs "Xcode handoff, ⌘R") — see [editor.md](./editor.md) § "Build → picking
+the target device". The fields stay editable by hand for a device no listing can see (remote/WiFi,
+an unusual setup).
+
+**Two DIFFERENT ids, and only the first is required.** Both live in the project's gitignored
+`project.user.json` (per-machine, never committed — Project Settings → Build → "This Machine"):
+
+| Field | From | Required? | Used by |
+|---|---|---|---|
+| `iosDeviceId` | `xcrun xctrace list devices` — the hardware UDID | **Yes** | `xcodebuild -destination 'id=…'` |
+| `iosDevicectlId` | `xcrun devicectl list devices` — a different GUID | No | `devicectl` install + launch |
+
+They are not interchangeable **in that direction**: `xcodebuild` rejects the devicectl GUID (see
+`wdaLauncher.parseIosDevices`, which reads `hardwareProperties.udid` for exactly this reason). The
+reverse is fine — `devicectl` accepts the hardware UDID as well as its own GUID (measured
+2026-08-08: `xcrun devicectl device info details --device <id>` resolves the same phone for either
+form), which is why the Build-menu picker can fill both fields from the one id it parses.
+
+⚠️ **`devicectl` is CoreDevice-only — iOS 17+.** A pre-iOS-17 device has no devicectl id *in
+existence*: `xcrun devicectl list devices` lists it `unavailable`, with no
+`hardwareProperties.udid` at all. So leave `iosDevicectlId` **empty** for such a device and the
+build plans an **Xcode handoff** instead — it builds, opens the `.xcodeproj`, and reports
+success; you press Run (⌘R) to deploy. The decision is `planIosInstall`
+(`engine/plugins/vite-asset-scanner.ts`), deliberately one exported pure function so the
+preflight guard and the step plan cannot disagree.
+
+That disagreement is exactly what shipped for a while: the preflight demanded BOTH ids, so a
+build that `xcodebuild` handles perfectly was refused before it started, and the refusal named
+`project.config.json` — the wrong file. Caught on an iPhone 8 / iOS 16.7.16, whose build then
+succeeded unchanged once the demand was dropped.
+
 ### Android Device
 ```bash
 MODOKI_PROJECT=games/<id> npm run build -- --target native
 (cd games/<id> && npx cap sync android)
-JAVA_HOME=$(/usr/libexec/java_home -v 21) games/<id>/android/gradlew -p games/<id>/android assembleDebug
+eval "$(node engine/scripts/print-toolchain-env.mjs)"   # JAVA_HOME + ANDROID_HOME, resolved as the editor does
+games/<id>/android/gradlew -p games/<id>/android assembleDebug
 adb install games/<id>/android/app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n <appId>/.MainActivity
 ```
+
+## Converted assets: the manifest points at the SOURCE, the build ships the VARIANT
+
+A sibling of the section above, and the same "fine in dev, broken when built" shape. Five asset
+kinds go through a converter — **textures, audio, environment HDRs, models, fonts** — and on a
+successful conversion the shaker ships only the derived variant and **drops the source**. But a
+manifest entry's `path` is still the SOURCE path. So a consumer that does `assetUrl(entry.path)`
+gets a URL that resolves in dev (Vite serves everything off disk) and 404s in production.
+
+Every consumer must therefore go through its variant resolver — `resolveTextureVariantUrl` /
+`servedAudioUrl` / `modelGlbUrl` — each of which falls back to the bare source **only when the
+asset is unconverted**, which is exactly the case where the source *is* shipped.
+
+**Fonts are the exception that proves it**, and the one that shipped broken. A font has two
+independent consumers needing different files:
+
+| consumer | authored as | needs |
+|---|---|---|
+| canvas text (`Text2D.font`) | a **GUID** | `~atlas.png` + `~metrics.json` |
+| DOM text (`UIElement.fontFamily`, CSS) | a **family NAME** | the source `.ttf`/`.otf`, via FontFace |
+
+`loadAllFonts` FontFace-loads the manifest path directly, so dropping the source 404'd every baked
+font at boot in every game — visible only as `[FontLoader] N/N fonts failed to load`, with the
+canvas text still rendering perfectly. It took an iPhone 7 to notice.
+
+The source now ships **iff** a DOM consumer needs it:
+`shipTtf = shipSource === 'always' || (shipSource !== 'never' && domUsed)`, where `domUsed` reuses
+the tree-shaker's font-family walk (`TreeShakeResult.domFontFiles`). The build logs the decision
+per font, and the manifest records `font.sourceShipped`, which `loadAllFonts` reads so a
+deliberately-dropped font is skipped rather than fetched-and-warned.
+
+⚠️ **`shipSource: 'auto'` cannot see a family named in CSS or assigned from game code** — a static
+scan only reaches scene/prefab `fontFamily`. A game that styles DOM text from a stylesheet must set
+`shipSource: 'always'` in the font's `.meta.json`, or its text silently falls back to a system face.
+This is the one known blind spot in the rule.
+
+## The shipped platform floors (`build.iosMinVersion` / `build.androidMinSdk`)
+
+**Never let the bundler pick this.** Vite 8's default `build.target` is
+`'baseline-widely-available'`, which resolves to `["chrome111","edge111","firefox114",
+"safari16.4","ios16.4"]` — silently making **iOS 16.4 the minimum for every game we ship**. esbuild
+then emits ES2022 static class blocks (three.js uses them), which are a **parse** error on older
+WebKit: the chunk never parses, the eager module graph dies, and the app hangs on the splash screen
+with *zero* JavaScript console output. `three.core` is on the eager boot path
+(`index → renderSettings → three.core`), so it takes down 2D-only games too.
+
+`build.iosMinVersion` (default **`16.4`**, raised from `15.4` on 2026-08-04 by owner decision —
+deliberately dropping the iPhone 7 / 6s / SE1 era) is the single source of truth, with two
+consumers that must never disagree.
+
+⚠️ That the floor now *equals* the `ios16.4` the bundler default would have picked is a
+coincidence, not a regression. The bug above was never the number — it was the floor being
+**implicit**: inherited from a default that moves between bundler majors, and disagreeing with the
+native deployment target. A deliberate, pinned 16.4 driving both consumers is the opposite of that.
+
+The **three** consumers:
+
+- **`vite.config.ts`** → `build.target` gets `ios<v>` / `safari<v>`
+- **`healNativeConfig`** → `healIosDeploymentTarget` rewrites `IPHONEOS_DEPLOYMENT_TARGET` in the
+  pbxproj (every build configuration — patching only the first leaves Release on the old floor)
+- **`healNativeConfig`** → `healIosSpmPlatform` rewrites `platforms: [.iOS(.vNN)]` in
+  `ios/App/CapApp-SPM/Package.swift` — the SPM package's own floor, **floored to the MAJOR**
+  (16.4 → `.v16`), because SPM's `SupportedPlatform` enumerates majors. Coarser than the pbxproj
+  target on purpose: a package minimum below the app's target always builds, and this is exactly
+  what Capacitor's generator emits from the same value, so the heal agrees with `cap sync` rather
+  than fighting it.
+
+They were previously independent literals that DID disagree — pbxproj `15.0` vs a bundle needing
+`15.4` — so the App Store would offer the game to a device that installs it and then dies on a
+missing API.
+
+⚠️ **The SPM floor was the third consumer, and it was unhealed until 2026-08-07** — so the "single
+source of truth" reached two of three places. Raising the default from 15.4 to 16.4 moved the
+pbxproj and the bundle and left `Package.swift` behind: **six of nine projects still declared
+`.v15`** while every pbxproj read `16.4`. The three that had moved were simply the three someone
+had run `cap sync` on since, which is the tell — the floor was tracking *who ran what*, not the
+config. Not a build break (SPM tolerates a package minimum under the app target), but precisely
+the per-project drift this config value exists to prevent. Both the heal and a
+**committed-state** guard now exist; the mechanism-only guard could not see it, since the heal
+runs on project open / native build and a project nobody opens stays stale on disk.
+
+Note both files carry `// DO NOT MODIFY THIS FILE - managed by Capacitor CLI commands`. We rewrite
+them anyway, for the same reason in both cases: regeneration is occasional and manual, and the
+floor must not wait for someone to remember.
+
+**15.4 remains the hard LOWER bound, not a round number.** esbuild lowers *syntax* but cannot
+polyfill *runtime APIs*; scanning a built bundle for APIs it can't reach finds exactly
+`structuredClone`, `Array.at` and `Object.hasOwn` — all three shipped in iOS 15.4. Lowering the
+floor below 15.4 therefore needs polyfills, not just a smaller number; `16.4` sits comfortably
+above that line, so no polyfills are needed at the current floor.
+
+Guarded by `engine/tests/architecture/buildTargetFloor.test.ts`, which fails if the pin is removed,
+replaced by a moving alias, if the two consumers are decoupled, or if the pinned floor value moves
+without someone deliberately updating the test.
+
+`build.androidMinSdk` (default **`31`**, Android 12 — reviewed alongside the iOS raise) is the
+Android sibling, with the same shape:
+
+- **`healNativeConfig`** → `healAndroidMinSdk` rewrites `minSdkVersion` in
+  `android/variables.gradle` (every occurrence, `/g`, on open/build)
+
+`cap add` scaffolds `minSdkVersion = 24` and nothing else ever revisits it, so without the heal a
+newly-scaffolded project silently ships API 24 and the floor drifts per-project — the same drift
+`iosMinVersion` was introduced to close on iOS. Same test file adds parallel Android coverage.
 
 ## iOS build notes
 
@@ -465,8 +828,13 @@ adb shell am start -n <appId>/.MainActivity
 
 ## Android build notes
 
-- Requires **JDK 21** (Capacitor 8 / AGP). Set `JAVA_HOME=$(/usr/libexec/java_home -v 21)` before
-  Gradle commands.
+- Requires **JDK 21** (Capacitor 8 / AGP) — get it, and `ANDROID_HOME`, from
+  `eval "$(node engine/scripts/print-toolchain-env.mjs)"`, which resolves through the same
+  version-strict `detect()` the editor build uses (provisioned toolchain first).
+  ⚠️ **Do NOT use `$(/usr/libexec/java_home -v 21)`** — it does not fail when no SYSTEM JDK 21 is
+  registered, it returns the newest one it knows. Measured on this Mac: it answered with **25.0.3**
+  while the provisioned Temurin 21 sat unused, and Gradle died with `Unsupported class file major
+  version 69`, which reads as an AGP bug rather than a wrong-Java one (#159).
 - Stock Gradle heap is `-Xmx1536m`; raise it (e.g. `-Xmx4096m`) only when a game bundles the 12
   AppLovin mediation adapters — none do yet.
 - Device must show as `device` (not `unauthorized`) in `adb devices`.

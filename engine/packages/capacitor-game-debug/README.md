@@ -55,6 +55,8 @@ import { GameDebug } from 'capacitor-game-debug';
 | `captureScreen()` | Take screenshot (base64 JPEG + dimensions) |
 | `getNativeLogs({ limit?, seconds?, filter?, subsystem? })` | Read native platform logs |
 | `sendResponse({ id, result?, error? })` | Reply to a bridge request |
+| `getDeviceIp()` | The device's WiFi IPv4 (empty if WiFi is down) — shown in the in-game debug menu |
+| `getDeviceHardware()` | Which device holds the lease: `model` (iOS `hw.machine` = `iPhone18,4`, matching `xcrun devicectl`'s `productType`; Android `Build.MODEL`) + `osVersion`. Empty strings when unknown — never invented. Used to tie a WebDriverAgent launch to the LEASED phone (#146) |
 
 ### Events
 

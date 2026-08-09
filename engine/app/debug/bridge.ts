@@ -10,6 +10,7 @@
  */
 
 import { makeDeviceEvalApi } from './deviceEvalApi';
+import { setConsoleSource } from './consoleSource';
 import { Capacitor } from '@capacitor/core';
 import { App as CapacitorApp } from '@capacitor/app';
 import { setJournalEnabled } from '@modoki/engine/runtime';
@@ -18,6 +19,9 @@ import {
   handleEval as evalCode,
   screenshotToCSS as toCSS,
   createConsoleRing,
+  clampEvalTimeout,
+  DEVICE_EVAL_TIMEOUT_MS,
+  DEVICE_EVAL_MAX_TIMEOUT_MS,
   MAX_CONSOLE_LOGS,
   type LastScreenInfo,
   type ScreenInfoParam,
@@ -60,6 +64,20 @@ function withMechanismSuffix(reply: string): string {
 
 // Original console for bridge's own logging (avoids feedback loop)
 const _log = console.log.bind(console);
+/** The ERROR twin of `_log`. Separate because a bridge that failed to start must not report it at
+ *  `log` level: on a device the only readable channel is logcat/OSLog, and a `console.log` line
+ *  there is indistinguishable from ordinary chatter — see `initDebugBridge`'s note on #164 for the
+ *  hour that cost.
+ *
+ *  LATE-bound (a wrapper, not a `.bind()` like `_log`) on purpose: `patchConsole` replaces
+ *  `console.error` with a wrapper that ALSO pushes into `consoleRing`, and every `_err` call site
+ *  fires after that runs. A `.bind()` captures the pre-patch function and so reaches logcat only.
+ *  That distinction is invisible for a boot failure — if the server never binds, nothing can read
+ *  the ring anyway — but it is not for the port-lifecycle failure, which is RECOVERABLE: a later
+ *  foreground can succeed, and then `device_console_logs` is reachable again with a gap it cannot
+ *  explain. Late-bound, the failure is in the ring waiting. No recursion risk: the wrapper calls the
+ *  original and appends to an array, it does not log. */
+const _err = (...args: unknown[]) => console.error(...args);
 
 // Screen info from the last native screenshot — used for iOS tap coordinate mapping.
 let lastScreenInfo: LastScreenInfo | null = null;
@@ -78,6 +96,42 @@ function patchConsole() {
       consoleRing.push(level, args);
     };
   }
+  // An uncaught error or a rejected promise never reaches `console.*`, so the patch above cannot
+  // see it — and a failed dynamic import or a throw deep in scene/resource loading is exactly the
+  // kind of thing worth diagnosing on a phone. `agentBridge` records these for the editor; the
+  // device had no equivalent, so its ring was silent on the whole class (#157).
+  // Each wrapped in try/catch for the same reason `agentBridge`'s twin is ("never let capture break
+  // logging"), and it matters MORE here: this handler runs INSIDE the window error handler, so a
+  // throw while describing an error becomes another error event. `e.error` is attacker-shaped in the
+  // general case — a value whose `stack` getter throws, or a Proxy — and `String(e.message)` can
+  // throw on an object with a hostile `toString`. Without the guard the entry is lost AND an
+  // exception escapes into the host, at precisely the moment something is already going wrong.
+  if (typeof window !== 'undefined') {
+    window.addEventListener('error', (e) => {
+      try {
+        const where = e.filename ? ` (${e.filename}:${e.lineno}:${e.colno})` : '';
+        const msg = e.error instanceof Error ? (e.error.stack || e.error.message) : String(e.message);
+        consoleRing.push('error', [`[uncaught] ${msg}${where}`]);
+      } catch { /* ignore — a capture failure must never amplify the error it is reporting */ }
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      try {
+        const r = (e as PromiseRejectionEvent).reason;
+        const msg = r instanceof Error ? (r.stack || r.message) : String(r);
+        consoleRing.push('error', [`[unhandledrejection] ${msg}`]);
+      } catch { /* ignore */ }
+    });
+  }
+  // Publish the ring so `diagnose` / the `console-logs` op can READ what this surface captured.
+  // Without this the device captured faithfully and nothing could reach it — see consoleSource.ts.
+  setConsoleSource(() => consoleRing.entries.map((e) => ({
+    // The ring carries 'info' as a distinct level; the reader's vocabulary has three. Fold it into
+    // 'log' rather than dropping the entry — losing a line to a vocabulary mismatch is the same
+    // class of silent omission this whole seam exists to end.
+    level: e.level === 'info' ? 'log' : e.level,
+    ts: e.timestamp,
+    text: e.args.join(' '),
+  })));
 }
 
 // --- Command Handlers ---
@@ -87,7 +141,13 @@ function patchConsole() {
  *  function stops passing the object it builds. This is the seam production actually takes
  *  (`case 'eval'` → here → `evalCode(code, api)`), so it is the one worth asserting. */
 export async function handleEval(params: Record<string, unknown>): Promise<unknown> {
-  return evalCode((params.code as string) ?? '', await makeDeviceEvalApi());
+  // The ceiling here USED to be dictated by the transport — `TcpLeaseTransport` fixed its request
+  // deadline at 5000ms per CONNECTION (host-side, its clock starting before the request even
+  // reached us), so a device budget at or above that could never be the one that fires. #153 made
+  // that deadline per-request and sized from this budget, so the ceiling is a policy choice again.
+  // See DEVICE_EVAL_MAX_TIMEOUT_MS.
+  const timeoutMs = clampEvalTimeout(params.timeoutMs, DEVICE_EVAL_TIMEOUT_MS, DEVICE_EVAL_MAX_TIMEOUT_MS);
+  return evalCode((params.code as string) ?? '', await makeDeviceEvalApi(), timeoutMs);
 }
 
 /** Convert screenshot pixel coords → CSS, reading the bridge's live `lastScreenInfo` + device dpr.
@@ -370,15 +430,59 @@ function handleConsoleLogs(params: Record<string, unknown>): ReturnType<typeof c
  *
  *  `@capacitor/app`'s `getInfo()` is unimplemented on web (throws) — this bridge only runs the
  *  native path in practice (`initNativeBridge`, gated on `Capacitor.isNativePlatform()`), but the
- *  fallback keeps this handler total rather than a rejection the router would have to translate. */
-export async function handleAppIdentity(): Promise<{ platform: string; appId: string; appName: string }> {
+ *  fallback keeps this handler total rather than a rejection the router would have to translate.
+ *
+ *  It also reports the HARDWARE the app is running on (#146), because the host cannot otherwise
+ *  tell which phone the lease is holding. See `readDeviceHardware` for why those two fields and
+ *  not a device id.
+ *
+ *  Additive on purpose: an older bridge answers without `deviceModel`/`osVersion`, and the host
+ *  treats their absence as "unknown", never as a mismatch. */
+export async function handleAppIdentity(): Promise<{
+  platform: string; appId: string; appName: string; deviceModel?: string; osVersion?: string;
+}> {
   const platform = Capacitor.getPlatform();
+  const hardware = await readDeviceHardware();
   try {
     const info = await CapacitorApp.getInfo();
-    return { platform, appId: info.id, appName: info.name };
+    return { platform, appId: info.id, appName: info.name, ...hardware };
   } catch {
-    return { platform, appId: '', appName: '' };
+    return { platform, appId: '', appName: '', ...hardware };
   }
+}
+
+/** The two hardware facts that let the HOST identify which paired iPhone this lease is holding
+ *  (#146), so it does not launch a signed WebDriverAgent on someone else's phone.
+ *
+ *  **Why these two and not a device id.** iOS forbids an app reading the hardware UDID, and
+ *  `identifierForVendor` is a per-vendor GUID that appears in no `xcrun` listing — so no id the app
+ *  can see is comparable with anything the Mac knows. `model` and `osVersion` are, exactly: the
+ *  plugin reads `model` from `hw.machine`, which is byte-identical to devicectl's
+ *  `hardwareProperties.productType` (`iPhone18,4`), and `osVersion` matches its `osVersionNumber`.
+ *  Two phones can share both, which is why the host REFUSES on an ambiguous match rather than
+ *  picking — this narrows the candidates honestly, it does not pretend to be a serial number.
+ *
+ *  **Read from `capacitor-game-debug`, NOT `@capacitor/device`.** The first version of #146 read
+ *  `Capacitor.Plugins.Device`, which looked safe — `deviceCaps.ts` reads the same global — but that
+ *  plugin is OPTIONAL and **no Modoki project installs it** (checked across all 22 games + demos:
+ *  none has the dependency, none has `CapacitorDevice` in its iOS `Package.swift`). So the probe
+ *  returned `{}` on every real device and the host silently fell back to guessing which phone to
+ *  launch on — the fix was inert in production while every test passed. `capacitor-game-debug` is
+ *  present by construction instead: #146 only matters while a device holds a lease, and holding one
+ *  REQUIRES this plugin. Precedent is not evidence; presence is.
+ *
+ *  Dynamically imported like the rest of this module's plugin use, so the web build does not pull
+ *  it into the initial chunk. Total by design — a plugin older than #146 has no such method and
+ *  rejects, which lands in the same `{}` as the web stub. */
+async function readDeviceHardware(): Promise<{ deviceModel?: string; osVersion?: string }> {
+  try {
+    const { GameDebug } = await import('capacitor-game-debug');
+    const info = await GameDebug.getDeviceHardware();
+    return {
+      ...(info?.model ? { deviceModel: info.model } : {}),
+      ...(info?.osVersion ? { osVersion: info.osVersion } : {}),
+    };
+  } catch { return {}; }
 }
 
 /** Build the `appStateChange` handler that makes THE FOREGROUND APP OWN THE PORT (#95).
@@ -404,7 +508,13 @@ export function createPortLifecycleHandler(deps: {
   start: () => Promise<{ port: number }>;
   stop: () => Promise<{ ok: boolean }>;
   log: (...args: unknown[]) => void;
+  /** Where a failure goes, when it is one that leaves the bridge UNREACHABLE. Defaults to `log`,
+   *  which is what every existing caller got — but a failed re-bind deserves better than that, see
+   *  the catch below. Injected rather than reaching for `console.error` directly so this stays as
+   *  testable as the rest of the handler. */
+  logError?: (...args: unknown[]) => void;
 }): (state: { isActive: boolean }) => void {
+  const logError = deps.logError ?? deps.log;
   let busy = false;
   return ({ isActive }) => {
     void (async () => {
@@ -422,10 +532,25 @@ export function createPortLifecycleHandler(deps: {
           deps.log('[debug-bridge] foregrounded — TCP server listening on port', r.port);
         }
       } catch (e) {
-        // Never let debug-bridge plumbing break the app's lifecycle handling. A failed release just
-        // means the old behaviour (the port stays held); a failed rebind surfaces host-side as an
-        // unreachable lease, which is the pre-existing failure mode, not a new one.
-        deps.log('[debug-bridge] appStateChange handling failed:', (e as Error).message);
+        // Never let debug-bridge plumbing break the app's lifecycle handling — hence swallowing at
+        // all. But the two failures are NOT equally serious, and reporting them identically is the
+        // #164 mistake in miniature (found sweeping for its pattern, not its symptom):
+        //   • a failed STOP restores the old behaviour — the port stays held. Benign, stays at log.
+        //   • a failed START means nothing is listening on 9095 after a foreground, so every
+        //     device_* tool is unreachable for the rest of the session. That is byte-for-byte the
+        //     symptom #164 was filed about, and at log level it is just as unfindable: the app runs
+        //     fine, the lease refuses, and the one line explaining it reads like ordinary chatter.
+        // The message carries the same greppable tokens as `initDebugBridge`'s, so ONE grep finds
+        // this whether the bridge died at boot or on a later resume.
+        if (isActive) {
+          logError(
+            '[debug-bridge] FAILED to re-bind on foreground — the GameDebug TCP server is NOT '
+            + 'listening, so every device_* tool is unreachable until the app is backgrounded and '
+            + 'brought forward again. Reason:', (e as Error).message,
+          );
+        } else {
+          deps.log('[debug-bridge] appStateChange handling failed:', (e as Error).message);
+        }
       } finally {
         busy = false;
       }
@@ -794,9 +919,9 @@ async function initNativeBridge() {
 
   try {
     const result = await GameDebug.startServer();
-    _log('[debug-bridge] Native TCP server started on port', result.port);
+    _log('[debug-bridge] Native TCP server listening on port', result.port);
   } catch (e) {
-    _log('[debug-bridge] startServer failed:', (e as Error).message);
+    _err('[debug-bridge] GameDebug.startServer failed:', (e as Error).message);
     throw e;
   }
 
@@ -817,6 +942,7 @@ async function initNativeBridge() {
     start: () => GameDebug.startServer(),
     stop: () => GameDebug.stopServer(),
     log: _log,
+    logError: _err,
   }));
 
   GameDebug.addListener('request', async (data) => {
@@ -907,7 +1033,27 @@ export function initDebugBridge() {
   if (Capacitor.isNativePlatform()) {
     _log('[debug-bridge] Initializing native bridge');
     initNativeBridge().catch((e) => {
-      _log('[debug-bridge] Native bridge init failed:', (e as Error).message);
+      // LOUD, and self-explaining (#164). This used to be a `console.log` reading "Native bridge
+      // init failed", which is the worst possible shape for the failure it reports: the app runs
+      // fine, nothing listens on 9095, and the ONE line explaining why is (a) at log level, where a
+      // device log is pure chatter, and (b) worded so that neither `GameDebug` nor `TCP server
+      // listening` — the two things anyone actually greps for — matches it. A session lost an hour
+      // concluding the branch had never run, while this line was sitting in logcat all along.
+      //
+      // So: error level, both greppable tokens in the text, and the two flags NAMED. There are two
+      // independent answers to "is this a debug build" and only one of them is the JS define —
+      // `__MODOKI_DEBUG_BUILD__` gates whether this code runs at all, while the native plugin gates
+      // `startServer` on the AndroidManifest meta-data / Info.plist that `healNativeConfig` writes
+      // from the same `build.debugBuild` (#112). A project scaffolded without a heal has the first
+      // and not the second, and every symptom points at the first.
+      _err(
+        '[debug-bridge] FAILED to start — the GameDebug TCP server is NOT listening, so every '
+        + 'device_* tool is unreachable for this app. Reason:', (e as Error).message,
+        '\n  If that says the debug bridge is disabled, or the plugin is not implemented: the JS '
+        + 'side is on (this ran) but the NATIVE gate is off. Reopen the project in the editor, or '
+        + 'run healNativeConfig(projectRoot), to sync build.debugBuild into the native project — '
+        + 'then rebuild.',
+      );
     });
   } else {
     _log('[debug-bridge] Web mode — use Chrome with --remote-debugging-port=9222 for MCP debugging');

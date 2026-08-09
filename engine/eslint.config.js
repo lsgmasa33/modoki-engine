@@ -204,6 +204,16 @@ export default tseslint.config(
       // local `npm run dist*`; a fresh CI checkout never has it, so this only
       // matters for local lint runs (e.g. the test-clean skill).
       'release/**',
+      // Playable-ad export output (games/<id>/ads/) — gitignored like dist/, and this list
+      // has to agree with .gitignore or the local gate breaks for a reason nobody wrote.
+      // A COMPLETED playable build inlines everything into one HTML and leaves no JS to
+      // lint, which is why this went unnoticed: it is an ABORTED one that strands a
+      // minified `ads/assets/index-*.js`, and `npm run lint` then reports tens of thousands
+      // of errors in bundled vendor code. Measured: 33,482 errors from one interrupted
+      // build, turning the pre-push gate red with nothing wrong in the source tree.
+      // (`subgame-dist/` and `.vite/` are gitignored build outputs of the same shape; they
+      // carry no lintable JS today, so they are deliberately not listed yet.)
+      '**/ads/**',
       '**/*.tsbuildinfo',
       '**/.cache/**',
       // VitePress generated dependency cache (docs site) — minified vendor
@@ -241,7 +251,11 @@ export default tseslint.config(
   },
   // Browser-side code: app, games, and the engine/editor source.
   {
-    files: ['engine/app/**/*.{ts,tsx}', 'games/**/*.{ts,tsx}', 'engine/packages/*/src/**/*.{ts,tsx}'],
+    // `demos/**` sits alongside `games/**` deliberately: a demo is the same kind of thing (a
+    // self-contained project) and is the MORE exposed of the two — each one is published to its
+    // own public repo, so an ungated defect ships. Its absence here was not a decision; the
+    // test-file carve-out below was already written for `demos/*/tests/**` in anticipation.
+    files: ['engine/app/**/*.{ts,tsx}', 'games/**/*.{ts,tsx}', 'demos/**/*.{ts,tsx}', 'engine/packages/*/src/**/*.{ts,tsx}'],
     languageOptions: { globals: globals.browser },
     plugins: { 'react-hooks': reactHooks, 'react-refresh': reactRefresh },
     rules: {
@@ -277,6 +291,99 @@ export default tseslint.config(
         {
           selector: "NewExpression[callee.name='EventSource'] TemplateElement[value.raw=/^\\/api\\//]",
           message: "Use backendEventSource() from editor/backend/editorBackend instead of new EventSource(`/api/...`).",
+        },
+        // ECS index gate: an entity that is spawned but not registered is invisible to the O(1)
+        // entity index, so every lookup silently degrades to an O(n) scan — and engine code then
+        // takes a DIFFERENT path than it does in a registered world. koota owns `spawn()`, so the
+        // pairing could never be automatic; it was simply remembered at every production site and
+        // forgotten in the harness + nine test files, which surfaced as 21,906 warning lines in one
+        // CI run (2026-08-04). spawnEntity() does both, and this makes forgetting it impossible.
+        //
+        // Scoped to PRODUCTION source deliberately. Every `.spawn(` in these zones is a real koota
+        // world (verified: 24 sites, 10 files, and no `child_process` import anywhere in them). Test
+        // files are NOT covered, because there `.spawn(` is overwhelmingly the createTestWorld
+        // HANDLE — which registers already — and a selector cannot tell `tw.spawn()` from
+        // `world.spawn()` by shape. Guarding production is what stops the class from returning.
+        {
+          selector: "CallExpression[callee.type='MemberExpression'][callee.property.name='spawn']",
+          message: "Use spawnEntity(world, ...traits) from runtime/core/ecs/world — a bare world.spawn() leaves the entity out of the entity index (O(n) lookups, and a different code path than the running game).",
+        },
+      ],
+    },
+  },
+  // Game/demo TEST files: the parent block's `games/**` glob swallows `games/*/tests/**`
+  // (and would swallow `demos/*/tests/**` were demos ever added above), where `.spawn(`
+  // is overwhelmingly the createTestWorld HANDLE — which already registers — not a bare
+  // koota world, exactly the false-positive class already excluded for engine/tests. A
+  // selector can't tell `tw.spawn()` from `world.spawn()` by shape, so this exempts the
+  // spawn selector for test files while re-listing the OTHER selectors from the parent
+  // block: `no-restricted-syntax` REPLACES (not merges) per matching config object, so a
+  // block that matches the same files and only sets the rule to "spawn-less" would
+  // silently drop the /api/ gate for every game/demo test file if it omitted them.
+  {
+    files: ['games/*/tests/**/*.{ts,tsx}', 'demos/*/tests/**/*.{ts,tsx}'],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: "CallExpression[callee.name='fetch'] > Literal[value=/^\\/api\\//]",
+          message: "Use backendFetch() from editor/backend/editorBackend instead of fetch('/api/...') — see ELECTRON_PLAN Phase 1.",
+        },
+        {
+          selector: "CallExpression[callee.name='fetch'] TemplateElement[value.raw=/^\\/api\\//]",
+          message: "Use backendFetch() from editor/backend/editorBackend instead of fetch(`/api/...`) — see ELECTRON_PLAN Phase 1.",
+        },
+        {
+          selector: "NewExpression[callee.name='EventSource'] > Literal[value=/^\\/api\\//]",
+          message: "Use backendEventSource() from editor/backend/editorBackend instead of new EventSource('/api/...').",
+        },
+        {
+          selector: "NewExpression[callee.name='EventSource'] TemplateElement[value.raw=/^\\/api\\//]",
+          message: "Use backendEventSource() from editor/backend/editorBackend instead of new EventSource(`/api/...`).",
+        },
+      ],
+    },
+  },
+  // ECS destroy gate: the symmetric partner of the spawn gate above. Forgetting to unregister
+  // before `entity.destroy()` is WORSE than forgetting to register on spawn — a stale index entry
+  // points at a dead entity, so `findEntityById` hands back a corpse and the caller reads traits
+  // off it (two real leaks found in games/agy, 2026-08-04). `destroyEntity()` does both.
+  //
+  // Scoped NARROWLY (game runtimes + the engine's own ECS core), deliberately NOT the wide
+  // browser-side zone above: `.destroy()` there is legitimately PixiJS/three cleanup (Scene2D,
+  // ShaderPreview, canvas2DPool, videoTextureSync2D, pixiParticle*, …) and a wide selector would be
+  // a false-positive storm. Every `.destroy()` in these two narrow zones was verified to be an ECS
+  // entity. Because `no-restricted-syntax` REPLACES (not merges) per matching config object, this
+  // re-lists the fetch/EventSource/spawn selectors too, so games/*/runtime/** keeps every gate the
+  // wide zone above set for it.
+  {
+    files: ['games/*/runtime/**/*.{ts,tsx}', 'demos/*/runtime/**/*.{ts,tsx}', 'engine/packages/*/src/runtime/core/ecs/**/*.ts'],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: "CallExpression[callee.name='fetch'] > Literal[value=/^\\/api\\//]",
+          message: "Use backendFetch() from editor/backend/editorBackend instead of fetch('/api/...') — see ELECTRON_PLAN Phase 1.",
+        },
+        {
+          selector: "CallExpression[callee.name='fetch'] TemplateElement[value.raw=/^\\/api\\//]",
+          message: "Use backendFetch() from editor/backend/editorBackend instead of fetch(`/api/...`) — see ELECTRON_PLAN Phase 1.",
+        },
+        {
+          selector: "NewExpression[callee.name='EventSource'] > Literal[value=/^\\/api\\//]",
+          message: "Use backendEventSource() from editor/backend/editorBackend instead of new EventSource('/api/...').",
+        },
+        {
+          selector: "NewExpression[callee.name='EventSource'] TemplateElement[value.raw=/^\\/api\\//]",
+          message: "Use backendEventSource() from editor/backend/editorBackend instead of new EventSource(`/api/...`).",
+        },
+        {
+          selector: "CallExpression[callee.type='MemberExpression'][callee.property.name='spawn']",
+          message: "Use spawnEntity(world, ...traits) from runtime/core/ecs/world — a bare world.spawn() leaves the entity out of the entity index (O(n) lookups, and a different code path than the running game).",
+        },
+        {
+          selector: "CallExpression[callee.type='MemberExpression'][callee.property.name='destroy']",
+          message: "Use destroyEntity(entity) from runtime/core/ecs/world — a bare entity.destroy() leaves a stale entry in the entity index pointing at a dead entity (findEntityById returns a corpse).",
         },
       ],
     },

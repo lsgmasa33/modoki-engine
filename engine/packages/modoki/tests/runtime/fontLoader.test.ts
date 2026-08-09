@@ -307,5 +307,49 @@ describe('fontLoader', () => {
       expect(getLoadedFontFamilies()).toContain('Roboto');
       warn.mockRestore();
     });
+
+    it('a failure warning names the failing path + reason, not just a count', async () => {
+      installFontFaceMock();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { loadAllFonts } = await getLoader();
+      const p = loadAllFonts([{ path: '/fonts/Open-Bold.woff2', type: 'font' }]);
+      const sources = Object.keys(loadCalls);
+      (rejecters[sources[0]] ?? []).forEach(r => r(new Error('boom')));
+      await p;
+      const msg = warn.mock.calls.map(c => String(c[0])).find(m => /fonts failed/.test(m));
+      expect(msg).toContain('/fonts/Open-Bold.woff2');
+      expect(msg).toContain('boom');
+      warn.mockRestore();
+    });
+
+    it('skips a font entry whose manifest block has sourceShipped:false — the build dropped it on purpose', async () => {
+      installFontFaceMock();
+      const { loadAllFonts, getLoadedFontFamilies } = await getLoader();
+      const p = loadAllFonts([
+        { path: '/fonts/Roboto-Regular.woff2', type: 'font', font: { sourceShipped: false } },
+        { path: '/fonts/Open-Bold.woff2', type: 'font', font: { sourceShipped: true } },
+        { path: '/fonts/Geologica-Bold.woff2', type: 'font' }, // no font block at all — dev/legacy, still loads
+      ]);
+      const sources = Object.keys(loadCalls);
+      // Only the two NOT flagged sourceShipped:false attempted a load.
+      expect(sources.length).toBe(2);
+      expect(sources.some(s => s.includes('Roboto'))).toBe(false);
+      sources.forEach(s => (resolvers[s] ?? []).forEach(r => r()));
+      await p;
+      expect(getLoadedFontFamilies()).not.toContain('Roboto');
+      expect(getLoadedFontFamilies()).toContain('Open');
+      expect(getLoadedFontFamilies()).toContain('Geologica');
+    });
+
+    it('does not warn about a sourceShipped:false font — it is not a failure', async () => {
+      installFontFaceMock();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { loadAllFonts } = await getLoader();
+      await loadAllFonts([
+        { path: '/fonts/Roboto-Regular.woff2', type: 'font', font: { sourceShipped: false } },
+      ]);
+      expect(warn).not.toHaveBeenCalled();
+      warn.mockRestore();
+    });
   });
 });

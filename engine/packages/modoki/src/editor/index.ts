@@ -1,7 +1,7 @@
 /** @modoki/editor — Visual editor, dev-only. Not shipped in production builds. */
 
 export { backendFetch, backendPostJson, backendEventSource, backendBase, backendUrl } from './backend/editorBackend';
-export { createEditor, type EditorOptions, getResolvedRender3d } from './createEditor';
+export { createEditor, setExtraMenus, type EditorOptions, type ExtraMenuItem, getResolvedRender3d } from './createEditor';
 export {
   pushAction, undo, redo, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion,
   beginActionCapture, endActionCapture, isCapturingActions, type UndoAction,
@@ -15,8 +15,8 @@ export {
 export {
   emptySpecs, primitiveSpecs, shape2DSpecs, canvas2DSpecs, uiSpecs, cameraSpecs, lightSpecs, environmentSpecs, particleSpecs,
   buildEntityCreateSpecs, type CreateEntitySpec, type CreateSpecs, type LightKind,
-} from './entityCreateSpecs';
-export { buildUiCreateSpecs, type UiPreset } from './uiAuthoring';
+} from '../runtime/scene/entityCreateSpecs';
+export { buildUiCreateSpecs, type UiPreset } from '../runtime/ui/uiAuthoring';
 export { enterPlay, stopPlay, pausePlay, resetPlayMode } from './scene/playMode';
 export {
   editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled,
@@ -31,6 +31,12 @@ export {
   applyWheelStep, useWheelStep,
 } from './panels/fields';
 export { useDebouncedSave } from './panels/useDebouncedSave';
+// Device listing — shared by the AI panel's connect picker and the app shell's Build-menu target
+// picker (#170), which is why it leaves the package rather than staying panel-private.
+export {
+  fetchDeviceList, androidRowLabel, androidRowNote,
+  type DeviceListReply, type AndroidDeviceRow, type IosDeviceRow, type DeviceClaim,
+} from './panels/deviceConnectModel';
 export {
   serializePrefab, instantiatePrefab, instantiatePrefabAsync, setPrefabSource,
   getPrefabSource, setPrefabCache, getOverrides, getOverrideValues,
@@ -73,4 +79,6 @@ export { hasUnsavedChanges, unsavedChangeCauses, markSceneSaved, type SaveResult
 
 // C7: the agent save-all path must honour prefab-edit mode like the human paths do —
 // otherwise an explicit `path` writes the SYNTHETIC prefab-edit world over a real scene.
-export { isEditingPrefab } from './scene/prefabEdit';
+// #125: prefab-edit is also the only round-trip that re-serializes a .prefab.json, so the
+// bulk re-save sweep (engine/scripts/resave-prefabs.sh) drives these three as agent ops.
+export { isEditingPrefab, openPrefabForEditing, savePrefabEdit, exitPrefabEditing } from './scene/prefabEdit';

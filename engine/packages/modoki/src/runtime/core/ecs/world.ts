@@ -8,6 +8,8 @@ import { type World } from 'koota';
 import { getCurrentWorld, getEntityIndex, getGuidIndex, peekCurrentWorld } from './worldRegistry';
 import { EntityAttributes } from '../traits/EntityAttributes';
 import { emit, entityRef, isJournalEnabled } from '../journal';
+import { inSystemTick } from '../systemTick';
+import { Transient } from '../traits/Transient';
 
 export { getCurrentWorld, setCurrentWorld, onWorldSwap, getGuidIndex, peekCurrentWorld } from './worldRegistry';
 
@@ -69,6 +71,55 @@ export function registerEntity(entity: any, world: World = getCurrentWorld()) {
   if (guid) getGuidIndex(world).set(guid, entity);
   _onStructure?.();
   emitLifecycle('@spawn', entity, world);
+}
+
+/** Spawn an entity AND put it in the world's index — the only sanctioned way to create one.
+ *
+ *  `world.spawn()` is koota's API, so nothing could make registration automatic; `registerEntity`
+ *  has always been a second call you had to remember. Every production site DID remember (a sweep
+ *  found no exception), but the harness and nine test files did not — and an unregistered entity
+ *  is invisible to the O(1) index, so every lookup falls back to an O(n) scan. That is not merely
+ *  slow: engine code under those tests took a DIFFERENT path than the same code takes in the
+ *  running game, and it announced itself as 21,906 warning lines in one CI run before anyone
+ *  noticed (2026-08-04).
+ *
+ *  There is no case for spawning without registering — hence this helper, and the ESLint rule that
+ *  bans a bare `.spawn(` everywhere except right here.
+ *
+ *  Also the one place that tags a RUNTIME spawn `Transient` (#124). Every load-time spawn
+ *  (scene load, GLB import, SceneManager, the headless harness) runs OUTSIDE a system tick, so
+ *  it is unaffected; a spawn made from INSIDE a registered system's `fn(world)` — e.g. a
+ *  PROJECTION-tier system like chess's board sync, which runs even while the editor is stopped
+ *  (see pipeline.ts's `runPipeline`) — gets tagged so the serializer skips it and its subtree
+ *  instead of baking generated/derived entities into the scene file on save.
+ *
+ *  `inSystemTick()` is a synchronous flag (set for the duration of the system loop only), so a
+ *  spawn made from an ASYNC continuation a system merely STARTED — e.g. a GLB load resolving
+ *  after the tick that kicked it off has already ended — lands outside the tick and is NOT
+ *  tagged. That's a known, deliberate gap: it errs toward the spawned entity getting SAVED
+ *  rather than silently dropped, which is the safe direction for what is fundamentally a
+ *  data-loss-shaped bug — a false negative here just re-creates the old behavior for that one
+ *  case, a false positive would destroy the caller's data. */
+export function spawnEntity(world: World, ...traits: Parameters<World['spawn']>) {
+  // eslint-disable-next-line no-restricted-syntax -- the one sanctioned world.spawn in the engine
+  const entity = world.spawn(...traits);
+  if (inSystemTick()) entity.add(Transient);
+  registerEntity(entity, world);
+  return entity;
+}
+
+/** Destroy an entity AND drop it from the world's index — the symmetric partner of spawnEntity,
+ *  and the only sanctioned way to remove one.
+ *
+ *  Forgetting this half is WORSE than forgetting to register. An unregistered entity merely costs
+ *  an O(n) scan and is still correct; an unregistered DESTROY leaves a live index entry pointing at
+ *  a dead entity, so `findEntityById` hands back a corpse and the caller reads traits off it. Two
+ *  sites in the since-deleted `games/agy` scaffold did exactly that (2026-08-04), found by asking
+ *  whether the spawn fix had a mirror image — it did. */
+export function destroyEntity(entity: any, world: World = getCurrentWorld()) {
+  unregisterEntity(entity, world);
+  // eslint-disable-next-line no-restricted-syntax -- the one sanctioned entity.destroy() in the engine
+  entity.destroy();
 }
 
 /** Unregister an entity from the given world's index. Called before entity.destroy(). */

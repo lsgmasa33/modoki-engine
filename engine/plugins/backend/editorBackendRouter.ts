@@ -26,6 +26,7 @@ import { execFileSync } from 'child_process';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, isGcsObjectMissing, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './gcloud';
 import { openInOS, revealInOS } from './osOpen';
 import { readMetaSidecar, writeMetaSidecar } from '../meta-sidecar';
+import { readFontAxes } from '../font-instance';
 import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
@@ -161,7 +162,7 @@ import {
 } from '../load-project-config';
 import {
   mergeProjectConfig, mergeProjectUserConfig, deepMergeConfigPatch, pruneProjectConfig, projectConfigIssues,
-  PROJECT_CONFIG_FILENAME,
+  PROJECT_CONFIG_FILENAME, PRIVATE_BUILD_FIELDS,
   findNullPatchPaths, DEFAULT_PROJECT_CONFIG, DEFAULT_PROJECT_USER_CONFIG, type RawProjectConfig,
 } from '../../project-config';
 import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, type PrefabResolver } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
@@ -170,10 +171,12 @@ import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type Muta
 import { getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData, type AssetSchemaType } from '../../packages/modoki/src/runtime/assets/assetSchemas';
 import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
+import { adbBinary, isUsable, listAndroidDevices, withFriendlyNames } from './androidDevices';
+import { adbDeviceId, iosDeviceId, listClaims, type DeviceClaim } from './deviceClaims';
 import { tryDeviceCdpInput, isDeviceCdpAvailable, synthFallbackBanner, TRUSTED_CDP_MECHANISM } from './deviceCdp';
 import { tryDeviceWdaInput, isDeviceWdaAvailable, resetDeviceWdaSession, tryDeviceWdaScreenshot, TRUSTED_WDA_MECHANISM, WDA_NOT_IOS_REASON, NO_WDA_ON_THIS_DEVICE } from './deviceWda';
 import { isDeviceFailureReply } from './deviceAim';
-import { stopWda } from './wdaLauncher';
+import { listIosDevicesForSelection, stopWda } from './wdaLauncher';
 import { resolveModules } from '../detect-modules';
 // Type-only — erased at runtime, so it does NOT pull the tree-shaker (and its
 // vite-asset-scanner import) into this host-agnostic router.
@@ -252,6 +255,12 @@ const ASSET_SCHEMA_TYPES = ['material', 'particle', 'animation', 'spriteanim', '
 const json = (body: unknown, status?: number): BackendResult => ({ kind: 'json', status, body });
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** Plain-object check for an untrusted patch body value (mirrors the private
+ *  `isPlainObject` in project-config.ts, which is not exported). Used by the
+ *  POST /api/project-settings private-build-field split below. */
+const isPlainObjectLocal = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
 
 // ── MCP persistence: MANUAL ONLY (owner decision, 2026-07-30) ──────────
 // There used to be an 'auto' mode (the default) in which every live mutation ALSO saved the
@@ -676,7 +685,20 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     // that answers `resolve-aim`), not just the half that is cheap to check — see the measured
     // false claim documented on `isDeviceCdpAvailable`.
     const proxy = (m: string, p: Record<string, unknown>) => deviceConnection.proxy(m, p);
-    if (await isDeviceCdpAvailable({ proxy })) return json({ ...status, inputMechanism: TRUSTED_CDP_MECHANISM });
+    // Gated on the device being ANDROID and on the CDP target being THIS lease's app, exactly as
+    // the input route is (#142) — a status read that says `trusted-cdp` for an iOS lease is the
+    // same lie, and it is the one an agent consults BEFORE deciding whether to trust its input.
+    if (await deviceConnection.devicePlatform() === 'android'
+        && await isDeviceCdpAvailable({
+          proxy,
+          preferPackage: (await deviceConnection.deviceAppId()) ?? undefined,
+          // The phone the LEASE resolved (#149). Without it, discovery on a two-handset Mac can
+          // find a webview on the OTHER device and report `trusted-cdp` for a lease that is not
+          // holding it — the same class as #142, one device down instead of one app.
+          ...(status.target?.serial ? { serial: status.target.serial } : {}),
+        })) {
+      return json({ ...status, inputMechanism: TRUSTED_CDP_MECHANISM });
+    }
     // #32 Phase 2 — an iOS device has no CDP route but may have WebDriverAgent. Reported honestly:
     // `trusted-wda` covers tap and drag ONLY, which is why the mechanism line names them rather than
     // implying every op is trusted (press_key/scroll/hover stay synthetic on iOS — see deviceWda.ts).
@@ -689,9 +711,55 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     }
     return json({ ...status, inputMechanism: 'synthetic' });
   }
+  // ── GET /api/device/list ── which devices could this Mac drive, and who already holds them (#149).
+  // Answers the two questions the device surface could not answer before: "which phone do you mean?"
+  // (several of the same platform attached) and "is anyone else already using it?" (four clones on
+  // one machine). Read-only — listing never claims anything.
+  //
+  // Both platforms in ONE reply because the caller's question is "what can I connect to", not "what
+  // Androids are there": an agent choosing a target should see that the iPhone it wants is held by
+  // a sibling clone without having to know to ask a second endpoint.
+  if (urlPath === '/api/device/list' && method === 'GET') {
+    const claims = listClaims();
+    const claimFor = (id: string): DeviceClaim | undefined => claims.find((c) => c.deviceId === id);
+    // adb absence is reported as a FIELD, not an error: "no Android devices" and "no adb installed"
+    // are different problems with different fixes, and collapsing them sends the human to look at
+    // the cable when the SDK is what is missing.
+    let adbPath: string | null = null;
+    try { adbPath = adbBinary(); } catch { /* not installed — reported below */ }
+    const android = (adbPath ? withFriendlyNames(listAndroidDevices()) : []).map((d) => ({
+      ...d,
+      usable: isUsable(d),
+      claim: claimFor(adbDeviceId(d.serial)) ?? null,
+    }));
+    // iOS listing is macOS-only and can be slow (two `xcrun` shell-outs, each bounded at 20s), so it
+    // is skipped entirely off-Mac rather than failing — the same platform gate the WDA launcher uses.
+    // `await`ed, not fired sync: this route runs inside the Electron main process and the AI panel
+    // polls it every 2.5s, so a sync exec here froze the whole editor's input for ~1.4s every ~10s
+    // (#168) — `listIosDevicesForSelection`/`wdaLauncherExec` now shell out via async `execFile`.
+    const ios = process.platform === 'darwin'
+      ? (await listIosDevicesForSelection()).map((d) => ({ ...d, claim: claimFor(iosDeviceId(d.udid)) ?? null }))
+      : [];
+    // A WiFi lease claims by ADDRESS, so its claim matches no hardware entry above. Surfaced
+    // separately rather than dropped: "someone holds 192.168.1.42" is exactly the collision a
+    // second session needs to see, and it is invisible in either hardware list.
+    const otherClaims = claims.filter((c) => c.deviceId.startsWith('ip:'));
+    return json({
+      android,
+      ios,
+      otherClaims,
+      adb: { present: !!adbPath, ...(adbPath ? { path: adbPath } : {}) },
+      // WHO IS ASKING. Without it a reader cannot tell its OWN claim from a sibling clone's — and
+      // the reader's own claim is the common case (this editor is holding the lease right now), so
+      // a picker would render the very device you are connected to as "held by someone" and refuse
+      // to select it. `clone`+`pid` are the two fields a claim carries that identify a holder.
+      self: { clone: process.cwd(), pid: process.pid },
+      ...(adbPath ? {} : { note: 'adb is not installed, so Android devices cannot be listed — install the Android SDK from Build Support (or set ANDROID_HOME).' }),
+    });
+  }
   if (urlPath === '/api/device/connect' && method === 'POST') {
     const b = (body ?? {}) as ConnectRequest;
-    try { return json(await deviceConnection.connect({ ip: b.ip, useAdb: b.useAdb, port: b.port })); }
+    try { return json(await deviceConnection.connect({ ip: b.ip, useAdb: b.useAdb, port: b.port, serial: b.serial })); }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 500); }
   }
   if (urlPath === '/api/device/disconnect' && method === 'POST') {
@@ -713,7 +781,19 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     const b = (body ?? {}) as { method?: string; params?: Record<string, unknown> };
     if (!b.method) return json({ error: 'method required' }, 400);
     try {
-      const proxy = (m: string, p: Record<string, unknown>) => deviceConnection.proxy(m, p);
+      // NESTED DEADLINES (#153), the same rule `/api/eval` follows one layer up: the transport
+      // deadline is sized from the OP'S OWN budget plus headroom, so the innermost timeout is the
+      // one that fires and the error names what the code was doing. Without it every device op
+      // shared `TcpLeaseTransport`'s fixed 5000ms — whose clock starts HOST-side, before the
+      // request reaches the phone — so a device-side budget at or near 5000 was unreachable and
+      // reported as a dead link. Read generically off `params.timeoutMs` rather than special-cased
+      // to `eval`: any op that grows a budget gets the same treatment for free, and an op without
+      // one passes `undefined` and keeps the connection default.
+      const opTimeout = Number((b.params as { timeoutMs?: unknown } | undefined)?.timeoutMs);
+      // Headroom for the round trip in BOTH directions. Deliberately smaller than /api/eval's
+      // 10s — that one crosses an HMR websocket relay; this is one LAN/USB hop.
+      const deadline = Number.isFinite(opTimeout) && opTimeout > 0 ? opTimeout + 5_000 : undefined;
+      const proxy = (m: string, p: Record<string, unknown>) => deviceConnection.proxy(m, p, deadline);
       // #102 — iOS out-of-app capture. The native path is the APP'S OWN capture, so a system dialog
       // or springboard is invisible to it (it returns the app underneath, which reads as a fine
       // screenshot of the wrong thing). WDA sees the whole screen. Two triggers, each covering what
@@ -752,7 +832,9 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
           if (!isIos) return json({ error: WDA_NOT_IOS_REASON }, 409);
           // Explicit ask pays the agent spin-up; a refusal must say why rather than quietly
           // handing back a native capture the caller specifically did not want.
-          const shot = await tryDeviceWdaScreenshot({ host }, { autoLaunch: true });
+          // The only screenshot path that LAUNCHES, so the only one that needs the lease's
+          // hardware to pick the right phone (#146). The two fallbacks below never auto-launch.
+          const shot = await tryDeviceWdaScreenshot({ host, lease: await deviceConnection.deviceHardware() }, { autoLaunch: true });
           return shot.handled ? json({ result: shot.reply }) : json({ error: shot.reason }, 409);
         }
         // The native capture fails two ways, and BOTH mean "the app could not photograph itself":
@@ -777,7 +859,32 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         // second call.
         return json({ result: native, wdaFallbackUnavailable: shot.reason });
       }
-      let outcome = await tryDeviceCdpInput(b.method, b.params ?? {}, { proxy });
+      // GATED ON THE DEVICE BEING ANDROID, and on the CDP target being THIS lease's app (#142).
+      // The mirror of the iOS gate below, and it was missing: CDP discovery runs entirely through
+      // adb (`/proc/net/unix` → `adb forward`) and knows nothing about the lease, so "a CDP route
+      // exists" is NOT "the leased device is the one adb sees". Measured with an iPhone leased over
+      // WiFi and a Samsung on USB: the tap was dispatched into the SAMSUNG and reported
+      // `ok (cdp touch) … [input:trusted-cdp]`, while the iPhone's page received nothing — with the
+      // coordinates resolved through the LEASE, i.e. computed on the iPhone's layout and injected
+      // into a different screen. Strict `=== 'android'`: an unconfirmed platform must never be read
+      // as Android, the same rule the iOS gate follows.
+      //
+      // Expressed as "no session" rather than as an early return on purpose: falling back to
+      // synthetic is ALLOWED but never QUIET (this module's header), and an early return with
+      // `reason: null` silently dropped the SYNTHETIC INPUT (NOT TRUSTED) banner for every
+      // non-Android device — caught by two existing tests. Routing the gate through `getSession`
+      // reuses tryDeviceCdpInput's reason logic verbatim instead of restating it here.
+      const isAndroid = await deviceConnection.devicePlatform() === 'android';
+      // ONE status read, not one per field: `status()` is a snapshot, and reading it twice inside a
+      // single dispatch could straddle a reconnect and answer the two halves from different leases.
+      const leasedSerial = deviceConnection.status().target?.serial;
+      let outcome = await tryDeviceCdpInput(b.method, b.params ?? {}, {
+        proxy,
+        preferPackage: (await deviceConnection.deviceAppId()) ?? undefined,
+        // Target the leased phone, not whichever adb lists first (#149).
+        ...(leasedSerial ? { serial: leasedSerial } : {}),
+        ...(isAndroid ? {} : { getSession: async () => null }),
+      });
       // #32 Phase 2: no CDP route (an iOS device, or an Android one without adb) ⇒ try
       // WebDriverAgent before giving up on trusted input. Only tap/drag are routable on iOS — the
       // other ops have no faithful trusted equivalent there (see deviceWda.ts's header), so they
@@ -789,15 +896,20 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // reporting "cannot tell which iPhone to use". Asked once per lease, and only here, so a
       // CDP-handled op pays nothing for it. See `devicePlatform()` for the measurement.
       if (!outcome.handled && await deviceConnection.devicePlatform() === 'ios') {
+        // `lease` is what stops the lazy launch picking a phone by what is plugged into this Mac
+        // (#146). Same probe as `devicePlatform()` just above, so it costs no extra round trip.
         const wda = await tryDeviceWdaInput(b.method, b.params ?? {}, {
-          proxy, host: deviceConnection.status().target?.host,
+          proxy,
+          host: deviceConnection.status().target?.host,
+          lease: await deviceConnection.deviceHardware(),
         });
         // Keep the CDP reason when WDA has nothing to add (`reason: null` = not an op it routes):
         // the caller's banner should name the cause, and "not a WDA op" is not the cause.
         if (wda.handled || wda.reason) outcome = wda;
       }
       if (outcome.handled) return json({ result: outcome.reply });
-      const synthetic = await deviceConnection.proxy(b.method, b.params ?? {});
+      // The op's own deadline applies here too — this is the path a `device_eval` actually takes.
+      const synthetic = await deviceConnection.proxy(b.method, b.params ?? {}, deadline);
       // An INPUT op that could have been trusted but wasn't: front the reply with a loud banner
       // naming the cause, instead of relying on the ` [input:synthetic]` suffix at the end of the
       // line. `reason: null` means this was never an input op (eval/screenshot/…) — stay silent.
@@ -824,9 +936,19 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // in `result` (the MCP tool flags that as isError). Editor-only: this router is stripped
   // from shipped game builds.
   if (urlPath === '/api/eval' && method === 'POST') {
-    const b = (body ?? {}) as { code?: string };
+    const b = (body ?? {}) as { code?: string; timeoutMs?: number };
     if (typeof b.code !== 'string' || !b.code) return json({ error: 'code (string) required' }, 400);
-    try { return json({ result: await ctx.requestBrowser('eval', { code: b.code }) }); }
+    // Size the RELAY deadline from the op's own, exactly as /api/wait-for-edit does. Without this
+    // the relay's 3000ms default was strictly SMALLER than the eval's 5000ms budget, so the eval's
+    // timeout message was unreachable and a legitimately-slow eval reported as a dead renderer.
+    // The clamp is restated rather than imported — this file cannot import the renderer bundle —
+    // and must stay in step with `clampEvalTimeout(..., EVAL_ASYNC_TIMEOUT_MS,
+    // EDITOR_EVAL_MAX_TIMEOUT_MS)` in bridgeHelpers.ts (same pattern, same reason, as wait-for-edit).
+    const opTimeout = Number.isFinite(b.timeoutMs) && (b.timeoutMs as number) > 0
+      ? Math.max(50, Math.min(25_000, Math.floor(b.timeoutMs as number)))
+      : 5000;
+    const relayTimeoutMs = opTimeout + 10_000; // headroom over the op's own deadline
+    try { return json({ result: await ctx.requestBrowser('eval', { code: b.code, timeoutMs: opTimeout }, relayTimeoutMs) }); }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
   }
 
@@ -876,6 +998,88 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   }
   if (urlPath === '/api/watch/clear' && method === 'POST') {
     try { return json(await ctx.requestBrowser('watch-clear', body ?? {})); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+
+  // ── Profiler (#166 P6) ── "where did the frame go?" for the EDITOR surface.
+  //
+  // The op shipped with #138 and had no typed tool on EITHER surface — it was reachable only by an
+  // agent who knew to eval it, which skips strict validation, the §5 envelope, and every coverage
+  // tier. Split by METHOD, not by a single route taking an action: the read actions are GET, and
+  // the ones that change profiler state (capture control, GPU timestamps, reset) are POST, so
+  // conventions §4 — "no mutating operation is reachable by GET", because a GET's ok is never
+  // failure-checked — holds per action rather than on average.
+  if (urlPath === '/api/profiler' && method === 'GET') {
+    const markers = query.get('markers');
+    const limit = query.get('limit');
+    const action = query.get('action') ?? 'read';
+    const MUTATING = ['capture-start', 'capture-stop', 'capture-clear', 'gpu-on', 'gpu-off', 'reset'];
+    if (action !== 'read' && action !== 'capture-read') {
+      // A mutating action arriving by GET is refused rather than served: obeying it here is exactly
+      // the unchecked-failure hole §4 describes. An UNKNOWN action is a DIFFERENT error and must not
+      // be told it "mutates" — `?action=Read` (wrong case) used to get that sentence, which is
+      // simply false and sends the reader looking for the wrong fix.
+      return MUTATING.includes(action)
+        ? json({ error: `profiler action "${action}" MUTATES profiler state, so it must be POSTed to /api/profiler — GET serves only read / capture-read.` }, 405)
+        : json({ error: `unknown profiler action "${action}". GET serves read / capture-read; POST /api/profiler takes ${MUTATING.join(' / ')}.` }, 400);
+    }
+    const params = {
+      action,
+      ...(markers != null && markers !== '' && !Number.isNaN(Number(markers)) ? { markers: Number(markers) } : {}),
+      ...(limit != null && limit !== '' && !Number.isNaN(Number(limit)) ? { limit: Number(limit) } : {}),
+    };
+    try { return json(await ctx.requestBrowser('profiler', params)); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+  if (urlPath === '/api/profiler' && method === 'POST') {
+    try { return json(await ctx.requestBrowser('profiler', body ?? {})); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+
+  // ── Input WATCH (#134, M→R) ── what the pointer actually did, and what it resolved to. ──
+  if (urlPath === '/api/input-watch/start' && method === 'POST') {
+    try { return json(await ctx.requestBrowser('input-watch-start', body ?? {})); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+  if (urlPath === '/api/input-watch/read' && method === 'GET') {
+    const limit = query.get('limit');
+    const precision = query.get('precision');
+    const params = {
+      unresolvedOnly: query.get('unresolvedOnly') === '1' || query.get('unresolvedOnly') === 'true',
+      ...(limit != null && limit !== '' && !Number.isNaN(Number(limit)) ? { limit: Number(limit) } : {}),
+      ...(precision != null && precision !== '' && !Number.isNaN(Number(precision)) ? { precision: Number(precision) } : {}),
+    };
+    try { return json(await ctx.requestBrowser('input-watch-read', params)); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+  if (urlPath === '/api/input-watch/stop' && method === 'POST') {
+    try { return json(await ctx.requestBrowser('input-watch-stop', {})); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+  if (urlPath === '/api/input-watch/clear' && method === 'POST') {
+    try { return json(await ctx.requestBrowser('input-watch-clear', {})); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+
+  // ── Hit REGIONS (#139, M→R) ── the shapes a game's hitTest uses, which are authored nowhere. ──
+  if (urlPath === '/api/hit-regions' && method === 'GET') {
+    const num = (k: string): number | undefined => {
+      const v = query.get(k);
+      return v != null && v !== '' && !Number.isNaN(Number(v)) ? Number(v) : undefined;
+    };
+    const ids = query.get('ids');
+    const atX = num('atX'), atY = num('atY');
+    const params = {
+      action: query.get('action') || 'read',
+      ...(query.get('provider') ? { provider: query.get('provider') } : {}),
+      ...(query.get('kind') ? { kind: query.get('kind') } : {}),
+      ...(ids ? { ids: ids.split(',').map((s) => s.trim()).filter(Boolean) } : {}),
+      ...(num('limit') !== undefined ? { limit: num('limit') } : {}),
+      ...(num('precision') !== undefined ? { precision: num('precision') } : {}),
+      // Both or neither — a half-specified point would silently probe (x, 0).
+      ...(atX !== undefined && atY !== undefined ? { at: { x: atX, y: atY } } : {}),
+    };
+    try { return json(await ctx.requestBrowser('hit-regions', params)); }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
   }
 
@@ -1404,6 +1608,30 @@ async function describeUnresolvedAgainstLiveWorld(
     return { kind: 'raw', contentType: 'application/json', body: JSON.stringify(readMetaSidecar(resolved)) };
   }
 
+  // ── GET /api/font-axes?path= (M) ── the variation axes a font actually exposes,
+  // read from its `fvar` table: [{tag, min, def, max}], `[]` for a static font.
+  //
+  // The Font Inspector needs these to offer real per-axis ranges instead of a free-text
+  // guess, and it CANNOT derive them itself: it runs in the renderer, and the answer lives
+  // in bytes on disk — pulling a 9MB CJK .ttf into the browser to read a ~100-byte table
+  // would be absurd. `def` matters as much as the range: it is frequently the axis MINIMUM
+  // (Geologica 100/Thin, Nunito 200/ExtraLight), which is the whole reason authoring an
+  // axis is necessary rather than cosmetic.
+  if (urlPath === '/api/font-axes' && method === 'GET') {
+    const assetPath = query.get('path') || '';
+    if (!assetPath) return json({ error: 'path is required (an asset-root path to a .ttf/.otf)' }, 400);
+    const resolved = ctx.resolveAssetPath(assetPath);
+    if (!resolved) return json({ error: `path outside allowed directories: ${assetPath}` }, 403);
+    if (!fs.existsSync(resolved)) return json({ error: `asset not found: ${assetPath}` }, 404);
+    try {
+      return json({ axes: readFontAxes(fs.readFileSync(resolved)) });
+    } catch (e) {
+      // A malformed/unreadable font is not a server fault — report empty axes so the
+      // Inspector degrades to "no axes" rather than showing an error box.
+      return json({ axes: [], warning: String(e) });
+    }
+  }
+
   // ── GET /api/scripts/tree (M) ── source files for the in-browser code editor:
   // the project working copy (writable) + the engine source (read-only). NOT
   // asset-manifest entries — scripts live outside asset roots by design.
@@ -1881,7 +2109,44 @@ async function describeUnresolvedAgainstLiveWorld(
       // back here and trip the unknown-section 400 below — a confusing refusal for
       // something the caller never authored. Drop it before anything else looks.
       const { configErrors: _configErrors, ...bodyIn } = (body ?? {}) as Record<string, unknown>;
-      const { user: userPart, ...configPart } = bodyIn;
+      const { user: userPartIn, ...configPart } = bodyIn;
+      let userPart = userPartIn;
+      // Private build.* fields (see PRIVATE_BUILD_FIELDS) must never land in
+      // project.config.json — the Project Settings dialog posts back the WHOLE
+      // resolved object (which is the OVERLAID config, see loadProjectConfig), so
+      // without this split a private value would round-trip straight back into the
+      // committed file on the very next save and undo the migration. Move each
+      // private field present in `configPart.build` into the user patch, and force
+      // it to '' in the committed patch so Apply also CLEARS any pre-existing
+      // committed value: a save becomes an automatic migration off the committed file.
+      //
+      // `build.<field>` present in the patch WINS over anything in `user.build` —
+      // it is the field the Project Settings dialog actually edits (see the
+      // `build.appleTeamId` / `build.webBucket` entries in app/editor/setup.ts), and
+      // the dialog posts the WHOLE object, so the `user` subtree it sends back is
+      // whatever it LOADED, never the edit. Deferring to it instead would silently
+      // discard every change: type a new Team ID, press Apply, and the stale
+      // round-tripped `user.build.appleTeamId` would win and the dialog would reload
+      // showing the old value — and clearing a field would be impossible. A caller
+      // that means to write the user file directly simply omits `build.<field>`
+      // (`modoki_project_settings action=set` can post either section alone).
+      if (isPlainObjectLocal(configPart.build)) {
+        const configBuild: Record<string, unknown> = { ...configPart.build };
+        const userRec: Record<string, unknown> = isPlainObjectLocal(userPart) ? { ...userPart } : {};
+        const userBuild: Record<string, unknown> = isPlainObjectLocal(userRec.build) ? { ...userRec.build } : {};
+        let touchedUserBuild = false;
+        for (const field of PRIVATE_BUILD_FIELDS) {
+          if (!Object.prototype.hasOwnProperty.call(configBuild, field)) continue;
+          userBuild[field] = configBuild[field];
+          touchedUserBuild = true;
+          configBuild[field] = '';
+        }
+        configPart.build = configBuild;
+        if (touchedUserBuild) {
+          userRec.build = userBuild;
+          userPart = userRec;
+        }
+      }
       // No config field is nullable, so a null is the caller reaching for "clear
       // this" with the wrong value. Writing it through poisons a typed field and
       // dropping it would be a silent no-op reported as success — reject instead.

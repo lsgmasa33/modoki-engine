@@ -37,6 +37,13 @@ export interface TreeShakeResult {
   /** Per-orphan detail (path + asset type + byte size) — powers the editor's
    *  "Clean Up Unused Assets" dialog. Same set as `orphans`, enriched. */
   orphanDetails: OrphanDetail[];
+  /** Font virtual paths kept because a scene/prefab named their CSS family via
+   *  `UIElement.fontFamily` (or a `resources[]` `type:'font'` entry) — i.e. a DOM/
+   *  PixiJS consumer, resolved by `resolveFontsByFamily`. A font NOT in this set may
+   *  still be kept (a Text2D GUID ref reaches it directly), but has no known DOM
+   *  consumer — this is the signal the build's `shipSource:'auto'` decision reads to
+   *  decide whether the source `.ttf`/`.otf` is worth shipping alongside its atlas. */
+  domFontFiles: Set<string>;
 }
 
 export interface OrphanDetail {
@@ -493,14 +500,15 @@ function processRig2D(json: unknown, state: WalkState, referencedBy: string): vo
 }
 
 /** A `.timeline.json` (Director sequence) references inner GUIDs the entity walk can't see:
- *  audio-cue GUIDs (audio tracks) and PREFAB GUIDs (control tracks). Follow both so an asset
- *  reachable ONLY through a timeline (no other reference) is kept — otherwise it's shaken out of
- *  prod and cueClip / the control spawn 404s at the marker. Mirrors SceneManager's runtime walk
- *  (collectTimelineAudioRefs + collectTimelineControlRefs). Animation-track clips are NAMES
+ *  audio-cue GUIDs (audio tracks), PREFAB GUIDs (control tracks) and VIDEO GUIDs (video tracks).
+ *  Follow all three so an asset reachable ONLY through a timeline (no other reference) is kept —
+ *  otherwise it's shaken out of prod and cueClip / the control spawn / the cutscene 404s at the
+ *  marker. Mirrors SceneManager's runtime walk (collectTimelineAudioRefs +
+ *  collectTimelineControlRefs + collectTimelineVideoRefs). Animation-track clips are NAMES
  *  resolved via the target Animator bank (kept by processAnimator), so they're not followed here. */
 function processTimeline(json: unknown, state: WalkState, referencedBy: string): void {
   if (!json || typeof json !== 'object') return;
-  const data = json as { tracks?: Array<{ type?: string; cues?: Array<{ clip?: unknown }>; clips?: Array<{ prefab?: unknown }> }> };
+  const data = json as { tracks?: Array<{ type?: string; cues?: Array<{ clip?: unknown }>; clips?: Array<{ prefab?: unknown; clip?: unknown }> }> };
   if (!Array.isArray(data.tracks)) return;
   for (const track of data.tracks) {
     if (track?.type === 'audio' && Array.isArray(track.cues)) {
@@ -508,6 +516,9 @@ function processTimeline(json: unknown, state: WalkState, referencedBy: string):
     }
     if (track?.type === 'control' && Array.isArray(track.clips)) {
       for (const clip of track.clips) pushRef(state, 'asset', clip?.prefab, referencedBy);
+    }
+    if (track?.type === 'video' && Array.isArray(track.clips)) {
+      for (const clip of track.clips) pushRef(state, 'asset', clip?.clip, referencedBy);
     }
   }
 }
@@ -648,7 +659,11 @@ function loadKeepList(projectRoot: string, roots: AssetRoot[]): string[] {
 
 // ── Main entry point ──────────────────────────────────
 
-export function computeKeptAssets(projectRoot: string, roots: AssetRoot[]): TreeShakeResult {
+export function computeKeptAssets(
+  projectRoot: string,
+  roots: AssetRoot[],
+  opts: { excludeVideo?: boolean } = {},
+): TreeShakeResult {
   const state: WalkState = {
     keep: new Set(),
     fontFamilies: new Set(),
@@ -772,7 +787,26 @@ export function computeKeptAssets(projectRoot: string, roots: AssetRoot[]): Tree
 
   // Resolve font families → actual files.
   const fontFiles = resolveFontsByFamily(state.fontFamilies, roots, state.warnings);
+  const domFontFiles = new Set(fontFiles.map(f => f.normalize('NFC')));
   for (const virtual of fontFiles) state.keep.add(virtual);
+
+  // `build.modules.video: false` (or 'auto' on a --target playable): drop the clips the walk
+  // just kept. This is the toggle's real payload — video's JS is engine code that the runtime
+  // barrel keeps alive regardless, so the megabytes are in the .mp4s, and a playable's 5 MB cap
+  // is the whole reason the module defaults off there. Dropped LAST, after the walk, so the
+  // reason is "the module is excluded" rather than "nothing referenced it" — which keeps the
+  // orphan report honest and means a re-enable needs no other change.
+  if (opts.excludeVideo) {
+    const dropped: string[] = [];
+    for (const virtual of [...state.keep]) {
+      if (classify(virtual) === 'video') { state.keep.delete(virtual); dropped.push(virtual); }
+    }
+    // Never silent: a build that quietly ships a game minus its cutscenes is indistinguishable
+    // from one that shipped fine until someone plays it.
+    if (dropped.length) {
+      console.log(`[asset-shaker] build.modules.video is off — dropped ${dropped.length} video clip(s): ${dropped.join(', ')}`);
+    }
+  }
 
   // Compute stats + orphan list by enumerating every shippable file under every root.
   // Normalize both sides to NFC because macOS APFS may return NFD filenames from
@@ -823,6 +857,7 @@ export function computeKeptAssets(projectRoot: string, roots: AssetRoot[]): Tree
     warnings: state.warnings,
     orphans,
     orphanDetails,
+    domFontFiles,
   };
 }
 

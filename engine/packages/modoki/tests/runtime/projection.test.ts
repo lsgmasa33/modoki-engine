@@ -95,4 +95,58 @@ describe('registerProjection', () => {
     tick();
     expect(sync).toHaveBeenCalledTimes(1); // never ran again
   });
+
+  describe('pauseWhileStopped', () => {
+    it('does not call syncFn while stopped', () => {
+      const store = makeStore();
+      const sync = vi.fn();
+      registerProjection('p', store, sync, undefined, { pauseWhileStopped: true });
+
+      setPlayState('stopped');
+      tick(); tick(); tick();
+      expect(sync).not.toHaveBeenCalled();
+    });
+
+    it('holds pending state (does NOT consume the dirty flag) and projects once running resumes', () => {
+      const store = makeStore();
+      const sync = vi.fn();
+      registerProjection('p', store, sync, undefined, { pauseWhileStopped: true });
+
+      setPlayState('stopped');
+      tick(); // initial dirty — held, not consumed
+      store.emit(); // store changed while stopped — still dirty
+      tick(); tick(); tick(); // held every time
+      expect(sync).not.toHaveBeenCalled();
+
+      setPlayState('playing');
+      tick();
+      expect(sync).toHaveBeenCalledTimes(1); // the held state finally projects
+      tick(); // clean now — no further calls
+      expect(sync).toHaveBeenCalledTimes(1);
+    });
+
+    it('without the option, a projection still runs while stopped (default unchanged)', () => {
+      const store = makeStore();
+      const sync = vi.fn();
+      registerProjection('p', store, sync); // no opts
+
+      setPlayState('stopped');
+      tick();
+      expect(sync).toHaveBeenCalledTimes(1);
+    });
+
+    it('setPlayState("paused") also holds it', () => {
+      const store = makeStore();
+      const sync = vi.fn();
+      registerProjection('p', store, sync, undefined, { pauseWhileStopped: true });
+
+      setPlayState('paused');
+      tick(); tick();
+      expect(sync).not.toHaveBeenCalled();
+
+      setPlayState('playing');
+      tick();
+      expect(sync).toHaveBeenCalledTimes(1);
+    });
+  });
 });

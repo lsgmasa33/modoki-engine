@@ -19,13 +19,19 @@
  *   - `signal`      → a zero-duration marker that `dispatchGameAction`s at its tick.
  *   - `audio`       → cues a sound (`cueClip`) at its tick.
  *   - `activation`  → toggles the target's `EntityAttributes.isActive` for a span.
+ *   - `video`       → plays the target's `VideoPlayer` over a clip span. START-AND-RUN, never
+ *                     scrubbed: assigning `currentTime` is an async keyframe-decoding seek, so
+ *                     video cannot be driven frame-accurately off the playhead (this is the same
+ *                     reason video is quarantined from the deterministic harness). The span
+ *                     boundaries are authoritative for start/stop; between them the element runs
+ *                     on the browser's media clock.
  *   - `control`     → instantiates a PREFAB at a clip's `start` (parented under the track target)
  *                     and destroys it at the clip's `end` — Unity's Control Track, prefab flavour.
  *                     A spawned prefab can carry a `ParticleEmitter`, so this covers "spawn an
  *                     effect on a beat". (Particle-system restart + nested sub-directors deferred.)
  */
 
-export type TrackKind = 'animation' | 'signal' | 'audio' | 'activation' | 'control';
+export type TrackKind = 'animation' | 'signal' | 'audio' | 'activation' | 'control' | 'video';
 
 /** Shared fields on every track. `target` = relative name-path from the Director root. */
 export interface TrackBase {
@@ -118,7 +124,25 @@ export interface ControlTrackDef extends TrackBase {
   clips: ControlClipBlock[];
 }
 
-export type TrackDef = AnimationTrackDef | SignalTrackDef | AudioTrackDef | ActivationTrackDef | ControlTrackDef;
+/** One clip on a video track. `clip` is a video asset GUID; the target must carry a
+ *  `VideoPlayer`. Playback starts at `start` (rewound to the clip's beginning) and stops at
+ *  `start + duration`; omit `duration` to let it run on past the span — useful when the clip's
+ *  own length, not the timeline's, should decide when it ends.
+ *
+ *  There is deliberately NO `scrub` here (unlike an animation clip). A video cannot be posed at
+ *  an arbitrary playhead time: the seek is asynchronous and lands on a keyframe, so a "scrubbed"
+ *  video would show whatever frame arrived, whenever it arrived. */
+export interface VideoClipBlock {
+  start: number;
+  duration?: number;
+  clip: string;
+}
+export interface VideoTrackDef extends TrackBase {
+  type: 'video';
+  clips: VideoClipBlock[];
+}
+
+export type TrackDef = AnimationTrackDef | SignalTrackDef | AudioTrackDef | ActivationTrackDef | ControlTrackDef | VideoTrackDef;
 
 export interface TimelineDef {
   /** Stable GUID — mirrors the `.meta.json` sidecar id. */
@@ -178,6 +202,18 @@ export function collectTimelineControlRefs(def: TimelineDef): string[] {
   return out;
 }
 
+/** The video-clip refs (GUIDs) a timeline's video tracks reference. Collected for the same
+ *  reason as audio cues and control prefabs: nothing else in the scene owns them, so without
+ *  this the production tree-shaker has no reason to keep the clip and the cutscene ships as a
+ *  404 that only fails on a real build. */
+export function collectTimelineVideoRefs(def: TimelineDef): string[] {
+  const out: string[] = [];
+  for (const track of def.tracks) {
+    if (track.type === 'video') for (const c of track.clips) if (c.clip) out.push(c.clip);
+  }
+  return out;
+}
+
 /** Normalize one track by kind: fill defaults, drop malformed entries, sort by time.
  *  An unknown/invalid `type` yields null (dropped by the caller). */
 function normalizeTrack(tr: Partial<TrackDef> & { type?: string }): TrackDef | null {
@@ -221,6 +257,16 @@ function normalizeTrack(tr: Partial<TrackDef> & { type?: string }): TrackDef | n
           .filter((s) => s && (typeof s.start === 'number' || typeof s.end === 'number'))
           .map((s) => ({ start: num(s.start, 0), end: num(s.end, 0) }))
           .filter((s) => s.end > s.start)
+          .sort((a, b) => a.start - b.start),
+      };
+    }
+    case 'video': {
+      const clips = Array.isArray((tr as VideoTrackDef).clips) ? (tr as VideoTrackDef).clips : [];
+      return {
+        ...base, type: 'video',
+        clips: clips
+          .filter((c) => c && typeof c.clip === 'string' && c.clip.length > 0)
+          .map((c) => ({ start: num(c.start, 0), duration: c.duration === undefined ? undefined : num(c.duration, 0), clip: c.clip }))
           .sort((a, b) => a.start - b.start),
       };
     }

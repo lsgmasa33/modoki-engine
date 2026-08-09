@@ -23,7 +23,8 @@
  * and electron-builder.yml.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
+import { winKillTreeArgs } from '../plugins/buildStepShell';
 import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
@@ -35,14 +36,53 @@ let currentRoot: string | null = null;
 let intentionalStop = false;
 let exitHookInstalled = false;
 
+/** Whether a force-kill of `c` must go through the Windows TREE kill rather than `child.kill()`.
+ *  Pure + exported so the decision is unit-testable from any host — the same reason
+ *  `winKillTreeArgs` is. `platform` defaults to the running process; override it only in tests. */
+export function needsWinTreeKill(
+  c: Pick<ChildProcess, 'pid' | 'exitCode' | 'signalCode'> | null | undefined,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (platform !== 'win32') return false;
+  // Never taskkill a REAPED pid: the number may have been reused by an unrelated process, and
+  // /T would take its whole tree with it. Same guard as killBuildProcess.
+  if (!c || !c.pid || c.exitCode !== null || c.signalCode !== null) return false;
+  return true;
+}
+
+/** Kill the Vite child AND its descendants, synchronously, on Windows only (#185).
+ *  Returns false on posix, where the caller's own `child.kill(sig)` is correct and sufficient (the
+ *  signal runs Vite's handlers, which reap the build children themselves). */
+function killTreeWin32(c: ChildProcess | null): boolean {
+  if (!needsWinTreeKill(c)) return false;
+  // Reuses buildStepShell's argv so the taskkill form — and the "BY PID, never /IM" rule that
+  // keeps it off another clone's processes — is defined in exactly one place.
+  try { execFileSync('taskkill', winKillTreeArgs(c!.pid!), { stdio: 'ignore' }); } catch { /* already gone */ }
+  return true;
+}
+
+/** Force-kill the Vite child: the whole tree on Windows, a plain SIGKILL elsewhere. */
+function killTree(c: ChildProcess | null): void {
+  if (killTreeWin32(c)) return;
+  c?.kill('SIGKILL');
+}
+
 /** Last-resort reaper: if main is SIGKILL'd / crashes / quits for an update,
  *  `before-quit` may not run and the spawned Vite child would orphan (holding its
  *  port). A synchronous process-exit hook force-kills it. Exit handlers must be
- *  synchronous, so we SIGKILL. Installed once, on first spawn. (E2) */
+ *  synchronous, so we SIGKILL. Installed once, on first spawn. (E2)
+ *
+ *  ⚠️ On Windows that must be a TREE kill, not `child.kill()` (#185). There, `kill()` is a
+ *  `TerminateProcess` on the Vite pid ALONE — Vite runs no handler, so `buildStepShell`'s own
+ *  shutdown hook never fires, and an in-flight build's grandchildren are orphaned. Measured: a
+ *  `gradlew --no-daemon` JVM outlived a hard-killed parent by 60s+. posix is already fine and is
+ *  deliberately left alone: SIGTERM/SIGKILL there DO run Vite's handlers, which reap the build
+ *  children properly, and signalling a group from here would reach the wrong processes (the Vite
+ *  child is not `detached`, so it shares Electron's group). */
 function installExitHook(): void {
   if (exitHookInstalled) return;
   exitHookInstalled = true;
-  const kill = () => { try { child?.kill('SIGKILL'); } catch { /* already gone */ } };
+  const kill = () => { try { killTree(child); } catch { /* already gone */ } };
   process.on('exit', kill);
   process.once('SIGINT', () => { kill(); process.exit(130); });
   process.once('SIGTERM', () => { kill(); process.exit(143); });
@@ -260,7 +300,12 @@ export async function stopDevServer(): Promise<void> {
     let done = false;
     const finish = () => { if (done) return; done = true; resolve(); };
     c.once('exit', finish);
+    // Windows has no real SIGTERM — `kill('SIGTERM')` is already a hard TerminateProcess on the
+    // Vite pid alone, so there is no graceful phase to wait out and nothing would reap the build
+    // grandchildren. Go straight to the tree kill (#185). posix keeps the graceful path: SIGTERM
+    // there runs Vite's handlers, which reap in-flight build children before it exits.
+    if (killTreeWin32(c)) { finish(); return; }
     c.kill('SIGTERM');
-    setTimeout(() => { try { c.kill('SIGKILL'); } catch { /* already gone */ } finish(); }, 3000);
+    setTimeout(() => { try { killTree(c); } catch { /* already gone */ } finish(); }, 3000);
   });
 }

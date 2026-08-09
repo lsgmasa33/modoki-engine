@@ -10,6 +10,7 @@
 import type { UndoAction } from '../undo/undoManager';
 import { writeAssetFile, deleteAssetFile, deleteAssetFiles, duplicateAssetFile } from './assetOps';
 import type { AssetEntry } from '../utils/assetPaths';
+import { unbindDeletedAssetEditors } from './assetEditorBindings';
 
 // Extensions we know are UTF-8 text — everything else is treated as binary so
 // the delete-undo snapshot round-trips bytes through base64 instead of
@@ -65,6 +66,11 @@ export function makeDuplicateUndo(results: DupResult[], refresh: () => void): Un
         // + GUID in a .meta.json the copy created).
         if (!isTextAsset(toPath)) await deleteAssetFile(toPath + '.meta.json');
       }
+      // The copy can be OPEN by now (duplicate → double-click the copy → ⌘Z), and a bound
+      // editor would autosave it straight back (#186). makeDeleteUndo's `redo` needs no
+      // such call: the forward delete already unbound, and `undo` restores the file
+      // without restoring the binding, so nothing is bound when it re-trashes.
+      unbindDeletedAssetEditors(results.map((r) => r.toPath));
       refresh();
     },
     redo: async () => {

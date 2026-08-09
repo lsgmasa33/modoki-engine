@@ -48,7 +48,7 @@ export type ToolContext = {
    *  "POST /api/scene-mutate on the editor backend", which describes our plumbing rather than the
    *  thing the caller asked for. Pass it wherever the intent isn't obvious from the route. */
   postJson: (path: string, payload: unknown, timeoutMs?: number, what?: string) => Promise<ToolResult>;
-  evalRenderer: (code: string) => Promise<ToolResult>;
+  evalRenderer: (code: string, timeoutMs?: number) => Promise<ToolResult>;
   editorAction: (action: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<ToolResult>;
   unsavedChangesWarning: () => Promise<string | null>;
   consumeBuildStream: (path: string, timeoutMs: number) => Promise<ToolResult>;
@@ -326,14 +326,21 @@ export function createToolContext(config: { backend: string; token?: string }): 
    *  successful `{ result: "Error: …" }` string rather than a 4xx — detect that prefix and surface
    *  it as a tool error, so a failed eval is never misread as a successful string value (the same
    *  false-success guard device_eval applies via isDeviceError). */
-  async function evalRenderer(code: string): Promise<ToolResult> {
+  async function evalRenderer(code: string, timeoutMs?: number): Promise<ToolResult> {
     try {
       await ensureIdentity();
+      // THREE nested deadlines, each strictly larger than the one inside it, or the outermost
+      // fires first and reports the wrong cause: eval budget (renderer) < relay (backend, +10s)
+      // < this client abort (+15s). The client's 30s default was already smaller than a 25s
+      // eval + 10s relay, so it has to be sized here rather than left at the default.
+      const clientTimeout = Number.isFinite(timeoutMs) && (timeoutMs as number) > 0
+        ? Math.max(50, Math.min(25_000, Math.floor(timeoutMs as number))) + 15_000
+        : undefined;
       const { status, body } = await call('/api/eval', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code }),
-      });
+        body: JSON.stringify(timeoutMs == null ? { code } : { code, timeoutMs }),
+      }, clientTimeout);
       if (status >= 400) return httpFailure('evaluate JS in the editor renderer', status, body);
       const result = (body as { result?: unknown } | null)?.result;
       if (typeof result === 'string' && result.startsWith('Error:')) {

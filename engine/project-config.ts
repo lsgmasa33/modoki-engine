@@ -87,6 +87,12 @@ export interface BuildModules {
   npr: ModuleToggle;
   /** GPU-compute particle backend (requires render3d + native WebGPU). */
   gpuParticles: ModuleToggle;
+  /** Video playback (HTMLVideoElement decode, video textures, the remote-clip cache).
+   *  `'auto'` detects a `VideoPlayer` trait, EXCEPT on a `--target playable` build, where
+   *  'auto' resolves OFF: a ≤5 MB MRAID bundle and a video file are close to mutually
+   *  exclusive. Set it to `true` to keep video in a playable anyway — a 400 KB stinger is a
+   *  legitimate thing to want, so the capability is defaulted off rather than removed. */
+  video: ModuleToggle;
 }
 
 /** One engine-module key (a field of {@link BuildModules}). */
@@ -142,6 +148,29 @@ export interface ProjectConfig {
      *  committed config, not project.user.json. The editor's heal-on-open syncs it
      *  into the iOS project's DEVELOPMENT_TEAM. Empty = leave the pbxproj as-is. */
     appleTeamId: string;
+    /** Minimum iOS version this project supports — the SINGLE source of truth for the
+     *  floor, driving BOTH halves of it:
+     *   - the JS bundle's syntax target (`build.target` in vite.config.ts → `ios<x>`/`safari<x>`)
+     *   - the native `IPHONEOS_DEPLOYMENT_TARGET`, synced by `healIosDeploymentTarget`
+     *
+     *  They were two independent hardcoded numbers that DISAGREED: every project's pbxproj
+     *  said 15.0 while the bundle required 15.4, so the App Store would offer the game to a
+     *  15.0–15.3 device that installs it and then dies on `structuredClone`/`Array.at`/
+     *  `Object.hasOwn`. One value, two consumers, so they cannot drift again.
+     *
+     *  ⚠️ Lowering this below 15.4 needs POLYFILLS, not just a smaller number. esbuild lowers
+     *  syntax; it does not add missing runtime APIs, and those three land in exactly 15.4. */
+    iosMinVersion: string;
+    /** Minimum Android SDK (API LEVEL, not the marketing version — 31 = Android 12) this
+     *  project supports — the Android sibling of `iosMinVersion`. The SINGLE source of
+     *  truth for the floor, synced into every project's `android/variables.gradle`
+     *  `minSdkVersion` by `healAndroidMinSdk` on project open/build.
+     *
+     *  It exists for the same reason `iosMinVersion` does: `cap add` generates
+     *  `minSdkVersion = 24`, and without a heal that number just sits there uninspected —
+     *  every newly-scaffolded project silently reverts to API 24 and the floor drifts
+     *  per-project, exactly the drift `iosMinVersion` was introduced to stop on iOS. */
+    androidMinSdk: number;
     /** Debug build — ships the event journal (`emit`/`modoki_journal`), the in-game
      *  debug menu (F12 / 3-finger tap: stats, world inspector, cheats, …), AND the
      *  on-device debug server (native TCP + UDP beacon / web-WS) that every
@@ -195,8 +224,12 @@ export interface ProjectConfig {
     /** Supported device orientation → iOS UISupportedInterfaceOrientations +
      *  Android android:screenOrientation. 'auto' = allow both portrait+landscape. */
     orientation: 'auto' | 'portrait' | 'landscape';
-    /** Hide the OS status bar (clock/wifi/battery) → iOS UIStatusBarHidden +
-     *  Android fullscreen flag. */
+    /** Hide the OS status bar (clock/wifi/battery) → iOS UIStatusBarHidden, and on Android
+     *  IMMERSIVE fullscreen: both the status bar AND the navigation (back/home/recents) bar,
+     *  re-hidden on every focus regain. Android is the asymmetric one on purpose — iOS has no
+     *  second bar, so "status bar hidden" there already means "the game owns the screen"; leaving
+     *  Android's nav bar up would honour the name and miss the intent. Applied by
+     *  `healAndroidFullscreen` (healNativeConfig.ts), which patches MainActivity.java. */
     statusBarHidden: boolean;
     /** Status-bar content style → iOS UIStatusBarStyle. 'default' = OS decides,
      *  'light' = light text (dark bg), 'dark' = dark text (light bg). */
@@ -214,6 +247,15 @@ export interface ProjectConfig {
       /** Upper bound on devicePixelRatio (perf vs sharpness). */
       pixelRatioCap: number;
       shadows: boolean;
+      /** Quality tier (#121): 'auto' delegates to the device allowlist + on-device calibration;
+       *  'low'/'high' pin it. A tier CLAMPS the settings above — it never raises them — so
+       *  'high' is exactly today's behaviour and the fields beside it stay authoritative.
+       *
+       *  **Defaults to 'auto' since #155**, which resolves LOW on anything not allowlisted (a
+       *  desktop excepted). Pin 'high' to opt a project out — but note what that opts into: a
+       *  Y6 2019 booting 'high' took a 6388 ms post-FX submit, lost its GPU context and stayed
+       *  blank, where 'auto' holds 27-33 fps on the same phone. */
+      qualityTier: 'auto' | 'low' | 'high';
       /** Tone-mapping operator ('ACESFilmic' | 'AgX' | 'Neutral' | 'Linear' | 'None'). */
       toneMapping: (typeof TONE_MAPPINGS)[number];
       exposure: number;
@@ -281,10 +323,45 @@ export interface ProjectConfig {
   };
 }
 
+/** The `build.*` fields that must never reach a PUBLIC repo — Apple's Team ID,
+ *  internal GCS bucket/CDN names, and a deploy command that can embed either.
+ *  Anything we do not want to ship to a public repo belongs in the per-machine
+ *  local config (`project.user.json`, gitignored), not the committed
+ *  `project.config.json` — the publish-time scrub (`SCRUBBED_BUILD_FIELDS` in
+ *  `scripts/lib/scrub-project-config.mjs`, which cannot import this TS file and
+ *  so is kept in step by a guard test instead) is the BACKSTOP, not the primary
+ *  defense; the primary defense is that the value was never committed in the
+ *  first place. See {@link overlayPrivateBuildFields}.
+ *
+ *  Deliberately does NOT include `debugBuild`, `webDeployMode`, or `webBasePath`
+ *  — those three DO ship publicly, just with a different (public-safe) value for
+ *  a published project; they are a publish-time RESET, not a leak, and stay
+ *  scrubbed-in-place in the committed file. */
+export const PRIVATE_BUILD_FIELDS = [
+  'appleTeamId',
+  'webBucket',
+  'webCdnUrlMap',
+  'webCdnBackendBucket',
+  'webDeployCommand',
+] as const;
+
+/** One of {@link PRIVATE_BUILD_FIELDS}. */
+export type PrivateBuildField = (typeof PRIVATE_BUILD_FIELDS)[number];
+
 /** Per-machine settings kept OUT of the committed config (gitignored
  *  project.user.json). These are about THIS developer's machine/hardware — the
  *  same iPhone/SDK regardless of which game is open — so they must never be
- *  committed. Merged over the committed config at build time. */
+ *  committed. Merged over the committed config at build time.
+ *
+ *  The `build` section (below) widens what this file MEANS: it is no longer only
+ *  "this developer's hardware" — it is also "private to this checkout," a
+ *  broader idea that happens to share the same gitignored, per-machine home. The
+ *  five fields in {@link PRIVATE_BUILD_FIELDS} (Apple Team ID, GCS bucket, CDN
+ *  names, deploy command) are ORG-shared in principle — the same value across
+ *  everyone's build of a given project — but they must never reach a PUBLIC repo,
+ *  and `project.config.json` is exactly the file that gets published. Rather than
+ *  invent a third file for "shared-but-private," they overlay onto the same
+ *  gitignored home `device`/`sdk` already use; see {@link overlayPrivateBuildFields}. */
 export interface ProjectUserConfig {
   device: {
     /** iOS hardware UDID for `xcodebuild -destination 'id=...'`. */
@@ -306,6 +383,18 @@ export interface ProjectUserConfig {
      *  install dirs, then the login shell). Needed because a Finder-launched packaged
      *  editor has a minimal PATH without the Google Cloud SDK. */
     gcloudPath: string;
+  };
+  /** Overlay values for the {@link PRIVATE_BUILD_FIELDS} of `ProjectConfig.build`
+   *  — see that constant for the rule. Empty string = "not set here," which falls
+   *  through to whatever `project.config.json` has (see
+   *  {@link overlayPrivateBuildFields}), so a project that has not migrated yet
+   *  keeps working unchanged. */
+  build: {
+    appleTeamId: string;
+    webBucket: string;
+    webCdnUrlMap: string;
+    webCdnBackendBucket: string;
+    webDeployCommand: string;
   };
 }
 
@@ -330,10 +419,17 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     webCdnBackendBucket: '',
     webDeployCommand: '',
     appleTeamId: '',
+    // 16.4 by owner decision (2026-08-04), deliberately dropping the iPhone 7 / 6s / SE1
+    // era. Comfortably above the 15.4 runtime-API line (structuredClone / Array.at /
+    // Object.hasOwn all land in 15.4), so no polyfills are needed at this floor.
+    iosMinVersion: '16.4',
+    // 31 = Android 12. cap add scaffolds minSdkVersion 24; healAndroidMinSdk syncs this
+    // value into android/variables.gradle so the floor can't drift per-project.
+    androidMinSdk: 31,
     debugBuild: false,
     modules: {
       render3d: 'auto', render2d: 'auto', physics2d: 'auto',
-      physics3d: 'auto', npr: 'auto', gpuParticles: 'auto',
+      physics3d: 'auto', npr: 'auto', gpuParticles: 'auto', video: 'auto',
     },
     playableMaxBytes: 5_242_880, // 5 MB (AppLovin)
     playableClickUrl: '',
@@ -351,7 +447,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   },
   rendering: {
     targetFps: 60, // matches the frame driver's historical default cap
-    three: { backend: 'auto', antialias: true, pixelRatioCap: 2, shadows: true, toneMapping: 'ACESFilmic', exposure: 1.2 },
+    three: { backend: 'auto', antialias: true, pixelRatioCap: 2, shadows: true, qualityTier: 'auto', toneMapping: 'ACESFilmic', exposure: 1.2 },
     pixi: { backend: 'auto', antialias: true, resolution: 0, pixelRatioCap: 2 },
     web: { sizeMode: 'free', width: 1280, height: 720 },
   },
@@ -386,6 +482,16 @@ export const DEFAULT_PROJECT_USER_CONFIG: ProjectUserConfig = {
     javaHome: '',
     androidHome: '',
     gcloudPath: '',
+  },
+  // Same all-empty rationale as `device`/`sdk` above: empty means "not set here,"
+  // which overlayPrivateBuildFields falls through to project.config.json for —
+  // load-bearing for every project that hasn't migrated a given field yet.
+  build: {
+    appleTeamId: '',
+    webBucket: '',
+    webCdnUrlMap: '',
+    webCdnBackendBucket: '',
+    webDeployCommand: '',
   },
 };
 
@@ -463,6 +569,9 @@ export function projectConfigIssues(partial: Partial<ProjectConfig> | null | und
  *  a guard test instead of by an import. */
 export const WEB_SIZE_MODES = ['free', 'fixed', 'max'] as const;
 export const GPU_BACKENDS = ['auto', 'webgpu', 'webgl'] as const;
+/** Quality tiers a project may select (#121 P3). 'auto' delegates to the device allowlist +
+ *  on-device calibration; 'low'/'high' pin it. */
+export const QUALITY_TIERS = ['auto', 'low', 'high'] as const;
 export const WEB_DEPLOY_MODES = ['none', 'gcs', 'custom'] as const;
 /** Ad-network MRAID/CTA conventions for the playable export. */
 export const PLAYABLE_NETWORKS = ['applovin', 'unity', 'ironsource', 'facebook', 'mintegral', 'generic'] as const;
@@ -562,7 +671,49 @@ export function mergeProjectUserConfig(partial: Partial<ProjectUserConfig> | nul
   return {
     device: { ...d.device, ...p.device },
     sdk: { ...d.sdk, ...p.sdk },
+    build: { ...d.build, ...p.build },
   };
+}
+
+/** Overlay the private `build.*` fields (see {@link PRIVATE_BUILD_FIELDS}) from
+ *  the per-machine user config onto a committed config, for READING. A NON-EMPTY
+ *  value in `user.build` wins over whatever `config.build` has; an EMPTY user
+ *  value falls through to the committed value unchanged. That fallthrough is
+ *  load-bearing: it is what keeps every project that has not yet migrated a given
+ *  field (its value still sitting in `project.config.json`) working exactly as
+ *  before — the overlay only takes over a field once the private value has moved.
+ *
+ *  Returns a NEW object; mutates neither argument. Callers pass the RESULT
+ *  wherever `config.build.<field>` used to be read directly — the canonical key
+ *  path is unchanged, only where the value physically lives has moved. */
+export function overlayPrivateBuildFields(config: ProjectConfig, user: ProjectUserConfig): ProjectConfig {
+  const build = { ...config.build };
+  for (const field of PRIVATE_BUILD_FIELDS) {
+    const userValue = user.build[field];
+    if (userValue !== '') build[field] = userValue;
+  }
+  return { ...config, build };
+}
+
+/** The inverse of {@link overlayPrivateBuildFields}, for the CLIENT-visible config: blank every
+ *  {@link PRIVATE_BUILD_FIELDS} value. Used by the `virtual:modoki-project-config` module
+ *  (`engine/plugins/vite-asset-scanner.ts`), which inlines the RESOLVED config into the browser
+ *  bundle — so without this the Apple Team ID and the internal bucket/CDN names ship inside every
+ *  built game's JavaScript, downloadable by anyone who can load the page. That is a WIDER
+ *  exposure than the committed-file one #172 set out to fix (a public URL, no repo access needed),
+ *  and it predates it: the values used to reach the same bundle from `project.config.json`.
+ *
+ *  All five are BUILD-time concerns — signing, deploy target, deploy command — and nothing in
+ *  `engine/app/**` or the runtime reads any of them (the editor's Project Settings dialog gets its
+ *  values from `GET /api/project-settings`, not this module, so editing is unaffected).
+ *
+ *  Blanks rather than deletes: the fields stay present and typed `string`, so a consumer that
+ *  someday reads one gets `''` — the same already-handled "not set" state an unmigrated project
+ *  produces — instead of an `undefined` that throws on `.trim()`. */
+export function stripPrivateBuildFields(config: ProjectConfig): ProjectConfig {
+  const build = { ...config.build };
+  for (const field of PRIVATE_BUILD_FIELDS) build[field] = '';
+  return { ...config, build };
 }
 
 /** The on-disk shape of either config file: whatever subset of the config the

@@ -7,7 +7,8 @@ import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
-import { activePartOf, withActivePart, partCount, uvToPosAffine } from './skinParts';
+import { activePartOf, withActivePart, partCount, uvToPosAffine, bboxCenter } from './skinParts';
+import { coerceRigBones } from '../../runtime/skinning/rig2dTypes';
 import { getAssetEntry, resolveGuidToPath } from '../../runtime/loaders/assetManifest';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { deriveBindMatrices, invert2D, identity2D, apply2D, mul2D, type BindBone, type Mat2D } from '../../runtime/skinning/rig2dMath';
@@ -23,27 +24,23 @@ const HEIGHT = 300;
 // (0..255) so tiny influences — which still deform the mesh — are visibly distinct from zero.
 const WEIGHT_FLOOR = 70;
 /** weight (0..1) → gray (0..255): 0 → black; else FLOOR..255 with a low-end gamma boost. */
-function weightGray(w: number): number {
+export function weightGray(w: number): number {
   const wc = w < 0 ? 0 : w > 1 ? 1 : w;
   if (wc <= 1e-4) return 0;
   return Math.round(WEIGHT_FLOOR + (255 - WEIGHT_FLOOR) * Math.pow(wc, 0.6));
 }
 
-type NamedBone = BindBone & { name: string };
-type Pose = Record<number, { x: number; y: number; rot: number }>;
-function coerceBones(raw: Rig2DFile['bones']): NamedBone[] {
-  return (raw ?? []).map((b, i) => ({
-    name: typeof b.name === 'string' && b.name ? b.name : `bone${i}`,
-    parent: Number.isInteger(b.parent) ? (b.parent as number) : -1,
-    x: b.x ?? 0, y: b.y ?? 0, rot: b.rot ?? 0,
-  }));
-}
+export type NamedBone = BindBone & { name: string };
+export type Pose = Record<number, { x: number; y: number; rot: number }>;
+// THE one copy lives in the runtime (rig2dTypes.coerceRigBones, #128) — the layer that
+// owns the format. This alias only keeps the local call sites reading naturally.
+const coerceBones = (raw: Rig2DFile['bones']): NamedBone[] => coerceRigBones(raw);
 
 /** Per-bone skinning matrices for a transient test pose. These depend ONLY on
  *  (bones, pose) — identical for every part — so compute them ONCE per draw/stroke and
  *  reuse across all parts, rather than re-deriving inside deformMesh per part. Returns
  *  null for an empty pose (bind pose → deformMesh passes verts through). */
-function computeSkinMats(bones: NamedBone[], pose: Pose): Mat2D[] | null {
+export function computeSkinMats(bones: NamedBone[], pose: Pose): Mat2D[] | null {
   if (!bones.length || !Object.keys(pose).length) return null;
   const posed = bones.map((b, i) => (pose[i] ? { ...b, x: pose[i].x, y: pose[i].y, rot: pose[i].rot } : b));
   const posedLocal = deriveBindMatrices(posed).rootLocal;
@@ -53,7 +50,7 @@ function computeSkinMats(bones: NamedBone[], pose: Pose): Mat2D[] | null {
 
 /** Linear-blend-skin bind verts by the precomputed per-bone `skin` matrices (from
  *  {@link computeSkinMats}). `skin === null` → bind pose, verts returned unchanged. */
-function deformMesh(bindVerts: number[][], skin: Mat2D[] | null, si: number[], sw: number[]): number[][] {
+export function deformMesh(bindVerts: number[][], skin: Mat2D[] | null, si: number[], sw: number[]): number[][] {
   if (!skin) return bindVerts;
   const o = new Float32Array(2);
   const out: number[][] = new Array(bindVerts.length);
@@ -71,30 +68,25 @@ function deformMesh(bindVerts: number[][], skin: Mat2D[] | null, si: number[], s
 }
 
 /** Bone rig-origin positions under a test pose (for drawing joints + paint fallback). */
-function posedOrigins(bones: NamedBone[], pose: Pose): { x: number; y: number }[] {
+export function posedOrigins(bones: NamedBone[], pose: Pose): { x: number; y: number }[] {
   if (!bones.length) return [];
   const posed = Object.keys(pose).length ? bones.map((b, i) => (pose[i] ? { ...b, x: pose[i].x, y: pose[i].y, rot: pose[i].rot } : b)) : bones;
   return deriveBindMatrices(posed).rootLocal.map((m) => ({ x: m.e, y: m.f }));
 }
 
-/** Bounding-box center of a texture-space vertex list — the part's "position" (its mesh
- *  carries no explicit origin, so the AABB center is what the Parts-mode gizmo + inspector
- *  read/write). Returns null for an empty mesh. */
-function centerOfVerts(verts: number[][]): { x: number; y: number } | null {
-  let mnx = Infinity, mny = Infinity, mxx = -Infinity, mxy = -Infinity;
-  for (const p of verts) { if (p[0] < mnx) mnx = p[0]; if (p[0] > mxx) mxx = p[0]; if (p[1] < mny) mny = p[1]; if (p[1] > mxy) mxy = p[1]; }
-  if (!Number.isFinite(mnx)) return null;
-  return { x: (mnx + mxx) / 2, y: (mny + mxy) / 2 };
-}
+/** The part's "position": its mesh carries no explicit origin, so the AABB centre is what
+ *  the Parts-mode gizmo + inspector read/write. Null for an empty mesh — there is no gizmo
+ *  to place. One copy, shared with SkinEditor (see skinParts.bboxCenter). */
+const centerOfVerts = bboxCenter;
 
-type DrawPart = { index: number; view: ReturnType<typeof activePartOf>; active: boolean; order: number };
+export type DrawPart = { index: number; view: ReturnType<typeof activePartOf>; active: boolean; order: number };
 /** Parts to draw in the canvas: every part NOT hidden in the editor-local preview set,
  *  plus the ACTIVE part (always shown, highlighted) even when hidden — you can't author a
  *  part you can't see. Preview visibility is editor-only and does NOT read the asset's
  *  runtime `visible` field, so the canvas never mirrors (or affects) scene/game render.
  *  `order` is the part's draw order (lower = behind), mirrored from the asset so the preview
  *  stacks parts exactly like the runtime (Scene2D sets each mesh's zIndex = order). */
-function visiblePartViews(def: Rig2DFile | null | undefined, activePart: number, previewHidden: number[]): DrawPart[] {
+export function visiblePartViews(def: Rig2DFile | null | undefined, activePart: number, previewHidden: number[]): DrawPart[] {
   const n = partCount(def);
   const out: DrawPart[] = [];
   for (let i = 0; i < n; i++) {

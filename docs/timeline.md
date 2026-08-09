@@ -34,7 +34,7 @@ Like Unity's *Timeline Asset* + *PlayableDirector*, the data and the binding are
 
 `runtime/timeline/types.ts` — `TimelineDef { id, name, duration, frameRate, tracks[] }`, plus
 `normalizeTimeline()` (fills defaults, sorts entries by time, drops malformed) and
-`defaultTimeline()`. Five track kinds, each `{ id, name, target, muted?, type }` + a per-type body:
+`defaultTimeline()`. Six track kinds, each `{ id, name, target, muted?, type }` + a per-type body:
 
 | Track | Body | Drives (existing subsystem) |
 |---|---|---|
@@ -43,6 +43,7 @@ Like Unity's *Timeline Asset* + *PlayableDirector*, the data and the binding are
 | `audio` | `cues: [{ t, clip, bus?, volume?, pitch? }]` — `clip` is an audio GUID | the audio cue bus (`cueClip`) |
 | `activation` | `spans: [{ start, end }]` | the target's `EntityAttributes.isActive` |
 | `control` | `clips:` a `prefab` GUID, **or** `particle:true`, **or** `subdirector:true` | **prefab**: instantiate under the track target at `start`, destroy at `start + duration`. **particle** (Phase E): RESTART the track target's `ParticleEmitter` at `start`, pause at `start + duration`. **sub-director** (Phase F): drive the track target's own `Director`/nested timeline synced to the clip (Play + ▶ Preview). Unity's Control Track. |
+| `video` | `clips: [{ start, duration?, clip }]` — `clip` is a video GUID | the target's `VideoPlayer`. Rewound + started at `start`, paused at `start + duration`; **omitting `duration` lets the clip's own length decide**. START-AND-RUN, never scrubbed — a video cannot be posed at an arbitrary playhead time (see [video.md](./video.md)), so there is deliberately no `scrub` field. Driven through the action registry rather than an import, which keeps video DCE-able behind `build.modules.video`. |
 
 Authorable via MCP `modoki_create_asset`/`modoki_write_asset` (schema registered in
 `runtime/assets/assetSchemas.ts`). **Never hand-write asset paths** — audio-cue clips and control

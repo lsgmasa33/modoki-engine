@@ -4,8 +4,9 @@
  *  optionally downmixing to mono, applying EBU R128 loudness normalization, and
  *  trimming leading/trailing silence. The single converted file lands in the
  *  content cache (see audio-cache.ts); cache hits skip all work. ffmpeg is an
- *  external prerequisite — {@link ensureFfmpeg} surfaces a clear install hint
- *  when it's missing (unlike toktx, ffmpeg IS in Homebrew: `brew install ffmpeg`).
+ *  external prerequisite — `ensureFfmpeg` (in ffmpeg-tool.ts, shared with the video
+ *  converter) surfaces a clear install hint when it's missing (unlike toktx, ffmpeg
+ *  IS in Homebrew: `brew install ffmpeg`).
  */
 
 import fs from 'fs';
@@ -18,53 +19,7 @@ import {
 import {
   getAudioCacheDir, audioHashKey, audioCachePathFor, audioCacheHit,
 } from './audio-cache';
-import { detect } from '../toolchain';
-
-const FFMPEG_MISSING_MSG = 'ffmpeg not found. Install it from the Build Support dialog (the editor provisions its own), set MODOKI_FFMPEG to a binary path, or install it on PATH (dev: `brew install ffmpeg`).';
-
-let ffmpegCheck: { ok: boolean; cli: string } | null = null;
-
-/** Resolve a native CLI: an explicit env override wins (bundled/hand-set), else the
- *  editor's provisioned toolchain copy (`install('ffmpeg')` → userData npm-tools),
- *  else the bare name on PATH (dev). detect() re-probes the current filesystem, so an
- *  on-demand install is picked up without restarting. */
-function resolveTool(envVar: string, id: 'ffmpeg' | 'ffprobe', fallback: string): string {
-  const override = process.env[envVar];
-  if (override) return override;
-  try {
-    const d = detect(id);
-    if (d.present && d.command) return d.command;
-  } catch { /* toolchain module unavailable → PATH fallback */ }
-  return fallback;
-}
-
-function ffmpegBinary(): string {
-  return resolveTool('MODOKI_FFMPEG', 'ffmpeg', 'ffmpeg');
-}
-
-function ffprobeBinary(): string {
-  return resolveTool('MODOKI_FFPROBE', 'ffprobe', 'ffprobe');
-}
-
-/** For tests — forget the cached CLI-availability probe. */
-export function __resetFfmpegCheck(): void { ffmpegCheck = null; }
-
-/** Ensure `ffmpeg` is callable; returns the CLI path/name or throws with an install hint. */
-export function ensureFfmpeg(): string {
-  const cli = ffmpegBinary();
-  if (ffmpegCheck && ffmpegCheck.cli === cli) {
-    if (!ffmpegCheck.ok) throw new Error(FFMPEG_MISSING_MSG);
-    return ffmpegCheck.cli;
-  }
-  try {
-    execFileSync(cli, ['-version'], { stdio: 'pipe' });
-    ffmpegCheck = { ok: true, cli };
-    return cli;
-  } catch {
-    ffmpegCheck = { ok: false, cli };
-    throw new Error(FFMPEG_MISSING_MSG);
-  }
-}
+import { ensureFfmpeg, ffprobeBinary } from './ffmpeg-tool';
 
 /** Build the `-af` filter chain (comma-joined) for the settings. Empty ⇒ no `-af`. */
 function buildFilters(settings: AudioImportSettings): string[] {

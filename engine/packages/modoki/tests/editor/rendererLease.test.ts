@@ -7,7 +7,7 @@
  *  is torn down exactly once, only when nothing has re-claimed it. */
 
 import { describe, expect, it, vi } from 'vitest';
-import { acquireRenderer, releaseRenderer, __hasLease } from '../../src/editor/panels/rendererLease';
+import { acquireRenderer, releaseRenderer, discardRenderer, __hasLease } from '../../src/editor/panels/rendererLease';
 
 function fakeRenderer() {
   return { dispose: vi.fn(), domElement: { remove: vi.fn() } };
@@ -91,5 +91,62 @@ describe('rendererLease', () => {
     releaseRenderer(container);
     await flushRelease();
     expect(renderer.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  // ── discardRenderer (#121 P1) ───────────────────────────────────────────────────────────
+  // The reuse property asserted above is what makes the lease correct for StrictMode and FATAL
+  // for context-loss recovery: a rebuild is `cleanup(); setup();` in ONE task, so its
+  // re-acquire lands before the deferred teardown fires and would be handed the dead renderer
+  // back — recovery silently doing nothing, with no error anywhere. These pin the escape hatch.
+
+  it('discard makes the renderer unreusable by a same-task re-acquire — the recovery case', async () => {
+    const container = {};
+    const dead = fakeRenderer();
+    await acquireRenderer(container, async () => dead);
+
+    // Exactly what recovery does: drop the dead renderer, then immediately bring one up.
+    discardRenderer(container);
+    const fresh = fakeRenderer();
+    const create = vi.fn(async () => fresh);
+    const got = await acquireRenderer(container, create);
+
+    expect(create).toHaveBeenCalledTimes(1); // a NEW device, not the corpse
+    expect(got).toBe(fresh);
+    expect(got).not.toBe(dead);
+    expect(dead.dispose).toHaveBeenCalledTimes(1);
+    expect(dead.domElement.remove).toHaveBeenCalledTimes(1);
+  });
+
+  it('discard cancels a pending deferred release so it cannot fire onto the new lease', async () => {
+    const container = {};
+    const dead = fakeRenderer();
+    await acquireRenderer(container, async () => dead);
+
+    releaseRenderer(container);  // schedules teardown on a macrotask
+    discardRenderer(container);  // ...and recovery discards before it fires
+    const fresh = fakeRenderer();
+    await acquireRenderer(container, async () => fresh);
+
+    await flushRelease();
+    expect(dead.dispose).toHaveBeenCalledTimes(1); // discarded once, not again by the timer
+    expect(fresh.dispose).not.toHaveBeenCalled();  // and the live one is untouched
+    expect(__hasLease(container)).toBe(true);
+  });
+
+  it('discard ignores a throwing dispose — a dead renderer must not abort the rebuild', async () => {
+    const container = {};
+    const dead = {
+      dispose: vi.fn(() => { throw new Error('context already lost'); }),
+      domElement: { remove: vi.fn() },
+    };
+    await acquireRenderer(container, async () => dead);
+
+    expect(() => discardRenderer(container)).not.toThrow();
+    expect(__hasLease(container)).toBe(false);
+    expect(dead.domElement.remove).toHaveBeenCalledTimes(1); // still detached despite the throw
+  });
+
+  it('discard on a container with no lease is a no-op', () => {
+    expect(() => discardRenderer({})).not.toThrow();
   });
 });

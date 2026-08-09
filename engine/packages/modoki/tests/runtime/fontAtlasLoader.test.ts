@@ -85,3 +85,62 @@ describe('fontAtlasLoader generation guard (scene-swap race)', () => {
     expect(getFontOwnerCounts()['font-b']).toBeUndefined();
   });
 });
+
+/** A `mode:'dynamic'` font is SEEDED BY ITS BAKE, and touches nothing else at boot.
+ *
+ *  This is what `dynamic` has always meant in the docs — "the baked atlas seeds a runtime
+ *  generator that fills in unseen glyphs on demand" — and what the loader did not do. It
+ *  skipped the bake entirely and regenerated the seed charset through the WASM worker on
+ *  every load: a 1.5 MB wasm fetch plus ~640 ms of rasterization (desktop) to reproduce
+ *  glyphs the shipped `~atlas.png` already held. Fonts are awaited scene resources, so all
+ *  of it was boot latency — Court's iOS build visibly stalled on it.
+ *
+ *  The assertions are about what is NOT done: no `.ttf` fetch, no generator, at boot. */
+describe('a dynamic font seeds from its bake', () => {
+  const dynamicEntry = { hash: 'h1', font: { mode: 'dynamic' as const, size: 48, distanceRange: 4 } };
+
+  /** Records every URL fetched so the test can assert on what was NOT requested. */
+  function trackingFetch(json: unknown): string[] {
+    const seen: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (u: string) => {
+      seen.push(String(u));
+      return completeResponse({ ok: true, json: async () => json });
+    }));
+    return seen;
+  }
+
+  beforeEach(async () => {
+    const mod = await import('../../src/runtime/loaders/assetManifest');
+    vi.spyOn(mod, 'getAssetEntry').mockReturnValue(dynamicEntry as never);
+  });
+
+  it('fetches the metrics, NOT the .ttf — the generator is never started', async () => {
+    const seen = trackingFetch(METRICS);
+    const p = await acquireFont(1, 'font-dyn');
+    expect(p, 'a dynamic font must load from its bake').not.toBeNull();
+
+    expect(seen.some((u) => u.includes('~metrics.json')), 'must read the baked metrics').toBe(true);
+    // The .ttf is the generator's input. Fetching it at boot is the regression.
+    expect(seen.some((u) => /\.ttf(\?|$)/.test(u) && !u.includes('~')), 'must NOT fetch the raw .ttf at boot').toBe(false);
+    expect(seen.some((u) => u.includes('~instance.ttf')), 'must NOT fetch the instance at boot').toBe(false);
+  });
+
+  it('serves baked glyphs immediately and reports the bake’s own atlas geometry', async () => {
+    trackingFetch(METRICS);
+    const p = (await acquireFont(1, 'font-dyn'))!;
+    expect(p.getGlyph(65)?.advance).toBe(0.5);          // straight from the bake
+    expect(p.atlas.width).toBe(64);                      // the bake's dims, not atlasMax
+    expect(p.atlas.size).toBe(48);
+    expect(p.atlas.distanceRange).toBe(4);
+    expect(p.metrics.lineHeight).toBe(1.2);
+  });
+
+  it('serves page 0 as the baked IMAGE, not a canvas', async () => {
+    trackingFetch(METRICS);
+    const p = (await acquireFont(1, 'font-dyn'))!;
+    expect(p.atlasImageUrl, 'page 0 must be the baked atlas image').toContain('~atlas.png');
+    // Routing the bake through a 2D canvas would premultiply-round-trip its true-SDF alpha.
+    expect(p.atlasCanvasAt?.(0)).toBeUndefined();
+    expect(p.pageCount).toBe(1);                         // nothing generated yet
+  });
+});

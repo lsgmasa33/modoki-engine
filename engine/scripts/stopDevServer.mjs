@@ -60,17 +60,43 @@ function kill(pid, force) {
 const rootMarker = `${norm(path.resolve(repoRoot))}/node_modules/`;
 const isViteCli = (c) => c.includes('/.bin/vite') || c.includes('/vite/bin/vite.js');
 
+/** True for the Vite the ELECTRON EDITOR spawned, as opposed to the one `npm run dev`
+ *  started. The header above has always promised this carve-out ("the Electron editor
+ *  owns the Vite it spawned — quit the editor to stop that one"), but nothing implemented
+ *  it: the editor spawns `$REPO/node_modules/vite/bin/vite.js`, the exact path isViteCli
+ *  matches, so `dev:stop` killed the editor's Vite every time and printed `Done.` The
+ *  editor was left alive with a dead dev server behind it — a failure mode that presents
+ *  as "the app is broken", not as "something was stopped" (#129).
+ *
+ *  `--configLoader runner` is the discriminator: devServer.ts passes it (so a packaged,
+ *  read-only install never writes a bundled config into its own tree) and NOTHING else in
+ *  the repo does — `npm run dev` is a bare `vite --config engine/vite.config.ts`. */
+const isEditorOwned = (c) => c.includes('--configloader runner') || c.includes('--configloader=runner');
+
 let procs;
 try { procs = listProcesses(); } catch (e) {
   console.error(`[stop-dev] could not list processes: ${e.message}`);
   process.exit(0); // never fail the caller — stopping is best-effort
 }
 
-const targets = procs.filter((p) => {
+const mine = procs.filter((p) => {
   if (!p.pid || p.pid === process.pid || p.pid === process.ppid) return false;
   const c = norm(p.cmd);
   return c.includes(rootMarker) && isViteCli(c);
 });
+// Compare lowercased on EVERY platform: norm() only lowercases on win32, and the flag is
+// spelled the same everywhere.
+const editorOwned = mine.filter((p) => isEditorOwned(norm(p.cmd).toLowerCase()));
+const targets = mine.filter((p) => !editorOwned.includes(p));
+
+// Say what we are NOT touching, and how to stop it — the old silence here is the whole bug.
+if (editorOwned.length) {
+  console.log(
+    `Leaving the editor's own dev server alone: ${editorOwned.map((t) => t.pid).join(' ')}\n`
+    + '  (that Vite belongs to a running Electron editor, which stops it on quit — killing it\n'
+    + '   would leave the editor up with a dead dev server behind it. Use `npm run editor:stop`.)',
+  );
+}
 
 if (targets.length === 0) { console.log('Done.'); process.exit(0); }
 

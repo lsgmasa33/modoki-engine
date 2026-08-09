@@ -69,20 +69,62 @@ export function removeBone(def: Rig2DFile, r: number): Rig2DFile {
     b.parent = p < 0 ? -1 : (remap.get(p) ?? -1);
   }
 
-  const n = def.mesh?.verts?.length ?? 0;
-  const oldIdx = def.skinIndices ?? [], oldW = def.skinWeights ?? [];
-  const si = new Array(n * 4).fill(0), sw = new Array(n * 4).fill(0);
-  for (let v = 0; v < n; v++) {
-    const acc = new Map<number, number>();
-    for (let k = 0; k < 4; k++) {
-      const w = oldW[v * 4 + k] ?? 0; if (w <= 0) continue;
-      const nb = remap.get(oldIdx[v * 4 + k] ?? 0);
-      if (nb == null || nb < 0) continue;    // deleted-root weight → dropped
-      acc.set(nb, (acc.get(nb) ?? 0) + w);
+  // EVERY mesh in the rig has to go through the remap, and a v2 rig has one per PART.
+  // This used to run over `def.mesh`/`def.skinIndices` only — the v1 top-level fields — while
+  // `def.parts` rode through the spread untouched, still indexed against the pre-delete numbering.
+  // `ensurePartsArray` STRIPS those top-level fields when it promotes a rig to v2, so on a
+  // multi-part rig the loop saw `n = 0`, did nothing, and wrote empty arrays: every part silently
+  // kept stale indices. On load `normalizePart` then clamps an index past the end to bone 0, so the
+  // damage shows up two ways — vertices bound to whatever bone shifted into the slot, and (for the
+  // last bone) vertices snapped to the root. Saved to disk either way. (#179)
+  const meshWeights = (
+    vertCount: number,
+    oldIdx: number[],
+    oldW: number[],
+  ): { skinIndices: number[]; skinWeights: number[] } => {
+    const si = new Array(vertCount * 4).fill(0), sw = new Array(vertCount * 4).fill(0);
+    for (let v = 0; v < vertCount; v++) {
+      const acc = new Map<number, number>();
+      for (let k = 0; k < 4; k++) {
+        // `!(w > 0)`, not `w <= 0`: NaN fails EVERY comparison, so `<=` would let a NaN weight
+        // through, poison `sum`, and zero the whole vertex including its valid buckets.
+        const w = oldW[v * 4 + k] ?? 0; if (!(w > 0)) continue;
+        const nb = remap.get(oldIdx[v * 4 + k] ?? 0);
+        if (nb == null || nb < 0) continue;    // deleted-root weight → dropped
+        acc.set(nb, (acc.get(nb) ?? 0) + w);
+      }
+      const top = [...acc.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4);
+      let sum = 0; for (const [, w] of top) sum += w;
+      if (!top.length || sum <= 0) {
+        // Every bucket dropped — a vertex bound ENTIRELY to the deleted bone. It must fall back to
+        // bone 0 at full weight, which is exactly what `normalizePart` does for a degenerate vertex
+        // on load. Leaving all four slots at 0 (what this did before) is not equivalent: the editor
+        // deforms from the RAW def, and `SkinCanvas.deformMesh` skips every zero-weight term, so the
+        // vertex collapsed to the local origin until the panel was reopened and the load path
+        // quietly repaired it. The invariant to hold onto: removeBone's output must NORMALIZE TO
+        // ITSELF, so the live preview and the reloaded rig cannot disagree.
+        si[v * 4] = 0; sw[v * 4] = 1;
+        continue;
+      }
+      for (let k = 0; k < top.length; k++) { si[v * 4 + k] = top[k][0]; sw[v * 4 + k] = top[k][1] / sum; }
     }
-    const top = [...acc.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4);
-    let sum = 0; for (const [, w] of top) sum += w;
-    for (let k = 0; k < top.length && sum > 0; k++) { si[v * 4 + k] = top[k][0]; sw[v * 4 + k] = top[k][1] / sum; }
+    return { skinIndices: si, skinWeights: sw };
+  };
+
+  // v2: remap EVERY part against its OWN vertex count — parts do not share a mesh. The top-level v1
+  // fields are deliberately left ALONE here rather than overwritten with an empty array computed
+  // from an absent `def.mesh`: `normalizeRig2D` ignores them whenever `parts` is present, so
+  // writing them would be inventing data, and it is what made the old bug invisible.
+  if (def.parts?.length) {
+    const parts = def.parts.map((p) => {
+      const n = p.mesh?.verts?.length ?? 0;
+      if (!n) return p;                        // a part with no mesh has no weights to remap
+      return { ...p, ...meshWeights(n, p.skinIndices ?? [], p.skinWeights ?? []) };
+    });
+    return { ...def, bones: newBones, parts };
   }
-  return { ...def, bones: newBones, skinIndices: si, skinWeights: sw };
+
+  // v1: the single implicit part lives in the top-level fields.
+  const n = def.mesh?.verts?.length ?? 0;
+  return { ...def, bones: newBones, ...meshWeights(n, def.skinIndices ?? [], def.skinWeights ?? []) };
 }

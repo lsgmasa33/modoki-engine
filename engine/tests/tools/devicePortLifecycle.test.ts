@@ -19,7 +19,8 @@ function harness(overrides: { start?: () => Promise<{ port: number }>; stop?: ()
   const start = vi.fn(overrides.start ?? (async () => ({ port: 9095 })));
   const stop = vi.fn(overrides.stop ?? (async () => ({ ok: true })));
   const log = vi.fn();
-  return { start, stop, log, handler: createPortLifecycleHandler({ start, stop, log }) };
+  const logError = vi.fn();
+  return { start, stop, log, logError, handler: createPortLifecycleHandler({ start, stop, log, logError }) };
 }
 
 describe('createPortLifecycleHandler (#95)', () => {
@@ -73,5 +74,41 @@ describe('createPortLifecycleHandler (#95)', () => {
     h.handler({ isActive: true });
     await settle();
     expect(h.start).toHaveBeenCalledTimes(1);
+  });
+
+  /** The two failures are not equally serious, and #164 is what happens when they are reported as
+   *  if they were. Found by sweeping that bug's PATTERN — "a failure that leaves the bridge
+   *  unreachable, reported at log level" — rather than its symptom. */
+  describe('a failed RE-BIND is reported louder than a failed release (#164)', () => {
+    it('foreground failure goes to logError, and says the server is not listening', async () => {
+      const h = harness({ start: async () => { throw new Error('EADDRINUSE'); } });
+      h.handler({ isActive: true });
+      await settle();
+      const err = h.logError.mock.calls.flat().join(' ');
+      expect(err).toMatch(/NOT listening/);
+      expect(err).toMatch(/device_\*/);                  // names what the reader has lost
+      expect(err).toMatch(/EADDRINUSE/);                 // never hides the underlying cause
+      // …and it must NOT be buried in the ordinary log stream, which is the whole point.
+      expect(h.log.mock.calls.flat().join(' ')).not.toMatch(/NOT listening/);
+    });
+
+    it('background failure stays at log level — the port merely stays held, which is benign', async () => {
+      const h = harness({ stop: async () => { throw new Error('socket already closed'); } });
+      h.handler({ isActive: false });
+      await settle();
+      expect(h.log.mock.calls.flat().join(' ')).toMatch(/appStateChange handling failed/);
+      expect(h.logError).not.toHaveBeenCalled();
+    });
+
+    it('logError defaults to log, so a caller that never heard of it still reports the failure', async () => {
+      // The dep is optional; a caller passing only `log` must not silently drop the loudest
+      // message in the file.
+      const start = vi.fn(async () => { throw new Error('boom'); });
+      const stop = vi.fn(async () => ({ ok: true }));
+      const log = vi.fn();
+      createPortLifecycleHandler({ start, stop, log })({ isActive: true });
+      await settle();
+      expect(log.mock.calls.flat().join(' ')).toMatch(/NOT listening/);
+    });
   });
 });

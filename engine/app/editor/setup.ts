@@ -8,19 +8,26 @@
 
 import { createElement } from 'react';
 import type React from 'react';
-import { createEditor, useEditorStore, backendFetch, backendEventSource } from '@modoki/engine/editor';
+import {
+  createEditor, setExtraMenus, useEditorStore, backendFetch, backendEventSource, fetchDeviceList,
+  type ExtraMenuItem, type DeviceListReply,
+} from '@modoki/engine/editor';
 import { GameView } from '@modoki/engine/editor/rendering';
 import { PlayerPrefs, selectDefaultBackend, setGameConfig, setPhysicsLayers } from '@modoki/engine/runtime';
 import type { GameConfig, EditorPanelDef } from '@modoki/engine/runtime';
 import projectConfig from 'virtual:modoki-project-config';
 import {
   CAPACITOR_ORIENTATIONS, STATUS_BAR_STYLES, KEYBOARD_RESIZE_MODES, WEB_DEPLOY_MODES, WEB_SIZE_MODES,
-  PLAYABLE_NETWORKS, IOS_CONTENT_MODES, ANDROID_SCHEMES, GPU_BACKENDS, TONE_MAPPINGS,
+  PLAYABLE_NETWORKS, IOS_CONTENT_MODES, ANDROID_SCHEMES, GPU_BACKENDS, QUALITY_TIERS, TONE_MAPPINGS,
 } from '../../project-config';
 import { loadProjectGames } from '../projectGames';
 import { registerAll } from '../ecs/register';
 import { DefaultGameUILayer } from '../ui/DefaultGameUILayer';
 import { registerEditorAgentOps } from './agentEditorOps';
+import {
+  iosTargetRows, androidTargetRows, iosTargetSummary, androidTargetSummary, buildRefusal, pickRefusal,
+  type DeviceTarget, type DeviceTargetPatch, type TargetRow,
+} from './buildTargetMenu';
 import { addGameBootFault, describeGameBootFaults } from './gameBootFaults';
 
 // Wrap modoki GameView with game-specific UI layer
@@ -58,6 +65,11 @@ async function runGameHook(gameId: string, phase: string, hook?: () => unknown):
 
 /** Trigger a build + deploy via the dev server's SSE endpoint */
 async function runBuild(platform: 'ios' | 'android' | 'web' | 'playable') {
+  // Refuse a SECOND concurrent build (see `buildRefusal` for what two at once actually do to the
+  // project dir). The DOM progress modal does not gate this: under Electron the build items live
+  // in the native application menu, which a modal cannot cover.
+  const refusal = buildRefusal(useEditorStore.getState().buildStatus);
+  if (refusal) { useEditorStore.getState().showToast(refusal, 'warn'); return; }
   // Tool gate: if a native build's required tools aren't installed, OPEN Build Support
   // (where they install with one click / auto-install) instead of starting a build that
   // would just fail at the server preflight. Turns the dead-end into a fix. Web and
@@ -76,6 +88,89 @@ async function runBuild(platform: 'ios' | 'android' | 'web' | 'playable') {
   }
   runStream(`/api/build?platform=${platform}`, 5, `${platform} build`, 'Starting build...');
 }
+
+// ── Build → device target picker (#170) ──────────────────────────────────────────────────────
+// The Build menu names the device it will build for, and its submenu switches it. The listing is
+// fetched ONCE after boot (two `xcrun` shell-outs — never on the click path, and never blocking
+// editor start) plus on the submenu's explicit "Refresh devices"; Electron gives no will-open
+// event for an application menu, so there is nothing cheaper to hook.
+let deviceList: DeviceListReply | null = null;
+let deviceTarget: DeviceTarget = { iosDeviceId: '', iosDevicectlId: '', androidDeviceId: '' };
+/** Re-render the Build menu from the state above — installed once the editor exists. */
+let republishBuildMenu: (() => void) | null = null;
+
+/** Read the ids the next build will use, straight from the same route Project Settings saves to,
+ *  so the two can never disagree about what the target is. */
+async function loadDeviceTarget(): Promise<void> {
+  try {
+    const r = await backendFetch('/api/project-settings');
+    if (!r.ok) return;
+    const j = (await r.json()) as { user?: { device?: Partial<DeviceTarget> } };
+    const d = j.user?.device;
+    if (d) deviceTarget = { iosDeviceId: d.iosDeviceId ?? '', iosDevicectlId: d.iosDevicectlId ?? '', androidDeviceId: d.androidDeviceId ?? '' };
+  } catch { /* backend not up — the menu shows "no device set", which is honest */ }
+}
+
+/** Sequence token for the listing fetch. Two refreshes can be in flight (the boot one takes
+ *  1.6-2.9s of `xcrun`, and "Refresh devices" is one click), they take VARIABLE time, and without
+ *  this the slower-but-older response lands last and overwrites the newer listing — the menu then
+ *  shows devices that were correct two seconds ago. Only `deviceList` needs it: `deviceTarget` is
+ *  re-read from disk, so a stale one cannot disagree with what the build will use. */
+let deviceListGeneration = 0;
+
+async function refreshDeviceTargets(): Promise<void> {
+  const generation = ++deviceListGeneration;
+  const [list] = await Promise.all([fetchDeviceList(), loadDeviceTarget()]);
+  if (generation !== deviceListGeneration) return; // a newer refresh already answered
+  deviceList = list;
+  republishBuildMenu?.();
+}
+
+/** Write a picked device into project.user.json, then BUILD to it. A PARTIAL patch
+ *  (`/api/project-settings` deep-merges), so the machine's other per-machine settings — and any
+ *  device id typed by hand into a field this menu does not offer — are left exactly as they were.
+ *
+ *  Picking builds because that is the motion the picker exists for: you open it to put this build
+ *  on THAT phone, and a select-then-confirm split makes the common case two trips through a menu.
+ *  The build is started only once the write has LANDED — a build against a target that failed to
+ *  save would go to the previous device while the menu claimed otherwise. Nothing can stop a build
+ *  once it starts (the progress modal only dismisses its own UI), which is why the submenu also
+ *  offers a set-without-building route out to Project Settings. */
+async function pickDeviceTarget(patch: DeviceTargetPatch, andBuild?: 'ios' | 'android'): Promise<void> {
+  const { showToast } = useEditorStore.getState();
+  // Refuse while Project Settings is open — see `pickRefusal`: that dialog would write back the
+  // device it snapshotted when it opened, silently undoing this pick on its next Save.
+  const refusal = pickRefusal(useEditorStore.getState().projectSettingsOpen);
+  if (refusal) { showToast(refusal, 'warn'); return; }
+  try {
+    const r = await backendFetch('/api/project-settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user: { device: patch } }),
+    });
+    if (!r.ok) {
+      // Never leave the menu showing a target that was not written — the next build would go
+      // somewhere else entirely, and the ✓ would be the reason nobody noticed.
+      const msg = await r.json().then((j: { error?: string }) => j?.error).catch(() => undefined);
+      showToast(`Could not set the build target: ${msg || `HTTP ${r.status}`}`, 'warn');
+      return;
+    }
+  } catch (e) {
+    showToast(`Could not set the build target: ${e instanceof Error ? e.message : String(e)}`, 'warn');
+    return;
+  }
+  deviceTarget = { ...deviceTarget, ...patch };
+  republishBuildMenu?.();
+  if (andBuild) void runBuild(andBuild);
+}
+
+/** One target row → a menu item. A disabled row is an explanation (nothing attached, adb missing,
+ *  the configured device unplugged) and carries no action. */
+const targetItem = (row: TargetRow, platform: 'ios' | 'android'): ExtraMenuItem => ({
+  label: row.label,
+  checked: row.checked,
+  ...(row.disabled || !row.patch ? { disabled: true } : { action: () => void pickDeviceTarget(row.patch!, platform) }),
+});
 
 /** Scaffold a native target (cap add + deps + config + heal) in one action. */
 function runAddNativeTarget(platform: 'ios' | 'android') {
@@ -262,27 +357,55 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
     .__modokiElectron?.platform;
   const iosUnavailable = !!electronPlatform && electronPlatform !== 'darwin';
 
+  // The Build menu, rebuilt whenever the device listing or the chosen target changes (#170). The
+  // device rows live in a SUBMENU under each native build item, whose own label names the target —
+  // so the menu says what it is about to do without being opened.
+  const buildMenu = (): ExtraMenuItem[] => {
+    // Every actionable row here BUILDS: a device row switches the target first, "Build now" keeps
+    // the current one. The one exception is the escape hatch — nothing stops a build once it has
+    // started, so there must be a way to change the target that is not also a commitment to run a
+    // multi-minute native build. It routes to Project Settings rather than duplicating the device
+    // list, because a second copy of the list is where the two would drift apart (and the menu
+    // renderers cap nesting at one level on purpose).
+    const deviceSubmenu = (rows: TargetRow[], platform: 'ios' | 'android', buildLabel: string): ExtraMenuItem[] => [
+      ...rows.map((r) => targetItem(r, platform)),
+      { label: '', separator: true },
+      { label: buildLabel, action: () => runBuild(platform) },
+      { label: 'Set target without building…', action: () => useEditorStore.getState().openProjectSettings() },
+      { label: 'Refresh devices', action: () => void refreshDeviceTargets() },
+    ];
+    return [
+      {
+        label: iosUnavailable ? `iOS Device — ${appName} (needs macOS)` : `iOS Device — ${appName} → ${iosTargetSummary(deviceList, deviceTarget)}`,
+        // NO action on a submenu parent: Electron ignores one, and the in-window bar opens the
+        // flyout instead of firing — so an `action` here would be dead code in both renderers
+        // while reading as the thing that builds. "Build now" INSIDE the submenu is that item.
+        disabled: iosUnavailable,
+        submenu: deviceSubmenu(iosTargetRows(deviceList, deviceTarget, electronPlatform), 'ios', `Build now → ${iosTargetSummary(deviceList, deviceTarget)}`),
+      },
+      {
+        label: `Android Device — ${appName} → ${androidTargetSummary(deviceList, deviceTarget)}`,
+        submenu: deviceSubmenu(androidTargetRows(deviceList, deviceTarget), 'android', `Build now → ${androidTargetSummary(deviceList, deviceTarget)}`),
+      },
+      { label: webLabel, action: () => runBuild('web') },
+      { label: `Playable Ad — ${appName}`, action: () => runBuild('playable') },
+      { label: '', separator: true },
+      { label: iosUnavailable ? 'Add iOS Target… (needs macOS)' : 'Add iOS Target…', action: () => runAddNativeTarget('ios'), disabled: iosUnavailable },
+      { label: 'Add Android Target…', action: () => runAddNativeTarget('android') },
+      { label: '', separator: true },
+      { label: 'Publish OTA Update…', action: () => useEditorStore.getState().openOtaPublish() },
+      { label: 'OTA Keys…', action: () => useEditorStore.getState().openOtaKeys() },
+      { label: '', separator: true },
+      { label: 'Build Support…', action: () => useEditorStore.getState().openBuildSupport() },
+    ];
+  };
+
   const Editor = createEditor({
     config: defaultConfig,
     gameId: chosenGameId,
     gameView: GameViewWithUI,
     panels: gamePanels,
-    extraMenus: {
-      Build: [
-        { label: iosUnavailable ? `iOS Device — ${appName} (needs macOS)` : `iOS Device — ${appName}`, action: () => runBuild('ios'), disabled: iosUnavailable },
-        { label: `Android Device — ${appName}`, action: () => runBuild('android') },
-        { label: webLabel, action: () => runBuild('web') },
-        { label: `Playable Ad — ${appName}`, action: () => runBuild('playable') },
-        { label: '', separator: true },
-        { label: iosUnavailable ? 'Add iOS Target… (needs macOS)' : 'Add iOS Target…', action: () => runAddNativeTarget('ios'), disabled: iosUnavailable },
-        { label: 'Add Android Target…', action: () => runAddNativeTarget('android') },
-        { label: '', separator: true },
-        { label: 'Publish OTA Update…', action: () => useEditorStore.getState().openOtaPublish() },
-        { label: 'OTA Keys…', action: () => useEditorStore.getState().openOtaKeys() },
-        { label: '', separator: true },
-        { label: 'Build Support…', action: () => useEditorStore.getState().openBuildSupport() },
-      ],
-    },
+    extraMenus: { Build: buildMenu() },
     projectSettings: {
       tabs: [
         {
@@ -397,13 +520,17 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
               title: 'Signing',
               fields: [
                 { key: 'build.appleTeamId', label: 'Apple Team ID', type: 'combo', options: teamOptions, placeholder: 'e.g. ABCDE12345', help: 'pick a team found on this Mac (or type an ID) — synced into iOS DEVELOPMENT_TEAM on every iOS build' },
+                { key: 'build.iosMinVersion', label: 'Minimum iOS version', type: 'text', placeholder: '16.4', help: 'the ONE floor — sets both the JS bundle target and the native IPHONEOS_DEPLOYMENT_TARGET. Below 15.4 needs polyfills (structuredClone / Array.at / Object.hasOwn land in 15.4), not just a smaller number' },
               ],
             },
             {
               title: 'This Machine (project.user.json — not committed)',
               fields: [
-                { key: 'user.device.iosDeviceId', label: 'iOS device UDID', type: 'text', help: "xcodebuild -destination 'id=…'" },
-                { key: 'user.device.iosDevicectlId', label: 'iOS devicectl id', type: 'text', help: 'xcrun devicectl --device …' },
+                { key: 'user.device.iosDeviceId', label: 'iOS device UDID', type: 'text', help: "Required for an iOS build — xcodebuild -destination 'id=…'" },
+                // Optional on purpose: devicectl is CoreDevice-only (iOS 17+), so a legacy
+                // device has no id to put here and the build hands off to Xcode instead.
+                // Saying so here keeps this panel agreeing with the build's own preflight.
+                { key: 'user.device.iosDevicectlId', label: 'iOS devicectl id', type: 'text', help: 'Optional (iOS 17+ only) — enables hands-free install/launch. Empty ⇒ the build opens Xcode for ⌘R. xcrun devicectl --device …' },
               ],
             },
             {
@@ -417,6 +544,12 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
         {
           title: 'Android',
           groups: [
+            {
+              title: 'Build',
+              fields: [
+                { key: 'build.androidMinSdk', label: 'Minimum Android SDK', type: 'number', placeholder: '31', help: 'API level, not the marketing version — 31 = Android 12. Synced into android/variables.gradle minSdkVersion on open. Capacitor scaffolds 24, so without this the floor drifts per-project.' },
+              ],
+            },
             {
               title: 'This Machine (project.user.json — not committed)',
               fields: [
@@ -453,6 +586,7 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
               title: 'Three.js (3D)',
               fields: [
                 { key: 'rendering.three.backend', label: 'GPU backend', type: 'select', options: GPU_BACKENDS.map((v) => ({ value: v, label: v })), help: 'auto = detect, prefer WebGPU' },
+                { key: 'rendering.three.qualityTier', label: 'Quality tier', type: 'select', options: QUALITY_TIERS.map((v) => ({ value: v, label: v })), help: 'auto = measure the device and pick; low clamps the four fields below. Takes effect on the next renderer bring-up — use the debug menu Device tab to preview it live' },
                 { key: 'rendering.three.antialias', label: 'Antialias', type: 'checkbox' },
                 { key: 'rendering.three.shadows', label: 'Shadows', type: 'checkbox' },
                 { key: 'rendering.three.pixelRatioCap', label: 'Pixel-ratio cap', type: 'number', placeholder: '2 (0 = uncapped)' },
@@ -503,6 +637,9 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
           // Apply physics layers live so the editor reflects matrix/name edits without
           // a reload — colliders rebuild next tick (resolved bits are in their signature).
           if (r.ok && values.physics) setPhysicsLayers(values.physics as Parameters<typeof setPhysicsLayers>[0]);
+          // The dialog can edit the same `user.device` ids the Build menu shows (#170) — re-read
+          // them so the menu's label and ✓ can't contradict the dialog the user just saved.
+          if (r.ok && values.user) void refreshDeviceTargets();
           if (r.ok) return true;
           // Surface the server's reason. The route refuses a save for things the user
           // can fix (an unsafe build field, a config file that no longer parses), and
@@ -526,6 +663,13 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
       },
     },
   });
+
+  // Build menu ↔ device listing (#170). Installed AFTER createEditor (nothing can render a menu
+  // before the editor exists) and deliberately NOT awaited: the iOS half is two `xcrun` shell-outs
+  // at ~1.6-2.9s uncached, and the editor must not wait on a phone probe to boot. The menu is
+  // correct-but-uninformed until this lands, then re-renders itself.
+  republishBuildMenu = () => setExtraMenus({ Build: buildMenu() });
+  void refreshDeviceTargets();
 
   // The editor booted, but this project's game code did not. Say so ON SCREEN — a console
   // line is not enough when the consequence (systems missing, entities inert) looks exactly

@@ -18,6 +18,7 @@ import { assetUrl } from '../../../runtime/loaders/assetUrl';
 import { inputStyle } from '../fields';
 import { formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';
 import { encodeUltraHDR, hashBytes, bytesToBase64 } from './encodeUltraHDR';
+import { withCurrentValue } from './importSettingOptions';
 
 // Preview canvas width (equirect is 2:1). Kept small — we nearest-sample the
 // source down to this so tonemapping a 2k HDR stays cheap.
@@ -213,7 +214,9 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
         <div style={rowStyle}>
           <span style={labelStyle}>Max Size</span>
           <select value={String(settings.maxSize)} onChange={(e) => update({ maxSize: Number(e.target.value) as EnvMaxSize })} style={{ ...inputStyle, flex: 1 }}>
-            {ENV_MAX_SIZES.map((s) => <option key={s} value={s}>{s}</option>)}
+            {/* Splice an off-list authored size in — an unmatched `value` would display as
+                the FIRST option and misreport the setting (#131). */}
+            {withCurrentValue(ENV_MAX_SIZES, settings.maxSize).map((s) => <option key={s} value={s}>{s}</option>)}
           </select>
         </div>
       )}

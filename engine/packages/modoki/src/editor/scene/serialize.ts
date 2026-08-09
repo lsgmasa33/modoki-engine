@@ -2,8 +2,9 @@
  *  Uses the trait registry — no hardcoded trait knowledge. */
 
 import { getAllEntities, readTraitData, findEntity, deleteEntities, subtreeIds } from '../../runtime/core/ecs/entityUtils';
-import { Transient } from '../../runtime/traits/Transient';
-import { getCurrentWorld, registerEntity } from '../../runtime/core/ecs/world';
+import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
+import { Transient } from '../../runtime/core/traits/Transient';
+import { getCurrentWorld, spawnEntity } from '../../runtime/core/ecs/world';
 import { Camera } from '../../runtime/traits/Camera';
 import { Transform } from '../../runtime/core/traits/Transform';
 import { EntityAttributes } from '../../runtime/core/traits/EntityAttributes';
@@ -13,6 +14,7 @@ import { backendFetch } from '../backend/editorBackend';
 import { saveAssetDialog } from '../utils/saveDialog';
 import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { sceneManager } from '../../runtime/scene/SceneManager';
+import { isPrefabEditWorld } from './prefabEditWorld';
 import { useEditorStore } from '../store/editorStore';
 import { setPlayState, getRunMode } from '../../runtime/core/playState';
 import { swapHistory, getEditVersion } from '../undo/undoManager';
@@ -197,7 +199,7 @@ export async function serializeScene(opts?: {
   // scrub/preview/play (a `Transient` root) AND its whole subtree from serialization — a
   // preview/scrub mutation must never reach disk. Exclude the subtree up front so ALL passes
   // below (guid pre-pass, prefab-child collection, the main loop) simply never see them, which
-  // avoids orphaning a transient prefab-instance's members. See runtime/traits/Transient.ts.
+  // avoids orphaning a transient prefab-instance's members. See runtime/core/traits/Transient.ts.
   const allInfos = getAllEntities();
   const transientIds = new Set<number>();
   for (const e of allInfos) {
@@ -788,7 +790,7 @@ export function unsavedChangeCauses(): { sceneDirty: boolean; dirtyAssetPaths: s
 export interface SaveResult {
   saved: boolean;
   path: string | null;
-  reason: 'ok' | 'cancelled' | 'write-failed' | 'needs-path' | 'playing';
+  reason: 'ok' | 'cancelled' | 'write-failed' | 'needs-path' | 'playing' | 'prefab-edit';
   /** Other loaded scenes (Phase 12, M3 — a dirty BASE, edited in place) written in
    *  the SAME `saveAll` call, alongside the primary. Absent/empty when nothing else
    *  was dirty. A base is only ever written once the primary's own save succeeded —
@@ -819,6 +821,26 @@ export async function saveScene(opts: {
   allowDialog?: boolean;
 } = {}): Promise<SaveResult> {
   const { path: explicitPath, allowDialog = true } = opts;
+  // ⚠️ NEVER serialize the prefab-edit world. Its entities are the prefab PLUS throwaway scaffolding
+  // (key light, ambient, HDR, and the 2D `Canvas2D` host + centring stage), and its scene path is
+  // deliberately null so a normal save cannot target a real file. But "no path" then fell into the
+  // Save-As branch below — so Cmd+S offered a native "Save Scene As" panel and, if accepted, would
+  // have written the SCAFFOLDING into a brand-new scene file.
+  //
+  // Observed, not theorised: an exit whose scene reload failed left the world synthetic with the
+  // `editingPrefab` flag cleared, `isEditingPrefab()` therefore returned false, and Cmd+S fell
+  // through to exactly that dialog ("prefab cannot be saved — it opens a new file dialog").
+  //
+  // The guard asks the WORLD (`isPrefabEditWorld`) rather than the store flag, which is the whole
+  // point: the flag is what was out of sync. `savePrefabEdit()` is the save for this world, and the
+  // Cmd+S callers route to it — this refusal is the backstop for every path that does not.
+  // ⚠️ Conjunction, not `isPrefabEditWorld()` alone. `newScene()` wipes the ECS world and sets
+  // `_currentScenePath` WITHOUT touching sceneManager, so the live path stays SYNTHETIC after
+  // "Create Scene" is used from the Assets panel during prefab-edit — and the bare guard then
+  // refused to write the brand-new scene, silently (neither `create()` nor `runCreate` checks the
+  // result). `_currentScenePath` is the discriminator: prefab-edit deliberately nulls it, while a
+  // real save target means the world is no longer the prefab's. Refusing needs BOTH.
+  if (isPrefabEditWorld() && !_currentScenePath) return { saved: false, path: null, reason: 'prefab-edit' };
   // TRANSIENCE guard (preview-mode-refactor, Phase 2): only ever WRITE authored data. While
   // scrub/preview/play is live the world holds preview mutations (a signal action moved the
   // camera, `isActive` toggled, a control prefab spawned) — the Transient skip drops spawns, but
@@ -979,27 +1001,50 @@ export async function loadScene(
 export function newScene(): void {
   deleteEntities(getAllEntities().map((e) => e.id));
   const world = getCurrentWorld();
-  registerEntity(world.spawn(
+  spawnEntity(world,
     Transform({ x: 0, y: 5, z: 10 }), Camera({ fov: 60 }), EntityAttributes({ name: 'Camera', sortOrder: 0 }),
-  ));
-  registerEntity(world.spawn(
+  );
+  spawnEntity(world,
     Environment({ hdrPath: WHITE_HDR_GUID }), EntityAttributes({ name: 'HDR Environment', sortOrder: 1 }),
-  ));
-  registerEntity(world.spawn(
+  );
+  spawnEntity(world,
     Transform({ x: 5, y: 10, z: 7 }),
     Light({ lightType: 'directional', color: 0xffffff, intensity: 2 }),
     EntityAttributes({ name: 'Directional Light', sortOrder: 2 }),
-  ));
-  registerEntity(world.spawn(
+  );
+  spawnEntity(world,
     Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.6 }),
     EntityAttributes({ name: 'Ambient Light', sortOrder: 3 }),
-  ));
+  );
   setCurrentScenePath(null);
   setCurrentBaseScene(undefined);
   swapHistory('');
   markSceneSaved(); // a fresh untitled scene has no unsaved WORK yet — new baseline (C7)
   clearAllSceneDirty();
   console.log('[Editor] New scene created');
+}
+
+/** Report (and reset) the #124 probe: authored entity fields that a SYSTEM rewrote while the
+ *  editor was stopped, and which this save therefore just persisted.
+ *
+ *  One grouped warning, never a refusal. The engine cannot tell a rogue write from an intended
+ *  one — a game may legitimately drive an authored entity from a projection — so the honest
+ *  move is to name it and let the human judge. The fix on the game's side is usually
+ *  `registerProjection(..., { pauseWhileStopped: true })`, which is why the message says so.
+ *
+ *  Exported for tests; `saveAll` is the only production caller. */
+export function warnAuthoredWritesWhileStopped(): void {
+  const { records, dropped } = getAuthoredWritesWhileStopped();
+  if (records.length === 0) return;
+  const lines = records.map(r => `  • ${r.name}.${r.trait}.${r.field}${r.count > 1 ? ` (${r.count}x)` : ''}`);
+  if (dropped > 0) lines.push(`  • …and ${dropped} more field(s) not listed`);
+  console.warn(
+    `[Editor] ${records.length} authored field(s) were changed by a running system while the editor was `
+    + `stopped, and this save wrote those values to disk:\n${lines.join('\n')}\n`
+    + `  If that is not intended, the projection driving them should be registered with `
+    + `{ pauseWhileStopped: true } (see docs/scene-loading.md § Authored vs runtime).`,
+  );
+  clearAuthoredWritesWhileStopped();
 }
 
 /** Save all editor-managed assets: the primary scene file (via `saveScene`), THEN
@@ -1018,6 +1063,10 @@ export function newScene(): void {
 export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {}): Promise<SaveResult> {
   const primaryResult = await saveScene(opts);
   if (!primaryResult.saved) return primaryResult;
+  // #124, warn-only: name any authored field a system rewrote while the editor was stopped —
+  // those values were just written to disk. Reported AFTER the save succeeds so a refused save
+  // (playing/previewing) doesn't warn about a file nothing wrote.
+  warnAuthoredWritesWhileStopped();
 
   const extraSaved: { path: string; guid: string }[] = [];
   const failed: { path: string; guid: string; reason: string }[] = [];

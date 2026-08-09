@@ -16,6 +16,7 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "captureScreen", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getNativeLogs", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getDeviceIp", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getDeviceHardware", returnType: CAPPluginReturnPromise),
     ]
 
     private var listener: NWListener?
@@ -171,6 +172,40 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
     /// type it into Modoki's Connect field. Empty string if WiFi isn't up.
     @objc func getDeviceIp(_ call: CAPPluginCall) {
         call.resolve(["ip": GameDebugPlugin.wifiIPv4() ?? ""])
+    }
+
+    /// WHICH PHONE this lease is holding (#146), so the host can tie a WebDriverAgent launch to it
+    /// instead of guessing from what is plugged into the Mac.
+    ///
+    /// `model` is `hw.machine` — the product type, `iPhone18,4` — chosen because it is the one
+    /// string the HOST also sees: `xcrun devicectl` reports it byte-identical as
+    /// `hardwareProperties.productType`, so the two can be compared. A UDID cannot: iOS forbids an
+    /// app reading the hardware UDID, and `identifierForVendor` appears in no `xcrun` listing.
+    /// `UIDevice.model` is NOT usable either — it answers a generic `"iPhone"`.
+    ///
+    /// This lives HERE rather than in `@capacitor/device` deliberately. #146 only matters while a
+    /// device holds a lease, and holding one requires this plugin — whereas `@capacitor/device` is
+    /// optional and no Modoki project installs it, which made the first version of that fix inert
+    /// on every real device (it read `Capacitor.Plugins.Device`, always undefined, so the host
+    /// always fell back to guessing). A fact needed by the lease belongs in the lease's own plugin.
+    ///
+    /// Never fabricates: an unreadable value is the empty string, which the host reads as "unknown"
+    /// and treats as unverified — never as a mismatch.
+    @objc func getDeviceHardware(_ call: CAPPluginCall) {
+        call.resolve([
+            "model": GameDebugPlugin.hardwareModel(),
+            "osVersion": UIDevice.current.systemVersion,
+        ])
+    }
+
+    /// `hw.machine` via sysctl — the same source Capacitor's Device plugin uses. Two calls: the
+    /// first sizes the buffer, the second fills it.
+    private static func hardwareModel() -> String {
+        var size = 0
+        guard sysctlbyname("hw.machine", nil, &size, nil, 0) == 0, size > 0 else { return "" }
+        var machine = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("hw.machine", &machine, &size, nil, 0) == 0 else { return "" }
+        return String(cString: machine)
     }
 
     private static func wifiIPv4() -> String? {

@@ -39,6 +39,30 @@ export interface FontImportSettings {
   atlasMax: number;
   /** How glyphs are sourced at runtime (baked-only vs baked-seeded dynamic gen). */
   mode: FontMode;
+  /** Variable-font axis instance — axis tag → pinned value, e.g. `{ wght: 700 }` or
+   *  `{ wght: 600, SHRP: 40 }`. Tags are raw OpenType tags from the source's `fvar`
+   *  table (the Font Inspector reads them, with each axis's real min/default/max).
+   *
+   *  Absent or empty ⇒ the font's DEFAULT instance. That default is often not Regular:
+   *  Geologica defaults to wght 100 (Thin) and Nunito to 200 (ExtraLight), so leaving
+   *  this unset is what made those families render at their lightest weight and nothing
+   *  else. See docs/plans/font-variation-axes-plan.md.
+   *
+   *  ONE FONT ASSET = ONE INSTANCE (as in Unity): two weights of a family means two font
+   *  assets, since each bakes its own atlas. Distinct from `Text2D.weight`, which is a
+   *  per-entity SDF edge shift (fake bolding of whatever instance was rasterized). */
+  variationAxes?: Record<string, number>;
+  /** Whether the build ships the source `.ttf`/`.otf` alongside the baked atlas.
+   *  `auto` (default) ships it only when the static asset-shaker finds a DOM
+   *  consumer — a `UIElement.fontFamily` (or `resources[]` `type:'font'`) naming
+   *  this font's CSS family — since DOM/PixiJS text goes through the browser's
+   *  FontFace API and needs the real outlines; CANVAS text (`Text2D.font`, a GUID)
+   *  renders from the atlas alone. `always` forces shipping even with no detected
+   *  DOM usage — the escape hatch for a family named from CODE (a runtime string,
+   *  not a scene field) or from a stylesheet the static scan can't see. `never`
+   *  forces dropping it even if DOM usage IS detected (accepting a fallback face)
+   *  when the payload isn't worth it. */
+  shipSource?: 'auto' | 'always' | 'never';
 }
 
 export const DEFAULT_FONT_SETTINGS: FontImportSettings = {
@@ -60,6 +84,7 @@ export const DEFAULT_FONT_SETTINGS: FontImportSettings = {
   // still packs into 1024²; the packer uses only what it needs).
   atlasMax: 2048,
   mode: 'baked',
+  shipSource: 'auto',
 };
 
 /** Cache bookkeeping persisted in the font's meta sidecar (`fontCache` block).
@@ -103,12 +128,20 @@ export function expandCharset(settings: Pick<FontImportSettings, 'charset' | 'cu
  *  these from the content cache; the build copies them into `dist/`. */
 export const FONT_ATLAS_SUFFIX = '~atlas.png';
 export const FONT_METRICS_SUFFIX = '~metrics.json';
+/** The axis-pinned static instance of the source font, emitted only when
+ *  `variationAxes` is set. Consumed by the DYNAMIC runtime generator, which rasterizes
+ *  raw outlines and so cannot apply axes itself. Baked fonts never need it at runtime —
+ *  their atlas was already baked from it. */
+export const FONT_INSTANCE_SUFFIX = '~instance.ttf';
 
 export function fontAtlasUrl(sourcePath: string): string {
   return sourcePath + FONT_ATLAS_SUFFIX;
 }
 export function fontMetricsUrl(sourcePath: string): string {
   return sourcePath + FONT_METRICS_SUFFIX;
+}
+export function fontInstanceUrl(sourcePath: string): string {
+  return sourcePath + FONT_INSTANCE_SUFFIX;
 }
 
 /** The font block baked onto an asset-manifest entry (`AssetEntry.font`) at scan/
@@ -134,4 +167,30 @@ export interface FontManifestBlock {
   /** Baked atlas page dimensions in px. */
   atlasWidth?: number;
   atlasHeight?: number;
+  /** ── DYNAMIC-only generation settings. Emitted just for `mode:'dynamic'` fonts, whose
+   *  provider generates its own atlas at runtime and so needs the authored knobs the
+   *  baked path gets from the sidecar at build time. (A baked font's atlas is already on
+   *  disk, so carrying these for it would be dead weight in every manifest.)
+   *
+   *  They exist because the dynamic provider used to take NO settings and hardcode
+   *  everything: a font could author `size: 128` and silently get 64. */
+  size?: number;
+  atlasMax?: number;
+  charset?: FontCharsetPreset;
+  customChars?: string;
+  /** True when an axis-pinned `~instance.ttf` variant was emitted and the DYNAMIC
+   *  runtime generator must fetch THAT instead of the source path. Absent/false ⇒ the
+   *  font authors no `variationAxes`, so the source itself is the right outlines.
+   *
+   *  Note a DOM consumer still wants the RAW source, not this: CSS `font-weight`
+   *  instances a variable font natively, so `sourceShipped` and `instanced` are
+   *  independent and a font can legitimately ship both. */
+  instanced?: boolean;
+  /** Whether the build shipped the source `.ttf`/`.otf` next to the atlas.
+   *  `false` means the shaker dropped it (`shipSource:'auto'` + no DOM usage
+   *  found, or an explicit `'never'`) — `loadAllFonts` must NOT FontFace-load
+   *  this entry's path, or it 404s and pads the "N/N fonts failed" warning with
+   *  a failure that isn't one. Absent/`true` means the source is available
+   *  (always the case in dev, which serves everything off disk). */
+  sourceShipped?: boolean;
 }

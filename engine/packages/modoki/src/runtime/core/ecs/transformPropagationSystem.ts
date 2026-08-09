@@ -32,7 +32,12 @@ import type { World } from 'koota';
 import { Transform } from '../traits/Transform';
 import { EntityAttributes } from '../traits/EntityAttributes';
 
-/** Computed world transforms, updated each frame. Renderers read from here. */
+/** Computed world transforms, updated each frame. Renderers read from here.
+ *  PERF (ecs-core F6): values are MUTATED IN PLACE across passes rather than replaced —
+ *  an unchanged-pass short-circuit relies on the object identity for a given id staying
+ *  stable so it can skip rewriting it. Every consumer does `.get(id)` and reads the fields
+ *  immediately, so nothing may retain a value object across frames — read it fresh each
+ *  time you need it. */
 export const worldTransforms = new Map<number, { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number }>();
 
 /** Entities deactivated via EntityAttributes.isActive (includes children of inactive parents). */
@@ -64,8 +69,41 @@ const _knownActive = new Set<number>();
 // (A→B→A). Without it the walk recurses forever and stack-overflows. (getWorldMatrix
 // has its own `visited` guard; this is the mirror for the deactivation pass.)
 const _deactVisiting = new Set<number>();
-const _entities: { id: number; parentId: number; x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number }[] = [];
-const _byId = new Map<number, typeof _entities[0]>();
+
+// ── PERF (ecs-core F6) — pooled per-entity records + change detection ──────────────────
+// This system runs up to 3x/frame (TRANSFORM_PREPASS, TRANSFORM, and an inline call from
+// scene3DSync.ts), and a frozen scene (nothing moved) was still paying full O(n) rebuild +
+// per-entity allocation on every pass. Two records pools below are kept alive across calls
+// and MUTATED rather than replaced (FIX 1); the SAME loop that mutates them compares the
+// new values against what was already sitting in the cell from the previous pass, which
+// gives "did anything change" for free without a caller-supplied dirty flag (FIX 2) — a
+// forgotten dirty-flag write is exactly the stale-world-transform bug class this repo keeps
+// hitting, so change detection is by comparison, never by trust.
+type EaRecord = { id: number; isActive: boolean; parentId: number };
+// Pool of EntityAttributes snapshots (ALL entities with the trait, not just ones with a
+// Transform) — this is what the isActive cascade depends on, so it must be compared in
+// full or a change on a Transform-less parent (e.g. a UI-only node) would go undetected.
+const _eaPool: EaRecord[] = [];
+let _eaCount = 0;
+let _prevEaCount = -1; // -1 = no previous pass for the current world yet
+
+type EntityRecord = { id: number; parentId: number; x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number; isActive: boolean };
+// Pool of Transform-query snapshots. Index 0.._entityCount-1 is this pass's live data;
+// anything beyond _entityCount is a stale tail from a larger previous pass and must not
+// be read (byId/composition below always iterate by count, never by `.length`).
+const _entities: EntityRecord[] = [];
+let _entityCount = 0;
+let _prevEntityCount = -1;
+// ids written into worldTransforms this pass — used to delete stale entries (despawned
+// entities) without a blanket `.clear()`.
+const _seenWorldIds = new Set<number>();
+// Forces a full recompute the first time a given world is seen, and again whenever the
+// CALLER passes a different world — otherwise two-world scene swaps (or, in tests, a
+// fresh `createWorld()` per test reusing small sequential entity ids) could compare
+// against a stale pass recorded for an entirely different world.
+let _prevWorld: World | null = null;
+
+const _byId = new Map<number, EntityRecord>();
 const _computed = new Map<number, THREE.Matrix4>();
 const _visited = new Set<number>();
 // Pool of Matrix4 objects for child world transforms. Trim at end of frame so
@@ -89,20 +127,95 @@ function trimMatrixPool() {
 }
 
 export function transformPropagationSystem(world: World) {
-  // ── 1. Compute deactivated entities from EntityAttributes (all entities, not just Transform) ──
+  const worldChanged = world !== _prevWorld;
+  _prevWorld = world;
+
+  // ── 1. Snapshot EntityAttributes (all entities, not just Transform) — feeds the isActive
+  //      cascade AND the parentId lookup used below. Pooled + compared in the SAME pass
+  //      (FIX 1 + FIX 2): each cell is mutated with this pass's values, but only after its
+  //      PREVIOUS contents are compared against them, so "did anything change" falls out of
+  //      work we have to do anyway instead of costing an extra sweep. ──
   _selfInactive.clear();
   _parentIdMap.clear();
   _allEntityIds.length = 0;
   const selfInactive = _selfInactive;
   const parentIdMap = _parentIdMap;
   const allEntityIds = _allEntityIds;
-  world.query(EntityAttributes).updateEach(([ea], entity) => {
+  let eaChanged = worldChanged;
+  let eaIndex = 0;
+  // readEach, NOT updateEach: this system only READS. koota's updateEach defaults to
+  // `changeDetection: 'auto'`, which per entity snapshots each trait, re-checks `world.has`,
+  // diffs every tracked trait against the snapshot and writes it back — all of it wasted when
+  // the callback never mutates. This pass runs over EVERY entity, twice per frame
+  // (TRANSFORM_PREPASS and TRANSFORM), so the waste is paid 4x per frame per entity.
+  world.query(EntityAttributes).readEach(([ea], entity) => {
     const id = entity.id();
     allEntityIds.push(id);
     if (!ea.isActive) selfInactive.add(id);
     if (ea.parentId) parentIdMap.set(id, ea.parentId);
-  });
 
+    if (eaIndex < _eaPool.length) {
+      const rec = _eaPool[eaIndex];
+      if (rec.id !== id || rec.isActive !== ea.isActive || rec.parentId !== ea.parentId) eaChanged = true;
+      rec.id = id;
+      rec.isActive = ea.isActive;
+      rec.parentId = ea.parentId;
+    } else {
+      _eaPool.push({ id, isActive: ea.isActive, parentId: ea.parentId });
+      eaChanged = true; // pool grew — a new entity this frame
+    }
+    eaIndex++;
+  });
+  _eaCount = eaIndex;
+  if (_eaCount !== _prevEaCount) eaChanged = true;
+  _prevEaCount = _eaCount;
+
+  // ── 2. Snapshot Transform-query entities the same way (pooled + compare-before-write). ──
+  const entities = _entities;
+  let transformChanged = worldChanged;
+  let entityIndex = 0;
+  world.query(Transform).readEach(([tf], entity) => {
+    const id = entity.id();
+    const parentId = parentIdMap.get(id) || 0;
+    const isActiveSelf = !selfInactive.has(id);
+    if (entityIndex < entities.length) {
+      const rec = entities[entityIndex];
+      if (
+        rec.id !== id || rec.parentId !== parentId ||
+        rec.x !== tf.x || rec.y !== tf.y || rec.z !== tf.z ||
+        rec.rx !== tf.rx || rec.ry !== tf.ry || rec.rz !== tf.rz ||
+        rec.sx !== tf.sx || rec.sy !== tf.sy || rec.sz !== tf.sz ||
+        rec.isActive !== isActiveSelf
+      ) transformChanged = true;
+      rec.id = id; rec.parentId = parentId;
+      rec.x = tf.x; rec.y = tf.y; rec.z = tf.z;
+      rec.rx = tf.rx; rec.ry = tf.ry; rec.rz = tf.rz;
+      rec.sx = tf.sx; rec.sy = tf.sy; rec.sz = tf.sz;
+      rec.isActive = isActiveSelf;
+    } else {
+      entities.push({
+        id, parentId,
+        x: tf.x, y: tf.y, z: tf.z,
+        rx: tf.rx, ry: tf.ry, rz: tf.rz,
+        sx: tf.sx, sy: tf.sy, sz: tf.sz,
+        isActive: isActiveSelf,
+      });
+      transformChanged = true; // pool grew — a new entity this frame
+    }
+    entityIndex++;
+  });
+  _entityCount = entityIndex;
+  if (_entityCount !== _prevEntityCount) transformChanged = true;
+  _prevEntityCount = _entityCount;
+
+  // ── 3. Provably unchanged since the last pass → worldTransforms and deactivatedEntities
+  //      already hold exactly the right values (both are mutated in place, never rebuilt
+  //      from scratch), so skip the cascade walk AND the composition/decompose work below
+  //      entirely. Exact `!==` comparison only — an epsilon would silently drop small real
+  //      motion, and "provably unchanged" is the whole point of this short-circuit. ──
+  if (!eaChanged && !transformChanged) return;
+
+  // ── 4. Compute deactivated entities from the EntityAttributes snapshot above ──
   deactivatedEntities.clear();
   _knownActive.clear();
   _deactVisiting.clear();
@@ -128,22 +241,11 @@ export function transformPropagationSystem(world: World) {
   }
   for (const id of allEntityIds) isDeactivated(id);
 
-  // ── 2. Collect transforms for world-space propagation ──
-  _entities.length = 0;
-  const entities = _entities;
-  world.query(Transform).updateEach(([tf], entity) => {
-    entities.push({
-      id: entity.id(),
-      parentId: parentIdMap.get(entity.id()) || 0,
-      x: tf.x, y: tf.y, z: tf.z,
-      rx: tf.rx, ry: tf.ry, rz: tf.rz,
-      sx: tf.sx, sy: tf.sy, sz: tf.sz,
-    });
-  });
-
+  // ── 5. Build the id→record lookup for composition, bounded to THIS pass's live count —
+  //      the pool may hold a stale tail from a larger previous pass. ──
   _byId.clear();
   const byId = _byId;
-  for (const e of entities) byId.set(e.id, e);
+  for (let i = 0; i < _entityCount; i++) { const e = entities[i]; byId.set(e.id, e); }
 
   // Compute world transform for each entity (with memoization)
   _computed.clear();
@@ -186,26 +288,42 @@ export function transformPropagationSystem(world: World) {
 
   // Compute and store decomposed world transforms
   // Fast path: entities without parents just copy local transform (no matrix math)
-  worldTransforms.clear();
-  for (const e of entities) {
+  // PERF (ecs-core F6): no blanket `.clear()` — reuse the existing value object for an id
+  // when one is already there (mutate its nine fields in place), insert a new one only for
+  // ids not seen before, then delete whatever wasn't touched this pass (a despawned entity)
+  // so the map can't leak. `worldTransforms` values are mutated in place; see the comment at
+  // its declaration for why nothing may retain one across frames.
+  _seenWorldIds.clear();
+  const seenWorldIds = _seenWorldIds;
+  for (let i = 0; i < _entityCount; i++) {
+    const e = entities[i];
+    let x: number, y: number, z: number, rx: number, ry: number, rz: number, sx: number, sy: number, sz: number;
     if (e.parentId === 0 || !byId.has(e.parentId)) {
       // Root entity — world = local (skip matrix allocation)
-      worldTransforms.set(e.id, {
-        x: e.x, y: e.y, z: e.z,
-        rx: e.rx, ry: e.ry, rz: e.rz,
-        sx: e.sx, sy: e.sy, sz: e.sz,
-      });
+      x = e.x; y = e.y; z = e.z;
+      rx = e.rx; ry = e.ry; rz = e.rz;
+      sx = e.sx; sy = e.sy; sz = e.sz;
     } else {
       // Child entity — need matrix multiplication
       const mat = getWorldMatrix(e.id);
       mat.decompose(_pos, _quat, _scale);
       _euler.setFromQuaternion(_quat);
-      worldTransforms.set(e.id, {
-        x: _pos.x, y: _pos.y, z: _pos.z,
-        rx: _euler.x, ry: _euler.y, rz: _euler.z,
-        sx: _scale.x, sy: _scale.y, sz: _scale.z,
-      });
+      x = _pos.x; y = _pos.y; z = _pos.z;
+      rx = _euler.x; ry = _euler.y; rz = _euler.z;
+      sx = _scale.x; sy = _scale.y; sz = _scale.z;
     }
+    const existing = worldTransforms.get(e.id);
+    if (existing) {
+      existing.x = x; existing.y = y; existing.z = z;
+      existing.rx = rx; existing.ry = ry; existing.rz = rz;
+      existing.sx = sx; existing.sy = sy; existing.sz = sz;
+    } else {
+      worldTransforms.set(e.id, { x, y, z, rx, ry, rz, sx, sy, sz });
+    }
+    seenWorldIds.add(e.id);
+  }
+  for (const id of worldTransforms.keys()) {
+    if (!seenWorldIds.has(id)) worldTransforms.delete(id);
   }
   trimMatrixPool();
 }

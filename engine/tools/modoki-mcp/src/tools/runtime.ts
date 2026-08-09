@@ -10,7 +10,7 @@ import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 
 export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
-  const { getJson, postJson, editorAction } = ctx;
+  const { getJson, postJson, editorAction, fail } = ctx;
 
   // ════════════════════════════════════════════════════════════════════════════
   // Enable-Claude-more tools (semantic verification, numeric layout, asset authoring,
@@ -162,9 +162,67 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
     'Structured render/scene health report — turns "it renders black / looks wrong" into concrete ' +
       'causes: dangling/illegal asset refs, NaN or zero-scale transforms, missing camera, off-screen ' +
       'entities, and recent console errors. Run this FIRST when something is visually broken (before ' +
-      'capture_viewport). Returns {ok, summary, refs, transforms, camera, offScreen, consoleErrors}.',
+      'capture_viewport). Returns {ok, summary, refs, transforms, camera, offScreen, consoleErrors, ' +
+      'errorWindowMs, olderErrors}. `consoleErrors` is NOT an absolute: it holds only the errors ' +
+      'inside `errorWindowMs` (the ones that gate `ok`, so a fixed error stops failing the verdict). ' +
+      'Everything older is COUNTED in `olderErrors {count, oldestTs, newestTs}` — read those with ' +
+      'modoki_get_console_logs level=error. So an empty `consoleErrors` means "none recently", and ' +
+      'the summary never claims "No issues detected" while older errors exist.',
     {},
     async () => getJson('/api/diagnose'),
+  );
+
+  // ── Profiler (#166 P6) — the editor half of a gap that existed on BOTH surfaces ──
+  tool(
+    'modoki_profiler',
+    'Where did the frame go? — the Profiler surface (#138), which until now had NO typed tool on ' +
+      'EITHER surface and was reachable only by an agent who knew to eval the op. Called bare it ' +
+      'reads the live marker aggregate (the per-marker self-ms breakdown of a frame). ' +
+      'capture-start/-stop/-read record real frames and rank the WORST by cost, not the most recent, ' +
+      'so a hitch stays findable after it happened. gpu-on/gpu-off enable GPU timestamp queries — ' +
+      'deliberately opt-in because enabling costs real time (two timestamps per pass) and the ' +
+      'profiler must not change what it measures; where the backend cannot support them the status ' +
+      'comes back "unsupported" with a reason and NO number is invented. reset clears markers and ' +
+      'captures. ⚠️ A desktop editor frame is fast almost regardless — for a REAL perf question use ' +
+      'device_profiler on the target phone; this is for finding which marker owns the frame, and for ' +
+      'editor-side regressions. Read actions are GET, state-changing ones POST.',
+    {
+      action: z.enum(['read', 'capture-start', 'capture-stop', 'capture-read', 'capture-clear', 'gpu-on', 'gpu-off', 'reset'])
+        .optional().describe('Default "read" (the live aggregate). capture-* record/read frames; gpu-* toggle GPU timestamps; reset clears markers + captures.'),
+      markers: z.number().optional().describe('action:read only — how many marker rows to return (default 12).'),
+      limit: z.number().optional().describe('action:capture-read only — how many of the WORST frames to return (default 5, max 20).'),
+    },
+    async ({ action, markers, limit }) => {
+      const act = action ?? 'read';
+      // A read-only filter passed to a state-changing action is REFUSED, not silently dropped —
+      // the cross-action hazard the conventions doc closed for `watch` (S3.19) rather than splitting
+      // the tool name. Silently ignoring `markers` on `reset` would read as "12 markers kept".
+      // Collect ALL stray filters, not just the first: an if/else chain named only one, so an agent
+      // that followed `expected` literally would omit it, resubmit, and hit a second unwarned
+      // refusal for the other. A refusal's job is to be the caller's next move, once.
+      const stray = [
+        ...(act !== 'read' && markers !== undefined ? [{ param: 'markers', belongsTo: 'read' }] : []),
+        ...(act !== 'capture-read' && limit !== undefined ? [{ param: 'limit', belongsTo: 'capture-read' }] : []),
+      ];
+      if (stray.length) {
+        const names = stray.map((s) => `\`${s.param}\``).join(' and ');
+        return fail({
+          code: 'UNKNOWN_PARAM',
+          tool: 'modoki_profiler',
+          what: `run profiler action '${act}' with ${names}`,
+          why: `${names} ${stray.length > 1 ? 'are read-side filters' : `is a read-side filter for action:'${stray[0].belongsTo}'`} and mean${stray.length > 1 ? '' : 's'} nothing for '${act}'. Silently dropping ${stray.length > 1 ? 'them' : 'it'} would read as though ${stray.length > 1 ? 'they had' : 'it had'} been applied.`,
+          expected: `omit ${names}${stray.length > 1 ? '' : `, or use action:'${stray[0].belongsTo}'`}`,
+          options: stray.map((s) => `${s.param} applies only to action:'${s.belongsTo}'`),
+        });
+      }
+      if (act === 'read' || act === 'capture-read') {
+        const qs = new URLSearchParams({ action: act });
+        if (markers !== undefined) qs.set('markers', String(markers));
+        if (limit !== undefined) qs.set('limit', String(limit));
+        return getJson(`/api/profiler?${qs.toString()}`);
+      }
+      return postJson('/api/profiler', { action: act });
+    },
   );
 
   // ── Percept Watch: numeric time-series over the live world ──
@@ -271,6 +329,124 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       }
       if (action === 'list') return getJson('/api/watch/list');
       return postJson('/api/watch/clear', { id });
+    },
+  );
+
+  // ── Input WATCH: what the pointer actually did (#134) ──
+  tool(
+    'modoki_input_watch',
+    'Input WATCH — a bounded record of what the POINTER actually did, and what it resolved to. ' +
+      'The journal answers "what did the game do"; this answers "what did the finger do" — the ' +
+      'question with the LEAST evidence when a gesture fails (a press that resolves to nothing ' +
+      'emits no journal event, no commit, no coordinates). action:start opens the window; it ' +
+      'RECORDS NOTHING BEFORE THAT CALL — no history, same contract as journal @contact capture. ' +
+      'action:read returns the most-recent presses (down/up points, distance travelled, hold time, ' +
+      'move-sample count, and what — if anything — the press resolved to). This is the ONLY tool ' +
+      'that can tell "the press hit nothing" (`resolved.by:\'none\'` — an authority looked and found ' +
+      'nothing there) apart from "nothing could answer" (`resolved.by:\'unknown\'` — nobody who ' +
+      'could look was asked); everything else either infers from absence or conflates the two. ' +
+      'action:stop closes the window but KEEPS what was recorded, so you can stop then read without ' +
+      'racing your own probe. action:clear drops recorded presses without closing the window. ' +
+      'Params are per-ACTION: a read-time filter on a START call (or `max` on anything but start) is ' +
+      'REFUSED naming the right action rather than silently dropped.',
+    {
+      action: z.enum(['start', 'read', 'stop', 'clear']).describe('open the window | read presses | close (keeps presses) | drop recorded presses (window stays open if it was)'),
+      max: z.number().int().positive().optional().describe('(start) Ring capacity — most recent N presses kept (default 40, ceiling 500).'),
+      limit: z.number().int().positive().optional().describe('(read) Most-recent N presses to return (default 20).'),
+      unresolvedOnly: z.boolean().optional().describe("(read) Keep only presses whose resolved.by is 'none' or 'unknown' — presses NOTHING could explain. THE diagnostic filter: this is the one question this tool exists to answer, so start here when a reported gesture apparently did nothing."),
+      precision: z.number().int().nonnegative().optional().describe('(read) Significant digits for float fields (x/y/upX/upY/maxD/heldMs). Default 9; 0 = exact.'),
+    },
+    async (args) => {
+      const { action, max, limit, unresolvedOnly, precision } = args;
+      // Per-action allowlist (mirrors modoki_watch's S3.19 fix) — a key belonging to a DIFFERENT
+      // action is refused BY NAME, never silently dropped (which would either widen a start to the
+      // default ring size unexpectedly or ignore a read-time narrow).
+      const ACCEPTS: Record<string, readonly string[]> = {
+        start: ['max'],
+        read: ['limit', 'unresolvedOnly', 'precision'],
+        stop: [],
+        clear: [],
+      };
+      const accepted = new Set<string>([...(ACCEPTS[action] ?? []), 'action']);
+      const stray = Object.keys(args).filter((k) => (args as Record<string, unknown>)[k] !== undefined && !accepted.has(k));
+      if (stray.length) {
+        return ctx.fail({
+          code: 'UNKNOWN_PARAM',
+          what: `${action} the input watch`,
+          why: `${stray.join(', ')} ${stray.length > 1 ? 'are' : 'is'} not accepted by action:'${action}'.`,
+          got: Object.fromEntries(stray.map((k) => [k, (args as Record<string, unknown>)[k]])),
+          expected: `action:'${action}' accepts: ${ACCEPTS[action]?.length ? ACCEPTS[action].join(', ') : '(no params beyond action)'}`,
+          options: stray.map((k) => {
+            const other = Object.entries(ACCEPTS).filter(([a, keys]) => a !== action && keys.includes(k)).map(([a]) => `action:'${a}'`);
+            return other.length ? `${k} — pass it on ${other.join(' or ')} instead` : `${k} — not a parameter of this action`;
+          }),
+        });
+      }
+      if (action === 'start') return postJson('/api/input-watch/start', { max });
+      if (action === 'stop') return postJson('/api/input-watch/stop', {});
+      if (action === 'clear') return postJson('/api/input-watch/clear', {});
+      const q = new URLSearchParams();
+      if (limit != null) q.set('limit', String(limit));
+      if (unresolvedOnly) q.set('unresolvedOnly', '1');
+      if (precision != null) q.set('precision', String(precision));
+      const qs = q.toString();
+      return getJson(`/api/input-watch/read${qs ? `?${qs}` : ''}`);
+    },
+  );
+
+  // ── Hit REGIONS: the shapes the hit-test uses (#139) ──
+  tool(
+    'modoki_hit_regions',
+    'Hit REGIONS — the shapes a game\'s hitTest actually uses, which are AUTHORED NOWHERE: they are ' +
+      'computed inside the hit-test from config, so no inspector, scene view or screenshot can show ' +
+      'them. The companion to modoki_input_watch: that one says a press hit nothing, this one says ' +
+      'WHAT it missed and BY HOW MUCH. action:read returns the regions as data (viewport CSS px — ' +
+      'the same space the input watch records presses in, so they compare with no transform). ' +
+      'action:show/hide toggles an on-screen overlay that draws the shapes AND plots the last few ' +
+      'recorded presses, green inside a region and red outside — the two failure classes made ' +
+      'visually distinct (a press outside every shape = targeting; a press inside the right shape ' +
+      'that still did nothing = latching/frame-rate). Pass at:{x,y} to ask the question directly: ' +
+      'it reports which regions contain that point, and when none do, the NEAREST region and its ' +
+      'distance in px. A region may carry `drawnShape` when the game DRAWS a different shape than ' +
+      'it hit-tests (a forgiving grab radius, a badge smaller than its ring) — that difference is ' +
+      'usually the bug. READ `providers`: an empty region list with no provider registered means ' +
+      'NOBODY COULD ANSWER, which is not the same as "there is nothing there".',
+    {
+      action: z.enum(['read', 'show', 'hide']).optional().describe("read the regions as data (default) | show the on-screen overlay | hide it"),
+      provider: z.string().optional().describe('(read) Only this provider\'s regions (a game id, e.g. "court").'),
+      kind: z.string().optional().describe('(read) Only this region kind — usually the same string the game\'s own hit-test reports, so it lines up with an input_watch record\'s resolved.kind.'),
+      ids: z.array(z.string()).optional().describe('(read) Only these region ids.'),
+      at: z.object({ x: z.number(), y: z.number() }).optional().describe('(read) A viewport CSS point to test. Returns hitsAt (regions containing it) and, when empty, nearest {id, kind, label, distancePx}. Feed a press coordinate straight from modoki_input_watch.'),
+      limit: z.number().int().positive().optional().describe('(read) Max regions returned (default 60). A full board is many cells; filter by kind= first.'),
+      precision: z.number().int().nonnegative().optional().describe('(read) Significant digits for float fields. Default 9; 0 = exact.'),
+    },
+    async (args) => {
+      const { action = 'read', provider, kind, ids, at, limit, precision } = args;
+      // Per-action allowlist, matching modoki_input_watch: a read-time filter on show/hide is
+      // refused by name rather than silently dropped, which would read as "the filter applied".
+      if (action !== 'read') {
+        const stray = ['provider', 'kind', 'ids', 'at', 'limit', 'precision']
+          .filter((k) => (args as Record<string, unknown>)[k] !== undefined);
+        if (stray.length) {
+          return ctx.fail({
+            code: 'UNKNOWN_PARAM',
+            what: `${action} the hit-region overlay`,
+            why: `${stray.join(', ')} ${stray.length > 1 ? 'are' : 'is'} not accepted by action:'${action}' — it only toggles the overlay.`,
+            got: Object.fromEntries(stray.map((k) => [k, (args as Record<string, unknown>)[k]])),
+            expected: `action:'${action}' accepts no params beyond action`,
+            options: [`pass ${stray.join(', ')} on action:'read' instead`],
+          });
+        }
+      }
+      const q = new URLSearchParams();
+      q.set('action', action);
+      if (provider) q.set('provider', provider);
+      if (kind) q.set('kind', kind);
+      if (ids?.length) q.set('ids', ids.join(','));
+      if (at) { q.set('atX', String(at.x)); q.set('atY', String(at.y)); }
+      if (limit != null) q.set('limit', String(limit));
+      if (precision != null) q.set('precision', String(precision));
+      return getJson(`/api/hit-regions?${q.toString()}`);
     },
   );
 }

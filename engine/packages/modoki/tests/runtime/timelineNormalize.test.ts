@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   normalizeTimeline, defaultTimeline, collectTimelineAudioRefs, collectTimelineControlRefs,
+  collectTimelineVideoRefs,
   type TimelineDef, type AnimationTrackDef, type SignalTrackDef, type AudioTrackDef, type ActivationTrackDef,
 } from '../../src/runtime/timeline/types';
 
@@ -100,5 +101,55 @@ describe('collectTimelineControlRefs', () => {
       tracks: [{ id: 'n', name: 'Anim', target: 'Alien', type: 'animation', clips: [{ start: 0, clip: 'Walk' }] } as AnimationTrackDef],
     };
     expect(collectTimelineControlRefs(normalizeTimeline(doc))).toEqual([]);
+  });
+});
+
+describe('video track', () => {
+  it('normalizes clips, drops ones with no clip GUID, and sorts by start', () => {
+    const doc: Partial<TimelineDef> = {
+      tracks: [{
+        id: 'v', name: 'Cutscene', target: 'Screen', type: 'video',
+        clips: [
+          { start: 3, duration: 2, clip: 'guid-vid-2' },
+          { start: 1, clip: 'guid-vid-1' },
+          { start: 2, clip: '' },          // no clip → dropped
+        ],
+      } as never],
+    };
+    const track = normalizeTimeline(doc).tracks[0] as { type: string; clips: { start: number; duration?: number; clip: string }[] };
+    expect(track.type).toBe('video');
+    expect(track.clips).toEqual([
+      { start: 1, duration: undefined, clip: 'guid-vid-1' },
+      { start: 3, duration: 2, clip: 'guid-vid-2' },
+    ]);
+  });
+
+  it('keeps `duration` undefined rather than defaulting it', () => {
+    // Omitted duration means "let the clip's own length decide when it ends" — filling in a
+    // number here would silently pause the video at an arbitrary point.
+    const doc: Partial<TimelineDef> = {
+      tracks: [{ id: 'v', name: 'V', target: '', type: 'video', clips: [{ start: 0, clip: 'g' }] } as never],
+    };
+    const track = normalizeTimeline(doc).tracks[0] as { clips: { duration?: number }[] };
+    expect(track.clips[0].duration).toBeUndefined();
+  });
+});
+
+describe('collectTimelineVideoRefs', () => {
+  it('returns only video-clip GUIDs — nothing else owns them, so this is what keeps them shippable', () => {
+    const doc: Partial<TimelineDef> = {
+      tracks: [
+        { id: 'v', name: 'V', target: '', type: 'video', clips: [{ start: 0, clip: 'guid-vid-1' }, { start: 4, clip: 'guid-vid-2' }] } as never,
+        { id: 'a', name: 'Audio', target: 'Sfx', type: 'audio', cues: [{ t: 1, clip: 'guid-sfx-1' }] } as AudioTrackDef,
+      ],
+    };
+    expect(collectTimelineVideoRefs(normalizeTimeline(doc))).toEqual(['guid-vid-1', 'guid-vid-2']);
+  });
+
+  it('is empty when there is no video track', () => {
+    const doc: Partial<TimelineDef> = {
+      tracks: [{ id: 'n', name: 'Anim', target: 'Alien', type: 'animation', clips: [{ start: 0, clip: 'Walk' }] } as AnimationTrackDef],
+    };
+    expect(collectTimelineVideoRefs(normalizeTimeline(doc))).toEqual([]);
   });
 });

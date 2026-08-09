@@ -641,6 +641,70 @@ if (!typo.isError || !/Unrecognized key/.test(text(typo))) {
 if (!/accepted params:/.test(text(typo))) throw new Error('the refusal must name the accepted params');
 console.log('batch pre-flight refuses an unknown arg key and lists the real ones ✓');
 
+// ── modoki_hit_regions (#139) ────────────────────────────────────────────────
+// The mutating half is show/hide — an SVG overlay on the human's editor. Fully restorable, so
+// this is smoke-covered rather than declared un-sweepable: it flips the overlay on, proves the
+// tool actually reached the renderer (`visible:true` read back, not just a cheerful ok), and
+// restores whatever the overlay was set to before. The read half is swept by the per-tool sweep.
+//
+// Deliberately does NOT assert that regions were RETURNED: whether any exist depends entirely on
+// the open project (a game with no provider correctly reports none), and asserting on it would
+// make this case fail for the honest answer. What is asserted is the contract that holds for every
+// project — `providers` is present, so an empty list can be read correctly.
+{
+  const before = JSON.parse(text(await client.callTool({ name: 'modoki_hit_regions', arguments: { action: 'read' } })));
+  if (!Array.isArray(before.providers)) throw new Error('hit_regions read must always report `providers` — it is what tells "nobody could answer" from "nothing is there"');
+  await withCleanup(async () => {
+    await client.callTool({ name: 'modoki_hit_regions', arguments: { action: 'show' } });
+    const shown = JSON.parse(text(await client.callTool({ name: 'modoki_hit_regions', arguments: { action: 'read' } })));
+    if (shown.visible !== true) throw new Error(`hit_regions show did not take: visible=${shown.visible}`);
+    // A read-time filter on show/hide must be REFUSED by name, not silently dropped — the same
+    // per-action allowlist modoki_input_watch enforces.
+    const stray = await client.callTool({ name: 'modoki_hit_regions', arguments: { action: 'hide', limit: 5 } });
+    if (!/UNKNOWN_PARAM/.test(text(stray))) throw new Error('hit_regions must refuse a read-time param on action:hide');
+    console.log(`hit_regions show/hide reaches the overlay ✓ (providers: ${before.providers.join(', ') || 'none'}, regions: ${before.totalCount})`);
+  }, async () => {
+    await client.callTool({ name: 'modoki_hit_regions', arguments: { action: before.visible ? 'show' : 'hide' } });
+  });
+}
+
+// ── modoki_profiler (#166 P6) ────────────────────────────────────────────────
+// Self-cleaning, so it is smoke-covered rather than listed as un-sweepable: the capture buffer is
+// profiler state, not the human's project, and the case restores GPU timing to how it found it.
+// The one thing only a live call proves is that /api/profiler exists on the other end at all —
+// which is exactly the class modoki_prefab sat in for months with T1+T2 green.
+{
+  const read = JSON.parse(text(await client.callTool({ name: 'modoki_profiler', arguments: {} })));
+  if (!read || typeof read !== 'object') throw new Error('profiler read returned nothing');
+
+  await withCleanup(async () => {
+    const started = JSON.parse(text(await client.callTool({ name: 'modoki_profiler', arguments: { action: 'capture-start' } })));
+    if (started.capturing !== true) throw new Error(`profiler capture-start did not take: ${JSON.stringify(started)}`);
+    await new Promise((r) => setTimeout(r, 300));
+    const stopped = JSON.parse(text(await client.callTool({ name: 'modoki_profiler', arguments: { action: 'capture-stop' } })));
+    if (stopped.capturing !== false) throw new Error(`profiler capture-stop did not take: ${JSON.stringify(stopped)}`);
+    const frames = JSON.parse(text(await client.callTool({ name: 'modoki_profiler', arguments: { action: 'capture-read', limit: 3 } })));
+    if (!Array.isArray(frames.worst)) throw new Error('profiler capture-read returned no `worst` array');
+    // Assert the LIMIT was honoured, not merely that an array came back. `Array.isArray` alone
+    // passes even when the route silently drops the query param (a typo'd query.get would look
+    // identical), which is the one thing this live tier is here to catch.
+    if (frames.worst.length > 3) throw new Error(`profiler capture-read ignored limit:3 — got ${frames.worst.length} frames, so the query param never reached the op`);
+    if (frames.frameCount > 0 && frames.worst.length === 0) throw new Error(`profiler capture-read returned 0 frames from a capture of ${frames.frameCount}`);
+    // Ranked by COST, not recency — the property that makes a hitch findable after the fact.
+    for (let i = 1; i < frames.worst.length; i++) {
+      if (frames.worst[i].frameMs > frames.worst[i - 1].frameMs) throw new Error('profiler capture-read is not sorted worst-first');
+    }
+
+    // A read-side filter on a MUTATING action must be refused BY NAME, not silently dropped —
+    // the same per-action hazard hit_regions and input_watch enforce (S3.19).
+    const stray = await client.callTool({ name: 'modoki_profiler', arguments: { action: 'reset', markers: 5 } });
+    if (!/UNKNOWN_PARAM/.test(text(stray))) throw new Error('profiler must refuse a read-side filter on action:reset');
+    console.log(`profiler capture round-trip ✓ (frames captured: ${frames.frameCount})`);
+  }, async () => {
+    await client.callTool({ name: 'modoki_profiler', arguments: { action: 'capture-clear' } });
+  });
+}
+
 await client.close();
 
 // F12 — a SKIPPED case used to leave the verdict at a cheerful `SMOKE OK`, so the run reported

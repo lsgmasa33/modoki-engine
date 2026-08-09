@@ -15,10 +15,10 @@
 import { resolveRef, getAssetEntry, isGuid, onFontInvalidated } from './assetManifest';
 import { assetUrl, withCacheBust } from './assetUrl';
 import { parseAssetJson } from './assetFetch';
-import { FONT_ATLAS_SUFFIX, FONT_METRICS_SUFFIX } from '../core/fontSettings';
+import { FONT_ATLAS_SUFFIX, FONT_METRICS_SUFFIX, FONT_INSTANCE_SUFFIX } from '../core/fontSettings';
 import { parseChlumskyJson } from '../rendering/text/glyphAtlas';
 import { BakedFontProvider, type FontProvider } from '../rendering/text/fontProvider';
-import { DynamicFontProvider } from '../rendering/text/dynamicFontProvider';
+import { DynamicFontProvider, dynamicConfigFromSettings } from '../rendering/text/dynamicFontProvider';
 import { disposeMsdfGenerator } from '../rendering/text/msdfGenerate';
 import { markTextDirty } from '../rendering/text/textDirty';
 
@@ -46,12 +46,17 @@ function addOwner(guid: string, sceneId: SceneId): void {
 function fontUrls(guid: string): { atlasUrl: string; metricsUrl: string; fontUrl: string } | null {
   const sourcePath = resolveRef(guid);
   if (!sourcePath) return null;
-  const hash = getAssetEntry(guid)?.hash;
+  const entry = getAssetEntry(guid);
+  const hash = entry?.hash;
   return {
     atlasUrl: withCacheBust(assetUrl(sourcePath + FONT_ATLAS_SUFFIX), hash),
     metricsUrl: withCacheBust(assetUrl(sourcePath + FONT_METRICS_SUFFIX), hash),
-    // Source .ttf/.otf — the dynamic provider generates glyphs from these raw bytes.
-    fontUrl: withCacheBust(assetUrl(sourcePath), hash),
+    // Raw outlines for the dynamic provider to rasterize. When the font authors
+    // `variationAxes` the build emits an axis-pinned `~instance.ttf` and THAT is the
+    // right file — the generator cannot apply axes itself, so fetching the source here
+    // would silently rasterize the font's default instance (Thin, for Geologica/Nunito/
+    // NotoSansJP) no matter what the sidecar says.
+    fontUrl: withCacheBust(assetUrl(entry?.font?.instanced ? sourcePath + FONT_INSTANCE_SUFFIX : sourcePath), hash),
   };
 }
 
@@ -74,17 +79,44 @@ export async function acquireFont(sceneId: SceneId, guid: string): Promise<FontP
       return null;
     }
     try {
-      // Dynamic (path B): generate glyphs at runtime from the raw font. Needs the
-      // SOURCE .ttf bytes (not the baked atlas); everything else (metrics, glyphs) is
-      // produced by the generator. Baked (path A): load the pre-baked mtsdf atlas.
-      const mode = getAssetEntry(guid)?.font?.mode;
+      // Dynamic (path B): generate glyphs at runtime from real outlines — the pinned
+      // `~instance.ttf` when axes are authored, else the source .ttf (never the baked
+      // atlas); metrics and glyphs all come from the generator. Baked (path A): load
+      // the pre-baked mtsdf atlas.
+      const fontBlock = getAssetEntry(guid)?.font;
       let provider: FontProvider | null;
-      if (mode === 'dynamic') {
-        const fontRes = await fetch(urls.fontUrl);
-        if (!fontRes.ok) throw new Error(`font fetch ${fontRes.status}`);
-        const bytes = new Uint8Array(await fontRes.arrayBuffer());
-        if (gen !== generation || !owners.has(guid)) return null;
-        provider = await DynamicFontProvider.create(guid, bytes);
+      if (fontBlock?.mode === 'dynamic') {
+        // The BAKED atlas is the seed — which is what `dynamic` has always meant in the
+        // docs, and what the code did not do. It used to skip the bake entirely and
+        // regenerate the seed charset through the WASM worker at every boot: a 1.5 MB wasm
+        // fetch plus ~640 ms of rasterization (desktop; more on a phone) to reproduce
+        // glyphs the shipped `~atlas.png` already contained, all of it blocking the scene
+        // load because fonts are awaited scene resources. Seeded from the bake this path is
+        // as fast as a baked font, and the generator is touched only if something actually
+        // asks for a glyph outside the baked charset.
+        const res = await fetch(urls.metricsUrl);
+        if (res.ok) {
+          const atlas = parseChlumskyJson(await parseAssetJson(res, urls.metricsUrl));
+          if (gen !== generation || !owners.has(guid)) return null;
+          provider = DynamicFontProvider.fromBaked(
+            guid, atlas, urls.atlasUrl,
+            // Deferred: not fetched at all unless a miss happens.
+            async () => {
+              const r = await fetch(urls.fontUrl);
+              if (!r.ok) throw new Error(`font fetch ${r.status}`);
+              return new Uint8Array(await r.arrayBuffer());
+            },
+            dynamicConfigFromSettings(fontBlock),
+          );
+        } else {
+          // No usable bake (conversion failed) — fall back to generating the seed, which is
+          // the only way this font renders at all. Slow, and now the exception.
+          const fontRes = await fetch(urls.fontUrl);
+          if (!fontRes.ok) throw new Error(`font fetch ${fontRes.status}`);
+          const bytes = new Uint8Array(await fontRes.arrayBuffer());
+          if (gen !== generation || !owners.has(guid)) return null;
+          provider = await DynamicFontProvider.create(guid, bytes, dynamicConfigFromSettings(fontBlock));
+        }
       } else {
         const res = await fetch(urls.metricsUrl);
         if (!res.ok) throw new Error(`metrics fetch ${res.status}`);

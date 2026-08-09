@@ -22,8 +22,9 @@ import path from 'path';
 import { readMetaSidecar } from '../meta-sidecar';
 import { getCacheDir, cachePathFor } from '../texture-cache';
 import { getAudioCacheDir, audioCachePathFor } from '../audio-cache';
+import { getVideoCacheDir, videoCachePathFor } from '../video-cache';
 import { getEnvCacheDir, envCachePathFor } from '../env-cache';
-import { getFontCacheDir, atlasCachePath, metricsCachePath } from '../font-cache';
+import { getFontCacheDir, atlasCachePath, metricsCachePath, instanceCachePath } from '../font-cache';
 import { getModelCacheDir, lodCachePath } from '../model-cache';
 import { atlasPageUrlPath } from '../atlas-cache';
 import { getReimportHandler, type ReimportContext, type ReimportAsset } from '../reimport-registry';
@@ -117,7 +118,7 @@ function dedupeBake(absSource: string, run: () => Promise<void>): Promise<void> 
  *  visible rather than masking the source. */
 async function autoBakeThenServe(
   ctx: Pick<BackendContext, 'projectRoot' | 'resolveAssetPath'> & AutoConvertCaps,
-  assetType: 'model' | 'texture' | 'atlas' | 'audio' | 'font' | 'environment',
+  assetType: 'model' | 'texture' | 'atlas' | 'audio' | 'video' | 'font' | 'environment',
   sourceUrl: string,
   absSource: string,
   resolveCached: () => BackendResult | null,
@@ -318,20 +319,55 @@ export async function serveProjectAsset(
     return raw('application/json', Buffer.from('not found'), 404);
   }
 
+  // 3c-bis. A converted VIDEO variant from the local cache. URL form:
+  //     <sourceUrl>~video.mp4 — the source's meta carries the cache hash. Same
+  //     placement rule as the audio branch: BEFORE the texture-variant branch, whose
+  //     `.+` would swallow the suffix. Without this route the runtime resolves a
+  //     `~video.mp4` URL that 404s, and the element reports the genuinely unhelpful
+  //     DEMUXER_ERROR_COULD_NOT_OPEN (it demuxed the 404 body).
+  const vid = urlPath.match(/^(.+)~video\.mp4$/);
+  if (vid) {
+    const sourceUrl = decodeURIComponent(vid[1]);
+    const absSource = ctx.resolveAssetPath(sourceUrl);
+    if (absSource) {
+      const hash = (readMetaSidecar(absSource).videoCache as { hash?: string } | undefined)?.hash;
+      if (hash) {
+        const cached = videoCachePathFor(getVideoCacheDir(ctx.projectRoot), sourceUrl, hash);
+        if (fs.existsSync(cached)) return file('video/mp4', cached, revalidate(hash));
+      }
+      // Cache miss — auto-import (dev/editor only): re-convert from the meta settings,
+      // healing a checkout that has the committed videoCache hash but no local bytes.
+      const auto = await autoBakeThenServe(ctx, 'video', sourceUrl, absSource, () => {
+        const h = (readMetaSidecar(absSource).videoCache as { hash?: string } | undefined)?.hash;
+        if (!h) return null;
+        const c = videoCachePathFor(getVideoCacheDir(ctx.projectRoot), sourceUrl, h);
+        if (!fs.existsSync(c)) return null;
+        console.log(`[asset-scanner] auto-converted video variant for ${sourceUrl} (hash ${h})`);
+        return file('video/mp4', c, revalidate(h));
+      });
+      if (auto) return auto;
+    }
+    return raw('application/json', Buffer.from('not found'), 404);
+  }
+
   // 3d. A converted font variant (mtsdf atlas PNG or Chlumsky metrics JSON) from
   //     the local cache. URL forms: <sourceUrl>~atlas.png / <sourceUrl>~metrics.json —
   //     the source font's meta carries the cache hash. Must run BEFORE the generic
   //     texture-variant branch below — that regex's `.+` would otherwise greedily
   //     match `<font>.ttf~atlas` as a (nonexistent) `png`-variant source.
-  const fm = urlPath.match(/^(.+\.(?:ttf|otf|woff|woff2))~(atlas\.png|metrics\.json)$/i);
+  const fm = urlPath.match(/^(.+\.(?:ttf|otf|woff|woff2))~(atlas\.png|metrics\.json|instance\.ttf)$/i);
   if (fm) {
     const sourceUrl = decodeURIComponent(fm[1]);
     const which = fm[2].toLowerCase();
-    const isAtlas = which === 'atlas.png';
-    const ctFor = isAtlas ? 'image/png' : 'application/json';
-    const cachePathFn = (h: string) => isAtlas
-      ? atlasCachePath(getFontCacheDir(ctx.projectRoot), sourceUrl, h)
-      : metricsCachePath(getFontCacheDir(ctx.projectRoot), sourceUrl, h);
+    const ctFor = which === 'atlas.png' ? 'image/png'
+      : which === 'metrics.json' ? 'application/json'
+      : 'font/ttf';
+    const cacheDirFor = () => getFontCacheDir(ctx.projectRoot);
+    const cachePathFn = (h: string) => which === 'atlas.png'
+      ? atlasCachePath(cacheDirFor(), sourceUrl, h)
+      : which === 'metrics.json'
+        ? metricsCachePath(cacheDirFor(), sourceUrl, h)
+        : instanceCachePath(cacheDirFor(), sourceUrl, h);
     const absSource = ctx.resolveAssetPath(sourceUrl);
     if (absSource) {
       const hash = (readMetaSidecar(absSource).fontCache as { hash?: string } | undefined)?.hash;

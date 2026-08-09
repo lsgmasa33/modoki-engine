@@ -56,6 +56,17 @@ describe('describeLease (device_status / device_connect / device_disconnect shar
     const t = describeLease({ state: 'connected', target: { host: '127.0.0.1', port: 9095, useAdb: true }, lastTarget: null });
     expect(t).toMatch(/connected via adb \(USB\)/);
   });
+
+  it('labels the adb port as the HOST tunnel, not the device port (#158)', () => {
+    // The two were the same number until #158 derived the host end per clone, and the old string
+    // ("adb (USB):9097") read as if 9097 were the app's port. `device_connect {port}` means the
+    // DEVICE port, so an agent round-tripping the displayed number would forward
+    // `tcp:9097 → tcp:9097` on the phone — nothing listening, and `explainConnectFailure` silent
+    // because it only fires on 9095. This asserts the number is never shown unlabelled.
+    const t = describeLease({ state: 'connected', target: { host: '127.0.0.1', port: 9097, useAdb: true }, lastTarget: null });
+    expect(t).toMatch(/host tunnel 127\.0\.0\.1:9097/);
+    expect(t).not.toMatch(/adb \(USB\):9097/);
+  });
   it('on disconnected, points at device_connect and echoes the last target', () => {
     const t = describeLease({ state: 'disconnected', target: null, lastTarget: { ip: '192.168.1.5', useAdb: false } });
     expect(t).toMatch(/No device connected/);

@@ -4,7 +4,10 @@
 import {
   registerSystem, runPipeline as modokiRunPipeline,
   timeSystem, uiTreeProjection, rotate3DSystem, timelineSystem, animationSystem, spriteAnimationSystem,
-  physics2DSystem, physics3DSystem, zone2DSystem, zone3DSystem, inputSystem, characterInputSystem, characterInput3DSystem, characterAnimationSystem, uiFocusSystem, skin2DSystem, audioSystem, setAudioWorldPositionResolver, materialInstanceSystem, SYSTEM_PRIORITY,
+  physics2DSystem, physics3DSystem, zone2DSystem, zone3DSystem, inputSystem, characterInputSystem, characterInput3DSystem, characterAnimationSystem, uiFocusSystem, hapticsSystem, skin2DSystem, audioSystem, setAudioWorldPositionResolver, materialInstanceSystem, SYSTEM_PRIORITY,
+  videoSystem, setVideoUrlResolver, resolveVideoUrl,
+  setVideoSourceResolver, setVideoDownloader, resolveVideoSource,
+  VideoCache, CacheApiBackend, hasCacheStorage,
 } from '@modoki/engine/runtime';
 import { transformPropagationSystem, worldTransforms } from '@modoki/engine/runtime';
 
@@ -12,6 +15,11 @@ import { transformPropagationSystem, worldTransforms } from '@modoki/engine/runt
 // cache — injected here so the engine's audioSystem stays THREE-free (P3). Audio runs after
 // transform propagation, so the cache is this frame's final poses.
 setAudioWorldPositionResolver((id) => worldTransforms.get(id));
+
+/** Per-game video cache ceiling. A code constant for now — a structural fallback rather than a
+ *  tunable, per the single-source-of-truth rule in CLAUDE.md. It becomes a `project.config.json`
+ *  knob the first time a game needs to differ, not before. See docs/video.md. */
+const VIDEO_CACHE_BUDGET_MB = 256;
 
 // Engine systems
 registerSystem('timeSystem', timeSystem, SYSTEM_PRIORITY.TIME);
@@ -34,6 +42,10 @@ registerSystem('rotate3D', rotate3DSystem, SYSTEM_PRIORITY.GAME);
 // after inputSystem (INPUT tier) has this frame's edges. App-pipeline only — the
 // activation itself is drained by UIRenderer outside the tick (applyBindings F10).
 registerSystem('uiFocus', uiFocusSystem, SYSTEM_PRIORITY.GAME);
+// Haptics settings → service. Copies two booleans; never plays anything (a haptic on a per-frame
+// path buzzes forever — moments fire from state transitions). INPUT tier so the gates are current
+// before this frame's gestures can raise a moment.
+registerSystem('haptics', hapticsSystem, SYSTEM_PRIORITY.INPUT);
 // Timeline / cutscene sequencer — one tick BEFORE animation (149) so a keyframe-scrub
 // Animation track sets Animator.{clip,time} and animationSystem samples that exact pose the
 // same frame. Playhead advances on the deterministic sim delta; sim-gated (149 < TRANSFORM),
@@ -68,9 +80,43 @@ registerSystem('zone3D', zone3DSystem, SYSTEM_PRIORITY.TRANSFORM + 2);
 // sources read current positions. App-pipeline only (NOT headless) so the harness
 // stays deterministic; audioService is itself a no-op without an AudioContext.
 registerSystem('audio', audioSystem, SYSTEM_PRIORITY.AUDIO);
-// Material parameter driving — presentation tier (260), ≥ TRANSFORM so it keeps writing
-// driven material params (uniforms via object userData) while paused/stopped. Reaches live
-// materials through the material broker, so it no-ops headless (no render surfaces).
+// Video playback — presentation tier alongside audio (video's SOUND routes onto the
+// audio bus, so they belong at the same stage). App-pipeline only, NOT headless: video
+// runs on the browser's media clock and cannot be stepped, so the determinism harness
+// must never see it. The GUID→URL resolver is injected for the same reason spatial audio's
+// world-position resolver is — it keeps the engine's videoSystem free of the loader stack.
+//
+// Gated on the module flag: a build that excludes video (build.modules.video = false, or
+// 'auto' on a --target playable) never registers the system, never opens a decoder and never
+// touches the cache.
+//
+// What this gate is FOR, measured rather than assumed: the win is the CLIPS, not the code.
+// Video has no vendor SDK behind it — unlike Rapier or PixiJS it is ~25 KB of engine source
+// reached through the runtime barrel, and a flag-gated dynamic import (the shape
+// materialInstanceSystem uses for the 2D broker) was tried and dropped only 3 KB, because the
+// barrel's static graph keeps it alive regardless. So the flag does two useful things and one
+// it does not: it stops video RUNNING, and it tells the asset shaker to drop the .mp4s (which
+// is what actually fits a playable under its cap). It does not strip the JS.
+if (__MODOKI_MODULE_VIDEO__) {
+  setVideoUrlResolver(resolveVideoUrl);
+  setVideoSourceResolver(resolveVideoSource);
+  // Downloaded-video cache. Only wired where the Cache API exists — without it a
+  // `download` clip falls back to streaming from its URL, which still PLAYS (it just
+  // isn't offline-capable). Degrading to "works, but not cached" beats not playing.
+  if (hasCacheStorage()) {
+    const videoCache = new VideoCache({
+      backend: new CacheApiBackend(),
+      budgetBytes: VIDEO_CACHE_BUDGET_MB * 1024 * 1024,
+      storage: typeof localStorage !== 'undefined' ? localStorage : undefined,
+    });
+    // Repair index/storage drift once at boot — the browser may have reclaimed our
+    // storage since last run, and a stale index would report a cache full of nothing.
+    void videoCache.reconcile();
+    setVideoDownloader((key, url, onProgress) =>
+      videoCache.fetchAndStore(key, url, onProgress && ((p) => onProgress(p.receivedBytes, p.totalBytes))));
+  }
+  registerSystem('video', videoSystem, SYSTEM_PRIORITY.AUDIO);
+}
 registerSystem('materialInstance', materialInstanceSystem, SYSTEM_PRIORITY.MATERIAL);
 registerSystem('uiTreeProjection', uiTreeProjection, SYSTEM_PRIORITY.PROJECTION);
 

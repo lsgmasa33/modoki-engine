@@ -11,6 +11,13 @@
   "compilerOptions": {
     "noEmit": true,
     "composite": false,
+    // `incremental` is compatible with `noEmit` (TS 4.0+) and with `composite: false`; it
+    // persists the type graph so a repeat `npm run typecheck` isn't a cold recheck of all
+    // of src/**. tsconfig.test.json extends THIS file and therefore MUST override
+    // tsBuildInfoFile with its own path — two programs sharing one buildinfo would
+    // invalidate each other every run, which is slower than no cache at all.
+    "incremental": true,
+    "tsBuildInfoFile": "../../../node_modules/.tmp/modoki-check.tsbuildinfo",
     "paths": {}
   }
 }

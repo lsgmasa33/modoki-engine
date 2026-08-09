@@ -28,6 +28,22 @@
  * a baseline entry that no longer hits also fails ("stale exemption"). The baseline is a RECORD of
  * what already existed when this guard landed, not a review or an approval — shrink it as blanks
  * get fixed, never grow it to make a new one quietly go away.
+ *
+ * NOTE (2026-08-04): 23 SCENE entries were dropped from the baseline in one go when every scene
+ * was re-saved through the current serializer (`engine/scripts/resave-scenes.sh`). That pass
+ * compacts default-valued fields OUT of the file, so a field authored as `"material": ""` is now
+ * simply absent — and this guard only sees values that are present. Nothing actionable was lost:
+ * every one of those entries was already an accepted exemption whose reason was "blank means use
+ * the default, not a missing ref", which is exactly what an absent field means. The PREFAB entries
+ * below still fire because prefabs were not part of that pass.
+ *
+ * NOTE (2026-08-06): prefabs HAVE now been re-saved (`engine/scripts/resave-prefabs.sh`, #125), and
+ * the prediction the previous paragraph ended on — "expect the same shrink for the same reason" —
+ * was WRONG, in the opposite direction. The prefab writer does not compact: `serializePrefab` reads
+ * each trait's FULL persisted schema (`readTraitDataFull`) and writes every field, so a re-save
+ * ADDS default-valued fields rather than removing them. Nothing shrank; two blank refs APPEARED
+ * (`Renderable2D.material` on Game_Canvas + GreenSlim), pinned below. The scene and prefab writers
+ * genuinely differ here, so do not reason about one from the other.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -57,16 +73,18 @@ const BASELINE: { key: string; why: string }[] = [
   { key: '/games/3d-test/assets/models/skinned-test/capsule.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
   { key: '/games/3d-test/assets/models/skinned-test/cone.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
   { key: '/games/3d-test/assets/models/skinned-test/cylinder.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
-  { key: '/games/3d-test/assets/scenes/2D Animation.scene.json:Renderable2D.material', why: '2D sprite falls back to the built-in default 2D material unless a custom one is authored' },
-  { key: '/games/3d-test/assets/scenes/2D Animation.scene.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/games/3d-test/assets/scenes/skinned-test.scene.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
-  { key: '/games/3d-test/assets/scenes/skinned-test.scene.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/games/3d-test/assets/scenes/tropical-island.scene.json:Renderable2D.material', why: '2D sprite falls back to the built-in default 2D material unless a custom one is authored' },
+  // Renderable2D.sprite became a PROVEN ref pair only when games/video-test authored a video
+  // GUID there — the first asset GUID in that field anywhere in the repo (every other 2D entity
+  // uses a primitive keyword or a slice name). This blank pre-dates that and is the 2D analogue
+  // of the Renderable3DPrimitive.material entries below: a coloured quad, not a forgotten image.
+  // (The SCENE blanks that came with it are gone for the reason in the 2026-08-04 note above —
+  // the re-save compacted them out of the file.)
+  { key: '/games/3d-test/assets/prefabs/Game_Canvas.prefab.json:Renderable2D.sprite', why: 'blank sprite = flat coloured primitive quad (Renderable2D.color + width/height), not a missing image' },
+  // Both of these appeared in the 2026-08-06 PREFAB re-save (#125), for the reason in the note
+  // above: the prefab writer emits the trait's FULL schema, so `material` — previously absent —
+  // is now written as "". Same exemption as the Renderable3DPrimitive.material entries below.
+  { key: '/games/3d-test/assets/prefabs/Game_Canvas.prefab.json:Renderable2D.material', why: 'optional 2D material override slot — blank means "use the default sprite material," not a forgotten material asset' },
   { key: '/games/alien-animal/assets/models/alien-animal.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
-  { key: '/games/anim-bug/assets/scenes/main.scene.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/games/audio-demo/assets/scenes/main.scene.json:AudioSource.clip', why: 'clip is resolved per-cue from SFXBank/Music elsewhere, not a single fixed clip on this trait' },
-  { key: '/games/codex/assets/scenes/main.scene.json:Renderable2D.material', why: '2D sprite falls back to the built-in default 2D material unless a custom one is authored' },
-  { key: '/games/skin-test/assets/scenes/billboard-2_5d.scene.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
   { key: '/games/sling/assets/prefabs/bumper.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
   { key: '/games/sling/assets/prefabs/bumper.prefab.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
   { key: '/games/sling/assets/prefabs/cover-enemy.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
@@ -74,28 +92,16 @@ const BASELINE: { key: string; why: string }[] = [
   { key: '/games/sling/assets/prefabs/enemy.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
   { key: '/games/sling/assets/prefabs/enemy.prefab.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
   { key: '/games/sling/assets/prefabs/goal-point.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
+  // Appeared in the 2026-08-06 prefab re-save (#125) — see the Game_Canvas.Renderable2D.material
+  // entry above: the prefab writer emits the full trait schema, so this optional slot is now present.
+  { key: '/games/sling/assets/prefabs/GreenSlim.prefab.json:Renderable2D.material', why: 'optional 2D material override slot — blank means "use the default sprite material," not a forgotten material asset' },
   { key: '/games/sling/assets/prefabs/green-enemy.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
   { key: '/games/sling/assets/prefabs/green-enemy.prefab.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
   { key: '/games/sling/assets/prefabs/puck.prefab.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
   { key: '/games/sling/assets/prefabs/puck.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/games/sling/assets/scenes/Lvl-0001.scene.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/games/sling/assets/scenes/Lvl-0002.scene.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/games/sling/assets/scenes/camera-demo.scene.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/games/space-invader/assets/scenes/main.scene.json:AudioSource.clip', why: 'clip is resolved per-cue from SFXBank/Music elsewhere, not a single fixed clip on this trait' },
   { key: '/games/timeline-demo/assets/models/alien-animal.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
   { key: '/games/timeline-demo/assets/prefabs/spark.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/games/timeline-demo/assets/scenes/main.scene.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
-  { key: '/games/timeline-demo/assets/scenes/main.scene.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/games/timeline-demo/assets/scenes/nested.scene.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
-  { key: '/games/timeline-demo/assets/scenes/overlap.scene.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
-  { key: '/demos/3d-physics-demo/assets/scenes/physics-showcase.scene.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/demos/3d-physics-demo/assets/scenes/physics-showcase.scene.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
-  { key: '/demos/3d-physics-demo/assets/scenes/terrain-demo.scene.json:Renderable3D.material', why: 'blank observed on a single instance (Terrain) — needs an owner call whether that is intentional; kept in the baseline as pre-existing, not approved' },
-  { key: '/demos/3d-physics-demo/assets/scenes/terrain-demo.scene.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/demos/3d-physics-demo/assets/scenes/terrain-demo.scene.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
   { key: '/demos/forest-camp/assets/models/char_Ranger.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
-  { key: '/demos/forest-camp/assets/scenes/main.scene.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
-  { key: '/demos/particle-demo/assets/scenes/main.scene.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
 ];
 
 function* walk(dir: string): Generator<string> {

@@ -276,6 +276,7 @@ describe('registerSelectionRestore', () => {
       // calls setStructureCallback at module load.
       getCurrentWorld: () => undefined, findEntityById: () => undefined,
       unregisterEntity: () => {}, setStructureCallback: () => {},
+      destroyEntity: (e: any) => { e.destroy(); },
     }));
 
     const { registerSelectionRestore } = await import('../../src/editor/store/selectionRestore');
@@ -295,6 +296,7 @@ describe('registerSelectionRestore', () => {
       onWorldSwap: (fn: any) => { listener = fn; return () => {}; },
       getCurrentWorld: () => undefined, findEntityById: () => undefined,
       unregisterEntity: () => {}, setStructureCallback: () => {},
+      destroyEntity: (e: any) => { e.destroy(); },
     }));
 
     const { registerSelectionRestore } = await import('../../src/editor/store/selectionRestore');

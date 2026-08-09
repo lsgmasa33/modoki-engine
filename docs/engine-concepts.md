@@ -55,6 +55,25 @@ that drives the Inspector and auto-serialization.
 > `Animator` → `animationSystem`. The trait is still just data; the system is
 > what makes it move.
 
+**Writing a trait — `entity.get()` hands you a COPY.** This is the one koota API
+shape that fails silently, so it is worth learning once rather than debugging:
+
+```ts
+const t = entity.get(Transform)!;
+t.x += 1;                                    // ✗ NO-OP — mutates a throwaway copy
+
+entity.set(Transform, { ...t, x: t.x + 1 }); // ✓ explicit write
+world.query(Transform).updateEach(([t]) => { t.x += 1; });  // ✓ writes back
+writeTraitField(id, meta, 'x', t.x + 1);     // ✓ editor/tooling path (fires dirty listeners)
+```
+
+There is no error and no warning — the field simply keeps its old value, so the
+symptom is a feature that "does nothing" with code that reads correctly. A
+now-deleted scaffold (`games/agy`) had its entire camera-follow and HUD built
+this way; every string and every camera lerp was dead, and it looked like a
+rendering bug. Inside `updateEach` the destructured trait IS live and writes
+back — that is why the same `t.x += 1` is right there and wrong above.
+
 ### Asset reference (GUID)
 
 When a trait field points at an asset — a mesh, material, texture/sprite, particle

@@ -51,6 +51,21 @@ export function isImagePath(ref: string): boolean {
   return /\.(png|jpe?g|webp|gif|svg)$/i.test(ref) || ref.startsWith('http') || ref.startsWith('data:') || ref.startsWith('blob:');
 }
 
+/** True if ref names a VIDEO asset — a moving picture rather than a still one.
+ *
+ *  Deliberately NOT folded into {@link isImagePath}: a video ref must produce a Sprite
+ *  slot (it is a bitmap on screen) while skipping the whole still-image pipeline —
+ *  `Assets.load`, the URL refcount, the atlas/frame machinery. PixiJS's own asset
+ *  loader WOULD happily load an `.mp4`, and that is precisely the trap: it mints its
+ *  OWN `HTMLVideoElement`, giving a second decoder, a second autoplay negotiation and
+ *  a second audio path for the clip `videoService` is already driving. The element is
+ *  adopted instead (see `videoTextureSync2D`). */
+export function isVideoRef(ref: string): boolean {
+  if (!ref) return false;
+  if (isGuid(ref)) return textureProvider.get()?.getAssetType(ref) === 'video';
+  return /\.(mp4|mov|m4v|webm|mkv)$/i.test(ref);
+}
+
 /** Resolve a sprite ref through the texture-resolution seam. See {@link ResolvedSprite}. */
 export function resolveSprite(ref: string): ResolvedSprite | undefined {
   return textureProvider.get()?.resolveSprite(ref);

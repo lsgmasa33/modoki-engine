@@ -17,14 +17,23 @@ import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_3D } fr
 import { registerSceneRenderer, unregisterSceneRenderer, normalizeJpegQuality, type SceneRenderer } from './offscreenCapture';
 import { registerBoundsProvider, projectAABBToScreen, type EntityScreenBounds } from '../core/screenBounds';
 import { readbackToRGBA, type ReadbackBackend } from './readbackToRGBA';
-import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, prewarmShadersForWorld, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
+import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, reconcileToneExposure, prewarmShadersForWorld, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
 import { registerRenderSurface } from './materialBroker';
-import { getRenderSettings } from './renderSettings';
+import { onRendererLost } from '../core/activeRenderer';
+import { createRendererRecovery } from './rendererRecovery';
+import { tickTierCalibration, applyPendingTierPromotion } from './tierCalibration';
+import { beginProfilerSample, endProfilerSample } from '../core/profilerMarkers';
+import { gpuPassScope } from '../core/gpuTimings';
+import { getRenderSettings, getEffectiveThreeSettings, getActiveTierOrDefault } from './renderSettings';
+import { tierAllowsPostFX } from './qualityTier';
 import { onForceResize } from './resizeBus';
 import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
 import { createParticleSyncState, syncParticles, disposeParticleSyncState } from './particleSync';
 import { createFlameMeshSyncState, syncFlameMeshes, disposeFlameMeshSyncState } from './flameMeshSync';
+import { createBlobShadowSyncState, syncBlobShadows, disposeBlobShadowSyncState } from './blobShadowSync';
+import { viewGroundFocus } from './shadowFollow';
 import { PARTICLE_LAYER } from './layers';
+import { areDebugHandlesEnabled } from '../core/debugHandles';
 import { NPRPostFX } from '../traits/NPRPostFX';
 import { BloomPostFX } from '../traits/BloomPostFX';
 import { VignettePostFX } from '../traits/VignettePostFX';
@@ -37,6 +46,22 @@ import { planStages, planFxaaEnabled, stackSignature } from './postfx/stackPlan'
 import type { BloomStageConfig, VignetteStageConfig, DofStageConfig, AoStageConfig, PostFXRequest } from './postfx/stackPlan';
 import { SuperSampleRebuildDebouncer } from './npr/ssRebuildDebounce';
 import { nprConfigFromTrait, type NprTraitSnapshot } from './npr/nprConfigFromTrait';
+
+/** Draw-call batching (#154 P4b) — built, correct, tested, and DEFAULT OFF because it was
+ *  measured to be worthless on the project it was built for.
+ *
+ *  On `games/sling` / Huawei Y6 it does exactly what it claims: 235 draw calls collapse to 38
+ *  (`drawCallsSaved: 197`). The frame does not move — 81-86 ms before, 85-86 ms after, inside a
+ *  +/-2.5% noise floor — because `submit` stays ~13 ms with 38 calls just as it was with 235. So
+ *  per-call driver overhead was never the cost, and the P4b premise was wrong. Worse, the batching
+ *  pass itself adds ~2.6 ms to `renderables`.
+ *
+ *  Kept rather than reverted because the mechanism is sound and the census says other projects are
+ *  far more repeated (forest-camp 554 entities on repeated pairs, 3d-test 456) — but it must not
+ *  ship enabled on the strength of a hypothesis its own measurement refuted. Flip this ON only
+ *  behind a before/after `renderer.calls` AND frame-time reading on the target device.
+ *  Full write-up: docs/plans/draw-call-instancing-plan.md. */
+const BATCH_DRAW_CALLS = false;
 
 let nextInstanceId = 0;
 
@@ -52,11 +77,54 @@ export default function Scene3D() {
     let renderer: WebGPURenderer | THREE.WebGLRenderer;
     let disposed = false;
 
-    createRenderer(container, config.preferWebGPU).then(r => {
+    // ── GPU context-loss recovery (#121 P1) ────────────────────────────────────────────────
+    // Everything this viewport owns — scene, cameras, renderState, particles, the post-FX
+    // stack, the frame callback, and the capture/bounds/broker registrations — is built inside
+    // `startRenderLoop()` and torn down by the `cleanupRef` it installs. So recovery does NOT
+    // need to re-point anything at a new renderer: it is a teardown plus a second bring-up, an
+    // in-place remount without React. That is only true while bring-up stays self-contained —
+    // anything hoisted OUT of startRenderLoop that touches the renderer breaks it.
+    //
+    // A lost three renderer cannot be revived (`_isDeviceLost` is never cleared anywhere in
+    // three), which is why this rebuilds rather than restores. See `core/activeRenderer.ts`.
+    const bringUp = async () => {
+      const r = await createRenderer(container, config.preferWebGPU);
       if (disposed) { r.dispose(); r.domElement.remove(); return; }
       renderer = r;
       startRenderLoop();
-    }).catch(e => {
+    };
+
+    /** Run the installed teardown exactly once, then forget it — so a bring-up that fails
+     *  before installing a new one can't leave the unmount path calling a stale closure over
+     *  an already-disposed renderer. */
+    const teardown = () => {
+      const fn = cleanupRef.current;
+      cleanupRef.current = null;
+      fn?.();
+    };
+
+    const recovery = createRendererRecovery({
+      rebuild: async () => { teardown(); await bringUp(); },
+      isDisposed: () => disposed,
+      // `description` first (it is what survives the device bridge — a bare non-Error logged
+      // straight to the console is the `{}` that started #156), then the raw value, so a desktop
+      // devtools reader keeps an inspectable object with whatever custom fields it carries.
+      onError: (e, { description, attempt, willRetry }) => console.error(
+        `[Scene3D] renderer rebuild after context loss FAILED (attempt ${attempt}) — ` +
+        (willRetry
+          ? 'retrying after a backoff:'
+          : 'giving up; this surface stays black until the game reloads:'),
+        description, e,
+      ),
+    });
+    // Only OUR renderer's death is ours to act on — the editor mounts a second viewport with
+    // its own renderer, and rebuilding a healthy one costs a prewarm stall for nothing.
+    const unsubRendererLost = onRendererLost((info) => {
+      if (info.renderer && renderer && info.renderer !== renderer) return;
+      recovery.request();
+    });
+
+    bringUp().catch(e => {
       console.error('[Scene3D] Renderer creation failed (no WebGPU or WebGL2):', e);
     });
 
@@ -173,9 +241,31 @@ export default function Scene3D() {
       config.sceneSetup(scene);
 
       const ecsLights = new Map<number, THREE.Light>();
+      // Scratch for deriving the shadow-follow ground focus each frame — there's no camera
+      // look-at concept here (unlike SceneView's orbit `controls.target`), so it's derived from
+      // the active camera's own forward ray. Module-closure-scoped so the per-frame sync
+      // allocates nothing.
+      const _shadowFocusDir = new THREE.Vector3();
+      /** Where the active camera is looking, as a ground point, for shadowFollowCamera lights.
+       *  Forward is derived from `cam.rotation` (same technique syncLights uses for a light's
+       *  aim) rather than `matrixWorld` — position/rotation are written directly onto the
+       *  camera each frame and matrixWorld isn't guaranteed fresh until the renderer submits. */
+      function shadowFocusFor(cam: THREE.Camera): { x: number; y: number; z: number } {
+        _shadowFocusDir.set(0, 0, -1).applyEuler(cam.rotation);
+        return viewGroundFocus({
+          camPos: { x: cam.position.x, y: cam.position.y, z: cam.position.z },
+          camForward: { x: _shadowFocusDir.x, y: _shadowFocusDir.y, z: _shadowFocusDir.z },
+          groundY: 0,
+          // No single per-light shadowCameraSize is reachable here — one focus point is shared
+          // across every light in the syncLights call, so this is a fixed bound rather than a
+          // derived one (flagged per the brief: "if it isn't [reachable], use a constant 32").
+          maxDistance: 32,
+        });
+      }
       const renderState = createRenderState(true); // primary surface — journals @anim-* (Percept J3)
       const particleState = createParticleSyncState();
       const flameState = createFlameMeshSyncState();
+      const blobShadowState = createBlobShadowSyncState();
       const unsubInvalidation = attachInvalidationListener(renderState, scene);
       // Publish this surface so the material broker (MaterialInstance) can reach
       // this world's live materials + object userData. getCurrentWorld follows swaps.
@@ -222,7 +312,15 @@ export default function Scene3D() {
       let captureCam: THREE.PerspectiveCamera | null = null;
       let captureOrthoCam: THREE.OrthographicCamera | null = null;
 
-      if (import.meta.env.DEV) (window as any).__3d = { camera, scene, renderer };
+      // Exposed in DEV *and* in a debugBuild game (project.config.json
+      // `build.debugBuild` — the same gate as the debug menu and the device bridge).
+      // Without the second half, a shipped-but-debuggable native build has no handle
+      // on the live scene, so every on-device rendering experiment costs a full
+      // build+install+launch cycle (~3 min) instead of one `device_eval` (#166).
+      // A release build still gets nothing: the gate is off there.
+      if (import.meta.env.DEV || areDebugHandlesEnabled()) {
+        (window as any).__3d = { camera, scene, renderer };
+      }
 
       const frameKey = `render3d-${nextInstanceId++}`;
 
@@ -252,26 +350,49 @@ export default function Scene3D() {
 
       function renderFrame() {
         if (capturing) return;
+        // Judge the frame profile and promote/demote the quality tier (#121 P3b). Self-throttling
+        // (CALIBRATION_INTERVAL_MS) and a no-op unless the project asked for 'auto', so this costs
+        // a comparison on the overwhelming majority of frames. Placed BEFORE the idle-gate return
+        // deliberately — a paused/stopped surface stops rendering but the profile it already
+        // gathered is still the evidence a demotion acts on.
+        tickTierCalibration();
         // Idle gate: while paused/stopped only dirty events + the grace window
         // need a redraw; while playing — or while the Animation editor is previewing
         // skeletal animation (mixer advancing) — render unconditionally.
         if (!isSimRunning() && !isSkeletalPreviewing() && dirtyFrames <= 0) return;
         if (dirtyFrames > 0) dirtyFrames--;
         const world = getCurrentWorld();
+        // Profiler-plan P2, second pass. `render3d-0` used to be ONE opaque span, which is how a
+        // 170ms frame on the A23 could report only 37.9ms of engine CPU with no interior to
+        // inspect. These sub-spans split the ECS->three sync from the actual submit, so the next
+        // capture can say WHICH of them the time is in — or prove it is in neither, which is the
+        // answer that sends us to GPU timestamps (P7) instead of more markers.
+        beginProfilerSample('sync');
         activeCamera = syncCamera(world, scene, camera, orthoCamera);
         applyFraming(world, activeCamera, camera.aspect, activeCamera === orthoCamera);
         syncEnvironment(world, scene);
+        // Must follow syncEnvironment: it is what decides whether this scene lost its IBL, and
+        // the exposure compensation is gated on that (#154). See reconcileToneExposure.
+        reconcileToneExposure(renderer);
         syncFog(world, scene);
-        syncLights(world, scene, ecsLights);
-        syncSceneRenderables3D(world, scene, renderState);
+        beginProfilerSample('lights');
+        syncLights(world, scene, ecsLights, shadowFocusFor(activeCamera));
+        endProfilerSample();
+        beginProfilerSample('renderables');
+        syncSceneRenderables3D(world, scene, renderState, { batchDrawCalls: BATCH_DRAW_CALLS });
+        endProfilerSample();
         orientBillboards(renderState, activeCamera); // face billboards toward the live camera
         // Inside the editor PREVIEW envelope the SceneView owns particle preview (it supplies its
         // own wall-clock delta + drains the timeline's one-shot restart/pause requests). If this
         // runtime renderer ALSO drained them it would consume the request first and, with the sim
         // clock frozen (getVisualDelta 0 in preview), show a stuck-at-frame-0 burst. So skip here
         // during scrub/preview; real Play (isSimRunning) is unaffected. (preview-mode-refactor Phase 5.)
+        beginProfilerSample('particles');
         if (!inPreviewSession()) syncParticles(world, scene, particleState);
         syncFlameMeshes(world, scene, flameState);
+        syncBlobShadows(world, scene, blobShadowState);
+        endProfilerSample();
+        endProfilerSample(); // 'sync'
 
         // Read NPR singleton — first entity with NPRPostFX, if any. The trait→config
         // mapping + signature are the pure `nprConfigFromTrait`/`nprConfigSignature`
@@ -408,7 +529,23 @@ export default function Scene3D() {
         // scenes / MCP writes only.)
         const liveSs = nprSnap ? Math.max(1, nprSnap.superSampleScale) : 1;
         const liveReq = buildReq(liveSs);
-        if (planStages(liveReq).length > 0 && isWebGPU) {
+        // The `low` tier drops the post-process stack outright (#121 P3c). It is the dominant
+        // remaining cost on a weak device and it is SCREEN-SPACE, so it is paid per pixel however
+        // simple the scene is — on an iPhone 8 a 27ms baseline became 56ms with NPR alone.
+        //
+        // Tearing down an EXISTING stack matters as much as not building one: a live demotion
+        // happens on a device that is already struggling, and a retained stack would keep its
+        // render targets (several full-resolution buffers) resident for nothing. This is the one
+        // place a tier change frees memory rather than just doing less work.
+        const postfxAllowed = tierAllowsPostFX(getActiveTierOrDefault());
+        if (!postfxAllowed && postfxStack) {
+          postfxStack.dispose();
+          postfxStack = null;
+          postfxCamera = null;
+          ssRebuild = null;
+          lastStackSig = null;
+        }
+        if (postfxAllowed && planStages(liveReq).length > 0 && isWebGPU) {
           // Rebuild on camera-object swap (perspective <-> ortho): the stack
           // baked the old camera object, incl. its depth-reconstruction path.
           const cameraChanged = postfxStack != null && postfxCamera !== activeCamera;
@@ -445,9 +582,19 @@ export default function Scene3D() {
               if (cfgScale === liveSs) lastStackSig = sig;
             }
           }
-          postfxStack.render();
+          // The CPU span and the GPU span are separate measurements of the same call and both are
+          // wanted: `submit-postfx` is how long the main thread spent HERE (on postfx-demo that
+          // was a median 37 ms — CPU blocking on GPU backpressure), while `gpuPassScope` claims
+          // the render-call ordinals so the GPU's own time lands under this name instead of an
+          // anonymous `pass[n]`. A post-FX chain is one scope over many internal three passes, so
+          // it reports as `postfx#0`, `postfx#1`, … — see `gpuPassScope`.
+          beginProfilerSample('submit-postfx');
+          gpuPassScope('postfx', () => postfxStack!.render());
+          endProfilerSample();
         } else {
-          renderer.render(scene, activeCamera);
+          beginProfilerSample('submit');
+          gpuPassScope('scene', () => renderer.render(scene, activeCamera));
+          endProfilerSample();
         }
       }
       // Prewarm the already-current scene before the first render. The runtime
@@ -503,16 +650,18 @@ export default function Scene3D() {
           const world = getCurrentWorld();
           const activeForCapture = syncCamera(world, scene, camera, orthoCamera);
           syncEnvironment(world, scene);
+          reconcileToneExposure(renderer);
           syncFog(world, scene);
-          syncLights(world, scene, ecsLights);
+          syncLights(world, scene, ecsLights, shadowFocusFor(activeForCapture));
           // Same unconditional renderable+skeletal core as the live renderFrame
           // (runtime-rendering-3d.md F1): without syncSkinnedModels/syncBones/
           // syncBoneAttachments a skeletal scene captured absent or frozen at a
           // stale pose, breaking the "same ECS state ⇒ same framing" contract of
           // the agent-verification path (modoki_render_scene).
-          syncSceneRenderables3D(world, scene, renderState);
+          syncSceneRenderables3D(world, scene, renderState, { batchDrawCalls: BATCH_DRAW_CALLS });
           syncParticles(world, scene, particleState);
           syncFlameMeshes(world, scene, flameState);
+          syncBlobShadows(world, scene, blobShadowState);
 
           // Deterministic camera: copy the live pose into the pooled capture cam,
           // then apply overrides. Mirror the live active projection so an ortho
@@ -635,6 +784,7 @@ export default function Scene3D() {
         disposeRenderState(renderState, scene);
         disposeParticleSyncState(particleState, scene);
         disposeFlameMeshSyncState(flameState, scene);
+        disposeBlobShadowSyncState(blobShadowState, scene);
         // clearOwnedMaterials MUST run after disposeRenderState (which consults
         // _ownedMaterials). The SHARED inline-texture/tint material caches are
         // freed by the module-level onWorldSwap listener in scene3DSync.ts, not
@@ -655,6 +805,11 @@ export default function Scene3D() {
       // new scene doesn't compile shaders on the main thread. SceneManager awaits
       // this hook between staging-world population and setCurrentWorld.
       const prewarmHook = async (stagingWorld: import('koota').World) => {
+        // A queued tier PROMOTION lands here, before the prewarm (#121 P3b): this is the scene
+        // boundary the deferral was waiting for, and applying the tier first means the prewarm
+        // that follows compiles the shaders the NEW tier actually needs, inside a stall the
+        // player has already accepted.
+        applyPendingTierPromotion();
         try {
           await prewarmShadersForWorld(stagingWorld, renderer, camera);
         } catch (e) {
@@ -680,8 +835,11 @@ export default function Scene3D() {
         // free/fixed, making this identical to the pre-clamp setSize path. basePR is
         // recomputed here every resize — never renderer.getPixelRatio(), which is the
         // already-clamped value and so can't climb back when the container shrinks.
+        // Tier-ADJUSTED (#121 P3) — `makeWebGPURenderer` sized the first buffer through the same
+        // accessor. Reading the RAW `pixelRatioCap` here would let the first resize silently undo
+        // the tier's cap, which on a low-end device is the whole point of the tier.
         const rs = getRenderSettings();
-        const basePR = basePixelRatio(window.devicePixelRatio, rs.three.pixelRatioCap);
+        const basePR = basePixelRatio(window.devicePixelRatio, getEffectiveThreeSettings().pixelRatioCap);
         renderer.setPixelRatio(clampPixelRatio(w, h, basePR, rs.web));
         renderer.setSize(w, h, false);
         renderer.domElement.style.width = `${w}px`;
@@ -697,35 +855,46 @@ export default function Scene3D() {
       const unregisterForceResize = onForceResize(applyResize);
 
       cleanupRef.current = () => {
-        unregisterSceneRenderer(offscreenRender);
-        unregBounds();
-        captureRT?.dispose();
+        // EVERY step is guarded (#121 P1). This teardown now runs on the RECOVERY path too,
+        // where the renderer's context is already dead — and three's dispose() paths touch the
+        // GPU. Unguarded, one throw would skip every later step: the frame callback left
+        // registered, `registerSceneRenderer`/`registerBoundsProvider`/`registerBeforeSwap`
+        // left holding closures over a dead renderer, and the rebuild double-registering on
+        // top of them. On the unmount path a throw was merely a leak; here it corrupts the
+        // thing recovery is trying to fix, so failures are logged and stepped over.
+        const step = (what: string, fn: () => void) => {
+          try { fn(); } catch (e) { console.warn(`[Scene3D] teardown step "${what}" failed`, e); }
+        };
+        step('unregisterSceneRenderer', () => unregisterSceneRenderer(offscreenRender));
+        step('unregBounds', unregBounds);
+        step('captureRT.dispose', () => captureRT?.dispose());
         captureRT = null;
         captureCanvas = null;
         captureCtx = null;
         captureCam = null;
         captureOrthoCam = null;
-        unsubSwap();
-        unsubInvalidation();
-        unregisterSurface();
-        for (const unsub of dirtyUnsubs) unsub();
-        sceneManager.unregisterBeforeSwap(prewarmHook);
-        resizeObserver.disconnect();
-        unregisterForceResize();
-        unregisterFrameCallback(frameKey);
-        disposeParticleSyncState(particleState, scene);
-        disposeFlameMeshSyncState(flameState, scene);
-        postfxStack?.dispose();
+        step('unsubSwap', unsubSwap);
+        step('unsubInvalidation', unsubInvalidation);
+        step('unregisterSurface', unregisterSurface);
+        for (const unsub of dirtyUnsubs) step('dirtyUnsub', unsub);
+        step('unregisterBeforeSwap', () => sceneManager.unregisterBeforeSwap(prewarmHook));
+        step('resizeObserver.disconnect', () => resizeObserver.disconnect());
+        step('unregisterForceResize', unregisterForceResize);
+        step('unregisterFrameCallback', () => unregisterFrameCallback(frameKey));
+        step('disposeParticleSyncState', () => disposeParticleSyncState(particleState, scene));
+        step('disposeFlameMeshSyncState', () => disposeFlameMeshSyncState(flameState, scene));
+        step('disposeBlobShadowSyncState', () => disposeBlobShadowSyncState(blobShadowState, scene));
+        step('postfxStack.dispose', () => postfxStack?.dispose());
         postfxStack = null;
         ssRebuild = null;
         // Tear down skinned entries (stop mixers, dispose per-clone skeleton
         // boneTextures) — consistent with the world-swap path. Without this,
         // unmount relied on renderer.dispose() reclaiming the GPU context.
-        disposeRenderState(renderState, scene);
+        step('disposeRenderState', () => disposeRenderState(renderState, scene));
         // Don't dispose scene.environment — it's owned by meshTemplateCache's
         // envCache (refcounted by SceneManager). Just detach.
         scene.environment = null;
-        scene.clear();
+        step('scene.clear', () => scene.clear());
         // SHARED module-level material caches (_defaultMaterial, inline-texture
         // mats, tint clones, and the _ownedMaterials tracking set) are
         // intentionally NOT disposed on a single panel's unmount. The editor
@@ -736,14 +905,16 @@ export default function Scene3D() {
         // onWorldSwap listener in scene3DSync.ts), when all loops rebuild
         // together, or reclaimed with the GPU context on final teardown. See
         // engine-review/runtime-rendering-3d.md F2.
-        renderer.dispose();
-        renderer.domElement.remove();
+        step('renderer.dispose', () => renderer.dispose());
+        step('domElement.remove', () => renderer.domElement.remove());
       };
     }
 
     return () => {
       disposed = true;
-      cleanupRef.current?.();
+      unsubRendererLost();
+      recovery.dispose();
+      teardown();
     };
   }, []);
 

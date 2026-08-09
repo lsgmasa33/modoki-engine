@@ -57,6 +57,11 @@ deterministic sim free of live DOM reads.
 - `runtime/core/pointerBlockers.ts` — the pointer-block-root registry (`registerPointerBlocker`/
   `isPointerBlocked`), consulted by `pointerSource.ts` at ingestion. Lives in `core/` (L0), not
   `input/` or `ui/` (both L2), because both need to reach it and there is no `ui → input` zone edge.
+- `runtime/input/pointerRecorder.ts` — the **input watch** (#134): a bounded, agent-readable record
+  of what the pointer actually did. Separate capture-phase listeners on `window`, attached only
+  while a watch window is open, so it sees a press regardless of what any layer downstream does
+  with it — blocked, `stopPropagation`'d, or a second finger `pointerSource` deliberately ignores.
+  See "The input watch" below.
 - `runtime/input/characterInputSystem.ts` / `characterInput3DSystem.ts` — GAME-tier bridges copying
   `Input` actions onto `CharacterController2D`/`3D` move/jump fields.
 - `runtime/input/inputPrompts.ts` / `inputPromptSources.ts` — the pure `promptFor(device, action)`
@@ -202,6 +207,247 @@ tables are plain read-only consts (a rebindable table is a later phase). Sources
 contributions and OR their held flags, which is why `clampAxes` exists. The `Input` resource is spawned
 automatically by `SceneManager` for every scene (like `Time`) — it's runtime-only, never authored into
 a scene file, and intentionally not an editor-inspectable trait.
+
+## Pointer lead — drawing where the finger is about to be
+
+A dragged object trails the finger on a touch device, and **it is not the frame budget**. Measured
+on an A23 (2026-08-06, Court): during a real drag the frame time was a median of **16.7 ms with
+exactly one frame over 25 ms out of 226** — a clean 60 fps — the ECS pipeline already runs `INPUT`
+(50) before `GAME` (100) before the 2D render, and `onPointerMove` queues nothing that could
+accumulate. Three plausible causes, all dead.
+
+**The decisive measurement was a control.** A bare DOM `<div>` moved directly in the pointer
+handler — no ECS, no canvas, the shortest path a browser offers — lagged by the *same* amount. So
+the latency is the platform's touch → event → render → composite pipeline, roughly **83 ms, five
+frames at 60 Hz**, and there is no frame left in engine code to reclaim. The owner then confirmed
+it on an iPhone 8 and an iPhone Air too, so it is not Android-specific. Chrome's own
+`getPredictedEvents()` reaches exactly **one** frame ahead (16.6 ms measured) and cannot close it.
+
+The only remaining lever is to draw where the finger is *heading*:
+
+| Piece | Where | What it does |
+|---|---|---|
+| `PointerFrame.vx/vy` | `core/inputActions.ts` | Pointer velocity, CSS px/ms |
+| velocity estimate | `input/pointerSource.ts` | Newest sample PAIR, EMA-smoothed; zeroed on press, release and reset |
+| `PointerFrame.t` | `core/inputActions.ts` | The sample's timestamp — how stale the position already is |
+| `input/oneEuroFilter.ts` | — | The adaptive filter + `POINTER_FILTER_DEFAULTS` |
+| `setPointerFilterParams` | `input/pointerSource.ts` | Retune `minCutoff`/`beta` live |
+| `pointerPredictedPos(world, leadMs?)` | `traits/Input.ts` | `pos + velocity × lead` |
+| `POINTER_LEAD_MS_DEFAULT` · `setPointerLeadMs` | `traits/Input.ts` | The engine-wide lead — **0, i.e. off by default** |
+| `setPointerLeadGate` · `pointerLeadGateFactor` | `traits/Input.ts` | The speed gate — no lead below `minSpeed`, full above `fullSpeed` |
+| Debug menu → **Input** | `runtime/debug/tabs/InputTab.tsx` | Measure a device: two rings (raw vs extrapolated) + a lead slider |
+
+⚠️ **The predicted point is RENDERING-only.** It is a guess about the future, so a hit-test that
+reads it resolves a tap, a drop cell or a drag threshold at a position the finger never occupied —
+on a fast flick that is a whole cell, and it would only ever appear on quick strokes, which is how
+it would ship. `pointerPos` stays the truth. Court keeps the two in separate fields for exactly
+this reason (`press.dragX/Y` vs `press.predX/Y`, `dragPoint()` vs `dragRenderPoint()`), and
+`games/court/tests/dragFx.test.ts` pins it: the picture leads by a cell while the drop still lands
+under the finger.
+
+### ⚠️ Extrapolate to a TIME, not by an OFFSET
+
+The obvious implementation — `lastEventPos + velocity × lead` — is **a known-wrong shape**, and it
+is what made the iPhone Air jitter. Input and display are asynchronous, so the newest event's age
+at render time varies by up to a full input interval every frame; adding a fixed offset to a
+position of *varying staleness* writes that phase noise straight into the pixels. Casiez et al.,
+[*Modeling and Reducing Spatial Jitter caused by Asynchronous Input and Output Rates*](https://gery.casiez.net/async),
+describe it and prescribe the fix — resample to a fixed point in **absolute time** — and Chrome on
+Android has shipped that by default since 2023.
+
+So `pointerPredictedPos` advances by `(now − sampleTime) + lead`. The age term cancels the phase
+noise; the lead term is the actual latency compensation. At 60 Hz the age varies by ~16 ms against
+a long true latency and the error was tolerable; at 120 Hz it varies by ~8 ms against a much
+shorter one, which is why the *fast* device was the one that trembled.
+
+A lead of **0 is fully off** — not even the age term applies. Disabling a feature must return
+exactly the previous behaviour, or "off" becomes a third mode nobody asked for.
+
+### The lead is SPEED-GATED
+
+The two failure modes sit at opposite ends of the speed range. Near-stationary, the latency is
+imperceptible and any extrapolation error is a visible tremor on a hard-edged object. Moving fast,
+the error is swamped by the movement and the latency is all you notice. **One fixed lead has to
+serve both and serves neither** — the same shape of problem the 1€ filter solves for smoothing,
+one level up.
+
+So the lead fades in between two speeds (`POINTER_LEAD_GATE_DEFAULTS`, live in the debug tab):
+
+| Knob | Meaning |
+|---|---|
+| `minSpeed` | below this, **no lead at all** — sits above the stationary noise floor |
+| `fullSpeed` | at or above this, the whole authored lead |
+
+⚠️ **A ramp, not a threshold.** A hard on/off jumps the drawn position by `speed × lead` at the
+crossing — about 7 px at 0.2 px/ms and a 33 ms lead — trading a tremor for a *snap*, which is worse
+because it correlates with the gesture rather than with noise. `pointerLeadGateFactor` is a
+smoothstep, so it has a zero derivative at both ends and the lead fades in with no discontinuity in
+position **or** velocity.
+
+The **age** term is deliberately *not* gated: it corrects a staleness that is known rather than
+guessed, and it is multiplied by the same near-zero velocity, so it is self-limiting.
+
+### The velocity is 1€-filtered, not EMA-smoothed
+
+A fixed smoothing constant must choose between two opposite requirements — heavy smoothing kills
+jitter but lags a fast movement; light smoothing tracks fast movement but leaves a slow one
+trembling. **Every fixed constant is wrong somewhere**, and this one was wrong twice on the *same*
+device: the A23 wanted an 83 ms lead one day and trembled at 33 ms the next. Once the position is
+advanced *between* samples, a velocity ERROR becomes a per-sample sawtooth — which is what "jitter"
+turned out to mean here.
+
+So both the smoothed position and the velocity come from the **1€ filter** (Casiez, Roussel & Vogel,
+CHI 2012 — the same author as the resampling work), whose cutoff rises with speed:
+`cutoff = minCutoff + beta × |velocity|`. Nearly still → heavy smoothing → jitter dies. Moving fast
+→ light smoothing → no lag where you would notice it. Two parameters, tuned **in this order**
+because they are close to independent:
+
+1. **`minCutoff`** (Hz) — LOWER it until a *stationary* finger stops trembling.
+2. **`beta`** — RAISE it until a *fast* drag stops lagging.
+
+Both are live in debug menu → **Input**, alongside the lead. Defaults are the paper's conservative
+starting point (`minCutoff` 1, `beta` 0), not a measurement — `beta: 0` deliberately errs toward
+lag, because lag is the symptom you can see and therefore tune away, whereas starting aggressive
+hides the jitter the filter exists to remove.
+
+⚠️ **Smooth the VELOCITY; extrapolate from the RAW position.** Filtering the base position and
+extrapolating from *that* subtracts the filter's lag from the lead — and at conservative settings
+it exceeds the lead, so switching prediction ON draws the object **behind** the finger. Measured
+during close-out: a 12-sample drag predicted x=372 against a true x=440. A feature whose on-state
+is worse than its off-state is a defect, not a tuning problem. Position noise is ~1 px; velocity
+noise times an 80 ms lead was the ~10 px tremor — only the second is worth filtering.
+
+⚠️ **Estimate velocity from the NEWEST pair, never a window average.** A window centred *N* ms in
+the past yields a velocity that is itself stale, so a requested lead of *L* advances the position
+by only *(L − N)*. Measured: a 5-sample window turned a requested 50 ms into roughly 17 ms of real
+lead — which reads as "prediction barely helps" and sends you hunting for the missing latency
+somewhere else entirely. The debug tab's rings run the same 1€ pipeline as `pointerSource` on
+purpose; a tuner that models the runtime differently is measuring the wrong thing.
+
+### ⚠️ There is no engine-wide number — the default is 0
+
+The obvious move is to ship 83 ms for everyone. **It is wrong, and measurably so.** Both of these
+were felt live, same build, same estimator:
+
+| Device | Verdict |
+|---|---|
+| Galaxy A23, 60 Hz | ~83 ms — the drag only stops trailing the finger with it |
+| iPhone Air, 120 Hz | **0 — any lead visibly JITTERS** |
+
+The reason is arithmetic, not taste. A two-point velocity divides by the sample gap, so at 120 Hz
+(~8.3 ms) one pixel of pointer noise becomes ~0.12 px/ms of velocity error, which an 83 ms lead
+multiplies into **~10 px of jitter**. At 60 Hz the gap is double, the noise term halves, and the
+device actually has latency worth cancelling. Same code, opposite outcome. A default of 83 would
+have shipped jitter to every fast device in order to fix a slow one.
+
+### ⚠️ The verdict: OFF — and it took four rounds to earn that answer honestly
+
+Prediction is **off by default** and Court declines it. Read this before re-proposing it, because
+three of the four rounds produced a *wrong* answer that looked like a real one:
+
+| Round | What was judged | Why the verdict was not trustworthy |
+|---|---|---|
+| 1 | "83 ms feels right" | Velocity came from a 66 ms window average, so the real lead was ~17 ms |
+| 2 | "even 33 jitters, off is best" | Extrapolated from the 1€-**smoothed** position — the picture drew ~68 px **behind** the finger. The ON state was worse than OFF *by construction* |
+| 3 | "33 is better; gate it by velocity" | Correct base at last, but the gate floor (0.05) sat *under* the estimator's own noise (measured median 0.065 while holding still), so the gate flickered 0↔0.6 and the ungated age term leaked ~2.5 px of varying offset |
+| 4 | **"no jittering now, much better — but off is the best"** | Correct implementation, fair test. **This is the verdict.** |
+
+The trade is latency for extrapolation error, and on Court's content the error loses: a chess piece
+is a hard-edged, high-contrast object on a still board, so any tremor reads instantly, while a few
+frames of lag on a deliberate placement gesture does not.
+
+That is a judgement about **this content on these devices** — a game with softer art, a continuous
+drag, or a lower-frequency object may well trade the other way. Which is why the mechanism, the
+tuner and `POINTER_LEAD_MS_ANDROID_60HZ` are kept rather than deleted: the next question costs a
+minute instead of a day.
+
+**The transferable lesson is the method, not the answer.** Every round's verdict was only as good
+as the implementation under it, and each defect was found by *measuring the running device* — a DOM
+control ring, a frame-time histogram, a per-frame recording of the predicted-vs-raw offset — never
+by reasoning about the code. Round 3's defects in particular were invisible to inspection and
+obvious in one 454-sample trace.
+
+**Do not re-enable it from reasoning.** Every number guessed from the hardware in this
+investigation was wrong: Android-only (it was not), scale-with-refresh-rate (it did not), 83 ms
+(the A23 later trembled at 33). Measure, or leave it off.
+
+**Adoption is also per-renderer.** The engine cannot know which entity is "the thing under the
+finger", so a game opts in by drawing at `pointerPredictedPos`. What the engine supplies is the
+mechanism, the measured constant, and the debug tab — so the next device gets a real number in a
+minute instead of a guess about the hardware, which is how both numbers above were nearly wrong.
+
+## The input watch — evidence for a gesture that did nothing
+
+The journal answers *"what did the game do"*. It cannot answer *"what did the player's finger do"*,
+and those become different questions the moment a gesture fails: a press that resolves to nothing
+emits nothing — no event, no commit, no coordinates. So the failure mode with the least evidence is
+the one players report most often ("I tried to drag it and nothing happened"). `pointerRecorder.ts`
+is the instrument for that class; the agent-facing tool over it is documented in
+[debug-tools-mcp.md](./debug-tools-mcp.md).
+
+Per press it records the down/up points, **travel distance and move-sample count**, hold duration,
+which pointer-block root swallowed it (if any), and what it resolved to. Travel and sample count are
+not padding: on the Galaxy A23 bug that produced this, *64 move samples over 1216 ms* is what killed
+the competing "the device dropped pointer samples so the drag never passed the slop threshold"
+hypothesis, and the measured 27.6 px miss is what showed the fix about to ship — a 1.2x grab
+forgiveness giving 27.31 px — would have failed by 0.3 px and looked like a different bug.
+
+**Its companion is the hit-region overlay** (`runtime/rendering/hitRegions.ts`, #139), which draws
+the shapes `hitTest` uses and plots recorded presses on top. The watch measures a miss; the overlay
+shows what was missed. Both halves came out of the same Court session, and the picture said at a
+glance what the number said only once someone thought to measure — it also killed a wrong theory
+outright (the `(i)` badge's real hit circle is visibly *smaller* than the ring drawn on screen), and
+revealed a 4.8 px dead ring between two controls that reading `hitTest` line by line does not show.
+A game publishes its geometry by calling `registerHitRegionProvider()` from the code that owns it.
+
+Two properties are load-bearing:
+
+- **Gated, and genuinely free when closed.** No listener is even attached until a window opens, and
+  nothing is captured retroactively — same contract as the journal's `@contact` Tier-2 gating. Raw
+  pointer traffic is high-frequency; an always-armed recorder would cost every shipped game a
+  listener it never reads.
+- **On DEVICE it is the only blocked-press evidence there is.** `input.pointer.blocked`
+  (`pointerSource.ts`) is emitted under `import.meta.env.DEV` only, so in a debugBuild running on
+  a phone — the surface where touch targets are actually missed — that event does not exist. The
+  gating is deliberate and stays: a blocked press is *common* (every tap on chrome is one), and
+  un-gating it would let blocked presses dominate the 10,000-event journal ring. The watch is the
+  device answer instead, because it is gated on a window nobody opens by accident, and it records
+  the blocking root's identity, which the event never carried.
+- **"Could not look" is never reported as "nothing is there."** `resolved` is a three-way answer —
+  deliberately the same three-way [`screenPick.pickAt`](../engine/packages/modoki/src/runtime/core/screenPick.ts)
+  already makes. Something was hit (`by:'game'|'ui'|'pick'`), an authority looked and found nothing
+  (`by:'none'`, naming who), or **nobody could look** (`by:'unknown'`, with the reason). Collapsing
+  the last two would answer the one question the tool exists for with a confident lie.
+
+### A canvas game must publish its own hit-test
+
+The engine cannot hit-test a canvas game. No game surface registers a pick provider (that is
+deliberate — see `screenPick.ts`'s header: selection policy is game code), so a game whose targets
+live in its own `hitTest` records `by:'unknown'` for every press until it opts in:
+
+```ts
+import { noteInputResolution } from '@modoki/engine/runtime';
+
+press.target = hitTest(x, y);
+noteInputResolution(press.target && { kind: press.target.kind, id: cellName(...) });
+// …and at release, for the drop target:
+noteInputResolution(dropTarget && { kind: dropTarget.kind, id: … }, 'drop');
+```
+
+- **Call it from the hit-test itself**, not from a second implementation that agrees today — the
+  same rule `screenPick` states for pick providers.
+- **Passing `null` is meaningful**: "my hit-test ran and found nothing" is a different, far more
+  useful answer than staying silent.
+- **It is a no-op when no window is open**, so it stays unguarded at the call site.
+- **`phase` is explicit, not inferred from timing.** A game hit-tests from a SYSTEM, a frame or more
+  after the DOM event — a quick tap is finished and recorded before the game ever looks at it. So
+  presses are claimed in gesture order from a FIFO and a `'drop'` note names the gesture whose press
+  was claimed last. Inferring the phase from "which press is in flight" mis-assigns under exactly
+  the rapid input a missed-gesture investigation involves.
+
+Worked example: `games/court/runtime/systems.ts` (`noteHit`), with the wiring pinned by
+`games/court/tests/inputWatch.test.ts` — a suite that exists because nothing else in Court would
+notice if those three calls were deleted.
 
 ## Gotchas
 

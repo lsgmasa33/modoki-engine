@@ -1,0 +1,83 @@
+<!doctype html>
+<!--
+  Boot ramp probe — standalone measurement page (#188).
+
+  WHY THIS EXISTS: the probe's thresholds (`PROBE_THRESHOLDS` in rampProbe.ts) ship null on
+  purpose and can only be filled in from REAL hardware. Getting a number off a phone otherwise
+  means a native build + deploy + a machine-wide device lease per device; this page needs none of
+  that, because the probe is plain web code. Open it in mobile Safari / Chrome on the device.
+
+  It is built STANDALONE (see build.mjs) rather than served from the dev server, for two reasons:
+  a phone pulling several hundred unbundled ESM modules over WiFi is painfully slow on exactly
+  the old hardware worth measuring, and a bundle is closer to what actually ships.
+
+  ⚠️ WebKit-on-Safari is not byte-identical to the Capacitor WKWebView a game runs in. Close
+  enough to set a threshold from; confirm a decisive number in a real build before shipping it.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Modoki ramp probe</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; padding: 16px; background: #14161a; color: #e8eaed;
+      font: 15px/1.5 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+      -webkit-text-size-adjust: 100%;
+    }
+    h1 { font-size: 17px; margin: 0 0 4px; }
+    .sub { color: #9aa0a6; font-size: 13px; margin-bottom: 16px; }
+    label { display: block; font-size: 13px; color: #9aa0a6; margin: 12px 0 4px; }
+    select, button {
+      font: inherit; width: 100%; padding: 12px; border-radius: 10px;
+      border: 1px solid #33363b; background: #1e2126; color: #e8eaed; -webkit-appearance: none;
+    }
+    button { background: #3b6fd4; border-color: #3b6fd4; font-weight: 600; margin-top: 16px; }
+    button:disabled { background: #2a2d33; border-color: #2a2d33; color: #6b7075; }
+    #status { margin-top: 16px; color: #9aa0a6; font-size: 13px; min-height: 20px; }
+    #out {
+      margin-top: 12px; padding: 12px; border-radius: 10px; background: #0d0f12;
+      border: 1px solid #33363b; font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+      white-space: pre-wrap; word-break: break-all; display: none;
+    }
+    .big { font-size: 28px; font-weight: 700; color: #7cc47f; margin-top: 12px; }
+    .warn { color: #e0a458; }
+    #build {
+      margin: 0 0 14px; padding: 10px 12px; border-radius: 10px;
+      background: #1b2a1c; border: 1px solid #2f5131; color: #9fd6a2;
+      font-family: ui-monospace, Menlo, monospace; font-size: 13px; text-align: center;
+    }
+    #build b { display: block; font-size: 11px; letter-spacing: .08em; color: #6f9a72; }
+    #reload { margin-top: 8px; background: #2a2d33; border-color: #33363b; font-weight: 400; }
+  </style>
+</head>
+<body>
+  <h1>Modoki boot ramp probe</h1>
+  <div class="sub">Measures fill + draw-call throughput. Takes about a second.</div>
+
+  <!-- Stamped at build time. If this does not match what the Mac printed, the page is CACHED and
+       any numbers it produces describe the wrong code. -->
+  <div id="build"><b>PAGE BUILD</b><span id="buildid">?</span></div>
+  <button id="reload">Force reload (bypass cache)</button>
+
+  <label for="device">Which device is this?</label>
+  <select id="device">
+    <option value="">— pick one —</option>
+    <option>iPhone 7</option>
+    <option>iPhone 8</option>
+    <option>iPhone 13 mini</option>
+    <option>iPhone Air</option>
+    <option>iPad mini (old)</option>
+    <option>iPad Pro</option>
+    <option>other</option>
+  </select>
+
+  <button id="run" disabled>Run probe</button>
+  <div id="status"></div>
+  <div class="big" id="headline"></div>
+  <div id="out"></div>
+
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

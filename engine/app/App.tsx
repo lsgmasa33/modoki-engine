@@ -14,6 +14,7 @@ import { GAMES } from 'virtual:modoki-games';
 import type { GameDefinition } from '@modoki/engine/runtime';
 import { setActiveResetPhase } from './ui/components/ErrorBoundary';
 import { audioDispose, audioResume } from '@modoki/engine/runtime';
+import { VideoOverlay } from '@modoki/engine/runtime';
 import { useKeyboardShift } from './hooks/useKeyboardShift';
 import { checkAppOtaUpdate, subscribeOtaGate, type OtaGateState } from './ota';
 import OtaRestartGate from './ui/components/OtaRestartGate';
@@ -162,6 +163,13 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
         // Hydrate this game's persistent prefs before scene load, so systems that
         // read saved progress at spawn see it. Namespaced by gameId; ungated by
         // platform (web + editor persist to localStorage, device to Preferences).
+        //
+        // ⚠️ ORDERING IS LOAD-BEARING FOR THE QUALITY TIER TOO (#121 P3d). The renderer resolves
+        // its tier at bring-up and reads the PLAYER's saved choice through `playerTierStore`,
+        // which reads this cache SYNCHRONOUSLY. `setConfigReady(true)` below is what mounts
+        // Scene3D, so this await must stay ahead of it — move it after and a player's chosen tier
+        // silently reads as null on every launch, falling back to the project setting with no
+        // error anywhere.
         await PlayerPrefs.init({ namespace: gameId, backend: selectDefaultBackend() });
         if (cancelled) return;
         if (def.resetPhase) setActiveResetPhase(def.resetPhase);
@@ -346,6 +354,10 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
           ) : (
             <DefaultGameUILayer />
           )}
+          {/* Cutscene layer — above the game + UI, below the loading/OTA gates (a
+              download prompt must still win over a movie). Renders nothing unless a
+              presentation-mode clip is playing. */}
+          {__MODOKI_MODULE_VIDEO__ && <VideoOverlay />}
           <LoadingOverlay
             visible={!initialized || transitioning}
             progress={otaGate?.phase === 'downloading' ? {

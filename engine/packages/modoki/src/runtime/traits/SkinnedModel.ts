@@ -26,4 +26,9 @@ export const SkinnedModel = trait({
    *  on/off (`EntityAttributes.isActive`, which also cascades to children); both must be
    *  true to draw. */
   isVisible: true as boolean,
+  /** Shadow-cast mode — see `Renderable3D.castShadow`: `'auto'` derives it from the material
+   *  (opaque casts, transparent doesn't), `'on'`/`'off'` force it. */
+  castShadow: 'auto' as 'auto' | 'on' | 'off',
+  /** Receive shadows cast by other objects. Defaults to true — today's unconditional behaviour. */
+  receiveShadow: true as boolean,
 });

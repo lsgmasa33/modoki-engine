@@ -78,6 +78,95 @@ viewport does begin** — a 2D project on which the user opens a Scene panel any
 normal renderer-health reporting. A definitive renderer-init FAILURE is never suppressed:
 a viewport that tried and threw is a real error whatever `render3d` says.
 
+### Menus, and how a host menu changes after boot
+
+A host registers menus through `createEditor({extraMenus})`, and `EditorApp` renders them into the
+in-window `MenuBar` **and** mirrors them into the OS application menu under Electron (a
+serializable spec pushed over IPC, whose click ids relay back). An item may carry a `submenu`,
+**one level deep** — deeper nesting is dropped by both renderers on purpose. Electron ignores a
+click on a submenu parent, so anything that must stay actionable belongs INSIDE the submenu too;
+that is why the Build menu repeats "Build now" there.
+
+`createEditor()` runs once, so a menu whose labels depend on something discovered later cannot be
+built at setup time. `setExtraMenus()` replaces the whole registry and bumps a version an external
+store publishes; `EditorApp` subscribes to it, rebuilds the tree and re-pushes the Electron spec.
+Whole-registry rather than a patch: the host owns the shape it registered, and a merge would make
+"remove an item" unexpressible.
+
+**An item's id carries its LABEL, not just its position** (`menuSpec.ts` — `Build#0#2:build-now`),
+and that is what makes a rebuildable menu safe. Electron's `MenuItem` click closure captures the id
+when the template is built, macOS keeps displaying an already-open menu after
+`setApplicationMenu` replaces it, and the renderer swaps its action map immediately — so a click on
+a stale item dispatches an OLD id into a NEW map. With purely positional ids that *resolves*, to
+whatever now sits at that index: at boot the Build menu's iOS submenu is a single placeholder row,
+so `Build#0#2` is "Build now"; ~2s later the device listing lands and index 2 is the third iPhone,
+whose action picks that phone and starts a build to it. Including the label makes the stale id miss
+instead, and the relay logs the miss rather than failing silently. The index stays in the id
+because two rows can share a label — device names repeat.
+
+### Build → picking the target device
+
+`Build → iOS Device` / `Android Device` name the device they will build for, and their submenus
+switch it (#170). Each row says what picking it means — a devicectl-reachable iPhone reads
+"hands-free install", a pre-iOS-17 one "Xcode handoff, ⌘R", because that is the consequence the
+old menu could not tell you and it is decided by whether `iosDevicectlId` ends up set
+(`planIosInstall`). Picking writes `user.device.*` into the gitignored `project.user.json` through
+the same `/api/project-settings` route Project Settings saves to, as a partial patch — so the two
+surfaces can never disagree, and hand-typed values this menu does not offer survive.
+
+**Picking a device also STARTS the build**, once the write has landed (a build against a target
+that failed to save would go to the previous device while the menu claimed otherwise). That is the
+motion the picker exists for — you open it to put this build on that phone, and a
+select-then-confirm split makes the common case two trips through a menu. `Build now → <device>`
+below it builds the CURRENT target without changing it.
+
+The cost is that a single menu click starts something that **cannot be stopped**: the build
+progress modal's only control dismisses its own UI, while the backend SSE build runs to
+completion. Hence `Set target without building…`, which routes to Project Settings rather than
+duplicating the device list — a second copy is where the two would drift apart, and both menu
+renderers cap nesting at one level on purpose.
+
+Three things the shape encodes:
+
+- **The listing is fetched once after boot, never on the click path.** Its iOS half is two `xcrun`
+  shell-outs (~1.6-2.9s uncached, 10s-cached server-side); Electron exposes no will-open event for
+  an application menu, so the alternatives were a poll or a stale menu. Hence the explicit
+  **Refresh devices** row.
+- **A device another clone is debugging is annotated, not disabled.** The claim (#149) is the
+  *debug lease*; installing a build does not need it, so `debugged by modoki-ai3` is information,
+  not a refusal. Same for an `unauthorized` Android — that state is fixed ON THE PHONE, and
+  blocking the pick would just send you back through the menu afterwards.
+- **Android keeps an explicit "Default (first adb device)" row.** An empty `androidDeviceId` means
+  "whatever adb picks", and a picker that could only set a concrete serial would quietly destroy
+  that meaning.
+
+A configured device the listing cannot see (unplugged, or hand-typed) still gets a checked
+`— not attached` row rather than vanishing: it is what the next build would use, and a menu with
+nothing checked would be lying about that. A listing that could not be READ says so separately
+("Device list not loaded yet") — "no answer from the listing" and "no phone attached" have
+different fixes, and the second sends you to check a cable that was never the problem.
+
+**Two refusals guard the pick**, both pure and unit-tested (`buildRefusal`, `pickRefusal`):
+
+- **A second concurrent build is refused.** `/api/build` takes no lock, `runBuild` fires an SSE
+  request per call, and a native OS menu is not covered by the DOM progress modal — so the modal
+  only *looks* like it is holding the door. Before every device row was a build this took a
+  deliberate second trip through the menu; now "wrong phone — click the right one" is the natural
+  gesture, and it would put two `xcodebuild`/gradle pipelines on one project dir, both reporting
+  into the single shared `buildStatus`. A build that already FAILED does not count as running: its
+  modal is merely still up, and refusing there would make "dismiss a dialog" a prerequisite for
+  retrying.
+- **A pick is refused while Project Settings is open.** `user.device.*` has two writers, and they
+  write differently: this menu sends a partial patch, while the dialog snapshots the whole config
+  when it OPENS and posts that snapshot on Save. So a pick made while it sits open is silently
+  written back to the old device — even when the user only meant to edit the app name — and the
+  menu then re-reads disk and quietly agrees with the stale value. A lost update nobody is told
+  about is worse than a refusal naming the reason.
+
+The pure row-building and both refusals are `engine/app/editor/buildTargetMenu.ts` (unit-tested
+without a phone); the fetching, the patch POST and a generation guard against out-of-order
+listings live in `engine/app/editor/setup.ts`.
+
 ### Project Settings — the save contract
 
 `ProjectSettingsDialog` edits the schema `createEditor()` registered; it `GET`s
@@ -179,6 +268,132 @@ explicit key list (unknown keys nested inside a declared section survive).
 ---
 
 ## Panels
+
+### A new dropdown in editor chrome must be DOM, not a native `<select>` (#149)
+
+A native `<select>` renders its popup in a separate OS layer that `sendInputEvent` cannot reach —
+`docs/debug-tools-mcp.md` already lists it among the things trusted input needs an opener tool to
+work around. So a `<select>` added to editor chrome is a control **neither the agent surface nor the
+Playwright specs can open**, and since the agent owns live verification of this surface (nobody else
+drives it), that means it ships unverified.
+
+Build the affordance out of ordinary DOM instead: a `role="combobox"` button plus a `role="listbox"`
+of `role="option"` rows, closing on Escape and outside-click, each row carrying a stable
+`data-testid` to aim at. The AI panel's device picker (`DeviceConnectSection.tsx`) is the worked
+example — it looks and behaves like a pull-down and is fully drivable by `modoki_tap {selector}`.
+
+This applies to NEW chrome. The existing `<select>`s (Inspector enum fields, device presets) are not
+worth a sweep on their own; convert one when you are already changing it and it blocks a check.
+
+### Where a panel's LOGIC belongs (and what is tested)
+
+A panel `.tsx` holds JSX, hooks and imperative wiring. **Its decisions belong in a
+plain `.ts` module beside it, and that module is where the tests go** — never a jsdom
+mount of the panel, which asserts the mock. The split is three layers: the `.tsx`
+keeps the DOM wiring, the `.ts` holds the decision as a pure function, and one e2e
+spec covers the real browser gesture.
+
+Measured (2026-08-04, `npm run coverage`): editor `.ts` is **79.8%** line-covered against
+editor `.tsx` at **12.9%**. Six large panels are at literal 0% — `SceneView` (2,304 lines),
+`Assets` (781), `AnimationEditor` (469), `EditorApp` (393 — 451 before #126),
+`ParticleEditor` (317), `TimelineEditor` (258). That gap is the strategy working, not
+failing: extraction moves decisions somewhere testable and leaves the JSX behind.
+
+The three that are *not* at zero — `SkinCanvas` 6.2%, `SkinEditor` 7.25%, `SpriteEditor`
+7.63% — are the ones whose already-pure helpers were exported and tested in place (see
+below). Exporting from a `.tsx` raises that `.tsx`'s own number; extracting *out* of one
+does not. Neither figure is a target.
+
+Extracted decision modules:
+
+| module | what it decides |
+|---|---|
+| `panels/assetListing.ts` | Assets filtering, sprite/type grouping, the visible-order walk that drives keyboard nav |
+| `panels/assetKeyCommands.ts` | every Assets keystroke → a command (platform-dependent delete chord, type-ahead) |
+| `panels/assetSelection.ts` | Assets click + drag selection policy |
+| `panels/assetOps.ts` | import/re-import planning, the delete sidecar rule, rename validation |
+| `panels/skinParts.ts` | rig part list edits (add/remove/reorder/rename/visibility), part geometry (`uvToPosAffine`, `partAngle`, `bboxCenter`), and the selection remap that must agree with them |
+| `scene/marqueeSelect.ts` | SceneView 2D box-selection: threshold, enclosure, selection merge |
+| `scene/pickSelection.ts` | the shared 2D + 3D viewport pick rule |
+| `scene/multiTransform.ts` | group-transform math, incl. which Transform fields each gizmo mode writes |
+| `utils/layoutStore.ts` | layout persistence — the restore precedence ladder, corrupt-layout self-heal, stale-tab retitling, the Load-Layout ordering rule |
+| `utils/layoutNames.ts` | layout name sanitising + the reserved autosave name |
+
+All are unit-tested, but "has a test file" is not "is covered": `assetOps.ts` sits at 56%
+(the rest is `/api/*` IO wrappers), and `skinParts.ts` sat at 58% with **five** exports no test
+executed — the issue that recorded it (#163) said four, having counted by reading the issue rather
+than the file. Check `npm run coverage`, and check it against the SOURCE, not against a list
+someone wrote down: those five are covered now, and the way the miscount survived into a ticket is
+the argument for measuring.
+
+Some panel logic is **already pure and at module scope but not exported**, so nothing
+can import it and nothing tests it (SkinCanvas's skinning math, SpriteEditor's slice
+geometry). Exporting it is the cheapest coverage in the editor: no refactor, so no
+behaviour risk. Prefer it over restructuring a component.
+
+**Two traps this work hit, both worth knowing before you add a panel helper:**
+
+1. **Duplicated private helpers — and deleting the original is NOT enough.** `.rig2d.json`
+   bone coercion existed in **four** places: `SkinEditor`, `SkinCanvas`, `scene/skinPrefab.ts`,
+   and inline in `runtime/skinning/rig2dTypes.ts`. The first pass unified two and declared
+   the class closed; a body-identity sweep found the rest, and the runtime's copy had
+   **already diverged** (it coerced numerically and preserved `noScale`; the editor's three
+   did neither). Testing one copy while others survive is the failure mode that makes this
+   work negative-value. So: look for a twin before writing a panel-local helper, put the one
+   copy in the layer that **owns the format** rather than in an editor-local module, and
+   **sweep the whole layer before claiming a duplication is resolved** — a scan for identical
+   top-level function bodies across `editor/**` takes a minute. (Same shape, different empty
+   case: `centerOfVerts`/`centerOf` → `skinParts.bboxCenter`, where the divergence was
+   meaningful and was preserved at the call sites instead of flattened.)
+2. **Not every panel yields to extraction.** SceneView is ~2,300 lines of *event
+   orchestration* — state spanning `pointerdown`/`move`/`up`, `stopPropagation`,
+   imperative renderer calls — and three seams moved only seven executable lines out
+   of it, where a similar effort on `Assets.tsx` moved 76. Extracting orchestration
+   re-expresses control flow, which is where behaviour quietly changes. "Honestly
+   untestable without an integration harness" is an acceptable answer for parts of
+   SceneView and `EditorApp.tsx`.
+3. **A list edit and the selection index are ONE decision — give them one entry point.** A
+   panel that edits a list (parts, tracks, slices) almost always keeps the selected item's
+   INDEX in separate state, and the two must be remapped together. Split them and they drift,
+   silently: `reorderPart` no-opped on an out-of-range index while its partner
+   `reorderActiveIndex` returned the raw target, so a reorder that changed nothing could still
+   move the selection (#163). Worse, the Parts ↑/↓ buttons called `movePart` and remapped
+   **nothing** — moving the SELECTED part left `activeSkinPart` on its old slot, so the
+   selection jumped to whatever swapped into it, and because `withActivePart(def,
+   activeSkinPart)` backs tessellate / auto-weight / sprite-assign, the next edit wrote to the
+   wrong part's mesh. The shape of the fix generalises: **one callback owns "edit the list AND
+   move the selection"** (`SkinEditor.reorderParts`), every gesture routes through it, and any
+   precondition the two halves share lives in ONE predicate they both call
+   (`reorderIsNoop`) — never two copies that must be kept in step. A move-by-one is just a
+   reorder, so the separate `movePart` helper was deleted rather than left beside the correct
+   path as the easier thing to reach for.
+
+**The `EditorApp.tsx` verdict (#126), for the record — it was NOT "no".** The plan expected
+the editor shell to be the hardest case and allowed the phase to end in a written decline.
+It did not need to. `EditorApp.tsx` sat at 0/451 lines, but ~58 of those were the
+**layout-persistence block: already pure, already at module scope, merely unexported** — the
+cheap category, not the SceneView one. Moved verbatim to `utils/layoutStore.ts` (34 tests,
+100% covered), which is the same move `utils/layoutNames.ts` made earlier for the same reason.
+The measurement that settles the argument: those two modules sit at 100% while the `.tsx` they
+came out of sits at 0.
+
+Two signature changes were needed and both are dependency injection, not redesign:
+`panelLabel(id, customPanels)` takes the custom-panel list instead of calling
+`getCustomPanels()` (importing `createEditor` into `utils/` would drag the whole editor back
+in, defeating the move), and `resetLayout` split into a testable `clearStoredLayout()` plus the
+`window.location.reload()` that stays in the component.
+
+**What genuinely remains untestable there is the other ~393 lines, and the reason is
+structural**: they are one 650-line React component plus six modal components — 34 hooks, the
+menu tree built from live callbacks, the Electron OS-menu bridge, project open/close, HMR-epoch
+wiring. There is no decision in it that is separable from the hook that owns its state; every
+candidate is orchestration, which is the Phase-2 shape. That part needs an integration harness,
+and one e2e spec is the honest coverage for it — which the suite already has.
+
+**The transferable lesson**: before declaring a `.tsx` untestable, grep it for module-scope
+`function`/`const` declarations that take no hooks. "Most Electron-entangled panel in the
+editor" was true of `EditorApp.tsx` as a whole and false of a seventh of it, and the plan's
+prediction was made from the file's reputation rather than from reading it.
 
 Panels live in `editor/panels/`:
 
@@ -449,6 +664,121 @@ single source of truth in `editorStore`**, so edits push to the **global** undo 
 consecutive same-field edits **coalesce** into one undo entry within a ~500 ms window; and
 persistence is a **debounced `/api/write-file`** (~400 ms) that also re-seeds the relevant
 runtime cache so any live entity referencing the asset updates next frame.
+
+#### The binding is a PATH, so every file move must update it (#186)
+
+The five binding editors — Particle, SpriteAnim, Skin, Animation, Timeline — each hold
+`editing<X>Asset`, and the debounced write above targets **that path**. So any operation
+that moves or removes the file without telling the panel makes the next edit write to the
+*old* location, and because a write SUCCEEDS, nothing reports it:
+
+- **Delete** → the file you moved to the trash comes back on the next edit.
+- **Rename / move** → the asset **forks**. Measured on `games/timeline-demo`: renaming a
+  bound timeline and then editing it re-created the old file with the new content while the
+  renamed file kept the old. Your edits go to a zombie; the renamed asset silently stops
+  receiving them.
+
+`panels/assetEditorBindings.ts` owns the repair, and the rule is **delete unbinds, move
+repoints** — a moved asset survives (its GUID and `.meta.json` sidecar travel with it), so
+the binding is repointed via `remapEditingAssetPath` rather than reopened: reopening
+re-fetches from disk and would discard the in-memory doc, which after a rename is the newer
+of the two.
+
+**Six call sites, and they are the whole contract** — asset delete (`executeDeletion`),
+folder delete (`handleDeleteFolder`, which deliberately does *not* route through
+`executeDeletion`), asset rename, cut/paste move, folder rename, and drag-drop into a folder
+(`handleFilesDrop`). The four move sites remap in their **undo/redo closures** too, since
+those move the file back — and each closure gates the remap on the move actually succeeding:
+`/api/move-file` 409s when the destination exists, and repointing a binding at a path the
+file is *not* at is the forking bug itself.
+
+Two sweep lessons are baked into that list. The first version wired only `executeDeletion`
+and missed four; a follow-up sweep for `moveFileTo` call sites still missed `handleFilesDrop`,
+which uses the sibling helper **`moveFile`** (folder target) instead. Grep for the *behaviour*
+— "what changes an asset's path?" — not for one helper's name. A copy/paste is deliberately
+absent: it creates a new file and leaves the original in place, so nothing bound has moved.
+
+Folder matching is **segment-boundary**, not `startsWith`: renaming `/assets/anim` must not
+capture `/assets/animations/…`. Adding a sixth binding editor means adding a row to
+`ASSET_EDITOR_BINDINGS`; a panel that forgets it gets this bug back with no new symptom.
+
+**Known gap, accepted:** `useDebouncedSave` cancels a pending write on unmount, so closing a
+panel within ~400 ms of an edit drops that write. Because closing a tab keeps the binding
+(below), the store holds the newer doc and the next edit re-saves it — the loss only
+materializes across an editor restart.
+
+#### Closing a panel KEEPS its binding, but drops the flags it owns
+
+Deliberate, and the opposite of the delete case above: reopening an asset editor lands back
+on what you were editing. (FlexLayout renders a tab lazily but keeps it mounted once shown,
+so merely *switching* tabs never unmounts a panel — only a real close does.)
+
+What a closed panel must **not** keep is state naming a live recorder or preview that no
+longer exists. `AnimationEditor` already dropped the record HOOK on unmount but left
+`isRecording` true, and `TimelineEditor` already tore down its preview SESSION but left
+`isPreviewPlaying` true — a toolbar reading "recording" for a panel you closed, and
+`get_editor_state` reporting it to agents as truth. Both now clear in the unmount cleanup
+that was already there, with **empty deps** so dragging a tab between tabsets re-mounts with
+the flags down rather than tearing out the binding.
+
+#### Guard: an editor-store action with no caller is a dead feature
+
+`tests/architecture/editorStoreActionsReachable.test.ts` fails when any function-typed
+`EditorState` member is never called outside the store. This is the repo's dominant
+"unreachable mechanism" shape (see [CLAUDE.md](../CLAUDE.md)) caught at the cheapest possible
+place, because *"was this ever called?"* is statically answerable.
+
+It exists because `skinWeightView`/`setSkinWeightView` had **zero** callers for their whole
+life, so the SceneView weight view could not be turned on at all (#181 — the branch was
+correct, the button simply did not exist). On its first run the guard found three more
+(`closeAnimationEditor` / `closeTimelineEditor` / `closeParticleEditor`), which is how the
+asset-binding bug above was found. The check is permissive on purpose — any reference
+outside `editorStore.ts` counts, including from a test — and it excludes its own file from
+the corpus, since naming an orphan in an allowlist would otherwise launder it.
+
+### The asset Inspector — two rules that have each failed three times
+
+The Inspector's asset view (`Inspector.tsx`) is the door to everything above: it renders a
+per-kind branch, and for any kind it does not recognise it prints "No actions for `<type>`
+assets". Both halves of that sentence have gone wrong repeatedly, in ways nothing failed on,
+so both are now enforced rather than remembered.
+
+**1. Every `AssetType` gets an action.** The recognised-kinds list used to be a string array
+written inline in the JSX, kept in step with the branches above it by hand. It drifted three
+times — `video` and `timeline` each shipped a working backend and editor with no Inspector
+entry at all, and `shader` drifted the other way, rendering `ShaderAssetView` *and* a cheerful
+"No actions for shader assets" underneath it. Every instance was found by a human reading the
+type union, never by a test. So `AssetType` is now **derived from the runtime `ASSET_TYPES`
+array** (`runtime/loaders/assetManifest.ts`) — making the set enumerable is the whole point —
+and the list lives in `assetViews/assetActions.ts` as `ASSET_TYPES_WITH_ACTIONS`, beside the
+views where a unit test can import it without mounting a panel.
+`packages/modoki/tests/editor/assetInspectorCoverage.test.ts` pins the two against each other
+**in both directions**; only one direction shows up as an empty panel, which is exactly why
+the shader case survived a sweep that was looking for empty panels.
+
+**2. A preset `<select>` must splice in the value it is bound to.** An HTML `<select>` whose
+`value` matches none of its `<option>`s does not render empty and does not warn — it displays
+its **first** option. A `.meta.json` holding a legal but non-preset number therefore renders
+as a *different* setting than the asset has, with nothing in the UI to say so (measured:
+`video.quality: 24`, an ordinary CRF, displaying as "18 — near-lossless"). Wrap the list in
+**`withCurrentValue(list, boundValue)`** (`assetViews/importSettingOptions.ts`), which splices
+the bound value in and keeps it editable — the tempting alternative, snapping to the nearest
+preset, silently rewrites an authored file. Skip the splice only while a multi-select is
+showing its "mixed" placeholder, where there is no single value to be honest about.
+
+The second rule is guarded **statically**, and the reason is worth keeping: the helper was
+already written, correct and unit-tested when the fix was declared done against the two views
+that had been reported. A close-out sweep then found **seven** more unspliced numeric selects
+— atlas page size, model texture max-size and UASTC level, three font controls, and a *second*
+UASTC select in the very file the fix had just edited. Testing a helper proves nothing about
+its call sites, and the call sites are where every instance of this bug has lived. So
+`tests/architecture/importSettingSelectsSpliced.test.ts` requires every option-producing
+`.map()` under `assetViews/**` to either splice or name itself in a documented exemption list
+(the exemptions are all string-valued or dynamically-built lists).
+
+Complementary, not redundant: `tests/assets/importSettingsOptions.test.ts` separately asserts
+every import-setting **default** appears in its own option list. Splicing can never reveal a
+bad default — a spliced default looks perfectly correct in the dropdown.
 
 ### Animation Editor
 
@@ -732,6 +1062,29 @@ Three things make it worth reading rather than just writing:
   outlives the launcher to write the `EXIT` line, so the pairing is the liveness signal.
 
 Logging is best-effort throughout: it must never take down a launch.
+
+### Stopping an editor
+
+`npm run editor:stop` (`engine/scripts/stop-editor.sh`) is the counterpart to the launcher. It
+SIGTERMs this clone's Electron main process first — the editor owns the Vite it spawned and
+stops it on quit, so quitting the app is what produces a clean teardown *and* lets the launch
+log's background waiter write its `EXIT` line. A straggler Vite is swept only if the editor died
+uncleanly. Every match is anchored to this repo's absolute paths, so a sibling clone's editor is
+never touched (#69); the matcher itself is shared with the launcher in
+`engine/scripts/lib/repo-reap.sh`.
+
+Two things that look like they should stop an editor and do not (#129):
+
+- **`npm run dev:stop`** is for a standalone `npm run dev`. It used to kill the editor's Vite as
+  well — leaving the app window up with a dead dev server behind it, which presents as *"the game
+  is broken"* rather than *"something was stopped"*, and once cost a debugging session chasing a
+  phantom game bug. It now identifies an editor-owned Vite by the `--configLoader runner` flag
+  `devServer.ts` passes, skips it, and says so. (Guarded by
+  `engine/tests/architecture/devStopEditorCarveOut.test.ts`, because that flag exists for a
+  packaging reason and nothing else would notice if it went away.)
+- **`POST <backend>/api/exit`** 404s. `/api/exit` is a *Vite dev-server* route, so it answers on
+  the Vite port (5175), not on the backend port that `MODOKI_BACKEND` and the launch banner
+  advertise — aiming it at the port you were told to use cannot work.
 
 ### UI Zoom (VS Code–style)
 

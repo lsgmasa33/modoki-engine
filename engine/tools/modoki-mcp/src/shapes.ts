@@ -28,15 +28,20 @@ export const entitySpec = z.object({
   guid: z.string().optional(),
   name: z.string().optional(),
   id: z.number().optional(),
-  surface: z.enum(['game-3d', 'game-2d', 'scene-view']).optional()
+  surface: z.enum(['game-3d', 'game-2d', 'scene-view', 'game-ui']).optional()
     .describe("Which on-screen surface to aim in. REQUIRED for a 2D/3D entity — including when " +
-      'only one viewport has it — and REFUSED for a UI entity (a single DOM node has no surface ' +
-      'to choose). A 2D/3D entity is often on screen TWICE: with the Scene and Game panels both ' +
+      'only one viewport has it. For a UI entity it is OPTIONAL but becomes REQUIRED when the ' +
+      "entity resolves to more than one DOM node: the editor mounts a UI renderer in BOTH the " +
+      "Scene panel's preview frame ('scene-view') and the Game panel ('game-ui'), so with both " +
+      'open every full-screen overlay, modal and HUD button has two live nodes and the aim is ' +
+      'refused until you say which. A shipped game (and an editor with one host mounted) has ' +
+      'exactly one node, where it stays optional. A 2D/3D entity is often on screen TWICE: with the Scene and Game panels both ' +
       'open, each measures it through its own camera. "Author it in the SceneView" and "play it ' +
       'in the GameView" are different intents, so stating which is how a call keeps meaning the ' +
       'same thing when the layout changes — and how a wrong assumption becomes a refusal that ' +
       "names the real surfaces instead of a success on the wrong viewport. 'scene-view' = the " +
-      "editor authoring viewport; 'game-3d'/'game-2d' = the running game."),
+      "editor authoring viewport (3D/2D authoring AND the UI preview frame); 'game-3d'/'game-2d' " +
+      "= the running game's canvases; 'game-ui' = the running game's DOM UI layer."),
   allowOccluded: z.boolean().optional()
     .describe('Aim at the entity even when the surface\'s own hit-test says something else is ' +
       'in front of it, and report what was actually hit. Default false: an occluded `entity` ' +
@@ -49,7 +54,8 @@ export const entitySpec = z.object({
   'Aim at a SCENE ENTITY by {guid} | {name} | {id} — resolved to its live screen rect INSIDE ' +
   'this call, so there is no read-then-tap race. Prefer guid: runtime ids are reassigned on ' +
   'every scene reload. A name matching several entities is REFUSED (not first-match). A 2D/3D ' +
-  'entity additionally REQUIRES `surface`. The response reports ' +
+  'entity additionally REQUIRES `surface`, and a UI entity requires it whenever it is mounted ' +
+  'in more than one panel. The response reports ' +
   '`entity` (who resolved), `surface` (WHICH on-screen copy was aimed at), `occluded`, and ' +
   '`occlusionScope`: "element" for a UI entity (a real DOM comparison — trustworthy); "entity" ' +
   'for a 2D/3D entity on a surface with a registered pick provider, where the surface\'s own ' +

@@ -72,6 +72,59 @@ fronts the synthetic reply with the banner when a trusted route was possible in 
 - **WDA**: a gesture is ONE actions call, and W3C defines `DELETE /actions` to release stuck
   pointers. So it releases, then **allows** the synthetic fallback — the user still gets their input.
 
+### The CDP tunnel has a lifetime, and it ends at `resetDeviceCdpSession`
+
+The Android channel rides an `adb forward tcp:<port> → localabstract:webview_devtools_remote_<pid>`
+that discovery creates. `<port>` is per-clone (`resolveDeviceCdpPort` = `9333 + (backend − 5179)`),
+so clones never contend — which is exactly why a leaked rule here is a *lifecycle* bug and not a
+collision, and why it stayed invisible: `deviceCdpAdb.removeForward` shipped with **zero call sites**
+and nothing ever removed a CDP forward at all (#160). Three dangling rules were found on this Mac
+pointing at webview pids of processes that were long gone.
+
+The rule now:
+
+- **`resetDeviceCdpSession()` is the single teardown**, and it removes the forward as well as
+  closing the socket. Closing the socket alone is half a teardown.
+- **A lease `disconnect()` calls it** — unconditionally, not gated on `useAdb`. The session cache is
+  process-global and keyed by serial (#149), so a lease that swaps phones must not inherit the
+  previous device's route. `disconnect()` also runs at the head of every `connect()`.
+- **Discovery cleans up after a candidate it declines.** Each probe `forward`s onto the same port, so
+  a rejected candidate is invisible while another follows it — but the last one to fail used to
+  survive the whole call, leaving a rule for a socket discovery had just declined.
+- **Removal is best-effort and never throws.** The failure being fixed is a rule *left standing*;
+  throwing out of the cleanup would strand the teardown that follows it. It warns instead.
+
+#### …but that teardown is the SECOND line of defence. Startup reclamation is the first.
+
+Everything above runs only when the session ends *politely*. `disconnect()`'s one production caller
+is the explicit `/api/device/disconnect` route, so the resources come back when a human clicks
+Disconnect — and leak on the far more common ending: quitting the editor with a device connected.
+That is exactly the state #160 was reported from ("no editor was running for any of the three"), and
+the first fix did not reach it.
+
+**A process-exit hook is NOT the answer, and that is measured rather than assumed.**
+`process.on('exit')` / `SIGINT` / `SIGTERM` handlers registered in the backend are installed under
+Electron and then never fire — Chromium's browser process takes the signal and terminates. Probed
+directly: the log shows the install line, no handler line after it, `Electron exited with signal
+SIGTERM`, and both rules still standing. Even if it did fire, `kill -9`, an OOM and a crash all skip
+it — the three ways an editor most often dies badly.
+
+So the lifetime is closed at **startup** instead — `reclaimStaleForwardsAtStartup()`, called by both
+backend hosts (`startBackendServer` in Electron, the Vite plugin's `configureServer` under a bare
+`npm run dev`), which no manner of dying can skip. Same shape the device-claims file already uses: a
+claim is expired by pid-liveness **on read**, not by a polite release. Safe because both ports are
+derived per clone, so a rule on one of our own ports at startup can only be our own leftover — this
+is not a sweep of "stale-looking" rules in general, which would be #158.
+
+⚠️ **The unit tests stub the adb seam, so they are necessary and not sufficient** — that stub is how
+the dead `removeForward` went unnoticed in the first place. The check that proves it end to end:
+
+```
+1. connect + one trusted input   → tcp:<host> and tcp:<cdp> both present
+2. kill the editor (SIGTERM)     → both STILL present   ← the exit hook does not save you
+3. start the next editor         → both gone, one `[device] reclaimed …` line each
+```
+
 ## WebDriverAgent lifecycle
 
 **Provisioned** (`engine/toolchain/wdaProvision.ts`) and **running** (`wdaLauncher.ts`) are different
@@ -95,11 +148,93 @@ build, the per-machine signing, and the expiry rule.
   the next tap. Nothing is stranded either way: the agent is still owned by the lease, so
   disconnecting stops it. A launch whose **process exits** is reported differently (a signing
   failure looks like that), and there the next call does start fresh.
+- **At most one launch PER MACHINE, not merely per process** (#149). The one-launch guard above is a
+  module-level `child` handle, so it could only ever see launches this backend started — and with
+  four clones running concurrent sessions, the rival agent came from a *sibling clone*, which that
+  handle cannot see. So the launch now takes a machine-wide claim on the phone
+  (`~/.modoki/device-claims.json`, keyed `ios:<udid>`) before spawning, released by `stopWda`. A
+  second clone is refused with the holder named, and — because a failed launch is never fatal here —
+  that refusal degrades to synthetic with the usual banner rather than breaking the session. Expiry
+  is pid-liveness + a 12h TTL, so a crashed editor never leaves a phone locked. See
+  [debug-tools-mcp.md](debug-tools-mcp.md) § "Several phones attached".
 - **Torn down with the lease** — one lease owns both channels, so there is exactly one answer to
   "who holds this device", and disconnecting can never strand a signed agent on the phone. Losing WDA
   **degrades input; it does not drop the lease** — screenshots and Percept reads keep working.
-- **One-time config on a Mac with several paired iPhones**: set `MODOKI_IOS_DEVICE_UDID`. Auto-launch
-  refuses to guess which phone to run a signed agent on.
+- **A launch failure QUOTES xcodebuild rather than guessing** (#144). The child's stdout is still
+  discarded — a test runner's log is not something an input op should stream — but its **stderr**
+  is piped into a 20-line ring buffer, and on a non-zero exit the most specific line is what the
+  caller is told (`xcodebuild: error: …`, `Cannot test target …`, and the signing/provisioning
+  lines, ranked; see `pickWdaFailureLine`). The old message stated *"check the build is still
+  signed (Build Support → iOS)"* unconditionally, as though it were the diagnosis — and on the
+  iPhone 8 it was simply wrong: re-signing could never have helped, and the hour spent trying is
+  what this buys back. The hint survives only as the fallback for when nothing was captured.
+  "Do not stream the log" and "keep nothing at all" were always different decisions; only the first
+  was intended. This is the one error path an agent cannot investigate for itself — it cannot
+  re-run `xcodebuild` and read the output — so whatever this message says *is* the diagnosis.
+
+  The **device listing** had the same defect one call earlier and was fixed with it: `listDevices`
+  ran devicectl with stderr discarded, so a failure surfaced as *"could not list iOS devices
+  (Command failed: xcrun devicectl …)"* — the command echoed back, naming nothing. `describeExecFailure`
+  now prefers the tool's own line over Node's `Command failed:` message. Found by sweeping the
+  pattern rather than the reported symptom; a grep for `stdio: 'ignore'` across `engine/` returns
+  those two plus existence-probes and `pkill`s, where there is genuinely no output to want.
+- **The launch is tied to the LEASED phone, not to what is plugged into this Mac** (#146). The
+  device list comes from `xcrun`, which knows nothing about the lease, so `resolveIosDevice` takes
+  the leased device's own hardware report (`DeviceConnectionManager.deviceHardware()`) and matches
+  it against the listing **between** the env pin and the connected-tunnel heuristic.
+
+  Without it, the sole-live-tunnel rule picked a phone on evidence with no relation to the lease:
+  an iOS lease is a WiFi address, and the phone at that address need not be the one on the cable —
+  so with one non-leased iPhone connected, the editor would confidently start a signed 60-second
+  agent on **that** phone. Milder than #142's cross-device *input*: the readiness probe targets the
+  lease host, so the stray agent never answers and the caller falls back to synthetic with the
+  usual banner. The cost is a surprise agent on someone else's phone and a launch failure that
+  names nothing about the mismatch.
+
+  **What is compared, and why those two fields.** iOS forbids an app reading its own hardware UDID,
+  and `identifierForVendor` appears in no `xcrun` listing — so no id the phone can see is
+  comparable with anything the Mac knows. Two strings are: `hw.machine` is byte-identical to
+  devicectl's `hardwareProperties.productType` (`iPhone18,4`), and the system version matches
+  `deviceProperties.osVersionNumber`. **The model decides; the version only
+  breaks ties** — devicectl reports the OS as of the device's *last connection*, so a phone that
+  has updated since would otherwise be excluded by its own freshness and the launch would refuse
+  as "wrong phone". A device the listing knows no model for (every pre-iPhone-X handset, visible
+  only to `xctrace`, which reports no model) is therefore always "unknown": never confirmed, never
+  contradicted.
+
+  Also measured and rejected: correlating the lease IP with devicectl's `potentialHostnames` over
+  mDNS (`Masaki-iPhone-Air.coredevice.local`). Those records exist only while a CoreDevice tunnel
+  is up — `ENOTFOUND` after a 5s timeout per name against every phone paired with this Mac.
+
+  **The phone reports it through `capacitor-game-debug`'s `getDeviceHardware`, and WHICH PLUGIN is
+  load-bearing.** The first version of this fix read `@capacitor/device` via `Capacitor.Plugins.Device`,
+  following `deviceCaps.ts`'s precedent — and was **inert on every real device**: that plugin is
+  optional and **no Modoki project installs it** (checked across all 22 games + demos: no
+  dependency, no `CapacitorDevice` in any iOS `Package.swift`). The probe returned nothing, the
+  lease reported `null`, and the launcher silently fell through to the guess it was written to
+  replace, with the entire unit suite green. The lesson generalises past this bug: **a fact the
+  lease needs belongs in the lease's own plugin.** `capacitor-game-debug` is present by
+  construction — #146 only matters while a device holds a lease, and holding one requires that
+  plugin — whereas anything optional is a fact you *hope* is there. Mocks cannot catch this class:
+  they answer to whichever plugin name the code asks for. `deviceAppIdentity.test.ts` therefore
+  carries two source-level guards — that the probe imports `capacitor-game-debug`, and that no
+  project has picked up `@capacitor/device` (which would quietly invalidate the reasoning).
+
+  Android reports the same shape (`Build.MODEL` / `Build.VERSION.RELEASE`) for **parity**
+  ([mcp-tool-conventions.md](mcp-tool-conventions.md) §9), not because anything launches there —
+  `device_status` names the hardware on both platforms rather than leaving one surface silent.
+
+  **An unverifiable choice guesses and SAYS SO, rather than refusing.** An app older than #146
+  reports no hardware, and refusing there would break every setup that works today until the game
+  on the phone is redeployed. So the old heuristic still runs, `resolveIosDevice` returns an
+  `unverified` reason with the device, and that reason is logged at launch **and appended to every
+  later message about that launch** — a failure whose real cause is "the agent went to the other
+  phone" is otherwise indistinguishable from one that did not. A **contradiction** is different and
+  is refused outright: if the lease names a model no paired iPhone has, every candidate is the
+  wrong phone.
+- **One-time config on a Mac with several paired iPhones**: set `MODOKI_IOS_DEVICE_UDID`. It
+  outranks everything, including the lease match — an explicit human decision is not second-guessed
+  by a heuristic. Needed less often since #146, which resolves the common case from the lease.
 - **iOS-ONLY, and gated on it** — the route is only attempted when the lease's device actually
   reports `platform: 'ios'` (`DeviceConnectionManager.devicePlatform()`, asked once per lease via
   the bridge's `app-identity` op and cached).
@@ -116,6 +251,67 @@ build, the per-machine signing, and the expiry rule.
   would repeat it. `useAdb` cannot stand in for the gate: it proves Android when true and proves
   nothing when false. An **unknown** platform (an old bridge with no `app-identity`) is treated as
   not-iOS, never as "assume iOS".
+
+  **The CDP route needed the mirror of this gate, and did not have it until #142 (2026-08-06).**
+  The reasoning above has a symmetric half that went unwritten for three days: *"a CDP route
+  exists" is not the same as "the leased device is the one adb sees."* CDP discovery is pure adb
+  (`/proc/net/unix` → `adb forward`) and never consults the lease, while the router tried it
+  **first and unconditionally**. Measured on hardware: an **iPhone** leased over WiFi (app
+  `com.modokiengine.court`, `platform: 'ios'`) with a **Samsung on USB** — `device_tap` dispatched
+  the touch into the *Samsung* and returned `ok (cdp touch) … [input:trusted-cdp]` while the
+  iPhone's page received **zero** events. Worse than a mislabel: `resolveAimViaDevice` resolves the
+  target through the **lease**, so the coordinates were computed on the iPhone's 375×667 layout and
+  injected into a different screen — cross-device coordinate injection, reported as a clean success
+  with a trusted stamp. After the fix, the same configuration delivers 4 events to the iPhone at
+  the resolved point, with the honest synthetic banner.
+
+  Two properties of that fix are load-bearing:
+  - **The platform gate is expressed as "no session", not as an early return.** Falling back is
+    ALLOWED but never QUIET; an early return with `reason: null` silently dropped the
+    `SYNTHETIC INPUT (NOT TRUSTED)` banner for every non-Android device. Routing the gate through
+    `getSession` reuses `tryDeviceCdpInput`'s reason logic instead of restating it.
+  - **Platform alone is not enough** — it still lets one Android lease drive a *different*
+    adb-visible Android. The lease's `appId` is therefore passed as `preferPackage`, which
+    `discoverDeviceCdpTarget` already matches against CDP's `Android-Package`; and the session
+    cache is keyed by that package, because a cache hit used to be returned *before*
+    `preferPackage` was looked at — handing a constrained caller a session discovered by an
+    unconstrained one, silently defeating the check.
+
+- **iOS 16 devices: selectable, but WDA still cannot RUN on them (measured 2026-08-07).** Two
+  separate things, and only the first was a Modoki bug. Device SELECTION was broken — `devicectl`
+  is CoreDevice/iOS 17+, so an older device appears in its JSON as a stub with no `udid` and was
+  dropped entirely, making it unreachable even via `MODOKI_IOS_DEVICE_UDID` (#143, fixed by
+  unioning in `xcrun xctrace list devices`). But once selectable, the launch fails anyway on the
+  owner's **iPhone 8 / iOS 16.7.16**:
+
+  ```
+  Cannot test target "WebDriverAgentRunner" on "iPhone8": Logic Testing Unavailable
+  ```
+
+  That line is now what the editor actually reports (#144). At the time it was found it was
+  visible only by re-running the command by hand — the launcher discarded the child's output and
+  reported a guess about signing instead, which is a large part of why this took as long as it did.
+
+  `xcodebuild -showdestinations` omits it for EVERY scheme in the WDA project while listing four
+  iOS-26 phones — **two of which are disconnected** — so destination eligibility tracks OS
+  version, not connection. Xcode will build and run ordinary apps on it (that is how the game gets
+  deployed), it just will not accept it as a TEST destination, and XCUITest is how WDA starts.
+  Confirmed identically from `xcodebuild` AND the Xcode GUI, so it is not a CLI limitation.
+
+  **Do not re-diagnose this.** Six theories were tested and disproved, in this order: a missing
+  iOS 16.7 developer disk image (a `16.7 → 16.4` symlink changed nothing — a DDI is
+  signature-checked, so renaming one gets it rejected, which also means that test was weaker than
+  it looked); the phone not being on USB (`ioreg` found it; failure identical on USB); wrong
+  architecture (runner, xctest bundle and lib are all arm64); absence from the provisioning profile
+  (a real gap — the device is registered now — same error afterwards); Developer Mode off or the
+  device unprepared (Xcode shows it Connected with apps installed); and the deployment target
+  (`IPHONEOS_DEPLOYMENT_TARGET = 15.0`). The one measurement that settled it was a CONTROL: the
+  same xctestrun launches WDA on the iPhone Air first try, isolating the variable to the OS.
+
+  Consequence for testing: **the iPhone 8 is a synthetic-input-only device.** Use the Air for any
+  trusted-input verification. The only avenue that could change this is a third-party XCUITest
+  launcher (e.g. `go-ios`) that bypasses Xcode's test machinery — a new toolchain dependency, so
+  an owner decision rather than an agent one.
 
 - **macOS-only, to start AND to use** — it is an `xcodebuild` run, matching
   `isInstallable('webdriveragent')`. Off macOS `ensureWdaRunning` refuses immediately, before any

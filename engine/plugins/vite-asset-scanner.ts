@@ -12,9 +12,13 @@ import type { Plugin } from 'vite';
 import { computeKeptAssets, formatBytes } from './asset-tree-shaker';
 import { assertNoConversionFallback, type ConversionFailure } from './asset-conversion-strict';
 import { loadProjectConfig, loadProjectUserConfig, validateBuildConfig, projectConfigUnionErrors } from './load-project-config';
+import { stripPrivateBuildFields } from '../project-config';
+import { resolveModules } from './detect-modules';
 import { findGamesEntry } from './findGamesEntry';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './backend/gcloud';
 import { projectAssetRoots } from '../scripts/projectRoots.mjs';
+import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
+import { acquireBuild, releasePolicy } from './backend/buildLock';
 import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, wdaTeamId, writeToolchainSettings, type BuildTarget, type ToolId } from '../toolchain';
 import { registerReimportHandler, type ReimportContext } from './reimport-registry';
 import { textureReimportHandler } from './reimport-texture';
@@ -24,8 +28,8 @@ import { audioReimportHandler } from './reimport-audio';
 import { fontReimportHandler } from './reimport-font';
 import { environmentReimportHandler } from './reimport-environment';
 import { convertFont } from './font-convert';
-import { getFontCacheDir, atlasCachePath, metricsCachePath } from './font-cache';
-import { resolveFontSettings, FONT_ATLAS_SUFFIX, FONT_METRICS_SUFFIX, type FontImportSettings, type FontManifestBlock, type FontCacheInfo } from '../packages/modoki/src/runtime/core/fontSettings';
+import { getFontCacheDir, atlasCachePath, metricsCachePath, instanceCachePath } from './font-cache';
+import { resolveFontSettings, FONT_ATLAS_SUFFIX, FONT_METRICS_SUFFIX, FONT_INSTANCE_SUFFIX, type FontImportSettings, type FontManifestBlock, type FontCacheInfo } from '../packages/modoki/src/runtime/core/fontSettings';
 import { readMetaSidecar } from './meta-sidecar';
 import { classifyJsonAssetSuffix, ID_BEARING_TYPES, BINARY_EXT_TYPE } from './assetTypes';
 import { getCacheDir, cachePathFor } from './texture-cache';
@@ -33,6 +37,13 @@ import { getAudioCacheDir, audioCachePathFor } from './audio-cache';
 import { convertAudio } from './audio-convert';
 import { resolveAudioSettings, audioFormatExtension, audioVariantSuffix, type AudioImportSettings } from '../packages/modoki/src/runtime/loaders/audioSettings';
 import type { AudioCacheInfo } from '../packages/modoki/src/runtime/loaders/audioSettings';
+import { videoReimportHandler } from './reimport-video';
+import { getVideoCacheDir, videoCachePathFor } from './video-cache';
+import { convertVideo } from './video-convert';
+import {
+  resolveVideoSettings, videoVariantSuffix, VIDEO_EXTENSION,
+  type VideoImportSettings, type VideoCacheInfo,
+} from '../packages/modoki/src/runtime/loaders/videoSettings';
 import { resolveEnvSettings, ENV_VARIANT_SUFFIX, ULTRAHDR_VARIANT_SUFFIX, envVariantSuffix, type EnvImportSettings, type EnvManifestBlock, type EnvCacheInfo } from '../packages/modoki/src/runtime/core/environmentSettings';
 import { convertEnvironment } from './env-convert';
 import { getEnvCacheDir, envCachePathFor } from './env-cache';
@@ -49,50 +60,16 @@ import { type SpriteSlice, type SpriteAssetRef } from '../packages/modoki/src/ru
 import { type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
 import { type SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { handleBackendRequest, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
+import { reclaimStaleForwardsAtStartup } from './backend/deviceConnection';
 import { vendorEnginePlugins, writeVendorMarker } from './vendorPlugins';
-import { spawnBuildCommand, resolveBuildStep, type BuildStep } from './buildStepShell';
+import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
 import { healNativeConfig } from './healNativeConfig';
-import { ensureCapacitorDeps, ensureCapacitorConfig, detectMissingFirebase, type NativePlatform } from './addNativeTarget';
+import { ICON_TOOL, ICON_COLORS, iconIsUpToDate, iconStampValue } from './iconAssets';
+import { ensureCapacitorDeps, scaffoldNativeTarget, type NativePlatform } from './addNativeTarget';
 import { discoverSigningTeams, type SigningTeam } from './signingTeams';
 import { serveProjectAsset } from './backend/staticAssets';
 import { writeBackendResult } from './backend/writeResult';
-import type { ProjectConfig } from '../project-config';
 
-/** The scaffold half of "Add Native Target": the in-process edits (Capacitor
- *  deps + capacitor.config.json + vendored engine plugins) followed by the shell
- *  steps (install → web build → `npx cap add` → heal native config). Shared by
- *  the explicit /api/add-native-target action AND the auto-scaffold that runs on
- *  the first native /api/build for a project with no ios/android folder yet.
- *
- *  `runShell(label, cmd, cwd)` is the caller's spawn wrapper (each SSE handler
- *  owns its own, wired to its abort/disconnect handling); a false return throws.
- *  Returns the missing-Firebase warnings the caller should surface — the build
- *  path pauses on a non-empty list so the user can supply the config first. */
-async function scaffoldNativeTarget(opts: {
-  projectRoot: string;
-  platform: NativePlatform;
-  buildCwd: string;
-  cfg: ProjectConfig;
-  send: (msg: string) => void;
-  runShell: (label: string, cmd: string, cwd: string) => Promise<boolean>;
-}): Promise<{ warnings: string[] }> {
-  const { projectRoot, platform, buildCwd, cfg, send, runShell } = opts;
-  // 1. In-process scaffold: deps + capacitor.config.json + vendor plugins.
-  for (const n of ensureCapacitorDeps(projectRoot, platform, buildCwd).notes) send(n);
-  for (const n of ensureCapacitorConfig(projectRoot, cfg).notes) send(n);
-  const v = vendorEnginePlugins(projectRoot, buildCwd);
-  if (v.vendored.length) send(`vendored engine plugin(s): ${v.vendored.join(', ')}`);
-  // 2. Install (project) — needs the cap CLI + plugin copies present.
-  if (!(await runShell('npm install', 'npm install', projectRoot))) throw new Error('npm install failed');
-  writeVendorMarker(projectRoot, v.expectedVendor); // record installed tarballs (D3)
-  // 3. Web build → games/<id>/dist (cap add needs webDir to exist).
-  if (!(await runShell('Building web assets', 'node engine/scripts/build-web.mjs --target native', buildCwd))) throw new Error('web build failed');
-  // 4. cap add (project) — generates the native project with the capacitor.config identity baked in.
-  if (!(await runShell(`cap add ${platform}`, `npx cap add ${platform}`, projectRoot))) throw new Error(`cap add ${platform} failed`);
-  // 5. Heal native config (local.properties / DEVELOPMENT_TEAM) + flag missing Firebase.
-  for (const n of healNativeConfig(projectRoot).notes) send(n);
-  return { warnings: detectMissingFirebase(projectRoot, platform) };
-}
 
 
 // The editor's OWN built-in engine assets (fonts, favicon). Resolved from this
@@ -189,6 +166,23 @@ interface AssetEntry {
    *  always, plus the converted variant's `ext` once the clip has been through the
    *  ffmpeg converter (so the runtime resolver can build the `~audio.<ext>` URL). */
   audio?: { loadType?: 'buffer' | 'stream'; format?: string; ext?: string };
+  /** Baked video block (`'video'` assets) — the delivery fork (`delivery`/`policy`)
+   *  always, plus the converted variant's `ext` + measured `bytes`/`durationSec` once
+   *  the clip has been through the ffmpeg converter. `bytes` is load-bearing, not
+   *  cosmetic: it resolves `policy: 'auto'` and feeds the per-game remote-footprint
+   *  budget, so the runtime must not have to fetch the file to learn its size. */
+  video?: {
+    delivery?: 'bundled' | 'remote';
+    policy?: 'stream' | 'download' | 'auto';
+    /** Where a remote clip's bytes live. Host MUST send CORS — see videoSettings. */
+    remoteUrl?: string;
+    ext?: string;
+    bytes?: number;
+    durationSec?: number;
+    width?: number;
+    height?: number;
+    hasAudio?: boolean;
+  };
   /** Baked font block (`'font'` assets) — mode/fieldType/distanceRange + atlas dims,
    *  written at build time once the font has been through msdf-atlas-gen (so the
    *  runtime resolves the `~atlas.png`/`~metrics.json` variants + picks a provider). */
@@ -451,6 +445,28 @@ export function isValidBuildPlatform(p: string | null | undefined): p is BuildPl
   return p != null && (BUILD_PLATFORMS as readonly string[]).includes(p);
 }
 
+/** How an iOS build gets its freshly-built `.app` onto the phone.
+ *  - `devicectl`    — `xcrun devicectl device install|launch`, hands-free. iOS 17+ ONLY.
+ *  - `xcode-handoff`— open the Xcode project and let the human press Run (⌘R). */
+export type IosInstallMode = 'devicectl' | 'xcode-handoff';
+
+/** The single decision behind an iOS device build: may it run, and how does it install?
+ *
+ *  ⚠️ **Only `iosDeviceId` is required**; `iosDevicectlId` is optional because `devicectl` is
+ *  CoreDevice-only (iOS 17+) and a legacy device has no such id in existence. The two ids,
+ *  where they live, and the Xcode-handoff fallback are documented in
+ *  docs/build.md § "iOS Device" — don't restate them here.
+ *
+ *  Kept as one pure function, and exported, because these two answers must not drift apart:
+ *  when the preflight required more than the step plan consumed, the guard rejected the very
+ *  case the plan's own Xcode-handoff branch existed to serve. */
+export function planIosInstall(o: { iosDeviceId: string; iosDevicectlId: string }):
+  | { ok: false; missing: 'iosDeviceId' }
+  | { ok: true; mode: IosInstallMode } {
+  if (!o.iosDeviceId.trim()) return { ok: false, missing: 'iosDeviceId' };
+  return { ok: true, mode: o.iosDevicectlId.trim() ? 'devicectl' : 'xcode-handoff' };
+}
+
 /** /api/ota/publish only ever builds+publishes the CURRENTLY OPEN project as ITSELF — see
  *  the route's own comment and ota-updates.md's Gotchas for why an override to a different
  *  bundleName used to be a silent publish-corruption risk (it would ship this project's
@@ -701,6 +717,10 @@ function scanDir(dir: string, base: string, urlPrefix: string): AssetEntry[] {
       // Baked audio block — loadType always (drives the runtime buffer/stream fork,
       // even for unconverted source clips); format+ext only once converted.
       let audio: { loadType?: 'buffer' | 'stream'; format?: string; ext?: string } | undefined;
+      // Baked video block — delivery/policy always (they drive the runtime
+      // bundled-vs-fetched and stream-vs-download forks even for an unconverted
+      // source); ext + measured size only once converted.
+      let video: AssetEntry['video'] | undefined;
       // Baked font block — mode (baked/dynamic) drives runtime provider selection;
       // fieldType/distanceRange/atlas dims feed the shader + variant URLs.
       let font: FontManifestBlock | undefined;
@@ -774,6 +794,32 @@ function scanDir(dir: string, base: string, urlPrefix: string): AssetEntry[] {
             hash = cache.hash;
           }
         }
+      } else if (type === 'video') {
+        // Bake the delivery fork always; the converted-variant ext + measured size
+        // only once the clip has been through the ffmpeg converter (videoCache set).
+        const meta = readMetaSidecar(fullPath);
+        const v = (meta as { video?: Partial<VideoImportSettings> }).video;
+        const cache = (meta as { videoCache?: VideoCacheInfo }).videoCache;
+        if (v || cache) {
+          const settings = resolveVideoSettings(meta as { video?: Partial<VideoImportSettings> });
+          video = {
+            delivery: settings.delivery, policy: settings.policy,
+            // Carried for a remote clip only — it's where the bytes come from, and
+            // without it "remote" silently degrades to the local path.
+            ...(settings.delivery === 'remote' && settings.remoteUrl ? { remoteUrl: settings.remoteUrl } : {}),
+          };
+          if (cache) {
+            video.ext = cache.ext ?? VIDEO_EXTENSION;
+            // Size/duration are what let `policy: 'auto'` decide without a network
+            // round-trip, so carry them even though they read as "stats".
+            if (cache.bytes != null) video.bytes = cache.bytes;
+            if (cache.durationSec != null) video.durationSec = cache.durationSec;
+            if (cache.width != null) video.width = cache.width;
+            if (cache.height != null) video.height = cache.height;
+            if (cache.hasAudio != null) video.hasAudio = cache.hasAudio;
+            hash = cache.hash;
+          }
+        }
       } else if (type === 'font') {
         // Font `mode` (baked vs dynamic) selects the runtime provider — without this
         // the manifest entry has no `font` block and every font loads baked. Always
@@ -788,6 +834,18 @@ function scanDir(dir: string, base: string, urlPrefix: string): AssetEntry[] {
             mode: settings.mode,
             fieldType: settings.fieldType,
             distanceRange: settings.pxRange,
+            // Dev serves every variant off the content cache, so an axis-bearing font
+            // always HAS its `~instance.ttf` here — the flag just tells the dynamic
+            // loader to fetch that rather than the un-instanced source.
+            ...(Object.keys(settings.variationAxes ?? {}).length > 0 ? { instanced: true } : {}),
+            // Dynamic-only: the runtime generator needs the authored knobs the baked
+            // path consumes at build time. Omitted for baked fonts (dead weight).
+            ...(settings.mode === 'dynamic' ? {
+              size: settings.size,
+              atlasMax: settings.atlasMax,
+              charset: settings.charset,
+              ...(settings.customChars ? { customChars: settings.customChars } : {}),
+            } : {}),
             ...(cache?.atlasWidth && cache?.atlasHeight ? { atlasWidth: cache.atlasWidth, atlasHeight: cache.atlasHeight } : {}),
           };
           if (cache?.hash) hash = cache.hash;
@@ -818,6 +876,7 @@ function scanDir(dir: string, base: string, urlPrefix: string): AssetEntry[] {
         ...(hash ? { hash } : {}),
         ...(atlas ? { atlas } : {}),
         ...(audio ? { audio } : {}),
+        ...(video ? { video } : {}),
         ...(font ? { font } : {}),
         ...(environment ? { environment } : {}),
       });
@@ -1290,6 +1349,7 @@ export function assetScannerPlugin(): Plugin {
       registerReimportHandler('model', modelReimportHandler);
       registerReimportHandler('atlas', atlasReimportHandler);
       registerReimportHandler('audio', audioReimportHandler);
+      registerReimportHandler('video', videoReimportHandler);
       registerReimportHandler('font', fontReimportHandler);
       registerReimportHandler('environment', environmentReimportHandler);
       cachedManifest = buildManifest(scanAllAssets(assetRoots), true); // dev: auto-heal id collisions
@@ -1303,7 +1363,12 @@ export function assetScannerPlugin(): Plugin {
     },
     load(id) {
       if (id === PROJECT_CONFIG_RESOLVED_ID) {
-        return `export default ${JSON.stringify(loadProjectConfig(projectRoot))};`;
+        // stripPrivateBuildFields, NOT the raw resolved config: this string is inlined into the
+        // browser bundle of every built game, and a built game is deployed to a public URL — so
+        // the Apple Team ID and the internal bucket/CDN names would be downloadable by anyone who
+        // can load the page. Nothing client-side reads them (they are signing/deploy inputs), so
+        // blanking costs nothing. See stripPrivateBuildFields in project-config.ts.
+        return `export default ${JSON.stringify(stripPrivateBuildFields(loadProjectConfig(projectRoot)))};`;
       }
       if (id === GAMES_RESOLVED_ID) {
         // Expose the open project's game (one project = one game, #29) — see
@@ -1313,6 +1378,8 @@ export function assetScannerPlugin(): Plugin {
     },
 
     configureServer(server) {
+      // The OTHER backend host — see startBackendServer in electron/backendServer.ts (#160).
+      reclaimStaleForwardsAtStartup();
       viteServer = server as unknown as { ws: { send: (m: object) => void } };
 
       // Agent bridge: cache the trait schema the browser pushes, and resolve
@@ -1535,11 +1602,30 @@ export function assetScannerPlugin(): Plugin {
           const buildCwd = editorRoot || projectRoot;
           const nativeDir = path.join(projectRoot, platform);
 
+          // The SAME slot /api/build and /api/ota/publish take (#173 close-out). The scaffold runs
+          // the identical `build-web.mjs --target native` into the identical `<project>/dist`
+          // (addNativeTarget.ts), and additionally `npm install`s and `cap add`s into the project —
+          // so racing a build corrupts dist, and racing ITSELF corrupts node_modules or leaves a
+          // half-written ios/ that this route's own `existsSync(nativeDir)` gate then reads as
+          // "already scaffolded". Nothing deduped two calls for the same platform before this.
+          const scaffoldSlot = acquireBuild(`${platform} native scaffold`);
+          if (!scaffoldSlot.ok) {
+            send(`[native] ${scaffoldSlot.message}`);
+            sendStatus(`FAILED:Another job is already running\n${scaffoldSlot.message}`);
+            res.end();
+            return;
+          }
+          const scaffoldRelease = releasePolicy(scaffoldSlot.release);
+          res.on('close', scaffoldRelease.onResponseClose);
+
           // Kill the in-flight child if the client disconnects (closed the dialog /
           // reloaded the renderer) so a long npm install / cap add isn't orphaned. (D6)
+          // `killBuildProcess` signals the process GROUP, so a compound step's grandchildren
+          // die with the shell rather than outliving it (#176) — this comment used to claim
+          // that outcome while `proc.kill()` delivered only the shell.
           let activeProc: ReturnType<typeof spawn> | null = null;
           let aborted = false;
-          req.on('close', () => { aborted = true; try { activeProc?.kill('SIGTERM'); } catch { /* gone */ } });
+          req.on('close', () => { aborted = true; killBuildProcess(activeProc); });
 
           // Provision Node ONCE so the scaffold's npm install / cap add run on it (no system npm).
           const buildEnv = await buildStepEnv({ MODOKI_PROJECT: projectRoot });
@@ -1556,6 +1642,7 @@ export function assetScannerPlugin(): Plugin {
             proc.on('error', (e) => { activeProc = null; send(`ERROR: ${e.message}`); resolve(false); });
           });
 
+          scaffoldRelease.onPipelineStart();
           (async () => {
             const TOTAL = 5;
             try {
@@ -1579,7 +1666,7 @@ export function assetScannerPlugin(): Plugin {
               sendStatus(`FAILED:${e instanceof Error ? e.message : String(e)}`);
               res.end();
             }
-          })();
+          })().finally(scaffoldRelease.onPipelineEnd);
           return;
         }
 
@@ -1673,6 +1760,52 @@ export function assetScannerPlugin(): Plugin {
           const sendStatus = (status: string) => { try { res.write(`event: status\ndata: ${JSON.stringify(status)}\n\n`); } catch { /* client disconnected */ } };
           const sendStep = (step: number, total: number) => { try { res.write(`event: step\ndata: ${JSON.stringify({ step, total })}\n\n`); } catch { /* client disconnected */ } };
 
+          // ONE build at a time (#173). #170's client guard covers the Build MENU; it cannot cover
+          // `modoki_build`, which arrives here directly while a human's build is mid-flight. Taken
+          // AFTER the SSE headers so the refusal reaches the client as a `FAILED:` status (the
+          // route's convention for a deliberate refusal — a bare status is pushed into the log by
+          // `consumeBuildStream` and then surfaces as "stream ended without a final status", i.e. an
+          // actionable refusal disguised as a protocol anomaly), and BEFORE any config load or
+          // preflight so a refused build does nothing at all.
+          const slot = acquireBuild(`${platform} build`);
+          if (!slot.ok) {
+            send(`[build] ${slot.message}`);
+            sendStatus(`FAILED:Another job is already running\n${slot.message}`);
+            res.end();
+            return;
+          }
+          // Releasing the slot has TWO owners, because the handler has two halves and only one of
+          // them is the build.
+          //
+          //  - Everything above the pipeline (config validation, the iOS device/team gates, the
+          //    webBucket gate, the toolchain preflight) returns SYNCHRONOUSLY with a `res.end()`.
+          //    Those paths spawn nothing, so `close` is the right release: it fires on a normal end
+          //    AND on a client disconnect, covering all six of them (and a throw) without a
+          //    `finally` around each.
+          //  - Once the PIPELINE starts, `close` is the WRONG signal, and the first version of this
+          //    used it anyway. A disconnect fires `close` immediately while the step loop is still
+          //    awaiting a spawned child — so the slot went free with `npm run build` mid-flush into
+          //    `<project>/dist`, and a retry starting right then wrote the same dist from two
+          //    processes: exactly the interleaving the lock exists to prevent, reachable through the
+          //    editor's own force-reload (a game `.ts` edit reloads the page, tearing down the
+          //    EventSource mid-build). So once started, the pipeline owns the release and gives it
+          //    back when it actually stops.
+          //
+          // "When the pipeline stops" means when the step's `bash` exits — which USED to be a
+          // weaker statement than "when the WORK stops". `bash -c` exec-replaces itself for a
+          // SIMPLE command but FORKS for a compound one (the iOS `Installing on device...` step,
+          // icon generation, the web deploy's per-extension loop), so the old `proc.kill()` hit
+          // the shell and left `devicectl`/`gcloud` running, orphaned, holding no slot. Closed in
+          // #176: steps spawn `detached` and abort via `killBuildProcess`, which signals the
+          // process GROUP — grandchildren included, plus a tool's own workers (xcodebuild's
+          // clang, gradle's `--no-daemon` JVM) without relying on that tool to forward a signal.
+          //
+          // ⚠️ Still bounded by the backend being ALIVE to run a handler. A SIGKILL'd backend
+          // orphans whatever was mid-step; nothing in-process can close that.
+          // See docs/build.md § "One build at a time".
+          const slotRelease = releasePolicy(slot.release);
+          res.on('close', slotRelease.onResponseClose);
+
           // Web deploy target: a game-only build served under modoki-engine.com/demo
           // from the GCS bucket gs://modoki-www-site/demo. Assets are fetched at
           // runtime with the /demo base prefix (see assetUrl()). gcloud storage is
@@ -1701,6 +1834,9 @@ export function assetScannerPlugin(): Plugin {
           const APP_ID = cfg.app.appId;
           const IOS_DEST = user.device.iosDeviceId;
           const IOS_DEVICECTL = user.device.iosDevicectlId;
+          // ONE decision, consumed by both the step plan (below) and the preflight guard
+          // (further down) — see planIosInstall for why they must not diverge.
+          const iosInstall = planIosInstall({ iosDeviceId: IOS_DEST, iosDevicectlId: IOS_DEVICECTL });
           // adb: an absolute path resolved from the SHARED toolchain (<android-sdk>/platform-tools/
           // adb) so it works even when platform-tools isn't on PATH (a packaged/no-PATH machine);
           // bare `adb` only as a fallback. -s <id> targets the configured device.
@@ -1710,7 +1846,21 @@ export function assetScannerPlugin(): Plugin {
           // word-splits → `bash: /Users/…/Library/Application: No such file or directory`. The
           // `-s <serial>` flag stays outside the quotes (serials are [A-Za-z0-9._:-], no spaces).
           const adbBin = JSON.stringify(detectAdb().path ?? 'adb');
-          const adb = user.device.androidDeviceId ? `${adbBin} -s ${user.device.androidDeviceId}` : adbBin;
+          // WHICH phone, when several are attached (#149). The project pin still wins — it is
+          // explicit config the human typed in Project Settings — but an UNPINNED project no longer
+          // falls through to a bare `adb`: with two handsets on USB that install failed with adb's
+          // own `more than one device/emulator` and no hint that a pin even existed. `androidSerialError`
+          // is carried to the Android preflight gate below rather than thrown here, so it surfaces
+          // as a friendly named-candidates failure alongside every other missing-prerequisite, and
+          // so it can never break a WEB or iOS build that has no business consulting adb at all.
+          let androidSerialError: string | null = null;
+          let androidSerial = user.device.androidDeviceId;
+          if (platform === 'android') {
+            const picked = resolveBuildAndroidSerial(listAndroidDevices(), { projectPin: user.device.androidDeviceId });
+            if ('error' in picked) androidSerialError = picked.error;
+            else androidSerial = picked.serial;
+          }
+          const adb = androidSerial ? `${adbBin} -s ${androidSerial}` : adbBin;
           // JAVA_HOME / ANDROID_HOME come from the SHARED toolchain (an explicit user.sdk override,
           // else `detect()`), resolved in JS and injected into the gradle step's spawn `env` (NOT a
           // bash `export` prefix — that's bash-only, and would SHADOW the shared detection with a
@@ -1778,18 +1928,32 @@ export function assetScannerPlugin(): Plugin {
             : path.join(buildCwd, 'build/icon.png');
           // `--<plat>` (a FLAG, not the positional arg) makes the platform list
           // exclusive — the positional form still tries PWA and fails on a missing
-          // www/manifest.json. Verified against @capacitor/assets 3.0.5. Colors are
-          // double-quoted (portable across bash + cmd.exe; `#` isn't a comment inside
-          // quotes on either). The mkdir+copy prep differs per shell (posix `mkdir -p`/
-          // `cp` vs cmd `mkdir`/`copy`); the `|| echo` non-fatal fallback works on both.
+          // www/manifest.json. Colors are double-quoted (portable across bash +
+          // cmd.exe; `#` isn't a comment inside quotes on either). The mkdir+copy prep
+          // differs per shell (posix `mkdir -p`/`cp` vs cmd `mkdir`/`copy`); the
+          // `|| echo` non-fatal fallback works on both.
+          //
+          // VERSION IS PINNED. This used to be a bare `@capacitor/assets` under a comment
+          // claiming it was "verified against 3.0.5" — but `npx --yes` installs LATEST, so
+          // the comment documented a version the build did not actually use. A newer
+          // release then started emitting extra density buckets (drawable-night-*, *-ldpi,
+          // mipmap-ldpi), which showed up as mystery untracked dirs in games that had done
+          // nothing but build. The generated icons are committed release artifacts; the
+          // tool that generates them cannot be a moving target.
           const iconGen = (plat: 'ios' | 'android') =>
-            `npx --yes @capacitor/assets generate --${plat} --iconBackgroundColor "#ffffff" --iconBackgroundColorDark "#111111" --splashBackgroundColor "#ffffff" --splashBackgroundColorDark "#111111"`;
-          const iconStep = (plat: 'ios' | 'android'): BuildStep => ({
-            label: 'Generating app icons...',
-            cmd: `mkdir -p assets && cp ${JSON.stringify(iconSrcAbs)} assets/icon.png && ${iconGen(plat)} || echo '[icon] generation skipped (source missing or @capacitor/assets error)'`,
-            winCmd: `(if not exist assets mkdir assets) && copy /y "${iconSrcAbs}" assets\\icon.png && ${iconGen(plat)} || echo [icon] generation skipped`,
-            cwd: plat === 'ios' ? iosCwd : androidCwd,
-          });
+            `npx --yes ${ICON_TOOL} generate --${plat} ${ICON_COLORS}`;
+          const iconStampRel = (plat: 'ios' | 'android', win: boolean) =>
+            win ? `.cache\\icon-stamp-${plat}` : `.cache/icon-stamp-${plat}`;
+          const iconStep = (plat: 'ios' | 'android'): BuildStep | null => {
+            if (iconIsUpToDate(projectRoot, iconSrcAbs, plat)) return null;
+            const stamp = iconStampValue(iconSrcAbs, plat);
+            return {
+              label: 'Generating app icons...',
+              cmd: `mkdir -p assets .cache && cp ${JSON.stringify(iconSrcAbs)} assets/icon.png && ${iconGen(plat)} && printf '%s' ${stamp} > ${JSON.stringify(iconStampRel(plat, false))} || echo '[icon] generation skipped (source missing or @capacitor/assets error)'`,
+              winCmd: `(if not exist assets mkdir assets) && (if not exist .cache mkdir .cache) && copy /y "${iconSrcAbs}" assets\\icon.png && ${iconGen(plat)} && (echo ${stamp}>"${iconStampRel(plat, true)}") || echo [icon] generation skipped`,
+              cwd: plat === 'ios' ? iosCwd : androidCwd,
+            };
+          };
           // OTA Phase 5a: embed this build's own manifest into dist so the very FIRST
           // OTA check on a fresh install has something local to diff against (see
           // engine/scripts/ota-embed-manifest.mjs's header). Must run AFTER the web
@@ -1804,22 +1968,44 @@ export function assetScannerPlugin(): Plugin {
             cmd: `node engine/scripts/ota-embed-manifest.mjs --dist ${JSON.stringify(projectDist)} --name ${JSON.stringify(cfg.ota.bundleName)} --engine-api ${cfg.ota.engineApi}`,
             cwd: buildCwd,
           } : null;
+          // Resolved once: `null` means the icons are already current for that platform,
+          // and the step is dropped from the plan entirely rather than run as a no-op.
+          const iosIconStep = iconStep('ios');
+          const androidIconStep = iconStep('android');
           const stepsByPlatform: Record<string, BuildStep[]> = {
             // iOS is macOS-only (preflight blocks it off-darwin), so its bash-only steps
             // (`$(…)`, `~`, xcodebuild/xcrun) never run on Windows — no winCmd needed.
             ios: [
               { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', cwd: buildCwd },
               ...(otaEmbedStep ? [otaEmbedStep] : []),
-              iconStep('ios'),
+              ...(iosIconStep ? [iosIconStep] : []),
               { label: 'Syncing Capacitor iOS...', cmd: 'npx cap sync ios', cwd: iosCwd },
               { label: 'Building Xcode project...', cmd: `xcodebuild ${iosXcodeTarget} -scheme App -configuration Debug -destination 'id=${IOS_DEST}' -allowProvisioningUpdates build`, cwd: iosCwd },
-              { label: 'Installing on device...', cmd: `APP_PATH=$(ls -dt ~/Library/Developer/Xcode/DerivedData/App-*/Build/Products/Debug-iphoneos/App.app 2>/dev/null | head -1) && xcrun devicectl device install app --device ${IOS_DEVICECTL} "$APP_PATH"`, cwd: iosCwd },
-              { label: 'Launching app...', cmd: `xcrun devicectl device process launch --device ${IOS_DEVICECTL} ${APP_ID}`, cwd: iosCwd },
+              // `devicectl` is CoreDevice-only — it REFUSES anything below iOS 17 with
+              // "This device does not support acquiring a usage assertion" (error 1010) or a
+              // bare "device was not found". The xcodebuild step above works fine on an old
+              // device, so the build genuinely succeeded and only the CLI handoff is
+              // impossible; failing with a raw CoreDeviceError there reads as "your build is
+              // broken" when the only thing missing is a way to push it. So fall back to
+              // handing the project to Xcode, which can still deploy to iOS 15. Measured on an
+              // iPhone 7 / iOS 15.8.2, where devicectl cannot install but Xcode's Run does.
+              // A pre-iOS-17 device has NO devicectl id to configure (it isn't a CoreDevice,
+              // so `xcrun devicectl list devices` reports it `unavailable`). That is a known,
+              // expected state — not a misconfiguration — so when the id is empty we skip
+              // straight to the Xcode handoff and report SUCCESS: the build did succeed, and
+              // only the CLI push is unavailable. Exiting non-zero here would label a healthy
+              // legacy-device build "failed".
+              iosInstall.ok && iosInstall.mode === 'devicectl'
+                ? { label: 'Installing on device...', cmd: `APP_PATH=$(ls -dt ~/Library/Developer/Xcode/DerivedData/App-*/Build/Products/Debug-iphoneos/App.app 2>/dev/null | head -1) && { xcrun devicectl device install app --device ${IOS_DEVICECTL} "$APP_PATH" || { echo ""; echo "⚠️  devicectl could not install to this device — it requires iOS 17+."; echo "   The app BUILT fine; only the command-line install is unavailable."; echo "   Opening the Xcode project — press Run (⌘R) there to deploy."; open "${iosXcodeTarget.replace(/^-(workspace|project) /, '')}" 2>/dev/null || true; exit 1; }; }`, cwd: iosCwd }
+                : { label: 'Handing off to Xcode (device predates devicectl)...', cmd: `echo "ℹ️  No iOS devicectl id set — devicectl requires iOS 17+, so this device can only be deployed from Xcode."; echo "   The app BUILT fine. Opening the Xcode project — press Run (⌘R) there to deploy."; open "${iosXcodeTarget.replace(/^-(workspace|project) /, '')}" 2>/dev/null || true`, cwd: iosCwd },
+              ...(iosInstall.ok && iosInstall.mode === 'devicectl'
+                ? [{ label: 'Launching app...', cmd: `xcrun devicectl device process launch --device ${IOS_DEVICECTL} ${APP_ID}`, cwd: iosCwd }]
+                : []),
             ],
             android: [
               { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', cwd: buildCwd },
               ...(otaEmbedStep ? [otaEmbedStep] : []),
-              iconStep('android'),
+              ...(androidIconStep ? [androidIconStep] : []),
               { label: 'Syncing Capacitor Android...', cmd: 'npx cap sync android', cwd: androidCwd },
               // gradlew wrapper: posix `android/gradlew` vs Windows `android\gradlew.bat`.
               // JAVA_HOME/ANDROID_HOME are injected via env (not a bash export prefix).
@@ -1951,20 +2137,26 @@ export function assetScannerPlugin(): Plugin {
           const needsNativeScaffold =
             (platform === 'ios' || platform === 'android') && !fs.existsSync(path.join(projectRoot, platform));
 
-          // iOS device builds need a target device: the xcodebuild -destination AND the
-          // install/launch steps all interpolate the configured id. An empty id yields a
+          // iOS device builds need a target device: the xcodebuild -destination interpolates
+          // the configured id (the devicectl install/launch steps interpolate the SEPARATE,
+          // optional devicectl id). An empty id yields a
           // cryptic `-destination 'id='` → `xcodebuild: error: missing value for key 'id'`
           // + a full usage dump (not an obvious "set your device" hint) — so fail fast with
           // guidance instead. (Android's `adb` degrades to auto-selecting the one device, so
           // it needs no such check.) The simulator isn't a target of this device pipeline.
-          if (platform === 'ios' && (!IOS_DEST || !IOS_DEVICECTL)) {
-            const missing = !IOS_DEST && !IOS_DEVICECTL ? 'iosDeviceId + iosDevicectlId'
-              : !IOS_DEST ? 'iosDeviceId (xcodebuild -destination)' : 'iosDevicectlId (device install/launch)';
-            const msg = `[build] No iOS device configured — ${missing} is empty in ` +
-              `${path.relative(buildCwd, path.join(projectRoot, 'project.config.json'))}. ` +
+          // Which ids are required, and why devicectl's is not, is documented once on
+          // `planIosInstall` — this guard only reports its verdict.
+          if (platform === 'ios' && !iosInstall.ok) {
+            // project.USER.json, not project.config.json: these are per-MACHINE device ids
+            // (gitignored, never committed). The message named the committed file until this
+            // close-out caught it — sending anyone who hit it to edit the wrong file.
+            const msg = `[build] No iOS device configured — iosDeviceId (xcodebuild -destination) is empty in ` +
+              `${path.relative(buildCwd, path.join(projectRoot, 'project.user.json'))}. ` +
               `Set it in Project Settings → Build: iosDeviceId = the xcodebuild UDID from ` +
-              `\`xcrun xctrace list devices\`, iosDevicectlId = the id from \`xcrun devicectl list devices\`. ` +
-              `Without it the build can't target or install on your iPhone.`;
+              `\`xcrun xctrace list devices\`. Without it the build can't target your iPhone. ` +
+              `(iosDevicectlId is optional — set it from \`xcrun devicectl list devices\` for a ` +
+              `hands-free install/launch on iOS 17+; leave it empty on older devices and the ` +
+              `build hands off to Xcode instead.)`;
             send(msg);
             // A DELIBERATE REFUSAL must be `FAILED:…`, not a bare status. `consumeBuildStream`
             // pushes any non-DONE/non-FAILED status into the log and, when the stream then closes,
@@ -2041,13 +2233,29 @@ export function assetScannerPlugin(): Plugin {
             res.end();
             return;
           }
+          // Which Android to install onto (#149) — refused HERE, in the same place as every other
+          // unmet prerequisite, so it costs no gradle build first. The message names the attached
+          // candidates and how to pin one; see `resolveBuildAndroidSerial`.
+          if (androidSerialError) {
+            send(`[build] Cannot choose an Android device: ${androidSerialError}\n`
+              + '  • Pin one in Project Settings → Device → "Android serial", or unplug the others.');
+            sendStatus('FAILED:Cannot choose an Android device — see log');
+            res.end();
+            return;
+          }
 
           // Kill the in-flight build child + stop launching steps if the client
           // disconnects (closed the Build dialog / reloaded), so gradle/xcodebuild/
-          // gcloud aren't left running for minutes and can't conflict with a retry. (D6)
+          // gcloud aren't left running for minutes. (D6)
+          // "Can't conflict with a retry" is what this claimed for a long time while `proc.kill()`
+          // could not deliver it: `bash -c` FORKS for a compound command (the iOS `Installing on
+          // device...` step is one), so the signal killed the shell and orphaned the real child.
+          // The build slot (#173) narrowed the window by holding until this loop settles; #176
+          // closed it — `killBuildProcess` signals the process GROUP, so the orphan can no longer
+          // outlive the slot. docs/build.md § "One build at a time".
           let activeProc: ReturnType<typeof spawn> | null = null;
           let aborted = false;
-          req.on('close', () => { aborted = true; try { activeProc?.kill('SIGTERM'); } catch { /* gone */ } });
+          req.on('close', () => { aborted = true; killBuildProcess(activeProc); });
 
           // Provision Node ONCE for this build so every step's bash `npm`/`npx`/`node` runs on the
           // toolchain-provisioned Node (packaged: no system npm). Shared by scaffold + build steps.
@@ -2103,6 +2311,10 @@ export function assetScannerPlugin(): Plugin {
             proc.on('error', (e) => { activeProc = null; send(`ERROR: ${e.message}`); resolve(false); });
           });
 
+          // From here the pipeline owns the build slot (see the two-owners note above) — set
+          // SYNCHRONOUSLY, before the first `await`, so a disconnect can never observe a started
+          // pipeline as un-started and release the slot out from under it.
+          slotRelease.onPipelineStart();
           (async () => {
             // First native build with no ios/android folder → scaffold it inline,
             // then PAUSE if it flags something the user must supply (missing
@@ -2235,7 +2447,10 @@ export function assetScannerPlugin(): Plugin {
             // "built" for the playable (nothing is deployed — the one HTML file IS the artifact); "deployed" for the rest.
             send(`\n✅ ${label} ${platform === 'playable' ? 'built' : 'build deployed'} successfully!`);
             res.end();
-          })();
+            // `finally`, not a tail call: the body has ~9 early `return`s (an aborted step, a failed
+            // step, a paused scaffold) and can reject, and every one of them must give the slot
+            // back — a leaked slot refuses every future build until the editor restarts.
+          })().finally(slotRelease.onPipelineEnd);
           return;
         }
 
@@ -2351,13 +2566,30 @@ export function assetScannerPlugin(): Plugin {
           // `node: command not found`, i.e. the publish was impossible in the one build where the
           // editor is most likely to be used and the failure said nothing about why. (§9: the
           // build family should not have two different notions of "the environment a step runs in".)
+          // The SAME slot the build takes (#173 close-out). This route runs the byte-identical
+          // `build-web.mjs --target native` into the byte-identical `<project>/dist` as
+          // /api/build's web step — and then UPLOADS that dist. So a publish racing a build does not
+          // merely corrupt a local artifact: it ships the torn bundle to every installed device that
+          // checks for an update, with no review step in between. Strictly worse than the case the
+          // lock was written for, and reachable by one human doing two ordinary things in one window
+          // (start Build → iOS, then open Publish OTA while it runs).
+          const otaSlot = acquireBuild('OTA publish');
+          if (!otaSlot.ok) {
+            send(`[ota] ${otaSlot.message}`);
+            sendStatus(`FAILED:Another job is already running\n${otaSlot.message}`);
+            res.end();
+            return;
+          }
+          const otaRelease = releasePolicy(otaSlot.release);
+          res.on('close', otaRelease.onResponseClose);
+
           const baseEnv = await buildStepEnv({ MODOKI_PROJECT: projectRoot });
           const gcloudEnv = { ...baseEnv, PATH: `${gcloudDir}:${baseEnv.PATH ?? ''}` };
           const distDir = path.join(projectRoot, 'dist');
 
           let activeProc: ReturnType<typeof spawn> | null = null;
           let aborted = false;
-          req.on('close', () => { aborted = true; try { activeProc?.kill('SIGTERM'); } catch { /* gone */ } });
+          req.on('close', () => { aborted = true; killBuildProcess(activeProc); });
 
           const runStep = (label: string, cmd: string, cwd: string, env: NodeJS.ProcessEnv) => new Promise<{ ok: boolean; output: string }>((resolve) => {
             send(`\n── ${label} ──`);
@@ -2370,6 +2602,9 @@ export function assetScannerPlugin(): Plugin {
             proc.on('error', (e) => { activeProc = null; send(`ERROR: ${e.message}`); resolve({ ok: false, output: e.message }); });
           });
 
+          // From here the publish pipeline owns the slot, not the socket — see the two-owners note
+          // on /api/build's acquire. Set synchronously, before the first `await`.
+          otaRelease.onPipelineStart();
           (async () => {
             // Step 1: build FRESH from the CURRENTLY OPEN project's project.config.json.
             // Never publish an arbitrary pre-built dist/ — that's how a stale pre-fix
@@ -2463,7 +2698,7 @@ export function assetScannerPlugin(): Plugin {
               `Verify with modoki_ota_status.`,
             );
             res.end();
-          })();
+          })().finally(otaRelease.onPipelineEnd);
           return;
         }
 
@@ -2513,10 +2748,19 @@ export function assetScannerPlugin(): Plugin {
         return;
       }
 
-      const result = computeKeptAssets(projectRoot, assetRoots);
+      // Resolve the module flags the same way vite.config.ts does, so the shaker and the
+      // bundle agree on what is in this build. `video: false` drops the clips — the toggle's
+      // real payload, since video's JS is engine code the runtime barrel keeps alive anyway.
+      const buildModules = resolveModules(
+        loadProjectConfig(projectRoot).build.modules,
+        projectRoot,
+        { playable: process.env.VITE_PLAYABLE === '1' },
+      );
+      const result = computeKeptAssets(projectRoot, assetRoots, { excludeVideo: !buildModules.video });
       const CONVERTIBLE = new Set(['.png', '.jpg', '.jpeg']);
       const MODEL_EXTS = new Set(['.glb', '.gltf']);
       const AUDIO_EXTS = new Set(['.mp3', '.m4a', '.aac', '.wav', '.ogg', '.flac']);
+      const VIDEO_EXTS = new Set(['.mp4', '.mov', '.m4v', '.webm', '.mkv']);
       const FONT_EXTS = new Set(['.ttf', '.otf', '.woff', '.woff2']);
 
       // Copy kept non-texture, non-converted-model files verbatim. Textures
@@ -2535,6 +2779,7 @@ export function assetScannerPlugin(): Plugin {
         if (CONVERTIBLE.has(ext)) continue;
         if (MODEL_EXTS.has(ext)) continue; // handled by the model branch below
         if (AUDIO_EXTS.has(ext)) continue; // handled by the audio branch below
+        if (VIDEO_EXTS.has(ext)) continue; // handled by the video branch below
         if (FONT_EXTS.has(ext)) continue; // handled by the font branch below
         if (ext === '.hdr') continue; // handled by the environment branch below (it
         //   ships the downscaled ~env.hdr variant + drops the multi-MB source, or
@@ -2624,6 +2869,60 @@ export function assetScannerPlugin(): Plugin {
       }
       if (audioVariantCount) console.log(`[asset-shaker] converted ${audioVariantCount} audio clip(s).`);
 
+      // Convert each kept video that has been through the ffmpeg converter (its meta
+      // has a `videoCache` block) and copy the single variant into dist/ at
+      // `<src>~video.mp4` — the source is NOT shipped. Unconverted video is copied
+      // verbatim so it still plays. On conversion FAILURE we ship the source + record
+      // it so the strict gate fails the build — parity with audio/textures.
+      //
+      // A `delivery: 'remote'` clip is NOT shipped: it lives on a CDN and the runtime
+      // streams or downloads it (see docs/video.md § "Remote delivery"). Its SOURCE stays
+      // in the project so the asset is importable, previewable and probeable like any
+      // other — but the build emits only the manifest entry, which is the whole point of
+      // the delivery mode. The manifest-vs-disk check skips remote entries for the same
+      // reason. (This shipped remote clips verbatim while P2 was unbuilt; that note is
+      // now stale and the behaviour with it.)
+      const convertedVideo = new Map<string, { settings: VideoImportSettings; ext: string; hash: string; bytes: number; durationSec?: number; width?: number; height?: number; hasAudio?: boolean }>();
+      let videoVariantCount = 0;
+      for (const virtualPath of result.kept) {
+        if (!VIDEO_EXTS.has(path.extname(virtualPath).toLowerCase())) continue;
+        const srcAbs = resolveAssetPath(virtualPath, assetRoots);
+        if (!srcAbs || !fs.existsSync(srcAbs)) continue;
+        const meta = readMetaSidecar(srcAbs);
+        const hasCache = !!(meta as { videoCache?: VideoCacheInfo }).videoCache;
+        const settings = resolveVideoSettings(meta as { video?: Partial<VideoImportSettings> });
+        // Remote: emit nothing at all. Checked BEFORE the unconverted fallback, or a
+        // remote clip that had never been through the converter would ship verbatim —
+        // which is exactly how it slipped through the first time.
+        if (settings.delivery === 'remote') continue;
+        const shipSource = () => {
+          const destPath = path.join(distDir, virtualPath.replace(/^\//, ''));
+          fs.mkdirSync(path.dirname(destPath), { recursive: true });
+          fs.copyFileSync(srcAbs, destPath);
+          copiedCount++;
+        };
+        if (!hasCache) { shipSource(); continue; } // unconverted — ship source verbatim
+        try {
+          const conv = await convertVideo({ projectRoot, sourceUrlPath: virtualPath, absSource: srcAbs, settings });
+          const cacheFile = videoCachePathFor(getVideoCacheDir(projectRoot), virtualPath, conv.hash);
+          const destPath = path.join(distDir, (virtualPath + videoVariantSuffix()).replace(/^\//, ''));
+          fs.mkdirSync(path.dirname(destPath), { recursive: true });
+          fs.copyFileSync(cacheFile, destPath);
+          videoVariantCount++;
+          convertedVideo.set(virtualPath.normalize('NFC'), {
+            settings, ext: conv.ext, hash: conv.hash, bytes: conv.bytes,
+            durationSec: conv.durationSec, width: conv.width, height: conv.height,
+            hasAudio: conv.hasAudio,
+          });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          console.warn(`[asset-shaker] video convert failed for ${virtualPath} — shipping source. ${msg}`);
+          conversionFailures.push({ virtualPath, kind: 'video', error: msg });
+          shipSource();
+        }
+      }
+      if (videoVariantCount) console.log(`[asset-shaker] converted ${videoVariantCount} video clip(s).`);
+
       // Downscale each kept environment HDR that has been through the converter (its
       // meta has an `environmentCache` block, written by the Environment Inspector
       // Apply / reimport) and copy the single variant into dist/ at `<src>~env.hdr`
@@ -2684,12 +2983,31 @@ export function assetScannerPlugin(): Plugin {
 
       // Bake each kept font that has been through the msdf-atlas-gen importer (its
       // meta has a `font` block, written by the Font Inspector Apply / reimport) and
-      // copy the two derived files into dist/ at `<src>~atlas.png` + `<src>~metrics.json`
-      // — the source .ttf is NOT shipped. A plain CSS-family-name font (no `font`
+      // copy the two derived files into dist/ at `<src>~atlas.png` + `<src>~metrics.json`.
+      //
+      // The source `.ttf`/`.otf` ships ONLY when something needs it. There are two
+      // distinct consumers, and only one needs the real outlines: CANVAS text
+      // (`Text2D.font`, a GUID) renders from the atlas alone, while DOM/PixiJS text
+      // (`UIElement.fontFamily`, a CSS family NAME) goes through the browser's
+      // FontFace API — and the manifest entry for a font IS its source path, so
+      // `loadAllFonts` FontFace-loads exactly that. Shipping it unconditionally wastes
+      // ~300KB/font on a canvas-only game; never shipping it 404s at boot
+      // ("[FontLoader] N/N fonts failed to load") for a DOM-using one. So: ship the
+      // source iff `result.domFontFiles` (computed by the shaker's font-family walk —
+      // see resolveFontsByFamily in asset-tree-shaker.ts) says a scene/prefab named
+      // this font's family in `fontFamily`, UNLESS `shipSource` overrides the call —
+      // `'always'` for a family named from CODE (a runtime string, not a scene field,
+      // which the static scan can't see) or `'never'` to force-drop despite detected
+      // DOM usage. The decision is recorded as `sourceShipped` on the manifest's `font`
+      // block so `loadAllFonts` knows not to fetch a path that was never shipped.
+      //
+      // A plain CSS-family-name font (no `font`
       // block) is copied verbatim so `fontFamily` still resolves. On bake FAILURE
       // (msdf-atlas-gen missing/crash) we ship the source + record it so the strict
-      // gate fails the build (unless MODOKI_ALLOW_ASSET_FALLBACK=1) — parity with audio.
-      const convertedFonts = new Map<string, { settings: FontImportSettings; hash: string; atlasWidth?: number; atlasHeight?: number }>(); // NFC virtualPath → blocks
+      // gate fails the build (unless MODOKI_ALLOW_ASSET_FALLBACK=1) — parity with audio:
+      // a failed bake means no atlas, so the source is the ONLY way the font renders
+      // at all, regardless of the shipSource decision.
+      const convertedFonts = new Map<string, { settings: FontImportSettings; hash: string; atlasWidth?: number; atlasHeight?: number; sourceShipped: boolean; instanced: boolean }>(); // NFC virtualPath → blocks
       let fontVariantCount = 0;
       for (const virtualPath of result.kept) {
         if (!FONT_EXTS.has(path.extname(virtualPath).toLowerCase())) continue;
@@ -2716,7 +3034,35 @@ export function assetScannerPlugin(): Plugin {
             fs.copyFileSync(cacheFile, destPath);
             fontVariantCount++;
           }
-          convertedFonts.set(virtualPath.normalize('NFC'), { settings, hash: conv.hash, atlasWidth: conv.atlasWidth, atlasHeight: conv.atlasHeight });
+          // TWO independent consumers of real outlines, and conflating them drops files:
+          //  - DOM text (`UIElement.fontFamily`) wants the RAW source — the browser's
+          //    FontFace API needs it, and CSS `font-weight` instances a variable font
+          //    natively, so our pinned instance is not a substitute.
+          //  - a DYNAMIC font's runtime generator rasterizes outlines itself, so it needs
+          //    the instance when axes are authored, else the raw source. This half used to
+          //    be missing entirely: the decision keyed only on DOM usage, so a dynamic
+          //    font referenced solely by `Text2D.font` (a GUID) had its source dropped and
+          //    404'd at boot in a production build. Dev never showed it — it serves
+          //    everything off disk.
+          const domUsed = result.domFontFiles.has(virtualPath.normalize('NFC'));
+          const domWants = settings.shipSource === 'always' || (settings.shipSource !== 'never' && domUsed);
+          const genWants = settings.mode === 'dynamic';
+          const shipInstance = genWants && !!conv.instanced;
+          const shipTtf = domWants || (genWants && !shipInstance);
+          if (shipTtf) shipSource();
+          if (shipInstance) {
+            const destPath = path.join(distDir, (virtualPath + FONT_INSTANCE_SUFFIX).replace(/^\//, ''));
+            fs.mkdirSync(path.dirname(destPath), { recursive: true });
+            fs.copyFileSync(instanceCachePath(getFontCacheDir(projectRoot), virtualPath, conv.hash), destPath);
+            fontVariantCount++;
+          }
+          const why = [
+            domWants ? (settings.shipSource === 'always' ? "source (shipSource:'always')" : 'source (DOM fontFamily usage)') : null,
+            shipInstance ? 'instance (dynamic + variationAxes)' : null,
+            !domWants && genWants && !shipInstance ? 'source (dynamic runtime generation)' : null,
+          ].filter(Boolean);
+          console.log(`[asset-shaker] font ${virtualPath}: ${['atlas', ...why].join(' + ')}`);
+          convertedFonts.set(virtualPath.normalize('NFC'), { settings, hash: conv.hash, atlasWidth: conv.atlasWidth, atlasHeight: conv.atlasHeight, sourceShipped: shipTtf, instanced: shipInstance });
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           console.warn(`[asset-shaker] font bake failed for ${virtualPath} — shipping source. ${msg}`);
@@ -2861,6 +3207,7 @@ export function assetScannerPlugin(): Plugin {
               __MODOKI_MODULE_PHYSICS3D__: 'true',
               __MODOKI_MODULE_NPR__: 'true',
               __MODOKI_MODULE_GPU_PARTICLES__: 'true',
+              __MODOKI_MODULE_VIDEO__: 'true',
             },
             resolve: {
               alias: [
@@ -3020,11 +3367,44 @@ export function assetScannerPlugin(): Plugin {
           entry.audio = { loadType: entry.audio.loadType };
           entry.hash = undefined;
         }
+        // Video: bake the converted variant's ext + measured size + build-time hash so
+        // the runtime resolves `<src>~video.mp4?v=<hash>` (source dropped from dist).
+        const vid = convertedVideo.get(entry.path.normalize('NFC'));
+        if (vid) {
+          entry.video = {
+            delivery: vid.settings.delivery,
+            policy: vid.settings.policy,
+            ...(vid.settings.delivery === 'remote' && vid.settings.remoteUrl
+              ? { remoteUrl: vid.settings.remoteUrl } : {}),
+            ext: vid.ext,
+            bytes: vid.bytes,
+            ...(vid.durationSec != null ? { durationSec: vid.durationSec } : {}),
+            ...(vid.width != null ? { width: vid.width } : {}),
+            ...(vid.height != null ? { height: vid.height } : {}),
+            ...(vid.hasAudio != null ? { hasAudio: vid.hasAudio } : {}),
+          };
+          entry.hash = vid.hash;
+        } else if (entry.video?.ext) {
+          // Conversion did NOT run/succeed this build (ffmpeg missing +
+          // MODOKI_ALLOW_ASSET_FALLBACK=1 shipped the raw source): drop the
+          // sidecar-baked variant fields so the manifest advertises the raw source
+          // that was actually shipped, not a `~video.mp4` that was never written.
+          // `bytes` goes too — a stale size would make `policy: 'auto'` decide against
+          // a file that isn't there.
+          entry.video = {
+            delivery: entry.video.delivery, policy: entry.video.policy,
+            ...(entry.video.remoteUrl ? { remoteUrl: entry.video.remoteUrl } : {}),
+          };
+          entry.hash = undefined;
+        }
         // Font: bake the manifest block (mode/fieldType/distanceRange/atlas dims) +
         // the build-time hash so the runtime resolves `<src>~atlas.png?v=<hash>` +
-        // `~metrics.json` (source .ttf dropped from dist). A font that fell back to
-        // raw source (bake failed + fallback allowed) keeps no `font` block, so the
-        // verifier below checks the shipped source instead.
+        // `~metrics.json`, plus `sourceShipped` recording whether the source `.ttf`
+        // was ALSO shipped this build (see the ship-source decision above) — absent
+        // that flag `loadAllFonts` can't tell a dropped-on-purpose source from a
+        // real 404. A font that fell back to raw source (bake failed + fallback
+        // allowed) keeps no `font` block, so the verifier below checks the shipped
+        // source instead.
         const f = convertedFonts.get(entry.path.normalize('NFC'));
         if (f) {
           const block: FontManifestBlock = {
@@ -3033,6 +3413,16 @@ export function assetScannerPlugin(): Plugin {
             distanceRange: f.settings.pxRange,
             ...(f.atlasWidth != null ? { atlasWidth: f.atlasWidth } : {}),
             ...(f.atlasHeight != null ? { atlasHeight: f.atlasHeight } : {}),
+            sourceShipped: f.sourceShipped,
+            ...(f.instanced ? { instanced: true } : {}),
+            // Dynamic-only: the runtime generator needs the authored knobs the baked
+            // path consumes at build time. Omitted for baked fonts (dead weight).
+            ...(f.settings.mode === 'dynamic' ? {
+              size: f.settings.size,
+              atlasMax: f.settings.atlasMax,
+              charset: f.settings.charset,
+              ...(f.settings.customChars ? { customChars: f.settings.customChars } : {}),
+            } : {}),
           };
           entry.font = block;
           entry.hash = f.hash;
@@ -3096,10 +3486,30 @@ export function assetScannerPlugin(): Plugin {
           } else if (entry.audio?.ext) {
             // Converted audio — the source was dropped; verify the single variant.
             checkFile(entry.path + `~audio.${entry.audio.ext}`, 'audio variant');
+          } else if (entry.video?.delivery === 'remote') {
+            // Nothing on disk BY DESIGN: a remote clip lives on the CDN and is streamed or
+            // downloaded at runtime. Checked before the `ext` case below because a remote
+            // entry never HAS an ext — it is never converted — so gating on ext alone let it
+            // fall through to the plain-copy check and fail the build.
+          } else if (entry.video?.ext) {
+            // Converted video — the source was dropped, so the SOURCE path in `entry.path` is
+            // never on disk; verify the emitted variant instead. Without this branch the entry
+            // fell through to the plain-copy check below and every video failed the build.
+            checkFile(entry.path + `~video.${entry.video.ext}`, 'video variant');
           } else if (entry.font) {
-            // Baked font — the source .ttf was dropped; verify both derived files.
+            // Baked font — verify both derived files. The source .ttf may or may not
+            // have shipped too (`entry.font.sourceShipped`); either way it isn't what
+            // the atlas/dynamic-gen path resolves, so it's not checked here.
             checkFile(entry.path + FONT_ATLAS_SUFFIX, 'font atlas');
             checkFile(entry.path + FONT_METRICS_SUFFIX, 'font metrics');
+            // A DYNAMIC font also generates glyphs at runtime from real outlines, so the
+            // file it will fetch must exist: the pinned instance when axes are authored,
+            // else the source itself. (A BAKED font renders from the atlas alone; its
+            // source ships only for DOM consumers, which is not checked here.)
+            if (entry.font.mode === 'dynamic') {
+              if (entry.font.instanced) checkFile(entry.path + FONT_INSTANCE_SUFFIX, 'font instance (dynamic + variationAxes)');
+              else checkFile(entry.path, 'font source (dynamic runtime generation)');
+            }
           } else if (entry.environment) {
             // Converted HDR — the source was dropped; verify the format's variant
             // (`~env.hdr` downscaled, or the committed `~ultrahdr.jpg` gainmap).

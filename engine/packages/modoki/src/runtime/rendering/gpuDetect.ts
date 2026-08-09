@@ -9,6 +9,10 @@
 // Set to true to force WebGL everywhere (for testing frame pacing).
 const FORCE_WEBGL = false;
 
+/** The GPU process gets this long to answer the probe. Generous — a cold adapter on a
+ *  loaded low-end device is slow — but finite, which is the point. */
+const PROBE_TIMEOUT_MS = 8_000;
+
 let result: boolean | null = null;
 let pending: Promise<boolean> | null = null;
 
@@ -20,10 +24,26 @@ async function probeWebGPU(): Promise<boolean> {
   }).gpu;
   if (!gpu) return false;
   try {
-    const adapter = await gpu.requestAdapter();
-    if (!adapter) return false;
-    await adapter.requestDevice();
-    return true;
+    // BOUNDED, like every other await that crosses a process boundary. `requestAdapter` is a
+    // call into the GPU process: when that process is unreachable it does not reject, it
+    // simply never answers — and iOS really does get there (`CARenderServer failed bootstrap
+    // look up` / `Failed to load a device context` in a device log). The result is memoized
+    // via `pending`, so one unanswered probe would leave every caller of
+    // getWebGPUSupported() awaiting forever — including Canvas2DPool's backend pick, which
+    // means the 2D renderer is never constructed and the screen stays blank with no error.
+    // Timing out returns false, which falls back to WebGL: a worse renderer beats none.
+    return await Promise.race([
+      (async () => {
+        const adapter = await gpu.requestAdapter();
+        if (!adapter) return false;
+        await adapter.requestDevice();
+        return true;
+      })(),
+      new Promise<boolean>((resolve) => setTimeout(() => {
+        console.warn(`[gpuDetect] WebGPU probe did not answer within ${PROBE_TIMEOUT_MS}ms — treating it as unsupported and falling back to WebGL.`);
+        resolve(false);
+      }, PROBE_TIMEOUT_MS)),
+    ]);
   } catch {
     return false;
   }

@@ -80,6 +80,18 @@ export type ToolContract = {
   /** Params that NARROW the response. A `read` tool with a large payload must have at least one
    *  (`docs/mcp-response-budget.md`: summary-first, and the hint names the filter to reach for). */
   filters: string[];
+  /** Declared exceptions to the "a boolean filter always EXPANDS the response" heuristic that
+   *  `mcpToolContracts.test.ts` guards `filters` with.
+   *
+   *  That heuristic held for the whole surface until `modoki_input_watch.unresolvedOnly` — every
+   *  narrowing param carried a value (an id, a name, a cap) and every boolean added something, so
+   *  "boolean ⇒ expanding" was a reliable tell rather than a rule. It is a heuristic, and this is
+   *  where an exception is DECLARED rather than dodged by omitting the filter: leaving the flag out
+   *  of `filters` would have kept the guard green while removing the tool's most useful narrowing
+   *  param from the over-cap hint — a silently worse answer for the agent, which is the outcome
+   *  §6 exists to prevent. Listing one here is a deliberate act that shows up in review; it is not
+   *  a way to bless an expanding flag. */
+  narrowingFlags?: string[];
   /** Smallest VALID call. `{}` when every param is optional. */
   minimalArgs: Record<string, unknown>;
   /** Does the `minimalArgs` form ITSELF mutate? Defaults to `mutating`.
@@ -264,9 +276,13 @@ const DECLS: Record<string, Decl> = {
   modoki_eval: {
     kind: 'control', method: 'POST', route: '/api/eval', mutating: true, requires: ['editor', 'renderer'],
     minimalArgs: { code: 'return 1 + 1;' },
-    notes: '#19: code runs as `new Function("modoki", code)` — the injected `modoki` object gives full op-registry + '
+    notes: '#19: code runs as an ASYNC function body (`await` is allowed, #145) with the injected `modoki` object as its '
+      + 'sole parameter — that object gives full op-registry + '
       + 'backendFetch access (see modoki_eval_api for the surface). Escape hatch, unvalidated by design; the older '
-      + '"dynamic import yields 19 of 55 ops" half-support this replaced is gone.',
+      + '"dynamic import yields 19 of 55 ops" half-support this replaced is gone. `timeoutMs` bounds the whole body '
+      + '(default 5000, max 25000, clamped): the route sizes the relay deadline from it and the client sizes its abort '
+      + 'from that, so all three stay ordered. Until they did, the relay\'s 3000ms default was SMALLER than the eval\'s '
+      + 'own 5000ms budget and capped every editor eval at 3s.',
   },
   modoki_eval_api: {
     kind: 'read', method: 'GET', route: '/api/eval-api', requires: ['editor', 'renderer'],
@@ -362,7 +378,12 @@ const DECLS: Record<string, Decl> = {
     notes: 'Sends `prefabAction` on the wire: the relay STRIPS a param named `action`. '
       + "persists:'both' because action:'create' WRITES the .prefab.json (writePrefabFile) while "
       + 'instantiate/detach/apply/revert are live-only; the undo entry covers the live tagging only, '
-      + 'never the file write (undoing an overwrite would destroy an asset the agent never created).',
+      + 'never the file write (undoing an overwrite would destroy an asset the agent never created). '
+      + "The edit-* actions drive PREFAB-EDIT MODE: 'edit-open' swaps the world for a synthetic "
+      + 'prefab scene (world-destructive, so it takes `force` like load-scene, and it saves the '
+      + "current scene on the way in), 'edit-save' re-serializes the .prefab.json, 'edit-exit' "
+      + 'reloads the return scene. None of the three is undoable — they are scene swaps and a '
+      + 'file write, matching load-scene and create respectively.',
   },
   modoki_gizmo: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-gizmo', mutating: true, persists: 'session',
@@ -484,6 +505,13 @@ const DECLS: Record<string, Decl> = {
     kind: 'read', method: 'GET', route: '/api/diagnose', requires: ['editor', 'scene'],
     notes: 'C7: `ok:false` is an ANSWER (your scene is unhealthy), not a failed call.',
   },
+  modoki_profiler: {
+    kind: 'control', method: 'GET', route: '/api/profiler', varies: 'both',
+    mutating: true, persists: 'session', requires: ['editor', 'renderer'],
+    filters: ['markers'],
+    minimalArgs: {},
+    notes: 'Read actions (read / capture-read) are GET; the state-changing ones (capture-*, gpu-*, reset) are POST, so §4 holds per action. A read-side filter passed to a mutating action is REFUSED, not dropped (the `watch` S3.19 hazard).',
+  },
   modoki_watch: {
     kind: 'control', method: 'GET', route: '/api/watch/list', varies: 'both',
     mutating: true, persists: 'session', requires: ['editor', 'renderer'],
@@ -495,6 +523,36 @@ const DECLS: Record<string, Decl> = {
     notes: "Three tools under one name: action start→POST /api/watch/start (creates a watcher), " +
       "read→samples, list→GET /api/watch/list, clear→POST /api/watch/clear (destroys watchers). " +
       "Declared kind is 'control', not 'read', because start/clear change watcher state.",
+  },
+  modoki_input_watch: {
+    kind: 'control', method: 'GET', route: '/api/input-watch/read', varies: 'both',
+    mutating: true, persists: 'session', requires: ['editor', 'renderer'],
+    filters: ['limit', 'unresolvedOnly', 'precision'],
+    // `unresolvedOnly` is the surface's first NARROWING boolean — it keeps only the presses that
+    // resolved to nothing, which is the whole diagnostic question here. See `narrowingFlags`.
+    narrowingFlags: ['unresolvedOnly'],
+    minimalArgs: { action: 'read' },
+    minimalArgsMutates: false, // action:'read' only reads; start/stop/clear are the mutating halves
+    notes: "Four ops under one name: action start→POST /api/input-watch/start (opens the recorder, " +
+      "records nothing before this call), read→GET /api/input-watch/read (default action), " +
+      "stop→POST /api/input-watch/stop (closes it, KEEPS recorded presses), clear→POST " +
+      "/api/input-watch/clear (drops recorded presses, window stays open if it was). Declared kind " +
+      "is 'control', not 'read', because start/stop/clear change recorder state.",
+  },
+
+  modoki_hit_regions: {
+    kind: 'control', method: 'GET', route: '/api/hit-regions', varies: 'both',
+    mutating: true, persists: 'session', requires: ['editor', 'renderer'],
+    filters: ['provider', 'kind', 'ids', 'limit', 'precision'],
+    minimalArgs: { action: 'read' },
+    // action:'read' only reads; show/hide flip the on-screen overlay, which is session state.
+    minimalArgsMutates: false,
+    notes: "Three actions under one name: action read (default) returns the regions as DATA, " +
+      "action show/hide toggles the on-screen SVG overlay. Declared kind is 'control', not 'read', " +
+      "because show/hide change overlay state. `at:{x,y}` answers the miss question directly — it " +
+      "reports which regions contain that point and, when none do, the NEAREST region with its " +
+      "distance in px. Returns `providers` alongside `regions` so an empty list can be read " +
+      "correctly: no provider registered is 'nobody could answer', not 'nothing is there'.",
   },
 
   // ── asset schema + authoring ──

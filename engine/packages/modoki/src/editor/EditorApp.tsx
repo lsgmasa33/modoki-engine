@@ -4,7 +4,6 @@ import './EditorApp.css';
 import { backendFetch } from './backend/editorBackend';
 import { useRef, useState, useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
 import { Layout, Model, TabNode, Actions, DockLocation } from 'flexlayout-react';
-import type { IJsonModel } from 'flexlayout-react';
 import 'flexlayout-react/style/dark.css';
 
 import { PanelFocusHost } from './input/PanelFocusHost';
@@ -18,6 +17,7 @@ import SceneView from './panels/SceneView';
 import Hierarchy from './panels/Hierarchy';
 import Inspector from './panels/Inspector';
 import Console from './panels/Console';
+import Profiler from './panels/Profiler';
 import Assets from './panels/Assets';
 import ParticleEditor from './panels/ParticleEditor';
 import AnimationEditor from './panels/AnimationEditor';
@@ -40,9 +40,16 @@ import { useEditorStore } from './store/editorStore';
 import { setActionCallback } from './undo/entityActions';
 import { pushAction, undo, redo, canUndo, canRedo, undoLabel, redoLabel, subscribeUndo, getUndoVersion } from './undo/undoManager';
 
-import { getGameViewComponent, getCustomPanels, getExtraMenus, getProjectSettings } from './createEditor';
+import { getGameViewComponent, getCustomPanels, getExtraMenus, getExtraMenusVersion, subscribeExtraMenus, getProjectSettings } from './createEditor';
 import { dockPanel, toDockLocation } from './panelDock';
-import { AUTOSAVE_NAME, isLayoutJson, sanitizeLayoutName, sanitizeExportFileName, deriveLayoutBaseName } from './utils/layoutNames';
+import { AUTOSAVE_NAME, isLayoutJson, sanitizeLayoutName, deriveLayoutBaseName } from './utils/layoutNames';
+import {
+  panelLabel, LAYOUT_NAME_KEY,
+  autoDockedPanels, markAutoDocked,
+  saveLayout, currentLayoutName,
+  writeLayoutJson, writeLayout, downloadLayoutJson, readLayout,
+  loadInitialModel, clearStoredLayout, orderLayoutChoices,
+} from './utils/layoutStore';
 
 // Wire ECS action callback to editor undo system
 setActionCallback(pushAction);
@@ -50,60 +57,6 @@ setActionCallback(pushAction);
 // GameView — injected by createEditor(), or placeholder
 const GameViewFallback = () => <div style={{ background: '#1a1a2e', color: '#555', display: 'flex', alignItems: 'center', justifyContent: 'center', width: '100%', height: '100%' }}>Game View (not configured)</div>;
 const GameView = getGameViewComponent() || GameViewFallback;
-
-// Default layout — Unity-inspired
-const defaultLayout: IJsonModel = {
-  global: {
-    // Each panel tab shows a ✕ that closes (hides) it; re-show from the Window menu.
-    tabEnableClose: true,
-    tabSetEnableMaximize: true,
-    tabSetEnableTabStrip: true,
-    splitterSize: 4,
-  },
-  borders: [],
-  layout: {
-    type: 'row',
-    weight: 100,
-    children: [
-      {
-        type: 'tabset',
-        weight: 15,
-        children: [
-          { type: 'tab', name: 'Hierarchy', component: 'hierarchy' },
-        ],
-      },
-      {
-        type: 'row',
-        weight: 55,
-        children: [
-          {
-            type: 'tabset',
-            weight: 60,
-            children: [
-              { type: 'tab', name: 'Scene', component: 'scene' },
-            ],
-          },
-          {
-            type: 'tabset',
-            weight: 40,
-            children: [
-              { type: 'tab', name: 'Game', component: 'game' },
-              { type: 'tab', name: 'Console', component: 'console' },
-              { type: 'tab', name: 'Assets', component: 'assets' },
-            ],
-          },
-        ],
-      },
-      {
-        type: 'tabset',
-        weight: 30,
-        children: [
-          { type: 'tab', name: 'Inspector', component: 'inspector' },
-        ],
-      },
-    ],
-  },
-};
 
 const PANELS: Record<string, React.ComponentType> = {
   scene: SceneView,
@@ -118,155 +71,13 @@ const PANELS: Record<string, React.ComponentType> = {
   'spriteanim-editor': SpriteAnimEditor,
   'skin-editor': SkinEditor,
   ai: AIPanel,
+  profiler: Profiler,
   // Game-specific panels injected via createEditor()
   ...Object.fromEntries(getCustomPanels().map(p => [p.id, p.component])),
 };
 
-// Human-readable labels for the Window menu (built-in name, else custom panel name).
-const PANEL_LABELS: Record<string, string> = {
-  scene: 'Scene', game: 'Game', hierarchy: 'Hierarchy', inspector: 'Inspector',
-  console: 'Console', assets: 'Assets', 'particle-editor': 'Particle Editor', 'animation-editor': 'Animation', 'timeline-editor': 'Timeline', 'spriteanim-editor': 'Sprite Animation', 'skin-editor': '2D Skin', ai: 'AI',
-};
-const panelLabel = (id: string): string =>
-  PANEL_LABELS[id] ?? getCustomPanels().find((p) => p.id === id)?.name ?? id;
-
-// ── Layout persistence ──────────────────────────────────
-//
-// Layouts are MACHINE-LOCAL editor working state — NOT engine source or project
-// data — so they're stored per-project under <project>/.modoki/layouts/ (a
-// gitignored dir), served by the backend /api/layout(s) endpoints. This mirrors
-// recent-projects.json; it deliberately does NOT use the asset tree (which would
-// write layouts into the engine package and commit them).
-//
-// The working layout also auto-saves to a reserved "autosave" layout so there's
-// ALWAYS a durable, loadable recovery point — the user never has to "Save Layout
-// As" before they can load a past layout. localStorage is kept only as an offline
-// fast-path mirror. The tracked layout NAME (last loaded/saved) persists in
-// localStorage so the association survives a reload.
-
-const LAYOUT_KEY = 'editor-layout';            // localStorage working-state mirror
-const LAYOUT_NAME_KEY = 'editor-layout-name';  // name of the tracked layout
-const AUTODOCK_KEY = 'editor-autodocked-panels'; // openByDefault panel ids already auto-docked once
-
-/** Panel ids this editor has already auto-docked (so an openByDefault panel appears
- *  once, then respects the user closing it). */
-function autoDockedPanels(): Set<string> {
-  try { return new Set(JSON.parse(localStorage.getItem(AUTODOCK_KEY) || '[]') as string[]); }
-  catch { return new Set(); }
-}
-function markAutoDocked(ids: string[]): void {
-  const s = autoDockedPanels();
-  for (const id of ids) s.add(id);
-  try { localStorage.setItem(AUTODOCK_KEY, JSON.stringify([...s])); } catch { /* storage full/blocked */ }
-}
-
-function saveLayout(model: Model) {
-  localStorage.setItem(LAYOUT_KEY, JSON.stringify(model.toJson()));
-}
-
-function loadLayout(): IJsonModel | null {
-  const json = localStorage.getItem(LAYOUT_KEY);
-  if (!json) return null;
-  try { return JSON.parse(json); }
-  catch { return null; }
-}
-
-function currentLayoutName(): string | null {
-  return localStorage.getItem(LAYOUT_NAME_KEY);
-}
-
-/** Write raw layout JSON to <project>/.modoki/layouts/<name>.layout.json. */
-async function writeLayoutJson(name: string, content: unknown): Promise<boolean> {
-  try {
-    const res = await backendFetch('/api/layout', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, content }),
-    });
-    return res.ok;
-  } catch { return false; }
-}
-
-/** Write a layout to <project>/.modoki/layouts/<name>.layout.json. */
-function writeLayout(name: string, model: Model): Promise<boolean> {
-  return writeLayoutJson(name, model.toJson());
-}
-
-
-/** Download arbitrary layout JSON as a portable `<name>.layout.json` file — the
- *  export counterpart to `LoadLayoutModal`'s "Load from file…" import. Works in
- *  both the Electron and web editors via a plain object-URL anchor click. */
-function downloadLayoutJson(name: string, json: unknown): void {
-  const blob = new Blob([JSON.stringify(json, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `${sanitizeExportFileName(name)}.layout.json`;
-  a.click();
-  // Defer the revoke — revoking on the same tick can race the browser's download
-  // read of the object URL and drop the file.
-  setTimeout(() => URL.revokeObjectURL(url), 0);
-}
-
-/** Read a saved layout by name, or null if it doesn't exist / fetch failed. */
-async function readLayout(name: string): Promise<IJsonModel | null> {
-  try {
-    const res = await backendFetch(`/api/layout?name=${encodeURIComponent(name)}`);
-    if (!res.ok) return null;
-    return await res.json();
-  } catch { return null; }
-}
-
-/** Build a Model from stored JSON, or null if missing/malformed — so a corrupt or
- *  stale-format saved layout falls back to the next candidate instead of crashing
- *  the editor on mount (Model.fromJson throws on bad input). Self-heals: the bad
- *  entry is overwritten by the next autosave. */
-function toModel(json: unknown): Model | null {
-  if (!json) return null;
-  try {
-    const m = Model.fromJson(json as IJsonModel);
-    normalizeTabTitles(m);
-    return m;
-  }
-  catch (e) { console.warn('[Editor] ignoring invalid saved layout (falling back):', e); return null; }
-}
-
-/** Retitle built-in editor tabs to their current PANEL_LABELS value. Tab names are
- *  derived purely from the component (tabs aren't user-renamable), so a persisted
- *  layout can carry a stale title after a panel is renamed (e.g. Skin → 2D Skin).
- *  Only touches known built-ins, leaving custom-panel tabs alone. */
-function normalizeTabTitles(model: Model): void {
-  model.visitNodes((node) => {
-    if (!(node instanceof TabNode)) return;
-    const component = node.getComponent();
-    const label = component ? PANEL_LABELS[component] : undefined;
-    if (label && node.getName() !== label) {
-      model.doAction(Actions.updateNodeAttributes(node.getId(), { name: label }));
-    }
-  });
-}
-
-/** Build the initial layout model: prefer the tracked layout, then the
- *  auto-saved last session, then the localStorage mirror, then the default.
- *  `fromDefault` is true only when nothing was restored — the "first load" signal
- *  that gates openByDefault custom-panel auto-docking (so a panel the user later
- *  closes stays closed on reload). */
-async function loadInitialModel(): Promise<{ model: Model; fromDefault: boolean }> {
-  const tracked = currentLayoutName();
-  if (tracked) {
-    const m = toModel(await readLayout(tracked));
-    if (m) return { model: m, fromDefault: false };
-    localStorage.removeItem(LAYOUT_NAME_KEY); // layout is gone/invalid — drop the stale reference
-  }
-  const autosaved = toModel(await readLayout(AUTOSAVE_NAME));
-  if (autosaved) return { model: autosaved, fromDefault: false };
-  const mirror = toModel(loadLayout());
-  if (mirror) return { model: mirror, fromDefault: false };
-  return { model: Model.fromJson(defaultLayout), fromDefault: true };
-}
-
 function resetLayout() {
-  localStorage.removeItem(LAYOUT_KEY);
-  localStorage.removeItem(LAYOUT_NAME_KEY);
+  clearStoredLayout();
   console.log('[Editor] Layout reset to default');
   // Reload for a clean panel remount (live Three.js/Pixi viewports don't tear
   // down cleanly on an in-place model swap).
@@ -276,6 +87,7 @@ function resetLayout() {
 // ── Menu definitions ────────────────────────────────────
 
 import MenuBar, { type BarMenuItem } from './components/MenuBar';
+import { buildMenuSpec } from './menuSpec';
 
 // ── Main Editor ─────────────────────────────────────────
 
@@ -339,7 +151,7 @@ export default function EditorApp() {
     const model = modelRef.current;
     if (!model) return;
     const loc = getCustomPanels().find((p) => p.id === id)?.dockLocation;
-    dockPanel(model, id, panelLabel(id), toDockLocation(loc));
+    dockPanel(model, id, panelLabel(id, getCustomPanels()), toDockLocation(loc));
   }, []);
 
   // Whether a panel currently has an open tab (drives the Window-menu checkmark).
@@ -461,7 +273,17 @@ export default function EditorApp() {
             useEditorStore.getState().showToast(msg, 'warn');
             return;
           }
-          if (isEditingPrefab()) { savePrefabEdit(); useEditorStore.getState().showToast('Prefab saved', 'success'); }
+          // ⚠️ AWAIT it and report what happened. This fired the green toast unconditionally, without
+          // awaiting — so a refused save (prefab root not found, the opened prefab gone from the
+          // editor cache, a failed write) told the human their work was safe when nothing had been
+          // written. Exactly the C7 class fixed for scenes three lines below, still live here.
+          if (isEditingPrefab()) {
+            void savePrefabEdit().then((ok) => {
+              const t = useEditorStore.getState().showToast;
+              if (ok) t('Prefab saved', 'success');
+              else t('Prefab save FAILED — nothing written to disk (see console)', 'warn');
+            });
+          }
           // Report what actually happened. This showed a green "Scene saved" unconditionally —
           // not even awaiting saveAll — so a Save-As CANCEL or a failed write (project moved,
           // disk full, permissions) told the HUMAN their work was safe when it was not. (C7)
@@ -470,7 +292,12 @@ export default function EditorApp() {
               const t = useEditorStore.getState().showToast;
               if (r.saved) t('Scene saved', 'success');
               else if (r.reason === 'cancelled') t('Save cancelled — nothing written', 'info');
-              else t(`Save FAILED (${r.reason}) — nothing written to disk`, 'warn');
+              // Reachable only when the prefab-edit world is loaded but the editingPrefab flag is
+              // gone, so the branch above did not claim the keystroke. Say which save is missing
+              // rather than "Save FAILED (prefab-edit)", which reads like a bug in the prefab.
+              else if (r.reason === 'prefab-edit') {
+                t('This is a prefab-edit world — re-open the prefab to save it (nothing written)', 'warn');
+              } else t(`Save FAILED (${r.reason}) — nothing written to disk`, 'warn');
             });
           }
         },
@@ -688,7 +515,7 @@ export default function EditorApp() {
     if (tabId) model.doAction(Actions.selectTab(tabId));
     else {
       const target = sceneTabsetId ?? firstTabsetId;
-      if (target) model.doAction(Actions.addNode({ type: 'tab', name: panelLabel('skin-editor'), component: 'skin-editor' }, target, DockLocation.CENTER, -1, true));
+      if (target) model.doAction(Actions.addNode({ type: 'tab', name: panelLabel('skin-editor', getCustomPanels()), component: 'skin-editor' }, target, DockLocation.CENTER, -1, true));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editingSkin?.path, skinNonce]);
@@ -730,7 +557,7 @@ export default function EditorApp() {
     if (!model) return;
     const { id } = panelOpenRequest;
     const loc = getCustomPanels().find((p) => p.id === id)?.dockLocation;
-    dockPanel(model, id, panelLabel(id), toDockLocation(loc));
+    dockPanel(model, id, panelLabel(id, getCustomPanels()), toDockLocation(loc));
     // Key on the nonce so a repeat open of the same panel re-focuses it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [panelOpenRequest?.nonce]);
@@ -797,6 +624,10 @@ export default function EditorApp() {
   // Play/Stop transitions (undo is disabled while Playing — see the Cmd+Z guard).
   const playState = useSyncExternalStore(onPlayStateChange, getPlayState, getPlayState);
   const canEdit = playState === 'stopped';
+  // Host-owned menus (Build) can be REPLACED after boot — the device pickers are filled from an
+  // async listing that must not block editor start. Bump → rebuild the tree AND re-push the
+  // Electron spec, or the OS menu keeps the boot-time labels forever.
+  const extraMenusVersion = useSyncExternalStore(subscribeExtraMenus, getExtraMenusVersion, getExtraMenusVersion);
 
   // Build the menu tree + its serializable Electron spec ONCE per relevant input
   // change (layout name, undo/redo state) instead of on every render. Recomputing
@@ -804,15 +635,29 @@ export default function EditorApp() {
   // `menu-structure` send on most renders (toasts, import progress, nonces). (F3)
   const { menus, menuSpecJson, menuActionMap } = useMemo(() => {
     void undoVersion; // dep: undo labels/enabled are read via canUndo()/undoLabel() below
+    void extraMenusVersion; // dep: getExtraMenus() below is a module registry, read imperatively
     const menus: Record<string, BarMenuItem[]> = {
     File: [
       // New Scene → Assets panel context menu (Create Scene), so it makes a scene
       // FILE. Save Scene As → rename the scene in the Assets window. Both dropped here.
       { label: 'Save All', shortcut: 'Cmd+S', action: () => {
-        if (isEditingPrefab()) { savePrefabEdit(); return; }
+        // ⚠️ This is the NATIVE File-menu twin of the `app.saveAll` keymap handler above, reachable
+        // without the shortcut, and it must report failures the same way. It did not: the prefab
+        // branch was fire-and-forget with no toast at all, so a refused prefab save (root not
+        // found, prefab evicted from the editor cache, write rejected) told the user nothing. The
+        // keymap handler was fixed first and this duplicate 360 lines away was missed — the exact
+        // hazard of having two entry points for one command.
+        if (isEditingPrefab()) {
+          void savePrefabEdit().then((ok) => {
+            const t = useEditorStore.getState().showToast;
+            t(ok ? 'Prefab saved' : 'Prefab save FAILED — nothing written to disk (see console)', ok ? 'success' : 'warn');
+          });
+          return;
+        }
         void saveAll().then((r) => { // never claim a save that didn't land (C7)
           const t = useEditorStore.getState().showToast;
           if (r.saved) t('Scene saved', 'success');
+          else if (r.reason === 'prefab-edit') t('This is a prefab-edit world — re-open the prefab to save it (nothing written)', 'warn');
           else if (r.reason !== 'cancelled') t(`Save FAILED (${r.reason}) — nothing written to disk`, 'warn');
         });
       } },
@@ -836,7 +681,7 @@ export default function EditorApp() {
     // marks panels currently open; closing a panel's tab (its ✕) hides it, and
     // picking it here brings it back.
     Window: Object.keys(PANELS).map((id) => ({
-      label: panelLabel(id),
+      label: panelLabel(id, getCustomPanels()),
       checked: isPanelVisible(id),
       action: () => showPanel(id),
     })),
@@ -853,20 +698,12 @@ export default function EditorApp() {
     // Under Electron, mirror `menus` into the OS-level application menu instead of
     // the in-window bar: build a serializable spec (no functions cross IPC) + an
     // id → action map, push the spec to main, and dispatch clicks relayed back.
-    const menuActionMap: Record<string, () => void> = {};
-    const menuSpec = {
-      menus: Object.entries(menus).map(([name, items]) => ({
-        name,
-        items: items.map((it, i) => {
-          if (it.separator) return { separator: true };
-          const id = `${name}#${i}`;
-          if (it.action) menuActionMap[id] = it.action;
-          return { id, label: it.label, shortcut: it.shortcut, disabled: it.disabled, checked: it.checked };
-        }),
-      })),
-    };
+    // Spec + action map are built together by `menuSpec.ts` — they must agree on ids, and the id
+    // scheme is load-bearing enough to be unit-tested (see `menuItemId` for why an id carries its
+    // label, not just its position).
+    const { menuSpec, menuActionMap } = buildMenuSpec(menus);
     return { menus, menuSpecJson: JSON.stringify(menuSpec), menuActionMap };
-  }, [layoutName, undoVersion, canEdit, handleSaveLayout, handleSaveLayoutAs, showPanel, isPanelVisible, layoutVersion]);
+  }, [layoutName, undoVersion, extraMenusVersion, canEdit, handleSaveLayout, handleSaveLayoutAs, showPanel, isPanelVisible, layoutVersion]);
 
   // Keep the click-relay's action map current with the latest memoized spec.
   menuActionRef.current = menuActionMap;
@@ -877,7 +714,14 @@ export default function EditorApp() {
   // Register the click relay once.
   useEffect(() => {
     if (!electronBridge) return;
-    return electronBridge.on('menu-action', (id) => { menuActionRef.current[id as string]?.(); });
+    return electronBridge.on('menu-action', (id) => {
+      const action = menuActionRef.current[id as string];
+      // A miss means the click came from a menu that has since been rebuilt (see the id scheme
+      // above) — doing nothing is correct, but it must not be SILENT: to the user their click
+      // simply did not work, and this line is the only evidence of why.
+      if (!action) { console.warn(`[editor] ignoring a menu click for "${id}" — the menu was rebuilt since it was opened; reopen it and click again`); return; }
+      action();
+    });
   }, []);
   // Cmd/Ctrl+wheel → whole-app UI zoom (VS Code–style). Forward the intent to main,
   // which owns the webContents zoom (clamp + persist). Capture phase + non-passive so
@@ -1014,14 +858,10 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     backendFetch('/api/layouts')
       .then((r) => r.json())
-      .then((m: { layouts: string[] }) => {
-        const names = m.layouts ?? [];
-        // Pin the auto-saved "last session" to the top with a friendly label; the
-        // rest are named layouts (Save Layout As) sorted alphabetically.
-        const autosave = names.filter((n) => n === AUTOSAVE_NAME).map((n) => ({ name: n, label: 'Last session (auto-saved)' }));
-        const named = names.filter((n) => n !== AUTOSAVE_NAME).sort((a, b) => a.localeCompare(b)).map((n) => ({ name: n, label: n }));
-        setLayouts([...autosave, ...named]);
-      })
+      // Pin the auto-saved "last session" to the top with a friendly label; the rest
+      // are named layouts (Save Layout As) sorted alphabetically. The rule itself is
+      // in layoutStore so it can be tested without mounting this dialog.
+      .then((m: { layouts: string[] }) => setLayouts(orderLayoutChoices(m.layouts ?? [])))
       .catch(() => setLayouts([]));
   }, []);
 

@@ -9,7 +9,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
-  getAllTraits, readTraitData, getCurrentWorld, getTraitByName,
+  getAllTraits, readTraitData, getCurrentWorld, getTraitByName, spawnEntity,
   type TraitMeta,
 } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -54,8 +54,8 @@ function pickDistinct(hint: FieldHint, old: unknown): unknown {
 function spawnWith(meta: TraitMeta): number {
   const ea = getTraitByName('EntityAttributes')!;
   const entity = meta.name === 'EntityAttributes'
-    ? getCurrentWorld().spawn(meta.trait({ name: 'rt' }))
-    : getCurrentWorld().spawn(meta.trait(), ea.trait({ name: 'rt' }));
+    ? spawnEntity(getCurrentWorld(), meta.trait({ name: 'rt' }))
+    : spawnEntity(getCurrentWorld(), meta.trait(), ea.trait({ name: 'rt' }));
   return entity.id();
 }
 

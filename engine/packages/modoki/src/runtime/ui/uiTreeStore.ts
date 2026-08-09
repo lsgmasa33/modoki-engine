@@ -26,7 +26,7 @@ export interface UINodeData {
   width: number; height: number;
   widthUnit: string; heightUnit: string;
   flexDirection: string; flexWrap: string; justifyContent: string; alignItems: string;
-  gap: number; flexGrow: number; flexShrink: number;
+  gap: number; gapUnit: string; flexGrow: number; flexShrink: number;
   paddingTop: number; paddingTopUnit: string;
   paddingLeft: number; paddingLeftUnit: string;
   paddingRight: number; paddingRightUnit: string;
@@ -38,7 +38,7 @@ export interface UINodeData {
   minWidth: number; minWidthUnit: string; maxWidth: number; maxWidthUnit: string;
   minHeight: number; minHeightUnit: string; maxHeight: number; maxHeightUnit: string;
   alignSelf: string; zIndex: number;
-  overflow: string; isVisible: boolean;
+  overflow: string; isVisible: boolean; pointerThrough: boolean;
   // ── Style ──
   backgroundColor: number; backgroundOpacity: number;
   borderRadius: number; borderWidth: number; borderColor: number; borderOpacity: number;
@@ -53,6 +53,10 @@ export interface UINodeData {
   textOverflow: string; maxLines: number;
   // ── Image ──
   imageSrc: string; imageMode: string;
+  /** This UI entity also carries a `VideoPlayer` — UINode mounts the clip into its box
+   *  (`UIVideoMount`), cropped by `imageMode`. Video as SCENERY, distinct from the
+   *  fullscreen `VideoOverlay` cutscene, which sits above everything. */
+  hasVideo: boolean;
   // ── Element type ──
   elementType: string; placeholder: string;
   // ── Range (slider) ──
@@ -181,7 +185,7 @@ function reconcileNode(node: UINodeData, nextPrev: Map<number, UINodeData>): UIN
 
 // Cache trait lookups (resolve once, reuse across frames)
 let _traitsCached = false;
-let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any;
+let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any, _videoMeta: any;
 
 function cacheTraits() {
   const allTraits = getAllTraits();
@@ -193,6 +197,7 @@ function cacheTraits() {
   _anchorMeta = allTraits.find(m => m.name === 'UIAnchor');
   _canvas2dMeta = allTraits.find(m => m.name === 'Canvas2D');
   _textAnimMeta = allTraits.find(m => m.name === 'TextAnimation');
+  _videoMeta = allTraits.find(m => m.name === 'VideoPlayer');
   _traitsCached = !!(_renderUIMeta && _uiElMeta);
 }
 
@@ -243,7 +248,7 @@ function buildTree(world: World): UINodeData[] {
         width: ui.width, height: ui.height,
         widthUnit: ui.widthUnit || 'px', heightUnit: ui.heightUnit || 'px',
         flexDirection: ui.flexDirection, flexWrap: ui.flexWrap || 'nowrap', justifyContent: ui.justifyContent,
-        alignItems: ui.alignItems, gap: ui.gap,
+        alignItems: ui.alignItems, gap: ui.gap, gapUnit: ui.gapUnit || 'px',
         flexGrow: ui.flexGrow, flexShrink: ui.flexShrink,
         paddingTop: ui.paddingTop, paddingTopUnit: ui.paddingTopUnit || 'px',
         paddingLeft: ui.paddingLeft, paddingLeftUnit: ui.paddingLeftUnit || 'px',
@@ -259,6 +264,7 @@ function buildTree(world: World): UINodeData[] {
         maxHeight: ui.maxHeight || 0, maxHeightUnit: ui.maxHeightUnit || 'px',
         alignSelf: ui.alignSelf || 'auto', zIndex: ui.zIndex || 0,
         overflow: ui.overflow, isVisible: ui.isVisible,
+        pointerThrough: ui.pointerThrough === true,
         backgroundColor: ui.backgroundColor || 0, backgroundOpacity: ui.backgroundOpacity || 0,
         borderRadius: ui.borderRadius || 0, borderWidth: ui.borderWidth || 0,
         borderColor: ui.borderColor || 0x333333, borderOpacity: ui.borderOpacity ?? 1, opacity: ui.opacity ?? 1,
@@ -274,6 +280,12 @@ function buildTree(world: World): UINodeData[] {
         imageSrc: ui.imageSrc || '', imageMode: ui.imageMode || 'cover',
         elementType: ui.elementType || 'div', placeholder: ui.placeholder || '',
         rangeMin: ui.rangeMin ?? 0, rangeMax: ui.rangeMax ?? 100, rangeStep: ui.rangeStep ?? 1,
+        // A PLAIN SCALAR, always written, never an optional nested block: `_scalarKeys`
+        // is derived once from whichever node happens to be built first, so an
+        // only-sometimes-present key can be missed entirely — and a node whose video
+        // appeared or vanished would then keep its old object reference and never
+        // re-render (the same trap the textAnim play-gate comment below records).
+        hasVideo: !!(_videoMeta && entity.has(_videoMeta.trait)),
         children: [],
       };
 

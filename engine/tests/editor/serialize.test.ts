@@ -2,7 +2,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createWorld } from 'koota';
-import { getCurrentWorld, loadSceneFile, SCENE_FORMAT_VERSION } from '@modoki/engine/runtime';
+import { getCurrentWorld, loadSceneFile, SCENE_FORMAT_VERSION, spawnEntity } from '@modoki/engine/runtime';
 import { Transform, Renderable3D, Renderable3DPrimitive, EntityAttributes, Time, Paused, Transient, PrefabInstance } from '@modoki/engine/runtime';
 import { RenderableUI, UIElement, UIBinding, UIAction, type UIActionBinding } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -20,14 +20,14 @@ const PAUSED_MESH_GUID = 'c0000000-0000-4000-8000-000000000002';
 describe('serializeScene', () => {
   beforeEach(() => {
     // Spawn some test entities
-    getCurrentWorld().spawn(Time());
-    getCurrentWorld().spawn(TestPhase({ phase: 'game' }));
-    getCurrentWorld().spawn(
+    spawnEntity(getCurrentWorld(), Time());
+    spawnEntity(getCurrentWorld(), TestPhase({ phase: 'game' }));
+    spawnEntity(getCurrentWorld(), 
       Transform({ x: 5, y: 10, z: 15 }),
       Renderable3D({ mesh: HERO_MESH_GUID }),
       EntityAttributes({ name: 'hero', isActive: true }),
     );
-    getCurrentWorld().spawn(
+    spawnEntity(getCurrentWorld(), 
       Transform({ x: 0, y: 0, z: 0 }),
       Renderable3DPrimitive({ mesh: 'cube', color: 0x00ff00, size: 2 }),
       EntityAttributes({ name: 'prim', isActive: true }),
@@ -96,19 +96,19 @@ describe('serializeScene', () => {
   // from a painted .level.json). serializeScene must skip a Transient entity AND its
   // whole subtree so a Cmd+S / Play snapshot never bakes it into the scene file.
   it('skips a Transient entity and its entire subtree', async () => {
-    const genRoot = getCurrentWorld().spawn(
+    const genRoot = spawnEntity(getCurrentWorld(), 
       Transform({ x: 0, y: 0, z: 0 }),
       EntityAttributes({ name: 'generated-field', isActive: true }),
     );
     genRoot.add(Transient);
     // A child of the transient root (parented) — must also be skipped.
-    getCurrentWorld().spawn(
+    spawnEntity(getCurrentWorld(), 
       Transform({ x: 1, y: 0, z: 0 }),
       Renderable3DPrimitive({ mesh: 'box', color: 0xffffff, size: 1 }),
       EntityAttributes({ name: 'generated-tile', isActive: true, parentId: genRoot.id() }),
     );
     // A normal sibling that must still serialize.
-    getCurrentWorld().spawn(
+    spawnEntity(getCurrentWorld(), 
       Transform({ x: 9, y: 0, z: 0 }),
       EntityAttributes({ name: 'authored-keeper', isActive: true }),
     );
@@ -127,14 +127,14 @@ describe('serializeScene', () => {
     // A transient prefab-instance root (GUID source, uncached — the transient skip runs BEFORE
     // any prefab resolution) plus a member child. This is what rebuildField produces.
     const KIT_SRC = 'aaaa2222-2222-4222-8222-222222222222';
-    const genInst = getCurrentWorld().spawn(
+    const genInst = spawnEntity(getCurrentWorld(), 
       Transform({ x: 0, y: 0, z: 0 }),
       PrefabInstance({ source: KIT_SRC, localId: 0 }),
       EntityAttributes({ name: 'gen-tile', isActive: true }),
     );
     genInst.set(PrefabInstance, { ...(genInst.get(PrefabInstance) as object), rootInstanceId: genInst.id() });
     genInst.add(Transient);
-    getCurrentWorld().spawn(
+    spawnEntity(getCurrentWorld(), 
       Transform({ x: 0.5, y: 0, z: 0 }),
       PrefabInstance({ source: KIT_SRC, localId: 2, rootInstanceId: genInst.id() }),
       EntityAttributes({ name: 'gen-tile-member', isActive: true, parentId: genInst.id() }),
@@ -152,7 +152,7 @@ describe('serializeScene', () => {
 
   it('serializes tag traits as boolean true', async () => {
     // Spawn entity with Paused tag
-    const entity = getCurrentWorld().spawn(
+    const entity = spawnEntity(getCurrentWorld(), 
       Transform({ x: 0, y: 0, z: 0 }),
       Renderable3D({ mesh: PAUSED_MESH_GUID }),
       EntityAttributes({ name: 'paused-entity', isActive: true }),
@@ -195,7 +195,7 @@ describe('serializeScene', () => {
   // guid must appear in the OUTPUT (snapshot needs stable identity) but the world
   // entity must stay untouched until an explicit { assignGuids: true } save.
   it('snapshot path (no opts) mints a guid into the output but NOT the live world', async () => {
-    const entity = getCurrentWorld().spawn(
+    const entity = spawnEntity(getCurrentWorld(), 
       Transform({ x: 1, y: 1, z: 1 }),
       EntityAttributes({ name: 'fresh-unsaved', isActive: true }),
     );
@@ -212,7 +212,7 @@ describe('serializeScene', () => {
   });
 
   it('save path ({ assignGuids: true }) commits the minted guid to the live world', async () => {
-    const entity = getCurrentWorld().spawn(
+    const entity = spawnEntity(getCurrentWorld(), 
       Transform({ x: 2, y: 2, z: 2 }),
       EntityAttributes({ name: 'fresh-tosave', isActive: true }),
     );
@@ -238,7 +238,7 @@ describe('serializeScene', () => {
 
   it('flags a stray internal asset path ref on save (GUID-only guard) without rewriting it', async () => {
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
-    getCurrentWorld().spawn(
+    spawnEntity(getCurrentWorld(), 
       Transform({ x: 2, y: 2, z: 2 }),
       Renderable3D({ mesh: '/models/stray.mesh.json' }),
       EntityAttributes({ name: 'stray', isActive: true }),
@@ -260,7 +260,7 @@ describe('serializeScene', () => {
   // that only wrote meta.fields silently dropped the chat-input wiring
   // (elementType/inputBinding/bindings) from the llm/chess scenes.
   it('serializes the full trait schema, not just curated Inspector fields', async () => {
-    const node0 = getCurrentWorld().spawn(
+    const node0 = spawnEntity(getCurrentWorld(), 
       RenderableUI(),
       EntityAttributes({ name: 'chat-input', isActive: true, layer: 'ui' }),
       UIElement({ elementType: 'input', placeholder: 'Type a message...' }),
@@ -341,11 +341,11 @@ describe('plain-entity full round-trip (serialize → loadSceneFile)', () => {
 
   it('reloads every trait field on plain entities, with the parent chain remapped', async () => {
     const src = getCurrentWorld();
-    const parent = src.spawn(
+    const parent = spawnEntity(src, 
       Transform({ x: 1, y: 2, z: 3, rx: 0.1, ry: 0.2, rz: 0.3, sx: 4, sy: 5, sz: 6 }),
       EntityAttributes({ name: 'rt-parent', isActive: false, sortOrder: 3, layer: '3d', guid: PARENT_GUID }),
     );
-    const child = src.spawn(
+    const child = spawnEntity(src, 
       Transform({ x: 7, y: 8, z: 9, rx: 1, ry: 1.1, rz: 1.2, sx: 0.5, sy: 0.6, sz: 0.7 }),
       Renderable3D({ mesh: MESH_GUID, material: MAT_GUID, isVisible: false }),
       EntityAttributes({ name: 'rt-child', isActive: true, sortOrder: 7, parentId: parent.id(), layer: '3d', guid: CHILD_GUID }),
@@ -354,7 +354,7 @@ describe('plain-entity full round-trip (serialize → loadSceneFile)', () => {
     // Inspector meta.fields (letterSpacing, textShadowBlur, maxLines, *Unit, …) —
     // the values most likely to be dropped by a serializer that only writes the
     // curated subset.
-    const ui = src.spawn(
+    const ui = spawnEntity(src, 
       RenderableUI(),
       UIElement({
         width: 320, height: 240, widthUnit: 'px', heightUnit: 'px',

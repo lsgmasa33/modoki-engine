@@ -25,6 +25,8 @@ import { Fog } from '../../three/traits/Fog';
 import { fog as fogTsl, exponentialHeightFogFactor, uniform, renderGroup } from 'three/tsl';
 import { worldTransforms, deactivatedEntities, transformPropagationSystem } from '../core/ecs/transformPropagationSystem';
 import { updateSceneLightUniforms } from './sceneLightUniforms';
+import { snapShadowCenter } from './shadowFollow';
+import { syncVideoTextures } from './videoTextureSync';
 import { setEntityMeshCollector } from './materialBroker';
 import { getAnimationClip } from '../loaders/animationClipCache';
 import { resolveActiveClip, resolveClipByName } from '../animation/animClipBank';
@@ -36,7 +38,17 @@ import {
   getCachedEnvironment, acquireEnvironment, onModelInvalidated, getMeshAsset,
 } from '../loaders/meshTemplateCache';
 import { getRiggedModel, ensureRiggedModelLoaded } from '../loaders/riggedModelCache';
-import { getRenderSettings, resolveToneMapping } from './renderSettings';
+import {
+  getRenderSettings, resolveToneMapping, getEffectiveThreeSettings,
+  getActiveQualityTier, setActiveQualityTier, getActiveTierOrDefault,
+} from './renderSettings';
+import { resolveTier, tierShadowMapSize, tierAllowsIBL, tierAmbientBoost, tierExposureBoost, shadowBiasScale, type QualityTierSetting } from './qualityTier';
+import { classifyDevice, probeFingerprint, type DeviceClass } from './rampProbe';
+import { probeVerdictStore } from '../core/probeVerdictStore';
+import { isProbeInFlight, withProbeInFlight } from './probeReentrancy';
+import { applyInstancedBatching } from './instancedBatching';
+import { getDeviceCaps } from './deviceCaps';
+import { getPlayerQualityTier } from './playerQualityTier';
 import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
 import { resolveAnimSetParams, ANIMSET_DEFAULTS, getAnimSet } from '../loaders/animSetCache';
 import { clone as cloneSkeleton, retargetClip } from 'three/examples/jsm/utils/SkeletonUtils.js';
@@ -48,11 +60,20 @@ import { getPlayState } from '../core/playState';
 import { isSkeletalPreviewing, skeletalPreviewDelta } from '../core/skeletalPreview';
 import { getSkeletalSeek, hasSkeletalSeeks, clearSkeletalSeeks } from '../core/skeletalSeek';
 import { createPrimitiveMesh } from '../loaders/primitives';
+import {
+  beginLightMaskFrame, getMaskedMaterial, isLightMaskingActive, maskNeedsVariant, baseOf,
+  DEFAULT_RENDERING_LAYER_MASK, type MaskedLight, type LightingFactory,
+} from './lightMaskVariants';
+import { getActiveRenderer } from '../core/activeRenderer';
 import { setActiveRenderer } from '../loaders/textureResolver';
 import { PARTICLE_LAYER } from './layers';
 
 // Reused across frames to avoid per-frame allocations
 const _activeLightIds = new Set<number>();
+/** This frame's lights + their rendering-layer masks (#136), filled by `syncLights` and
+ *  consumed by the renderable pass that follows it. Reused across frames — `beginLightMaskFrame`
+ *  copies what it keeps. */
+const _maskedLights: MaskedLight[] = [];
 const _activeRenderIds = new Set<number>();
 const _defaultMaterial = new THREE.MeshStandardMaterial({ color: 0xcccccc, roughness: 0.5, metalness: 0 });
 
@@ -369,8 +390,25 @@ export function setActiveCameraFrame(world: World, ref: { name?: string; guid?: 
 
 // ── Environment sync ────────────────────────────────────
 
+/** Did the LAST {@link syncEnvironment} actually take IBL away from this scene?
+ *
+ *  The compensation (`iblOffAmbientBoost` / `iblOffExposure`) must key off THIS, not off the
+ *  tier — suppression is conditional (the tier says no IBL *and* the scene has a loaded HDR
+ *  `Environment` to lose), while a tier check alone is unconditional. Keying the compensation
+ *  on the tier brightened every low-tier scene that never had an environment at all, which is
+ *  a tier RAISING its output — the one thing `docs/rendering.md` § "Quality tiers" says a tier
+ *  must never do. And since an unrecognised device resolves `low` (see `resolveTier`), that was
+ *  every phone running any project with an `AmbientLight` and no `Environment`. */
+let iblSuppressed = false;
+
+/** Test/diagnostic read of the flag above. */
+export function isIblSuppressed(): boolean {
+  return iblSuppressed;
+}
+
 export function syncEnvironment(world: World, scene: THREE.Scene) {
   let envActive = false;
+  let suppressed = false;
   world.query(Environment).updateEach(([env], entity) => {
     if (deactivatedEntities.has(entity.id())) return;
     envActive = true;
@@ -388,8 +426,15 @@ export function syncEnvironment(world: World, scene: THREE.Scene) {
       // Change-gate every write (F5): this runs every frame, but the env texture +
       // its scalars rarely change, and reassigning `scene.background`/intensity flags
       // the three render state dirty on some backends → redundant work.
-      if (scene.environment !== cached) scene.environment = cached;
-      if (scene.environmentIntensity !== envIntensity) scene.environmentIntensity = envIntensity;
+      // Tier gate (#154): IBL costs ~26 ms of a ~53 ms frame on a Huawei Y6 — half of it. The
+      // BACKGROUND below is left alone (measured not to be the cost); only the lighting
+      // contribution is suppressed, and syncLights/applyRendererColorConfig compensate.
+      const iblOn = tierAllowsIBL(getActiveTierOrDefault());
+      if (!iblOn) suppressed = true; // this scene HAS an env and the tier is taking it away
+      const wantEnv = iblOn ? cached : null;
+      const wantEnvIntensity = iblOn ? envIntensity : 1;
+      if (scene.environment !== wantEnv) scene.environment = wantEnv;
+      if (scene.environmentIntensity !== wantEnvIntensity) scene.environmentIntensity = wantEnvIntensity;
       if (env.showAsBackground) {
         if (scene.background !== cached) scene.background = cached;
         if (scene.backgroundIntensity !== bgIntensity) scene.backgroundIntensity = bgIntensity;
@@ -409,6 +454,9 @@ export function syncEnvironment(world: World, scene: THREE.Scene) {
     scene.environment = null;
     scene.environmentIntensity = 1;
   }
+  // Recomputed from scratch each frame, so a scene swap into a no-environment scene (or a tier
+  // promotion) drops the compensation on the very next frame rather than leaving it stuck on.
+  iblSuppressed = suppressed;
 }
 
 /** Force a NodeMaterialObserver refresh across the scene so a change to
@@ -576,23 +624,42 @@ function createLightFromTrait(light: { lightType: string; color: number; intensi
   }
 }
 
-/** Mark a freshly-created object (and any nested meshes, e.g. LOD levels or a loaded
- *  model graph) as shadow caster + receiver. Inert unless a light casts + the renderer's
- *  shadowMap is enabled (both gated elsewhere), so this is always safe to apply.
- *  A mesh whose material is alpha-blended (`transparent: true` — water, glass, sprite
- *  billboards) does NOT cast: the shadow map treats blended geometry as fully opaque,
- *  so a translucent surface would throw a hard, wrongly-shaped shadow (see the pond
- *  water plane in demos/forest-camp — its shadow read as a ghost duplicate of itself
- *  offset across the grass). It still RECEIVES shadows normally. */
-function applyShadowFlags(obj: THREE.Object3D): void {
+/** Set castShadow/receiveShadow on an object (and any nested meshes, e.g. LOD levels or a
+ *  loaded model graph) from the entity's authored Renderable3D/Renderable3DPrimitive/
+ *  SkinnedModel fields. Inert unless a light casts + the renderer's shadowMap is enabled
+ *  (both gated elsewhere), so this is always safe to apply.
+ *  `castMode: 'auto'` (the default) derives cast from the material: a mesh whose material
+ *  is alpha-blended (`transparent: true` — water, glass, sprite billboards) does NOT cast —
+ *  the shadow map treats blended geometry as fully opaque, so a translucent surface would
+ *  throw a hard, wrongly-shaped shadow (see the pond water plane in demos/forest-camp —
+ *  its shadow read as a ghost duplicate of itself offset across the grass). `'on'`/`'off'`
+ *  force the cast flag regardless of the material. */
+function applyShadowFlags(obj: THREE.Object3D, castMode: 'auto' | 'on' | 'off', receive: boolean): void {
   obj.traverse((o) => {
     const m = o as THREE.Mesh;
     if (!m.isMesh) return;
     const mat = m.material as THREE.Material | THREE.Material[] | undefined;
     const transparent = Array.isArray(mat) ? mat.some((mm) => mm.transparent) : mat?.transparent;
-    m.castShadow = !transparent;
-    m.receiveShadow = true;
+    m.castShadow = castMode === 'auto' ? !transparent : castMode === 'on';
+    m.receiveShadow = receive;
   });
+}
+
+/** Composite cache key for `RenderState.ecsShadowFlags` — cheaper than storing a tuple, and a
+ *  Map<number,string> mirrors the house style of `ecsMaterials`/`ecsColors`/`ecsSizes`. */
+function shadowFlagsKey(castMode: 'auto' | 'on' | 'off', receive: boolean): string {
+  return `${castMode}:${receive}`;
+}
+
+/** World position of a light's authored shadow follow target, or undefined when there is no
+ *  target, the guid is stale, or the entity has no resolved world transform yet. Undefined means
+ *  "fall back to the view focus" — never "centre on the origin". */
+function resolveShadowFocus(guid: string, world: World): { x: number; y: number; z: number } | undefined {
+  if (!guid) return undefined;
+  const e = findEntityByGuid(guid, world);
+  if (!e) return undefined;
+  const wt = worldTransforms.get(e.id());
+  return wt ? { x: wt.x, y: wt.y, z: wt.z } : undefined;
 }
 
 /** Configure a directional/spot light's shadow map + camera + bias from its Light trait.
@@ -600,16 +667,26 @@ function applyShadowFlags(obj: THREE.Object3D): void {
  *  regenerates the depth texture when the size actually changes. */
 function configureLightShadow(
   l: THREE.DirectionalLight | THREE.SpotLight,
-  light: { shadowMapSize: number; shadowCameraSize: number; shadowBias: number; shadowNormalBias: number; shadowRadius: number },
+  light: { shadowMapSize: number; shadowCameraSize: number; shadowBias: number; shadowNormalBias: number; shadowRadius: number; shadowFollowCamera: boolean },
+  focus?: { x: number; y: number; z: number },
 ): void {
   const s = l.shadow;
-  const size = light.shadowMapSize || 2048;
+  // Clamp to the tier's ceiling (#121 P3). `Light.shadowMapSize` is a per-light trait field with
+  // no global cap, so without this a tier could say "shadows, but smaller" and nothing would
+  // enforce it — a scene authoring 2048 across 150 casters would ignore the tier entirely.
+  const authoredSize = light.shadowMapSize || 2048;
+  const size = tierShadowMapSize(authoredSize, getActiveTierOrDefault());
   if (s.mapSize.width !== size || s.mapSize.height !== size) {
     s.mapSize.set(size, size);
     if (s.map) { s.map.dispose(); (s as unknown as { map: unknown }).map = null; }
   }
-  s.bias = light.shadowBias;
-  s.normalBias = light.shadowNormalBias;
+  // Bias is texel-footprint-relative — a map clamped smaller than authored needs a scaled bias
+  // or it self-shadows (see `shadowBiasScale` in qualityTier.ts, and §0b "Shadows on `low`
+  // would render ACNE" for why a matching extent-shrink was tried and reverted: it silently
+  // dropped distant casters' shadows rather than fixing the sampling).
+  const scale = shadowBiasScale(authoredSize, size);
+  s.bias = light.shadowBias * scale;
+  s.normalBias = light.shadowNormalBias * scale;
   (s as unknown as { radius: number }).radius = light.shadowRadius;
   s.camera.near = 0.1;
   s.camera.far = 200;
@@ -617,6 +694,36 @@ function configureLightShadow(
     const c = light.shadowCameraSize || 16;
     const cam = s.camera as THREE.OrthographicCamera;
     cam.left = -c; cam.right = c; cam.top = c; cam.bottom = -c;
+
+    // Recentre the box on the view instead of leaving it anchored at the light's authored
+    // position (see shadowFollow.ts for the measured forest-camp footprint this fixes).
+    if (light.shadowFollowCamera && focus) {
+      // Capture the AUTHORED direction before moving anything — position/target for this
+      // frame were already synced by the caller (syncLights runs the world-transform block
+      // before calling here).
+      const dx = l.target.position.x - l.position.x;
+      const dy = l.target.position.y - l.position.y;
+      const dz = l.target.position.z - l.position.z;
+      const dirLen = Math.hypot(dx, dy, dz) || 1;
+      const d = { x: dx / dirLen, y: dy / dirLen, z: dz / dirLen };
+      // `size` (px) here is the TIER-CLAMPED map size computed above, not the authored one —
+      // the snap has to match the map that was actually allocated.
+      const center = snapShadowCenter({ focus, lightDir: d, size: c, mapSize: size });
+      l.target.position.set(center.x, center.y, center.z);
+      // For a directional light only the DIRECTION affects shading — moving position and
+      // target together along that same direction preserves it exactly, so this only moves
+      // the shadow camera, never the light's illumination.
+      const back = c * 2 + 10;
+      l.position.set(center.x - d.x * back, center.y - d.y * back, center.z - d.z * back);
+      // The pull-back has to fit INSIDE the depth range set above, and `far` up there is a flat
+      // 200 chosen when the camera sat at the light's authored position. Recentring puts the
+      // focus `back` away instead, so at shadowCameraSize >= 95 the focus lands at or beyond
+      // far=200 and EVERY shadow from this light silently disappears — a scene-scale box (an
+      // outdoor level authoring 100+) would have been broken by a feature that defaults to on.
+      // Widen rather than replace, so the common small-box case keeps its authored 200.
+      s.camera.far = Math.max(s.camera.far, back + c * 2);
+      l.target.updateMatrixWorld();
+    }
   }
   s.camera.updateProjectionMatrix();
 }
@@ -649,8 +756,14 @@ function lightMatchesType(l: THREE.Light, lightType: string): boolean {
 const _lightEuler = new THREE.Euler();
 const _lightForward = new THREE.Vector3();
 
-export function syncLights(world: World, scene: THREE.Scene, ecsLights: Map<number, THREE.Light>) {
+export function syncLights(
+  world: World,
+  scene: THREE.Scene,
+  ecsLights: Map<number, THREE.Light>,
+  focus?: { x: number; y: number; z: number },
+) {
   _activeLightIds.clear();
+  _maskedLights.length = 0;
   world.query(Light).updateEach(([light], entity) => {
     if (deactivatedEntities.has(entity.id())) return;
     const id = entity.id();
@@ -680,11 +793,14 @@ export function syncLights(world: World, scene: THREE.Scene, ecsLights: Map<numb
     // Per-frame: re-apply every field the trait carries. Light subclasses
     // ignore irrelevant fields (e.g. AmbientLight has no `distance`).
     l.color.setHex(light.color);
-    l.intensity = light.intensity;
+    // Ambient carries the IBL-off compensation (#154) — a scene whose IBL was suppressed would
+    // otherwise render visibly dark and flat. Gated on `isIblSuppressed()`, NOT on the tier: a
+    // scene that never had an environment has nothing to compensate for, and boosting it anyway
+    // is a tier raising its output. Always 1 unless this frame actually lost an environment, so
+    // the authored value passes through untouched everywhere else.
+    l.intensity = light.intensity
+      * (iblSuppressed && l instanceof THREE.AmbientLight ? tierAmbientBoost(getActiveTierOrDefault()) : 1);
     l.castShadow = light.castShadow;
-    if (light.castShadow && (l instanceof THREE.DirectionalLight || l instanceof THREE.SpotLight)) {
-      configureLightShadow(l, light);
-    }
     if (l instanceof THREE.PointLight || l instanceof THREE.SpotLight) {
       l.distance = light.distance;
     }
@@ -731,6 +847,36 @@ export function syncLights(world: World, scene: THREE.Scene, ecsLights: Map<numb
         if (!l.target.parent) scene.add(l.target);
       }
     }
+
+    // Shadow config runs AFTER the position/target sync above — a follow-recentre needs this
+    // frame's authored direction, not last frame's.
+    if (light.castShadow && (l instanceof THREE.DirectionalLight || l instanceof THREE.SpotLight)) {
+      // An authored follow TARGET beats the caller's view-derived focus: measured in
+      // demos/forest-camp, the derived ground point trails the character by 2.8-3.7 m (it grows
+      // while walking, since the camera lags and looks slightly ahead), which spends a quarter of
+      // the box's radius on empty ground. Centred on the subject instead, `shadowCameraSize` can
+      // be SMALLER for the same coverage around it — and texel size is 2*size/mapSize, so that is
+      // the cheapest sharpness available. Falls back to the view focus when unset or unresolvable
+      // (a stale guid must not silently pin the box at the world origin).
+      // Resolve the target ONLY when it can actually be used. `configureLightShadow` consumes
+      // `focus` inside its DirectionalLight branch and behind `shadowFollowCamera`, so without
+      // this gate every spot-light shadow — and every directional that opted OUT of follow —
+      // paid a guid lookup whose result is discarded. That matters because a STALE guid is not
+      // a cheap miss: `findEntityByGuid` self-heals by rescanning the whole world, and since the
+      // entity is genuinely gone the rescan repeats every frame, forever, silently (the fallback
+      // renders correctly, so only a profiler would ever show it). Same self-heal precedent as
+      // `syncBoneAttachments`, but that one only pays it per live BoneAttachment.
+      const wantsFollow = light.shadowFollowCamera && l instanceof THREE.DirectionalLight;
+      const targetFocus = wantsFollow && light.shadowFollowTarget
+        ? resolveShadowFocus(light.shadowFollowTarget, world)
+        : undefined;
+      configureLightShadow(l, light, targetFocus ?? focus);
+    }
+
+    // Rendering-layer mask (#136) — published for the renderable pass, which runs after this
+    // one (see `syncSceneRenderables3D`). Collected HERE because this is the only place the
+    // ECS `Light` trait and its THREE.Light are both in hand.
+    _maskedLights.push({ light: l, mask: light.renderingLayerMask });
   });
   for (const [id, l] of ecsLights) {
     if (!_activeLightIds.has(id)) {
@@ -860,6 +1006,18 @@ export interface RenderState {
   ecsMaterials: Map<number, string>;
   ecsColors: Map<number, number>;
   ecsSizes: Map<number, number>;
+  /** Last-applied shadow-flags composite key (`shadowFlagsKey`) per entity id, so
+   *  `applyShadowFlags` re-runs only when the authored castShadow/receiveShadow fields
+   *  actually change, not every frame (#183 — covers Renderable3D/Renderable3DPrimitive
+   *  AND SkinnedModel entities, keyed by the same entity id). */
+  ecsShadowFlags: Map<number, string>;
+  /** The SAME cache for the SKINNED pass, and deliberately a SEPARATE map: an entity may carry
+   *  a SkinnedModel AND a Renderable3D/Renderable3DPrimitive at once (nothing declares them
+   *  mutually exclusive), and the two passes own DIFFERENT THREE objects under the one entity
+   *  id. Sharing one map made each pass see the other's key, mismatch, and re-apply — a
+   *  permanent per-frame `traverse` of the whole rig that renders correctly and so is invisible,
+   *  which is exactly the cost this cache exists to avoid. */
+  skinnedShadowFlags: Map<number, string>;
   ownsGeometry: Set<number>;
   /** SkinnedModel entities — clone + mixer per entity id. */
   skinned: Map<number, SkinnedEntry>;
@@ -885,6 +1043,8 @@ export function createRenderState(emitLifecycle = false): RenderState {
     ecsMaterials: new Map(),
     ecsColors: new Map(),
     ecsSizes: new Map(),
+    ecsShadowFlags: new Map(),
+    skinnedShadowFlags: new Map(),
     ownsGeometry: new Set(),
     skinned: new Map(),
     billboards: new Map(),
@@ -934,6 +1094,7 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
       state.ecsObjects.delete(id);
       state.ecsSprites.delete(id);
       state.ecsMaterials.delete(id);
+      state.ecsShadowFlags.delete(id);
       state.ownsGeometry.delete(id);
     }
 
@@ -950,6 +1111,7 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
       const entry = state.skinned.get(id);
       if (entry) disposeSkinnedEntry(entry, scene);
       state.skinned.delete(id);
+      state.skinnedShadowFlags.delete(id);
     }
   });
 }
@@ -983,6 +1145,8 @@ export function disposeRenderState(
   state.ecsMaterials.clear();
   state.ecsColors.clear();
   state.ecsSizes.clear();
+  state.ecsShadowFlags.clear();
+  state.skinnedShadowFlags.clear();
   state.ownsGeometry.clear();
 }
 
@@ -1036,6 +1200,8 @@ function syncMaterial(
   state: RenderState,
   isTinted = false,
   isInstanced = false,
+  isMasked = false,
+  castMode: 'auto' | 'on' | 'off' = 'auto',
 ): void {
   const targets = materialTargetsOf(obj);
   const prevMat = state.ecsMaterials.get(id);
@@ -1053,22 +1219,59 @@ function syncMaterial(
         _ownedMaterials.delete(oldMat);
         oldMat.dispose();
       }
-      if (newMat) { t.material = newMat; t.castShadow = !newMat.transparent; }
+      // Only 'auto' re-derives cast from the new material's transparency — an explicit
+      // 'on'/'off' override (#183) must survive a material swap, not be clobbered here.
+      if (newMat) { t.material = newMat; if (castMode === 'auto') t.castShadow = !newMat.transparent; }
     }
-  } else if (!isTinted && !isInstanced && curMat) {
+  } else if (!isTinted && !isInstanced && !isMasked && curMat) {
     // .mat.json path unchanged but the async load may have finished since
     // last frame — check if the resolved material is now available.
     // Skipped for tinted meshes AND for entities with a MaterialInstance prop
     // override: those bind a per-entity CLONE of the resolved material (the Tint
     // block / materialInstanceSystem own the binding), so resetting to the base
     // here would fight that clone every frame.
+    // Skipped for light-masked entities (#136) for the same reason — `applyLightMask` binds a
+    // shared (material, mask) variant afterwards. NOTE the branch ABOVE still runs for them, so
+    // a genuine material-ref change is still picked up and the variant rebuilds from the new
+    // base; only the per-frame re-bind is suppressed.
     const resolved = resolveMaterial(curMat);
     if (resolved) {
       for (const t of targets) {
         if (t.material !== resolved) t.material = resolved;
-        t.castShadow = !resolved.transparent; // keep in sync even once the ref settles
+        // See the 'auto'-only guard above.
+        if (castMode === 'auto') t.castShadow = !resolved.transparent; // keep in sync even once the ref settles
       }
     }
+  }
+}
+
+/** Swap an entity's meshes onto the light-mask variant of whatever material they ended up with
+ *  (#136). Runs LAST, after `syncMaterial`, Tint and MaterialInstance have settled the material,
+ *  so it composes with them instead of competing: the variant is derived FROM the material the
+ *  entity actually has, whether that is the shared base, a tint clone, or a per-entity clone.
+ *
+ *  No-op unless masking is active AND the entity's mask sees fewer than every light — so an
+ *  unauthored scene walks this and allocates nothing.
+ *
+ *  The `!==` guard makes it a genuine no-op once applied. That matters more than usual here:
+ *  reassigning `.material` every frame is what `syncRenderablesChurn` exists to catch, and the
+ *  first hand-patched device test of this feature measured NO improvement precisely because
+ *  `syncMaterial` was reassigning the base underneath a per-mesh override every frame. */
+function applyLightMask(obj: THREE.Object3D, mask: number): void {
+  if (!isLightMaskingActive()) return;
+  const factory = getActiveRenderer() as unknown as LightingFactory | null;
+  // No renderer yet (first frames / headless): leave the material alone rather than caching a
+  // variant we cannot build — masking picks up on a later frame.
+  if (!factory?.lighting) return;
+  for (const t of materialTargetsOf(obj)) {
+    const cur = t.material as THREE.Material | THREE.Material[];
+    // Multi-material meshes are not covered yet: each slot would need its own variant, and no
+    // authored content uses one with a mask. Skipped here rather than silently mis-lit.
+    if (Array.isArray(cur) || !cur) continue;
+    // `baseOf` — by frame 2 `t.material` IS last frame's variant, and cloning that would clone
+    // the clone every frame (measured: variants growing 1, 2, 3, … with nothing looking wrong).
+    const variant = getMaskedMaterial(baseOf(cur), mask, factory);
+    if (variant && t.material !== variant) t.material = variant;
   }
 }
 
@@ -1254,13 +1457,17 @@ function buildNodes(root: THREE.Object3D): Map<string, NodeRender> {
  *  `.mat.json` guid; an unset slot restores the baked GLB material. Cheap on the
  *  steady state (rebinds only on change). A guid whose material hasn't finished
  *  loading is left baked and retried next frame. Exported + `resolve`-injectable
- *  for unit tests. No-op when the node isn't in this clone (stale node name). */
+ *  for unit tests. No-op when the node isn't in this clone (stale node name).
+ *  Returns whether any MATERIAL was rebound this call (visibility alone doesn't count) —
+ *  the caller uses that to re-derive `castShadow` for an `'auto'` rig, since a swapped-in
+ *  material can differ in transparency from the one the flags were derived from (#183). */
 export function syncNodeMaterials(
   node: NodeRender,
   overrides: Record<string, string> | undefined,
   visible: boolean,
   resolve: (guid: string) => THREE.Material | undefined = resolveMaterial,
-): void {
+): boolean {
+  let changed = false;
   if (node.visibleApplied !== visible) {
     for (const m of node.meshes) m.visible = visible;
     node.visibleApplied = visible;
@@ -1279,6 +1486,7 @@ export function syncNodeMaterials(
         else (t.mesh.material as THREE.Material[])[t.index] = (baked as THREE.Material[])[t.index];
       }
       node.appliedOverrides.delete(slot);
+      changed = true;
       continue;
     }
     const mat = resolve(guid);
@@ -1288,7 +1496,9 @@ export function syncNodeMaterials(
       else (t.mesh.material as THREE.Material[])[t.index] = mat;
     }
     node.appliedOverrides.set(slot, guid);
+    changed = true;
   }
+  return changed;
 }
 
 /** Bind every `SkinnedMeshRenderer` entity to its rig root's clone: resolve the
@@ -1302,7 +1512,12 @@ function syncSkinnedMeshRenderers(world: World, state: RenderState): void {
     if (!entry) return; // rig not built yet, or renderer not a child of a rig root
     const node = entry.nodes.get(r.node);
     if (!node) return; // stale node name (model re-imported with different meshes)
-    syncNodeMaterials(node, r.materials, r.visible);
+    // A rebound material can differ in transparency from the one the rig's shadow flags were
+    // derived from, and this pass runs AFTER the SkinnedModel loop that applies them — so drop
+    // the cached key and let the next frame re-derive. Unconditional rather than 'auto'-only:
+    // re-applying an explicit 'on'/'off' just re-asserts the same value, and reaching the rig's
+    // mode from a child renderer entity would cost more than the one extra traverse it saves.
+    if (syncNodeMaterials(node, r.materials, r.visible)) state.skinnedShadowFlags.delete(parentId);
   });
 }
 
@@ -1519,6 +1734,9 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
     if (entry && (entry.modelRef !== sm.model || entry.libraryKey !== libKey)) {
       disposeSkinnedEntry(entry, scene);
       skinned.delete(id);
+      // A fresh clone is about to be built below, defaulting to no shadow (see the scene.add(root)
+      // comment) — force the next shadow-flags check to re-apply rather than reading a stale key.
+      state.skinnedShadowFlags.delete(id);
       entry = undefined;
     }
 
@@ -1554,6 +1772,13 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
       const bones = new Map<string, THREE.Bone>();
       root.traverse((o) => { if ((o as THREE.Bone).isBone) bones.set(o.name, o as THREE.Bone); });
       scene.add(root);
+      // #183 — this call was MISSING entirely: every rigged character kept THREE's defaults
+      // (castShadow false, receiveShadow false) and never cast OR received a shadow. A
+      // receiveShadow of false is the tell that this function never ran on a mesh — every
+      // OTHER renderer path (LOD/GLB/primitive, below) calls applyShadowFlags and none of
+      // them leaves receiveShadow false, since today's default is unconditional true.
+      applyShadowFlags(root, sm.castShadow, sm.receiveShadow);
+      state.skinnedShadowFlags.set(id, shadowFlagsKey(sm.castShadow, sm.receiveShadow));
       // Cache each ROOT bone's static wrapper prefix (clone-root → bone.parent), so the
       // bone bridge can read/write that bone's entity Transform in clone-root space (the
       // space the import authored it in — see SkinnedEntry.boneWrapperPrefix).
@@ -1579,6 +1804,16 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
 
     if (!entry) return;
     _activeSkinnedIds.add(id);
+
+    // Live-edit path: the clone above already got its shadow flags at creation — this only
+    // re-applies when the authored fields change on an EXISTING entry (#183).
+    {
+      const shadowKey = shadowFlagsKey(sm.castShadow, sm.receiveShadow);
+      if (state.skinnedShadowFlags.get(id) !== shadowKey) {
+        applyShadowFlags(entry.root, sm.castShadow, sm.receiveShadow);
+        state.skinnedShadowFlags.set(id, shadowKey);
+      }
+    }
 
     // Merge any newly-loaded library/animSet clips this frame (lazy + idempotent).
     // Before driveAnimator so a freshly-bound clip can be the requested one.
@@ -1627,6 +1862,7 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
     if (_activeSkinnedIds.has(id)) continue;
     disposeSkinnedEntry(entry, scene);
     skinned.delete(id);
+    state.skinnedShadowFlags.delete(id);
   }
 
   // Apply per-mesh materials + visibility from child SkinnedMeshRenderer entities.
@@ -2054,8 +2290,27 @@ export function syncBones(world: World, _scene: THREE.Scene, state: RenderState)
 }
 
 export function syncRenderables(world: World, scene: THREE.Scene, state: RenderState, callbacks?: SyncCallbacks) {
-  const { ecsObjects, ecsSprites, ecsMaterials, ecsColors, ecsSizes, ownsGeometry } = state;
+  const { ecsObjects, ecsSprites, ecsMaterials, ecsColors, ecsSizes, ecsShadowFlags, ownsGeometry } = state;
   _activeRenderIds.clear();
+
+  // Rendering-layer light masks (#136). Publish the light set BEFORE the renderable loops so
+  // `applyLightMask` can look variants up as each entity's material settles.
+  //
+  // The renderable side is scanned separately rather than folded into the loop below because
+  // masking has to be armed BEFORE the first entity is processed: a renderable whose mask
+  // excludes the default layer must stop being lit by default-layer lights, and discovering
+  // that mid-loop would leave every entity before it lit wrongly for a frame. The scan reads
+  // one number per renderable and is skipped entirely once a masked light has already armed it.
+  let anyRenderableMasked = false;
+  world.query(Renderable3D).updateEach(([rend]) => {
+    if (rend.renderingLayerMask !== DEFAULT_RENDERING_LAYER_MASK) anyRenderableMasked = true;
+  });
+  if (!anyRenderableMasked) {
+    world.query(Renderable3DPrimitive).updateEach(([rend]) => {
+      if (rend.material && rend.renderingLayerMask !== DEFAULT_RENDERING_LAYER_MASK) anyRenderableMasked = true;
+    });
+  }
+  beginLightMaskFrame(_maskedLights, anyRenderableMasked);
 
   // ── GLB meshes (Renderable3D) ─────────────────────────
   world.query(Transform, Renderable3D).updateEach(([tf, rend], entity) => {
@@ -2070,6 +2325,9 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       ecsObjects.delete(id);
       ecsSprites.delete(id);
       ownsGeometry.delete(id);
+      // A fresh THREE object is about to be built below, defaulting to no shadow — force the
+      // next applyShadowFlags check to re-apply rather than reading a stale "unchanged" key.
+      ecsShadowFlags.delete(id);
       obj = undefined;
     }
 
@@ -2084,7 +2342,6 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
           const mesh = new THREE.Mesh(lod.templates[i].geometry, material);
           lodObj.addLevel(mesh, lod.distances[i] ?? 0);
         }
-        applyShadowFlags(lodObj);
         scene.add(lodObj);
         ecsObjects.set(id, lodObj);
         ecsSprites.set(id, rend.mesh);
@@ -2094,12 +2351,21 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
         if (template) {
           const material = resolveMaterialForMesh(rend.material, rend.mesh) || template.material;
           const mesh = new THREE.Mesh(template.geometry, material);
-          applyShadowFlags(mesh);
           scene.add(mesh);
           ecsObjects.set(id, mesh);
           ecsSprites.set(id, rend.mesh);
           obj = mesh;
         }
+      }
+    }
+
+    // Shadow flags — apply on creation and re-apply only when the authored fields change
+    // (the ecsShadowFlags cache holds the last-applied key; #183).
+    if (obj) {
+      const shadowKey = shadowFlagsKey(rend.castShadow, rend.receiveShadow);
+      if (ecsShadowFlags.get(id) !== shadowKey) {
+        applyShadowFlags(obj, rend.castShadow, rend.receiveShadow);
+        ecsShadowFlags.set(id, shadowKey);
       }
     }
 
@@ -2109,7 +2375,8 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       // MaterialInstance (a per-entity material clone driven by materialInstanceSystem) takes
       // precedence over Tint — both would otherwise claim mesh.material and fight each frame.
       const tinted = !instanced && entity.has(Tint);
-      syncMaterial(obj, id, rend.material || '', state, tinted, instanced);
+      const masked = maskNeedsVariant(rend.renderingLayerMask);
+      syncMaterial(obj, id, rend.material || '', state, tinted, instanced, masked, rend.castShadow);
       // Per-entity Tint: bind a tinted clone of the resolved material. Passing
       // isTinted above stops syncMaterial from re-binding the base each frame, so
       // this block owns the material — the clone cache + `!==` guard then make it
@@ -2124,6 +2391,8 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
           }
         }
       }
+      // Last, so it derives from the settled material (base / tint clone / instance clone).
+      applyLightMask(obj, rend.renderingLayerMask);
     }
 
     if (obj) applyTransform(obj, id, tf, callbacks);
@@ -2152,6 +2421,9 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       ecsColors.delete(id);
       ecsMaterials.delete(id);
       ecsSizes.delete(id);
+      // A fresh mesh is about to be built below, defaulting to no shadow — force the next
+      // applyShadowFlags check to re-apply rather than reading a stale "unchanged" key.
+      ecsShadowFlags.delete(id);
       ownsGeometry.delete(id);
       obj = undefined;
     }
@@ -2168,7 +2440,6 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
         const resolved = resolveMaterial(rend.material);
         if (resolved) (obj as THREE.Mesh).material = resolved;
       }
-      applyShadowFlags(obj);
       scene.add(obj);
       ecsObjects.set(id, obj);
       ecsSprites.set(id, rend.mesh);
@@ -2178,9 +2449,23 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       ownsGeometry.add(id);
     }
 
+    // Shadow flags — apply on creation and re-apply only when the authored fields change
+    // (the ecsShadowFlags cache holds the last-applied key; #183).
+    {
+      const shadowKey = shadowFlagsKey(rend.castShadow, rend.receiveShadow);
+      if (ecsShadowFlags.get(id) !== shadowKey) {
+        applyShadowFlags(obj, rend.castShadow, rend.receiveShadow);
+        ecsShadowFlags.set(id, shadowKey);
+      }
+    }
+
     // Material override — a .mat.json material GUID (empty = engine default).
     const instanced = isMaterialInstanced(entity);
-    syncMaterial(obj as THREE.Mesh, id, rend.material || '', state, false, instanced);
+    // Masks apply only to explicit-material primitives — see the trait's field comment: a
+    // default-material primitive owns a per-entity material that the colour block below writes
+    // into, and a shared (material, mask) variant would fight it.
+    const masked = !!rend.material && maskNeedsVariant(rend.renderingLayerMask);
+    syncMaterial(obj as THREE.Mesh, id, rend.material || '', state, false, instanced, masked, rend.castShadow);
 
     // Update color when changed (only applies to the default material, not a .mat.json). A
     // single default-material primitive is NOT a supported MaterialInstance prop base (its
@@ -2193,6 +2478,9 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
         ((obj as THREE.Mesh).material as THREE.MeshStandardMaterial).color.setHex(rend.color);
       }
     }
+    // After the colour block, and only for explicit materials (the colour path above owns the
+    // default-material case outright).
+    if (rend.material) applyLightMask(obj, rend.renderingLayerMask);
 
     applyTransform(obj, id, tf, callbacks);
   });
@@ -2218,6 +2506,7 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       ecsSprites.delete(id);
       ecsColors.delete(id);
       ecsMaterials.delete(id);
+      ecsShadowFlags.delete(id);
       ownsGeometry.delete(id);
     }
   }
@@ -2719,7 +3008,7 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
         g.setAttribute('aTextColor', new THREE.BufferAttribute(geo.colors, 4)); // per-glyph colour (white ⇒ no tint)
         g.setIndex(new THREE.BufferAttribute(geo.indices, 1));
         g.translate(ax, ay, 0);
-        const mat = makeMtsdfMaterial(ptex, provider.atlas.width, provider.atlas.height, provider.atlas.distanceRange, provider.atlas.size, textStyle(t));
+        const mat = makeMtsdfMaterial(ptex, provider.atlas.width, provider.atlas.height, provider.atlas.distanceRange, provider.atlas.size, textStyle(t), provider.atlas.type !== 'msdf');
         const mesh = new THREE.Mesh(g, mat);
         // Per-glyph animation nudges verts past the static bounds; skip frustum
         // culling (text is cheap) so an animated glyph never pops out at the edge.
@@ -2770,7 +3059,14 @@ export function syncSceneRenderables3D(
   world: World,
   scene: THREE.Scene,
   state: RenderState,
-  callbacks?: { renderables?: SyncCallbacks; skinned?: SyncCallbacks },
+  callbacks?: {
+    renderables?: SyncCallbacks;
+    skinned?: SyncCallbacks;
+    /** Collapse repeated (geometry, material) draws into InstancedMesh (#154 P4b). Opt-in:
+     *  the editor SceneView must NOT enable it, because it picks entities by raycasting the
+     *  individual meshes a batch hides. See instancedBatching.ts. */
+    batchDrawCalls?: boolean;
+  },
 ) {
   syncRenderables(world, scene, state, callbacks?.renderables);
   syncSkinnedModels(world, scene, state, callbacks?.skinned);
@@ -2781,6 +3077,19 @@ export function syncSceneRenderables3D(
   // own camera). Uses the gizmo-aware renderables callback for consistent transform skip.
   syncBillboardSprites(world, scene, state, callbacks?.renderables);
   syncText3D(world, scene, state, callbacks?.renderables);
+  // Video screens — binds a VideoPlayer entity's live element onto its material as a
+  // VideoTexture. Runs LAST because it reads the objects the syncs above create, and
+  // lives in its own module (an additive concern; this file is big enough).
+  if (__MODOKI_MODULE_VIDEO__) syncVideoTextures(world, state);
+
+  // Draw-call batching (#154 P4b) — LAST, and opt-in per caller. It reads the geometry,
+  // material and world transform the syncs above settled, and decides none of them; running it
+  // earlier would key off half-resolved materials and merge things that are about to diverge.
+  //
+  // OPT-IN because it hides the individual meshes it replaces, and the editor SceneView picks
+  // entities by raycasting those meshes — batching them there would break selection. The game
+  // runtime, which has no picking, is where the 237-draw-call frame lives.
+  if (callbacks?.batchDrawCalls) applyInstancedBatching(scene, state.ecsObjects.values());
 }
 
 /** Clear all owned-material tracking. Call on world swap alongside clearing
@@ -2791,10 +3100,33 @@ export function clearOwnedMaterials() {
 
 // ── Shader prewarm ──────────────────────────────────────
 
-/** Build a throwaway THREE.Scene containing placeholder meshes for every
- *  Renderable3D + Renderable3DPrimitive in the given world, and run
- *  renderer.compileAsync against it. This compiles all shader programs the
- *  new scene will need BEFORE the world swap, eliminating first-frame stutter.
+/** Build a throwaway THREE.Scene containing placeholder meshes for every DISTINCT
+ *  (mesh, material) pair among the world's Renderable3D + Renderable3DPrimitive
+ *  entities, and run renderer.compileAsync against it. This compiles all shader
+ *  programs the new scene will need BEFORE the world swap, eliminating
+ *  first-frame stutter.
+ *
+ *  **One placeholder per PAIR, not per entity** (#154 P4a). Deduping is sound because
+ *  both refs resolve deterministically: the same (mesh, material) pair always yields
+ *  the same geometry + material object, hence the same program. Size/colour are
+ *  deliberately NOT part of the key — they are uniforms, and a primitive's size
+ *  changes vertex VALUES, not the attribute layout the program is built from.
+ *
+ *  ⚠️ **This is a redundant-work cleanup, NOT the fix for the boot stall — measured.**
+ *  It looked like the fix: `compileAsync` walks its render list object-by-object, and a
+ *  warm sweep on the Y6 2019 read a clean ~65 ms per DISTINCT object (1→51 objects,
+ *  181→3548 ms). But an A/B/A in one app run on a Galaxy A23 (SC-56C), toggling the
+ *  dedupe between scene reloads, put 33 placeholders at 1326/1131/1174/1182 ms against
+ *  14 at 920/1132/1326/1226 ms — **no difference outside the noise**. The warm sweep
+ *  varied distinct programs; deduping only removes DUPLICATES, and a duplicate is
+ *  already nearly free. What the stall actually is: **cold shader compilation**,
+ *  ~1.2 s per distinct program on the Y6 (postfx-demo's 14 distinct pairs = **16.5 s**
+ *  of boot prewarm there, against 2.9 s on the A23). Cutting the object count cannot
+ *  touch that; cutting the number of distinct MATERIALS would.
+ *
+ *  What this still buys: 19 fewer render-list objects and, for postfx-demo, 18 skipped
+ *  `createPrimitiveMesh` calls — each of which mints a geometry + material only to
+ *  dispose it below. Keep it for that; do not credit it with a framerate or boot win.
  *
  *  The geometries + materials come from the world-independent mesh/material
  *  caches (already populated by SceneManager's resource acquire), so no
@@ -2813,17 +3145,31 @@ export async function prewarmShadersForWorld(
   const primitiveMeshes: THREE.Mesh[] = [];
   const prewarmLights: THREE.Light[] = [];
 
+  // Distinct (mesh, material) pairs already placed — see the header note. Prefixed
+  // per renderer kind so a GLB mesh ref can never collide with a primitive keyword.
+  const seenPairs = new Set<string>();
+  const skip = (k: string) => { if (seenPairs.has(k)) return true; seenPairs.add(k); return false; };
+
   // Mirror the staging world's Environment so compileAsync produces the correct
   // PBR shader variant (with envMap sampling). Without this, the first real
   // render recompiles shaders and stutters.
-  world.query(Environment).updateEach(([env]: [{ hdrPath: string; intensity: number }]) => {
-    if (!env.hdrPath) return;
-    const cached = getCachedEnvironment(env.hdrPath);
-    if (cached) {
-      prewarmScene.environment = cached;
-      prewarmScene.environmentIntensity = env.intensity;
-    }
-  });
+  //
+  // GATED ON THE TIER, for the same reason the mirror exists at all (#154): a tier with `ibl`
+  // false renders with `scene.environment` null, so mirroring the env here would compile the
+  // envMap variant that the real render never uses — and the first frame would then compile the
+  // NON-env variant synchronously, which is precisely the cold-compile stutter this mirror is
+  // here to prevent (measured at 3926 ms on the Y6, P4a). The prewarm must model the scene the
+  // tier will actually draw, not the scene as authored.
+  if (tierAllowsIBL(getActiveTierOrDefault())) {
+    world.query(Environment).readEach(([env]: [{ hdrPath: string; intensity: number }]) => {
+      if (!env.hdrPath) return;
+      const cached = getCachedEnvironment(env.hdrPath);
+      if (cached) {
+        prewarmScene.environment = cached;
+        prewarmScene.environmentIntensity = env.intensity;
+      }
+    });
+  }
 
   // Mirror the staging world's lights so compileAsync produces the correct
   // shader variants (otherwise Three.js's LightsNode warns + skips compile).
@@ -2837,6 +3183,7 @@ export async function prewarmShadersForWorld(
 
   world.query(Renderable3D).updateEach(([rend]: [{ isVisible: boolean; mesh: string; material: string }]) => {
     if (!rend.isVisible || !rend.mesh) return;
+    if (skip(`g|${rend.mesh}|${rend.material}`)) return;
     const template = resolveMeshTemplate(rend.mesh);
     if (!template) return;
     const material = resolveMaterialForMesh(rend.material, rend.mesh) || template.material;
@@ -2847,6 +3194,7 @@ export async function prewarmShadersForWorld(
 
   world.query(Renderable3DPrimitive).updateEach(([rend]: [{ isVisible: boolean; mesh: string; size: number; color: number; material: string }]) => {
     if (!rend.isVisible) return;
+    if (skip(`p|${rend.mesh}|${rend.material}`)) return;
     const obj = createPrimitiveMesh(rend.mesh, rend.size, rend.color);
     if (obj) {
       // Apply .mat.json override if set (mirrors runtime sync behaviour)
@@ -2936,8 +3284,151 @@ export function applyRendererColorConfig(r: {
 }): void {
   const { toneMapping, exposure } = getRenderSettings().three;
   r.toneMapping = resolveToneMapping(toneMapping);
-  r.toneMappingExposure = exposure;
   r.outputColorSpace = THREE.SRGBColorSpace;
+  // The AUTHORED exposure, with no IBL-off compensation on it. The compensation belongs to a
+  // surface that syncs an `Environment` and can therefore know whether one was suppressed —
+  // this function also serves the asset-preview renderers (ModelPreview, previewScene), which
+  // never sync one, so baking it in here would light a material thumbnail 1.25x brighter
+  // because a game panel elsewhere happened to be on the low tier.
+  r.toneMappingExposure = exposure;
+}
+
+/** The exposure half of the IBL-off compensation (#154), split out because it is the one part of
+ *  the color config that is NOT fixed at renderer creation.
+ *
+ *  `applyRendererColorConfig` runs once, when the renderer is made — before any scene has loaded,
+ *  so it cannot yet know whether this scene owns an `Environment` to lose. The compensation must
+ *  follow the same "was IBL actually suppressed" predicate as the ambient boost (otherwise the
+ *  two halves disagree and the tier raises exposure on scenes that never had IBL), so the render
+ *  loop calls this after `syncEnvironment` each frame. Change-gated: the assignment is skipped
+ *  when the value already matches, so the steady state writes nothing.
+ *
+ *  **Call it immediately after your OWN `syncEnvironment`, on every surface that has one.**
+ *  `isIblSuppressed()` is module state describing what the LAST `syncEnvironment` saw, and the
+ *  editor mounts two surfaces that each call it. A surface that sets the flag and never reads it
+ *  back keeps whatever exposure it was constructed with — which is how the Scene panel came to
+ *  bake in a compensation belonging to the Game panel. */
+export function reconcileToneExposure(r: { toneMappingExposure: number }): void {
+  const { exposure } = getRenderSettings().three;
+  const want = exposure * (iblSuppressed ? tierExposureBoost(getActiveTierOrDefault()) : 1);
+  if (r.toneMappingExposure !== want) r.toneMappingExposure = want;
+}
+
+/** Resolve the quality tier once, before the first drawing buffer is allocated (#121 P3).
+ *
+ *  Idempotent: a second viewport (the editor mounts SceneView + GameView) reuses the resolution
+ *  rather than re-probing, so both surfaces are guaranteed the same tier.
+ *
+ *  The device probe is only awaited for `'auto'`. A pinned `'low'`/`'high'` resolves synchronously
+ *  from the setting alone, so it pays nothing for a capability probe it would ignore.
+ *
+ *  ⚠️ Since #155 made `'auto'` the DEFAULT, the probe is on the common path rather than the opt-in
+ *  one — an unpinned project now awaits `getDeviceCaps()` before the first drawing buffer. That is
+ *  the cost of deciding the tier before a buffer is allocated, and it cannot be deferred: the
+ *  knobs the tier clamps (`antialias` especially) are baked into the buffer at creation. */
+async function resolveActiveTier(setting: QualityTierSetting): Promise<void> {
+  if (getActiveQualityTier()) return;
+  // ⚠️ RE-ENTRANCY. The probe below builds a renderer, renderer construction lands back here, and
+  // nothing has set a tier yet — so without this the call recurses without bound and the process
+  // dies. It killed an iPhone 13 mini's tab in ~80 ms, and was invisible on every desktop, which
+  // resolves 'desktop' and never reaches the probe. See probeReentrancy.ts.
+  //
+  // Returning without resolving is correct here: the probe's own renderer is throwaway, it is
+  // explicitly clamped to DPR 1 by the runner, and `getEffectiveThreeSettings()` falls back to the
+  // project's authored settings when no tier is active. The tier is resolved by the OUTER call
+  // once the probe returns.
+  if (isProbeInFlight()) return;
+  // The player's stored choice outranks everything, including a pinned project setting — see
+  // playerQualityTier.ts. Read before the early-out so a pin cannot hide it.
+  const playerChoice = getPlayerQualityTier();
+  if (playerChoice || setting !== 'auto') {
+    // No caps, and that is SOUND HERE — unlike the identical-looking call in playerQualityTier.ts,
+    // which was a bug (#155). This branch runs only when a player choice or a project pin exists,
+    // and both are decided by `resolveTier` BEFORE it ever consults `formFactor`/`gpuRenderer`. So
+    // the facts omitted here cannot change the answer. Add a resolver branch above those two and
+    // this becomes wrong — feed it `getDeviceCapsSync()` then.
+    setActiveQualityTier(resolveTier({ platform: '', playerChoice, projectSetting: setting }));
+    return;
+  }
+  let caps: Awaited<ReturnType<typeof getDeviceCaps>> | null = null;
+  try {
+    caps = await getDeviceCaps();
+  } catch {
+    // A probe failure must not block rendering. resolveTier with no facts falls through to
+    // "unrecognised device → start low", which is the safe direction (see its doc).
+  }
+  const facts = {
+    platform: caps?.platform ?? '',
+    playerChoice,
+    deviceModel: caps?.deviceModel,
+    gpuRenderer: caps?.gpuRenderer,
+    // Absent on a failed probe, which resolveTier reads as "handheld" — the safe side.
+    formFactor: caps?.formFactor,
+    projectSetting: setting,
+  };
+
+  // Resolve WITHOUT the ramp probe first, and only pay for it if nothing cheaper answered.
+  //
+  // This is what gives the plan's "desktop skips it entirely" for free, and it extends the same
+  // courtesy to every other free answer: a player choice, a project pin, an iOS model id, an
+  // allowlisted Android GPU. `'calibrating'` is precisely the state that means "nothing here
+  // decided" — the state in which, before #188, a device sat on `low` forever because the
+  // promotion path never fired on any hardware ever measured.
+  const cheap = resolveTier(facts);
+  if (cheap.source !== 'calibrating') {
+    setActiveQualityTier(cheap);
+    return;
+  }
+
+  const probeClass = await resolveProbeClass(caps);
+  setActiveQualityTier(resolveTier({ ...facts, probeClass }));
+}
+
+/** The boot ramp probe's verdict — from cache when we have one for this hardware, otherwise by
+ *  running it (#188).
+ *
+ *  ⚠️ RUNNING IT BLOCKS THE LAUNCH, by owner decision and by necessity: the knobs a tier clamps —
+ *  `antialias` above all — are baked into the drawing buffer at renderer creation, so a verdict
+ *  that arrives after this point cannot be applied at all. The cache is what keeps that a
+ *  once-per-device cost rather than a once-per-launch one.
+ *
+ *  Never throws: any failure resolves `undefined`, which `resolveTier` reads as "no information"
+ *  and answers exactly as it did before this existed. */
+async function resolveProbeClass(
+  caps: Awaited<ReturnType<typeof getDeviceCaps>> | null,
+): Promise<DeviceClass | undefined> {
+  const fingerprint = probeFingerprint({
+    platform: caps?.platform,
+    deviceModel: caps?.deviceModel,
+    gpuRenderer: caps?.gpuRenderer,
+    viewportPx: typeof window === 'undefined' ? 0 : window.innerWidth * window.innerHeight,
+  });
+
+  const store = probeVerdictStore.get();
+  const cached = store?.read();
+  if (cached && cached.fingerprint === fingerprint) return cached.deviceClass;
+
+  try {
+    const { runBootRampProbe } = await import('./rampProbeRunner');
+    // Guarded: the probe constructs a renderer, which re-enters this very resolution path.
+    const measurement = await withProbeInFlight(() => runBootRampProbe());
+    if (!measurement) return undefined;
+    const verdict = classifyDevice(measurement);
+    console.warn(
+      `[rampProbe] ${verdict.deviceClass} — ${verdict.reason} `
+      + `(blocked launch ${measurement.totalMs.toFixed(0)}ms: renderer `
+      + `${measurement.rendererMs.toFixed(0)}ms + compile ${measurement.compileMs.toFixed(0)}ms + ramps; `
+      + `interval ${measurement.intervalMs.toFixed(1)}ms, `
+      + `fill ${measurement.fill.status}, draw ${measurement.draw.status})`,
+    );
+    // Only a real verdict is worth caching. Caching `'unknown'` would freeze in the state the
+    // probe is in TODAY (thresholds unset), so that filling those thresholds in would never
+    // reach a device that had already launched once.
+    if (verdict.deviceClass !== 'unknown') store?.write({ fingerprint, deviceClass: verdict.deviceClass });
+    return verdict.deviceClass === 'unknown' ? undefined : verdict.deviceClass;
+  } catch {
+    return undefined;
+  }
 }
 
 export interface MakeRendererOptions {
@@ -2957,7 +3448,10 @@ export async function makeWebGPURenderer(
   const { getWebGPUSupported } = await import('./gpuDetect');
   const webgpuSupported = await getWebGPUSupported();
   const settings = getRenderSettings();
-  const three = settings.three;
+  await resolveActiveTier(settings.three.qualityTier);
+  // Tier-ADJUSTED, not raw: this is where the first drawing buffer is allocated, and Scene3D's
+  // ResizeObserver reads the same accessor on every later resize so the two cannot disagree.
+  const three = getEffectiveThreeSettings();
   // Backend selection: 'webgl' forces the WebGL2 backend outright; 'webgpu'/'auto'
   // use native WebGPU when the device supports it, else fall back to WebGL2. (Both
   // run the same TSL/node pipeline — see the createRenderer doc comment.)

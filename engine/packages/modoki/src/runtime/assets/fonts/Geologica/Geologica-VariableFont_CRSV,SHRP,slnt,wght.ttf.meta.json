@@ -1,0 +1,22 @@
+{
+  "id": "641f6283-b442-4205-94cd-1664b4ec4588",
+  "version": 2,
+  "font": {
+    "fieldType": "mtsdf",
+    "size": 128,
+    "pxRange": 8,
+    "charset": "ascii",
+    "atlasMax": 2048,
+    "mode": "dynamic",
+    "shipSource": "auto",
+    "variationAxes": {
+      "wght": 400
+    }
+  },
+  "fontCache": {
+    "hash": "dd6d7847805d1b4f",
+    "atlasWidth": 1024,
+    "atlasHeight": 1024,
+    "glyphCount": 95
+  }
+}

@@ -94,7 +94,8 @@ Both `onScreen: true`, and — until 2026-07-30 — both **unlabelled**, so reso
 one the provider `Set` happened to yield. When that was the panel not on top, the click landed in
 the wrong viewport and reported success: the exact failure mode `entity` aiming exists to remove.
 
-So every provider labels its rects (`surface: 'game-3d' | 'game-2d' | 'scene-view'`), and **a 2D/3D
+So every provider labels its rects (`surface: 'game-3d' | 'game-2d' | 'scene-view'`, plus
+`'game-ui'` for the DOM UI layer), and **a 2D/3D
 entity aim REQUIRES `surface`** — including when only one viewport has the entity.
 
 That last part is the whole point, and it is not about disambiguation. Refusing only the *ambiguous*
@@ -109,10 +110,17 @@ regardless of which panels the human happens to have open.
 
 - A successful aim **always** reports the `surface` it used — "I tapped the cube" is not checkable
   without knowing which on-screen cube.
-- **A UI entity refuses `surface`.** It *is* a single DOM node, so there is nothing to choose and no
-  surface name describes it. Refused rather than ignored: accepting a parameter and not using it
-  would let the caller believe it had constrained an aim that was never constrained — the same lie
-  in the other direction.
+- **A UI entity accepts `surface`, and REQUIRES it when it is mounted more than once.** "It is a
+  single DOM node" was the original ground for refusing it, and that was wrong: the editor mounts a
+  UIRenderer in **both** SceneView's `[data-ui-preview-frame]` (`scene-view`) and GameView's
+  `[data-game-view-area]` (`game-ui`), and every UINode stamps `data-entity-id` — so with both
+  panels open, every full-screen overlay, modal and HUD button has TWO live nodes. Unlike 2D/3D it
+  is **not** required when only one node exists: a shipped game has exactly one, so demanding it
+  there would break correct calls to buy nothing. The response always echoes the surface aimed at.
+  (The MCP schema omitted `'game-ui'` from its enum until #151, which made a two-mount UI entity
+  unaimable by name: the backend refused the un-surfaced aim and named the fix, and the fix it
+  named was rejected by the tool's own schema. Both refusals were individually right; together
+  they were a dead end — the reason a vocabulary must live in ONE place.)
 - When the chosen surface is not aimable, the reason names **that** surface (`game-3d: off-screen`).
   Reporting the other panel's reason would answer a question the caller did not ask.
 - **`get_editor_state.surfaces`** lists the surfaces mounted right now, so a caller — especially a

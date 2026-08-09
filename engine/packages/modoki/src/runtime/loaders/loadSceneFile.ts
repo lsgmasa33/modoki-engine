@@ -1,10 +1,10 @@
 /** Load a scene JSON file into an ECS world. Shared between editor and runtime. */
 
 import { type World } from 'koota';
-import { getCurrentWorld, registerEntity, indexEntityGuid, findEntityByGuid } from '../core/ecs/world';
+import { getCurrentWorld, spawnEntity, indexEntityGuid, findEntityByGuid } from '../core/ecs/world';
 import { getAllTraits, getTraitByName } from '../core/ecs/traitRegistry';
 import { loadModelTemplates, getCachedPrefab } from './meshTemplateCache';
-import { isGuid, isExternalUrl, resolveRef, getAssetType, deriveGuid, newGuid, getAssetEntry } from './assetManifest';
+import { isGuid, isExternalUrl, resolveRef, getAssetType, deriveGuid, newGuid, getAssetEntry, type AssetType } from './assetManifest';
 import { markUIDirty } from '../ui/uiTreeStore';
 import { markOverride, clearOverrideMarks, clearAllOverrideMarks } from './overrideMarks';
 import { isPersistentTraitField } from '../core/ecs/traitSchema';
@@ -13,7 +13,7 @@ import { REF_FIELDS_BY_TRAIT } from './sceneValidation';
 import { parseClipBank } from '../audio/clipBank';
 import { parseAnimClipBank } from '../animation/animClipBank';
 import { getRunMode } from '../core/playState';
-import { Transient } from '../traits/Transient';
+import { Transient } from '../core/traits/Transient';
 
 /** A child subtree an instance adds beyond what its prefab defines. Anchored to
  *  an existing prefab member by `parentLocalId`; nested adds live in `children`
@@ -72,7 +72,7 @@ export interface SceneEntityEntry {
 }
 
 export interface SceneResourceRef {
-  type: 'model' | 'riggedModel' | 'mesh' | 'material' | 'texture' | 'prefab' | 'font' | 'environment' | 'particle' | 'animation' | 'animset' | 'spriteanim' | 'rig2d' | 'audio' | 'shader' | 'timeline';
+  type: 'model' | 'riggedModel' | 'mesh' | 'material' | 'texture' | 'video' | 'prefab' | 'font' | 'environment' | 'particle' | 'animation' | 'animset' | 'spriteanim' | 'rig2d' | 'audio' | 'shader' | 'timeline';
   path: string;
   postprocessor?: string;
 }
@@ -693,8 +693,7 @@ export function applyStructureByLocalToEcs(
       },
       findEntity: (ecsId) => handleById().get(ecsId),
       spawnAdded: (traitArgs) => {
-        const entity = world.spawn(...(traitArgs as Parameters<typeof world.spawn>));
-        registerEntity(entity, world);
+        const entity = spawnEntity(world, ...(traitArgs as Parameters<typeof world.spawn>));
         return entity.id();
       },
       spawnNestedInstance: (node, parentEcsId) => {
@@ -858,8 +857,7 @@ export function instantiatePrefabIntoWorld(
       }));
     }
     if (traitArgs.length > 0) {
-      const entity = world.spawn(...traitArgs as Parameters<typeof world.spawn>);
-      registerEntity(entity, world);
+      const entity = spawnEntity(world, ...traitArgs as Parameters<typeof world.spawn>);
       clearOverrideMarks(entity.id()); // fresh member — drop stale marks on a reused id
       const localId = entry.localId ?? 0;
       if (localId) localToEcs.set(localId, entity.id());
@@ -1021,7 +1019,7 @@ const SCALAR_RESOURCE_TYPE_BY_FIELD: Record<string, SceneResourceRef['type']> = 
   'Renderable3D.material': 'material',
   'SkinnedModel.model': 'riggedModel',
   'SkeletalAnimator.animSet': 'animset',
-  'Renderable2D.sprite': 'texture',
+  'VideoPlayer.clip': 'video',
   'Renderable2D.material': 'shader', // 2D custom material (.shader.json) — lazy-loaded by Scene2D
   'Text3D.font': 'font',
   'Text2D.font': 'font',
@@ -1035,7 +1033,29 @@ const SCALAR_RESOURCE_TYPE_BY_FIELD: Record<string, SceneResourceRef['type']> = 
   'Director.timeline': 'timeline',
   // Registry fields intentionally NOT here (handled explicitly in the loop below):
   //   Renderable3DPrimitive.material — dynamic texture-or-material via getAssetType
+  //   Renderable2D.sprite            — dynamic texture-or-video via getAssetType
   //   ModelSource.glbPath            — carries a postprocessor payload
+};
+
+/** Manifest asset TYPE → the SceneResourceRef type it is acquired as. Drives the
+ *  generic game-trait sweep below, which types a ref by what the asset actually IS
+ *  rather than by the field it sits in (there is no registry entry to consult for a
+ *  game trait). The two unions are deliberately not identical:
+ *    - `sprite` is a texture as far as acquisition is concerned.
+ *    - `scene` is NOT a resource — scenes are loaded by SceneManager, not the
+ *      resource cache, so a game trait holding a "next level" scene guid must not
+ *      drag that whole scene into this one's preload.
+ *    - `atlas` has no SceneResourceRef type at all: atlas MEMBERS are referenced by
+ *      their own texture guids (which repoint to the packed page), so the page is
+ *      already acquired through them.
+ *  A type absent here is skipped, silently — an unmapped kind means "not something
+ *  the resource pipeline acquires", not "dropped by accident". */
+const RESOURCE_TYPE_BY_ASSET_TYPE: Partial<Record<AssetType, SceneResourceRef['type']>> = {
+  mesh: 'mesh', material: 'material', prefab: 'prefab', model: 'model',
+  environment: 'environment', texture: 'texture', sprite: 'texture', font: 'font',
+  shader: 'shader', particle: 'particle', animation: 'animation', animset: 'animset',
+  spriteanim: 'spriteanim', rig2d: 'rig2d', audio: 'audio', timeline: 'timeline',
+  video: 'video',
 };
 
 /** Walk entities and extract every resource ref they reference. Mirrors the
@@ -1047,14 +1067,30 @@ const SCALAR_RESOURCE_TYPE_BY_FIELD: Record<string, SceneResourceRef['type']> = 
  *  The SCALAR ref fields are data-driven from REF_FIELDS_BY_TRAIT (via
  *  SCALAR_RESOURCE_TYPE_BY_FIELD); the non-scalar / dynamic / payload-bearing refs
  *  (AnimationLibrary.animSets, SkinnedMeshRenderer.materials, Renderable3DPrimitive.material,
- *  ModelSource.glbPath, UIElement.fontFamily, structural entry.prefab) stay explicit. */
+ *  ModelSource.glbPath, UIElement.fontFamily, structural entry.prefab) stay explicit.
+ *  Anything held on a GAME-defined trait is caught by the generic sweep at the end. */
 export function collectResourceRefsFromEntities(
-  entities: ReadonlyArray<{ traits: Record<string, unknown>; prefab?: string; added?: AddedEntity[] }>,
+  entities: ReadonlyArray<{
+    traits: Record<string, unknown>;
+    prefab?: string;
+    added?: AddedEntity[];
+    /** Per-localId prefab-instance overrides — see pushOverrideBags below. */
+    overrides?: Record<string, unknown>;
+    /** Path-keyed nested-instance overrides (one level deeper than `overrides`). */
+    nestedOverrides?: Record<string, Record<string, unknown>>;
+  }>,
 ): SceneResourceRef[] {
   const seen = new Set<string>();
   const refs: SceneResourceRef[] = [];
+  /** Every ref an EXPLICIT rule above claimed, keyed by the ref alone (not by
+   *  `type:ref`). The generic sweep skips these, so a field whose declared type
+   *  differs from the asset's manifest type — `SkinnedModel.model` is acquired as
+   *  `riggedModel` while the .glb's manifest type is `model` — yields ONE entry
+   *  with the declared type, not two entries for the same asset. */
+  const claimed = new Set<string>();
   const add = (type: SceneResourceRef['type'], ref: string) => {
     if (!ref) return;
+    claimed.add(ref);
     const key = `${type}:${ref}`;
     if (seen.has(key)) return;
     seen.add(key);
@@ -1064,12 +1100,45 @@ export function collectResourceRefsFromEntities(
   // Flatten structural additions into the scan so an added child's mesh/material/
   // texture/effect is acquired at load too (a `traits`-only view per added node).
   const flat: Array<{ traits: Record<string, unknown>; prefab?: string }> = [];
+
+  /** A prefab-instance's per-localId override map — `{ localId: { TraitName: { …fields } } }`.
+   *  Each value is a TRAIT BAG, so pushing it into `flat` as a pseudo-entity makes every rule
+   *  below (the registry loop, the explicit handlers, the generic game-trait sweep) see it with
+   *  no special-casing.
+   *
+   *  An override can introduce a ref the base prefab does NOT have — the editor's ordinary
+   *  "instantiate a prefab, then swap this instance's mesh/material" — and until now those refs
+   *  reached the resources manifest through nothing at all. Measured on committed content:
+   *  `games/space-console/Station.scene.json` carried **31** override-only `Renderable3D.mesh`
+   *  and `.material` GUIDs absent from its `resources`, and both are ACQUIRING types, so they
+   *  were neither preloaded nor scene-refcounted — and because SceneManager's fresh re-walk is
+   *  THIS function, the miss survived the re-walk that normally rescues a stale manifest.
+   *  The build was never affected: the tree-shaker walks `entry.overrides` itself
+   *  (`asset-tree-shaker.ts` extractEntityRefs), which is why this stayed invisible for so long.
+   *  Found by the #123 close-out sweep — the same "a ref the walker cannot see" pattern as the
+   *  game-trait case, reached by a different route. */
+  const pushOverrideBags = (map: Record<string, unknown> | undefined) => {
+    if (!map || typeof map !== 'object') return;
+    for (const bag of Object.values(map)) {
+      if (bag && typeof bag === 'object') flat.push({ traits: bag as Record<string, unknown> });
+    }
+  };
+
   for (const entry of entities) {
     flat.push(entry);
+    pushOverrideBags(entry.overrides);
+    // `nestedOverrides` is path-keyed one level deeper — `{ path: { localId: { Trait: {…} } } }`.
+    for (const byLocal of Object.values(entry.nestedOverrides ?? {})) pushOverrideBags(byLocal);
     const walkAdded = (node: AddedEntity) => {
       // A reference node carries a child prefab GUID — surface it so the prefab is
       // acquired; recurse BOTH the plain `children` and a reference node's `added`.
       flat.push({ traits: node.traits, prefab: node.prefab });
+      // A reference-style added node is itself a nested instance, so it carries the same
+      // two override shapes (F8) — the exact place assertNoPathRefs was once blind.
+      pushOverrideBags(node.overrides as Record<string, unknown> | undefined);
+      for (const byLocal of Object.values(node.nestedOverrides ?? {})) {
+        pushOverrideBags(byLocal as Record<string, unknown>);
+      }
       node.children.forEach(walkAdded);
       node.added?.forEach(walkAdded);
     };
@@ -1131,6 +1200,18 @@ export function collectResourceRefsFromEntities(
     if (animator && typeof animator !== 'boolean') {
       for (const c of parseAnimClipBank(animator.clips)) if (looksFetchable(c.clip)) add('animation', c.clip);
     }
+    // Renderable2D.sprite is USUALLY a texture, but a video GUID is legal there too
+    // (a moving picture on a 2D sprite). Type it by what the asset actually IS, not by
+    // the field it sits in — a video filed as a texture is a ref the manifest describes
+    // wrongly, and the next reader to trust that type is the one who pays.
+    const r2d = entry.traits['Renderable2D'] as Record<string, unknown> | undefined;
+    if (r2d && typeof r2d !== 'boolean') {
+      const sprite = r2d.sprite as string | undefined;
+      if (looksFetchable(sprite)) {
+        const t = isGuid(sprite!) ? getAssetType(sprite!) : undefined;
+        add(t === 'video' ? 'video' : 'texture', sprite!);
+      }
+    }
     const r3dp = entry.traits['Renderable3DPrimitive'] as Record<string, unknown> | undefined;
     if (r3dp && typeof r3dp !== 'boolean') {
       // material may be a .mat.json GUID or a raw texture GUID — collect under
@@ -1156,6 +1237,7 @@ export function collectResourceRefsFromEntities(
       const postprocessor = ms.postprocessor as string | undefined;
       // GUID-only, like every other ref (resolveRef rejects internal paths).
       if (looksFetchable(glb)) {
+        claimed.add(glb!); // pushed directly (postprocessor payload), so claim it by hand
         const key = `model:${glb}`;
         if (!seen.has(key)) {
           seen.add(key);
@@ -1178,6 +1260,60 @@ export function collectResourceRefsFromEntities(
     }
     // Structural prefab reference on the entity itself (not a trait field).
     if (looksFetchable(entry.prefab)) add('prefab', entry.prefab!);
+  }
+
+  // ── Generic GUID sweep — makes GAME-DEFINED traits work with no registration (#123) ──
+  //
+  // Everything above is keyed off REF_FIELDS_BY_TRAIT, a closed engine-only const with no
+  // registration API. So an asset guid held on a GAME trait (space-invader's
+  // `SpaceInvaderAssets.catvaderAnim`) was structurally invisible here, and re-saving the
+  // scene rebuilt `resources` WITHOUT it.
+  //
+  // What that costs, stated precisely — #123 filed it as an "asset the build cannot see" (the
+  // #53 class), and that is NOT the failure. Two things make the stored manifest far less
+  // load-bearing than it looks:
+  //   - The BUILD never reads it. The tree-shaker walks scene ENTITIES via its own generic
+  //     sweep (asset-tree-shaker.ts). Measured: a web build of space-invader from a manifest
+  //     with both refs deleted still ships the spriteanim AND the texture.
+  //   - The RUNTIME does not trust it either. `SceneManager.collectSceneResourceRefs` unions
+  //     the stored `resources` with a FRESH call to this function, so a stale file self-heals
+  //     ("`resources` is a hint, not the authority" — docs/scene-loading.md).
+  // So what actually bit is not a stale FILE, which nothing depends on, but a blind WALKER:
+  // this function is the fresh walk, so a ref it cannot see is missing from BOTH halves of
+  // that union. For an acquiring type — prefab, material, model, environment, animset, audio —
+  // that means never preloaded and never scene-refcounted, and no re-save could have fixed it
+  // because the re-save calls this same walker. Fixing the walker fixes every scene at load,
+  // including ones never re-saved; re-saving only brings the committed file back in step.
+  //
+  // A game cannot register into the engine without reaching into it, which the portability
+  // rule forbids, so a registration API would push the drift onto every game instead of
+  // removing it.
+  //
+  // The asset MANIFEST is already the complete guid → asset index, so no registry is needed:
+  // a trait field whose string is a guid that RESOLVES in the manifest is, by construction, a
+  // reference to a real asset. This is the same conclusion the build tree-shaker reached for
+  // the same reason (asset-tree-shaker.ts, "Generic scalar/array GUID sweep") — the two now
+  // agree on which refs exist instead of the shaker keeping a file the manifest omits.
+  //
+  // Silent on a miss, deliberately: an ENTITY reference is also a guid and is never in the
+  // asset manifest, so warning here would fire on every parent/target field in the scene.
+  // Runs as a SECOND pass over `flat` — not inside the loop above — so every explicit claim
+  // is registered before any sweep decision, whichever entity carries it.
+  const sweep = (value: unknown) => {
+    if (typeof value !== 'string' || !isGuid(value) || claimed.has(value)) return;
+    const rtype = RESOURCE_TYPE_BY_ASSET_TYPE[getAssetType(value) as AssetType];
+    if (rtype) add(rtype, value);
+  };
+  for (const entry of flat) {
+    for (const bag of Object.values(entry.traits)) {
+      if (!bag || typeof bag !== 'object') continue;
+      for (const value of Object.values(bag as Record<string, unknown>)) {
+        // One level of array unwrap, to also catch an AnimationLibrary-shaped guid
+        // array on a game trait (a level list, an enemy-prefab table).
+        if (Array.isArray(value)) value.forEach(sweep);
+        else sweep(value);
+      }
+    }
   }
 
   refs.sort((a, b) => a.type.localeCompare(b.type) || a.path.localeCompare(b.path));
@@ -1312,8 +1448,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
       if (eaMeta) traitArgs.push(eaMeta.trait({ guid: entry.guid }));
     }
     if (traitArgs.length > 0) {
-      const entity = world.spawn(...traitArgs);
-      registerEntity(entity, world);
+      const entity = spawnEntity(world, ...traitArgs);
       onEntitySpawned?.(entity, entry.id);
       idMap.set(entry.id, entity.id());
       spawnedByEntryId.set(entry.id, entity);

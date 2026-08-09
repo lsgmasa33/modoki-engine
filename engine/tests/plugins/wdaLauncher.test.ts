@@ -1,9 +1,12 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
 import path from 'node:path';
 import {
   parseIosDevices, resolveIosDevice, ensureWdaRunning, stopWda,
   isWdaProcessRunning, _resetWdaLauncherForTests, WDA_PROBE_TIMEOUT_MS,
+  parseXctraceDevices, mergeIosDevices, pickWdaFailureLine, describeExecFailure,
+  _devicectlOutPath,
 } from '../../plugins/backend/wdaLauncher';
 
 /**
@@ -50,7 +53,9 @@ describe('parseIosDevices', () => {
       { udid: 'B', name: 'Old', state: 'disconnected' },
       { udid: 'C', name: 'Older', state: 'disconnected' },
     ]));
-    expect(out.filter((d) => d.connected)).toEqual([{ udid: 'A', name: 'Air', connected: true }]);
+    // `devicectl: true` on every row here is the point of the flag: this parse IS the devicectl
+    // listing, so anything it returns can be installed to hands-free (#170).
+    expect(out.filter((d) => d.connected)).toEqual([{ udid: 'A', name: 'Air', connected: true, devicectl: true }]);
     expect(out).toHaveLength(3);   // all three are CANDIDATES; only the tunnel state differs
   });
 
@@ -72,13 +77,20 @@ describe('resolveIosDevice — never guess which phone', () => {
   const A = { udid: 'A', name: 'Air', connected: true };
   const B = { udid: 'B', name: 'Mini', connected: false };
 
-  it('uses the only paired device', () => {
-    expect(resolveIosDevice([A], {})).toEqual({ device: A });
+  it('uses the only paired device, and SAYS the lease could not confirm it (#146)', () => {
+    const r = resolveIosDevice([A], {}) as { device: typeof A; unverified: string };
+    expect(r.device).toEqual(A);
+    // With no lease hardware to compare against, the choice is a guess about WHICH PHONE — kept
+    // (refusing would break every setup running an app older than #146) but never silent.
+    expect(r.unverified).toMatch(/did not report its hardware/);
   });
 
   it('prefers the one with a LIVE tunnel when several are paired', () => {
     // A live tunnel is the strongest available evidence of "the phone on the desk right now".
-    expect(resolveIosDevice([B, A], {})).toEqual({ device: A });
+    // Note it is evidence about THIS MAC, not about the lease — hence the caveat (#146).
+    const r = resolveIosDevice([B, A], {}) as { device: typeof A; unverified: string };
+    expect(r.device).toEqual(A);
+    expect(r.unverified).toBeTruthy();
   });
 
   it('REFUSES when the choice is genuinely ambiguous, naming the candidates AND the fix', () => {
@@ -104,7 +116,154 @@ describe('resolveIosDevice — never guess which phone', () => {
   });
 });
 
+/**
+ * #146 — the device was chosen with NO reference to the lease, so a Mac with one non-leased iPhone
+ * connected would start a signed 60-second agent on that phone without asking. It fails safe for
+ * input (the probe targets the lease host, so the stray agent never answers), but the surprise
+ * agent is the cost, and the old code's own doc said this must not happen.
+ *
+ * The fix compares the phone's self-reported `hw.machine` with devicectl's `productType` — the
+ * only two strings both sides can see, since iOS forbids an app reading its own UDID.
+ */
+describe('resolveIosDevice — tie the launch to the LEASED phone (#146)', () => {
+  const air = { udid: 'AIR', name: 'Air', connected: false, productType: 'iPhone18,4', osVersion: '26.5.2' };
+  const mini = { udid: 'MINI', name: 'Mini', connected: true, productType: 'iPhone14,4', osVersion: '26.5.2' };
+
+  it('picks the leased phone even when a DIFFERENT one is the only thing connected', () => {
+    // The exact #146 scenario. The old rule took `mini` outright (sole live tunnel) and launched a
+    // signed agent on it; an iOS lease is a WiFi address, so "plugged in" says nothing about it.
+    const r = resolveIosDevice([air, mini], {}, { deviceModel: 'iPhone18,4', osVersion: '26.5.2' });
+    expect(r).toEqual({ device: air });   // no `unverified` — this one is PROVEN
+  });
+
+  it('REFUSES when no paired phone is the leased model, instead of launching on the wrong one', () => {
+    const r = resolveIosDevice([air, mini], {}, { deviceModel: 'iPhone99,9', osVersion: '30.0' });
+    expect(r).toHaveProperty('error');
+    expect((r as { error: string }).error).toMatch(/iPhone99,9/);
+    expect((r as { error: string }).error).toMatch(/matches none/);
+  });
+
+  it('a STALE os version never contradicts — devicectl reports it as of the last connection', () => {
+    // The trap this rule exists to avoid: devicectl's `osVersionNumber` is from the device's LAST
+    // CONNECTION, so a phone that has updated since would be excluded by its own freshness and the
+    // launch would refuse with "wrong phone". Only the immutable model may contradict.
+    const r = resolveIosDevice([air], {}, { deviceModel: 'iPhone18,4', osVersion: '26.6' });
+    expect(r).toEqual({ device: air });
+  });
+
+  it('two phones of the SAME model: the version breaks the tie', () => {
+    const twin = { ...air, udid: 'TWIN', name: 'Twin', osVersion: '26.4' };
+    const r = resolveIosDevice([air, twin], {}, { deviceModel: 'iPhone18,4', osVersion: '26.5.2' });
+    expect(r).toEqual({ device: air });
+  });
+
+  it('two phones the lease cannot tell apart at all: falls back, and SAYS it could not verify', () => {
+    const twin = { ...air, udid: 'TWIN', name: 'Twin', connected: true };
+    const r = resolveIosDevice([air, twin], {}, { deviceModel: 'iPhone18,4', osVersion: '26.5.2' }) as
+      { device: typeof air; unverified: string };
+    expect(r.device.udid).toBe('TWIN');   // the live tunnel still breaks the tie…
+    expect(r.unverified).toMatch(/cannot say which is the leased one/);   // …but it is not a proof
+  });
+
+  it('a model-less legacy device is UNKNOWN, never contradicted', () => {
+    // Every pre-iPhone-X handset: only `xctrace` can see it, and that listing carries no model. It
+    // must not be excluded on version alone, nor claimed as a match.
+    const legacy = { udid: 'OLD', name: 'iPhone8', connected: true, osVersion: '16.7.16' };
+    const r = resolveIosDevice([legacy], {}, { deviceModel: 'iPhone18,4', osVersion: '26.5.2' }) as
+      { device: typeof legacy; unverified: string };
+    expect(r.device).toEqual(legacy);
+    expect(r.unverified).toMatch(/no paired iPhone reports the leased device's model/);
+  });
+
+  it('the explicit pin still outranks the lease', () => {
+    // Rule 1 is absolute: an explicit UDID is a human decision and must not be second-guessed by a
+    // heuristic, however good the heuristic is.
+    expect(resolveIosDevice([air, mini], { MODOKI_IOS_DEVICE_UDID: 'MINI' }, { deviceModel: 'iPhone18,4', osVersion: '26.5.2' }))
+      .toEqual({ device: mini });
+  });
+});
+
+/**
+ * #144 — a WDA launch failure reported a GUESS ("check the build is still signed"), because the
+ * child's output was discarded entirely. On the iPhone 8 that advice was simply wrong: re-signing
+ * could never have helped, and the real reason (`Cannot test target … Logic Testing Unavailable`)
+ * was visible only by re-running xcodebuild by hand. This is the one error path an agent cannot
+ * investigate for itself, so whatever the message says IS the diagnosis.
+ */
+describe('pickWdaFailureLine — quote xcodebuild, do not guess (#144)', () => {
+  it('prefers the specific error over the summary that ends the log', () => {
+    // "Last line wins" is the tempting rule and it is wrong: a failed xcodebuild run ends with a
+    // summary that names nothing, while the actionable line sits further up.
+    expect(pickWdaFailureLine([
+      'Testing started',
+      'xcodebuild: error: Unable to find a destination matching the provided destination specifier',
+      '** TEST EXECUTE FAILED **',
+    ])).toMatch(/^xcodebuild: error:/);
+  });
+
+  it('finds the real iPhone 8 cause — the one the old message could not report', () => {
+    expect(pickWdaFailureLine([
+      'DVTDeviceOperation: Encountered a build number "" that is incompatible with DVTBuildVersion',
+      'Cannot test target "WebDriverAgentRunner" on "iPhone8": Logic Testing Unavailable',
+      '** TEST EXECUTE FAILED **',
+    ])).toMatch(/Logic Testing Unavailable/);
+  });
+
+  it('falls back to the last line rather than nothing when nothing is recognised', () => {
+    expect(pickWdaFailureLine(['odd', 'unrecognised tail'])).toBe('unrecognised tail');
+  });
+
+  it('has nothing to say when nothing was captured', () => {
+    expect(pickWdaFailureLine([])).toBeNull();
+  });
+});
+
+/** The same defect one call earlier: the DEVICE LISTING discarded devicectl's stderr too, so a
+ *  failure surfaced as `could not list iOS devices (Command failed: xcrun devicectl …)` — the
+ *  command echoed back, naming nothing. Found by sweeping #144's pattern rather than its symptom. */
+describe('describeExecFailure — prefer what the tool said over Node\'s "Command failed"', () => {
+  it('quotes stderr instead of the echoed command', () => {
+    const e = Object.assign(new Error('Command failed: xcrun devicectl list devices'), {
+      stderr: Buffer.from('xcrun: error: unable to find utility "devicectl", not a developer tool or in PATH\n'),
+    });
+    expect(describeExecFailure(e)).toMatch(/unable to find utility "devicectl"/);
+    expect(describeExecFailure(e)).not.toMatch(/Command failed/);
+  });
+
+  it('accepts a string stderr as well as a Buffer', () => {
+    expect(describeExecFailure(Object.assign(new Error('nope'), { stderr: 'error: no Xcode' }))).toBe('error: no Xcode');
+  });
+
+  it('falls back to the message when the tool said nothing', () => {
+    // The ENOENT case: the binary never ran, so there is no stderr to prefer.
+    expect(describeExecFailure(new Error('spawnSync xcrun ENOENT'))).toBe('spawnSync xcrun ENOENT');
+    expect(describeExecFailure(Object.assign(new Error('m'), { stderr: Buffer.from('   \n\n') }))).toBe('m');
+  });
+
+  it('survives a non-Error throw', () => {
+    expect(describeExecFailure('just a string')).toBe('just a string');
+  });
+});
+
 describe('the real devicectl invocation', () => {
+  it('writes each listing to its OWN temp file', () => {
+    // ⚠️ The path was `modoki-devicectl-<pid>.json` — ONE file per process — and that was safe only
+    // by accident: `execFileSync` blocked the single JS thread for the whole spawn→read→unlink
+    // cycle, so two listings could not interleave. #168 made the POLLED listing async and left
+    // `ensureWdaRunning` on the sync twin, so they can now overlap and write the same file: an
+    // `/api/device/list` poll is mid-flight (its OS process still writing) when a `device_tap`
+    // runs `listDevicesSync`. A torn or already-unlinked read makes `parseIosDevices` return `[]`,
+    // which `ensureWdaRunning` LATCHES into `lastFailure` as "no iOS device is paired with this
+    // Mac" for the rest of the session — trusted input silently degraded, looking like an
+    // unplugged phone.
+    //
+    // Asserting UNIQUENESS rather than a format: the fix is that no two calls can collide, and a
+    // format assertion would pass for a constant that merely looked unique.
+    const paths = [_devicectlOutPath(), _devicectlOutPath(), _devicectlOutPath()];
+    expect(new Set(paths).size, `two listings share a temp file: ${paths.join(', ')}`).toBe(3);
+    for (const p of paths) expect(p).toContain(String(process.pid));
+  });
+
   it('never writes its JSON to /dev/stdout', () => {
     // Found LIVE, not here: `--json-output /dev/stdout` interleaves devicectl's human-readable
     // table with the JSON, so it never parses — and the failure presents as "no iOS device is
@@ -112,9 +271,23 @@ describe('the real devicectl invocation', () => {
     // real command is only exercised on a Mac with a device attached; this asserts the shape of
     // the command itself, which is the part they cannot reach.
     const src = readFileSync(path.join(__dirname, '../../plugins/backend/wdaLauncher.ts'), 'utf8');
-    const call = src.slice(src.indexOf('listDevices()'), src.indexOf('listDevices()') + 600);
-    expect(call).toContain('--json-output');
-    expect(call).not.toMatch(/--json-output'?,?\s*'\/dev\/stdout'/);
+    // ⚠️ Read the shared `DEVICECTL_ARGV`, not a function body. #168 split the listing into an
+    // async seam (the POLLED route, which must not block the Electron main process) and a sync
+    // twin (`ensureWdaRunning`, whose critical section must stay await-free), and slicing one
+    // function's body would leave the other's invocation unguarded — while still passing.
+    const argvLine = /const DEVICECTL_ARGV = [^\n]*\n/.exec(src)?.[0];
+    expect(argvLine, 'DEVICECTL_ARGV is gone — this test no longer guards the real command').toBeDefined();
+    expect(argvLine!).toContain('--json-output');
+    expect(argvLine!).not.toMatch(/--json-output'?,?\s*'\/dev\/stdout'/);
+    // And there is exactly ONE of them in CODE: a seam that builds its own argv inline would escape
+    // the check above, which is the only way this guard can be true and useless at the same time.
+    // Comment lines are excluded — the module banner and `parseIosDevices`' doc both name the flag
+    // while invoking nothing, and counting those made this assert 3 and fail on prose.
+    const codeMentions = src.split('\n')
+      .filter((l) => l.includes('--json-output') && !/^\s*(\/\/|\*|\/\*)/.test(l));
+    expect(codeMentions.length,
+      `--json-output appears in ${codeMentions.length} code lines — a seam is building its own ` +
+      'argv, so the assertions above no longer cover every devicectl invocation').toBe(1);
   });
 });
 
@@ -123,9 +296,12 @@ describe('ensureWdaRunning', () => {
   const okProbe = async () => true;
   const deadProbe = async () => false;
 
+  // `platform` is pinned on every case that expects to get PAST the darwin gate below. Without it
+  // these read as "WDA behaviour" but silently assert "…on a Mac", and every one of them failed on
+  // the ubuntu + windows CI legs — where the gate correctly refuses before the probe ever runs.
   it('does NOT spawn when WDA is already answering — including one started by hand', async () => {
     const spawnImpl = vi.fn();
-    const r = await ensureWdaRunning({ host: 'd', port: 8100, probe: okProbe, spawnImpl: spawnImpl as never });
+    const r = await ensureWdaRunning({ host: 'd', port: 8100, platform: 'darwin', probe: okProbe, spawnImpl: spawnImpl as never });
     expect(r).toEqual({ running: true });
     expect(spawnImpl).not.toHaveBeenCalled();
   });
@@ -325,6 +501,103 @@ describe('ensureWdaRunning', () => {
     expect(spawnImpl).toHaveBeenCalledTimes(2);
   });
 
+  it('a dead launch QUOTES xcodebuild instead of guessing at signing (#144)', async () => {
+    // End-to-end for #144: the stderr pipe, the ring buffer and the message, together. The unit
+    // tests above cover the ranking; what they cannot show is that anything is captured at all —
+    // which is precisely what was missing, since the child was spawned with its output discarded.
+    let exitCb: (() => void) | null = null;
+    const stderr = new EventEmitter() as EventEmitter & { setEncoding?: (e: string) => void };
+    const proc = {
+      exitCode: null, killed: false, kill() {}, stderr,
+      on(ev: string, cb: () => void) { if (ev === 'exit') exitCb = cb; },
+    };
+    const probe = async () => {
+      stderr.emit('data', 'Testing started\nCannot test target "WebDriverAgentRunner" on "iPhone8": Logic Testing Unavailable\n** TEST EXECUTE FAILED **\n');
+      exitCb?.(); exitCb = null;
+      return false;
+    };
+    const r = await ensureWdaRunning({
+      host: 'd', port: 8100, probe, sleep: fastSleep, xctestrun: '/fake/WDA.xctestrun',
+      listDevices: () => listing([{ udid: 'A', name: 'Air' }]),
+      spawnImpl: (() => proc) as never, platform: 'darwin',
+    });
+    expect(r.reason).toMatch(/Logic Testing Unavailable/);
+    // …and the guess it replaced is GONE from this path. Re-signing could not have helped here,
+    // and saying so cost an hour on #143.
+    expect(r.reason).not.toMatch(/still signed/);
+  });
+
+  it('spawns with stderr PIPED and stdout still discarded (#144)', () => {
+    // The pair matters: piping stdout too would put a test runner's whole log through this
+    // process, which is the thing the original `stdio:'ignore'` was right to avoid.
+    const proc = { exitCode: null, killed: false, kill() {}, on() {} };
+    const spawnImpl = vi.fn(() => proc);
+    return ensureWdaRunning({
+      host: 'd', port: 8100, probe: deadProbe, sleep: fastSleep, xctestrun: '/fake/WDA.xctestrun',
+      listDevices: () => listing([{ udid: 'A', name: 'Air' }]),
+      spawnImpl: spawnImpl as never, platform: 'darwin', timeoutMs: 0,
+    }).then(() => {
+      const opts = (spawnImpl.mock.calls[0] as unknown as [string, string[], { stdio: string[] }])[2];
+      expect(opts.stdio).toEqual(['ignore', 'ignore', 'pipe']);
+    });
+  });
+
+  it('a child with NO stderr still launches — losing the diagnostic must not break the launch', async () => {
+    // Every injected double in this file is such a child, but the real reason is production: if
+    // the pipe cannot be established, the launch is still the thing the caller asked for.
+    const proc = { exitCode: null, killed: false, kill() {}, on() {} };
+    const r = await ensureWdaRunning({
+      host: 'd', port: 8100, probe: deadProbe, sleep: fastSleep, xctestrun: '/fake/WDA.xctestrun',
+      listDevices: () => listing([{ udid: 'A', name: 'Air' }]),
+      spawnImpl: (() => proc) as never, platform: 'darwin', timeoutMs: 0,
+    });
+    expect(r.reason).toMatch(/has been starting/);
+  });
+
+  it('passes the LEASE through, so the launch targets the leased phone (#146)', async () => {
+    // The wiring, not the rule (that is unit-tested above): with two paired phones the old code
+    // took the connected one outright. Here the lease names the OTHER one, and that is the one
+    // `-destination id=` must carry.
+    const proc = { exitCode: null, killed: false, kill() {}, on() {} };
+    const spawnImpl = vi.fn(() => proc);
+    await ensureWdaRunning({
+      host: 'd', port: 8100, probe: deadProbe, sleep: fastSleep, xctestrun: '/fake/WDA.xctestrun',
+      listDevices: () => JSON.stringify({
+        result: {
+          devices: [
+            { connectionProperties: { tunnelState: 'disconnected' }, hardwareProperties: { udid: 'AIR', platform: 'iOS', productType: 'iPhone18,4' }, deviceProperties: { name: 'Air', osVersionNumber: '26.5.2' } },
+            { connectionProperties: { tunnelState: 'connected' }, hardwareProperties: { udid: 'MINI', platform: 'iOS', productType: 'iPhone14,4' }, deviceProperties: { name: 'Mini', osVersionNumber: '26.5.2' } },
+          ],
+        },
+      }),
+      spawnImpl: spawnImpl as never, platform: 'darwin', timeoutMs: 0,
+      lease: { deviceModel: 'iPhone18,4', osVersion: '26.5.2' },
+    });
+    const [, args] = spawnImpl.mock.calls[0] as unknown as [string, string[]];
+    expect(args).toContain('id=AIR');
+    expect(args).not.toContain('id=MINI');
+  });
+
+  it('an UNVERIFIED choice rides along on every later message about that launch (#146)', async () => {
+    // "Guess but say so". The launch is kept — refusing would break every setup whose app predates
+    // the hardware probe — but a failure must not read as though the phone was known to be right.
+    const proc = { exitCode: null, killed: false, kill() {}, on() {} };
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const r = await ensureWdaRunning({
+        host: 'd', port: 8100, probe: deadProbe, sleep: fastSleep, xctestrun: '/fake/WDA.xctestrun',
+        listDevices: () => listing([{ udid: 'A', name: 'Air' }]),
+        spawnImpl: (() => proc) as never, platform: 'darwin', timeoutMs: 0,
+        lease: { deviceModel: null, osVersion: null },   // an app older than #146
+      });
+      expect(r.reason).toMatch(/MODOKI_IOS_DEVICE_UDID/);
+      expect(r.reason).toMatch(/Air \(A\)/);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('[wda]'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('spawns xcodebuild against the RESOLVED udid, and reports running once it answers', async () => {
     const proc = { exitCode: null, killed: false, kill() {}, on() {} };
     const spawnImpl = vi.fn(() => proc);
@@ -358,5 +631,106 @@ describe('ensureWdaRunning', () => {
     stopWda();
     expect(proc.killed).toBe(true);
     expect(isWdaProcessRunning()).toBe(false);
+  });
+});
+
+
+/** #143 — `devicectl` is CoreDevice (iOS 17+), so an iOS 16-or-older device appears in its JSON as
+ *  a stub with no `udid` and is dropped. That made every pre-iPhone-X handset unselectable for
+ *  trusted input — and NOT EVEN `MODOKI_IOS_DEVICE_UDID` could reach it, since the pin is matched
+ *  against that same list. Measured on an iPhone 8 / iOS 16.7.16 holding a live lease.
+ *
+ *  The fixture below is REAL output from `xcrun xctrace list devices` on the Mac where this was
+ *  found, trimmed only in the simulator list — every LINE SHAPE is preserved (the version-less Mac
+ *  line, the 40-hex legacy UDID, the curly vs straight apostrophe), because invented fixtures are
+ *  what let the shape drift. Only the ids and owner names are replaced: a real UDID or a real
+ *  person's device name in a file that ships to the public mirror is #103's leak, and it has now
+ *  aborted the OSS snapshot twice (see `PLACEHOLDER_UDIDS` in scripts/scan-publish-safety.mjs). */
+const XCTRACE_REAL = [
+  '== Devices ==',
+  'Dev’s MacBook Pro (98C84BED-A4A8-50F3-9873-8F3BE2862EE4)',
+  'iPhone8 (16.7.16) (deadbeefdeadbeefdeadbeefdeadbeefdeadbeef)',
+  '',
+  '== Devices Offline ==',
+  'Test iPhone Air (26.5.2) (DEADBEEF-0123456789ABCDEF)',
+  "Someone's iPhone (26.6) (DEADBEEF-1123456789ABCDEF)",
+  'Unknown (B0FE9C9A-513C-56FA-B5A2-80952F941F3B)',
+  'iPhone 13 mini (26.5.2) (DEADBEEF-2123456789ABCDEF)',
+  '',
+  '== Simulators ==',
+  'iPhone 17 Simulator (26.5) (EFED8E7C-2BC4-429F-8BF7-451E49EC84E5)',
+  'iPhone Air Simulator (26.5) (CCABD5E9-2E82-4944-9033-BB15560B13E7)',
+].join('\n');
+
+describe('parseXctraceDevices — the legacy listing, the only one that sees iOS <= 16 (#143)', () => {
+  it('finds the iOS 16 device devicectl cannot describe, with its 40-hex legacy UDID', () => {
+    const d = parseXctraceDevices(XCTRACE_REAL).find((x) => x.name === 'iPhone8');
+    // The OS version comes free with the parse and is kept (#146) — it is the ONLY hardware fact
+    // this listing carries, since `xctrace` reports no model.
+    expect(d).toEqual({ udid: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', name: 'iPhone8', connected: true, osVersion: '16.7.16' });
+  });
+
+  it('excludes the Mac itself — by shape, not by name', () => {
+    // The Mac's line carries a UDID but NO OS version, which is why the pattern requires the
+    // `(os) (udid)` pair. Matching on the name would break on a renamed machine.
+    const names = parseXctraceDevices(XCTRACE_REAL).map((d) => d.name);
+    expect(names.some((n) => n.includes('MacBook'))).toBe(false);
+    expect(names.some((n) => n === 'Unknown')).toBe(false);   // also version-less
+  });
+
+  it('excludes simulators — a simulator is not a phone to run a signed agent on', () => {
+    expect(parseXctraceDevices(XCTRACE_REAL).some((d) => d.name.includes('Simulator'))).toBe(false);
+  });
+
+  it('reads `connected` from the section, so Offline devices are candidates but not preferred', () => {
+    const byName = Object.fromEntries(parseXctraceDevices(XCTRACE_REAL).map((d) => [d.name, d.connected]));
+    expect(byName['iPhone8']).toBe(true);
+    expect(byName['Test iPhone Air']).toBe(false);
+  });
+
+  it('returns [] for empty/garbage rather than throwing — the source is additive and may be absent', () => {
+    expect(parseXctraceDevices('')).toEqual([]);
+    expect(parseXctraceDevices('not a listing at all')).toEqual([]);
+  });
+});
+
+describe('mergeIosDevices — devicectl stays authoritative, legacy only ADDS (#143)', () => {
+  it('adds a device only the legacy listing can see', () => {
+    const merged = mergeIosDevices(
+      [{ udid: 'DEADBEEF-0123456789ABCDEF', name: 'Test iPhone Air', connected: false }],
+      parseXctraceDevices(XCTRACE_REAL),
+    );
+    expect(merged.map((d) => d.name)).toContain('iPhone8');
+  });
+
+  it('does not duplicate a device both listings report', () => {
+    // The two agree byte-for-byte on overlapping UDIDs (verified on hardware), so the dedupe is
+    // exact rather than heuristic. A duplicate would make resolveIosDevice refuse as "ambiguous"
+    // for a single phone — the failure this guards.
+    const primary = [{ udid: 'DEADBEEF-0123456789ABCDEF', name: 'Test iPhone Air', connected: true }];
+    const merged = mergeIosDevices(primary, parseXctraceDevices(XCTRACE_REAL));
+    expect(merged.filter((d) => d.udid === 'DEADBEEF-0123456789ABCDEF')).toHaveLength(1);
+    // and the devicectl entry WINS (it carries the richer fields + the live tunnel state)
+    expect(merged.find((d) => d.udid === 'DEADBEEF-0123456789ABCDEF')!.connected).toBe(true);
+  });
+
+  it('the merged list makes MODOKI_IOS_DEVICE_UDID able to reach an iOS 16 device at all', () => {
+    // The end-to-end point of #143: before the merge this pin answered "matches none of this
+    // Mac's paired iOS devices", leaving the device unselectable by ANY means.
+    const merged = mergeIosDevices(parseIosDevices('{"result":{"devices":[]}}'), parseXctraceDevices(XCTRACE_REAL));
+    const r = resolveIosDevice(merged, { MODOKI_IOS_DEVICE_UDID: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' } as NodeJS.ProcessEnv);
+    expect(r).toEqual({ device: { udid: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', name: 'iPhone8', connected: true, osVersion: '16.7.16' } });
+  });
+
+  it('a devicectl-listed device carries devicectl:true; a legacy-xctrace-only device carries no such field (#170)', () => {
+    // The Build-menu device picker (buildTargetMenu.ts) writes `iosDevicectlId` from exactly this
+    // field: present -> a hands-free `xcrun devicectl` install; absent -> an Xcode handoff, because
+    // an xctrace-only device is pre-iOS-17 and `devicectl install` cannot drive it at all.
+    const primary = parseIosDevices(listing([{ udid: 'DEADBEEF-0123456789ABCDEF', name: 'Test iPhone Air' }]));
+    const merged = mergeIosDevices(primary, parseXctraceDevices(XCTRACE_REAL));
+    const devicectlDevice = merged.find((d) => d.udid === 'DEADBEEF-0123456789ABCDEF');
+    const legacyOnlyDevice = merged.find((d) => d.name === 'iPhone8');
+    expect(devicectlDevice?.devicectl).toBe(true);
+    expect(legacyOnlyDevice?.devicectl).toBeUndefined();
   });
 });

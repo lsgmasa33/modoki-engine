@@ -10,7 +10,12 @@ export { ENGINE_VERSION, SCENE_FORMAT_VERSION, ENGINE_API_VERSION } from './core
 export { WHITE_HDR_GUID, DEFAULT_FONT_GUID } from './assets/builtinAssets';
 export { getCurrentWorld, setCurrentWorld, onWorldSwap } from './core/ecs/world';
 export { hostCanvases, hostCanvasUnder } from './ui/hostCanvas';
-export { clientToDesign2D, designToClient2D } from './rendering/canvas2DScaler';
+// `computeCanvasScale` alongside the two point-mappers because a game that draws a FULL-SCREEN
+// quad in design space needs the same scale the mappers use internally: with a letterboxing
+// scaleMode the design box is smaller than the host element, so "cover the screen" is an extent
+// the game can only compute from that scale. Court re-derived it by hand and shipped a constant
+// that was 25% short on a wide host — exactly the drift `clientToDesign2D` exists to prevent.
+export { clientToDesign2D, designToClient2D, computeCanvasScale } from './rendering/canvas2DScaler';
 export type { World } from 'koota';
 export {
   registerTrait, getAllTraits, getTraitByName, getTraitMeta, inferFields,
@@ -30,14 +35,30 @@ export {
   PlayerPrefs, InMemoryBackend, LocalStorageBackend, PreferencesBackend, selectDefaultBackend,
   type JsonValue, type PlayerPrefsInitOptions, type PrefsBackend,
 } from './storage';
+export { hapticsSystem } from './haptics/hapticsSystem';
+export { registerHapticControls } from './actions/hapticControls';
+export {
+  playHaptic, configureHaptics, areHapticsEnabled, canDeviceVibrate,
+  hapticLatencyMean, hapticLatencySamples, clearHapticLatency,
+  cancelPendingHaptics, disposeHaptics, setHapticBackend,
+} from './haptics/hapticsService';
+export {
+  registerHapticPatterns, clearHapticPatterns, resolveHapticPattern, hapticPatternNames,
+  ENGINE_HAPTIC_PATTERNS,
+  type HapticPreset, type HapticStep, type HapticPattern,
+} from './haptics/patterns';
+export {
+  NoopHapticBackend, CapacitorHapticBackend, pickHapticBackend, type HapticBackend,
+} from './haptics/backends';
+export { HapticSettings } from './traits/HapticSettings';
 export {
   Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, EntityAttributes, Camera, CameraFrame,
   PrefabInstance, ModelSource, Paused, Persistent, markPersistent, Transient, Time, Input,
-  UIElement, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, type MaterialParamOverride, type MaterialParamSource, ParticleEmitter, FlameMesh,
+  UIElement, type UILengthUnit, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, type MaterialParamOverride, type MaterialParamSource, ParticleEmitter, FlameMesh, BlobShadow,
   Animator, SpriteAnimator, defaultSpriteClip, clampAngle,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
-  AudioSource, AudioListener,
+  AudioSource, AudioListener, VideoPlayer,
   type MeshAsset, type MaterialAsset, type SpriteClip, type BodyType2D, type ColliderShape2D, type JointType2D,
   type BodyType3D, type ColliderShape3D, type JointType3D,
 } from './traits';
@@ -72,8 +93,9 @@ export {
   type TimelineDef, type TrackDef, type TrackKind, type TrackBase,
   type AnimationTrackDef, type AnimationClipBlock, type SignalTrackDef, type SignalMarker,
   type AudioTrackDef, type AudioCueBlock, type ActivationTrackDef, type ActivationSpan,
-  type ControlTrackDef, type ControlClipBlock,
+  type ControlTrackDef, type ControlClipBlock, type VideoTrackDef, type VideoClipBlock,
   defaultTimeline, normalizeTimeline, collectTimelineAudioRefs, collectTimelineControlRefs,
+  collectTimelineVideoRefs,
 } from './timeline/types';
 export {
   getTimeline, setTimeline, invalidateTimeline, clearTimelineCache, loadTimelineNow,
@@ -117,13 +139,17 @@ export {
   onStructureDirty, markStructureDirty, getStructureVersion,
   type EntityInfo,
 } from './core/ecs/entityUtils';
-export { findEntityById, findEntityByGuid, registerEntity, unregisterEntity } from './core/ecs/world';
+export { findEntityById, findEntityByGuid, registerEntity, spawnEntity, unregisterEntity, destroyEntity } from './core/ecs/world';
 export {
   registerModelPostprocessor, getModelPostprocessor, getAllModelPostprocessors, getModelPostprocessorIds,
   type ModelPostprocessor,
 } from './loaders/modelPostprocessorRegistry';
 export {
   loadModelTemplates, getMeshTemplate, resolveMeshTemplate,
+  // Exposed so a GAME can merge kit pieces at a chosen LOD level rather than always L0 —
+  // sling's field welds its per-cell drip meshes into one object and must weld the level the
+  // camera actually shows, or the merge would undo the LOD chain.
+  resolveMeshLodInfo,
   registerRuntimeMeshTemplate, unregisterRuntimeMeshTemplate,
   resolveMaterial, resolveMaterialForMesh,
   getTemplatesForModel,
@@ -148,7 +174,92 @@ export {
   getRendererGateHealth,
   invalidateTexture, getSharedTextureStats, disposeAllSharedTextures,
 } from './loaders/textureResolver';
-export { getGpuFaultState, MAX_REPORTED_GPU_ERRORS, type GpuFaultState } from './core/activeRenderer';
+export {
+  getGpuFaultState, MAX_REPORTED_GPU_ERRORS, type GpuFaultState,
+  // GPU context-loss recovery (#121 P1). `onRendererLost` is how a VIEWPORT subscribes to
+  // "your renderer is dead, build a new one" — this is the only route back, because a lost
+  // three renderer cannot be revived (its `_isDeviceLost` gate is never cleared).
+  onRendererLost, isRecoveryAbandoned, resetRecoveryState,
+  MAX_RECOVERY_ATTEMPTS, RECOVERY_WINDOW_MS, type RendererLostInfo,
+} from './core/activeRenderer';
+// Device capability probe (#121 P0). Safe in this SHARED barrel — it pulls no three/webgpu
+// (gpuDetect probes `navigator.gpu` natively and activeRenderer's three imports are type-only),
+// so a 2D-only game importing this barrel still tree-shakes the 3D stack out.
+export {
+  getDeviceCaps, getDeviceCapsSync, resetDeviceCaps,
+  type DeviceCaps, type CompressedTextureSupport,
+} from './rendering/deviceCaps';
+// Frame-time profiler (#121 P2) — the instrument the per-project 30fps work depends on.
+// Frame TIME, not fps: fps saturates at the vsync ceiling and reports 3ms and 16ms frames
+// identically as 60.
+export {
+  getFrameProfile, resetFrameProfile, BUDGET_30FPS_MS, PROFILE_WINDOW_FRAMES,
+  type FrameProfile, type FrameStat,
+} from './core/frameProfiler';
+export { readPerfProfile } from './debug/perfSources';
+// Profiler markers — the data model the Profiler panel and the MCP surface are both views of.
+// `profileScope` is public API: game code can name its own spans and they rank alongside the
+// engine's. See docs/plans/profiler.md.
+export {
+  profileScope, beginProfilerSample, endProfilerSample, setProfilerEnabled, isProfilerEnabled,
+  getMarkerTree, getMarkerFaults, getMarkerNodeCount, resetProfilerMarkers,
+  MAX_MARKER_DEPTH, MAX_MARKER_NODES,
+  type MarkerSample, type MarkerFaults,
+} from './core/profilerMarkers';
+export {
+  getMarkerAggregate, getMarkerRanking, resetMarkerAggregate, MARKER_WINDOW_FRAMES,
+  type MarkerAggregate, type MarkerStat,
+} from './core/profilerAggregate';
+// Frame capture (P6) — record N frames of trees and step through them. Exported as plain JSON
+// so a capture taken on a phone can be reasoned about without anyone holding the phone.
+export {
+  startCapture, stopCapture, isCapturing, getCapture, clearCapture, exportCapture,
+  getWorstCapturedFrame, MAX_CAPTURE_FRAMES,
+  type CapturedFrame, type CaptureState,
+} from './core/profilerCapture';
+// Counters (P9) — game-authored numeric series charted alongside the engine's timings.
+// setCounter for a LEVEL (persists), countEvent for a RATE (resets each frame).
+export {
+  setCounter, countEvent, getCounters, resetCounters,
+  COUNTER_WINDOW_FRAMES, MAX_COUNTERS,
+  type CounterStat, type CounterReport,
+} from './core/profilerCounters';
+// GPU timing (P7) — the real per-pass GPU ms that `restMs` cannot be. OFF by default and
+// runtime-toggleable (three already enables the device feature, so nothing is paid until asked).
+// Unavailable reports as `status: 'unsupported'` with the numbers ABSENT, never as zero.
+export {
+  setGpuTimingEnabled, isGpuTimingEnabled, getGpuProfile, getRestBreakdown, gpuPassScope,
+  pollGpuTimings, resetGpuTimings, getNewestGpuFrameId, MAX_GPU_PASS_LABELS,
+  type GpuProfile, type GpuPassStat, type GpuTimingStatus, type RestBreakdown,
+} from './core/gpuTimings';
+// Hit regions (#139) — the shapes a game's hitTest uses, which are authored NOWHERE and so cannot
+// be seen in an inspector, a scene view or a screenshot. A game publishes them from the code that
+// OWNS the geometry (never a second copy of it) via registerHitRegionProvider.
+export {
+  registerHitRegionProvider, collectHitRegions, hitRegionProviders,
+  isHitRegionOverlayVisible, setHitRegionOverlayVisible, subscribeHitRegionOverlay,
+  hitShapeContains, hitShapeDistance, regionsAt, nearestRegionTo,
+  type HitRegion, type HitShape, type HitRegionFilter, type HitRegionProvider,
+} from './rendering/hitRegions';
+// Quality tiers (#121 P3) — two tiers, measurement as ground truth, allowlist as a shortcut.
+// The allowlist ships EMPTY and `auto` is NOT the default: see the module header, both are
+// deliberate states pending P5 calibration on real hardware, not unfinished work.
+export {
+  resolveTier, evaluateTierChange, freshTierChangeState, tierShadowMapSize, tierAllowsPostFX,
+  TIER_SETTINGS, TIER_ALLOWLIST, DEFAULT_TIER_SETTING,
+  type QualityTier, type QualityTierSetting, type TierResolution, type TierSource,
+  type TierRenderOverrides, type TierResolveInput, type TierChangeState, type TierDecision,
+  iosModelTier, parseAppleModel, IOS_HIGH_TIER_MIN_GENERATION,
+} from './rendering/qualityTier';
+// The boot ramp probe (#188). The PURE half only — the runner pulls in three and is imported
+// dynamically at the one call site that needs it, so a headless or DCE'd build never loads it.
+export {
+  startRamp, rampNextLoad, recordRampFrame, readRamp, estimateIntervalMs, classifyDevice,
+  probeFingerprint, PROBE_THRESHOLDS, PROBE_BUDGET_MS, RAMP_BOUNDS,
+  type DeviceClass, type ProbeMeasurement, type ProbeVerdict, type RampKind, type RampReading,
+  type RampState, type RampStatus, type RampStep, type ThroughputBound,
+} from './rendering/rampProbe';
+export { probeVerdictStore, type ProbeVerdictStore, type CachedProbeVerdict } from './core/probeVerdictStore';
 export { registerMaterialType, getMaterialBuilder, getRegisteredMaterialTypes, type MaterialBuilder } from './loaders/materialTypes';
 export { registerCustomShader, unregisterCustomShader, getCustomShader, getCustomShaderSchema, getRegisteredShaderNames, type CustomShaderBuild } from './loaders/customShaders';
 export { mergeParamDefaults, coerceParamValue, fetchShaderManifest, type ShaderParam, type ShaderParamType, type ShaderParamSchema, type ShaderManifest } from './loaders/shaderSchema';
@@ -173,6 +284,15 @@ export { sceneManager, gameIdFromScenePath, type Scene, type SceneState, type Lo
 export { validateSceneData, typeMismatch, REF_FIELDS_BY_TRAIT, type SceneSchema, type ValidationResult } from './loaders/sceneValidation';
 export { buildSceneSchema } from './scene/sceneSchema';
 export { applyOps, type MutateOp, type MutableScene, type MutableEntity, type EntityRef as MutateEntityRef, type ApplyResult } from './scene/sceneMutate';
+// Entity-creation spec builders + the anchor-first UI authoring rules. In runtime (not editor)
+// since #166 so the DEVICE create-entity op can build the SAME entities the editor does — the
+// editor half of the package is stripped from a shipped game build. See
+// docs/plans/device-authoring-parity-plan.md.
+export { buildEntityCreateSpecs, type CreateEntitySpec, type CreateSpecs, type TraitSpec, type LightKind } from './scene/entityCreateSpecs';
+export { buildUiCreateSpecs, type UiPreset, type UiTraitSpec } from './ui/uiAuthoring';
+// Hierarchy legality (#166 P7) — the ONE self-parent/cycle rule, shared by the editor's undoable
+// reparent and the device's direct parentId write. See runtime/core/ecs/hierarchy.ts.
+export { isAncestorOf, reparentRefusal, type ReparentRefusal } from './core/ecs/hierarchy';
 /** LOCAL↔WORLD Transform authoring (`set_transform {space}`) — the FILE-path conversion.
  *  The live path uses `worldToLocal3D`/`getWorldTransform3D` from core/ecs/worldTransform. */
 export { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes, type TRS } from './scene/transformSpace';
@@ -215,6 +335,10 @@ export {
   isDebugMenuEnabled,
   setDebugMenuEnabled,
 } from './debug/debugMenuRegistry';
+export {
+  setDebugHandlesEnabled,
+  areDebugHandlesEnabled,
+} from './core/debugHandles';
 export type { DebugTabDef, DebugCommandDef } from './debug/debugMenuRegistry';
 
 // ── Frame Driver (no heavy deps — safe for all importers) ──
@@ -229,7 +353,16 @@ export type { FrameLoopHealth } from './rendering/frameDriver';
 // ── Render settings (project-configured renderer knobs) ──
 export {
   setRenderSettings, getRenderSettings, resetRenderSettings, resolveToneMapping,
+  setActiveQualityTier, getActiveQualityTier, getEffectiveThreeSettings, getActiveTierOrDefault,
 } from './rendering/renderSettings';
+export {
+  tickTierCalibration, applyPendingTierPromotion, resetTierCalibration,
+  getPendingTierPromotion, CALIBRATION_INTERVAL_MS,
+} from './rendering/tierCalibration';
+export {
+  getPlayerQualityTier, setPlayerQualityTier, hasPlayerQualityTier, choosePlayerQualityTier,
+} from './rendering/playerQualityTier';
+export { playerTierStore, type PlayerTierStore } from './core/playerTierStore';
 export type { RenderSettings, ThreeRenderSettings, PixiRenderSettings, WebRenderSettings } from './rendering/renderSettings';
 export { getWorldTransform3D, getWorldMatrix3D, getParentWorldMatrix3D, worldToLocal3D, hasParent } from './core/ecs/worldTransform';
 export type { WorldTransform3D } from './core/ecs/worldTransform';
@@ -276,12 +409,22 @@ export {
   // Pointer / tap / drag accessors (already unambiguous, no prefix needed).
   pointer as inputPointer, pointerDown, pointerPressed, pointerReleased,
   pointerPos, pointerDrag, getWheelDelta, setPointer as setInputPointer,
+  // Latency compensation — `pointerPredictedPos` is RENDERING-only; hit-tests read `pointerPos`.
+  pointerPredictedPos, pointerVelocity, setPointerLeadMs, getPointerLeadMs,
+  POINTER_LEAD_MS_DEFAULT, POINTER_LEAD_MS_ANDROID_60HZ,
+  setPointerLeadGate, getPointerLeadGate, pointerLeadGateFactor, POINTER_LEAD_GATE_DEFAULTS,
 } from './traits/Input';
+export {
+  setPointerFilterParams, getPointerFilterParams,
+} from './input/pointerSource';
+export {
+  createOneEuroFilter, oneEuroAlpha, POINTER_FILTER_DEFAULTS, type OneEuroParams,
+} from './input/oneEuroFilter';
 export { rawNow, setManualNow, advanceManual, restoreRealClock, isManualClock } from './core/clock';
 export { stepSimulation, type StepOptions } from './core/stepSimulation';
 export { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';
 export {
-  emit, entityRef, journalEvents, drainJournal, clearJournal, setJournalTick, setJournalEnabled,
+  emit, entityRef, journalEvents, drainJournal, clearJournal, setJournalTick, journalTick, setJournalEnabled,
   resolveRefName, setVerboseCapture, verboseCaptureState, isVerboseType,
   isJournalEnabled,
   type GameEvent, type JournalLevel,
@@ -325,6 +468,13 @@ export { characterInput3DSystem } from './input/characterInput3DSystem';
 export { characterAnimationSystem } from './animation/characterAnimationSystem';
 export { audioSystem, stopWorldAudio, stopEntityAudio, setAudioWorldPositionResolver } from './audio/audioSystem';
 export { registerAudioControls, useAudioMixStore } from './actions/audioControls';
+export { registerVideoControls } from './actions/videoControls';
+// Fullscreen cutscene layer. React + DOM only (no THREE), so exporting it here does
+// not pull the 3D graph into a 2D game — see the rendering-entry note below.
+export { VideoOverlay, type VideoOverlayProps } from './video/VideoOverlay';
+export {
+  videoEvents, clearVideoEventHandlers, emitVideoSkip, type VideoEventPayload,
+} from './video/VideoEvents';
 // Audio subsystem — service (playback backend), cue bus, context, buffer cache.
 export {
   play as audioPlay, stopAll as audioStopAll, resume as audioResume, dispose as audioDispose,
@@ -334,6 +484,25 @@ export {
   getAudioLog, clearAudioLog, setAudioRecordMode,
   type BusName, type AudioPlaySpec, type AudioHandle, type AudioLogEntry,
 } from './audio/audioService';
+// Video subsystem — playback core (HTMLVideoElement lifetime, timeScale coupling,
+// autoplay-block recovery). Its SOUND routes onto the audio bus above.
+export {
+  playVideo, applyTimeScale as applyVideoTimeScale, disposeAllVideo, liveVideoCount,
+  type VideoHandle, type VideoPlaySpec, type VideoTimeMode,
+} from './video/videoService';
+export {
+  videoSystem, stopWorldVideo, setVideoUrlResolver, videoElementFor, seekEntityVideo,
+  setVideoSourceResolver, setVideoDownloader, type ResolvedVideoSource,
+} from './video/videoSystem';
+export { resolveVideoUrl, resolveVideoSource, type VideoSource } from './loaders/videoUrl';
+export {
+  VideoCache, CacheApiBackend, hasCacheStorage,
+  type CacheBackend, type VideoCacheOptions, type DownloadProgress,
+} from './video/videoCache';
+export {
+  planAdmission, explainRefusal, totalBytes as videoCacheTotalBytes,
+  type CacheEntry, type AdmissionResult,
+} from './video/videoCachePolicy';
 export { cueSound, cueClip, drainAudioCues, clearAudioCues, type AudioCue } from './audio/audioCues';
 export { parseClipBank, stringifyClipBank, clipRefForKey, type ClipBankEntry } from './audio/clipBank';
 export { getAudioContext, hasAudioSupport, disposeAudioContext } from './audio/audioContext';
@@ -358,6 +527,16 @@ export { registerInputPromptSources } from './input/inputPromptSources';
 // sibling of the game canvas) claims exclusive ownership of pointer gestures that
 // start on it, so `pointerSource` never latches them as a game gesture.
 export { registerPointerBlocker, registerPointerPassthrough, isPointerBlocked } from './core/pointerBlockers';
+// Input WATCH (#134) — a game publishes what its OWN hit-test resolved a press to, which is the
+// one thing no engine-side observer can compute for a canvas game. Safe to call unconditionally:
+// it is a no-op until an agent opens a watch window.
+// The control half is consumed by `engine/app/debug/agentBridge.ts`, which reaches this package
+// only through its declared `exports` map — so an agent op cannot register without these.
+export {
+  noteInputResolution,
+  startInputWatch, stopInputWatch, clearInputPresses, readInputPresses, isInputWatchOpen,
+  type InputPressRecord, type InputResolution,
+} from './input/pointerRecorder';
 export {
   AXES, DIGITAL, applyDeadzone, clampAxes, computeEdges, computePointerEdge, createInputFrame, beginSample,
   makeAxes, makeFlags, makePointer,
@@ -383,7 +562,7 @@ export {
 } from './core/pipeline';
 export type { SystemOptions } from './core/pipeline';
 export { registerLateUpdate, unregisterLateUpdate, runLateUpdates, clearLateUpdates, type LateUpdateFn } from './core/lateUpdate';
-export { registerProjection, unregisterProjection, type SubscribableStore } from './core/projection';
+export { registerProjection, unregisterProjection, type SubscribableStore, type ProjectionOptions } from './core/projection';
 // ── Managers (event-driven counterpart to Systems) ──
 export {
   registerManager, registerManagers, unregisterManager, unregisterManagers,

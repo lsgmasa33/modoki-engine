@@ -15,6 +15,7 @@ import { invalidateAudio } from '../../../runtime/loaders/audioBufferCache';
 import { getAudioContext } from '../../../runtime/audio/audioContext';
 import { inputStyle } from '../fields';
 import { formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';
+import { withCurrentValue } from './importSettingOptions';
 
 const FORMAT_LABELS: Record<AudioFormat, string> = {
   mp3: 'MP3 (default — license-free, universal)',
@@ -117,22 +118,27 @@ export function AudioAssetView({ path, name }: { path: string; name: string }) {
         <div style={rowStyle}>
           <span style={labelStyle}>Bitrate (kbps)</span>
           <select value={String(settings.quality)} onChange={(e) => update({ quality: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
-            {AUDIO_BITRATES.map((b) => <option key={b} value={b}>{b}</option>)}
+            {withCurrentValue(AUDIO_BITRATES, settings.quality).map((b) => <option key={b} value={b}>{b}</option>)}
           </select>
         </div>
       )}
       <div style={rowStyle}>
         <span style={labelStyle}>Sample Rate</span>
         <select value={String(settings.sampleRate ?? 0)} onChange={(e) => update({ sampleRate: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
-          {/* opus only accepts a fixed set of rates — offer just those for opus. */}
-          {(settings.format === 'opus' ? OPUS_SAMPLE_RATES : AUDIO_SAMPLE_RATES).map((r) => <option key={r} value={r}>{r === 0 ? 'Source' : `${r} Hz`}</option>)}
+          {/* opus only accepts a fixed set of rates — offer just those for opus. A rate the
+              sidecar already holds is spliced in either way: an unlisted `value` would
+              otherwise display as the FIRST option and misreport the setting (#131). For
+              opus that also makes an illegal authored rate VISIBLE rather than disguising
+              it as "Source". */}
+          {withCurrentValue(settings.format === 'opus' ? OPUS_SAMPLE_RATES : AUDIO_SAMPLE_RATES, settings.sampleRate ?? 0)
+            .map((r) => <option key={r} value={r}>{r === 0 ? 'Source' : `${r} Hz`}</option>)}
         </select>
       </div>
       {settings.format === 'wav' && (
         <div style={rowStyle}>
           <span style={labelStyle}>Bit Depth</span>
           <select value={String(settings.bitDepth ?? 16)} onChange={(e) => update({ bitDepth: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
-            {AUDIO_BIT_DEPTHS.map((b) => <option key={b} value={b}>{b}-bit{b === 32 ? ' (float)' : ''}</option>)}
+            {withCurrentValue(AUDIO_BIT_DEPTHS, settings.bitDepth ?? 16).map((b) => <option key={b} value={b}>{b}-bit{b === 32 ? ' (float)' : ''}</option>)}
           </select>
         </div>
       )}

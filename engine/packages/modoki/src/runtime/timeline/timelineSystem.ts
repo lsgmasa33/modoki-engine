@@ -665,6 +665,37 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
         }
         break;
       }
+      case 'video': {
+        // Edge-driven like a control clip, and driven through the ACTION REGISTRY rather than by
+        // importing videoSystem. Two reasons, both deliberate: it mirrors how the animation track
+        // triggers a skeletal animator (`engine.playClip`), and it keeps the video subsystem
+        // DCE-able — a hard import here would pin video into every bundle, defeating the
+        // `build.modules` toggle. With video switched off the dispatch warns once per crossing
+        // instead of failing the build, which is the honest outcome for a timeline that asks for
+        // a subsystem the game excluded.
+        const targetId = resolveTrackTarget(index, p.rootId, track.target);
+        if (targetId === null) break;
+        const entity = index.byId.get(targetId) as unknown as Entity | undefined;
+        if (!entity) break;
+        for (const clip of track.clips) {
+          if (crossed(p.prev, p.cur, clip.start, p.loop, p.duration, p.justStarted, p.advanced)) {
+            // Rewind BEFORE setting the clip. On a looping Director (or a re-entered span) the
+            // element is mid-playback and `setClip` with the same GUID is a no-op in the video
+            // reconcile — so without the stop, the second pass would resume from wherever the
+            // first left off rather than replaying the cutscene.
+            dispatchGameAction('video.stop', { target: entity });
+            dispatchGameAction('video.setClip', { target: entity, params: { clip: clip.clip } });
+          }
+          if (clip.duration !== undefined
+              && crossed(p.prev, p.cur, clip.start + clip.duration, p.loop, p.duration, p.justStarted, p.advanced)) {
+            // Pause, not stop: the last frame stays on screen, so a video texture doesn't blink
+            // back to frame 0 on the way out. The clip ref is left set on the trait — restoring
+            // it would force a reload for no visible benefit.
+            dispatchGameAction('video.pause', { target: entity });
+          }
+        }
+        break;
+      }
       case 'activation':
         break; // handled by pose()
     }

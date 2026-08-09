@@ -14,3 +14,4 @@ declare const __MODOKI_MODULE_PHYSICS2D__: boolean;
 declare const __MODOKI_MODULE_PHYSICS3D__: boolean;
 declare const __MODOKI_MODULE_NPR__: boolean;
 declare const __MODOKI_MODULE_GPU_PARTICLES__: boolean;
+declare const __MODOKI_MODULE_VIDEO__: boolean;

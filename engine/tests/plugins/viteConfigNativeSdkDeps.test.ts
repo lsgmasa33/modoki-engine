@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type { UserConfig } from 'vite'
 import { hasInternalGames } from '../helpers/repoLayout'
+import { aliasFor, aliasKeys } from './viteAlias'
 
 /**
  * Regression guard for the packaged-editor "project opens TWICE" bug.
@@ -64,15 +65,15 @@ describe.skipIf(!hasInternalGames())('vite.config native-SDK app-services deps (
     process.env.MODOKI_PROJECT = 'games/3d-test'
     const config = await buildConfig()
     const include = config.optimizeDeps?.include ?? []
-    const alias = config.resolve?.alias as Record<string, string> | undefined
+    const alias = config.resolve?.alias as Parameters<typeof aliasFor>[0]
 
     expect(include).toContain('@capacitor-firebase/analytics')
     expect(include).toContain('@capacitor-firebase/crashlytics')
 
     // The alias must point at the SAME resolved file the cold scan bundled — a real, existing
     // absolute path inside the game's OWN node_modules (not the engine's).
-    const analyticsAlias = alias?.['@capacitor-firebase/analytics']
-    const crashlyticsAlias = alias?.['@capacitor-firebase/crashlytics']
+    const analyticsAlias = aliasFor(alias, '@capacitor-firebase/analytics')
+    const crashlyticsAlias = aliasFor(alias, '@capacitor-firebase/crashlytics')
     expect(analyticsAlias).toBeTruthy()
     expect(crashlyticsAlias).toBeTruthy()
     expect(path.isAbsolute(analyticsAlias!)).toBe(true)
@@ -86,15 +87,15 @@ describe.skipIf(!hasInternalGames())('vite.config native-SDK app-services deps (
     process.env.MODOKI_PROJECT = 'games/3d-test'
     const config = await buildConfig()
     const include = config.optimizeDeps?.include ?? []
-    const alias = config.resolve?.alias as Record<string, string> | undefined
+    const alias = config.resolve?.alias as Parameters<typeof aliasFor>[0]
 
     // capacitor-adjust / capacitor-applovin-max are `file:../…` in app-services/package.json —
     // local source packages, like @modoki/engine, not registry deps. Forcing them into the cold
     // optimizer would fight the same staleness class this fix is meant to resolve.
     expect(include).not.toContain('capacitor-adjust')
     expect(include).not.toContain('capacitor-applovin-max')
-    expect(alias?.['capacitor-adjust']).toBeUndefined()
-    expect(alias?.['capacitor-applovin-max']).toBeUndefined()
+    expect(aliasFor(alias, 'capacitor-adjust')).toBeUndefined()
+    expect(aliasFor(alias, 'capacitor-applovin-max')).toBeUndefined()
   })
 
   it('does not throw on an unresolvable app-services dep, and excludes it from include/alias', async () => {
@@ -109,9 +110,9 @@ describe.skipIf(!hasInternalGames())('vite.config native-SDK app-services deps (
     // asserts the behavior that actually matters: no throw, cleanly excluded.)
     const config = await buildConfig()
     const include = config.optimizeDeps?.include ?? []
-    const alias = config.resolve?.alias as Record<string, string> | undefined
+    const alias = config.resolve?.alias as Parameters<typeof aliasFor>[0]
     expect(include).not.toContain('firebase')
-    expect(alias?.firebase).toBeUndefined()
+    expect(aliasFor(alias, 'firebase')).toBeUndefined()
   })
 
   it('a project with no packages/app-services (e.g. games/sling) adds nothing beyond the base @modoki/engine list', async () => {
@@ -119,7 +120,7 @@ describe.skipIf(!hasInternalGames())('vite.config native-SDK app-services deps (
     process.env.MODOKI_PROJECT = 'games/sling'
     const config = await buildConfig()
     const include = config.optimizeDeps?.include ?? []
-    const alias = config.resolve?.alias as Record<string, string> | undefined
+    const alias = config.resolve?.alias as Parameters<typeof aliasFor>[0]
 
     const baseline = new Set([
       '@modoki/engine/runtime',
@@ -130,7 +131,7 @@ describe.skipIf(!hasInternalGames())('vite.config native-SDK app-services deps (
       '@modoki/engine/three',
     ])
     for (const spec of include) expect(baseline.has(spec)).toBe(true)
-    expect(Object.keys(alias ?? {}).some((k) => k.startsWith('@capacitor-firebase'))).toBe(false)
+    expect(aliasKeys(alias).some((k) => k.startsWith('@capacitor-firebase'))).toBe(false)
   })
 
   it('dev (MODOKI_VITE_CACHEDIR unset): does not force app-services deps into optimizeDeps even for a project that has them', async () => {
@@ -138,10 +139,10 @@ describe.skipIf(!hasInternalGames())('vite.config native-SDK app-services deps (
     process.env.MODOKI_PROJECT = 'games/3d-test'
     const config = await buildConfig()
     const include = config.optimizeDeps?.include ?? []
-    const alias = config.resolve?.alias as Record<string, string> | undefined
+    const alias = config.resolve?.alias as Parameters<typeof aliasFor>[0]
 
     expect(include).not.toContain('@capacitor-firebase/analytics')
     expect(include).not.toContain('@capacitor-firebase/crashlytics')
-    expect(alias?.['@capacitor-firebase/analytics']).toBeUndefined()
+    expect(aliasFor(alias, '@capacitor-firebase/analytics')).toBeUndefined()
   })
 })

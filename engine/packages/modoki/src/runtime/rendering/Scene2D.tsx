@@ -51,7 +51,11 @@ import { getSkin2DBuffer, clearSkin2DBuffers, frameSkin2DUVs } from '../skinning
 import { clearDeform2DBuffers } from '../animation/deform2DBuffers';
 import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_2D, PRIORITY_EDITOR_2D } from './frameDriver';
 import { sceneManager } from '../scene/SceneManager';
-import { isImagePath, resolveImageUrl, resolvePrimitiveShape, getWorldTransform2D, resolveSprite, type ResolvedSprite } from './renderUtils';
+import { isImagePath, isVideoRef, resolveImageUrl, resolvePrimitiveShape, getWorldTransform2D, resolveSprite, type ResolvedSprite } from './renderUtils';
+import { syncVideoTextures2D, disposeVideoTextures2D } from './videoTextureSync2D';
+/** Shared empty result for the video pass when the module is excluded — a fresh [] per frame
+ *  would allocate for a subsystem that isn't even in the build. */
+const EMPTY_IDS: number[] = [];
 import { computePivotOffset, computeSpriteScale, drawPrimitiveShapeGfx, drawColliderFillGfx, drawColliderOutlineGfx, colliderOutlineSig, COLLIDER_SPRITE, pixiBlendMode2D } from './render2DUtils';
 import { computeCanvasScale, canvasPxToClient } from './canvas2DScaler';
 import { getSpriteEpoch } from '../loaders/assetManifest';
@@ -552,6 +556,21 @@ export class Scene2DRenderer {
     return sp;
   }
 
+  /** A Sprite for a VIDEO ref: an empty shell, deliberately.
+   *
+   *  No `Assets.load`, no URL retain, no frame/atlas handling — `videoTextureSync2D`
+   *  fills the texture in from the element `videoService` already owns. Routing a video
+   *  through `makeSprite` would have Pixi's video loader mint a SECOND
+   *  `HTMLVideoElement` for the same clip: two decoders, two audio paths, and playback
+   *  the engine's `timeScale` cannot reach. `textureUrl` stays `''`, so `disposeSlot`
+   *  has nothing to release — which is right, since nothing was ever retained. */
+  private makeVideoSprite(container: Container): Sprite {
+    const sp = new Sprite(Texture.EMPTY);
+    sp.anchor.set(0.5);
+    container.addChild(sp);
+    return sp;
+  }
+
   /** Resolve the texture a 2D-material entity should sample as `uTexture` from its
    *  Renderable2D.sprite. Returns the entity's own sprite bitmap once resident; while
    *  it loads (or when the entity has no image sprite) returns Texture.WHITE with an
@@ -743,7 +762,13 @@ export class Scene2DRenderer {
 
         this.activeIds.add(id);
 
-        const imageMode = isImagePath(rend.sprite);
+        // A video ref is a Sprite on screen but NOT an image asset — it skips the whole
+        // still-image path (resolve/load/retain/atlas) and gets its texture from
+        // videoTextureSync2D instead. Checked first so `imageMode` can never also be
+        // true for it; both together would double-build the slot.
+        const videoMode = isVideoRef(rend.sprite);
+        const imageMode = !videoMode && isImagePath(rend.sprite);
+        const spriteKind: DisplayKind = (imageMode || videoMode) ? 'sprite' : 'graphics';
         // Epoch of the texture backing THIS ref (per-texture, so re-slicing one sheet
         // only rebuilds sprites of that sheet — not every 2D sprite on screen).
         const spriteEpoch = getSpriteEpoch(rend.sprite);
@@ -781,7 +806,7 @@ export class Scene2DRenderer {
           displaySlot!.spriteRef = rend.sprite;
           displaySlot!.hasFrame = resolved!.frame != null;
           // textureUrl + refcount unchanged — that's the whole point (no unload churn).
-        } else if (displaySlot && ((imageMode ? 'sprite' : 'graphics') !== displaySlot.kind || displaySlot.spriteRef !== rend.sprite ||
+        } else if (displaySlot && (spriteKind !== displaySlot.kind || displaySlot.spriteRef !== rend.sprite ||
           (imageMode && displaySlot.builtEpoch !== spriteEpoch))) {
           // Kind changed, a genuine URL change, or a re-slice epoch bump → full rebuild.
           // RETAIN-BEFORE-RELEASE (material→sprite same-url swap): when a material is cleared at
@@ -799,7 +824,12 @@ export class Scene2DRenderer {
         }
 
         if (!displaySlot) {
-          if (imageMode) {
+          if (videoMode) {
+            displaySlot = {
+              kind: 'sprite', obj: this.makeVideoSprite(canvasSlot.container),
+              spriteRef: rend.sprite, textureUrl: '', hasFrame: false, builtEpoch: spriteEpoch, meshVersion: -1,
+            };
+          } else if (imageMode) {
             if (!resolved) { if (bridgeUrl) releaseSpriteTexture(bridgeUrl); return; } // guid not yet in manifest — wait for next frame
             displaySlot = {
               kind: 'sprite', obj: this.makeSprite(resolved, canvasSlot.container),
@@ -1229,7 +1259,14 @@ export class Scene2DRenderer {
           disposeSlot(slot); this.slots.delete(id); this.lastTextRender.delete(id); slot = undefined;
         }
 
-        const atlas = { width: provider.atlas.width, height: provider.atlas.height, distanceRange: provider.atlas.distanceRange, size: provider.atlas.size };
+        // SPREAD, never an enumerated field list. A snapshot is wanted (it is stashed on the
+        // shader to re-derive the shadow offset on a style change), but naming the fields
+        // means a new one is silently dropped: `type` was added so the shader could tell an
+        // mtsdf atlas from a 3-channel msdf one, this literal kept omitting it, and the
+        // fallback stayed off — the msdf glow rendered as a solid rectangle exactly as
+        // before the fix, with the unit tests green because they assert on the shader
+        // SOURCE, not on the uniform that reaches it.
+        const atlas = { ...provider.atlas };
 
         // (Re)build geometry only when the layout changed (or the slot is new). One Mesh
         // per atlas PAGE the text touches (dynamic CJK spills across pages); baked text
@@ -1266,7 +1303,7 @@ export class Scene2DRenderer {
               buffer: new Buffer({ data: geo.colors, label: 'attribute-text-color', usage: BufferUsage.VERTEX | BufferUsage.COPY_DST }),
               format: 'float32x4', stride: 4 * 4, offset: 0,
             });
-            const shader = makeMtsdfPixiShader(ptex, atlas, style);
+            const shader = makeMtsdfPixiShader(ptex, atlas, style, t.fontSize);
             const mesh = new Mesh({ geometry, texture: ptex, shader });
             container.addChild(mesh);
             slot.pageMeshes.push(mesh); slot.textShaders.push(shader); slot.pageNums!.push(page);
@@ -1410,6 +1447,25 @@ export class Scene2DRenderer {
       }
     }
 
+    // Video sprites: adopt each playing entity's HTMLVideoElement onto its Sprite. Runs
+    // after the sprite pass (it needs the slots) and before renderAll.
+    //
+    // A playing clip changes its pixels every frame with NO ECS write to notice, so it
+    // has to hold its own canvas dirty AND keep the idle gate awake — otherwise the
+    // editor's render-on-demand loop settles and the video freezes on its first frame,
+    // which looks exactly like a decode failure.
+    const videoIds = __MODOKI_MODULE_VIDEO__ ? syncVideoTextures2D(world, this, (eid) => {
+      const s = this.slots.get(eid);
+      return s?.kind === 'sprite' ? (s.obj as Sprite) : null;
+    }) : EMPTY_IDS;
+    if (videoIds.length) {
+      for (const eid of videoIds) {
+        const cid = this.canvasOfEntity.get(eid);
+        if (cid != null) this.dirtyCanvases.add(cid);
+      }
+      this.markDirty();
+    }
+
     // Editor collider overlay (no-op unless enabled) — draws onto canvas containers and
     // marks them dirty, so it must run before renderAll.
     this.drawColliderOverlays(world);
@@ -1481,6 +1537,9 @@ export class Scene2DRenderer {
     this.unsub2DMat = register2DMaterialShaderMap(this.entityShaders);
 
     this.unsubSwap = onWorldSwap(() => {
+      // Before the slots go: release() restores each Sprite's previous texture, and a
+      // destroyed Sprite can't take one back.
+      if (__MODOKI_MODULE_VIDEO__) disposeVideoTextures2D(this);
       for (const slot of this.slots.values()) disposeSlot(slot);
       this.slots.clear();
       this.entityShaders.clear();
@@ -1543,6 +1602,7 @@ export class Scene2DRenderer {
     if (this.unsubBounds) { this.unsubBounds(); this.unsubBounds = null; }
     if (this.primary) sceneManager.unregisterBeforeSwap(prewarmHook);
 
+    if (__MODOKI_MODULE_VIDEO__) disposeVideoTextures2D(this);   // before disposeSlot — see the onWorldSwap note
     for (const slot of this.slots.values()) disposeSlot(slot);
     this.slots.clear();
     this.entityShaders.clear();

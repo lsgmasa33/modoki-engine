@@ -55,6 +55,18 @@ export interface PointerFrame {
   startX: number; startY: number;
   dragX: number; dragY: number;
   wheel: number;
+  /** Pointer VELOCITY in CSS px per millisecond, EMA-smoothed, 0 while the pointer is up.
+   *  Published so a consumer can EXTRAPOLATE the pointer forward and cancel the platform's
+   *  touch-to-photon latency — see `pointerPredictedPos`. Raw (not presentation-scaled), to
+   *  match `x`/`y`; `dragX`/`dragY` are the scaled pair. */
+  vx: number; vy: number;
+  /** `timeStamp` of the sample `x`/`y` came from, on the `performance.now()` clock (0 if none).
+   *  Load-bearing for prediction: input and display are ASYNCHRONOUS, so the newest event's age
+   *  at render time varies by up to a full input interval every frame. Extrapolating a fixed
+   *  lead from the event — instead of to a fixed point in absolute time — bakes that phase noise
+   *  straight into the drawn position, which is spatial JITTER rather than latency. See
+   *  `pointerPredictedPos`. */
+  t: number;
 }
 
 /** The merged per-frame snapshot a set of sources produces. `held` is the level
@@ -75,7 +87,7 @@ export function makeAxes(): AxisMap {
 }
 
 export function makePointer(): PointerFrame {
-  return { x: 0, y: 0, down: false, pressed: false, released: false, startX: 0, startY: 0, dragX: 0, dragY: 0, wheel: 0 };
+  return { x: 0, y: 0, down: false, pressed: false, released: false, startX: 0, startY: 0, dragX: 0, dragY: 0, wheel: 0, vx: 0, vy: 0, t: 0 };
 }
 
 export function makeFlags(): FlagMap {
