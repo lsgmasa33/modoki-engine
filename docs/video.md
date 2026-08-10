@@ -271,6 +271,44 @@ entirely (`isVideoRef` in `runtime/core/textureRefs.ts`), leaving an empty Sprit
 shared element it blacks out the 3D texture and the fullscreen overlay along with the sprite.
 `release()` detaches the resource first, and that ordering is asserted directly.
 
+**The 3D binding takes a CLONE of the material, and taking the material itself is a crash (#192).**
+The obvious implementation — write the video onto the mesh's `map`, put the old `map` back when the
+clip stops — is wrong twice:
+
+1. Engine materials are **shared and refcounted by GUID** ([scene-loading.md](scene-loading.md)), so
+   writing `map` onto one shows the video on every other mesh using it.
+2. three's `NodeMaterialObserver` is **asymmetric about null**, and the second half is what kills the
+   renderer:
+
+   ```js
+   getMaterialData:  if ( value === null || value === undefined ) continue;   // recording SKIPS null
+   equals:           } else if ( mtlValue.isTexture === true ) {              // comparing does NOT guard it
+   ```
+
+   The snapshot lives in a module-level `_materialCache` **keyed by the material object and written
+   once** — nothing re-records it, and `material.needsUpdate = true` does *not* reset it. So a slot
+   recorded holding a texture that later returns to `null` makes `equals()` dereference null on every
+   subsequent frame: `Cannot read properties of null (reading 'isTexture')`, thrown out of the render
+   loop in **every** viewport, and permanently — that material can never be rendered again. Restoring
+   `map` to its previous value walked into this whenever that value was null, i.e. any screen with no
+   authored map. `demos/video-demo` has no `.mat.json` at all, so *every* surface there was affected
+   and the first clip stop killed the scene.
+
+`videoTextureSync` therefore binds a private clone: the shared original is never mutated, and the
+clone is swapped out whole and disposed rather than having its map cleared. The cost is one extra
+pipeline per video surface — the same trade `Tint` and `MaterialInstance` already make for their own
+per-entity clones. Two consequences worth knowing:
+
+- It runs **last** in the frame, so it re-asserts its clone against `syncMaterial`'s per-frame
+  re-bind of a resolved `.mat.json`; if the material *ref* genuinely changed, it rebuilds the clone
+  from the new base instead of pinning the old look.
+- If the slot **shape** changes under a live binding (single ⇄ material array) the binding is dropped
+  and re-derived, never re-asserted — writing into a slot that no longer exists would clobber a
+  freshly-assigned array, or strand a binding nothing could restore.
+
+The 2D twin is unaffected: PixiJS has no such observer, and it swaps `sprite.texture` rather than a
+material property.
+
 **Neither renderer's default upload cadence is right.** Three's `VideoTexture` marks itself dirty
 every frame — 60 GPU uploads for a 24 fps clip. Pixi's `VideoSource` only self-drives via a `load()`
 path that both awaits an alpha probe (whose continuation dereferences a resource we may have
