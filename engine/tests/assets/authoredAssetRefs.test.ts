@@ -73,9 +73,11 @@ const BASELINE: { key: string; why: string }[] = [
   { key: '/games/3d-test/assets/models/skinned-test/capsule.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
   { key: '/games/3d-test/assets/models/skinned-test/cone.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
   { key: '/games/3d-test/assets/models/skinned-test/cylinder.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
-  // Renderable2D.sprite became a PROVEN ref pair only when games/video-test authored a video
-  // GUID there — the first asset GUID in that field anywhere in the repo (every other 2D entity
-  // uses a primitive keyword or a slice name). This blank pre-dates that and is the 2D analogue
+  // Renderable2D.sprite became a PROVEN ref pair only when the video work authored a video GUID
+  // there — the first asset GUID in that field anywhere in the repo (every other 2D entity
+  // uses a primitive keyword or a slice name). It was `games/video-test` that first proved it;
+  // that fixture is deleted now, and `demos/video-demo`'s 2D video sprite keeps the pair proven.
+  // This blank pre-dates all of it and is the 2D analogue
   // of the Renderable3DPrimitive.material entries below: a coloured quad, not a forgotten image.
   // (The SCENE blanks that came with it are gone for the reason in the 2026-08-04 note above —
   // the re-save compacted them out of the file.)
