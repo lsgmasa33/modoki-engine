@@ -140,8 +140,10 @@ dropped or a change reverted, reopen the issue; do not assume closed means shipp
 An Issue's value dies when it closes. Before landing a non-trivial fix, put the durable part
 — root cause, what the wrong theories were, the lesson — in the **feature doc** it belongs
 to, per [doc-conventions.md](./doc-conventions.md). The Issue tracks *that the work happened*;
-the repo explains *what was learned*. Several of the best entries in `docs/todo.md` record a
-diagnosis that was wrong for a day; that content must not evaporate into a closed ticket.
+the repo explains *what was learned*. The best of these write-ups record a diagnosis that was
+wrong for a day — see the prefab-persistence and scene-id incidents in
+[prefabs.md](./prefabs.md) and [scene-loading.md](./scene-loading.md) — and that content must
+not evaporate into a closed ticket.
 
 ## Filing new work
 
@@ -149,7 +151,7 @@ diagnosis that was wrong for a day; that content must not evaporate into a close
 gh issue create --title "..." --body "..."
 ```
 
-Write the body the way the good `docs/todo.md` entries are written — the measured evidence,
+Write the body the way the incident write-ups in the feature docs are written — the measured evidence,
 the file and line, what was ruled out — not a one-line summary. The detail is what makes an
 item actionable months later by a session with none of today's context.
 

@@ -1021,6 +1021,38 @@ rather than keeping two copies of the hash):
 | `smoke-packaged.sh` | 38600 + 0..199 | `SMOKE_BACKEND_PORT` |
 | `assert-app-renders.sh` | 38900 + 0..199 | `RENDER_BACKEND_PORT` |
 
+**The e2e suite has to report its own completeness, because a SHORT run reports green.** It once
+printed `17 passed (1.9m)` instead of 46 — exit 0, zero failures. A subset that reports success is
+strictly worse than a red run: it sails through the pre-push ritual looking like a pass. The root
+cause was found only by trying to start the dev server by hand and getting "port already in use" on
+a port believed free — an **orphaned Vite dev server** was bound to the e2e port and
+`webServer.reuseExistingServer: true` silently **adopted** it, then that adopted server died partway
+through the run. That is why the failure point moved between runs (test 38, then 13, then 5) and why
+the symptom alternated between a truncated run and a cascade of `net::ERR_CONNECTION_REFUSED`.
+Measured on one commit and tree: adopted orphan → 41 failed / 5 passed; port cleared first → 46
+passed, exit 0, clean teardown. Fixed by `reuseExistingServer: false` on the dedicated port — the
+suite would rather fail loudly than adopt a server it cannot vouch for. **What creates an orphan is
+still unknown**; the leading theory is a run killed by a signal (a `| head` closing the pipe, a
+timeout, a Ctrl-C) leaving `npm run dev`'s child vite behind when the npm parent dies.
+
+`engine/tests/e2e/runCompleteReporter.ts` catches the class regardless of cause: a run that reports
+success while covering only part of the suite FAILS. Two checks, and the second is not redundant —
+every discovered test must actually have run, **and** at least `EXPECTED_MIN_TESTS` must have been
+discovered, because if discovery itself comes up short the first check is trivially true.
+`MODOKI_E2E_MIN_TESTS=n` for a deliberate subset. Implementation note: `process.exitCode = 1` does
+**not** work in a Playwright reporter (Playwright assigns its own exit code after reporters finish),
+so the guard returns `{ status: 'failed' }` from `onEnd`. The `46`s above are the 2026-07-29
+incident's numbers and stay as narration — **today's floor is `EXPECTED_MIN_TESTS`, currently 50,
+matching 50 discovered specs.** Read the constant, never a count copied out of prose; growing the
+suite without raising it is how the guard quietly loosens.
+
+**Per-worker dev servers are the real fix for the serial cost, and are deliberately low priority.**
+(Why the suite is serial at all — 4 workers contending on the one shared dev server, failing
+nondeterministically — is in CLAUDE.md's e2e section.) The ceiling was estimated at ~1.7m: fixed
+dev-server boot ≈30s + the then-46 tests ÷ 4. So ~3m/run at best, minus whatever 4 concurrent Vite + backend + chokidar
+instances cost each other in I/O and RAM, against the cost of replacing `webServer` with a
+worker-scoped fixture plus per-worker teardown.
+
 Keep the blocks wide. A tight range is the tempting simplification and it is wrong: 10 slots was
 tried for the packaged harnesses and immediately mapped two real clones to the same port
 (birthday problem — ~30% for four clones in ten slots), which is a per-clone scheme that isn't.

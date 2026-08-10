@@ -273,6 +273,25 @@ whose log was clean:
 | Asset manifest | filtered to the kept assets | same | `resolveGuidToPath` resolves nothing |
 | `detectType` | filename/dir convention | `assets/levels/index.json` typed `scene` | level manifest offered as the BOOT scene |
 
+That same `detectType` misclassification also broke GUID stamping, independent of the tree-shaker
+bugs above. Rule: an asset's GUID lives in a top-level `id` field ONLY when the parsed JSON is a
+stampable plain object; anything else gets the same `<file>.meta.json` sidecar that binary assets
+use. The two halves of that rule failed together: `detectType` **then** ended in a catch-all that
+typed any leftover `.json` as `'scene'` — an `ID_BEARING_TYPES` kind whose guid is meant to live in
+a top-level `id` — and `games/court/runtime/assets/levels/index.json`
+is a top-level JSON **array**, so `json.id = guid` on it was silently dropped by
+`JSON.stringify` (arrays serialize only numeric-index elements). So `writeAssetGuid` wrote the file
+back unchanged yet still returned `true`, the heal loop logged "minted missing GUID" as if it had
+succeeded, the next scan found no `id`, and it re-minted forever — a non-deterministic GUID on
+every scan. **Both halves are now closed, and either one alone would have been enough** — which is
+why the rule is worth stating rather than treating as a footnote to #54. `detectType` no longer
+guesses (it returns `null` for an uncategorized `.json`; see the row above), *and* `writeAssetGuid`
+takes the in-place-`id` path only when `isStampableObject` holds (`!!json && typeof json ===
+'object' && !Array.isArray(json)`), falling back to the sidecar otherwise. Regression cover in
+`engine/tests/plugins/viteAssetScanner.test.ts` — the `writeAssetGuid` array fallback and
+`buildManifest` heal stability across repeated scans. That Court file is the live proof the
+fallback fires: it carries a committed `index.json.meta.json` rather than an inert in-file `id`.
+
 **The fix is to author the ref, not to patch the keep-list.** Put it on a **resource trait** in
 the scene: the tree-shaker's generic sweep (`probeTraitRefs`, `engine/plugins/asset-tree-shaker.ts`)
 keeps any GUID on any trait bag that resolves in the asset index — **game-defined traits included,

@@ -996,7 +996,7 @@ describe('writeAssetGuid', () => {
     expect(JSON.parse(fs.readFileSync(glb + '.meta.json', 'utf-8')).id).toBe(fresh);
   });
 
-  // Regression for the non-deterministic-GUID bug (docs/todo.md, 2026-07-28): an
+  // Regression for the non-deterministic-GUID bug (see docs/build.md's GUID-stamping passage, 2026-07-28): an
   // unrecognized top-level-ARRAY .json (e.g. a level-index manifest) falls through
   // detectType's catch-all to 'scene' (an ID_BEARING_TYPE), but `json.id = guid` on
   // an array is dropped by JSON.stringify — the old code reported success while

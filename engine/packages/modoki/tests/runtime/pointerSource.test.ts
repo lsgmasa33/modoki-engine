@@ -122,8 +122,8 @@ describe('pointerSource', () => {
   });
 
   it('a press followed by moves BEFORE the next sample reports the press at its true down point, not the latest move', () => {
-    // Regression for the bug behind Court's drag/tap-aim misses (the down/up FIFO,
-    // docs/input.md): level
+    // Regression for the bug behind Court's drag/tap-aim misses (the down/up FIFO —
+    // see this module's own EDGE LATCHING banner, which docs/input.md defers to): level
     // state alone reports the pressed edge at whatever position the LATEST move left
     // it at, corrupting the down point an aim/drag-origin reads. The FIFO must report
     // the down transition's own coordinates on the frame it drains, THEN fall back to
@@ -151,8 +151,8 @@ describe('pointerSource', () => {
   });
 
   it('a press+release that both happen between samples still yields a pressed edge then a released edge, not neither', () => {
-    // The unified root cause of both Court aim bugs above (down/up FIFO, docs/input.md):
-    // an atomic gesture (down→moves→up)
+    // The unified root cause of both Court aim bugs above (down/up FIFO — pointerSource.ts's
+    // EDGE LATCHING banner): an atomic gesture (down→moves→up)
     // whose down and up land between two `inputSystem` ticks previously vanished — down
     // and up cancelled out, so NEITHER edge fired. The FIFO drains one transition per
     // sample, so a same-gap press+release now reports pressed on frame N and released on

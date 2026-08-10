@@ -101,7 +101,7 @@ export function computeCanvasScale(
  *  `referenceToScreen2D`/`canvasPxToClient`, the paired inverse). Factored out of
  *  `screenToReference2D` so bounds reporting can share the exact same client↔canvas-px
  *  half without re-deriving it (a divergent re-derivation was the coordinate-space bug
- *  docs/todo.md filed against Court's 2D drag-aim). */
+ *  behind Court's 2D drag-aim misses — see docs/rendering.md's Canvas2D section). */
 export function clientToCanvasPx(
   clientX: number, clientY: number,
   rect: { left: number; top: number; width: number; height: number },
@@ -152,7 +152,7 @@ export function screenToReference2D(
 /** Invert `screenToReference2D`: a Canvas2D reference-space (design) coordinate →
  *  client (CSS) coords. The forward twin agents need to AIM at a design-space point
  *  (e.g. a game's own layout data) without hand-rolling the design→CSS fit transform —
- *  see `docs/todo.md`'s "bounds coords don't match the aim space" entry. Shares
+ *  see docs/rendering.md's Canvas2D section. Shares
  *  `canvasPxToClient` with `bounds2DProvider` (`Scene2D.tsx`) so both directions and
  *  the bounds report agree by construction, not by re-derivation. */
 export function referenceToScreen2D(
@@ -171,7 +171,7 @@ export function referenceToScreen2D(
  *  canvas is gone/degenerate. Wraps `computeCanvasScale` + `screenToReference2D` so a
  *  game never has to hand-roll the fit-mode math itself (a hand-rolled copy is exactly
  *  what silently drifts from the engine the day the Canvas2D trait is edited — see
- *  `docs/todo.md`). Pair: `designToClient2D`. */
+ *  docs/rendering.md's Canvas2D section). Pair: `designToClient2D`. */
 export function clientToDesign2D(
   canvas: HTMLCanvasElement,
   clientX: number, clientY: number,
