@@ -41,11 +41,32 @@ reap_repo_process() { # $1 = absolute path fragment identifying this repo's proc
   esac
 }
 
-# True while any process matching the fragment is still alive. Unix-only signal (`pgrep`);
-# on Windows the CIM reap above is already a forced stop, so callers treat it as done.
+# True while any process matching the fragment is still alive.
+#
+# WINDOWS: this used to `return 1` unconditionally, on the reasoning that the CIM reap above is
+# already a forced stop so the POLLING callers can treat it as done. That is true of the polling
+# loops and false of every other caller — and `stop-editor.sh` opens with
+# `if ! reap_repo_alive MAIN && ! reap_repo_alive VITE; then echo "no editor running"; exit 0`.
+# With a constant false, that guard always fired: `npm run editor:stop` printed "no editor
+# running for this clone" and exited 0 WITHOUT STOPPING ANYTHING, on every Windows run, while
+# the editor and its Vite carried on. The sanctioned way to stop an editor was a no-op that
+# reported success. Measured on the win clone: electron.exe and vite.js both still up
+# immediately after a "Done."-free clean exit, still serving 5173.
+#
+# So answer the question for real, with the same CIM query and the same absolute-path scoping
+# the reap uses (a sibling clone is never matched). `$PID` excludes this powershell itself,
+# whose own command line contains the pattern.
 reap_repo_alive() { # $1 = the same absolute path fragment
   case "$(uname -s)" in
-    MINGW*|MSYS*|CYGWIN*) return 1 ;;
+    MINGW*|MSYS*|CYGWIN*)
+      local pat_m pat_w n
+      pat_m="$(cygpath -m "$1" 2>/dev/null || echo "$1")"
+      pat_w="$(cygpath -w "$1" 2>/dev/null || echo "$1")"
+      n="$(powershell.exe -NoProfile -NonInteractive -Command \
+        "@(Get-CimInstance Win32_Process | Where-Object { \$_.ProcessId -ne \$PID -and (\$_.CommandLine -like '*$pat_m*' -or \$_.CommandLine -like '*$pat_w*') }).Count" \
+        2>/dev/null | tr -d '\r\n ')"
+      [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null
+      ;;
     *) pgrep -f "$1" >/dev/null 2>&1 ;;
   esac
 }

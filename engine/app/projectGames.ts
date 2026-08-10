@@ -16,6 +16,63 @@ export interface ProjectGames {
   GAMES: GameDefinition[];
 }
 
+/** Ask the dev server serving this page which project it is rooted at. null = it didn't say
+ *  (an older build without the route, or the SPA fallback answering with HTML). Never throws. */
+async function devServerProjectRoot(): Promise<string | null> {
+  try {
+    // NOT backendFetch: that routes to the ELECTRON backend, and the whole question here is
+    // whether the server ON THIS ORIGIN is the one the Electron host thinks it is. Asking the
+    // host would just echo back the project it intended to open — the answer we already have,
+    // and the one that is wrong. This has to be a same-origin fetch at the Vite server.
+    // eslint-disable-next-line no-restricted-syntax -- must interrogate the origin serving this page, not the backend
+    const res = await fetch('/api/dev-server-identity');
+    if (!res.ok) return null;
+    const j = (await res.json()) as { modoki?: unknown; projectRoot?: unknown };
+    return j.modoki === true && typeof j.projectRoot === 'string' ? j.projectRoot : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Explain a failed game-code import — the two causes are indistinguishable from the
+ *  exception, which is why this used to assert the wrong one.
+ *
+ *  The browser says `Failed to fetch dynamically imported module` both when Vite REFUSED the
+ *  path (outside `server.fs.allow`) and when Vite happily answered its SPA fallback because
+ *  the path isn't under the root it was started at — and in the field it was overwhelmingly
+ *  the second (#190): a stale dev server kept the port across a project switch, so the editor
+ *  showed project B while every module and asset came from project A. Telling that user to
+ *  re-root a dev server they never started sent them looking in the wrong place entirely.
+ *
+ *  Pure + exported so both branches are testable without a dev server. */
+export function gameLoadFailureMessage(url: string, devServerRoot: string | null): string {
+  // Normalise BOTH sides to the same shape: forward slashes, no leading or trailing slash,
+  // case-folded. The leading slash is the subtle one — `/@fs/` is followed directly by the
+  // drive letter on Windows (`/@fs/E:/…`) but by a rooted path on posix (`/@fs/home/…`), while
+  // the identity always carries a native absolute path. Comparing them raw reports a mismatch
+  // for the project that IS open, i.e. cries "stale server" at a perfectly healthy editor.
+  const norm = (p: string) => p.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '').toLowerCase();
+  const filePath = norm(url.replace(/^\/@fs\//, ''));
+  const rooted = devServerRoot !== null && filePath.startsWith(`${norm(devServerRoot)}/`);
+  if (devServerRoot !== null && !rooted) {
+    return (
+      `[modoki] Could NOT load the open project's games from ${url}.\n` +
+      `The dev server on this origin is rooted at a DIFFERENT project (${devServerRoot}), so it ` +
+      `answered with the editor's HTML page instead of that module — and every asset you see is ` +
+      `coming from that other project too. It did not re-root when the project changed (a stale ` +
+      `server is holding the port). Quit and relaunch the editor.`
+    );
+  }
+  return (
+    `[modoki] Could NOT load the open project's games from ${url}.\n` +
+    `The dev server can't serve code outside its allowed roots. To open an external project, ` +
+    `restart the dev server rooted at it:\n` +
+    `  npm run dev:stop && MODOKI_PROJECT=<project-dir> npm run dev\n` +
+    `(or use scripts/launch-editor.sh <project-dir>). Falling back to the editor's built-in ` +
+    `games for now.`
+  );
+}
+
 export async function loadProjectGames(): Promise<ProjectGames> {
   // Dev editor only: __MODOKI_EDITOR__ is true in both `vite` dev and the editor
   // build, but import.meta.hot is present only under `vite` dev — so the packaged
@@ -34,21 +91,11 @@ export async function loadProjectGames(): Promise<ProjectGames> {
             const game = mod.game as GameDefinition;
             return { ALL_GAMES: [game], GAMES: [game] };
           } catch (importErr) {
-            // The backend pointed us at the open project's registry, but Vite
-            // refused to serve it — almost always because the project lives
-            // OUTSIDE the dev server's fs.allow (an external project opened
-            // against a dev server that was started rooted at the repo). Falling
-            // back to the baked repo games here would silently load the WRONG
-            // project and look like "Open Project did nothing", so make it loud.
-            console.error(
-              `[modoki] Could NOT load the open project's games from ${url}.\n` +
-              `The dev server can't serve code outside its allowed roots. To open an ` +
-              `external project, restart the dev server rooted at it:\n` +
-              `  npm run dev:stop && MODOKI_PROJECT=<project-dir> npm run dev\n` +
-              `(or use scripts/launch-editor.sh <project-dir>). Falling back to the ` +
-              `editor's built-in games for now.`,
-              importErr,
-            );
+            // The backend pointed us at the open project's game code and the import failed.
+            // Falling back to the baked repo games here would silently load the WRONG project
+            // and look like "Open Project did nothing", so make it loud — and ask the dev
+            // server WHY before blaming a cause (see gameLoadFailureMessage).
+            console.error(gameLoadFailureMessage(url, await devServerProjectRoot()), importErr);
           }
         }
       }

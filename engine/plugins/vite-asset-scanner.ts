@@ -1484,6 +1484,34 @@ export function assetScannerPlugin(): Plugin {
           return;
         }
 
+        // GET /api/dev-server-identity — WHO is on this port: the pid to kill, the project
+        // this server is rooted at, and the editor tree it serves.
+        //
+        // main needs this because a reachable port is NOT proof the server on it is the one
+        // main just started (#190). The guard it replaces was timing-based — "did our child
+        // exit yet?" — and a stale server answers in <50ms while a fresh Vite takes ~2s to
+        // fail its bind, so that check lost the race every time: the editor reported "dev
+        // server up (project B)" about somebody else's server still rooted at project A, and
+        // the renderer then loaded A's game code and assets under B's name.
+        //
+        // `repoRoot` is what scopes main's reclaim to OUR install: a sibling clone's dev
+        // server answers here too, and it must be refused, never killed.
+        //
+        // Handled HERE, ahead of the shared /api router, because the answer is about THIS
+        // PROCESS — mounted in the Electron host the same route would describe the wrong one.
+        // (`editorRoot` is the repo root; it is `path.dirname(config.root)` — see its
+        // assignment and the `repoRootAbs` derivation in the build SSR server below.)
+        if (req.url === '/api/dev-server-identity') {
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'application/json');
+          res.setHeader('Cache-Control', 'no-store');
+          // `ppid` is the editor that spawned this server. It is what tells a LEAKED server
+          // (its editor is gone — reclaimable) apart from one a second live editor of the same
+          // install is legitimately using (must not be touched).
+          res.end(JSON.stringify({ modoki: true, pid: process.pid, ppid: process.ppid, projectRoot, repoRoot: editorRoot }));
+          return;
+        }
+
         // Delegate router-owned /api routes to the transport-agnostic backend
         // (ELECTRON_PLAN Phase 1). Everything except /api/exit (above) and the
         // SSE streams (/api/build, /api/add-native-target — handled below) flows

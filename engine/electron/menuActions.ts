@@ -53,9 +53,22 @@ export function normalizeLabel(label: string | undefined): string {
     .toLowerCase();
 }
 
-/** Split a user path on `/`, `>`, or `\` (so "View/Zoom In", "View > Zoom In" both work), trimming
- *  each segment. Empty segments (a stray separator) are dropped. */
+/** Split a user path on `/` or `>` (so "View/Zoom In" and "View > Zoom In" both work), trimming
+ *  each segment. Empty segments (a stray separator) are dropped.
+ *
+ *  `\` is deliberately NOT a separator here: a menu LABEL can legitimately contain backslashes,
+ *  and on Windows one always does — every File → Open Recent entry is a native path
+ *  (`E:\Projects\modoki\games\skin-test`). Splitting on `\` shredded those into segments that
+ *  match nothing, so the entire Open Recent submenu was unreachable from MCP on Windows while
+ *  the failure's own `available` list advertised the exact path it had just refused. */
 export function splitMenuPath(path: string): string[] {
+  return path.split(/[/>]/).map((s) => s.trim()).filter(Boolean);
+}
+
+/** As above, but ALSO treating `\` as a separator — the old behaviour, kept as a fallback so
+ *  someone who types "View\Zoom In" still gets their item. Tried only after the strict split
+ *  fails, so a real backslash in a label always wins over the convenience reading. */
+export function splitMenuPathLoose(path: string): string[] {
   return path.split(/[/>\\]/).map((s) => s.trim()).filter(Boolean);
 }
 
@@ -100,19 +113,37 @@ export function findMenuItem(
     return byId(items);
   }
   if (target.path) {
-    const segs = splitMenuPath(target.path).map(normalizeLabel);
-    if (!segs.length) return null;
-    let level: readonly MenuItemLike[] = items;
-    let found: MenuItemLike | null = null;
-    for (let i = 0; i < segs.length; i++) {
-      found = level.find((it) => normalizeLabel(it.label ?? it.role) === segs[i]) ?? null;
-      if (!found) return null;
-      if (i < segs.length - 1) {
-        if (!found.submenu) return null; // path descends past a leaf
-        level = found.submenu.items;
+    // Strict split first (a `\` is part of a LABEL — Windows Open Recent entries are native
+    // paths), then the lenient one so "View\Zoom In" still resolves. Order is the whole point.
+    //
+    // A LABEL MAY CONTAIN THE SEPARATOR ITSELF, so this cannot be a plain segment-by-segment
+    // walk. On macOS an Open Recent entry is labelled with an absolute POSIX path, so
+    // `serializeMenu` emits "File/Open Recent//Users/me/proj" — which a naive split shatters
+    // into "Users", "me", "proj" and can never match. The tool then REFUSES the exact path it
+    // had just advertised, which is the Windows `\` bug (#190) in its posix mirror. Segments
+    // are therefore NOT pre-filtered: the empty one is the leading "/" of such a label, and
+    // dropping it would make the rejoined label unmatchable in a second way.
+    //
+    // Longest grouping first, so a label containing separators beats a same-named shallow item.
+    const walk = (level: readonly MenuItemLike[], rest: string[]): MenuItemLike | null => {
+      if (!rest.length) return null;
+      for (let take = rest.length; take >= 1; take--) {
+        const label = normalizeLabel(rest.slice(0, take).join('/'));
+        if (!label) continue;
+        const hit = level.find((it) => normalizeLabel(it.label ?? it.role) === label);
+        if (!hit) continue;
+        if (take === rest.length) return hit;
+        if (!hit.submenu) continue; // descends past a leaf — a shorter grouping may still work
+        const deeper = walk(hit.submenu.items, rest.slice(take));
+        if (deeper) return deeper;
       }
-    }
-    return found;
+      // A stray separator ("View//Zoom In", a trailing "/") — tolerated as before, but only
+      // AFTER every grouping that could have consumed it as part of a label has been tried.
+      if (rest[0] === '') return walk(level, rest.slice(1));
+      return null;
+    };
+    const split = (re: RegExp) => target.path!.split(re).map((s) => s.trim());
+    return walk(items, split(/[/>]/)) ?? walk(items, split(/[/>\\]/));
   }
   return null;
 }

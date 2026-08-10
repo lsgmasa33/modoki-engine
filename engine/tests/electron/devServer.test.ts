@@ -4,7 +4,11 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import net from 'node:net';
 import http from 'node:http';
-import { findFreePort, waitForServer, needsWinTreeKill } from '../../electron/devServer';
+import {
+  findFreePort, waitForServer, needsWinTreeKill,
+  parseDevServerIdentity, classifyPortHolder, samePath, exitDisposition,
+  probeDevServerPort, isProcessAlive, startDevServer, stopChild, type DevServerIdentity,
+} from '../../electron/devServer';
 
 let occupied: net.Server | null = null;
 
@@ -192,5 +196,380 @@ describe('needsWinTreeKill — when stopping Vite needs a tree kill (#185)', () 
     expect(needsWinTreeKill(null, 'win32')).toBe(false);
     expect(needsWinTreeKill(undefined, 'win32')).toBe(false);
     expect(needsWinTreeKill({ pid: undefined, exitCode: null, signalCode: null }, 'win32')).toBe(false);
+  });
+});
+
+/**
+ * #190 — the editor served the WRONG project after every switch but the first.
+ *
+ * Measured on the win clone with the installed v0.4.0 editor. `main.log`, opening video-demo:
+ *   07:22:00.606  dev server up at http://127.0.0.1:5173 (project ...\demos\video-demo)
+ *   07:22:02.699  dev server exited unexpectedly (code 1)
+ * "up" landed 17ms after the spawn — a Vite boot is ~2s — because `waitForServer` was answered
+ * by the server ALREADY on the port, while ours died on `--strictPort` two seconds later. The
+ * renderer then loaded games/court's `game.ts` and assets under video-demo's name.
+ *
+ * The chain, and what each group below pins:
+ *   - `stopDevServer` resolved when `taskkill` returned, not when the child exited;
+ *   - so the predecessor's `exit` arrived AFTER the replacement was spawned, and the
+ *     module-global `intentionalStop` had already been reset to false → it logged a false
+ *     "exited unexpectedly" and nulled `child`, orphaning the live Vite (`exitDisposition`);
+ *   - the next switch had nothing to stop, and the #67 guard could not see it because that
+ *     guard is TIMING-based — it only catches a child that has already died (`waitForServer`
+ *     with `expect.pid`, and `classifyPortHolder` for the pre-spawn check).
+ */
+describe('#190 — proving the server on the port is OURS', () => {
+  const OUR_EDITOR_PID = 16268;
+  const ours: DevServerIdentity = {
+    pid: 4242,
+    ppid: OUR_EDITOR_PID,
+    projectRoot: 'E:\\Projects\\modoki\\demos\\video-demo',
+    repoRoot: 'C:\\Program Files\\Modoki Editor\\resources\\app.asar.unpacked',
+  };
+  const body = (o: Partial<DevServerIdentity> & { modoki?: unknown }) => JSON.stringify({ modoki: true, ...o });
+
+  describe('parseDevServerIdentity — only OUR payload counts as an answer', () => {
+    it('accepts the real payload', () => {
+      expect(parseDevServerIdentity(body(ours))).toEqual(ours);
+    });
+
+    // The exact body that made this bug invisible: Vite answers an unknown path with its SPA
+    // fallback, 200 + index.html. A parser that shrugged at that would read "no one is there".
+    it('rejects the SPA HTML fallback', () => {
+      expect(parseDevServerIdentity('<!doctype html>\n<html lang="en">')).toBeNull();
+    });
+
+    it('rejects the JSON 404 an older build\'s /api catch-all emits', () => {
+      expect(parseDevServerIdentity(JSON.stringify({
+        error: 'no such API route: GET /api/dev-server-identity',
+        hint: 'Check the path and method.',
+      }))).toBeNull();
+    });
+
+    it('rejects a body that omits the modoki marker, however complete it otherwise looks', () => {
+      expect(parseDevServerIdentity(JSON.stringify({ ...ours }))).toBeNull();
+    });
+
+    it('rejects partial or wrongly-typed fields — a half-answer must not authorise a kill', () => {
+      expect(parseDevServerIdentity(body({ pid: 1, projectRoot: 'p' }))).toBeNull();       // no repoRoot
+      expect(parseDevServerIdentity(body({ ...ours, pid: 0 }))).toBeNull();                 // pid 0
+      expect(parseDevServerIdentity(body({ ...ours, pid: 1.5 }))).toBeNull();               // not a pid
+      expect(parseDevServerIdentity(body({ ...ours, pid: '4242' as unknown as number }))).toBeNull();
+      expect(parseDevServerIdentity(body({ ...ours, repoRoot: '' }))).toBeNull();
+      // No ppid ⇒ no ownership check is possible, so the kill cannot be authorised either.
+      expect(parseDevServerIdentity(body({ ...ours, ppid: undefined }))).toBeNull();
+    });
+  });
+
+  describe('classifyPortHolder — reclaim is a KILL, so gate it on install AND ownership', () => {
+    const self = { repoRoot: ours.repoRoot, pid: OUR_EDITOR_PID };
+    const dead = () => false;
+    const alive = () => true;
+    const win = (isAlive: (p: number) => boolean) => ({ platform: 'win32' as const, isAlive });
+
+    it('nothing on the port ⇒ free', () => {
+      expect(classifyPortHolder({ state: 'empty' }, self)).toEqual({ action: 'free' });
+    });
+
+    // The #190 stray: spawned by THIS process and then lost track of. Nothing else will ever
+    // clean it up, so "is its editor alive" must not be allowed to protect it — its editor is us.
+    it('a stray WE spawned ⇒ reclaim, even though its editor (us) is alive', () => {
+      expect(classifyPortHolder({ state: 'modoki', identity: ours }, self, win(alive)))
+        .toEqual({ action: 'reclaim', pid: 4242, projectRoot: ours.projectRoot });
+    });
+
+    it('a leaked server whose editor is GONE ⇒ reclaim', () => {
+      const orphan = { ...ours, ppid: 99999 };
+      expect(classifyPortHolder({ state: 'modoki', identity: orphan }, self, win(dead)).action).toBe('reclaim');
+    });
+
+    // Same install is NOT enough. A second editor window is legitimately using its own dev
+    // server, and stealing its port is the same class of harm as killing a sibling clone's.
+    it('ANOTHER LIVE editor of this same install ⇒ refuse', () => {
+      const otherWindow = { ...ours, ppid: 12345 };
+      const v = classifyPortHolder({ state: 'modoki', identity: otherWindow }, self, win(alive));
+      expect(v.action).toBe('refuse');
+      expect(v.action === 'refuse' && v.why).toContain('another editor of this install is running');
+      expect(v.action === 'refuse' && v.why).toContain('12345');
+    });
+
+    // The rule that keeps a reclaim safe. Four clones share this machine; taking a port from
+    // one of them is the same failure `reapScoping.test.ts` bans for pkill patterns, and being
+    // handed a pid does not make it ours to kill. Checked BEFORE ownership: a dead sibling
+    // clone's server is still not ours.
+    it('ANOTHER install/clone\'s dev server ⇒ refuse, never kill — even if its editor is dead', () => {
+      const sibling = { ...ours, repoRoot: 'E:\\Projects\\modoki-ai2', pid: 999 };
+      const v = classifyPortHolder({ state: 'modoki', identity: sibling }, self, win(dead));
+      expect(v.action).toBe('refuse');
+      expect(v.action === 'refuse' && v.why).toContain('different install/clone');
+      expect(v.action === 'refuse' && v.why).toContain('999');
+    });
+
+    // 'foreign' and 'empty' must NOT collapse: one means spawn, the other means stop. A
+    // nullable identity would have merged them and spawned straight into an occupied port.
+    it('an unidentified server ⇒ refuse — that is NOT the same as an empty port', () => {
+      const v = classifyPortHolder({ state: 'foreign' }, self);
+      expect(v.action).toBe('refuse');
+      expect(classifyPortHolder({ state: 'empty' }, self).action).toBe('free');
+    });
+
+    // Both sides of the comparison come from different worlds — `path` on one, JSON from
+    // another process on the other. On Windows a raw === would refuse our OWN install and
+    // turn every reclaim into a hard failure to open a project.
+    it('matches our install across separator and case differences (Windows)', () => {
+      const mixed = { ...ours, repoRoot: 'c:/program files/modoki editor/resources/app.asar.unpacked/' };
+      expect(classifyPortHolder({ state: 'modoki', identity: mixed }, self, win(alive)).action).toBe('reclaim');
+      // …and posix must stay case-SENSITIVE: there, those are genuinely different directories.
+      expect(classifyPortHolder({ state: 'modoki', identity: mixed }, self, { platform: 'linux', isAlive: alive }).action)
+        .toBe('refuse');
+    });
+
+    // EPERM from `kill(pid, 0)` means the process EXISTS but is not ours to signal. Reading
+    // that as "dead" is exactly how an ownership check ends up authorising a kill it shouldn't.
+    it('isProcessAlive treats an unsignallable process as alive, and a bad pid as dead', () => {
+      expect(isProcessAlive(process.pid)).toBe(true);
+      expect(isProcessAlive(0)).toBe(false);
+      expect(isProcessAlive(-1)).toBe(false);
+      expect(isProcessAlive(1.5)).toBe(false);
+    });
+
+    it('samePath normalises separators and trailing slashes', () => {
+      expect(samePath('/a/b', '/a/b/', 'linux')).toBe(true);
+      expect(samePath('C:\\a\\b', 'C:/a/b', 'win32')).toBe(true);
+      expect(samePath('/a/b', '/a/bc', 'linux')).toBe(false);
+    });
+  });
+
+  describe('exitDisposition — a dying predecessor must not clobber its replacement', () => {
+    // THE bug. On Windows the old child's exit lands after the new spawn; under the old global
+    // flag it read as "unexpected" and set child = null, so the NEXT stopDevServer() had
+    // nothing to stop and the stale server kept the port.
+    it('an intentionally-stopped child that exits after its replacement does NOTHING', () => {
+      expect(exitDisposition({ intentional: true, isCurrent: false }))
+        .toEqual({ logUnexpected: false, clearState: false });
+    });
+
+    it('the current child dying on its own clears the state and says so', () => {
+      expect(exitDisposition({ intentional: false, isCurrent: true }))
+        .toEqual({ logUnexpected: true, clearState: true });
+    });
+
+    it('a superseded child dying on its own is reported but touches no state', () => {
+      expect(exitDisposition({ intentional: false, isCurrent: false }))
+        .toEqual({ logUnexpected: true, clearState: false });
+    });
+
+    it('an intentional stop of the current child is silent — we asked for it', () => {
+      expect(exitDisposition({ intentional: true, isCurrent: true }))
+        .toEqual({ logUnexpected: false, clearState: false });
+    });
+  });
+
+  describe('stopChild — a kill being ISSUED is not the process being GONE', () => {
+    /** The half of #190 that the Windows fix left behind, and the one that reaches macOS.
+     *
+     *  `stopDevServer` learned to await the real `exit` on its normal path, but its
+     *  force-kill branch still resolved in the same tick as the kill. posix reaches that
+     *  branch whenever Vite ignores SIGTERM for the grace period; the SIGKILL that follows is
+     *  uncatchable but the kernel still needs a moment to reap the process and release its
+     *  listening socket. Resolving there hands the caller a port that is still held, and the
+     *  pre-spawn probe then reads our own dying child as a `foreign` holder and REFUSES to
+     *  start — "a server that is not a Modoki dev server is already on this port", about our
+     *  own Vite, where waiting ~1ms would have succeeded. */
+    const fakeChild = () => {
+      let onExit: (() => void) | null = null;
+      return {
+        c: { once: (ev: string, fn: () => void) => { if (ev === 'exit') onExit = fn; } },
+        exit: () => onExit?.(),
+      };
+    };
+
+    it('resolves on exit during the grace period, and never force-kills', async () => {
+      const { c, exit } = fakeChild();
+      let forced = 0;
+      const p = stopChild(c, { initial: () => {}, force: () => { forced++; } }, { graceMs: 50, reapMs: 50 });
+      exit();
+      expect(await p).toBe('exited');
+      expect(forced).toBe(0);
+    });
+
+    it('KEEPS WAITING after the force kill — an exit that lands later still counts', async () => {
+      // The regression guard. Against the old code this resolved the instant `force` ran, so
+      // the assertion below that it has NOT settled yet is what discriminates.
+      const { c, exit } = fakeChild();
+      let forcedAt = 0;
+      const p = stopChild(
+        c,
+        { initial: () => {}, force: () => { forcedAt = Date.now(); } },
+        { graceMs: 20, reapMs: 500 },
+      );
+      let settled: string | null = null;
+      void p.then((r) => { settled = r; });
+
+      await new Promise((r) => setTimeout(r, 60));
+      expect(forcedAt).toBeGreaterThan(0);       // the force kill HAS run
+      expect(settled).toBeNull();                // ...and we are still waiting for the reap
+
+      exit();
+      expect(await p).toBe('exited');
+    });
+
+    it('gives up after reapMs rather than hanging, and says which way it ended', async () => {
+      const { c } = fakeChild();                 // never exits
+      const p = stopChild(c, { initial: () => {}, force: () => {} }, { graceMs: 10, reapMs: 20 });
+      expect(await p).toBe('abandoned');
+    });
+
+    it('a force kill that throws does not strand the caller', async () => {
+      const { c, exit } = fakeChild();
+      const p = stopChild(
+        c,
+        { initial: () => {}, force: () => { throw new Error('already gone'); } },
+        { graceMs: 10, reapMs: 200 },
+      );
+      exit();
+      expect(await p).toBe('exited');
+    });
+  });
+
+  describe('waitForServer with expect.pid — identity beats timing', () => {
+    let server: http.Server | null = null;
+    afterEach(() => { server?.close(); server = null; });
+
+    /** A dev server that answers the identity route as `pid`. */
+    const serve = async (pid: number | null): Promise<string> => {
+      const srv = http.createServer((q, s) => {
+        if (q.url === '/api/dev-server-identity' && pid !== null) {
+          s.setHeader('Content-Type', 'application/json');
+          s.end(body({ ...ours, pid }));
+          return;
+        }
+        s.end('<!doctype html><html></html>'); // Vite's SPA fallback, the real 404 shape
+      });
+      await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+      server = srv;
+      return `http://127.0.0.1:${(srv.address() as net.AddressInfo).port}/`;
+    };
+
+    it('accepts the server when the pid on the port is the one we spawned', async () => {
+      const url = await serve(4242);
+      await expect(waitForServer(url, 5000, () => false, { pid: 4242 })).resolves.toBeUndefined();
+    });
+
+    // The regression that matters: our child is ALIVE (abort false — it takes ~2s to die on
+    // its bind) and a stale server is answering instantly. The old code returned success here
+    // and the editor went on to serve that other project.
+    it('REFUSES a stale server answering on our port while our child is still alive', async () => {
+      const url = await serve(1111); // somebody else's dev server, still up
+      await expect(waitForServer(url, 1200, () => false, { pid: 4242 }))
+        .rejects.toThrow(/still held by a DIFFERENT Modoki dev server .*pid 1111/s);
+    });
+
+    it('names the project the stale server is rooted at — that is the whole diagnosis', async () => {
+      const url = await serve(1111);
+      await expect(waitForServer(url, 1200, () => false, { pid: 4242 }))
+        .rejects.toThrow(/video-demo/);
+    });
+
+    // Without expect.pid the behaviour must be exactly as before, or every existing caller
+    // and the #67 guard above change meaning.
+    it('is unchanged when no pid is expected', async () => {
+      const url = await serve(null);
+      await expect(waitForServer(url, 5000, () => false)).resolves.toBeUndefined();
+    });
+
+    // The message must not contradict the check that produced it: we only reach the timeout
+    // via a POSITIVE `reachable` probe, so "not reachable" is the one thing that cannot be
+    // true — and it points the reader at a network problem instead of at the squatter.
+    it('does not report "not reachable" about a port that is answering', async () => {
+      const url = await serve(null); // answers, but never identifies (no identity route)
+      await expect(waitForServer(url, 900, () => false, { pid: 4242 }))
+        .rejects.toThrow(/answering .* but not as our dev server/s);
+    });
+  });
+
+  // The wiring, not just the decision: startDevServer must CONSULT the probe and refuse before
+  // it spawns anything. Without this, classifyPortHolder could be perfect and never called —
+  // which is precisely the shape of the original bug (a guard that existed and lost its race).
+  describe('startDevServer — refuses an occupied port instead of adopting what is on it', () => {
+    let server: http.Server | null = null;
+    afterEach(() => { server?.close(); server = null; });
+
+    const listen = async (handler: http.RequestListener): Promise<string> => {
+      const srv = http.createServer(handler);
+      await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+      server = srv;
+      return `http://127.0.0.1:${(srv.address() as net.AddressInfo).port}/`;
+    };
+
+    // repoRoot/projectRoot are never touched on this path — it throws before spawn — so the
+    // paths only need to be distinguishable, not real.
+    const start = (url: string) => startDevServer({ repoRoot: ours.repoRoot, projectRoot: 'X', url });
+
+    it('a NON-Modoki server on the port ⇒ loud failure, not a silent adoption', async () => {
+      const url = await listen((_q, s) => s.end('not yours'));
+      await expect(start(url)).rejects.toThrow(/not a Modoki dev server/);
+    });
+
+    it('another LIVE editor of this install ⇒ loud failure naming it', async () => {
+      // ppid = our parent: a real, live pid that is not this process, so the ownership check
+      // must protect it. (Reclaiming here would kill a colleague's working editor.)
+      const url = await listen((_q, s) => {
+        s.setHeader('Content-Type', 'application/json');
+        s.end(body({ ...ours, ppid: process.ppid }));
+      });
+      await expect(start(url)).rejects.toThrow(/another editor of this install is running/);
+    });
+  });
+
+  describe('probeDevServerPort — the live tri-state', () => {
+    let server: http.Server | null = null;
+    afterEach(() => { server?.close(); server = null; });
+
+    const listen = async (handler: http.RequestListener): Promise<string> => {
+      const srv = http.createServer(handler);
+      await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+      server = srv;
+      return `http://127.0.0.1:${(srv.address() as net.AddressInfo).port}/`;
+    };
+
+    it('reports a Modoki dev server', async () => {
+      const url = await listen((_q, s) => { s.setHeader('Content-Type', 'application/json'); s.end(body(ours)); });
+      expect(await probeDevServerPort(url)).toEqual({ state: 'modoki', identity: ours });
+    });
+
+    it('reports a server that will not identify itself as foreign, not as empty', async () => {
+      const url = await listen((_q, s) => s.end('<!doctype html><html></html>'));
+      expect(await probeDevServerPort(url)).toEqual({ state: 'foreign' });
+    });
+
+    it('reports a dead port as empty', async () => {
+      // Bind then close, so the port is real but nothing is on it (ECONNREFUSED).
+      const url = await listen((_q, s) => s.end('x'));
+      server?.close(); server = null;
+      expect(await probeDevServerPort(url, 800)).toEqual({ state: 'empty' });
+    });
+
+    // 'empty' AUTHORISES A SPAWN and 'foreign' refuses one, so a hung server misfiled as empty
+    // sends the caller straight into an occupied port: --strictPort kills the new Vite, and the
+    // editor then reports "not reachable" about a port that is plainly answering. That wrong
+    // diagnosis is the exact failure mode of #190, reintroduced one layer down.
+    it('a server that ACCEPTS the connection and never answers is foreign, not empty', async () => {
+      const url = await listen(() => { /* accept, then hang forever */ });
+      expect(await probeDevServerPort(url, 300)).toEqual({ state: 'foreign' });
+    });
+
+    // ⚠️ NOT a regression guard for the 64KB cap, and mutation-testing says so: deleting the cap
+    // leaves this green, because a 320KB body fails JSON.parse either way. The cap bounds MEMORY,
+    // which has no observable verdict to assert on. Kept as a smoke test that a streaming
+    // stranger is classified and does not hang the probe — don't read it as covering the cap.
+    it('a streaming stranger is still just foreign (and does not hang the probe)', async () => {
+      const url = await listen((_q, s) => {
+        s.writeHead(200, { 'Content-Type': 'application/json' });
+        for (let i = 0; i < 40; i++) s.write('x'.repeat(8 * 1024)); // 320KB > the 64KB cap
+        s.end();
+      });
+      expect(await probeDevServerPort(url, 3000)).toEqual({ state: 'foreign' });
+    });
   });
 });
