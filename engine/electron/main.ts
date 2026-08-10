@@ -93,7 +93,7 @@ import { createInputRoutes } from './inputRoutes';
 import { serializeMenu, triggerMenuItem, type MenuItemLike } from './menuActions';
 import { getSsrLoadModule, closeSsrLoader } from './ssrLoader';
 import { buildProdCsp, PROD_CSP_ORIGINS } from './csp';
-import { startDevServer, stopDevServer, findFreePort } from './devServer';
+import { startDevServer, stopDevServer, findFreePort, reclaimLeakedDevServer } from './devServer';
 import { showSplash, setSplashStatus, closeSplash } from './splash';
 import { pickProjectFolder, pickNewProjectFolder, addRecentProject, getRecentProjects, migrateLegacyRecents, setRecentsScope, chooseInitialProject, projectFolderKind, installAppMenu, type RendererMenuSpec } from './projects';
 import { scaffoldProject } from './newProject';
@@ -1432,6 +1432,20 @@ app.whenReady().then(async () => {
   // unless MODOKI_DEV_URL pins the origin. This is what lets a SECOND editor launch
   // on another port instead of the Vite spawn hard-failing on --strictPort. Done
   // before the backend starts because the backend proxies /api/build to DEV_URL.
+  // First, take the conventional port back if a dev server of THIS install leaked onto it and
+  // its editor is gone (#190). Before findFreePort, deliberately: that function would see the
+  // squatter and politely drift us onto an ephemeral port, leaving the leak to keep watching
+  // and rewriting the repo forever. A live editor's server — this install's or another
+  // clone's — is refused by classifyPortHolder and we drift as before.
+  {
+    const r = await reclaimLeakedDevServer(DEV_URL, { repoRoot: REPO_ROOT, pid: process.pid });
+    if (r.reclaimed) {
+      console.log(
+        `[modoki-electron] ${DEV_URL} was held by a leaked dev server (pid ${r.pid}, project ${r.projectRoot})` +
+        `${r.freed ? ' — reclaimed the port.' : ' — it did NOT release the port; falling back to another one.'}`,
+      );
+    }
+  }
   if (!process.env.MODOKI_DEV_URL) {
     const vitePort = await findFreePort(Number(new URL(DEV_URL).port) || 5173);
     DEV_URL = `http://127.0.0.1:${vitePort}`;

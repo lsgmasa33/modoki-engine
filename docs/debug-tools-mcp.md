@@ -454,6 +454,11 @@ same actions + state a person has in the editor. They relay to the renderer over
   `id`/`accelerator`/`enabled`); `path:"View/Zoom In"` or `id:…` fires that item's click (the same
   callback a human's click runs). This is the ONLY way to reach menu-only actions — `modoki_press_key`
   cannot trigger native Electron menu accelerators (Chromium swallows them). *(Electron editor only.)*
+  A path segment may itself contain `\` — on Windows every **File → Open Recent** entry is a native
+  path — so the matcher splits on `/` and `>` only, and retries with `\` as a separator just for a
+  human-typed `View\Zoom In`. It used to split on `\` first, which shredded those labels and made
+  the whole Open Recent submenu unreachable while the refusal's own `available` list advertised the
+  exact path it had refused. Switching projects from MCP goes through this submenu.
 - **Keyboard focus:** `modoki_focus {selector?}` — focus that element, or with NO selector blur the
   focused one. The game's input sampler drops keys while a DOM text field (Console filter, an
   Inspector input) holds focus, so blur first when trusted key input mysteriously does nothing.

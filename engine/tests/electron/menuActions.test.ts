@@ -5,7 +5,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import {
-  normalizeLabel, splitMenuPath, serializeMenu, findMenuItem, triggerMenuItem, actionablePaths,
+  normalizeLabel, splitMenuPath, splitMenuPathLoose, serializeMenu, findMenuItem, triggerMenuItem, actionablePaths,
   type MenuItemLike,
 } from '../../electron/menuActions';
 
@@ -39,10 +39,98 @@ describe('normalizeLabel / splitMenuPath', () => {
     expect(normalizeLabel('✓ Actual Size')).toBe('actual size');
     expect(normalizeLabel('Open Recent...')).toBe('open recent');
   });
-  it('splits on /, >, and \\ and drops empties', () => {
+  it('splits on / and > and drops empties', () => {
     expect(splitMenuPath('View/Zoom In')).toEqual(['View', 'Zoom In']);
     expect(splitMenuPath('View > Zoom In')).toEqual(['View', 'Zoom In']);
     expect(splitMenuPath(' View // Zoom In ')).toEqual(['View', 'Zoom In']);
+  });
+  // A `\` is NOT a separator in the strict split: on Windows every File → Open Recent label IS
+  // a native path, and shredding it produced segments matching nothing.
+  it('keeps backslashes INSIDE a segment — a Windows path is a label, not a path of labels', () => {
+    expect(splitMenuPath('File/Open Recent/E:\\Projects\\modoki\\games\\skin-test'))
+      .toEqual(['File', 'Open Recent', 'E:\\Projects\\modoki\\games\\skin-test']);
+  });
+  it('splitMenuPathLoose keeps the old convenience reading for a human-typed path', () => {
+    expect(splitMenuPathLoose('View\\Zoom In')).toEqual(['View', 'Zoom In']);
+  });
+});
+
+/** Windows-only in practice, and it made the whole Open Recent submenu unreachable from MCP —
+ *  which is how a project switch had to be driven to reproduce #190 in the first place. The
+ *  refusal even listed the exact path it was rejecting, so the tool contradicted itself. */
+describe('findMenuItem — a menu label that contains backslashes (Windows Open Recent)', () => {
+  const recents: MenuItemLike[] = [
+    { label: 'File', submenu: { items: [
+      { label: 'Open Recent', submenu: { items: [
+        { label: '✓ E:\\Projects\\modoki\\games\\court', click: vi.fn() },
+        { label: 'E:\\Projects\\modoki\\games\\skin-test', click: vi.fn() },
+      ] } },
+    ] } },
+  ];
+
+  it('resolves the exact path serializeMenu advertises', () => {
+    const path = serializeMenu(recents)[0].submenu![0].submenu![1].path;
+    expect(path).toBe('File/Open Recent/E:\\Projects\\modoki\\games\\skin-test');
+    expect(findMenuItem(recents, { path })?.label).toBe('E:\\Projects\\modoki\\games\\skin-test');
+  });
+
+  it('still resolves the checked (currently-open) entry, whose label carries the ✓ glyph', () => {
+    expect(findMenuItem(recents, { path: 'File/Open Recent/E:\\Projects\\modoki\\games\\court' })?.label)
+      .toBe('✓ E:\\Projects\\modoki\\games\\court');
+  });
+
+  it('does not regress the backslash-as-separator convenience where nothing matches literally', () => {
+    const menu = makeMenu().items;
+    expect(findMenuItem(menu, { path: 'View\\Zoom In' })?.label).toBe('Zoom In');
+  });
+});
+
+/** The POSIX MIRROR of the bug above, and it was still live after the Windows fix. A macOS
+ *  Open Recent label is an absolute POSIX path, so the label contains the PRIMARY separator —
+ *  `serializeMenu` emits "File/Open Recent//Users/me/proj" and a segment-by-segment walk looks
+ *  for a child called "Users". Same self-contradicting refusal (the exact advertised path,
+ *  listed as available and rejected), same consequence: no agent-driven project switch on the
+ *  platform this repo is mostly developed on. Found while live-verifying #190 on macOS. */
+describe('findMenuItem — a menu label that IS an absolute POSIX path (macOS Open Recent)', () => {
+  const recents: MenuItemLike[] = [
+    { label: 'File', submenu: { items: [
+      { label: 'Open Recent', submenu: { items: [
+        { label: '✓ /Users/me/Projects/modoki/games/3d-test', click: vi.fn() },
+        { label: '/Users/me/Projects/modoki/games/sling', click: vi.fn() },
+      ] } },
+    ] } },
+  ];
+
+  it('resolves the exact path serializeMenu advertises', () => {
+    const path = serializeMenu(recents)[0].submenu![0].submenu![1].path;
+    expect(path).toBe('File/Open Recent//Users/me/Projects/modoki/games/sling');
+    expect(findMenuItem(recents, { path })?.label).toBe('/Users/me/Projects/modoki/games/sling');
+  });
+
+  it('still resolves the checked (currently-open) entry, whose label carries the ✓ glyph', () => {
+    expect(findMenuItem(recents, { path: 'File/Open Recent//Users/me/Projects/modoki/games/3d-test' })?.label)
+      .toBe('✓ /Users/me/Projects/modoki/games/3d-test');
+  });
+
+  it('a label containing separators beats a shallower same-named item — longest grouping wins', () => {
+    // Without longest-first, "Open Recent" could be consumed and the remainder walked as
+    // segments, which is exactly how the posix label got shredded.
+    const menu: MenuItemLike[] = [
+      { label: 'File', submenu: { items: [
+        { label: 'Open Recent', submenu: { items: [
+          { label: 'Users', click: vi.fn() },
+          { label: '/Users/me/proj', click: vi.fn() },
+        ] } },
+      ] } },
+    ];
+    expect(findMenuItem(menu, { path: 'File/Open Recent//Users/me/proj' })?.label).toBe('/Users/me/proj');
+    expect(findMenuItem(menu, { path: 'File/Open Recent/Users' })?.label).toBe('Users');
+  });
+
+  it('still tolerates a stray separator where no label could have absorbed it', () => {
+    const menu = makeMenu().items;
+    expect(findMenuItem(menu, { path: 'View//Zoom In' })?.label).toBe('Zoom In');
+    expect(findMenuItem(menu, { path: '/View/Zoom In' })?.label).toBe('Zoom In');
   });
 });
 

@@ -1035,6 +1035,68 @@ clash, that something is a foreign server. Adopting it used to surface much late
 because the roots being enforced belonged to the *other* clone. It now fails immediately and
 says so.
 
+**That guard was necessary and not sufficient — it is TIMING, and timing lost the race (#190).**
+It can only catch a child that has *already* exited, and the numbers are lopsided: a server
+that is already running answers in <50ms, while a freshly-spawned Vite takes ~2s to reach its
+bind and die. So on every project switch the check ran early, saw a live child, accepted the
+stale server, and main logged `dev server up (project B)` **17ms** after spawning — about
+somebody else's server, still rooted at project A. Nothing looked broken: the editor showed B,
+the renderer loaded A's `game.ts` and A's assets, and saves landed in A's tree. The only visible
+symptom was the allowed-roots error above, once again naming the wrong cause.
+
+How a stale server got there is the other half, and it was pure bookkeeping. `stopDevServer`
+resolved the instant `taskkill` returned rather than when the child exited, so on Windows the
+predecessor's `exit` arrived *after* the replacement had been spawned — by which time the
+module-global `intentionalStop` had been reset to `false` and was describing the wrong process.
+The dead child's handler therefore logged a spurious "dev server exited unexpectedly" **and**
+nulled `child`, orphaning the live Vite. The next switch had nothing to stop, so the old server
+kept the port and the new one died on `--strictPort`. First switch fine, every one after it wrong.
+
+The fix replaces timing with **identity**, and is in three parts (`devServer.ts`):
+
+| Part | What it closes |
+|---|---|
+| `intentionallyStopped` (a `WeakSet`) + `exitDisposition` | a superseded child can no longer clear state that now describes its replacement |
+| `stopDevServer` awaits the real `exit` | the port is actually free before the respawn |
+| `/api/dev-server-identity` + `probeDevServerPort` | the server on the port must BE the one we spawned |
+
+The identity route is served by the asset-scanner middleware and answers `{modoki, pid, ppid,
+projectRoot, repoRoot}` — deliberately ahead of the shared `/api` router, because the answer is
+about *that process* and the same route mounted in the Electron host would describe the wrong
+one. It is checked twice: before spawning (what already holds the port?) and inside
+`waitForServer` (is the pid on the port the pid we spawned?).
+
+Because the pre-spawn check can end in a **kill**, two conditions gate it and both must hold:
+`repoRoot` must match this install (never take a port from another clone — the rule
+`reapScoping.test.ts` enforces for `pkill` patterns applies just as much to a pid a process
+hands you), and the server must be *unowned* — its `ppid` either dead, or equal to our own pid,
+which is the lost-child case. A second live editor of the same install is refused and named,
+not reclaimed. Anything that will not identify itself is refused too: "nothing is listening" and
+"something is listening that isn't ours" demand opposite actions, so `probeDevServerPort`
+returns a tri-state rather than a nullable identity.
+
+Which failure maps to which state is load-bearing, because `empty` authorises a spawn and
+`foreign` refuses one. **Only `ECONNREFUSED` proves the port is free.** A *timeout* means the
+connection was accepted and the answer never came — something is there, hung — so it is
+`foreign`; filing it under `empty` would send the caller into an occupied port, where
+`--strictPort` kills the new Vite and the editor reports "not reachable" about a port that is
+plainly answering. That is #190's own failure mode one layer down, which is why the mapping is
+spelled out rather than left to intuition.
+
+If the route's payload ever drifts from `parseDevServerIdentity` (a renamed field, a dropped
+`ppid`), every probe returns `foreign` and the editor **refuses to launch** with "answering …
+but not as our dev server". Loud and immediate, on the first launch after the change — which is
+why the two readers of this payload are left as independent checks rather than given a
+sync guard.
+
+⚠️ **A leaked Vite does not survive its editor on Windows** — measured: killing the main process
+took its Vite with it (Electron's job object), so the damage there is confined to a session. On
+macOS/Linux there is no job object and an orphan really can outlive its editor, which is what
+`reclaimLeakedDevServer` (called at startup, before `findFreePort`) is for. Letting
+`findFreePort` politely drift around a squatter instead would leave it running with its asset
+scanner still **watching the repo**, rewriting `.meta.json` sidecars under a project nobody has
+open — the write-behind-your-back hazard of root `CLAUDE.md` #18, self-inflicted.
+
 ### The launch log — who started which editor
 
 `launch-editor.sh` appends every launch to **`~/.modoki/editor-launches.log`**
@@ -1072,6 +1134,14 @@ log's background waiter write its `EXIT` line. A straggler Vite is swept only if
 uncleanly. Every match is anchored to this repo's absolute paths, so a sibling clone's editor is
 never touched (#69); the matcher itself is shared with the launcher in
 `engine/scripts/lib/repo-reap.sh`.
+
+⚠️ **On Windows this was a complete no-op that reported success** (found while reproducing #190).
+`reap_repo_alive` returned `1` unconditionally there, on the reasoning that the Windows reap is
+already a forced stop so the *polling* callers can treat it as done. True of the polling loops,
+false of the guard the script opens with — `if ! reap_repo_alive MAIN && ! reap_repo_alive VITE`
+— which therefore always fired: `npm run editor:stop` printed *"no editor running for this
+clone"* and exited 0 while the editor and its Vite carried on serving 5173. It now answers the
+question for real, via the same CIM query and the same absolute-path scoping the reap uses.
 
 Two things that look like they should stop an editor and do not (#129):
 
