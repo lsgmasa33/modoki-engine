@@ -730,7 +730,7 @@ class SceneManagerImpl implements SceneManager {
         // Transient: this singleton is MATERIALIZED here, not authored — so it must
         // never be written back to whichever scene happens to be saved next. Without
         // the tag a save silently GREW any scene lacking a Time entity by one
-        // (measured on ui-focus-demo.json, 9 → 10 entities, docs/todo.md), which is a
+        // (measured on ui-focus-demo.json, 9 → 10 entities; see docs/scene-loading.md), which is a
         // counter-example to the A10 "a no-op save is a no-op" invariant. Worse for a
         // BASE scene: the foreign-entity filter in serialize.ts skips any entity
         // without EntityAttributes, and this one has none, so it lands in EVERY file

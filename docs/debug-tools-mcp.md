@@ -371,6 +371,19 @@ The MCP is **parity-plus** with chrome-devtools for the editor, and better on tw
 - `modoki_capture_viewport` — `webContents.capturePage()`; captures the **real composited window**
   (use over a screenshot for "numbers right but renders black/NaN"). `modoki_render_scene` /
   `modoki_render_sequence` render the 3D view directly.
+  - **If it fails, read the sentence it gives you — and note the one thing it will NOT claim.**
+    `explainCaptureFailure` (`engine/electron/rendererOps.ts`) composes that message from the
+    window facts *plus* the renderer's own `frameLoop`/`rendererGate`, fetched over IPC only on
+    the failure path. The invariant, pinned by `engine/tests/electron/captureScale.test.ts`:
+    **it claims a wedged renderer ONLY when the frame loop reports `stalled`.** A layout with no
+    Scene/Game panel open has an `idle` frame loop **by design** (reproduced live on
+    `games/court` with both closed), so `idle` reads "nothing is rendering to capture — NOT a
+    wedged renderer" and points you at `modoki_render_scene`, which needs no mounted viewport;
+    `hidden` is throttling; `running` is stated as evidence *against* a wedge. This exists
+    because the message used to assert "most likely wedged" whenever it found no window-level
+    fault — a diagnosis, and a wrong one for a fully-supported state, which sent the reader
+    hunting a renderer fault that did not exist. **An error message that guesses a cause is
+    worse than one that reports what it observed.**
 - `modoki_tap` / `modoki_drag` — **trusted** `sendInputEvent`; hit-tests **PixiJS + Three.js
   together** (Chrome MCP `drag` is DOM-only — you'd have to `evaluate_script` the EventSystem). Both
   now take `button` (`right`→context menu, `middle`→orbit-pan), `clickCount` (`2`→double-click), and

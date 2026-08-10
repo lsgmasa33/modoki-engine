@@ -189,7 +189,7 @@ the wrong panel). Two source-text tripwires stand in for that:
 - **HMR is untrustworthy for this code.** Hook order and listener registration change here, so a
   session that has absorbed a lot of HMR is not evidence either way — a correct fix measured four
   separate times as "not working" before a forced CDP `Page.reload` showed it working. Relaunch, or
-  reload, before concluding anything. (Also tracked in [todo.md](./todo.md).)
+  reload, before concluding anything.
 
 ## Related
 

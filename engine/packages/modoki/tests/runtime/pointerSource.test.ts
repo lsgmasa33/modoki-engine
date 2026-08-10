@@ -122,7 +122,8 @@ describe('pointerSource', () => {
   });
 
   it('a press followed by moves BEFORE the next sample reports the press at its true down point, not the latest move', () => {
-    // Regression for the bug behind docs/todo.md's Court drag/tap-aim entries: level
+    // Regression for the bug behind Court's drag/tap-aim misses (the down/up FIFO,
+    // docs/input.md): level
     // state alone reports the pressed edge at whatever position the LATEST move left
     // it at, corrupting the down point an aim/drag-origin reads. The FIFO must report
     // the down transition's own coordinates on the frame it drains, THEN fall back to
@@ -150,7 +151,8 @@ describe('pointerSource', () => {
   });
 
   it('a press+release that both happen between samples still yields a pressed edge then a released edge, not neither', () => {
-    // The unified root cause of both docs/todo.md bugs: an atomic gesture (down→moves→up)
+    // The unified root cause of both Court aim bugs above (down/up FIFO, docs/input.md):
+    // an atomic gesture (down→moves→up)
     // whose down and up land between two `inputSystem` ticks previously vanished — down
     // and up cancelled out, so NEITHER edge fired. The FIFO drains one transition per
     // sample, so a same-gap press+release now reports pressed on frame N and released on
@@ -265,7 +267,7 @@ describe('pointerSource', () => {
       // filtering at ingestion means the gesture never latches `activeId`, so its
       // later move/up already no-op via the existing pointerId!==activeId guard —
       // this is the "drag passes under a DOM HUD mid-gesture" and "board drag that
-      // started elsewhere" cases from docs/todo.md.
+      // started elsewhere" cases from docs/input.md.
       const root = document.createElement('div');
       const outside = document.createElement('div');
       document.body.append(root, outside);

@@ -145,7 +145,7 @@ describe('captureViewport', () => {
  *  sentence is a real bug, and it was one: with NO window-level fault found, this used to say
  *  the renderer "is most likely wedged". A layout with no Scene/Game panel open has an `idle`
  *  frame loop BY DESIGN (a supported state), so the message sent the reader hunting a renderer
- *  fault that did not exist. See `docs/todo.md`.
+ *  fault that did not exist. See `docs/debug-tools-mcp.md`.
  *
  *  The invariant these pin: **claim a wedge only when the frame loop says `stalled`.** */
 describe('explainCaptureFailure', () => {

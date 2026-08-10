@@ -507,7 +507,7 @@ export async function serializeScene(opts?: {
           // Writing them out instead FREEZES each file at the defaults of the day it
           // was saved, so a later change to a trait default silently stops reaching
           // every already-saved scene — the reason the repo-wide legacy-scene
-          // migration was on hold (docs/todo.md). Owner's call, 2026-07-31.
+          // migration was on hold (see docs/scene-loading.md). Owner's call, 2026-07-31.
           // …except a field the passes below REWRITE (parentId + every other
           // `entityId`-flagged ref, guid-ified there). Those are always emitted, so
           // skipping one here would only move it to the END of the object — pure diff
@@ -589,7 +589,7 @@ export async function serializeScene(opts?: {
   // re-registered under a different path string (a scanner rescan is enough), and a
   // miss there mints a fresh guid — which dangles every reference to the scene,
   // `project.config.json`'s included. That is how `tropical-island.json` lost its
-  // `4bc54ae4-…` id on a save (docs/todo.md, 2026-07-30).
+  // `4bc54ae4-…` id on a save (see docs/scene-loading.md, 2026-07-30).
   // `LoadedSceneEntry.guid` falls back to a `path:…` tag for a file with no valid
   // guid, so it is only trustworthy when it actually IS a guid.
   const sceneId = targetScene

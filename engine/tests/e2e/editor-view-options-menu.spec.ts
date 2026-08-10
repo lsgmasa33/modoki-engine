@@ -1,5 +1,5 @@
 /** Real-browser E2E for the SceneView "View ▾" dropdown chrome (ViewOptionsMenu,
- *  docs/todo.md "manual edit"). ViewOptionsMenu.test.tsx (jsdom/RTL) covers the same
+ *  see docs/editor.md). ViewOptionsMenu.test.tsx (jsdom/RTL) covers the same
  *  open/close/toggle logic already — this spec exists for the ONE thing jsdom can't prove:
  *  real keyboard dispatch through the editor's global keymap resolver (`useOverlayEscape` /
  *  `register`), which needs the actual window-level dispatcher mounted by the app shell. No

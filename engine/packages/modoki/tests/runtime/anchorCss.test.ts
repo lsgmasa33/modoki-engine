@@ -56,7 +56,7 @@ describe('applyAnchorStyle — emitted declarations', () => {
     });
 
     it('width is cleared on a stretched axis, so the offsets fully govern it', () => {
-      // Why an authored UIElement.width is inert here — see docs/todo.md.
+      // Why an authored UIElement.width is inert here — see docs/ui-system.md.
       const s = styleFor({ anchor: 'top-stretch', left: 10, right: 10 });
       expect(s.width).toBeUndefined();
       expect(s.height).toBeUndefined(); // top-stretch sets no height either

@@ -19,8 +19,8 @@
  *    - the `Time (resource)` entity SceneManager materializes is tagged `Transient`, so it is no
  *      longer inserted into whatever scene is saved next.
  *  Measured on `games/3d-test` right after: 5 of 7 accepted, up from 2 of 7. The two rejects are
- *  unrelated pre-existing issues, logged in `docs/todo.md` (a prefab-override capture that drops
- *  a marked `Animator.clip`, and structural `added` subtrees still writing defaults).
+ *  unrelated pre-existing issues: a prefab-override capture that drops a marked `Animator.clip`
+ *  (see docs/prefabs.md), and structural `added` subtrees still writing defaults.
  *
  *  A bulk `--apply` across all 47 scenes is therefore now a reasonable thing to run — but it is
  *  still the OWNER's call, because 10 of those scenes live in PUBLISHED demos and the diff lands

@@ -181,7 +181,7 @@ function readEditorState() {
     // Percept surface (previously answerable only via a raw CDP eval of window.*). `zoomFactor`
     // is the VS Code–style whole-app UI zoom (getPresentationScale is editor-calibrated to
     // webContents.getZoomFactor); `devicePixelRatio` is the raw backing-store ratio (display
-    // scale × zoom). See docs/todo.md (zoom-session MCP gaps).
+    // scale × zoom). See docs/debug-tools-mcp.md.
     viewport: readViewport(),
     // Which on-screen surfaces have a bounds provider mounted RIGHT NOW. A 2D/3D entity aim
     // REQUIRES a `surface` (docs/enact.md), so without this a caller had to guess at exactly the

@@ -13,7 +13,7 @@
  *  the world, must never be written to a scene file".
  *
  *  What this protects: a save used to GROW any scene lacking a Time entity by one
- *  (measured: ui-focus-demo.json, 9 → 10 entities, docs/todo.md), breaking A10's "a no-op
+ *  (measured: ui-focus-demo.json, 9 → 10 entities; see docs/scene-loading.md), breaking A10's "a no-op
  *  save is a no-op". And because serialize's foreign-entity filter skips entities without
  *  `EntityAttributes`, the stray singleton was not even confined to the primary — it
  *  landed in whichever file was being saved, a shared BASE scene included. */

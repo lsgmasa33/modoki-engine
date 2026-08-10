@@ -649,7 +649,7 @@ describe('/api/invalidate-project-config', () => {
   });
 });
 
-/** REGRESSION (docs/todo.md, measured 2026-07-28 on games/court): `action=set` used to
+/** REGRESSION (see docs/debug-tools-mcp.md, measured 2026-07-28 on games/court): `action=set` used to
  *  merge the body onto the DEFAULTS and write the whole resolved config, so a second
  *  `set` passing only `build.*` silently reverted app identity to
  *  com.modokiengine.prototype / "Puzzle Prototype" and blanked appleTeamId — and the

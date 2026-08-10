@@ -104,7 +104,7 @@ export interface CaptureWindowFacts {
  *  was found this said the renderer "is most likely wedged". That reads as a diagnosis, and it
  *  was WRONG for a fully-supported state — a layout with no Scene/Game panel open (a 2D-only
  *  project with both closed) has an `idle` frame loop by design, and the message sent the
- *  reader chasing a renderer fault that did not exist. See `docs/todo.md`.
+ *  reader chasing a renderer fault that did not exist. See `docs/debug-tools-mcp.md`.
  *
  *  So: assert a wedge ONLY when the frame loop actually reports `stalled`, and otherwise report
  *  what the renderer says. `idle` and `hidden` get their own actionable text; a `running` loop

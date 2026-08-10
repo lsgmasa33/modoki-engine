@@ -14,7 +14,7 @@
  *     `PrefabInstance.rootInstanceId` numeric and would have dangled the prefab reference;
  *   - `ui-focus-demo.json` is REJECTED — the save inserted a `Time (resource)` entity (9 → 10);
  *   - default-materialization is REJECTED, which is why 5 of 7 scenes failed and the bulk migration
- *     is on hold (see docs/todo.md).
+ *     was on hold (see docs/scene-loading.md).
  */
 
 import { describe, it, expect } from 'vitest';

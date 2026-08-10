@@ -13,7 +13,7 @@ This file is the normative ritual. `CLAUDE.md` carries a short pointer to it.
 | Kind of thing | Home | Why |
 |---|---|---|
 | **Open, claimable work** — a bug to fix, a feature to build | **GitHub Issue** | Must be claimable across clones with no sync delay |
-| **Closed incident write-up** — root cause, wrong theories, the lesson | `docs/todo.md` "Issues", or folded into the feature doc | Code-adjacent, greppable, versioned with the code it describes. An Issue buries it behind search |
+| **Closed incident write-up** — root cause, wrong theories, the lesson | **The feature doc** for the subsystem it broke (`prefabs.md`, `scene-loading.md`, …) — NOT `todo.md`, which was cleared of them 2026-08-10 | Code-adjacent, greppable, versioned with the code it describes, and read by whoever next touches that subsystem. An Issue buries it behind search; a todo list buries it under everything else |
 | **Declined decision** — considered and rejected, with the trigger to revisit | `docs/todo.md` "Deferred decisions" | Its job is to stop the question being re-litigated; it is not work |
 | **Capability backlog** — "what a mature engine has that Modoki doesn't" | `docs/todo.md` "Missing features" | A roadmap, not claimable tasks. Promote an entry to an Issue when it becomes real work |
 

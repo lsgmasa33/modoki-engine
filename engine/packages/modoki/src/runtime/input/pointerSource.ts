@@ -55,8 +55,8 @@
  *  `pointerId !== activeId` checks below — for free, with no additional state, and
  *  a SECOND pointer landing on the canvas becomes the active gesture (the only real
  *  multitouch benefit available here — `pointerSource` tracks a single pointer, so
- *  there is nothing to key a claim by `pointerId`; see the module's git history /
- *  `docs/todo.md` for the earlier per-pointerId design this replaced). Because the
+ *  there is nothing to key a claim by `pointerId`; see the module's git history and
+ *  docs/input.md for the earlier per-pointerId design this replaced). Because the
  *  decision is recomputed from the live DOM at every event rather than latched into
  *  a claim, a registration can never "leak" — there is no claim state to strand. */
 

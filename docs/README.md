@@ -114,7 +114,7 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 | [mobile-ota-updates-plan.md](./plans/mobile-ota-updates-plan.md) | Open items only — all phases shipped (see [ota-updates.md](./ota-updates.md) / [ota-subgame-modules.md](./ota-subgame-modules.md)): two open design conversations, known-but-unfixed edge cases, the private device-test loop |
 | [preview-mode-refactor.md](./plans/preview-mode-refactor.md) | Plan to unify the fragmented "in an editor preview?" signals into one `RunMode` + a serialization-transience rule so no preview/scrub mutation reaches disk |
 | [entity-id-guard-game-traits-plan.md](./plans/entity-id-guard-game-traits-plan.md) | Extend Phase 15's entity-id remap guard from engine-only tests to a registration-time check covering GAME traits too (`notEntityId` hint + dev warning), and fix the one live offender — sling's `Enemy.hpBarId`; also adds a click-to-copy entity-GUID chip to the Inspector header |
-| [todo.md](./todo.md) | Open task checklist — editor, rendering/materials (`MaterialModifier`, custom shader lighting, HDR import settings), native/build |
+| [todo.md](./todo.md) | **Not** a task list (open work is GitHub Issues) — the capability roadmap (what a mature engine has that Modoki doesn't) and the declined decisions, each with its trigger to revisit |
 
 ## Background & Evaluations
 

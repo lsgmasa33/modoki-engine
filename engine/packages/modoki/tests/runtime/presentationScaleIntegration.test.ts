@@ -15,7 +15,7 @@
  *  reports a queued down transition's OWN coordinates on the frame that drains it, then falls
  *  back to level state on the next sample — so collapsing a down+move into one un-ticked sample
  *  would misreport the move's position as the press point, which is the coordinate-space bug
- *  this fix closes (docs/todo.md), not what this test is pinning. */
+ *  this fix closes (docs/input.md), not what this test is pinning. */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createWorld, type World } from 'koota';
 import { pointerSource } from '../../src/runtime/input/pointerSource';

@@ -501,7 +501,7 @@ export class Scene2DRenderer {
 
   /** Toggle collider-ONLY mode (editor): hides every sprite and forces every Collider2D
    *  outline on, in purple — the 2D SceneView counterpart of the 3D "Colliders" toolbar
-   *  toggle (docs/todo.md "manual edit"). Forces a redraw so sprites vanish/reappear now. */
+   *  toggle (see docs/editor.md). Forces a redraw so sprites vanish/reappear now. */
   setCollidersOnly(on: boolean) {
     if (this._collidersOnly === on) return;
     this._collidersOnly = on;

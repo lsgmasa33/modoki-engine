@@ -2,7 +2,7 @@
  *
  *  A `save_all` on `games/3d-test/runtime/assets/scenes/tropical-island.json` migrated
  *  it v9→v12 correctly and then ALSO replaced its top-level `id` with a fresh guid,
- *  leaving `project.config.json`'s scene reference dangling (docs/todo.md, 2026-07-30).
+ *  leaving `project.config.json`'s scene reference dangling (see docs/scene-loading.md, 2026-07-30).
  *  The migration was never the culprit — every migrator in `loadSceneFile.ts` mutates
  *  in place and does not even see `id`/`createdAt`. The re-mint came from
  *  `serializeScene`, which recovered the PRIMARY's id by reverse-looking-up the path in

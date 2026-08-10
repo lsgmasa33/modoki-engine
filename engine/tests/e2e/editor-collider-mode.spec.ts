@@ -1,5 +1,5 @@
 /** Real-browser E2E for the SceneView "Colliders" checkbox (collider-only mode,
- *  docs/todo.md "manual edit"), inside the toolbar's "View ▾" dropdown (ViewOptionsMenu):
+ *  see docs/editor.md), inside the toolbar's "View ▾" dropdown (ViewOptionsMenu):
  *  pressing it must actually hide regular mesh rendering, not just flip the checkbox — a
  *  jsdom/headless-logic test can't prove a THREE.Mesh's `.visible` flag flipped inside
  *  SceneView's closure-scoped render loop. Observation is via the dev-only
