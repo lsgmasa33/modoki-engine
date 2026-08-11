@@ -1,6 +1,6 @@
 /** UltraHDR encode helpers — the Node-testable pure bits (the gainmap encode itself
  *  is browser-only). hashBytes drives the prod `?v=<hash>` cache-bust, so its
- *  determinism matters. See docs/asset-inspector-plan.md Phase 4b. */
+ *  determinism matters. See docs/plans/asset-inspector-plan.md Phase 4b. */
 
 import { describe, it, expect } from 'vitest';
 import { hashBytes, bytesToBase64 } from '../../packages/modoki/src/editor/panels/assetViews/encodeUltraHDR';

@@ -154,8 +154,8 @@ export const adbRunner = {
   /** Remove the rule on `hostPort` — but ONLY if it belongs to `serial`.
    *
    *  ⚠️ `adb forward --remove` matches on the HOST PORT SPEC, not on `-s` (#158). Measured: with two
-   *  phones leased by two clones, `adb -s RFCTB0EV83K forward --remove tcp:9095` deleted the rule
-   *  owned by `RFCTA14CMRF`, leaving that clone's live lease with no tunnel and no error — the same
+   *  phones leased by two clones, `adb -s RFDEADBEEF1 forward --remove tcp:9095` deleted the rule
+   *  owned by `RFDEADBEEF2`, leaving that clone's live lease with no tunnel and no error — the same
    *  cross-clone reach the `pkill -f` scoping rule exists to prevent, in a different mechanism.
    *  Per-clone host ports make the collision unreachable; this check means a mismatched removal
    *  refuses rather than reaches across even if something else ever re-introduces one. */

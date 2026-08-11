@@ -39,7 +39,7 @@ clean and hot-reloads.
   `evalColorTrack`/`evalBooleanTrack`/`evalSteppedTrack`, `applyTangentMode`. No THREE, no ECS.
 - `runtime/animation/sampleClip.ts` — `applyClipAtTime` (sample every track, name-path resolve,
   batch-write onto bound entities), `applyClipAtTimeBlended`, `advanceClipTime`. Shared by playback + scrub.
-- `runtime/ecs/entityIndex.ts` — **engine core, not animation**: the per-frame `EntityIndex`
+- `runtime/core/ecs/entityIndex.ts` — **engine core, not animation**: the per-frame `EntityIndex`
   (`buildEntityIndex`), relative name-path resolution (`resolveTrackTarget`) and the
   active-in-hierarchy predicate (`isEntityActiveInHierarchy`). Born here for clip binding, but the
   renderer, the sequencer and 2D deform all build the same index — so it lives in core and the
@@ -106,7 +106,7 @@ the same blend so a bone-targeting clip switch crossfades too.
 
 **Switching clips at runtime (one API for all three animators).** `Animator`, `SpriteAnimator`, and
 `SkeletalAnimator` all model "the active clip is a NAME", so a single engine action drives whichever
-the entity carries: **`engine.playClip`** (`runtime/ui/engineActions.ts`) — the unified twin of
+the entity carries: **`engine.playClip`** (`runtime/actions/engineActions.ts`) — the unified twin of
 `engine.toggleAnimator`. It takes a `clip` NAME param and, per present trait, resets `time` + sets
 `playing` (keyframe/sprite, guarded by `animatorHasClip`/`spriteAnimHasClip`) or writes the name for
 the mixer to crossfade (skeletal — validated at the render layer, no synchronous guard). Bind it to a

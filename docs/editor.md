@@ -52,7 +52,8 @@ another project/machine or share it, both directions go through a portable
 imports one (parsed, guarded by `isLayoutJson`, then written into the project store under
 its derived base name), and both *Save Layout As…* and *Load Layout…* have an *Export to
 file…* action that downloads the current/selected layout via a `Blob` + `<a download>`
-click (`downloadLayoutJson`, `sanitizeExportFileName` in `editor/utils/layoutNames.ts`).
+click (`downloadLayoutJson` in `editor/utils/layoutStore.ts`, `sanitizeExportFileName` in
+`editor/utils/layoutNames.ts`).
 There is no top-level menu item for export — it's reached through those two modals.
 
 The menu bar (`File` / `Edit` / `View`, plus host-injected menus) is rendered by
@@ -454,7 +455,7 @@ Dialogs/modals mounted by the shell include `ApplyPrefabDialog`,
 ## Trait registry & the auto-generated Inspector
 
 Every ECS trait the editor can show is described by a **`TraitMeta`** in the trait registry
-(`runtime/ecs/traitRegistry.ts`). A game registers its traits once (engine traits via
+(`runtime/core/ecs/traitRegistry.ts`). A game registers its traits once (engine traits via
 `engine/app/ecs/registerTraits.ts`'s `registerAllTraits()`; game traits from the game's own
 `setup.ts`), and from that metadata the editor **auto-generates the Inspector, serializes
 generically, and discovers entities** — there is no hand-written Inspector form per trait.
@@ -1251,7 +1252,7 @@ The undo stack is capped at 200 entries (oldest dropped, warned once per session
 | Host configuration factory | `editor/createEditor.tsx` |
 | Editor state (selection, gizmo) | `editor/store/editorStore.ts` |
 | Panels | `editor/panels/` (Hierarchy, Inspector, SceneView, Assets, Console, ModelPreview) |
-| Trait registry / Inspector field hints | `runtime/ecs/traitRegistry.ts`, `engine/app/ecs/registerTraits.ts` |
+| Trait registry / Inspector field hints | `runtime/core/ecs/traitRegistry.ts`, `engine/app/ecs/registerTraits.ts` |
 | 3D gizmo | Three.js `TransformControls` (in `SceneView.tsx`) |
 | UI / 2D gizmo | `editor/panels/UIResizeOverlay.tsx`, `Gizmo2D.ts` |
 | Multi-select group-gizmo math (3D + 2D) | `editor/scene/multiTransform.ts` |

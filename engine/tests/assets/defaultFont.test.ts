@@ -114,7 +114,7 @@ describe('the engine default font', () => {
    * ⚠️ Do not "fix" a weight by reaching for `msdf-atlas-gen -varfont` — it is a SILENT
    * NO-OP in our build (accepted, exit 0, byte-identical atlas). Axes are applied before
    * the bake by `engine/plugins/font-instance.ts`, which both the baked and dynamic paths
-   * consume. See docs/plans/font-variation-axes-plan.md §8.
+   * consume. See docs/fonts.md §3.
    *
    * **`Text2D.weight` is NOT that axis and is not a bug.** It is an SDF edge shift
    * (`edge = 0.5 - weight`, `mtsdfShader.ts`) — fake bolding by dilating the glyph outline.

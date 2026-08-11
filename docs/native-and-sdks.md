@@ -107,10 +107,10 @@ Analytics, crashlytics, ads, and attribution are **app/game concerns, not engine
 
 ### Key files
 
-- `engine/packages/modoki/src/runtime/appServices.ts` — the registry: `registerAppServices(services)` (merge-registers), `appServices()` (read the current set), `clearAppServices()` (drop them on game swap). Interfaces `CrashlyticsService` (`recordError`/`log`), `AdsService` (`init`/`cleanup`), `AttributionService` (`init`).
-- `engine/packages/modoki/src/runtime/gameDefinition.ts` — the `GameDefinition.registerAppServices?()` hook a project implements.
+- `engine/packages/modoki/src/runtime/core/appServices.ts` — the registry: `registerAppServices(services)` (merge-registers), `appServices()` (read the current set), `clearAppServices()` (drop them on game swap). Interfaces `CrashlyticsService` (`recordError`/`log`), `AdsService` (`init`/`cleanup`), `AttributionService` (`init`).
+- `engine/packages/modoki/src/runtime/core/gameDefinition.ts` — the `GameDefinition.registerAppServices?()` hook a project implements.
 - `games/3d-test/packages/app-services/src/index.ts` — a game's implementation: `register()` calls `registerAppServices({ crashlytics, ads, attribution })`, wiring its own `crashlytics.ts` / `ads.ts` / `attribution.ts` into the engine surface.
-- `engine/app/App.tsx` — the shell that drives the lifecycle; `engine/app/ui/components/ErrorBoundary.tsx` + `engine/app/store/gameStore.ts` — the engine-side callers of `crashlytics`.
+- `engine/app/App.tsx` — the shell that drives the lifecycle; `engine/app/ui/components/ErrorBoundary.tsx` + `runtime/store/gameStore.ts` — the engine-side callers of `crashlytics`.
 
 ### How it works
 
@@ -167,31 +167,8 @@ reads as false. Detail:
 ### MCP tools
 
 The MCP server at `engine/tools/game-debug-mcp/` is a **thin client** of Modoki's device lease — every tool
-proxies through the editor backend's `/api/device/request`. It exposes 20 tools to Claude Code
-(device Percept/Enact parity work grew this from an original 7):
-
-| Tool | Description |
-|---|---|
-| `device_status` | Report the Modoki lease (connected device, or how to connect) |
-| `device_connect` | Connect to a device by IP or adb |
-| `device_disconnect` | Release the device lease |
-| `device_eval` | Execute JavaScript in the game WebView |
-| `device_get_scene_state` | Read live scene/entity/trait state (Percept) |
-| `device_diagnose` | Report NaN transforms, broken refs, orphaned entities |
-| `device_journal` | Read the tick-stamped semantic event journal |
-| `device_resolve_refs` | Resolve GUID refs to live entities |
-| `device_introspect` | Inspect available traits/actions |
-| `device_layout_bounds` | Read UI layout bounds |
-| `device_watch` | Live time-series of chosen entities/traits |
-| `device_screenshot` | Capture the device screen → saves the file, opens Preview, returns **path + dimensions** (image inlined only with `inline:true`) |
-| `device_tap` | Tap at screenshot pixel coordinates (device converts to CSS off the last capture) |
-| `device_drag` | Drag between two points (PixiJS EventSystem) |
-| `device_dispatch_action` | Dispatch a trusted game action (Enact) |
-| `device_press_key` | Send a trusted key press |
-| `device_hover` | Send a trusted hover/pointer-move |
-| `device_scroll` | Send a trusted scroll |
-| `device_console_logs` | Read captured `console.log/warn/error` |
-| `device_native_logs` | Read iOS OSLogStore or Android logcat |
+proxies through the editor backend's `/api/device/request`. Full device tool catalog:
+[debug-tools-mcp.md](./debug-tools-mcp.md).
 
 **Connection is a deliberate, Modoki-owned lease** — the human clicks *Connect a Device* in the
 editor's AI panel (IP or adb); the backend holds one socket + the lease GUID (which never leaves the

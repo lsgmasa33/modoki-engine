@@ -56,10 +56,11 @@ Manager). Many features are **both** — see [Time](#time-system--manager).
 Seven of the registered "systems" are projections: they tick only to *poll for
 change* and mirror a store into ECS (or back). They're correctly Systems (they
 tick), but six of them hand-roll per-frame change detection. `uiTreeProjection`
-already solved this with a **dirty flag** (`markUIDirty`). A future
-`registerProjection(name, store, syncFn)` helper that subscribes to the store and
-runs `syncFn` only on change would turn those six pollers into event-driven syncs
-(see the rollout plan, Phase 6 — out of scope for the core work).
+already solved this with a **dirty flag** (`markUIDirty`). `registerProjection(name, store, syncFn)`
+(`runtime/core/projection.ts`) now generalizes that: it subscribes to the store and runs `syncFn`
+only on change, turning a per-frame poller into an event-driven sync. It **shipped and is in use** —
+`games/chess/runtime/setup.ts` and `games/llm-test/runtime/setup.ts` register four projections
+through it between them. Converting any remaining hand-rolled pollers is mechanical.
 
 ## The Manager primitive
 
@@ -129,7 +130,7 @@ setCurrentWorld(new)
   → releaseAllForScene(old)
   → oldWorld.destroy()
   → if the game changed: init new game-scoped managers that match the game filter
-  → init new scene-scoped managers that match the scene filter   (via fireSceneCallbacks)
+  → init new scene-scoped managers that match the scene filter   (via initSceneManagersFor)
 ```
 
 App-scoped managers are untouched by swaps — they init/dispose only at

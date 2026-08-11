@@ -41,7 +41,7 @@ const EditorApp = GAME_ONLY ? null : lazy(() => import('./editor/setup').then(m 
 // In-game debug menu (F12 / 3-finger tap). Present in the editor and in a game build
 // that opts in via project.config.json `build.debugBuild`. The flag is a build-time
 // constant so the dynamic import below is dead-code-eliminated and the whole
-// debug-menu chunk never ships when off. See docs/debug-menu-plan.md.
+// debug-menu chunk never ships when off. See docs/debug-menu.md.
 const DEBUG_MENU_ON = __MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__;
 const DebugMenu = DEBUG_MENU_ON
   ? lazy(() => import('@modoki/engine/runtime/debug').then(m => ({ default: m.DebugMenu })))

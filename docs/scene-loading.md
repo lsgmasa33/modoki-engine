@@ -75,7 +75,7 @@ only drops to zero once no remaining scene owns it.
 ## Scene manifest format
 
 The current scene file version is **12** (`SceneFile.version`), stamped from
-`SCENE_FORMAT_VERSION` in `runtime/version.ts`; the `SceneFile` interface is
+`SCENE_FORMAT_VERSION` in `runtime/core/version.ts`; the `SceneFile` interface is
 defined in `editor/scene/serialize.ts`:
 
 ```ts
@@ -135,8 +135,9 @@ path in `prefab.ts` and still write every field.
 Inspector section is deliberately absent from it (`Animator.clips`/`clip`,
 `SpriteAnimator.clip`, `AudioSource.clips`, `UIElement.flexWrap`,
 `EntityAttributes.editorFolder`, `Time.timeScale`, …). Every persistence path therefore
-reads through `readTraitDataFull` and gates stored fields with `traitDefinesField`
-(both in `runtime/core/ecs/entityUtils.ts`) — the scene serializer, `serializePrefab`,
+reads through `readTraitDataFull` (`runtime/core/ecs/entityUtils.ts`) and gates stored
+fields with `isPersistentTraitField` (`runtime/core/ecs/traitSchema.ts`) — the scene
+serializer, `serializePrefab`,
 `captureInstanceOverrides`, and both override-apply paths. `meta.fields` is consulted
 only for the `runtimeOnly` flag (which fields to *drop*). Getting this wrong is silent
 data loss, not a warning: the prefab paths once used `meta.fields` and a load→save
@@ -178,7 +179,7 @@ It follows that **a save REGENERATES `resources` rather than preserving it** —
 `serializeScene` discards the loaded array and rebuilds from the entities. So a file
 whose array was written by an older, less complete walk gets *upgraded* on its first
 save, and the array can grow without anything being wrong (issue #17 saw 2 → 3+ on
-`material-instance-demo.json`). The walk is deterministic — same entities, same array,
+`material-instance-demo.scene.json`). The walk is deterministic — same entities, same array,
 same order (`resourceRefsStability.test.ts` pins this, including dedupe of a ref two
 entities share) — so the second save produces the same bytes as the first.
 
@@ -480,7 +481,7 @@ that:
   (`getGuidForPath(path) ?? newGuid()`). That misses whenever `registerAsset` re-registers
   the same guid under a different path string, since it evicts the stale `pathToGuid` entry
   — an ordinary manifest rescan is enough. A miss **mints**, which silently dangles every
-  reference to the scene: measured on `tropical-island.json`, whose `project.config.json`
+  reference to the scene: measured on `tropical-island.scene.json`, whose `project.config.json`
   entry and a unit test both named the old guid (2026-07-30). The manifest lookup survives
   only as a fallback for a serialize with no live load behind it.
 
@@ -512,7 +513,7 @@ another scene that shares it**. Shared rig and session state (Time, camera, ligh
 UI, physics config) is authored **once** in the base; a level file becomes only what is
 actually per-level.
 
-The problem it solves is concrete: sling's `Lvl-0001.json` and `Lvl-0002.json` were
+The problem it solves is concrete: sling's `Lvl-0001.scene.json` and `Lvl-0002.scene.json` were
 byte-identical except `FieldSource.level`/`.wave` — ~38 duplicated entities per file,
 and no state (not even `Time.elapsed`) carried across the swap. Base scenes dissolve
 that identity problem rather than papering over it: there is exactly one Time entity,
@@ -640,7 +641,7 @@ Two consumers:
 - **The materialized Time singleton is tagged `Transient`, so it is never saved.** It has
   to exist in the world (systems reading delta are no-ops without it) but it was never
   authored, so writing it back would GROW whatever scene is saved next by one entity —
-  measured on `ui-focus-demo.json`, 9 → 10, a direct counter-example to "a no-op save is a
+  measured on `ui-focus-demo.scene.json`, 9 → 10, a direct counter-example to "a no-op save is a
   no-op". It was not even confined to the primary: serialize's foreign-entity filter skips
   any entity without `EntityAttributes`, and this one has none, so it landed in a shared
   **base** just as readily.
@@ -981,7 +982,7 @@ tree-shaker's keep-walk (`plugins/asset-tree-shaker.ts`) walks it, so a new ref
 field added there is covered everywhere. Non-scalar refs (`UIElement.fontFamily`
 = a CSS family name; `AnimationLibrary.animSets` = a guid array) are intentionally
 excluded and handled explicitly. The predicates themselves live in
-`runtime/loaders/assetRefRules.ts`: `isGuid` (UUID-v4 shape), `isExternalUrl`
+`runtime/core/assetRefRules.ts`: `isGuid` (UUID-v4 shape), `isExternalUrl`
 (`http(s):`/`data:`/`blob:`), `isInternalAssetPath` (leading `/` + a managed
 asset extension).
 

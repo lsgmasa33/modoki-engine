@@ -166,7 +166,7 @@ The physics system is the single **producer** of contact/sensor events; game cod
 so reactions stay deterministic):
 
 **C — `Physics2DEvents` manager (imperative, the substrate).** A scene-scoped manager
-(`runtime/managers/Physics2DEvents.ts`, registered in `app/ecs/register.ts`) exposing a
+(`runtime/physics/Physics2DEvents.ts`, registered in `app/ecs/register.ts`) exposing a
 subscribe API to code:
 ```ts
 import { physics2DEvents } from '@modoki/engine/runtime';
@@ -194,7 +194,7 @@ The enter/exit fan-out is dimension-agnostic and lives in ONE module,
 `synthesizeContactExits` / `makeFireOnCollision`), used by BOTH `physics2DSystem` and
 `physics3DSystem` — only the injected event bus + `OnCollision` trait differ, so a fix to the
 correctness-critical enter/exit balance can't silently miss a dimension. The bus itself comes from
-`runtime/managers/physicsEventBus.ts` (`createPhysicsEventBus` → two instances, `Physics2DEvents`
+`runtime/physics/physicsEventBus.ts` (`createPhysicsEventBus` → two instances, `Physics2DEvents`
 / `Physics3DEvents`, because one koota world can carry both 2D and 3D bodies and their subscriber
 sets must not conflate).
 
@@ -306,7 +306,7 @@ Pair it with a **kinematic** `RigidBody2D` + a `Collider2D` (box/capsule).
   (GAME priority, so sim-gated) bridges that resource's axis/jump onto every `CharacterController2D`
   each frame. Because it reads plain trait data, `characterInputSystem` is deterministic and runs in
   the harness too — a test spawns `Input`, sets its fields, and asserts on `moveX`/`jump`.
-- **Controls (demo):** A/D or ←/→ to move, W/↑/Space to jump. See `2d-physics-demo/platformer.json`.
+- **Controls (demo):** A/D or ←/→ to move, W/↑/Space to jump. See `2d-physics-demo/platformer.scene.json`.
 
 ## Character sprite animation (Phase 4.6)
 
@@ -335,7 +335,7 @@ driver tying motion state to a clip. `CharacterAnimator2D` (`runtime/traits/Char
 - **Demo asset:** `2d-physics-demo/…/sprites/player.png` — a **CC0** character sheet
   (bevouliin.com via OpenGameArt), cropped to alpha bounds and packed into a uniform 6×2 grid of
   192×320 cells, sliced via its `.meta.json`; attribution in `2d-physics-demo/ATTRIBUTION.md`.
-  The `platformer.json` Player uses it: `idle` 2 frames, `walk` 6, `jump` 2 (`mode:"once"`, so it
+  The `platformer.scene.json` Player uses it: `idle` 2 frames, `walk` 6, `jump` 2 (`mode:"once"`, so it
   holds the falling frame while airborne).
 
 ## Scene queries & runtime forces (both dimensions)
@@ -494,7 +494,7 @@ and WASM registry above are the SAME shared code, dimension-parameterized. What 
   preventDefaulted), **Alt/Cmd-click** a handle to delete (never below the shape minimum —
   3 for polygon/concave, 2 for polyline). Every edit is one undo entry and writes the `points` field (GUID-safe
   — points are inline coordinates, not an asset ref). The gizmo is hidden while editing. Pure list
-  ops live in `runtime/scene/colliderPoints.ts`; the world↔local point math + vertex picking in
+  ops live in `runtime/core/colliderPoints.ts`; the world↔local point math + vertex picking in
   `editor/panels/colliderEdit2D.ts`.
 - **`sprite: 'collider'` render mode** (DONE): a polygon/polyline/concave collider has no primitive
   equivalent, so give its entity a `Renderable2D` with `sprite: 'collider'` and it draws the
@@ -538,12 +538,12 @@ and WASM registry above are the SAME shared code, dimension-parameterized. What 
 
 | Sub-phase | Scope | Status | Verification |
 |---|---|---|---|
-| **4.1 — CCD** | Already wired via `RigidBody2D.ccd` → `setCcdEnabled`; add proof + demo. | ✅ done | `tests/runtime/physics2DCcd.test.ts` — fast ball tunnels a thin wall with `ccd:false`, is stopped with `ccd:true`. Demo scene `2d-physics-demo/…/ccd-tunneling.json` (two gravity-launched balls, CCD on/off). |
-| **4.2 — Compound colliders** | One `RigidBody2D` adopts DIRECT child entities that have `Collider2D` but no own `RigidBody2D`, attaching each as a collider at the child's local Transform offset. Single-level only (grandchildren not chained). `physics2DSystem`: `collectCompoundChildren` groups by numeric `parentId`; `BodyRec.colliderHandles` tracks own+child handles; child edits change `bodySig` → rebuild. | ✅ done | `tests/runtime/physics2DCompound.test.ts` — two-footed body straddles a gap a single centered box falls through; a child collider's collision resolves to the child entity. Demo `2d-physics-demo/…/compound-colliders.json` (table, cross, dumbbell). |
-| **4.3 — Collision-mesh authoring** | SceneView "collider edit mode" (⬟ Points toolbar toggle): draggable vertex handles for `polygon`/`polyline`/`concave` colliders — drag to move, double-click an edge to insert, Alt/Cmd-click a handle to delete; writes the `points` field (undoable). Pure logic in `runtime/scene/colliderPoints.ts`; world↔local + picking in `editor/panels/colliderEdit2D.ts`. | ✅ done | `tests/runtime/colliderPoints.test.ts` (parse/serialize/move/insert/remove/nearest-edge) + `tests/editor/colliderEdit2D.test.ts` (world↔local round-trip, pickVertex). Demo `2d-physics-demo/…/collider-mesh.json` (editable polygon ramp + polyline terrain). |
-| **4.4 — Convex decomposition** | New `concave` shape: `poly-decomp-es` decomposes the point list into convex pieces → multiple `convexHull` colliders on ONE body (so a DYNAMIC concave solid works; a lone hull would fill the concavity). `makeColliderDesc` now returns a desc ARRAY; `attachCollider` returns handle[]. Falls back to a single hull if the list isn't decomposable. Editable via ⬟ Points. | ✅ done | `tests/runtime/physics2DConcave.test.ts` — a U-cup catches a ball inside (y>0) where the same points as a `polygon` hull leave it on top (y<0); decomposition splits a U into >1 piece. Demo `2d-physics-demo/…/concave-shapes.json` (bowl collecting balls + a dynamic boomerang). |
-| **4.5 — Character controller** | `CharacterController2D` trait (kinematic body) driven inside `physics2DSystem` via Rapier's `KinematicCharacterController` (collide-and-slide, autostep, slope limits, snap-to-ground, grounded + velY readback). Passive window keys (`keyboardSource`) feed the `Input` resource via `inputSystem`; `characterInputSystem` bridges that resource's moveX/jump onto the trait each frame (sim-gated; harness-safe — reads trait data, not the DOM). | ✅ done | `tests/runtime/physics2DCharacter.test.ts` — walks + grounded, falls unsupported, blocked by a wall, auto-steps a ledge only when enabled (driven by trait fields). Demo `2d-physics-demo/…/platformer.json` (A/D move · Space jump · stairs · platform · wall). |
-| **4.6 — Character sprite animation** | `CharacterAnimator2D` trait + `characterAnimationSystem` (GAME priority) map `CharacterController2D` motion state → active `SpriteAnimator` clip (jump/walk/idle) and flip facing via `Renderable2D.flipX`. Reuses the existing flipbook stack (`SpriteAnimator` + grid slicing + `resolveSprite` sub-rects). Registered in the Inspector **Add Component** menu. | ✅ done | `tests/runtime/characterAnimation.test.ts` — clip selection (idle/walk/jump, threshold), facing flip + magnitude preserved, `flip:false` opt-out. Demo `2d-physics-demo/…/platformer.json` Player uses `sprites/player.png` (CC0, 6×2 sheet of 192×320 cells). |
+| **4.1 — CCD** | Already wired via `RigidBody2D.ccd` → `setCcdEnabled`; add proof + demo. | ✅ done | `tests/runtime/physics2DCcd.test.ts` — fast ball tunnels a thin wall with `ccd:false`, is stopped with `ccd:true`. Demo scene `2d-physics-demo/…/ccd-tunneling.scene.json` (two gravity-launched balls, CCD on/off). |
+| **4.2 — Compound colliders** | One `RigidBody2D` adopts DIRECT child entities that have `Collider2D` but no own `RigidBody2D`, attaching each as a collider at the child's local Transform offset. Single-level only (grandchildren not chained). `physics2DSystem`: `collectCompoundChildren` groups by numeric `parentId`; `BodyRec.colliderHandles` tracks own+child handles; child edits change `bodySig` → rebuild. | ✅ done | `tests/runtime/physics2DCompound.test.ts` — two-footed body straddles a gap a single centered box falls through; a child collider's collision resolves to the child entity. Demo `2d-physics-demo/…/compound-colliders.scene.json` (table, cross, dumbbell). |
+| **4.3 — Collision-mesh authoring** | SceneView "collider edit mode" (⬟ Points toolbar toggle): draggable vertex handles for `polygon`/`polyline`/`concave` colliders — drag to move, double-click an edge to insert, Alt/Cmd-click a handle to delete; writes the `points` field (undoable). Pure logic in `runtime/core/colliderPoints.ts`; world↔local + picking in `editor/panels/colliderEdit2D.ts`. | ✅ done | `tests/runtime/colliderPoints.test.ts` (parse/serialize/move/insert/remove/nearest-edge) + `tests/editor/colliderEdit2D.test.ts` (world↔local round-trip, pickVertex). Demo `2d-physics-demo/…/collider-mesh.scene.json` (editable polygon ramp + polyline terrain). |
+| **4.4 — Convex decomposition** | New `concave` shape: `poly-decomp-es` decomposes the point list into convex pieces → multiple `convexHull` colliders on ONE body (so a DYNAMIC concave solid works; a lone hull would fill the concavity). `makeColliderDesc` now returns a desc ARRAY; `attachCollider` returns handle[]. Falls back to a single hull if the list isn't decomposable. Editable via ⬟ Points. | ✅ done | `tests/runtime/physics2DConcave.test.ts` — a U-cup catches a ball inside (y>0) where the same points as a `polygon` hull leave it on top (y<0); decomposition splits a U into >1 piece. Demo `2d-physics-demo/…/concave-shapes.scene.json` (bowl collecting balls + a dynamic boomerang). |
+| **4.5 — Character controller** | `CharacterController2D` trait (kinematic body) driven inside `physics2DSystem` via Rapier's `KinematicCharacterController` (collide-and-slide, autostep, slope limits, snap-to-ground, grounded + velY readback). Passive window keys (`keyboardSource`) feed the `Input` resource via `inputSystem`; `characterInputSystem` bridges that resource's moveX/jump onto the trait each frame (sim-gated; harness-safe — reads trait data, not the DOM). | ✅ done | `tests/runtime/physics2DCharacter.test.ts` — walks + grounded, falls unsupported, blocked by a wall, auto-steps a ledge only when enabled (driven by trait fields). Demo `2d-physics-demo/…/platformer.scene.json` (A/D move · Space jump · stairs · platform · wall). |
+| **4.6 — Character sprite animation** | `CharacterAnimator2D` trait + `characterAnimationSystem` (GAME priority) map `CharacterController2D` motion state → active `SpriteAnimator` clip (jump/walk/idle) and flip facing via `Renderable2D.flipX`. Reuses the existing flipbook stack (`SpriteAnimator` + grid slicing + `resolveSprite` sub-rects). Registered in the Inspector **Add Component** menu. | ✅ done | `tests/runtime/characterAnimation.test.ts` — clip selection (idle/walk/jump, threshold), facing flip + magnitude preserved, `flip:false` opt-out. Demo `2d-physics-demo/…/platformer.scene.json` Player uses `sprites/player.png` (CC0, 6×2 sheet of 192×320 cells). |
 
 **Note on the CCD demo (4.1):** CCD-*off* tunneling is inherently framerate-dependent (a discrete
 step tunnels only when no sub-step sample lands inside the obstacle), so the demo drives the balls

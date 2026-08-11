@@ -8,7 +8,7 @@
  *
  *  Ships in game builds; runtime behaviour is gated by {@link isDebugMenuEnabled}
  *  (pushed from `app/main.tsx`, mirroring `setJournalEnabled`). See
- *  docs/debug-menu-plan.md. */
+ *  docs/debug-menu.md. */
 
 import type React from 'react';
 

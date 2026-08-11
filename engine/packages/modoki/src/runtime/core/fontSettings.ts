@@ -46,7 +46,7 @@ export interface FontImportSettings {
    *  Absent or empty ⇒ the font's DEFAULT instance. That default is often not Regular:
    *  Geologica defaults to wght 100 (Thin) and Nunito to 200 (ExtraLight), so leaving
    *  this unset is what made those families render at their lightest weight and nothing
-   *  else. See docs/plans/font-variation-axes-plan.md.
+   *  else. See docs/fonts.md.
    *
    *  ONE FONT ASSET = ONE INSTANCE (as in Unity): two weights of a family means two font
    *  assets, since each bakes its own atlas. Distinct from `Text2D.weight`, which is a

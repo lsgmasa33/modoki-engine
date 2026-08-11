@@ -6,8 +6,8 @@
  *
  *   - **baked** — `msdf-atlas-gen -varfont <file>?wght=700` is a SILENT NO-OP in our
  *     build: the flag is accepted, exit code 0, no warning, and the atlas comes out
- *     BYTE-IDENTICAL to a plain `-font` bake (measured; see docs/plans/font-variation-axes-plan.md
- *     §8). So the bake is fed an already-instanced file via plain `-font`, and
+ *     BYTE-IDENTICAL to a plain `-font` bake (measured; see docs/fonts.md
+ *     §3). So the bake is fed an already-instanced file via plain `-font`, and
  *     `buildAtlasGenArgs` must never grow a `-varfont` (guarded in fontConvert.test.ts).
  *   - **dynamic** — `@zappar/msdf-generator`'s options carry no axis coordinates at all,
  *     and it rasterizes raw font bytes with no CSS/canvas rasterizer to borrow instancing

@@ -33,7 +33,7 @@ deterministic sim free of live DOM reads.
 
 ## Key files
 
-- `runtime/input/actions.ts` — the vocabulary (`AXES`, `DIGITAL`, `InputDevice`, `PointerFrame`) + pure
+- `runtime/core/inputActions.ts` — the vocabulary (`AXES`, `DIGITAL`, `InputDevice`, `PointerFrame`) + pure
   frame helpers (`makeAxes`/`makeFlags`/`makePointer`, `beginSample`, `computeEdges`,
   `computePointerEdge`, `clampAxes`, `applyDeadzone`).
 - `runtime/traits/Input.ts` — the `Input` resource trait + read accessors (`axis`/`held`/`pressed`/

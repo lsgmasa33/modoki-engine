@@ -72,8 +72,8 @@ export interface ForwardRule { serial: string; local: string; remote: string }
 /** Parse `adb forward --list`. PURE.
  *
  *  Format:
- *    RFCTB0EV83K tcp:9095 tcp:9095
- *    RFCTA14CMRF tcp:9333 localabstract:webview_devtools_remote_12345
+ *    RFDEADBEEF1 tcp:9095 tcp:9095
+ *    RFDEADBEEF2 tcp:9333 localabstract:webview_devtools_remote_12345
  *
  *  A cold daemon prepends its `* daemon …` banner on the same stream, dropped EXPLICITLY here the
  *  way `parseAdbDevices` drops it — not left to the shape check below. Both known banner lines
@@ -116,7 +116,7 @@ export function isUsable(d: AndroidDevice): boolean {
  *  Format, which the parse depends on:
  *    List of devices attached
  *    ASJ6R19826001453   device usb:2-1.4.3 model:MRD_LX3 device:HWMRD transport_id:3
- *    RFCTA14CMRF        unauthorized usb:2-1.1
+ *    RFDEADBEEF2        unauthorized usb:2-1.1
  *    emulator-5554      device product:sdk_gphone64_arm64 model:sdk_gphone64_arm64
  *
  *  A cold daemon prepends `* daemon not running; starting now at tcp:5037` and `* daemon started
@@ -254,7 +254,7 @@ export function withFriendlyNames(devices: AndroidDevice[]): AndroidDevice[] {
   });
 }
 
-/** A one-line description of a device for a message: `RFCTA14CMRF (Galaxy A23 5G)`. Prefers the
+/** A one-line description of a device for a message: `RFDEADBEEF2 (Galaxy A23 5G)`. Prefers the
  *  phone's own name over the model code — on a desk with three Androids, `SC_56C` vs `SM_S901U1` is
  *  precisely the pair a human cannot tell apart. Falls back to the model when no name was learned. */
 export function describeAndroidDevice(d: AndroidDevice): string {

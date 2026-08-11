@@ -3,7 +3,7 @@
  *  - `atlasMax` (runtime dynamic-page size) is hidden for a baked font (it has no
  *    baked effect — msdf-atlas-gen auto-sizes) and shown only in dynamic mode.
  *  Backend + store are mocked so the view mounts headless. See
- *  docs/asset-inspector-plan.md Phase 1. */
+ *  docs/plans/asset-inspector-plan.md Phase 1. */
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render, cleanup, fireEvent, waitFor } from '@testing-library/react';

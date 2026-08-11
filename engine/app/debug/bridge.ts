@@ -883,7 +883,7 @@ async function handleMessage(req: Request): Promise<unknown> {
     // registration side-effects run on first import, so runAgentOp then resolves. Imported
     // DYNAMICALLY so the ops chunk is code-split out of the main bundle and only loads on the
     // first Percept request over a live lease (a release game's server rejects connections, so
-    // handleMessage never runs → the chunk never loads). See docs/plans/device-percept-enact-plan.md.
+    // handleMessage never runs → the chunk never loads). See docs/debug-tools-mcp.md.
     default: return await delegateToAgentOps(req.method, p);
   }
 }

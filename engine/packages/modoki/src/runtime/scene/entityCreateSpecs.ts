@@ -10,7 +10,7 @@
  *  Lives in `runtime/` (not `editor/`) since #166: the DEVICE `create-entity` op needs these
  *  builders, and the editor half of the package is stripped from a shipped game build. Nothing
  *  here touches the editor — it is pure spec construction. See
- *  docs/plans/device-authoring-parity-plan.md §7. */
+ *  docs/mcp-tool-conventions.md §9. */
 
 import { buildUiCreateSpecs, type UiPreset } from '../ui/uiAuthoring';
 

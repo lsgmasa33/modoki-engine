@@ -2,7 +2,7 @@
  *  Covers the WebP-quality control's visibility logic in the pure, prop-driven
  *  TextureSettingsControls. The font fieldType/atlasMax + spriteanim-button changes
  *  are covered by their own unit tests + live-verify (their host views are
- *  backend-coupled). See docs/asset-inspector-plan.md Phase 1. */
+ *  backend-coupled). See docs/plans/asset-inspector-plan.md Phase 1. */
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render, cleanup, fireEvent } from '@testing-library/react';

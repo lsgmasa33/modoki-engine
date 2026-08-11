@@ -89,9 +89,12 @@ export interface VideoImportSettings {
    *  The host MUST send `Access-Control-Allow-Origin`, and this is not a formality:
    *  a video used as a GPU texture is loaded with `crossOrigin='anonymous'`, so a
    *  host without CORS fails the load outright — while omitting the flag taints the
-   *  canvas and makes the texture unusable instead. Measured: GitHub *Releases* sends
-   *  range requests but NO CORS, so it cannot host video; jsDelivr and archive.org
-   *  both send `ACAO: *`. Ignored when `delivery` is `'bundled'`. */
+   *  canvas and makes the texture unusable instead. Measured: **jsDelivr** sends
+   *  `ACAO: *` and is the usable host. GitHub *Releases* sends range requests but NO
+   *  CORS. **archive.org sends `ACAO: *` on its 302 and NOTHING on the storage node
+   *  that serves the bytes** — so a casual `curl -I`, which follows the redirect and
+   *  prints the first header it sees, reports a header the real response lacks. It is
+   *  not usable. Ignored when `delivery` is `'bundled'`. */
   remoteUrl?: string;
 }
 

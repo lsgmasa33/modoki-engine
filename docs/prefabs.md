@@ -169,7 +169,7 @@ renderer should draw a row for it. A field can persist and still be absent from 
 loader apply (`applyOverridesByLocalToEcs`) — used to treat `field in meta.fields` as
 "does this field persist", which lost data twice over: the loader **dropped** such a
 field instead of applying it (and so never seeded its override mark), and capture never
-**read** it, so the next save deleted it from the file. Measured on `skinned-test.json`: a load→save removed a populated
+**read** it, so the next save deleted it from the file. Measured on `skinned-test.scene.json`: a load→save removed a populated
 `Animator.clips` bank naming a real clip guid. A field the schema does not declare is
 still ignored — that is the genuinely renamed/retired case. Capture additionally skips
 `runtimeOnly` fields at the READ, mirroring `serializeScene`, so live read-back

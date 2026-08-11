@@ -13,13 +13,14 @@ import { setJournalEnabled, setDebugMenuEnabled, setDebugHandlesEnabled, readPer
 // Electron editor, __MODOKI_EDITOR__) and in a game build that opts in via
 // project.config.json `build.debugBuild`; OFF in a normal shipped game build so
 // `emit()` adds no per-event allocation on hot paths (physics contacts, etc.).
-// (Deferred: a debug|profile|release mode enum — see docs/percept-plan.md.)
+// (Deferred: a debug|profile|release mode enum in place of these two booleans — four surfaces
+// below gate on the same pair. Why it is not obviously right: docs/todo.md § Deferred decisions.)
 setJournalEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
 
 // In-game debug menu — ON in the editor (dev + packaged Electron editor) and in a
 // game build that opts in via project.config.json `build.debugBuild`. The App.tsx
 // lazy import is gated on the same OR, so a release build with the flag off
-// tree-shakes the whole debug-menu chunk out. See docs/debug-menu-plan.md.
+// tree-shakes the whole debug-menu chunk out. See docs/debug-menu.md.
 setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
 
 // Live-inspection handles (`window.__3d` — camera/scene/renderer) — same gate again. Without

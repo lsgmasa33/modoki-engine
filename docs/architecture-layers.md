@@ -135,11 +135,11 @@ The two other inversions to reach for when registration does not fit:
   calls `.get()` instead of importing the loader directly. Per the owner's D5 decision, an
   unprovided slot **warns once and returns a neutral value — it does not throw**, so a headless unit
   test that deep-imports one L2 module, or a DCE'd playable-ad build that drops a provider, degrades
-  instead of crashing. **One slot per type**, owned by whichever L2 folder owns that type — nine
+  instead of crashing. **One slot per type**, owned by whichever L2 folder owns that type — eleven
   slots exist today (`particles/particleDefProvider`, `core/textureProvider` +`core/textureRefs`,
   `core/assetPlumbing`, `animation/assetProviders`, `audio/audioAssetProvider`,
   `skinning/rig2dProvider`, `rendering/materialProvider`, `physics/meshColliderProvider`,
-  `timeline/timelineAssetProvider`) — never one god registry, which would satisfy the linter while
+  `timeline/assetProvider`, `core/playerTierStore`, `core/probeVerdictStore`) — never one god registry, which would satisfy the linter while
   re-creating the original hairball behind a single name.
 - **Move the type down** — if a subsystem type is really the trait's own schema, move it into
   `traits/` (or `core/`) and let the subsystem import it from there. `UIActionBinding` belongs to

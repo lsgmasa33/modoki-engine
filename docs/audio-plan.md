@@ -184,7 +184,7 @@ trait fields controlled by built-in actions** — and every game gets it for fre
   used to reap a crossfade tail reliably even during a time-stop (`timeScale 0`),
   where an engine-delta reaper would stall (`getVisualDelta` is 0). The `fadingOut`
   list now only force-stops tails on Stop/scene-swap + sweeps ended handles.
-- **Built-in `audio.*` UIActions** (`runtime/audio/audioControls.ts`,
+- **Built-in `audio.*` UIActions** (`runtime/actions/audioControls.ts`,
   `registerAudioControls()` wired in `app/ecs/register.ts` alongside
   `registerEngineActions`): `audio.play` / `pause` / `toggle` / `stop` / `setClip` /
   `toggleCrossfade` (flips `crossfadeSec` 0↔N) / `setBusVolume` / `playOneShot`.

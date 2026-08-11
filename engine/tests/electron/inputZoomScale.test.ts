@@ -5,7 +5,7 @@
  *  injected DIP coordinate into the page by DIVIDING by the zoom factor — so to land on the
  *  element at zoomed-CSS point P we must inject P·f. This pins that scaling for tap/drag/
  *  hover/scroll so a future refactor can't silently reintroduce the off-by-zoom miss that a
- *  live audit measured (docs/plans/editor-ui-zoom-plan.md). */
+ *  live audit measured (docs/debug-tools-mcp.md). */
 import { describe, it, expect } from 'vitest';
 import type { BrowserWindow } from 'electron';
 import { tap, drag, hover, scroll, captureGesture } from '../../electron/rendererOps';

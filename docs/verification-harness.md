@@ -55,7 +55,7 @@ not "build a harness from scratch."
 
 | Need | Existing seam | File |
 |------|---------------|------|
-| Centralized time | `Time` trait (`delta`/`elapsed`/`smoothedDelta`/`frame`) | `runtime/traits/Time.ts` |
+| Centralized time | `Time` trait (`delta`/`elapsed`/`smoothedDelta`/`frame`) | `runtime/core/traits/Time.ts` |
 | Clock source | `timeSystem` — module-global `let lastTime = performance.now()` | `runtime/core/timeSystem.ts` |
 | Single-step | `Paused` trait + `stepOneFrame` (editor step button) | `runtime/rendering/frameDriver.ts`, `timeSystem.ts` |
 | Sim on/off gate | `playState` — `getPlayState/setPlayState/isSimRunning` | `runtime/core/playState.ts` |

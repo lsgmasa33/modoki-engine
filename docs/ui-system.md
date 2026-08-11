@@ -115,7 +115,7 @@ number straight into a field with zero game code.
 `UINode` runs the matching rows with `applyBindings(node.action.bindings, event, {selfGuid, …})`
 (imported from `runtime/ui/bindings.ts`) on `'click'`/`'change'`/`'submit'`. For a
 `kind:'call'` row, `applyBindings` dispatches internally through `dispatchUIAction` into
-`runtime/ui/actionRegistry.ts`, where games register handlers via
+`runtime/core/actionRegistry.ts`, where games register handlers via
 `registerUIAction(name, handler)` / `unregisterUIAction(name)`. An unknown action
 **throws in dev** and warns in production, so typo'd action names surface immediately.
 (Bindings are inert unless the game is running — `applyBindings` early-returns when the
@@ -124,7 +124,7 @@ sim is stopped, so editor Stopped/Paused states never mutate the scene.)
 #### Engine built-in `UIAction`s
 
 Four stateless lifecycle/animator handlers are registered once at startup by
-`registerEngineActions()` (`runtime/ui/engineActions.ts`), callable from any
+`registerEngineActions()` (`runtime/actions/engineActions.ts`), callable from any
 `kind:'call'` binding by name:
 
 - **`engine.reload`** — `window.location.reload()` (hard web-view reload).
@@ -198,7 +198,7 @@ both directions: a stretched primary makes the field read-only on siblings where
 genuinely takes effect, and an un-stretched primary lets a write land on siblings that
 silently discard it — the very trap the gate exists for, re-entered through the selection.
 So both gates read EVERY selected entity (`selectionSizeGate` / `selectionAnchorGate`,
-`editor/uiAuthoring.ts`) and yield one of three verdicts: **inert** (dead on all → read-only
+`runtime/ui/uiAuthoring.ts`) and yield one of three verdicts: **inert** (dead on all → read-only
 + dimmed), **live** (dead on none → untouched), or **mixed** — which stays **editable**,
 half-dimmed, its tooltip stating how much of the write will be discarded. Blocking the mixed
 case would strand the entities where the value works, which is why "some are inert" may not
@@ -479,7 +479,7 @@ World-space text renders from a signed-distance-field atlas, not a `FontFace`.
 a source `.ttf`/`.otf` and the resolved charset to emit an mtsdf atlas PNG + a Chlumsky
 JSON metrics layout into a content cache (cache hits skip the work; a missing
 `msdf-atlas-gen` binary surfaces an install hint). Per-font settings live in the font's
-`.meta.json` (`font` block, `runtime/loaders/fontSettings.ts`): `fieldType` (`mtsdf`),
+`.meta.json` (`font` block, `runtime/core/fontSettings.ts`): `fieldType` (`mtsdf`),
 `size` (default 128), `pxRange` (default 8 — headroom for outline/glow), `charset`
 (`ascii`/`latin1`/`custom`), `atlasMax`, and `mode` (`baked` fixed atlas vs `dynamic`,
 which seeds a runtime MSDF generator for unseen/CJK glyphs). Settings are baked into the
@@ -552,11 +552,11 @@ verified against the game's `game.ts`/`runtime/setup.ts` and `app/App.tsx`.)
 | Renderer + DOM node | `runtime/ui/UIRenderer.tsx`, `UINode.tsx` |
 | Tree build + dirty flag | `runtime/ui/uiTreeStore.ts` (`buildTree`, `markUIDirty`, `uiTreeProjection`) |
 | Selector hook | `runtime/ui/useUIEntities.ts` |
-| Action registry + engine built-ins | `runtime/ui/actionRegistry.ts`, `runtime/ui/engineActions.ts` |
+| Action registry + engine built-ins | `runtime/core/actionRegistry.ts`, `runtime/actions/engineActions.ts` |
 | Binding resolver | `runtime/ui/bindingResolver.ts` |
 | Anchor math | `runtime/ui/anchorLayout.ts` |
 | Focus nav (trait / system / manager) | `runtime/traits/UIFocusable.ts`, `runtime/ui/uiFocusSystem.ts`, `runtime/ui/focusManager.ts` |
 | Text animation | `runtime/traits/TextAnimation.ts`, `runtime/ui/uiTextAnimation.ts`, `runtime/rendering/text/textAnimate.ts` |
 | Nine-slice image + editor | `runtime/ui/NineSliceImage.tsx`, `editor/panels/NineSliceEditor.tsx` |
-| Fonts (FontFace loader / MSDF convert / settings) | `runtime/loaders/fontLoader.ts`, `plugins/font-convert.ts`, `runtime/loaders/fontSettings.ts` |
+| Fonts (FontFace loader / MSDF convert / settings) | `runtime/loaders/fontLoader.ts`, `plugins/font-convert.ts`, `runtime/core/fontSettings.ts` |
 | Custom game UI | game's `game.ts` (`UIComponent`), `app/App.tsx`, `app/ui/DefaultGameUILayer.tsx` |

@@ -216,7 +216,21 @@ response**. Measured, because this is easy to get wrong:
 | jsDelivr | yes (206) | `*` | **yes** |
 
 The archive.org row is the trap: a casual `curl -I` follows the redirect and shows a header that
-the response actually serving the bytes does not have.
+the response actually serving the bytes does not have. Re-measured 2026-08-11 and it still holds —
+`/download/…` answers `302` with `access-control-allow-origin: *`, and the
+`dnNNNNNN.us.archive.org` node it redirects to answers `200` with no CORS header at all. A code
+comment claiming archive.org sends `ACAO: *` was corrected against this measurement, not the other
+way round.
+
+⚠️ **The Inspector warns on any `*.archive.org` host, and the subdomains are the point.** Warning
+only on the bare domain leaves it silent on the URL a user is most likely to paste: they use the
+`/download/` link, preview it in a browser, and the address bar then shows the
+`ia<n>`/`dn<n>.us.archive.org` node it redirected to — so the copied URL is the storage node, which
+is exactly the broken case. (`ia801409…` further `301`s to `dn801201…`; both are archive.org
+subdomains, so one subdomain-permitting rule covers the family, while `archive.org.evil.com` and
+`notarchive.org` still correctly do not match.) `web.archive.org` matches the same rule and is
+**not** separately measured — being warned is the safe direction. Pinned by
+`engine/tests/editor/videoAssetLogic.test.ts`.
 
 ## Sequencing a cutscene
 

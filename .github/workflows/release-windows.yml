@@ -10,7 +10,7 @@
 # build / internal distribution; add signing (env-gated, like the macOS notarize
 # hook) before a public release. Likewise the electron-updater feed (latest.yml) is
 # NOT published to GCS here — the Windows auto-update channel waits until the build
-# is signed + validated on a real Windows box (see docs/plans/editor-toolchain-layer-plan.md,
+# is signed + validated on a real Windows box (see docs/editor-toolchain.md,
 # Phase W).
 #
 # toktx/libktx AND msdf-atlas-gen ARE bundled on Windows via the "Stage toktx" / "Stage

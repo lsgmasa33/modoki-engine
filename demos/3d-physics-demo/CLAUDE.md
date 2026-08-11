@@ -21,16 +21,16 @@ everything is authored in the scenes — **the scene is the source of truth**
   custom UI.
 - **Config** — `physics3DDemoConfig` (`runtime/config.ts`) is a bare `GameConfig`:
   `sceneSetup`/`initWorld` are no-ops; it just points `scenePath` at
-  `physics-showcase.json`. World gravity (`-9.81` Y) lives on the scene's `Physics3D`
+  `physics-showcase.scene.json`. World gravity (`-9.81` Y) lives on the scene's `Physics3D`
   resource entity, live-editable in the Inspector.
 - **Scenes** (`runtime/assets/scenes/`) — two:
-  - **physics-showcase.json** (default, 39 entities) — organised with `editorFolder`
+  - **physics-showcase.scene.json** (default, 39 entities) — organised with `editorFolder`
     tags: `Setup` · `Level` · `Bodies` · `Joints/{Pendulum,Chain,Slider Test}` ·
     `Interaction` · `manual_test`. The 4 static walls are parented under an empty
     `Walls` transform group. Joints cover **revolute** (Pendulum), **spherical**
     (3-link Chain + the `manual_test` pendulum) and **prismatic** with travel limits
     (Slider Test).
-  - **terrain-demo.json** (55 entities) — a Terrain GLB with a trimesh
+  - **terrain-demo.scene.json** (55 entities) — a Terrain GLB with a trimesh
     (`.colmesh.glb`) collider and 49 balls raining onto it. No joints, no folders.
 - **Assets** — the terrain model under `runtime/assets/models/terrain/` and nothing
   else; every other visible object is an engine primitive. No textures/HDR/audio/fonts.

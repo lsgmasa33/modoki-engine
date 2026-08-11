@@ -59,7 +59,7 @@ Grouped:
   **All of it is live-world only** — a device has no project on disk, there is no undo stack, and a
   relaunch is the undo. Every reply says so rather than leaving persistence unstated. `device_step`
   advances REAL frames (~16-33ms each), not a fixed dt: a measurement aid, not a deterministic
-  repro. Why these exist and what is still missing: [plans/device-authoring-parity-plan.md](plans/device-authoring-parity-plan.md).
+  repro. Why these exist, and the registration rule that keeps the two surfaces at parity: [mcp-tool-conventions.md](mcp-tool-conventions.md) §9.
 - **Enact (input):** `device_tap` · `device_drag` · `device_pointer` (sustained/HELD
   press, split into down/move/up — the stateful twin of `device_drag`) · `device_dispatch_action` ·
   `device_press_key` · `device_hover` · `device_scroll` · `device_type_text`.
@@ -350,7 +350,7 @@ idiom as backend/Vite/CDP: `9095 + (backend − 5179)` → 9095 / 9096 / 9097 / 
 Two consequences worth carrying. **`status.target.port` is the HOST port**, not the app's — over WiFi
 they are the same number, over adb they are not. And **`adb forward --remove` matches on the host port
 spec and ignores `-s`**: a serial-targeted removal *will* delete another phone's rule (observed —
-`adb -s RFCTB0EV83K forward --remove tcp:9095` stripped `RFCTA14CMRF`'s live tunnel). Both
+`adb -s RFDEADBEEF1 forward --remove tcp:9095` stripped `RFDEADBEEF2`'s live tunnel). Both
 `adbRunner.removeForward` and the CDP tunnel's now verify ownership against `adb forward --list`
 first and skip with a log on a mismatch — the same cross-clone reach the `pkill -f` scoping rule
 exists to prevent, in a different mechanism. One gap remains, documented on `resolveDeviceHostPort`:
@@ -1014,7 +1014,7 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   + projected 2D/3D), and `overlaps:true` for the same-layer overlapping PAIRS — that list is O(n²) (2,625
   pairs, 77k chars ≈ 19k tokens on a 241-entity scene), so it's opt-in. Check alignment/overlap/clipping as data.
   (Providers register in `Scene3D`/`Scene2D`; UI via `[data-entity-id]` DOM. New:
-  `runtime/rendering/screenBounds.ts`, `app/debug/layoutDump.ts`.)
+  `runtime/core/screenBounds.ts`, `app/debug/layoutDump.ts`.)
 - **Diagnose:** `modoki_diagnose` → structured causes (bad refs, NaN/zero-scale transforms, no camera,
   off-screen, console errors) — run FIRST when something renders wrong. (`app/debug/diagnose.ts`.)
   **`consoleErrors` is windowed, and the window is a VERDICT window, not a reporting one (#152).**
@@ -1423,7 +1423,7 @@ larger, riskier pbxproj edit than #112 needed.
 
 ## Agent Dev-Server API (AI-friendly scene editing)
 
-Dev-only endpoints + scene hot-reload so an AI agent (or any tooling) can edit scenes via plain `curl` and verify the result **without driving a browser/screenshot**. All dev-only (the asset-scanner middleware only runs under `vite` dev). Server: `engine/plugins/vite-asset-scanner.ts`. Browser client: `engine/app/debug/agentBridge.ts` (gated on `import.meta.hot`, stripped from prod). Pure logic (shared Node + browser): `packages/modoki/src/runtime/scene/{sceneValidation,sceneMutate,sceneSchema}.ts`; ref predicates in import-free `runtime/loaders/assetRefRules.ts`.
+Dev-only endpoints + scene hot-reload so an AI agent (or any tooling) can edit scenes via plain `curl` and verify the result **without driving a browser/screenshot**. All dev-only (the asset-scanner middleware only runs under `vite` dev). Server: `engine/plugins/vite-asset-scanner.ts`. Browser client: `engine/app/debug/agentBridge.ts` (gated on `import.meta.hot`, stripped from prod). Pure logic (shared Node + browser): `packages/modoki/src/runtime/scene/{sceneValidation,sceneMutate,sceneSchema}.ts`; ref predicates in import-free `runtime/core/assetRefRules.ts`.
 
 - **Scene/prefab hot-reload** — editing a scene file on disk (the `Edit` tool, `git checkout`, `/api/scene-mutate`) auto-reloads the **active** scene in the browser; editor camera + selection are preserved (selection via the existing GUID-keyed `selectionRestore`). A prefab edit reloads the current scene (instances re-expand). The watcher classifies files with the scanner's own `detectType()` — **scene files are positively identified by the `.scene.json` suffix** (or, as a legacy fallback, a plain `.json` under a `scenes/` dir — issue #54). The editor's own Cmd+S saves (`/api/write-file`) are suppressed (1.5s self-write guard) so they don't bounce the live scene; external edits still reload.
 - **`curl localhost:5173/api/scene-state[?trait=Transform][&id=N]`** — returns the **live ECS world** as JSON. **Bare it is an INDEX** (`{scenePath, entityCount, entities:[{id,guid,name,parentId,layer,traits:[names]}], hint}`), capped at a default `limit` of 200 entities — past that it clips and gains `truncated`/`totalCount`. Pass a target (`trait`/`id`/`name`/`where`) or an enricher (`full`/`world`/`bounds`/`contacts`) to get trait **values** (`traits` becomes an object); a targeted query is never capped unless you pass `limit`. Relays to the open tab over the HMR socket (504 if no app is open). Because it reads the live world (not the file), a changed value here proves a hot-reload actually took effect. **Prefer this over screenshots to verify scene edits.**

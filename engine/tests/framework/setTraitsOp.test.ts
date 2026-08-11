@@ -6,7 +6,7 @@
  *  refused rather than first-matched (§3), and the reply carries the readback that verifies it.
  *
  *  Registered in agentBridge (runtime), NOT agentEditorOps — which is what gets it onto the device
- *  and into both eval APIs. See docs/plans/device-authoring-parity-plan.md. */
+ *  and into both eval APIs. See docs/mcp-tool-conventions.md §9. */
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { createTestWorld, type TestWorld, Transform, EntityAttributes } from '@modoki/engine/runtime';

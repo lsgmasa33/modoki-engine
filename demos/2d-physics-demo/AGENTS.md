@@ -16,10 +16,10 @@ source of truth) — `initWorld`/`sceneSetup` are empty and there are no custom 
   Everything else — falling bodies, bouncing, pendulum, spring, sensor detection, player movement —
   is stock engine traits (`RigidBody2D`, `Collider2D`, joints, `CharacterController2D`).
 - **Config knobs** — none. `runtime/config.ts` (`physicsDemoConfig`) just points `scenePath` at
-  `physics-playground.json` with empty `sceneSetup`/`initWorld`; there is no config resource trait.
+  `physics-playground.scene.json` with empty `sceneSetup`/`initWorld`; there is no config resource trait.
 - **Custom traits / UI / services** — none. No `runtime/setup.ts`, `systems.ts`, `traits.ts`, or
   `ui/`. The platformer's Credits dialog is plain ECS UI entities.
-- **Scenes** — the starting scene is **`physics-playground.json`** (floor + walls, three boxes,
+- **Scenes** — the starting scene is **`physics-playground.scene.json`** (floor + walls, three boxes,
   ghost/bouncy balls, pendulum anchor+bob+revolute joint, spring anchor+bob+joint, the Sensor Zone).
   The others demonstrate one feature each: `ccd-tunneling` (CCD on vs off), `collider-mesh`
   (editable polygon ramp + polyline terrain), `compound-colliders` (table/cross/dumbbell),

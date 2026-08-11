@@ -83,6 +83,31 @@ describe('videoSettingsWarnings', () => {
     expect(w[0]).toMatch(/CORS/);
   });
 
+  it('flags archive.org — CORS on the /download/ redirect, none on the node serving the bytes', () => {
+    const w = videoSettingsWarnings(s({ delivery: 'remote', remoteUrl: 'https://archive.org/download/item/x.mp4' }), cache());
+    expect(w[0]).toMatch(/CORS/);
+  });
+
+  it('flags an archive.org STORAGE NODE url — the one a user actually copies', () => {
+    // The trap this whole branch exists for. A user pastes the /download/ link, previews it in a
+    // browser, and the address bar now shows the ia*/dn* node it redirected to — so the node URL
+    // is the likeliest paste, and a `(www\.)?`-anchored pattern was silent on exactly it.
+    for (const url of [
+      'https://ia801409.us.archive.org/0/items/item/x.mp4',
+      'https://dn801201.us.archive.org/0/items/item/x.mp4',
+    ]) {
+      expect(videoSettingsWarnings(s({ delivery: 'remote', remoteUrl: url }), cache())[0], url).toMatch(/CORS/);
+    }
+  });
+
+  it('does not mistake a lookalike host for archive.org', () => {
+    // Subdomain-permitting must not become substring-matching: both of these are attacker- or
+    // typo-shaped hosts that are NOT archive.org, and neither should be warned about.
+    for (const url of ['https://archive.org.evil.test/x.mp4', 'https://notarchive.org/x.mp4']) {
+      expect(videoSettingsWarnings(s({ delivery: 'remote', remoteUrl: url }), cache()), url).toEqual([]);
+    }
+  });
+
   it('accepts a CORS-serving host without comment', () => {
     expect(videoSettingsWarnings(s({ delivery: 'remote', remoteUrl: 'https://cdn.jsdelivr.net/gh/o/r/x.mp4' }), cache())).toEqual([]);
   });

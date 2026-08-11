@@ -376,10 +376,10 @@ describe('CDP forward lifecycle — the tunnel is torn down (#160)', () => {
   it('a candidate that fails its probe does not leave its rule behind', async () => {
     const s = stubDiscovery({ sockets: '0000 0002 0001 @webview_devtools_remote_1234\n', fail: true });
     try {
-      expect(await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFCTB0EV83K' })).toBeNull();
+      expect(await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFDEADBEEF1' })).toBeNull();
       // The bug: `forward` ran, discovery declined the candidate, and the rule survived the call.
       expect(s.forward).toHaveBeenCalledTimes(1);
-      expect(s.remove).toHaveBeenCalledWith(9335, 'RFCTB0EV83K');
+      expect(s.remove).toHaveBeenCalledWith(9335, 'RFDEADBEEF1');
     } finally { s.restore(); resetDeviceCdpSession(); }
   });
 
@@ -389,8 +389,8 @@ describe('CDP forward lifecycle — the tunnel is torn down (#160)', () => {
       version: { 'Android-Package': 'com.other.app' }, list: PAGE,
     });
     try {
-      expect(await discoverDeviceCdpTarget({ localPort: 9335, preferPackage: 'com.modokiengine.sling', serial: 'RFCTB0EV83K' })).toBeNull();
-      expect(s.remove).toHaveBeenCalledWith(9335, 'RFCTB0EV83K');
+      expect(await discoverDeviceCdpTarget({ localPort: 9335, preferPackage: 'com.modokiengine.sling', serial: 'RFDEADBEEF1' })).toBeNull();
+      expect(s.remove).toHaveBeenCalledWith(9335, 'RFDEADBEEF1');
     } finally { s.restore(); resetDeviceCdpSession(); }
   });
 
@@ -400,7 +400,7 @@ describe('CDP forward lifecycle — the tunnel is torn down (#160)', () => {
       version: { 'Android-Package': 'com.modokiengine.sling' }, list: PAGE,
     });
     try {
-      const target = await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFCTB0EV83K' });
+      const target = await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFDEADBEEF1' });
       expect(target?.androidPackage).toBe('com.modokiengine.sling');
       expect(s.remove).not.toHaveBeenCalled();
     } finally { s.restore(); resetDeviceCdpSession(); }
@@ -412,9 +412,9 @@ describe('CDP forward lifecycle — the tunnel is torn down (#160)', () => {
       version: { 'Android-Package': 'com.modokiengine.sling' }, list: PAGE,
     });
     try {
-      await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFCTB0EV83K' });
+      await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFDEADBEEF1' });
       resetDeviceCdpSession();
-      expect(s.remove).toHaveBeenCalledWith(9335, 'RFCTB0EV83K');
+      expect(s.remove).toHaveBeenCalledWith(9335, 'RFDEADBEEF1');
       // Latch cleared: a second teardown must not re-issue a removal for a rule already gone —
       // with a sibling clone's rule potentially now on that port, that is the #158 hazard.
       s.remove.mockClear();
@@ -430,7 +430,7 @@ describe('CDP forward lifecycle — the tunnel is torn down (#160)', () => {
     });
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
-      await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFCTB0EV83K' });
+      await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFDEADBEEF1' });
       s.remove.mockImplementation(() => { throw new Error('adb: device not found'); });
       expect(() => resetDeviceCdpSession()).not.toThrow();
       expect(warn).toHaveBeenCalled();

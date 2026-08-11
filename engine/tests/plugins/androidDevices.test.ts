@@ -30,19 +30,19 @@ describe('parseAdbDevices', () => {
       '* daemon not running; starting now at tcp:5037',
       '* daemon started successfully',
       'List of devices attached',
-      'RFCTB0EV83K   device',
+      'RFDEADBEEF1   device',
     ].join('\n');
-    expect(parseAdbDevices(out)).toEqual([{ serial: 'RFCTB0EV83K', state: 'device' }]);
+    expect(parseAdbDevices(out)).toEqual([{ serial: 'RFDEADBEEF1', state: 'device' }]);
   });
 
   it('keeps unauthorized and offline devices, with their raw state (no model on an unauthorized phone)', () => {
     const out = [
       'List of devices attached',
-      'RFCTA14CMRF        unauthorized usb:2-1.1',
+      'RFDEADBEEF2        unauthorized usb:2-1.1',
       'ABCDEF123          offline',
     ].join('\n');
     expect(parseAdbDevices(out)).toEqual([
-      { serial: 'RFCTA14CMRF', state: 'unauthorized' },
+      { serial: 'RFDEADBEEF2', state: 'unauthorized' },
       { serial: 'ABCDEF123', state: 'offline' },
     ]);
   });
@@ -58,8 +58,8 @@ describe('parseAdbDevices', () => {
   });
 
   it('skips blank and whitespace-only lines', () => {
-    const out = '\n   \nList of devices attached\n\nRFCTB0EV83K   device\n\n   \n';
-    expect(parseAdbDevices(out)).toEqual([{ serial: 'RFCTB0EV83K', state: 'device' }]);
+    const out = '\n   \nList of devices attached\n\nRFDEADBEEF1   device\n\n   \n';
+    expect(parseAdbDevices(out)).toEqual([{ serial: 'RFDEADBEEF1', state: 'device' }]);
   });
 
   it('skips garbage lines that carry no state token', () => {
@@ -80,23 +80,23 @@ describe('isUsable / describeAndroidDevice', () => {
   });
 
   it('describes a usable device by serial + model, with no state suffix', () => {
-    expect(describeAndroidDevice({ serial: 'RFCTB0EV83K', state: 'device', model: 'SC_56C' }))
-      .toBe('RFCTB0EV83K (SC_56C)');
+    expect(describeAndroidDevice({ serial: 'RFDEADBEEF1', state: 'device', model: 'SC_56C' }))
+      .toBe('RFDEADBEEF1 (SC_56C)');
   });
 
   it('describes an unusable device with its state, since that IS the fix', () => {
-    expect(describeAndroidDevice({ serial: 'RFCTA14CMRF', state: 'unauthorized' }))
-      .toBe('RFCTA14CMRF (unauthorized)');
+    expect(describeAndroidDevice({ serial: 'RFDEADBEEF2', state: 'unauthorized' }))
+      .toBe('RFDEADBEEF2 (unauthorized)');
   });
 
   it('describes a bare device with neither model nor a usability suffix as just the serial', () => {
-    expect(describeAndroidDevice({ serial: 'RFCTB0EV83K', state: 'device' })).toBe('RFCTB0EV83K');
+    expect(describeAndroidDevice({ serial: 'RFDEADBEEF1', state: 'device' })).toBe('RFDEADBEEF1');
   });
 });
 
 describe('adbArgs', () => {
   it('prefixes -s <serial> when a serial is known', () => {
-    expect(adbArgs('RFCTB0EV83K', ['shell', 'echo', 'hi'])).toEqual(['-s', 'RFCTB0EV83K', 'shell', 'echo', 'hi']);
+    expect(adbArgs('RFDEADBEEF1', ['shell', 'echo', 'hi'])).toEqual(['-s', 'RFDEADBEEF1', 'shell', 'echo', 'hi']);
   });
 
   it('is the identity when serial is undefined', () => {

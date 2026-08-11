@@ -287,7 +287,7 @@ export { applyOps, type MutateOp, type MutableScene, type MutableEntity, type En
 // Entity-creation spec builders + the anchor-first UI authoring rules. In runtime (not editor)
 // since #166 so the DEVICE create-entity op can build the SAME entities the editor does — the
 // editor half of the package is stripped from a shipped game build. See
-// docs/plans/device-authoring-parity-plan.md.
+// docs/mcp-tool-conventions.md §9.
 export { buildEntityCreateSpecs, type CreateEntitySpec, type CreateSpecs, type TraitSpec, type LightKind } from './scene/entityCreateSpecs';
 export { buildUiCreateSpecs, type UiPreset, type UiTraitSpec } from './ui/uiAuthoring';
 // Hierarchy legality (#166 P7) — the ONE self-parent/cycle rule, shared by the editor's undoable

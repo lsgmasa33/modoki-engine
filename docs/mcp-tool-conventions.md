@@ -1,7 +1,8 @@
 # MCP tool conventions
 
-**Normative.** These are the rules every Modoki agent tool obeys — the `modoki_*` MCP (77 tools),
-the `device_*` MCP (20), and the dev-server `curl` API. One rule per subsection, each with the
+**Normative.** These are the rules every Modoki agent tool obeys — the `modoki_*` MCP, the
+`device_*` MCP (tool catalog for both: [debug-tools-mcp.md](debug-tools-mcp.md)), and the
+dev-server `curl` API. One rule per subsection, each with the
 reason it exists and, where applicable, the finding that produced it
 ([the audit ledger](reviews/2026-07-30-mcp-tool-audit.md)).
 
@@ -251,6 +252,20 @@ all six device Percept tools — the exact class fixed on the editor side and si
   the *previous* device's dimensions and reports "Tapped (x,y) — ok" (S1).
 - **A capability reachable on one surface and not another is a finding**, either closed or recorded
   as deliberate with a reason.
+
+**Where an op is REGISTERED is what keeps parity closed — this is structural, not a habit** (#166).
+The device surface and the editor surface differ in exactly one way: the device has no editor.
+So:
+
+> **An op whose implementation needs only `runtime/` registers in `agentBridge.ts`, where both
+> surfaces get it. Only an op that touches editor chrome, the undo stack, or the project on disk
+> belongs in `agentEditorOps.ts`.**
+
+Both eval APIs are *generated from the op registry*, which is why `device_eval` could never have
+substituted for the missing tools — eval adds composition and zero capability. Registering a
+runtime-only op in the editor file is therefore not a stylistic slip; it is how the write gap
+opened one op at a time, each new capability landing wherever its first caller happened to live.
+An op registered in `agentEditorOps.ts` whose handler reaches nothing from `editor/` is a finding.
 
 ## 10. Every tool declares its contract, and is covered three ways
 

@@ -322,7 +322,7 @@ export interface TapOpts {
  *  page zoom (factor f = 1.2^level) they differ: Chromium maps an injected DIP coordinate
  *  into the page by DIVIDING by f, so to land on the element at zoomed-CSS point P we must
  *  inject P·f. No-op at zoom 0 (f=1). MEASURED + rationale: the coordinate audit in
- *  docs/plans/editor-ui-zoom-plan.md. */
+ *  docs/debug-tools-mcp.md. */
 const toDip = (wc: Electron.WebContents, x: number, y: number): { x: number; y: number } => {
   const f = wc.getZoomFactor();
   return { x: x * f, y: y * f };

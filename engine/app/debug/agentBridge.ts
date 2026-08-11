@@ -6,7 +6,7 @@
  *  its extra ops from `../editor/agentEditorOps.ts`, which runs LATER (a function call from
  *  `setup.ts`, against this module's top-level registrations) and therefore REPLACES a name where
  *  it has a richer, undoable version. Which half an op belongs in is a rule, not a habit — see
- *  docs/plans/device-authoring-parity-plan.md §7.
+ *  docs/mcp-tool-conventions.md §9.
  *
  *  Three transports reach it: Vite's HMR websocket (dev), Electron IPC (packaged editor), and the
  *  TCP device lease (a game on a phone). The ops themselves are transport-agnostic.
@@ -1069,7 +1069,7 @@ registerAgentOp('set-timescale', (params) => {
 // than in agentEditorOps so the DEVICE gets it too, along with both eval APIs (which are generated
 // from this registry). The editor keeps its own richer, UNDOABLE `apply-scene-ops` alongside it;
 // this op is the flat, single-selector twin that works on every surface.
-// See docs/plans/device-authoring-parity-plan.md.
+// See docs/mcp-tool-conventions.md §9.
 /** Guess an asset-def kind from its filename. The suffixes are the project's own convention
  *  (docs/doc-conventions.md), not a heuristic. Exported so the EDITOR op reuses it instead of
  *  keeping a second copy (#166 P7 — the duplication class §9 warns about). */
@@ -1177,7 +1177,7 @@ export function simStepDefaultTimeout(frames: number): number {
 // The consequence is stated rather than hidden: a step here is one REAL frame (~16-33ms, whatever
 // the phone took), not a fixed dt, so this is a measurement aid and NOT a deterministic repro. The
 // deterministic-but-invasive alternative (install the manual clock, suspend the rAF driver) was
-// considered and declined — see docs/plans/device-authoring-parity-plan.md P3.
+// considered and declined — see docs/mcp-tool-conventions.md §9 P3.
 registerAgentOp('sim-step', (params) => {
   const p = (params ?? {}) as { frames?: number; scale?: number; timeoutMs?: number };
   const world = getCurrentWorld();

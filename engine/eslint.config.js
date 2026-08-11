@@ -393,7 +393,7 @@ export default tseslint.config(
     files: ['engine/plugins/**/*.{ts,js,mjs}', 'engine/tools/**/*.{ts,js,mjs}', 'engine/scripts/**/*.{js,mjs}', 'engine/electron/**/*.ts', 'engine/toolchain/**/*.ts', '*.config.{ts,js}'],
     languageOptions: { globals: globals.node },
     rules: {
-      // Toolchain parity gate (docs/plans/editor-toolchain-layer-plan.md): resolve external CLI
+      // Toolchain parity gate (docs/editor-toolchain.md): resolve external CLI
       // tools through engine/toolchain (which honours env overrides like MODOKI_TOKTX / the
       // packaged bundled binary), NEVER a bare tool name — a bare `toktx` is absent in a dmg.
       // Currently enforced for toktx (the migrated tool); extends to npm/npx/gltfpack/adb/… as

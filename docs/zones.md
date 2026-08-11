@@ -77,7 +77,7 @@ For every enter and exit, `zone2DSystem` / `zone3DSystem` fan out to:
   trigger collider fires `OnTriggerExit`.) ⚠️ Note this is the OPPOSITE of `Director`, which FREEZES
   when its entity is deactivated (see [timeline.md](./timeline.md)) — a playhead has no ledger to
   keep balanced, so resuming where it stopped is the useful behaviour there. Both use the same core
-  predicate, `isEntityActiveInHierarchy` (`runtime/ecs/entityIndex.ts`); what differs is what the
+  predicate, `isEntityActiveInHierarchy` (`runtime/core/ecs/entityIndex.ts`); what differs is what the
   subsystem does about it.
 - **Self-skip.** A zone that is itself tagged `ZoneOccupant` never triggers on itself.
 - **Channel isolation.** 2D and 3D occupancy state is kept per-channel, so a scene running both
@@ -98,7 +98,7 @@ For every enter and exit, `zone2DSystem` / `zone3DSystem` fan out to:
 - Shared core (routing + occupancy diff + despawn synthesis + world-pose read):
   `runtime/zones/zoneTriggerCore.ts`
 - Dimension systems: `runtime/zones/{zone3DSystem,zone2DSystem}.ts` (containment math per shape)
-- Event buses: `runtime/managers/{zoneEventBus,Zone3DEvents,Zone2DEvents}.ts`
+- Event buses: `runtime/zones/{zoneEventBus,Zone3DEvents,Zone2DEvents}.ts`
 - Wiring: systems in `engine/app/ecs/pipeline.ts`, managers in `engine/app/ecs/register.ts`, editor
   metadata in `engine/app/ecs/registerTraits.ts`
 - Editor wireframe: `Zone3D` in `editor/panels/SceneView.tsx` (3D mesh gizmo); `Zone2D` in the same

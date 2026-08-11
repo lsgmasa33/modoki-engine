@@ -245,14 +245,14 @@ describe('describeConflict', () => {
 
 describe('round-trip through the real file', () => {
   it('claim, then a fresh listClaims read parses the documented on-disk shape', () => {
-    const r = claimDevice({ deviceId: 'adb:RFCTB0EV83K', clone: '/Users/x/Projects/modoki', branch: 'main', guid: 'g-1', label: 'SC_56C', purpose: 'device lease' });
+    const r = claimDevice({ deviceId: 'adb:RFDEADBEEF1', clone: '/Users/x/Projects/modoki', branch: 'main', guid: 'g-1', label: 'SC_56C', purpose: 'device lease' });
     expect(r.ok).toBe(true);
 
     const onDisk = JSON.parse(fs.readFileSync(claimsFilePath(), 'utf8')) as { claims: DeviceClaim[] };
     expect(onDisk.claims).toHaveLength(1);
     const [claim] = onDisk.claims;
     expect(claim).toMatchObject({
-      deviceId: 'adb:RFCTB0EV83K',
+      deviceId: 'adb:RFDEADBEEF1',
       clone: '/Users/x/Projects/modoki',
       branch: 'main',
       pid: process.pid,

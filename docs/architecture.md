@@ -115,7 +115,7 @@ writes:
   update-depth limit; the rAF defer collapses it to a single post-load render.
 
 Every entity carries the **`EntityAttributes`** trait
-(`runtime/traits/EntityAttributes.ts`) for metadata: `name`, `isActive`, `sortOrder`,
+(`runtime/core/traits/EntityAttributes.ts`) for metadata: `name`, `isActive`, `sortOrder`,
 `parentId` (0 = root), `layer`, and `guid`. `parentId` builds the scene hierarchy;
 `guid` is the entity's stable UUID that survives scene swaps and cross-prefab
 references.
@@ -432,8 +432,8 @@ For how scenes are loaded into a world and how prefabs instantiate, see
 ## Editor Backend (Vite / Electron parity)
 
 The editor's `/api/*` command endpoints are served by a **transport-agnostic router**
-(`engine/plugins/backend/editorBackendRouter.ts`) — ~59 pure `(ctx, params) =>
-BackendResult` handlers (over ~57 `/api` paths) over a small filesystem/exec
+(`engine/plugins/backend/editorBackendRouter.ts`) — pure `(ctx, params) =>
+BackendResult` handlers over `/api` paths, over a small filesystem/exec
 `BackendContext` interface. The
 same router is mounted by **both** hosts, so daily Electron use exercises the exact
 production backend path the DMG ships, not a Vite-only surrogate:

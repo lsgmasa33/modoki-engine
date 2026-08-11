@@ -748,7 +748,7 @@ export function registerTools(server: McpServer) {
   // Verify game state by DATA, not pixels — critical on device, where Claude is weak at pixels AND
   // Android WebGPU screenshots come back black (only the adb framebuffer has the scene). These proxy
   // the SAME summary-first, GUID-addressed, float-rounded ops the editor MCP uses (agentBridge), now
-  // reachable on the device path. See docs/plans/device-percept-enact-plan.md.
+  // reachable on the device path. See docs/debug-tools-mcp.md.
 
   /** Run a structured op over the lease and shape its reply (compact JSON, or `isError` for a device
    *  `Error:` reply). Shared by the Percept tools. */

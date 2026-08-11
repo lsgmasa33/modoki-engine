@@ -146,10 +146,9 @@ where meshes are evicted-but-not-yet-rebuilt — it self-heals on the next frame
 bake is on disk regardless, so a later scene load still picks it up.
 
 Both the dev server (`vite-asset-scanner.ts` `configResolved`) and the packaged
-editor (`engine/electron/main.ts` at startup) register the handlers so
-`/api/reimport` has them in either host. The dev server registers `texture`,
-`model`, `atlas`, `audio`, `font`, `environment`; the packaged editor registers
-the same set except `atlas`. `getReimportTypes()` exposes the
+editor (`engine/electron/main.ts` at startup) register the same seven handlers so
+`/api/reimport` has them in either host: `texture`, `model`, `atlas`, `audio`,
+`video`, `font`, `environment`. `getReimportTypes()` exposes the
 set over `GET /api/reimport-types`, so the editor derives its "what can be
 re-imported" menu from the live server registry instead of a hardcoded client
 constant — a newly-registered handler surfaces without a client edit.
@@ -318,7 +317,7 @@ The 2D path decodes `.ktx2` sprites/atlas-pages through PixiJS's own KTX2 parser
 not `KTX2Loader` — so 2D has **zero** dependency on `detectSupport`/GPU caps:
 `selectVariant(settings, '2d', caps)` ignores the `caps` argument entirely (the
 ASTC capability only affects the `'3d'` branch), and `ensureKtx2Caps()` above is
-never on a 2D/UI-only project's load path. `runtime/rendering/pixiKtxTranscoder.ts`
+never on a 2D/UI-only project's load path. `runtime/loaders/pixiKtxTranscoder.ts`
 `ensurePixiKtxTranscoder()` (idempotent, called during 2D startup by
 `Scene2D.tsx` and `pixiParticleBackend.ts`) does two things PixiJS v8 does **not**
 do on its own:
@@ -367,7 +366,7 @@ three.js Basis transcoder is provided at `/basis/` for the 3D KTX2 path.
 - `plugins/atlas-cache.ts` — atlas content hash + synthetic page url path.
 - `runtime/loaders/spriteAtlas.ts` — pure MaxRects packer + atlas schema types.
 - `scripts/stage-toktx.cjs` — electron-builder `beforePack`: bundles `toktx` + `libktx`.
-- `runtime/rendering/pixiKtxTranscoder.ts` — registers PixiJS `loadKTX2` +
+- `runtime/loaders/pixiKtxTranscoder.ts` — registers PixiJS `loadKTX2` +
   locally-served libktx (2D KTX2 sprite decode).
 - `vite-asset-scanner.ts` — variant/transcoder serving + build-time generation.
   (The `/api/reimport` + `/api/reimport-types` endpoints live in

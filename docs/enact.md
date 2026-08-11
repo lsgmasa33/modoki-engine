@@ -161,10 +161,11 @@ Three compounding papercuts motivated the fix, all now addressed by the pieces b
 `entity`, above) alongside `{x,y}`, resolved **server-side** so there's no race between reading a
 position and acting on it. Precedence is `entity` → `selector` → `{x,y}`.
 
-- `resolveEndpoint` lives in `engine/app/debug/domResolve.ts` (extracted from the DnD path in
+- `resolveDomPointReport` lives in `engine/app/debug/domResolve.ts` (extracted from the DnD path in
   `engine/app/debug/domDnd.ts`).
-- A renderer op `resolve-dom-point` performs the resolution; `engine/electron/main.ts` resolves
-  before calling `tap()`/`drag()`, mirroring the `/api/input/tap-handle` route.
+- A renderer op `resolve-dom-point` performs the resolution; the `resolvePoint` seam in
+  `engine/electron/inputRoutes.ts` resolves before calling `tap()`/`drag()`, mirroring the
+  `/api/input/tap-handle` route.
 - The response **reports the element actually hit**:
   `{ok, point, matched:'span.kebab', hitTarget:'div.header'}`. When `matched !== hitTarget`,
   something is covering the target — this diagnoses the occlusion class of bug without a

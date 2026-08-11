@@ -1,7 +1,7 @@
 /**
  * @modoki/toolchain — the single place the editor RESOLVES an external CLI tool.
  *
- * Phase 2 of the editor-shipping plan (docs/plans/editor-toolchain-layer-plan.md). Today "how do I
+ * Phase 2 of the editor-shipping plan (docs/editor-toolchain.md). Today "how do I
  * find/run tool X" is answered inline at ~30 spawn sites, each with its own strategy — including a
  * real bug: rigged-model-optimize.ts spawned bare `toktx`, ignoring the bundled MODOKI_TOKTX path,
  * so KTX2 compression of rigged GLBs silently failed in the packaged editor. This module collapses

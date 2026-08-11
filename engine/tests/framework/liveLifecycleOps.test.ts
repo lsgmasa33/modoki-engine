@@ -1,5 +1,5 @@
 /** create-entity / duplicate-entity / delete-entities — the RUNTIME (undo-free) twins registered in
- *  agentBridge so the DEVICE has them (#166 P2, docs/plans/device-authoring-parity-plan.md).
+ *  agentBridge so the DEVICE has them (#166 P2, docs/mcp-tool-conventions.md §9).
  *
  *  In an editor session these op names are replaced at startup by the editor's undoable versions;
  *  what runs here is what a phone runs. The rules pinned below are the ones whose absence would be

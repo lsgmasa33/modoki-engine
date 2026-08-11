@@ -2,7 +2,7 @@
  *  - Unit: buildPreviewMaterial produces a faithful THREE material from .mat.json data.
  *  - Integration: Preview3DShell drives populate/frame/wireframe/rebuild/dispose and
  *    degrades gracefully when WebGL is unavailable; MaterialPreview builds a sphere.
- *  createPreviewScene is mocked (no WebGL in jsdom). See docs/asset-inspector-plan.md. */
+ *  createPreviewScene is mocked (no WebGL in jsdom). See docs/plans/asset-inspector-plan.md. */
 
 import { describe, it, expect, afterEach, beforeEach, vi, type Mock } from 'vitest';
 import { render, cleanup, fireEvent, waitFor } from '@testing-library/react';

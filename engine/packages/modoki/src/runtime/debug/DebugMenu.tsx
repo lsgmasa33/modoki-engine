@@ -15,7 +15,7 @@
  *  GameView — absolute within the device preview so it doesn't cover editor chrome).
  *
  *  Lives in `runtime/**`: NO wall-clock / Math.random. The 3-finger gesture uses a
- *  touch-count latch. See docs/debug-menu-plan.md. */
+ *  touch-count latch. See docs/debug-menu.md. */
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react';
 import {

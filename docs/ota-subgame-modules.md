@@ -156,7 +156,7 @@ unhandled) → load `subgame.js` via `<script>` tag → engine-API check (§4, a
 
 ## 4. Engine-API version contract
 
-`ENGINE_API_VERSION` (`engine/packages/modoki/src/runtime/version.ts`) is the single source of
+`ENGINE_API_VERSION` (`engine/packages/modoki/src/runtime/core/version.ts`) is the single source of
 truth; `project-config.ts`'s `ota.engineApi` default is pinned to it by a vitest.
 
 A sub-game declares its expected version **twice, both build-stamped from
@@ -187,7 +187,7 @@ sub-games keep running.
   `external` being a predicate over exact keys **and** prefixes.
 - *Missing entry at eval* → `undefined.Vector3`, a loud crash. Guarded by `ensure(sharedDeps)`
   refusing to evaluate when a key is absent.
-- **Cross-cutting, highest-value guard:** `runtime/instanceGuard.ts` —
+- **Cross-cutting, highest-value guard:** `runtime/core/instanceGuard.ts` —
   `globalThis.__MODOKI_RUNTIME_INSTANCES__`, incremented on first evaluation of
   `@modoki/engine/runtime`, logs loudly (never throws) if a second copy ever evaluates. Catches
   every duplication route at once — botched externals, a stale registry key, a future Vite

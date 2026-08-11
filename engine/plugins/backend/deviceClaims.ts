@@ -41,7 +41,7 @@
  *     dead one for an extra hour merely produces a refusal that names a pid the human can check.
  *
  * A refusal always NAMES the holder (`docs/mcp-tool-conventions.md` §5) — "clone work-ai has held
- * RFCTA14CMRF since 14:02 (pid 8123)" is actionable; "device busy" is not.
+ * RFDEADBEEF2 since 14:02 (pid 8123)" is actionable; "device busy" is not.
  *
  * ── KNOWN GAP: one phone can hold two claim ids ──
  * A device is claimed under the id it was REACHED by, and an iPhone can be reached two ways: a WiFi
