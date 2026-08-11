@@ -39,7 +39,7 @@ import { applyTextAnimation, isTextAnimating, isColorEffect, type TextAnimParams
 import { getTime } from '../core/getTime';
 import { ensureFontLoaded, getLoadedFont } from '../loaders/fontAtlasLoader';
 import { getFontTexturePixi } from './text/fontTexturePixi';
-import { loadPixiTexture } from './pixiTextureLoad';
+import { isPixiTextureLive, loadPixiTexture } from './pixiTextureLoad';
 import { makeMtsdfPixiShader, updateMtsdfPixiStyle } from './text/mtsdfPixiShader';
 import { layoutText } from './text/layoutText';
 import { buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage } from './text/textMesh';
@@ -124,14 +124,39 @@ interface Slot { kind: DisplayKind; obj: Graphics | Sprite | Mesh | Container; s
 // SHARED across all Scene2DRenderer instances: two viewports displaying the same URL
 // each hold a ref, so a texture unloads only when the LAST viewport releases it (F3).
 const spriteTextureRefs = new Map<string, number>();
+
+// ⚠️ A refcount reaching 0 does NOT mean the texture is finished with — it means nothing holds it
+// AT THIS INSTANT. A renderer that rebuilds a subtree by despawning and respawning it (Court's
+// board overlay does exactly this on every interaction) legitimately drops a url to 0 and back to
+// 1 inside ONE synchronous frame, and unloading on the spot destroyed the source out from under
+// the sprite about to re-retain it: `Assets.unload` removes the cache entry asynchronously but
+// destroys the source eagerly, so the respawned sprite found `cache.has(url) === true`, bound a
+// sourceless texture and drew NOTHING, permanently. So the unload is DEFERRED by a macrotask and
+// CANCELLED if anything re-retains in the meantime — a same-frame rebuild never reaches it, while
+// a genuine last release still frees the VRAM one tick later.
+const pendingTextureUnloads = new Map<string, ReturnType<typeof setTimeout>>();
+
+function unloadSpriteTextureNow(url: string) {
+  if (Assets.cache.has(url)) Assets.unload(url).catch(() => { /* ignore */ });
+}
+
 function retainSpriteTexture(url: string) {
+  const pending = pendingTextureUnloads.get(url);
+  if (pending !== undefined) { clearTimeout(pending); pendingTextureUnloads.delete(url); }
   spriteTextureRefs.set(url, (spriteTextureRefs.get(url) ?? 0) + 1);
 }
 function releaseSpriteTexture(url: string) {
   const n = (spriteTextureRefs.get(url) ?? 0) - 1;
   if (n <= 0) {
     spriteTextureRefs.delete(url);
-    if (Assets.cache.has(url)) Assets.unload(url).catch(() => { /* ignore */ });
+    if (pendingTextureUnloads.has(url)) return;
+    const handle = setTimeout(() => {
+      pendingTextureUnloads.delete(url);
+      // Re-retained while we waited (the same-frame rebuild case) — the hold is live again.
+      if ((spriteTextureRefs.get(url) ?? 0) > 0) return;
+      unloadSpriteTextureNow(url);
+    }, 0);
+    pendingTextureUnloads.set(url, handle);
   } else {
     spriteTextureRefs.set(url, n);
   }
@@ -144,10 +169,14 @@ function releaseSpriteTexture(url: string) {
  *  texture), so this is a defensive net that also enforces the "no texture accounting
  *  survives a scene" invariant (F3) — without it any drift would pin VRAM across scenes. */
 function unloadAllSpriteTextures() {
-  for (const url of spriteTextureRefs.keys()) {
-    if (Assets.cache.has(url)) Assets.unload(url).catch(() => { /* ignore */ });
-  }
+  for (const url of spriteTextureRefs.keys()) unloadSpriteTextureNow(url);
   spriteTextureRefs.clear();
+  // Deferred unloads must be SETTLED here, not left to fire after the world is gone: their
+  // timers close over a url whose accounting this call is erasing, so leaving one armed would
+  // let it run against the NEXT scene's cache. Flushing them (rather than only cancelling)
+  // keeps the "no texture accounting survives a scene" invariant (F3) exact.
+  for (const [url, handle] of pendingTextureUnloads) { clearTimeout(handle); unloadSpriteTextureNow(url); }
+  pendingTextureUnloads.clear();
 }
 
 // ── Trait metadata cache (global — the trait registry is process-wide) ──
@@ -535,9 +564,17 @@ export class Scene2DRenderer {
     container.addChild(sp);
     const url = resolved.url;
     retainSpriteTexture(url);
-    if (Assets.cache.has(url)) {
-      sp.texture = frameTexture(Assets.get(url) as Texture, resolved);
+    // ⚠️ Presence in the cache is NOT the same as being usable, and this used to test only
+    // `has(url)`. An entry whose source was destroyed by an in-flight `Assets.unload` is still
+    // PRESENT — binding it yields a sprite that draws nothing, forever, because this branch
+    // never kicks a load. `resolveMaterialTexture` already validates `source` for the same
+    // reason; the sprite path did not, which is the whole of Court's invisible pen marks.
+    // Evict the dead entry first, or `Assets.load` would hand back the same corpse.
+    const cachedBase = Assets.cache.has(url) ? (Assets.get(url) as Texture | undefined) : undefined;
+    if (cachedBase?.source) {
+      sp.texture = frameTexture(cachedBase, resolved);
     } else {
+      if (cachedBase) Assets.cache.remove(url);
       loadPixiTexture(url).then((base: Texture) => {
         // F12 — the `sp.destroyed` check is the LOAD-BEARING guard against a stale async
         // load clobbering the wrong texture. A sprite is NEVER reused across URL changes:
@@ -598,8 +635,12 @@ export class Scene2DRenderer {
         const framed = !wholeOnly && resolved.frame != null;
         return { tex: framed ? frameTexture(base, resolved) : base, url, hasFrame: framed };
       }
+      // ⚠️ Sourceless-but-cached is TERMINAL unless the entry is evicted. `markDirty` alone only
+      // re-runs this same branch, which re-reads the same dead entry — a livelock that renders
+      // WHITE forever. Drop it so the load path below can genuinely refetch. (Mid-decode entries
+      // are not reachable here: Pixi publishes to the cache on resolve, not before.)
+      Assets.cache.remove(url);
       this.markDirty();
-      return { tex: Texture.WHITE, url: '', hasFrame: false };
     }
     if (!this._materialTexLoading.has(url)) {
       this._materialTexLoading.add(url);
@@ -1122,7 +1163,12 @@ export class Scene2DRenderer {
         let allLoaded = true;
         for (const part of buf.parts) {
           if (!part.url) { allLoaded = false; continue; }
-          if (!Assets.cache.has(part.url)) {
+          // ⚠️ `isPixiTextureLive`, NOT `Assets.cache.has` — a present-but-SOURCELESS entry must
+          // count as "not loaded" or this loop skips the shim and binds the corpse into a `new Mesh`
+          // below. `12fea928` named this exact site and judged it covered by the shim's eviction;
+          // it was not, because `has()` short-circuits before the shim is ever called. See
+          // `isPixiTextureLive`'s banner.
+          if (!isPixiTextureLive(part.url)) {
             allLoaded = false;
             loadPixiTexture(part.url).then(() => this.markDirty()).catch((e: unknown) => {
               console.warn(`[Scene2D] Skinned mesh texture load failed: ${part.url}`, e);

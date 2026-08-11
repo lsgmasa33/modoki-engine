@@ -74,7 +74,11 @@ export type RampStatus =
   /** Ran out of frames before escaping or reaching the ceiling. Still yields a LOWER BOUND —
    *  whatever it did render, it rendered — so this is a weaker answer, not a missing one. */
   | 'budget'
-  /** A single frame exceeded {@link ABORT_FRAME_MS}. Stop immediately — see the watchdog note. */
+  /** A single frame exceeded `ABORT_FRAME_MS`. Stop immediately — see the watchdog note.
+   *  (Plain code span, not `{@link}`: the constant is module-local to `rampProbe.ts` and not
+   *  re-exported from the package index, so TypeDoc cannot resolve it from this PUBLIC type and
+   *  emitted an unresolved-link warning. Widening the API surface for a doc link is the wrong
+   *  trade.) */
   | 'aborted';
 
 /** Frame time, as a multiple of the display interval, at which a reading stops being dominated
