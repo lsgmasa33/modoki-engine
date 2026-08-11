@@ -211,31 +211,51 @@ it through `registerPlugin` by name with a type-only import, so nothing pulls it
 
 ## 7. Platform notes
 
-### iOS — StoreKit Testing is the day-to-day loop
+### iOS — the real App Store sandbox is the loop
 
-The fixture runs against a **local StoreKit configuration** (`Modoki.storekit` + a shared
-`.xcscheme`), needing **no sandbox tester, no App Store Connect product record and no Paid
-Applications Agreement**. On a device from iOS 15.2. There is no Apple ID prompt at all — "it never
-asked me to log in" is the feature, not a symptom.
+The fixture talks to the **real sandbox**: both products load and purchase there. The local
+StoreKit catalog (`Modoki.storekit`) was **removed on 2026-08-12** once the sandbox worked — a local
+catalog answers *instead* of Apple, so keeping one around is a way to accidentally test nothing.
+`games/iap-test/tests/storekitScheme.test.ts` keeps it gone.
 
-- **Xcode's Run *syncs* the config** into a persistent per-bundle-id container
-  (`DVTDevice.handleStoreKitConfigurationSyncForBundleID`). After one Run, **any** later launch path
-  inherits it — a Modoki build, `devicectl`, or tapping the icon. It is one-time setup per device,
-  repeated only when the `.storekit` changes, **not** a per-launch requirement.
-- `xcodebuild` alone never performs that sync. A device that has never had an Xcode Run for the
-  bundle id gets zero products. **If IAP suddenly reads `0/2` on a device that worked yesterday, try
-  one Xcode Run before auditing App Store Connect.** Xcode is AppleScript-scriptable
-  (`tell application "Xcode" to run`), so even that needs no GUI.
-- **Every failure here is silent.** An unresolvable config path shows "None" in Edit Scheme → Run →
-  Options, logs nothing, and returns an empty product list — indistinguishable from an inactive
-  agreement or a product stuck in Missing Metadata. `games/iap-test/tests/storekitScheme.test.ts`
-  guards what is statically checkable.
+**When `Product.products(for:)` returns an empty array, it is almost certainly incomplete metadata
+on the product's own page.** It fails with no error and no reason, which invites elaborate
+theories; two were recorded here before the right one, and both were wrong:
+
+- *"the account state is broken"* — the Paid Applications Agreement was Active with banking and W-9
+  complete the whole time.
+- *"nothing has been submitted"* — reasoned from the subscription group's banner (*"Your first
+  subscription group must be submitted with a new app version"*) plus forum threads reporting empty
+  arrays on never-released apps. Disproved by observation: the subscription started serving with
+  nothing submitted and nothing reviewed. [TN3186][tn3186] is right as written — sandbox
+  availability does not require submission, and that banner governs **review**.
+
+What actually fixed it, twice: **adding the localization text.** The subscription group's
+Localization was empty, then `com.modoki.coins100`'s was; each product resolved as soon as it had
+one. A sandbox tester is irrelevant to this symptom — product *fetch* touches no account, so the
+Users and Access role requirement bites only at purchase time.
+
+The `store: N/2` line the fixture puts on screen is what makes this tractable: **`0/2` is
+app-level** (agreement, bundle id, signing team), **`k/2` is one product's own state**. Read the
+count before opening App Store Connect.
+
+⚠️ **A device can keep answering from a StoreKit catalog that is no longer in the repo.** An Xcode
+**Run** *syncs* a configuration into a persistent per-bundle-id container
+(`DVTDevice.handleStoreKitConfigurationSyncForBundleID`), and every later launch path inherits it —
+a Modoki build, `devicectl`, or tapping the icon. `xcodebuild` alone never syncs, and deleting the
+app is what clears it. So **delete the app from the device before trusting any product count**; a
+reading taken on a phone that once ran a local catalog is not evidence about App Store Connect.
+This is also why the repo once had a catalog attached while the phone was on the real store.
+
 - **Xcode rewrites `.xcscheme` through its own serializer and deletes comments.** A scheme cannot
   document itself; that is why this knowledge is here.
-- **Xcode → Debug → StoreKit → Manage Transactions** is the instrument: it simulates interrupted
-  purchases, Ask-to-Buy, refunds and renewals, and it shows whether a transaction still exists. A
-  redeploy can clear the local transaction store, which makes correct code look broken — check that
-  window before concluding a recovery failure.
+- **What the removal costs:** Xcode → Debug → StoreKit → Manage Transactions only drives a local
+  catalog. It simulated interrupted purchases, Ask-to-Buy, refunds and renewals, and it is how the
+  crash matrix was performed by hand on iOS. The matrix is verified, but re-running it now means the
+  sandbox's own tools (Settings → Developer, accelerated renewals) plus the fixture's built-in
+  interruption harness.
+
+[tn3186]: https://developer.apple.com/documentation/technotes/tn3186-troubleshooting-in-app-purchases-availability-in-the-sandbox
 
 ### Android — every device iteration costs a Play upload
 
