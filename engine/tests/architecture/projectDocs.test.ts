@@ -21,29 +21,36 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 const repoRoot = path.resolve(__dirname, '../../..');
 const TEMPLATE = 'engine/templates/starter/CLAUDE.md';
 
-const SKIP_DIRS = new Set([
-  'node_modules', '.git', 'dist', 'ios', 'android', 'Pods', 'ads', '.cache', 'build', '.modoki',
-]);
-
-function walk(dir: string, out: string[] = [], depth = 0): string[] {
-  if (depth > 10) return out;
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return out;
-  }
-  for (const e of entries) {
-    if (SKIP_DIRS.has(e.name)) continue;
-    const p = path.join(dir, e.name);
-    if (e.isDirectory()) walk(p, out, depth + 1);
-    else out.push(p);
-  }
-  return out;
+/** Files under `prefix`, enumerated through GIT rather than by walking the filesystem.
+ *
+ *  Mirrors `docCitations.test.ts`'s `repoFiles()` and exists for the same reason (ba6aae93): a
+ *  hand-maintained skip list cannot win against build output, because `release/` was only the
+ *  instance that bit — any gitignored directory holding a copy of the tree does the same, and the
+ *  failure is MACHINE-DEPENDENT, so it reads as "the merge broke it".
+ *
+ *  Here the consequence is worse than a false alarm and points the other way. This list builds the
+ *  set of filenames considered PRESENT in a project, so a stray gitignored copy does not add a
+ *  false offender — it makes a real one DISAPPEAR. A `main.json` inside some project's ignored
+ *  build output would vouch for a doc citing `main.json`, and the guard would report green on
+ *  precisely the citation it exists to catch, on whichever machine happened to have built.
+ *
+ *  `--cached --others --exclude-standard` = tracked plus new-untracked, minus everything
+ *  `.gitignore` covers. The `--others` half keeps a just-added, not-yet-staged asset counted as
+ *  present, so adding a scene and documenting it in one go does not trip the rule. */
+function gitFilesUnder(prefix: string): string[] {
+  const out = execFileSync(
+    'git',
+    ['ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', prefix],
+    { cwd: repoRoot, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
+  )
+    .split('\0')
+    .filter(Boolean);
+  return out.map((p) => path.join(repoRoot, p));
 }
 
 /** Every `games/<id>` / `demos/<id>` that carries its own CLAUDE.md. */
@@ -107,7 +114,14 @@ describe('project CLAUDE.md cites asset filenames that exist (#195)', () => {
       const exempt = new Set(
         ABSENT_ON_PURPOSE.filter((e) => e.project === project).map((e) => e.file),
       );
-      const basenames = walk(path.join(repoRoot, project)).map((f) => path.basename(f));
+      const basenames = gitFilesUnder(project).map((f) => path.basename(f));
+      // Vacuous-pass floor, per the same reasoning ba6aae93 added to docCitations: this rule
+      // reports an offender only when a cited name is MISSING from `basenames`, so an enumeration
+      // that returned nothing would make every citation look absent — or, with the exemptions in
+      // front of it, could equally make the whole loop no-op. Either way a broken `git ls-files`
+      // (wrong cwd, a flag that stops matching) must fail loudly rather than report green. Every
+      // project has at least a CLAUDE.md and a project.config.json.
+      expect(basenames.length, `${project}: git enumeration returned no files`).toBeGreaterThan(1);
       const present = new Set(basenames);
       // A filename may contain a SPACE (`2D Animation.scene.json`), which the token regex cannot
       // span without swallowing prose. Handle it by BLANKING every real space-containing name out
@@ -154,7 +168,7 @@ describe('project CLAUDE.md cites asset filenames that exist (#195)', () => {
 
   it('every ABSENT_ON_PURPOSE entry names a file that is still absent', () => {
     const stale = ABSENT_ON_PURPOSE.filter((e) => {
-      const present = new Set(walk(path.join(repoRoot, e.project)).map((f) => path.basename(f)));
+      const present = new Set(gitFilesUnder(e.project).map((f) => path.basename(f)));
       return present.has(e.file);
     }).map((e) => `${e.project}: ${e.file} — now exists; drop this entry (${e.reason})`);
     expect(stale, 'ABSENT_ON_PURPOSE has entries that are no longer needed').toEqual([]);
