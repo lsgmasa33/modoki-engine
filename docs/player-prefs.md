@@ -48,6 +48,7 @@ PlayerPrefs.delete(key): void                    // also: set(key, undefined)
 PlayerPrefs.keys(): string[]
 PlayerPrefs.clear(): void                         // empties THIS game's namespace
 PlayerPrefs.isHydrated(): boolean                 // true once init() has hydrated the cache
+PlayerPrefs.hasPendingWrite(key): boolean         // a write the backend has NOT accepted (see Gotchas)
 await PlayerPrefs.flush()                         // resolve once pending writes are durable
 ```
 
@@ -93,6 +94,18 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   written. Call `flush()` at a save point you care about. On Android, `SharedPreferences.apply()`
   is async-to-disk, so even an awaited `set()`/`flush()` is not a hard fsync — durability leans
   on the OS lifecycle (that's what flush-on-background is for).
+- ⚠️ **`flush()` resolving does NOT mean the write landed, and reading it back cannot tell you.**
+  A rejected `backend.set()` (quota exceeded, a native I/O error) is caught in `drain()`, re-queued
+  into `dirty` and warned about — and `writeChain` still settles *fulfilled* so later writes are not
+  poisoned. Meanwhile `cache` keeps the value, so `get()` returns it happily. Every ordinary signal
+  says success. **`await flush()` then `hasPendingWrite(key)` is the only way to learn otherwise.**
+
+  This exists because the IAP ledger needs it (see [iap.md](./iap.md)): its durability check read
+  the value back and therefore could not fail, so it confirmed a grant that never reached the disk
+  and the purchase state machine then took an irreversible step on it. Any consumer gating something
+  irreversible on "is it saved?" must use this; a read-back is self-confirming. Still not an fsync —
+  `false` means the platform accepted it, not that it is on the platter.
+
 - **No cross-key transaction.** Two values that must stay consistent belong in **one** key.
 - **JSON only.** `undefined` deletes the key. A top-level function/symbol or a cyclic value is
   skipped with a warning (not stored). Nested functions are dropped by `JSON.stringify`;

@@ -124,6 +124,17 @@ engine/tools/game-debug-mcp/dist/
 # NEVER commit — anyone with it can sign updates the app will trust and run.
 /build/ota-keys/
 
+# Android upload/signing keys and their passwords (#196). NEVER commit — an upload key in a public
+# snapshot is a signing-identity compromise, and unlike a leaked id it cannot be rotated by editing
+# a file (Google's key-reset process, or a new app listing).
+# Repo-wide rather than per-game on purpose: the Android .gitignore TEMPLATE ships these commented
+# out, so every future `cap add android` re-opens the hole unless something above it is closed.
+# Real keys belong outside the repo entirely (~/.modoki/keystores/).
+*.jks
+*.keystore
+games/*/android/keystore.properties
+demos/*/android/keystore.properties
+
 # Per-machine settings (device UDIDs, local SDK paths) — never committed. Lives
 # next to each game's committed project.config.json. Commit
 # project.user.example.json instead.

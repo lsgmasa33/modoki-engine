@@ -238,6 +238,31 @@ function isHydrated(): boolean {
   return hydrated;
 }
 
+/**
+ * Does this key still have a write the backend has NOT accepted?
+ *
+ * ⚠️ **Read this together with `flush()`, because `flush()` resolving does not mean the write
+ * landed.** A rejected `backend.set()` (quota exceeded, a native I/O error) is caught in `drain()`,
+ * re-queued into `dirty`, and warned about — and `writeChain` still settles *fulfilled* so later
+ * writes are not poisoned. Meanwhile `cache` keeps the value, so `get()` happily returns it. Every
+ * signal a caller normally has says the write succeeded.
+ *
+ * So: `await flush()` then `hasPendingWrite(key)` is the only way to learn that it did not.
+ *
+ * This exists for the purchase ledger (#196), where the distinction is money. Its durability check
+ * read the value back through `get()` and therefore could not fail: it was re-reading the
+ * optimistic cache, so it confirmed a grant that had never reached the disk, and the state machine
+ * then FINISHED the transaction — telling the store to stop re-delivering a purchase whose record
+ * was about to vanish on the next launch. Nothing else in the engine cares this much; nothing else
+ * has an irreversible step gated on the answer.
+ *
+ * NOTE this still is not an fsync — on Android `SharedPreferences.apply()` is async-to-disk, so
+ * `false` means "the platform accepted it", not "it is on the platter". See docs/player-prefs.md.
+ */
+function hasPendingWrite(key: string): boolean {
+  return dirty.has(key);
+}
+
 export const PlayerPrefs = {
   init,
   get,
@@ -248,6 +273,7 @@ export const PlayerPrefs = {
   clear,
   flush,
   isHydrated,
+  hasPendingWrite,
 } as const;
 
 // ── Test seam ─────────────────────────────────────────────────────

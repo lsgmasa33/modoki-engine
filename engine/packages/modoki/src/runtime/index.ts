@@ -35,6 +35,22 @@ export {
   PlayerPrefs, InMemoryBackend, LocalStorageBackend, PreferencesBackend, selectDefaultBackend,
   type JsonValue, type PlayerPrefsInitOptions, type PrefsBackend,
 } from './storage';
+export { createPrefsDocStore, type PrefsDocStore } from './storage/prefsDocStore';
+// In-app purchases (#196). `reconcile()` MUST run once per launch before the player can buy
+// anything — it is the recovery pass for a purchase interrupted by a crash or force-close.
+// Generic verbs are prefixed on the way out — the barrel is one flat namespace shared with every
+// other subsystem, and a bare `purchase`/`spend`/`reconcile` there would be ambiguous at the call
+// site. Same reason audio exports `play as audioPlay`.
+export {
+  configureIap, resetIap, restorePurchases, refreshEntitlements, isEntitled,
+  purchase as iapPurchase, reconcile as iapReconcile, spend as iapSpend,
+  balanceOf as iapBalanceOf, productInfo as iapProductInfo,
+  IapLedger, NoopStoreBackend, LocalVerifier, MockStoreBackend, pickStoreBackend,
+  type ConfigureIapOptions, type StoreBackend, type IapLedgerStore, type PurchaseVerifier,
+  type ProductKind, type IapProduct, type IapProductInfo, type StoreTransaction,
+  type PurchaseOutcome, type PurchaseResult,
+} from './iap';
+export { registerIapControls } from './actions/iapControls';
 export { hapticsSystem } from './haptics/hapticsSystem';
 export { registerHapticControls } from './actions/hapticControls';
 export {
