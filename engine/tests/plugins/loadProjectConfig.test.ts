@@ -270,6 +270,38 @@ describe('deepMergeConfigPatch (the WRITE-time merge — patch onto disk, not on
     expect(out).toEqual({ app: { appId: 'a', appName: 'b' }, build: { debugBuild: true, appleTeamId: 'X' } });
   });
 
+  it('REPLACES rendering.three.tiers wholesale, so removing a quality tier actually removes it', () => {
+    // ⚠️ Without this, the Project Settings "Remove" button is a LIE: the dialog posts the whole
+    // draft, an omitted `low` is just an absent key, and every other map-like section reads that
+    // as "don't touch" — so the dialog closes cleanly, reports success, and the tier is still in
+    // the file on the next load. The component's own object is correct and all of its unit tests
+    // pass; only exercising the real merge can see it. (Found by the A3 agent, empirically.)
+    const disk = {
+      rendering: { three: { qualityTier: 'auto', tiers: { mid: { ibl: true }, low: { ibl: false } } } },
+    };
+    const out = deepMergeConfigPatch(disk, {
+      rendering: { three: { qualityTier: 'auto', tiers: { mid: { ibl: true } } } },
+    }) as typeof disk;
+    expect(out.rendering.three.tiers).toEqual({ mid: { ibl: true } });
+    expect('low' in out.rendering.three.tiers).toBe(false);
+  });
+
+  it('an EMPTY tiers object clears them all — the last Remove must reach the file', () => {
+    // `undefined` cannot express this: the merge treats it as absent, i.e. "leave the file alone".
+    // `{}` is also semantically right — `configCount({})` is 1, the same as an absent `tiers`.
+    const disk = { rendering: { three: { tiers: { low: { ibl: false } } } } };
+    const out = deepMergeConfigPatch(disk, { rendering: { three: { tiers: {} } } }) as typeof disk;
+    expect(out.rendering.three.tiers).toEqual({});
+  });
+
+  it('still MERGES its neighbours — the wholesale rule is scoped to that one path', () => {
+    // A path-keyed exception is easy to write too broadly. `rendering.three`'s own sibling fields
+    // must keep merging, or editing one field would blank the rest of the block.
+    const disk = { rendering: { three: { qualityTier: 'auto', antialias: true, exposure: 1.2 } } };
+    const out = deepMergeConfigPatch(disk, { rendering: { three: { exposure: 2 } } }) as typeof disk;
+    expect(out.rendering.three).toEqual({ qualityTier: 'auto', antialias: true, exposure: 2 });
+  });
+
   it('replaces arrays wholesale — never concatenates or index-merges', () => {
     // Otherwise you could never REMOVE a scene or a physics layer.
     const disk = { content: { scenes: ['a', 'b', 'c'] }, physics: { layers: ['Default', 'Player'] } };
@@ -552,6 +584,9 @@ describe('DEFAULT_PROJECT_CONFIG.rendering / engine renderSettings agreement', (
     // -pure and cannot import the engine, so the check lives here.
     resetRenderSettings();
     expect(getRenderSettings()).toEqual({
+      // `targetFps` joined the registry in #202 so a tier can clamp it — it used to reach the
+      // frame driver directly and bypass this agreement check entirely.
+      targetFps: DEFAULT_PROJECT_CONFIG.rendering.targetFps,
       three: DEFAULT_PROJECT_CONFIG.rendering.three,
       pixi: DEFAULT_PROJECT_CONFIG.rendering.pixi,
       web: DEFAULT_PROJECT_CONFIG.rendering.web,

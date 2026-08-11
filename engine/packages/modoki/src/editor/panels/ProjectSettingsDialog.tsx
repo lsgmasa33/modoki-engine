@@ -9,6 +9,7 @@ import { getProjectSettings, type ProjectSettingsField } from '../createEditor';
 import PhysicsLayersEditor from './PhysicsLayersEditor';
 import SceneListEditor from './SceneListEditor';
 import ModuleTogglesEditor from './ModuleTogglesEditor';
+import QualityTiersEditor from './QualityTiersEditor';
 
 type Values = Record<string, unknown>;
 
@@ -136,6 +137,8 @@ function Field({ field, value, onChange, onPick }: {
       return <div>{label}<PhysicsLayersEditor value={value} onChange={onChange} /></div>;
     case 'module-toggles':
       return <div>{label}<ModuleTogglesEditor value={value} onChange={onChange} /></div>;
+    case 'quality-tiers':
+      return <div>{label}<QualityTiersEditor value={value} onChange={onChange} /></div>;
     default:
       return (
         <div>{label}

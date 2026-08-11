@@ -11,6 +11,9 @@ vi.mock('../../app/ecs/registerTraits', () => ({
 const mockRegisterManager = vi.fn();
 const mockSetPhysicsLayers = vi.fn();
 const mockSetTargetFPS = vi.fn();
+/** Returns a value that is NOT the project config's `targetFps`, deliberately — see the frame-cap
+ *  test below for why an equal value could not tell the two code paths apart. */
+const mockGetEffectiveTargetFps = vi.fn(() => 30);
 const mockSetRenderSettings = vi.fn();
 
 vi.mock('@modoki/engine/runtime', () => ({
@@ -21,6 +24,7 @@ vi.mock('@modoki/engine/runtime', () => ({
   registerEngineActions: () => {},
   registerAudioControls: () => {},
   registerHapticControls: () => {},
+  registerQualityControls: () => {},
   registerVideoControls: () => {},
   registerManager: (...args: any[]) => mockRegisterManager(...args),
   timeManager: { name: 'engine.time' },
@@ -34,6 +38,7 @@ vi.mock('@modoki/engine/runtime', () => ({
   setPhysicsLayers: (...args: any[]) => mockSetPhysicsLayers(...args),
   setTargetFPS: (...args: any[]) => mockSetTargetFPS(...args),
   setRenderSettings: (...args: any[]) => mockSetRenderSettings(...args),
+  getEffectiveTargetFps: () => mockGetEffectiveTargetFps(),
 }));
 
 describe('registerAll', () => {
@@ -94,5 +99,34 @@ describe('registerAll', () => {
     const { registerAll } = await import('../../app/ecs/register');
     registerAll();
     expect(mockRegisterManager).toHaveBeenCalledWith(expect.objectContaining({ name: 'TimelineEvents' }));
+  });
+});
+
+describe('the frame cap goes through the TIER-AWARE accessor (#202)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.resetModules();
+  });
+
+  it('reads `getEffectiveTargetFps()`, not `projectConfig.rendering.targetFps`', async () => {
+    // ⚠️ A DISTINGUISHING OBSERVATION, and it has to be. The two sources agree at boot (no tier
+    // has resolved yet), so a test whose mock returned the project's own 60 would pass under BOTH
+    // the old direct read and the new accessor and prove nothing. The mock returns 30 instead:
+    // only the accessor path can produce it.
+    const { registerAll } = await import('../../app/ecs/register');
+    registerAll();
+    expect(mockGetEffectiveTargetFps).toHaveBeenCalled();
+    expect(mockSetTargetFPS).toHaveBeenCalledWith(30);
+  });
+
+  it('injects the render settings BEFORE reading the cap back', async () => {
+    // Order is load-bearing: `getEffectiveTargetFps()` reads the AUTHORED value out of the
+    // settings registry, so a call made before `setRenderSettings` would read the engine default
+    // rather than what the project asked for.
+    const { registerAll } = await import('../../app/ecs/register');
+    registerAll();
+    const injected = mockSetRenderSettings.mock.invocationCallOrder[0];
+    const capRead = mockGetEffectiveTargetFps.mock.invocationCallOrder[0];
+    expect(injected).toBeLessThan(capRead);
   });
 });

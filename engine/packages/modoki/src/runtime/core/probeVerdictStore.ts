@@ -20,7 +20,32 @@ import { createProviderSlot } from './providerSlot';
  *  different hardware. */
 export interface CachedProbeVerdict {
   fingerprint: string;
-  deviceClass: 'weak' | 'capable';
+  /** The measured bands only. Spelled out rather than imported from `rendering/rampProbe`'s
+   *  `DeviceClass` because this is an L0 module (see `playerTierStore` for the same seam) — and
+   *  narrower than it on purpose: `'unknown'` is not a verdict and must never be cached, or a
+   *  device that probed before the thresholds existed would be frozen in that state forever. */
+  deviceClass: 'weak' | 'middle' | 'capable';
+  /** The raw readings this verdict is folded from, oldest first — NOT just the verdict.
+   *
+   *  ⚠️ **A BAND CANNOT BE AVERAGED; READINGS CAN.** Refining across launches means taking the
+   *  MEDIAN of what several launches measured, and "the median of `weak`, `middle`, `weak`" is a
+   *  vote, not a measurement — it throws away how close each pass was to a boundary, which is the
+   *  whole signal. So the numbers are what persists and the band is recomputed from them.
+   *
+   *  Also why this is a list and not a running mean: a mean cannot be un-skewed by a later sample,
+   *  and the outlier passes this exists to survive are exactly the ones that would skew it.
+   *
+   *  ⚠️ **THE AXES CHANGED (#188, 2026-08-11): these are `cpu` and `shade`, not `fill` and `draw`.**
+   *  A persisted sample is a reading of a SPECIFIC quantity, so renaming the fields is not cosmetic
+   *  — `CLASSIFIER_VERSION` is part of the fingerprint precisely so a record written under the old
+   *  pair can never be medianed against one written under the new. Spelled out here rather than
+   *  imported as `ProbeReading` for the same L0 reason as `deviceClass` above.
+   */
+  samples: { cpuUnitsPerMs: number; shadeMfragPerMs: number }[];
+  /** Settled — later launches must NOT probe again. While false the device pays one probe per
+   *  launch until it settles, which is the cost of the owner's "refine across launches" choice:
+   *  no launch pays more than one probe, but the first few launches each pay one. */
+  final: boolean;
 }
 
 export interface ProbeVerdictStore {

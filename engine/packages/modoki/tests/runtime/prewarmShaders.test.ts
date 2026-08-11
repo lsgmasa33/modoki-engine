@@ -147,7 +147,12 @@ describe('prewarmShadersForWorld — the environment mirror follows the TIER', (
     const envTexture = { isTexture: true, name: 'fake-hdr' };
     const { world, sync } = await setup({ env: envTexture });
     const { Environment } = await import('../../src/three/traits/Environment');
-    const { setActiveQualityTier } = await import('../../src/runtime/rendering/renderSettings');
+    const { setActiveQualityTier, setRenderSettings } = await import('../../src/runtime/rendering/renderSettings');
+    const { TIER_SETTINGS } = await import('../../src/runtime/rendering/qualityTier');
+    // The DEFAULT is now the ABSENCE of clamping (docs/rendering.md § "Quality tiers") — `low` is a
+    // no-op unless the project authored something to clamp with, so author it from the seed table to
+    // keep exercising the prewarm/tier mirror this describe block is for.
+    setRenderSettings({ three: { tiers: { low: TIER_SETTINGS.low } } });
     setActiveQualityTier(tier as never);
     world.spawn(Environment({ hdrPath: 'hdr-guid', intensity: 0.4 }));
     const { renderer, compiledEnvironments } = makeRendererStub();

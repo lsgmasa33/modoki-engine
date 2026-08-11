@@ -24,8 +24,8 @@ import { createRendererRecovery } from './rendererRecovery';
 import { tickTierCalibration, applyPendingTierPromotion } from './tierCalibration';
 import { beginProfilerSample, endProfilerSample } from '../core/profilerMarkers';
 import { gpuPassScope } from '../core/gpuTimings';
-import { getRenderSettings, getEffectiveThreeSettings, getActiveTierOrDefault } from './renderSettings';
-import { tierAllowsPostFX } from './qualityTier';
+import { getRenderSettings, getEffectiveThreeSettings, getActiveTierOverrides } from './renderSettings';
+import { maskPostFXRequest } from './qualityTier';
 import { onForceResize } from './resizeBus';
 import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
 import { createParticleSyncState, syncParticles, disposeParticleSyncState } from './particleSync';
@@ -517,7 +517,14 @@ export default function Scene3D() {
           if (dofEnabled) req.dof = dofCfg;
           if (bloomEnabled) req.bloom = bloomCfg;
           if (vignetteEnabled) req.vignette = vignetteCfg;
-          return req;
+          // ⚠️ MASK AT THE SOURCE, not at the call site. The active tier drops effects per
+          // effect, and `buildReq` is called TWICE — once for `liveReq`, and again below for
+          // `effectiveReq` while an SS-scale change is still settling. Masking only the first
+          // left the second one unmasked, so a dragged supersample slider handed `setConfig`
+          // (and a rebuilt `PostFXStack`) a request with the tier-dropped effect back in it,
+          // until the scale settled. Every request is now born masked, so there is no second
+          // call site to remember.
+          return maskPostFXRequest(req, getActiveTierOverrides());
         };
 
         // Clamp HERE, at the single source, so the planner and the stage both see
@@ -529,23 +536,27 @@ export default function Scene3D() {
         // scenes / MCP writes only.)
         const liveSs = nprSnap ? Math.max(1, nprSnap.superSampleScale) : 1;
         const liveReq = buildReq(liveSs);
-        // The `low` tier drops the post-process stack outright (#121 P3c). It is the dominant
-        // remaining cost on a weak device and it is SCREEN-SPACE, so it is paid per pixel however
-        // simple the scene is — on an iPhone 8 a 27ms baseline became 56ms with NPR alone.
-        //
+        // The active tier MASKS the request per effect (owner, 2026-08-11) rather than gating the
+        // whole stack — see `PostFXEffect`'s header in qualityTier.ts. The effects are not remotely
+        // comparable in cost (an iPhone 8: NPR ~+29ms, vignette ~6ms, bloom ~4ms), so an
+        // all-or-nothing switch was blunter than the measurements require: postfx-demo's degraded
+        // config could drop NPR and GTAO and stay recognisably itself, but couldn't say so.
+        // The mask itself is applied inside `buildReq` — see the warning there for why it cannot
+        // live here.
+        const hasStages = planStages(liveReq).length > 0;
         // Tearing down an EXISTING stack matters as much as not building one: a live demotion
         // happens on a device that is already struggling, and a retained stack would keep its
         // render targets (several full-resolution buffers) resident for nothing. This is the one
-        // place a tier change frees memory rather than just doing less work.
-        const postfxAllowed = tierAllowsPostFX(getActiveTierOrDefault());
-        if (!postfxAllowed && postfxStack) {
+        // place a tier change frees memory rather than just doing less work. Fires whenever the
+        // MASKED request has nothing left, not just when a whole-stack switch used to say so.
+        if (!hasStages && postfxStack) {
           postfxStack.dispose();
           postfxStack = null;
           postfxCamera = null;
           ssRebuild = null;
           lastStackSig = null;
         }
-        if (postfxAllowed && planStages(liveReq).length > 0 && isWebGPU) {
+        if (hasStages && isWebGPU) {
           // Rebuild on camera-object swap (perspective <-> ortho): the stack
           // baked the old camera object, incl. its depth-reconstruction path.
           const cameraChanged = postfxStack != null && postfxCamera !== activeCamera;

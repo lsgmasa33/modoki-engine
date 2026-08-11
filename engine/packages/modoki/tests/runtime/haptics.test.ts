@@ -17,7 +17,11 @@ import {
   ENGINE_HAPTIC_PATTERNS, NoopHapticBackend, cancelPendingHaptics,
   type HapticBackend, type HapticPreset,
 } from '@modoki/engine/runtime';
-import { createTestWorld } from '@modoki/engine/runtime';
+import { createTestWorld, registerHapticControls, HapticSettings } from '@modoki/engine/runtime';
+import { createWorld } from 'koota';
+import { dispatchUIAction } from '../../src/runtime/core/actionRegistry';
+import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
+import { setPlayState } from '../../src/runtime/core/playState';
 
 /** A backend that records what it was asked to play and claims it CAN vibrate, so the service
  *  takes the device path instead of short-circuiting at the noop check. */
@@ -204,5 +208,59 @@ describe('the journal event — the only headless verification route', () => {
     } finally {
       tw.dispose();
     }
+  });
+});
+
+/** The DECLARATIVE layer — `hapticControls.ts`'s three UIActions, dispatched the way
+ *  `ui/bindings.ts` dispatches them.
+ *
+ *  ⚠️ THIS BLOCK EXISTS BECAUSE ITS ABSENCE HID A DEAD ACTION FOR THE LIFE OF THE MODULE. Every
+ *  test above drives `playHaptic` directly, so `haptics.play` could read its pattern out of a
+ *  field no authored binding can populate (`ctx.payload`, typed `string | number`, where the
+ *  handler expected an object) and stay green: authoring a pattern silently played `'select'`,
+ *  and `haptics.set` did nothing at all. Found 2026-08-11 building the neighbouring `quality.set`.
+ *  Dispatch through the registry with the shapes bindings.ts really delivers, or this rots again. */
+describe('the declarative actions (hapticControls)', () => {
+  beforeEach(() => {
+    registerHapticControls();
+    setCurrentWorld(createWorld());
+    setPlayState('playing'); // dispatchUIAction is inert unless the sim is running
+  });
+
+  it('plays the AUTHORED pattern, not the default — `params: { pattern }`', () => {
+    registerHapticPatterns({ 'test.buzz': [{ preset: 'impact.heavy', delayMs: 0 }] });
+    dispatchUIAction('haptics.play', { params: { pattern: 'test.buzz' } });
+    vi.runAllTimers();
+    expect(rec.played).toHaveLength(1);
+    expect(rec.played[0]).toBe('impact.heavy');
+  });
+
+  it('takes the pattern from `payload` too — a control emitting `$value`', () => {
+    registerHapticPatterns({ 'test.buzz': [{ preset: 'impact.heavy', delayMs: 0 }] });
+    dispatchUIAction('haptics.play', { payload: 'test.buzz' });
+    vi.runAllTimers();
+    expect(rec.played[0]).toBe('impact.heavy');
+  });
+
+  it('falls back to `select` only when nothing was authored', () => {
+    dispatchUIAction('haptics.play', {});
+    vi.runAllTimers();
+    expect(rec.played).toHaveLength(1);
+  });
+
+  it('`haptics.set` writes the authored boolean into HapticSettings', () => {
+    const world = createWorld();
+    setCurrentWorld(world);
+    world.spawn(HapticSettings({ enabled: true, masterIntensity: 1 }));
+    dispatchUIAction('haptics.set', { params: { enabled: false } });
+    expect(world.queryFirst(HapticSettings)?.get(HapticSettings)?.enabled).toBe(false);
+  });
+
+  it('`haptics.toggle` flips it', () => {
+    const world = createWorld();
+    setCurrentWorld(world);
+    world.spawn(HapticSettings({ enabled: false, masterIntensity: 1 }));
+    dispatchUIAction('haptics.toggle', {});
+    expect(world.queryFirst(HapticSettings)?.get(HapticSettings)?.enabled).toBe(true);
   });
 });

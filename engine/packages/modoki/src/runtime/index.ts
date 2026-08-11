@@ -53,6 +53,7 @@ export {
 export { registerIapControls } from './actions/iapControls';
 export { hapticsSystem } from './haptics/hapticsSystem';
 export { registerHapticControls } from './actions/hapticControls';
+export { registerQualityControls } from './actions/qualityControls';
 export {
   playHaptic, configureHaptics, areHapticsEnabled, canDeviceVibrate,
   hapticLatencyMean, hapticLatencySamples, clearHapticLatency,
@@ -257,24 +258,39 @@ export {
   hitShapeContains, hitShapeDistance, regionsAt, nearestRegionTo,
   type HitRegion, type HitShape, type HitRegionFilter, type HitRegionProvider,
 } from './rendering/hitRegions';
-// Quality tiers (#121 P3) — two tiers, measurement as ground truth, allowlist as a shortcut.
-// The allowlist ships EMPTY and `auto` is NOT the default: see the module header, both are
-// deliberate states pending P5 calibration on real hardware, not unfinished work.
+// Quality tiers (#121 P3) — THREE tiers since #188 (`low`/`mid`/`high`), measurement as ground
+// truth, allowlist as a shortcut. The allowlist still ships EMPTY on purpose; see the module
+// header for why that is a deliberate state and not unfinished work.
 export {
-  resolveTier, evaluateTierChange, freshTierChangeState, tierShadowMapSize, tierAllowsPostFX,
+  resolveTier, evaluateTierChange, freshTierChangeState, promotionCeiling,
+  tierShadowMapSize, tierAllowsEffect,
   TIER_SETTINGS, TIER_ALLOWLIST, DEFAULT_TIER_SETTING,
+  TIER_ORDER, isQualityTier, tierAbove, tierBelow,
   type QualityTier, type QualityTierSetting, type TierResolution, type TierSource,
   type TierRenderOverrides, type TierResolveInput, type TierChangeState, type TierDecision,
-  iosModelTier, parseAppleModel, IOS_HIGH_TIER_MIN_GENERATION,
+  type PostFXEffect,
+  iosModelTier, parseAppleModel, IOS_TIER_MIN_GENERATION,
 } from './rendering/qualityTier';
 // The boot ramp probe (#188). The PURE half only — the runner pulls in three and is imported
 // dynamically at the one call site that needs it, so a headless or DCE'd build never loads it.
 export {
   startRamp, rampNextLoad, recordRampFrame, readRamp, estimateIntervalMs, classifyDevice,
   probeFingerprint, PROBE_THRESHOLDS, PROBE_BUDGET_MS, RAMP_BOUNDS,
-  type DeviceClass, type ProbeMeasurement, type ProbeVerdict, type RampKind, type RampReading,
+  classifyReading, readingOf, refineProbeVerdict,
+  fillMegapixelsPerMs, shadeMegaFragmentsPerMs,
+  PROBE_SAMPLE_TARGET,
+  type ProbeClockKind,
+  type ProbeReading, type ProbeRefinement, type ProbeThreshold, type DeviceClass, type ProbeMeasurement, type ProbeVerdict, type RampKind, type RampReading,
   type RampState, type RampStatus, type RampStep, type ThroughputBound,
 } from './rendering/rampProbe';
+// The automatic light cap (#188 item 7) — the tier's light limits, actually enforced. The stats
+// are exported for `diagnose`: "why is this object dark?" is the question this feature
+// generates, and answering it from data beats answering it from the shader.
+export { getAutoLightCapStats, isAutoLightCapEngaged } from './rendering/autoLightCapFrame';
+// The mask variants the cap (or an authored scene) actually produced. On the barrel for the same
+// reason: verifying that a light selection REACHED the renderer needs the running instance, and a
+// direct `/@fs/` import from a debug eval can land on a second copy of the module.
+export { getLightMaskStats } from './rendering/lightMaskVariants';
 export { probeVerdictStore, type ProbeVerdictStore, type CachedProbeVerdict } from './core/probeVerdictStore';
 export { registerMaterialType, getMaterialBuilder, getRegisteredMaterialTypes, type MaterialBuilder } from './loaders/materialTypes';
 export { registerCustomShader, unregisterCustomShader, getCustomShader, getCustomShaderSchema, getRegisteredShaderNames, type CustomShaderBuild } from './loaders/customShaders';
@@ -369,10 +385,12 @@ export type { FrameLoopHealth } from './rendering/frameDriver';
 // ── Render settings (project-configured renderer knobs) ──
 export {
   setRenderSettings, getRenderSettings, resetRenderSettings, resolveToneMapping,
-  setActiveQualityTier, getActiveQualityTier, getEffectiveThreeSettings, getActiveTierOrDefault,
+  setActiveQualityTier, getActiveQualityTier, getAssessedQualityTier,
+  getEffectiveThreeSettings, getEffectivePixiSettings, getEffectiveTargetFps,
+  getActiveTierOrDefault,
 } from './rendering/renderSettings';
 export {
-  tickTierCalibration, applyPendingTierPromotion, resetTierCalibration,
+  tickTierCalibration, applyPendingTierPromotion, resetTierCalibration, setTierFrameCapEnabled,
   getPendingTierPromotion, CALIBRATION_INTERVAL_MS,
 } from './rendering/tierCalibration';
 export {

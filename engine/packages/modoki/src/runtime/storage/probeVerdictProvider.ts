@@ -15,16 +15,50 @@ import { PlayerPrefs } from './playerPrefs';
 /** Namespaced so a game's own prefs cannot collide with it. */
 export const PROBE_VERDICT_PREF_KEY = 'modoki.rendering.probeVerdict';
 
+/** Typed against the stored union, so adding a band (`'middle'`, #188) fails to compile here
+ *  until this list follows — the alternative being a verdict that writes fine and then reads back
+ *  as "no cache", i.e. a launch-blocking probe on every single boot with nothing to show for it. */
+const VALID_CLASSES: readonly CachedProbeVerdict['deviceClass'][] = ['weak', 'middle', 'capable'];
+
+type SampleKey = keyof CachedProbeVerdict['samples'][number];
+
+/** The numeric fields a persisted sample must carry, DERIVED FROM THE TYPE rather than retyped.
+ *
+ *  ⚠️ **THIS SHAPE IS TYPED AS LOOSE JSON ON PURPOSE, WHICH MEANS NOTHING ELSE CAN CATCH A RENAME —
+ *  and one got through.** When #188 swapped the classifier from `fill`/`draw` to `cpu`/`shade`, the
+ *  validator below kept checking `fillMpxPerMs`/`drawUnitsPerMs` through the `as` casts that exist
+ *  to stop us reading unvalidated prefs at the shape we WANT. It compiled perfectly and returned
+ *  `null` for every well-formed record: the cache was dead, so the probe re-ran on every launch and
+ *  never accumulated the samples it needs to settle. Nothing failed; it just quietly cost every
+ *  launch a blocking probe, forever.
+ *
+ *  A `Record<SampleKey, true>` closes both directions at compile time. Rename a field and the stale
+ *  key is an excess property here; ADD one and the record is missing a key. Either way this file
+ *  fails to build until the validator follows — which is the only mechanism available, since the
+ *  runtime shape is deliberately untyped. Paired with a write→read round-trip test
+ *  (`tests/storage/probeVerdictProvider.test.ts`), because a compile-time guard cannot prove the
+ *  two halves actually agree at runtime. */
+const SAMPLE_KEY_SET: Record<SampleKey, true> = { cpuUnitsPerMs: true, shadeMfragPerMs: true };
+const SAMPLE_KEYS = Object.keys(SAMPLE_KEY_SET) as readonly SampleKey[];
+
 probeVerdictStore.provide({
   read(): CachedProbeVerdict | null {
     // Typed as a loose string map, not as `CachedProbeVerdict`: this is unvalidated persisted
     // JSON, and reading it at the shape we WANT is how a malformed record gets waved through.
     const raw = PlayerPrefs.get<Record<string, string>>(PROBE_VERDICT_PREF_KEY);
     if (!raw || typeof raw !== 'object') return null;
-    const { fingerprint, deviceClass } = raw as Partial<CachedProbeVerdict>;
+    const { fingerprint, deviceClass, samples, final } = raw as Partial<CachedProbeVerdict>;
     if (typeof fingerprint !== 'string' || !fingerprint) return null;
-    if (deviceClass !== 'weak' && deviceClass !== 'capable') return null;
-    return { fingerprint, deviceClass };
+    if (!deviceClass || !VALID_CLASSES.includes(deviceClass)) return null;
+    // A record written before cross-launch refinement existed has no `samples`, and reading one as
+    // "settled with zero samples" would freeze a device on the single pass this change exists to
+    // stop trusting. Rejecting it re-probes, which is the cheap and correct outcome.
+    if (!Array.isArray(samples) || samples.length === 0) return null;
+    const clean = samples.filter((s): s is CachedProbeVerdict['samples'][number] =>
+      !!s && typeof s === 'object'
+      && SAMPLE_KEYS.every((k) => Number.isFinite((s as Record<string, unknown>)[k])));
+    if (clean.length !== samples.length) return null;
+    return { fingerprint, deviceClass, samples: clean, final: final === true };
   },
   write(verdict) {
     if (verdict === null) PlayerPrefs.delete(PROBE_VERDICT_PREF_KEY);

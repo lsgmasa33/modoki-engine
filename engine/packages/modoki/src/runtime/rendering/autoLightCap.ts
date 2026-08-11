@@ -93,10 +93,15 @@ export function canAutoCap(lightCount: number): boolean {
  *  Ties break on `index` so the choice is DETERMINISTIC — two equally effective lights must not
  *  swap between frames (or between the editor and a device), because a changed selection swaps a
  *  material variant and would strobe the scene. */
-export function globalKeptMask(lights: readonly CapLight[], caps: LightCaps): number {
+export function globalKeptMask(
+  lights: readonly CapLight[],
+  caps: LightCaps,
+  allowed: number = ALL_LIGHTS_MASK,
+): number {
   let mask = 0;
   const directional: CapLight[] = [];
   for (const l of lights) {
+    if (((allowed >> l.index) & 1) === 0) continue;      // see `allowed` on maskForObject
     if (l.type === 'ambient') mask |= 1 << l.index;      // never capped
     else if (l.type === 'directional') directional.push(l);
   }
@@ -113,21 +118,36 @@ export function globalKeptMask(lights: readonly CapLight[], caps: LightCaps): nu
  *  Distance is measured to the light's POSITION, squared (no sqrt — only the ordering matters).
  *  Intensity and range are deliberately NOT weighted in: a brightness-weighted metric changes
  *  which light wins as intensities animate, and every change of winner is a material-variant swap.
- *  Nearest is stable, cheap, and predictable, which matters more here than being optimal. */
+ *  Nearest is stable, cheap, and predictable, which matters more here than being optimal.
+ *
+ *  ⚠️ **`allowed` RESTRICTS THE CANDIDATES; IT IS NOT A FILTER ON THE RESULT.** When a scene also
+ *  authors rendering-layer masks, an object may only be lit by some of these lights — and choosing
+ *  the nearest N globally and intersecting afterwards is measurably wrong, not merely redundant:
+ *  the nearest light is often one the author excluded, so the intersection deletes it and the
+ *  object ends up with FEWER lights than either mechanism alone would have given it (a black
+ *  object where the artist asked for a lit one). Selecting from the eligible set instead means
+ *  "the nearest local light you are ALLOWED to see", which is what the two mechanisms mean
+ *  together. The same argument applies to the directional choice in {@link globalKeptMask}, which
+ *  is why the global part is computed per distinct authored mask rather than once. */
 export function maskForObject(
   lights: readonly CapLight[],
   caps: LightCaps,
   globalMask: number,
   x: number, y: number, z: number,
+  allowed: number = ALL_LIGHTS_MASK,
 ): number {
   if (caps.maxLocal <= 0) {
     let mask = globalMask;
-    for (const l of lights) if (l.type === 'point' || l.type === 'spot') mask |= 1 << l.index;
+    for (const l of lights) {
+      if (((allowed >> l.index) & 1) === 0) continue;
+      if (l.type === 'point' || l.type === 'spot') mask |= 1 << l.index;
+    }
     return mask;
   }
   const local: { l: CapLight; d2: number }[] = [];
   for (const l of lights) {
     if (l.type !== 'point' && l.type !== 'spot') continue;
+    if (((allowed >> l.index) & 1) === 0) continue;
     const dx = l.x - x, dy = l.y - y, dz = l.z - z;
     local.push({ l, d2: dx * dx + dy * dy + dz * dz });
   }

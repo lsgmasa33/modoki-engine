@@ -10,7 +10,7 @@
 import {
   getAllEntities, getAllTraits, readTraitData, readTraitDataFull,
   REF_FIELDS_BY_TRAIT, isGuid, isExternalUrl, isInternalAssetPath, resolveGuidToPath,
-  getDeviceCaps, getDeviceCapsSync, readPerfProfile, getActiveQualityTier,
+  getDeviceCaps, getDeviceCapsSync, readPerfProfile, getActiveQualityTier, getAutoLightCapStats,
 } from '@modoki/engine/runtime';
 import { computeLayoutBounds } from './layoutDump';
 
@@ -146,11 +146,17 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
   // the player picked it, and those want completely different responses. Omitted entirely until
   // a renderer has resolved one, matching the healthy-means-silent convention above.
   const tier = getActiveQualityTier();
+  // The automatic light cap (#188 item 7), reported ONLY when it is doing something. A tier's
+  // light limits are invisible otherwise — and they were literally inert for months — so "how many
+  // of this scene's lights is this object actually lit by?" needs an answer from data. Omitted
+  // when disengaged, matching the healthy-means-silent convention above.
+  const lightCap = getAutoLightCapStats();
 
   return {
     ok,
     ...(deviceCaps ? { deviceCaps } : {}),
     ...(tier ? { qualityTier: tier } : {}),
+    ...(lightCap.engaged ? { lightCap } : {}),
     perf,
     refs: { issues: refIssues, count: refIssues.length },
     transforms: { nan, zeroScale },

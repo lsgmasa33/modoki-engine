@@ -387,6 +387,10 @@ describe('syncLights — IBL-off ambient compensation', () => {
     const settings = await import('../../src/runtime/rendering/renderSettings');
     const { TIER_SETTINGS } = await import('../../src/runtime/rendering/qualityTier');
     const sync = await import('../../src/runtime/rendering/scene3DSync');
+    // The DEFAULT is now the ABSENCE of clamping (docs/rendering.md § "Quality tiers") — `low` is a
+    // no-op (IBL stays ON) unless the project authored something to clamp with, so author it from the
+    // seed table to keep exercising the IBL-off compensation this describe block is for.
+    settings.setRenderSettings({ three: { tiers: { low: TIER_SETTINGS.low } } });
     settings.setActiveQualityTier({ tier: 'low', source: 'measured', reason: 'test' });
     return { world: createWorld(), Light, Environment, sync, settings, TIER_SETTINGS, scene: new THREE.Scene() };
   }

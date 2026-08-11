@@ -11,11 +11,20 @@
 
 import { createProviderSlot } from './providerSlot';
 
+/** The tier names, spelled out rather than imported from `rendering/qualityTier`: this is an L0
+ *  core module and may not import an L2 subsystem (see docs/architecture-layers.md). Keep in step
+ *  with `QualityTier`. The compiler catches the DANGEROUS direction — adding a tier there and
+ *  forgetting this mirror fails at `playerQualityTier`'s `write(tier)` call. It does NOT catch the
+ *  reverse (a value here that `QualityTier` lacks), because the read path narrows through
+ *  `isQualityTier(raw: unknown)`, and a type guard whose parameter is `unknown` is never compared
+ *  against the static type of what was passed. One direction enforced, one direction discipline. */
+export type PersistedQualityTier = 'low' | 'mid' | 'high';
+
 export interface PlayerTierStore {
-  /** 'low' | 'high', or null when the player has expressed no preference. */
-  read(): 'low' | 'high' | null;
+  /** A tier, or null when the player has expressed no preference. */
+  read(): PersistedQualityTier | null;
   /** null clears the override. */
-  write(tier: 'low' | 'high' | null): void;
+  write(tier: PersistedQualityTier | null): void;
 }
 
 export const playerTierStore = createProviderSlot<PlayerTierStore>('playerTierStore');

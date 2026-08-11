@@ -40,12 +40,19 @@ import {
 import { getRiggedModel, ensureRiggedModelLoaded } from '../loaders/riggedModelCache';
 import {
   getRenderSettings, resolveToneMapping, getEffectiveThreeSettings,
-  getActiveQualityTier, setActiveQualityTier, getActiveTierOrDefault,
+  getActiveQualityTier, setActiveQualityTier, getActiveTierOverrides,
 } from './renderSettings';
-import { resolveTier, tierShadowMapSize, tierAllowsIBL, tierAmbientBoost, tierExposureBoost, shadowBiasScale, type QualityTierSetting } from './qualityTier';
-import { classifyDevice, probeFingerprint, type DeviceClass } from './rampProbe';
+import { resolveTier, tierShadowMapSize, tierAllowsIBL, tierAmbientBoost, tierExposureBoost, shadowBiasScale, configCount, type QualityTierSetting, type TierResolution } from './qualityTier';
+import { applyActiveTierToRuntime } from './tierCalibration';
+import {
+  classifyDevice, probeFingerprint, readingOf, refineProbeVerdict,
+  fillMegapixelsPerMs, shadeMegaFragmentsPerMs,
+  type DeviceClass, type ProbeMeasurement, type RampReading,
+} from './rampProbe';
+import { armAutoLightCap, autoCapMaskFor, isAutoLightCapEngaged } from './autoLightCapFrame';
 import { probeVerdictStore } from '../core/probeVerdictStore';
-import { isProbeInFlight, withProbeInFlight } from './probeReentrancy';
+import { areDebugHandlesEnabled } from '../core/debugHandles';
+import { isProbeInFlight, withProbeInFlight, shareTierResolution } from './probeReentrancy';
 import { applyInstancedBatching } from './instancedBatching';
 import { getDeviceCaps } from './deviceCaps';
 import { getPlayerQualityTier } from './playerQualityTier';
@@ -429,7 +436,7 @@ export function syncEnvironment(world: World, scene: THREE.Scene) {
       // Tier gate (#154): IBL costs ~26 ms of a ~53 ms frame on a Huawei Y6 — half of it. The
       // BACKGROUND below is left alone (measured not to be the cost); only the lighting
       // contribution is suppressed, and syncLights/applyRendererColorConfig compensate.
-      const iblOn = tierAllowsIBL(getActiveTierOrDefault());
+      const iblOn = tierAllowsIBL(getActiveTierOverrides());
       if (!iblOn) suppressed = true; // this scene HAS an env and the tier is taking it away
       const wantEnv = iblOn ? cached : null;
       const wantEnvIntensity = iblOn ? envIntensity : 1;
@@ -675,7 +682,7 @@ function configureLightShadow(
   // no global cap, so without this a tier could say "shadows, but smaller" and nothing would
   // enforce it — a scene authoring 2048 across 150 casters would ignore the tier entirely.
   const authoredSize = light.shadowMapSize || 2048;
-  const size = tierShadowMapSize(authoredSize, getActiveTierOrDefault());
+  const size = tierShadowMapSize(authoredSize, getActiveTierOverrides());
   if (s.mapSize.width !== size || s.mapSize.height !== size) {
     s.mapSize.set(size, size);
     if (s.map) { s.map.dispose(); (s as unknown as { map: unknown }).map = null; }
@@ -799,7 +806,7 @@ export function syncLights(
     // is a tier raising its output. Always 1 unless this frame actually lost an environment, so
     // the authored value passes through untouched everywhere else.
     l.intensity = light.intensity
-      * (iblSuppressed && l instanceof THREE.AmbientLight ? tierAmbientBoost(getActiveTierOrDefault()) : 1);
+      * (iblSuppressed && l instanceof THREE.AmbientLight ? tierAmbientBoost(getActiveTierOverrides()) : 1);
     l.castShadow = light.castShadow;
     if (l instanceof THREE.PointLight || l instanceof THREE.SpotLight) {
       l.distance = light.distance;
@@ -1257,6 +1264,20 @@ function syncMaterial(
  *  reassigning `.material` every frame is what `syncRenderablesChurn` exists to catch, and the
  *  first hand-patched device test of this feature measured NO improvement precisely because
  *  `syncMaterial` was reassigning the base underneath a per-mesh override every frame. */
+/** The light mask for one object: the authored layer mask, or — when the automatic cap is
+ *  engaged — the authored intent intersected with the cap's per-object selection.
+ *
+ *  Position comes from `matrixWorld`, NOT the Transform trait: the cap picks the NEAREST local
+ *  lights, and a child entity's local position says nothing about where it is in the world (the
+ *  world-transform gap — rendering is the one layer that composes parents). A frame of staleness
+ *  is acceptable here and cheaper than forcing an update: the selection only has to be right
+ *  about which lights are closest, not about the exact metre. */
+function lightMaskFor(renderableMask: number, obj: THREE.Object3D): number {
+  if (!isAutoLightCapEngaged()) return renderableMask;
+  const p = obj.matrixWorld.elements;
+  return autoCapMaskFor(renderableMask, p[12], p[13], p[14]);
+}
+
 function applyLightMask(obj: THREE.Object3D, mask: number): void {
   if (!isLightMaskingActive()) return;
   const factory = getActiveRenderer() as unknown as LightingFactory | null;
@@ -2310,7 +2331,14 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       if (rend.material && rend.renderingLayerMask !== DEFAULT_RENDERING_LAYER_MASK) anyRenderableMasked = true;
     });
   }
-  beginLightMaskFrame(_maskedLights, anyRenderableMasked);
+  // ── The automatic light cap (#188 item 7) ────────────────────────────────────────────────
+  // Armed HERE, between the renderable scan and the publication, because it must see the frame's
+  // final light list and must republish it before any entity resolves a mask. It engages only
+  // when the tier's caps would actually restrict something (`high` never can — its caps are 0 =
+  // unlimited), so the common path is untouched. When it engages it also ARMS masking, since the
+  // scene itself may have authored nothing.
+  const capEngaged = armAutoLightCap(_maskedLights, getActiveTierOverrides());
+  beginLightMaskFrame(_maskedLights, anyRenderableMasked || capEngaged);
 
   // ── GLB meshes (Renderable3D) ─────────────────────────
   world.query(Transform, Renderable3D).updateEach(([tf, rend], entity) => {
@@ -2375,7 +2403,8 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       // MaterialInstance (a per-entity material clone driven by materialInstanceSystem) takes
       // precedence over Tint — both would otherwise claim mesh.material and fight each frame.
       const tinted = !instanced && entity.has(Tint);
-      const masked = maskNeedsVariant(rend.renderingLayerMask);
+      const lightMask = lightMaskFor(rend.renderingLayerMask, obj);
+      const masked = maskNeedsVariant(lightMask);
       syncMaterial(obj, id, rend.material || '', state, tinted, instanced, masked, rend.castShadow);
       // Per-entity Tint: bind a tinted clone of the resolved material. Passing
       // isTinted above stops syncMaterial from re-binding the base each frame, so
@@ -2392,7 +2421,7 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
         }
       }
       // Last, so it derives from the settled material (base / tint clone / instance clone).
-      applyLightMask(obj, rend.renderingLayerMask);
+      applyLightMask(obj, lightMask);
     }
 
     if (obj) applyTransform(obj, id, tf, callbacks);
@@ -2464,7 +2493,8 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
     // Masks apply only to explicit-material primitives — see the trait's field comment: a
     // default-material primitive owns a per-entity material that the colour block below writes
     // into, and a shared (material, mask) variant would fight it.
-    const masked = !!rend.material && maskNeedsVariant(rend.renderingLayerMask);
+    const lightMask = lightMaskFor(rend.renderingLayerMask, obj);
+    const masked = !!rend.material && maskNeedsVariant(lightMask);
     syncMaterial(obj as THREE.Mesh, id, rend.material || '', state, false, instanced, masked, rend.castShadow);
 
     // Update color when changed (only applies to the default material, not a .mat.json). A
@@ -2480,7 +2510,7 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
     }
     // After the colour block, and only for explicit materials (the colour path above owns the
     // default-material case outright).
-    if (rend.material) applyLightMask(obj, rend.renderingLayerMask);
+    if (rend.material) applyLightMask(obj, lightMask);
 
     applyTransform(obj, id, tf, callbacks);
   });
@@ -3160,7 +3190,7 @@ export async function prewarmShadersForWorld(
   // NON-env variant synchronously, which is precisely the cold-compile stutter this mirror is
   // here to prevent (measured at 3926 ms on the Y6, P4a). The prewarm must model the scene the
   // tier will actually draw, not the scene as authored.
-  if (tierAllowsIBL(getActiveTierOrDefault())) {
+  if (tierAllowsIBL(getActiveTierOverrides())) {
     world.query(Environment).readEach(([env]: [{ hdrPath: string; intensity: number }]) => {
       if (!env.hdrPath) return;
       const cached = getCachedEnvironment(env.hdrPath);
@@ -3310,7 +3340,7 @@ export function applyRendererColorConfig(r: {
  *  bake in a compensation belonging to the Game panel. */
 export function reconcileToneExposure(r: { toneMappingExposure: number }): void {
   const { exposure } = getRenderSettings().three;
-  const want = exposure * (iblSuppressed ? tierExposureBoost(getActiveTierOrDefault()) : 1);
+  const want = exposure * (iblSuppressed ? tierExposureBoost(getActiveTierOverrides()) : 1);
   if (r.toneMappingExposure !== want) r.toneMappingExposure = want;
 }
 
@@ -3337,7 +3367,38 @@ async function resolveActiveTier(setting: QualityTierSetting): Promise<void> {
   // explicitly clamped to DPR 1 by the runner, and `getEffectiveThreeSettings()` falls back to the
   // project's authored settings when no tier is active. The tier is resolved by the OUTER call
   // once the probe returns.
+  //
+  // ⚠️ THIS CHECK MUST STAY ABOVE THE DEDUP BELOW. The re-entrant call arrives from INSIDE the
+  // in-flight resolution, so making it await that same promise would deadlock the launch — it
+  // would be waiting for the thing that is waiting for it. Breaking the recursion first is what
+  // makes the dedup safe.
   if (isProbeInFlight()) return;
+  // ── CONCURRENT FIRST CALLS SHARE ONE RESOLUTION ──────────────────────────────────────────
+  // The guard above stops RECURSION; it does not stop two surfaces racing. Both `getDeviceCaps()`
+  // and the probe are awaited, so two renderers created in the same tick each get past every
+  // check above before either sets `probing` — and would then each run a launch-blocking probe.
+  // That was survivable when the probe ran once ever and wrote the same verdict twice. It is not
+  // now: the verdict refines across launches, both would read the SAME prior samples, and the
+  // second write would discard the first's reading — so a device would pay two probes and bank
+  // one sample. This makes "no launch pays more than one probe" true rather than nearly true.
+  return shareTierResolution(() => resolveActiveTierOnce(setting));
+}
+
+/** Publish a first-of-session tier resolution AND push what it implies into the live runtime.
+ *
+ *  ⚠️ **`setActiveQualityTier` ALONE IS NOT ENOUGH, and it used to be all this did (#202).** It
+ *  records the tier; it applies nothing. That was invisible while a tier only clamped Three.js
+ *  knobs, because `makeWebGPURenderer` reads `getEffectiveThreeSettings()` on the very next line
+ *  after awaiting this resolution — so the three fields appeared to "just work" and every other
+ *  field a tier gained would silently not. The frame cap and the 2D backing size are the first two
+ *  with no such reader. Route every publish through here so the next one cannot be forgotten
+ *  either. */
+function publishActiveTier(res: TierResolution): void {
+  setActiveQualityTier(res);
+  applyActiveTierToRuntime();
+}
+
+async function resolveActiveTierOnce(setting: QualityTierSetting): Promise<void> {
   // The player's stored choice outranks everything, including a pinned project setting — see
   // playerQualityTier.ts. Read before the early-out so a pin cannot hide it.
   const playerChoice = getPlayerQualityTier();
@@ -3347,9 +3408,40 @@ async function resolveActiveTier(setting: QualityTierSetting): Promise<void> {
     // and both are decided by `resolveTier` BEFORE it ever consults `formFactor`/`gpuRenderer`. So
     // the facts omitted here cannot change the answer. Add a resolver branch above those two and
     // this becomes wrong — feed it `getDeviceCapsSync()` then.
-    setActiveQualityTier(resolveTier({ platform: '', playerChoice, projectSetting: setting }));
+    publishActiveTier(resolveTier({ platform: '', playerChoice, projectSetting: setting }));
     return;
   }
+
+  // ⭐ ONE CONFIG ⇒ NO PROBE (owner, 2026-08-11; plan §2.2). Stated as a property rather than an
+  // optimisation: the probe's ONLY job is to choose between configs, so when a project authored
+  // just the default there is nothing to choose and the ~0.5-2.6 s of blocked launch buys a
+  // verdict that cannot change a single pixel. (An A23/S22 pays 0.5-0.8 s, an iPhone 8
+  // 1964-2619 ms, a Y6 ~2.2 s cold — and the verdict refines over three launches, so a device
+  // can pay it three times.)
+  //
+  // It sits ABOVE `getDeviceCaps()` deliberately, so the caps-probe renderer is not built either,
+  // and above the iOS model table + desktop carve-out because with one config all three would
+  // pick a tier NAME that decides nothing — reporting `mid` from a model id while rendering
+  // completely unclamped is a more confusing answer than reporting the truth.
+  //
+  // Two whole classes fall out of the rule instead of needing their own special cases:
+  //   - A PLAYABLE AD never probes. It could not have probed usefully anyway — `deviceModel`
+  //     comes from the `GameDebug` native plugin and a playable is a plugin-less web bundle, so
+  //     it always resolved `calibrating` and always ran the FULL probe, on every impression,
+  //     since a one-shot ad webview never accumulates the three launches a verdict needs.
+  //   - The EDITOR never probes: one config, on a desktop.
+  const tiers = getRenderSettings().three.tiers;
+  if (configCount(tiers) <= 1) {
+    publishActiveTier({
+      tier: 'high',
+      source: 'single-config',
+      // `high` names the UNCLAMPED default, which is what one config means — every tier resolves
+      // to the same overrides here, so the name is reporting, not policy.
+      reason: 'this project authored one quality config — nothing to measure between',
+    });
+    return;
+  }
+
   let caps: Awaited<ReturnType<typeof getDeviceCaps>> | null = null;
   try {
     caps = await getDeviceCaps();
@@ -3376,12 +3468,79 @@ async function resolveActiveTier(setting: QualityTierSetting): Promise<void> {
   // promotion path never fired on any hardware ever measured.
   const cheap = resolveTier(facts);
   if (cheap.source !== 'calibrating') {
-    setActiveQualityTier(cheap);
+    // ── MEASURE-AND-LOG (#188) ────────────────────────────────────────────────────────────
+    // ⚠️ **iOS HAS NEVER MEASURED ITSELF, AND THAT IS WHY THIS EXISTS.** `resolveTier` answers
+    // `source: 'model'` from the iOS model-generation table, which is `!== 'calibrating'`, so this
+    // early return is reached and the ramp probe below never runs on any iPhone or iPad. Measured
+    // 2026-08-11: an iPhone 8 running postfx-demo natively logged not one probe line across three
+    // full uninstall-and-reinstall cycles — it looked exactly like a broken build, and it was the
+    // design working as written.
+    //
+    // The consequence is that every band boundary this workstream derives comes from Android alone,
+    // while the thresholds apply to iOS too. The harness page is not a substitute: measured on the
+    // SAME three phones both ways, it disagrees with native about the RATIO between devices, not
+    // merely the level (S22:A23 on the cpu ramp is 2.1x native and 13.3x on the harness). A number
+    // from a different instrument cannot calibrate this one.
+    //
+    // So a debug build measures anyway and throws the verdict away. Three properties make that
+    // safe, and all three are load-bearing:
+    //   - the TIER IS UNCHANGED — `cheap` is what gets set, exactly as before;
+    //   - it is DEBUG-ONLY, so a release build is byte-for-byte unaffected;
+    //   - it EXCLUDES DESKTOP, because `areDebugHandlesEnabled()` is also true in the editor and
+    //     desktop reaches this same early return via `formFactor` — without that clause every
+    //     editor launch would grow a ramp probe it has no use for.
+    // It runs at the same point in boot as the real probe on Android (before the tier is set, on
+    // the critical path) precisely so the numbers are comparable to the Android campaign's; a
+    // measurement taken under different conditions would be the very thing this comment warns about.
+    if (areDebugHandlesEnabled() && caps?.formFactor !== 'desktop') {
+      await resolveProbeClass(caps, cheap.source);
+    }
+    publishActiveTier(cheap);
     return;
   }
 
   const probeClass = await resolveProbeClass(caps);
-  setActiveQualityTier(resolveTier({ ...facts, probeClass }));
+  publishActiveTier(resolveTier({ ...facts, probeClass }));
+}
+
+/** The quantitative tail of a probe run, for the boot log.
+ *
+ *  ⚠️ **IT IS PRINTED ON THE FAILURE PATH TOO, and that is the whole reason it exists as a
+ *  function.** The failing branch used to log a reason string and nothing else, so the single run
+ *  that most needed explaining — "fill ramp produced no usable reading" — was the one run whose
+ *  numbers were never recorded. Measured on a Galaxy S22 (2026-08-11): every first native launch
+ *  fails that way, and three sessions of investigation could not say why, because the log withheld
+ *  the interval the whole ramp is scaled against.
+ *
+ *  The STEP TABLE is the load-bearing part. `status` alone says a ramp did not escape; the steps
+ *  say whether it was still vsync-pinned (the device is fast and the ceiling is too low), already
+ *  running long (the yardstick is wrong), or never got enough frames to try. Those three want
+ *  opposite fixes and are indistinguishable from a verdict. */
+function describeProbe(m: ProbeMeasurement): string {
+  const ramp = (r: RampReading) =>
+    `${r.kind} ${r.status}/${r.bound} [`
+    + r.steps.map((s) => `${s.load}:${s.frameMs.toFixed(1)}`
+      + (s.gpuMs === undefined ? '' : `/gpu${s.gpuMs.toFixed(1)}`)).join(' ') + ']';
+  const ramps = [m.fill, m.draw, m.shade, m.cpu]
+    .filter((r): r is RampReading => r !== undefined).map(ramp).join(', ');
+  // ⚠️ THE CLOCK'S IDENTITY LEADS, because without it none of the numbers after it can be compared
+  // across devices. A WebGPU `onSubmittedWorkDone` reading and a WebGL2 `fenceSync` reading have
+  // different delivery latencies and different noise floors, and the runner has always KNOWN which
+  // it used — it just never survived to this line, because a `mark()` is only kept as `lastStage`
+  // and the next stage overwrites it. Two phones were ranked against each other for a whole session
+  // without anyone being able to say whether they had been timed by the same instrument.
+  return `${m.clockKind} clock, interval ${m.intervalMs.toFixed(1)}ms, ${ramps}, `
+    + `blocked launch ${m.totalMs.toFixed(0)}ms `
+    + `(renderer ${m.rendererMs.toFixed(0)} + compile ${m.compileMs.toFixed(0)}`
+    + (m.shadeCompileMs > 0 ? `+${m.shadeCompileMs.toFixed(0)}` : '')
+    + ` + ramps), buffer ${(m.bufferPixels / 1_000_000).toFixed(2)}Mpx`
+    + (m.shadeRegionPixels > 0 ? `, shade region ${m.shadeRegionPixels}px` : '')
+    // The two DERIVED, device-comparable figures. `fill`'s raw unit is screens/ms and `shade`'s is
+    // instances/ms; neither means anything across devices until it is normalised, and printing the
+    // raw step table without them is what let three sessions compare panel sizes by mistake.
+    + `, derived fill ${fillMegapixelsPerMs(m).toFixed(2)}Mpx/ms`
+    + (m.shade ? ` shade ${shadeMegaFragmentsPerMs(m).toFixed(2)}Mfrag/ms` : '')
+    + (m.cpu ? ` cpu ${(m.cpu.unitsPerMs / 1000).toFixed(1)}k xform/ms` : '');
 }
 
 /** The boot ramp probe's verdict — from cache when we have one for this hardware, otherwise by
@@ -3396,7 +3555,15 @@ async function resolveActiveTier(setting: QualityTierSetting): Promise<void> {
  *  and answers exactly as it did before this existed. */
 async function resolveProbeClass(
   caps: Awaited<ReturnType<typeof getDeviceCaps>> | null,
+  /** Set when the tier was ALREADY decided by something cheaper and this run is measure-and-log
+   *  only — the value is that decider's `source`, and every line this function logs says so.
+   *
+   *  ⚠️ The wording is not cosmetic. Without it an iPhone prints `[rampProbe] middle` while its tier
+   *  is `high` from the model table, and the only honest reading of that pair is that one of them is
+   *  a bug. Naming the decider is what makes the two lines agree with each other. */
+  evidenceFor?: string,
 ): Promise<DeviceClass | undefined> {
+  const tag = evidenceFor ? `[rampProbe] EVIDENCE ONLY (tier came from '${evidenceFor}')` : '[rampProbe]';
   const fingerprint = probeFingerprint({
     platform: caps?.platform,
     deviceModel: caps?.deviceModel,
@@ -3406,28 +3573,59 @@ async function resolveProbeClass(
 
   const store = probeVerdictStore.get();
   const cached = store?.read();
-  if (cached && cached.fingerprint === fingerprint) return cached.deviceClass;
+  const forThisDevice = cached && cached.fingerprint === fingerprint ? cached : null;
+  // SETTLED means never probe again. An UNSETTLED record means the opposite — probe once more and
+  // fold the result in — which is the whole of "refine across launches" (owner, 2026-08-09): one
+  // probe per launch as before, but the first few launches each pay one instead of only the first.
+  if (forThisDevice?.final) return forThisDevice.deviceClass;
 
+  // ⚠️ THE STAGE BREADCRUMB IS NOT OPTIONAL DIAGNOSTICS — IT IS THE ONLY WITNESS ON THE PATHS THAT
+  // RETURN NOTHING. `runBootRampProbe` resolves `null` for every unhappy ending it has — no DOM, no
+  // renderer, a throw, an implausible interval — and this function then returned silently, so a
+  // device that never classified left a log identical to one that never probed. Measured
+  // 2026-08-11: a Galaxy A23 and a Huawei Y6 each loaded the probe module on three launches and
+  // emitted not one line about what happened next. The runner has always MARKED every stage; the
+  // production caller simply passed no callback and threw the marks away.
+  let lastStage = 'start';
   try {
     const { runBootRampProbe } = await import('./rampProbeRunner');
     // Guarded: the probe constructs a renderer, which re-enters this very resolution path.
-    const measurement = await withProbeInFlight(() => runBootRampProbe());
-    if (!measurement) return undefined;
-    const verdict = classifyDevice(measurement);
+    const measurement = await withProbeInFlight(() => runBootRampProbe((stage) => { lastStage = stage; }));
+    // Fall back to what earlier launches concluded rather than to nothing: a probe that failed
+    // THIS launch does not invalidate readings that succeeded before it.
+    if (!measurement) {
+      console.warn(`${tag} produced no measurement — last stage '${lastStage}'`);
+      return forThisDevice?.deviceClass;
+    }
+    const oneRun = classifyDevice(measurement);
+    // An unusable ramp yields no READING, so there is nothing to fold in — keep what we had.
+    if (oneRun.deviceClass === 'unknown') {
+      console.warn(`${tag} no usable reading — ${oneRun.reason} (${describeProbe(measurement)})`);
+      return forThisDevice?.deviceClass;
+    }
+    const refined = refineProbeVerdict(forThisDevice?.samples ?? [], readingOf(measurement));
     console.warn(
-      `[rampProbe] ${verdict.deviceClass} — ${verdict.reason} `
-      + `(blocked launch ${measurement.totalMs.toFixed(0)}ms: renderer `
-      + `${measurement.rendererMs.toFixed(0)}ms + compile ${measurement.compileMs.toFixed(0)}ms + ramps; `
-      + `interval ${measurement.intervalMs.toFixed(1)}ms, `
-      + `fill ${measurement.fill.status}, draw ${measurement.draw.status})`,
+      `${tag} ${refined.deviceClass} — ${refined.reason} `
+      + `(this pass alone: ${oneRun.deviceClass}; ${describeProbe(measurement)})`,
     );
-    // Only a real verdict is worth caching. Caching `'unknown'` would freeze in the state the
-    // probe is in TODAY (thresholds unset), so that filling those thresholds in would never
-    // reach a device that had already launched once.
-    if (verdict.deviceClass !== 'unknown') store?.write({ fingerprint, deviceClass: verdict.deviceClass });
-    return verdict.deviceClass === 'unknown' ? undefined : verdict.deviceClass;
-  } catch {
-    return undefined;
+    // Only a real verdict is worth persisting. Caching `'unknown'` would freeze a device in the
+    // state the probe is in TODAY, so that correcting the thresholds later could never reach a
+    // device that had already launched once.
+    if (refined.deviceClass !== 'unknown') {
+      store?.write({
+        fingerprint,
+        deviceClass: refined.deviceClass,
+        samples: [...refined.samples],
+        final: refined.final,
+      });
+    }
+    return refined.deviceClass === 'unknown' ? undefined : refined.deviceClass;
+  } catch (e) {
+    // Swallowing the tier decision is right — a probe failure must never block rendering — but
+    // swallowing the REASON is not. This catch spans a dynamic import, a renderer construction and
+    // a PlayerPrefs write; silent, all three failures look the same as no probe at all.
+    console.warn(`${tag} threw at stage '${lastStage}' — ${String(e).slice(0, 200)}`);
+    return forThisDevice?.deviceClass;
   }
 }
 

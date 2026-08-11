@@ -586,12 +586,21 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
               title: 'Three.js (3D)',
               fields: [
                 { key: 'rendering.three.backend', label: 'GPU backend', type: 'select', options: GPU_BACKENDS.map((v) => ({ value: v, label: v })), help: 'auto = detect, prefer WebGPU' },
-                { key: 'rendering.three.qualityTier', label: 'Quality tier', type: 'select', options: QUALITY_TIERS.map((v) => ({ value: v, label: v })), help: 'auto = measure the device and pick; low clamps the four fields below. Takes effect on the next renderer bring-up — use the debug menu Device tab to preview it live' },
+                // ⚠️ Ten fields across two consumption paths now (docs/rendering.md § "Quality tiers"),
+                // not four, and there are THREE tiers ('mid' authored separately below) — the old text said
+                // "four fields below" from when this dropdown was the only tier surface. ⚠️ Pinning a tier
+                // this project has NOT authored (via "quality-tiers" below) does NOTHING: every tier resolves
+                // to the unclamped default until a config exists for it (resolveTierOverrides falls back to
+                // the default, never invents clamping). The plan (§2.3) wants this dropdown filtered to only
+                // the tiers actually authored, which needs a new schema capability for dynamic (data-dependent)
+                // select options — out of scope for A3; tracked there, not half-built here.
+                { key: 'rendering.three.qualityTier', label: 'Quality tier', type: 'select', options: QUALITY_TIERS.map((v) => ({ value: v, label: v })), help: "auto = measure the device and pick among the tiers this project authored below. Pinning 'mid'/'low' does NOTHING unless that tier has been added under Quality Tiers — an unauthored tier always resolves the unclamped default. Takes effect on the next renderer bring-up — use the debug menu Device tab to preview it live" },
                 { key: 'rendering.three.antialias', label: 'Antialias', type: 'checkbox' },
                 { key: 'rendering.three.shadows', label: 'Shadows', type: 'checkbox' },
                 { key: 'rendering.three.pixelRatioCap', label: 'Pixel-ratio cap', type: 'number', placeholder: '2 (0 = uncapped)' },
                 { key: 'rendering.three.toneMapping', label: 'Tone mapping', type: 'select', options: TONE_MAPPINGS.map((v) => ({ value: v, label: v })) },
                 { key: 'rendering.three.exposure', label: 'Exposure', type: 'number', placeholder: '1' },
+                { key: 'rendering.three.tiers', label: 'Quality Tiers (mid / low)', type: 'quality-tiers', help: 'add a mid/low degradation on top of the default above — seeded from the engine\'s measured behaviour. No tiers authored = one config = the boot probe never runs.' },
               ],
             },
             {

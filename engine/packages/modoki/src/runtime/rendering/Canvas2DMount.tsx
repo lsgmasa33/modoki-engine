@@ -6,7 +6,7 @@ import { useRef, useEffect } from 'react';
 import { defaultPool, type Canvas2DPool } from './canvas2DPool';
 import { markScene2DDirty } from './Scene2D';
 import { retrySizeUntilMeasured, computeBackingSize } from './canvas2DSizing';
-import { getRenderSettings } from './renderSettings';
+import { getRenderSettings, getEffectivePixiSettings } from './renderSettings';
 import { onForceResize } from './resizeBus';
 
 interface Canvas2DMountProps {
@@ -56,12 +56,19 @@ export function Canvas2DMount({ entityId, pool = defaultPool, markDirty = markSc
       // never capped), the `max` sizeMode buffer clamp (only when applyWebSizeMode —
       // excludes the editor viewport), and the GPU max-texture longer-axis cap. See
       // canvas2DSizing.ts for the full mechanics.
+      //
+      // ⚠️ `pixelRatioCap` comes from getEffectivePixiSettings() — the TIER-ADJUSTED value (#202)
+      // — while `resolution` comes from the raw settings, because a pinned resolution is
+      // deliberately not tiered (capping an explicit pin would make the pin a lie). This function
+      // re-reads on every run and is registered on the resize bus below, which is what makes a
+      // live tier change reach the backing buffer with no diffing anywhere.
+      const pixi = getEffectivePixiSettings();
       return computeBackingSize({
         rectWidth: rect.width,
         rectHeight: rect.height,
         devicePixelRatio: window.devicePixelRatio || 1,
         resolution: getRenderSettings().pixi.resolution,
-        pixelRatioCap: getRenderSettings().pixi.pixelRatioCap,
+        pixelRatioCap: pixi.pixelRatioCap,
         web: applyWebSizeMode ? getRenderSettings().web : null,
       });
     }

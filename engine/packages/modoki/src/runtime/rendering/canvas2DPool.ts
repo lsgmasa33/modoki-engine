@@ -26,7 +26,7 @@
 
 import { Application, Container } from 'pixi.js';
 import { getWebGPUSupported } from './gpuDetect';
-import { getRenderSettings } from './renderSettings';
+import { getRenderSettings, getEffectivePixiSettings } from './renderSettings';
 import { registerPointerPassthrough } from '../core/pointerBlockers';
 
 /** Resolve the PixiJS renderer backend the Canvas2D layer will actually use:
@@ -123,7 +123,12 @@ export class Canvas2DPool {
     if (slot.initialized) return;
     if (!this.preferenceResolved) await this.initPool();
 
-    const pixi = getRenderSettings().pixi;
+    // TIER-ADJUSTED (#202) — `antialias` is one of the two 2D fields a tier may clamp. ⚠️ Like its
+    // 3D twin it is a CONSTRUCTOR option (baked in by `Application.init` below), so a tier
+    // resolved or changed after this slot exists cannot walk it back; it catches up on the next
+    // slot creation. `resolution` is not passed at all (see the block comment below), and
+    // `backend` is deliberately not tier-clampable.
+    const pixi = getEffectivePixiSettings();
     // Deliberately do NOT pass `resolution`/`autoDensity` here — Pixi stays at its default
     // resolution of 1, so `renderer.resize(w, h)` (called from Canvas2DMount via
     // canvas2DSizing.computeBackingSize) means literally "w×h backing pixels", and the

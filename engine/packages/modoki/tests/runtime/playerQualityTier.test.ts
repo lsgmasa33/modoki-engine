@@ -23,10 +23,10 @@ import {
 import {
   tickTierCalibration, resetTierCalibration, getPendingTierPromotion, CALIBRATION_INTERVAL_MS,
 } from '../../src/runtime/rendering/tierCalibration';
-import { PROMOTION_HOLD_MS } from '../../src/runtime/rendering/qualityTier';
+import { PROMOTION_HOLD_MS, TIER_SETTINGS } from '../../src/runtime/rendering/qualityTier';
 import type { FrameProfile } from '../../src/runtime/core/frameProfiler';
 
-let stored: 'low' | 'high' | null = null;
+let stored: 'low' | 'mid' | 'high' | null = null;
 const stat = (v: number) => ({ median: v, p95: v, min: v, max: v });
 const mockProfile: FrameProfile = {
   samples: 120, frameMs: stat(10), cpuMs: stat(4), restMs: stat(6), fps: 100,
@@ -99,13 +99,19 @@ describe('calibration must not argue with the player', () => {
   });
 
   it('resumes calibrating once the player picks Auto', () => {
-    setRenderSettings({ three: { qualityTier: 'auto' } });
+    // Authored configs, because since the owner's "one config ⇒ nothing to change to" rule
+    // (plan §2.2) calibration only runs when there IS something to move to. This test is about
+    // the player gate releasing, not about the config gate — so give it a ladder to climb.
+    setRenderSettings({ three: { qualityTier: 'auto', tiers: { mid: TIER_SETTINGS.mid, low: TIER_SETTINGS.low } } });
     setActiveQualityTier({ tier: 'low', source: 'calibrating', reason: 'x' });
     setPlayerQualityTier(null);
 
     for (let t = 0; t <= PROMOTION_HOLD_MS + CALIBRATION_INTERVAL_MS; t += CALIBRATION_INTERVAL_MS) {
       tickTierCalibration(t);
     }
-    expect(getPendingTierPromotion()).toMatchObject({ tier: 'high' });
+    // ONE STEP UP THE LADDER, so `low` promotes to `mid` and not to `high` (#188). Before `mid`
+    // existed this read 'high' and meant the same thing — "the next tier up" — which is exactly
+    // why the target now comes from the decision instead of from a literal at the call site.
+    expect(getPendingTierPromotion()).toMatchObject({ tier: 'mid' });
   });
 });

@@ -111,6 +111,50 @@ describe('gpuDetect', () => {
  *  every caller of getWebGPUSupported() awaiting forever — including Canvas2DPool's backend
  *  pick, which means the 2D renderer is never constructed and the screen stays blank with no
  *  error. Same shape as the font worker that hung Court's splash screen. */
+describe('the timeout must not fire when the probe ANSWERED', () => {
+  it('logs nothing once a fast probe has succeeded', async () => {
+    // ⚠️ The timer was created and never cancelled, so it fired 8s after EVERY probe and warned
+    // "did not answer within 8000ms — falling back to WebGL" — including on devices that answered
+    // in 13-29ms and were using WebGPU perfectly. `resolve(false)` on a settled race is a silent
+    // no-op, so nothing downstream broke; only the log lied, and on a phone the log is the whole
+    // instrument. It produced two confidently wrong conclusions before anyone questioned it.
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      setGpu(gpu({ adapter: true }));
+      const { getWebGPUSupported } = await getModule();
+      await expect(getWebGPUSupported()).resolves.toBe(true);
+      await vi.advanceTimersByTimeAsync(30_000);   // long past the 8s timeout
+      expect(warn).not.toHaveBeenCalled();
+    } finally { warn.mockRestore(); vi.useRealTimers(); }
+  });
+
+  it('logs nothing when the device is genuinely unsupported and said so quickly', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      setGpu(gpu({ adapter: false }));           // a real "no adapter" answer, not a hang
+      const { getWebGPUSupported } = await getModule();
+      await expect(getWebGPUSupported()).resolves.toBe(false);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(warn).not.toHaveBeenCalled();       // false, but NOT because it timed out
+    } finally { warn.mockRestore(); vi.useRealTimers(); }
+  });
+
+  it('DOES warn when the probe really never answers — the message must stay truthful', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      setGpu({ requestAdapter: () => new Promise(() => {}) });
+      const { getWebGPUSupported } = await getModule();
+      const probe = getWebGPUSupported();
+      await vi.advanceTimersByTimeAsync(8_001);
+      await expect(probe).resolves.toBe(false);
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally { warn.mockRestore(); vi.useRealTimers(); }
+  });
+});
+
 describe('the WebGPU probe cannot hang', () => {
   it('resolves false when requestAdapter never answers', async () => {
     vi.useFakeTimers();

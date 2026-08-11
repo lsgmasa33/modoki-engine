@@ -98,6 +98,43 @@ export interface BuildModules {
 /** One engine-module key (a field of {@link BuildModules}). */
 export type ModuleKey = keyof BuildModules;
 
+/** A project's authored degradation for one tier below the default
+ *  (docs/rendering.md § "Quality tiers") — every field a tier may clamp, seeded
+ *  from the engine's measured `TIER_SETTINGS` when a project adds one. Mirrors
+ *  `TierRenderOverrides` (runtime/rendering/qualityTier.ts) field-for-field; restated rather than
+ *  imported because this file is deliberately import-free (see the header). */
+export interface TierOverridesConfig {
+  pixelRatioCap: number;
+  antialias: boolean;
+  shadows: boolean;
+  shadowMapCeiling: number;
+  /** Per-effect post-FX gate (§3 "Post-FX is PER EFFECT, not one switch") — the same five keys
+   *  as the engine's `PostFXEffect`. */
+  postFX: {
+    npr: boolean;
+    ao: boolean;
+    dof: boolean;
+    bloom: boolean;
+    vignette: boolean;
+  };
+  maxDirectional: number;
+  maxLocal: number;
+  ibl: boolean;
+  iblOffAmbientBoost: number;
+  iblOffExposure: number;
+  /** Frame cap this tier imposes, in fps. **0 = no tier cap** — the same sentinel as
+   *  `rendering.targetFps` above, which is why the engine clamps it through
+   *  `applyTierToTargetFps` and not a `Math.min` (#202). */
+  targetFps: number;
+  /** The 2D analogue of `pixelRatioCap`, applied to the PixiJS backing buffer. **0 = uncapped**
+   *  (matching `rendering.pixi.pixelRatioCap`'s own convention). `pixi.resolution` is deliberately
+   *  NOT tiered — it is a pin, and capping a pin would make the pin a lie. */
+  pixiPixelRatioCap: number;
+  /** The 2D analogue of `antialias`. Baked into the Pixi `Application` at slot creation, so a live
+   *  tier change catches up on the next slot rather than applying immediately. */
+  pixiAntialias: boolean;
+}
+
 export interface ProjectConfig {
   app: {
     /** Capacitor appId / native bundle identifier. */
@@ -248,17 +285,27 @@ export interface ProjectConfig {
       pixelRatioCap: number;
       shadows: boolean;
       /** Quality tier (#121): 'auto' delegates to the device allowlist + on-device calibration;
-       *  'low'/'high' pin it. A tier CLAMPS the settings above — it never raises them — so
+       *  'low'/'mid'/'high' pin it. A tier CLAMPS the settings above — it never raises them — so
        *  'high' is exactly today's behaviour and the fields beside it stay authoritative.
        *
        *  **Defaults to 'auto' since #155**, which resolves LOW on anything not allowlisted (a
        *  desktop excepted). Pin 'high' to opt a project out — but note what that opts into: a
        *  Y6 2019 booting 'high' took a 6388 ms post-FX submit, lost its GPU context and stayed
        *  blank, where 'auto' holds 27-33 fps on the same phone. */
-      qualityTier: 'auto' | 'low' | 'high';
+      qualityTier: 'auto' | 'low' | 'mid' | 'high';
       /** Tone-mapping operator ('ACESFilmic' | 'AgX' | 'Neutral' | 'Linear' | 'None'). */
       toneMapping: (typeof TONE_MAPPINGS)[number];
       exposure: number;
+      /** A project's authored `mid`/`low` degradation configs
+       *  (docs/rendering.md § "Quality tiers") — ABSENT, not an empty object, when
+       *  the project has authored neither. **Presence is the signal**: no `tiers` means one
+       *  config (the default, i.e. no clamping at all) means nothing to choose between means
+       *  the boot probe does not need to run (§2.2, A2). A project adds `mid`/`low` only to opt
+       *  into degradation; `rendering.three` above gains nothing from this field existing. */
+      tiers?: {
+        mid?: TierOverridesConfig;
+        low?: TierOverridesConfig;
+      };
     };
     pixi: {
       /** GPU API: 'auto' (detect, prefer WebGPU) | 'webgpu' | 'webgl'. */
@@ -569,9 +616,11 @@ export function projectConfigIssues(partial: Partial<ProjectConfig> | null | und
  *  a guard test instead of by an import. */
 export const WEB_SIZE_MODES = ['free', 'fixed', 'max'] as const;
 export const GPU_BACKENDS = ['auto', 'webgpu', 'webgl'] as const;
-/** Quality tiers a project may select (#121 P3). 'auto' delegates to the device allowlist +
- *  on-device calibration; 'low'/'high' pin it. */
-export const QUALITY_TIERS = ['auto', 'low', 'high'] as const;
+/** Quality tiers a project may select (#121 P3, `mid` added by #188). 'auto' delegates to the
+ *  device allowlist + the boot ramp probe + on-device calibration; 'low'/'mid'/'high' pin it.
+ *  Kept in the same weakest-first order as the package's `TIER_ORDER`, which is what a pinning UI
+ *  reads as a ladder. */
+export const QUALITY_TIERS = ['auto', 'low', 'mid', 'high'] as const;
 export const WEB_DEPLOY_MODES = ['none', 'gcs', 'custom'] as const;
 /** Ad-network MRAID/CTA conventions for the playable export. */
 export const PLAYABLE_NETWORKS = ['applovin', 'unity', 'ironsource', 'facebook', 'mintegral', 'generic'] as const;
@@ -752,13 +801,38 @@ const FORBIDDEN_PATCH_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
  *     is keyed by postprocessor id, and since objects merge recursively there is no way
  *     to express "delete this entry" through a patch. Removing one means editing
  *     project.config.json directly. Fixed-shape sections are unaffected, and arrays
- *     (content.scenes, physics.layers) do support removal because they replace. */
-export function deepMergeConfigPatch(base: RawProjectConfig, patch: RawProjectConfig): RawProjectConfig {
+ *     (content.scenes, physics.layers) do support removal because they replace.
+ *   - ...EXCEPT the paths in {@link REPLACE_WHOLESALE}, which behave like arrays. See there. */
+/** Dot-paths merged as LEAVES — replaced wholesale — because for them the ABSENCE of a key is
+ *  meaningful data rather than "leave it alone".
+ *
+ *  ⚠️ **`rendering.three.tiers` is here because without it the Project Settings "Remove" button
+ *  is a lie.** The dialog posts the whole draft and the backend deep-merges it, so a removed
+ *  `low` is simply an absent key — which every other map-like section reads as "don't touch". The
+ *  dialog would close cleanly, report success, and the tier would still be in the file on the next
+ *  load. Found by testing the real merge rather than the component (`deepMergeConfigPatch` with a
+ *  `low`-omitting patch demonstrably returned the `low` unchanged), which is the only way to see
+ *  it — the component's own object is correct, and every unit test of it passes.
+ *
+ *  It is also the ONE map here whose emptiness is semantic: no `tiers` (or an empty one) means the
+ *  project authored a single quality config, which is what tells the boot probe not to run at all
+ *  (docs/rendering.md § "Quality tiers"). A section that cannot express removal cannot
+ *  express that. */
+const REPLACE_WHOLESALE = new Set(['rendering.three.tiers']);
+
+export function deepMergeConfigPatch(
+  base: RawProjectConfig,
+  patch: RawProjectConfig,
+  path = '',
+): RawProjectConfig {
   const out: RawProjectConfig = { ...base };
   for (const [k, v] of Object.entries(patch)) {
     if (v === undefined || FORBIDDEN_PATCH_KEYS.has(k)) continue;
+    const here = path ? `${path}.${k}` : k;
     const prev = out[k];
-    out[k] = isPlainObject(v) && isPlainObject(prev) ? deepMergeConfigPatch(prev, v) : v;
+    out[k] = isPlainObject(v) && isPlainObject(prev) && !REPLACE_WHOLESALE.has(here)
+      ? deepMergeConfigPatch(prev, v, here)
+      : v;
   }
   return out;
 }

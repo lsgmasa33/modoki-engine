@@ -9,7 +9,9 @@
  *  move it. Three runs make an outlier visible instead of authoritative. */
 
 import { runBootRampProbe } from '../../packages/modoki/src/runtime/rendering/rampProbeRunner';
-import { classifyDevice, fillMegapixelsPerMs, type ProbeMeasurement } from '../../packages/modoki/src/runtime/rendering/rampProbe';
+import {
+  classifyDevice, fillMegapixelsPerMs, shadeMegaFragmentsPerMs, type ProbeMeasurement,
+} from '../../packages/modoki/src/runtime/rendering/rampProbe';
 import { getRenderSettings, setRenderSettings } from '../../packages/modoki/src/runtime/rendering/renderSettings';
 
 /** Injected by build.mjs. See its comment for why a visible build stamp is load-bearing here. */
@@ -57,13 +59,23 @@ const RUNS = Math.min(20, Math.max(1, Number(new URLSearchParams(location.search
 function line(m: ProbeMeasurement): string {
   const r = (n: number) => Math.round(n);
   const f = (n: number) => n.toFixed(1);
-  return `total=${r(m.totalMs)} renderer=${r(m.rendererMs)} compile=${r(m.compileMs)} `
-    + `interval=${f(m.intervalMs)} buf=${m.bufferPixels} `
-    // Mpx/ms is the comparable figure; the raw quads/ms is kept only so a suspicious reading can
-    // be traced back to the ramp that produced it.
+  // ⚠️ THE CLOCK LEADS. A WebGPU queue-promise reading and a WebGL2 fence reading have different
+  // delivery latencies and noise floors, and on the Android campaign the three phones split across
+  // BOTH (Y6 on webgl2, both Samsungs on webgpu). A cross-device table that does not say which
+  // instrument produced each row is not a comparison.
+  return `clock=${m.clockKind} total=${r(m.totalMs)} renderer=${r(m.rendererMs)} `
+    + `compile=${r(m.compileMs)}+${r(m.shadeCompileMs)} `
+    + `interval=${f(m.intervalMs)} buf=${m.bufferPixels} region=${m.shadeRegionPixels} `
+    // The DERIVED figures first — the raw per-ramp units are not comparable between devices
+    // (see fillMegapixelsPerMs / shadeMegaFragmentsPerMs) and the raw ones are kept only so a
+    // suspicious reading can be traced back to the ramp that produced it.
     + `fillMpx=${fillMegapixelsPerMs(m).toFixed(3)} `
+    + `shadeMfrag=${shadeMegaFragmentsPerMs(m).toFixed(3)} `
+    + `cpuK=${m.cpu ? (m.cpu.unitsPerMs / 1000).toFixed(2) : 'n/a'} `
     + `fill=${m.fill.status}/${m.fill.bound}:${f(m.fill.unitsPerMs)}@${m.fill.peakLoad} `
-    + `draw=${m.draw.status}/${m.draw.bound}:${f(m.draw.unitsPerMs)}@${m.draw.peakLoad}`;
+    + `draw=${m.draw.status}/${m.draw.bound}:${f(m.draw.unitsPerMs)}@${m.draw.peakLoad} `
+    + `shade=${m.shade ? `${m.shade.status}/${m.shade.bound}:${f(m.shade.unitsPerMs)}@${m.shade.peakLoad}` : 'absent'} `
+    + `cpu=${m.cpu ? `${m.cpu.status}/${m.cpu.bound}:${r(m.cpu.unitsPerMs)}@${m.cpu.peakLoad}` : 'absent'}`;
 }
 
 /** Ship one line home immediately.
@@ -144,8 +156,10 @@ async function runProbeSession(): Promise<void> {
     // Mpx/ms, not the raw quads/ms the ramp works in: the raw figure is not comparable between
     // devices (see fillMegapixelsPerMs), and a headline is exactly where someone reads a number
     // off a screen and compares it to another device's.
-    headlineEl.textContent = `${Math.round(med.totalMs)} ms · fill ${fillMegapixelsPerMs(med).toFixed(2)} Mpx/ms `
-      + `· draw ${med.draw.unitsPerMs.toFixed(0)}/ms · ${med.fill.status}/${med.draw.status}`;
+    headlineEl.textContent = `${Math.round(med.totalMs)} ms · cpu `
+      + `${med.cpu ? (med.cpu.unitsPerMs / 1000).toFixed(1) : '-'}k xform/ms `
+      + `· shade ${shadeMegaFragmentsPerMs(med).toFixed(2)} Mfrag/ms `
+      + `· fill ${fillMegapixelsPerMs(med).toFixed(2)} Mpx/ms · ${med.clockKind}`;
   } else {
     headlineEl.textContent = 'no result';
     headlineEl.className = 'big warn';

@@ -513,10 +513,17 @@ export const spaceConsoleConfig: GameConfig = {
 
 The `GameConfig.preferWebGPU` JSDoc in `runtime/config.ts` is likewise stale (still describes an `'auto'` → legacy `WebGLRenderer` fallback).
 
-### Quality tiers — `low` / `high` (#121 P3)
+### Quality tiers — `low` / `mid` / `high` (#121 P3, `mid` from #188)
 
-A project sets `rendering.three.qualityTier: 'auto' | 'low' | 'high'` (Project Settings → Three.js).
-Two tiers, not three: three would demand evidence for two boundaries and we had it for zero.
+A project sets `rendering.three.qualityTier: 'auto' | 'low' | 'mid' | 'high'` (Project Settings →
+Three.js).
+
+⚠️ **It was two tiers for most of this work, and the reason was honest** — three tiers demand
+evidence for two boundaries and we had it for zero. What changed is the **boot ramp probe** (below):
+run on five real devices, it puts the population in three bands ~10× and ~2.5× apart. The Galaxy
+A23 is the case that forced it — a two-tier split files it with a Huawei Y6, and that is wrong by
+our own measurement, since forest-camp's IBL costs **+2.9 ms of GPU** there and fits inside 60 fps
+on hardware ~10× the Y6.
 
 **A TIER CLAMPS; IT NEVER RAISES.** `high` is provably a no-op — a project that deliberately
 authored `pixelRatioCap: 1` or `shadows: false` keeps it, because landing on the high tier is not a
@@ -526,16 +533,386 @@ for every existing project when the default was `high`. As of #155, `DEFAULT_TIE
 through the allowlist/desktop-carve-out/calibration precedence below, and an unrecognised device
 starts `low`. A project that wants exactly today's behaviour must pin `qualityTier: 'high'`.
 
-| knob | `low` | `high` | live-changeable? |
-|---|---|---|---|
-| `pixelRatioCap` | 1 | 2 | ✅ via the resize bus |
-| `shadows` | off | on | ✅ `shadowMap.enabled` |
-| `Light.shadowMapSize` ceiling | 512 | none | ✅ re-read each frame by `syncLights` |
-| post-FX stack | **dropped** | on | ✅ stack disposed |
-| `antialias` | off | on | ❌ **constructor-only** |
-| **IBL** (`scene.environment`) | **dropped** | on | ✅ `syncEnvironment` re-reads each frame |
-| ambient compensation | ×4 | ×1 | ✅ `syncLights`, gated on `isIblSuppressed()` |
-| exposure compensation | ×1.25 | ×1 | ✅ `reconcileToneExposure`, same gate, per frame |
+| knob | `low` | `mid` | `high` | live-changeable? |
+|---|---|---|---|---|
+| `pixelRatioCap` | 1 | 1 | 2 | ✅ via the resize bus |
+| `shadows` | off | **on** | on | ✅ `shadowMap.enabled` |
+| `Light.shadowMapSize` ceiling | 512 | **1024** | none | ✅ re-read each frame by `syncLights` |
+| post-FX stack | **dropped** | **dropped** | on | ✅ stack disposed |
+| `antialias` | off | off | on | ❌ **constructor-only** |
+| max directional lights | 1 | 2 | unlimited | ⚠️ **NOT WIRED — see below** |
+| max point+spot lights | 1 | 3 | unlimited | ⚠️ **NOT WIRED — see below** |
+| **IBL** (`scene.environment`) | **dropped** | **on** | on | ✅ `syncEnvironment` re-reads each frame |
+| ambient compensation | ×4 | ×1 | ×1 | ✅ `syncLights`, gated on `isIblSuppressed()` |
+| exposure compensation | ×1.25 | ×1 | ×1 | ✅ `reconcileToneExposure`, same gate, per frame |
+| **`targetFps`** (#202) | **30** | none | none | ✅ `setTargetFPS` at every publish point — **not in the editor** |
+| **`pixi.pixelRatioCap`** (#202) | **1** | 1 | 2 | ✅ via the resize bus |
+| **`pixi.antialias`** (#202) | off | off | on | ❌ **constructor-only** (`Application.init`) |
+
+**`mid` LOOSENS ONLY WHAT WAS MEASURED**, and reading the table's unchanged columns as unfinished
+work gets it backwards. IBL is on because the A23 was measured affording it; shadows are on because
+the band is ~10× the Y6 — but with a map-size **floor**, since bias scaling alone was measured NOT
+to make a 512 map usable. Post-FX stays off *because* of a measurement, not for lack of one: an
+iPhone 8, squarely mid-band, goes 27 ms → 56 ms on NPR alone. Resolution and AA stay at `low`'s
+values because nothing has measured them on this band, and that costs nothing today — every
+mid-band device currently resolves `low` anyway, so `mid` is a strict improvement on what they get,
+never a regression. The light caps are anchored on the A23 ladder (1 directional = 21 ms; +3 point =
+34 ms; +8 point = 165 ms — superlinear, with a cliff between 5 and 10 lights).
+
+The one number here with neither a measurement nor a carry-forward is the **1024 shadow-map
+ceiling**: 512 is measured unusable and 2048 is what projects author, so it is the step between.
+Worst case it renders coarser shadows than intended, which costs quality and not the frame.
+
+#### ⭐ A TIER'S CONTENT IS AUTHORED BY THE PROJECT — `TIER_SETTINGS` is only the seed
+
+Owner decision, 2026-08-11. The table above is **not** what runs any more; it is what a project
+**starts from**. A project authors its own degradation in **Project Settings → Rendering & Physics
+→ Three.js (3D)**, and the rule that shapes everything else is:
+
+> **A project starts with ONE config — the default, which is what it authored — and *adds* a `mid`
+> and a `low` only if it wants degradation.**
+
+Why it moved: `TIER_SETTINGS` was ten fields of `const` that the owner could not reach, which is
+exactly the bias CLAUDE.md's "Author values in the SCENE and the PREFAB" rule exists to correct. A
+project could only pin *which row it got*, never say what a row meant — so postfx-demo, a post-FX
+*showcase*, had to drop the entire stack on `low` because the engine said so.
+
+- **The default is the ABSENCE of clamping**, not a stored object. `rendering.three` gains nothing;
+  only an added tier carries values (`rendering.three.tiers.{mid,low}`, both optional and **absent**
+  rather than empty when unauthored). That is what `high` already meant — the engine guarantees it
+  is a no-op — so this names existing behaviour. `UNCLAMPED_OVERRIDES` is the identity.
+  ⚠️ It is a **true** identity, which `TIER_SETTINGS.high` was not: that row carries
+  `pixelRatioCap: 2` and the clamp is `Math.min(authored, 2)`, so a project authoring 3 silently
+  got 2 (#200).
+- **Resolution falls DOWN, never up.** A `low` on a project that authored only `mid` gets `mid` —
+  the author's most conservative config is the closest thing to what they meant, and reaching for
+  the unclamped default there would hand the weakest hardware the settings they were degrading away
+  from. `unknown` (the probe ran and produced nothing usable) takes the LOWEST authored config, for
+  the same reason: absence of a measurement is not evidence of capability.
+- ⭐ **ONE CONFIG ⇒ NO PROBE, and no calibration either.** Stated as a property rather than an
+  optimisation: the probe's only job is to *choose between configs*, so with one config the choice
+  is already made and the launch-blocking probe buys a verdict that cannot change a pixel — 0.5–0.8 s
+  on an A23/S22, 1964–2619 ms on an iPhone 8, ~2.2 s cold on a Y6, and up to three launches before
+  a verdict settles. The live half stands down too: with nothing to demote *to*, a demotion would
+  move a tier name, free no memory, drop no effect, and still pay a `forceResizeAllSurfaces()` on a
+  device already missing its budget. Two cases fall out of the rule instead of needing their own
+  gates — **a playable ad never probes** (it never could have usefully: `deviceModel` comes from
+  the `GameDebug` native plugin, so a plugin-less ad bundle always resolved `calibrating` and ran
+  the FULL probe on *every impression*), and neither does the editor.
+- **Post-FX is per effect**, not one switch: `npr`/`ao`/`dof`/`bloom`/`vignette`, named with
+  `PostFXRequest`'s own keys because the mask is applied by *deleting* keys from that request. On
+  one iPhone 8 NPR is ~+29 ms against vignette's ~6 and bloom's ~4 — seven to one, and the old
+  boolean treated them identically.
+- **Adding a tier SEEDS it from `TIER_SETTINGS`**, with the measurement behind each value in the
+  field's help text, so "Add low" is an informed edit rather than ten blank boxes.
+- **Every existing project was seeded** (`engine/scripts/seed-quality-tiers.mjs`), so nothing
+  regressed — at the price that a seeded project has >1 config and therefore keeps probing. The
+  drift guard is on the **seeder's** values against `TIER_SETTINGS`, deliberately *not* on each
+  project's, since asserting those still match would forbid the tuning this feature exists for.
+  ⚠️ The seeder is **idempotent by "already authors `tiers`"**, which means a field added later
+  would never reach the 22 already-seeded projects. So it also **backfills**: any seed key an
+  authored tier is missing is added, per tier, and a key already present is never overwritten (a
+  tuned value stays authoritative — the STARTING POINT rule applies to a field added today exactly
+  as it did in A4). `resolveTierOverrides` completes a config the same way at read time, from
+  `UNCLAMPED_OVERRIDES`, so **a missing field means UNCLAMPED, never `0`/`false`** — a config
+  written before a field existed cannot have meant to clamp it, and `Math.min(3, undefined)` is
+  `NaN`, i.e. a backing buffer of `NaN` pixels, silently.
+
+#### The 2D layer and the frame cap (#202)
+
+A tier used to clamp **three Three.js knobs and nothing else**. `qualityTier.ts` contained zero
+references to `pixi` and the clamp was literally named `applyTierToThree`, so `pixi.pixelRatioCap`
+and `pixi.antialias` passed through untouched at every tier — meaning the whole tier system, boot
+probe included, changed nothing for a project that renders no 3D. `games/court` is the sharpest
+case: it authors `pixi.pixelRatioCap: 3`. And `targetFps` reached the frame driver once at boot
+(`register.ts`) and was never re-read, so it was the one renderer knob no tier could touch.
+
+- **The 2D DPR cap carries the SAME Y6 measurement, not a new one** — 1× = 22 ms/45 fps against
+  2× = 69 ms/14 fps, ~4× cost for 2× DPR. That is a fill-rate fact about a tile-based mobile GPU,
+  not a Three.js fact, so it applies to a Pixi canvas identically. Say "carry-forward" rather than
+  implying the 2D layer was measured separately.
+- ⚠️ **`low` capping to 30 fps is the ONE seeded value that is a deliberate behaviour change**
+  (owner, 2026-08-11). Every other seeded value preserves what the fleet already did; this one
+  takes a seeded project on weak hardware from uncapped to capped. It was chosen over the inert
+  `0` because it is the largest single saving in the table — halving per-second GPU *and* CPU work
+  and cutting thermal throttling — and because it buys **feel**: a device that cannot hold 60
+  judders between 40 and 55, where a 30 cap is a stable 30. `mid` stays uncapped; no mid-band
+  device has been measured missing 60, and inventing a cap is what this table exists to avoid.
+- ⚠️ **`0` MEANS "NO CAP" ON ALL THREE NUMERIC FIELDS, so none of them may clamp with a bare
+  `Math.min`.** `min(60, 0)` is 0 — which would silently *remove* a project's own cap on every
+  tier that sets none; `min(0, 30)` is also 0 — so the field would read as wired and do nothing on
+  exactly the projects that left the default alone. All three go through `applyTierToTargetFps` /
+  `applyTierToPixi` / `applyTierToThree`, which widen `0` to `Infinity`, compare, and narrow back.
+
+  ⚠️ **`three.pixelRatioCap` is the third, and it was missed for a whole close-out.** The sentinel
+  helpers were written for `targetFps` and `pixiPixelRatioCap` while the *pre-existing* field with
+  identical semantics kept its bare `Math.min` — so a project authoring `0` (native DPR on capable
+  hardware, which Project Settings advertises as `2 (0 = uncapped)` and `basePixelRatio` reads as
+  `cap > 0 ? min(dpr, cap) : dpr`) had `min(0, 1) = 0` on `low`: still uncapped, with the single
+  measured saving behind that whole row doing nothing on exactly the devices it exists for. The
+  lesson generalises past this field: **when you build a helper because a sentinel makes the
+  obvious operation wrong, sweep for every field that shares the sentinel**, not just the ones the
+  current change happens to add.
+- **`pixi.resolution` is deliberately NOT tiered.** It is a PIN (0 = auto), and the standing rule
+  is that a pinned resolution is never capped — capping an explicit pin would make the pin a lie.
+  There is no analogue on the `three` side, so tiering it would be a new philosophy rather than a
+  symmetric addition. If a project ever pins it high, that is the moment to ask whether a tier may
+  overrule a pin.
+
+⚠️ **THE TRAP THAT ALMOST SHIPPED: `setActiveQualityTier` RECORDS a tier, it APPLIES nothing.** The
+tier a device actually ships with is published by `scene3DSync.resolveActiveTierOnce` calling it
+**directly** — that path never goes through `applyQualityTier`, which runs only on a live
+promote/demote and on a player's menu choice. Three survived that only because
+`makeWebGPURenderer` re-reads `getEffectiveThreeSettings()` on the very next line after awaiting
+the resolution, so the three 3D fields appeared to "just work" and any field added later would
+silently not. Wiring the frame cap into `applyQualityTier` alone — the obvious place, and what
+this work was originally specified to do — would have left it inert on the path nearly every
+device takes and never leaves. Both publish points now call one `applyActiveTierToRuntime()`
+(`setTargetFPS` + `forceResizeAllSurfaces`). `Canvas2DMount` was already on that bus and re-reads
+its settings on every run, so the broadcast *is* the whole of "apply the new 2D cap".
+
+⚠️ **A PROJECT WITH NO 3D RESOLVES NO TIER AT ALL.** `resolveActiveTier` runs from exactly one
+place — `makeWebGPURenderer` — so if `Scene3D` never mounts, nothing ever builds a renderer and
+`getActiveQualityTier()` stays `null` for the process lifetime. Every tier field is inert there:
+the 3D ones equally, and always have been; #202 only makes it consequential.
+
+**Two independent routes reach that state, and missing the second is easy** — the first close-out
+of #202 named only `disable3D` and was wrong about the blast radius:
+
+| route | mechanism | projects |
+|---|---|---|
+| `disable3D: true` in the game config | `App.tsx` renders `Scene3D && !disable3D` | `games/chess`, `games/audio-demo` |
+| `build.modules.render3d: false` | `Scene3D` is `null` at module scope (`__MODOKI_MODULE_RENDER3D__`) | `games/space-invader` |
+
+A 2D project that does neither (`games/court`, `games/text_demo`, `demos/2d-physics-demo`) mounts
+Scene3D, resolves normally, and gets the full clamp — verified live on court. Tracked on **#203**;
+fixing it means resolving a tier outside the 3D renderer's bring-up, and neither option is free
+(on Android the only classifier is the ramp probe, which *builds a Three renderer* — so a 2D-only
+project either pays a launch-blocking probe it has no other use for, or falls through to
+`calibrating` → `low` and goes from unclamped to clamped on every mobile device). An owner call,
+not a refactor.
+
+⚠️ **THE 2D `antialias` DOES NOT MERELY "CATCH UP LATER" — IT USUALLY MISSES THE FIRST SLOT.** Both
+`antialias` fields are constructor options, but the two layers are not equally protected:
+`makeWebGPURenderer` *awaits* `resolveActiveTier` before it allocates, so 3D gets the clamped value
+first time. `Canvas2DPool.initSlotApp` awaits only backend detection and then reads the effective
+settings — it never waits for a tier. `Scene3D` and the 2D host mount as siblings in one React
+commit, and the boot probe takes 0.5–2.6 s, so on a mixed project the first Pixi `Application` is
+almost always created *before* the tier resolves and bakes in the unclamped AA for a slot that
+typically lives for the session. The DPR cap is unaffected (it re-measures through the resize bus).
+This is a known limitation of the same shape as #203 and belongs with that decision — making the 2D
+pool block on a 3D-owned probe is exactly the coupling #203 exists to settle.
+
+⚠️ **THE FRAME CAP IS OFF IN THE EDITOR, deliberately** (`setTierFrameCapEnabled`, called from
+`app/main.tsx` beside `setJournalEnabled` and friends). `targetFPS` is a single global in the frame
+driver gating *every* registered callback — the ECS tick and `PRIORITY_EDITOR_3D`/`_2D` along with
+the game's passes. The editor mounts `Scene3D`, so it runs tier calibration, and two viewports
+doing double the work is precisely what trips a demotion — which would then throttle the author's
+whole session, gizmo dragging included, for a symptom the shipped build never had. Every other tier
+knob degrades how the preview *looks*, which is arguably informative; this one degrades the tool.
+The cost, stated rather than discovered: **GameView does not preview the frame cap.** Note the gate
+is a runtime setter and not `if (!__MODOKI_EDITOR__)` at the call site — that global is `true`
+under `vitest` and under a plain `npm run dev`, so it would have disabled the cap for a developer
+running their own game and made the behaviour untestable by construction.
+
+**Verified live** on `games/court` (2026-08-11), by perturbation rather than by reading data back:
+authoring a `low` with `pixiPixelRatioCap: 0.5` and `targetFps: 24` — values in no table and no
+config, so nothing else could produce them — took the Pixi backing buffer 513 → 257 px and the
+frame driver's live `targetFPS` 60 → 24. On a fresh launch with the tier resolving to `low` at
+boot, an authored `targetFps: 60` ran at **30** with `pixi.pixelRatioCap` clamped 3 → 1.
+
+⚠️ **Two consequences that read as bugs if you meet them cold.** Pinning `qualityTier: 'low'` on a
+project that has authored nothing **does nothing** — you cannot select a config that does not
+exist, and the dropdown still offers all four (filtering it needs a dynamic-options capability the
+settings schema lacks). And `rendering.three.tiers` is in `deepMergeConfigPatch`'s
+`REPLACE_WHOLESALE` set: without that, removing a tier in the dialog would post an *absent* key,
+which every other map-like section reads as "leave it alone" — the Remove button would close
+cleanly, report success, and change nothing on disk.
+
+#### The automatic light cap — the tier's light limits, enforced (#188 item 7)
+
+⚠️ **These two rows were AUTHORED INTENT and nothing else from #121 P3c until 2026-08-10**:
+`autoLightCap.ts` held the rule, was unit-tested, and was **imported by nothing**, so a `low`-tier
+phone rendered every scene light on every fragment. `autoLightCapFrame.ts` is the wiring that was
+missing; it decides a mask and hands it to the **authored mask path** (`lightMaskVariants`, #136)
+rather than introducing a second mechanism.
+
+The rule: **all ambient + the most EFFECTIVE N directional + the nearest N point/spot.** Ambient is
+never capped (three sums it into a single constant term). Directionals are chosen scene-wide by
+luminance-weighted intensity rather than raw intensity — a deep-blue rim light at 2.0 contributes
+less visible light than a white key at 1.0 and would otherwise win. Locals are chosen per object,
+by distance.
+
+**Measured on two real devices** (`demos/postfx-demo`, frozen viewpoint, cap toggled on and off
+inside a single run, with the run rejected unless the viewpoint, the tier and the toggle all held):
+
+| device | GPU | tier | scene | cap ON | cap OFF |
+|---|---|---|---|---|---|
+| **Huawei Y6 2019** | PowerVR Rogue GE8300 | `low` | as shipped | **16.6 ms frame** (10.7 rest) | **18.4 ms frame** (11.9 rest) |
+| **Galaxy A23 5G** | Mali-G57 MC2 | `mid` | as shipped | 10.9–11.3 ms GPU | 11.0–11.1 ms GPU |
+| **Galaxy A23 5G** | Mali-G57 MC2 | `mid` | masks stripped | **3.80 ms GPU** | **9.24 ms GPU** |
+
+Three things to read out of that:
+
+- **On the Y6 the cap is the difference between hitting vsync and missing it** — 18.4 ms → 16.6 ms
+  on the demo *as shipped*. Note `gpu: unsupported` there: WebGL2 without
+  `EXT_disjoint_timer_query_webgl2`, exactly the population this plan predicted GPU timers would
+  never reach, so that row is frame/rest time rather than GPU time.
+- **On a scene that already authors its own masks the cap is NEUTRAL** (10.9–11.3 against
+  11.0–11.1 — inside the noise, reproduced across two independent runs). This settles a question
+  that was open: it neither helps nor hurts there, which is what "the artist already culled these
+  lights" should look like.
+- **On an un-authored scene it is worth 2.4×** — 9.24 → 3.80 ms. That is the win the A23 light
+  ladder predicted, and un-authored is what every project except postfx-demo is.
+- **A Galaxy S22 also runs the cap**, because it resolves `mid` in a real game (below). Forcing
+  `high` on it confirms the property the table implies: `engaged: false`, caps `0/0`, while the
+  scene's own authored masks keep working (25 variants) — `high` cannot engage the cap, and the
+  two mechanisms are independent.
+
+⚠️ Stripping the masks on the A23 also made the scene heavy enough that **calibration demoted
+`mid`→`low` mid-run** while the camera tour moved, which invalidates any A/B taken across it. The
+measurement harness now rejects a run whose viewpoint, tier or toggle changed rather than
+averaging over it — a median across a demotion is how this workstream has twice published a number
+that was really two conditions.
+
+⚠️⚠️ **THE PROBE DOES NOT CLASSIFY A DEVICE IN THE NATIVE SHIPPING PATH, BECAUSE ITS MEASUREMENT
+WINDOW IS THE GAME'S OWN BOOT.** Measured 2026-08-11 on all three phones, native APK, cached verdict
+wiped before each run — full evidence and method in
+[docs/plans/low-end-device-support.md](./plans/low-end-device-support.md) § "The probe measures the
+boot, not the device".
+
+The probe runs before the real renderer exists, i.e. while the game is parsing GLBs and uploading
+textures, and it times frames with rAF deltas. So it times the STALLS:
+
+| device | warm-up frames, rendering an EMPTY scene | estimated interval | true interval | verdict |
+|---|---|---|---|---|
+| Galaxy S22 | `[125 125 125 125 167 167 167 167]` ms | 125.6–167.4 ms | 16.8 ms | **none**, 9/9 launches |
+| Galaxy A23 5G | `[100 117 117 117 117 117 133 133]` ms | 116.7 → 99.9 → 83.3 ms | 16.7 ms | **none**, 3/3 |
+
+The A23 row is worth reading twice: the estimate falls on each successive launch as the caches warm,
+and after three it is **still 5 × the truth**. Warming the app does not recover the measurement —
+the stalls are GLB parse and texture upload, which are paid every launch.
+
+Every ramp threshold is a multiple of that estimate, so one contaminated number breaks four things
+at once: escape needs `3 × interval` = 377–502 ms, which is past `ABORT_FRAME_MS` (250), so **escape
+is unreachable by construction**; the budget becomes `9 × interval` ≈ 1.1–1.5 s, past the whole
+`HARD_DEADLINE_MS` (900 ms), so the ramp is cut off with `status: 'running'` and yields nothing; the
+floor it would otherwise have produced was persisted as if it were a slope; and a small enough floor
+reads as "clear below every boundary" and **settled the verdict permanently on one pass**.
+
+⚠️ **This supersedes the earlier reading of the same symptom** — "the devices are measured against
+different yardsticks, so use a fixed one", and "the probe reads 20–40 % slower inside a game than on
+the harness, so re-derive the bands from in-game probes". Both are **retracted**. It is not an offset
+to calibrate out and it is not a per-device yardstick problem: the ramp is not measuring the GPU at
+all, so no choice of boundary and no common yardstick can fix it. What made it look like it worked is
+that a weak device also has a slow boot, so the Y6's contaminated numbers landed in the `weak` band
+and read as correct.
+
+`mid` remains correct as a TIER — its settings are measured and the light cap it enables is worth
+2.4 × — but **which tier a native device is assigned is not trustworthy**, and the failure direction
+is `low` (recoverable, and what every device got before #188 anyway).
+
+**Four guards now stand between that and a wrong verdict**, all measured into place 2026-08-11:
+
+- ~~**A floor cannot settle a device BELOW a band boundary**~~ — **SUPERSEDED 2026-08-11: nothing
+  settles on one pass any more, so the asymmetry this guard encoded has no path left and
+  `ProbeReading.measured` was removed with it.** The one-pass shortcut needed the per-launch spread
+  to be inside `PROBE_CLEAR_MARGIN` (1.5x). Measured, it is not: the A23's shade axis alone spans
+  0.055-0.16 and OVERLAPS the iPhone 7's 0.03-0.07, so no single reading separates a mid-band phone
+  from a weak one at any margin. Every device now pays the full `PROBE_SAMPLE_TARGET` (3) launches,
+  and against a median a floor is merely conservative — it understates, which is the recoverable
+  direction.
+- **An implausible interval declines the pass** (`MAX_PLAUSIBLE_INTERVAL_MS` = 40 ms — 30 Hz plus
+  jitter, since a throttled iPhone 8 really does drop there). ⚠️ Declines rather than CLAMPS: against
+  a clamped 35 ms the S22's real steps "escape" on two boot stalls and report 0.14 Mpx/ms, settling a
+  flagship at `weak`.
+- **Every failure path logs** — the stage breadcrumb, the error, and the full ramp step table. It
+  used to return `null` silently, so a device that never classified looked exactly like one that
+  never probed.
+- **The frame wait is bounded (5 s).** rAF does not fire while the page is invisible, and the probe
+  blocks renderer creation — so a launch with the screen off used to hang it forever, with
+  `HARD_DEADLINE_MS` unable to help (it is only consulted after a frame arrives).
+
+Three properties keep it off the common path and bounded:
+
+- **It engages only when the tier's caps would restrict something** (`capChangesAnything`). The
+  census says nearly every scene is one directional plus a few locals, which already fits — so
+  nothing is published and the frame behaves exactly as before. `high` sets both caps to 0
+  (unlimited) and can therefore never engage.
+- **An object whose AUTHORED selection already fits is left alone** — a CPU fast path, and provably
+  not a behaviour change, since capping a set that already fits returns that same set.
+- **It disengages entirely** past 31 lights (a 32-bit mask cannot address them individually, and a
+  partial cap would drop whichever fell off the end) or on a light type the rule cannot classify
+  (hemisphere, rect-area) — leaving the scene fully lit rather than guessing.
+
+⚠️ **Two mask SPACES, and conflating them mis-lights the scene.** Authored masks are LAYER bitmasks
+that intersect (several lights may share a layer); the cap's mask is INDEX space, where bit `i` is
+the light at index `i`. When the cap engages it republishes every light under a synthetic identity
+mask, so a selection can name individual lights. The authored intent then enters as the **candidate
+set**, not as a filter on the result: choosing the nearest N globally and intersecting afterwards
+deletes the cap's own choice whenever the nearest light is one the artist masked away, leaving the
+object with fewer lights than either mechanism alone would have given it.
+
+✅ **SETTLED — what it costs on a scene that DOES author masks: nothing measurable.** Earlier runs
+disagreed (1.1 ms slower, then 0.45 ms faster) because they compared different frozen viewpoints; a
+controlled run on the A23 puts the cap at 10.9–11.3 ms GPU against 11.0–11.1 ms uncapped, i.e.
+inside the noise, reproduced twice. postfx-demo is the only project that authors masks.
+
+`diagnose` reports `lightCap` whenever the cap is engaged — "why is this object dark?" is the
+question this feature generates, and it should be answerable from data.
+
+#### Native (WebView) differs from mobile Chrome — verified on a Huawei Y6, 2026-08-10
+
+Demos publish **web-only**, so measuring one in mobile Chrome is its shipping surface. Native games
+are a different runtime, and three differences showed up the moment the same demo ran as an APK:
+
+- **`deviceModel` exists natively and not on web** (`MRD-LX3`, via the `GameDebug` bridge). That is
+  the field the iOS tier table keys on, so iOS *web* takes the measured path while iOS *native*
+  answers statically — as documented above, now observed.
+- ✅ ~~The WebGPU probe costs 8 seconds~~ — **RETRACTED, and it was a phantom.** The message
+  `[gpuDetect] WebGPU probe did not answer within 8000ms` fired on every launch of every device
+  because the timeout timer was created and **never cancelled**: it ran 8 s after a probe that had
+  already answered, and `resolve(false)` on a settled race is a silent no-op. Measured directly in
+  the WebView on a Galaxy A23: `requestAdapter()` **27 ms**, `requestDevice()` **29 ms**, returning
+  a real `arm`/`valhall` adapter. Fixed by clearing the timer in a `finally`, verified on device
+  (the line is gone), and pinned by a test that fails if the timer is left uncancelled.
+- ⚠️ **The ramp probe returned NO READING on the first native launch**:
+  `[rampProbe] no usable reading — fill ramp produced no usable reading (running)`. Status
+  `running` means the ramp was cut off mid-flight, so the device fell through to
+  `source: 'calibrating'` — the right tier (`low`) by fallback rather than by measurement.
+
+  The cause is `HARD_DEADLINE_MS = PROBE_BUDGET_MS * 3` (900 ms), which is **wall clock**. This is
+  the same defect class the plan already fixed one level down: `RAMP_BUDGET_FRAMES` became frames
+  precisely because a millisecond budget buys too few frames on slow hardware and "returns a
+  non-answer that looks like an answer". The outer deadline never got the same treatment, and the
+  Y6's cold launch is where that bites.
+
+  **It self-heals**: a second attempt measures cleanly — the Y6 blocking the launch 1948 ms, the
+  A23 landing `middle` and caching it. ⚠️ The `fill`/`draw` figures this passage used to quote are
+  removed rather than updated: those ramps no longer decide anything (see the band table below), and
+  a corroboration between two numbers that both measured the wrong quantity is not corroboration.
+
+  ⚠️ **Do not read an early sample as a failed probe.** A reading taken seconds after launch shows
+  `source: 'calibrating'` and no cached verdict on every device, because the FIRST attempt has
+  failed and the second has not finished. It is not evidence the probe is inert natively — the
+  A23, sampled later, reports `source: 'measured'` with the verdict cached. Native PlayerPrefs is
+  also `@capacitor/preferences`, **not** localStorage, so reading `localStorage` for the cached
+  verdict reports "nothing cached" for every device no matter what is stored.
+
+- ✅ ~~The native WebView never gets WebGPU~~ — **RETRACTED.** That was read off the phantom
+  warning above and is false: the A23 and S22 have working WebGPU in the WebView, and
+  `DeviceCaps.webgpu` (which is the same probe) correctly reported `true` all along. The lesson is
+  the one this file keeps re-learning: **a log line is an instrument, and an instrument can be
+  broken.** Two confident conclusions were drawn from this one — "native has no WebGPU" and "the
+  probe costs 8 s of every launch" — and both were wrong, in the same direction, for a whole
+  session. The Y6 genuinely reports `webgpu: false`; that answer is real and arrives fast.
+- **Steady state is still 60 fps natively** on both the A23 and the S22 with the cap engaged
+  (16.6 / 16.8 ms, 8 and 11 draw calls). The A23 got there the interesting way: it booted `mid`
+  from its cached verdict, hit a 92.6 ms frame during load, and **calibration demoted it to `low`**
+  — the demotion ladder firing on real hardware, unprompted.
+- ⚠️ **Unexplained: the S22 reports `probeVerdictStore` as having no provider** in the native app,
+  which would mean it cannot cache a verdict and re-probes every launch. The A23 has the provider
+  in the same APK. Not chased down.
 
 **IBL is the single most expensive thing the low tier drops — by a wide margin.** Measured on a
 Huawei Y6 2019 (#154): **~26 ms of a ~53 ms frame**, entirely GPU. Suppressing it took `games/sling`
@@ -626,35 +1003,203 @@ get backwards:
   shaders; a mid-play promotion can freeze longer than the low tier it escapes, while a deferred
   demotion leaves a struggling device struggling until a scene load — which for a one-scene game is
   never. Demotion is also **sticky**: never promote again after one, or the tier oscillates.
+- **Both move ONE RUNG of `TIER_ORDER` at a time**, and the target comes from the decision, never
+  from a literal at the call site — `low → mid → high` up, `high → mid → low` down. A hardcoded
+  `'low'`/`'high'` was correct only while there were two tiers; with three it would jump the ladder
+  and throw away settings a middling device was measured affording. A second demotion still reaches
+  `low`, because the sticky flag blocks promotion only.
+- **`mid` is the one rung that can move in both directions, and the two rules can BOTH be true
+  there.** On a 30 Hz display a vsync-pinned 33.4 ms frame is over the 33.3 ms budget *and* leaves
+  the CPU under 40% of the interval. Demotion is evaluated first and has the shorter hold (2 s vs
+  5 s), so that resolves in the safe direction every time.
 - **Headroom is judged by `cpuMs` while vsync-bound, by `frameMs` only once frames run long.**
   While vsync-capped, `frameMs` is pinned at the display interval and reports "barely making 60"
   and "trivially making 60" identically — judging by it would promote a device with no headroom.
+- ⭐ **PROMOTION MAY NOT EXCEED THE TIER THE DEVICE WAS ASSESSED AT** (`promotionCeiling`, #188).
+  The headroom rule above reads `cpuMs` and nothing else, and that proxy is wrong in both
+  directions on the hardware this exists for: on an A23, `games/3d-test` runs the GPU at **13.9 of
+  every 16.6 ms** with `presentIdleMs: 0` while the CPU reads as idle. No live signal fixes it
+  there — `frameMs` is pinned, `restMs` mixes GPU with idle, and GPU timestamps are `unsupported`
+  on WebGL2 mobile. What *can* see GPU cost is the boot ramp probe's `shade` axis, so once
+  something has assessed the device that assessment is the cap:
+
+  | assessed by | promotion may reach |
+  |---|---|
+  | `measured` (the probe's band) · `model` (iOS table) · `allowlist` · `desktop` | exactly that tier |
+  | `player` · `project` (a human decided; calibration already refuses to run) | exactly that tier |
+  | `calibrating` — **nothing** assessed it | **one rung**, never further |
+
+  ⚠️ The consequence is deliberate: **on a device the probe classified, live promotion is a
+  no-op.** That is the probe's job done, not a mechanism gone missing. The one rung for an
+  unassessed device is what stops `auto` pinning unrecognised hardware to `low` forever (#155's
+  stated cost) without ever reaching `high` on something nobody measured. A project that knows it
+  is cheap enough to outrun its band pins `qualityTier: 'high'`; a player who can see the screen
+  overrides everything (below). **Demotion is untouched** — live, immediate, sticky.
+
+  The cap reads `getAssessedQualityTier()`, which holds the session's FIRST resolution, not
+  `getActiveQualityTier()`. Every live change republishes with `source: 'measured'`, so the active
+  resolution asserts a measurement on devices nothing ever measured, and the original source is
+  gone from the second call onward. The two happen to agree today (`'measured'` caps at its own
+  tier) — verified by perturbing the call and watching every test stay green — so the honest test
+  is that the *assessment survives*, which is what `tierCalibration.test.ts` pins.
+- **A capped device says so, once per session**: `TierDecision` has a third action, `hold`, for
+  "sustained headroom, and the assessment caps it". Without it a device that held five seconds of
+  headroom and did not move is indistinguishable from one whose streak never started, and "why is
+  my A23 not promoting" has no answer short of an eval.
 
 **Seeing it:** the resolved tier, its `source`, and a one-line `reason` appear in `diagnose` and in
-the debug menu's **Device tab**, which also has low/high buttons that apply a tier LIVE so a
-low-end look can be authored without owning the phone. The reason is the point — "low" alone is
+the debug menu's **Device tab**, which also has one button per tier (driven off `TIER_ORDER`, so a
+new tier appears there automatically) applying it LIVE, so a low-end look can be authored without
+owning the phone. The reason is the point — "low" alone is
 unexplainable, and project-pinned / failed-calibration / player-chosen want different responses.
 
 **iOS answers from the MODEL ID and never measures** (owner, 2026-08-09) — `TierSource: 'model'`,
-via `IOS_HIGH_TIER_MIN_GENERATION`. Apple's hardware set is small and the generation is *encoded in
+⚠️ **except that a DEBUG build now measures anyway and throws the verdict away** (#188,
+2026-08-11): `resolveActiveTierOnce` runs the ramp probe even when something cheaper decided, gated
+on `areDebugHandlesEnabled()` and excluding desktop, and logs it as `EVIDENCE ONLY (tier came from
+'<source>')`. The tier is unchanged and a release build is unaffected — it exists because no iPhone
+had ever produced a probe reading, so every band boundary was derived from Android while applying to
+iOS too. The harness page is not a substitute: measured on the same three phones both ways, it
+disagrees with native about the RATIO between devices (S22:A23 on `cpu` is 2.1x native, 13.3x on the
+harness), so it is a different instrument rather than a proxy.
+
+via `IOS_TIER_MIN_GENERATION`. Apple's hardware set is small and the generation is *encoded in
 the identifier*, so `iPhone10,1` sorts against `iPhone14,6` with no lookup; Android's only
 comparable signal is the GPU renderer string, which is ambiguous (one name, two GPUs) and already
 deprecated in Firefox for fingerprinting. That is why one platform gets a table and the other has
 to measure.
+
+It carries **two floors per family since #188** (`mid` and `high`), and the `mid` one is a
+correction: an iPhone 8 (A11) reads 3.9 Mpx/ms + 15.8 calls/ms on the ramp probe — the *middle*
+band, which it is one of the two devices defining — so the single-floor table said `low` on a
+native build while the same handset on iOS web said `mid` from the probe. Two classifiers, one
+phone, two answers. What the A11 measurement actually shows is 27 ms → 56 ms **with NPR**, i.e. it
+cannot afford post-FX, which is the knob `mid` turns off; nothing has shown it unable to afford IBL
+or shadows at DPR 1. The **iPad row keeps `mid === high` on purpose** — no iPad below A12 has been
+measured, so giving it a mid band would invent the kind of number this table exists to avoid, and
+iPad behaviour is unchanged.
 
 It is a **threshold (`>= N`), not a list**, and that is the whole point: an enumerated allowlist
 ossifies in the *worst* direction — a phone that does not exist yet is absent from it, so next
 year's hardware is classified `low` by a table written today. `>=` cannot fail that way, because
 newer Apple silicon is only ever faster. The major number is a real SoC boundary rather than a
 year: `iPhone10,x` is A11, covering the iPhone 8 **and** the iPhone X, which genuinely share the
-chip. Two caveats: the floor value for `iPhone` is inferred (only the A11 side is measured — 27 ms
-→ 56 ms with NPR, missing the budget), the `iPad` value is a straight guess, and the rule is
+chip. Two caveats: the **high** floor for `iPhone` is still inferred (the probe now corroborates it
+from an unrelated method — an A12 iPad measures ~2.5× the A11 iPhone, into the `capable` band), the
+`iPad` value is a straight guess, and the rule is
 **native-only** — mobile Safari reports no model, so iOS *web*, which is how every published demo
 ships, stays on the measured path.
 
 The Android allowlist (`TIER_ALLOWLIST`) ships **empty on purpose**: an unvalidated threshold in
-code is what ossifies. Measured, a Galaxy A23 does not qualify for `high`, so it correctly
-calibrates.
+code is what ossifies. Measured, a Galaxy A23 does not qualify for `high` — it is `mid`.
+
+#### The boot ramp probe — how a device gets classified (#188)
+
+`rampProbe.ts` (pure policy + maths) + `rampProbeRunner.ts` (renderer side). It runs ONCE per
+device, at boot, and the tier it produces does not change mid-play; demotion stays live.
+
+- **Why a probe rather than live stats.** `frameMs` is pinned at the display interval whenever the
+  renderer finishes early, so it reports "barely making 60" and "trivially making 60" identically.
+  A ramp escapes that by construction: raise the load until the frame is no longer vsync-bound. GPU
+  timestamps cannot substitute — they report `unsupported` on WebGL2 without
+  `EXT_disjoint_timer_query_webgl2`, i.e. on most of the low-end Android population the tiers exist
+  for.
+- **Two ramps, because our three profiled projects had three different bottlenecks**: `fill`
+  (overlapping quads → fragment throughput, reported in **megapixels/ms** so a small screen cannot
+  score as a fast GPU) and `draw` (many tiny quads → per-object submit). **Both** must clear a
+  band's floor; the weaker bottleneck is the one a real frame hits.
+- **Throughput is a SLOPE between two supra-vsync steps**, never `load / frameMs` at one point —
+  that would attribute the fixed per-frame overhead to the load.
+- **It resolves to ~3×, and no better.** Vsync rounds every frame to a whole interval, so
+  neighbouring slope outputs sit 3× apart (measured on an A23: the draw figure took essentially two
+  values, 10.2 and 30.7). The band boundaries sit in the middle of 10× and 2.5× gaps, well outside
+  that. Do not chase finer resolution until something needs it.
+- **It BLOCKS THE LAUNCH** — necessarily, since `antialias` is baked into the swapchain at renderer
+  creation. Measured per pass: **~2.2 s cold on a Huawei Y6** (of which ~1.3 s is cold renderer
+  creation), ~0.5-0.8 s on an A23/S22. (A recorded ~5.8 s exists for the Y6's first-EVER launch;
+  a re-run on the same phone measured 2.25 s cold, so treat 5.8 s as a first-install worst case,
+  not the steady cold path.) The verdict is cached in `PlayerPrefs` against a hardware fingerprint
+  (platform, model, GPU renderer string, a coarse viewport bucket **and a classifier version**, so
+  re-drawn band boundaries cannot leave already-launched devices pinned to a stale conclusion).
+- **The verdict is REFINED ACROSS LAUNCHES, not decided by one pass** (owner, 2026-08-09). One
+  pass misclassifies by a band about **1 run in 5** — measured on three attached devices, five
+  passes each: Y6 `weak`×4 + `middle`×1, A23 `middle`×4 + `weak`×1, S22 `capable`×4 + `middle`×1 —
+  and the original design cached that one pass for the life of the device. (The "bands are 10×
+  apart" argument compared band *medians* to a per-reading error bar; a single pass is exposed to
+  the *within-device* spread, which measured 2.3–4.5×.) So the cache now persists the raw
+  **readings**, not just the band — a band cannot be averaged, and a vote over bands throws away
+  how close each pass came to a boundary. Three rules:
+  - **`PROBE_SAMPLE_TARGET` = 3**, checked exhaustively against those runs: every one of the 10
+    possible 3-subsets per device gives the right band (30/30). Two fails 3 of 10 on the S22 (a
+    median of two is their mean). Five buys nothing three did not.
+  - ⚠️ ~~**One pass settles it if the reading is `PROBE_CLEAR_MARGIN` (1.5×) clear of every
+    boundary**~~ — **REMOVED 2026-08-11. Every device now pays all three launches.** The shortcut
+    was sound only if the per-launch spread was inside the margin, and it is not: the A23's `shade`
+    axis spans 0.055–0.16 and OVERLAPS the iPhone 7's 0.03–0.07, so a single reading cannot separate
+    a mid-band phone from a weak one at any margin. Worse, the A23 has produced a pass 1.5× clear
+    BELOW the `middle` floor on real hardware — under this rule that cached `weak` on that phone for
+    the life of the device. The cost of removing it is two extra probe launches on hardware that
+    used to settle early, the slowest included; a launch is recoverable and a cached wrong verdict
+    is not.
+  - **While refining, the reported band is the LOWEST sample's; only the settled verdict is the
+    median.** Same asymmetry as everything else here — booting a weak device high is a lost context
+    (#156), booting a capable device low is a beat of ugliness the next launch corrects. In
+    practice an S22 sits at `mid` for two launches and earns `high` on the third, and a Y6 that
+    draws its one bad pass first spends *one* launch on `mid` instead of forever.
+
+  ⚠️ The honest cost of this choice: no launch pays more than one probe, but the **first up-to-3
+  launches each pay one** where previously only the first did. A pre-refinement cached record has
+  no `samples` and is rejected on read, so an already-launched device re-probes — deliberately.
+
+  "No launch pays more than one" is enforced by `shareTierResolution` (`probeReentrancy.ts`), and
+  it is a *different* guard from the recursion flag beside it: that one stops a call arriving from
+  INSIDE the probe, this one stops two surfaces arriving from outside it in the same tick, before
+  either has set the flag. Both would otherwise clear every early-out and probe — and since the
+  verdict refines, both would read the same prior samples and the second write would discard the
+  first's reading, so the device pays two probes and banks one sample. ⚠️ The recursion check must
+  stay ABOVE the coalescer: a re-entrant call handed to it would await the promise waiting for it.
+- **The measured bands**, medians of `escaped`/`measured` readings only — a `budget`/`ceiling` row
+  is a lower bound, not a measurement, and mixing the two produced two wrong answers in this
+  workstream:
+
+  ⚠️ **The AXES CHANGED on 2026-08-11 — the bands are `cpu` and `shade`, not `fill` and `draw`.**
+  `fill` never measured fill: it stacks coplanar OPAQUE quads, and a tile-based GPU resolves which
+  fragment survives BEFORE shading, so the overdraw never reaches a shader and what was ranked was
+  rasterization. `draw` produced no usable reading at all on the two weakest devices (Y6 0/6
+  launches, iPhone 7 0/3) — it failed on exactly the hardware the tier system exists for. Both are
+  still measured and logged; neither votes. `CLASSIFIER_VERSION` is 4 so no verdict survives the
+  change.
+
+  | band | devices | cpu k xform/ms | shade Mfrag/ms | tier |
+  |---|---|---|---|---|
+  | `weak` | Huawei Y6 2019 · iPhone 7 (A10) | 2.0 · 5.5 | 0.02 · 0.03 | `low` |
+  | `middle` | Galaxy A23 5G · iPhone 8 (A11) | 9.9 · 10.9 | 0.13 · 0.20 | `mid` |
+  | `capable` | Galaxy S22 · iPhone Air | 21.3 · 37.4 | 0.21 · 0.20 | `high` |
+
+  Boundaries at the geometric mean of each gap: `middle` 4500 / 0.06, `capable` 14500 / 0.165.
+  Each band mixes vendors and platforms — the A23 and the iPhone 8 land on top of each other from
+  opposite ecosystems, on measurement alone, and the probe never sees a model id.
+
+  ⭐ **The two axes are COMPLEMENTARY, and requiring BOTH is load-bearing.** `cpu` is monotone over
+  the whole range; `shade` separates the bottom 4-6x and then SATURATES at the top, where the
+  iPhone 8, S22 and iPhone Air all read 0.20-0.21 across several times the real performance. The
+  case that proves it is the **iPhone 7**: it clears the middle `cpu` floor (5.5k against 4500) and
+  fails the middle `shade` floor (0.03 against 0.06), so a cpu-only classifier would call a 2016
+  phone `middle`.
+
+  ⚠️ An **iPad mini 5** measured `cpu` 7.9k and is deliberately absent: its shade ramp sits on a
+  ~27 ms fixed floor (largest buffer here, on the WebGL2 fence path), yielding one or two real
+  points and no trustworthy slope. A large-buffer WebGL2 tablet is the one device shape this
+  instrument still cannot read.
+- **`'unknown'` is not a fourth band.** It means the probe did not run or produced nothing usable,
+  lands on `low` like `weak` does, and is never cached — but the `reason` distinguishes them, or an
+  inert probe would be indistinguishable from one that ran and said no.
+- **The measurement harness**: `node engine/tools/ramp-probe-page/build.mjs --serve` builds a
+  standalone page on `0.0.0.0:8899`. Android can be driven over USB end to end
+  (`adb reverse tcp:8899 tcp:8899`, then an `am start` at `?auto=<label>&runs=8`); iOS needs a human
+  to open the URL. ⚠️ **Space the runs out — the probe heats the device it measures.** Twenty
+  stacked runs took an iPhone 8 to 30 Hz, at which point every threshold doubled, nothing escaped,
+  and ten runs returned beautifully consistent numbers that were pure artifact.
 
 ### GPU context loss is recoverable — and bring-up must stay self-contained
 

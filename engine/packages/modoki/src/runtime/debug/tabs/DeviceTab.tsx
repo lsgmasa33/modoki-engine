@@ -6,7 +6,7 @@ import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { scrollRootStyle } from '../tabLayout';
 import { getRenderSettings, setRenderSettings, getActiveQualityTier } from '../../rendering/renderSettings';
 import { applyQualityTier } from '../../rendering/tierCalibration';
-import type { QualityTier } from '../../rendering/qualityTier';
+import { TIER_ORDER, type QualityTier } from '../../rendering/qualityTier';
 import { forceResizeAllSurfaces } from '../../rendering/resizeBus';
 
 interface Insets { top: string; right: string; bottom: string; left: string }
@@ -231,7 +231,7 @@ export function DeviceTab() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
           <span style={{ ...keyStyle, width: 18 }}>Tier</span>
           <div style={{ display: 'flex', gap: 4 }}>
-            {(['low', 'high'] as QualityTier[]).map((t) => {
+            {TIER_ORDER.map((t) => {
               const active = activeTier?.tier === t;
               return (
                 <button
