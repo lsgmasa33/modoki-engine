@@ -78,6 +78,21 @@ function line(m: ProbeMeasurement): string {
     + `cpu=${m.cpu ? `${m.cpu.status}/${m.cpu.bound}:${r(m.cpu.unitsPerMs)}@${m.cpu.peakLoad}` : 'absent'}`;
 }
 
+/** The run whose `totalMs` sits in the middle of the batch — a genuine median (#205 R5.4).
+ *
+ *  ⚠️ This used to be `measurements[Math.floor(measurements.length / 2)]` — the run in the
+ *  MIDDLE POSITION BY ORDER, i.e. whichever run happened to finish second (of three), presented
+ *  to a human as `med`. An unlucky cold first run (this file's own header explains why the first
+ *  pass is not like the others — thermal state, a background app, one unlucky vsync quantum) could
+ *  land in that position and be reported as the representative reading when it was the outlier.
+ *  Sorting by `totalMs` before taking the middle element makes the label true. `totalMs` is the
+ *  headline's own leading figure, so it is the natural key to sort by; `Array.prototype.sort` is
+ *  stable, so equal-`totalMs` runs keep their original order rather than being reordered by noise. */
+export function medianMeasurement(measurements: ProbeMeasurement[]): ProbeMeasurement {
+  const sorted = [...measurements].sort((a, b) => a.totalMs - b.totalMs);
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
 /** Ship one line home immediately.
  *
  *  ⚠️ SENT PER RUN, not once at the end. An iPhone 13 mini crashed its own tab mid-probe, and
@@ -152,7 +167,7 @@ async function runProbeSession(): Promise<void> {
     ? 'done — results sent, nothing else needed'
     : 'done — could NOT send; tap the box to copy and paste it back';
   if (measurements.length) {
-    const med = measurements[Math.floor(measurements.length / 2)];
+    const med = medianMeasurement(measurements);
     // Mpx/ms, not the raw quads/ms the ramp works in: the raw figure is not comparable between
     // devices (see fillMegapixelsPerMs), and a headline is exactly where someone reads a number
     // off a screen and compares it to another device's.

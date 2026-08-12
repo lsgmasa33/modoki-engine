@@ -52,7 +52,7 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../
  *  in the header enforces it. Every number here is a measurement; the plan's §3 records which. */
 export const SEED = {
   mid: {
-    pixelRatioCap: 1,
+    pixelRatioCap: 1.5,
     antialias: false,
     shadows: true,
     shadowMapCeiling: 1024,
@@ -98,22 +98,40 @@ export function needsSeed(cfg) {
   return (three?.qualityTier ?? 'auto') === 'auto';
 }
 
-/** Add any SEED key an authored tier is missing, PER TIER, and never touch a key already there —
- *  see the header for why add-only is the rule and not an oversight. Mutates `tiers` in place (the
- *  caller owns a fresh parse of its own file) and returns the `tier.key` labels it added, so the
- *  console summary can say honestly what happened. A tier absent from `tiers` (the project never
- *  authored it) is left absent — that decision belongs to `needsSeed()`, not here. */
+const isPlainObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/** Add any SEED key an authored object is missing, RECURSING into plain-object values (`postFX`
+ *  being the motivating case — a top-level-only pass could never reach a new `PostFXEffect`, and
+ *  `complete()`'s `{...ALL_POSTFX, ...o.postFX}` treats an absent effect as ALLOWED, i.e. a new
+ *  effect the engine ships would default to ON fleet-wide at `low`). Add-only: a key already
+ *  present in `authoredObj` is never overwritten, at any depth — a tuned value stays authoritative.
+ *  `added` collects the full dot-path (`postFX.<effect>`, joined with the tier name by the caller)
+ *  so the console summary names exactly what changed rather than just "postFX". */
+function backfillObject(seedObj, authoredObj, prefix, added) {
+  for (const key of Object.keys(seedObj)) {
+    const seedVal = seedObj[key];
+    if (!(key in authoredObj)) {
+      authoredObj[key] = structuredClone(seedVal);
+      added.push(`${prefix}${key}`);
+    } else if (isPlainObject(seedVal) && isPlainObject(authoredObj[key])) {
+      backfillObject(seedVal, authoredObj[key], `${prefix}${key}.`, added);
+    }
+    // else: authored a non-object value (or an object shape the seed no longer expects) — leave
+    // it exactly as authored.
+  }
+}
+
+/** Add any SEED key an authored tier is missing, PER TIER — see {@link backfillObject} for the
+ *  add-only recursion. Mutates `tiers` in place (the caller owns a fresh parse of its own file)
+ *  and returns the `tier.key[.nested...]` labels it added, so the console summary can say
+ *  honestly what happened. A tier absent from `tiers` (the project never authored it) is left
+ *  absent — that decision belongs to `needsSeed()`, not here. */
 export function backfillTiers(tiers) {
   const added = [];
   for (const tierName of ['mid', 'low']) {
     const authored = tiers?.[tierName];
     if (!authored) continue;                       // never authored — not this function's call
-    for (const key of Object.keys(SEED[tierName])) {
-      if (!(key in authored)) {
-        authored[key] = SEED[tierName][key];
-        added.push(`${tierName}.${key}`);
-      }
-    }
+    backfillObject(SEED[tierName], authored, `${tierName}.`, added);
   }
   return added;
 }

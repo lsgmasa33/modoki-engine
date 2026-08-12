@@ -62,7 +62,12 @@
  *  get to overrule the measurement. */
 
 import { BUDGET_30FPS_MS, type FrameProfile } from '../core/frameProfiler';
-import type { DeviceClass } from './rampProbe';
+import { probeVerdictStore } from '../core/probeVerdictStore';
+import { probeFingerprint, type DeviceClass } from './rampProbe';
+// TYPE-ONLY, so this module keeps its one-way dependency and stays runtime-pure (`stackPlan.ts`
+// imports nothing at all). It buys the exhaustiveness check on `POSTFX_KEY_PERMISSION` — the whole
+// point of which is that a stage added there cannot silently escape the tier mask again.
+import type { PostFXRequest } from './postfx/stackPlan';
 
 export type QualityTier = 'low' | 'mid' | 'high';
 /** What a PROJECT may ask for. `'auto'` delegates to the allowlist + calibration. */
@@ -290,13 +295,28 @@ export const TIER_SETTINGS: Record<QualityTier, TierRenderOverrides> = {
    *                         also the safe direction — worst case a mid device renders shadows
    *                         that are coarser than intended, which costs quality, not the frame.
    *
+   *  ── `pixelRatioCap: 1.5` — THE MEASUREMENT THAT EARNED IT (owner, 2026-08-12) ─────────────
+   *    This row said 1 for months, correctly, because the plan demanded "its own measurement; do
+   *    not guess it" and the only datum was the Y6 paying ~4x for 2x DPR — not a curve that
+   *    extrapolates by eye. It has now been measured on the band's own anchor, a Galaxy A23
+   *    (`sling`, uncapped, driven through the tier path so every resize is real):
+   *
+   *      DPR 1      384x801   0.31 Mpx   61.7 fps   16.2ms   GPU 4.9ms
+   *      DPR 1.5    576x1201  0.69 Mpx   59.5 fps   16.8ms   GPU 6.2ms   <- 2.2x the pixels, holds 60
+   *      DPR 1.875  720x1501  1.08 Mpx   54.6 fps   18.3ms   GPU 7.2ms   <- misses 60
+   *
+   *    The curve bends hard BETWEEN the integers, which is why the answer was invisible while the
+   *    only options anyone tried were 1 and 2. 1.5 buys 2.2x the pixels for +1.3ms of GPU and stays
+   *    inside the frame; 2 costs 3.5x and does not.
+   *
+   *    ⚠️ MEASURED ON ONE PROJECT, and `sling` is LIGHT — 38 draw calls, 112k triangles. A
+   *    fill-heavy scene (forest-camp, postfx-demo) has not been measured at 1.5 on this band, and
+   *    a project that cannot afford it should author its own `tiers.mid.pixelRatioCap: 1`. The
+   *    number here is the seed, not a law.
+   *    ⚠️ It was also measured on a DEBUG build carrying ~10.5ms of CPU; a release build has more
+   *    margin, not less, so this errs safe.
+   *
    *  ── WHAT IS DELIBERATELY STILL AT `low`, AND WHY THAT IS NOT LAZINESS ─────────────────────
-   *    pixelRatioCap: 1     The plan says this "wants its own measurement; do not guess it", and
-   *                         it is right: on the Y6 a fill-bound GPU paid ~4x for 2x DPR, which is
-   *                         not a curve that extrapolates by eye. Note what keeping 1 costs —
-   *                         NOTHING, today: every mid-band device currently resolves `low` and so
-   *                         already runs at DPR 1. Raising it is an improvement to be earned, not
-   *                         a regression to be avoided.
    *    antialias: false     Baked into the swapchain at renderer construction (see
    *                         `tierCalibration`'s header), so a wrong guess here cannot be walked
    *                         back live. Unmeasured on this band.
@@ -313,23 +333,26 @@ export const TIER_SETTINGS: Record<QualityTier, TierRenderOverrides> = {
    *  ~30 fps edge of that ladder on desktop-authored content, with the DPR-1 clamp (worth ~2.7x
    *  there) still in hand — and well clear of the collapse.
    *
-   *  ⚠️ **BUT `maxDirectional`/`maxLocal` ARE INERT — on EVERY tier, and have been since #121
-   *  P3c.** Their only reader is `rendering/autoLightCap.ts`, which is complete, unit-tested and
-   *  imported by NOTHING (it is not even on the runtime barrel; its landing commit says "NOT yet
-   *  wired"). So `low` has been rendering every scene light on every fragment all along, and
-   *  these two numbers are authored intent rather than a limit. They are kept, and kept measured,
-   *  so that wiring `autoLightCap` is a small change rather than a fresh round of measurement —
-   *  but do not read them as protection a mid device currently has. Tracked on #188. */
+   *  ✅ **`maxDirectional`/`maxLocal` ARE LIVE** — wired in `1631ac8a` ("the tier's light caps stop
+   *  being decorative — 9.24ms to 3.80ms of GPU on an A23"), applied per frame by
+   *  `armAutoLightCap(_maskedLights, getActiveTierOverrides())` in `scene3DSync`. This docblock
+   *  said "INERT — on EVERY tier" for a further day after that landed, and so did the tier table in
+   *  rendering.md and — worst — the Project Settings help text the author reads while choosing the
+   *  number. Two fields that work, labelled dead, so nobody tunes them (review 2026-08-12). The
+   *  mechanism lives in `rendering/autoLightCap.ts` + `autoLightCapFrame.ts`; the ladder above is
+   *  the measurement behind these two values and is the part worth carrying. */
   mid: {
-    pixelRatioCap: 1, antialias: false, shadows: true, shadowMapCeiling: 1024, postFX: NO_POSTFX,
-    maxDirectional: 2, maxLocal: 3,   // authored intent — NOT enforced yet, see above
+    pixelRatioCap: 1.5, antialias: false, shadows: true, shadowMapCeiling: 1024, postFX: NO_POSTFX,
+    maxDirectional: 2, maxLocal: 3,   // enforced per frame — see above
     ibl: true, iblOffAmbientBoost: 1, iblOffExposure: 1,
     // NO frame cap on `mid`, and that is the same discipline as the four fields above it: a mid
     // device has never been measured missing 60, so capping it to 30 would be inventing a number
     // to fill the row. `low` gets 30 because the Y6 was measured at 14-45 fps; nothing here was.
     targetFps: 0,
-    // Carry-forward of this row's own `pixelRatioCap: 1`, which is itself deliberately still at
-    // `low`'s value ("raising it is an improvement to be earned"). Same for AA.
+    // ⚠️ NOT carried forward with the 3D cap. `pixelRatioCap` moved to 1.5 on a THREE.js
+    // measurement (see above); the 2D DPR is a separate instrument on a separate renderer and
+    // #204 is still open on what it should be for Android. Raising this one by analogy is the
+    // guess that measurement replaced — it stays at 1 until a Pixi ramp says otherwise. AA the same.
     pixiPixelRatioCap: 1, pixiAntialias: false,
   },
   high: {
@@ -461,6 +484,41 @@ export function tierAllowsEffect(o: TierRenderOverrides, effect: PostFXEffect): 
   return o.postFX[effect];
 }
 
+/** Every key a `PostFXRequest` can carry — **which is NOT the same set as {@link POSTFX_EFFECTS}**,
+ *  and the difference was a real leak (review 2026-08-12).
+ *
+ *  ⚠️ `fxaa` is a full member of `PostFXRequest` (`postfx/stackPlan.ts`) but is not a TIER field, so
+ *  the old mask — which looped over `POSTFX_EFFECTS` — could not reach it. `Scene3D` populates
+ *  `req.fxaa` inside its `if (nprSnap)` block, so masking `npr` off deleted `req.npr` and left
+ *  `req.fxaa` behind: `planStages` still returned a non-empty stack, and a tier whose authored
+ *  config says every post-FX effect is OFF still allocated a full-screen render target and ran an
+ *  FXAA pass every frame. WebGPU-only (`planFxaaEnabled` refuses on WebGL2), which is exactly why it
+ *  was invisible on the Y6 and iPhone 8 where most of this was measured.
+ *
+ *  Typed as `keyof PostFXRequest` so **a stage added to that interface is a compile error here**
+ *  until someone decides whether a tier may drop it. That is the property worth having: deriving
+ *  `fxaa`'s permission from `npr` inside `Scene3D`'s request builder would have fixed today's leak
+ *  and re-created the same class one level down. */
+type PostFXRequestKey = keyof PostFXRequest;
+
+/** Which tier permission governs each request key. Exhaustive by type — see
+ *  {@link PostFXRequestKey}.
+ *
+ *  `fxaa` maps to `antialias` rather than to a post-FX effect because that is what it IS: the
+ *  anti-aliasing the tier already has an authored field for. So a tier that turned AA off gets no
+ *  FXAA pass, and `high` (`antialias: true` in {@link UNCLAMPED_OVERRIDES}) keeps it — the no-op
+ *  guarantee holds. */
+const POSTFX_KEY_PERMISSION: Record<PostFXRequestKey, (o: TierRenderOverrides) => boolean> = {
+  npr: (o) => tierAllowsEffect(o, 'npr'),
+  ao: (o) => tierAllowsEffect(o, 'ao'),
+  dof: (o) => tierAllowsEffect(o, 'dof'),
+  bloom: (o) => tierAllowsEffect(o, 'bloom'),
+  vignette: (o) => tierAllowsEffect(o, 'vignette'),
+  fxaa: (o) => o.antialias,
+};
+
+const POSTFX_REQUEST_KEYS = Object.keys(POSTFX_KEY_PERMISSION) as PostFXRequestKey[];
+
 /** Delete every key the RESOLVED overrides disallow from a post-FX request, in place — the
  *  mechanism {@link POSTFX_EFFECTS}'s header promises ("the tier mask is applied by DELETING keys
  *  from that request"). Generic over the request shape (rather than importing `PostFXRequest`
@@ -470,12 +528,12 @@ export function tierAllowsEffect(o: TierRenderOverrides, effect: PostFXEffect): 
  *  DECISION belongs in a plain, tested module beside it.
  *
  *  Returns `req` for convenience; the caller already owns its lifetime for the frame. */
-export function maskPostFXRequest<T extends Partial<Record<PostFXEffect, unknown>>>(
+export function maskPostFXRequest<T extends Partial<Record<PostFXRequestKey, unknown>>>(
   req: T,
   o: TierRenderOverrides,
 ): T {
-  for (const effect of POSTFX_EFFECTS) {
-    if (!tierAllowsEffect(o, effect)) delete req[effect];
+  for (const key of POSTFX_REQUEST_KEYS) {
+    if (!POSTFX_KEY_PERMISSION[key](o)) delete req[key];
   }
   return req;
 }
@@ -678,6 +736,80 @@ export interface TierResolveInput {
   probeClass?: DeviceClass;
 }
 
+/** The device facts a tier resolution is built from — the shape `DeviceCaps` supplies, narrowed to
+ *  what {@link resolveTier} reads. Structural rather than an import of `DeviceCaps`, so this module
+ *  stays free of the caps probe. */
+export interface TierDeviceFacts {
+  platform?: string;
+  deviceModel?: string;
+  gpuRenderer?: string;
+  formFactor?: 'mobile' | 'desktop';
+}
+
+/** The cached boot-probe class for THIS device, or `undefined` when there is none that applies.
+ *
+ *  Checked against {@link probeFingerprint} so a verdict measured on different hardware — or under
+ *  a different `CLASSIFIER_VERSION` — is never reused. Synchronous: the probe ran at renderer
+ *  bring-up, so by the time any later caller asks, the answer is in `PlayerPrefs`. */
+export function readCachedProbeClass(caps: TierDeviceFacts | null | undefined): DeviceClass | undefined {
+  const cached = probeVerdictStore.get()?.read();
+  if (!cached) return undefined;
+  // Through `globalThis`, not `window` — this module is compiled without the DOM lib on purpose
+  // (it is the pure policy half, unit-tested headless), and the viewport is the one fact the
+  // fingerprint needs that only the host has. `0` in a headless program matches what
+  // `probeFingerprint` already does with an absent viewport.
+  const g = globalThis as { innerWidth?: number; innerHeight?: number };
+  const fingerprint = probeFingerprint({
+    platform: caps?.platform,
+    deviceModel: caps?.deviceModel,
+    gpuRenderer: caps?.gpuRenderer,
+    viewportPx: (g.innerWidth ?? 0) * (g.innerHeight ?? 0),
+  });
+  // `CachedProbeVerdict.deviceClass` excludes `'unknown'` by type — an unusable reading is never
+  // written (`rampProbe`), so a cache hit is always a real band.
+  return cached.fingerprint === fingerprint ? cached.deviceClass : undefined;
+}
+
+/** Build the input for {@link resolveTier} from the device facts — **the ONE builder both the boot
+ *  path and a later re-resolution go through.**
+ *
+ *  ⚠️ **THIS EXISTS BECAUSE THE TWO CALLERS DRIFTED, AND THE DRIFT WAS INVISIBLE** (review
+ *  2026-08-12, found independently by six review dimensions). `choosePlayerQualityTier(null)` —
+ *  a game's "Auto" button — hand-assembled its own input and omitted `probeClass`, the one field
+ *  carrying the boot measurement. `TIER_ALLOWLIST.androidGpuPatterns` is empty, so on Android
+ *  nothing else can answer: a Galaxy A23 the probe had measured as `middle` dropped to
+ *  `calibrating → low` the moment its player tapped Auto, and (before the frame-cap fix in
+ *  `hasHeadroom`) could never climb back. Relaunching cleared it, so it read as a glitch.
+ *
+ *  Adding the field to the one caller that forgot it would have fixed today's bug and left the
+ *  shape that produced it. A single builder means a field added to {@link TierResolveInput} cannot
+ *  be supplied by only one caller — that is the property, not the deduplication.
+ *
+ *  The two knobs exist because boot genuinely needs both behaviours, and BOTH must stay in the one
+ *  builder or the drift comes straight back:
+ *  - `probeClass` — an explicit override for the moment boot has just measured a FRESHER value than
+ *    the cache holds. Every other caller omits it and gets the cached verdict.
+ *  - `useProbe: false` — boot's deliberate FIRST pass, which resolves without any probe answer at
+ *    all so it can find out whether something cheaper (a player choice, a project pin, an iOS model
+ *    id, an allowlisted GPU, desktop) already decides the tier, and only pay for the probe when
+ *    nothing did. `'calibrating'` is exactly the state that means "nothing here decided". */
+export function buildTierResolveInput(
+  caps: TierDeviceFacts | null | undefined,
+  projectSetting: QualityTierSetting | undefined,
+  opts: { playerChoice?: QualityTier | null; probeClass?: DeviceClass; useProbe?: boolean } = {},
+): TierResolveInput {
+  const useProbe = opts.useProbe ?? true;
+  return {
+    platform: caps?.platform ?? '',
+    deviceModel: caps?.deviceModel,
+    gpuRenderer: caps?.gpuRenderer,
+    formFactor: caps?.formFactor,
+    playerChoice: opts.playerChoice,
+    projectSetting,
+    probeClass: useProbe ? (opts.probeClass ?? readCachedProbeClass(caps)) : undefined,
+  };
+}
+
 /** What each MEASURED device class means for the tier. Kept as a table rather than a chain of
  *  `if`s so the mapping is one readable line per band, and so a new class cannot be added to
  *  `DeviceClass` without the compiler pointing here. `'unknown'` is absent on purpose — it is the
@@ -833,10 +965,16 @@ export function freshTierChangeState(): TierChangeState {
  *    `allowlist`    a known-good GPU string answered.
  *    `desktop`      already `high`; stated uniformly rather than special-cased, so a fourth tier
  *                   could never quietly make desktop promotable.
- *    `player` /     a HUMAN decided. Calibration already refuses to run in both cases
- *    `project`      (`tickTierCalibration` early-returns), so this is belt-and-braces — but an
- *                   inference overriding an explicit choice is the one thing those controls exist
- *                   to prevent, and the cap says so in the one place that would have to be wrong.
+ *    `project`      a HUMAN decided. Calibration already refuses to run (`tickTierCalibration`
+ *                   early-returns unless the setting is `'auto'`), so this is belt-and-braces —
+ *                   but an inference overriding an explicit choice is the one thing those controls
+ *                   exist to prevent, and the cap says so in the place that would have to be wrong.
+ *    `player`       ⚠️ NEVER ARRIVES HERE (#208). A pin is not a statement about the hardware, so
+ *                   `setActiveQualityTier` does not latch it as the assessment — it used to, and a
+ *                   pin that survived into the next launch then capped promotion at the player's
+ *                   old choice for the whole process, even after they chose "Auto" again. The
+ *                   clause is kept in this table because the ARGUMENT still holds if one ever
+ *                   reaches here; what changed is that one no longer does.
  *    `calibrating`  NOTHING assessed it — the probe produced no usable reading, or never ran. This
  *                   is the only case with room to climb, and it gets exactly ONE step: enough that
  *                   `auto` cannot pin unrecognised hardware to `low` forever (#155's stated cost),
@@ -887,7 +1025,19 @@ export type TierDecision =
  *  interval and cannot go lower — so it reports "barely making 60" and "trivially making 60"
  *  identically, and judging headroom by it would promote a device that has none. While
  *  vsync-bound the honest question is how much of the frame the CPU is actually eating; only
- *  when frames run long does `frameMs` regain meaning. */
+ *  when frames run long does `frameMs` regain meaning.
+ *
+ *  ⚠️ **`vsyncBound` COVERS THE ENGINE'S OWN FRAME CAP, and it did not until 2026-08-12.** A loop
+ *  pacing to `targetFps` is finishing early and waiting — the same regime as vsync — but the
+ *  profiler's interval list held only DISPLAY intervals, so a 30-capped device (which is every
+ *  project's `low` since #202 seeded `targetFps: 30`) read `frameMs.median ≈ 33.3 ms`, went
+ *  `vsyncBound: false`, and fell to the branch below asking for <= 16.67 ms — **unreachable under
+ *  the tier's own cap**. Live promotion out of `low` was therefore impossible fleet-wide, which
+ *  silently voided #155's promised escape for a `calibrating` device. The cap is now pushed into
+ *  `frameProfiler` from `setTargetFPS`, so a capped-and-comfortable device takes the CPU-ratio
+ *  branch — the regime it is genuinely in. Any test for this must derive `vsyncBound` from a real
+ *  profile; the hand-set `profileOf(10, 4)` fixtures describe a frame the `low` tier cannot
+ *  produce and stayed green throughout the defect. */
 function hasHeadroom(p: FrameProfile): boolean {
   if (p.samples < MIN_SAMPLES_TO_JUDGE) return false;
   if (p.vsyncBound) {
@@ -932,8 +1082,12 @@ export function evaluateTierChange(
           decision: {
             action: 'demote',
             tier: down,
+            // The budget the profile ACTUALLY judged itself against, never `BUDGET_30FPS_MS` —
+            // which stopped being the threshold once `overBudget` started reading the frame cap
+            // in force. At the fleet's `targetFps: 60` this is 20 ms, and the old literal made
+            // the log read "22.0ms over the 33.3ms budget" (close-out 2026-08-12).
             reason: `median frame ${profile.frameMs.median.toFixed(1)}ms over the `
-              + `${BUDGET_30FPS_MS.toFixed(1)}ms budget for ${DEMOTION_HOLD_MS / 1000}s`,
+              + `${profile.budgetMs.toFixed(1)}ms budget for ${DEMOTION_HOLD_MS / 1000}s`,
           },
           state: { ...next, overBudgetSince: 0, demoted: true },
         };

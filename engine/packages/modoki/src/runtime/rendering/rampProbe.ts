@@ -422,6 +422,17 @@ const SPIKE_RATIO = 3;
  *  not to judge how much movement is enough. */
 const GROWTH_OVER_FLOOR = 1.25;
 
+/** How much MORE than its successor a step may cost before it is read as a transient rather than
+ *  as load.
+ *
+ *  The ramp DOUBLES its load each step, so a step costing meaningfully more than the next one did
+ *  not measure load — nothing about the workload got cheaper. The tolerance is for measurement
+ *  noise (iOS quantizes `performance.now()` to 1 ms, and a vsync-pinned pair can straddle an
+ *  interval), not for a real drop. Kept small deliberately: this guards the OVERSTATING direction,
+ *  where the cost of a false negative is a device promoted into a GPU it cannot afford, and the
+ *  cost of a false positive is one skipped candidate for `a`. */
+const NON_MONOTONE_RATIO = 1.2;
+
 /** Did this step cost disproportionately more than the one before it? See {@link SPIKE_RATIO}.
  *
  *  ⚠️ **ONE-DIRECTIONAL, AND THE OTHER DIRECTION IS THE DANGEROUS ONE.** This flags a step that
@@ -507,9 +518,39 @@ export function readRamp(s: RampState): RampReading {
     // OVERSTATES: on `[4:10, 8:24, 16:80]` that fallback fits 10 -> 24 and reports 0.286 units/ms
     // where the honest pair reports 0.143 — 2x high, in the direction that costs a GPU context.
     if (bi < 2) return { ...base, unitsPerMs: 0, bound: 'none' };
-    const a = s.steps.find((step, i) => i > 0 && i < bi && step.frameMs >= pin && loadBearing(step))
-      ?? s.steps.find((step, i) => i > 0 && i < bi && step.frameMs >= pin)
-      ?? s.steps[bi - 1];
+    // ⚠️ **`a` MUST NOT BE A SPIKE, and `find`-earliest actively PREFERS one** (review 2026-08-12).
+    // `isSpike` had exactly ONE call site — the tail trim above — while this search took the
+    // EARLIEST step clearing `pin`. `loadBearing` is a lower bound, so a hitch clears it trivially:
+    // the first step a GC pause / OS deschedule / GPU stall touches is the first step that
+    // qualifies, and `find` returns it. That shrinks `dMs` and therefore OVERSTATES throughput —
+    // the direction this module's header names as what costs a GPU context.
+    //
+    // MEASURED against this module: an iPhone-8-class cpu ladder
+    // `4096:0.4 8192:0.8 16384:1.5 32768:3 65536:6 131072:12` reads 10.9k xform/ms — the value that
+    // device contributed to `PROBE_THRESHOLDS`. The SAME ladder with one 7 ms pause at step 2 reads
+    // **22.9k**, clearing the `capable` floor of 14 500 and handing a mid-band phone the unclamped
+    // tier. `isSpike` was already TRUE at that index; it was simply never asked.
+    //
+    // Only the median-of-three contained it, and only when at most one launch hitched.
+    //
+    // ⚠️ **THE TEST IS NON-MONOTONICITY, NOT MAGNITUDE — `isSpike` is the WRONG predicate here and
+    // using it broke a real case.** `isSpike` asks "did this cost much more than the step before",
+    // which on a ramp whose LOAD DOUBLES every step is exactly what a slow device legitimately
+    // does: the pinned `escape beats the budget on the last affordable frame` case ramps
+    // `20 -> 120 -> 140` and its 6x second step is genuine growth, not a hitch. What separates the
+    // two is what comes AFTER. Real load growth is monotone — the next step carries twice the load,
+    // so it cannot cost meaningfully LESS. A transient is a local maximum: `…0.8, 7, 3, 6…` and
+    // `…10, 35, 14…` both fall back down, and both are the readings that overstated.
+    const notTransient = (i: number) => {
+      const next = s.steps[i + 1];               // always in range: the searches require `i < bi`
+      return !next || s.steps[i].frameMs <= next.frameMs * NON_MONOTONE_RATIO;
+    };
+    const a = s.steps.find((step, i) => i > 0 && i < bi && step.frameMs >= pin && loadBearing(step) && notTransient(i))
+      ?? s.steps.find((step, i) => i > 0 && i < bi && step.frameMs >= pin && notTransient(i))
+      // The last-resort pair. Still checked: falling back onto a hitch is the same overstatement by
+      // another route, and refusing costs only a reading — `bound: 'none'` falls through to what
+      // earlier launches concluded, which is the safe direction.
+      ?? (notTransient(bi - 1) ? s.steps[bi - 1] : undefined);
     if (!a) return { ...base, unitsPerMs: 0, bound: 'none' };
     const dLoad = b.load - a.load;
     const dMs = b.frameMs - a.frameMs;

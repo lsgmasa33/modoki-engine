@@ -682,6 +682,68 @@ describe('readRamp rejects OUTLIER STEPS — the real tables that motivated it',
   });
 });
 
+describe('readRamp rejects a TRANSIENT as the fit\'s start point (review 2026-08-12, #202 close-out)', () => {
+  // ⚠️ THE DEFECT. `loadBearing`/`pin` are LOWER bounds only, so `find`-earliest picked the
+  // FIRST step that cleared them — and a hitch (a GC pause, an OS deschedule, a GPU stall) clears
+  // a lower bound trivially. That shrinks `dMs` and OVERSTATES throughput — the direction that
+  // costs a GPU context (see the module's own header). `isSpike` was the wrong guard to reuse
+  // here (it compares against the PREVIOUS step, which a ramp that doubles its load legitimately
+  // trips — see the existing `escape beats the budget on the last affordable frame` case, ramping
+  // `20 -> 120 -> 140`); the correct test is NON-MONOTONICITY: a real load step cannot cost less
+  // than its DOUBLED successor, so a step that does is a local maximum, not load.
+
+  /** Drive a `cpu` ramp through an exact recorded step table (loads 4096, 8192, 16384, ... —
+   *  `RAMP_BOUNDS.cpu.startLoad` doubling), mirroring `shadeRampOf` above. */
+  function cpuRampOf(frameTimes: readonly number[]) {
+    let s = startRamp('cpu', 4, 200);
+    for (const ms of frameTimes) s = recordRampFrame(s, ms);
+    return s;
+  }
+
+  it('the baseline ladder — an iPhone-8-class cpu ramp with no hitch', () => {
+    // The exact reading that phone contributed to PROBE_THRESHOLDS.
+    const s = cpuRampOf([0.4, 0.8, 1.5, 3, 6, 12]);
+    expect(s.status).toBe('escaped');
+    const r = readRamp(s);
+    expect(r.bound).toBe('measured');
+    expect(r.unitsPerMs).toBeCloseTo(10922.67, 1);
+  });
+
+  it('a hitch mid-ramp (16384:7 instead of 1.5) reads the SAME — it did not overstate the device', () => {
+    // Before the fix this read 22937.6 (`find`-earliest paired the hitch step, 16384:7, with the
+    // final step: dLoad=114688, dMs=5).
+    const s = cpuRampOf([0.4, 0.8, 7, 3, 6, 12]);
+    expect(s.status).toBe('escaped');
+    const r = readRamp(s);
+    expect(r.unitsPerMs).toBeCloseTo(10922.67, 1);
+  });
+
+  it('a hitch one step later (32768:8 instead of 3) reads the SAME again', () => {
+    // Before the fix this read 24576 (`find`-earliest paired 32768:8 with the final step:
+    // dLoad=98304, dMs=4).
+    const s = cpuRampOf([0.4, 0.8, 1.5, 8, 6, 12]);
+    expect(s.status).toBe('escaped');
+    const r = readRamp(s);
+    expect(r.unitsPerMs).toBeCloseTo(10922.67, 1);
+  });
+
+  it('the SAME defect on the shade axis — a hitch at 32:35 must not overstate throughput', () => {
+    // Baseline: 4:8 8:9 16:10 32:12 64:14 128:20 256:30 512:55 -> ~10.24 units/ms (both cases
+    // fit 256:30 -> 512:55; the ladder up to there is all sub-pin floor).
+    let s = startRamp('shade', 16.7, 400);
+    for (const ms of [8, 9, 10, 12, 14, 20, 30, 55]) s = recordRampFrame(s, ms);
+    expect(s.status).toBe('escaped');
+    expect(readRamp(s).unitsPerMs).toBeCloseTo(10.24, 1);
+
+    // Same ladder, 32:12 replaced by 32:35 (a hitch). Before the fix this read 24 (`find`-earliest
+    // paired 32:35 with the final step: dLoad=480, dMs=20).
+    let hitched = startRamp('shade', 16.7, 400);
+    for (const ms of [8, 9, 10, 35, 14, 20, 30, 55]) hitched = recordRampFrame(hitched, ms);
+    expect(hitched.status).toBe('escaped');
+    expect(readRamp(hitched).unitsPerMs).toBeCloseTo(10.24, 1);
+  });
+});
+
 describe('refining a verdict ACROSS LAUNCHES (#188)', () => {
   const r = (cpuUnitsPerMs: number, shadeMfragPerMs: number): ProbeReading =>
     ({ cpuUnitsPerMs, shadeMfragPerMs });

@@ -38,7 +38,7 @@
       "exposure": 1.1,
       "tiers": {
         "mid": {
-          "pixelRatioCap": 1,
+          "pixelRatioCap": 1.5,
           "antialias": false,
           "shadows": true,
           "shadowMapCeiling": 1024,

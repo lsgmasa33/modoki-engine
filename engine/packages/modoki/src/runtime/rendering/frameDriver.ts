@@ -3,7 +3,7 @@
  *  ECS pipeline (0) → Three.js render (10) → PixiJS render (20). */
 
 import { rawNow } from '../core/clock';
-import { recordFrame } from '../core/frameProfiler';
+import { recordFrame, setProfilerFrameCap } from '../core/frameProfiler';
 import { beginProfilerFrame, endProfilerFrame, profileScope } from '../core/profilerMarkers';
 import { recordMarkerFrame } from '../core/profilerAggregate';
 import { captureFrame } from '../core/profilerCapture';
@@ -20,7 +20,13 @@ export const PRIORITY_EDITOR_2D = 40;
 
 /** Target FPS cap. Set to 0 for uncapped (uses display refresh rate). */
 export let targetFPS = 60;
-export function setTargetFPS(fps: number) { targetFPS = fps; }
+/** ⚠️ The cap is told to the PROFILER here and nowhere else. `runFrame` skips the whole callback
+ *  pass before `recordFrame` runs, so a capped loop's measured `frameMs` is this interval rather
+ *  than the display's — and a profiler that does not know that reports a device obeying its cap as
+ *  a device missing its budget, which disabled tier promotion fleet-wide (see
+ *  `frameProfiler.frameCapIntervalMs`). Every source of the cap — project config and a quality
+ *  tier — goes through this one setter, so a source added later cannot bypass it. */
+export function setTargetFPS(fps: number) { targetFPS = fps; setProfilerFrameCap(fps); }
 
 const callbacks = new Map<string, { cb: FrameCallback; priority: number }>();
 let sorted: { key: string; cb: FrameCallback }[] = [];

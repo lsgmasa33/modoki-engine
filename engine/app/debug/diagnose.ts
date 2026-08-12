@@ -11,6 +11,7 @@ import {
   getAllEntities, getAllTraits, readTraitData, readTraitDataFull,
   REF_FIELDS_BY_TRAIT, isGuid, isExternalUrl, isInternalAssetPath, resolveGuidToPath,
   getDeviceCaps, getDeviceCapsSync, readPerfProfile, getActiveQualityTier, getAutoLightCapStats,
+  getAssessedQualityTier, getEffectiveTargetFps, getRenderSettings, configCount,
 } from '@modoki/engine/runtime';
 import { computeLayoutBounds } from './layoutDump';
 
@@ -146,6 +147,23 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
   // the player picked it, and those want completely different responses. Omitted entirely until
   // a renderer has resolved one, matching the healthy-means-silent convention above.
   const tier = getActiveQualityTier();
+  // Three cheap fields beside the tier name — added because "did the clamp take?" was otherwise
+  // answerable only from source, on a subsystem whose entire failure history is fields that read
+  // as wired and did nothing (#188, R6.3). Deliberately NOT the whole resolved
+  // `TierRenderOverrides` object — that spends response budget on a subsystem most `diagnose`
+  // calls are not asking about.
+  // `assessed`: the tier this session STARTED at (boot probe / allowlist / calibrating), distinct
+  // from `tier` once live calibration has promoted/demoted away from it.
+  const assessed = getAssessedQualityTier();
+  // `configCount`: how many tier configs the project actually authored (1 = default only, and the
+  // boot probe never ran). Through the engine's own `configCount`, never re-derived here — the
+  // probe gate reads that function, and a second inline copy of `1 + mid? + low?` would be a
+  // hand-synced duplicate of the rule that decides whether a device is measured at all.
+  const tierConfigCount = configCount(getRenderSettings().three.tiers);
+  // `targetFps`: the EFFECTIVE frame cap (authored `rendering.targetFps` clamped by the active
+  // tier), never `getRenderSettings().targetFps` — see `getEffectiveTargetFps`'s own doc for why
+  // the raw value looks right in the editor and on desktop and is wrong on the device that matters.
+  const effectiveTargetFps = getEffectiveTargetFps();
   // The automatic light cap (#188 item 7), reported ONLY when it is doing something. A tier's
   // light limits are invisible otherwise — and they were literally inert for months — so "how many
   // of this scene's lights is this object actually lit by?" needs an answer from data. Omitted
@@ -155,7 +173,9 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
   return {
     ok,
     ...(deviceCaps ? { deviceCaps } : {}),
-    ...(tier ? { qualityTier: tier } : {}),
+    ...(tier
+      ? { qualityTier: { ...tier, assessed, configCount: tierConfigCount, targetFps: effectiveTargetFps } }
+      : {}),
     ...(lightCap.engaged ? { lightCap } : {}),
     perf,
     refs: { issues: refIssues, count: refIssues.length },

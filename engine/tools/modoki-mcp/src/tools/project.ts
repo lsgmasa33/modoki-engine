@@ -65,12 +65,15 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
       'the file needs repairing by hand first. action=set deep-merges ' +
       '`values` onto what is ON DISK and persists: a section you omit is left untouched, and only ' +
       'what the project actually chose is written (engine defaults are not baked in). A PARTIAL SET ' +
-      'IS SAFE — edit one field at a time. Arrays (content.scenes, physics.layers) replace wholesale ' +
-      'rather than merging, and a key you DO pass always wins — including "" and false, which is how ' +
-      'you clear a field. Refused with 400 (nothing written) if: a build field would be unsafe to ' +
-      'interpolate into a shell command; the patch contains a `null` anywhere (no field is nullable — ' +
-      'use ""/false/0 to clear); or project.config.json exists but is not valid JSON, since a patch ' +
-      'onto a file that cannot be read would replace it. Contract + rationale: docs/editor.md ' +
+      'IS SAFE — edit one field at a time. Arrays (content.scenes, physics.layers) AND ' +
+      '`rendering.three.tiers` replace wholesale rather than merging, and a key you DO pass always ' +
+      'wins — including "" and false, which is how you clear a field. Refused with 400 (nothing ' +
+      'written) if: a build field would be unsafe to interpolate into a shell command; the patch ' +
+      'contains a `null` anywhere (no field is nullable — use ""/false/0 to clear); ' +
+      '`rendering.three.tiers` is present but any named tier object is missing a field (it is NOT ' +
+      'merged onto the on-disk tier — post the complete tier block or omit the key entirely); or ' +
+      'project.config.json exists but is not valid JSON, since a patch onto a file that cannot be ' +
+      'read would replace it. Contract + rationale: docs/editor.md ' +
       '"Project Settings — the save contract".',
     {
       action: z.enum(['get', 'set']),

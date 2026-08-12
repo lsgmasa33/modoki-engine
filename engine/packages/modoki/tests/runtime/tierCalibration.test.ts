@@ -24,7 +24,7 @@ import { BUDGET_30FPS_MS, type FrameProfile } from '../../src/runtime/core/frame
 import {
   tickTierCalibration, applyPendingTierPromotion, resetTierCalibration,
   getPendingTierPromotion, CALIBRATION_INTERVAL_MS, applyActiveTierToRuntime, applyQualityTier,
-  setTierFrameCapEnabled,
+  setTierFrameCapEnabled, setTierCalibrationEnabled,
 } from '../../src/runtime/rendering/tierCalibration';
 import * as frameDriver from '../../src/runtime/rendering/frameDriver';
 import {
@@ -32,6 +32,7 @@ import {
   getAssessedQualityTier,
 } from '../../src/runtime/rendering/renderSettings';
 import { PROMOTION_HOLD_MS, DEMOTION_HOLD_MS, TIER_SETTINGS } from '../../src/runtime/rendering/qualityTier';
+import { playerTierStore } from '../../src/runtime/core/playerTierStore';
 
 let mockRenderer: { shadowMap: { enabled: boolean } };
 let resizeCalls = 0;
@@ -42,7 +43,7 @@ function profileOf(frameMs: number, cpuMs: number): FrameProfile {
   return {
     samples: 120, frameMs: stat(frameMs), cpuMs: stat(cpuMs),
     restMs: stat(Math.max(0, frameMs - cpuMs)), fps: 1000 / frameMs,
-    vsyncBound: false, overBudget: frameMs > BUDGET_30FPS_MS, discontinuities: 0,
+    vsyncBound: false, overBudget: frameMs > BUDGET_30FPS_MS, budgetMs: BUDGET_30FPS_MS, discontinuities: 0,
   };
 }
 const ROOMY = () => profileOf(10, 4);
@@ -238,6 +239,53 @@ describe('promotion WAITS for a scene boundary', () => {
   });
 });
 
+describe('applyPendingTierPromotion RE-RUNS ITS GATES (#202 close-out)', () => {
+  // ⚠️ THE DEFECT. A queued promotion can be a whole scene old — the player can open a settings
+  // menu and pin a tier, or a project setting can be edited live, in the meantime. Before this
+  // fix, `applyPendingTierPromotion` applied whatever `tickTierCalibration` had queued with no
+  // re-check, silently overwriting an explicit human choice made AFTER the queue decision. These
+  // pin that the three gates it now re-runs (`qualityTier === 'auto'`, no player pin,
+  // `configCount > 1`) each actually block the apply — and the positive control proves the gates
+  // are not simply refusing everything.
+  let playerTier: 'low' | 'mid' | 'high' | null = null;
+
+  beforeEach(() => {
+    playerTier = null;
+    playerTierStore.reset();
+    playerTierStore.provide({ read: () => playerTier, write: (t) => { playerTier = t; } });
+    setActiveQualityTier({ tier: 'low', source: 'calibrating', reason: 'x' });
+  });
+
+  function queuePromotion() {
+    for (let t = 0; t <= PROMOTION_HOLD_MS + CALIBRATION_INTERVAL_MS; t += CALIBRATION_INTERVAL_MS) {
+      tickTierCalibration(t);
+    }
+    expect(getPendingTierPromotion()).toMatchObject({ tier: 'mid' }); // sanity: it did queue
+  }
+
+  it('the positive control — with nothing pinned in the meantime, it DOES apply', () => {
+    // Matters on its own: a gate that refused everything would pass the two negative tests below
+    // for the wrong reason.
+    queuePromotion();
+    applyPendingTierPromotion();
+    expect(getActiveQualityTier()?.tier).toBe('mid');
+  });
+
+  it('does NOT apply once the player has pinned a tier after the promotion was queued', () => {
+    queuePromotion();
+    playerTier = 'low'; // the player's explicit choice, made AFTER the queue decision
+    applyPendingTierPromotion();
+    expect(getActiveQualityTier()?.tier).toBe('low'); // unmoved — the human's choice wins
+  });
+
+  it('does NOT apply once the project setting is no longer `auto`', () => {
+    queuePromotion();
+    setRenderSettings({ three: { qualityTier: 'high', tiers: { mid: TIER_SETTINGS.mid, low: TIER_SETTINGS.low } } });
+    applyPendingTierPromotion();
+    expect(getActiveQualityTier()?.tier).toBe('low'); // unmoved
+  });
+});
+
 describe('ONE CONFIG means the live half stands down too (plan §2.2/§4)', () => {
   // The boot probe skipping itself is the visible half of the owner's rule. This is the other
   // one, and it is the half that could plausibly have been forgotten: with only the default
@@ -366,5 +414,48 @@ describe('setTierFrameCapEnabled — the editor is not throttled by a phone`s ca
     expect(frameDriver.targetFPS).toBe(60);          // gated
     expect(mockRenderer.shadowMap.enabled).toBe(false); // low authors shadows: false — still applied
     expect(resizeCalls).toBe(1);                      // 2D/3D DPR still re-measured
+  });
+});
+
+describe('setTierCalibrationEnabled — the editor does not auto-calibrate (R7.4)', () => {
+  afterEach(() => setTierCalibrationEnabled(true));
+
+  // ⚠️ BOTH DIRECTIONS. The positive control is what makes the negative meaningful: a gate that
+  // refused everything would pass a "does not demote" assertion while having broken calibration
+  // outright — the exact failure mode the "one config" gate's own tests were built to avoid.
+  it('OFF: a drowning profile does NOT demote, and queues nothing', () => {
+    setTierCalibrationEnabled(false);
+    applyQualityTier('high', 'project', 'test');
+    mockProfile = DROWNING();
+    for (let t = 0; t <= DEMOTION_HOLD_MS + CALIBRATION_INTERVAL_MS; t += CALIBRATION_INTERVAL_MS) {
+      tickTierCalibration(t);
+    }
+    expect(getActiveQualityTier()?.tier).toBe('high');
+    expect(getPendingTierPromotion()).toBeNull();
+  });
+
+  it('ON: the same profile DOES demote — so the gate is what stopped it', () => {
+    setTierCalibrationEnabled(true);
+    applyQualityTier('high', 'project', 'test');
+    mockProfile = DROWNING();
+    for (let t = 0; t <= DEMOTION_HOLD_MS + CALIBRATION_INTERVAL_MS; t += CALIBRATION_INTERVAL_MS) {
+      tickTierCalibration(t);
+    }
+    expect(getActiveQualityTier()?.tier).not.toBe('high');
+  });
+
+  // A promotion decided BEFORE the gate closed must not still land at the next scene boundary.
+  it('OFF: a queued promotion is dropped rather than applied at a scene boundary', () => {
+    setTierCalibrationEnabled(true);
+    applyQualityTier('low', 'calibrating', 'test');
+    mockProfile = ROOMY();
+    for (let t = 0; t <= PROMOTION_HOLD_MS + CALIBRATION_INTERVAL_MS; t += CALIBRATION_INTERVAL_MS) {
+      tickTierCalibration(t);
+    }
+    expect(getPendingTierPromotion()).not.toBeNull();
+
+    setTierCalibrationEnabled(false);
+    applyPendingTierPromotion();
+    expect(getActiveQualityTier()?.tier).toBe('low');
   });
 });

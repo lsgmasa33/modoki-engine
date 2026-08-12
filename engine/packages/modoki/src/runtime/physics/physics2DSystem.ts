@@ -33,6 +33,7 @@ import { getWorldTransform3D } from '../core/ecs/worldTransform';
 import { createPhysicsWorldRegistry } from './physicsWorldRegistry';
 import { physics2DEvents } from './Physics2DEvents';
 import { makeFireOnCollision, drainContactEvents, synthesizeContactExits, refOf, type ColliderInfo } from './physicsContactEvents';
+import { physicsSubsteps, substepFraction, substepLerp } from './physicsSubstep';
 import { dropEntityFromContactIndex } from './physicsContactIndex';
 import { emit, isVerboseCaptureActive } from '../core/journal';
 import { warnVocabOnce } from '../core/warnVocab';
@@ -657,6 +658,57 @@ const _seenSolo = new Set<number>();     // reused per tick (solo-collider recon
 const _seenJoints = new Set<number>();   // reused per tick (joint reconcile)
 const _v: Vec2 = { x: 0, y: 0 };         // scratch for pull/push conversions (consumed immediately)
 const _desired: Vec2 = { x: 0, y: 0 };   // scratch for the character move delta
+
+// ── Kinematic targets issued THIS TICK, for per-substep re-issue ──────────────────────────────
+// The 2D half of the mechanism documented on `substepFraction` (physicsSubstep.ts) — kept in step
+// with `physics3DSystem`'s copy on purpose, and `physicsSubstepKinematic.test.ts` asserts both
+// dimensions behave the same so the pair cannot drift. Rotation here is a single ANGLE, not a
+// quaternion, which is the only real difference. A grown-once pool, like the scratch above: this
+// runs per moving kinematic body per tick.
+interface KinTarget2D {
+  body: RRigidBody2D;
+  sx: number; sy: number; sa: number;   // pose the body starts the frame at
+  tx: number; ty: number; ta: number;   // pose the frame asks it to reach
+  rot: boolean;                         // false for a character (translation only)
+}
+const _kin2: KinTarget2D[] = [];
+let _kin2Count = 0;
+const _v2d: Vec2 = { x: 0, y: 0 };
+
+/** Issue a kinematic target AND record it, so a split frame can re-issue it per substep.
+ *  `ang` null = translation only (the character path, which never spins its body). */
+function trackKinematic2D(body: RRigidBody2D, tx: number, ty: number, ang: number | null): void {
+  const t = body.translation();
+  let e = _kin2[_kin2Count];
+  if (!e) { e = { body, sx: 0, sy: 0, sa: 0, tx: 0, ty: 0, ta: 0, rot: false }; _kin2.push(e); }
+  e.body = body;
+  e.sx = t.x; e.sy = t.y; e.sa = ang === null ? 0 : body.rotation();
+  e.tx = tx; e.ty = ty; e.ta = ang ?? 0;
+  e.rot = ang !== null;
+  _kin2Count++;
+  // The full-frame target, issued now — an unsplit frame is byte-for-byte what it was.
+  _v2d.x = tx; _v2d.y = ty;
+  body.setNextKinematicTranslation(_v2d);
+  if (ang !== null) body.setNextKinematicRotation(ang);
+}
+
+/** Re-issue every recorded target at `frac` of the way through the frame — split frames only. */
+function retargetKinematics2D(frac: number): void {
+  for (let i = 0; i < _kin2Count; i++) {
+    const e = _kin2[i];
+    _v2d.x = substepLerp(e.sx, e.tx, frac);
+    _v2d.y = substepLerp(e.sy, e.ty, frac);
+    e.body.setNextKinematicTranslation(_v2d);
+    // Shortest arc across the ±pi seam: without it a body crossing pi spins the long way round
+    // for one frame, at a speed the interpolation was added to keep honest.
+    if (e.rot) {
+      let d = e.ta - e.sa;
+      while (d > Math.PI) d -= 2 * Math.PI;
+      while (d < -Math.PI) d += 2 * Math.PI;
+      e.body.setNextKinematicRotation(frac >= 1 ? e.ta : e.sa + d * frac);
+    }
+  }
+}
 /** Shared read-only empty children list — avoids a throwaway `[]` per non-compound body/tick. */
 const EMPTY_CHILDREN: readonly Entity[] = Object.freeze([]);
 
@@ -789,7 +841,9 @@ function stepCharacters(st: PhysicsWorldState, world: World, cfg: PhysicsConfig,
       const grounded = ctrl.computedGrounded();
 
       const t = body.translation();
-      body.setNextKinematicTranslation({ x: t.x + mv.x, y: t.y + mv.y });
+      // Recorded like every other kinematic target — see `substepFraction` (physicsSubstep.ts).
+      // A character is not substepped, but the solver consuming its target is.
+      trackKinematic2D(body, t.x + mv.x, t.y + mv.y, null);
 
       if (grounded && velY > 0) velY = 0; // landed — stop the fall
       cc.velY = velY;
@@ -846,6 +900,9 @@ export function physics2DSystem(world: World): void {
 
   const cfg = readConfig(world);
   const st = getOrCreateWorldState(world, cfg);
+  // Forget last tick's kinematic targets before anything records new ones — including on a tick
+  // that never steps (`dt <= 0`), or the next split frame interpolates from a stale start pose.
+  _kin2Count = 0;
   // Live gravity edits — cheap to set every tick.
   st.world.gravity = { x: cfg.gravityX, y: -cfg.gravityY };
   st.ppm = cfg.ppm;   // cache for the query/forces helpers (live pixelsPerMeter edits)
@@ -883,8 +940,9 @@ export function physics2DSystem(world: World): void {
         const body = st.world.getRigidBody(rec.bodyHandle);
         if (body) {
           if (rec.bodyType === 'kinematic') {
-            body.setNextKinematicTranslation({ x: pos.x, y: pos.y });
-            body.setNextKinematicRotation(ang);
+            // Through the recorder, so a SPLIT frame re-issues this per substep instead of handing
+            // the solver the whole frame's motion at `count`x speed in substep 1.
+            trackKinematic2D(body, pos.x, pos.y, ang);
           } else {
             body.setTranslation({ x: pos.x, y: pos.y }, true);
             body.setRotation(ang, true);
@@ -941,9 +999,20 @@ export function physics2DSystem(world: World): void {
   stepCharacters(st, world, cfg, dt);
 
   // ── Step ──
-  if (dt > 0) {
-    st.world.timestep = dt;
+  // SUBSTEPPED so no solver step is ever coarser than 1/60, whatever the render rate — a frame cap
+  // (a project's `targetFps`, or a quality tier's) must not change how the game behaves. See
+  // `physicsSubstep.ts` for why this is a ceiling on the step rather than a fixed-dt accumulator,
+  // and why character controllers stay outside the loop.
+  const { count: substeps, h: substepDt } = physicsSubsteps(dt);
+  for (let i = 0; i < substeps; i++) {
+    // Where every kinematic target should be at the END of this substep. Unsplit frames skip it.
+    if (substeps > 1) retargetKinematics2D(substepFraction(i, substeps));
+    st.world.timestep = substepDt;
     st.world.step(st.eventQueue);
+    // ⚠️ DRAINED INSIDE THE LOOP — the auto-draining EventQueue is CLEARED by every `world.step`,
+    // so a single drain after the loop would discard every substep's contacts but the last.
+    drainContactEvents(world, st.colliders, st.eventQueue, physics2DEvents, fireOnCollision,
+      (h1, h2, a, b, phase) => emitContactDetail2D(st, world, cfg.ppm, h1, h2, a, b, phase));
   }
 
   // ── Pull dynamic bodies (Rapier → ECS) — only when a step actually ran (dt>0), so a
@@ -994,11 +1063,11 @@ export function physics2DSystem(world: World): void {
     rec.lastX = t.x; rec.lastY = t.y;
   });
 
-  // ── Drain contact + sensor events → journal, Physics2DEvents manager, OnCollision2D. On a
-  //    solid contact BEGIN, also read the manifold for a rich `contact` event (point/normal/
-  //    impact speed) — the impact detail games need for damage / SFX / effect spawning. ──
-  if (dt > 0) drainContactEvents(world, st.colliders, st.eventQueue, physics2DEvents, fireOnCollision,
-    (h1, h2, a, b, phase) => emitContactDetail2D(st, world, cfg.ppm, h1, h2, a, b, phase));
+  // ── Contact + sensor events → journal, Physics2DEvents manager, OnCollision2D — DRAINED PER
+  //    SUBSTEP inside the step loop above, not here, because the auto-draining EventQueue is
+  //    cleared by each `world.step`. On a solid contact BEGIN the drain also reads the manifold
+  //    for a rich `contact` event (point/normal/impact speed) — the impact detail games need for
+  //    damage / SFX / effect spawning. ──
 }
 
 /** A 2D raycast against the physics world, in ECS/screen coordinates.

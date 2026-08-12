@@ -14,9 +14,32 @@ import { trait } from 'koota';
  * as the entity rises above the surface. No hit (or no physics world) → hidden, not a
  * floating blob.
  *
- * Authored on the entity by presence — not tier-gated, not wired to `TIER_SETTINGS`.
+ * ⚠️ **THE COST MODEL RUNS OPPOSITE TO THAT PURPOSE UNLESS YOU SAY OTHERWISE — see
+ * `onlyWhenShadowsOff`.** A blob costs one physics raycast PER FRAME PER VIEWPORT plus an
+ * always-submitted `frustumCulled = false` draw, on EVERY tier — including `high`, where the real
+ * shadow it stands in for is being rendered too, so the device pays for both. Before 2026-08-12
+ * presence was the only knob, so an author could not express "only when shadows are off" at all
+ * (review R7.2). They can now, and it is opt-in.
  */
 export const BlobShadow = trait({
+  /** Draw the blob ONLY while the active quality tier has real shadows off — the low-tier
+   *  substitute case this trait was built for. The gate short-circuits BEFORE the ground raycast,
+   *  so a blob ticked this way costs **nothing** on a tier that renders real shadows, instead of a
+   *  scene query per frame per viewport whose result is thrown away.
+   *
+   *  ⚠️ **DEFAULT `false` — opt IN, and the default is the owner's deliberate choice** (2026-08-12),
+   *  taken over defaulting `true` for one reason: the editor runs unclamped, so a `true` default
+   *  would make a freshly-added BlobShadow render NOTHING in the Inspector until the tier dropped
+   *  to `low`. A trait that looks dead when you author it is the exact defect class this review was
+   *  cleaning up, and introducing a fresh instance of it to fix a cost was the wrong trade. So
+   *  nothing changes until someone ticks this, and the saving is a deliberate authoring act.
+   *
+   *  Leaving it `false` is also simply CORRECT for a blob that is not a tier substitute at all: an
+   *  entity that can never cast a real shadow (an alpha-blended material — `applyShadowFlags`
+   *  leaves `castShadow` false for a `transparent` one, since the shadow map treats blended
+   *  geometry as opaque), or a deliberate stylistic blob. The engine cannot tell that case from
+   *  "this is standing in for a shadow", which is why it is authored rather than inferred. */
+  onlyWhenShadowsOff: false,
   /** world-space radius of the blob (ground units) */
   radius: 0.5,
   /** peak darkness at ground contact (0..1) */

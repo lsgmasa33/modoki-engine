@@ -31,6 +31,7 @@ import {
   KEYBOARD_RESIZE_MODES,
   WEB_DEPLOY_MODES,
   PLAYABLE_NETWORKS,
+  QUALITY_TIERS,
   type ProjectConfigIssue,
 } from '../../project-config';
 
@@ -44,6 +45,7 @@ const UNION_FIELDS: { path: string; patch: Record<string, unknown>; allowed: rea
   { path: 'build.webDeployMode', patch: { build: { webDeployMode: 'GCS' } }, allowed: WEB_DEPLOY_MODES },
   { path: 'build.playableNetwork', patch: { build: { playableNetwork: 'AppLovin' } }, allowed: PLAYABLE_NETWORKS },
   { path: 'rendering.three.toneMapping', patch: { rendering: { three: { toneMapping: 'ACES Filmic' } } }, allowed: TONE_MAPPINGS },
+  { path: 'rendering.three.qualityTier', patch: { rendering: { three: { qualityTier: 'Low' } } }, allowed: QUALITY_TIERS },
 ];
 
 describe('project.config string unions are all validated (#39)', () => {

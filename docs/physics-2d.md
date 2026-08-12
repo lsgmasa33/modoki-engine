@@ -79,6 +79,41 @@ Rapier2D is compatible with the harness and does **not** trip the determinism gu
 - Collisions/sensors become **journal events** (`emit('@collision'|'@sensor', …)`) you assert on in
   `createTestWorld` — no screenshots. This is the payoff that justifies Rapier over Matter.js.
 
+### A frame cap must not change how the game behaves — substepping (2026-08-12)
+
+`frameDriver`'s cap skips the whole callback pass, `PRIORITY_ECS` included, so a frame cap is not
+a render setting: it changes the rate the **simulation** ticks at. Both systems used to step Rapier
+once per tick at `getSimDelta(world)`, so a quality tier's `low.targetFps: 30` doubled the solver
+timestep on exactly the devices nobody can inspect — stacks settle differently, joints soften, and
+a fast body travels twice as far per step (halving the effective CCD margin). Worse, a live
+demotion changed it *mid-play*.
+
+**Physics now simulates at 1/60 whatever the render rate** (owner, 2026-08-12). The frame's delta is
+divided into equal steps, none coarser than `MAX_PHYSICS_STEP_S` — a *ceiling* on the step, not a
+fixed-dt accumulator, because without a render-interpolation layer an accumulator makes a 60 Hz
+display do 0 steps on one frame and 2 on the next whenever rAF jitters. At 60 fps `count` is 1 and
+nothing changes. Detail and the rejected alternatives: `runtime/physics/physicsSubstep.ts`.
+
+Three consequences worth knowing, each one earned:
+
+- **Contact events are drained INSIDE the step loop.** Rapier's auto-draining `EventQueue` is
+  cleared by every `world.step()`, so one drain after the loop would discard every substep's
+  contacts but the last — a contact that began and ended inside one frame would go unreported at
+  30 fps and report fine at 60.
+- ⭐ **A kinematic target is re-issued PER SUBSTEP** (`retargetKinematics`). Rapier derives a
+  position-based kinematic body's implicit velocity as `(next − current) / timestep` inside the
+  step that consumes it, so a target set once per frame moves the body at `count`× speed in
+  substep 1 and not at all in substep 2. Measured against raw Rapier over 1 s: a **carried box
+  kept 4% of its 60 fps velocity** and slid 1.5 m off the back of the platform, and a box in the
+  platform's path was shoved ~2× as fast. Interpolating the target per substep reproduces the
+  60 fps sequence identically. Pinned by `physicsSubstepKinematic.test.ts`, which compares the two
+  rates rather than asserting fixed numbers — a fixture would pass a build where both rates are
+  equally wrong.
+- **Character controllers are not substepped**, deliberately: `stepCharacters` compares the body
+  against a teleport baseline rewritten only in the post-step pull-back, so a second call would
+  read the first substep's own motion as an external teleport. Its kinematic *target* still goes
+  through the per-substep re-issue above, since the solver consuming it is substepped.
+
 ## Traits (3 core + 1 singleton)
 
 Defined with koota `trait()` under `runtime/traits/`, registered with editor metadata in

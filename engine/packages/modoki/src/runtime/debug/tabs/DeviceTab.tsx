@@ -4,7 +4,10 @@
 
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { scrollRootStyle } from '../tabLayout';
-import { getRenderSettings, setRenderSettings, getActiveQualityTier } from '../../rendering/renderSettings';
+import {
+  getRenderSettings, setRenderSettings, getActiveQualityTier,
+  getEffectiveThreeSettings, getEffectivePixiSettings, getActiveTierOverrides,
+} from '../../rendering/renderSettings';
 import { applyQualityTier } from '../../rendering/tierCalibration';
 import { TIER_ORDER, type QualityTier } from '../../rendering/qualityTier';
 import { forceResizeAllSurfaces } from '../../rendering/resizeBus';
@@ -65,32 +68,90 @@ function readCanvasBuffers(): { twoD: BufferRow[]; threeD: BufferRow[] } {
 
 /** `1`/`2`/`3` pin the backing-resolution multiplier; `0` ('Off') is the engine's existing
  *  "uncapped" sentinel (see renderSettings.ts) — NOT Infinity. */
+/** ⚠️ `pixelRatioCap` is a FLOAT, not an enum — `basePixelRatio` is `Math.min(dpr, cap)`
+ *  (`webCanvasSizing.ts`), so a fractional cap is ordinary, not a special case. Fractional is in
+ *  fact the NORM on Android: a Galaxy A23 reports `devicePixelRatio: 1.875`, and `demos/video-demo`
+ *  already authors `1.5`.
+ *
+ *  1.5 earns its place beside the integers because it is where the interesting answer lives: on an
+ *  A23, DPR 1 is 0.31 Mpx and DPR 2 (i.e. its native 1.875) is 1.08 Mpx — a 3.5x jump that costs
+ *  ~2.2 ms of GPU and drops the frame under 60. 1.5 sits between them, and without a button for it
+ *  the only way to try the middle of that range was to edit a config and rebuild. */
 const CAP_OPTIONS: Array<{ value: number; label: string }> = [
   { value: 1, label: '1' },
+  { value: 1.5, label: '1.5' },
   { value: 2, label: '2' },
   { value: 3, label: '3' },
   { value: 0, label: 'Off' },
 ];
 
-function CapButtonRow({ label, current, onPick }: { label: string; current: number; onPick: (v: number) => void }) {
+/** `Infinity` is the tier's own "unclamped" identity (`UNCLAMPED_OVERRIDES`); an authored `0`
+ *  ("Off") means the same thing from the other side (`renderSettings.ts`'s sentinel). Both read
+ *  as "no ceiling" here so a button's would-be-authored value compares against the tier's ceiling
+ *  on equal terms. */
+function asCeiling(v: number): number {
+  return v > 0 ? v : Infinity;
+}
+
+/** Would picking `value` on this A/B button be immediately clamped back down by the ACTIVE tier?
+ *  This is what makes the row honest — R6.2: on `low`/`mid` (`pixelRatioCap: 1`), tapping `2` or
+ *  `3` used to store the authored value while the renderer kept running at 1, and the owner had
+ *  no way to tell from this panel that the tap did nothing.
+ *
+ *  ⚠️ **IT LABELS THE BUTTON; IT DOES NOT DISABLE IT** (owner, 2026-08-12). Disabling was tried and
+ *  is wrong: A/B-ing the backing resolution on a device is the whole reason this row exists, and a
+ *  tier clamps it on every phone that is not `high` — i.e. on exactly the hardware worth testing.
+ *  Removing the control to signal the clamp takes away the thing the panel is FOR. The tap still
+ *  writes the authored value; the readout beside the row says what the tier is doing to it, and the
+ *  tier buttons in this same tab are how you lift the clamp. Honest, not inert. */
+function willBeClamped(value: number, tierCeiling: number): boolean {
+  return asCeiling(value) > tierCeiling;
+}
+
+function CapButtonRow({
+  label, effective, authored, tierCeiling, onPick,
+}: {
+  label: string; effective: number; authored: number; tierCeiling: number; onPick: (v: number) => void;
+}) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4, flexWrap: 'wrap' }}>
       <span style={{ ...keyStyle, width: 18 }}>{label}</span>
       <div style={{ display: 'flex', gap: 4 }}>
         {CAP_OPTIONS.map(({ value, label: btnLabel }) => {
-          const active = current === value;
+          // ⚠️ HIGHLIGHT WHAT THE TAP WROTE — the AUTHORED value — not the effective one.
+          // R6.2 highlighted `effective`, which sounds right ("show what is really running") and
+          // is wrong for a SELECTOR: the tap writes the authored value, so on any clamped tier the
+          // highlight never moved and the button read as broken. Reported from the device, 2026-08-12.
+          // The effective value is not lost — it is marked below and spelled out in the readout
+          // beside the row.
+          const active = authored === value;
+          // What the renderer is ACTUALLY running, when the tier clamped the pick somewhere else.
+          const isEffective = effective === value && effective !== authored;
+          const clamped = willBeClamped(value, tierCeiling);
           return (
             <button
               key={btnLabel}
               onClick={() => onPick(value)}
+              title={
+                isEffective
+                  ? `Running at this — the tier clamped your pick of ${authored > 0 ? authored : 'Off'} down to it`
+                  : clamped
+                    ? `The active tier clamps this to ${tierCeiling === Infinity ? 'uncapped' : tierCeiling} — it will be stored, but pick a higher tier to see it on screen`
+                    : undefined
+              }
               style={{
                 fontSize: 11,
                 padding: '2px 8px',
                 borderRadius: 4,
-                border: `1px solid ${active ? '#7ec8ff' : '#2d5a8a'}`,
+                // SELECTED = solid border (what you picked). RUNNING-but-not-picked = dashed
+                // (what the tier gave you instead). Two different facts, two different marks, so
+                // neither has to be inferred from the other.
+                border: active ? '1px solid #7ec8ff' : isEffective ? '1px dashed #7ec8ff' : '1px solid #2d5a8a',
                 background: active ? '#16223a' : 'transparent',
-                color: active ? '#7ec8ff' : '#8b8ba7',
+                // Dimmed as a HINT that the tier will clamp it — still tappable, see `willBeClamped`.
+                color: clamped ? '#5c5c70' : active || isEffective ? '#7ec8ff' : '#8b8ba7',
                 cursor: 'pointer',
+                opacity: clamped ? 0.7 : 1,
               }}
             >
               {btnLabel}
@@ -98,6 +159,13 @@ function CapButtonRow({ label, current, onPick }: { label: string; current: numb
           );
         })}
       </div>
+      {/* The AUTHORED value beside the effective one, only when a tier is clamping them apart —
+          the readout must not silently hide what was actually stored. */}
+      {authored !== effective && (
+        <span style={{ fontSize: 10, color: '#8b8ba7' }}>
+          (authored {authored > 0 ? authored : 'Off'}, tier clamps to {effective > 0 ? effective : 'Off'})
+        </span>
+      )}
     </div>
   );
 }
@@ -202,7 +270,19 @@ export function DeviceTab() {
     ]));
   }
 
+  // AUTHORED (what's stored in project settings — what a tap here writes) vs. EFFECTIVE (what
+  // the active tier actually lets the renderer run at). `getRenderSettings()` alone used to feed
+  // this whole panel, which made the readout and the A/B buttons lie on any tiered device: `low`
+  // and `mid` both seed `pixelRatioCap: 1`, so on e.g. a Galaxy A23 the authored `2` showed
+  // highlighted while the renderer ran at 1, and tapping `3` stored it with no visible change
+  // (R6.2 — see docs/rendering.md § "Quality tiers", "Read the tier through
+  // `getEffectiveThreeSettings()`").
   const liveCaps = getRenderSettings();
+  const effectiveThree = getEffectiveThreeSettings();
+  const effectivePixi = getEffectivePixiSettings();
+  const tierOverrides = getActiveTierOverrides();
+  const tierCeilingThree = asCeiling(tierOverrides.pixelRatioCap);
+  const tierCeilingPixi = asCeiling(tierOverrides.pixiPixelRatioCap);
 
   return (
     <div style={scrollRootStyle(3)}>
@@ -219,8 +299,20 @@ export function DeviceTab() {
           live via renderSettings + forceResizeAllSurfaces (resizeBus.ts), no rebuild needed. */}
       <div style={sectionStyle}>
         <div style={sectionTitleStyle}>Backing resolution</div>
-        <CapButtonRow label="2D" current={liveCaps.pixi.pixelRatioCap} onPick={(v) => setCap('pixi', v)} />
-        <CapButtonRow label="3D" current={liveCaps.three.pixelRatioCap} onPick={(v) => setCap('three', v)} />
+        <CapButtonRow
+          label="2D"
+          effective={effectivePixi.pixelRatioCap}
+          authored={liveCaps.pixi.pixelRatioCap}
+          tierCeiling={tierCeilingPixi}
+          onPick={(v) => setCap('pixi', v)}
+        />
+        <CapButtonRow
+          label="3D"
+          effective={effectiveThree.pixelRatioCap}
+          authored={liveCaps.three.pixelRatioCap}
+          tierCeiling={tierCeilingThree}
+          onPick={(v) => setCap('three', v)}
+        />
         <div style={{ ...rowStyle, marginTop: 6 }}>
           <span style={keyStyle}>Quality tier</span>
           <span style={valStyle}>{activeTier ? `${activeTier.tier} (${activeTier.source})` : '—'}</span>
@@ -254,9 +346,16 @@ export function DeviceTab() {
           </div>
         </div>
         <div style={{ ...rowStyle, marginTop: 4 }}>
-          <span style={keyStyle}>Caps (2D/3D)</span>
-          <span style={valStyle}>{liveCaps.pixi.pixelRatioCap} / {liveCaps.three.pixelRatioCap}</span>
+          <span style={keyStyle}>Effective caps (2D/3D)</span>
+          <span style={valStyle}>{effectivePixi.pixelRatioCap} / {effectiveThree.pixelRatioCap}</span>
         </div>
+        {(liveCaps.pixi.pixelRatioCap !== effectivePixi.pixelRatioCap
+          || liveCaps.three.pixelRatioCap !== effectiveThree.pixelRatioCap) && (
+          <div style={rowStyle}>
+            <span style={keyStyle}>Authored caps (2D/3D)</span>
+            <span style={valStyle}>{liveCaps.pixi.pixelRatioCap} / {liveCaps.three.pixelRatioCap}</span>
+          </div>
+        )}
         {bufferRows.map(([k, v]) => (
           <div key={k} style={rowStyle}>
             <span style={keyStyle}>{k}</span>

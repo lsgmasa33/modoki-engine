@@ -38,6 +38,7 @@ import { meshColliderProvider } from './meshColliderProvider';
 import { buildMeshColliderDescs } from './meshColliderGeometry';
 import { physics3DEvents } from './Physics3DEvents';
 import { makeFireOnCollision, drainContactEvents, synthesizeContactExits, refOf, type ColliderInfo } from './physicsContactEvents';
+import { physicsSubsteps, substepFraction, substepLerp } from './physicsSubstep';
 import { dropEntityFromContactIndex } from './physicsContactIndex';
 import { emit, isVerboseCaptureActive } from '../core/journal';
 import { warnVocabOnce } from '../core/warnVocab';
@@ -129,6 +130,77 @@ const _e: Euler3 = { rx: 0, ry: 0, rz: 0 };
 const _desired: Vec3 = { x: 0, y: 0, z: 0 };   // character move delta (physics meters)
 const _childScratch = new Map<number, Entity[]>();
 const EMPTY_CHILDREN: readonly Entity[] = Object.freeze([]);
+
+// ── Kinematic targets issued THIS TICK, for per-substep re-issue ──────────────────────────────
+// See `substepFraction` in physicsSubstep.ts for the measurement that makes this necessary: a
+// target set once per frame and consumed by a SPLIT frame moves the body at `count`x speed in
+// substep 1 and not at all in substep 2, which breaks friction grip and doubles push impulses.
+//
+// A GROWN-ONCE POOL, not a per-frame array of literals: this runs for every moving kinematic body
+// every tick, and the surrounding code goes to some length (`_v`, `_q`, `_desired`) to keep the
+// physics tick allocation-free. Entries are reused; `_kinCount` is the live length.
+interface KinTarget3D {
+  body: RRigidBody;
+  sx: number; sy: number; sz: number;            // pose the body starts the frame at
+  tx: number; ty: number; tz: number;            // pose the frame asks it to reach
+  rot: boolean;                                  // false for a character (translation only)
+  sqx: number; sqy: number; sqz: number; sqw: number;
+  tqx: number; tqy: number; tqz: number; tqw: number;
+}
+const _kin: KinTarget3D[] = [];
+let _kinCount = 0;
+
+/** Issue a kinematic target AND record it, so a split frame can re-issue it per substep.
+ *  `quat` null = translation only (the character path, which never spins its body). */
+function trackKinematic(body: RRigidBody, tx: number, ty: number, tz: number, quat: Quat | null): void {
+  const t = body.translation();
+  const r = quat ? body.rotation() : _IDENT_Q;
+  let e = _kin[_kinCount];
+  if (!e) {
+    e = { body, sx: 0, sy: 0, sz: 0, tx: 0, ty: 0, tz: 0, rot: false, sqx: 0, sqy: 0, sqz: 0, sqw: 1, tqx: 0, tqy: 0, tqz: 0, tqw: 1 };
+    _kin.push(e);
+  }
+  e.body = body;
+  e.sx = t.x; e.sy = t.y; e.sz = t.z;
+  e.tx = tx; e.ty = ty; e.tz = tz;
+  e.rot = quat !== null;
+  e.sqx = r.x; e.sqy = r.y; e.sqz = r.z; e.sqw = r.w;
+  if (quat) { e.tqx = quat.x; e.tqy = quat.y; e.tqz = quat.z; e.tqw = quat.w; }
+  _kinCount++;
+  // The full-frame target, issued now — so a frame that turns out NOT to be split (the 60 fps
+  // case, and every frame before this mechanism existed) is byte-for-byte unchanged.
+  _v2.x = tx; _v2.y = ty; _v2.z = tz;
+  body.setNextKinematicTranslation(_v2);
+  if (quat) body.setNextKinematicRotation(quat);
+}
+
+/** Re-issue every recorded target at `frac` of the way through the frame. Called before each
+ *  substep of a SPLIT frame only — at `count === 1` the target set by `trackKinematic` already
+ *  is the answer. Rotation is nlerp'd + normalised (shortest arc): the per-substep angle is a
+ *  fraction of one frame's rotation, where nlerp and slerp differ by far less than the f32 the
+ *  solver stores. */
+function retargetKinematics(frac: number): void {
+  for (let i = 0; i < _kinCount; i++) {
+    const e = _kin[i];
+    _v2.x = substepLerp(e.sx, e.tx, frac);
+    _v2.y = substepLerp(e.sy, e.ty, frac);
+    _v2.z = substepLerp(e.sz, e.tz, frac);
+    e.body.setNextKinematicTranslation(_v2);
+    if (!e.rot) continue;
+    const dot = e.sqx * e.tqx + e.sqy * e.tqy + e.sqz * e.tqz + e.sqw * e.tqw;
+    const s = dot < 0 ? -1 : 1;   // shortest arc — a quaternion and its negation are the same rotation
+    const qx = substepLerp(e.sqx, s * e.tqx, frac);
+    const qy = substepLerp(e.sqy, s * e.tqy, frac);
+    const qz = substepLerp(e.sqz, s * e.tqz, frac);
+    const qw = substepLerp(e.sqw, s * e.tqw, frac);
+    const len = Math.hypot(qx, qy, qz, qw) || 1;
+    _q2.x = qx / len; _q2.y = qy / len; _q2.z = qz / len; _q2.w = qw / len;
+    e.body.setNextKinematicRotation(_q2);
+  }
+}
+
+const _v2: Vec3 = { x: 0, y: 0, z: 0 };
+const _q2: Quat = { x: 0, y: 0, z: 0, w: 1 };
 
 /** O(1) parentId read off the entity handle (no world scan). 0 = root / unparented. */
 function parentIdOf(entity: Entity): number {
@@ -732,7 +804,10 @@ function stepCharacters(st: PhysicsWorldState3D, world: World, cfg: PhysicsConfi
 
       const t = body.translation();
       _v.x = t.x + mv.x; _v.y = t.y + mv.y; _v.z = t.z + mv.z;   // reuse scratch (apos no longer needed)
-      body.setNextKinematicTranslation(_v);
+      // Recorded like every other kinematic target: a character is not substepped (see
+      // `physicsSubstep.ts`), but the solver that consumes its target IS, and a character walking
+      // into a dynamic box would otherwise shove it at `count`x speed on a capped frame.
+      trackKinematic(body, _v.x, _v.y, _v.z, null);
 
       if (grounded && velY < 0) velY = 0; // landed — stop the fall
       cc.velY = velY;
@@ -779,6 +854,11 @@ export function physics3DSystem(world: World): void {
 
   const cfg = readConfig(world);
   const st = getOrCreateWorldState(world, cfg);
+  // Forget last tick's kinematic targets BEFORE anything can record new ones — including on a
+  // tick that never steps (`dt <= 0`), or the next split frame would interpolate against a stale
+  // start pose. Two physics worlds in one process share this scratch, which is safe only because
+  // it lives entirely within one synchronous system call.
+  _kinCount = 0;
   // Live gravity edits — cheap to set every tick. No flip (right-handed Y-up both sides).
   st.world.gravity = { x: cfg.gravityX, y: cfg.gravityY, z: cfg.gravityZ };
   st.upm = cfg.upm;   // refresh the cached scale for the query/forces helpers (avoids re-querying)
@@ -814,8 +894,11 @@ export function physics3DSystem(world: World): void {
         if (body) {
           // pos === _v, quat === _q (right-shaped, consumed synchronously) — pass scratch directly.
           if (rec.bodyType === 'kinematic') {
-            body.setNextKinematicTranslation(pos);
-            body.setNextKinematicRotation(quat);
+            // Through the recorder, so a SPLIT frame re-issues this target per substep instead of
+            // handing the solver the whole frame's motion at `count`x speed in substep 1 — see
+            // `substepFraction`'s docblock for the measurement. `count === 1` calls
+            // `setNextKinematic*` with exactly these values and nothing else changes.
+            trackKinematic(body, pos.x, pos.y, pos.z, quat);
           } else {
             body.setTranslation(pos, true);
             body.setRotation(quat, true);
@@ -874,9 +957,24 @@ export function physics3DSystem(world: World): void {
   stepCharacters(st, world, cfg, dt);
 
   // ── Step ──
-  if (dt > 0) {
-    st.world.timestep = dt;
+  // SUBSTEPPED so no solver step is ever coarser than 1/60, whatever the render rate — a frame cap
+  // (a project's `targetFps`, or a quality tier's) must not change how the game behaves. See
+  // `physicsSubstep.ts` for why this is a ceiling on the step rather than a fixed-dt accumulator,
+  // and why character controllers stay outside the loop.
+  const { count: substeps, h: substepDt } = physicsSubsteps(dt);
+  for (let i = 0; i < substeps; i++) {
+    // Move every kinematic target to where it should be at the END of THIS substep. Skipped
+    // entirely when the frame is not split, so the un-capped path does no extra work and issues
+    // no extra Rapier call.
+    if (substeps > 1) retargetKinematics(substepFraction(i, substeps));
+    st.world.timestep = substepDt;
     st.world.step(st.eventQueue);
+    // ⚠️ DRAINED INSIDE THE LOOP. `new R.EventQueue(true)` auto-drains — Rapier CLEARS it at the
+    // start of every `world.step` — so draining once after the loop would silently discard every
+    // substep's contacts but the last. A contact that begins and ends within one frame would then
+    // never be reported at 30 fps while reporting fine at 60.
+    drainContactEvents(world, st.colliders, st.eventQueue, physics3DEvents, fireOnCollision,
+      (h1, h2, a, b, phase) => emitContactDetail(st, world, cfg.upm, h1, h2, a, b, phase));
   }
 
   // ── Pull dynamic bodies (Rapier → ECS) — only when a step ran (dt>0), so a paused sim
@@ -933,11 +1031,11 @@ export function physics3DSystem(world: World): void {
     rec.lastX = t.x; rec.lastY = t.y; rec.lastZ = t.z;   // teleport-detection baseline (world/phys units)
   });
 
-  // ── Drain contact + sensor events → journal, Physics3DEvents manager, OnCollision3D. On a
-  //    solid contact BEGIN, also read the manifold for a rich `contact` event (point/normal/
-  //    impact speed) — the impact detail games need for damage / SFX / effect spawning. ──
-  if (dt > 0) drainContactEvents(world, st.colliders, st.eventQueue, physics3DEvents, fireOnCollision,
-    (h1, h2, a, b, phase) => emitContactDetail(st, world, cfg.upm, h1, h2, a, b, phase));
+  // ── Contact + sensor events → journal, Physics3DEvents manager, OnCollision3D — DRAINED PER
+  //    SUBSTEP inside the step loop above, not here, because the auto-draining EventQueue is
+  //    cleared by each `world.step`. On a solid contact BEGIN the drain also reads the manifold
+  //    for a rich `contact` event (point/normal/impact speed) — the impact detail games need for
+  //    damage / SFX / effect spawning. ──
 }
 
 /** On a solid contact BEGIN, read the Rapier manifold (world-space point + normal) + compute the

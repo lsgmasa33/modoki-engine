@@ -47,7 +47,7 @@ import { targetFPS } from './frameDriver';
 import { makeGpuClock, type GpuClock } from './gpuClock';
 import {
   startRamp, rampNextLoad, recordRampFrame, readRamp, estimateIntervalMs,
-  RAMP_BOUNDS, PROBE_BUDGET_MS,
+  RAMP_BOUNDS, PROBE_BUDGET_MS, ESCAPE_MULTIPLE, ABORT_FRAME_MS,
   type ProbeClockKind, type ProbeMeasurement, type RampKind, type RampReading,
 } from './rampProbe';
 
@@ -134,16 +134,96 @@ const GPU_RAMP_BUDGET_MS = 400;
 /** Ceiling on the HEAVY shader's compile, ms. See its call site for why it is bounded at all. */
 const SHADE_COMPILE_TIMEOUT_MS = 3_000;
 
+/** Ceiling on THROWAWAY renderer creation, ms (#205 R5.3).
+ *
+ *  `makeWebGPURenderer` is awaited before the real renderer is ever built, and until it settles
+ *  `runBootRampProbe` cannot return — so an unbounded await here does not just lose the probe, it
+ *  blocks `Scene3D.bringUp` forever, and `bringUp`'s only failure handling is a `.catch(...)` that
+ *  a PENDING promise never reaches. The observable failure is a permanently blank 3D surface with
+ *  no error anywhere.
+ *
+ *  Generous, because cold renderer creation is genuinely slow on real hardware: this module's own
+ *  measurements are 600-1700 ms on several phones and 796 ms on an iPhone 13 mini's first run (see
+ *  {@link HARD_DEADLINE_MS}'s comment). 5 s — the same order as {@link FRAME_WAIT_TIMEOUT_MS}, the
+ *  other "give up on the device entirely" bound in this file — comfortably clears that range while
+ *  still firing on a genuinely wedged create (a lost/never-acquired GPU context) instead of hanging
+ *  the launch indefinitely. */
+const RENDERER_CREATE_TIMEOUT_MS = 5_000;
+
+/** Ceiling on the TRIVIAL material's compile, ms (#205 R5.3) — the first `compileAsync`, which
+ *  builds the cheapest program the probe (or the engine) can express: an unlit quad, no lights, no
+ *  shadows, no environment, no post-FX (see the module header). It had no timeout at all, unlike
+ *  the HEAVY shader's second compile 28 lines below it — the exact asymmetry this constant closes.
+ *
+ *  Smaller than {@link SHADE_COMPILE_TIMEOUT_MS} on purpose: a program this simple has no business
+ *  taking anywhere near as long as a 16-dependent-tap shader, so a bound this generous already
+ *  means the compiler pipeline itself is not responding, not that the device is merely slow. */
+const TRIVIAL_COMPILE_TIMEOUT_MS = 1_500;
+
 /** Reject if `p` has not settled in `ms`. The timer is CLEARED on the happy path — an uncancelled
  *  one is the bug that made this workstream believe in a phantom 8-second WebGPU timeout for a
  *  whole session (see `gpuDetect.ts`). Same shape as `gpuClock.ts`'s, which is module-private
- *  there. */
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+ *  there.
+ *
+ *  Exported so a test can assert the timeout MECHANISM rejects a promise that never settles,
+ *  rather than only exercising the call sites through a fast mock that proves nothing about a
+ *  hang. */
+export function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout>;
   return Promise.race([
     p,
     new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms); }),
   ]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
+
+/** {@link withTimeout}, for a promise whose VALUE OWNS A RESOURCE: if the timeout wins, whatever
+ *  the promise eventually hands back is disposed instead of leaked.
+ *
+ *  ⚠️ **`Promise.race` CANCELS NOTHING, AND THE LOSER HERE HOLDS A GPU CONTEXT** (close-out
+ *  2026-08-12). `runBootRampProbe` assigns its `renderer` from the race, so on expiry the variable
+ *  stays null, the `finally` disposes NOTHING, and the abandoned `makeWebGPURenderer` keeps going
+ *  — very possibly succeeding a moment later with a live WebGPU device nothing holds a reference
+ *  to. That is exactly the "a leaked GPU context is a real cost on exactly the low-memory hardware
+ *  being characterised" the `finally` block exists to prevent, reached through the one path that
+ *  skipped it. And the timeout fires on slow, weak, thermally throttled devices — the population
+ *  the probe is FOR, which also re-runs it across three launches.
+ *
+ *  The flag, not a null check on the caller's variable: this callback is subscribed BEFORE the
+ *  `await` resolves, so on the HAPPY path it runs before the caller has stored the renderer
+ *  anywhere, and a "has the caller got one yet?" test would dispose the good one. */
+export async function awaitOrDispose<T extends { dispose: () => void }>(p: Promise<T>, ms: number): Promise<T> {
+  let abandoned = false;
+  void p.then((v) => { if (abandoned) v.dispose(); }, () => {});
+  try {
+    return await withTimeout(p, ms);
+  } catch (e) {
+    abandoned = true;   // set BEFORE rethrowing — the late resolution is what reads it
+    throw e;
+  }
+}
+
+/** Clamp the interval fed to a presentation-paced ramp's escape threshold so it stays in the
+ *  relation every ramp assumes: `ESCAPE_MULTIPLE x interval < ABORT_FRAME_MS` (#205 R5.4).
+ *  Nothing enforced this before.
+ *
+ *  `intervalMs` at the raf-path call site is `Math.max(measuredIntervalMs, cappedIntervalMs)` —
+ *  the measured half is already bounded by {@link MAX_PLAUSIBLE_INTERVAL_MS}, but the CAPPED half
+ *  is a legitimate, authored project setting (a game that targets 20 fps has a real 50 ms
+ *  interval), and the plausibility guard deliberately never inspects it — see its call site's
+ *  comment. Push that capped interval low enough (roughly 8 fps or slower, a real setting nothing
+ *  stops a project authoring) and `ESCAPE_MULTIPLE x interval` clears `ABORT_FRAME_MS` on its
+ *  own: the escape bar sits ABOVE the abort bar, so every ramp on that project aborts on its very
+ *  first over-budget step and can never escape — the exact inversion this closes.
+ *
+ *  This clamps only the ESCAPE YARDSTICK a ramp is measured against, not the reported
+ *  `intervalMs` field on `ProbeMeasurement` — the project's real target interval is still
+ *  honestly reported; only the internal threshold that decides "has this ramp escaped" is
+ *  bounded, the same way {@link RAMP_BOUNDS} already bounds load rather than lying about it. */
+export function escapableIntervalMs(intervalMs: number): number {
+  // Strictly less than: escape firing in the SAME frame that trips ABORT_FRAME_MS is still the
+  // inversion, not a guaranteed escape, hence the small margin off the exact ceiling.
+  const ceilingMs = ABORT_FRAME_MS / ESCAPE_MULTIPLE;
+  return Math.min(intervalMs, ceilingMs - 0.001);
 }
 
 /** Renders used to settle the pipeline on the GPU-clock path. No interval is estimated here — that
@@ -477,8 +557,11 @@ function nextFrame(): Promise<number | null> {
  *  Timing is the interval between successive rAF timestamps — the same metric `frameProfiler`
  *  uses, and the one the escape logic is written against. It is NOT the CPU time around
  *  `render()`, which on both backends returns before the GPU has done the work and would report
- *  a fill-bound device as infinitely fast. */
-async function runRamp(
+ *  a fill-bound device as infinitely fast.
+ *
+ *  Exported so a test can drive one ramp directly against fakes, without standing up the whole
+ *  probe — needed to prove the warm-up-load cleanup on the `no-frames` exit (#205 R5.4). */
+export async function runRamp(
   kind: RampKind,
   renderer: WebGPURenderer,
   scene: THREE.Scene,
@@ -547,7 +630,13 @@ async function runRamp(
 
   let state = startRamp(kind, intervalMs);
   let last = await nextFrame();
-  if (last === null) { mark(`${kind}:no-frames`); return readRamp(state); }
+  // ⚠️ CLEAR THE LOAD ON THIS EXIT TOO (#205 R5.4). `setLoad(group, warmLoad)` above already made
+  // this ramp's warm-up load VISIBLE in the scene, and this early return used to leave it that way
+  // — the next ramp's warm-up render (and its first timed frame) would then be contaminated by a
+  // load that belongs to a ramp which never got a single measured step. Every other exit from this
+  // function already zeroes the load (the GPU-paced path above, and the bottom of the loop below);
+  // this was the one that didn't.
+  if (last === null) { mark(`${kind}:no-frames`); setLoad(group, 0); return readRamp(state); }
 
   for (;;) {
     const load = rampNextLoad(state);
@@ -632,7 +721,15 @@ export async function runBootRampProbe(
     const { makeWebGPURenderer } = await import('./scene3DSync');
     mark('renderer-create');
     const rendererStarted = rawNow();
-    renderer = await makeWebGPURenderer(container);
+    // ⚠️ BOUNDED (#205 R5.3) — see {@link RENDERER_CREATE_TIMEOUT_MS}. This used to be a bare
+    // `await` with no timeout at all: every OTHER step in this function bounds itself, but a
+    // renderer that never resolves hangs `resolveActiveTier` forever, and `Scene3D.bringUp`'s only
+    // failure handling is a `.catch(...)` that a pending promise never reaches — a permanently
+    // blank surface with no error. On expiry this throws into the `try` below, which is the SAME
+    // degrade path an ordinary creation failure already takes: mark it, dispose what exists, and
+    // return `null` so the caller falls back to today's behaviour rather than the tier decision
+    // ever seeing a rejection.
+    renderer = await awaitOrDispose(makeWebGPURenderer(container), RENDERER_CREATE_TIMEOUT_MS);
     // DPR 1, explicitly. `makeWebGPURenderer` applies the project's pixelRatioCap, which on an
     // unpinned project is the HIGH tier's 2 — and 2x on a phone is 4x the fragments, which is
     // half of how the 13 mini's tab died. The clamp is safe because the result is normalised by
@@ -653,7 +750,13 @@ export async function runBootRampProbe(
     setLoad(fillGroup, 1);
     mark('compile');
     const compileStarted = rawNow();
-    await renderer.compileAsync(scene, camera);
+    // ⚠️ BOUNDED (#205 R5.3) — see {@link TRIVIAL_COMPILE_TIMEOUT_MS}. The SECOND compile 28 lines
+    // below already learned this lesson ("an unbounded second compile is exactly the 'boot must
+    // never be hostage to the probe' rule being broken by the probe"); this, the FIRST compile, had
+    // the same unbounded shape and is the other half of the same defect. Same degrade on expiry:
+    // the rejection propagates to the outer `catch`, which marks it and returns `null` rather than
+    // throwing into renderer bring-up.
+    await withTimeout(renderer.compileAsync(scene, camera), TRIVIAL_COMPILE_TIMEOUT_MS);
     const compileMs = rawNow() - compileStarted;
     mark('compile-ok');
     setLoad(fillGroup, 0);
@@ -806,13 +909,19 @@ export async function runBootRampProbe(
     // body runs once regardless, so it renders one frame and breaks with `status: 'running'`, which
     // reads as `bound: 'none'`. Silently starved, on the fallback path that exists precisely for
     // the oldest hardware. Found in close-out review.
-    const fill = await runRamp('fill', renderer, scene, camera, fillGroup, intervalMs, rawNow() + HARD_DEADLINE_MS, mark, null);
+    //
+    // ⚠️ `escapableIntervalMs(intervalMs)`, NOT the raw `intervalMs` — see its doc (#205 R5.4). A
+    // large enough authored `targetFPS` pushes `intervalMs` past `ABORT_FRAME_MS / ESCAPE_MULTIPLE`,
+    // at which point escape becomes unreachable before abort. `intervalMs` itself is still what
+    // gets reported below; only the ramps' own escape yardstick is bounded.
+    const rampIntervalMs = escapableIntervalMs(intervalMs);
+    const fill = await runRamp('fill', renderer, scene, camera, fillGroup, rampIntervalMs, rawNow() + HARD_DEADLINE_MS, mark, null);
     mark(`fill-ok ${fill.status}`);
-    const draw = await runRamp('draw', renderer, scene, camera, drawGroup, intervalMs, rawNow() + HARD_DEADLINE_MS, mark, null);
+    const draw = await runRamp('draw', renderer, scene, camera, drawGroup, rampIntervalMs, rawNow() + HARD_DEADLINE_MS, mark, null);
     mark(`draw-ok ${draw.status}`);
     let shade: RampReading | undefined;
     if (shadeGroup) {
-      shade = await runRamp('shade', renderer, scene, camera, shadeGroup, intervalMs, rawNow() + HARD_DEADLINE_MS, mark, null);
+      shade = await runRamp('shade', renderer, scene, camera, shadeGroup, rampIntervalMs, rawNow() + HARD_DEADLINE_MS, mark, null);
       mark(`shade-ok ${shade.status}`);
     }
 

@@ -9,9 +9,9 @@
  *  profiler confidently wrong rather than merely absent, which is worse than having no profiler
  *  at all — the plan exists because a previous fix was shipped against the wrong bottleneck. */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
-  recordFrame, getFrameProfile, resetFrameProfile,
+  recordFrame, getFrameProfile, resetFrameProfile, setProfilerFrameCap,
   BUDGET_30FPS_MS, PROFILE_WINDOW_FRAMES,
 } from '../../src/runtime/core/frameProfiler';
 
@@ -155,6 +155,32 @@ describe('frameProfiler — discontinuities', () => {
     recordFrame(1000, 1002);
     recordFrame(1000, 1002); // same timestamp — no elapsed interval
     expect(getFrameProfile().samples).toBe(0);
+  });
+});
+
+describe('frameProfiler — setProfilerFrameCap (#202 close-out: the cap must be judged against itself)', () => {
+  // ⚠️ `low`'s seeded `targetFps: 30` produces a ~33.3ms median, which is not within 1.2x of ANY
+  // display interval in VSYNC_INTERVALS_MS (the largest accepted median there is 20ms). Without
+  // `setProfilerFrameCap`, a device obeying its own 30fps cap read `vsyncBound: false` and
+  // `overBudget` against the fixed 30fps budget — which made live promotion out of `low`
+  // mathematically impossible fleet-wide. This is the regression that fix exists to close.
+  afterEach(() => setProfilerFrameCap(0)); // module state — must not leak into other test files
+
+  it('a device pacing to a 30fps cap reads vsyncBound + NOT overBudget, capped at 30', () => {
+    setProfilerFrameCap(30);
+    feed(Array.from({ length: 20 }, () => ({ frameMs: 1000 / 30, cpuMs: 5 })));
+    const p = getFrameProfile();
+    expect(p.vsyncBound).toBe(true);
+    expect(p.overBudget).toBe(false);
+  });
+
+  it('the SAME frames read NOT vsyncBound with no cap in force (0 = uncapped)', () => {
+    // Distinguishing control: same frame times, only the cap differs. ~33.3ms clears none of the
+    // display intervals (largest accepted median there is 20ms), so with no cap this must flip.
+    setProfilerFrameCap(0);
+    feed(Array.from({ length: 20 }, () => ({ frameMs: 1000 / 30, cpuMs: 5 })));
+    const p = getFrameProfile();
+    expect(p.vsyncBound).toBe(false);
   });
 });
 

@@ -267,6 +267,10 @@ export function registerAllTraits() {
   registerTrait({
     name: 'BlobShadow', trait: BlobShadow, category: 'component', componentCategory: 'Rendering', priority: 37,
     fields: {
+      // FIRST in the list on purpose: it decides whether any of the fields below ever run. The
+      // gate short-circuits before the ground raycast, so a blob left at the default costs nothing
+      // on a tier that renders real shadows — which is every tier above `low`.
+      onlyWhenShadowsOff: { type: 'boolean', tooltip: 'Tick to draw this blob ONLY while the quality tier has real shadows off — the low-tier substitute case. It then costs nothing on higher tiers (the gate skips the ground raycast). Leave OFF (the default) for a blob that should always draw: an entity that can never cast a real shadow anyway, e.g. an alpha-blended material, or a deliberate stylistic blob' },
       radius: { type: 'number', min: 0, step: 0.05, tooltip: 'World-space radius of the blob' },
       opacity: { type: 'number', min: 0, max: 1, step: 0.05, tooltip: 'Peak darkness at ground contact' },
       groundOffset: { type: 'number', min: 0, step: 0.01, tooltip: 'Lift above the found surface, along its normal, to avoid z-fighting' },

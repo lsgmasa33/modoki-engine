@@ -65,8 +65,18 @@ export interface FrameProfile {
   /** Median frameMs is within 20% of a plausible vsync interval, i.e. the frame is finishing
    *  early and `restMs` is mostly idle rather than GPU cost. */
   vsyncBound: boolean;
-  /** Median frameMs exceeds the 30 fps budget — the phase-5 pass/fail. */
+  /** Median frameMs exceeds {@link FrameProfile.budgetMs} — the phase-5 pass/fail. */
   overBudget: boolean;
+  /** The threshold {@link FrameProfile.overBudget} was judged against, ms.
+   *
+   *  ⚠️ **REPORTED BECAUSE A CONSUMER GUESSED IT AND GUESSED WRONG** (close-out 2026-08-12).
+   *  `overBudget` stopped meaning "slower than 30 fps" the moment it started reading the frame
+   *  cap in force (see {@link frameCapIntervalMs}) — at the fleet's `targetFps: 60` the real
+   *  threshold is **20 ms**, not 33.3. `evaluateTierChange` still built its demotion reason from
+   *  `BUDGET_30FPS_MS`, so a device demoting at a 22 ms median logged *"median frame 22.0ms over
+   *  the 33.3ms budget"* — a sentence that contradicts itself, on the one surface that exists to
+   *  explain a surprising tier. A judgement that carries its own threshold cannot be misquoted. */
+  budgetMs: number;
   /** Frames dropped from the window as discontinuities (see MAX_PLAUSIBLE_FRAME_MS). A
    *  non-zero count next to a healthy profile usually means stalls, not smooth rendering. */
   discontinuities: number;
@@ -136,8 +146,34 @@ const summarize = summarizeStat;
  *  means the renderer is finishing early and waiting — not that it is GPU-bound. */
 const VSYNC_INTERVALS_MS = [1000 / 60, 1000 / 120, 1000 / 90, 1000 / 144];
 
+/** The interval the ENGINE'S OWN frame cap is pacing to, ms; 0 when uncapped.
+ *
+ *  ⚠️ **THIS FIELD EXISTS BECAUSE ITS ABSENCE DISABLED TIER PROMOTION ON EVERY PROJECT IN THE
+ *  REPO** (review 2026-08-12). `frameDriver` skips the whole callback pass before `recordFrame`
+ *  runs, so a capped loop's `frameMs` is the CAP's interval, not the display's — and the list
+ *  above knows only display intervals. #202 seeded `low.targetFps: 30` into all 23 projects, so
+ *  every `low` device read `frameMs.median ≈ 33.3 ms`, which is not within 1.2x of ANY entry
+ *  above (the largest accepted median is 20 ms). `vsyncBound` therefore went false, `hasHeadroom`
+ *  fell to its `<= BUDGET_30FPS_MS * 0.5` branch — 16.67 ms, unreachable under a 30 fps cap — and
+ *  the single promotion step `promotionCeiling` grants a `calibrating` device could never fire.
+ *
+ *  A cap is a FRAME-DRIVER fact, not a display fact, so it is PUSHED IN rather than imported:
+ *  `frameProfiler` is L0 core and the cap's owner (`frameDriver`, L2) may import downward but not
+ *  the reverse. It is set from `setTargetFPS` — the single point every source of the cap goes
+ *  through (project config AND a tier) — so a new source cannot bypass it. */
+let frameCapIntervalMs = 0;
+
+/** Tell the profiler what interval the frame driver is pacing to. `fps <= 0` means uncapped.
+ *  Called only from {@link setTargetFPS}; see {@link frameCapIntervalMs} for why it is a push. */
+export function setProfilerFrameCap(fps: number): void {
+  frameCapIntervalMs = fps > 0 ? 1000 / fps : 0;
+}
+
 function isVsyncBound(medianFrameMs: number): boolean {
   if (medianFrameMs <= 0) return false;
+  // The engine's own cap first: a loop pacing to 33.3 ms because it was TOLD to is finishing
+  // early and waiting, which is exactly what this flag means — the same regime as vsync.
+  if (frameCapIntervalMs > 0 && medianFrameMs <= frameCapIntervalMs * 1.2) return true;
   return VSYNC_INTERVALS_MS.some((iv) => medianFrameMs <= iv * 1.2);
 }
 
@@ -156,6 +192,9 @@ export function getFrameProfile(): FrameProfile {
   // difference of two order statistics from different frames and need not correspond to any
   // frame that actually happened.
   const restMs = summarize(frames.map((f, i) => Math.max(0, f - cpus[i])));
+  // ONE expression for the threshold, published as `budgetMs` and compared against below — so
+  // "what counts as over budget" and "what we say it was" cannot disagree.
+  const budgetMs = frameCapIntervalMs > 0 ? frameCapIntervalMs * 1.2 : BUDGET_30FPS_MS;
   return {
     samples: filled,
     frameMs,
@@ -163,7 +202,13 @@ export function getFrameProfile(): FrameProfile {
     restMs,
     fps: frameMs.median > 0 ? 1000 / frameMs.median : 0,
     vsyncBound: isVsyncBound(frameMs.median),
-    overBudget: frameMs.median > BUDGET_30FPS_MS,
+    // Judged against the cap in force, not a fixed 30 fps. A project that ASKED for 30 is not
+    // "over budget" for delivering it — and at `targetFps: 30` the nominal interval is
+    // BUDGET_30FPS_MS to the decimal, so a bare `>` made obeying the cap a jitter-decided coin
+    // flip. The 1.2x matches `isVsyncBound`'s tolerance so the two cannot disagree about the
+    // same reading.
+    overBudget: frameMs.median > budgetMs,
+    budgetMs,
     discontinuities,
   };
 }

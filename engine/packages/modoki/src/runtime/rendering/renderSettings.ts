@@ -177,8 +177,23 @@ export function setActiveQualityTier(res: TierResolution | null): void {
   // measured by the boot probe, answered from the iOS model table, or never assessed at all? — is
   // gone, and `'measured'` is asserted about devices nothing ever measured. `promotionCeiling`
   // needs precisely that lost fact (#188).
+  //
+  // ⚠️ A PLAYER CHOICE IS NOT AN ASSESSMENT, AND LATCHING IT AS ONE TRAPPED THE CEILING (#208).
+  // A pin persists in `PlayerPrefs`, so the NEXT launch boots straight into
+  // `{source:'player'}` — the probe never runs (`resolveActiveTierOnce` early-returns above it) —
+  // and that resolution latched here. Switching back to "Auto" then correctly re-resolved and
+  // applied `mid`/`measured`, but `assessedTier` still read `low`/`player`, so `promotionCeiling`
+  // stayed at the pinned tier for the whole process: the player handed control back and the
+  // engine kept their old answer as the ceiling. Observed on the A23.
+  //
+  // The fix is at the source rather than at the Auto path, because `player` is the one source
+  // that is not a statement about the HARDWARE — it is a human preference, and nothing measured
+  // this device. So it never latches, `assessedTier` stays whatever really assessed the device
+  // (or null: honestly "nothing did"), and the first non-player resolution after the pin clears
+  // latches normally. `project` is deliberately NOT excluded — calibration does not run at all
+  // unless the setting is `'auto'`, so a project pin can never consult the ceiling.
   if (res === null) assessedTier = null;
-  else if (assessedTier === null) assessedTier = res;
+  else if (assessedTier === null && res.source !== 'player') assessedTier = res;
 }
 
 /** The resolved tier + WHY, or null before a renderer has brought one up. Surfaced in

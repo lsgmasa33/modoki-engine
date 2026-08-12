@@ -3,7 +3,10 @@
  *  missing-camera detection over a headless createTestWorld. */
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { createTestWorld, type TestWorld, Transform, EntityAttributes, Renderable3D, Camera } from '@modoki/engine/runtime';
+import {
+  createTestWorld, type TestWorld, Transform, EntityAttributes, Renderable3D, Camera,
+  setActiveQualityTier, setRenderSettings, resetRenderSettings,
+} from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { computeDiagnostics } from '../../app/debug/diagnose';
 
@@ -143,5 +146,42 @@ describe('computeDiagnostics (live world)', () => {
     expect(d.ok).toBe(true); // soft — not gated
     expect(d.summary).toMatch(/zero-scale/);
     expect(d.summary).not.toMatch(/No issues detected/);
+  });
+});
+
+// R6.3: "did the clamp take?" was previously answerable only by reading source — the tier NAME
+// was reported and nothing it actually applied. These three fields are cheap and deliberately
+// small: NOT the whole resolved TierRenderOverrides object, which would spend response budget on
+// a subsystem most `diagnose` calls are not asking about.
+describe('computeDiagnostics: quality tier fields (R6.3)', () => {
+  afterEach(() => resetRenderSettings());
+
+  it('omits qualityTier entirely until a tier has resolved (healthy-means-silent)', () => {
+    game = createTestWorld({});
+    const d = computeDiagnostics() as ReturnType<typeof computeDiagnostics> & { qualityTier?: unknown };
+    expect(d.qualityTier).toBeUndefined();
+  });
+
+  it('reports assessed, configCount and the EFFECTIVE targetFps once a tier resolves', () => {
+    game = createTestWorld({});
+    setRenderSettings({
+      targetFps: 60,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test-only partial tier config
+      three: { tiers: { low: { targetFps: 30 } } } as any,
+    });
+    setActiveQualityTier({ tier: 'low', source: 'calibrating', reason: 'unrecognised device — starting low' });
+
+    const d = computeDiagnostics() as ReturnType<typeof computeDiagnostics> & {
+      qualityTier: { tier: string; assessed: { tier: string; source: string }; configCount: number; targetFps: number };
+    };
+    expect(d.qualityTier.tier).toBe('low');
+    // `assessed` is the tier this SESSION started at — the first resolution, distinct from a
+    // later live promote/demote (getAssessedQualityTier's whole reason to exist).
+    expect(d.qualityTier.assessed).toEqual({ tier: 'low', source: 'calibrating', reason: 'unrecognised device — starting low' });
+    // 1 (default) + 1 (authored `low`) — the boot-probe gate signal from `configCount`.
+    expect(d.qualityTier.configCount).toBe(2);
+    // The EFFECTIVE cap (authored 60, clamped by the authored `low.targetFps: 30`), never the
+    // raw authored value — that is the exact distinction R6.2/R6.3 exist to stop hiding.
+    expect(d.qualityTier.targetFps).toBe(30);
   });
 });

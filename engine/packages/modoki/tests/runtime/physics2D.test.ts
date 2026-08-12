@@ -84,6 +84,59 @@ describe('physics2DSystem — falling & resting', () => {
   });
 });
 
+describe('physics2DSystem — substepping is render-rate independent (#205 R2)', () => {
+  /** A bouncy circle launched sideways between two facing walls, dropped onto a static floor
+   *  (Y-DOWN screen coords), run to a fixed total elapsed time via `ticks` frames of `dt` each.
+   *  High restitution off floor + walls gives many bounces in 4s, so a coarser per-frame solver
+   *  step (the pre-substepping bug) compounds into a measurable drift. A straight drop onto a
+   *  flat floor (no walls) converges to the same resting spot either way — vacuous. */
+  function bounceScene(t: TestWorld) {
+    t.spawn(Physics2D({ gravityX: 0, gravityY: 9.81, pixelsPerMeter: 100 }));
+    t.spawn(
+      Transform({ x: 0, y: 0 }),
+      RigidBody2D({ bodyType: 'static' }),
+      Collider2D({ shape: 'box', halfW: 1000, halfH: 10 }),
+    );
+    t.spawn(
+      Transform({ x: 150, y: -300 }),
+      RigidBody2D({ bodyType: 'static' }),
+      Collider2D({ shape: 'box', halfW: 20, halfH: 300 }),
+    );
+    t.spawn(
+      Transform({ x: -150, y: -300 }),
+      RigidBody2D({ bodyType: 'static' }),
+      Collider2D({ shape: 'box', halfW: 20, halfH: 300 }),
+    );
+    return t.spawn(
+      Transform({ x: 0, y: -500 }),
+      RigidBody2D({ bodyType: 'dynamic', vx: 300 }),
+      Collider2D({ shape: 'circle', radius: 25, restitution: 0.85, friction: 0.1 }),
+    );
+  }
+
+  function runBounce(ticks: number, dt: number): { x: number; y: number } {
+    const t = createTestWorld({
+      systems: [{ name: 'physics2D', fn: physics2DSystem, priority: SYSTEM_PRIORITY.PHYSICS }],
+    });
+    const box = bounceScene(t);
+    t.step(ticks, dt);
+    const tf = t.trait<{ x: number; y: number }>(Transform, box);
+    disposePhysics2D(t.world); t.dispose();
+    return tf;
+  }
+
+  it('the same total elapsed time settles to the same place whether it arrives as 1/60 or 1/30 ticks', () => {
+    // World A: 240 ticks of 1/60 = 4s. World B: 120 ticks of 1/30 = the SAME 4s.
+    const a = runBounce(240, 1 / 60);
+    const b = runBounce(120, 1 / 30);
+    // Measured pre-fix (single un-substepped step at dt=1/30): diff ≈ {x: 5.84, y: -0.0007}px —
+    // several pixels of drift after ~8 bounces off the walls/floor. Post-fix, x agrees to
+    // sub-pixel precision. See physicsSubstep.ts's docblock for why.
+    expect(b.x).toBeCloseTo(a.x, 0);
+    expect(b.y).toBeCloseTo(a.y, 0);
+  });
+});
+
 describe('physics2DSystem — Percept isSleeping read-back (S5)', () => {
   it('reports a falling body awake and a settled body asleep', () => {
     tw = newWorld();

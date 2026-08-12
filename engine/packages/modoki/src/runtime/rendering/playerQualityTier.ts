@@ -22,7 +22,7 @@
 
 import { playerTierStore } from '../core/playerTierStore';
 import { getDeviceCapsSync } from './deviceCaps';
-import { isQualityTier, resolveTier, type QualityTier } from './qualityTier';
+import { buildTierResolveInput, isQualityTier, resolveTier, type QualityTier } from './qualityTier';
 import { getRenderSettings } from './renderSettings';
 import { applyQualityTier } from './tierCalibration';
 
@@ -83,13 +83,12 @@ export function choosePlayerQualityTier(tier: QualityTier | null): void {
   // exactly the cost that gate removes. What keeps this from being a #155 regression is that
   // with one config EVERY tier resolves to the same unclamped overrides, so the tier named here
   // cannot change a pixel. If that ever stops being true, warm the caps before this line.
+  //
+  // ⚠️ THROUGH `buildTierResolveInput`, NOT A HAND-ASSEMBLED OBJECT. This call site used to build
+  // its own and omit `probeClass` — so "Auto" threw away the boot probe's verdict and, on Android
+  // (where the GPU allowlist is empty and nothing else can answer), dropped a device the probe had
+  // measured as `middle` all the way to `calibrating → low`. See the builder's docblock.
   const caps = getDeviceCapsSync();
-  const resolved = resolveTier({
-    platform: caps?.platform ?? '',
-    deviceModel: caps?.deviceModel,
-    gpuRenderer: caps?.gpuRenderer,
-    formFactor: caps?.formFactor,
-    projectSetting: setting,
-  });
+  const resolved = resolveTier(buildTierResolveInput(caps, setting));
   applyQualityTier(resolved.tier, resolved.source, `player chose Auto — ${resolved.reason}`);
 }

@@ -49,7 +49,7 @@ function fieldHelp(tier: TieredKey, field: NumberField | CheckboxField): string 
         : '0 = no ceiling. Y6: 2048 renders clean; 512 renders a dithered, under-sampled mess whatever the bias — resolution is the dominant term, not bias.';
     case 'maxDirectional':
     case 'maxLocal':
-      return '0 = unlimited. A23 ladder: 1 directional = 21ms, +3 point = 34ms, +8 point = 165ms — superlinear, with a cliff between 5 and 10 lights. ⚠️ Not yet enforced by the renderer (autoLightCap.ts is unwired) — authored intent for when it is, not a live limit today.';
+      return '0 = unlimited. A23 ladder: 1 directional = 21ms, +3 point = 34ms, +8 point = 165ms — superlinear, with a cliff between 5 and 10 lights. Enforced live, per frame — the mask is recomputed and re-applied every frame via the authored mask path (see docs/rendering.md § "The automatic light cap").';
     case 'ibl':
       return 'Y6: IBL costs ~26ms of a ~53ms frame, entirely GPU. Off took sling 18.7→36.5 fps. Not fixable by shrinking the HDR — three’s PMREM samples a fixed-size CubeUV map regardless of source size.';
     case 'iblOffAmbientBoost':

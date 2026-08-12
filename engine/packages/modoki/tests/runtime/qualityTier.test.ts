@@ -7,7 +7,7 @@
  *  vsync-bound would promote a device that has none — `frameMs` is pinned at the display
  *  interval there and reports "barely making 60" and "trivially making 60" identically. */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import {
   resolveTier, evaluateTierChange, freshTierChangeState, promotionCeiling,
   tierShadowMapSize, shadowBiasScale,
@@ -20,9 +20,15 @@ import {
   tierAllowsEffect, tierAllowsIBL, tierAmbientBoost, tierExposureBoost,
   UNCLAMPED_OVERRIDES, resolveTierOverrides, configCount, maskPostFXRequest,
   ALL_POSTFX, NO_POSTFX, POSTFX_EFFECTS,
+  buildTierResolveInput, readCachedProbeClass,
   type TierRenderOverrides, type AuthoredTiers, type PostFXMask,
 } from '../../src/runtime/rendering/qualityTier';
-import { BUDGET_30FPS_MS, type FrameProfile } from '../../src/runtime/core/frameProfiler';
+import {
+  BUDGET_30FPS_MS, recordFrame, resetFrameProfile, setProfilerFrameCap, getFrameProfile,
+  type FrameProfile,
+} from '../../src/runtime/core/frameProfiler';
+import { probeVerdictStore } from '../../src/runtime/core/probeVerdictStore';
+import { probeFingerprint } from '../../src/runtime/rendering/rampProbe';
 
 /** Build a FrameProfile with the fields the tier policy reads. */
 function profile(o: {
@@ -37,6 +43,8 @@ function profile(o: {
     fps: 1000 / o.frameMs,
     vsyncBound: o.vsyncBound ?? false,
     overBudget: o.frameMs > BUDGET_30FPS_MS,
+    // The threshold the fixture judged itself by — the demotion reason quotes it back.
+    budgetMs: BUDGET_30FPS_MS,
     discontinuities: 0,
   };
 }
@@ -206,6 +214,78 @@ describe('resolveTier — the boot ramp probe (#188)', () => {
   });
 });
 
+describe('buildTierResolveInput — the ONE input builder both boot and player Auto go through', () => {
+  // ⚠️ THE DEFECT THIS EXISTS FOR: `choosePlayerQualityTier(null)` used to hand-assemble its own
+  // input and simply omit `probeClass`, so a device the boot probe had measured got no credit for
+  // it the moment its player tapped "Auto". A single builder means a caller cannot forget the
+  // field — see (4)'s test in playerQualityTier.test.ts for the end-to-end shape of that bug.
+  const caps = { platform: 'android', deviceModel: 'SM-S901U1', gpuRenderer: 'Adreno (TM) 730' };
+
+  const g = globalThis as { innerWidth?: number; innerHeight?: number };
+  const viewportPx = (g.innerWidth ?? 0) * (g.innerHeight ?? 0);
+  const matchingFingerprint = probeFingerprint({ ...caps, viewportPx });
+
+  afterEach(() => probeVerdictStore.reset());
+
+  it('carries the cached verdict when the fingerprint matches this device', () => {
+    probeVerdictStore.provide({
+      read: () => ({ fingerprint: matchingFingerprint, deviceClass: 'middle', samples: [], final: true }),
+      write: () => {},
+    });
+    const input = buildTierResolveInput(caps, 'auto');
+    expect(input.probeClass).toBe('middle');
+  });
+
+  it('omits the verdict when the fingerprint does NOT match — different hardware, not this device\'s answer', () => {
+    probeVerdictStore.provide({
+      read: () => ({ fingerprint: 'v3|android|SM-OTHER||100', deviceClass: 'capable', samples: [], final: true }),
+      write: () => {},
+    });
+    const input = buildTierResolveInput(caps, 'auto');
+    expect(input.probeClass).toBeUndefined();
+  });
+
+  it('`useProbe: false` omits the probe class even when a matching verdict exists — boot\'s deliberate first pass', () => {
+    probeVerdictStore.provide({
+      read: () => ({ fingerprint: matchingFingerprint, deviceClass: 'middle', samples: [], final: true }),
+      write: () => {},
+    });
+    const input = buildTierResolveInput(caps, 'auto', { useProbe: false });
+    expect(input.probeClass).toBeUndefined();
+  });
+
+  it('an explicit `opts.probeClass` overrides the cache — boot\'s fresher-than-cache measurement', () => {
+    probeVerdictStore.provide({
+      read: () => ({ fingerprint: matchingFingerprint, deviceClass: 'weak', samples: [], final: true }),
+      write: () => {},
+    });
+    const input = buildTierResolveInput(caps, 'auto', { probeClass: 'capable' });
+    expect(input.probeClass).toBe('capable');
+  });
+});
+
+describe('readCachedProbeClass', () => {
+  const caps = { platform: 'android', deviceModel: 'SM-S901U1', gpuRenderer: 'Adreno (TM) 730' };
+  const g = globalThis as { innerWidth?: number; innerHeight?: number };
+  const viewportPx = (g.innerWidth ?? 0) * (g.innerHeight ?? 0);
+  const matchingFingerprint = probeFingerprint({ ...caps, viewportPx });
+
+  afterEach(() => probeVerdictStore.reset());
+
+  it('returns undefined with no provider installed', () => {
+    probeVerdictStore.reset();
+    expect(readCachedProbeClass(caps)).toBeUndefined();
+  });
+
+  it('returns the cached class on a fingerprint match', () => {
+    probeVerdictStore.provide({
+      read: () => ({ fingerprint: matchingFingerprint, deviceClass: 'capable', samples: [], final: true }),
+      write: () => {},
+    });
+    expect(readCachedProbeClass(caps)).toBe('capable');
+  });
+});
+
 describe('iOS resolves from the model id (owner, 2026-08-09)', () => {
   it('parses a model id into family + generation', () => {
     expect(parseAppleModel('iPhone10,1')).toEqual({ family: 'iPhone', generation: 10 });
@@ -357,6 +437,51 @@ describe('evaluateTierChange — the vsync-bound signal switch', () => {
   });
 });
 
+describe('evaluateTierChange — promotion under the ENGINE\'S OWN frame cap (#202 close-out)', () => {
+  // ⚠️ THE DEFECT THIS BLOCK EXISTS FOR. `low`'s seeded `targetFps: 30` made `frameMs.median`
+  // land at ~33.3ms, which `isVsyncBound` could not recognise (it only knew display intervals) —
+  // so a capped-and-comfortable device fell to the `frameMs <= BUDGET_30FPS_MS * 0.5` branch,
+  // asking for <= 16.67ms under a 30fps cap. Unreachable. Promotion out of `low` was therefore
+  // impossible fleet-wide, and every EXISTING promotion test in this file stayed green throughout
+  // because they hand-set `vsyncBound: true` via the `profile()` fixture — a frame the `low` tier
+  // could never actually produce. This block drives the REAL profiler (recordFrame +
+  // setProfilerFrameCap) instead, so `vsyncBound` comes from `isVsyncBound()` like it does in
+  // production.
+  afterEach(() => setProfilerFrameCap(0));
+
+  function realCappedProfile(cpuMs: number): FrameProfile {
+    resetFrameProfile();
+    setProfilerFrameCap(30);
+    let t = 0;
+    recordFrame(t, t + 1);
+    for (let i = 0; i < 40; i++) {
+      t += 1000 / 30;
+      recordFrame(t, t + cpuMs);
+    }
+    return getFrameProfile();
+  }
+
+  it('a capped device with comfortable CPU headroom IS promotable — driven through the real profiler', () => {
+    const p = realCappedProfile(4); // 4ms of CPU in a 33.3ms capped frame: plenty of room
+    expect(p.vsyncBound).toBe(true); // sanity: this is the regime the fix targets
+    const s = freshTierChangeState();
+    const a = evaluateTierChange('low', p, s, 1000, 'high');
+    const b = evaluateTierChange('low', p, a.state, 1000 + PROMOTION_HOLD_MS, 'high');
+    expect(b.decision.action).toBe('promote');
+  });
+
+  it('a capped device with NO cpu headroom does not promote — the cap alone is not evidence', () => {
+    // Distinguishing control: same cap, same regime, only the CPU cost differs (well past
+    // PROMOTION_CPU_RATIO of the 33.3ms capped interval).
+    const p = realCappedProfile(20);
+    expect(p.vsyncBound).toBe(true);
+    const s = freshTierChangeState();
+    const a = evaluateTierChange('low', p, s, 1000, 'high');
+    const b = evaluateTierChange('low', p, a.state, 1000 + PROMOTION_HOLD_MS * 3, 'high');
+    expect(b.decision.action).toBe('none');
+  });
+});
+
 describe('promotionCeiling — a measurement is not overruled by a CPU streak (#188)', () => {
   const res = (tier: QualityTier, source: TierSource): TierResolution =>
     ({ tier, source, reason: 'test' });
@@ -461,6 +586,22 @@ describe('evaluateTierChange — demotion', () => {
 
   it('demotes FASTER than it promotes — an emergency, not an upgrade', () => {
     expect(DEMOTION_HOLD_MS).toBeLessThan(PROMOTION_HOLD_MS);
+  });
+
+  it('says which budget it actually missed, not a hardcoded 30 fps (close-out 2026-08-12)', () => {
+    // ⚠️ THE DEFECT. `overBudget` reads the FRAME CAP in force (`frameProfiler.setProfilerFrameCap`),
+    // so at the fleet's `targetFps: 60` the real threshold is 20 ms — but the reason string was
+    // built from `BUDGET_30FPS_MS`, so a device demoting at a 22 ms median logged "22.0ms over the
+    // 33.3ms budget": a sentence contradicting itself, on the one surface that exists to explain a
+    // surprising tier. Restore the literal and this fails; nothing else does, which is the point —
+    // the DECISION was right all along, only the account of it was wrong.
+    const capped: FrameProfile = { ...profile({ frameMs: 22, cpuMs: 12 }), overBudget: true, budgetMs: 20 };
+    const s = freshTierChangeState();
+    const a = evaluateTierChange('high', capped, s, 1000, UNCAPPED);
+    const b = evaluateTierChange('high', capped, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED);
+    expect(b.decision).toMatchObject({ action: 'demote' });
+    expect(b.decision).toMatchObject({ reason: expect.stringContaining('22.0ms over the 20.0ms budget') });
+    expect(String((b.decision as { reason: string }).reason)).not.toContain('33.3');
   });
 
   it('a demotion is STICKY — never promote again, or the tier oscillates', () => {
@@ -586,15 +727,26 @@ describe('tier settings', () => {
     });
   });
 
-  it('mid loosens ONLY what was measured, and keeps the rest at low\'s values (#188)', () => {
+  it('mid loosens ONLY what was measured (#188), resolution included as of 2026-08-12', () => {
     // Each field is either measured on a mid-band device or a deliberate carry-forward; none is
     // invented. IBL because the A23 affords it (+2.9ms GPU inside 60fps); shadows because the band
     // is 10x the Y6; post-FX off because an iPhone 8 — squarely mid-band — goes 27ms -> 56ms on
-    // NPR alone. Resolution and AA stay at `low` because nothing has measured them here, which
-    // costs nothing today: every mid-band device currently resolves `low` anyway.
+    // NPR alone.
+    //
+    // ⭐ `pixelRatioCap: 1.5` USED TO BE 1, and the change is a measurement rather than a loosening
+    // of the rule. Measured on the band's own anchor (Galaxy A23, sling, uncapped): DPR 1 = 61.7fps
+    // / 4.9ms GPU, DPR 1.5 = 59.5fps / 6.2ms, DPR 1.875 = 54.6fps / 7.2ms. 1.5 buys 2.2x the pixels
+    // and holds 60; 2 does not. The curve bends BETWEEN the integers, which is why this sat at 1
+    // while the only values anyone tried were 1 and 2.
+    //
+    // AA stays at `low`'s value — still nothing has measured it on this band, and it is
+    // constructor-only so it cannot be A/B'd live the way resolution just was.
     expect(TIER_SETTINGS.mid).toMatchObject({
-      ibl: true, shadows: true, postFX: NO_POSTFX, pixelRatioCap: 1, antialias: false,
+      ibl: true, shadows: true, postFX: NO_POSTFX, pixelRatioCap: 1.5, antialias: false,
     });
+    // The ladder property this must not break: strictly between low and unclamped.
+    expect(TIER_SETTINGS.mid.pixelRatioCap).toBeGreaterThan(TIER_SETTINGS.low.pixelRatioCap);
+    expect(TIER_SETTINGS.mid.pixelRatioCap).toBeLessThan(UNCLAMPED_OVERRIDES.pixelRatioCap);
   });
 
   it('mid sits strictly between the two on every knob it changes', () => {
@@ -856,6 +1008,31 @@ describe('maskPostFXRequest — the tier FILTERS the frame\'s request, per effec
     expect(maskPostFXRequest({ ...full }, { ...UNCLAMPED_OVERRIDES, postFX: ALL_POSTFX })).toEqual(full);
     expect(maskPostFXRequest({ ...full }, { ...UNCLAMPED_OVERRIDES, postFX: NO_POSTFX })).toEqual({});
   });
+
+  describe('`fxaa` — a PostFXRequest member POSTFX_EFFECTS could never reach (review 2026-08-12)', () => {
+    // ⚠️ THE LEAK THIS CLOSES. `fxaa` is a full member of `PostFXRequest` but is not a
+    // `PostFXEffect` / tier field, so the old mask — looping over `POSTFX_EFFECTS` — could never
+    // even SEE it. A tier with every post-FX effect off still ran a full-screen FXAA pass every
+    // frame. `fxaa`'s permission is the tier's `antialias` field, not a post-FX toggle — it is AA,
+    // not an effect.
+    it('drops fxaa under NO_POSTFX + antialias:false, alongside npr', () => {
+      const req: Record<string, unknown> = { npr: { fake: 'npr' }, fxaa: { fake: 'fxaa' } };
+      const overrides: TierRenderOverrides = { ...UNCLAMPED_OVERRIDES, postFX: NO_POSTFX, antialias: false };
+      expect(maskPostFXRequest(req, overrides)).toEqual({});
+    });
+
+    it('is a no-op under UNCLAMPED_OVERRIDES — `high` keeps fxaa, so the no-op guarantee holds', () => {
+      const req: Record<string, unknown> = { npr: { fake: 'npr' }, fxaa: { fake: 'fxaa' } };
+      const out = maskPostFXRequest({ ...req }, UNCLAMPED_OVERRIDES);
+      expect(out).toEqual(req);
+    });
+
+    it('SURVIVES with antialias:true even when every post-FX effect is off — fxaa is AA, not an effect', () => {
+      const req: Record<string, unknown> = { fxaa: { fake: 'fxaa' } };
+      const overrides: TierRenderOverrides = { ...UNCLAMPED_OVERRIDES, postFX: NO_POSTFX, antialias: true };
+      expect(maskPostFXRequest(req, overrides)).toEqual({ fxaa: { fake: 'fxaa' } });
+    });
+  });
 });
 
 // ── Verify by PERTURBING (not just green tests) ─────────────────────────────────────────────
@@ -1049,8 +1226,17 @@ describe('applyTierToThree — the `0 = uncapped` sentinel (close-out finding)',
   const authored = (pixelRatioCap: number) => ({ pixelRatioCap, antialias: true, shadows: true });
 
   it('an authored 0 IS capped by the tier — the bug', () => {
-    expect(applyTierToThree(authored(0), TIER_SETTINGS.low).pixelRatioCap).toBe(1);
-    expect(applyTierToThree(authored(0), TIER_SETTINGS.mid).pixelRatioCap).toBe(1);
+    // ⚠️ Against the TIER'S OWN value, not a literal. This asserted `toBe(1)` for both tiers and
+    // broke the day `mid` was retuned to 1.5 (2026-08-12) — a sentinel guard failing because a
+    // TUNING number moved, which is the guard coupled to the wrong thing. What must hold is that
+    // an authored 0 ("uncapped") comes back CLAMPED TO WHATEVER THE TIER SAYS; the tier's value is
+    // the subject of `tier settings` above, and belongs only there.
+    expect(applyTierToThree(authored(0), TIER_SETTINGS.low).pixelRatioCap)
+      .toBe(TIER_SETTINGS.low.pixelRatioCap);
+    expect(applyTierToThree(authored(0), TIER_SETTINGS.mid).pixelRatioCap)
+      .toBe(TIER_SETTINGS.mid.pixelRatioCap);
+    // And it is genuinely a clamp, not a pass-through of the sentinel.
+    expect(applyTierToThree(authored(0), TIER_SETTINGS.mid).pixelRatioCap).not.toBe(0);
   });
 
   it('an authored 0 stays uncapped under the unclamped default, and round-trips as 0', () => {

@@ -7,7 +7,7 @@ import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.tsx'
 import { Capacitor } from '@capacitor/core'
-import { setJournalEnabled, setDebugMenuEnabled, setDebugHandlesEnabled, setTierFrameCapEnabled, readPerfProfile, setProfilerEnabled } from '@modoki/engine/runtime'
+import { setJournalEnabled, setDebugMenuEnabled, setDebugHandlesEnabled, setTierFrameCapEnabled, setTierCalibrationEnabled, readPerfProfile, setProfilerEnabled } from '@modoki/engine/runtime'
 
 // Debug build — event-journal recording gate. ON in the editor (dev + the packaged
 // Electron editor, __MODOKI_EDITOR__) and in a game build that opts in via
@@ -38,6 +38,16 @@ setDebugHandlesEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
 // Note the gate is __MODOKI_EDITOR__ ALONE, not OR'd with __MODOKI_DEBUG_BUILD__ — a debug GAME
 // build is still a game, and must run at the cap it will ship with.
 setTierFrameCapEnabled(!__MODOKI_EDITOR__)
+
+// And the broader half: the editor does not AUTO-CALIBRATE its tier at all (owner, 2026-08-12).
+// The carve-out above was too narrow — its own rationale claimed the other knobs only change how
+// the preview looks, but `applyActiveTierToRuntime` ends in an ungated `forceResizeAllSurfaces()`
+// and the SceneView is on that bus, so a demotion silently dropped IBL, ambient, exposure, the
+// shadow-map ceiling and the 2D backing buffer on the AUTHORING viewport — sticky for the session,
+// triggered by the editor's own double-viewport load. Setting a tier by hand still works, which is
+// the honest way to preview `low`. Same `__MODOKI_EDITOR__`-alone rule as above: a debug GAME build
+// is still a game and must calibrate the way it will ship.
+setTierCalibrationEnabled(!__MODOKI_EDITOR__)
 
 // Profiler reachable on a DEVICE build. `readPerfProfile()` already separates main-thread
 // engine work (`cpuMs`) from everything else (`restMs` = GPU + present + idle), and names the

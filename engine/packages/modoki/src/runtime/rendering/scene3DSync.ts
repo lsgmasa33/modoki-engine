@@ -42,7 +42,7 @@ import {
   getRenderSettings, resolveToneMapping, getEffectiveThreeSettings,
   getActiveQualityTier, setActiveQualityTier, getActiveTierOverrides,
 } from './renderSettings';
-import { resolveTier, tierShadowMapSize, tierAllowsIBL, tierAmbientBoost, tierExposureBoost, shadowBiasScale, configCount, type QualityTierSetting, type TierResolution } from './qualityTier';
+import { buildTierResolveInput, resolveTier, tierShadowMapSize, tierAllowsIBL, tierAmbientBoost, tierExposureBoost, shadowBiasScale, configCount, type QualityTierSetting, type TierResolution } from './qualityTier';
 import { applyActiveTierToRuntime } from './tierCalibration';
 import {
   classifyDevice, probeFingerprint, readingOf, refineProbeVerdict,
@@ -3449,15 +3449,11 @@ async function resolveActiveTierOnce(setting: QualityTierSetting): Promise<void>
     // A probe failure must not block rendering. resolveTier with no facts falls through to
     // "unrecognised device → start low", which is the safe direction (see its doc).
   }
-  const facts = {
-    platform: caps?.platform ?? '',
-    playerChoice,
-    deviceModel: caps?.deviceModel,
-    gpuRenderer: caps?.gpuRenderer,
-    // Absent on a failed probe, which resolveTier reads as "handheld" — the safe side.
-    formFactor: caps?.formFactor,
-    projectSetting: setting,
-  };
+  // Through the shared builder, so a field added to `TierResolveInput` cannot reach the boot path
+  // and miss `choosePlayerQualityTier`'s re-resolution (or the reverse — which is the drift that
+  // made "Auto" throw away the probe's verdict). `formFactor` absent on a failed probe is read by
+  // `resolveTier` as "handheld" — the safe side.
+  const factsCaps = caps;
 
   // Resolve WITHOUT the ramp probe first, and only pay for it if nothing cheaper answered.
   //
@@ -3466,7 +3462,7 @@ async function resolveActiveTierOnce(setting: QualityTierSetting): Promise<void>
   // allowlisted Android GPU. `'calibrating'` is precisely the state that means "nothing here
   // decided" — the state in which, before #188, a device sat on `low` forever because the
   // promotion path never fired on any hardware ever measured.
-  const cheap = resolveTier(facts);
+  const cheap = resolveTier(buildTierResolveInput(factsCaps, setting, { playerChoice, useProbe: false }));
   if (cheap.source !== 'calibrating') {
     // ── MEASURE-AND-LOG (#188) ────────────────────────────────────────────────────────────
     // ⚠️ **iOS HAS NEVER MEASURED ITSELF, AND THAT IS WHY THIS EXISTS.** `resolveTier` answers
@@ -3500,7 +3496,7 @@ async function resolveActiveTierOnce(setting: QualityTierSetting): Promise<void>
   }
 
   const probeClass = await resolveProbeClass(caps);
-  publishActiveTier(resolveTier({ ...facts, probeClass }));
+  publishActiveTier(resolveTier(buildTierResolveInput(factsCaps, setting, { playerChoice, probeClass })));
 }
 
 /** The quantitative tail of a probe run, for the boot log.

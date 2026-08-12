@@ -169,6 +169,7 @@ import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, 
 import { isGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
 import { getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData, type AssetSchemaType } from '../../packages/modoki/src/runtime/assets/assetSchemas';
+import { UNCLAMPED_OVERRIDES } from '../../packages/modoki/src/runtime/rendering/qualityTier';
 import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
 import { adbBinary, isUsable, listAndroidDevices, withFriendlyNames } from './androidDevices';
@@ -261,6 +262,31 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  *  POST /api/project-settings private-build-field split below. */
 const isPlainObjectLocal = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/** Every key path in a reference object, NESTED KEYS INCLUDED (`postFX.bloom`, not `postFX`).
+ *
+ *  ⚠️ **A TOP-LEVEL LIST LETS THROUGH THE ONE SHAPE THE TIERS GUARD BELOW EXISTS TO REFUSE**
+ *  (close-out 2026-08-12). `postFX` is one key, so `hasOwnProperty(tier,'postFX')` is satisfied by
+ *  `{npr:false}` — and `complete()` (qualityTier.ts) merges a partial block over `ALL_POSTFX`,
+ *  reading every ABSENT effect as ALLOWED. A Project Settings / `modoki_project_settings` patch
+ *  that dropped four of the five effects therefore passed a check whose stated job is "post the
+ *  complete block", was written to disk, and silently switched those effects back ON for that
+ *  tier — the exact silent-wrong the guard was added for, one level down. The engine's own
+ *  `hasEveryField` already descends into `postFX`; this makes the route agree with it. */
+function requiredKeyPaths(ref: Record<string, unknown>, prefix = ''): string[] {
+  return Object.entries(ref).flatMap(([k, v]) =>
+    isPlainObjectLocal(v) ? requiredKeyPaths(v, `${prefix}${k}.`) : [`${prefix}${k}`]);
+}
+
+/** Is a dotted key path present on an untrusted patch value? Presence only — never the value. */
+function hasKeyPath(o: unknown, keyPath: string): boolean {
+  let cur: unknown = o;
+  for (const seg of keyPath.split('.')) {
+    if (!isPlainObjectLocal(cur) || !Object.prototype.hasOwnProperty.call(cur, seg)) return false;
+    cur = cur[seg];
+  }
+  return true;
+}
 
 // ── MCP persistence: MANUAL ONLY (owner decision, 2026-07-30) ──────────
 // There used to be an 'auto' mode (the default) in which every live mutation ALSO saved the
@@ -2091,6 +2117,12 @@ async function describeUnresolvedAgainstLiveWorld(
   // any UNDECLARED top-level key. Pre-existing — the old route did the same — and
   // inert, since every reader resolves through that same list. Unknown keys nested
   // INSIDE a declared section do survive, via prune's already-on-disk rule.)
+  // ⚠️ **EXCEPT `rendering.three.tiers`** (REPLACE_WHOLESALE, project-config.ts): it is merged as
+  // a LEAF, not a section, so a patch naming it REPLACES the whole map — an omitted tier is
+  // DELETED, not left alone, and an omitted FIELD inside a named tier is refused below rather than
+  // silently dropped (see the tiers-completeness check further down). This is deliberate — the
+  // Project Settings "Remove tier" button needs a way to express deletion, which "omission means
+  // untouched" cannot express.
   // This is load-bearing: the Project Settings
   // dialog posts the WHOLE object (so every key is present and blanking a field
   // still works), but `modoki_project_settings action=set` and the OTA-keys
@@ -2173,6 +2205,31 @@ async function describeUnresolvedAgainstLiveWorld(
           error: `null is not a valid value for ${nulls.join(', ')} — no project-config field is ` +
             'nullable. Use "" (string), false (boolean) or 0 (number) to clear a field.',
         }, 400);
+      }
+      // `rendering.three.tiers` is in REPLACE_WHOLESALE (project-config.ts) — a patch that names
+      // it is deep-merged as a LEAF, so a tier object missing a field doesn't inherit that field
+      // from the file, it simply LOSES it. `complete()` (qualityTier.ts) then fills the hole from
+      // UNCLAMPED_OVERRIDES at read time, so the tier quietly stops clamping and this route still
+      // answers ok:true — the exact silent-wrong this route's own docblock and
+      // `modoki_project_settings`'s tool description warn `tiers` is the one exception to
+      // "an omitted section is left untouched". Refuse a partial tier object rather than merge it
+      // back (that would defeat the Project Settings "Remove tier" button, which relies on
+      // REPLACE_WHOLESALE to express deletion) — the caller must post the complete block.
+      const tiersThree = isPlainObjectLocal(configPart.rendering) ? (configPart.rendering as Record<string, unknown>).three : undefined;
+      const tiersPatch = isPlainObjectLocal(tiersThree) ? (tiersThree as Record<string, unknown>).tiers : undefined;
+      if (isPlainObjectLocal(tiersPatch)) {
+        // NESTED key paths, not top-level keys — see `requiredKeyPaths`: a partial `postFX` block
+        // otherwise passes this gate and reads back as "every missing effect ALLOWED".
+        const requiredFields = requiredKeyPaths(UNCLAMPED_OVERRIDES as unknown as Record<string, unknown>);
+        const incompleteTiers = Object.entries(tiersPatch as Record<string, unknown>).filter(
+          ([, tierValue]) => !isPlainObjectLocal(tierValue) || requiredFields.some((f) => !hasKeyPath(tierValue, f)),
+        );
+        if (incompleteTiers.length) {
+          return json({
+            error: `rendering.three.tiers is replaced wholesale — post the complete block. ` +
+              `${incompleteTiers.map(([k]) => `"${k}"`).join(', ')} is missing one or more of: ${requiredFields.join(', ')}.`,
+          }, 400);
+        }
       }
       // Keep the PRE-EDIT file around: it is what prune measures "was already
       // recorded" against. Pruning against nextRaw instead would make every key in

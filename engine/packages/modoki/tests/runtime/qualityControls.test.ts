@@ -23,13 +23,13 @@ import { registerQualityControls } from '../../src/runtime/actions/qualityContro
 import { dispatchUIAction, type UIActionPayload } from '../../src/runtime/core/actionRegistry';
 import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
 import { getPlayState, setPlayState } from '../../src/runtime/core/playState';
-import type { FrameProfile } from '../../src/runtime/core/frameProfiler';
+import { BUDGET_30FPS_MS, type FrameProfile } from '../../src/runtime/core/frameProfiler';
 
 let stored: 'low' | 'mid' | 'high' | null = null;
 const stat = (v: number) => ({ median: v, p95: v, min: v, max: v });
 const mockProfile: FrameProfile = {
   samples: 120, frameMs: stat(10), cpuMs: stat(4), restMs: stat(6), fps: 100,
-  vsyncBound: false, overBudget: false, discontinuities: 0,
+  vsyncBound: false, overBudget: false, budgetMs: BUDGET_30FPS_MS, discontinuities: 0,
 };
 
 const prevState = getPlayState();

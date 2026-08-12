@@ -266,6 +266,10 @@ export {
   tierShadowMapSize, tierAllowsEffect,
   TIER_SETTINGS, TIER_ALLOWLIST, DEFAULT_TIER_SETTING,
   TIER_ORDER, isQualityTier, tierAbove, tierBelow,
+  // On the barrel because `diagnose` needs it and re-deriving `1 + mid? + low?` inline gave the
+  // probe gate a second, hand-synced definition — the shadowing shape this workstream's review
+  // exists to remove, not add.
+  configCount,
   type QualityTier, type QualityTierSetting, type TierResolution, type TierSource,
   type TierRenderOverrides, type TierResolveInput, type TierChangeState, type TierDecision,
   type PostFXEffect,
@@ -390,7 +394,7 @@ export {
   getActiveTierOrDefault,
 } from './rendering/renderSettings';
 export {
-  tickTierCalibration, applyPendingTierPromotion, resetTierCalibration, setTierFrameCapEnabled,
+  tickTierCalibration, applyPendingTierPromotion, resetTierCalibration, setTierFrameCapEnabled, setTierCalibrationEnabled,
   getPendingTierPromotion, CALIBRATION_INTERVAL_MS,
 } from './rendering/tierCalibration';
 export {
@@ -403,7 +407,20 @@ export type { WorldTransform3D } from './core/ecs/worldTransform';
 // The CACHED half of the world-transform contract (the on-demand half is worldTransform.ts
 // above). Lived in `src/three/` until P5; `@modoki/engine/three` still re-exports these for
 // back-compat, but this barrel is the canonical import path.
-export { transformPropagationSystem, worldTransforms, deactivatedEntities } from './core/ecs/transformPropagationSystem';
+//
+// ⚠️ **`worldTransforms` HANDS BACK A POOLED RECORD THAT THE NEXT PASS OVERWRITES IN PLACE — do
+// not retain what `.get()` returns.** Hold it across frames and your snapshot silently becomes the
+// current pose (a drag-start reads a zero delta), with no error anywhere. Use
+// `readWorldTransformInto(id, out)` whenever the value outlives the statement that read it; `.get()`
+// is for hot paths that destructure immediately. The warning is repeated HERE, at the export, and
+// not only on the declaration, because that is where a caller meets it — the rule lived solely in a
+// comment on the Map while 76 read sites accumulated against it (review 2026-08-12, R7.1).
+//
+// ⚠️ NOT interchangeable with `getWorldTransform3D` above: this is the per-frame CACHE (O(1)),
+// that one RECOMPUTES on demand and rebuilds two full-world maps per call — right for a one-off,
+// wrong for reading many entities per frame.
+export { transformPropagationSystem, worldTransforms, readWorldTransformInto, deactivatedEntities } from './core/ecs/transformPropagationSystem';
+export type { WorldTransformRecord } from './core/ecs/transformPropagationSystem';
 export { computeContainerBox, clampBufferSize } from './rendering/webCanvasSizing';
 export type { WebSizing, ContainerBox } from './rendering/webCanvasSizing';
 export { useGameLoop } from './rendering/useGameLoop';

@@ -535,19 +535,41 @@ starts `low`. A project that wants exactly today's behaviour must pin `qualityTi
 
 | knob | `low` | `mid` | `high` | live-changeable? |
 |---|---|---|---|---|
-| `pixelRatioCap` | 1 | 1 | 2 | ✅ via the resize bus |
+| `pixelRatioCap` | 1 | **1.5** | 2 | ✅ via the resize bus |
 | `shadows` | off | **on** | on | ✅ `shadowMap.enabled` |
 | `Light.shadowMapSize` ceiling | 512 | **1024** | none | ✅ re-read each frame by `syncLights` |
 | post-FX stack | **dropped** | **dropped** | on | ✅ stack disposed |
 | `antialias` | off | off | on | ❌ **constructor-only** |
-| max directional lights | 1 | 2 | unlimited | ⚠️ **NOT WIRED — see below** |
-| max point+spot lights | 1 | 3 | unlimited | ⚠️ **NOT WIRED — see below** |
+| max directional lights | 1 | 2 | unlimited | ✅ per-frame, via `armAutoLightCap` — see § "The automatic light cap" below |
+| max point+spot lights | 1 | 3 | unlimited | ✅ per-frame, via `armAutoLightCap` — see § "The automatic light cap" below |
 | **IBL** (`scene.environment`) | **dropped** | **on** | on | ✅ `syncEnvironment` re-reads each frame |
 | ambient compensation | ×4 | ×1 | ×1 | ✅ `syncLights`, gated on `isIblSuppressed()` |
 | exposure compensation | ×1.25 | ×1 | ×1 | ✅ `reconcileToneExposure`, same gate, per frame |
 | **`targetFps`** (#202) | **30** | none | none | ✅ `setTargetFPS` at every publish point — **not in the editor** |
 | **`pixi.pixelRatioCap`** (#202) | **1** | 1 | 2 | ✅ via the resize bus |
 | **`pixi.antialias`** (#202) | off | off | on | ❌ **constructor-only** (`Application.init`) |
+
+⭐ **`mid`'s `pixelRatioCap` is 1.5 as of 2026-08-12, and it is a MEASUREMENT, not a compromise.**
+It sat at `low`'s value of 1 for months because the plan demanded "its own measurement; do not guess
+it" and the only datum was a Y6 paying ~4x for 2x DPR. Measured on the band's own anchor, a Galaxy
+A23 (`sling`, uncapped, driven through the tier path so every resize is real):
+
+| DPR | buffer | Mpx | fps | frame | GPU (`restMs`) |
+|---|---|---|---|---|---|
+| 1 | 384x801 | 0.31 | 61.7 | 16.2 ms | 4.9 ms |
+| **1.5** | 576x1201 | 0.69 | **59.5** | 16.8 ms | 6.2 ms |
+| 1.875 (cap 2) | 720x1501 | 1.08 | 54.6 | 18.3 ms | 7.2 ms |
+
+**The curve bends BETWEEN the integers** — which is why the answer stayed hidden while the only
+values anyone tried were 1 and 2 (the debug menu's DPR row offered exactly those, and now offers
+1.5 too). 1.5 buys 2.2x the pixels for +1.3 ms of GPU and holds 60; 2 costs 3.5x and does not.
+
+⚠️ **Measured on ONE project, and `sling` is light** (38 draw calls, 112k triangles). A fill-heavy
+scene has not been measured at 1.5 on this band; a project that cannot afford it authors its own
+`tiers.mid.pixelRatioCap: 1`. ⚠️ And on a DEBUG build carrying ~10.5 ms of CPU — a release build has
+more margin, so this errs safe. ⚠️ `pixi.pixelRatioCap` did NOT follow it: that is a different
+renderer and #204 is still open on what 2D DPR should be for Android; raising it by analogy is the
+guess this measurement replaced.
 
 **`mid` LOOSENS ONLY WHAT WAS MEASURED**, and reading the table's unchanged columns as unfinished
 work gets it backwards. IBL is on because the A23 was measured affording it; shadows are on because
@@ -974,7 +996,7 @@ the one moment the device is already struggling.
 Scene3D's `ResizeObserver` on every resize. If one applied the tier and the other read the raw
 setting, the first resize would silently undo it.
 
-**Precedence: player > project pin > iOS model id > allowlist > desktop > calibrating (low).** The player wins
+**Precedence: player > project pin > iOS model id > allowlist > desktop > measured (boot ramp probe) > calibrating (low).** The player wins
 outright because they can see the screen and we cannot; their choice persists via `PlayerPrefs`
 (behind the `playerTierStore` provider slot, since `rendering/` may not import `storage/`) and
 **stops calibration**, or the engine would override an explicit human decision with an inference.
@@ -1015,6 +1037,16 @@ get backwards:
 - **Headroom is judged by `cpuMs` while vsync-bound, by `frameMs` only once frames run long.**
   While vsync-capped, `frameMs` is pinned at the display interval and reports "barely making 60"
   and "trivially making 60" identically — judging by it would promote a device with no headroom.
+- ⚠️ **"Over budget" means the FRAME CAP in force × 1.2, not a fixed 30 fps** — and the practical
+  effect is that **demotion is stricter than it looks**. `frameProfiler` reads the cap
+  (`setProfilerFrameCap`, pushed from `setTargetFPS`), so on the fleet's `targetFps: 60` the
+  threshold is **20 ms**, not 33.3: a device holding ~45 fps for the 2 s hold demotes one rung,
+  where before it had to fall under 30 fps. That is deliberate — you asked for 60 and are not
+  getting it, and demoting is the recoverable direction — but demotion is **sticky for the
+  session**, so a heavy load window can cost a rung until relaunch. A project that would rather
+  ride it out authors a lower `rendering.targetFps`, which raises its own budget in step. The
+  profile publishes the threshold it used (`budgetMs`) and the demotion log quotes THAT; it used
+  to quote a hardcoded 33.3 ms and contradict its own numbers (close-out 2026-08-12).
 - ⭐ **PROMOTION MAY NOT EXCEED THE TIER THE DEVICE WAS ASSESSED AT** (`promotionCeiling`, #188).
   The headroom rule above reads `cpuMs` and nothing else, and that proxy is wrong in both
   directions on the hardware this exists for: on an A23, `games/3d-test` runs the GPU at **13.9 of
@@ -1026,8 +1058,17 @@ get backwards:
   | assessed by | promotion may reach |
   |---|---|
   | `measured` (the probe's band) · `model` (iOS table) · `allowlist` · `desktop` | exactly that tier |
-  | `player` · `project` (a human decided; calibration already refuses to run) | exactly that tier |
+  | `project` (a human decided; calibration already refuses to run) | exactly that tier |
   | `calibrating` — **nothing** assessed it | **one rung**, never further |
+
+  ⚠️ **A `player` pin never becomes an assessment at all (#208).** A pin persists in `PlayerPrefs`,
+  so the next launch boots straight into `{source:'player'}` and the probe never runs — and that
+  resolution used to latch as *the assessment*. Switching back to "Auto" then re-resolved the
+  active tier correctly and left the ceiling pinned at whatever the player had picked, for the
+  whole process. `setActiveQualityTier` now skips `player` when latching, so the assessment stays
+  the device's (or `null` — honestly "nothing measured it this launch") and the first non-player
+  resolution after the pin clears latches normally. Nothing is lost: calibration already
+  early-returns while a pin is in force, so the ceiling is not consulted then anyway.
 
   ⚠️ The consequence is deliberate: **on a device the probe classified, live promotion is a
   no-op.** That is the probe's job done, not a mechanism gone missing. The one rung for an

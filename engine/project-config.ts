@@ -694,6 +694,7 @@ export function mergeProjectConfig(
         ...d.rendering.three, ...p.rendering?.three,
         backend: pick(p.rendering?.three?.backend, GPU_BACKENDS, d.rendering.three.backend, 'rendering.three.backend'),
         toneMapping: pick(p.rendering?.three?.toneMapping, TONE_MAPPINGS, d.rendering.three.toneMapping, 'rendering.three.toneMapping'),
+        qualityTier: pick(p.rendering?.three?.qualityTier, QUALITY_TIERS, d.rendering.three.qualityTier, 'rendering.three.qualityTier'),
       },
       pixi: {
         ...d.rendering.pixi, ...p.rendering?.pixi,

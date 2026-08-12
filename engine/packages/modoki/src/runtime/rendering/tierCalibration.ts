@@ -105,6 +105,43 @@ export function setTierFrameCapEnabled(enabled: boolean): void {
   frameCapEnabled = enabled;
 }
 
+/** May the LIVE calibration loop change the tier by itself? Default TRUE — a shipped game is what
+ *  it exists for. */
+let liveCalibrationEnabled = true;
+
+/** Opt live tier calibration out entirely. The editor calls this (`app/main.tsx`), and this is the
+ *  broader sibling of {@link setTierFrameCapEnabled}.
+ *
+ *  ⚠️ **THE FRAME-CAP CARVE-OUT WAS TOO NARROW, AND ITS OWN REASONING SAID SO WITHOUT NOTICING.**
+ *  It justified itself with "every other tier knob degrades how the preview LOOKS, which is
+ *  arguably informative; this one degrades the tool." The other knobs do not stop at the preview:
+ *  `applyActiveTierToRuntime` ends in an UNGATED `forceResizeAllSurfaces()`, and the editor's own
+ *  SceneView is on that bus — so a demotion silently dropped IBL, ambient, exposure, the shadow-map
+ *  ceiling and the 2D backing buffer on the AUTHORING viewport, stickily, for the rest of the
+ *  session. And what trips the demotion is the editor's own double-viewport load, a symptom the
+ *  shipped build never has. An author was being quietly moved to worse settings while judging how
+ *  their scene looks (review 2026-08-12, R7.4).
+ *
+ *  Owner's decision: the editor does not auto-calibrate at all. Setting a tier BY HAND still works
+ *  (`applyQualityTier`, the debug menu's tier buttons, Project Settings), which is the honest way
+ *  to preview `low` — you choose it, rather than the tool deciding your machine is slow.
+ *
+ *  ⚠️ It also removes a second defect for free, which is why the narrower alternative was not
+ *  taken: the live shadow toggle writes `shadowMap.enabled` to `getActiveRenderer()`, a SINGLE
+ *  global handle, while the editor registers TWO renderers — so which viewport received it depended
+ *  on registration order, and that order changes whenever a context-loss rebuild or a SceneView
+ *  remount re-registers. With no live tier change in the editor, the ambiguous case cannot arise.
+ *  A shipped game has one renderer, so nothing there needs the per-renderer state that fixing it
+ *  properly would require.
+ *
+ *  Deliberately NOT the other route considered — making SceneView read `getRenderSettings()`
+ *  instead of the `getEffective*` accessors. That would re-create exactly the
+ *  code-shadows-the-source-of-truth split `renderSettings.ts` documents as the reason there is ONE
+ *  resolution point, and it would only cover the fields somebody remembered to change. */
+export function setTierCalibrationEnabled(enabled: boolean): void {
+  liveCalibrationEnabled = enabled;
+}
+
 /** Push whatever the CURRENTLY ACTIVE tier implies into the live runtime. Reads the tier from
  *  `renderSettings`; publishing it is the caller's job.
  *
@@ -153,6 +190,10 @@ export function applyQualityTier(tier: QualityTier, source: TierSource, reason: 
  *  A no-op unless the project asked for `'auto'` — a pinned tier is a decision the project
  *  already made, and measuring its way out of it would silently override the author. */
 export function tickTierCalibration(now: number = rawNow()): void {
+  // FIRST, above every other gate: the editor opts out entirely. See `setTierCalibrationEnabled`
+  // — auto-demoting the surface an author is judging their scene on, because the editor's own two
+  // viewports missed a budget the shipped build never would, is the tool degrading itself.
+  if (!liveCalibrationEnabled) return;
   if (getRenderSettings().three.qualityTier !== 'auto') return;
   // A PLAYER CHOICE OUTRANKS MEASUREMENT. Without this, someone who picked `low` in a settings
   // menu on an `auto` project would be silently promoted back to `high` five seconds later by the
@@ -221,10 +262,27 @@ export function tickTierCalibration(now: number = rawNow()): void {
 }
 
 /** Apply a queued promotion. Call at a scene boundary (SceneManager's before-swap hook), where
- *  the shader recompile is hidden inside a load the player has already accepted. */
+ *  the shader recompile is hidden inside a load the player has already accepted.
+ *
+ *  ⚠️ **THE GATES ARE RE-RUN HERE, because the decision can be a whole scene old.** A promotion is
+ *  deferred deliberately, and everything `tickTierCalibration` checked before queuing it can change
+ *  in the meantime — the player can open a settings menu and pin a tier, or pick "Auto"; a project
+ *  setting can be edited live in the editor. Without this, an explicit human choice was silently
+ *  overwritten at the next scene load by an inference made before they made it, which is precisely
+ *  what the player control exists to prevent (review 2026-08-12).
+ *
+ *  Note what is deliberately NOT reset: `state.demoted` and the headroom streak. Those carry the
+ *  anti-oscillation stickiness, and clearing them on a player action would let a device that has
+ *  already proven it cannot hold a tier climb straight back into it. */
 export function applyPendingTierPromotion(): void {
   if (!pendingPromotion) return;
   const { tier, reason } = pendingPromotion;
   pendingPromotion = null;
+  // Same gate as the tick, for the queue's sake: a promotion decided before calibration was turned
+  // off must not still land at the next scene boundary.
+  if (!liveCalibrationEnabled) return;
+  if (getRenderSettings().three.qualityTier !== 'auto') return;
+  if (hasPlayerQualityTier()) return;
+  if (configCount(getRenderSettings().three.tiers) <= 1) return;
   applyQualityTier(tier, 'measured', `${reason} (applied at a scene boundary)`);
 }

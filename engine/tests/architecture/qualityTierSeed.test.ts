@@ -87,4 +87,29 @@ describe('backfilling fields a project seeded before they existed', () => {
     const tiers = { mid: structuredClone(SEED.mid), low: structuredClone(SEED.low) };
     expect(backfillTiers(tiers)).toEqual([]);
   });
+
+  it('RECURSES into a nested plain object (postFX) — a top-level-only pass could never reach a ' +
+    'new PostFXEffect, and an absent effect key reads as ALLOWED at read time (complete()\'s ' +
+    '{...ALL_POSTFX, ...o.postFX})', () => {
+    const low = structuredClone(SEED.low);
+    delete (low.postFX as Partial<typeof SEED.low.postFX>).ao; // simulate a 6th effect the project never saw
+    const tiers = { mid: structuredClone(SEED.mid), low };
+
+    const added = backfillTiers(tiers);
+
+    expect(added).toEqual(['low.postFX.ao']);
+    expect(tiers.low.postFX.ao).toBe(SEED.low.postFX.ao);
+  });
+
+  it('does not disturb an already-tuned sibling key inside a nested object', () => {
+    const low = structuredClone(SEED.low);
+    low.postFX.bloom = true; // tuned
+    delete (low.postFX as Partial<typeof SEED.low.postFX>).vignette;
+    const tiers = { mid: structuredClone(SEED.mid), low };
+
+    const added = backfillTiers(tiers);
+
+    expect(added).toEqual(['low.postFX.vignette']);
+    expect(tiers.low.postFX.bloom).toBe(true); // tuned value left alone
+  });
 });
