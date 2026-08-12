@@ -131,6 +131,15 @@ on `px`/`py`/`pz` reads-and-writes once, not three spread-copies. It dirties the
 (`markUIDirty`) when it touches a UI trait — otherwise a UI clip plays in ECS but never repaints
 (the DOM only rebuilds on the dirty flag).
 
+⚠️ **An UNCHANGED value is skipped — both the `entity.set` and the dirty flag.** This matters more
+than it sounds, because a clip is sampled EVERY frame regardless of `playing`: a held pose (before a
+timeline clip block starts, after it ends, or any paused/clamped animator) re-evaluates to the same
+number forever. Writing that unconditionally cost a spread + set per animator per frame, and on a UI
+trait it rebuilt the WHOLE UI projection every frame for the rest of the session — a one-second fade
+buying a permanent per-frame DOM rebuild (found via court's title intro, five UI animators over a
+169-entity tree). A **dotted/nested** field (`overrides.0.source.value`) cannot be compared cheaply,
+so it counts as changed and keeps the old always-write path.
+
 Curve evaluation (`curveEval.ts`) mirrors Unity's `AnimationCurve`: constant clamp outside the key
 range, weighted cubic-bezier Hermite between keys using each key's out/in tangents + weights, and a
 **STEPPED** (`+Infinity`) out-tangent holds the left value until the next key. `evalSegment` solves
@@ -269,7 +278,8 @@ swapped-away scene is dropped.
   keeps the two distinct. Legacy/partial keys with an absent `outTangent` must read as 0, or
   `evalTrack` (which treats non-finite as STEPPED) and `evalSegment` (which reads 0) would disagree.
 - **Animating a UI trait needs the dirty flag** — `applyClipAtTime` calls `markUIDirty()` when it
-  writes a UI trait; a bare `entity.set` on a UI field won't repaint on its own.
+  writes a UI trait; a bare `entity.set` on a UI field won't repaint on its own. It fires only when
+  a value actually CHANGED, so a held pose is inert rather than a per-frame rebuild (above).
 - **`SkeletalAnimator.speed/loop/fadeDuration` are OVERRIDES, and "equals the trait default" is the
   sentinel for "inherit the animset value."** `ANIMSET_DEFAULTS` in `animSetCache` MUST stay equal to
   the trait defaults (`speed:1, loop:true, fadeDuration:0`) — that equality *is* the inherit switch.

@@ -100,10 +100,19 @@ export function applyClipAtTime(
     // of the array; a flat field is a plain assign. Several fields of one trait batch here, so we
     // apply them in sequence onto the same accumulating object.
     let next: Record<string, unknown> = { ...current };
+    // Does this frame's pose actually DIFFER from what the trait already holds? A clip is sampled
+    // every frame regardless of `playing`, so a held pose (before a timeline clip block starts,
+    // after it ends, or any paused/clamped animator) re-writes the same numbers forever. The write
+    // itself is a spread + set, and on a UI trait it also dirties the WHOLE UI projection — which
+    // turned a one-second fade into a permanent per-frame DOM rebuild for the entire session.
+    // A dotted field writes into a nested location and cannot be compared cheaply, so it counts as
+    // changed and keeps the old always-write behavior.
+    let changed = false;
     for (const [f, v] of Object.entries(w.patch)) {
-      if (f.includes('.')) next = setPath(next, f, v);
-      else next[f] = v;
+      if (f.includes('.')) { next = setPath(next, f, v); changed = true; }
+      else { next[f] = v; if (!Object.is(current[f], v)) changed = true; }
     }
+    if (!changed) continue;
     w.entity.set(w.meta.trait, next);
     if (isUITrait(w.meta)) uiTouched = true;
   }
@@ -231,12 +240,20 @@ function writePose(pose: PoseMap): number {
     // `overrides.0.source.value`) writes into the nested location via setPath so the crossfade
     // path handles nested-path tracks too — a plain spread would write a bogus flat key.
     let next: Record<string, unknown> = { ...current };
+    // Same unchanged-value skip as `applyClipAtTime` — see the note there. Cheaper to justify
+    // here (a crossfade is transient, so most frames DO move a value), but two clips can blend to
+    // a pose identical to the last frame's: equal held segments, a `fadeDuration` long enough to
+    // outlast the motion, or a field only one side animates that has already reached its key.
+    // `applied` still counts every field POSED, not every field written — it reports how much of
+    // the blend was evaluated, and skipping a redundant `set` does not make that smaller.
+    let changed = false;
     for (const [field, fs] of entry.fields) {
       const v = coerce(fs.type, fs.raw, fs.options);
-      if (field.includes('.')) next = setPath(next, field, v);
-      else next[field] = v;
+      if (field.includes('.')) { next = setPath(next, field, v); changed = true; }
+      else { next[field] = v; if (!Object.is(current[field], v)) changed = true; }
       applied++;
     }
+    if (!changed) continue;
     entry.entity.set(entry.meta.trait, next);
     if (isUITrait(entry.meta)) uiTouched = true;
   }

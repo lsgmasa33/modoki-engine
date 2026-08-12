@@ -241,11 +241,60 @@ describe('applyClipAtTime — UI dirty flag', () => {
     applyClipAtTime(world, root.id(), c, 1);
     expect(markUIDirty).not.toHaveBeenCalled();
   });
+
+  // A clip is sampled every frame regardless of `playing`, so a HELD pose (before a timeline clip
+  // block starts, after it ends, or a paused animator) re-writes identical values forever. On a UI
+  // trait that used to dirty the whole UI projection every frame for the rest of the session —
+  // a one-second fade costing a permanent per-frame DOM rebuild.
+  it('does NOT re-dirty the UI tree while the sampled value is unchanged', () => {
+    const world = createWorld();
+    const root = world.spawn(Panel({ w: 0 }), EntityAttributes({ name: 'root', parentId: 0 }));
+    const c = clip([{ path: '', trait: 'Panel', field: 'w', type: 'number', keys: [key(0, 0), key(1, 100)] }]);
+    applyClipAtTime(world, root.id(), c, 1);
+    expect(markUIDirty).toHaveBeenCalledTimes(1);
+    // Re-sampling the SAME time (a clamped/held pose) must be inert.
+    applyClipAtTime(world, root.id(), c, 1);
+    applyClipAtTime(world, root.id(), c, 1);
+    expect(markUIDirty).toHaveBeenCalledTimes(1);
+    expect(root.get(Panel)!.w).toBeCloseTo(100);
+    // Moving the playhead to a genuinely different value dirties again.
+    applyClipAtTime(world, root.id(), c, 0.5);
+    expect(markUIDirty).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('applyClipAtTimeBlended (crossfade)', () => {
   beforeEach(ensureRegistered);
   const rad = (deg: number) => (deg * Math.PI) / 180;
+
+  // The crossfade path (`writePose`) carries the same unchanged-value skip as `applyClipAtTime`.
+  // A fade usually DOES move a value every frame, which is why this is easy to overlook — but two
+  // clips can blend to the pose the trait already holds (equal held segments, a fadeDuration
+  // outlasting the motion, or a field only one side animates that has reached its key), and on a
+  // UI trait each of those frames used to rebuild the whole UI projection.
+  it('does NOT re-dirty the UI tree when the BLENDED pose is unchanged', () => {
+    vi.mocked(markUIDirty).mockClear();
+    const world = createWorld();
+    const root = world.spawn(Panel({ w: 0 }), EntityAttributes({ name: 'root', parentId: 0 }));
+    // Both sides hold the same constant, so every blend weight lands on the same value.
+    const from = clip([{ path: '', trait: 'Panel', field: 'w', type: 'number', keys: [key(0, 42)] }]);
+    const to = clip([{ path: '', trait: 'Panel', field: 'w', type: 'number', keys: [key(0, 42)] }]);
+
+    applyClipAtTimeBlended(world, root.id(), { clip: from, time: 0 }, { clip: to, time: 0 }, 0.5);
+    expect(root.get(Panel)!.w).toBeCloseTo(42);
+    expect(markUIDirty, 'the first frame really does write').toHaveBeenCalledTimes(1);
+
+    // Advancing the fade weight changes nothing about the resulting pose — so nothing should write.
+    applyClipAtTimeBlended(world, root.id(), { clip: from, time: 0 }, { clip: to, time: 0 }, 0.75);
+    applyClipAtTimeBlended(world, root.id(), { clip: from, time: 0 }, { clip: to, time: 0 }, 1);
+    expect(markUIDirty).toHaveBeenCalledTimes(1);
+
+    // A blend that genuinely moves the value still repaints.
+    const moved = clip([{ path: '', trait: 'Panel', field: 'w', type: 'number', keys: [key(0, 100)] }]);
+    applyClipAtTimeBlended(world, root.id(), { clip: from, time: 0 }, { clip: moved, time: 0 }, 1);
+    expect(root.get(Panel)!.w).toBeCloseTo(100);
+    expect(markUIDirty).toHaveBeenCalledTimes(2);
+  });
 
   it('lerps a numeric field at the blend weight (midpoint at w=0.5)', () => {
     const world = createWorld();
