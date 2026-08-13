@@ -37,6 +37,7 @@ let stateDir: string;
 // did not release) — the suite was quietly reproducing the very bug it now guards against.
 let home: string;
 let prevHome: string | undefined;
+let prevBackendPort: string | undefined;
 beforeEach(() => {
   home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-'));
   prevHome = process.env.MODOKI_HOME;
@@ -53,6 +54,13 @@ beforeEach(() => {
   // hold, which would make these tests pass or fail by what else is plugged in. Same hazard as the
   // un-stubbed device listing above. Tests that need a live socket override it.
   process.env.MODOKI_DEVICE_HOST_PORT = '1';
+  // Same hazard as MODOKI_HOME and the device listing above, one variable further out: the
+  // per-clone port DERIVATION reads MODOKI_BACKEND_PORT, so a developer who exports it — which
+  // the Clones table in CLAUDE.md actively encourages — makes these tests derive that clone's
+  // ports instead of the default 9095/9333 the reclaim test pins. The suite then passes or fails
+  // by the shell it was launched from. Cleared here and restored in afterEach.
+  prevBackendPort = process.env.MODOKI_BACKEND_PORT;
+  delete process.env.MODOKI_BACKEND_PORT;
   stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-adb-'));
 });
 afterEach(() => {
@@ -60,6 +68,8 @@ afterEach(() => {
   else process.env.MODOKI_HOME = prevHome;
   fs.rmSync(home, { recursive: true, force: true });
   delete process.env.MODOKI_DEVICE_HOST_PORT;
+  if (prevBackendPort === undefined) delete process.env.MODOKI_BACKEND_PORT;
+  else process.env.MODOKI_BACKEND_PORT = prevBackendPort;
   adbRunner.forward = realForward; adbRunner.removeForward = realRemove; adbRunner.listForwards = realListForwards;
   androidDevicesExec.list = realList;
   androidDevicesExec.deviceName = realDeviceName;
