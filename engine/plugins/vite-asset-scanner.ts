@@ -19,7 +19,7 @@ import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN, OTA_SAFE_
 import { projectAssetRoots } from '../scripts/projectRoots.mjs';
 import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
 import { acquireBuild, releasePolicy } from './backend/buildLock';
-import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, wdaTeamId, writeToolchainSettings, type BuildTarget, type ToolId } from '../toolchain';
+import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, goIosBinFor, wdaTeamId, writeToolchainSettings, type BuildTarget, type ToolId } from '../toolchain';
 import { registerReimportHandler, type ReimportContext } from './reimport-registry';
 import { textureReimportHandler } from './reimport-texture';
 import { modelReimportHandler, resolvePostprocessorForId, validatePostprocessorRegistry, isRiggedMeta } from './reimport-model';
@@ -447,8 +447,9 @@ export function isValidBuildPlatform(p: string | null | undefined): p is BuildPl
 
 /** How an iOS build gets its freshly-built `.app` onto the phone.
  *  - `devicectl`    — `xcrun devicectl device install|launch`, hands-free. iOS 17+ ONLY.
+ *  - `go-ios`       — the provisioned `ios install|launch`, hands-free on iOS 12–16.
  *  - `xcode-handoff`— open the Xcode project and let the human press Run (⌘R). */
-export type IosInstallMode = 'devicectl' | 'xcode-handoff';
+export type IosInstallMode = 'devicectl' | 'go-ios' | 'xcode-handoff';
 
 /** The single decision behind an iOS device build: may it run, and how does it install?
  *
@@ -457,14 +458,21 @@ export type IosInstallMode = 'devicectl' | 'xcode-handoff';
  *  where they live, and the Xcode-handoff fallback are documented in
  *  docs/build.md § "iOS Device" — don't restate them here.
  *
+ *  `goIos` is "go-ios is present, or this editor can provision it" — the caller's answer, because
+ *  it depends on the toolchain dir and the running platform, which a pure function can't see. It is
+ *  consulted ONLY when devicectl can't be used: an iOS 17+ device stays on Apple's own tool, so we
+ *  never need go-ios's sudo tunnel, and the ONE case go-ios serves is the one that used to demand a
+ *  human at the keyboard.
+ *
  *  Kept as one pure function, and exported, because these two answers must not drift apart:
  *  when the preflight required more than the step plan consumed, the guard rejected the very
  *  case the plan's own Xcode-handoff branch existed to serve. */
-export function planIosInstall(o: { iosDeviceId: string; iosDevicectlId: string }):
+export function planIosInstall(o: { iosDeviceId: string; iosDevicectlId: string; goIos?: boolean }):
   | { ok: false; missing: 'iosDeviceId' }
   | { ok: true; mode: IosInstallMode } {
   if (!o.iosDeviceId.trim()) return { ok: false, missing: 'iosDeviceId' };
-  return { ok: true, mode: o.iosDevicectlId.trim() ? 'devicectl' : 'xcode-handoff' };
+  if (o.iosDevicectlId.trim()) return { ok: true, mode: 'devicectl' };
+  return { ok: true, mode: o.goIos ? 'go-ios' : 'xcode-handoff' };
 }
 
 /** /api/ota/publish only ever builds+publishes the CURRENTLY OPEN project as ITSELF — see
@@ -1862,9 +1870,23 @@ export function assetScannerPlugin(): Plugin {
           const APP_ID = cfg.app.appId;
           const IOS_DEST = user.device.iosDeviceId;
           const IOS_DEVICECTL = user.device.iosDevicectlId;
+          // go-ios: the hands-free install path for a device `devicectl` cannot reach (iOS ≤16).
+          // Resolved to an ABSOLUTE path where possible, and QUOTED at every use — the provisioned
+          // one lives under "…/Application Support/Modoki Editor/toolchain/…" (spaces), and these
+          // commands are interpolated into a bash string, the same trap `adb` documents below.
+          //
+          // `goIosUsable` is "present, or we can get it": the toolchain dir is where install() puts
+          // it, so being able to provision counts. The async phase before the steps run does the
+          // actual provisioning if it's missing — resolving the PATH here, before that, is safe
+          // precisely because the install lands at exactly this path.
+          const goIosDetected = detectTool('go-ios');
+          const goIosToolchainDir = process.env.MODOKI_TOOLCHAIN_DIR;
+          const GO_IOS = goIosDetected.command
+            ?? (goIosToolchainDir ? goIosBinFor(path.join(goIosToolchainDir, 'go-ios')) : 'ios');
+          const goIosUsable = goIosDetected.present || (!!goIosToolchainDir && isInstallable('go-ios'));
           // ONE decision, consumed by both the step plan (below) and the preflight guard
           // (further down) — see planIosInstall for why they must not diverge.
-          const iosInstall = planIosInstall({ iosDeviceId: IOS_DEST, iosDevicectlId: IOS_DEVICECTL });
+          const iosInstall = planIosInstall({ iosDeviceId: IOS_DEST, iosDevicectlId: IOS_DEVICECTL, goIos: goIosUsable });
           // adb: an absolute path resolved from the SHARED toolchain (<android-sdk>/platform-tools/
           // adb) so it works even when platform-tools isn't on PATH (a packaged/no-PATH machine);
           // bare `adb` only as a fallback. -s <id> targets the configured device.
@@ -2000,6 +2022,48 @@ export function assetScannerPlugin(): Plugin {
           // and the step is dropped from the plan entirely rather than run as a no-op.
           const iosIconStep = iconStep('ios');
           const androidIconStep = iconStep('android');
+          // ── How the built .app reaches the phone (see planIosInstall for the 3 modes) ──
+          // The freshly-built bundle: newest matching DerivedData product. Shared by both
+          // hands-free modes so they can never disagree about WHICH .app was just built.
+          const iosAppPath = 'APP_PATH=$(ls -dt ~/Library/Developer/Xcode/DerivedData/App-*/Build/Products/Debug-iphoneos/App.app 2>/dev/null | head -1)';
+          const iosProjPath = iosXcodeTarget.replace(/^-(workspace|project) /, '');
+          // The shared bail-out: the app BUILT, only the push failed, so say that and hand the
+          // project to Xcode rather than reporting a raw tool error that reads as a broken build.
+          const iosHandoff = (why: string) =>
+            `echo ""; echo "${why}"; echo "   The app BUILT fine; only the command-line install is unavailable."; echo "   Opening the Xcode project — press Run (⌘R) there to deploy."; open "${iosProjPath}" 2>/dev/null || true`;
+          const GO_IOS_Q = JSON.stringify(GO_IOS);
+          const iosDeploySteps: BuildStep[] =
+            // `devicectl` is CoreDevice-only — it REFUSES anything below iOS 17 with
+            // "This device does not support acquiring a usage assertion" (error 1010) or a
+            // bare "device was not found". The xcodebuild step works fine on an old device,
+            // so the build genuinely succeeded and only the CLI handoff is impossible.
+            // Measured on an iPhone 7 / iOS 15.8.2, where devicectl cannot install but Xcode's
+            // Run does. iOS 17+ deliberately STAYS here rather than moving to go-ios: go-ios
+            // needs a sudo `ios tunnel start` on 17+, and Apple's own tool needs nothing.
+            iosInstall.ok && iosInstall.mode === 'devicectl' ? [
+              { label: 'Installing on device...', cmd: `${iosAppPath} && { xcrun devicectl device install app --device ${IOS_DEVICECTL} "$APP_PATH" || { ${iosHandoff('⚠️  devicectl could not install to this device — it requires iOS 17+.')}; exit 1; }; }`, cwd: iosCwd },
+              { label: 'Launching app...', cmd: `xcrun devicectl device process launch --device ${IOS_DEVICECTL} ${APP_ID}`, cwd: iosCwd },
+            ]
+            // go-ios: the iOS ≤16 device that has no devicectl id in EXISTENCE (it isn't a
+            // CoreDevice, so `devicectl list devices` reports it `unavailable`). This used to be
+            // the dead end that ended every such build with a human pressing ⌘R. go-ios talks to
+            // the device over usbmuxd and installs the `.app` FOLDER directly — no Payload/ + zip
+            // step, unlike the libimobiledevice recipe in docs/build.md. Verified end to end on
+            // an iPhone 8 / iOS 16.7.16: kill → install → launch → a new pid that outlives the
+            // tool, 4s for the whole cycle.
+            : iosInstall.ok && iosInstall.mode === 'go-ios' ? [
+              { label: 'Installing on device (go-ios)...', cmd: `${iosAppPath} && { ${GO_IOS_Q} install --path="$APP_PATH" --udid=${IOS_DEST} || { ${iosHandoff('⚠️  go-ios could not install to this device.')}; exit 1; }; }`, cwd: iosCwd },
+              // A launch failure is NOT worth failing the build over: the new build is already on
+              // the phone, which is the part that can't be redone by tapping an icon. Say what
+              // happened and exit 0. (The most likely cause is a locked/asleep device.)
+              { label: 'Launching app...', cmd: `${GO_IOS_Q} launch ${APP_ID} --udid=${IOS_DEST} || { echo ""; echo "⚠️  Installed, but the app could not be launched — unlock the device and tap the icon."; }`, cwd: iosCwd },
+            ]
+            // Neither tool can reach it: an iOS ≤16 device on an editor with no go-ios and no way
+            // to provision one. The build DID succeed, so report success and hand off — exiting
+            // non-zero here would label a healthy legacy-device build "failed".
+            : [
+              { label: 'Handing off to Xcode (no CLI install available)...', cmd: `echo "ℹ️  No devicectl id set (that needs iOS 17+), and go-ios is not available to install to an older device."; echo "   Install go-ios from Build Support to make this hands-free."; ${iosHandoff('ℹ️  Deploying from Xcode instead.')}`, cwd: iosCwd },
+            ];
           const stepsByPlatform: Record<string, BuildStep[]> = {
             // iOS is macOS-only (preflight blocks it off-darwin), so its bash-only steps
             // (`$(…)`, `~`, xcodebuild/xcrun) never run on Windows — no winCmd needed.
@@ -2009,26 +2073,7 @@ export function assetScannerPlugin(): Plugin {
               ...(iosIconStep ? [iosIconStep] : []),
               { label: 'Syncing Capacitor iOS...', cmd: 'npx cap sync ios', cwd: iosCwd },
               { label: 'Building Xcode project...', cmd: `xcodebuild ${iosXcodeTarget} -scheme App -configuration Debug -destination 'id=${IOS_DEST}' -allowProvisioningUpdates build`, cwd: iosCwd },
-              // `devicectl` is CoreDevice-only — it REFUSES anything below iOS 17 with
-              // "This device does not support acquiring a usage assertion" (error 1010) or a
-              // bare "device was not found". The xcodebuild step above works fine on an old
-              // device, so the build genuinely succeeded and only the CLI handoff is
-              // impossible; failing with a raw CoreDeviceError there reads as "your build is
-              // broken" when the only thing missing is a way to push it. So fall back to
-              // handing the project to Xcode, which can still deploy to iOS 15. Measured on an
-              // iPhone 7 / iOS 15.8.2, where devicectl cannot install but Xcode's Run does.
-              // A pre-iOS-17 device has NO devicectl id to configure (it isn't a CoreDevice,
-              // so `xcrun devicectl list devices` reports it `unavailable`). That is a known,
-              // expected state — not a misconfiguration — so when the id is empty we skip
-              // straight to the Xcode handoff and report SUCCESS: the build did succeed, and
-              // only the CLI push is unavailable. Exiting non-zero here would label a healthy
-              // legacy-device build "failed".
-              iosInstall.ok && iosInstall.mode === 'devicectl'
-                ? { label: 'Installing on device...', cmd: `APP_PATH=$(ls -dt ~/Library/Developer/Xcode/DerivedData/App-*/Build/Products/Debug-iphoneos/App.app 2>/dev/null | head -1) && { xcrun devicectl device install app --device ${IOS_DEVICECTL} "$APP_PATH" || { echo ""; echo "⚠️  devicectl could not install to this device — it requires iOS 17+."; echo "   The app BUILT fine; only the command-line install is unavailable."; echo "   Opening the Xcode project — press Run (⌘R) there to deploy."; open "${iosXcodeTarget.replace(/^-(workspace|project) /, '')}" 2>/dev/null || true; exit 1; }; }`, cwd: iosCwd }
-                : { label: 'Handing off to Xcode (device predates devicectl)...', cmd: `echo "ℹ️  No iOS devicectl id set — devicectl requires iOS 17+, so this device can only be deployed from Xcode."; echo "   The app BUILT fine. Opening the Xcode project — press Run (⌘R) there to deploy."; open "${iosXcodeTarget.replace(/^-(workspace|project) /, '')}" 2>/dev/null || true`, cwd: iosCwd },
-              ...(iosInstall.ok && iosInstall.mode === 'devicectl'
-                ? [{ label: 'Launching app...', cmd: `xcrun devicectl device process launch --device ${IOS_DEVICECTL} ${APP_ID}`, cwd: iosCwd }]
-                : []),
+              ...iosDeploySteps,
             ],
             android: [
               { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', cwd: buildCwd },
@@ -2384,6 +2429,23 @@ export function assetScannerPlugin(): Plugin {
             // + cheap; a no-op when nothing changed (or already healed by the scaffold).
             if (platform === 'ios' || platform === 'android') {
               for (const n of healNativeConfig(projectRoot).notes) send(`[heal] ${n}`);
+            }
+            // Provision go-ios the moment a build actually needs it — this build targets an iOS
+            // device `devicectl` cannot reach, and without go-ios the deploy ends in a manual ⌘R.
+            // Deliberately NOT in AUTO_INSTALL: 17 MB down / 45 MB on disk, useless to anyone whose
+            // phone is iOS 17+, so it is fetched here (once) rather than by every editor at
+            // onboarding. A failure is NOT fatal — the steps still run, `ios install` fails, and
+            // the step's own bail-out hands the project to Xcode exactly as it did before go-ios
+            // existed. That is why this can't strand a build it was only ever trying to improve.
+            if (platform === 'ios' && iosInstall.ok && iosInstall.mode === 'go-ios' && !goIosDetected.present && goIosToolchainDir) {
+              send('\nThis device predates devicectl (iOS 17+), so the build needs go-ios to install hands-free.');
+              try {
+                await installTool('go-ios', { toolchainDir: goIosToolchainDir, onLog: (line) => send(line) });
+                send('✅ go-ios provisioned — the app will install and launch without Xcode.');
+              } catch (e) {
+                send(`⚠️  Could not provision go-ios (${e instanceof Error ? e.message : String(e)}) — falling back to the Xcode handoff.`);
+              }
+              if (aborted) return;
             }
             // Heal engine-REQUIRED Capacitor plugins on EVERY native build. A project
             // scaffolded before an engine feature added a runtime plugin — @capacitor/preferences

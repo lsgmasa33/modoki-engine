@@ -24,9 +24,10 @@ import path from 'node:path'
 import { ensureJdk, discoverJavaHome, jdkVersionDir } from './jdkProvision'
 import { ensureCmdlineTools, runSdkmanager, ANDROID_SDK_PACKAGES } from './androidSdkProvision'
 import { ensureRuby, rubyDirFor } from './rubyProvision'
+import { ensureGoIos, goIosBinFor } from './goIosProvision'
 import { ensureWda, wdaBuildStatus, PINNED_WDA, type CommandRunner as WdaCommandRunner } from './wdaProvision'
 
-export type ToolId = 'toktx' | 'android-sdk' | 'npm' | 'java' | 'xcodebuild' | 'gltf-transform-cli' | 'gltfpack' | 'cocoapods' | 'ffmpeg' | 'ffprobe' | 'msdf-atlas-gen' | 'webdriveragent'
+export type ToolId = 'toktx' | 'android-sdk' | 'npm' | 'java' | 'xcodebuild' | 'gltf-transform-cli' | 'gltfpack' | 'cocoapods' | 'ffmpeg' | 'ffprobe' | 'msdf-atlas-gen' | 'webdriveragent' | 'go-ios'
 
 /** How a resolved tool is located. `env` = an env override; `path` = a bare binary found on PATH;
  *  `probe` = a candidate directory that exists (directory tools like the Android SDK). */
@@ -351,6 +352,26 @@ const REGISTRY: Record<ToolId, ToolDescriptor> = {
     missingMsg:
       'ffprobe not found — needed for audio import stats. Install it from the Build Support ' +
       "dialog, or run `install('ffprobe')`.",
+  },
+  'go-ios': {
+    kind: 'binary',
+    // Hands-free install+launch on an iOS device that `devicectl` cannot reach (it is CoreDevice-
+    // only ⇒ iOS 17+). Without it, `Build → iOS Device` on an older phone builds fine and then
+    // hands off to Xcode for a manual ⌘R. Provisioned as a pinned, sha256-verified universal
+    // binary under <toolchainDir>/go-ios (see goIosProvision.ts for why not the npm package).
+    //
+    // The PATH fallback is deliberate but note what it means: the binary is named plainly `ios`,
+    // so a bare `ios` on PATH is only *probably* this tool. Everything we do with it is
+    // additive — a wrong `ios` fails the install step and the build falls back to the Xcode
+    // handoff it would have taken anyway — so the failure mode is the status quo, not damage.
+    envVar: 'MODOKI_GO_IOS',
+    extraCandidates: () => (process.env.MODOKI_TOOLCHAIN_DIR ? [goIosBinFor(path.join(process.env.MODOKI_TOOLCHAIN_DIR, 'go-ios'))] : []),
+    bin: 'ios',
+    versionArgs: ['version'], // prints {"version":"1.3.2"} on stdout (WARN lines go to stderr)
+    missingMsg:
+      'go-ios not found — without it, deploying to an iOS 16-or-older device stops after the build ' +
+      'and hands off to Xcode for a manual Run (⌘R). Install it from the Build Support dialog, or ' +
+      "run `install('go-ios')`. (iOS 17+ devices use Apple's own devicectl and never need it.)",
   },
 }
 
@@ -957,7 +978,7 @@ export const TOOL_IDS = Object.keys(REGISTRY) as ToolId[]
 
 /** Tools that `install()` can provision automatically (vs `guide()`-only, like Xcode). Grows as
  *  more installers land (gltfpack, android-sdk, java/jdk, cocoapods). */
-export const INSTALLABLE: ReadonlySet<ToolId> = new Set<ToolId>(['gltf-transform-cli', 'gltfpack', 'java', 'android-sdk', 'ffmpeg', 'ffprobe'])
+export const INSTALLABLE: ReadonlySet<ToolId> = new Set<ToolId>(['gltf-transform-cli', 'gltfpack', 'java', 'android-sdk', 'ffmpeg', 'ffprobe', 'go-ios'])
 
 /** PINNED versions for the CLI/gem tools we install by name (unlike Node/JDK/Ruby, whose version is
  *  in the download URL). Pinning makes installs reproducible (dev == packaged) AND lets a pin bump
@@ -1162,6 +1183,9 @@ export interface InstallResult {
  *  iOS/CocoaPods is macOS-only). So it's installable on darwin, guided elsewhere. */
 export function isInstallable(id: ToolId): boolean {
   if (id === 'cocoapods') return process.platform === 'darwin'
+  // go-ios builds for Linux/Windows too, but Modoki's iOS builds are macOS-only (xcodebuild does
+  // the compile + signing; go-ios only replaces the INSTALL), so it could not be used elsewhere.
+  if (id === 'go-ios') return process.platform === 'darwin'
   // WDA is BUILT by xcodebuild, so it is macOS-only for the same reason CocoaPods is — and, unlike
   // every other installable tool, it also needs a signing identity, which install() checks.
   if (id === 'webdriveragent') return process.platform === 'darwin'
@@ -1218,6 +1242,15 @@ export async function install(id: ToolId, opts: { toolchainDir: string; onLog?: 
   if (id === 'ffmpeg') return installNpmBinaryTool('ffmpeg-static', FFMPEG_NPM_VERSION, ffmpegToolBin, opts)
   if (id === 'ffprobe') return installNpmBinaryTool('@ffprobe-installer/ffprobe', FFPROBE_NPM_VERSION, ffprobeToolBin, opts)
   if (id === 'cocoapods') return installCocoapods(opts)
+  if (id === 'go-ios') {
+    // Pinned + sha256-verified universal binary from the GitHub release (see goIosProvision.ts).
+    // NOT in AUTO_INSTALL on purpose: it is 17 MB down / 45 MB on disk and only matters when you
+    // deploy to an iOS ≤16 device, so /api/build provisions it at the exact moment a build needs
+    // it, and the Build Support dialog offers it as a button. Nobody else pays for it.
+    const { bin } = await ensureGoIos(path.join(opts.toolchainDir, 'go-ios'), { onLog: opts.onLog })
+    resetToolchainCache()
+    return { path: bin }
+  }
   if (id === 'webdriveragent') {
     // Fetch the pinned WDA source and build+sign it for THIS machine. Only the build lives here;
     // launching it against a device is a per-lease lifecycle owned by the device code (plan
@@ -1278,6 +1311,7 @@ function toolOwnedDirs(id: ToolId, toolchainDir: string): string[] {
     // Both the fetched source and our DerivedData live under here, which is why the build is kept
     // out of the user's ~/Library DerivedData: "Remove all tools" must actually remove it.
     case 'webdriveragent': return [path.join(toolchainDir, 'wda')]
+    case 'go-ios': return [path.join(toolchainDir, 'go-ios')]
     default: return []
   }
 }
@@ -1471,6 +1505,8 @@ export { ensureNode, extractArchive, nodeDistFor, PINNED_NODE, nodeDistKey, type
 export { ensureJdk, discoverJavaHome, javaBinName, jdkVersionDir, PINNED_JDK, jdkDistKey, type ProvisionedJdk } from './jdkProvision'
 // On-demand portable-Ruby provisioning: the brew-free CocoaPods path (gem-installs CocoaPods on it).
 export { ensureRuby, rubyDistKey, rubyDirFor, PINNED_RUBY, type ProvisionedRuby } from './rubyProvision'
+// On-demand go-ios provisioning: hands-free install+launch on an iOS ≤16 device (no ⌘R handoff).
+export { ensureGoIos, goIosBinFor, goIosDirFor, PINNED_GO_IOS, type ProvisionedGoIos } from './goIosProvision'
 // On-demand Android SDK provisioning (E-3): cmdline-tools bootstrap + sdkmanager packages/licenses.
 export {
   ensureCmdlineTools, runSdkmanager, sdkmanagerPath, cmdlineToolsKey,

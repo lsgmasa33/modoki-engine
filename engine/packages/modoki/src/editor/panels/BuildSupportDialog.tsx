@@ -39,6 +39,7 @@ const TOOL_LABEL: Record<string, string> = {
   'xcodebuild': 'Xcode',
   'cocoapods': 'CocoaPods (adapter games only)',
   'webdriveragent': 'WebDriverAgent (trusted iOS input)',
+  'go-ios': 'go-ios (deploy to iOS 16 and older)',
   'toktx': 'KTX-Software (toktx)',
   'gltf-transform-cli': 'glTF-Transform CLI',
   'ffmpeg': 'ffmpeg',
@@ -57,7 +58,11 @@ const GROUPS: { title: string; subtitle: string; ids: string[]; adb?: boolean; i
   { title: 'Android Build Support', subtitle: 'Build & deploy Android APKs', ids: ['java', 'android-sdk'], adb: true },
   // `webdriveragent` is NOT a build prerequisite — it only affects AI/agent device-input fidelity.
   // It rides in the iOS box because it needs the same Xcode + signing setup as everything else here.
-  { title: 'iOS Build Support', subtitle: 'Build & deploy iOS apps (macOS only)', ids: ['xcodebuild', 'cocoapods', 'webdriveragent'], iosOnly: true },
+  // `go-ios` is likewise not a prerequisite: absent, a build targeting an iOS ≤16 device still
+  // succeeds and hands off to Xcode for a manual ⌘R. It is listed so that handoff is a CHOICE — a
+  // row you can install once — rather than a dead end with no visible cause. A build that needs it
+  // also provisions it on its own, so this row is the discoverable path, not the only one.
+  { title: 'iOS Build Support', subtitle: 'Build & deploy iOS apps (macOS only)', ids: ['xcodebuild', 'cocoapods', 'go-ios', 'webdriveragent'], iosOnly: true },
   { title: 'Model Tools', subtitle: 'GLB import / KTX2 compression', ids: ['toktx', 'gltf-transform-cli'] },
   { title: 'Text Tools', subtitle: 'MTSDF font-atlas baking (dynamic / CJK text) — bundled', ids: ['msdf-atlas-gen'] },
   { title: 'Audio Tools', subtitle: 'Audio import — auto-installed by the editor', ids: ['ffmpeg', 'ffprobe'] },

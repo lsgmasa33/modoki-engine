@@ -20,7 +20,7 @@ it runs identically in the Vite-plugin process, the Electron main backend, and h
 
 `detect(id)` / `resolve(id)` locate a tool without / with throwing. Two kinds:
 
-- **Binary tools** (`toktx`, `msdf-atlas-gen`, `npm`, `xcodebuild`, `cocoapods`, `gltf-transform-cli`, `gltfpack`, `ffmpeg`, `ffprobe`) —
+- **Binary tools** (`toktx`, `msdf-atlas-gen`, `npm`, `xcodebuild`, `cocoapods`, `gltf-transform-cli`, `gltfpack`, `ffmpeg`, `ffprobe`, `go-ios`) —
   resolved from an **env override** → **extra candidates** (a userData install location) → **PATH**,
   each validated by a `--version` probe. Results are **cached** (the probe spawn is expensive and its
   inputs are fixed at startup).
@@ -81,6 +81,7 @@ tool that must be installed by hand. The dialog shows an **Install** button for 
 | **`xcodebuild` (Xcode)** | **Guided only** — multi-GB, App-Store-gated, macOS-only. `guide('xcodebuild')` gives the App Store link + `xcode-select`/license/Apple-ID steps. | — |
 | **`cocoapods`** | **Auto-installed on macOS** (`isInstallable` returns true on `darwin`, guided elsewhere) — `installCocoapods()` provisions an **isolated portable Ruby** into `<toolchainDir>/ruby` (`rubyProvision.ts`), then `gem install cocoapods` into an isolated `GEM_HOME` (`<toolchainDir>/cocoapods-gems`) — no Homebrew, no system Ruby. Native gem extensions compile against Xcode's clang (already required for iOS). `guide('cocoapods')` points at the one-click Install button. Not a `preflight('ios')` blocker — most iOS games are SPM-only and never need it. | `1.17.0` |
 | **`webdriveragent`** | **Auto-installed on macOS** — `wdaProvision.ts` `ensureWda()` fetches the pinned Appium WDA source via `npm pack`, re-namespaces its bundle ids, and `xcodebuild build-for-testing`s it into `<toolchainDir>/wda`. Enables **trusted iOS device input** (#32 Phase 2); absent, `device_*` input falls back to synthetic DOM events and says so. Never a build blocker. See § "WebDriverAgent — the one BUILT tool" below. | `appium-webdriveragent@16.1.1` |
+| **`go-ios`** | **Installable on macOS, but NOT auto-installed** (#217) — `goIosProvision.ts` `ensureGoIos()` downloads the pinned GitHub release zip (a single universal x86_64+arm64 Mach-O, not the npm package, which bundles all 5 platforms' binaries: 16.8 MB vs 60 MB down), **sha256**-verified, extracted to `<toolchainDir>/go-ios/<version>/ios`. Deliberately kept out of `AUTO_INSTALL` — it's only useful for deploying to an iOS ≤16 device (a devicectl-reachable iOS 17+ device never needs it), so most editors would pay its size for nothing; `/api/build` provisions it itself, on demand, the moment a build actually targets such a device, and a provisioning failure there falls back to the Xcode ⌘R handoff rather than failing the build. | `1.3.2` |
 
 ⚠️ **`tar` does NOT mean bsdtar on Windows — never spawn a bare `tar`.** Every provisioner above
 extracts through one shared `extractArchive()`, and that one code path only works because **bsdtar**
@@ -192,7 +193,7 @@ to fix it:
 
 | Tool | Gated when toggle is OFF? |
 |---|---|
-| `java`, `android-sdk`, `gltf-transform-cli`, `gltfpack`, `ffmpeg`, `ffprobe` | **Yes** — installable into the toolchain dir |
+| `java`, `android-sdk`, `gltf-transform-cli`, `gltfpack`, `ffmpeg`, `ffprobe`, `go-ios` | **Yes** — installable into the toolchain dir |
 | `toktx`, `msdf-atlas-gen` | Yes, **when bundled** (their `MODOKI_*` env var is set by the packaged host); a dev checkout has no bundle, so PATH stays usable |
 | `npm` | Yes, **when the editor provisions Node** (packaged, or `MODOKI_PROVISION_NODE=1`); a plain dev checkout keeps its PATH npm |
 | `xcodebuild` | **No** — Apple-supplied and multi-GB; it can never be bundled, so it always resolves from the system |

@@ -109,9 +109,15 @@ because two rows can share a label — device names repeat.
 
 `Build → iOS Device` / `Android Device` name the device they will build for, and their submenus
 switch it (#170). Each row says what picking it means — a devicectl-reachable iPhone reads
-"hands-free install", a pre-iOS-17 one "Xcode handoff, ⌘R", because that is the consequence the
-old menu could not tell you and it is decided by whether `iosDevicectlId` ends up set
-(`planIosInstall`). Picking writes `user.device.*` into the gitignored `project.user.json` through
+"hands-free install", a pre-iOS-17 one "hands-free install (go-ios)" (#217), because that is the
+consequence the old menu could not tell you and it is decided by `planIosInstall`'s three modes
+(`'devicectl'` / `'go-ios'` / `'xcode-handoff'`), keyed off `iosDevicectlId`. Both rows now read
+"hands-free" because both ARE hands-free — go-ios closed the gap where an older device used to read
+"Xcode handoff, ⌘R" — and the tool name stays in the label so the two paths are still
+distinguishable when one of them misbehaves: a devicectl install/launch failure and a go-ios
+install/launch failure surface differently, and only the latter can fall further back to the Xcode
+handoff (when go-ios itself isn't present or provisionable). Picking writes `user.device.*` into
+the gitignored `project.user.json` through
 the same `/api/project-settings` route Project Settings saves to, as a partial patch — so the two
 surfaces can never disagree, and hand-typed values this menu does not offer survive.
 

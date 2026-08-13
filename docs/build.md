@@ -690,11 +690,28 @@ VPN & Device Management → Trust.
 ⚠️ **Those last two lines are iOS 17+ ONLY.** `devicectl` is CoreDevice-only and **cannot see an
 iOS ≤16 device at all** — including this Mac's main iOS test device, the iPhone 8 (16.7.16). Read
 without this note, the recipe above looks like the only route and the answer looks like "open Xcode
-and press ⌘R"; it is not, and an agent can deploy to a 16.x phone unattended.
+and press ⌘R"; it is not, and an agent can deploy to a 16.x phone unattended — both from the CLI
+recipes below and, as of #217, from `Build → iOS Device` itself (next section).
+
+**iOS ≤16 — go-ios** (`engine/toolchain/goIosProvision.ts`; installable from **Build Support…** or
+provisioned automatically by a build that needs it). This is what `Build → iOS Device` now uses —
+see "Hands-free install (go-ios)" below. The manual equivalent is shorter than libimobiledevice:
+`ios install` takes the built `.app` **folder** directly, no `Payload`/zip step:
+
+```bash
+xcodebuild -project games/<id>/ios/App/App.xcodeproj -scheme App -configuration Debug \
+  -destination 'id=<UDID>' -allowProvisioningUpdates -derivedDataPath /tmp/<id>-dd build
+ios install --path=/tmp/<id>-dd/Build/Products/Debug-iphoneos/App.app --udid=<UDID>
+ios launch <appId> --udid=<UDID>
+```
+
+No sudo, no tunnel, no manual Developer Disk Image mount is needed on 16.x — measured on the iPhone
+8 (16.7.16): kill the running app, `ios install` + `ios launch`, whole cycle ~4s, verified by a new
+pid that outlives the tool.
 
 **iOS ≤16 — libimobiledevice** (`brew install libimobiledevice ideviceinstaller`; already on PATH on
-this Mac). Proven on this device class during #205, where an iPhone 7 took a development-signed
-build with **no Xcode run at all**:
+this Mac) is the older manual route — kept because it still works and #205 proved it, on a device
+class (an iPhone 7) that took a development-signed build with **no Xcode run at all**:
 
 ```bash
 idevice_id -l                                   # the UDID; xcrun xctrace also lists 16.x devices
@@ -718,7 +735,8 @@ Three caveats, none of which the install step can fix for you:
   territory and an owner decision, not something to re-diagnose.
 
 The intended split, per [plans/low-end-device-support.md](./plans/low-end-device-support.md):
-**iOS 15/16 → libimobiledevice** (`idevicesyslog`, `ideviceinstaller`, `idevicedebug`);
+**iOS 15/16 → go-ios** (`ios install`/`ios launch`, what the editor build now uses; the manual
+libimobiledevice recipe above still works as a fallback);
 **iOS 17+ → `xcrun devicectl … --console`**.
 
 **Normally you never type either of these — pick the phone from the Build menu.** `Build → iOS
@@ -726,10 +744,10 @@ Device` names its current target in the label and lists every device this Mac ca
 submenu; picking one writes BOTH ids below into `project.user.json` **and starts the build**, so
 the menu and Project Settings stay one source of truth. (`Set target without building…` in the
 same submenu is the way to change the target without committing to a build — a started build
-cannot be cancelled.) The submenu also says which install each device will get
-("hands-free install" vs "Xcode handoff, ⌘R") — see [editor.md](./editor.md) § "Build → picking
-the target device". The fields stay editable by hand for a device no listing can see (remote/WiFi,
-an unusual setup).
+cannot be cancelled.) The submenu also says which install each device will get ("hands-free
+install" for a devicectl-reachable iPhone, "hands-free install (go-ios)" for an older one) — see
+[editor.md](./editor.md) § "Build → picking the target device". The fields stay editable by hand
+for a device no listing can see (remote/WiFi, an unusual setup).
 
 **Two DIFFERENT ids, and only the first is required.** Both live in the project's gitignored
 `project.user.json` (per-machine, never committed — Project Settings → Build → "This Machine"):
@@ -747,11 +765,13 @@ form), which is why the Build-menu picker can fill both fields from the one id i
 
 ⚠️ **`devicectl` is CoreDevice-only — iOS 17+.** A pre-iOS-17 device has no devicectl id *in
 existence*: `xcrun devicectl list devices` lists it `unavailable`, with no
-`hardwareProperties.udid` at all. So leave `iosDevicectlId` **empty** for such a device and the
-build plans an **Xcode handoff** instead — it builds, opens the `.xcodeproj`, and reports
-success; you press Run (⌘R) to deploy. The decision is `planIosInstall`
+`hardwareProperties.udid` at all. So leave `iosDevicectlId` **empty** for such a device — the build
+then installs via **go-ios** instead (#217), provisioning it on demand if it isn't already present,
+and only falls all the way back to the Xcode handoff (open the `.xcodeproj`, press Run ⌘R) when
+go-ios is neither present nor provisionable. The decision is `planIosInstall`
 (`engine/plugins/vite-asset-scanner.ts`), deliberately one exported pure function so the
-preflight guard and the step plan cannot disagree.
+preflight guard and the step plan cannot disagree — it now returns one of three modes:
+`'devicectl'`, `'go-ios'`, `'xcode-handoff'`.
 
 That disagreement is exactly what shipped for a while: the preflight demanded BOTH ids, so a
 build that `xcodebuild` handles perfectly was refused before it started, and the refusal named

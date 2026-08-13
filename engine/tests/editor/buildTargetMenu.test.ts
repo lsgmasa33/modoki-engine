@@ -114,18 +114,22 @@ describe('iosTargetRows', () => {
   });
 
   it('a legacy xctrace-only device (no devicectl field) clears iosDevicectlId in its patch', () => {
-    // Picking a pre-iOS-17 device must plan an Xcode handoff, not a devicectl install that would
-    // fail on the phone — clearing the id is what makes that happen.
+    // Picking a pre-iOS-17 device must NOT plan a devicectl install, which would fail on the phone
+    // — clearing the id is what makes that happen (the build then installs via go-ios instead).
     const list = listWith({ ios: [iosRow({ udid: 'A' })] }); // devicectl absent
     const [row] = iosTargetRows(list, noTarget);
     expect(row.patch).toEqual({ iosDeviceId: 'A', iosDevicectlId: '' });
   });
 
-  it('the label names the install mode', () => {
+  it('the label names the install mode, naming the TOOL for a legacy device', () => {
+    // Both are hands-free now (#217 — go-ios installs to what devicectl cannot see), so the row
+    // has to distinguish them by tool: "Xcode handoff" here would be a lie, and a bare
+    // "hands-free install" on both would hide which program is about to talk to the phone.
     const list = listWith({ ios: [iosRow({ udid: 'A', devicectl: true }), iosRow({ udid: 'B' })] });
     const [devicectlRow, legacyRow] = iosTargetRows(list, noTarget);
     expect(devicectlRow.label).toContain('hands-free install');
-    expect(legacyRow.label).toContain('Xcode handoff');
+    expect(devicectlRow.label).not.toContain('go-ios');
+    expect(legacyRow.label).toContain('hands-free install (go-ios)');
   });
 
   it('a claim held by ANOTHER clone is annotated in the label but the row stays selectable', () => {
