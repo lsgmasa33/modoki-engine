@@ -31,7 +31,10 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     {
       x: z.number().optional().describe('Page CSS x. Required unless `selector` is given.'),
       y: z.number().optional().describe('Page CSS y. Required unless `selector` is given.'),
-      selector: z.string().optional().describe("CSS selector to aim at, e.g. '[data-ui-id=\"inspector.header.kebab\"]'. Overrides x/y."),
+      // The example must name a selector that EXISTS: `inspector.header.kebab` did not (the
+      // Inspector has no kebab menu at all), and being the docstring example is exactly how a
+      // wrong selector propagates — it was copied into a QA case brief before anyone checked.
+      selector: z.string().optional().describe("CSS selector to aim at, e.g. '[data-ui-id=\"inspector.header.delete\"]'. Overrides x/y."),
       entity: entitySpec.optional(),
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button (default 'left')."),
       clickCount: z.number().optional().describe('1 = single (default), 2 = double-click.'),

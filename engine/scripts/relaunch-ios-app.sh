@@ -48,10 +48,19 @@ read_ids() {
 DEVICECTL_ID=""
 UDID=""
 if [[ -n "$DEVICE" ]]; then
-  # An explicitly passed device goes to devicectl, which accepts a name OR either id form. go-ios
-  # needs the hardware UDID specifically, so it is only used when that is what we were handed.
-  DEVICECTL_ID="$DEVICE"
-  [[ "$DEVICE" =~ ^[0-9a-fA-F]{40}$|^[0-9A-F]{8}-[0-9A-F]{16}$ ]] && UDID="$DEVICE"
+  # ⚠️ A 40-hex id is PRE-iPhone-X hardware, which devicectl cannot see AT ALL — so it must go to
+  # go-ios, not to devicectl. An earlier revision set DEVICECTL_ID unconditionally here, which made
+  # the go-ios branch below unreachable for every explicitly-passed device: running this with the
+  # iPhone 8's own UDID (the device this whole path exists for) took the devicectl branch and died
+  # on a CoreDeviceError. Everything else — a NAME, or devicectl's own UUID form — only devicectl
+  # can resolve. The devicectl branch also falls back to go-ios at runtime, so a misclassification
+  # here degrades rather than dead-ends.
+  if [[ "$DEVICE" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    UDID="$DEVICE"
+  else
+    DEVICECTL_ID="$DEVICE"
+    [[ "$DEVICE" =~ ^[0-9A-F]{8}-[0-9A-F]{16}$ ]] && UDID="$DEVICE"
+  fi
 else
   CANDIDATES=()
   if [[ -n "${MODOKI_PROJECT:-}" ]]; then
@@ -126,7 +135,22 @@ echo "Bundle: $BUNDLE_ID"
 
 # devicectl only when the device HAS a devicectl id (a pre-iOS-17 device has none in existence —
 # `xcrun devicectl list devices` reports it `unavailable`, with no hardwareProperties.udid at all).
+# `use_devicectl` rather than a bare `-n "$DEVICECTL_ID"`: devicectl must not be attempted when it
+# cannot see the device, and the cheapest reliable probe is its own listing. Without this a device
+# that devicectl merely FAILS on would abort the script under `set -e` instead of degrading to
+# go-ios, which is the transport that can actually reach it.
+use_devicectl=0
 if [[ -n "$DEVICECTL_ID" ]]; then
+  if [[ -z "$UDID" || -z "$GO_IOS" ]]; then
+    use_devicectl=1          # nothing to fall back TO — let devicectl's own error be the answer
+  elif xcrun devicectl device info details --device "$DEVICECTL_ID" >/dev/null 2>&1; then
+    use_devicectl=1
+  else
+    echo "devicectl cannot see this device (iOS <= 16?) — using go-ios."
+  fi
+fi
+
+if [[ "$use_devicectl" == 1 ]]; then
   echo "Device: $DEVICECTL_ID (devicectl)"
   TMP_APPS="$(mktemp)"
   TMP_PROCS="$(mktemp)"

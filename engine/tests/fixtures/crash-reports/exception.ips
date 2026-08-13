@@ -1,0 +1,90 @@
+{"is_simulated": 1, "app_name": "diagnosticd", "timestamp": "2026-08-13 16:58:54.00 +0900", "app_version": "", "slice_uuid": "DEADBEEF-0000-0000-0000-000000000000", "build_version": "", "platform": 2, "share_with_app_devs": 0, "is_first_party": 1, "bug_type": "308", "os_version": "iPhone OS 16.7.16 (20H392)", "roots_installed": 0, "incident_id": "DEADBEEF-0000-0000-0000-000000000000", "name": "diagnosticd"}
+{
+ "uptime": 20000,
+ "procRole": "Unspecified",
+ "version": 2,
+ "userID": 0,
+ "deployVersion": 210,
+ "modelCode": "iPhone10,1",
+ "coalitionID": 646,
+ "osVersion": {
+  "isEmbedded": true,
+  "train": "iPhone OS 16.7.16",
+  "releaseType": "User",
+  "build": "20H392"
+ },
+ "captureTime": "2026-08-13 16:58:54.2283 +0900",
+ "incident": "DEADBEEF-0000-0000-0000-000000000000",
+ "pid": 469,
+ "cpuType": "ARM-64",
+ "roots_installed": 0,
+ "bug_type": "308",
+ "procStartAbsTime": 37913267259,
+ "procName": "diagnosticd",
+ "procPath": "/usr/libexec/diagnosticd",
+ "parentPid": 1,
+ "coalitionName": "com.apple.diagnosticd",
+ "crashReporterKey": "0000000000000000000000000000000000000000",
+ "wasUnlockedSinceBoot": 1,
+ "isLocked": 0,
+ "codeSigningValidationCategory": 0,
+ "codeSigningTrustLevel": 0,
+ "basebandVersion": "0.00.00",
+ "isLightWeightCorpse": 1,
+ "exception": {
+  "codes": "0x6000000000000007, 0x0000000000000009",
+  "reason": 9,
+  "message": "namespc 7 reason_code 0x0000000000000009",
+  "subtype": "GUARD_TYPE_USER",
+  "type": "EXC_GUARD",
+  "rawCodes": [
+   6917529027641081863,
+   9
+  ],
+  "namespc": 7
+ },
+ "termination": {
+  "flags": 518,
+  "code": 9,
+  "namespace": "LIBXPC",
+  "indicator": "XPC_EXIT_REASON_FAULT"
+ },
+ "faultingThread": 0,
+ "threads": [
+  {
+   "triggered": true,
+   "id": 80215,
+   "name": "",
+   "frames": [
+    {
+     "imageOffset": 1113703664,
+     "imageIndex": 0
+    },
+    {
+     "imageOffset": 1371407224,
+     "imageIndex": 0
+    },
+    {
+     "imageOffset": 1371408992,
+     "imageIndex": 0
+    },
+    {
+     "imageOffset": 1371440776,
+     "imageIndex": 0
+    },
+    {
+     "imageOffset": 1371451904,
+     "imageIndex": 0
+    }
+   ]
+  }
+ ],
+ "usedImages": [
+  {
+   "size": 2362400768,
+   "source": "S",
+   "base": 6442450944,
+   "uuid": "DEADBEEF-0000-0000-0000-000000000000"
+  }
+ ]
+}

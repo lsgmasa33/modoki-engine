@@ -42,6 +42,10 @@ const REPO_TOP_LEVEL =
 const CASE_TYPES = ['auto', 'agent', 'human'];
 const TARGETS = [
   'editor',
+  // The editor running on the WINDOWS clone. Deliberately distinct from `editor`: this repo has a
+  // recurring class of Windows-only path bugs (drive letters, separators, `/@fs/` URLs, a
+  // `:`-joined PATH), and a Mac session handed such a case would report a confident false PASS.
+  'editor-win',
   'web',
   'ios-air',
   'ios-8',
@@ -217,8 +221,77 @@ export function codeTokens(md: string): string[] {
   return [...inline, ...fenced].filter(Boolean);
 }
 
+/**
+ * Whole inline code spans, unsplit.
+ *
+ * Needed because **this repo has asset filenames containing spaces** — e.g.
+ * `games/3d-test/runtime/assets/scenes/2D Animation.scene.json`. Splitting that span on whitespace
+ * yields `…/scenes/2D` plus `Animation.scene.json`, and the checker then reports a perfectly correct
+ * citation as two missing paths. The caller uses this to ask "is the ENTIRE span a real path?" before
+ * falling back to the token split.
+ *
+ * This cannot re-open the hole the split was introduced to close: a span is only accepted whole when
+ * it EXISTS on disk, so a span naming something missing is still split and still checked token by
+ * token.
+ */
+export function codeSpans(md: string): string[] {
+  return [...md.matchAll(/`([^`\n]+)`/g)].map((m) => m[1].trim()).filter(Boolean);
+}
+
+/**
+ * Strip a trailing line reference from a cited path — `foo.ts:525`, `foo.ts:525-573`, `foo.ts#L525`.
+ *
+ * `file_path:line_number` is the repo's own citation convention (CLAUDE.md: it is clickable), and
+ * the checker used to treat the whole thing as the path and report the file as missing. The fix
+ * belongs HERE rather than in the cases: the guard's contract is "fix the extractor's precision,
+ * never delete the assertion", and pushing authors to drop line numbers would make every case
+ * vaguer to satisfy a tool.
+ */
+export function stripLineRef(path: string): string {
+  return path.replace(/(?::\d+(?:-\d+)?|#L\d+(?:-L?\d+)?)$/, '');
+}
+
 function git(args: string[]): string {
   return execFileSync('git', args, { cwd: REPO_ROOT, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+}
+
+/** True when `path` is `entry` or lives under it — `creates: games/x` covers `games/x/a/b.json`. */
+export function isUnder(path: string, entry: string): boolean {
+  return path === entry || path.startsWith(`${entry}/`);
+}
+
+/**
+ * Every `data-ui-id` an editor source file exposes, in ALL THREE forms it is written in.
+ *
+ * A case that aims `modoki_tap` at a selector which does not exist wastes the runner's whole
+ * session, and it is invisible to every other check — the tool exists, the parameter exists, only
+ * the target does not. `modoki_tap`'s own docstring shipped exactly that mistake
+ * (`inspector.header.kebab`, an Inspector kebab menu that has never existed), and it propagated into
+ * a case brief before anyone checked. So the ids are extracted mechanically:
+ *
+ *  1. `data-ui-id="literal"` — the plain JSX attribute.
+ *  2. `uiId="literal"` / `dataUiId="literal"` — passed as a prop to a component that renders it
+ *     (`TreeSearchInput`, `TypeFilterMenu`, `QualityTiersEditor`'s field rows…).
+ *  3. `uiId: 'literal'` — an object property inside an items array (`ViewOptionsMenu`'s options).
+ *
+ * Forms 2 and 3 are not decoration: leaving either out reported three PERFECTLY CORRECT citations
+ * as missing on the first run of this check. A guard that cries wolf gets disabled.
+ */
+export function knownUiIds(sources: string[]): { ids: Set<string>; prefixes: string[] } {
+  const ids = new Set<string>();
+  const joined = sources.join('\n');
+  const literal = [
+    /data-ui-id=["']([\w.:-]+)["']/g,
+    /\buiId=["']([\w.:-]+)["']/g,
+    /\bdataUiId=["']([\w.:-]+)["']/g,
+    /\buiId:\s*["']([\w.:-]+)["']/g,
+  ];
+  for (const re of literal) for (const m of joined.matchAll(re)) ids.add(m[1]);
+  // A template-built id (`hierarchy.folder.${name}`) can only be checked to its static prefix.
+  const prefixes = [...joined.matchAll(/(?:data-ui-id|uiId|dataUiId)[=:]\s*\{?`([\w.:-]*)\$/g)]
+    .map((m) => m[1])
+    .filter(Boolean);
+  return { ids, prefixes };
 }
 
 /**
@@ -271,6 +344,75 @@ describe('qa case guard helpers', () => {
 
     it('ignores prose outside code spans', () => {
       expect(codeTokens('engine/scripts/not-in-backticks.sh')).toEqual([]);
+    });
+  });
+
+  describe('codeSpans', () => {
+    it('returns whole spans, so a path containing a space can be checked as one path', () => {
+      // The real case: `games/3d-test/runtime/assets/scenes/2D Animation.scene.json` exists on disk.
+      // Split on whitespace it becomes `…/scenes/2D` + `Animation.scene.json`, and the checker
+      // reports a correct citation as a missing path.
+      const md = 'open `games/3d-test/runtime/assets/scenes/2D Animation.scene.json` now';
+      expect(codeSpans(md)).toEqual(['games/3d-test/runtime/assets/scenes/2D Animation.scene.json']);
+    });
+
+    it('ignores fenced blocks (only inline spans carry space-bearing paths in practice)', () => {
+      expect(codeSpans('```bash\nls games/x\n```')).toEqual([]);
+    });
+  });
+
+  describe('stripLineRef', () => {
+    it('strips a single line and a range, keeping the path', () => {
+      expect(stripLineRef('engine/app/editor/agentEditorOps.ts:525')).toBe(
+        'engine/app/editor/agentEditorOps.ts',
+      );
+      expect(stripLineRef('engine/app/editor/agentEditorOps.ts:525-573')).toBe(
+        'engine/app/editor/agentEditorOps.ts',
+      );
+      expect(stripLineRef('docs/editor.md#L12')).toBe('docs/editor.md');
+    });
+
+    it('leaves a path with no line reference alone', () => {
+      expect(stripLineRef('games/anim-bug/project.config.json')).toBe(
+        'games/anim-bug/project.config.json',
+      );
+    });
+  });
+
+  describe('knownUiIds', () => {
+    it('collects the attribute, prop and object-property forms', () => {
+      // All three appear in the real editor. Missing form 2 or 3 reported three CORRECT citations
+      // as missing when this check first ran — which is how a guard earns a reputation for lying.
+      const { ids } = knownUiIds([
+        '<button data-ui-id="inspector.header.delete" />',
+        '<TreeSearchInput uiId="assets.toolbar.search" />',
+        '<Row dataUiId="quality-tiers.field.mid.shadows" />',
+        "items={[{ key: 'grid', uiId: 'sceneView.toolbar.grid' }]}",
+      ]);
+      expect([...ids].sort()).toEqual([
+        'assets.toolbar.search',
+        'inspector.header.delete',
+        'quality-tiers.field.mid.shadows',
+        'sceneView.toolbar.grid',
+      ]);
+    });
+
+    it('exposes the static prefix of a template-built id', () => {
+      const { prefixes } = knownUiIds(['<div data-ui-id={`hierarchy.folder.${name}`} />']);
+      expect(prefixes).toEqual(['hierarchy.folder.']);
+    });
+  });
+
+  describe('isUnder', () => {
+    it('matches the entry itself and anything below it', () => {
+      expect(isUnder('games/qa-temp', 'games/qa-temp')).toBe(true);
+      expect(isUnder('games/qa-temp/project.config.json', 'games/qa-temp')).toBe(true);
+    });
+
+    it('does not match a sibling that merely shares a prefix', () => {
+      // The bug this pins: a naive startsWith would let `creates: games/qa` excuse every path
+      // under `games/qa-something-else`, silently un-checking real citations.
+      expect(isUnder('games/qa-temp-other/x.json', 'games/qa-temp')).toBe(false);
     });
   });
 
@@ -427,20 +569,93 @@ describeCases('QA case references', () => {
     expect(duds).toEqual([]);
   });
 
-  it('every repo path cited in a code span exists (or is a gitignored build output)', () => {
+  it('every repo path cited in a code span exists (or is declared in `creates:`)', () => {
     const missing: string[] = [];
     for (const c of cases) {
+      const creates = Array.isArray(c.fm?.fields.creates) ? (c.fm.fields.creates as string[]) : [];
+      // A span that is ITSELF a real path (asset filenames in this repo contain spaces) is verified
+      // whole; its fragments must not then be re-checked as if they were separate paths.
+      const verifiedWhole = new Set(
+        codeSpans(c.body).filter((s) => REPO_TOP_LEVEL.test(s) && existsSync(join(REPO_ROOT, s))),
+      );
+      const fragments = new Set([...verifiedWhole].flatMap((s) => s.split(/\s+/)));
       for (const token of codeTokens(c.body)) {
-        const path = token.replace(/[.,;:)\]]+$/, '').trim();
+        if (fragments.has(token)) continue;
+        const path = stripLineRef(token.replace(/[.,;:)\]]+$/, '').trim());
         if (!REPO_TOP_LEVEL.test(path)) continue;
         // Placeholders (`games/<id>/…`), globs and shell expansions are not literal paths.
         if (/[<>{}*$\s]/.test(path)) continue;
         if (existsSync(join(REPO_ROOT, path))) continue;
         if (isIgnoredBuildOutput(path)) continue;
+        // A path the case CREATES is expected to be absent — that is the point of `creates:`.
+        if (creates.some((entry) => isUnder(path, entry))) continue;
         missing.push(`${c.rel}: "${path}"`);
       }
     }
     expect(missing).toEqual([]);
+  });
+
+  /**
+   * `creates:` is the cleanup contract, and this is the half that makes it mean something.
+   *
+   * A case that scaffolds a temp project or writes a probe asset must name those paths, and they
+   * must NOT be in the tree: a present one is committed RESIDUE from a run whose cleanup did not
+   * happen — exactly the CLAUDE.md #18 hazard (a stray file swept in by `git add -A`), and residue
+   * under `games/` breaks every other clone's `npm test`, not just this one's.
+   *
+   * If this fires while a QA run is genuinely in progress in this clone, that is expected — finish
+   * the case's cleanup step. Otherwise somebody committed the leftovers.
+   */
+  it('no `creates:` path is present in the tree (that would be leftover QA residue)', () => {
+    const residue: string[] = [];
+    for (const c of cases) {
+      const creates = c.fm?.fields.creates;
+      if (!Array.isArray(creates)) continue;
+      for (const entry of creates) {
+        if (/[<>{}*$\s]/.test(entry)) {
+          residue.push(`${c.rel}: creates: "${entry}" is a placeholder, not a real path`);
+          continue;
+        }
+        if (!REPO_TOP_LEVEL.test(entry)) {
+          residue.push(`${c.rel}: creates: "${entry}" is not a repo-relative path`);
+          continue;
+        }
+        if (existsSync(join(REPO_ROOT, entry))) residue.push(`${c.rel}: creates: "${entry}" EXISTS`);
+      }
+    }
+    expect(residue).toEqual([]);
+  });
+
+  /**
+   * A selector is an AIM. If it does not resolve, the case cannot be executed at all — and unlike a
+   * wrong path or a wrong tool name, nothing else in this file would notice: the tool is real, the
+   * parameter is real, only the target is missing. Wave 2 of the suite drives the editor through its
+   * actual chrome, so this became the highest-value check to add.
+   */
+  it('every `data-ui-id` a case aims at exists in the editor source', () => {
+    const roots = ['engine/packages/modoki/src', 'engine/app', 'engine/electron'].map((r) =>
+      join(REPO_ROOT, r),
+    );
+    const sources = roots
+      .filter((r) => existsSync(r))
+      .flatMap((r) => walk(r).filter((f) => /\.tsx?$/.test(f)))
+      .map((f) => readFileSync(f, 'utf8'));
+    const { ids, prefixes } = knownUiIds(sources);
+    // A vacuous pass would be worse than no check — the editor really does tag its chrome.
+    expect(ids.size).toBeGreaterThan(30);
+
+    const unknown: string[] = [];
+    for (const c of cases) {
+      for (const m of c.body.matchAll(/data-ui-id=\\?["']([\w.:${}<>-]+)/g)) {
+        const id = m[1];
+        if (/[${}<>]/.test(id)) continue; // a placeholder the runner substitutes
+        if (ids.has(id) || prefixes.some((p) => id.startsWith(p))) continue;
+        unknown.push(`${c.rel}: [data-ui-id="${id}"]`);
+      }
+    }
+    // PROPOSING an id that should exist is legitimate — write it in prose, without the
+    // `data-ui-id="…"` code span, so it cannot be mistaken for a working selector.
+    expect(unknown).toEqual([]);
   });
 
   it('every MCP tool named in a case exists on the tool surface', () => {

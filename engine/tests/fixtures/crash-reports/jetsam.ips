@@ -1,0 +1,171 @@
+{"bug_type": "298", "timestamp": "2026-08-07 13:35:43.00 +0900", "os_version": "iPhone OS 16.7.16 (20H392)", "roots_installed": 0, "incident_id": "DEADBEEF-0000-0000-0000-000000000000"}
+{
+ "crashReporterKey": "0000000000000000000000000000000000000000",
+ "kernel": "Darwin Kernel Version 22.6.0: Tue Jul  2 20:47:35 PDT 2024; root:xnu-8796.142.1.703.8~1/RELEASE_ARM64_T8015",
+ "product": "iPhone10,1",
+ "incident": "DEADBEEF-0000-0000-0000-000000000000",
+ "date": "2026-08-07 13:35:43.66 +0900",
+ "build": "iPhone OS 16.7.16 (20H392)",
+ "roots_installed": 0,
+ "bug_type": "298",
+ "timeDelta": 23,
+ "memoryStatus": {
+  "compressorSize": 27459,
+  "compressions": 3489695,
+  "decompressions": 2492782,
+  "zoneMapCap": 738131968,
+  "largestZone": "vm objects",
+  "largestZoneSize": 8388608,
+  "pageSize": 16384,
+  "uncompressed": 84656,
+  "zoneMapSize": 127123456,
+  "memoryPages": {
+   "active": 26932,
+   "throttled": 0,
+   "fileBacked": 14856,
+   "wired": 42134,
+   "anonymous": 38698,
+   "purgeable": 10,
+   "inactive": 26375,
+   "free": 2879,
+   "speculative": 247
+  }
+ },
+ "largestProcess": "com.apple.WebKit.WebContent",
+ "genCounter": 1,
+ "processes": [
+  {
+   "uuid": "DEADBEEF-0000-0000-0000-000000000000",
+   "states": [
+    "suspended"
+   ],
+   "csFlags": 570434309,
+   "purgeable": 0,
+   "age": 446262643274,
+   "fds": 50,
+   "coalition": 1047,
+   "csTrustLevel": 0,
+   "rpages": 85,
+   "priority": 30,
+   "mem_regions": 48,
+   "physicalPages": {
+    "internal": [
+     0,
+     78
+    ]
+   },
+   "freeze_skip_reason:": "none",
+   "pid": 1100,
+   "cpuTime": 0.057047,
+   "name": "App",
+   "lifetimeMax": 85
+  },
+  {
+   "uuid": "DEADBEEF-0000-0000-0000-000000000000",
+   "states": [
+    "frontmost"
+   ],
+   "csFlags": 838868996,
+   "purgeable": 0,
+   "age": 434773450836,
+   "fds": 50,
+   "coalition": 1061,
+   "csTrustLevel": 0,
+   "rpages": 2822,
+   "priority": 100,
+   "mem_regions": 269,
+   "physicalPages": {
+    "internal": [
+     298,
+     2541
+    ]
+   },
+   "freeze_skip_reason:": "none",
+   "pid": 1117,
+   "cpuTime": 674.62191,
+   "name": "App",
+   "lifetimeMax": 4902
+  },
+  {
+   "states": [
+    "frontmost"
+   ],
+   "genCount": 0,
+   "purgeable": 0,
+   "rpages": 65749,
+   "physicalPages": {
+    "internal": [
+     15991,
+     8534
+    ]
+   },
+   "mem_regions": 436,
+   "uuid": "DEADBEEF-0000-0000-0000-000000000000",
+   "fds": 25,
+   "name": "com.apple.WebKit.WebContent",
+   "priority": 100,
+   "csTrustLevel": 0,
+   "cpuTime": 252.700262,
+   "freeze_skip_reason:": "none",
+   "age": 22275865154,
+   "coalition": 1061,
+   "csFlags": 570434305,
+   "reason": "highwater",
+   "pid": 1211,
+   "lifetimeMax": 67533,
+   "killDelta": 3354
+  },
+  {
+   "uuid": "DEADBEEF-0000-0000-0000-000000000000",
+   "states": [
+    "frontmost"
+   ],
+   "csFlags": 570434305,
+   "purgeable": 0,
+   "age": 22256453582,
+   "fds": 25,
+   "coalition": 1061,
+   "csTrustLevel": 0,
+   "rpages": 6481,
+   "priority": 100,
+   "mem_regions": 996,
+   "physicalPages": {
+    "internal": [
+     2825,
+     3166
+    ]
+   },
+   "freeze_skip_reason:": "none",
+   "pid": 1212,
+   "cpuTime": 169.399972,
+   "name": "com.apple.WebKit.GPU",
+   "lifetimeMax": 7267
+  },
+  {
+   "uuid": "DEADBEEF-0000-0000-0000-000000000000",
+   "states": [
+    "frontmost"
+   ],
+   "csFlags": 570434305,
+   "purgeable": 3,
+   "age": 3729974988717,
+   "fds": 200,
+   "coalition": 10,
+   "csTrustLevel": 0,
+   "rpages": 3426,
+   "priority": 160,
+   "mem_regions": 596,
+   "physicalPages": {
+    "internal": [
+     1198,
+     2491
+    ]
+   },
+   "freeze_skip_reason:": "none",
+   "pid": 33,
+   "cpuTime": 444.956982,
+   "name": "SpringBoard",
+   "lifetimeMax": 4726
+  }
+ ]
+}

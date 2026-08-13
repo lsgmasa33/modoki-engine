@@ -442,6 +442,15 @@ async function deviceRequest(method: string, params: Record<string, unknown> = {
   return body.result;
 }
 
+/** As `deviceRequest`, but keeps the SIBLING fields the route sets beside `result`. Most ops have
+ *  none; the ones that do are reporting something about the read itself that the payload cannot
+ *  carry — a truncated syslog capture is the case that forced this, since silent truncation reads
+ *  as "that is all the device logged", which is the "no silent caps" rule this repo already applies
+ *  to workflows. */
+async function deviceRequestFull(method: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+  return (await backendPost('/api/device/request', { method, params })) as Record<string, unknown>;
+}
+
 // ── Tool registration ────────────────────────────────────────
 
 export function registerTools(server: McpServer) {
@@ -1903,27 +1912,94 @@ async function coordScaleOrRefusal(
     },
   );
 
+  // ── Crash reports ──────────────────────────────────────────
+
+  tool('device_crash_reports',
+    'What the DEVICE recorded when the app died — the backward-looking surface, since ' +
+    "device_native_logs source:'app' needs the app alive. Bare call = the recent records for this " +
+    'app. iOS: crash + jetsam `.ips` reports (every device-wide jetsam included — that is how an ' +
+    'app dies without writing a report of its own); pass `name` for a SUMMARY of one. Android: ' +
+    'FATAL EXCEPTION crashes plus activity-manager kills (`am_kill`, with the oom_adj and reason), ' +
+    'returned directly — logcat has no report FILES, so `name` is iOS-only. Needs go-ios (iOS) or ' +
+    'adb (Android); needs no lease and no running app.',
+    {
+      name: z.string().optional().describe('iOS only: summarise this report (a filename from the bare listing). Omit to list. Android returns records directly and refuses this.'),
+      app: z.string().optional().describe("Which app. iOS: the PROCESS name (default 'App' — every Modoki iOS game is the Capacitor App target), not the bundle id, which never appears in a report filename. Android: the PACKAGE, defaulting to the leased app or the open project's."),
+      limit: z.number().optional().describe('Max reports to list (default: 20, newest first)'),
+      all: z.boolean().optional().describe('List EVERY report on the device, not just this app’s. Noisy — a phone keeps ~100, mostly Siri/system chatter.'),
+      raw: z.boolean().optional().describe('IGNORED unless `name` is given (iOS). With `name`: the raw report text instead of the summary, capped at 20k chars. A jetsam report is ~117KB of device-wide snapshot, which is why summary is the default.'),
+      platform: z.enum(['ios', 'android']).optional().describe("Which platform to read, when no lease says. Needed ONLY when both an iPhone and an Android are attached — then the call refuses rather than picking one, because reading the wrong phone gives a confidently wrong answer."),
+    },
+    async ({ name, app, limit, all, raw, platform }) => {
+      try {
+        const body = await deviceRequestFull('crashReports', {
+          ...(name ? { name } : {}), ...(app ? { app } : {}), ...(platform ? { platform } : {}),
+          ...(limit !== undefined ? { limit } : {}), ...(all ? { all } : {}), ...(raw ? { raw } : {}),
+        });
+        const result = body.result;
+        // The C7 class: a device/route refusal arrives as an `Error: …` STRING resolved as a normal
+        // result, and `raw:true` legitimately returns a string too — so without this check a refusal
+        // would be handed back as if it were the report text.
+        if (isDeviceError(result)) return deviceReplyFailure('device_crash_reports', 'read the device crash reports', result);
+        // `raw` — the route already appends its own truncation marker to the text, so nothing to add.
+        if (typeof result === 'string') return { content: [{ type: 'text' as const, text: result }] };
+        // A listing says what it HID. "19 reports" when 99 exist is a different answer from "19
+        // reports exist", and only one of them is true.
+        const note = Array.isArray(result)
+          ? `[${String(body.shown)} of ${String(body.matched)} matching · ${String(body.totalOnDevice)} on device${body.filteredTo ? ` · filtered to process '${String(body.filteredTo)}' (pass all:true for everything)` : ''}]\n`
+          : '';
+        return { content: [{ type: 'text' as const, text: note + JSON.stringify(result, null, 2) }] };
+      } catch (e) {
+        return caughtFailure('device_crash_reports', 'read the device crash reports', e);
+      }
+    },
+  );
+
   // ── Native Logs ────────────────────────────────────────────
 
   tool('device_native_logs',
-    'Return native logs from the device (logcat on Android, os_log on iOS).',
+    "Return native logs from the device. source:'app' (default) reads the app's OWN os_log/logcat " +
+    'from inside the process, LOOKING BACK `seconds`. ' +
+    "source:'system' reads the whole device log from the host — use it for a launch-time failure " +
+    'or a system kill, which the app cannot report about itself. ⚠️ The DIRECTION differs by ' +
+    'platform: on iOS it streams FORWARD for `seconds` (start it, then reproduce — it cannot show ' +
+    'something that already happened), while on Android it dumps logcat BACKWARD, so it needs no ' +
+    'capture window and `seconds` is ignored there.',
     {
       limit: z.number().optional().describe('Max lines (default: 50)'),
       filter: z.string().optional().describe('Text filter (case-insensitive). Only return lines containing this string.'),
-      seconds: z.number().optional().describe('Time window in seconds (default: 60)'),
+      seconds: z.number().optional().describe("Window in seconds. source:'app' looks BACK this far (default 60). source:'system' on iOS CAPTURES for this long (default 10, max 60) and you wait it out; on Android it is IGNORED — logcat already holds the past."),
+      source: z.enum(['app', 'system']).optional().describe("'app' (default) = in-process, needs the app running and connected. 'system' = host-side device log (go-ios syslog on iOS, adb logcat on Android); needs no lease and works when the app is dead."),
+      platform: z.enum(['ios', 'android']).optional().describe("Which platform to read, when no lease says. Needed ONLY when both an iPhone and an Android are attached — then the call refuses rather than picking one, because reading the wrong phone gives a confidently wrong answer."),
     },
-    async ({ limit, filter, seconds }) => {
+    async ({ limit, filter, seconds, source, platform }) => {
       try {
-        const raw = await deviceRequest('nativeLogs', {
+        const body = await deviceRequestFull('nativeLogs', {
           limit: limit ?? 50,
-          seconds: seconds ?? 60,
+          // Two different questions, so two different defaults — see the description. Sending the
+          // app path's 60 into a forward capture would make every system read a minute long.
+          seconds: seconds ?? (source === 'system' ? 10 : 60),
+          ...(source ? { source } : {}),
+          ...(platform ? { platform } : {}),
           ...(filter ? { filter } : {}),
         });
+        const raw = body.result;
         // Same class as device_console_logs above: an `Error: …` reply would be String()'d straight
         // into the payload and read as log CONTENT.
         if (isDeviceError(raw)) return deviceReplyFailure('device_native_logs', 'read the native device logs', raw);
         const result = parseReply<string[]>(raw);
-        return { content: [{ type: 'text' as const, text: (Array.isArray(result) ? result.join('\n') : String(result)) || 'No logs.' }] };
+        const text = (Array.isArray(result) ? result.join('\n') : String(result)) || 'No logs.';
+        // Say what the read actually WAS when it was a forward capture — an empty system result is
+        // "nothing was logged in those N seconds", not "the device has no logs", and those lead to
+        // opposite next moves. Truncation is stated for the same reason.
+        const note = source !== 'system' ? ''
+          // Android dumps a ring buffer (backward); iOS streams (forward). Saying WHICH read you
+          // got is the difference between "nothing was logged" and "nothing happened while I
+          // watched", and those lead to opposite next moves.
+          : body.backward
+            ? `[system log (logcat dump, backward)${body.device ? ` · ${String(body.device)}` : ''}${body.clamped ? ' · limit capped at 400 lines (response budget)' : ''}]\n`
+            : `[system syslog${body.device ? ` · ${String(body.device)}` : ''} · streamed forward for ${String(body.capturedFor ?? seconds ?? 10)}s${body.truncated ? ` · older matching lines dropped past limit ${limit ?? 50}` : ''}]\n`;
+        return { content: [{ type: 'text' as const, text: note + text }] };
       } catch (e) {
         return caughtFailure('device_native_logs', 'read the native device logs (logcat / os_log)', e);
       }

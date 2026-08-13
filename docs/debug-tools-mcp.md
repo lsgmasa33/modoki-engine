@@ -37,7 +37,9 @@ Grouped:
   `code` sees an injected `modoki` scripting object — the live agent-op registry, generated per op)
   · `device_eval_api` (discovery: what that object exposes — **and what it does not**) ·
   `device_screenshot` ·
-  `device_console_logs` · `device_native_logs` (both default `limit:50`).
+  `device_console_logs` · `device_native_logs` (both default `limit:50`; see "Two sources of
+  native logs" below) · `device_crash_reports` (iOS crash + jetsam reports — the only surface that
+  explains a death that already happened).
 - **Percept (read-by-data):** `device_get_scene_state` · `device_diagnose` · `device_journal` ·
   `device_resolve_refs` · `device_introspect` · `device_layout_bounds` · `device_watch` ·
   `device_profiler` (where did the frame go — the phone is the only place that question is real) ·
@@ -270,6 +272,110 @@ listens. Reopen the project in the editor (heal-on-open) and rebuild.
 The bridge now says so itself, at **error** level and carrying both `GameDebug` and
 `TCP server listening` so one grep finds it — it previously reported this at log level, worded to
 match neither, which is why the failure read as "the branch never ran".
+
+### Two sources of native logs, and they answer different questions (#217)
+
+`device_native_logs` has a `source`, and picking the wrong one gets you plausible-looking log lines
+that cannot contain the answer:
+
+| | `source:'app'` (default) | `source:'system'` |
+|---|---|---|
+| Where it reads | `OSLogStore(.currentProcessIdentifier)` **inside the app** (`GameDebugPlugin.swift`), logcat in-process on Android | **host-side**: `ios syslog` over USB (iOS) / `adb logcat -d` (Android) |
+| Direction | **backward** — a query over stored logs, `seconds` looks back | **iOS: forward** (a stream; `seconds` is how long it captures, and you wait it out). **Android: backward** (a ring-buffer dump; `seconds` is ignored) |
+| Needs | the app running **and** the debug lease connected | nothing: no lease, no claim, app may be dead or uninstalled |
+| Sees | only this process's own logging | everything the device logs, including what the system says *about* us |
+
+⚠️ **That direction split is real, not an inconsistency to smooth over.** logcat is a ring buffer
+that already holds the past; iOS's syslog relay only delivers what happens after you attach. Making
+both "consistent" would either cost Android its main advantage or make an agent wait ten seconds for
+logs it already has. The response says which read you got (`logcat dump, backward` vs `streamed
+forward for Ns`), because an empty result means *"nothing was logged"* in one case and *"nothing
+happened while I watched"* in the other, and those lead to opposite next moves.
+
+**The `system` source exists for the three questions the app path cannot answer even in principle**
+— why it CRASHED (the process that would have replied is gone), what happened during LAUNCH before
+the bridge attached, and system-side kills (jetsam/OOM, watchdog, sandbox denials), which our
+process never emits. Measured on an iPhone 8: killing the app mid-capture surfaced SpringBoard's
+whole teardown of `com.modokiengine.court`, none of which the in-process path could have produced.
+
+⚠️ **Forward means forward.** `source:'system'` cannot show a crash that already happened — attach,
+then reproduce. **`device_crash_reports` is the backward-looking surface** (below); it is a separate
+tool rather than a third `source`, because a report reader and a live stream are different things.
+
+### `device_crash_reports` — what the device wrote when the app died (#218)
+
+The `.ips` reports the system writes at the moment of death and keeps for days. Bare call lists this
+app's recent reports; `name` summarises one. Needs no lease and no running app — by definition.
+
+**A `JetsamEvent` is included even though its filename names no process, and that is the point:** it
+is how an app dies *without* writing a report of its own, so a strict process filter would hide the
+likeliest cause of a mystery termination on a low-end device. Summarised, never dumped — one
+measured jetsam is 117 KB and 207 processes, and the answer inside it is four numbers:
+
+```
+killed:  com.apple.WebKit.WebContent  1027.3 MB  reason: highwater
+largest: com.apple.WebKit.WebContent  1027.3 MB
+app:     App pid 1117  44.1 MB (peak 76.6 MB)
+```
+
+That is the difference between "the screen went black" and "the WebView hit its ~1 GB ceiling while
+our shell held 44 MB". `raw:true` returns the report text (capped) when the summary is not enough.
+MB figures assume **16 KiB pages** — an assumption named in `IOS_PAGE_BYTES`, because the reports
+carry no page size. The parser branches on report SHAPE, never on `bug_type`: that code is opaque
+and has moved across OS versions, and being wrong about it would mis-parse a real crash in silence.
+
+**On Android the same tool reads two logcat buffers** (`deviceAndroidDiag.ts`), and the pairing with
+iOS is exact: `-b crash` ↔ an `.ips` exception report (`FATAL EXCEPTION` + stack), and `-b events`
+`am_kill`/`am_proc_died` ↔ a `JetsamEvent` — the activity manager killing a process, with its
+oom_adj and its own reason (`empty #34`, `cached`). That second one is how an Android app dies
+*without* writing a crash of its own, which is why both are behind one tool. Measured on a Galaxy
+S22 against a deliberately forced crash: the `FATAL EXCEPTION` and the process death that followed
+it come back correlated on the same pid.
+
+Two Android-only notes. **`name` is iOS-only** — logcat hands back content, not report FILES, so
+there is nothing to address; the bare call already returns the records. And the package filter
+includes **`<pkg>:sub` processes**, because a Capacitor game's WebView runs in its own
+`:sandboxed_process` and that renderer kill is the one that actually takes the screen black.
+Deliberately not used: `adb bugreport` (tens of MB, a minute-plus, for a superset that mostly does
+not answer "why did my app die") and `/data/tombstones` (root-only on a production device).
+
+### Which phone a host-side op talks to — ask the TRANSPORT
+
+On Android these read through `adb`, targeted by the LEASE's serial when there is one, else the
+project pin, else the only attached device — a refusal naming every candidate otherwise (#149).
+On iOS both surfaces need go-ios (Build Support → go-ios, or the first iOS ≤16 build provisions
+it), and both resolve the device through **`ios list`, not `devicectl`/`xctrace`**. That is a correction,
+not a preference: measured 2026-08-13, an iPhone 8 that go-ios reported continuously **vanished from
+the xctrace listing for minutes** and came back, so a syslog read resolved through Apple's listing
+failed with "matches none of this Mac's paired iOS devices" about a device that was plugged in,
+awake, and answering. usbmuxd is a different visibility path from CoreDevice and Instruments, so
+asking Apple's tools whether go-ios can reach something is asking the wrong party.
+
+The rule generalises: **resolve a device through the transport the op will use.** A build still
+resolves through `devicectl`/`xctrace` — correctly, because `xcodebuild` targets *that* listing.
+
+Selection order is the usual one: `MODOKI_IOS_DEVICE_UDID` → the only attached device → the one
+whose `ProductType` matches the leased app's reported model (the lease never learns a UDID by
+design, #146) → **refuse, naming every candidate**. Reading logs off the wrong phone produces a
+confidently wrong answer that looks right.
+
+**The same rule binds the PLATFORM, and that was a real defect** (close-out review). These ops exist
+for when the app has died — which is exactly when the lease is gone and cannot say what platform it
+was. The first cut fell through to iOS whenever the platform was unknown, and with an iPhone and
+three Androids attached it silently answered about the iPhone: right-looking payload, wrong device,
+no hint a choice had been made. Both tools now take `platform: 'ios'|'android'`, and the order is
+**explicit → lease → what is actually attached → refuse naming both sides**. `pickHostSidePlatform`
+is the one pure function that decides it, the same shape as `planIosInstall`.
+
+⚠️ **A WiFi lease names no adb serial.** `target.serial` is set only on the `useAdb` path, so "there
+is a lease" is not "we know which handset" — and falling through to the build resolver would read a
+DIFFERENT USB phone while labelling it as the leased one. With a serial-less lease the Android side
+disambiguates by the leased hardware model, exactly as the iOS side does, and refuses rather than
+guessing.
+
+**Response budget**: an Android system-log read caps at **400 returned lines** (`MAX_RETURNED_LINES`)
+however large a `limit` you pass, and says `clamped` when it did. 4000 threadtime lines is ~400 KB,
+roughly 7x the 60,000-char budget, and nothing else on this path truncates.
 
 ### Several phones attached: which one, and who has it (#149)
 
@@ -1228,16 +1334,19 @@ with the debug port (same backend/project so the MCP stays valid) —
 ./node_modules/.bin/electron --remote-debugging-port=9223 "$PWD/engine/electron/dist/main.cjs" &`
 — then find the page target via `curl -s localhost:9223/json` (filter to the `/#/editor` url). The
 `chrome-devtools` MCP manages its OWN browser and usually CAN'T attach to an arbitrary Electron
-port, so drive CDP directly: a ~30-line Node script using `ws` opens the page's
-`webSocketDebuggerUrl` and calls `Runtime.evaluate` with `returnByValue`/`awaitPromise` (put the
-script IN the repo dir so `ws` resolves — ESM ignores `NODE_PATH`). The backend (5180) is separate
-from the renderer, so the modoki MCP keeps working through the reload.
+port, so drive CDP directly: a ~25-line Node script opens the page's `webSocketDebuggerUrl` and
+calls `Runtime.evaluate` with `returnByValue`/`awaitPromise`. **No dependency is needed — Node 22+
+has a global `WebSocket`**, and `ws` is not a dependency of this repo (an earlier version of this
+recipe imported it, which fails with `ERR_MODULE_NOT_FOUND` wherever you put the script). The
+global is the WHATWG client, not an EventEmitter: it has `onopen`/`onmessage`, **not** `.on()` /
+`.once()`, and the message payload arrives as `event.data`. The backend (5180) is separate from the
+renderer, so the modoki MCP keeps working through the reload.
 
 The minimal script — evaluate an expression in the live renderer without perturbing it (write it
 under the repo root as `cdp-eval.mjs`, run `node cdp-eval.mjs "<expr>"`):
 
 ```js
-import WebSocket from 'ws';
+// No imports: Node 22+ ships a global WebSocket. `ws` is NOT a dependency here.
 const PORT = process.env.CDP_PORT || 9223;
 const expr = process.argv[2] ?? '1+1';
 // 1. find the editor page target
@@ -1246,13 +1355,15 @@ const page = targets.find(t => t.type === 'page' && t.url.includes('/#/editor'))
 if (!page) throw new Error('no /#/editor page target — is Electron up with --remote-debugging-port?');
 // 2. open its CDP socket and Runtime.evaluate
 const ws = new WebSocket(page.webSocketDebuggerUrl);
-await new Promise(r => ws.once('open', r));
-const send = (id, method, params) => ws.send(JSON.stringify({ id, method, params }));
-ws.on('message', (buf) => {
-  const m = JSON.parse(buf);
+await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
+ws.onmessage = (event) => {
+  const m = JSON.parse(event.data);            // WHATWG: payload is event.data, not a Buffer arg
   if (m.id === 1) { console.log(JSON.stringify(m.result?.result ?? m.error, null, 2)); ws.close(); }
-});
-send(1, 'Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true });
+};
+ws.send(JSON.stringify({
+  id: 1, method: 'Runtime.evaluate',
+  params: { expression: expr, returnByValue: true, awaitPromise: true },
+}));
 ```
 
 Read a live fiber/prop, a `getAnimations()` clock, or a WGSL error object the same way — the

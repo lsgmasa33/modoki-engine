@@ -1323,6 +1323,10 @@ export function isRemovable(id: ToolId): boolean {
   const d = detect(id)
   if (!d.present) return false
   if (id === 'gltf-transform-cli' || id === 'gltfpack' || id === 'ffmpeg' || id === 'ffprobe') return !!d.path?.includes('npm-tools')
+  // go-ios's binary is named plainly `ios`, so a PATH hit is only PROBABLY ours (see its registry
+  // entry). Offering "Remove" for a binary we never provisioned is a UI lie — the same reason
+  // cocoapods checks its source below. Ours lives under the toolchain dir; nothing else counts.
+  if (id === 'go-ios') return !!process.env.MODOKI_TOOLCHAIN_DIR && !!d.path?.startsWith(process.env.MODOKI_TOOLCHAIN_DIR)
   if (id === 'cocoapods') return d.source === 'probe' // our provisioned pod (not a system one)
   return toolOwnedDirs(id, process.env.MODOKI_TOOLCHAIN_DIR).length > 0
 }

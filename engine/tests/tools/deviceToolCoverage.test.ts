@@ -55,6 +55,7 @@ const NOT_A_JSON_ENVELOPE: Record<string, string> = {
   device_eval_api: 'returns a discovery document (the injected object\'s op list), not a status envelope',
   device_console_logs: 'returns a log payload; its failures arrive as `Error: …`',
   device_native_logs: 'returns a log payload; its failures arrive as `Error: …`',
+  device_crash_reports: 'returns a report listing / a parsed report summary — the payload IS the answer, not a status envelope',
   device_tap: 'input tools reply with a bare `ok …` / `Error: …` STRING, not JSON',
   device_drag: 'bare-string input reply',
   device_pointer: 'bare-string input reply',
@@ -94,6 +95,9 @@ const MINIMAL: Record<string, Record<string, unknown>> = {
   device_invalidate_assets: { items: [{ path: '/a.glb', type: 'model' }] },
   device_console_logs: {},
   device_native_logs: {},
+  // Bare = list this app's recent reports. Host-side (go-ios), so it needs no lease — but the
+  // MINIMAL form still has to be the ERGONOMIC one, which for a listing is no arguments at all.
+  device_crash_reports: {},
   device_eval: { code: 'return 1' },
   device_eval_api: {},   // discovery for device_eval's injected `modoki` object (#83) — no params
   device_screenshot: {},

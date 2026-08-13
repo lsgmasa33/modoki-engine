@@ -172,12 +172,16 @@ import { getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData
 import { UNCLAMPED_OVERRIDES } from '../../packages/modoki/src/runtime/rendering/qualityTier';
 import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
-import { adbBinary, isUsable, listAndroidDevices, withFriendlyNames } from './androidDevices';
+import { adbBinary, isUsable, listAndroidDevices, resolveBuildAndroidSerial, withFriendlyNames } from './androidDevices';
 import { adbDeviceId, iosDeviceId, listClaims, type DeviceClaim } from './deviceClaims';
 import { tryDeviceCdpInput, isDeviceCdpAvailable, synthFallbackBanner, TRUSTED_CDP_MECHANISM } from './deviceCdp';
 import { tryDeviceWdaInput, isDeviceWdaAvailable, resetDeviceWdaSession, tryDeviceWdaScreenshot, TRUSTED_WDA_MECHANISM, WDA_NOT_IOS_REASON, NO_WDA_ON_THIS_DEVICE } from './deviceWda';
 import { isDeviceFailureReply } from './deviceAim';
 import { listIosDevicesForSelection, stopWda } from './wdaLauncher';
+import { captureIosSyslog, resolveGoIos } from './deviceSyslog';
+import { resolveGoIosDevice, listGoIosUdids, pickHostSidePlatform } from './goIosDevice';
+import { readAndroidDiagnostics, readAndroidSystemLog } from './deviceAndroidDiag';
+import { listCrashReports, fetchCrashReport, filterCrashReports, summarizeCrashReport, RAW_CHARS_MAX } from './deviceCrashReports';
 import { resolveModules } from '../detect-modules';
 // Type-only — erased at runtime, so it does NOT pull the tree-shaker (and its
 // vite-asset-scanner import) into this host-agnostic router.
@@ -820,6 +824,160 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // 10s — that one crosses an HMR websocket relay; this is one LAN/USB hop.
       const deadline = Number.isFinite(opTimeout) && opTimeout > 0 ? opTimeout + 5_000 : undefined;
       const proxy = (m: string, p: Record<string, unknown>) => deviceConnection.proxy(m, p, deadline);
+      // SYSTEM logs come from the HOST, not the app (see deviceSyslog.ts). Handled before every
+      // lease-dependent path below, and deliberately NOT gated on the lease: the questions this
+      // source exists for — why did it crash, what did launch do, did the system jetsam us — are
+      // asked exactly when the app is not there to answer. It reads the phone over USB and takes no
+      // hardware claim, the same rule `adb shell` already follows in deviceClaims.ts.
+      // WHICH phone, for every host-side go-ios op below — asked of GO-IOS, not of devicectl/xctrace
+      // (see goIosDevice.ts: an iPhone 8 measurably vanished from the xctrace listing while go-ios
+      // talked to it throughout, so resolving through Apple's listing failed about a device that was
+      // plugged in and answering). The lease contributes only its hardware MODEL, which is all it is
+      // allowed to know (#146). Shared by the syslog and crash-report branches so one request can
+      // never target two different phones.
+      const resolveHostSideIosDevice = async () => {
+        const goIos = resolveGoIos();
+        if (!goIos) {
+          return { error: "go-ios is not installed. Install it from the editor's Build Support dialog (iOS Build Support → go-ios), or set MODOKI_GO_IOS." };
+        }
+        return resolveGoIosDevice({ goIos, env: process.env, lease: await deviceConnection.deviceHardware() });
+      };
+      // WHICH Android, for the host-side adb ops. The LEASE's serial wins (it is the phone the
+      // caller is already driving); otherwise the same rule a build follows — the project pin, else
+      // the only attached device, else a refusal naming every candidate (#149). Never a bare `adb`
+      // with three handsets plugged in, which reads whichever one adb happens to list first.
+      const resolveHostSideAndroidSerial = async (): Promise<{ serial?: string } | { error: string }> => {
+        const st = deviceConnection.status();
+        if (st.target?.serial) return { serial: st.target.serial };
+        const attached = withFriendlyNames(listAndroidDevices().filter(isUsable));
+        // ⚠️ A WIFI lease carries NO serial — `target.serial` is set only on the `useAdb` path — so
+        // "there is a lease" does not mean "we know which handset". Falling straight through to the
+        // build resolver then reads logs off whichever OTHER phone happens to be on USB, labelled
+        // as if it were the leased one: the same silent wrong-device answer the platform gate above
+        // exists to refuse. So when a lease is live but serial-less, disambiguate the way the iOS
+        // side does — by the hardware MODEL the lease reports — and refuse rather than guess.
+        if (st.state === 'connected') {
+          const model = (await deviceConnection.deviceHardware()).deviceModel;
+          const hits = model ? attached.filter((d) => d.model === model || d.name === model) : [];
+          if (hits.length === 1) return { serial: hits[0].serial };
+          if (attached.length === 1 && !model) return { serial: attached[0].serial };
+          return { error: `the lease is over WiFi, so it names no adb serial${model ? ` (device model ${model})` : ''} — attached: ${attached.map((d) => `${d.serial}${d.name ? ` (${d.name})` : ''}`).join(', ') || 'none'}. Reconnect over adb, or pin device.androidDeviceId in Project Settings.` };
+        }
+        const picked = resolveBuildAndroidSerial(listAndroidDevices(), { projectPin: loadProjectUserConfig(ctx.projectRoot).device.androidDeviceId });
+        return 'error' in picked ? picked : { serial: picked.serial };
+      };
+      // WHICH PLATFORM these host-side ops read. The lease answers it when there is one — but these
+      // ops exist precisely for when there ISN'T (the app died, so the lease died with it), and the
+      // first cut fell through to iOS whenever the platform was unknown.
+      //
+      // ⚠️ MEASURED, and it is why this is a function and not a boolean: with an iPhone and three
+      // Androids attached and no lease, `crashReports` silently answered about the IPHONE —
+      // `device: 30afceaf…, totalOnDevice: 99` — to a caller who may well have been debugging the
+      // Samsung. No error, no hint that a choice was made. That is the "confidently wrong answer
+      // that looks right" class #149 refuses for adb serials, one level up: the same rule has to
+      // bind the PLATFORM, not just which handset within one.
+      //
+      // So: an explicit `platform` wins, then the lease, then what is actually ATTACHED — and when
+      // both kinds are attached it REFUSES and says how to disambiguate, rather than picking.
+      // The DECISION is `pickHostSidePlatform` (pure, unit-tested); this only gathers its inputs.
+      // Both listings are best-effort: a missing adb or go-ios means "that platform has nothing
+      // attached", which the decision then reads as evidence rather than as an error — the whole
+      // point being to answer from what IS present.
+      const resolveHostSidePlatform = async (explicit?: string): Promise<'ios' | 'android' | { error: string }> => {
+        let androids: string[] = [];
+        try { androids = listAndroidDevices().filter(isUsable).map((d) => d.serial); } catch { /* no adb */ }
+        let iphones: string[] = [];
+        const goIos = resolveGoIos();
+        if (goIos) { try { iphones = await listGoIosUdids(goIos); } catch { /* no usbmuxd */ } }
+        return pickHostSidePlatform({ explicit, leased: await deviceConnection.devicePlatform(), iphones, androids });
+      };
+      if (b.method === 'nativeLogs' && (b.params as { source?: string } | undefined)?.source === 'system') {
+        const p = (b.params ?? {}) as { seconds?: number; limit?: number; filter?: string; platform?: string };
+        const plat = await resolveHostSidePlatform(p.platform);
+        if (typeof plat !== 'string') return json({ error: `system logs: ${plat.error}` }, 409);
+        if (plat === 'android') {
+          const picked = await resolveHostSideAndroidSerial();
+          if ('error' in picked) return json({ error: `system logs: ${picked.error}` }, 409);
+          try {
+            // BACKWARD, unlike iOS: logcat dumps a ring buffer that already holds the past, so
+            // there is no capture window and `seconds` has nothing to mean here.
+            const log = await readAndroidSystemLog({ serial: picked.serial, limit: p.limit, filter: p.filter });
+            return json({ result: log.lines, backward: true, clamped: log.clamped, device: picked.serial ?? 'the attached device' });
+          } catch (e) {
+            return json({ error: e instanceof Error ? e.message : String(e) }, 409);
+          }
+        }
+        const picked = await resolveHostSideIosDevice();
+        if ('error' in picked) return json({ error: `system logs: ${picked.error}` }, 409);
+        try {
+          const cap = await captureIosSyslog({
+            udid: picked.device.udid, seconds: p.seconds, limit: p.limit, filter: p.filter,
+          });
+          return json({ result: cap.lines, capturedFor: cap.capturedFor, truncated: cap.truncated, device: picked.device.name ?? picked.device.udid });
+        } catch (e) {
+          return json({ error: e instanceof Error ? e.message : String(e) }, 409);
+        }
+      }
+      // Crash / jetsam reports — the BACKWARD-looking record, and the only surface that can explain
+      // a death that already happened (see deviceCrashReports.ts). Host-side and lease-free for the
+      // same reason as the syslog branch, only more so: by definition the app is not running.
+      if (b.method === 'crashReports') {
+        const p = (b.params ?? {}) as { name?: string; app?: string; limit?: number; all?: boolean; raw?: boolean; platform?: string };
+        const plat = await resolveHostSidePlatform(p.platform);
+        if (typeof plat !== 'string') return json({ error: `crash reports: ${plat.error}` }, 409);
+        if (plat === 'android') {
+          const picked = await resolveHostSideAndroidSerial();
+          if ('error' in picked) return json({ error: `crash reports: ${picked.error}` }, 409);
+          // The package, which on Android IS the process name (unlike iOS, where every Modoki game
+          // is the Capacitor `App` target). The leased app first; else the OPEN PROJECT's appId,
+          // which the backend already knows and which is what you almost always mean.
+          const pkg = p.all ? undefined : (p.app || await deviceConnection.deviceAppId() || loadProjectConfig(ctx.projectRoot).app.appId);
+          try {
+            // No two-step here, and that asymmetry is real rather than an oversight: iOS lists
+            // FILES you then fetch, while logcat hands back the content itself, already bounded.
+            // `name` therefore has nothing to address on Android.
+            if (p.name) return json({ error: 'crash reports: `name` is iOS-only — Android returns the records themselves, since logcat has no report files to address.' }, 409);
+            const diag = await readAndroidDiagnostics({ serial: picked.serial, pkg, limit: p.limit });
+            return json({
+              result: diag.records, device: picked.serial ?? 'the attached device',
+              totalOnDevice: diag.totalSeen, matched: diag.matched, shown: diag.records.length,
+              filteredTo: pkg ?? null,
+            });
+          } catch (e) {
+            return json({ error: e instanceof Error ? e.message : String(e) }, 409);
+          }
+        }
+        const picked = await resolveHostSideIosDevice();
+        if ('error' in picked) return json({ error: `crash reports: ${picked.error}` }, 409);
+        const udid = picked.device.udid;
+        // Every Modoki iOS game is the Capacitor `App` target, so that is the process name the
+        // device files reports under — NOT the bundle id, which never appears in a report FILENAME.
+        // Overridable for the odd target, and bypassable entirely with `all`.
+        const appProcess = p.all ? undefined : (p.app || 'App');
+        try {
+          if (p.name) {
+            const text = await fetchCrashReport({ udid, name: p.name });
+            if (p.raw) {
+              const clipped = text.length > RAW_CHARS_MAX;
+              return json({ result: clipped ? `${text.slice(0, RAW_CHARS_MAX)}\n…[truncated ${text.length - RAW_CHARS_MAX} chars]` : text, truncated: clipped });
+            }
+            return json({ result: summarizeCrashReport(text, appProcess), name: p.name, device: picked.device.name ?? picked.device.udid });
+          }
+          const all = await listCrashReports({ udid });
+          const refs = filterCrashReports(all, appProcess);
+          const limit = Math.max(1, Math.floor(p.limit ?? 20));
+          // Say what was HIDDEN. A filtered listing that silently drops 80 of 99 files reads as "the
+          // device has 19 reports", and the next question ("is it really not there?") then gets the
+          // wrong answer — the no-silent-caps rule this repo already applies to workflows.
+          return json({
+            result: refs.slice(0, limit), device: picked.device.name ?? picked.device.udid,
+            totalOnDevice: all.length, matched: refs.length, shown: Math.min(limit, refs.length),
+            filteredTo: appProcess ?? null,
+          });
+        } catch (e) {
+          return json({ error: e instanceof Error ? e.message : String(e) }, 409);
+        }
+      }
       // #102 — iOS out-of-app capture. The native path is the APP'S OWN capture, so a system dialog
       // or springboard is invisible to it (it returns the app underneath, which reads as a fine
       // screenshot of the wrong thing). WDA sees the whole screen. Two triggers, each covering what
