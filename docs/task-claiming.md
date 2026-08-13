@@ -28,7 +28,7 @@ something, it stays in the repo.**
 gh issue list --state open                       # what's open
 gh issue list --state open --label "wip/work-ai2"  # what THIS clone already claimed
 # what's actually available to an agent right now:
-gh issue list --state open --search "-label:needs-owner -label:blocked -label:wip/main -label:wip/work-ai -label:wip/work-ai2 -label:wip/work-ai3 -label:wip/win"
+gh issue list --state open --search "-label:needs-owner -label:blocked -label:wip/main -label:wip/work-ai -label:wip/work-ai2 -label:wip/work-ai3 -label:wip/work-qa -label:wip/win"
 ```
 
 Anything carrying a `wip/*` label is **taken by another session** — pick something else,
@@ -58,6 +58,7 @@ The label is the claim. Derive it from the **current branch**, not the directory
 | `work-ai` | `wip/work-ai` | `~/Projects/modoki-ai` |
 | `work-ai2` | `wip/work-ai2` | `~/Projects/modoki-ai2` |
 | `work-ai3` | `wip/work-ai3` | `~/Projects/modoki-ai3` |
+| `work-qa` | `wip/work-qa` | `~/Projects/modoki-qa` |
 | `win` | `wip/win` | Windows machine |
 
 ```bash
@@ -117,7 +118,8 @@ gh issue edit <N> --remove-label "wip/$(git branch --show-current)"
 ```
 
 **Do not wait for the merge to close it.** GitHub only auto-closes on a commit reaching the
-**default branch** (`main`), and worker clones commit to `work-ai`/`work-ai2`/`work-ai3`/`win` — so
+**default branch** (`main`), and worker clones commit to
+`work-ai`/`work-ai2`/`work-ai3`/`work-qa`/`win` — so
 relying on the trailer alone leaves finished work sitting in the open list, indistinguishable
 from untouched work, until the owner next integrates. That is the stale-checkbox class the
 Issues migration existed to kill, reappearing one level up. Closing early costs nothing: the
