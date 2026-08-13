@@ -35,13 +35,20 @@ export interface CachedProbeVerdict {
    *  Also why this is a list and not a running mean: a mean cannot be un-skewed by a later sample,
    *  and the outlier passes this exists to survive are exactly the ones that would skew it.
    *
+   *  ⚠️ **`fillMpxPerMs` REJOINED THEM (#203, 2026-08-13) — as the 2D probe's DECIDING axis, not
+   *  as the resurrection of the old fill/draw pair.** A 2D project's only tier-controlled GPU knob
+   *  is fill-rate bound, so a 2D probe runs `fill` + `cpu` where a 3D one runs `shade` + `cpu`.
+   *  Both fields are always written and only the relevant one is read; which that is comes from
+   *  `ProbeMeasurement.axes`, and `CLASSIFIER_VERSION` (now 5) keeps a record written under one
+   *  instrument from being medianed against another's.
+   *
    *  ⚠️ **THE AXES CHANGED (#188, 2026-08-11): these are `cpu` and `shade`, not `fill` and `draw`.**
    *  A persisted sample is a reading of a SPECIFIC quantity, so renaming the fields is not cosmetic
    *  — `CLASSIFIER_VERSION` is part of the fingerprint precisely so a record written under the old
    *  pair can never be medianed against one written under the new. Spelled out here rather than
    *  imported as `ProbeReading` for the same L0 reason as `deviceClass` above.
    */
-  samples: { cpuUnitsPerMs: number; shadeMfragPerMs: number }[];
+  samples: { cpuUnitsPerMs: number; shadeMfragPerMs: number; fillMpxPerMs: number }[];
   /** Settled — later launches must NOT probe again. While false the device pays one probe per
    *  launch until it settles, which is the cost of the owner's "refine across launches" choice:
    *  no launch pays more than one probe, but the first few launches each pay one. */

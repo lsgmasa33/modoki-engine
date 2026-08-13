@@ -640,6 +640,54 @@ project could only pin *which row it got*, never say what a row meant — so pos
   written before a field existed cannot have meant to clamp it, and `Math.min(3, undefined)` is
   `NaN`, i.e. a backing buffer of `NaN` pixels, silently.
 
+#### A project with no 3D surface resolves a tier too (#203)
+
+⭐ **Until 2026-08-13 it did not, and every tier field on three projects was inert.**
+`resolveActiveTier` ran from exactly one call site — `makeWebGPURenderer` — so `games/chess` and
+`games/audio-demo` (`disable3D: true`) and `games/space-invader` (`build.modules.render3d: false`)
+built no renderer, resolved no tier, and left `getActiveQualityTier()` null for the process
+lifetime with `getActiveTierOverrides()` returning the unclamped default. All three were seeded
+with a full `rendering.three.tiers` config; nothing errored, the Inspector showed every field, and
+none of it did anything. #202 made it consequential by giving a tier the 2D DPR cap and the frame
+cap — the first two fields those projects would have benefited from.
+
+**It had a second half the issue never recorded, and it is the worse one**: `tickTierCalibration`
+is called from `Scene3D.tsx` and nowhere else, so a 2D project had no live calibration in *either*
+direction. It could not be demoted when it dropped frames and could not be promoted when it turned
+out to have headroom. Resolving a tier at boot without fixing that would buy a first guess with no
+way to correct it.
+
+Both halves now live in **`tierBoot.ts`**, called from the app shell's boot sequence when no
+`Scene3D` will mount:
+
+- the decision itself moved out of `scene3DSync` into **`tierResolve.ts`**, which imports no
+  `three/webgpu` — that import is exactly what `render3d: false` dead-code-eliminates, and pulling
+  it back through the tier resolver would re-break the projects this exists for, silently, visible
+  only as a bundle ~173 KB larger. A 3D project still resolves inside `makeWebGPURenderer`, because
+  `antialias` is a renderer constructor option a later decision cannot apply;
+- the calibration loop registers a frame callback at `PRIORITY_RENDER_2D`.
+
+⚠️ The condition is **`!Scene3D || config.disable3D`, and the first half is the one a config check
+misses.** `space-invader` sets `build.modules.render3d: false`, which nulls `Scene3D` at build time
+while `disable3D` stays unset — so a test on the flag alone would leave the playable-ad project,
+the one with the tightest budget in the repo, exactly as unclassified as before.
+
+⚠️ **The probe runs its 2D shape there — `fill` + `cpu`, not `shade` + `cpu`** (owner,
+2026-08-13). A 2D project's only tier-controlled GPU knob is `pixiPixelRatioCap`, which is purely
+fill-rate bound, so `shade` would be pricing IBL and shadow taps the project will never issue and
+charging the launch for it. `ProbeMeasurement.axes` carries which shape ran, explicitly rather than
+inferred from which reading is present — "`shade` is undefined so it was 2D" is true today and
+silently wrong the first time a 3D probe's heavy program fails to compile, which is a supported
+degrade path.
+
+⚠️ **`PROBE_THRESHOLDS_2D` ships NULL**, exactly as the 3D pair shipped null, and that is the
+honest state rather than a gap. There is no number to inherit: the 3D figures were measured through
+a Three renderer, and the fill axis has never had a boundary drawn on it at all. In practice a
+recognised device answers from `gpuIdentity` in ~0 ms and never reaches the probe; an unrecognised
+one classifies `unknown`, exactly as it does today; and every launch now logs `fill` in comparable
+Mpx/ms, which is the measurement a boundary has to come from. Four devices on a 2D project, three
+wiped launches each, is what fills it in.
+
 #### The 2D layer and the frame cap (#202)
 
 A tier used to clamp **three Three.js knobs and nothing else**. `qualityTier.ts` contained zero
@@ -682,7 +730,7 @@ case: it authors `pixi.pixelRatioCap: 3`. And `targetFps` reached the frame driv
   overrule a pin.
 
 ⚠️ **THE TRAP THAT ALMOST SHIPPED: `setActiveQualityTier` RECORDS a tier, it APPLIES nothing.** The
-tier a device actually ships with is published by `scene3DSync.resolveActiveTierOnce` calling it
+tier a device actually ships with is published by `tierResolve.resolveActiveTierOnce` calling it
 **directly** — that path never goes through `applyQualityTier`, which runs only on a live
 promote/demote and on a player's menu choice. Three survived that only because
 `makeWebGPURenderer` re-reads `getEffectiveThreeSettings()` on the very next line after awaiting
@@ -693,10 +741,11 @@ device takes and never leaves. Both publish points now call one `applyActiveTier
 (`setTargetFPS` + `forceResizeAllSurfaces`). `Canvas2DMount` was already on that bus and re-reads
 its settings on every run, so the broadcast *is* the whole of "apply the new 2D cap".
 
-⚠️ **A PROJECT WITH NO 3D RESOLVES NO TIER AT ALL.** `resolveActiveTier` runs from exactly one
-place — `makeWebGPURenderer` — so if `Scene3D` never mounts, nothing ever builds a renderer and
-`getActiveQualityTier()` stays `null` for the process lifetime. Every tier field is inert there:
-the 3D ones equally, and always have been; #202 only makes it consequential.
+✅ **A PROJECT WITH NO 3D USED TO RESOLVE NO TIER AT ALL — FIXED 2026-08-13 (#203).** The history
+is worth keeping, because the shape recurs: `resolveActiveTier` ran from exactly one place,
+`makeWebGPURenderer`, so if `Scene3D` never mounted nothing built a renderer and
+`getActiveQualityTier()` stayed `null` for the process lifetime, with every tier field inert — the
+3D ones equally, and always had been. #202 only made it consequential.
 
 **Two independent routes reach that state, and missing the second is easy** — the first close-out
 of #202 named only `disable3D` and was wrong about the blast radius:
@@ -707,12 +756,14 @@ of #202 named only `disable3D` and was wrong about the blast radius:
 | `build.modules.render3d: false` | `Scene3D` is `null` at module scope (`__MODOKI_MODULE_RENDER3D__`) | `games/space-invader` |
 
 A 2D project that does neither (`games/court`, `games/text_demo`, `demos/2d-physics-demo`) mounts
-Scene3D, resolves normally, and gets the full clamp — verified live on court. Tracked on **#203**;
-fixing it means resolving a tier outside the 3D renderer's bring-up, and neither option is free
-(on Android the only classifier is the ramp probe, which *builds a Three renderer* — so a 2D-only
-project either pays a launch-blocking probe it has no other use for, or falls through to
-`calibrating` → `low` and goes from unclamped to clamped on every mobile device). An owner call,
-not a refactor.
+Scene3D and always resolved normally — verified live on court.
+
+⚠️ **The fork that made this expensive is gone, and it is worth saying why rather than just that
+it is fixed.** The blocker was that on Android the only classifier *built a Three renderer*, so a
+2D project had to choose between a launch-blocking probe it had no use for and falling through to
+`low` on every mobile device. #210 gave recognised hardware a ~0 ms string lookup, and
+`rampWorkloadGL` moved the probe off Three entirely — so neither horn of the fork survived. See
+"A project with no 3D surface resolves a tier too" above for what replaced it.
 
 ⚠️ **THE 2D `antialias` DOES NOT MERELY "CATCH UP LATER" — IT USUALLY MISSES THE FIRST SLOT.** Both
 `antialias` fields are constructor options, but the two layers are not equally protected:
@@ -895,8 +946,16 @@ Why this replaced the probe as the primary classifier (all measured 2026-08-12, 
 - the probe **measures the boot, not the device** — the same Galaxy S22 reads `cpu` 11.2k on
   `sling` and 37.4k on `3d-physics-demo`, because the ramp runs while GLBs parse and textures
   upload;
-- its top axis is **flat where the top boundary is** — `shade` reads 0.20 / 0.21 / 0.20 for an
-  iPhone 8, an S22 and an iPhone Air, so **no Android device ever reached `capable`**;
+- its top axis **was flat where the top boundary is** — `shade` read 0.20 / 0.21 / 0.20 for an
+  iPhone 8, an S22 and an iPhone Air, so **no Android device ever reached `capable`**.
+  ⭐ **FIXED 2026-08-13, and the cause was not the axis.** The probe was measuring flagships at
+  IDLE CLOCKS: running the same ramp twice in one launch, a Galaxy S22 goes 7.49 → 19.92 while a
+  Galaxy A23 moves only 12.13 → 15.61, and on the second pass the S22 finally ranks above the A23.
+  Each GPU ramp now discards a warm-up pass, the shade axis is monotone across the three Androids
+  (0.04 / 0.14 / 0.18), and **the S22 classifies `capable`**. Two other explanations were tested on
+  hardware and refuted first — the GPU-clock latency floor (raising the ramp's start load moved
+  nothing) and the per-submit clear (the S22's buffer is the *smaller* of the two). This does not
+  make the probe primary again: identity still answers first, in ~0 ms, for recognised hardware;
 - it needs **three launches to settle**, so the verdict is wrong on launches 1 and 2 — the ones a
   first impression is made on;
 - it **blocks launch 0.5–2.6 s**.
@@ -905,7 +964,7 @@ Why this replaced the probe as the primary classifier (all measured 2026-08-12, 
 
 | layer | answers | source | stale-proof? |
 |---|---|---|---|
-| **table** — 84 Android GPUs, vendored in `gpuBenchmarks.ts` | hardware we have data on; most entries sit at the bottom of the range, so the decision that can black-screen a phone is made where the data is densest | `'gpu-benchmark'` | **CC BY 4.0**, first-party from Kishonti |
+| **table** — 132 Android GPUs, vendored in `gpuBenchmarks.ts` | hardware we have data on; most entries sit at the bottom of the range, so the decision that can black-screen a phone is made where the data is densest | `'gpu-benchmark'` | **CC BY 4.0**, first-party from Kishonti |
 | **generation floor** — parsed from the renderer string | hardware the data can NEVER cover: `Adreno 8xx`, `Immortalis-G9xx`, `Xclipse 9xx` | `'gpu-generation'` | ✅ never stale |
 
 ⭐ **The table comes from Kishonti's own open-sourced GFXBench results** (CC BY 4.0, © 2005–2025
@@ -933,12 +992,36 @@ and `high` was unreachable for any Android device. `source: 'gpu-benchmark'` is 
 probe was skipped: only the `cheap.source !== 'calibrating'` early return can produce it.
 ⚠️ The Y6 leg is NOT a fresh observation — it cannot install against `androidMinSdk: 31`.
 
+⭐ **Every GPU with at least one submission gets a row, and thin rows are ROUNDED DOWN near a
+boundary** (2026-08-13). The generator dropped GPUs with fewer than three submissions until then,
+on the argument that "a median of two is just their mean" — true as statistics, and answering the
+wrong question: this table does not publish an fps, it picks one of three coarse bands. Bootstrapped
+over the source CSV itself (every individual submission against its own GPU's full-population
+median, GPUs with n ≥ 8, 3,266 submissions), **a single submission lands in a different band only
+0.7% of the time**, and the error is skewed ~100× toward the safe direction — 2.87% read below half
+the truth, 0.03% read above 3× it.
+
+The gate is now 1, which takes the table from **84 GPUs to 132**. The additions are the high-volume
+budget and midrange silicon that previously had no row at all — Adreno 610/612/615/616/619/620/644,
+Mali-G31/G51/G52 MC1/G57/G57 MC3/G72 MP3/G76 MC4/G610 MC6, Xclipse 940, Mali-G925-Immortalis MC12.
+The risk is paid for at the consumer instead: a row with fewer than `CONFIDENT_SAMPLES` (3, i.e. the
+old gate — so nothing that shipped before changes tier) that sits within `LOW_CONFIDENCE_MARGIN`
+(1.2×) above a floor is **rounded down one band**, and its `reason` says so. Today that demotes
+exactly four rows: Adreno 615/616 and Intel Skylake GT1 over the `mid` floor, Adreno 644 over
+`high`. Rounding is **downward only** — a thin row just below a floor is already on the safe side.
+
+⚠️ **The comparison is not "table against truth", it is "table against what happens instead".** An
+absent row falls through to the boot probe, which was measured missing by a full band on the S22 and
+reading its deciding `shade` axis 1.6–3× low on both Android phones. 0.7% is an improvement on that.
+
 ⚠️ **The band floors are not a frame budget.** The table's numbers are a GFXBench-derived
-*relative ranking*. `HIGH_FLOOR_FPS = 80` is read off a **genuinely empty interval** (nothing in
-the table reads 71–89), and a test fails if a regeneration ever closes that gap.
-The floors are **`MID_FLOOR_FPS = 29`** and **`HIGH_FLOOR_FPS = 85`**, each placed at the widest
+*relative ranking*. The floors are **`MID_FLOOR_FPS = 29`** and **`HIGH_FLOOR_FPS = 85`**, each placed at the widest
 gap in its corridor (27.86→29.99 and 77.24→91.02), with no entry sitting exactly on either — a
 property a test pins, because an earlier floor landed exactly on two budget parts and promoted them.
+⚠️ That gap test reads the **confident** rows only, and it has to: softening the sample gate put
+`adreno644` (90.3, n=1) inside the `high` gap, and it is demoted for exactly that reason. The floors
+stay placed by the data they were derived from. The guard did its job — it failed on the
+regeneration rather than letting a data-placed boundary quietly become an arbitrary one.
 
 ⚠️ **Neither sits in a large void, and the previous table's void was an ARTIFACT.** That table had a
 conspicuous empty interval at 71–89 which this doc once cited as "decided by the data". It was the

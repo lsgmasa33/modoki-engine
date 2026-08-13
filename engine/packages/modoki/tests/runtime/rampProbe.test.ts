@@ -11,7 +11,7 @@ import {
   startRamp, rampNextLoad, recordRampFrame, readRamp, estimateIntervalMs, classifyDevice,
   ESCAPE_MULTIPLE, ESCAPE_PRIOR_MULTIPLE, ABORT_FRAME_MS, RAMP_BOUNDS, PROBE_THRESHOLDS, probeFingerprint, fillMegapixelsPerMs,
   shadeMegaFragmentsPerMs,
-  refineProbeVerdict, PROBE_SAMPLE_TARGET, readingOf,
+  refineProbeVerdict, PROBE_SAMPLE_TARGET, readingOf, classifyReading, PROBE_THRESHOLDS_2D,
   type RampKind, type RampState, type RampReading, type ProbeMeasurement, type ProbeReading,
 } from '../../src/runtime/rendering/rampProbe';
 
@@ -55,7 +55,7 @@ const measurementFixture = (
   draw: RampReading,
   extra?: { shade?: RampReading; cpu?: RampReading; shadeRegionPixels?: number },
 ): ProbeMeasurement => ({
-  intervalMs: 16.7, clockKind: 'webgpu', fill, draw,
+  intervalMs: 16.7, clockKind: 'webgpu', axes: '3d', fill, draw,
   totalMs: 280, rendererMs: 60, compileMs: 18, shadeCompileMs: 0,
   bufferPixels: 1_000_000, shadeRegionPixels: extra?.shadeRegionPixels ?? 0,
   ...(extra?.shade ? { shade: extra.shade } : {}),
@@ -386,7 +386,7 @@ describe('fillMegapixelsPerMs — the ramp\'s raw fill number is NOT comparable 
     kind: 'fill', status: 'escaped', unitsPerMs, bound: 'measured', peakLoad: 32, steps: [],
   });
   const m = (fillUnits: number, bufferPixels: number): ProbeMeasurement => ({
-    intervalMs: INTERVAL, clockKind: 'webgpu', fill: reading(fillUnits),
+    intervalMs: INTERVAL, clockKind: 'webgpu', axes: '2d', fill: reading(fillUnits),
     draw: { kind: 'draw', status: 'escaped', unitsPerMs: 50, bound: 'measured', peakLoad: 512, steps: [] },
     totalMs: 300, rendererMs: 10, compileMs: 3, shadeCompileMs: 0, bufferPixels, shadeRegionPixels: 0,
   });
@@ -402,7 +402,7 @@ describe('fillMegapixelsPerMs — the ramp\'s raw fill number is NOT comparable 
     // That is exactly backwards, and it would have set the thresholds off the wrong device.
     const phone = m(4, 500_000);
     const tablet = m(2, 3_500_000);
-    expect(phone.fill.unitsPerMs).toBeGreaterThan(tablet.fill.unitsPerMs);       // raw: phone wins
+    expect(phone.fill!.unitsPerMs).toBeGreaterThan(tablet.fill!.unitsPerMs);     // raw: phone wins
     expect(fillMegapixelsPerMs(tablet)).toBeGreaterThan(fillMegapixelsPerMs(phone)); // real: tablet
   });
 
@@ -502,7 +502,7 @@ describe('classifyDevice', () => {
     // discard coplanar overdraw before shading) and draw produced no reading on the two weakest
     // phones; these are the boundaries that replaced the old fill/draw pair. Reverting either to
     // null would silently stop every device from being classified at all.
-    expect(PROBE_THRESHOLDS.middle).toEqual({ cpuUnitsPerMs: 4_500, shadeMfragPerMs: 0.06 });
+    expect(PROBE_THRESHOLDS.middle).toEqual({ cpuUnitsPerMs: 2_500, shadeMfragPerMs: 0.06 });
     expect(PROBE_THRESHOLDS.capable).toEqual({ cpuUnitsPerMs: 14_500, shadeMfragPerMs: 0.165 });
   });
 
@@ -631,8 +631,17 @@ describe('classifyDevice ignores fill/draw — they are logged only, not classif
 });
 
 describe('readRamp rejects OUTLIER STEPS — the real tables that motivated it', () => {
-  /** Drive a shade ramp through an exact recorded step table. The shade ramp starts at 4 and
-   *  doubles, so a real log line's loads line up with what the state machine asks for. */
+  /** Load these recordings were CAPTURED at. Pinned, not inherited from `RAMP_BOUNDS`.
+   *
+   *  ⚠️ Every table below is an exact step sequence off a real phone at loads 4, 8, 16, … When the
+   *  production shade ramp moved its start to 32 (it was fitting through a GPU-clock latency
+   *  floor), inheriting the constant re-attached these frame times to loads that never produced
+   *  them and three tests went red. They are not stale: they are evidence about `readRamp`'s
+   *  FITTING behaviour, which does not depend on where the ramp begins. Re-recording them at 32
+   *  would discard three device sessions to prove nothing new. */
+  const RECORDED_AT_START_LOAD = 4;
+
+  /** Drive a shade ramp through an exact recorded step table, at the load it was recorded at. */
   function shadeRampOf(frameTimes: readonly number[]) {
     // 400 ms, matching `GPU_RAMP_BUDGET_MS` — these tables came off the GPU-CLOCK path, which
     // budgets in wall clock rather than in frames. With the presentation path's 150 ms the ramps
@@ -642,7 +651,7 @@ describe('readRamp rejects OUTLIER STEPS — the real tables that motivated it',
     // measure, so it feeds a nominal 16.7 — and the difference is not cosmetic here: the iPad's
     // `32:25` step clears a 25.00 pin and misses a 25.05 one, so at 1000/60 that ramp escapes a
     // step early and stops before the load-bearing steps this test is about.
-    let s = startRamp('shade', 16.7, 400);
+    let s = startRamp('shade', 16.7, 400, RECORDED_AT_START_LOAD);
     for (const ms of frameTimes) s = recordRampFrame(s, ms);
     return s;
   }
@@ -657,7 +666,7 @@ describe('readRamp rejects OUTLIER STEPS — the real tables that motivated it',
     // Trimmed, the fit runs 128:26.1 -> 512:49.9 and lands back among that device's real readings.
     expect(r.unitsPerMs / 100).toBeCloseTo(0.161, 3);
     // The number that matters is which side of the boundary it falls: 0.055 was weak, 0.161 is not.
-    expect(r.unitsPerMs / 100).toBeGreaterThan(PROBE_THRESHOLDS.middle!.shadeMfragPerMs);
+    expect(r.unitsPerMs / 100).toBeGreaterThan(PROBE_THRESHOLDS.middle!.shadeMfragPerMs!);
   });
 
   it('never starts the fit at the FIRST step — the A23 launch that read nothing at all', () => {
@@ -730,14 +739,14 @@ describe('readRamp rejects a TRANSIENT as the fit\'s start point (review 2026-08
   it('the SAME defect on the shade axis — a hitch at 32:35 must not overstate throughput', () => {
     // Baseline: 4:8 8:9 16:10 32:12 64:14 128:20 256:30 512:55 -> ~10.24 units/ms (both cases
     // fit 256:30 -> 512:55; the ladder up to there is all sub-pin floor).
-    let s = startRamp('shade', 16.7, 400);
+    let s = startRamp('shade', 16.7, 400, 4);   // ladder written at loads 4,8,16,… — see RECORDED_AT_START_LOAD
     for (const ms of [8, 9, 10, 12, 14, 20, 30, 55]) s = recordRampFrame(s, ms);
     expect(s.status).toBe('escaped');
     expect(readRamp(s).unitsPerMs).toBeCloseTo(10.24, 1);
 
     // Same ladder, 32:12 replaced by 32:35 (a hitch). Before the fix this read 24 (`find`-earliest
     // paired 32:35 with the final step: dLoad=480, dMs=20).
-    let hitched = startRamp('shade', 16.7, 400);
+    let hitched = startRamp('shade', 16.7, 400, 4);   // ladder written at loads 4,8,16,… — see RECORDED_AT_START_LOAD
     for (const ms of [8, 9, 10, 35, 14, 20, 30, 55]) hitched = recordRampFrame(hitched, ms);
     expect(hitched.status).toBe('escaped');
     expect(readRamp(hitched).unitsPerMs).toBeCloseTo(10.24, 1);
@@ -745,8 +754,11 @@ describe('readRamp rejects a TRANSIENT as the fit\'s start point (review 2026-08
 });
 
 describe('refining a verdict ACROSS LAUNCHES (#188)', () => {
+  // `fillMpxPerMs` is 0 throughout: these are the real 3D readings off the phones, taken before a
+  // 2D probe shape existed, and the 3D classifier does not read that axis. A fabricated value
+  // would be a number nobody measured sitting in the one fixture that exists because it is real.
   const r = (cpuUnitsPerMs: number, shadeMfragPerMs: number): ProbeReading =>
-    ({ cpuUnitsPerMs, shadeMfragPerMs });
+    ({ cpuUnitsPerMs, shadeMfragPerMs, fillMpxPerMs: 0 });
 
   /** REAL per-launch readings, native, three launches per device with the stored verdict wiped
    *  before each one (2026-08-11). Not illustrative — these are the numbers off the phones, and two
@@ -768,7 +780,7 @@ describe('refining a verdict ACROSS LAUNCHES (#188)', () => {
     const seen: string[] = [];
     for (const reading of readings) {
       if (state.final) break;                      // settled: a later launch must not probe again
-      const next = refineProbeVerdict(state.samples, reading);
+      const next = refineProbeVerdict(state.samples, reading, '3d');
       state = { samples: [...next.samples], final: next.final };
       seen.push(next.deviceClass);
     }
@@ -815,14 +827,14 @@ describe('refining a verdict ACROSS LAUNCHES (#188)', () => {
   it('never keeps more than the target number of samples', () => {
     let samples: ProbeReading[] = [];
     for (const reading of [...RUNS.a23, ...RUNS.a23]) {
-      samples = [...refineProbeVerdict(samples, reading).samples];
+      samples = [...refineProbeVerdict(samples, reading, '3d').samples];
     }
     expect(samples).toHaveLength(PROBE_SAMPLE_TARGET);
   });
 
   it('never settles while the thresholds are unset', () => {
     PROBE_THRESHOLDS.middle = null;
-    expect(refineProbeVerdict([], r(2_000, 0.02))).toMatchObject({ deviceClass: 'unknown', final: false });
+    expect(refineProbeVerdict([], r(2_000, 0.02), '3d')).toMatchObject({ deviceClass: 'unknown', final: false });
   });
 });
 
@@ -833,14 +845,14 @@ describe('the refinement policy does not trust its own inputs', () => {
     // "equal" — `sort` then leaves the array in INSERTION ORDER and `sorted[mid]` is not the
     // median at all. Measured before the guard: one NaN among three returned `weak` (safe by luck)
     // and stayed in the array to poison every later launch too.
-    const good = { cpuUnitsPerMs: 21_300, shadeMfragPerMs: 0.21 };
-    const r = refineProbeVerdict([good, { cpuUnitsPerMs: NaN, shadeMfragPerMs: NaN }], good);
+    const good = { cpuUnitsPerMs: 21_300, shadeMfragPerMs: 0.21, fillMpxPerMs: 0 };
+    const r = refineProbeVerdict([good, { cpuUnitsPerMs: NaN, shadeMfragPerMs: NaN, fillMpxPerMs: 0 }], good, '3d');
     expect(r.samples).toEqual([good, good]);
     expect(r.samples.every((s) => Number.isFinite(s.cpuUnitsPerMs))).toBe(true);
   });
 
   it('says so rather than guessing when nothing finite survives', () => {
-    const r = refineProbeVerdict([], { cpuUnitsPerMs: Number.NaN, shadeMfragPerMs: 1 });
+    const r = refineProbeVerdict([], { cpuUnitsPerMs: Number.NaN, shadeMfragPerMs: 1, fillMpxPerMs: 0 }, '3d');
     expect(r).toMatchObject({ deviceClass: 'unknown', final: false });
     expect(r.samples).toHaveLength(0);
   });
@@ -867,8 +879,8 @@ describe('the refinement policy does not trust its own inputs', () => {
     expect(slope).toEqual(floor);
     expect(slope).not.toHaveProperty('measured');
     // ⚠️ The property that replaced it: NEITHER can settle a device by itself, whichever it is.
-    expect(refineProbeVerdict([], slope).final).toBe(false);
-    expect(refineProbeVerdict([], floor).final).toBe(false);
+    expect(refineProbeVerdict([], slope, '3d').final).toBe(false);
+    expect(refineProbeVerdict([], floor, '3d').final).toBe(false);
   });
 
   it('reports the RAMP failure ahead of "thresholds unset" — the device-specific fact wins', () => {
@@ -913,5 +925,156 @@ describe('the effective frame interval is the GAME\'s, not the rAF cadence', () 
 
   it('falls back to the measurement when the cap is disabled', () => {
     expect(effective(8.4, 0)).toBeCloseTo(8.4, 1);
+  });
+});
+
+describe('⭐ the three devices the 2D bands were measured on (#203/#204, 2026-08-13)', () => {
+  // `games/space-invader` (render3d:false, so the probe ran with no Three in the process at all),
+  // debug build, `pm clear` before EVERY launch, three launches each. Medians below. These are the
+  // entire empirical basis for the 2D table — if one moves, the table is wrong, not the test.
+  const reading2D = (cpuK: number, fillMpx: number): ProbeReading =>
+    ({ cpuUnitsPerMs: cpuK * 1000, shadeMfragPerMs: 0, fillMpxPerMs: fillMpx });
+
+  it('ships with two MEASURED boundaries, not with nulls', () => {
+    // They shipped null for one day on purpose. Reverting either would silently stop classifying
+    // every unrecognised 2D device.
+    expect(PROBE_THRESHOLDS_2D.middle).toEqual({ cpuUnitsPerMs: 4_500, fillMpxPerMs: 1.68 });
+    expect(PROBE_THRESHOLDS_2D.capable).toEqual({ cpuUnitsPerMs: 4_500, fillMpxPerMs: 4.6 });
+  });
+
+  it('Huawei Y6 (PowerVR GE8300) — fill 1.02, cpu 2.0k — is weak', () => {
+    expect(classifyReading(reading2D(2.0, 1.02), '2d').deviceClass).toBe('weak');
+  });
+
+  it('⭐ Galaxy A23 (Mali-G57 MC2) — fill 2.77 — is middle, and specifically NOT capable', () => {
+    // The half that matters: 2.77 sits below the 4.6 capable floor, so the A23 does not get an
+    // unclamped 2D DPR. That is the decision #204 is about.
+    expect(classifyReading(reading2D(10.1, 2.77), '2d').deviceClass).toBe('middle');
+  });
+
+  it('⚠️ the middle FILL floor is load-bearing for a device none of the three anchors is', () => {
+    // Mutation exposed this: dropping the middle fill floor from 1.68 to 0.5 broke no device test,
+    // because all three anchors are decided by other comparisons (the Y6 fails the cpu floor
+    // outright). The floor exists for a device with adequate CPU and poor fill — a budget phone
+    // with a modern core and a weak GPU, which is most of the population this workstream is about.
+    // Without a case like this the floor could rot to any value and the suite would stay green.
+    expect(classifyReading(reading2D(10.0, 1.00), '2d').deviceClass).toBe('weak');
+    expect(classifyReading(reading2D(10.0, 2.00), '2d').deviceClass).toBe('middle');
+  });
+
+  it('Galaxy S22 (Adreno 730) — fill >= 7.69 — is capable, on a LOWER BOUND', () => {
+    // Its ramp never escaped (ceiling/lower), so the reading is "at least 7.69". Clearing a floor
+    // on a lower bound is sound; FAILING one on a lower bound would not have been.
+    expect(classifyReading(reading2D(13.9, 7.69), '2d').deviceClass).toBe('capable');
+  });
+
+  it('⚠️ the cpu axis cannot separate the A23 from the S22 — fill is what decides', () => {
+    // Their measured cpu ranges OVERLAP (A23 9.5-12.8k, S22 12.0-13.9k), which is why the capable
+    // row carries the same cpu floor as middle. Swap only the fill figures and the verdicts swap
+    // with them: the decision really is made on the axis the doc claims.
+    expect(classifyReading(reading2D(13.9, 2.77), '2d').deviceClass).toBe('middle');
+    expect(classifyReading(reading2D(10.1, 7.69), '2d').deviceClass).toBe('capable');
+  });
+
+  it('a 2D reading is NOT judged by the 3D table', () => {
+    // Different quantities in different units. Judging one by the other's floors is the "number
+    // from a different instrument" mistake this workstream has made twice.
+    const a23 = reading2D(10.1, 2.77);
+    expect(classifyReading(a23, '2d').deviceClass).toBe('middle');
+    expect(classifyReading(a23, '3d').deviceClass).toBe('weak');   // shade is 0 on a 2D probe
+  });
+});
+
+describe('⚠️ the INTERIM verdict must use the 2D table too (found on a Galaxy A23)', () => {
+  // Before three samples exist, `refineProbeVerdict` returns the LOWEST band seen so far — a
+  // deliberate "start low, climb as evidence accumulates". That interim path called
+  // `classifyReading` WITHOUT the axis, so it defaulted to the 3D table, where a 2D reading's
+  // `shadeMfragPerMs` is 0 by construction. Every 2D device therefore reported `weak` on launches
+  // 1 and 2 — the launches a first impression is made on, which is the owner's stated constraint.
+  const a23 = { cpuUnitsPerMs: 10_100, shadeMfragPerMs: 0, fillMpxPerMs: 2.77 };
+
+  it('a single A23-grade 2D reading refines to middle, not weak', () => {
+    const r = refineProbeVerdict([], a23, '2d');
+    expect(r.deviceClass).toBe('middle');
+    expect(r.final).toBe(false);        // still refining — the interim path, which is the buggy one
+  });
+
+  it('and the interim verdict AGREES with what classifyDevice says about the same reading', () => {
+    // The disagreement between these two is exactly what the device log showed:
+    // "weak — lowest of 1 launch(es) so far ... (this pass alone: middle)". They read the same
+    // numbers and must reach the same band.
+    expect(refineProbeVerdict([], a23, '2d').deviceClass).toBe(classifyReading(a23, '2d').deviceClass);
+  });
+
+  it('the conservative rule itself still holds — the lowest of two disagreeing launches wins', () => {
+    // Non-vacuity: the fix must not have turned "lowest so far" into "latest".
+    const weak = { cpuUnitsPerMs: 2_000, shadeMfragPerMs: 0, fillMpxPerMs: 1.02 };
+    expect(refineProbeVerdict([a23], weak, '2d').deviceClass).toBe('weak');
+    expect(refineProbeVerdict([weak], a23, '2d').deviceClass).toBe('weak');
+  });
+});
+
+describe('⚠️ a threshold missing its axis\'s GPU floor fails CLOSED (close-out 2026-08-13)', () => {
+  // `clears()` used `?? 0` and a comment claiming the type prevented a threshold with no GPU
+  // floor. It does not: both GPU fields must be optional, since a 2D row carries fillMpxPerMs and
+  // a 3D row shadeMfragPerMs. So `{ cpuUnitsPerMs: 4_500 }` type-checks, and `?? 0` turned the GPU
+  // comparison into "anything clears" — collapsing the decision to CPU alone, the classifier this
+  // file's own iPhone 7 derivation proves wrong.
+  const SHIPPED = { ...PROBE_THRESHOLDS_2D };
+  afterEach(() => { PROBE_THRESHOLDS_2D.middle = SHIPPED.middle; PROBE_THRESHOLDS_2D.capable = SHIPPED.capable; });
+
+  it('a GPU-floor-less threshold clears NOTHING rather than everything', () => {
+    PROBE_THRESHOLDS_2D.middle = { cpuUnitsPerMs: 4_500 };          // the forgetful edit
+    PROBE_THRESHOLDS_2D.capable = { cpuUnitsPerMs: 4_500 };
+    // An S22-grade reading: huge fill, ample cpu. Fail-open called this `capable`; fail-closed
+    // calls it `weak` — wrong, but loudly and in the safe direction.
+    const s22 = { cpuUnitsPerMs: 13_900, shadeMfragPerMs: 0, fillMpxPerMs: 7.69 };
+    expect(classifyReading(s22, '2d').deviceClass).toBe('weak');
+  });
+
+  it('⭐ and the SHIPPED tables each carry the floor their axis reads', () => {
+    // The guard that keeps the loud case off a device. Asserted per axis, because a 3D row
+    // carrying only fillMpxPerMs would satisfy a naive "has some GPU field" check and still
+    // decide nothing.
+    for (const [name, t] of Object.entries(PROBE_THRESHOLDS)) {
+      expect(t?.shadeMfragPerMs, `3D ${name} threshold has no shade floor`).toBeGreaterThan(0);
+    }
+    for (const [name, t] of Object.entries(PROBE_THRESHOLDS_2D)) {
+      expect(t?.fillMpxPerMs, `2D ${name} threshold has no fill floor`).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('⭐ the three devices the 3D bands were RE-ANCHORED on (v6 warm-up path, 2026-08-13)', () => {
+  // `games/sling`, shipped discarded-warm-up path, `pm clear` before every launch, three each.
+  // Medians. These replace nothing — the six v4 devices below still band identically — they are
+  // the evidence that the cpu floor had to move from 4,500 to 2,500.
+  const r3d = (cpuK: number, shade: number): ProbeReading =>
+    ({ cpuUnitsPerMs: cpuK * 1000, shadeMfragPerMs: shade, fillMpxPerMs: 0 });
+
+  it('Huawei Y6 — cpu 1.9k, shade 0.04 — weak', () => {
+    expect(classifyReading(r3d(1.9, 0.04), '3d').deviceClass).toBe('weak');
+  });
+
+  it('⭐ Galaxy A23 — cpu 3.5k, shade 0.14 — middle, which the 4,500 floor denied it', () => {
+    // The verdict the re-anchor exists for: a clean shade reading vetoed by the axis that is not
+    // deciding. At the old floor this device read `weak` on two launches of three.
+    expect(classifyReading(r3d(3.5, 0.14), '3d').deviceClass).toBe('middle');
+  });
+
+  it('⭐⭐ Galaxy S22 — cpu 17.0k, shade 0.18 — CAPABLE, a band this file twice called unreachable', () => {
+    // Before the warm-up pass this phone measured 0.07-0.08 shade and could not clear 0.165 on any
+    // instrument. The hardware never changed; it was being measured at idle clocks.
+    expect(classifyReading(r3d(17.0, 0.18), '3d').deviceClass).toBe('capable');
+  });
+
+  it('and the shade axis is MONOTONE across the three — 0.04 < 0.14 < 0.18', () => {
+    // The property that was false in every previous session: the S22 ranked BELOW the A23.
+    // ⚠️ Two literal-vs-literal assertions lived here (`expect(0.04).toBeLessThan(0.14)`) and were
+    // removed in close-out: they compared constants to each other, could not fail whatever the code
+    // did, and read as coverage. The band sequence below is the assertion that can.
+    const bands = [r3d(1.9, 0.04), r3d(3.5, 0.14), r3d(17.0, 0.18)]
+      .map((x) => classifyReading(x, '3d').deviceClass);
+    expect(bands).toEqual(['weak', 'middle', 'capable']);
   });
 });

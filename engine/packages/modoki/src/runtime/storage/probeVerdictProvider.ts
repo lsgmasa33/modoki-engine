@@ -38,7 +38,14 @@ type SampleKey = keyof CachedProbeVerdict['samples'][number];
  *  runtime shape is deliberately untyped. Paired with a write→read round-trip test
  *  (`tests/storage/probeVerdictProvider.test.ts`), because a compile-time guard cannot prove the
  *  two halves actually agree at runtime. */
-const SAMPLE_KEY_SET: Record<SampleKey, true> = { cpuUnitsPerMs: true, shadeMfragPerMs: true };
+// ⭐ And it EARNED ITS KEEP AGAIN on 2026-08-13: adding `fillMpxPerMs` for the 2D probe (#203)
+// failed this file to build, which is the whole design working. Without it the new field would
+// have been written by every 2D launch and silently dropped by every read, so a 2D device could
+// never accumulate the samples its verdict needs to settle — the same dead cache as before, in a
+// mechanism whose entire point is to settle within three launches.
+const SAMPLE_KEY_SET: Record<SampleKey, true> = {
+  cpuUnitsPerMs: true, shadeMfragPerMs: true, fillMpxPerMs: true,
+};
 const SAMPLE_KEYS = Object.keys(SAMPLE_KEY_SET) as readonly SampleKey[];
 
 probeVerdictStore.provide({

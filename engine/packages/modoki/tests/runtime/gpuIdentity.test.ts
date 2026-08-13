@@ -9,8 +9,22 @@ import { describe, it, expect } from 'vitest';
 import {
   normalizeGpuKey, parseGpuKey, gpuIdentityTier, tierForBenchmarkFps,
   gpuGenerationFloors, MID_FLOOR_FPS, HIGH_FLOOR_FPS,
+  CONFIDENT_SAMPLES, LOW_CONFIDENCE_MARGIN,
 } from '../../src/runtime/rendering/gpuIdentity';
-import { GPU_BENCHMARK_FPS } from '../../src/runtime/rendering/gpuBenchmarks';
+import { GPU_BENCHMARK_FPS, GPU_BENCHMARK_SAMPLES } from '../../src/runtime/rendering/gpuBenchmarks';
+
+/** The readings the band floors were DERIVED from — rows with enough submissions to be taken at
+ *  face value ({@link CONFIDENT_SAMPLES}).
+ *
+ *  ⚠️ **The gap tests below must use this, not every value in the table, and the reason is the
+ *  whole point of the sample gate softening (2026-08-13).** Dropping the gate from 3 to 1 added 48
+ *  rows, four of which land inside the floors' gaps — and those four are demoted by the
+ *  low-confidence rule precisely BECAUSE they land there. Asserting the gaps over the raw values
+ *  would fail on rows whose values the resolver deliberately does not believe. */
+const confidentFps = (): number[] =>
+  Object.entries(GPU_BENCHMARK_FPS)
+    .filter(([key]) => (GPU_BENCHMARK_SAMPLES[key] ?? 0) >= CONFIDENT_SAMPLES)
+    .map(([, fps]) => fps);
 
 describe('normalizeGpuKey', () => {
   it('unwraps the ANGLE form Android Chrome actually reports', () => {
@@ -72,11 +86,16 @@ describe('band floors', () => {
     expect(tierForBenchmarkFps(MID_FLOOR_FPS - 1)).toBe('low');
   });
 
-  it('the high floor still sits in an EMPTY interval of the table', () => {
+  it('the high floor still sits in an EMPTY interval of the CONFIDENT table', () => {
     // 85 sits in the widest gap of the A23..S22 corridor — 77.24 (`adreno630`) to 91.02
     // (`adreno640`), with nothing between. Regenerating the table could close that gap and
     // silently turn a data-placed boundary into an arbitrary one; this fails when that happens.
-    const inGap = Object.values(GPU_BENCHMARK_FPS).filter((f) => f > 77.241 && f < 91.023);
+    //
+    // ⚠️ It DID happen, and the guard worked: softening the sample gate added `adreno644` at
+    // 90.273, inside this gap. It is a single submission, so the low-confidence rule rounds it to
+    // `mid` — see the rule's own tests below. The floor is still placed by the data it was
+    // derived from, which is what this asserts.
+    const inGap = confidentFps().filter((f) => f > 77.241 && f < 91.023);
     expect(inGap).toEqual([]);
     expect(HIGH_FLOOR_FPS).toBeGreaterThan(77.241);
     expect(HIGH_FLOOR_FPS).toBeLessThan(91.023);
@@ -87,11 +106,13 @@ describe('band floors', () => {
     // promoted them to `mid` — IBL, shadows, DPR 1.5 — on the thinnest evidence in the table, in
     // the direction that costs a GPU context (#156). 29 sits in the empty 27.86-29.99 interval,
     // and the last assertion keeps it off any entry exactly.
-    const inGap = Object.values(GPU_BENCHMARK_FPS).filter((f) => f > 27.864 && f < 29.992);
+    const inGap = confidentFps().filter((f) => f > 27.864 && f < 29.992);
     expect(inGap).toEqual([]);
     expect(MID_FLOOR_FPS).toBeGreaterThan(27.864);
     expect(MID_FLOOR_FPS).toBeLessThan(29.992);
-    // A boundary that any entry sits exactly on is one rounding away from flipping.
+    // A boundary that any entry sits exactly on is one rounding away from flipping. Asserted over
+    // the WHOLE table, thin rows included: an exact hit is a coincidence worth knowing about
+    // whatever the row's confidence, and the low-confidence rule rounds down rather than away.
     expect(Object.values(GPU_BENCHMARK_FPS)).not.toContain(MID_FLOOR_FPS);
   });
 
@@ -101,6 +122,71 @@ describe('band floors', () => {
     expect(gpuIdentityTier('Adreno (TM) 512')?.tier).toBe('low');   // Snapdragon 625, budget
     expect(gpuIdentityTier('Mali-G52 MC2')?.tier).toBe('low');      // entry-level
     expect(gpuIdentityTier('Adreno (TM) 530')?.tier).toBe('mid');   // Snapdragon 820, flagship
+  });
+});
+
+describe('⚠️ thin rows — the price of softening the sample gate from 3 to 1', () => {
+  // The gate softened on 2026-08-13 (84 rows -> 132) because the measured band-flip rate of a
+  // single submission is 0.7%, and because the alternative to a row is the boot probe, which was
+  // measured missing by a FULL BAND on a Galaxy S22. This rule is where that risk is paid for.
+
+  it('takes a thin row at face value when it clears the floor by the margin', () => {
+    // Adreno 619 (47.5, n=1) is nowhere near 29 — one submission is fine when the answer is not
+    // close. If this ever demotes, the rule has stopped being a boundary rule.
+    expect(gpuIdentityTier('Adreno (TM) 619')?.tier).toBe('mid');
+    expect(gpuIdentityTier('Mali-G610 MC6')?.tier).toBe('high');   // 160.9, n=1
+  });
+
+  it('⭐ rounds a thin row DOWN when it only just clears a floor', () => {
+    // The four rows in today's table that are both thin AND boundary-adjacent. Each would have
+    // shipped a band higher on one or two submissions.
+    expect(gpuIdentityTier('Adreno (TM) 644')?.tier).toBe('mid');  // 90.3, n=1, high floor 85
+    expect(gpuIdentityTier('Adreno (TM) 615')?.tier).toBe('low');  // 29.4, n=2, mid floor 29
+    expect(gpuIdentityTier('Adreno (TM) 616')?.tier).toBe('low');  // 32.4, n=2
+  });
+
+  it('says WHY in the reason, because the two numbers otherwise read as a bug', () => {
+    // 90.3 against a documented floor of 85 resolving `mid` is exactly the shape of thing a
+    // reader files a bug about. `diagnose` is the surface that has to answer for it.
+    const v = gpuIdentityTier('Adreno (TM) 644');
+    expect(v?.reason).toContain('1 submission');
+    expect(v?.reason).toContain('rounded DOWN');
+    // ...and a confident row says nothing extra, so the note means something when it appears.
+    expect(gpuIdentityTier('Adreno (TM) 730')?.reason).not.toContain('submission');
+  });
+
+  it('rounds DOWN only — a thin row just BELOW a floor is left where it is', () => {
+    // Promoting on thin evidence is the direction that ends in a lost GPU context (#156). A row
+    // sitting under a floor is already on the safe side and must not be nudged across it.
+    expect(tierForBenchmarkFps(MID_FLOOR_FPS - 0.1, 1)).toBe('low');
+    expect(tierForBenchmarkFps(HIGH_FLOOR_FPS - 0.1, 1)).toBe('mid');
+  });
+
+  it('leaves every CONFIDENT row exactly where it was before the gate softened', () => {
+    // The compatibility claim the value of CONFIDENT_SAMPLES rests on: it is the OLD gate, so a
+    // row the previous table shipped is judged identically. Nothing that shipped changes tier.
+    for (const [key, fps] of Object.entries(GPU_BENCHMARK_FPS)) {
+      if ((GPU_BENCHMARK_SAMPLES[key] ?? 0) < CONFIDENT_SAMPLES) continue;
+      expect(tierForBenchmarkFps(fps, GPU_BENCHMARK_SAMPLES[key]), key).toBe(tierForBenchmarkFps(fps));
+    }
+  });
+
+  it('⚠️ demotes only a HANDFUL of rows — a regeneration that demotes wholesale is a red flag', () => {
+    // Non-vacuity in both directions. If a future source produced mostly thin rows, this rule
+    // would quietly become "everything is one band lower", which is a different policy than the
+    // one that was argued for. Four today; the ceiling is deliberately loose, the point is order
+    // of magnitude.
+    const demoted = Object.entries(GPU_BENCHMARK_FPS).filter(([key, fps]) =>
+      tierForBenchmarkFps(fps, GPU_BENCHMARK_SAMPLES[key]) !== tierForBenchmarkFps(fps));
+    expect(demoted.length).toBeGreaterThan(0);
+    expect(demoted.length).toBeLessThan(15);
+  });
+
+  it('the margin and the confidence gate are the values the derivation names', () => {
+    // Both are quoted by number in gen-gpu-benchmarks.mjs's justification and in rendering.md.
+    // Changing one without the other leaves the prose lying.
+    expect(CONFIDENT_SAMPLES).toBe(3);
+    expect(LOW_CONFIDENCE_MARGIN).toBe(1.2);
   });
 });
 

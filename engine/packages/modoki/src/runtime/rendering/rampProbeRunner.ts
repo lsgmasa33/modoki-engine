@@ -39,16 +39,23 @@
  *  at a small buffer can still be asked whether it affords a large one. Measuring big was never
  *  necessary — only measuring in KNOWN units was. */
 
-import * as THREE from 'three/webgpu';
-import type { WebGPURenderer } from 'three/webgpu';
-import { makeHeavyShadeAssets, type HeavyShadeAssets } from './probeHeavyShader';
+// ⚠️ PLAIN `three`, NOT `three/webgpu` — and the distinction is the whole of #203.
+//
+// `three/webgpu` is dead-code-eliminated by `build.modules.render3d: false`, so importing it here
+// made the probe unrunnable on precisely the projects that had no other classifier. `three`'s core
+// MATH is a different matter: `runtime/core/ecs/transformPropagationSystem.ts` imports it in every
+// project, 2D ones included, so the CPU ramp below costs a 2D bundle nothing AND stays faithful to
+// the code it models. The rendering half now goes through `rampWorkloadGL`, which needs no Three
+// at all.
+import * as THREE from 'three';
 import { rawNow } from '../core/clock';
 import { targetFPS } from './frameDriver';
-import { makeGpuClock, type GpuClock } from './gpuClock';
+import { type GpuClock } from './gpuClock';
+import { createGlProbeSurface, type RampWorkload } from './rampWorkloadGL';
 import {
   startRamp, rampNextLoad, recordRampFrame, readRamp, estimateIntervalMs,
   RAMP_BOUNDS, PROBE_BUDGET_MS, ESCAPE_MULTIPLE, ABORT_FRAME_MS,
-  type ProbeClockKind, type ProbeMeasurement, type RampKind, type RampReading,
+  type ProbeAxes, type ProbeClockKind, type ProbeMeasurement, type RampKind, type RampReading,
 } from './rampProbe';
 
 /** Frames rendered at a trivial load before any ramp, to (a) settle the pipeline and (b) measure
@@ -77,6 +84,62 @@ const WARMUP_FRAMES = 8;
  *  The ramps budget themselves separately; this is only the outer guard that stops a pathological
  *  device turning a blocking probe into a hang. */
 const HARD_DEADLINE_MS = PROBE_BUDGET_MS * 3;
+
+/** Ceiling on the WHOLE probe — every phase, summed — measured from the moment it starts, ms.
+ *
+ *  ⚠️ **EVERY PIECE WAS BOUNDED AND THE SUM WAS NOT, WHICH IS NOT THE SAME THING.**
+ *  {@link HARD_DEADLINE_MS} is 900 ms and reads like an outer guard, but it was recomputed
+ *  FRESH at each use (`rawNow() + HARD_DEADLINE_MS`, once for the cpu ramp and once per GPU ramp),
+ *  so it bounded each phase against its own start rather than the probe against its. The GPU
+ *  warm-up loop had no deadline at all, and each `awaitCompletion()` is bounded only by the clock's
+ *  own 2 s completion timeout. Worst case: 900 + 3 x 2000 + 900 = 7.8 s of blocked launch, with
+ *  nothing capping the total.
+ *
+ *  ⭐ **MEASURED, on a Galaxy A23 running `games/space-invader`: a 4416 ms launch**, against
+ *  277-480 ms across nine other wiped launches on the same build and device. Its ramp steps summed
+ *  to ~250 ms, so the time was NOT in the measurement — it was in the waits around it, which is
+ *  exactly the shape this constant now bounds. Rare (roughly 1 in 10) and therefore the kind of
+ *  thing that ships: a 4.4 s hang on a launch is worse for a player than any tier being one band
+ *  wrong, and it would never show up in a five-launch test.
+ *
+ *  The value is a compromise stated rather than assumed. It has to be generous enough
+ *  that the SLOWEST device still completes a legitimate measurement — the Huawei Y6 is the device
+ *  this whole workstream exists for and it must not be truncated into a worse verdict — while being
+ *  far below the ~6 s the owner set as the outside limit for the probe as a whole. Typical runs
+ *  measure 232-480 ms, so this is ~5x headroom over the normal case and still cuts the pathological
+ *  one by more than half. */
+// ⚠️ RAISED 2500 -> 3200 for the discarded warm-up pass below. A Huawei Y6 measured ~2.1 s with a
+// single pass, so the old ceiling would have truncated the measured pass on exactly the device
+// that must not be truncated. The warm-up carries the smaller `GPU_RAMP_BUDGET_MS` rather than the
+// full phase budget, so a slow device spends most of the extra on the pass that counts.
+const PROBE_TOTAL_BUDGET_MS = 3_200;
+
+/** Await the GPU clock, but never past `deadline`.
+ *
+ *  ⚠️ **THE BOUND HAS TO LIVE AT THE WAIT, and this module has learned that once already** — see
+ *  `nextFrame`, where a 5 s timeout was added because "`HARD_DEADLINE_MS` is checked AFTER a frame
+ *  arrives, so a ramp waiting on a frame that never comes cannot consult it". The identical hole
+ *  existed on the clock path: a deadline check between iterations cannot shorten a single
+ *  2 s fence wait, and three of those in the warm-up loop is most of a pathological launch.
+ *
+ *  ⚠️ Racing does not CANCEL the underlying poll — `gpuClock`'s fence loop keeps running until its
+ *  own timeout. That is acceptable and bounded (it self-terminates within 2 s, and the probe's GL
+ *  surface is disposed in a `finally` regardless), but it is a leak of work rather than of memory
+ *  and is worth knowing when reading a log where a late fence result appears after the verdict.
+ *
+ *  Resolving `null` on expiry deliberately reuses the "clock failed" path the callers already
+ *  handle, rather than introducing a third outcome they would each have to learn about. */
+async function awaitClockWithin(clock: GpuClock, deadline: number): Promise<number | null> {
+  const remaining = deadline - rawNow();
+  if (remaining <= 0) return null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expiry = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), remaining); });
+  try {
+    return await Promise.race([clock.awaitCompletion(), expiry]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** Hard cap on the probe's drawing buffer, in pixels (~1.05 MP — roughly 1080x970).
  *
@@ -131,35 +194,6 @@ const GPU_NOMINAL_INTERVAL_MS = 16.7;
  *  statement about a device whose first step already costs more than a whole frame. */
 const GPU_RAMP_BUDGET_MS = 400;
 
-/** Ceiling on the HEAVY shader's compile, ms. See its call site for why it is bounded at all. */
-const SHADE_COMPILE_TIMEOUT_MS = 3_000;
-
-/** Ceiling on THROWAWAY renderer creation, ms (#205 R5.3).
- *
- *  `makeWebGPURenderer` is awaited before the real renderer is ever built, and until it settles
- *  `runBootRampProbe` cannot return — so an unbounded await here does not just lose the probe, it
- *  blocks `Scene3D.bringUp` forever, and `bringUp`'s only failure handling is a `.catch(...)` that
- *  a PENDING promise never reaches. The observable failure is a permanently blank 3D surface with
- *  no error anywhere.
- *
- *  Generous, because cold renderer creation is genuinely slow on real hardware: this module's own
- *  measurements are 600-1700 ms on several phones and 796 ms on an iPhone 13 mini's first run (see
- *  {@link HARD_DEADLINE_MS}'s comment). 5 s — the same order as {@link FRAME_WAIT_TIMEOUT_MS}, the
- *  other "give up on the device entirely" bound in this file — comfortably clears that range while
- *  still firing on a genuinely wedged create (a lost/never-acquired GPU context) instead of hanging
- *  the launch indefinitely. */
-const RENDERER_CREATE_TIMEOUT_MS = 5_000;
-
-/** Ceiling on the TRIVIAL material's compile, ms (#205 R5.3) — the first `compileAsync`, which
- *  builds the cheapest program the probe (or the engine) can express: an unlit quad, no lights, no
- *  shadows, no environment, no post-FX (see the module header). It had no timeout at all, unlike
- *  the HEAVY shader's second compile 28 lines below it — the exact asymmetry this constant closes.
- *
- *  Smaller than {@link SHADE_COMPILE_TIMEOUT_MS} on purpose: a program this simple has no business
- *  taking anywhere near as long as a 16-dependent-tap shader, so a bound this generous already
- *  means the compiler pipeline itself is not responding, not that the device is merely slow. */
-const TRIVIAL_COMPILE_TIMEOUT_MS = 1_500;
-
 /** Reject if `p` has not settled in `ms`. The timer is CLEARED on the happy path — an uncancelled
  *  one is the bug that made this workstream believe in a phantom 8-second WebGPU timeout for a
  *  whole session (see `gpuDetect.ts`). Same shape as `gpuClock.ts`'s, which is module-private
@@ -174,32 +208,6 @@ export function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
     p,
     new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms); }),
   ]).finally(() => clearTimeout(timer)) as Promise<T>;
-}
-
-/** {@link withTimeout}, for a promise whose VALUE OWNS A RESOURCE: if the timeout wins, whatever
- *  the promise eventually hands back is disposed instead of leaked.
- *
- *  ⚠️ **`Promise.race` CANCELS NOTHING, AND THE LOSER HERE HOLDS A GPU CONTEXT** (close-out
- *  2026-08-12). `runBootRampProbe` assigns its `renderer` from the race, so on expiry the variable
- *  stays null, the `finally` disposes NOTHING, and the abandoned `makeWebGPURenderer` keeps going
- *  — very possibly succeeding a moment later with a live WebGPU device nothing holds a reference
- *  to. That is exactly the "a leaked GPU context is a real cost on exactly the low-memory hardware
- *  being characterised" the `finally` block exists to prevent, reached through the one path that
- *  skipped it. And the timeout fires on slow, weak, thermally throttled devices — the population
- *  the probe is FOR, which also re-runs it across three launches.
- *
- *  The flag, not a null check on the caller's variable: this callback is subscribed BEFORE the
- *  `await` resolves, so on the HAPPY path it runs before the caller has stored the renderer
- *  anywhere, and a "has the caller got one yet?" test would dispose the good one. */
-export async function awaitOrDispose<T extends { dispose: () => void }>(p: Promise<T>, ms: number): Promise<T> {
-  let abandoned = false;
-  void p.then((v) => { if (abandoned) v.dispose(); }, () => {});
-  try {
-    return await withTimeout(p, ms);
-  } catch (e) {
-    abandoned = true;   // set BEFORE rethrowing — the late resolution is what reads it
-    throw e;
-  }
 }
 
 /** Clamp the interval fed to a presentation-paced ramp's escape threshold so it stays in the
@@ -230,19 +238,6 @@ export function escapableIntervalMs(intervalMs: number): number {
  *  is the whole point — so this only has to be enough that the first measured step is not also the
  *  first draw the driver has ever seen. */
 const GPU_WARMUP_RENDERS = 3;
-
-/** Side of the SQUARE the heavy-shader ramp shades, in drawing-buffer pixels.
- *
- *  ⚠️ **THE REGION IS FIXED AND THE PANEL IS NOT — that is the whole design.** The fill ramp shades
- *  the whole viewport, so its raw unit is "screens per ms" and a screen is a different number of
- *  pixels on every device; `fillMegapixelsPerMs` exists solely to undo that, and it needs the buffer
- *  size to do it. Hold the region fixed instead and the reading is comparable by construction, with
- *  no normalisation and no dependence on the panel at all.
- *
- *  It is also the safety property. The load is instances OVER THIS REGION, so the worst submit is
- *  `maxLoad x 100 x 100` = 41 M heavy fragments — bounded before any measurement happens, unlike the
- *  190 Mpx full-buffer submit that terminated an iPhone 13 mini's tab. */
-const SHADE_REGION_PX = 100;
 
 /** The yardstick the CPU ramp's escape rules are expressed against, ms.
  *
@@ -282,135 +277,6 @@ const CPU_WORKING_SET = 256;
  *  optimisation threshold and costs a millisecond or two. */
 const CPU_WARMUP_ITERATIONS = 8_192;
 const CPU_WARMUP_PASSES = 3;
-
-/** One quad, shared by every object in both ramps. `PlaneGeometry(2, 2)` exactly fills the
- *  symmetric ortho frustum below, so a fill quad at unit scale covers the viewport precisely. */
-function makeProbeAssets() {
-  const geometry = new THREE.PlaneGeometry(2, 2);
-  // depthTest/depthWrite OFF is what makes the fill ramp mean anything: with depth on, the first
-  // quad would occlude the rest and N quads would shade one screen instead of N.
-  //
-  // ⚠️ **BUT DEPTH-OFF WAS NEVER ENOUGH, AND THE FILL RAMP HAS THEREFORE NEVER MEASURED FILL.**
-  // Turning depth off stops the DEPTH TEST from rejecting the stack; it does not stop a tile-based
-  // GPU from resolving, before shading, that only the last coplanar opaque fragment can survive.
-  // Measured over CDP on an M-series GPU (2026-08-11): with the same heavy shader, opaque stacked
-  // instances are FLAT — 2048 of them cost 0.60 ms against one instance's 0.40 — while additive
-  // ones scale 0.50 -> 4.30 ms. What the opaque fill ramp actually prices is RASTERIZATION of N
-  // quads, not N screens of shading.
-  //
-  // **This is the answer to the question this workstream has been stuck on.** "Fill does not rank
-  // these GPUs, and cannot" — an A23 whose fill time did not move across an eightfold load, both
-  // Samsungs sitting far below their datasheet fill rates, a flagship reading half a budget phone.
-  // Every one of those is what you get from measuring raster/setup rate and calling it fill.
-  // Blending is what makes the overdraw real, on this material and the heavy one alike.
-  const material = new THREE.MeshBasicMaterial({
-    color: 0x040404, depthTest: false, depthWrite: false,
-    transparent: true, blending: THREE.AdditiveBlending,
-  });
-  return { geometry, material };
-}
-
-/** The heavy ramp's objects: `maxLoad` instances of a quad scaled to exactly `SHADE_REGION_PX`
- *  square, all stacked at the origin, so load is pure overdraw of the heavy shader over a fixed
- *  area. One draw call, for the same reason the fill ramp is one (see {@link buildRampGroup}).
- *
- *  Returns the region it actually achieved in pixels — `min(SHADE_REGION_PX, buffer)` on each axis,
- *  since a window narrower than the region cannot host it. Reporting it rather than assuming it is
- *  what keeps the reading comparable when that clamp bites. */
-function buildShadeGroup(
-  geometry: THREE.BufferGeometry,
-  material: THREE.Material,
-  cw: number,
-  ch: number,
-): { group: THREE.InstancedMesh; regionPixels: number } {
-  const { maxLoad } = RAMP_BOUNDS.shade;
-  // The ortho frustum is [-1,1] on both axes and `PlaneGeometry(2, 2)` fills it, so a scale of
-  // `px / bufferSide` covers exactly `px` pixels on that axis.
-  const sx = Math.min(1, SHADE_REGION_PX / cw);
-  const sy = Math.min(1, SHADE_REGION_PX / ch);
-  const group = new THREE.InstancedMesh(geometry, material, maxLoad);
-  const m = new THREE.Matrix4().makeScale(sx, sy, 1);
-  for (let i = 0; i < maxLoad; i++) group.setMatrixAt(i, m);
-  group.instanceMatrix.needsUpdate = true;
-  group.frustumCulled = false; // culling would silently drop the whole ramp
-  group.count = 0;
-  group.visible = false;
-  return { group, regionPixels: Math.round(sx * cw) * Math.round(sy * ch) };
-}
-
-/** Build both ramps' objects up front, ALL of them, and drive load by toggling `visible`.
- *
- *  ⚠️ Creating meshes as the ramp grows would corrupt the very thing being measured: each
- *  doubling would allocate as many objects as already exist, so allocation cost would scale
- *  WITH LOAD and be indistinguishable from the render cost in the slope. Allocating up front
- *  moves it outside the timed section entirely; toggling visibility afterwards is O(load) of
- *  trivial work against O(load) draw calls.
- *
- *  Positions are derived from the index — never `Math.random()`, which the determinism guard
- *  rejects in `runtime/**` and which would also make two probes on one device disagree. */
-function buildRampGroup(
-  kind: RampKind,
-  geometry: THREE.BufferGeometry,
-  material: THREE.Material,
-): THREE.Object3D {
-  const { maxLoad } = RAMP_BOUNDS[kind];
-
-  if (kind === 'fill') {
-    // ⚠️ ONE DRAW CALL, N INSTANCES — and this is a CORRECTION, not an optimisation.
-    //
-    // The fill ramp used to be N separate full-screen Meshes, which made it N DRAW CALLS as well as
-    // N screens of overdraw. On a GPU with a large fill rate the per-draw cost then dominates and
-    // the "fill" number stops being about fill at all. Measured on the GPU clock: a Galaxy S22 read
-    // 1.57 Mpx/ms against a Galaxy A23's 3.13 — the flagship reading HALF the budget phone, which
-    // is impossible for fill and is the signature of measuring submit. Both sat far below their
-    // datasheet fill rates, which is the same tell from the other direction.
-    //
-    // An InstancedMesh renders `count` copies from ONE submit, so overdraw scales while draw cost
-    // does not, and the two ramps finally measure two different things — which is the entire
-    // premise of having two of them.
-    const instanced = new THREE.InstancedMesh(geometry, material, maxLoad);
-    // Every instance is the same full-viewport quad at the origin: N of them is N screens of
-    // overdraw, exactly as the stacked meshes were.
-    const identity = new THREE.Matrix4();
-    for (let i = 0; i < maxLoad; i++) instanced.setMatrixAt(i, identity);
-    instanced.instanceMatrix.needsUpdate = true;
-    instanced.frustumCulled = false; // culling would silently drop the whole ramp
-    instanced.count = 0;
-    instanced.visible = false;
-    return instanced;
-  }
-
-  const group = new THREE.Group();
-  // A square-ish lattice, so the draw ramp's quads are spread across the viewport rather than
-  // stacked in one spot where a tile-based renderer could treat them as a single region.
-  const cols = Math.ceil(Math.sqrt(maxLoad));
-  for (let i = 0; i < maxLoad; i++) {
-    const mesh = new THREE.Mesh(geometry, material);
-    // Tiny and scattered. The fill cost is negligible by construction, so what this ramp
-    // prices is the per-object CPU submit — forest-camp's actual bottleneck (0.14 ms/call on
-    // the Y6), which a fill-heavy probe would never have predicted.
-    const col = i % cols;
-    const row = Math.floor(i / cols);
-    mesh.position.set((col / cols) * 2 - 1, (row / cols) * 2 - 1, 0);
-    mesh.scale.setScalar(0.5 / cols);
-    mesh.visible = false;
-    mesh.frustumCulled = false; // culling would silently drop draws and flatten the ramp
-    group.add(mesh);
-  }
-  group.visible = false;
-  return group;
-}
-
-/** Show exactly the first `load` objects of a group. */
-function setLoad(target: THREE.Object3D, load: number): void {
-  target.visible = load > 0;
-  // The fill ramp is an InstancedMesh: `count` IS the load, in O(1) and one draw call.
-  if ((target as THREE.InstancedMesh).isInstancedMesh) {
-    (target as THREE.InstancedMesh).count = load;
-    return;
-  }
-  for (let i = 0; i < target.children.length; i++) target.children[i].visible = i < load;
-}
 
 // ── THE CPU RAMP ───────────────────────────────────────────────────────────────────────────
 
@@ -495,7 +361,17 @@ function propagate(n: CpuNodes, iterations: number): number {
  *  this degrades MONOTONICALLY: a busier device reads slower, which is the direction a tier
  *  decision wants anyway. Validate it the same way everything else here was validated, though:
  *  a boot reading against a quiet reading, on the same device. */
-function runCpuRamp(mark: (stage: string) => void, deadline: number): RampReading {
+// Exported for the same reason `runRamp` is: a test must be able to drive it directly, without
+// standing up a GL surface it does not need. Its deadline behaviour is the whole of what a test
+// has to reach here.
+export function runCpuRamp(mark: (stage: string) => void, deadline: number): RampReading {
+  // ⚠️ CHECK THE DEADLINE BEFORE DOING ANY WORK — the GPU path added exactly this guard
+  // (`${kind}:deadline-before-start`) and the cpu path was left without it. `phaseDeadline` can
+  // hand back a time already past when GL setup and the two shader compiles alone exhaust
+  // `PROBE_TOTAL_BUDGET_MS`, which is the pathological launch that budget exists for — and this is
+  // the one consumer of it that would then run three JIT warm-up passes and a first ramp step
+  // before consulting it.
+  if (rawNow() > deadline) { mark('cpu:deadline-before-start'); return readRamp(startRamp('cpu', CPU_NOMINAL_INTERVAL_MS)); }
   const nodes = makeCpuNodes();
   for (let i = 0; i < CPU_WARMUP_PASSES; i++) propagate(nodes, CPU_WARMUP_ITERATIONS);
   mark('cpu:warm');
@@ -551,34 +427,36 @@ function nextFrame(): Promise<number | null> {
     requestAnimationFrame((t) => finish(t));
   });
 }
-
 /** Run one ramp to completion. Returns its reading.
  *
  *  Timing is the interval between successive rAF timestamps — the same metric `frameProfiler`
- *  uses, and the one the escape logic is written against. It is NOT the CPU time around
- *  `render()`, which on both backends returns before the GPU has done the work and would report
- *  a fill-bound device as infinitely fast.
+ *  uses, and the one the escape logic is written against. It is NOT the CPU time around the
+ *  submit, which returns before the GPU has done the work and would report a fill-bound device as
+ *  infinitely fast.
+ *
+ *  ⚠️ **Takes a {@link RampWorkload}, not a renderer and a scene (#203).** Everything hard-won in
+ *  this function — the warm-up submit, the per-ramp deadline, the escape logic, the load cleanup on
+ *  every exit — is about TIMING and is independent of how the pixels are produced. Parameterising
+ *  the work is what let the Three renderer be replaced by a raw WebGL2 context without touching any
+ *  of it. See `rampWorkloadGL.ts` for why that replacement had to happen.
  *
  *  Exported so a test can drive one ramp directly against fakes, without standing up the whole
  *  probe — needed to prove the warm-up-load cleanup on the `no-frames` exit (#205 R5.4). */
 export async function runRamp(
   kind: RampKind,
-  renderer: WebGPURenderer,
-  scene: THREE.Scene,
-  camera: THREE.Camera,
-  group: THREE.Object3D,
+  workload: RampWorkload,
   intervalMs: number,
   deadline: number,
   mark: (stage: string) => void,
   clock: GpuClock | null,
 ): Promise<RampReading> {
-  // ⚠️ ONE UNRECORDED RENDER AT THE START LOAD, BEFORE EVERY RAMP — the fix for a defect that was
+  // ⚠️ ONE UNRECORDED SUBMIT AT THE START LOAD, BEFORE EVERY RAMP — the fix for a defect that was
   // costing whole devices their verdict.
   //
   // MEASURED, campaign of 2026-08-11, three phones x three launches: EVERY GPU ramp's first step
   // was a 3-6x outlier over its second (Y6 draw `32:272.8` then `64:39.4`; A23 shade `4:140.2` then
   // `8:33.4`; S22 draw `32:15.8` then `64:2.6`). It is a pipeline switch, not a device: each ramp is
-  // the first draw of a different geometry and blend state, and the driver pays for that once.
+  // the first draw of a different program and blend state, and the driver pays for that once.
   //
   // It is not cosmetic, because `readRamp` spans from the EARLIEST supra-pin step to the last — so
   // an inflated first step makes the slope flat or NEGATIVE and the reading comes back `'none'`.
@@ -589,19 +467,19 @@ export async function runRamp(
   // The corroboration is that the CPU ramp — the ONLY ramp that already warmed up — is the only one
   // with no first-step outlier anywhere, and it read `escaped/measured` 9 times out of 9.
   //
-  // A warm-up RENDER rather than a discarded step: a discarded step still costs its (large) time and
+  // A warm-up SUBMIT rather than a discarded step: a discarded step still costs its (large) time and
   // can still abort the ramp before anything is recorded.
-  // ⚠️ CHECK THE DEADLINE BEFORE THE WARM-UP, not only inside the loop. The warm-up render is
-  // bounded only by the clock's own 2 s completion timeout (or `nextFrame`'s 5 s), neither of which
+  // ⚠️ CHECK THE DEADLINE BEFORE THE WARM-UP, not only inside the loop. The warm-up is bounded only
+  // by the clock's own 2 s completion timeout (or `nextFrame`'s 5 s), neither of which
   // `HARD_DEADLINE_MS` can see — so with three GPU ramps a probe that is already out of time could
   // still spend seconds warming up ramps it will not measure. Found in close-out review.
   if (rawNow() > deadline) { mark(`${kind}:deadline-before-start`); return readRamp(startRamp(kind, intervalMs)); }
   const warmLoad = RAMP_BOUNDS[kind].startLoad;
-  setLoad(group, warmLoad);
+  workload.setLoad(warmLoad);
   mark(`${kind}:warm`);
-  renderer.render(scene, camera);
+  workload.submit();
   if (clock) {
-    if (await clock.awaitCompletion() === null) mark(`${kind}:warm-clock-failed`);
+    if (await awaitClockWithin(clock, deadline) === null) mark(`${kind}:warm-clock-failed`);
   } else if (await nextFrame() === null) {
     mark(`${kind}:warm-no-frames`);
   }
@@ -614,38 +492,37 @@ export async function runRamp(
     for (;;) {
       const load = rampNextLoad(gpuState);
       if (load === null) break;
-      setLoad(group, load);
+      workload.setLoad(load);
       mark(`${kind}:${load}`);
-      renderer.render(scene, camera);
-      const gpuMs = await clock.awaitCompletion();
+      workload.submit();
+      const gpuMs = await awaitClockWithin(clock, deadline);
       // The clock failing mid-ramp is not a slow device — it is no measurement. Stop and report
       // whatever the earlier steps already established rather than recording a fabricated time.
       if (gpuMs === null) { mark(`${kind}:gpu-clock-failed`); break; }
       gpuState = recordRampFrame(gpuState, gpuMs, gpuMs);
       if (rawNow() > deadline) break;
     }
-    setLoad(group, 0);
+    workload.setLoad(0);
     return readRamp(gpuState);
   }
 
   let state = startRamp(kind, intervalMs);
   let last = await nextFrame();
-  // ⚠️ CLEAR THE LOAD ON THIS EXIT TOO (#205 R5.4). `setLoad(group, warmLoad)` above already made
-  // this ramp's warm-up load VISIBLE in the scene, and this early return used to leave it that way
-  // — the next ramp's warm-up render (and its first timed frame) would then be contaminated by a
-  // load that belongs to a ramp which never got a single measured step. Every other exit from this
-  // function already zeroes the load (the GPU-paced path above, and the bottom of the loop below);
-  // this was the one that didn't.
-  if (last === null) { mark(`${kind}:no-frames`); setLoad(group, 0); return readRamp(state); }
+  // ⚠️ CLEAR THE LOAD ON THIS EXIT TOO (#205 R5.4). The warm-up above already made this ramp's load
+  // live, and this early return used to leave it that way — the next ramp's warm-up submit (and its
+  // first timed frame) would then be contaminated by a load belonging to a ramp which never got a
+  // single measured step. Every other exit from this function already zeroes the load; this was the
+  // one that didn't.
+  if (last === null) { mark(`${kind}:no-frames`); workload.setLoad(0); return readRamp(state); }
 
   for (;;) {
     const load = rampNextLoad(state);
     if (load === null) break;
-    setLoad(group, load);
+    workload.setLoad(load);
     // Marked BEFORE the submit: if this load is the one that kills the process, the last stage
-    // reported IS the culprit. A mark after the render would name the last SURVIVED load instead.
+    // reported IS the culprit. A mark after it would name the last SURVIVED load instead.
     mark(`${kind}:${load}`);
-    renderer.render(scene, camera);
+    workload.submit();
     const now = await nextFrame();
     // Frames stopped arriving (the page went invisible mid-ramp). Whatever was recorded stands —
     // `readRamp` reports it as the bound it is — but do not wait forever for the next one.
@@ -657,18 +534,27 @@ export async function runRamp(
     if (rawNow() > deadline) break;
   }
 
-  setLoad(group, 0);
+  workload.setLoad(0);
   return readRamp(state);
 }
 
-/** Run the boot probe. Resolves `null` when the probe cannot run at all (no DOM, no renderer),
- *  which callers must treat as "no information" — i.e. today's behaviour — and never as a verdict.
+/** Run the boot probe. Resolves `null` when the probe cannot run at all (no DOM, no WebGL2), which
+ *  callers must treat as "no information" — i.e. today's behaviour — and never as a verdict.
  *
- *  ⚠️ THIS BLOCKS THE LAUNCH BY DESIGN. Everything it costs — one shader compile, a warm-up, two
- *  ramps — happens before the real renderer is created, because a tier decided any later cannot
- *  apply `antialias`. It is first-launch-only; the caller caches the verdict. */
+ *  ⚠️ THIS BLOCKS THE LAUNCH BY DESIGN. Everything it costs happens before the real renderer is
+ *  created, because a tier decided any later cannot apply `antialias`. It is first-launch-only; the
+ *  caller caches the verdict.
+ *
+ *  ⭐ **`only2D` selects the FILL ramp as the deciding GPU axis** (owner, 2026-08-13). A 2D
+ *  project's only tier-controlled GPU knob is `pixiPixelRatioCap`, which is purely fill-rate bound
+ *  — so `shade` (a stand-in for IBL and shadow taps a 2D project will never issue) is measuring the
+ *  wrong thing there, and paying for it in blocked launch. The `draw` ramp goes too: a 2D scene's
+ *  submit cost is Pixi's batcher's, not one draw per sprite. So a 2D-only project runs `fill` + `cpu`
+ *  and a 3D one runs `shade` + `cpu`, and both are the SAME instrument on the same context — which
+ *  is what keeps a phone's two readings comparable. */
 export async function runBootRampProbe(
   onProgress?: (stage: string) => void,
+  only2D = false,
 ): Promise<ProbeMeasurement | null> {
   const mark = (stage: string) => { try { onProgress?.(stage); } catch { /* never fail the probe */ } };
   if (typeof document === 'undefined' || typeof requestAnimationFrame === 'undefined') return null;
@@ -676,162 +562,115 @@ export async function runBootRampProbe(
 
   const started = rawNow();
 
-  const container = document.createElement('div');
-  // Sized from the viewport but CLAMPED to MAX_PROBE_PIXELS — not the 2px of `capsProbeRenderer`
-  // (a 2px buffer would report every device on earth as fill-infinite) and not the native buffer
-  // either (that killed a tab; see the module header). Aspect is preserved so the shape of the
-  // work resembles a real frame.
+  // Sized from the viewport but CLAMPED to MAX_PROBE_PIXELS — not 2px (which would report every
+  // device on earth as fill-infinite) and not the native buffer either (that killed a tab; see the
+  // module header). Aspect is preserved so the shape of the work resembles a real frame.
   const vw = Math.max(1, window.innerWidth);
   const vh = Math.max(1, window.innerHeight);
   const scale = Math.min(1, Math.sqrt(MAX_PROBE_PIXELS / (vw * vh)));
   const cw = Math.max(1, Math.round(vw * scale));
   const ch = Math.max(1, Math.round(vh * scale));
-  container.style.cssText = 'position:fixed;left:-9999px;top:0;pointer-events:none;'
-    + `width:${cw}px;height:${ch}px;`;
-  document.body.appendChild(container);
 
-  let renderer: WebGPURenderer | null = null;
-  const { geometry, material } = makeProbeAssets();
-  const scene = new THREE.Scene();
-  const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 10);
-  camera.position.z = 1;
-  const fillGroup = buildRampGroup('fill', geometry, material);
-  const drawGroup = buildRampGroup('draw', geometry, material);
-  scene.add(fillGroup, drawGroup);
+  // ⚠️ NO RENDERER IS CONSTRUCTED HERE ANY MORE, and three separate hazards left with it: the
+  // re-entrancy that killed an iPhone 13 mini's tab, the GPU context leaked by the creation
+  // timeout, and the 600-1700 ms of cold renderer creation that used to be able to consume the
+  // entire ramp allowance on a first launch. See `rampWorkloadGL.ts`.
+  const surface = createGlProbeSurface(cw, ch, mark);
+  if (!surface) { mark('no-gl-surface'); return null; }
+  const { workloads, clock, bufferPixels, shadeRegionPixels, compileMs, shadeCompileMs } = surface;
+  const rendererMs = 0;
 
-  // ⚠️ THE HEAVY RAMP IS OPTIONAL BY CONSTRUCTION. Building its material is the only part of the
-  // probe that runs engine shader-graph code, and a backend or a three version that refuses it must
-  // still yield the fill/draw/cpu measurement rather than collapsing the whole probe to `null`. A
-  // probe that answers less is not the same failure as a probe that answers nothing.
-  let heavy: HeavyShadeAssets | null = null;
-  let shadeGroup: THREE.InstancedMesh | null = null;
-  let shadeRegionPixels = 0;
-  try {
-    heavy = makeHeavyShadeAssets();
-    const built = buildShadeGroup(geometry, heavy.material, cw, ch);
-    shadeGroup = built.group;
-    shadeRegionPixels = built.regionPixels;
-    scene.add(shadeGroup);
-  } catch (e) {
-    mark(`shade-assets-failed ${String(e).slice(0, 120)}`);
-  }
+  // Which GPU axis decides, and which is simply not run. `shade` is absent from a 2D probe and
+  // `fill`/`draw` from a 3D one; `classifyDevice` already treats an absent reading as no evidence
+  // rather than as a zero.
+  const axes: ProbeAxes = only2D ? '2d' : '3d';
+  const gpuKinds: RampKind[] = only2D ? ['fill'] : ['shade'];
+
+  // ⭐ ONE DEADLINE FOR THE WHOLE PROBE, computed ONCE — see {@link PROBE_TOTAL_BUDGET_MS}. Every
+  // phase below clamps its own budget against this, so a phase that overruns eats into what the
+  // next one may spend instead of adding to it. `started` rather than `rawNow()`: the GL surface
+  // and its shader compiles are part of what the player is waiting through, so they belong inside
+  // the budget rather than before it.
+  const probeDeadline = started + PROBE_TOTAL_BUDGET_MS;
+  /** A phase's own budget, never past the probe's. */
+  const phaseDeadline = (budgetMs: number) => Math.min(rawNow() + budgetMs, probeDeadline);
+  mark(`gl-ok ${cw}x${ch} axes=${gpuKinds.join('+')}+cpu`);
 
   try {
-    mark('import-scene3DSync');
-    const { makeWebGPURenderer } = await import('./scene3DSync');
-    mark('renderer-create');
-    const rendererStarted = rawNow();
-    // ⚠️ BOUNDED (#205 R5.3) — see {@link RENDERER_CREATE_TIMEOUT_MS}. This used to be a bare
-    // `await` with no timeout at all: every OTHER step in this function bounds itself, but a
-    // renderer that never resolves hangs `resolveActiveTier` forever, and `Scene3D.bringUp`'s only
-    // failure handling is a `.catch(...)` that a pending promise never reaches — a permanently
-    // blank surface with no error. On expiry this throws into the `try` below, which is the SAME
-    // degrade path an ordinary creation failure already takes: mark it, dispose what exists, and
-    // return `null` so the caller falls back to today's behaviour rather than the tier decision
-    // ever seeing a rejection.
-    renderer = await awaitOrDispose(makeWebGPURenderer(container), RENDERER_CREATE_TIMEOUT_MS);
-    // DPR 1, explicitly. `makeWebGPURenderer` applies the project's pixelRatioCap, which on an
-    // unpinned project is the HIGH tier's 2 — and 2x on a phone is 4x the fragments, which is
-    // half of how the 13 mini's tab died. The clamp is safe because the result is normalised by
-    // buffer size (fillMegapixelsPerMs), so a small buffer loses no comparability.
-    renderer.setPixelRatio(1);
-    renderer.setSize(cw, ch, false);
-    const rendererMs = rawNow() - rendererStarted;
-    const bufferPixels = cw * ch;
-    // Name the BACKEND: 'auto' picks WebGPU when the device claims support, and a crash that only
-    // happens on one backend is a completely different bug from one that happens on both.
-    const be = (renderer as unknown as { backend?: { isWebGPUBackend?: boolean; isWebGLBackend?: boolean } }).backend;
-    mark(`renderer-ok ${cw}x${ch} backend=${be?.isWebGPUBackend ? 'webgpu' : be?.isWebGLBackend ? 'webgl2' : '?'}`);
-
-    // THE BLOCKING COMPILE. One material, both ramps — see the module header. Awaiting it here
-    // is the whole reason the probe can inform this launch rather than the next one, and it also
-    // keeps the compile OUT of the first timed frame, where it would have been charged to the
-    // load and wrecked the slope.
-    setLoad(fillGroup, 1);
-    mark('compile');
-    const compileStarted = rawNow();
-    // ⚠️ BOUNDED (#205 R5.3) — see {@link TRIVIAL_COMPILE_TIMEOUT_MS}. The SECOND compile 28 lines
-    // below already learned this lesson ("an unbounded second compile is exactly the 'boot must
-    // never be hostage to the probe' rule being broken by the probe"); this, the FIRST compile, had
-    // the same unbounded shape and is the other half of the same defect. Same degrade on expiry:
-    // the rejection propagates to the outer `catch`, which marks it and returns `null` rather than
-    // throwing into renderer bring-up.
-    await withTimeout(renderer.compileAsync(scene, camera), TRIVIAL_COMPILE_TIMEOUT_MS);
-    const compileMs = rawNow() - compileStarted;
-    mark('compile-ok');
-    setLoad(fillGroup, 0);
-
     // ── THE CPU RAMP RUNS FIRST, AND THE ORDER IS DELIBERATE ──────────────────────────────
     // It needs no GPU, so no GPU ramp's deadline can starve it (which is exactly how the Y6's draw
     // ramp came back empty, twice, before each ramp got its own); nothing has been submitted yet,
-    // so it is not being timed against a queue draining underneath it; and it is the cheapest of the
-    // four, so paying for it first guarantees every launch yields at least one axis even when the
-    // GPU side produces nothing at all.
-    const cpu = runCpuRamp(mark, rawNow() + HARD_DEADLINE_MS);
+    // so it is not being timed against a queue draining underneath it; and it is the cheapest, so
+    // paying for it first guarantees every launch yields at least one axis even when the GPU side
+    // produces nothing at all.
+    const cpu = runCpuRamp(mark, phaseDeadline(HARD_DEADLINE_MS));
     mark(`cpu-ok ${cpu.status}/${cpu.bound}`);
 
-    // THE SECOND COMPILE, timed apart from the first — see `probeHeavyShader.ts` for why the
-    // number is reported rather than assumed. Compiling it here, after the trivial material, is
-    // what keeps the two costs separable: `compileAsync` only builds what it has not built already.
-    let shadeCompileMs = 0;
-    if (shadeGroup) {
-      try {
-        setLoad(shadeGroup, 1);
-        const shadeCompileStarted = rawNow();
-        // ⚠️ BOUNDED. This is a genuinely new, non-trivial program (16 dependent taps in a loop) and
-        // `compileAsync` had no timeout, no deadline and no budget — on hardware where one program
-        // has measured ~1.2 s, an unbounded second compile is exactly the "boot must never be
-        // hostage to the probe" rule being broken by the probe. 3 s is ~7x the worst compile
-        // actually measured (420-425 ms on an iPhone 7), so no real device should reach it; a
-        // device that does loses the shade ramp, not its launch.
-        await withTimeout(renderer.compileAsync(scene, camera), SHADE_COMPILE_TIMEOUT_MS);
-        shadeCompileMs = rawNow() - shadeCompileStarted;
-        setLoad(shadeGroup, 0);
-        mark(`shade-compile-ok ${shadeCompileMs.toFixed(0)}ms`);
-      } catch (e) {
-        // A heavy material that will not compile is not a slow device. Drop the ramp and keep the
-        // rest of the probe, rather than letting one optional axis fail the launch's measurement.
-        mark(`shade-compile-failed ${String(e).slice(0, 120)}`);
-        scene.remove(shadeGroup);
-        // Dispose BEFORE dropping the reference — `finally`'s `shadeGroup?.dispose()` cannot reach
-        // it once this is null, and this is the one path where the group is fully constructed. No
-        // live leak today (the throwaway renderer's own `dispose()` destroys the device and with it
-        // every buffer), but that is a property of the renderer being throwaway, not of this code.
-        shadeGroup.dispose();
-        shadeGroup = null;
-        shadeRegionPixels = 0;
-      }
-    }
+    const readings: Partial<Record<RampKind, RampReading>> = {};
 
     // ── THE GPU-CLOCK PATH, PREFERRED WHENEVER IT IS AVAILABLE (#188 (ii)) ────────────────
     // It waits for the GPU, never for the display, so the WebView's boot-time rAF backoff cannot
     // touch it — and there is consequently no interval to estimate and nothing to declare
-    // implausible. The presentation path below stays as the fallback for a backend that offers
-    // neither `onSubmittedWorkDone` nor `fenceSync`.
-    const clock = makeGpuClock(renderer);
+    // implausible. The presentation path below stays as the fallback for a context with no fence.
     mark(`gpu-clock ${clock ? clock.kind : 'unavailable'}`);
     if (clock) {
+      // ⚠️ THE WARM-UP IS THE PHASE THAT HAD NO DEADLINE AT ALL, and on the evidence it is where
+      // the pathological launch went: three fence waits, each bounded only by the clock's own 2 s,
+      // before a single measured step. Both halves are needed — the loop consults the deadline
+      // BETWEEN renders, and `awaitClockWithin` bounds each individual wait, since a check between
+      // iterations cannot shorten the wait it is standing after.
       for (let i = 0; i < GPU_WARMUP_RENDERS; i++) {
-        renderer.render(scene, camera);
-        if (await clock.awaitCompletion() === null) { mark(`gpu-warmup-failed at ${i}`); break; }
+        if (rawNow() > probeDeadline) { mark(`gpu-warmup-deadline at ${i}`); break; }
+        workloads[gpuKinds[0]].submit();
+        if (await awaitClockWithin(clock, probeDeadline) === null) { mark(`gpu-warmup-failed at ${i}`); break; }
       }
-      // ⚠️ A DEADLINE EACH, not one shared between them. Shared, a GPU-paced fill ramp consumed the
-      // whole allowance and the draw ramp reported `running` with no reading — measured on the Y6,
-      // twice. Each ramp's own `GPU_RAMP_BUDGET_MS` normally stops it long before this fires; this
-      // is only the guard against a pathological device, and a guard one ramp can spend on behalf
-      // of the other is not a guard for the second one at all.
-      const gpuFill = await runRamp('fill', renderer, scene, camera, fillGroup, GPU_NOMINAL_INTERVAL_MS, rawNow() + HARD_DEADLINE_MS, mark, clock);
-      mark(`fill-ok ${gpuFill.status}/${gpuFill.bound}`);
-      const gpuDraw = await runRamp('draw', renderer, scene, camera, drawGroup, GPU_NOMINAL_INTERVAL_MS, rawNow() + HARD_DEADLINE_MS, mark, clock);
-      mark(`draw-ok ${gpuDraw.status}/${gpuDraw.bound}`);
-      let gpuShade: RampReading | undefined;
-      if (shadeGroup) {
-        gpuShade = await runRamp('shade', renderer, scene, camera, shadeGroup, GPU_NOMINAL_INTERVAL_MS, rawNow() + HARD_DEADLINE_MS, mark, clock);
-        mark(`shade-ok ${gpuShade.status}/${gpuShade.bound}`);
+      for (const kind of gpuKinds) {
+        // ⚠️ A DEADLINE EACH, not one shared between them. Shared, a GPU-paced fill ramp consumed
+        // the whole allowance and the next ramp reported `running` with no reading — measured on
+        // the Y6, twice. Each ramp's own `GPU_RAMP_BUDGET_MS` normally stops it long before this
+        // fires; a guard one ramp can spend on behalf of the other is not a guard for the second.
+        // ⭐ **THE FIRST PASS IS DISCARDED — A FLAGSHIP AT IDLE CLOCKS READS LIKE A BUDGET
+        // PHONE.** This is the fix for an inversion that survived two other explanations: the
+        // shade axis ranked a Galaxy S22 BELOW a Galaxy A23, which is impossible, and neither the
+        // GPU-clock latency floor (raising `startLoad` changed nothing) nor the per-submit clear
+        // (the S22's buffer is the SMALLER of the two, 0.27 vs 0.31 Mpx) accounted for it.
+        //
+        // Running the same ramp twice in one launch named the cause (2026-08-13, `games/sling`,
+        // two launches per device):
+        //
+        //     device   pass 1        pass 2        gain
+        //     A23      12.13 11.74   15.61 15.50   ~1.3x
+        //     S22       7.49  7.71   19.92 11.48   1.5-2.7x
+        //
+        // The flagship gains far more, and on pass 2 it finally reads ABOVE the A23 — the ordering
+        // was never wrong about the hardware, the probe was measuring a GPU that had not clocked
+        // up. A weak device is already at its ceiling and gains little, which is why this asymmetry
+        // is the governor rather than caching or warm shaders.
+        //
+        // ⚠️ `GPU_WARMUP_RENDERS` does NOT cover this and is not the same thing: three submits at
+        // the START load settle the pipeline, which is what they were added for. A governor needs
+        // sustained work, and only a full ramp supplies it.
+        //
+        // The pass is bounded like any other and its reading is thrown away — no marks, so the
+        // stage breadcrumbs still describe the measured pass.
+        //
+        // ⚠️ **CLOCK PATH ONLY, and that is a real asymmetry.** The presentation/rAF fallback below
+        // (taken when `makeGpuClock` returns null) still runs ONE un-warmed pass, and
+        // `classifyReading` does not read `clockKind` — so a fallback reading and a clock reading
+        // are judged by the same thresholds while having been taken at different GPU clocks. The
+        // exposure is narrow (WebGL2 `fenceSync` is core, so the fallback is rare) and it is why
+        // this is documented rather than fixed: warming the presentation path costs whole rAF
+        // frames, not submits. If a device population ever lands on that path, this is the first
+        // thing to suspect about its numbers.
+        await runRamp(
+          kind, workloads[kind], GPU_NOMINAL_INTERVAL_MS, phaseDeadline(GPU_RAMP_BUDGET_MS), () => {}, clock);
+        readings[kind] = await runRamp(
+          kind, workloads[kind], GPU_NOMINAL_INTERVAL_MS, phaseDeadline(HARD_DEADLINE_MS), mark, clock);
+        mark(`${kind}-ok ${readings[kind]!.status}/${readings[kind]!.bound} (after a discarded warm-up pass)`);
       }
       return {
-        intervalMs: GPU_NOMINAL_INTERVAL_MS, clockKind: clock.kind,
-        fill: gpuFill, draw: gpuDraw, shade: gpuShade, cpu,
+        intervalMs: GPU_NOMINAL_INTERVAL_MS, clockKind: clock.kind, axes,
+        fill: readings.fill, draw: readings.draw, shade: readings.shade, cpu,
         totalMs: rawNow() - started, rendererMs, compileMs, shadeCompileMs,
         bufferPixels, shadeRegionPixels,
       };
@@ -841,7 +680,7 @@ export async function runBootRampProbe(
     let last = await nextFrame();
     if (last === null) { mark('no-frames — the page is not visible'); return null; }
     for (let i = 0; i < WARMUP_FRAMES; i++) {
-      renderer.render(scene, camera);
+      workloads[gpuKinds[0]].submit();
       const now = await nextFrame();
       if (now === null) { mark(`warmup-frames-stopped after ${i}`); return null; }
       warmup.push(now - last);
@@ -877,57 +716,40 @@ export async function runBootRampProbe(
         + `[${warmup.map((f) => f.toFixed(0)).join(' ')}] — the warm-up timed the boot, not the display`);
     }
 
-    // ⚠️ The ramp deadline starts HERE, after setup — not at the top of the probe. It used to
-    // include renderer creation, and on an iPhone 13 mini's FIRST run that took 796 ms (against
-    // 3 ms once warm): setup alone consumed the whole allowance, both ramps broke out on their
-    // first frame, and the run produced `status: 'running'` with no reading at all. Setup cost is
-    // real and is reported (`rendererMs`, `compileMs`), but it must not be able to starve the
-    // measurement it exists to enable.
     // ⚠️ RETURN THE CPU AXIS EVEN HERE, and note this is NOT a softening of the decline. The
     // plausibility guard exists because every PRESENTATION-paced threshold is a multiple of the
-    // interval, so a contaminated interval poisons the fill and draw ramps — it says nothing about a
-    // ramp that never consulted the display. Those two are reported as the empty readings they are
+    // interval, so a contaminated interval poisons the GPU ramps — it says nothing about a ramp
+    // that never consulted the display. Those are reported as the empty readings they are
     // (`bound: 'none'`, which `classifyDevice` already refuses to classify), so the verdict is
     // exactly as declined as it was before; what changes is that the launch stops throwing away the
     // one measurement it did legitimately take.
     if (intervalImplausible) {
       const declined = (kind: RampKind) => readRamp(startRamp(kind, 0));
       return {
-        intervalMs, clockKind: 'raf' satisfies ProbeClockKind,
-        fill: declined('fill'), draw: declined('draw'), cpu,
+        intervalMs, clockKind: 'raf' satisfies ProbeClockKind, axes,
+        fill: only2D ? declined('fill') : undefined,
+        shade: only2D ? undefined : declined('shade'),
+        cpu,
         totalMs: rawNow() - started, rendererMs, compileMs, shadeCompileMs,
-        // The real region, not 0: `shadeCompileMs` above is non-zero whenever the heavy material
-        // compiled, and a log that charges a launch for "compile" while claiming no shade ramp
-        // exists reads as a run where the material was never built.
         bufferPixels, shadeRegionPixels,
       };
     }
-    // ⚠️ A DEADLINE EACH HERE TOO. The GPU-clock path above was given per-ramp deadlines after a
-    // shared one starved the Y6's draw ramp twice — and this fallback was left sharing one, then
-    // had a THIRD ramp added in front of it. Shared, fill and draw can consume up to 360 ms each of
-    // their own budgets and leave `shade` entering `runRamp` already past the deadline: its loop
-    // body runs once regardless, so it renders one frame and breaks with `status: 'running'`, which
-    // reads as `bound: 'none'`. Silently starved, on the fallback path that exists precisely for
-    // the oldest hardware. Found in close-out review.
+    // ⚠️ A DEADLINE EACH HERE TOO — see the GPU-clock path above for the measurement that forced it.
     //
     // ⚠️ `escapableIntervalMs(intervalMs)`, NOT the raw `intervalMs` — see its doc (#205 R5.4). A
     // large enough authored `targetFPS` pushes `intervalMs` past `ABORT_FRAME_MS / ESCAPE_MULTIPLE`,
     // at which point escape becomes unreachable before abort. `intervalMs` itself is still what
     // gets reported below; only the ramps' own escape yardstick is bounded.
     const rampIntervalMs = escapableIntervalMs(intervalMs);
-    const fill = await runRamp('fill', renderer, scene, camera, fillGroup, rampIntervalMs, rawNow() + HARD_DEADLINE_MS, mark, null);
-    mark(`fill-ok ${fill.status}`);
-    const draw = await runRamp('draw', renderer, scene, camera, drawGroup, rampIntervalMs, rawNow() + HARD_DEADLINE_MS, mark, null);
-    mark(`draw-ok ${draw.status}`);
-    let shade: RampReading | undefined;
-    if (shadeGroup) {
-      shade = await runRamp('shade', renderer, scene, camera, shadeGroup, rampIntervalMs, rawNow() + HARD_DEADLINE_MS, mark, null);
-      mark(`shade-ok ${shade.status}`);
+    for (const kind of gpuKinds) {
+      readings[kind] = await runRamp(
+        kind, workloads[kind], rampIntervalMs, phaseDeadline(HARD_DEADLINE_MS), mark, null);
+      mark(`${kind}-ok ${readings[kind]!.status}`);
     }
 
     return {
-      intervalMs, clockKind: 'raf' satisfies ProbeClockKind,
-      fill, draw, shade, cpu,
+      intervalMs, clockKind: 'raf' satisfies ProbeClockKind, axes,
+      fill: readings.fill, draw: readings.draw, shade: readings.shade, cpu,
       totalMs: rawNow() - started, rendererMs, compileMs, shadeCompileMs,
       bufferPixels, shadeRegionPixels,
     };
@@ -937,19 +759,8 @@ export async function runBootRampProbe(
     mark(`threw ${String(e).slice(0, 160)}`);
     return null;
   } finally {
-    // Dispose in full: this renderer exists only to answer one question, and a leaked GPU context
-    // is a real cost on exactly the low-memory hardware being characterised.
-    (fillGroup as THREE.InstancedMesh).dispose?.();
-    drawGroup.clear();
-    shadeGroup?.dispose();
-    // The heavy material and its texture are the probe's largest GPU residents after the renderer
-    // itself, and they are disposed whether or not the ramp ever ran — `shadeGroup` is null on a
-    // compile failure, but `heavy` was already built by then.
-    heavy?.material.dispose();
-    heavy?.texture.dispose();
-    geometry.dispose();
-    material.dispose();
-    renderer?.dispose();
-    container.remove();
+    // Dispose in full: this context exists only to answer one question, and a leaked GL context is
+    // a real cost on exactly the low-memory hardware being characterised.
+    surface.dispose();
   }
 }

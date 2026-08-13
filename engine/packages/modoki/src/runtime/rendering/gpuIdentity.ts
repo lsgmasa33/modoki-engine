@@ -44,7 +44,7 @@
  *  Pure: takes a string, returns a verdict. No DOM, no renderer, no frame. That is what lets a
  *  2D-only project resolve a tier without mounting `Scene3D` at all (#203). */
 
-import { GPU_BENCHMARK_FPS } from './gpuBenchmarks';
+import { GPU_BENCHMARK_FPS, GPU_BENCHMARK_SAMPLES } from './gpuBenchmarks';
 import type { QualityTier } from './qualityTier';
 
 /** Reduce a renderer string to a stable lookup key.
@@ -182,10 +182,47 @@ export const MID_FLOOR_FPS = 29;
 /** See {@link MID_FLOOR_FPS}. Placed in the empty 77.24-91.02 interval. */
 export const HIGH_FLOOR_FPS = 85;
 
-/** Band a table reading falls in. Pure and total — every number has a band. */
-export function tierForBenchmarkFps(fps: number): QualityTier {
-  if (fps >= HIGH_FLOOR_FPS) return 'high';
-  return fps >= MID_FLOOR_FPS ? 'mid' : 'low';
+/** Submissions behind a table row at or above which its figure is taken at FACE VALUE.
+ *
+ *  The generator's sample gate softened from 3 to 1 on 2026-08-13 (84 rows -> 132; see
+ *  `gen-gpu-benchmarks.mjs` for the bootstrap that justifies it). The measured risk of a thin row
+ *  is small but not zero — **0.7% of single submissions land in a different band than their GPU's
+ *  full-population median** — and it is concentrated entirely in rows sitting just above a floor.
+ *  A row at 143 does not care; a row at 29.4 against a floor of 29 does.
+ *
+ *  So the softening is paid for HERE rather than by dropping the data: below this many samples, a
+ *  figure inside {@link LOW_CONFIDENCE_MARGIN} of the floor it just cleared is rounded DOWN. The
+ *  value is 3 because that is the gate this replaced — rows the old table already trusted are
+ *  trusted identically, so nothing that shipped before changes tier. */
+export const CONFIDENT_SAMPLES = 3;
+
+/** How far above a floor a thin row must sit to be believed — 1.2, i.e. 20%.
+ *
+ *  Chosen against the measured spread rather than picked: the p75 single-submission reading is
+ *  1.06x its truth and the p95 is 1.49x, so 20% covers the ordinary high tail without discarding
+ *  rows that clear a floor decisively. Applied to today's table it demotes **exactly four** rows,
+ *  all of them thin AND boundary-adjacent — Adreno 615 (29.4), Intel Skylake GT1 (31.0) and Adreno
+ *  616 (32.4) over the `mid` floor of 29, and Adreno 644 (90.3, n=1) over the `high` floor of 85 —
+ *  and leaves the other 44 additions at face value.
+ *
+ *  ⚠️ It rounds DOWN only. A thin row just BELOW a floor is left alone: that is already the safe
+ *  side, and promoting on thin evidence is the direction that ends in a lost GPU context (#156). */
+export const LOW_CONFIDENCE_MARGIN = 1.2;
+
+/** Band a table reading falls in. Pure and total — every number has a band.
+ *
+ *  `samples` is the row's submission count ({@link GPU_BENCHMARK_SAMPLES}). Omit it and the figure
+ *  is taken at face value, which is the right default for a number that did not come from the
+ *  table — a test's literal, or a future hand-authored anchor. Passing it in is what activates the
+ *  {@link CONFIDENT_SAMPLES} rounding, and both real call sites do. */
+export function tierForBenchmarkFps(fps: number, samples?: number): QualityTier {
+  const thin = samples !== undefined && samples < CONFIDENT_SAMPLES;
+  // Round a thin row down to the band below whichever floor it only just cleared. Written as
+  // "cleared this floor but not by the margin" rather than as a scaled comparison so that the two
+  // floors cannot drift apart: each is checked against its own value.
+  if (fps >= HIGH_FLOOR_FPS) return thin && fps < HIGH_FLOOR_FPS * LOW_CONFIDENCE_MARGIN ? 'mid' : 'high';
+  if (fps >= MID_FLOOR_FPS) return thin && fps < MID_FLOOR_FPS * LOW_CONFIDENCE_MARGIN ? 'low' : 'mid';
+  return 'low';
 }
 
 /** Per family: the generation at or above which a GPU is `high` WITHOUT a table row.
@@ -231,6 +268,30 @@ export function gpuGenerationFloors(): Readonly<typeof GENERATION_FLOORS> {
   return GENERATION_FLOORS;
 }
 
+/** Band a table row, and the parenthetical that explains it — from ONE reading of the row.
+ *
+ *  ⚠️ **The tier and the explanation must not be computed separately, and they were at first.** A
+ *  first cut had the call sites pass `GPU_BENCHMARK_SAMPLES[key]` to `tierForBenchmarkFps` and a
+ *  sibling helper re-derive "did that round down?" for the reason. A mutation test found the hole
+ *  immediately: drop the sample count at ONE call site and the tier silently stops rounding while
+ *  the reason keeps announcing a rounding that no longer happens. Two halves of one fact, kept in
+ *  step by hand, is the exact shape this repo keeps getting bitten by — so there is now one
+ *  lookup, and a caller cannot hold it wrong.
+ *
+ *  ⚠️ **The rounding case MUST say so.** An Adreno 644 reading 90.3 against a documented `high`
+ *  floor of 85 resolves `mid`, and a reader comparing those two numbers in `diagnose` has every
+ *  reason to file a bug. The one surface that explains a surprising tier has to explain this one
+ *  too — the same argument `resolveProbeClass` makes for labelling its evidence-only lines. */
+function bandRow(key: string, fps: number): { tier: QualityTier; note: string } {
+  const n = GPU_BENCHMARK_SAMPLES[key];
+  const tier = tierForBenchmarkFps(fps, n);
+  if (n === undefined || n >= CONFIDENT_SAMPLES) return { tier, note: '' };
+  const note = `, from ${n} submission${n === 1 ? '' : 's'}`
+    + (tier !== tierForBenchmarkFps(fps)
+      ? ` — rounded DOWN a band for sitting within ${LOW_CONFIDENCE_MARGIN}x of the floor` : '');
+  return { tier, note };
+}
+
 export interface GpuIdentityVerdict {
   tier: QualityTier;
   /** Which layer answered. `'gpu-benchmark'` is a table hit; `'gpu-generation'` is extrapolation
@@ -260,10 +321,11 @@ export function gpuIdentityTier(renderer: string | undefined): GpuIdentityVerdic
 
   const exact = GPU_BENCHMARK_FPS[key];
   if (exact !== undefined) {
+    const { tier, note } = bandRow(key, exact);
     return {
-      tier: tierForBenchmarkFps(exact),
+      tier,
       via: 'gpu-benchmark',
-      reason: `${renderer} is a known GPU (throughput index ${exact})`,
+      reason: `${renderer} is a known GPU (throughput index ${exact}${note})`,
     };
   }
 
@@ -276,10 +338,11 @@ export function gpuIdentityTier(renderer: string | undefined): GpuIdentityVerdic
     const coreless = key.replace(/m[cp]\d+/, '');
     const relaxed = GPU_BENCHMARK_FPS[coreless];
     if (relaxed !== undefined) {
+      const { tier, note } = bandRow(coreless, relaxed);
       return {
-        tier: tierForBenchmarkFps(relaxed),
+        tier,
         via: 'gpu-benchmark',
-        reason: `${renderer} matched ${coreless} (throughput index ${relaxed}); `
+        reason: `${renderer} matched ${coreless} (throughput index ${relaxed}${note}); `
           + 'no row for this core count',
       };
     }

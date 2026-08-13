@@ -37,7 +37,7 @@ afterEach(() => {
 function measurement(totalMs: number): ProbeMeasurement {
   const reading = { kind: 'fill' as const, status: 'escaped' as const, unitsPerMs: 1, bound: 'measured' as const, peakLoad: 8, steps: [] };
   return {
-    intervalMs: 16.7, clockKind: 'webgpu', fill: reading, draw: reading,
+    intervalMs: 16.7, clockKind: 'webgpu', axes: '3d', fill: reading, draw: reading,
     totalMs, rendererMs: 10, compileMs: 10, shadeCompileMs: 0,
     bufferPixels: 1_000_000, shadeRegionPixels: 0,
   };

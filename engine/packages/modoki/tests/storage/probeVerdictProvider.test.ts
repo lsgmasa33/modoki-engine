@@ -23,8 +23,8 @@ const VERDICT: CachedProbeVerdict = {
   deviceClass: 'middle',
   // Real A23 readings (native, 2026-08-11).
   samples: [
-    { cpuUnitsPerMs: 9_200, shadeMfragPerMs: 0.11 },
-    { cpuUnitsPerMs: 9_900, shadeMfragPerMs: 0.14 },
+    { cpuUnitsPerMs: 9_200, shadeMfragPerMs: 0.11, fillMpxPerMs: 0 },
+    { cpuUnitsPerMs: 9_900, shadeMfragPerMs: 0.14, fillMpxPerMs: 0 },
   ],
   final: false,
 };
@@ -47,12 +47,12 @@ describe('probe verdict cache — write then read, the way two launches drive it
     // every launch for the life of the install — measurably worse than having no cache at all,
     // because the launch cost is paid forever and no verdict is ever earned.
     const launches: ProbeReading[] = [
-      { cpuUnitsPerMs: 9_200, shadeMfragPerMs: 0.11 },
-      { cpuUnitsPerMs: 9_900, shadeMfragPerMs: 0.14 },
-      { cpuUnitsPerMs: 10_600, shadeMfragPerMs: 0.16 },
+      { cpuUnitsPerMs: 9_200, shadeMfragPerMs: 0.11, fillMpxPerMs: 0 },
+      { cpuUnitsPerMs: 9_900, shadeMfragPerMs: 0.14, fillMpxPerMs: 0 },
+      { cpuUnitsPerMs: 10_600, shadeMfragPerMs: 0.16, fillMpxPerMs: 0 },
     ];
     const store = probeVerdictStore.get()!;
-    let refined = refineProbeVerdict([], launches[0]);
+    let refined = refineProbeVerdict([], launches[0], '3d');
     for (const reading of launches.slice(1)) {
       store.write({
         fingerprint: VERDICT.fingerprint,
@@ -64,7 +64,7 @@ describe('probe verdict cache — write then read, the way two launches drive it
       // null here the chain silently restarts, which is the whole bug.
       const carried = store.read();
       expect(carried, 'the previous launch\'s samples must survive').not.toBeNull();
-      refined = refineProbeVerdict(carried!.samples, reading);
+      refined = refineProbeVerdict(carried!.samples, reading, '3d');
     }
     expect(refined.samples).toHaveLength(3);
     expect(refined).toMatchObject({ deviceClass: 'middle', final: true });
@@ -74,7 +74,7 @@ describe('probe verdict cache — write then read, the way two launches drive it
     // Pins the two shapes together. `readingOf` is what production persists, so a field it emits
     // that the validator does not know about is the exact drift this file guards.
     const reading = readingOf({
-      intervalMs: 16.7, clockKind: 'webgpu',
+      intervalMs: 16.7, clockKind: 'webgpu', axes: '3d',
       fill: { kind: 'fill', status: 'ceiling', unitsPerMs: 0, bound: 'lower', peakLoad: 0, steps: [] },
       draw: { kind: 'draw', status: 'ceiling', unitsPerMs: 0, bound: 'lower', peakLoad: 0, steps: [] },
       cpu: { kind: 'cpu', status: 'escaped', unitsPerMs: 9_900, bound: 'measured', peakLoad: 131_072, steps: [] },
@@ -93,7 +93,7 @@ describe('probe verdict cache — write then read, the way two launches drive it
     const store = probeVerdictStore.get()!;
     for (const bad of [
       { ...VERDICT, samples: [] },
-      { ...VERDICT, samples: [{ cpuUnitsPerMs: Number.NaN, shadeMfragPerMs: 0.11 }] },
+      { ...VERDICT, samples: [{ cpuUnitsPerMs: Number.NaN, shadeMfragPerMs: 0.11, fillMpxPerMs: 0 }] },
       { ...VERDICT, samples: [{ cpuUnitsPerMs: 9_200 }] },            // half a sample
       { ...VERDICT, deviceClass: 'unknown' as CachedProbeVerdict['deviceClass'] },
       { ...VERDICT, fingerprint: '' },

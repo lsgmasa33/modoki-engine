@@ -65,19 +65,47 @@ const TEST = '1080p Manhattan Offscreen';
 
 /** Minimum submissions behind a GPU's figure.
  *
- *  **THREE, because a median of two is just their mean** — the same argument `PROBE_SAMPLE_TARGET`
- *  makes elsewhere in this engine, applied to the same problem. One or two results are one or two
- *  phones on one or two days, possibly thermally throttled, possibly a spoofed renderer string, and
- *  this table's whole job is to be steadier than the boot probe it replaced. Entries below this are
- *  dropped rather than smoothed: an absent row falls through to the probe, which is the honest
- *  outcome for "we do not know".
+ *  **ONE, since 2026-08-13 — it was THREE, and the softening is measured, not a relaxation of
+ *  standards.** The old rule's argument was *"a median of two is just their mean"*, which is
+ *  correct as statistics and answers the wrong question: this table does not publish an fps, it
+ *  chooses between three coarse bands. What matters is not how noisy one submission is but how
+ *  often that noise crosses a band floor.
  *
- *  ⚠️ Stated because it is the kind of threshold that looks arbitrary later: raising this from 2 to
- *  3 also removed a row that was visibly wrong — `Mali-T720` (a 2014 entry-level Midgard part)
- *  reading 13.0 on n=2, which would have ranked it ABOVE a 2021 Mali-G68. The justification is the
- *  median argument, not that one row; but a rule that also deletes a known-bad datum is worth
- *  keeping for both reasons. */
-const MIN_SAMPLES = 3;
+ *  Bootstrapped over the source CSV itself — every individual submission compared against the
+ *  full-population median of its own GPU, across GPUs with n >= 8 (3,266 submissions):
+ *
+ *      ratio to the truth   p05 0.59   p25 0.86   p50 1.00   p75 1.06   p95 1.49
+ *      lands in a DIFFERENT band than the truth ................ 0.7%
+ *      reads LOW  (< half the truth) ........................... 2.87%
+ *      reads WILDLY HIGH (> 3x the truth) ...................... 0.03%  (1 of 3,032)
+ *
+ *  ⭐ **The error is skewed the safe way by ~100x.** The direction that costs a GPU context and a
+ *  permanently black screen (#156) is reading HIGH, and that is the rare one; reading low costs a
+ *  beat of uglier rendering. The single >3x outlier in the whole corpus is instructive about what
+ *  the risk actually IS — a `Mali-T720` submission at 65.7 fps against a population median of 2.8
+ *  over 812 submissions, i.e. a spoofed or mislabelled entry, not thermal noise.
+ *
+ *  ⚠️ **And the comparison is not "table against truth", it is "table against what happens
+ *  INSTEAD".** An absent row falls through to the boot probe — which this workstream measured
+ *  missing by a full band on a Galaxy S22 and reading its deciding `shade` axis 1.6-3x low on both
+ *  Android phones it was run on. A 0.7% wrong-band risk is a large improvement on that, not a
+ *  concession.
+ *
+ *  What it buys: **84 GPUs -> 132**. The additions are not exotica — they are the high-volume
+ *  budget and midrange silicon that had no row at all: Adreno 610/612/615/616/619/620/644,
+ *  Mali-G31/G51/G52 MC1/G57/G57 MC3/G72 MP3/G76 MC4/G610 MC6/G715-Immortalis MC11, Xclipse 940,
+ *  Mali-G925-Immortalis MC12.
+ *
+ *  ⚠️ **The hedge lives at the CONSUMER, not here** — `gpuIdentity.ts`'s `CONFIDENT_SAMPLES` rounds
+ *  a low-n row DOWN when it sits just above a band floor, which is the only place a bad read can
+ *  change an answer. That is why `GPU_BENCHMARK_SAMPLES` is emitted beside the figures rather than
+ *  being generator-internal bookkeeping: the runtime needs to know how much to trust each row.
+ *  Keep the two in step — softening here without that rule ships the 4 boundary-adjacent rows
+ *  (Adreno 615/616, Skylake GT1, Adreno 644) at face value.
+ *
+ *  ⚠️ Kept as a named constant rather than deleting the filter, because the honest floor is still
+ *  "at least one real submission" and a future source may want it raised again. */
+const MIN_SAMPLES = 1;
 
 /** Parse one CSV line, honouring quotes. Device and vendor names really do contain commas
  *  (`Samsung Electronics Co., Ltd.`), so a naive `split(',')` shifts every later field — which
@@ -197,9 +225,10 @@ const out = `/* eslint-disable */
  *
  *  Published at https://github.com/Kishonti-Opensource/GFXBench_and_CompuBench_results. The
  *  specific changes: Android GPU rows for a single test were selected, per-device medians reduced
- *  to one median per GPU, GPUs with fewer than ${MIN_SAMPLES} submissions dropped, vendor
- *  prefixes, ANGLE wrappers and core-count descriptors stripped, and keys renormalized. Full
- *  notice: \`oss/THIRD-PARTY-NOTICES.md\`.
+ *  to one median per GPU, GPUs with fewer than ${MIN_SAMPLES} submission${MIN_SAMPLES === 1 ? '' : 's'} dropped,
+ *  the submission count retained alongside each figure, vendor prefixes, ANGLE wrappers and
+ *  core-count descriptors stripped, and keys renormalized. Full notice:
+ *  \`oss/THIRD-PARTY-NOTICES.md\`.
  *
  *  ${kept.length} entries, from ${byKey.size} Android GPUs on this test.
  */
@@ -207,9 +236,13 @@ export const GPU_BENCHMARK_FPS: Readonly<Record<string, number>> = {
 ${kept.map((r) => `  ${JSON.stringify(r.key)}: ${r.fps},`).join('\n')}
 };
 
-/** How many submissions each figure is a median of. Not read at runtime — it exists so a
- *  surprising row can be weighed without regenerating, and so a test can assert the thin ones are
- *  known rather than accidental. */
+/** How many submissions each figure is a median of.
+ *
+ *  ⚠️ **READ AT RUNTIME since the sample gate softened to ${MIN_SAMPLES}** — it was documented as
+ *  "not read at runtime" while the gate was 3 and every row was equally trustworthy. It is now the
+ *  input to \`gpuIdentity.ts\`'s \`CONFIDENT_SAMPLES\` rule, which rounds a thin row DOWN when it
+ *  sits just above a band floor. Dropping this map would not fail to compile in an obvious place;
+ *  it would silently promote four known boundary-adjacent GPUs. */
 export const GPU_BENCHMARK_SAMPLES: Readonly<Record<string, number>> = {
 ${kept.map((r) => `  ${JSON.stringify(r.key)}: ${r.n},`).join('\n')}
 };

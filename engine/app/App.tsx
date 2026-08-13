@@ -114,6 +114,9 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
   const [disable3D, setDisable3D] = useState(false);
   const [otaGate, setOtaGate] = useState<OtaGateState | null>(null);
   const activeGameIdRef = useRef<string | null>(null);
+  /** Whether this shell started the no-3D tier-calibration loop, so a game swap knows to stop it.
+   *  A ref rather than state: it is read inside the load effect and must never re-run it. */
+  const no3DTierLoopRef = useRef(false);
 
   useEffect(() => subscribeOtaGate(setOtaGate), []);
 
@@ -142,6 +145,19 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
           const prevDef = findGame(prevGameId);
           if (prevDef?.unregisterSystems) await prevDef.unregisterSystems();
           clearAppServices(); // drop the previous game's services before the next registers
+          // ⚠️ AND THE 2D TIER-CALIBRATION LOOP, which the no-3D boot path below registers on the
+          // frame driver (#203). It was exported with a teardown and never given one: swapping a
+          // 2D game for a 3D one skipped the branch that starts it, so nothing stopped it, and
+          // `Scene3D` then ticked `tickTierCalibration` alongside it every frame for the rest of
+          // the session. Stopped unconditionally here and restarted below only if the NEW game
+          // needs it, so the pair is symmetric rather than conditional at both ends — a
+          // conditional teardown is what produced the leak.
+          if (no3DTierLoopRef.current) {
+            const { stopTierCalibrationForNo3DProject } =
+              await import('@modoki/engine/runtime/rendering/tierBoot');
+            stopTierCalibrationForNo3DProject();
+            no3DTierLoopRef.current = false;
+          }
         }
         if (cancelled) return;
         if (def.registerPostprocessors) await def.registerPostprocessors();
@@ -186,12 +202,51 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
         if (cancelled) return;
 
         setGameConfig(config);
+        const no3D = !!config.disable3D || !Scene3D;
         setDisable3D(!!config.disable3D);
 
         if (isFirstLoad) {
           // First-ever render: trait registry + font kickoff.
           initWorldSync();
         }
+        // ⭐ A PROJECT WITH NO 3D SURFACE RESOLVES ITS QUALITY TIER HERE (#203).
+        //
+        // A 3D project resolves inside `makeWebGPURenderer`, and must: `antialias` is a renderer
+        // CONSTRUCTOR option, so a tier decided after the first drawing buffer exists cannot apply
+        // it. A project that never builds a renderer therefore never reached that call at all —
+        // `getActiveQualityTier()` stayed null for the process lifetime, `getActiveTierOverrides()`
+        // returned UNCLAMPED, and every field in the `rendering.three.tiers` config chess,
+        // audio-demo and space-invader were seeded with did nothing. This is the missing door.
+        //
+        // ⚠️ `!Scene3D` as well as `config.disable3D` — they are DIFFERENT projects and the second
+        // is the one a `disable3D` check misses. `space-invader` sets `build.modules.render3d:
+        // false`, which makes `Scene3D` null at build time while `disable3D` stays unset, so a
+        // condition on the config flag alone would leave the playable-ad project — the one with the
+        // tightest performance budget here — exactly as unclassified as before.
+        //
+        // ⚠️ AWAITED, and ahead of `setConfigReady`. The 2D backing-buffer scale comes from the
+        // resolved tier and `setConfigReady(true)` is what mounts the renderers; resolving after it
+        // would size the first buffers unclamped and pop when the tier landed. Same ordering
+        // argument as the `PlayerPrefs.init` above, which is awaited here for the sibling reason
+        // (the player's saved tier choice is read synchronously out of that cache).
+        //
+        // ⚠️⚠️ **AND IT MUST COME AFTER `initWorldSync()`, WHICH IS WHERE THE PROJECT'S RENDER
+        // SETTINGS ARE INJECTED** (`ecs/register.ts` → `setRenderSettings(projectConfig.rendering)`).
+        // It sat one block earlier for its first hour and was silently WRONG on device: with the
+        // settings still at their defaults, `three.tiers` is empty, the resolver's "one config ⇒
+        // nothing to choose between" gate fires, and the project publishes `{tier: 'high', source:
+        // 'single-config'}` — i.e. UNCLAMPED — before its two authored configs exist. Sticky, too:
+        // `resolveActiveTier` early-outs on an existing tier, so the correct resolution can never
+        // happen afterwards. Measured on a Galaxy A23 running `games/space-invader`: not one probe
+        // line across a wiped launch, because the tier had already been decided from an empty
+        // config. Pinned by `tierBoot.test.ts` ("resolving before the project's tiers are loaded").
+        if (no3D) {
+          const { resolveTierForNo3DProject } = await import('@modoki/engine/runtime/rendering/tierBoot');
+          await resolveTierForNo3DProject();
+          no3DTierLoopRef.current = true;
+          if (cancelled) return;
+        }
+
 
         // Mount renderers BEFORE scene load so their registerBeforeSwap hooks
         // (Scene3D shader prewarm, Scene2D sprite preload) are registered in

@@ -248,6 +248,30 @@ export const RAMP_BOUNDS: Record<RampKind, { startLoad: number; maxLoad: number 
    *  4 to 4096: at 16 dependent taps over 100x100 px, load 4 is ~0.6 M taps (sub-millisecond on a
    *  flagship, a few ms on a Y6) and the escape bar sits ~250x above the former, ~20x above the
    *  latter. Both ends therefore land inside the ramp instead of against a bound. */
+  // ⛔ **RAISING `startLoad` TO 32 WAS TRIED ON HARDWARE AND REFUTED — do not retry it**
+  // (2026-08-13, `games/sling`, three wiped launches per device on Y6 / A23 / S22).
+  //
+  // The theory was sound and the data killed it. This axis INVERTS at the top — a Galaxy S22
+  // derives less shading throughput than a Galaxy A23, which is impossible — and the S22's step
+  // table looked like it named the cause:
+  //     shade [4:4.2 8:4.2 16:4.2 32:8.6 64:12.7 ...]
+  //             ^^^^^^^^^^^^^^^^ flat across a 4x load change: a ~4.2 ms GPU-clock latency floor.
+  // Three of eight fitted points carrying no signal, and a fixed cost weighs heaviest on the
+  // FASTEST device, so removing them should have lifted the S22 specifically. Measured, medians:
+  //
+  //     startLoad  4    A23 0.15 / 0.12      S22 0.08 / 0.07     (two sessions)
+  //     startLoad 32    A23 0.13             S22 0.07            <- inversion UNCHANGED
+  //
+  // The floor is real and is not the cause. The surviving explanation, UNTESTED: 16 DEPENDENT
+  // texture reads are LATENCY-bound, and a fixed 100x100 px region cannot supply a wide GPU with
+  // enough parallel fragments to hide that latency. A flagship's advantage is throughput, which a
+  // 10k-fragment workload never asks for, while the A23's narrower GPU keeps its fewer lanes busy.
+  // If that is right the REGION is the knob, not the load — and enlarging it trades against the
+  // bounded-submit safety property the fixed region exists to provide. Measure before changing it.
+  //
+  // ⚠️ Third ramp to fail this way (fill measured submit; shade measures latency): **a synthetic
+  // ramp measures whatever is scarcest, which is not necessarily what it is named after.** Check a
+  // new axis against hardware it should rank obviously before trusting its ordering.
   shade: { startLoad: 4, maxLoad: 4096 },
   /** Transform propagations per synchronous loop — pure main-thread CPU, no GPU at all.
    *
@@ -311,8 +335,26 @@ export function estimateIntervalMs(warmupFrameMs: readonly number[]): number {
  *  PRESENTATION-paced ramp needs doublings and the display decides how long one costs (see its
  *  comment — it was moved off wall clock precisely because 150 ms bought ~4 frames at 30 Hz). Neither
  *  argument survives when nothing waits for a frame, so that path budgets in ms again. */
-export function startRamp(kind: RampKind, intervalMs: number, budgetMsOverride?: number): RampState {
-  const { startLoad, maxLoad } = RAMP_BOUNDS[kind];
+export function startRamp(
+  kind: RampKind,
+  intervalMs: number,
+  budgetMsOverride?: number,
+  /** Begin at this load instead of the kind's authored `startLoad`.
+   *
+   *  ⚠️ **A TEST SEAM, and it exists to protect RECORDED EVIDENCE from a production tuning
+   *  change.** `readRamp`'s outlier tests replay exact step tables captured off real phones —
+   *  `[8.3, 10.5, 11.1, 13.6, 17.5, 26.1, 37.7, 49.9, 188.7]` is one Galaxy A23 launch. Those
+   *  frame times belong to the loads they were MEASURED at, so when `RAMP_BOUNDS.shade.startLoad`
+   *  moved from 4 to 32 the recordings silently re-attached to loads that never produced them and
+   *  three tests went red. The recordings are not stale — they are evidence about the FITTING
+   *  logic, which is what those tests are about, and that logic does not care where the ramp
+   *  starts. Pinning them here keeps the evidence intact and lets the production constant move.
+   *
+   *  Never pass this from production code: the authored `startLoad` is the measurement decision. */
+  startLoadOverride?: number,
+): RampState {
+  const { startLoad: authoredStart, maxLoad } = RAMP_BOUNDS[kind];
+  const startLoad = startLoadOverride ?? authoredStart;
   return {
     kind,
     intervalMs,
@@ -611,8 +653,22 @@ export interface ProbeMeasurement {
   intervalMs: number;
   /** What timed the steps — see {@link ProbeClockKind}. Report it beside every number it produced. */
   clockKind: ProbeClockKind;
-  fill: RampReading;
-  draw: RampReading;
+  /** Which GPU axis this run measured — see `runBootRampProbe`'s `only2D`.
+   *
+   *  ⚠️ **EXPLICIT, not inferred from which reading is present.** "`shade` is undefined, so it must
+   *  have been a 2D probe" is true today and silently wrong the first time a 3D probe's heavy
+   *  program fails to compile — which is a supported, tested degrade path. The classifier would
+   *  then judge a 3D device against 2D thresholds and say nothing about it. */
+  axes: '2d' | '3d';
+  /** The full-viewport overdraw ramp. Present on a 2D probe, where it is the DECIDING GPU axis:
+   *  a 2D project's only tier-controlled GPU knob is `pixiPixelRatioCap`, which is fill-rate bound.
+   *  Absent on a 3D probe, which spends its GPU budget on `shade` instead. */
+  fill?: RampReading;
+  /** The per-object submit ramp. Measured by neither probe shape today — it has not voted since
+   *  2026-08-11 and fails outright on the weakest hardware (Y6 0/6, iPhone 7 0/3), which is
+   *  precisely the population it would have to be right about. Kept in the type because the ramp
+   *  itself still exists and can be re-enabled by naming it in `gpuKinds`. */
+  draw?: RampReading;
   /** The heavy-shader ramp, when the probe could build and compile its material.
    *
    *  Optional because a backend that refuses the material must still yield the fill/draw
@@ -665,7 +721,7 @@ export interface ProbeMeasurement {
  *
  *  The DRAW ramp needs no such treatment: draw calls per millisecond is already resolution-free. */
 export function fillMegapixelsPerMs(m: ProbeMeasurement): number {
-  if (!m.bufferPixels || m.fill.bound === 'none') return 0;
+  if (!m.bufferPixels || !m.fill || m.fill.bound === 'none') return 0;
   return (m.fill.unitsPerMs * m.bufferPixels) / 1_000_000;
 }
 
@@ -739,8 +795,22 @@ export function probeFingerprint(input: ProbeFingerprintInput): string {
  *
  *  1 = the two-band (weak/capable) classifier, thresholds unset — so it never cached anything in
  *  production. 2 = the three-band classifier of #188. 3 = blended ramps, so overdraw is no longer
- *  removed by tile-based hidden-surface removal before it can be measured. */
-const CLASSIFIER_VERSION = 4;
+ *  removed by tile-based hidden-surface removal before it can be measured. 4 = the shade axis
+ *  joined cpu in deciding.
+ *
+ *  **5 = the ramps moved off Three onto a raw WebGL2 context** (#203, `rampWorkloadGL.ts`), and
+ *  this is the clearest case the rule has ever had: the same ramp, the same unit, a different
+ *  instrument. Every v4 sample was taken through `WebGPURenderer` — a different API, a different
+ *  compiler, a different submit path — so medianing one against a v5 sample would combine two
+ *  measurements of the same quantity taken with two rulers. v5 also introduces the 2D probe shape,
+ *  whose deciding axis is `fill` rather than `shade`.
+ *
+ *  **6 = the GPU ramps discard a warm-up PASS**, so a flagship is measured after its governor has
+ *  clocked up rather than at idle. Measured: a Galaxy S22 reads 7.5 on pass 1 and 19.9 on pass 2,
+ *  where a Galaxy A23 moves only 12.1 -> 15.6. Every v5 sample was taken at whatever clock the
+ *  device happened to be at, and the error is largest on the fastest hardware — so medianing one
+ *  against a v6 sample would mix two populations, not two readings. */
+const CLASSIFIER_VERSION = 6;
 
 /** One band's floor: the throughput a device must clear on BOTH ramps to be called this.
  *
@@ -759,12 +829,21 @@ const CLASSIFIER_VERSION = 4;
  *  NPR post-FX and shadow sampling — texture-sampling and ALU) plus the main-thread cost that this
  *  plan's own strongest finding says decided forest-camp. */
 export interface ProbeThreshold {
-  /** Transform propagations per ms — main-thread CPU. Resolution-free by construction. */
+  /** Transform propagations per ms — main-thread CPU. Resolution-free by construction, and the one
+   *  axis BOTH probe shapes share: a 2D game propagates transforms exactly as a 3D one does. */
   cpuUnitsPerMs: number;
   /** MILLIONS of heavy shaded fragments per ms, never the ramp's raw instances/ms — see
-   *  {@link shadeMegaFragmentsPerMs} for why the raw figure is not comparable across devices. */
-  shadeMfragPerMs: number;
+   *  {@link shadeMegaFragmentsPerMs} for why the raw figure is not comparable across devices.
+   *  The GPU floor of a **3D** threshold. */
+  shadeMfragPerMs?: number;
+  /** MEGAPIXELS of overdraw per ms — {@link fillMegapixelsPerMs}. The GPU floor of a **2D**
+   *  threshold, where the tier's only GPU knob (`pixiPixelRatioCap`) is fill-rate bound. */
+  fillMpxPerMs?: number;
 }
+
+/** Which GPU axis a probe ran, and therefore which threshold table judges it. See
+ *  {@link ProbeMeasurement.axes} for why this is carried explicitly rather than inferred. */
+export type ProbeAxes = '2d' | '3d';
 
 /** The two band boundaries, MEASURED on SEVEN DEVICES across two platforms (#188, 2026-08-11).
  *
@@ -814,11 +893,108 @@ export const PROBE_THRESHOLDS: {
 } = {
   /** Between the iPhone 7 (5.5k / 0.03) and the A23 (9.9k / 0.13). The SHADE floor is what does the
    *  work here — it is what keeps the iPhone 7 out of `middle`, since that phone clears the cpu
-   *  floor comfortably. */
-  middle: { cpuUnitsPerMs: 4_500, shadeMfragPerMs: 0.06 },
+   *  floor comfortably.
+   *
+   *  ⭐ **THE CPU FLOOR MOVED 4,500 -> 2,500 WHEN THE PROBE STOPPED MEASURING IDLE CLOCKS**
+   *  (2026-08-13, v6 — see `CLASSIFIER_VERSION`). Re-measured on the shipped warm-up path,
+   *  `games/sling`, three wiped launches per device:
+   *
+   *      Huawei Y6    cpu 1.8/2.0/1.9 -> 1.9k    shade 0.04/0.05/0.03 -> 0.04
+   *      Galaxy A23   cpu 3.0/8.2/3.5 -> 3.5k    shade 0.14/0.18/0.09 -> 0.14
+   *      Galaxy S22   cpu 21.5/15.2/17.0 -> 17.0k shade 0.19/0.18/0.09 -> 0.18
+   *
+   *  ⭐ **0.04 < 0.14 < 0.18 — the shade axis is MONOTONE for the first time**, and the S22 clears
+   *  the capable floor. This file said twice that `capable` was unreachable on Android; it was a
+   *  governor artifact, not a boundary problem, and the discarded warm-up pass removed it.
+   *
+   *  The cpu floor had to move because the A23's cpu reads 3.0-8.2k on this instrument and 4,500
+   *  vetoed it on two launches of three — a device with a clean shade reading of 0.14 being called
+   *  `weak` by the axis that is NOT deciding. 2,500 separates every observed reading (Y6 max 2.0k,
+   *  A23 min 3.0k) and sits between the two derivations: 2.45k from that min/max pair, 2.58k from
+   *  the medians.
+   *
+   *  ⚠️ **ONLY THIS ONE NUMBER MOVED, deliberately.** Checked against all six devices the v4 table
+   *  was derived from — Y6, iPhone 7, A23, iPhone 8, S22, iPhone Air — and every one still bands
+   *  exactly as before. Three of those are iOS and have no v6 measurement (iOS answers from the
+   *  model-id table and never reaches the probe), so a wider retune would have discarded recorded
+   *  evidence to fit three Android phones. The `capable` row needs no change at all: the S22's new
+   *  medians (17.0k / 0.18) clear it as they stand. */
+  middle: { cpuUnitsPerMs: 2_500, shadeMfragPerMs: 0.06 },
   /** Between the iPhone 8 (10.9k / 0.20) and the S22 (21.3k / 0.21). Here it is the CPU floor that
    *  does the work: shade has saturated by this point and cannot tell these three apart. */
   capable: { cpuUnitsPerMs: 14_500, shadeMfragPerMs: 0.165 },
+};
+
+/** The 2D probe's band boundaries, **MEASURED ON THREE ANDROID DEVICES, 2026-08-13** (#203/#204).
+ *
+ *  They shipped `null` for one day, exactly as the 3D pair shipped null, because a threshold
+ *  invented before the hardware is measured is what ossifies. This is the campaign that filled them
+ *  in: `games/space-invader` (`render3d: false`, so the probe ran with no Three in the process at
+ *  all — which is itself the proof `rampWorkloadGL` works), a debug build, `pm clear` before EVERY
+ *  launch so no reading is a refinement of another, three launches per device.
+ *
+ *      Huawei Y6 2019   PowerVR GE8300    fill 1.43 / 1.02 / 0.66  -> median 1.02   cpu  2.0k
+ *      Galaxy A23       Mali-G57 MC2      fill 2.97 / 1.93 / 2.77  -> median 2.77   cpu 10.1k
+ *      Galaxy S22       Adreno 730        fill 7.88 / 7.69 / 7.47  -> median 7.69   cpu 13.9k
+ *
+ *  ⭐ **THE FILL AXIS SEPARATES ALL THREE, WHICH `shade` NEVER DID.** 1.02 / 2.77 / 7.69 is monotone
+ *  with 2.7x and 2.8x between neighbours. Compare the 3D pair, whose `shade` axis reads
+ *  0.20/0.21/0.20 for an iPhone 8, an S22 and an iPhone Air and saturates from a 2017 phone upward.
+ *  Measuring the axis the knob actually moves is what bought the separation: a 2D tier's only GPU
+ *  knob is `pixiPixelRatioCap`, and fill rate is what it trades against.
+ *
+ *  ⚠️ **THE S22 FIGURE IS A LOWER BOUND — `ceiling/lower`, not `escaped/measured`.** Its fill ramp
+ *  exhausted `RAMP_BOUNDS.fill.maxLoad` without ever slowing to the escape threshold, so the true
+ *  value is *at least* 7.69 and unknown above that. Two consequences, both stated rather than
+ *  buried:
+ *    - Using it to place `capable` is SOUND for the direction that matters — "at least 7.69, and
+ *      7.69 clears 4.6" needs no upper bound, which is the same argument `clears()` already makes
+ *      for a `'lower'` reading.
+ *    - But the true gap is WIDER than measured, so 4.6 is the LOWEST defensible capable floor
+ *      rather than the centre of the real gap. Raising `RAMP_BOUNDS.fill.maxLoad` until the S22
+ *      escapes would settle it. **Not done here** because the reading is already load-bearing in
+ *      the safe direction — see below.
+ *
+ *  ⚠️ **AND THE SAFETY ASYMMETRY IS WEAKER IN 2D THAN IN 3D, WHICH IS WHY A SLIGHTLY LOW CAPABLE
+ *  FLOOR IS ACCEPTABLE HERE AND WOULD NOT BE THERE.** The 3D rule ("never guess upward") is
+ *  written against a measured failure: booting `high` on weak hardware lights up IBL, shadows and
+ *  post-FX, loses the GPU context, and blacks the screen for the process lifetime (#156). A 2D
+ *  project has none of those — a wrong `high` costs fill rate at a higher DPR, which is the ~4x
+ *  the Y6 measured (1x = 22ms/45fps, 2x = 69ms/14fps). Bad, and RECOVERABLE: live calibration now
+ *  runs on 2D projects (`tierBoot.ts`), so an over-promoted device demotes itself within seconds.
+ *  Before #203 it could not, and this floor would have had to be far more conservative.
+ *
+ *  ── WHY `cpu` DOES NOT DECIDE `capable` HERE, AND THE 3D TABLE'S ARGUMENT DOES NOT CARRY ──
+ *  The 3D pair demands BOTH axes because each covers the other's blind spot. On this population
+ *  the cpu axis **cannot separate mid from high at all**: the A23 ranges 9.5-12.8k and the S22
+ *  12.0-13.9k, so their ranges OVERLAP, and the S22 also produced a 218.5k first-launch outlier
+ *  (17x its other two readings). A capable floor on cpu would be decided by launch noise. So the
+ *  capable row carries the SAME cpu floor as middle: cpu decides weak-versus-not, fill decides the
+ *  rest, and that division is a measurement rather than a preference.
+ *
+ *  ⚠️ **A CORROBORATION THIS COMMENT ONCE CLAIMED HAS EXPIRED — do not lean on it.** It read: the
+ *  geometric mean of the Y6 (2.0k) and the A23 (10.1k) is 4.49k, and the 3D table independently put
+ *  its middle cpu floor at 4,500, so "two independent campaigns landing on the same boundary is the
+ *  strongest evidence in this file that the cpu axis measures something real". The 3D floor moved
+ *  to **2,500** on 2026-08-13 (v6, after the warm-up fix), so the two no longer agree — and the
+ *  reason they diverged is the point: the A23's cpu reads 3.0-15.1k across sessions on the same
+ *  project, a 5x spread. The agreement was a coincidence of which session each campaign sampled.
+ *  **The cpu axis is the noisy one**; see the plan's § 1 for the boot-vs-quiet validation it needs.
+ *
+ *  ⚠️ Fill these in from measurements, never from a datasheet — and never from the 3D pair, which
+ *  was taken through a `WebGPURenderer` (see `CLASSIFIER_VERSION`). */
+export const PROBE_THRESHOLDS_2D: {
+  middle: ProbeThreshold | null;
+  capable: ProbeThreshold | null;
+} = {
+  /** Between the Y6 (1.02 Mpx/ms) and the A23 (2.77) — geometric mean 1.68. The cpu floor is the
+   *  same 4,500 the 3D table derived independently; here it is the geometric mean of 2.0k and
+   *  10.1k, which is 4.49k. */
+  middle: { cpuUnitsPerMs: 4_500, fillMpxPerMs: 1.68 },
+  /** Between the A23 (2.77) and the S22 (>= 7.69) — geometric mean 4.62, rounded to 4.6. The cpu
+   *  floor is deliberately NOT raised: those two devices' cpu ranges overlap, so it cannot decide
+   *  this boundary and pretending otherwise would make the verdict depend on launch noise. */
+  capable: { cpuUnitsPerMs: 4_500, fillMpxPerMs: 4.6 },
 };
 
 /** One device's throughput on both ramps, in the two COMPARABLE units — the only thing worth
@@ -828,8 +1004,13 @@ export interface ProbeReading {
   /** Transform propagations per ms. See {@link ProbeThreshold} for why this replaced `fill`. */
   cpuUnitsPerMs: number;
   /** Millions of heavy shaded fragments per ms — {@link shadeMegaFragmentsPerMs}, never the raw
-   *  instances/ms, which is not comparable across devices. */
+   *  instances/ms, which is not comparable across devices. Zero on a 2D probe, which does not run
+   *  the shade ramp. */
   shadeMfragPerMs: number;
+  /** Megapixels of overdraw per ms — {@link fillMegapixelsPerMs}, never the raw screens/ms, which
+   *  is a different number on every panel. The DECIDING GPU axis on a 2D probe; zero on a 3D one,
+   *  which does not run the fill ramp. */
+  fillMpxPerMs: number;
   /** ⚠️ **`measured` WAS HERE AND IS GONE (2026-08-11) — removed WITH the one-pass settle, and
    *  only safe to remove because of it.**
    *
@@ -851,6 +1032,7 @@ export function readingOf(m: ProbeMeasurement): ProbeReading {
   return {
     cpuUnitsPerMs: m.cpu?.unitsPerMs ?? 0,
     shadeMfragPerMs: shadeMegaFragmentsPerMs(m),
+    fillMpxPerMs: fillMegapixelsPerMs(m),
   };
 }
 
@@ -858,35 +1040,56 @@ export function readingOf(m: ProbeMeasurement): ProbeReading {
  *  bottlenecks and a device that is fill-strong and submit-weak is not capable — it is
  *  forest-camp's failure mode wearing a good fill number. A `'lower'` bound counts as clearing:
  *  "at least X, and X clears" is a sound argument even though the true figure is unknown. */
-function clears(r: ProbeReading, t: ProbeThreshold): boolean {
-  return r.cpuUnitsPerMs >= t.cpuUnitsPerMs && r.shadeMfragPerMs >= t.shadeMfragPerMs;
+function clears(r: ProbeReading, t: ProbeThreshold, axes: ProbeAxes): boolean {
+  if (r.cpuUnitsPerMs < t.cpuUnitsPerMs) return false;
+  // ⚠️ **FAILS CLOSED ON A MISSING GPU FLOOR, and it used to fail OPEN while a comment here claimed
+  // the type prevented the case.** It does not: both GPU fields are optional on `ProbeThreshold`
+  // (they must be — a 2D threshold carries `fillMpxPerMs` and a 3D one `shadeMfragPerMs`, so
+  // neither can be required), so `{ cpuUnitsPerMs: 4_500 }` type-checks perfectly. With the old
+  // `?? 0`, such a row turned the GPU comparison into "any non-negative reading clears" and
+  // collapsed the band decision to CPU ALONE — which is precisely the classifier this file's own
+  // derivation proves wrong (the iPhone 7 clears the middle cpu floor and fails the middle shade
+  // floor; a cpu-only classifier calls a 2016 phone `middle`).
+  //
+  // `undefined` now means NOTHING clears, so a table edited to drop its axis's floor reports every
+  // device as `weak` — loudly wrong and safe, rather than quietly permissive and unsafe. A guard
+  // test asserts both shipped tables carry the floor their axis reads, so the loud case cannot
+  // reach a device either.
+  const floor = axes === '2d' ? t.fillMpxPerMs : t.shadeMfragPerMs;
+  if (floor === undefined) return false;
+  return (axes === '2d' ? r.fillMpxPerMs : r.shadeMfragPerMs) >= floor;
 }
 
 /** Band a single reading falls in. Split out from {@link classifyDevice} so a MEDIAN of several
  *  launches' readings can be classified by exactly the same rule as one launch's — the alternative
  *  being a second copy of the boundary comparisons, which would drift. */
-export function classifyReading(r: ProbeReading): ProbeVerdict {
-  const { middle, capable } = PROBE_THRESHOLDS;
+export function classifyReading(r: ProbeReading, axes: ProbeAxes = '3d'): ProbeVerdict {
+  const { middle, capable } = axes === '2d' ? PROBE_THRESHOLDS_2D : PROBE_THRESHOLDS;
   if (middle === null || capable === null) {
     return {
       deviceClass: 'unknown',
-      reason: 'probe thresholds are unset — measure real hardware before classifying',
+      reason: `${axes} probe thresholds are unset — measure real hardware before classifying`,
     };
   }
   const detail = `cpu ${(r.cpuUnitsPerMs / 1000).toFixed(1)}k xform/ms, `
-    + `shade ${r.shadeMfragPerMs.toFixed(3)}Mfrag/ms`;
-  if (clears(r, capable)) {
+    + (axes === '2d'
+      ? `fill ${r.fillMpxPerMs.toFixed(3)}Mpx/ms`
+      : `shade ${r.shadeMfragPerMs.toFixed(3)}Mfrag/ms`);
+  if (clears(r, capable, axes)) {
     return { deviceClass: 'capable', reason: `${detail} — clears the capable floor on both ramps` };
   }
-  if (clears(r, middle)) {
+  if (clears(r, middle, axes)) {
     return { deviceClass: 'middle', reason: `${detail} — clears the middle floor on both ramps` };
   }
   // Name the ramp that fell short, not just the verdict: "weak on draw" and "weak on fill" are
   // different hardware and lead to different authoring advice, and this string is what `diagnose`
   // and the boot log show.
   const cpuShort = r.cpuUnitsPerMs < middle.cpuUnitsPerMs;
-  const shadeShort = r.shadeMfragPerMs < middle.shadeMfragPerMs;
-  const short = cpuShort && shadeShort ? 'both ramps' : cpuShort ? 'the cpu ramp' : 'the shade ramp';
+  const gpuName = axes === '2d' ? 'the fill ramp' : 'the shade ramp';
+  const gpuShort = axes === '2d'
+    ? r.fillMpxPerMs < (middle.fillMpxPerMs ?? 0)
+    : r.shadeMfragPerMs < (middle.shadeMfragPerMs ?? 0);
+  const short = cpuShort && gpuShort ? 'both ramps' : cpuShort ? 'the cpu ramp' : gpuName;
   return { deviceClass: 'weak', reason: `${detail} — under the middle floor on ${short}` };
 }
 
@@ -912,8 +1115,15 @@ export function classifyDevice(m: ProbeMeasurement): ProbeVerdict {
   // `'absent'` rather than a real `RampStatus`: a ramp that never ran did not exhaust a frame
   // budget, and saying `budget` there is a claim about something that did not happen — the exact
   // sort of quietly-false detail this module refuses to print elsewhere.
+  // ⚠️ WHICH GPU RAMP DECIDES DEPENDS ON THE PROBE SHAPE (#203). A 2D probe never runs `shade`, so
+  // demanding it here would refuse every 2D device a verdict while its own deciding axis sat
+  // measured and ignored — the "mechanism that cannot fire" shape, in the one function whose job is
+  // to reach a conclusion.
+  const gpu = m.axes === '2d'
+    ? m.fill ?? { kind: 'fill' as const, status: 'absent' }
+    : m.shade ?? { kind: 'shade' as const, status: 'absent' };
   const undecidable = !m.cpu || m.cpu.bound === 'none' ? m.cpu ?? { kind: 'cpu' as const, status: 'absent' }
-    : !m.shade || m.shade.bound === 'none' ? m.shade ?? { kind: 'shade' as const, status: 'absent' }
+    : !('bound' in gpu) || gpu.bound === 'none' ? gpu
       : null;
   if (undecidable) {
     return {
@@ -923,7 +1133,7 @@ export function classifyDevice(m: ProbeMeasurement): ProbeVerdict {
   }
   // Shade compared in MEGA-FRAGMENTS/ms, not the ramp's raw instances/ms — see
   // shadeMegaFragmentsPerMs.
-  return classifyReading(readingOf(m));
+  return classifyReading(readingOf(m), m.axes);
 }
 
 // ── Refining a verdict ACROSS LAUNCHES (owner decision, 2026-08-09) ────────────────────────
@@ -1005,6 +1215,11 @@ export interface ProbeRefinement {
 export function refineProbeVerdict(
   previous: readonly ProbeReading[],
   reading: ProbeReading,
+  /** Which axis decides — the same discriminator {@link classifyReading} takes, threaded through
+   *  so a median of 2D readings is judged by the 2D table. A default would be a silent bug: the
+   *  medians would be right and the boundary they were compared against would be the other
+   *  shape's. */
+  axes: ProbeAxes,
 ): ProbeRefinement {
   // ⚠️ NON-FINITE SAMPLES ARE DROPPED HERE, at the policy boundary, even though the persistence
   // layer already validates with `Number.isFinite`. This module is pure and its `previous` comes
@@ -1015,15 +1230,20 @@ export function refineProbeVerdict(
   // the median at all. Measured: one NaN sample among three returned `weak` — the safe direction
   // by luck, not by design — and stayed in the array to poison every later launch's median too.
   const samples = [...previous, reading]
-    .filter((s) => Number.isFinite(s.cpuUnitsPerMs) && Number.isFinite(s.shadeMfragPerMs))
+    .filter((s) => Number.isFinite(s.cpuUnitsPerMs)
+      && Number.isFinite(axes === '2d' ? s.fillMpxPerMs : s.shadeMfragPerMs))
     .slice(-PROBE_SAMPLE_TARGET);
   if (samples.length === 0) {
     return { samples, deviceClass: 'unknown', reason: 'no finite reading to classify', final: false };
   }
   const medianVerdict = classifyReading({
     cpuUnitsPerMs: median(samples.map((s) => s.cpuUnitsPerMs)),
-    shadeMfragPerMs: median(samples.map((s) => s.shadeMfragPerMs)),
-  });
+    // Both axes are medianed whichever shape is in play. Only one of them is read by
+    // `classifyReading`, but a persisted sample that carried a real number on one launch and a
+    // hole on the next would be a worse thing to debug than a field nobody consulted.
+    shadeMfragPerMs: median(samples.map((s) => s.shadeMfragPerMs ?? 0)),
+    fillMpxPerMs: median(samples.map((s) => s.fillMpxPerMs ?? 0)),
+  }, axes);
 
   // ⚠️ There is deliberately NO one-pass shortcut here any more — see the note above
   // `PROBE_SAMPLE_TARGET`. Every device now pays the full three launches, including one whose
@@ -1038,8 +1258,20 @@ export function refineProbeVerdict(
     };
   }
 
+  // ⚠️ **`axes` HERE TOO — IT WAS MISSING, AND IT MADE EVERY 2D DEVICE `weak` FOR TWO LAUNCHES.**
+  // `classifyReading`'s parameter defaults to `'3d'`, and a 2D reading carries `shadeMfragPerMs: 0`
+  // because a 2D probe never runs the shade ramp — so the interim ranking judged every 2D device
+  // against a floor it could not clear by construction. The median path below was threaded
+  // correctly, which is what made the bug survive: the two halves of this function disagreed, and
+  // only the one that runs on launches 1 and 2 was wrong.
+  //
+  // Caught by reading a device log rather than by a test: a Galaxy A23 printed
+  // `weak — lowest of 1 launch(es) so far ... (this pass alone: middle)`. Those two clauses
+  // describe the SAME reading and cannot both be right — the "this pass alone" half goes through
+  // `classifyDevice`, which does pass the axis. A disagreement printed on one line is the only
+  // reason this was visible at all, which is an argument for logging both.
   const ranked = samples
-    .map((s) => classifyReading(s).deviceClass)
+    .map((s) => classifyReading(s, axes).deviceClass)
     .filter((c): c is Exclude<DeviceClass, 'unknown'> => c !== 'unknown');
   if (ranked.length === 0) {
     return { samples, deviceClass: 'unknown', reason: medianVerdict.reason, final: false };
