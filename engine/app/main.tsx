@@ -7,7 +7,7 @@ import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.tsx'
 import { Capacitor } from '@capacitor/core'
-import { setJournalEnabled, setDebugMenuEnabled, setDebugHandlesEnabled, setTierFrameCapEnabled, setTierCalibrationEnabled, readPerfProfile, setProfilerEnabled } from '@modoki/engine/runtime'
+import { setJournalEnabled, setDebugMenuEnabled, setDebugHandlesEnabled, setTierFrameCapEnabled, setTierCalibrationEnabled, setBootProbeAllowed, readPerfProfile, setProfilerEnabled } from '@modoki/engine/runtime'
 
 // Debug build — event-journal recording gate. ON in the editor (dev + the packaged
 // Electron editor, __MODOKI_EDITOR__) and in a game build that opts in via
@@ -28,6 +28,17 @@ setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
 // one `device_eval`; a release build with the flag off publishes nothing. Deliberately its own
 // switch rather than riding the journal's, so a game can drop journal cost without going blind.
 setDebugHandlesEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
+
+// The boot ramp probe — refused in a PLAYABLE AD and nowhere else (#221 W2 item 5). It is the
+// only build where a launch-blocking measurement is unaffordable: an ad network measures
+// time-to-interaction, and since the probe learned to settle within one launch its bill on real
+// phones is 1.6-1.8 s. Every cheaper layer still answers (player pin, project pin, single-config,
+// the iOS model table, GPU identity), so a playable on recognised hardware is unaffected — it was
+// never reaching the probe. On unrecognised hardware it starts `calibrating` and the live loop
+// corrects within seconds.
+// ⚠️ SET SYNCHRONOUSLY HERE, not from `bootPlayable` — that arrives via a dynamic import, and the
+// tier is resolved by App.tsx's boot effect, which does not wait for it.
+setBootProbeAllowed(!__MODOKI_PLAYABLE__)
 
 // A quality tier's FRAME CAP — off in the editor, on everywhere else. Unlike the three gates
 // above this is not a debug switch: `targetFPS` is one global in the frame driver gating EVERY

@@ -1254,6 +1254,13 @@ get backwards:
   fixes were built and refuted; see `CPU_WARMUP_RAMPS`). Rather than inflate the floors, the boot
   reading is accepted as deliberately low and the correction moved to the live path.
 
+  ✅ **The whole round trip is verified on a Galaxy S22** (2026-08-13): `mid via measured —
+  cpu-limited`, a 5 s headroom streak, then `switched to 'high' — cpu 6.4ms of a 16.7ms frame
+  sustained for 5s (applied at a scene boundary)`. ⚠️ Note what the same phone does on the *heavier*
+  scene: `cpu 6.8 ms` of a `16.7 ms` frame against a bar of `interval × PROMOTION_CPU_RATIO` =
+  **6.68 ms** — declining by 0.12 ms. The ceiling being raised does not mean a device climbs; on
+  content that already spends ~41% of the frame on CPU the headroom rule is the binding constraint.
+
   It is set **only** when the reading cleared the next band's GPU floor and missed its cpu floor,
   which is what keeps the objection above intact: there is no GPU verdict being overruled, and
   `hasHeadroom` measures exactly the quantity that was under-read. A device short on `shade` is not

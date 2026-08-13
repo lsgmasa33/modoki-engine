@@ -132,7 +132,7 @@ describe('runRamp — warm-up load cleanup on the no-frames exit (#205 R5.4)', (
     const marks: string[] = [];
 
     const runP = runRamp(
-      'draw',
+      'shade',
       workload,
       16.7,
       Infinity, // deadline: not what this test is exercising
@@ -144,7 +144,7 @@ describe('runRamp — warm-up load cleanup on the no-frames exit (#205 R5.4)', (
     await vi.advanceTimersByTimeAsync(20_000);
     const reading = await runP;
 
-    expect(marks).toContain('draw:no-frames');
+    expect(marks).toContain('shade:no-frames');
     expect(reading.bound).toBe('none');
     // THE ASSERTION THAT DISTINGUISHES THE FIX FROM THE DEFECT: before the fix this stayed at the
     // warm-up load, which `runRamp` had set earlier in this same call and never cleared on this
@@ -309,10 +309,16 @@ describe('the cpu ramp respects a budget already spent (close-out 2026-08-13)', 
 
 describe('createGlProbeSurface — the workloads, against a fake GL (#203)', () => {
   /** (see the module-scope `fakeGl`) A GL context recording only what the assertions below read. Deliberately not a full fake:
-   *  what matters is WHICH draw entry point each ramp uses, because that distinction — one
-   *  instanced submit for `fill`/`shade`, N submits for `draw` — is the correction that made the
-   *  two ramps measure two different things (a Galaxy S22 once read HALF a Galaxy A23 on "fill",
-   *  which is the signature of measuring submit cost instead). */
+   *  what matters is WHICH draw entry point each ramp uses — `fill`/`shade` submit ONE instanced
+   *  call regardless of load, overdraw rather than submit count.
+   *
+   *  ⛔ Until 2026-08-13 (#221 W2 item 4) this described a THIRD workload, `draw`, whose whole
+   *  point was N submits per object — one per object was the correction that made `fill` and
+   *  `draw` measure two different things (a Galaxy S22 once read HALF a Galaxy A23 on "fill",
+   *  which is the signature of measuring submit cost instead). `draw` itself is gone; see the
+   *  `RampKind` removal record in `rampProbe.ts`. `fakeGl`'s `calls.plain` counter (N-submit
+   *  entry point) is now dead in this file too but is left in place — it is recoverable evidence
+   *  alongside `draw`, not a defect to clean up on its own. */
 
   function withFakeGl<T>(fn: (calls: ReturnType<typeof fakeGl>['calls']) => T): T {
     const { gl, calls } = fakeGl();
@@ -321,7 +327,7 @@ describe('createGlProbeSurface — the workloads, against a fake GL (#203)', () 
     try { return fn(calls); } finally { spy.mockRestore(); }
   }
 
-  it('fill and shade issue ONE instanced submit; draw issues one per object', () => {
+  it('fill and shade issue ONE instanced submit each', () => {
     withFakeGl((calls) => {
       const s = createGlProbeSurface(640, 480, () => {});
       expect(s).not.toBeNull();
@@ -334,11 +340,7 @@ describe('createGlProbeSurface — the workloads, against a fake GL (#203)', () 
       s!.workloads.shade.setLoad(4);
       s!.workloads.shade.submit();
       expect(calls.instanced).toEqual([8, 4]);
-
-      s!.workloads.draw.setLoad(5);
-      s!.workloads.draw.submit();
-      expect(calls.plain).toBe(5);            // five separate submits — that IS the measurement
-      expect(calls.instanced).toEqual([8, 4]);
+      expect(calls.plain).toBe(0);
       s!.dispose();
     });
   });

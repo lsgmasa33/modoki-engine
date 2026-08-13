@@ -79,7 +79,21 @@
  *  voided a session's worth of counts. The ones that do not discriminate come OUT again; see
  *  docs/plans/low-end-device-support.md. Do not read the presence of a ramp here as a claim that
  *  it is load-bearing. */
-export type RampKind = 'fill' | 'draw' | 'shade' | 'cpu';
+// ⛔ **`draw` REMOVED 2026-08-13 by owner decision (#221 W2 item 4)** — the per-object-submit
+// ramp. It had not been measured by EITHER probe shape since 2026-08-11: `gpuKinds` in
+// `rampProbeRunner.ts` names only `fill` (2D) or `shade` (3D), so `draw` never ran and no
+// threshold ever read it. When it did run, it failed outright on the weakest hardware this probe
+// exists for (Huawei Y6 0/6 launches produced a reading, iPhone 7 0/3). Dead weight in a
+// launch-blocking probe.
+//
+// The ramp and its GL workload (`rampWorkloadGL.ts`) are recoverable from git if a future project
+// turns out to be per-object-submit bound — forest-camp measured 0.14 ms/call on the Y6, which is
+// the case that would justify bringing it back.
+//
+// `CLASSIFIER_VERSION` is NOT bumped for this removal: `draw` never entered `ProbeReading` (it was
+// evidence-only on `ProbeMeasurement`), so there is no persisted sample and no threshold whose
+// meaning changed. Do not "fix" this.
+export type RampKind = 'fill' | 'shade' | 'cpu';
 
 /** One rendered step: how much was drawn, and how long that frame took. */
 export interface RampStep {
@@ -227,14 +241,35 @@ export const RAMP_BOUNDS: Record<RampKind, { startLoad: number; maxLoad: number 
   /** Large overlapping quads — fragment throughput. 256x screen overdraw is far past anything a
    *  shipping frame does, which is the point: it must be out of reach for a STRONG device, or the
    *  strong device reports the ceiling instead of itself. */
-  fill: { startLoad: 8, maxLoad: 1024 },
-  /** Many tiny quads — per-object CPU submit. forest-camp's real frame submits hundreds of draws,
-   *  and at 0.14 ms/call on the Y6 that is where its cost was.
-   *
-   *  Starts at 32, not 8: the budget affords ~9 frames at 60 Hz, and the first two doublings were
-   *  measurably pointless — every device tested sat at vsync through them. Spending those frames
-   *  higher up the ramp is what lets it reach the ceiling within budget. */
-  draw: { startLoad: 32, maxLoad: 4096 },
+  // ⚠️ **maxLoad RAISED 1024 -> 65536 (2026-08-13, #221) because TWO devices topped it out.** An
+  // iPhone Air and a Galaxy S22 both returned `ceiling/lower` — they exhausted the ramp without
+  // ever reaching the escape bar, their last step still ~15 ms against a bar of 50 ms — so both
+  // "measurements" were lower bounds and the axis could not rank anything above ~24 Mpx/ms. That
+  // is the failure this whole block warns about two paragraphs down, arrived at from the other
+  // direction: a ceiling low enough that strong devices reach it measures the ceiling.
+  //
+  // **THE HEADROOM IS FREE AGAINST THE RAMP BUDGET.** A first attempt at 8192 was measured on a
+  // Galaxy S22 and escaped on its VERY LAST STEP (3 wiped launches, escape at 8192 / 83.9 ms against
+  // a bar of 50.1) — one device-generation from being clipped again. A bigger ceiling is cheap
+  // because a ramp always ends on the first step past the escape bar, so the step times at the END
+  // are ~50-100 ms on EVERY device: a faster GPU simply spends more doublings getting there, and its
+  // early steps sit on the GPU-clock latency floor (~4.2 ms on the S22, ~8 ms on an iPhone Air —
+  // iOS quantizes to 1 ms, which is why an Air's step table is all integers) rather than on real
+  // work. Measured sum for the S22's full 11-step ramp: ~200 ms, against `GPU_RAMP_BUDGET_MS` 400.
+  //
+  // ⚠️ **IT IS NOT FREE AGAINST BLOCKED LAUNCH, AND THIS COMMENT SAID IT WAS FOR ONE COMMIT.**
+  // MEASURED on the iPhone Air, same build, ceiling the only change: **blocked launch 264 ms -> 486
+  // ms**. The three added steps cost ~104 ms and the discarded warm-up pass renders them again, so
+  // the true price is ~2x the visible steps. That is the honest cost of the change and it is worth
+  // paying — the alternative is a fast unrecognised device being ranked by the ramp's ceiling — but
+  // it lands squarely on the launch time W2 exists to cut, and a device only pays it while it is
+  // still refining (`PROBE_SAMPLE_TARGET` launches) and never once recognised by GPU identity.
+  //
+  // So: 65536, which is four doublings past where an S22 escapes, with `ABORT_FRAME_MS` (250) as
+  // the backstop against a device that somehow stalls rather than escapes. Escape is tested BEFORE
+  // the ceiling, so weak hardware never renders any of it — a Huawei Y6 escapes in its first steps
+  // and pays nothing at all.
+  fill: { startLoad: 8, maxLoad: 65536 },
   /** Overdraw of a HEAVY fragment shader over a FIXED small region — the axis the tiers actually
    *  gate (IBL lookups, shadow taps, post-FX), all of it texture-sampling and ALU.
    *
@@ -664,14 +699,9 @@ export interface ProbeMeasurement {
    *  a 2D project's only tier-controlled GPU knob is `pixiPixelRatioCap`, which is fill-rate bound.
    *  Absent on a 3D probe, which spends its GPU budget on `shade` instead. */
   fill?: RampReading;
-  /** The per-object submit ramp. Measured by neither probe shape today — it has not voted since
-   *  2026-08-11 and fails outright on the weakest hardware (Y6 0/6, iPhone 7 0/3), which is
-   *  precisely the population it would have to be right about. Kept in the type because the ramp
-   *  itself still exists and can be re-enabled by naming it in `gpuKinds`. */
-  draw?: RampReading;
   /** The heavy-shader ramp, when the probe could build and compile its material.
    *
-   *  Optional because a backend that refuses the material must still yield the fill/draw
+   *  Optional because a backend that refuses the material must still yield the fill
    *  measurement rather than nothing — and because it is EVIDENCE ONLY today: it is logged and
    *  reported, and no threshold reads it. It moves into {@link ProbeReading} (and bumps
    *  `CLASSIFIER_VERSION`, which is module-local and so not linkable here) if and only if a
@@ -865,8 +895,16 @@ export function probeFingerprint(input: ProbeFingerprintInput): string {
  *  thing would arguably be to go back to 7. It stays at 8 because builds carrying the two-discard
  *  instrument really did run on hardware and really did write samples, and a version number that
  *  goes backwards would let those samples median against readings they are not comparable to. A
- *  burned integer costs nothing; a mixed population costs a wrong band. */
-const CLASSIFIER_VERSION = 8;
+ *  burned integer costs nothing; a mixed population costs a wrong band.
+ *
+ *  **9 = the fill ramp's ceiling rose 1024 -> 8192** (#221). This is not a boundary move, it is the
+ *  same "different quantity, same unit" case as v3: a v8 fill sample from an iPhone Air or a Galaxy
+ *  S22 is `ceiling/lower` — a LOWER BOUND on a device that never reached the escape bar — while a
+ *  v9 sample from the same phone is an escaped measurement. Medianing a bound against a measurement
+ *  understates the device by however much the old ceiling clipped, which on those two phones is
+ *  exactly the error this change exists to remove. Weak hardware escapes long before either
+ *  ceiling and is unaffected — but the version cannot be conditional on the device. */
+const CLASSIFIER_VERSION = 9;
 
 /** One band's floor: the throughput a device must clear on BOTH ramps to be called this.
  *
@@ -989,27 +1027,53 @@ export const PROBE_THRESHOLDS: {
  *  all — which is itself the proof `rampWorkloadGL` works), a debug build, `pm clear` before EVERY
  *  launch so no reading is a refinement of another, three launches per device.
  *
+ *  ⭐ **RE-MEASURED 2026-08-13 ON v9 (#221), AND ONE NUMBER MOVED BY 3.4x.** The campaign below was
+ *  taken with `RAMP_BOUNDS.fill.maxLoad` at 1024, which the S22 could not escape — so its 7.69 was
+ *  a `ceiling/lower` BOUND, and the warning three paragraphs down said so and asked for exactly this
+ *  re-measure. Same protocol, same project, same three phones, ceiling now 65536:
+ *
+ *      Huawei Y6 2019   PowerVR GE8300    fill 0.75 / 1.12 / 1.10  -> median 1.10   cpu 2.1k
+ *      Galaxy A23       Mali-G57 MC2      fill 2.85 / 2.80 / 2.81  -> median 2.81   cpu 9.0k
+ *      Galaxy S22       Adreno 730        fill 21.79 / 25.82 / 25.99 -> median 25.82 cpu 11.8k
+ *      iPhone Air       Apple A19 Pro     fill 65.37 / 68.21 / 98.06 -> median 68.21 cpu 58.3k
+ *
+ *  ⭐ **THE iPHONE AIR IS THE FOURTH ANCHOR AND THE AXIS STAYS MONOTONE OVER 62x**: 1.10 / 2.81 /
+ *  25.82 / 68.21. It too read `ceiling/lower` under the old bound (24.5, i.e. 2.8x under) and now
+ *  escapes. It does NOT move a boundary — it clears `capable` by 8x — and that is the point of
+ *  recording it: a threshold campaign needs a device that is unambiguously past the top floor, or
+ *  the top floor is only ever pinned from below.
+ *
+ *  **All three now `escaped/measured`; not one is a bound.** The two weak devices barely moved
+ *  (1.02 -> 1.10, 2.77 -> 2.81) — they escaped under the old ceiling too, so nothing about them
+ *  changed — while the S22 went 7.69 -> 25.82. That asymmetry is the proof the old figure was the
+ *  ceiling talking rather than the phone: a ramp bound cannot affect a device that never reaches it.
+ *  ⭐ It also tightened the S22's own spread to 1.19x (from 1.05x on a pinned bound, which was
+ *  precision about the ceiling, not about the GPU).
+ *
+ *  ⚠️ The ORIGINAL v5 campaign is kept below because the boundary derivation quoted it for a day
+ *  and because it is the record of how the axis was found. Do not median a v5 fill sample against a
+ *  v9 one — `CLASSIFIER_VERSION` exists to make that impossible.
+ *
  *      Huawei Y6 2019   PowerVR GE8300    fill 1.43 / 1.02 / 0.66  -> median 1.02   cpu  2.0k
  *      Galaxy A23       Mali-G57 MC2      fill 2.97 / 1.93 / 2.77  -> median 2.77   cpu 10.1k
- *      Galaxy S22       Adreno 730        fill 7.88 / 7.69 / 7.47  -> median 7.69   cpu 13.9k
+ *      Galaxy S22       Adreno 730        fill 7.88 / 7.69 / 7.47  -> median 7.69   cpu 13.9k  ⛔ BOUND
  *
- *  ⭐ **THE FILL AXIS SEPARATES ALL THREE, WHICH `shade` NEVER DID.** 1.02 / 2.77 / 7.69 is monotone
- *  with 2.7x and 2.8x between neighbours. Compare the 3D pair, whose `shade` axis reads
+ *  ⭐ **THE FILL AXIS SEPARATES ALL THREE, WHICH `shade` NEVER DID.** 1.10 / 2.81 / 25.82 is
+ *  monotone with 2.6x and 9.2x between neighbours — and the top gap is 3.3x WIDER than the bounded
+ *  campaign could see, which is the whole cost of a clipped ceiling. Compare the 3D pair, whose
+ *  `shade` axis reads
  *  0.20/0.21/0.20 for an iPhone 8, an S22 and an iPhone Air and saturates from a 2017 phone upward.
  *  Measuring the axis the knob actually moves is what bought the separation: a 2D tier's only GPU
  *  knob is `pixiPixelRatioCap`, and fill rate is what it trades against.
  *
- *  ⚠️ **THE S22 FIGURE IS A LOWER BOUND — `ceiling/lower`, not `escaped/measured`.** Its fill ramp
- *  exhausted `RAMP_BOUNDS.fill.maxLoad` without ever slowing to the escape threshold, so the true
- *  value is *at least* 7.69 and unknown above that. Two consequences, both stated rather than
- *  buried:
- *    - Using it to place `capable` is SOUND for the direction that matters — "at least 7.69, and
- *      7.69 clears 4.6" needs no upper bound, which is the same argument `clears()` already makes
- *      for a `'lower'` reading.
- *    - But the true gap is WIDER than measured, so 4.6 is the LOWEST defensible capable floor
- *      rather than the centre of the real gap. Raising `RAMP_BOUNDS.fill.maxLoad` until the S22
- *      escapes would settle it. **Not done here** because the reading is already load-bearing in
- *      the safe direction — see below.
+ *  ✅ **THE LOWER-BOUND WARNING THAT USED TO STAND HERE IS DISCHARGED (#221).** It read: the S22's
+ *  fill exhausted `RAMP_BOUNDS.fill.maxLoad` without reaching the escape threshold, so 7.69 was a
+ *  bound, 4.6 was "the LOWEST defensible capable floor rather than the centre of the real gap", and
+ *  raising the ceiling until the S22 escapes would settle it. That was done, the S22 escapes, and
+ *  the capable floor moved 4.6 -> 8.5 as a result. ⭐ **The lesson is about instruments, not about
+ *  this axis:** a bound is safe to compare against in ONE direction (`clears()` handles it) and is
+ *  useless for placing a boundary BETWEEN two devices, because a midpoint needs both ends. Nothing
+ *  flagged this for a day except a `ceiling/lower` status in a log line nobody was reading.
  *
  *  ⚠️ **AND THE SAFETY ASYMMETRY IS WEAKER IN 2D THAN IN 3D, WHICH IS WHY A SLIGHTLY LOW CAPABLE
  *  FLOOR IS ACCEPTABLE HERE AND WOULD NOT BE THERE.** The 3D rule ("never guess upward") is
@@ -1043,14 +1107,33 @@ export const PROBE_THRESHOLDS_2D: {
   middle: ProbeThreshold | null;
   capable: ProbeThreshold | null;
 } = {
-  /** Between the Y6 (1.02 Mpx/ms) and the A23 (2.77) — geometric mean 1.68. The cpu floor is the
-   *  same 4,500 the 3D table derived independently; here it is the geometric mean of 2.0k and
-   *  10.1k, which is 4.49k. */
+  /** Between the Y6 (1.10 Mpx/ms) and the A23 (2.81) — geometric mean 1.76.
+   *
+   *  ⚠️ **LEFT AT 1.68 ON THE v9 RE-MEASURE, deliberately.** The v5 pair (1.02 / 2.77) put the mean
+   *  at 1.68 and the v9 pair puts it at 1.76 — a 5% move, well inside the launch-to-launch spread
+   *  on this axis (the Y6 alone reads 0.75-1.12). Chasing that is fitting noise, and every re-fit
+   *  costs the ability to say a threshold has been stable across two independent campaigns. Both
+   *  devices escaped under BOTH ceilings, so there is no instrument change here to correct for —
+   *  which is exactly why this row can be left alone while the `capable` row could not.
+   *
+   *  The cpu floor is the same 4,500 the 3D table derived independently; here it is the geometric
+   *  mean of 2.0k and 10.1k, which is 4.49k. */
   middle: { cpuUnitsPerMs: 4_500, fillMpxPerMs: 1.68 },
-  /** Between the A23 (2.77) and the S22 (>= 7.69) — geometric mean 4.62, rounded to 4.6. The cpu
-   *  floor is deliberately NOT raised: those two devices' cpu ranges overlap, so it cannot decide
-   *  this boundary and pretending otherwise would make the verdict depend on launch noise. */
-  capable: { cpuUnitsPerMs: 4_500, fillMpxPerMs: 4.6 },
+  /** Between the A23 (2.81) and the S22 (25.82) — geometric mean 8.51, rounded to 8.5.
+   *
+   *  ⭐ **MOVED 4.6 -> 8.5 ON THE v9 RE-MEASURE (#221), and the old value was not wrong so much as
+   *  bounded.** 4.6 was the geometric mean of 2.77 and a `ceiling/lower` 7.69 — a midpoint computed
+   *  with one end pinned to the instrument's own ceiling. With the S22 escaping at 25.82 the real
+   *  gap is 9.2x rather than 2.8x, and its centre is 8.5.
+   *
+   *  ⚠️ **The move is UPWARD, i.e. toward the conservative side, and that is worth stating because
+   *  the direction was not chosen — it fell out.** Nothing measured sits between 4.6 and 8.5, so no
+   *  device tested changes band; what changes is where a device we have never seen lands, and it
+   *  now needs to look materially more like an S22 than like an A23 before it is called `capable`.
+   *
+   *  The cpu floor is deliberately NOT raised: those two devices' cpu ranges overlap, so it cannot
+   *  decide this boundary and pretending otherwise would make the verdict depend on launch noise. */
+  capable: { cpuUnitsPerMs: 4_500, fillMpxPerMs: 8.5 },
 };
 
 /** One device's throughput on both ramps, in the two COMPARABLE units — the only thing worth
@@ -1350,7 +1433,10 @@ export function refineProbeVerdict(
       samples,
       deviceClass: medianVerdict.deviceClass,
       cpuLimited: medianVerdict.cpuLimited,
-      reason: `${medianVerdict.reason} (median of ${samples.length} launches)`,
+      // "readings", not "launches" — since #221 they may all come from ONE launch (see
+      // `resolveProbeClass`'s in-launch loop), and a log line that says "3 launches" on a device's
+      // first launch is the kind of small lie that costs an hour later.
+      reason: `${medianVerdict.reason} (median of ${samples.length} readings)`,
       final: medianVerdict.deviceClass !== 'unknown',
     };
   }

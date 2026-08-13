@@ -375,6 +375,10 @@ export {
   setDebugHandlesEnabled,
   areDebugHandlesEnabled,
 } from './core/debugHandles';
+export {
+  setBootProbeAllowed,
+  isBootProbeAllowed,
+} from './core/bootProbeAllowed';
 export type { DebugTabDef, DebugCommandDef } from './debug/debugMenuRegistry';
 
 // ── Frame Driver (no heavy deps — safe for all importers) ──

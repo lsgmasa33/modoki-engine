@@ -79,7 +79,7 @@
 
 import { rawNow } from '../core/clock';
 import { makeGpuClock, type GpuClock } from './gpuClock';
-import { RAMP_BOUNDS, type RampKind } from './rampProbe';
+import type { RampKind } from './rampProbe';
 
 /** Dependent texture reads per fragment in the heavy shader. Kept identical to
  *  `probeHeavyShader.SHADE_TAPS` — the number models a tier's worth of per-fragment work (IBL is
@@ -341,25 +341,11 @@ export function createGlProbeSurface(cw: number, ch: number, mark: (stage: strin
     const sy = Math.min(1, SHADE_REGION_PX / ch);
     const shadeRegionPixels = Math.round(sx * cw) * Math.round(sy * ch);
 
-    // The draw ramp's lattice: small quads spread across the viewport rather than stacked in one
-    // spot, where a tile-based renderer could treat them as a single region. Precomputed, because
-    // the loop below is the thing being timed.
-    const drawMax = RAMP_BOUNDS.draw.maxLoad;
-    const cols = Math.ceil(Math.sqrt(drawMax));
-    const drawOffsets = new Float32Array(drawMax * 2);
-    for (let i = 0; i < drawMax; i++) {
-      drawOffsets[i * 2] = ((i % cols) / cols) * 2 - 1;
-      drawOffsets[i * 2 + 1] = (Math.floor(i / cols) / cols) * 2 - 1;
-    }
-    const drawScale = 0.5 / cols;
-
     let fillLoad = 0;
-    let drawLoad = 0;
     let shadeLoad = 0;
 
     const workloads: Record<RampKind, RampWorkload> = {
-      // ONE draw call, N instances: overdraw scales while submit cost does not. That separation is
-      // the entire premise of having a fill ramp and a draw ramp rather than one ramp.
+      // ONE draw call, N instances: overdraw scales while submit cost does not.
       fill: {
         setLoad: (n) => { fillLoad = n; },
         submit: () => {
@@ -369,22 +355,6 @@ export function createGlProbeSurface(cw: number, ch: number, mark: (stage: strin
           gl.uniform2f(cheapScale, 1, 1);       // full viewport
           gl.uniform2f(cheapOffset, 0, 0);
           gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, fillLoad);
-        },
-      },
-      // N draw calls of tiny scattered quads. Fill cost is negligible by construction, so what
-      // this prices is the per-object CPU submit — forest-camp's actual bottleneck (0.14 ms/call
-      // on the Y6), which a fill-heavy probe would never have predicted.
-      draw: {
-        setLoad: (n) => { drawLoad = n; },
-        submit: () => {
-          gl.clear(gl.COLOR_BUFFER_BIT);
-          if (drawLoad <= 0) return;
-          gl.useProgram(cheapProgram);
-          gl.uniform2f(cheapScale, drawScale, drawScale);
-          for (let i = 0; i < drawLoad; i++) {
-            gl.uniform2f(cheapOffset, drawOffsets[i * 2], drawOffsets[i * 2 + 1]);
-            gl.drawArrays(gl.TRIANGLES, 0, 6);
-          }
         },
       },
       // Instanced overdraw of the heavy shader over the FIXED region. A no-op when the program

@@ -774,7 +774,7 @@ export async function runBootRampProbe(
       }
       return {
         intervalMs: GPU_NOMINAL_INTERVAL_MS, clockKind: clock.kind, axes,
-        fill: readings.fill, draw: readings.draw, shade: readings.shade, cpu, cpuWarmups,
+        fill: readings.fill, shade: readings.shade, cpu, cpuWarmups,
         totalMs: rawNow() - started, rendererMs, compileMs, shadeCompileMs,
         bufferPixels, shadeRegionPixels,
       };
@@ -853,7 +853,7 @@ export async function runBootRampProbe(
 
     return {
       intervalMs, clockKind: 'raf' satisfies ProbeClockKind, axes,
-      fill: readings.fill, draw: readings.draw, shade: readings.shade, cpu, cpuWarmups,
+      fill: readings.fill, shade: readings.shade, cpu, cpuWarmups,
       totalMs: rawNow() - started, rendererMs, compileMs, shadeCompileMs,
       bufferPixels, shadeRegionPixels,
     };

@@ -84,11 +84,14 @@ function line(m: ProbeMeasurement): string {
     + `fillMpx=${fillMegapixelsPerMs(m).toFixed(3)} `
     + `shadeMfrag=${shadeMegaFragmentsPerMs(m).toFixed(3)} `
     + `cpuK=${m.cpu ? (m.cpu.unitsPerMs / 1000).toFixed(2) : 'n/a'} `
-    // `fill` and `draw` are optional since #203 — a 3D probe runs neither, a 2D probe runs `fill`
-    // only. Printed as 'absent' rather than skipped, the same way `shade` already is: a missing
-    // line and a zero reading look identical in a log, and this page exists to compare readings.
+    // `fill` is optional since #203 — a 3D probe does not run it, a 2D probe does. Printed as
+    // 'absent' rather than skipped, the same way `shade` already is: a missing line and a zero
+    // reading look identical in a log, and this page exists to compare readings.
+    //
+    // ⛔ `draw` was a second optional GPU ramp printed here until 2026-08-13 (#221 W2 item 4),
+    // when it was removed from `ProbeMeasurement` entirely — see the `RampKind` removal record
+    // in `rampProbe.ts`.
     + `fill=${m.fill ? `${m.fill.status}/${m.fill.bound}:${f(m.fill.unitsPerMs)}@${m.fill.peakLoad}` : 'absent'} `
-    + `draw=${m.draw ? `${m.draw.status}/${m.draw.bound}:${f(m.draw.unitsPerMs)}@${m.draw.peakLoad}` : 'absent'} `
     + `shade=${m.shade ? `${m.shade.status}/${m.shade.bound}:${f(m.shade.unitsPerMs)}@${m.shade.peakLoad}` : 'absent'} `
     + `cpu=${m.cpu ? `${m.cpu.status}/${m.cpu.bound}:${r(m.cpu.unitsPerMs)}@${m.cpu.peakLoad}` : 'absent'}`;
 }

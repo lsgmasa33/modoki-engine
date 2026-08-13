@@ -73,6 +73,17 @@ web builds too), but its headline win is fitting a game under the playable's 5 M
 - **Single chunk = `inlineDynamicImports`, NOT `codeSplitting`.** `codeSplitting` is not a real Rollup
   option — Rollup silently ignores it, the lazy renderer chunk stays split, and the inliner's stray-JS
   guard aborts every 3D-game playable. Only `inlineDynamicImports:true` folds dynamic imports into the entry.
+- **A playable never runs the boot ramp probe** (#221) — `main.tsx` sets
+  `setBootProbeAllowed(!__MODOKI_PLAYABLE__)` at module scope, and `tierResolve` refuses on BOTH its
+  probe call sites. It is not covered by "one config ⇒ no probe": that short-circuit needs the
+  project to have authored exactly one tier config (the default is two), and the measure-and-log
+  EVIDENCE path ignores it entirely — so a playable exported from any of the ten projects shipping
+  `build.debugBuild: true` used to pay **1.6-1.8 s of blocked launch** to log a verdict it discarded.
+  Every cheaper layer (player pin, project pin, single-config, iOS model table, GPU identity) still
+  answers; unrecognised hardware starts `calibrating` and the live loop corrects it in seconds.
+  ⚠️ Set it SYNCHRONOUSLY in `main.tsx`, never from `bootPlayable` — that arrives via a dynamic
+  import and the tier is resolved without waiting for it. Guarded by
+  `tests/architecture/playableSkipsProbe.test.ts`, because no unit test can see that wiring.
 - **You cannot `grep` the artifact.** The payload is gzip+base64 inside the bootstrap — plaintext search
   finds nothing (two false "no audio inlined" diagnoses came from this). Decompress it to inspect (see
   `smoke-playable.mjs` / the `inlinePlayable.test.ts` round-trip).

@@ -76,7 +76,6 @@ describe('probe verdict cache — write then read, the way two launches drive it
     const reading = readingOf({
       intervalMs: 16.7, clockKind: 'webgpu', axes: '3d',
       fill: { kind: 'fill', status: 'ceiling', unitsPerMs: 0, bound: 'lower', peakLoad: 0, steps: [] },
-      draw: { kind: 'draw', status: 'ceiling', unitsPerMs: 0, bound: 'lower', peakLoad: 0, steps: [] },
       cpu: { kind: 'cpu', status: 'escaped', unitsPerMs: 9_900, bound: 'measured', peakLoad: 131_072, steps: [] },
       shade: { kind: 'shade', status: 'escaped', unitsPerMs: 14, bound: 'measured', peakLoad: 512, steps: [] },
       totalMs: 1_700, rendererMs: 19, compileMs: 96, shadeCompileMs: 53,

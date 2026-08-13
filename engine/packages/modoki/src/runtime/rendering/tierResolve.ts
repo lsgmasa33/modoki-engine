@@ -29,11 +29,13 @@ import {
 import { applyActiveTierToRuntime } from './tierCalibration';
 import {
   classifyDevice, classifyMedianOf, probeFingerprint, readingOf, refineProbeVerdict,
-  fillMegapixelsPerMs, shadeMegaFragmentsPerMs,
-  type DeviceClass, type ProbeMeasurement, type RampReading,
+  fillMegapixelsPerMs, shadeMegaFragmentsPerMs, PROBE_SAMPLE_TARGET,
+  type DeviceClass, type ProbeMeasurement, type ProbeReading, type RampReading,
 } from './rampProbe';
+import { rawNow } from '../core/clock';
 import { probeVerdictStore } from '../core/probeVerdictStore';
 import { areDebugHandlesEnabled } from '../core/debugHandles';
+import { isBootProbeAllowed } from '../core/bootProbeAllowed';
 import { isProbeInFlight, withProbeInFlight, shareTierResolution } from './probeReentrancy';
 import { getDeviceCaps } from './deviceCaps';
 import { getPlayerQualityTier } from './playerQualityTier';
@@ -209,13 +211,28 @@ async function resolveActiveTierOnce(setting: QualityTierSetting, only2D: boolea
     // It runs at the same point in boot as the real probe on Android (before the tier is set, on
     // the critical path) precisely so the numbers are comparable to the Android campaign's; a
     // measurement taken under different conditions would be the very thing this comment warns about.
-    if (areDebugHandlesEnabled() && caps?.formFactor !== 'desktop') {
+    // ⚠️ `isBootProbeAllowed()` FIRST, and this is the call site that made the flag necessary
+    // (#221 W2 item 5): a playable ad exported from one of the ten projects that ship
+    // `build.debugBuild: true` would otherwise run the whole probe — now 1.6-1.8 s of blocked
+    // launch — purely to LOG a verdict it then discards, in the one build where launch time is
+    // the product.
+    if (isBootProbeAllowed() && areDebugHandlesEnabled() && caps?.formFactor !== 'desktop') {
       await resolveProbeClass(caps, only2D, cheap.source);
     }
     publishActiveTier(cheap);
     return;
   }
 
+  // ⚠️ **AND THE REAL PATH TOO — "one config ⇒ no probe" is a PROJECT's choice, not the ad
+  // format's.** The single-config short-circuit above fires only when the project authored exactly
+  // one tier config; a playable exported from a project with two (the scaffolder's default, and
+  // every project in this repo) arrives here like anything else. Refusing leaves the ad on
+  // `calibrating`, which the live loop corrects within seconds — the same degrade the plan already
+  // accepts for the stale-data tail, and far cheaper than the launch it would have cost.
+  if (!isBootProbeAllowed()) {
+    publishActiveTier(resolveTier(buildTierResolveInput(factsCaps, setting, { playerChoice })));
+    return;
+  }
   const probed = await resolveProbeClass(caps, only2D);
   publishActiveTier(resolveTier(buildTierResolveInput(factsCaps, setting, {
     playerChoice,
@@ -244,7 +261,7 @@ function describeProbe(m: ProbeMeasurement): string {
     `${r.kind} ${r.status}/${r.bound} [`
     + r.steps.map((s) => `${s.load}:${s.frameMs.toFixed(1)}`
       + (s.gpuMs === undefined ? '' : `/gpu${s.gpuMs.toFixed(1)}`)).join(' ') + ']';
-  const ramps = [m.fill, m.draw, m.shade, m.cpu]
+  const ramps = [m.fill, m.shade, m.cpu]
     .filter((r): r is RampReading => r !== undefined).map(ramp).join(', ');
   // ⚠️ THE CLOCK'S IDENTITY LEADS, because without it none of the numbers after it can be compared
   // across devices. A WebGPU `onSubmittedWorkDone` reading and a WebGL2 `fenceSync` reading have
@@ -338,56 +355,135 @@ async function resolveProbeClass(
   // emitted not one line about what happened next. The runner has always MARKED every stage; the
   // production caller simply passed no callback and threw the marks away.
   let lastStage = 'start';
+  const fallback = () => (forThisDevice
+    ? {
+      deviceClass: forThisDevice.deviceClass,
+      cpuLimited: classifyMedianOf(forThisDevice.samples, only2D ? '2d' : '3d').cpuLimited,
+    }
+    : undefined);
   try {
     const { runBootRampProbe } = await import('./rampProbeRunner');
-    // Guarded: the probe constructs a renderer, which re-enters this very resolution path.
-    const measurement = await withProbeInFlight(
-      () => runBootRampProbe((stage) => { lastStage = stage; }, only2D));
-    // Fall back to what earlier launches concluded rather than to nothing: a probe that failed
-    // THIS launch does not invalidate readings that succeeded before it.
-    if (!measurement) {
-      console.warn(`${tag} produced no measurement — last stage '${lastStage}'`);
-      return forThisDevice
-      ? { deviceClass: forThisDevice.deviceClass, cpuLimited: classifyMedianOf(forThisDevice.samples, only2D ? '2d' : '3d').cpuLimited }
-      : undefined;
+    const startedAt = rawNow();
+    let samples: readonly ProbeReading[] = forThisDevice?.samples ?? [];
+    let deviceClass: DeviceClass = forThisDevice?.deviceClass ?? 'unknown';
+    let cpuLimited = false;
+    let final = false;
+    let passes = 0;
+    /** Each pass's verdict ON ITS OWN — the unanimity test below, not diagnostics. */
+    const perPass: DeviceClass[] = [];
+    /** The FIRST pass's reading, kept apart because it is the only one taken on a cold device and
+     *  therefore the only one drawn from the same population the thresholds were derived from. */
+    let coldReading: ProbeReading | null = null;
+
+    // ⭐ **REPEATED WITHIN ONE LAUNCH (#221 W2), not once per launch as before.** The verdict has
+    // always been the median of {@link PROBE_SAMPLE_TARGET} readings; what changed is WHERE those
+    // readings come from. Taking one per launch meant launches 1 and 2 were wrong by construction —
+    // and those are the launches a first impression is made on, which is the entire point of the
+    // workstream. See the loop's exit conditions below for what it costs.
+    while (samples.length < PROBE_SAMPLE_TARGET) {
+      // Guarded: the probe constructs a renderer, which re-enters this very resolution path.
+      const measurement = await withProbeInFlight(
+        () => runBootRampProbe((stage) => { lastStage = stage; }, only2D));
+      passes++;
+      // Fall back to what earlier passes (and earlier launches) concluded rather than to nothing:
+      // a pass that failed does not invalidate readings that succeeded before it. BREAK rather than
+      // retry — the failures `runBootRampProbe` resolves `null` for (no DOM, no renderer, a throw)
+      // are properties of the environment, so a second attempt would fail the same way and charge
+      // the launch twice for it.
+      if (!measurement) {
+        console.warn(`${tag} pass ${passes} produced no measurement — last stage '${lastStage}'`);
+        break;
+      }
+      const oneRun = classifyDevice(measurement);
+      // An unusable ramp yields no READING, so there is nothing to fold in.
+      if (oneRun.deviceClass === 'unknown') {
+        console.warn(`${tag} pass ${passes} no usable reading — ${oneRun.reason} (${describeProbe(measurement)})`);
+        break;
+      }
+      const reading = readingOf(measurement);
+      if (coldReading === null) coldReading = reading;
+      perPass.push(oneRun.deviceClass);
+      const refined = refineProbeVerdict(samples, reading, measurement.axes);
+      samples = refined.samples;
+      deviceClass = refined.deviceClass;
+      cpuLimited = refined.cpuLimited;
+      // ⭐ **UNANIMITY, NOT THE MEDIAN, IS WHAT LICENCES SETTLING IN ONE LAUNCH — and this is a
+      // measured correction to W2 as it was written.** `refineProbeVerdict`'s own `final` is the
+      // CROSS-LAUNCH rule: three readings, each from a cold device, median them. In-launch passes
+      // are not that — they are a WARMING SEQUENCE, and the trend is visible on hardware (a Huawei
+      // Y6 read fill 0.94 → 1.17 → 1.36 within one launch, and on another launch 1.37 → 2.11 →
+      // 1.69 with an in-launch median of 1.69 against a cross-launch median of 1.10). The bias is
+      // UPWARD, which is the unsafe direction: the Y6's warm median sits above the `middle` fill
+      // floor of 1.68, and only the cpu floor kept it out of a band that measured 14 fps on that
+      // phone. Medianing a warm population against thresholds derived from a cold one is the
+      // "number from a different instrument" mistake this workstream has now made three times.
+      //
+      // So a launch may settle only when every pass in it agreed on the band ANYWAY — in which
+      // case the warming did not reach a boundary and the median cannot be wrong about it. When
+      // they disagree, the device is near a boundary, which is exactly the case extra launches
+      // were always worth paying for: see the `coldReading` write below.
+      final = refined.final && perPass.length >= PROBE_SAMPLE_TARGET
+        && perPass.every((c) => c === perPass[0]);
+      console.warn(
+        `${tag} ${refined.deviceClass} — ${refined.reason} `
+        + `(pass ${passes} this launch, alone: ${oneRun.deviceClass}; ${describeProbe(measurement)})`,
+      );
+      if (final) break;
+      // ⚠️ **THE BUDGET IS WHAT KEEPS THIS SAFE ON THE HARDWARE IT IS FOR.** A Huawei Y6's single
+      // probe costs ~2 s; three of them back to back would be a 6 s stall on exactly the device
+      // least able to absorb one. When the budget is spent the loop stops with `final: false`, so
+      // the device refines across the NEXT launches exactly as it did before this change — the old
+      // behaviour survives as the degrade path rather than being replaced.
+      if (rawNow() - startedAt > PROBE_IN_LAUNCH_BUDGET_MS) {
+        console.warn(
+          `${tag} stopping after ${passes} pass(es) — `
+          + `${(rawNow() - startedAt).toFixed(0)}ms spent, over the ${PROBE_IN_LAUNCH_BUDGET_MS}ms `
+          + `in-launch budget; will refine on the next launch`,
+        );
+        break;
+      }
     }
-    const oneRun = classifyDevice(measurement);
-    // An unusable ramp yields no READING, so there is nothing to fold in — keep what we had.
-    if (oneRun.deviceClass === 'unknown') {
-      console.warn(`${tag} no usable reading — ${oneRun.reason} (${describeProbe(measurement)})`);
-      return forThisDevice
-      ? { deviceClass: forThisDevice.deviceClass, cpuLimited: classifyMedianOf(forThisDevice.samples, only2D ? '2d' : '3d').cpuLimited }
-      : undefined;
-    }
-    const refined = refineProbeVerdict(forThisDevice?.samples ?? [], readingOf(measurement), measurement.axes);
-    console.warn(
-      `${tag} ${refined.deviceClass} — ${refined.reason} `
-      + `(this pass alone: ${oneRun.deviceClass}; ${describeProbe(measurement)})`,
-    );
+
     // Only a real verdict is worth persisting. Caching `'unknown'` would freeze a device in the
     // state the probe is in TODAY, so that correcting the thresholds later could never reach a
     // device that had already launched once.
-    if (refined.deviceClass !== 'unknown') {
-      store?.write({
-        fingerprint,
-        deviceClass: refined.deviceClass,
-        samples: [...refined.samples],
-        final: refined.final,
-      });
+    // ⚠️ **WHEN THE PASSES DISAGREED, ONLY THE COLD ONE IS KEPT.** Persisting all three would leave
+    // the store holding two warm readings that the NEXT launch's cold reading gets medianed
+    // against — a mixed population, permanently, in the store. One cold sample per launch is
+    // exactly the pre-#221 behaviour, so a near-boundary device degrades to the path that was
+    // already measured rather than to a new one.
+    const toStore = final ? samples : (coldReading ? [coldReading] : []);
+    // ⚠️ The band must DESCRIBE the samples stored beside it, or a later launch reads a verdict its
+    // own evidence does not support. On the settled path those are the same thing; on the cold-only
+    // path the stored band has to be the cold sample's, not the lowest of three.
+    const storedClass = final ? deviceClass : classifyMedianOf(toStore, only2D ? '2d' : '3d').deviceClass;
+    if (storedClass !== 'unknown' && toStore.length > 0) {
+      store?.write({ fingerprint, deviceClass: storedClass, samples: [...toStore], final });
     }
-    return refined.deviceClass === 'unknown'
-      ? undefined
-      : { deviceClass: refined.deviceClass, cpuLimited: refined.cpuLimited };
+    return deviceClass === 'unknown' ? fallback() : { deviceClass, cpuLimited };
   } catch (e) {
     // Swallowing the tier decision is right — a probe failure must never block rendering — but
     // swallowing the REASON is not. This catch spans a dynamic import, a renderer construction and
     // a PlayerPrefs write; silent, all three failures look the same as no probe at all.
     console.warn(`${tag} threw at stage '${lastStage}' — ${String(e).slice(0, 200)}`);
-    return forThisDevice
-      ? { deviceClass: forThisDevice.deviceClass, cpuLimited: classifyMedianOf(forThisDevice.samples, only2D ? '2d' : '3d').cpuLimited }
-      : undefined;
+    return fallback();
   }
 }
+
+/** Wall clock the whole in-launch repeat may spend, ms — measured from the first pass's start.
+ *
+ *  ⚠️ **IT BOUNDS THE REPEAT, NOT A PROBE.** One probe is already bounded by the runner's own
+ *  `PROBE_TOTAL_BUDGET_MS` (3.2 s); this stops the LOOP asking for another one it cannot afford.
+ *  Without it, `PROBE_SAMPLE_TARGET` passes on the slowest hardware would stack those budgets — a
+ *  9.6 s worst case, against the ~6 s the owner set as the outside limit for the probe as a whole.
+ *
+ *  2500 ms, chosen from measurement rather than from the limit: a Galaxy S22 spends ~570 ms per
+ *  pass and an iPhone Air ~490 ms, so both take all three passes and settle in one launch, while a
+ *  Huawei Y6 (~2 s a pass) takes one and refines across launches as it always did. That split is
+ *  the intent, not a side effect — the devices that can afford to settle immediately are the ones
+ *  where a wrong first impression is most visible, and the device that cannot is the one where a
+ *  long stall hurts most. */
+const PROBE_IN_LAUNCH_BUDGET_MS = 2_500;
 
 /** Resolve a tier for a project that will never build a 3D renderer (#203).
  *

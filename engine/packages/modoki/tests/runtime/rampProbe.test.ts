@@ -42,20 +42,23 @@ function vsyncDevice(unitsPerMs: number, overheadMs: number, interval = INTERVAL
 }
 
 /** Shared measurement/reading fixtures, reused by several `describe` blocks below — including
- *  classifyDevice's cpu/shade classification tests and the fill/draw evidence-only tests, both
+ *  classifyDevice's cpu/shade classification tests and the fill evidence-only tests, both
  *  #188's axis swap (2026-08-11) — extended with optional shade/cpu params rather than growing a
  *  fourth parallel factory. `fillMegapixelsPerMs` keeps its own smaller, block-local fixtures for
- *  its pre-existing tests; that ramp is unaffected by the swap. */
+ *  its pre-existing tests; that ramp is unaffected by the swap.
+ *
+ *  ⛔ `draw` was a third fixed param here until 2026-08-13 (#221 W2 item 4), when the `draw` ramp
+ *  itself was removed from `ProbeMeasurement` — see the removal record beside `RampKind` in
+ *  `rampProbe.ts`. Every call site below dropped its `readingFixture('draw', …)` argument. */
 const readingFixture = (kind: RampKind, unitsPerMs: number, bound: RampReading['bound'] = 'measured'): RampReading => ({
   kind, status: bound === 'lower' ? 'ceiling' : bound === 'none' ? 'budget' : 'escaped',
   unitsPerMs, bound, peakLoad: 64, steps: [],
 });
 const measurementFixture = (
   fill: RampReading,
-  draw: RampReading,
   extra?: { shade?: RampReading; cpu?: RampReading; shadeRegionPixels?: number },
 ): ProbeMeasurement => ({
-  intervalMs: 16.7, clockKind: 'webgpu', axes: '3d', fill, draw,
+  intervalMs: 16.7, clockKind: 'webgpu', axes: '3d', fill,
   totalMs: 280, rendererMs: 60, compileMs: 18, shadeCompileMs: 0,
   bufferPixels: 1_000_000, shadeRegionPixels: extra?.shadeRegionPixels ?? 0,
   ...(extra?.shade ? { shade: extra.shade } : {}),
@@ -96,7 +99,7 @@ describe('RAMP_BOUNDS — total over every RampKind', () => {
     // reach and the ramp would report `'ceiling'` at some ODD load nobody chose. Bitwise, not
     // `Math.log2`, to sidestep any float rounding on the larger bounds (cpu's maxLoad is 2097152).
     const isPowerOfTwo = (n: number) => Number.isInteger(n) && n > 0 && (n & (n - 1)) === 0;
-    const kinds: readonly RampKind[] = ['fill', 'draw', 'shade', 'cpu'];
+    const kinds: readonly RampKind[] = ['fill', 'shade', 'cpu'];
     for (const kind of kinds) {
       const bounds = RAMP_BOUNDS[kind];
       expect(bounds).toBeDefined();
@@ -110,7 +113,7 @@ describe('RAMP_BOUNDS — total over every RampKind', () => {
 describe('startRamp', () => {
   it('starts at the kind\'s start load', () => {
     expect(rampNextLoad(startRamp('fill', INTERVAL))).toBe(RAMP_BOUNDS.fill.startLoad);
-    expect(rampNextLoad(startRamp('draw', INTERVAL))).toBe(RAMP_BOUNDS.draw.startLoad);
+    expect(rampNextLoad(startRamp('shade', INTERVAL))).toBe(RAMP_BOUNDS.shade.startLoad);
   });
 
   it('refuses to run at all without a measured interval', () => {
@@ -124,7 +127,9 @@ describe('startRamp', () => {
 
 describe('recordRampFrame — the ramp itself', () => {
   it('doubles the load each step', () => {
-    let s = startRamp('draw', INTERVAL);
+    // Kind is 'shade' pinned to load 32 (not the removed 'draw' kind) via `startLoadOverride` —
+    // see its doc comment — purely to keep this test's numbers unchanged across the #221 removal.
+    let s = startRamp('shade', INTERVAL, undefined, 32);
     const loads: number[] = [];
     for (let i = 0; i < 4; i++) {
       loads.push(rampNextLoad(s)!);
@@ -161,7 +166,7 @@ describe('escape detection', () => {
   it('rejects a spike out of a vsync-PINNED frame — that is a hiccup, not load', () => {
     // The predecessor sits at 1.0x the interval, so there is no second real point to draw a slope
     // between; whatever the spike is, it is not a measurement.
-    let s = startRamp('draw', INTERVAL);
+    let s = startRamp('shade', INTERVAL);
     s = recordRampFrame(s, INTERVAL);
     s = recordRampFrame(s, INTERVAL * ESCAPE_MULTIPLE + 1);
     expect(s.status).toBe('running');
@@ -172,7 +177,10 @@ describe('escape detection', () => {
     // already paid for: an iPhone 8's draw ramp ran 512 calls in ~38ms then 1024 in ~76ms — a
     // clean doubling with 2x growth — but 38ms is only 2.2x a 17ms interval, so it was thrown
     // away, and reaching a step where both frames cleared 3x cost more than the whole budget.
-    let s = startRamp('draw', INTERVAL);
+    // (The `draw` ramp itself was removed 2026-08-13, #221 — see `rampProbe.ts`'s `RampKind`
+    // removal record. This is escape-logic evidence, not a `draw`-specific test, so it now runs
+    // on `shade`, pinned to load 32 via `startLoadOverride` to keep every number below unchanged.)
+    let s = startRamp('shade', INTERVAL, undefined, 32);
     s = recordRampFrame(s, INTERVAL);  // load 32, still pinned — MIN_STEPS_BEFORE_ESCAPE
     s = recordRampFrame(s, 38);        // load 64
     s = recordRampFrame(s, 76);        // load 128
@@ -183,7 +191,7 @@ describe('escape detection', () => {
   });
 
   it('still rejects a predecessor that is barely off the pin', () => {
-    let s = startRamp('draw', INTERVAL);
+    let s = startRamp('shade', INTERVAL);
     s = recordRampFrame(s, INTERVAL * (ESCAPE_PRIOR_MULTIPLE - 0.2));
     s = recordRampFrame(s, INTERVAL * 6);
     expect(s.status).toBe('running');
@@ -192,14 +200,14 @@ describe('escape detection', () => {
   it('does not count a frame merely OVER the interval — vsync quantization lands there', () => {
     // A frame that misses one slot presents at exactly 2x the interval on a 60 Hz panel. If that
     // counted as escape the ramp would measure a slope off two missed slots.
-    let s = startRamp('draw', INTERVAL);
+    let s = startRamp('shade', INTERVAL);
     s = recordRampFrame(s, INTERVAL * 2);
     s = recordRampFrame(s, INTERVAL * 2);
     expect(s.status).toBe('running');
   });
 
   it('escapes once two consecutive steps clear the threshold', () => {
-    let s = startRamp('draw', INTERVAL);
+    let s = startRamp('shade', INTERVAL);
     s = recordRampFrame(s, INTERVAL);      // MIN_STEPS_BEFORE_ESCAPE — the settling guard
     s = recordRampFrame(s, INTERVAL * 4);
     expect(s.status).toBe('running');
@@ -261,7 +269,7 @@ describe('readRamp — throughput', () => {
     // 4 units/ms with 5 ms of per-frame overhead, presented through a 60 Hz compositor. A naive
     // `load / frameMs` at the escape step would read ~1.9 — off by more than 2x, because it
     // charges the overhead and the quantization to the load. The slope should not.
-    const s = runRamp('draw', vsyncDevice(4, 5));
+    const s = runRamp('shade', vsyncDevice(4, 5));
     const r = readRamp(s);
     expect(r.bound).toBe('measured');
     expect(r.unitsPerMs).toBeGreaterThan(3);
@@ -278,13 +286,13 @@ describe('readRamp — throughput', () => {
     // throughput sends a device to the low tier, which is the recoverable mistake (see
     // qualityTier's module header); overstating it is the one that costs a GPU context. The size
     // of the error is a known limitation; its SIGN is a guarantee.
-    const r = readRamp(runRamp('draw', vsyncDevice(8, 40)));
+    const r = readRamp(runRamp('shade', vsyncDevice(8, 40)));
     expect(r.unitsPerMs).toBeGreaterThan(0);
     expect(r.unitsPerMs).toBeLessThanOrEqual(8);
   });
 
   it('reports a LOWER bound when a strong device never escapes', () => {
-    const s = runRamp('draw', () => INTERVAL);
+    const s = runRamp('shade', () => INTERVAL);
     const r = readRamp(s);
     expect(r.bound).toBe('lower');
     expect(r.unitsPerMs).toBeCloseTo(r.peakLoad / INTERVAL, 5);
@@ -293,7 +301,7 @@ describe('readRamp — throughput', () => {
   it('divides a lower bound by the FRAME, not the interval, when the ramp ran long', () => {
     // Over-loaded but never past the escape threshold: frames sit at 2x the interval until the
     // budget runs out. Dividing by the interval here would claim twice the throughput shown.
-    const s = runRamp('draw', () => INTERVAL * 2);
+    const s = runRamp('shade', () => INTERVAL * 2);
     const r = readRamp(s);
     expect(r.status).toBe('budget');
     expect(r.bound).toBe('lower');
@@ -304,7 +312,9 @@ describe('readRamp — throughput', () => {
     // Both steps are well past the threshold and identical: the cost is fixed overhead, not the
     // load. Stopping here would hand the slope estimator two identical points; the correct move
     // is to keep doubling until the load actually shows up.
-    let s = startRamp('draw', INTERVAL);
+    // Pinned to load 32 via `startLoadOverride` (the removed 'draw' kind's own start load) purely
+    // to keep the `128` expectation below unchanged across the #221 removal.
+    let s = startRamp('shade', INTERVAL, undefined, 32);
     s = recordRampFrame(s, INTERVAL * 3.5);
     s = recordRampFrame(s, INTERVAL * 3.5);
     expect(s.status).toBe('running');
@@ -349,7 +359,9 @@ describe('readRamp — throughput', () => {
     // 1 ms so a cheap final step reads 1. Taking the slower of the last two frames is strictly
     // conservative and a no-op whenever load growth makes the last step the slowest, which is the
     // normal case.
-    let s = startRamp('draw', 16.7, 4_000);
+    // Pinned to load 32 via `startLoadOverride` (the removed 'draw' kind's own start load, which
+    // shares 'shade's maxLoad of 4096) so this ceiling-reaching sequence is unchanged by #221.
+    let s = startRamp('shade', 16.7, 4_000, 32);
     for (const ms of [20, 20, 20, 20, 20, 20, 20, 5]) s = recordRampFrame(s, ms);
     const r = readRamp(s);
     expect(r.bound).toBe('lower');
@@ -360,7 +372,7 @@ describe('readRamp — throughput', () => {
   it('leaves an ordinary lower bound alone — the guard must not tax the normal case', () => {
     // Load grows, so the last frame is the slowest and `Math.max` picks exactly what the old code
     // picked. A conservative guard that also moved normal readings would silently re-band devices.
-    let s = startRamp('draw', 16.7, 4_000);
+    let s = startRamp('shade', 16.7, 4_000, 32);
     for (const ms of [5, 6, 8, 11, 14, 17, 20, 24]) s = recordRampFrame(s, ms);
     const r = readRamp(s);
     expect(r.bound).toBe('lower');
@@ -375,8 +387,8 @@ describe('readRamp — throughput', () => {
   it('ranks a fast device above a slow one on the same ramp', () => {
     // The property that actually matters downstream: whatever the absolute error, the ORDER of
     // two devices must survive the estimator.
-    const fast = readRamp(runRamp('draw', vsyncDevice(20, 2)));
-    const slow = readRamp(runRamp('draw', vsyncDevice(2, 2)));
+    const fast = readRamp(runRamp('shade', vsyncDevice(20, 2)));
+    const slow = readRamp(runRamp('shade', vsyncDevice(2, 2)));
     expect(fast.unitsPerMs).toBeGreaterThan(slow.unitsPerMs);
   });
 });
@@ -387,7 +399,6 @@ describe('fillMegapixelsPerMs — the ramp\'s raw fill number is NOT comparable 
   });
   const m = (fillUnits: number, bufferPixels: number): ProbeMeasurement => ({
     intervalMs: INTERVAL, clockKind: 'webgpu', axes: '2d', fill: reading(fillUnits),
-    draw: { kind: 'draw', status: 'escaped', unitsPerMs: 50, bound: 'measured', peakLoad: 512, steps: [] },
     totalMs: 300, rendererMs: 10, compileMs: 3, shadeCompileMs: 0, bufferPixels, shadeRegionPixels: 0,
   });
 
@@ -416,7 +427,7 @@ describe('fillMegapixelsPerMs — the ramp\'s raw fill number is NOT comparable 
 describe('shadeMegaFragmentsPerMs — the same treatment fillMegapixelsPerMs gives fill (#188)', () => {
   it('normalises instances/ms by the FIXED shade region into millions of shaded fragments/ms', () => {
     // 4 instances/ms over a 10,000px (100x100) region is 40,000 fragments/ms, i.e. 0.04 Mfrag/ms.
-    const m = measurementFixture(readingFixture('fill', 5), readingFixture('draw', 30), {
+    const m = measurementFixture(readingFixture('fill', 5), {
       shade: readingFixture('shade', 4), shadeRegionPixels: 10_000,
     });
     expect(shadeMegaFragmentsPerMs(m)).toBeCloseTo(0.04, 6);
@@ -425,19 +436,19 @@ describe('shadeMegaFragmentsPerMs — the same treatment fillMegapixelsPerMs giv
   it('is 0 when the measurement carries no shade reading at all', () => {
     // The common case on a backend that refused the heavy material — fill/draw still measured,
     // shade simply absent.
-    const m = measurementFixture(readingFixture('fill', 5), readingFixture('draw', 30));
+    const m = measurementFixture(readingFixture('fill', 5));
     expect(shadeMegaFragmentsPerMs(m)).toBe(0);
   });
 
   it('is 0 when the shade ramp produced no usable reading', () => {
-    const m = measurementFixture(readingFixture('fill', 5), readingFixture('draw', 30), {
+    const m = measurementFixture(readingFixture('fill', 5), {
       shade: readingFixture('shade', 0, 'none'), shadeRegionPixels: 10_000,
     });
     expect(shadeMegaFragmentsPerMs(m)).toBe(0);
   });
 
   it('is 0 when the region collapsed to nothing — a buffer too small to host it', () => {
-    const m = measurementFixture(readingFixture('fill', 5), readingFixture('draw', 30), {
+    const m = measurementFixture(readingFixture('fill', 5), {
       shade: readingFixture('shade', 4), shadeRegionPixels: 0,
     });
     expect(shadeMegaFragmentsPerMs(m)).toBe(0);
@@ -483,7 +494,7 @@ describe('classifyDevice', () => {
   // most cases here pin them at 'none' to prove that directly — see the dedicated regression test
   // below for why that matters.
   const measurement = (cpuUnitsPerMs: number, shadeMfragPerMs: number, bound: RampReading['bound'] = 'measured') =>
-    measurementFixture(readingFixture('fill', 0, 'none'), readingFixture('draw', 0, 'none'), {
+    measurementFixture(readingFixture('fill', 0, 'none'), {
       cpu: readingFixture('cpu', cpuUnitsPerMs, bound),
       shade: shadeReading(shadeMfragPerMs, bound),
       shadeRegionPixels: 10_000,
@@ -557,19 +568,19 @@ describe('classifyDevice', () => {
     // The exact defect the swap fixes: the Huawei Y6 (0/6 draw escapes) and the iPhone 7 (0/3)
     // used to classify on zero launches, because a `'none'` fill or draw refused a verdict. Good
     // cpu+shade must still classify normally with fill/draw both unusable.
-    const m = measurementFixture(readingFixture('fill', 0, 'none'), readingFixture('draw', 0, 'none'), {
+    const m = measurementFixture(readingFixture('fill', 0, 'none'), {
       cpu: readingFixture('cpu', 21_300), shade: shadeReading(0.21), shadeRegionPixels: 10_000,
     });
     expect(classifyDevice(m).deviceClass).toBe('capable');
   });
 
   it('refuses to classify when the cpu ramp produced no reading — absent or `bound: \'none\'`', () => {
-    const absent = measurementFixture(readingFixture('fill', 5), readingFixture('draw', 30), {
+    const absent = measurementFixture(readingFixture('fill', 5), {
       shade: shadeReading(0.21), shadeRegionPixels: 10_000,
     });
     expect(classifyDevice(absent).reason).toMatch(/cpu ramp produced no usable reading/);
 
-    const none = measurementFixture(readingFixture('fill', 0, 'none'), readingFixture('draw', 0, 'none'), {
+    const none = measurementFixture(readingFixture('fill', 0, 'none'), {
       cpu: readingFixture('cpu', 0, 'none'), shade: shadeReading(0.21), shadeRegionPixels: 10_000,
     });
     expect(classifyDevice(none).deviceClass).toBe('unknown');
@@ -577,12 +588,12 @@ describe('classifyDevice', () => {
   });
 
   it('refuses to classify when the shade ramp produced no reading — absent or `bound: \'none\'`', () => {
-    const absent = measurementFixture(readingFixture('fill', 5), readingFixture('draw', 30), {
+    const absent = measurementFixture(readingFixture('fill', 5), {
       cpu: readingFixture('cpu', 21_300),
     });
     expect(classifyDevice(absent).reason).toMatch(/shade ramp produced no usable reading/);
 
-    const none = measurementFixture(readingFixture('fill', 0, 'none'), readingFixture('draw', 0, 'none'), {
+    const none = measurementFixture(readingFixture('fill', 0, 'none'), {
       cpu: readingFixture('cpu', 21_300), shade: readingFixture('shade', 0, 'none'), shadeRegionPixels: 10_000,
     });
     expect(classifyDevice(none).reason).toMatch(/shade ramp produced no usable reading/);
@@ -593,24 +604,26 @@ describe('classifyDevice', () => {
   });
 });
 
-describe('classifyDevice ignores fill/draw — they are logged only, not classified on (#188 axis swap)', () => {
+describe('classifyDevice ignores fill — logged only, not classified on (#188 axis swap)', () => {
   // Fixed cpu/shade pair that lands in `middle` on its own (the Galaxy A23 medians from the
-  // classifyDevice suite above). Every test below only varies fill/draw around it. Before #188
-  // this block pinned shade/cpu as the evidence-only axes; the swap inverted which pair that is.
+  // classifyDevice suite above). Every test below only varies fill around it. Before #188 this
+  // block pinned shade/cpu as the evidence-only axes; the swap inverted which pair that is.
+  // (`draw` sat alongside `fill` here as a second evidence-only axis until it was removed
+  // entirely 2026-08-13, #221 W2 item 4 — see the `RampKind` removal record in `rampProbe.ts`.)
   const cpuReading = readingFixture('cpu', 9_900);
   const midShadeReading = shadeReading(0.13);
 
-  it('stays `middle` whether fill/draw are absurdly high, absurdly low, or absent entirely', () => {
-    // A future change that starts classifying on fill/draw again is exactly the regression this
-    // pins: today NOTHING reads those fields for classification, so no value — however extreme —
-    // may move the verdict.
-    const withHighAxes = measurementFixture(readingFixture('fill', 1e9), readingFixture('draw', 1e9), {
+  it('stays `middle` whether fill is absurdly high, absurdly low, or absent entirely', () => {
+    // A future change that starts classifying on fill again is exactly the regression this pins:
+    // today NOTHING reads that field for classification, so no value — however extreme — may
+    // move the verdict.
+    const withHighAxes = measurementFixture(readingFixture('fill', 1e9), {
       cpu: cpuReading, shade: midShadeReading, shadeRegionPixels: 10_000,
     });
-    const withLowAxes = measurementFixture(readingFixture('fill', 1e-9), readingFixture('draw', 1e-9), {
+    const withLowAxes = measurementFixture(readingFixture('fill', 1e-9), {
       cpu: cpuReading, shade: midShadeReading, shadeRegionPixels: 10_000,
     });
-    const withNoneAxes = measurementFixture(readingFixture('fill', 0, 'none'), readingFixture('draw', 0, 'none'), {
+    const withNoneAxes = measurementFixture(readingFixture('fill', 0, 'none'), {
       cpu: cpuReading, shade: midShadeReading, shadeRegionPixels: 10_000,
     });
     expect(classifyDevice(withHighAxes).deviceClass).toBe('middle');
@@ -618,12 +631,12 @@ describe('classifyDevice ignores fill/draw — they are logged only, not classif
     expect(classifyDevice(withNoneAxes).deviceClass).toBe('middle');
   });
 
-  it('does not refuse classification when fill or draw themselves are unusable', () => {
+  it('does not refuse classification when fill itself is unusable', () => {
     // classifyDevice's `'unknown'` check reads only m.cpu.bound / m.shade.bound now — a `'none'`
     // on an evidence-only axis must not slip through that check and poison an otherwise-good
     // reading. Same fact as the dedicated regression test in the classifyDevice suite above, from
-    // the "ignores fill/draw entirely" side rather than the "cpu/shade still decide" side.
-    const withNoneAxes = measurementFixture(readingFixture('fill', 0, 'none'), readingFixture('draw', 0, 'none'), {
+    // the "ignores fill entirely" side rather than the "cpu/shade still decide" side.
+    const withNoneAxes = measurementFixture(readingFixture('fill', 0, 'none'), {
       cpu: cpuReading, shade: midShadeReading, shadeRegionPixels: 10_000,
     });
     expect(classifyDevice(withNoneAxes).deviceClass).toBe('middle');
@@ -870,10 +883,10 @@ describe('the refinement policy does not trust its own inputs', () => {
     // With the one-pass shortcut gone that danger has no path left — against a median of three a
     // floor is merely conservative, since it understates and understating is the recoverable
     // direction. So the field went with it.
-    const slope = readingOf(measurementFixture(readingFixture('fill', 0, 'none'), readingFixture('draw', 0, 'none'), {
+    const slope = readingOf(measurementFixture(readingFixture('fill', 0, 'none'), {
       cpu: readingFixture('cpu', 21_300), shade: shadeReading(0.21), shadeRegionPixels: 10_000,
     }));
-    const floor = readingOf(measurementFixture(readingFixture('fill', 0, 'none'), readingFixture('draw', 0, 'none'), {
+    const floor = readingOf(measurementFixture(readingFixture('fill', 0, 'none'), {
       cpu: readingFixture('cpu', 21_300, 'lower'), shade: shadeReading(0.21, 'lower'), shadeRegionPixels: 10_000,
     }));
     expect(slope).toEqual(floor);
@@ -889,7 +902,7 @@ describe('the refinement policy does not trust its own inputs', () => {
     // out of `classifyDevice`, and nothing would have caught it.
     PROBE_THRESHOLDS.middle = null;
     PROBE_THRESHOLDS.capable = null;
-    const v = classifyDevice(measurementFixture(readingFixture('fill', 5), readingFixture('draw', 30), {
+    const v = classifyDevice(measurementFixture(readingFixture('fill', 5), {
       cpu: readingFixture('cpu', 0, 'none'), shade: shadeReading(0.21), shadeRegionPixels: 10_000,
     }));
     expect(v.deviceClass).toBe('unknown');
@@ -928,10 +941,16 @@ describe('the effective frame interval is the GAME\'s, not the rAF cadence', () 
   });
 });
 
-describe('⭐ the three devices the 2D bands were measured on (#203/#204, 2026-08-13)', () => {
+describe('⭐ the three devices the 2D bands were measured on (#203/#204, re-measured on v9 for #221)', () => {
   // `games/space-invader` (render3d:false, so the probe ran with no Three in the process at all),
   // debug build, `pm clear` before EVERY launch, three launches each. Medians below. These are the
   // entire empirical basis for the 2D table — if one moves, the table is wrong, not the test.
+  //
+  // ⭐ RE-MEASURED 2026-08-13 after `RAMP_BOUNDS.fill.maxLoad` rose 1024 -> 65536: the S22 could not
+  // escape the old ceiling, so its 7.69 was a BOUND and the capable floor derived from it was a
+  // midpoint with one end pinned to the instrument. Escaped, it reads 25.82 and the floor moved
+  // 4.6 -> 8.5. The Y6 (1.02 -> 1.10) and A23 (2.77 -> 2.81) escaped under both ceilings and barely
+  // moved — which is what proves the change is about the ceiling and not about the phones.
   const reading2D = (cpuK: number, fillMpx: number): ProbeReading =>
     ({ cpuUnitsPerMs: cpuK * 1000, shadeMfragPerMs: 0, fillMpxPerMs: fillMpx });
 
@@ -939,17 +958,19 @@ describe('⭐ the three devices the 2D bands were measured on (#203/#204, 2026-0
     // They shipped null for one day on purpose. Reverting either would silently stop classifying
     // every unrecognised 2D device.
     expect(PROBE_THRESHOLDS_2D.middle).toEqual({ cpuUnitsPerMs: 4_500, fillMpxPerMs: 1.68 });
-    expect(PROBE_THRESHOLDS_2D.capable).toEqual({ cpuUnitsPerMs: 4_500, fillMpxPerMs: 4.6 });
+    expect(PROBE_THRESHOLDS_2D.capable).toEqual({ cpuUnitsPerMs: 4_500, fillMpxPerMs: 8.5 });
   });
 
-  it('Huawei Y6 (PowerVR GE8300) — fill 1.02, cpu 2.0k — is weak', () => {
-    expect(classifyReading(reading2D(2.0, 1.02), '2d').deviceClass).toBe('weak');
+  it('Huawei Y6 (PowerVR GE8300) — fill 1.10, cpu 2.1k — is weak', () => {
+    expect(classifyReading(reading2D(2.1, 1.10), '2d').deviceClass).toBe('weak');
+    expect(classifyReading(reading2D(2.0, 1.02), '2d').deviceClass).toBe('weak');   // the v5 median
   });
 
-  it('⭐ Galaxy A23 (Mali-G57 MC2) — fill 2.77 — is middle, and specifically NOT capable', () => {
-    // The half that matters: 2.77 sits below the 4.6 capable floor, so the A23 does not get an
+  it('⭐ Galaxy A23 (Mali-G57 MC2) — fill 2.81 — is middle, and specifically NOT capable', () => {
+    // The half that matters: 2.81 sits below the capable floor, so the A23 does not get an
     // unclamped 2D DPR. That is the decision #204 is about.
-    expect(classifyReading(reading2D(10.1, 2.77), '2d').deviceClass).toBe('middle');
+    expect(classifyReading(reading2D(9.0, 2.81), '2d').deviceClass).toBe('middle');
+    expect(classifyReading(reading2D(10.1, 2.77), '2d').deviceClass).toBe('middle');  // the v5 median
   });
 
   it('⚠️ the middle FILL floor is load-bearing for a device none of the three anchors is', () => {
@@ -962,18 +983,31 @@ describe('⭐ the three devices the 2D bands were measured on (#203/#204, 2026-0
     expect(classifyReading(reading2D(10.0, 2.00), '2d').deviceClass).toBe('middle');
   });
 
-  it('Galaxy S22 (Adreno 730) — fill >= 7.69 — is capable, on a LOWER BOUND', () => {
-    // Its ramp never escaped (ceiling/lower), so the reading is "at least 7.69". Clearing a floor
-    // on a lower bound is sound; FAILING one on a lower bound would not have been.
-    expect(classifyReading(reading2D(13.9, 7.69), '2d').deviceClass).toBe('capable');
+  it('Galaxy S22 (Adreno 730) — fill 25.82, an ESCAPED measurement — is capable', () => {
+    expect(classifyReading(reading2D(11.8, 25.82), '2d').deviceClass).toBe('capable');
+  });
+
+  it('iPhone Air (A19 Pro) — fill 68.21 — is capable, clearing the floor by 8x', () => {
+    // The fourth anchor, measured 2026-08-13 on the same v9 instrument (it read 24.5 as a BOUND
+    // before). It moves no boundary and is pinned anyway: without a device unambiguously past the
+    // top floor, that floor is only ever placed from below.
+    expect(classifyReading(reading2D(58.3, 68.21), '2d').deviceClass).toBe('capable');
+  });
+
+  it('⚠️ the S22 as the OLD ceiling measured it — 7.69 — would now be MIDDLE, and that is correct', () => {
+    // The bound and the floor moved together, so this is not a regression: 7.69 was never a
+    // statement about the phone, it was the ramp's own ceiling divided by a frame. Pinned because
+    // it is the one number a reader is most likely to carry forward from the v5 campaign, and
+    // carrying it forward now gives the wrong band.
+    expect(classifyReading(reading2D(13.9, 7.69), '2d').deviceClass).toBe('middle');
   });
 
   it('⚠️ the cpu axis cannot separate the A23 from the S22 — fill is what decides', () => {
-    // Their measured cpu ranges OVERLAP (A23 9.5-12.8k, S22 12.0-13.9k), which is why the capable
+    // Their measured cpu ranges OVERLAP (A23 9.0-12.8k, S22 11.8-23.2k), which is why the capable
     // row carries the same cpu floor as middle. Swap only the fill figures and the verdicts swap
     // with them: the decision really is made on the axis the doc claims.
-    expect(classifyReading(reading2D(13.9, 2.77), '2d').deviceClass).toBe('middle');
-    expect(classifyReading(reading2D(10.1, 7.69), '2d').deviceClass).toBe('capable');
+    expect(classifyReading(reading2D(11.8, 2.81), '2d').deviceClass).toBe('middle');
+    expect(classifyReading(reading2D(9.0, 25.82), '2d').deviceClass).toBe('capable');
   });
 
   it('a 2D reading is NOT judged by the 3D table', () => {
