@@ -1107,9 +1107,11 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   today and drift on the first retune. (`runtime/rendering/hitRegions.ts`; Court is the worked
   example, `games/court/runtime/systems.ts`.)
 - **Editor session (perceive the human):** `modoki_editor_journal {type,source,since,sinceCap,merged,limit,clear}`
-  — the human-authoring stream (`!` sigil: `!select`/`!edit`/`!transform`/`!create`/`!duplicate`/`!delete`/
-  `!reparent`/`!play`/`!pause`/`!stop`/`!gizmo`/`!scene-load`/`!save`/`!undo`/`!redo`), GUID-addressed with
-  old→new values on edits. Every event carries **`source:'human'|'agent'`** so you never mistake YOUR
+  — the human-authoring stream (`!` sigil: `!select`/`!edit`/`!mutate`/`!transform`/`!create`/`!duplicate`/
+  `!delete`/`!reparent`/`!play`/`!pause`/`!stop`/`!gizmo`/`!scene-load`/`!save`/`!undo`/`!redo`), GUID-addressed with
+  old→new values on edits. ⚠️ `!edit` is the human Inspector-field path; **your own
+  `modoki_mutate_scene`/`modoki_set_transform` land as `!mutate`** — this list omitted it, and a QA
+  case that filtered for `!edit` failed against a healthy engine. Every event carries **`source:'human'|'agent'`** so you never mistake YOUR
   own edits for the human's (agent-driven editor ops self-tag `'agent'`). `merged:1` interleaves it with
   the game journal by a shared capture counter for the "pressed Play → set timeScale 0.3 → `@match` tick 84"
   correlated story. All three streams return the **last 100 + `byType` counts**; cursor precisely with

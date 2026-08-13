@@ -63,7 +63,7 @@
 
 import { BUDGET_30FPS_MS, type FrameProfile } from '../core/frameProfiler';
 import { probeVerdictStore } from '../core/probeVerdictStore';
-import { probeFingerprint, type DeviceClass } from './rampProbe';
+import { probeFingerprint, classifyMedianOf, type DeviceClass, type ProbeVerdict } from './rampProbe';
 // The GPU-identity layer (#210). Its import back to here is TYPE-ONLY (`QualityTier`), so it is
 // erased at compile time and this stays a one-way runtime dependency — the same shape, and for the
 // same reason, as the `PostFXRequest` import below.
@@ -127,6 +127,11 @@ export interface TierResolution {
   source: TierSource;
   /** One human-readable clause. Shown in `diagnose` and the debug menu. */
   reason: string;
+  /** Set only on `source: 'measured'` — the boot probe found this device short of the next band
+   *  on the CPU axis alone, with the GPU axis already clear. Read by {@link promotionCeiling},
+   *  which uses it to allow exactly one live promotion step. See {@link ProbeVerdict.cpuLimited}
+   *  for why that is sound here and nowhere else. */
+  cpuLimited?: boolean;
 }
 
 /** The five composable post-process effects, named with `PostFXRequest`'s OWN keys
@@ -746,6 +751,9 @@ export interface TierResolveInput {
    *  run, or produced nothing usable — all of which must land on today's behaviour, never on a
    *  guess. See `rampProbe.ts`. */
   probeClass?: DeviceClass;
+  /** Companion to {@link TierResolveInput.probeClass} — see {@link ProbeVerdict.cpuLimited}.
+   *  Absent whenever `probeClass` is, and ignored on every branch that answers before the probe. */
+  probeCpuLimited?: boolean;
 }
 
 /** The device facts a tier resolution is built from — the shape `DeviceCaps` supplies, narrowed to
@@ -758,12 +766,20 @@ export interface TierDeviceFacts {
   formFactor?: 'mobile' | 'desktop';
 }
 
-/** The cached boot-probe class for THIS device, or `undefined` when there is none that applies.
+/** The cached boot-probe verdict for THIS device, or `undefined` when there is none that applies.
  *
  *  Checked against {@link probeFingerprint} so a verdict measured on different hardware — or under
  *  a different `CLASSIFIER_VERSION` — is never reused. Synchronous: the probe ran at renderer
- *  bring-up, so by the time any later caller asks, the answer is in `PlayerPrefs`. */
-export function readCachedProbeClass(caps: TierDeviceFacts | null | undefined): DeviceClass | undefined {
+ *  bring-up, so by the time any later caller asks, the answer is in `PlayerPrefs`.
+ *
+ *  ⚠️ `cpuLimited` is RECOMPUTED from the stored samples rather than stored beside the band,
+ *  through the same `classifyMedianOf` the live path uses. Two reasons, and the second is the one
+ *  that matters: a stored derived field would have to be migrated every time the thresholds move,
+ *  and a device that cached a verdict under an old table would then carry a promotion licence
+ *  derived from boundaries that no longer exist. Recomputing costs three medians. */
+export function readCachedProbeVerdict(
+  caps: TierDeviceFacts | null | undefined,
+): { deviceClass: DeviceClass; cpuLimited: boolean } | undefined {
   const cached = probeVerdictStore.get()?.read();
   if (!cached) return undefined;
   // Through `globalThis`, not `window` — this module is compiled without the DOM lib on purpose
@@ -779,7 +795,13 @@ export function readCachedProbeClass(caps: TierDeviceFacts | null | undefined): 
   });
   // `CachedProbeVerdict.deviceClass` excludes `'unknown'` by type — an unusable reading is never
   // written (`rampProbe`), so a cache hit is always a real band.
-  return cached.fingerprint === fingerprint ? cached.deviceClass : undefined;
+  if (cached.fingerprint !== fingerprint) return undefined;
+  // ⚠️ `'3d'`, and it is not an assumption: the fingerprint built above omits the `':2d'` platform
+  // suffix that `resolveProbeClass` appends for a 2D probe, so a 2D record can never match here in
+  // the first place. A 2D project reaches its verdict through the live path, which knows its own
+  // shape. Stated rather than left implicit, because reading the axis wrong is silent — it would
+  // judge a shade reading against a fill floor.
+  return { deviceClass: cached.deviceClass, cpuLimited: classifyMedianOf(cached.samples, '3d').cpuLimited };
 }
 
 /** Build the input for {@link resolveTier} from the device facts — **the ONE builder both the boot
@@ -808,9 +830,19 @@ export function readCachedProbeClass(caps: TierDeviceFacts | null | undefined): 
 export function buildTierResolveInput(
   caps: TierDeviceFacts | null | undefined,
   projectSetting: QualityTierSetting | undefined,
-  opts: { playerChoice?: QualityTier | null; probeClass?: DeviceClass; useProbe?: boolean } = {},
+  opts: {
+    playerChoice?: QualityTier | null;
+    probeClass?: DeviceClass;
+    /** See {@link ProbeVerdict.cpuLimited}. Threaded THROUGH THIS BUILDER rather than read at the
+     *  call site for the reason the builder exists at all: the two callers drifted once already,
+     *  and a promotion licence that only one of them passed would be a tier that promotes on the
+     *  boot path and not after a player picks "Auto" again. */
+    probeCpuLimited?: boolean;
+    useProbe?: boolean;
+  } = {},
 ): TierResolveInput {
   const useProbe = opts.useProbe ?? true;
+  const cached = useProbe && opts.probeClass === undefined ? readCachedProbeVerdict(caps) : null;
   return {
     platform: caps?.platform ?? '',
     deviceModel: caps?.deviceModel,
@@ -818,7 +850,8 @@ export function buildTierResolveInput(
     formFactor: caps?.formFactor,
     playerChoice: opts.playerChoice,
     projectSetting,
-    probeClass: useProbe ? (opts.probeClass ?? readCachedProbeClass(caps)) : undefined,
+    probeClass: useProbe ? (opts.probeClass ?? cached?.deviceClass) : undefined,
+    probeCpuLimited: useProbe ? (opts.probeCpuLimited ?? cached?.cpuLimited) : undefined,
   };
 }
 
@@ -931,7 +964,9 @@ export function resolveTier(input: TierResolveInput): TierResolution {
     return {
       tier: measured,
       source: 'measured',
-      reason: `boot ramp probe measured this device as ${input.probeClass}`,
+      cpuLimited: input.probeCpuLimited,
+      reason: `boot ramp probe measured this device as ${input.probeClass}`
+        + (input.probeCpuLimited ? ' — cpu-limited, so live calibration may promote one step' : ''),
     };
   }
 
@@ -994,6 +1029,17 @@ export function freshTierChangeState(): TierChangeState {
  *
  *    `measured`     the boot probe measured cpu + shade on THIS hardware — the best GPU evidence
  *                   obtainable on a WebGL2 phone. Nothing live improves on it.
+ *                   ⭐ **ONE EXCEPTION, and it is the only crack in this rule (#205, owner
+ *                   2026-08-13): a `cpuLimited` measurement gets ONE step.** That flag means the
+ *                   reading missed the next band on the CPU axis ALONE, with the GPU axis already
+ *                   clear — so the objection above (a CPU streak cannot see a GPU-bound frame)
+ *                   does not arise: there is no GPU verdict to overrule. And the boot cpu number
+ *                   is a MEASURED under-estimate, 20-30% below what the same device sustains in
+ *                   game across three Androids, because the probe runs while the launch boost is
+ *                   decaying and nothing inside the probe closes that (two fixes tried, both
+ *                   refuted — see `CPU_WARMUP_RAMPS`). The owner's decision was to accept the
+ *                   under-estimate rather than inflate the floors and let calibration promote;
+ *                   this is that decision, scoped to the axis it is true of.
  *    `model`        the iOS model-generation table answered statically.
  *    `allowlist`    a known-good GPU string answered.
  *    `desktop`      already `high`; stated uniformly rather than special-cased, so a fourth tier
@@ -1013,8 +1059,9 @@ export function freshTierChangeState(): TierChangeState {
  *                   `auto` cannot pin unrecognised hardware to `low` forever (#155's stated cost),
  *                   and not enough to reach `high` on a device nobody has ever measured.
  *
- *  ⚠️ The honest consequence, and it is deliberate: on a device the probe DID classify, live
- *  promotion becomes a no-op. That is the probe's job done, not a mechanism gone missing — and a
+ *  ⚠️ The honest consequence, and it is deliberate: on a device the probe classified as anything
+ *  other than `cpuLimited`, live promotion becomes a no-op. That is the probe's job done, not a
+ *  mechanism gone missing — and a
  *  project that knows it is cheap enough to outrun its hardware's band pins `qualityTier: 'high'`,
  *  while a player who can see the screen overrides everything via `choosePlayerQualityTier`.
  *  Demotion is UNAFFECTED: it stays live, immediate and sticky, because being wrong downward is
@@ -1025,6 +1072,16 @@ export function promotionCeiling(assessed: TierResolution | null): QualityTier {
   // un-assessed rule applied to the tier an unrecognised device starts at.
   if (!assessed) return tierAbove('low') ?? 'low';
   if (assessed.source === 'calibrating') return tierAbove(assessed.tier) ?? assessed.tier;
+  // ⭐ The CPU-LIMITED exception (#205, owner 2026-08-13) — see the table above for why it is the
+  // ONLY crack in "a measurement is the ceiling", and `ProbeVerdict.cpuLimited` for why it is
+  // sound. In short: the boot cpu reading is a measured under-estimate (20-30% below what the same
+  // device sustains in game, on three Androids), the owner's decision was to accept that rather
+  // than inflate the floors, and `hasHeadroom` measures the SAME quantity the probe under-read.
+  // It applies only where the GPU axis has already cleared the band above, so the "a CPU streak
+  // cannot see a GPU-bound frame" objection never comes into play.
+  if (assessed.source === 'measured' && assessed.cpuLimited) {
+    return tierAbove(assessed.tier) ?? assessed.tier;
+  }
   return assessed.tier;
 }
 

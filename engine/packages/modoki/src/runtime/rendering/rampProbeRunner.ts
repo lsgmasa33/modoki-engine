@@ -278,6 +278,46 @@ const CPU_WORKING_SET = 256;
 const CPU_WARMUP_ITERATIONS = 8_192;
 const CPU_WARMUP_PASSES = 3;
 
+/** Whole cpu ramps run and DISCARDED before the one that classifies.
+ *
+ *  ⚠️ **NOT the same thing as {@link CPU_WARMUP_PASSES} one line above, and conflating them is the
+ *  mistake this constant exists to prevent.** Those three passes of 8192 iterations warm the JIT —
+ *  they take a millisecond or two, which is orders of magnitude too little work to move a CPU
+ *  governor. A governor needs *sustained* load, and only a full ramp supplies it.
+ *
+ *  **1 — and ⛔ 2 WAS TRIED ON HARDWARE AND MADE IT WORSE. Do not retry it.** The theory was
+ *  reasonable: with one discard the in-game reading was excellent (spreads 1.05-1.17x on three
+ *  phones) while the BOOT reading — the one that actually decides a tier — sat 20-30% below it and
+ *  still spread 1.38-1.98x, and at boot the process launch has already boosted the CPU, so pass 1
+ *  is not cold and one discard has nothing left to warm. A second discard should have bought the
+ *  ramp more sustained work. Measured, same 5-boot / 5-in-game protocol, three phones:
+ *
+ *    | device     | boot 1 discard | boot 2 discards | in-game 1 discard | in-game 2 discards |
+ *    |------------|----------------|-----------------|-------------------|--------------------|
+ *    | Huawei Y6  | 1.7 (1.83x)    | 2.0 (1.69x)     | 2.1 (1.10x)       | 2.2 (1.15x)        |
+ *    | Galaxy A23 | 8.7 (1.38x)    | 9.2 (1.25x)     | 12.1 (1.17x)      | 9.5 (1.09x)        |
+ *    | Galaxy S22 | 20.2 (1.98x)   | **19.3 (2.82x)**| 23.8 (1.05x)      | 23.2 (1.19x)       |
+ *
+ *  The S22's boot spread nearly DOUBLED — worse than the single-pass instrument it replaced — and
+ *  its band flipped `middle`/`capable` across the five launches. Everything else moved within
+ *  noise. The mechanism is visible in the warm-up sequences the log now prints: an A23 in-game run
+ *  read `warm-up 3.6k->13.4k` and then measured **9.8k**. Pass 2 peaks and pass 3 falls back, so
+ *  the boost is transient and decays even under continuous load.
+ *
+ *  ⚠️ **THE S22 BOOT ×2 CELL IS A RE-MEASUREMENT, and the first attempt at it was contaminated.**
+ *  The original run (18:17-18:20) overlapped a device lease another clone held on that phone
+ *  (`~/.modoki/device-claims.json`, `work-ai`, claimed 18:15:49) and read 16.8 (3.56x). Re-run at
+ *  18:58-19:01 with the phone free: **19.3 (2.82x)** — the number in the table. So the confound
+ *  was real and it inflated the harm; the DIRECTION is unchanged and now measured cleanly, since
+ *  2.82x is still materially worse than the 1.98x the single discard gives, and the band still
+ *  flips (`middle` on launch 1, `capable` on 2-5). Two lessons, both cheap: check the claims file
+ *  BEFORE a measurement run, and re-measure rather than argue from a claim record.
+ *
+ *  ⚠️ **So more sustained work is NOT monotonically a warmer reading**, which is the assumption
+ *  any "just add another pass" fix rests on. The remaining boot gap needs a different mechanism,
+ *  not a bigger count of this one. */
+const CPU_WARMUP_RAMPS = 1;
+
 // ── THE CPU RAMP ───────────────────────────────────────────────────────────────────────────
 
 /** Where the CPU ramp's result goes, so that nothing it computes is dead.
@@ -354,13 +394,49 @@ function propagate(n: CpuNodes, iterations: number): number {
 
 /** Run the CPU ramp to completion. No renderer, no clock, no frames — just JS and `rawNow()`.
  *
- *  ⚠️ **DURING BOOT THIS MEASURES AVAILABLE CPU, NOT PEAK CPU, and that is the caveat to carry.**
- *  The main thread is contended at boot; a synchronous loop cannot be preempted by other JS, but it
- *  can be descheduled by the OS and interrupted by GC. Unlike rAF — which does not degrade under
- *  contention so much as stop meaning anything, backing off in whole multiples of the panel tick —
- *  this degrades MONOTONICALLY: a busier device reads slower, which is the direction a tier
- *  decision wants anyway. Validate it the same way everything else here was validated, though:
- *  a boot reading against a quiet reading, on the same device. */
+ *  ⚠️ **THIS MEASURES AVAILABLE CPU, NOT PEAK CPU, AND WHICH CLOCK IT CATCHES THE DEVICE AT IS THE
+ *  WHOLE STORY.** Two rounds of the boot-vs-in-game A/B were run on 2026-08-13 (#205) — three
+ *  Androids, `games/sling`, five boot launches (`pm clear` before each) against five in-game runs
+ *  from the debug menu's `Re-run probe (idle)` button. cpu, k xform/ms, median (spread):
+ *
+ *    | device     | v6 boot     | v6 in-game  | v7 boot     | v7 in-game        |
+ *    |------------|-------------|-------------|-------------|-------------------|
+ *    | Huawei Y6  | 1.9 (1.18x) | 2.0 (1.44x) | 1.7 (1.83x) | **2.1 (1.10x)**   |
+ *    | Galaxy A23 | 7.7 (2.1x)  | 3.8 (1.4x)  | 8.7 (1.38x) | **12.1 (1.17x)**  |
+ *    | Galaxy S22 | 18.2 (3.5x) | 19.3 (2.4x) | 20.2 (1.98x)| **23.8 (1.05x)**  |
+ *
+ *  ⛔ **THE v6 COLUMNS ARE SUPERSEDED — do not quote them, and do not re-derive the conclusion
+ *  they supported.** They read "the A23 is 2x higher at boot than in game", which looked like a
+ *  device-dependent bias in the unsafe direction. It was an artifact of the INSTRUMENT: v6 ran one
+ *  cpu pass, so the in-game reading was taken on a CPU that had settled to a low clock and never
+ *  climbed. v7's discarded pass warms it, and the same A23 reads 12.1 in game rather than 3.8 —
+ *  the v6 "in-game" number reappears exactly as v7's warm-up pass (3.5-4.8k).
+ *
+ *  What v7 shows instead:
+ *    - **In game the axis is finally an instrument.** All three spreads collapse to 1.05-1.17x,
+ *      and the ordering is clean and wide: Y6 2.1 < A23 12.1 < S22 23.8.
+ *    - **The warm-up gain is asymmetric, which is what identifies it as the governor** — in game
+ *      the A23 gains ~3.1x over its own warm-up pass, the S22 ~1.2x, and the Y6 ~1.0x. A device
+ *      already at its ceiling has nothing to gain, the same signature the GPU discard found.
+ *    - **Boot is now the WORSE condition**, and it is where the shipped decision is made: spread
+ *      1.38-1.98x on the Samsungs, and both read BELOW their in-game figure (A23 8.7 vs 12.1, S22
+ *      20.2 vs 23.8). Boot gains scatter around 1.0 because process launch has already boosted the
+ *      CPU for pass 1 — so at boot the discard has nothing left to warm and only adds a sample.
+ *      The Y6's boot spread got worse, 1.18x -> 1.83x; small absolute numbers, but stated.
+ *
+ *  ⛔ **TWO THINGS HAVE NOW BEEN TRIED AGAINST THE REMAINING BOOT SPREAD AND BOTH FAILED. Do not
+ *  retry either.**
+ *    - **Defer the probe out of boot** — refuted by v6: the in-game spread was then no better than
+ *      the boot spread, and on the Y6 it was wider.
+ *    - **Discard a SECOND cpu pass** — built, installed, measured, reverted. It nearly doubled the
+ *      S22's boot spread (1.98x -> 3.56x, worse than the single-pass instrument) and flipped its
+ *      band across launches. Full table in {@link CPU_WARMUP_RAMPS}. The reason it cannot work is
+ *      in the warm-up sequences the log prints: an A23 in-game run read `warm-up 3.6k->13.4k` and
+ *      then measured 9.8k, so the boost is transient and decays even under continuous load. More
+ *      sustained work is not monotonically a warmer reading.
+ *
+ *  ⚠️ And do NOT retune the cpu floors off these numbers: see
+ *  docs/plans/low-end-device-support.md § 1, including the S22 band flip the discard caused. */
 // Exported for the same reason `runRamp` is: a test must be able to drive it directly, without
 // standing up a GL surface it does not need. Its deadline behaviour is the whole of what a test
 // has to reach here.
@@ -603,8 +679,36 @@ export async function runBootRampProbe(
     // so it is not being timed against a queue draining underneath it; and it is the cheapest, so
     // paying for it first guarantees every launch yields at least one axis even when the GPU side
     // produces nothing at all.
+    // ⭐ **THE CPU RAMP RUNS {@link CPU_WARMUP_RAMPS}+1 TIMES AND CLASSIFIES THE LAST**, for the
+    // same governor reason the GPU ramps discard theirs — see the shade discard below, and
+    // `runCpuRamp`'s own header for the two rounds of boot-vs-in-game measurement behind the
+    // count. `CPU_WARMUP_PASSES` warms the JIT (three passes of 8192, ~1-2 ms); it cannot warm a
+    // CPU governor, which needs sustained work and only a full ramp supplies it.
+    //
+    // ⚠️ The discarded readings are KEPT, not thrown away, and that is the one place this differs
+    // from the GPU discard. The cpu axis is the half still under investigation, and the pass-to-
+    // pass progression IS the governor signal — reporting it on every probe means the next person
+    // can read a device's DVFS behaviour straight off its boot log instead of building a
+    // diagnostic to ask. They vote on nothing: `readingOf` and every threshold read `cpu`.
+    //
+    // Cheap enough not to need a budget bump: a cpu ramp escapes in ~25-40 ms (Huawei Y6, the
+    // slowest device here, measured ~35 ms), so even three passes cost ~105 ms against a
+    // `PROBE_TOTAL_BUDGET_MS` of 3200 that the same phone completes inside ~2.15 s. Each warm-up
+    // carries the smaller `CPU_RAMP_BUDGET_MS` so a pathological device spends its remaining
+    // allowance on the pass that counts.
+    const cpuWarmups: RampReading[] = [];
+    for (let i = 0; i < CPU_WARMUP_RAMPS; i++) {
+      cpuWarmups.push(runCpuRamp(() => {}, phaseDeadline(CPU_RAMP_BUDGET_MS)));
+    }
     const cpu = runCpuRamp(mark, phaseDeadline(HARD_DEADLINE_MS));
-    mark(`cpu-ok ${cpu.status}/${cpu.bound}`);
+    // ⚠️ No `=== 1 ? '' : 'es'` pluralisation here, and that is not a style choice: `const x = 1`
+    // gives TypeScript the LITERAL type `1`, so comparing it against any other literal is an
+    // "unintentional comparison" ERROR — i.e. the moment someone retunes `CPU_WARMUP_RAMPS` the
+    // build breaks in a file they did not touch. Worse than the error is how it presents:
+    // `build-web.mjs` fails, `cap sync` copies the STALE `dist/`, gradle reports BUILD SUCCESSFUL,
+    // and the phone runs the previous instrument while you measure it. Hit exactly that on
+    // 2026-08-13 while re-measuring the S22 — the first probe line was the giveaway.
+    mark(`cpu-ok ${cpu.status}/${cpu.bound} (after ${CPU_WARMUP_RAMPS}x discarded warm-up ramp)`);
 
     const readings: Partial<Record<RampKind, RampReading>> = {};
 
@@ -670,7 +774,7 @@ export async function runBootRampProbe(
       }
       return {
         intervalMs: GPU_NOMINAL_INTERVAL_MS, clockKind: clock.kind, axes,
-        fill: readings.fill, draw: readings.draw, shade: readings.shade, cpu,
+        fill: readings.fill, draw: readings.draw, shade: readings.shade, cpu, cpuWarmups,
         totalMs: rawNow() - started, rendererMs, compileMs, shadeCompileMs,
         bufferPixels, shadeRegionPixels,
       };
@@ -749,7 +853,7 @@ export async function runBootRampProbe(
 
     return {
       intervalMs, clockKind: 'raf' satisfies ProbeClockKind, axes,
-      fill: readings.fill, draw: readings.draw, shade: readings.shade, cpu,
+      fill: readings.fill, draw: readings.draw, shade: readings.shade, cpu, cpuWarmups,
       totalMs: rawNow() - started, rendererMs, compileMs, shadeCompileMs,
       bufferPixels, shadeRegionPixels,
     };

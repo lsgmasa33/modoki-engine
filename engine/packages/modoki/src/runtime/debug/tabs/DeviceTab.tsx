@@ -9,6 +9,7 @@ import {
   getEffectiveThreeSettings, getEffectivePixiSettings, getActiveTierOverrides,
 } from '../../rendering/renderSettings';
 import { applyQualityTier } from '../../rendering/tierCalibration';
+import { runProbeForDiagnostics } from '../../rendering/tierResolve';
 import { TIER_ORDER, type QualityTier } from '../../rendering/qualityTier';
 import { forceResizeAllSurfaces } from '../../rendering/resizeBus';
 
@@ -177,6 +178,8 @@ export function DeviceTab() {
   // Bumping this forces a re-render so the Caps row (read live from getRenderSettings()
   // below, not component state) reflects a click immediately.
   const [, bumpCapsTick] = useState(0);
+  const [probeRunning, setProbeRunning] = useState(false);
+  const [probeResult, setProbeResult] = useState<string | null>(null);
   const rafRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -234,6 +237,31 @@ export function DeviceTab() {
   function previewTier(tier: QualityTier) {
     applyQualityTier(tier, 'project', 'previewed from the debug menu');
     bumpCapsTick((n) => n + 1);
+  }
+
+  /** Re-run the ramp probe NOW, with the game idle — the boot-vs-quiet A/B the cpu ramp asks for.
+   *
+   *  `runCpuRamp` measures *available* CPU, not peak, and its own doc asks for one validation:
+   *  a boot reading against a quiet reading on the same device. This is the quiet half. It writes
+   *  no verdict and publishes no tier (see `runProbeForDiagnostics`) — the numbers land here and in
+   *  the console, in the same format as the boot line, and nothing on screen changes.
+   *
+   *  The probe blocks the main thread in bursts, so the button is disabled while one is running
+   *  rather than allowing a second tap to measure the first probe's contention. */
+  function rerunProbe() {
+    if (probeRunning) return;
+    setProbeRunning(true);
+    setProbeResult(null);
+    // Two rAFs before starting: the tap's own click handling, style recalc and the disabled-state
+    // repaint are main-thread work, and a probe started synchronously in the handler would time
+    // them. The whole point of this button is a reading taken while the thread is quiet.
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      // `only2D` from what is actually mounted, not from config: a project with no 3D canvas runs
+      // the `fill` shape at boot, and a diagnostic on the other axis would not be comparable to it.
+      void runProbeForDiagnostics(buffers.threeD.length === 0)
+        .then((summary) => { setProbeResult(summary); })
+        .finally(() => { setProbeRunning(false); });
+    }));
   }
 
   const activeTier = getActiveQualityTier();
@@ -321,7 +349,10 @@ export function DeviceTab() {
           <div style={{ ...uaStyle, marginBottom: 4 }}>{activeTier.reason}</div>
         )}
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-          <span style={{ ...keyStyle, width: 18 }}>Tier</span>
+          {/* 42, not the 18 the `2D`/`3D` rows above use: `keyStyle` sets `flexShrink: 0` but not
+              `overflow`, so a label wider than its box paints OVER the control beside it rather
+              than truncating. Measured on a Galaxy A23 — `Probe` sat on top of its own button. */}
+          <span style={{ ...keyStyle, width: 42 }}>Tier</span>
           <div style={{ display: 'flex', gap: 4 }}>
             {TIER_ORDER.map((t) => {
               const active = activeTier?.tier === t;
@@ -345,6 +376,27 @@ export function DeviceTab() {
             })}
           </div>
         </div>
+        {/* The boot-vs-idle probe A/B (#205). Deliberately NOT a tier control — it measures and
+            reports, writes no verdict, publishes no tier. See `runProbeForDiagnostics`. */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+          <span style={{ ...keyStyle, width: 42 }}>Probe</span>
+          <button
+            onClick={rerunProbe}
+            disabled={probeRunning}
+            style={{
+              fontSize: 11,
+              padding: '2px 8px',
+              borderRadius: 4,
+              border: '1px solid #2d5a8a',
+              background: 'transparent',
+              color: probeRunning ? '#5a5a70' : '#8b8ba7',
+              cursor: probeRunning ? 'default' : 'pointer',
+            }}
+          >
+            {probeRunning ? 'measuring…' : 'Re-run probe (idle)'}
+          </button>
+        </div>
+        {probeResult && <div style={{ ...uaStyle, marginBottom: 4 }}>{probeResult}</div>}
         <div style={{ ...rowStyle, marginTop: 4 }}>
           <span style={keyStyle}>Effective caps (2D/3D)</span>
           <span style={valStyle}>{effectivePixi.pixelRatioCap} / {effectiveThree.pixelRatioCap}</span>

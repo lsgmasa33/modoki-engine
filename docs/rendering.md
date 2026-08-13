@@ -1243,8 +1243,24 @@ get backwards:
   | assessed by | promotion may reach |
   |---|---|
   | `measured` (the probe's band) · `model` (iOS table) · `allowlist` · `desktop` | exactly that tier |
+  | `measured` **and `cpuLimited`** — the probe missed the next band on the cpu axis ALONE | **one rung** |
   | `project` (a human decided; calibration already refuses to run) | exactly that tier |
   | `calibrating` — **nothing** assessed it | **one rung**, never further |
+
+  ⭐ **The `cpuLimited` row is the only crack in "a measurement is the cap", and it exists because
+  the boot cpu reading is a MEASURED under-estimate** (#205, owner 2026-08-13): across three
+  Androids a device reads 20-30% lower at boot than the same device sustains in game, because the
+  probe runs while the launch boost is decaying — and nothing inside the probe closes that (two
+  fixes were built and refuted; see `CPU_WARMUP_RAMPS`). Rather than inflate the floors, the boot
+  reading is accepted as deliberately low and the correction moved to the live path.
+
+  It is set **only** when the reading cleared the next band's GPU floor and missed its cpu floor,
+  which is what keeps the objection above intact: there is no GPU verdict being overruled, and
+  `hasHeadroom` measures exactly the quantity that was under-read. A device short on `shade` is not
+  `cpuLimited` and does not move. On the **2D** table it can only ever apply to `weak → middle`,
+  since both bands share a cpu floor of 4,500. On a cached verdict it is **recomputed from the
+  stored samples**, never persisted — a stored derived field would outlive the thresholds it came
+  from.
 
   ⚠️ **A `player` pin never becomes an assessment at all (#208).** A pin persists in `PlayerPrefs`,
   so the next launch boots straight into `{source:'player'}` and the probe never runs — and that
@@ -1255,8 +1271,8 @@ get backwards:
   resolution after the pin clears latches normally. Nothing is lost: calibration already
   early-returns while a pin is in force, so the ceiling is not consulted then anyway.
 
-  ⚠️ The consequence is deliberate: **on a device the probe classified, live promotion is a
-  no-op.** That is the probe's job done, not a mechanism gone missing. The one rung for an
+  ⚠️ The consequence is deliberate: **on a device the probe classified as anything but
+  `cpuLimited`, live promotion is a no-op.** That is the probe's job done, not a mechanism gone missing. The one rung for an
   unassessed device is what stops `auto` pinning unrecognised hardware to `low` forever (#155's
   stated cost) without ever reaching `high` on something nobody measured. A project that knows it
   is cheap enough to outrun its band pins `qualityTier: 'high'`; a player who can see the screen

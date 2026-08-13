@@ -680,6 +680,24 @@ export interface ProbeMeasurement {
   /** The main-thread CPU ramp. Always available — it needs no GPU — but optional for the same
    *  evidence-only reason as {@link ProbeMeasurement.shade}. */
   cpu?: RampReading;
+  /** The DISCARDED cpu passes, oldest first — reported, never classified.
+   *
+   *  ⚠️ **They are here because the pass-to-pass PROGRESSION is the DVFS signal, and this axis is
+   *  the one still under investigation.** The GPU ramps discard their warm-up pass and drop it on
+   *  the floor; the cpu ramp keeps its readings so a device's governor behaviour can be read off
+   *  its ordinary boot log rather than needing a diagnostic build to ask the question again. The
+   *  three phones this was derived on disagree about it sharply, and boot disagrees with in-game
+   *  on the same phone (see `runCpuRamp`'s header) — so it is not a settled constant of the
+   *  hardware, and printing it is how that stays visible.
+   *
+   *  A LIST rather than one reading because the count is a tuning knob (`CPU_WARMUP_RAMPS`) that
+   *  has already moved once: with a single field, raising it would have silently reported one
+   *  arbitrary pass out of several and hidden whether the later ones were still climbing.
+   *
+   *  ⛔ Nothing may classify on them. `readingOf` takes `cpu`, every threshold reads `cpu`, and a
+   *  warm-up reading folded into either would put back exactly the cold-governor number the
+   *  discards exist to remove. */
+  cpuWarmups?: readonly RampReading[];
   /** Total wall-clock spent, including renderer creation, the shader compile and warm-up. This
    *  is the number that matters to a player, because the probe BLOCKS THE LAUNCH. */
   totalMs: number;
@@ -746,6 +764,28 @@ export interface ProbeVerdict {
   /** One human-readable clause, surfaced through `diagnose` so a surprising class is
    *  explainable without an eval. */
   reason: string;
+  /** ⭐ **Is the CPU AXIS what is holding this device out of the next band up?** True only when the
+   *  reading fails the next band's cpu floor while CLEARING its GPU floor — i.e. the GPU has
+   *  already demonstrated it belongs a band higher and only cpu says otherwise.
+   *
+   *  This exists because the boot cpu reading is a KNOWN UNDER-ESTIMATE (#205): measured on three
+   *  Androids, a device reads 20-30% lower at boot than the same device sustains in game, because
+   *  the probe runs while the launch boost is decaying and no amount of warming inside the probe
+   *  closes the gap. The owner's decision was to accept that under-estimate rather than inflate
+   *  the floors, and let live calibration promote — and `promotionCeiling` needs to know WHICH
+   *  devices that licence applies to, because it does not apply to all of them.
+   *
+   *  ⚠️ **The narrowness is the whole argument.** `evaluateTierChange`'s `hasHeadroom` judges from
+   *  `cpuMs` alone, and `promotionCeiling` documents at length why that must not overrule a GPU
+   *  measurement — a Galaxy A23 can run the GPU at 84% of the frame while its CPU reads as idle,
+   *  and no live signal on WebGL2 mobile can see it. That objection is about the SHADE axis, and
+   *  it is untouched here: a device short on shade is not `cpuLimited` and its ceiling does not
+   *  move. A cpu-limited device is the one case where the live signal measures the same quantity
+   *  the probe under-read, so correcting it with that signal is sound rather than a loophole.
+   *
+   *  False at the top band (nothing above `capable` to be limited out of) and false for `unknown`
+   *  (no reading, so no statement). */
+  cpuLimited: boolean;
 }
 
 /** Facts that, if any of them changed, invalidate a cached verdict. */
@@ -809,8 +849,24 @@ export function probeFingerprint(input: ProbeFingerprintInput): string {
  *  clocked up rather than at idle. Measured: a Galaxy S22 reads 7.5 on pass 1 and 19.9 on pass 2,
  *  where a Galaxy A23 moves only 12.1 -> 15.6. Every v5 sample was taken at whatever clock the
  *  device happened to be at, and the error is largest on the fastest hardware — so medianing one
- *  against a v6 sample would mix two populations, not two readings. */
-const CLASSIFIER_VERSION = 6;
+ *  against a v6 sample would mix two populations, not two readings.
+ *
+ *  **7 = the CPU ramp discards a warm-up pass too**, for the same governor reason v6 gave the GPU
+ *  ramps. v6 left the cpu axis measuring whatever clock the CPU happened to be at, and the
+ *  boot-vs-in-game A/B (#205, `runCpuRamp`'s header) showed that is not a small error: a Galaxy
+ *  A23's cpu reading at boot is 2x what the same device reads while the game runs. Every v6 cpu
+ *  sample is a cold-governor reading; medianing one against a v7 sample mixes the population this
+ *  discard exists to leave behind.
+ *
+ *  **8 = A BURNED NUMBER, and it is deliberately not reused.** It was minted for a SECOND
+ *  discarded cpu pass (`CPU_WARMUP_RAMPS` 1 -> 2), which was built, installed on three phones,
+ *  measured, and **reverted** — it nearly doubled a Galaxy S22's boot spread (see
+ *  `CPU_WARMUP_RAMPS`). The shipped instrument is therefore identical to v7's, and the honest
+ *  thing would arguably be to go back to 7. It stays at 8 because builds carrying the two-discard
+ *  instrument really did run on hardware and really did write samples, and a version number that
+ *  goes backwards would let those samples median against readings they are not comparable to. A
+ *  burned integer costs nothing; a mixed population costs a wrong band. */
+const CLASSIFIER_VERSION = 8;
 
 /** One band's floor: the throughput a device must clear on BOTH ramps to be called this.
  *
@@ -1068,18 +1124,34 @@ export function classifyReading(r: ProbeReading, axes: ProbeAxes = '3d'): ProbeV
   if (middle === null || capable === null) {
     return {
       deviceClass: 'unknown',
+      cpuLimited: false,
       reason: `${axes} probe thresholds are unset — measure real hardware before classifying`,
     };
   }
+  /** Does this reading miss `t` on cpu ALONE — GPU cleared, cpu short? See `ProbeVerdict.cpuLimited`. */
+  const cpuOnlyShortOf = (t: ProbeThreshold): boolean => {
+    if (r.cpuUnitsPerMs >= t.cpuUnitsPerMs) return false;
+    const floor = axes === '2d' ? t.fillMpxPerMs : t.shadeMfragPerMs;
+    // Fails CLOSED on a missing floor, for the same reason `clears` does: an absent GPU floor means
+    // "nothing clears", so it cannot be read as "the GPU cleared and only cpu is short".
+    if (floor === undefined) return false;
+    return (axes === '2d' ? r.fillMpxPerMs : r.shadeMfragPerMs) >= floor;
+  };
   const detail = `cpu ${(r.cpuUnitsPerMs / 1000).toFixed(1)}k xform/ms, `
     + (axes === '2d'
       ? `fill ${r.fillMpxPerMs.toFixed(3)}Mpx/ms`
       : `shade ${r.shadeMfragPerMs.toFixed(3)}Mfrag/ms`);
   if (clears(r, capable, axes)) {
-    return { deviceClass: 'capable', reason: `${detail} — clears the capable floor on both ramps` };
+    // Top band — there is no band above to be held out of, so `cpuLimited` is false by definition
+    // rather than by measurement.
+    return { deviceClass: 'capable', cpuLimited: false, reason: `${detail} — clears the capable floor on both ramps` };
   }
   if (clears(r, middle, axes)) {
-    return { deviceClass: 'middle', reason: `${detail} — clears the middle floor on both ramps` };
+    return {
+      deviceClass: 'middle',
+      cpuLimited: cpuOnlyShortOf(capable),
+      reason: `${detail} — clears the middle floor on both ramps`,
+    };
   }
   // Name the ramp that fell short, not just the verdict: "weak on draw" and "weak on fill" are
   // different hardware and lead to different authoring advice, and this string is what `diagnose`
@@ -1090,7 +1162,11 @@ export function classifyReading(r: ProbeReading, axes: ProbeAxes = '3d'): ProbeV
     ? r.fillMpxPerMs < (middle.fillMpxPerMs ?? 0)
     : r.shadeMfragPerMs < (middle.shadeMfragPerMs ?? 0);
   const short = cpuShort && gpuShort ? 'both ramps' : cpuShort ? 'the cpu ramp' : gpuName;
-  return { deviceClass: 'weak', reason: `${detail} — under the middle floor on ${short}` };
+  return {
+    deviceClass: 'weak',
+    cpuLimited: cpuOnlyShortOf(middle),
+    reason: `${detail} — under the middle floor on ${short}`,
+  };
 }
 
 /** Classify a completed measurement into one of the three measured bands. Pure.
@@ -1128,6 +1204,8 @@ export function classifyDevice(m: ProbeMeasurement): ProbeVerdict {
   if (undecidable) {
     return {
       deviceClass: 'unknown',
+      // No reading, so no statement about which axis is binding — see `ProbeVerdict.cpuLimited`.
+      cpuLimited: false,
       reason: `${undecidable.kind} ramp produced no usable reading (${undecidable.status})`,
     };
   }
@@ -1193,8 +1271,30 @@ export interface ProbeRefinement {
   samples: readonly ProbeReading[];
   deviceClass: DeviceClass;
   reason: string;
+  /** See {@link ProbeVerdict.cpuLimited} — carried through so `resolveTier` can hand it to
+   *  `promotionCeiling`. Taken from the MEDIAN verdict, not from the newest launch, for the same
+   *  reason `deviceClass` is: one launch's reading is not what this device is. */
+  cpuLimited: boolean;
   /** Settled — do not probe this device again. */
   final: boolean;
+}
+
+/** Classify the median of several launches' readings. **The one place that median is computed**,
+ *  so the live refinement path and the cached-verdict path cannot drift into two definitions of
+ *  what a device measured — which they would, because the cache stores `samples` and not the
+ *  verdict's derived fields (`cpuLimited` was the first such field and immediately needed here). */
+export function classifyMedianOf(samples: readonly ProbeReading[], axes: ProbeAxes): ProbeVerdict {
+  if (samples.length === 0) {
+    return { deviceClass: 'unknown', cpuLimited: false, reason: 'no reading to classify' };
+  }
+  return classifyReading({
+    cpuUnitsPerMs: median(samples.map((s) => s.cpuUnitsPerMs)),
+    // Both axes are medianed whichever shape is in play. Only one of them is read by
+    // `classifyReading`, but a persisted sample that carried a real number on one launch and a
+    // hole on the next would be a worse thing to debug than a field nobody consulted.
+    shadeMfragPerMs: median(samples.map((s) => s.shadeMfragPerMs ?? 0)),
+    fillMpxPerMs: median(samples.map((s) => s.fillMpxPerMs ?? 0)),
+  }, axes);
 }
 
 /** Fold one launch's reading into what earlier launches measured, and say whether to stop.
@@ -1234,16 +1334,12 @@ export function refineProbeVerdict(
       && Number.isFinite(axes === '2d' ? s.fillMpxPerMs : s.shadeMfragPerMs))
     .slice(-PROBE_SAMPLE_TARGET);
   if (samples.length === 0) {
-    return { samples, deviceClass: 'unknown', reason: 'no finite reading to classify', final: false };
+    return {
+      samples, deviceClass: 'unknown', cpuLimited: false,
+      reason: 'no finite reading to classify', final: false,
+    };
   }
-  const medianVerdict = classifyReading({
-    cpuUnitsPerMs: median(samples.map((s) => s.cpuUnitsPerMs)),
-    // Both axes are medianed whichever shape is in play. Only one of them is read by
-    // `classifyReading`, but a persisted sample that carried a real number on one launch and a
-    // hole on the next would be a worse thing to debug than a field nobody consulted.
-    shadeMfragPerMs: median(samples.map((s) => s.shadeMfragPerMs ?? 0)),
-    fillMpxPerMs: median(samples.map((s) => s.fillMpxPerMs ?? 0)),
-  }, axes);
+  const medianVerdict = classifyMedianOf(samples, axes);
 
   // ⚠️ There is deliberately NO one-pass shortcut here any more — see the note above
   // `PROBE_SAMPLE_TARGET`. Every device now pays the full three launches, including one whose
@@ -1253,6 +1349,7 @@ export function refineProbeVerdict(
     return {
       samples,
       deviceClass: medianVerdict.deviceClass,
+      cpuLimited: medianVerdict.cpuLimited,
       reason: `${medianVerdict.reason} (median of ${samples.length} launches)`,
       final: medianVerdict.deviceClass !== 'unknown',
     };
@@ -1274,13 +1371,19 @@ export function refineProbeVerdict(
     .map((s) => classifyReading(s, axes).deviceClass)
     .filter((c): c is Exclude<DeviceClass, 'unknown'> => c !== 'unknown');
   if (ranked.length === 0) {
-    return { samples, deviceClass: 'unknown', reason: medianVerdict.reason, final: false };
+    return { samples, deviceClass: 'unknown', cpuLimited: false, reason: medianVerdict.reason, final: false };
   }
   const order: Exclude<DeviceClass, 'unknown'>[] = ['weak', 'middle', 'capable'];
   const lowest = order[Math.min(...ranked.map((c) => order.indexOf(c)))];
   return {
     samples,
     deviceClass: lowest,
+    // From the MEDIAN verdict even while the running answer is the LOWEST sample. The two are
+    // deliberately different questions: `deviceClass` errs downward until the verdict settles
+    // (booting a weak device high is a black screen), while `cpuLimited` is a statement about the
+    // SHAPE of the bottleneck, where the median is the honest reading and erring in either
+    // direction buys nothing.
+    cpuLimited: medianVerdict.cpuLimited,
     reason: `${lowest} — lowest of ${samples.length} launch(es) so far, still refining `
       + `(${PROBE_SAMPLE_TARGET - samples.length} to go)`,
     final: false,

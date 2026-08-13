@@ -28,7 +28,7 @@ import {
 } from './qualityTier';
 import { applyActiveTierToRuntime } from './tierCalibration';
 import {
-  classifyDevice, probeFingerprint, readingOf, refineProbeVerdict,
+  classifyDevice, classifyMedianOf, probeFingerprint, readingOf, refineProbeVerdict,
   fillMegapixelsPerMs, shadeMegaFragmentsPerMs,
   type DeviceClass, type ProbeMeasurement, type RampReading,
 } from './rampProbe';
@@ -216,8 +216,14 @@ async function resolveActiveTierOnce(setting: QualityTierSetting, only2D: boolea
     return;
   }
 
-  const probeClass = await resolveProbeClass(caps, only2D);
-  publishActiveTier(resolveTier(buildTierResolveInput(factsCaps, setting, { playerChoice, probeClass })));
+  const probed = await resolveProbeClass(caps, only2D);
+  publishActiveTier(resolveTier(buildTierResolveInput(factsCaps, setting, {
+    playerChoice,
+    probeClass: probed?.deviceClass,
+    // See `ProbeVerdict.cpuLimited` — the licence `promotionCeiling` reads to allow ONE live
+    // promotion step off a measured tier the boot cpu under-estimate held down.
+    probeCpuLimited: probed?.cpuLimited,
+  })));
 }
 
 /** The quantitative tail of a probe run, for the boot log.
@@ -257,7 +263,16 @@ function describeProbe(m: ProbeMeasurement): string {
     // raw step table without them is what let three sessions compare panel sizes by mistake.
     + `, derived fill ${fillMegapixelsPerMs(m).toFixed(2)}Mpx/ms`
     + (m.shade ? ` shade ${shadeMegaFragmentsPerMs(m).toFixed(2)}Mfrag/ms` : '')
-    + (m.cpu ? ` cpu ${(m.cpu.unitsPerMs / 1000).toFixed(1)}k xform/ms` : '');
+    + (m.cpu ? ` cpu ${(m.cpu.unitsPerMs / 1000).toFixed(1)}k xform/ms` : '')
+    // The discarded passes, in order, and the gain from the FIRST of them — the DVFS signal, per
+    // device, on every boot log. `cpu` above is the measured pass; these are what the same ramp
+    // read before the governor had seen that much sustained work. A gain near 1.0 means the device
+    // was already at its clocks, and the sequence says whether it was still climbing when the
+    // measured pass ran — which is the question `CPU_WARMUP_RAMPS` is tuned against.
+    + (m.cpu && m.cpuWarmups?.length && m.cpuWarmups[0].unitsPerMs > 0
+      ? ` (warm-up ${m.cpuWarmups.map((r) => `${(r.unitsPerMs / 1000).toFixed(1)}k`).join('->')}`
+        + `, gain ${(m.cpu.unitsPerMs / m.cpuWarmups[0].unitsPerMs).toFixed(2)}x)`
+      : '');
 }
 
 /** The boot ramp probe's verdict — from cache when we have one for this hardware, otherwise by
@@ -283,7 +298,7 @@ async function resolveProbeClass(
    *  is `high` from the model table, and the only honest reading of that pair is that one of them is
    *  a bug. Naming the decider is what makes the two lines agree with each other. */
   evidenceFor?: string,
-): Promise<DeviceClass | undefined> {
+): Promise<{ deviceClass: DeviceClass; cpuLimited: boolean } | undefined> {
   const tag = evidenceFor ? `[rampProbe] EVIDENCE ONLY (tier came from '${evidenceFor}')` : '[rampProbe]';
   const fingerprint = probeFingerprint({
     // ⚠️ THE PROBE SHAPE IS PART OF THE FINGERPRINT (#203). A 2D verdict and a 3D verdict are
@@ -304,7 +319,16 @@ async function resolveProbeClass(
   // SETTLED means never probe again. An UNSETTLED record means the opposite — probe once more and
   // fold the result in — which is the whole of "refine across launches" (owner, 2026-08-09): one
   // probe per launch as before, but the first few launches each pay one instead of only the first.
-  if (forThisDevice?.final) return forThisDevice.deviceClass;
+  // ⚠️ `cpuLimited` is RECOMPUTED from the stored samples, never stored — see
+  // `readCachedProbeVerdict` for why (a stored derived field would outlive the thresholds it was
+  // derived from). `classifyMedianOf` is the same median the live path takes, so a settled device
+  // and a still-refining one cannot disagree about the shape of their own bottleneck.
+  if (forThisDevice?.final) {
+    return {
+      deviceClass: forThisDevice.deviceClass,
+      cpuLimited: classifyMedianOf(forThisDevice.samples, only2D ? '2d' : '3d').cpuLimited,
+    };
+  }
 
   // ⚠️ THE STAGE BREADCRUMB IS NOT OPTIONAL DIAGNOSTICS — IT IS THE ONLY WITNESS ON THE PATHS THAT
   // RETURN NOTHING. `runBootRampProbe` resolves `null` for every unhappy ending it has — no DOM, no
@@ -323,13 +347,17 @@ async function resolveProbeClass(
     // THIS launch does not invalidate readings that succeeded before it.
     if (!measurement) {
       console.warn(`${tag} produced no measurement — last stage '${lastStage}'`);
-      return forThisDevice?.deviceClass;
+      return forThisDevice
+      ? { deviceClass: forThisDevice.deviceClass, cpuLimited: classifyMedianOf(forThisDevice.samples, only2D ? '2d' : '3d').cpuLimited }
+      : undefined;
     }
     const oneRun = classifyDevice(measurement);
     // An unusable ramp yields no READING, so there is nothing to fold in — keep what we had.
     if (oneRun.deviceClass === 'unknown') {
       console.warn(`${tag} no usable reading — ${oneRun.reason} (${describeProbe(measurement)})`);
-      return forThisDevice?.deviceClass;
+      return forThisDevice
+      ? { deviceClass: forThisDevice.deviceClass, cpuLimited: classifyMedianOf(forThisDevice.samples, only2D ? '2d' : '3d').cpuLimited }
+      : undefined;
     }
     const refined = refineProbeVerdict(forThisDevice?.samples ?? [], readingOf(measurement), measurement.axes);
     console.warn(
@@ -347,13 +375,17 @@ async function resolveProbeClass(
         final: refined.final,
       });
     }
-    return refined.deviceClass === 'unknown' ? undefined : refined.deviceClass;
+    return refined.deviceClass === 'unknown'
+      ? undefined
+      : { deviceClass: refined.deviceClass, cpuLimited: refined.cpuLimited };
   } catch (e) {
     // Swallowing the tier decision is right — a probe failure must never block rendering — but
     // swallowing the REASON is not. This catch spans a dynamic import, a renderer construction and
     // a PlayerPrefs write; silent, all three failures look the same as no probe at all.
     console.warn(`${tag} threw at stage '${lastStage}' — ${String(e).slice(0, 200)}`);
-    return forThisDevice?.deviceClass;
+    return forThisDevice
+      ? { deviceClass: forThisDevice.deviceClass, cpuLimited: classifyMedianOf(forThisDevice.samples, only2D ? '2d' : '3d').cpuLimited }
+      : undefined;
   }
 }
 
@@ -364,4 +396,55 @@ async function resolveProbeClass(
  *  as what it is, and so nothing in the 3D path can pass `true` by accident. */
 export function resolveActiveTierForNo3D(): Promise<void> {
   return resolveActiveTier(getRenderSettings().three.qualityTier, true);
+}
+
+/** ⭐ Run the ramp probe AGAIN, on demand, and report it — changing nothing (#205).
+ *
+ *  ── WHY THIS EXISTS ───────────────────────────────────────────────────────────────────────
+ *  `runCpuRamp`'s own doc says it measures **available** CPU rather than peak, because the main
+ *  thread is contended at boot, and it asks for exactly one validation: *"a boot reading against a
+ *  quiet reading, on the same device."* That validation had never been run, because there was no
+ *  way to run the probe outside boot — `resolveProbeClass` is private, and the verdict store
+ *  early-outs on `final` so a settled device never probes again however many times it is launched.
+ *  This is that missing door, and the Galaxy A23's 5x cpu spread across sessions is what needs it.
+ *
+ *  ── WHAT IT DELIBERATELY DOES NOT DO ──────────────────────────────────────────────────────
+ *  ⚠️ **It does not write `probeVerdictStore`, and that is load-bearing, not tidiness.** The stored
+ *  verdict is a MEDIAN over launch samples (`refineProbeVerdict`), so folding hand-triggered idle
+ *  runs into it would let the diagnostic move the very number it was built to measure — and would
+ *  do it asymmetrically, since an idle run is exactly the reading that differs from a boot one.
+ *  ⚠️ **It does not publish a tier either.** `getActiveQualityTier()` is untouched, so tapping this
+ *  cannot change what is on screen; the tier buttons beside it are the control that does that.
+ *
+ *  The log line is the SAME `describeProbe` format as the boot line on purpose — the whole point is
+ *  that the two are read side by side in one logcat capture, so they must be the same instrument
+ *  reported the same way. Only the tag differs.
+ *
+ *  Never throws: a failure is reported in the returned string, like every other path here. */
+export async function runProbeForDiagnostics(only2D = false): Promise<string> {
+  // A boot probe may still be in flight on a slow device if the menu is opened early. Running a
+  // second one concurrently would have them contend for the same GPU and the same main thread,
+  // which is precisely the confound this measurement exists to remove.
+  if (isProbeInFlight()) return 'a probe is already running — try again in a moment';
+  let lastStage = 'start';
+  try {
+    const { runBootRampProbe } = await import('./rampProbeRunner');
+    const measurement = await withProbeInFlight(
+      () => runBootRampProbe((stage) => { lastStage = stage; }, only2D));
+    if (!measurement) {
+      const msg = `produced no measurement — last stage '${lastStage}'`;
+      console.warn(`[rampProbe] DIAGNOSTIC (idle) ${msg}`);
+      return msg;
+    }
+    // The one-pass verdict, NOT a refined one: a refinement medians across stored samples, and this
+    // run is not stored. Reporting `oneRun` is the honest answer for a single hand-triggered pass.
+    const oneRun = classifyDevice(measurement);
+    const summary = `${oneRun.deviceClass} — ${describeProbe(measurement)}`;
+    console.warn(`[rampProbe] DIAGNOSTIC (idle) ${summary}`);
+    return summary;
+  } catch (e) {
+    const msg = `threw at stage '${lastStage}' — ${String(e).slice(0, 200)}`;
+    console.warn(`[rampProbe] DIAGNOSTIC (idle) ${msg}`);
+    return msg;
+  }
 }

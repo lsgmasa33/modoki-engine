@@ -52,11 +52,20 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_editor_journal',
     'Read the EDITOR-ACTIVITY stream — what is being done in the editor session (Editor Percept). ' +
-      'Event TYPES: !edit, !select, !create, !delete, !duplicate, !reparent, !transform, !undo, !redo, ' +
-      '!play, !pause, !stop, !scene-load, !save, !gizmo. Structural events carry guids: !create/!duplicate ' +
+      'Event TYPES: !edit, !mutate, !select, !create, !delete, !duplicate, !reparent, !transform, ' +
+      '!undo, !redo, !play, !pause, !stop, !scene-load, !save, !gizmo. ' +
+      '⚠️ **!mutate is what YOUR OWN modoki_mutate_scene / modoki_set_transform produce** (label ' +
+      '"Mutate Scene (N ops)"); !edit is the HUMAN Inspector-field path. This list omitted !mutate, ' +
+      'and a QA case that trusted it asserted !edit and failed against a perfectly healthy engine — ' +
+      'assert on what the journal returns, not on a remembered name. A !mutate is a COMPOSITE, so ' +
+      'its payload is `{count, ops:[{kind, label, …that op\'s own payload, detail?}], truncated?}` — ' +
+      'the entity guids are inside `ops[]`, one line per sub-op, not at the top level. ' +
+      'Structural events carry guids: !create/!duplicate ' +
       '`{entity, parent, source?}`, !delete `{entities:[guid]}`, !reparent `{entity, from, to, reorder}` ' +
       '(from/to are parent guids, "root" for scene root), !transform `{entity, before, after}` (a gizmo ' +
-      'drag — before/after hold only the TRS fields that moved, e.g. {x,y,z}). !scene-load `{path, ' +
+      'drag — before/after hold only the TRS fields that moved, e.g. {x,y,z}; a MULTI-SELECT drag is ' +
+      'ONE event shaped `{entities:[guid], members:[{entity, before, after}]}` instead, so read ' +
+      '`members` — `payload.entity` is undefined there). !scene-load `{path, ' +
       'entityCount}`, !save `{path, entities}`, !gizmo `{mode|space}`. ' +
       'A trait-field !edit ALSO carries a structured `detail: {trait, field, entities[guid], old[], ' +
       'new[]}` (index-aligned arrays; length-1 for a single edit, N for a multi-select — so "zeroed ' +

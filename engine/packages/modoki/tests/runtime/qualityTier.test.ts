@@ -20,7 +20,7 @@ import {
   tierAllowsEffect, tierAllowsIBL, tierAmbientBoost, tierExposureBoost,
   UNCLAMPED_OVERRIDES, resolveTierOverrides, configCount, maskPostFXRequest,
   ALL_POSTFX, NO_POSTFX, POSTFX_EFFECTS,
-  buildTierResolveInput, readCachedProbeClass,
+  buildTierResolveInput, readCachedProbeVerdict,
   type TierRenderOverrides, type AuthoredTiers, type PostFXMask,
 } from '../../src/runtime/rendering/qualityTier';
 import {
@@ -353,7 +353,7 @@ describe('buildTierResolveInput — the ONE input builder both boot and player A
   });
 });
 
-describe('readCachedProbeClass', () => {
+describe('readCachedProbeVerdict', () => {
   const caps = { platform: 'android', deviceModel: 'SM-S901U1', gpuRenderer: 'Adreno (TM) 730' };
   const g = globalThis as { innerWidth?: number; innerHeight?: number };
   const viewportPx = (g.innerWidth ?? 0) * (g.innerHeight ?? 0);
@@ -363,7 +363,7 @@ describe('readCachedProbeClass', () => {
 
   it('returns undefined with no provider installed', () => {
     probeVerdictStore.reset();
-    expect(readCachedProbeClass(caps)).toBeUndefined();
+    expect(readCachedProbeVerdict(caps)).toBeUndefined();
   });
 
   it('returns the cached class on a fingerprint match', () => {
@@ -371,7 +371,28 @@ describe('readCachedProbeClass', () => {
       read: () => ({ fingerprint: matchingFingerprint, deviceClass: 'capable', samples: [], final: true }),
       write: () => {},
     });
-    expect(readCachedProbeClass(caps)).toBe('capable');
+    expect(readCachedProbeVerdict(caps)?.deviceClass).toBe('capable');
+  });
+
+  it('⭐ recomputes cpuLimited from the stored SAMPLES, not from a stored flag (#205)', () => {
+    // A `middle` device whose stored samples clear the capable SHADE floor and miss its cpu floor.
+    // The licence must survive a relaunch, and it must survive a threshold change — which is why
+    // it is derived here rather than persisted beside the band. If this ever reads `false` on a
+    // cache hit, a device promoted on launch 1 silently stops being promotable on launch 2.
+    probeVerdictStore.provide({
+      read: () => ({
+        fingerprint: matchingFingerprint,
+        deviceClass: 'middle',
+        samples: [{ cpuUnitsPerMs: 5_000, shadeMfragPerMs: 0.5, fillMpxPerMs: 0 }],
+        final: true,
+      }),
+      write: () => {},
+    });
+
+    const cached = readCachedProbeVerdict(caps);
+
+    expect(cached?.deviceClass).toBe('middle');
+    expect(cached?.cpuLimited).toBe(true);
   });
 });
 
@@ -596,18 +617,42 @@ describe('promotionCeiling — a measurement is not overruled by a CPU streak (#
     expect(promotionCeiling(res('high', 'gpu-generation'))).toBe('high');
   });
 
-  it('⛔ does NOT grant a probe verdict a promotion step — considered and DECLINED (#210)', () => {
-    // The tempting change, and why it is not made. #210 measured the probe UNDER-reporting on
-    // Android (the S22 reads `middle` where identity and the truth say `high`), which argues for
-    // letting a `measured` device climb one step. It is refused because `hasHeadroom` is CPU-ONLY
-    // and the SAME campaign measured why that is fatal here: the Huawei Y6 sat at `cpu 1.7ms of an
-    // 18.6ms frame` — abundant CPU headroom while the GPU was the limiter. Granting the step would
-    // promote GPU-bound devices into IBL and post-FX on a signal that cannot see the GPU, which is
-    // precisely the hole `promotionCeiling` was added to close (#188).
+  it('⛔ does NOT grant a GPU-limited probe verdict a promotion step (#210)', () => {
+    // The tempting change, and why it is still refused for this case. #210 measured the probe
+    // UNDER-reporting on Android (the S22 reads `middle` where identity and the truth say `high`),
+    // which argues for letting a `measured` device climb. It is refused wherever the GPU is what
+    // fell short, because `hasHeadroom` is CPU-ONLY and the SAME campaign measured why that is
+    // fatal here: the Huawei Y6 sat at `cpu 1.7ms of an 18.6ms frame` — abundant CPU headroom
+    // while the GPU was the limiter. Granting the step would promote GPU-bound devices into IBL
+    // and post-FX on a signal that cannot see the GPU, the hole `promotionCeiling` closes (#188).
     //
-    // The S22 case is solved by IDENTITY answering first, not by loosening this ceiling.
+    // ⚠️ `cpuLimited` UNSET is the default and means exactly this case — no licence.
     expect(promotionCeiling(res('mid', 'measured'))).toBe('mid');
     expect(promotionCeiling(res('low', 'measured'))).toBe('low');
+    expect(promotionCeiling({ ...res('mid', 'measured'), cpuLimited: false })).toBe('mid');
+  });
+
+  it('⭐ DOES grant a CPU-LIMITED probe verdict exactly one step (#205, owner 2026-08-13)', () => {
+    // The one crack in "a measurement is the ceiling", and it is narrow by construction:
+    // `cpuLimited` is set only when the reading missed the next band on the CPU axis ALONE, with
+    // the GPU axis already clear. So there is no GPU verdict being overruled — the objection in
+    // the test above cannot arise — and the live signal (`hasHeadroom`, cpu-only) measures the
+    // SAME quantity the boot probe under-read by a measured 20-30%.
+    expect(promotionCeiling({ ...res('mid', 'measured'), cpuLimited: true })).toBe('high');
+    expect(promotionCeiling({ ...res('low', 'measured'), cpuLimited: true })).toBe('mid');
+  });
+
+  it('the cpu-limited licence is ONE step, and never off the top of the ladder', () => {
+    expect(promotionCeiling({ ...res('high', 'measured'), cpuLimited: true })).toBe('high');
+  });
+
+  it('the licence does NOT leak to any other source', () => {
+    // `cpuLimited` is only ever set on a `measured` resolution, but a defensive check costs
+    // nothing and this is the function where a stray flag would be most expensive: identity is
+    // the MORE reliable signal of the two and must not be climbable.
+    expect(promotionCeiling({ ...res('mid', 'gpu-benchmark'), cpuLimited: true })).toBe('mid');
+    expect(promotionCeiling({ ...res('mid', 'model'), cpuLimited: true })).toBe('mid');
+    expect(promotionCeiling({ ...res('mid', 'project'), cpuLimited: true })).toBe('mid');
   });
 
   it('caps a HUMAN decision at exactly what they chose', () => {
@@ -1370,5 +1415,61 @@ describe('applyTierToThree — the `0 = uncapped` sentinel (close-out finding)',
       expect(applyTierToThree(authored(cap), TIER_SETTINGS.low).pixelRatioCap)
         .toBe(applyTierToPixi({ pixelRatioCap: cap, antialias: true }, TIER_SETTINGS.low).pixelRatioCap);
     }
+  });
+});
+
+describe('⭐ the cpu-limited licence, END TO END through the builder (#205)', () => {
+  // ⚠️ **THE UNIT TESTS ABOVE CANNOT CATCH THE FAILURE THIS EXISTS FOR.** `classifyReading` sets
+  // the flag and `promotionCeiling` reads it, and both are covered — but the flag crosses THREE
+  // module boundaries in between (`resolveProbeClass` -> `buildTierResolveInput` -> `resolveTier`
+  // -> `TierResolution`), and a field dropped at any one of them leaves every unit test green
+  // while the licence never reaches a device. That is this repo's dominant defect shape: a
+  // mechanism that cannot fire.
+  const caps = { platform: 'android', deviceModel: 'SM-X', gpuRenderer: 'Some Unlisted GPU 1' };
+
+  afterEach(() => probeVerdictStore.reset());
+
+  it('a cpu-limited probe verdict survives the builder and raises the ceiling', () => {
+    const input = buildTierResolveInput(caps, 'auto', { probeClass: 'middle', probeCpuLimited: true });
+    const resolved = resolveTier(input);
+
+    expect(resolved.source).toBe('measured');
+    expect(resolved.tier).toBe('mid');
+    expect(promotionCeiling(resolved)).toBe('high');
+    // The reason string is what a human reads in `diagnose` and the boot log when they ask why a
+    // device climbed. A licence nobody can see explained is how this becomes folklore.
+    expect(resolved.reason).toContain('cpu-limited');
+  });
+
+  it('a GPU-limited probe verdict goes through the same path and does NOT', () => {
+    const resolved = resolveTier(
+      buildTierResolveInput(caps, 'auto', { probeClass: 'middle', probeCpuLimited: false }));
+
+    expect(resolved.source).toBe('measured');
+    expect(promotionCeiling(resolved)).toBe('mid');
+    expect(resolved.reason).not.toContain('cpu-limited');
+  });
+
+  it('⭐ and it survives a RELAUNCH — the licence is rebuilt from the cached samples', () => {
+    // The builder reads the cache when no explicit probeClass is passed, which is the shape of
+    // every launch after the verdict settles. If `cpuLimited` were dropped here, a device would
+    // be promotable on the launch it was measured and never again — a bug that only shows up on
+    // the SECOND launch, which is exactly the kind this suite is bad at noticing.
+    const g = globalThis as { innerWidth?: number; innerHeight?: number };
+    probeVerdictStore.provide({
+      read: () => ({
+        fingerprint: probeFingerprint({ ...caps, viewportPx: (g.innerWidth ?? 0) * (g.innerHeight ?? 0) }),
+        deviceClass: 'middle',
+        // Clears the capable SHADE floor (0.165), misses its cpu floor (14_500) — cpu-limited.
+        samples: [{ cpuUnitsPerMs: 5_000, shadeMfragPerMs: 0.5, fillMpxPerMs: 0 }],
+        final: true,
+      }),
+      write: () => {},
+    });
+
+    const resolved = resolveTier(buildTierResolveInput(caps, 'auto'));
+
+    expect(resolved.source).toBe('measured');
+    expect(promotionCeiling(resolved)).toBe('high');
   });
 });

@@ -239,6 +239,27 @@ export function codeSpans(md: string): string[] {
 }
 
 /**
+ * The whitespace fragments of verified space-bearing spans — MINUS any fragment the case also cites
+ * as a span in its OWN right.
+ *
+ * The exemption exists so the pieces of an already-verified path (`…/sprites/slime` +
+ * `spritesheet.png`) are not re-checked as if they were two paths. Exempting them GLOBALLY per case
+ * opened a false negative, and a real one: `games/sling/runtime/assets/sprites/slime spritesheet
+ * calciumtrice.png.meta.json` exists, and truncating a copy at the space yields
+ * `games/sling/runtime/assets/sprites/slime` — a broken citation that is ALSO the first fragment, so
+ * the global set swallowed it and the guard reported nothing.
+ *
+ * Citing a fragment on its own is the author saying "this is a path"; that claim gets checked. Being
+ * a fragment only excuses a token the case never made a claim about.
+ */
+export function exemptFragments(spans: string[], verifiedWhole: string[]): Set<string> {
+  const claimed = new Set(spans);
+  return new Set(
+    verifiedWhole.flatMap((s) => s.split(/\s+/)).filter((frag) => !claimed.has(frag)),
+  );
+}
+
+/**
  * Strip a trailing line reference from a cited path — `foo.ts:525`, `foo.ts:525-573`, `foo.ts#L525`.
  *
  * `file_path:line_number` is the repo's own citation convention (CLAUDE.md: it is clickable), and
@@ -358,6 +379,25 @@ describe('qa case guard helpers', () => {
 
     it('ignores fenced blocks (only inline spans carry space-bearing paths in practice)', () => {
       expect(codeSpans('```bash\nls games/x\n```')).toEqual([]);
+    });
+  });
+
+  describe('exemptFragments', () => {
+    const full = 'games/sling/runtime/assets/sprites/slime spritesheet calciumtrice.png.meta.json';
+    const truncated = 'games/sling/runtime/assets/sprites/slime';
+
+    it('exempts the pieces of a verified space-bearing path', () => {
+      expect([...exemptFragments([full], [full])].sort()).toEqual([
+        'calciumtrice.png.meta.json',
+        truncated,
+        'spritesheet',
+      ]);
+    });
+
+    it('does NOT exempt a fragment the case also cites as a path in its own right', () => {
+      // The false negative this closes: `<…>/slime` is both a broken citation AND the first
+      // fragment of the valid full path, so a global exemption swallowed it silently.
+      expect(exemptFragments([full, truncated], [full]).has(truncated)).toBe(false);
     });
   });
 
@@ -575,10 +615,11 @@ describeCases('QA case references', () => {
       const creates = Array.isArray(c.fm?.fields.creates) ? (c.fm.fields.creates as string[]) : [];
       // A span that is ITSELF a real path (asset filenames in this repo contain spaces) is verified
       // whole; its fragments must not then be re-checked as if they were separate paths.
-      const verifiedWhole = new Set(
-        codeSpans(c.body).filter((s) => REPO_TOP_LEVEL.test(s) && existsSync(join(REPO_ROOT, s))),
+      const spans = codeSpans(c.body);
+      const verifiedWhole = spans.filter(
+        (s) => REPO_TOP_LEVEL.test(s) && existsSync(join(REPO_ROOT, s)),
       );
-      const fragments = new Set([...verifiedWhole].flatMap((s) => s.split(/\s+/)));
+      const fragments = exemptFragments(spans, verifiedWhole);
       for (const token of codeTokens(c.body)) {
         if (fragments.has(token)) continue;
         const path = stripLineRef(token.replace(/[.,;:)\]]+$/, '').trim());
@@ -608,10 +649,12 @@ describeCases('QA case references', () => {
    */
   it('no `creates:` path is present in the tree (that would be leftover QA residue)', () => {
     const residue: string[] = [];
+    let checked = 0;
     for (const c of cases) {
       const creates = c.fm?.fields.creates;
       if (!Array.isArray(creates)) continue;
       for (const entry of creates) {
+        checked++;
         if (/[<>{}*$\s]/.test(entry)) {
           residue.push(`${c.rel}: creates: "${entry}" is a placeholder, not a real path`);
           continue;
@@ -623,6 +666,11 @@ describeCases('QA case references', () => {
         if (existsSync(join(REPO_ROOT, entry))) residue.push(`${c.rel}: creates: "${entry}" EXISTS`);
       }
     }
+    // Same reason its `data-ui-id` sibling asserts a floor: with no `creates:` anywhere this loop
+    // runs zero times and `[] === []` passes, so the check would stop working with no signal. A
+    // floor of 1 rather than today's 30 — cases legitimately come and go, and the failure this
+    // guards against is the field vanishing entirely, not shrinking.
+    expect(checked).toBeGreaterThan(0);
     expect(residue).toEqual([]);
   });
 
@@ -644,8 +692,17 @@ describeCases('QA case references', () => {
     // A vacuous pass would be worse than no check — the editor really does tag its chrome.
     expect(ids.size).toBeGreaterThan(30);
 
+    // qa/README.md is scanned alongside the cases: the SPEC teaches selectors too, and a wrong one
+    // there propagates further than in any single case. It already did — `modoki_tap`'s docstring
+    // taught `inspector.header.kebab` (an Inspector kebab menu that has never existed), the README
+    // quoted the docstring as its worked example, and a case brief copied the README.
+    const docs = [
+      ...cases.map((c) => ({ rel: c.rel, body: c.body })),
+      { rel: 'qa/README.md', body: readFileSync(join(REPO_ROOT, 'qa', 'README.md'), 'utf8') },
+    ];
+
     const unknown: string[] = [];
-    for (const c of cases) {
+    for (const c of docs) {
       for (const m of c.body.matchAll(/data-ui-id=\\?["']([\w.:${}<>-]+)/g)) {
         const id = m[1];
         if (/[${}<>]/.test(id)) continue; // a placeholder the runner substitutes
@@ -656,6 +713,57 @@ describeCases('QA case references', () => {
     // PROPOSING an id that should exist is legitimate — write it in prose, without the
     // `data-ui-id="…"` code span, so it cannot be mistaken for a working selector.
     expect(unknown).toEqual([]);
+  });
+
+  /**
+   * The README's "Areas" table is what an author reads BEFORE writing a case, and it says a new
+   * area is a new id prefix forever. So an area missing from it is not a doc nit — the author finds
+   * no row for what they are writing, invents `qa/cases/context-menus/` with `QA-CTXMENU-`, and one
+   * concern now lives under two permanent prefixes with the existing cases stranded on the other
+   * side. That already happened: the three areas the interactive-surface batch added
+   * (`contextmenu`, `dialogs`, `menubar` — 25 cases, 13% of the suite) shipped with no row, and
+   * every other check here was green, because none of them reads the README.
+   *
+   * The prefix half matters for the same reason in reverse: a row promising `QA-DLG-` while the
+   * directory actually uses `QA-DIALOG-` sends the next author to the wrong one.
+   */
+  it('every case area has a README row, with the id prefix that area actually uses', () => {
+    const readme = readFileSync(join(REPO_ROOT, 'qa', 'README.md'), 'utf8');
+    const rows = new Map(
+      [...readme.matchAll(/^\|\s*`([a-z][\w-]*)`\s*\|\s*`(QA-[A-Z]+-)`\s*\|/gm)].map((m) => [
+        m[1],
+        m[2],
+      ]),
+    );
+    // A table that stops parsing (a reformat, a renamed heading) must fail loudly, not vacuously.
+    expect(rows.size).toBeGreaterThan(20);
+
+    const prefixes = new Map<string, Set<string>>();
+    for (const c of cases) {
+      const id = typeof c.fm?.fields.id === 'string' ? c.fm.fields.id : '';
+      const prefix = /^(QA-[A-Z]+-)/.exec(id)?.[1];
+      if (!prefix) continue; // the id-format assertion owns a malformed id
+      if (!prefixes.has(c.dir)) prefixes.set(c.dir, new Set());
+      prefixes.get(c.dir)!.add(prefix);
+    }
+
+    const problems: string[] = [];
+    for (const [area, used] of [...prefixes].sort(([a], [b]) => a.localeCompare(b))) {
+      const row = rows.get(area);
+      if (!row) {
+        problems.push(`qa/cases/${area}/ has no row in qa/README.md's Areas table (ids use ${[...used].join(', ')})`);
+      } else if (used.size > 1) {
+        problems.push(`qa/cases/${area}/ mixes id prefixes ${[...used].sort().join(', ')} — one area, one prefix`);
+      } else if ([...used][0] !== row) {
+        problems.push(`qa/cases/${area}/ uses ${[...used][0]} but the README table promises ${row}`);
+      }
+    }
+    for (const area of rows.keys()) {
+      if (!existsSync(join(CASES_DIR, area))) {
+        problems.push(`qa/README.md's Areas table lists \`${area}\`, which is not a directory under qa/cases`);
+      }
+    }
+    expect(problems).toEqual([]);
   });
 
   it('every MCP tool named in a case exists on the tool surface', () => {

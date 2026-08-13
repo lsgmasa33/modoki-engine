@@ -1078,3 +1078,69 @@ describe('⭐ the three devices the 3D bands were RE-ANCHORED on (v6 warm-up pat
     expect(bands).toEqual(['weak', 'middle', 'capable']);
   });
 });
+
+describe('⭐ classifyReading — cpuLimited, the promotion licence (#205)', () => {
+  // The flag `promotionCeiling` reads to allow ONE live step off a measured tier. It must be true
+  // ONLY when the CPU axis alone is what held the device out of the next band — see
+  // `ProbeVerdict.cpuLimited`. The floors it is checked against: middle cpu 2_500 / shade 0.06,
+  // capable cpu 14_500 / shade 0.165.
+  const reading = (cpuUnitsPerMs: number, shadeMfragPerMs: number) =>
+    ({ cpuUnitsPerMs, shadeMfragPerMs, fillMpxPerMs: 0 });
+
+  it('is TRUE for a middle device that clears the capable SHADE floor and misses its cpu floor', () => {
+    const v = classifyReading(reading(5_000, 0.5), '3d');
+    expect(v.deviceClass).toBe('middle');
+    expect(v.cpuLimited).toBe(true);
+  });
+
+  it('is FALSE when the GPU axis is what fell short — the case the ceiling exists to refuse', () => {
+    // Short on BOTH: promoting this on a cpu streak is exactly the Huawei Y6 failure
+    // `promotionCeiling` was added for, and a cpu-only signal cannot see it.
+    const v = classifyReading(reading(5_000, 0.1), '3d');
+    expect(v.deviceClass).toBe('middle');
+    expect(v.cpuLimited).toBe(false);
+  });
+
+  it('is FALSE when the GPU is short and the CPU already clears the band above', () => {
+    const v = classifyReading(reading(20_000, 0.1), '3d');
+    expect(v.deviceClass).toBe('middle');
+    expect(v.cpuLimited).toBe(false);
+  });
+
+  it('applies to a WEAK device too — its next band up is middle, not capable', () => {
+    // cpu under the middle floor, shade over it. A weak device held down by cpu alone is the
+    // population most at risk of being trapped on `low`, which is #205's title.
+    const v = classifyReading(reading(1_000, 0.5), '3d');
+    expect(v.deviceClass).toBe('weak');
+    expect(v.cpuLimited).toBe(true);
+  });
+
+  it('is FALSE at the top — there is no band above capable to be limited out of', () => {
+    const v = classifyReading(reading(20_000, 0.5), '3d');
+    expect(v.deviceClass).toBe('capable');
+    expect(v.cpuLimited).toBe(false);
+  });
+
+  it('reads the FILL axis on a 2D probe, not shade', () => {
+    // Non-vacuity for the axis parameter: the same numbers must answer differently per shape, or
+    // a 2D device would be judged against a floor it can never clear (the bug that made every 2D
+    // device `weak` for two launches). 2D floors: middle cpu 4_500 / fill 1.68.
+    const r = { cpuUnitsPerMs: 3_000, shadeMfragPerMs: 0, fillMpxPerMs: 2.0 };
+    // 2D: fill clears middle, cpu does not — cpu-limited.
+    expect(classifyReading(r, '2d').cpuLimited).toBe(true);
+    // 3D: the same record carries no shade at all, so the GPU axis is what falls short.
+    expect(classifyReading(r, '3d').cpuLimited).toBe(false);
+  });
+
+  it('⚠️ can never be true between middle and capable on the 2D table — the cpu floors are equal', () => {
+    // `PROBE_THRESHOLDS_2D` sets cpu 4_500 for BOTH bands (fill is the deciding axis there), so a
+    // 2D device that clears middle on cpu clears capable on cpu too and the licence only ever
+    // applies to weak -> middle. Pinned because it is invisible from the flag's definition, and a
+    // future 2D retune that splits those floors should have to notice this.
+    expect(PROBE_THRESHOLDS_2D.middle?.cpuUnitsPerMs).toBe(PROBE_THRESHOLDS_2D.capable?.cpuUnitsPerMs);
+    const clearsMiddleOnCpu = { cpuUnitsPerMs: 5_000, shadeMfragPerMs: 0, fillMpxPerMs: 2.0 };
+    const v = classifyReading(clearsMiddleOnCpu, '2d');
+    expect(v.deviceClass).toBe('middle');
+    expect(v.cpuLimited).toBe(false);
+  });
+});

@@ -97,7 +97,7 @@ the input-source guard.
 | **Prefs** | `PlayerPrefs` viewer — the engine-owned per-key JSON store (per-game namespace). |
 | **Cheats** | Auto-listed UIActions (`getUIActionNames` → `dispatchUIAction`) **plus** game `registerDebugCommand` buttons. |
 | **Console** | Ring-buffer view of captured `console.*` with a level filter + Clear. |
-| **Device** | Platform / viewport / screen / DPR / cores / memory / safe-area (refreshes on rotation), plus the **Backing resolution** A/B below. |
+| **Device** | Platform / viewport / screen / DPR / cores / memory / safe-area (refreshes on rotation), plus the **Backing resolution** A/B and the **`Re-run probe (idle)`** button below. |
 
 ### Backing resolution — the live `pixelRatioCap` A/B (Device tab)
 
@@ -131,6 +131,28 @@ Mechanism: `rendering/resizeBus.ts` (`onForceResize` / `forceResizeAllSurfaces`)
 on every run, so a live settings change only needs those handlers re-invoked — nothing caches or
 diffs, and the bus stays a dumb listener registry. Changes are runtime-only: nothing is persisted,
 so a relaunch returns to the project's configured caps.
+
+### `Re-run probe (idle)` — measuring the ramp probe away from boot (Device tab)
+
+Runs the boot ramp probe again, on demand, and prints its reading in the **same** `describeProbe`
+format as the boot line — so a boot log and an in-game log can be read side by side in one logcat
+capture. It **writes no verdict and publishes no tier**: `runProbeForDiagnostics` deliberately
+skips `probeVerdictStore` (whose stored median an idle reading would otherwise skew, asymmetrically)
+and never calls `publishActiveTier`, so tapping it cannot change what is on screen. It refuses
+while a boot probe is still in flight rather than measuring its contention, and it runs the 2D or
+3D probe shape according to whether a 3D canvas is mounted, so the reading is comparable to that
+device's boot reading rather than to the other axis.
+
+**Why it exists.** `runCpuRamp` measures *available* CPU, and until this button there was no way to
+ask what the same device reads when it is not booting — `resolveProbeClass` is private and the
+verdict store early-outs on `final`, so a settled device never probes again however often it is
+launched. The A/B it was built for is written up in
+[low-end-device-support.md](plans/low-end-device-support.md) § 1; the headline is that the boot
+reading is not depressed by contention as assumed, and on a Galaxy A23 it reads **2× higher** than
+the same device reads while the game is running.
+
+Drive it over adb with no lease: `adb shell input keyevent 142` (F12) opens the menu, then tap
+through ☰ → Device. Each run logs `[rampProbe] DIAGNOSTIC (idle) …` to the console.
 
 ### Floating stat widgets
 

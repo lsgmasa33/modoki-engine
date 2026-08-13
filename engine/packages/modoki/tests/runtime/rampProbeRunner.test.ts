@@ -267,6 +267,44 @@ describe('the cpu ramp respects a budget already spent (close-out 2026-08-13)', 
     // The warm-up alone is documented at "a millisecond or two"; bailing must be far under that.
     expect(performance.now() - started).toBeLessThan(5);
   });
+
+  it('⭐ the probe discards CPU_WARMUP_RAMPS cpu passes and classifies the one after (#205)', async () => {
+    // A JIT warm-up cannot warm a CPU governor: three passes of 8192 iterations are a millisecond
+    // or two, and a governor needs sustained work. So a whole ramp is discarded, exactly as the
+    // GPU ramps discard theirs. The COUNT is pinned below because it has already moved twice —
+    // 2 was tried on hardware and reverted (see `CPU_WARMUP_RAMPS`).
+    //
+    // ⚠️ **THE DISCRIMINATING ASSERTION IS `cpuWarmups`, NOT THE MARK.** A mark string can be
+    // written by hand and would stay green if someone deleted the extra passes; a `cpuWarmups`
+    // entry can only exist because a whole extra ramp ran and returned a reading.
+    const { gl } = fakeGl();
+    // `fenceSync` present and signalling immediately puts the orchestrator on the GPU-clock path,
+    // so the probe completes without waiting on jsdom's rAF and the test stays fast.
+    const signalling = {
+      ...gl,
+      SYNC_GPU_COMMANDS_COMPLETE: 100, ALREADY_SIGNALED: 101, CONDITION_SATISFIED: 102, WAIT_FAILED: 103,
+      fenceSync: () => ({}), clientWaitSync: () => 101, deleteSync: () => {}, flush: () => {},
+    };
+    const canvas = { width: 0, height: 0, getContext: () => signalling };
+    const spy = vi.spyOn(document, 'createElement').mockReturnValue(canvas as never);
+    try {
+      const marks: string[] = [];
+      const m = await runBootRampProbe((s) => marks.push(s));
+
+      expect(m).not.toBeNull();
+      expect(m!.cpu).toBeDefined();
+      // An EXACT length, not "at least one" — the count is the knob this test is protecting, and
+      // `length > 0` would stay green through either direction of a change to it.
+      expect(m!.cpuWarmups).toHaveLength(1);
+      // The discarded passes are SILENT — each is handed a no-op `mark`, so the stage breadcrumbs
+      // still describe the pass that counts. Without this, a crash mid-warm-up would report a
+      // stage from a ramp nobody classified.
+      expect(marks.filter((s) => s.startsWith('cpu:')).length).toBeGreaterThan(0);
+      expect(marks.some((s) => s.startsWith('cpu-ok') && s.includes('1x discarded warm-up ramp'))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });
 
 describe('createGlProbeSurface — the workloads, against a fake GL (#203)', () => {
