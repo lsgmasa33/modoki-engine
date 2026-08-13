@@ -93,6 +93,12 @@ export function parseFrontmatter(raw: string): Frontmatter | null {
       unparsed.push(line);
       continue;
     }
+    // Real YAML REJECTS a duplicate mapping key; this subset would keep the last silently, so a
+    // stale copy-pasted `id:` or `covers:` would decide the case with no trace. Reported instead.
+    if (Object.prototype.hasOwnProperty.call(fields, kv[1])) {
+      unparsed.push(`duplicate key "${kv[1]}": ${line.trim()}`);
+      continue;
+    }
     // Scoped to the iteration: a key is consumed by the very next lines, never carried across.
     const currentKey = kv[1];
     const value = kv[2].trim();
@@ -118,17 +124,33 @@ export function parseFrontmatter(raw: string): Frontmatter | null {
 const stripQuotes = (v: string) => v.replace(/^['"]|['"]$/g, '');
 
 /**
- * Minimal glob → RegExp for the patterns `covers:` uses. Also hand-rolled, and for the same
- * reason as the YAML subset above.
+ * Minimal glob → RegExp for the patterns `covers:` uses.
+ *
+ * CONSECUTIVE `**\/` ARE COLLAPSED FIRST, and that is a correctness AND a safety fix, not tidying.
+ * Each `**\/` compiles to the optional group `(?:.*\/)?`; chaining them made the regex backtrack
+ * catastrophically against a deep non-matching path — measured 1ms / 8 / 52 / 306 / 1584ms for
+ * 4..8 chained segments, i.e. roughly 6x per segment, unbounded beyond that. `a/**\/**\/b` means
+ * exactly what `a/**\/b` means, so collapsing loses nothing and removes the chain.
+ *
+ * A leading `/` is also stripped: GitHub compare paths are repo-relative with no leading slash,
+ * so `/src/foo.ts` could never match anything and the case could never go stale — silently.
  */
 export function globToRegExp(glob: string): RegExp {
+  // Collapse `**/**/` chains (see the note above) and drop a leading slash.
+  let normalised = glob.replace(/^\/+/, '');
+  let prev;
+  do {
+    prev = normalised;
+    normalised = normalised.replace(/\*\*\/(?=\*\*\/)/g, '');
+  } while (normalised !== prev);
+
   let out = '';
-  for (let i = 0; i < glob.length; i++) {
-    const c = glob[i];
+  for (let i = 0; i < normalised.length; i++) {
+    const c = normalised[i];
     if (c === '*') {
-      if (glob[i + 1] === '*') {
+      if (normalised[i + 1] === '*') {
         // `**/` spans zero or more directories; a trailing `**` spans anything.
-        if (glob[i + 2] === '/') {
+        if (normalised[i + 2] === '/') {
           out += '(?:.*/)?';
           i += 2;
         } else {
@@ -179,11 +201,20 @@ function loadCases(): CaseFile[] {
     .sort((a, b) => a.rel.localeCompare(b.rel));
 }
 
-/** Tokens inside inline code spans and fenced blocks — never bare prose. */
-function codeTokens(md: string): string[] {
-  const inline = [...md.matchAll(/`([^`\n]+)`/g)].map((m) => m[1]);
+/**
+ * Tokens inside inline code spans and fenced blocks — never bare prose.
+ *
+ * BOTH are split on whitespace. An inline span used to be kept whole, which quietly defeated
+ * this guard for the commonest citation shape in the repo: `` `engine/scripts/launch-editor.sh
+ * games/3d-test` `` became one token containing a space, and the placeholder filter (which skips
+ * anything with whitespace, for `games/<id>/…`) then dropped it without ever checking either
+ * path existed. A renamed script would have passed silently — in the guard whose entire job is
+ * catching renamed references.
+ */
+export function codeTokens(md: string): string[] {
+  const inline = [...md.matchAll(/`([^`\n]+)`/g)].flatMap((m) => m[1].split(/\s+/));
   const fenced = [...md.matchAll(/```[a-z]*\n([\s\S]*?)```/g)].flatMap((m) => m[1].split(/\s+/));
-  return [...inline, ...fenced];
+  return [...inline, ...fenced].filter(Boolean);
 }
 
 function git(args: string[]): string {
@@ -209,6 +240,68 @@ function isIgnoredBuildOutput(path: string): boolean {
   }
   return false;
 }
+
+/**
+ * Unit cover for this guard's own helpers.
+ *
+ * These run unconditionally — they take no repo state, so they hold in the OSS snapshot too.
+ * Both cases below are regressions found by reviewing this file AFTER it shipped green: a guard
+ * that is wrong is worse than no guard, because it reports "clean" either way.
+ */
+describe('qa case guard helpers', () => {
+  describe('codeTokens', () => {
+    it('splits an inline span on whitespace so "script arg" citations are BOTH checked', () => {
+      // The regression: this returned one token containing a space, which the caller's
+      // placeholder filter then skipped entirely — silently un-checking both paths.
+      const tokens = codeTokens('Run `engine/scripts/launch-editor.sh games/3d-test` now.');
+      expect(tokens).toContain('engine/scripts/launch-editor.sh');
+      expect(tokens).toContain('games/3d-test');
+    });
+
+    it('still returns a lone inline token', () => {
+      expect(codeTokens('see `engine/scripts/solo.sh` here')).toEqual(['engine/scripts/solo.sh']);
+    });
+
+    it('splits fenced blocks and drops empty fragments', () => {
+      const tokens = codeTokens('```bash\nnpm run build -- --target web\n```');
+      expect(tokens).toContain('npm');
+      expect(tokens).toContain('--target');
+      expect(tokens).not.toContain('');
+    });
+
+    it('ignores prose outside code spans', () => {
+      expect(codeTokens('engine/scripts/not-in-backticks.sh')).toEqual([]);
+    });
+  });
+
+  describe('parseFrontmatter', () => {
+    const fm = (body: string) => parseFrontmatter(`---\n${body}\n---\nbody`);
+
+    it('reports a duplicate key instead of silently keeping the last', () => {
+      // Real YAML throws on a duplicate mapping key. This subset used to keep the last value
+      // with no trace, so a stale copy-pasted `id:` would decide the case invisibly.
+      const out = fm('id: QA-A-0001\nid: QA-B-0002\ntitle: t');
+      expect(out?.unparsed.some((u) => u.includes('duplicate key "id"'))).toBe(true);
+    });
+
+    it('parses scalars, inline lists and block lists', () => {
+      const out = fm('id: QA-X-0001\ntargets: [editor, web]\ncovers:\n  - a/**\n  - b/c.ts');
+      expect(out?.fields.id).toBe('QA-X-0001');
+      expect(out?.fields.targets).toEqual(['editor', 'web']);
+      expect(out?.fields.covers).toEqual(['a/**', 'b/c.ts']);
+      expect(out?.unparsed).toEqual([]);
+    });
+
+    it('returns null when there is no frontmatter at all', () => {
+      expect(parseFrontmatter('# just a heading')).toBeNull();
+    });
+
+    it('reports a line it cannot parse rather than dropping it', () => {
+      const out = fm('id: QA-X-0001\nthis is not a key/value line');
+      expect(out?.unparsed.length).toBe(1);
+    });
+  });
+});
 
 const describeCases = HAS_CASES ? describe : describe.skip;
 
