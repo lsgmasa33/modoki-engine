@@ -24,6 +24,16 @@ describe('deviceAndroidDiag — parseLogcatLine', () => {
   it('returns null for a banner line rather than inventing a record', () => {
     expect(parseLogcatLine('--------- beginning of crash')).toBeNull()
   })
+
+  it('parses a CRLF line — adb on WINDOWS does not send LF', () => {
+    // REGRESSION (Windows CI, 2026-08-13): `\r` is a JS line terminator, so `.` will not match it
+    // and the trailing `(.*)$` failed — every line parsed as null, `parseCrashBuffer` returned [],
+    // and the tool reported "no crashes" about a phone that had just crashed. Invisible to a Mac
+    // run, which is why the assertion is on an explicit `\r` rather than on a fixture (whose line
+    // endings git rewrites per platform, so it can only ever test the host it runs on).
+    expect(parseLogcatLine('08-13 18:11:17.565 13160 13160 E AndroidRuntime: FATAL EXCEPTION: main\r'))
+      .toEqual({ when: '08-13 18:11:17.565', pid: 13160, tag: 'AndroidRuntime', text: 'FATAL EXCEPTION: main' })
+  })
 })
 
 describe('deviceAndroidDiag — parseCrashBuffer', () => {
@@ -35,6 +45,14 @@ describe('deviceAndroidDiag — parseCrashBuffer', () => {
     expect(c.exception).toContain('CrashedByAdbException')
     expect(c.frames[0]).toMatch(/^at android\.app\.ActivityThread/)
     expect(c.frames.length).toBeGreaterThan(3)
+  })
+
+  it('parses the SAME buffer delivered as CRLF — the Windows adb shape', () => {
+    // The end-to-end payoff of the parseLogcatLine fix, asserted on the real fixture rewritten to
+    // CRLF in-test: this is byte-for-byte what the Windows CI leg fed it when it returned [].
+    const [c] = parseCrashBuffer(load('crash-buffer.txt').replace(/\n/g, '\r\n'))
+    expect(c.process).toBe('com.modokiengine.court')
+    expect(c.frames[0]).toMatch(/^at android\.app\.ActivityThread/)
   })
 
   it('caps the stack — a deep trace is not worth the response budget', () => {

@@ -53,9 +53,15 @@ async function adb(serial: string | undefined, args: string[]): Promise<string> 
   return stdout;
 }
 
-/** A `logcat -v threadtime` line: `MM-DD HH:MM:SS.mmm  PID  TID L TAG: message`. Pure. */
+/** A `logcat -v threadtime` line: `MM-DD HH:MM:SS.mmm  PID  TID L TAG: message`. Pure.
+ *
+ *  ⚠️ The `trimEnd` is load-bearing on WINDOWS, where adb hands back CRLF: `\r` is a JS line
+ *  terminator, so `.` does not match it and the trailing `(.*)$` fails — the whole regex misses and
+ *  EVERY line parses as null. That is not a cosmetic wart: `parseCrashBuffer` then returns `[]` and
+ *  `device_crash_reports` answers "no crashes" about a phone that just crashed, which is the worst
+ *  answer a diagnostic can give. Caught by the Windows CI leg (2026-08-13), never by a Mac run. */
 export function parseLogcatLine(line: string): { when: string; pid: number; tag: string; text: string } | null {
-  const m = /^(\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+(\d+)\s+(\d+)\s+([VDIWEF])\s+([^:]*):\s?(.*)$/.exec(line);
+  const m = /^(\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+(\d+)\s+(\d+)\s+([VDIWEF])\s+([^:]*):\s?(.*)$/.exec(line.trimEnd());
   if (!m) return null;
   return { when: m[1], pid: Number(m[2]), tag: m[5].trim(), text: m[6] };
 }

@@ -8,8 +8,17 @@ import { captureIosSyslog, parseSyslogLine, DEFAULT_CAPTURE_SECONDS, MAX_CAPTURE
  * Host-side iOS system-log capture. go-ios is stubbed by a script that emits the same JSON-per-line
  * shape the real one does, so the ring buffer / filter / bounded-stream behaviour is testable with
  * no phone attached. The real transport was measured separately against an iPhone 8 / iOS 16.7.16.
+ *
+ * ⚠️ SKIPPED ON WINDOWS, and there is no portable stub to write. The suite works by spawning a fake
+ * `ios`, and Windows cannot execute a script directly: an extensionless `#!/bin/sh` file is ENOENT,
+ * and the obvious `.cmd` shim is refused too — Node has thrown EINVAL on spawning `.cmd`/`.bat`
+ * without `shell:true` since the CVE-2024-27980 fix, and turning `shell` on in the PRODUCTION spawn
+ * to suit a test would be the tail wagging the dog. What is lost is coverage of Node's own child
+ * plumbing on Windows; what is under test — the ring buffer, the filter, the clamp, the snapshot
+ * copy — is platform-independent and runs on ubuntu + macOS. `parseSyslogLine` below is pure and
+ * still runs everywhere, including Windows.
  */
-describe('deviceSyslog — captureIosSyslog (stubbed go-ios)', () => {
+describe.skipIf(process.platform === 'win32')('deviceSyslog — captureIosSyslog (stubbed go-ios)', () => {
   let dir: string
   beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-syslog-')) })
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }) })
