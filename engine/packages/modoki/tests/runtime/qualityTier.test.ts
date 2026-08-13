@@ -92,7 +92,12 @@ describe('resolveTier — auto', () => {
   it('starts an unrecognised device LOW and marks it calibrating', () => {
     // Booting high and guessing wrong is a lost context and a permanent black screen; booting
     // low and guessing wrong costs a beat of ugliness. The asymmetry decides the default.
-    const r = resolveTier({ platform: 'android', projectSetting: 'auto', gpuRenderer: 'Mali-G57' });
+    //
+    // ⚠️ The renderer here must be one GPU IDENTITY CANNOT PLACE (#210). It used to read
+    // `Mali-G57`, which is now a table hit resolving to `mid` — a realistic-looking string stopped
+    // exercising this branch the moment the identity layer landed. Do not "improve" it back to a
+    // real GPU name.
+    const r = resolveTier({ platform: 'android', projectSetting: 'auto', gpuRenderer: 'Vivante GC7000' });
     expect(r).toMatchObject({ tier: 'low', source: 'calibrating' });
   });
 
@@ -142,13 +147,97 @@ describe('resolveTier — auto', () => {
     }, [{ pattern: /Mali-G57/, tier: 'mid' }]);
   });
 
-  it('falls through to calibrating when the allowlist does not match', () => {
+  it('falls through to calibrating when neither the allowlist NOR gpu identity matches', () => {
     withAllowlist(() => {
+      // ⚠️ `Adreno (TM) 610` used to stand in for "no match" and is now a table hit (#210). The
+      // fall-through needs a renderer BOTH layers decline — see the note in the unrecognised-device
+      // test above.
       const r = resolveTier({
-        platform: 'android', gpuRenderer: 'Adreno (TM) 610', projectSetting: 'auto',
+        platform: 'android', gpuRenderer: 'Vivante GC7000', projectSetting: 'auto',
       });
       expect(r.source).toBe('calibrating');
     }, [{ pattern: /Adreno \(TM\) 619/, tier: 'high' }]);
+  });
+});
+
+describe('resolveTier — GPU identity (#210)', () => {
+  it('classifies the two real Android anchors from the string alone, with no probe', () => {
+    // The whole point: this is the launch-#1 answer, and `probeClass` is absent in both calls.
+    expect(resolveTier({
+      platform: 'android', projectSetting: 'auto',
+      gpuRenderer: 'ANGLE (Qualcomm, Adreno (TM) 730, OpenGL ES 3.2)',
+    })).toMatchObject({ tier: 'high', source: 'gpu-benchmark' });
+
+    expect(resolveTier({ platform: 'android', projectSetting: 'auto', gpuRenderer: 'Mali-G57 MC2' }))
+      .toMatchObject({ tier: 'mid', source: 'gpu-benchmark' });
+  });
+
+  it('⚠️ a DESKTOP is decided before the table, which is mobile', () => {
+    // The vendored table carries mobile Intel/NVIDIA parts, and a desktop reporting an integrated
+    // Intel GPU matches a row reading 30 — so the wrong order silently DEMOTES an authoring
+    // machine to `mid`. This is the assertion that pins the placement.
+    expect(resolveTier({
+      platform: 'web', projectSetting: 'auto', formFactor: 'desktop',
+      gpuRenderer: 'Intel Mesa DRI Intel HD Graphics 5500',
+    })).toMatchObject({ tier: 'high', source: 'desktop' });
+  });
+
+  it('identity BEATS the probe — it is right on launch #1 and the probe is not', () => {
+    // A device the probe measured as `weak` but whose GPU we have data for. Identity wins, because
+    // the probe's verdict is a boot-contaminated median that needs three launches to settle.
+    expect(resolveTier({
+      platform: 'android', projectSetting: 'auto',
+      gpuRenderer: 'Adreno (TM) 730', probeClass: 'weak',
+    })).toMatchObject({ tier: 'high', source: 'gpu-benchmark' });
+  });
+
+  it('hands an unplaceable GPU to the probe rather than guessing', () => {
+    // Adding the identity layer must only move devices that had NO confident answer. A string it
+    // declines lands exactly where it landed before.
+    expect(resolveTier({
+      platform: 'android', projectSetting: 'auto',
+      gpuRenderer: 'Vivante GC7000', probeClass: 'middle',
+    })).toMatchObject({ tier: 'mid', source: 'measured' });
+  });
+
+  it('a hand-written allowlist entry still outranks the table', () => {
+    // The allowlist is the escape hatch for a device we learn is misclassified, so it has to win.
+    withAllowlist(() => {
+      expect(resolveTier({
+        platform: 'android', projectSetting: 'auto', gpuRenderer: 'Adreno (TM) 730',
+      })).toMatchObject({ tier: 'low', source: 'allowlist' });
+    }, [{ pattern: /Adreno \(TM\) 730/, tier: 'low' }]);
+  });
+
+  it('⭐ SKIPS THE LAUNCH-BLOCKING PROBE — this is the condition scene3DSync branches on', () => {
+    // `resolveActiveTierOnce` resolves once with `useProbe: false` and only pays for the ramp when
+    // that comes back `'calibrating'`. So "a recognised GPU costs no launch time" is not a separate
+    // mechanism to build — it is exactly this assertion, and it is the whole first-impression win
+    // (0.5-2.6 s of blocked launch, on every Android device, gone).
+    const cheap = resolveTier(buildTierResolveInput(
+      { platform: 'android', gpuRenderer: 'Adreno (TM) 730', formFactor: 'mobile' },
+      'auto',
+      { useProbe: false },
+    ));
+    expect(cheap.source).not.toBe('calibrating');
+    expect(cheap).toMatchObject({ tier: 'high', source: 'gpu-benchmark' });
+
+    // ...and the converse, or the assertion above would pass for the wrong reason: a GPU identity
+    // cannot place still reaches the probe.
+    const unknown = resolveTier(buildTierResolveInput(
+      { platform: 'android', gpuRenderer: 'Vivante GC7000', formFactor: 'mobile' },
+      'auto',
+      { useProbe: false },
+    ));
+    expect(unknown.source).toBe('calibrating');
+  });
+
+  it('iOS still answers from the model id, never from the masked renderer string', () => {
+    // WebGL reports `Apple GPU` on every iPhone, so identity declines by design and the model
+    // table — which is strictly better — keeps the decision.
+    expect(resolveTier({
+      platform: 'ios', projectSetting: 'auto', deviceModel: 'iPhone14,2', gpuRenderer: 'Apple GPU',
+    })).toMatchObject({ source: 'model' });
   });
 });
 
@@ -498,6 +587,29 @@ describe('promotionCeiling — a measurement is not overruled by a CPU streak (#
     expect(promotionCeiling(res('mid', 'allowlist'))).toBe('mid');
   });
 
+  it('caps at what GPU IDENTITY answered — it is a lookup, not an inference (#210)', () => {
+    // These two sources arrived with #210 and nothing pinned them. A device identified as `mid`
+    // must not be promoted to `high` by a CPU-only streak, for exactly the reason the probe case
+    // above gives — and more so, since identity is the MORE reliable signal of the two.
+    expect(promotionCeiling(res('mid', 'gpu-benchmark'))).toBe('mid');
+    expect(promotionCeiling(res('low', 'gpu-benchmark'))).toBe('low');
+    expect(promotionCeiling(res('high', 'gpu-generation'))).toBe('high');
+  });
+
+  it('⛔ does NOT grant a probe verdict a promotion step — considered and DECLINED (#210)', () => {
+    // The tempting change, and why it is not made. #210 measured the probe UNDER-reporting on
+    // Android (the S22 reads `middle` where identity and the truth say `high`), which argues for
+    // letting a `measured` device climb one step. It is refused because `hasHeadroom` is CPU-ONLY
+    // and the SAME campaign measured why that is fatal here: the Huawei Y6 sat at `cpu 1.7ms of an
+    // 18.6ms frame` — abundant CPU headroom while the GPU was the limiter. Granting the step would
+    // promote GPU-bound devices into IBL and post-FX on a signal that cannot see the GPU, which is
+    // precisely the hole `promotionCeiling` was added to close (#188).
+    //
+    // The S22 case is solved by IDENTITY answering first, not by loosening this ceiling.
+    expect(promotionCeiling(res('mid', 'measured'))).toBe('mid');
+    expect(promotionCeiling(res('low', 'measured'))).toBe('low');
+  });
+
   it('caps a HUMAN decision at exactly what they chose', () => {
     // Calibration already refuses to run for these (tickTierCalibration early-returns), so this
     // is belt-and-braces — but an inference raising an explicit choice is the one thing those
@@ -786,7 +898,8 @@ describe('tier settings', () => {
     expect(tierShadowMapSize(4096, TIER_SETTINGS.high)).toBe(4096);
   });
 
-  // §0b "Shadows on `low` would render ACNE" (docs/plans/low-end-device-support.md) — a
+  // "Shadows on `low` would render ACNE" (docs/rendering.md § "Quality tiers"; the Y6 evidence is
+  // in git at 8bed9661:docs/plans/low-end-device-support.md, whose §0b was folded away) — a
   // clamped shadow map without a matching bias adjustment self-shadows. Bias scaling alone was
   // MEASURED on a Huawei Y6 not to make a clamped map look good (still dithered/under-sampled —
   // see the comment on `shadowBiasScale`); this is a texel-correctness fix, not a quality one.

@@ -678,6 +678,40 @@ xcrun devicectl device process launch --device <DEVICE_ID> <appId>
 First device install requires trusting the developer profile: Settings → General →
 VPN & Device Management → Trust.
 
+⚠️ **Those last two lines are iOS 17+ ONLY.** `devicectl` is CoreDevice-only and **cannot see an
+iOS ≤16 device at all** — including this Mac's main iOS test device, the iPhone 8 (16.7.16). Read
+without this note, the recipe above looks like the only route and the answer looks like "open Xcode
+and press ⌘R"; it is not, and an agent can deploy to a 16.x phone unattended.
+
+**iOS ≤16 — libimobiledevice** (`brew install libimobiledevice ideviceinstaller`; already on PATH on
+this Mac). Proven on this device class during #205, where an iPhone 7 took a development-signed
+build with **no Xcode run at all**:
+
+```bash
+idevice_id -l                                   # the UDID; xcrun xctrace also lists 16.x devices
+xcodebuild -project games/<id>/ios/App/App.xcodeproj -scheme App -configuration Debug \
+  -destination 'id=<UDID>' -allowProvisioningUpdates -derivedDataPath /tmp/court-dd build
+mkdir -p /tmp/ipa/Payload && cp -R /tmp/court-dd/Build/Products/Debug-iphoneos/App.app /tmp/ipa/Payload/
+(cd /tmp/ipa && zip -qry app.ipa Payload)
+ideviceinstaller -u <UDID> install /tmp/ipa/app.ipa
+idevicedebug -u <UDID> run <appId>              # launch + attach stdout; idevicesyslog for logs
+```
+
+Three caveats, none of which the install step can fix for you:
+- **This replaces the INSTALL, not the SIGNING.** The `.app` must already be development-signed —
+  that is what the `xcodebuild` step above does, and it still needs a Team ID
+  (`project.user.json`).
+- **`idevicedebug run` needs the Developer Disk Image mounted**, which it is on any device Xcode
+  has already run something on.
+- **It does NOT buy trusted input.** That needs a WebDriverAgent XCUITest bundle, and Xcode refuses
+  the iPhone 8 as a TEST destination — six theories tested and disproved, see
+  [trusted-device-input.md](./trusted-device-input.md) § "iOS 16 devices". Getting there is `go-ios`
+  territory and an owner decision, not something to re-diagnose.
+
+The intended split, per [plans/low-end-device-support.md](./plans/low-end-device-support.md):
+**iOS 15/16 → libimobiledevice** (`idevicesyslog`, `ideviceinstaller`, `idevicedebug`);
+**iOS 17+ → `xcrun devicectl … --console`**.
+
 **Normally you never type either of these — pick the phone from the Build menu.** `Build → iOS
 Device` names its current target in the label and lists every device this Mac can see in a
 submenu; picking one writes BOTH ids below into `project.user.json` **and starts the build**, so

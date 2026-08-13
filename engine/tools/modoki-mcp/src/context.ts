@@ -119,7 +119,13 @@ export function createToolContext(config: { backend: string; token?: string }): 
           expected: 'a running editor whose backend port matches MODOKI_BACKEND',
           options: [
             'start the editor: engine/scripts/launch-editor.sh games/<id>',
-            'this clone\'s backend port is 5181 (main=5179, work-ai=5180) — check MODOKI_BACKEND points at YOUR editor',
+            // This used to assert "this clone's backend port is 5181" — hardcoded from whichever
+            // clone the message was written on, and therefore WRONG on every other one. It sent a
+            // reader on modoki-qa (5183) to work-ai2's editor. A hint that confidently names the
+            // wrong port is worse than no hint, so state the convention and point at the one
+            // source that cannot be stale: the launch banner.
+            'per-clone backend ports: main=5179, work-ai=5180, work-ai2=5181, work-ai3=5182, work-qa=5183 — set MODOKI_BACKEND (or env.MODOKI_BACKEND in .claude/settings.local.json) to YOUR clone\'s port',
+            'the launch banner prints the port it actually bound — trust it over any table',
           ],
         });
   }

@@ -883,6 +883,108 @@ inside the noise, reproduced twice. postfx-demo is the only project that authors
 `diagnose` reports `lightCap` whenever the cap is engaged — "why is this object dark?" is the
 question this feature generates, and it should be answerable from data.
 
+#### ⭐ GPU identity decides the tier — the probe is the fallback (#210)
+
+**A device is classified by WHAT ITS GPU IS, not by benchmarking it at boot.** `resolveTier`
+consults `gpuIdentity.ts` after the desktop carve-out and **before** the ramp probe, so a
+recognised device gets its tier in ~0 ms, correctly, **on launch #1**.
+
+Why this replaced the probe as the primary classifier (all measured 2026-08-12, evidence in
+[plans/low-end-device-support.md](plans/low-end-device-support.md) § 2):
+
+- the probe **measures the boot, not the device** — the same Galaxy S22 reads `cpu` 11.2k on
+  `sling` and 37.4k on `3d-physics-demo`, because the ramp runs while GLBs parse and textures
+  upload;
+- its top axis is **flat where the top boundary is** — `shade` reads 0.20 / 0.21 / 0.20 for an
+  iPhone 8, an S22 and an iPhone Air, so **no Android device ever reached `capable`**;
+- it needs **three launches to settle**, so the verdict is wrong on launches 1 and 2 — the ones a
+  first impression is made on;
+- it **blocks launch 0.5–2.6 s**.
+
+**Two layers**, and the second covers the first's blind spot:
+
+| layer | answers | source | stale-proof? |
+|---|---|---|---|
+| **table** — 84 Android GPUs, vendored in `gpuBenchmarks.ts` | hardware we have data on; most entries sit at the bottom of the range, so the decision that can black-screen a phone is made where the data is densest | `'gpu-benchmark'` | **CC BY 4.0**, first-party from Kishonti |
+| **generation floor** — parsed from the renderer string | hardware the data can NEVER cover: `Adreno 8xx`, `Immortalis-G9xx`, `Xclipse 9xx` | `'gpu-generation'` | ✅ never stale |
+
+⭐ **The table comes from Kishonti's own open-sourced GFXBench results** (CC BY 4.0, © 2005–2025
+Kishonti Ltd), not from a third-party republication. GFXBench was retired in December 2025 and its
+results database published; taking the figures from the party that measured them replaced an
+earlier table whose upstream rights were an open question. Attribution — credit, licence link, and
+the statement that changes were made — is in `oss/THIRD-PARTY-NOTICES.md`, enforced by a guard test
+because no automated licence scanner can see vendored data.
+
+⭐ **It uses an OFFSCREEN test, and that is what resurrected the top band.** The previous table's
+numbers were *onscreen* framerates capped at 120 by a 120 Hz panel, so every GPU above an Adreno 650
+read ~120 and flagships could not be told apart — which is why this workstream once concluded the
+`capable`/`high` boundary was unresolvable. Uncapped, the same GPUs span
+650 → 122, 730 → 143, 740 → 233, 750 → 317, 830 → 436.
+
+Anchored on the three devices this engine has actually measured: **PowerVR GE8300 (Huawei Y6)
+→ `low`**, **Mali-G57 MC2 (Galaxy A23) → `mid`**, **Adreno 730 (Galaxy S22) → `high`** — the
+band structure the ramp campaign spent three days failing to reproduce.
+
+✅ **VERIFIED ON HARDWARE, 2026-08-12** (`demos/3d-physics-demo`, fresh APK, `pm clear` first, tier
+read from the live page): the A23 reports `Mali-G57 MC2` and resolves **`mid`/`gpu-benchmark`**; the
+S22 reports `Adreno (TM) 730` and resolves **`high`/`gpu-benchmark`**. The S22 result is the one
+that matters — six probe launches across two projects had put that phone at `middle` every time,
+and `high` was unreachable for any Android device. `source: 'gpu-benchmark'` is itself the proof the
+probe was skipped: only the `cheap.source !== 'calibrating'` early return can produce it.
+⚠️ The Y6 leg is NOT a fresh observation — it cannot install against `androidMinSdk: 31`.
+
+⚠️ **The band floors are not a frame budget.** The table's numbers are a GFXBench-derived
+*relative ranking*. `HIGH_FLOOR_FPS = 80` is read off a **genuinely empty interval** (nothing in
+the table reads 71–89), and a test fails if a regeneration ever closes that gap.
+The floors are **`MID_FLOOR_FPS = 29`** and **`HIGH_FLOOR_FPS = 85`**, each placed at the widest
+gap in its corridor (27.86→29.99 and 77.24→91.02), with no entry sitting exactly on either — a
+property a test pins, because an earlier floor landed exactly on two budget parts and promoted them.
+
+⚠️ **Neither sits in a large void, and the previous table's void was an ARTIFACT.** That table had a
+conspicuous empty interval at 71–89 which this doc once cited as "decided by the data". It was the
+edge of the refresh-rate saturation cliff. Uncapped data is dense and continuous, which is more
+truthful — and it means both floors rest on the three measured anchors plus a plausibility
+argument, not on a canyon. **Measured devices between the anchors are what would settle them.**
+
+⚠️ **Extrapolation is only ever UPWARD, and only past the top of the data** — and "bigger number"
+is not "newer series". An **Adreno 765 is upper-midrange where an Adreno 750 is a flagship**, so
+`adreno`/`mali-g` compare by series (`floor(n/100)`) while `xclipse` compares by generation
+(Samsung has stayed inside 9xx across three architectures). A part inside the top series that has
+no row falls to the probe, which is the conservative answer.
+
+⚠️ **Core counts come as `MCn` OR `MPn`** — ARM writes `MC` on Valhall-era parts and `MP` on
+Midgard/Bifrost ones, and the table carries both. Matching only `MC` (a close-out fix) silently
+disabled the "retry without the core count" fallback for every older Mali, so a `Mali-G72 MP6` fell
+through to the probe while `malig72` sat unused in the table — stranding precisely the old, weak
+hardware the data is densest on.
+
+⚠️ **The ANGLE unwrap is load-bearing.** Android Chrome reports
+`ANGLE (Qualcomm, Adreno (TM) 730, OpenGL ES 3.2)` — the most common string shape on the platform.
+A lazy `[^)]*` stops inside `Adreno (TM)` and the whole match fails, leaving `ANGLE (Qualcomm` as
+the candidate, which normalizes to `angle` and matches nothing. `normalizeGpuKey` is duplicated in
+`engine/scripts/gen-gpu-benchmarks.mjs` (an `.mjs` build script cannot import the package), and a
+test requires every generated key to be a **fixed point** of the runtime copy — a divergence would
+be a table that silently never matches, with no error and no log.
+
+**Two consequences that fall out for free:**
+
+- **A recognised device skips the launch-blocking probe entirely.** `resolveActiveTierOnce`
+  resolves once with `useProbe: false` and only pays for the ramp when that returns
+  `'calibrating'`. Identity returns `'gpu-benchmark'`, so the branch is never taken. No new
+  mechanism — the property is pinned by a test on exactly that condition.
+- **A DEBUG build still measures and throws the verdict away**, so every launch on a recognised
+  phone is a free A/B between identity and the probe. A release build is byte-for-byte unaffected.
+
+⚠️ **The desktop carve-out MUST stay ahead of this**, and the ordering is pinned by a test: the
+table is *mobile* and includes mobile Intel/NVIDIA parts, so a desktop reporting an integrated
+Intel GPU matches a row reading 30 and would be **demoted to `mid`** — an authoring machine
+downgraded by a phone table. iOS likewise still answers from the model id, because WebGL masks
+every iPhone to `Apple GPU`.
+
+Identity returns `null` rather than guessing on a masked string, an unknown vendor or a generation
+it cannot place — which lands exactly where such a device already landed (the probe, then
+`calibrating → low`). **So adding this layer can only move a device that had no confident answer.**
+
 #### Native (WebView) differs from mobile Chrome — verified on a Huawei Y6, 2026-08-10
 
 Demos publish **web-only**, so measuring one in mobile Chrome is its shipping surface. Native games
@@ -1695,9 +1797,73 @@ Found via Court's memo pen marks, which rendered nothing while being perfectly c
 
 A slot has TWO independent claims and is reclaimable only when BOTH drop:
 - **`boundBySim`** — Scene2D's claim: the Canvas2D entity is present in the world (`allocate` / `release`).
-- **`mounted`** — Canvas2DMount's claim: the slot's `<canvas>` is in the DOM (`mount` / `unmount`).
+- **`mounted`** — Canvas2DMount's claim: that component owns the slot (`mount` / `unmount`).
+
+⚠️ **`mounted` does NOT mean "the canvas is in the DOM", and conflating the two cost #213 five fixes.** `Canvas2DMount` takes the claim synchronously in its effect but appends the canvas only once `slot.ready` resolves — i.e. after an async `Application.init()`. Inside that gap the slot is fully claimed and `canvas.parentElement` is `null`. **Any teardown that asks the DOM "is anyone using this slot?" gets the wrong answer there.** Ask the CLAIM. See the incident below.
 
 Reclaiming only when both clear stops mount/unmount churn from leaking slots AND stops slot reuse from destroying the WebGL context behind a still-visible canvas; `entityId === null` is the canonical "unclaimed" marker. The pool DETACHES children on reclaim but never destroys them — Scene2D owns display-object destruction + texture-refcount release (destroying in both places would double-free). `renderAll` swallows a transient teardown-race throw (a canvas losing its context mid-swap) silently and only warns after 30 consecutive stuck frames.
+
+#### Incident: the engine destroying its own GPU context (#213, closed 2026-08-13)
+
+Court rendered no gameboard on an iPhone 8 (A11 / iOS 16) while the ECS, the DOM, the canvas size
+and the intro were all perfectly correct. Five fixes were needed; four were real defects but not
+this one. The durable lessons:
+
+**Root cause.** `destroyPool()` decided "is this slot in use?" by reading `canvas.parentElement`.
+Inside `Canvas2DMount`'s async gap (above) that reads `null` on a fully-claimed slot, so:
+
+1. `mount(id)` → slot claimed, `Application.init()` in flight, canvas not appended.
+2. `destroyPool()` → `releaseAll()` leaves `entityId` set (reclaim bails on `mounted`), the DOM
+   check says free, slot flagged `destroyed` and spliced out. Its app is NOT destroyed here —
+   `initialized` is still false.
+3. `init()` resolves → `initSlotApp`'s orphan check destroys the brand-new, LIVE context.
+4. `slot.ready` resolves → `Canvas2DMount` appends the now-DEAD canvas into the DOM.
+5. `webglcontextlost` fires on a visible canvas; recovery declines `'disposed'`; `renderAll` never
+   iterates the slot **because it is no longer in the pool**.
+
+Step 5 is why "0 of 25,680 sampled pixels ever drawn" was literal rather than "draws into a dead
+context" — nothing ever tried to draw.
+
+**How it was finally pinned, and the transferable technique.** Every destroy path uses
+`app.destroy(true)`, which Pixi's `ViewSystem` treats as `removeView` — it removes the canvas from
+its parent. The canvas was measured IN the DOM with a dead context, so it had **no parent when the
+context died** and was appended afterwards. That one observation discriminated this from the
+already-fixed "destroyed a mounted slot" case; no amount of source reading could.
+
+**Traps that burned whole sessions — do not repeat:**
+- **It is a RACE (~60% of boots on that device), not deterministic.** Every "clean install → the
+  board renders → fixed" was one or two lucky boots. **A single good boot is not evidence.** Verify
+  a race fix by RATE against a measured baseline, plus an observation that the race actually
+  occurred and was survived (the pool logs a one-shot warn when a teardown lands in the gap).
+- **A plain webview `location.reload()` reproduces it** — no reinstall, no Xcode. That is the cheap
+  repro loop, drivable over the device lease.
+- **The build/install path decides whether it reproduces at all.** Same source, same phone, same
+  reload protocol: Modoki Build → iOS → Xcode ⌘R failed 6/10, while a raw `xcodebuild` +
+  `ideviceinstaller` build failed **0/10 even unfixed**. An agent-built install therefore cannot
+  falsify a fix here — always A/B the *unfixed* build on the *same* path before believing a green.
+- **A test can DEFEND the bug.** The guard added by the previous fix asserted that `destroyPool()`
+  destroys a slot whose mount claim is held — the exact failing state, encoded as correct.
+- **Do not infer "spliced out" from `!slots.includes(slot)`.** That is also true of a slot not yet
+  pushed and of a still-claimed one; `Canvas2DSlot.destroyed` is the explicit flag, and the
+  `includes` check is the line that actually destroyed the context.
+- StrictMode's double-invoke of effects is **development-only**, so it cannot explain a
+  `destroyPool()` during a shipped boot (verified: the shipped React chunk is the production build).
+  What calls it in production is still unidentified — the teardown is merely safe now.
+
+**⚠️ Pixi fires a context loss on EVERY `app.destroy()`.** `GlContextSystem.destroy()` ends with
+`extensions.loseContext?.loseContext()`, and it removes only *Pixi's* listeners, not ours. Three
+consequences the pool now handles explicitly, each with a mutation-verified test:
+
+- A slot's `webglcontextlost` handler runs on our OWN teardown. Unguarded it emitted two errors
+  swearing the surface would stay blank and citing #213 — on a correct path. Every destroy site
+  therefore sets `destroyed` and detaches the listeners **before** calling `app.destroy()`.
+- Those listeners close over the **slot**, not the canvas, so one left on a *replaced* canvas keeps
+  mutating the live slot: a rebuild's forced loss would flip `contextLost` back to true on the
+  freshly healthy renderer and queue a redundant second rebuild.
+- `initSlotApp` must **capture** `slot.app` rather than re-read it after its `await`. `rebuildSlotApp`
+  reassigns `slot.app`, so a rebuild whose `init()` exceeds `REBUILD_INIT_TIMEOUT_MS` (rejected, but
+  *not* cancelled) would resume on the retry's Application — double-counting the context budget while
+  the timed-out one is never destroyed at all: a leaked live GPU context.
 
 ### 2D SDF text (MTSDF)
 

@@ -708,6 +708,13 @@ export class Scene2DRenderer {
     const previewChanged2D = previewing2D !== this._wasPreviewing2D;
     this._wasPreviewing2D = previewing2D;
 
+    // A slot whose renderer was rebuilt after GPU context loss owes its new (empty) frame a FULL
+    // redraw (#213). Read-and-clear, and read BEFORE the idle skip below: a context can die while
+    // the sim is paused — an editor viewport, or a game between levels — and skipping the frame
+    // would drop the one signal that says "everything on this surface must be drawn again",
+    // leaving it blank behind a perfectly healthy context.
+    if (this.pool.consumeRebuildFlag()) this._externalDirty = true;
+
     // (1) Idle whole-frame skip — while the sim is stopped/paused, 2D only changes
     // via paths that set _externalDirty, so idle + clean ⇒ no ECS scan, no render.
     if (!isSimRunning() && !this._externalDirty && !previewing2D && !previewChanged2D) return;

@@ -108,7 +108,11 @@ describe('choosePlayerQualityTier(null) — "Auto" must NOT discard the boot pro
   it('an Android device the probe measured `middle` resolves to `mid`/`measured`, not `low`/`calibrating`', () => {
     mockCaps = {
       platform: 'android', webgpu: false, backend: 'WebGL',
-      gpuRenderer: 'Mali-G57 MC2', compressed: { astc: false, etc2: true, s3tc: false },
+      // ⚠️ A GPU **identity cannot place** (#210), and that is the point: this test is about the
+      // PROBE path, and identity now answers ahead of it. `Mali-G57 MC2` used to sit here and is a
+      // table hit resolving `mid`/`gpu-benchmark` — which would pass the tier assertion while
+      // testing nothing about `probeClass`. Do not restore a real GPU name.
+      gpuRenderer: 'Vivante GC7000', compressed: { astc: false, etc2: true, s3tc: false },
       formFactor: 'mobile',
     };
     const g = globalThis as { innerWidth?: number; innerHeight?: number };
@@ -144,7 +148,11 @@ describe('a player pin is not an ASSESSMENT — the promotion ceiling must not l
   const bootPinnedThenAuto = (): void => {
     mockCaps = {
       platform: 'android', webgpu: false, backend: 'WebGL',
-      gpuRenderer: 'Mali-G57 MC2', compressed: { astc: false, etc2: true, s3tc: false },
+      // ⚠️ A GPU **identity cannot place** (#210), and that is the point: this test is about the
+      // PROBE path, and identity now answers ahead of it. `Mali-G57 MC2` used to sit here and is a
+      // table hit resolving `mid`/`gpu-benchmark` — which would pass the tier assertion while
+      // testing nothing about `probeClass`. Do not restore a real GPU name.
+      gpuRenderer: 'Vivante GC7000', compressed: { astc: false, etc2: true, s3tc: false },
       formFactor: 'mobile',
     };
     const g = globalThis as { innerWidth?: number; innerHeight?: number };

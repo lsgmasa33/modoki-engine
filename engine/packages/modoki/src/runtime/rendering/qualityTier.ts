@@ -64,6 +64,10 @@
 import { BUDGET_30FPS_MS, type FrameProfile } from '../core/frameProfiler';
 import { probeVerdictStore } from '../core/probeVerdictStore';
 import { probeFingerprint, type DeviceClass } from './rampProbe';
+// The GPU-identity layer (#210). Its import back to here is TYPE-ONLY (`QualityTier`), so it is
+// erased at compile time and this stays a one-way runtime dependency — the same shape, and for the
+// same reason, as the `PostFXRequest` import below.
+import { gpuIdentityTier } from './gpuIdentity';
 // TYPE-ONLY, so this module keeps its one-way dependency and stays runtime-pure (`stackPlan.ts`
 // imports nothing at all). It buys the exhaustiveness check on `POSTFX_KEY_PERMISSION` — the whole
 // point of which is that a stage added there cannot silently escape the tier mask again.
@@ -104,6 +108,14 @@ export const DEFAULT_TIER_SETTING: QualityTierSetting = 'auto';
 /** How a tier was arrived at — reported so a surprising tier is explainable without an eval. */
 export type TierSource =
   | 'player' | 'project' | 'allowlist' | 'model' | 'desktop' | 'calibrating' | 'measured'
+  /** The GPU renderer string named hardware we have throughput data for (#210). Distinct from
+   *  `'allowlist'` (a hand-written override) and from `'measured'` (this device was benchmarked
+   *  at boot): this is a LOOKUP, correct on launch #1 and costing no launch time. */
+  | 'gpu-benchmark'
+  /** The GPU is a generation NEWER than anything in the table, so it inherited the top entry's
+   *  band. Reported apart from `'gpu-benchmark'` because it carries different confidence — see
+   *  `gpuIdentity.ts`. */
+  | 'gpu-generation'
   /** The project authored ONE config, so nothing was measured and nothing needed to be — see
    *  `configCount`. Distinct from `'project'` (an explicit pin) and from `'desktop'` (a
    *  device judgement): this says the QUESTION did not arise, which is a different fact from any
@@ -881,6 +893,27 @@ export function resolveTier(input: TierResolveInput): TierResolution {
   // demos' whole mobile-web audience the tier that bricked the Y6.
   if (input.formFactor === 'desktop') {
     return { tier: 'high', source: 'desktop', reason: 'desktop-class host — not the hardware the low default guards' };
+  }
+
+  // ⭐ GPU IDENTITY (#210) — the layer that makes a first impression correct on launch #1.
+  //
+  // Placed AFTER the desktop carve-out and BEFORE the probe, and both halves of that matter:
+  //
+  //   - After `desktop`, because the vendored table is MOBILE and includes mobile Intel/NVIDIA
+  //     parts (`intel hd graphics 5500`, `tegra x1`). A desktop reporting an integrated Intel GPU
+  //     would otherwise match a row reading 30 and be DEMOTED to `mid` — an authoring machine
+  //     downgraded by a phone table.
+  //   - Before `measured`, because this is the whole point: a table hit costs ~0 ms and is right
+  //     the first time, where the probe blocks launch 0.5-2.6 s and needs three launches to settle
+  //     (so its verdict is wrong on launches 1 and 2 — the ones a first impression is made on).
+  //
+  // Identity returns `null` rather than guessing on a masked string, an unknown vendor, or a
+  // generation it cannot place, which lands exactly where this device already landed: the probe,
+  // and failing that `calibrating` -> `low`. So adding this layer can only move a device that had
+  // no confident answer, never overrule one that did.
+  const identified = gpuIdentityTier(input.gpuRenderer);
+  if (identified) {
+    return { tier: identified.tier, source: identified.via, reason: identified.reason };
   }
 
   // The boot ramp probe (#188), if it ran. It sits BELOW the desktop carve-out deliberately —

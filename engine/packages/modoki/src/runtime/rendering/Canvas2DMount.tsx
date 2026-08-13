@@ -74,8 +74,31 @@ export function Canvas2DMount({ entityId, pool = defaultPool, markDirty = markSc
     }
 
     function applySize(w: number, h: number) {
-      pool.resize(entityId, w, h);
+      // Resize the slot we HOLD, never a fresh lookup by entityId (#213). This component owns
+      // `slot` — it is the canvas we appended to the DOM — and `pool.resize(entityId, …)` silently
+      // did nothing whenever that entity had been reclaimed out of `entityMap` while its canvas was
+      // still mounted. The result was a canvas pinned at 1x1 forever with no error and no warning:
+      // the retry below counts the call as applied and stops, and every later ResizeObserver fire
+      // no-ops identically. Measured live on an iPhone 8, where the slower async `app.init()` makes
+      // the reclaim window easy to hit; the same build was fine on an iPad and on desktop.
+      if (slot) pool.resizeSlot(slot, w, h);
       markDirty(); // a resize moves the scaler → wake the render gate (F1)
+
+      // ⚠️ VERIFY THE RESIZE LANDED. Applying a size and having the canvas ignore it is a REAL
+      // shipped failure (#213: a 1x1 buffer stretched over a full-size box on an iPhone 8, while
+      // the same build was fine on iPad and desktop), and it is invisible from every other angle —
+      // the retry counts the call as applied and stops, so its own 0x0 warning never fires, no
+      // error is thrown, the DOM chain measures correctly and the WebGL2 context is live. The only
+      // observable is the one thing nobody checked: the canvas did not change size.
+      // Cheap (two property reads on a path that runs on mount + real resizes, not per frame).
+      if (slot && slot.canvas.width <= 1 && w > 1) {
+        console.error(
+          `[Canvas2DMount] entity ${entityId}: applied ${w}x${h} but the canvas is still ` +
+          `${slot.canvas.width}x${slot.canvas.height} — this surface will render a 1px buffer ` +
+          `stretched over its box. initialized=${slot.initialized} mounted=${slot.mounted} ` +
+          `boundBySim=${slot.boundBySim} slotEntity=${slot.entityId} (see #213).`,
+        );
+      }
     }
 
     function updateSize() {

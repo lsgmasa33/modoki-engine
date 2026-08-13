@@ -100,6 +100,14 @@ export interface RendererRecoveryDeps {
   delayMs?: number;
   /** Bring-up rejections tolerated before giving up. Default `DEFAULT_MAX_REBUILD_ATTEMPTS`. */
   maxAttempts?: number;
+  /** Called when a rebuild request is DROPPED or a scheduled run bails, with the reason.
+   *
+   *  ⚠️ These paths used to return in total silence, and that is how a recovery failure becomes
+   *  indistinguishable from a recovery that never ran: #213 spent a round trip on a device
+   *  unable to tell "rebuild rejected" from "rebuild never started", because only the success and
+   *  failure paths ever said anything. A recovery mechanism that can decline silently cannot be
+   *  debugged from a log. */
+  onSkipped?: (reason: 'disposed' | 'in-flight' | 'timer-pending') => void;
   /** Injectable timers — so the tests assert the POLICY rather than sleeping through it. */
   setTimer?: (fn: () => void, ms: number) => unknown;
   clearTimer?: (handle: unknown) => void;
@@ -136,7 +144,7 @@ export function createRendererRecovery(deps: RendererRecoveryDeps): RendererReco
     timer = null;
     // Re-check: the viewport can unmount during the delay, and rebuilding into a torn-down
     // container would leak a renderer nobody will ever dispose.
-    if (disposed || deps.isDisposed()) return;
+    if (disposed || deps.isDisposed()) { deps.onSkipped?.('disposed'); return; }
     inFlight = true;
     let failed = false;
     try {
@@ -170,13 +178,16 @@ export function createRendererRecovery(deps: RendererRecoveryDeps): RendererReco
   /** Arm the one pending timer. Coalescing lives here so both the loss path and the retry path
    *  are physically unable to run two rebuilds. */
   function schedule(ms: number): void {
-    if (disposed || deps.isDisposed()) return;
-    if (inFlight || timer !== null) return;
+    if (disposed || deps.isDisposed()) { deps.onSkipped?.('disposed'); return; }
+    if (inFlight || timer !== null) { deps.onSkipped?.(inFlight ? 'in-flight' : 'timer-pending'); return; }
     timer = setTimer(run, ms);
   }
 
   function request(): void {
-    if (disposed || deps.isDisposed()) return;
+    // ⚠️ This early return was SILENT, and it is the first one a request hits — so a recovery that
+    // never even scheduled looked identical, in the log, to one that scheduled and failed. On
+    // device that cost a full build/deploy round trip to distinguish (#213).
+    if (disposed || deps.isDisposed()) { deps.onSkipped?.('disposed'); return; }
     if (inFlight) { again = true; return; }   // rule 3
     failures = 0;                              // a fresh fault gets the full retry budget
     schedule(delayMs);                         // rules 1 + 2

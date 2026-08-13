@@ -210,16 +210,23 @@ function sortChildren(n: UINodeData) {
   for (let i = 0; i < n.children.length; i++) sortChildren(n.children[i]);
 }
 
-function buildTree(world: World): UINodeData[] {
+/** Build the tree, or **`null` when it CANNOT be built yet** (traits not registered).
+ *
+ *  ⚠️ The null is the whole point, and it replaces a `[]` that was a latent bug. The caller
+ *  clears the dirty flag, so returning an empty tree here CONSUMED the rebuild request and left
+ *  the UI permanently empty unless something else happened to dirty it later. The old comment
+ *  said this "self-corrects on the next markUIDirty rebuild" — nothing guarantees there is a next
+ *  one. `loadSceneFile` fires exactly ONE markUIDirty for the whole batch, so if that is the
+ *  signal that lands here too early, no UI is ever rendered: no Canvas2D node means
+ *  `Canvas2DMount` never mounts, which means a 2D game draws NOTHING, with no error anywhere. */
+function buildTree(world: World): UINodeData[] | null {
   if (!_traitsCached) cacheTraits();
   if (!_traitsCached) {
-    // Traits not registered yet — expected during the initial-dirty build that
-    // runs before game/editor setup registers traits. A UI entity can't exist
-    // without RenderableUI/UIElement being registered first, so this transient
-    // empty tree self-corrects on the next markUIDirty rebuild. (A game that
-    // genuinely forgets to register UI traits surfaces via loadSceneFile's
-    // unknown-trait warnings, not here.)
-    return [];
+    // Traits not registered yet — expected during the initial-dirty build that runs before
+    // game/editor setup registers traits. Signal "not yet" so the caller KEEPS the request
+    // pending rather than swallowing it. (A game that genuinely forgets to register UI traits
+    // surfaces via loadSceneFile's unknown-trait warnings, not here.)
+    return null;
   }
 
   _nodes.clear();
@@ -421,7 +428,14 @@ function buildTree(world: World): UINodeData[] {
 export function uiTreeProjection(world: World) {
   ensureInitialized();
   if (!isUIDirty()) return;
-  clearUIDirty();
+  // ⚠️ Build FIRST, clear the flag only if the build actually produced a tree. The flag used to
+  // be cleared up front, so a build that could not run yet (traits not registered — `buildTree`
+  // returns null) silently ATE the rebuild request: the request is gone, the tree stays empty,
+  // and recovery depends on some unrelated code dirtying the UI again later. Nothing guarantees
+  // that. Keeping the flag set costs one retry per frame until traits exist — which is what
+  // "dirty" already means — and turns a permanent, silent blank UI into a one-frame delay.
   const tree = buildTree(world);
+  if (tree === null) return;
+  clearUIDirty();
   useUITreeStore.setState({ tree });
 }
