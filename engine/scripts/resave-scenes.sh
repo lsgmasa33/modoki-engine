@@ -39,6 +39,11 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PORT=${MODOKI_BACKEND_PORT:-5179}
 BE="http://127.0.0.1:${PORT}"
+# Per clone, keyed on the backend port like every other editor-adjacent temp path here:
+# /tmp is machine-wide, so a bare name means two clones resaving at once overwrite each
+# other's launch output — and the only time this file is read is the `FAILED to open`
+# branch below, i.e. precisely when tailing a sibling's log sends you the wrong way.
+LAUNCH_LOG="/tmp/resave-launch-${PORT}.log"
 cd "$ROOT"
 
 [ $# -gt 0 ] || { echo "usage: $0 <project>... (e.g. games/sling)" >&2; exit 2; }
@@ -48,7 +53,7 @@ for PROJ in "$@"; do
   [ -d "$ROOT/$PROJ" ] || { echo "  no such project"; continue; }
 
   # Repo-scoped launcher — never touches a sibling clone's editor.
-  MODOKI_BACKEND_PORT="$PORT" engine/scripts/launch-editor.sh "$PROJ" > /tmp/resave-launch.log 2>&1
+  MODOKI_BACKEND_PORT="$PORT" engine/scripts/launch-editor.sh "$PROJ" > "$LAUNCH_LOG" 2>&1
 
   # Match the FULL projectRoot, not a bare substring: `games/court` is a substring of
   # nothing here today, but a future `games/court-2` would make a loose match open the
@@ -61,7 +66,7 @@ for PROJ in "$@"; do
   done
   case "$ident" in
     *"\"projectRoot\":\"$ROOT/$PROJ\""*) ;;
-    *) echo "  FAILED to open (identity: ${ident:-none})"; tail -5 /tmp/resave-launch.log; continue;;
+    *) echo "  FAILED to open (identity: ${ident:-none})"; tail -5 "$LAUNCH_LOG"; continue;;
   esac
 
   # The backend answers before the renderer window exists, but load-scene needs the

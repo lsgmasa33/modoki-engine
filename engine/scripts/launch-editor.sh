@@ -94,8 +94,21 @@ fi
 # port is auto-picked (MULTI mode). Without this every editor writes the same
 # /tmp/modoki-editor.log and you read the wrong instance's output.
 LOG_TAG="${BACKEND_PORT:-$$}"
-VITE_LOG="/tmp/modoki-vite-${LOG_TAG}.log"
 EDITOR_LOG="/tmp/modoki-editor-${LOG_TAG}.log"
+# The VITE log is the app's to open, not this shell's — main spawns Vite and redirects it
+# to MODOKI_VITE_LOG (engine/electron/devServer.ts). So two things differ from EDITOR_LOG
+# above, and BOTH were wrong here until 2026-08-13:
+#   1. It must be EXPORTED. This variable was computed and then never used, so every clone
+#      fell through to devServer.ts's default and appended into ONE shared file — while
+#      `dev server exited unexpectedly … see <path>` pointed all of them at it. The
+#      per-port editor log was clone-safe and the Vite log silently was not.
+#   2. It must be a NATIVE path, never a Git-Bash "/tmp/…". MSYS rewrites POSIX-looking
+#      ARGUMENTS to a native program but never ENV VARS, and this crosses into a native
+#      Electron process as an env var — the same trap smoke-packaged.sh documents, which
+#      is why that script resolves the temp dir through packagedAppPaths.mjs. Do the same.
+# An explicit MODOKI_VITE_LOG always wins, like every other override in this script.
+VITE_LOG="${MODOKI_VITE_LOG:-$(node "$REPO/engine/scripts/packagedAppPaths.mjs" tmpdir)/modoki-vite-${LOG_TAG}.log}"
+export MODOKI_VITE_LOG="$VITE_LOG"
 
 # 1. Stop ONLY this repo's prior editor + the Vite it owns — matched by this
 #    repo's ABSOLUTE paths so a sibling git worktree's editor (a DIFFERENT path,
@@ -299,6 +312,7 @@ else
   echo "[launch-editor]   CDP:          off (auto backend port; set MODOKI_CDP_PORT to enable)"
 fi
 echo "[launch-editor]   Log:          $EDITOR_LOG"
+echo "[launch-editor]   Vite log:     $VITE_LOG"
 
 # The editor is up and its ports are RESOLVED — record what it actually bound, which is
 # what a later "who is on this port?" needs. Vite in particular may differ from `want:`

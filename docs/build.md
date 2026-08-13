@@ -392,6 +392,15 @@ Three loops, three jobs — don't conflate them:
   the tree, so an in-repo `.app` would find the repo's `node_modules` and **mask** the exact
   "dependency excluded from the package" bugs the test exists to catch. Building outside the repo is a
   deliberate correctness property — do NOT relocate the build into the project folder.
+  - **…and each loop owns its OWN directory there, per clone.** The temp dir is machine-wide, so the
+    name is the only thing separating them: `test-packaged.sh` builds at `modoki-pkg-test-<clone>`,
+    `smoke-packaged.sh` at `modoki-pkg-smoke-<clone>`. They must not converge — `editor:*:packaged`
+    is `test-packaged.sh` `exec`ing a long-lived interactive editor out of its dir, while the smoke
+    reaps packaged apps and `rm -rf`s its own before every build. `repro-cold-boot.sh` is the one
+    deliberate SHARER: its default `OUT` reuses the **smoke** dir, because its job is to relaunch the
+    app that gate just built. That coupling is invisible when it breaks — the script finds an older
+    app and reports on it — so `engine/tests/architecture/tempPathScoping.test.ts` pins the two names
+    to each other, and fails any temp path that lacks a per-clone discriminator.
 
 ⚠️ **`fs.stat` timestamps are FABRICATED for paths inside `app.asar`.** Electron's asar shim
 reports a real `size` but synthesizes the times — measured on packaged Windows (2026-08-02),

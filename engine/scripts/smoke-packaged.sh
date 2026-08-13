@@ -32,15 +32,29 @@ PROJECT="$(cd "${1:-games/3d-test}" && { pwd -W 2>/dev/null || pwd; })"
 # (MODOKI_VITE_LOG in particular is opened by the app, not by this shell).
 PATHS="$REPO/engine/scripts/packagedAppPaths.mjs"
 TMPBASE="$(node "$PATHS" tmpdir)"
-OUT="$TMPBASE/modoki-pkg-test"
-VITELOG="$TMPBASE/modoki-smoke-vite.log"; APPLOG="$TMPBASE/modoki-smoke-app.log"
-BUILDLOG="$TMPBASE/modoki-smoke-build.log"
+# PER CLONE, for the same reason test-packaged.sh is (#69): the temp dir is machine-wide,
+# so these bare names were shared by every clone — and this script `rm -rf`s OUT and
+# USERDATA before building into them. Two clones running `verify:packaged` at once would
+# delete each other's build mid-run, and the smoke would report on whichever .app won the
+# race. The PORT below and the throwaway profile were already per-clone; the PATHS were the
+# gap. `$(basename "$REPO")` is the same discriminator test-packaged.sh uses.
+#
+# …and a distinct BASENAME from test-packaged.sh, which builds at
+# `modoki-pkg-test-<clone>`. Sharing the per-clone name would be a WITHIN-clone collision
+# in place of the cross-clone one: `editor:main:packaged` is test-packaged.sh `exec`ing a
+# long-lived interactive editor out of that dir, and this script reaps packaged apps and
+# `rm -rf "$OUT"`s before it builds — so a smoke run would delete the app the owner is
+# sitting in front of. Different job, different dir.
+CLONE="$(basename "$REPO")"
+OUT="$TMPBASE/modoki-pkg-smoke-$CLONE"
+VITELOG="$TMPBASE/modoki-smoke-vite-$CLONE.log"; APPLOG="$TMPBASE/modoki-smoke-app-$CLONE.log"
+BUILDLOG="$TMPBASE/modoki-smoke-build-$CLONE.log"
 # A THROWAWAY Chromium profile for the launch leg — see the --user-data-dir note at the
 # launch below. Not under the packaged product name: `killPackaged`'s no-appDir fallback
 # reaps on `Modoki Editor.app/Contents/`, and Electron repeats --user-data-dir in every
 # helper's command line, so a profile path containing that substring would make our own
 # helpers reapable by a machine-wide clean (the #69 signature, in reverse).
-USERDATA="$TMPBASE/modoki-smoke-userdata"
+USERDATA="$TMPBASE/modoki-smoke-userdata-$CLONE"
 # Dedicated port OUTSIDE the human-editor range (5179 main / 5180 ai / 5181 ai2) so a
 # throwaway smoke build (e.g. from `npm run verify:packaged`) can't collide with a
 # sibling clone's live dev editor — the packaged app pins MODOKI_BACKEND_PORT and

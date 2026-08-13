@@ -418,7 +418,12 @@ function renderScreenshot(
   const mimeType = decoded.dataUrl.startsWith('data:image/jpeg') ? 'image/jpeg' : 'image/png';
   const info = decoded.info + (opts.aimHint ?? '');
   const buf = Buffer.from(base64, 'base64');
-  const outPath = opts.savePath ?? join(tmpdir(), `device-screenshot.${extFor(mimeType)}`);
+  // pid-tagged like the adb capture path above, and for the same reason: the temp dir is
+  // machine-wide, one MCP server runs per clone, and the device LEASE is per DEVICE — so two
+  // clones driving two different phones both wrote this one file and each got back a path
+  // holding the OTHER phone's pixels. A screenshot that silently shows someone else's device
+  // is worse than no screenshot; it is evidence, and it was wrong.
+  const outPath = opts.savePath ?? join(tmpdir(), `device-screenshot-${process.pid}.${extFor(mimeType)}`);
   writeFileSync(outPath, buf);
   // fire-and-forget (macOS). `VITEST` guard: this is the first code path a test drives end-to-end,
   // and a suite that opens a GUI app on the developer's machine is a suite people stop running —

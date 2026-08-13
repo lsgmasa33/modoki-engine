@@ -22,7 +22,7 @@
 #
 # Usage (build the app first — npm run dist:dir, or reuse the smoke build):
 #   N=30 engine/scripts/repro-cold-boot.sh
-#   OUT=/tmp/modoki-pkg-test PROJECT=games/3d-test N=12 engine/scripts/repro-cold-boot.sh
+#   OUT=/path/to/an/app/output/dir PROJECT=games/3d-test N=12 engine/scripts/repro-cold-boot.sh
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,7 +34,11 @@ PATHS="$REPO/engine/scripts/packagedAppPaths.mjs"
 # builds under the former — so the naive default silently resolved a DIFFERENT, day-old app
 # and reported it green. That is the same "manufactures a test that proves nothing" failure
 # clean-packaged-cache.mjs documents. Share the helper so this and the smoke gate agree.
-OUT="${OUT:-$(node "$PATHS" tmpdir)/modoki-pkg-test}"
+# Keep this basename IN LOCKSTEP with smoke-packaged.sh's OUT — that agreement is the whole
+# point of the paragraph above, and it is invisible: nothing fails when the two drift, the
+# reused app is simply the wrong one. Both are per clone now (the temp dir is machine-wide),
+# so the discriminator has to match too, not just the prefix.
+OUT="${OUT:-$(node "$PATHS" tmpdir)/modoki-pkg-smoke-$(basename "$REPO")}"
 OUT="${OUT%/}"
 PROJECT="${PROJECT:-games/3d-test}"
 N="${N:-12}"
