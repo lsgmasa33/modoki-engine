@@ -177,9 +177,10 @@ const COURT_QUICK_EXCLUDE = [
   '../games/court/tests/corpus.test.ts',
   '../games/court/tests/strategies.test.ts',
   '../games/court/tests/shapeGeneration.test.ts',
-  // The 12 sharded sweep files (36 until #216 merged the three families into one walk). Worth only
-  // ~5s — but with the sweeps off they run ZERO tests (every one skips), so that is 5s for no
-  // assertions whatsoever. A CONVENTION, not an enumeration:
+  // The 48 sharded sweep files. ⚠️ The count has moved twice and in OPPOSITE directions: #216 merged
+  // three 12-file families into one (36 -> 12), then #223 sharded hintNotes, hintStories and
+  // hint.test.ts's two corpus tests (12 -> 48). With the sweeps off they run ZERO tests (every one
+  // skips), so that is several seconds for no assertions whatsoever. A CONVENTION, not an enumeration:
   // `tests/shard.ts` splits a corpus sweep across files because vitest parallelizes by FILE and
   // cannot split one `it()`, so anything `*.shard*` is a corpus walker by construction and a fourth
   // family sharded tomorrow is covered on the day it lands.
