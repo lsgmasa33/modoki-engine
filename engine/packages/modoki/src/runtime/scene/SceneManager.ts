@@ -1294,17 +1294,17 @@ function snapshotPersistentEntities(world: World, keptBaseGuids: Set<string> = n
     entriesById.set(id, entry);
   }
 
-  // Return in ECS-ID order, not BFS/subtree order (scene-loading.md,
-  // Phase 3 — the owner-chosen fix for the "carry" half of the entity-order churn
-  // Phase 0 measured). This array becomes `loadSceneFile`'s spawn order for these
-  // entities (SceneManager.ts's carry-respawn call passes it straight through as
-  // `data.entities`), which in turn is the array order `serializeScene` later
-  // reproduces on save. A COLD load spawns a scene's entities in FILE order —
-  // ecs ids are handed out sequentially by a fresh world's allocator — so id
-  // order and file order coincide there. Reproducing that same id order here
-  // means a base scene saved after being CARRIED across a swap comes out in the
-  // same order as one saved after a cold load, instead of BFS's subtree-grouped
-  // order (which regroups by root→children and doesn't match the file at all).
+  // Return in ECS-ID order, not BFS/subtree order (scene-loading.md, Phase 3 — the
+  // owner-chosen fix for the "carry" half of the entity-order churn Phase 0 measured).
+  // This array becomes `loadSceneFile`'s spawn order for these entities (the
+  // carry-respawn call below passes it straight through as `data.entities`).
+  //
+  // It no longer decides the SAVED order: `serializeScene` sorts into Hierarchy display
+  // order (parents first, siblings by sortOrder, guid tiebreak) regardless of how the
+  // scene was loaded (QA-HIER-0002), so a carried save and a cold-loaded save now agree
+  // by construction rather than by keeping this in step with the allocator. Kept as-is
+  // because spawn order is still the cheapest stable choice here and nothing gains from
+  // churning it.
   // Parent-before-child is NOT required: `loadSceneFile` spawns every entity in
   // pass 1, then resolves every `parentId` in pass 2, after the full array has
   // already been spawned — order-independent by construction.

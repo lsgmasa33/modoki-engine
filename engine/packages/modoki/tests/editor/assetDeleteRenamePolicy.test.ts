@@ -17,14 +17,14 @@ describe('deletionPathsFor — the sidecar rule', () => {
 
   it('trashes a BINARY asset\'s .meta.json, not just snapshots it', () => {
     // The regression: this list used to contain only the asset.
-    expect(deletionPathsFor('/a/hero.png', 'texture')).toEqual([
-      '/a/hero.png', '/a/hero.png.meta.json', '/a/hero.png.meta.local.json',
-    ]);
+    expect(deletionPathsFor('/a/hero.png', 'texture'))
+      .toEqual(['/a/hero.png', '/a/hero.png.meta.json', '/a/hero.png.meta.local.json']);
   });
 
-  it('also trashes the gitignored .meta.local.json half', () => {
-    // The second half of the same sidecar rule: the machine-local byte-stats file was
-    // stranded on every delete. Gitignored, so nothing ever surfaced the residue.
+  it('trashes the GITIGNORED .meta.local.json half too (QA-CTX-0005)', () => {
+    // The second regression in the same rule. `.meta.local.json` holds this machine's
+    // byte stats and is gitignored, so a stranded one never shows in `git status` —
+    // every binary delete left one behind, forever.
     expect(deletionPathsFor('/a/hero.png', 'texture')).toContain('/a/hero.png.meta.local.json');
   });
 
@@ -50,7 +50,7 @@ describe('deletionPathsFor — the sidecar rule', () => {
       '/m/rig.glb', '/m/rig.glb.meta.json', '/m/rig.glb.meta.local.json',
       '/m/rig.mesh.json',            // text — no sidecar
       '/m/rig.mat.json',             // text — no sidecar
-      // binary — both sidecar halves
+      // binary — BOTH sidecar halves
       '/m/rig_diffuse.png', '/m/rig_diffuse.png.meta.json', '/m/rig_diffuse.png.meta.local.json',
     ]);
   });

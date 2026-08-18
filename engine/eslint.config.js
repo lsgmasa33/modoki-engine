@@ -226,6 +226,12 @@ export default tseslint.config(
       '**/*.xcframework/**',
       '**/Pods/**',
       '**/DerivedData/**',
+      // Agent scratch — Claude Code's per-session git WORKTREES live here, each a full second
+      // copy of this repo (gitignored). Linting one means linting the whole engine twice, at a
+      // commit that is not the one you are working on: a stale worktree turned `npm run lint`
+      // red with 36 errors in code nobody on this branch had touched, and since lint is a
+      // `verify` leg that is the whole local gate going red for a directory that is not source.
+      '**/.claude/**',
     ],
   },
   // Base JS + TS recommended for every source file.

@@ -20,7 +20,7 @@ export { buildUiCreateSpecs, type UiPreset } from '../runtime/ui/uiAuthoring';
 export { enterPlay, stopPlay, pausePlay, resetPlayMode } from './scene/playMode';
 export {
   editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled,
-  withEditorActor, openActorLease, closeActorLease, ACTOR_LEASE_TTL_MS,
+  withEditorActor, openActorLease, closeActorLease, ACTOR_LEASE_TTL_MS, ACTOR_LEASE_GRACE_MS,
   waitForEditorJournal, type EditorEvent, type WaitForEditResult,
 } from './editorJournal';
 export {

@@ -259,7 +259,14 @@ export function removeTraitFromEntitiesWithUndo(entityIds: number[], meta: Trait
   const targets: { ref: EntityRef; data: Record<string, unknown> | null }[] = [];
   for (const id of entityIds) {
     const e = findEntity(id);
-    if (e && e.has(meta.trait)) targets.push({ ref: entityRef(id), data: readTraitData(id, meta) });
+    // readTraitDataFull + clone, for the SAME reason snapshotEntity uses them: readTraitData
+    // returns only the curated meta.fields subset, so removing an Animator and undoing came
+    // back with an EMPTY clip bank — the values this snapshot exists to restore were never
+    // captured. Sibling of QA-CTX-0003, found by its close-out sweep.
+    if (e && e.has(meta.trait)) {
+      const full = readTraitDataFull(id, meta);
+      targets.push({ ref: entityRef(id), data: full ? cloneTraitValues(full) : null });
+    }
   }
   if (targets.length === 0) return;
   const affectedScenes = resolveAffectedScenes(entityIds);
@@ -363,16 +370,14 @@ export function snapshotEntity(entityId: number): EntitySnapshot | null {
   for (const meta of getAllTraits()) {
     if (!entity.has(meta.trait)) continue;
     if (meta.category === 'tag') { traits.push({ meta, data: true }); }
-    else {
-      // readTraitDataFull, not the curated readTraitData: off-meta fields (Animator.clips /
-      // .clip, AnimationLibrary.animSets, SkinnedMeshRenderer.materials — anything a custom
-      // Inspector section owns and `fields` therefore omits) are real persistent state, and
-      // readTraitData drops them, so a duplicate/paste/delete-undo silently came back empty.
-      // cloneTraitValues because Full hands back LIVE references into the trait store — two
-      // entities sharing one array is the other half of this bug.
-      const data = readTraitDataFull(entityId, meta);
-      if (data) traits.push({ meta, data: cloneTraitValues(data) });
-    }
+    // readTraitDataFull, NOT readTraitData: the latter returns only the curated
+    // Inspector subset in `meta.fields`, so any persistent field a custom Inspector
+    // section owns (Animator.clips/clip, AudioSource.clips, AoS object fields) was
+    // silently DROPPED from the snapshot — a duplicate came back with an empty clip
+    // bank, and delete+undo lost it outright (QA-CTX-0003). cloneTraitValues because
+    // readTraitDataFull hands back LIVE references into the trait store: without it a
+    // duplicate would share the source's array and editing one would mutate the other.
+    else { const data = readTraitDataFull(entityId, meta); if (data) traits.push({ meta, data: cloneTraitValues(data) }); }
   }
   const childEntities = getAllEntities().filter(e => e.parentId === entityId);
   const children = childEntities.map(c => snapshotEntity(c.id)).filter((s): s is EntitySnapshot => s !== null);

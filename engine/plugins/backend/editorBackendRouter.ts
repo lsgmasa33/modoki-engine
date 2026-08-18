@@ -168,6 +168,7 @@ import {
 import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, type PrefabResolver } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { isGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
+import type { ErrorCode } from '../../tools/shared/mcpResult';
 import { getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData, type AssetSchemaType } from '../../packages/modoki/src/runtime/assets/assetSchemas';
 import { UNCLAMPED_OVERRIDES } from '../../packages/modoki/src/runtime/rendering/qualityTier';
 import { pruneOldTempFiles } from './tempFiles';
@@ -332,10 +333,12 @@ function writeDataUrlToTemp(dataUrl: unknown): string {
 /** Atomic JSON write: tmp file + rename. (Mirrors the scanner's helper; kept
  *  local to avoid an import cycle.) */
 function writeJsonAtomic(absPath: string, data: unknown): void {
-  // Create parents, like /api/write-file does. Without this, creating the first asset of a
-  // kind a project has never held (no `timelines/` folder yet) died on a bare ENOENT — the
-  // two write routes disagreed on whether a missing directory is the caller's problem.
-  fs.mkdirSync(path.dirname(absPath), { recursive: true });
+  // mkdir -p first, exactly as /api/write-file does. Without it /api/create-asset
+  // threw a raw ENOENT 500 whenever the target folder did not exist yet — while
+  // the sibling endpoint happily created it, so which of the two you called
+  // decided whether "write an asset into a new folder" worked (QA-CTX-0008).
+  const dir = path.dirname(absPath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const tmp = absPath + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
   fs.renameSync(tmp, absPath);
@@ -1565,6 +1568,7 @@ async function describeUnresolvedAgainstLiveWorld(
           const live = (await ctx.requestBrowser('apply-scene-ops', { ops }, 30_000)) as {
             ok: boolean; changed: number; errors: string[]; warnings: string[]; unresolved: EntityRef[];
             created?: Array<{ op: number; id: number; guid: string; name: string }>;
+            code?: ErrorCode;
           };
           // Manual-only: a live edit NEVER writes the file. `saved:false` is the truth for
           // every live call now, and the hint says how to persist — the field is kept (rather
@@ -1584,6 +1588,7 @@ async function describeUnresolvedAgainstLiveWorld(
             ...(live.created?.length ? { created: live.created } : {}),
             ...(live.changed > 0 ? { hint: 'applied to the LIVE world only — run modoki_save_all to write it to disk.' } : {}),
             ...(live.unresolved.length ? { unresolved: live.unresolved } : {}),
+            ...(live.code ? { code: live.code } : {}),
           });
         } catch (e) {
           // The live path itself failed (relay error mid-call, not "no editor") — this is NOT
@@ -1613,7 +1618,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // below) before writing — otherwise every setTrait through this route would
       // reintroduce an `id` field on EVERY entity, the exact diff noise Phase 3 removed.
       const backfilledIds = assignSyntheticEntityIds(scene);
-      const { changed, errors, warnings: opWarnings, unresolved, created } = applyOps(scene, ops);
+      const { changed, errors, warnings: opWarnings, unresolved, created, code: applyCode } = applyOps(scene, ops);
       // Surface BOTH the op-level warnings (dangling refs / orphaned parents from F5)
       // and the post-apply schema validation warnings.
       const schema = ctx.getSchema();
@@ -1670,6 +1675,7 @@ async function describeUnresolvedAgainstLiveWorld(
         ...(created?.length ? { created } : {}),
         ...(liveHint ? { hint: liveHint } : {}),
         ...(returnScene && changed > 0 ? { scene } : {}),
+        ...(applyCode ? { code: applyCode } : {}),
       });
     } catch (e) {
       return json({ error: e instanceof Error ? e.message : String(e) }, 500);

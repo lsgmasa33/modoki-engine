@@ -22,7 +22,7 @@ import { editorEmit } from '../editorJournal';
 import { captureInstanceOverrides, captureInstanceStructure, getPrefabSource, getCachedPrefabSync } from './prefab';
 import type { AddedEntity, NestedOverridePaths } from '../../runtime/loaders/loadSceneFile';
 import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, collectResourceRefsFromEntities } from '../../runtime/loaders/loadSceneFile';
-import { newGuid, isInternalAssetPath, isInternalFontPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
+import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
 import { isGuid } from '../../runtime/core/assetRefRules';
 import { clearAllSceneDirty, clearSceneDirty, dirtySceneGuidsSnapshot, isSceneDirty } from './sceneDirty';
 import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
@@ -385,6 +385,67 @@ export async function serializeScene(opts?: {
     return prefabRootInfo.has(cur) ? { topId: cur, path } : null;
   };
 
+  /** The order entities are WRITTEN in — the Hierarchy's display order, made fully
+   *  stable (QA-HIER-0002).
+   *
+   *  It used to be live-world iteration order, which follows runtime ECS ids. Those are
+   *  reassigned by a delete+undo (the entity respawns at a new id) or a duplicate+delete,
+   *  so the next save re-emitted IDENTICAL data in a different order. Measured on
+   *  `games/anim-bug`: same guid set, zero entities whose content differed, and
+   *  `main.scene.json` still MODIFIED — one entity had moved within the array. That is
+   *  semantically harmless (sortOrder carries the authored intent), and it is exactly the
+   *  CLAUDE.md #18 hazard: a running editor writing to `games/**` with a contentless diff
+   *  that rides into an unrelated commit because nobody reads it. It also makes
+   *  "git status is clean" unusable as a QA cleanup check for any case touching entity
+   *  lifecycle.
+   *
+   *  Parents before their children, siblings by `sortOrder` — i.e. what the Hierarchy
+   *  shows (the owner's call: match the file to the panel, so a scene diff is readable).
+   *  The tiebreak is the GUID, not the ecs id `buildEntityTree` uses: colliding
+   *  sortOrders are ordinary (legacy entities all sit at 0) and an id tiebreak would
+   *  reintroduce exactly the churn this removes. Name is the last resort, for the
+   *  un-guidable entity `guidForId` returns '' for.
+   *
+   *  This supersedes the Phase 3 (scene-loading.md) choice to reproduce ECS-ID order on
+   *  the carry-respawn path: the written order no longer depends on how the scene was
+   *  loaded at all, so a carried save and a cold-loaded save agree by construction rather
+   *  than by keeping two paths in step. */
+  const orderedInfos = ((): typeof entityInfos => {
+    const present = new Set(entityInfos.map((e) => e.id));
+    const childrenOf = new Map<number, typeof entityInfos>();
+    const roots: typeof entityInfos = [];
+    for (const info of entityInfos) {
+      // A parent outside this scene's slice (a base-owned parent, an excluded
+      // transient) makes the entity a root here — the same rule buildEntityTree uses.
+      if (info.parentId && present.has(info.parentId)) {
+        const list = childrenOf.get(info.parentId);
+        if (list) list.push(info); else childrenOf.set(info.parentId, [info]);
+      } else {
+        roots.push(info);
+      }
+    }
+    const bySortThenGuid = (a: typeof entityInfos[number], b: typeof entityInfos[number]) =>
+      a.sortOrder - b.sortOrder
+      || guidForId(a.id).localeCompare(guidForId(b.id))
+      || a.name.localeCompare(b.name);
+    const out: typeof entityInfos = [];
+    const visit = (list: typeof entityInfos) => {
+      for (const info of [...list].sort(bySortThenGuid)) {
+        out.push(info);
+        const kids = childrenOf.get(info.id);
+        if (kids) visit(kids);
+      }
+    };
+    visit(roots);
+    // Belt-and-braces: a parent cycle would strand entities. Append anything the walk
+    // did not reach rather than silently DROPPING it from the saved scene.
+    if (out.length !== entityInfos.length) {
+      const emitted = new Set(out.map((e) => e.id));
+      for (const info of entityInfos) if (!emitted.has(info.id)) out.push(info);
+    }
+    return out;
+  })();
+
   const nestedOverridesByTop = new Map<number, NestedOverridePaths>();
   for (const ni of nestedInstances) {
     const resolved = resolvePath(ni.rootId);
@@ -402,7 +463,7 @@ export async function serializeScene(opts?: {
     nestedOverridesByTop.set(resolved.topId, map);
   }
 
-  for (const info of entityInfos) {
+  for (const info of orderedInfos) {
     // Skip prefab children + structural additions — re-instantiated from the prefab
     if (prefabChildIds.has(info.id)) continue;
 
@@ -621,21 +682,7 @@ export async function serializeScene(opts?: {
  *  `overrides`, recursive `added` subtrees, and path-keyed `nestedOverrides` (F8).
  *  Exported for unit testing the full-coverage walk. */
 export function assertNoPathRefs(entry: SerializedEntity): void {
-  // Font ASSET fields (manifest-tracked GUID refs). `isInternalAssetPath` excludes font
-  // extensions on purpose — for `UIElement.fontFamily`, a CSS family name — which let a
-  // literal path in these two fields through every rejection site: the #53 class, a ref
-  // the build cannot see, failing only once shipped.
-  const FONT_REF_FIELDS = new Set(['Text2D.font', 'Text3D.font']);
   const flag = (field: string, v: unknown) => {
-    // `field` is a context-prefixed label (`overrides[5].Text2D.font`); match the tail.
-    const isFontField = FONT_REF_FIELDS.has(field.split('.').slice(-2).join('.'));
-    if (typeof v === 'string' && isFontField && isInternalFontPath(v)) {
-      console.error(
-        `[serialize] internal asset path in ${field} — font references must be GUIDs: ${v}\n` +
-        `  (import the font so it gets a manifest GUID; only UIElement.fontFamily takes a plain name)`,
-      );
-      return;
-    }
     if (typeof v === 'string' && isInternalAssetPath(v)) {
       console.error(
         `[serialize] internal asset path in ${field} — references must be GUIDs: ${v}\n` +

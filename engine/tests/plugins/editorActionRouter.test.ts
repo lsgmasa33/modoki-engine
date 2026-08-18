@@ -304,6 +304,28 @@ describe('/api/asset-schema + /api/asset-write (Phase C, host-side)', () => {
     });
   });
 
+  /** QA-CTX-0008 — /api/create-asset threw a raw ENOENT 500 when the target folder
+   *  did not exist, while its sibling /api/write-file mkdir -p'd happily. Which of
+   *  the two an agent happened to call decided whether creating an asset in a new
+   *  folder worked at all. */
+  describe('/api/create-asset into a folder that does not exist yet', () => {
+    let dir: string;
+    const ctx = () => makeCtx({ resolveAssetPath: (p: string) => path.join(dir, p.replace(/^\/games\/x\//, '')) });
+
+    beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-createasset-')); });
+    afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+
+    it('creates the parent directories rather than throwing ENOENT', async () => {
+      const r = (await post('/api/create-asset', {
+        type: 'material', path: '/games/x/new/deep/folder/hero.mat.json',
+      }, ctx())) as { status?: number; body?: { ok?: boolean; id?: string } };
+      expect(r.status ?? 200).toBe(200);
+      expect(r.body?.ok).toBe(true);
+      const written = JSON.parse(fs.readFileSync(path.join(dir, 'new/deep/folder/hero.mat.json'), 'utf-8'));
+      expect(written.id).toBe(r.body?.id);
+    });
+  });
+
   it('asset-write 400 on hard-invalid data (non-object)', async () => {
     const r = (await post('/api/asset-write', { path: '/games/x/a.mat.json', type: 'material', data: 5 }, makeCtx())) as { status?: number };
     expect(r.status).toBe(400);

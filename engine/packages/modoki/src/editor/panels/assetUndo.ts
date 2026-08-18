@@ -62,9 +62,15 @@ export function makeDuplicateUndo(results: DupResult[], refresh: () => void): Un
     undo: async () => {
       for (const { toPath } of results) {
         await deleteAssetFile(toPath);
-        // Drop the duplicate's sidecar too (binary assets carry import settings
-        // + GUID in a .meta.json the copy created).
-        if (!isTextAsset(toPath)) await deleteAssetFile(toPath + '.meta.json');
+        // Drop BOTH halves of the duplicate's sidecar pair: the committed `.meta.json`
+        // (import settings + GUID the copy created) and the gitignored machine-local
+        // `.meta.local.json` (byte stats). Dropping only the committed half left the local
+        // one on disk after every undone duplicate — the QA-CTX-0005 leak, in the flow that
+        // sweep did not reach. deleteAssetFile no-ops on a path that is not there.
+        if (!isTextAsset(toPath)) {
+          await deleteAssetFile(toPath + '.meta.json');
+          await deleteAssetFile(toPath + '.meta.local.json');
+        }
       }
       // The copy can be OPEN by now (duplicate → double-click the copy → ⌘Z), and a bound
       // editor would autosave it straight back (#186). makeDeleteUndo's `redo` needs no

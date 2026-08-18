@@ -47,6 +47,18 @@ describe('moveAssetFile', () => {
     expect(read('dst/a.png.meta.json')).toBe('{"id":"g1"}');
   });
 
+  it('carries the GITIGNORED .meta.local.json half along too (QA-CTX-0005)', () => {
+    // Both halves are written as a pair by writeMetaSidecar. Moving only the committed
+    // one stranded the local stats under the OLD filename and left the moved asset
+    // with none — invisible, because the file is gitignored.
+    write('src/a.png', 'X');
+    write('src/a.png.meta.json', '{"id":"g1"}');
+    write('src/a.png.meta.local.json', '{"bytes":42}');
+    moveAssetFile(abs('src/a.png'), abs('dst/a.png'));
+    expect(exists('src/a.png.meta.local.json')).toBe(false);
+    expect(read('dst/a.png.meta.local.json')).toBe('{"bytes":42}');
+  });
+
   it('moves a whole folder subtree (rename of a directory)', () => {
     write('old/x.png', '1');
     write('old/sub/y.png', '2');

@@ -29,8 +29,12 @@ const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  *  was passed through as if it were a usable URL. Found by the #123 close-out sweep — the
  *  same "a ref the guard cannot see" pattern, one layer down.
  *
- *  FONTS (.ttf/.otf/.woff/.woff2) stay excluded on purpose: `UIElement.fontFamily` is a CSS
- *  family name (or font path), not a manifest-asset GUID. */
+ *  FONTS (.ttf/.otf/.woff/.woff2) stay excluded from THIS predicate on purpose:
+ *  `UIElement.fontFamily` is a CSS family name (or font path), not a manifest-asset GUID, and
+ *  it is read straight into a CSS `font-family` style. But `Text2D.font` / `Text3D.font` ARE
+ *  manifest-tracked font-asset GUIDs, so a literal path there is the same #53 failure as
+ *  anywhere else — see `isInternalFontPath` below, which the FIELD-AWARE rejection sites use
+ *  alongside this one (QA-INSP-0004). */
 const JSON_ASSET_SUFFIXES = [
   'scene', 'atlas', 'mesh', 'mat', 'prefab', 'shader', 'particle',
   'animset', 'spriteanim', 'rig2d', 'anim', 'level', 'wave', 'timeline', 'court',
@@ -68,18 +72,25 @@ export function isInternalAssetPath(ref: string | undefined | null): boolean {
   return ref.startsWith('/') && ASSET_PATH_RE.test(ref);
 }
 
-/** Font files a literal path must be rejected for — but ONLY on a font ASSET field
- *  (`Text2D.font` / `Text3D.font`, which are manifest-tracked GUID refs), never on
- *  `UIElement.fontFamily`, which is a CSS family name. That field distinction is why
- *  fonts cannot simply join `BINARY_ASSET_EXTS` above: the extension alone cannot tell
- *  the two apart, so the CALLER has to say which kind of field it is holding. */
-const FONT_EXT_RE = /\.(?:ttf|otf|woff2?)$/i;
+/** Font-file suffixes. Split out from {@link isInternalAssetPath} rather than folded into it
+ *  because the answer depends on the FIELD, not the extension: the same `/…/Inter.ttf` is a
+ *  legitimate value for `UIElement.fontFamily` (a CSS family name or font path, never resolved
+ *  through the manifest) and an invalid one for `Text2D.font` / `Text3D.font` (manifest-tracked
+ *  font-asset GUIDs — `registerTraits.ts` declares the field's `accept` list and
+ *  `assetManifest.ts` lists 'font' among the asset types).
+ *
+ *  Before this existed a literal path typed into `Text2D.font` passed `resolveRef` unrejected
+ *  and with NO console error, unlike every other asset-ref field in the engine — a ref the
+ *  build cannot see, which fails only once you ship, because dev serves everything off disk
+ *  (QA-INSP-0004, the #53 class). */
+const FONT_EXTS = ['ttf', 'otf', 'woff', 'woff2'] as const;
+const FONT_PATH_RE = new RegExp(`\\.(?:${FONT_EXTS.join('|')})$`, 'i');
 
-/** Like {@link isInternalAssetPath} but for a font ASSET ref field. Kept separate so
- *  `UIElement.fontFamily` keeps passing a path/family name through untouched. */
+/** Returns true if `ref` is a project-internal FONT *path*. Only meaningful for a field that
+ *  holds a font-ASSET ref (`Text2D.font`, `Text3D.font`) — never for `UIElement.fontFamily`. */
 export function isInternalFontPath(ref: string | undefined | null): boolean {
   if (!ref) return false;
-  return ref.startsWith('/') && FONT_EXT_RE.test(ref);
+  return ref.startsWith('/') && FONT_PATH_RE.test(ref);
 }
 
 /** Generate a fresh UUID v4 string. (`crypto` is a global in both the browser

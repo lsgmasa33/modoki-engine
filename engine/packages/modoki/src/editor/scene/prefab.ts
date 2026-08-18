@@ -803,6 +803,36 @@ export function getOverrideValues(
   return result;
 }
 
+/** Build the `currentTraits` bag `getOverrideValues` compares against the prefab base.
+ *
+ *  `readTraitDataFull`, NOT `readTraitData`: the latter returns only the curated Inspector
+ *  subset in `meta.fields`, so every persistent field a custom Inspector section owns
+ *  (`Animator.clips`, `AudioSource.clips`) and every AoS field (`AnimationLibrary.animSets`,
+ *  `SkinnedMeshRenderer.materials`, `UIAction.onClickSet`) would be ABSENT from the
+ *  comparison — reported as "not overridden" whatever its value. Runtime-only read-back
+ *  fields are then stripped, or a live playhead would read as an override on every instance.
+ *
+ *  Shared rather than inlined because the Apply/Revert DIALOG built this bag with the
+ *  curated read while the serializer used the full one, so the dialog under-reported exactly
+ *  those fields and a user could not apply them (found by the QA-CTX-0003 close-out sweep —
+ *  the third site where that same substitution has bitten). One builder, one answer. */
+export function collectComparableTraits(
+  ecsId: number,
+  allTraits: TraitMeta[],
+): Record<string, Record<string, unknown>> {
+  const out: Record<string, Record<string, unknown>> = {};
+  for (const meta of allTraits) {
+    if (meta.name === 'PrefabInstance') continue;
+    const data = readTraitDataFull(ecsId, meta);
+    if (!data) continue;
+    for (const field of Object.keys(data)) {
+      if (isRuntimeOnlyField(meta, field)) delete data[field];
+    }
+    out[meta.name] = data;
+  }
+  return out;
+}
+
 /** Get overrides: fields that differ from the prefab source.
  *  Returns a set of "traitName.fieldName" strings for overridden fields. */
 export function getOverrides(
@@ -874,16 +904,7 @@ export function captureInstanceOverrides(
     // excluding it at the READ means no later path can resurrect it. Tags: the read
     // returns {} for a tag the entity has (null if absent), so an added tag shows up
     // as `{name: {}}`. See runtime/core/ecs/traitSchema.ts.
-    const currentTraits: Record<string, Record<string, unknown>> = {};
-    for (const meta of allTraits) {
-      if (meta.name === 'PrefabInstance') continue;
-      const data = readTraitDataFull(entity.id(), meta);
-      if (!data) continue;
-      for (const field of Object.keys(data)) {
-        if (isRuntimeOnlyField(meta, field)) delete data[field];
-      }
-      currentTraits[meta.name] = data;
-    }
+    const currentTraits = collectComparableTraits(entity.id(), allTraits);
 
     const diffs = getOverrideValues(localId, currentTraits, prefab);
     const markSet = getOverrideMarkSet(entity.id());

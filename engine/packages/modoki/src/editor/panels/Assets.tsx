@@ -738,6 +738,22 @@ export default function Assets() {
 
   useEffect(() => { refresh(); }, [refresh, assetsVersion]);
 
+  /** What the toolbar's Refresh button runs — NOT `refresh` directly.
+   *
+   *  `refresh` re-scans and repopulates THIS panel only. `assetsVersion` is the
+   *  editor-wide "assets changed" signal, and other views subscribe to it — the
+   *  Script tree re-fetches on it, and it is the only trigger it has. So a Refresh
+   *  that called `refresh` left a script added or deleted on disk invisible until
+   *  something unrelated (an asset save, a full editor reload) happened to bump the
+   *  version: the one affordance a human reaches for did not fix the one thing they
+   *  reached for it about (QA-EDITOR-0009).
+   *
+   *  Bumping the version is enough for this panel too — the effect above is keyed on
+   *  it — so this is a bump, not a bump PLUS a direct call, which would scan twice. */
+  const refreshAll = useCallback(() => {
+    useEditorStore.getState().refreshAssets();
+  }, []);
+
   // Derive the re-importable type set from the server registry once on mount, so
   // the per-row "Re-import" menu + recursive re-import count track what the server
   // can actually handle instead of a hardcoded client constant. (F9.)
@@ -1243,7 +1259,10 @@ export default function Assets() {
         const back: PathMove[] = [];
         for (const { from, to } of done) {
           if (op === 'cut') { if (await moveFileTo(to, from)) back.push({ from: to, to: from }); }
-          else { await deleteAsset(to); if (!isTextAsset(to)) await deleteAsset(to + '.meta.json'); }
+          // Both sidecar halves — the committed `.meta.json` AND the gitignored
+          // `.meta.local.json` — or undoing a paste leaves the local one behind
+          // forever (QA-CTX-0005). deleteAsset no-ops on a path that isn't there.
+          else { await deleteAsset(to); if (!isTextAsset(to)) { await deleteAsset(to + '.meta.json'); await deleteAsset(to + '.meta.local.json'); } }
         }
         if (op === 'cut') logBindingChanges(applyAssetPathMoves(back));
         else logBindingChanges(unbindDeletedAssetEditors(done.map(({ to }) => to)));
@@ -1709,12 +1728,7 @@ export default function Assets() {
         <div style={toolbarDividerStyle} />
         {/* — Scan / convert: Refresh, Re-import all (heavy → last) — */}
         <button
-          // Bump the STORE version rather than calling this panel's own refresh(): the
-          // effect below re-runs on assetsVersion, so this panel still rescans, and every
-          // other version-keyed consumer (the Script tree above all) refreshes with it. A
-          // bare refresh() left a script added or removed on disk invisible — and Refresh
-          // is the one affordance a human reaches for.
-          onClick={() => useEditorStore.getState().refreshAssets()}
+          onClick={refreshAll}
           disabled={loading}
           title="Scan public/ folder"
           data-ui-id="assets.toolbar.refresh" data-ui-kind="button" data-ui-label="refresh"

@@ -87,6 +87,9 @@ describe('addressing', () => {
     expect(r.ok).toBe(false);
     expect(r.error).toContain('2 entities are named');
     expect(r.error).toContain('address by guid');
+    // QA-TOOL-0003: the machine-readable twin of the same refusal — was REFUSED_BY_OP,
+    // indistinguishable from any other refusal without string-matching `error`.
+    expect(r.code).toBe('AMBIGUOUS');
   });
 
   it('resolves by id, but guid wins when both are given', () => {
@@ -98,8 +101,14 @@ describe('addressing', () => {
   });
 
   it('reports a miss as a result, never a throw', () => {
-    expect(resolveEntityPointReport({ guid: 'nope', surface: 'game-3d' })).toMatchObject({ ok: false, error: expect.stringContaining('no entity with guid') });
-    expect(resolveEntityPointReport({})).toMatchObject({ ok: false, error: expect.stringContaining('provide an entity') });
+    expect(resolveEntityPointReport({ guid: 'nope', surface: 'game-3d' })).toMatchObject({
+      ok: false, error: expect.stringContaining('no entity with guid'), code: 'NOT_FOUND',
+    });
+    // No `{guid}|{name}|{id}` at all is a different mistake (a malformed call, not "not found")
+    // and stays uncoded — the caller's REFUSED_BY_OP fallback is the honest answer for it.
+    const noSpec = resolveEntityPointReport({});
+    expect(noSpec).toMatchObject({ ok: false, error: expect.stringContaining('provide an entity') });
+    expect(noSpec.code).toBeUndefined();
   });
 });
 
@@ -252,6 +261,7 @@ describe('multi-surface entities', () => {
     expect(r.error).toMatch(/'scene-view'/);
     // The error must carry the fix, not just the complaint.
     expect(r.error).toMatch(/Pass surface:'game-3d'/);
+    expect(r.code).toBe('AMBIGUOUS_SURFACE');
   });
 
   it('REFUSES a 2D/3D aim with no surface even when only ONE surface has the entity', () => {
@@ -349,6 +359,7 @@ describe('multi-surface entities', () => {
     expect(r.error).toMatch(/rendered in 2 surfaces/);
     expect(r.error).toMatch(/scene-view/);
     expect(r.error).toMatch(/game-ui/);
+    expect(r.code).toBe('AMBIGUOUS_SURFACE');
   });
 
   it('aims in the surface the caller names, not the first in document order', () => {
@@ -405,6 +416,9 @@ describe('2D/3D entities with a pick provider (entity scope)', () => {
     expect(r.ok).toBe(false);
     expect(r.error).toContain('Wall');
     expect(r.error).toContain('allowOccluded:true'); // the escape hatch is discoverable from the error
+    // QA-TOOL-0003 — MEASURED live as the motivating bug: this refusal used to arrive as the
+    // generic REFUSED_BY_OP, indistinguishable from any other refusal without string-matching.
+    expect(r.code).toBe('OCCLUDED');
   });
 
   it('the SAME call with allowOccluded:true dispatches and reports what was actually hit', () => {

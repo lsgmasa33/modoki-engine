@@ -3145,6 +3145,31 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     }
 
     // Shared gizmo geometries (reused across entities)
+    /** Pose an ECS icon gizmo (light / particle emitter / environment / empty marker) from
+     *  the entity's WORLD transform.
+     *
+     *  Rotation is the part that was missing, and it is not cosmetic: TransformControls
+     *  derives LOCAL space from the attached object's world quaternion, so an icon left at
+     *  identity made `gizmoSpace:'local'` behave exactly like `'world'` for every
+     *  icon-represented entity. MEASURED on games/anim-bug (2026-08-18): with the Sun light
+     *  rotated 45deg about Y, the `gizmo3d:translate:x` handle sat at the IDENTICAL screen
+     *  position in both spaces (305.12574311218117), while a real mesh moved correctly
+     *  (177.46 world -> 179.53 local). QA-SVIEW-0003.
+     *
+     *  The frame-box, zone and camera gizmos already did this — these four sites simply
+     *  never got it. It is also more truthful on its own terms: a particle emitter's CONE
+     *  icon pointed +Y no matter which way the emitter faced.
+     *
+     *  `skipRotation` mirrors the camera pivot's guard: while THIS entity is mid-drag,
+     *  TransformControls owns the object's rotation and writing the ECS value back on top
+     *  of it every frame would fight the drag. */
+    const poseIconGizmo = (g: THREE.Object3D, id: number, gizmoDragging: boolean) => {
+      const wt = worldTransforms.get(id);
+      if (!wt) return;
+      g.position.set(wt.x, wt.y, wt.z);
+      if (!gizmoDragging) g.rotation.set(wt.rx, wt.ry, wt.rz);
+    };
+
     const GIZMO_SHAPES = {
       light: new THREE.OctahedronGeometry(0.25),
       environment: new THREE.SphereGeometry(0.2, 12, 12),
@@ -3617,8 +3642,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             ecsGizmos.set(envId, g);
           }
           if (ecsGizmos.has(envId)) {
-            const wt = worldTransforms.get(envId);
-            if (wt) ecsGizmos.get(envId)!.position.set(wt.x, wt.y, wt.z);
+            poseIconGizmo(ecsGizmos.get(envId)!, envId, gizmoEntityId === envId && !!(gizmo as { dragging?: boolean }).dragging);
           }
           // Editor background: show editor bg color when env doesn't show as background
           if (scene.environment && !env.showAsBackground) {
@@ -3652,8 +3676,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           }
           const g = ecsGizmos.get(id)!;
           ((g as THREE.Mesh).material as THREE.MeshBasicMaterial).color.setHex(light.color);
-          const wt = worldTransforms.get(id);
-          if (wt) g.position.set(wt.x, wt.y, wt.z);
+          poseIconGizmo(g, id, gizmoEntityId === id && !!(gizmo as { dragging?: boolean }).dragging);
           // Shadow-frustum viz: outline the shadow-camera coverage for a flagged
           // directional shadow-caster (single reusable box — one key light is typical).
           if (!sfShown && light.lightType === 'directional' && light.castShadow && light.showShadowFrustum) {
@@ -3690,8 +3713,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             scene.add(g);
             ecsGizmos.set(id, g);
           }
-          const wt = worldTransforms.get(id);
-          if (wt) ecsGizmos.get(id)!.position.set(wt.x, wt.y, wt.z);
+          poseIconGizmo(ecsGizmos.get(id)!, id, gizmoEntityId === id && !!(gizmo as { dragging?: boolean }).dragging);
         });
         // Remove icons for emitters deleted within the current scene.
         for (const id of particleGizmoIds) {
@@ -3911,6 +3933,11 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           const wt = worldTransforms.get(id);
           if (wt) {
             g.position.set(wt.x, wt.y, wt.z);
+            // Rotation too — see poseIconGizmo. (Scale below is bespoke here, so this site
+            // sets the pose inline rather than calling that helper.)
+            if (!(gizmoEntityId === id && (gizmo as { dragging?: boolean }).dragging)) {
+              g.rotation.set(wt.rx, wt.ry, wt.rz);
+            }
             // Size the marker by the entity's WORLD scale, so a heavily-scaled rig's
             // bones (model root ~0.0005 × armature 100× ≈ 0.05) get small joint markers
             // instead of fixed 0.3-unit boxes that dwarf the whole model. Plain empties

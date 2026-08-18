@@ -22,35 +22,6 @@ function base(): SerializedEntity {
   return { id: 1, name: 'e', traits: {} };
 }
 
-describe('assertNoPathRefs — font ASSET fields (Text2D/Text3D.font)', () => {
-  const FONT = '/assets/fonts/Inter.ttf';
-
-  it('flags a literal font path on Text2D.font', () => {
-    assertNoPathRefs({ ...base(), traits: { Text2D: { font: FONT } } });
-    expect(flaggedWith('Text2D.font')).toBe(true);
-  });
-
-  it('flags it on Text3D.font too', () => {
-    assertNoPathRefs({ ...base(), traits: { Text3D: { font: FONT } } });
-    expect(flaggedWith('Text3D.font')).toBe(true);
-  });
-
-  it('flags it inside a prefab override, not just at the top level', () => {
-    assertNoPathRefs({ ...base(), overrides: { 5: { Text2D: { font: FONT } } } });
-    expect(flaggedWith('Text2D.font')).toBe(true);
-  });
-
-  it('leaves UIElement.fontFamily alone — a CSS family name, not a manifest asset', () => {
-    assertNoPathRefs({ ...base(), traits: { UIElement: { fontFamily: FONT } } });
-    expect(err).not.toHaveBeenCalled();
-  });
-
-  it('passes a GUID font ref', () => {
-    assertNoPathRefs({ ...base(), traits: { Text2D: { font: '2aeb118a-5f36-41cc-8bb4-edc2ce19e042' } } });
-    expect(err).not.toHaveBeenCalled();
-  });
-});
-
 describe('assertNoPathRefs — full-coverage ref walk (F8)', () => {
   it('still flags a path ref in a top-level trait', () => {
     assertNoPathRefs({ ...base(), traits: { Renderable3D: { mesh: STRAY } } });

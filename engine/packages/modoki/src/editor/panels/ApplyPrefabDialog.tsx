@@ -11,6 +11,7 @@ import { useEditorStore } from '../store/editorStore';
 import {
   getPrefabSource,
   getOverrideValues,
+  collectComparableTraits,
   captureInstanceStructure,
   revertOverridesSelective,
   rebuildInstance,
@@ -80,14 +81,13 @@ function buildTree(rootInstanceId: number, prefab: PrefabFile): EntityNode[] {
     if (!localId) return;
     const ecsId = entity.id();
 
-    // Snapshot live trait data for comparison
-    const currentTraits: Record<string, Record<string, unknown>> = {};
-    for (const meta of allTraits) {
-      if (meta.name === 'PrefabInstance') continue;
-      if (meta.category === 'tag') continue;
-      const data = readTraitData(ecsId, meta);
-      if (data) currentTraits[meta.name] = data;
-    }
+    // Snapshot live trait data for comparison — through the SHARED builder the serializer
+    // uses. This built its own bag from `readTraitData` (the curated meta.fields subset), so
+    // an override on any field a custom Inspector section owns (Animator.clips) or any AoS
+    // field (SkinnedMeshRenderer.materials, AnimationLibrary.animSets) was absent from the
+    // comparison: the dialog reported it as un-overridden and the user could not apply it,
+    // while the scene serializer stored it correctly. QA-CTX-0003 close-out sweep.
+    const currentTraits = collectComparableTraits(ecsId, allTraits);
     const diffs = getOverrideValues(localId, currentTraits, prefab);
     if (Object.keys(diffs).length === 0) return;
 

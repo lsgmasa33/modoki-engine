@@ -19,16 +19,20 @@ export function createFolderAt(absPath: string): void {
   fs.mkdirSync(absPath, { recursive: true });
 }
 
-/** Move/rename a file (or folder) and carry its `.meta.json` sidecar along.
- *  Creates the destination directory if needed. Works for directories too
- *  (renameSync moves the whole subtree). */
+/** Move/rename a file (or folder) and carry BOTH halves of its sidecar pair along —
+ *  the committed `.meta.json` and the gitignored machine-local `.meta.local.json`
+ *  (see `meta-sidecar.ts`). Carrying only the committed half left the local one
+ *  stranded under the OLD filename and the moved asset with no byte stats
+ *  (QA-CTX-0005, sibling of the delete leak). Creates the destination directory if
+ *  needed. Works for directories too (renameSync moves the whole subtree). */
 export function moveAssetFile(absFrom: string, absTo: string): void {
   const destDir = path.dirname(absTo);
   if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
   fs.renameSync(absFrom, absTo);
-  const metaFrom = absFrom + '.meta.json';
-  const metaTo = absTo + '.meta.json';
-  if (fs.existsSync(metaFrom)) fs.renameSync(metaFrom, metaTo);
+  for (const suffix of ['.meta.json', '.meta.local.json']) {
+    const metaFrom = absFrom + suffix;
+    if (fs.existsSync(metaFrom)) fs.renameSync(metaFrom, absTo + suffix);
+  }
 }
 
 /** Build the platform-specific command + argv that moves one OR MANY files/folders

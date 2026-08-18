@@ -27,7 +27,8 @@
 import { getAllEntities, collectScreenBounds, pickAt, type BoundsSurface } from '@modoki/engine/runtime';
 import { describeElement, occlusionAt, resolveElementPoint } from './domResolve';
 import { uiNodesFor, namedUiSurface } from './uiSurface';
-import type { EntityPointSpec, EntityPointResolution, AimedAt, AimErrorCode } from './entityPointContract';
+import type { EntityPointSpec, EntityPointResolution, AimedAt } from './entityPointContract';
+import type { ErrorCode } from '../../tools/shared/mcpResult';
 
 export type { EntityPointSpec, EntityPointResolution } from './entityPointContract';
 
@@ -37,24 +38,24 @@ export type { EntityPointSpec, EntityPointResolution } from './entityPointContra
  *  ERROR, not a first-match: silently picking one of three entities called "Enemy" produces a
  *  successful-looking click on the wrong one, which is the entire class of bug this file exists
  *  to remove. */
-function resolveEntity(spec: EntityPointSpec): { info: ReturnType<typeof getAllEntities>[number] } | { error: string; errorCode?: AimErrorCode } {
+function resolveEntity(spec: EntityPointSpec): { info: ReturnType<typeof getAllEntities>[number] } | { error: string; code?: ErrorCode } {
   const all = getAllEntities();
   if (spec.guid) {
     const hit = all.find((e) => e.guid === spec.guid);
-    return hit ? { info: hit } : { error: `no entity with guid ${JSON.stringify(spec.guid)}`, errorCode: 'NOT_FOUND' };
+    return hit ? { info: hit } : { error: `no entity with guid ${JSON.stringify(spec.guid)}`, code: 'NOT_FOUND' };
   }
   if (spec.name) {
     const hits = all.filter((e) => e.name === spec.name);
-    if (hits.length === 0) return { error: `no entity named ${JSON.stringify(spec.name)}`, errorCode: 'NOT_FOUND' };
+    if (hits.length === 0) return { error: `no entity named ${JSON.stringify(spec.name)}`, code: 'NOT_FOUND' };
     if (hits.length > 1) {
       const guids = hits.map((e) => e.guid || `id:${e.id}`).join(', ');
-      return { error: `${hits.length} entities are named ${JSON.stringify(spec.name)} (${guids}) — address by guid`, errorCode: 'AMBIGUOUS' };
+      return { error: `${hits.length} entities are named ${JSON.stringify(spec.name)} (${guids}) — address by guid`, code: 'AMBIGUOUS' };
     }
     return { info: hits[0] };
   }
   if (typeof spec.id === 'number') {
     const hit = all.find((e) => e.id === spec.id);
-    return hit ? { info: hit } : { error: `no entity with id ${spec.id}`, errorCode: 'NOT_FOUND' };
+    return hit ? { info: hit } : { error: `no entity with id ${spec.id}`, code: 'NOT_FOUND' };
   }
   return { error: 'provide an entity {guid} | {name} | {id}' };
 }
@@ -134,15 +135,11 @@ function* sampleAimPoints(x: number, y: number, w: number, h: number): Generator
  *  a 400). Mirrors `resolveDomPointReport`. */
 export function resolveEntityPointReport(spec: EntityPointSpec): EntityPointResolution {
   const r = resolveEntity(spec ?? {});
-  if ('error' in r) return { ok: false, error: r.error, ...(r.errorCode ? { errorCode: r.errorCode } : {}) };
+  if ('error' in r) return { ok: false, error: r.error, ...(r.code ? { code: r.code } : {}) };
   const { info } = r;
   const entity = { id: info.id, name: info.name, guid: info.guid, layer: info.layer ?? null };
   const matched = `${info.name || '(unnamed)'}${info.guid ? ` [${info.guid}]` : ` (id:${info.id})`}`;
-  // `errorCode` is what an agent BRANCHES on — an ambiguous aim has a mechanical fix (re-aim by
-  // guid, and the guids are in the message) that an occluded one does not. The prose stays the
-  // explanation; the code is the machine-readable half.
-  const fail = (error: string, errorCode?: AimErrorCode): EntityPointResolution =>
-    ({ ok: false, error, entity, matched, ...(errorCode ? { errorCode } : {}) });
+  const fail = (error: string, code?: ErrorCode): EntityPointResolution => ({ ok: false, error, entity, matched, ...(code ? { code } : {}) });
 
   // ── UI: the entity is a DOM node — reuse the selector path's recipe verbatim. ──
   if (info.layer === 'ui') {
@@ -173,7 +170,7 @@ export function resolveEntityPointReport(spec: EntityPointSpec): EntityPointReso
         return fail(`entity ${matched} has no DOM node in surface '${spec.surface}' — it is rendered in ${opts.join(', ')}`);
       }
       if (wanted.length > 1) {
-        return fail(`entity ${matched} has ${wanted.length} DOM nodes in surface '${spec.surface}' — cannot choose between them`, 'AMBIGUOUS');
+        return fail(`entity ${matched} has ${wanted.length} DOM nodes in surface '${spec.surface}' — cannot choose between them`);
       }
       chosen = wanted[0];
     } else if (spec.surface && namedUiSurface(chosen.surface) !== spec.surface) {

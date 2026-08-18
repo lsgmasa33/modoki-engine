@@ -16,7 +16,7 @@
  *  L0 and may import nothing (docs/architecture-layers.md), while the classifier is L3
  *  `loaders/`. So the copy is forced, and this test is what keeps it honest. */
 import { describe, it, expect } from 'vitest';
-import { isInternalAssetPath } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { isInternalAssetPath, isInternalFontPath } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import {
   JSON_ASSET_SUFFIX_TYPE, BINARY_EXT_TYPE,
 } from '../../packages/modoki/src/runtime/loaders/assetTypeClassifier';
@@ -54,6 +54,29 @@ describe('isInternalAssetPath covers every managed asset kind', () => {
     for (const ext of FONT_EXTS) {
       expect(isInternalAssetPath(`/games/x/assets/fonts/thing${ext}`), ext).toBe(false);
     }
+  });
+
+  /** QA-INSP-0004 — the exclusion above is right for `UIElement.fontFamily` and WRONG for
+   *  `Text2D.font` / `Text3D.font`, which are manifest-tracked font-asset GUIDs. The answer
+   *  depends on the FIELD, not the extension, so it is a second predicate rather than a
+   *  widening of the first — and the field-aware rejection sites (resolveRef, the scene
+   *  validator, diagnose) ask both. */
+  describe('isInternalFontPath — the field-aware other half', () => {
+    it('claims an internal font path for every font extension', () => {
+      for (const ext of FONT_EXTS) {
+        expect(isInternalFontPath(`/games/x/assets/fonts/thing${ext}`), ext).toBe(true);
+      }
+    });
+
+    it('claims nothing else — not a GUID, a URL, a bare filename, or another asset kind', () => {
+      expect(isInternalFontPath('7b5534ab-5bc6-4082-a813-a291f3a69e54')).toBe(false);
+      expect(isInternalFontPath('https://fonts.example.com/Inter.woff2')).toBe(false);
+      expect(isInternalFontPath('Inter.ttf')).toBe(false);          // no leading slash
+      expect(isInternalFontPath('Helvetica Neue')).toBe(false);     // a CSS family name
+      expect(isInternalFontPath('/games/x/assets/tex/hero.png')).toBe(false);
+      expect(isInternalFontPath('')).toBe(false);
+      expect(isInternalFontPath(undefined)).toBe(false);
+    });
   });
 
   it('needs the leading slash — a bare filename or a URL is not an internal path', () => {

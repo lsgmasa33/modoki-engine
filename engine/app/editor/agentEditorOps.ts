@@ -16,6 +16,7 @@
  *  agent's edits are undoable too. */
 
 import * as THREE from 'three';
+import type { ErrorCode } from '../../tools/shared/mcpResult';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
 import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor, inferAssetDefType } from '../debug/agentBridge';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
@@ -463,21 +464,21 @@ function worldFieldsToLocalLive(id: number, fields: Record<string, unknown>): { 
  *  Inside a batch there is no intermediate response in which to notice, and the entity-aimed input
  *  path already refuses exactly this (see `entityResolve.ts`) — so the two halves of the agent
  *  surface disagreed about whether an ambiguous name is addressable. It is not. */
-function resolveLiveEntityRef(ref: MutateEntityRef | undefined): { id: number } | { error: string } {
+function resolveLiveEntityRef(ref: MutateEntityRef | undefined): { id: number } | { error: string; code?: ErrorCode } {
   if (!ref) return { error: 'no entity ref given — pass {guid} | {name} | {id}' };
   if (ref.guid) {
     const e = findEntityByGuid(ref.guid);
-    return e ? { id: e.id() } : { error: `no LIVE entity with guid ${JSON.stringify(ref.guid)}` };
+    return e ? { id: e.id() } : { error: `no LIVE entity with guid ${JSON.stringify(ref.guid)}`, code: 'NOT_FOUND' };
   }
   if (ref.id != null) {
-    return findEntity(ref.id) ? { id: ref.id } : { error: `no LIVE entity with id ${ref.id}` };
+    return findEntity(ref.id) ? { id: ref.id } : { error: `no LIVE entity with id ${ref.id}`, code: 'NOT_FOUND' };
   }
   if (ref.name) {
     const hits = getAllEntities().filter((en) => en.name === ref.name);
-    if (hits.length === 0) return { error: `no LIVE entity named ${JSON.stringify(ref.name)}` };
+    if (hits.length === 0) return { error: `no LIVE entity named ${JSON.stringify(ref.name)}`, code: 'NOT_FOUND' };
     if (hits.length > 1) {
       const which = hits.map((e) => e.guid || `id:${e.id}`).join(', ');
-      return { error: `${hits.length} LIVE entities are named ${JSON.stringify(ref.name)} (${which}) — address by guid` };
+      return { error: `${hits.length} LIVE entities are named ${JSON.stringify(ref.name)} (${which}) — address by guid`, code: 'AMBIGUOUS' };
     }
     return { id: hits[0].id };
   }
@@ -506,6 +507,7 @@ const LIVE_CORE_TRAITS = new Set(['Transform', 'EntityAttributes']);
 async function applySceneOpsLive(ops: MutateOp[]): Promise<{
   changed: number; errors: string[]; warnings: string[]; unresolved: MutateEntityRef[];
   created: Array<{ op: number; id: number; guid: string; name: string }>;
+  code?: ErrorCode;
 }> {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -515,6 +517,11 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
   // name, which this surface refuses when the name is ambiguous.
   const created: Array<{ op: number; id: number; guid: string; name: string }> = [];
   let changed = 0;
+  // FIRST resolveLiveEntityRef failure's machine code, if it had one (NOT_FOUND/AMBIGUOUS) — a
+  // single-op call (the common case: modoki_set_transform/tap) needs its refusal's code to
+  // survive to the HTTP boundary, and the first one is the one that actually blocked the op the
+  // caller most likely cares about.
+  let code: ErrorCode | undefined;
   const allTraitsList = getAllTraits();
 
   await runAsCompositeAction({ label: `Mutate Scene (${ops.length} op${ops.length === 1 ? '' : 's'})`, kind: '!mutate' }, () => {
@@ -524,7 +531,7 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
       try {
         if (op.op === 'setTrait') {
           const resolved = resolveLiveEntityRef(op.entity);
-          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); continue; }
+          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); if (code === undefined) code = resolved.code; continue; }
           const id = resolved.id;
           if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
           const meta = allTraitsList.find((t) => t.name === op.trait);
@@ -563,7 +570,7 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
           }
         } else if (op.op === 'removeTrait') {
           const resolved = resolveLiveEntityRef(op.entity);
-          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); continue; }
+          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); if (code === undefined) code = resolved.code; continue; }
           const id = resolved.id;
           if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
           if (LIVE_CORE_TRAITS.has(op.trait)) { errors.push(`${where}: cannot remove core trait '${op.trait}'`); continue; }
@@ -606,7 +613,7 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
           created.push({ op: i, id: newId, guid: ensureGuid(newId), name: op.name ?? 'New Entity' });
         } else if (op.op === 'removeEntity') {
           const resolved = resolveLiveEntityRef(op.entity);
-          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); continue; }
+          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); if (code === undefined) code = resolved.code; continue; }
           const id = resolved.id;
           deleteEntitiesWithUndo([id]);
           changed++;
@@ -619,7 +626,7 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
     }
   });
 
-  return { changed, errors, warnings, unresolved, created };
+  return { changed, errors, warnings, unresolved, created, ...(code ? { code } : {}) };
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────
@@ -1235,9 +1242,9 @@ export function registerEditorAgentOps(): void {
   registerAgentOp('apply-scene-ops', async (params) => {
     const p = (params ?? {}) as { ops?: MutateOp[] };
     if (!Array.isArray(p.ops) || p.ops.length === 0) throw new Error('apply-scene-ops requires a non-empty { ops } array');
-    const { changed, errors, warnings, unresolved, created } = await applySceneOpsLive(p.ops);
+    const { changed, errors, warnings, unresolved, created, code } = await applySceneOpsLive(p.ops);
     return { ok: errors.length === 0, changed, errors, warnings, unresolved, saved: false,
-      ...(created.length ? { created } : {}) };
+      ...(created.length ? { created } : {}), ...(code ? { code } : {}) };
   });
 
   // ── Prefab ops ──

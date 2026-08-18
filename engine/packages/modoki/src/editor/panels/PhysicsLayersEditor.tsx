@@ -21,18 +21,6 @@ function normalize(value: unknown): PhysicsLayersValue {
   return { layers, collisionMatrix: matrix };
 }
 
-/** Append a layer that collides with everything, keeping the matrix SYMMETRIC.
- *
- *  The new row is all-ones, so every EXISTING row must gain the new layer's bit too —
- *  otherwise a project whose matrix was customized (not all-ones) ends up asymmetric,
- *  and the runtime's `symmetrize()` silently ORs the gap closed on load, so the grid
- *  shown right after "+ Add layer" is not what the runtime will do once saved. Pure —
- *  exported for unit testing. */
-export function appendLayerRow(collisionMatrix: number[]): number[] {
-  const bit = 1 << collisionMatrix.length; // the new layer's index
-  return [...collisionMatrix.map((row) => (row | bit) & ALL), ALL];
-}
-
 /** Drop bit k from a 16-bit mask and shift higher bits down one (layer removal). */
 function removeBit(v: number, k: number): number {
   const low = v & ((1 << k) - 1);
@@ -79,10 +67,9 @@ export default function PhysicsLayersEditor({ value, onChange }: { value: unknow
 
   const addLayer = () => {
     if (layers.length >= MAX_LAYERS) return;
-    // New layer collides with everything by default. Existing rows only have its bit
-    // set for free when the matrix is untouched all-ones — a customized matrix needs
-    // the bit ORed in explicitly, or the result is asymmetric.
-    emit([...layers, uniqueName()], appendLayerRow(collisionMatrix));
+    // New layer collides with everything by default; existing rows already have its
+    // bit set (defaults are all-ones), and the new row is all-ones too → symmetric.
+    emit([...layers, uniqueName()], [...collisionMatrix, ALL]);
   };
 
   const removeLayer = (k: number) => {

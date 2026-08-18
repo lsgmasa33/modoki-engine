@@ -130,6 +130,21 @@ export function createToolContext(config: { backend: string; token?: string }): 
         });
   }
 
+  /** A specific code the BACKEND supplied beats one derived from the HTTP status. Three of the
+   *  closed set (`AMBIGUOUS`/`AMBIGUOUS_SURFACE`/`OCCLUDED`) are refusals a route can name
+   *  precisely — measured live: `modoki_set_transform {entity:{name:'DUP_probe'}}` against two
+   *  same-named entities came back as the generic `REFUSED_BY_OP`, indistinguishable from any
+   *  other refusal without string-matching prose. `fallback` is whatever this call site would
+   *  have used anyway, so an ordinary body with no `code` (or a junk value that isn't in the
+   *  closed set) is unaffected. */
+  function codeFromBody(body: unknown, fallback: ErrorCode): ErrorCode {
+    if (body && typeof body === 'object') {
+      const c = (body as { code?: unknown }).code;
+      if (typeof c === 'string' && (ERROR_CODES as readonly string[]).includes(c)) return c as ErrorCode;
+    }
+    return fallback;
+  }
+
   /** A backend HTTP failure, as a §5 envelope. One builder so every route reports a 4xx/5xx the
    *  same way — the audit found `backend ${status}: ${JSON.stringify(body)}` repeated at six sites
    *  and nowhere did it say what the caller should do next. */
@@ -167,9 +182,10 @@ export function createToolContext(config: { backend: string; token?: string }): 
     // discriminator than a structured flag would be, so both hosts should grow one — but this is
     // the seam that must not be WRONG in the meantime, and both strings are ours.
     const routeMissing = status === 404 && (!detail || /no backend route for|no such API route/i.test(detail));
-    const code: ErrorCode = bodyCode(body) ?? (status === 404
+    const statusCode: ErrorCode = status === 404
       ? (routeMissing ? 'NOT_AVAILABLE_HERE' : 'NOT_FOUND')
-      : status >= 500 ? 'NOT_AVAILABLE_HERE' : 'REFUSED_BY_OP');
+      : status >= 500 ? 'NOT_AVAILABLE_HERE' : 'REFUSED_BY_OP';
+    const code = codeFromBody(body, statusCode);
     return fail({
       code,
       what,
@@ -183,20 +199,6 @@ export function createToolContext(config: { backend: string; token?: string }): 
           ? { options: ['the backend belongs to a DIFFERENT editor/project (C6) — call modoki_identity, then point MODOKI_BACKEND at your own editor'] }
           : {}),
     });
-  }
-
-  /** A refusal the BACKEND already classified. The aim resolver knows the difference between
-   *  "that name matches three entities", "say which surface" and "something is in front of it" —
-   *  and those are the documented codes an agent branches on (docs/mcp-tool-conventions.md §5).
-   *  They were never emitted: everything arrived as the generic REFUSED_BY_OP, so the only way to
-   *  tell an ambiguous aim from an occluded one was to string-match the prose. Trust the body's
-   *  `errorCode` only when it is IN the closed set — an unknown string is not a code.
-   *  `engine/tests/tools/mcpErrorCodeCoverage.test.ts` keeps the two ends in step. */
-  function bodyCode(body: unknown): ErrorCode | null {
-    const raw = body && typeof body === 'object' ? (body as { errorCode?: unknown }).errorCode : undefined;
-    return typeof raw === 'string' && (ERROR_CODES as readonly string[]).includes(raw)
-      ? (raw as ErrorCode)
-      : null;
   }
 
   /** V3 — a missing `/api` route on the dev server falls through to the SPA and answers **200 with
@@ -276,7 +278,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
         const failure = isFailureBody(body);
         if (failure) {
           return fail({
-            code: bodyCode(body) ?? 'REFUSED_BY_OP',
+            code: codeFromBody(body, 'REFUSED_BY_OP'),
             what: `GET ${path} on the editor backend`,
             why: failure.split('\n\nfull response:')[0],
             got: body,
@@ -330,7 +332,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
       const failure = isFailureBody(body);
       return failure
         ? fail({
-            code: bodyCode(body) ?? 'REFUSED_BY_OP',
+            code: codeFromBody(body, 'REFUSED_BY_OP'),
             what: label,
             why: failure.split('\n\nfull response:')[0],
             got: body,

@@ -99,29 +99,37 @@ export function planImports(
  *  standing up fetch + the backend.
  *
  *  - The asset itself always goes first, so an undo restores in the original order.
- *  - A BINARY asset also drops its `.meta.json` (GUID + import settings — both
- *    dangle if lost across a delete/undo) AND its `.meta.local.json` (the gitignored
- *    machine-local byte-stats half — see plugins/meta-sidecar.ts). The local half was
- *    missed, so every delete stranded one: gitignored, so it never showed in
- *    `git status`, harmless individually and unbounded over time. Text assets carry
- *    their id inline and have no sidecar.
+ *  - A BINARY asset also drops BOTH sidecar halves: the committed `.meta.json`
+ *    (GUID + import settings — both dangle if lost across a delete/undo) and the
+ *    gitignored `.meta.local.json` (this machine's byte-stats; see
+ *    `engine/plugins/meta-sidecar.ts`). Missing the local half left a file on disk
+ *    after every delete, forever — invisible to `git status` because it is
+ *    gitignored, and unbounded over time (QA-CTX-0005). Text assets carry their id
+ *    inline and have no sidecar.
  *  - A MODEL additionally drops everything it generated (meshes / materials /
  *    textures) and each generated BINARY file's own sidecar.
  *
  *  The backend skips paths that no longer exist, so listing a maybe-absent sidecar
  *  is harmless — which is why this can be a pure list rather than an existence
  *  check per path. */
+/** Both halves of a binary asset's sidecar pair: the committed `.meta.json` and
+ *  the gitignored machine-local `.meta.local.json`. They are written as a pair by
+ *  `writeMetaSidecar`, so anything that moves or removes one must handle both. */
+function sidecarsFor(assetPath: string): string[] {
+  return [assetPath + '.meta.json', assetPath + '.meta.local.json'];
+}
+
 export function deletionPathsFor(
   assetPath: string,
   assetType: string,
   generated?: { meshes?: string[]; materials?: string[]; textures?: string[] } | null,
 ): string[] {
   const paths: string[] = [assetPath];
-  if (!isTextAsset(assetPath)) paths.push(assetPath + '.meta.json', assetPath + '.meta.local.json');
+  if (!isTextAsset(assetPath)) paths.push(...sidecarsFor(assetPath));
   if (assetType === 'model' && generated) {
     for (const f of [...(generated.meshes ?? []), ...(generated.materials ?? []), ...(generated.textures ?? [])]) {
       paths.push(f);
-      if (!isTextAsset(f)) paths.push(f + '.meta.json', f + '.meta.local.json');
+      if (!isTextAsset(f)) paths.push(...sidecarsFor(f));
     }
   }
   return paths;

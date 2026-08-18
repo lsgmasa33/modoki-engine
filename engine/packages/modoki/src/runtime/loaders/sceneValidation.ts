@@ -12,7 +12,7 @@
  *  trait registry, structural + GUID-reference checks still run; trait/field
  *  type checks are skipped (reported once as an info note by the caller). */
 
-import { isGuid, isExternalUrl, isInternalAssetPath } from '../core/assetRefRules';
+import { isGuid, isExternalUrl, isInternalAssetPath, isInternalFontPath } from '../core/assetRefRules';
 import { isSizeInert } from '../ui/anchorLayout';
 
 /** Asset-reference fields, keyed by the trait they live on. A value in one of
@@ -233,7 +233,11 @@ export function validateSceneData(data: unknown, schema?: SceneSchema, getPrefab
           if (typeof v !== 'string' || v === '') continue;
           if (traitName === 'Renderable2D' && field === 'sprite' && PRIMITIVE_SPRITES.has(v)) continue;
           if (isGuid(v) || isExternalUrl(v)) continue;
-          if (isInternalAssetPath(v)) {
+          // Every field in this registry holds a manifest-asset GUID, `Text2D.font` /
+          // `Text3D.font` included — so a font PATH is a literal-path violation here, even
+          // though isInternalAssetPath excludes font extensions for fontFamily's sake
+          // (which is not in this registry). QA-INSP-0004.
+          if (isInternalAssetPath(v) || isInternalFontPath(v)) {
             warnings.push(
               `${label}.${traitName}.${field}: internal asset path '${v}' — references must be a GUID (use the asset's id / .meta.json sidecar)`,
             );

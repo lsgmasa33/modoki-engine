@@ -21,6 +21,9 @@ const Health = trait({ hp: 100 });
 // AoS trait with a map field (clips) NOT declared in meta.fields — mirrors SpriteAnimator,
 // exercising the readTraitDataFull fallback path in writeTraitFieldsPerEntityWithUndo.
 const SpriteAnim = trait(() => ({ clips: {} as Record<string, any>, clip: '' as string, time: 0, playing: true }));
+// SoA trait whose persistent `clips`/`clip` are owned by a custom Inspector section and so
+// are NOT in meta.fields — exactly the real Animator's shape (QA-CTX-0003).
+const AnimBank = trait({ clips: '[]' as string, clip: '' as string, time: 0 });
 const PrefabInstance = trait({ source: '', localId: 0, rootInstanceId: 0, parentLocalId: 0 });
 
 let testWorld: ReturnType<typeof createWorld>;
@@ -70,6 +73,8 @@ const traitDefs = [
   { name: 'Health', trait: Health, category: 'component' as const, fields: { hp: { type: 'number' } } },
   // Only scalar fields declared; `clips`/`clip` are intentionally omitted (custom section owns them).
   { name: 'SpriteAnim', trait: SpriteAnim, category: 'component' as const, fields: { time: { type: 'number' }, playing: { type: 'boolean' } } },
+  // Same deal, SoA: only `time` is declared; `clips`/`clip` persist but are off-meta.
+  { name: 'AnimBank', trait: AnimBank, category: 'component' as const, fields: { time: { type: 'number' } } },
   {
     name: 'PrefabInstance', trait: PrefabInstance, category: 'component' as const,
     fields: {
@@ -294,6 +299,34 @@ describe('snapshotEntity', () => {
     expect(snapshot!.children[0].id).toBe(child.id());
   });
 
+  // QA-CTX-0003 — snapshotEntity read the CURATED `meta.fields` subset, so any
+  // persistent field a custom Inspector section owns (Animator.clips/clip) was dropped
+  // from every snapshot: a duplicate came back with an empty clip bank, and delete+undo
+  // lost it outright. These pin the full-schema read on both trait shapes.
+  it('captures a persistent field that is NOT declared in meta.fields (SoA, e.g. Animator.clips)', async () => {
+    const { snapshotEntity } = await getModule();
+    const entity = spawnEntity('Rigged');
+    entity.add(AnimBank({ clips: '[{"name":"default","clip":"guid-1"}]', clip: 'default', time: 0 }));
+
+    const snap = snapshotEntity(entity.id())!;
+    const bank = snap.traits.find(t => t.meta.name === 'AnimBank')!.data as Record<string, unknown>;
+    expect(bank.clips).toBe('[{"name":"default","clip":"guid-1"}]');
+    expect(bank.clip).toBe('default');
+  });
+
+  it('captures an off-meta AoS field and CLONES it (no shared reference with the live trait)', async () => {
+    const { snapshotEntity } = await getModule();
+    const entity = spawnEntity('Sprite');
+    entity.add(SpriteAnim({ clips: { idle: { frames: [0, 1] } }, clip: 'idle', time: 0, playing: true }));
+
+    const snap = snapshotEntity(entity.id())!;
+    const data = snap.traits.find(t => t.meta.name === 'SpriteAnim')!.data as Record<string, any>;
+    expect(data.clips).toEqual({ idle: { frames: [0, 1] } });
+    // Mutating the live trait must not reach through into the snapshot.
+    entity.get(SpriteAnim)!.clips.idle.frames.push(2);
+    expect(data.clips.idle.frames).toEqual([0, 1]);
+  });
+
   it('returns null for non-existent entity', async () => {
     const { snapshotEntity } = await getModule();
     expect(snapshotEntity(99999)).toBeNull();
@@ -441,6 +474,20 @@ describe('createEntitySubtreeWithUndo', () => {
 });
 
 describe('duplicateEntity', () => {
+  // QA-CTX-0003 — the copy came back with an EMPTY clip bank, because snapshotEntity
+  // read only the curated meta.fields subset. Every other field round-tripped, which is
+  // why a green suite sat on top of it: no fixture entity carried an off-meta field.
+  it('carries an off-meta persistent field (Animator.clips shape) onto the copy', async () => {
+    const { duplicateEntity } = await getModule();
+    const original = spawnEntity('Rigged');
+    original.add(AnimBank({ clips: '[{"name":"default","clip":"guid-1"}]', clip: 'default', time: 0 }));
+
+    const newId = duplicateEntity(original.id(), vi.fn())!;
+    const copy = entityIndex.get(newId);
+    expect(copy.get(AnimBank).clips).toBe('[{"name":"default","clip":"guid-1"}]');
+    expect(copy.get(AnimBank).clip).toBe('default');
+  });
+
   it('duplicates an entity into the same parent and selects the copy', async () => {
     const { duplicateEntity } = await getModule();
     const parent = spawnEntity('Parent');
@@ -460,25 +507,6 @@ describe('duplicateEntity', () => {
     expect(copyParent).toBe(parent.id());
     expect(pushedActions).toHaveLength(1);
     expect(pushedActions[0].label).toBe('Duplicate Entity');
-  });
-
-  it('carries OFF-META fields (Animator.clips class) onto the copy, unaliased', async () => {
-    // snapshotEntity read the curated meta.fields only, so a field a custom Inspector
-    // section owns — Animator.clips here, mirrored by SpriteAnim.clips/clip — came back
-    // empty on the duplicate. Deep-cloned, so editing the copy cannot reach the source.
-    const { duplicateEntity } = await getModule();
-    const original = spawnEntity('Animated');
-    original.add(SpriteAnim({ clips: { default: { clip: '2aeb118a', frames: [0, 1, 2] } }, clip: 'default', time: 0, playing: true }));
-
-    const newId = duplicateEntity(original.id(), vi.fn())!;
-    const copy = entityIndex.get(newId);
-    const copied = copy.get(SpriteAnim);
-    expect(copied.clip).toBe('default');
-    expect(copied.clips.default).toEqual({ clip: '2aeb118a', frames: [0, 1, 2] });
-
-    // Not the same object: mutating the copy must not touch the source.
-    copied.clips.default.clip = 'mutated';
-    expect(original.get(SpriteAnim)!.clips.default.clip).toBe('2aeb118a');
   });
 
   it('duplicates children recursively', async () => {
@@ -1225,6 +1253,25 @@ describe('addTraitToEntitiesWithUndo', () => {
 });
 
 describe('removeTraitFromEntitiesWithUndo', () => {
+  // Sibling of QA-CTX-0003, found by its close-out sweep. This snapshot exists ONLY to
+  // restore the trait on undo, and it was taken through the curated meta.fields subset —
+  // so removing an Animator and pressing Cmd+Z brought it back with an EMPTY clip bank.
+  it('restores an off-meta persistent field on undo (Animator.clips shape)', async () => {
+    const { removeTraitFromEntitiesWithUndo } = await getModule();
+    const entity = spawnEntity('Rigged');
+    entity.add(AnimBank({ clips: '[{"name":"default","clip":"guid-1"}]', clip: 'default', time: 0 }));
+    const meta = traitDefs.find(t => t.name === 'AnimBank')!;
+
+    removeTraitFromEntitiesWithUndo([entity.id()], meta as never);
+    expect(entity.has(AnimBank)).toBe(false);
+
+    await pushedActions[0].undo();
+    expect(entity.has(AnimBank)).toBe(true);
+    const restored = entity.get(AnimBank)!;
+    expect(restored.clips).toBe('[{"name":"default","clip":"guid-1"}]');
+    expect(restored.clip).toBe('default');
+  });
+
   it('removes from entities that have it and restores per-entity data on undo', async () => {
     const { removeTraitFromEntitiesWithUndo } = await getModule();
     const a = spawnEntity('A'); a.add(Health({ hp: 50 }));

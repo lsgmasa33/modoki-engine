@@ -98,6 +98,36 @@ describe('§5 — classification: the code must match what actually went wrong',
     expect(JSON.stringify(e.got)).toContain('changed');
   });
 
+  // QA-TOOL-0003 — `codeFromBody` (context.ts): a backend that names a SPECIFIC code wins over
+  // the generic status-derived one, at both `isFailureBody` refusal sites (getJson's
+  // checkFailure branch, and the POST branch here). MEASURED live: with two entities named
+  // `DUP_probe`, `modoki_set_transform {entity:{name:'DUP_probe'}}` returned `REFUSED_BY_OP`
+  // instead of `AMBIGUOUS` — the generic fallback is what this closes.
+  it('a body-supplied `code` wins over the generic REFUSED_BY_OP', async () => {
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/scene-mutate'
+        ? { body: { ok: false, changed: 0, errors: ["2 entities are named \"DUP_probe\" — address by guid"], code: 'AMBIGUOUS' } }
+        : undefined));
+    const e = envelope(s, await s.call('modoki_set_transform', { entity: { name: 'DUP_probe' }, space: 'local', position: [1, 2, 3] }));
+    expect(e.code).toBe('AMBIGUOUS');
+  });
+
+  it('a body with no `code` — or a junk value not in the closed set — still falls back to REFUSED_BY_OP', async () => {
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/scene-mutate'
+        ? { body: { ok: false, changed: 0, errors: ['unknown trait field "poistion"'] } }
+        : undefined));
+    const e = envelope(s, await s.call('modoki_set_transform', { entity: { name: 'Capsule' }, space: 'local', position: [1, 2, 3] }));
+    expect(e.code).toBe('REFUSED_BY_OP');
+
+    const sJunk = (surface = loadSurface((req) =>
+      req.path === '/api/scene-mutate'
+        ? { body: { ok: false, changed: 0, errors: ['unknown trait field "poistion"'], code: 'NOT_A_REAL_CODE' } }
+        : undefined));
+    const eJunk = envelope(sJunk, await sJunk.call('modoki_set_transform', { entity: { name: 'Capsule' }, space: 'local', position: [1, 2, 3] }));
+    expect(eJunk.code).toBe('REFUSED_BY_OP');
+  });
+
   it('V3 — a 200 answering the SPA HTML is NOT_AVAILABLE_HERE, never an answer', async () => {
     // Measured on the default backend: a missing `/api` route falls through to the editor page and
     // answers 200 with index.html, which the transport happily reported as a successful read whose

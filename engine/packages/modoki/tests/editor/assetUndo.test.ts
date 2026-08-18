@@ -104,9 +104,16 @@ describe('makeDuplicateUndo', () => {
     expect(action.label).toBe('Duplicate island.glb');
 
     await action.undo();
-    // Binary copy → its .meta.json sidecar is trashed too (carries GUID + settings).
+    // Binary copy → BOTH sidecar halves are trashed: the committed `.meta.json` (GUID +
+    // settings) and the gitignored machine-local `.meta.local.json` (byte stats). Dropping
+    // only the committed half stranded the local one on disk after every undone duplicate —
+    // the QA-CTX-0005 leak class, in the flow that fix's first sweep did not reach.
     const deletes = calls.filter((c) => c.url === '/api/delete-asset').map((c) => c.body.path);
-    expect(deletes).toEqual(['/assets/island copy.glb', '/assets/island copy.glb.meta.json']);
+    expect(deletes).toEqual([
+      '/assets/island copy.glb',
+      '/assets/island copy.glb.meta.json',
+      '/assets/island copy.glb.meta.local.json',
+    ]);
     expect(refresh).toHaveBeenCalledTimes(1);
 
     calls = [];

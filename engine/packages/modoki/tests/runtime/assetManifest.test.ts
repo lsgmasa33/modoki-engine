@@ -163,6 +163,25 @@ describe('resolveRef', () => {
     err.mockRestore();
   });
 
+  /** QA-INSP-0004 — a literal FONT path used to pass through here silently. Every other
+   *  asset-ref field was rejected loudly; `Text2D.font` / `Text3D.font` were not, because
+   *  isInternalAssetPath excludes font extensions for `UIElement.fontFamily`'s sake — and
+   *  fontFamily never reaches resolveRef at all (it is read straight into a CSS style). A
+   *  ref the build cannot see fails only once you ship, since dev serves off disk. */
+  it('rejects an internal FONT path too (Text2D/Text3D.font are manifest GUIDs)', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    for (const p of [
+      '/games/x/assets/fonts/Inter.ttf',
+      '/games/x/assets/fonts/Inter.otf',
+      '/games/x/assets/fonts/Inter.woff',
+      '/games/x/assets/fonts/Inter.woff2',
+    ]) {
+      expect(resolveRef(p), p).toBeUndefined();
+    }
+    expect(err).toHaveBeenCalledTimes(4);
+    err.mockRestore();
+  });
+
   it('passes external URLs through unchanged (not manifest assets)', () => {
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
     expect(resolveRef('https://cdn.example.com/sprite.png')).toBe('https://cdn.example.com/sprite.png');

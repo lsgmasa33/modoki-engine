@@ -101,10 +101,38 @@ export function openActorLease(who: 'human' | 'agent', ttlMs: number = ACTOR_LEA
   return lease.id;
 }
 
-/** Close a lease. Ignores an id that is not the CURRENT lease, so a late close from a
- *  superseded op cannot cancel the attribution of the one now in flight. */
+/** Trailing window a closed lease stays live for.
+ *
+ *  A close means "I have finished SENDING the input", not "the editor has finished
+ *  REACTING to it", and those are different moments in different tasks. Synthetic input
+ *  goes through the browser's input pipeline; the close arrives as an IPC message on the
+ *  JS task queue. Nothing orders them, so it is a RACE — and the loser is whichever
+ *  journal event the input causes.
+ *
+ *  MEASURED (backend 5183, games/anim-bug, 2026-08-18): two identical
+ *  `modoki_drag_handle` calls on `gizmo3d:translate:x`, seconds apart, in an unattended
+ *  session with nobody at the keyboard. The first journalled its `!transform` as
+ *  source:'human' — 184ms after the same gesture's `!focus`, which was correctly 'agent'.
+ *  The second journalled 'agent'. Same call, same code, opposite answers: the emit lost
+ *  the race once and won it once. That non-determinism is also what QA-GVIEW-0008 sees on
+ *  the GameView toolbar, from the same cause.
+ *
+ *  So the close SHORTENS the lease rather than clearing it. Sized well above the measured
+ *  184ms, and equal to the editor's other renderer-side deferral window (undoManager's
+ *  `COALESCE_MS`) so there is one number to reason about rather than two.
+ *
+ *  What it costs, stated plainly: a human acting within 500ms of an agent input is tagged
+ *  'agent'. That is the same trade the lease already makes — and strictly smaller than the
+ *  3s `ACTOR_LEASE_TTL_MS` backstop that already applies whenever a close fails to land. */
+export const ACTOR_LEASE_GRACE_MS = 500;
+
+/** Close a lease — i.e. let it EXPIRE after {@link ACTOR_LEASE_GRACE_MS} rather than
+ *  clearing it outright; see that constant for why. Ignores an id that is not the CURRENT
+ *  lease, so a late close from a superseded op cannot cancel the attribution of the one now
+ *  in flight, and never EXTENDS a lease that was already closing sooner. */
 export function closeActorLease(id: number): void {
-  if (lease && lease.id === id) lease = null;
+  if (!lease || lease.id !== id) return;
+  lease = { ...lease, deadline: Math.min(lease.deadline, Date.now() + ACTOR_LEASE_GRACE_MS) };
 }
 
 /** Test/teardown hook. */

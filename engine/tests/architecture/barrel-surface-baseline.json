@@ -499,6 +499,7 @@
   "isHitRegionOverlayVisible",
   "isInputWatchOpen",
   "isInternalAssetPath",
+  "isInternalFontPath",
   "isJournalEnabled",
   "isLiveRender",
   "isManualClock",

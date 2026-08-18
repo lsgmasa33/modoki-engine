@@ -485,7 +485,12 @@ const pathRefSeen = new Set<string>();
 export function resolveRef(ref: string): string | undefined {
   if (!ref) return undefined;
   if (isGuid(ref)) return guidToEntry.get(ref)?.path;
-  if (isInternalAssetPath(ref)) {
+  // A FONT path counts here too. `isInternalAssetPath` deliberately excludes font
+  // extensions for `UIElement.fontFamily`'s sake — but fontFamily is read straight into a
+  // CSS style and never reaches resolveRef, while `Text2D.font`/`Text3D.font` DO, and they
+  // are manifest-tracked GUIDs. So a literal font path used to pass through this function
+  // unrejected and with no error, unlike every other asset-ref field (QA-INSP-0004).
+  if (isInternalAssetPath(ref) || isInternalFontPath(ref)) {
     if (!pathRefSeen.has(ref)) {
       pathRefSeen.add(ref);
       console.error(
