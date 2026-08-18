@@ -122,6 +122,25 @@ class is `receiveShadow`**: the function sets it true unconditionally, so a mesh
 `receiveShadow: false` proves it never ran there — whatever the material says. Do not re-derive the
 old "a transparent material explains it" theory; it was measured false.
 
+#### The shadow pass is a SECOND submit of the scene, and it is easy for it to be the bigger one
+
+A casting directional light makes `renderer.render()` submit the casters again, from the shadow
+camera. Nothing bounds that against what the player camera sees, so the shadow pass can cost more
+than the visible frame — measured on `demos/forest-camp` / Galaxy A23 (#224), where it was **57 of
+103 draw calls and 58k of 87k triangles, against a main pass of 46 calls and 29k**. That project is
+CPU-bound there, and `renderer.render` costs ~0.063 ms per draw call on that device, so the shadow
+pass was ~3.6 ms of a 15.7 ms CPU frame.
+
+**Cut the caster LIST, not the shadow settings.** Both obvious knobs were measured and neither is a
+lever: `shadowMapSize` 1024 → 512 changed nothing (the cost is submission, not rasterization), and
+`shadowCameraSize` 16 → 6 culled 8 calls because the casters cluster near the camera anyway. What
+works is authoring `Renderable3D.castShadow: 'off'` on geometry whose shadow nobody reads — in
+forest-camp, grass/flowers/bushes, which bought ~1.0 ms.
+
+⚠️ **Size the cut in DRAW CALLS, not meshes.** Turning 23 forest-camp entities off removed 30 caster
+*meshes* but only 10 draw calls, because LOD children are counted in a mesh traversal and only one
+level ever submits. A mesh count will overstate the win by ~3x on any LOD-wrapped content.
+
 #### Follow (`shadowFollow.ts`)
 
 A directional shadow camera anchored at the light's authored position covers a FIXED patch of ground,

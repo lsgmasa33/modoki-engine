@@ -13,7 +13,7 @@
  *  is the single mockable seam — no GLB template load needed; the mesh the sync
  *  stores in `ecsObjects` is the one we inspect for dispose() calls. */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // A live Set the sync reads to decide "deactivated" — tests push ids into it.
 const deactivatedEntities = new Set<number>();
@@ -25,6 +25,16 @@ beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
   deactivatedEntities.clear();
+});
+
+// koota caps live worlds at 16 and `setup()` makes one per test, so a file that never frees them
+// hits "Too many worlds created" once it passes 16 tests — a budget that silently blocks the NEXT
+// test added here rather than failing the one that exhausted it. Every world setup() builds is
+// registered and destroyed after its test.
+const spawnedWorlds: { destroy: () => void }[] = [];
+afterEach(() => {
+  for (const w of spawnedWorlds) w.destroy();
+  spawnedWorlds.length = 0;
 });
 
 /** A primitive-mesh stand-in: real-enough shape for applyTransform / dispose
@@ -80,7 +90,9 @@ async function setup() {
   const sync = await import('../../src/runtime/rendering/scene3DSync');
   const mtc = await import('../../src/runtime/loaders/meshTemplateCache');
   const scene: any = { add: vi.fn(), remove: vi.fn() };
-  return { world: createWorld(), traits, sync, scene, created, isImagePath, mtc, nextMeshOpts };
+  const world = createWorld();
+  spawnedWorlds.push(world as unknown as { destroy: () => void });
+  return { world, traits, sync, scene, created, isImagePath, mtc, nextMeshOpts };
 }
 
 describe('syncRenderables — populate (add path)', () => {
@@ -380,5 +392,85 @@ describe('syncRenderables — shadow flags (#183)', () => {
     expect(state.ecsObjects.get(id)).toBe(mesh);   // proves this is a re-apply, not a rebuild
     expect(mesh.castShadow).toBe(false);
     expect(mesh.receiveShadow).toBe(false);
+  });
+});
+
+/** The GLB/LOD call site (#224). Everything above drives `Renderable3DPrimitive`, whose fake mesh
+ *  is its own one-node subtree — so it proves `applyShadowFlags` works, and proves nothing about
+ *  the OTHER call sites that have to pass the authored field to it. That distinction is not
+ *  academic: #183 was a MISSING call site (skinned models never called it at all) while the
+ *  function itself was fine, and the primitive tests stayed green throughout.
+ *
+ *  `Renderable3D` + baked LODs is the combination `demos/forest-camp` now depends on — its
+ *  grass/flowers/bushes are LOD-wrapped, which is why turning 23 entities off moved 30 caster
+ *  MESHES. A per-level assertion is what distinguishes "the flag reached the LOD wrapper" from
+ *  "the flag reached the geometry that actually submits". */
+describe('syncRenderables — shadow flags on the GLB/LOD path (#224)', () => {
+  /** Two LOD levels sharing an opaque material, so `auto` casts and only an explicit `off`
+   *  can turn the levels false. */
+  /** THREE.Mesh's constructor runs updateMorphTargets, which reads geometry.morphAttributes —
+   *  so the fake geometry needs that key or construction throws before any flag is applied. */
+  const geom = () => ({ morphAttributes: {}, dispose: () => {} });
+
+  function lodInfoOf(transparent = false) {
+    const material = { transparent, color: { setHex: () => {} }, dispose: () => {} };
+    return {
+      templates: [{ geometry: geom(), material }, { geometry: geom(), material }],
+      distances: [0, 50],
+    };
+  }
+
+  it('castShadow "off" reaches EVERY LOD level, not just the LOD wrapper', async () => {
+    const { world, traits, sync, scene, mtc } = await setup();
+    const { Transform, Renderable3D } = traits;
+    (mtc.resolveMeshLodInfo as any).mockReturnValue(lodInfoOf());
+    const id = world.spawn(
+      Transform(),
+      Renderable3D({ mesh: 'tree-guid', isVisible: true, castShadow: 'off', receiveShadow: true }),
+    ).id();
+    const state = sync.createRenderState();
+
+    sync.syncRenderables(world, scene, state);
+
+    const lod: any = state.ecsObjects.get(id);
+    expect(lod.levels.length).toBe(2);              // the LOD really was built
+    const levels = lod.levels.map((l: any) => l.object);
+    for (const m of levels) expect(m.castShadow).toBe(false);
+    for (const m of levels) expect(m.receiveShadow).toBe(true);
+  });
+
+  it('castShadow "auto" with an opaque material still casts on every level', async () => {
+    const { world, traits, sync, scene, mtc } = await setup();
+    const { Transform, Renderable3D } = traits;
+    (mtc.resolveMeshLodInfo as any).mockReturnValue(lodInfoOf());
+    const id = world.spawn(
+      Transform(),
+      Renderable3D({ mesh: 'tree-guid', isVisible: true, castShadow: 'auto', receiveShadow: true }),
+    ).id();
+    const state = sync.createRenderState();
+
+    sync.syncRenderables(world, scene, state);
+
+    const lod: any = state.ecsObjects.get(id);
+    for (const l of lod.levels) expect(l.object.castShadow).toBe(true);
+  });
+
+  it('castShadow "off" reaches a non-LOD GLB mesh', async () => {
+    const { world, traits, sync, scene, mtc } = await setup();
+    const { Transform, Renderable3D } = traits;
+    (mtc.resolveMeshTemplate as any).mockReturnValue({
+      geometry: geom(), material: { transparent: false, color: { setHex: () => {} }, dispose: () => {} },
+    });
+    const id = world.spawn(
+      Transform(),
+      Renderable3D({ mesh: 'rock-guid', isVisible: true, castShadow: 'off', receiveShadow: true }),
+    ).id();
+    const state = sync.createRenderState();
+
+    sync.syncRenderables(world, scene, state);
+
+    const mesh: any = state.ecsObjects.get(id);
+    expect(mesh.castShadow).toBe(false);
+    expect(mesh.receiveShadow).toBe(true);
   });
 });

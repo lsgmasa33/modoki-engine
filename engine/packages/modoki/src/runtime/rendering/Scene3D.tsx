@@ -56,6 +56,16 @@ import { nprConfigFromTrait, type NprTraitSnapshot } from './npr/nprConfigFromTr
  *  per-call driver overhead was never the cost, and the P4b premise was wrong. Worse, the batching
  *  pass itself adds ~2.6 ms to `renderables`.
  *
+ *  ⚠️ THAT FLAT SLOPE IS REGIME-SPECIFIC, NOT A PROPERTY OF `submit` (#224, 2026-08-14). The same
+ *  measurement on `demos/forest-camp` / Galaxy A23 — a 17.5 ms frame rather than an 85 ms one —
+ *  gives `submit ~= 2.5 ms + 0.063 ms per draw call`, from two independent perturbations that
+ *  agree: dropping the shadow pass (57 calls, 0.065 ms/call) and hiding half the visible meshes
+ *  (19 calls, 0.063 ms/call). Both readings are right. Sling at 85 ms is GPU-bound, so its
+ *  `submit` was a CPU-side wait on a GPU that was already the limiter and call count could not
+ *  matter (§9 of the plan says exactly this); forest-camp at 17 ms is CPU-bound, and there
+ *  per-call cost is precisely what is being paid. Read "per-call overhead was never the cost" as
+ *  scoped to the GPU-bound regime it was measured in — it does not generalize.
+ *
  *  Kept rather than reverted because the mechanism is sound and the census says other projects are
  *  far more repeated (forest-camp 554 entities on repeated pairs, 3d-test 456) — but it must not
  *  ship enabled on the strength of a hypothesis its own measurement refuted. Flip this ON only
