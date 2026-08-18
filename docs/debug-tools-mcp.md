@@ -742,7 +742,8 @@ instead.** `isError: true` plus a single shape (full contract:
 ```
 
 `UNKNOWN_PARAM` · `AMBIGUOUS` · `NOT_FOUND` · `AMBIGUOUS_SURFACE` · `OCCLUDED` · `REFUSED_BY_OP` ·
-`NO_RENDERER` · `TIMEOUT` · `TOO_LARGE` · `REQUIRES_SAVE` · `NOT_AVAILABLE_HERE` · `PARTIAL`.
+`NO_RENDERER` · `TIMEOUT` · `REQUIRES_SAVE` · `NOT_AVAILABLE_HERE` · `PARTIAL`. (An over-budget
+answer is a SUCCESS carrying `{elided:true, hint}`, not a code — narrow the call with the hint.)
 
 **Read the `code` before the prose** — it tells you whether to retry, re-aim, save first, or stop:
 

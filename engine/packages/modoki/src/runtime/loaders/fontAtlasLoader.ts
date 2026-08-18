@@ -12,7 +12,7 @@
  *  data); Scene3D/Scene2D each build their own GPU texture from it.
  */
 
-import { resolveRef, getAssetEntry, isGuid, onFontInvalidated } from './assetManifest';
+import { resolveRef, getAssetEntry, isGuid, isInternalFontPath, onFontInvalidated } from './assetManifest';
 import { assetUrl, withCacheBust } from './assetUrl';
 import { parseAssetJson } from './assetFetch';
 import { FONT_ATLAS_SUFFIX, FONT_METRICS_SUFFIX, FONT_INSTANCE_SUFFIX } from '../core/fontSettings';
@@ -144,12 +144,27 @@ export async function acquireFont(sceneId: SceneId, guid: string): Promise<FontP
   return promise;
 }
 
+/** One error per offending ref — a per-frame renderer calls ensureFontLoaded constantly. */
+const pathRefWarned = new Set<string>();
+
 /** Fire-and-forget acquire — the renderer calls this when it first sees a font
  *  GUID on an entity; the atlas loads in the background and the next relayout (once
  *  {@link getLoadedFont} returns non-undefined) renders the text. */
 export function ensureFontLoaded(sceneId: SceneId, guid: string): void {
   if (providers.has(guid)) { addOwner(guid, sceneId); return; }
-  if (!guid || !isGuid(guid)) return;
+  if (!guid || !isGuid(guid)) {
+    // A literal font PATH used to drop out here in total silence — the one asset-ref
+    // field with no rejection anywhere (fonts are excluded from isInternalAssetPath for
+    // UIElement.fontFamily's sake). Say it once per ref, like resolveRef does.
+    if (isInternalFontPath(guid) && !pathRefWarned.has(guid)) {
+      pathRefWarned.add(guid);
+      console.error(
+        `[fontAtlasLoader] path reference no longer supported — use a GUID: ${guid}\n` +
+        `  (import the font so it gets a manifest GUID; the build cannot see a path ref.)`,
+      );
+    }
+    return;
+  }
   void acquireFont(sceneId, guid);
 }
 

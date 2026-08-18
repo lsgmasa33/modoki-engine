@@ -963,6 +963,21 @@ describe('asset-tree-shaker', () => {
     expect(result.stats.droppedBytes).toBeGreaterThan(0);
   });
 
+  it('never reports a SIDECAR as an orphan — neither .meta.json nor .meta.local.json', () => {
+    // The gitignored machine-local half used to classify as 'unknown-json' and so got its
+    // own row in "Clean Up Unused Assets": every freshly imported texture showed as TWO
+    // orphans, and the second could not be bundled away with its parent.
+    fx.writeVirtual('/games/test/assets/tex/probe.png', 'fake');
+    fx.writeJson('/games/test/assets/tex/probe.png.meta.json', { version: 2, id: '11111111-1111-4111-8111-111111111111' });
+    fx.writeJson('/games/test/assets/tex/probe.png.meta.local.json', { textureCache: { bytes: 123 } });
+    fx.writeJson('/games/test/assets/scenes/main.json', { version: 6, entities: [] });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.orphans).toContain('/games/test/assets/tex/probe.png');
+    expect(result.orphans.filter((o) => o.includes('.meta'))).toEqual([]);
+  });
+
   it('keeps the HDR referenced via Environment trait in a real-world-ish scene', () => {
     // Mirrors the tropical-island.json shape: scene has Environment entity + ModelSource entity.
     fx.writeVirtual('/games/test/assets/models/island.glb', 'fake');

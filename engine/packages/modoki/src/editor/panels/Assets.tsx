@@ -1709,7 +1709,12 @@ export default function Assets() {
         <div style={toolbarDividerStyle} />
         {/* — Scan / convert: Refresh, Re-import all (heavy → last) — */}
         <button
-          onClick={refresh}
+          // Bump the STORE version rather than calling this panel's own refresh(): the
+          // effect below re-runs on assetsVersion, so this panel still rescans, and every
+          // other version-keyed consumer (the Script tree above all) refreshes with it. A
+          // bare refresh() left a script added or removed on disk invisible — and Refresh
+          // is the one affordance a human reaches for.
+          onClick={() => useEditorStore.getState().refreshAssets()}
           disabled={loading}
           title="Scan public/ folder"
           data-ui-id="assets.toolbar.refresh" data-ui-kind="button" data-ui-label="refresh"

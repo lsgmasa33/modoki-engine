@@ -365,7 +365,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'value through the app\'s own UI. Requires the Electron editor.',
     {
       text: z.string().describe('Text to type into the focused input.'),
-      clearFirst: z.boolean().optional().describe('Select-all + delete before typing (replace vs append).'),
+      clearFirst: z.boolean().optional().describe('Empty the field before typing (replace vs append). A field it could not empty is reported as an ERROR naming what is still in it, never a silent append.'),
       submitKey: z.string().optional().describe("Terminal key after typing: 'Enter', 'Tab', or 'Escape'."),
     },
     async ({ text, clearFirst, submitKey }) => postJson('/api/input/type', { text, clearFirst, submitKey }),

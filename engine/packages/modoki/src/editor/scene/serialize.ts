@@ -22,7 +22,7 @@ import { editorEmit } from '../editorJournal';
 import { captureInstanceOverrides, captureInstanceStructure, getPrefabSource, getCachedPrefabSync } from './prefab';
 import type { AddedEntity, NestedOverridePaths } from '../../runtime/loaders/loadSceneFile';
 import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, collectResourceRefsFromEntities } from '../../runtime/loaders/loadSceneFile';
-import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
+import { newGuid, isInternalAssetPath, isInternalFontPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
 import { isGuid } from '../../runtime/core/assetRefRules';
 import { clearAllSceneDirty, clearSceneDirty, dirtySceneGuidsSnapshot, isSceneDirty } from './sceneDirty';
 import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
@@ -621,7 +621,21 @@ export async function serializeScene(opts?: {
  *  `overrides`, recursive `added` subtrees, and path-keyed `nestedOverrides` (F8).
  *  Exported for unit testing the full-coverage walk. */
 export function assertNoPathRefs(entry: SerializedEntity): void {
+  // Font ASSET fields (manifest-tracked GUID refs). `isInternalAssetPath` excludes font
+  // extensions on purpose — for `UIElement.fontFamily`, a CSS family name — which let a
+  // literal path in these two fields through every rejection site: the #53 class, a ref
+  // the build cannot see, failing only once shipped.
+  const FONT_REF_FIELDS = new Set(['Text2D.font', 'Text3D.font']);
   const flag = (field: string, v: unknown) => {
+    // `field` is a context-prefixed label (`overrides[5].Text2D.font`); match the tail.
+    const isFontField = FONT_REF_FIELDS.has(field.split('.').slice(-2).join('.'));
+    if (typeof v === 'string' && isFontField && isInternalFontPath(v)) {
+      console.error(
+        `[serialize] internal asset path in ${field} — font references must be GUIDs: ${v}\n` +
+        `  (import the font so it gets a manifest GUID; only UIElement.fontFamily takes a plain name)`,
+      );
+      return;
+    }
     if (typeof v === 'string' && isInternalAssetPath(v)) {
       console.error(
         `[serialize] internal asset path in ${field} — references must be GUIDs: ${v}\n` +

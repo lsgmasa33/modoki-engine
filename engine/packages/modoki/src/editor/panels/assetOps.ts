@@ -100,8 +100,11 @@ export function planImports(
  *
  *  - The asset itself always goes first, so an undo restores in the original order.
  *  - A BINARY asset also drops its `.meta.json` (GUID + import settings — both
- *    dangle if lost across a delete/undo). Text assets carry their id inline and
- *    have no sidecar.
+ *    dangle if lost across a delete/undo) AND its `.meta.local.json` (the gitignored
+ *    machine-local byte-stats half — see plugins/meta-sidecar.ts). The local half was
+ *    missed, so every delete stranded one: gitignored, so it never showed in
+ *    `git status`, harmless individually and unbounded over time. Text assets carry
+ *    their id inline and have no sidecar.
  *  - A MODEL additionally drops everything it generated (meshes / materials /
  *    textures) and each generated BINARY file's own sidecar.
  *
@@ -114,11 +117,11 @@ export function deletionPathsFor(
   generated?: { meshes?: string[]; materials?: string[]; textures?: string[] } | null,
 ): string[] {
   const paths: string[] = [assetPath];
-  if (!isTextAsset(assetPath)) paths.push(assetPath + '.meta.json');
+  if (!isTextAsset(assetPath)) paths.push(assetPath + '.meta.json', assetPath + '.meta.local.json');
   if (assetType === 'model' && generated) {
     for (const f of [...(generated.meshes ?? []), ...(generated.materials ?? []), ...(generated.textures ?? [])]) {
       paths.push(f);
-      if (!isTextAsset(f)) paths.push(f + '.meta.json');
+      if (!isTextAsset(f)) paths.push(f + '.meta.json', f + '.meta.local.json');
     }
   }
   return paths;

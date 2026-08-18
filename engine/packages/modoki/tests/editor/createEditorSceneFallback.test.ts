@@ -67,6 +67,29 @@ describe('resolveBootSceneOverride (issue #43 — --scene / MODOKI_SCENE launch 
     expect(resolveBootSceneOverride('main', SCENES)).toBe('/assets/scenes/main.json');
   });
 
+  // Every real project on disk uses the `<name>.scene.json` DOUBLE extension. The fixture
+  // above uses single-extension names, which is exactly why the bare-name lookup could
+  // strip only `.json` (leaving `Lvl-0001.scene`) and match nothing in practice.
+  const REAL_SCENES = [
+    '/assets/scenes/Base.scene.json',
+    '/assets/scenes/Lvl-0001.scene.json',
+    '/assets/scenes/Lvl-0002.scene.json',
+  ];
+
+  it('matches a bare name against the real <name>.scene.json convention', () => {
+    expect(resolveBootSceneOverride('Lvl-0001', REAL_SCENES)).toBe('/assets/scenes/Lvl-0001.scene.json');
+    expect(resolveBootSceneOverride('lvl-0002', REAL_SCENES)).toBe('/assets/scenes/Lvl-0002.scene.json');
+    expect(resolveBootSceneOverride('base', REAL_SCENES)).toBe('/assets/scenes/Base.scene.json');
+  });
+
+  it('still accepts the `<name>.scene` form (the .json-stripped basename)', () => {
+    expect(resolveBootSceneOverride('Lvl-0001.scene', REAL_SCENES)).toBe('/assets/scenes/Lvl-0001.scene.json');
+  });
+
+  it('a full filename with the double extension still short-circuits, no lookup', () => {
+    expect(resolveBootSceneOverride('Lvl-0001.scene.json', REAL_SCENES)).toBe('Lvl-0001.scene.json');
+  });
+
   it('falls through to null when the name matches nothing (typo)', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     expect(resolveBootSceneOverride('Level-9999', SCENES)).toBeNull();

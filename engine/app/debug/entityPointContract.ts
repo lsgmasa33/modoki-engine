@@ -96,10 +96,21 @@ export type OcclusionScope = 'element' | 'canvas' | 'entity';
  *    for a clean centre hit. */
 export type AimedAt = 'centre' | 'sampled';
 
+/** Machine-readable reason an aim was refused — a SUBSET of the MCP surface's closed error-code
+ *  set (`engine/tools/shared/mcpResult.ts`), carried from here so the MCP can report the specific
+ *  code instead of flattening every refusal to the generic REFUSED_BY_OP. The codes were
+ *  documented (docs/mcp-tool-conventions.md §5) and never emitted: an agent could only tell an
+ *  ambiguous aim from an occluded one by string-matching the prose, which is exactly what a closed
+ *  code set exists to avoid. Deliberately NOT imported from the MCP package — this runs in the
+ *  renderer and must not depend on the tool server; the guard test keeps the two in step. */
+export type AimErrorCode = 'AMBIGUOUS' | 'AMBIGUOUS_SURFACE' | 'OCCLUDED' | 'NOT_FOUND';
+
 export interface EntityPointResolution {
   ok: boolean;
   /** Present when `ok` is false — why the entity could not be aimed at. */
   error?: string;
+  /** Present when `ok` is false and the reason is one the caller can branch on. */
+  errorCode?: AimErrorCode;
   x?: number;
   y?: number;
   /** Who resolved. Echoed back so a `{name}` aim can be checked against the entity actually

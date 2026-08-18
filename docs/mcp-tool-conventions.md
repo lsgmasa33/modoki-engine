@@ -161,8 +161,12 @@ Shape — `isError: true` plus:
 ```
 
 Closed code set (extend deliberately, never ad hoc): `UNKNOWN_PARAM` · `AMBIGUOUS` · `NOT_FOUND` ·
-`AMBIGUOUS_SURFACE` · `OCCLUDED` · `REFUSED_BY_OP` · `NO_RENDERER` · `TIMEOUT` · `TOO_LARGE` ·
+`AMBIGUOUS_SURFACE` · `OCCLUDED` · `REFUSED_BY_OP` · `NO_RENDERER` · `TIMEOUT` ·
 `REQUIRES_SAVE` · `NOT_AVAILABLE_HERE` · `PARTIAL`.
+
+An answer that exceeds the response budget is **not** a failure code — it comes back as a
+SUCCESS carrying `{elided:true, bytes, hint, preview}`, because a hint the caller can narrow with
+beats an error it can only retry.
 
 Rules:
 - **A refusal is not a transport failure.** A deliberate op refusal is a 400 that says so, never a

@@ -207,8 +207,8 @@ const pathToGuid = new Map<string, string>();
 // Pure ref predicates live in assetRefRules.ts (zero imports, Node-safe) so they
 // can be shared with the dev-server plugin + scene validator/mutator. Imported
 // for internal use AND re-exported to keep assetManifest's public API stable.
-import { isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid } from '../core/assetRefRules';
-export { isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid };
+import { isGuid, isExternalUrl, isInternalAssetPath, isInternalFontPath, newGuid, deriveGuid } from '../core/assetRefRules';
+export { isGuid, isExternalUrl, isInternalAssetPath, isInternalFontPath, newGuid, deriveGuid };
 // FontManifestBlock is defined in the pure fontSettings module (Node-safe, so the
 // build plugins can import it without pulling this browser-coupled module into
 // their Node typecheck); re-exported here for runtime consumers.

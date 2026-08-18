@@ -44,7 +44,14 @@ export const MAX_PAYLOAD_CHARS = 60_000;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** The CLOSED set of failure codes. Extend deliberately — a new code is a claim that the caller
- *  should react differently, so if the reaction is the same as an existing code, reuse it. */
+ *  should react differently, so if the reaction is the same as an existing code, reuse it. And a
+ *  code NOTHING EMITS is worse than a missing one: it promises a distinction the surface does not
+ *  make, and the caller who branches on it silently never takes that branch.
+ *  `engine/tests/tools/mcpErrorCodeCoverage.test.ts` fails on one.
+ *
+ *  `TOO_LARGE` used to sit here and was never emitted: an over-budget answer is a deliberate
+ *  SUCCESS carrying `{elided:true, bytes, hint, preview}` (see `encode`), because a hint the agent
+ *  can act on beats an error it can only retry. Removed rather than faked. */
 export const ERROR_CODES = [
   'UNKNOWN_PARAM',      // a parameter the tool does not accept (a typo is a different operation)
   'AMBIGUOUS',          // the aim matched more than one target — never first-match silently
@@ -54,7 +61,6 @@ export const ERROR_CODES = [
   'REFUSED_BY_OP',      // the operation itself declined (incl. a no-op the caller asked to change)
   'NO_RENDERER',        // nothing is rendering, so there is no live state to read or drive
   'TIMEOUT',            // no answer in time — the editor may be busy or wedged
-  'TOO_LARGE',          // the answer exists but exceeds the response budget; narrow it
   'REQUIRES_SAVE',      // live-world work is not on disk and this reads the file
   'NOT_AVAILABLE_HERE', // could not look (auth/network/route absent) — NOT "nothing is there"
   'PARTIAL',            // some of the work succeeded; a failure unless the tool documents it

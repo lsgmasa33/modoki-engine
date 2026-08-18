@@ -462,6 +462,25 @@ describe('duplicateEntity', () => {
     expect(pushedActions[0].label).toBe('Duplicate Entity');
   });
 
+  it('carries OFF-META fields (Animator.clips class) onto the copy, unaliased', async () => {
+    // snapshotEntity read the curated meta.fields only, so a field a custom Inspector
+    // section owns — Animator.clips here, mirrored by SpriteAnim.clips/clip — came back
+    // empty on the duplicate. Deep-cloned, so editing the copy cannot reach the source.
+    const { duplicateEntity } = await getModule();
+    const original = spawnEntity('Animated');
+    original.add(SpriteAnim({ clips: { default: { clip: '2aeb118a', frames: [0, 1, 2] } }, clip: 'default', time: 0, playing: true }));
+
+    const newId = duplicateEntity(original.id(), vi.fn())!;
+    const copy = entityIndex.get(newId);
+    const copied = copy.get(SpriteAnim);
+    expect(copied.clip).toBe('default');
+    expect(copied.clips.default).toEqual({ clip: '2aeb118a', frames: [0, 1, 2] });
+
+    // Not the same object: mutating the copy must not touch the source.
+    copied.clips.default.clip = 'mutated';
+    expect(original.get(SpriteAnim)!.clips.default.clip).toBe('2aeb118a');
+  });
+
   it('duplicates children recursively', async () => {
     const { duplicateEntity } = await getModule();
     const root = spawnEntity('Root');

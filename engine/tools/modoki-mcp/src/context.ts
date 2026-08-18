@@ -12,7 +12,7 @@
  *
  *  Keep this module free of side effects. */
 
-import { createFormatter, isFailureBody, type ToolResult, type ToolErrorDetail, type ErrorCode } from './result.js';
+import { createFormatter, isFailureBody, ERROR_CODES, type ToolResult, type ToolErrorDetail, type ErrorCode } from './result.js';
 import { identityMismatch, tokenMismatchWarning, describeIdentity, type BackendIdentity } from '../../shared/identity.js';
 
 export type ToolContext = {
@@ -167,9 +167,9 @@ export function createToolContext(config: { backend: string; token?: string }): 
     // discriminator than a structured flag would be, so both hosts should grow one — but this is
     // the seam that must not be WRONG in the meantime, and both strings are ours.
     const routeMissing = status === 404 && (!detail || /no backend route for|no such API route/i.test(detail));
-    const code: ErrorCode = status === 404
+    const code: ErrorCode = bodyCode(body) ?? (status === 404
       ? (routeMissing ? 'NOT_AVAILABLE_HERE' : 'NOT_FOUND')
-      : status >= 500 ? 'NOT_AVAILABLE_HERE' : 'REFUSED_BY_OP';
+      : status >= 500 ? 'NOT_AVAILABLE_HERE' : 'REFUSED_BY_OP');
     return fail({
       code,
       what,
@@ -183,6 +183,20 @@ export function createToolContext(config: { backend: string; token?: string }): 
           ? { options: ['the backend belongs to a DIFFERENT editor/project (C6) — call modoki_identity, then point MODOKI_BACKEND at your own editor'] }
           : {}),
     });
+  }
+
+  /** A refusal the BACKEND already classified. The aim resolver knows the difference between
+   *  "that name matches three entities", "say which surface" and "something is in front of it" —
+   *  and those are the documented codes an agent branches on (docs/mcp-tool-conventions.md §5).
+   *  They were never emitted: everything arrived as the generic REFUSED_BY_OP, so the only way to
+   *  tell an ambiguous aim from an occluded one was to string-match the prose. Trust the body's
+   *  `errorCode` only when it is IN the closed set — an unknown string is not a code.
+   *  `engine/tests/tools/mcpErrorCodeCoverage.test.ts` keeps the two ends in step. */
+  function bodyCode(body: unknown): ErrorCode | null {
+    const raw = body && typeof body === 'object' ? (body as { errorCode?: unknown }).errorCode : undefined;
+    return typeof raw === 'string' && (ERROR_CODES as readonly string[]).includes(raw)
+      ? (raw as ErrorCode)
+      : null;
   }
 
   /** V3 — a missing `/api` route on the dev server falls through to the SPA and answers **200 with
@@ -262,7 +276,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
         const failure = isFailureBody(body);
         if (failure) {
           return fail({
-            code: 'REFUSED_BY_OP',
+            code: bodyCode(body) ?? 'REFUSED_BY_OP',
             what: `GET ${path} on the editor backend`,
             why: failure.split('\n\nfull response:')[0],
             got: body,
@@ -316,7 +330,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
       const failure = isFailureBody(body);
       return failure
         ? fail({
-            code: 'REFUSED_BY_OP',
+            code: bodyCode(body) ?? 'REFUSED_BY_OP',
             what: label,
             why: failure.split('\n\nfull response:')[0],
             got: body,

@@ -68,6 +68,20 @@ export function isInternalAssetPath(ref: string | undefined | null): boolean {
   return ref.startsWith('/') && ASSET_PATH_RE.test(ref);
 }
 
+/** Font files a literal path must be rejected for — but ONLY on a font ASSET field
+ *  (`Text2D.font` / `Text3D.font`, which are manifest-tracked GUID refs), never on
+ *  `UIElement.fontFamily`, which is a CSS family name. That field distinction is why
+ *  fonts cannot simply join `BINARY_ASSET_EXTS` above: the extension alone cannot tell
+ *  the two apart, so the CALLER has to say which kind of field it is holding. */
+const FONT_EXT_RE = /\.(?:ttf|otf|woff2?)$/i;
+
+/** Like {@link isInternalAssetPath} but for a font ASSET ref field. Kept separate so
+ *  `UIElement.fontFamily` keeps passing a path/family name through untouched. */
+export function isInternalFontPath(ref: string | undefined | null): boolean {
+  if (!ref) return false;
+  return ref.startsWith('/') && FONT_EXT_RE.test(ref);
+}
+
 /** Generate a fresh UUID v4 string. (`crypto` is a global in both the browser
  *  and Node ≥ 19.) */
 export function newGuid(): string {

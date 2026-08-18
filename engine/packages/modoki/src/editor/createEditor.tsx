@@ -95,8 +95,12 @@ export function resolveBootSceneOverride(override: string | null | undefined, sc
   if (override.includes('/') || override.toLowerCase().endsWith('.json')) return override;
   const target = override.toLowerCase();
   const matches = sceneList.filter((p) => {
+    // Every real project uses the `<name>.scene.json` DOUBLE extension, so stripping only
+    // `.json` leaves `<name>.scene` and a bare `--scene <name>` never matches (QA bug).
+    // Accept both the fully-stripped name and the `.scene`-suffixed one.
     const base = (p.split('/').pop() ?? p).replace(/\.json$/i, '');
-    return base.toLowerCase() === target;
+    const bare = base.replace(/\.scene$/i, '');
+    return base.toLowerCase() === target || bare.toLowerCase() === target;
   });
   if (matches.length === 1) return matches[0];
   if (matches.length === 0) {

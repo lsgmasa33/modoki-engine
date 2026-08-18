@@ -105,7 +105,10 @@ export interface ResolvedPoint {
 }
 
 const json = (body: unknown, status?: number): BackendResult => ({ kind: 'json', ...(status ? { status } : {}), body });
-const bad = (error: string) => json({ error }, 400);
+// `errorCode` (when the renderer supplied one) rides along with the prose so the MCP can report
+// the SPECIFIC documented code — AMBIGUOUS / AMBIGUOUS_SURFACE / OCCLUDED — instead of flattening
+// every aim refusal into the generic REFUSED_BY_OP an agent cannot branch on.
+const bad = (error: string, errorCode?: string) => json(errorCode ? { error, errorCode } : { error }, 400);
 
 /** Resolve a `{selector}` in the renderer, or pass `{x,y}` through. Returns the point or
  *  a prefixed error string — never throws, so a bad selector is a 400, not a 500. */
@@ -113,7 +116,7 @@ export async function resolvePoint(
   spec: PointSpec | undefined,
   which: string,
   requestRenderer: InputRouteDeps['requestRenderer'],
-): Promise<{ point: ResolvedPoint } | { error: string }> {
+): Promise<{ point: ResolvedPoint } | { error: string; errorCode?: string }> {
   // ── entity: resolve {guid}/{name}/{id} to the entity's LIVE screen rect in the renderer. ──
   // Highest precedence: it is the most specific thing the caller can say, and (unlike a
   // selector) there is no legacy call shape that passes it incidentally.
@@ -125,7 +128,10 @@ export async function resolvePoint(
       return { error: `${which}: renderer could not resolve entity (${e instanceof Error ? e.message : String(e)})` };
     }
     if (!res || !res.ok || typeof res.x !== 'number' || typeof res.y !== 'number') {
-      return { error: `${which}: ${res?.error ?? 'entity did not resolve'}` };
+      return {
+        error: `${which}: ${res?.error ?? 'entity did not resolve'}`,
+        ...(res?.errorCode ? { errorCode: res.errorCode } : {}),
+      };
     }
     return {
       point: {
@@ -232,7 +238,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
     if (urlPath === '/api/input/tap') {
       const { x, y, selector, entity, button, clickCount, modifiers } = (body ?? {}) as PointSpec & { button?: MouseButton; clickCount?: number; modifiers?: InputModifier[] };
       const r = await resolvePoint({ x, y, selector, entity }, 'tap', requestRenderer);
-      if ('error' in r) return bad(r.error);
+      if ('error' in r) return bad(r.error, r.errorCode);
       await ops.tap(r.point.x, r.point.y, { button, clickCount, modifiers });
       return json({ ok: true, tapped: { x: r.point.x, y: r.point.y, button: button ?? 'left', clickCount: clickCount ?? 1 }, ...provenance(r.point) });
     }
@@ -240,9 +246,9 @@ export function createInputRoutes(deps: InputRouteDeps) {
     if (urlPath === '/api/input/drag') {
       const { from, to, steps, button, modifiers } = (body ?? {}) as { from?: PointSpec; to?: PointSpec; steps?: number; button?: MouseButton; modifiers?: InputModifier[] };
       const rf = await resolvePoint(from, 'from', requestRenderer);
-      if ('error' in rf) return bad(rf.error);
+      if ('error' in rf) return bad(rf.error, rf.errorCode);
       const rt = await resolvePoint(to, 'to', requestRenderer);
-      if ('error' in rt) return bad(rt.error);
+      if ('error' in rt) return bad(rt.error, rt.errorCode);
       // A zero-length drag is a CLICK, not a drag: mouseDown+mouseUp at one pixel is what Blink
       // synthesizes a `click` from. Measured — `modoki_drag {from:{700,200},to:{700,200}}` over
       // empty SceneView space returned ok:true and CLEARED the human's selection (entity 38 →
@@ -281,7 +287,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
         return json({ error: `no pointer is held — send action:'down' first (this ${action} would be a stray event).` }, 409);
       }
       const r = await resolvePoint({ x, y, selector, entity }, `pointer ${action}`, requestRenderer);
-      if ('error' in r) return bad(r.error);
+      if ('error' in r) return bad(r.error, r.errorCode);
       // 'down' takes its button from the request (default left); 'move'/'up' REUSE the held one so
       // the whole gesture is one consistent button and a move reads as a drag-move.
       const effButton: MouseButton = action === 'down' ? (button ?? 'left') : heldPointer!.button;
@@ -301,7 +307,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
     if (urlPath === '/api/input/hover') {
       const { x, y, selector, entity, modifiers } = (body ?? {}) as PointSpec & { modifiers?: InputModifier[] };
       const r = await resolvePoint({ x, y, selector, entity }, 'hover', requestRenderer);
-      if ('error' in r) return bad(r.error);
+      if ('error' in r) return bad(r.error, r.errorCode);
       await ops.hover(r.point.x, r.point.y, modifiers);
       return json({ ok: true, hovered: { x: r.point.x, y: r.point.y }, ...provenance(r.point) });
     }
@@ -309,7 +315,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
     if (urlPath === '/api/input/scroll') {
       const { x, y, selector, entity, deltaX, deltaY, modifiers } = (body ?? {}) as PointSpec & { deltaX?: number; deltaY?: number; modifiers?: InputModifier[] };
       const r = await resolvePoint({ x, y, selector, entity }, 'scroll', requestRenderer);
-      if ('error' in r) return bad(r.error);
+      if ('error' in r) return bad(r.error, r.errorCode);
       // A scroll with no delta is a no-op wearing an action's name (S3.15). `deltaY` documents no
       // default and the tool shape is non-strict about intent — a misspelled `dy` reaches here as
       // nothing at all — so the pre-fix behaviour dispatched a zero-delta wheel and answered

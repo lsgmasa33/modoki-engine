@@ -97,13 +97,27 @@ function pbxproj(opts: { team?: string; ext?: { team?: string } } = {}): string 
     body += cfgBlock(U.extDebug, 'Debug', opts.ext.team) + cfgBlock(U.extRelease, 'Release', opts.ext.team)
       + listBlock(U.extList, 'MyExtension', U.extDebug, U.extRelease);
   }
-  return `// !$*UTF8*$!\n{${body}\n}\n`;
+  // The debug.xcconfig file reference + its group membership are part of EVERY real Capacitor
+  // project, and the Release-wrapper attach keys off them (it refuses to invent references into a
+  // shape it does not recognise). Without them here the fixture silently skipped that path.
+  const xcconfigRefs = `
+\t\t958DCC722DB07C7200EA8C5F /* debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = debug.xcconfig; path = ../debug.xcconfig; sourceTree = SOURCE_ROOT; };
+\t\t504EC3061FED79650016851F /* Products */ = {
+\t\t\tisa = PBXGroup;
+\t\t\tchildren = (
+\t\t\t\t958DCC722DB07C7200EA8C5F /* debug.xcconfig */,
+\t\t\t);
+\t\t};`;
+  return `// !$*UTF8*$!\n{${xcconfigRefs}${body}\n}\n`;
 }
 
 function writePbxproj(content: string) {
   const dir = path.join(root, 'ios', 'App', 'App.xcodeproj');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'project.pbxproj'), content);
+  // Capacitor's own file. Laid down by default because the heal REFUSES to strip the pbxproj
+  // team unless both configurations are wired, and Debug's wiring is an include in this file.
+  fs.writeFileSync(path.join(root, 'ios', 'debug.xcconfig'), 'CAPACITOR_DEBUG = true\n');
 }
 function readPbxproj(): string {
   return fs.readFileSync(path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj'), 'utf8');
@@ -168,24 +182,53 @@ describe('healNativeConfig — android/local.properties', () => {
 });
 
 describe('healNativeConfig — iOS DEVELOPMENT_TEAM', () => {
-  it('inserts DEVELOPMENT_TEAM into every block that lacks it', () => {
+  // ⚠️ These four USED to assert the Team ID was written INTO the pbxproj. That expectation was
+  // the defect, not the contract: the pbxproj is tracked, so every heal put an owner-private value
+  // back into git where `privateBuildFields.test.ts` could not see it (#172 closed this for
+  // project.config.json and missed the second home). The value now lives in the GITIGNORED
+  // ios/modoki.local.xcconfig and is stripped OUT of the pbxproj. What survives unchanged is the
+  // target scoping — that intent was always right.
+  const localXcconfig = () => fs.readFileSync(path.join(root, 'ios', 'modoki.local.xcconfig'), 'utf8');
+
+  it('puts the team in the gitignored xcconfig and NOT in the tracked pbxproj', () => {
     writePbxproj(pbxproj());
     writeConfig('ABCDE12345');
     healNativeConfig(root);
-    const out = readPbxproj();
-    const count = (out.match(/DEVELOPMENT_TEAM = ABCDE12345;/g) || []).length;
-    expect(count).toBe(2); // Debug + Release
-    // Inserted right after PRODUCT_NAME.
-    expect(out).toMatch(/PRODUCT_NAME = "\$\(TARGET_NAME\)";\n\s*DEVELOPMENT_TEAM = ABCDE12345;/);
+    expect(localXcconfig()).toContain('DEVELOPMENT_TEAM = ABCDE12345');
+    expect(readPbxproj()).not.toContain('ABCDE12345');
   });
 
-  it('corrects a stale team value without duplicating', () => {
+  it('strips a previously committed team out of the pbxproj', () => {
     writePbxproj(pbxproj({ team: 'OLDTEAM123' }));
     writeConfig('ABCDE12345');
     healNativeConfig(root);
     const out = readPbxproj();
+    // Both the stale value and the setting itself are gone — a blank would SHADOW the xcconfig,
+    // because a target's buildSettings beat its baseConfigurationReference.
     expect(out).not.toContain('OLDTEAM123');
-    expect((out.match(/DEVELOPMENT_TEAM = ABCDE12345;/g) || []).length).toBe(2);
+    expect(out).not.toMatch(/DEVELOPMENT_TEAM/);
+    expect(localXcconfig()).toContain('DEVELOPMENT_TEAM = ABCDE12345');
+  });
+
+  it('wires BOTH configurations — Debug via debug.xcconfig, Release via its own wrapper', () => {
+    // Capacitor attaches debug.xcconfig to the DEBUG configs only, so a Debug-only include leaves
+    // the configuration that actually ships with no team. Measured against the real toolchain with
+    // `xcodebuild -showBuildSettings -configuration Release`.
+    writePbxproj(pbxproj());
+    writeConfig('ABCDE12345');
+    healNativeConfig(root);
+    expect(fs.readFileSync(path.join(root, 'ios', 'debug.xcconfig'), 'utf8'))
+      .toContain('#include? "modoki.local.xcconfig"');
+    // The Release wrapper is TRACKED, so it must carry the include and never the value.
+    const wrapper = fs.readFileSync(path.join(root, 'ios', 'modoki.xcconfig'), 'utf8');
+    expect(wrapper).toContain('#include? "modoki.local.xcconfig"');
+    expect(wrapper).not.toContain('ABCDE12345');
+    const out = readPbxproj();
+    expect(out).toContain('modoki.xcconfig');
+    // Attached to Release (which Capacitor left with no base configuration) …
+    expect(out).toMatch(/\/\* Release \*\/ = \{\n\s*isa = XCBuildConfiguration;\n\s*baseConfigurationReference = \w+ \/\* modoki\.xcconfig \*\//);
+    // … and NOT to Debug, whose own base configuration must not be displaced.
+    expect(out).not.toMatch(/\/\* Debug \*\/ = \{\n\s*isa = XCBuildConfiguration;\n\s*baseConfigurationReference = \w+ \/\* modoki\.xcconfig \*\//);
   });
 
   it('is idempotent — a second pass changes nothing', () => {
@@ -204,23 +247,38 @@ describe('healNativeConfig — iOS DEVELOPMENT_TEAM', () => {
     expect(readPbxproj()).not.toContain('DEVELOPMENT_TEAM');
   });
 
-  it('does NOT flatten a separate target\'s team (D2)', () => {
-    // App target has no team (heal inserts), a second target carries its own.
+  it('refuses to strip when a configuration is NOT wired — never leaves a project teamless', () => {
+    // The strip destroys the last copy of the value, so it is only safe once something supplies it.
+    // Here Debug cannot be wired (no debug.xcconfig), so the committed team must survive — a heal
+    // that stripped anyway would break signing with Xcode's cryptic "requires a development team",
+    // and there would be nothing left to restore from.
+    writePbxproj(pbxproj({ team: 'OLDTEAM123' }));
+    fs.rmSync(path.join(root, 'ios', 'debug.xcconfig'));
+    writeConfig('ABCDE12345');
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(readPbxproj()).toContain('OLDTEAM123');   // untouched
+    expect(notes).toContain('not wired');            // and it SAYS so rather than failing silently
+  });
+
+  it('does NOT strip a separate target\'s team (D2)', () => {
+    // Same intent as before the xcconfig move: the App target is ours to rewrite, an extension's
+    // signing is not. Only the direction changed — we remove rather than insert.
     writePbxproj(pbxproj({ ext: { team: 'EXTTEAM123' } }));
     writeConfig('ABCDE12345');
     healNativeConfig(root);
     const out = readPbxproj();
-    expect((out.match(/DEVELOPMENT_TEAM = ABCDE12345;/g) || []).length).toBe(2); // App Debug+Release only
     expect((out.match(/DEVELOPMENT_TEAM = EXTTEAM123;/g) || []).length).toBe(2); // extension untouched
+    expect(out).not.toContain('ABCDE12345');
   });
 
-  it('corrects the empty-quoted DEVELOPMENT_TEAM = ""; form (D2)', () => {
+  it('removes the empty-quoted DEVELOPMENT_TEAM = ""; form rather than filling it (D2)', () => {
+    // The blank is the dangerous case: left in place it wins over the xcconfig and signing fails
+    // in a way that looks exactly like a missing team.
     writePbxproj(pbxproj({ team: '""' }));
     writeConfig('ABCDE12345');
     healNativeConfig(root);
-    const out = readPbxproj();
-    expect(out).not.toContain('DEVELOPMENT_TEAM = "";');
-    expect((out.match(/DEVELOPMENT_TEAM = ABCDE12345;/g) || []).length).toBe(2);
+    expect(readPbxproj()).not.toContain('DEVELOPMENT_TEAM = "";');
+    expect(localXcconfig()).toContain('DEVELOPMENT_TEAM = ABCDE12345');
   });
 
   it('bails safely when the App target config list is absent (no flatten)', () => {
@@ -773,6 +831,103 @@ describe('healNativeConfig — Android debugBuild meta-data (#112)', () => {
   it('no-op when the project has no android/ folder', () => {
     writeConfig('', true); writeGameDebugDep();
     expect(() => healNativeConfig(root)).not.toThrow();
+  });
+});
+
+describe('healNativeConfig — Android game mode (#228)', () => {
+  const MANIFEST = ['android', 'app', 'src', 'main', 'AndroidManifest.xml'];
+  const GAME_MODE_XML = ['android', 'app', 'src', 'main', 'res', 'xml', 'game_mode_config.xml'];
+  const readManifest = () => fs.readFileSync(path.join(root, ...MANIFEST), 'utf8');
+
+  /** Carries `${applicationId}` on purpose — a `$`-bearing manifest is what a string
+   *  replacement would corrupt, and Capacitor's real FileProvider block has one. */
+  function writeManifest() {
+    fs.mkdirSync(path.join(root, 'android', 'app', 'src', 'main'), { recursive: true });
+    fs.writeFileSync(path.join(root, ...MANIFEST),
+      '<?xml version="1.0" encoding="utf-8"?>\n<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n\n' +
+      '    <application\n        android:allowBackup="true"\n        android:label="@string/app_name">\n' +
+      '        <activity android:name=".MainActivity" android:exported="true" />\n' +
+      '        <provider android:authorities="${applicationId}.fileprovider" android:exported="false" />\n' +
+      '    </application>\n\n' +
+      '    <uses-permission android:name="android.permission.INTERNET" />\n</manifest>\n');
+  }
+
+  it('declares the app a game — appCategory, the config resource, and the meta-data wiring it', () => {
+    writeManifest(); writeConfig('');
+    healNativeConfig(root);
+    const m = readManifest();
+    expect(m).toContain('android:appCategory="game"');
+    expect(m).toContain('<meta-data android:name="android.game_mode_config" android:resource="@xml/game_mode_config" />');
+    expect(m.indexOf('android.game_mode_config')).toBeLessThan(m.indexOf('</application>'));
+
+    const xml = fs.readFileSync(path.join(root, ...GAME_MODE_XML), 'utf8');
+    // Opted OUT: an OS-imposed downscale or fps cap would fight the engine's own quality tiers
+    // and corrupt live tier calibration (#227). This is what the file is FOR.
+    expect(xml).toContain('android:allowGameDownscaling="false"');
+    expect(xml).toContain('android:allowGameFpsOverride="false"');
+  });
+
+  it('claims NO game-mode support, because nothing reads GameManager.getGameMode()', () => {
+    // Declaring a mode is a promise the app adapts itself when the user selects it. The engine has
+    // no GameManager binding, so `true` here would advertise behaviour that does not exist —
+    // CLAUDE.md's "an unwired field is a lie with a tooltip", aimed at the OS. Flip one to `true`
+    // only in the change that adds the binding AND acts on it; this test is the tripwire for that.
+    writeManifest(); writeConfig('');
+    healNativeConfig(root);
+    const xml = fs.readFileSync(path.join(root, ...GAME_MODE_XML), 'utf8');
+    expect(xml).toContain('android:supportsBatteryGameMode="false"');
+    expect(xml).toContain('android:supportsPerformanceGameMode="false"');
+  });
+
+  it('leaves the rest of the manifest byte-intact, including a ${applicationId} token', () => {
+    writeManifest(); writeConfig('');
+    healNativeConfig(root);
+    const m = readManifest();
+    expect(m).toContain('android:authorities="${applicationId}.fileprovider"');
+    expect(m).toContain('<activity android:name=".MainActivity"');
+    expect(m).toContain('android:allowBackup="true"');
+  });
+
+  it('is idempotent — a second heal changes nothing and duplicates nothing', () => {
+    writeManifest(); writeConfig('');
+    healNativeConfig(root);
+    const once = readManifest();
+    healNativeConfig(root);
+    expect(readManifest()).toBe(once);
+    expect((once.match(/android:appCategory=/g) || []).length).toBe(1);
+    expect((once.match(/android\.game_mode_config/g) || []).length).toBe(1);
+  });
+
+  it('rewrites its own fence rather than appending a second one', () => {
+    writeManifest(); writeConfig('');
+    healNativeConfig(root);
+    // Corrupt the generated block; the fence must be replaced in place.
+    const stale = readManifest().replace('@xml/game_mode_config', '@xml/stale_name');
+    fs.writeFileSync(path.join(root, ...MANIFEST), stale);
+    healNativeConfig(root);
+    const m = readManifest();
+    expect(m).not.toContain('stale_name');
+    expect((m.match(/modoki:game-mode-begin/g) || []).length).toBe(1);
+  });
+
+  it('restores the config resource if it is deleted', () => {
+    writeManifest(); writeConfig('');
+    healNativeConfig(root);
+    fs.rmSync(path.join(root, ...GAME_MODE_XML));
+    healNativeConfig(root);
+    expect(fs.existsSync(path.join(root, ...GAME_MODE_XML))).toBe(true);
+  });
+
+  it('applies WITHOUT the game-debug dep — unlike the debugBuild meta-data, this is unconditional', () => {
+    writeManifest(); writeConfig(''); // no writeGameDebugDep()
+    healNativeConfig(root);
+    expect(readManifest()).toContain('android:appCategory="game"');
+  });
+
+  it('no-op when the project has no android/ folder', () => {
+    writeConfig('');
+    expect(() => healNativeConfig(root)).not.toThrow();
+    expect(fs.existsSync(path.join(root, ...GAME_MODE_XML))).toBe(false);
   });
 });
 

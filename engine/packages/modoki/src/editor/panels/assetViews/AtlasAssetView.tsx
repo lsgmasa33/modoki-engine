@@ -7,7 +7,7 @@
  *  the live manifest (`getAssetEntry(guid).atlas`) for the page preview + stats — it
  *  refreshes after a Re-pack via the watcher's manifest broadcast. */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { backendFetch } from '../../backend/editorBackend';
 import { writeAssetFile } from '../assetOps';
 import { useEditorStore } from '../../store/editorStore';
@@ -19,21 +19,13 @@ import { AssetRefField } from '../AssetRefField';
 import { inputStyle } from '../fields';
 import { reimportBtnStyle } from './widgets';
 import { withCurrentValue } from './importSettingOptions';
-
-interface AtlasSourceDoc {
-  id?: string;
-  version?: number;
-  members: string[];
-  pageSize: number;
-  padding: number;
-  extrude: number;
-  maxPages?: number;
-}
-
-const DEFAULT_DOC: AtlasSourceDoc = { members: [], pageSize: 1024, padding: 2, extrude: 1 };
+import { parseAtlasDoc, serializeAtlasDoc, DEFAULT_ATLAS_DOC, type AtlasSourceDoc } from './atlasDoc';
 
 export function AtlasAssetView({ path, name }: { path: string; name: string }) {
-  const [doc, setDoc] = useState<AtlasSourceDoc>(DEFAULT_DOC);
+  const [doc, setDoc] = useState<AtlasSourceDoc>(DEFAULT_ATLAS_DOC);
+  // The file as READ, so a write carries through every key this view does not model —
+  // the `texture` block above all. Without it, one member edit deleted it off disk.
+  const rawRef = useRef<Record<string, unknown>>({});
   const [packing, setPacking] = useState(false);
   const [blockVersion, setBlockVersion] = useState(0); // bump to re-read the manifest block
   const refreshAssets = useEditorStore((s) => s.refreshAssets);
@@ -53,14 +45,8 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
       .then((r) => (r.ok ? r.json() : null))
       .then((d: Partial<AtlasSourceDoc> | null) => {
         if (!d) return;
-        setDoc({
-          id: d.id, version: d.version,
-          members: Array.isArray(d.members) ? d.members.filter((m): m is string => typeof m === 'string') : [],
-          pageSize: typeof d.pageSize === 'number' ? d.pageSize : 1024,
-          padding: typeof d.padding === 'number' ? d.padding : 2,
-          extrude: typeof d.extrude === 'number' ? d.extrude : 1,
-          ...(typeof d.maxPages === 'number' ? { maxPages: d.maxPages } : {}),
-        });
+        rawRef.current = d as Record<string, unknown>;
+        setDoc(parseAtlasDoc(d));
       })
       .catch(() => { /* keep defaults */ });
     return () => ac.abort();
@@ -71,7 +57,7 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
   const update = useCallback((patch: Partial<AtlasSourceDoc>) => {
     setDoc((prev) => {
       const next = { ...prev, ...patch, version: 1 as const };
-      void writeAssetFile(path, JSON.stringify(next, null, 2));
+      void writeAssetFile(path, serializeAtlasDoc(rawRef.current, next));
       return next;
     });
   }, [path]);

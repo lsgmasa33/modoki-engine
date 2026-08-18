@@ -597,8 +597,9 @@ export async function focusElement(
  *  `sendInputEvent` char events flow through Chromium's input pipeline, so a React
  *  controlled input (e.g. the Inspector's BufferedTextInput) fires its real
  *  onChange — a synthetic `element.value =` would not. Focus the target first
- *  (e.g. `tap` on the input). `clearFirst` selects-all + deletes so the field is
- *  replaced rather than appended; `submitKey` presses a terminal key afterward —
+ *  (e.g. `tap` on the input). `clearFirst` selects the field's contents (in the renderer — a
+ *  native Cmd+A accelerator is unreachable from `sendInputEvent`) and deletes them with a trusted
+ *  Backspace, so the field is replaced rather than appended, and says so if it could not; `submitKey` presses a terminal key afterward —
  *  'Tab'/'Escape' BLUR the field (the key case for verifying commit-on-blur),
  *  'Enter' submits. */
 /** TWO DIFFERENT QUESTIONS, deliberately not one predicate (measured 2026-07-22).
@@ -635,6 +636,62 @@ export const ACTIVE_ELEMENT_PROBE = `(() => {
 async function readActiveElement(wc: Electron.WebContents): Promise<{ typable: boolean; gameSwallows: boolean; descriptor: string | null }> {
   return wc.executeJavaScript(ACTIVE_ELEMENT_PROBE, true)
     .catch(() => ({ typable: false, gameSwallows: false, descriptor: null }));
+}
+
+/** Select the focused field's entire contents, from INSIDE the renderer.
+ *
+ *  NOT Cmd+A. On macOS Select All in a text field is a native Edit-menu ACCELERATOR, and
+ *  Chromium's `sendInputEvent` does not trigger native menu accelerators — `pressKey`'s own
+ *  description already says so. So the old clearFirst sent an inert Cmd+A followed by a
+ *  Backspace that deleted exactly ONE character, and the caller got old-text-minus-a-letter with
+ *  the new text appended, reported as `{ok:true, typed:<full length>}`. Selection is not input,
+ *  so doing it in the renderer costs nothing in fidelity: the DELETE that follows is still a
+ *  trusted key event, which is the part a React controlled input must see.
+ *
+ *  Returns the selected text (so the caller knows how much to delete), or null if there is
+ *  nothing selectable. */
+const SELECT_ALL_PROBE = `(() => {
+  const a = document.activeElement;
+  if (!a) return null;
+  if (a.isContentEditable === true) {
+    const r = document.createRange();
+    r.selectNodeContents(a);
+    const sel = window.getSelection();
+    if (!sel) return null;
+    sel.removeAllRanges();
+    sel.addRange(r);
+    return a.textContent || '';
+  }
+  if (typeof a.select === 'function') { a.select(); return a.value == null ? '' : String(a.value); }
+  return null;
+})()`;
+
+/** Empty the focused field. Returns undefined on success, or an explanation of what is STILL in
+ *  it — clearFirst failing silently is what made the original bug invisible. */
+async function clearFocusedField(wc: Electron.WebContents): Promise<string | undefined> {
+  const selected: string | null = await wc.executeJavaScript(SELECT_ALL_PROBE, true).catch(() => null);
+  if (selected === null) return undefined; // nothing selectable (canvas/div) — nothing to clear
+  const backspace = async () => {
+    wc.sendInputEvent({ type: 'keyDown', keyCode: 'Backspace' } as Electron.KeyboardInputEvent);
+    wc.sendInputEvent({ type: 'keyUp', keyCode: 'Backspace' } as Electron.KeyboardInputEvent);
+    await sleep(8);
+  };
+  await backspace(); // deletes the whole SELECTION in one press
+  let left = await readFocusedValue(wc);
+  // Belt and braces for a field that re-seeds itself or swallows the selection: delete what is
+  // left one character at a time, bounded by its own length so this can never spin.
+  for (let i = 0; left && i < left.length + 1 && i < 256; i++) {
+    await backspace();
+    const next = await readFocusedValue(wc);
+    if (next === left) break; // no progress — stop rather than hammer the field
+    left = next;
+  }
+  if (left) {
+    return `clearFirst did NOT empty the field — it still holds ${JSON.stringify(left)}, so what `
+      + 'you typed is appended to it rather than replacing it. Clear it through the app\'s own UI, '
+      + 'or set the value with modoki_eval.';
+  }
+  return undefined;
 }
 
 /** Read the focused element's current text — the MEASUREMENT `typed` is derived from (S3.18).
@@ -680,16 +737,8 @@ export async function typeText(
   if (!active.typable) return { typed: 0, editable: false, activeElement: active.descriptor };
   // Read BEFORE `clearFirst` runs? No — after it, so the delta measures what THIS call inserted
   // rather than counting the cleared text as a negative.
-  if (opts?.clearFirst) {
-    // Cmd+A (macOS) / Ctrl+A elsewhere, then Backspace — empty the field first.
-    const mod = process.platform === 'darwin' ? 'meta' : 'control';
-    wc.sendInputEvent({ type: 'keyDown', keyCode: 'a', modifiers: [mod] } as Electron.KeyboardInputEvent);
-    wc.sendInputEvent({ type: 'keyUp', keyCode: 'a', modifiers: [mod] } as Electron.KeyboardInputEvent);
-    await sleep(8);
-    wc.sendInputEvent({ type: 'keyDown', keyCode: 'Backspace' } as Electron.KeyboardInputEvent);
-    wc.sendInputEvent({ type: 'keyUp', keyCode: 'Backspace' } as Electron.KeyboardInputEvent);
-    await sleep(8);
-  }
+  let clearError: string | undefined;
+  if (opts?.clearFirst) clearError = await clearFocusedField(wc);
   const before: string | null = await readFocusedValue(wc);
   for (const ch of text) {
     // Only the `char` event inserts text; keyDown/keyUp bracket it so key handlers
@@ -711,7 +760,10 @@ export async function typeText(
   // wrapper, say) — then there is nothing to measure and `typed` falls back to the request, which
   // is at least no worse than before and is not dressed up as an observation.
   if (before === null || after === null) {
-    return { typed: text.length, editable: true, activeElement: active.descriptor, valueAfter: after };
+    return {
+      typed: text.length, editable: true, activeElement: active.descriptor, valueAfter: after,
+      ...(clearError ? { error: clearError } : {}),
+    };
   }
   // WHAT LANDED, not how much the length grew (independent review, 2026-07-30). A length delta is
   // the insert count only when typing APPENDS — but Chromium replaces the current SELECTION, so
@@ -725,6 +777,15 @@ export async function typeText(
   // append and replace, and needs no knowledge of what was selected.
   const landed = text.length === 0 || after.includes(text);
   const inserted = landed ? text.length : Math.max(0, after.length - before.length);
+  // A clearFirst that did not clear is a FAILURE even when the typed text landed: the field then
+  // holds old+new concatenated, and `ok:true` with a correct `typed` count hides it completely
+  // (the bug this replaced produced 'New EntitBuffalo Fort' and reported success).
+  if (clearError) {
+    return {
+      typed: inserted, editable: true, activeElement: active.descriptor, valueAfter: after,
+      error: clearError,
+    };
+  }
   return {
     typed: inserted,
     editable: true,

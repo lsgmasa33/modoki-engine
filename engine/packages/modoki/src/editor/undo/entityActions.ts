@@ -363,7 +363,16 @@ export function snapshotEntity(entityId: number): EntitySnapshot | null {
   for (const meta of getAllTraits()) {
     if (!entity.has(meta.trait)) continue;
     if (meta.category === 'tag') { traits.push({ meta, data: true }); }
-    else { const data = readTraitData(entityId, meta); if (data) traits.push({ meta, data: { ...data } }); }
+    else {
+      // readTraitDataFull, not the curated readTraitData: off-meta fields (Animator.clips /
+      // .clip, AnimationLibrary.animSets, SkinnedMeshRenderer.materials — anything a custom
+      // Inspector section owns and `fields` therefore omits) are real persistent state, and
+      // readTraitData drops them, so a duplicate/paste/delete-undo silently came back empty.
+      // cloneTraitValues because Full hands back LIVE references into the trait store — two
+      // entities sharing one array is the other half of this bug.
+      const data = readTraitDataFull(entityId, meta);
+      if (data) traits.push({ meta, data: cloneTraitValues(data) });
+    }
   }
   const childEntities = getAllEntities().filter(e => e.parentId === entityId);
   const children = childEntities.map(c => snapshotEntity(c.id)).filter((s): s is EntitySnapshot => s !== null);

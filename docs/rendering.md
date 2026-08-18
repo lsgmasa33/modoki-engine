@@ -618,6 +618,46 @@ The one number here with neither a measurement nor a carry-forward is the **1024
 ceiling**: 512 is measured unusable and 2048 is what projects author, so it is the step between.
 Worst case it renders coarser shadows than intended, which costs quality and not the frame.
 
+#### A frame time measured on a big.LITTLE phone is a LITTLE-core number — and that is the shipping budget
+
+Every CPU figure above from the Galaxy A23 was produced with the **big cores idle**. Sampling the
+frame-critical threads while `demos/forest-camp` renders puts `RenderThread` on the LITTLE cluster
+in ~27 of 30 samples and `Chrome_InProcGpu` / `VizWebView` / `mali-cmar-backend` / the main thread
+at ~0 of 30 — while cpu6/cpu7 idle around **985 MHz of a 2203 MHz ceiling**. The little cores are
+`cpu_capacity` **367**; the big ones **1024**. So there is a 2.8× machine sitting unused next to
+every low-end measurement this doc reports.
+
+**It is not reachable from the app, and that is measured, not assumed** (#228). Three independent
+findings, each sufficient on its own:
+
+- **ADPF — the sanctioned API for this — is unsupported.** `dumpsys performance_hint` reports
+  `HAL Support: false` and `HintSessionPreferredRate: -1`, so `createHintSession()` returns null.
+  The other low-end phone here (Huawei MRD-LX3, Android 9) has no `performance_hint` service at all.
+- **The mechanism ADPF drives does not exist on this kernel.** Its whole effect is `uclamp.min`, and
+  `/dev/cpuctl/top-app/cpu.uclamp.min` is absent — the device is on the older **schedtune** scheme.
+- **The scheduler is behaving correctly.** `/dev/stune/top-app/schedtune.boost` is **0** and
+  `prefer_idle` **0** — this OEM gives the *foreground* group no boost — and with the misfit
+  threshold at ~80% of 367, no single one of our four render threads is ever heavy enough to be
+  flagged for migration. The work is split four ways, so none of them qualifies.
+
+**Declaring the app a game does not change it either.** `android:appCategory="game"` plus a
+`game_mode_config.xml` (both now healed in by `healNativeConfig`) *do* register the app —
+`dumpsys game` went from an empty dump to listing the package — and moved placement not at all:
+A/B/A, 30 samples per arm, `RenderThread` on a big core **3/30 → 4/30 → 4/30**, cpu7 median 985 MHz
+in all three arms. Those keys are kept for the intervention opt-outs (below), not as a perf fix.
+**Do not re-run this experiment.**
+
+The consequence is the useful part, and it points the opposite way from the intuition that started
+it: the A55 numbers are **not** conservative readings that a scheduling fix would improve on — they
+are the budget the game actually ships into. Content levers keep their full weight. It also means a
+single before/after frame-time reading on this device proves nothing: `cpuMs` swings 13.0–18.1 ms
+with no input change, which is this same placement lottery, so alternate A/B/A.
+
+⚠️ The one thing the app *can* control is letting the OS make it worse. `game_mode_config.xml` sets
+`allowGameDownscaling="false"` and `allowGameFpsOverride="false"`: those are Android's compat
+interventions for games that do not manage their own quality, and an OS-imposed fps cap would be
+read by live tier calibration as the device being slow — demoting it for a slowdown the OS imposed.
+
 #### ⭐ A TIER'S CONTENT IS AUTHORED BY THE PROJECT — `TIER_SETTINGS` is only the seed
 
 Owner decision, 2026-08-11. The table above is **not** what runs any more; it is what a project

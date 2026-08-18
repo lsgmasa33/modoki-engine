@@ -79,7 +79,12 @@ const TYPEABLE_EXTS = new Set([
 ]);
 
 function classify(virtualPath: string): string {
-  if (virtualPath.endsWith('.meta.json')) return 'meta';
+  // BOTH sidecar halves — the committed `.meta.json` and the gitignored machine-local
+  // `.meta.local.json` (plugins/meta-sidecar.ts). The local half fell through to
+  // 'unknown-json' and so was reported as its OWN orphan, giving every freshly imported
+  // texture a phantom second row in "Clean Up Unused Assets" that could not be bundled
+  // away with its parent. The scanner's detectType() already excludes both forms.
+  if (virtualPath.endsWith('.meta.json') || virtualPath.endsWith('.meta.local.json')) return 'meta';
   // Committed UltraHDR variant (`<src>.hdr~ultrahdr.jpg`) — a DERIVED file next to its
   // source HDR, NOT a texture. Mirrors the scanner's detectType() exclusion so the two
   // classifiers stay in lockstep (else it'd be logged as a dropped/orphan texture).

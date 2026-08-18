@@ -87,3 +87,76 @@ describe('private build fields never reach a committed file (#172)', () => {
     expect(tracked('*project.user.json', 'project.user.json')).toEqual([]);
   });
 });
+
+/** The SECOND home of the Apple Team ID, and the one #172 never reached: the Xcode project.
+ *
+ *  `healNativeConfig` writes `build.appleTeamId` into `ios/App/App.xcodeproj/project.pbxproj` as
+ *  `DEVELOPMENT_TEAM`, because that file is the BUILD INPUT — signing genuinely needs the value
+ *  there, so the #172 trick (keep the committed copy blank, overlay at load) does not transfer.
+ *  The pbxproj is also tracked. So the value lands in a committed file by design, and the guard
+ *  above cannot see it: it reads `project.config.json`, never a pbxproj.
+ *
+ *  Found 2026-08-18 while healing a manifest change across every project — the sweep ran the WHOLE
+ *  heal, silently planting the owner's real Team ID in a publishable demo's pbxproj. Four such
+ *  lines already existed in `demos/2d-physics-demo` + `demos/3d-physics-demo`, committed and green.
+ *
+ *  Scoped to `demos/` deliberately, and NOT widened to `games/`:
+ *
+ *  - **`demos/` is the publishable set.** Its whole point is that it can be pushed to a public repo.
+ *  - **`games/` never ships** (the snapshot drops it by construction), and the owner signs those
+ *    projects from this machine — blanking them would fight the workflow the heal exists to serve,
+ *    to protect content that has no publish path. 14 committed Team IDs live there on purpose.
+ *
+ *  This is NOT the thing standing between the value and a public repo — both publish scripts delete
+ *  `ios/` from the stage and verify the deletion, and `publish-engine-oss.sh` step 3b3 greps the
+ *  whole stage for the real IDs. It closes the gap those leave: 3b3 is hub-only AND skips when the
+ *  gitignored `project.user.json` is absent (so the public CI run never greps at all), and the
+ *  `ios/`-drop only protects a demo published WITHOUT native. The moment someone publishes a demo
+ *  with its Xcode project — a plausible ask — the incidental protection is gone. `npm test` runs on
+ *  every clone.
+ *
+ *  Reads the INDEX, not the working tree, and that distinction is load-bearing: the heal legitimately
+ *  refills the working-tree copy whenever a demo with a local Team ID is opened or built, so a
+ *  working-tree read would go red on ordinary work and get muted. What matters is what is about to
+ *  be COMMITTED. */
+describe('a demo never commits an Apple Team ID in its Xcode project', () => {
+  const pbxprojs = tracked('demos/*/ios/**/project.pbxproj');
+
+  // ⚠️ The FLOOR is layout-gated; the ASSERTION below is NOT, and that split is the point.
+  //
+  // Gating the whole describe on `hasInternalGames()` was the first version, and it is exactly the
+  // proxy mistake `repoLayout.ts` documents ("gate on the thing the test actually needs, not on a
+  // proxy that happens to correlate with it today"). What this guard needs is *demo pbxproj files
+  // in the index*; `hasInternalGames()` answers a question about `games/`. The two agree on all
+  // three layouts that exist today — and disagree on precisely the one this guard exists for: a
+  // snapshot shipping demos WITH their Xcode projects, no games. There the proxy reads false and
+  // the guard would have switched itself off in the only situation where the Team ID could ship.
+  //
+  // So: an empty list makes the assertion trivially pass (correct — nothing to check), while the
+  // non-vacuity floor runs only where a real count is knowable.
+  it.skipIf(!hasInternalGames())('finds demo Xcode projects to check — a vacuous pass is a failure', () => {
+    // Six demos carry native today. The floor sits under that so deleting one is not a false red,
+    // but above zero so a path/rename change cannot switch the guard off silently.
+    expect(pbxprojs.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it('every committed demo pbxproj has a blank DEVELOPMENT_TEAM', () => {
+    const offenders: string[] = [];
+    for (const rel of pbxprojs) {
+      // `git show :<path>` is the staged content — what a commit from here would record.
+      const staged = execFileSync('git', ['show', `:${rel}`], {
+        cwd: repoRoot, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+      });
+      for (const line of staged.split('\n')) {
+        const m = line.match(/DEVELOPMENT_TEAM = (.+);\s*$/);
+        // Structural, like the guard above: anything that is not the empty string is a finding,
+        // so this needs no knowledge of the owner's real IDs and behaves the same on every clone.
+        if (m && m[1].trim() !== '""') offenders.push(`${rel}: ${m[1].trim()}`);
+      }
+    }
+    expect(
+      offenders,
+      'a demo is publishable — its Team ID belongs in the gitignored project.user.json, which healNativeConfig applies locally',
+    ).toEqual([]);
+  });
+});

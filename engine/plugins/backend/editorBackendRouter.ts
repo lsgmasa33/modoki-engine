@@ -332,6 +332,10 @@ function writeDataUrlToTemp(dataUrl: unknown): string {
 /** Atomic JSON write: tmp file + rename. (Mirrors the scanner's helper; kept
  *  local to avoid an import cycle.) */
 function writeJsonAtomic(absPath: string, data: unknown): void {
+  // Create parents, like /api/write-file does. Without this, creating the first asset of a
+  // kind a project has never held (no `timelines/` folder yet) died on a bare ENOENT — the
+  // two write routes disagreed on whether a missing directory is the caller's problem.
+  fs.mkdirSync(path.dirname(absPath), { recursive: true });
   const tmp = absPath + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
   fs.renameSync(tmp, absPath);
