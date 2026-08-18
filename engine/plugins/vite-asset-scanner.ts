@@ -61,7 +61,7 @@ import { type SpriteSlice, type SpriteAssetRef } from '../packages/modoki/src/ru
 import { type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
 import { type SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { handleBackendRequest, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
-import { reclaimStaleForwardsAtStartup } from './backend/deviceConnection';
+import { reclaimStaleForwardsAtStartup, deviceConnection } from './backend/deviceConnection';
 import { vendorEnginePlugins, writeVendorMarker } from './vendorPlugins';
 import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
 import { healNativeConfig } from './healNativeConfig';
@@ -1919,7 +1919,17 @@ export function assetScannerPlugin(): Plugin {
           let androidSerialError: string | null = null;
           let androidSerial = user.device.androidDeviceId;
           if (platform === 'android') {
-            const picked = resolveBuildAndroidSerial(listAndroidDevices(), { projectPin: user.device.androidDeviceId });
+            // The HELD LEASE's phone is consulted too (#235). The refusal this can produce
+            // offers `device_connect {useAdb:true, serial}` and the AI panel's picker as
+            // remedies — both of which act by opening a lease — so without this the build
+            // advertised two actions it then ignored, and an agent that followed the advice
+            // got the identical refusal on the next build. The lease is read HERE rather than
+            // inside resolveBuildAndroidSerial because androidDevices.ts must not import the
+            // lease manager (deviceConnection.ts imports IT; see that module's header).
+            // Only an adb lease carries a serial — a WiFi/IP lease has none, and reports undefined.
+            const lease = deviceConnection.status();
+            const leaseSerial = lease.state === 'connected' && lease.target?.useAdb ? lease.target.serial : undefined;
+            const picked = resolveBuildAndroidSerial(listAndroidDevices(), { projectPin: user.device.androidDeviceId, leaseSerial });
             if ('error' in picked) androidSerialError = picked.error;
             else androidSerial = picked.serial;
           }
@@ -2877,6 +2887,26 @@ export function assetScannerPlugin(): Plugin {
         ))
         : [];
       const result = computeKeptAssets(projectRoot, assetRoots, { excludeVideo: !buildModules.video });
+      // Build-time guard (#237): fail rather than ship a ref the structured walk could not see.
+      // computeKeptAssets' unreachableRefs is empty on every committed project today — a
+      // non-empty entry means probeTraitRefs (plugins/asset-tree-shaker.ts) has a blind spot
+      // like #237's (SkinnedMeshRenderer.materials, a nested Record no field-shape handler
+      // covered), and the asset it names resolves to nothing at runtime: dropped from the build,
+      // 404ing on-device with no dev-mode symptom to catch it first (dev serves everything off
+      // disk regardless of the shake). Deliberately BUILD-ONLY — the editor's own
+      // computeUnused() call (the "Clean Up Unused Assets" dialog, above in this file) must stay
+      // non-throwing, since it runs on every keystroke-adjacent editor action, not just a build.
+      if (result.unreachableRefs.length > 0) {
+        const detail = result.unreachableRefs
+          .map((r) => `  ${r.guid} → ${r.target} (referenced by ${r.referencedBy})`)
+          .join('\n');
+        throw new Error(
+          `[asset-shaker] found ${result.unreachableRefs.length} ref(s) the tree-shaker could not see:\n${detail}\n` +
+          `Each of these resolves to nothing at runtime — the asset is dropped from the build and the ` +
+          `value silently does not apply. Either teach the walker this ref shape (probeTraitRefs in ` +
+          `plugins/asset-tree-shaker.ts), remove the ref, or list the asset in this project's asset-keep.json.`,
+        );
+      }
       const CONVERTIBLE = new Set(['.png', '.jpg', '.jpeg']);
       const MODEL_EXTS = new Set(['.glb', '.gltf']);
       const AUDIO_EXTS = new Set(['.mp3', '.m4a', '.aac', '.wav', '.ogg', '.flac']);

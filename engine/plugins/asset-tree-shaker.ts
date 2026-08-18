@@ -20,6 +20,7 @@ import { resolveTextureType } from '../packages/modoki/src/runtime/loaders/textu
 import { ULTRAHDR_VARIANT_SUFFIX } from '../packages/modoki/src/runtime/core/environmentSettings';
 import { deriveGuid } from '../packages/modoki/src/runtime/core/assetRefRules';
 import { parseAnimClipBank } from '../packages/modoki/src/runtime/animation/animClipBank';
+import { parseClipBank } from '../packages/modoki/src/runtime/audio/clipBank';
 
 /** UUID v4 shape — matches the runtime assetManifest GUID_RE. */
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -44,6 +45,13 @@ export interface TreeShakeResult {
    *  consumer — this is the signal the build's `shipSource:'auto'` decision reads to
    *  decide whether the source `.ttf`/`.otf` is worth shipping alongside its atlas. */
   domFontFiles: Set<string>;
+  /** Refs the structured walk could not see: a GUID that appears in a KEPT
+   *  scene/prefab/… JSON and resolves (via the guid index) to a real shippable
+   *  asset that the shake DROPPED. Empty on every committed project today —
+   *  a non-empty entry means the walker has a blind spot like #237's, and the
+   *  build fails rather than shipping an asset ref that resolves to nothing on
+   *  a user's device. */
+  unreachableRefs: Array<{ guid: string; target: string; referencedBy: string }>;
 }
 
 export interface OrphanDetail {
@@ -309,13 +317,18 @@ function probeTraitRefs(traits: Record<string, unknown>, state: WalkState, refer
   // (buildGuidIndex). A trait field whose string value is a guid PRESENT in that index is, by
   // construction, a reference to a real asset — no per-game registration needed, ever, for any
   // game. Walk every trait bag's own fields (unwrapping one level of string array, to also catch
-  // an AnimationLibrary-shaped guid array on a game trait) and keep any hit.
+  // an AnimationLibrary-shaped guid array on a game trait; and one level of plain object, to also
+  // catch a SkinnedMeshRenderer.materials-shaped slot-name → guid map on a game trait — #237) and
+  // keep any hit.
   //
   // Deliberately does NOT warn on a miss, unlike the loop above: an ENTITY reference is also a
   // guid and is never in the asset index, so warning here would flood every build log with false
   // "unresolved ref" noise for ordinary entity refs. Pre-checking guidIndex membership before
   // calling pushRef is what keeps this silent on a miss (pushRef only warns when isGuid() is
-  // true and the index lookup fails — that branch is unreachable from this call site).
+  // true and the index lookup fails — that branch is unreachable from this call site). The same
+  // reasoning covers the object branch below: it's a GAME trait, so there's no registry to
+  // pre-declare its shape against, and a miss (an entity-ref guid nested in an object field) must
+  // stay silent for the same reason.
   for (const bag of Object.values(traits)) {
     if (!bag || typeof bag !== 'object') continue;
     for (const value of Object.values(bag as Record<string, unknown>)) {
@@ -323,6 +336,10 @@ function probeTraitRefs(traits: Record<string, unknown>, state: WalkState, refer
         if (isGuid(value) && state.guidIndex.has(value.toLowerCase())) pushRef(state, 'asset', value, referencedBy);
       } else if (Array.isArray(value)) {
         for (const el of value) {
+          if (typeof el === 'string' && isGuid(el) && state.guidIndex.has(el.toLowerCase())) pushRef(state, 'asset', el, referencedBy);
+        }
+      } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+        for (const el of Object.values(value as Record<string, unknown>)) {
           if (typeof el === 'string' && isGuid(el) && state.guidIndex.has(el.toLowerCase())) pushRef(state, 'asset', el, referencedBy);
         }
       }
@@ -366,26 +383,97 @@ function probeTraitRefs(traits: Record<string, unknown>, state: WalkState, refer
   if (animator && typeof animator === 'object') {
     for (const c of parseAnimClipBank(animator.clips)) pushRef(state, 'asset', c.clip, referencedBy);
   }
+
+  // SkinnedMeshRenderer.materials (#237) — per-material-slot overrides: original material
+  // NAME → a `.mat.json` guid (Record<string, string>). REF_FIELDS_BY_TRAIT only holds
+  // SCALAR fields, and this is a nested object, so it can't register there; the generic
+  // sweep above is also no help, because it only unwraps a `string`/`string[]`, not a
+  // record. Both walkers miss it identically, so it needs its own handler like
+  // MaterialInstance.overrides above. Use pushRef (not the guidIndex-gated sweep)
+  // deliberately: a slot pointing at a deleted material should surface as the
+  // `unresolved GUID ref:` warning, not vanish silently. Measured live: 11 refs across 3
+  // committed projects (forest-camp ×1, alien-animal ×5, timeline-demo ×5) were all
+  // tree-shaken out of production before this fix, 404ing on-device as
+  // "[MeshCache] Unknown asset guid: …" (#237).
+  const skinnedMeshRenderer = traits['SkinnedMeshRenderer'] as Record<string, unknown> | undefined;
+  if (skinnedMeshRenderer && typeof skinnedMeshRenderer === 'object' && skinnedMeshRenderer.materials && typeof skinnedMeshRenderer.materials === 'object') {
+    for (const v of Object.values(skinnedMeshRenderer.materials as Record<string, unknown>)) pushRef(state, 'material', v, referencedBy);
+  }
+
+  // AudioSource.clips — the named audio bank, a JSON-STRING `[{key, ref}]` of clip guids, exactly
+  // like Animator.clips above. Found by the #237 close-out sweep, which compared this walker's
+  // explicit handlers against the RUNTIME collector's (loadSceneFile.ts
+  // collectResourceRefsFromEntities): the runtime parsed this bank and the build did not, the same
+  // disagreement that WAS #237. `REF_FIELDS_BY_TRAIT` covers only the scalar `clip`, and the
+  // generic sweep cannot help — the bank is one JSON string, so isGuid() on it is false and every
+  // ref inside is invisible to it.
+  //
+  // Nothing is broken on committed content TODAY, and the reason is worth stating so nobody reads
+  // this as dead code: every committed AudioSource lives in a SCENE, and a scene carries a
+  // `resources[]` manifest (regenerated from the same runtime collector) which the walk above
+  // reads — so the bank refs are reached by that route. A prefab has no `resources[]`, so an
+  // AudioSource bank authored in a PREFAB was dropped: only the active `clip` shipped, and
+  // `audio.play` on any other key silently played nothing on device.
+  const audioSource = traits['AudioSource'] as Record<string, unknown> | undefined;
+  if (audioSource && typeof audioSource === 'object') {
+    for (const c of parseClipBank(audioSource.clips)) pushRef(state, 'asset', c.ref, referencedBy);
+  }
+}
+
+interface OverrideCarrier {
+  traits?: Record<string, unknown>;
+  prefab?: string;
+  /** `{ localId: { TraitName: { …fields } } }`. */
+  overrides?: Record<string, unknown>;
+  /** One level deeper — `{ path: { localId: { TraitName: { …fields } } } }`. */
+  nestedOverrides?: Record<string, Record<string, unknown>>;
+  /** Structural additions; a reference-style node is itself a nested instance. */
+  added?: unknown[];
+  children?: unknown[];
 }
 
 function extractEntityRefs(
-  entry: { traits?: Record<string, unknown>; prefab?: string; overrides?: Record<string, unknown> },
+  entry: OverrideCarrier,
   state: WalkState,
   referencedBy: string,
 ): void {
-  probeTraitRefs((entry.traits ?? {}) as Record<string, unknown>, state, referencedBy);
-
   // A prefab-instance's `overrides` map is { localId: { TraitName: { …fields } } }.
   // Each value is a trait-bag that can carry asset refs the base prefab lacks — walk
   // them like a trait-bag so an override-only ref (e.g. Animator.clip → wave.anim on
   // the bar instance) isn't shaken out.
-  if (entry.overrides && typeof entry.overrides === 'object') {
-    for (const bag of Object.values(entry.overrides)) {
+  const pushOverrideBags = (map: Record<string, unknown> | undefined): void => {
+    if (!map || typeof map !== 'object') return;
+    for (const bag of Object.values(map)) {
       if (bag && typeof bag === 'object') probeTraitRefs(bag as Record<string, unknown>, state, referencedBy);
     }
-  }
+  };
 
-  if (entry.prefab) pushRef(state, 'prefab', entry.prefab, referencedBy);
+  // `nestedOverrides` and `added` were walked by the RUNTIME collector
+  // (`collectResourceRefsFromEntities`, loadSceneFile.ts) and by nothing here — the third
+  // instance of #237's pattern, and the one a diff of the two walkers' TRAIT handlers does not
+  // reach, because this gap is structural rather than field-shaped. Mirrors that function
+  // deliberately: same four carriers, same recursion, so "which stores can hold an override?" is
+  // answered in one place and the two walkers can be compared by eye.
+  //
+  // Nothing in committed content hits it today (the only `nestedOverrides` user,
+  // space-console's Station.scene.json, overrides two scalar floats). The cost of leaving it was
+  // no longer a silent 404 either — since the unreachable-ref guard below, a ref authored here
+  // would FAIL THE BUILD instead, which is a hard stop on legitimate authoring.
+  const walkCarrier = (node: OverrideCarrier): void => {
+    probeTraitRefs((node.traits ?? {}) as Record<string, unknown>, state, referencedBy);
+    pushOverrideBags(node.overrides);
+    for (const byLocal of Object.values(node.nestedOverrides ?? {})) pushOverrideBags(byLocal);
+    if (node.prefab) pushRef(state, 'prefab', node.prefab, referencedBy);
+    // A reference-style added node carries its own subtree AND its own override shapes.
+    for (const child of node.added ?? []) {
+      if (child && typeof child === 'object') walkCarrier(child as OverrideCarrier);
+    }
+    for (const child of node.children ?? []) {
+      if (child && typeof child === 'object') walkCarrier(child as OverrideCarrier);
+    }
+  };
+
+  walkCarrier(entry);
 }
 
 function processSceneOrPrefab(json: unknown, state: WalkState, referencedBy: string): void {
@@ -664,6 +752,14 @@ function loadKeepList(projectRoot: string, roots: AssetRoot[]): string[] {
 
 // ── Main entry point ──────────────────────────────────
 
+/** The asset types the walk below OPENS and reads refs out of — everything else in the keep-set
+ *  is a leaf (a texture, a GLB, an audio clip). KEEP IN LOCKSTEP with the `type === …` branches
+ *  in the queue loop: the unreachable-ref guard scans exactly this set, so a walkable type
+ *  missing here would be walked but never audited. */
+const WALKABLE_TYPES = new Set([
+  'scene', 'prefab', 'mesh', 'material', 'shader', 'particle', 'animset', 'spriteanim', 'rig2d', 'timeline',
+]);
+
 export function computeKeptAssets(
   projectRoot: string,
   roots: AssetRoot[],
@@ -795,6 +891,55 @@ export function computeKeptAssets(
   const domFontFiles = new Set(fontFiles.map(f => f.normalize('NFC')));
   for (const virtual of fontFiles) state.keep.add(virtual);
 
+  // Build-time guard (#237): a GUID visible only by REGEX over a kept scene/prefab/mesh/
+  // material/particle/timeline/animset/spriteanim/rig2d file, that resolves through the guid
+  // index to a REAL shippable asset the structured walk above never queued. Any survivor here
+  // means the walker has a blind spot exactly like #237's (`SkinnedMeshRenderer.materials`, a
+  // nested Record neither REF_FIELDS_BY_TRAIT nor the generic sweep could see) — a ref a human
+  // reading the raw JSON can plainly see, that every `process*` function above missed because it
+  // assumed a field SHAPE the ref didn't match. This is the class catcher for the NEXT such
+  // shape, not just this one. Computed here — after font resolution, BEFORE the video-module
+  // drop below — so a deliberately EXCLUDED video clip is never flagged as "the walker missed
+  // this": it didn't; the toggle did, on purpose.
+  const GUID_SCAN_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+  const unreachableRefs: TreeShakeResult['unreachableRefs'] = [];
+  const seenUnreachable = new Set<string>(); // dedup key: `${guid}|${referencedBy}`
+  // A separate NFC-normalized snapshot of the keep-set, taken NOW (not the `keepNfc` built
+  // further below for the orphan report) — this check must run before excludeVideo prunes
+  // video clips out of state.keep, or a legitimately-dropped video ref would misreport as
+  // "unreachable" instead of "excluded".
+  const keepNfcForUnreachable = new Set<string>();
+  for (const p of state.keep) keepNfcForUnreachable.add(p.normalize('NFC'));
+  for (const virtualPath of state.keep) {
+    // Scan exactly what the queue loop WALKS, by asking classify() — not a suffix regex of
+    // this check's own. A second list of "files that carry refs" is the same drift this whole
+    // guard exists to catch: `classify` types a LEGACY pre-migration scene (a plain `.json`
+    // under `/scenes/`, no `.scene.json` suffix — see the NOTE on the queue loop) as 'scene'
+    // and walks it, and a suffix regex would have silently skipped auditing it.
+    if (!WALKABLE_TYPES.has(classify(virtualPath))) continue;
+    const abs = virtualToAbs(virtualPath, roots);
+    if (!abs || !fs.existsSync(abs)) continue; // unreadable/missing — already warned elsewhere
+    let text: string;
+    try {
+      text = fs.readFileSync(abs, 'utf-8');
+    } catch {
+      continue;
+    }
+    const ownNfc = virtualPath.normalize('NFC');
+    for (const m of text.matchAll(GUID_SCAN_RE)) {
+      const g = m[0];
+      const target = state.guidIndex.get(g.toLowerCase());
+      if (!target) continue; // not an asset guid — an entity ref, or a guid-shaped non-ref string
+      const targetNfc = target.normalize('NFC');
+      if (targetNfc === ownNfc) continue; // the file's own top-level `id`, not a ref to another asset
+      if (keepNfcForUnreachable.has(targetNfc)) continue; // already reachable through SOME path
+      const key = `${g.toLowerCase()}|${virtualPath}`;
+      if (seenUnreachable.has(key)) continue;
+      seenUnreachable.add(key);
+      unreachableRefs.push({ guid: g, target, referencedBy: virtualPath });
+    }
+  }
+
   // `build.modules.video: false` (or 'auto' on a --target playable): drop the clips the walk
   // just kept. This is the toggle's real payload — video's JS is engine code that the runtime
   // barrel keeps alive regardless, so the megabytes are in the .mp4s, and a playable's 5 MB cap
@@ -863,6 +1008,7 @@ export function computeKeptAssets(
     orphans,
     orphanDetails,
     domFontFiles,
+    unreachableRefs,
   };
 }
 

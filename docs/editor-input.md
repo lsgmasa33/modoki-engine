@@ -142,6 +142,91 @@ the policy.**
   work without first clicking the GameView.
 - The gate **fails open** if the policy function throws.
 
+## Never make a commit depend on a focus EVENT (#233)
+
+Chromium dispatches `focus` and `blur` **only while `document.hasFocus()`**. With the editor window
+behind another window — an ordinary state for a human, and the PERMANENT one for any agent-driven
+MCP session — `el.blur()` still moves `document.activeElement` but fires **no event**. So the
+familiar field idiom
+
+```tsx
+onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}   // ✗ commit never runs
+onBlur={(e) => commit(e.target.value)}
+```
+
+silently does nothing: the value is typed, Enter is pressed, and nothing is written. Nothing errors.
+
+**The rule: Enter commits DIRECTLY.** Keep `onBlur` committing too — that is the click-away path, and
+a click-away only happens while the window IS focused, which is exactly when the browser does deliver
+the event.
+
+```tsx
+onKeyDown={(e) => { if (e.key === 'Enter') { commit(e.currentTarget.value); e.currentTarget.blur(); } }}
+onBlur={(e) => commit(e.target.value)}
+```
+
+Two consequences that are easy to get wrong, both of which cost a real bug in #233:
+
+- **The trailing `blur()` DOES fire `onBlur` when the window is focused**, so `commit` runs twice.
+  Make it idempotent — and check per site rather than assuming, because a guard that compares against
+  a **prop** is stale in that same synchronous tick (React has not re-rendered). A ref updated inside
+  `commit` is what actually closes it.
+- **That idempotency guard must be RESET when the value changes externally** (an undo, another panel,
+  a reselect). It exists only to swallow the trailing blur, and held longer it becomes the very bug it
+  was added to prevent: re-entering a previously-committed value compares equal and silently does
+  nothing.
+
+The same applies to `onFocus`: any state it gates is dead in an unfocused window. Drive
+"is the user mid-edit?" from `onChange`, which fires regardless. `useBufferedValue` still gets this
+wrong for every Inspector field — see #242.
+
+### And the mirror-image trap: Escape, in a window that IS focused
+
+The rule above is about a blur that never fires. The opposite state has its own bug, and the #233
+close-out review caught it about to ship. A controlled input whose Escape handler reads
+
+```tsx
+else if (e.key === 'Escape') { setLocal(value); e.currentTarget.blur(); }   // ✗
+```
+
+**schedules** the revert and then blurs on the next line. In a genuinely OS-focused window that
+`.blur()` dispatches *synchronously, inside the same handler*, before React has flushed anything —
+so `onBlur` still sees the pre-Escape value and **commits the text the user just discarded**. The
+field then repaints as reverted, so Escape looks like it worked while the garbage was already
+persisted.
+
+**Revert the DOM node first, and never commit from a state closure:**
+
+```tsx
+onBlur={(e) => commit(e.currentTarget.value)}                 // read the node, not a closure
+onKeyDown={(e) => {
+  if (e.key === 'Escape') {
+    e.currentTarget.value = value;                            // synchronous — beats the blur
+    setLocal(value);
+    e.currentTarget.blur();
+  }
+}}
+```
+
+Now the trailing blur sees the reverted value and no-ops whichever order the two run in. An
+**uncontrolled** field (`defaultValue` + a direct `e.currentTarget.value = initial` revert) was never
+exposed to this — that is why `SkinEditor`'s `InlineNameField` is clean and the two controlled fields
+were not.
+
+**A test that stubs `blur()` to a no-op cannot see this class**, because it models only the unfocused
+window. Editor field tests need BOTH: the non-dispatching stub for the #233 condition, and a stub
+that really dispatches `focusout` for this one. See `textCommitField.test.tsx`.
+
+### Remount a field when its TARGET changes
+
+A field that tracks "is the user mid-edit?" in a ref must be keyed on what it edits. The ref is
+cleared by a commit, so a target swap that never blurs the input — an agent changing selection over
+MCP — leaves the previous target's typed text in place, and the next commit applies it to the NEW
+target. The component cannot tell a target swap from an ordinary external value change, so the fix is
+a React `key`, not more logic inside it.
+
+Measured behaviour, the diagnosis, and how to reproduce it live: **[qa/knowledge.md](../qa/knowledge.md) §5**.
+
 ## Guards
 
 Nothing structurally prevents the next ad-hoc `window.addEventListener('keydown', …)` — adding one

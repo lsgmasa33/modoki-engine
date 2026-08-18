@@ -394,6 +394,16 @@ device down). Precedence, and the refusal that names every candidate, is documen
 `resolveAndroidSerial` in `engine/plugins/backend/androidDevices.ts`; `MODOKI_ANDROID_SERIAL` (and
 adb's own `ANDROID_SERIAL`) pin it, and the panel remembers your last pick per clone.
 
+A native **Android build** picks its install target through `resolveBuildAndroidSerial`, whose order
+is: the project's own pin (Project Settings) → **the held lease's phone** → the shared rule above.
+The lease leg is #235, and it is what makes the refusal honest rather than a new convenience: the
+shared message offers `device_connect {useAdb:true, serial}` and the AI panel's picker as remedies,
+and both act by opening a lease — so while the build consulted only the project pin, an agent that
+did exactly what the message said got the identical refusal on the next build, one full
+build-and-refuse cycle later. The lease is a **preference, not a pin** (same rule the remembered
+target follows): a leased phone that has since been unplugged is ignored rather than hard-failing a
+build with a serial the human never typed.
+
 **Devices are named by what the PHONE calls itself, not by its model code.** `adb devices -l` reports
 only `model:` — `SC_56C`, `SM_S901U1`, `MRD_LX3` — which is precisely the string that fails to tell
 three handsets on a desk apart. So the listing asks each phone once (one `adb shell`, memoized per

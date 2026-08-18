@@ -467,6 +467,43 @@ guide lines** (the l/r/t/b insets) plus an "edge scale" (CSS px per source px �
 four guide knobs are also exposed as Enact interaction handles (`kind:'nineslice-guide'`)
 for headless dragging.
 
+Two things about the modal are load-bearing, both from the same report ("editing the 9-slice
+doesn't change the Inspector values", owner 2026-08-18):
+
+- **Save AWAITS the meta write before calling `onClose`.** The Inspector's close handler re-reads
+  the same sidecar (`loadMeta()`), so an un-awaited POST raced that GET over one file with no
+  ordering between them. When the GET won, the edit was on disk and the Inspector kept showing
+  the pre-edit numbers indefinitely. It reproduced 2 times in 6 on a live editor — intermittent
+  enough that a first attempt to reproduce it came back clean, which is exactly what made it
+  expensive. `writeMetaOrWarn` returns its promise for this reason; a caller that then READS the
+  file back must await it. (`SpriteEditor` had the identical shape and the identical fix.
+  `EnvironmentAssetView` was already writing `await writeMetaOrWarn(...)` against the old `void`
+  signature — an await that sequenced nothing.)
+- **Closing without saving REVERTS the live preview.** The preview re-registers the whole-image
+  sprite on every drag; nothing used to undo it, so Cancel left the RUNNING manifest holding the
+  discarded border while the file and the Inspector held the old one. Measured on `games/3d-test`'s
+  "Hello Buton" (a UI element whose `imageSrc` IS that sprite guid): drag `l` 34→59, Cancel, then
+  touch any `UIElement` field and the button re-renders at `background-size: 472.881%` (279/59)
+  instead of `820.588%` (279/34) — file 34, Inspector 34, screen 59, for the rest of the session.
+  That three-way divergence is most of why the whole thing read as "the editor applied my change
+  but the Inspector didn't update". `nineSliceRevert.ts` restores the SNAPSHOT taken when the modal
+  opened rather than re-deriving from the meta: a sliced sheet has no whole-image sprite at all
+  (see [textures.md](./textures.md)), so it must end up with none again rather than one the modal
+  invented. A FAILED write does not count as saved: `savedRef` is assigned from the write's RESULT,
+  so the revert still fires and the live sprite cannot keep a border that never reached disk.
+- **A failed write keeps the dialog OPEN** (owner, 2026-08-18), with the reason logged — closing
+  would throw the edit away for something that has nothing to do with the edit (a dev-server blip)
+  and leave no way to retry. Verified against a real 500: the dialog stays open with the edit
+  intact, pressing Save again lands it, and cancelling after a failed save still reverts the
+  preview to the last value that actually reached disk. `SpriteEditor` does the same, and matters
+  more there — a slice set is far more work to re-author than four insets.
+- **The backdrop does NOT dismiss it.** This dialog holds unsaved work, and a stray click outside
+  used to close it and discard every edit with no confirmation — indistinguishable from a Save,
+  while the scene kept the live preview. Cancel and Save are the only exits. The one-shot pickers
+  (SpritePicker, AddPropertyPicker, BindAnimatorPicker, the layout prompts) keep their backdrop
+  dismiss, because there dismissing IS the cancel. Guarded both ways by
+  `engine/tests/architecture/modalDismissScope.test.ts`.
+
 ---
 
 ## Fonts

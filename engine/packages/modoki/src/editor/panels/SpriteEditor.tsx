@@ -521,7 +521,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   };
 
   // ── Persist ──
-  const save = () => {
+  const save = async () => {
     if (!imgDims) return;
     const clean = sprites.filter((s) => s.guid !== '__preview__' && s.rect.w > 0 && s.rect.h > 0);
     const textureGuid = typeof meta?.id === 'string' ? meta.id : undefined;
@@ -536,7 +536,15 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
       spriteAlphaThreshold: alphaThreshold,
     };
     if (clean.length === 0) { delete (nextMeta as Record<string, unknown>).sprites; delete (nextMeta as Record<string, unknown>).spriteSheet; }
-    writeMetaOrWarn(path, nextMeta);
+    // AWAIT before onClose() — same race as the 9-slice editor: the Inspector re-reads this
+    // file on close, and an un-awaited POST let that GET win and report the pre-edit slices.
+    const persisted = await writeMetaOrWarn(path, nextMeta);
+    if (!persisted) {
+      // Keep the dialog open on a failed write — see the note in NineSliceEditor.save. A slice set
+      // is far more work to re-author than a border, so losing it to a dev-server blip is worse.
+      console.error(`[SpriteEditor] save failed for ${path} — the dialog is staying open so the slices are not lost. See the /api/write-meta error above.`);
+      return;
+    }
 
     // Live-register the slices so existing references resolve without a rescan, and
     // drop entries for slices that were removed in this session.
@@ -561,9 +569,17 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
 
   const selSlice = sprites.find((s) => s.guid === selected && s.guid !== '__preview__') ?? null;
 
+  // The overlay below is deliberately INERT — no `onClick={onClose}`. This dialog holds unsaved
+  // work, and a stray click outside it used to close it and discard every edit silently: no
+  // confirmation, and no visual difference from a Save, so the scene kept the live preview while
+  // the meta and the Inspector still said the old value (owner, 2026-08-18). Cancel and Save are
+  // the only exits. Do not "restore" the dismiss here — it is correct for the one-shot pickers
+  // (SpritePicker, AddPropertyPicker, BindAnimatorPicker, the layout prompts), where dismissing
+  // IS the cancel and there is nothing to lose. Guarded by
+  // engine/tests/architecture/modalDismissScope.test.ts.
   return (
-    <div style={overlay} onClick={onClose}>
-      <div style={dialog} onClick={(e) => e.stopPropagation()}>
+    <div style={overlay}>
+      <div style={dialog}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
           <div style={{ color: '#fff', fontSize: 13, fontWeight: 'bold' }}>Sprite Editor — {name}</div>
           <div style={{ color: '#888', fontSize: 11 }}>{imgDims ? `${imgDims.w}×${imgDims.h}` : '…'} · {sprites.filter(s => s.guid !== '__preview__').length} sprites</div>

@@ -29,18 +29,35 @@ export function FieldLabel({ label, hint, style }: { label: string; hint?: Field
   return <span style={style}>{label}</span>;
 }
 
-/** Fire-and-forget POST to /api/write-meta with a loud failure log. Replaces
- *  the swallow-catch pattern (`.catch(() => {})`) that hid dev-server outages
- *  — the user would update a field, see it apply locally, reload, and find
- *  the change reverted silently. */
-export function writeMetaOrWarn(path: string, meta: unknown): void {
-  backendFetch('/api/write-meta', {
+/** POST to /api/write-meta with a loud failure log. Replaces the swallow-catch pattern
+ *  (`.catch(() => {})`) that hid dev-server outages — the user would update a field, see it
+ *  apply locally, reload, and find the change reverted silently.
+ *
+ *  RETURNS THE PROMISE, and a caller that then READS the file back must await it. It used to
+ *  return `void`, which made the write unsequenceable: the 9-slice and Sprite editors both did
+ *  `writeMetaOrWarn(...)` then `onClose()`, and the Inspector's onClose handler re-reads the
+ *  meta — so a GET raced an un-awaited POST over the same file. When the GET won, the write
+ *  landed on disk and the Inspector showed the PRE-edit numbers, indefinitely. Intermittent by
+ *  construction, which is why it read as "the 9-slice editor doesn't change the Inspector
+ *  values" and survived a first attempt to reproduce it. `EnvironmentAssetView` was already
+ *  writing `await writeMetaOrWarn(...)` against the `void` signature — an await that resolved
+ *  instantly and sequenced nothing, so the intent was there and silently did not hold.
+ *
+ *  Resolves `true` when the write reached disk. Existing fire-and-forget callers can keep
+ *  ignoring it — an unread promise is the old behaviour exactly. */
+export function writeMetaOrWarn(path: string, meta: unknown): Promise<boolean> {
+  return backendFetch('/api/write-meta', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path, meta }),
   }).then(async (res) => {
-    if (!res.ok) console.error(`[Inspector] /api/write-meta failed for ${path}: ${res.status} ${await res.text().catch(() => '')}`);
+    if (!res.ok) {
+      console.error(`[Inspector] /api/write-meta failed for ${path}: ${res.status} ${await res.text().catch(() => '')}`);
+      return false;
+    }
+    return true;
   }).catch((e) => {
     console.error(`[Inspector] /api/write-meta network error for ${path}:`, e);
+    return false;
   });
 }
 

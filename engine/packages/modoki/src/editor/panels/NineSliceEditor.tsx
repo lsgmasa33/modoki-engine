@@ -14,7 +14,8 @@ import { backendFetch } from '../backend/editorBackend';
 import { useEditorStore } from '../store/editorStore';
 import { writeMetaOrWarn } from './assetViews/widgets';
 import { BufferedNumberInput } from './fields';
-import { registerSprite, isGuid, deriveGuid } from '../../runtime/loaders/assetManifest';
+import { registerSprite, isGuid, deriveGuid, type SpriteAssetRef } from '../../runtime/loaders/assetManifest';
+import { captureSpriteSnapshot, revertSpritePreview } from './nineSliceRevert';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { registerHandleProvider, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
 
@@ -42,6 +43,11 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   const dragRef = useRef<Edge | null>(null);
   const panRef = useRef<{ active: boolean; cx: number; cy: number; sl: number; st: number }>({ active: false, cx: 0, cy: 0, sl: 0, st: 0 });
   const pendingAnchorRef = useRef<{ ix: number; iy: number; vx: number; vy: number } | null>(null);
+  // The whole-image sprite EXACTLY as it was when this modal opened (or `null` when the manifest
+  // had none), so closing without saving can put it back — see the unmount effect below.
+  // `undefined` = not captured yet.
+  const entrySnapshotRef = useRef<SpriteAssetRef | null | undefined>(undefined);
+  const savedRef = useRef(false);
   const refreshAssets = useEditorStore((s) => s.refreshAssets);
 
   // ── Load source image + existing border meta ──
@@ -201,6 +207,9 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   useEffect(() => {
     const texGuid = typeof meta?.id === 'string' ? meta.id : undefined;
     if (!texGuid || !isGuid(texGuid) || !imgDims) return;
+    // Snapshot the sprite BEFORE the first preview overwrites it — the revert below restores
+    // exactly this, so a cancelled edit leaves the manifest as it found it.
+    if (entrySnapshotRef.current === undefined) entrySnapshotRef.current = captureSpriteSnapshot(texGuid);
     const hasBorder = border.l || border.r || border.t || border.b;
     registerSprite(deriveGuid('sprite:' + texGuid), texGuid, path, {
       texture: texGuid, name, rect: { x: 0, y: 0, w: imgDims.w, h: imgDims.h }, pivot: { x: 0.5, y: 0.5 },
@@ -209,6 +218,33 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
     });
     markUIDirty();
   }, [border, edgeScale, meta, imgDims, path, name]);
+
+  // ── Revert the live preview when the modal closes WITHOUT saving ──
+  //
+  // The preview above re-registers the texture's whole-image sprite on every drag. Nothing used to
+  // undo that, so Cancel (or a click on the backdrop, back when that closed the dialog) left the
+  // RUNNING manifest holding the discarded border while the meta file and the Inspector both held
+  // the old one. Measured on games/3d-test's "Hello Buton": drag l 34 -> 59, Cancel, then touch any
+  // UIElement field, and the button re-renders with the 59 geometry — the file says 34, the
+  // Inspector says 34, the screen shows 59, for the rest of the session. That divergence is what
+  // made the whole thing read as "the editor applied my change but the Inspector didn't update".
+  //
+  // Restores the SNAPSHOT rather than re-deriving a sprite from the meta: a texture the scanner
+  // never gave a whole-image sprite (a SLICED sheet — see docs/textures.md) must end up with none
+  // again, not with one this modal invented. `[]` deps with a ref for the payload, because a
+  // cleanup is the only place that runs on unmount and it must read CURRENT values, not the first
+  // render's.
+  const revertRef = useRef<{ texGuid?: string; imgDims: { w: number; h: number } | null; path: string }>({ imgDims: null, path });
+  revertRef.current = { texGuid: typeof meta?.id === 'string' ? meta.id : undefined, imgDims, path };
+  useEffect(() => () => {
+    revertSpritePreview({
+      texGuid: revertRef.current.texGuid,
+      path: revertRef.current.path,
+      snapshot: entrySnapshotRef.current,
+      saved: savedRef.current,
+    });
+    markUIDirty();
+  }, []);
 
   // ── Interaction ──
   const onMouseDown = (e: React.MouseEvent) => {
@@ -268,12 +304,30 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   });
 
   // ── Persist ──
-  const save = () => {
+  const save = async () => {
     const hasBorder = border.l || border.r || border.t || border.b;
     const borderOut = { ...border, ...(edgeScale !== 1 ? { scale: edgeScale } : {}) };
     const nextMeta = { ...(meta ?? {}), version: 2, ...(hasBorder ? { border: borderOut } : {}) };
     if (!hasBorder) delete (nextMeta as Record<string, unknown>).border;
-    writeMetaOrWarn(path, nextMeta);
+    // AWAIT the write before onClose(): the Inspector's onClose handler re-reads this exact file,
+    // so an un-awaited POST raced that GET and the Inspector kept showing the pre-edit numbers
+    // (the reported "editing the 9-slice doesn't change the Inspector values").
+    // The RESULT, not an unconditional `true`. A failed write (dev server down, 500) still closes
+    // the modal, and marking it saved would skip the unmount revert — leaving the live sprite
+    // holding a border that never reached disk while the file keeps the old one. That is exactly
+    // the divergence the revert exists to prevent, reintroduced on the error path.
+    const persisted = await writeMetaOrWarn(path, nextMeta);
+    if (!persisted) {
+      // KEEP THE DIALOG OPEN (owner, 2026-08-18). Closing on a failed write throws the edit away
+      // for a reason that has nothing to do with the edit — a dev-server blip — and the user has
+      // no way to retry it. Staying open means Save can simply be pressed again. `savedRef` stays
+      // false, so a later Cancel still reverts the live preview. `writeMetaOrWarn` has already
+      // logged the status + body; this line names the dialog, since that one is tagged
+      // `[Inspector]` for every caller.
+      console.error(`[NineSliceEditor] save failed for ${path} — the dialog is staying open so the edit is not lost. See the /api/write-meta error above.`);
+      return;
+    }
+    savedRef.current = persisted;
 
     // Live-update the texture's auto whole-image sprite so UINode's border-image
     // reflects the edit without waiting for a rescan.
@@ -290,9 +344,17 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
     onClose();
   };
 
+  // The overlay below is deliberately INERT — no `onClick={onClose}`. This dialog holds unsaved
+  // work, and a stray click outside it used to close it and discard every edit silently: no
+  // confirmation, and no visual difference from a Save, so the scene kept the live preview while
+  // the meta and the Inspector still said the old value (owner, 2026-08-18). Cancel and Save are
+  // the only exits. Do not "restore" the dismiss here — it is correct for the one-shot pickers
+  // (SpritePicker, AddPropertyPicker, BindAnimatorPicker, the layout prompts), where dismissing
+  // IS the cancel and there is nothing to lose. Guarded by
+  // engine/tests/architecture/modalDismissScope.test.ts.
   return (
-    <div style={overlay} onClick={onClose}>
-      <div style={dialog} onClick={(e) => e.stopPropagation()}>
+    <div style={overlay}>
+      <div style={dialog}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
           <div style={{ color: '#fff', fontSize: 13, fontWeight: 'bold' }}>9-slice Border — {name}</div>
           <div style={{ color: '#888', fontSize: 11 }}>{imgDims ? `${imgDims.w}×${imgDims.h}` : '…'}</div>

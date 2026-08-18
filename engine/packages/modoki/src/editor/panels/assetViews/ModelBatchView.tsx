@@ -1,20 +1,27 @@
 /** ModelBatchView — multi-select editor for N model (.glb) assets. Batch-sets the
  *  postprocessor across the selection (differing values show "Mixed") and offers a
- *  single "Re-import all (N)". Meta writes are fire-and-forget, matching the
- *  single-asset model view. */
+ *  single "Re-import all (N)".
+ *
+ *  ⚠️ Meta writes here are READ-MODIFY-WRITE, and must stay that way. `/api/write-meta`
+ *  REPLACES the sidecar (`writeMetaSidecar` → `writeJsonAtomic`, no merge), so posting a bare
+ *  `{version, postprocessor}` destroyed everything else in it — including the asset's stable
+ *  `id`. See the note on the single-asset path in `Inspector.tsx`. */
 
 import { useState, useEffect, useCallback } from 'react';
 import { backendFetch } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
 import { getModelPostprocessorIds } from '../../../runtime/loaders/modelPostprocessorRegistry';
 import { inputStyle, MIXED_PLACEHOLDER } from '../fields';
-import { reimportBtnStyle } from './widgets';
+import { reimportBtnStyle, writeMetaOrWarn } from './widgets';
 import { reimportPaths } from './reimport';
 import type { SelectedAsset } from '../../store/editorStore';
 
 export function ModelBatchView({ assets }: { assets: SelectedAsset[] }) {
   const paths = assets.map((a) => a.path);
   const [postprocessors, setPostprocessors] = useState<Record<string, string>>({});
+  // The FULL sidecar per path, kept so a postprocessor change can merge into it instead of
+  // replacing it. Without this the batch destroyed one guid per selected model, per click.
+  const [metas, setMetas] = useState<Record<string, Record<string, unknown>>>({});
   const [loaded, setLoaded] = useState(false);
   const [importing, setImporting] = useState(false);
   const postprocessorIds = getModelPostprocessorIds();
@@ -26,11 +33,12 @@ export function ModelBatchView({ assets }: { assets: SelectedAsset[] }) {
     const entries = await Promise.all(paths.map(async (p) => {
       try {
         const r = await backendFetch(`/api/read-meta?path=${encodeURIComponent(p)}`);
-        const m = r.ok ? await r.json() : {};
-        return [p, (m.postprocessor as string) ?? 'none'] as const;
-      } catch { return [p, 'none'] as const; }
+        const m = (r.ok ? await r.json() : {}) as Record<string, unknown>;
+        return [p, (m.postprocessor as string) ?? 'none', m] as const;
+      } catch { return [p, 'none', {} as Record<string, unknown>] as const; }
     }));
-    setPostprocessors(Object.fromEntries(entries));
+    setPostprocessors(Object.fromEntries(entries.map(([p, v]) => [p, v])));
+    setMetas(Object.fromEntries(entries.map(([p, , m]) => [p, m])));
     setLoaded(true);
   }, [paths]);
 
@@ -45,14 +53,12 @@ export function ModelBatchView({ assets }: { assets: SelectedAsset[] }) {
       const updated: Record<string, string> = { ...prev };
       for (const p of paths) {
         updated[p] = next;
-        backendFetch('/api/write-meta', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: p, meta: { version: 1, postprocessor: next } }),
-        }).catch(() => {});
+        // MERGE — a bare {version, postprocessor} would replace the whole sidecar.
+        void writeMetaOrWarn(p, { ...(metas[p] ?? {}), version: 2, postprocessor: next });
       }
       return updated;
     });
-  }, [paths]);
+  }, [paths, metas]);
 
   const reimportAll = useCallback(async () => {
     setImporting(true);

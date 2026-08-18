@@ -97,6 +97,65 @@ async function resolveSpriteDomain(spriteGuid: string | undefined, fallbackVerts
   return { width: b.width, height: b.height, pivotX: b.pivotX, pivotY: b.pivotY };
 }
 
+/** Inline part-name field (list row + inspector). Same class of bug as
+ *  `components/RenameInput.tsx` (#233): Chromium only dispatches focus/blur while
+ *  `document.hasFocus()`, so an agent-driven session (window never OS-focused) would see
+ *  an Enter → `.blur()` → `onBlur`-commits chain silently do nothing. Enter here commits
+ *  DIRECTLY, and Escape closes/reverts directly too — neither depends on a blur event
+ *  reaching this field, matching the qa/knowledge.md §5 rule.
+ *
+ *  Extracted (rather than inlined per call site) because a naive "commit(); blur();" is
+ *  NOT idempotent: when the window IS focused the trailing blur() fires onBlur in the
+ *  SAME synchronous tick as the Enter handler, before React has re-rendered — so a
+ *  re-check against the `initial` PROP would still see the OLD (pre-rename) value and
+ *  push a second, identical rename onto the undo stack. `lastCommittedRef` guards this
+ *  without depending on a focus event to reset it (a `doneRef`-style one-shot lock would:
+ *  the inspector call site keeps this field mounted across a rename — same `key` — so a
+ *  lock that only clears `onFocus` would silently brick every edit after the first in an
+ *  unfocused window, where refocusing never fires that event either). */
+function InlineNameField({ initial, onCommit, onDone, autoFocus, style }: {
+  initial: string;
+  onCommit: (name: string) => void;
+  /** Called after either commit or cancel — the inline list-row editor uses this to close
+   *  itself (`setEditingPart(null)`); the inspector field has none. */
+  onDone?: () => void;
+  autoFocus?: boolean;
+  style?: React.CSSProperties;
+}) {
+  const lastCommittedRef = useRef<string | null>(null);
+  // Clear the latch whenever the value changes from OUTSIDE (undo, another panel, a
+  // reselect). It exists only to swallow the trailing blur that Enter fires in the SAME
+  // synchronous tick, and that window closes at the next render — held any longer it
+  // becomes the very bug this fix removes: re-entering a previously-committed value
+  // after an external change would compare equal to the latch and silently do nothing.
+  useEffect(() => { lastCommittedRef.current = null; }, [initial]);
+  const commit = (raw: string) => {
+    const n = raw.trim();
+    if (n && n !== initial && n !== lastCommittedRef.current) {
+      lastCommittedRef.current = n;
+      onCommit(n);
+    }
+    onDone?.();
+  };
+  return (
+    <input
+      autoFocus={autoFocus}
+      defaultValue={initial}
+      onClick={onDone ? (e) => e.stopPropagation() : undefined}
+      onBlur={(e) => commit(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') { e.preventDefault(); commit(e.currentTarget.value); e.currentTarget.blur(); }
+        else if (e.key === 'Escape') {
+          e.preventDefault();
+          e.currentTarget.value = initial;
+          if (onDone) onDone(); else e.currentTarget.blur();
+        }
+      }}
+      style={style}
+    />
+  );
+}
+
 export default function SkinEditor() {
   const asset = useEditorStore((s) => s.editingSkinAsset);
   const nonce = useEditorStore((s) => s.skinEditNonce);
@@ -560,8 +619,15 @@ export default function SkinEditor() {
       <>
         <div style={inspectorHeadStyle}>
           <span style={{ ...inspectorKind, color: paintMode ? '#7a9c5a' : '#5a7a9a' }}>{paintMode ? 'Bone · pose' : 'Bone'}</span>
+          {/* Enter commits DIRECTLY rather than routing through blur() — Chromium only
+              dispatches focus/blur while `document.hasFocus()`, so an agent-driven session
+              (window never OS-focused) would otherwise see the commit silently never run
+              (#233). The trailing blur() below still fires onBlur when the window IS
+              focused, re-running setBoneName with the same (now-committed) value — harmless,
+              since setBoneName reads the LIVE store and no-ops when the name already
+              matches (no double undo entry). */}
           <input key={`b${selBone}`} defaultValue={b.name} onBlur={(e) => setBoneName(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); else if (e.key === 'Escape') { e.currentTarget.value = b.name; e.currentTarget.blur(); } }}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); setBoneName(e.currentTarget.value); e.currentTarget.blur(); } else if (e.key === 'Escape') { e.currentTarget.value = b.name; e.currentTarget.blur(); } }}
             style={nameInputStyle} />
         </div>
         {poseActive && (
@@ -698,9 +764,9 @@ export default function SkinEditor() {
                   onChange={(e) => { e.stopPropagation(); useEditorStore.getState().toggleSkinPreviewPart(i); }}
                   title={previewHidden.includes(i) ? 'Show in canvas preview' : 'Hide in canvas preview'} style={{ accentColor: '#4a9eff', cursor: 'pointer', margin: '0 2px' }} />
                 {editingPart === i ? (
-                  <input autoFocus defaultValue={p.name} onClick={(e) => e.stopPropagation()}
-                    onBlur={(e) => { const n = e.target.value.trim(); if (n && n !== p.name) partAction(renamePart(def!, i, n), 'rename part'); setEditingPart(null); }}
-                    onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); else if (e.key === 'Escape') { e.currentTarget.value = p.name; e.currentTarget.blur(); } }}
+                  <InlineNameField autoFocus initial={p.name}
+                    onCommit={(n) => partAction(renamePart(def!, i, n), 'rename part')}
+                    onDone={() => setEditingPart(null)}
                     style={{ flex: 1, minWidth: 0, background: '#0e0e16', color: '#ccc', border: '1px solid #3a6a8a', borderRadius: 3, padding: '1px 4px', fontFamily: 'monospace', fontSize: 11 }} />
                 ) : (
                   <span onDoubleClick={(e) => { e.stopPropagation(); setEditingPart(i); }}
@@ -800,9 +866,8 @@ export default function SkinEditor() {
                 {/* Name (generalized — part) */}
                 <div style={inspectorHeadStyle}>
                   <span style={inspectorKind}>Part</span>
-                  <input key={`p${activePart}`} defaultValue={partName}
-                    onBlur={(e) => { const n = e.target.value.trim(); if (n && n !== partName) partAction(renamePart(def!, activePart, n), 'rename part'); }}
-                    onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); else if (e.key === 'Escape') { e.currentTarget.value = partName; e.currentTarget.blur(); } }}
+                  <InlineNameField key={`p${activePart}`} initial={partName}
+                    onCommit={(n) => partAction(renamePart(def!, activePart, n), 'rename part')}
                     style={nameInputStyle} />
                 </div>
                 {/* Source art */}

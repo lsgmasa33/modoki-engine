@@ -29,7 +29,7 @@ import { AssetRefField } from './AssetRefField';
 import { parseClipBank, stringifyClipBank, type ClipBankEntry } from '../../runtime/audio/clipBank';
 import { SpriteAnimatorSection } from './SpriteAnimatorSection';
 import { AnimatorClipsSection } from './AnimatorClipsSection';
-import { FieldLabel, NumberField, DropdownField, ColorField, Section, SubSection, DEFAULT_COLOR, colorToHex } from './assetViews/widgets';
+import { FieldLabel, NumberField, DropdownField, ColorField, Section, SubSection, DEFAULT_COLOR, colorToHex, writeMetaOrWarn } from './assetViews/widgets';
 import { defaultForHint, FieldValueWidget, EntityRefField, useWorldDirtyTick } from './inspectorFields';
 import { AddComponentPicker } from './AddComponentPicker';
 import { UIActionBindingsField } from './UIActionBindingsField';
@@ -1286,6 +1286,17 @@ function AssetBatchInspector({ assets }: { assets: SelectedAsset[] }) {
 
 function AssetInspector({ asset }: { asset: SelectedAsset }) {
   const [postprocessor, setPostprocessor] = useState('none');
+  // The FULL sidecar, kept so a postprocessor change MERGES into it. `/api/write-meta` REPLACES
+  // the file (`writeMetaSidecar` → `writeJsonAtomic`, no merge on the server), so posting a bare
+  // `{version:1, postprocessor}` — which this did — destroyed every other key. On a real model
+  // (demos/forest-camp/…/char_Ranger.glb.meta.json) that is `id`, `rig`, `generated` and
+  // `modelCache`: the asset's STABLE GUID, so every scene and mesh ref to it dangles and the next
+  // scan mints a new one; the derived-file cleanup list; and the LOD block. It also downgraded
+  // `version` 2 → 1. Every other writer in the editor spreads the loaded meta first; these two
+  // (here and ModelBatchView, which did it to every selected model at once) did not.
+  // A ref, not state: nothing RENDERS from it — it exists only so the change handler can merge
+  // into the sidecar it loaded, so writing it must not re-render.
+  const metaRef = useRef<Record<string, unknown> | null>(null);
   const [metaLoaded, setMetaLoaded] = useState(false);
   const postprocessorIds = getModelPostprocessorIds();
 
@@ -1296,7 +1307,7 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
     const ac = new AbortController();
     backendFetch(`/api/read-meta?path=${encodeURIComponent(asset.path)}`, { signal: ac.signal })
       .then(r => r.ok ? r.json() : {})
-      .then((meta: Record<string, unknown>) => { if (meta.postprocessor) setPostprocessor(meta.postprocessor as string); setMetaLoaded(true); })
+      .then((m: Record<string, unknown>) => { metaRef.current = m; if (m.postprocessor) setPostprocessor(m.postprocessor as string); setMetaLoaded(true); })
       .catch(e => { if (e.name !== 'AbortError') setMetaLoaded(true); });
     return () => ac.abort();
   }, [asset.path, asset.type]);
@@ -1304,10 +1315,11 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
   // Persist postprocessor to meta when changed
   const handlePostprocessorChange = useCallback((newPostprocessor: string) => {
     setPostprocessor(newPostprocessor);
-    backendFetch('/api/write-meta', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: asset.path, meta: { version: 1, postprocessor: newPostprocessor } }),
-    }).catch(() => {});
+    const updated = { ...(metaRef.current ?? {}), version: 2, postprocessor: newPostprocessor };
+    metaRef.current = updated;
+    // writeMetaOrWarn, not a raw fetch with `.catch(() => {})` — that swallow-catch is exactly
+    // the pattern it exists to replace (a dev-server outage looked like a successful edit).
+    void writeMetaOrWarn(asset.path, updated);
   }, [asset.path]);
 
   return (

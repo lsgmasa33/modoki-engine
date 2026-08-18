@@ -102,11 +102,17 @@ export default function AnimationToolbar(p: ToolbarProps) {
 
       <span style={sep} />
       <Tooltip text="Clip name" style={{ cursor: 'text' }}><input value={p.clipName} onChange={(e) => p.onRename(e.target.value)} style={{ ...input, width: 120, fontWeight: 'bold' }} /></Tooltip>
+      {/* Both NumBoxes are keyed on the clip so switching clips REMOUNTS them. `editingRef` is set
+          from onChange and cleared only by a commit, so a clip swap that never blurs the field — an
+          agent changing selection over MCP, the premise of #233 — would keep clip A's typed text and
+          then commit it against clip B. The trade is deliberate: renaming the clip also remounts
+          these two, discarding an uncommitted number mid-rename. Losing a number you had not
+          committed is strictly better than silently writing it to the wrong clip. */}
       <Tooltip text="Authoring sample rate (frames per second) — Unity's Samples"><label style={lbl}>Samples
-        <NumBox value={p.frameRate} min={1} step={1} width={42} onSet={(v) => p.onSetFrameRate(Math.max(1, Math.round(v)))} />
+        <NumBox key={`fps:${p.clipName}`} value={p.frameRate} min={1} step={1} width={42} onSet={(v) => p.onSetFrameRate(Math.max(1, Math.round(v)))} />
       </label></Tooltip>
       <Tooltip text="Clip length (seconds)"><label style={lbl}>Len
-        <NumBox value={p.duration} min={0.1} step={0.1} width={46} onSet={(v) => p.onSetDuration(Math.max(0.1, v))} />
+        <NumBox key={`len:${p.clipName}`} value={p.duration} min={0.1} step={0.1} width={46} onSet={(v) => p.onSetDuration(Math.max(0.1, v))} />
       </label></Tooltip>
       <TipButton tip="Loop playback" onClick={p.onToggleLoop} style={{ ...btn, background: p.loop ? '#2d6cdf' : '#2a2a40' }}>⟳ Loop</TipButton>
       <TipButton tip="Add a keyframe at the playhead on every track (K)" onClick={p.onAddKey} style={btn}>◆<sub style={{ fontSize: 9 }}>+</sub> Key</TipButton>
@@ -148,19 +154,48 @@ function FrameField({ frame, onSet }: { frame: number; onSet: (f: number) => voi
   return <NumBox value={frame} step={1} width={48} onSet={(v) => onSet(Math.max(0, Math.round(v)))} title="Current frame" />;
 }
 
-/** Small numeric box that commits on Enter/blur (buffers raw text while focused). */
+/** Small numeric box that commits on Enter/blur (buffers raw text while editing).
+ *
+ *  Enter commits DIRECTLY rather than routing through `.blur()` — Chromium only
+ *  dispatches focus/blur while `document.hasFocus()`, so an agent-driven session (window
+ *  never OS-focused) would otherwise see the commit silently never run (#233). The
+ *  trailing `.blur()` below still fires `onBlur` when the window IS focused, re-running
+ *  `commit()`; `lastCommittedRef` makes that harmless.
+ *
+ *  The in-progress-edit tracking is likewise NOT keyed off `onFocus` (same dead-in-an-
+ *  unfocused-window problem — it used to gate the resync effect via a `focused` state
+ *  that never became true, so an external `value` change could stomp a keystroke mid-
+ *  edit without anyone noticing). `editingRef` is set from `onChange` instead, which
+ *  fires regardless of OS window focus. */
 export function NumBox({ value, onSet, min, step, width, title }: { value: number; onSet: (v: number) => void; min?: number; step?: number; width: number; title?: string }) {
   const [local, setLocal] = useState(String(value));
-  const [focused, setFocused] = useState(false);
-  useEffect(() => { if (!focused) setLocal(String(value)); }, [value, focused]);
-  const commit = () => { const n = parseFloat(local); if (Number.isFinite(n)) onSet(min !== undefined ? Math.max(min, n) : n); else setLocal(String(value)); };
+  const editingRef = useRef(false);
+  const lastCommittedRef = useRef<number | null>(null);
+  // Clear the latch whenever the value changes from OUTSIDE (undo, another panel, a
+  // reselect). It exists only to swallow the trailing blur that Enter fires in the SAME
+  // synchronous tick, and that window closes at the next render — held any longer it
+  // becomes the very bug this fix removes: re-entering a previously-committed value
+  // after an external change would compare equal to the latch and silently do nothing.
+  useEffect(() => {
+    lastCommittedRef.current = null;
+    if (!editingRef.current) setLocal(String(value));
+  }, [value]);
+  const commit = () => {
+    editingRef.current = false;
+    const n = parseFloat(local);
+    if (!Number.isFinite(n)) { setLocal(String(value)); return; }
+    const clamped = min !== undefined ? Math.max(min, n) : n;
+    if (clamped !== value && clamped !== lastCommittedRef.current) {
+      lastCommittedRef.current = clamped;
+      onSet(clamped);
+    }
+  };
   return (
     <input
       title={title} type="text" inputMode="decimal" value={local}
-      onFocus={() => setFocused(true)}
-      onBlur={() => { setFocused(false); commit(); }}
-      onChange={(e) => setLocal(e.target.value)}
-      onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+      onBlur={commit}
+      onChange={(e) => { editingRef.current = true; setLocal(e.target.value); }}
+      onKeyDown={(e) => { if (e.key === 'Enter') { commit(); (e.target as HTMLInputElement).blur(); } }}
       step={step}
       style={{ ...input, width, marginLeft: 4 }}
     />

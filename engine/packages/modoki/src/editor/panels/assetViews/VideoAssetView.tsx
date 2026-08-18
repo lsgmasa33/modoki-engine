@@ -6,7 +6,7 @@
  *  There is no output-format control on purpose — video is H.264/mp4 only, because
  *  that is the sole codec the iOS WKWebView plays. See docs/video.md. */
 
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { backendFetch } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
 import {
@@ -154,6 +154,13 @@ export function VideoAssetView({ path, name }: { path: string; name: string }) {
             </select>
           </div>
           <TextCommitField
+            // Keyed on the asset so switching videos REMOUNTS the field. Its `editingRef` is set
+            // from onChange and cleared only by a commit, so a target swap that never blurs the
+            // input — an agent changing selection over MCP, which is the whole premise of #233 —
+            // would leave the previous asset's typed text in place and then commit it against the
+            // NEW asset. Remounting is the React answer; the component itself cannot tell a target
+            // swap from an ordinary external value change.
+            key={path}
             label="Remote URL"
             uiId="inspector.video.remoteUrl"
             value={settings.remoteUrl ?? ''}
@@ -272,14 +279,40 @@ export function VideoAssetView({ path, name }: { path: string; name: string }) {
 
 /** Text field that commits on blur or Enter, not per keystroke — the sidecar write is
  *  a network round-trip, and a URL typed a character at a time would fire one per
- *  letter (and persist a dozen invalid intermediate URLs). Escape reverts. */
-function TextCommitField({ label, uiId, value, placeholder, onCommit }: {
+ *  letter (and persist a dozen invalid intermediate URLs). Escape reverts.
+ *
+ *  Enter commits DIRECTLY rather than routing through `.blur()` — Chromium only
+ *  dispatches focus/blur while `document.hasFocus()`, so an agent-driven session
+ *  (window never OS-focused) would otherwise see the commit silently never run (#233).
+ *  Escape likewise reverts directly rather than relying on the blur it also triggers.
+ *  The in-progress-edit tracking is driven by `onChange` (fires regardless of window
+ *  focus) via `editingRef`, not by the `onFocus` this used to gate on — `onFocus` is
+ *  exactly as dead as `onBlur` in that state, so the old `focused` flag never became
+ *  true and the resync effect never actually gated anything there. Exported for unit
+ *  testing (same class of component as `components/RenameInput.tsx`). */
+export function TextCommitField({ label, uiId, value, placeholder, onCommit }: {
   label: string; uiId?: string; value: string; placeholder?: string; onCommit: (v: string) => void;
 }) {
   const [local, setLocal] = useState(value);
-  const [focused, setFocused] = useState(false);
+  const editingRef = useRef(false);
   // Re-sync when the asset changes underneath us, but never while the user is typing.
-  useEffect(() => { if (!focused) setLocal(value); }, [value, focused]);
+  const lastCommittedRef = useRef<string | null>(null);
+  // Clear the latch whenever the value changes from OUTSIDE (undo, another panel, a
+  // reselect). It exists only to swallow the trailing blur that Enter fires in the SAME
+  // synchronous tick, and that window closes at the next render — held any longer it
+  // becomes the very bug this fix removes: re-entering a previously-committed value
+  // after an external change would compare equal to the latch and silently do nothing.
+  useEffect(() => {
+    lastCommittedRef.current = null;
+    if (!editingRef.current) setLocal(value);
+  }, [value]);
+  const commit = (raw: string) => {
+    editingRef.current = false;
+    if (raw !== value && raw !== lastCommittedRef.current) {
+      lastCommittedRef.current = raw;
+      onCommit(raw);
+    }
+  };
   return (
     <div style={rowStyle}>
       <span style={labelStyle}>{label}</span>
@@ -289,13 +322,24 @@ function TextCommitField({ label, uiId, value, placeholder, onCommit }: {
         spellCheck={false}
         value={local}
         placeholder={placeholder}
-        onFocus={() => setFocused(true)}
-        onBlur={() => { setFocused(false); if (local !== value) onCommit(local); }}
+        onBlur={(e) => commit(e.currentTarget.value)}
         onKeyDown={(e) => {
-          if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
-          else if (e.key === 'Escape') { setLocal(value); (e.currentTarget as HTMLInputElement).blur(); }
+          if (e.key === 'Enter') { commit(e.currentTarget.value); (e.currentTarget as HTMLInputElement).blur(); }
+          // Escape must revert ORDER-INDEPENDENTLY. `setX(...)` only SCHEDULES a React update, and
+          // the `.blur()` on the next line dispatches synchronously in a genuinely focused window —
+          // before that flush — so an onBlur that reads state (or a DOM node the revert has not
+          // reached) would commit the very text just discarded, then repaint as reverted so it LOOKS
+          // like Escape worked. Writing the DOM node first makes the trailing blur see the reverted
+          // value and no-op, whichever order they run in. Same shape as SkinEditor's InlineNameField,
+          // which is uncontrolled and was always safe for exactly this reason.
+          else if (e.key === 'Escape') {
+            editingRef.current = false;
+            e.currentTarget.value = value;
+            setLocal(value);
+            (e.currentTarget as HTMLInputElement).blur();
+          }
         }}
-        onChange={(e) => setLocal(e.target.value)}
+        onChange={(e) => { editingRef.current = true; setLocal(e.target.value); }}
         style={{ ...inputStyle, flex: 1, minWidth: 0 }}
       />
     </div>

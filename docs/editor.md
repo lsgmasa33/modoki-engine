@@ -941,6 +941,24 @@ controls) into the texture's `.meta.json`, and live-registers each slice as a `'
 manifest entry so it can be referenced from `Renderable2D.sprite`. One undo step captures
 the full slice set **and** the slicing parameters. See [Materials & Textures](./textures.md).
 
+> **A `.meta.json` write REPLACES the file — every writer must read-modify-write.**
+> `/api/write-meta` → `writeMetaSidecar` → `writeJsonAtomic(sidecarPath, committed)`: no merge with
+> what is on disk, deliberately (it also has to split the local-only cache keys out into
+> `.meta.local.json`). So a writer that posts a fragment destroys everything else in the sidecar.
+> Both **postprocessor** controls did exactly that — `Inspector.tsx`'s single-asset dropdown and
+> `ModelBatchView`'s batch one, each posting a bare `{version: 1, postprocessor}`. On a real model
+> (`demos/forest-camp/.../char_Ranger.glb.meta.json`, keys `version, id, rig, generated,
+> modelCache`) picking a postprocessor left `{version: 1, postprocessor}`, losing the asset's
+> **stable GUID** — so every scene and mesh ref to it dangles and the next scan mints a new one,
+> which re-importing cannot repair — plus the `generated` cleanup list (orphaning its derived
+> meshes/materials), the `rig` block and the LOD `modelCache`, and downgrading `version` 2 → 1.
+> The batch view did it to every selected model per click. Both now merge into the sidecar they
+> loaded, like every other writer already did. A literal that does NOT spread is legal only when
+> it authors a COMPLETE sidecar including `id` (the model-import path in `ModelAssetView`);
+> `engine/tests/editor/metaMergeNotClobber.test.ts` encodes exactly that rule. Found by the
+> close-out sweep of the 9-slice work, not by a report — the post succeeds, the UI updates, and
+> the damage sits in a file nobody re-reads until much later.
+
 ### SpriteAnim Editor
 
 `editor/panels/SpriteAnimEditor.tsx` — a dockable editor for `.spriteanim.json` assets (a

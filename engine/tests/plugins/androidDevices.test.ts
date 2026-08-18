@@ -5,7 +5,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
-  parseAdbDevices, resolveAndroidSerial, adbArgs, describeAndroidDevice, isUsable,
+  parseAdbDevices, resolveAndroidSerial, resolveBuildAndroidSerial, adbArgs, describeAndroidDevice, isUsable,
   friendlyName, withFriendlyNames, _clearFriendlyNameCache, androidDevicesExec,
   type AndroidDevice,
 } from '../../plugins/backend/androidDevices';
@@ -298,5 +298,50 @@ describe('friendlyName / withFriendlyNames / describeAndroidDevice — #149 frie
       expect(describeAndroidDevice({ serial: 'S', state: 'unauthorized', model: 'SC_56C', name: 'Galaxy A23 5G' }))
         .toBe('S (Galaxy A23 5G, unauthorized)');
     });
+  });
+});
+
+describe('resolveBuildAndroidSerial — the BUILD path also honours the held lease (#235)', () => {
+  const A = { serial: 'AAA', state: 'device', model: 'SM_S901U1' };
+  const B = { serial: 'BBB', state: 'device', model: 'SC_56C' };
+
+  it('uses the lease serial when the project has no pin — the refusal names device_connect, so it must work', () => {
+    // The bug: with three phones attached the build refused and told the caller to run
+    // `device_connect {useAdb:true, serial}`. Doing exactly that produced the IDENTICAL
+    // refusal on the next build, because the build path passed only the project pin —
+    // costing a full build-and-refuse cycle to discover the advice was inert.
+    expect(resolveBuildAndroidSerial([A, B], { leaseSerial: 'BBB', env: {} })).toEqual({ serial: 'BBB' });
+  });
+
+  it('the project pin still wins over the lease — durable config beats session state', () => {
+    expect(resolveBuildAndroidSerial([A, B], { projectPin: 'AAA', leaseSerial: 'BBB', env: {} })).toEqual({ serial: 'AAA' });
+  });
+
+  it('the lease beats the environment pin', () => {
+    expect(resolveBuildAndroidSerial([A, B], { leaseSerial: 'BBB', env: { MODOKI_ANDROID_SERIAL: 'AAA' } }))
+      .toEqual({ serial: 'BBB' });
+  });
+
+  it('a lease whose phone was UNPLUGGED degrades to the ordinary rule — a preference, not a pin', () => {
+    // A lease outlives the cable. Treated as a pin, an unplugged leased handset would hard-fail
+    // the build naming a serial the human never typed; as a preference the one remaining phone
+    // just builds. Same rule deviceConnection.ts states for its remembered target.
+    expect(resolveBuildAndroidSerial([A], { leaseSerial: 'BBB', env: {} })).toEqual({ serial: 'AAA' });
+  });
+
+  it('an UNUSABLE leased device is ignored too, and the refusal names the real candidates', () => {
+    const unauthorized = { serial: 'BBB', state: 'unauthorized' };
+    const r = resolveBuildAndroidSerial([A, unauthorized], { leaseSerial: 'BBB', env: {} });
+    // A is the only usable one, so it wins rather than the build dying on an unauthorized phone.
+    expect(r).toEqual({ serial: 'AAA' });
+  });
+
+  it('no pin, no lease, several phones — still refuses with every candidate named', () => {
+    const r = resolveBuildAndroidSerial([A, B], { env: {} });
+    expect('error' in r).toBe(true);
+    if ('error' in r) {
+      expect(r.error).toContain('AAA');
+      expect(r.error).toContain('BBB');
+    }
   });
 });

@@ -44,6 +44,7 @@ function result(over: Partial<TreeShakeResult>): TreeShakeResult {
     orphans: [],
     orphanDetails: [],
     domFontFiles: new Set(),
+    unreachableRefs: [],
     ...over,
   };
 }

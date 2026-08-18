@@ -340,6 +340,82 @@ stale-checked both ways so the backlog can only shrink. **Verify any migration w
 production build** (`MODOKI_PROJECT=games/<id> npm run build -- --target web`) — `npm test` cannot
 see this class.
 
+### The other direction — a ref the walker cannot SEE (#237)
+
+Everything above is a ref the build cannot see because it lives in **code**. There is a second half,
+and it bites authored data that is doing everything right: a ref in a **scene or prefab**, in a
+*shape* the walker does not reach.
+
+`SkinnedMeshRenderer.materials` is the worked example. It is a `Record<string, string>` — material
+slot NAME → `.mat.json` GUID — and `probeTraitRefs` reached exactly two shapes: a scalar field named
+in `REF_FIELDS_BY_TRAIT` (scalar-only, and with no `SkinnedMeshRenderer` entry) and one level of
+string ARRAY. A map is neither, so **every per-slot material override was shaken out of every
+production build**. Measured across all 23 committed projects: 11 such refs in 3 projects
+(`demos/forest-camp` ×1, `games/alien-animal` ×5, `games/timeline-demo` ×5), 11 dropped.
+
+Two things make this class nastier than the code-ref one:
+
+- **The runtime and the build disagreed, and the runtime was right.**
+  `collectResourceRefsFromEntities` (`runtime/loaders/loadSceneFile.ts`) has had an explicit
+  `SkinnedMeshRenderer.materials` branch all along, so the material is acquired and applied in dev
+  and in the editor. Only the *build* was blind. Two walkers over the same authored data, one with a
+  hole in it, and nothing compared them.
+- **The failure is silent by construction.** An authored material override that resolves to nothing
+  does not error — it simply does not apply, and the mesh keeps whatever material its GLB brought.
+  It shipped in the flagship published demo and surfaced only as a single
+  `[MeshCache] Unknown asset guid:` line in a device log.
+
+**Guard**: `computeKeptAssets` returns `unreachableRefs`, and a build with any entry **fails**.
+After the walk it re-reads every KEPT walkable asset JSON as text and flags any GUID that (a) the
+asset index resolves to a real shippable asset and (b) the keep-set does not contain. Both
+conditions carry weight: a GUID the asset index does not know is an entity ref and is ignored, which
+is what makes the check exact rather than noisy — measured **0 false positives across all 23
+projects**, against exactly the 11 true positives above. It is deliberately **shape-blind**: it does
+not care how the ref was written, so the *next* blind spot fails the build instead of shipping.
+
+Two details that are load-bearing rather than incidental:
+
+- It runs **before** the `build.modules.video` drop, so a clip excluded on purpose is never
+  misreported as a ref the walker missed.
+- It scans exactly the types the walk opens, asked via `classify()` — **not a suffix regex of its
+  own**. A second hand-maintained list of "files that carry refs" would be the same walker-vs-checker
+  drift the guard exists to catch (concretely: a legacy pre-migration scene is a plain `.json` under
+  `/scenes/`, which `classify` types `scene` and the walker reads, and which a `.scene.json` regex
+  would have skipped).
+
+As with the keep-list above, the fix for a flagged ref is to **teach `probeTraitRefs` the shape**,
+not to paper over it with an `asset-keep.json` entry.
+
+**The sweep that follows from this** — and it found a second instance immediately. State the defect
+as "the RUNTIME collector and the BUILD walker disagree about a trait", and the two lists are both
+readable: `collectResourceRefsFromEntities` (`runtime/loaders/loadSceneFile.ts`) carries explicit
+handlers for 14 traits, `probeTraitRefs` for 5. Differencing them turned up **`AudioSource.clips`** —
+a JSON-STRING bank `[{key, ref}]`, parsed by the runtime and by nothing in the build.
+`REF_FIELDS_BY_TRAIT` covers only the scalar `clip`, and the generic sweep sees one JSON string, so
+`isGuid()` is false and every ref inside is invisible to it. Now handled.
+
+Nothing was broken on committed content, and *why* is the part worth carrying: every committed
+`AudioSource` lives in a **scene**, and a scene carries a `resources[]` manifest — regenerated from
+that same runtime collector — which the walk reads, so the bank refs were reached by that route. A
+**prefab** has no `resources[]`. That is the asymmetry behind both bugs: a ref authored in a prefab
+gets exactly one chance to be seen, and it is the walker's own trait handling. `char_Ranger.prefab.json`
+is why #237 shipped; an `AudioSource` bank in a prefab would have shipped the same way, with
+`audio.play` on every non-active key silently playing nothing on device.
+
+**And a THIRD instance, which that sweep could not have found** — worth stating because it corrects
+the sweep's own framing. Differencing the two walkers' *trait handler* lists is a field-shape test,
+and the remaining gap was **structural**: `extractEntityRefs` walked an entity's `traits` and its
+`overrides`, while `collectResourceRefsFromEntities` also walks `nestedOverrides` (one level deeper —
+`{ path: { localId: { Trait } } }`) and every `added` subtree, each of which carries its own override
+maps. So the right pattern statement is not "which traits does each walker know" but **"which STORES
+can hold an override, and does each walker read all of them"** — and the answer now lives in one
+recursive helper per walker, so the two can be compared by eye.
+
+Nothing in committed content reaches it (`space-console`'s `Station.scene.json` is the only
+`nestedOverrides` user, and it overrides two scalar floats). The reason to fix it anyway is the guard
+above: since a ref the walker cannot see now **fails the build**, leaving the gap would have turned a
+silent 404 into a hard stop on legitimate authoring.
+
 ## Packaged editor loop (test the DMG faithfully, fast)
 
 ⚠️ **Why the packaged reaper is anchored to a bundle PATH, and must stay that way.** For months,
