@@ -180,14 +180,22 @@ export interface InputDeliverability { visibilityState?: string; hasFocus?: bool
 
 /** Ask the renderer whether trusted input can actually be DELIVERED right now.
  *
- *  Chromium drops every `sendInputEvent` while the window is OCCLUDED (fully covered by
- *  another app, or minimised) — the page goes `visibilityState:'hidden'` and nothing arrives.
- *  Measured 2026-08-18: three consecutive taps at a correctly-resolved Assets row delivered
- *  ZERO events (a capture-phase `document` listener recorded nothing, the row never selected),
- *  and every call still answered `ok:true, occluded:false`. Raising the window made the
- *  IDENTICAL call land. That is the silent-failure class this whole surface exists to remove:
- *  the reply described what the call AIMED at, never what arrived, so the agent blamed
- *  whatever feature it was driving.
+ *  Chromium drops every `sendInputEvent` to a page whose `visibilityState` is `'hidden'` —
+ *  nothing arrives at all. Measured 2026-08-18: three consecutive taps at a correctly-resolved
+ *  Assets row delivered ZERO events (a capture-phase `document` listener recorded nothing, the
+ *  row never selected), and every call still answered `ok:true, occluded:false`. That is the
+ *  silent-failure class this whole surface exists to remove: the reply described what the call
+ *  AIMED at, never what arrived, so the agent blamed whatever feature it was driving.
+ *
+ *  ⚠️ What PUTS a window into that state changed later the same day (#243), so do not read this
+ *  gate as "occluded input is dropped" — it no longer is, on macOS. `main.ts` now appends
+ *  `disable-backgrounding-occluded-windows`, and a COVERED window measures `'visible'` at 61fps
+ *  where it used to report `'hidden'` at fps 0. A MINIMISED one does too, and a trusted tap was
+ *  measured LANDING there (`mousedown:trusted`/`mouseup:trusted`, focus moved to the tapped
+ *  input). Believing the old rule is exactly the stop-and-ask-a-human round trip #243 removed.
+ *  The gate stays because its remaining causes are unmeasured — another Space, a sleeping
+ *  display, or a platform the switch does not reach — and a cheap gate that never fires costs
+ *  nothing, whereas removing it would restore the silent miss on whatever still triggers it.
  *
  *  Best-effort, like the attribution lease: a renderer that cannot answer must never fail the
  *  input (a refused tap is a broken tool; an unqualified one is only a missing hint).
@@ -211,10 +219,13 @@ export function hiddenWindowRefusal(live: InputDeliverability | null, what: stri
   return json({
     ok: false,
     code: 'REFUSED_BY_OP' satisfies ErrorCode,
-    error: `the editor window is HIDDEN/OCCLUDED (document.visibilityState is "hidden"), so Chromium `
-      + `would drop ${what} and deliver nothing — no event reaches the page at all. Nothing was `
-      + 'dispatched. Raise the editor window (bring the Electron app to the front, or un-minimise it) '
-      + 'and retry; the identical call lands once the page is visible.',
+    error: `the editor page reports document.visibilityState "hidden", so Chromium would drop `
+      + `${what} and deliver nothing — no event reaches the page at all. Nothing was dispatched; `
+      + 'the identical call lands once the page is visible. NOTE (#243): a COVERED or MINIMISED '
+      + 'window no longer causes this on macOS — both measure as "visible", and a trusted tap was '
+      + 'measured landing while minimised — so raising the window is probably NOT the fix here. '
+      + 'Look for a cause the occlusion switch does not reach: another Space, a sleeping display, '
+      + 'or a platform where it does not apply.',
     windowVisibility: 'hidden',
   }, 409);
 }
@@ -269,19 +280,10 @@ export function createInputRoutes(deps: InputRouteDeps) {
     }
   }
 
-  /** Ask the renderer whether trusted input can actually be DELIVERED right now.
-   *
-   *  Chromium drops every `sendInputEvent` while the window is OCCLUDED (fully covered by
-   *  another app, or minimised) — the page goes `visibilityState:'hidden'` and nothing arrives.
-   *  Measured 2026-08-18: three consecutive taps at a correctly-resolved Assets row delivered
-   *  ZERO events (a capture-phase `document` listener recorded nothing, the row never selected),
-   *  and every call still answered `ok:true, occluded:false`. Raising the window made the
-   *  IDENTICAL call land. That is the silent-failure class this whole surface exists to remove:
-   *  the reply described what the call AIMED at, never what arrived, so the agent blamed
-   *  whatever feature it was driving.
-   *
-   *  Best-effort, like the attribution lease: a renderer that cannot answer must never fail the
-   *  input (a refused tap is a broken tool; an unqualified one is only a missing hint). */
+  /** Gate every dispatching `/api/input/*` route on whether trusted input can actually be
+   *  DELIVERED right now. Why this exists, what Chromium actually drops, and the #243 change to
+   *  which window states still reach it: see `inputDeliverability` above — the one copy. (This
+   *  used to restate that comment verbatim, and the two would have drifted apart at #243.) */
   const handler = (async function inputRoutes(req: HostRequest): Promise<BackendResult | null> {
     const { method, urlPath } = req;
     if (!urlPath.startsWith('/api/input/') || method !== 'POST') return null;

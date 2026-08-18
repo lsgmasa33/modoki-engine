@@ -876,7 +876,13 @@ describe('actor lease brackets every input dispatch', () => {
  *  arrived, which is the exact silent-miss class the provenance fields exist to remove: the
  *  reply described what the call AIMED at, not what landed. Measured live 2026-08-18 on backend
  *  5183 — three taps, zero events on a capture-phase `document` listener; raising the window
- *  made the identical call land. */
+ *  made the identical call land.
+ *
+ *  ⚠️ These tests MOCK `visibilityState:'hidden'`, so they still pin the gate exactly — but do
+ *  not read them as evidence that a covered window reaches it. Later on 2026-08-18, #243 added
+ *  `disable-backgrounding-occluded-windows`, after which a covered window measures 'visible' at
+ *  61fps and a MINIMISED one delivers a trusted tap. The gate is near-unreachable on macOS now;
+ *  it is kept for the states nobody has measured. See `inputDeliverability` in inputRoutes.ts. */
 describe('window deliverability', () => {
   const ROUTES: [string, unknown][] = [
     ['/api/input/tap', { x: 1, y: 2 }],
@@ -895,7 +901,17 @@ describe('window deliverability', () => {
     routes = createInputRoutes({ ops, requestRenderer });
     const res = await post(urlPath, body);
     expect(res).toMatchObject({ kind: 'json', status: 409, body: { ok: false, code: 'REFUSED_BY_OP', windowVisibility: 'hidden' } });
-    expect((res as { body: { error: string } }).body.error).toMatch(/HIDDEN\/OCCLUDED/);
+    // The message names the OBSERVED state, not a guessed cause. It used to assert
+    // "HIDDEN/OCCLUDED ... raise the editor window", and #243 made both halves wrong on macOS:
+    // `disable-backgrounding-occluded-windows` keeps a covered AND a minimised window at
+    // 'visible' (a trusted tap was measured landing while minimised), so occlusion no longer
+    // reaches this branch and raising the window is no longer the remedy. Telling a reader to
+    // un-cover a window sends them hunting a cause that cannot apply — the failure mode this
+    // repo already names: an error message that guesses a cause is worse than one that reports.
+    const err = (res as { body: { error: string } }).body.error;
+    expect(err).toMatch(/visibilityState "hidden"/);
+    expect(err).toMatch(/#243/);
+    expect(err).not.toMatch(/Raise the editor window/);
     // Nothing was dispatched, and nothing was even resolved — the refusal is BEFORE the aim.
     expect(calls).toEqual([]);
     // ...and no attribution lease was opened for a dispatch that never happened.

@@ -382,6 +382,19 @@ if (CDP.openSwitch) {
   app.commandLine.appendSwitch('remote-debugging-port', String(CDP.port));
   logToFile('info', `[cdp] renderer remote-debugging enabled on 127.0.0.1:${CDP.port}`);
 }
+// Keep the frame loop alive when another window COVERS the editor (#243). This is a
+// different mechanism from the `backgroundThrottling: false` we already set on the
+// BrowserWindow: that governs Chromium's background TIMER throttling, whereas macOS
+// occlusion makes the OS report the window as occluded, Chromium transitions the
+// renderer to hidden, and rAF stops outright rather than being throttled. Measured with
+// backgroundThrottling already false: a covered editor read visibilityState 'hidden',
+// fps 0, and never spawned a level's entities — so scene load, prefab instantiation,
+// play/step and every agent-driven verification stalled until a human raised the window.
+// Unconditional on purpose: it does not add a policy, it makes the one the BrowserWindow
+// comment ALREADY states ("don't throttle when the window is occluded or backgrounded …
+// including headless/MCP verification runs") actually hold. Cost is a covered window
+// that keeps rendering; that trade was already accepted for the backgrounded case.
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 // A per-launch nonce baked into the renderer URL (`?cdpNonce=<uuid>#/editor`) so probeCdp
 // can prove a CDP endpoint is OUR process, not a sibling editor / stray Chrome tab (§12.2).
 // Minted once per process; loadURL uses it and cdpStatus() matches it.

@@ -455,6 +455,34 @@ content (the host element sets `isolation:isolate`); a CSS grid (`{l} 1fr {r}` �
 source sub-rect via the dimensionless `background-position`/`background-size` % trick, so
 it's independent of the (downscaled) texture variant actually loaded.
 
+### ⚠️ `scale` does not adapt — and for a capsule that is load-bearing
+
+`border.scale` is **CSS px per source px, fixed**. The grid adapts *cell sizes* to the element's
+real size, but the corner/edge columns are drawn at `inset × scale` regardless of how big the
+element turned out. So a master is only correct at the size its `scale` was chosen for.
+
+The sharp case is a **capsule** — a pill sliced with `t/b = 0`, where the left/right columns *are*
+the round caps. A true capsule needs its cap exactly **half the rendered height**; the columns
+still stretch vertically to fill, so any other value renders them as an ellipse. Court shipped
+`btn-pill-small` (228×68, `l/r = 36`) at `scale: 1` inside a 26 px-tall button: caps drawn 36 px
+wide and crushed to 26 tall, sitting inside the element's own `borderRadius: 999` — which draws a
+*real* capsule. Two mismatched curves, one inside the other, reading on screen as a stray shape
+floating in the button. `scale: 0.36` (= 13/36) fixes it.
+
+- **The check**: `l × scale ≈ height / 2`. Measure the emitted columns to confirm — expect
+  `l × scale + 2`, since each cell bleeds `OV = 1px` per side (above).
+- **Slicing a pill horizontally cannot work.** `t/b > 0` cuts through the caps and straightens
+  their sides; no guide value recovers the curve. A small pill needs its own master at `t/b = 0`
+  rather than a share of a bigger button's.
+- **A viewport-relative height desyncs it.** An element sized in `vmin`/`vh` under a fixed `scale`
+  is only correct at one viewport; below that the caps flatten again. Pin the height in px, or
+  accept the distortion off the design size. Court's pill measured 26 px on an iPad Pro 11", 19 px
+  on an iPhone Air and 16 px on a folded Fold7 from one `4.5vmin` authoring — caps 1.00× / 1.37× /
+  1.60× off. Only the height matters; the width may stay relative, since the middle column stretches.
+- ⚠️ **Verify on the SMALLEST target, never the largest.** Where a `vmin` height clamps to its own
+  px cap, the broken and pinned authorings render identically — so the big screen passes under both
+  hypotheses and proves nothing. The iPad did exactly that for Court.
+
 ### The 9-slice editor
 
 `NineSliceEditor` (`editor/panels/NineSliceEditor.tsx`) is a dev-only modal opened from
