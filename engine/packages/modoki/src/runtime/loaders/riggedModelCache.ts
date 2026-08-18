@@ -28,6 +28,7 @@ import { lodUrlSuffix } from './modelSettings';
 import { getKTX2Loader, ensureKtx2Caps } from './textureResolver';
 import { getModelPostprocessor } from './modelPostprocessorRegistry';
 import { takeParsedGltf, disposePendingGltf } from './parsedGltfHandoff';
+import { notifyModelTemplatesLoaded } from './modelLoadNotify';
 
 export interface RiggedModel {
   /** The parsed GLB scene graph — bones, SkinnedMeshes, materials. Cloned per
@@ -196,6 +197,11 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
       // / owners lookups resolve regardless of which candidate actually loaded.
       cache.set(path, model);
       console.log(`[RiggedCache] Loaded ${loadedFrom} — ${model.animations.length} clip(s): ${model.animations.map((c) => c.name).join(', ')}`);
+      // Same render-on-demand edge the static mesh cache fires: a re-imported SKINNED GLB is
+      // evicted from the scene by attachInvalidationListener and rebuilt only on a frame that
+      // runs, and this parse is the slow half. Without this the rig is the one thing
+      // QA-ASSET-0008's fix would still have left missing. See modelLoadNotify.ts.
+      notifyModelTemplatesLoaded(path);
       resolve();
     };
 

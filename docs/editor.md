@@ -472,6 +472,21 @@ Dialogs/modals mounted by the shell include `ApplyPrefabDialog`,
 `ProjectSettingsDialog`, and the import/build progress modals. Each panel is wrapped in a
 `PanelErrorBoundary` so one panel crashing doesn't take down the editor.
 
+**"Reload Panel" cannot fix every crash, and the boundary now says so instead of looping.** The
+button really does unmount and remount the children, so a panel that died on transient state
+recovers. What it cannot touch is a crash caused by the panel's PERSISTED tab config: the children
+are still bound to the same FlexLayout tab-node object resident in the in-memory model, so the
+initializer re-reads the same bad `node.getConfig()` and dies identically — and repairing the file
+on disk changes nothing until the layout model is re-read. Measured with a non-iterable Console
+`config.levels` (QA-EDITOR-0008): the data was fixed on disk, `Reload Panel` still re-crashed every
+time, and only a full reload recovered — which the UI gave no hint of needing.
+
+So the boundary counts its own retries. A crash arriving after a reset means the in-place path
+failed for THIS crash, and only then does it add the explanation plus a **Reload Editor** button,
+behind an in-place confirm (the reload discards unsaved scene edits, and `window.confirm` blocks
+the renderer). A remount that SURVIVES clears the counter, so a panel that crashed, recovered, and
+hit something unrelated later still gets its own cheap retry first.
+
 ---
 
 ## Trait registry & the auto-generated Inspector
@@ -541,6 +556,29 @@ derives basic hints from a koota schema's default values; it has no internal cal
 
 The gizmo mode (`translate | rotate | scale`) and space (`world | local`) live in
 `editorStore` and are shared by both modes via a toolbar.
+
+### The idle render gate — what re-arms it, and the edge that keeps being missed
+
+The 3D viewport draws only while its dirty gate has frames left (`editor/panels/viewportDirtyGate.ts`
+— a 60-frame / ~1s COUNTDOWN, not a boolean, because several async loaders in `scene3DSync` poll
+"not ready, retry next frame" with no completion callback). Everything that can change the rendered
+image therefore has to re-arm it, and `SceneView`'s subscription list is the whole set: trait writes,
+structure changes, world swaps, play-state edges, dynamic-font glyph generation, the editor store,
+OrbitControls, and — since QA-ASSET-0008 — **both edges of a model re-import**.
+
+**Both edges, and the second is the one that gets forgotten.** An editor re-import calls
+`invalidateModel`, which evicts the live meshes before the GPU geometry is disposed; that changes the
+image at once. The REBUILD only happens on a frame that runs, and a GLB re-parse routinely takes
+longer than the 1s grace — so re-arming on the invalidation alone still left a re-imported object
+missing indefinitely (measured on `games/space-console`: 10s+, twice, recovering only when an
+unrelated selection forced a frame). It reads as data loss, not as a stale frame. The completion edge
+is `runtime/loaders/modelLoadNotify.ts`, fired by **both** model caches — `meshTemplateCache` for
+static templates and `riggedModelCache` for skinned prototypes. A notifier wired into only the first
+would leave re-imported CHARACTERS broken while every static mesh recovered, which is why it is a
+shared leaf module rather than an export of either cache.
+
+The continuously-rendering GameView needs none of this, which is why the bug was viewport-specific —
+and why "it works in the Game panel" is not evidence that a render-on-demand path is fine.
 
 #### Multi-select gizmo
 

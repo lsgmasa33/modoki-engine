@@ -51,7 +51,8 @@ import { acquireRenderer, releaseRenderer, discardRenderer } from './rendererLea
 import { drawColliderOutline, drawSkinnedMeshFlat2D, drawSkinnedMeshWireframe2D, drawWeightHeatmap2D, drawDominantBoneMap2D, computePivotOffset, COLLIDER_SPRITE } from '../../runtime/rendering/render2DUtils';
 import { getSkin2DBuffer } from '../../runtime/skinning/skin2DBuffers';
 import { getRig2D, type ParsedRig2D } from '../../runtime/loaders/rig2dCache';
-import { resolveMeshTemplate } from '../../runtime/loaders/meshTemplateCache';
+import { resolveMeshTemplate, onModelInvalidated } from '../../runtime/loaders/meshTemplateCache';
+import { onModelTemplatesLoaded } from '../../runtime/loaders/modelLoadNotify';
 import { boneWeightField, dominantBoneField } from '../../runtime/skinning/rig2dWeightPaint';
 import { overlayPartIndices } from './skinWeightOverlay';
 import { computeCanvasScale, screenToReference2D } from '../../runtime/rendering/canvas2DScaler';
@@ -2020,6 +2021,7 @@ function registerScene2DColliderHandles(canvasEntityId: number, getCanvas: () =>
         y: rect.top + (backingY / ph) * rect.height,
         label: `vertex ${i}`,
         meta: { entityId: selId, index: i, local: [p.x, p.y] },
+        owner: canvas,
       };
     });
   });
@@ -2073,6 +2075,7 @@ function registerScene2DGizmoHandles(getCanvas: () => HTMLCanvasElement | null, 
         y: rect.top + (backingY / ph) * rect.height,
         label: `${mode} ${handle}`,
         meta: { handle, mode, space, world: [wx, wy] },
+        owner: canvas,
       };
     });
   });
@@ -2439,6 +2442,13 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       onWorldSwap(markViewportDirty),              // scene load/reload, Play/Stop world rebuild
       onPlayStateChange(markViewportDirty),        // Play ↔ Stop ↔ Pause edges
       onTextDirty(markViewportDirty),              // dynamic-font glyph gen / async atlas load (not an ECS write)
+      // Model re-import — BOTH edges, and both are load-bearing. The invalidation evicts the
+      // live meshes (attachInvalidationListener above), which changes the image immediately;
+      // the rebuild lands whenever the GLB finishes re-parsing, which routinely outlasts the
+      // gate's ~1s grace. Without the second one the object stayed missing indefinitely on
+      // this render-on-demand viewport (QA-ASSET-0008).
+      onModelInvalidated(markViewportDirty),
+      onModelTemplatesLoaded(markViewportDirty),
       useEditorStore.subscribe(markViewportDirty), // selection, gizmo mode/space, view mode, layers, particlePreview, gameRect …
     ];
 
@@ -2459,6 +2469,22 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     //    axis basis follows gizmoSpace. Skips an axis pointing ~at/away from the camera
     //    (un-aimable) and returns [] when nothing's attached. meta.approximate flags these
     //    as aim aids, not exact handle centres.
+    //
+    //    `owner` is the renderer canvas, and it is load-bearing rather than decorative. The
+    //    aim point is the object's origin plus a FIXED SCREEN OFFSET (52px), so on a narrow
+    //    Scene panel it can land past the canvas edge and over a neighbouring panel — where
+    //    the trusted click goes to that panel and the gizmo never sees a pointerdown. Without
+    //    an owner, `computeHandles` cannot occlusion-check the point, so the handle came back
+    //    `occlusionChecked:false` and `modoki_drag_handle` answered a cheerful ok:true with a
+    //    resolved from/to while nothing moved at all.
+    //
+    //    MEASURED 2026-08-18 (games/anim-bug, backend 5183, Scene canvas 256px wide): the Sun
+    //    light's origin projected to x=253.8, its +x aim point to x=305.1 — 49px into the
+    //    Assets panel, `document.elementFromPoint` returning that panel's row — and the drag
+    //    moved nothing, while the Sphere at x=177 moved 0 -> 1.516 on the identical call. It
+    //    was filed as "a LIGHT's gizmo does nothing, a mesh works" (QA-SVIEW-0003) and is not
+    //    about lights: it is about WHERE the two happened to project. With the owner supplied
+    //    the same call now reports `occluded:true` + `occludedBy` naming the cover.
     const unregGizmo3DHandles = registerHandleProvider((): InteractionHandle[] => {
       const obj = gizmo.object;
       if (!obj || !gizmo.enabled || !(gizmo as { visible?: boolean }).visible) return [];
@@ -2494,13 +2520,13 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       const push = (id: string, label: string, px: number, dir: THREE.Vector3, axis: string) => {
         const sd = screenDir(dir);
         if (!sd) return;
-        out.push({ id, kind: 'gizmo-axis', editor: 'gizmo3d', x: oC.x + sd.x * px, y: oC.y + sd.y * px, label, meta: { axis, mode: gizmoMode, space: gizmoSpace, approximate: true } });
+        out.push({ id, kind: 'gizmo-axis', editor: 'gizmo3d', x: oC.x + sd.x * px, y: oC.y + sd.y * px, label, meta: { axis, mode: gizmoMode, space: gizmoSpace, approximate: true }, owner: renderer.domElement });
       };
       const PX = 52, RING_PX = 66;
       if (gizmoMode === 'translate' || gizmoMode === 'scale') {
         for (const ax of ['x', 'y', 'z'] as const) push(`gizmo3d:${gizmoMode}:${ax}`, `${gizmoMode} ${ax}`, PX, axisDir(ax), ax);
         // Centre = screen-space plane move / uniform scale (grab at the origin itself).
-        out.push({ id: `gizmo3d:${gizmoMode}:center`, kind: 'gizmo-axis', editor: 'gizmo3d', x: oC.x, y: oC.y, label: `${gizmoMode} center`, meta: { axis: 'center', mode: gizmoMode, space: gizmoSpace, approximate: true } });
+        out.push({ id: `gizmo3d:${gizmoMode}:center`, kind: 'gizmo-axis', editor: 'gizmo3d', x: oC.x, y: oC.y, label: `${gizmoMode} center`, meta: { axis: 'center', mode: gizmoMode, space: gizmoSpace, approximate: true }, owner: renderer.domElement });
       } else if (gizmoMode === 'rotate') {
         // Each rotation ring lies perpendicular to its axis — aim a point ON the ring by
         // offsetting along a perpendicular axis (x-ring↔y dir, y-ring↔z, z-ring↔x).

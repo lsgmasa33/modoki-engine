@@ -109,9 +109,13 @@ export function newGuid(): string {
  *
  *  It is tempting to read "derived, so it need not be serialized" and conclude the algorithm is
  *  swappable. It is not. Two call sites write the result into files that outlive the process:
- *    - `SpritePicker.tsx` assigns `deriveGuid('sprite:' + textureGuid)` — the whole-image sprite id
- *      — into scene `Renderable2D`/UI refs. `asset-tree-shaker.ts` re-derives the same value to
- *      avoid shaking the texture out of a build, and `assetRefIntegrity.test.ts` validates against it.
+ *    - `editor/panels/spritePickerGroups.ts` derives `deriveGuid('sprite:' + textureGuid)` — the
+ *      whole-image sprite id — for the SpritePicker's "whole" button and SkinEditor's drag-drop,
+ *      which write it into scene `Renderable2D`/UI refs and rig2d `parts[].sprite`.
+ *      `asset-tree-shaker.ts` re-derives the same value to avoid shaking the texture out of a
+ *      build, and `assetRefIntegrity.test.ts` validates against it. (Both editor callers go
+ *      through `wholeImageSpriteRef`, which returns undefined when the sprite does not exist —
+ *      a sliced sheet has none. See docs/textures.md § Gotchas.)
  *    - Prefab-member ids are referenced from OUTSIDE the instance, and those referring entities
  *      are serialized.
  *  Change the seed format, the hash, or the layout, and every 2D sprite reference in every project

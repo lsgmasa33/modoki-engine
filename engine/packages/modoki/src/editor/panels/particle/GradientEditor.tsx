@@ -137,6 +137,7 @@ export default function GradientEditor({ value, onChange }: Props) {
             y: rect.top + rect.height / 2,
             label: `${kind} stop t=${s.t.toFixed(2)}`,
             meta: { strip: kind, index: i, t: s.t },
+            owner: el,
           });
         });
       }

@@ -404,6 +404,20 @@ pixels a device downloads and uploads.
 - **KTX2/Basis is bottom-origin**, so KTX2 textures use `flipY = false`
   (matches the GLB convention) and `generateMipmaps = false` (mips are baked).
   `applyTextureSettings()` enforces this.
+- **A SLICED texture has NO whole-image sprite, and nothing says so out loud.** The scanner
+  auto-emits a whole-image `'sprite'` (guid `deriveGuid('sprite:' + textureGuid)`, path
+  `<tex>#default`) for a 2D/UI texture in the branch **mutually exclusive** with the sliced one
+  (`vite-asset-scanner.ts`) — so a texture with `spriteMode:'multiple'` never gets one. Deriving
+  that guid anyway yields a ref with no manifest entry: it renders nothing and logs nothing.
+  Two editor surfaces did exactly that and shipped dead refs — the SpritePicker's "whole" button
+  for any sliced sheet (QA-INSP-0011, reproduced on `games/sling`'s 200-slice slime sheet) and
+  SkinEditor's drag-drop of a texture onto a rig part. **Ask the manifest whether the sprite
+  exists** (`wholeImageSpriteRef` in `editor/panels/spritePickerGroups.ts`, shared by both) rather
+  than re-deriving the emit rule — a second derivation of the rule is how the two drift. Do NOT
+  fall back to the raw texture guid when it is absent: 2D refs are sprites-only, and that trades a
+  dead ref for a different invariant violation. `assetRefIntegrity.test.ts` now models the same
+  exclusion; it used to add the derived guid unconditionally, which made the guard vouch for
+  precisely the dead ref it exists to catch.
 - **DOM image refs** (`UIElement.imageSrc` in `UINode.tsx`) MUST resolve via
   `resolveDomImageUrl` → `resolveBrowserImageUrl` (the WebP/PNG browser
   sibling), **not** `resolveImageUrl` / `resolveTextureVariantUrl(ref, '2d')`

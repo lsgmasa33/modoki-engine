@@ -4,19 +4,15 @@
  *  cropped thumbnail of the frame (using the dev-served source image) + its name;
  *  clicking assigns the sprite's GUID. A per-texture "whole image" row assigns the
  *  texture's auto whole-image SPRITE GUID (never the raw texture — 2D refs are
- *  sprites-only). Dev-only (editor). */
+ *  sprites-only) — and is shown only when that sprite actually exists, which a sliced
+ *  sheet's texture has none of (see spritePickerGroups.ts). Dev-only (editor). */
 
 import { useRef } from 'react';
 import { useOverlayEscape } from '../input/useOverlayEscape';
 import type { AssetEntry } from '../../runtime/loaders/assetManifest';
 import { resolveGuidToPath } from '../../runtime/loaders/assetManifest';
-import { deriveGuid } from '../../runtime/core/assetRefRules';
 import { assetDisplayName } from './AssetRefField';
-
-/** The whole-image sprite GUID a 2D/UI texture auto-exposes — must match the
- *  scanner's `deriveGuid('sprite:' + textureGuid)`. Assigning THIS (not the raw
- *  texture GUID) is what keeps 2D refs sprites-only. */
-const wholeImageSpriteGuid = (texGuid: string) => deriveGuid('sprite:' + texGuid);
+import { groupSpritesByTexture } from './spritePickerGroups';
 
 const BOX_W = 46;
 const BOX_H = 38;
@@ -55,15 +51,8 @@ export function SpritePicker({ anchor, assets, onPick, onClear, onClose }: {
   const ref = useRef<HTMLDivElement>(null);
   useOverlayEscape(true, onClose, 'sprite-picker');
 
-  // Group sprite assets by their parent texture.
-  const groups = new Map<string, { texPath: string | undefined; sprites: AssetEntry[] }>();
-  for (const a of assets) {
-    if (a.type !== 'sprite' || !a.sprite || !a.guid) continue;
-    const texGuid = a.sprite.texture;
-    let g = groups.get(texGuid);
-    if (!g) { g = { texPath: resolveGuidToPath(texGuid), sprites: [] }; groups.set(texGuid, g); }
-    g.sprites.push(a);
-  }
+  // Group sprite assets by their parent texture (pure — see spritePickerGroups.ts).
+  const groups = groupSpritesByTexture(assets);
 
   const left = Math.min(anchor.left, window.innerWidth - 280);
   const top = Math.min(anchor.bottom + 2, window.innerHeight - 360);
@@ -89,13 +78,17 @@ export function SpritePicker({ anchor, assets, onPick, onClear, onClose }: {
             No sliced sprites yet. Select a texture in the Assets panel → Inspector → <b>Sprite Editor</b> to slice it.
           </div>
         ) : (
-          [...groups.entries()].map(([texGuid, g]) => (
+          [...groups.entries()].map(([texGuid, g]) => {
+            const texPath = resolveGuidToPath(texGuid);
+            return (
             <div key={texGuid} style={{ marginBottom: 6 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#9ad', margin: '2px 0' }}>
                 <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {g.texPath ? assetDisplayName(g.texPath) : texGuid.slice(0, 8)}
+                  {texPath ? assetDisplayName(texPath) : texGuid.slice(0, 8)}
                 </span>
-                <button onClick={() => onPick(wholeImageSpriteGuid(texGuid))} style={wholeBtn} title="Assign the whole-image sprite">whole</button>
+                {g.wholeGuid && (
+                  <button onClick={() => onPick(g.wholeGuid!)} style={wholeBtn} title="Assign the whole-image sprite">whole</button>
+                )}
               </div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
                 {g.sprites.map((s) => (
@@ -105,13 +98,14 @@ export function SpritePicker({ anchor, assets, onPick, onClear, onClose }: {
                     title={`${s.sprite!.name ?? ''}  ${s.sprite!.rect.w}×${s.sprite!.rect.h}`}
                     style={{ cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1, width: BOX_W }}
                   >
-                    <div style={spriteThumbStyle(g.texPath, s.sprite!.rect, s.sprite!.sheetW, s.sprite!.sheetH)} />
+                    <div style={spriteThumbStyle(texPath, s.sprite!.rect, s.sprite!.sheetW, s.sprite!.sheetH)} />
                     <span style={{ width: BOX_W, fontSize: 9, color: '#aaa', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'center' }}>{s.sprite!.name ?? '—'}</span>
                   </div>
                 ))}
               </div>
             </div>
-          ))
+            );
+          })
         )}
       </div>
     </div>

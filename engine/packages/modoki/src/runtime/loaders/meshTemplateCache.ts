@@ -14,6 +14,7 @@ import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { modelGlbUrl, resolveRefWarnOnce } from './modelGlbUrl';
 import { takeParsedGltf, clearParsedGltfHandoff } from './parsedGltfHandoff';
+import { notifyModelTemplatesLoaded } from './modelLoadNotify';
 import { addToOwnerSet, removeFromOwnerSet } from './ownerSet';
 import { loadTexture3D, releaseTexture3D, isSharedTexture, resolveEnvVariantUrl, getEnvFormat } from './textureResolver';
 import { clearParticleCache } from './particleCache';
@@ -396,6 +397,7 @@ export function onModelInvalidated(fn: ModelInvalidationListener): () => void {
   return () => { modelInvalidationListeners.delete(fn); };
 }
 
+
 /** Per-source-path snapshot of LOD paths captured at acquireModel time. Used by
  *  release-time invalidation so a manifest entry that gets torn down (rename,
  *  reimport-with-id-change, world swap) before release does not orphan the LOD
@@ -681,6 +683,9 @@ export function loadModelTemplates(
         if (typeof (model as { clear?: () => void }).clear === 'function') (model as { clear: () => void }).clear();
 
         console.log(`[MeshCache] Loaded ${count} templates from ${path}`);
+        // Re-arm the editor SceneView's dirty gate — see modelLoadNotify.ts for why the
+        // invalidation edge alone does not close QA-ASSET-0008.
+        notifyModelTemplatesLoaded(path);
         resolve();
       } catch (err) {
         console.error(`[MeshCache] Failed during template processing for ${path}:`, err);

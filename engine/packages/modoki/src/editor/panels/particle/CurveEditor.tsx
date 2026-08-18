@@ -55,6 +55,7 @@ export default function CurveEditor({ points, onChange, height = 96, color = '#4
         y: rect.top + curveY(p.v, st.vbh) * sy,
         label: `${st.label ?? 'curve'} pt${i} (t=${p.t.toFixed(2)}, v=${p.v.toFixed(2)})`,
         meta: { curve: st.label, index: i, t: p.t, v: p.v, endpoint: i === 0 || i === st.pts.length - 1 },
+        owner: svg,
       }));
     });
     return unreg;

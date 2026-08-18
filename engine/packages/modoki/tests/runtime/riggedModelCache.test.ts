@@ -96,6 +96,7 @@ import {
   offerParsedGltf, hasPendingGltf, clearParsedGltfHandoff,
 } from '../../src/runtime/loaders/parsedGltfHandoff';
 import { setActiveRenderer, getKTX2Loader } from '../../src/runtime/loaders/textureResolver';
+import { onModelTemplatesLoaded } from '../../src/runtime/loaders/modelLoadNotify';
 
 const REF = 'alien.glb';
 const PATH = '/models/alien.glb';
@@ -127,6 +128,37 @@ beforeEach(() => {
 });
 
 describe('riggedModelCache', () => {
+  /** QA-ASSET-0008's sibling. The editor SceneView renders on demand, so a re-imported model is
+   *  evicted immediately and rebuilt only on a frame that runs; the viewport's dirty gate is
+   *  re-armed off this shared edge because a GLB re-parse outlasts its ~1s grace. The fix was
+   *  first wired only into meshTemplateCache, which would have left a re-imported CHARACTER
+   *  missing on the SceneView while every static mesh recovered — the rigged prototype lives in
+   *  THIS cache, with its own loader. */
+  it('fires the shared model-loaded edge once the prototype is cached', async () => {
+    const seen: string[] = [];
+    const off = onModelTemplatesLoaded((p) => seen.push(p));
+    try {
+      await acquireRiggedModel(1, REF);
+    } finally { off(); }
+    expect(seen).toEqual([PATH]);
+    // AFTER the cache write, never before — a redraw armed ahead of it would draw the same
+    // empty frame and settle again.
+    expect(getRiggedModel(REF)).toBeTruthy();
+  });
+
+  it('does not fire the loaded edge when the load is dropped mid-flight', async () => {
+    // Released before the parse lands → the prototype is disposed and never cached, so there is
+    // nothing new to draw and no redraw to arm.
+    const seen: string[] = [];
+    const off = onModelTemplatesLoaded((p) => seen.push(p));
+    const p = acquireRiggedModel(1, REF);
+    releaseRiggedModelsForScene(1);
+    await p;
+    off();
+    expect(seen).toEqual([]);
+    expect(getRiggedModel(REF)).toBeUndefined();
+  });
+
   it('returns undefined / empty clips before load', () => {
     expect(getRiggedModel(REF)).toBeUndefined();
     expect(getClipNames(REF)).toEqual([]);

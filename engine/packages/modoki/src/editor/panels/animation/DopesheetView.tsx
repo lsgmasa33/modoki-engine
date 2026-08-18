@@ -110,6 +110,7 @@ function DopesheetView({
             y: rect.top + cy,
             label: `${track.trait}.${track.field} t=${k.t.toFixed(3)}`,
             meta: { trackIndex: ti, keyIndex: ki, time: k.t, value: k.v, path: track.path, track: `${track.trait}.${track.field}` },
+            owner: el,
           });
         });
       });

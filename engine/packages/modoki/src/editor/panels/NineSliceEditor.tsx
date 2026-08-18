@@ -152,6 +152,7 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
           y: rect.top + (vertical ? rect.height / 2 : g),
           label: EDGE_LABEL[e],
           meta: { edge: e, inset: e === 'l' ? st.border.l : e === 'r' ? st.border.r : e === 't' ? st.border.t : st.border.b },
+          owner: canvas,
         };
       });
     });

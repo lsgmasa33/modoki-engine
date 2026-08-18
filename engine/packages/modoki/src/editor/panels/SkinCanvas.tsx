@@ -244,6 +244,7 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
         y: rect.top + bt + (st.origin[i].y * scale + oy),
         label: b.name,
         meta: { boneIndex: i, name: b.name, parent: b.parent, skinMode: st.skinMode, boneTool: st.tool },
+        owner: canvas,
       }));
     });
     return unreg;

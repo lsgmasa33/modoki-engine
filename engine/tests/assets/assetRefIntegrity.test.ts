@@ -229,10 +229,17 @@ function textureAndSpriteGuids() {
     const metaPath = t.abs + '.meta.json';
     if (!fs.existsSync(metaPath)) continue;
     const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as Parameters<typeof resolveTextureType>[0] & { sprites?: { guid?: string }[] };
-    for (const s of meta?.sprites ?? []) if (isGuid(s.guid)) sprites.add(s.guid!.toLowerCase());
-    // A 2D/UI texture with no explicit slices exposes a derived whole-image sprite.
+    const slices = (meta?.sprites ?? []).filter((s) => isGuid(s.guid));
+    for (const s of slices) sprites.add(s.guid!.toLowerCase());
+    // A 2D/UI texture with no explicit slices exposes a derived whole-image sprite — and the
+    // `no explicit slices` half is load-bearing, not prose. The scanner emits the `#default`
+    // entry in the branch MUTUALLY EXCLUSIVE with the sliced one (vite-asset-scanner.ts
+    // ~906-946), so a `spriteMode:'multiple'` sheet has no whole-image sprite at all. This
+    // guard used to add the derived guid unconditionally, which made it vouch for exactly the
+    // dead ref it exists to catch: the SpritePicker's "whole" button committed that guid for a
+    // sliced sheet (QA-INSP-0011), and a scene saved with it would have passed here.
     const ttype = resolveTextureType(meta);
-    if (ttype === '2d' || ttype === 'ui') sprites.add(deriveGuid('sprite:' + guid).toLowerCase());
+    if (slices.length === 0 && (ttype === '2d' || ttype === 'ui')) sprites.add(deriveGuid('sprite:' + guid).toLowerCase());
   }
   return { textures, sprites };
 }

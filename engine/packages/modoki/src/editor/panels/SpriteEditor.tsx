@@ -161,6 +161,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
           y: rect.top + hp.y * st.scale,
           label: `${s.name} ${h}`,
           meta: { guid: s.guid, name: s.name, handle: h, rect: s.rect },
+          owner: canvas,
         };
       });
       out.push({
@@ -171,6 +172,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
         y: rect.top + (s.rect.y + s.rect.h * s.pivot.y) * st.scale,
         label: `${s.name} pivot`,
         meta: { guid: s.guid, name: s.name, pivot: s.pivot },
+        owner: canvas,
       });
       return out;
     });

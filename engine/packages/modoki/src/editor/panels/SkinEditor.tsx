@@ -15,7 +15,7 @@
 import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react';
 import { backendFetch } from '../backend/editorBackend';
 import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath, getGuidForPath } from '../../runtime/loaders/assetManifest';
-import { deriveGuid } from '../../runtime/core/assetRefRules';
+import { wholeImageSpriteRef } from './spritePickerGroups';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { type Rig2DFile } from '../../runtime/loaders/rig2dCache';
 import { coerceRigBones } from '../../runtime/skinning/rig2dTypes';
@@ -270,14 +270,28 @@ export default function SkinEditor() {
   const resolveDroppedSprites = useCallback((e: React.DragEvent): string[] => {
     const isImage = (p: string, type?: string) => type === 'sprite' || type === 'texture' || /\.(png|jpe?g|webp)$/i.test(p);
     // A part.sprite ref must be a SPRITE guid, never a raw texture guid — a dropped texture
-    // resolves to its derived whole-image sprite (matches SpritePicker's "whole" button); an
-    // explicit sprite slice passes through unchanged. (assetRefIntegrity guards this invariant.)
-    const toSpriteGuid = (guid: string): string => (getAssetEntry(guid)?.type === 'texture' ? deriveGuid('sprite:' + guid) : guid);
+    // resolves to its derived whole-image sprite; an explicit sprite slice passes through
+    // unchanged. (assetRefIntegrity guards this invariant.)
+    //
+    // The derived guid is only REAL for a texture with no explicit slices: the scanner emits
+    // the whole-image `#default` sprite in the branch that is mutually exclusive with the
+    // sliced one, so deriving it for a `spriteMode:'multiple'` sheet yields a guid with no
+    // manifest entry — a dead ref that renders nothing and logs nothing. Same defect the
+    // SpritePicker's "whole" button had (QA-INSP-0011); this was its second site. So ask the
+    // manifest whether the sprite exists rather than re-deriving the scanner's emit rule, and
+    // drop the drop with a reason instead of assigning a ref that cannot resolve.
+    const toSpriteGuid = (guid: string): string => {
+      if (getAssetEntry(guid)?.type !== 'texture') return guid;
+      const whole = wholeImageSpriteRef(guid, getAssetEntry);
+      if (whole) return whole;
+      console.warn(`[SkinEditor] "${resolveGuidToPath(guid) ?? guid}" is a SLICED spritesheet — it has no whole-image sprite to assign. Drop one of its slices instead (Assets panel → the texture's slices).`);
+      return '';
+    };
     const pathsRaw = e.dataTransfer.getData('application/editor-asset-paths');
     if (pathsRaw) {
       try {
         const paths = (JSON.parse(pathsRaw) as string[]).filter((p) => isImage(p));
-        if (paths.length > 1) return paths.map((p) => getGuidForPath(p)).filter((g): g is string => !!g).map(toSpriteGuid);
+        if (paths.length > 1) return paths.map((p) => getGuidForPath(p)).filter((g): g is string => !!g).map(toSpriteGuid).filter(Boolean);
       } catch { /* fall through to the single payload */ }
     }
     const raw = e.dataTransfer.getData('application/editor-asset');
@@ -286,7 +300,7 @@ export default function SkinEditor() {
     if (!isImage(path, type)) return [];
     const resolved = guid || getGuidForPath(path);
     if (!resolved) { console.warn(`[SkinEditor] "${path}" has no GUID yet — refresh the Assets panel and drop again.`); return []; }
-    return [toSpriteGuid(resolved)];
+    return [toSpriteGuid(resolved)].filter(Boolean);
   }, []);
 
   // Append a new part per sprite (each named after its asset, auto-tessellated). Sequential so

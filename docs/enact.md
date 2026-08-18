@@ -226,6 +226,30 @@ The handle shape carries three fields that make chrome addressing robust:
   (`fromTarget` / `toTarget`, mirroring `/api/input/drag`), because a covered source and a covered
   destination need different fixes.
 
+  **Every provider names its owning element, and that is a rule, not a nicety.** `computeHandles`
+  occlusion-checks a handle only when its provider supplies `owner` (the element itself for chrome,
+  the owning `<canvas>`/`<svg>`/container for a Canvas2D/SVG editor); one that omits it is counted
+  in `occlusionUnchecked` instead of being given a wrong clean bill of health. That fallback is
+  honest but was, for a while, the state of every non-chrome provider — so a keyframe, a bone, a
+  collider vertex and a 3D gizmo axis were all un-hit-tested.
+
+  What that cost, measured 2026-08-18 on `games/anim-bug`: a bug was filed as "dragging a LIGHT's
+  3D translate gizmo does nothing while a mesh in the same scene moves" (QA-SVIEW-0003), which
+  reads as a lights regression and is not one. A gizmo axis aim point is the object's origin plus a
+  FIXED 52px screen offset. The Scene panel's canvas was 256px wide; the light's origin projected to
+  x=253.8, so its +x aim point landed at x=305.1 — 49px past the canvas edge, inside the Assets
+  panel — and the trusted click went there while `modoki_drag_handle` answered `ok:true` with a
+  resolved from/to. The mesh simply projected further left. The light's un-occluded z handle moved
+  it normally. With `owner` supplied the same call reports `occludedBy: "div"` and `occludedCount`
+  rises, which is the whole difference between a silent miss and a diagnosable one.
+
+  The rule is enforced by `engine/tests/architecture/handleProviderOwner.test.ts` — a SOURCE guard,
+  because these providers live inside panel mount effects that cannot be invoked without a real
+  viewport. One provider is deliberately exempt and the guard asserts it stays that way:
+  **`UIResizeOverlay`**, whose 8 handles sit ON the entity element but are driven by sibling overlay
+  divs drawn over it, so owning the entity element would report every handle as occluded by its own
+  grab affordance. Wiring it needs the overlay divs themselves, which the provider does not hold.
+
 ### What's tagged today
 
 28 live handles in the first pass: ContextMenu rows (every menu in the editor), Inspector header
@@ -465,9 +489,6 @@ A corollary for tests: a jsdom test is necessary but **not sufficient** for an i
 
 Not-yet-done follow-ups, none blocking:
 
-- **Canvas providers should name their owning `<canvas>`** (`owner: canvasEl`, one field per
-  provider) so their handles get occlusion-checked instead of counted in `occlusionUnchecked`.
-  Until then a covered keyframe is *admitted-unknown*, not *assumed-fine*.
 - **`registerHandleProvider(fn, {editor})`** so `collectHandles` can skip providers the `editor`
   filter excludes. Today `modoki_handles {editor:'collider2d'}` still pays the full chrome DOM
   walk (a `getBoundingClientRect` + `elementFromPoint` per tagged element) before discarding it —
