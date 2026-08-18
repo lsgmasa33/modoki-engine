@@ -101,7 +101,10 @@ describe('interaction-handle providers name their owning element', () => {
 
   it.each(files.map(({ file }) => file))('%s', (file) => {
     const { literals } = files.find((f) => f.file === file)!;
-    const exemptKey = Object.keys(EXEMPT).find((k) => file.endsWith(k));
+    // `join` yields backslashes on Windows while EXEMPT is keyed with `/` — compare on a
+    // normalized path, or every exemption silently stops applying there (CI, 2026-08-18).
+    const posix = file.replace(/\\/g, '/');
+    const exemptKey = Object.keys(EXEMPT).find((k) => posix.endsWith(k));
     for (const lit of literals) {
       // An exemption that has since been wired is stale — delete the EXEMPT entry.
       if (exemptKey) expect(lit).not.toContain('owner:');
