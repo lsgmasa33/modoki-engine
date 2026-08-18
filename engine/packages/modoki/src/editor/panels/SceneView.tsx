@@ -91,6 +91,7 @@ import { drawGizmo2D, hitTestGizmo2D, cursorForHandle, applyGizmoDrag2D, snapDra
 import { layoutText } from '../../runtime/rendering/text/layoutText';
 import { getLoadedFont } from '../../runtime/loaders/fontAtlasLoader';
 import { onTextDirty } from '../../runtime/rendering/text/textDirty';
+import { onMaterial3DDirty } from '../../runtime/rendering/materialDirty';
 
 /** The 2D gizmo box for a Text2D entity: the laid-out text block (px in Canvas2D
  *  units) as HALF-extents (the gizmo/outline convention — box is w*2×h*2), with the
@@ -2442,6 +2443,12 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       onWorldSwap(markViewportDirty),              // scene load/reload, Play/Stop world rebuild
       onPlayStateChange(markViewportDirty),        // Play ↔ Stop ↔ Pause edges
       onTextDirty(markViewportDirty),              // dynamic-font glyph gen / async atlas load (not an ECS write)
+      // MaterialInstance prop overrides write a number straight onto a THREE.Material clone —
+      // no trait write, no store change, so NOTHING else here armed the gate and the viewport
+      // kept showing the pre-change frame. Data-level checks all pass while only the pixels are
+      // stale, and capture_viewport cannot reveal it either (it screenshots the window, it does
+      // not force a render). See runtime/rendering/materialDirty.ts.
+      onMaterial3DDirty(markViewportDirty),
       // Model re-import — BOTH edges, and both are load-bearing. The invalidation evicts the
       // live meshes (attachInvalidationListener above), which changes the image immediately;
       // the rebuild lands whenever the GLB finishes re-parsing, which routinely outlasts the
@@ -2449,6 +2456,18 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // this render-on-demand viewport (QA-ASSET-0008).
       onModelInvalidated(markViewportDirty),
       onModelTemplatesLoaded(markViewportDirty),
+      // ⚠️ UNDO/REDO. It reverts traits with a direct `entity.set`, which does NOT go through
+      // writeTraitField and so fires NO dirty broadcast — the 2D gate has said exactly this since
+      // it was bitten (see the subscribeUndo effect above), and the 3D gate simply never got the
+      // same wiring. Without it `scene3DSync` does not run after an undo, so the THREE object
+      // keeps its PRE-undo world matrix while the ECS Transform is already reverted, and the next
+      // reader of the render-side state gets the stale value for one call: `focus_entity` framed
+      // the camera at x:1807 for an entity back at x:5, a gizmo drag computed its base from the
+      // un-reverted position (so a second undo could not restore the original), and the projected
+      // gizmo aim-points briefly reported no handles at all. Calling either a SECOND time
+      // "fixed" it only because the first call moved the camera, and OrbitControls' own 'change'
+      // armed the gate. Testboard QA-SVIEW-0001 / QA-SVIEW-0003.
+      subscribeUndo(markViewportDirty),
       useEditorStore.subscribe(markViewportDirty), // selection, gizmo mode/space, view mode, layers, particlePreview, gameRect …
     ];
 

@@ -29,7 +29,17 @@ export function registerRenderTools(tool: ToolDef, ctx: ToolContext): void {
       'If NO viewport is mounted, modoki_render_scene is NOT a fallback — it needs the Game ' +
       'panel\'s 3D surface, i.e. exactly what is missing. Open the panel, or read the scene as ' +
       'DATA (modoki_get_scene_state / modoki_diagnose), which needs no renderer at all. ' +
-      'This FORCES a fresh render, so it CANNOT reveal a stale or render-on-demand frame — the broken frame heals in the capture. For the TRUE framebuffer use CDP Page.captureScreenshot (see CLAUDE.md). ',
+      '\n\n⚠️ This does NOT force a render. It is `webContents.capturePage()` — a screenshot of ' +
+      'the WINDOW, i.e. whatever each surface last drew. The Game panel renders continuously so ' +
+      'its pixels are current, but the editor SceneView is RENDER-ON-DEMAND: with nothing marking ' +
+      'it dirty it can hand you a frame from minutes ago, and repeated captures come back ' +
+      'BYTE-IDENTICAL through a change you just made. (Measured 2026-08-18: painting a visible ' +
+      'material red left three successive captures identical until a camera move re-armed the ' +
+      'gate.) So a capture that "did not change" is NOT evidence the change failed to render — ' +
+      'this description used to claim the opposite and cost a QA session a wrong verdict. To ' +
+      'force one, use modoki_render_scene (a real offscreen render, Game panel only), or move ' +
+      'the SceneView camera first. For the TRUE framebuffer use CDP Page.captureScreenshot ' +
+      '(see CLAUDE.md). ',
     {
       maxSide: z.number().int().positive().optional().describe('Longest-side cap in px (default 1568).'),
       quality: z.number().int().min(1).max(100).optional().describe('JPEG quality 1-100 (default 70). SAME unit as render_scene/render_sequence; the effective value is echoed back.'),

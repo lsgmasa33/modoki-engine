@@ -2058,8 +2058,18 @@ Each cost a session or more.
 - **`setRenderSettings` alone does NOT resize.** The backing buffer follows only once something
   drives the resize bus. **Read the canvas buffer, never the setting**, when asking what is on
   screen.
-- **`modoki_capture_viewport` / `device_screenshot` FORCE a render**, so they mask render-on-demand
-  and stale-frame bugs. Use CDP `Page.captureScreenshot` for the true framebuffer.
+- ⚠️ **Neither `modoki_capture_viewport` nor `device_screenshot` forces a render.** `capture_viewport`
+  is `webContents.capturePage()`, a screenshot of the window; the iOS device capture is
+  `window.drawHierarchy(in:afterScreenUpdates: false)`, which *explicitly* declines to flush pending
+  updates, and `adb screencap` reads the already-composited buffer. **An unchanged capture is
+  therefore not evidence that a change failed to render.** Whether a capture can be STALE is a
+  property of the SURFACE, not of the capture call: a shipped game renders continuously via rAF, so
+  a device screenshot is current — but the editor SceneView is render-on-demand, and there
+  successive captures come back byte-identical straight through a real change until something arms
+  its dirty gate (measured 2026-08-18: painting a visible material red, three identical captures
+  until a camera move). To force a frame use `modoki_render_scene` (a genuine offscreen render,
+  Game panel only) or move the camera; for the true framebuffer use CDP `Page.captureScreenshot`.
+  The corollary: if a device surface ever goes on-demand, the same trap arrives with it.
 - **Tooling**: Android over `adb`; iOS 15/16 via `libimobiledevice`, iOS 17+ via `xcrun devicectl`.
 
 #### More reference measurements

@@ -96,10 +96,19 @@ nothing changes. Detail and the rejected alternatives: `runtime/physics/physicsS
 
 Three consequences worth knowing, each one earned:
 
-- **Contact events are drained INSIDE the step loop.** Rapier's auto-draining `EventQueue` is
-  cleared by every `world.step()`, so one drain after the loop would discard every substep's
-  contacts but the last — a contact that began and ended inside one frame would go unreported at
-  30 fps and report fine at 60.
+- **Contact events are drained INSIDE the step loop, and ROUTED after it.** Rapier's auto-draining
+  `EventQueue` is cleared by every `world.step()`, so one drain after the loop would discard every
+  substep's contacts but the last — a contact that began and ended inside one frame would go
+  unreported at 30 fps and report fine at 60. The narrow-phase MANIFOLD is equally perishable, so
+  it is snapshotted at drain time too. But the fan-out to subscribers is **deferred to after the
+  Rapier→ECS pull** (`collectContactEvents` → `routeContactEvents`), because a subscriber must read
+  the pose and velocity the frame ENDS with. ⚠️ Routing inside the loop as well — which is what
+  landed first — silently handed every collision callback the PREVIOUS frame's `Transform` and
+  `RigidBody`. It is invisible in a unit test that only counts events, and it changed real
+  gameplay: `games/sling`'s bumper reads both the puck's velocity and its world position, so it
+  kicked the puck at its un-bounced APPROACH speed and the puck gained energy on every hit
+  (owner-reported, "the puck accelerates when it collides with a bumper"). Pinned in both
+  dimensions by the "a collision callback reads the POST-step world" test.
 - ⭐ **A kinematic target is re-issued PER SUBSTEP** (`retargetKinematics`). Rapier derives a
   position-based kinematic body's implicit velocity as `(next − current) / timestep` inside the
   step that consumes it, so a target set once per frame moves the body at `count`× speed in
@@ -225,7 +234,8 @@ green on enter, reverts on exit, and logs a `zone` journal event).
 ### The shared producer + the rich `@contact` event
 
 The enter/exit fan-out is dimension-agnostic and lives in ONE module,
-`runtime/physics/physicsContactEvents.ts` (`drainContactEvents` / `routePair` /
+`runtime/physics/physicsContactEvents.ts` (`collectContactEvents` / `routeContactEvents` /
+`routePair` /
 `synthesizeContactExits` / `makeFireOnCollision`), used by BOTH `physics2DSystem` and
 `physics3DSystem` — only the injected event bus + `OnCollision` trait differ, so a fix to the
 correctness-critical enter/exit balance can't silently miss a dimension. The bus itself comes from
@@ -240,7 +250,9 @@ fans a rich **`@contact`** event, `{ a, b, point, normal, speed }` — the world
 once per contact begin (sensors carry no manifold, so they're skipped). Code subscribes via
 `physics2DEvents.onContact((a, b, detail) => …)`; the journal event is GUID-addressed (Percept).
 `emitContactDetail` is per-dimension (manifold reading is Rapier-2D-vs-3D-specific) and is the
-optional `onPair` hook `drainContactEvents` invokes.
+optional `onPair` hook `routeContactEvents` invokes. It is split in two on purpose: the manifold is
+read by `captureManifold*` at DRAIN time (it is gone after the next `world.step`), while `speed`
+comes from the ECS velocities AFTER the pull — see the substep note above.
 
 Two removal subtleties: Rapier emits **no stop event** when a collider is freed/rebuilt, so
 `synthesizeContactExits` walks the still-overlapping pairs and fires the missing `exit` **before**

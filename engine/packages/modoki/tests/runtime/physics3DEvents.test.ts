@@ -328,3 +328,78 @@ describe('Physics3DEvents — contact events survive substepping (#205 R2)', () 
     expect(hits).toContain('exit');
   });
 });
+
+describe('Physics3DEvents — a collision callback reads the POST-step world', () => {
+  // #205 R2 moved the contact drain INSIDE the substep loop (correct — the auto-draining
+  // EventQueue is cleared by every `world.step`), but the loop sits BEFORE the Rapier→ECS pull,
+  // so every subscriber started seeing the PREVIOUS frame's Transform + velocity. Sling's bumper
+  // reads both (`speed = hypot(rb.vx, rb.vz)`, direction from the puck's world position) and so
+  // kicked the puck at its un-bounced APPROACH speed — the owner's "the puck accelerates when it
+  // collides with a bumper".
+  it('sees the same Transform/velocity the frame ends with, not the frame it started with', () => {
+    tw = createTestWorld({ systems: [PHYS] });
+    tw.spawn(Physics3D({ gravityX: 0, gravityY: -20, gravityZ: 0 }));
+    tw.spawn(Transform({ x: 0, y: 0, z: 0 }), RigidBody3D({ bodyType: 'static' }),
+      Collider3D({ shape: 'box', halfW: 5, halfH: 0.5, halfD: 5 }));
+    const ball = tw.spawn(Transform({ x: 0, y: 4, z: 0 }),
+      RigidBody3D({ bodyType: 'dynamic' }),
+      Collider3D({ shape: 'sphere', radius: 0.3, restitution: 0.8 }));
+
+    let inCb: { y: number; vy: number } | null = null;
+    physics3DEvents.onCollision((_a, _b, phase) => {
+      if (phase !== 'enter' || inCb) return;
+      inCb = { y: ball.get(Transform)!.y, vy: ball.get(RigidBody3D)!.vy };
+    }, tw.world);
+
+    let before: { y: number; vy: number } | null = null;
+    let after: { y: number; vy: number } | null = null;
+    for (let i = 0; i < 240 && !inCb; i++) {
+      const pre = { y: ball.get(Transform)!.y, vy: ball.get(RigidBody3D)!.vy };
+      tw.step(1);
+      if (inCb) { before = pre; after = { y: ball.get(Transform)!.y, vy: ball.get(RigidBody3D)!.vy }; }
+    }
+
+    expect(inCb).toBeTruthy();
+    // The callback must observe the pose/velocity the step produced …
+    expect(inCb!.y).toBeCloseTo(after!.y, 9);
+    expect(inCb!.vy).toBeCloseTo(after!.vy, 9);
+    // … and NOT the pre-step approach state. The bounce reverses vy, so the two are far apart;
+    // assert that explicitly so the test cannot pass vacuously if the ball ever settles.
+    expect(Math.abs(after!.vy - before!.vy)).toBeGreaterThan(1);
+  });
+});
+
+describe('Physics3DEvents — the POST-step guarantee holds on a SUBSTEPPED frame', () => {
+  // At 1/60 `physicsSubsteps` returns count 1, so the collect-then-route split is only one step
+  // deep and the ordering bug would look the same either way. At 1/30 the frame splits in two:
+  // pairs collected in substep 1 are routed after substep 2 AND after the pull, which is the seam
+  // the split actually exists for. A capped-to-30fps device is the production case.
+  it('a contact routed after two substeps still reads the frame-END transform', () => {
+    tw = createTestWorld({ systems: [PHYS] });
+    tw.spawn(Physics3D({ gravityX: 0, gravityY: -20, gravityZ: 0 }));
+    tw.spawn(Transform({ x: 0, y: 0, z: 0 }), RigidBody3D({ bodyType: 'static' }),
+      Collider3D({ shape: 'box', halfW: 5, halfH: 0.5, halfD: 5 }));
+    const ball = tw.spawn(Transform({ x: 0, y: 4, z: 0 }),
+      RigidBody3D({ bodyType: 'dynamic' }),
+      Collider3D({ shape: 'sphere', radius: 0.3, restitution: 0.8 }));
+
+    let inCb: { y: number; vy: number } | null = null;
+    physics3DEvents.onCollision((_a, _b, phase) => {
+      if (phase !== 'enter' || inCb) return;
+      inCb = { y: ball.get(Transform)!.y, vy: ball.get(RigidBody3D)!.vy };
+    }, tw.world);
+
+    let before: { y: number; vy: number } | null = null;
+    let after: { y: number; vy: number } | null = null;
+    for (let i = 0; i < 240 && !inCb; i++) {
+      const pre = { y: ball.get(Transform)!.y, vy: ball.get(RigidBody3D)!.vy };
+      tw.step(1, 1 / 30);   // dt/(1/60 * 1.05) = 1.9 -> ceil = 2 substeps
+      if (inCb) { before = pre; after = { y: ball.get(Transform)!.y, vy: ball.get(RigidBody3D)!.vy }; }
+    }
+
+    expect(inCb).toBeTruthy();
+    expect(inCb!.y).toBeCloseTo(after!.y, 9);
+    expect(inCb!.vy).toBeCloseTo(after!.vy, 9);
+    expect(Math.abs(after!.vy - before!.vy)).toBeGreaterThan(1);
+  });
+});

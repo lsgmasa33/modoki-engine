@@ -9,7 +9,7 @@
  *    fade → fade-in (loop ⇒ pulse)   wave → gentle float   bounce → bounce
  *    jitter → shake   rainbow → colour cycle   typewriter → left-to-right clip wipe
  *
- *  Amplitude (em, ×fontSize → px) drives translate distance via a `--ui-amp` custom
+ *  Amplitude (em) drives translate distance via a `--ui-amp` custom
  *  property so the keyframes stay static (injected once). `frequency` is unused here
  *  (no per-glyph phase). Pure except {@link ensureUITextAnimStyles} (DOM injection).
  */
@@ -59,8 +59,14 @@ export interface UITextAnimStyle {
   /** The CSS `animation` shorthand for the text element. Empty for per-char effects
    *  (typewriter), which build a per-glyph animation in the renderer instead. */
   animation: string;
-  /** translate distance in px for `--ui-amp` (0 for non-motion effects). */
-  ampPx: number;
+  /** translate distance in **em** for `--ui-amp` (0 for non-motion effects).
+   *
+   *  ⚠️ Was `ampPx`, computed as `amplitude * fontSize` (#245). That resolution step assumed
+   *  `UIElement.fontSize` was pixels — true until `fontSizeUnit` existed, and silently wrong
+   *  after, since the number could then be vmin. `em` resolves against the element's own computed
+   *  font size, so it is the SAME value for a px-authored font and correct for every other unit;
+   *  the multiplication was always just an em→px conversion done by hand. */
+  amp: number;
   /** Extra span CSS the effect needs (rainbow's clipped gradient); absent otherwise. */
   style?: Record<string, string>;
   /** Per-character reveal (typewriter): the renderer splits the text into one span
@@ -73,13 +79,13 @@ export interface UITextAnimStyle {
 
 /** Map an effect + params → the CSS animation for a DOM text element, or null for
  *  `none`/unknown. `fontSize` scales the em amplitude to px. Pure. */
-export function uiTextAnimation(params: UITextAnimParams, fontSize: number): UITextAnimStyle | null {
+export function uiTextAnimation(params: UITextAnimParams): UITextAnimStyle | null {
   const m = EFFECTS[params.effect];
   if (!m) return null;
   if (m.perChar) {
     // ~11 glyphs/sec at speed 1. The renderer turns this into a per-glyph delay.
     const staggerSec = 0.09 / Math.max(0.1, params.speed);
-    return { animation: '', ampPx: 0, perChar: { staggerSec, loop: params.loop, fadeIn: params.fadeIn !== false } };
+    return { animation: '', amp: 0, perChar: { staggerSec, loop: params.loop, fadeIn: params.fadeIn !== false } };
   }
   const dur = (1 / Math.max(0.1, params.speed)).toFixed(3);
   const iter = m.periodic ? 'infinite' : (params.loop ? 'infinite' : '1');
@@ -88,7 +94,7 @@ export function uiTextAnimation(params: UITextAnimParams, fontSize: number): UIT
   const fill = !m.periodic && !params.loop ? 'forwards' : 'none';
   return {
     animation: `${m.kf} ${dur}s ${m.timing} 0s ${iter} ${direction} ${fill}`,
-    ampPx: m.amp ? params.amplitude * fontSize : 0,
+    amp: m.amp ? params.amplitude : 0,
     ...(m.gradient ? { style: RAINBOW_STYLE } : {}),
   };
 }

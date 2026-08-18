@@ -944,7 +944,8 @@ export function registerAllTraits() {
 
       // ── Text section ──
       text: { type: 'string', tooltip: 'Text content. Supports {storeField} templates', ...S('Text'), sectionDivider: true },
-      fontSize: { type: 'number', step: 1, tooltip: 'Text size (px)', ...S('Text') },
+      fontSize: { type: 'number', step: 1, tooltip: 'Text size, in fontSizeUnit (px by default).', ...S('Text') },
+      fontSizeUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for fontSize. Default px.\nSet it to vmin when the element\u2019s HEIGHT comes from its text and its parent is sized in %/vh \u2014 otherwise the parent scales and the text does not, and there is a viewport size below which the content overflows its container. lineHeight is still px-only, so leave it 0 (auto) with a scaling fontSize.', ...S('Text') },
       fontWeight: { type: 'enum', options: ['normal', 'bold'], tooltip: 'Text weight', ...S('Text') },
       fontStyle: { type: 'enum', options: ['normal', 'italic'], tooltip: 'Text style', ...S('Text') },
       textColor: { type: 'color', alphaField: 'textOpacity', tooltip: 'Text color', ...S('Text') },
@@ -952,7 +953,8 @@ export function registerAllTraits() {
       textAlign: { type: 'enum', options: ['left', 'center', 'right'], tooltip: 'Horizontal text alignment', ...S('Text') },
       fontFamily: { type: 'string', tooltip: 'Font family name or drag a font asset. Empty = system default', accept: ['.ttf', '.otf', '.woff', '.woff2'], ...S('Text') },
       lineHeight: { type: 'number', step: 0.1, tooltip: 'Line height multiplier. 0 = auto', ...S('Text') },
-      letterSpacing: { type: 'number', step: 0.5, tooltip: 'Letter spacing (px)', ...S('Text') },
+      letterSpacing: { type: 'number', step: 0.5, tooltip: 'Letter spacing, in letterSpacingUnit (px by default).', ...S('Text') },
+      letterSpacingUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for letterSpacing. Default px.\nMatch it to fontSizeUnit: tracking is only meaningful as a RATIO of the glyph size, so px tracking under a scaling font says something different at every viewport.', ...S('Text') },
       textOverflow: { type: 'enum', options: ['clip', 'ellipsis'], tooltip: 'How to handle text overflow', ...S('Text') },
       maxLines: { type: 'number', step: 1, tooltip: 'Max visible lines. 0 = unlimited', ...S('Text') },
 

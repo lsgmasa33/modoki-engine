@@ -45,9 +45,9 @@ export interface UINodeData {
   opacity: number;
   // ── Text ──
   text: string;
-  fontFamily: string; fontSize: number; fontWeight: string; fontStyle: string;
+  fontFamily: string; fontSize: number; fontSizeUnit: string; fontWeight: string; fontStyle: string;
   textColor: number; textOpacity: number; textAlign: string;
-  lineHeight: number; letterSpacing: number;
+  lineHeight: number; letterSpacing: number; letterSpacingUnit: string;
   textShadowColor: number; textShadowOpacity: number; textShadowOffsetX: number; textShadowOffsetY: number; textShadowBlur: number;
   textStrokeColor: number; textStrokeOpacity: number; textStrokeWidth: number;
   textOverflow: string; maxLines: number;
@@ -276,10 +276,10 @@ function buildTree(world: World): UINodeData[] | null {
         borderRadius: ui.borderRadius || 0, borderWidth: ui.borderWidth || 0,
         borderColor: ui.borderColor || 0x333333, borderOpacity: ui.borderOpacity ?? 1, opacity: ui.opacity ?? 1,
         text: ui.text || '', fontFamily: ui.fontFamily || '',
-        fontSize: ui.fontSize || 16, fontWeight: ui.fontWeight || 'normal',
+        fontSize: ui.fontSize || 16, fontSizeUnit: ui.fontSizeUnit || 'px', fontWeight: ui.fontWeight || 'normal',
         fontStyle: ui.fontStyle || 'normal', textColor: ui.textColor ?? 0xffffff, textOpacity: ui.textOpacity ?? 1,
         textAlign: ui.textAlign || 'left',
-        lineHeight: ui.lineHeight || 0, letterSpacing: ui.letterSpacing || 0,
+        lineHeight: ui.lineHeight || 0, letterSpacing: ui.letterSpacing || 0, letterSpacingUnit: ui.letterSpacingUnit || 'px',
         textShadowColor: ui.textShadowColor || 0, textShadowOpacity: ui.textShadowOpacity ?? 1, textShadowOffsetX: ui.textShadowOffsetX || 0,
         textShadowOffsetY: ui.textShadowOffsetY || 0, textShadowBlur: ui.textShadowBlur || 0,
         textStrokeColor: ui.textStrokeColor || 0, textStrokeOpacity: ui.textStrokeOpacity ?? 1, textStrokeWidth: ui.textStrokeWidth || 0,

@@ -89,6 +89,25 @@ export const UIElement = trait({
   text: '' as string,
   fontFamily: '' as string,
   fontSize: 16,
+  /**
+   * Unit for `fontSize`. Defaults to `'px'`, which is what fontSize silently WAS before this
+   * existed — so every authored value keeps its meaning and nothing re-lays-out.
+   *
+   * ⚠️ **Why it exists (#245): text-sized content could not scale, and its container could.** Every
+   * other length on this trait carries a unit; `fontSize` did not, so a control whose height comes
+   * from its TEXT is fixed px inside a parent that may be sized in `%`/`vh` — which means there is
+   * always a viewport size below which it overflows. Court hit this twice: the pen glyph that
+   * "agreed at exactly one screen size and drifted at every other" (see `noteBrushSprite`), and
+   * the main menu, where three difficulty buttons pushed the column off the paper page below a
+   * ~975px window (measured, #245).
+   *
+   * Set it to `vmin` to make text scale with the viewport the way `width`/`padding` already can.
+   *
+   * ⚠️ `lineHeight` has the SAME shape and is still px-only — deliberately out of scope here, so
+   * a scaling `fontSize` with an authored `lineHeight` will drift. Author `lineHeight` 0 (auto)
+   * alongside a non-px `fontSize` until that follows.
+   */
+  fontSizeUnit: 'px' as UILengthUnit,
   fontWeight: 'normal' as 'normal' | 'bold',
   fontStyle: 'normal' as 'normal' | 'italic',
   textColor: 0xffffff as number,
@@ -96,6 +115,16 @@ export const UIElement = trait({
   textAlign: 'left' as 'left' | 'center' | 'right',
   lineHeight: 0,         // 0 = auto/normal
   letterSpacing: 0,
+  /**
+   * Unit for `letterSpacing`. Defaults to `'px'` — what it silently was before this existed.
+   *
+   * ⚠️ **Tracking must follow the font, or it drifts** (#245). Letter spacing is only meaningful
+   * as a RATIO of the glyph size, so a px tracking under a scaling `fontSize` says something
+   * different at every viewport. Court's menu title measured 0.130em of tracking at its reference
+   * size and 0.261em at a 480px window — the same authored 7px, twice the optical gap, because
+   * only the font shrank. Author both in the same unit.
+   */
+  letterSpacingUnit: 'px' as UILengthUnit,
   textShadowColor: 0x000000 as number,
   textShadowOpacity: 1,  // shadow color alpha (folded into the textShadowColor picker)
   textShadowOffsetX: 0,

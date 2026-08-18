@@ -65,24 +65,32 @@ export function resetMaterialInstanceClones(): void {
  *  be a STABLE reference (the caller caches it), so the
  *  `!==` guard rebuilds only on a genuine base change and never thrashes. `meshes` are all the
  *  entity's drawables across every surface — one clone is shared by all. For a prop that touches a
- *  material array, the value is written to EVERY slot. Idempotent once bound. */
-export function applyPropOverride(id: number, meshes: THREE.Mesh[], base: MatOrArray, target: string, value: number): void {
+ *  material array, the value is written to EVERY slot. Idempotent once bound.
+ *
+ *  Returns TRUE when this call (re)bound a clone — a fresh entity, a changed base, or a mesh that
+ *  was still pointing at the shared material. The caller uses it to arm the SceneView's
+ *  render-on-demand gate: the picture changes on a rebind even when the driven VALUE did not (see
+ *  `rendering/materialDirty.ts`), so value comparison alone would miss the very first frame. */
+export function applyPropOverride(id: number, meshes: THREE.Mesh[], base: MatOrArray, target: string, value: number): boolean {
   let entry = clones.get(id);
   let old: MatOrArray | undefined;
+  let rebound = false;
   if (!entry || entry.base !== base) {
     // New entity, or the resolved base changed (material ref swap / async load landed).
     old = entry?.clone;
     entry = { clone: Array.isArray(base) ? base.map((m) => m.clone()) : base.clone(), base };
     clones.set(id, entry);
+    rebound = true;
   }
   for (const mesh of meshes) {
-    if (mesh.material !== entry.clone) mesh.material = entry.clone as THREE.Material | THREE.Material[];
+    if (mesh.material !== entry.clone) { mesh.material = entry.clone as THREE.Material | THREE.Material[]; rebound = true; }
   }
   if (Array.isArray(entry.clone)) { for (const c of entry.clone) applyProp(c, target, value); }
   else applyProp(entry.clone, target, value);
   // Dispose the superseded clone AFTER every mesh has been rebound, so nothing renders a
   // disposed material even momentarily.
   if (old) disposeMat(old);
+  return rebound;
 }
 
 /** Write one standard material property from a numeric driver value. Color-typed props

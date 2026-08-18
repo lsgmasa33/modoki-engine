@@ -32,7 +32,7 @@ import { worldTransforms } from '../core/ecs/transformPropagationSystem';
 import { getWorldTransform3D } from '../core/ecs/worldTransform';
 import { createPhysicsWorldRegistry } from './physicsWorldRegistry';
 import { physics2DEvents } from './Physics2DEvents';
-import { makeFireOnCollision, drainContactEvents, synthesizeContactExits, refOf, type ColliderInfo } from './physicsContactEvents';
+import { makeFireOnCollision, collectContactEvents, routeContactEvents, synthesizeContactExits, refOf, type ColliderInfo, type DrainedPair } from './physicsContactEvents';
 import { physicsSubsteps, substepFraction, substepLerp } from './physicsSubstep';
 import { dropEntityFromContactIndex } from './physicsContactIndex';
 import { emit, isVerboseCaptureActive } from '../core/journal';
@@ -1004,15 +1004,18 @@ export function physics2DSystem(world: World): void {
   // `physicsSubstep.ts` for why this is a ceiling on the step rather than a fixed-dt accumulator,
   // and why character controllers stay outside the loop.
   const { count: substeps, h: substepDt } = physicsSubsteps(dt);
+  _drained2D.length = 0;
   for (let i = 0; i < substeps; i++) {
     // Where every kinematic target should be at the END of this substep. Unsplit frames skip it.
     if (substeps > 1) retargetKinematics2D(substepFraction(i, substeps));
     st.world.timestep = substepDt;
     st.world.step(st.eventQueue);
     // ⚠️ DRAINED INSIDE THE LOOP — the auto-draining EventQueue is CLEARED by every `world.step`,
-    // so a single drain after the loop would discard every substep's contacts but the last.
-    drainContactEvents(world, st.colliders, st.eventQueue, physics2DEvents, fireOnCollision,
-      (h1, h2, a, b, phase) => emitContactDetail2D(st, world, cfg.ppm, h1, h2, a, b, phase));
+    // so a single drain after the loop would discard every substep's contacts but the last. The
+    // narrow-phase manifold is equally perishable and is snapshotted here too; the fan-out to
+    // subscribers is NOT — see `collectContactEvents` for why routing waits for the pull below.
+    collectContactEvents(st.colliders, st.eventQueue, _drained2D,
+      (h1, h2, a, b, phase) => captureManifold2D(st, h1, h2, a, b, phase));
   }
 
   // ── Pull dynamic bodies (Rapier → ECS) — only when a step actually ran (dt>0), so a
@@ -1063,11 +1066,47 @@ export function physics2DSystem(world: World): void {
     rec.lastX = t.x; rec.lastY = t.y;
   });
 
-  // ── Contact + sensor events → journal, Physics2DEvents manager, OnCollision2D — DRAINED PER
-  //    SUBSTEP inside the step loop above, not here, because the auto-draining EventQueue is
-  //    cleared by each `world.step`. On a solid contact BEGIN the drain also reads the manifold
-  //    for a rich `contact` event (point/normal/impact speed) — the impact detail games need for
-  //    damage / SFX / effect spawning. ──
+  // ── Contact + sensor events → journal, Physics2DEvents manager, OnCollision2D. The Rapier
+  //    queue was DRAINED PER SUBSTEP above (it is cleared by each `world.step`); the fan-out
+  //    happens HERE, after the pull, so a subscriber reads the pose and velocity the frame
+  //    actually ends with rather than the one it started with. On a solid contact BEGIN the
+  //    snapshotted manifold becomes a rich `contact` event (point/normal/impact speed) — the
+  //    impact detail games need for damage / SFX / effect spawning. ──
+  if (_drained2D.length) {
+    routeContactEvents(world, _drained2D, physics2DEvents, fireOnCollision,
+      (p) => emitContactDetail2D(world, cfg.ppm, p));
+    _drained2D.length = 0;
+  }
+}
+
+/** Snapshot of the Rapier narrow-phase manifold for one contact BEGIN, in physics units. Taken at
+ *  drain time because the manifold is only valid until the next `world.step`. */
+interface ManifoldHit2D { px: number; py: number; nx: number; ny: number }
+
+/** Per-frame scratch for the drained pairs. Module-level (not per-world state) because its whole
+ *  lifetime is inside one `physics2DSystem` call. Two worlds are safe (the calls are sequential and this
+ *  function never awaits); RE-ENTRANCY is the standing bet, not an accident — `routeContactEvents`
+ *  runs game code, and a synchronous re-entry into this system would `.length = 0` the array the
+ *  outer `for…of` is walking and silently drop the rest. Nothing can reach it today (the system is
+ *  reachable only from the pipeline), and the kinematic retarget scratch beside it makes the same
+ *  bet with MORE at stake. Revisit both together if a game action ever gains the ability to force
+ *  a synchronous step. */
+const _drained2D: DrainedPair<ManifoldHit2D>[] = [];
+
+/** Read the contact manifold for a solid contact BEGIN. Sensors carry no solver contact, and an
+ *  `exit` has no manifold left to read, so both return null and skip the `@contact` detail. */
+function captureManifold2D(st: PhysicsWorldState, h1: number, h2: number, a: ColliderInfo, b: ColliderInfo, phase: 'enter' | 'exit'): ManifoldHit2D | null {
+  if (phase !== 'enter' || a.isSensor || b.isSensor) return null;
+  const c1 = st.world.getCollider(h1), c2 = st.world.getCollider(h2);
+  if (!c1 || !c2) return null;
+  let px = 0, py = 0, nx = 0, ny = 0, has = false;
+  st.world.contactPair(c1, c2, (manifold) => {
+    const nrm = manifold.normal(); nx = nrm.x; ny = nrm.y;
+    if (manifold.numSolverContacts() > 0) { const p = manifold.solverContactPoint(0); px = p.x; py = p.y; }
+    else { const p = c1.translation(); px = p.x; py = p.y; }  // fallback: collider center
+    has = true;
+  });
+  return has ? { px, py, nx, ny } : null;
 }
 
 /** A 2D raycast against the physics world, in ECS/screen coordinates.
@@ -1263,23 +1302,15 @@ export function wakeBody2D(world: World, entity: Entity): boolean {
   return true;
 }
 
-/** On a solid contact BEGIN, read the Rapier manifold (screen-space point + normal) + compute the
- *  relative approach speed along the normal, then fan a `contact` event to the journal + bus.
- *  Sensors carry no solver contact, so they're skipped. Fires once per contact begin. */
-function emitContactDetail2D(st: PhysicsWorldState, world: World, ppm: number, h1: number, h2: number, a: ColliderInfo, b: ColliderInfo, phase: 'enter' | 'exit'): void {
-  if (phase !== 'enter' || a.isSensor || b.isSensor) return;
-  const c1 = st.world.getCollider(h1), c2 = st.world.getCollider(h2);
-  if (!c1 || !c2) return;
-  let px = 0, py = 0, nx = 0, ny = 0, has = false;
-  st.world.contactPair(c1, c2, (manifold) => {
-    const nrm = manifold.normal(); nx = nrm.x; ny = nrm.y;
-    if (manifold.numSolverContacts() > 0) { const p = manifold.solverContactPoint(0); px = p.x; py = p.y; }
-    else { const p = c1.translation(); px = p.x; py = p.y; }  // fallback: collider center
-    has = true;
-  });
-  if (!has) return;
-  const point = vecPhysToEcs(px, py, ppm);        // physics meters → screen units (scale + Y-flip)
-  const normal = [nx, -ny];                        // direction: Y-flip only (unit stays unit)
+/** Fan the rich `contact` event for a solid contact BEGIN: the manifold point/normal snapshotted
+ *  at drain time, plus the relative approach speed along that normal read from the POST-step ECS
+ *  velocities. Pairs with no manifold (sensors, exits, a contact already separated) are skipped. */
+function emitContactDetail2D(world: World, ppm: number, pair: DrainedPair<ManifoldHit2D>): void {
+  const m = pair.manifold;
+  if (!m) return;
+  const { a, b } = pair;
+  const point = vecPhysToEcs(m.px, m.py, ppm);     // physics meters → screen units (scale + Y-flip)
+  const normal = [m.nx, -m.ny];                    // direction: Y-flip only (unit stays unit)
   const va = a.entity.has(RigidBody2D) ? (a.entity.get(RigidBody2D) as RbData) : null;
   const vb = b.entity.has(RigidBody2D) ? (b.entity.get(RigidBody2D) as RbData) : null;
   // relative approach velocity along the (unit) normal — world units/s (all in ECS/screen frame)

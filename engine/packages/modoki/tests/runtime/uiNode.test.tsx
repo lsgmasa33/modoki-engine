@@ -85,8 +85,8 @@ function makeNode(over: Partial<UINodeData> = {}): UINodeData {
     minHeight: 0, minHeightUnit: 'px', maxHeight: 0, maxHeightUnit: 'px',
     alignSelf: 'auto', zIndex: 0, overflow: 'visible', isVisible: true, pointerThrough: false,
     backgroundColor: 0, backgroundOpacity: 0, borderRadius: 0, borderWidth: 0, borderColor: 0x333333, borderOpacity: 1, opacity: 1,
-    text: '', fontFamily: '', fontSize: 16, fontWeight: 'normal', fontStyle: 'normal',
-    textColor: 0xffffff, textOpacity: 1, textAlign: 'left', lineHeight: 0, letterSpacing: 0,
+    text: '', fontFamily: '', fontSize: 16, fontSizeUnit: 'px', fontWeight: 'normal', fontStyle: 'normal',
+    textColor: 0xffffff, textOpacity: 1, textAlign: 'left', lineHeight: 0, letterSpacing: 0, letterSpacingUnit: 'px',
     textShadowColor: 0, textShadowOpacity: 1, textShadowOffsetX: 0, textShadowOffsetY: 0, textShadowBlur: 0,
     textStrokeColor: 0, textStrokeOpacity: 1, textStrokeWidth: 0, textOverflow: 'clip', maxLines: 0,
     imageSrc: '', imageMode: 'cover', hasVideo: false, elementType: 'div', placeholder: '',
@@ -305,6 +305,30 @@ describe('UINode text rendering', () => {
     const el = renderNode(makeNode({ text: 'Hello', lineHeight: 20, fontSize: 14 }));
     expect(el.textContent).toBe('Hello');
     expect(el.style.lineHeight).toBe('20px');
+  });
+
+  /** #245 — text-sized content must be able to scale with the viewport, like every other length
+   *  on UIElement already can. Court's main menu overflowed its percentage-height paper page below
+   *  a ~975px window because three text-sized buttons could not shrink with it. */
+  it('emits fontSize through the --ui-* custom properties when fontSizeUnit is not px', () => {
+    const el = renderNode(makeNode({ text: 'Hello', fontSize: 4, fontSizeUnit: 'vmin' }));
+    expect(el.style.fontSize).toBe('calc(4 * var(--ui-vmin, 1vmin))');
+  });
+
+  it('a px fontSize is emitted unchanged — the default cannot re-lay-out existing UI', () => {
+    // The whole safety of #245 rests on this: `fontSizeUnit` defaults to 'px', and px must go out
+    // as the bare number it always was. A regression here silently re-sizes every authored screen.
+    const el = renderNode(makeNode({ text: 'Hello', fontSize: 14, fontSizeUnit: 'px' }));
+    expect(el.style.fontSize).toBe('14px');
+  });
+
+  /** #245 sibling — tracking is only meaningful as a RATIO of the glyph size, so a px
+   *  letterSpacing under a scaling fontSize says something different at every viewport. Court's
+   *  menu title measured 0.130em of tracking at its reference size and 0.261em at a 480px window
+   *  from the SAME authored 7px, because only the font shrank. */
+  it('emits letterSpacing through the --ui-* custom properties when its unit is not px', () => {
+    const el = renderNode(makeNode({ text: 'Hello', letterSpacing: 1.14, letterSpacingUnit: 'vh' }));
+    expect(el.style.letterSpacing).toBe('calc(1.14 * var(--ui-vh, 1vh))');
   });
 
   it('resolves a text binding through resolveTemplate', () => {

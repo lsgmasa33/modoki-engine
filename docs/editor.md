@@ -588,6 +588,44 @@ static templates and `riggedModelCache` for skinned prototypes. A notifier wired
 would leave re-imported CHARACTERS broken while every static mesh recovered, which is why it is a
 shared leaf module rather than an export of either cache.
 
+**UNDO/REDO was missing from that list entirely, and it is the sharpest case (2026-08-18).** Undo
+reverts a transform through `gizmoUndo.ts`'s `apply`, a raw `en.set(trait, …)` — it does not go
+through `writeTraitField`, so it fires NO dirty broadcast. The 2D gate has compensated for exactly
+this since it was bitten (the `subscribeUndo` effect in `SceneView.tsx`); the 3D gate never got the
+same wiring. So after an undo `scene3DSync` did not run, and the THREE object kept its PRE-undo
+world matrix while the ECS Transform was already reverted — the next reader of render-side state
+got the stale value for one call. That is `modoki_focus_entity` framing the camera at x:1807 for an
+entity back at x:5 (QA-SVIEW-0003), a gizmo drag computing its base from the un-reverted position so
+a second undo could not restore the original (QA-SVIEW-0001), and the projected gizmo aim-points
+briefly reporting no handles. Calling either a SECOND time "fixed" it only because the first call
+moved the camera and OrbitControls' own `change` armed the gate — which is why it read as
+"stale for exactly one call" rather than as a dead viewport.
+
+MEASURED, same camera pose either side, `games/anim-bug`, Sun dragged +260 px on the X gizmo then
+undone: **before** the fix the scene-view screen rect stayed byte-identical to the DRAGGED reading
+(x 172.528) and only snapped to the reverted x −53.722 when an unrelated selection change armed the
+gate; **after**, the first read is already x −53.721. Note a `modoki_set_transform` + undo does NOT
+reproduce it — that path goes through `mutate_scene`, which does fire the broadcast, so a repro has
+to use the real gizmo drag.
+
+**MaterialInstance was the same shape, found a different way (2026-08-18).** A `kind:'prop'` override
+writes a plain NUMBER onto a per-entity THREE material clone — opacity, colour, roughness, a map
+offset. No trait is written and no store changes, so **not one** of the sources above saw it and the
+viewport kept showing the pre-change frame indefinitely. Every data-level check passes while only
+the pixels are stale: `get_scene_state` reports the authored override and the clone genuinely
+carries the new value. `runtime/rendering/materialDirty.ts` is the missing channel (the sibling of
+`text/textDirty.ts`, and the 3D half of what `markEntity2DMaterialDirty` already did for Pixi);
+`materialInstanceSystem` bumps it only on an ACTUAL value change or a clone rebind, so a
+constant-source override costs one frame and a time/curve-driven one redraws every frame, which is
+what it is asking for.
+
+⚠️ **`modoki_capture_viewport` cannot detect any of this**, and believing otherwise is how the
+MaterialInstance case was mis-diagnosed as "the override never reaches the render, even after a
+FORCED render". It does not force a render, so on this viewport it returns the last drawn frame —
+see [rendering.md](rendering.md) § "The measurement protocol" for the mechanism and what to use
+instead. **This is the standing hazard for anything measured through this panel**, not a detail of
+the MaterialInstance case.
+
 The continuously-rendering GameView needs none of this, which is why the bug was viewport-specific —
 and why "it works in the Game panel" is not evidence that a render-on-demand path is fine.
 

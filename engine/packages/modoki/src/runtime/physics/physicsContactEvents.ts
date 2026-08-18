@@ -78,7 +78,7 @@ function routePair(world: World, a: ColliderInfo, b: ColliderInfo, phase: 'enter
 }
 
 /** Percept: update the queryable current-contact index for ONE live drain-path pair, rolled
- *  up to bodies (self-pairs excluded). Called ONLY from `drainContactEvents`, where both
+ *  up to bodies (self-pairs excluded). Called ONLY from `routeContactEvents`, where both
  *  entities are alive so enter and exit roll up to the SAME body — NOT from the synthesized
  *  despawn-exit path, whose dead/reparented entities would roll up asymmetrically; body
  *  REMOVAL is instead cleaned by `dropEntityFromContactIndex` (see physicsContactIndex.ts). */
@@ -87,23 +87,53 @@ function indexLivePair(world: World, a: ColliderInfo, b: ColliderInfo, phase: 'e
   if (ba !== bb) updateContactIndex(world, ba, bb, a.isSensor || b.isSensor, phase);
 }
 
-/** Drain Rapier's contact + sensor events for this step → the three sinks. Call only when dt>0.
- *  `onPair` (optional) fires for each resolved pair with the raw collider handles + phase — the
- *  dimension-specific hook where a system can read the contact manifold (point/normal/impact) and
- *  fan a rich `contact` event, since manifold reading is Rapier-2D-vs-3D specific. */
-export function drainContactEvents(
-  world: World, colliders: ColliderMap, eventQueue: EventQueueLike, bus: PhysicsEventBus, fire: FireOnCollision,
-  onPair?: (h1: number, h2: number, a: ColliderInfo, b: ColliderInfo, phase: 'enter' | 'exit') => void,
+/** ONE drained Rapier pair, resolved to entities and waiting to be routed. `manifold` is whatever
+ *  the caller's `capture` hook snapshotted at drain time (see {@link collectContactEvents}). */
+export interface DrainedPair<M = unknown> {
+  h1: number; h2: number; a: ColliderInfo; b: ColliderInfo; phase: 'enter' | 'exit'; manifold: M | null;
+}
+
+/** Drain THIS step's Rapier contact + sensor events into `out`. Call after EVERY `world.step` —
+ *  `new EventQueue(true)` auto-drains, so Rapier clears it at the start of the next step and a
+ *  single drain after a substep loop would keep only the last substep's contacts.
+ *
+ *  ⚠️ **Draining and ROUTING are deliberately separate.** A subscriber must see the world the
+ *  frame ENDS in, so the fan-out to the journal / event bus / `OnCollision` trait is deferred to
+ *  {@link routeContactEvents}, called after the Rapier→ECS pull. Draining inside the loop and
+ *  routing inside it too (#205 R2, 2026-08-12) silently handed every collision callback the
+ *  PREVIOUS frame's Transform and velocity: `sling`'s bumper reads both, so it kicked the puck at
+ *  its un-bounced approach speed and the puck gained energy on every hit.
+ *
+ *  `capture` is the one thing that CANNOT be deferred — Rapier's narrow-phase manifold for a
+ *  contact is only valid until the next `world.step`, so a caller that wants the contact
+ *  point/normal snapshots it here and reads velocities later. */
+export function collectContactEvents<M>(
+  colliders: ColliderMap, eventQueue: EventQueueLike, out: DrainedPair<M>[],
+  capture?: (h1: number, h2: number, a: ColliderInfo, b: ColliderInfo, phase: 'enter' | 'exit') => M | null,
 ): void {
   eventQueue.drainCollisionEvents((h1, h2, started) => {
     const a = colliders.get(h1);
     const b = colliders.get(h2);
     if (!a || !b) return; // one collider already removed this frame
-    const phase = started ? 'enter' : 'exit';
-    routePair(world, a, b, phase, bus, fire);
-    indexLivePair(world, a, b, phase); // Percept contact index — live path only (both alive here)
-    onPair?.(h1, h2, a, b, phase);
+    const phase: 'enter' | 'exit' = started ? 'enter' : 'exit';
+    out.push({ h1, h2, a, b, phase, manifold: capture ? capture(h1, h2, a, b, phase) : null });
   });
+}
+
+/** Fan every collected pair to the three sinks (tick-stamped journal + code-subscriber bus +
+ *  declarative `OnCollision`) and the Percept contact index, in drain order. Call AFTER the
+ *  Rapier→ECS pull so a subscriber reads post-step transforms/velocities — see
+ *  {@link collectContactEvents}. `onPair` is the dimension-specific hook (the rich `@contact`
+ *  detail event, which needs the snapshotted manifold plus the now-current velocities). */
+export function routeContactEvents<M>(
+  world: World, pairs: readonly DrainedPair<M>[], bus: PhysicsEventBus, fire: FireOnCollision,
+  onPair?: (pair: DrainedPair<M>) => void,
+): void {
+  for (const p of pairs) {
+    routePair(world, p.a, p.b, p.phase, bus, fire);
+    indexLivePair(world, p.a, p.b, p.phase); // Percept contact index — live path only
+    onPair?.(p);
+  }
 }
 
 /** Synthesize `exit` events for pairs still overlapping the given collider handles BEFORE they

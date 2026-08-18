@@ -31,8 +31,8 @@ import { useFocusStore } from './focusManager';
  *  (all value-stable frame-to-frame) makes React bail out, leaving the span's DOM
  *  untouched so the browser-driven animation runs uninterrupted. */
 const AnimatedText = React.memo(function AnimatedText(
-  { text, animation, ampPx, extra, perCharStagger, perCharLoop, perCharFade }:
-  { text: string; animation: string; ampPx: number; extra?: Record<string, string>;
+  { text, animation, amp, extra, perCharStagger, perCharLoop, perCharFade }:
+  { text: string; animation: string; amp: number; extra?: Record<string, string>;
     perCharStagger?: number; perCharLoop?: boolean; perCharFade?: boolean },
 ) {
   // Typewriter: split into one span per glyph and stagger each by `perCharStagger`, so
@@ -64,7 +64,12 @@ const AnimatedText = React.memo(function AnimatedText(
     );
   }
   const style: React.CSSProperties = { display: 'inline-block', animation, willChange: 'transform', ...(extra as React.CSSProperties) };
-  if (ampPx) (style as Record<string, string>)['--ui-amp'] = `${ampPx}px`;
+  // ⚠️ **em, not px** (#245). The amplitude is a MULTIPLE of the font size — `uiTextAnimation`'s
+  // own doc calls it "em" — and it used to be resolved to px by multiplying the authored
+  // `fontSize` NUMBER. That silently breaks the moment `fontSizeUnit` is not px, because the
+  // number is then vmin, not pixels. `em` resolves against the element's own COMPUTED font size,
+  // so it is correct for every unit and needs no resolution step at all.
+  if (amp) (style as Record<string, string>)['--ui-amp'] = `${amp}em`;
   return <span style={style}>{text}</span>;
 });
 
@@ -235,7 +240,9 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
 
   // ── Text styling (only when text content exists) ──
   if (text) {
-    style.fontSize = node.fontSize;
+    // `cssVal` so a non-px `fontSizeUnit` resolves through the same `--ui-*` custom properties
+    // every other length uses (#245). Default 'px' returns the bare number, i.e. unchanged.
+    style.fontSize = cssVal(node.fontSize, node.fontSizeUnit);
     style.fontWeight = node.fontWeight as any;
     if (node.fontStyle !== 'normal') style.fontStyle = node.fontStyle;
     style.color = hexToRgba(node.textColor, node.textOpacity ?? 1);
@@ -244,7 +251,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     // unitless, which CSS reads as a font-size MULTIPLIER (e.g. 20 → 20×14px =
     // 280px/line). Emit explicit px so the authored value means pixels.
     if (node.lineHeight) style.lineHeight = `${node.lineHeight}px`;
-    if (node.letterSpacing) style.letterSpacing = node.letterSpacing;
+    if (node.letterSpacing) style.letterSpacing = cssVal(node.letterSpacing, node.letterSpacingUnit);
     if (node.textShadowBlur || node.textShadowOffsetX || node.textShadowOffsetY) {
       style.textShadow = `${node.textShadowOffsetX}px ${node.textShadowOffsetY}px ${node.textShadowBlur}px ${hexToRgba(node.textShadowColor, node.textShadowOpacity ?? 1)}`;
     }
@@ -399,7 +406,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       : '';
     // Apply text styles to the input element
     if (node.fontFamily) style.fontFamily = node.fontFamily;
-    style.fontSize = node.fontSize;
+    style.fontSize = cssVal(node.fontSize, node.fontSizeUnit);
     style.fontWeight = node.fontWeight as any;
     style.color = hexToRgba(node.textColor, node.textOpacity ?? 1);
     if (onSelectEntity) {
@@ -520,10 +527,10 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // geometry paths), and its presence/absence drives the re-render on Play/Stop.
   let textContent: React.ReactNode = text;
   if (text && node.textAnim) {
-    const a = uiTextAnimation(node.textAnim, node.fontSize || 16);
+    const a = uiTextAnimation(node.textAnim);
     if (a) {
       ensureUITextAnimStyles();
-      textContent = <AnimatedText text={text} animation={a.animation} ampPx={a.ampPx} extra={a.style}
+      textContent = <AnimatedText text={text} animation={a.animation} amp={a.amp} extra={a.style}
         perCharStagger={a.perChar?.staggerSec} perCharLoop={a.perChar?.loop} perCharFade={a.perChar?.fadeIn} />;
     }
   }

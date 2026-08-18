@@ -53,12 +53,31 @@ Field groups (representative fields, verified against `UIElement.ts`):
   is wrong with the data: Court's 5x5 attack reference (five 5vh cells, four 4px gaps, a 29.6vh
   row) needed 98.95px of a 98.26px row on a short window and drew 4-wide by 7 rows deep. Mixed
   units are only safe where the row COUNT carries no meaning.
+
+  ⚠️ **`fontSize` carries a unit too, since #245 — and it did NOT until then.** It was unitless px
+  while every other length had a unit, so an element whose HEIGHT comes from its text could not
+  scale while its container could: there was always a viewport size below which such content
+  overflowed a `%`/`vh`-sized parent. Court hit it twice — a pen glyph that "agreed at exactly one
+  screen size and drifted at every other", and its main menu overflowing the paper page below a
+  ~975px window. `fontSizeUnit` defaults to `'px'`, so nothing authored before it changes.
+  **Pick the unit from the CONSTRAINT's axis**: if the thing that must fit is a height, use `vh` —
+  `vmin` is `min(vw,vh)` and tracks WIDTH on any landscape host, so a window that only gets shorter
+  would shrink the parent and leave the text alone. And remember margin/padding percentages resolve
+  against WIDTH even for `marginTop`, so a `%` top margin is a width-derived vertical term.
+  ⚠️ **`letterSpacing` carries a unit too, and it must MATCH `fontSizeUnit`.** Tracking is only
+  meaningful as a ratio of the glyph size, so px tracking under a scaling font says something
+  different at every viewport — measured on Court's menu title, 0.130em of tracking at its
+  reference size and 0.261em at a 480px window, from the same authored 7px, because only the font
+  shrank. Both now scale: 0.1296em and 0.0627em hold across viewports (observed live).
+  ⚠️ `lineHeight` is still px-only — leave it `0` (auto) alongside a scaling `fontSize`. So are
+  `textStrokeWidth`, `textShadowOffset{X,Y}`/`textShadowBlur`, `borderWidth` and `borderRadius`;
+  each has the same shape and will drift under a scaling font, and none is wired yet.
 - **Style (box visuals)** — `backgroundColor` (packed hex int, `0` = transparent),
   `backgroundOpacity`, `borderRadius`, `borderWidth`, `borderColor`, `borderOpacity`
   (border color alpha, folded into the `borderColor` picker), `opacity`.
-- **Text** — `text`, `fontFamily`, `fontSize`, `fontWeight`, `fontStyle`, `textColor`,
+- **Text** — `text`, `fontFamily`, `fontSize` + **`fontSizeUnit`**, `fontWeight`, `fontStyle`, `textColor`,
   `textOpacity` (folded into the `textColor` picker), `textAlign`, `lineHeight`,
-  `letterSpacing`, `textShadow*` (color/opacity/offsetX/offsetY/blur — `textShadowOpacity`
+  `letterSpacing` + **`letterSpacingUnit`**, `textShadow*` (color/opacity/offsetX/offsetY/blur — `textShadowOpacity`
   folded into `textShadowColor`), `textStrokeColor`/`textStrokeOpacity`
   (folded into `textStrokeColor`)/`textStrokeWidth`, `textOverflow` (`clip | ellipsis`),
   `maxLines`.
@@ -406,7 +425,7 @@ stale GUIDs never linger.
 alongside a text-bearing entity and its glyphs animate procedurally from
 `(glyphIndex, engine time, params)` — no per-glyph authoring, and it works on
 dynamic/CJK strings of any length. Fields: `effect` (`none | typewriter | wave | bounce |
-jitter | fade | rainbow`), `speed`, `amplitude` (em, ×fontSize), `frequency` (per-glyph
+jitter | fade | rainbow`), `speed`, `amplitude` (em — emitted as `em`, see below), `frequency` (per-glyph
 phase), `loop`, and `fadeIn` (typewriter soft-fade vs hard-pop). Like skeletal animation
 it plays only while the sim runs and freezes when stopped.
 
