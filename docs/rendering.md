@@ -1878,9 +1878,30 @@ everything else — and both were overtaken:
 
    ⭐ **So the settle rule is UNANIMITY, not the median**: a launch may settle only when every pass
    in it classified the same band anyway — in which case the warming never reached a boundary. When
-   the passes disagree, only the **first (cold) reading** is persisted with `final: false`, which is
-   exactly the pre-#221 behaviour, so a near-boundary device degrades onto the already-measured path
-   rather than onto a new one.
+   the passes disagree, only **cold readings** are persisted with `final: false` — one per launch —
+   so a near-boundary device degrades onto the already-measured pre-#221 path rather than onto a new
+   one.
+
+   ⚠️ **That degrade path did not exist for eight days: it degraded to NEVER SETTLING (#240, fixed
+   2026-08-18).** The in-launch loop is seeded from the cache, so a launch reading a stored sample
+   runs *fewer* than three passes by construction — and the in-launch settle demands three passes in
+   THIS launch. The store then kept only the newest cold reading, throwing the accumulation away.
+   Read 1 sample → run 2 passes → store 1 sample, on every launch for the life of the install.
+   Measured on a Galaxy A23 over three launches at ~1.1 s of blocked launch each, its cpu reading
+   moving 8977 → 9230 → re-measured and discarded. The devices that pay are the ones the probe
+   DECIDES for — an unrecognised/masked/software renderer, and every iOS **web** device, i.e. the
+   published demos' mobile-web audience. Fix: cold readings **accumulate** instead of replacing, and
+   the `perPass` unanimity conjunct gates the in-launch shortcut only — the CROSS-launch settle
+   (three cold readings, medianed, `refineProbeVerdict`'s own rule) is allowed to stand again.
+   Verified on the A23 by installing over its stuck record: launch 1 stored 2 samples, launch 2
+   stored 3 and `final: true`, launch 3 ran **zero** passes.
+
+   ⚠️ **`PROBE_IN_LAUNCH_BUDGET_MS`'s "a Y6 pass costs ~2 s, so it takes only one" was never true**
+   — the table above says 3 passes in 1602 ms on that phone, on the same day the constant was
+   written. The figure predated the renderer removal (`8cf61e859`, "600-1700 ms of cold renderer
+   creation") and the draw-ramp deletion. Re-measured 2026-08-18 on the Y6: **589 / 478 / 468 ms**,
+   1.54 s for three, settling in launch 1; a Galaxy A23 501 / 621 ms. The budget currently stops
+   nothing on any device we own.
 3. ✅ **Playable ads must never probe — LANDED 2026-08-13** (`core/bootProbeAllowed.ts`, set from
    `main.tsx` as `setBootProbeAllowed(!__MODOKI_PLAYABLE__)`). ⚠️ **"One config ⇒ no probe" covered
    LESS than the item assumed, and the gap was the expensive half:**

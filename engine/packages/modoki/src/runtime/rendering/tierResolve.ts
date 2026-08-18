@@ -429,11 +429,11 @@ async function resolveProbeClass(
         + `(pass ${passes} this launch, alone: ${oneRun.deviceClass}; ${describeProbe(measurement)})`,
       );
       if (final) break;
-      // ⚠️ **THE BUDGET IS WHAT KEEPS THIS SAFE ON THE HARDWARE IT IS FOR.** A Huawei Y6's single
-      // probe costs ~2 s; three of them back to back would be a 6 s stall on exactly the device
-      // least able to absorb one. When the budget is spent the loop stops with `final: false`, so
-      // the device refines across the NEXT launches exactly as it did before this change — the old
-      // behaviour survives as the degrade path rather than being replaced.
+      // ⚠️ **THE BUDGET IS WHAT KEEPS THIS BOUNDED ON HARDWARE SLOWER THAN ANYTHING MEASURED.**
+      // When it is spent the loop stops with `final: false`, and the device then refines across the
+      // NEXT launches by accumulating one cold reading each until three of them settle it (see the
+      // store below) — the old behaviour surviving as the degrade path rather than being replaced,
+      // which is a claim this comment made from #221 until #240 made it true.
       if (rawNow() - startedAt > PROBE_IN_LAUNCH_BUDGET_MS) {
         console.warn(
           `${tag} stopping after ${passes} pass(es) — `
@@ -447,18 +447,38 @@ async function resolveProbeClass(
     // Only a real verdict is worth persisting. Caching `'unknown'` would freeze a device in the
     // state the probe is in TODAY, so that correcting the thresholds later could never reach a
     // device that had already launched once.
-    // ⚠️ **WHEN THE PASSES DISAGREED, ONLY THE COLD ONE IS KEPT.** Persisting all three would leave
-    // the store holding two warm readings that the NEXT launch's cold reading gets medianed
-    // against — a mixed population, permanently, in the store. One cold sample per launch is
-    // exactly the pre-#221 behaviour, so a near-boundary device degrades to the path that was
-    // already measured rather than to a new one.
-    const toStore = final ? samples : (coldReading ? [coldReading] : []);
+    // ⚠️ **AN UNSETTLED RECORD HOLDS COLD READINGS ONLY, ONE PER LAUNCH — AND THEY ACCUMULATE.**
+    // Persisting this launch's warm passes would leave the store holding readings that the NEXT
+    // launch's cold reading gets medianed against — a mixed population, permanently, in the store.
+    // But keeping only the NEWEST cold reading, which is what this line did until #240, throws the
+    // accumulation away every launch and makes the cross-launch settle below unreachable: read 1
+    // sample, run 2 passes, store 1 sample, forever, on every device whose in-launch passes did
+    // not agree. Measured on a Galaxy A23 over three launches, and its cpu reading moved
+    // 8977 -> 9230 across one of them — it re-measured the device and discarded the answer.
+    // The slice is applied to BOTH branches, not just the appending one: `previous` comes from
+    // persisted JSON that outlives engine upgrades and can be hand-edited (see
+    // `probeVerdictProvider`), so "a record holds at most `PROBE_SAMPLE_TARGET` samples" is only an
+    // invariant if nothing can carry a longer one forward — including the path where this launch
+    // measured nothing to add.
+    const cachedCold = forThisDevice?.samples ?? [];
+    const coldSamples = (coldReading ? [...cachedCold, coldReading] : cachedCold)
+      .slice(-PROBE_SAMPLE_TARGET);
+    const toStore = final ? samples : coldSamples;
     // ⚠️ The band must DESCRIBE the samples stored beside it, or a later launch reads a verdict its
     // own evidence does not support. On the settled path those are the same thing; on the cold-only
-    // path the stored band has to be the cold sample's, not the lowest of three.
+    // path the stored band has to be the cold samples' median, not the lowest of three.
     const storedClass = final ? deviceClass : classifyMedianOf(toStore, only2D ? '2d' : '3d').deviceClass;
+    // ⭐ **TWO WAYS TO SETTLE, AND THE SECOND IS THE ONE #221 LOST (#240).** `final` above is the
+    // IN-LAUNCH one — three passes in THIS launch that all agreed on the band, see the unanimity
+    // note. This is the CROSS-LAUNCH one, and it is the older of the two: three cold readings, one
+    // per launch, medianed exactly as `refineProbeVerdict` has always done. #221's
+    // `perPass.length >= PROBE_SAMPLE_TARGET` conjunct vetoed it for every device that took it,
+    // because a launch that reads a non-empty cache runs FEWER than three passes by construction —
+    // so the device paid a launch-blocking probe on every launch for the life of the install and
+    // could never settle. That conjunct gates the in-launch shortcut; it must not gate this.
+    const settled = final || (toStore.length >= PROBE_SAMPLE_TARGET && storedClass !== 'unknown');
     if (storedClass !== 'unknown' && toStore.length > 0) {
-      store?.write({ fingerprint, deviceClass: storedClass, samples: [...toStore], final });
+      store?.write({ fingerprint, deviceClass: storedClass, samples: [...toStore], final: settled });
     }
     return deviceClass === 'unknown' ? fallback() : { deviceClass, cpuLimited };
   } catch (e) {
@@ -478,11 +498,18 @@ async function resolveProbeClass(
  *  9.6 s worst case, against the ~6 s the owner set as the outside limit for the probe as a whole.
  *
  *  2500 ms, chosen from measurement rather than from the limit: a Galaxy S22 spends ~570 ms per
- *  pass and an iPhone Air ~490 ms, so both take all three passes and settle in one launch, while a
- *  Huawei Y6 (~2 s a pass) takes one and refines across launches as it always did. That split is
- *  the intent, not a side effect — the devices that can afford to settle immediately are the ones
- *  where a wrong first impression is most visible, and the device that cannot is the one where a
- *  long stall hurts most. */
+ *  pass and an iPhone Air ~490 ms, so both take all three passes and settle in one launch.
+ *
+ *  ⚠️ **THE "SLOW DEVICE TAKES ONE PASS" SPLIT THIS COMMENT USED TO DESCRIBE IS NOT REAL — the
+ *  ~2 s-per-pass Huawei Y6 figure it rested on was already stale when it was written (#240).** The
+ *  probe had stopped constructing a renderer nine hours earlier (`8cf61e859`, which names what left
+ *  with it: "600-1700 ms of cold renderer creation"), and the draw ramp went 48 minutes later
+ *  (`1ff11afaf`). Re-measured 2026-08-18 on the Y6 itself (MRD-LX3, PowerVR Rogue GE8300,
+ *  `games/sling` debug): **589 / 478 / 468 ms — 1.54 s for all three passes**, ~4x cheaper than the
+ *  number this constant was sized against, and it settles in launch 1 and never probes again. A
+ *  Galaxy A23 measures 501 / 621 ms. So the budget stops nothing on any device we own; it is kept
+ *  as the bound against hardware slower than anything measured, NOT as a split that shapes
+ *  behaviour on the devices it names. Re-measure before quoting a per-pass cost from it again. */
 const PROBE_IN_LAUNCH_BUDGET_MS = 2_500;
 
 /** Resolve a tier for a project that will never build a 3D renderer (#203).

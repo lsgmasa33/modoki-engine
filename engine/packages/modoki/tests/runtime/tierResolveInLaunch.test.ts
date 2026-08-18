@@ -164,3 +164,98 @@ describe('the boot probe settles within ONE launch (#221 W2)', () => {
     expect(write).not.toHaveBeenCalled();
   });
 });
+
+
+/** ⭐ **THE SECOND HALF: SETTLING ACROSS LAUNCHES, WHICH #221 BROKE AND #240 MEASURED (issue #240).**
+ *
+ *  The in-launch loop above is seeded from the CACHE, so a launch that reads a stored sample runs
+ *  fewer than `PROBE_SAMPLE_TARGET` passes by construction — and the in-launch settle requires
+ *  three passes IN THIS LAUNCH. A device that missed the one settle window it gets (its passes
+ *  disagreed, or the budget cut the loop short) therefore read 1 sample, ran 2 passes and stored 1
+ *  sample, on every launch for the life of the install. Reproduced on a Galaxy A23 across three
+ *  launches, 2026-08-18, at ~1.1 s of blocked launch each.
+ *
+ *  What these pin is the ACCUMULATION and the cross-launch settle, in launch sequences rather than
+ *  in one call — the defect is invisible inside a single resolve, which is why the whole of #221's
+ *  suite above stayed green through it. */
+describe('the boot probe also settles ACROSS launches (#240)', () => {
+  /** A persistent store, so a launch reads what the previous one wrote — the fingerprint included.
+   *  Hand-building a cached record instead is the trap: jsdom's fingerprint would not match it, the
+   *  record would read as "no cache", and the test would pass by probing from scratch. */
+  function persistentStore() {
+    const box: { record: CachedProbeVerdict | null } = { record: null };
+    return {
+      box,
+      store: {
+        read: () => box.record,
+        write: (v: CachedProbeVerdict) => { box.record = v; },
+      },
+    };
+  }
+
+  /** One cold launch. The passes DISAGREE within it (cold 1.0 = weak, then warm 2.5 = middle),
+   *  which is the near-boundary device the in-launch unanimity rule deliberately refuses to settle
+   *  — and therefore the only device that ever reaches this path. Returns the pass count. */
+  async function launch(store: ReturnType<typeof persistentStore>['store']): Promise<number> {
+    resetProbeInFlightForTest();
+    resetDeviceCaps();
+    resetRenderSettings();
+    setRenderSettings({
+      ...BASE,
+      three: { ...BASE.three, qualityTier: 'auto', tiers: TWO_CONFIGS as never },
+    });
+    runBootRampProbe.mockReset();
+    runBootRampProbe.mockResolvedValue(fakeMeasurement(2.5, 9_000));
+    runBootRampProbe.mockResolvedValueOnce(fakeMeasurement(1.0, 9_000));
+    probeVerdictStore.provide(store as never);
+    await resolveActiveTierForNo3D();
+    return runBootRampProbe.mock.calls.length;
+  }
+
+  it('⭐ a device whose passes never agree still settles — by the THIRD launch, not never', async () => {
+    const { box, store } = persistentStore();
+
+    // Launch 1: empty cache, so the loop runs the full three passes and they disagree — one cold
+    // reading is kept, exactly as before.
+    expect(await launch(store)).toBe(PROBE_SAMPLE_TARGET);
+    expect(box.record!.samples).toHaveLength(1);
+    expect(box.record!.final).toBe(false);
+
+    // Launch 2: THE REGRESSION. This wrote 1 sample back before the fix — the absorbing state.
+    expect(await launch(store)).toBe(2);
+    expect(box.record!.samples).toHaveLength(2);
+    expect(box.record!.final).toBe(false);
+
+    // Launch 3: the third COLD reading completes the cross-launch median, which is the pre-#221
+    // rule and the degrade path the store's comment always claimed to preserve.
+    expect(await launch(store)).toBe(1);
+    expect(box.record!.samples).toHaveLength(PROBE_SAMPLE_TARGET);
+    expect(box.record!.final).toBe(true);
+    expect(box.record!.deviceClass).toBe('weak');
+  });
+
+  it('⭐ and then stops probing entirely — the launch-blocking probe is what the bug cost', async () => {
+    const { box, store } = persistentStore();
+    await launch(store);
+    await launch(store);
+    await launch(store);
+    expect(box.record!.final).toBe(true);
+    // The half a player feels. A settled record short-circuits ahead of the loop, so launch 4 pays
+    // nothing; without the settle it paid two passes, forever.
+    expect(await launch(store)).toBe(0);
+  });
+
+  it('⚠️ what accumulates is COLD readings only — never this launch\'s warm passes', async () => {
+    // The reason the store kept one sample in the first place, and it must survive the fix: warm
+    // in-launch passes are a different population from the cold ones the thresholds were derived
+    // from, so medianing the two together is the "number from a different instrument" mistake.
+    // Every launch here reads 1.0 cold and 2.5 warm; only the 1.0s may be persisted.
+    const { box, store } = persistentStore();
+    await launch(store);
+    await launch(store);
+    await launch(store);
+
+    expect(box.record!.samples).toHaveLength(PROBE_SAMPLE_TARGET);
+    for (const s of box.record!.samples) expect(s.fillMpxPerMs).toBeCloseTo(1.0, 5);
+  });
+});
