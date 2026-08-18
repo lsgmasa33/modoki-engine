@@ -587,6 +587,10 @@ describe('DEFAULT_PROJECT_CONFIG.rendering / engine renderSettings agreement', (
       // `targetFps` joined the registry in #202 so a tier can clamp it — it used to reach the
       // frame driver directly and bypass this agreement check entirely.
       targetFps: DEFAULT_PROJECT_CONFIG.rendering.targetFps,
+      // #227. `''` on both sides = "the project authored no copy"; the engine default lives in
+      // `getTierSwitchMessage`, deliberately NOT in either defaults literal, so there is one
+      // fallback rather than two that can drift.
+      tierSwitchMessage: DEFAULT_PROJECT_CONFIG.rendering.tierSwitchMessage,
       three: DEFAULT_PROJECT_CONFIG.rendering.three,
       pixi: DEFAULT_PROJECT_CONFIG.rendering.pixi,
       web: DEFAULT_PROJECT_CONFIG.rendering.web,

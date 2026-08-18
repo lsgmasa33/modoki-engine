@@ -34,12 +34,13 @@
  *  of the clamp instead of a second copy here that could drift. */
 
 import { rawNow } from '../core/clock';
-import { getFrameProfile } from '../core/frameProfiler';
+import { getFrameProfile, resetFrameProfile } from '../core/frameProfiler';
+import { onWorldSwap } from '../core/ecs/world';
 import { getActiveRenderer } from '../core/activeRenderer';
 import { forceResizeAllSurfaces } from './resizeBus';
 import {
   getActiveQualityTier, getAssessedQualityTier, setActiveQualityTier, getEffectiveThreeSettings,
-  getEffectiveTargetFps, getRenderSettings, getActiveTierOverrides,
+  getEffectiveTargetFps, getRenderSettings, getActiveTierOverrides, getTierSwitchMessage,
 } from './renderSettings';
 import { setTargetFPS } from './frameDriver';
 import {
@@ -54,13 +55,51 @@ import { setActiveTextureSizeCap } from '../core/textureSizeCap';
  *  more often. Any value well under the hold times preserves their meaning. */
 export const CALIBRATION_INTERVAL_MS = 500;
 
+/** How long a queued promotion waits for a scene boundary before giving up and applying itself
+ *  mid-play behind the overlay (#227).
+ *
+ *  A judgement call, and the trade-off is real in both directions: a multi-scene game may have a
+ *  free boundary just past this deadline, and applying early spends a visible pause that waiting
+ *  would have avoided. Waiting longer makes the mid-play path rarer but leaves a SINGLE-scene game
+ *  — which has no boundary, ever — at the lower tier for that much more of its run. 15 s errs
+ *  toward landing the promotion, because the overlay makes the pause explained rather than
+ *  mysterious, and a promotion that never lands is the failure this whole path exists to fix. */
+export const PROMOTION_BOUNDARY_GRACE_MS = 15_000;
+
+/** How long after the first tick calibration arms itself if no world swap ever arrives (#227).
+ *
+ *  ⚠️ **A FAILSAFE, NOT A GRACE PERIOD, AND THE DIFFERENCE IS WHY IT IS THIS LONG.** The real arm
+ *  signal is the first world swap (see the `onWorldSwap` subscription below) — a scene that has
+ *  finished loading. This exists only so a project that never completes one cannot leave
+ *  calibration asleep for the whole session, which would be #227's own failure shape inverted: a
+ *  genuinely slow device that can never be demoted because the mechanism is politely waiting.
+ *  A SHORT value would be actively harmful — it would fire DURING a slow first load and hand the
+ *  policy exactly the boot frames the arming exists to exclude, which is #227 verbatim. So it must
+ *  sit comfortably beyond any plausible load: the worst first-scene prewarm this repo has measured
+ *  is postfx-demo's 16.5 s on a Huawei Y6 (`scene3DSync.ts`), and 30 s clears it. */
+export const ARM_BACKSTOP_MS = 30_000;
+
 let state: TierChangeState = freshTierChangeState();
 let lastCheck = 0;
 /** Whether the "held at the assessed ceiling" explanation has already been printed this session. */
 let loggedHold = false;
 /** A promotion waiting for a scene boundary. Promotions are NOT applied where they are decided —
- *  see `applyPendingPromotion`. */
-let pendingPromotion: { tier: QualityTier; reason: string } | null = null;
+ *  see `applyPendingPromotion`. `since` is when it was queued, for {@link PROMOTION_BOUNDARY_GRACE_MS}. */
+let pendingPromotion: { tier: QualityTier; reason: string; since: number } | null = null;
+/** Has calibration been armed — i.e. is the frame profile now describing the GAME rather than a
+ *  scene load? See {@link armTierCalibration}. */
+let armed = false;
+/** When `tickTierCalibration` first ran, so the backstop has something to measure from.
+ *
+ *  ⚠️ `-1` for "never", NOT `0`. The clock this reads is injected and starts at 0 in every test and
+ *  on any manual-clock harness, so a `0` sentinel is indistinguishable from a legitimate first
+ *  reading — and the branch below would re-stamp the start on EVERY tick until the clock happened
+ *  to move off zero, pushing the deadline forever and disarming the backstop entirely. Caught by
+ *  the backstop test, which ticks from 0. */
+let firstTickAt = -1;
+/** Is an overlay-covered mid-play tier switch in flight? Guards against a second one being started
+ *  while the first is still waiting out its frames. */
+let switchInFlight = false;
 
 /** Reset all calibration state. For tests, and for a deliberate fresh session. */
 export function resetTierCalibration(): void {
@@ -68,10 +107,111 @@ export function resetTierCalibration(): void {
   lastCheck = 0;
   pendingPromotion = null;
   loggedHold = false;
+  armed = false;
+  firstTickAt = -1;
+  switchInFlight = false;
+  publishTierSwitchOverlay(null);
 }
 
-/** Test seam: what is queued for the next scene boundary, if anything. */
-export function getPendingTierPromotion(): { tier: QualityTier; reason: string } | null {
+// ── The tier-switch overlay seam ────────────────────────────────────────────────────────────
+//
+// ⚠️ **A LISTENER, NOT A STORE WRITE, AND THAT IS A LAYER CONSTRAINT RATHER THAN A PREFERENCE.**
+// `runtime/store` is L3 and `runtime/rendering` is L2 (see `engine/eslint.config.js`), so this
+// module physically cannot import the game store to publish into — an upward import is an ESLint
+// error, and the cycle guard exists because that class of edge is an order-sensitive correctness
+// bug. So the engine publishes and the APP SHELL subscribes, which also keeps a UI dependency out
+// of the engine package entirely.
+//
+// There is exactly ONE reader (`engine/app/App.tsx`). Keep it that way: a second subscriber that
+// also decides to render something would double the overlay with nothing to arbitrate between them.
+type TierSwitchOverlayListener = (message: string | null) => void;
+const overlayListeners = new Set<TierSwitchOverlayListener>();
+
+/** Subscribe to tier-switch overlay copy. `message` is the text to show, `null` to hide.
+ *  Returns an unsubscribe function. The app shell is the only intended caller. */
+export function onTierSwitchOverlay(fn: TierSwitchOverlayListener): () => void {
+  overlayListeners.add(fn);
+  return () => { overlayListeners.delete(fn); };
+}
+
+/** Current overlay copy, for tests and for a late subscriber. */
+let overlayMessage: string | null = null;
+export function getTierSwitchOverlayMessage(): string | null { return overlayMessage; }
+
+function publishTierSwitchOverlay(message: string | null): void {
+  overlayMessage = message;
+  for (const fn of overlayListeners) {
+    try { fn(message); } catch (e) { console.warn('[qualityTier] overlay listener failed:', e); }
+  }
+}
+
+/** Arm live calibration: from here on, the frame profile is treated as evidence about what this
+ *  device can SUSTAIN (#227).
+ *
+ *  ── WHY ARMING EXISTS ─────────────────────────────────────────────────────────────────────
+ *  Calibration used to start judging the moment a tier resolved, which on `demos/forest-camp` /
+ *  Galaxy A23 meant judging GLB parsing and shader compilation. Measured: two independent methods
+ *  assessed the device `mid` (`[rampProbe] middle`, then `mid via gpu-benchmark`), and 3.57 s later
+ *  a 95.5 ms median — produced entirely inside the load — demoted it to `low` and, because demotion
+ *  is sticky, pinned it there for the session. Pinned to `mid` the same scene on the same phone
+ *  runs 16.8-20.5 ms, inside the 20 ms budget it was condemned against.
+ *
+ *  ── WHY IT ALSO RESETS THE PROFILE, WHICH IS THE HALF THAT IS EASY TO MISS ─────────────────
+ *  Gating the VERDICT is not enough on its own. `PROFILE_WINDOW_FRAMES` is a frame COUNT (120),
+ *  deliberately, so a slow device gets a longer window — at the A23's 95.5 ms load frames that is
+ *  ~11.4 s of history. Arming without dropping the window would hand the policy a median still
+ *  dominated by the load it just waited out, and the demotion would fire a moment later anyway.
+ *  `MIN_SAMPLES_TO_JUDGE` (30) then refills honestly before anything is judged.
+ *
+ *  Idempotent — the first call wins, so a game with many scene loads arms once. */
+export function armTierCalibration(): void {
+  if (armed) return;
+  armed = true;
+  resetFrameProfile();
+}
+
+/** Test seam: has calibration armed yet? */
+export function isTierCalibrationArmed(): boolean { return armed; }
+
+// THE ARM SIGNAL. `onWorldSwap` fires from `setCurrentWorld` — the atomic swap at the END of a
+// scene load, after the staging world is populated AND after the beforeSwap prewarm hook has
+// compiled shaders. That is precisely "the scene is loaded", and it is the last expensive thing
+// in the sequence.
+//
+// ⚠️ **`onWorldSwap`, NOT `sceneManager.registerSceneCallback('*', …)`**, which is the API that
+// looks purpose-built for this. Its registry is a `Map` KEYED BY PATTERN, so a second `'*'`
+// registrant silently REPLACES the first — arming would be one game callback away from vanishing,
+// and nothing would report it. `onWorldSwap` holds a `Set` and appends. It is also L0, so this L2
+// module may import it (`registerSceneCallback` lives in L3 `scene/` and may not be imported here
+// at all), and it covers the 2D path for free — `tierBoot`'s no-Scene3D projects swap worlds
+// through the same SceneManager.
+// ⚠️ **GATED ON `liveCalibrationEnabled`, and it must be** (close-out 2026-08-18). Arming calls
+// `resetFrameProfile()`, and the EDITOR explicitly opts out of live calibration
+// (`main.tsx: setTierCalibrationEnabled(!__MODOKI_EDITOR__)`) — but a module-scope listener does
+// not care what the tick's gates say, so an ungated one fired there too and zeroed the frame
+// window on the first scene load. That window is what `debug/perfSources.ts` feeds to the Profiler
+// panel and to `modoki_profiler`, so an agent measuring right after loading the scene it wants to
+// measure got percentiles over a handful of frames, or an empty profile, with nothing indicating
+// why. A mechanism the editor has opted out of must not have side effects there.
+onWorldSwap(() => { if (liveCalibrationEnabled) armTierCalibration(); });
+
+// THE SCENE BOUNDARY, for projects whose renderer does not provide one. `Scene3D` applies a queued
+// promotion from its `beforeSwap` prewarm hook — EARLIER than this, and deliberately so, because
+// applying the tier first means the prewarm that follows compiles the shaders the new tier actually
+// needs. A 2D project has no prewarm hook to hang that on, so the swap itself is its boundary.
+// Running on both paths is harmless: whichever fires first clears `pendingPromotion` and the other
+// is a no-op.
+//
+// ⚠️ This REPLACES a per-frame `applyPendingTierPromotion()` in `tierBoot`'s frame callback, whose
+// own comment claimed "the promotion is applied at a SCENE BOUNDARY, not here" while the code
+// applied it on the very next frame — i.e. mid-play, uncovered, which is what the deferral exists
+// to prevent. A mid-play application is now a deliberate path with an overlay
+// (`applyPromotionBehindOverlay`), not an accident of where a call sat.
+onWorldSwap(() => applyPendingTierPromotion());
+
+/** Test seam: what is queued for the next scene boundary, if anything. `since` is when it was
+ *  FIRST queued — see the queue site for why re-deciding must not re-stamp it. */
+export function getPendingTierPromotion(): { tier: QualityTier; reason: string; since: number } | null {
   return pendingPromotion;
 }
 
@@ -223,8 +363,50 @@ export function tickTierCalibration(now: number = rawNow()): void {
   const active = getActiveQualityTier();
   if (!active) return; // no renderer has resolved a tier yet
 
+  // ⭐ NOT ARMED ⇒ THE PROFILE IS NOT EVIDENCE YET (#227). See `armTierCalibration` for the
+  // measurement this exists for. Suppression covers BOTH directions deliberately, not just the
+  // demotion that was observed misfiring: a promotion decided off load frames would be reading
+  // the same contaminated window, and letting one direction through would make the window's
+  // meaning depend on which way it happened to point.
+  //
+  // ⚠️ DEMOTION IS SUPPRESSED TOO, AND THAT IS THE OWNER'S CALL RATHER THAN AN OVERSIGHT (owner,
+  // 2026-08-18). The alternative considered was keeping demotion live at a much harsher threshold
+  // so only catastrophic frames trip it, and the measurement rules it out: the A23's load frames
+  // ran 95.5 ms against a 20 ms budget — nearly 5x over — so any threshold high enough to ignore a
+  // load is high enough to ignore a genuinely broken device too. The cost, stated: a device that
+  // truly cannot render gets no relief until its first scene finishes loading. That is cheap
+  // because the player is watching a LOAD, not playing — the knobs a demotion would apply (DPR,
+  // shadows, frame cap) change how a rendered game looks, and there is not one yet. The one knob
+  // that matters during a load is the texture cap, and that is already resolved from the probe
+  // before assets start fetching (`tierBoot.resolveTierBeforeSceneLoad`, #212); demoting mid-load
+  // would not retroactively re-request textures already in flight.
+  if (!armed) {
+    if (firstTickAt < 0) firstTickAt = now;
+    // The failsafe. See ARM_BACKSTOP_MS — long on purpose, so a slow load can never trip it.
+    if (now - firstTickAt >= ARM_BACKSTOP_MS) {
+      console.warn(
+        `[qualityTier] arming calibration after ${ARM_BACKSTOP_MS / 1000}s with no world swap — `
+        + 'no scene finished loading, so the frame profile is being trusted without one',
+      );
+      armTierCalibration();
+    }
+    // Return either way: `armTierCalibration` just dropped the profile window, so there is nothing
+    // to judge on this tick regardless of which branch armed it.
+    return;
+  }
+
   if (now - lastCheck < CALIBRATION_INTERVAL_MS) return;
   lastCheck = now;
+
+  // A queued promotion that has waited long enough for a scene boundary applies itself mid-play,
+  // behind the overlay. See `applyPromotionBehindOverlay` — a one-scene game reaches no boundary
+  // EVER, so without this the promotion path is dead for a whole class of game and nothing says so.
+  if (pendingPromotion && now - pendingPromotion.since >= PROMOTION_BOUNDARY_GRACE_MS) {
+    const queued = pendingPromotion;
+    pendingPromotion = null;
+    applyPromotionBehindOverlay(queued.tier, queued.reason);
+    return;
+  }
 
   // The ceiling comes from the ASSESSED resolution, never the active one — see `promotionCeiling`.
   //
@@ -267,8 +449,76 @@ export function tickTierCalibration(now: number = rawNow()): void {
     // frameDriver stall from prewarm alone. A promotion that freezes mid-play for several seconds
     // is worse than the low tier it escapes; a scene load hides the recompile inside a stall the
     // player has already accepted.
-    pendingPromotion = { tier: decision.tier, reason: decision.reason };
+    // ⚠️ `since` IS THE ORIGINAL QUEUE TIME, NOT `now`, WHEN THE SAME TIER IS ALREADY QUEUED.
+    // The policy re-decides a promotion every PROMOTION_HOLD_MS for as long as the headroom holds
+    // (it has no memory — see `evaluateTierChange`), so re-stamping here would push the deadline
+    // out on every re-decision and `PROMOTION_BOUNDARY_GRACE_MS` could never elapse on the device
+    // that needs it most: one comfortably fast enough to keep qualifying. The mid-play path would
+    // be dead code that looks wired. Caught by the grace test, not by reading this function.
+    pendingPromotion = {
+      tier: decision.tier,
+      reason: decision.reason,
+      since: pendingPromotion?.tier === decision.tier ? pendingPromotion.since : now,
+    };
   }
+}
+
+/** Run `fn` after `n` animation frames have been presented. Used to get the overlay PAINTED before
+ *  the stall starts, and to keep it up across the stall afterwards.
+ *
+ *  Frames, not a timer: what has to happen is a paint, and a `setTimeout` would fire on a schedule
+ *  that has nothing to do with whether one occurred — under the very main-thread block this exists
+ *  to cover, a timer would elapse and the overlay still would not be on screen. */
+function afterFrames(n: number, fn: () => void): void {
+  if (n <= 0) { fn(); return; }
+  if (typeof requestAnimationFrame !== 'function') { fn(); return; } // headless/tests
+  requestAnimationFrame(() => afterFrames(n - 1, fn));
+}
+
+/** Apply a promotion MID-PLAY, with the tier-switch overlay covering the shader recompile (#227).
+ *
+ *  ── WHY A PROMOTION CAN COST SECONDS ──────────────────────────────────────────────────────
+ *  A tier change alters which shader VARIANTS the scene needs (IBL on/off is enough on its own),
+ *  and cold compilation is ~1.2 s per distinct program — measured 2.9 s on a Galaxy A23 and 16.5 s
+ *  on a Huawei Y6 for postfx-demo's 14 distinct pairs (`scene3DSync.ts`). `compileAsync` is already
+ *  in use and does NOT remove it. Normally that hides inside a scene load; here there is no load.
+ *
+ *  ── WHY THE SPINNER SURVIVES THE STALL AND A PROGRESS BAR WOULD NOT ───────────────────────
+ *  `LoadingOverlay`'s spinner animates `transform: rotate()`, which browsers run on the COMPOSITOR
+ *  thread — it keeps turning while the main thread is blocked. Its indeterminate progress bar
+ *  animates `margin-left`, which is main-thread layout and would freeze mid-slide. A frozen
+ *  progress bar reads as a crash, so this path must use the spinner variant.
+ *
+ *  ✅ **MEASURED on the Galaxy A23's WebView** (2026-08-18), not inferred: the same spinner CSS
+ *  under a 6.03 s synchronous WebGL compile+link storm (367 programs) kept rotating for all 10
+ *  captured frames inside the block, at the same per-frame delta as the 8 frames before it.
+ *  Captured with `adb exec-out screencap`, which reads the native framebuffer and so cannot be
+ *  fooled by the blocked webview thread. See docs/rendering.md § "Quality tiers".
+ *
+ *  ── WHY TWO FRAMES BEFORE, THREE AFTER ────────────────────────────────────────────────────
+ *  Before: one frame for the subscriber to render the overlay, one more for it to be presented. If
+ *  the switch started in the same frame as the publish, the block would begin before anything was
+ *  on screen and the player would get the freeze with no explanation — the exact outcome this
+ *  covers. After: the stall lands on the first frame that renders under the new tier, so the
+ *  overlay has to outlive it; three frames is enough to be past it without depending on knowing
+ *  when the compile finished, which nothing here can observe. */
+function applyPromotionBehindOverlay(tier: QualityTier, reason: string): void {
+  // A second switch while one is in flight would publish `null` from the first one's tail and
+  // uncover the second one's stall.
+  if (switchInFlight) return;
+  switchInFlight = true;
+  publishTierSwitchOverlay(getTierSwitchMessage());
+  afterFrames(2, () => {
+    try {
+      applyQualityTier(tier, 'measured', `${reason} (applied mid-play behind the tier-switch overlay)`);
+    } finally {
+      // `finally`, so a throw inside the apply cannot leave the overlay covering the game forever.
+      afterFrames(3, () => {
+        publishTierSwitchOverlay(null);
+        switchInFlight = false;
+      });
+    }
+  });
 }
 
 /** Apply a queued promotion. Call at a scene boundary (SceneManager's before-swap hook), where
@@ -286,6 +536,9 @@ export function tickTierCalibration(now: number = rawNow()): void {
  *  already proven it cannot hold a tier climb straight back into it. */
 export function applyPendingTierPromotion(): void {
   if (!pendingPromotion) return;
+  // An overlay-covered mid-play switch is already running this promotion's replacement; applying
+  // a second one underneath it would uncover the stall it is covering.
+  if (switchInFlight) return;
   const { tier, reason } = pendingPromotion;
   pendingPromotion = null;
   // Same gate as the tick, for the queue's sake: a promotion decided before calibration was turned

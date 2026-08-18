@@ -291,6 +291,17 @@ export interface ProjectConfig {
     /** Target frame rate for the rAF loop. 0 = uncapped (display refresh). A
      *  positive value throttles the loop (e.g. 30/60) to save battery/heat. */
     targetFps: number;
+    /** Message shown over the brief overlay while a LIVE quality-tier promotion is applied
+     *  (#227). Authored per project because it is player-facing copy: it needs each game's
+     *  voice and its language, and the engine cannot supply either. Empty string = fall back
+     *  to the engine default.
+     *
+     *  Why a message exists at all: a tier switch recompiles shaders — ~1.2 s per distinct
+     *  program, measured 2.9 s on a Galaxy A23 and 16.5 s on a Huawei Y6 for postfx-demo's 14
+     *  pairs (runtime/rendering/scene3DSync.ts). A promotion normally hides that inside a scene
+     *  load, but a single-scene game never reaches one, so the stall lands mid-play and the
+     *  player is owed an explanation rather than a freeze. */
+    tierSwitchMessage: string;
     three: {
       /** GPU API: 'auto' (detect, prefer WebGPU) | 'webgpu' | 'webgl'. */
       backend: 'auto' | 'webgpu' | 'webgl';
@@ -509,6 +520,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   },
   rendering: {
     targetFps: 60, // matches the frame driver's historical default cap
+    tierSwitchMessage: '', // empty = the engine's own default copy
     three: { backend: 'auto', antialias: true, pixelRatioCap: 2, shadows: true, qualityTier: 'auto', toneMapping: 'ACESFilmic', exposure: 1.2 },
     pixi: { backend: 'auto', antialias: true, resolution: 0, pixelRatioCap: 2 },
     web: { sizeMode: 'free', width: 1280, height: 720 },

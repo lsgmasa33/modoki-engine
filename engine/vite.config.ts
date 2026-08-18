@@ -177,9 +177,10 @@ const COURT_QUICK_EXCLUDE = [
   '../games/court/tests/corpus.test.ts',
   '../games/court/tests/strategies.test.ts',
   '../games/court/tests/shapeGeneration.test.ts',
-  // The 48 sharded sweep files. ⚠️ The count has moved twice and in OPPOSITE directions: #216 merged
-  // three 12-file families into one (36 -> 12), then #223 sharded hintNotes, hintStories and
-  // hint.test.ts's two corpus tests (12 -> 48). With the sweeps off they run ZERO tests (every one
+  // The 60 sharded sweep files. ⚠️ The count has moved three times and in OPPOSITE directions: #216
+  // merged three 12-file families into one (36 -> 12), then #223 sharded hintNotes, hintStories and
+  // hint.test.ts's two corpus tests (12 -> 48), then corpus.test.ts's rating walk (48 -> 60). With
+  // the sweeps off they run ZERO tests (every one
   // skips), so that is several seconds for no assertions whatsoever. A CONVENTION, not an enumeration:
   // `tests/shard.ts` splits a corpus sweep across files because vitest parallelizes by FILE and
   // cannot split one `it()`, so anything `*.shard*` is a corpus walker by construction and a fourth

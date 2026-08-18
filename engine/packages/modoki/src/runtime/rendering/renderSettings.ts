@@ -81,6 +81,16 @@ export interface RenderSettings {
    *  *now*" every time the tier moves, instead of the tier having to remember what the project
    *  originally asked for. The frame driver's own `targetFPS` remains the live value. */
   targetFps: number;
+  /** Player-facing copy shown over the overlay while a live tier promotion is applied (#227).
+   *  Authored per project (`rendering.tierSwitchMessage`) because it needs the game's voice and
+   *  its language; `''` means the project did not author one and
+   *  {@link getTierSwitchMessage} answers with the engine default.
+   *
+   *  ⚠️ It lives at the ROOT, not under `three`. A 2D-only project promotes too — `tierBoot.ts`
+   *  drives the same calibration loop with no `Scene3D` — so hanging it off the Three block
+   *  would put the copy out of reach of exactly the projects whose tier changes are cheapest to
+   *  apply. */
+  tierSwitchMessage: string;
   three: ThreeRenderSettings;
   pixi: PixiRenderSettings;
   web: WebRenderSettings;
@@ -95,6 +105,10 @@ const DEFAULTS: Readonly<RenderSettings> = Object.freeze({
   // Matches `project-config.ts`'s own default AND the frame driver's historical `targetFPS = 60`,
   // so an unset project and a standalone import agree.
   targetFps: 60,
+  // Empty, not the default copy itself — see `getTierSwitchMessage`. Holding the AUTHORED value
+  // (absent included) is what lets the fallback stay in one place instead of being baked in here
+  // and re-checked at every reader.
+  tierSwitchMessage: '',
   three: {
     backend: 'auto',
     antialias: true,
@@ -110,6 +124,7 @@ const DEFAULTS: Readonly<RenderSettings> = Object.freeze({
 
 const cloneDefaults = (): RenderSettings => ({
   targetFps: DEFAULTS.targetFps,
+  tierSwitchMessage: DEFAULTS.tierSwitchMessage,
   three: { ...DEFAULTS.three },
   pixi: { ...DEFAULTS.pixi },
   web: { ...DEFAULTS.web },
@@ -135,6 +150,9 @@ export function setRenderSettings(next: PartialRenderSettings | undefined): void
     // A scalar, so `??` rather than a spread — and `??` not `||`, because `0` is a MEANINGFUL
     // value here (uncapped), not an absent one.
     targetFps: next.targetFps ?? settings.targetFps,
+    // `??` for the same reason as `targetFps` above: `''` is a MEANINGFUL authored value here
+    // ("I did not write copy, use the engine's"), not an absent one.
+    tierSwitchMessage: next.tierSwitchMessage ?? settings.tierSwitchMessage,
     three: { ...settings.three, ...next.three },
     pixi: { ...settings.pixi, ...next.pixi },
     web: { ...settings.web, ...next.web },
@@ -248,6 +266,24 @@ export function getEffectivePixiSettings(): PixiRenderSettings {
 export function getEffectiveTargetFps(): number {
   const authored = settings.targetFps;
   return activeTier ? applyTierToTargetFps(authored, getActiveTierOverrides()) : authored;
+}
+
+/** The engine's own copy for the tier-switch overlay, used when a project authored none.
+ *
+ *  Deliberately vague about DIRECTION ("adjusting", not "improving"): the same overlay would be
+ *  reused if a demotion ever needed covering, and copy that promises an upgrade would then be a
+ *  lie at the worst possible moment. Deliberately not a brand voice either — a project that wants
+ *  one authors `rendering.tierSwitchMessage`. */
+export const DEFAULT_TIER_SWITCH_MESSAGE = 'Adjusting graphics quality…';
+
+/** Copy to show over the tier-switch overlay: the project's if it authored one, else the engine's.
+ *
+ *  ⚠️ **READ THIS, NEVER `getRenderSettings().tierSwitchMessage`.** The authored field is `''` on
+ *  every project that did not write copy — which is nearly all of them — so a caller reading it
+ *  directly renders an EMPTY overlay: a spinner over a blank label, on the one surface whose whole
+ *  job is to explain an unexpected pause. The fallback belongs in one place, and this is it. */
+export function getTierSwitchMessage(): string {
+  return settings.tierSwitchMessage.trim() || DEFAULT_TIER_SWITCH_MESSAGE;
 }
 
 /** The tier a caller should assume when none has been resolved. Keeps "no tier yet" from

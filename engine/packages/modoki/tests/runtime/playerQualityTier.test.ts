@@ -25,6 +25,7 @@ import {
 } from '../../src/runtime/rendering/renderSettings';
 import {
   tickTierCalibration, resetTierCalibration, getPendingTierPromotion, CALIBRATION_INTERVAL_MS,
+  armTierCalibration,
 } from '../../src/runtime/rendering/tierCalibration';
 import { PROMOTION_HOLD_MS, TIER_SETTINGS, promotionCeiling } from '../../src/runtime/rendering/qualityTier';
 import { probeFingerprint } from '../../src/runtime/rendering/rampProbe';
@@ -48,6 +49,9 @@ beforeEach(() => {
   probeVerdictStore.reset();
   resetRenderSettings();
   resetTierCalibration();
+  // Since #227 the loop ignores the profile until a scene has loaded — see tierCalibration.test.ts.
+  // This suite is about the PLAYER-choice gate, so it arms and asks its own question.
+  armTierCalibration();
 });
 
 describe('storage round-trip', () => {

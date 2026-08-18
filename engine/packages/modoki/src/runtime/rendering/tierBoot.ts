@@ -45,7 +45,7 @@
 import { resolveActiveTier, resolveActiveTierForNo3D } from './tierResolve';
 import { getRenderSettings } from './renderSettings';
 import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_2D } from './frameDriver';
-import { tickTierCalibration, applyPendingTierPromotion } from './tierCalibration';
+import { tickTierCalibration } from './tierCalibration';
 
 const CALIBRATION_KEY = 'tier-calibration-2d';
 
@@ -78,12 +78,16 @@ export async function resolveTierForNo3DProject(): Promise<void> {
  *  the profile as of the last completed frame either way, and the ordering only decides which
  *  frame that is.
  *
- *  ⚠️ The promotion is applied at a SCENE BOUNDARY, not here — see `applyPendingTierPromotion`.
- *  Calling it every frame is correct and cheap: it is a no-op unless something is queued. */
+ *  ⚠️ **THIS ONLY TICKS. It does NOT apply a queued promotion, and it used to (#227).** The call
+ *  sat here under a comment reading "the promotion is applied at a SCENE BOUNDARY, not here …it is
+ *  a no-op unless something is queued" — true of the no-op case and false of the one that matters:
+ *  when something WAS queued, this applied it on the very next frame, mid-play and uncovered,
+ *  which is exactly what deferring to a boundary exists to prevent. A 2D project's boundary is now
+ *  the world swap (`onWorldSwap` in `tierCalibration.ts`), and a deliberate mid-play application
+ *  goes behind the tier-switch overlay. */
 export function startTierCalibrationForNo3DProject(): void {
   registerFrameCallback(CALIBRATION_KEY, () => {
     tickTierCalibration();
-    applyPendingTierPromotion();
   }, PRIORITY_RENDER_2D);
 }
 

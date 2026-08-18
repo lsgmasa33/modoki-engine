@@ -1292,7 +1292,10 @@ are a different runtime, and three differences showed up the moment the same dem
 - **Steady state is still 60 fps natively** on both the A23 and the S22 with the cap engaged
   (16.6 / 16.8 ms, 8 and 11 draw calls). The A23 got there the interesting way: it booted `mid`
   from its cached verdict, hit a 92.6 ms frame during load, and **calibration demoted it to `low`**
-  — the demotion ladder firing on real hardware, unprompted.
+  — the demotion ladder firing on real hardware, unprompted. ⚠️ **Re-read after #227: that was also
+  the defect.** "During load" is the whole of it — the frame being judged was produced by the load,
+  not by the game. Calibration is no longer armed until a scene has finished loading; see "Live
+  calibration" below.
 - ⚠️ **Unexplained: the S22 reports `probeVerdictStore` as having no provider** in the native app,
   which would mean it cannot cache a verdict and re-probes every launch. The A23 has the provider
   in the same APK. Not chased down.
@@ -1408,6 +1411,84 @@ get backwards:
   ride it out authors a lower `rendering.targetFps`, which raises its own budget in step. The
   profile publishes the threshold it used (`budgetMs`) and the demotion log quotes THAT; it used
   to quote a hardcoded 33.3 ms and contradict its own numbers (close-out 2026-08-12).
+- ⭐ **CALIBRATION IS NOT ARMED UNTIL A SCENE HAS FINISHED LOADING** (#227, `armTierCalibration`).
+  The loop used to start judging the instant a tier resolved, which meant judging GLB parsing and
+  shader compilation and calling the result the device's steady-state capability.
+
+  **Measured on `demos/forest-camp` / Galaxy A23** (2026-08-14, app data cleared): `[rampProbe]
+  middle` at +0.000 s and `mid via gpu-benchmark` at +0.001 s — *two independent methods agreeing* —
+  then `switched to 'low'` at +3.570 s on a 95.5 ms median over the 20 ms budget. The 2 s streak
+  began ~1.6 s in, inside the load. Pinned to `mid` the same scene on the same phone runs
+  **16.8-20.5 ms**, inside the budget it was condemned against, and because demotion is sticky the
+  misreading lasted the session. Nothing about this is forest-camp-specific: any project with a
+  non-trivial first load, on any device assessed above `low`, was exposed.
+
+  The rules, and each is load-bearing:
+  - **The arm signal is the first world swap** — `onWorldSwap`, which fires from `setCurrentWorld`
+    at the END of a load, after the staging world is populated *and* after the `beforeSwap` prewarm
+    has compiled shaders. ⚠️ Deliberately **not** `sceneManager.registerSceneCallback('*', …)`,
+    which looks purpose-built for it: that registry is a `Map` keyed by pattern, so a second `'*'`
+    registrant silently replaces the first and arming would vanish with nothing reporting it.
+    `onWorldSwap` holds a `Set`, and it is L0 — `rendering/` (L2) may not import `scene/` (L3) at all.
+  - **Arming also DROPS the frame window**, and that half is easy to miss. `PROFILE_WINDOW_FRAMES`
+    is a frame *count* (120), on purpose, so a slow device gets a longer window — at 95.5 ms load
+    frames that is ~11.4 s of history. Gating the verdict without dropping the window would hand
+    the policy a median still dominated by the load, and the demotion would fire moments later
+    anyway.
+  - **Both directions are suppressed**, not just the demotion that was seen misfiring — a promotion
+    decided off load frames reads the same contaminated window.
+  - ⚠️ **Demotion is suppressed outright during the window** (owner, 2026-08-18). The alternative —
+    keep it live at a harsher threshold so only catastrophic frames trip it — is ruled out by the
+    measurement, not by taste: the A23's load frames ran 95.5 ms against a 20 ms budget, nearly 5×
+    over, so any threshold high enough to ignore a load also ignores a genuinely broken device. The
+    stated cost is that a device that truly cannot render gets no relief until its first scene
+    loads; that is cheap because the player is watching a *load*, and the knobs a demotion applies
+    (DPR, shadows, frame cap) change how a rendered game looks. The one knob that matters during a
+    load is the texture cap, already resolved from the probe before assets fetch (#212).
+  - ⚠️ **Arming is gated on live calibration being ENABLED, so the editor is untouched.** The
+    listener is module-scope and does not consult the tick's gates, so an ungated one fired in the
+    editor too — which opts out entirely (`main.tsx: setTierCalibrationEnabled(!__MODOKI_EDITOR__)`)
+    — and zeroed the frame window on the first scene load. That window is what `debug/perfSources.ts`
+    feeds the Profiler panel and `modoki_profiler`, so a measurement taken just after loading the
+    scene you want to measure read a handful of frames with nothing saying why. A mechanism the
+    editor has opted out of must not have side effects there.
+  - **A 30 s backstop arms it anyway** if no world swap ever arrives, so "arm on a scene load"
+    cannot fail *closed* and leave a slow device un-demotable for the session — #227 inverted, and
+    the worse direction. It is long on purpose: a short backstop would fire mid-load and hand the
+    policy exactly the frames arming excludes. The worst first-scene prewarm measured here is
+    postfx-demo's **16.5 s on a Huawei Y6**, and 30 s clears it.
+
+  ✅ **VERIFIED ON THE A23** (2026-08-18, on the low-end Samsung, `demos/forest-camp`, app data cleared,
+  repo config). An A/B on the same device and the same install path, which is the only form of this
+  check that means anything — "no demotion" alone is equally explained by a crash, a gate, or a
+  missing config:
+
+  | build | result |
+  |---|---|
+  | pre-fix (`HEAD~1`) | `mid via gpu-benchmark` → `switched to 'low' — median frame 83.6ms over the 20.0ms budget for 2s` |
+  | post-fix | `mid via gpu-benchmark`, **no switch** — 33 s of runtime, tier stays `mid` |
+
+  The backstop warning never appeared despite >30 s elapsing, which is the positive half of the
+  result: arming came from a real world swap, not from the failsafe. `qualityTier` is unset on
+  forest-camp (so `auto`) and it authors both `mid` and `low`, so neither the pinned-tier nor the
+  one-config gate can account for the quiet run.
+
+  ✅ **The overlay spinner survives the stall — measured, not inferred.** The mid-play promotion
+  path covers a shader recompile with `LoadingOverlay`'s spinner, which only works if a
+  compositor-driven `transform` animation keeps running while the main thread is blocked. On the
+  A23's WebView, the same spinner CSS under a **6.03 s synchronous WebGL compile+link storm (367
+  programs)** kept rotating across all **10 captured frames inside the block**, at the same
+  per-frame pixel delta as the 8 frames before it. Captured with `adb exec-out screencap`, which
+  reads the NATIVE framebuffer and therefore cannot be fooled by the blocked webview thread — a
+  webview-side capture would have proved nothing. ⚠️ The progress-bar variant animates
+  `margin-left` (main-thread layout) and would freeze mid-slide; this path must stay on the spinner.
+
+  📌 **This re-reads an earlier observation in this file.** The native-build note above records the
+  A23 booting `mid` from a cached verdict, hitting a 92.6 ms frame *during load*, and demoting to
+  `low` — written up at the time as "the demotion ladder firing on real hardware, unprompted." It
+  was the ladder firing, and it was also this defect. The same log line is evidence for both
+  readings; only the timing relative to the load separates them.
+
 - ⭐ **PROMOTION MAY NOT EXCEED THE TIER THE DEVICE WAS ASSESSED AT** (`promotionCeiling`, #188).
   The headroom rule above reads `cpuMs` and nothing else, and that proxy is wrong in both
   directions on the hardware this exists for: on an A23, `games/3d-test` runs the GPU at **13.9 of

@@ -1208,6 +1208,15 @@ export function evaluateTierChange(
     // promotion branch below clears it for a tier that cannot promote (`high`), which is the same
     // guarantee expressed where it belongs.
     if (profile.samples >= MIN_SAMPLES_TO_JUDGE && profile.overBudget) {
+      // ⚠️ `0` IS BOTH "no streak" AND A LEGITIMATE `now`, and the collision is TOLERATED HERE
+      // rather than fixed — but do not copy the shape. Under a manual clock starting at 0 the
+      // first qualifying tick stamps 0, reads as "no streak" on the next tick, and re-stamps —
+      // costing one CALIBRATION_INTERVAL_MS off a hold. Benign here (production `rawNow()` has
+      // advanced far past 0 before a tier resolves and 30 samples accumulate, and the cost is
+      // one interval), and changing it means changing `TierChangeState`'s shape, which many
+      // tests construct. It is NOT benign wherever ticks are far apart: the #227 backstop used
+      // this exact pattern with a 30 s gap and could never fire — see `firstTickAt`, which uses
+      // `-1`.
       if (next.overBudgetSince === 0) next.overBudgetSince = now;
       if (now - next.overBudgetSince >= DEMOTION_HOLD_MS) {
         return {

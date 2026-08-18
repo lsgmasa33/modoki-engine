@@ -400,11 +400,13 @@ export {
   setRenderSettings, getRenderSettings, resetRenderSettings, resolveToneMapping,
   setActiveQualityTier, getActiveQualityTier, getAssessedQualityTier,
   getEffectiveThreeSettings, getEffectivePixiSettings, getEffectiveTargetFps,
+  getTierSwitchMessage, DEFAULT_TIER_SWITCH_MESSAGE,
   getActiveTierOrDefault,
 } from './rendering/renderSettings';
 export {
   tickTierCalibration, applyPendingTierPromotion, resetTierCalibration, setTierFrameCapEnabled, setTierCalibrationEnabled,
-  getPendingTierPromotion, CALIBRATION_INTERVAL_MS,
+  getPendingTierPromotion, CALIBRATION_INTERVAL_MS, onTierSwitchOverlay, getTierSwitchOverlayMessage,
+  armTierCalibration, isTierCalibrationArmed, ARM_BACKSTOP_MS, PROMOTION_BOUNDARY_GRACE_MS,
 } from './rendering/tierCalibration';
 export {
   getPlayerQualityTier, setPlayerQualityTier, hasPlayerQualityTier, choosePlayerQualityTier,

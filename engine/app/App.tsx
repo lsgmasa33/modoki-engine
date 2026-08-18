@@ -16,6 +16,7 @@ import { setActiveResetPhase } from './ui/components/ErrorBoundary';
 import { audioDispose, audioResume } from '@modoki/engine/runtime';
 import { VideoOverlay } from '@modoki/engine/runtime';
 import { useKeyboardShift } from './hooks/useKeyboardShift';
+import { onTierSwitchOverlay } from '@modoki/engine/runtime';
 import { checkAppOtaUpdate, subscribeOtaGate, type OtaGateState } from './ota';
 import OtaRestartGate from './ui/components/OtaRestartGate';
 import { loadStagedSubgames } from './subgameLoader';
@@ -103,6 +104,12 @@ function findGame(gameId: string): GameDefinition | undefined {
 const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) {
   useKeyboardShift();
 
+  // The engine applies a quality-tier promotion mid-play when no scene boundary arrives to hide the
+  // shader recompile in (#227) — a single-scene game never reaches one. It publishes copy here so
+  // the player sees an explained pause rather than a freeze. Subscribed once for the app's life;
+  // the initial read covers a switch that started before this effect ran.
+  useEffect(() => onTierSwitchOverlay(setTierSwitchMessage), []);
+
   // configReady: config is set, renderers can mount (scene may not be loaded)
   // initialized: scene loaded + rendered, everything ready
   // transitioning: game-to-game swap in progress (overlay visible)
@@ -113,6 +120,9 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
   const [GameUI, setGameUI] = useState<React.ComponentType | null>(null);
   const [disable3D, setDisable3D] = useState(false);
   const [otaGate, setOtaGate] = useState<OtaGateState | null>(null);
+  /** Copy for the tier-switch overlay, or null when no tier switch is being applied (#227). The
+   *  engine publishes it (`onTierSwitchOverlay`); this is its ONE reader. */
+  const [tierSwitchMessage, setTierSwitchMessage] = useState<string | null>(null);
   const activeGameIdRef = useRef<string | null>(null);
   /** Whether this shell started the no-3D tier-calibration loop, so a game swap knows to stop it.
    *  A ref rather than state: it is read inside the load effect and must never re-run it. */
@@ -427,7 +437,11 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
               presentation-mode clip is playing. */}
           {__MODOKI_MODULE_VIDEO__ && <VideoOverlay />}
           <LoadingOverlay
-            visible={!initialized || transitioning}
+            visible={!initialized || transitioning || tierSwitchMessage != null}
+            // A tier switch must PAINT before the main thread blocks on the recompile, so it skips
+            // the anti-flash delay. Boot and game swaps keep it.
+            immediate={tierSwitchMessage != null}
+            label={tierSwitchMessage ?? undefined}
             progress={otaGate?.phase === 'downloading' ? {
               fraction: otaGate.progress && otaGate.progress.bytesTotal > 0 ? otaGate.progress.bytesDone / otaGate.progress.bytesTotal : null,
               label: 'Downloading update…',

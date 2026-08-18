@@ -21,10 +21,12 @@ vi.mock('../../src/runtime/rendering/resizeBus', () => ({
 }));
 
 import { BUDGET_30FPS_MS, type FrameProfile } from '../../src/runtime/core/frameProfiler';
+import * as profiler from '../../src/runtime/core/frameProfiler';
 import {
   tickTierCalibration, applyPendingTierPromotion, resetTierCalibration,
   getPendingTierPromotion, CALIBRATION_INTERVAL_MS, applyActiveTierToRuntime, applyQualityTier,
-  setTierFrameCapEnabled, setTierCalibrationEnabled,
+  setTierFrameCapEnabled, setTierCalibrationEnabled, armTierCalibration, isTierCalibrationArmed,
+  ARM_BACKSTOP_MS, PROMOTION_BOUNDARY_GRACE_MS, onTierSwitchOverlay, getTierSwitchOverlayMessage,
 } from '../../src/runtime/rendering/tierCalibration';
 import * as frameDriver from '../../src/runtime/rendering/frameDriver';
 import {
@@ -63,6 +65,12 @@ beforeEach(() => {
   // TIER_SETTINGS keeps every assertion below about the ladder, not about the seed values.
   // The one describe block that deliberately authors NOTHING resets this itself.
   setRenderSettings({ three: { qualityTier: 'auto', tiers: { mid: TIER_SETTINGS.mid, low: TIER_SETTINGS.low } } });
+  // ⚠️ ARM IT. Since #227 the loop ignores the frame profile until a scene has finished loading
+  // (`onWorldSwap` → `armTierCalibration`), because otherwise it judges GLB parsing and shader
+  // compilation — which demoted a correctly-assessed `mid` A23 to `low` for the session. Every
+  // test below is about what the loop does with a profile it is ALLOWED to believe, so they arm
+  // here; the arming rule has its own describe block at the bottom of this file.
+  armTierCalibration();
 });
 
 describe('tickTierCalibration — gating', () => {
@@ -182,6 +190,7 @@ describe('promotion WAITS for a scene boundary', () => {
     // — a device cannot be "measured as middle" unless there was something to measure between.
     setRenderSettings({ three: { qualityTier: 'auto', tiers: { mid: TIER_SETTINGS.mid, low: TIER_SETTINGS.low } } });
     setActiveQualityTier({ tier: 'mid', source: 'measured', reason: 'probe measured middle' });
+    armTierCalibration();   // the reset above un-armed it (#227)
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       for (let t = 0; t <= PROMOTION_HOLD_MS * 4; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
@@ -486,5 +495,205 @@ describe('setTierCalibrationEnabled — the editor does not auto-calibrate (R7.4
     setTierCalibrationEnabled(false);
     applyPendingTierPromotion();
     expect(getActiveQualityTier()?.tier).toBe('low');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #227 — arming. Calibration must not judge a device on frames produced while its first scene
+// was still loading.
+//
+// ⚠️ THESE TESTS DO NOT ARM IN `beforeEach` — they undo it. The suite-wide `armTierCalibration()`
+// exists so every OTHER test is about the policy; here the arming IS the subject, so each case
+// resets first and states its own starting point.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('#227 — calibration is not armed until a scene has loaded', () => {
+  /** Back to the un-armed state the suite's beforeEach leaves behind, with the configs a live
+   *  project needs re-authored (resetTierCalibration does not touch render settings, but the
+   *  active tier must be re-published for the loop to have anything to judge). */
+  function unarmed(tier: 'low' | 'mid' = 'mid') {
+    resetTierCalibration();
+    setActiveQualityTier({ tier, source: 'gpu-benchmark', reason: 'a known GPU' });
+  }
+
+  it('⭐ does NOT demote on load frames — the A23 case this issue was filed for', () => {
+    // The measured defect, in one test. On demos/forest-camp / Galaxy A23 two independent methods
+    // assessed the device `mid`, and 3.57s later a 95.5ms median produced entirely inside GLB
+    // parsing and shader compilation demoted it to `low` — stickily, for the whole session. Pinned
+    // to `mid` the same scene on the same phone runs 16.8-20.5ms, inside the 20ms budget it was
+    // condemned against.
+    unarmed('mid');
+    mockProfile = DROWNING();
+
+    // Four full demotion hold periods of load-shaped frames. Before #227 this demoted on the first.
+    for (let t = 0; t <= DEMOTION_HOLD_MS * 4; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+
+    expect(getActiveQualityTier()?.tier).toBe('mid');
+  });
+
+  it('demotes on the SAME profile once armed — so it is the arming that stopped it', () => {
+    // The distinguishing control for the test above. Without this, "did not demote" is equally
+    // explained by a broken profile, a missing config, or a gate somewhere else entirely.
+    unarmed('mid');
+    mockProfile = DROWNING();
+    for (let t = 0; t <= DEMOTION_HOLD_MS * 4; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+    expect(getActiveQualityTier()?.tier).toBe('mid');   // still un-armed
+
+    armTierCalibration();
+    const base = DEMOTION_HOLD_MS * 4;
+    for (let t = base; t <= base + DEMOTION_HOLD_MS * 2; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+    expect(getActiveQualityTier()?.tier).toBe('low');
+  });
+
+  it('suppresses PROMOTION too, not just the demotion that was observed misfiring', () => {
+    // Both directions, deliberately: a promotion decided off load frames reads the same
+    // contaminated window, and letting one direction through would make the window's meaning
+    // depend on which way it happened to point.
+    unarmed('low');
+    setActiveQualityTier({ tier: 'low', source: 'calibrating', reason: 'unrecognised device' });
+    mockProfile = ROOMY();
+    for (let t = 0; t <= PROMOTION_HOLD_MS * 3; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+    expect(getPendingTierPromotion()).toBeNull();
+  });
+
+  it('arms on a world swap — the real signal, not a timer', async () => {
+    unarmed('mid');
+    expect(isTierCalibrationArmed()).toBe(false);
+
+    // Drive a REAL world swap rather than calling armTierCalibration(): the subscription is the
+    // thing under test, and asserting on the helper would pass just as well with nothing wired.
+    const { createWorld } = await import('koota');
+    const { setCurrentWorld } = await import('../../src/runtime/core/ecs/worldRegistry');
+    setCurrentWorld(createWorld());
+
+    expect(isTierCalibrationArmed()).toBe(true);
+  });
+
+  it('drops the frame window when it arms — gating the verdict alone is not enough', () => {
+    // PROFILE_WINDOW_FRAMES is a frame COUNT (120), so at the A23's 95.5ms load frames the window
+    // holds ~11.4s of history. Arming without dropping it would hand the policy a median still
+    // dominated by the load it just waited out, and the demotion would fire a moment later anyway.
+    unarmed('mid');
+    const spy = vi.spyOn(profiler, 'resetFrameProfile');
+    try {
+      armTierCalibration();
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally { spy.mockRestore(); }
+  });
+
+  it('is idempotent — a game with many scene loads arms once, and does not re-drop the window', () => {
+    unarmed('mid');
+    const spy = vi.spyOn(profiler, 'resetFrameProfile');
+    try {
+      armTierCalibration();
+      armTierCalibration();
+      armTierCalibration();
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally { spy.mockRestore(); }
+  });
+
+  it('the BACKSTOP arms it when no scene ever loads, so calibration cannot sleep forever', () => {
+    // The failsafe. Without it, "arm on a scene load" fails CLOSED on a project that never
+    // completes one: a genuinely slow device could never be demoted because the mechanism is
+    // politely waiting. That is #227 inverted, and it is the worse direction.
+    unarmed('mid');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      tickTierCalibration(0);                       // starts the backstop clock
+      tickTierCalibration(ARM_BACKSTOP_MS - 1);
+      expect(isTierCalibrationArmed()).toBe(false); // not yet — a slow load must not trip it
+
+      tickTierCalibration(ARM_BACKSTOP_MS);
+      expect(isTierCalibrationArmed()).toBe(true);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('no world swap'))).toBe(true);
+    } finally { warn.mockRestore(); }
+  });
+
+  it('does NOT arm — or touch the frame profile — when the editor has opted out', async () => {
+    // Close-out finding. Arming calls resetFrameProfile(), and the editor opts out of live
+    // calibration entirely (`main.tsx: setTierCalibrationEnabled(!__MODOKI_EDITOR__)`). A
+    // MODULE-SCOPE onWorldSwap listener does not consult the tick's gates, so an ungated one
+    // zeroed the profiler window on the editor's first scene load — the window
+    // `debug/perfSources.ts` feeds to the Profiler panel and `modoki_profiler`. An agent
+    // measuring right after loading the scene it wants to measure got percentiles over a
+    // handful of frames, with nothing saying why.
+    unarmed('mid');
+    const spy = vi.spyOn(profiler, 'resetFrameProfile');
+    setTierCalibrationEnabled(false);
+    try {
+      const { createWorld } = await import('koota');
+      const { setCurrentWorld } = await import('../../src/runtime/core/ecs/worldRegistry');
+      setCurrentWorld(createWorld());
+
+      expect(isTierCalibrationArmed()).toBe(false);
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      setTierCalibrationEnabled(true);
+      spy.mockRestore();
+    }
+  });
+
+  it('the positive control — with calibration ON, the same swap DOES arm and reset', async () => {
+    // Without this, the test above passes just as well if the listener were deleted outright.
+    unarmed('mid');
+    const spy = vi.spyOn(profiler, 'resetFrameProfile');
+    try {
+      const { createWorld } = await import('koota');
+      const { setCurrentWorld } = await import('../../src/runtime/core/ecs/worldRegistry');
+      setCurrentWorld(createWorld());
+
+      expect(isTierCalibrationArmed()).toBe(true);
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally { spy.mockRestore(); }
+  });
+
+  it('the backstop clears the worst load this repo has measured', () => {
+    // Not a tautology on the constant: it pins the RELATIONSHIP the constant exists to satisfy.
+    // postfx-demo's prewarm on a Huawei Y6 is 16.5s (scene3DSync.ts). A backstop shorter than that
+    // would fire mid-load and hand the policy exactly the frames arming excludes — #227 verbatim.
+    expect(ARM_BACKSTOP_MS).toBeGreaterThan(16_500);
+  });
+});
+
+describe('#227 — a queued promotion that never gets a scene boundary', () => {
+  it('applies mid-play once the grace expires, behind the tier-switch overlay', async () => {
+    // A single-scene game reaches no boundary EVER, so without this the promotion path is dead for
+    // a whole class of game and nothing says so.
+    setActiveQualityTier({ tier: 'low', source: 'calibrating', reason: 'unrecognised device' });
+    mockProfile = ROOMY();
+    const seen: (string | null)[] = [];
+    const off = onTierSwitchOverlay((m) => seen.push(m));
+    try {
+      for (let t = 0; t <= PROMOTION_HOLD_MS * 2; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+      const queued = getPendingTierPromotion();
+      expect(queued?.tier).toBe('mid');
+
+      // Still waiting for a boundary that is not coming. Stepped by CALIBRATION_INTERVAL_MS, not
+      // by 1 ms: the grace check sits BELOW the throttle, so two ticks a millisecond apart would
+      // see only the first — the second would return at the throttle and the test would read a
+      // working mechanism as broken.
+      tickTierCalibration(queued!.since + PROMOTION_BOUNDARY_GRACE_MS - CALIBRATION_INTERVAL_MS);
+      expect(getActiveQualityTier()?.tier).toBe('low');
+      expect(getTierSwitchOverlayMessage()).toBeNull();
+
+      tickTierCalibration(queued!.since + PROMOTION_BOUNDARY_GRACE_MS);
+      // The overlay goes up BEFORE the switch — that ordering is the whole point, since the
+      // recompile blocks the main thread and an overlay published afterwards would never paint.
+      expect(seen[0]).toBeTruthy();
+      expect(getPendingTierPromotion()).toBeNull();
+    } finally { off(); }
+  });
+
+  it('a boundary that DOES arrive still wins — the mid-play path is the fallback, not the default', () => {
+    setActiveQualityTier({ tier: 'low', source: 'calibrating', reason: 'unrecognised device' });
+    mockProfile = ROOMY();
+    for (let t = 0; t <= PROMOTION_HOLD_MS * 2; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+    expect(getPendingTierPromotion()?.tier).toBe('mid');
+
+    applyPendingTierPromotion();
+    expect(getActiveQualityTier()?.tier).toBe('mid');
+    // Nothing left for the grace timer to fire on, and no overlay was ever shown: a boundary-applied
+    // promotion hides inside a load the player already accepted and needs no explanation.
+    expect(getPendingTierPromotion()).toBeNull();
+    expect(getTierSwitchOverlayMessage()).toBeNull();
   });
 });

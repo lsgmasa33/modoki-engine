@@ -137,10 +137,14 @@ describe('live calibration on a project with no Scene3D', () => {
     startTierCalibrationForNo3DProject();
     stepOneFrame();
     expect(tick).toHaveBeenCalledTimes(1);
-    // The promotion is applied at a scene boundary and is a no-op unless one is queued, but it has
-    // to be CALLED — `Scene3D` calls both, and a 2D project that ticked without applying would
-    // decide promotions it never delivered.
-    expect(apply).toHaveBeenCalledTimes(1);
+    // ⚠️ AND IT MUST NOT APPLY A QUEUED PROMOTION PER FRAME (#227). This assertion used to be
+    // `expect(apply).toHaveBeenCalledTimes(1)`, justified as "a no-op unless one is queued" — true
+    // of the empty case and false of the one that matters: with a promotion queued, a per-frame
+    // call applied it on the NEXT FRAME, mid-play and uncovered, which is exactly what deferring
+    // to a scene boundary exists to prevent. A 2D project's boundary is the world swap
+    // (`onWorldSwap` in tierCalibration.ts); a deliberate mid-play application goes behind the
+    // tier-switch overlay instead.
+    expect(apply).not.toHaveBeenCalled();
 
     // Registering twice must REPLACE, not duplicate: the boot path is idempotent and a game swap
     // re-enters it. Two callbacks would double-count nothing here, but they would leak one.
