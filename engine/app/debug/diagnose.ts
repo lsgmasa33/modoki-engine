@@ -11,6 +11,7 @@ import {
   getAllEntities, getAllTraits, readTraitData, readTraitDataFull,
   REF_FIELDS_BY_TRAIT, isGuid, isExternalUrl, isInternalAssetPath, isInternalFontPath, resolveGuidToPath,
   getDeviceCaps, getDeviceCapsSync, readPerfProfile, getActiveQualityTier, getAutoLightCapStats,
+  getShadowCasterCapStats,
   getAssessedQualityTier, getEffectiveTargetFps, getRenderSettings, configCount,
 } from '@modoki/engine/runtime';
 import { getActiveTextureSizeCap } from '@modoki/engine/runtime';
@@ -173,6 +174,10 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
   // of this scene's lights is this object actually lit by?" needs an answer from data. Omitted
   // when disengaged, matching the healthy-means-silent convention above.
   const lightCap = getAutoLightCapStats();
+  // The shadow-caster cap (#229), on the same "reported only when it is doing something" rule.
+  // A shadow the tier dropped has no error and no visible cause — the scene just renders one
+  // fewer shadow than it authored — so this is the only place that can answer "where did it go?".
+  const shadowCap = getShadowCasterCapStats();
 
   return {
     ok,
@@ -190,6 +195,7 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
       }
       : {}),
     ...(lightCap.engaged ? { lightCap } : {}),
+    ...(shadowCap.engaged ? { shadowCap } : {}),
     perf,
     refs: { issues: refIssues, count: refIssues.length },
     transforms: { nan, zeroScale },

@@ -291,6 +291,10 @@ export {
 // are exported for `diagnose`: "why is this object dark?" is the question this feature
 // generates, and answering it from data beats answering it from the shader.
 export { getAutoLightCapStats, isAutoLightCapEngaged } from './rendering/autoLightCapFrame';
+// Only the stats accessor — `diagnose` reads it. The cap's arm/reset hooks and its pure rule stay
+// internal, exactly as `autoLightCapFrame`'s do: a test imports those by path, and a name in the
+// barrel is public API for every game and demo.
+export { getShadowCasterCapStats } from './rendering/shadowCasterCapFrame';
 // The mask variants the cap (or an authored scene) actually produced. On the barrel for the same
 // reason: verifying that a light selection REACHED the renderer needs the running instance, and a
 // direct `/@fs/` import from a debug eval can land on a second copy of the module.

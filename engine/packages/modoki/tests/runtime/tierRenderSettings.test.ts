@@ -135,6 +135,8 @@ describe('getActiveTierOverrides', () => {
       targetFps: 24, pixiPixelRatioCap: 1, pixiAntialias: false,
       // #212's field, same argument again — 999 appears in no engine table.
       textureMaxSize: 999,
+      // #229's field, same argument once more: every engine table holds 0 or 1, never 3.
+      maxShadowCasters: 3,
     };
     setRenderSettings({ three: { tiers: { low: authoredLow } } });
     setActiveQualityTier({ tier: 'low', source: 'project', reason: 'test' });

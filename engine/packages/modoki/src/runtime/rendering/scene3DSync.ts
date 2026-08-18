@@ -43,6 +43,8 @@ import {
 } from './renderSettings';
 import { tierShadowMapSize, tierAllowsIBL, tierAmbientBoost, tierExposureBoost, shadowBiasScale } from './qualityTier';
 import { armAutoLightCap, autoCapMaskFor, isAutoLightCapEngaged } from './autoLightCapFrame';
+import { armShadowCasterCap, shadowCasterAllowed } from './shadowCasterCapFrame';
+import { casterTypeOf, type ShadowCaster } from './shadowCasterCap';
 import { applyInstancedBatching } from './instancedBatching';
 import { resolveActiveTier } from './tierResolve';
 import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
@@ -752,6 +754,35 @@ function lightMatchesType(l: THREE.Light, lightType: string): boolean {
 const _lightEuler = new THREE.Euler();
 const _lightForward = new THREE.Vector3();
 
+/** This frame's shadow-casting lights, reduced to what the cap's rule needs. Reused across
+ *  frames — see `_maskedLights` above for why the render sync allocates nothing per frame. */
+const _shadowCasters: ShadowCaster[] = [];
+
+/** Collect the ACTIVE casting lights for the shadow-caster cap (#229), then arm it.
+ *
+ *  Lives here rather than in `shadowCasterCapFrame` because reading the world means importing the
+ *  `Light` trait, which an L2 subsystem may not do — this file is reclassified L3 (D4 in
+ *  `docs/architecture-layers.md`), so the query belongs on this side of the seam. Same inversion
+ *  `armAutoLightCap` uses with its `MaskedLight[]`.
+ *
+ *  An unlimited cap (`high`, and every project that never authored a tier) walks NO lights: the
+ *  query is cheap, but the loop allocates one descriptor per casting light per frame, and paying
+ *  that to compute a cap which cannot bite is exactly the per-frame churn that measures as the
+ *  engine's CPU cost on a weak device. */
+function armShadowCastersFor(world: World, max: number): void {
+  _shadowCasters.length = 0;
+  if (max <= 0) { armShadowCasterCap(_shadowCasters, max); return; }
+  world.query(Light).forEach((entity) => {
+    if (deactivatedEntities.has(entity.id())) return;
+    const l = entity.get(Light);
+    if (!l || !l.castShadow) return;
+    const type = casterTypeOf(l.lightType);
+    if (type === null) return;
+    _shadowCasters.push({ id: entity.id(), type, intensity: l.intensity, color: l.color });
+  });
+  armShadowCasterCap(_shadowCasters, max);
+}
+
 export function syncLights(
   world: World,
   scene: THREE.Scene,
@@ -760,6 +791,9 @@ export function syncLights(
 ) {
   _activeLightIds.clear();
   _maskedLights.length = 0;
+  // Which lights may render a shadow map at all (#229). Decided BEFORE the loop because it is a
+  // question about the whole light set — see `armShadowCastersFor`.
+  armShadowCastersFor(world, getActiveTierOverrides().maxShadowCasters);
   world.query(Light).updateEach(([light], entity) => {
     if (deactivatedEntities.has(entity.id())) return;
     const id = entity.id();
@@ -796,7 +830,11 @@ export function syncLights(
     // the authored value passes through untouched everywhere else.
     l.intensity = light.intensity
       * (iblSuppressed && l instanceof THREE.AmbientLight ? tierAmbientBoost(getActiveTierOverrides()) : 1);
-    l.castShadow = light.castShadow;
+    // The tier's shadow-caster cap (#229) applies HERE rather than by not authoring the flag:
+    // `castShadow` is the authored intent and stays untouched in the trait, while three is told
+    // what this frame can afford. A light the cap demoted renders no map and builds no
+    // `ShadowNode`, which is the whole saving — an extra submit of the caster set per light.
+    l.castShadow = light.castShadow && shadowCasterAllowed(id);
     if (l instanceof THREE.PointLight || l instanceof THREE.SpotLight) {
       l.distance = light.distance;
     }
@@ -846,7 +884,7 @@ export function syncLights(
 
     // Shadow config runs AFTER the position/target sync above — a follow-recentre needs this
     // frame's authored direction, not last frame's.
-    if (light.castShadow && (l instanceof THREE.DirectionalLight || l instanceof THREE.SpotLight)) {
+    if (l.castShadow && (l instanceof THREE.DirectionalLight || l instanceof THREE.SpotLight)) {
       // An authored follow TARGET beats the caller's view-derived focus: measured in
       // demos/forest-camp, the derived ground point trails the character by 2.8-3.7 m (it grows
       // while walking, since the camera lags and looks slightly ahead), which spends a quarter of

@@ -119,6 +119,12 @@ export interface TierOverridesConfig {
   };
   maxDirectional: number;
   maxLocal: number;
+  /** Most lights that may render a shadow map this frame. **0 = unlimited** (#229). Mirrors
+   *  `TierRenderOverrides.maxShadowCasters` (runtime/rendering/qualityTier.ts) — separate from
+   *  `maxDirectional`/`maxLocal` (those cap how many lights SHADE a fragment; this caps how many
+   *  RENDER a shadow map, a whole extra scene submit each) and from `shadowMapCeiling` (that caps
+   *  a map's size, not how many are rendered). */
+  maxShadowCasters: number;
   ibl: boolean;
   iblOffAmbientBoost: number;
   iblOffExposure: number;

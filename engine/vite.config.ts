@@ -163,6 +163,13 @@ const fsAllow = externalProject ? [repoRoot, externalProject] : [repoRoot]
 // Three files are 256s of the 275s of test-body time, and they are what this drops. What is left
 // runs in ~6s.
 //
+// ⚠️ **THOSE THREE NUMBERS ARE HISTORICAL as of 2026-08-18** — the same three files were memoised,
+// sharded and split that day (corpus 174.9 -> 20.3s, strategies 119.0 -> 16.9s, shapeGeneration
+// 113.8 -> 65.2s across five files). They are STILL the right things to exclude, so the list does
+// not change; the figures above just record why it was drawn, not what it costs now. ⚠️ Note also
+// that the table is per-file TEST-BODY time, which EXCLUDES import — and describe-body work is
+// billed to import, which is how shapeGeneration read 37.6s here while the file took 113.8s.
+//
 // ⚠️ **Measure before adding anything here, because the obvious culprit was not one.** Court's
 // files were believed to pay ~5-6s EACH at import — a figure that came from dividing a total which
 // one file dominated. `hintPainting.test.ts` was walking the corpus at describe-body scope, where
@@ -176,7 +183,10 @@ const COURT_QUICK_EXCLUDE = [
   // the rejection-funnel cover a generator edit breaks first, and this tier can afford it.
   '../games/court/tests/corpus.test.ts',
   '../games/court/tests/strategies.test.ts',
-  '../games/court/tests/shapeGeneration.test.ts',
+  // A GLOB: `shapeGeneration` split into five files on 2026-08-18 (its describe-body generation
+  // was 76.2 s of a 114.3 s file, billed under `import`), so an exact path would have quietly
+  // readmitted four of them into the fast loop.
+  '../games/court/tests/shapeGeneration*.test.ts',
   // The 60 sharded sweep files. ⚠️ The count has moved three times and in OPPOSITE directions: #216
   // merged three 12-file families into one (36 -> 12), then #223 sharded hintNotes, hintStories and
   // hint.test.ts's two corpus tests (12 -> 48), then corpus.test.ts's rating walk (48 -> 60). With

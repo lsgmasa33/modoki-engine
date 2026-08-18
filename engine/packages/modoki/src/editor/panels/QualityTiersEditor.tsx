@@ -29,7 +29,7 @@ const POSTFX_LABELS: Record<PostFXEffect, string> = {
   npr: 'NPR outline', ao: 'GTAO', dof: 'Depth of field', bloom: 'Bloom', vignette: 'Vignette',
 };
 
-type NumberField = 'pixelRatioCap' | 'shadowMapCeiling' | 'maxDirectional' | 'maxLocal' | 'iblOffAmbientBoost' | 'iblOffExposure' | 'targetFps' | 'pixiPixelRatioCap' | 'textureMaxSize';
+type NumberField = 'pixelRatioCap' | 'shadowMapCeiling' | 'maxDirectional' | 'maxLocal' | 'maxShadowCasters' | 'iblOffAmbientBoost' | 'iblOffExposure' | 'targetFps' | 'pixiPixelRatioCap' | 'textureMaxSize';
 type CheckboxField = 'antialias' | 'shadows' | 'ibl' | 'pixiAntialias';
 
 /** Per-field help, carrying the MEASUREMENT that justifies the seeded value (plan §3's tables)
@@ -50,6 +50,8 @@ function fieldHelp(tier: TieredKey, field: NumberField | CheckboxField): string 
     case 'maxDirectional':
     case 'maxLocal':
       return '0 = unlimited. A23 ladder: 1 directional = 21ms, +3 point = 34ms, +8 point = 165ms — superlinear, with a cliff between 5 and 10 lights. Enforced live, per frame — the mask is recomputed and re-applied every frame via the authored mask path (see docs/rendering.md § "The automatic light cap").';
+    case 'maxShadowCasters':
+      return '0 = unlimited. Caps how many lights render a shadow map this frame — a whole extra submit of the caster set for the WHOLE scene, once per frame, unlike Max directional/point-spot above (which cap how many lights SHADE a fragment). Separate from Shadow-map ceiling below, which caps a map’s SIZE, not how many are rendered. A23: one shadow pass measured 57 of 103 draw calls, 58k of 87k triangles, ~3.6ms of a 15.7ms CPU frame (#229).';
     case 'ibl':
       return 'Y6: IBL costs ~26ms of a ~53ms frame, entirely GPU. Off took sling 18.7→36.5 fps. Not fixable by shrinking the HDR — three’s PMREM samples a fixed-size CubeUV map regardless of source size.';
     case 'iblOffAmbientBoost':
@@ -161,6 +163,8 @@ function TierCard({ tier, cfg, onChange, onRemove }: {
         dataUiId={`quality-tiers.field.${tier}.maxDirectional`} />
       <NumberRow tier={tier} field="maxLocal" label="Max point/spot lights" cfg={cfg} onChange={onChange}
         dataUiId={`quality-tiers.field.${tier}.maxLocal`} />
+      <NumberRow tier={tier} field="maxShadowCasters" label="Max shadow casters" cfg={cfg} onChange={onChange}
+        dataUiId={`quality-tiers.field.${tier}.maxShadowCasters`} />
       <NumberRow tier={tier} field="iblOffAmbientBoost" label="IBL-off ambient boost" cfg={cfg} onChange={onChange}
         dataUiId={`quality-tiers.field.${tier}.iblOffAmbientBoost`} />
       <NumberRow tier={tier} field="iblOffExposure" label="IBL-off exposure boost" cfg={cfg} onChange={onChange}

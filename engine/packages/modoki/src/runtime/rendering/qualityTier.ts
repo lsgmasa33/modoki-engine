@@ -187,6 +187,26 @@ export interface TierRenderOverrides {
   maxDirectional: number;
   /** Most POINT+SPOT ("local") lights an object may be lit by. 0 = unlimited. */
   maxLocal: number;
+  /** Most lights that may RENDER A SHADOW MAP this frame. **0 = unlimited.** (#229)
+   *
+   *  The sibling of `maxDirectional`/`maxLocal`, and NOT covered by them: those cap how many
+   *  lights SHADE a fragment, which is a per-object, per-fragment cost. A shadow map is a whole
+   *  extra submit of the caster set for the WHOLE scene, once per frame, at the same price
+   *  whether one fragment samples it or a million. Between `shadows: false` and "every casting
+   *  light renders a full map" this table had nothing — `shadowMapCeiling` caps a map's SIZE,
+   *  never how many are rendered.
+   *
+   *  MEASURED, #224 on a Galaxy A23: ONE shadow pass is 57 of 103 draw calls, 58k of 87k
+   *  triangles and ~3.6 ms of a 15.7 ms CPU frame — that pass submitted more geometry than the
+   *  visible scene did. `demos/postfx-demo` authors FIVE casting spots and is the only scene in
+   *  the fleet with more than one.
+   *
+   *  Which casters survive is `keptShadowCasters` (`rendering/shadowCasterCap.ts`) — directionals
+   *  first, then locals, each by effective intensity. It counts LIGHTS, not passes, which
+   *  under-counts a POINT light: its shadow is a cube map, i.e. six passes. No scene in the fleet
+   *  casts from a point light, so weighting that is unmeasured policy rather than a fix; if one
+   *  ever does, this is the note that says the cap is looser than it looks for that light. */
+  maxShadowCasters: number;
   /** May image-based lighting (an HDR `Environment`) light the scene on this tier?
    *
    *  MEASURED on a Huawei Y6 2019 (#154): IBL costs **~26 ms of a ~53 ms frame** — half of it,
@@ -303,6 +323,10 @@ export const TIER_SETTINGS: Record<QualityTier, TierRenderOverrides> = {
     // IBL saving on FRAME RATE, which is where it actually lands.
     pixelRatioCap: 1, antialias: false, shadows: false, shadowMapCeiling: 512, postFX: NO_POSTFX,
     maxDirectional: 1, maxLocal: 1,
+    // Inert while `shadows: false` above holds, and set to the honest value anyway rather than 0:
+    // a project that turns shadows back on at `low` (its tier config is its own to tune) must not
+    // silently inherit "unlimited" from a row that had no reason to think about it.
+    maxShadowCasters: 1,
     ibl: false, iblOffAmbientBoost: 4, iblOffExposure: 1.25,
     // ⚠️ **30 IS A DELIBERATE BEHAVIOUR CHANGE, not a carry-forward** (owner, 2026-08-11). Every
     // other seeded value preserves what the fleet already did; this one does not. A4 seeded 22
@@ -391,6 +415,14 @@ export const TIER_SETTINGS: Record<QualityTier, TierRenderOverrides> = {
   mid: {
     pixelRatioCap: 1.5, antialias: false, shadows: true, shadowMapCeiling: 1024, postFX: NO_POSTFX,
     maxDirectional: 2, maxLocal: 3,   // enforced per frame — see above
+    // ⚠️ **1 IS A DELIBERATE BEHAVIOUR CHANGE**, in the same spirit as `low`'s `targetFps: 30`
+    // below: `0` would be authorable-and-inert, and this issue exists precisely because there was
+    // nothing between "all shadows off" and "every caster renders a full map". At ~3.6 ms per
+    // pass against a 20 ms budget, a second caster is ~18% of the frame, so `mid` buys ONE
+    // scene-defining shadow and pays for no more. Today this touches exactly one project —
+    // `demos/postfx-demo`, five casting spots — which can raise its own `mid` row if the gallery
+    // wants more back.
+    maxShadowCasters: 1,
     ibl: true, iblOffAmbientBoost: 1, iblOffExposure: 1,
     // NO frame cap on `mid`, and that is the same discipline as the four fields above it: a mid
     // device has never been measured missing 60, so capping it to 30 would be inventing a number
@@ -409,7 +441,7 @@ export const TIER_SETTINGS: Record<QualityTier, TierRenderOverrides> = {
   },
   high: {
     pixelRatioCap: 2, antialias: true, shadows: true, shadowMapCeiling: 0, postFX: ALL_POSTFX,
-    maxDirectional: 0, maxLocal: 0,
+    maxDirectional: 0, maxLocal: 0, maxShadowCasters: 0,
     ibl: true, iblOffAmbientBoost: 1, iblOffExposure: 1,
     // Mirrors the 3D row above it. ⚠️ This row is NOT what `high` resolves to — that is
     // `UNCLAMPED_OVERRIDES`, and the difference is live (see its header). This row survives only
@@ -439,7 +471,7 @@ export const TIER_SETTINGS: Record<QualityTier, TierRenderOverrides> = {
  *  gives Court back the value it asked for. */
 export const UNCLAMPED_OVERRIDES: TierRenderOverrides = {
   pixelRatioCap: Infinity, antialias: true, shadows: true, shadowMapCeiling: 0, postFX: ALL_POSTFX,
-  maxDirectional: 0, maxLocal: 0,
+  maxDirectional: 0, maxLocal: 0, maxShadowCasters: 0,
   ibl: true, iblOffAmbientBoost: 1, iblOffExposure: 1,
   // `0` (not `Infinity`) is the identity for these two, because both fields carry the "0 = no cap"
   // sentinel rather than a numeric ceiling — `applyTierToTargetFps`/`applyTierToPixi` widen it to

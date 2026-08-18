@@ -57,7 +57,8 @@
           "targetFps": 0,
           "pixiPixelRatioCap": 1,
           "pixiAntialias": false,
-          "textureMaxSize": 1024
+          "textureMaxSize": 1024,
+          "maxShadowCasters": 1
         },
         "low": {
           "pixelRatioCap": 1,
@@ -79,7 +80,8 @@
           "targetFps": 30,
           "pixiPixelRatioCap": 1,
           "pixiAntialias": false,
-          "textureMaxSize": 512
+          "textureMaxSize": 512,
+          "maxShadowCasters": 1
         }
       }
     },

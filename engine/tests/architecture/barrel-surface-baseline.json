@@ -416,6 +416,7 @@
   "getRig2D",
   "getRiggedModel",
   "getRunMode",
+  "getShadowCasterCapStats",
   "getSharedTextureStats",
   "getSimDelta",
   "getSkeletalSeek",

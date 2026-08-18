@@ -561,6 +561,7 @@ starts `low`. A project that wants exactly today's behaviour must pin `qualityTi
 | `antialias` | off | off | on | ❌ **constructor-only** |
 | max directional lights | 1 | 2 | unlimited | ✅ per-frame, via `armAutoLightCap` — see § "The automatic light cap" below |
 | max point+spot lights | 1 | 3 | unlimited | ✅ per-frame, via `armAutoLightCap` — see § "The automatic light cap" below |
+| **max shadow casters** (#229) | **1** | **1** | unlimited | ✅ per-frame, via `armShadowCasterCap` |
 | **IBL** (`scene.environment`) | **dropped** | **on** | on | ✅ `syncEnvironment` re-reads each frame |
 | ambient compensation | ×4 | ×1 | ×1 | ✅ `syncLights`, gated on `isIblSuppressed()` |
 | exposure compensation | ×1.25 | ×1 | ×1 | ✅ `reconcileToneExposure`, same gate, per frame |
@@ -568,6 +569,27 @@ starts `low`. A project that wants exactly today's behaviour must pin `qualityTi
 | **`pixi.pixelRatioCap`** (#202) | **1** | 1 | 2 | ✅ via the resize bus |
 | **`pixi.antialias`** (#202) | off | off | on | ❌ **constructor-only** (`Application.init`) |
 | **`textureMaxSize`** (#212) | **512** | **1024** | none | ⚠️ per-TEXTURE, at LOAD — a texture already in flight keeps its current variant; the next load picks up a live tier change |
+
+**`maxShadowCasters` caps how many lights RENDER a shadow map, not how many SHADE a fragment
+(#229).** `max directional`/`max point+spot` above bound per-fragment shading; a shadow map is a
+whole extra submit of the scene's caster set, once per frame, at the same cost regardless of how
+many fragments sample it — between `shadows: off` and "every casting light renders a full map" the
+tier table had nothing for that. Measured on a Galaxy A23: one shadow pass cost 57 of 103 draw
+calls, 58k of 87k triangles, ~3.6 ms of a 15.7 ms CPU frame. `demos/postfx-demo` (five casting
+spots) is the only scene in the fleet with more than one caster today. Which lights survive when
+the cap bites — directionals first, then spot/point, each by effective intensity — is
+`shadowCasterCap.ts`; the full rationale is `TierRenderOverrides.maxShadowCasters`'s docblock in
+`qualityTier.ts`.
+
+⚠️ **The selection is fixed at scene load ON PURPOSE — moving it at runtime costs ~200 ms per
+swap.** The obvious better rule is "whichever light lights the thing the camera/Director is
+focused on", and it was measured on a Galaxy A23 (`demos/postfx-demo`, one caster flipped, every
+frame timed around it): **255.3 ms** on the swap frame, **191.3 ms** swapping back, then **220.4**
+and **184.9** for a third and fourth swap of the same pair — no warm-up, the price is per swap.
+Changing which lights cast changes the `ShadowNode` set a material's `LightsNode` builds, and that
+pipeline rebuild is a synchronous stall. A focus-driven caster therefore needs a pre-warm that
+compiles every single-caster variant up front (the `prewarmShadersForWorld` pattern) before it is
+viable — it is not a comparator swap.
 
 **`textureMaxSize` is a DOWNLOAD-size knob, orthogonal to every other row above it (#212).**
 Textures are 67% of a shipped build (measured on `demos/postfx-demo`: 21.8 MB of KTX2 in a
@@ -1004,6 +1026,14 @@ inside the noise, reproduced twice. postfx-demo is the only project that authors
 
 `diagnose` reports `lightCap` whenever the cap is engaged — "why is this object dark?" is the
 question this feature generates, and it should be answerable from data.
+
+The shadow-caster cap (#229) has the same reporting rule and one extra wrinkle worth knowing:
+`diagnose` reports `shadowCap` when that cap is engaged, but its `casters`/`kept` counts are
+**absent rather than zero when the tier is unlimited**. On that path the engine deliberately never
+walks the lights (there is no cap to compute), so it does not know the count — and a `0` from the
+one function exported to answer "where did my shadow go?" would be a confident wrong answer on the
+most common path of all. A scene that WAS counted reports both numbers even when the cap did not
+bite, so "5 casters, 5 kept" is still a usable answer.
 
 #### ⭐ GPU identity decides the tier — the probe is the fallback (#210)
 
