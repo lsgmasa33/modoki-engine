@@ -264,6 +264,53 @@ were not.
 window. Editor field tests need BOTH: the non-dispatching stub for the #233 condition, and a stub
 that really dispatches `focusout` for this one. See `textCommitField.test.tsx`.
 
+### And a fourth shape: an undo SNAPSHOT (#244)
+
+The three shapes above are all about the VALUE. A field can also hang something else off focus —
+the Sprite Editor's slicer params took their undo snapshot in `onFocus` and pushed it in `onBlur`,
+which is a fourth way for the same missing event to bite. With no focus events the value still
+landed on every keystroke and **nothing reached the modal's history**, so ⌘Z reverted whatever step
+came *before* the edit. Nothing errored, and the value looked right.
+
+**The rule: open the session from `onChange` and close it on a signal that does not need focus.**
+`editor/panels/coalescedEdit.ts` is the shared piece — `note()` snapshots lazily on the first change
+since the last commit, an idle timer commits the run as ONE undo step, and `flush()` closes it from
+anything else that touches the history.
+
+Two consequences that are easy to miss:
+
+- **`undo`/`redo` MUST `flush()` first.** This half of the bug does not need an unfocused window at
+  all: type into a field and press ⌘Z without leaving it, and the pending snapshot is still
+  un-pushed when the stack is popped. That is what makes it testable (see below).
+- **Keep `onBlur` flushing** — it is the click-away path, and a *second* commit signal is free.
+  What #244 was is `onBlur` being the ONLY one. In `SpriteEditor`'s `Num` it sits on the `<label>`
+  rather than the input, because React's `onBlur` is `focusout` (it bubbles) and the shared
+  `BufferedNumberInput` owns the input's own focus handlers.
+
+The same change replaced that panel's bespoke `<input type="number">` with `BufferedNumberInput`.
+A number input reports `value === ''` for an incomplete entry like a lone `-`, so with a
+commit-per-keystroke field the sign was wiped before a digit could follow and a negative offset was
+not typeable — the reason `fields.tsx` moved off `type="number"` in the first place.
+
+### Testing this class: drive the field with no focus events
+
+`engine/tests/e2e/editor-unfocused-field-commits.spec.ts` is the guard for #244 **and** for #242,
+which shipped live-verified only. It is worth knowing why it looks the way it does.
+
+Headless Chromium reports `document.hasFocus() === true`, and a second page does not change that
+(measured) — so the unfocused state cannot be produced by window management. It is produced through
+the EVENTS instead: dispatch `input` on the field through React's own value setter and never
+dispatch `focus`/`blur`. The component sees exactly what an unfocused window gives it.
+
+Two details are load-bearing, and a test that skips them passes against the broken code:
+
+- **Append one character at a time, re-reading the field's value from the DOM each time.** If the
+  field's own commit echoes back and rewrites the buffer mid-edit (#242), the next character has to
+  land on the rewritten text — which is what a human typing into an unfocused window gets, and what
+  pushing whole strings would hide.
+- **Assert the STORE, not just the field**, wherever the display legitimately holds an
+  unreconciled value (a clamped field shows `-3.5` while the store holds the clamp).
+
 ### Remount a field when its TARGET changes
 
 A field that tracks "is the user mid-edit?" in a ref must be keyed on what it edits. The ref is

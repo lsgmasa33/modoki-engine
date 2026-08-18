@@ -1697,6 +1697,7 @@ export default function Assets() {
             selected={typeFilter}
             onToggle={toggleTypeFilter}
             onClear={() => setTypeFilter(new Set())}
+            uiId="assets.toolbar.typeFilter"
           />
         )}
         <div style={toolbarDividerStyle} />

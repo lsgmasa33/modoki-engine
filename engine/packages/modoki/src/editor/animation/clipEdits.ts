@@ -5,8 +5,9 @@
  * returns plain data; the component keeps only store wiring + the commit() call.
  */
 
-import { upsertKey, trackKey } from './recording';
+import { upsertKey, trackKey, reapplyTangentsAround } from './recording';
 import { applyTangentMode } from '../../runtime/animation/curveEval';
+import { clampKeyTime } from '../panels/animation/timelineMath';
 import type { AnimationClipDef, AnimationTrack, Keyframe, TrackValueType } from '../../runtime/animation/types';
 
 const EPS = 1e-4;
@@ -133,13 +134,61 @@ export function applyBreakUnify(tracks: AnimationTrack[], byTrack: Map<number, S
 // ── Value nudge + add-property planning ──
 
 /** Add `dv` to the value of every selected key ON A NUMBER TRACK (color/boolean/enum
- *  tracks are skipped even if selected, so a fractional delta can't corrupt an index). */
+ *  tracks are skipped even if selected, so a fractional delta can't corrupt an index).
+ *
+ *  Re-derives the tangents of every nudged key and its neighbors afterwards — a derived
+ *  mode reads its slope off the surrounding values, so a nudge that skipped this wrote a
+ *  key claiming `tangentMode:'auto'` beside a tangent 'auto' no longer produces. See
+ *  `reapplyTangentsAround`. */
 export function applyValueNudge(tracks: AnimationTrack[], byTrack: Map<number, Set<number>>, dv: number): AnimationTrack[] {
   return tracks.map((tr, ti) => {
     const kis = byTrack.get(ti);
     if (!kis || tr.type !== 'number') return tr;
-    return { ...tr, keys: tr.keys.map((k, ki) => (kis.has(ki) ? { ...k, v: k.v + dv } : k)) };
+    const keys = tr.keys.map((k, ki) => (kis.has(ki) ? { ...k, v: k.v + dv } : { ...k }));
+    reapplyTangentsAround(keys, kis);
+    return { ...tr, keys };
   });
+}
+
+// ── Single-key patch (Curves drag + the numeric Value/Frame fields) ──
+
+/** Does this patch MOVE the key, without itself authoring a tangent?
+ *
+ *  Only a `t`/`v` change restales the DERIVED tangents around a key. A patch that sets a
+ *  tangent field IS the hand-edit (a Curves tangent-handle drag sends exactly that), so
+ *  re-deriving on it would compute the user's own drag away on the frame they made it. */
+function patchMovesKey(patch: Partial<Keyframe>): boolean {
+  if (patch.t === undefined && patch.v === undefined) return false;
+  return patch.inTangent === undefined && patch.outTangent === undefined
+    && patch.inWeight === undefined && patch.outWeight === undefined
+    && patch.tangentMode === undefined && patch.broken === undefined;
+}
+
+/**
+ * Merge `patch` into `keys[ki]` — the Curves-view key drag and the Inspector's numeric
+ * Value/Frame fields. Time is clamped strictly between the neighbours (and by `maxT`), so
+ * the dragged INDEX stays stable and the array never resorts mid-drag.
+ *
+ * Re-derives the tangents of the patched key and its neighbours whenever the patch moved it
+ * — the same reason `applyValueNudge` and `moveKeysInTime` do. This path was the third
+ * writer of a key's `t`/`v` and the one the original bug report did not reach: dragging a
+ * key in the Curves view left both neighbours carrying `tangentMode:'auto'` beside a tangent
+ * 'auto' no longer produces, which the runtime then plays verbatim
+ * (`normalizeAnimationClip` never re-derives). Because the clamp keeps the index stable,
+ * adjacency cannot change here, so the ±1 scope is exactly right.
+ */
+export function applyKeyPatch(
+  keys: Keyframe[],
+  ki: number,
+  patch: Partial<Keyframe>,
+  maxT = Number.POSITIVE_INFINITY,
+): Keyframe[] {
+  if (ki < 0 || ki >= keys.length) return keys;
+  const next = keys.map((k) => ({ ...k }));
+  next[ki] = { ...next[ki], ...patch };
+  if (patch.t !== undefined) next[ki].t = clampKeyTime(keys, ki, next[ki].t, maxT);
+  if (patchMovesKey(patch)) reapplyTangentsAround(next, [ki]);
+  return next;
 }
 
 /** A property the picker can add (structural subset of the picker's PropertyCandidate). */

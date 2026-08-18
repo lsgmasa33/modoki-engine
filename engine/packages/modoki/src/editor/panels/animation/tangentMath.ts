@@ -6,7 +6,7 @@
  *  into slope+weight. `handlePt` (forward) and `deriveTangentFromHandle` (inverse) must
  *  round-trip: drag a handle to a data point, read it back, get the same data point. */
 
-import { DEFAULT_TANGENT_WEIGHT, type Keyframe } from '../../../runtime/animation/types';
+import { DEFAULT_TANGENT_WEIGHT, type Keyframe, type TangentMode } from '../../../runtime/animation/types';
 
 const EPS = 1e-3;
 
@@ -49,18 +49,23 @@ export function deriveTangentFromHandle(
   segDt: number,
   unified: boolean,
 ): Partial<Keyframe> {
+  // RECORD the mode, or the drag is temporary. Without it the key keeps whatever mode it had
+  // — usually 'auto' — and the next neighbour edit re-derives the hand-shaped tangent away
+  // (`reapplyTangent` honours the key's OWN mode). `freeSmooth` vs `free` preserves what the
+  // drag meant: a unified handle stays mirrored, a broken one stays broken.
+  const mode: TangentMode = unified ? 'freeSmooth' : 'free';
   if (side === 'out') {
     const ddt = Math.max(EPS, dataT - k.t);
     const slope = (dataV - k.v) / ddt;
     const w = Math.max(0.02, Math.min(1, ddt / Math.max(EPS, segDt)));
-    const patch: Partial<Keyframe> = { outTangent: slope, outWeight: w };
+    const patch: Partial<Keyframe> = { outTangent: slope, outWeight: w, tangentMode: mode, broken: !unified };
     if (unified) patch.inTangent = slope;
     return patch;
   }
   const bdt = Math.max(EPS, k.t - dataT);
   const slope = (k.v - dataV) / bdt;
   const w = Math.max(0.02, Math.min(1, bdt / Math.max(EPS, segDt)));
-  const patch: Partial<Keyframe> = { inTangent: slope, inWeight: w };
+  const patch: Partial<Keyframe> = { inTangent: slope, inWeight: w, tangentMode: mode, broken: !unified };
   if (unified) patch.outTangent = slope;
   return patch;
 }

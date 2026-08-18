@@ -124,24 +124,27 @@ export default function GameView({ uiLayer }: GameViewProps) {
         <DevicePicker preset={preset} orientation={orientation} onSelect={setPreset} onToggleOrientation={toggleOrientation} />
         <div style={{ width: 1, height: 18, background: '#444', margin: '0 6px' }} />
         {isStopped ? (
-          <button onClick={onPlay} style={{ ...iconBtnStyle, color: '#2ecc71' }} title="Play (⌘P)">▶</button>
+          <button data-ui-id="gameView.toolbar.play" onClick={onPlay} style={{ ...iconBtnStyle, color: '#2ecc71' }} title="Play (⌘P)">▶</button>
         ) : (
-          <button onClick={onStop} style={{ ...iconBtnStyle, color: '#e74c3c' }} title="Stop">⏹</button>
+          <button data-ui-id="gameView.toolbar.stop" onClick={onStop} style={{ ...iconBtnStyle, color: '#e74c3c' }} title="Stop">⏹</button>
         )}
-        <button onClick={isPaused ? onPlay : onPause} style={{ ...iconBtnStyle, opacity: isStopped ? 0.4 : 1 }}
+        {/* One control, two labels — the id stays `pause` in BOTH states on purpose: an agent
+            aims by id and reads which it is from get_editor_state.playState, so a resume can't
+            miss because the selector changed underneath it. */}
+        <button data-ui-id="gameView.toolbar.pause" onClick={isPaused ? onPlay : onPause} style={{ ...iconBtnStyle, opacity: isStopped ? 0.4 : 1 }}
           title={isPaused ? 'Resume (⌘P)' : 'Pause (⌘P)'} disabled={isStopped}>
           {isPaused ? '▶' : '⏸'}
         </button>
-        <button onClick={stepOnce} style={{ ...iconBtnStyle, opacity: isPaused ? 1 : 0.4 }} title="Step Frame" disabled={!isPaused}>
+        <button data-ui-id="gameView.toolbar.step" onClick={stepOnce} style={{ ...iconBtnStyle, opacity: isPaused ? 1 : 0.4 }} title="Step Frame" disabled={!isPaused}>
           ⏭
         </button>
         <div style={{ width: 1, height: 18, background: '#444', margin: '0 6px' }} />
-        <button onClick={toggleColliders} style={{ ...iconBtnStyle, color: showColliders ? '#2effa6' : '#888' }}
+        <button data-ui-id="gameView.toolbar.colliders" onClick={toggleColliders} style={{ ...iconBtnStyle, color: showColliders ? '#2effa6' : '#888' }}
           title="Toggle 2D collider overlay">⬡</button>
-        <button onClick={toggleMute} style={{ ...iconBtnStyle, color: muted ? '#e74c3c' : '#888' }}
+        <button data-ui-id="gameView.toolbar.mute" onClick={toggleMute} style={{ ...iconBtnStyle, color: muted ? '#e74c3c' : '#888' }}
           title={muted ? 'Unmute audio' : 'Mute audio'}>{muted ? '🔇' : '🔊'}</button>
         <span style={{ flex: 1 }} />
-        <span style={{ color: isStopped ? '#888' : isPaused ? '#f1c40f' : '#2ecc71', fontSize: '11px', whiteSpace: 'nowrap', flexShrink: 0 }}>
+        <span data-ui-id="gameView.status" style={{ color: isStopped ? '#888' : isPaused ? '#f1c40f' : '#2ecc71', fontSize: '11px', whiteSpace: 'nowrap', flexShrink: 0 }}>
           {isStopped ? 'STOPPED' : isPaused ? 'PAUSED' : 'PLAYING'}
         </span>
         <span style={{ color: '#555', fontSize: '11px', flexShrink: 0 }}>|</span>

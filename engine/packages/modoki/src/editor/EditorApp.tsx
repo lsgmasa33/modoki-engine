@@ -826,6 +826,7 @@ function SaveLayoutAsModal({ initial, onSave, onExport, onClose }: { initial: st
       <div onClick={(e) => e.stopPropagation()} style={{ background: '#1e1e30', border: '1px solid #555', borderRadius: 6, padding: '16px 20px', minWidth: 300, fontFamily: 'monospace' }}>
         <div style={{ color: '#fff', fontSize: 13, marginBottom: 12 }}>Save Layout As</div>
         <input
+          data-ui-id="layout.saveAs.name"
           ref={inputRef}
           value={name}
           onChange={(e) => setName(e.target.value)}
@@ -838,10 +839,10 @@ function SaveLayoutAsModal({ initial, onSave, onExport, onClose }: { initial: st
           }}
         />
         <div style={{ display: 'flex', gap: 8, justifyContent: 'space-between', marginTop: 12 }}>
-          <button onClick={exportToFile} title="Download the current layout as a portable .layout.json file (doesn't save it in the project)" style={{ padding: '4px 16px', border: '1px solid #555', borderRadius: 3, background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11 }}>Export to file…</button>
+          <button data-ui-id="layout.saveAs.export" onClick={exportToFile} title="Download the current layout as a portable .layout.json file (doesn't save it in the project)" style={{ padding: '4px 16px', border: '1px solid #555', borderRadius: 3, background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11 }}>Export to file…</button>
           <div style={{ display: 'flex', gap: 8 }}>
-            <button onClick={onClose} style={{ padding: '4px 16px', border: '1px solid #555', borderRadius: 3, background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11 }}>Cancel</button>
-            <button onClick={commit} style={{ padding: '4px 16px', border: '1px solid #3a6', borderRadius: 3, background: '#244', color: '#cfc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11 }}>Save</button>
+            <button data-ui-id="layout.saveAs.cancel" onClick={onClose} style={{ padding: '4px 16px', border: '1px solid #555', borderRadius: 3, background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11 }}>Cancel</button>
+            <button data-ui-id="layout.saveAs.save" onClick={commit} style={{ padding: '4px 16px', border: '1px solid #3a6', borderRadius: 3, background: '#244', color: '#cfc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11 }}>Save</button>
           </div>
         </div>
       </div>
@@ -913,14 +914,14 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 320, overflowY: 'auto' }}>
             {layouts.map((l) => (
               <div key={l.name} style={{ display: 'flex', gap: 4 }}>
-                <button onClick={() => load(l.name)} style={{
+                <button data-ui-id={`layout.load.${l.name}`} onClick={() => load(l.name)} style={{
                   flex: 1, textAlign: 'left', padding: '6px 10px', border: '1px solid #444', borderRadius: 3,
                   background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 12,
                 }}
                   onMouseEnter={(e) => (e.currentTarget.style.background = '#3a3a5c')}
                   onMouseLeave={(e) => (e.currentTarget.style.background = '#2a2a40')}
                 >{l.label}</button>
-                <button onClick={() => exportLayout(l.name)} title="Export to file…" style={{
+                <button data-ui-id={`layout.export.${l.name}`} onClick={() => exportLayout(l.name)} title="Export to file…" style={{
                   padding: '6px 10px', border: '1px solid #444', borderRadius: 3,
                   background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 12,
                 }}
@@ -932,11 +933,11 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
           </div>
         )}
         <div style={{ display: 'flex', gap: 8, justifyContent: 'space-between', marginTop: 12 }}>
-          <button onClick={loadFromFile} style={{
+          <button data-ui-id="layout.load.fromFile" onClick={loadFromFile} style={{
             padding: '4px 16px', border: '1px solid #555', borderRadius: 3,
             background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11,
           }}>Load from file…</button>
-          <button onClick={onClose} style={{
+          <button data-ui-id="layout.load.cancel" onClick={onClose} style={{
             padding: '4px 16px', border: '1px solid #555', borderRadius: 3,
             background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11,
           }}>Cancel</button>

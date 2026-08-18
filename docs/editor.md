@@ -977,7 +977,11 @@ cell size, with offset/padding), **auto-detect by alpha islands** (threshold sli
 persists `sprites[]` + `spriteSheet` (and the `spriteGrid` / `spriteAlphaThreshold`
 controls) into the texture's `.meta.json`, and live-registers each slice as a `'sprite'`
 manifest entry so it can be referenced from `Renderable2D.sprite`. One undo step captures
-the full slice set **and** the slicing parameters. See [Materials & Textures](./textures.md).
+the full slice set **and** the slicing parameters. Its fields commit on EVERY keystroke, so a
+run of them coalesces into that one step via `panels/coalescedEdit.ts` — opened on the first
+change and closed by an idle timer or by anything else that touches the history, **never by a
+focus event**, which does not fire in an unfocused window (#244; the class, and how to test it,
+is in [editor input](./editor-input.md)). See [Materials & Textures](./textures.md).
 
 > **A `.meta.json` write REPLACES the file — every writer must read-modify-write.**
 > `/api/write-meta` → `writeMetaSidecar` → `writeJsonAtomic(sidecarPath, committed)`: no merge with
@@ -1170,8 +1174,8 @@ discovered, because if discovery itself comes up short the first check is trivia
 `MODOKI_E2E_MIN_TESTS=n` for a deliberate subset. Implementation note: `process.exitCode = 1` does
 **not** work in a Playwright reporter (Playwright assigns its own exit code after reporters finish),
 so the guard returns `{ status: 'failed' }` from `onEnd`. The `46`s above are the 2026-07-29
-incident's numbers and stay as narration — **today's floor is `EXPECTED_MIN_TESTS`, currently 50,
-matching 50 discovered specs.** Read the constant, never a count copied out of prose; growing the
+incident's numbers and stay as narration — **today's floor is `EXPECTED_MIN_TESTS`, currently 54,
+matching 54 discovered specs.** Read the constant, never a count copied out of prose; growing the
 suite without raising it is how the guard quietly loosens.
 
 **Per-worker dev servers are the real fix for the serial cost, and are deliberately low priority.**

@@ -505,6 +505,20 @@ The MCP is **parity-plus** with chrome-devtools for the editor, and better on tw
   now take `button` (`right`→context menu, `middle`→orbit-pan), `clickCount` (`2`→double-click), and
   `modifiers` (`shift`/`meta`→multi-select, snap). Full raw-input siblings — `modoki_hover`,
   `modoki_scroll`, `modoki_press_key`, `modoki_dnd` — and the aimed-drag layer are under **Enact** below.
+  - **A drag's `modifiers` are genuinely HELD, not just a bit on the mouse events.** `drag()`
+    presses each one as a real `keyDown` right after the mousedown and releases it after the
+    mouseup, so the key is down across every intermediate move. The distinction is load-bearing:
+    the 2D gizmo's snap reads `e.shiftKey` off each pointer-move, but the 3D gizmo's reads a
+    `window` keydown/keyup listener (`onSnapKey`) that tracks the modifier's LEVEL — the mouse bit
+    is invisible to it, and `modoki_press_key` cannot help because it completes keyDown→keyUp
+    inside one call. That left 3D-gizmo snapping undrivable by any MCP sequence until it was fixed;
+    `modoki_drag {modifiers:['shift']}` now snaps both gizmos. The press lands *after* the
+    mousedown on purpose — the mousedown is what gives the panel the keyboard scope `onSnapKey`
+    gates on. **The SUSTAINED-pointer trio does NOT do this**: `modoki_pointer` `down`/`move`/`up`
+    still sets `modifiers` on the mouse events only, so a level-tracking listener is unreachable
+    through it. Holding a real key across separate HTTP calls needs the release to be as reliable
+    as the press (a missed `up` leaves Chromium with a stuck modifier), so it was left alone — use
+    `modoki_drag` when the modifier's LEVEL is what the code under test reads.
 - `modoki_batch` — run several tools **in order, in one turn**. Reach for it when you already know
   the whole sequence (`create_entity` → `set_transform` → `save_all`, or `tap` → `wait` → capture).
   It exists for two reasons: **ordering cannot be expressed any other way** — issuing several tool

@@ -75,3 +75,27 @@ describe('deriveTangentFromHandle — unified vs broken', () => {
     expect(tiny.outWeight).toBe(0.02);
   });
 });
+
+// A hand-drag that does not RECORD its mode is temporary: the key keeps whatever mode it had
+// (usually 'auto') and the next neighbour edit re-derives the shape away. That was the bug.
+describe('deriveTangentFromHandle — the drag records what it meant', () => {
+  it("a unified drag records 'freeSmooth' and stays mirrored", () => {
+    const patch = deriveTangentFromHandle(key({ tangentMode: 'auto' }), 'out', 2, 6, 1, true);
+    expect(patch.tangentMode).toBe('freeSmooth');
+    expect(patch.broken).toBe(false);
+    expect(patch.inTangent).toBe(patch.outTangent); // mirrored, which is what 'freeSmooth' means
+  });
+
+  it("a broken drag records 'free' and moves only its own side", () => {
+    const patch = deriveTangentFromHandle(key({ tangentMode: 'auto', broken: true }), 'out', 2, 6, 1, false);
+    expect(patch.tangentMode).toBe('free');
+    expect(patch.broken).toBe(true);
+    expect(patch.inTangent).toBeUndefined(); // the other handle is left alone
+  });
+
+  it('records the mode on the IN side too', () => {
+    const patch = deriveTangentFromHandle(key({ tangentMode: 'auto' }), 'in', 0, -2, 1, true);
+    expect(patch.tangentMode).toBe('freeSmooth');
+    expect(patch.broken).toBe(false);
+  });
+});

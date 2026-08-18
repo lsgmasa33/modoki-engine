@@ -1,9 +1,10 @@
 /** Pure clip-edit transforms — copy/paste placement + collision avoidance, break/unify. */
 
 import { describe, it, expect } from 'vitest';
-import { extractKeyBlock, planPaste, applyBreakUnify, applyValueNudge, planAddedTracks } from '../../src/editor/animation/clipEdits';
+import { extractKeyBlock, planPaste, applyBreakUnify, applyValueNudge, applyKeyPatch, planAddedTracks } from '../../src/editor/animation/clipEdits';
 import { groupSelection, upsertKey } from '../../src/editor/animation/recording';
 import { evalTrackValue } from '../../src/runtime/animation/curveEval';
+import { deriveTangentFromHandle } from '../../src/editor/panels/animation/tangentMath';
 import type { AnimationClipDef, AnimationTrack, Keyframe } from '../../src/runtime/animation/types';
 
 const FR = 60;
@@ -143,6 +144,124 @@ describe('applyValueNudge', () => {
     expect(out[0].keys.map((k) => k.v)).toEqual([0, 1.5, 2]);
     expect(out[1].keys[0].v).toBe(0x112233); // color track skipped
     expect(out[1]).toBe(tracks[1]); // untouched track returned by reference
+  });
+
+  it("re-derives the nudged key's own 'auto' tangent AND its neighbors'", () => {
+    // Bake the track through upsertKey so every key starts with a correct 'auto' tangent.
+    let keys: Keyframe[] = [];
+    for (const [t, v] of [[0, 0], [0.3, 1], [0.6, 2]] as const) keys = upsertKey(keys, t, v);
+    const tracks = [track('y', keys)];
+    // Nudge the MIDDLE key. key[1]'s own slope is (v2-v0)/(t2-t0) — unchanged by its own
+    // value — but key[0]'s and key[2]'s slopes both read key[1].v, so both must move.
+    const out = applyValueNudge(tracks, groupSelection(['0:1']), 0.5);
+    const k = out[0].keys;
+    expect(k[0].outTangent).toBeCloseTo((k[1].v - k[0].v) / (k[1].t - k[0].t), 9);
+    expect(k[1].outTangent).toBeCloseTo((k[2].v - k[0].v) / (k[2].t - k[0].t), 9);
+    expect(k[2].outTangent).toBeCloseTo((k[2].v - k[1].v) / (k[2].t - k[1].t), 9);
+    // The stale values are what the pre-fix nudge left behind — assert they are gone.
+    expect(k[0].outTangent).not.toBeCloseTo(tracks[0].keys[0].outTangent, 6);
+    expect(k[2].outTangent).not.toBeCloseTo(tracks[0].keys[2].outTangent, 6);
+  });
+
+  it("leaves a 'constant' key stepped and a 'free' key's hand-edited handles alone", () => {
+    const tracks = [track('y', [
+      key(0, 0, { tangentMode: 'constant', outTangent: Infinity, broken: true }),
+      key(0.3, 1, { tangentMode: 'free', inTangent: 7, outTangent: -7, broken: true }),
+      key(0.6, 2, { tangentMode: 'auto' }),
+    ])];
+    const k = applyValueNudge(tracks, groupSelection(['0:1']), 0.5)[0].keys;
+    expect(k[0].outTangent).toBe(Infinity);   // constant stays stepped
+    expect(k[1].inTangent).toBe(7);           // free keeps its handles
+    expect(k[1].outTangent).toBe(-7);
+    expect(k[2].outTangent).toBeCloseTo((k[2].v - k[1].v) / (k[2].t - k[1].t), 9); // auto re-derives
+  });
+});
+
+// The Curves-view key drag and the Inspector's numeric Value/Frame fields — the THIRD writer
+// of a key's t/v, and the one the original tangent-staleness report never reached.
+describe('applyKeyPatch', () => {
+  const baked = (): Keyframe[] => {
+    let ks: Keyframe[] = [];
+    for (const [t, v] of [[0, 0], [0.2, 1], [0.4, 4]] as const) ks = upsertKey(ks, t, v);
+    return ks;
+  };
+
+  it("re-derives the patched key's neighbours when the patch moves its VALUE", () => {
+    const before = baked();
+    const k = applyKeyPatch(before, 1, { v: 5 });
+    expect(k[1].v).toBe(5);
+    expect(k[0].outTangent).toBeCloseTo((k[1].v - k[0].v) / (k[1].t - k[0].t), 9);
+    expect(k[2].outTangent).toBeCloseTo((k[2].v - k[1].v) / (k[2].t - k[1].t), 9);
+    expect(k[0].outTangent).not.toBeCloseTo(before[0].outTangent, 6);
+    expect(k[2].outTangent).not.toBeCloseTo(before[2].outTangent, 6);
+  });
+
+  it('re-derives when the patch moves its TIME, and clamps between the neighbours', () => {
+    const before = baked();
+    const k = applyKeyPatch(before, 1, { t: 99 }); // way past its right neighbour
+    expect(k[1].t).toBeLessThan(k[2].t);           // clamped — index order preserved
+    expect(k[1].t).toBeGreaterThan(k[0].t);
+    expect(k[0].outTangent).toBeCloseTo((k[1].v - k[0].v) / (k[1].t - k[0].t), 9);
+    expect(k[0].outTangent).not.toBeCloseTo(before[0].outTangent, 6);
+  });
+
+  it('does NOT recompute a tangent-handle drag away (the patch that AUTHORS a tangent)', () => {
+    // A Curves tangent-handle drag sends {inTangent, outTangent, inWeight/outWeight} — and
+    // may send no t/v at all. Re-deriving on it would erase the drag on the frame it happened.
+    const k = applyKeyPatch(baked(), 1, { outTangent: 42, inTangent: 42, outWeight: 0.3 });
+    expect(k[1].outTangent).toBe(42);
+    expect(k[1].inTangent).toBe(42);
+    // Even a patch that moves the key AND sets a tangent keeps the authored tangent.
+    const k2 = applyKeyPatch(baked(), 1, { v: 5, outTangent: 7 });
+    expect(k2[1].v).toBe(5);
+    expect(k2[1].outTangent).toBe(7);
+  });
+
+  it('leaves the input array untouched and ignores an out-of-range index', () => {
+    const before = baked();
+    const snapshot = JSON.stringify(before);
+    applyKeyPatch(before, 1, { v: 5 });
+    expect(JSON.stringify(before)).toBe(snapshot); // no in-place mutation of the caller's keys
+    expect(applyKeyPatch(before, 9, { v: 5 })).toBe(before);
+    expect(applyKeyPatch(before, -1, { v: 5 })).toBe(before);
+  });
+});
+
+// The behaviour the freeSmooth mode exists for, end to end through the real editor path:
+// hand-shape a tangent, then edit a NEIGHBOUR, and the hand shape must survive.
+describe('a hand-shaped tangent survives a neighbour edit', () => {
+  const baked = (): Keyframe[] => {
+    let ks: Keyframe[] = [];
+    for (const [t, v] of [[0, 0], [0.2, 1], [0.4, 4]] as const) ks = upsertKey(ks, t, v);
+    return ks;
+  };
+
+  it("a unified handle drag (freeSmooth) is NOT recomputed when a neighbour moves", () => {
+    // 1. Drag key[1]'s out handle — the patch a CurvesView tangent drag sends.
+    const dragged = applyKeyPatch(baked(), 1, deriveTangentFromHandle(baked()[1], 'out', 0.3, 3, 0.2, true));
+    const shaped = dragged[1].outTangent;
+    expect(dragged[1].tangentMode).toBe('freeSmooth');
+    expect(dragged[1].broken).toBe(false);
+    // 2. Now move a NEIGHBOUR. Every derived key around it re-derives; key[1] must not.
+    const after = applyKeyPatch(dragged, 2, { v: 99 });
+    expect(after[1].outTangent).toBe(shaped);
+    expect(after[1].inTangent).toBe(dragged[1].inTangent);
+    expect(after[2].outTangent).not.toBeCloseTo(dragged[2].outTangent, 6); // the neighbour DID re-derive
+  });
+
+  it("the same drag left as 'auto' would have been recomputed away — the pre-fix behaviour", () => {
+    const dragged = applyKeyPatch(baked(), 1, { inTangent: 42, outTangent: 42, tangentMode: 'auto' });
+    const after = applyKeyPatch(dragged, 2, { v: 99 });
+    expect(after[1].outTangent).not.toBe(42); // 'auto' re-derives, so the hand shape is gone
+  });
+
+  it('a broken drag survives too, and keeps its handles independent', () => {
+    const dragged = applyKeyPatch(baked(), 1, deriveTangentFromHandle(baked()[1], 'out', 0.3, 3, 0.2, false));
+    expect(dragged[1].tangentMode).toBe('free');
+    const shaped = dragged[1].outTangent;
+    const after = applyKeyPatch(dragged, 0, { v: -5 });
+    expect(after[1].outTangent).toBe(shaped);
+    expect(after[1].broken).toBe(true);
   });
 });
 

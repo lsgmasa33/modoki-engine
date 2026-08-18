@@ -50,14 +50,18 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'swaps / gizmo drags need them). Each endpoint is `{entity}` ({guid|name|id}), ' +
       '`{selector}`, or page CSS `{x,y}` — the first two resolved to a live point in the ' +
       "same call). `button:'middle'`/'right' = " +
-      "orbit-pan the 3D viewport; `modifiers:['shift']` = gizmo snap. For HTML5 drag-and-drop " +
+      "orbit-pan the 3D viewport; `modifiers:['shift']` = gizmo snap. A modifier is genuinely " +
+      'HELD for the gesture — pressed as a real key after the mousedown and released after the ' +
+      'mouseup, not just set as a bit on the mouse events — so a listener that tracks the ' +
+      "modifier's LEVEL (the SceneView 3D gizmo's snap does) sees it down for every intermediate " +
+      'move. For HTML5 drag-and-drop ' +
       '(asset→slot, reparent) use modoki_dnd, NOT this. Requires the Electron editor.',
     {
       from: pointSpec.describe('Drag origin: {entity} | {selector} | {x,y}.'),
       to: pointSpec.describe('Drag destination: {entity} | {selector} | {x,y}.'),
       steps: z.number().optional().describe('Intermediate move count (default 10).'),
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button (default 'left')."),
-      modifiers: z.array(modifierEnum).optional().describe('Held modifier keys.'),
+      modifiers: z.array(modifierEnum).optional().describe('Modifier keys held for the whole drag (real keyDown/keyUp around the gesture).'),
     },
     async ({ from, to, steps, button, modifiers }) => postJson('/api/input/drag', { from, to, steps, button, modifiers }),
   );
@@ -334,7 +338,8 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'time, pose a bone). Destination is ONE of: `to:{x,y}` (absolute CSS px), `toId` ' +
       '(another handle\'s position — e.g. snap one vertex onto another), or `delta:{dx,dy}` ' +
       '(offset from the handle\'s current position). Resolves live coords server-side so ' +
-      'there is no query→drag race. `modifiers:["shift"]` = gizmo/snap. Occlusion is reported PER ' +
+      'there is no query→drag race. `modifiers:["shift"]` = gizmo/snap, and is HELD as a real ' +
+      'key for the whole drag (see modoki_drag). Occlusion is reported PER ' +
       'ENDPOINT — `fromTarget`/`toTarget` each carry `occluded` (boolean) + `occludedBy` — so a ' +
       'covered source and a covered destination are distinguishable (they need different fixes); ' +
       '`toTarget` appears only for a `toId` destination. Requires the Electron editor.',
@@ -345,7 +350,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       delta: z.object({ dx: z.number(), dy: z.number() }).optional().describe('Offset from the handle\'s current position.'),
       steps: z.number().optional().describe('Intermediate move count (default 10).'),
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button held for the drag (default 'left')."),
-      modifiers: z.array(modifierEnum).optional(),
+      modifiers: z.array(modifierEnum).optional().describe('Modifier keys held for the whole drag (real keyDown/keyUp around the gesture).'),
     },
     async ({ id, to, toId, delta, steps, button, modifiers }) => postJson('/api/input/drag-handle', { id, to, toId, delta, steps, button, modifiers }),
   );

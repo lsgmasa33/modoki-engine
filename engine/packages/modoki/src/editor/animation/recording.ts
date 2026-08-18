@@ -75,6 +75,30 @@ function reapplyTangent(keys: Keyframe[], i: number): void {
   applyTangentMode(keys, i, keys[i].tangentMode ?? 'auto');
 }
 
+/** Re-derive the tangents of every key in `touched` PLUS its immediate neighbors, each
+ *  honoring its own stored mode — the same scope `upsertKey` uses after an insert.
+ *
+ *  Every edit that moves a key's `t` or `v` has to run this, because a derived mode is
+ *  derived from the NEIGHBORS: an 'auto' key's slope is the secant through the keys on
+ *  either side, so changing one key restales the two beside it as well. The edits that
+ *  skipped it (a value nudge, a time drag) left `tangentMode:'auto'` on disk next to a
+ *  tangent 'auto' does not produce — so the runtime, which trusts the stored number
+ *  verbatim (`normalizeAnimationClip` never re-derives), played a curve the editor would
+ *  redraw the moment anything touched that key again. Measured on games/anim-bug's
+ *  animation.anim.json: key[1] stored 5.5677 where its own neighbors give 10.7874.
+ *
+ *  Mutates `keys` in place (callers pass a fresh copy). */
+export function reapplyTangentsAround(keys: Keyframe[], touched: Iterable<number>): void {
+  const scope = new Set<number>();
+  for (const i of touched) {
+    if (i < 0 || i >= keys.length) continue;
+    scope.add(i);
+    if (i > 0) scope.add(i - 1);
+    if (i < keys.length - 1) scope.add(i + 1);
+  }
+  for (const i of scope) reapplyTangent(keys, i);
+}
+
 /** Insert or update a key at `time` on a copy of `keys`, kept sorted, with each
  *  affected key's tangent recomputed per its own mode. Returns the new keys array. */
 export function upsertKey(keys: Keyframe[], time: number, v: number): Keyframe[] {
@@ -239,13 +263,23 @@ export function moveKeysInTime(
   const tracks = baseTracks.map((tr, ti) => {
     const times = selTimes.get(ti);
     if (!times) return tr;
-    const shifted = tr.keys.map((k) => (times.has(k.t) ? { ...k, t: k.t + delta, _sel: true } : { ...k })) as (Keyframe & { _sel?: boolean })[];
+    // `_wasBeside` marks a key that SAT NEXT TO a moved one before the move. A time shift
+    // changes ADJACENCY, not just spans, so the neighbours the moved key LEFT BEHIND are
+    // restaled too and are not reachable from its new index: move B out of A-B-C-D and A's
+    // own 'auto' slope is now the secant to C, while nothing downstream would recompute it.
+    // Tagging them here — while the ORIGINAL order is still known — is the only cheap way to
+    // find them again after the sort.
+    const shifted = tr.keys.map((k, ki) => {
+      if (times.has(k.t)) return { ...k, t: k.t + delta, _sel: true };
+      const beside = (ki > 0 && times.has(tr.keys[ki - 1].t)) || (ki < tr.keys.length - 1 && times.has(tr.keys[ki + 1].t));
+      return beside ? { ...k, _wasBeside: true } : { ...k };
+    }) as (Keyframe & { _sel?: boolean; _wasBeside?: boolean })[];
     shifted.sort((a, b) => a.t - b.t);
     // Dedup: a moved (selected) key that lands within TIME_EPS of another key collapses
     // to a single key — the SELECTED key wins (the user dragged/nudged it there). Without
     // this, a group shift could leave two keys at the same time (dt=0 discontinuity in
     // eval, a "stuck" leftover), the one path that violated upsertKey's merge invariant. (A2)
-    const keys: (Keyframe & { _sel?: boolean })[] = [];
+    const keys: (Keyframe & { _sel?: boolean; _wasBeside?: boolean })[] = [];
     for (const cur of shifted) {
       const prev = keys[keys.length - 1];
       if (prev && Math.abs(cur.t - prev.t) <= TIME_EPS) {
@@ -254,7 +288,18 @@ export function moveKeysInTime(
       }
       keys.push(cur);
     }
-    keys.forEach((k, ki) => { if (k._sel) { selected.push(`${ti}:${ki}`); delete k._sel; } });
+    const touched: number[] = [];
+    keys.forEach((k, ki) => {
+      if (k._sel) { selected.push(`${ti}:${ki}`); touched.push(ki); delete k._sel; }
+      else if (k._wasBeside) touched.push(ki);
+      delete k._wasBeside;
+    });
+    // A time shift restales every derived tangent it touches: an 'auto' key's slope is the
+    // secant through its neighbours, so both ends move — the keys the moved one landed
+    // between (reached by reapplyTangentsAround's own ±1) and the ones it left behind
+    // (`_wasBeside`). Without this the track keeps `tangentMode:'auto'` beside a tangent
+    // 'auto' no longer produces, and the runtime plays the stale number verbatim.
+    reapplyTangentsAround(keys as Keyframe[], touched);
     return { ...tr, keys: keys as Keyframe[] };
   });
   return { tracks, selected, delta };

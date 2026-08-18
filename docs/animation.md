@@ -145,7 +145,26 @@ range, weighted cubic-bezier Hermite between keys using each key's out/in tangen
 **STEPPED** (`+Infinity`) out-tangent holds the left value until the next key. `evalSegment` solves
 the time→parameter map with Newton + a real bisection fallback (bracketed, can't diverge to the
 wrong root) and clamps the tangent-weight *sum* to keep `x(u)` monotonic. `applyTangentMode`
-implements the right-click tangent menu (auto/linear/constant/free) and records the mode on the key.
+implements the right-click tangent menu and records the mode on the key.
+
+**A key's `tangentMode` decides who OWNS its tangents, and that is the load-bearing distinction:**
+
+| mode | tangents are | on a neighbour edit |
+|---|---|---|
+| `auto` | derived — the secant through the surrounding two keys | re-fitted |
+| `linear` | derived — secants to each neighbour | re-fitted |
+| `constant` | authored — `outTangent` is STEPPED | held |
+| `freeSmooth` | authored by hand, in/out **mirrored** | held |
+| `free` | authored by hand, in/out **independent** (`broken`) | held |
+
+`reapplyTangent` re-applies a key's OWN mode whenever a neighbour's `t`/`v` moves, so the derived
+modes stay correct as the curve is edited and the authored ones survive. **A hand-drag of a tangent
+handle therefore has to RECORD its mode**, or the shape is temporary: `deriveTangentFromHandle`
+writes `freeSmooth` for a unified drag and `free` for a broken one. It did not, so the key stayed
+`auto` and the next neighbour edit re-derived the hand-shaped curve away — and `free` alone could
+not fix it, because preserving the numbers by marking the key broken silently turns one smooth
+handle into two independent ones. `freeSmooth` is the authored-and-still-mirrored case (Unity's
+"Free Smooth" beside its "Broken").
 
 ### 3D skeletal (`SkinnedModel` + `SkeletalAnimator`)
 
@@ -274,6 +293,12 @@ swapped-away scene is dropped.
   stepped key would reload as linear. The persistent marker is `tangentMode:'constant'`;
   `normalizeAnimationClip` reconstructs `outTangent = STEPPED` from it on load. If you build a clip in
   code, set the mode, not just the raw tangent.
+- **Every edit that moves a key's `t` or `v` must re-derive the tangents AROUND it** — a derived
+  mode reads its slope off the NEIGHBOURS, so moving one key restales three. There are three such
+  writers (`applyValueNudge`, `moveKeysInTime`, `applyKeyPatch`) and they all call
+  `reapplyTangentsAround`; the runtime does NOT paper over a miss, because `normalizeAnimationClip`
+  trusts the stored number verbatim. A time move additionally restales the keys it LEFT BEHIND —
+  adjacency changes, not just spans — which is why `moveKeysInTime` tags them before it re-sorts.
 - **A missing/NaN tangent means *flat* (0), a genuine `+Infinity` means *hold*** — `normTangent`
   keeps the two distinct. Legacy/partial keys with an absent `outTangent` must read as 0, or
   `evalTrack` (which treats non-finite as STEPPED) and `evalSegment` (which reads 0) would disagree.

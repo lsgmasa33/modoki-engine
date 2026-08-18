@@ -353,8 +353,31 @@ export interface DragOpts {
   steps?: number;
   /** Mouse button (default 'left'). 'middle'/'right' = orbit-pan in 3D. */
   button?: MouseButton;
-  /** Held modifiers (Shift = gizmo snap, Alt = duplicate-drag, …). */
+  /** Held modifiers (Shift = gizmo snap, Alt = duplicate-drag, …). Set on every mouse
+   *  event of the gesture AND sent as real keyDown/keyUp around it — see `MODIFIER_KEYCODE`. */
   modifiers?: InputModifier[];
+}
+
+/** An `InputModifier` → the Electron `keyCode` for the physical modifier key.
+ *
+ *  A drag's `modifiers` used to set the bit on the MOUSE event only, which is invisible to a
+ *  `window` keydown/keyup listener — and that is how the editor tracks a modifier whose LEVEL
+ *  matters rather than its edge. `SceneView`'s 3D-gizmo snap is exactly that (`onSnapKey`, which
+ *  needs the keyup as much as the keydown), so no sequence of MCP calls could hold Shift for the
+ *  duration of a gizmo drag and the 3D half of snapping was untestable (bug XmytWgSlUzMPCNHtrhUw);
+ *  `modoki_press_key` could not close the gap either, because it completes keyDown→keyUp inside
+ *  one call. Sending the real key events around the gesture makes both consumers agree. */
+type CanonModifier = 'shift' | 'control' | 'alt' | 'meta';
+const CANON_MODIFIER: Record<InputModifier, CanonModifier> = {
+  shift: 'shift', control: 'control', alt: 'alt', meta: 'meta', cmd: 'meta', command: 'meta',
+};
+const MODIFIER_KEYCODE: Record<CanonModifier, string> = {
+  shift: 'Shift', control: 'Control', alt: 'Alt', meta: 'Meta',
+};
+
+/** `modifiers` as distinct canonical keys, stable order ('cmd'/'command'/'meta' collapse to one). */
+function canonModifiers(modifiers: InputModifier[] | undefined): CanonModifier[] {
+  return [...new Set((modifiers ?? []).map((m) => CANON_MODIFIER[m]).filter(Boolean))];
 }
 
 /** Trusted drag from → to with intermediate moves (gesture thresholds — match-3
@@ -377,8 +400,20 @@ export async function drag(
   // `pointerMove` (see `buttonHeldModifier`): without it Chromium reports `buttons:0`
   // on each move, so a listener gating on `e.buttons` sees the gesture as released.
   const heldModifiers = [...(modifiers ?? []), buttonHeldModifier(button)];
+  const modKeys = canonModifiers(modifiers);
+  // Keyboard events dispatch to the FOCUSED web contents (mouse events hit-test by coordinate),
+  // so an agent-driven window that isn't OS-focused would drop the modifier keyDown. Same reason
+  // `pressKey` focuses. Only when there IS a modifier — a plain drag must not touch focus.
+  if (modKeys.length) { wc.focus(); await sleep(16); }
   wc.sendInputEvent({ type: 'mouseMove', x: from.x, y: from.y, modifiers } as Electron.MouseInputEvent);
   wc.sendInputEvent({ type: 'mouseDown', x: from.x, y: from.y, button, clickCount: 1, modifiers } as Electron.MouseInputEvent);
+  // Press the modifier AFTER mouseDown: the press is what gives the panel keyboard scope, and
+  // SceneView's snap listener only arms while its own panel is focused. Released after mouseUp
+  // so the whole gesture — every intermediate move — happens with the key genuinely down.
+  modKeys.forEach((m, i) => {
+    // Each keyDown reports the modifiers held INCLUDING itself — what a real keyboard does.
+    wc.sendInputEvent({ type: 'keyDown', keyCode: MODIFIER_KEYCODE[m], modifiers: modKeys.slice(0, i + 1) } as Electron.KeyboardInputEvent);
+  });
   await sleep(16);
   for (let i = 1; i <= n; i++) {
     const t = i / n;
@@ -388,6 +423,12 @@ export async function drag(
     await sleep(16);
   }
   wc.sendInputEvent({ type: 'mouseUp', x: to.x, y: to.y, button, clickCount: 1, modifiers } as Electron.MouseInputEvent);
+  // Release in reverse, each keyUp reporting only the modifiers STILL held — so the last one
+  // reports `shiftKey:false`. A listener that reads the level off the event (onSnapKey does)
+  // would otherwise latch the modifier ON forever after an agent drag.
+  for (let i = modKeys.length - 1; i >= 0; i--) {
+    wc.sendInputEvent({ type: 'keyUp', keyCode: MODIFIER_KEYCODE[modKeys[i]], modifiers: modKeys.slice(0, i) } as Electron.KeyboardInputEvent);
+  }
 }
 
 export interface PointerOpts {

@@ -397,8 +397,8 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
         </div>
 
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 10 }}>
-          <button style={btn} onClick={onClose}>Cancel</button>
-          <button style={{ ...btn, background: '#2ecc71', border: '1px solid #27ae60', color: '#fff' }} onClick={save}>Save</button>
+          <button data-ui-id="nineSlice.cancel" style={btn} onClick={onClose}>Cancel</button>
+          <button data-ui-id="nineSlice.save" style={{ ...btn, background: '#2ecc71', border: '1px solid #27ae60', color: '#fff' }} onClick={save}>Save</button>
         </div>
       </div>
     </div>

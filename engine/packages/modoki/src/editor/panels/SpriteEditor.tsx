@@ -26,6 +26,8 @@ import {
 } from '../../runtime/loaders/assetManifest';
 import { markScene2DDirty } from '../../runtime/rendering/Scene2D';
 import { registerHandleProvider, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
+import { createCoalescedEdit, type CoalescedEdit } from './coalescedEdit';
+import { BufferedNumberInput } from './fields';
 
 type DragMode =
   | { kind: 'none' }
@@ -287,8 +289,10 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   // and alpha threshold, so undo rolls back parameter changes (Cols/Off X/…) too,
   // not just the slices they produced. Drag gestures (move/resize/create) record a
   // SINGLE entry per gesture (pre-gesture snapshot, pushed on mouseUp); discrete
-  // actions (grid/auto/delete/selected-field edit) push before mutating; grid/alpha
-  // param fields record one entry per editing session (focus → blur, if changed).
+  // actions (grid/auto/delete) push before mutating; per-keystroke fields (grid/alpha
+  // params, the Selected-sprite numbers) coalesce a run of keystrokes into ONE entry via
+  // `paramEditRef` — an idle timer plus a flush from anything else that touches history,
+  // never a focus event (#244).
   // `__preview__` is never part of a snapshot.
   const spritesRef = useRef(sprites);
   spritesRef.current = sprites;
@@ -299,7 +303,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   const pastRef = useRef<EditorSnap[]>([]);
   const futureRef = useRef<EditorSnap[]>([]);
   const gestureStartRef = useRef<EditorSnap | null>(null);
-  const paramStartRef = useRef<EditorSnap | null>(null);
+  const paramEditRef = useRef<CoalescedEdit | null>(null);
   const [, setHistVer] = useState(0);
   const cleanSprites = (arr: SpriteSlice[]): SpriteSlice[] =>
     arr.filter((s) => s.guid !== '__preview__').map((s) => ({ ...s, rect: { ...s.rect }, pivot: { ...s.pivot } }));
@@ -316,8 +320,26 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     futureRef.current = [];
     setHistVer((v) => v + 1);
   };
-  // Discrete action: snapshot the current state before mutating it.
-  const recordHistory = () => pushHistory(takeSnap());
+  // Per-keystroke fields (grid/alpha params, the Selected-sprite numbers) coalesce into ONE
+  // undo step — snapshotted lazily on the first `onChange`, committed on an idle timer or by
+  // any other history-touching action. NEVER on focus/blur: those events don't fire in an
+  // unfocused window and the step went missing entirely (#244 — see coalescedEdit.ts).
+  // Built ONCE (a ref, not per render) and therefore closing over the first render's
+  // `takeSnap`/`pushHistory` — which is safe precisely because both read through refs
+  // (`spritesRef`/`gridRef`/`alphaRef`/`pastRef`) and `setHistVer` is stable. Rebuilding it
+  // per render would instead throw away the open session on every keystroke.
+  if (!paramEditRef.current) {
+    paramEditRef.current = createCoalescedEdit<EditorSnap>({
+      take: () => takeSnap(), same: (a, b) => sameSnap(a, b), push: (before) => pushHistory(before),
+    });
+  }
+  const noteParamEdit = () => paramEditRef.current?.note();
+  const flushParamEdit = () => paramEditRef.current?.flush();
+  // A pending session must not outlive the modal — its timer would fire into an unmounted tree.
+  useEffect(() => () => paramEditRef.current?.cancel(), []);
+  // Discrete action: snapshot the current state before mutating it. Closes any open
+  // param session first, so the two land as separate undo steps in the order they happened.
+  const recordHistory = () => { flushParamEdit(); pushHistory(takeSnap()); };
   const applySnap = (s: EditorSnap) => {
     setSprites(s.sprites.map((x) => ({ ...x, rect: { ...x.rect }, pivot: { ...x.pivot } })));
     setGrid({ ...s.grid });
@@ -325,6 +347,9 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     setSelected((sel) => (s.sprites.some((x) => x.guid === sel) ? sel : null));
   };
   const undo = useCallback(() => {
+    // Commit a pending param session BEFORE popping — otherwise the edit the user is
+    // undoing was never pushed and this reverts whatever came before it instead (#244).
+    paramEditRef.current?.flush();
     if (!pastRef.current.length) return;
     const prev = pastRef.current.pop()!;
     futureRef.current.push(takeSnap());
@@ -333,6 +358,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const redo = useCallback(() => {
+    paramEditRef.current?.flush();
     if (!futureRef.current.length) return;
     const next = futureRef.current.pop()!;
     pastRef.current.push(takeSnap());
@@ -343,15 +369,8 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   const canUndo = pastRef.current.length > 0;
   const canRedo = futureRef.current.length > 0;
 
-  // Grid/alpha param fields: snapshot on focus, commit ONE undo step on blur if the
-  // value actually changed — so a field-editing session is a single undo, matching
-  // the way a drag gesture commits once.
-  const beginParamEdit = () => { paramStartRef.current = takeSnap(); };
-  const commitParamEdit = () => {
-    const start = paramStartRef.current;
-    paramStartRef.current = null;
-    if (start && !sameSnap(start, takeSnap())) pushHistory(start);
-  };
+  // Set one grid param, coalescing a run of keystrokes into a single undo step.
+  const setGridParam = (patch: Partial<GridOpts>) => { noteParamEdit(); setGrid((g) => ({ ...g, ...patch })); };
 
   // Keyboard: Cmd/Ctrl+Z = undo, +Shift (or Ctrl+Y) = redo. Intercept in the
   // capture phase and ALWAYS stopPropagation while the modal is open, so the
@@ -406,7 +425,9 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     }
     if (e.button !== 0) return; // only left button edits rects
     // Capture the pre-gesture snapshot so a move/resize/create commits ONE undo
-    // step on mouseUp (only if it actually changed anything).
+    // step on mouseUp (only if it actually changed anything). Close any open param
+    // session first so the gesture doesn't swallow it.
+    flushParamEdit();
     gestureStartRef.current = takeSnap();
     const rect = canvas.getBoundingClientRect();
     const px = e.clientX - rect.left, py = e.clientY - rect.top;
@@ -500,7 +521,9 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
 
   // ── Selected-sprite field edits ──
   const patchSelected = (patch: Partial<SpriteSlice> | { rect?: Partial<SpriteRect>; pivot?: Partial<SpriteSlice['pivot']> }) => {
-    recordHistory();
+    // These fields also commit per keystroke, so they coalesce too — an 8-character rename
+    // used to push 8 undo steps, and reverting it meant pressing ⌘Z eight times.
+    noteParamEdit();
     setSprites((prev) => prev.map((s) => {
       if (s.guid !== selected) return s;
       const p = patch as { name?: string; rect?: Partial<SpriteRect>; pivot?: Partial<SpriteSlice['pivot']> };
@@ -618,27 +641,27 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
                 </select>
               </Row>
               {grid.mode === 'count' ? (
-                <Row><Num label="Cols" v={grid.cols} on={(v) => setGrid({ ...grid, cols: v })} onFocus={beginParamEdit} onBlur={commitParamEdit} /><Num label="Rows" v={grid.rows} on={(v) => setGrid({ ...grid, rows: v })} onFocus={beginParamEdit} onBlur={commitParamEdit} /></Row>
+                <Row><Num label="Cols" v={grid.cols} on={(v) => setGridParam({ cols: v })} onBlur={flushParamEdit} /><Num label="Rows" v={grid.rows} on={(v) => setGridParam({ rows: v })} onBlur={flushParamEdit} /></Row>
               ) : (
-                <Row><Num label="Cell W" v={grid.cellW} on={(v) => setGrid({ ...grid, cellW: v })} onFocus={beginParamEdit} onBlur={commitParamEdit} /><Num label="Cell H" v={grid.cellH} on={(v) => setGrid({ ...grid, cellH: v })} onFocus={beginParamEdit} onBlur={commitParamEdit} /></Row>
+                <Row><Num label="Cell W" v={grid.cellW} on={(v) => setGridParam({ cellW: v })} onBlur={flushParamEdit} /><Num label="Cell H" v={grid.cellH} on={(v) => setGridParam({ cellH: v })} onBlur={flushParamEdit} /></Row>
               )}
-              <Row><Num label="Off X" v={grid.offsetX} on={(v) => setGrid({ ...grid, offsetX: v })} onFocus={beginParamEdit} onBlur={commitParamEdit} /><Num label="Off Y" v={grid.offsetY} on={(v) => setGrid({ ...grid, offsetY: v })} onFocus={beginParamEdit} onBlur={commitParamEdit} /></Row>
-              <Row><Num label="Pad X" v={grid.paddingX} on={(v) => setGrid({ ...grid, paddingX: v })} onFocus={beginParamEdit} onBlur={commitParamEdit} /><Num label="Pad Y" v={grid.paddingY} on={(v) => setGrid({ ...grid, paddingY: v })} onFocus={beginParamEdit} onBlur={commitParamEdit} /></Row>
+              <Row><Num label="Off X" v={grid.offsetX} on={(v) => setGridParam({ offsetX: v })} onBlur={flushParamEdit} /><Num label="Off Y" v={grid.offsetY} on={(v) => setGridParam({ offsetY: v })} onBlur={flushParamEdit} /></Row>
+              <Row><Num label="Pad X" v={grid.paddingX} on={(v) => setGridParam({ paddingX: v })} onBlur={flushParamEdit} /><Num label="Pad Y" v={grid.paddingY} on={(v) => setGridParam({ paddingY: v })} onBlur={flushParamEdit} /></Row>
               <button style={btn} onClick={applyGrid}>Slice Grid</button>
             </Section>
 
             <Section title="Auto (by alpha)">
-              <Row><Num label="Threshold" v={alphaThreshold} on={setAlphaThreshold} onFocus={beginParamEdit} onBlur={commitParamEdit} /></Row>
+              <Row><Num label="Threshold" v={alphaThreshold} on={(v) => { noteParamEdit(); setAlphaThreshold(v); }} onBlur={flushParamEdit} /></Row>
               <button style={btn} onClick={applyAutoAlpha}>Detect Sprites</button>
             </Section>
 
             <Section title="Selected">
               {selSlice ? (
                 <>
-                  <Row><input value={selSlice.name} onChange={(e) => patchSelected({ name: e.target.value })} style={{ ...inputStyle, flex: 1 }} placeholder="name" /></Row>
-                  <Row><Num label="X" v={selSlice.rect.x} on={(v) => patchSelected({ rect: { x: v } })} /><Num label="Y" v={selSlice.rect.y} on={(v) => patchSelected({ rect: { y: v } })} /></Row>
-                  <Row><Num label="W" v={selSlice.rect.w} on={(v) => patchSelected({ rect: { w: v } })} /><Num label="H" v={selSlice.rect.h} on={(v) => patchSelected({ rect: { h: v } })} /></Row>
-                  <Row><Num label="Pivot X" v={selSlice.pivot.x} step={0.1} on={(v) => patchSelected({ pivot: { x: v } })} /><Num label="Pivot Y" v={selSlice.pivot.y} step={0.1} on={(v) => patchSelected({ pivot: { y: v } })} /></Row>
+                  <Row><input value={selSlice.name} onChange={(e) => patchSelected({ name: e.target.value })} onBlur={flushParamEdit} style={{ ...inputStyle, flex: 1 }} placeholder="name" /></Row>
+                  <Row><Num label="X" v={selSlice.rect.x} on={(v) => patchSelected({ rect: { x: v } })} onBlur={flushParamEdit} /><Num label="Y" v={selSlice.rect.y} on={(v) => patchSelected({ rect: { y: v } })} onBlur={flushParamEdit} /></Row>
+                  <Row><Num label="W" v={selSlice.rect.w} on={(v) => patchSelected({ rect: { w: v } })} onBlur={flushParamEdit} /><Num label="H" v={selSlice.rect.h} on={(v) => patchSelected({ rect: { h: v } })} onBlur={flushParamEdit} /></Row>
+                  <Row><Num label="Pivot X" v={selSlice.pivot.x} step={0.1} on={(v) => patchSelected({ pivot: { x: v } })} onBlur={flushParamEdit} /><Num label="Pivot Y" v={selSlice.pivot.y} step={0.1} on={(v) => patchSelected({ pivot: { y: v } })} onBlur={flushParamEdit} /></Row>
                   <button style={{ ...btn, background: '#7a2727', border: '1px solid #913030' }} onClick={deleteSelected}>Delete Sprite</button>
                 </>
               ) : <div style={{ color: '#666', fontSize: 11 }}>Drag on the image to draw a sprite, or slice a grid.</div>}
@@ -660,8 +683,8 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
         </div>
 
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 10 }}>
-          <button style={btn} onClick={onClose}>Cancel</button>
-          <button style={{ ...btn, background: '#2ecc71', border: '1px solid #27ae60', color: '#fff' }} onClick={save}>Save</button>
+          <button data-ui-id="spriteEditor.cancel" style={btn} onClick={onClose}>Cancel</button>
+          <button data-ui-id="spriteEditor.save" style={{ ...btn, background: '#2ecc71', border: '1px solid #27ae60', color: '#fff' }} onClick={save}>Save</button>
         </div>
       </div>
     </div>
@@ -777,11 +800,20 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 function Row({ children }: { children: React.ReactNode }) {
   return <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>{children}</div>;
 }
-function Num({ label, v, on, step, onFocus, onBlur }: { label: string; v: number; on: (v: number) => void; step?: number; onFocus?: () => void; onBlur?: () => void }) {
+/** A labelled number field. Delegates to the Inspector's `BufferedNumberInput` rather than
+ *  carrying its own `<input type="number">`: a number input reports `value === ''` for an
+ *  incomplete entry like a lone `-` or a trailing `.`, so the commit-per-keystroke wiring
+ *  wiped the sign before a digit could follow and a negative offset / fractional pivot was
+ *  not typeable at all. The shared field also carries the #242 echo guard and wheel-stepping.
+ *
+ *  `onBlur` sits on the LABEL, not the input: React's onBlur is `focusout`, which bubbles,
+ *  and BufferedNumberInput owns the input's own focus handlers. It is an EXTRA commit signal
+ *  for the click-away path — never the only one, which is what #244 was. */
+function Num({ label, v, on, step, onBlur }: { label: string; v: number; on: (v: number) => void; step?: number; onBlur?: () => void }) {
   return (
-    <label style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 2 }}>
+    <label style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 2 }} onBlur={onBlur}>
       <span style={{ color: '#888', fontSize: 10 }}>{label}</span>
-      <input type="number" value={v} step={step ?? 1} onFocus={onFocus} onBlur={onBlur} onChange={(e) => on(e.target.value === '' ? 0 : Number(e.target.value))} style={inputStyle} />
+      <BufferedNumberInput value={v} onChange={on} step={step ?? 1} style={inputStyle} />
     </label>
   );
 }

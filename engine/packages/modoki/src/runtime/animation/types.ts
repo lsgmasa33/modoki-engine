@@ -20,7 +20,17 @@ export type TrackValueType = 'number' | 'color' | 'boolean' | 'enum';
  *  neighbor-recompute can preserve a user's choice instead of forcing 'auto'.
  *  Mirrors Unity's tangent menu. (Defined here, not curveEval, so Keyframe can
  *  reference it without a circular import; curveEval re-exports it.) */
-export type TangentMode = 'auto' | 'linear' | 'constant' | 'free';
+/** How a key's tangents are PRODUCED, which decides what a neighbour edit is allowed to
+ *  recompute. `auto`/`linear` are DERIVED — re-fitted from the neighbours whenever one moves.
+ *  `constant`/`free`/`freeSmooth` are AUTHORED — the stored numbers are the answer.
+ *
+ *  `free` vs `freeSmooth` is the broken/unified split, and it is the reason `freeSmooth`
+ *  exists: dragging a tangent handle used to leave the key labelled `auto`, so the next
+ *  neighbour edit recomputed the hand-shaped curve away. Recording `free` instead would keep
+ *  the shape but ALSO break the handles apart, silently turning a single smooth drag into two
+ *  independent ones. `freeSmooth` is the authored-and-still-mirrored case (Unity's "Free
+ *  Smooth" beside its "Broken"). */
+export type TangentMode = 'auto' | 'linear' | 'constant' | 'free' | 'freeSmooth';
 
 /** A `stepped` (constant) segment is encoded by an outgoing tangent of Infinity
  *  on the left key — matching Unity's "Constant" tangent mode. */

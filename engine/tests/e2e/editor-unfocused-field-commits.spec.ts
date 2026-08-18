@@ -1,0 +1,201 @@
+/** E2E — the editor's commit-on-every-keystroke fields, driven the way an UNFOCUSED
+ *  window delivers them: real `input` events through React, and NO focus/blur.
+ *
+ *  Both bugs covered here were invisible to every other tier. `npm test` cannot see them
+ *  (they live in a real browser's event delivery), and an ordinary Playwright spec cannot
+ *  either — a click-and-type in a FOCUSED window fires `focus`/`blur`, which is exactly the
+ *  crutch the broken code leaned on. So `typeUnfocused` below reproduces the one thing that
+ *  actually differs in an unfocused window: Chromium dispatches `focus`/`blur` only while
+ *  `document.hasFocus()`, so a field gets its `onChange` and nothing else. (Headless Chromium
+ *  reports `hasFocus() === true` and a second page does not change that — measured — so the
+ *  state has to be produced through the events, not through window management.)
+ *
+ *  - **#244** — SpriteEditor's slicer params took their undo snapshot in `onFocus` and pushed
+ *    it in `onBlur`, so with no focus events NOTHING reached the modal's history: the edit
+ *    applied and ⌘Z silently reverted whatever came before it instead.
+ *  - **#242** — ParticleEditor's `NumInput` re-synced its buffer from the store whenever it
+ *    was not `focusedRef`-flagged, so the field's OWN commit echoed back and rewrote the text
+ *    mid-edit; the remaining keystrokes landed on the echo and a clamped field committed a
+ *    value the user never typed. That fix shipped with no automated guard (verified live
+ *    only) — this is it.
+ *
+ *  `qa/knowledge.md` §5 / `docs/editor-input.md` § "Never make a commit depend on a focus
+ *  EVENT" is the class both belong to.
+ */
+
+import { test, expect, type Page } from '@playwright/test';
+import fs from 'fs';
+import path from 'path';
+import zlib from 'zlib';
+import { gotoEmptyEditor } from './helpers';
+import { discoverProjects } from '../../scripts/projectRoots.mjs';
+
+// Host the generated fixtures inside a real project's asset root so the dev server serves
+// them. games/ is PREFERRED over demos/ for the same reason as editor-particles.spec.ts: a
+// crash between beforeAll and afterAll must not strand a fixture inside the published set.
+const HOST = (() => {
+  const projects = discoverProjects(process.cwd()) as { root: string; name: string; dir: string }[];
+  const host = projects.find((p) => p.root === 'games') ?? projects[0];
+  if (!host) throw new Error('editor-unfocused-field-commits: no project found to host the fixtures');
+  return host;
+})();
+const ABS_DIR = path.join(HOST.dir, 'runtime/assets/__e2e_fields__');
+const URL_DIR = `/${HOST.root}/${HOST.name}/assets/__e2e_fields__`;
+const SHEET_URL = `${URL_DIR}/sheet.png`;
+const PARTICLE_URL = `${URL_DIR}/e2e-fields.particle.json`;
+
+/** A minimal opaque RGBA PNG — the Sprite Editor needs a decodable image, not a real sheet. */
+function png(w: number, h: number): Buffer {
+  const raw = Buffer.alloc((w * 4 + 1) * h);
+  for (let y = 0; y < h; y++) {
+    const off = y * (w * 4 + 1);
+    for (let x = 0; x < w; x++) raw.set([200, 60, 60, 255], off + 1 + x * 4);
+  }
+  const chunk = (type: string, data: Buffer) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const td = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(zlib.crc32(td) >>> 0);
+    return Buffer.concat([len, td, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4);
+  ihdr[8] = 8; ihdr[9] = 6; // 8-bit RGBA
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+// `startOpacity` is the shape #242 was measured on: a CLAMPED field (min 0, max 1), which is
+// what supplies the echo — an in-progress `-3` clamps to 0, moves the store, and the store
+// answers back. 0.4 so the pre-edit value is distinguishable from every value in play.
+const PARTICLE_JSON = {
+  version: 1, name: 'E2E Fields', duration: 1, looping: true, maxParticles: 10, worldSpace: false,
+  emission: { rateOverTime: 5 },
+  shape: { type: 'cone', angle: 10, radius: 0.1 },
+  startLifetime: { min: 1, max: 1 }, startSpeed: { min: 1, max: 1 }, startSize: { min: 0.1, max: 0.1 },
+  startColor: { r: 1, g: 1, b: 1 }, startOpacity: 0.4, gravity: 0,
+  render: { blend: 'normal', mode: 'mesh', meshPrimitive: 'box', meshLit: false },
+  id: '2b0f9d41-4a2e-4f3a-9c66-0b1d5f7a1e02',
+};
+
+test.beforeAll(() => {
+  fs.rmSync(ABS_DIR, { recursive: true, force: true });
+  fs.mkdirSync(ABS_DIR, { recursive: true });
+  fs.writeFileSync(path.join(ABS_DIR, 'sheet.png'), png(64, 64));
+  fs.writeFileSync(path.join(ABS_DIR, 'e2e-fields.particle.json'), JSON.stringify(PARTICLE_JSON, null, 2));
+});
+test.afterAll(() => { fs.rmSync(ABS_DIR, { recursive: true, force: true }); });
+
+/** Tag the `<input>` whose label reads exactly `label` with `data-e2e-f="<label>"`.
+ *  Matches the label's FIRST TEXT NODE, so a trailing hint marker (ParticleEditor's ⓘ) and a
+ *  longer label that merely starts the same way can't be mistaken for it. */
+async function tagField(page: Page, label: string) {
+  const found = await page.evaluate((l) => {
+    const span = [...document.querySelectorAll('span')].find((s) =>
+      s.firstChild?.nodeType === Node.TEXT_NODE && s.firstChild.nodeValue === l && s.parentElement?.querySelector('input'));
+    const input = span?.parentElement?.querySelector('input');
+    if (!input) return false;
+    input.setAttribute('data-e2e-f', l);
+    return true;
+  }, label);
+  expect(found, `field labelled "${label}" not found`).toBe(true);
+}
+
+const fieldText = (page: Page, label: string) =>
+  page.evaluate((l) => (document.querySelector(`[data-e2e-f="${l}"]`) as HTMLInputElement | null)?.value ?? null, label);
+
+/** Type into a tagged field the way an UNFOCUSED window delivers it — one `input` event per
+ *  character, through React's own value setter, with no `focus`/`blur` ever dispatched.
+ *
+ *  Each character is APPENDED to whatever the field currently shows, re-read from the DOM every
+ *  time. That is the load-bearing detail: if the field's own commit echoes back and rewrites the
+ *  buffer mid-edit (#242), the next character lands on the rewritten text — exactly as it does
+ *  for a human typing into an unfocused window, and not at all if the test pushed whole strings. */
+async function typeUnfocused(page: Page, label: string, text: string, { clear = true } = {}) {
+  const send = async (next: string | null) => {
+    await page.evaluate(({ l, n }) => {
+      const el = document.querySelector(`[data-e2e-f="${l}"]`) as HTMLInputElement;
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+      setter.call(el, n === null ? el.value : n);   // React tracks the node's value; go through its setter
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    }, { l: label, n: next });
+    // Let React flush + the store round-trip land before reading the field for the next char.
+    await page.evaluate(() => new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r()))));
+  };
+  if (clear) await send('');
+  for (const ch of text) {
+    const cur = await fieldText(page, label);
+    await send((cur ?? '') + ch);
+  }
+}
+
+const undoKey = 'ControlOrMeta+z';
+
+test.describe('Sprite Editor — slicer params are undoable with no focus events (#244)', () => {
+  test('⌘Z reverts the param the user just typed, not the step before it', async ({ page }) => {
+    await gotoEmptyEditor(page);
+    await page.evaluate((u) => (window as any).__modokiEditorTest.store.getState().requestTextureEditor(u, 'sprite'), SHEET_URL);
+    await page.waitForSelector('text=Sprite Editor —', { timeout: 15_000 });
+    await tagField(page, 'Off X');
+    await tagField(page, 'Cols');
+    expect(await fieldText(page, 'Cols')).toBe('4');
+    expect(await fieldText(page, 'Off X')).toBe('0');
+
+    // Step 1: an earlier edit, left idle long enough to commit as its own undo step.
+    await typeUnfocused(page, 'Off X', '5');
+    await page.waitForTimeout(900);
+    expect(await fieldText(page, 'Off X')).toBe('5');
+
+    // Step 2: the edit under test, undone WITHOUT ever leaving the field.
+    await typeUnfocused(page, 'Cols', '8');
+    expect(await fieldText(page, 'Cols')).toBe('8');
+    await page.keyboard.press(undoKey);
+
+    // Before the fix this asserted the bug: Cols stayed 8 (its edit was never pushed) and
+    // Off X fell back to 0 (the step that WAS pushed is the one that got undone).
+    await expect.poll(() => fieldText(page, 'Cols')).toBe('4');
+    expect(await fieldText(page, 'Off X')).toBe('5');
+
+    // …and the two are separate steps, in the order they happened.
+    await page.keyboard.press(undoKey);
+    await expect.poll(() => fieldText(page, 'Off X')).toBe('0');
+    expect(await fieldText(page, 'Cols')).toBe('4');
+  });
+
+  test('a run of keystrokes in one field is ONE undo step, not one per keystroke', async ({ page }) => {
+    await gotoEmptyEditor(page);
+    await page.evaluate((u) => (window as any).__modokiEditorTest.store.getState().requestTextureEditor(u, 'sprite'), SHEET_URL);
+    await page.waitForSelector('text=Sprite Editor —', { timeout: 15_000 });
+    await tagField(page, 'Pad X');
+
+    await typeUnfocused(page, 'Pad X', '123');
+    expect(await fieldText(page, 'Pad X')).toBe('123');
+    await page.keyboard.press(undoKey);
+    // One step back to the pre-typing value — not to '12', which is what a per-keystroke
+    // history would give (and what the Selected-sprite fields used to do).
+    await expect.poll(() => fieldText(page, 'Pad X')).toBe('0');
+  });
+});
+
+test.describe('Particle Editor — a clamped number field survives typing with no focus events (#242)', () => {
+  test('typing -3.5 into a clamped field commits the clamp, not an echo of its own commit', async ({ page }) => {
+    await gotoEmptyEditor(page);
+    await page.evaluate((u) => (window as any).__modokiEditorTest.store.getState()
+      .openParticleEditor({ path: u, type: 'particle', name: 'e2e-fields' }), PARTICLE_URL);
+    await expect.poll(async () => {
+      await tagField(page, 'Opacity').catch(() => {});
+      return fieldText(page, 'Opacity');
+    }, { timeout: 15_000, intervals: [200, 400, 800] }).toBe('0.4');
+
+    await typeUnfocused(page, 'Opacity', '-3.5');
+
+    // The buffer holds what was typed — pre-fix, the echo of the field's own clamped commit
+    // rewrote it mid-entry and the remaining characters landed on a '0'.
+    expect(await fieldText(page, 'Opacity')).toBe('-3.5');
+    // And the STORE holds the clamp of what was typed. Read the def, never the field: the
+    // display legitimately shows an out-of-range value until something reconciles it.
+    const stored = await page.evaluate(() => (window as any).__modokiEditorTest.store.getState().editingParticleDef?.startOpacity);
+    expect(stored).toBe(0);
+  });
+});

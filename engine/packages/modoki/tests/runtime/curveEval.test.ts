@@ -188,6 +188,24 @@ describe('curveEval.applyTangentMode', () => {
     expect(keys[1].outTangent).toBeCloseTo(0);
     expect(keys[1].broken).toBe(false);
   });
+
+  // The authored-and-still-mirrored mode. `free` preserves hand-set tangents too, but by
+  // breaking the handles apart — which silently changes what a unified drag meant.
+  it('freeSmooth keeps the authored tangents AND keeps the handles unified', () => {
+    const keys = [k(0, 0), { ...k(1, 10), inTangent: 7, outTangent: 7, broken: true }, k(2, 0)];
+    applyTangentMode(keys, 1, 'freeSmooth');
+    expect(keys[1].inTangent).toBe(7);   // untouched — the numbers ARE the answer
+    expect(keys[1].outTangent).toBe(7);
+    expect(keys[1].broken).toBe(false);  // …and mirrored, unlike 'free'
+    expect(keys[1].tangentMode).toBe('freeSmooth');
+  });
+
+  it("free keeps the same tangents but breaks the handles apart — the pair's whole distinction", () => {
+    const keys = [k(0, 0), { ...k(1, 10), inTangent: 7, outTangent: 7 }, k(2, 0)];
+    applyTangentMode(keys, 1, 'free');
+    expect(keys[1].inTangent).toBe(7);
+    expect(keys[1].broken).toBe(true);
+  });
 });
 
 describe('normalizeAnimationClip — tangent defaulting (F8)', () => {

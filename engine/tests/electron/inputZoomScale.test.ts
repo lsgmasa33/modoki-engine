@@ -15,6 +15,10 @@ function fakeWindow(zoomFactor: number) {
   const events: Array<{ type: string; x?: number; y?: number; deltaY?: number }> = [];
   const win = { webContents: {
     getZoomFactor: () => zoomFactor,
+    // drag() focuses the web contents before pressing a modifier key (keyboard events go to
+    // the FOCUSED contents). This fake never passes modifiers, so it is never called — but a
+    // fake missing it turns "someone added a modifier to this test" into a confusing throw.
+    focus: () => {},
     sendInputEvent: (e: { type: string; x?: number; y?: number; deltaY?: number }) => { events.push(e); },
   } };
   return { win: win as unknown as BrowserWindow, events };

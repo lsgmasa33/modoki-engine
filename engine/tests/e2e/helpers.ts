@@ -3,11 +3,30 @@ import { type Page, expect } from '@playwright/test';
 export const SCENE = '/tests/e2e/fixtures/e2e-smoke.scene.json';
 export const SCENE_2D = '/tests/e2e/fixtures/e2e-2d.scene.json';
 
+/** Swallow the editor's layout AUTOSAVE (`POST /api/layout`) so a spec cannot persist a
+ *  dock-layout change into this clone's `.modoki/layouts/autosave.layout.json`.
+ *
+ *  That file is gitignored and is read back on EVERY editor boot, including a fresh Playwright
+ *  context — so a layout written by one spec is inherited by every later run AND by the human's
+ *  next editor launch. It is not covered by "e2e leaves the working tree unchanged": `git diff`
+ *  cannot see an ignored file. Measured 2026-08-19: a spec that opened the Particle Editor panel
+ *  left a `particle-editor` tab SELECTED over the Scene tab, so `[data-scene-viewport] canvas`
+ *  never mounted again and the whole suite timed out at boot — at HEAD, with no source change,
+ *  which reads exactly like a real regression. Blocked in the goto helpers so a spec cannot
+ *  forget; `page.unroute('**\/api/layout')` if you are actually testing layout persistence. */
+async function blockLayoutAutosave(page: Page) {
+  await page.route('**/api/layout', (route) =>
+    (route.request().method() === 'POST'
+      ? route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true,"e2e":"layout write suppressed"}' })
+      : route.continue()));
+}
+
 /** Navigate to the editor with a fixture scene loaded and the WebGL2 path forced.
  *  Waits until the scene has populated (optionally until a named entity exists). */
 export async function gotoEditorWithScene(page: Page, scene = SCENE, waitForEntity?: string) {
   // Force WebGL2 (detection does requestAdapter/Device → "no WebGPU" → WebGL2/SwiftShader).
   await page.addInitScript(() => { try { delete (navigator as any).gpu; } catch { /* ignore */ } });
+  await blockLayoutAutosave(page);
   await page.goto('/#/editor');
   await page.waitForSelector('[data-scene-viewport] canvas', { timeout: 30_000 });
   // Load the fixture through the bridge rather than seeding localStorage: the editor
@@ -26,6 +45,7 @@ export async function gotoEditorWithScene(page: Page, scene = SCENE, waitForEnti
  *  the viewport canvas is up and the dev test bridge is installed. */
 export async function gotoEmptyEditor(page: Page) {
   await page.addInitScript(() => { try { delete (navigator as any).gpu; } catch { /* ignore */ } });
+  await blockLayoutAutosave(page);
   await page.goto('/#/editor');
   await page.waitForSelector('[data-scene-viewport] canvas', { timeout: 30_000 });
   await page.waitForFunction(() => !!(window as any).__modokiEditorTest, null, { timeout: 30_000 });

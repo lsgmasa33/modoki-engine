@@ -215,6 +215,12 @@ export function applyTangentMode(keys: Keyframe[], i: number, mode: TangentMode)
       k.broken = false;
       break;
     }
+    case 'freeSmooth':
+      // Hand-authored AND unified: keep the tangents exactly as dragged, and keep the two
+      // handles mirrored. The whole point of the mode — `free` would preserve the numbers
+      // too, but by breaking the handles apart, which is not what a unified drag asked for.
+      k.broken = false;
+      break;
     case 'free':
     default:
       // Leave tangents as-is; just mark broken so in/out move independently.

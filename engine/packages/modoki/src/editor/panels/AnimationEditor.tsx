@@ -34,7 +34,7 @@ import {
   trackKey, groupSelection, selRefsFromIds, resolveKeySelection, nextKeyTime,
   remapSelectionAfterRemoval, reorderPermutation, remapSelectionAfterReorder, remapSelectionAfterDelete,
 } from '../animation/recording';
-import { extractKeyBlock, planPaste, applyBreakUnify, applyValueNudge, planAddedTracks, type KeyClipboard } from '../animation/clipEdits';
+import { extractKeyBlock, planPaste, applyBreakUnify, applyValueNudge, applyKeyPatch, planAddedTracks, type KeyClipboard } from '../animation/clipEdits';
 import { shouldCoalesce } from '../animation/undoCoalesce';
 import { getAnimEntityIndex, resolvePathToEntityId } from '../animation/entityIndex';
 import { applyTangentMode, evalTrackValue, type TangentMode } from '../../runtime/animation/curveEval';
@@ -48,7 +48,7 @@ import AddPropertyPicker, { type PropertyCandidate } from './animation/AddProper
 import BindAnimatorPicker from './animation/BindAnimatorPicker';
 import { bindClipToEntity } from '../animation/bindAnimator';
 import { resolveAnimatorRootForClip } from './openAssetInEditor';
-import { clampKeyTime, frameToTime, snapToFrame, timeToFrame, DEFAULT_VIEWPORT, type Viewport } from './animation/timelineMath';
+import { frameToTime, snapToFrame, timeToFrame, DEFAULT_VIEWPORT, type Viewport } from './animation/timelineMath';
 import { saveAssetDialog } from '../utils/saveDialog';
 import { enterScrubMode, enterPreviewMode, exitPreviewMode, getModeOwner } from '../scene/playMode';
 import {
@@ -590,18 +590,14 @@ export default function AnimationEditor() {
   }, [setSel]);
   // Curves view: merge a patch into one key (time clamped between neighbors so the
   // dragged index stays stable — no resort mid-drag).
-  const editKey = useCallback((ti: number, ki: number, patch: Partial<Keyframe>) => mutateTrack(ti, (tr) => {
-    const keys = tr.keys.map((kk, i) => {
-      if (i !== ki) return kk;
-      const merged = { ...kk, ...patch };
-      // Clamp to the clip duration too (default max is +Infinity), so the numeric
-      // frame field can't push the last key past the end where it's unreachable in
-      // preview — consistent with the Curves key drag. (A4)
-      if (patch.t !== undefined) merged.t = clampKeyTime(tr.keys, ki, merged.t, useEditorStore.getState().editingAnimationClip?.duration ?? Number.POSITIVE_INFINITY);
-      return merged;
-    });
-    return { ...tr, keys };
-  }, `editkey:${ti}:${ki}`), [mutateTrack]);
+  // Clamped to the clip duration too (default max is +Infinity), so the numeric frame field
+  // can't push the last key past the end where it's unreachable in preview — consistent with
+  // the Curves key drag. (A4) The merge, the clamp and the tangent re-derive live in
+  // `applyKeyPatch` so they are unit-testable; this keeps only the store read.
+  const editKey = useCallback((ti: number, ki: number, patch: Partial<Keyframe>) => mutateTrack(ti, (tr) => ({
+    ...tr,
+    keys: applyKeyPatch(tr.keys, ki, patch, useEditorStore.getState().editingAnimationClip?.duration ?? Number.POSITIVE_INFINITY),
+  }), `editkey:${ti}:${ki}`), [mutateTrack]);
   const setTangentMode = useCallback((ti: number, ki: number, mode: TangentMode) => mutateTrack(ti, (tr) => {
     const keys = tr.keys.map((k) => ({ ...k }));
     applyTangentMode(keys, ki, mode);

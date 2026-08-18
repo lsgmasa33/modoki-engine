@@ -293,6 +293,13 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
         // Addressable so a selection made OUTSIDE the panel (viewport click, undo, an
         // agent's set-selection) can scroll this row into view — see revealSelected.
         data-entity-row={entity.id}
+        // …and addressable by GUID for agent input. `data-entity-row` cannot serve: it is a
+        // RUNTIME id, reassigned on every scene hot-reload (which a mutate itself triggers), so
+        // a selector built from one aims at whatever now holds that number. The guid is the only
+        // address that survives, which is why every other MCP entity aim insists on it.
+        // Omitted rather than emitted empty for a guid-less entity, so a selector can never
+        // match "all the rows without a guid".
+        {...(entity.guid ? { 'data-ui-id': `hierarchy.entity.${entity.guid}` } : {})}
         onClick={(e) => onSelect(entity.id, e)}
         onDoubleClick={(e) => { if (hasChildren) onToggle(entity.id, e.altKey); }}
         onContextMenu={(e) => onContextMenu(e, entity)}

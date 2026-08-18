@@ -168,6 +168,45 @@ describe('moveKeysInTime', () => {
     expect(r.selected).toEqual(['0:2']); // the moved key is now at index 2, not 1
   });
 
+  it("re-derives the moved key's 'auto' tangent and its new neighbors' after a time shift", () => {
+    // Bake through upsertKey so every key starts with a correct 'auto' tangent, then move
+    // the middle key: its own span changes, and so do both of its neighbors'.
+    let keys: Keyframe[] = [];
+    for (const [t, v] of [[0, 0], [0.1, 1], [0.2, 4]] as const) keys = upsertKey(keys, t, v);
+    const before = keys.map((x) => x.outTangent);
+    const r = moveKeysInTime(
+      [{ path: '', trait: 'Transform', field: 'x', type: 'number', keys }],
+      [{ ti: 0, t0: 0.1 }], 0.1, 0.15, FR, DUR,
+    );
+    const out = r.tracks[0].keys;
+    expect(out.map((x) => +x.t.toFixed(4))).toEqual([0, 0.15, 0.2]);
+    expect(out[0].outTangent).toBeCloseTo((out[1].v - out[0].v) / (out[1].t - out[0].t), 9);
+    expect(out[1].outTangent).toBeCloseTo((out[2].v - out[0].v) / (out[2].t - out[0].t), 9);
+    expect(out[2].outTangent).toBeCloseTo((out[2].v - out[1].v) / (out[2].t - out[1].t), 9);
+    expect(out[0].outTangent).not.toBeCloseTo(before[0], 6); // the stale value is gone
+    expect(out[2].outTangent).not.toBeCloseTo(before[2], 6);
+  });
+
+  it("re-derives the neighbours the moved key LEFT BEHIND, not just its new ones", () => {
+    // A-B-C-D, all 'auto'. Drag B past C: the new order is A,C,B,D. C/B/D are reachable from
+    // B's new index, but A is not — and A's own slope is the secant to its NEXT key, which
+    // just changed from B to C. Covering only the new side leaves A stale.
+    let keys: Keyframe[] = [];
+    for (const [t, v] of [[0, 0], [0.1, 1], [0.2, 4], [0.3, 9]] as const) keys = upsertKey(keys, t, v);
+    const staleA = keys[0].outTangent;                         // (1-0)/(0.1-0) = 10
+    const r = moveKeysInTime(
+      [{ path: '', trait: 'Transform', field: 'x', type: 'number', keys }],
+      [{ ti: 0, t0: 0.1 }], 0.1, 0.25, FR, DUR,
+    );
+    const out = r.tracks[0].keys;
+    expect(out.map((x) => +x.t.toFixed(4))).toEqual([0, 0.2, 0.25, 0.3]); // A, C, B, D
+    expect(staleA).toBeCloseTo(10, 9);
+    // A is index 0, so 'auto' reads prev??self → its slope is the secant to its NEXT key,
+    // now C: (4-0)/(0.2-0) = 20.
+    expect(out[0].outTangent).toBeCloseTo(20, 9);
+    expect(out[0].outTangent).not.toBeCloseTo(staleA, 6);
+  });
+
   it('moves keys across multiple tracks by the same delta', () => {
     const t2: AnimationTrack[] = [
       ...tracks(),

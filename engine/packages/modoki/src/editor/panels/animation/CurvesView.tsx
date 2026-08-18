@@ -289,6 +289,7 @@ function CurvesView({
     { label: 'Auto (smooth)', onClick: () => onSetTangentMode(menu.ti, menu.ki, 'auto') },
     { label: 'Linear', onClick: () => onSetTangentMode(menu.ti, menu.ki, 'linear') },
     { label: 'Constant (stepped)', onClick: () => onSetTangentMode(menu.ti, menu.ki, 'constant') },
+    { label: 'Free Smooth (hand-set, mirrored)', onClick: () => onSetTangentMode(menu.ti, menu.ki, 'freeSmooth') },
     { label: 'Free (broken)', onClick: () => onSetTangentMode(menu.ti, menu.ki, 'free') },
     { label: '—', separator: true },
     { label: 'Delete key', danger: true, onClick: () => onDeleteKey(menu.ti, menu.ki) },

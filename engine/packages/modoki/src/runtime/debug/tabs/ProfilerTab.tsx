@@ -96,8 +96,8 @@ export function ProfilerTab() {
         <div style={headingStyle}>
           Markers
           <span style={{ float: 'right', display: 'flex', gap: 4 }}>
-            <button style={tabBtn(view === 'self')} onClick={() => setView('self')}>Self</button>
-            <button style={tabBtn(view === 'tree')} onClick={() => setView('tree')}>Tree</button>
+            <button data-ui-id="profiler.markers.self" style={tabBtn(view === 'self')} onClick={() => setView('self')}>Self</button>
+            <button data-ui-id="profiler.markers.tree" style={tabBtn(view === 'tree')} onClick={() => setView('tree')}>Tree</button>
           </span>
         </div>
 
@@ -150,7 +150,7 @@ function GpuSection() {
       <div style={headingStyle}>
         GPU
         <span style={{ float: 'right', display: 'flex', gap: 4 }}>
-          <button style={tabBtn(on)} onClick={() => setGpuTimingEnabled(!on)}>
+          <button data-ui-id="profiler.gpu.toggle" style={tabBtn(on)} onClick={() => setGpuTimingEnabled(!on)}>
             {on ? '■ Stop' : '● Measure'}
           </button>
         </span>
@@ -266,19 +266,20 @@ function CaptureSection() {
       <div style={headingStyle}>Capture</div>
       <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
         {cap.capturing ? (
-          <button style={tabBtn(true)} onClick={() => stopCapture()}>■ Stop ({cap.frames.length})</button>
+          <button data-ui-id="profiler.capture.stop" style={tabBtn(true)} onClick={() => stopCapture()}>■ Stop ({cap.frames.length})</button>
         ) : (
-          <button style={tabBtn(false)} onClick={() => { startCapture(); setFrameIdx(0); }}>● Record</button>
+          <button data-ui-id="profiler.capture.record" style={tabBtn(false)} onClick={() => { startCapture(); setFrameIdx(0); }}>● Record</button>
         )}
         {has && !cap.capturing && (
           <>
-            <button style={tabBtn(false)} onClick={() => { clearCapture(); setFrameIdx(0); }}>Clear</button>
+            <button data-ui-id="profiler.capture.clear" style={tabBtn(false)} onClick={() => { clearCapture(); setFrameIdx(0); }}>Clear</button>
             {worst && (
-              <button style={tabBtn(false)} onClick={() => setFrameIdx(worst.index)}>
+              <button data-ui-id="profiler.capture.jumpWorst" style={tabBtn(false)} onClick={() => setFrameIdx(worst.index)}>
                 Jump to worst ({ms(worst.frameMs)})
               </button>
             )}
             <button
+              data-ui-id="profiler.capture.export"
               style={tabBtn(false)}
               onClick={() => {
                 // Plain JSON — diffable, attachable to an issue, and readable by an agent.
