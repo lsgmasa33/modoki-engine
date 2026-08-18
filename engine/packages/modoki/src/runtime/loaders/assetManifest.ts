@@ -243,7 +243,7 @@ export function registerAsset(
   path: string,
   type: AssetType,
   texture?: TextureImportSettings,
-  modelBlocks?: { model?: ModelImportSettings; modelCache?: ModelCacheInfo; postprocessor?: string; sprite?: SpriteAssetRef; atlas?: AtlasCacheBlock; audio?: AudioManifestBlock; video?: VideoManifestBlock; font?: FontManifestBlock; environment?: EnvManifestBlock },
+  modelBlocks?: { textureType?: TextureType; model?: ModelImportSettings; modelCache?: ModelCacheInfo; postprocessor?: string; sprite?: SpriteAssetRef; atlas?: AtlasCacheBlock; audio?: AudioManifestBlock; video?: VideoManifestBlock; font?: FontManifestBlock; environment?: EnvManifestBlock },
   hash?: string,
 ): void {
   if (!isGuid(guid)) {
@@ -273,6 +273,16 @@ export function registerAsset(
   guidToEntry.set(guid, {
     guid, path, type,
     texture: texture ?? (typeChanged ? undefined : prior?.texture),
+    // The AUTHORED usage type (`3d`/`2d`/`ui`), and it must ride along with `texture`: it is
+    // what `resolveBrowserImageUrl` asks `browserVariant` for, and an absent value there is
+    // not neutral — it falls back to inferring the type from the FORMAT, and a `ktx2-*` format
+    // infers `3d`, i.e. "no WebP sibling exists". So a `ui`-typed KTX2 texture (which the build
+    // DOES emit a WebP for) resolved to the raw, production-stripped source instead. This field
+    // was declared on `AssetEntry`, read in exactly one place, and written by NOBODY — retyping
+    // a texture and re-importing it fixed the file on disk and changed nothing in the running
+    // editor, because the field never crossed from the scanner's manifest into this map
+    // (QA-ASSET-0007).
+    textureType: modelBlocks?.textureType ?? (typeChanged ? undefined : prior?.textureType),
     model: modelBlocks?.model ?? (typeChanged ? undefined : prior?.model),
     // Derive variant URLs from the CURRENT path so a moved/renamed source resolves
     // without a re-import (the stored processedPath/lodPaths may be stale — see the
@@ -525,6 +535,7 @@ export function loadManifestJson(json: AssetManifestFile, opts?: { pathPrefix?: 
     present?.add(entry.guid);
     _manifestGuids.add(entry.guid);
     registerAsset(entry.guid, path, entry.type as AssetType, entry.texture, {
+      textureType: entry.textureType,
       model: entry.model,
       modelCache: entry.modelCache,
       postprocessor: entry.postprocessor,
@@ -616,6 +627,7 @@ export function serializeManifest(): AssetManifestFile {
     assets.push({
       guid: entry.guid, path: entry.path, type: entry.type,
       texture: entry.texture,
+      textureType: entry.textureType,
       model: entry.model,
       modelCache: entry.modelCache,
       postprocessor: entry.postprocessor,

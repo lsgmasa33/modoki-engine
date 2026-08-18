@@ -591,7 +591,7 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
   const localUnder = (parent: number, bones: BindBone[], tx: number, ty: number): [number, number] => {
     const { rootLocal } = bones.length ? deriveBindMatrices(bones) : { rootLocal: [] };
     const pInv = parent >= 0 && rootLocal[parent] ? invert2D(rootLocal[parent]) : identity2D();
-    const out = new Float32Array(2); apply2D(pInv, tx, ty, out, 0);
+    const out: number[] = [0, 0]; apply2D(pInv, tx, ty, out, 0);   // float64: this lands in the rig JSON
     return [out[0], out[1]];
   };
 
@@ -772,7 +772,7 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
         const frame = paintMode && Object.keys(testPose).length ? cur.map((b, i) => (testPose[i] ? { ...b, x: testPose[i].x, y: testPose[i].y, rot: testPose[i].rot } : b)) : cur;
         const { rootLocal } = deriveBindMatrices(frame);
         const pInv = parent >= 0 && rootLocal[parent] ? invert2D(rootLocal[parent]) : identity2D();
-        const out = new Float32Array(2); apply2D(pInv, tex.x, tex.y, out, 0);
+        const out: number[] = [0, 0]; apply2D(pInv, tex.x, tex.y, out, 0);   // float64: this lands in the rig JSON
         applyBoneTransform({ x: out[0], y: out[1] });
       }
       if (res.rz !== undefined) applyBoneTransform({ rot: res.rz - g.parentWorldRz });

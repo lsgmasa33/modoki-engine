@@ -214,8 +214,8 @@ function resolveAtlasPageBrowserUrl(frame: AtlasFrameRef): string | undefined {
  *  resolves is FORGOTTEN (`forgetUnresolvedSprite`), so that transient miss cannot permanently
  *  silence the guid: without that, a ref that failed once before the manifest arrived, then
  *  worked, then genuinely broke mid-session would fail in exactly the "blank screen, clean
- *  console" way this warning exists to prevent. (The pre-existing 3D `unknownGuidSeen` sets have
- *  the same gap; fixing them is a separate change.) */
+ *  console" way this warning exists to prevent. (The 3D `unknownGuidSeen` sets had the same gap
+ *  until QA-ASSET-0005 measured its cost; `resolveRefWarnOnce` forgets a resolving ref too now.) */
 const _unresolvedSpriteWarned = new Set<string>();
 function warnUnresolvedSprite(ref: string, why: string): undefined {
   if (!isGuid(ref) || _unresolvedSpriteWarned.has(ref)) return undefined;
@@ -320,6 +320,12 @@ export function resolveBrowserImageUrl(ref: string, warnKtx = false): string | u
     // The WebP/PNG sibling a 2d/ui texture exposes (mirrors what the build emits).
     const variant = browserVariant(settings.format, texEntry?.textureType);
     if (variant) {
+      // It has a sibling now → forget any earlier complaint about this ref, so a retype BACK to
+      // `3d` (or a re-import that drops the sibling) warns again instead of riding on the
+      // silence the first warning bought. Retype+reimport is the DOCUMENTED repair for this
+      // exact warning and it only started taking effect live once `textureType` reached the
+      // runtime manifest (QA-ASSET-0007) — so this condition genuinely flips mid-session now.
+      if (_domKtxWarned.size) _domKtxWarned.delete(ref);
       return withCacheBust(assetUrl(sourcePath + variantSuffix(variant)), texEntry?.hash);
     }
     // 3d-typed KTX2 texture in the DOM → no browser variant on disk.

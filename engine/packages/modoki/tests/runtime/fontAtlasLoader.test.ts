@@ -6,8 +6,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { completeResponse } from '../stubs/assetResponse';
 
+/** Guids the manifest pretends NOT to know — lets a test flip a ref from unresolvable to
+ *  resolvable and back, which is what the warn-once "forget" behaviour is about. */
+const missingGuids = new Set<string>();
 vi.mock('../../src/runtime/loaders/assetManifest', () => ({
-  resolveRef: (g: string) => (g.startsWith('font-') ? `/fonts/${g}.ttf` : undefined),
+  resolveRef: (g: string) => (g.startsWith('font-') && !missingGuids.has(g) ? `/fonts/${g}.ttf` : undefined),
   getAssetEntry: () => ({ hash: 'h1' }),
   isGuid: (g: unknown) => typeof g === 'string' && g.startsWith('font-'),
   onFontInvalidated: () => () => {},
@@ -142,5 +145,35 @@ describe('a dynamic font seeds from its bake', () => {
     // Routing the bake through a 2D canvas would premultiply-round-trip its true-SDF alpha.
     expect(p.atlasCanvasAt?.(0)).toBeUndefined();
     expect(p.pageCount).toBe(1);                         // nothing generated yet
+  });
+});
+
+describe('the unresolvable-font warning forgets a guid that later resolves (QA-ASSET-0005 class)', () => {
+  // `unknownSeen` is module-level and only cleared on a full dispose, so ONE miss in the window
+  // before the manifest reaches the client silenced that guid for the rest of the session — and
+  // the deletion that actually broke the font then produced no console line at all. Same gap
+  // `resolveRefWarnOnce` had; found by sweeping for its siblings.
+  it('warns once, goes quiet once it resolves, then warns AGAIN when it genuinely breaks', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      mockFetchOnce(METRICS);
+      missingGuids.add('font-late');
+
+      expect(await acquireFont(1, 'font-late')).toBeNull();     // transient miss
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(await acquireFont(1, 'font-late')).toBeNull();     // deduped
+      expect(warn).toHaveBeenCalledTimes(1);
+
+      // The second half of the same defect: the unresolvable result was MEMOIZED in
+      // `loadPromises` and nothing ever cleared it, so the font stayed dead for the session
+      // even after the manifest arrived. This line fails on the old code.
+      missingGuids.delete('font-late');                          // manifest arrives
+      expect(await acquireFont(1, 'font-late')).not.toBeNull();
+
+      releaseFontsForScene(1);                                   // drop the cached provider
+      missingGuids.add('font-late');                             // now genuinely deleted
+      expect(await acquireFont(1, 'font-late')).toBeNull();
+      expect(warn).toHaveBeenCalledTimes(2);                     // warns AGAIN, not silently
+    } finally { warn.mockRestore(); missingGuids.clear(); }
   });
 });

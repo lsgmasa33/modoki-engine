@@ -34,3 +34,103 @@ export function findCanvasAncestor(
   }
   return null;
 }
+
+/** One entity that will not be drawn: it has a Renderable2D but no Canvas2D ancestor. */
+export interface Unrenderable2D { id: number; name: string }
+
+/** Which entities in `rootId`'s subtree carry a Renderable2D yet route to no Canvas2D — i.e.
+ *  will render NOTHING, silently (Scene2D skips them; see its `noteOrphan2D`).
+ *
+ *  Pure over a flat entity list so a caller that has just spawned a subtree can answer the
+ *  question immediately, before any frame has been drawn — which is what lets the prefab
+ *  instantiate tool say so in its own response instead of returning a cheerful ok:true for an
+ *  invisible entity (QA-ASSET-0014). Traits are matched by NAME, the same shape `getAllEntities`
+ *  reports. An empty array means every 2D entity in the subtree has a canvas. */
+/** The traits Scene2D routes through a Canvas2D — one per pass (Renderable2D sprites/graphics,
+ *  SkinnedSprite2D deformable meshes, Text2D). Kept here rather than derived from
+ *  `EntityAttributes.layer`, because that field says '2d' for entities Scene2D never queries and
+ *  is stale-able (it is stored, not always recomputed): the question here is precisely "would
+ *  Scene2D skip this entity", so it is answered against Scene2D's own queries. */
+const CANVAS_REQUIRING_TRAITS = ['Renderable2D', 'SkinnedSprite2D', 'Text2D'] as const;
+
+/** A companion that promotes a 2D rig OUT of the flat canvas and into the Three.js scene, where
+ *  it needs no Canvas2D ancestor at all — Scene2D's skinned pass skips these deliberately. */
+const PROMOTES_TO_3D = ['Billboard3D', 'FlatSprite3D'] as const;
+
+export function findUnrenderable2D(
+  entities: readonly { id: number; name: string; parentId: number; traits: readonly string[] }[],
+  rootId: number,
+): Unrenderable2D[] {
+  const parentOf = new Map<number, number>();
+  const canvasIds = new Set<number>();
+  for (const e of entities) {
+    parentOf.set(e.id, e.parentId);
+    if (e.traits.includes('Canvas2D')) canvasIds.add(e.id);
+  }
+  // Subtree membership by walking each candidate UP to rootId — cheaper than materialising the
+  // subtree, and it reuses the same cycle-guarded shape as the routing walk above.
+  const inSubtree = (id: number): boolean => {
+    let cur = id;
+    const seen = new Set<number>();
+    while (cur > 0 && !seen.has(cur)) {
+      if (cur === rootId) return true;
+      seen.add(cur);
+      cur = parentOf.get(cur) || 0;
+    }
+    return false;
+  };
+  const out: Unrenderable2D[] = [];
+  for (const e of entities) {
+    if (!CANVAS_REQUIRING_TRAITS.some((t) => e.traits.includes(t))) continue;
+    if (PROMOTES_TO_3D.some((t) => e.traits.includes(t))) continue;
+    if (!inSubtree(e.id)) continue;
+    if (findCanvasAncestor(e.id, parentOf, canvasIds) === null) out.push({ id: e.id, name: e.name });
+  }
+  return out;
+}
+
+/** The warn-once bookkeeping behind Scene2D's "this 2D entity has no Canvas2D ancestor" report.
+ *
+ *  Extracted from `Scene2D.tsx` so the decision is testable without mounting PixiJS in jsdom —
+ *  same split as the routing walk above, and the same reason: the component owns the draw loop,
+ *  this module owns what the draw loop DECIDES.
+ *
+ *  Two properties it exists to hold, both of which regressed silently in the class version:
+ *
+ *  1. **It FORGETS an entity that recovers.** The warned set is keyed by guid (so it survives a
+ *     hot-reload's id reassignment), and nothing dropped a key when the entity found a canvas —
+ *     so parenting an orphan under the host and then back out again produced NO second warning.
+ *     A warn-once registry over a condition that genuinely recovers has to forget, or the second
+ *     break is the silent one. Same gap `resolveRefWarnOnce` had (QA-ASSET-0005).
+ *  2. **The guid lookup stays OFF the hot path.** `key()` is a callback, not a value, and it is
+ *     invoked only on the frame an entity crosses the warn threshold or recovers — never for the
+ *     healthy entities that make up the whole scene, which is every entity, every frame. */
+export class Orphan2DTracker {
+  private readonly frames = new Map<number, number>();
+  private readonly warned = new Set<string>();
+
+  /** Count a frame in which `entityId` routed to no canvas. Returns the warn key exactly ONCE
+   *  per orphaning — on the frame the count reaches `afterFrames` and the key is not already
+   *  warned — else null. */
+  note(entityId: number, key: () => string, afterFrames: number): string | null {
+    const frames = (this.frames.get(entityId) ?? 0) + 1;
+    this.frames.set(entityId, frames);
+    if (frames !== afterFrames) return null;      // exactly once, not every frame after
+    const k = key();
+    if (this.warned.has(k)) return null;
+    this.warned.add(k);
+    return k;
+  }
+
+  /** `entityId` found a canvas — drop its count and its warned key so a later re-orphaning
+   *  warns again. No-op (and no `key()` call) for an entity that was never counted. */
+  clear(entityId: number, key: () => string): void {
+    if (this.frames.size === 0) return;
+    if (!this.frames.delete(entityId)) return;
+    if (this.warned.size === 0) return;
+    this.warned.delete(key());
+  }
+
+  /** Forget everything (teardown / tests). */
+  reset(): void { this.frames.clear(); this.warned.clear(); }
+}

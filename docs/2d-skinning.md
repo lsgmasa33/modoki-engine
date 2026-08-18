@@ -276,6 +276,28 @@ an optional alpha coverage predicate; these return a ready `.rig2d.json` payload
   `normalizeRig2D` ignores those whenever `parts` is present, so writing them is
   inventing data, and it is what made the bug invisible. `addBone` (appends) and
   `reparentBone` (rewrites a parent field only) shift no indices and need none of this.
+- **A structural edit must not touch a vertex the edit does not touch** (QA-ASSET-0015). Deleting a
+  bone NOTHING is weighted to used to rewrite every weight in the file: each surviving vertex was
+  re-accumulated and divided by its own sum, and `w / sum` is **not** the identity in floating
+  point — an authored set sums to 1 ± an ulp (`bar.rig2d.json`'s first vertex sums to 1 + 2.2e-16),
+  so every value came back an ulp lighter. `SkinEditor`'s 400ms autosave then put that on disk: a
+  60-line git diff on a rig nothing semantically changed, on every rig anyone opened and touched.
+  `removeBone` now passes an untouched vertex through **verbatim** (only the indices move), and
+  keeps the renormalize for a vertex that actually lost or merged a bucket, or whose weights do
+  not sum to 1 — a genuinely malformed vertex still gets repaired, because the loader would
+  renormalize it out from under the raw-def preview otherwise. Note the reported diagnosis
+  (a float32 round-trip in the live cache) was **wrong**: the float32 numbers came from
+  `read-asset-def`, which reported the runtime-PARSED rig; it reports the authored doc now
+  (`getRig2DSource`), so the two questions no longer share one misleading answer.
+- **`apply2D` writes into its `out` param, and picking `Float32Array` vs `number[]` is a
+  CORRECTNESS decision** — found sweeping for siblings of the above. `Mat2D` is float64
+  throughout, so a `Float32Array` out-buffer truncates the result: right for the per-frame deform
+  buffer the GPU reads, wrong for anything that goes back into the rig JSON. All three authoring
+  call sites had it wrong — `reparentBone` and the Skin canvas's add-bone and gizmo-drag handlers
+  each write their result straight to a bone's local x/y. Reparenting a bone at x=0.1 under an
+  IDENTITY parent — an operation whose whole contract is "preserve the world position" — wrote
+  0.10000000149011612 to disk. This is the float32 truncation QA-ASSET-0015 reported; it was one
+  function away from where the report looked.
 - **A weight that outruns the skeleton now warns at load, once per part** — the clamp
   above still happens (the rig has to render), but `normalizePart` counts the bad indices
   and reports them with the part name and bone count. Nothing legitimately authors a rig

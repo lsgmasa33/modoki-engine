@@ -137,7 +137,7 @@ export {
 } from './loaders/spriteAnimCache';
 // 2D sprite skinning — rig asset loader + pure LBS math.
 export {
-  getRig2D, setRig2D, invalidateRig2D, clearRig2DCache, normalizeRig2D,
+  getRig2D, getRig2DSource, setRig2D, invalidateRig2D, clearRig2DCache, normalizeRig2D,
   type ParsedRig2D, type Rig2DFile, type Rig2DBone,
 } from './loaders/rig2dCache';
 export {
@@ -157,6 +157,7 @@ export {
   type EntityInfo,
 } from './core/ecs/entityUtils';
 export { findEntityById, findEntityByGuid, registerEntity, spawnEntity, unregisterEntity, destroyEntity } from './core/ecs/world';
+export { findUnrenderable2D, type Unrenderable2D } from './rendering/canvas2DRouting';
 export {
   registerModelPostprocessor, getModelPostprocessor, getAllModelPostprocessors, getModelPostprocessorIds,
   type ModelPostprocessor,

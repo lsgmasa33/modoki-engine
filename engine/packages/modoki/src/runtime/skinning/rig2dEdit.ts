@@ -43,14 +43,16 @@ export function reparentBone(def: Rig2DFile, child: number, newParent: number): 
   const { rootLocal } = deriveBindMatrices(coerce(bones));
   const world = rootLocal[child];
   const pInv = newParent >= 0 && rootLocal[newParent] ? invert2D(rootLocal[newParent]) : identity2D();
-  const out = new Float32Array(2); apply2D(pInv, world.e, world.f, out, 0);
+  const out: number[] = [0, 0]; apply2D(pInv, world.e, world.f, out, 0);   // float64: this lands in the rig JSON
   const newBones = bones.map((b, i) => (i === child ? { ...b, parent: newParent, x: out[0], y: out[1] } : b));
   return { ...def, bones: newBones };
 }
 
 /** Remove bone `r`: its children re-parent to its parent, all parent indices shift to
  *  close the gap, and its vertex weights transfer to its parent (or drop if it was a
- *  root). Per-vertex weights are re-accumulated, capped at 4, and renormalized. */
+ *  root). A vertex the deletion does not touch keeps its authored weights BYTE-FOR-BYTE (only
+ *  its indices shift); one that loses or merges a bucket is re-accumulated, capped at 4, and
+ *  renormalized. */
 export function removeBone(def: Rig2DFile, r: number): Rig2DFile {
   const bones = def.bones ?? [];
   if (r < 0 || r >= bones.length) return def;
@@ -85,13 +87,45 @@ export function removeBone(def: Rig2DFile, r: number): Rig2DFile {
     const si = new Array(vertCount * 4).fill(0), sw = new Array(vertCount * 4).fill(0);
     for (let v = 0; v < vertCount; v++) {
       const acc = new Map<number, number>();
+      // Bookkeeping for the untouched-vertex fast path below: how many live buckets there were,
+      // whether any was dropped by the remap, whether any slot held something that is neither a
+      // positive weight nor a clean 0 (a NaN/negative — a value the slow path REPAIRS, so such a
+      // vertex is not "untouched"), and what the live buckets already sum to.
+      let live = 0, dropped = false, malformed = false, rawSum = 0;
       for (let k = 0; k < 4; k++) {
         // `!(w > 0)`, not `w <= 0`: NaN fails EVERY comparison, so `<=` would let a NaN weight
         // through, poison `sum`, and zero the whole vertex including its valid buckets.
-        const w = oldW[v * 4 + k] ?? 0; if (!(w > 0)) continue;
+        const w = oldW[v * 4 + k] ?? 0; if (!(w > 0)) { if (w !== 0) malformed = true; continue; }
+        live++; rawSum += w;
         const nb = remap.get(oldIdx[v * 4 + k] ?? 0);
-        if (nb == null || nb < 0) continue;    // deleted-root weight → dropped
+        if (nb == null || nb < 0) { dropped = true; continue; }  // deleted-root weight → dropped
         acc.set(nb, (acc.get(nb) ?? 0) + w);
+      }
+      // UNTOUCHED VERTEX — every bucket survived the remap, no two collapsed into one, nothing
+      // needed repair, and the weights already sum to 1. Nothing about this vertex changed, so
+      // copy its weights through VERBATIM; only the INDICES move.
+      //
+      // Running them back out through `w / sum` is not a no-op in floating point, and that is the
+      // whole bug (QA-ASSET-0015). An authored set sums to 1 ± an ulp — `bar.rig2d.json`'s first
+      // vertex sums to 1 + 2.2e-16 — so re-dividing shifts every value by an ulp:
+      // 0.7172465286407307 comes back 0.7172465286407306. Deleting one bone that no vertex was
+      // bound to therefore rewrote all 180 weights in the file, and the editor's 400ms autosave
+      // put that on disk: a 60-line git diff on an asset nothing semantically changed, on every
+      // rig anyone opens and touches. (The report diagnosed it as a float32 round-trip; it is
+      // not — `read-asset-def` reads the runtime-parsed rig, which is where the float32 numbers
+      // it saw came from.)
+      //
+      // The `rawSum` guard keeps the REPAIR half of the old behaviour: a vertex whose weights do
+      // not sum to 1 is genuinely wrong, and the loader would renormalize it out from under the
+      // editor's raw-def preview, so it still takes the slow path. 1e-9 is far above any
+      // normalization ulp and far below any real authoring error.
+      if (live > 0 && !dropped && !malformed && acc.size === live && Math.abs(rawSum - 1) <= 1e-9) {
+        for (let k = 0; k < 4; k++) {
+          const w = oldW[v * 4 + k] ?? 0; if (!(w > 0)) continue;
+          si[v * 4 + k] = remap.get(oldIdx[v * 4 + k] ?? 0) ?? 0;
+          sw[v * 4 + k] = w;
+        }
+        continue;
       }
       const top = [...acc.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4);
       let sum = 0; for (const [, w] of top) sum += w;

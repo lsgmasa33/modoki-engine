@@ -23,7 +23,17 @@ import { assetUrl, withCacheBust } from './assetUrl';
  *  internal-path rejection are handled by `resolveRef`. `label` is the caller's
  *  log tag (e.g. `MeshCache`/`RiggedCache`); `seen` is the caller's own
  *  one-time-warned set (kept per-cache so the warning fires once per cache).
- *  Returns undefined if a GUID isn't in the manifest. */
+ *  Returns undefined if a GUID isn't in the manifest.
+ *
+ *  A ref that LATER resolves is FORGOTTEN, so a transient miss cannot permanently silence
+ *  the guid. This was the documented gap in the 2D twin's header ("the pre-existing 3D
+ *  `unknownGuidSeen` sets have the same gap; fixing them is a separate change") and it has a
+ *  measured cost: `seen` is module-level and never cleared, so ONE failed lookup in the window
+ *  before the manifest reaches the client — an agent creating a material and assigning it in the
+ *  same breath, a scene binding a ref mid-rescan — buys silence for the rest of the session.
+ *  Delete that asset an hour later and the entity falls back to nothing with a perfectly clean
+ *  console (QA-ASSET-0005): total silence, which is precisely the failure this warning exists to
+ *  prevent, and worse than never having warned at all. */
 export function resolveRefWarnOnce(
   ref: string | undefined | null,
   label: string,
@@ -31,9 +41,14 @@ export function resolveRefWarnOnce(
 ): string | undefined {
   if (!ref) return undefined;
   const path = resolveRef(ref);
-  if (isGuid(ref) && !path && !seen.has(ref)) {
-    seen.add(ref);
-    console.warn(`[${label}] Unknown asset guid: ${ref}\n  (not in the manifest — dropped from the build, renamed, or never assigned an id?)`);
+  if (!isGuid(ref)) return path;
+  if (!path) {
+    if (!seen.has(ref)) {
+      seen.add(ref);
+      console.warn(`[${label}] Unknown asset guid: ${ref}\n  (not in the manifest — dropped from the build, renamed, or never assigned an id?)`);
+    }
+  } else if (seen.size) {
+    seen.delete(ref);   // it resolves now → a future genuine break must warn again
   }
   return path;
 }

@@ -64,12 +64,12 @@ import { makePixiShaderInstance, type PixiShaderProgram } from './pixiShaderBuil
 import { coerceParamValue } from '../loaders/shaderSchema';
 import { register2DMaterialShaderMap, isEntity2DMaterialDirty } from './sprite2DMaterialBroker';
 import { computePaintOrder } from './paintOrder';
-import { findCanvasAncestor as resolveCanvasAncestor } from './canvas2DRouting';
+import { findCanvasAncestor as resolveCanvasAncestor, Orphan2DTracker } from './canvas2DRouting';
 import {
   createParticleSync2DState, syncParticles2D, releaseCanvas2DEmitters, disposeParticleSync2DState,
   type ParticleSync2DState, type ParticleSync2DCtx,
 } from './particleSync2D';
-import { addDirtyListener, onStructureDirty } from '../core/ecs/entityUtils';
+import { addDirtyListener, onStructureDirty, readTraitData } from '../core/ecs/entityUtils';
 import { isSimRunning, onPlayStateChange } from '../core/playState';
 import { Canvas2DPool, defaultPool } from './canvas2DPool';
 import { registerBoundsProvider, type BoundsSurface, type EntityScreenBounds } from '../core/screenBounds';
@@ -178,6 +178,20 @@ function unloadAllSpriteTextures() {
   for (const [url, handle] of pendingTextureUnloads) { clearTimeout(handle); unloadSpriteTextureNow(url); }
   pendingTextureUnloads.clear();
 }
+
+/** SCANNED frames a visible 2D entity may go undrawn for want of a Canvas2D ancestor before the
+ *  warning fires — deliberately 1, i.e. the first scan that sees it.
+ *
+ *  This started as ~1s-at-60fps, on the reasonable-sounding theory that a grace window would
+ *  cover a load that spawns a child before its canvas host. Measured in a live editor: it NEVER
+ *  fired. `renderFrame` skips its entire ECS scan while the sim is stopped and nothing is dirty
+ *  (the idle skip below), so these are not wall-clock frames at all — instantiating an orphaned
+ *  rig into a stopped editor produced exactly ONE scan with the entity orphaned, and then
+ *  silence. Any threshold above 1 is therefore a warning that only fires while the game is
+ *  running, which is precisely the case a human is least likely to be reading the console for.
+ *  The residual risk — a mid-load scan catching a child before its canvas — is a single
+ *  console line, against the alternative of the silence this whole change exists to end. */
+const ORPHAN_2D_WARN_FRAMES = 1;
 
 // ── Trait metadata cache (global — the trait registry is process-wide) ──
 let traitsCached = false;
@@ -472,6 +486,16 @@ export class Scene2DRenderer {
   private readonly canvasCompensate = new Map<number, { x: number; y: number }>();  // canvasEntityId → shape compensation
   // Reused out-param so the path-caching walk allocates nothing per call.
   private readonly ancestorPath: number[] = [];
+  // Visible Renderable2D entities skipped for want of a Canvas2D ancestor: id → consecutive
+  // frames skipped. A 2D entity outside every canvas draws NOTHING and said so nowhere — the
+  // one measured cost was an agent instantiating a 2D prefab at the world root (the tool's own
+  // default), getting ok:true and screen:null, and having to reparent by trial and error
+  // (QA-ASSET-0014). Counted rather than warned on sight because a scene/prefab load can spawn a
+  // child a frame or two before its canvas host, and a warning fired in that window is a lie.
+  // Warn-once bookkeeping for "visible 2D entity with no Canvas2D ancestor". Keyed by guid
+  // (falling back to id) so the warning survives a hot-reload's id reassignment; see
+  // `Orphan2DTracker` in canvas2DRouting.ts for what it guarantees and why it is not inline here.
+  private readonly orphan2D = new Orphan2DTracker();
 
   // ── 2D particle emitters ──
   private particleState2D: ParticleSync2DState | null = null;
@@ -542,6 +566,27 @@ export class Scene2DRenderer {
    *  i.e. it's actually drawn right now, not just Renderable2D.isVisible on the ECS side. Lets
    *  an E2E assert collider-only mode really hides sprites (see devTestBridge.has2DSprite). */
   hasSprite(entityId: number): boolean { return this.slots.has(entityId); }
+
+  /** The guid-or-id key this entity warns under. A callback at both call sites so the trait read
+   *  never happens on the healthy path — see `Orphan2DTracker`. */
+  private orphan2DKey(entityId: number): string {
+    const attrs = attrMeta ? readTraitData(entityId, attrMeta) : null;
+    return ((attrs?.guid as string) || '') || `id:${entityId}`;
+  }
+
+  /** Count a frame in which `entityId` was visible, active, and drawn by nothing because no
+   *  Canvas2D ancestor exists — and say so ONCE, after the grace window, at warn level. */
+  private noteOrphan2D(entityId: number): void {
+    const key = this.orphan2D.note(entityId, () => this.orphan2DKey(entityId), ORPHAN_2D_WARN_FRAMES);
+    if (!key) return;
+    const attrs = attrMeta ? readTraitData(entityId, attrMeta) : null;
+    const name = (attrs?.name as string) || `entity ${entityId}`;
+    console.warn(
+      `[Scene2D] "${name}" (${key}) is a visible 2D entity with no Canvas2D ancestor, so it is `
+      + 'never drawn. Parent it under the scene\'s Canvas2D host entity — a 2D entity at the '
+      + 'world root renders nowhere.',
+    );
+  }
 
   private findCanvasAncestor(entityId: number): number | null {
     // Per-frame cache fast-path (set by the path-caching below for siblings that
@@ -803,7 +848,8 @@ export class Scene2DRenderer {
 
         // Find which Canvas2D this entity belongs to
         const canvasId = this.findCanvasAncestor(id);
-        if (canvasId === null) return; // no Canvas2D ancestor — skip
+        if (canvasId === null) { this.noteOrphan2D(id); return; } // no Canvas2D ancestor — skip
+        this.orphan2D.clear(id, () => this.orphan2DKey(id));
 
         const canvasSlot = this.pool.getSlot(canvasId);
         if (!canvasSlot) return;
@@ -1158,11 +1204,15 @@ export class Scene2DRenderer {
         // returning before `activeIds.add` lets the end-of-pass sweep dispose any stale 2D slot.
         if (entity.has(Billboard3D) || entity.has(FlatSprite3D)) return;
         const id = entity.id();
+        // Canvas routing is checked BEFORE rig readiness: "parented outside every canvas" is the
+        // more fundamental failure of the two, and a rig that never finishes loading would
+        // otherwise swallow the report of it entirely (measured — the warning never fired).
+        const canvasId = this.findCanvasAncestor(id);
+        if (canvasId === null) { this.noteOrphan2D(id); return; }
+        this.orphan2D.clear(id, () => this.orphan2DKey(id));
         const buf = getSkin2DBuffer(id);
         if (!buf || !buf.parts.length) return; // rig not ready yet — skin2DSystem retries next frame
 
-        const canvasId = this.findCanvasAncestor(id);
-        if (canvasId === null) return;
         const canvasSlot = this.pool.getSlot(canvasId);
         if (!canvasSlot) return;
 
@@ -1288,7 +1338,8 @@ export class Scene2DRenderer {
         if (!t.isVisible || this._collidersOnly || deactivatedEntities.has(entity.id())) return;
         const id = entity.id();
         const canvasId = this.findCanvasAncestor(id);
-        if (canvasId === null) return;
+        if (canvasId === null) { this.noteOrphan2D(id); return; }
+        this.orphan2D.clear(id, () => this.orphan2DKey(id));
         const canvasSlot = this.pool.getSlot(canvasId);
         if (!canvasSlot) return;
 

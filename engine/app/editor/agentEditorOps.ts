@@ -49,10 +49,10 @@ import {
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
-  getPlayState, setPlayState, getRunMode, isAdvancing, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, findEntityByGuid, deleteEntity,
+  getPlayState, setPlayState, getRunMode, isAdvancing, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, findEntityByGuid, deleteEntity, findUnrenderable2D,
   getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents, getParticleEffect, mountedSurfaces,
   getTimeline, normalizeTimeline, getGuidForPath, getAssetType, getPresentationScale,
-  getSpriteAnim, getRig2D,
+  getSpriteAnim, getRig2D, getRig2DSource,
   getAllTraits, PRIMITIVE_NAMES, PRIMITIVE_SPRITE_NAMES, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
@@ -1300,7 +1300,19 @@ export function registerEditorAgentOps(): void {
         },
         remove: (id) => { deleteEntity(id); },
       }));
-      return { ok: true, rootId, guid: ensureGuid(rootId), saved: false };
+      // A 2D entity outside every Canvas2D is drawn by nothing, and used to come back as a
+      // bare ok:true — the caller then found screen:null with no idea why (QA-ASSET-0014).
+      // The tool's own default parent (world root) is exactly where that happens, so the
+      // answer belongs in THIS response, not only in the console a frame later.
+      const unrenderable = findUnrenderable2D(getAllEntities(), rootId);
+      const warnings = unrenderable.length === 0 ? [] : [
+        `${unrenderable.map((e) => `"${e.name}" (id ${e.id})`).join(', ')}: 2D entit`
+        + `${unrenderable.length === 1 ? 'y has' : 'ies have'} no Canvas2D ancestor and will not `
+        + 'render. Reparent under the scene\'s Canvas2D host (modoki_reparent_entity), or pass '
+        + 'parentGuid on instantiate.',
+      ];
+      return { ok: true, rootId, guid: ensureGuid(rootId), saved: false,
+        ...(warnings.length ? { warnings } : {}) };
     }
     if (which === 'create') {
       if ((p.entityId == null && !p.entityGuid) || !p.path) throw new Error('prefab create requires { entityId | entityGuid, path }');
@@ -1773,7 +1785,14 @@ export function registerEditorAgentOps(): void {
       : kind === 'animation' ? getAnimationClip(path, peek)
       : kind === 'timeline' ? getTimeline(path, peek)
       : kind === 'spriteanim' ? getSpriteAnim(path, peek)
-      : kind === 'rig2d' ? getRig2D(path, peek)
+      // rig2d reports the AUTHORED doc, not the parsed runtime rig. Every other kind's cache
+      // holds the file's own JSON; rig2d's holds packed Float32Arrays with the weights already
+      // renormalized, so this op used to answer a question about the ASSET with the deform
+      // driver's input — float32 weights, v1 rigs silently promoted to v2 parts. A QA run read
+      // those numbers as the editor corrupting the rig on load (QA-ASSET-0015). `?? getRig2D`
+      // keeps the "is it in the live cache at all?" answer identical for a rig seeded by an
+      // older path that never recorded a source.
+      : kind === 'rig2d' ? (getRig2DSource(path) ?? getRig2D(path, peek))
       : undefined;
     if (def === undefined) {
       throw new Error(

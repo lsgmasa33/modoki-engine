@@ -4,7 +4,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
-  getRig2D, setRig2D, invalidateRig2D, clearRig2DCache, type Rig2DFile,
+  getRig2D, getRig2DSource, setRig2D, invalidateRig2D, clearRig2DCache, type Rig2DFile,
 } from '../../src/runtime/loaders/rig2dCache';
 
 const MINIMAL_RIG: Rig2DFile = {
@@ -59,5 +59,44 @@ describe('rig2dCache', () => {
     expect(getRig2D('c.rig2d.json')).not.toBeNull();
     invalidateRig2D('c.rig2d.json');
     expect(getRig2D('c.rig2d.json')).toBeNull();
+  });
+});
+
+describe('getRig2DSource — the AUTHORED doc, not the parsed rig (QA-ASSET-0015)', () => {
+  // The parsed rig is a runtime structure: packed Float32Arrays, weights renormalized, v1
+  // promoted to v2 parts. Reporting it as "what the asset says" is how a float32-precision
+  // read came to be mistaken for the editor corrupting a rig on load.
+  const PATH = 'src.rig2d.json';
+  const AUTHORED: Rig2DFile = {
+    ...MINIMAL_RIG,
+    mesh: { verts: [[0, 0]], uvs: [[0, 0]], tris: [] },
+    skinIndices: [0, 0, 0, 0],
+    skinWeights: [0.7172465286407307, 0, 0, 0],
+  };
+
+  it('is null for a rig nothing has loaded, and never starts a fetch', () => {
+    const f = vi.fn();
+    vi.stubGlobal('fetch', f);
+    expect(getRig2DSource('cold.rig2d.json')).toBeNull();
+    expect(f).not.toHaveBeenCalled();
+  });
+
+  it('hands back the seeded doc byte-for-byte, at float64 precision', () => {
+    setRig2D(PATH, AUTHORED);
+    expect(getRig2DSource(PATH)).toBe(AUTHORED);
+    expect(getRig2DSource(PATH)!.skinWeights![0]).toBe(0.7172465286407307);
+    // ...while the parsed rig is (correctly) float32 and restructured — the two answers differ,
+    // which is exactly why both exist.
+    expect(getRig2D(PATH)!.parts[0].skinWeights[0]).not.toBe(0.7172465286407307);
+  });
+
+  it('is dropped by invalidate and by a full clear, in lockstep with the parsed rig', () => {
+    setRig2D(PATH, AUTHORED);
+    invalidateRig2D(PATH);
+    expect(getRig2DSource(PATH)).toBeNull();
+
+    setRig2D(PATH, AUTHORED);
+    clearRig2DCache();
+    expect(getRig2DSource(PATH)).toBeNull();
   });
 });

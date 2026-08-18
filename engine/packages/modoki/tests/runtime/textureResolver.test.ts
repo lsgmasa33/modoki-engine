@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach, beforeAll, vi, afterEach } from 'vitest';
 import * as THREE from 'three';
-import { clearManifest, registerAsset, registerSprite } from '../../src/runtime/loaders/assetManifest';
+import { clearManifest, registerAsset, registerSprite, loadManifestJson, serializeManifest } from '../../src/runtime/loaders/assetManifest';
 import {
   resolveTextureVariantUrl, getTextureSettings, invalidateTexture, resolveSprite,
   loadTexture3D, releaseTexture3D, getSharedTextureStats, disposeAllSharedTextures, isSharedTexture,
   getKTX2Loader, setActiveRenderer, onRendererReady, getActiveRenderer,
-  resetUnresolvedSpriteWarnings,
+  resetUnresolvedSpriteWarnings, resolveBrowserImageUrl,
 } from '../../src/runtime/loaders/textureResolver';
 import { DEFAULT_TEXTURE_SETTINGS } from '../../src/runtime/loaders/textureSettings';
 import { setActiveTextureSizeCap, resetActiveTextureSizeCap } from '../../src/runtime/core/textureSizeCap';
@@ -538,5 +538,77 @@ describe('resolveSprite — dangling refs warn once', () => {
       resolveSprite('https://example.com/x.png');
       expect(warn).not.toHaveBeenCalled();
     } finally { warn.mockRestore(); }
+  });
+});
+
+describe('resolveBrowserImageUrl — the authored texture TYPE decides the DOM variant (QA-ASSET-0007)', () => {
+  // The regression this locks: `AssetEntry.textureType` was declared, read here, and written by
+  // nobody — `loadManifestJson` dropped the scanner's `textureType` on the floor. With it absent,
+  // `browserVariant` infers the type from the FORMAT, and every `ktx2-*` format infers `3d` ⇒
+  // "no WebP sibling". So a `ui`-typed KTX2 texture (for which the build DOES emit a WebP)
+  // resolved to the raw source PNG — the file production strips. Nothing warned, and re-typing
+  // the texture + re-importing changed nothing in a running editor, because the field never
+  // crossed into the client's map at all.
+  const UI_GUID = '22222222-2222-4222-8222-222222222222';
+
+  it('returns the WebP sibling for a ui-typed KTX2 texture', () => {
+    registerAsset(UI_GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, { textureType: 'ui' });
+    expect(resolveBrowserImageUrl(UI_GUID)).toContain(PATH + '~webp.webp');
+  });
+
+  it('returns the WebP sibling for a 2d-typed KTX2 texture', () => {
+    registerAsset(UI_GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, { textureType: '2d' });
+    expect(resolveBrowserImageUrl(UI_GUID)).toContain(PATH + '~webp.webp');
+  });
+
+  it('falls back to the source for a 3d-typed KTX2 texture (no sibling is emitted)', () => {
+    registerAsset(UI_GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, { textureType: '3d' });
+    const url = resolveBrowserImageUrl(UI_GUID);
+    expect(url).toContain(PATH);
+    expect(url).not.toContain('~');
+  });
+
+  it('carries textureType across a manifest round-trip (load → serialize → load)', () => {
+    loadManifestJson({
+      version: 2,
+      assets: [{ guid: UI_GUID, path: PATH, type: 'texture', texture: { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, textureType: 'ui' }],
+    });
+    expect(resolveBrowserImageUrl(UI_GUID)).toContain(PATH + '~webp.webp');
+
+    const round = serializeManifest();
+    expect(round.assets.find((a) => a.guid === UI_GUID)?.textureType).toBe('ui');
+
+    clearManifest();
+    loadManifestJson(round);
+    expect(resolveBrowserImageUrl(UI_GUID)).toContain(PATH + '~webp.webp');
+  });
+
+  it('forgets its DOM-KTX complaint once the texture gains a browser sibling', () => {
+    // Retype + reimport is the documented repair for the `3d`-typed-KTX2-in-DOM warning, and it
+    // only started taking effect live once textureType reached the runtime manifest — so the
+    // condition genuinely flips mid-session now. A warn-once set that never forgets would let a
+    // retype BACK to `3d` ride on the silence the first warning bought.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      registerAsset(UI_GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, { textureType: '3d' });
+      resolveBrowserImageUrl(UI_GUID, true);
+      expect(warn).toHaveBeenCalledTimes(1);
+
+      registerAsset(UI_GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, { textureType: 'ui' });
+      expect(resolveBrowserImageUrl(UI_GUID, true)).toContain('~webp.webp');   // repaired -> forgotten
+
+      registerAsset(UI_GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, { textureType: '3d' });
+      resolveBrowserImageUrl(UI_GUID, true);
+      expect(warn).toHaveBeenCalledTimes(2);                                   // warns AGAIN
+    } finally { warn.mockRestore(); }
+  });
+
+  it('re-registering without a textureType keeps the one already known', () => {
+    // A loader self-registering on fetch (`registerAsset(id, path, 'texture')`) passes no blocks;
+    // it must not blank the type the scanner established, or the DOM variant would silently
+    // regress to the source URL the first time anything touched the asset.
+    registerAsset(UI_GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, { textureType: 'ui' });
+    registerAsset(UI_GUID, PATH, 'texture');
+    expect(resolveBrowserImageUrl(UI_GUID)).toContain(PATH + '~webp.webp');
   });
 });

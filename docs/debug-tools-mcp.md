@@ -660,7 +660,11 @@ What that means per tool:
   rendered frame — see the "verify by DATA" rule above). It reads the **LIVE** cache, not the file,
   which is the whole point under manual persistence: an unsaved edit exists only live, so a file
   read would report the pre-edit value and make a successful edit look like a no-op. `unsaved: true`
-  means a write is parked for it.
+  means a write is parked for it. What it returns is the **authored** def in every case — including
+  `rig2d`, whose live cache holds a runtime structure (packed `Float32Array`s, weights already
+  renormalized, v1 promoted to v2 parts). Reporting that was a real trap: the float32 weights it
+  handed back were read as the editor corrupting a rig on load (QA-ASSET-0015), and the actual disk
+  churn was somewhere else entirely.
 - **`write_asset` / `create_asset` / `import_file` / `reimport_asset`** always write. They are
   explicit "write this file" tools, not live-state edits.
 - **The live-world entity/prefab tools** (`create_entity`, `duplicate_entity`, `delete_entities`,

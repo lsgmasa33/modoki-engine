@@ -427,6 +427,24 @@ pixels a device downloads and uploads.
   `3d`-typed KTX2 texture (no WebP sibling) referenced from the DOM logs a loud
   (deduped) error pointing you to set the texture type to `2d`/`ui` so a WebP is
   emitted.
+- ⚠️ **The authored TYPE has to reach the RUNTIME manifest, and for a long time it did not**
+  (QA-ASSET-0007). `browserVariant(format, type)` decides whether a WebP sibling exists, and an
+  absent `type` is **not neutral** — it re-infers the type from the FORMAT, and every `ktx2-*`
+  format infers `3d`, i.e. "no sibling". `AssetEntry.textureType` was declared, read in exactly
+  that one place, and written by **nobody**: `loadManifestJson` dropped the scanner's
+  `textureType` on the floor. So every `ui`/`2d`-typed KTX2 texture — the ones the build DOES
+  emit a WebP for — resolved in the DOM to the raw source PNG that production strips. The failure
+  is silent in dev (the source is served off disk) and the `warnKtx` path stays quiet because the
+  runtime believes the texture is `3d`. What made it *look* like a different bug: re-typing a
+  texture and re-importing it correctly fixed the sidecar, the scanner's manifest and
+  `/api/rescan-assets`' own response, and changed nothing in the running editor — because the
+  field never crossed into the client's map at all, at any point, ever. If a manifest field is
+  read anywhere, check something WRITES it: `registerAsset` takes each block explicitly, so a new
+  one is opt-in and its absence is invisible. Guarded now by
+  `engine/tests/architecture/manifestBlockPlumbing.test.ts`, which asserts every `AssetEntry`
+  field is written by `registerAsset`, forwarded by `loadManifestJson`, and emitted by
+  `serializeManifest` — a source scan rather than a round-trip, because a round-trip can only
+  exercise a field it knows how to SET, which is exactly the field nobody plumbed.
 
 ## Key files
 
