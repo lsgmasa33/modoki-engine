@@ -87,6 +87,50 @@ function pickAutoFocus(scoped: Candidate[]): string {
   return (auto ?? ordered[0]).guid;
 }
 
+/** The two hosts that mount a `UIRenderer`, in preference order. The editor mounts it TWICE
+ *  (GameView, and SceneView's device-sized preview frame), so one UI entity can have two live
+ *  DOM nodes; a shipped game matches neither and gets `null`. Same vocabulary as
+ *  `engine/app/debug/uiSurface.ts` — kept as bare attribute selectors here because the runtime
+ *  package cannot import the app's debug layer. */
+const UI_HOSTS = ['[data-game-view-area]', '[data-ui-preview-frame]'];
+
+function uiHostOf(el: Element): Element | null {
+  for (const sel of UI_HOSTS) { const h = el.closest(sel); if (h) return h; }
+  return null;
+}
+
+/** On-screen rects for UI candidates, read from the DOM `UIRenderer` actually rendered.
+ *
+ *  WHY THIS EXISTS (QA-UI-0002). Spatial nav is the documented fallback when an explicit
+ *  `navUp/Down/Left/Right` link points at something that is not a live candidate — e.g. the
+ *  authored target was set `focusable:false`. It could never fire in a real game: EVERY
+ *  `registerBoundsProvider` caller is a 2D/3D renderer (Scene2D, Scene3D, SceneView), UI-layer
+ *  rects are merged separately by the `layout-bounds` op straight from `[data-entity-id]` DOM
+ *  nodes, and so `collectScreenBounds()` returns nothing for a UI entity. The measured symptom
+ *  was focus BLOCKING on a disabled button instead of skipping it. It looked healthy in tests
+ *  only because the unit test registers a fake provider. So read the same DOM the op reads.
+ *
+ *  All rects must come from ONE host: the two mounts are different projections of the same
+ *  layout, and comparing across them would compute nearest-in-direction in two coordinate
+ *  frames at once. The host holding the currently-focused node wins (preferring the GameView —
+ *  this system only runs while the sim is playing). */
+function collectUIDomRects(scoped: Candidate[], fromEntityId: number): Map<number, ScreenRect> {
+  const out = new Map<number, ScreenRect>();
+  if (typeof document === 'undefined') return out;
+  const fromNodes = [...document.querySelectorAll(`[data-entity-id="${fromEntityId}"]`)];
+  if (fromNodes.length === 0) return out; // not a DOM-rendered UI entity → provider rects
+  const host = uiHostOf(fromNodes.find((el) => el.closest(UI_HOSTS[0])) ?? fromNodes[0]);
+  for (const c of scoped) {
+    const el = [...document.querySelectorAll(`[data-entity-id="${c.entityId}"]`)]
+      .find((n) => uiHostOf(n) === host);
+    if (!el) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) continue; // not laid out → not a nav target
+    out.set(c.entityId, { x: r.left, y: r.top, w: r.width, h: r.height });
+  }
+  return out;
+}
+
 /** Resolve a directional move from `fromGuid`: explicit authored link first, else the
  *  spatially nearest scoped candidate in `dir` using on-screen rects. Returns the new
  *  focus GUID, or '' if there's nowhere to go. */
@@ -98,10 +142,14 @@ function resolveNav(fromGuid: string, dir: NavDir, scoped: Candidate[]): string 
   const linked = from.nav[dir];
   if (linked && scoped.some((c) => c.guid === linked)) return linked;
 
-  // 2. Spatial: nearest-in-direction by on-screen rect. Needs rects from the bounds
-  //    providers; absent (headless) → no spatial move.
-  const byId = new Map<number, ScreenRect>();
-  for (const b of collectScreenBounds()) if (b.screen) byId.set(b.id, b.screen);
+  // 2. Spatial: nearest-in-direction by on-screen rect. UI rects come from the DOM
+  //    (see collectUIDomRects); a registered bounds provider is the fallback for a
+  //    non-DOM host and for headless tests. Absent entirely → no spatial move.
+  let byId = collectUIDomRects(scoped, from.entityId);
+  if (!byId.has(from.entityId)) {
+    byId = new Map<number, ScreenRect>();
+    for (const b of collectScreenBounds()) if (b.screen) byId.set(b.id, b.screen);
+  }
   const fromRect = byId.get(from.entityId);
   if (!fromRect) return '';
   const cands = scoped

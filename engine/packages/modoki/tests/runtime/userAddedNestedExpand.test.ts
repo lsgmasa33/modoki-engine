@@ -16,13 +16,19 @@ const TRAITS = [
   { name: 'PrefabInstance', trait: PrefabInstance, category: 'component', fields: { source: 0, localId: 0, rootInstanceId: 0, parentLocalId: 0 } },
 ] as const;
 
+// Mirrors the real module: `spawnEntity` registers into the id index and `findEntityById`
+// reads it. A double that skips the registration answers undefined for an entity it just
+// created — which is not how the engine behaves.
+const idIndex = new Map<number, any>();
 vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => createWorld(),
-  registerEntity: vi.fn(),
-  spawnEntity: (world: any, ...traits: any[]) => world.spawn(...traits),
-  unregisterEntity: vi.fn(),
-  destroyEntity: (e: any) => { e.destroy(); },
+  registerEntity: (e: any) => idIndex.set(e.id(), e),
+  spawnEntity: (world: any, ...traits: any[]) => { const e = world.spawn(...traits); idIndex.set(e.id(), e); return e; },
+  unregisterEntity: (e: any) => idIndex.delete(e.id()),
+  destroyEntity: (e: any) => { idIndex.delete(e.id()); e.destroy(); },
   setStructureCallback: vi.fn(),
+  indexEntityGuid: vi.fn(),
+  findEntityById: (id: number) => idIndex.get(id),
 }));
 vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getAllTraits: () => TRAITS,
@@ -43,11 +49,11 @@ vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({
 const getModule = () => import('../../src/runtime/loaders/loadSceneFile');
 
 function dump(world: ReturnType<typeof createWorld>) {
-  const out: { id: number; name: string; parentId: number; source?: string }[] = [];
+  const out: { id: number; name: string; parentId: number; guid: string; source?: string }[] = [];
   for (const e of world.entities as any) {
     if (!e.has(EntityAttributes)) continue;
     const ea = e.get(EntityAttributes);
-    out.push({ id: e.id(), name: ea.name, parentId: ea.parentId, source: e.has(PrefabInstance) ? e.get(PrefabInstance).source : undefined });
+    out.push({ id: e.id(), name: ea.name, parentId: ea.parentId, guid: ea.guid, source: e.has(PrefabInstance) ? e.get(PrefabInstance).source : undefined });
   }
   return out;
 }
@@ -63,7 +69,7 @@ const pPrefab = {
 
 describe('runtime — user-added nested instance reference node expands under its member', () => {
   let world: ReturnType<typeof createWorld>;
-  beforeEach(() => { world = createWorld(); });
+  beforeEach(() => { world = createWorld(); idIndex.clear(); });
 
   it('expands the child prefab under the anchor member (parentLocalId 2 → P2)', async () => {
     const { instantiatePrefabIntoWorld } = await getModule();
@@ -81,5 +87,8 @@ describe('runtime — user-added nested instance reference node expands under it
     // Expanded as a real instance (carries the child source) under P2.
     expect(q1.source).toBe(Q);
     expect(q1.parentId).toBe(p2.id);
+    // …AND under the guid the reference node was serialized with (QA-PREFAB-0004). Placement
+    // was already preserved here; identity was not, so a reload silently re-addressed it.
+    expect(q1.guid).toBe('q-guid');
   });
 });

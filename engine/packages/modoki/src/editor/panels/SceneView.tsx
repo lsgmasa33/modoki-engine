@@ -34,7 +34,8 @@ import {
   PRIORITY_EDITOR_3D, PRIORITY_EDITOR_2D,
 } from '../../runtime/rendering/frameDriver';
 import { createParticleSyncState, syncParticles, disposeParticleSyncState } from '../../runtime/rendering/particleSync';
-import { registerBoundsProvider, projectAABBToScreen, type EntityScreenBounds } from '../../runtime/core/screenBounds';
+import { registerBoundsProvider } from '../../runtime/core/screenBounds';
+import { computeEntityScreenBounds } from '../../runtime/rendering/entityScreenBounds';
 import { registerPickProvider } from '../../runtime/core/screenPick';
 import { registerHandleProvider, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
 import { createFlameMeshSyncState, syncFlameMeshes, disposeFlameMeshSyncState } from '../../runtime/rendering/flameMeshSync';
@@ -3085,6 +3086,12 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // viewport and intercepting clicks meant for models behind it. No-op raycast
     // removes it from picking entirely while keeping it rendered when selected.
     camFrustumLines.raycast = () => {};
+    // …and for the SAME reason it must not contribute to the entity's measured BOUNDS: a rect
+    // that spans the frustum describes a region a click cannot select the camera in, so an
+    // entity aim computed from it lands in empty space (QA-CTX-0006). `noBounds` prunes this
+    // subtree from the bounds provider's walk, keeping "what is measured" equal to "what is
+    // clickable". Set beside the raycast override so the two can't drift apart.
+    camFrustumLines.userData.noBounds = true;
     camGizmoPivot.add(camFrustumLines);
 
     // Updated each frame from the Camera trait's fov/aspect/near/far. Writes
@@ -3210,31 +3217,29 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // whole file is stripped from game builds); if both this and the game provider report
     // the same id, agentBridge's boundsById Map keeps the last (worldAABB is identical;
     // screen is a valid projection either way).
-    const _svBoundsBox = new THREE.Box3();
-    const _svSize = new THREE.Vector3(), _svCenter = new THREE.Vector3();
+    // Declared HERE, above the bounds provider, because that provider now reads it (below).
+    // Icon gizmos for Camera/Light/Environment/empty entities — the objects that make an
+    // otherwise-invisible entity clickable in the viewport.
+    const ecsGizmos = new Map<number, THREE.Object3D>();
+
     const unregBounds = registerBoundsProvider((ids) => {
-      const out: EntityScreenBounds[] = [];
       const r = renderer.domElement.getBoundingClientRect();
-      const vp = { left: r.left, top: r.top, width: r.width, height: r.height };
-      const projectOne = (id: number, obj: THREE.Object3D) => {
-        if (ids && !ids.has(id)) return;
-        obj.updateWorldMatrix(true, true);
-        _svBoundsBox.setFromObject(obj);
-        const { screen, onScreen } = projectAABBToScreen(_svBoundsBox, activeEditorCam, vp);
-        let worldAABB: EntityScreenBounds['worldAABB'];
-        if (!_svBoundsBox.isEmpty()) {
-          _svBoundsBox.getSize(_svSize); _svBoundsBox.getCenter(_svCenter);
-          worldAABB = { size: [_svSize.x, _svSize.y, _svSize.z], center: [_svCenter.x, _svCenter.y, _svCenter.z] };
-        }
-        out.push({ id, layer: '3d', surface: 'scene-view', screen, onScreen, ...(worldAABB ? { worldAABB } : {}) });
-      };
-      for (const [id, obj] of renderState.ecsObjects) projectOne(id, obj);
-      // Skinned meshes (SkinnedMeshRenderer) live in `skinned`, keyed by entity id, with
-      // their cloned hierarchy at `entry.root` — the whole point of this provider for a
-      // skeletal scene. (The runtime Scene3D provider covers only ecsObjects; skinned
-      // parity there is a possible follow-up.) setFromObject uses the bind-pose bounds.
-      for (const [id, entry] of renderState.skinned) projectOne(id, entry.root);
-      return out;
+      // WHAT is measured (and why an icon gizmo is measured differently from a mesh) lives in
+      // `editor/scene/sceneViewBounds.ts`, where it is unit-tested. Only the live inputs —
+      // this renderer's viewport rect and the active editor camera — belong here.
+      return computeEntityScreenBounds(
+        {
+          ecsObjects: renderState.ecsObjects,
+          skinned: renderState.skinned,
+          billboards: renderState.billboards,
+          textMeshes: renderState.textMeshes,
+          gizmos: ecsGizmos,
+        },
+        activeEditorCam,
+        { left: r.left, top: r.top, width: r.width, height: r.height },
+        'scene-view',
+        ids,
+      );
     }, 'scene-view');
 
     // Pick provider (F15 — docs/enact.md): `pickEntityAtViewportPoint` (defined above,
@@ -3245,7 +3250,6 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // registers at 10 since it visually sits on top and must win when both answer (#80).
     const unregPick = registerPickProvider(pickEntityAtViewportPoint, 'scene-view');
 
-    const ecsGizmos = new Map<number, THREE.Object3D>();
     const outlineMeshes = new Map<number, THREE.LineSegments>();
     // Dimmer secondary outlines for the selected entity's descendants (children,
     // grandchildren, deeper) — keyed by descendant id, following each one's baked world TRS.

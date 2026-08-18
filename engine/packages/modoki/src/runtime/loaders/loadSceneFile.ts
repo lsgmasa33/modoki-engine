@@ -1,7 +1,7 @@
 /** Load a scene JSON file into an ECS world. Shared between editor and runtime. */
 
 import { type World } from 'koota';
-import { getCurrentWorld, spawnEntity, indexEntityGuid, findEntityByGuid } from '../core/ecs/world';
+import { getCurrentWorld, spawnEntity, indexEntityGuid, findEntityById, findEntityByGuid } from '../core/ecs/world';
 import { getAllTraits, getTraitByName } from '../core/ecs/traitRegistry';
 import { loadModelTemplates, getCachedPrefab } from './meshTemplateCache';
 import { isGuid, isExternalUrl, resolveRef, getAssetType, deriveGuid, newGuid, getAssetEntry, type AssetType } from './assetManifest';
@@ -661,6 +661,21 @@ export function applyStructureCore(
   ops.onComplete?.();
 }
 
+/** Stamp a scene-authored guid onto a freshly expanded prefab-instance root, and index it.
+ *  No-op when the root already carries that guid. */
+function applyRootGuid(world: World, rootEcsId: number, guid: string): void {
+  const attrMeta = getTraitByName('EntityAttributes');
+  if (!attrMeta) return;
+  // O(1) through the entity index every spawn already populates — NOT a scan of world.entities,
+  // which would make a scene with many nested instances O(instances x entities) at load.
+  const e = findEntityById(rootEcsId, world) as EntityHandle | undefined;
+  if (!e || !e.has(attrMeta.trait)) return;
+  const ea = e.get(attrMeta.trait) as Record<string, unknown>;
+  if (ea.guid === guid) return;
+  e.set(attrMeta.trait, { ...ea, guid });
+  indexEntityGuid(e, world);
+}
+
 /** Apply structural overrides (added entities, removed entities, removed traits)
  *  on top of an instantiated prefab, using a localId → ecsId map. Runtime side —
  *  operates on a koota world directly so the loader stays free of editor deps.
@@ -699,10 +714,22 @@ export function applyStructureByLocalToEcs(
       spawnNestedInstance: (node, parentEcsId) => {
         const child = getCachedPrefab(node.prefab!) as { entities: PrefabFileEntry[]; rootLocalId?: number; id?: string } | null;
         if (!child) { console.warn(`[loadSceneFile] added nested instance not cached: ${node.prefab}`); return; }
-        instantiatePrefabIntoWorld(
+        const rootEcsId = instantiatePrefabIntoWorld(
           world, child, parentEcsId, undefined, node.prefab, node.overrides,
           { added: node.added, removed: node.removed, removedTraits: node.removedTraits }, undefined, node.nestedOverrides,
         );
+        // RESTORE the node's own guid (QA-PREFAB-0004). A nested instance's root is
+        // serialized with its guid right here in the `added[]` entry — the same way a
+        // TOP-LEVEL instance root carries `SceneEntityEntry.guid`, which the loader hands
+        // to `onInstantiatePrefab` as `rootGuid`. This path had no equivalent, so the
+        // expanded root came out guid-less and `deriveInstanceMemberGuids` minted a fresh
+        // derived one: the entity survived the reload with the right parent, traits and
+        // overrides, under a DIFFERENT guid. Every external reference to it (an agent's
+        // captured address, a cross-entity ref) went stale on the next load with no error,
+        // against the engine's own "guid is the stable anchor" contract. Stamped before
+        // `deriveInstanceMemberGuids` runs, so this instance's MEMBERS also derive off the
+        // stable root guid instead of off a fresh one.
+        if (rootEcsId && node.guid) applyRootGuid(world, rootEcsId, node.guid);
       },
     },
     localToEcs,

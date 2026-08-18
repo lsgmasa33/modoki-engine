@@ -131,6 +131,24 @@ regardless of which panels the human happens to have open.
 row per *entity*, so it reports the winning rect's `surface` plus `otherSurfaces: […]` — it still
 answers with one rect, but no longer presents one of several answers as the answer.
 
+### What a 3D surface measures — and why it must equal what a click SELECTS
+
+Both 3D providers run one shared body, `runtime/rendering/entityScreenBounds.ts`: meshes
+(`ecsObjects`), skinned roots, billboards, SDF text meshes, and — SceneView only — the **icon
+gizmos** that stand in for Camera/Light/Environment entities. That list is not decoration; it is
+the invariant. Measure fewer kinds than the surface renders and an entity is on screen, genuinely
+click-selectable, and refused by an `entity` aim with *"has no screen bounds"* — which is what
+QA-CTX-0006/QA-SVIEW-0004 hit for lights and cameras, and what a skinned character hit in the
+GAME view. Two consequences that are easy to get backwards:
+
+- **An icon gizmo reports no `worldAABB`.** That field means the entity's true geometric extent;
+  a Light has none, so the icon's box would be a confident wrong answer. Screen rect only.
+- **A child excluded from picking is excluded from bounds.** The camera gizmo's frustum lines
+  already had a no-op `raycast`, but `Box3.setFromObject` walks every child regardless — which
+  measured the camera at 5613×1981 px, a rect no click inside it selects the camera in.
+  `userData.noBounds` prunes such a subtree, and the flag is set beside the raycast override so
+  the two cannot drift.
+
 ## The original gap
 
 Percept can locate ECS entities via bounds providers, but those providers are only three —

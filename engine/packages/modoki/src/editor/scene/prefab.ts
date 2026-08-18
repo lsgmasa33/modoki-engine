@@ -1324,6 +1324,19 @@ export function applyStructureByRootInstance(
         if (!child) { console.warn(`[Prefab] added nested instance "${node.prefab}" not cached`); return; }
         const childRoot = instantiatePrefab(child, parentEcsId);
         if (!childRoot) return;
+        // RESTORE the node's own guid — the editor-side twin of the loader fix (QA-PREFAB-0004).
+        // `captureNestedRef` reads the live guid onto the reference node precisely so a rebuild
+        // can put it back, and `rebuildInstance` already does exactly this for the OUTER root
+        // ("refs into the instance survive the rebuild"). Without it a Revert to Prefab, an
+        // Apply, or the undo/redo of a prefab drop re-expands the nested instance with the
+        // TEMPLATE's guid — which prefab templates clear, so it comes back as '' and the entity
+        // is not addressable by guid at all, worse than the loader's fresh-guid churn.
+        const eaMeta = getTraitByName('EntityAttributes');
+        if (eaMeta && node.guid) {
+          writeTraitField(childRoot, eaMeta, 'guid', node.guid);
+          const ent = findEntity(childRoot);
+          if (ent) indexEntityGuid(ent);
+        }
         setPrefabSource(childRoot, node.prefab!);
         if (node.overrides) applyOverridesByRootInstance(childRoot, node.overrides);
         if (node.added?.length || node.removed?.length || node.removedTraits) {

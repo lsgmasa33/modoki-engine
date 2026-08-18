@@ -366,9 +366,21 @@ Directional resolution, per move:
 1. **Explicit link** — the `nav<Dir>` GUID, if it points at a live scoped candidate.
 2. **Spatial** — `pickInDirection()` picks the nearest scoped candidate strictly in the
    pressed direction, scored by distance *along* the axis plus 2× the perpendicular
-   offset (a slightly-off but closer target still wins; a wildly-sideways one loses),
-   using on-screen rects from the shared bounds providers. Headless (no rects) → spatial
-   no-ops, but explicit links + autofocus still work.
+   offset (a slightly-off but closer target still wins; a wildly-sideways one loses).
+   Rects come from the **DOM** — the same `[data-entity-id]` nodes the `layout-bounds` op
+   reads — measured within ONE host, the one holding the focused node (the editor mounts a
+   `UIRenderer` in both GameView and SceneView's preview frame, and the two are different
+   projections of the same layout). A registered bounds provider is the fallback for a
+   non-DOM host; headless (no rects either way) → spatial no-ops, but explicit links +
+   autofocus still work.
+
+   ⚠️ It read `collectScreenBounds()` alone until QA-UI-0002, and that never returned a
+   rect for a UI entity: **every bounds provider is a 2D/3D renderer** (`Scene2D`,
+   `Scene3D`, `SceneView`), and UI rects have always been merged separately from the DOM.
+   So the spatial tier — the fallback that fires when an explicit link points at something
+   no longer focusable — could not fire in a real game, and focus BLOCKED on a disabled
+   button instead of skipping it. It looked healthy because the unit test registered a
+   provider of its own.
 
 Candidate gathering enforces **ancestor-inclusive visibility**: the canonical hide
 pattern sets `UIElement.isVisible=false` on a panel container while its children stay

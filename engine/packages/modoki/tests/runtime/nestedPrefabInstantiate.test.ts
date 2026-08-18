@@ -14,13 +14,17 @@ const PrefabInstance = trait({ source: '' as string, localId: 0, rootInstanceId:
 let testWorld: ReturnType<typeof createWorld>;
 const cachedPrefabs = new Map<string, unknown>();
 
+// The real `spawnEntity` REGISTERS into the world's id index, and `findEntityById` reads it —
+// a double that spawns without registering (and answers undefined) is a lie about the module,
+// and one that made an O(1) index lookup look broken while an O(n) scan looked fine.
+const idIndex = new Map<number, any>();
 vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
-  registerEntity: vi.fn(),
-  spawnEntity: (world: any, ...traits: any[]) => world.spawn(...traits),
+  registerEntity: (e: any) => idIndex.set(e.id(), e),
+  spawnEntity: (world: any, ...traits: any[]) => { const e = world.spawn(...traits); idIndex.set(e.id(), e); return e; },
   setStructureCallback: vi.fn(),
   indexEntityGuid: () => {},
-  findEntityById: (_id: number) => undefined,
+  findEntityById: (id: number) => idIndex.get(id),
   findEntityByGuid: (guid: string, world: any = testWorld) => {
     let found: any;
     world.query(EntityAttributes).updateEach(([ea]: any[], e: any) => { if (!found && ea.guid === guid) found = e; });
@@ -44,7 +48,7 @@ vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({
 
 vi.mock('../../src/runtime/ui/uiTreeStore', () => ({ markUIDirty: vi.fn() }));
 
-beforeEach(() => { testWorld = createWorld(); cachedPrefabs.clear(); });
+beforeEach(() => { testWorld = createWorld(); cachedPrefabs.clear(); idIndex.clear(); });
 afterEach(() => { testWorld.destroy(); });
 
 const getLoader = () => import('../../src/runtime/loaders/loadSceneFile');
@@ -281,5 +285,66 @@ describe('instantiatePrefabIntoWorld — nested prefabs', () => {
     // Outer expanded once; the cycle back to Outer is refused (cycle guard).
     const outers = snapshot().filter(s => s.source === 'Outer');
     expect(outers.length).toBeGreaterThan(0);
+  });
+});
+
+describe('user-added nested instance — guid stability (QA-PREFAB-0004)', () => {
+  const NESTED_GUID = 'c913bd4a-3cc3-4201-9cef-30479f890e80';
+
+  // A plain outer prefab (no nested ROW) so the only Inner instance in the world is the
+  // user-ADDED one this test is about.
+  const plainOuter = {
+    id: 'Outer', rootLocalId: 1,
+    entities: [
+      { localId: 1, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'O1', parentId: 0 } } },
+      { localId: 2, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'O2', parentId: 1 } } },
+    ],
+  };
+
+  /** Expand `plainOuter` with a reference-style added node — the shape
+   *  `serialize.ts` writes for a prefab dropped UNDER a prefab member. */
+  function expandWithNestedAdd(guid: string) {
+    cachedPrefabs.set('Inner', innerPrefab);
+    return import('../../src/runtime/loaders/loadSceneFile').then(({ instantiatePrefabIntoWorld }) =>
+      instantiatePrefabIntoWorld(testWorld, plainOuter, 0, undefined, 'Outer', undefined, {
+        added: [{
+          parentLocalId: 1, guid, name: 'Inner', traits: {}, children: [],
+          prefab: 'Inner',
+          overrides: { 1: { Transform: { x: 321.5 } } },
+        }],
+      } as never),
+    );
+  }
+
+  function guidOf(entityId: number): string {
+    let g = '';
+    testWorld.query(EntityAttributes).updateEach(([ea]: any[], e: any) => {
+      if (e.id() === entityId) g = ea.guid as string;
+    });
+    return g;
+  }
+
+  it('re-expands the nested instance root under its SERIALIZED guid, not a fresh one', async () => {
+    await expandWithNestedAdd(NESTED_GUID);
+
+    // The inner root is the Inner-sourced member whose parent is the outer root.
+    const snap = snapshot();
+    const inner = snap.find(s => s.source === 'Inner' && s.localId === 1)!;
+    expect(inner).toBeDefined();
+    expect(guidOf(inner.id)).toBe(NESTED_GUID);
+  });
+
+  it('still applies the node overrides while restoring the guid', async () => {
+    await expandWithNestedAdd(NESTED_GUID);
+    const inner = snapshot().find(s => s.source === 'Inner' && s.localId === 1)!;
+    let x = 0;
+    testWorld.query(Transform).updateEach(([t]: any[], e: any) => { if (e.id() === inner.id) x = t.x as number; });
+    expect(x).toBe(321.5);
+  });
+
+  it('leaves the guid empty when the node carries none (member derivation fills it later)', async () => {
+    await expandWithNestedAdd('');
+    const inner = snapshot().find(s => s.source === 'Inner' && s.localId === 1)!;
+    expect(guidOf(inner.id)).toBe('');
   });
 });

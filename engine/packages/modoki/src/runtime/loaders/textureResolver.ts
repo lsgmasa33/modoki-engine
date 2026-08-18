@@ -200,6 +200,42 @@ function resolveAtlasPageBrowserUrl(frame: AtlasFrameRef): string | undefined {
   return withCacheBust(assetUrl(`${atlasPath}~page${frame.page}${variantSuffix(variant)}`), frame.hash);
 }
 
+/** One-time warn for a 2D sprite ref that will never resolve.
+ *
+ *  WHY (QA-ASSET-0011). The 3D path warns once per unresolvable guid via
+ *  `resolveRefWarnOnce` (`[MeshCache] Unknown asset guid: …`); the 2D path returned
+ *  `undefined` and both Scene2D call sites bailed silently ("wait for next frame" — which
+ *  never ends for a ref that will never resolve). Delete a texture a 2D sprite references
+ *  and you got a blank screen with a clean console. The asymmetry WAS the defect. Warned
+ *  here rather than at the two call sites so every `resolveSprite` consumer inherits it.
+ *
+ *  Deduped per ref, so the transient window before the manifest loads costs at most one line —
+ *  the same trade `resolveRefWarnOnce` already makes on the 3D side. But a ref that LATER
+ *  resolves is FORGOTTEN (`forgetUnresolvedSprite`), so that transient miss cannot permanently
+ *  silence the guid: without that, a ref that failed once before the manifest arrived, then
+ *  worked, then genuinely broke mid-session would fail in exactly the "blank screen, clean
+ *  console" way this warning exists to prevent. (The pre-existing 3D `unknownGuidSeen` sets have
+ *  the same gap; fixing them is a separate change.) */
+const _unresolvedSpriteWarned = new Set<string>();
+function warnUnresolvedSprite(ref: string, why: string): undefined {
+  if (!isGuid(ref) || _unresolvedSpriteWarned.has(ref)) return undefined;
+  _unresolvedSpriteWarned.add(ref);
+  console.warn(`[Sprite2D] Unknown asset guid: ${ref}\n  (${why} — deleted, dropped from the build, renamed, or never assigned an id?)`);
+  return undefined;
+}
+
+/** A ref that resolves is no longer "unresolved" — drop it so a future genuine failure warns. */
+function forgetUnresolvedSprite(ref: string): void {
+  if (_unresolvedSpriteWarned.size) _unresolvedSpriteWarned.delete(ref);
+}
+
+/** Forget every warned ref. Called by the harness teardown (`createTestWorld().dispose()`)
+ *  alongside the other warn-once registries, so a warning assertion cannot be swallowed by a
+ *  sibling test that already tripped it. */
+export function resetUnresolvedSpriteWarnings(): void {
+  _unresolvedSpriteWarned.clear();
+}
+
 /** Resolve a 2D image-or-sprite ref to `{ url, frame, pivot }`.
  *  - A sprite GUID that's a member of a BUILT atlas resolves to the atlas page URL +
  *    its rect ON THE PAGE. `sheetW/sheetH` carry the page dims so a consumer can
@@ -215,6 +251,7 @@ export function resolveSprite(ref: string): ResolvedSprite | undefined {
   if (af) {
     const url = resolveAtlasPageUrl(af, '2d');
     if (url) {
+      forgetUnresolvedSprite(ref);
       return { url, frame: { ...af.rect }, pivot: { ...af.pivot }, sheetW: af.pageW, sheetH: af.pageH };
     }
     // No 2D page variant (mis-set atlas format) — fall through to the source sprite.
@@ -224,7 +261,8 @@ export function resolveSprite(ref: string): ResolvedSprite | undefined {
     // Resolve the URL through the parent texture's 2D variant (the slice has no file
     // of its own). Phase-2 packing will redirect this to the atlas page + page rect.
     const url = resolveTextureVariantUrl(entry.sprite.texture, '2d');
-    if (!url) return undefined;
+    if (!url) return warnUnresolvedSprite(ref, `its parent texture ${entry.sprite.texture} has no 2D variant`);
+    forgetUnresolvedSprite(ref);
     return {
       url, frame: { ...entry.sprite.rect }, pivot: { ...entry.sprite.pivot },
       sheetW: entry.sprite.sheetW ?? null, sheetH: entry.sprite.sheetH ?? null,
@@ -232,7 +270,8 @@ export function resolveSprite(ref: string): ResolvedSprite | undefined {
     };
   }
   const url = resolveTextureVariantUrl(ref, '2d');
-  if (!url) return undefined;
+  if (!url) return warnUnresolvedSprite(ref, 'not in the manifest');
+  forgetUnresolvedSprite(ref);
   return { url, frame: null, pivot: null, sheetW: null, sheetH: null };
 }
 

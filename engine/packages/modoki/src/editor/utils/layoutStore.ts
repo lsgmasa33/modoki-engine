@@ -90,6 +90,10 @@ export const panelLabel = (id: string, customPanels: readonly { id: string; name
 export const LAYOUT_KEY = 'editor-layout';            // localStorage working-state mirror
 export const LAYOUT_NAME_KEY = 'editor-layout-name';  // name of the tracked layout
 export const AUTODOCK_KEY = 'editor-autodocked-panels'; // openByDefault panel ids already auto-docked once
+/** One-shot marker: "the next load must start from the DEFAULT layout".
+ *  Why it is a marker rather than a deletion, and how it sits in the restore ladder:
+ *  [docs/editor.md](../../../../../../docs/editor.md) § "Shell & layout" (QA-EDITOR-0004). */
+export const LAYOUT_RESET_KEY = 'editor-layout-reset';
 
 /** Panel ids this editor has already auto-docked (so an openByDefault panel appears
  *  once, then respects the user closing it). */
@@ -194,6 +198,9 @@ export function normalizeTabTitles(model: Model): void {
  *  that gates openByDefault custom-panel auto-docking (so a panel the user later
  *  closes stays closed on reload). */
 export async function loadInitialModel(): Promise<{ model: Model; fromDefault: boolean }> {
+  // Consumed FIRST and unconditionally, so a throw further down can't strand the flag and
+  // reset every subsequent load.
+  if (takeLayoutResetFlag()) return { model: Model.fromJson(defaultLayout), fromDefault: true };
   const tracked = currentLayoutName();
   if (tracked) {
     const m = toModel(await readLayout(tracked));
@@ -212,6 +219,41 @@ export async function loadInitialModel(): Promise<{ model: Model; fromDefault: b
 export function clearStoredLayout(): void {
   localStorage.removeItem(LAYOUT_KEY);
   localStorage.removeItem(LAYOUT_NAME_KEY);
+  // The autosave outranks both keys above on load — see LAYOUT_RESET_KEY.
+  try { sessionStorage.setItem(LAYOUT_RESET_KEY, '1'); } catch { /* private mode → best effort */ }
+  _resetThisLoad = null; // a newly-armed reset must not be answered from this load's memo
+}
+
+/** Whether THIS page load is a reset load — resolved once, from the marker, then remembered.
+ *  `null` = not yet asked. */
+let _resetThisLoad: boolean | null = null;
+
+/** Is this page load a reset load? Reads and clears the marker on the FIRST call, then answers
+ *  from memory for the rest of the load.
+ *
+ *  The memo is not an optimisation, it is the fix for a defect the first version shipped with
+ *  (found by the close-out review). `main.tsx` wraps the app in `<StrictMode>`, so in dev React
+ *  mounts, runs effects, tears them down and runs them AGAIN. `EditorApp`'s init effect calls
+ *  `loadInitialModel()`, which consults this synchronously — so a read-and-clear consumed the
+ *  marker on the first, DISCARDED invocation (`alive = false`), and the second, live one saw
+ *  nothing and restored the autosave: Reset Layout silently reverted to the exact pre-fix bug,
+ *  deterministically, in every `npm run dev` session. The marker is still cleared on that first
+ *  read, so the next real page load restores normally — which is the semantics the name means:
+ *  one-shot per LOAD, not per call. */
+export function takeLayoutResetFlag(): boolean {
+  if (_resetThisLoad === null) {
+    try {
+      const v = sessionStorage.getItem(LAYOUT_RESET_KEY);
+      if (v) sessionStorage.removeItem(LAYOUT_RESET_KEY);
+      _resetThisLoad = !!v;
+    } catch { _resetThisLoad = false; }
+  }
+  return _resetThisLoad;
+}
+
+/** Test-only: model a fresh PAGE LOAD, which in production is a fresh module instance. */
+export function _resetLayoutLoadMemoForTests(): void {
+  _resetThisLoad = null;
 }
 
 /** One entry in the Load-Layout list: `name` is the layout id used to load it,

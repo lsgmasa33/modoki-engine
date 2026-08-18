@@ -586,7 +586,11 @@ export function createEditor(options: EditorOptions): React.ComponentType {
     import.meta.hot.on('asset-manifest-updated', (data: unknown) => {
       try {
         const manifest = data as Parameters<typeof loadManifestJson>[0];
-        loadManifestJson(manifest);
+        // `prune: true` — this payload is the dev server's COMPLETE rescan, so a guid missing
+        // from it is a file that no longer exists. Without it the client's guid map only ever
+        // grew and a deleted texture kept showing up in the SpritePicker until a full reload
+        // (QA-DLG-0009).
+        loadManifestJson(manifest, { prune: true });
         // Auto-refresh the Assets panel when the set of files on disk changes
         // (Finder drops, Create Prefab, external edits, deletes/renames) so the
         // user never has to hit Refresh. assetSetSignature dedupes the watcher's

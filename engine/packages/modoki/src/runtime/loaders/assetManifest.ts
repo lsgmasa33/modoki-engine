@@ -503,6 +503,9 @@ export function resolveRef(ref: string): string | undefined {
   return ref;
 }
 
+/** Guids registered BY `loadManifestJson` — the provenance the prune pass is scoped to. */
+const _manifestGuids = new Set<string>();
+
 /** Bulk-load a manifest JSON (production build path). Entries without a guid
  *  are ignored — they live in the same file for legacy font/panel discovery.
  *
@@ -512,12 +515,15 @@ export function resolveRef(ref: string): string | undefined {
  *  the shell's own assets and resolve against the shell's root. Prefixing each path
  *  once here, at merge time, is enough: the manifest is a guid→path map consumed only
  *  through `resolveRef` → `assetUrl`, never read again from the source JSON. */
-export function loadManifestJson(json: AssetManifestFile, opts?: { pathPrefix?: string }): void {
+export function loadManifestJson(json: AssetManifestFile, opts?: { pathPrefix?: string; prune?: boolean }): void {
   if (!Array.isArray(json.assets)) return;
   const prefix = opts?.pathPrefix ?? '';
+  const present = opts?.prune ? new Set<string>() : null;
   for (const entry of json.assets) {
     if (!entry.guid || !isGuid(entry.guid)) continue;
     const path = prefix ? prefix.replace(/\/$/, '') + entry.path : entry.path;
+    present?.add(entry.guid);
+    _manifestGuids.add(entry.guid);
     registerAsset(entry.guid, path, entry.type as AssetType, entry.texture, {
       model: entry.model,
       modelCache: entry.modelCache,
@@ -529,6 +535,36 @@ export function loadManifestJson(json: AssetManifestFile, opts?: { pathPrefix?: 
       font: entry.font,
       environment: entry.environment,
     }, entry.hash);
+  }
+  // PRUNE (opt-in) — drop guids this manifest no longer carries.
+  //
+  // WHY (QA-DLG-0009). `guidToEntry` is a module-level Map that was only ever ADDED to. The dev
+  // server rescans on every file change and pushes a COMPLETE manifest, but the client merged it
+  // and never removed a guid that had gone — so a texture deleted through Move to Trash lived on
+  // in `getAllAssets()` for the life of the browser context, and the SpritePicker (whose whole
+  // data source is that array) kept offering phantom sprites that resolve to nothing. Only a full
+  // editor reload cleared it.
+  //
+  // Restricted to guids THIS function registered (`_manifestGuids`): the same entry point also
+  // merges an OTA sub-game's manifest FRAGMENT (see `pathPrefix`), which must never prune the
+  // shell's assets, and the client registers guids of its own that no scanner payload contains —
+  // a scene guid stamped by SceneManager at load, an editor-side `registerSprite`. Pruning by
+  // "absent from this payload" alone would silently delete those.
+  //
+  // NEVER prune to nothing. `rebuildManifest` (vite-asset-scanner) re-derives the asset roots
+  // and broadcasts whatever the scan returns, with no plausibility check — so a moment where
+  // the asset directory is unreadable (a project switch, a `git checkout` under a live editor)
+  // publishes an EMPTY manifest. Pruning on that would blank every texture, mesh and material
+  // in the running editor at once, turning "some files went away" into a total wipe. An empty
+  // payload can never legitimately REQUIRE a prune either: a project with no assets has nothing
+  // registered from a manifest to begin with (client-side registrations are out of scope above),
+  // so refusing here can only protect. Introduced with the prune; found by the close-out review.
+  if (present && present.size > 0) {
+    for (const guid of [..._manifestGuids]) {
+      if (present.has(guid)) continue;
+      _manifestGuids.delete(guid);
+      unregisterAsset(guid);
+    }
   }
 }
 
@@ -599,6 +635,7 @@ export function serializeManifest(): AssetManifestFile {
 export function clearManifest(): void {
   guidToEntry.clear();
   pathToGuid.clear();
+  _manifestGuids.clear();
   _spriteEpochByTexture.clear();
   clearAtlasFrames();
   manifestLoadPromise = null;

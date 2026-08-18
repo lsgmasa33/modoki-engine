@@ -36,15 +36,31 @@ Scene/Game/Console/Assets column (center), and Inspector (right).
 
 Layout state is persisted two ways:
 
-- **Working state** auto-saves (debounced) to `localStorage` under `editor-layout`.
+- **Working state** auto-saves (debounced) BOTH to `localStorage` under `editor-layout`
+  **and** to a reserved server-side layout named `autosave` — the recovery point the Load
+  Layout dialog pins as *"Last session (auto-saved)"*.
 - **Named layouts** are written as `<name>.layout.json` files under
   `<project>/.modoki/layouts` via the backend's `/api/layout` POST endpoint
   (listed via `/api/layouts` GET) (File → *Save Layout As…* / *Load Layout…*). The tracked file path is stored in
   `localStorage` so the association survives a reload.
 
-On startup `loadInitialModel()` prefers the tracked file, then the localStorage mirror,
-then the built-in default layout. *Reset Layout* clears both and reloads (live
-Three.js/Pixi viewports don't tear down cleanly on an in-place model swap).
+On startup `loadInitialModel()` ranks **tracked file → autosave → localStorage mirror →
+built-in default**. The autosave tier is easy to forget and is load-bearing: it sits ABOVE
+the mirror, so clearing the two `localStorage` keys does not get you the default.
+
+*Reset Layout* therefore does not work by deletion. It clears the two keys, arms a one-shot
+`sessionStorage` marker (`editor-layout-reset`), and reloads; `loadInitialModel()` consults
+that marker first and skips every restore tier for exactly that one **load** (live
+Three.js/Pixi viewports don't tear down cleanly on an in-place model swap, hence the reload).
+Deleting the autosave instead would destroy the recovery point, and doing nothing about it was
+QA-EDITOR-0004: once any panel had moved, *Reset Layout* restored the very layout being reset.
+
+⚠️ One-shot per **load**, not per call, and that distinction is load-bearing. `main.tsx` wraps
+the app in `<StrictMode>`, so in dev React runs `EditorApp`'s init effect, discards it, and runs
+it again — two `loadInitialModel()` calls per page load, and the SECOND is the one that renders.
+A plain read-and-clear was consumed by the discarded first call, which put the bug straight back
+in every `npm run dev` session. `takeLayoutResetFlag()` clears the marker on its first read but
+keeps answering from a module-level memo for the rest of that load.
 
 A named layout is project-local (`.modoki/layouts` is gitignored) — to move a layout to
 another project/machine or share it, both directions go through a portable

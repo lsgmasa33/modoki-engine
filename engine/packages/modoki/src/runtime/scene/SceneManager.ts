@@ -43,7 +43,7 @@ import {
 import { acquireRiggedModel } from '../loaders/riggedModelCache';
 import { acquireAudio } from '../loaders/audioBufferCache';
 import { acquireFont } from '../loaders/fontAtlasLoader';
-import { registerAsset, isGuid, resolveRef, resolveGuidToPath, getAudioLoadType } from '../loaders/assetManifest';
+import { registerAsset, isGuid, resolveGuidToPath, getAudioLoadType } from '../loaders/assetManifest';
 import { loadTimelineNow } from '../loaders/timelineCache';
 import { collectTimelineAudioRefs, collectTimelineControlRefs, collectTimelineVideoRefs } from '../timeline/types';
 import { ASSET_FETCH_INIT, parseAssetJson } from '../loaders/assetFetch';
@@ -915,13 +915,20 @@ class SceneManagerImpl implements SceneManager {
       const def = await loadTimelineNow(tRef.path);
       if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
       if (!def) continue;
+      // The GUID goes in AS-IS — `acquireAudio` resolves it itself, exactly like prefabs and
+      // video below, and exactly like every audio resource a scene file authors (checked: every
+      // `type:'audio'` entry in games/ + demos/ is a GUID). This line used to pre-resolve the
+      // GUID to a path, which made the ref resolve TWICE: `acquireAudio` → `refToPath` →
+      // `resolveRef(<internal path>)`, which correctly rejects an internal path
+      // ("[assetManifest] path reference no longer supported — use a GUID"), bailed, and left the
+      // clip un-preloaded — so a timeline audio cue never played and every boot logged the error
+      // (QA-GAME-0001, timeline-demo). Invisible to `assetRefIntegrity`, which scans committed
+      // data: this path only ever existed at runtime.
       for (const cueRef of collectTimelineAudioRefs(def)) {
-        const audioPath = isGuid(cueRef) ? resolveRef(cueRef) : cueRef;
-        if (audioPath) addRef({ type: 'audio', path: audioPath });
+        if (cueRef) addRef({ type: 'audio', path: cueRef });
       }
       // Prefab resources carry the GUID (not a resolved path) — matching the entity collector's
-      // PrefabInstance.source refs, since acquirePrefab resolves the GUID itself. (Audio above
-      // carries the resolved path; the two resource kinds differ by convention.)
+      // PrefabInstance.source refs, since acquirePrefab resolves the GUID itself.
       for (const prefabRef of collectTimelineControlRefs(def)) {
         if (prefabRef) addRef({ type: 'prefab', path: prefabRef });
       }

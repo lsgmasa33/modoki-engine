@@ -15,7 +15,8 @@ import { isSkeletalPreviewing } from '../core/skeletalPreview';
 import { sceneManager } from '../scene/SceneManager';
 import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_3D } from './frameDriver';
 import { registerSceneRenderer, unregisterSceneRenderer, normalizeJpegQuality, type SceneRenderer } from './offscreenCapture';
-import { registerBoundsProvider, projectAABBToScreen, type EntityScreenBounds } from '../core/screenBounds';
+import { registerBoundsProvider } from '../core/screenBounds';
+import { computeEntityScreenBounds } from './entityScreenBounds';
 import { readbackToRGBA, type ReadbackBackend } from './readbackToRGBA';
 import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, reconcileToneExposure, prewarmShadersForWorld, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
 import { registerRenderSurface } from './materialBroker';
@@ -772,31 +773,27 @@ export default function Scene3D() {
       // live world AABB through the GAME camera to a viewport CSS rect, so an agent
       // can reason about on-screen position/size/overlap numerically. Works at any
       // hierarchy depth (Box3.setFromObject + updateWorldMatrix walk the full chain).
-      const _boundsBox = new THREE.Box3();
       const unregBounds = registerBoundsProvider((ids) => {
-        const out: EntityScreenBounds[] = [];
         const r = renderer.domElement.getBoundingClientRect();
-        const vp = { left: r.left, top: r.top, width: r.width, height: r.height };
-        for (const [id, obj] of renderState.ecsObjects) {
-          if (ids && !ids.has(id)) continue;
-          obj.updateWorldMatrix(true, true);
-          _boundsBox.setFromObject(obj);
-          // Project through the ACTIVE camera (ortho or perspective) so the
-          // reported rects match what's actually rendered — an ortho scene
-          // projected through the perspective frustum gives wrong CSS rects +
-          // onScreen flags.
-          const { screen, onScreen } = projectAABBToScreen(_boundsBox, activeCamera, vp);
-          // V5: also surface the raw world-space AABB size/center (previously computed
-          // then discarded) so scene-state?bounds carries true geometric extent.
-          let worldAABB: EntityScreenBounds['worldAABB'];
-          if (!_boundsBox.isEmpty()) {
-            const s = _boundsBox.getSize(new THREE.Vector3());
-            const c = _boundsBox.getCenter(new THREE.Vector3());
-            worldAABB = { size: [s.x, s.y, s.z], center: [c.x, c.y, c.z] };
-          }
-          out.push({ id, layer: '3d', surface: 'game-3d', screen, onScreen, ...(worldAABB ? { worldAABB } : {}) });
-        }
-        return out;
+        // Shared with SceneView's provider (`runtime/rendering/entityScreenBounds.ts`) so the
+        // two cannot measure different sets of entities — which they did: this one covered
+        // ONLY `ecsObjects`, so a skinned character had no bounds in the GAME view and an
+        // entity aim at `surface:'game-3d'` was refused for something plainly on screen.
+        // Projected through the ACTIVE camera (ortho or perspective) so the rects match what is
+        // actually rendered — an ortho scene through the perspective frustum gives wrong CSS
+        // rects and onScreen flags. No gizmos here: icon affordances are editor-only.
+        return computeEntityScreenBounds(
+          {
+            ecsObjects: renderState.ecsObjects,
+            skinned: renderState.skinned,
+            billboards: renderState.billboards,
+            textMeshes: renderState.textMeshes,
+          },
+          activeCamera,
+          { left: r.left, top: r.top, width: r.width, height: r.height },
+          'game-3d',
+          ids,
+        );
       }, 'game-3d');
 
       // On world swap, drop all cached Three.js objects (entity IDs are world-scoped).

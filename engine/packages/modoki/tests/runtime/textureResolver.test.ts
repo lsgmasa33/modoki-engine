@@ -5,6 +5,7 @@ import {
   resolveTextureVariantUrl, getTextureSettings, invalidateTexture, resolveSprite,
   loadTexture3D, releaseTexture3D, getSharedTextureStats, disposeAllSharedTextures, isSharedTexture,
   getKTX2Loader, setActiveRenderer, onRendererReady, getActiveRenderer,
+  resetUnresolvedSpriteWarnings,
 } from '../../src/runtime/loaders/textureResolver';
 import { DEFAULT_TEXTURE_SETTINGS } from '../../src/runtime/loaders/textureSettings';
 import { setActiveTextureSizeCap, resetActiveTextureSizeCap } from '../../src/runtime/core/textureSizeCap';
@@ -474,5 +475,68 @@ describe('setActiveRenderer caps detection + rendererReady (Missing Test #3)', (
     });
     setActiveRenderer({} as never);
     reset.mockRestore();
+  });
+});
+
+/** A dangling 2D sprite ref must not fail SILENTLY (QA-ASSET-0011).
+ *
+ *  The 3D path has warned once per unresolvable guid for a long time; the 2D path returned
+ *  `undefined` and Scene2D's two call sites bailed with no output, so deleting a texture a
+ *  sprite referenced rendered nothing against a clean console. */
+describe('resolveSprite — dangling refs warn once', () => {
+  const MISSING = '44444444-4444-4444-8444-444444444444';
+  const SPRITE = '55555555-5555-4555-8555-555555555555';
+
+  beforeEach(() => resetUnresolvedSpriteWarnings());
+
+  it('warns exactly once for a guid that is not in the manifest, and stays undefined', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(resolveSprite(MISSING)).toBeUndefined();
+      expect(resolveSprite(MISSING)).toBeUndefined();
+      expect(resolveSprite(MISSING)).toBeUndefined();
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).toContain(MISSING);
+      expect(String(warn.mock.calls[0][0])).toContain('[Sprite2D]');
+    } finally { warn.mockRestore(); }
+  });
+
+  it('warns for a slice whose parent texture has gone missing', () => {
+    // The slice is registered, but its parent texture guid resolves to nothing.
+    registerSprite(SPRITE, MISSING, PATH, {
+      texture: MISSING, rect: { x: 0, y: 0, w: 8, h: 8 }, pivot: { x: 0.5, y: 0.5 },
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(resolveSprite(SPRITE)).toBeUndefined();
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).toContain(SPRITE);
+    } finally { warn.mockRestore(); }
+  });
+
+  it('FORGETS a ref that later resolves, so a genuine later break still warns', () => {
+    // The transient window before the manifest loads must not permanently silence a guid — that
+    // is the exact "blank screen, clean console" failure this warning exists to prevent.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(resolveSprite(MISSING)).toBeUndefined();     // transient miss → warns once
+      expect(warn).toHaveBeenCalledTimes(1);
+
+      registerAsset(MISSING, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'webp' });
+      expect(resolveSprite(MISSING)?.url).toContain(PATH); // now resolves → forgotten
+
+      clearManifest();                                    // the asset is genuinely gone
+      expect(resolveSprite(MISSING)).toBeUndefined();
+      expect(warn).toHaveBeenCalledTimes(2);              // warns AGAIN, not silently
+    } finally { warn.mockRestore(); }
+  });
+
+  it('does not warn for a non-guid ref (a primitive keyword or external URL)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      resolveSprite('circle');
+      resolveSprite('https://example.com/x.png');
+      expect(warn).not.toHaveBeenCalled();
+    } finally { warn.mockRestore(); }
   });
 });

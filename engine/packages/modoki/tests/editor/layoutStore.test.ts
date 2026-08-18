@@ -40,6 +40,7 @@ import {
   saveLayout, loadLayout, currentLayoutName,
   writeLayoutJson, writeLayout, downloadLayoutJson, readLayout,
   toModel, normalizeTabTitles, loadInitialModel, clearStoredLayout, orderLayoutChoices,
+  takeLayoutResetFlag, LAYOUT_RESET_KEY, _resetLayoutLoadMemoForTests,
 } from '../../src/editor/utils/layoutStore';
 
 const okJson = (body: unknown) => ({ ok: true, json: async () => body }) as unknown as Response;
@@ -54,6 +55,8 @@ const minimalModel = (component = 'scene', name = 'Scene'): IJsonModel => ({
 
 beforeEach(() => {
   localStorage.clear();
+  sessionStorage.clear();
+  _resetLayoutLoadMemoForTests(); // each test is a fresh page load
   backendFetch.mockReset();
 });
 
@@ -347,5 +350,64 @@ describe('clearStoredLayout', () => {
     clearStoredLayout();
     expect(localStorage.getItem(LAYOUT_KEY)).toBeNull();
     expect(localStorage.getItem(LAYOUT_NAME_KEY)).toBeNull();
+  });
+
+  /** QA-EDITOR-0004: dropping the two localStorage keys was never enough — the server-side
+   *  autosave outranks both, so Reset Layout handed back the layout being reset. */
+  it('arms the one-shot reset marker so the next load skips every restore tier', () => {
+    clearStoredLayout();
+    expect(sessionStorage.getItem(LAYOUT_RESET_KEY)).toBe('1');
+  });
+
+  it('takeLayoutResetFlag clears the marker on the first read, but keeps ANSWERING for this load', () => {
+    clearStoredLayout();
+    expect(takeLayoutResetFlag()).toBe(true);
+    expect(sessionStorage.getItem(LAYOUT_RESET_KEY)).toBeNull(); // consumed…
+    expect(takeLayoutResetFlag()).toBe(true);                    // …but still true THIS load
+    _resetLayoutLoadMemoForTests();                              // a fresh page load
+    expect(takeLayoutResetFlag()).toBe(false);
+  });
+
+  /** `main.tsx` wraps the app in <StrictMode>, so in dev React runs EditorApp's init effect,
+   *  discards it, and runs it again — two `loadInitialModel()` calls in one page load, the
+   *  SECOND of which is the live one. A read-and-clear marker was consumed by the discarded
+   *  first call, so Reset Layout silently regressed to restoring the autosave every single
+   *  time. Found by the close-out review of the fix itself. */
+  it('survives StrictMode: the SECOND loadInitialModel of the same load is still the default', async () => {
+    saveLayout(Model.fromJson(minimalModel('assets', 'Assets')));
+    backendFetch.mockImplementation(async (url: string) =>
+      (url.includes(`name=${AUTOSAVE_NAME}`) ? okJson(minimalModel('console', 'Console')) : notOk()));
+
+    clearStoredLayout();
+    const first = await loadInitialModel();   // React's discarded invocation
+    const second = await loadInitialModel();  // the one that actually renders
+    expect(first.fromDefault).toBe(true);
+    expect(second.fromDefault).toBe(true);
+
+    _resetLayoutLoadMemoForTests();           // the NEXT real page load
+    expect((await loadInitialModel()).fromDefault).toBe(false);
+  });
+
+  it('after a reset, loadInitialModel returns the DEFAULT even though an autosave exists', async () => {
+    saveLayout(Model.fromJson(minimalModel('assets', 'Assets')));
+    localStorage.setItem(LAYOUT_NAME_KEY, 'my-named-layout');
+    backendFetch.mockImplementation(async (url: string) => {
+      if (url.includes('name=my-named-layout')) return okJson(minimalModel('inspector', 'Inspector'));
+      if (url.includes(`name=${AUTOSAVE_NAME}`)) return okJson(minimalModel('console', 'Console'));
+      return notOk();
+    });
+
+    clearStoredLayout();
+    const { model, fromDefault } = await loadInitialModel();
+    expect(fromDefault).toBe(true);
+    let sawScene = false;
+    model.visitNodes((n) => { if (n.getType() === 'tab' && (n as unknown as { getComponent(): string }).getComponent() === 'scene') sawScene = true; });
+    expect(sawScene).toBe(true);
+
+    // ONE-SHOT PER LOAD: the very next PAGE LOAD restores normally again (the autosave is
+    // still a recovery point, it just no longer defeats the menu item).
+    _resetLayoutLoadMemoForTests();
+    const again = await loadInitialModel();
+    expect(again.fromDefault).toBe(false);
   });
 });
