@@ -46,7 +46,7 @@ function profileOf(frameMs: number, cpuMs: number): FrameProfile {
   return {
     samples: 120, frameMs: stat(frameMs), cpuMs: stat(cpuMs),
     restMs: stat(Math.max(0, frameMs - cpuMs)), fps: 1000 / frameMs,
-    vsyncBound: false, overBudget: frameMs > BUDGET_30FPS_MS, budgetMs: BUDGET_30FPS_MS, discontinuities: 0,
+    vsyncBound: false, overBudget: frameMs > BUDGET_30FPS_MS, budgetMs: BUDGET_30FPS_MS, discontinuities: 0, worstStallMs: 0,
   };
 }
 const ROOMY = () => profileOf(10, 4);

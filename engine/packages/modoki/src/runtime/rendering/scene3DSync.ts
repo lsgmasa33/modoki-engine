@@ -45,7 +45,7 @@ import { tierShadowMapSize, tierAllowsIBL, tierAmbientBoost, tierExposureBoost, 
 import { armAutoLightCap, autoCapMaskFor, isAutoLightCapEngaged } from './autoLightCapFrame';
 import { armShadowCasterCap, shadowCasterAllowed } from './shadowCasterCapFrame';
 import { casterTypeOf, type ShadowCaster } from './shadowCasterCap';
-import { applyInstancedBatching } from './instancedBatching';
+import { applyInstancedBatching, clearInstancedBatches } from './instancedBatching';
 import { resolveActiveTier } from './tierResolve';
 import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
 import { resolveAnimSetParams, ANIMSET_DEFAULTS, getAnimSet } from '../loaders/animSetCache';
@@ -3146,7 +3146,12 @@ export function syncSceneRenderables3D(
   // OPT-IN because it hides the individual meshes it replaces, and the editor SceneView picks
   // entities by raycasting those meshes — batching them there would break selection. The game
   // runtime, which has no picking, is where the 237-draw-call frame lives.
+  // Turning it OFF must RESTORE the scene, not just stop batching: the pass hides every member it
+  // replaced, so skipping the call would leave those meshes hidden and their InstancedMesh still
+  // in the scene — a scene that renders FEWER draws with batching "off" than with it on, which
+  // silently corrupts exactly the A/B a caller flips this flag to run.
   if (callbacks?.batchDrawCalls) applyInstancedBatching(scene, state.ecsObjects.values());
+  else clearInstancedBatches(scene);
 }
 
 /** Clear all owned-material tracking. Call on world swap alongside clearing

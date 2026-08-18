@@ -80,6 +80,16 @@ export interface FrameProfile {
   /** Frames dropped from the window as discontinuities (see MAX_PLAUSIBLE_FRAME_MS). A
    *  non-zero count next to a healthy profile usually means stalls, not smooth rendering. */
   discontinuities: number;
+  /** The LONGEST dropped interval, in ms, since the last reset — 0 when none was dropped.
+   *
+   *  Counting stalls without sizing them is what made the boot stall un-re-measurable (#212 item
+   *  3): a 3,926 ms figure sat unverified in an issue for weeks because the only instrument that
+   *  saw the stall deliberately threw the number away, and `discontinuities: 1` reads identically
+   *  for a 1.1 s hitch and a 7 s freeze. Dropping it from the PERCENTILES is right — one stall
+   *  would poison every one of them — but dropping it from the RECORD was not. Recorded here so
+   *  "did the compileAsync change kill the boot stall" is one profiler read rather than a
+   *  bespoke instrumentation pass. */
+  worstStallMs: number;
 }
 
 // Two parallel ring buffers rather than an array of objects: this writes every frame, and a
@@ -91,6 +101,7 @@ let writeIndex = 0;
 let filled = 0;
 let prevFrameStart = 0;
 let discontinuities = 0;
+let worstStallMs = 0;
 
 /** Record one frame. Called by `frameDriver` — two `rawNow()` reads and a ring write, so it is
  *  ALWAYS ON: the faults worth profiling (a boot-time context loss, an intermittent hitch) are
@@ -107,6 +118,7 @@ export function recordFrame(frameStart: number, callbacksEnd: number): { frameMs
       if (filled < PROFILE_WINDOW_FRAMES) filled++;
     } else {
       discontinuities++;
+      if (frameMs > worstStallMs) worstStallMs = frameMs;
     }
   }
   prevFrameStart = frameStart;
@@ -210,6 +222,7 @@ export function getFrameProfile(): FrameProfile {
     overBudget: frameMs.median > budgetMs,
     budgetMs,
     discontinuities,
+    worstStallMs,
   };
 }
 
@@ -223,6 +236,7 @@ export function resetFrameProfile(): void {
   filled = 0;
   prevFrameStart = 0;
   discontinuities = 0;
+  worstStallMs = 0;
 }
 
 /** Timestamp source, shared with `frameDriver` so both agree under an injected manual clock. */

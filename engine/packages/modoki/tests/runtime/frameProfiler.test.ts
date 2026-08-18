@@ -151,6 +151,27 @@ describe('frameProfiler — discontinuities', () => {
     expect(getFrameProfile().discontinuities).toBe(2);
   });
 
+  it('SIZES the worst stall, not just counts it — 1.1s and 7s are not the same fault', () => {
+    // The count alone was the whole instrument for the boot stall (#212 item 3), and it reads
+    // identically for a hitch and a freeze — which is why a 3,926 ms figure could sit unverified.
+    feed([
+      { frameMs: 16, cpuMs: 4 },
+      { frameMs: 1290, cpuMs: 5 },
+      { frameMs: 16, cpuMs: 4 },
+      { frameMs: 3926, cpuMs: 5 },
+      { frameMs: 16, cpuMs: 4 },
+    ]);
+    const p = getFrameProfile();
+    expect(p.discontinuities).toBe(2);
+    expect(p.worstStallMs).toBe(3926);   // the WORST, not the latest
+    expect(p.frameMs.max).toBe(16);      // and still kept out of the percentiles
+  });
+
+  it('reports no stall as 0 rather than a stale high-water mark', () => {
+    feed([{ frameMs: 16, cpuMs: 4 }, { frameMs: 17, cpuMs: 4 }]);
+    expect(getFrameProfile().worstStallMs).toBe(0);
+  });
+
   it('ignores a zero or negative interval', () => {
     recordFrame(1000, 1002);
     recordFrame(1000, 1002); // same timestamp — no elapsed interval
@@ -207,6 +228,7 @@ describe('frameProfiler — the ring', () => {
     const p = getFrameProfile();
     expect(p.samples).toBe(0);
     expect(p.discontinuities).toBe(0);
+    expect(p.worstStallMs).toBe(0);
     // The baseline is cleared too, so the next single frame produces no phantom interval
     // measured against a timestamp from before the reset.
     recordFrame(50000, 50004);

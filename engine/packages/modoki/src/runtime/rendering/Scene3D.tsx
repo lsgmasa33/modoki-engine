@@ -67,12 +67,41 @@ import { nprConfigFromTrait, type NprTraitSnapshot } from './npr/nprConfigFromTr
  *  per-call cost is precisely what is being paid. Read "per-call overhead was never the cost" as
  *  scoped to the GPU-bound regime it was measured in — it does not generalize.
  *
- *  Kept rather than reverted because the mechanism is sound and the census says other projects are
- *  far more repeated (forest-camp 554 entities on repeated pairs, 3d-test 456) — but it must not
+ *  ⛔ AND THE CENSUS THAT KEPT IT ALIVE IS WRONG (#212, 2026-08-18). "forest-camp 554 entities on
+ *  repeated pairs" does not survive contact with the running scene: measured live on a Galaxy A23,
+ *  forest-camp has 88 batchable meshes resolving to 59 distinct geometries, and its LARGEST repeat
+ *  group is 5 — one short of MIN_INSTANCES, so `batched: 0 of 80 considered` with 51 buckets
+ *  `below-threshold`. Turning the flag on there changed draw calls 94 -> 94 and cost +0.4 ms in
+ *  `renderables` for a pass that batched nothing. The census counted AUTHORED mesh refs; the batch
+ *  key is RESOLVED geometry+material identity, and the two are not the same number.
+ *  (Not a material-forking artifact — pairBuckets 59 == geoBuckets 59, so nothing forked; the
+ *  geometry simply is not repeated. Ruled out explicitly because it is the plausible wrong answer.)
+ *
+ *  So the flag now needs BOTH conditions and no project has shown both: repeated geometry (sling
+ *  has it; forest-camp does not) AND a CPU-bound submit (forest-camp has it at 8.2 of 15.7 ms CPU;
+ *  sling did not, being GPU-bound at 85 ms). Before flipping it on for a project, read
+ *  `getBatchStats()` FIRST — `batched`/`drawCallsSaved` say in one call whether there is anything
+ *  to win, without a build.
+ *
+ *  Kept rather than reverted because the mechanism is sound — but it must not
  *  ship enabled on the strength of a hypothesis its own measurement refuted. Flip this ON only
  *  behind a before/after `renderer.calls` AND frame-time reading on the target device.
  *  Full write-up: docs/plans/draw-call-instancing-plan.md. */
 const BATCH_DRAW_CALLS = false;
+
+/** Runtime override for the on-device A/B this flag's own comment demands (#212).
+ *
+ *  Rebuilding and reinstalling per arm makes the install path itself a variable, and on a phone
+ *  whose `cpuMs` swings 13-18 ms on its own that confound is larger than the effect being
+ *  measured. So the arm is switchable in place: `__modokiBatchDrawCalls = true|false` through
+ *  `device_eval`, read per sync, `undefined` meaning "whatever the build ships". Toggling ON
+ *  costs a one-off pipeline compile for the instanced variant (an InstancedMesh is a different
+ *  shader), so discard the first samples after a flip and read steady state — the same trap that
+ *  made a runtime shadow-caster swap unshippable at ~200 ms per swap (#229). */
+function batchDrawCallsEnabled(): boolean {
+  const override = (globalThis as { __modokiBatchDrawCalls?: boolean }).__modokiBatchDrawCalls;
+  return typeof override === 'boolean' ? override : BATCH_DRAW_CALLS;
+}
 
 let nextInstanceId = 0;
 
@@ -390,7 +419,7 @@ export default function Scene3D() {
         syncLights(world, scene, ecsLights, shadowFocusFor(activeCamera));
         endProfilerSample();
         beginProfilerSample('renderables');
-        syncSceneRenderables3D(world, scene, renderState, { batchDrawCalls: BATCH_DRAW_CALLS });
+        syncSceneRenderables3D(world, scene, renderState, { batchDrawCalls: batchDrawCallsEnabled() });
         endProfilerSample();
         orientBillboards(renderState, activeCamera); // face billboards toward the live camera
         // Inside the editor PREVIEW envelope the SceneView owns particle preview (it supplies its
@@ -680,7 +709,7 @@ export default function Scene3D() {
           // syncBoneAttachments a skeletal scene captured absent or frozen at a
           // stale pose, breaking the "same ECS state ⇒ same framing" contract of
           // the agent-verification path (modoki_render_scene).
-          syncSceneRenderables3D(world, scene, renderState, { batchDrawCalls: BATCH_DRAW_CALLS });
+          syncSceneRenderables3D(world, scene, renderState, { batchDrawCalls: batchDrawCallsEnabled() });
           syncParticles(world, scene, particleState);
           syncFlameMeshes(world, scene, flameState);
           syncBlobShadows(world, scene, blobShadowState);

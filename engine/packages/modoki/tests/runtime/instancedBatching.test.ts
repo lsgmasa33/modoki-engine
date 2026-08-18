@@ -2,10 +2,15 @@
  *  that merges two entities whose materials diverged is faster AND wrong, and wrong in a way that
  *  looks like "lighting stopped working on some tiles" rather than like a batching bug. */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import * as THREE from 'three';
+
+// The module registers its world-swap teardown at import time (mirroring flameMeshSync's lathe
+// cache); stub the hook so importing it here does not pull in the real world graph.
+vi.mock('../../src/runtime/core/ecs/world', () => ({ onWorldSwap: vi.fn() }));
+
 import {
-  applyInstancedBatching, clearInstancedBatches, getBatchStats, MIN_INSTANCES,
+  applyInstancedBatching, clearInstancedBatches, clearAllInstancedBatches, getBatchStats, MIN_INSTANCES,
 } from '../../src/runtime/rendering/instancedBatching';
 
 function meshes(n: number, geo: THREE.BufferGeometry, mat: THREE.Material): THREE.Mesh[] {
@@ -142,6 +147,27 @@ describe('lifecycle', () => {
     expect(scene.children.some((c) => (c as THREE.InstancedMesh).isInstancedMesh)).toBe(false);
   });
 
+  it('clears only the scene it was given — one module, several scenes', () => {
+    // The editor runs the Game panel (batching on) and the SceneView (batching off, because it
+    // picks by raycasting the meshes a batch hides) against ONE module instance. An unfiltered
+    // clear would let the SceneView's sync dispose the game's batches every frame and the game
+    // rebuild them every frame — pipeline churn caused by the cleanup path.
+    const other = new THREE.Scene();
+    const mine = meshes(MIN_INSTANCES, geo, mat);
+    mine.forEach((m) => scene.add(m));
+    applyInstancedBatching(scene, mine);
+
+    const theirGeo = new THREE.BoxGeometry(2, 2, 2);
+    const theirs = meshes(MIN_INSTANCES, theirGeo, mat);
+    theirs.forEach((m) => other.add(m));
+    applyInstancedBatching(other, theirs);
+
+    clearInstancedBatches(other);
+    expect(theirs.every((m) => m.visible)).toBe(true);        // theirs restored
+    expect(mine.every((m) => !m.visible)).toBe(true);         // mine untouched
+    expect(scene.children.some((c) => (c as THREE.InstancedMesh).isInstancedMesh)).toBe(true);
+  });
+
   it('rebuilds when membership changes, and retires a group that drops below the threshold', () => {
     const ms = meshes(MIN_INSTANCES + 2, geo, mat);
     ms.forEach((m) => scene.add(m));
@@ -179,6 +205,51 @@ describe('lifecycle', () => {
     const m = new THREE.Matrix4();
     inst.getMatrixAt(1, m);
     expect(new THREE.Vector3().setFromMatrixPosition(m).x).toBeCloseTo(99);
+  });
+});
+
+describe('teardown paths the scene scoping opened', () => {
+  it('reclaims an ORPHANED batch instead of stranding its members hidden', () => {
+    const ms = meshes(MIN_INSTANCES, geo, mat);
+    ms.forEach((m) => scene.add(m));
+    applyInstancedBatching(scene, ms);
+    const batch = scene.children.find((c) => (c as THREE.InstancedMesh).isInstancedMesh)!;
+
+    // The scene is torn down without going through clearInstancedBatches — the batch is now
+    // parented to nothing, and no future call will ever be handed its old scene again.
+    batch.removeFromParent();
+
+    // A clear for a DIFFERENT scene must still reclaim it: scoping by `parent === scene` alone
+    // skipped it forever, leaving every member invisible and the group leaked.
+    clearInstancedBatches(new THREE.Scene());
+    expect(ms.every((m) => m.visible)).toBe(true);
+  });
+
+  it('clearAllInstancedBatches drops batches from EVERY scene — the world is going away', () => {
+    const a = meshes(MIN_INSTANCES, geo, mat);
+    a.forEach((m) => scene.add(m));
+    applyInstancedBatching(scene, a);
+
+    const other = new THREE.Scene();
+    const theirGeo = new THREE.BoxGeometry(3, 3, 3);
+    const b = meshes(MIN_INSTANCES, theirGeo, mat);
+    b.forEach((m) => other.add(m));
+    applyInstancedBatching(other, b);
+
+    clearAllInstancedBatches();
+    expect([...a, ...b].every((m) => m.visible)).toBe(true);
+    expect(scene.children.some((c) => (c as THREE.InstancedMesh).isInstancedMesh)).toBe(false);
+    expect(other.children.some((c) => (c as THREE.InstancedMesh).isInstancedMesh)).toBe(false);
+  });
+
+  it('does not allocate a stats object on the no-op path', () => {
+    // clearInstancedBatches runs on the else branch of EVERY sync — every frame, every surface,
+    // for as long as batching ships off. Returning a fresh object there put four allocations per
+    // frame into the render loop of every game. Identity is the only way to observe that.
+    clearInstancedBatches(scene);
+    const first = getBatchStats();
+    clearInstancedBatches(scene);
+    expect(getBatchStats()).toBe(first);
   });
 });
 

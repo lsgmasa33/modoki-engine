@@ -38,7 +38,7 @@ let stored: 'low' | 'mid' | 'high' | null = null;
 const stat = (v: number) => ({ median: v, p95: v, min: v, max: v });
 const mockProfile: FrameProfile = {
   samples: 120, frameMs: stat(10), cpuMs: stat(4), restMs: stat(6), fps: 100,
-  vsyncBound: false, overBudget: false, budgetMs: BUDGET_30FPS_MS, discontinuities: 0,
+  vsyncBound: false, overBudget: false, budgetMs: BUDGET_30FPS_MS, discontinuities: 0, worstStallMs: 0,
 };
 
 beforeEach(() => {

@@ -46,6 +46,7 @@ function profile(o: {
     // The threshold the fixture judged itself by — the demotion reason quotes it back.
     budgetMs: BUDGET_30FPS_MS,
     discontinuities: 0,
+    worstStallMs: 0,
   };
 }
 
