@@ -388,3 +388,86 @@ describe('source paths cited in docs and CLAUDE.md resolve (#194, second face; #
     expect(stale, 'exemption list has entries that are no longer needed').toEqual([]);
   });
 });
+
+/* ------------------------------------------------------------------ Rule 3 */
+
+/** Rule 3: a cited SECTION (`… test-cost.md § 8a-bis`) names a heading that exists.
+ *
+ *  Rules 1 and 2 check that a cited PATH resolves. That is not enough where a doc is cited by
+ *  section: `games/court/test-cost.md` is pointed at by 15 source files, several of them by
+ *  section number (`§ 6`, `§ 7b`, `§ 8a-bis`), because the sections carry the reasoning the
+ *  code depends on. Renumbering one breaks every citation of it and NOTHING notices — the path
+ *  still resolves, so rule 1 stays green while the pointer now aims at different prose. That is
+ *  the same defect #194 was about, one level finer, and the doc itself asks callers not to
+ *  renumber precisely because nothing enforced it.
+ *
+ *  SCOPE, deliberately narrow so this cannot cry wolf:
+ *  - Only a `§` that FOLLOWS a doc path within a short window is attributed to that doc. A bare
+ *    `§ 5` elsewhere in a file usually refers to the file's own sections, and guessing at those
+ *    would fail on correct prose.
+ *  - Only NUMERIC-style ids (`6`, `7b`, `8a-bis`) are checked. Citations by quoted title
+ *    (`§ "a gate that still pays is not a gate"`) or by word (`§ Phase 5`) are skipped: they are
+ *    rarer, and matching them on prose would be guesswork rather than a check.
+ *  - ⚠️ Only docs that NUMBER their headings are checked at all. Measured when this rule was
+ *    added: `docs/connect-claude-code.md`, `docs/ui-system.md`, `docs/audio-plan.md` and
+ *    `CLAUDE.md` are all cited as `§ N` while defining zero numbered headings, so there the `§`
+ *    means something else (a legacy scheme, a subsection like `§5.3`, a line). Checking those
+ *    would fail on prose this guard has no business judging. The cost of that narrowing is
+ *    real and is stated in the report rather than hidden: a dangling `§` in an UNNUMBERED doc
+ *    is not caught here.
+ */
+const SECTION_CITE = /([A-Za-z0-9_./-]+\.md)\)?[^\n§]{0,60}§\s*([0-9]+[a-z]*(?:-bis)?)(?![.\d])/g;
+
+/** Heading ids a markdown doc actually defines: `## 6. …`, `### 8a-bis. …`, `## ⚠️ 0. …`. */
+function headingIds(absDoc: string): Set<string> {
+  const ids = new Set<string>();
+  for (const line of fs.readFileSync(absDoc, 'utf8').split('\n')) {
+    const m = /^#{2,4}\s+(?:[^\w\s]+\s+)*([0-9]+[a-z]*(?:-bis)?)\./.exec(line);
+    if (m) ids.add(m[1]);
+  }
+  return ids;
+}
+
+describe('cited doc SECTIONS resolve', () => {
+  it('every `<doc>.md § N` names a heading that doc defines', () => {
+    if (!hasFullDocsTree()) return; // OSS snapshot trims docs/plans + games; nothing to check.
+
+    const offenders: string[] = [];
+    let checked = 0;
+
+    for (const abs of repoFiles()) {
+      const relFile = rel(abs);
+      if (isNonCitingSource(relFile)) continue;
+      if (relFile === 'engine/tests/architecture/docCitations.test.ts') continue; // this file
+      const text = fs.readFileSync(abs, 'utf8');
+
+      for (const m of text.matchAll(SECTION_CITE)) {
+        const [, citedPath, section] = m;
+        // Resolve the cited doc relative to the citing file first (most citations are relative),
+        // then from the repo root (bare `docs/…` form).
+        const candidates = [
+          path.resolve(path.dirname(abs), citedPath),
+          path.join(repoRoot, citedPath),
+        ];
+        const target = candidates.find((c) => fs.existsSync(c) && c.endsWith('.md'));
+        if (!target) continue; // rule 1 owns unresolvable paths; don't double-report them.
+        const ids = headingIds(target);
+        if (ids.size === 0) continue; // doc does not number its headings — see the scope note.
+        checked++;
+        if (!ids.has(section)) {
+          const line = text.slice(0, m.index).split('\n').length;
+          offenders.push(`${relFile}:${line} cites ${rel(target)} § ${section} — no such heading`);
+        }
+      }
+    }
+
+    // Vacuity floor: the repo really does carry dozens of these, so a regex that stops matching
+    // must fail loudly rather than pass by checking nothing.
+    expect(checked, 'no section citations found at all — the matcher is broken').toBeGreaterThan(10);
+    expect(
+      [...new Set(offenders)].sort(),
+      'these citations name a section that does not exist. Either the heading was renumbered '
+        + '(repoint the citation) or the section was renamed away — see docs/doc-conventions.md.',
+    ).toEqual([]);
+  });
+});

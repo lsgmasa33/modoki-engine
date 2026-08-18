@@ -681,7 +681,10 @@ export default defineConfig(({ command }) => {
       // it (vitest runs a describe callback to collect its tasks, and bills that under `import`).
       // With `hintPainting.test.ts` fixed on 2026-08-14 the whole Court suite went 434s -> 135s,
       // and Court's real per-file import is ~0.4-1.2s. The exclusion still earns its place
-      // (`verify` 145s -> 43s here, measured after the fix) — just not for that reason.
+      // (`verify` 145s -> 43s here, measured 2026-08-14 after the fix) — just not for that reason.
+      // ⚠️ That pair is a SNAPSHOT and the "with Court" half is superseded: `verify` is 82-86s as
+      // of 2026-08-18 (games/court/test-cost.md § 9). The exclusion's value has not been
+      // re-measured since, so treat 43s as un-refreshed rather than current.
       //
       // Same predicate as those gates (`courtAuthored.mjs`, one implementation, two consumers) and
       // the same fail-safe direction: `courtTouched()` returns `null` when git cannot answer, and

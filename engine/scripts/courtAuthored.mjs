@@ -9,7 +9,9 @@
  *     for a clone that IS working on Court and wants to choose which tiers run.
  *
  * The gate is worth its complexity on measurement: `npm run verify` runs **145 s with Court and
- * 43 s without** on this Mac (2026-08-14, 731 levels).
+ * 43 s without** on this Mac (2026-08-14, 731 levels). ⚠️ SNAPSHOT — the "with Court" half is
+ * superseded (`verify` is 82-86 s as of 2026-08-18, `games/court/test-cost.md` § 9); the gain has
+ * not been re-measured since, so the gate's value is un-refreshed, not disproved.
  *
  * ⚠️ **It used to say `describe.skipIf` DOES NOT SAVE WALL CLOCK, and that was a wrong reading of a
  * real measurement — the correction is the useful part.** On 2026-08-13, gating every corpus-walking

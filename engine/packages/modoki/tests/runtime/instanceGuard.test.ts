@@ -1,5 +1,5 @@
 /** Cross-cutting singleton-duplication guard (OTA Phase 4,
- *  docs/ota-subgame-modules.md §5). Simulates "two copies of the runtime running
+ *  docs/ota-subgame-modules.md § "Failure-mode checklist"). Simulates "two copies of the runtime running
  *  side by side" via `vi.resetModules()` + a fresh dynamic import — the same mechanism
  *  a real duplication bug would trigger (module re-evaluation), without needing an
  *  actual second bundle. */

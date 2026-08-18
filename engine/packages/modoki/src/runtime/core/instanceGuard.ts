@@ -1,5 +1,5 @@
 /** Cross-cutting singleton-duplication guard (OTA Phase 4,
- *  docs/ota-subgame-modules.md §5 — "the single highest-value guard"). Every route
+ *  docs/ota-subgame-modules.md § "Failure-mode checklist" — "the single highest-value guard"). Every route
  *  to two copies of this runtime running side-by-side — botched Rollup externalization
  *  in a sub-game build, a stale `sharedRegistry.ts` key, a future Vite `resolve.dedupe`
  *  regression — produces the SAME symptom: two separate ECS world registries, two trait
@@ -37,6 +37,6 @@ if (count > 1) {
     'unknown, …) that do not look like their real cause. Likely culprits: a sub-game ' +
     'bundle that bundled its own copy instead of externalizing to the shared registry ' +
     '(see sharedRegistry.ts / subgameBuild.ts), a stale shared-registry key, or a Vite ' +
-    '`resolve.dedupe` regression. See docs/ota-subgame-modules.md §5.',
+    '`resolve.dedupe` regression. See docs/ota-subgame-modules.md § "Failure-mode checklist".',
   );
 }
