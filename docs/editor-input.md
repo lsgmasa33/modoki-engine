@@ -177,8 +177,55 @@ Two consequences that are easy to get wrong, both of which cost a real bug in #2
   nothing.
 
 The same applies to `onFocus`: any state it gates is dead in an unfocused window. Drive
-"is the user mid-edit?" from `onChange`, which fires regardless. `useBufferedValue` still gets this
-wrong for every Inspector field — see #242.
+"is the user mid-edit?" from `onChange`, which fires regardless.
+
+### A per-keystroke commit needs a THIRD pattern: guard on the ECHO, not on focus (#242)
+
+The two rules above fit a field that commits on a terminal signal. A field that commits on **every
+keystroke** — `useBufferedValue`, which backs every Inspector field, and `ParticleEditor`'s
+`NumInput` — has no terminal signal to hang an `editingRef` off, and its `focusedRef` guard was dead
+in an unfocused window. **What clobbered the buffer was the field's OWN commit**: clearing it commits
+`parse('')` = 0, the store echoes 0 back, the re-sync effect rewrites the empty buffer to `'0'`, and
+the remaining keystrokes land on that. Measured on `games/sling` Lvl-0002: `-3.5` typed into a
+cleared `Transform.x` stored **0** and left the field reading `0-3.5`, with `modoki_type_text`
+reporting success.
+
+**The rule: skip the re-sync when the text on screen already MEANS the store's value.** At that point
+re-syncing can only reformat it (`''` or `'-'` → `'0'`), which is the destruction itself and never
+new information; a genuine external change (a gizmo drag, an undo, a reselect) does not parse-match
+and still re-syncs.
+
+```tsx
+useEffect(() => {
+  if (focusedRef.current) return;
+  setLocalValue((cur) => (Object.is(parse(cur), externalValue) ? cur : String(externalValue)));
+}, [externalValue]);
+```
+
+⚠️ `parse` is read through a **ref** in the real code, not closed over as above. It is an inline
+arrow at most call sites, so as an effect dep it would re-run this on every render and clobber any
+text that has not yet round-tripped through the store — and omitting it from the deps without a ref
+is a stale closure plus a lint warning. The `setLocalValue` updater is what keeps `localValue`
+itself out of the deps, which matters for the same reason.
+
+- **Stateless on purpose.** Remembering the last value the field committed also settles the repro and
+  goes stale: nothing clears the memory, so once something drags the value away and back to the
+  remembered one, the field skips a re-sync it owes and sits on the intermediate text. (`NumBox`'s
+  latch is the same idea done safely — it is cleared by the external-change effect, which is exactly
+  what makes it a *trailing-blur* swallow rather than a permanent one.)
+- **Two known costs, both deliberate.** A non-injective `parse` — `BufferedNumberInput`'s min/max
+  clamp — cannot be told from a reformat, so typing `1.8` into a `max=1` field leaves the display on
+  `1.8` while the store holds `1` until blur reconciles it. That is what a FOCUSED window already
+  did, so the fix aligns the two rather than inventing a behaviour; but with no blur in an
+  agent-driven session, **read the value back with `modoki_get_scene_state`, never off the field.**
+  And in mixed (multi-select) mode the guard is skipped entirely, so entering mixed mode still clears
+  the buffer and shows the `----` placeholder.
+- **`ParticleEditor`'s `NumInput` had the same defect and auto-saves**, so the corrupted value reached
+  disk with no Save at all (`ParticleEditor.tsx` writes on a trailing timer, by design). Typing `-3.5`
+  into one of its clamped fields committed **0.5** — the clamp of an in-progress `-3` to 0 is what
+  moved the store and supplied the echo. Most of its number fields are clamped (25 of 38 carry a
+  `min`/`max`, by `grep -nE "<(Num|NumInput)\b[^>]*(min|max)=\{"`), so the exposure is the panel,
+  not a corner of it.
 
 ### And the mirror-image trap: Escape, in a window that IS focused
 

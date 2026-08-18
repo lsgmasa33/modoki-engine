@@ -628,6 +628,19 @@ function Hint({ text }: { text: string }) {
   );
 }
 
+/** The value {@link NumInput}'s `handle` would push upstream for this text, or `null` when it
+ *  pushes nothing (mid-typing: '', '-', '.'). **One definition, because the re-sync effect has to
+ *  ask the same question** — a second copy of the clamp would drift, and the two disagreeing is
+ *  exactly a buffer that re-syncs when it should not. */
+function committedValueOf(raw: string, min?: number, max?: number): number | null {
+  const n = parseFloat(raw);
+  if (!Number.isFinite(n)) return null;
+  let c = n;
+  if (min !== undefined) c = Math.max(min, c);
+  if (max !== undefined) c = Math.min(max, c);
+  return c;
+}
+
 /** Signed-number input. Uses `type="text"` (not `type="number"`) because a number
  *  input reports `value === ''` for an incomplete entry like a lone `-`, so the minus
  *  sign is wiped before a digit can follow — you could only type negatives by entering
@@ -640,14 +653,27 @@ function NumInput({ value, on, title, min, max, step, disabled, width }: { value
   const ref = useRef<HTMLInputElement>(null);
   const valueRef = useRef(value);
   valueRef.current = value;
-  useEffect(() => { if (!focused.current) setLocal(String(value)); }, [value]);
+  // ⚠️ **`focused` ALONE CANNOT GUARD THIS — Chromium dispatches `focus`/`blur` only while
+  // `document.hasFocus()` (#242, and #233's rule: nothing in the editor may depend on a focus event
+  // firing).** With the window behind another one no focus event lands, so this effect ran mid-edit
+  // and the field's OWN commit was what clobbered it. Concretely, on one of the clamped fields here
+  // (25 of the 38 carry a `min`/`max`): typing `-3.5` into a field showing 0.4 pushes nothing for
+  // `-`, clamps `-3` to 0, and the echo of that 0 rewrote the buffer to '0' — so the rest of the
+  // keystrokes landed on it and the field committed **0.5**. Focused, the same typing commits 0.
+  // Focus decided the result, which is the bug. Measured on demos/particle-demo's comet effect.
+  //
+  // ⭐ So the guard is the ECHO: when the text on screen would commit exactly the value already in
+  // the store, re-syncing can only reformat it, which is the destruction itself and never new
+  // information. A real external change (a preset load, an undo, retargeting the panel) does not
+  // match and still re-syncs. Same fix as `useBufferedValue` in `fields.tsx`.
+  useEffect(() => {
+    if (focused.current) return;
+    setLocal((cur) => (Object.is(committedValueOf(cur, min, max), value) ? cur : String(value)));
+  }, [value, min, max]);
   const handle = (raw: string) => {
     setLocal(raw);
-    const n = parseFloat(raw);
-    if (!Number.isFinite(n)) return; // mid-typing ("", "-", ".") — keep the text, push nothing
-    let c = n;
-    if (min !== undefined) c = Math.max(min, c);
-    if (max !== undefined) c = Math.min(max, c);
+    const c = committedValueOf(raw, min, max);
+    if (c === null) return; // mid-typing ("", "-", ".") — keep the text, push nothing
     on(c);
   };
   // Mouse-wheel adjust (focused only); Shift = ×10. Steps from the shown value, falling
