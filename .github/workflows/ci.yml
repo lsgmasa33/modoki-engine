@@ -184,6 +184,12 @@ jobs:
   package:
     name: package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Declared explicitly because the prune step below deletes artifacts. Naming any
+    # permission drops the defaults for this job, so `contents: read` has to be restated
+    # for checkout.
+    permissions:
+      contents: read
+      actions: write
     strategy:
       fail-fast: false
       matrix:
@@ -239,7 +245,43 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.path }}
-          # Short on purpose: these rebuild on every push to main, so they are a rolling
-          # build check, not an archive. The real releases are the durable artifacts.
-          retention-days: 5
+          # A BACKSTOP, not the mechanism — the prune step below is what keeps the set at one.
+          # This only bounds an orphan left behind by a run that died before pruning.
+          retention-days: 2
           if-no-files-found: error
+
+      # Keep exactly ONE copy of this artifact: the one just uploaded.
+      #
+      # GitHub mints a new artifact per run rather than overwriting a same-named one, so
+      # without this the set grows by ~500 MB per push to main and `retention-days` bounds it
+      # only by a rolling window — a DAY's pushes, not one build. That is what filled the
+      # account's 0.5 GB artifact quota: 21.7 GB live on 2026-08-18, 8.9 GB of it these two
+      # names across 36 runs. Once the quota is full, uploads start failing (release-windows.yml
+      # already carries a continue-on-error for exactly that).
+      #
+      # Why one copy is the right number: these are a per-push packaging gate, and their only
+      # download use is grabbing the LATEST build to test the DMG/installer without cutting a
+      # release. An older run's copy answers no question its own green tick has not already
+      # answered. Real versions live on the Releases page, permanently and off this quota.
+      #
+      # continue-on-error on purpose: this job gates PACKAGING. A prune that cannot delete
+      # (restricted token, API blip) must not turn a good build red — it just leaves that run's
+      # copy to `retention-days`.
+      - name: Prune older copies of this artifact
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ matrix.artifact }}
+        run: |
+          set -uo pipefail
+          # Newest first, skip the first (this run's), delete the rest. The two matrix legs
+          # prune different NAMEs, so they cannot race each other.
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" --paginate \
+            --jq ".artifacts[] | select(.expired == false and .name == \"$NAME\") | [.created_at, .id] | @tsv" \
+            | sort -r | tail -n +2 | cut -f2 \
+            | while read -r id; do
+                echo "deleting stale $NAME artifact $id"
+                gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" --silent \
+                  || echo "::warning::could not delete artifact $id"
+              done
