@@ -809,6 +809,23 @@ registerAgentOp('resolve-dom-point', (params) => resolveDomPointReport((params ?
 // PixiJS bounds, and the DOM. ──
 registerAgentOp('resolve-entity-point', (params) => resolveEntityPointReport((params ?? {}) as EntityPointSpec));
 
+// ── Can trusted input actually be DELIVERED to this window right now? ──
+// Chromium DROPS every `sendInputEvent` while the window is OCCLUDED (another app fully covers
+// it, or it is minimised) — `document.visibilityState === 'hidden'`. Nothing on the main-process
+// side can see that, so the host input routes ask here before dispatching: measured 2026-08-18,
+// three consecutive `modoki_tap`s at a correctly-resolved point delivered ZERO events (a
+// capture-phase `document` listener saw nothing) while every call answered `ok:true,
+// occluded:false`. Only the renderer knows — occlusion is a page-visibility fact, not a
+// BrowserWindow one.
+//
+// `hasFocus` is the WEAKER sibling and is reported rather than refused: with the window visible
+// but not OS-focused, input DOES arrive, but Chromium fires no focus/blur/focusin/focusout, so
+// anything the editor does on a focus event silently does not happen.
+registerAgentOp('input-deliverability', () => ({
+  visibilityState: document.visibilityState,
+  hasFocus: document.hasFocus(),
+}));
+
 // ── Phase F: structured render/scene health (causes, not a black screenshot) ──
 // Only errors inside this window gate `ok` (F14): a stale load-time / prior-scene error otherwise
 // pins ok:false forever. Date.now() is fine here — app/debug is outside the runtime determinism

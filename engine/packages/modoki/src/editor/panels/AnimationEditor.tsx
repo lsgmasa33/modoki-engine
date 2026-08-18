@@ -10,6 +10,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { backendFetch } from '../backend/editorBackend';
 import { useEditorStore } from '../store/editorStore';
+import { pendingAssetDoc } from './pendingAssetDoc';
+import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
@@ -254,6 +256,23 @@ export default function AnimationEditor() {
     const existing = useEditorStore.getState().editingAnimationClip;
     if (existing) { savedMarkRef.current?.(existing); return; } // keep unsaved edits on re-mount
     const { loadAnimationClip } = useEditorStore.getState();
+    // An UNSAVED write parked for this asset (an agent `anim-set-clip` / `anim-add-key` under manual
+    // persistence) is not on disk yet — fetching the file would open the PRE-edit doc and re-seed
+    // the live cache with it, discarding the edit everywhere except the registry that still holds
+    // it (QA-CTX-0008, measured on the timeline twin of this path). Marked saved because it is
+    // parked, not written: the pending write stays pending until Save All, and the autosave must
+    // not commit it on open.
+    const parked = pendingAssetDoc(asset.path, 'animation');
+    if (parked) {
+      const doc = normalizeAnimationClip(parked as Partial<AnimationClipDef>);
+      // Same id/registration parity as the fetch path below — a legacy def with no in-file guid
+      // must still get one, or the asset stays unaddressable by GUID for as long as it is open.
+      if (!doc.id) doc.id = newGuid();
+      registerAsset(doc.id, asset.path, 'animation');
+      savedMarkRef.current?.(doc);
+      loadAnimationClip(doc);
+      return;
+    }
     fetch(asset.path)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
       .then((json) => {
@@ -799,7 +818,13 @@ export default function AnimationEditor() {
     return backendFetch('/api/write-file', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path, content: JSON.stringify(c, null, 2) }),
-    }).then((res) => { setSaveMsg(res.ok ? 'Saved ✓' : `Save failed (${res.status})`); return res.ok; })
+    }).then((res) => {
+      setSaveMsg(res.ok ? 'Saved ✓' : `Save failed (${res.status})`);
+      // The file is now authoritative — drop any OLDER parked write for it, or the next save_all
+      // flushes that stale doc back over what was just written (measured; see assetWrittenToDisk).
+      if (res.ok) assetWrittenToDisk(path);
+      return res.ok;
+    })
       .catch((e) => { console.error('[AnimationEditor] auto-save failed', e); setSaveMsg('Save failed'); return false; });
   }, [asset?.path]);
   const { markSaved } = useDebouncedSave(clip, writeClip, AUTOSAVE_MS);

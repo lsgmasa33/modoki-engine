@@ -320,6 +320,50 @@ said it worked" as a claim about the renderer, not about the human.
   reproduces the browser suppressing the compatibility `mousedown` when a canvas handler
   `preventDefault`s. This is the standard the others should be held to.
 
+### An OCCLUDED window delivers nothing at all (measured 2026-08-18, fixed)
+
+The most complete version of that failure shape: while the editor window is **hidden** —
+another app fully covers it, or it is minimised, i.e. `document.visibilityState === 'hidden'` —
+Chromium **drops every `sendInputEvent`**, and every input route used to answer `ok:true`.
+Measured on backend 5183 with `document.elementFromPoint` returning the intended Assets row:
+three consecutive `modoki_tap {selector}` calls returned `ok:true, occluded:false`, a
+capture-phase `click` **and** `mousedown` listener on `document` recorded **zero** events, and the
+row never selected. Raising the window (`osascript … set frontmost of process "Electron"`) made
+the *identical* call land, `trusted:true`.
+
+This is precisely what the provenance fields exist to remove — the reply described what the call
+**aimed at**, never what **arrived** — and it is the likely cause of a QA report blaming three
+trusted primitives (Escape, a tap, Tab) that were all working.
+
+**Now refused, not reported.** `createInputRoutes` asks the renderer (`input-deliverability`,
+`engine/app/debug/agentBridge.ts`) before dispatching anything, at the same single seam as the
+actor lease, and a hidden window is an HTTP **409** naming the cause and the fix (raise the
+window) with **nothing dispatched** — no aim resolved, no lease opened. A renderer that cannot
+answer does **not** veto the input: an unqualified tap is a missing hint, a refused one is a
+broken tool.
+
+Two deliberate exceptions, both because a refusal must not state a false cause:
+
+- **`/api/input/focus` is exempt.** It is the one route here that dispatches no OS input —
+  `focusElement` is `wc.focus()` plus `executeJavaScript`, which a hidden window still runs.
+- **An unrecognised `/api/input/<x>` still falls through** (`null`, so the caller tries its next
+  handler) rather than 409-ing on a path this file does not own. `DISPATCHED_INPUT_ROUTES` is
+  what both the gate and the fall-through read.
+
+**`/api/capture-gesture` carries the same gate**, wired through the exported
+`inputDeliverability`/`hiddenWindowRefusal` rather than a second copy of the rule: it drives its
+own trusted drag through `rendererOps`, so it never passes through `createInputRoutes`. A hidden
+window there produces a flat trajectory — the third way that route can manufacture a confident
+"the object didn't track the drag", after the phantom sample guid and the stopped sim it already
+guards.
+
+**The weaker sibling is reported, not refused.** With the window **visible but not OS-focused**
+(`document.hasFocus() === false`), input DOES arrive, but Chromium dispatches no
+`focus`/`blur`/`focusin`/`focusout` — `el.focus()`/`el.blur()` move `document.activeElement` and
+fire nothing, so anything the editor does *on* a focus event silently does not happen (a
+commit-on-blur field is the classic; RenameInput was fixed at the source in `a03249ca`). The
+input itself is real, so the response simply carries **`windowFocused: false`**.
+
 ### Audited and fixed (2026-07-22)
 
 A fan-out audit over drag / dnd / scroll / hover / type_text / handles / capture_gesture, each

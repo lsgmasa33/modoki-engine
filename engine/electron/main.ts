@@ -89,7 +89,7 @@ import { startBackendServer, type BackendServerHandle, type HostRoutes } from '.
 import type { LiveReloadKind } from '../plugins/vite-asset-scanner';
 import { captureViewport, tap, drag, hover, scroll, pointerDown, pointerMove, pointerUp, pressKey, typeText, focusElement, captureGesture } from './rendererOps';
 import type { RenderSurfaceFacts } from './rendererOps';
-import { createInputRoutes } from './inputRoutes';
+import { createInputRoutes, inputDeliverability, hiddenWindowRefusal } from './inputRoutes';
 import { serializeMenu, triggerMenuItem, type MenuItemLike } from './menuActions';
 import { getSsrLoadModule, closeSsrLoader } from './ssrLoader';
 import { buildProdCsp, PROD_CSP_ORIGINS } from './csp';
@@ -1376,6 +1376,14 @@ app.whenReady().then(async () => {
       if (playProbe && playProbe.playState !== 'playing') {
         return { kind: 'json', status: 409, body: { error: `game is ${playProbe.playState ?? 'not playing'} — press Play first (modoki_play_control play). capture_gesture samples the motion the drag causes; a stopped game produces a flat, misleading trajectory.` } };
       }
+      // A HIDDEN window drops every sendInputEvent, so the drag would deliver nothing and the
+      // trajectory would be flat — the third way this route can produce a confident, misleading
+      // "the object didn't track the drag", after the phantom guid and the stopped sim above.
+      // The same gate `/api/input/*` applies, reached through the shared helper rather than a
+      // second copy of the rule (this route drives its own drag through rendererOps, so it does
+      // not pass through createInputRoutes).
+      const gestureRefusal = hiddenWindowRefusal(await inputDeliverability(requestRenderer), 'the drag this samples');
+      if (gestureRefusal) return gestureRefusal;
       const result = await captureGesture(mainWindow, {
         from, to, steps,
         sample: () => requestRenderer('scene-state', sampleParams),

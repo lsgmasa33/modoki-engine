@@ -44,6 +44,10 @@ function makeRenderer(overrides?: Record<string, unknown>) {
       leaseCalls.push(p);
       return p.open ? { id: 42 } : { ok: true };
     }
+    // Window deliverability brackets every route like the lease does — kept out of `calls`
+    // (and overridable per-test) for the same reason: it is identical noise on every test and
+    // would bury the resolve-vs-dispatch ordering these tests exist to pin.
+    if (op === 'input-deliverability') return overrides?.['input-deliverability'] ?? { visibilityState: 'visible', hasFocus: true };
     calls.push(`renderer:${op}`);
     if (op === 'resolve-dom-point') {
       const sel = (params as { selector: string }).selector;
@@ -150,7 +154,7 @@ describe('tap', () => {
     expect(res).toMatchObject({ kind: 'json', body: { ok: true, tapped: { x: 769, y: 310, button: 'left', clickCount: 1 } } });
     expect(calls).toEqual(['tap(769,310)']);
     // The renderer is asked for NOTHING but the actor lease — no resolution round-trip.
-    expect(requestRenderer.mock.calls.every(([op]) => op === 'actor-lease')).toBe(true);
+    expect(requestRenderer.mock.calls.every(([op]) => op === 'actor-lease' || op === 'input-deliverability')).toBe(true);
     // A coordinate tap carries no provenance fields — nothing was matched.
     expect((res as { body: Record<string, unknown> }).body.matched).toBeUndefined();
   });
@@ -863,5 +867,88 @@ describe('actor lease brackets every input dispatch', () => {
   it('does NOT bracket a non-input route', async () => {
     expect(await post('/api/capture-viewport', {})).toBeNull();
     expect(leaseCalls).toEqual([]);
+  });
+});
+
+/** A HIDDEN window swallows trusted input whole — Chromium delivers nothing at all while
+ *  `document.visibilityState === 'hidden'` (the editor occluded by another app, or minimised).
+ *  Before this gate every route answered `ok:true, occluded:false` for input that never
+ *  arrived, which is the exact silent-miss class the provenance fields exist to remove: the
+ *  reply described what the call AIMED at, not what landed. Measured live 2026-08-18 on backend
+ *  5183 — three taps, zero events on a capture-phase `document` listener; raising the window
+ *  made the identical call land. */
+describe('window deliverability', () => {
+  const ROUTES: [string, unknown][] = [
+    ['/api/input/tap', { x: 1, y: 2 }],
+    ['/api/input/drag', { from: { x: 1, y: 2 }, to: { x: 3, y: 4 } }],
+    ['/api/input/pointer', { action: 'down', x: 1, y: 2 }],
+    ['/api/input/hover', { x: 1, y: 2 }],
+    ['/api/input/scroll', { x: 1, y: 2, deltaY: 120 }],
+    ['/api/input/key', { key: 'Escape' }],
+    ['/api/input/type', { text: 'hi' }],
+    ['/api/input/tap-handle', { id: 'bone.0' }],
+    ['/api/input/drag-handle', { id: 'bone.0', delta: { dx: 5, dy: 5 } }],
+  ];
+
+  it.each(ROUTES)('%s REFUSES while the window is hidden, and dispatches nothing', async (urlPath, body) => {
+    requestRenderer = makeRenderer({ 'input-deliverability': { visibilityState: 'hidden', hasFocus: false } });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const res = await post(urlPath, body);
+    expect(res).toMatchObject({ kind: 'json', status: 409, body: { ok: false, code: 'REFUSED_BY_OP', windowVisibility: 'hidden' } });
+    expect((res as { body: { error: string } }).body.error).toMatch(/HIDDEN\/OCCLUDED/);
+    // Nothing was dispatched, and nothing was even resolved — the refusal is BEFORE the aim.
+    expect(calls).toEqual([]);
+    // ...and no attribution lease was opened for a dispatch that never happened.
+    expect(leaseCalls).toEqual([]);
+  });
+
+  it('EXEMPTS /api/input/focus — it dispatches no OS input, so the refusal would be a false claim', () => {
+    // `focusElement` is `wc.focus()` + executeJavaScript, which a hidden window still runs. The
+    // refusal's stated reason ("Chromium would drop this input") is simply untrue for this route,
+    // and a refusal whose cause is false is worse than either answer.
+    return (async () => {
+      requestRenderer = makeRenderer({ 'input-deliverability': { visibilityState: 'hidden', hasFocus: false } });
+      routes = createInputRoutes({ ops, requestRenderer });
+      const res = await post('/api/input/focus', { selector: '#kebab' });
+      expect(ops.focusElement).toHaveBeenCalledWith('#kebab');
+      expect(res).toMatchObject({ kind: 'json', body: { ok: true } });
+    })();
+  });
+
+  it('an UNRECOGNISED /api/input/* path still falls through while hidden, instead of 409-ing', async () => {
+    // The gate must not answer for a path this file does not own — the caller has other handlers
+    // to try, and a 409 here would swallow the request whenever the window happened to be hidden.
+    requestRenderer = makeRenderer({ 'input-deliverability': { visibilityState: 'hidden', hasFocus: false } });
+    routes = createInputRoutes({ ops, requestRenderer });
+    expect(await post('/api/input/unknown', {})).toBeNull();
+    expect(calls).toEqual([]);
+  });
+
+  it('a VISIBLE but unfocused window still dispatches, and says so', async () => {
+    // The weaker sibling: input arrives, but Chromium fires no focus/blur/focusin/focusout, so
+    // anything the editor does ON a focus event (commit-on-blur, for one) silently does not
+    // happen. That is a report, not a veto — the input itself is real.
+    requestRenderer = makeRenderer({ 'input-deliverability': { visibilityState: 'visible', hasFocus: false } });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const res = await post('/api/input/tap', { x: 5, y: 6 });
+    expect(ops.tap).toHaveBeenCalledWith(5, 6, expect.anything());
+    expect(res).toMatchObject({ kind: 'json', body: { ok: true, windowFocused: false } });
+  });
+
+  it('a focused, visible window adds no noise to the response', async () => {
+    const res = await post('/api/input/tap', { x: 5, y: 6 });
+    expect((res as { body: Record<string, unknown> }).body.windowFocused).toBeUndefined();
+    expect((res as { body: Record<string, unknown> }).body.windowVisibility).toBeUndefined();
+  });
+
+  it('dispatches when the renderer cannot answer at all — an unknown state must not veto input', async () => {
+    // Same rule as the attribution lease: a renderer mid-reload, or one too old to know the op,
+    // must not be able to break input. An unqualified tap is a missing hint; a refused one is a
+    // broken tool.
+    requestRenderer = makeRenderer({ 'input-deliverability': null });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const res = await post('/api/input/tap', { x: 7, y: 8 });
+    expect(ops.tap).toHaveBeenCalledWith(7, 8, expect.anything());
+    expect(res).toMatchObject({ body: { ok: true } });
   });
 });

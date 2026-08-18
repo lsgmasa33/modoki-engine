@@ -21,6 +21,8 @@ import { useDebouncedSave } from './useDebouncedSave';
 import { applyWheelStep, useWheelStep } from './fields';
 import { AssetRefField } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
+import { pendingAssetDoc } from './pendingAssetDoc';
+import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { pushAction, peekUndo, isExecutingUndoRedo, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
 import CurveEditor from './particle/CurveEditor';
 import { DEFAULT_CURVE_POINTS, withCurvePoints, withCurveScale } from './particle/curveMath';
@@ -185,6 +187,23 @@ export default function ParticleEditor() {
     const existing = useEditorStore.getState().editingParticleDef;
     if (existing) { savedMarkRef.current?.(existing); return; } // already loaded — keep it (treat as in-sync)
     const { loadParticleDef } = useEditorStore.getState();
+    // An UNSAVED write parked for this asset (an agent `particle-set` under manual
+    // persistence) is not on disk yet — fetching the file would open the PRE-edit doc and re-seed
+    // the live cache with it, discarding the edit everywhere except the registry that still holds
+    // it (QA-CTX-0008, measured on the timeline twin of this path). Marked saved because it is
+    // parked, not written: the pending write stays pending until Save All, and the autosave must
+    // not commit it on open.
+    const parked = pendingAssetDoc(asset.path, 'particle');
+    if (parked) {
+      const doc = normalizeParticleDef(parked as Partial<ParticleEffectDef>);
+      // Same id/registration parity as the fetch path below — a legacy def with no in-file guid
+      // must still get one, or the asset stays unaddressable by GUID for as long as it is open.
+      if (!doc.id) doc.id = newGuid();
+      registerAsset(doc.id, asset.path, 'particle');
+      savedMarkRef.current?.(doc);
+      loadParticleDef(doc);
+      return;
+    }
     fetch(asset.path)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
       .then((json) => {
@@ -318,6 +337,9 @@ export default function ParticleEditor() {
       body: JSON.stringify({ path, content: JSON.stringify(d, null, 2) }),
     }).then((res) => {
       setSaveMsg(res.ok ? 'Saved ✓' : `Save failed (${res.status})`);
+      // The file is now authoritative — drop any OLDER parked write for it, or the next save_all
+      // flushes that stale doc back over what was just written (measured; see assetWrittenToDisk).
+      if (res.ok) assetWrittenToDisk(path);
       return res.ok;
     }).catch((e) => { console.error('[ParticleEditor] auto-save failed', e); setSaveMsg('Save failed'); return false; });
   }, [asset?.path]);

@@ -10,6 +10,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { backendFetch } from '../backend/editorBackend';
 import { useEditorStore } from '../store/editorStore';
+import { pendingAssetDoc } from './pendingAssetDoc';
+import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { getCurrentWorld, onWorldSwap } from '../../runtime/core/ecs/world';
@@ -157,6 +159,22 @@ export default function TimelineEditor() {
     const existing = useEditorStore.getState().editingTimelineDoc;
     if (existing) { savedMarkRef.current?.(existing); return; } // keep unsaved edits on re-mount
     const { loadTimelineDoc } = useEditorStore.getState();
+    // An UNSAVED write parked for this asset (an agent `timeline-set`/`timeline-add-clip` under
+    // manual persistence) is not on disk yet — fetching the file would open the PRE-edit doc and
+    // re-seed the live cache with it, discarding the edit everywhere except the registry that
+    // still holds it (QA-CTX-0008). Marked saved because it is parked, not written: the pending
+    // write stays pending until Save All, and the autosave must not commit it on open.
+    const parked = pendingAssetDoc(asset.path, 'timeline');
+    if (parked) {
+      const doc = normalizeTimeline(parked as Partial<TimelineDef>);
+      // Same id/registration parity as the fetch path below — a legacy def with no in-file guid
+      // must still get one, or the asset stays unaddressable by GUID for as long as it is open.
+      if (!doc.id) doc.id = newGuid();
+      registerAsset(doc.id, asset.path, 'timeline');
+      savedMarkRef.current?.(doc);
+      loadTimelineDoc(doc);
+      return;
+    }
     fetch(asset.path)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
       .then((json) => {
@@ -446,7 +464,13 @@ export default function TimelineEditor() {
     return backendFetch('/api/asset-write', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path, type: 'timeline', data: d }),
-    }).then((res) => { setSaveMsg(res.ok ? 'Saved ✓' : `Save failed (${res.status})`); return res.ok; })
+    }).then((res) => {
+      setSaveMsg(res.ok ? 'Saved ✓' : `Save failed (${res.status})`);
+      // The file is now authoritative — drop any OLDER parked write for it, or the next save_all
+      // flushes that stale doc back over what was just written (measured; see assetWrittenToDisk).
+      if (res.ok) assetWrittenToDisk(path);
+      return res.ok;
+    })
       .catch((e) => { setSaveMsg('Save failed'); console.warn('[TimelineEditor] save failed', e); return false; });
   }, [asset?.path]);
   const { markSaved } = useDebouncedSave(doc, writeDoc, AUTOSAVE_MS);

@@ -223,9 +223,18 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     }
   }
 
+  // ── Font family — emitted whether or not THIS node has text ──
+  // `font-family` inherits, so authoring it on a container is how a whole UI tree gets one
+  // typeface from one field. It used to live inside the `if (text)` block below, which made
+  // that impossible: a container's authored family was silently dropped, and the only way to
+  // restyle a scene was to repeat the family on every text node — 41 of them in Court, i.e. 41
+  // copies of one decision, which is the drift this repo's palette work exists to end. The
+  // field is on every UIElement and the Inspector shows it everywhere, so honouring it only on
+  // leaves was an authoring surface that lied.
+  if (node.fontFamily) style.fontFamily = node.fontFamily;
+
   // ── Text styling (only when text content exists) ──
   if (text) {
-    if (node.fontFamily) style.fontFamily = node.fontFamily;
     style.fontSize = node.fontSize;
     style.fontWeight = node.fontWeight as any;
     if (node.fontStyle !== 'normal') style.fontStyle = node.fontStyle;

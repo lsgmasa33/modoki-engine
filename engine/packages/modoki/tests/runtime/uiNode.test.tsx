@@ -130,6 +130,33 @@ describe('UINode CSS helpers', () => {
   });
 });
 
+// ── Font family ──
+describe('UINode fontFamily is emitted on containers, not only on text nodes', () => {
+  /**
+   * `font-family` inherits, so authoring it on a container is how a whole UI tree gets one
+   * typeface from ONE field. It used to be written only inside the `if (text)` branch, which
+   * silently dropped a container's authored family — and the only remaining way to restyle a
+   * scene was to repeat the family on every text node (41 of them in Court).
+   *
+   * The regression is invisible without this test: the container still renders, the field is
+   * still in the Inspector, and the text still has A font. Only the wrong one.
+   */
+  it('a container with no text still emits its authored family, so descendants inherit it', () => {
+    const { container } = render(<UINode node={makeNode({ text: '', fontFamily: 'Varela Round' })} storeState={{}} />);
+    expect((container.firstElementChild as HTMLElement).style.fontFamily).toContain('Varela Round');
+  });
+
+  it('a text node still emits its own family', () => {
+    const { container } = render(<UINode node={makeNode({ text: 'hi', fontFamily: 'Varela Round' })} storeState={{}} />);
+    expect((container.firstElementChild as HTMLElement).style.fontFamily).toContain('Varela Round');
+  });
+
+  it('an unauthored family is left alone, so the inherited one wins', () => {
+    const { container } = render(<UINode node={makeNode({ text: 'hi', fontFamily: '' })} storeState={{}} />);
+    expect((container.firstElementChild as HTMLElement).style.fontFamily).toBe('');
+  });
+});
+
 // ── Box visuals ──
 describe('UINode box rendering', () => {
   it('renders nothing when not visible', () => {

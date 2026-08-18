@@ -231,6 +231,17 @@ projects:
   the already-RESOLVED config, where the bad value has been coerced away and is no longer there
   to complain about. Not wired into the settings-save route, which round-trips out-of-union
   values on purpose (`coerceUnions:false`).
+- **The Scenes tab discovers scenes LIVE, not at boot.** Every other field's `options` are a
+  static list the schema carries, built once during editor setup — for the scene list that made
+  the dialog describe a project that no longer existed. Measured on `games/anim-bug`
+  (QA-DLG-0005): a scene authored in the session (New Scene → Save As) was on disk and in the
+  asset manifest — `modoki_list_assets {type:'scene'}` returned it — and the Scenes tab listed
+  only the boot-time scene, with no error, until a relaunch, so it could not be added to the
+  build list at all. `SceneListEditor.discoverScenes` now unions the boot-time `options` with
+  the live manifest (`getAllAssets()`, the same source `list_assets` reads); the boot-time
+  LABELS still win, since the host built them from the backend's own paths, and an empty
+  manifest falls back to exactly the old list.
+
 - **A vocabulary is declared ONCE, in `engine/project-config.ts`.** Each string union is an
   exported `as const` tuple (`ORIENTATIONS`, `TONE_MAPPINGS`, `WEB_DEPLOY_MODES`, …) that both
   the validator and the Project Settings dropdowns read — the dialog used to restate all ten

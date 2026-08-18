@@ -68,7 +68,7 @@ export {
 } from './scene/serialize';
 export {
   markAssetDirty, hasDirtyAssets, getDirtyAssetPaths, peekDirtyAsset, clearDirtyAssets,
-  discardDirtyAssets, flushDirtyAssets, type FlushResult,
+  discardDirtyAssets, assetWrittenToDisk, flushDirtyAssets, type FlushResult,
 } from './scene/dirtyAssets';
 export { importModel } from './scene/modelImport';
 export { useEditorStore } from './store/editorStore';

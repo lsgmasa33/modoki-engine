@@ -110,6 +110,32 @@ route); a failed flush leaves its entry pending rather than silently dropping it
 asset an agent can't see is the same silent-loss trap the original `unsavedChanges` field
 exists to close for live scene edits.
 
+**Opening the asset's PANEL must not resurrect the file (QA-CTX-0008).** A parked write means the
+doc on disk is the PRE-edit one, and every asset editor opened by fetching that file — which
+re-seeded the live cache with it. Measured on `games/3d-test`: `timeline_add_clip` reported
+`{ok:true, tracks:1}` and `read_asset_def` agreed, and the moment the Timeline Editor was opened on
+that asset the live def read `tracks: []`, while the parked write and `unsaved:true` both stayed —
+so the panel displayed a document that disagreed with what `save_all` would have written, and the
+edit was gone from everything that reads the cache. The Timeline / Particle / Animation panels now
+ask `pendingAssetDoc(path, type)` (`editor/panels/pendingAssetDoc.ts`) first and open the parked doc
+when there is one, falling back to the file otherwise. It is marked as the panel's SAVED baseline
+deliberately: the write is parked, not written, so the panel's debounced autosave must not commit on
+open what the human never chose to save — verified live, the file stayed at `tracks: []` while the
+panel and the cache both showed the edit.
+
+**And the panel's own save must DROP the parked write, or it loses to it.** The registry entry
+outlives the panel's autosave, so the older parked doc was still queued after the panel had already
+written a newer one — measured the same session: `particle_set` parked v1, a panel-shaped
+`/api/write-file` put v2 on disk, `dirtyAssetPaths` still listed the path, and `save_all` rewrote
+the file back to **v1** with no warning. `dropParkedWriteFor` (agentBridge) already states the rule
+for an EXTERNAL change, but it rides the file watcher and cannot see these: `/api/write-file`
+fingerprints its own bytes via `markEditorWrite` precisely so the editor does not react to itself
+(the Particle and Animation panels), and the Timeline panel's un-suppressed `/api/asset-write` is
+still only debounced — a `save_all` in that gap loses the same way. So the writer says so directly:
+each panel calls `assetWrittenToDisk(path)` on a successful save, which drops the stale park and
+logs what it dropped. Verified live end-to-end — a duration edited in the Particle Editor now
+survives `save_all`, and `dirtyAssetPaths` clears at the panel write.
+
 The mode itself lives in the BACKEND process (Node), not the renderer — it fronts both the
 file-direct routes (Node-side) and the live-world routes (relayed to the renderer). The
 renderer doesn't otherwise know the session mode, so the backend's `/api/editor-action` relay

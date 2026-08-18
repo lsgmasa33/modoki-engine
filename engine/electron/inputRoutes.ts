@@ -174,6 +174,60 @@ function provenance(p: ResolvedPoint): Record<string, unknown> {
   return out;
 }
 
+/** What the renderer says about whether trusted input can be DELIVERED right now.
+ *  `null` when the renderer could not answer — an UNKNOWN state, never a refusal. */
+export interface InputDeliverability { visibilityState?: string; hasFocus?: boolean }
+
+/** Ask the renderer whether trusted input can actually be DELIVERED right now.
+ *
+ *  Chromium drops every `sendInputEvent` while the window is OCCLUDED (fully covered by
+ *  another app, or minimised) — the page goes `visibilityState:'hidden'` and nothing arrives.
+ *  Measured 2026-08-18: three consecutive taps at a correctly-resolved Assets row delivered
+ *  ZERO events (a capture-phase `document` listener recorded nothing, the row never selected),
+ *  and every call still answered `ok:true, occluded:false`. Raising the window made the
+ *  IDENTICAL call land. That is the silent-failure class this whole surface exists to remove:
+ *  the reply described what the call AIMED at, never what arrived, so the agent blamed
+ *  whatever feature it was driving.
+ *
+ *  Best-effort, like the attribution lease: a renderer that cannot answer must never fail the
+ *  input (a refused tap is a broken tool; an unqualified one is only a missing hint).
+ *
+ *  Exported because `/api/input/*` is NOT the only route that dispatches trusted input —
+ *  `/api/capture-gesture` drives its own drag through `rendererOps` — and a gate only one of
+ *  them passes through is a gate with a hole in it. */
+export async function inputDeliverability(
+  requestRenderer: InputRouteDeps['requestRenderer'],
+): Promise<InputDeliverability | null> {
+  try {
+    return (await requestRenderer('input-deliverability', {})) as InputDeliverability | null;
+  } catch { return null; }
+}
+
+/** The 409 for a hidden window, or null when the input can go ahead (including the
+ *  could-not-tell case). `what` names the caller's action so the message reads as the answer to
+ *  the call that was actually made. */
+export function hiddenWindowRefusal(live: InputDeliverability | null, what: string): BackendResult | null {
+  if (live?.visibilityState !== 'hidden') return null;
+  return json({
+    ok: false,
+    code: 'REFUSED_BY_OP' satisfies ErrorCode,
+    error: `the editor window is HIDDEN/OCCLUDED (document.visibilityState is "hidden"), so Chromium `
+      + `would drop ${what} and deliver nothing — no event reaches the page at all. Nothing was `
+      + 'dispatched. Raise the editor window (bring the Electron app to the front, or un-minimise it) '
+      + 'and retry; the identical call lands once the page is visible.',
+    windowVisibility: 'hidden',
+  }, 409);
+}
+
+/** The `/api/input/*` paths this file actually dispatches. The gate and the fall-through both
+ *  read it, so "is this one of ours?" has one answer — and a route added to `dispatchInput`
+ *  without being added here simply falls through, rather than being silently ungated. */
+const DISPATCHED_INPUT_ROUTES = new Set([
+  '/api/input/tap', '/api/input/drag', '/api/input/pointer', '/api/input/hover',
+  '/api/input/scroll', '/api/input/key', '/api/input/type', '/api/input/focus',
+  '/api/input/tap-handle', '/api/input/drag-handle',
+]);
+
 /** Build the `/api/input/*` handler. Returns null for any other route so the caller can
  *  fall through to the next set of host routes / the shared router. */
 export function createInputRoutes(deps: InputRouteDeps) {
@@ -215,10 +269,42 @@ export function createInputRoutes(deps: InputRouteDeps) {
     }
   }
 
+  /** Ask the renderer whether trusted input can actually be DELIVERED right now.
+   *
+   *  Chromium drops every `sendInputEvent` while the window is OCCLUDED (fully covered by
+   *  another app, or minimised) — the page goes `visibilityState:'hidden'` and nothing arrives.
+   *  Measured 2026-08-18: three consecutive taps at a correctly-resolved Assets row delivered
+   *  ZERO events (a capture-phase `document` listener recorded nothing, the row never selected),
+   *  and every call still answered `ok:true, occluded:false`. Raising the window made the
+   *  IDENTICAL call land. That is the silent-failure class this whole surface exists to remove:
+   *  the reply described what the call AIMED at, never what arrived, so the agent blamed
+   *  whatever feature it was driving.
+   *
+   *  Best-effort, like the attribution lease: a renderer that cannot answer must never fail the
+   *  input (a refused tap is a broken tool; an unqualified one is only a missing hint). */
   const handler = (async function inputRoutes(req: HostRequest): Promise<BackendResult | null> {
     const { method, urlPath } = req;
     if (!urlPath.startsWith('/api/input/') || method !== 'POST') return null;
-    return withAgentAttribution(() => dispatchInput(req));
+    // An unrecognised `/api/input/<x>` must FALL THROUGH (null) so the caller can try the next
+    // handler — including while the window is hidden. Checking the route set here rather than
+    // letting `dispatchInput`'s trailing `return null` decide keeps that true: the gate below
+    // would otherwise answer 409 for a path this file does not own.
+    if (!DISPATCHED_INPUT_ROUTES.has(urlPath)) return null;
+    const live = await inputDeliverability(requestRenderer);
+    // `/api/input/focus` is exempt: it is the one route here that dispatches NO OS input —
+    // `focusElement` is `wc.focus()` plus `executeJavaScript`, which a hidden window still runs.
+    // Refusing it would state a reason ("Chromium would drop this input") that is untrue for it,
+    // and a refusal whose stated cause is false is worse than either answer.
+    const refusal = urlPath === '/api/input/focus' ? null : hiddenWindowRefusal(live, 'this input');
+    if (refusal) return refusal;
+    const r = await withAgentAttribution(() => dispatchInput(req));
+    // Visible but NOT OS-focused: input arrives, yet Chromium fires no focus/blur/focusin/
+    // focusout — so anything the editor does ON a focus event silently does not happen (a
+    // commit-on-blur field is the classic). Reported, not refused: the input itself is real.
+    if (r && r.kind === 'json' && live && live.hasFocus === false && r.body && typeof r.body === 'object' && !Array.isArray(r.body)) {
+      (r.body as Record<string, unknown>).windowFocused = false;
+    }
+    return r;
   }) as InputRoutesHandler;
 
   /** Drop any held sustained-pointer press. Called when the renderer reloads/navigates: the

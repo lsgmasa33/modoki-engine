@@ -41,6 +41,32 @@ export function peekDirtyAsset(path: string): { type: AssetSchemaType; data: unk
   return d ? { type: d.type, data: d.data } : null;
 }
 
+/** The EDITOR just wrote this asset's file itself, so any write still parked for that path is
+ *  stale — drop it, or the next `saveAll` flushes the older doc straight over what was just
+ *  written. Returns whether anything was dropped.
+ *
+ *  MEASURED, not theoretical (2026-08-18, games/3d-test): `particle_set` parked v1; a panel-shaped
+ *  `/api/write-file` POST put v2 on disk; `dirtyAssetPaths` still listed the path; `save_all` then
+ *  rewrote the file back to v1 with no warning. The human's panel edits were gone.
+ *
+ *  `dropParkedWriteFor` (agentBridge) already states this rule for an EXTERNAL change — the file
+ *  watcher sees the write and discards the park. It cannot see these: `/api/write-file` fingerprints
+ *  its own bytes through `markEditorWrite` precisely so the editor does not react to itself, so the
+ *  Particle and Animation panels' debounced saves fire no watcher event at all. The Timeline panel
+ *  writes through `/api/asset-write`, which is not suppressed — but the watcher is debounced, so a
+ *  `save_all` in the gap loses the same way. Both are closed by the writer saying so directly.
+ *
+ *  Loud, never silent, for the same reason as `dropParkedWriteFor`: this discards pending work. */
+export function assetWrittenToDisk(path: string): boolean {
+  if (!dirty.delete(path)) return false;
+  console.warn(
+    `[dirtyAssets] ${path} was just written to disk by its editor panel — DISCARDED the older ` +
+    'parked write for it. The file is now authoritative; the parked doc would have overwritten it ' +
+    'at the next save_all.',
+  );
+  return true;
+}
+
 /** Test-only: drop every pending entry without writing it. */
 export function clearDirtyAssets(): void { dirty.clear(); }
 
