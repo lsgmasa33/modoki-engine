@@ -147,9 +147,9 @@ device's boot reading rather than to the other axis.
 ask what the same device reads when it is not booting — `resolveProbeClass` is private and the
 verdict store early-outs on `final`, so a settled device never probes again however often it is
 launched. The A/B it was built for is written up in
-[low-end-device-support.md](plans/low-end-device-support.md) § 1; the headline is that the boot
-reading is not depressed by contention as assumed, and on a Galaxy A23 it reads **2× higher** than
-the same device reads while the game is running.
+[rendering.md](rendering.md) § "Quality tiers" ("The CPU axis — boot vs in-game"); the headline is
+that the boot reading is not depressed by contention as assumed, and on a Galaxy A23 it reads
+**2× higher** than the same device reads while the game is running.
 
 Drive it over adb with no lease: `adb shell input keyevent 142` (F12) opens the menu, then tap
 through ☰ → Device. Each run logs `[rampProbe] DIAGNOSTIC (idle) …` to the console.

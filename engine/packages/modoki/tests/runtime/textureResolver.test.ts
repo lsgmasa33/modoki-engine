@@ -7,11 +7,13 @@ import {
   getKTX2Loader, setActiveRenderer, onRendererReady, getActiveRenderer,
 } from '../../src/runtime/loaders/textureResolver';
 import { DEFAULT_TEXTURE_SETTINGS } from '../../src/runtime/loaders/textureSettings';
+import { setActiveTextureSizeCap, resetActiveTextureSizeCap } from '../../src/runtime/core/textureSizeCap';
 
 const GUID = '11111111-1111-4111-8111-111111111111';
 const PATH = '/games/g/assets/tex/rock.png';
 
 beforeEach(() => clearManifest());
+afterEach(() => resetActiveTextureSizeCap());
 
 describe('resolveTextureVariantUrl', () => {
   it('falls back to the source URL when the texture is unconverted', () => {
@@ -63,6 +65,32 @@ describe('resolveTextureVariantUrl', () => {
     } finally {
       vi.unstubAllEnvs();
     }
+  });
+
+  // #212 texture LOD by quality tier. The resolver must NEVER guess a capped URL the build
+  // didn't actually emit — a missing asset hangs rather than fails (this repo's own history).
+  describe('with an active tier texture-size cap', () => {
+    it('uses the capped URL when the manifest lists that size as emitted', () => {
+      registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc', sizes: [512, 1024] });
+      setActiveTextureSizeCap(512);
+      expect(resolveTextureVariantUrl(GUID, '3d')).toContain(PATH + '~uastc@512.ktx2');
+    });
+
+    it('falls back to the UNCAPPED URL when the manifest does NOT list that size — no 404 guess', () => {
+      registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }); // no `sizes` at all
+      setActiveTextureSizeCap(512);
+      const url = resolveTextureVariantUrl(GUID, '3d');
+      expect(url).toContain(PATH + '~uastc.ktx2');
+      expect(url).not.toContain('@512');
+    });
+
+    it('a cap of 0 (no tier resolved / uncapped tier) is today\'s URL, unchanged', () => {
+      registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc', sizes: [512] });
+      setActiveTextureSizeCap(0);
+      const url = resolveTextureVariantUrl(GUID, '3d');
+      expect(url).toContain(PATH + '~uastc.ktx2');
+      expect(url).not.toContain('@');
+    });
   });
 });
 

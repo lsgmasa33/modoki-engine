@@ -336,6 +336,65 @@ project-root-then-editor fallback) and copied into `dist/pixi-ktx/` at build tim
 by `shipPixiKtxTranscoder()` in `vite-asset-scanner.ts` — mirroring how the
 three.js Basis transcoder is provided at `/basis/` for the 3D KTX2 path.
 
+## Texture LOD by quality tier (#212)
+
+Textures are 67% of a shipped build (measured on `demos/postfx-demo`: 21.8 MB of KTX2 in a
+32.4 MB dist). Everything above this section is format-aware (KTX2 vs WebP) but **size-blind** —
+a `low`-tier phone downloaded the identical full-resolution texture a flagship did. This section
+is the orthogonal axis: it never touches codec/format selection (`selectVariant`), only how many
+pixels a device downloads and uploads.
+
+- **Authored**: a project's `rendering.three.tiers.{mid,low}.textureMaxSize`
+  (`TierRenderOverrides.textureMaxSize` — `runtime/rendering/qualityTier.ts`, docs/rendering.md §
+  "Quality tiers"). **0 = no cap.** Seeded `low: 512`, `mid: 1024` alongside every other tier
+  knob (`engine/scripts/seed-quality-tiers.mjs`).
+- **Build** (`vite-asset-scanner.ts`, inside the same loop that runs the primary
+  `convertTexture()` pass): reads the project's DISTINCT non-zero authored caps, and for each one
+  strictly below the texture's own `maxSize` **and** below its source's longest edge, runs
+  `convertTexture()` again with that cap as `maxSize` — reusing the converter's existing
+  downscale-then-encode path, not a second resizer. `sizesToEmit(caps, maxSize, srcWidth,
+  srcHeight)` (`runtime/loaders/textureSettings.ts`) is the pure decision behind "strictly
+  below both": a cap that cannot shrink the texture further emits nothing, so a texture already
+  smaller than every authored cap costs zero extra files, and a project that authors no tiers
+  gets a byte-identical build. The caps actually emitted are baked onto the manifest as
+  `texture.sizes: number[]` (`AssetManifestEntry.texture`, `assetManifest.ts`) — the runtime
+  never guesses a size that wasn't built.
+- ⭐ **WHEN they are emitted — `build.textureTierVariants`, owner decision 2026-08-14.** Every size
+  ships INSIDE the package, so the +19% install-size cost (`demos/postfx-demo` 32,428 → 38,736 KB)
+  is paid by nobody on a wire delivery — the device downloads only the variant it picks — and is
+  pure growth for an APK/IPA where every size is already on disk. So `'auto'` (the default) emits
+  only when the payload travels over the wire, `'always'` is the native opt-IN, `'never'` forces
+  it off. One predicate, `shouldEmitTextureTierVariants` (`engine/plugins/textureTierEmit.ts`);
+  the scanner calls it once and must not re-derive the condition inline.
+
+  ⚠️ **"Over the wire" is NOT `--target web`, and that trap is the reason the predicate exists:
+  an OTA publish builds with `--target native`** and must (an OTA bundle replaces the web content
+  INSIDE an installed app, so it is served from the app root, never the web sub-path — #40). It is
+  wire delivery and it must emit, so the publish route layers `MODOKI_OTA_PUBLISH=1` onto its build
+  step (`otaPublishBuildStepEnv`) and the predicate reads that as well as `MODOKI_BUILD_TARGET`.
+  A **playable** build never emits regardless of mode — `playableTextureSettings` already clamps
+  every texture to ≤512, so a second size axis is waste, and `'always'` does not override it.
+
+  Measured on `demos/postfx-demo`, same tree: `--target web` → 21 `@512` files, 21 `sizes` entries,
+  dist 39,384 KB; `--target native` → **0** files, **0** `sizes` entries, dist 33,828 KB. The
+  5,556 KB difference is exactly the capped-variant payload measured on device, which is the
+  cross-check that the gate drops the right bytes and nothing else.
+
+- **URL**: `variantSuffix(v, sizeCap?)` appends `@<size>` before the extension —
+  `rock.png~uastc.ktx2` uncapped, `rock.png~uastc@512.ktx2` at the 512 cap. Omitting `sizeCap`
+  (or passing `0`) reproduces exactly today's suffix, so every asset that shipped before this
+  feature exists keeps its URL byte-for-byte — no re-import needed anywhere in the fleet.
+- **Runtime**: the resolved tier's `textureMaxSize` is written to `runtime/core/textureSizeCap.ts`
+  — a tiny **L0** module, not the usual `runtime/core/playerTierStore.ts`-style provider slot,
+  because both ends of this seam already live in the engine (`tierCalibration.ts`, L2, writes;
+  `textureResolver.ts`, L3, reads) — see that module's header for why it isn't a plain import
+  from `rendering/` instead (the same "no static L3→L2 edge" discipline the KTX2 caps probe
+  already follows with a dynamic import). `resolveTextureVariantUrl` uses the active cap **only**
+  when the texture's own baked `texture.sizes` lists it; otherwise it falls straight through to
+  the uncapped URL — no tier resolved, or the manifest doesn't confirm the size, both mean
+  "today's behaviour, unchanged". A texture already in flight keeps whatever variant it started
+  loading; a live tier change is picked up by the NEXT load, not an in-place swap.
+
 ## Gotchas
 
 - **Multiple-of-4 dimensions are mandatory** for block-compressed KTX2

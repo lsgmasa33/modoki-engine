@@ -52,8 +52,9 @@ import { getModelCacheDir, lodCachePath } from './model-cache';
 import { convertTexture } from './texture-convert';
 import { convertModel } from './model-convert';
 import { convertRiggedModel } from './rigged-model-optimize';
-import { resolveTextureSettings, resolveTextureType, variantSuffix, variantsToEmit, type TextureImportSettings, type TextureType, type TextureVariant } from '../packages/modoki/src/runtime/loaders/textureSettings';
+import { resolveTextureSettings, resolveTextureType, variantSuffix, variantsToEmit, sizesToEmit, type TextureImportSettings, type TextureType, type TextureVariant } from '../packages/modoki/src/runtime/loaders/textureSettings';
 import { isPlayableBuild, playableTextureSettings, playableEnvSettings } from './playable-profile';
+import { shouldEmitTextureTierVariants } from './textureTierEmit';
 import { deriveGuid } from '../packages/modoki/src/runtime/core/assetRefRules';
 import { resolveModelSettings, lodUrlSuffix, type ModelImportSettings, type ModelCacheInfo } from '../packages/modoki/src/runtime/loaders/modelSettings';
 import { type SpriteSlice, type SpriteAssetRef } from '../packages/modoki/src/runtime/loaders/spriteSheet';
@@ -520,6 +521,18 @@ export function playableBuildSteps(buildCwd: string, webCwd: string): BuildStep[
     { label: 'Building playable ad (single HTML)...', cmd: 'node engine/scripts/build-web.mjs --target playable', env: { VITE_PLAYABLE: '1' }, cwd: buildCwd },
     { label: 'Revealing ads/...', cmd: `open ${JSON.stringify(adsDir)}`, winCmd: `start "" "${adsDir}"`, cwd: webCwd },
   ];
+}
+
+/** Env for the OTA publish pipeline's `--target native` web-asset build step. Layers
+ *  `MODOKI_OTA_PUBLISH=1` on top of the caller's (gcloud-augmented) base env — the trap
+ *  `shouldEmitTextureTierVariants` exists to avoid: this step always passes `--target native`
+ *  (an OTA bundle replaces the web content INSIDE an installed app, so it must be served from
+ *  the app root, never the web sub-path — see the `--target native` comment above), which would
+ *  otherwise be indistinguishable from a plain native package build that should NOT emit tier
+ *  variants. Pure — extracted from the `/api/ota/publish` handler so this is unit-testable
+ *  without spawning a real build. */
+export function otaPublishBuildStepEnv(gcloudEnv: NodeJS.ProcessEnv, projectRoot: string): NodeJS.ProcessEnv {
+  return { ...gcloudEnv, MODOKI_PROJECT: projectRoot, MODOKI_OTA_PUBLISH: '1' };
 }
 
 // resolveGcloudDir moved to ./backend/gcloud.ts (shared with editorBackendRouter.ts,
@@ -2703,7 +2716,7 @@ export function assetScannerPlugin(): Plugin {
             // content INSIDE an installed native app, so it is served from the app root — never
             // `--target web`, which would bake in the project's sub-path webBasePath (#40).
             sendStatus('Building web assets...');
-            const build = await runStep('Building web assets...', 'node engine/scripts/build-web.mjs --target native', buildCwd, { ...gcloudEnv, MODOKI_PROJECT: projectRoot });
+            const build = await runStep('Building web assets...', 'node engine/scripts/build-web.mjs --target native', buildCwd, otaPublishBuildStepEnv(gcloudEnv, projectRoot));
             if (aborted) return;
             if (!build.ok) { sendStatus(`FAILED:Building web assets\n${build.output.slice(-1500)}`); res.end(); return; }
 
@@ -2841,11 +2854,28 @@ export function assetScannerPlugin(): Plugin {
       // Resolve the module flags the same way vite.config.ts does, so the shaker and the
       // bundle agree on what is in this build. `video: false` drops the clips — the toggle's
       // real payload, since video's JS is engine code the runtime barrel keeps alive anyway.
+      const projectConfig = loadProjectConfig(projectRoot);
       const buildModules = resolveModules(
-        loadProjectConfig(projectRoot).build.modules,
+        projectConfig.build.modules,
         projectRoot,
         { playable: process.env.VITE_PLAYABLE === '1' },
       );
+      // Texture LOD by quality tier (#212): the DISTINCT non-zero `textureMaxSize` caps this
+      // project's `mid`/`low` tiers author, if any. Read ONCE here (not project's `high`/default —
+      // that tier ships the source size, nothing to shrink). An unauthored project (no `tiers`,
+      // the common case today) yields an empty array and the emit loop below is a no-op — a
+      // byte-identical build to before this feature existed.
+      //
+      // Gated on `shouldEmitTextureTierVariants` (owner decision): every size ships INSIDE the
+      // package, so a plain native install pays the +19% dist cost for nothing it will ever
+      // fetch. Emit only when the payload travels over the wire (web, or an OTA publish) unless
+      // the project's `build.textureTierVariants` overrides it — see `plugins/textureTierEmit.ts`.
+      const tierTextureMaxSizeCaps = shouldEmitTextureTierVariants(projectConfig.build.textureTierVariants)
+        ? Array.from(new Set(
+          [projectConfig.rendering.three.tiers?.mid?.textureMaxSize, projectConfig.rendering.three.tiers?.low?.textureMaxSize]
+            .filter((v): v is number => typeof v === 'number' && v > 0),
+        ))
+        : [];
       const result = computeKeptAssets(projectRoot, assetRoots, { excludeVideo: !buildModules.video });
       const CONVERTIBLE = new Set(['.png', '.jpg', '.jpeg']);
       const MODEL_EXTS = new Set(['.glb', '.gltf']);
@@ -2904,6 +2934,28 @@ export function assetScannerPlugin(): Plugin {
             fs.copyFileSync(cacheFile, destPath);
             variantCount++;
           }
+          // Texture LOD by quality tier (#212) — additional derived files at the project's
+          // authored tier caps, ORTHOGONAL to the primary conversion above (same source, same
+          // format, only `maxSize` differs). `sizesToEmit` is the pure decision (unit-tested on
+          // its own); a cap that cannot shrink this texture further than it already is emits
+          // nothing, so a texture already below every tier cap costs zero extra files. Skipped
+          // entirely for a project that authors no tiers (`tierTextureMaxSizeCaps` is empty) —
+          // the whole point being that such a project's build stays byte-identical.
+          const capSizes = sizesToEmit(tierTextureMaxSizeCaps, settings.maxSize, conv.srcWidth, conv.srcHeight);
+          for (const cap of capSizes) {
+            const capSettings: TextureImportSettings = { ...settings, maxSize: cap as TextureImportSettings['maxSize'] };
+            const capConv = await convertTexture({ projectRoot, sourceUrlPath: virtualPath, absSource: srcAbs, settings: capSettings, textureType });
+            for (const v of capConv.variants) {
+              const cacheFile = cachePathFor(getCacheDir(projectRoot), virtualPath, capConv.hash, v);
+              const destPath = path.join(distDir, (virtualPath + variantSuffix(v, cap)).replace(/^\//, ''));
+              fs.mkdirSync(path.dirname(destPath), { recursive: true });
+              fs.copyFileSync(cacheFile, destPath);
+              variantCount++;
+            }
+          }
+          // Bake which caps actually got a variant onto the manifest-bound settings — the runtime
+          // resolver must never GUESS a capped URL that wasn't emitted (see textureResolver.ts).
+          if (capSizes.length > 0) settings.sizes = capSizes;
           convertedSettings.set(virtualPath.normalize('NFC'), settings);
           convertedHashes.set(virtualPath.normalize('NFC'), conv.hash);
         } catch (e) {
@@ -3561,6 +3613,13 @@ export function assetScannerPlugin(): Plugin {
             // than storing a variant list. A 2d/ui texture also emits a WebP sibling.
             for (const v of variantsToEmit(entry.texture.format, entry.textureType ?? resolveTextureType({ texture: entry.texture }))) {
               checkFile(entry.path + variantSuffix(v), 'variant');
+              // Texture LOD by quality tier (#212) — verify every size the manifest CLAIMS was
+              // emitted actually landed in dist. `entry.texture.sizes` is baked by the emitter
+              // above, so a mismatch here is a real bug (a cap the runtime would 404 on), not a
+              // derivable set like the base variants above it.
+              for (const cap of entry.texture.sizes ?? []) {
+                checkFile(entry.path + variantSuffix(v, cap), 'tier-sized variant');
+              }
             }
           } else if (entry.modelCache) {
             for (const lodPath of entry.modelCache.lodPaths) {

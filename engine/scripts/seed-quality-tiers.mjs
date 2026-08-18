@@ -65,6 +65,7 @@ export const SEED = {
     targetFps: 0,
     pixiPixelRatioCap: 1,
     pixiAntialias: false,
+    textureMaxSize: 1024,
   },
   low: {
     pixelRatioCap: 1,
@@ -80,6 +81,7 @@ export const SEED = {
     targetFps: 30,
     pixiPixelRatioCap: 1,
     pixiAntialias: false,
+    textureMaxSize: 512,
   },
 };
 

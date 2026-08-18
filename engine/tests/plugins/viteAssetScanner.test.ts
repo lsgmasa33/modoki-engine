@@ -21,6 +21,7 @@ import {
   isUnderAssetRoot,
   isValidBuildPlatform, BUILD_PLATFORMS, playableBuildSteps,
   otaPublishBundleNameAllowed, otaSigningKeyRefusal, isGcloudObjectNotFoundError,
+  otaPublishBuildStepEnv,
   type AssetRoot,
 } from '../../plugins/vite-asset-scanner';
 import { findGamesEntry } from '../../plugins/findGamesEntry';
@@ -1278,6 +1279,27 @@ describe('otaSigningKeyRefusal (/api/ota/publish signing-key identity guard)', (
   it('is exact — no trimming or case leniency on a cryptographic identity', () => {
     expect(otaSigningKeyRefusal(`${KEY_A} `, KEY_A)).toBe('mismatch');
     expect(otaSigningKeyRefusal(KEY_A.toLowerCase(), KEY_A)).toBe('mismatch');
+  });
+});
+
+/** #212 — the OTA publish pipeline's `--target native` build step must be distinguishable from
+ *  a plain native package build, so `shouldEmitTextureTierVariants('auto')` can emit tier
+ *  variants for one and not the other. Both routes run the identical
+ *  `build-web.mjs --target native` command; MODOKI_OTA_PUBLISH=1 is the only thing that tells
+ *  them apart. */
+describe('otaPublishBuildStepEnv (/api/ota/publish native-build env)', () => {
+  it('sets MODOKI_OTA_PUBLISH=1 alongside MODOKI_PROJECT, on top of the caller\'s base env', () => {
+    const out = otaPublishBuildStepEnv({ PATH: '/usr/bin', FOO: 'bar' }, '/repo/games/sling');
+    expect(out.MODOKI_OTA_PUBLISH).toBe('1');
+    expect(out.MODOKI_PROJECT).toBe('/repo/games/sling');
+    expect(out.PATH).toBe('/usr/bin');
+    expect(out.FOO).toBe('bar');
+  });
+
+  it('does not mutate the caller\'s env object', () => {
+    const base = { PATH: '/usr/bin' };
+    otaPublishBuildStepEnv(base, '/repo/games/sling');
+    expect(base).toEqual({ PATH: '/usr/bin' });
   });
 });
 

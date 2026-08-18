@@ -379,6 +379,11 @@ export {
   setBootProbeAllowed,
   isBootProbeAllowed,
 } from './core/bootProbeAllowed';
+export {
+  setActiveTextureSizeCap,
+  getActiveTextureSizeCap,
+  resetActiveTextureSizeCap,
+} from './core/textureSizeCap';
 export type { DebugTabDef, DebugCommandDef } from './debug/debugMenuRegistry';
 
 // ── Frame Driver (no heavy deps — safe for all importers) ──

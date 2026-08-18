@@ -13,6 +13,7 @@ import {
   getDeviceCaps, getDeviceCapsSync, readPerfProfile, getActiveQualityTier, getAutoLightCapStats,
   getAssessedQualityTier, getEffectiveTargetFps, getRenderSettings, configCount,
 } from '@modoki/engine/runtime';
+import { getActiveTextureSizeCap } from '@modoki/engine/runtime';
 import { computeLayoutBounds } from './layoutDump';
 
 export interface DiagnoseConsoleEntry { level: string; ts: number; text: string }
@@ -174,7 +175,16 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
     ok,
     ...(deviceCaps ? { deviceCaps } : {}),
     ...(tier
-      ? { qualityTier: { ...tier, assessed, configCount: tierConfigCount, targetFps: effectiveTargetFps } }
+      ? {
+        qualityTier: {
+          ...tier, assessed, configCount: tierConfigCount, targetFps: effectiveTargetFps,
+          // The tier's TEXTURE cap, in force right now (#212). Reported because it is the one
+          // tier knob with no visible symptom when it fails: a texture resolved before the cap
+          // was published silently fetches the full-size URL and looks perfectly correct on
+          // screen. Verifying this needs data, not pixels.
+          textureSizeCap: getActiveTextureSizeCap(),
+        },
+      }
       : {}),
     ...(lightCap.engaged ? { lightCap } : {}),
     perf,

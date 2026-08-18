@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
+import { courtTouched } from './scripts/courtAuthored.mjs'
 import { assetScannerPlugin } from './plugins/vite-asset-scanner'
 import { loadProjectConfig } from './plugins/load-project-config'
 import { resolveModules } from './plugins/detect-modules'
@@ -141,6 +142,64 @@ const externalProject = (() => {
 // C4c-2: serve an external project's game code (`/@fs/<proj>/...`) — Vite blocks
 // paths outside fs.allow. repoRoot covers the in-repo example.
 const fsAllow = externalProject ? [repoRoot, externalProject] : [repoRoot]
+
+// ── `test:court:quick` — the pre-commit FEEDBACK LOOP for a clone that IS working on Court ──────
+//
+// Owner, 2026-08-13: *"even for Court, we cannot wait for 7 mins every time we make a change."* The
+// file-level gate below buys the OTHER clones their time back; this buys it for the Court session.
+//
+// ⚠️ **An EXCLUDE list, deliberately — never a keep-list.** The two rot in opposite directions and
+// only one of them rots visibly: a new heavy file that nobody adds here makes `quick` slow, which
+// you notice on the next run; a new UNIT file missing from a keep-list silently stops being
+// covered, and nothing ever tells you. Same fail-toward-running direction as `courtTouched()`.
+//
+// Sized from a MEASUREMENT, not from which names sound expensive (2026-08-14, this Mac, 731 levels,
+// whole Court suite with sweeps OFF — 102 files, 135s wall, per-file test-body time):
+//
+//   corpus.test.ts          137.0s │ generator.test.ts       9.0s │ every other file  < 1.6s
+//   strategies.test.ts       81.4s │ rules.test.ts           3.4s │
+//   shapeGeneration.test.ts  37.6s │ hintAudit.test.ts       1.5s │
+//
+// Three files are 256s of the 275s of test-body time, and they are what this drops. What is left
+// runs in ~6s.
+//
+// ⚠️ **Measure before adding anything here, because the obvious culprit was not one.** Court's
+// files were believed to pay ~5-6s EACH at import — a figure that came from dividing a total which
+// one file dominated. `hintPainting.test.ts` was walking the corpus at describe-body scope, where
+// `describe.skipIf` cannot reach it (vitest runs a describe callback to collect its tasks), so it
+// cost 419s of a 434s run with the sweeps switched OFF. With that fixed, Court's real import cost
+// is ~0.4-1.2s per file and the whole suite is 135s. Cutting file count is worth far less than the
+// two paragraphs above once suggested.
+const COURT_QUICK_EXCLUDE = [
+  // The three heavy bodies. `shapeGeneration` RUNS the generator; `corpus`/`strategies` walk all
+  // 731 shipped levels through the solver. `generator.test.ts` (9s) is deliberately KEPT — it is
+  // the rejection-funnel cover a generator edit breaks first, and this tier can afford it.
+  '../games/court/tests/corpus.test.ts',
+  '../games/court/tests/strategies.test.ts',
+  '../games/court/tests/shapeGeneration.test.ts',
+  // The 12 sharded sweep files (36 until #216 merged the three families into one walk). Worth only
+  // ~5s — but with the sweeps off they run ZERO tests (every one skips), so that is 5s for no
+  // assertions whatsoever. A CONVENTION, not an enumeration:
+  // `tests/shard.ts` splits a corpus sweep across files because vitest parallelizes by FILE and
+  // cannot split one `it()`, so anything `*.shard*` is a corpus walker by construction and a fourth
+  // family sharded tomorrow is covered on the day it lands.
+  '../games/court/tests/*.shard*.test.ts',
+]
+
+/** Is this run the `quick` tier? Announced, because a fast green must never look like a full one. */
+const courtQuick = !!process.env.VITEST && process.env.MODOKI_COURT_QUICK === '1'
+if (courtQuick) {
+  // ⚠️ **This is a FEEDBACK LOOP, not a gate**, and saying so here is the whole point of the
+  // banner: CLAUDE.md's rule from the CI-budget incident is that a gate which is silently off is
+  // worse than one deliberately off. What `quick` drops is exactly the cover that catches a
+  // generator or corpus regression, so a green here licenses a COMMIT, never a ship.
+  console.error(
+    '\n[court] QUICK TIER — the corpus-walking and sweep files are NOT in this run.\n'
+    + '[court] It is a feedback loop, not a gate: a green here means "keep going", not "ready to ship".\n'
+    + '[court] Before Court work leaves this clone: MODOKI_COURT_SWEEPS=1 npm test (tier 3).\n'
+    + `[court] Excluded: ${COURT_QUICK_EXCLUDE.map((p) => p.replace('../games/court/tests/', '')).join(' ')}\n`,
+  )
+}
 
 // C4c-3a: HOST-PROVIDED DEPS. An external project's game code imports the shared
 // singletons (@modoki/engine, three, react, …) but should NOT have to install
@@ -593,6 +652,49 @@ export default defineConfig(({ command }) => {
       // electron-builder output (gitignored) — a full repo copy under app.asar.unpacked
       // that vitest would otherwise re-discover and run as duplicate (often stale) tests.
       '**/release/**',
+      // ── COURT'S TESTS, on a clone that has nothing to do with Court ──────────────────────────
+      //
+      // Owner, 2026-08-13: *"other clones who don't work on court doesn't need to run this"*. The
+      // hard-track production run took the corpus 184 -> 731 and the app-tests leg from ~110s to
+      // 507s here; the Windows clone is ~4.5x slower again.
+      //
+      // A FILE-LEVEL exclusion, so a clone with nothing to do with Court does not even discover
+      // these files. `sweepGate.ts`'s gates remain, for a clone that IS on Court and wants tiers.
+      //
+      // ⚠️ **The original justification here was WRONG and is worth not repeating.** It read
+      // "`describe.skipIf` does not save wall clock — each of Court's ~100 files pays ~5s at
+      // import", from a measurement where gating every corpus-walking describe moved test-body time
+      // 255.7s -> 50.7s and wall clock 412s -> 428s. The clock did not move because BOTH arms were
+      // pinned by one file walking the corpus at describe-body scope, where a `skipIf` cannot reach
+      // it (vitest runs a describe callback to collect its tasks, and bills that under `import`).
+      // With `hintPainting.test.ts` fixed on 2026-08-14 the whole Court suite went 434s -> 135s,
+      // and Court's real per-file import is ~0.4-1.2s. The exclusion still earns its place
+      // (`verify` 145s -> 43s here, measured after the fix) — just not for that reason.
+      //
+      // Same predicate as those gates (`courtAuthored.mjs`, one implementation, two consumers) and
+      // the same fail-safe direction: `courtTouched()` returns `null` when git cannot answer, and
+      // only an explicit `false` excludes. So a broken detector runs the tests rather than silently
+      // dropping them — the failure mode that makes a gate worse than no gate.
+      //
+      // `MODOKI_COURT_TESTS=1` forces them back in (and any Court env override implies it, so
+      // `MODOKI_COURT_SWEEPS=1` on a non-Court clone still works rather than mysteriously running
+      // nothing); `=0` forces them OUT, which is how a Court-authoring clone measures what everyone
+      // else now pays, and how you bisect an unrelated failure without Court in the way. Guarded on
+      // `VITEST` because this config also serves the dev server, which must never pay a git probe.
+      ...(process.env.VITEST && (
+        process.env.MODOKI_COURT_TESTS === '0'
+        || (!process.env.MODOKI_COURT_TESTS
+            && !process.env.MODOKI_COURT_SWEEPS
+            && !process.env.MODOKI_COURT_CORPUS
+            && !process.env.MODOKI_COURT_QUICK
+            && courtTouched() === false)
+      ) ? ['../games/court/tests/**'] : []),
+      // The quick tier's heavy files (see COURT_QUICK_EXCLUDE above). Here rather than on the
+      // vitest CLI because **`--exclude` on the command line does not narrow the config's
+      // exclude — it replaces the option and was measured doing nothing**: an `--exclude` of the
+      // three heaviest files still ran all 102 (`Test Files 60 passed | 42 skipped (102)`) and took
+      // 483s. The only exclusion vitest honours here is this array.
+      ...(courtQuick ? COURT_QUICK_EXCLUDE : []),
     ],
   },
   }

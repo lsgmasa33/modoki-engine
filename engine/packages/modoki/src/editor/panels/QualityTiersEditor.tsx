@@ -29,7 +29,7 @@ const POSTFX_LABELS: Record<PostFXEffect, string> = {
   npr: 'NPR outline', ao: 'GTAO', dof: 'Depth of field', bloom: 'Bloom', vignette: 'Vignette',
 };
 
-type NumberField = 'pixelRatioCap' | 'shadowMapCeiling' | 'maxDirectional' | 'maxLocal' | 'iblOffAmbientBoost' | 'iblOffExposure' | 'targetFps' | 'pixiPixelRatioCap';
+type NumberField = 'pixelRatioCap' | 'shadowMapCeiling' | 'maxDirectional' | 'maxLocal' | 'iblOffAmbientBoost' | 'iblOffExposure' | 'targetFps' | 'pixiPixelRatioCap' | 'textureMaxSize';
 type CheckboxField = 'antialias' | 'shadows' | 'ibl' | 'pixiAntialias';
 
 /** Per-field help, carrying the MEASUREMENT that justifies the seeded value (plan §3's tables)
@@ -63,6 +63,8 @@ function fieldHelp(tier: TieredKey, field: NumberField | CheckboxField): string 
       return '0 = uncapped. The 2D twin of Pixel-ratio cap above, carrying the SAME Y6 measurement (1x = 22ms/45fps, 2x = 69ms/14fps, ~4x cost for 2x DPR) rather than a separate one — that is a fill-rate fact about a tile-based mobile GPU, not a Three.js fact, so it applies to a Pixi canvas identically. pixi.resolution is deliberately NOT tiered: it is a pin, and capping a pin would make the pin a lie.';
     case 'pixiAntialias':
       return 'Same live-change limitation as Antialias above: baked into the Pixi Application when a canvas slot is created, so a tier change catches up on the next slot rather than applying immediately.';
+    case 'textureMaxSize':
+      return '0 = no cap (ship the source size). Textures are 67% of a shipped build (postfx-demo: 21.8MB of KTX2 in a 32.4MB dist) and variant resolution was size-blind — a low phone downloaded the same full-resolution KTX2 as a flagship. A build only emits an extra file for a cap that actually shrinks this texture, so raising this later costs nothing on textures that were already smaller.';
     default:
       return '';
   }
@@ -170,6 +172,8 @@ function TierCard({ tier, cfg, onChange, onRemove }: {
         dataUiId={`quality-tiers.field.${tier}.pixiPixelRatioCap`} />
       <CheckboxRow tier={tier} field="pixiAntialias" label="2D antialias" cfg={cfg} onChange={onChange}
         dataUiId={`quality-tiers.field.${tier}.pixiAntialias`} />
+      <NumberRow tier={tier} field="textureMaxSize" label="Texture max size" cfg={cfg} onChange={onChange}
+        dataUiId={`quality-tiers.field.${tier}.textureMaxSize`} />
       <div style={fieldRow}>
         <div style={{ color: '#aaa', fontSize: 11, marginBottom: 3 }}>Post-FX</div>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>

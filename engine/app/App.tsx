@@ -240,12 +240,25 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
         // happen afterwards. Measured on a Galaxy A23 running `games/space-invader`: not one probe
         // line across a wiped launch, because the tier had already been decided from an empty
         // config. Pinned by `tierBoot.test.ts` ("resolving before the project's tiers are loaded").
+        //
+        // ⭐ **AND A 3D PROJECT RESOLVES HERE TOO NOW (#212, 2026-08-14).** It used to resolve
+        // ONLY inside `makeWebGPURenderer`, which was fine while every tier knob was read by the
+        // renderer itself — and stopped being fine the moment a tier knob was read by the ASSET
+        // path. `textureMaxSize` is consulted when a scene's textures resolve, and scene load
+        // races renderer creation, so the cap arrived too late to choose a variant. Measured on a
+        // Galaxy A23 pinned `low`: cap 512 in force, `sizes:[512]` in the manifest, 21 `@512`
+        // files in the APK, and 0 of 21 textures fetched the capped URL. Silent, because the
+        // uncapped URL is the correct fallback for "no cap".
+        const { resolveTierForNo3DProject, resolveTierBeforeSceneLoad } =
+          await import('@modoki/engine/runtime/rendering/tierBoot');
         if (no3D) {
-          const { resolveTierForNo3DProject } = await import('@modoki/engine/runtime/rendering/tierBoot');
           await resolveTierForNo3DProject();
           no3DTierLoopRef.current = true;
-          if (cancelled) return;
+        } else {
+          // The 3D shape (`shade`, not `fill`), and no calibration loop — `Scene3D` owns that one.
+          await resolveTierBeforeSceneLoad();
         }
+        if (cancelled) return;
 
 
         // Mount renderers BEFORE scene load so their registerBeforeSwap hooks

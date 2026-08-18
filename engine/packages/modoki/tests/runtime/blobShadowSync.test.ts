@@ -1,5 +1,6 @@
-/** blobShadowSync — BlobShadow entity → ground-contact shadow quad (low-end-device-support
- *  §0b: a cheap grounding cue for entities that don't cast a real shadow).
+/** blobShadowSync — BlobShadow entity → ground-contact shadow quad (a cheap grounding cue for
+ *  entities that don't cast a real shadow, from the low-end-device-support workstream — see
+ *  docs/rendering.md § "Quality tiers").
  *
  *  Covers the PURE decision logic (`blobShadowPlacement`): the fade curve from full
  *  opacity at the surface down to 0 at `fadeHeight` and beyond (clamped), and that a

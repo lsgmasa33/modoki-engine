@@ -19,6 +19,7 @@ import projectConfig from 'virtual:modoki-project-config';
 import {
   CAPACITOR_ORIENTATIONS, STATUS_BAR_STYLES, KEYBOARD_RESIZE_MODES, WEB_DEPLOY_MODES, WEB_SIZE_MODES,
   PLAYABLE_NETWORKS, IOS_CONTENT_MODES, ANDROID_SCHEMES, GPU_BACKENDS, QUALITY_TIERS, TONE_MAPPINGS,
+  TEXTURE_TIER_VARIANTS_MODES,
 } from '../../project-config';
 import { loadProjectGames } from '../projectGames';
 import { registerAll } from '../ecs/register';
@@ -446,6 +447,11 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
               title: 'Developer',
               fields: [
                 { key: 'build.debugBuild', label: 'Debug build', type: 'checkbox', help: 'Ships the event journal (emit/modoki_journal), the in-game debug menu (F12 / 3-finger tap: stats, world, journal, device IP), and the debug bridge that device_* AI tools connect to — INCLUDING device_eval (arbitrary JS on the device). Turn ON for a QA/playtest/profiling build; leave OFF for release, where all three are tree-shaken out (nothing to connect to, no journal overhead). Always on in the editor/dev. Rebuild to apply.' },
+                { key: 'build.textureTierVariants', label: 'Texture tier variants', type: 'select', options: labeled(TEXTURE_TIER_VARIANTS_MODES, {
+                  auto: 'Auto (emit only when delivered over the wire)',
+                  always: 'Always (also emit for a plain native package)',
+                  never: 'Never (skip even on web)',
+                }), help: 'Per-tier LOD texture variants (Rendering → Quality Tiers) ship every size INSIDE the package — a real install-size cost that only pays off when the device fetches just the one it needs. "Auto" emits for a web build or an OTA publish and skips a plain iOS/Android package build; "Always" is the opt-in for a native project whose textures are big enough that the boot-time/GPU-memory win outweighs the install size; a playable build never emits regardless (already clamped to 512px).' },
               ],
             },
           ],

@@ -33,6 +33,7 @@ import {
 } from '../../src/runtime/rendering/renderSettings';
 import { PROMOTION_HOLD_MS, DEMOTION_HOLD_MS, TIER_SETTINGS } from '../../src/runtime/rendering/qualityTier';
 import { playerTierStore } from '../../src/runtime/core/playerTierStore';
+import { getActiveTextureSizeCap, resetActiveTextureSizeCap } from '../../src/runtime/core/textureSizeCap';
 
 let mockRenderer: { shadowMap: { enabled: boolean } };
 let resizeCalls = 0;
@@ -377,6 +378,34 @@ describe('applyActiveTierToRuntime — pushing the active tier into the live run
     setActiveQualityTier({ tier: 'high', source: 'measured', reason: 'x' });
     applyQualityTier('low', 'measured', 'over budget');
     expect(frameDriver.targetFPS).toBe(30);
+  });
+
+  // #212 texture LOD by quality tier.
+  describe('the texture size cap', () => {
+    afterEach(() => resetActiveTextureSizeCap());
+
+    it('publishes the active tier`s textureMaxSize to the L0 seam', () => {
+      setActiveQualityTier({ tier: 'low', source: 'measured', reason: 'x' });
+      applyActiveTierToRuntime();
+      expect(getActiveTextureSizeCap()).toBe(TIER_SETTINGS.low.textureMaxSize); // 512
+    });
+
+    it('restores the wider (or absent) cap when the tier moves back up', () => {
+      setActiveQualityTier({ tier: 'low', source: 'measured', reason: 'x' });
+      applyActiveTierToRuntime();
+      expect(getActiveTextureSizeCap()).toBe(512);
+      setActiveQualityTier({ tier: 'high', source: 'measured', reason: 'x' });
+      applyActiveTierToRuntime();
+      expect(getActiveTextureSizeCap()).toBe(0); // high's config carries textureMaxSize: 0 here
+    });
+
+    it('leaves the cap at 0 on a project that authored no tiers', () => {
+      resetRenderSettings();
+      setRenderSettings({ targetFps: 60 });
+      setActiveQualityTier({ tier: 'low', source: 'project', reason: 'x' });
+      applyActiveTierToRuntime();
+      expect(getActiveTextureSizeCap()).toBe(0);
+    });
   });
 });
 

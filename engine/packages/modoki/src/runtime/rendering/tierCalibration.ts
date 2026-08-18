@@ -39,7 +39,7 @@ import { getActiveRenderer } from '../core/activeRenderer';
 import { forceResizeAllSurfaces } from './resizeBus';
 import {
   getActiveQualityTier, getAssessedQualityTier, setActiveQualityTier, getEffectiveThreeSettings,
-  getEffectiveTargetFps, getRenderSettings,
+  getEffectiveTargetFps, getRenderSettings, getActiveTierOverrides,
 } from './renderSettings';
 import { setTargetFPS } from './frameDriver';
 import {
@@ -47,6 +47,7 @@ import {
   type QualityTier, type TierChangeState, type TierSource,
 } from './qualityTier';
 import { hasPlayerQualityTier } from './playerQualityTier';
+import { setActiveTextureSizeCap } from '../core/textureSizeCap';
 
 /** How often the profile is judged. Not every frame: the policy needs a SUSTAINED signal
  *  (`PROMOTION_HOLD_MS` is 5 s), so sampling faster buys nothing and just reads the ring buffer
@@ -162,6 +163,15 @@ export function applyActiveTierToRuntime(): void {
   const r = getActiveRenderer() as unknown as { shadowMap?: { enabled: boolean } } | null;
   const three = getEffectiveThreeSettings();
   if (r?.shadowMap) r.shadowMap.enabled = three.shadows;
+  // Texture LOD by quality tier (#212). Not a `ThreeRenderSettings` field — there is no
+  // project-authored counterpart to clamp against (unlike `pixelRatioCap`), so this reads the
+  // resolved tier's own `textureMaxSize` directly rather than through `getEffectiveThreeSettings`.
+  // Written to the L0 seam (`runtime/core/textureSizeCap.ts`) so `textureResolver.ts` can read
+  // it without `runtime/loaders` statically importing `runtime/rendering` — see that module's
+  // header. No `forceResizeAllSurfaces()`-style re-apply needed: a texture in flight keeps
+  // loading at whatever cap was active when it was requested, exactly like every other
+  // already-loaded resource under a live tier change.
+  setActiveTextureSizeCap(getActiveTierOverrides().textureMaxSize);
   // The frame cap. Re-derived from the AUTHORED value every time rather than remembered, so a
   // promotion back up restores what the project asked for instead of whatever a demotion left.
   //

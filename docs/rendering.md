@@ -176,7 +176,7 @@ inert — no variant is allocated and the code path is skipped entirely.
 **Why**: forward shading evaluates EVERY scene light for EVERY fragment, superlinearly on mobile.
 Masking is the highest-value low-tier knob there is — bigger than the entire post-FX stack. The
 numbers, and the two measurement traps that produced three retracted figures, are in
-[plans/low-end-device-support.md](plans/low-end-device-support.md).
+"The automatic light cap" below.
 
 **Mechanism**: three's `NodeMaterial.lightsNode` overrides the scene's global light list for one
 material, in a single pass. It works on a classic `MeshStandardMaterial` because
@@ -548,6 +548,20 @@ starts `low`. A project that wants exactly today's behaviour must pin `qualityTi
 | **`targetFps`** (#202) | **30** | none | none | ✅ `setTargetFPS` at every publish point — **not in the editor** |
 | **`pixi.pixelRatioCap`** (#202) | **1** | 1 | 2 | ✅ via the resize bus |
 | **`pixi.antialias`** (#202) | off | off | on | ❌ **constructor-only** (`Application.init`) |
+| **`textureMaxSize`** (#212) | **512** | **1024** | none | ⚠️ per-TEXTURE, at LOAD — a texture already in flight keeps its current variant; the next load picks up a live tier change |
+
+**`textureMaxSize` is a DOWNLOAD-size knob, orthogonal to every other row above it (#212).**
+Textures are 67% of a shipped build (measured on `demos/postfx-demo`: 21.8 MB of KTX2 in a
+32.4 MB dist), and variant resolution was format-aware (KTX2 vs WebP) but size-blind — a `low`
+phone downloaded the identical full-resolution texture a flagship did. The build
+(`vite-asset-scanner.ts`) emits an EXTRA derived file at each authored tier's cap (only when the
+cap actually shrinks that texture further than it already is — see `sizesToEmit` in
+`runtime/loaders/textureSettings.ts`), and the runtime resolver picks it up only when the
+manifest confirms that size was actually built (never a guess — a 404 there is a hang, not a
+failure, per this repo's own history). It never touches format/codec selection
+(`selectVariant`), so it composes with every other row unchanged. Full pipeline detail —
+`variantSuffix`'s `@<size>` suffix, the manifest's `texture.sizes`, the `textureSizeCap.ts` L0
+seam — is in [docs/textures.md](./textures.md) § "Texture LOD by quality tier".
 
 ⭐ **`mid`'s `pixelRatioCap` is 1.5 as of 2026-08-12, and it is a MEASUREMENT, not a compromise.**
 It sat at `low`'s value of 1 for months because the plan demanded "its own measurement; do not guess
@@ -850,9 +864,7 @@ that was really two conditions.
 
 ⚠️⚠️ **THE PROBE DOES NOT CLASSIFY A DEVICE IN THE NATIVE SHIPPING PATH, BECAUSE ITS MEASUREMENT
 WINDOW IS THE GAME'S OWN BOOT.** Measured 2026-08-11 on all three phones, native APK, cached verdict
-wiped before each run — full evidence and method in
-[docs/plans/low-end-device-support.md](./plans/low-end-device-support.md) § "The probe measures the
-boot, not the device".
+wiped before each run:
 
 The probe runs before the real renderer exists, i.e. while the game is parsing GLBs and uploading
 textures, and it times frames with rAF deltas. So it times the STALLS:
@@ -940,8 +952,8 @@ question this feature generates, and it should be answerable from data.
 consults `gpuIdentity.ts` after the desktop carve-out and **before** the ramp probe, so a
 recognised device gets its tier in ~0 ms, correctly, **on launch #1**.
 
-Why this replaced the probe as the primary classifier (all measured 2026-08-12, evidence in
-[plans/low-end-device-support.md](plans/low-end-device-support.md) § 2):
+Why this replaced the probe as the primary classifier (all measured 2026-08-12, evidence in "The
+three-layer resolver, and what the GPU database cannot do" below):
 
 - the probe **measures the boot, not the device** — the same Galaxy S22 reads `cpu` 11.2k on
   `sling` and 37.4k on `3d-physics-demo`, because the ramp runs while GLBs parse and textures
@@ -956,9 +968,12 @@ Why this replaced the probe as the primary classifier (all measured 2026-08-12, 
   hardware and refuted first — the GPU-clock latency floor (raising the ramp's start load moved
   nothing) and the per-submit clear (the S22's buffer is the *smaller* of the two). This does not
   make the probe primary again: identity still answers first, in ~0 ms, for recognised hardware;
-- it needs **three launches to settle**, so the verdict is wrong on launches 1 and 2 — the ones a
-  first impression is made on;
-- it **blocks launch 0.5–2.6 s**.
+- it needed **three launches to settle**, so the verdict was wrong on launches 1 and 2 — the ones a
+  first impression is made on. ⭐ **FIXED 2026-08-13 (#221)**: the probe now repeats itself within
+  one launch and settles there, under the unanimity rule described in "W2 — the probe becomes an
+  isolated fallback" below. This one is no longer an argument against the probe;
+- it **blocks launch 0.5–2.6 s** — and settling in one launch made that 1.6–1.8 s on the three
+  Androids, paid once instead of three times. Still the reason identity answers first.
 
 **Two layers**, and the second covers the first's blind spot:
 
@@ -1067,6 +1082,108 @@ every iPhone to `Apple GPU`.
 Identity returns `null` rather than guessing on a masked string, an unknown vendor or a generation
 it cannot place — which lands exactly where such a device already landed (the probe, then
 `calibrating → low`). **So adding this layer can only move a device that had no confident answer.**
+
+#### The three-layer resolver, and what the GPU database cannot do (#210)
+
+**Why identity is better, with the numbers.** `deviceCaps.ts:180` already reads
+`UNMASKED_RENDERER_WEBGL` on every device in a release build. It was written off
+(`qualityTier.ts:649`) as *"ambiguous — one name ships two GPUs"*. Checked against real data, the
+ambiguity is between **siblings**, not generations, and a public database resolves even that:
+
+| our device | database entry | fps |
+|---|---|---|
+| **Galaxy S22** `SM-S901U1` | `qualcomm adreno 730` → *"samsung galaxy s22 5g (sm-s901u)"* | **120** |
+| **Galaxy A23** (Mali-G57 MC2) | `arm mali-g57 mc2` → *"samsung galaxy a2…"* | **35** |
+| **Huawei Y6** (GE8300) | `powervr rogue ge8300` | **5–9** |
+
+It names our exact phone models, and it splits `mali-g57 mc2` (35) from `mc3` (48) from plain `g57`
+(49) — the ambiguity the code cites as the reason Android must measure.
+
+**Ordering 120 / 35 / 5–9 is the band structure the ramp campaign spent three days failing to
+reproduce**, available in ~0 ms with no launch cost and correct on launch #1.
+
+⚠️ **What the database CANNOT do — and why it does not matter here.** Its top saturates.
+Histogrammed across all 104 mobile entries:
+
+```
+median fps    entries
+  0- 14    ############################################ 44
+ 15- 29    ################# 17
+ 30- 44    ############## 14
+ 45- 59    ############ 12
+ 60- 74    ####### 7
+ 90-119    ##### 5
+120-134    ##### 5     ← Adreno 650=117, 730=120, 750=121, G715=121, G720=120
+```
+
+Those are **onscreen fps capped by a 120 Hz panel**, so an Adreno 650 (2020) and an Adreno 750
+(2024) read 4% apart, which is false.
+
+**But this saturation is benign and ours is not, and the difference is which side of the boundary
+it falls on.** `shade` saturates at an **iPhone 8 — a 2017 phone** — i.e. *below* the boundary we
+need to draw. The database saturates at a 2020 flagship sustaining 120 fps in a GFXBench scene,
+i.e. *well above* anything our content asks of a GPU. So **"reads ≥ ~100 → `high`" is a sound
+rule**, where "shade reads 0.20 → ?" is not.
+
+And the region that carries the real risk is where this data is dense and monotone: **75 of 104
+entries sit below 45 fps.** The decision that can black-screen a phone is made exactly where the
+data is good.
+
+**The three-layer resolver.** Each layer covers the blind spot of the one above it. Precedence is
+top-down; the first layer that answers, wins.
+
+| layer | answers | stale-proof? | cost |
+|---|---|---|---|
+| **1. Family + generation** — parsed from the renderer string | the TOP: `Adreno 8xx`, `Immortalis-G9xx`, `Xclipse 9xx` → `high` | ✅ **never** | ~0 ms |
+| **2. GPU database** — vendored lookup on the normalized renderer string | the long tail of old/cheap hardware, where names do not order cleanly and the black-screen risk lives | frozen Dec 2025 — which is *behind* us | ~36 KB, ~0 ms |
+| **3. Probe** — the existing ramp | unknown vendor, masked string, iOS web | — | the 6 s, paid by a MINORITY |
+| **iOS native** — model id (already shipped) | all iOS native | ✅ threshold rule | ~0 ms |
+
+**Layer 1 is what makes the stale database a non-issue**, and it is not a new idea — it is the rule
+`qualityTier.ts:653` already argues for on iOS, never applied to Android:
+
+> *"A THRESHOLD, NOT A LIST — AND THAT IS THE WHOLE POINT. An enumerated allowlist ossifies in the
+> WORST direction… A `>= N` rule cannot fail that way, because newer silicon is only ever faster."*
+
+The generation number is IN the string — `Adreno (TM) 840`, `Immortalis-G925`, `Xclipse 940` — so
+2026 and 2027 silicon classify with no data refresh. **Verified against real shipping parts**, not
+invented ones: all four of those resolve `high` via `gpu-generation` with no table row.
+
+**There is no database current enough to make this unnecessary, and that is structural.** Surveyed
+2026-08-12: detect-gpu's source (GFXBench) froze Dec 2025 and its
+[issue #132](https://github.com/pmndrs/detect-gpu/issues/132) is open with no PR and no timeline;
+the newest alternative found, [cpuranker](https://cpuranker.github.io/gpu.html) (98 GPUs, Jan 2026,
+AnTuTu+GFXBench, GPU-name-keyed, CSV export), is one month newer and **still lacks Adreno 830/840**.
+Every such database lags shipping hardware by months. Layer 1 is what makes that fine.
+
+⚠️ **`Adreno 850` DOES NOT EXIST** — it was a rumour for Snapdragon 8 Elite Gen 6 (Sept 2026), and
+it sat in a test as if it were real hardware. The shipping top is **Adreno 840** (SD 8 Elite Gen 5),
+with 830 before it.
+
+**The one gap a newer database WOULD close** is midrange parts *inside* the top series — Adreno
+725/732/735, and Huawei's **Maleoon** family, which detect-gpu lacks entirely. Layer 1 deliberately
+refuses those (extrapolating inside a series is the Adreno-765 bug), so they fall to the probe.
+cpuranker has all of them. That is a **precision** win on new midrange, not a coverage win on
+flagships, and the probe already handles it safely — so it is optional polish, not a blocker.
+Merging it means either scraping an HTML table under an unstated licence, or hand-adding ~12 rows
+with a source note; prefer the latter. Tested as a known property, not left as a surprise.
+
+**The owner's constraint this is built to satisfy:**
+
+> *"the game first impression is important. if probe says low on a high end device, the player
+> experience would be bad vice versa."*
+
+**A recognised device resolves its tier in ~0 ms, on launch #1, with no benchmark.** The 6 s probe
+budget is then spent where it is genuinely needed — making the fallback stable for the unrecognised
+tail — instead of being charged to every install. The player's own `quality.set` control stays
+exactly as it is; it is the escape hatch in both directions.
+
+⛔ **CANCELLED: the `capable` band re-campaign.** It was once the top item of this workstream. **Do
+not run it.** Nothing available can rank flagships against each other — not our `shade` ramp (flat
+from the iPhone 8 upward), not GFXBench (refresh-capped from the Adreno 650 upward), and not a
+6-second version of either. The top boundary is a **lookup**, not a measurement. Re-opening this
+needs a new axis with evidence it discriminates above an Adreno 650, not another campaign on the
+axes we have.
 
 #### Native (WebView) differs from mobile Chrome — verified on a Huawei Y6, 2026-08-10
 
@@ -1449,6 +1566,347 @@ device, at boot, and the tier it produces does not change mid-play; demotion sta
   to open the URL. ⚠️ **Space the runs out — the probe heats the device it measures.** Twenty
   stacked runs took an iPhone 8 to 30 Hz, at which point every threshold doubled, nothing escaped,
   and ten runs returned beautifully consistent numbers that were pure artifact.
+
+#### The CPU axis — boot vs in-game, and why more passes cannot fix it (#205)
+
+Two rounds of the boot-vs-in-game A/B were run on 2026-08-13 — three Androids, `games/sling`,
+five boot launches (`pm clear` before each) against five in-game runs from the debug menu's
+`Re-run probe (idle)` button. **v6** is the single-pass cpu ramp; **v7** discards a warm-up pass,
+as the GPU ramps have since done. cpu, k xform/ms, median (spread):
+
+| device | v6 boot | v6 in-game | v7 boot | v7 in-game |
+|---|---|---|---|---|
+| **Huawei Y6** | 1.9 (1.18x) | 2.0 (1.44x) | 1.7 (1.83x) | **2.1 (1.10x)** |
+| **Galaxy A23** | 7.7 (2.1x) | 3.8 (1.4x) | 8.7 (1.38x) | **12.1 (1.17x)** |
+| **Galaxy S22** | 18.2 (3.5x) | 19.3 (2.4x) | 20.2 (1.98x) | **23.8 (1.05x)** |
+
+⛔ **The v6 conclusion is RETRACTED — it was an instrument artifact, and it is written up here only
+so nobody re-derives it.** v6 said "the A23 reads 2x higher at boot than in game", i.e. a
+device-dependent bias in the unsafe direction. Wrong: v6 ran one cpu pass, so its *in-game* reading
+caught a CPU that had settled low and never climbed. Under v7 the same A23 reads 12.1 in game
+rather than 3.8 — and the old in-game number reappears exactly as v7's discarded warm-up pass
+(3.5-4.8k), which is what makes this a diagnosis rather than a coincidence.
+
+- **In game, all three spreads collapse to 1.05-1.17x** and the ordering is clean and wide: Y6
+  2.1 < A23 12.1 < S22 23.8. The axis has never looked like this before.
+- **The gain is asymmetric, which is what identifies the governor** — in game the A23 gains ~3.1x
+  over its own warm-up pass, the S22 ~1.2x, the Y6 ~1.0x. A device already at its ceiling gains
+  nothing, the same signature the shade discard found.
+- ⚠️ **Boot is now the WORSE condition, and boot is where the shipped decision is made.** Spread
+  1.38-1.98x on the Samsungs, and both read BELOW their in-game figure. At boot the process launch
+  has already boosted the CPU, so pass 1 is not cold and the discard has nothing to warm. The Y6's
+  boot spread got worse (1.18x -> 1.83x) — small absolute numbers, but stated.
+- ⚠️ **A BAND MOVED: the S22 now reads `capable` on 4 of 5 boot launches** (cpu floor 14,500), where
+  under v6 it read `middle` on 4 of 5. Not a retune — a consequence of measuring the same phone with
+  a warmed instrument. Flagged rather than acted on.
+
+⛔ **TWO FIXES FOR THE BOOT SPREAD HAVE NOW BEEN TRIED ON HARDWARE AND BOTH FAILED. Do not retry
+either.**
+
+- **Defer the probe out of boot** — refuted by v6: the in-game spread was then no better than the
+  boot spread, and on the Y6 it was wider.
+- **Discard a SECOND cpu pass** (owner-directed, 2026-08-13) — built, installed on all three phones,
+  measured on the same 5+5 protocol, **reverted**. Median (spread):
+
+  | device | boot ×1 | boot ×2 | in-game ×1 | in-game ×2 |
+  |---|---|---|---|---|
+  | Huawei Y6 | 1.7 (1.83x) | 2.0 (1.69x) | 2.1 (1.10x) | 2.2 (1.15x) |
+  | Galaxy A23 | 8.7 (1.38x) | 9.2 (1.25x) | 12.1 (1.17x) | 9.5 (1.09x) |
+  | Galaxy S22 | 20.2 (1.98x) | **19.3 (2.82x)** | 23.8 (1.05x) | 23.2 (1.19x) |
+
+  The S22's boot spread nearly doubled — worse than the single-pass instrument it replaced — and
+  its band flipped `middle`/`capable` across the five launches. Everything else moved within noise.
+
+  ⚠️ **The S22 boot ×2 cell is a RE-MEASUREMENT — the first attempt was contaminated.** That run
+  (18:17-18:20) overlapped a lease another clone held on the phone (`work-ai`, claimed 18:15:49) and
+  read **16.8 (3.56x)**. Re-run 18:58-19:01 with the phone free: **19.3 (2.82x)**, the number in the
+  table. The confound was real and it inflated the harm — but the direction is unchanged and now
+  measured cleanly, since 2.82x is still materially worse than ×1's 1.98x and the band still flips
+  (`middle` on launch 1, `capable` on 2-5). ⭐ **Two cheap lessons: check
+  `~/.modoki/device-claims.json` BEFORE a measurement run, and re-measure rather than argue from a
+  claim record** — a claim proves a claim, not activity, and the claiming pid was dead by the time
+  anyone looked.
+
+  ⭐ **Why it cannot work, and this is the durable part:** the warm-up sequences the log now prints
+  show an A23 in-game run reading `warm-up 3.6k->13.4k` and then measuring **9.8k**. Pass 2 peaks,
+  pass 3 falls back. **The boost is transient and decays even under continuous load, so more
+  sustained work is not monotonically a warmer reading** — which is the assumption every "add
+  another pass" variant rests on.
+
+*How the S22 promotion test was staged, so the result is reproducible and its limits are visible:*
+two throwaway edits, neither shipped — `gpuIdentityTier` forced `null` (all three phones are in the
+GPU table, so the probe path is otherwise unreachable), and the `capable` cpu floor raised to 40,000
+so the S22 landed in the cpu-limited state deterministically rather than on a lucky median. The
+scene boundaries were driven with `device_load_scene` over the adb lease.
+
+⚠️ **The S22 is the target population and it is not a coincidence.** Its shade sits at ~0.20 against
+a `capable` floor of 0.165 while its cpu straddles 14,500 — so the launches where it reads `middle`
+are precisely the ones where cpu fell short and shade cleared. The A23 (shade ~0.14) and the Y6
+(~0.03) are **shade-limited**, so the licence correctly never applies to them. Which is the honest
+scope of this change: it helps devices the cpu axis alone holds down, and on this hardware that is
+one phone out of three.
+
+*Honest limit:* "in-game" means **steady-state gameplay with the debug menu open**, not an idle
+process — the game loop is running and competing, which is deliberately the condition a tier is
+supposed to predict. Neither condition here is a quiescent-CPU reading.
+
+#### W2 — the probe becomes an isolated fallback: what landed (#221)
+
+Owner: *"if probe becomes stable and finishes in ~6 seconds, I think it's great."*
+
+⚠️ **Two earlier items in this plan (delete `capable`; trim the probe to two ramps) were written
+before #205/#203 landed and were CONTRADICTED BY MEASUREMENT — struck through rather than deleted,
+because a reader who has seen an earlier version of this plan would otherwise reinstate them.**
+Both rested on the same premise — that the probe's only remaining job is to separate `weak` from
+everything else — and both were overtaken:
+
+- ⛔ ~~"Two bands, not three — `capable` is deleted."~~ **INVALID, confirmed by the owner
+  2026-08-13.** `capable` is not deleted; it is *reachable* and *anchored on both tables*. The shade
+  axis went monotone once the GPU ramp discarded a warm-up pass, a Galaxy S22 now reaches `capable`
+  on the 3D table, and the 2D table's capable floor is a measured 8.5 Mpx/ms with an escaped S22 on
+  the far side of it. Collapsing to two bands now would discard both.
+- ⚠️ ~~"Trim the instrument — `fill` and `draw` have not voted since 2026-08-11."~~ **HALF right,
+  and the half that was right is now DONE.** False of `fill`: it is **the deciding axis of the
+  entire 2D probe**, because `pixiPixelRatioCap` is the only GPU knob a 2D tier moves and it is
+  fill-rate bound — dropping it would leave every 2D project with no GPU axis at all. True of
+  `draw`: ✅ **deleted 2026-08-13 by owner decision.** `gpuKinds` named only `fill` (2D) or `shade`
+  (3D), so it had not run since 2026-08-11 and no threshold read it; when it did run it failed
+  outright on the weakest hardware (Y6 0/6, iPhone 7 0/3). The ramp and its GL workload are
+  recoverable from git if a project ever turns out to be per-object-submit bound — forest-camp
+  measured 0.14 ms/call on the Y6, which is the case that would justify it. `CLASSIFIER_VERSION` is
+  deliberately NOT bumped: `draw` never entered `ProbeReading`, so no persisted sample and no
+  threshold changed meaning.
+
+1. ✅ **Isolation — ALREADY TRUE, verified by reading the boot path 2026-08-13, no work needed.**
+   Both doors already run the probe ahead of every asset: a 2D project resolves in `App.tsx`'s
+   `GameShell` **before** `setConfigReady(true)` mounts the renderers and before
+   `ensureManifestLoaded`/`loadScene`; a 3D project resolves inside `makeWebGPURenderer`, which is
+   likewise ahead of the manifest and the scene. The contention this item was written against was
+   the **rAF path's** interval estimation (an S22 estimating 125–167 ms against a true 16.8 ms), and
+   that path is now the fallback — the GPU-clock path waits on a fence, estimates no interval, and
+   uses a nominal 16.7 ms constant. ⚠️ Do not "add isolation"; there is nothing to move.
+2. ✅ **Settle within ONE launch — LANDED 2026-08-13 (`tierResolve.ts`), and the naive version was
+   REFUTED on hardware first.** `resolveProbeClass` now repeats the whole probe up to
+   `PROBE_SAMPLE_TARGET` times inside one launch, bounded by `PROBE_IN_LAUNCH_BUDGET_MS` (2500).
+   Measured, one wiped launch per device, `space-invader`:
+
+   | device | passes | per-pass band | settles | blocked launch, total |
+   |---|---|---|---|---|
+   | Huawei Y6 | 3 | weak · weak · weak | launch 1 | 1602 ms |
+   | Galaxy A23 | 3 | middle · middle · middle | launch 1 | 1828 ms |
+   | Galaxy S22 | 3 | capable · capable · capable | launch 1 | 1655 ms |
+
+   Launch 2 emits **zero** probe lines on all three — the cache short-circuit still fires ahead of
+   the loop.
+
+   ⛔ **The in-launch MEDIAN is wrong and was nearly shipped.** In-launch passes are a **warming
+   sequence**, not independent draws: a Y6 read fill `0.94 → 1.17 → 1.36` in one launch, and on
+   another `1.37 → 2.11 → 1.69` — an in-launch median of **1.69** against a cross-launch median of
+   **1.10**, a 1.5× **upward** bias that lands past the 1.68 `middle` fill floor. Only the cpu floor
+   kept that phone out of a band measured at 14 fps on it. Medianing a warm population against
+   cold-derived thresholds is the same instrument mistake this workstream has now made three times.
+
+   ⭐ **So the settle rule is UNANIMITY, not the median**: a launch may settle only when every pass
+   in it classified the same band anyway — in which case the warming never reached a boundary. When
+   the passes disagree, only the **first (cold) reading** is persisted with `final: false`, which is
+   exactly the pre-#221 behaviour, so a near-boundary device degrades onto the already-measured path
+   rather than onto a new one.
+3. ✅ **Playable ads must never probe — LANDED 2026-08-13** (`core/bootProbeAllowed.ts`, set from
+   `main.tsx` as `setBootProbeAllowed(!__MODOKI_PLAYABLE__)`). ⚠️ **"One config ⇒ no probe" covered
+   LESS than the item assumed, and the gap was the expensive half:**
+   - the single-config short-circuit is a **project's** choice, not the ad format's — it fires only
+     when exactly one tier config is authored, and the scaffolder's default (and every project here)
+     is two;
+   - the **measure-and-log EVIDENCE path never consulted it at all** — a tier answered cheaply by
+     GPU identity or the iOS model table still ran the whole probe whenever
+     `areDebugHandlesEnabled()`, and **ten projects ship `build.debugBuild: true`**. So the likely
+     playable was exactly the one that paid.
+
+   ⚠️ **And the bill had just tripled**: the in-launch settling above took it from ~550 ms to
+   **1.6–1.8 s** of blocked launch, in the one build where launch time is the product.
+
+   ⭐ **Verified the probe really was reaching a playable, rather than assuming it.** Grepping
+   `games/space-invader/ads/index.html` for `rampProbe` returns **0**, which is meaningless and
+   nearly became a wrong conclusion here — the creative's JS payload is compressed + base64, a trap
+   [playable-export.md](./playable-export.md) § Gotchas already records ("You cannot `grep` the
+   artifact", two false diagnoses before this one). Decompressed, the payload contains `rampProbe`
+   ×5, `qualityTier` ×12 and `resolveTierForNo3D` ×4.
+
+   Both guards are mutation-checked (removing either fails a test), and a separate architecture
+   guard pins the `main.tsx` wiring, which no unit test can reach — deleting that one line would
+   otherwise leave the whole suite green.
+
+#### The 2D probe: sample-gate softening, the fill-ceiling bug, and the v9 re-measure (#221)
+
+- **The probe runs on a raw WebGL2 context** (`rampWorkloadGL.ts`), so `render3d: false` and
+  `disable3D` projects can run it. ONE instrument, not two — the Three path is deleted, taking the
+  re-entrancy hazard, the leaked-context timeout and 600–1700 ms of cold renderer creation with it.
+- ✅ **VERIFIED ON HARDWARE 2026-08-13 — `games/space-invader` on the iPhone Air.** The 2D probe
+  ran, on a 2D-only project (`build.modules.render3d: false`), and the device resolved a tier:
+
+  ```
+  [rampProbe] EVIDENCE ONLY (tier came from 'model') capable — cpu 43.7k xform/ms,
+              fill 24.515Mpx/ms — clears the capable floor on both ramps (median of 3 launches)
+  [qualityTier] high via model — iPhone18,4 is iPhone generation 18, at or past the high-tier
+              floor of 11
+  ```
+
+  The probe AGREES with the model table (`capable` → `high`), which is the first cross-check the
+  2D shape has ever had. It is also **cheap**: `blocked launch 264 ms`, against 0.5-2.6 s for the
+  3D shape on Android.
+
+  ⚠️ **STILL true, and still the rule: not verifiable in the editor.** The seam is in `App.tsx`'s
+  `GameShell`, which the editor does not mount. An attempt to read the live tier through CDP
+  returned `null`, and that reading is UNTRUSTWORTHY — the `/@fs/` import produced a second module
+  instance (its `tiers` came back `[]`), so it reported a fresh module's state, not the app's.
+  **Verify on a device build, or via the web build served at `/`.**
+
+  ⚠️ **iOS console logs do NOT reach `idevicesyslog` or `log stream`** — a WKWebView's
+  `console.warn` goes to the debugger, not `os_log`, so 899k syslog lines contained not one probe
+  line. What works is `xcrun devicectl device process launch --console --terminate-existing
+  <bundleId>`. Recorded because two tools failing silently reads exactly like a probe that never
+  ran.
+
+- ✅ **AND IT FOUND SOMETHING — FIXED 2026-08-13 (#221): the fill ramp's CEILING was too low for
+  modern hardware.** The Air's fill ramp came back `ceiling/lower` — it exhausted
+  `RAMP_BOUNDS.fill.maxLoad` (1024) without escaping, its last step still only 15 ms — so its
+  24.5 Mpx/ms was a LOWER BOUND, and so was the Galaxy S22's 7.69. A midpoint computed with one end
+  pinned to the instrument's own ceiling is not a midpoint, so the 2D `capable` floor was wrong by
+  more than it looked.
+
+- ⭐ **THE 2D FILL AXIS IS RE-MEASURED ON AN UNCLIPPED RAMP (#221, `v9`), AND ONE NUMBER MOVED
+  3.4x.** `RAMP_BOUNDS.fill.maxLoad` 1024 → **65536**; `games/space-invader`, debug build,
+  `pm clear` before every launch, three launches per device. Median Mpx/ms:
+
+  | device | v5 (ceiling 1024) | v9 (ceiling 65536) | status |
+  |---|---|---|---|
+  | Huawei Y6 | 1.02 | **1.10** | escaped under both — unchanged |
+  | Galaxy A23 | 2.77 | **2.81** | escaped under both — unchanged |
+  | Galaxy S22 | 7.69 ⛔ bound | **25.82** | now `escaped/measured` |
+  | iPhone Air | 24.5 ⛔ bound | **68.21** | now `escaped/measured` |
+
+  ⭐ **The asymmetry IS the proof.** A ramp ceiling cannot affect a device that never reaches it, so
+  the two weak phones moving <5% while the flagship moves 3.4x is exactly the signature of a clipped
+  instrument rather than of three phones changing. The S22's spread also *tightened* to 1.19x — its
+  old 1.05x was precision about the ceiling, not about the GPU.
+
+  **Consequence: the 2D `capable` floor moved 4.6 → 8.5** (geometric mean of 2.81 and 25.82). The
+  `middle` floor stayed at **1.68** deliberately — the v9 pair puts it at 1.76, a 5% move inside the
+  Y6's own 0.75–1.12 launch spread, and re-fitting on noise costs the ability to say a threshold
+  survived two independent campaigns. **No device tested changes band**; what changed is where an
+  unseen device lands, and the move is toward the conservative side.
+
+  ⚠️ **How big a ceiling is enough, and why the first answer was not:** 8192 was tried first and the
+  S22 escaped on its VERY LAST STEP (83.9 ms against a 50.1 ms bar) — one device generation from
+  being clipped again. The headroom is free because a ramp always ends on the first step past the
+  escape bar, so the *last* step costs ~50–100 ms on every device and a faster GPU just spends more
+  doublings at the ~4.2 ms GPU-clock latency floor getting there. Measured: the S22's full 11-step
+  ramp sums to ~200 ms against a 400 ms budget. **Take the headroom; it is not paid for by anyone.**
+
+  ✅ **The iPhone Air leg is DONE** (three launches, `--console`): 65.37 / 68.21 / 98.06 →
+  **68.21**, `escaped/measured`, escape at 8192 / 56 ms. It was 24.5 ⛔ bound before, so 2.8x under.
+  The axis is monotone over 62x across four devices and the Air clears `capable` by 8x, which is
+  what a top anchor is for — without one the top floor is only ever pinned from below.
+
+  ⚠️ **AND IT PRICED THE CHANGE, WHICH THE ANDROID RUNS COULD NOT: blocked launch 264 ms → 486 ms
+  on the Air**, same build, ceiling the only difference. The three added steps cost ~104 ms and the
+  discarded warm-up pass renders them again, so the price is ~2x the visible steps. The first
+  version of the code comment claimed the headroom was "free" — it is free against
+  `GPU_RAMP_BUDGET_MS`, and it is **not** free against launch time, which is the number this work
+  exists to cut. Worth paying (the alternative is ranking a fast unrecognised device by the ramp's
+  ceiling), and only paid while a device is still refining and never once GPU identity recognises
+  it.
+  ⭐ The lesson: a change measured only on hardware that escapes EARLY cannot show you what it costs
+  the hardware that escapes LATE. The Y6 and A23 both said "free"; only the fastest device tested
+  had the steps to pay for.
+
+#### Findings that must not be re-derived
+
+Each cost a session or more.
+
+1. **Opaque overdraw is not a load.** A tile-based GPU resolves which fragment survives BEFORE
+   shading, so stacking coplanar opaque quads measures rasterization, not fill. Every mobile GPU is
+   tile-based. Blending is what makes overdraw real. This explains three sessions of "fill cannot
+   rank these GPUs".
+2. **A boundary separates MEDIANS, never readings.** The A23's `shade` spans 0.055–0.16 and
+   OVERLAPS the iPhone 7's 0.03–0.07. Any one-pass settle is unsound; `PROBE_CLEAR_MARGIN` was
+   removed for this and must not return without new evidence.
+3. **Guards written naively defend only the safe direction.** Throughput is `dLoad/dMs`, so an
+   anomalously SMALL `dMs` *overstates* — and overstating is what costs a GPU context. Every guard
+   written first (`SPIKE_RATIO`, `GROWTH_OVER_FLOOR`) caught only the understating direction; three
+   defects lived in that blind spot.
+4. **A mechanism that is authored but never read is this repo's dominant defect.** `autoLightCap`
+   held the rule, was unit-tested, and was imported by nothing for two months. The tier's light
+   limits were authored intent and nothing else. **Verify by PERTURBING an authored value** and
+   watching the render follow — a value that coincides with the default cannot tell "read" from
+   "ignored".
+5. **A tier CLAMPS; it never raises.** `high` is a true no-op (`UNCLAMPED_OVERRIDES` is the
+   identity). This is what made tiers safe to wire into every existing project, and it is why a
+   wrong `mid`-vs-`high` verdict is cosmetic while a wrong `weak` verdict is a black screen.
+6. **The failure directions are not symmetric.** Booting high on weak hardware: one 6,388 ms
+   `submit-postfx`, the GPU watchdog kills the context, recovery fails, blank for the process
+   lifetime (#156, Huawei Y6). Booting low on strong hardware: a beat of uglier rendering, fixable
+   by the player's own setting. Design every fallback toward the second.
+
+#### The measurement protocol — every line was paid for
+
+- **ONE campaign, ONE build, at a time.** Two overlapping campaigns on the same phones voided a
+  session's counts.
+- **Measure on MORE THAN ONE PROJECT.** All seven original band figures came from one, and that is
+  why they do not transfer.
+- **Wipe the verdict before every launch** (`adb shell pm clear <pkg>`; on iOS
+  `ideviceinstaller uninstall` — NSUserDefaults survives a reinstall). ⚠️ Wiping is right for
+  independent readings and blind to the persistence seam; test that separately.
+- **Check the phone is awake AND unlocked** — `dumpsys display | grep mScreenState`. A dark or
+  locked phone stops rAF and is indistinguishable from a broken build in logcat.
+- **Read EVERY device's leg before concluding.** Repeatedly, the leg skipped held the answer.
+- **A metronomic reading is a throttle, not contention.** Frame deltas stepping by a whole number of
+  the device's own ticks are the scheduler backing off; a busy CPU is never that tidy.
+- **iOS quantizes `performance.now()` to 1 ms**, so every iOS step time is a whole number and reads
+  as more precise than it is. Real resolution is about ±15%.
+- **`setRenderSettings` alone does NOT resize.** The backing buffer follows only once something
+  drives the resize bus. **Read the canvas buffer, never the setting**, when asking what is on
+  screen.
+- **`modoki_capture_viewport` / `device_screenshot` FORCE a render**, so they mask render-on-demand
+  and stale-frame bugs. Use CDP `Page.captureScreenshot` for the true framebuffer.
+- **Tooling**: Android over `adb`; iOS 15/16 via `libimobiledevice`, iOS 17+ via `xcrun devicectl`.
+
+#### More reference measurements
+
+**A TRUE release build cannot afford `mid.pixelRatioCap: 1.875` — it is far past a cliff, not near
+one.** The DPR ladder above (`sling` on an A23) was measured on a DEBUG build carrying ~10.5 ms of
+CPU, which left open the possibility that a release build's extra margin could afford more. Both
+halves of that doubt failed:
+
+1. **The ~10 ms is NOT debug overhead.** Measured on an Android **release-build-type** APK (bridge
+   still compiled in, so the profiler could be read): `cpuMs` median **10.0 ms** at DPR 1, **10.0**
+   at 1.5, **10.8** at 1.875 — flat across the DPR ladder and identical to the debug figure. That
+   CPU is the game and engine, not the build type. DPR is a GPU knob and the ladder confirms it:
+   `restMs` 6.7 → 6.5 → 8.3, and only the 1.875 row misses vsync (frame 20.0 ms, 50 fps).
+2. **A TRUE release build cannot afford 1.875 either — it is far past a cliff, not near one.**
+   `debugBuild: false` (no bridge at all), so measured from OUTSIDE the app with
+   `adb shell dumpsys gfxinfo <pkg>`, two builds differing only in `mid.pixelRatioCap`:
+
+   | `mid.pixelRatioCap` | device DPR | buffer | p50 | p90 | janky | Missed Vsync |
+   |---|---|---|---|---|---|---|
+   | **1.5** | 1.5 | 0.69 Mpx | **26 ms** | 34 ms | 35.8% | **0** |
+   | 2 | 1.875 | 1.08 Mpx | **53 ms** | 73 ms | 98.0% | 145 |
+
+   A 1.56x pixel increase doubles the frame — superlinear, and the `Missed Vsync` count goes 0 →
+   145. **1.5 is the right cap on this band; it was never conservative.**
+
+⚠️ **`gfxinfo` absolutes are not the in-app frame time** (26 ms against the profiler's 16.7 ms at the
+same cap) — it counts UI-thread/compositing work the engine's own profiler does not. Read the
+DELTA between two builds on one instrument, never the level. It is still the only instrument that
+works with no bridge compiled in, which is what "release" means here.
+
+⚠️ Two method notes worth keeping: a release APK needs signing to install (debug keystore via
+`apksigner` is fine for a perf test), and `gradlew` needs `JAVA_HOME=/opt/homebrew/opt/openjdk@21`
+on this Mac — the default JDK 25 fails with `Unsupported class file major version 69`.
+
+**Physics substepping costs less than assumed** — A23, `sling`, `frame/ecs/physics3D` selfMs:
+0.9 ms at `mid` (60 fps, one substep) → 1.4 ms at `low` (30 fps, two substeps). Not 2×, and per
+*second* the cost falls: 54 ms/s → 42 ms/s.
 
 ### GPU context loss is recoverable — and bring-up must stay self-contained
 

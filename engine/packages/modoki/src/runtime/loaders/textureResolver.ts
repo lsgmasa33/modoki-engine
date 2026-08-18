@@ -22,6 +22,7 @@ import {
   setActiveRendererHandle, ktx2CapsReady, areKtx2CapsReady, markKtx2CapsReady,
 } from '../core/activeRenderer';
 import { warnVocabOnce } from '../core/warnVocab';
+import { getActiveTextureSizeCap } from '../core/textureSizeCap';
 export { getActiveRenderer, onRendererReady, rendererReady, getRendererGateHealth } from '../core/activeRenderer';
 export type { RendererGateHealth } from '../core/activeRenderer';
 export type { ResolvedSprite } from '../core/textureProvider';
@@ -144,9 +145,17 @@ export function resolveTextureVariantUrl(ref: string, usage: '2d' | '3d'): strin
   const settings = entry?.texture;
   if (!settings) return assetUrl(sourcePath); // unconverted → source fallback
   const variant = selectVariant(settings, usage, detectedCaps);
+  // Texture LOD by quality tier (#212). The active tier's cap is used ONLY when the manifest
+  // says a variant was actually EMITTED at that size — never guessed. A cap the build didn't
+  // produce (project authors no tiers; this size wasn't below this texture's own maxSize/source
+  // dims; an older manifest predating this feature) falls straight through to today's URL,
+  // unchanged — the resolver must not request a file that may not exist (a missing asset hangs
+  // rather than fails, per this repo's own history).
+  const cap = getActiveTextureSizeCap();
+  const sizeCap = cap > 0 && settings.sizes?.includes(cap) ? cap : undefined;
   // Cache-bust immutable production assets with the content hash (shared helper —
   // matches modelGlbUrl + the invalidateTexture eviction key below).
-  return withCacheBust(assetUrl(sourcePath + variantSuffix(variant)), entry?.hash);
+  return withCacheBust(assetUrl(sourcePath + variantSuffix(variant, sizeCap)), entry?.hash);
 }
 
 /** Resolve an environment (HDR) ref to the served URL of its converted variant
@@ -437,8 +446,17 @@ export function invalidateTexture(ref: string): void {
   // SAME key construction loadTexture3D uses, including the ?v=<hash> suffix in prod.
   const hash = getAssetEntry(ref)?.hash;
   const urls = new Set<string>();
+  // ⚠️ **EVERY EMITTED SIZE, NOT JUST THE UNCAPPED ONE (#212).** This set is matched against
+  // `TexCacheEntry.url`, so a variant missing from it can never be evicted — and a per-tier capped
+  // texture (`~uastc@512.ktx2`) was missing from it for exactly as long as the feature existed.
+  // Measured: `invalidateAssets` reported `textures: 0` on a scene holding 21 of them. It fails
+  // SILENTLY in the worst direction for an editor re-import — the stale texture simply stays on
+  // screen and the author concludes their re-import did not take.
+  const sizes: (number | undefined)[] = [undefined, ...(getAssetEntry(ref)?.texture?.sizes ?? [])];
   for (const v of ['uastc', 'etc1s', 'astc', 'webp', 'png'] as const) {
-    urls.add(withCacheBust(assetUrl(sourcePath + variantSuffix(v)), hash));
+    for (const size of sizes) {
+      urls.add(withCacheBust(assetUrl(sourcePath + variantSuffix(v, size)), hash));
+    }
   }
   urls.add(withCacheBust(assetUrl(sourcePath), hash));
   // Force-evict + dispose any shared textures bound to those URLs.

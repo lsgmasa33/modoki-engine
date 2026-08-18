@@ -892,6 +892,45 @@ Android sibling, with the same shape:
 newly-scaffolded project silently ships API 24 and the floor drifts per-project — the same drift
 `iosMinVersion` was introduced to close on iOS. Same test file adds parallel Android coverage.
 
+## Testing on hardware BELOW the shipping floor (Y6, iPhone 7)
+
+The two weakest devices this engine has real measurements from are **below the target floor on
+purpose** (`androidMinSdk: 31`, `iosMinVersion: '16.4'`), so a stock build refuses to install. They
+are still the most valuable hardware for a low-end campaign — they are the devices the shipping
+floors exist because of. **Lower the floor temporarily; never commit it.**
+
+### Android (Huawei Y6 2019 — API 28)
+
+`INSTALL_FAILED_OLDER_SDK` is the symptom. **Two files must move together** — a guard fails the
+build if a committed native floor disagrees with its config (that gate has gone red before):
+
+```bash
+# 1. the config
+node -e "const f=require('fs'),p='games/<id>/project.config.json',c=JSON.parse(f.readFileSync(p));\
+  c.build.androidMinSdk=28; f.writeFileSync(p,JSON.stringify(c,null,2)+'\n')"
+# 2. the native floor healNativeConfig syncs FROM it
+gsed -i 's/minSdkVersion = 31/minSdkVersion = 28/' games/<id>/android/variables.gradle
+
+# build + install as usual, then REVERT BOTH:
+git checkout -- games/<id>/project.config.json games/<id>/android/variables.gradle
+```
+
+⚠️ **Revert before committing anything.** Verified working 2026-08-12: `games/sling` installed and
+ran on the Y6 at API 28, and produced a probe-vs-identity A/B that nothing else could.
+⚠️ `npx cap sync android` also rewrites the **#206** escaping `@capacitor/haptics` gradle path on
+every run — revert that too (`git status` after every build).
+
+### iOS (iPhone 7 — iOS 15.x max)
+
+Same shape, different knob: the floor is `build.iosMinVersion` (`'16.4'`), synced into the Xcode
+project's `IPHONEOS_DEPLOYMENT_TARGET` by `healNativeConfig`. Lower both, build, **revert both**.
+⚠️ The iPhone 7 additionally cannot run WebDriverAgent, so its input is synthetic-only — see
+[trusted-device-input.md](./trusted-device-input.md). It is a MEASUREMENT device, not an
+interaction device.
+
+**Why this is written down**: both devices are permanently out of the shipping floor, so this is
+not a one-off — it is the standing procedure for every future campaign that wants the low end.
+
 ## iOS build notes
 
 - **`.xcodeproj` vs `.xcworkspace` depends on the game's deps.** A Firebase-only / SPM-only game

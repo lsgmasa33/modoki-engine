@@ -53,6 +53,15 @@ export interface TextureImportSettings {
    *  `--uastc_rdo_l`. Higher = smaller (Zstd compresses better) at some quality cost;
    *  0 disables RDO. Default 1.0. */
   uastcRdoLambda?: number;
+  /** BUILD-BAKED, not authored — the distinct tier `textureMaxSize` caps this texture actually
+   *  got an extra derived variant for (texture LOD by quality tier, #212). Written by the build
+   *  emitter (`vite-asset-scanner.ts`) alongside `maxSize`/`format`, mirroring how `hash`/
+   *  `variantBytes` are baked-not-authored elsewhere in this pipeline. The runtime resolver
+   *  ({@link resolveTextureVariantUrl} in `textureResolver.ts`) must NEVER guess a capped URL
+   *  that isn't listed here — an unlisted cap is a 404, and per this repo's own history a
+   *  missing asset HANGS rather than fails. Absent/empty on every texture until a project
+   *  authors a tier `textureMaxSize` — see `sizesToEmit`. */
+  sizes?: number[];
 }
 
 export const DEFAULT_TEXTURE_SETTINGS: TextureImportSettings = {
@@ -212,9 +221,37 @@ export function browserVariant(format: TextureFormat, type?: TextureType): Textu
 
 /** Suffix appended to the source path to form the deterministic served URL,
  *  e.g. `rock.png` + `~uastc.ktx2`. Dev server and production build both serve
- *  the variant at this URL, so the runtime computes it without reading the hash. */
-export function variantSuffix(v: TextureVariant): string {
-  return `~${v}.${variantExtension(v)}`;
+ *  the variant at this URL, so the runtime computes it without reading the hash.
+ *
+ *  `sizeCap` is the texture-LOD-by-quality-tier axis (#212), ORTHOGONAL to the format/usage
+ *  axis `v` already encodes: absent (or falsy/0, the same "no cap" sentinel used everywhere
+ *  else in this pipeline) yields exactly today's suffix — `~uastc.ktx2` — so every asset
+ *  shipped before this feature existed keeps its URL byte-for-byte. A cap appends `@<n>`
+ *  before the extension: `~uastc@512.ktx2`. */
+export function variantSuffix(v: TextureVariant, sizeCap?: number): string {
+  const cap = sizeCap && sizeCap > 0 ? `@${sizeCap}` : '';
+  return `~${v}${cap}.${variantExtension(v)}`;
+}
+
+/** Which of a project's authored tier `textureMaxSize` caps would actually shrink THIS texture
+ *  further than it is already shrunk — the build-side half of texture LOD by quality tier
+ *  (#212). Pure (no fs/sharp/toktx) so the decision is unit-testable without a real build; the
+ *  emitter (`vite-asset-scanner.ts`) calls this to decide which extra variants to convert.
+ *
+ *  A cap emits NOTHING when it cannot shrink anything — at or above the texture's own authored
+ *  `maxSize` (nothing to gain over what already ships), or at or above the source's longest
+ *  edge (the texture is already smaller than the cap, so capping it would produce a byte-for-
+ *  byte duplicate of the uncapped file under a different name). Distinct + ascending, so the
+ *  caller emits each real size exactly once regardless of how many tiers share a cap value. */
+export function sizesToEmit(
+  tierCaps: readonly number[],
+  maxSize: number,
+  srcWidth: number,
+  srcHeight: number,
+): number[] {
+  const longestSourceEdge = Math.max(srcWidth, srcHeight);
+  const distinct = Array.from(new Set(tierCaps.filter((c) => c > 0)));
+  return distinct.filter((c) => c < maxSize && c < longestSourceEdge).sort((a, b) => a - b);
 }
 
 /** Pick the best variant for a call site given GPU capabilities. Pure +

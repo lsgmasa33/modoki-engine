@@ -133,6 +133,12 @@ export interface TierOverridesConfig {
   /** The 2D analogue of `antialias`. Baked into the Pixi `Application` at slot creation, so a live
    *  tier change catches up on the next slot rather than applying immediately. */
   pixiAntialias: boolean;
+  /** Longest-edge cap for a TEXTURE on this tier, in pixels (texture LOD by quality tier, #212).
+   *  **0 = no cap** (ship the source size). Mirrors `TierRenderOverrides.textureMaxSize`
+   *  (runtime/rendering/qualityTier.ts) — this file restates rather than imports it (see the
+   *  header). Read by the build emitter (`vite-asset-scanner.ts`) to decide which extra
+   *  downscaled variants to convert; never touches format/codec selection. */
+  textureMaxSize: number;
 }
 
 export interface ProjectConfig {
@@ -243,6 +249,14 @@ export interface ProjectConfig {
     /** Ad network the playable targets (Phase 5/8) — reserved for per-network CTA/
      *  MRAID quirks. Default 'applovin'. */
     playableNetwork: (typeof PLAYABLE_NETWORKS)[number];
+    /** Per-tier texture LOD variants (#212): every size ships INSIDE the package, so it's a
+     *  real cost for a native install (measured: +19% dist) that only pays off when the
+     *  device actually fetches just the variant it needs — i.e. when the payload travels over
+     *  the wire (a web build, or a native build shipped via OTA). 'auto' (default) emits under
+     *  exactly that condition; 'always' is the native opt-IN for a project whose textures are
+     *  huge enough that the boot-time/GPU-memory win is worth the install size; 'never' opts a
+     *  web project out. See `plugins/textureTierEmit.ts`. */
+    textureTierVariants: (typeof TEXTURE_TIER_VARIANTS_MODES)[number];
   };
   /** Native Capacitor shell settings, synthesized into `capacitor.config.json`
    *  (previously hardcoded in the generator) plus native-project patches applied
@@ -481,6 +495,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     playableMaxBytes: 5_242_880, // 5 MB (AppLovin)
     playableClickUrl: '',
     playableNetwork: 'applovin',
+    textureTierVariants: 'auto',
   },
   capacitor: {
     webDir: 'dist',
@@ -624,6 +639,11 @@ export const QUALITY_TIERS = ['auto', 'low', 'mid', 'high'] as const;
 export const WEB_DEPLOY_MODES = ['none', 'gcs', 'custom'] as const;
 /** Ad-network MRAID/CTA conventions for the playable export. */
 export const PLAYABLE_NETWORKS = ['applovin', 'unity', 'ironsource', 'facebook', 'mintegral', 'generic'] as const;
+/** Whether a build emits per-tier texture LOD variants (#212) — 'auto' emits only when the
+ *  payload is delivered OVER THE WIRE (a web build, or a native build that's actually an OTA
+ *  publish); 'always'/'never' override that in either direction. See
+ *  `plugins/textureTierEmit.ts` for the predicate this drives. */
+export const TEXTURE_TIER_VARIANTS_MODES = ['auto', 'always', 'never'] as const;
 export const CAPACITOR_ORIENTATIONS = ['auto', 'portrait', 'landscape'] as const;
 export const STATUS_BAR_STYLES = ['default', 'light', 'dark'] as const;
 /** Capacitor `ios.preferredContentMode` (see addNativeTarget.ts). */
@@ -674,6 +694,7 @@ export function mergeProjectConfig(
       // deploy/playable step silently picked a branch for it.
       webDeployMode: pick(p.build?.webDeployMode, WEB_DEPLOY_MODES, d.build.webDeployMode, 'build.webDeployMode'),
       playableNetwork: pick(p.build?.playableNetwork, PLAYABLE_NETWORKS, d.build.playableNetwork, 'build.playableNetwork'),
+      textureTierVariants: pick(p.build?.textureTierVariants, TEXTURE_TIER_VARIANTS_MODES, d.build.textureTierVariants, 'build.textureTierVariants'),
     },
     capacitor: {
       ...d.capacitor, ...p.capacitor,

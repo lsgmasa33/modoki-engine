@@ -435,8 +435,8 @@ function propagate(n: CpuNodes, iterations: number): number {
  *      then measured 9.8k, so the boost is transient and decays even under continuous load. More
  *      sustained work is not monotonically a warmer reading.
  *
- *  ⚠️ And do NOT retune the cpu floors off these numbers: see
- *  docs/plans/low-end-device-support.md § 1, including the S22 band flip the discard caused. */
+ *  ⚠️ And do NOT retune the cpu floors off these numbers: see docs/rendering.md § "Quality tiers"
+ *  → "The CPU axis — boot vs in-game", including the S22 band flip the discard caused. */
 // Exported for the same reason `runRamp` is: a test must be able to drive it directly, without
 // standing up a GL surface it does not need. Its deadline behaviour is the whole of what a test
 // has to reach here.

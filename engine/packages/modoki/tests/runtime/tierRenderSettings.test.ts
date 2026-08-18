@@ -133,6 +133,8 @@ describe('getActiveTierOverrides', () => {
       // shadowMapCeiling's 777 above. They also keep this config COMPLETE, which is what makes
       // the `toBe` identity below a statement about the resolver rather than about back-filling.
       targetFps: 24, pixiPixelRatioCap: 1, pixiAntialias: false,
+      // #212's field, same argument again — 999 appears in no engine table.
+      textureMaxSize: 999,
     };
     setRenderSettings({ three: { tiers: { low: authoredLow } } });
     setActiveQualityTier({ tier: 'low', source: 'project', reason: 'test' });

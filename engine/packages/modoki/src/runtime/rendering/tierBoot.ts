@@ -27,14 +27,23 @@
  *      to a 2D project too — with the FILL ramp as its deciding axis, since `pixiPixelRatioCap` is
  *      the only GPU knob a 2D tier moves and it is fill-rate bound.
  *
- *  ⚠️ **This module must NOT be imported by `Scene3D`'s path.** A 3D project resolves its tier
- *  exactly where it always did — inside `makeWebGPURenderer`, before the first drawing buffer is
- *  allocated — because `antialias` is a constructor option and a tier decided later cannot apply
- *  it. Resolving earlier from here would be harmless but pointless; resolving in BOTH places is
- *  merely idempotent (`resolveActiveTier` early-outs on an existing tier). What matters is that
- *  the 3D ordering is not disturbed. */
+ *  ⚠️ **This module must NOT be imported by `Scene3D`'s path.** A 3D project still resolves inside
+ *  `makeWebGPURenderer` too — it must, because `antialias` is a renderer CONSTRUCTOR option and a
+ *  tier decided after the first drawing buffer exists cannot apply it. Resolving in both places is
+ *  merely idempotent (`resolveActiveTier` early-outs on an existing tier).
+ *
+ *  ⭐ **"Resolving earlier from here would be harmless but POINTLESS" — that sentence stood here
+ *  until 2026-08-14 and it is now false, which is why {@link resolveTierBeforeSceneLoad} exists.**
+ *  It was true while every tier knob was read by the renderer itself. Texture LOD by tier (#212)
+ *  broke that: the tier's `textureMaxSize` is read by `resolveTextureVariantUrl` when a SCENE's
+ *  textures resolve, and scene load races renderer creation. Measured on a Galaxy A23 with the
+ *  tier pinned `low` from boot — cap 512 in force, `sizes:[512]` in the manifest, all 21 `@512`
+ *  files shipped in the APK, and **0 of 21 textures fetched the capped URL** (first KTX2 request
+ *  at 873 ms). Nothing errored: an unresolved cap falls back to the full-size URL, which is the
+ *  correct behaviour and therefore completely silent. */
 
-import { resolveActiveTierForNo3D } from './tierResolve';
+import { resolveActiveTier, resolveActiveTierForNo3D } from './tierResolve';
+import { getRenderSettings } from './renderSettings';
 import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_2D } from './frameDriver';
 import { tickTierCalibration, applyPendingTierPromotion } from './tierCalibration';
 
@@ -80,6 +89,29 @@ export function startTierCalibrationForNo3DProject(): void {
 
 /** Tear the loop down — for a game swap, and for tests, which must not leak a callback into the
  *  next test's frame driver. */
+/** Resolve the quality tier for a project that WILL mount a 3D surface, before the scene loads.
+ *
+ *  ⚠️ **This is an ORDERING fix, not a second resolver** (#212). `makeWebGPURenderer` still calls
+ *  `resolveActiveTier` and still must; this one runs first so the tier exists before anything
+ *  resolves an asset URL from it. `resolveActiveTier` early-outs on an existing tier, so whichever
+ *  gets there first wins and the other is free.
+ *
+ *  Three things fall out of resolving here rather than inside the renderer, and they are the
+ *  argument for it:
+ *    - the tier is in force before `loadScene`, so per-tier texture variants are actually chosen;
+ *    - the probe (when a device needs one) runs with NO renderer in existence, which is the
+ *      isolation W2 wanted and removes the probe→renderer→probe re-entrancy hazard
+ *      (`probeReentrancy.ts`) rather than guarding it;
+ *    - `antialias` is unaffected — the renderer reads `getEffectiveThreeSettings()` after its own
+ *      (now instant) resolve, and reads a tier that is already correct instead of racing to set it.
+ *
+ *  ⚠️ NOT `only2D`: a 3D project must be judged on the `shade` axis, not `fill`. Passing the wrong
+ *  shape would median a reading against the other table's floors — the mistake `probeFingerprint`
+ *  carries the shape for. */
+export async function resolveTierBeforeSceneLoad(): Promise<void> {
+  await resolveActiveTier(getRenderSettings().three.qualityTier);
+}
+
 export function stopTierCalibrationForNo3DProject(): void {
   unregisterFrameCallback(CALIBRATION_KEY);
 }

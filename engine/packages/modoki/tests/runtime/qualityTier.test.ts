@@ -932,6 +932,22 @@ describe('tier settings', () => {
     expect(TIER_SETTINGS.high).toMatchObject({ pixelRatioCap: 2, antialias: true, shadows: true });
   });
 
+  // #212 texture LOD by quality tier — the seeds this task's build/runtime pieces read.
+  it('textureMaxSize: low 512, mid 1024, high 0 (no cap) — the ladder, unclamped-then-loosening', () => {
+    expect(TIER_SETTINGS.low.textureMaxSize).toBe(512);
+    expect(TIER_SETTINGS.mid.textureMaxSize).toBe(1024);
+    expect(TIER_SETTINGS.high.textureMaxSize).toBe(0);
+    // The ladder property, mirroring `pixelRatioCap`'s own assertion above: strictly between
+    // low and unclamped (0 reads as Infinity for THIS field's sentinel, so "greater" is the
+    // right direction — mid's cap is looser, i.e. bigger, than low's).
+    expect(TIER_SETTINGS.mid.textureMaxSize).toBeGreaterThan(TIER_SETTINGS.low.textureMaxSize);
+  });
+
+  it('UNCLAMPED_OVERRIDES.textureMaxSize is 0 — the "no cap" sentinel is already the identity, ' +
+    'unlike pixelRatioCap which needs Infinity', () => {
+    expect(UNCLAMPED_OVERRIDES.textureMaxSize).toBe(0);
+  });
+
   it('clamps an authored shadow map to the tier ceiling', () => {
     // Light.shadowMapSize is a per-light trait with no global cap, so a tier could not otherwise
     // enforce "shadows, but smaller".

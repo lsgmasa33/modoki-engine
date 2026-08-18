@@ -12,7 +12,7 @@
  *  seeing only ambient + directional = 98 ms; dropping the post-FX stack on top of that = 20 ms
  *  (49 fps). Culling lights was worth ~470 ms of that 689 while the ENTIRE post-FX stack was
  *  worth 104 — hence a light-count cap being the highest-value low-tier knob there is.
- *  Detail: docs/plans/low-end-device-support.md §4.
+ *  Detail: docs/rendering.md § "Quality tiers" → "The automatic light cap".
  *
  *  MECHANISM: three's `NodeMaterial.lightsNode` overrides the scene's global light list for one
  *  material, in a SINGLE pass (`NodeMaterial.js` — `this.lightsNode || builder.lightsNode`). It

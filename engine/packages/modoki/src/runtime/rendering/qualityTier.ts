@@ -247,6 +247,29 @@ export interface TierRenderOverrides {
    *  after that slot exists cannot walk it back. A demotion applies the DPR cap (which is
    *  re-measured through the resize bus) and AA catches up on the next slot creation. */
   pixiAntialias: boolean;
+
+  // ── Texture LOD by quality tier (#212) ───────────────────────────────────────────────────
+  /** Longest-edge cap for a TEXTURE on this tier, in pixels. **0 = no cap** (ship the source
+   *  size, same sentinel as everywhere else in this table). Textures are 67% of a shipped
+   *  build (measured on `demos/postfx-demo`: 21.8 MB of KTX2 in a 32.4 MB dist) and variant
+   *  resolution was format-aware but SIZE-blind — a `low` phone downloaded the identical
+   *  full-resolution KTX2 a flagship did. This is the orthogonal axis: it never touches
+   *  format/codec selection (`selectVariant`), only how large the shipped pixels are.
+   *
+   *  ⚠️ Typed as a bare `number`, not `TextureMaxSize` (`runtime/loaders/textureSettings.ts`) —
+   *  that type lives in L3 and this module is L2, so importing it would be an illegal UPWARD
+   *  edge (`docs/architecture-layers.md`). The build emitter validates the value where it is
+   *  actually consumed instead.
+   *
+   *  Applied at TWO removes from here, deliberately: the build (`vite-asset-scanner.ts`) reads
+   *  a project's authored `tiers.{mid,low}.textureMaxSize` to decide which EXTRA derived
+   *  variants to emit (`sizesToEmit` in `textureSettings.ts`), and the runtime
+   *  (`resolveTextureVariantUrl`) reads the ACTIVE tier's cap via `runtime/core/textureSizeCap.ts`
+   *  (an L0 seam — see its header for why this module may not be imported directly from
+   *  `runtime/loaders`) to pick a capped URL only when the manifest says that size was actually
+   *  emitted. No tier resolved, or the manifest doesn't list the cap ⇒ today's URL, unchanged —
+   *  the resolver must never GUESS a URL that was not built, which is a 404. */
+  textureMaxSize: number;
 }
 
 /** Treat the shared "0 = no cap" sentinel as no ceiling, so two caps can be compared with
@@ -293,6 +316,13 @@ export const TIER_SETTINGS: Record<QualityTier, TierRenderOverrides> = {
     // ~4x cost for 2x DPR is a fill-rate fact about a tile-based mobile GPU, so it applies to a
     // Pixi canvas identically. Say so rather than implying the 2D layer was measured separately.
     pixiPixelRatioCap: 1, pixiAntialias: false,
+    // #212. A representative texture (`gothic_statue_diff`, 1024² source, `maxSize: 2048`) ships
+    // as a 2.1 MB UASTC KTX2 at full size and ~528 KB at 512 — the same shrink direction as every
+    // other `low` knob in this row, applied to the axis none of them touch (download size, not
+    // GPU cost). No standalone device measurement yet (unlike `pixelRatioCap`'s Y6 numbers
+    // above); 512 is the smallest `TextureMaxSize` step below `mid`'s 1024, chosen as the most
+    // conservative useful cap rather than invented mid-scale.
+    textureMaxSize: 512,
   },
   /** #188. Every field here is either MEASURED on a mid-band device or deliberately left at
    *  `low`'s value; none of them is a number invented to fill the row.
@@ -371,6 +401,11 @@ export const TIER_SETTINGS: Record<QualityTier, TierRenderOverrides> = {
     // #204 is still open on what it should be for Android. Raising this one by analogy is the
     // guess that measurement replaced — it stays at 1 until a Pixi ramp says otherwise. AA the same.
     pixiPixelRatioCap: 1, pixiAntialias: false,
+    // #212. One step above `low`'s 512 — a mid device was measured affording IBL/shadows/1.5x
+    // DPR, so shipping it the same texture download as `low` would be leaving a saving on the
+    // table that the rest of this row already says it can spend. 1024 halves the pixel count
+    // against an unauthored (`maxSize: 2048`) texture with no per-texture tuning needed.
+    textureMaxSize: 1024,
   },
   high: {
     pixelRatioCap: 2, antialias: true, shadows: true, shadowMapCeiling: 0, postFX: ALL_POSTFX,
@@ -380,6 +415,10 @@ export const TIER_SETTINGS: Record<QualityTier, TierRenderOverrides> = {
     // `UNCLAMPED_OVERRIDES`, and the difference is live (see its header). This row survives only
     // as documentation of the old table; `seedTier` offers `mid`/`low` alone.
     targetFps: 0, pixiPixelRatioCap: 2, pixiAntialias: true,
+    // 0 = no cap — capable hardware ships whatever the texture authors (mirrors every other
+    // field in this row being a documented no-op; `UNCLAMPED_OVERRIDES` is what `high` actually
+    // resolves to, see the warning above).
+    textureMaxSize: 0,
   },
 };
 
@@ -408,6 +447,9 @@ export const UNCLAMPED_OVERRIDES: TierRenderOverrides = {
   // would be a value no project config can hold, and this object doubles as the fill-in for a
   // config authored before a field existed (see {@link resolveTierOverrides}).
   targetFps: 0, pixiPixelRatioCap: 0, pixiAntialias: true,
+  // `0` is already the "no cap" sentinel (unlike `pixelRatioCap`, there is no numeric-ceiling
+  // form to reconcile) — a texture ships at whatever it authored, unclamped.
+  textureMaxSize: 0,
 };
 
 /** What a project authors, if anything. Both keys ABSENT rather than null when unauthored —
@@ -1268,7 +1310,7 @@ export function tierShadowMapSize(authored: number, o: TierRenderOverrides): num
 }
 
 /** Bias multiplier for a shadow map that a tier clamped smaller than authored. See
- *  docs/plans/low-end-device-support.md §0b "Shadows on `low` would render ACNE":
+ *  docs/rendering.md § "Quality tiers" — "Shadows on `low` would render ACNE" without this:
  *  `tierShadowMapSize` shrinks `Light.shadowMapSize` to fit a tier's ceiling but leaves
  *  `shadowBias`/`shadowNormalBias` untouched, and bias is TEXEL-FOOTPRINT-relative (a fixed
  *  bias is calibrated against `(2 * cameraSize) / mapSize`, the world-space size of one

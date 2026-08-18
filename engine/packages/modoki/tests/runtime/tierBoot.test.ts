@@ -11,7 +11,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
-  resolveTierForNo3DProject, startTierCalibrationForNo3DProject,
+  resolveTierForNo3DProject, resolveTierBeforeSceneLoad, startTierCalibrationForNo3DProject,
   stopTierCalibrationForNo3DProject,
 } from '../../src/runtime/rendering/tierBoot';
 import {
@@ -162,5 +162,31 @@ describe('live calibration on a project with no Scene3D', () => {
     // Unregistering something already gone is a no-op, not an error: the teardown runs on paths
     // where the loop was never started.
     expect(() => stopTierCalibrationForNo3DProject()).not.toThrow();
+  });
+});
+
+describe('resolveTierBeforeSceneLoad (#212 — the ORDERING fix)', () => {
+  it('⭐ resolves a tier for a 3D project, before any renderer exists', async () => {
+    // The defect it fixes is invisible in this test's own assertion and worth naming: a 3D project
+    // used to resolve ONLY inside `makeWebGPURenderer`, so a tier knob read by the ASSET path
+    // (`textureMaxSize`, #212) arrived after the scene's textures had already picked their URLs.
+    // Measured on a Galaxy A23 pinned `low`: 0 of 21 textures fetched the capped variant.
+    await resolveTierBeforeSceneLoad();
+    expect(getActiveQualityTier()).not.toBeNull();
+  });
+
+  it('does NOT start the calibration loop — Scene3D owns that on a 3D project', async () => {
+    // Starting it here would double-drive `tickTierCalibration` once Scene3D registers its own.
+    const tick = vi.spyOn(calibration, 'tickTierCalibration');
+    await resolveTierBeforeSceneLoad();
+    stepOneFrame();
+    expect(tick).not.toHaveBeenCalled();
+  });
+
+  it('is idempotent with the renderer-side resolve — whichever runs first wins', async () => {
+    await resolveTierBeforeSceneLoad();
+    const first = getActiveQualityTier();
+    await resolveTierBeforeSceneLoad();
+    expect(getActiveQualityTier()).toBe(first);
   });
 });

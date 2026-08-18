@@ -85,9 +85,21 @@ const BANNED: { re: RegExp; why: string }[] = [
 ];
 
 /** Fenced code blocks only. Prose explaining WHY `java_home` is wrong must stay legal — this guard
- *  exists to stop the instruction, not the explanation. */
+ *  exists to stop the instruction, not the explanation.
+ *
+ *  Pairs EVERY fence (any language tag, or none), then keeps only the shell-like ones. The
+ *  earlier version's regex required the language tag itself to be `bash|sh|shell|console`, so a
+ *  single ` ```ts ` or ` ```js ` fence anywhere in the file failed to match as an opener and
+ *  desynced every fence pairing AFTER it — the next *closing* triple-backtick was read as the next
+ *  *opening* one, silently merging long, unrelated stretches of prose into one bogus "code block".
+ *  That stayed invisible for a long time because no BANNED text happened to fall inside the
+ *  resulting mismatched span; it surfaced only once ordinary prose containing `JAVA_HOME=/opt/
+ *  homebrew...` (as an inline code span, not a shell instruction) landed inside one. */
 function commandBlocks(md: string): string[] {
-  return [...md.matchAll(/```(?:bash|sh|shell|console)?\n([\s\S]*?)```/g)].map((m) => m[1]);
+  const SHELL_TAGS = new Set(['', 'bash', 'sh', 'shell', 'console']);
+  return [...md.matchAll(/```(\w*)\n([\s\S]*?)```/g)]
+    .filter((m) => SHELL_TAGS.has(m[1]))
+    .map((m) => m[2]);
 }
 
 describe('CLI build recipes resolve the toolchain the way the editor does (#159)', () => {

@@ -242,6 +242,43 @@ Practical tooling notes for tuning ratios/errors:
   instanced than per-instance LOD.
 - **Three levels is enough** for most games — the default `lodCount: 3`.
 
+## ⛔ LOD switch distances are authored for the CONTENT, and the defaults fit nothing (#212)
+
+⚠️ **MEASURED ON HARDWARE 2026-08-14, and it refutes the assumption that LOD chains are the
+triangle lever.** `demos/forest-camp` on a Galaxy A23, live via `device_eval`:
+
+- **80 LOD nodes, every one with 3 levels** — the chains exist and are correctly built
+  (16 of 19 models author `lodCount: 3`, and `lodPaths`/`lod1.glb`/`lod2.glb` are all on disk).
+- **Every one of the 80 renders LOD 0.** Not one has ever switched.
+- The reason is arithmetic: the default `lodDistances` are **`[0, 80, 250]`**, and the scene's
+  farthest object sits **21.3 world units** from the camera (min 4.9, median 10.7). LOD 1 is out
+  of reach by ~4x, LOD 2 by ~12x.
+
+⭐ **So a chain can be complete, shipped, and dead — and nothing says so.** `lodCount: 3` in the
+importer, three GLBs on disk and three levels in the scene graph all report success; only the
+runtime level selection reveals that the chain never fires. Check the SELECTION, not the chain.
+
+⛔ **And fixing the distances would not have bought frame rate — do not spend a session on it for
+performance reasons.** Forcing all 80 nodes to LOD 1 live (same scene, same frame, tier `mid`,
+uncapped at `targetFps: 60`):
+
+| | LOD 0 | LOD 1 forced |
+|---|---|---|
+| visible triangles | 81,974 | **50,488** (−38%) |
+| frame | 17.5 ms | 17.8 ms |
+| `cpuMs` | 15.7 | 15.2 |
+| `restMs` (GPU) | 2.6 | 2.4 |
+
+**A 38% triangle cut moved the frame by 0.3 ms, into the noise.** The frame is **CPU-bound** —
+15.7 ms of CPU against 2.6 ms of GPU — so triangles were never the constraint on this project and
+this device. Same shape as the draw-call batching refutation (197 calls removed, frame unchanged):
+the mechanism works and the bottleneck is elsewhere.
+
+⚠️ Read that as a fact about *this project on this device*, not a general law. Distances still want
+authoring for a project whose camera genuinely pulls back (a strategy or fly-over view), where the
+same chain would fire constantly — the point is that "fix the LOD distances" is a **correctness /
+content** job, not a performance one, until a profile shows a GPU-bound vertex cost.
+
 ## Known limits (v1)
 
 - **Multiple Nodes sharing the SAME Mesh primitive with divergent fixups** →

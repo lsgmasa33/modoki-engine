@@ -12,7 +12,7 @@
  *  while `3d-test` runs the GPU at 84% and the CPU rule sees nothing wrong. Feeding real GPU
  *  time in does not fix it — timestamp queries report `unsupported` on WebGL2 without
  *  `EXT_disjoint_timer_query_webgl2`, i.e. on most low-end Android, which is the population the
- *  tier system exists for. See docs/plans/low-end-device-support.md § "the boot ramp probe".
+ *  tier system exists for. See docs/rendering.md § "Quality tiers" → "The boot ramp probe".
  *
  *  ── WHAT MAKES A PROBE ABLE TO ANSWER WHERE LIVE STATS CANNOT ─────────────────────────────
  *  `frameMs` is PINNED at the display interval whenever the renderer finishes early, so it
@@ -77,7 +77,7 @@
  *  than two, and the point of running all four at once is to find out which of them discriminate
  *  — on one build, in one campaign, because two overlapping campaigns on the same phones already
  *  voided a session's worth of counts. The ones that do not discriminate come OUT again; see
- *  docs/plans/low-end-device-support.md. Do not read the presence of a ramp here as a claim that
+ *  docs/rendering.md § "Quality tiers". Do not read the presence of a ramp here as a claim that
  *  it is load-bearing. */
 // ⛔ **`draw` REMOVED 2026-08-13 by owner decision (#221 W2 item 4)** — the per-object-submit
 // ramp. It had not been measured by EITHER probe shape since 2026-08-11: `gpuKinds` in
