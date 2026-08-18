@@ -46,8 +46,22 @@ export {
   writePrefabFile, resolveExistingPrefabId,
   tagEntityTreeAsInstance, untagEntityTreeAsInstance,
   detachPrefabInstance, reattachPrefabInstance,
+  captureInstanceStructure, resolveInstanceContext,
   type PrefabFile, type RevertResult,
 } from './scene/prefab';
+// Shared override-key enumeration for the Apply-to-Prefab / Revert-Overrides surfaces —
+// the dialog (ApplyPrefabDialog.tsx) and the `modoki_prefab {prefabAction:'overrides'}`
+// agent op both build their checkbox/discovery list from this ONE walk, so they cannot
+// silently drift from each other (see prefabOverrideKeys.ts's header comment).
+export {
+  fieldKey, addedKey, removedEntityKey, removedTraitKey,
+  collectInstanceOverrideFields, collectInstanceOverrideKeys,
+  type FieldNode, type TraitNode, type EntityOverrideNode, type InstanceOverrideKeys,
+} from './scene/prefabOverrideKeys';
+// `applyToPrefabWithUndo` is the ONLY way to apply overrides that also records undo —
+// `applyToPrefabSelective` above is the raw mutation the dialog/agent-op undo wrapper
+// calls into, kept exported too for callers that manage their own undo entry.
+export { applyToPrefabWithUndo } from './undo/applyPrefabUndo';
 export {
   saveScene, saveAll, serializeScene, loadScene, newScene,
   getCurrentScenePath, setCurrentScenePath, isTraitDefault, type SceneFile,

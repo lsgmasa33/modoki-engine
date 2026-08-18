@@ -10,8 +10,6 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import {
   getPrefabSource,
-  getOverrideValues,
-  collectComparableTraits,
   captureInstanceStructure,
   revertOverridesSelective,
   rebuildInstance,
@@ -20,29 +18,18 @@ import {
 import { pushAction } from '../undo/undoManager';
 import { entityRef } from '../undo/entityRef';
 import { applyToPrefabWithUndo } from '../undo/applyPrefabUndo';
-import { getTraitByName, getAllTraits } from '../../runtime/core/ecs/traitRegistry';
-import { readTraitData } from '../../runtime/core/ecs/entityUtils';
+import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import type { AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { buildOverrideForest, type ForestNode } from './prefabOverrideForest';
+import {
+  collectInstanceOverrideFields, addedKey, removedEntityKey, removedTraitKey,
+  type EntityOverrideNode,
+} from '../scene/prefabOverrideKeys';
 
-interface FieldNode {
-  field: string;
-  current: unknown;
-  base: unknown;
-  key: string; // "localId.traitName.fieldName"
-}
-interface TraitNode {
-  trait: string;
-  fields: FieldNode[];
-}
-interface EntityNode {
-  ecsId: number;
-  parentEcsId: number; // live EntityAttributes.parentId — used to nest the dialog tree
-  localId: number;
-  name: string;
-  traits: TraitNode[];
-}
+// The dialog's tree node is the shared shape exactly — aliased locally so the rest
+// of this file (predating the extraction) doesn't need a wholesale rename.
+type EntityNode = EntityOverrideNode;
 
 /** Structural diff nodes, alongside the per-field EntityNode list. */
 interface RemovedEntityNode { localId: number; name: string; key: string }   // "-removed.<localId>"
@@ -67,66 +54,6 @@ function stringifyValue(v: unknown): string {
   return JSON.stringify(v);
 }
 
-function buildTree(rootInstanceId: number, prefab: PrefabFile): EntityNode[] {
-  const PrefabInstanceMeta = getTraitByName('PrefabInstance');
-  if (!PrefabInstanceMeta) return [];
-  const allTraits = getAllTraits();
-  const entityNameMeta = getTraitByName('EntityAttributes');
-
-  const entries: EntityNode[] = [];
-  getCurrentWorld().query(PrefabInstanceMeta.trait).updateEach(([pi], entity) => {
-    const piData = pi as Record<string, unknown>;
-    if (piData.rootInstanceId !== rootInstanceId) return;
-    const localId = piData.localId as number;
-    if (!localId) return;
-    const ecsId = entity.id();
-
-    // Snapshot live trait data for comparison — through the SHARED builder the serializer
-    // uses. This built its own bag from `readTraitData` (the curated meta.fields subset), so
-    // an override on any field a custom Inspector section owns (Animator.clips) or any AoS
-    // field (SkinnedMeshRenderer.materials, AnimationLibrary.animSets) was absent from the
-    // comparison: the dialog reported it as un-overridden and the user could not apply it,
-    // while the scene serializer stored it correctly. QA-CTX-0003 close-out sweep.
-    const currentTraits = collectComparableTraits(ecsId, allTraits);
-    const diffs = getOverrideValues(localId, currentTraits, prefab);
-    if (Object.keys(diffs).length === 0) return;
-
-    // Entity display name: prefer live EntityAttributes.name; fall back to prefab name.
-    // Also capture the live parentId so the dialog can nest children under parents.
-    let name = '';
-    let parentEcsId = 0;
-    if (entityNameMeta) {
-      const ea = readTraitData(ecsId, entityNameMeta);
-      if (ea?.name) name = ea.name as string;
-      if (typeof ea?.parentId === 'number') parentEcsId = ea.parentId as number;
-    }
-    if (!name) {
-      const prefabEntity = prefab.entities.find((e) => e.localId === localId);
-      name = (prefabEntity?.name as string) || `localId ${localId}`;
-    }
-
-    const prefabEntity = prefab.entities.find((e) => e.localId === localId);
-    const traitNodes: TraitNode[] = [];
-    for (const [traitName, fields] of Object.entries(diffs)) {
-      const fieldNodes: FieldNode[] = [];
-      const base = (prefabEntity?.traits[traitName] as Record<string, unknown>) || {};
-      for (const [field, current] of Object.entries(fields)) {
-        fieldNodes.push({
-          field,
-          current,
-          base: base[field],
-          key: `${localId}.${traitName}.${field}`,
-        });
-      }
-      if (fieldNodes.length > 0) traitNodes.push({ trait: traitName, fields: fieldNodes });
-    }
-    if (traitNodes.length > 0) entries.push({ ecsId, parentEcsId, localId, name, traits: traitNodes });
-  });
-
-  entries.sort((a, b) => a.localId - b.localId);
-  return entries;
-}
-
 /** Build the structural diff (added subtrees, removed entities, removed traits)
  *  for the dialog from the live instance + prefab. */
 function buildStructural(rootInstanceId: number, prefab: PrefabFile): Structural {
@@ -135,14 +62,14 @@ function buildStructural(rootInstanceId: number, prefab: PrefabFile): Structural
     prefab.entities.find((e) => e.localId === localId)?.name || `localId ${localId}`;
 
   const removedEntities: RemovedEntityNode[] = s.removed.map((localId) => ({
-    localId, name: prefabName(localId), key: `-removed.${localId}`,
+    localId, name: prefabName(localId), key: removedEntityKey(localId),
   }));
 
   const removedTraits: RemovedTraitNode[] = [];
   for (const [localIdStr, names] of Object.entries(s.removedTraits)) {
     const localId = Number(localIdStr);
     for (const trait of names) {
-      removedTraits.push({ localId, entityName: prefabName(localId), trait, key: `-trait.${localId}.${trait}` });
+      removedTraits.push({ localId, entityName: prefabName(localId), trait, key: removedTraitKey(localId, trait) });
     }
   }
   return { added: s.added, removedEntities, removedTraits };
@@ -245,12 +172,12 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
         if (!cancelled) setLoadState({ kind: 'error', message: `Could not load prefab ${source}` });
         return;
       }
-      const entities = buildTree(rootInstanceId, prefab);
+      const entities = collectInstanceOverrideFields(rootInstanceId, prefab);
       const structural = buildStructural(rootInstanceId, prefab);
       if (cancelled) return;
       const allKeys = new Set<string>();
       for (const e of entities) for (const t of e.traits) for (const f of t.fields) allKeys.add(f.key);
-      for (const node of structural.added) allKeys.add(`+added.${node.guid}`);
+      for (const node of structural.added) allKeys.add(addedKey(node.guid));
       for (const r of structural.removedEntities) allKeys.add(r.key);
       for (const r of structural.removedTraits) allKeys.add(r.key);
       setChecked(allKeys);
@@ -266,7 +193,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
     let checkedCount = 0;
     const tally = (key: string) => { total++; if (checked.has(key)) checkedCount++; };
     for (const e of loadState.entities) for (const t of e.traits) for (const f of t.fields) tally(f.key);
-    for (const node of loadState.structural.added) tally(`+added.${node.guid}`);
+    for (const node of loadState.structural.added) tally(addedKey(node.guid));
     for (const r of loadState.structural.removedEntities) tally(r.key);
     for (const r of loadState.structural.removedTraits) tally(r.key);
     return { total, checked: checkedCount };
@@ -457,7 +384,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
             && buildOverrideForest(loadState.entities).map((fnode) => renderEntityNode(fnode))}
 
           {loadState.kind === 'ready' && loadState.structural.added.map((node) => {
-            const key = `+added.${node.guid}`;
+            const key = addedKey(node.guid);
             return (
               <div key={key} style={{ marginBottom: 4 }}>
                 <div style={{ ...baseRow, paddingLeft: 4 }}>

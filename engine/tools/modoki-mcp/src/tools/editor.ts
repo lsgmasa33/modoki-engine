@@ -346,9 +346,22 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Prefab actions: instantiate a .prefab.json into the scene (path + optional parent), ' +
       'create a prefab FROM an entity (entity + destination path), or detach an instance (entity, ' +
       '"unpack completely"). detach FAILS if the entity is not a prefab instance (nothing to unpack). ' +
-      'Persistence: instantiate/detach are LIVE-world only. create writes the .prefab.json to disk ' +
-      'AND tags the source entities as a PrefabInstance in the LIVE world (unsaved) — run ' +
-      'modoki_save_all to persist that linkage into the scene, or a reload discards it. ' +
+      'overrides/apply/revert are the agent path onto the human "Apply to Prefab" / "Revert ' +
+      'Overrides" dialogs: overrides is a READ-only discovery call — pass an instance entity, get ' +
+      'back every current override as exact key strings (plus per-field current/base values) — ' +
+      'apply/revert then take an optional `keys` subset of those SAME strings (omit `keys` to act ' +
+      'on ALL current overrides). apply WRITES the selected overrides into the .prefab.json (every ' +
+      'other instance now inherits them); revert resets the selected overrides on THIS instance ' +
+      'only, back to the prefab base — the file is untouched. Both FAIL loudly (never a silent ' +
+      'ok:true) if the entity is not an instance, if ANY of the given `keys` matches no real ' +
+      'override, or if the instance has no overrides at all. NOT every override is applyable: a ' +
+      'scene-only or runtime-only field (EntityAttributes.editorFolder, read-backs) can be ' +
+      'REVERTED but cannot be written into a template — naming one in `keys` refuses, and an ' +
+      'omitted-keys apply reports it under `skippedKeys` rather than counting it as applied. ' +
+      'Persistence: instantiate/detach/overrides/revert are LIVE-world only. create and apply ' +
+      'WRITE the .prefab.json to disk. create ALSO tags the source entities as a PrefabInstance ' +
+      'in the LIVE world (unsaved) — run modoki_save_all to persist that linkage into the scene, ' +
+      'or a reload discards it. ' +
       'Address the entity/parent by guid (PREFER — stable) or id. ' +
       'PREFAB-EDIT MODE (edit-open / edit-save / edit-exit) is how you edit the TEMPLATE itself: ' +
       'edit-open swaps the world for a synthetic scene holding the prefab in isolation (so it ' +
@@ -357,14 +370,15 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'and edit-exit reloads the scene you came from so its instances re-expand from the new file. ' +
       'While in that mode modoki_save_all REFUSES — edit-save is the save.',
     {
-      action: z.enum(['instantiate', 'create', 'detach', 'edit-open', 'edit-save', 'edit-exit'])
-        .describe("instantiate: spawn a prefab into the scene. create: turn an existing entity INTO a prefab asset. detach: break an instance's link to its prefab. edit-open/edit-save/edit-exit: enter, write, and leave prefab-edit mode on the template itself. Sent on the wire as `prefabAction` — the relay strips a param named `action`."),
+      action: z.enum(['instantiate', 'create', 'detach', 'overrides', 'apply', 'revert', 'edit-open', 'edit-save', 'edit-exit'])
+        .describe("instantiate: spawn a prefab into the scene. create: turn an existing entity INTO a prefab asset. detach: break an instance's link to its prefab. overrides: list an instance's current overrides as key strings (read-only — the discovery step for apply/revert). apply: write selected overrides into the .prefab.json. revert: reset selected overrides on this instance back to the prefab base. edit-open/edit-save/edit-exit: enter, write, and leave prefab-edit mode on the template itself. Sent on the wire as `prefabAction` — the relay strips a param named `action`."),
       path: z.string().optional().describe('instantiate / edit-open: prefab asset path. create: destination .prefab.json path.'),
       force: z.boolean().optional().describe('edit-open: discard unsaved live work instead of refusing (edit-open swaps the world, like load_scene).'),
       parentId: z.number().optional().describe('instantiate: parent entity id (default root). Prefer parentGuid.'),
       parentGuid: z.string().optional().describe('instantiate: parent entity guid (preferred; wins over parentId).'),
-      entityId: z.number().optional().describe('create/detach: the entity id. Prefer entityGuid.'),
-      entityGuid: z.string().optional().describe('create/detach: the entity guid (preferred; wins over entityId).'),
+      entityId: z.number().optional().describe('create/detach/overrides/apply/revert: the entity id. Prefer entityGuid.'),
+      entityGuid: z.string().optional().describe('create/detach/overrides/apply/revert: the entity guid (preferred; wins over entityId).'),
+      keys: z.array(z.string()).optional().describe("apply/revert: the override keys to act on — exact strings from a prior `overrides` call's `keys.all`. ALL-or-nothing: one unrecognized key refuses the whole call rather than quietly acting on the rest. OMIT to act on ALL current overrides; an explicit empty array is REFUSED, because a filter that matched nothing means 'act on nothing' and must not fall through to 'act on everything'."),
       save: SAVE_PARAM,
     },
     // `prefabAction`, NOT `action`: /api/editor-action spends `action` on the op name and strips it

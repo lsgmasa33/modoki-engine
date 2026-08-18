@@ -89,3 +89,19 @@ describe('BufferedNumberInput — min/max cap on commit', () => {
     expect(onChange).toHaveBeenLastCalledWith(0.6);
   });
 });
+
+describe('BufferedNumberInput — dataUiId reaches the DOM', () => {
+  // Bug y9WMNPkT0DivkxZKJDWU: a QA case aimed a CSS selector at the input's stale
+  // `value` attribute, which stops matching the moment the value changes. The fix is a
+  // stable `data-ui-id`; this confirms the prop actually lands on the rendered <input>
+  // rather than only existing in the type signature.
+  it('renders the id as data-ui-id when passed, and omits the attribute when not', () => {
+    const { container: withId } = render(
+      <BufferedNumberInput value={18.4} onChange={vi.fn()} dataUiId="inspector.field.Transform.x" />,
+    );
+    expect(withId.querySelector('input')!.getAttribute('data-ui-id')).toBe('inspector.field.Transform.x');
+
+    const { container: withoutId } = render(<BufferedNumberInput value={18.4} onChange={vi.fn()} />);
+    expect(withoutId.querySelector('input')!.hasAttribute('data-ui-id')).toBe(false);
+  });
+});

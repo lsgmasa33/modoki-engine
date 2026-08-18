@@ -216,6 +216,12 @@ The handle shape carries three fields that make chrome addressing robust:
 - **`rect`** (not just the center point) → overlap between handles is computable.
 - **`meta.disabled`** → a greyed-out Paste is reported as data, not left for the agent to infer
   from a pixel shade.
+- **`meta.state`** (from an optional `data-ui-state` on the element) → the same argument for a
+  control that has a CURRENT VALUE rather than just a pressed/not-pressed. A segmented
+  Auto | On | Off row renders its active segment as a background colour, which is unreadable in a
+  downscaled capture; `state:'selected'` on the active segment makes "what is physics3d set to?"
+  a read instead of a guess. Set it only where there is a state worth reading back — it is not
+  decoration for a plain button.
 - **`occludedBy`**, computed via `document.elementFromPoint(cx, cy)`: when the topmost element at
   the handle's center isn't the handle or a descendant, the report names what covers it. This
   finds the "`⋮`-covered-by-its-own-open-menu" bug in a single query.

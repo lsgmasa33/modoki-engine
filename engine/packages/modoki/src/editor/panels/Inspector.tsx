@@ -239,13 +239,14 @@ function AnchorPickerField({ value, onChange, mixed = false }: { value: string; 
 // colorToHex + ColorField moved to ./assetViews/widgets (F2); imported above.
 // colorToHex is re-exported (near defaultForHint) for back-compat (tests import it).
 
-function VecField({ label, fields, data, onChange, overriddenKeys, mixedKeys }: {
+function VecField({ label, fields, data, onChange, overriddenKeys, mixedKeys, traitName }: {
   label: string;
   fields: { key: string; hint: FieldHint }[];
   data: Record<string, unknown>;
   onChange: (key: string, v: number) => void;
   overriddenKeys?: Set<string>;
   mixedKeys?: Set<string>;
+  traitName: string;
 }) {
   // Derive short labels: strip common prefix, use last distinct part
   // e.g. [lookAtX, lookAtY, lookAtZ] → [X, Y, Z], [near, far] → [Near, Far].
@@ -282,6 +283,7 @@ function VecField({ label, fields, data, onChange, overriddenKeys, mixedKeys }: 
               <BufferedNumberInput value={parseFloat(displayVal.toFixed(2))} step={f.hint.step || 0.1} mixed={isMixed} readOnly={f.hint.readOnly}
                 onChange={(v) => onChange(f.key, isDeg ? v * (Math.PI / 180) : v)}
                 min={isDeg ? undefined : f.hint.min} max={isDeg ? undefined : f.hint.max}
+                dataUiId={`inspector.field.${traitName}.${f.key}`}
                 style={{ ...inputStyle, flex: 1, minWidth: 0, color: isOv ? '#5dade2' : '#ddd', fontWeight: isOv ? 'bold' : 'normal', ...(f.hint.readOnly ? readOnlyFieldStyle : null) }} />
             </div>
           );
@@ -950,6 +952,7 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
           <FieldLabel label={key} hint={labelHint} style={{ width: 50, color: ov ? '#5dade2' : '#888', fontSize: '11px', fontWeight: ov ? 'bold' : 'normal' }} />
           <BufferedNumberInput value={val as number} step={hint.step ?? 1} mixed={mx} min={hint.min} max={hint.max}
             onChange={v => write(key, v)} readOnly={stretchDisabled}
+            dataUiId={`inspector.field.${meta.name}.${key}`}
             style={{ flex: 1, background: '#111', color: '#ddd', border: '1px solid #444', borderRadius: 3, padding: '2px 4px', fontSize: '12px', fontFamily: 'monospace' }} />
           <select value={isMixed(unitKey) ? '' : unit} onChange={e => { if (e.target.value !== '') write(unitKey, e.target.value); }} disabled={stretchDisabled}
             style={{ background: '#111', color: '#ddd', border: '1px solid #444', borderRadius: 3, padding: '2px 2px', fontSize: '11px', fontFamily: 'monospace', cursor: 'pointer' }}>
@@ -967,7 +970,8 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
     if (hint.type === 'number') {
       const disabledByAnchor = selfPlacementDisabled(key);
       return <div key={key} style={{ ...(ov ? overrideStyle : {}), ...(disabledByAnchor ? { opacity: 0.35 } : {}) }}><NumberField label={key} value={val as number} step={hint.step}
-        readOnly={hint.readOnly || disabledByAnchor} wide onChange={(v) => write(key, v)} overrideColor={ov} hint={hint} mixed={mx} /></div>;
+        readOnly={hint.readOnly || disabledByAnchor} wide onChange={(v) => write(key, v)} overrideColor={ov} hint={hint} mixed={mx}
+        dataUiId={`inspector.field.${meta.name}.${key}`} /></div>;
     }
     if (hint.type === 'string') {
       if (meta.name === 'PrefabInstance' && key === 'source' && val) {
@@ -1068,7 +1072,7 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
     const mxKeys = new Set(groupFields.filter((f) => isMixed(f.key)).map((f) => f.key));
     return (
       <div key={`group:${name}`} style={ovKeys.size > 0 ? overrideStyle : undefined}>
-        <VecField label={name} fields={groupFields} data={data} onChange={(key, v) => write(key, v)} overriddenKeys={ovKeys} mixedKeys={mxKeys} />
+        <VecField label={name} fields={groupFields} data={data} onChange={(key, v) => write(key, v)} overriddenKeys={ovKeys} mixedKeys={mxKeys} traitName={meta.name} />
       </div>
     );
   };

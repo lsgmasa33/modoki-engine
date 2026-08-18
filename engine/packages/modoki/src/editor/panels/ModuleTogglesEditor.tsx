@@ -20,10 +20,14 @@ const MODULES: { key: string; label: string; hint: string }[] = [
   { key: 'gpuParticles', label: 'GPU particles', hint: 'compute backend — needs 3D + WebGPU' },
 ];
 
-const OPTIONS: { value: Toggle; label: string }[] = [
-  { value: 'auto', label: 'Auto' },
-  { value: true, label: 'On' },
-  { value: false, label: 'Off' },
+/** `slug` is the STABLE half of each option's `data-ui-id` — deliberately not derived from
+ *  `label` or from the array index. An index (`buttons[2]` for Off) is what an agent was
+ *  forced onto while every button in a row shared one `title={m.key}`, and it breaks silently
+ *  the moment this array is reordered: the call still succeeds, on the wrong option. */
+const OPTIONS: { value: Toggle; label: string; slug: string }[] = [
+  { value: 'auto', label: 'Auto', slug: 'auto' },
+  { value: true, label: 'On', slug: 'on' },
+  { value: false, label: 'Off', slug: 'off' },
 ];
 
 const row: React.CSSProperties = {
@@ -65,14 +69,23 @@ export default function ModuleTogglesEditor({ value, onChange }: {
       {MODULES.map((m) => {
         const cur = normalize(modules[m.key]);
         return (
-          <div key={m.key} style={row}>
+          <div key={m.key} style={row}
+            data-ui-id={`module-toggles.row.${m.key}`} data-ui-kind="row" data-ui-label={m.label}>
             <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {m.label}
               <span style={{ color: '#666', marginLeft: 6 }}>{m.hint}</span>
             </span>
             {OPTIONS.map((o) => (
-              <button key={String(o.value)} style={cur === o.value ? segOn : seg}
-                title={m.key} onClick={() => set(m.key, o.value)}>
+              // One id per (module, option) — the row's three buttons used to be
+              // indistinguishable (all three carried `title={m.key}`), so nothing but a DOM
+              // index could aim at "Off for physics3d". `data-ui-state` reports the CURRENT
+              // selection on the button itself, so an agent can read back what it just set
+              // without inferring it from the segment's background colour.
+              <button key={o.slug} style={cur === o.value ? segOn : seg}
+                data-ui-id={`module-toggles.${m.key}.${o.slug}`} data-ui-kind="button"
+                data-ui-label={`${m.label} ${o.label}`}
+                data-ui-state={cur === o.value ? 'selected' : undefined}
+                title={`${m.key}: ${o.label}`} onClick={() => set(m.key, o.value)}>
                 {o.label}
               </button>
             ))}

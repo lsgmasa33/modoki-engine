@@ -78,9 +78,29 @@ const REQUIRED: Array<{ file: string; ids: string[]; why: string }> = [
     why: 'driving the Console filter, which get_console_logs can read but not operate.',
   },
   {
+    file: 'panels/ModuleTogglesEditor.tsx',
+    ids: ['`module-toggles.row.${m.key}`', '`module-toggles.${m.key}.${o.slug}`'],
+    why: 'the Project Settings → Engine Modules tri-state rows. All three segments of a row '
+      + 'once shared one `title={m.key}`, so the only way to aim at "Off" was a DOM index — '
+      + 'which reorders silently. The `o.slug` half is what keeps the id stable under a reorder.',
+  },
+  {
     file: 'panels/ApplyPrefabDialog.tsx',
     ids: ['prefab.dialog.confirm', 'prefab.dialog.cancel'],
     why: 'the modal EXIT. Inspector tags open this dialog; without these an agent enters a modal it cannot leave.',
+  },
+  {
+    // Two Inspector call sites construct the same-shaped id independently: the generic
+    // `hint.type:'number'` branch (NumberField) and the bounded UI-anchor size branch
+    // (BufferedNumberInput) both key off `meta.name` (the trait); VecField's per-axis
+    // BufferedNumberInput keys off its own `traitName` prop instead, since VecField has
+    // no `meta` in scope. Without a stable id here a QA case has to aim by the stale
+    // `value` DOM attribute, which stops matching the moment the field changes (bug
+    // y9WMNPkT0DivkxZKJDWU — QA-INSP-0010 aimed a `NumberField` selector at a value that
+    // could never render, because the case assumed the OTHER widget backed the field).
+    file: 'panels/Inspector.tsx',
+    ids: ['`inspector.field.${meta.name}.${key}`', '`inspector.field.${traitName}.${f.key}`'],
+    why: 'per-field ids for every Inspector number input (NumberField and BufferedNumberInput alike), so a case can aim by stable id instead of a value-dependent CSS selector.',
   },
 ];
 

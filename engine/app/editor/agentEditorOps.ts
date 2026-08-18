@@ -37,6 +37,8 @@ import {
   getPrefabSource, instantiatePrefabAsync, setPrefabSource, serializePrefab, writePrefabFile,
   resolveExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance,
   detachPrefabInstance, reattachPrefabInstance,
+  applyToPrefabWithUndo, revertOverridesSelective, rebuildInstance, resolveInstanceContext,
+  collectInstanceOverrideFields, collectInstanceOverrideKeys,
   pushAction, makePrefabInstantiateAction, entityRef,
   getEditorViewportCamera, focusEntityInSceneView,
   upsertKey, findTrack, encodeValue,
@@ -213,7 +215,13 @@ interface CreateEntityParams { spec: CreateEntitySpec; parentId?: number; parent
  *  `.prefab.json` in isolation, saving the edited template back, and returning to the scene
  *  it was opened from. They are the only route that re-serializes a prefab file, which is why
  *  the bulk re-save sweep (#125, engine/scripts/resave-prefabs.sh) is built on them. */
-type PrefabAction = 'instantiate' | 'create' | 'detach' | 'edit-open' | 'edit-save' | 'edit-exit';
+type PrefabAction =
+  | 'instantiate' | 'create' | 'detach'
+  // ── override discovery/apply/revert (#2Tkw8CiWRATmHck2ze7q) — the ONLY route by which
+  // an agent can drive the human "Apply to Prefab" / "Revert Overrides" dialogs, which
+  // previously had no agent path at all despite this contract claiming one existed. ──
+  | 'overrides' | 'apply' | 'revert'
+  | 'edit-open' | 'edit-save' | 'edit-exit';
 
 interface PrefabParams {
   /** Which prefab operation. Callers reaching this op DIRECTLY (`runAgentOp`, `modoki_eval`) may
@@ -234,10 +242,17 @@ interface PrefabParams {
   parentId?: number;
   /** instantiate: parent entity guid (stable; wins over parentId). */
   parentGuid?: string;
-  /** create/detach: the entity to make a prefab from / detach. */
+  /** create/detach/overrides/apply/revert: the entity to make a prefab from / detach /
+   *  inspect-or-mutate overrides on. For overrides/apply/revert this must be a prefab
+   *  INSTANCE ROOT (or any member — resolution walks to the instance the entity belongs to
+   *  the same way the human dialogs do: via the entity's own PrefabInstance trait). */
   entityId?: number;
-  /** create/detach: the entity guid (stable; wins over entityId). */
+  /** create/detach/overrides/apply/revert: the entity guid (stable; wins over entityId). */
   entityGuid?: string;
+  /** apply/revert: the override keys to act on (see `overrides`'s `keys.all` for the exact
+   *  strings — `"localId.trait.field"` / `"+added.<guid>"` / `"-removed.<localId>"` /
+   *  `"-trait.<localId>.<name>"`). Omitted ⇒ ALL current overrides on the instance. */
+  keys?: string[];
 }
 
 /** Raw selection write — no undo entry (the agent shouldn't pollute the human's
@@ -1335,6 +1350,155 @@ export function registerEditorAgentOps(): void {
       });
       return { ok: true, detached: snapshot.length, saved: false };
     }
+    // ── Override discovery/apply/revert (#2Tkw8CiWRATmHck2ze7q) ──
+    // The human "Apply to Prefab" / "Revert Overrides" dialogs (ApplyPrefabDialog.tsx) were
+    // the ONLY caller of applyToPrefabWithUndo/revertOverridesSelective, so an agent had no way
+    // to reach them at all — a checkbox tree isn't something a tool call can click. `overrides`
+    // is the read-only discovery call that stands in for the dialog's tree (built from the SAME
+    // collectInstanceOverrideKeys/collectInstanceOverrideFields walk, so the keys it hands back
+    // are exactly the keys `apply`/`revert` accept); `apply`/`revert` mirror the dialog's confirm
+    // handlers, keys and all.
+    if (which === 'overrides') {
+      if (p.entityId == null && !p.entityGuid) throw new Error('prefab overrides requires { entityId | entityGuid }');
+      const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab overrides');
+      const ctx = resolveInstanceContext(entityId);
+      if (!ctx) {
+        throw new Error(`prefab overrides: entity ${entityId} is not a prefab instance — it carries no PrefabInstance trait, so it has no overrides to discover.`);
+      }
+      const prefab = await getPrefabSource(ctx.source);
+      if (!prefab) throw new Error(`prefab overrides: could not load prefab source "${ctx.source}" for entity ${entityId}.`);
+      const entities = collectInstanceOverrideFields(ctx.rootInstanceId, prefab);
+      const keys = collectInstanceOverrideKeys(ctx.rootInstanceId, prefab);
+      // Flatten the per-entity/trait tree into one list an agent can scan for a key without
+      // guessing the string shape — the whole point of this action existing.
+      const fields = entities.flatMap((e) => e.traits.flatMap((t) => t.fields.map((f) => ({
+        localId: e.localId, entityName: e.name, trait: t.trait, field: f.field,
+        current: f.current, base: f.base, key: f.key,
+      }))));
+      return {
+        ok: true, source: ctx.source, rootInstanceId: ctx.rootInstanceId, guid: ensureGuid(ctx.rootInstanceId),
+        keys, fields,
+        // Say out loud what `keys` deliberately does NOT contain, so the omission is data rather
+        // than a discrepancy the caller only notices by counting. `unaddressableAdded` are added
+        // subtrees whose entity has no guid yet (minted lazily — save the scene and they become
+        // addressable); `applyExcluded` are revertable-but-not-applyable fields.
+        ...(keys.unaddressableAdded > 0
+          ? { note: `${keys.unaddressableAdded} added subtree(s) have no guid yet and are NOT listed in keys.added — save the scene (modoki_save_all) to make them addressable.` }
+          : {}),
+      };
+    }
+    if (which === 'apply' || which === 'revert') {
+      const verb = which; // 'apply' | 'revert'
+      if (p.entityId == null && !p.entityGuid) throw new Error(`prefab ${verb} requires { entityId | entityGuid }`);
+      const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, `prefab ${verb}`);
+      const ctx = resolveInstanceContext(entityId);
+      if (!ctx) {
+        throw new Error(`prefab ${verb}: entity ${entityId} is not a prefab instance — nothing to ${verb}.`);
+      }
+      const prefab = await getPrefabSource(ctx.source);
+      if (!prefab) throw new Error(`prefab ${verb}: could not load prefab source "${ctx.source}" for entity ${entityId}.`);
+      const available = collectInstanceOverrideKeys(ctx.rootInstanceId, prefab);
+      if (available.all.length === 0) {
+        throw new Error(`prefab ${verb}: instance rooted at entity ${ctx.rootInstanceId} has no overrides — nothing to ${verb}.`);
+      }
+      let keySet: Set<string>;
+      // An EXPLICIT empty array is refused, not treated as "omitted". They are opposite
+      // intents and the fallthrough picks the destructive one: a caller that built `keys` by
+      // filtering `overrides.keys.all` and matched nothing means "act on NOTHING", and would
+      // instead have had every override on the instance applied to the shared prefab (or
+      // reverted away). `keys` being absent is the only thing that means "all".
+      if (p.keys && p.keys.length === 0) {
+        throw new Error(
+          `prefab ${verb}: \`keys\` was given as an EMPTY array, which is ambiguous — omit \`keys\` ` +
+          `entirely to ${verb} ALL ${available.all.length} override(s), or pass the ones you mean. ` +
+          'Refusing rather than guessing: an empty selection computed by a filter means "nothing", ' +
+          'while the omitted-keys default means "everything", and acting on the wrong one here is ' +
+          `${verb === 'apply' ? 'a write to the shared prefab every other instance inherits' : 'a teardown of every override on this instance'}.`,
+        );
+      }
+      if (p.keys && p.keys.length > 0) {
+        // EVERY key must match, not merely one of them. A silent no-op is the class of failure
+        // the Percept/Enact contract exists to remove — and the PARTIAL version is the nastier
+        // half: dropping the unmatched keys and applying the rest returns {ok:true} having done
+        // most of what was asked, so the caller has no reason to look. One typo in a list of
+        // five would then leave a field un-applied, and the next reader would conclude the
+        // apply is flaky rather than that they mistyped a key.
+        const unknown = new Set(p.keys.filter((k) => !available.all.includes(k)));
+        if (unknown.size > 0) {
+          const sample = available.all.slice(0, 5).join(', ');
+          throw new Error(
+            `prefab ${verb}: ${unknown.size} of the ${p.keys.length} given key(s) match no override on this ` +
+            `instance — ${[...unknown].slice(0, 5).join(', ')}${unknown.size > 5 ? ', …' : ''}. NOTHING was ` +
+            `${verb === 'apply' ? 'applied' : 'reverted'} (a partial ${verb} would look like a success). Valid ` +
+            `keys (${available.all.length} total) include: ${sample}${available.all.length > 5 ? ', …' : ''}. ` +
+            "Call prefabAction:'overrides' for the exact set.",
+          );
+        }
+        keySet = new Set(p.keys);
+      } else {
+        keySet = new Set(available.all); // omitted ⇒ act on everything
+      }
+
+      if (which === 'apply') {
+        // Some override keys are REVERTABLE but not APPLYABLE: a field kept out of a written
+        // template (a runtime read-back, or the scene-only EntityAttributes.editorFolder)
+        // is `continue`d past by applyToPrefabSelective WITHOUT being counted, so the overall
+        // `applied` flag can be true while a specific requested key was never written.
+        // Echoing the request back as `appliedKeys` would report that key as applied.
+        const excluded = available.applyExcluded.filter((k) => keySet.has(k));
+        if (p.keys && excluded.length > 0) {
+          // Explicitly asked for by name → refuse, rather than do less than was asked.
+          throw new Error(
+            `prefab apply: ${excluded.length} requested key(s) cannot be written into a prefab ` +
+            `template — ${excluded.join(', ')}. These are scene-only or runtime-only fields ` +
+            "(EntityAttributes.editorFolder, runtime read-backs); apply would silently skip them. " +
+            "They ARE revertable — prefabAction:'revert' resets them on this instance. Drop them " +
+            'from `keys` to apply the rest.',
+          );
+        }
+        // applyToPrefabWithUndo pushes its OWN undo entry (before/after prefab + scene
+        // snapshot — see applyPrefabUndo.ts) — do NOT push a second one here.
+        const result = await applyToPrefabWithUndo(ctx.rootInstanceId, keySet);
+        if (!result.applied) {
+          throw new Error(`prefab apply: nothing was written — the apply produced no change for entity ${entityId} (it may have stopped being a prefab instance mid-call).`);
+        }
+        // apply WRITES the .prefab.json — say so honestly, mirroring how `create` reports `saved`.
+        // `appliedKeys` excludes what the template cannot carry; `skippedKeys` names it rather
+        // than leaving the caller to diff a second `overrides` call to notice.
+        const applied = [...keySet].filter((k) => !excluded.includes(k));
+        return {
+          ok: true, source: result.source, appliedKeys: applied,
+          ...(excluded.length > 0 ? { skippedKeys: excluded, skippedReason: 'not representable in a prefab template (scene-only / runtime-only field)' } : {}),
+          promotedAdditions: result.promotedAdditions, saved: true,
+        };
+      }
+
+      // which === 'revert' — mirrors ApplyPrefabDialog.handleRevert EXACTLY: revert itself
+      // pushes NO undo entry (rebuildInstance is a raw teardown+rebuild), so the caller must,
+      // with the same before/after rebuild-from-snapshot undo/redo the dialog wires.
+      const result = await revertOverridesSelective(ctx.rootInstanceId, keySet);
+      if (!result) {
+        throw new Error(`prefab revert: revertOverridesSelective returned nothing for entity ${entityId} — it stopped being a prefab instance, or the prefab source could not be re-loaded for the rebuild (see the editor console for the [Prefab] warning).`);
+      }
+      const ref = entityRef(result.newRootId);
+      useEditorStore.getState().selectEntity(result.newRootId);
+      const { source, prefab: revertedPrefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure } = result;
+      pushAction({
+        label: 'Revert prefab overrides',
+        undo: () => {
+          const cur = ref.resolve(); if (cur == null) return;
+          const id = rebuildInstance(cur, source, revertedPrefab, fullOverrides, fullStructure);
+          useEditorStore.getState().selectEntity(id);
+        },
+        redo: () => {
+          const cur = ref.resolve(); if (cur == null) return;
+          const id = rebuildInstance(cur, source, revertedPrefab, reducedOverrides, reducedStructure);
+          useEditorStore.getState().selectEntity(id);
+        },
+      });
+      // revert is live-only — the prefab FILE is untouched, matching instantiate/detach.
+      return { ok: true, newRootId: result.newRootId, guid: ensureGuid(result.newRootId), revertedKeys: [...keySet], saved: false };
+    }
     // ── Prefab-edit mode (#125) ──
     // The only path that re-SERIALIZES an existing .prefab.json. `create` writes a prefab FROM a
     // scene entity; these open the template itself in an isolated synthetic world, so a save
@@ -1399,7 +1563,7 @@ export function registerEditorAgentOps(): void {
     }
     throw new Error(
       `unknown prefab action '${which}' — pass prefabAction: 'instantiate' | 'create' | 'detach' ` +
-      "| 'edit-open' | 'edit-save' | 'edit-exit' " +
+      "| 'overrides' | 'apply' | 'revert' | 'edit-open' | 'edit-save' | 'edit-exit' " +
       "(the name is `prefabAction`, not `action`: /api/editor-action spends `action` on the op name).",
     );
   });

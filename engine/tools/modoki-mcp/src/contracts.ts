@@ -376,9 +376,23 @@ const DECLS: Record<string, Decl> = {
     mutating: true, undoable: true, persists: 'both', requires: ['editor', 'scene'], aim: 'entity',
     minimalArgs: { action: 'instantiate', path: '/assets/prefabs/probe.prefab.json' },
     notes: 'Sends `prefabAction` on the wire: the relay STRIPS a param named `action`. '
-      + "persists:'both' because action:'create' WRITES the .prefab.json (writePrefabFile) while "
-      + 'instantiate/detach/apply/revert are live-only; the undo entry covers the live tagging only, '
-      + 'never the file write (undoing an overwrite would destroy an asset the agent never created). '
+      + "persists:'both' because action:'create' and 'apply' WRITE the .prefab.json "
+      + "(writePrefabFile / applyToPrefabWithUndo) while instantiate/detach/overrides/revert are "
+      + "live-only; the undo entry covers the live tagging/rebuild only, never a file write "
+      + '(undoing an overwrite would destroy an asset the agent never created — apply is the one '
+      + "exception: its undo DOES restore the pre-apply .prefab.json, because that write IS the op). "
+      + "'overrides' is READ-only discovery — it walks the SAME override-key enumeration "
+      + "'apply'/'revert' consume (collectInstanceOverrideKeys) and hands back the exact key "
+      + "strings, so an agent can pick `keys` without guessing the "
+      + '`"localId.trait.field"` / `"+added.<guid>"` / `"-removed.<localId>"` / '
+      + '`"-trait.<localId>.<name>"` shapes. `apply`/`revert` act on ALL current overrides when '
+      + '`keys` is omitted, and throw (never a silent ok:true) if ANY given key matches no '
+      + 'override — a partial apply/revert would read as a success. An EXPLICIT empty `keys` '
+      + 'array is refused rather than treated as omitted: a caller-side filter that matched '
+      + 'nothing means "act on nothing", and falling through to "act on everything" is the '
+      + 'destructive reading. Not every override is applyable, either — a scene-only/runtime-only '
+      + 'field (EntityAttributes.editorFolder) is revertable but is skipped by a template write, '
+      + 'so apply refuses it when named and reports it as `skippedKeys` when not. '
       + "The edit-* actions drive PREFAB-EDIT MODE: 'edit-open' swaps the world for a synthetic "
       + 'prefab scene (world-destructive, so it takes `force` like load-scene, and it saves the '
       + "current scene on the way in), 'edit-save' re-serializes the .prefab.json, 'edit-exit' "

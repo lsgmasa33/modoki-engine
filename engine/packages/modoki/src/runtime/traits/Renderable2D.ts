@@ -17,6 +17,12 @@ export const Renderable2D = trait({
   /** Alpha multiplier (0..1) applied on top of `color`'s RGB tint — the color's
    *  A channel. Folded into the Inspector color picker for Renderable2D. */
   opacity: 1 as number,
+  /** ⚠️ **HALF extents, not full ones** — the drawn quad is `width * 2` by `height * 2`. Both the
+   *  sprite path (`computeSpriteScale`: `targetW * 2 / texW`) and the primitive path
+   *  (`computeShapeGeometry`, whose params are documented as half-width/half-height) read them that
+   *  way, and this holds identically for a prefab member. Worth stating here because the opposite
+   *  is the intuitive reading: a game that assumed full extents put every tray emblem 0.47 badge
+   *  diameters out of place, and no test could see it. */
   width: 20 as number,
   height: 20 as number,
   pivotX: 0.5 as number,

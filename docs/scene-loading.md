@@ -620,6 +620,29 @@ Two consumers:
   it**. This is a transitional safety net for bases extracted by copy-and-thin (sling's
   two levels shared all 38 guids), not a statement about precedence.
 
+### Guid uniqueness is a PER-FILE rule, not a repo-wide one
+
+Worth stating explicitly, because the obvious reading of the guard above is the wrong one and
+it has already sent one sweep in the wrong direction (2026-08-18):
+
+- **Within one scene file, a guid must be unique.** Two entries answering to the same guid mean
+  an arbitrary winner for every `findEntityByGuid`, and an ambiguous parent for any child naming
+  that guid as its `parentId`. Nothing in the load path catches it — both `filterPersistentDuplicates`
+  and `filterDuplicateChainGuids` compare a scene against something ELSE already loaded (a carried
+  entity, an earlier chain scene), so a collision *inside* one file passes straight through and
+  both entities spawn. Guarded by `engine/tests/assets/sceneGuidUniqueness.test.ts`.
+- **Across scene files, sharing a guid is NORMAL and is sometimes required.** A sweep of the 54
+  committed scenes found ~80 shared guids and only two same-file collisions. `games/sling`'s
+  `Lvl-0001`/`Lvl-0002` are variants of the same authored entities; `games/space-console`'s three
+  scenes share one UI shell; and the `Persistent` carry-across-swap mechanism **depends** on both
+  scene files naming the entity by the same guid — that is precisely how `filterPersistentDuplicates`
+  recognises the carried entity and drops the scene's copy.
+
+So a repo-wide uniqueness check would fail on the architecture rather than find a bug. The honest
+cross-file signal is "same guid, *different* entity name", which is too weak to gate a build on: an
+entity legitimately renamed in one scene is indistinguishable from a copy-paste collision. The guard
+is therefore scoped to same-file collisions deliberately, and says so in its own header.
+
 ### Gotchas
 
 - **A carried prefab instance loses its EDITOR bookkeeping** (Apply-to-Prefab,

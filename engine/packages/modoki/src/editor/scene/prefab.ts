@@ -29,7 +29,7 @@ const SCENE_ONLY_TEMPLATE_FIELDS = new Set(['EntityAttributes.editorFolder']);
 /** True when a live field must be kept OUT of a written prefab template: pure
  *  runtime read-back, or a scene-only organizational field. Shared by both paths
  *  that write a template — creating a prefab, and applying overrides back into one. */
-function isTemplateExcludedField(meta: TraitMeta, field: string): boolean {
+export function isTemplateExcludedField(meta: TraitMeta, field: string): boolean {
   return isRuntimeOnlyField(meta, field) || SCENE_ONLY_TEMPLATE_FIELDS.has(`${meta.name}.${field}`);
 }
 
@@ -1470,8 +1470,16 @@ export function setPrefabCache(source: string, prefab: PrefabFile | null): void 
 }
 
 /** Look up an entity's PrefabInstance source + rootInstanceId. Returns null if
- *  the entity is not part of a prefab instance. */
-function resolveInstanceContext(entityId: number): { source: string; rootInstanceId: number } | null {
+ *  the entity is not part of a prefab instance.
+ *
+ *  EXPORTED because the agent ops need the same lookup to turn a `{guid}` into the
+ *  `(source, rootInstanceId)` pair `applyToPrefabWithUndo`/`revertOverridesSelective`
+ *  take. It was briefly copied into `agentEditorOps.ts` instead — the duplicated-private-
+ *  helper trap docs/editor.md warns about, and worse here than usual: the copy would keep
+ *  answering plausibly after this one's rules changed (a nested member's rootInstanceId
+ *  points at ITS OWN prefab's root, not the outermost one), so the two would disagree only
+ *  on nested instances. One lookup, one answer. */
+export function resolveInstanceContext(entityId: number): { source: string; rootInstanceId: number } | null {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return null;
   let source = '';

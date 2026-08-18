@@ -565,7 +565,7 @@ same actions + state a person has in the editor. They relay to the renderer over
 - **Edit like a human (undoable):** `modoki_create_entity` (empty/primitive/2d/ui/camera/light/
   particle — identical to the Hierarchy menu), `modoki_duplicate_entity`, `modoki_delete_entities`,
   `modoki_reparent_entity`, `modoki_set_selection`, `modoki_gizmo`, `modoki_focus_entity`,
-  `modoki_history {undo|redo}`. `modoki_prefab {instantiate|create|detach}`.
+  `modoki_history {undo|redo}`. `modoki_prefab {instantiate|create|detach|overrides|apply|revert}`.
   `modoki_set_transform` sets position/rotation/scale in ONE call (partial merge) and — unlike a
   plain `setTrait` — routes a prefab INSTANCE's edit into its overrides instead of being silently
   ignored; prefer it over hand-building a `mutate_scene` op.
@@ -911,7 +911,6 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | Tool | Endpoint | Effect | Needs | Aim | Smallest call |
 |---|---|---|---|---|---|
 | `modoki_batch` | — | live | editor | — | `{"steps":[{"tool":"wait","args":{"ms":1}}]}` |
-
 <!-- END GENERATED TOOL CATALOG -->
 
 ### `device_*` vs `modoki_*` — the naming asymmetries, stated once
@@ -1269,8 +1268,16 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
   `data-ui-id="<panel>.<region>.<name>"` and surface as handles, so `modoki_tap_handle {id}` drives them
   with **no new input tool and no pixel measuring**. Ids are stable and semantic
   (`inspector.section.Transform.menu`, `contextmenu.item.Copy Component`, `sceneView.toolbar.gizmo.rotate`,
-  `hierarchy.toolbar.create`, `prefab.dialog.confirm`). Each handle reports `rect`, `meta.disabled` (a
-  greyed control is DATA, not a shade of grey) and `occludedBy` (what covers it — occlusion is computed
+  `hierarchy.toolbar.create`, `prefab.dialog.confirm`). **Every Inspector NUMBER field is addressable
+  as `inspector.field.<Trait>.<field>`** (`inspector.field.Transform.x`,
+  `inspector.field.Rotate3D.speed`) — grouped vector axes, bounded UI-anchor sizes and plain numeric
+  trait fields alike. Use it instead of a `input[value="…"]` CSS selector: React writes the `value`
+  ATTRIBUTE only on the initial render, so a value-based selector silently stops matching the moment
+  the field changes — which is usually the very next step of whatever you are driving. Each handle
+  reports `rect`, `meta.disabled` (a
+  greyed control is DATA, not a shade of grey), `meta.state` where the control has a current value —
+  `module-toggles.physics3d.off` reports `state:'selected'` when that is what the project is set to,
+  so a tri-state row is read rather than eyeballed — and `occludedBy` (what covers it — occlusion is computed
   for EVERY handle that names an owning element, not just chrome; `occlusionUnchecked` counts the ones
   that named none, so **`occludedCount:0` only means "all clickable" when `occlusionUnchecked` is 0 too**).
   **A handle only exists when its panel is rendered** — an empty result means "open that panel / select an

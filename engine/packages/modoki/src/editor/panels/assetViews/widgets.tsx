@@ -44,8 +44,8 @@ export function writeMetaOrWarn(path: string, meta: unknown): void {
   });
 }
 
-export function NumberField({ label, value, onChange, step = 0.1, readOnly = false, wide = false, overrideColor = false, hint, mixed = false }: {
-  label: string; value: number; onChange: (v: number) => void; step?: number; readOnly?: boolean; wide?: boolean; overrideColor?: boolean; hint?: FieldHint; mixed?: boolean;
+export function NumberField({ label, value, onChange, step = 0.1, readOnly = false, wide = false, overrideColor = false, hint, mixed = false, dataUiId }: {
+  label: string; value: number; onChange: (v: number) => void; step?: number; readOnly?: boolean; wide?: boolean; overrideColor?: boolean; hint?: FieldHint; mixed?: boolean; dataUiId?: string;
 }) {
   // Enforce the hint's declared min/max on commit (previously display-only — see
   // BufferedNumberInput). Clamp in `parse` so a typed out-of-range value is capped.
@@ -69,6 +69,7 @@ export function NumberField({ label, value, onChange, step = 0.1, readOnly = fal
           min={hint!.min} max={hint!.max} step={sliderStep}
           value={mixed ? hint!.min! : parseNumber(localValue)}
           onChange={(e) => handleChange(e.target.value)}
+          data-ui-id={dataUiId ? `${dataUiId}.slider` : undefined}
           style={{ flex: 1, minWidth: 0, accentColor: '#5dade2', cursor: 'pointer' }}
         />
       )}
@@ -82,6 +83,7 @@ export function NumberField({ label, value, onChange, step = 0.1, readOnly = fal
         onBlur={onBlur}
         onDoubleClick={(e) => (e.target as HTMLInputElement).select()}
         onChange={(e) => handleChange(e.target.value)}
+        data-ui-id={dataUiId}
         style={{ ...inputStyle, ...(bounded ? { width: 52, flexShrink: 0 } : { flex: 1 }), color: overrideColor ? '#5dade2' : '#ddd', fontWeight: overrideColor ? 'bold' : 'normal', ...(readOnly ? readOnlyFieldStyle : null) }}
       />
     </div>
