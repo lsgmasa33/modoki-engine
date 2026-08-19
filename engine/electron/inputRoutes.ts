@@ -323,6 +323,11 @@ const DISPATCHED_INPUT_ROUTES = new Set([
 export function createInputRoutes(deps: InputRouteDeps) {
   const { ops, requestRenderer } = deps;
 
+  /** What `probe-key-reach` answers (editor/input/keyReach.ts). Loosely typed on purpose:
+   *  it crosses the renderer relay as JSON, and an editor build predating the op replies
+   *  with something else entirely — every field is therefore optional and unchecked here. */
+  type KeyReachReply = { focusedPanel?: string | null; editorBinding?: string | null; gameInputSuppressed?: boolean; simRunning?: boolean; chord?: string } | null;
+
   /** The currently-HELD sustained pointer (from `/api/input/pointer` action:'down'), or null.
    *  Lives in the factory closure so it persists ACROSS requests — that is the whole point: a
    *  `down` in one MCP call, a `move`/`up` in later ones. Tracks the button so a `move`/`up`
@@ -525,6 +530,21 @@ export function createInputRoutes(deps: InputRouteDeps) {
           return bad(`could not focus panel "${panel}" (scope is now ${JSON.stringify(focusedPanel)}) — is that panel open? Panel ids are the FlexLayout tab ids: scene, game, hierarchy, inspector, console, assets, animation-editor, timeline-editor, particle-editor, spriteanim-editor, skin-editor, ai.`);
         }
       }
+      // Will this press reach ANYTHING? Probe BEFORE dispatching — the press itself can move
+      // both the scope and DOM focus, so asking afterwards would report the wrong world.
+      // Best-effort by design: a probe that cannot answer (no renderer, an older renderer
+      // build that has not registered the op) must never fail the INPUT — it only decides
+      // whether a warning rides along. Same policy as withAgentAttribution above.
+      let reach: KeyReachReply = null;
+      try {
+        reach = (await requestRenderer('probe-key-reach', { key, modifiers })) as KeyReachReply;
+      } catch { /* unreachable renderer — press anyway, unwarned */ }
+      // Echo the scope on EVERY press, not only when the caller set it. Not knowing where the
+      // scope was is what made QA-PHYS-0003 unanswerable from the responses alone: 80 presses
+      // each said ok:true and none of them said which panel owned the keyboard.
+      if (focusedPanel === undefined && reach && typeof reach === 'object' && 'focusedPanel' in reach) {
+        focusedPanel = reach.focusedPanel ?? null;
+      }
       const r = await ops.pressKey(key, modifiers);
       // The key IS dispatched (DOM hotkeys fire regardless), so this stays ok:true — but if a
       // field is focused the GAME never samples it, so surface that so a silent no-reach is
@@ -535,10 +555,39 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // measured: `f` framed the selection with a readOnly input focused. The old wording
       // ("will swallow this key") claimed more than the probe knows and read as a flat
       // contradiction of what had just happened.
+      const warnings: string[] = [];
+      if (r.gameSwallows) {
+        warnings.push(`a form field (${r.activeElement}) has focus, so the RUNNING GAME's input sampler will ignore this key — call modoki_focus (no selector) to blur it if you meant to drive the game. Editor shortcuts are unaffected and may still fire.`);
+      }
+      // THE SECOND GATE (QA-PHYS-0003). Three conditions, and each one removes a class of
+      // false alarm the live check actually produced:
+      //   simRunning       — the gate is closed through most ordinary editing (any panel but
+      //                      the GameView closes it), so without this it fires on nearly every
+      //                      press in a stopped editor and gets tuned out inside one session.
+      //   gameInputSuppressed — measured by running the gate the editor installed, not by
+      //                      re-deriving its policy here.
+      //   !editorBinding   — a chord the keymap claims (a `w` that sets the gizmo mode with
+      //                      the Scene panel focused) is correct usage; stay quiet for it.
+      // WORDED TO WHAT THE GATE PROVES, no further. `editorBinding: null` rules out the
+      // keymap registry, which is the editor's only window-level CHORD listener — but not an
+      // element-level onKeyDown (a text input, the Add-Component picker), which fires while
+      // that element holds DOM focus. `activeElement` in this same response is that half of
+      // the answer. So: "did not reach the running game" yes, "did nothing at all" no.
+      const scopeBlocked = !!(reach?.simRunning && reach.gameInputSuppressed && !reach.editorBinding);
+      if (scopeBlocked) {
+        warnings.push(`the editor keyboard scope is ${JSON.stringify(reach!.focusedPanel ?? null)}, so the input gate blocked this key from the RUNNING GAME — it moved nothing there. Pass panel:"game" if you meant to drive the game. A bare modoki_focus {} does NOT do this: it clears DOM focus only, and the keyboard scope is separate state. (Editor shortcuts scoped to that panel are unaffected and may still have fired.)`);
+      }
       return json({
         ok: true, pressed: { key, modifiers: modifiers ?? [] }, activeElement: r.activeElement,
         ...(focusedPanel !== undefined ? { focusedPanel } : {}),
-        ...(r.gameSwallows ? { warning: `a form field (${r.activeElement}) has focus, so the RUNNING GAME's input sampler will ignore this key — call modoki_focus (no selector) to blur it if you meant to drive the game. Editor shortcuts are unaffected and may still fire.` } : {}),
+        // The resolved chord rides along ONLY with the scope warning. `keyReach` computes it
+        // either way and this used to drop it on the floor while the field's own docstring
+        // promised it was echoed — a claim nothing kept. It earns its place exactly here: the
+        // warning says a key reached nothing, and `chord` is how you tell "the scope was
+        // wrong" from "I spelled the key wrong" (`{key:'UpArro'}` canonicalizes to `uparro`,
+        // matches nothing, and dispatches a DOM event no sampler recognizes).
+        ...(scopeBlocked && reach?.chord ? { chord: reach.chord } : {}),
+        ...(warnings.length ? { warning: warnings.join(' ') } : {}),
       });
     }
 

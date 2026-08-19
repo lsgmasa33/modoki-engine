@@ -20,6 +20,11 @@ import { createInputRoutes, resolvePoint, type InputOps } from '../../electron/i
  *  pin, in noise identical on every single one of them. */
 let calls: string[];
 let leaseCalls: { open?: boolean; id?: number }[];
+/** What the fake `probe-key-reach` answers. Default = the open world (no panel owns the
+ *  keyboard, so the gate lets input through); a test that needs the QA-PHYS-0003 world
+ *  reassigns it before posting. */
+let keyReach: { focusedPanel: string | null; editorBinding: string | null; gameInputSuppressed: boolean; simRunning: boolean };
+
 
 function makeOps(): InputOps {
   return {
@@ -119,6 +124,11 @@ function makeRenderer(overrides?: Record<string, unknown>) {
       if (spec.name === 'Enemy') return { ok: false, error: '3 entities are named "Enemy" (g-a, g-b, g-c) — address by guid' };
       return { ok: false, error: `no entity with guid ${JSON.stringify(spec.guid ?? spec.name ?? spec.id)}` };
     }
+    if (op === 'probe-key-reach') {
+      // The default world: nothing focused, so the gate is open and the press reaches the
+      // game. Individual tests override `keyReach` to model a closed gate.
+      return { ok: true, ...keyReach, chord: String((params as { key: string }).key).toLowerCase() };
+    }
     if (op === 'set-focus-scope') {
       const wanted = (params as { panel: string }).panel;
       // The real op returns the store's value AFTER the set — a panel that is not open
@@ -160,6 +170,7 @@ const post = (urlPath: string, body: unknown) =>
 beforeEach(() => {
   calls = [];
   leaseCalls = [];
+  keyReach = { focusedPanel: null, editorBinding: null, gameInputSuppressed: false, simRunning: false };
   ops = makeOps();
   requestRenderer = makeRenderer();
   routes = createInputRoutes({ ops, requestRenderer });
@@ -957,7 +968,9 @@ describe('panel-targeted input (focus-scope P7)', () => {
     // time, so focusing after the press would be useless.
     const r = await post('/api/input/key', { key: 'w', panel: 'scene' }) as { body: unknown };
     expect(r.body).toMatchObject({ ok: true, focusedPanel: 'scene' });
-    expect(calls).toEqual(['renderer:set-focus-scope', 'key(w)']);
+    // The reach probe rides between them and must also precede the press — it reports the
+    // world the key is about to land in, which the press itself can change.
+    expect(calls).toEqual(['renderer:set-focus-scope', 'renderer:probe-key-reach', 'key(w)']);
   });
 
   it('FAILS LOUDLY when the panel is not open, and does NOT press the key', async () => {
@@ -969,11 +982,15 @@ describe('panel-targeted input (focus-scope P7)', () => {
     expect(ops.pressKey).not.toHaveBeenCalled();
   });
 
-  it('leaves the key path untouched when no panel is given', async () => {
+  it('does NOT set the scope when no panel is given — but still reports where it is', async () => {
+    // This used to assert the response had NO `focusedPanel` at all. That silence is what
+    // made QA-PHYS-0003 undiagnosable from the transcript: 80 presses, every one ok:true,
+    // and nothing anywhere saying which panel owned the keyboard. Echoing it is free.
+    keyReach = { focusedPanel: 'hierarchy', editorBinding: 'app.undo', gameInputSuppressed: true, simRunning: false };
     const r = await post('/api/input/key', { key: 'z', modifiers: ['meta'] }) as { body: unknown };
-    expect(r.body).toMatchObject({ ok: true, pressed: { key: 'z' } });
-    expect(r.body).not.toHaveProperty('focusedPanel');
-    expect(calls).toEqual(['key(z)']);
+    expect(r.body).toMatchObject({ ok: true, pressed: { key: 'z' }, focusedPanel: 'hierarchy' });
+    expect(calls).toEqual(['renderer:probe-key-reach', 'key(z)']);
+    expect(calls).not.toContain('renderer:set-focus-scope');
   });
 
   it('focus accepts a panel WITHOUT touching DOM focus', async () => {
@@ -993,6 +1010,93 @@ describe('panel-targeted input (focus-scope P7)', () => {
     const r = await post('/api/input/focus', {}) as { body: unknown };
     expect(r.body).toMatchObject({ ok: true });
     expect(ops.focusElement).toHaveBeenCalledWith(undefined);
+  });
+});
+
+/** QA-PHYS-0003 — the SECOND gate.
+ *
+ *  A runner drove `press_key {key:'d'}` 80 times at a running platformer and reported the
+ *  character controller broken. It was not: the previous case had left the keyboard scope on
+ *  `scene`, so EditorApp's input gate dropped every key before the game sampled it, while the
+ *  route answered ok:true 80 times. The press was a provable no-op and nothing said so. */
+describe('press_key: warning when the press reached NOTHING', () => {
+  it('warns, and names panel:"game" as the fix, when the gate blocked an unbound key', async () => {
+    keyReach = { focusedPanel: 'scene', editorBinding: null, gameInputSuppressed: true, simRunning: true };
+    const r = await post('/api/input/key', { key: 'd' }) as { body: { ok: boolean; warning?: string; focusedPanel?: string | null; chord?: string } };
+    expect(r.body.ok).toBe(true);                    // the key WAS dispatched — this is advice, not a refusal
+    expect(r.body.focusedPanel).toBe('scene');
+    expect(r.body.warning).toContain('blocked this key from the RUNNING GAME');
+    expect(r.body.warning).toContain('panel:"game"');
+    // The exact misconception that produced the false negative, named in the message.
+    expect(r.body.warning).toContain('modoki_focus {}');
+    // And the chord it resolved, so "wrong scope" is distinguishable from "wrong key spelling".
+    expect(r.body.chord).toBe('d');
+  });
+
+  it('echoes `chord` ONLY with the scope warning — it is noise on a press that worked', async () => {
+    keyReach = { focusedPanel: 'game', editorBinding: null, gameInputSuppressed: false, simRunning: true };
+    const r = await post('/api/input/key', { key: 'd' }) as { body: Record<string, unknown> };
+    expect(r.body).not.toHaveProperty('chord');
+  });
+
+  it('claims only what the GATE proves — never that the press did nothing at all', async () => {
+    // `editorBinding: null` rules out the keymap REGISTRY — the editor's only window-level
+    // chord listener — but not an element-level onKeyDown, which fires while that element
+    // holds DOM focus. `activeElement` (same response) is the other half. So the message may
+    // say the key never reached the game and must not say the press did nothing at all.
+    keyReach = { focusedPanel: 'hierarchy', editorBinding: null, gameInputSuppressed: true, simRunning: true };
+    const r = await post('/api/input/key', { key: 'ArrowDown' }) as { body: { warning?: string } };
+    expect(r.body.warning).not.toContain('did nothing at all');
+    expect(r.body.warning).toContain('may still have fired');
+  });
+
+  it('stays silent while the sim is STOPPED — the gate is shut through most ordinary editing', async () => {
+    // Without this condition the warning fires on nearly every press in a stopped editor
+    // (any panel but the GameView closes the gate) and is tuned out inside one session.
+    keyReach = { focusedPanel: 'scene', editorBinding: null, gameInputSuppressed: true, simRunning: false };
+    const r = await post('/api/input/key', { key: 'd' }) as { body: { warning?: string } };
+    expect(r.body.warning).toBeUndefined();
+  });
+
+  it('stays SILENT when an editor binding claimed the chord — that is correct usage', async () => {
+    // `w` sets the gizmo mode with the Scene panel focused. The gate is closed (the game
+    // gets nothing) and that is exactly right. Warning here would fire on most presses in a
+    // normal editor session and train the reader to skip the field.
+    keyReach = { focusedPanel: 'scene', editorBinding: 'gizmo.translate', gameInputSuppressed: true, simRunning: true };
+    const r = await post('/api/input/key', { key: 'w' }) as { body: { warning?: string } };
+    expect(r.body.warning).toBeUndefined();
+  });
+
+  it('stays silent when the gate is OPEN, even with nothing bound — the game got the key', async () => {
+    keyReach = { focusedPanel: 'game', editorBinding: null, gameInputSuppressed: false, simRunning: true };
+    const r = await post('/api/input/key', { key: 'd' }) as { body: { warning?: string } };
+    expect(r.body.warning).toBeUndefined();
+  });
+
+  it('reports BOTH gates when both are shut, rather than picking one', async () => {
+    // A Console filter field has focus AND the scope is on that panel. Two independent
+    // causes, two different fixes; naming one would send the caller to do half the work.
+    ops.pressKey = vi.fn(async (k: string) => { calls.push(`key(${k})`); return { activeElement: 'input#filter', gameSwallows: true }; });
+    routes = createInputRoutes({ ops, requestRenderer });
+    keyReach = { focusedPanel: 'console', editorBinding: null, gameInputSuppressed: true, simRunning: true };
+    const r = await post('/api/input/key', { key: 'd' }) as { body: { warning?: string } };
+    expect(r.body.warning).toContain('a form field (input#filter) has focus');
+    expect(r.body.warning).toContain('blocked this key from the RUNNING GAME');
+  });
+
+  it('presses anyway when the probe is unavailable — a broken probe must not break input', async () => {
+    // An editor build predating the op, or a renderer that went away between calls. The
+    // press is the product; the warning is commentary.
+    requestRenderer = vi.fn(async (op: string) => {
+      calls.push(`renderer:${op}`);
+      if (op === 'probe-key-reach') throw new Error('unknown op');
+      return null;
+    }) as unknown as typeof requestRenderer;
+    routes = createInputRoutes({ ops, requestRenderer });
+    const r = await post('/api/input/key', { key: 'd' }) as { body: { ok: boolean; warning?: string } };
+    expect(r.body.ok).toBe(true);
+    expect(r.body.warning).toBeUndefined();
+    expect(calls).toContain('key(d)');
   });
 });
 

@@ -629,9 +629,14 @@ same actions + state a person has in the editor. They relay to the renderer over
   human-typed `View\Zoom In`. It used to split on `\` first, which shredded those labels and made
   the whole Open Recent submenu unreachable while the refusal's own `available` list advertised the
   exact path it had refused. Switching projects from MCP goes through this submenu.
-- **Keyboard focus:** `modoki_focus {selector?}` — focus that element, or with NO selector blur the
-  focused one. The game's input sampler drops keys while a DOM text field (Console filter, an
-  Inspector input) holds focus, so blur first when trusted key input mysteriously does nothing.
+- **Keyboard focus:** `modoki_focus {selector?, panel?}` — `selector` sets `document.activeElement`,
+  `panel` sets the editor KEYBOARD SCOPE; with neither, it blurs the focused element. ⚠️ **Driving a
+  running GAME needs BOTH gates open, and the bare blur opens one**: keys are dropped while a DOM
+  text field holds focus (blur fixes that) AND while any panel other than the GameView owns the
+  scope (only `panel:"game"` fixes that). Assuming the blur was enough is what produced a false
+  "the character controller is broken" — the two gates, and the warning `modoki_press_key` now
+  emits, are in
+  [editor-input.md → The runtime input gate](./editor-input.md#the-runtime-input-gate--mechanism-vs-policy).
 - **Scenes/assets:** `modoki_list_scenes` / `modoki_load_scene` / `modoki_new_scene` /
   `modoki_save_all`; `modoki_import_file` (drag-from-Finder equivalent); `modoki_project_settings`
   (`action=set` is a PATCH deep-merged onto the on-disk config — a partial is safe, and omitted

@@ -210,7 +210,14 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'sent while the wrong panel is focused does NOTHING — silently, because the dispatcher ' +
       'yields rather than erroring. Pass `panel` to set the keyboard scope first instead of ' +
       'tapping-and-hoping; the response echoes `focusedPanel`. ' +
-      'CAVEAT: this is renderer-level input — it does NOT trigger native Electron MENU ' +
+      'TWO GATES STOP A KEY REACHING THE GAME, and naming only the first cost a QA run a '
+      + 'false "the character controller is broken" (QA-PHYS-0003): (1) a focused text field, '
+      + 'which modoki_focus with no selector clears, and (2) the KEYBOARD SCOPE — while any '
+      + 'panel other than the Game panel owns it, the editor gate suppresses input to the '
+      + 'running game entirely. A bare modoki_focus {} fixes only the first. Pass panel:"game" '
+      + 'to drive the game. The response now echoes `focusedPanel` on every press, and warns '
+      + 'when a press reached NOTHING (no editor binding claimed it and the gate blocked it). '
+      + 'CAVEAT: this is renderer-level input — it does NOT trigger native Electron MENU ' +
       'accelerators, so a chord the OS menu claims (Cmd+R reload, Cmd+Alt+I devtools, and on ' +
       'Windows/Linux F12) reaches page handlers here but behaves differently for a human. ' +
       'Requires the Electron editor.',
@@ -230,11 +237,15 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_focus',
     'Move keyboard focus in the editor window: focus the element matching `selector`, or — ' +
       'with NO selector — blur the currently-focused element (focus falls back to <body>). ' +
-      'General-purpose (focus any panel/canvas/input, or defocus a text field). The common ' +
+      'General-purpose (focus any panel/canvas/input, or defocus a text field). One common ' +
       "use is unblocking trusted key input for the GAME: the game's input sampler drops keys " +
       'while a DOM text field (Console filter, inspector) holds focus, and a viewport click ' +
-      'does NOT blur it — so call this (no selector) before modoki_press_key to drive ' +
-      'nav/jump/confirm. A non-focusable target (canvas/div) is given tabindex=-1 so it can ' +
+      'does NOT blur it — so call this (no selector) before modoki_press_key. ⚠️ THAT IS ONLY ' +
+      'HALF THE STORY: blurring does NOT move the keyboard scope, and while a panel other ' +
+      'than the Game panel owns the scope the editor gate suppresses game input outright — so ' +
+      'to DRIVE THE GAME pass panel:"game" (here or on modoki_press_key). A bare {} that is ' +
+      'expected to do that instead reports success and changes nothing, which is exactly the ' +
+      'false negative QA-PHYS-0003 measured. A non-focusable target (canvas/div) is given tabindex=-1 so it can ' +
       'take focus. Returns {focused, blurred, ok, activeElement} — a MISS is a named failure ' +
       '(invalid selector / no element matched / element refused focus), never a bare ok:false. ' +
       'KEYBOARD SCOPE vs DOM FOCUS are different things: `panel` sets which panel the editor ' +

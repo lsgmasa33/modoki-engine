@@ -136,11 +136,55 @@ the policy.**
 - `EditorApp` installs `() => focusedPanel !== null && focusedPanel !== 'game'`. **A shipped game
   never calls `setInputGate`**, so the default gate stays null → zero behaviour change in a build,
   and `createTestWorld`/headless is untouched.
-- **Closing the gate resets held state**, on the closing edge. Hold `W`, click the Hierarchy, and
-  the character must stop — otherwise `sample()` keeps reporting `w` held until physical release.
+- **A closed gate DRAINS every frame** (`reset()` on each source), rather than once on an edge.
+  Hold `W`, click the Hierarchy, and the character must stop — otherwise `sample()` keeps
+  reporting `w` held until physical release. The same drain stops a queued backlog (pointerSource's
+  press FIFO fills from clicks made in editor panels) from replaying into the game on reopen.
+  ⚠️ It must NOT reset on the REOPENING edge, which is what it used to do (#264): `PanelFocusHost`
+  moves the scope on capture-phase pointerdown, so a click into the Game panel opens the gate and
+  lands in the queue in the same tick — and the reopening reset then ate it, along with the rest of
+  that gesture (`reset()` nulls `activeId`, so the later move/up fall through). First click lost,
+  second fine, which reads as flaky. Measured live 2026-08-19: pre-fix the first tap delivered 0
+  presses to the game and the second delivered 1; after, the first delivers 1.
 - **Null focus deliberately does not suppress**: pressing Play and immediately using WASD has to
   work without first clicking the GameView.
 - The gate **fails open** if the policy function throws.
+
+### The agent-facing half: a suppressed key used to look identical to a delivered one
+
+The gate is right, and it was also **invisible**. `modoki_press_key` answered `ok:true` whether the
+key reached the game or was dropped at the gate, and its own docs named only the OTHER gate (a
+focused text field), telling callers to fix it with a bare `modoki_focus {}` — which clears DOM
+focus and does not touch `focusedPanel`. A QA run followed that advice literally, pressed `d` 80
+times at a running platformer with the scope stuck on `scene`, measured a byte-identical
+`Transform.x`, and reported the character controller broken (testboard `xfMfBSDskBmFY7phWSVm`).
+
+`/api/input/key` now asks the renderer one read-only question BEFORE dispatching —
+`probe-key-reach` → `editor/input/keyReach.ts` — and reports:
+
+- `focusedPanel` on **every** press, not only when the caller set it;
+- a warning when the press reached **nothing**: `isInputSuppressed()` is true AND `resolve()` found
+  no binding for the chord in the current scope.
+
+Both halves of that condition are load-bearing. `gameInputSuppressed` alone is true through most
+ordinary editor work — a `w` that sets the gizmo mode with the Scene panel focused is correct usage
+— so warning on it would fire on nearly every press and be tuned out within a session. Paired with
+"no binding claimed it", the press is a **provable** no-op, which is worth interrupting for.
+
+**What `editorBinding: null` does and does not prove.** It rules out the keymap registry, which
+is the editor's only window-level *chord* listener (`dispatcher.ts`, plus one Shift-snap modifier
+watcher in SceneView that binds nothing). It does not rule out an element-level `onKeyDown` — a
+text input, the Add-Component picker, `AssetRefField` — which fires while that element holds DOM
+focus; `activeElement`, reported in the same response, is that half of the answer. So the warning
+says the key never reached the running game, and deliberately does **not** say the press did
+nothing at all.
+
+The probe calls `isInputSuppressed()` and `resolve()` rather than re-deriving
+`focusedPanel !== 'game'` in the main process: the policy above is stated in exactly one place and
+a second copy would drift the first time the gate learns a new condition. The one fact that *is*
+duplicated across the process boundary — the arrow-key name aliases — has a drift guard
+(`engine/tests/electron/keyReach.test.ts`), because a one-sided addition there would make the
+warning lie on that key alone.
 
 ## Never make a commit depend on a focus EVENT (#233)
 

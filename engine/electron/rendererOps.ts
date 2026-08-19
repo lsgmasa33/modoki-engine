@@ -546,7 +546,7 @@ export async function scroll(
 /** Electron `sendInputEvent` keyCode wants Accelerator names (`Up`/`Down`/…), not the
  *  DOM `key` names (`ArrowUp`/…). Alias the DOM arrow names so callers can pass either and
  *  the game still receives a DOM keydown with `e.key === 'ArrowDown'`. */
-const KEYCODE_ALIAS: Record<string, string> = {
+export const KEYCODE_ALIAS: Record<string, string> = {
   ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right',
 };
 

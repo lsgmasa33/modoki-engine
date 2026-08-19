@@ -263,21 +263,46 @@ for the rest of the session — the symptom is whatever that game does when the 
 
 The mechanism, verified in a running editor (2026-08-19):
 
-- Every prefab write/overwrite/undo goes through `setPrefabCache()`
+- A prefab write goes through `setPrefabCache()` / `writePrefabFile()`
   (`editor/scene/prefab.ts`), which calls `invalidatePrefab(source)` — deleting the entry from
   the **runtime** `prefabCache` in `runtime/loaders/meshTemplateCache.ts`.
 - `acquirePrefab` is the only thing that refills it, and it is called from just two kinds of
   place: `SceneManager` during a scene load, and games that preload deliberately
   (`games/sling`, `demos/forest-camp`, each with its own owner-id sentinel).
-- So after an edit, `getCachedPrefab()` returns `undefined` until the next scene load
-  (Stop→Play, or reopening the project). **Nothing warns.**
+- So after such a write, `getCachedPrefab()` returns `undefined` until the next scene load.
+  **Nothing warns.**
 
-**What this looks like in a game**, and it is not hypothetical: Court's guard flag falls back to
-drawn primitives when its prefab is uncached, so flags planted before the edit kept the real art
-and every one planted after it drew a placeholder — a permanently half-placeholder board, in
-exactly the tweak-the-prefab-live workflow the prefab existed to support. Fixed there by
+⚠️ **WHICH writes actually strand it — this matters, and an earlier draft of this section got it
+wrong.** The invalidate's own comment states the intended contract ("so the NEXT scene load
+re-reads the new file"), and **prefab-EDIT MODE honours it**: `exitPrefabEditing` calls
+`loadScene(target)`, which re-acquires. So the open-edit-save-exit loop is safe, and
+`games/court/art.md`'s claim that the tray "picks the new offsets up when you leave edit mode"
+is **correct for that workflow**.
+
+The paths that invalidate an in-use prefab and do **not** reload are:
+- **Apply to Prefab** on a scene instance — `applyToPrefabWithUndo` → `writePrefabFile`, live-only.
+- **`modoki_prefab action:'apply'`** (and `'create'`), the agent surface for the same op.
+
+Creating a NEW prefab from an entity (`assetOps.ts`) also invalidates, but only its own
+freshly-minted guid, which nothing is using yet — harmless.
+
+⚠️ **There is NO file-watcher path.** Editing a `.prefab.json` on disk does not invalidate
+anything, so the runtime keeps serving the OLD prefab until a scene load — a staleness problem,
+not a fallback one, and the opposite failure to the above.
+
+**What this looks like in a game.** Court's guard flag falls back to drawn primitives when its
+prefab is uncached, so after an Apply-to-Prefab the flags already planted keep the real art while
+every new one draws a placeholder, and the board stays mixed until a scene load. Fixed there by
 recording the art each instance was spawned with, retiring on a mismatch, and asking for the
 prefab back once on a miss (`syncFlags`, `games/court/runtime/systems.ts`).
+
+**Measured on Court's tray badge, 2026-08-19** — the wholesale version of the same failure. With
+the prefab cached, a board build gives the authored instance (`Coin` ×6, `CountBadge`, `CountBanner`,
+`InfoBadge`, `ChipRow`). Invalidate, then rebuild the board with **no** scene reload, and every one
+of those drops to **0**, replaced by the pre-#171 code-spawned set (`TrayIcon_<piece>`,
+`TrayCountBanner_<piece>`, `InfoBadge_<piece>` …). The tray silently reverts to the old art and
+the constant layout — `refreshBadgeLayout` and the instantiation are two separate consumers of the
+same cache and both fall back.
 
 **If you spawn prefab instances at runtime, handle the miss on purpose.** Two things, and the
 first alone is not enough:
@@ -289,10 +314,15 @@ first alone is not enough:
    mixed population that never converges, because "this cell already has an instance" is true and
    says nothing about which art that instance wears.
 
-⚠️ **`games/court`'s tray badge reads the same cache and has NOT been audited for this**
-(`refreshBadgeLayout` → `getCachedPrefab`, falling back to code constants). `games/court/art.md`
-claims the tray "picks the new offsets up when you leave edit mode"; that claim predates this
-finding and has not been re-tested against it. Tracked separately rather than fixed blind.
+Court's tray badge has now been audited (#262) — see the measurement above.
+
+⚠️ **Acquiring under your own owner sentinel means RELEASING it too.** `acquirePrefab(<sentinel>,
+guid)` adds that sentinel to the prefab's owner set, so the scene's own `releaseAllForScene` can
+never evict it and the prefab outlives the game. Drop the holds wholesale when the game
+unregisters — `releaseAllForScene(<sentinel>)`, not `releasePrefab` per guid, because a per-guid
+release leaks anything the acquire pulled in transitively (`games/sling` records this at its own
+call site, and `games/court` had to add it after missing it). Two other games still spawn prefabs
+at runtime without the re-acquire half: #265.
 
 ## Mesh sharing
 

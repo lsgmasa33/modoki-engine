@@ -44,7 +44,8 @@ deterministic sim free of live DOM reads.
 - `runtime/input/inputSources.ts` — the `InputSource` interface + registry (`registerSource`/
   `sampleAll`/`attachAll`) and the app-scope `inputSourcesManager`. Also the **host input gate**
   (`setInputGate`/`isInputSuppressed`): a host may suppress ingestion wholesale, and every source's
-  optional `reset()` runs on the closing edge so held state can't strand. It lives at the registry
+  optional `reset()` runs on EVERY suppressed frame (never on the reopening one — #264) so held
+  state can't strand and a queued backlog can't replay. It lives at the registry
   because all three sources need it and only the keyboard had any guard. A shipped game never
   installs one — see [editor-input.md](./editor-input.md).
 - `runtime/input/keyboardSource.ts` — DOM keyboard modality: passive listeners, editing-guard,

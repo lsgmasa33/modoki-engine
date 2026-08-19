@@ -45,6 +45,7 @@ import {
   readEditorJournal, clearEditorJournal, withEditorActor, openActorLease, closeActorLease,
   waitForEditorJournal,
   getResolvedRender3d,
+  probeKeyReach,
   type PrefabFile,
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
@@ -927,6 +928,15 @@ export function registerEditorAgentOps(): void {
     const p = (params ?? {}) as { panel?: string | null };
     if (p.panel !== undefined) useEditorStore.getState().setFocusedPanel(p.panel);
     return { ok: true, focusedPanel: useEditorStore.getState().focusedPanel };
+  });
+  // Would this key reach anything? Read-only twin of set-focus-scope, asked by
+  // `/api/input/key` BEFORE it presses — see editor/input/keyReach.ts for why both gates
+  // have to be answered together. Never mutates: a probe that moved the scope it is
+  // reporting on would be the measurement changing the thing measured.
+  registerAgentOp('probe-key-reach', (params) => {
+    const p = (params ?? {}) as { key?: string; modifiers?: string[] };
+    if (typeof p.key !== 'string' || !p.key) return { ok: false, error: 'key is required' };
+    return { ok: true, ...probeKeyReach(p.key, p.modifiers) };
   });
   registerAgentOp('set-collider-edit', (params) => {
     const p = (params ?? {}) as { on?: boolean };

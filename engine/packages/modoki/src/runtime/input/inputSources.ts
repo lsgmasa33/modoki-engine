@@ -54,13 +54,11 @@ export interface InputSource {
 // at the registry covers all three and anything a game registers later.
 
 let inputGate: (() => boolean) | null = null;
-let wasSuppressed = false;
 
 /** Install the host's suppression predicate — return true to BLOCK input from reaching
  *  the game. Pass null to clear. */
 export function setInputGate(fn: (() => boolean) | null): void {
   inputGate = fn;
-  if (!fn) wasSuppressed = false;
 }
 
 /** Is input currently suppressed by the host? A throwing gate fails OPEN — a broken
@@ -106,26 +104,41 @@ export function detachAll(): void {
 
 /** Merge every attached source into `out`, in registration order.
  *
- *  While the host gate is closed, sources are NOT sampled and their latched state is
- *  dropped on the closing edge. The reset is load-bearing, not tidiness: hold W, click
- *  the Hierarchy, and without it `held` still contains 'w', so the character keeps
- *  walking until you physically release. Same class as the existing blur / play-start
- *  resets in keyboardSource. */
+ *  While the host gate is closed, sources are NOT sampled and every frame DRAINS them.
+ *  The drop is load-bearing, not tidiness, and it answers two different problems:
+ *
+ *    - latched LEVEL state: hold W, click the Hierarchy, and without a reset `held` still
+ *      contains 'w', so the character keeps walking until you physically release. Same
+ *      class as the existing blur / play-start resets in keyboardSource.
+ *    - QUEUED discrete events: a source's raw listeners are never detached by the gate —
+ *      only `sample()` is skipped — so pointerSource's press/release FIFO keeps filling
+ *      with every click made in an editor panel while the game is unfocused. Left alone,
+ *      reopening replays that whole backlog into the game, one entry per frame.
+ *
+ *  ⚠️ DRAIN CONTINUOUSLY, NEVER ON THE REOPENING EDGE (#264). This used to reset on both
+ *  edges — closing, then again on reopening to clear the backlog — and the reopening reset
+ *  ate the very input that OPENED the gate. `PanelFocusHost` moves the keyboard scope on
+ *  CAPTURE-phase pointerdown, before any panel handler and before pointerSource's own
+ *  window listener enqueues the press. So a click into the Game panel flips the gate open
+ *  and lands in the queue within the same tick, and the next frame — still carrying
+ *  `wasSuppressed` from before — reset it away. Not just its pressed edge: `reset()` clears
+ *  `activeId`, so the gesture's later move/up fall through pointerSource's
+ *  `pointerId !== activeId` checks too, and a drag-to-aim died whole. The second click
+ *  worked, which is what made it read as flaky rather than broken.
+ *
+ *  Draining every suppressed frame keeps the backlog property (nothing survives to replay)
+ *  while leaving the reopened frame untouched, so a press that arrives AFTER the gate opens
+ *  is delivered. It also removes the edge bookkeeping entirely — there is no `wasSuppressed`
+ *  any more, and no way to get its two edges out of step.
+ *
+ *  This runs only while a host gate is installed AND closed — i.e. in the editor, with the
+ *  sim playing and a non-game panel focused. A shipped game installs no gate and never
+ *  reaches it. `reset()` must stay CHEAP for that reason: it is now per-frame, not per-edge. */
 export function sampleAll(out: InputFrame): void {
-  const suppressed = isInputSuppressed();
-  if (suppressed) {
-    if (!wasSuppressed) { wasSuppressed = true; for (const s of sources) s.reset?.(); }
+  if (isInputSuppressed()) {
+    for (const s of sources) s.reset?.();
     return;
   }
-  // Reset again on the REOPENING edge, not just the closing one: a source's raw
-  // listeners (window pointerdown/up, etc.) are never detached by the gate — only
-  // `sample()` is skipped while suppressed — so a source that queues discrete events
-  // (pointerSource's press/release FIFO) keeps enqueuing every click made in an
-  // editor panel while the game is unfocused. Without this, reopening the gate
-  // replays that whole backlog into the game one entry per frame. Closing-edge reset
-  // alone only clears what was ALREADY latched at the moment of closing.
-  if (wasSuppressed) { for (const s of sources) s.reset?.(); }
-  wasSuppressed = false;
   for (const s of sources) s.sample(out);
 }
 
