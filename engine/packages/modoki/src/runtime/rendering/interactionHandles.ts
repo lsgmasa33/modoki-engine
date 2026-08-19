@@ -84,6 +84,10 @@ export function registerHandleProvider(fn: HandleProvider): () => void {
  *  every `modoki_handles` poll. */
 const warnedDuplicates = new Set<string>();
 
+/** Providers already reported as throwing, so the error fires once per provider rather than on
+ *  every `modoki_handles` poll. */
+const warnedThrowers = new WeakSet<HandleProvider>();
+
 /** Collect handles from every registered provider, optionally filtered. A provider
  *  that throws is skipped (one bad editor can't break the whole report).
  *
@@ -98,7 +102,17 @@ export function collectHandles(filter?: HandleFilter): InteractionHandle[] {
   const seen = new Set<string>();
   for (const p of providers) {
     let handles: InteractionHandle[];
-    try { handles = p(); } catch { continue; } // skip a failing editor
+    // Skip a failing editor — but SAY SO. A swallowed throw here is indistinguishable from
+    // "that editor has nothing to offer right now", which is the answer `modoki_handles` gives
+    // for a perfectly healthy idle panel: a provider broken by an edit reads as an empty,
+    // plausible report. Once per provider, so a per-frame poll can't flood the console.
+    try { handles = p(); } catch (err) {
+      if (!warnedThrowers.has(p)) {
+        warnedThrowers.add(p);
+        console.error('[interactionHandles] a handle provider threw — its handles are MISSING from this report, not absent:', err);
+      }
+      continue;
+    }
     for (const h of handles) {
       if (filter?.editor && h.editor !== filter.editor) continue;
       if (filter?.kind && h.kind !== filter.kind) continue;

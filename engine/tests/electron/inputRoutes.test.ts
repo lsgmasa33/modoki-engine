@@ -543,8 +543,11 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
   });
 
   // ── F1: the resolve closure used to drop onScreen/occludedBy/disabled, so tap/drag fired
-  //    unconditionally and always returned ok:true. Now off-screen / disabled = a genuine miss
-  //    (ok:false, dispatch nothing); occluded = still act, but surface `occluded`. ──
+  //    unconditionally and always returned ok:true. Now off-screen / disabled / OCCLUDED are all a
+  //    genuine miss (ok:false, dispatch nothing), and `allowOccluded:true` is the escape hatch.
+  //    Occluded was a warning-that-still-dispatched until 2026-08-19: a 2D gizmo handle sitting
+  //    under the SceneView's own toolbar pressed the TOOLBAR and answered ok:true, which was filed
+  //    as "the handle is completely inert" (testboard 5jE5Tip6Qwp7s7YVAYoH — it was not). ──
   it('tap-handle REFUSES an off-screen handle (ok:false) and dispatches nothing', async () => {
     const res = await post('/api/input/tap-handle', { id: 'bone.off' }) as { body: { ok: boolean; error: string } };
     expect(res.body.ok).toBe(false);
@@ -559,8 +562,16 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
-  it('tap-handle TAPS an occluded handle but surfaces `occluded` (provenance, not a veto)', async () => {
-    const res = await post('/api/input/tap-handle', { id: 'bone.covered' }) as { body: Record<string, unknown> };
+  it('tap-handle REFUSES an occluded handle, naming the cover and the escape hatch', async () => {
+    const res = await post('/api/input/tap-handle', { id: 'bone.covered' }) as { body: { ok: boolean; error: string } };
+    expect(res.body.ok).toBe(false);
+    expect(res.body.error).toMatch(/covered by div\.modal/);
+    expect(res.body.error).toMatch(/allowOccluded/);
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('…and allowOccluded:true presses anyway, still reporting `occluded`', async () => {
+    const res = await post('/api/input/tap-handle', { id: 'bone.covered', allowOccluded: true }) as { body: Record<string, unknown> };
     expect(ops.tap).toHaveBeenCalledWith(40, 40, expect.anything());
     // S3.17 — `occluded` is a BOOLEAN here, exactly as on tap/hover/drag/pointer; the covering
     // element's identity lives in `occludedBy`. It used to be the STRING itself, so the handle
@@ -583,16 +594,20 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
     expect(ops.drag).not.toHaveBeenCalled();
   });
 
-  it('drag-handle still drags an occluded endpoint but reports `occluded`', async () => {
-    const res = await post('/api/input/drag-handle', { id: 'bone.covered', to: { x: 5, y: 5 } }) as { body: Record<string, unknown> };
+  it('drag-handle REFUSES a covered source, and drags it under allowOccluded', async () => {
+    const refused = await post('/api/input/drag-handle', { id: 'bone.covered', to: { x: 5, y: 5 } }) as { body: { ok: boolean; error: string } };
+    expect(refused.body.ok).toBe(false);
+    expect(refused.body.error).toMatch(/covered by div\.modal/);
+    expect(ops.drag).not.toHaveBeenCalled();
+    const forced = await post('/api/input/drag-handle', { id: 'bone.covered', to: { x: 5, y: 5 }, allowOccluded: true }) as { body: Record<string, unknown> };
     expect(ops.drag).toHaveBeenCalledWith({ x: 40, y: 40 }, { x: 5, y: 5 }, expect.anything());
-    expect(res.body).toMatchObject({ ok: true, occluded: true, occludedBy: 'div.modal' });
+    expect(forced.body).toMatchObject({ ok: true, occluded: true, occludedBy: 'div.modal' });
   });
 
   it('drag-handle says WHICH endpoint was covered (S3.17)', async () => {
     // The two endpoints used to collapse into one `occluded` field, so a caller could not tell a
     // covered source from a covered destination — and the fixes differ.
-    const res = await post('/api/input/drag-handle', { id: 'bone.0', toId: 'bone.covered' }) as
+    const res = await post('/api/input/drag-handle', { id: 'bone.0', toId: 'bone.covered', allowOccluded: true }) as
       { body: { fromTarget?: Record<string, unknown>; toTarget?: Record<string, unknown> } };
     expect(res.body.fromTarget).toMatchObject({ id: 'bone.0', occluded: false, occludedBy: null, occlusionChecked: true });
     expect(res.body.toTarget).toMatchObject({ id: 'bone.covered', occluded: true, occludedBy: 'div.modal', occlusionChecked: true });

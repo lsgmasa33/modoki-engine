@@ -241,13 +241,73 @@ The handle shape carries three fields that make chrome addressing robust:
 
   What that cost, measured 2026-08-18 on `games/anim-bug`: a bug was filed as "dragging a LIGHT's
   3D translate gizmo does nothing while a mesh in the same scene moves" (QA-SVIEW-0003), which
-  reads as a lights regression and is not one. A gizmo axis aim point is the object's origin plus a
-  FIXED 52px screen offset. The Scene panel's canvas was 256px wide; the light's origin projected to
+  reads as a lights regression and is not one. A gizmo axis aim point WAS the object's origin plus a
+  FIXED 52px screen offset (it is derived from the picker's real geometry now — see below, which is
+  the same constant biting a second way). The Scene panel's canvas was 256px wide; the light's origin projected to
   x=253.8, so its +x aim point landed at x=305.1 — 49px past the canvas edge, inside the Assets
   panel — and the trusted click went there while `modoki_drag_handle` answered `ok:true` with a
   resolved from/to. The mesh simply projected further left. The light's un-occluded z handle moved
-  it normally. With `owner` supplied the same call reports `occludedBy: "div"` and `occludedCount`
-  rises, which is the whole difference between a silent miss and a diagnosable one.
+  it normally. With `owner` supplied the same call reports `occludedBy` naming the cover and
+  `occludedCount` rises, which is the whole difference between a silent miss and a diagnosable one.
+
+  **The prediction must include the GIZMO, or it names an entity the click will not select.** The
+  transform gizmo of the selected entity sits exactly where an aim lands (its origin) and covers
+  ~50-200 px around it; TransformControls handles that press itself and SceneView's selection
+  handler bails, so the click changes nothing. The pick provider did not model that, so `pickAt`
+  answered with whatever mesh was behind the gizmo — or `null` for a point on an arm over empty
+  sky, where the click provably leaves the selection alone. Filed as "the reported
+  `occludedByEntity`/`hitTarget` does not match what the dispatched click actually selects"
+  (testboard `UfbeEfhHmNwd0GVVnESC`). The provider now answers with the gizmo's OWN entity for such
+  a point — the truthful "a click here leaves that selected" — which also makes an aim at the
+  already-selected entity succeed instead of being refused by its own gizmo. Guarded by an e2e that
+  predicts, clicks, and compares across a ring of points around the gizmo
+  (`editor-smoke.spec.ts`), verified to FAIL with the fix disabled.
+
+  **Reporting the cover was not enough on its own, and the same class of phantom bug came back.**
+  A covered handle still DISPATCHED, so `ok:true` with an `occludedBy` field kept reading as a
+  success: on 2026-08-19 a 2D gizmo's free-move handle sat under the SceneView's own 32px toolbar,
+  the press went to the toolbar, and it was filed as "`gizmo2d:free` has ZERO effect — not just
+  unsnapped, completely inert" (testboard 5jE5Tip6Qwp7s7YVAYoH, severity high). The handle was
+  fine — moving the entity out from under the toolbar moved it on the first attempt. So an occluded
+  endpoint is now a **REFUSAL** on `tap_handle`/`drag_handle`, the way an occluded entity aim
+  already is on `modoki_tap`, with `allowOccluded:true` as the deliberate escape hatch. Two smaller
+  changes came with it, because a refusal is only useful if it is actionable: `describeOccluder`
+  walks up for the nearest ancestor that names anything (a bare `"div"` identifies nothing), and
+  the SceneView toolbar — chrome that structurally overlaps the top of the viewport — carries
+  `data-ui-id="sceneView.toolbar"` so it names itself.
+
+  **A 3D gizmo aim point is now geometry, not a pixel guess — for EVERY handle.** The old constants
+  (52px for an arrow, 66px for a ring) could not work, and not because of camera distance: the gizmo
+  holds a constant size in the RENDERER'S viewport, so its screen size scales with the PANEL. In the
+  default dock the Scene canvas is small. Measured 2026-08-19 on games/3d-test (canvas 366x227),
+  raycasting three's own picker along the X axis: it answers `X` from ~10px out to ~45px and
+  NOTHING at 52px — the published aim sat past the arrow's tip, the press fell through, and the
+  drag orbited the camera. (A miss over empty viewport also MARQUEE-SELECTS, so it can silently
+  swap the selection and make the next drag move the wrong entities.) After the fix, all 11
+  published handles across translate/rotate/scale raycast to exactly their intended picker on that
+  same small panel. An axis three has HIDDEN (within ~8° of the view, where it collapses the picker
+  to 1e-10) is no longer published at all.
+
+  A ROTATE ring's picker is a thin torus with nothing inside it, so the fixed 66px offset
+  aimed into its hole at every camera distance: the press fell through to the viewport background
+  and orbited the camera (testboard `zBgcNtw2HLyXwT9lMEe4`). And `scale:center` pressed the gizmo
+  ORIGIN, where three's uniform-scale ratio `pointEnd.length() / pointStart.length()` divides by
+  ~0 — measured 8.3e7 from a 120x80px drag, with the reflection decomposing to a sign flip on X
+  alone (`1Rg36fFvZBdeNmUrtjs7`, filed as a "non-uniform" scale; it is one mirror, not per-axis
+  skew). Both aims are derived from three's own handle scale in
+  `engine/packages/modoki/src/editor/panels/gizmo3dAim.ts`, which carries the formula and the
+  measurements.
+
+  **Three things the close-out's own review turned up, all measured, all fixed in the same pass.**
+  (a) `eye` — three derives it as the negated VIEW DIRECTION for an orthographic camera and as
+  `cameraPosition - worldPosition` for a perspective one; the editor has an ortho sibling, so the
+  perspective form would have hidden an axis three kept or published one it collapsed to 1e-10.
+  (b) The rotate ring's near-candidate is ranked by projected NDC depth, not by distance to the
+  camera's POSITION — the latter is quietly the wrong measure under an orthographic projection.
+  (c) `scale:center` verifies which picker it would select: three's three PLANE pickers are thin
+  plates in the gizmo's positive octant, and a ray can cross one before reaching the uniform box —
+  measured on a two-entity selection, whose proxy has no rotation so the plates lie in the world
+  planes, the drag came back with `sy` UNCHANGED and x/z grown, i.e. a silent two-axis scale.
 
   The rule is enforced by `engine/tests/architecture/handleProviderOwner.test.ts` — a SOURCE guard,
   because these providers live inside panel mount effects that cannot be invoked without a real

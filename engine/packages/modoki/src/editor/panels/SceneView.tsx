@@ -68,7 +68,7 @@ import { useEditorStore } from '../store/editorStore';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { isTextEditable } from '../input/focusScope';
-import { worldToLocalTransform } from '../scene/gizmoTransform';
+import { worldToLocalTransform, clampScaleCrossingPivot, scaleCrossedPivot, type ScaleSigns } from '../scene/gizmoTransform';
 import { boneRelToProxyLocal, proxyLocalToBoneLocal } from '../scene/billboardBonePose';
 import { setEditorViewportCamera, setFocusEntityHandler, focusEntityInSceneView, canFrameSelected, setViewportController, setEcsObjectsRegistry } from '../scene/sceneViewBus';
 import { withWarnFilter } from '../scene/warnFilter';
@@ -87,6 +87,7 @@ import {
 } from '../../runtime/core/colliderPoints';
 import { colliderEditInfo, worldPointToLocal, localToWorld, pickVertex, colliderPickHalfExtents } from './colliderEdit2D';
 import { descendantUnionGizmoBox2D } from './gizmoBounds';
+import { gizmoWorldScale, rotateRingAim, scaleCenterAim, axisPickAim, ROTATE_RING_RADIUS, SCALE_XYZ_HALF_EXTENT, AXIS_PICKER_CENTER } from './gizmo3dAim';
 import { drawGizmo2D, hitTestGizmo2D, cursorForHandle, applyGizmoDrag2D, snapDragResult, DEFAULT_GIZMO_SNAP, worldToLocal2D, type GizmoHandle } from './Gizmo2D';
 import { layoutText } from '../../runtime/rendering/text/layoutText';
 import { getLoadedFont } from '../../runtime/loaders/fontAtlasLoader';
@@ -635,8 +636,11 @@ export default function SceneView() {
 
   return (
     <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-      {/* Toolbar */}
-      <div style={{
+      {/* Toolbar. `data-ui-id` is not decoration: this strip OVERLAPS the viewport's top edge, so a
+          gizmo/collider handle near the top of the scene resolves to a point underneath it, and the
+          occlusion report is the only thing that tells a caller why their press did nothing. An
+          anonymous div made that report read "covered by div" (testboard 5jE5Tip6Qwp7s7YVAYoH). */}
+      <div data-ui-id="sceneView.toolbar" style={{
         height: 32, background: '#1e1e30', borderBottom: '1px solid #333',
         display: 'flex', alignItems: 'center', padding: '0 6px', flexShrink: 0,
         fontFamily: 'monospace', fontSize: '13px', gap: 3,
@@ -2489,6 +2493,10 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     //    (un-aimable) and returns [] when nothing's attached. meta.approximate flags these
     //    as aim aids, not exact handle centres.
     //
+    //    ROTATE is the exception and does NOT use a fixed pixel offset — its picker is a thin
+    //    torus with nothing inside it, so an offset guess aims into the hole and the press
+    //    orbits the camera. `gizmo3dAim.ts` derives that ring's real world radius instead.
+    //
     //    `owner` is the renderer canvas, and it is load-bearing rather than decorative. The
     //    aim point is the object's origin plus a FIXED SCREEN OFFSET (52px), so on a narrow
     //    Scene panel it can land past the canvas edge and over a neighbouring panel — where
@@ -2526,31 +2534,66 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         const base = ax === 'x' ? new THREE.Vector3(1, 0, 0) : ax === 'y' ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(0, 0, 1);
         return localBasis ? base.applyQuaternion(q) : base;
       };
-      // On-screen unit direction of a world axis at the origin (null if ~parallel to view).
-      const screenDir = (dir: THREE.Vector3) => {
-        const sC = project(origin.clone().addScaledVector(dir, 0.001));
-        if (sC.z > 1) return null; // stepped behind camera
-        const dxs = sC.x - oC.x, dys = sC.y - oC.y;
-        const len = Math.hypot(dxs, dys);
-        if (len < 1e-4) return null; // axis points ~at/away from camera → un-aimable
-        return { x: dxs / len, y: dys / len };
-      };
       const out: InteractionHandle[] = [];
-      const push = (id: string, label: string, px: number, dir: THREE.Vector3, axis: string) => {
-        const sd = screenDir(dir);
-        if (!sd) return;
-        out.push({ id, kind: 'gizmo-axis', editor: 'gizmo3d', x: oC.x + sd.x * px, y: oC.y + sd.y * px, label, meta: { axis, mode: gizmoMode, space: gizmoSpace, approximate: true }, owner: renderer.domElement });
+      const gizmoCam = (gizmo.camera ?? activeEditorCam) as THREE.PerspectiveCamera | THREE.OrthographicCamera;
+      const camPos = gizmoCam.getWorldPosition(new THREE.Vector3());
+      const worldScale = gizmoWorldScale(gizmoCam, camPos, origin, gizmo.size);
+      // `project` wants a real Vector3 (it clones + projects); the aim module speaks plain {x,y,z}.
+      const projectPlain = (p: { x: number; y: number; z: number }) => project(new THREE.Vector3(p.x, p.y, p.z));
+      // A handle with several equally good grab points prefers one the canvas actually owns, so the
+      // toolbar / view-cube chrome over the viewport corners doesn't blind an otherwise fine aim.
+      const reachable = (p: { x: number; y: number }) => {
+        const el = document.elementFromPoint(p.x, p.y);
+        return !!el && (el === renderer.domElement || renderer.domElement.contains(el));
       };
-      const PX = 52, RING_PX = 66;
+      // three's OWN `eye`, and the branch matters: for an ORTHOGRAPHIC camera it is the negated
+      // view direction, NOT the direction to the camera's position (TransformControls.js:1113).
+      // The editor has an orthographic sibling camera, so getting this wrong there would hide an
+      // axis three kept (dropping a usable handle) or publish one three collapsed to 1e-10 —
+      // reintroducing the exact miss this module exists to prevent, in ortho only.
+      const eye = (gizmoCam as THREE.OrthographicCamera).isOrthographicCamera
+        ? gizmoCam.getWorldDirection(new THREE.Vector3()).negate()
+        : camPos.clone().sub(origin).normalize();
+      // Which of three's internal pickers a press would select. Same defensive read as the pick
+      // provider below: a rename on upgrade degrades to "cannot tell" rather than throwing.
+      const pickerNameAt = (px: number, py: number): string | null => {
+        const picker = (gizmo as unknown as { _gizmo?: { picker?: Record<string, THREE.Object3D> } })._gizmo?.picker?.[gizmo.getMode()];
+        if (!picker || !picker.children.length) return null;
+        const n = { x: ((px - r.left) / r.width) * 2 - 1, y: -((py - r.top) / r.height) * 2 + 1 };
+        raycaster.setFromCamera(new THREE.Vector2(n.x, n.y), gizmoCam);
+        const hit = raycaster.intersectObjects(picker.children, true)[0];
+        return hit ? (hit.object.parent?.name || hit.object.name || null) : null;
+      };
       if (gizmoMode === 'translate' || gizmoMode === 'scale') {
-        for (const ax of ['x', 'y', 'z'] as const) push(`gizmo3d:${gizmoMode}:${ax}`, `${gizmoMode} ${ax}`, PX, axisDir(ax), ax);
-        // Centre = screen-space plane move / uniform scale (grab at the origin itself).
-        out.push({ id: `gizmo3d:${gizmoMode}:center`, kind: 'gizmo-axis', editor: 'gizmo3d', x: oC.x, y: oC.y, label: `${gizmoMode} center`, meta: { axis: 'center', mode: gizmoMode, space: gizmoSpace, approximate: true }, owner: renderer.domElement });
+        for (const ax of ['x', 'y', 'z'] as const) {
+          const aim = axisPickAim({ origin, dir: axisDir(ax), offsetWorld: AXIS_PICKER_CENTER * worldScale, eye, project: projectPlain, reachable });
+          if (!aim) continue;
+          out.push({ id: `gizmo3d:${gizmoMode}:${ax}`, kind: 'gizmo-axis', editor: 'gizmo3d', x: aim.x, y: aim.y, label: `${gizmoMode} ${ax}`, meta: { axis: ax, mode: gizmoMode, space: gizmoSpace, approximate: true, world: [aim.world.x, aim.world.y, aim.world.z] }, owner: renderer.domElement });
+        }
+        // Centre = screen-space plane move (translate) / uniform scale. Translate grabs the origin
+        // itself; SCALE must not — three divides by the press's radius from the origin, so an
+        // exactly-centred press blows the ratio up (and flips its sign). See scaleCenterAim.
+        let centre: { x: number; y: number } | null = { x: oC.x, y: oC.y };
+        if (gizmoMode === 'scale') {
+          const camRight = new THREE.Vector3().setFromMatrixColumn(gizmoCam.matrixWorld, 0);
+          const camUp = new THREE.Vector3().setFromMatrixColumn(gizmoCam.matrixWorld, 1);
+          centre = scaleCenterAim({ origin, cameraRight: camRight, cameraUp: camUp, halfExtentWorld: SCALE_XYZ_HALF_EXTENT * worldScale, project: projectPlain, reachable, picksUniform: (p) => pickerNameAt(p.x, p.y) === 'XYZ' });
+        }
+        if (centre) out.push({ id: `gizmo3d:${gizmoMode}:center`, kind: 'gizmo-axis', editor: 'gizmo3d', x: centre.x, y: centre.y, label: `${gizmoMode} center`, meta: { axis: 'center', mode: gizmoMode, space: gizmoSpace, approximate: true }, owner: renderer.domElement });
       } else if (gizmoMode === 'rotate') {
-        // Each rotation ring lies perpendicular to its axis — aim a point ON the ring by
-        // offsetting along a perpendicular axis (x-ring↔y dir, y-ring↔z, z-ring↔x).
-        const perp: Record<'x' | 'y' | 'z', 'x' | 'y' | 'z'> = { x: 'y', y: 'z', z: 'x' };
-        for (const ax of ['x', 'y', 'z'] as const) push(`gizmo3d:rotate:${ax}`, `rotate ${ax}`, RING_PX, axisDir(perp[ax]), ax);
+        // A rotation ring is an ANNULUS with nothing inside it, so a fixed screen offset the way
+        // translate/scale use one cannot work: it aims into the hole, the press falls through to
+        // the viewport background, and the drag ORBITS THE CAMERA. Compute the ring's real world
+        // radius instead, and aim at a 45° diagonal of its own plane (the axis-aligned points are
+        // where two rings intersect). Why, and the measurement: `gizmo3dAim.ts`'s header.
+        const radius = ROTATE_RING_RADIUS * worldScale;
+        const planeAxes: Record<'x' | 'y' | 'z', ['x' | 'y' | 'z', 'x' | 'y' | 'z']> = { x: ['y', 'z'], y: ['z', 'x'], z: ['x', 'y'] };
+        for (const ax of ['x', 'y', 'z'] as const) {
+          const [ua, va] = planeAxes[ax];
+          const aim = rotateRingAim({ origin, u: axisDir(ua), vAxis: axisDir(va), radius, project: projectPlain, reachable });
+          if (!aim) continue;
+          out.push({ id: `gizmo3d:rotate:${ax}`, kind: 'gizmo-axis', editor: 'gizmo3d', x: aim.x, y: aim.y, label: `rotate ${ax}`, meta: { axis: ax, mode: gizmoMode, space: gizmoSpace, approximate: true, world: [aim.world.x, aim.world.y, aim.world.z] }, owner: renderer.domElement });
+        }
       }
       return out;
     });
@@ -2598,6 +2641,9 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // Track which entity the gizmo is attached to (for ECS sync skip)
     let gizmoEntityId: number | null = null;
     let gizmoDragStart: { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number } | null = null;
+    /** Sign of the gizmo'd object's scale when a scale drag STARTED — so a drag that crosses the
+     *  pivot stops at 0 instead of mirroring the entity (clampScaleCrossingPivot). */
+    let gizmoScaleStartSign: ScaleSigns | null = null;
 
     // ── Multi-select group gizmo ──
     // When >1 entity is selected the gizmo attaches to this empty PROXY parked at the group
@@ -2661,6 +2707,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           return { id, parentId, startWorld: trsToMatrix(w, new THREE.Matrix4()), before };
         });
         groupDrag = { members, pivotStart: groupProxy.matrixWorld.clone() };
+        gizmoScaleStartSign = { x: Math.sign(groupProxy.scale.x), y: Math.sign(groupProxy.scale.y), z: Math.sign(groupProxy.scale.z) };
         return;
       }
       if (gizmoEntityId === null) return;
@@ -2668,6 +2715,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       if (!entity || !entity.has(Transform)) return;
       const tf = entity.get(Transform);
       gizmoDragStart = { x: tf.x, y: tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: tf.sx, sy: tf.sy, sz: tf.sz };
+      const o = gizmo.object;
+      gizmoScaleStartSign = o ? { x: Math.sign(o.scale.x), y: Math.sign(o.scale.y), z: Math.sign(o.scale.z) } : null;
     };
     gizmo.addEventListener('mouseDown', onGizmoMouseDown);
 
@@ -2691,6 +2740,11 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         if (!groupDrag) return;
         groupProxy.updateMatrixWorld(true);
         const mode = gizmo.getMode() as 'translate' | 'rotate' | 'scale';
+        // Crossing the pivot mid-scale mirrors the proxy, and a group scale spreads members by the
+        // same ratio — so a mirrored frame does not just invert scales, it throws every member
+        // through the pivot. Drop the frame; the drag stops at its last valid state. See
+        // `scaleCrossedPivot` for the measurement.
+        if (mode === 'scale' && scaleCrossedPivot(groupProxy.scale, gizmoScaleStartSign)) return;
         const news = applyGroupTransform3D({
           memberStartWorld: groupDrag.members.map((m) => m.startWorld),
           pivotStart: groupDrag.pivotStart,
@@ -2761,7 +2815,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       } else if (mode === 'rotate') {
         entity.set(Transform, { ...current, rx: clampAngle(local.rx), ry: clampAngle(local.ry), rz: clampAngle(local.rz) });
       } else if (mode === 'scale') {
-        entity.set(Transform, { ...current, sx: local.sx, sy: local.sy, sz: local.sz });
+        const s = clampScaleCrossingPivot(local, obj.scale, gizmoScaleStartSign);
+        entity.set(Transform, { ...current, sx: s.sx, sy: s.sy, sz: s.sz });
       }
       // Bulk entity.set bypasses writeTraitField, which is what normally
       // fires the dirty broadcast. Notify subscribers (Inspector, Canvas2D
@@ -2997,6 +3052,29 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             gameAspectFromRect(useEditorStore.getState().gameRect, getGameAspect()))
         : computeFullNDC(clientX, clientY, r);
       const activeCam = isUI ? gameActiveCam : activeEditorCam;
+      // A press that lands on the TRANSFORM GIZMO never reaches the selection at all:
+      // TransformControls handles it first and starts a drag, and `onPointerDown` below bails
+      // while it is dragging. So the honest answer for such a point is "the selection stays as it
+      // is" — the gizmo's own entity — NOT whatever mesh happens to be behind the gizmo.
+      //
+      // Predicting this matters because the gizmo sits exactly where an aim usually lands (the
+      // selected entity's origin) and covers ~50-200 px around it. Without this, `pickAt` named a
+      // mesh the click provably would not select: measured 2026-08-19 on games/anim-bug, with a
+      // 20x box enclosing a cone, `modoki_tap` reported "a click here selects Box" while the click
+      // changed no selection at all — which is how testboard UfbeEfhHmNwd0GVVnESC came to read as
+      // "the report contradicts the real outcome". From a CLEARED selection (no gizmo on screen)
+      // the same click does select Box, exactly as reported.
+      //
+      // three's picker geometry is internal, so this reads it defensively: a rename on upgrade
+      // degrades to the old behaviour rather than throwing.
+      const gizmoOwner = gizmoEntityId ?? useEditorStore.getState().selectedEntityIds[0] ?? null;
+      if (gizmoOwner !== null && gizmo.enabled && (gizmo as { visible?: boolean }).visible && gizmo.object) {
+        const picker = (gizmo as unknown as { _gizmo?: { picker?: Record<string, THREE.Object3D> } })._gizmo?.picker?.[gizmo.getMode()];
+        if (picker && picker.children.length) {
+          raycaster.setFromCamera(new THREE.Vector2(mx, my), activeCam);
+          if (raycaster.intersectObjects(picker.children, true).length) return gizmoOwner;
+        }
+      }
       const { show3D } = layersRef.current;
       // Meshes listed before gizmos so a mesh wins the tie at a shared ancestor.
       const entries: Pick3DEntry[] = [

@@ -84,7 +84,25 @@ export function isOccluded(el: Element, top: Element | null): boolean {
 export function occlusionAt(owner: Element, x: number, y: number): string | null {
   const top = document.elementFromPoint(x, y);
   if (!isOccluded(owner, top)) return null;
-  return describeElement(top) ?? 'nothing (clipped or off-window)';
+  return describeOccluder(top) ?? 'nothing (clipped or off-window)';
+}
+
+/** Name the covering element WELL ENOUGH TO ACT ON. `describeElement` falls back to the bare tag
+ *  when an element carries no id/class/data-ui-id, and a bare `"div"` is what a caller gets told is
+ *  covering their handle — true, useless, and indistinguishable from every other anonymous div. The
+ *  editor's own panel chrome is exactly that kind of element: the SceneView toolbar strip that
+ *  covered a 2D gizmo handle (testboard 5jE5Tip6Qwp7s7YVAYoH) is a style-only div. So when the top
+ *  element names nothing, walk up for the nearest ancestor that does and say which panel it is in. */
+export function describeOccluder(el: Element | null | undefined): string | null {
+  const own = describeElement(el);
+  if (!own || /[.#[]/.test(own)) return own; // already identifiable
+  for (let p = el!.parentElement, hops = 0; p && hops < 8; p = p.parentElement, hops++) {
+    const panel = p.getAttribute('data-editor-panel');
+    if (panel) return `${own} in the "${panel}" panel`;
+    const named = describeElement(p);
+    if (named && /[.#[]/.test(named)) return `${own} inside ${named}`;
+  }
+  return own;
 }
 
 /** The single place a spec becomes an element + a point. Both public resolvers wrap this,

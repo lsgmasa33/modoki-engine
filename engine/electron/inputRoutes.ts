@@ -496,6 +496,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       const h = (body ?? {}) as {
         id?: string; to?: { x: number; y: number }; toId?: string; delta?: { dx: number; dy: number };
         steps?: number; button?: MouseButton; clickCount?: number; modifiers?: InputModifier[];
+        allowOccluded?: boolean;
       };
       if (typeof h.id !== 'string' || !h.id) return bad('id (handle id) is required');
       // Carry the aimability annotations computeHandles already produces — the old closure narrowed
@@ -507,17 +508,28 @@ export function createInputRoutes(deps: InputRouteDeps) {
         const res = (await requestRenderer('enact-handles', { ids: [id] })) as { handles?: ResolvedHandle[] } | null;
         return res?.handles?.find((x) => x.id === id) ?? null;
       };
-      // OFF-screen (scrolled out of its panel) or DISABLED (greyed-out) = a genuine miss → refuse
-      // (ok:false). OCCLUDED (something covers it) → the tap hits the cover, but mirror modoki_tap and
-      // still act while surfacing `occluded` as a warning, rather than refusing.
-      const blockedReason = (hd: ResolvedHandle): string | null =>
+      // OFF-screen (scrolled out of its panel), DISABLED (greyed-out), or OCCLUDED (something
+      // covers it) = a genuine miss → refuse (ok:false).
+      //
+      // Occluded USED to be a warning that still dispatched, on the stated grounds of mirroring
+      // modoki_tap. That mirror no longer holds — modoki_tap's ENTITY aim refuses an occluded aim
+      // unless `allowOccluded` — and the warning shape cost a QA session a wrong verdict: a 2D
+      // gizmo's free-move handle happened to sit under the SceneView's own 32px toolbar, the press
+      // went to the toolbar, and `ok:true` with a `occludedBy:"div"` field read as "the handle is
+      // completely inert" (testboard 5jE5Tip6Qwp7s7YVAYoH, filed high; the handle was fine — moving
+      // the entity out from under the toolbar moved it correctly on the first try). A press that
+      // provably lands on something else is a miss, and a miss reported as a success is how a tool
+      // manufactures a phantom product bug. `allowOccluded:true` still forces it through.
+      const blockedReason = (hd: ResolvedHandle, allowOccluded?: boolean): string | null =>
         hd.onScreen === false ? 'off-screen — scroll it into view (modoki_scroll over the panel), then retry'
           : hd.meta?.disabled === true ? 'disabled (inert / greyed-out)'
-            : null;
+            : hd.occludedBy !== undefined && !allowOccluded
+              ? `covered by ${hd.occludedBy} — the press would land on THAT, not on the handle. Move the covering panel/menu (or the target) out of the way, or pass allowOccluded:true to press anyway and see what happens`
+              : null;
 
       const from = await resolve(h.id);
       if (!from) return json({ error: `no live handle with id '${h.id}' (query /api/enact-handles to list current handles)` }, 404);
-      const fromBlocked = blockedReason(from);
+      const fromBlocked = blockedReason(from, h.allowOccluded);
       if (fromBlocked) return json({ ok: false, error: `handle '${h.id}' is ${fromBlocked}`, handle: { id: h.id, x: from.x, y: from.y, onScreen: from.onScreen ?? true } });
       // S3.17 — `occluded` means the SAME thing here as on every other aimed route: a BOOLEAN,
       // always present, with the covering element's identity in `occludedBy`. The handle routes
@@ -552,7 +564,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       if (!to && h.toId) {
         const t = await resolve(h.toId);
         if (!t) return json({ error: `no live handle with toId '${h.toId}'` }, 404);
-        const tBlocked = blockedReason(t);
+        const tBlocked = blockedReason(t, h.allowOccluded);
         if (tBlocked) return json({ ok: false, error: `toId handle '${h.toId}' is ${tBlocked}`, handle: { id: h.toId, x: t.x, y: t.y, onScreen: t.onScreen ?? true } });
         to = { x: t.x, y: t.y };
         toHandle = t;

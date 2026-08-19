@@ -319,15 +319,18 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'vertex/bone without eyeballing pixels. `button`/`clickCount`/`modifiers` as in ' +
       'modoki_tap (e.g. clickCount:2 to insert/rename, modifiers:["shift"] to add to a ' +
       'marquee selection). Reports `occluded` (BOOLEAN — same meaning as modoki_tap) plus ' +
-      '`occludedBy` naming the covering element; an off-screen or disabled handle is REFUSED ' +
-      'rather than tapped. Requires the Electron editor.',
+      '`occludedBy` naming the covering element. An off-screen, disabled, or OCCLUDED handle is ' +
+      'REFUSED rather than tapped: a press that provably lands on the covering element is a miss, ' +
+      'and reporting one as ok:true is how a covered handle reads as an inert one. Pass ' +
+      '`allowOccluded:true` to press anyway and see what happens. Requires the Electron editor.',
     {
       id: z.string().describe('Handle id from modoki_handles.'),
       button: z.enum(['left', 'right', 'middle']).optional().describe('Mouse button held during the drag (default left).'),
       clickCount: z.number().optional(),
       modifiers: z.array(modifierEnum).optional(),
+      allowOccluded: z.boolean().optional().describe('Press even though something covers the handle (default false = refuse, naming the cover).'),
     },
-    async ({ id, button, clickCount, modifiers }) => postJson('/api/input/tap-handle', { id, button, clickCount, modifiers }),
+    async ({ id, button, clickCount, modifiers, allowOccluded }) => postJson('/api/input/tap-handle', { id, button, clickCount, modifiers, allowOccluded }),
   );
 
   // ── drag_handle — trusted drag of a named handle (Electron editor only) ──
@@ -342,7 +345,9 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'key for the whole drag (see modoki_drag). Occlusion is reported PER ' +
       'ENDPOINT — `fromTarget`/`toTarget` each carry `occluded` (boolean) + `occludedBy` — so a ' +
       'covered source and a covered destination are distinguishable (they need different fixes); ' +
-      '`toTarget` appears only for a `toId` destination. Requires the Electron editor.',
+      '`toTarget` appears only for a `toId` destination. An off-screen, disabled, or OCCLUDED ' +
+      'endpoint is REFUSED rather than dragged (the press would land on the cover, which reads as ' +
+      '"this handle does nothing"); `allowOccluded:true` forces it. Requires the Electron editor.',
     {
       id: z.string().describe('Handle id to drag (from modoki_handles).'),
       to: z.object({ x: z.number(), y: z.number() }).optional().describe('Absolute destination in viewport CSS px.'),
@@ -351,8 +356,9 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       steps: z.number().optional().describe('Intermediate move count (default 10).'),
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button held for the drag (default 'left')."),
       modifiers: z.array(modifierEnum).optional().describe('Modifier keys held for the whole drag (real keyDown/keyUp around the gesture).'),
+      allowOccluded: z.boolean().optional().describe('Drag even though something covers an endpoint (default false = refuse, naming the cover).'),
     },
-    async ({ id, to, toId, delta, steps, button, modifiers }) => postJson('/api/input/drag-handle', { id, to, toId, delta, steps, button, modifiers }),
+    async ({ id, to, toId, delta, steps, button, modifiers, allowOccluded }) => postJson('/api/input/drag-handle', { id, to, toId, delta, steps, button, modifiers, allowOccluded }),
   );
 
   // ── type — trusted keyboard input into the focused element (Electron editor only) ──

@@ -771,8 +771,13 @@ so existing callers don't break; don't pass it.
 - **A tool result means what it says.** A tool that did nothing now FAILS; it does not return
   a cheerful `ok:true` with the bad news buried in a field. `unsavedChanges` on
   `get_editor_state` tells you where you stand. The re-audit swept this across the whole surface:
-  `tap_handle`/`drag_handle` refuse an off-screen/disabled handle and report `occluded` (a BOOLEAN,
-  always present) + `occludedBy`, per endpoint for `drag_handle` (S3.17);
+  `tap_handle`/`drag_handle` refuse an off-screen, disabled, or OCCLUDED handle and report
+  `occluded` (a BOOLEAN, always present) + `occludedBy`, per endpoint for `drag_handle` (S3.17) —
+  `allowOccluded:true` presses anyway. Occluded was a *warning that still dispatched* until
+  2026-08-19: a 2D gizmo handle under the SceneView's own toolbar pressed the TOOLBAR and answered
+  `ok:true`, and the covered press was filed as "the handle is completely inert" (testboard
+  5jE5Tip6Qwp7s7YVAYoH — it was not; the same handle moved the entity on the first try once it was
+  out from under the toolbar);
   `dispatch_action`/`play_clip` fail on an unknown name / stale guid / no-animator target;
   `reimport`/`import_file` fail on a no-match / unrecognized type; `timeline_set` fails when
   normalization drops a malformed item; `capture_gesture` requires the game Playing; and `diagnose`

@@ -224,10 +224,10 @@ advice itself, which is about the tool and not about any particular asset:
 
 ## 8. Related
 
-- [plans/court-tray-readability-plan.md](./plans/court-tray-readability-plan.md) — Court's live
-  art-direction record, and the only one since `court-art-direction.md` was retired on 2026-08-08.
-  Its "Absorbed from the retired art-direction doc" section carries the measurements that outlived
-  that brief, plus a ledger of what the brief specified and nobody built.
+- [../games/court/art.md](../games/court/art.md) — Court's art record: the approved reference set,
+  the owner rulings, the page/tray geometry with its measurements, the traps that generalise
+  (`outlineWidth` is normalised, a dark tint deletes a white master, a flat bar vanishes on some
+  region), and a ledger of what earlier briefs specified and nobody built.
 - [../games/court/art/README.md](../games/court/art/README.md) — Court's generation **recipes**: the
   two keying routes (white-on-black for a white subject, magenta for a coloured one), the grading
   step, and the acceptance test. Start here before generating a Court asset.

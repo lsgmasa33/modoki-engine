@@ -71,3 +71,50 @@ export function worldToLocalTransform(
     sx: _outScale.x, sy: _outScale.y, sz: _outScale.z,
   };
 }
+
+/** Signs of a scale triple at drag start — 0 for an axis that started at 0. */
+export interface ScaleSigns { x: number; y: number; z: number }
+
+/** Drag the scale gizmo far enough and the pointer crosses the pivot; three.js reads that as a
+ *  MIRROR and takes the scale negative (`TransformControls.js`: `if (pointEnd.dot(pointStart) < 0)
+ *  d *= -1`, and the per-axis branch's component divide does the same). The 2D gizmo already ruled
+ *  against that — `Gizmo2D`'s F9 clamps each ratio to >= 0 so crossing the pivot stops at 0 instead
+ *  of silently mirroring the entity — and 2D and 3D should not disagree about what the same gesture
+ *  means. So: an axis whose sign flipped during the drag lands on 0.
+ *
+ *  The signs are read from the OBJECT's scale, not from the decomposed local TRS, and that matters:
+ *  `Matrix4.decompose()` cannot represent a reflection in a TRS triple, so it parks the whole
+ *  negative determinant on X. A uniform mirror therefore decomposes to `(-s, +s, +s)` — which is
+ *  how testboard 1Rg36fFvZBdeNmUrtjs7 came to read as "the CENTER handle produces a NON-uniform,
+ *  sign-flipped scale on one axis". It is one mirror, not a per-axis asymmetry; measured
+ *  2026-08-19, and it reproduces from an ordinary camera, not the near-degenerate one that report
+ *  suspected.
+ *
+ *  An entity AUTHORED with a negative scale keeps it: only a sign CHANGE within the drag is caught.
+ */
+export function clampScaleCrossingPivot(local: TransformTRS, objScale: { x: number; y: number; z: number }, startSign: ScaleSigns | null): TransformTRS {
+  if (!startSign) return local;
+  return {
+    ...local,
+    sx: Math.sign(objScale.x) !== startSign.x ? 0 : local.sx,
+    sy: Math.sign(objScale.y) !== startSign.y ? 0 : local.sy,
+    sz: Math.sign(objScale.z) !== startSign.z ? 0 : local.sz,
+  };
+}
+
+/** Did this frame of a scale drag cross the pivot — i.e. has any axis changed sign since the press?
+ *
+ *  The MULTI-SELECT path needs the question rather than the clamp. There the drag scales every
+ *  member's OFFSET from the group pivot as well as its scale, so a mirrored frame does not merely
+ *  invert a scale: it throws the members through the pivot and out the other side. Measured
+ *  2026-08-19 on games/anim-bug — one 200x150 px drag past the pivot on a two-entity selection left
+ *  `Sun` at `sx:-600, sy:3229, sz:2291` and moved `Sphere` to `(953, 0, -15998)`. Clamping the
+ *  scale alone would leave those positions. The caller drops the whole frame instead, which stops
+ *  the drag at its last valid state — the same "crossing the pivot stops, it does not mirror" rule
+ *  `Gizmo2D`'s F9 sets for 2D and `clampScaleCrossingPivot` sets for a single entity. */
+export function scaleCrossedPivot(objScale: { x: number; y: number; z: number }, startSign: ScaleSigns | null): boolean {
+  if (!startSign) return false;
+  return Math.sign(objScale.x) !== startSign.x
+    || Math.sign(objScale.y) !== startSign.y
+    || Math.sign(objScale.z) !== startSign.z;
+}

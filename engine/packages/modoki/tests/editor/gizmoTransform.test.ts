@@ -11,6 +11,8 @@ import { describe, it, expect } from 'vitest';
 import * as THREE from 'three';
 import {
   worldToLocalTransform,
+  clampScaleCrossingPivot,
+  scaleCrossedPivot,
   type TransformTRS,
 } from '../../src/editor/scene/gizmoTransform';
 
@@ -94,5 +96,77 @@ describe('worldToLocalTransform', () => {
     const wrong = worldToLocalTransform(obj, null);
     expect(wrong.x).toBeCloseTo(11, 5);
     expect(wrong.x).not.toBeCloseTo(local.x, 1);
+  });
+});
+
+
+/** A scale drag that crosses the pivot must STOP at 0, not mirror the entity — the 3D twin of
+ *  Gizmo2D's F9 clamp. Testboard 1Rg36fFvZBdeNmUrtjs7. */
+describe('clampScaleCrossingPivot', () => {
+  const base: TransformTRS = { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 };
+  const positive = { x: 1, y: 1, z: 1 };
+
+  it('passes an ordinary positive scale through untouched', () => {
+    const local = { ...base, sx: 2.5, sy: 2.5, sz: 2.5 };
+    expect(clampScaleCrossingPivot(local, { x: 2.5, y: 2.5, z: 2.5 }, positive)).toEqual(local);
+  });
+
+  it('zeroes ALL THREE axes for a uniform mirror, despite decompose parking the sign on X alone', () => {
+    // three applied d = -14.7 to every axis; decompose reports (-14.7, +14.7, +14.7).
+    const local = { ...base, sx: -14.7, sy: 14.7, sz: 14.7 };
+    const out = clampScaleCrossingPivot(local, { x: -14.7, y: -14.7, z: -14.7 }, positive);
+    expect([out.sx, out.sy, out.sz]).toEqual([0, 0, 0]);
+  });
+
+  it('zeroes only the axis that flipped on a single-axis drag', () => {
+    const local = { ...base, sx: -3, sy: 1, sz: 1 };
+    const out = clampScaleCrossingPivot(local, { x: -3, y: 1, z: 1 }, positive);
+    expect([out.sx, out.sy, out.sz]).toEqual([0, 1, 1]);
+  });
+
+  it('KEEPS an authored negative scale — only a sign change within the drag is caught', () => {
+    const local = { ...base, sx: -6, sy: 2, sz: 2 };
+    const out = clampScaleCrossingPivot(local, { x: -6, y: 2, z: 2 }, { x: -1, y: 1, z: 1 });
+    expect([out.sx, out.sy, out.sz]).toEqual([-6, 2, 2]);
+  });
+
+  it('is a no-op when no start sign was captured', () => {
+    const local = { ...base, sx: -6, sy: 2, sz: 2 };
+    expect(clampScaleCrossingPivot(local, { x: -6, y: 2, z: 2 }, null)).toEqual(local);
+  });
+
+  it('leaves rotation and position alone', () => {
+    const local = { ...base, x: 3, rx: 0.5, sx: -1, sy: -1, sz: -1 };
+    const out = clampScaleCrossingPivot(local, { x: -1, y: -1, z: -1 }, positive);
+    expect(out.x).toBe(3);
+    expect(out.rx).toBe(0.5);
+  });
+});
+
+
+/** The MULTI-SELECT half of the same rule. A group scale spreads every member's offset from the
+ *  pivot by the ratio, so a mirrored frame throws them through it — measured at `sy:3229` and a
+ *  member at `(953, 0, -15998)` before the guard. The caller drops such a frame entirely. */
+describe('scaleCrossedPivot', () => {
+  const positive = { x: 1, y: 1, z: 1 };
+
+  it('is false for an ordinary shrink or grow', () => {
+    expect(scaleCrossedPivot({ x: 0.2, y: 0.2, z: 0.2 }, positive)).toBe(false);
+    expect(scaleCrossedPivot({ x: 9, y: 9, z: 9 }, positive)).toBe(false);
+  });
+
+  it('is true the moment ANY axis changes sign — one mirrored axis is a crossed pivot', () => {
+    expect(scaleCrossedPivot({ x: -1, y: -1, z: -1 }, positive)).toBe(true);
+    expect(scaleCrossedPivot({ x: -1, y: 1, z: 1 }, positive)).toBe(true);
+  });
+
+  it('respects a selection that STARTED mirrored, so an authored flip is not a crossing', () => {
+    const mirrored = { x: -1, y: 1, z: 1 };
+    expect(scaleCrossedPivot({ x: -4, y: 4, z: 4 }, mirrored)).toBe(false);
+    expect(scaleCrossedPivot({ x: 4, y: 4, z: 4 }, mirrored)).toBe(true);
+  });
+
+  it('is false when no start sign was captured — never block a drag on a missing baseline', () => {
+    expect(scaleCrossedPivot({ x: -1, y: -1, z: -1 }, null)).toBe(false);
   });
 });

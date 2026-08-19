@@ -9,7 +9,7 @@
  *  button) is what Electron verification is for — see the plan's working agreements. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { resolveDomPoint, resolveDomPointReport, describeElement } from '../../app/debug/domResolve';
+import { resolveDomPoint, resolveDomPointReport, describeElement, describeOccluder } from '../../app/debug/domResolve';
 
 /** Give `el` a real-looking rect. jsdom reports all zeroes otherwise. */
 function stubRect(el: Element, r: { left: number; top: number; width: number; height: number }) {
@@ -218,5 +218,35 @@ describe('resolveDomPointReport (serializable — the trusted-input path)', () =
   it('reports nothing at the coordinates as a failure rather than aiming blindly', () => {
     stubTopmost(null);
     expect(resolveDomPointReport({ x: 5, y: 5 })).toMatchObject({ ok: false, error: 'no element at (5, 5)' });
+  });
+});
+
+
+/** An occluder the caller cannot ACT on is barely better than none. `describeElement` bottoms out
+ *  at the bare tag for a style-only element, and the editor's panel chrome is exactly that: the
+ *  SceneView toolbar strip that covered a 2D gizmo handle (testboard 5jE5Tip6Qwp7s7YVAYoH) is an
+ *  anonymous div, and "covered by div" is what the report said. */
+describe('describeOccluder', () => {
+  it('keeps an already-identifiable description as-is', () => {
+    document.body.innerHTML = '<div class="menu"><button data-ui-id="x.y"></button></div>';
+    expect(describeOccluder(document.querySelector('button')!)).toBe('button[data-ui-id="x.y"]');
+    expect(describeOccluder(document.querySelector('div')!)).toBe('div.menu');
+  });
+
+  it('names the PANEL an anonymous element sits in', () => {
+    document.body.innerHTML = '<div data-editor-panel="scene"><div><div id="strip"></div></div></div>';
+    document.getElementById('strip')!.removeAttribute('id');
+    const anon = document.querySelector('[data-editor-panel] div div')!;
+    expect(describeOccluder(anon)).toBe('div in the "scene" panel');
+  });
+
+  it('falls back to the nearest NAMED ancestor when no panel is in the chain', () => {
+    document.body.innerHTML = '<section class="overlay"><div><span></span></div></section>';
+    // The intermediate div names nothing either, so the walk keeps going.
+    expect(describeOccluder(document.querySelector('span')!)).toBe('span inside section.overlay');
+  });
+
+  it('answers null for no element at all', () => {
+    expect(describeOccluder(null)).toBeNull();
   });
 });
