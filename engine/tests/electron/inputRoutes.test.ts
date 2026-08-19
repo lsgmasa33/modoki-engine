@@ -53,11 +53,34 @@ function makeRenderer(overrides?: Record<string, unknown>) {
       const sel = (params as { selector: string }).selector;
       if (sel === '#kebab') return { ok: true, x: 210, y: 110, matched: 'button#kebab', hitTarget: 'button#kebab', occluded: false };
       if (sel === '#covered') return { ok: true, x: 50, y: 60, matched: 'button#covered', hitTarget: 'div.menu', occluded: true };
+      // Scrolled out of its own list: occluded, but by the chrome BEHIND it, not by something on top.
+      if (sel === '#scrolled-out') return { ok: true, x: 20, y: 483, matched: 'div#scrolled-out', hitTarget: 'div.flexlayout__splitter', occluded: true, clipped: true };
       return { ok: false, error: `no element matches selector "${sel}"` };
     }
     if (op === 'resolve-entity-point') {
       const spec = (params ?? {}) as { guid?: string; name?: string; id?: number; allowOccluded?: boolean };
       // 'Puck' is a 3D scene entity — canvas-scope occlusion, nothing covering it.
+      // Hit-test found NO element: the point is clipped away or past the window edge. `hitTarget`
+      // is the shared NOTHING_AT_POINT sentinel, not a describable cover.
+      if (spec.name === 'EdgeCube') {
+        return {
+          ok: true, x: 1000, y: 300,
+          entity: { id: 11, name: 'EdgeCube', guid: 'g-edge', layer: '3d' },
+          matched: 'EdgeCube [g-edge]', hitTarget: 'nothing (clipped or off-window)',
+          occluded: true, occlusionScope: 'canvas', surface: 'game-3d',
+        };
+      }
+      // 'entity' scope, picker FOUND the target, and a modal covers the canvas over it — the
+      // combination the suite had no fixture for.
+      if (spec.name === 'CoveredHero') {
+        return {
+          ok: true, x: 420, y: 260,
+          entity: { id: 12, name: 'CoveredHero', guid: 'g-covhero', layer: '3d' },
+          matched: 'CoveredHero [g-covhero]', hitTarget: 'div.modal',
+          occluded: true, occlusionScope: 'entity', surface: 'scene-view',
+          occludedByEntity: null, aimedAt: 'centre',
+        };
+      }
       if (spec.guid === 'g-puck' || spec.name === 'Puck') {
         return {
           ok: true, x: 400, y: 300,
@@ -111,13 +134,15 @@ function makeRenderer(overrides?: Record<string, unknown>) {
       // below is the realistic shape for a keyframe/bone/vertex handle — the majority case that
       // the old `occluded: occludedBy !== undefined` derivation answered `false` for, asserting a
       // check that never ran.
-      const known: Array<{ id: string; x: number; y: number; onScreen?: boolean; occludedBy?: string; occlusionChecked?: boolean; meta?: { disabled?: boolean } }> = [
+      const known: Array<{ id: string; x: number; y: number; onScreen?: boolean; clipped?: boolean; occludedBy?: string; occlusionChecked?: boolean; meta?: { disabled?: boolean } }> = [
         { id: 'bone.0', x: 11, y: 22, occlusionChecked: true },
         { id: 'bone.1', x: 90, y: 80, occlusionChecked: true },
         { id: 'bone.off', x: -5, y: 400, onScreen: false },
         { id: 'bone.disabled', x: 30, y: 30, onScreen: true, meta: { disabled: true } },
         { id: 'bone.covered', x: 40, y: 40, onScreen: true, occludedBy: 'div.modal', occlusionChecked: true },
         { id: 'bone.canvas', x: 60, y: 60, onScreen: true },
+        // Inside the window, outside its own panel's clip box (testboard AceYUBoBXbcGtIIFmzGb).
+        { id: 'grad.clipped', x: 200, y: 863, onScreen: false, clipped: true, occlusionChecked: true },
       ];
       return { handles: known.filter((h) => wanted.includes(h.id)) };
     }
@@ -602,10 +627,30 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
   //    Occluded was a warning-that-still-dispatched until 2026-08-19: a 2D gizmo handle sitting
   //    under the SceneView's own toolbar pressed the TOOLBAR and answered ok:true, which was filed
   //    as "the handle is completely inert" (testboard 5jE5Tip6Qwp7s7YVAYoH — it was not). ──
+  it('a SCROLLED-OUT selector is refused with the scroll remedy, not "dismiss the modal"', async () => {
+    // The covering element is an anonymous splitter either way, so its name cannot tell the caller
+    // which fix applies. `clipped` can.
+    const res = await post('/api/input/tap', { selector: '#scrolled-out' }) as { status: number; body: { error: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/SCROLLED OUT/);
+    expect(res.body.error).toMatch(/modoki_scroll/);
+    expect(res.body.error).not.toMatch(/an open menu, a modal/);
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
   it('tap-handle REFUSES an off-screen handle (ok:false) and dispatches nothing', async () => {
     const res = await post('/api/input/tap-handle', { id: 'bone.off' }) as { body: { ok: boolean; error: string } };
     expect(res.body.ok).toBe(false);
     expect(res.body.error).toMatch(/off-screen/);
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('a CLIPPED handle is refused with the remedy that actually applies, not "scroll it"', async () => {
+    // Off the PANEL, not off the window: the press would land on whichever panel owns those
+    // pixels, and telling the caller to scroll is wrong for a handle drawn past a viewport edge.
+    const res = await post('/api/input/tap-handle', { id: 'grad.clipped' }) as { body: { ok: boolean; error: string } };
+    expect(res.body.ok).toBe(false);
+    expect(res.body.error).toMatch(/OUTSIDE its own panel/);
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
@@ -728,9 +773,95 @@ describe('entity-aimed input (the third target surface)', () => {
     // canvas scope: `occluded:false` says nothing about a mesh in FRONT of the target.
     const mesh = await post('/api/input/tap', { entity: { guid: 'g-puck' } });
     expect((mesh as { body: unknown }).body).toMatchObject({ occluded: false, occlusionScope: 'canvas' });
-    // element scope: a real DOM comparison, so this one is trustworthy.
-    const ui = await post('/api/input/tap', { entity: { name: 'StartButton' } });
+    // element scope, COVERED: this used to dispatch and report {occluded:true, ok:true}. The scope
+    // is still reported — on the forced path, which is the only one that presses a covered target.
+    const ui = await post('/api/input/tap', { entity: { name: 'StartButton' }, allowOccluded: true });
     expect((ui as { body: unknown }).body).toMatchObject({ occluded: true, occlusionScope: 'element', hitTarget: 'div.modal' });
+  });
+
+  it('REFUSES a covered ENTITY aim, on every scope — §3 binds `entity` and `selector` alike', async () => {
+    // The OLD expectation (asserted right above until 2026-08-19) was that a UI button under an
+    // open modal resolves, dispatches, and comes back ok:true with occluded:true. That is the §0
+    // rank-1 false success: the press went to the modal. Only the MESH half of §3's rule was
+    // implemented — the picker's "another entity is in front" — while DOM-level covering was a
+    // flag on all three scopes.
+    const res = await post('/api/input/tap', { entity: { name: 'StartButton' } }) as { status: number; body: { error: string; code?: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('OCCLUDED');
+    expect(res.body.error).toMatch(/covered by div\.modal/);
+    expect(res.body.error).toMatch(/allowOccluded/);
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('NOTHING at the point gets its own remedy — you cannot dismiss "nothing"', async () => {
+    // centreIsInWindow admits x === innerWidth while elementFromPoint is exclusive at that edge, so
+    // a rect flush against the right/bottom of the window resolves to a point with no element at
+    // all. The generic message told the caller to "dismiss/move what covers it" — which the same
+    // sentence calls "nothing".
+    const res = await post('/api/input/tap', { entity: { name: 'EdgeCube', surface: 'game-3d' } }) as { status: number; body: { error: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/NOTHING at it/);
+    expect(res.body.error).toMatch(/Move the camera/);
+    expect(res.body.error).not.toMatch(/Dismiss\/move what covers it/);
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('refuses a covered entity aim on hover, scroll and BOTH drag endpoints too, not just tap', async () => {
+    // The guard is shared, but nothing asserted it for these routes — only selector-addressed
+    // covers were tested there, so an entity-specific regression could pass the suite.
+    const hover = await post('/api/input/hover', { entity: { name: 'StartButton' } }) as { status: number };
+    const scroll = await post('/api/input/scroll', { entity: { name: 'StartButton' }, deltaY: 100 }) as { status: number };
+    const dragFrom = await post('/api/input/drag', { from: { entity: { name: 'StartButton' } }, to: { x: 5, y: 5 } }) as { status: number };
+    const dragTo = await post('/api/input/drag', { from: { x: 5, y: 5 }, to: { entity: { name: 'StartButton' } } }) as { status: number };
+    expect([hover.status, scroll.status, dragFrom.status, dragTo.status]).toEqual([400, 400, 400, 400]);
+    expect(ops.hover).not.toHaveBeenCalled();
+    expect(ops.scroll).not.toHaveBeenCalled();
+    expect(ops.drag).not.toHaveBeenCalled();
+  });
+
+  it("the 'entity' scope refuses when the picker FOUND the target but a modal covers the canvas", async () => {
+    // Two independent occluders, and only the mesh one was ever refused: the pick succeeds, so the
+    // surface WOULD select the entity — but the click never reaches the canvas at all.
+    const res = await post('/api/input/tap', { entity: { name: 'CoveredHero', surface: 'scene-view' } }) as { status: number; body: { error: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/covered by div\.modal/);
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('one flag, one answer: entity.allowOccluded:false + top-level true refuses BOTH kinds of cover', async () => {
+    // §9 — the merge was written twice and the copies disagreed in exactly this combination.
+    // `resolvePoint` sends the renderer `entity.allowOccluded ?? allowOccluded` = false, so
+    // entityResolve refuses a PICKER-occluded aim; a re-derived `!false && !true` in the route
+    // waved a DOM-occluded one through. Which cover was in the way decided the behaviour.
+    const res = await post('/api/input/tap', {
+      entity: { name: 'StartButton', allowOccluded: false }, allowOccluded: true,
+    }) as { status: number; body: { code?: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('OCCLUDED');
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('…and a held gesture\'s move/up is never refused — it goes to whatever captured the press', async () => {
+    // The one carve-out §3 names, and it is about DELIVERY rather than aim: what sits under the
+    // destination cannot stop a captured drag. inputRoutes forces allowOccluded for non-`down`.
+    await post('/api/input/pointer', { action: 'down', entity: { guid: 'g-puck' } });
+    const moved = await post('/api/input/pointer', { action: 'move', entity: { name: 'StartButton' } }) as { status: number };
+    expect(moved.status).not.toBe(400);
+    expect(ops.pointerMove).toHaveBeenCalled();
+  });
+
+  it('…and an explicit entity.allowOccluded:false does NOT re-impose a refusal on that move', async () => {
+    // The carve-out is about DELIVERY — the press already captured the target — so it overrides
+    // the caller's flag instead of losing to it via `??`. Before this, the top-level force reached
+    // only the top-level field and the explicit false won at the entity layer, refusing a move
+    // mid-gesture and stranding the held press.
+    await post('/api/input/pointer', { action: 'down', entity: { guid: 'g-puck' } });
+    const moved = await post('/api/input/pointer', {
+      action: 'move', entity: { name: 'StartButton', allowOccluded: false },
+    }) as { status: number };
+    expect(moved.status).not.toBe(400);
+    expect(ops.pointerMove).toHaveBeenCalled();
+    await post('/api/input/pointer', { action: 'up', entity: { guid: 'g-puck' } });
   });
 
   it('refuses an ambiguous name instead of picking one — and dispatches nothing', async () => {

@@ -1096,7 +1096,7 @@ export function registerTools(server: McpServer) {
       'iOS only: `source:"wda"` captures the WHOLE DEVICE SCREEN via WebDriverAgent instead of the ' +
       'app\'s own capture — the only way to see a system permission/ATT dialog, springboard, or ' +
       'anything outside the app. Its pixels are DEVICE-screen coordinates and must NOT be fed to ' +
-      'device_tap/device_drag (aim by selector/entity instead).',
+      'device_tap/device_drag (aim by `selector` instead — this surface has no `entity` addressing).',
     {
       savePath: z.string().optional().describe('Where to save (e.g., /tmp/screenshot.jpg). Defaults to a temp file.'),
       inline: z.boolean().optional().describe('Also embed the image in the response. Large — only when you need to SEE it.'),

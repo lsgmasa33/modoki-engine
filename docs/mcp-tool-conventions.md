@@ -347,7 +347,8 @@ These three needed owner sign-off because each changes the advertised surface. A
    its `action:'set'` is already a different method on the wire and is declared as `varies`.
 
 4. **§3 occlusion refusal on the SELECTOR path — LANDED (2026-08-19).** `entity` aims had refused
-   since 2026-07-29 and the DEVICE surface refused a covered selector from the start
+   since 2026-08-02 (`609663e75`; 2026-07-29 added entity ADDRESSING, not the refusal) and the
+   DEVICE surface refused a covered selector from the start
    (`device_tap`: *"an OCCLUDED target is refused here rather than tapping something else"*), while
    the editor's selector path pressed anyway and reported `ok:true` with `occluded:true` in a
    field — §9's "a rule implemented twice diverges", and a rank-1 false success on the ranking in

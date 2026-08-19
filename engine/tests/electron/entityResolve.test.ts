@@ -472,3 +472,54 @@ describe('2D/3D entities with a pick provider (entity scope)', () => {
     expect(aimPuck()).toMatchObject({ ok: true, occlusionScope: 'canvas' });
   });
 });
+
+describe('the aim point must be on the surface that was ASKED FOR', () => {
+  /** A canvas inside a named editor host, as the real DOM has it: the SceneView's canvas lives
+   *  under `[data-scene-viewport]`, the Game panel's under `[data-game-view-area]`. */
+  const hostedCanvas = (marker: 'data-game-view-area' | 'data-scene-viewport') => {
+    const host = document.createElement('div');
+    host.setAttribute(marker, '');
+    const c = document.createElement('canvas');
+    host.appendChild(c);
+    document.body.appendChild(host);
+    return c;
+  };
+
+  it('REFUSES a game-3d aim whose centre lands on the Scene panel\'s canvas', () => {
+    // The editor puts the two canvases side by side (measured on games/3d-test at 1600x968: Game
+    // 3D x 0-366, SceneView x 370-736), and a rect straddling the Game canvas's edge has its
+    // CENTRE on the SceneView. Every check downstream is then answering about the wrong surface:
+    // the pick says "nothing there" and the DOM check sees *a* canvas and calls it clean. Measured
+    // 2026-08-19 before this guard: ok:true, occluded:false, and the click focused the Scene panel.
+    stubTopmost(hostedCanvas('data-scene-viewport'));
+    const r = aimPuck();
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('the Scene panel');
+    expect(r.code).toBe('OCCLUDED');
+  });
+
+  it('REFUSES a scene-view aim whose centre lands on the Game panel\'s canvas', () => {
+    collectScreenBounds.mockReturnValue([{ ...bounds()[0], surface: 'scene-view' }]);
+    stubTopmost(hostedCanvas('data-game-view-area'));
+    const r = resolveEntityPointReport({ guid: 'g-puck', surface: 'scene-view' });
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('the Game panel');
+  });
+
+  it('allows the aim when the canvas belongs to the surface that was asked for', () => {
+    stubTopmost(hostedCanvas('data-game-view-area'));
+    expect(aimPuck()).toMatchObject({ ok: true, occlusionScope: 'canvas' });
+  });
+
+  it('an UNMARKED canvas stays permissive — a shipped game carries neither host marker', () => {
+    // The markers are editor chrome. Reading "not in the Game panel" as "foreign" would refuse
+    // every aim in a real game build, where the canvas is under neither.
+    stubTopmost(document.createElement('canvas'));
+    expect(aimPuck()).toMatchObject({ ok: true, occlusionScope: 'canvas' });
+  });
+
+  it('allowOccluded does NOT open it — nothing is covering the target, the aim is on the wrong surface', () => {
+    stubTopmost(hostedCanvas('data-scene-viewport'));
+    expect(aimPuck({ allowOccluded: true })).toMatchObject({ ok: false });
+  });
+});

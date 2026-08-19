@@ -194,6 +194,46 @@ describe('resolveDomPointReport (serializable — the trusted-input path)', () =
     expect(r.hitTarget).toBeNull();
   });
 
+  it('SCROLLED OUT of its own list is flagged `clipped`, not just "covered"', () => {
+    // A Hierarchy row below the fold reports a real rect at its LAID-OUT position, so the centre
+    // lands on whatever chrome owns those pixels — usually an anonymous splitter div. Naming that
+    // div told the caller to "dismiss the menu/modal covering it", which is not what is wrong and
+    // not a thing they can do. Measured by an independent sweep of this editor's live selectors on
+    // 2026-08-19: 12 of 22 occluded hits were this class.
+    const list = document.createElement('div');
+    list.style.overflow = 'auto';
+    stubRect(list, { left: 0, top: 0, width: 200, height: 462 });
+    const row = document.createElement('div');
+    row.setAttribute('data-ui-id', 'hierarchy.entity.abc');
+    list.appendChild(row);
+    document.body.appendChild(list);
+    stubRect(row, { left: 0, top: 471, width: 200, height: 24 });   // scrolled past the clip
+    const splitter = document.createElement('div');
+    splitter.className = 'flexlayout__splitter';
+    document.body.appendChild(splitter);
+    stubTopmost(splitter);
+
+    const r = resolveDomPointReport({ selector: '[data-ui-id="hierarchy.entity.abc"]' });
+    expect(r.occluded).toBe(true);
+    expect(r.clipped).toBe(true);
+    expect(r.hitTarget).toContain('splitter');
+  });
+
+  it('…and a genuinely COVERED target is not flagged clipped — the two need different fixes', () => {
+    const btn = document.createElement('button');
+    btn.setAttribute('data-ui-id', 'inspector.kebab');
+    document.body.appendChild(btn);
+    stubRect(btn, { left: 300, top: 50, width: 14, height: 14 });
+    const menu = document.createElement('div');
+    menu.className = 'context-menu';
+    document.body.appendChild(menu);
+    stubTopmost(menu);
+
+    const r = resolveDomPointReport({ selector: '[data-ui-id="inspector.kebab"]' });
+    expect(r.occluded).toBe(true);
+    expect(r.clipped).toBeUndefined();
+  });
+
   it('a coordinate spec passes through and reports only what is under it', () => {
     const el = document.createElement('canvas');
     stubTopmost(el);
@@ -226,6 +266,31 @@ describe('resolveDomPointReport (serializable — the trusted-input path)', () =
  *  at the bare tag for a style-only element, and the editor's panel chrome is exactly that: the
  *  SceneView toolbar strip that covered a 2D gizmo handle (testboard 5jE5Tip6Qwp7s7YVAYoH) is an
  *  anonymous div, and "covered by div" is what the report said. */
+describe('naming a cover that has nothing but a title', () => {
+  it('falls back to `title` before the bare tag', () => {
+    // Measured 2026-08-19 in a live editor: a tap at a game-ui entity while the sim is STOPPED is
+    // correctly refused — the Game panel lays a full-panel shield over the game — but the cover was
+    // reported as "div inside div.flexlayout__tab_moveable", which is true and unactionable. The
+    // shield's own title is the remedy, so it belongs in the refusal.
+    const shield = document.createElement('div');
+    shield.setAttribute('title', 'Press Play to run the game and interact with its UI');
+    document.body.appendChild(shield);
+    expect(describeElement(shield)).toBe('div[title="Press Play to run the game and interact with its UI"]');
+  });
+
+  it('a class still wins over a title, and a long title is trimmed', () => {
+    const named = document.createElement('div');
+    named.className = 'context-menu';
+    named.setAttribute('title', 'whatever');
+    expect(describeElement(named)).toBe('div.context-menu');
+    const wordy = document.createElement('div');
+    wordy.setAttribute('title', 'x'.repeat(200));
+    const d = describeElement(wordy)!;
+    expect(d.length).toBeLessThan(100);
+    expect(d.endsWith('…"]')).toBe(true);
+  });
+});
+
 describe('describeOccluder', () => {
   it('keeps an already-identifiable description as-is', () => {
     document.body.innerHTML = '<div class="menu"><button data-ui-id="x.y"></button></div>';

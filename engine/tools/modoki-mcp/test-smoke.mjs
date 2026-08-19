@@ -337,6 +337,14 @@ const uc3 = JSON.parse(text(await client.callTool({ name: 'modoki_batch', argume
   // legitimately returns "Boat Hull" for every one of the 25 sampled points, and #15's
   // occlusion check correctly REFUSES. That is the tool being right and the fixture being
   // unreproducible. focus_entity makes the precondition something this suite controls.
+  //
+  // ⚠️ The SCENE is not controlled the same way, and a failed run poisons the next one. UC8 swaps
+  // scenes and restores at the end — so a run that DIES before that restore (UC3 itself throwing,
+  // say) leaves the editor remembering the swapped scene, and the next `launch-editor.sh` reopens
+  // it. UC3 then SKIPS ("no entity named 'cube' in the OPEN scene") and later cases fail on a
+  // fixture nobody chose. Measured 2026-08-19, three runs to work out. Launch the gate with the
+  // scene PINNED — `launch-editor.sh games/3d-test --scene tropical-island` — and it is
+  // reproducible.
   { tool: 'modoki_focus_entity', args: { guid: CUBE_GUID }, result: 'none' },
   { tool: 'wait', args: { ms: 200 }, result: 'none' },
   { tool: 'modoki_tap', args: { entity: { name: 'cube', surface: 'scene-view' } } },

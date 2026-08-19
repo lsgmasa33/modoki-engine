@@ -52,18 +52,25 @@ const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : a
 // profile, and clobbering it is the same class of bug in reverse. (The CSP smoke launches
 // the packaged app with one.)
 if (shouldOverrideUserData(process.argv)) {
-  app.setPath('userData', resolveUserDataDir({
+  // §14.4: several editors run inside ONE clone under MODOKI_MULTI and would otherwise
+  // share this clone's profile → LevelDB single-writer fight. Give each its own
+  // sub-profile keyed on the project it opened (stable across relaunch, distinct between
+  // co-running editors). Only under MULTI, so the normal single-editor case is unchanged.
+  const profileSubKey = process.env.MODOKI_MULTI ? multiProfileKey(process.env.MODOKI_PROJECT) : null;
+  const base = resolveUserDataDir({
     appData: app.getPath('appData'),
     isPackaged: app.isPackaged,
     repoRoot: app.isPackaged
       ? path.join(process.resourcesPath, 'app.asar.unpacked')
       : path.resolve(__dirname, '..', '..', '..'),
-    // §14.4: several editors run inside ONE clone under MODOKI_MULTI and would otherwise
-    // share this clone's profile → LevelDB single-writer fight. Give each its own
-    // sub-profile keyed on the project it opened (stable across relaunch, distinct between
-    // co-running editors). Only under MULTI, so the normal single-editor case is unchanged.
-    subKey: process.env.MODOKI_MULTI ? multiProfileKey(process.env.MODOKI_PROJECT) : null,
-  }));
+    subKey: null,
+  });
+  app.setPath('userData', profileSubKey ? path.join(base, profileSubKey) : base);
+  // …but the UI PREFS follow the clone, not the sub-profile. The split exists for Chromium's
+  // single-writer LevelDB; a zoom level is our own atomically-written file and belongs to the
+  // human, so letting a MULTI launch strand it in a sibling directory just looks like "the
+  // persisted zoom is never restored" (testboard q1k7p2hGZB9lGvYi11go). See setUiPrefsDir.
+  setUiPrefsDir(base);
 }
 
 // Adopt a pre-existing toolchain instead of re-fetching ~1.2GB. Pinning the toolchain dir
@@ -105,7 +112,7 @@ import { vendorEnginePlugins, writeVendorMarker, type VendorResult } from '../pl
 import { composeDepsInstallError } from './projectDeps';
 import { healNativeConfig } from '../plugins/healNativeConfig';
 import { setupAutoUpdate, checkForUpdatesInteractive, isUpdateInstalling } from './autoUpdate';
-import { restoreZoom, handleZoom } from './zoom';
+import { restoreZoom, handleZoom, setUiPrefsDir } from './zoom';
 import { registerReimportHandler } from '../plugins/reimport-registry';
 import { textureReimportHandler } from '../plugins/reimport-texture';
 import { modelReimportHandler } from '../plugins/reimport-model';

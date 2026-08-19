@@ -158,6 +158,59 @@ GAME view. Two consequences that are easy to get backwards:
   `userData.noBounds` prunes such a subtree, and the flag is set beside the raycast override so
   the two cannot drift.
 
+### A covered aim is refused on EVERY scope (2026-08-19)
+
+`mcp-tool-conventions.md` §3 says a resolvable aim that something covers is refused, and that the
+rule "binds `entity` and `selector` alike — they are the same category". Only the MESH half was
+implemented: `entityResolve` refuses when the surface's own picker names another entity in front.
+DOM-level covering — a modal, a menu, a panel over the viewport — was reported as `occluded:true`
+and **dispatched anyway**, on all three scopes. A tap aimed at a UI button under an open dialog
+pressed the dialog and answered `ok:true`. That is the §0 rank-1 false success, and the contract had
+already decided it; this was a gap, not a policy question.
+
+`allowOccluded:true` is the escape hatch and now has an effect on the canvas scope too (its
+description said it did not). The two carve-outs §3 names are unchanged: raw `{x,y}` is never
+refused, and a held gesture's `move`/`up` goes to whatever captured the press — `inputRoutes` forces
+`allowOccluded` for any `pointer` action other than `down`, so occlusion at the destination cannot
+break a legitimate drag — and it forces it on the ENTITY spec as well as the top-level field,
+because the two merge with `??` and a caller's explicit `entity:{allowOccluded:false}` would
+otherwise win and refuse a move the press had already captured. The carve-out is a fact about
+delivery, not a preference, so it overrides; `??` stays the right precedence everywhere the flag
+really is the caller's intent.
+
+### The aim point must be ON the surface, and INSIDE the panel (2026-08-19)
+
+Two aims, one mistake, found one after the other: a coordinate is judged against the WINDOW when
+the boundary that matters is the panel it belongs to.
+
+- **`handles`' `onScreen`** compared the point to `window.innerWidth/Height` only. A docked panel
+  is an `overflow`-clipped box and `getBoundingClientRect()` on something scrolled out of one still
+  reports its laid-out position — for a Particle Editor two-and-a-half screens tall, hundreds of px
+  below the panel, on top of whichever panel owns those pixels. `computeHandles` now intersects the
+  clip box of every clipping ancestor **including the owner itself** (the Dopesheet and Curves
+  editors hand out their own `overflow:hidden` container as `owner` and compute each handle's x
+  unclamped from `timeToX`, so a keyframe panned out of the time window sits beside the container,
+  over the TrackList). Testboard `AceYUBoBXbcGtIIFmzGb`.
+- **The `selector` aim** had the same blind spot with a worse symptom: a Hierarchy row below the
+  fold resolves to a real rect whose centre lands on a splitter, so the refusal blamed "an open
+  menu, a modal, a panel that overlaps" — none of them true, none of them actionable. A sweep of
+  this editor's live `[data-ui-id]` set found 12 of 22 occluded hits were this class. Both paths now
+  share `withinClip` and report **`clipped`**, which is what picks the remedy: *scroll/enlarge the
+  panel* versus *dismiss what covers it*. The covering element's name cannot distinguish them —
+  it is an anonymous `div` either way.
+- **An `entity` aim on a canvas surface** could resolve onto a DIFFERENT panel's canvas entirely.
+  The editor puts the Game panel's canvases beside the SceneView's (measured on `games/3d-test`,
+  1600×968: Game 3D at x 0–366, SceneView at x 370–736), an entity's rect may straddle its own
+  canvas's edge with its centre outside, and the DOM check accepted *any* `<canvas>` as "the click
+  reached the surface". Measured: `modoki_tap {entity: Plane029, surface:'game-3d'}` at (402,186)
+  answered `ok:true, occluded:false` and the editor journal recorded `!focus {panel:"scene"}` — the
+  click drove the Scene panel. The canvas must now belong to the surface that was named, decided
+  from the two host markers that exist (`[data-game-view-area]`, `[data-scene-viewport]`) and
+  **positively in both directions**: a canvas under neither — a shipped game's — stays permissive,
+  because the markers are editor chrome and reading their absence as "foreign" would refuse every
+  runtime aim. `allowOccluded` does not open it: nothing is covering the target, the coordinate is
+  simply not on the surface that was asked for.
+
 ## The original gap
 
 Percept can locate ECS entities via bounds providers, but those providers are only three —
@@ -484,9 +537,10 @@ Follow-ups:
 - [ ] **Audit the rest of the surviving findings.** The audit produced 19 that survived refutation;
       3 were measured and fixed. Unverified-but-plausible remainders worth measuring: `hover` never
       un-hovers (sticky hover state inherited by later ops), `scroll` takes no `modifiers` (so
-      Ctrl/Cmd+wheel paths are unreachable), `handles`' `onScreen` is window-relative rather than
-      clipped to the owning panel, and `capture_gesture`'s `t` is an interpolation fraction with no
-      time axis at all — which is odd for the op whose whole purpose is measuring input *feel*.
+      Ctrl/Cmd+wheel paths are unreachable), and `capture_gesture`'s `t` is an interpolation
+      fraction with no time axis at all — which is odd for the op whose whole purpose is measuring
+      input *feel*. (`handles`' window-relative `onScreen` was on this list; measured and fixed
+      2026-08-19 — see "The aim point must be ON the surface, and INSIDE the panel".)
 ### `dnd`: accepted ≠ committed (measured + fixed 2026-07-22)
 
 The prediction above was **confirmed**. Dropping a texture on a Hierarchy entity row returned
@@ -564,6 +618,29 @@ only input tool that carries none of the shared `matched`/`hitTarget`/`occluded`
 runs through the editor-action relay rather than `/api/input/*`. Both facts are now in the tool
 description instead of being discoverable only by trying. Its endpoints are strict + refined, so `to:{}`
 and a misspelled `selecter` are refused rather than reaching the relay as "no aim at all".
+
+**And it does not occlusion-check either endpoint — deliberately, for a reason the other aims do not
+have.** §3's rule refuses a covered aim because *the input would land on the covering element*; that
+rationale does not hold here. `performDomDnd` resolves with `resolveDomPoint` (which computes no
+occlusion at all) and then dispatches `dragstart`/`dragover`/`drop` with `el.dispatchEvent()` —
+straight at the node, bypassing hit-testing. So a covered target really does receive the drop, and
+refusing would reject a call that works.
+
+The trap is the other way round, and it is a FIDELITY one: a covered drop **succeeds here where a
+human's would fail**, hit-tested into the covering element. So a QA case that drops onto something
+behind a modal passes, and the product could still be broken for a user. Nothing in the response
+says so — `modoki_dnd` reports no `occluded` field to say so with. If that bites, the fix is to
+report occlusion as a WARNING (not a refusal, which would be wrong), and it is worth measuring
+before building. Recorded here rather than left as an unexplained gap, per §9's "either closed or
+recorded as deliberate with a reason".
+
+**Device-surface asymmetries (§9), both deliberate, neither previously written down:**
+`allowOccluded` exists only on the editor — `resolveAim` (`bridge.ts`) refuses a covered selector
+unconditionally, with no escape hatch — and the device surface has no `entity` addressing at all
+(selector or screenshot pixels only), because it has no editor to resolve a scene entity through.
+Both leave the device STRICTER than the editor, which is the safe direction; the `entity` gap is
+now stated on `device_screenshot`'s description too, which used to send callers to "aim by
+selector/entity" on tools that have no such parameter.
 ### Agent-input provenance: the actor lease (fixed 2026-07-22)
 
 `withEditorActor` can only attribute code the agent **calls**. Trusted input is the opposite

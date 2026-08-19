@@ -25,7 +25,24 @@ const clamp = (level: number): number => Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, l
 
 let currentLevel = 0;
 
-const prefsFile = (): string => path.join(app.getPath('userData'), 'ui-prefs.json');
+/** Where `ui-prefs.json` lives. Defaults to userData; main overrides it to the CLONE-level
+ *  profile when this editor is running in a `MODOKI_MULTI` sub-profile — see `setUiPrefsDir`. */
+let uiPrefsDir: string | null = null;
+
+/** Point UI prefs at `dir` instead of userData.
+ *
+ *  A `MODOKI_MULTI` editor gets its own userData SUB-profile (userDataDir.ts §14.4), which is
+ *  right for the thing that motivated it — Chromium's LevelDB is single-writer, so co-running
+ *  editors in one clone must not share it. `ui-prefs.json` is not that: it is our own file,
+ *  written atomically, holding a preference the human set for the EDITOR, not for one launch
+ *  flavour. Splitting it means zooming in a `MODOKI_MULTI` editor and relaunching normally
+ *  silently starts back at 100% with the old level still sitting in a sibling directory —
+ *  which reads exactly like "the persisted zoom is never restored" and was reported as such
+ *  (testboard q1k7p2hGZB9lGvYi11go). Two editors racing on a last-write-wins UI pref is the
+ *  cheaper problem by a wide margin. */
+export function setUiPrefsDir(dir: string | null): void { uiPrefsDir = dir; }
+
+const prefsFile = (): string => path.join(uiPrefsDir ?? app.getPath('userData'), 'ui-prefs.json');
 
 /** Best-effort read of the persisted zoom level (clamped). Defaults to 0. */
 export function loadZoomLevel(): number {

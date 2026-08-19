@@ -26,6 +26,9 @@ import type { MouseButton, InputModifier } from './rendererOps';
 // than re-declared because both sides speak this shape over the bridge, and a second copy
 // of a wire contract silently drifts.
 import type { DomPointResolution } from '../app/debug/domPointContract';
+// A VALUE, not a type — the refusal messages branch on it. From the DOM-free contract module for
+// the reason its header gives: importing domResolve.ts would pull `document` into this program.
+import { NOTHING_AT_POINT } from '../app/debug/domPointContract';
 import type { EntityPointSpec, EntityPointResolution, OcclusionScope, AimedAt } from '../app/debug/entityPointContract';
 import type { ErrorCode } from '../tools/shared/mcpResult';
 
@@ -80,7 +83,8 @@ export interface PointSpec {
    *  A resolvable aim (`entity`, `selector`) names a THING, so a press the surface would deliver
    *  somewhere else is a failed intent, not a caveat — `mcp-tool-conventions.md` §0 ranks a false
    *  success as the worst outcome on this surface, above backwards compatibility. The entity path
-   *  has refused since 2026-07-29 and the DEVICE surface refuses a covered selector too
+   *  has refused since 2026-08-02 (609663e75 — 2026-07-29 added entity ADDRESSING, not the
+   *  refusal) and the DEVICE surface refuses a covered selector too
    *  (`device_tap`: "a selector miss or an OCCLUDED target is refused here rather than tapping
    *  something else"); the editor's selector path was the one holdout, which is the divergence §9
    *  predicts when a rule is implemented twice. Raw `{x,y}` is deliberately NOT covered: you asked
@@ -145,6 +149,45 @@ export async function resolvePoint(
     if (!res || !res.ok || typeof res.x !== 'number' || typeof res.y !== 'number') {
       return { error: `${which}: ${res?.error ?? 'entity did not resolve'}`, ...(res?.code ? { code: res.code } : {}) };
     }
+    // §3: "a resolvable aim that something COVERS is refused ... this binds `entity` and
+    // `selector` alike". Only the MESH-level half of that was implemented — entityResolve refuses
+    // when the surface's own picker says another entity is in front. DOM-level covering (a modal,
+    // a menu, a panel over the viewport) was reported as `occluded:true` and DISPATCHED ANYWAY on
+    // all three scopes, so a tap meant for a UI button under an open dialog pressed the dialog and
+    // answered ok:true — the §0 rank-1 false success, on the aim category §3 says is one category.
+    // The two documented carve-outs still hold and neither is here: raw {x,y} never reaches this
+    // branch, and a held gesture's move/up is forced through by its caller (see the pointer route).
+    //
+    // Reads `entitySpec.allowOccluded`, the value ALREADY sent to the renderer, rather than
+    // re-deriving it from the two fields. §9: a rule implemented twice diverges — and these two
+    // did, in one reachable combination. `entity:{allowOccluded:false}` with a top-level
+    // `allowOccluded:true` merges to false, so entityResolve refuses a picker-occluded aim while a
+    // re-derived `!false && !true` here would have waved a DOM-occluded one through: one flag,
+    // opposite answers, decided by which kind of cover happened to be in the way.
+    if (res.occluded && !entitySpec.allowOccluded) {
+      const scope = res.occlusionScope === 'canvas'
+        ? ' (this surface has no pick provider, so only DOM-level covering was checked — a mesh in '
+          + 'front of it would not be detected at all)'
+        : '';
+      // "Nothing" is not something you can dismiss. When the hit-test found NO element the point is
+      // clipped away or off-window, and telling the caller to move the thing covering it — which
+      // the message itself calls "nothing" — is self-contradictory advice for a real, if narrow,
+      // case: `centreIsInWindow` admits `x === innerWidth` while `elementFromPoint` is exclusive at
+      // that same edge, so a rect flush against the window's right/bottom lands here.
+      const nothingThere = !res.hitTarget || res.hitTarget === NOTHING_AT_POINT;
+      return {
+        error: nothingThere
+          ? `${which}: ${res.matched ?? 'the entity'} resolves to a point with NOTHING at it — `
+            + `(${Math.round(res.x)}, ${Math.round(res.y)}) is clipped away or past the window edge, so the `
+            + `input would go nowhere${scope}. Move the camera (or the entity) so it is framed well `
+            + 'inside the viewport, then re-aim.'
+          : `${which}: ${res.matched ?? 'the entity'} resolves to a point covered by `
+            + `${res.hitTarget} — the input would land on THAT, not on your target${scope}. `
+            + 'Dismiss/move what covers it, or pass allowOccluded:true to aim there anyway and see '
+            + 'what happens.',
+        code: 'OCCLUDED',
+      };
+    }
     return {
       point: {
         x: res.x, y: res.y,
@@ -165,11 +208,21 @@ export async function resolvePoint(
       return { error: `${which}: ${res?.error ?? 'selector did not resolve'}` };
     }
     if (res.occluded && !spec.allowOccluded) {
+      // Two different diagnoses, because they want different actions and the covering element's
+      // name distinguishes them for nobody: an anonymous splitter div reads the same whether a
+      // modal is over your target or your target is scrolled out of its own list. `clipped` says
+      // which (a sweep of this editor's live selectors found 12 of 22 occluded hits were the
+      // scroll case), so the fix named is the fix that works.
       return {
-        error: `${which}: ${JSON.stringify(spec.selector)} resolves to a point covered by `
-          + `${res.hitTarget ?? 'something else'} — the input would land on THAT, not on your target. `
-          + 'Dismiss/move what covers it (an open menu, a modal, a panel that overlaps), scroll the '
-          + 'target clear, or pass allowOccluded:true to aim there anyway and see what happens.',
+        error: res.clipped
+          ? `${which}: ${JSON.stringify(spec.selector)} is SCROLLED OUT of its own container — its `
+            + `rect is real but nothing is drawn there, so the point lands on ${res.hitTarget ?? 'other chrome'} `
+            + 'instead. Scroll it into view (modoki_scroll over that panel) or enlarge the panel, then '
+            + 're-aim; allowOccluded:true would press the chrome behind it.'
+          : `${which}: ${JSON.stringify(spec.selector)} resolves to a point covered by `
+            + `${res.hitTarget ?? 'something else'} — the input would land on THAT, not on your target. `
+            + 'Dismiss/move what covers it (an open menu, a modal, a panel that overlaps), scroll the '
+            + 'target clear, or pass allowOccluded:true to aim there anyway and see what happens.',
         code: 'OCCLUDED',
       };
     }
@@ -401,8 +454,19 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // Only the PRESS is gated on occlusion. A `move`/`up` mid-gesture is delivered to whatever
       // captured the press, so what happens to sit under the destination says nothing about
       // whether the event lands — refusing there would break legitimate held drags.
+      // …and for an ENTITY aim the force has to reach the entity spec too, not just the top-level
+      // flag: `resolvePoint` merges them with `??`, so a caller's explicit
+      // `entity:{allowOccluded:false}` would win and re-impose a refusal on a move the press has
+      // already captured. The carve-out is a fact about DELIVERY, not a preference, so it
+      // overrides rather than loses. (`??` stays the right precedence everywhere else, where the
+      // flag really is the caller's intent.)
+      const held = action !== 'down';
       const r = await resolvePoint(
-        { x, y, selector, entity, allowOccluded: action === 'down' ? allowOccluded : true },
+        {
+          x, y, selector,
+          entity: held && entity ? { ...entity, allowOccluded: true } : entity,
+          allowOccluded: held ? true : allowOccluded,
+        },
         `pointer ${action}`, requestRenderer,
       );
       if ('error' in r) return bad(r.error, r.code);
@@ -538,7 +602,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // the result to {id,x,y} and DROPPED them, so tap/drag fired unconditionally: an off-screen
       // handle taps nothing, an occluded one hits the covering element, a disabled one is inert, and
       // all three returned ok:true. (F1)
-      type ResolvedHandle = { id: string; x: number; y: number; onScreen?: boolean; occludedBy?: string; occlusionChecked?: boolean; meta?: { disabled?: boolean } };
+      type ResolvedHandle = { id: string; x: number; y: number; onScreen?: boolean; clipped?: boolean; occludedBy?: string; occlusionChecked?: boolean; meta?: { disabled?: boolean } };
       const resolve = async (id: string) => {
         const res = (await requestRenderer('enact-handles', { ids: [id] })) as { handles?: ResolvedHandle[] } | null;
         return res?.handles?.find((x) => x.id === id) ?? null;
@@ -556,7 +620,15 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // provably lands on something else is a miss, and a miss reported as a success is how a tool
       // manufactures a phantom product bug. `allowOccluded:true` still forces it through.
       const blockedReason = (hd: ResolvedHandle, allowOccluded?: boolean): string | null =>
-        hd.onScreen === false ? 'off-screen — scroll it into view (modoki_scroll over the panel), then retry'
+        hd.onScreen === false
+          // `clipped` = inside the window but outside its OWN panel's visible box. Same refusal,
+          // different remedy: scrolling is what fixes a panel taller than its dock row, and is
+          // useless for a gizmo handle projected past the edge of its viewport (there the panel
+          // or the camera has to move). Saying "scroll it into view" for both sent a QA session
+          // scrolling a canvas that does not scroll.
+          ? (hd.clipped
+            ? 'off-screen — its coordinates are inside the window but OUTSIDE its own panel\'s visible box, so a press there lands on whatever panel occupies those pixels. Scroll that panel (modoki_scroll over it), enlarge it, or move the target back into view, then retry'
+            : 'off-screen — scroll it into view (modoki_scroll over the panel), then retry')
           : hd.meta?.disabled === true ? 'disabled (inert / greyed-out)'
             : hd.occludedBy !== undefined && !allowOccluded
               ? `covered by ${hd.occludedBy} — the press would land on THAT, not on the handle. Move the covering panel/menu (or the target) out of the way, or pass allowOccluded:true to press anyway and see what happens`

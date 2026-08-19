@@ -25,7 +25,7 @@
  *  `docs/enact.md` ("Aimed input has THREE target surfaces"). */
 
 import { getAllEntities, collectScreenBounds, pickAt, type BoundsSurface } from '@modoki/engine/runtime';
-import { describeElement, occlusionAt, resolveElementPoint } from './domResolve';
+import { describeElement, occlusionAt, resolveElementPoint, NOTHING_AT_POINT } from './domResolve';
 import { uiNodesFor, namedUiSurface } from './uiSurface';
 import type { EntityPointSpec, EntityPointResolution, AimedAt } from './entityPointContract';
 import type { ErrorCode } from '../../tools/shared/mcpResult';
@@ -74,13 +74,40 @@ function centreIsInWindow(x: number, y: number): boolean {
 }
 
 /** DOM-level occlusion for a canvas-rendered (2D/3D) entity. The entity has no node of its own,
- *  so the question this CAN answer is "does the click reach the rendering surface at all" — a
- *  panel, dialog, or overlay sitting on top. Anything inside a `<canvas>` counts as reaching it. */
+ *  so the question this CAN answer is "does the click reach a rendering surface at all" — a panel,
+ *  dialog, or overlay sitting on top. Anything inside a `<canvas>` counts as reaching one.
+ *
+ *  WHICH canvas is a separate question, answered by `foreignCanvasAt` before this runs — see there
+ *  for why accepting any canvas here was reporting a click on the neighbouring panel as clean. */
 function canvasOcclusionAt(x: number, y: number): string | null {
   const top = typeof document === 'undefined' ? null : document.elementFromPoint(x, y);
-  if (!top) return 'nothing (clipped or off-window)';
+  if (!top) return NOTHING_AT_POINT;
   if (top.tagName === 'CANVAS' || top.closest('canvas')) return null;
-  return describeElement(top) ?? 'nothing (clipped or off-window)';
+  return describeElement(top) ?? NOTHING_AT_POINT;
+}
+
+/** Names the OTHER panel when (x,y) lands on a canvas that is not the aimed surface's, else null.
+ *
+ *  Kept separate from `canvasOcclusionAt` because it is a different question with a different
+ *  answer: "something is covering the surface" is a flag on this path by contract, while "you are
+ *  pointing at a different surface entirely" is a wrong aim and must be refused. Folding it into
+ *  the occlusion flag would either weaken the refusal or silently start refusing the documented
+ *  covered-canvas case. */
+function foreignCanvasAt(x: number, y: number, surface: string): string | null {
+  if (typeof document === 'undefined') return null;
+  const top = document.elementFromPoint(x, y);
+  const canvas = top && (top.tagName === 'CANVAS' ? top : top.closest('canvas'));
+  if (!canvas) return null;                       // not a canvas at all — canvasOcclusionAt's job
+  // POSITIVE identification in both directions, never inference from absence. A shipped game's
+  // canvas carries NEITHER marker, and "not in the Game panel" would refuse every runtime aim
+  // there — the editor-only markers cannot be read as a partition of the world.
+  const host = canvas.closest('[data-game-view-area]') ? 'game'
+    : canvas.closest('[data-scene-viewport]') ? 'scene-view'
+      : null;
+  if (!host) return null;
+  const want = surface.startsWith('game') ? 'game' : surface === 'scene-view' ? 'scene-view' : null;
+  if (!want || host === want) return null;
+  return host === 'game' ? 'the Game panel' : 'the Scene panel';
 }
 
 /** Does `hitId` count as hitting `targetId`? Exact match, or the hit entity being a DESCENDANT
@@ -294,6 +321,25 @@ export function resolveEntityPointReport(spec: EntityPointSpec): EntityPointReso
   // there), or `undefined` (no picker registered for this surface — the question was never
   // asked). Only the last one keeps the old `'canvas'` scope, and it is the normal case for the
   // runtime GameView, which ships no default picker on purpose (`screenPick.ts` header).
+  // WRONG SURFACE first, and it is a refusal rather than a flag. The aim point can sit on a
+  // NEIGHBOURING panel's canvas when the entity's rect straddles its own canvas's edge, and every
+  // check downstream is asked about the wrong surface after that: the pick returns "nothing there"
+  // (a misleading "it is behind something") and the DOM check sees a canvas and calls it clean.
+  // Measured 2026-08-19 on games/3d-test: tap {entity: Plane029, surface:'game-3d'} at (402,186)
+  // answered ok:true / occluded:false and the click landed in the Scene panel (!focus {panel:
+  // "scene"} in the editor journal). `allowOccluded` does NOT open this: there is nothing covering
+  // the target here — the coordinate simply is not on the surface that was asked for.
+  const foreign = foreignCanvasAt(cx, cy, surfaceName);
+  if (foreign) {
+    return fail(
+      `entity ${matched} is not aimable in '${surfaceName}': its rect straddles that surface's edge, ` +
+      `so its centre (${Math.round(cx)}, ${Math.round(cy)}) lands on ${foreign} — a click there would ` +
+      'drive the wrong panel. Move the camera so the entity is framed fully inside its own surface, ' +
+      'or aim at the surface it is actually on.',
+      'OCCLUDED',
+    );
+  }
+
   const allEntities = getAllEntities();
   const rect = bounds.screen!;
   let x = cx;
@@ -350,7 +396,8 @@ export function resolveEntityPointReport(spec: EntityPointSpec): EntityPointReso
   if (!found && !spec.allowOccluded) {
     // A REFUSAL, not a flag. `entity` aiming expresses intent about an ENTITY, so a click the
     // surface would not honour is a failed intent — dispatching it would land on the blocker (or
-    // on nothing) and report success. Owner decision, 2026-07-29; `allowOccluded: true` is the
+    // on nothing) and report success. Owner decision; landed 2026-08-02 (609663e75 — the entity
+    // ADDRESSING mode is the older 2026-07-29 change). `allowOccluded: true` is the
     // escape hatch and is named in the message so the capability is discoverable from the error.
     const searched = samplesTried > 1
       ? ` Tried ${samplesTried} points across its projected rect (centre first); none of them picked it.`

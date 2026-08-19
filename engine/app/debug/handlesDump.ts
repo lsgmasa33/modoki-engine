@@ -7,7 +7,7 @@
  *  drive it with `drag-handle`/`tap-handle` — no screenshot, no pixel guessing. */
 
 import { collectHandles, type HandleFilter, type InteractionHandle } from '@modoki/engine/runtime';
-import { occlusionAt } from './domResolve';
+import { occlusionAt, withinClip, type DomRect } from './domResolve';
 
 export type HandlesDumpParams = HandleFilter;
 
@@ -15,9 +15,24 @@ export type HandlesDumpParams = HandleFilter;
  *  be reported at a valid viewport-CSS-px position yet be OFF-screen — e.g. an editor panel
  *  taller than the window scrolls its lower section (a gradient strip, a curve) below the
  *  fold. `tap`/`drag` at an off-screen point hit nothing, so surface it: scroll the panel
- *  (modoki_scroll over it) until the handle's `onScreen` flips true, then aim. */
+ *  (modoki_scroll over it) until the handle's `onScreen` flips true, then aim.
+ *
+ *  "Off-screen" means off the DOCKED PANEL as well as off the window. A panel is an
+ *  `overflow`-clipped box, and `getBoundingClientRect()` on something scrolled out of one
+ *  still reports its laid-out position — which for a tall panel lands hundreds of px below
+ *  the panel, on TOP OF A DIFFERENT PANEL. Judged against the window alone that reads
+ *  `onScreen:true`, and an aim there drives the other panel (testboard
+ *  AceYUBoBXbcGtIIFmzGb). So the clip box of every scrolling ancestor counts too — for the
+ *  handles whose provider names an `owner`; an owner-less handle can only be judged against
+ *  the window, the same limit that leaves its occlusion unchecked. */
 export type AnnotatedHandle = Omit<InteractionHandle, 'owner'> & {
   onScreen: boolean;
+  /** Present (`true`) only when the point is inside the WINDOW but outside its own panel's
+   *  clip box. The two off-screen cases want different actions — a window miss means the
+   *  window/camera has to move, a clipped one means scroll or enlarge that panel — and a
+   *  gizmo handle projected past its viewport's edge is clipped, not scrollable at all, so
+   *  "scroll it into view" would be wrong advice. */
+  clipped?: true;
   /** False when the handle's provider named no owning element, so `occludedBy` is unknown
    *  rather than known-absent. Don't read a missing `occludedBy` as "clickable" without it. */
   occlusionChecked: boolean;
@@ -57,6 +72,9 @@ export function computeHandles(params: HandlesDumpParams = {}): HandlesDumpResul
   const vw = typeof window !== 'undefined' ? window.innerWidth : Infinity;
   const vh = typeof window !== 'undefined' ? window.innerHeight : Infinity;
 
+  // One clip-rect memo for the whole call — see `withinClip`. Handles routinely share an owner
+  // (every keyframe in a Dopesheet names the same container), and the DOM cannot change mid-call.
+  const clipCache = new Map<Element, DomRect | null>();
   const handles: AnnotatedHandle[] = raw.map((h) => {
     // Occlusion is computed HERE, for every handle that names an owning element — not in
     // the chrome provider. Being un-clickable because something covers you is a property
@@ -64,10 +82,13 @@ export function computeHandles(params: HandlesDumpParams = {}): HandlesDumpResul
     // DOM node, so it must never reach the JSON that crosses the agent bridge.
     const { owner, ...rest } = h;
     const occludedBy = isElement(owner) ? occlusionAt(owner, h.x, h.y) : undefined;
+    const inWindow = h.x >= 0 && h.y >= 0 && h.x <= vw && h.y <= vh;
+    const clipped = inWindow && isElement(owner) && !withinClip(owner, h.x, h.y, clipCache);
     return {
       ...rest,
       ...(occludedBy ? { occludedBy } : {}),
-      onScreen: h.x >= 0 && h.y >= 0 && h.x <= vw && h.y <= vh,
+      onScreen: inWindow && !clipped,
+      ...(clipped ? { clipped: true as const } : {}),
       occlusionChecked: isElement(owner),
     };
   });

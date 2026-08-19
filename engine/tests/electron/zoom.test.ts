@@ -14,7 +14,7 @@ vi.mock('electron', () => ({
 }));
 
 import {
-  applyZoom, restoreZoom, handleZoom, loadZoomLevel, getZoomLevel,
+  applyZoom, restoreZoom, handleZoom, loadZoomLevel, getZoomLevel, setUiPrefsDir,
   ZOOM_MIN, ZOOM_MAX, ZOOM_STEP,
 } from '../../electron/zoom';
 import * as atomicWrite from '../../electron/atomicWrite';
@@ -48,6 +48,7 @@ let counter = 0;
 beforeEach(() => {
   root.dir = fs.mkdtempSync(path.join(os.tmpdir(), `modoki-zoom-${counter++}-`));
   fs.mkdirSync(path.join(root.dir, 'userData'), { recursive: true });
+  setUiPrefsDir(null); // default: prefs live in userData
   handleZoom(null, { dir: 'reset' }); // reset module state (level AND wheel accumulator) between tests
 });
 afterEach(() => { fs.rmSync(root.dir, { recursive: true, force: true }); });
@@ -142,6 +143,23 @@ describe('zoom controller', () => {
     expect(loadZoomLevel()).toBe(ZOOM_MAX);
     fs.rmSync(prefsFile());
     expect(loadZoomLevel()).toBe(0);
+  });
+
+  it('a MODOKI_MULTI sub-profile still reads and writes the CLONE-level prefs file', () => {
+    // The sub-profile exists for Chromium's single-writer LevelDB; a UI preference is the
+    // human's, not one launch flavour's. Splitting it stranded a zoom level in a sibling
+    // directory, which reads as "the persisted zoom is never restored" (testboard
+    // q1k7p2hGZB9lGvYi11go). main.ts points this at the sub-profile's PARENT.
+    const sub = path.join(root.dir, 'userData', 'anim-bug-22c830ab');
+    fs.mkdirSync(sub, { recursive: true });
+    setUiPrefsDir(path.join(root.dir, 'userData')); // what main.ts passes: the clone-level dir
+    const { win } = makeWin();
+    applyZoom(win, 1);
+    expect(readPrefs().zoomLevel).toBe(1);                       // clone-level file
+    expect(fs.existsSync(path.join(sub, 'ui-prefs.json'))).toBe(false); // nothing in the sub-profile
+    // …and a later NON-multi launch, whose prefs dir is the default userData, sees it.
+    setUiPrefsDir(null);
+    expect(loadZoomLevel()).toBe(1);
   });
 
   it('merges onto existing prefs without clobbering sibling keys', () => {

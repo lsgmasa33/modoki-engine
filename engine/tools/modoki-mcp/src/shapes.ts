@@ -48,8 +48,11 @@ export const entitySpec = z.object({
       'aim on a surface with a pick provider (`occlusionScope:\'entity\'`) is a REFUSAL, not a ' +
       'flag — "click the character" failed if the game would not select that character (the ' +
       'character-behind-a-wall case). Pass true as the "click it anyway and see what happens" ' +
-      'escape hatch. No effect on a surface with no pick provider (`occlusionScope:\'canvas\'`, ' +
-      'nothing to be occluded BY as far as anything can tell) or on the `selector` path.'),
+      'escape hatch. It applies on EVERY scope: a covered aim is refused whether the cover is ' +
+      'another entity (the picker saw it) or a DOM element over the viewport — a modal, a menu, ' +
+      'a panel — because the press lands on that either way. What the scope still tells you is ' +
+      'how far the check could SEE: on `occlusionScope:\'canvas\'` only DOM covering was ' +
+      'checked, so a mesh in front of the target is not detected at all.'),
 }).describe(
   'Aim at a SCENE ENTITY by {guid} | {name} | {id} — resolved to its live screen rect INSIDE ' +
   'this call, so there is no read-then-tap race. Prefer guid: runtime ids are reassigned on ' +
