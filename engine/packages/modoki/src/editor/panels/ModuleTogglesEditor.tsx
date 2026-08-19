@@ -9,15 +9,14 @@
 
 type Toggle = 'auto' | boolean;
 
-/** The six modules, in display order, with a short "what it costs" hint drawn
+/** The five modules, in display order, with a short "what it costs" hint drawn
  *  from the measured bundle table (gzipped) so the choice is informed. */
 const MODULES: { key: string; label: string; hint: string }[] = [
   { key: 'render3d', label: '3D rendering', hint: 'Three.js / WebGPU (~173 KB)' },
   { key: 'render2d', label: '2D rendering', hint: 'PixiJS (~21 KB)' },
   { key: 'physics2d', label: '2D physics', hint: 'Rapier2D (~635 KB)' },
   { key: 'physics3d', label: '3D physics', hint: 'Rapier3D (~841 KB)' },
-  { key: 'npr', label: 'NPR post-FX', hint: 'outline pass — needs 3D' },
-  { key: 'gpuParticles', label: 'GPU particles', hint: 'compute backend — needs 3D + WebGPU' },
+  { key: 'video', label: 'Video', hint: '~3 KB decode + the CLIPS (2.7 MB on video-demo) — auto-off in playables' },
 ];
 
 /** `slug` is the STABLE half of each option's `data-ui-id` — deliberately not derived from

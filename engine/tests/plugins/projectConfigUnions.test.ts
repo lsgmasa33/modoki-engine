@@ -9,7 +9,12 @@
  *     unlocks rotation on BOTH platforms (`healNativeConfig` falls iOS back to `auto`, Android
  *     to `fullSensor`) and the launch log echoes the value you WROTE, so the log looks correct.
  *     You find out from a store screenshot.
- *   - `build.webDeployMode` / `build.playableNetwork` → the deploy/playable step picks a branch.
+ *   - `build.webDeployMode` → the deploy step picks a branch on it.
+ *   - `build.playableNetwork` → validated here, but NOTHING branches on it yet: the MRAID shim
+ *     (`app/playable/mraid.ts`) is network-agnostic and only AppLovin is really covered. Per-network
+ *     adapters are deliberately deferred (docs/playable-export.md § "Deferred — per-network
+ *     adapters"), so this guard is protecting a value the build does not consume — keep it, but
+ *     do not read it as evidence the field is wired.
  *   - `rendering.three.toneMapping` → `resolveToneMapping` maps unknown → ACESFilmic BY DESIGN,
  *     which is why a typo was invisible: the fallback IS the most common intended value.
  *

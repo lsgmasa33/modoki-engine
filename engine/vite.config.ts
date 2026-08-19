@@ -360,8 +360,6 @@ export default defineConfig(({ command }) => {
     __MODOKI_MODULE_RENDER2D__: JSON.stringify(moduleFlags.render2d),
     __MODOKI_MODULE_PHYSICS2D__: JSON.stringify(moduleFlags.physics2d),
     __MODOKI_MODULE_PHYSICS3D__: JSON.stringify(moduleFlags.physics3d),
-    __MODOKI_MODULE_NPR__: JSON.stringify(moduleFlags.npr),
-    __MODOKI_MODULE_GPU_PARTICLES__: JSON.stringify(moduleFlags.gpuParticles),
     __MODOKI_MODULE_VIDEO__: JSON.stringify(moduleFlags.video),
     // Playable (Phase 5): the app boots the MRAID/CTA layer only in a playable build,
     // and the CTA routes to this store URL. False/'' in every other build → the whole

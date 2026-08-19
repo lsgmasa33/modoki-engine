@@ -43,17 +43,18 @@ the end-card on the cap or a game-dispatched `window 'playable:end'`.
 
 ## Engine module toggles (`build.modules`)
 
-A build can include/exclude the heavy engine SDKs (three.js, PixiJS, Rapier 2D/3D, NPR, GPU
-particles) so an unused one is dead-code-eliminated. This is a **general build feature** (it shrinks
+A build can include/exclude the heavy engine SDKs (three.js, PixiJS, Rapier 2D/3D) and the video
+payload so an unused one is dead-code-eliminated. This is a **general build feature** (it shrinks
 web builds too), but its headline win is fitting a game under the playable's 5 MB ceiling. `project.config.json`
 `build.modules.<key>` is `'auto' | boolean` per module (`render3d`, `render2d`, `physics2d`, `physics3d`,
-`npr`, `gpuParticles`; all `'auto'` by default).
+`video`; all `'auto'` by default). **Every key here is read by real gating code** — see "A toggle that
+removes nothing" below for the two that were not, and why they are gone rather than wired.
 
 - **Resolution** (`engine/plugins/detect-modules.ts`, Node-only): `resolveModules` turns each toggle into a
   concrete boolean. `'auto'` → `detectModules` scans the project's included scene JSON for trait signals
   (`Renderable3D`/`Light`/`Camera`/`Environment`/`ModelSource` → `render3d`; `Canvas2D`/`Renderable2D`/`Sprite`
-  → `render2d`; `RigidBody2D`/`Collider2D` → `physics2d`; `layer:'3d'|'2d'` on `EntityAttributes`; NPR +
-  GPU-particles ride along with `render3d`). Broad on purpose — a false-positive just ships an unused SDK
+  → `render2d`; `RigidBody2D`/`Collider2D` → `physics2d`; `VideoPlayer` → `video`; `layer:'3d'|'2d'` on
+  `EntityAttributes`). Broad on purpose — a false-positive just ships an unused SDK
   (safe); a false-negative is loud (a build-time warn + the guard below). An explicit `true`/`false` forces
   it and logs a warning if `false` contradicts a used module.
 - **Wiring**: the resolved booleans become `__MODOKI_MODULE_RENDER3D__` / `…_RENDER2D__` / … Vite defines
@@ -86,6 +87,34 @@ web builds too), but its headline win is fitting a game under the playable's 5 M
     the 2D boot entries and fails if anything reaches `three/webgpu`/`three/tsl`; gated edges are
     listed explicitly and each is re-checked to still carry its gate. Adding a new one is a
     deliberate line in `GATED_EDGES`, not a silent 546 KB.
+
+- **A toggle that removes nothing is worse than no toggle — `npr` and `gpuParticles` were DELETED,
+  not wired** (#256, 2026-08-19). Both were resolved by `resolveModules`, given dedicated ride-along
+  logic in `detectModules`, emitted as `__MODOKI_MODULE_NPR__` / `__MODOKI_MODULE_GPU_PARTICLES__`
+  defines, and offered to the owner as Auto | On | Off rows — and **no source file ever branched on
+  either define**. Setting `npr: false` shipped the outline pass unchanged, reported nothing, and
+  looked exactly like a working switch. This is CLAUDE.md's "every field you expose must be READ"
+  applied to a build setting instead of a prefab field: an unwired field is a lie with a tooltip.
+  - **Measured before deciding** (`demos/particle-demo`, `--target web`, 3,785,929 B of JS baseline),
+    because "wire it" and "delete it" are both defensible until you know the number. Writing the real
+    gate for `gpuParticles` (a flag check in `gpuEligible` + the router's `new GpuComputeBackend()`
+    behind the flag) removed **16.7 KB minified / 4.8 KB gzip** — `Scene3D` 80.3 → 63.9 KB. For `npr`
+    the *upper bound* — emptying the NPR-only modules outright, more than any real gate could remove —
+    was **3.2 KB minified / ~1 KB gzip**.
+  - **Neither drops an SDK.** `three.webgpu` moved 8 bytes and `three.tsl` 45: both features live
+    inside the `Scene3D` chunk that only exists when `render3d` is already on, and the CPU TSL particle
+    backend pulls the same TSL surface the GPU one does. So the win is each feature's own code, against
+    a floor of 178 KB gzipped of `three.webgpu`. **Do not re-propose these toggles** on the intuition
+    that a compute backend "must be big" — it was measured, and it is 4.8 KB.
+  - **Deleting a key needs no migration.** `project.config.json` files in the wild (published demo repos
+    included) still carry `"npr": "auto"`; `project-config.ts`'s `modules: { ...d.build.modules,
+    ...p.build?.modules }` spread carries an unknown key through inertly and `resolveModules` iterates
+    `MODULE_KEYS`, so it is ignored rather than rejected.
+  - **The inverse defect was in the same panel**: `video` — a fully-wired module with 8 consumers, and
+    the only one carrying a *media* payload (`video: false` on `demos/video-demo` cuts the dist from
+    8,684 → 5,920 KB, ~2.7 MB, against just 6.1 KB of JS) — had **no row at all**, reachable only by
+    hand-editing JSON. It was added when the dead two came out. A module surface can lie in both
+    directions; check the panel against `MODULE_KEYS`, not against itself.
 
 - **Single chunk = `inlineDynamicImports`, NOT `codeSplitting`.** `codeSplitting` is not a real Rollup
   option — Rollup silently ignores it, the lazy renderer chunk stays split, and the inliner's stray-JS

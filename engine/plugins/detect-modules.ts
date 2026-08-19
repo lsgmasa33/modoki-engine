@@ -16,7 +16,7 @@ import type { BuildModules, ModuleKey } from '../project-config';
 
 export type { ModuleKey };
 
-export const MODULE_KEYS: ModuleKey[] = ['render3d', 'render2d', 'physics2d', 'physics3d', 'npr', 'gpuParticles', 'video'];
+export const MODULE_KEYS: ModuleKey[] = ['render3d', 'render2d', 'physics2d', 'physics3d', 'video'];
 
 /** Which module a trait name implies. Matched against the trait keys present on
  *  any entity in any included scene. Intentionally BROAD — a false-positive
@@ -45,7 +45,7 @@ export interface DetectResult {
 
 /** All resolved module flags default off; a scan flips the used ones on. */
 function emptyFlags(): Record<ModuleKey, boolean> {
-  return { render3d: false, render2d: false, physics2d: false, physics3d: false, npr: false, gpuParticles: false, video: false };
+  return { render3d: false, render2d: false, physics2d: false, physics3d: false, video: false };
 }
 
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'ios', 'android', '.git']);
@@ -103,15 +103,6 @@ export function detectModules(projectRoot: string): DetectResult {
     }
   }
 
-  // Sub-features of the 3D renderer. Until finer per-feature detection lands
-  // (an NPR camera setting / a particle backend field), 'auto' conservatively
-  // keeps them whenever 3D is present — safe (never strips a used feature); an
-  // explicit `false` still forces them out. TODO: detect NPR/GPU-particle usage.
-  if (used.render3d) {
-    used.npr = true;
-    used.gpuParticles = true;
-  }
-
   return { used, scenesScanned: files.length };
 }
 
@@ -131,7 +122,7 @@ export function resolveModules(
   opts: { playable?: boolean } = {},
 ): Record<ModuleKey, boolean> {
   if (!projectRoot) {
-    return { render3d: true, render2d: true, physics2d: true, physics3d: true, npr: true, gpuParticles: true, video: true };
+    return { render3d: true, render2d: true, physics2d: true, physics3d: true, video: true };
   }
 
   const detect = detectModules(projectRoot);

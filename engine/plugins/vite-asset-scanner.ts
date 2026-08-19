@@ -3371,8 +3371,6 @@ export function assetScannerPlugin(): Plugin {
               __MODOKI_MODULE_RENDER2D__: 'true',
               __MODOKI_MODULE_PHYSICS2D__: 'true',
               __MODOKI_MODULE_PHYSICS3D__: 'true',
-              __MODOKI_MODULE_NPR__: 'true',
-              __MODOKI_MODULE_GPU_PARTICLES__: 'true',
               __MODOKI_MODULE_VIDEO__: 'true',
             },
             resolve: {

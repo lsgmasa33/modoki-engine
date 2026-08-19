@@ -72,8 +72,7 @@ export type ModuleToggle = 'auto' | boolean;
 /** Per-project include/exclude of the heavy engine SDKs. Drives build-time
  *  tree-shaking for every target (web / native / playable) and is surfaced as
  *  Auto | On | Off checkboxes in Project Settings → Engine Modules. Each field
- *  defaults to `'auto'` (detect from the included scenes). `npr` and
- *  `gpuParticles` are sub-features of `render3d`. */
+ *  defaults to `'auto'` (detect from the included scenes). */
 export interface BuildModules {
   /** Three.js 3D renderer (Scene3D + the three.webgpu / TSL node pipeline). */
   render3d: ModuleToggle;
@@ -83,10 +82,6 @@ export interface BuildModules {
   physics2d: ModuleToggle;
   /** Rapier 3D physics. */
   physics3d: ModuleToggle;
-  /** NPR post-processing (requires render3d). */
-  npr: ModuleToggle;
-  /** GPU-compute particle backend (requires render3d + native WebGPU). */
-  gpuParticles: ModuleToggle;
   /** Video playback (HTMLVideoElement decode, video textures, the remote-clip cache).
    *  `'auto'` detects a `VideoPlayer` trait, EXCEPT on a `--target playable` build, where
    *  'auto' resolves OFF: a ≤5 MB MRAID bundle and a video file are close to mutually
@@ -513,7 +508,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     debugBuild: false,
     modules: {
       render3d: 'auto', render2d: 'auto', physics2d: 'auto',
-      physics3d: 'auto', npr: 'auto', gpuParticles: 'auto', video: 'auto',
+      physics3d: 'auto', video: 'auto',
     },
     playableMaxBytes: 5_242_880, // 5 MB (AppLovin)
     playableClickUrl: '',

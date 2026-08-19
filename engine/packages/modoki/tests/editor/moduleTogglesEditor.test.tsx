@@ -1,5 +1,5 @@
 /** ModuleTogglesEditor — the 'module-toggles' Project Settings widget. It edits
- *  build.modules (a record of ModuleToggle = 'auto' | boolean) as six tri-state
+ *  build.modules (a record of ModuleToggle = 'auto' | boolean) as five tri-state
  *  Auto|On|Off rows, always writing the WHOLE modules object back (so every key
  *  persists, not just the one clicked). Dependency-light (React only) → jsdom. */
 // @vitest-environment jsdom
@@ -7,7 +7,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { render, fireEvent, within } from '@testing-library/react';
 import ModuleTogglesEditor from '../../src/editor/panels/ModuleTogglesEditor';
 
-const MODULE_KEYS = ['render3d', 'render2d', 'physics2d', 'physics3d', 'npr', 'gpuParticles'];
+const MODULE_KEYS = ['render3d', 'render2d', 'physics2d', 'physics3d', 'video'];
 
 /** Find a module's row by its `data-ui-id`.
  *
@@ -35,13 +35,13 @@ describe('ModuleTogglesEditor', () => {
 
   it('clicking On writes the full modules object with only that key changed', () => {
     const onChange = vi.fn();
-    const value = { render3d: 'auto', render2d: 'auto', physics2d: 'auto', physics3d: 'auto', npr: 'auto', gpuParticles: 'auto' };
+    const value = { render3d: 'auto', render2d: 'auto', physics2d: 'auto', physics3d: 'auto', video: 'auto' };
     const { container } = render(<ModuleTogglesEditor value={value} onChange={onChange} />);
     const row = rowFor(container, 'physics2d');
     fireEvent.click(within(row).getByText('On'));
     expect(onChange).toHaveBeenCalledTimes(1);
     expect(onChange).toHaveBeenCalledWith({
-      render3d: 'auto', render2d: 'auto', physics2d: true, physics3d: 'auto', npr: 'auto', gpuParticles: 'auto',
+      render3d: 'auto', render2d: 'auto', physics2d: true, physics3d: 'auto', video: 'auto',
     });
   });
 
@@ -50,7 +50,7 @@ describe('ModuleTogglesEditor', () => {
     const { container } = render(<ModuleTogglesEditor value={{ render3d: true, physics3d: false }} onChange={onChange} />);
     fireEvent.click(within(rowFor(container, 'render2d')).getByText('Off'));
     expect(onChange).toHaveBeenCalledWith({
-      render3d: true, render2d: false, physics2d: 'auto', physics3d: false, npr: 'auto', gpuParticles: 'auto',
+      render3d: true, render2d: false, physics2d: 'auto', physics3d: false, video: 'auto',
     });
   });
 
@@ -76,9 +76,9 @@ describe('ModuleTogglesEditor', () => {
     const onChange = vi.fn();
     // value is not an object → all rows Auto; clicking one still yields a full object.
     const { container } = render(<ModuleTogglesEditor value={undefined} onChange={onChange} />);
-    fireEvent.click(within(rowFor(container, 'npr')).getByText('On'));
+    fireEvent.click(within(rowFor(container, 'video')).getByText('On'));
     expect(onChange).toHaveBeenCalledWith({
-      render3d: 'auto', render2d: 'auto', physics2d: 'auto', physics3d: 'auto', npr: true, gpuParticles: 'auto',
+      render3d: 'auto', render2d: 'auto', physics2d: 'auto', physics3d: 'auto', video: true,
     });
   });
 });
