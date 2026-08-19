@@ -52,6 +52,11 @@ Settings → Developer → "Debug build") — there's no independent debug-menu-
 [debug-tools-mcp.md](./debug-tools-mcp.md) "Percept".
 
 - **Editor / dev:** always enabled (`__MODOKI_EDITOR__`).
+- **New projects: ON.** The scaffolder template sets `"debugBuild": true`, so a freshly
+  created project is agent-reachable and profilable without a config hunt — and must be
+  turned OFF before it ships. The loader default is still `false`, so a config that omits
+  the key (one hand-written, or copied from elsewhere) is off. Every project under
+  `games/` and `demos/` sets it `true` today; none of them ship (#239).
 - **Shipped game:** enabled only when the project sets `build.debugBuild: true`. When off,
   `App.tsx` never lazy-imports the `@modoki/engine/runtime/debug` chunk, so the entire menu (tabs,
   widgets, console capture, toaster) **tree-shakes out** of the bundle. Toggle it in the editor via

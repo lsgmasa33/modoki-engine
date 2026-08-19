@@ -405,6 +405,10 @@ export {
   setRenderSettings, getRenderSettings, resetRenderSettings, resolveToneMapping,
   setActiveQualityTier, getActiveQualityTier, getAssessedQualityTier,
   getEffectiveThreeSettings, getEffectivePixiSettings, getEffectiveTargetFps,
+  // Exported for GAMES, not just the renderer (#241): a game that wants to react to the tier
+  // needs to ask what the tier ALLOWS — `tierAllowsEffect(getActiveTierOverrides(), 'bloom')`
+  // — and the resolved overrides were reachable only from inside the engine.
+  getActiveTierOverrides,
   getTierSwitchMessage, DEFAULT_TIER_SWITCH_MESSAGE,
   getActiveTierOrDefault,
 } from './rendering/renderSettings';
@@ -416,6 +420,10 @@ export {
 export {
   getPlayerQualityTier, setPlayerQualityTier, hasPlayerQualityTier, choosePlayerQualityTier,
 } from './rendering/playerQualityTier';
+// The game-facing tier-change seam (#241) — subscribe to degrade YOUR game by tier; the
+// exports above only ever move the engine's own render knobs.
+export { onQualityTierChange, resetQualityTierChangeListeners } from './rendering/tierChangeNotify';
+export type { QualityTierChangeListener } from './rendering/tierChangeNotify';
 export { playerTierStore, type PlayerTierStore } from './core/playerTierStore';
 export type { RenderSettings, ThreeRenderSettings, PixiRenderSettings, WebRenderSettings } from './rendering/renderSettings';
 export { getWorldTransform3D, getWorldMatrix3D, getParentWorldMatrix3D, worldToLocal3D, hasParent } from './core/ecs/worldTransform';

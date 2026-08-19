@@ -99,7 +99,48 @@ export function resolveDeviceHostPort(env: NodeJS.ProcessEnv = process.env): num
  *  reply, which is byte-for-byte what a dead device end looks like through a forward. It names both
  *  and gives the one command that settles it. Reporting two candidates honestly beats reporting one
  *  confidently and wrongly. */
-export function explainConnectFailure(detail: string | undefined, port: number, useAdb = false): string | undefined {
+export function explainConnectFailure(
+  detail: string | undefined, port: number, useAdb = false, debugBuild?: boolean,
+): string | undefined {
+  // ⭐ A KNOWN-OFF FLAG IS THE LEADING SUSPECT (#239) — but only ECONNREFUSED lets it be the
+  // ONLY one, and that asymmetry is the whole of this branch.
+  //
+  // `build.debugBuild: false` means no TCP server was compiled in, so a project with it off
+  // explains "nothing is listening" completely. Six of twenty projects shipped without the flag
+  // and each cost a hunt, because the adb advice below leads with a HEAL problem — and healing a
+  // `false` flag writes it off again, so its one suggested fix could not work.
+  //
+  // ⚠️ **BUT THE FLAG IS THE OPEN PROJECT'S, AND THE PHONE MAY BE RUNNING A DIFFERENT APP.** The
+  // running app is only knowable AFTER a lease opens (`device_status` reports the socket holder
+  // for exactly this reason, #88), so at this moment it is unknown. That matters because
+  // `refused` means the socket OPENED and the handshake got no reply — something ACCEPTED the
+  // connection, which is proof a server is listening and therefore proof it is not simply absent.
+  // A backgrounded sibling app squatting the shared 9095 produces precisely that, and it is not
+  // hypothetical: it was hit on a Galaxy A23 on 2026-08-19, where `sling` answered a connect
+  // aimed at `postfx-demo`. So `refused` keeps the second cause; only ECONNREFUSED — where
+  // nothing accepted at all — gets to be definitive.
+  const flagOff = debugBuild === false;
+  if (flagOff && detail && /ECONNREFUSED/i.test(detail)) {
+    return `${detail} — this project has \`build.debugBuild: false\`, so the app was built with `
+      + `NO debug bridge: there is no TCP server on the device to connect to, and no lease to `
+      + `take. Nothing about the network, the port, or another Modoki holding the lease is `
+      + `involved. Fix: set Project Settings → Developer → "Debug build" (or \`build.debugBuild: `
+      + `true\` in project.config.json), then REBUILD and redeploy — reopening the project alone `
+      + `is not enough, because heal syncs the flag's current value into the native project and `
+      + `that value is off.`;
+  }
+  if (flagOff && detail === 'refused') {
+    return `refused — the socket opened but the app never answered the lease handshake. This `
+      + `project has \`build.debugBuild: false\`, so it ships NO debug bridge, which is the `
+      + `likeliest cause and the one to rule out first: set Project Settings → Developer → `
+      + `"Debug build" (or \`build.debugBuild: true\`), then REBUILD and redeploy — reopening the `
+      + `project alone is not enough, because heal syncs the flag's current value and that value `
+      + `is off.\n  It is NOT the only cause, because something accepted the connection: over adb `
+      + `the forward accepts on this clone's end even when the device port is dead, and over WiFi `
+      + `an accepted socket means some app IS listening on ${port} — a backgrounded sibling Modoki `
+      + `game squatting the shared port answers exactly like this. Check with `
+      + `\`adb shell ps -A | grep modoki\` and force-stop the others, or relaunch the app.`;
+  }
   // `refused` is the sentinel `DeviceLeaseClient.connect` sets when the socket opened but the
   // handshake produced nothing (deviceLease.ts). A GENUINE busy reply from the device always names
   // its reason — `busy` / `no-lease` / `not-owner` — so this branch cannot swallow a real lease
@@ -426,6 +467,10 @@ export interface ConnectRequest {
    *  `adb devices`. Only meaningful with `useAdb`; a serial that matches nothing attached is an
    *  error, never a fall-through to another phone. */
   serial?: string;
+  /** The OPEN PROJECT's `build.debugBuild`, supplied by the router — never by the caller (#239).
+   *  When it is `false` the app has no debug bridge compiled in at all, which turns the handshake
+   *  failure below from two guesses into one certainty. */
+  debugBuild?: boolean;
 }
 
 export class DeviceConnectionManager {
@@ -497,6 +542,7 @@ export class DeviceConnectionManager {
     // 9095). Over adb the port we CONNECT to is this clone's derived host end of the tunnel; over
     // WiFi the two are the same port, because there is no tunnel.
     const devicePort = req.port ?? DEVICE_PORT;
+    const debugBuild = req.debugBuild;
     let port = devicePort;
     let host: string;
     let serial: string | undefined;
@@ -566,7 +612,7 @@ export class DeviceConnectionManager {
       transport: this.transport,
       // The advice keys off the DEVICE port, not the host end of the tunnel: an ECONNREFUSED on a
       // derived 127.0.0.1:9097 still means "nothing is listening on 9095 over there".
-      onState: (s, d) => { this.state = s; this.detail = explainConnectFailure(d, devicePort, useAdb); },
+      onState: (s, d) => { this.state = s; this.detail = explainConnectFailure(d, devicePort, useAdb, debugBuild); },
     });
     this.target = { host, port, useAdb, ...(serial ? { serial } : {}) };
     const landed = await this.client.connect();

@@ -233,7 +233,13 @@ export interface ProjectConfig {
      *  tree-shakes out — a release build has no eval-capable server to connect to.
      *  Set true for a QA/playtest/profiling game build that needs any of this on
      *  device. (Previously the debug bridge was ungated on native, so every native
-     *  build shipped it; this flag closes that exposure.) */
+     *  build shipped it; this flag closes that exposure.)
+     *
+     *  NOTE the LOADER default below stays `false` — a config that omits the key
+     *  is off — but the scaffolder template sets `"debugBuild": true`, so a NEWLY
+     *  created project is debuggable/profilable out of the box and must be turned
+     *  OFF before it ships (#239: six of twenty projects were unreachable by every
+     *  `device_*` tool, each costing a config flip + rebuild to measure). */
     debugBuild: boolean;
     /** Build-time engine-module include/exclude toggles — tree-shakes unused
      *  SDKs (three.js / pixi.js / Rapier) out of the bundle. Each defaults to

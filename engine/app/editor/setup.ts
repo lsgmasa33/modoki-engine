@@ -446,7 +446,7 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
             {
               title: 'Developer',
               fields: [
-                { key: 'build.debugBuild', label: 'Debug build', type: 'checkbox', help: 'Ships the event journal (emit/modoki_journal), the in-game debug menu (F12 / 3-finger tap: stats, world, journal, device IP), and the debug bridge that device_* AI tools connect to — INCLUDING device_eval (arbitrary JS on the device). Turn ON for a QA/playtest/profiling build; leave OFF for release, where all three are tree-shaken out (nothing to connect to, no journal overhead). Always on in the editor/dev. Rebuild to apply.' },
+                { key: 'build.debugBuild', label: 'Debug build', type: 'checkbox', help: 'Ships the event journal (emit/modoki_journal), the in-game debug menu (F12 / 3-finger tap: stats, world, journal, device IP), and the debug bridge that device_* AI tools connect to — INCLUDING device_eval (arbitrary JS on the device). Turn ON for a QA/playtest/profiling build; leave OFF for release, where the debug menu and the bridge are tree-shaken out entirely (nothing to connect to) and the journal stops recording. Always on in the editor/dev. Rebuild to apply.' },
                 { key: 'build.textureTierVariants', label: 'Texture tier variants', type: 'select', options: labeled(TEXTURE_TIER_VARIANTS_MODES, {
                   auto: 'Auto (emit only when delivered over the wire)',
                   always: 'Always (also emit for a plain native package)',

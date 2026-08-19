@@ -254,6 +254,22 @@ host — a first-wins plugin refuses an extra client by dropping the socket with
 byte-for-byte what a dead device end looks like through a forward — so `explainConnectFailure` names
 both rather than guessing, and the connect no longer keeps its hardware claim when it fails.
 
+**When the OPEN PROJECT ships `build.debugBuild: false`, the message says so first (#239)** — that
+flag means no TCP server was compiled in, which explains "nothing is listening" outright, and the
+advice below (reopen the project so heal syncs the flag) *cannot work* while the flag is off,
+because heal writes its current value. The backend reads the flag from `loadProjectConfig`, never
+from the request body, so a caller cannot talk the refusal out of naming it.
+
+⚠️ **But it is definitive ONLY for `ECONNREFUSED`, and the asymmetry is load-bearing.** `refused`
+means the socket was ACCEPTED and then not answered — something *is* listening, which is proof the
+server is not simply absent. Two reasons that happens with the open project's flag off: over adb
+the forward accepts on this clone's end even when the device port is dead, and **the flag belongs
+to the open project while the phone may be running a different app** — which app holds the socket
+is unknowable until a lease opens (see `device_status`, #88). A backgrounded sibling game squatting
+the shared 9095 answers exactly like this; it was hit on a Galaxy A23 on 2026-08-19, where `sling`
+answered a connect aimed at `postfx-demo`. So `refused` names the flag as the leading suspect and
+keeps the second cause; only `ECONNREFUSED` gets to rule the others out.
+
 Which one it is, settled in one command (**hex** — `/proc/net/tcp` is hex, and hand-converting 9095
 to `0x238F` instead of `0x2387` is a mistake that has already voided one investigation):
 
@@ -1060,12 +1076,20 @@ authored, bare = game-authored, `!` = human/editor. All ride the same bridge (de
 entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
 - **Semantic (game logic):** `modoki_journal` reads the tick-stamped event trace — game `emit`s
   (`match`/`score`/`win`) PLUS engine `@`-lifecycle events (`@spawn`/`@despawn`, `@anim-start`/
-  `@anim-loop`/`@anim-finish`, `@contact`/`@sensor`, `@scene-loaded`/`@scene-swapped`), GUID-addressed.
+  `@anim-loop`/`@anim-finish`, `@contact`/`@sensor`, `@scene-loaded`/`@scene-swapped`, `@tier`
+  — a quality-tier change carrying `prev`/`source`/`reason`), GUID-addressed.
   `modoki_dispatch_action` fires a game intent by name (needs Play); `modoki_list_actions` discovers
   dispatchable actions + read-values. Assert on events, not screenshots. Returns the **last 100 events
   + `byType` counts over the whole 10,000-event ring** (a `@contact`-heavy physics session is ~582k
   tokens entire) — narrow with `type=`, raise `limit=N`. (Journal is **off in shipped game builds** —
-  gated `__MODOKI_EDITOR__ || build.debugBuild`; always on in the editor. On device the bridge
+  gated `__MODOKI_EDITOR__ || build.debugBuild`; always on in the editor. **Off means not
+  RECORDING, not removed** — unlike the debug menu and the bridge (dynamic imports that
+  tree-shake out entirely), `core/journal.ts` is statically imported by ~14 runtime modules
+  (`SceneManager`, physics, zones, timeline, haptics, video, IAP…), so a release build still
+  ships the ring-buffer module and pays one dead `if` per `emit()`. Threading a compile-time
+  flag through all of them for a few KB was **declined** — it is a dead branch, not an attack
+  surface like the bridge's eval endpoint; revisit only if a playable-ad byte budget actually
+  needs it ([playable-export.md](./playable-export.md)). On device the bridge
   turns it ON the moment a debug client attaches — on `connectionChanged` AND, because a page
   reload re-runs `main.tsx`'s disable while the native socket persists with no reconnect event, at
   bridge init via `getStatus().clientConnected` — so launch/reload-time events record during a

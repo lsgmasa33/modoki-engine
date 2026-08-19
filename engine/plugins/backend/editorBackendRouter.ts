@@ -796,7 +796,11 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   }
   if (urlPath === '/api/device/connect' && method === 'POST') {
     const b = (body ?? {}) as ConnectRequest;
-    try { return json(await deviceConnection.connect({ ip: b.ip, useAdb: b.useAdb, port: b.port, serial: b.serial })); }
+    // `debugBuild` comes from the OPEN PROJECT's config, never from `b` — a caller must not be
+    // able to talk the refusal out of naming the real cause (#239).
+    let debugBuild: boolean | undefined;
+    try { debugBuild = loadProjectConfig(ctx.projectRoot).build.debugBuild === true; } catch { /* unreadable config: stay silent rather than guess */ }
+    try { return json(await deviceConnection.connect({ ip: b.ip, useAdb: b.useAdb, port: b.port, serial: b.serial, debugBuild })); }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 500); }
   }
   if (urlPath === '/api/device/disconnect' && method === 'POST') {

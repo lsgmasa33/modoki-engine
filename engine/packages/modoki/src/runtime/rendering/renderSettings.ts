@@ -29,6 +29,7 @@ import {
   type QualityTier, type QualityTierSetting, type TierResolution,
   type TierRenderOverrides, type AuthoredTiers,
 } from './qualityTier';
+import { publishQualityTierChange } from './tierChangeNotify';
 
 export interface ThreeRenderSettings {
   backend: 'auto' | 'webgpu' | 'webgl';
@@ -188,6 +189,7 @@ let assessedTier: TierResolution | null = null;
 /** Publish the resolved tier. Called once at renderer bring-up, and again by the calibration
  *  loop on a promote/demote (P3b). */
 export function setActiveQualityTier(res: TierResolution | null): void {
+  const prev = activeTier?.tier ?? null;
   activeTier = res;
   // ⚠️ THE FIRST RESOLUTION OF A SESSION IS KEPT SEPARATELY, and it is not the same fact as the
   // active one. `applyQualityTier` re-publishes here on every live promote/demote with
@@ -212,6 +214,13 @@ export function setActiveQualityTier(res: TierResolution | null): void {
   // unless the setting is `'auto'`, so a project pin can never consult the ceiling.
   if (res === null) assessedTier = null;
   else if (assessedTier === null && res.source !== 'player') assessedTier = res;
+
+  // Tell any game that asked (#241). AFTER the latching above, so a listener reading
+  // `getAssessedQualityTier()` sees the same world the rest of the engine does. Only on an
+  // actual CHANGE of tier: a re-publish carrying a new `reason` for the tier already active
+  // is not something a game degrades itself over, and clearing the tier (`res === null`) is
+  // teardown, not a tier a game could act on.
+  if (res !== null && res.tier !== prev) publishQualityTierChange(res, prev);
 }
 
 /** The resolved tier + WHY, or null before a renderer has brought one up. Surfaced in

@@ -4,7 +4,8 @@
     "webBucket": "",
     "webBasePath": "/",
     "webCdnUrlMap": "",
-    "appleTeamId": ""
+    "appleTeamId": "",
+    "debugBuild": true
   },
   "app": {
     "appId": "__APP_ID__",

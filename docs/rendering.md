@@ -799,6 +799,44 @@ project could only pin *which row it got*, never say what a row meant — so pos
   written before a field existed cannot have meant to clamp it, and `Math.min(3, undefined)` is
   `NaN`, i.e. a backing buffer of `NaN` pixels, silently.
 
+#### Telling a GAME the tier changed — `onQualityTierChange` (#241)
+
+Every knob described above is a knob the engine turns on **itself**. A game that wants to degrade
+its own content by tier — spawn counts, particle budgets, an LOD bias, an expensive gameplay
+effect — needs to know when the tier moves, and until #241 it could only poll
+`getActiveTierOrDefault()` and hope it read at the right moment. Polling is fine at a scene
+boundary and wrong for the case the tier system exists for: **calibration demotes mid-session, on
+the weak hardware where a game's own degradation matters most.**
+
+```ts
+import { onQualityTierChange } from '@modoki/engine/runtime'
+
+const off = onQualityTierChange((res, prev) => {
+  // prev === null on the first resolution of a session — the tier the device booted into.
+  setMaxEnemies(res.tier === 'low' ? 12 : 40)
+})
+```
+
+- **Multi-subscriber, deliberately.** The other listener seam here, `onTierSwitchOverlay`, carries
+  overlay COPY and documents that it has exactly one intended reader; two renderers of it would
+  double the overlay. N readers of a *value* cannot conflict that way.
+- **Fires on CHANGE only.** A re-publish carrying a fresh `reason` for the tier already active is
+  not a tier change, and clearing the tier at teardown is not one either.
+- **A listener, not a store write** — `runtime/store` is L3 and `runtime/rendering` is L2, so
+  publishing into the store would be an upward import and an ESLint error.
+- **A `@tier` journal event rides along**, so a demote is visible to `modoki_journal` /
+  `device_journal` and assertable in `createTestWorld`. It is Tier-1 (always-on): tier changes are
+  low-rate, and gating them behind a watch would mean the demote you are hunting is the one event
+  you did not capture.
+
+⚠️ **It publishes from `setActiveQualityTier`, NOT from `applyQualityTier` — and that is #202
+repeating.** `applyQualityTier` reads like the single funnel every tier change goes through and is
+not: it runs on a live promote/demote and on a player's menu pick, while **the tier a device
+actually ships with is published by `tierResolve.publishActiveTier` calling `setActiveQualityTier`
+directly**. Wiring a new tier consumer into `applyQualityTier` alone is precisely how the frame cap
+and the 2D backing size ended up inert on the path nearly every device takes and never leaves. Any
+future tier consumer belongs at the value, not at one of its callers.
+
 #### A project with no 3D surface resolves a tier too (#203)
 
 ⭐ **Until 2026-08-13 it did not, and every tier field on three projects was inert.**

@@ -87,3 +87,69 @@ describe('explainConnectFailure over adb (#164)', () => {
     expect(explainConnectFailure('refused', DEVICE_PORT)).toBe('refused');
   });
 });
+
+/** #239 — the flag the message could always have READ.
+ *
+ *  Six of twenty projects shipped with `build.debugBuild` absent, so `device_connect` dead-ended on
+ *  each one. The two branches above are honest about not being able to tell their causes apart, and
+ *  the adb one leads with a HEAL problem — but healing a `false` flag writes it off again, so its
+ *  single suggested fix could not work. When the router can see the flag is off there is nothing to
+ *  guess: no server was compiled in. */
+describe('explainConnectFailure when the project is not a debug build (#239)', () => {
+  it('names the flag as THE cause, over adb', () => {
+    const out = explainConnectFailure('refused', DEVICE_PORT, true, false)!;
+    expect(out).toContain('build.debugBuild: false');
+  });
+
+  it('names it over WiFi too, where the symptom is an ECONNREFUSED instead', () => {
+    const out = explainConnectFailure(`connect ECONNREFUSED 192.168.1.181:${DEVICE_PORT}`, DEVICE_PORT, false, false)!;
+    expect(out).toContain('build.debugBuild: false');
+  });
+
+  it('says REBUILD, and says reopening alone is not enough', () => {
+    // The trap this replaces: the adb advice sends you to heal-on-open, which syncs the flag's
+    // CURRENT value — off — into the native project. Following it changes nothing and reads as
+    // "I did the fix and it still fails".
+    const out = explainConnectFailure('refused', DEVICE_PORT, true, false)!;
+    expect(out).toMatch(/REBUILD/i);
+    expect(out).toMatch(/not enough/i);
+  });
+
+  it('over ECONNREFUSED it may rule the other causes OUT — nothing accepted the socket', () => {
+    const out = explainConnectFailure(`connect ECONNREFUSED 10.0.0.5:${DEVICE_PORT}`, DEVICE_PORT, false, false)!;
+    expect(out).toMatch(/Nothing about the network, the port, or another Modoki/i);
+  });
+
+  it('over `refused` it must NOT rule them out — an accepted socket proves something IS listening', () => {
+    // ⚠️ THE FLAG IS THE OPEN PROJECT'S; THE PHONE MAY BE RUNNING A DIFFERENT APP, and which app
+    // holds the socket is unknowable until a lease opens (#88). `refused` means the connection was
+    // ACCEPTED and then not answered — so "no server was compiled in" cannot be the whole story.
+    // Hit for real on a Galaxy A23 (2026-08-19): a backgrounded `sling` answered a connect aimed
+    // at `postfx-demo`. Had the open project been debugBuild:false, the old message would have
+    // said "there is no TCP server on the device" while sling's server was demonstrably replying.
+    const out = explainConnectFailure('refused', DEVICE_PORT, true, false)!;
+    expect(out).toContain('build.debugBuild: false');       // still the leading suspect
+    expect(out).toMatch(/NOT the only cause/i);             // but not the only one
+    expect(out).toMatch(/squatting the shared port|force-stop/i);
+  });
+
+  it('stays out of the way when the flag is ON — the old two-cause advice is still the right answer', () => {
+    const out = explainConnectFailure('refused', DEVICE_PORT, true, true)!;
+    expect(out).not.toContain('build.debugBuild: false');
+    expect(out).toContain('/proc/net/tcp');
+  });
+
+  it('stays out of the way when the flag is UNKNOWN — an unreadable config must not assert', () => {
+    const out = explainConnectFailure('refused', DEVICE_PORT, true, undefined)!;
+    expect(out).not.toContain('build.debugBuild: false');
+  });
+
+  it('leaves a GENUINE busy reply alone even when the flag is off', () => {
+    // The device answered and named its reason. A flag we can see is off does not make that a lie —
+    // and overriding it would reintroduce, in the other direction, the confident-and-wrong report
+    // this whole message exists to avoid.
+    for (const reason of ['busy', 'no-lease', 'not-owner']) {
+      expect(explainConnectFailure(reason, DEVICE_PORT, true, false)).toBe(reason);
+    }
+  });
+});
