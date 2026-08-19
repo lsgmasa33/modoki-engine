@@ -82,6 +82,7 @@ export function registerSource(source: InputSource): void {
 }
 
 export function unregisterSource(name: string): void {
+  brokenResets.delete(name);
   const idx = sources.findIndex((s) => s.name === name);
   if (idx >= 0) { sources[idx].detach(); sources.splice(idx, 1); }
 }
@@ -136,10 +137,44 @@ export function detachAll(): void {
  *  reaches it. `reset()` must stay CHEAP for that reason: it is now per-frame, not per-edge. */
 export function sampleAll(out: InputFrame): void {
   if (isInputSuppressed()) {
-    for (const s of sources) s.reset?.();
+    for (const s of sources) drain(s);
     return;
   }
   for (const s of sources) s.sample(out);
+}
+
+/** Names already reported for a throwing `reset()`, so the warning is once per source, not
+ *  once per frame. Cleared in `unregisterSource` so a re-registered (fixed) source can warn
+ *  again. */
+const brokenResets = new Set<string>();
+
+/** Drain one source, FAILING OPEN like the gate predicate above.
+ *
+ *  Why this is guarded when `sample()` is not: making the drain continuous (#264) removed the
+ *  natural throttle that used to bound a throwing `reset()`. Under the old edge-triggered
+ *  shape a throw could not repeat — the next suppressed frame took the early return, ran
+ *  clean, and `frameDriver` clears a callback's error count on any successful run. Per-frame,
+ *  a throwing reset throws EVERY suppressed frame, and `frameDriver` auto-unregisters a
+ *  callback after 10 consecutive errors (rendering/frameDriver.ts) — that callback being the
+ *  whole `'ecs'` pipeline. So a game registering one buggy `InputSource` could kill physics,
+ *  animation and transforms for the session by clicking into an editor panel and leaving it
+ *  there for a sixth of a second. None of the three built-in sources can throw (all pure
+ *  field/Set writes), so this is a guard for `registerSource`'s public contract, not for us.
+ *
+ *  Swallowed but NOT silent: a broken reset strands held state, which is exactly what this
+ *  mechanism exists to prevent, so it is reported once per source rather than hidden.
+ *  `sample()` is deliberately left unguarded — it is unchanged by #264 and has always run
+ *  once per unsuppressed frame, so guarding it here would be a behaviour change smuggled in
+ *  under a fix for something else. */
+function drain(s: InputSource): void {
+  try {
+    s.reset?.();
+  } catch (err) {
+    if (!brokenResets.has(s.name)) {
+      brokenResets.add(s.name);
+      console.error(`[input] source "${s.name}" threw in reset() — its held state cannot be cleared while input is suppressed, so it may strand. Reported once.`, err);
+    }
+  }
 }
 
 // Built-in sources. Keyboard + gamepad + pointer are always registered (all inert

@@ -148,7 +148,14 @@ the policy.**
   presses to the game and the second delivered 1; after, the first delivers 1.
 - **Null focus deliberately does not suppress**: pressing Play and immediately using WASD has to
   work without first clicking the GameView.
-- The gate **fails open** if the policy function throws.
+- The gate **fails open** if the policy function throws — and so does the DRAIN. A source whose
+  `reset()` throws is reported once, by name, and skipped; the rest still drain. That guard is
+  load-bearing only because the drain is per-frame: `frameDriver` auto-unregisters a callback
+  after 10 *consecutive* throws, and the callback here is the whole `'ecs'` pipeline, so an
+  unguarded throwing reset would let one buggy game-registered source kill physics, animation
+  and transforms by leaving a non-game panel focused for ~166 ms. The old edge-triggered shape
+  could not reach 10 in a row (the next suppressed frame returned early and ran clean, which
+  clears the count). `sample()` stays unguarded — it is unchanged, and always ran per frame.
 
 ### The agent-facing half: a suppressed key used to look identical to a delivered one
 

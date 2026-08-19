@@ -103,10 +103,14 @@ describe('gate closed — input stops reaching the game', () => {
     expect(fake.calls.reset).toBe(2);   // suppressed again → draining again
   });
 
-  it('a backlog queued while suppressed still cannot replay', () => {
-    // The property the deleted reopening-edge reset existed for. It must survive the
-    // change to a continuous drain — this is what stops every click made in an editor
-    // panel from replaying into the game once the GameView regains focus.
+  it('keeps draining while shut, and stops once open — the bookkeeping half', () => {
+    // ⚠️ SCOPE, because the first draft of this test claimed more than it checks: `fake` is a
+    // COUNTING source with no queue, so nothing here can verify that queued DATA does not
+    // replay. It pins the reset FREQUENCY only. The real anti-replay property — a genuine
+    // queued press not leaking into the game — is pinned by
+    // '#264 › still drops a press made while the gate was shut', which drives the real
+    // pointerSource. (The test this replaced was count-only too, so that property was never
+    // covered before either; the #264 block is strictly stronger than what was deleted.)
     let blocked = true;
     setInputGate(() => blocked);
     sampleAll(emptyFrame());
@@ -145,6 +149,10 @@ describe('#264: the press that opens the gate', () => {
     return f;
   };
 
+  // `detach()` calls reset(), which clears down/activeId/pending/the 1€ filters — but NOT
+  // x/y/startX/startY, which persist as the last known pointer position by design. Inert
+  // today (no later test in this file reads pointer coordinates) and called out here because
+  // the next one that does would inherit 160/140 from the drag case above.
   afterEach(() => { pointerSource.detach(); });
 
   it('delivers a press that lands in the same tick the scope moves to the game', () => {
@@ -205,6 +213,42 @@ describe('#264: the press that opens the gate', () => {
 });
 
 describe('robustness', () => {
+  it('a source whose reset() THROWS cannot kill the frame callback (#264 follow-up)', () => {
+    // Making the drain continuous removed the throttle that used to bound this: under the old
+    // edge-triggered shape a throwing reset could not repeat, and frameDriver clears a
+    // callback's error count on any successful run. Per-frame it throws every suppressed
+    // frame, and frameDriver auto-unregisters after 10 CONSECUTIVE errors — that callback
+    // being the whole 'ecs' pipeline. So an unguarded drain lets one buggy game-registered
+    // source kill physics/animation/transforms by leaving an editor panel focused for ~166ms.
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const bad: InputSource = {
+      name: 'test-throwing-reset',
+      attach() {}, detach() {}, sample() {},
+      reset() { throw new Error('boom'); },
+    };
+    // Registered BEFORE the healthy one, deliberately: `fake` (from beforeEach) already sits
+    // earlier in the array, so asserting on it proves nothing about whether a throw stops the
+    // iteration. `after` is what pins that — a first draft asserted on `fake` and a
+    // break-out-of-the-loop mutation sailed straight through it.
+    const after = fakeSource('test-after-thrower');
+    registerSource(bad);
+    registerSource(after.src);
+    setInputGate(() => true);
+    try {
+      for (let i = 0; i < 12; i++) expect(() => sampleAll(emptyFrame())).not.toThrow();
+      // Reported ONCE, not once per frame — a per-frame console.error is its own outage.
+      expect(err).toHaveBeenCalledTimes(1);
+      expect(String(err.mock.calls[0][0])).toContain('test-throwing-reset');
+      // A source AFTER the thrower is still drained — one bad source must not strand the rest.
+      expect(after.calls.reset).toBe(12);
+    } finally {
+      unregisterSource('test-throwing-reset');
+      unregisterSource('test-after-thrower');
+      err.mockRestore();
+    }
+  });
+
+
   it('fails OPEN when the gate throws', () => {
     // A broken editor predicate must never make a game permanently uncontrollable.
     setInputGate(() => { throw new Error('boom'); });
