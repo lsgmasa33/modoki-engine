@@ -14,10 +14,10 @@ import net from 'net';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
-import { DeviceConnectionManager, adbRunner, releaseDeviceResourcesOnExit, reclaimStaleForwardsAtStartup } from '../../plugins/backend/deviceConnection';
+import { DeviceConnectionManager, adbRunner, releaseDeviceResourcesOnExit, reclaimStaleDeviceStateAtStartup } from '../../plugins/backend/deviceConnection';
 import { androidDevicesExec, _clearFriendlyNameCache } from '../../plugins/backend/androidDevices';
 import { DeviceLeaseAuthority } from '../../plugins/backend/deviceLease';
-import { listClaims } from '../../plugins/backend/deviceClaims';
+import { claimsDir, listClaims } from '../../plugins/backend/deviceClaims';
 import { deviceCdpAdb, discoverDeviceCdpTarget, resetDeviceCdpSession } from '../../plugins/backend/deviceCdp';
 
 const realForward = adbRunner.forward;
@@ -338,7 +338,7 @@ describe('DeviceConnectionManager — useAdb branch', () => {
       ].join('\n');
       (adbRunner.removeForward as ReturnType<typeof vi.fn>).mockClear();
 
-      reclaimStaleForwardsAtStartup();
+      reclaimStaleDeviceStateAtStartup();
 
       const ports = (adbRunner.removeForward as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
       expect(ports.sort()).toEqual([9095, 9333]);
@@ -348,8 +348,32 @@ describe('DeviceConnectionManager — useAdb branch', () => {
     it('reclaims nothing when the ports are clear — the normal startup, and it must stay silent', () => {
       adbRunner.listForwards = () => 'OTHERSERIAL tcp:9334 localabstract:webview_devtools_remote_888';
       (adbRunner.removeForward as ReturnType<typeof vi.fn>).mockClear();
-      reclaimStaleForwardsAtStartup();
+      reclaimStaleDeviceStateAtStartup();
       expect(adbRunner.removeForward).not.toHaveBeenCalled();
+    });
+
+    /** #225 — the claims half of the same startup hook.
+     *
+     *  A dead-pid claim never BLOCKED another clone (every reader applies `isStale`, and
+     *  `deviceClaims.test.ts` measures that directly). What it did was sit in
+     *  `~/.modoki/device-claims.json` naming a clone, a branch and a purpose — a file CLAUDE.md
+     *  tells an agent to read as "did I give the phone back" — so the corpse read as a live hold
+     *  and was hand-deleted twice before it became an issue. Startup is where it gets swept,
+     *  because `stop-editor.sh` sends a SIGTERM that no in-process hook survives. */
+    it('sweeps a dead-pid claim out of the claims FILE at startup, leaving live ones', () => {
+      const file = path.join(claimsDir(), 'device-claims.json');
+      fs.mkdirSync(claimsDir(), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify({ claims: [
+        { deviceId: 'adb:THEIRS', clone: '/Users/x/Projects/modoki-ai3', branch: 'work-ai3', pid: 424242, at: Date.now(), purpose: 'holding a device lease over USB' },
+        { deviceId: 'adb:MINE', clone: '/Users/x/Projects/modoki', branch: 'main', pid: process.pid, at: Date.now() },
+      ] }));
+      adbRunner.listForwards = () => '';
+
+      reclaimStaleDeviceStateAtStartup();
+
+      const onDisk = JSON.parse(fs.readFileSync(file, 'utf8')).claims as Array<{ deviceId: string }>;
+      expect(onDisk.map((c) => c.deviceId)).toEqual(['adb:MINE']);
+      fs.rmSync(file, { force: true });
     });
 
     it('is a no-op when nothing is held — a bare import must not touch adb on exit', () => {

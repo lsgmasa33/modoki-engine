@@ -55,6 +55,33 @@ export const UIElement = trait({
   maxHeightUnit: 'px' as UILengthUnit,
   alignSelf: 'auto' as 'auto' | 'flex-start' | 'center' | 'flex-end' | 'stretch',
   zIndex: 0,
+  /**
+   * Tilt, in DEGREES clockwise. 0 = square, the pre-existing behaviour of every authored element.
+   *
+   * ⚠️ **It rotates about the ANCHOR PIVOT, not about the element's own centre** — matching what
+   * `UIAnchor.pivotX/pivotY` already means everywhere else: the pivot is the point of the element
+   * that sits ON the anchor point, so it is the one point a tilt must leave alone. Rotating about
+   * the box centre instead would slide a top-left-anchored element off its own anchor as soon as
+   * the angle changed, which is the shape of bug that reads as "the anchor is broken". An element
+   * with no anchor, or on a STRETCHED axis (where the pivot is ignored because both edges are
+   * pinned), rotates about its centre — there is no pivot to honour.
+   *
+   * Why it exists (#234): a nine-slice CANNOT bake its own tilt. Slices are axis-aligned rects, so
+   * a rotated master is cut along the wrong axes and the corners shear — and a dialog card has to
+   * be a nine-slice, because one master serves both a wide panel and a tall one. So it was
+   * tilt-in-the-engine or square, with nothing in between. Court's approved art direction wants its
+   * cards a few degrees off square, which is most of what makes them read as paper on a desk.
+   *
+   * ⚠️ **A non-zero rotation creates a STACKING CONTEXT** (any transform does), which traps the
+   * `zIndex` of everything inside it — the trap `games/court/CLAUDE.md` already records for
+   * `ChromeRoot`'s centre anchor. Tilting a full-screen container is therefore not free: children
+   * that were escaping its z-order stop escaping. Tilt the CARD, not the layer that holds it.
+   *
+   * ⚠️ The editor's selection overlay stays AXIS-ALIGNED — `resolveAnchorRect` measures an
+   * unrotated rect, so a tilted element's outline and gizmo box will not follow the tilt. Cosmetic
+   * (the render is correct), and deliberately out of scope; it is the honest cost of the feature.
+   */
+  rotation: 0,
   overflow: 'visible' as 'visible' | 'hidden' | 'scroll',
   isVisible: true,
   /**

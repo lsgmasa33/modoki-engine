@@ -40,13 +40,33 @@ reap_repo_process "$MAIN"
 # Give Electron a graceful window to run its exit hooks — that is what takes its OWN Vite
 # down with it, and what makes the launch log's EXIT line appear. Poll rather than sleeping
 # a flat interval so a clean quit returns immediately.
-for _ in $(seq 1 20); do
+#
+# The window is 15s, not the 5s it was. A SIGKILL is not just a blunt stop here: Chromium
+# commits the localStorage LevelDB on a CLEAN SHUTDOWN, so forcing discards every write since
+# the last commit — the saved panel layout, panel/expansion state, and the game's
+# `@editor`-namespace PlayerPrefs. Measured 2026-08-19 (docs/player-prefs.md § Gotchas): a
+# value confirmed present in localStorage survives a graceful stop and is GONE after a
+# SIGKILL, at 0s and at 8s after the write, so waiting for the flush is not an option — only
+# letting the process exit on its own is.
+#
+# 5s turned out to be short enough that a healthy-but-slow exit hit the force path twice in
+# one session. The trade is deliberately one-sided: a genuinely wedged editor now costs 10
+# extra seconds and still dies, while a healthy one keeps state you would otherwise re-set by
+# hand.
+GRACEFUL_POLLS=60   # × 0.25s = 15s
+for _ in $(seq 1 $GRACEFUL_POLLS); do
   reap_repo_alive "$MAIN" || break
   sleep 0.25
 done
 
 if reap_repo_alive "$MAIN"; then
-  echo "[stop-editor] editor did not exit gracefully — forcing."
+  # Say what forcing COSTS. A layout that silently reverts reads as the editor losing your
+  # work at random; naming it here is the difference between a known trade and a mystery.
+  echo "[stop-editor] editor did not exit gracefully after ${GRACEFUL_POLLS}×0.25s — forcing."
+  echo "[stop-editor]   ⚠️  A forced stop discards this editor's UNCOMMITTED localStorage:"
+  echo "[stop-editor]       saved layout, panel state, and the game's @editor PlayerPrefs."
+  echo "[stop-editor]       Chromium only commits those on a clean exit. Not a crash — see"
+  echo "[stop-editor]       docs/player-prefs.md § Gotchas."
   reap_repo_force "$MAIN"
 fi
 

@@ -20,7 +20,7 @@ const UIVideoMount = __MODOKI_MODULE_VIDEO__
   : null;
 import { resolveDomImageUrl, resolveSprite } from '../core/textureRefs';
 import { isGuid } from '../core/assetRefRules';
-import { applyAnchorStyle } from './anchorCss';
+import { applyAnchorStyle, applyRotationStyle } from './anchorCss';
 import { NineSliceImage } from './NineSliceImage';
 import { uiTextAnimation, ensureUITextAnimStyles } from './uiTextAnimation';
 import { useFocusStore } from './focusManager';
@@ -284,6 +284,11 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   if (node.anchor) {
     applyAnchorStyle(style, node.anchor);
   }
+
+  // ── Rotation (#234) ──
+  // AFTER the anchor, because it composes onto the anchor's pivot translate rather than replacing
+  // it. Applies to anchored and flow-laid-out elements alike; the pivot rules live in anchorCss.
+  applyRotationStyle(style, node.rotation, node.anchor);
 
   // ── Click handler ──
   // A button is interactive if it dispatches an action OR applies declarative

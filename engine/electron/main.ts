@@ -115,6 +115,7 @@ import { environmentReimportHandler } from '../plugins/reimport-environment';
 import { atlasReimportHandler } from '../plugins/reimport-atlas';
 import { videoReimportHandler } from '../plugins/reimport-video';
 import type { BackendContext } from '../plugins/backend/editorBackendRouter';
+import { releaseDeviceResourcesOnExit } from '../plugins/backend/deviceConnection';
 import type { SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { ENGINE_VERSION } from '../packages/modoki/src/runtime/core/version';
 
@@ -1941,6 +1942,14 @@ app.on('before-quit', (e) => {
     // Bound the teardown so a wedged close() (e.g. a stuck SSE socket) can't hang
     // the quit, and always exit even if a step rejects. (E4)
     const teardown = (async () => {
+      // Give the phone back BEFORE anything can hang: an adb forward and a device claim are
+      // MACHINE-WIDE state that outlives this process, and until #225 nothing in production called
+      // this at all — the only caller was `/api/device/disconnect`, i.e. the case where a human had
+      // already tidied up. All of it is sync, so it completes even if a step below wedges and the
+      // 5s race times the teardown out. It does NOT cover a SIGTERM (`stop-editor.sh`) or a crash:
+      // Chromium takes the signal and this listener never runs — that is what the startup sweep in
+      // `reclaimStaleDeviceStateAtStartup` is for.
+      try { releaseDeviceResourcesOnExit(); } catch { /* never let cleanup block the quit */ }
       await backendHandle?.close().catch(() => {});
       await state.backend?.stop().catch(() => {});
       await closeSsrLoader().catch(() => {});

@@ -86,7 +86,7 @@ import { nprConfigFromTrait, type NprTraitSnapshot } from './npr/nprConfigFromTr
  *  Kept rather than reverted because the mechanism is sound — but it must not
  *  ship enabled on the strength of a hypothesis its own measurement refuted. Flip this ON only
  *  behind a before/after `renderer.calls` AND frame-time reading on the target device.
- *  Full write-up: docs/plans/draw-call-instancing-plan.md. */
+ *  Full write-up: docs/rendering.md § "Draw-Call Cost & Instanced Batching". */
 const BATCH_DRAW_CALLS = false;
 
 /** Runtime override for the on-device A/B this flag's own comment demands (#212).

@@ -254,6 +254,70 @@ Standard `MeshStandardMaterial`s get scene lights for free through Three's `Ligh
 - **Why scene-global, not per-mesh** — materials are shared + refcounted, so a true "nearest lights to THIS mesh" pick would force per-entity material clones. Instead ONE singleton set of `uniform()` nodes is shared by every custom material; `updateSceneLightUniforms(world)` refreshes their values at the end of `syncLights` (so every render surface feeds it, and a gizmo-moved light updates immediately). The singleton is created lazily on first bind — a scene with no custom shaders pays nothing. Per-mesh selection is a possible future extension.
 - **Shader inputs** — a file shader binds these by argument name (it declares only what it uses): `sceneDiffuse` (vec3, a ready-made Lambert term — `albedo * (ambientColor + sceneDiffuse)`), plus the raw `keyLightDir` / `keyLightColor` / `ambientColor` for shaders that want their own (stylized) lighting math. Point-light falloff is windowed `(1 - (d·invRange)⁴)²`, which collapses to no attenuation when `invRange` is 0 (infinite range). Code TSL builders reach the same uniforms via `getSceneLightUniforms()` from `@modoki/engine/runtime/rendering`. Worked examples (both migrated off hardcoded suns): `games/space-console/.../shaders/ship-halo.{wgsl,glsl}` and `games/space-console/runtime/shaders/planet.ts`.
 
+## Draw-Call Cost & Instanced Batching (`instancedBatching.ts`)
+
+`instancedBatching.ts` collapses repeated (geometry, material) pairs into `InstancedMesh` draws.
+It is BUILT, unit-tested, and **`BATCH_DRAW_CALLS = false`** in `Scene3D.tsx` — read the flag's
+own comment for the disposition and the two conditions it needs. What follows is what the three
+measurements taught that outlives the flag.
+
+### `submit` measures a QUEUE — establish which side is slower BEFORE reading draw calls into it
+
+This is the load-bearing rule, and it is why two honest measurements of the same marker disagreed.
+
+- **`games/sling` / Huawei Y6.** 197 draw calls removed (235 → 38) and the frame **did not move**:
+  81–86 ms in both arms, inside a ±2.5% noise floor. `submit` stayed ~13 ms at 38 calls having been
+  13–25 ms at 235 — if per-call driver overhead were the cost it would have collapsed with the
+  count. Batching cut `cpuMs` 62.7 → 38.6 and `restMs` rose 17.7 → **47.2** to absorb it: sling is
+  **GPU-bound at ~85 ms**, and its 25 ms `submit` was a CPU-side wait on a GPU that was already the
+  limiter.
+- **`demos/forest-camp` / Galaxy A23.** The opposite regime, `cpuMs` 15.6 against `restMs` 2.4, and
+  there `submit` scales per call: `submit ≈ 2.5 ms + 0.063 ms × calls`, from two perturbations that
+  agree on the slope (shadow pass off→on, 46→103 calls; half the `Renderable3D` hidden, 47→28).
+  Two were needed — the shadow A/B varies call count *and* pass type together, so on its own it
+  cannot separate per-call cost from depth-only-pass cost.
+
+So: `submit`'s cost is set by whichever side of the queue is slower. Read `cpuMs` vs `restMs`
+first; a draw-call conclusion drawn from `submit` alone is a guess about which regime you are in.
+
+### Check `getBatchStats()` before building anything
+
+`batched` / `drawCallsSaved` / `skipped` answer "is there a win available here" from one live read,
+with no rebuild and no A/B. The forest-camp A/B/A that killed the idea there is one
+`device_profiler` field in hindsight: `batched: 0 of 80`, `skipped: {below-threshold: 51}` — 88
+batchable meshes resolving to **59 distinct geometries, largest repeat group 5**, one below
+`MIN_INSTANCES`. Nothing to collapse, and the A→A′ drift was as large as A→B.
+
+⚠️ **Census by RESOLVED identity, never by authored mesh refs.** "forest-camp: 554 entities on
+repeated pairs" counted authored refs and is what kept the idea alive for eleven days after its own
+refutation. Rule the plausible wrong answer out explicitly while you are there: `pairBuckets 59 ==
+geoBuckets 59` proved per-entity material forks were *not* splitting a repeated geometry into
+singletons — had those differed, the fix would have been a material-sharing one instead.
+
+### What forces an entity OUT of a batch
+
+Still reference, because the mechanism still ships. `InstancedMesh` shares ONE material across all
+instances, so any per-entity divergence breaks the group:
+
+- **`ecsColors` / `ecsMaterials`** — per-entity colour and material overrides. An override is its
+  own material, so it cannot share.
+- **`renderingLayerMask`** — `applyLightMask` swaps in a per-mask material variant. Different mask
+  → different material → different batch.
+- **`castShadow`**, set per-material from transparency.
+- **`isVisible`** — cheap: skip the instance.
+
+**The batch key must therefore be the RESOLVED material identity, not the authored `material`
+GUID.** Two entities sharing a GUID but carrying different masks are not batchable, and treating
+them as one is a rendering bug that presents as "lighting stopped working on some tiles".
+
+### The process lesson, which is the durable output
+
+This was a plausible optimization built on a marker read as a cause. What changed is the cost of
+finding out: `drawCallsSaved: 197` beside an unchanged frame time is unambiguous in ONE
+measurement, where `calls: 235` alone had already produced a false null result an hour earlier.
+**The instrumentation, not the optimization, was the valuable output** — the stats that say *why* a
+candidate was skipped turned a day of hunting into one build.
+
 ## HDR Environment & IBL
 
 An `Environment` entity (`three/traits/Environment.ts`) binds an HDR equirect as the scene's image-based lighting + optional background. `syncEnvironment(world, scene)` (`scene3DSync.ts`) binds the CACHED texture each frame:

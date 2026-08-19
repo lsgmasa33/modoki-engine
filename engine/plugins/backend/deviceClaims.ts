@@ -301,6 +301,43 @@ export function releaseAllForThisProcess(opts: { now?: number; alive?: (pid: num
   });
 }
 
+/** Drop every claim whose holder is provably gone — from the FILE, not merely from a read.
+ *
+ *  Every reader already applies `isStale`, so a dead-pid claim never actually blocks anyone. That
+ *  is measured, not assumed, and it is the half of #225 that was wrong: the report described a
+ *  phone "locked out for the rest of a working day", and a probe with a synthetic dead-pid claim
+ *  showed `listClaims()` returning `[]` and a sibling clone claiming the same device unrefused.
+ *
+ *  What a corpse in the file DOES do is lie to a human. `~/.modoki/device-claims.json` is a
+ *  documented read surface — CLAUDE.md tells an agent to check it is clear of this clone after a
+ *  session — and an entry naming this clone, this branch and a purpose reads exactly like a live
+ *  hold. Twice that cost the reporter a hand-edit, and then an issue. So the fix is to make the
+ *  file agree with the rule, rather than to change a rule that was already right.
+ *
+ *  Called at backend STARTUP, the same lifetime hook `reclaimStaleDeviceStateAtStartup` uses for
+ *  adb forwards and for exactly the same reason: startup is the one teardown point that a crash, a
+ *  `kill -9`, or the SIGTERM `stop-editor.sh` sends cannot skip. Writes only when something
+ *  actually goes, so importing this module — or starting a backend on a machine with no claims —
+ *  never creates the file.
+ *
+ *  Returns what it swept, so the caller can say so rather than cleaning up silently. */
+export function sweepStaleClaims(opts: { now?: number; alive?: (pid: number) => boolean } = {}): DeviceClaim[] {
+  return withLock(() => {
+    const all = readClaims();
+    // Partition ONCE. Calling isStale twice — once to collect, once to filter the write — reads
+    // the clock and probes the pid twice, so a claim that expires BETWEEN the two calls is dropped
+    // from the file by the second and missing from the list returned by the first. The write would
+    // still be right; the caller's "swept N" line would not, and a cleanup that misreports what it
+    // cleaned is exactly the class of message #225 was filed about.
+    const stale: DeviceClaim[] = [];
+    const live: DeviceClaim[] = [];
+    for (const c of all) (isStale(c, opts) ? stale : live).push(c);
+    if (!stale.length) return [];
+    writeClaims(live);
+    return stale;
+  });
+}
+
 /** Exactly what this process took, and from which claims dir — so the exit hook gives back what it
  *  holds rather than "whatever in the current file bears my pid".
  *

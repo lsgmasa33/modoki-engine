@@ -37,7 +37,7 @@ export interface UINodeData {
   marginLeft: number; marginLeftUnit: string;
   minWidth: number; minWidthUnit: string; maxWidth: number; maxWidthUnit: string;
   minHeight: number; minHeightUnit: string; maxHeight: number; maxHeightUnit: string;
-  alignSelf: string; zIndex: number;
+  alignSelf: string; zIndex: number; rotation: number;
   overflow: string; isVisible: boolean; pointerThrough: boolean;
   // ── Style ──
   backgroundColor: number; backgroundOpacity: number;
@@ -269,7 +269,7 @@ function buildTree(world: World): UINodeData[] | null {
         maxWidth: ui.maxWidth || 0, maxWidthUnit: ui.maxWidthUnit || 'px',
         minHeight: ui.minHeight || 0, minHeightUnit: ui.minHeightUnit || 'px',
         maxHeight: ui.maxHeight || 0, maxHeightUnit: ui.maxHeightUnit || 'px',
-        alignSelf: ui.alignSelf || 'auto', zIndex: ui.zIndex || 0,
+        alignSelf: ui.alignSelf || 'auto', zIndex: ui.zIndex || 0, rotation: ui.rotation || 0,
         overflow: ui.overflow, isVisible: ui.isVisible,
         pointerThrough: ui.pointerThrough === true,
         backgroundColor: ui.backgroundColor || 0, backgroundOpacity: ui.backgroundOpacity || 0,

@@ -21,7 +21,7 @@ import {
   adbArgs, adbBinary, describeAndroidDevice, forwardOwner, listAndroidDevices, resolveAndroidSerial,
   withFriendlyNames,
 } from './androidDevices';
-import { adbDeviceId, claimDevice, releaseDevice, releaseAllForThisProcess, wifiDeviceId } from './deviceClaims';
+import { adbDeviceId, claimDevice, releaseDevice, releaseAllForThisProcess, sweepStaleClaims, wifiDeviceId } from './deviceClaims';
 import { DeviceLeaseClient, type LeaseTransport, type LeaseRequest, type LeaseReply, type LeaseState } from './deviceLease';
 import { resetDeviceCdpSession, resolveDeviceCdpPort } from './deviceCdp';
 
@@ -782,7 +782,7 @@ export class DeviceConnectionManager {
 /** Process-global device connection (one per backend → one per clone). */
 export const deviceConnection = new DeviceConnectionManager();
 
-// NOTE: `reclaimStaleForwardsAtStartup()` is deliberately NOT called at module scope. It shells out
+// NOTE: `reclaimStaleDeviceStateAtStartup()` is deliberately NOT called at module scope. It shells out
 // to `adb forward --list`, and module load happens before any test's `beforeEach` can stub the
 // seam — so every suite that merely imports this file would run a real adb command whose result
 // depends on what is plugged into the machine. That is precisely the half-injectable-seam trap
@@ -807,10 +807,21 @@ export const deviceConnection = new DeviceConnectionManager();
  *  all and outlives the machine's session.
  *
  *  Best-effort and never throws: this runs on the exit path, where a throw would abort the steps
- *  after it and could take the exit code with it. */
+ *  after it and could take the exit code with it.
+ *
+ *  ⚠️ **It was named `OnExit` and wired to no exit at all until #225** — the only callers were
+ *  tests, so the leak it was written to close was still open, invisibly, and the comment below
+ *  ("the exit hooks pass nothing") described hooks that did not exist. Its production caller is now
+ *  Electron's awaited `before-quit` teardown in `electron/main.ts`, which covers a normal quit
+ *  (⌘Q, Quit, an app-driven `app.quit()`). It does NOT cover a SIGTERM — `stop-editor.sh` sends
+ *  one and Chromium takes the signal, measured — nor a crash or `kill -9`. Those endings are closed
+ *  at the other end instead, by `reclaimStaleDeviceStateAtStartup()`, which no manner of dying can
+ *  skip. Do not add a SIGTERM listener here to "finish the job": it would suppress Node's default
+ *  terminate-on-signal and change how the editor shuts down, which is the trade `deviceClaims.ts`
+ *  already declined. */
 export function releaseDeviceResourcesOnExit(conn: DeviceConnectionManager = deviceConnection): void {
   // `conn` is a seam for tests only — production has exactly one manager (the singleton below), and
-  // the exit hooks pass nothing. Without it a test can only assert against process-global state.
+  // the before-quit caller passes nothing. Without it a test can only assert against process-global state.
   // Order matters only in that each step must not be able to prevent the next.
   try { conn.releaseAdbForwardSync(); } catch { /* adb gone / rule already removed */ }
   try { resetDeviceCdpSession(); } catch { /* already torn down */ }
@@ -839,7 +850,17 @@ export function releaseDeviceResourcesOnExit(conn: DeviceConnectionManager = dev
  *  holds no lease, so a rule sitting on one of our own ports can only be our own leftover. It is
  *  emphatically not a sweep of "stale-looking" rules in general: reaching across to a port we do
  *  not own is #158, and this never does. */
-export function reclaimStaleForwardsAtStartup(): void {
+export function reclaimStaleDeviceStateAtStartup(): void {
+  // Claims first — it is pure fs and cannot be blocked by a missing adb. A dead-pid claim never
+  // BLOCKED anyone (every reader applies `isStale`), but it sits in `~/.modoki/device-claims.json`,
+  // which CLAUDE.md tells an agent to read as the answer to "did I give the phone back" — so a
+  // corpse there reads as a live hold and cost the #225 reporter two hand-edits. Startup is the
+  // one point neither a crash nor `stop-editor.sh`'s SIGTERM can skip; see `sweepStaleClaims`.
+  try {
+    for (const c of sweepStaleClaims()) {
+      console.log(`[device] swept a stale claim on ${c.deviceId} left by ${c.clone} (pid ${c.pid}, gone)`);
+    }
+  } catch { /* an unwritable claims file must never block startup */ }
   for (const port of [resolveDeviceHostPort(), resolveDeviceCdpPort()]) {
     try {
       const owner = forwardOwner(adbRunner.listForwards(), port);

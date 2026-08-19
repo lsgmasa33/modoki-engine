@@ -109,10 +109,14 @@ directly: the log shows the install line, no handler line after it, `Electron ex
 SIGTERM`, and both rules still standing. Even if it did fire, `kill -9`, an OOM and a crash all skip
 it — the three ways an editor most often dies badly.
 
-So the lifetime is closed at **startup** instead — `reclaimStaleForwardsAtStartup()`, called by both
+So the lifetime is closed at **startup** instead — `reclaimStaleDeviceStateAtStartup()`, called by both
 backend hosts (`startBackendServer` in Electron, the Vite plugin's `configureServer` under a bare
 `npm run dev`), which no manner of dying can skip. Same shape the device-claims file already uses: a
-claim is expired by pid-liveness **on read**, not by a polite release. Safe because both ports are
+claim is expired by pid-liveness **on read**, not by a polite release — and since #225 the same
+startup hook also SWEEPS those expired claims out of the file, so `~/.modoki/device-claims.json`
+stops accumulating corpses that read as live holds. (What #225 turned out NOT to be: a lockout. A
+dead-pid claim never blocked another clone, because every reader already applied the expiry. The
+file was lying, not the rule.) Safe because both ports are
 derived per clone, so a rule on one of our own ports at startup can only be our own leftover — this
 is not a sweep of "stale-looking" rules in general, which would be #158.
 

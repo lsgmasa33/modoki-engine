@@ -16,6 +16,32 @@ import { STRETCH_X, STRETCH_Y, type AnchorData } from './anchorLayout';
 
 export type AnchorCssData = AnchorData & { safeArea?: boolean; zIndex?: number };
 
+/** Compose a UIElement's tilt onto whatever transform the anchor already wrote (#234).
+ *
+ *  Must run AFTER `applyAnchorStyle`, and appends rather than assigns: the anchor's pivot
+ *  `translate()` is what POSITIONS the element, so replacing it would move the element instead of
+ *  turning it. Two elements' worth of bugs live in that one word.
+ *
+ *  **`transform-origin` follows the anchor pivot**, so the point of the element that sits on the
+ *  anchor point is the point a tilt leaves alone. Without it a top-left-anchored element would
+ *  swing off its own anchor as the angle changed — which reads as a broken anchor, not as a tilt.
+ *  A STRETCHED axis has both edges pinned and ignores the pivot (see `applyAnchorStyle`), so its
+ *  origin stays at the centre; an element with no anchor at all is in flow layout and likewise
+ *  rotates about its centre.
+ *
+ *  A zero angle writes NOTHING — not `rotate(0deg)`, not an origin. Every element that predates
+ *  this field must emit byte-identical CSS, and a stray transform would hand it a stacking context
+ *  it never had (see the trait's warning). */
+export function applyRotationStyle(style: CSSProperties, degrees: number, a?: AnchorCssData): void {
+  if (!degrees) return;
+  if (a) {
+    const ox = STRETCH_X.includes(a.anchor) ? 50 : a.pivotX * 100;
+    const oy = STRETCH_Y.includes(a.anchor) ? 50 : a.pivotY * 100;
+    style.transformOrigin = `${ox}% ${oy}%`;
+  }
+  style.transform = style.transform ? `${style.transform} rotate(${degrees}deg)` : `rotate(${degrees}deg)`;
+}
+
 /** Mutate `style` in place with the absolute-positioning CSS for anchor `a`.
  *  (Mirrors anchorLayout.resolveAnchorRect — keep them in sync; parity-tested.) */
 export function applyAnchorStyle(style: CSSProperties, a: AnchorCssData): void {

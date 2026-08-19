@@ -422,9 +422,20 @@ and a WDA launch targets a phone by UDID — so two clones could (and did) drive
 `~/.modoki/device-claims.json` sits beside `editor-launches.log`, machine-wide **for the same reason
 that log is**: the sibling that caused the collision is exactly what a per-clone file cannot see. A
 claim is taken by the lease (`connect`) and by the WDA launch, released on `disconnect`/`stopWda`, and
-expired by **pid liveness plus a 12h TTL** — a dead session must never hold hardware hostage. A
-refusal names the clone, branch, pid and time. Rationale in `engine/plugins/backend/deviceClaims.ts`;
-this replaces the unenforced "serialize on-device builds" convention in the root `CLAUDE.md`.
+expired by **pid liveness OR a 12h TTL**, either alone sufficient — a dead session must never hold
+hardware hostage. A refusal names the clone, branch, pid and time. Rationale in
+`engine/plugins/backend/deviceClaims.ts`; this replaces the unenforced "serialize on-device builds"
+convention in the root `CLAUDE.md`.
+
+⚠️ **Ask `device_list`, not the file — the file can hold corpses that block nothing** (#225). Expiry
+is applied ON READ, so a claim whose pid is gone is already expired the instant the process dies:
+`device_list` will not show it and another clone's `connect` is not refused. The RECORD, though, is
+only rewritten when something claims, releases, or sweeps — and `stop-editor.sh` sends a SIGTERM that
+no in-process hook survives, so a `cat ~/.modoki/device-claims.json` right after stopping an editor
+can still show an entry naming your clone, your branch and a purpose. That reads exactly like a live
+hold and is not one; it was hand-deleted twice before being measured. Two things now keep the file
+honest — Electron's `before-quit` releases on a normal quit, and every backend startup sweeps
+dead-pid entries — but the rule stands regardless of what the file says: **a dead pid holds nothing.**
 
 **⚠️ Listing devices must never be SYNCHRONOUS — the backend runs inside the Electron main process
 (#168).** `/api/device/list` resolved its iOS half with `execFileSync('xcrun', ['xctrace', 'list',

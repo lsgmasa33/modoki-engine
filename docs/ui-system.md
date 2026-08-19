@@ -43,7 +43,8 @@ Field groups (representative fields, verified against `UIElement.ts`):
   total over the union, not a ternary chain with a fall-through.** Also:
   `flexDirection`, `flexWrap`, `justifyContent`, `alignItems`, `gap` + `gapUnit`, `flexGrow`,
   `flexShrink`, per-edge `padding*`/`margin*` (each with its own `*Unit`),
-  `minWidth`/`maxWidth`/`minHeight`/`maxHeight`, `alignSelf`, `zIndex`, `overflow`
+  `minWidth`/`maxWidth`/`minHeight`/`maxHeight`, `alignSelf`, `zIndex`, `rotation` (see below),
+  `overflow`
   (`visible | hidden | scroll`), `isVisible`, `pointerThrough` (see below).
 
   ⚠️ **Match `gapUnit` to the unit the CHILDREN are sized in.** `gap` was px-only until
@@ -179,6 +180,35 @@ parent (`UIAnchor.ts`):
 
 An anchored element is rendered with `position: absolute`; pivot is applied as a CSS
 `translate(-pivotX%, -pivotY%)`. Stretched axes ignore pivot (both edges are pinned).
+
+### Rotation (`UIElement.rotation`)
+
+`rotation` tilts an element by N **degrees clockwise**; 0 is square. It composes onto the anchor's
+pivot translate (`translate(…) rotate(Ndeg)`), never replaces it — replacing it would MOVE the
+element rather than turn it.
+
+**It turns about the anchor PIVOT**, via a matching `transform-origin`. The pivot is by definition
+the point of the element that sits on the anchor point, so it is the one point a tilt must leave
+alone; rotating about the box centre would swing a `top-left`-anchored element off its own anchor as
+the angle changed, which reads as a broken anchor rather than as a tilt. An element with **no**
+anchor, or on a **stretched** axis (where the pivot is already ignored because both edges are
+pinned), turns about its centre — there is no pivot to honour.
+
+Why it exists (#234): **a nine-slice cannot bake its own tilt.** Slices are axis-aligned rects, so a
+rotated master is cut along the wrong axes and the corners shear — and a dialog card has to be a
+nine-slice, because one master serves both a wide panel and a tall one. So the choice was
+tilt-in-the-engine or square, with nothing in between.
+
+Two costs, both real:
+
+- ⚠️ **A non-zero rotation creates a stacking context** (any CSS transform does), which traps the
+  `zIndex` of everything inside it — the same trap `games/court/CLAUDE.md` records for
+  `ChromeRoot`'s centre anchor. Tilt the CARD, not the layer that holds it. A zero angle emits
+  nothing at all (no `rotate(0deg)`, no origin), so an element that predates the field is
+  byte-identical and gains no stacking context.
+- ⚠️ **The editor's selection overlay stays axis-aligned.** `resolveAnchorRect` measures an
+  unrotated rect, so a tilted element's outline and gizmo box do not follow the tilt. Cosmetic —
+  the render is correct — and deliberately out of scope.
 
 **An offset means a different thing per axis, and the axis decides — not the field.**
 On a **non-stretched** axis the anchor is a single *point*, so an offset **moves** the

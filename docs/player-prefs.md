@@ -111,8 +111,9 @@ if (score > best) PlayerPrefs.set('bestScore', score);
 
   Not a timing race — waiting does not help, because nothing commits until shutdown. ⚠️ This bites
   the editor itself: `stop-editor.sh` falls back to `SIGKILL` when Electron does not exit within its
-  5 s window ("did not exit gracefully — forcing"), so the sanctioned stop can silently discard
-  editor prefs. It also means a `kill -9`'d session's *deletes* revert — the old value is still the
+  graceful window ("did not exit gracefully — forcing"), so the sanctioned stop CAN discard editor
+  prefs — no longer silently, and less often: the window was raised 5 s → 15 s after a
+  healthy-but-slow exit was measured at 10 s, and the force path now names what it drops. It also means a `kill -9`'d session's *deletes* revert — the old value is still the
   last thing on disk.
 
   So a game that must not lose progress cannot rely on `flush()` alone; it leans on the OS lifecycle

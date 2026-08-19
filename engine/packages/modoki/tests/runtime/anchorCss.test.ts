@@ -12,7 +12,7 @@
 
 import { describe, it, expect } from 'vitest';
 import type { CSSProperties } from 'react';
-import { applyAnchorStyle, type AnchorCssData } from '../../src/runtime/ui/anchorCss';
+import { applyAnchorStyle, applyRotationStyle, type AnchorCssData } from '../../src/runtime/ui/anchorCss';
 
 function anchor(over: Partial<AnchorCssData> = {}): AnchorCssData {
   return {
@@ -164,5 +164,56 @@ describe('applyAnchorStyle — emitted declarations', () => {
   it('zIndex is emitted only when non-zero', () => {
     expect(styleFor({ anchor: 'center', zIndex: 5 }).zIndex).toBe(5);
     expect(styleFor({ anchor: 'center', zIndex: 0 }).zIndex).toBeUndefined();
+  });
+});
+
+/** #234 — the tilt. The whole risk is that it COMPOSES with the anchor rather than replacing it,
+ *  and that the point it turns about is the one the anchor pinned. */
+describe('applyRotationStyle — the tilt (#234)', () => {
+  const tilted = (deg: number, over: Partial<AnchorCssData> = {}): CSSProperties => {
+    const s: CSSProperties = {};
+    const a = anchor(over);
+    applyAnchorStyle(s, a);
+    applyRotationStyle(s, deg, a);
+    return s;
+  };
+
+  it('appends to the anchor pivot translate instead of clobbering it', () => {
+    // pivot 0.5/0.5 emits translate(-50%,-50%) — the declaration that POSITIONS a centred element.
+    // Assigning transform here (rather than appending) would move the card, not turn it.
+    const s = tilted(5, { anchor: 'center', pivotX: 0.5, pivotY: 0.5 });
+    expect(s.transform).toBe('translate(-50%, -50%) rotate(5deg)');
+  });
+
+  it('rotates alone when the anchor wrote no translate', () => {
+    expect(tilted(5, { anchor: 'top-left', pivotX: 0, pivotY: 0 }).transform).toBe('rotate(5deg)');
+  });
+
+  it('turns about the anchor PIVOT, so the anchored point stays put', () => {
+    expect(tilted(5, { anchor: 'top-left', pivotX: 0, pivotY: 0 }).transformOrigin).toBe('0% 0%');
+    expect(tilted(5, { anchor: 'center', pivotX: 0.5, pivotY: 0.5 }).transformOrigin).toBe('50% 50%');
+    expect(tilted(-3, { anchor: 'bottom-right', pivotX: 1, pivotY: 1 }).transformOrigin).toBe('100% 100%');
+  });
+
+  it('ignores the pivot on a STRETCHED axis, which has both edges pinned', () => {
+    // applyAnchorStyle already drops the pivot translate on a stretched axis; the origin has to
+    // agree, or the tilt turns about a point the layout never used.
+    expect(tilted(5, { anchor: 'top-stretch', pivotX: 1, pivotY: 1 }).transformOrigin).toBe('50% 100%');
+    expect(tilted(5, { anchor: 'stretch', pivotX: 1, pivotY: 1 }).transformOrigin).toBe('50% 50%');
+  });
+
+  it('turns an UNANCHORED element about its own centre (no anchor to honour)', () => {
+    const s: CSSProperties = {};
+    applyRotationStyle(s, 7);
+    expect(s.transform).toBe('rotate(7deg)');
+    expect(s.transformOrigin).toBeUndefined();   // CSS default is 50% 50%
+  });
+
+  it('writes NOTHING at zero — every element that predates the field emits identical CSS', () => {
+    // Not merely tidiness: a stray transform hands the element a stacking context it never had,
+    // which silently traps its children's zIndex.
+    const s = tilted(0, { anchor: 'center', pivotX: 0.5, pivotY: 0.5 });
+    expect(s.transform).toBe('translate(-50%, -50%)');
+    expect(s.transformOrigin).toBeUndefined();
   });
 });

@@ -83,7 +83,7 @@ function makeNode(over: Partial<UINodeData> = {}): UINodeData {
     marginBottom: 0, marginBottomUnit: 'px', marginLeft: 0, marginLeftUnit: 'px',
     minWidth: 0, minWidthUnit: 'px', maxWidth: 0, maxWidthUnit: 'px',
     minHeight: 0, minHeightUnit: 'px', maxHeight: 0, maxHeightUnit: 'px',
-    alignSelf: 'auto', zIndex: 0, overflow: 'visible', isVisible: true, pointerThrough: false,
+    alignSelf: 'auto', zIndex: 0, rotation: 0, overflow: 'visible', isVisible: true, pointerThrough: false,
     backgroundColor: 0, backgroundOpacity: 0, borderRadius: 0, borderWidth: 0, borderColor: 0x333333, borderOpacity: 1, opacity: 1,
     text: '', fontFamily: '', fontSize: 16, fontSizeUnit: 'px', fontWeight: 'normal', fontStyle: 'normal',
     textColor: 0xffffff, textOpacity: 1, textAlign: 'left', lineHeight: 0, letterSpacing: 0, letterSpacingUnit: 'px',
@@ -785,5 +785,34 @@ describe('NineSliceImage — per-slice background math', () => {
     expect(inners[4].style.backgroundPosition).toBe('50% 75%');
     // center size: 100/84 & 60/44 as %
     expect(inners[4].style.backgroundSize).toBe(`${(100 / 84) * 100}% ${(60 / 44) * 100}%`);
+  });
+});
+
+/** #234 — the tilt reaching the DOM. anchorCss.test.ts pins the CSS the emitter BUILDS; this pins
+ *  that a `rotation` authored on the trait actually arrives on the rendered element, which is the
+ *  half a unit test of the emitter cannot see (a field wired into nothing renders perfectly). */
+describe('UIElement.rotation (#234)', () => {
+  it('renders a tilted element', () => {
+    const { container } = render(<UINode node={makeNode({ rotation: 5 })} storeState={{}} />);
+    expect((container.firstElementChild as HTMLElement).style.transform).toBe('rotate(5deg)');
+  });
+
+  it('leaves an untilted element with no transform at all', () => {
+    const { container } = render(<UINode node={makeNode({ rotation: 0 })} storeState={{}} />);
+    expect((container.firstElementChild as HTMLElement).style.transform).toBe('');
+  });
+
+  it('composes with the anchor pivot translate rather than replacing it', () => {
+    const node = makeNode({
+      rotation: -4,
+      anchor: {
+        anchor: 'center', top: 0, topUnit: 'px', right: 0, rightUnit: 'px',
+        bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px',
+        pivotX: 0.5, pivotY: 0.5, safeArea: false, zIndex: 0,
+      },
+    });
+    const el = render(<UINode node={node} storeState={{}} />).container.firstElementChild as HTMLElement;
+    expect(el.style.transform).toBe('translate(-50%, -50%) rotate(-4deg)');
+    expect(el.style.transformOrigin).toBe('50% 50%');
   });
 });

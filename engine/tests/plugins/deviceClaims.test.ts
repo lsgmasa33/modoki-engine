@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   claimsDir, isPidAlive, isStale, listClaims, claimDevice, releaseDevice,
-  releaseAllForThisProcess, describeConflict, adbDeviceId, iosDeviceId, wifiDeviceId,
+  releaseAllForThisProcess, sweepStaleClaims, describeConflict, adbDeviceId, iosDeviceId, wifiDeviceId,
   CLAIM_TTL_MS,
   type DeviceClaim,
 } from '../../plugins/backend/deviceClaims';
@@ -218,6 +218,80 @@ describe('releaseAllForThisProcess', () => {
     const remaining = listClaims({ alive: (pid) => pid === process.pid || pid === 424242 });
     expect(remaining).toHaveLength(1);
     expect(remaining[0].deviceId).toBe('adb:C');
+  });
+});
+
+describe('sweepStaleClaims (#225)', () => {
+  // The premise of #225 was that a dead-pid claim locks the phone out of every other clone. It does
+  // not, and that is measured here rather than argued: the read path already expires it. What the
+  // corpse actually does is LIE — `~/.modoki/device-claims.json` is a read surface CLAUDE.md points
+  // agents at — so the sweep is about the file agreeing with the rule.
+  it('a dead-pid claim never blocked anyone in the first place', () => {
+    fs.mkdirSync(home, { recursive: true });
+    const dead: DeviceClaim = { deviceId: 'adb:STALE', clone: '/other', branch: 'work-ai3', pid: 424242, at: Date.now() };
+    fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [dead] }));
+    const alive = (pid: number) => pid === process.pid;
+
+    expect(listClaims({ alive })).toEqual([]);
+    expect(claimDevice({ deviceId: 'adb:STALE', clone: '/mine' }, { alive }).ok).toBe(true);
+  });
+
+  it('removes claims whose pid is gone and returns them, keeping live ones', () => {
+    fs.mkdirSync(home, { recursive: true });
+    const live: DeviceClaim = { deviceId: 'adb:LIVE', clone: '/mine', branch: 'main', pid: process.pid, at: Date.now() };
+    const dead: DeviceClaim = { deviceId: 'adb:DEAD', clone: '/other', branch: 'work-ai', pid: 424242, at: Date.now() };
+    fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [live, dead] }));
+
+    const swept = sweepStaleClaims({ alive: (pid) => pid === process.pid });
+
+    expect(swept.map((c) => c.deviceId)).toEqual(['adb:DEAD']);
+    const onDisk = JSON.parse(fs.readFileSync(claimsFilePath(), 'utf8')).claims as DeviceClaim[];
+    expect(onDisk.map((c) => c.deviceId)).toEqual(['adb:LIVE']);
+  });
+
+  it('sweeps a claim that outlived the TTL even though its pid is alive', () => {
+    fs.mkdirSync(home, { recursive: true });
+    const old: DeviceClaim = { deviceId: 'adb:OLD', clone: '/mine', branch: 'main', pid: process.pid, at: 1_000 };
+    fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [old] }));
+
+    const swept = sweepStaleClaims({ now: 1_000 + CLAIM_TTL_MS + 1, alive: () => true });
+
+    expect(swept.map((c) => c.deviceId)).toEqual(['adb:OLD']);
+  });
+
+  // A backend starts on every editor launch, so an unconditional write here would create
+  // `~/.modoki/device-claims.json` on a machine that has never touched a device.
+  it('returns EXACTLY what it removed, even when a claim expires mid-sweep', () => {
+    // The partition is computed once. With two isStale passes, a pid dying between them would be
+    // dropped from the file by the second pass and absent from the returned list — the caller
+    // would log "swept 0" having swept 1. `alive` flips on its second probe to force that window.
+    fs.mkdirSync(home, { recursive: true });
+    const a: DeviceClaim = { deviceId: 'adb:A', clone: '/mine', branch: 'main', pid: 111, at: Date.now() };
+    const b: DeviceClaim = { deviceId: 'adb:B', clone: '/mine', branch: 'main', pid: 222, at: Date.now() };
+    fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [a, b] }));
+    let probes = 0;
+    const flaky = (pid: number) => { probes += 1; return pid === 222 ? probes < 3 : false; };
+
+    const swept = sweepStaleClaims({ alive: flaky });
+
+    const onDisk = JSON.parse(fs.readFileSync(claimsFilePath(), 'utf8')).claims as DeviceClaim[];
+    const removed = ['adb:A', 'adb:B'].filter((id) => !onDisk.some((c) => c.deviceId === id));
+    expect(swept.map((c) => c.deviceId).sort()).toEqual(removed.sort());
+  });
+
+  it('creates no file when there is nothing to sweep', () => {
+    expect(sweepStaleClaims()).toEqual([]);
+    expect(fs.existsSync(claimsFilePath())).toBe(false);
+  });
+
+  it('leaves a file of entirely live claims byte-identical', () => {
+    fs.mkdirSync(home, { recursive: true });
+    const live: DeviceClaim = { deviceId: 'adb:LIVE', clone: '/mine', branch: 'main', pid: process.pid, at: Date.now() };
+    const raw = JSON.stringify({ claims: [live] });
+    fs.writeFileSync(claimsFilePath(), raw);
+
+    expect(sweepStaleClaims({ alive: () => true })).toEqual([]);
+    expect(fs.readFileSync(claimsFilePath(), 'utf8')).toBe(raw);
   });
 });
 

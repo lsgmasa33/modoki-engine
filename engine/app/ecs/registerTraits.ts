@@ -912,6 +912,7 @@ export function registerAllTraits() {
       alignSelf: { type: 'enum', options: ['auto', 'flex-start', 'center', 'flex-end', 'stretch'], tooltip: 'Override parent alignItems for this element', ...S('Layout') },
       overflow: { type: 'enum', options: ['visible', 'hidden', 'scroll'], tooltip: 'What happens when children exceed bounds.\nvisible = no clipping, hidden = clip, scroll = scrollbar', ...S('Layout') },
       zIndex: { type: 'number', step: 1, tooltip: 'Stacking order among siblings', ...S('Layout') },
+      rotation: { type: 'number', step: 1, tooltip: 'Tilt in degrees, clockwise. 0 = square.\nRotates about the ANCHOR PIVOT (the point that sits on the anchor point), so the anchor stays put as the angle changes; an unanchored or stretched element turns about its centre.\n\u26a0\ufe0f A non-zero rotation creates a stacking context, which traps the zIndex of everything inside it \u2014 tilt the card, not the layer holding it.\n\u26a0\ufe0f The editor selection overlay stays axis-aligned; the render is still correct.', ...S('Layout') },
       pointerThrough: { type: 'boolean', tooltip: 'Never take the pointer — taps fall through to whatever is BEHIND this element.\nChildren keep their own (a button inside stays clickable).\nFor a decorative container drawn over something that must stay tappable.\nNOTE: on an overflow:scroll box this gives up scrolling it.', ...S('Layout') },
 
       // ── Child Layout section (Unity LayoutGroup — arranges THIS element's children) ──
