@@ -143,7 +143,16 @@ The core AppLovin MAX SDK comes from SPM (`capacitor-applovin-max/Package.swift`
 
 ### SKAdNetwork
 
-258 SKAdNetwork IDs in `ios/App/App/Info.plist` (a superset of AppLovin's official 152). Consolidated list: `https://skadnetwork-ids.applovin.com/v1/skadnetworkids.json`.
+258 SKAdNetwork IDs in `ios/App/App/Info.plist` (a superset of AppLovin's official 152 —
+measured 2026-08-19, the endpoint returns exactly 152).
+
+⚠️ **`https://skadnetwork-ids.applovin.com/v1/skadnetworkids.json` is NOT a consolidated list**,
+though it is easy to read as one. AppLovin states it covers **their own network only** — "this
+is not the case for the other ad networks that AppLovin mediates". The other ~106 ids in the
+258 come from the individual mediation adapters' own documentation. So a script that populates
+`SKAdNetworkItems` from that endpoint alone produces a list that **looks complete and silently
+omits every mediated network** — the ads still serve, and the attribution for those networks
+just never arrives.
 
 ## Debug Bridge & MCP
 

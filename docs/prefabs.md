@@ -309,6 +309,16 @@ first alone is not enough:
 
 1. **Re-acquire on a cache miss** — `void acquirePrefab(<your owner sentinel>, guid)`, guarded so
    it fires once per guid rather than every frame.
+   ⚠️ **Re-arm that guard on the fetch POPULATING the cache — never in a `.catch`.** Measured
+   2026-08-19: `acquirePrefab` on an unresolvable guid **RESOLVES**, with the cache still empty —
+   `fetchPrefab` swallows `!res.ok` and parse errors and never rejects. So a `.catch(() => rearm)`
+   is dead code, and a guard that is never re-armed heals only the FIRST invalidation: a second
+   Apply-to-Prefab in the same session stays broken. Re-arming unconditionally is the opposite
+   trap, refetching a genuinely-missing prefab every frame forever. `.finally(() => { if
+   (getCachedPrefab(ref)) rearm; })` is the shape that does neither.
+   ⚠️ Whether you are exposed depends on **what else clears your guard**: `games/court` clears its
+   on every board build, so it was safe either way; `games/sling` clears its only on unregister and
+   `demos/forest-camp` only on world swap — and an Apply-to-Prefab is neither.
 2. **Remember what each live instance was built FROM**, and retire instances whose source no
    longer matches. Without this, the window between the invalidation and the re-acquire leaves a
    mixed population that never converges, because "this cell already has an instance" is true and

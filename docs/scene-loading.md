@@ -94,6 +94,26 @@ interface SceneFile {
 `SerializedEntity.id` is now optional and, since v12, never written — see "Entity-id
 stability on disk" below.
 
+### The `entities` ARRAY ORDER is the Hierarchy's display order
+
+`serializeScene` writes parents before their children, siblings by `sortOrder`, with the
+**GUID** as the tiebreak and the name as a last resort (`orderedInfos` in `serialize.ts`).
+It used to follow live ECS-id order, which made a save churn: a delete+undo respawns the
+entity at a new id, so the next save emitted byte-identical data in a different array order
+(`3d2372741`). Nothing loads order-sensitively — `sortOrder` carries the authored intent —
+so this is purely about making a scene diff readable, and about letting "`git status` is
+clean" mean something after a save.
+
+⚠️ **The committed scene files predate that fix, so the FIRST save of any project rewrites
+its scene with a one-time, contentless reorder.** Measured 2026-08-19: a bare Save All with
+no edit at all produces the diff on `games/anim-bug` and `games/timeline-demo` (a guid-keyed
+comparison shows the same entities, zero content differences, identical top-level fields),
+and a second save is byte-identical — one-shot, not churn. A static sweep of the ordering
+rule over every committed scene puts it at **52 of 53 files**. Two consequences: don't read
+that diff as a bug, and don't treat a post-save `git status` as evidence of a content change
+without comparing as parsed data first. Retiring it means re-saving every project once, which
+is a deliberate `games/**`+`demos/**` commit nobody has made yet.
+
 ### Only NON-DEFAULT trait fields are written
 
 A trait field still holding its koota schema default is **omitted** from the file
