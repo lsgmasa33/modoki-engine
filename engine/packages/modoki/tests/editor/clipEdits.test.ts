@@ -123,6 +123,37 @@ describe('applyBreakUnify', () => {
     expect(unified[0].keys[1].tangentMode).toBe('auto');
   });
 
+  // Unify must KEEP a shape the user actually made — the toggle's two directions have to be
+  // inverses, or break→unify silently replaces hand-shaping with the derived slope.
+  it('unify PRESERVES a hand-shaped key as freeSmooth, mirrored onto the average', () => {
+    const broken = applyBreakUnify(base(), groupSelection(['0:1']));
+    // Shape one side independently — the only way in/out can differ.
+    broken[0].keys[1] = { ...broken[0].keys[1], inTangent: 8, outTangent: 2 };
+    const unified = applyBreakUnify(broken, groupSelection(['0:1']));
+    const k = unified[0].keys[1];
+    expect(k.tangentMode).toBe('freeSmooth');
+    expect(k.broken).toBe(false);
+    expect(k.inTangent).toBe(5);   // (8+2)/2 — mirrored, neither side wins arbitrarily
+    expect(k.outTangent).toBe(5);
+  });
+
+  it('unify RE-DERIVES an untouched key, so a double-toggle does not quietly freeze it', () => {
+    const broken = applyBreakUnify(base(), groupSelection(['0:1']));
+    expect(broken[0].keys[1].inTangent).toBe(broken[0].keys[1].outTangent); // break alone shapes nothing
+    const unified = applyBreakUnify(broken, groupSelection(['0:1']));
+    expect(unified[0].keys[1].tangentMode).toBe('auto'); // still DERIVED — tracks its neighbours
+  });
+
+  it('a preserved key then holds its shape through a neighbour recompute', () => {
+    const broken = applyBreakUnify(base(), groupSelection(['0:1']));
+    broken[0].keys[1] = { ...broken[0].keys[1], inTangent: 8, outTangent: 2 };
+    const unified = applyBreakUnify(broken, groupSelection(['0:1']));
+    const after = upsertKey(unified[0].keys, 0.15, 1.5);
+    const k = after.find((x) => Math.abs(x.t - 0.1) < 1e-6)!;
+    expect(k.outTangent).toBe(5);  // authored — the neighbour insert did not re-derive it
+    expect(k.broken).toBe(false);
+  });
+
   it('A3: a unified key stays unified through a neighbor recompute (does not revert to broken)', () => {
     const broken = applyBreakUnify(base(), groupSelection(['0:1']));
     const unified = applyBreakUnify(broken, groupSelection(['0:1']));

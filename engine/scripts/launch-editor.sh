@@ -302,6 +302,16 @@ done
 if [ -n "$VITE_ACTUAL" ]; then
   if [ -n "${MODOKI_VITE_PORT:-}" ] && [ "$VITE_ACTUAL" != "$MODOKI_VITE_PORT" ]; then
     echo "[launch-editor]   Editor page:  http://127.0.0.1:${VITE_ACTUAL}/#/editor  (wanted ${MODOKI_VITE_PORT} — it was taken)"
+    # Say what the drift COSTS, not just that it happened. localStorage is keyed by ORIGIN
+    # (scheme://host:PORT), so a bumped Vite port silently hands the editor an empty store:
+    # a different saved layout, different panel state, and a different PlayerPrefs partition
+    # for the same game. It reads as "my data vanished", and the editor then writes its own
+    # boot keys into the new partition — so "other keys are still there" looks like proof the
+    # storage persisted when it is the opposite. That misread cost a QA session and a
+    # wrong high-severity bug report against PlayerPrefs.flush().
+    echo "[launch-editor]   ⚠️  DIFFERENT ORIGIN → different localStorage: this editor has its own saved"
+    echo "[launch-editor]       layout, panel state and PlayerPrefs store, separate from port ${MODOKI_VITE_PORT}."
+    echo "[launch-editor]       Data written on the other port is not lost — it is on the other port."
   else
     echo "[launch-editor]   Editor page:  http://127.0.0.1:${VITE_ACTUAL}/#/editor"
   fi

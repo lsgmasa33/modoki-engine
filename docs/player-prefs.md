@@ -18,7 +18,8 @@ Claude-friendly store modelled on Unity's `PlayerPrefs`, refined in three ways:
   in-memory cache is touched in JS's single thread.)
 - **Best-effort durability** (atomic ≠ durable). A kill immediately after `set()` can *lose*
   the last write but never *corrupt* it — the same guarantee Unity gives. `flush()` and
-  flush-on-background close the gap.
+  flush-on-background NARROW the gap; they do not close it (see Gotchas — a `SIGKILL` loses a
+  flushed web write, measured).
 
 It is an engine-owned singleton, exported from the runtime barrel like `sceneManager` — a
 game just imports and calls it; there is no registration.
@@ -90,10 +91,33 @@ if (score > best) PlayerPrefs.set('bestScore', score);
 
 ## Gotchas
 
-- **Atomic ≠ durable.** A crash right after `set()` can lose that write; it is never partially
-  written. Call `flush()` at a save point you care about. On Android, `SharedPreferences.apply()`
-  is async-to-disk, so even an awaited `set()`/`flush()` is not a hard fsync — durability leans
-  on the OS lifecycle (that's what flush-on-background is for).
+- **Atomic ≠ durable, and `flush()` does NOT close that gap — it is not an fsync on ANY backend.**
+  A crash right after `set()` can lose that write; it is never partially written. `flush()` gets the
+  value to the *platform*, and then the platform decides when it reaches the platter:
+  - **Android** — `SharedPreferences.apply()` returns before the write hits disk.
+  - **Web / Electron** — `localStorage.setItem` is synchronous into Chromium's in-memory area, but
+    the on-disk LevelDB is committed on a **clean shutdown**. A `SIGKILL` loses every write since
+    the last commit.
+
+  **MEASURED on the editor** (2026-08-19, `games/anim-bug`, backend 5183): identical
+  `set()` + `await flush()` returning `pending:false`, with the raw `localStorage` entry confirmed
+  present, then —
+
+  | how the process ended | the flushed value after relaunch |
+  |---|---|
+  | `npm run editor:stop`, graceful (SIGTERM, exit hooks ran) | **survives** |
+  | `SIGKILL` immediately after `flush()` | **lost** |
+  | `SIGKILL` 8 s after `flush()` | **lost** |
+
+  Not a timing race — waiting does not help, because nothing commits until shutdown. ⚠️ This bites
+  the editor itself: `stop-editor.sh` falls back to `SIGKILL` when Electron does not exit within its
+  5 s window ("did not exit gracefully — forcing"), so the sanctioned stop can silently discard
+  editor prefs. It also means a `kill -9`'d session's *deletes* revert — the old value is still the
+  last thing on disk.
+
+  So a game that must not lose progress cannot rely on `flush()` alone; it leans on the OS lifecycle
+  (that is what flush-on-background is for) and, where the value is irreversible, on being able to
+  re-derive the state from an authority that is not PlayerPrefs.
 - ⚠️ **`flush()` resolving does NOT mean the write landed, and reading it back cannot tell you.**
   A rejected `backend.set()` (quota exceeded, a native I/O error) is caught in `drain()`, re-queued
   into `dirty` and warned about — and `writeChain` still settles *fulfilled* so later writes are not

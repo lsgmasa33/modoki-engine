@@ -46,7 +46,15 @@ export class InMemoryBackend implements PrefsBackend {
 
 /** Web backend. Each key → its own `localStorage` entry; `setItem` replaces the value
  *  wholesale (atomic — a reader never sees a torn string). `set` may throw
- *  `QuotaExceededError`; the write pipeline in playerPrefs.ts catches it and re-queues. */
+ *  `QuotaExceededError`; the write pipeline in playerPrefs.ts catches it and re-queues.
+ *
+ *  Caveat (durability), the exact counterpart of the Android one below: `setItem` is
+ *  SYNCHRONOUS into the browser's in-memory area, but the on-disk store is written back
+ *  asynchronously — under Electron, Chromium commits the localStorage LevelDB on a CLEAN
+ *  SHUTDOWN. So an awaited `set()`/`flush()` guarantees atomicity but NOT persistence: a
+ *  SIGKILL (crash, force-quit, `stop-editor.sh`'s own force path) loses every write since the
+ *  last commit, and waiting longer does not help. Measured three ways in
+ *  docs/player-prefs.md § Gotchas. */
 export class LocalStorageBackend implements PrefsBackend {
   async getAll(prefix: string): Promise<Record<string, string>> {
     const out: Record<string, string> = {};

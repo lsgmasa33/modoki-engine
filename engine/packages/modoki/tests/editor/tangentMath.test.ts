@@ -2,7 +2,7 @@
  *  deriveTangentFromHandle ↔ handleDataPt round-trip, and the unified/broken mirroring. */
 import { describe, it, expect } from 'vitest';
 import { deriveTangentFromHandle, handleDataPt } from '../../src/editor/panels/animation/tangentMath';
-import { DEFAULT_TANGENT_WEIGHT, type Keyframe } from '../../src/runtime/animation/types';
+import { DEFAULT_TANGENT_WEIGHT, STEPPED, normalizeAnimationClip, type Keyframe } from '../../src/runtime/animation/types';
 
 const key = (over: Partial<Keyframe> = {}): Keyframe => ({ t: 1, v: 2, inTangent: 0, outTangent: 0, ...over });
 
@@ -97,5 +97,35 @@ describe('deriveTangentFromHandle — the drag records what it meant', () => {
     const patch = deriveTangentFromHandle(key({ tangentMode: 'auto' }), 'in', 0, -2, 1, true);
     expect(patch.tangentMode).toBe('freeSmooth');
     expect(patch.broken).toBe(false);
+  });
+});
+
+// A stepped key's hold lives on the OUTGOING tangent, and survives a save only because
+// tangentMode:'constant' tells the loader to rebuild it (JSON.stringify(Infinity) === "null").
+// So a drag that relabels such a key is data loss one reload later, not a cosmetic slip.
+describe('deriveTangentFromHandle — a STEPPED key keeps its hold', () => {
+  const stepped = (): Keyframe => key({ tangentMode: 'constant', outTangent: STEPPED, inTangent: 4, broken: true });
+
+  it("dragging the IN handle keeps tangentMode 'constant' — the hold is untouched", () => {
+    const patch = deriveTangentFromHandle(stepped(), 'in', 0.5, 1, 1, false);
+    expect(patch.tangentMode).toBe('constant');
+    expect(patch.outTangent).toBeUndefined(); // the outgoing side — the hold — is not written
+  });
+
+  it("dragging the OUT handle DOES relabel it, because that replaces the hold with a slope", () => {
+    const patch = deriveTangentFromHandle(stepped(), 'out', 2, 6, 1, false);
+    expect(patch.tangentMode).toBe('free');
+    expect(Number.isFinite(patch.outTangent!)).toBe(true);
+  });
+
+  it('the hold survives a real save/load round-trip after an in-handle drag', () => {
+    const k = { ...stepped(), ...deriveTangentFromHandle(stepped(), 'in', 0.5, 1, 1, false) };
+    // The save side: JSON cannot carry Infinity, so this is what actually reaches disk.
+    const onDisk = JSON.parse(JSON.stringify({
+      tracks: [{ path: '', trait: 'T', field: 'f', type: 'number', keys: [k, { t: 2, v: 9, inTangent: 0, outTangent: 0 }] }],
+    }));
+    expect(onDisk.tracks[0].keys[0].outTangent).toBeNull(); // Infinity → null, as expected
+    const reloaded = normalizeAnimationClip(onDisk);
+    expect(reloaded.tracks[0].keys[0].outTangent).toBe(STEPPED); // …and rebuilt from the mode
   });
 });

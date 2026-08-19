@@ -164,7 +164,18 @@ writes `freeSmooth` for a unified drag and `free` for a broken one. It did not, 
 `auto` and the next neighbour edit re-derived the hand-shaped curve away — and `free` alone could
 not fix it, because preserving the numbers by marking the key broken silently turns one smooth
 handle into two independent ones. `freeSmooth` is the authored-and-still-mirrored case (Unity's
-"Free Smooth" beside its "Broken").
+"Free Smooth" beside its "Broken"). Switching a key INTO `freeSmooth` mirrors its two handles
+onto their average — clearing `broken` alone would leave a key that claims to be unified and
+does not look it.
+
+**The Break/Unify toggle (B, or the toolbar button) decides per key, and the rule is "keep a
+shape the user actually made".** Break is always `free`. Unify is `freeSmooth` when the key's
+handles DIFFER — they can only differ if someone moved one independently — and `auto` when they
+do not. Neither flat answer works: always-`auto` means break→unify silently replaces
+hand-shaping with the derived slope, so the toggle's two directions are not inverses;
+always-`freeSmooth` means a key double-toggled without any dragging goes from derived to
+authored and quietly stops tracking its neighbours, which surfaces much later as an edit that
+fails to propagate. The per-key test removes both.
 
 ### 3D skeletal (`SkinnedModel` + `SkeletalAnimator`)
 
@@ -293,6 +304,11 @@ swapped-away scene is dropped.
   stepped key would reload as linear. The persistent marker is `tangentMode:'constant'`;
   `normalizeAnimationClip` reconstructs `outTangent = STEPPED` from it on load. If you build a clip in
   code, set the mode, not just the raw tangent.
+  ⚠️ **Corollary: anything that RELABELS a stepped key destroys the hold, one reload later.** The
+  mode is not decoration, it is the only surviving record. A key's hold lives on the OUTGOING
+  tangent, so dragging its IN handle leaves it holding and it must stay `'constant'` —
+  `deriveTangentFromHandle` special-cases exactly that. Dragging the OUT handle is the opposite:
+  that replaces the hold with a real slope, so relabelling is then correct.
 - **Every edit that moves a key's `t` or `v` must re-derive the tangents AROUND it** — a derived
   mode reads its slope off the NEIGHBOURS, so moving one key restales three. There are three such
   writers (`applyValueNudge`, `moveKeysInTime`, `applyKeyPatch`) and they all call

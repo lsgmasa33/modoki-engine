@@ -10,7 +10,12 @@
  *     JS's single thread.
  *   - DURABILITY IS BEST-EFFORT (atomic ≠ durable): a kill right after `set()` can
  *     lose the last write but never corrupt it — the guarantee Unity gives. Call
- *     `flush()` (before quit / on background) to make pending writes durable.
+ *     `flush()` (before quit / on background) to push pending writes to the platform.
+ *     ⚠️ `flush()` is NOT an fsync on any backend: it resolves once the platform has
+ *     ACCEPTED the write, and the platform decides when that reaches the platter.
+ *     On web/Electron, Chromium commits the localStorage area on a CLEAN SHUTDOWN, so
+ *     a SIGKILL loses a flushed write — measured, and waiting does not help (see
+ *     docs/player-prefs.md § Gotchas for the three-arm measurement).
  *
  *  Shape mirrors the engine's other singletons (audioService, sceneManager): a
  *  module singleton games `import { PlayerPrefs } from '@modoki/engine/runtime'` and
@@ -256,8 +261,12 @@ function isHydrated(): boolean {
  * was about to vanish on the next launch. Nothing else in the engine cares this much; nothing else
  * has an irreversible step gated on the answer.
  *
- * NOTE this still is not an fsync — on Android `SharedPreferences.apply()` is async-to-disk, so
- * `false` means "the platform accepted it", not "it is on the platter". See docs/player-prefs.md.
+ * NOTE this still is not an fsync — `false` means "the platform ACCEPTED it", not "it is on the
+ * platter", and that holds on EVERY backend, not just the native one: Android's
+ * `SharedPreferences.apply()` is async-to-disk, and on web/Electron Chromium commits the
+ * localStorage area only on a clean shutdown, so a SIGKILL loses a flushed write. This function
+ * therefore separates "the backend rejected it" from "the backend took it" — never "it is safe".
+ * See docs/player-prefs.md § Gotchas.
  */
 function hasPendingWrite(key: string): boolean {
   return dirty.has(key);

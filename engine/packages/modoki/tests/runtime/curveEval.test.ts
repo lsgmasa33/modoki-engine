@@ -200,6 +200,25 @@ describe('curveEval.applyTangentMode', () => {
     expect(keys[1].tangentMode).toBe('freeSmooth');
   });
 
+  it('freeSmooth MIRRORS a broken key onto the average rather than just clearing the flag', () => {
+    // Clearing `broken` alone would leave {broken:false, in !== out} — a key that claims to
+    // be unified and does not look it.
+    const keys = [k(0, 0), { ...k(1, 10), inTangent: 8, outTangent: 2, broken: true }, k(2, 0)];
+    applyTangentMode(keys, 1, 'freeSmooth');
+    expect(keys[1].inTangent).toBe(5);
+    expect(keys[1].outTangent).toBe(5);
+    expect(keys[1].broken).toBe(false);
+  });
+
+  it('freeSmooth on a STEPPED key mirrors onto the finite side, never onto Infinity', () => {
+    // A 'constant' key carries outTangent = STEPPED; averaging would poison both handles.
+    const keys = [k(0, 0), { ...k(1, 10), inTangent: 4, outTangent: STEPPED }, k(2, 0)];
+    applyTangentMode(keys, 1, 'freeSmooth');
+    expect(keys[1].inTangent).toBe(4);
+    expect(keys[1].outTangent).toBe(4);   // the hold is gone — that is what leaving 'constant' means
+    expect(Number.isFinite(keys[1].outTangent)).toBe(true);
+  });
+
   it("free keeps the same tangents but breaks the handles apart — the pair's whole distinction", () => {
     const keys = [k(0, 0), { ...k(1, 10), inTangent: 7, outTangent: 7 }, k(2, 0)];
     applyTangentMode(keys, 1, 'free');

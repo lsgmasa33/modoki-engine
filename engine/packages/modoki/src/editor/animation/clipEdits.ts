@@ -121,14 +121,37 @@ export function planPaste(clip: AnimationClipDef, cb: KeyClipboard, opts: PasteO
 export function applyBreakUnify(tracks: AnimationTrack[], byTrack: Map<number, Set<number>>): AnimationTrack[] {
   let anyUnified = false;
   for (const [ti, kis] of byTrack) for (const ki of kis) { const k = tracks[ti]?.keys[ki]; if (k && !k.broken) anyUnified = true; }
-  const mode: 'free' | 'auto' = anyUnified ? 'free' : 'auto';
   return tracks.map((tr, ti) => {
     const kis = byTrack.get(ti);
     if (!kis) return tr;
     const keys = tr.keys.map((k) => ({ ...k }));
-    for (const ki of kis) if (keys[ki]) applyTangentMode(keys, ki, mode);
+    for (const ki of kis) if (keys[ki]) applyTangentMode(keys, ki, anyUnified ? 'free' : unifyModeFor(keys[ki]));
     return { ...tr, keys };
   });
+}
+
+/**
+ * Which mode "unify" should land a key in: keep a shape the user actually made, re-derive
+ * when there is none to keep.
+ *
+ * Unify used to mean `auto` for every key, which made the toggle NOT a toggle — break, drag
+ * one handle, unify, and the hand-shaping was silently replaced by the neighbour-derived
+ * slope. A toggle whose two directions are not inverses is the bug.
+ *
+ * But flipping it wholesale to `freeSmooth` trades a loud failure for a quiet one: a key
+ * double-toggled without any dragging would go from DERIVED to AUTHORED and quietly stop
+ * tracking its neighbours, which you only notice much later when an edit fails to propagate.
+ * Between a mistake you can see and one you cannot, this repo takes the visible one.
+ *
+ * So the test is whether the handles actually DIFFER. They can only differ if someone moved
+ * one of them independently — breaking a key alone leaves `in === out` and is visually a
+ * no-op. Both failure modes disappear: an untouched double-toggle re-derives and stays live,
+ * a shaped key keeps its shape. (A key hand-dragged to two bit-identical slopes would
+ * re-derive, but reaching that needs breaking first and then landing both float slopes on
+ * the same value — and a UNIFIED drag records `freeSmooth` already, so it never gets here.)
+ */
+function unifyModeFor(k: Keyframe): 'auto' | 'freeSmooth' {
+  return k.inTangent === k.outTangent ? 'auto' : 'freeSmooth';
 }
 
 // ── Value nudge + add-property planning ──
