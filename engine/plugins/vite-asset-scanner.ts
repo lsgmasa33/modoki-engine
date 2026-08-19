@@ -2050,6 +2050,15 @@ export function assetScannerPlugin(): Plugin {
             `echo ""; echo "${why}"; echo "   The app BUILT fine; only the command-line install is unavailable."; echo "   Opening the Xcode project — press Run (⌘R) there to deploy."; open "${iosProjPath}" 2>/dev/null || true`;
           const GO_IOS_Q = JSON.stringify(GO_IOS);
           const iosDeploySteps: BuildStep[] =
+            // ⚠️ The failure message names CANDIDATES, not a verdict — the same correction the
+            // go-ios launch step below carries. It used to assert "it requires iOS 17+", which is
+            // wrong-by-construction on the path almost everyone takes: `iosDevicectlId` is filled
+            // from the Build menu's device picker, and the picker sets it ONLY for a device
+            // devicectl can see, i.e. one that is already iOS 17+. So a failure here is a locked
+            // or untrusted phone far more often than a version problem, and the old copy sent the
+            // reader to fix the one thing that could not be the cause. The version note survives
+            // because the id CAN also be hand-typed in Project Settings, where it is reachable.
+            //
             // `devicectl` is CoreDevice-only — it REFUSES anything below iOS 17 with
             // "This device does not support acquiring a usage assertion" (error 1010) or a
             // bare "device was not found". The xcodebuild step works fine on an old device,
@@ -2058,7 +2067,7 @@ export function assetScannerPlugin(): Plugin {
             // Run does. iOS 17+ deliberately STAYS here rather than moving to go-ios: go-ios
             // needs a sudo `ios tunnel start` on 17+, and Apple's own tool needs nothing.
             iosInstall.ok && iosInstall.mode === 'devicectl' ? [
-              { label: 'Installing on device...', cmd: `${iosAppPath} && { xcrun devicectl device install app --device ${IOS_DEVICECTL} "$APP_PATH" || { ${iosHandoff('⚠️  devicectl could not install to this device — it requires iOS 17+.')}; exit 1; }; }`, cwd: iosCwd },
+              { label: 'Installing on device...', cmd: `${iosAppPath} && { xcrun devicectl device install app --device ${IOS_DEVICECTL} "$APP_PATH" || { ${iosHandoff('⚠️  devicectl could not install to this device. Check it is unlocked, awake and trusted; devicectl also cannot reach anything below iOS 17.')}; exit 1; }; }`, cwd: iosCwd },
               { label: 'Launching app...', cmd: `xcrun devicectl device process launch --device ${IOS_DEVICECTL} ${APP_ID}`, cwd: iosCwd },
             ]
             // go-ios: the iOS ≤16 device that has no devicectl id in EXISTENCE (it isn't a
@@ -2072,8 +2081,25 @@ export function assetScannerPlugin(): Plugin {
               { label: 'Installing on device (go-ios)...', cmd: `${iosAppPath} && { ${GO_IOS_Q} install --path="$APP_PATH" --udid=${IOS_DEST} || { ${iosHandoff('⚠️  go-ios could not install to this device.')}; exit 1; }; }`, cwd: iosCwd },
               // A launch failure is NOT worth failing the build over: the new build is already on
               // the phone, which is the part that can't be redone by tapping an icon. Say what
-              // happened and exit 0. (The most likely cause is a locked/asleep device.)
-              { label: 'Launching app...', cmd: `${GO_IOS_Q} launch ${APP_ID} --udid=${IOS_DEST} || { echo ""; echo "⚠️  Installed, but the app could not be launched — unlock the device and tap the icon."; }`, cwd: iosCwd },
+              // happened and exit 0.
+              //
+              // ⚠️ **LEAD WITH THE INSTALL HAVING SUCCEEDED, and do not blame the lock screen.** This
+              // used to read "unlock the device and tap the icon", which names the ONE cause an
+              // agent or a human can act on and is wrong on the hardware that actually hits this.
+              // `go-ios launch` drives Apple's INSTRUMENTS service (`processcontrol` over
+              // `com.apple.instruments.remoteserver.DVTSecureSocketProxy`), and on an older handset
+              // that service can be permanently unavailable — measured on the iPhone 8 / iOS 16.7.16
+              // under Xcode 26.5, where it fails with a handshake EOF that no unlock, replug or
+              // Developer-Disk-Image mount changes (one is already mounted; `ios image auto` is a
+              // no-op there). It is the same dead instruments stack that stops WebDriverAgent on
+              // that phone and hides it from `xctrace` — see docs/trusted-device-input.md, and do
+              // not re-diagnose it.
+              //
+              // The failure therefore reads as "the build did not deploy" while the app is sitting
+              // on the phone, freshly installed. The one thing the reader needs is that the INSTALL
+              // landed; the cause is second, and go-ios's own error is already on the build stream
+              // above this line for the detail.
+              { label: 'Launching app...', cmd: `${GO_IOS_Q} launch ${APP_ID} --udid=${IOS_DEST} || { echo ""; echo "✅ Installed — the new build IS on the device."; echo "⚠️  Auto-launch failed, so it did not come to the foreground. Tap the app icon to run it."; echo "   Launching goes through Apple's instruments service, which some older devices do not"; echo "   provide (iOS ≤16 on a recent Xcode) — there the install is hands-free but the launch"; echo "   never will be. A locked or asleep device causes this too, so check that first."; }`, cwd: iosCwd },
             ]
             // Neither tool can reach it: an iOS ≤16 device on an editor with no go-ios and no way
             // to provision one. The build DID succeed, so report success and hand off — exiting

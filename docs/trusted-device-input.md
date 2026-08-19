@@ -296,6 +296,16 @@ build, the per-machine signing, and the expiry rule.
   visible only by re-running the command by hand — the launcher discarded the child's output and
   reported a guess about signing instead, which is a large part of why this took as long as it did.
 
+  ⚠️ **The same dead instruments stack also blocks `go-ios launch` on that phone, so this is not
+  only a WDA fact** (measured 2026-08-19, Xcode 26.5). `ios launch <bundle-id>` drives
+  `processcontrol` over `com.apple.instruments.remoteserver.DVTSecureSocketProxy` and fails with
+  that service `unavailable` (handshake EOF), exit 1 — while `ios install` over usbmuxd works
+  perfectly, and `xctrace` cannot see the phone at all even though `xcodebuild -showdestinations`
+  can. Mounting the Developer Disk Image is NOT the fix: `ios image auto` reports one already
+  mounted and the launch fails identically. Consequence for deploys, and the message the build
+  prints instead of a failure: [build.md](./build.md) § "iOS Device". `idevicedebug --detach run`
+  (libimobiledevice) goes through debugserver rather than instruments and DOES launch it.
+
   `xcodebuild -showdestinations` omits it for EVERY scheme in the WDA project while listing four
   iOS-26 phones — **two of which are disconnected** — so destination eligibility tracks OS
   version, not connection. Xcode will build and run ordinary apps on it (that is how the game gets

@@ -172,6 +172,71 @@ export function resetRenderSettings(): void {
   // promotion in a world that never made it. `activeTier` is cleared here rather than through
   // `setActiveQualityTier(null)`, so the pairing has to be maintained in both places.
   assessedTier = null;
+  // And the debug override — see the block below. Without this a test that pins one leaks it
+  // into the next, exactly like `activeTier`/`assessedTier` above.
+  // Cleared THROUGH the setter so a mounted panel is notified, rather than by assigning the
+  // object directly — a reset that silently leaves the panel showing an override nothing holds
+  // any more is the same stale-display defect the notification exists for.
+  setDebugPixelRatioCapOverride('pixi', null);
+  setDebugPixelRatioCapOverride('three', null);
+}
+
+// ── Debug pixelRatioCap override (the debug menu's "Backing resolution" row) ──────────────────
+// The Device tab's Backing-resolution row writes `settings.{pixi,three}.pixelRatioCap` (the
+// AUTHORED value), which `getEffectivePixiSettings`/`getEffectiveThreeSettings` then clamp
+// through the active tier just like a project's own config would. On any device below `high`
+// that clamp eats the pick right back — tapping "3" on an iPhone 8 (tier `mid`,
+// `pixiPixelRatioCap: 1`) writes authored 3, effective 1, canvas unchanged. The row exists to
+// A/B backing resolution on real hardware, so it needs a way to go ABOVE the tier's ceiling.
+//
+// This is a SEPARATE, debug-only channel rather than a bigger authored value, because raising the
+// authored cap would raise it for the project too — this must affect only what the debug menu is
+// currently probing, and must never survive a reload (no PlayerPrefs, no project.config.json)
+// like the existing `previewTier`.
+//
+// ⚠️ `null` MEANS "no override, tier governs" — NOT `0`. `0` is already a meaningful value on this
+// API: `computeBackingSize`/`applyTierToPixi`/`applyTierToThree` all treat an authored
+// `pixelRatioCap` of `0` as UNCAPPED (devicePixelRatio, no ceiling), and `CAP_OPTIONS` in
+// DeviceTab includes an "Off" button whose value literally IS `0`. If `0` also meant "cleared",
+// picking "Off" from the debug menu would be indistinguishable from handing control back to the
+// tier — two different intents collapsing into the same falsy value. `number | null` keeps them
+// apart.
+let debugPixelRatioCapOverride: { pixi: number | null; three: number | null } = { pixi: null, three: null };
+
+/** Fired whenever the override changes, so a MOUNTED panel can re-read it.
+ *
+ *  ⚠️ Not ceremony: the Device tab reads the override at RENDER time and re-renders only when one
+ *  of its own buttons was pressed. The setter above is exported from `runtime/index.ts` precisely
+ *  so an agent can drive the override from `device_eval` without touching the panel — and that
+ *  path bumped nothing, so the open panel went on showing its pre-override marks (wrong button
+ *  highlighted, caption absent) until an unrelated resize happened to re-render it. A debug
+ *  surface that silently disagrees with the renderer is the false-success class this panel exists
+ *  to prevent, so the notification is part of the feature, not polish. */
+const overrideListeners = new Set<() => void>();
+
+/** Subscribe to override changes; returns the unsubscribe. */
+export function onDebugPixelRatioCapOverrideChange(cb: () => void): () => void {
+  overrideListeners.add(cb);
+  return () => { overrideListeners.delete(cb); };
+}
+
+/** Iterate a COPY — a listener that unsubscribes itself during the callback must not corrupt the
+ *  live Set's iteration or skip a sibling (same rule as `resizeBus`). */
+function notifyOverrideChanged(): void {
+  for (const cb of [...overrideListeners]) cb();
+}
+
+/** Set (or clear, with `null`) the debug override for one surface's `pixelRatioCap`. Debug-only,
+ *  non-persistent — see the block comment above. */
+export function setDebugPixelRatioCapOverride(surface: 'pixi' | 'three', value: number | null): void {
+  if (debugPixelRatioCapOverride[surface] === value) return; // no listener work for a no-op set
+  debugPixelRatioCapOverride = { ...debugPixelRatioCapOverride, [surface]: value };
+  notifyOverrideChanged();
+}
+
+/** The current override for one surface, or `null` if the tier is governing it. */
+export function getDebugPixelRatioCapOverride(surface: 'pixi' | 'three'): number | null {
+  return debugPixelRatioCapOverride[surface];
 }
 
 // ── Active quality tier (#121 P3) ──────────────────────────────────────────────────────────
@@ -242,10 +307,16 @@ export function getAssessedQualityTier(): TierResolution | null {
  *  consumer should read instead of `getRenderSettings().three`.
  *
  *  Falls back to the raw settings when no tier has been resolved yet, so a call before bring-up
- *  behaves exactly as it did before tiers existed. */
+ *  behaves exactly as it did before tiers existed.
+ *
+ *  A non-null debug override (see the block above `debugPixelRatioCapOverride`) SKIPS the tier
+ *  clamp entirely for `pixelRatioCap` — every other field still flows through the tier — and wins
+ *  even before a tier has resolved, so the debug menu is never at the mercy of bring-up ordering. */
 export function getEffectiveThreeSettings(): ThreeRenderSettings {
   const three = settings.three;
-  return activeTier ? applyTierToThree(three, getActiveTierOverrides()) : three;
+  const base = activeTier ? applyTierToThree(three, getActiveTierOverrides()) : three;
+  const override = debugPixelRatioCapOverride.three;
+  return override === null ? base : { ...base, pixelRatioCap: override };
 }
 
 /** The project's pixi settings with the active tier applied — the 2D twin of
@@ -259,10 +330,15 @@ export function getEffectiveThreeSettings(): ThreeRenderSettings {
  *  Huawei Y6 paying ~4x for 2x DPR) is a FILL-RATE fact, not a Three.js fact; it applies to a Pixi
  *  canvas identically.
  *
- *  Falls back to the raw settings when no tier has been resolved yet, exactly as its 3D twin does. */
+ *  Falls back to the raw settings when no tier has been resolved yet, exactly as its 3D twin does.
+ *
+ *  Same debug override as {@link getEffectiveThreeSettings} — see the block above
+ *  `debugPixelRatioCapOverride`. Kept symmetric with the 3D accessor on purpose. */
 export function getEffectivePixiSettings(): PixiRenderSettings {
   const pixi = settings.pixi;
-  return activeTier ? applyTierToPixi(pixi, getActiveTierOverrides()) : pixi;
+  const base = activeTier ? applyTierToPixi(pixi, getActiveTierOverrides()) : pixi;
+  const override = debugPixelRatioCapOverride.pixi;
+  return override === null ? base : { ...base, pixelRatioCap: override };
 }
 
 /** The frame cap in force: the project's authored `rendering.targetFps` clamped by the active

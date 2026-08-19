@@ -7,11 +7,13 @@ import { scrollRootStyle } from '../tabLayout';
 import {
   getRenderSettings, setRenderSettings, getActiveQualityTier,
   getEffectiveThreeSettings, getEffectivePixiSettings, getActiveTierOverrides,
+  setDebugPixelRatioCapOverride, getDebugPixelRatioCapOverride, onDebugPixelRatioCapOverrideChange,
 } from '../../rendering/renderSettings';
 import { applyQualityTier } from '../../rendering/tierCalibration';
 import { runProbeForDiagnostics } from '../../rendering/tierResolve';
 import { TIER_ORDER, type QualityTier } from '../../rendering/qualityTier';
 import { forceResizeAllSurfaces } from '../../rendering/resizeBus';
+import { asCeiling, pickedCap, capButtonMarks, capRowCaption, type CapRowState } from './capRowMarks';
 
 interface Insets { top: string; right: string; bottom: string; left: string }
 
@@ -86,56 +88,57 @@ const CAP_OPTIONS: Array<{ value: number; label: string }> = [
   { value: 0, label: 'Off' },
 ];
 
-/** `Infinity` is the tier's own "unclamped" identity (`UNCLAMPED_OVERRIDES`); an authored `0`
- *  ("Off") means the same thing from the other side (`renderSettings.ts`'s sentinel). Both read
- *  as "no ceiling" here so a button's would-be-authored value compares against the tier's ceiling
- *  on equal terms. */
-function asCeiling(v: number): number {
-  return v > 0 ? v : Infinity;
-}
-
-/** Would picking `value` on this A/B button be immediately clamped back down by the ACTIVE tier?
- *  This is what makes the row honest — R6.2: on `low`/`mid` (`pixelRatioCap: 1`), tapping `2` or
- *  `3` used to store the authored value while the renderer kept running at 1, and the owner had
- *  no way to tell from this panel that the tap did nothing.
- *
- *  ⚠️ **IT LABELS THE BUTTON; IT DOES NOT DISABLE IT** (owner, 2026-08-12). Disabling was tried and
- *  is wrong: A/B-ing the backing resolution on a device is the whole reason this row exists, and a
- *  tier clamps it on every phone that is not `high` — i.e. on exactly the hardware worth testing.
- *  Removing the control to signal the clamp takes away the thing the panel is FOR. The tap still
- *  writes the authored value; the readout beside the row says what the tier is doing to it, and the
- *  tier buttons in this same tab are how you lift the clamp. Honest, not inert. */
-function willBeClamped(value: number, tierCeiling: number): boolean {
-  return asCeiling(value) > tierCeiling;
-}
-
 function CapButtonRow({
-  label, effective, authored, tierCeiling, onPick,
+  label, effective, authored, tierCeiling, override, onPick, onAuto,
 }: {
-  label: string; effective: number; authored: number; tierCeiling: number; onPick: (v: number) => void;
+  label: string; effective: number; authored: number; tierCeiling: number;
+  /** The live debug override for this surface — `null` means the tier governs. */
+  override: number | null;
+  onPick: (v: number) => void;
+  /** Hand the surface back to the tier (clears the override). */
+  onAuto: () => void;
 }) {
+  const overridden = override !== null;
+  const state: CapRowState = { authored, override, effective, tierCeiling };
+  const caption = capRowCaption(state);
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4, flexWrap: 'wrap' }}>
       <span style={{ ...keyStyle, width: 18 }}>{label}</span>
       <div style={{ display: 'flex', gap: 4 }}>
+        {/* `Auto` at the HEAD of the row — hands the surface back to the tier. Without it, the
+            other buttons could push a value ABOVE the tier's ceiling but there would be no way to
+            compare back against what the tier would actually run without relaunching, which is
+            exactly what this row is for. */}
+        <button
+          key="auto"
+          onClick={onAuto}
+          title={overridden ? undefined : 'The tier already governs this surface'}
+          style={{
+            fontSize: 11,
+            padding: '2px 8px',
+            borderRadius: 4,
+            border: !overridden ? '1px solid #7ec8ff' : '1px solid #2d5a8a',
+            background: !overridden ? '#16223a' : 'transparent',
+            color: !overridden ? '#7ec8ff' : '#8b8ba7',
+            cursor: 'pointer',
+          }}
+        >
+          Auto
+        </button>
         {CAP_OPTIONS.map(({ value, label: btnLabel }) => {
-          // ⚠️ HIGHLIGHT WHAT THE TAP WROTE — the AUTHORED value — not the effective one.
-          // R6.2 highlighted `effective`, which sounds right ("show what is really running") and
-          // is wrong for a SELECTOR: the tap writes the authored value, so on any clamped tier the
-          // highlight never moved and the button read as broken. Reported from the device, 2026-08-12.
-          // The effective value is not lost — it is marked below and spelled out in the readout
-          // beside the row.
-          const active = authored === value;
-          // What the renderer is ACTUALLY running, when the tier clamped the pick somewhere else.
-          const isEffective = effective === value && effective !== authored;
-          const clamped = willBeClamped(value, tierCeiling);
+          // WHICH mark each button gets — and WHY it is the pick rather than the effective value,
+          // and why the pick is the override once one is in force — is `capRowMarks.ts`. Both
+          // rules were learned from a device reporting the row as broken; that module owns them
+          // and the tests that pin them, so this file does not restate them.
+          const picked = pickedCap(state);
+          const { active, isEffective, clamped } = capButtonMarks(value, state);
           return (
             <button
               key={btnLabel}
               onClick={() => onPick(value)}
               title={
                 isEffective
-                  ? `Running at this — the tier clamped your pick of ${authored > 0 ? authored : 'Off'} down to it`
+                  ? `Running at this — the tier clamped your pick of ${picked > 0 ? picked : 'Off'} down to it`
                   : clamped
                     ? `The active tier clamps this to ${tierCeiling === Infinity ? 'uncapped' : tierCeiling} — it will be stored, but pick a higher tier to see it on screen`
                     : undefined
@@ -149,7 +152,7 @@ function CapButtonRow({
                 // neither has to be inferred from the other.
                 border: active ? '1px solid #7ec8ff' : isEffective ? '1px dashed #7ec8ff' : '1px solid #2d5a8a',
                 background: active ? '#16223a' : 'transparent',
-                // Dimmed as a HINT that the tier will clamp it — still tappable, see `willBeClamped`.
+                // Dimmed as a HINT that the tier will clamp it — still tappable, see `willBeClamped` in capRowMarks.ts.
                 color: clamped ? '#5c5c70' : active || isEffective ? '#7ec8ff' : '#8b8ba7',
                 cursor: 'pointer',
                 opacity: clamped ? 0.7 : 1,
@@ -160,12 +163,14 @@ function CapButtonRow({
           );
         })}
       </div>
-      {/* The AUTHORED value beside the effective one, only when a tier is clamping them apart —
-          the readout must not silently hide what was actually stored. */}
-      {authored !== effective && (
-        <span style={{ fontSize: 10, color: '#8b8ba7' }}>
-          (authored {authored > 0 ? authored : 'Off'}, tier clamps to {effective > 0 ? effective : 'Off'})
-        </span>
+      {/* Two different captions, because they are two different facts: a TIER clamp (no override —
+          the authored pick was capped back down) vs. a DEBUG override (the tier's own ceiling is
+          being overridden, which is the whole point of this row — see `capRowMarks.ts` for the
+          full rationale). The panel must still let you SEE what the tier would have done even
+          while overriding it, so the override caption spells out the ceiling rather than just
+          saying "on". */}
+      {caption !== null && (
+        <span style={{ fontSize: 10, color: '#8b8ba7' }}>({caption})</span>
       )}
     </div>
   );
@@ -207,16 +212,47 @@ export function DeviceTab() {
     };
   }, []);
 
+  /** Writes the authored value (unchanged) AND the debug override, so this is what actually runs
+   *  even when it exceeds the active tier's ceiling — see `setDebugPixelRatioCapOverride` in
+   *  renderSettings.ts for why the override is a separate `number | null` channel rather than
+   *  just a bigger authored value. */
+  // An override set from OUTSIDE this panel — `runtime/index.ts` exports the setter so an agent
+  // can drive it from device_eval — changes nothing this component watches, so without this the
+  // open panel keeps rendering its pre-override marks. Only the SETTING is re-read here: an
+  // external set does not force a resize, so the buffer rows genuinely have not moved yet, and
+  // re-reading them is honest rather than premature.
+  useEffect(() => onDebugPixelRatioCapOverrideChange(() => {
+    bumpCapsTick((n) => n + 1);
+    setBuffers(readCanvasBuffers());
+  }), []);
+
   function setCap(surface: 'pixi' | 'three', cap: number) {
     const rs = getRenderSettings();
     if (surface === 'pixi') setRenderSettings({ pixi: { ...rs.pixi, pixelRatioCap: cap } });
     else setRenderSettings({ three: { ...rs.three, pixelRatioCap: cap } });
+    setDebugPixelRatioCapOverride(surface, cap);
     forceResizeAllSurfaces();
     bumpCapsTick((n) => n + 1);
     // The resize path itself runs synchronously, but a pooled PixiJS Application (and,
     // in principle, three) can land its actual buffer resize on a later frame — wait
     // two rAFs before re-reading the DOM so the readout below reflects the NEW buffer,
     // not a stale one from before the click.
+    if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = requestAnimationFrame(() => {
+        rafRef.current = null;
+        setBuffers(readCanvasBuffers());
+      });
+    });
+  }
+
+  /** `Auto` — hand the surface back to the tier by clearing the override. Same forceResize +
+   *  two-rAF re-read as `setCap`, so the readout reflects the tier's own buffer size, not a
+   *  stale one from the override. */
+  function clearCapOverride(surface: 'pixi' | 'three') {
+    setDebugPixelRatioCapOverride(surface, null);
+    forceResizeAllSurfaces();
+    bumpCapsTick((n) => n + 1);
     if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     rafRef.current = requestAnimationFrame(() => {
       rafRef.current = requestAnimationFrame(() => {
@@ -332,14 +368,18 @@ export function DeviceTab() {
           effective={effectivePixi.pixelRatioCap}
           authored={liveCaps.pixi.pixelRatioCap}
           tierCeiling={tierCeilingPixi}
+          override={getDebugPixelRatioCapOverride('pixi')}
           onPick={(v) => setCap('pixi', v)}
+          onAuto={() => clearCapOverride('pixi')}
         />
         <CapButtonRow
           label="3D"
           effective={effectiveThree.pixelRatioCap}
           authored={liveCaps.three.pixelRatioCap}
           tierCeiling={tierCeilingThree}
+          override={getDebugPixelRatioCapOverride('three')}
           onPick={(v) => setCap('three', v)}
+          onAuto={() => clearCapOverride('three')}
         />
         <div style={{ ...rowStyle, marginTop: 6 }}>
           <span style={keyStyle}>Quality tier</span>

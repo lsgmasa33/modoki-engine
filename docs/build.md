@@ -876,6 +876,33 @@ build that `xcodebuild` handles perfectly was refused before it started, and the
 `project.config.json` — the wrong file. Caught on an iPhone 8 / iOS 16.7.16, whose build then
 succeeded unchanged once the demand was dropped.
 
+⚠️ **On some legacy hardware the INSTALL is hands-free and the LAUNCH never will be — the build
+says so rather than reporting a failure** (measured 2026-08-19, iPhone 8 / iOS 16.7.16, Xcode
+26.5). `ios install` lands the `.app` over usbmuxd in ~8 s; `ios launch` then fails with
+`processcontrol failed: instruments service
+"com.apple.instruments.remoteserver.DVTSecureSocketProxy" unavailable`, exit 1. That is the SAME
+dead instruments stack that stops WebDriverAgent on that phone and hides it from `xctrace` — see
+[trusted-device-input.md](./trusted-device-input.md) § "iOS 16 devices"; do not re-diagnose it, and
+note that mounting the Developer Disk Image is not the fix (`ios image auto` reports one is already
+mounted and the launch fails identically).
+
+The launch step is deliberately non-fatal — the new build is already ON the phone, which is the
+part a tap cannot redo — so the build stays green and prints that the install succeeded, that the
+app did not come to the foreground, and that launching goes through a service some older devices
+do not provide. It used to say only "unlock the device and tap the icon", which names the one
+cause that can never apply here and reads as "the deploy failed" while the app sits installed one
+tap away. A locked or asleep device is still a real cause on healthy hardware, so it stays in the
+message as the first thing to check — the correction is that it is no longer presented as the only
+one. The install step's own failure message was corrected the same way: it asserted "it requires
+iOS 17+", which is wrong-by-construction whenever `iosDevicectlId` came from the Build menu's
+picker (the picker only fills it for a device devicectl can already see).
+
+`idevicedebug --detach run <bundle-id>` (libimobiledevice, Homebrew) DOES launch that phone —
+verified, exit 0, and the app outlives the tool. It is deliberately **not** wired into the build:
+the editor does not provision libimobiledevice, so depending on it would make the deploy behave
+differently on two machines depending on what Homebrew happens to have installed. Run it by hand
+when you want the loop hands-free on such a device.
+
 ### Android Device
 ```bash
 MODOKI_PROJECT=games/<id> npm run build -- --target native

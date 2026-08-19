@@ -411,6 +411,13 @@ export {
   getActiveTierOverrides,
   getTierSwitchMessage, DEFAULT_TIER_SWITCH_MESSAGE,
   getActiveTierOrDefault,
+  // The debug menu's backing-resolution override. Exported for the same reason
+  // `getActiveTierOverrides` above is: this list is EXPLICIT, so anything not named here is
+  // unreachable from outside the package — including from a `device_eval`/`modoki_eval`, which
+  // is the only way an agent can check on real hardware what the override is actually doing.
+  // The feature works without this (DeviceTab imports the module directly); what it loses is
+  // the ability to be VERIFIED on the device it exists for.
+  setDebugPixelRatioCapOverride, getDebugPixelRatioCapOverride,
 } from './rendering/renderSettings';
 export {
   tickTierCalibration, applyPendingTierPromotion, resetTierCalibration, setTierFrameCapEnabled, setTierCalibrationEnabled,

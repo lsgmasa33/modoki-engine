@@ -1729,6 +1729,35 @@ new tier appears there automatically) applying it LIVE, so a low-end look can be
 owning the phone. The reason is the point — "low" alone is
 unexplainable, and project-pinned / failed-calibration / player-chosen want different responses.
 
+**The Device tab's "Backing resolution" row can drive `pixelRatioCap` ABOVE the active tier's
+ceiling** (2026-08-19), through a debug-only override channel in `renderSettings.ts`
+(`setDebugPixelRatioCapOverride`, per-surface `number | null`) that
+`getEffectivePixiSettings`/`getEffectiveThreeSettings` honour by skipping the tier clamp for that
+one field. Every other tier-governed knob keeps flowing through the tier, and the clamp on a
+*project's authored config* is untouched — this is an escape hatch for the panel, not a hole in the
+low-end protection.
+
+Why it had to exist: the row wrote the AUTHORED value and the tier clamped it straight back, so on
+any device below `high` a pick changed nothing you could see — measured on an iPhone 8 (tier `mid`,
+`pixiPixelRatioCap: 1`), where tapping "3" gave authored 3, effective 1 and a canvas that stayed
+375×667. The row exists to A/B backing resolution on exactly that hardware, so it read as broken on
+the only devices it was for.
+
+Three properties worth knowing, all deliberate:
+- **`Auto`**, at the head of each row, clears the override and hands the surface back to the tier —
+  without it you could go above the ceiling but never compare against the tier again without
+  relaunching, which is the other half of an A/B.
+- **The override SURVIVES a live tier change** (owner's call, 2026-08-19): an explicit QA override
+  outranks a calibration demotion, which goes on dropping shadows and post-FX around it.
+- **`0` means UNCAPPED, `null` means "no override"** — they are different states, which is why the
+  channel is `number | null` and not a bare number. The row's "Off" button IS `0`.
+
+It is non-persistent (no PlayerPrefs, no `project.config.json`), like the tier-preview buttons
+beside it. `runtime/index.ts` exports the setter so an agent can drive it from `device_eval`, and
+a change made that way notifies the panel — a debug surface silently disagreeing with the renderer
+is the false-success class the panel exists to prevent. What the row's marks and caption mean lives
+in `capRowMarks.ts` (pure, tested).
+
 **iOS answers from the MODEL ID and never measures** (owner, 2026-08-09) — `TierSource: 'model'`,
 ⚠️ **except that a DEBUG build now measures anyway and throws the verdict away** (#188,
 2026-08-11): `resolveActiveTierOnce` runs the ramp probe even when something cheaper decided, gated
