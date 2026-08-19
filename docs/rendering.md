@@ -31,6 +31,44 @@ Object lifetimes are tracked in a `RenderState` (`ecsObjects`, `ecsSprites`, `ec
 
 `Scene2D.tsx` renders `Renderable2D` entities into their nearest `Canvas2D` ancestor's PixiJS container. A sprite is drawn either as a tinted `Graphics` primitive (driven by `Renderable2D.color`) or an image. Shared draw computations live in `render2DUtils.ts` (`drawPrimitiveShapeGfx()`, etc.) so the editor and runtime share one code path. Full detail: [2D Rendering (PixiJS)](#2d-rendering-pixijs) below.
 
+#### The PixiJS tree is FLAT — alpha does not inherit for free (`GroupAlpha`, #211)
+
+Every display object goes straight onto its `Canvas2D` slot container, so the Pixi tree carries no
+nesting and a parent's `alpha` never reaches its children. UI does not have this problem (nested
+DOM + CSS opacity), and fading a WHOLE 2D canvas already worked — the pooled Pixi canvas is
+`appendChild`-ed *inside* the `2D Canvas` UI node's div, so CSS opacity on that node composites all
+of PixiJS at once. What was missing is fading PART of a scene.
+
+**`GroupAlpha { alpha }`** supplies the ancestor product. Semantics follow Unity's CanvasGroup and a
+PixiJS container: it multiplies the entity **and every descendant**, nested groups multiply
+together, and it **composes with** `Renderable2D.opacity` (`drawn = opacity × group`) rather than
+replacing it — so a game already driving per-entity opacity for its own reasons keeps doing that
+while a group fade rides on top. Put it on a bare hierarchy node to fade a subtree the node itself
+does not draw. The product is computed once per rebuild by `computeGroupAlpha` (`groupAlpha.ts`)
+off the same parent map `computePaintOrder` uses, and is **sparse** — no `GroupAlpha` anywhere means
+an empty map and a `?? 1` read, so a scene that never uses it pays one `.size` check.
+
+2D **particle emitters** honour it too, by a different route: `particleSync2D` attaches its wrapper
+straight onto the same Canvas2D slot container, so it takes the product through
+`ParticleSync2DCtx.groupAlphaOf` and writes `wrapper.alpha` every frame (particles animate
+continuously — there is no snapshot to invalidate). Without that a faded group dimmed its sprites
+and left its particles at full brightness, which is the half-wired version of a trait that claims
+the whole subtree.
+
+⚠️ **The load-bearing part is the CHANGE DETECTION, not the multiply.** Each 2D pass early-returns
+on a per-entity snapshot, and those snapshots compared the entity's OWN `opacity`. A parent group
+fading while the child's own opacity holds still is exactly the case that would read as "nothing
+changed" and never paint — the fade would work on the frame the child moved and at no other time.
+So the snapshots store the **effective** alpha (`opacity × group`), and `Text2D` — whose opacity
+lives in the MTSDF shader uniforms rather than on the container — carries `groupAlpha` as its own
+snapshot field. Verified live rather than by inspection: an authored `0.25` over a background of
+(11,12,28) predicted a composite of (51,21,35) and measured (52,22,34); nesting `0.25 × 0.5`
+predicted (31,17,31) and measured (31,17,31) exactly, with a sibling outside the group
+byte-identical throughout.
+
+The editor gets this for free — `editorScene2D.ts` instantiates the same `Scene2DRenderer`, so the
+SceneView preview and the game cannot disagree about it.
+
 ### `ui` — React DOM
 
 UI entities (`Renderable.layer = 'ui'`) are projected to React/DOM by `UIRenderer`, laid out with CSS flexbox and bound to the store. Full details in [UI System](./ui-system.md).

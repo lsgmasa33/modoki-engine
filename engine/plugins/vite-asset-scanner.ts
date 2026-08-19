@@ -65,7 +65,7 @@ import { reclaimStaleDeviceStateAtStartup, deviceConnection } from './backend/de
 import { vendorEnginePlugins, writeVendorMarker } from './vendorPlugins';
 import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
 import { healNativeConfig } from './healNativeConfig';
-import { ICON_TOOL, ICON_COLORS, iconIsUpToDate, iconStampValue } from './iconAssets';
+import { iconIsUpToDate, iconStampValue } from './iconAssets';
 import { ensureCapacitorDeps, scaffoldNativeTarget, type NativePlatform } from './addNativeTarget';
 import { discoverSigningTeams, type SigningTeam } from './signingTeams';
 import { serveProjectAsset } from './backend/staticAssets';
@@ -2001,29 +2001,23 @@ export function assetScannerPlugin(): Plugin {
             : path.join(buildCwd, 'build/icon.png');
           // `--<plat>` (a FLAG, not the positional arg) makes the platform list
           // exclusive — the positional form still tries PWA and fails on a missing
-          // www/manifest.json. Colors are double-quoted (portable across bash +
-          // cmd.exe; `#` isn't a comment inside quotes on either). The mkdir+copy prep
-          // differs per shell (posix `mkdir -p`/`cp` vs cmd `mkdir`/`copy`); the
-          // `|| echo` non-fatal fallback works on both.
-          //
-          // VERSION IS PINNED. This used to be a bare `@capacitor/assets` under a comment
-          // claiming it was "verified against 3.0.5" — but `npx --yes` installs LATEST, so
-          // the comment documented a version the build did not actually use. A newer
-          // release then started emitting extra density buckets (drawable-night-*, *-ldpi,
-          // mipmap-ldpi), which showed up as mystery untracked dirs in games that had done
-          // nothing but build. The generated icons are committed release artifacts; the
-          // tool that generates them cannot be a moving target.
-          const iconGen = (plat: 'ios' | 'android') =>
-            `npx --yes ${ICON_TOOL} generate --${plat} ${ICON_COLORS}`;
-          const iconStampRel = (plat: 'ios' | 'android', win: boolean) =>
-            win ? `.cache\\icon-stamp-${plat}` : `.cache/icon-stamp-${plat}`;
+          // www/manifest.json. The tool version is PINNED (scripts/iconAssets.mjs); the
+          // flag does NOT keep the run inside that platform, which is what the wrapper
+          // below is for.
+          // The staging, the run, the freshness stamp and the SIDE-EFFECT CLEANUP all live in
+          // `engine/scripts/generate-icons.mjs` — one portable Node step instead of two
+          // hand-kept shell variants. It exists because the generator does not stay inside the
+          // platform it is given: `generate --android` also rewrites `ios/…/project.pbxproj`
+          // (mangling `LastUpgradeCheck = 0920` → `920`) and re-serializes AndroidManifest.xml
+          // (#236). The script restores every pre-existing NON-image file the run touched and
+          // reports what it restored; images — its actual product — are left alone.
           const iconStep = (plat: 'ios' | 'android'): BuildStep | null => {
             if (iconIsUpToDate(projectRoot, iconSrcAbs, plat)) return null;
             const stamp = iconStampValue(iconSrcAbs, plat);
+            const script = path.join(buildCwd, 'engine/scripts/generate-icons.mjs');
             return {
               label: 'Generating app icons...',
-              cmd: `mkdir -p assets .cache && cp ${JSON.stringify(iconSrcAbs)} assets/icon.png && ${iconGen(plat)} && printf '%s' ${stamp} > ${JSON.stringify(iconStampRel(plat, false))} || echo '[icon] generation skipped (source missing or @capacitor/assets error)'`,
-              winCmd: `(if not exist assets mkdir assets) && (if not exist .cache mkdir .cache) && copy /y "${iconSrcAbs}" assets\\icon.png && ${iconGen(plat)} && (echo ${stamp}>"${iconStampRel(plat, true)}") || echo [icon] generation skipped`,
+              cmd: `node ${JSON.stringify(script)} --project ${JSON.stringify(projectRoot)} --platform ${plat} --icon ${JSON.stringify(iconSrcAbs)} --stamp ${stamp}`,
               cwd: plat === 'ios' ? iosCwd : androidCwd,
             };
           };

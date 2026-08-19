@@ -105,8 +105,12 @@ Two things went wrong before it did:
   across two games in one day, burying real diffs in re-encoded binaries.
 - The generator was invoked as a bare `npx --yes @capacitor/assets` beneath a comment claiming
   it was "verified against 3.0.5". `npx --yes` installs **latest**, so the comment described a
-  version the build never used; a newer release started emitting extra density buckets
-  (`drawable-night-*`, `*-ldpi`, `mipmap-ldpi`) that surfaced as mystery untracked directories.
+  version the build never used.
+  ⚠️ That fix also blamed the **extra density buckets** (`drawable-*-night-*`, `*-ldpi`,
+  `mipmap-ldpi`, `mipmap-<dpi>/ic_launcher_background.png`) on the floating version. Measured
+  2026-08-19 on `demos/forest-camp`: the **pinned 3.0.5 emits them too** — 21 paths no project
+  commits. Pinning made them stop *changing*; it did not make them stop *appearing*. Whether
+  they should be committed or gitignored is still open (#236).
 
 Now: the tool version is **pinned** (`ICON_TOOL`), and a stamp under the project's gitignored
 `.cache/` records the tool version + platform + colour flags + the **content hash** of the
@@ -114,6 +118,24 @@ source image. Regeneration happens when any of those change, or when the generat
 been deleted (a sentinel file is checked, so a wiped `res/` still comes back). Content-hashing
 means repointing `app.iconSource` at a byte-identical file is correctly a no-op, while editing
 an image in place is not.
+
+**The generator does not stay inside the platform it is given** (#236). Measured on
+`forest-camp`: `generate --android` also rewrites `ios/App/App.xcodeproj/project.pbxproj`,
+stripping the leading zero off `LastUpgradeCheck = 0920` → `920` — an **iOS** file mangled by an
+**Android** build — and re-serializes `AndroidManifest.xml` (blank lines dropped, `<?xml … ?>`
+respaced). Neither is a semantic change, and about half the repo's projects already carry the
+mangled `920` in a commit, which is how quietly it travels. `demos/` is the publishable tree, so
+this is CLAUDE.md's #18 hazard arriving from the build instead of the editor.
+
+So the step now runs through **`engine/scripts/generate-icons.mjs`** rather than a shell
+one-liner. It snapshots everything under `ios/`+`android/` outside the running platform's
+**product directory** — `android/app/src/main/res/**` for `--android`,
+`ios/App/App/Assets.xcassets/**` for `--ios`, both measured rather than assumed — runs the
+generator, then puts back anything it wrote outside that scope and **reports what it put back**,
+so a project that genuinely needs such an edit sees a line every build rather than silence.
+The scope is a PATH, not a file type: an extension-based rule also reverted
+`res/mipmap-anydpi-v26/ic_launcher.xml`, where the generator legitimately repoints the adaptive
+icon's background at the PNG it just made. Guard: `engine/tests/plugins/generateIcons.test.ts`.
 
 **Why not just gitignore the icons?** Generation is deliberately non-fatal (`|| echo '[icon]
 generation skipped'`) and needs `npx` to reach the network. Untracked icons would let an

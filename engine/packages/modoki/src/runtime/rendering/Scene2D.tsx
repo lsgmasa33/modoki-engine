@@ -33,7 +33,7 @@ import { Graphics, Sprite, Mesh, MeshGeometry, Texture, Rectangle, Assets, Conta
 import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { getCurrentWorld, onWorldSwap } from '../core/ecs/world';
 import { getAllTraits } from '../core/ecs/traitRegistry';
-import { Transform, Renderable2D, Collider2D, SkinnedSprite2D, Billboard3D, FlatSprite3D, Text2D, TextAnimation } from '../traits';
+import { Transform, Renderable2D, Collider2D, SkinnedSprite2D, Billboard3D, FlatSprite3D, Text2D, TextAnimation, GroupAlpha } from '../traits';
 import { MaterialInstance } from '../traits/MaterialInstance';
 import { applyTextAnimation, isTextAnimating, isColorEffect, type TextAnimParams } from './text/textAnimate';
 import { getTime } from '../core/getTime';
@@ -64,6 +64,7 @@ import { makePixiShaderInstance, type PixiShaderProgram } from './pixiShaderBuil
 import { coerceParamValue } from '../loaders/shaderSchema';
 import { register2DMaterialShaderMap, isEntity2DMaterialDirty } from './sprite2DMaterialBroker';
 import { computePaintOrder } from './paintOrder';
+import { computeGroupAlpha } from './groupAlpha';
 import { findCanvasAncestor as resolveCanvasAncestor, Orphan2DTracker } from './canvas2DRouting';
 import {
   createParticleSync2DState, syncParticles2D, releaseCanvas2DEmitters, disposeParticleSync2DState,
@@ -356,6 +357,12 @@ interface TextSnap {
   canvasId: number; x: number; y: number; rz: number; sx: number; sy: number;
   anchorX: number; anchorY: number; paint: number; compX: number; compY: number;
   layoutHash: string; styleHash: string;
+  /** GroupAlpha ancestry product (#211). Its own field rather than a term in `styleHash`:
+   *  text opacity lives in the MTSDF shader uniforms, group alpha rides on the container,
+   *  and folding it into the style hash would trigger a pointless uniform rewrite on every
+   *  frame of a fade. It still has to be COMPARED here — the block early-returns when
+   *  nothing changed, so a parent fading over a static label would otherwise never paint. */
+  groupAlpha: number;
 }
 
 /** Per-entity snapshot for the 2D-material (Mesh) pass — the inputs that determine the
@@ -481,6 +488,10 @@ export class Scene2DRenderer {
   private readonly parentOfEntity = new Map<number, number>();   // entityId → parentId
   private readonly sortOrderOfEntity = new Map<number, number>(); // entityId → EntityAttributes.sortOrder
   private paintOrderOf = new Map<number, number>();              // entityId → global paint index (sortOrder DFS)
+  /** entityId → alpha inherited from GroupAlpha ancestors × its own (#211). SPARSE: only
+   *  entities actually faded appear, so a scene with no GroupAlpha keeps an empty map and
+   *  every read falls through to 1. */
+  private groupAlphaOf = new Map<number, number>();
   private readonly canvasOfEntity = new Map<number, number>();   // entityId → canvas2D entityId (cached)
   private readonly canvasEntityIds = new Set<number>();          // all Canvas2D entity IDs this frame
   private readonly canvasCompensate = new Map<number, { x: number; y: number }>();  // canvasEntityId → shape compensation
@@ -535,6 +546,7 @@ export class Scene2DRenderer {
       slotContainer: (cid) => this.pool.getSlot(cid)?.container ?? null,
       markDirty: (cid) => { this.dirtyCanvases.add(cid); },
       compensate: (cid) => this.canvasCompensate.get(cid) ?? this._oneComp,
+      groupAlphaOf: (id) => this.groupAlphaOf.get(id) ?? 1,
     };
   }
 
@@ -792,6 +804,14 @@ export class Scene2DRenderer {
     // Global paint order (hierarchy DFS by sortOrder, re-ranked by orderInLayer) — drives
     // Pixi child z so 2D siblings stack by hierarchy, matching the editor SceneView.
     this.paintOrderOf = computePaintOrder(this.sortOrderOfEntity, this.parentOfEntity, orderInLayerOfEntity.size ? orderInLayerOfEntity : undefined);
+    // Group alpha (#211): the ancestor product that the flat PixiJS tree cannot give us for
+    // free. Same parent map as the paint order, one pass, and skipped entirely when nothing
+    // in the scene carries the trait.
+    const groupAlphaOfEntity = new Map<number, number>();
+    world.query(GroupAlpha).updateEach(([g]: any[], entity: any) => {
+      if (g.alpha !== 1) groupAlphaOfEntity.set(entity.id(), g.alpha);
+    });
+    this.groupAlphaOf = computeGroupAlpha(groupAlphaOfEntity, this.parentOfEntity);
 
     // Step 2: Collect Canvas2D entity IDs and set up their pool slots + scaler. A
     // canvas is dirty when its scaler output changed (resize / referenceWidth /
@@ -943,6 +963,11 @@ export class Scene2DRenderer {
         const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1 };
         const wt = getWorldTransform2D(id, tf);
         const paint = this.paintOrderOf.get(id) ?? 0;
+        // Effective alpha = the entity's own opacity × its GroupAlpha ancestry (#211). The
+        // PRODUCT is what goes in the snapshot below, not `rend.opacity` — otherwise a parent
+        // group fading while the child's own opacity holds still reads as "unchanged" and the
+        // fade never paints.
+        const alpha = rend.opacity * (this.groupAlphaOf.get(id) ?? 1);
         let texW = 0, texH = 0;
         if (displaySlot.kind === 'sprite') {
           const sp = displaySlot.obj as Sprite;
@@ -961,7 +986,7 @@ export class Scene2DRenderer {
         const changed = forceAll || !snap ||
           snap.canvasId !== canvasId || snap.kind !== displaySlot.kind || snap.spriteRef !== rend.sprite ||
           snap.x !== wt.x || snap.y !== wt.y || snap.rz !== wt.rz || snap.sx !== wt.sx || snap.sy !== wt.sy ||
-          snap.color !== rend.color || snap.opacity !== rend.opacity || snap.w !== rend.width || snap.h !== rend.height ||
+          snap.color !== rend.color || snap.opacity !== alpha || snap.w !== rend.width || snap.h !== rend.height ||
           snap.px !== px || snap.py !== py || snap.keepAspect !== rend.keepAspect ||
           snap.flipX !== rend.flipX || snap.flipY !== rend.flipY ||
           snap.texW !== texW || snap.texH !== texH || snap.compX !== comp.x || snap.compY !== comp.y ||
@@ -979,7 +1004,7 @@ export class Scene2DRenderer {
         // Stack by hierarchy paint order (sortableChildren re-sorts on render).
         displaySlot.obj.zIndex = paint;
         // Alpha (color's A channel) — applies to both sprites and primitives.
-        displaySlot.obj.alpha = rend.opacity;
+        displaySlot.obj.alpha = alpha;
         // Blend/compositing mode — set on the view (Sprite or Graphics both support it).
         (displaySlot.obj as Sprite | Graphics).blendMode = blend;
 
@@ -1016,14 +1041,14 @@ export class Scene2DRenderer {
         if (snap) {
           snap.canvasId = canvasId; snap.kind = displaySlot.kind; snap.spriteRef = rend.sprite;
           snap.x = wt.x; snap.y = wt.y; snap.rz = wt.rz; snap.sx = wt.sx; snap.sy = wt.sy;
-          snap.color = rend.color; snap.opacity = rend.opacity; snap.w = rend.width; snap.h = rend.height; snap.px = px; snap.py = py;
+          snap.color = rend.color; snap.opacity = alpha; snap.w = rend.width; snap.h = rend.height; snap.px = px; snap.py = py;
           snap.keepAspect = rend.keepAspect; snap.flipX = rend.flipX; snap.flipY = rend.flipY; snap.texW = texW; snap.texH = texH;
           snap.compX = comp.x; snap.compY = comp.y; snap.paint = paint; snap.colliderSig = colliderSig; snap.blend = blend;
         } else {
           this.lastRender.set(id, {
             canvasId, kind: displaySlot.kind, spriteRef: rend.sprite,
             x: wt.x, y: wt.y, rz: wt.rz, sx: wt.sx, sy: wt.sy,
-            color: rend.color, opacity: rend.opacity, w: rend.width, h: rend.height, px, py, keepAspect: rend.keepAspect,
+            color: rend.color, opacity: alpha, w: rend.width, h: rend.height, px, py, keepAspect: rend.keepAspect,
             flipX: rend.flipX, flipY: rend.flipY,
             texW, texH, compX: comp.x, compY: comp.y, paint, colliderSig, blend,
           });
@@ -1137,9 +1162,11 @@ export class Scene2DRenderer {
         const paint = this.paintOrderOf.get(id) ?? 0;
         const fx = rend.flipX ? -1 : 1, fy = rend.flipY ? -1 : 1;
         const blend = pixiBlendMode2D(rend.blendMode);
+        const alpha = rend.opacity * (this.groupAlphaOf.get(id) ?? 1); // #211 — see the sprite path
+
         // Apply the placement/appearance every frame (cheap property writes, always correct).
         mesh.zIndex = paint;
-        mesh.alpha = rend.opacity;
+        mesh.alpha = alpha;
         mesh.tint = rend.color; // flows into the shader's vColor (localUniformBit)
         mesh.blendMode = blend;
         mesh.position.set(wt.x, wt.y);
@@ -1165,12 +1192,12 @@ export class Scene2DRenderer {
           if (snap && snap.canvasId !== canvasId) this.dirtyCanvases.add(snap.canvasId); // left a canvas → redraw it too
           if (snap) {
             snap.canvasId = canvasId; snap.x = wt.x; snap.y = wt.y; snap.rz = wt.rz; snap.sx = wt.sx; snap.sy = wt.sy;
-            snap.color = rend.color; snap.opacity = rend.opacity; snap.blend = blend; snap.paint = paint;
+            snap.color = rend.color; snap.opacity = alpha; snap.blend = blend; snap.paint = paint;
             snap.flipX = rend.flipX; snap.flipY = rend.flipY; snap.compX = comp.x; snap.compY = comp.y;
           } else {
             this.lastMaterialRender.set(id, {
               canvasId, x: wt.x, y: wt.y, rz: wt.rz, sx: wt.sx, sy: wt.sy,
-              color: rend.color, opacity: rend.opacity, blend, paint,
+              color: rend.color, opacity: alpha, blend, paint,
               flipX: rend.flipX, flipY: rend.flipY, compX: comp.x, compY: comp.y,
             });
           }
@@ -1272,13 +1299,14 @@ export class Scene2DRenderer {
         const paint = this.paintOrderOf.get(id) ?? 0;
         const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1 };
         const deform = buf.version;
+        const alpha = ss.opacity * (this.groupAlphaOf.get(id) ?? 1); // #211 — see the sprite path
 
         // Change detection: skip when neither the placement nor the deform moved.
         const snap = this.lastMeshRender.get(id);
         const changed = forceAll || !snap ||
           snap.canvasId !== canvasId ||
           snap.x !== wt.x || snap.y !== wt.y || snap.rz !== wt.rz || snap.sx !== wt.sx || snap.sy !== wt.sy ||
-          snap.color !== ss.color || snap.opacity !== ss.opacity ||
+          snap.color !== ss.color || snap.opacity !== alpha ||
           snap.flipX !== ss.flipX || snap.flipY !== ss.flipY || snap.paint !== paint ||
           snap.deform !== deform || snap.compX !== comp.x || snap.compY !== comp.y;
         if (!changed) return;
@@ -1305,7 +1333,7 @@ export class Scene2DRenderer {
         // (editor visibility toggle) simply doesn't draw.
         for (let pi = 0; pi < meshes.length; pi++) { meshes[pi].tint = ss.color; meshes[pi].visible = buf.parts[pi]?.visible !== false; }
         container.zIndex = paint;
-        container.alpha = ss.opacity;
+        container.alpha = alpha;
         container.position.set(wt.x, wt.y);
         container.rotation = wt.rz;
         // flipX/flipY mirror about the rig origin — a render-only sign flip on scale.
@@ -1314,12 +1342,12 @@ export class Scene2DRenderer {
 
         if (snap) {
           snap.canvasId = canvasId; snap.x = wt.x; snap.y = wt.y; snap.rz = wt.rz; snap.sx = wt.sx; snap.sy = wt.sy;
-          snap.color = ss.color; snap.opacity = ss.opacity; snap.flipX = ss.flipX; snap.flipY = ss.flipY;
+          snap.color = ss.color; snap.opacity = alpha; snap.flipX = ss.flipX; snap.flipY = ss.flipY;
           snap.paint = paint; snap.deform = deform; snap.compX = comp.x; snap.compY = comp.y;
         } else {
           this.lastMeshRender.set(id, {
             canvasId, x: wt.x, y: wt.y, rz: wt.rz, sx: wt.sx, sy: wt.sy,
-            color: ss.color, opacity: ss.opacity, flipX: ss.flipX, flipY: ss.flipY,
+            color: ss.color, opacity: alpha, flipX: ss.flipX, flipY: ss.flipY,
             paint, deform, compX: comp.x, compY: comp.y,
           });
         }
@@ -1465,12 +1493,13 @@ export class Scene2DRenderer {
         const paint = this.paintOrderOf.get(id) ?? 0;
         const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1 };
 
+        const groupAlpha = this.groupAlphaOf.get(id) ?? 1; // #211 — t.opacity is already in the shader
         const snap = this.lastTextRender.get(id);
         const changed = forceAll || !snap ||
           snap.canvasId !== canvasId ||
           snap.x !== wt.x || snap.y !== wt.y || snap.rz !== wt.rz || snap.sx !== wt.sx || snap.sy !== wt.sy ||
           snap.anchorX !== t.anchorX || snap.anchorY !== t.anchorY || snap.paint !== paint ||
-          snap.compX !== comp.x || snap.compY !== comp.y ||
+          snap.compX !== comp.x || snap.compY !== comp.y || snap.groupAlpha !== groupAlpha ||
           snap.layoutHash !== layoutHash || snap.styleHash !== styleHash;
         if (!changed) return;
 
@@ -1487,16 +1516,17 @@ export class Scene2DRenderer {
         container.rotation = wt.rz;
         container.scale.set(wt.sx * comp.x, wt.sy * comp.y);
         container.zIndex = paint;
+        container.alpha = groupAlpha;
 
         if (snap) {
           snap.canvasId = canvasId; snap.x = wt.x; snap.y = wt.y; snap.rz = wt.rz; snap.sx = wt.sx; snap.sy = wt.sy;
           snap.anchorX = t.anchorX; snap.anchorY = t.anchorY; snap.paint = paint; snap.compX = comp.x; snap.compY = comp.y;
-          snap.layoutHash = layoutHash; snap.styleHash = styleHash;
+          snap.layoutHash = layoutHash; snap.styleHash = styleHash; snap.groupAlpha = groupAlpha;
         } else {
           this.lastTextRender.set(id, {
             canvasId, x: wt.x, y: wt.y, rz: wt.rz, sx: wt.sx, sy: wt.sy,
             anchorX: t.anchorX, anchorY: t.anchorY, paint, compX: comp.x, compY: comp.y,
-            layoutHash, styleHash,
+            layoutHash, styleHash, groupAlpha,
           });
         }
        } catch (e) {

@@ -5,10 +5,12 @@
  *
  *  1. **An unpinned generator.** The build ran a bare `npx --yes @capacitor/assets` under a
  *     comment claiming it was "verified against 3.0.5" — but `npx --yes` installs LATEST, so
- *     the comment documented a version the build did not use. A newer release began emitting
- *     extra density buckets (`drawable-night-*`, `*-ldpi`, `mipmap-ldpi`), which appeared as
- *     mystery untracked directories in games that had done nothing but build. The generated
- *     icons are committed release artifacts, so the tool making them is pinned here.
+ *     the comment documented a version the build did not use. The generated icons are
+ *     committed release artifacts, so the tool making them is pinned here.
+ *     ⚠️ That fix also blamed the extra density buckets (`drawable-*-night-*`, `*-ldpi`,
+ *     `mipmap-ldpi`) on the floating version. Measured 2026-08-19: the PINNED 3.0.5 emits
+ *     them too — 21 paths on forest-camp that no project commits. Pinning stopped them
+ *     changing, not appearing (#236).
  *
  *  2. **Unconditional regeneration.** The step ran on every native build, rewriting every
  *     tracked mipmap/splash PNG each time. Any game that had been built therefore had a
@@ -27,12 +29,11 @@ import path from 'path';
 export type IconPlatform = 'ios' | 'android';
 
 /** PINNED — see (1) above. Bumping this invalidates every stamp, so the next build of each
- *  project regenerates its icons exactly once. */
-export const ICON_TOOL = '@capacitor/assets@3.0.5';
-
-/** Passed to the generator verbatim. Part of the stamp: changing a colour must regenerate. */
-export const ICON_COLORS = '--iconBackgroundColor "#ffffff" --iconBackgroundColorDark "#111111" '
-  + '--splashBackgroundColor "#ffffff" --splashBackgroundColorDark "#111111"';
+ *  project regenerates its icons exactly once. Defined in `scripts/iconAssets.mjs` because the
+ *  generator wrapper (`scripts/generate-icons.mjs`) is plain Node and cannot import this file;
+ *  re-exported here so every existing consumer is unchanged. */
+export { ICON_TOOL, ICON_COLORS } from '../scripts/iconAssets.mjs';
+import { ICON_TOOL, ICON_COLORS } from '../scripts/iconAssets.mjs';
 
 /** Stamp file, under the project's gitignored `.cache/`. Never committed. */
 export function iconStampPath(projectRoot: string, plat: IconPlatform): string {

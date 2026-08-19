@@ -73,6 +73,7 @@ function makeMockCtx() {
   const slots = new Map<number, Container>();
   const dirty = new Set<number>();
   const markDirtyCalls: number[] = [];
+  const groupAlpha = new Map<number, number>();
   const ctx: ParticleSync2DCtx = {
     canvasIdOf: (id: number) => (canvasOf.has(id) ? canvasOf.get(id)! : null),
     slotContainer: (cid: number) => {
@@ -82,8 +83,9 @@ function makeMockCtx() {
     },
     markDirty: (cid: number) => { dirty.add(cid); markDirtyCalls.push(cid); },
     compensate: () => ({ x: 1, y: 1 }),
+    groupAlphaOf: (id: number) => groupAlpha.get(id) ?? 1,
   };
-  return { ctx, canvasOf, slots, dirty, markDirtyCalls };
+  return { ctx, canvasOf, slots, dirty, markDirtyCalls, groupAlpha };
 }
 
 describe('syncParticles2D', () => {
@@ -279,3 +281,37 @@ describe('syncParticles2D', () => {
     expect(state.recs.size).toBe(0);
   });
 });
+  // #211 — an emitter's wrapper goes straight onto the Canvas2D slot container like every other
+  // 2D display object, so the flat Pixi tree gives it no inherited alpha either. Found in the
+  // close-out sweep: GroupAlpha shipped fading sprites/text and leaving particles at full
+  // brightness, which is the half-wired version of a trait that claims the whole subtree.
+  it('applies the GroupAlpha ancestry product to the emitter wrapper (#211)', () => {
+    const world = createWorld();
+    const { backend, calls } = makeMockBackend();
+    const { ctx, canvasOf, groupAlpha } = makeMockCtx();
+    const state = createParticleSync2DState(backend);
+    const e = world.spawn(Transform, ParticleEmitter({ effect: EFFECT }));
+    canvasOf.set(e.id(), 1);
+    groupAlpha.set(e.id(), 0.25);
+
+    syncParticles2D(world, ctx, state, 0.016);
+    const wrapper = backend.getContainer({ id: calls.create[0].id });
+    expect(wrapper.alpha).toBe(0.25);
+
+    // And it FOLLOWS the group rather than sticking at the value it first saw.
+    groupAlpha.set(e.id(), 0.5);
+    syncParticles2D(world, ctx, state, 0.016);
+    expect(wrapper.alpha).toBe(0.5);
+  });
+
+  it('leaves an emitter with no GroupAlpha ancestor fully opaque', () => {
+    const world = createWorld();
+    const { backend, calls } = makeMockBackend();
+    const { ctx, canvasOf } = makeMockCtx();
+    const state = createParticleSync2DState(backend);
+    const e = world.spawn(Transform, ParticleEmitter({ effect: EFFECT }));
+    canvasOf.set(e.id(), 1);
+    syncParticles2D(world, ctx, state, 0.016);
+    expect(backend.getContainer({ id: calls.create[0].id }).alpha).toBe(1);
+  });
+

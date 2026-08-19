@@ -164,6 +164,7 @@ describe('particle 2D/3D partition (exactly-one-path)', () => {
       slotContainer: (cid: number) => slotFor(cid),
       markDirty: (cid: number) => { dirty.add(cid); },
       compensate: (_cid: number) => ({ x: 1, y: 1 }),
+      groupAlphaOf: () => 1,
     };
     const state2d = sync2d.createParticleSync2DState(backend2d);
     sync2d.syncParticles2D(world, ctx, state2d, 0.016);

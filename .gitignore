@@ -157,7 +157,10 @@ games/*/runtime/assets/__e2e_*__/
 
 # App-icon staging dir — the build copies the source icon here for
 # @capacitor/assets; generated icons land in the native projects (committed).
+# demos/ needs the same rule: it was written for games/ only, so three demos
+# committed a byte-identical copy of the repo's build/icon.png (#236).
 games/*/assets/
+demos/*/assets/
 
 # Electron main/preload bundle output
 engine/electron/dist/

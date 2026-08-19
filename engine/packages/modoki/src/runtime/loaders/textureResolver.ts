@@ -106,13 +106,25 @@ async function runCapsProbe(
  *  (`capsProbeRenderer.ts`, dynamically imported so `runtime/loaders` never statically depends
  *  on `runtime/rendering` — see `docs/architecture-layers.md`'s cycle guard) purely to run
  *  `detectSupport`. Never rejects — a probe failure still resolves the gate (see `runCapsProbe`)
- *  so a dead GPU degrades to per-texture errors instead of hanging every future KTX2 load. */
+ *  so a dead GPU degrades to per-texture errors instead of hanging every future KTX2 load.
+ *  In a `build.modules.render3d: false` bundle there is no probe at all — see the gate below. */
 export async function ensureKtx2Caps(opts?: {
   delayMs?: number;
   probeFactory?: () => Promise<WebGPURenderer | THREE.WebGLRenderer>;
   timers?: { setTimeout: typeof setTimeout; clearTimeout: typeof clearTimeout };
 }): Promise<void> {
   if (areKtx2CapsReady()) return;
+  // No 3D renderer in this build → there is nothing for a probe to detect, and standing one up
+  // is what dragged 546 KB of `three/webgpu` into a 2D-only bundle (#214): the probe is the ONLY
+  // module reaching `scene3DSync` from a 2D boot, so this early return is what lets Rolldown DCE
+  // the `import('../rendering/capsProbeRenderer')` below — keep the import AFTER it (same shape
+  // as `materialPresets`'s fileShaderBuilder gate). Nothing is lost: three's KTX2Loader is a
+  // 3D-only consumer (PixiJS transcodes the 2D path itself), `selectVariant`'s '2d' branch
+  // returns before it ever reads `detectedCaps`, and every caller of this gate — scene3DSync,
+  // riggedModelCache, the editor — is itself 3D-only. Resolving (rather than hanging or
+  // rejecting) keeps the contract this function documents: it never rejects, and a caller that
+  // somehow reaches it in a 2D build proceeds instead of waiting forever.
+  if (!__MODOKI_MODULE_RENDER3D__) { markKtx2CapsReady('no-3d'); return; }
   const delayMs = opts?.delayMs ?? KTX2_PROBE_DELAY_MS;
   const timers = opts?.timers ?? {
     setTimeout: globalThis.setTimeout.bind(globalThis),

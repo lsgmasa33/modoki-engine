@@ -70,6 +70,23 @@ web builds too), but its headline win is fitting a game under the playable's 5 M
 
 ## Gotchas (the load-bearing, hard-won ones)
 
+- **Gating `App.tsx`'s entry is NOT enough — one other reachable import re-roots the whole SDK**
+  (#214). `games/space-invader` sets `render3d: false`, and the toggle genuinely reached the shell
+  (the built bundle folds the boot condition, `Scene3D` really is `null`) — yet it still shipped a
+  **546 KB `three.webgpu` chunk**, because `textureResolver`'s KTX2 caps probe kept an *ungated*
+  `import('../rendering/capsProbeRenderer')`, and that module pulls `scene3DSync` → `three/webgpu`.
+  A dynamic import is a graph edge whether or not anything ever calls it, so the SDK shipped while
+  being unreachable at runtime. Gating it took the bundle from **3025 kB → 2443 kB** of JS (gzip
+  931 → 767 kB). Two things follow:
+  - **The DCE gate has a SHAPE**: the `__MODOKI_MODULE_*__` check must return *before* the import,
+    in the same function (see `ensureKtx2Caps`, and `materialPresets`' `fileShaderBuilder` gate).
+    A flag consulted after the `import(...)` folds nothing.
+  - **`npm test` could not see this class, so a guard now does.**
+    `engine/packages/modoki/tests/runtime/render3dBoundary.test.ts` walks the import closure from
+    the 2D boot entries and fails if anything reaches `three/webgpu`/`three/tsl`; gated edges are
+    listed explicitly and each is re-checked to still carry its gate. Adding a new one is a
+    deliberate line in `GATED_EDGES`, not a silent 546 KB.
+
 - **Single chunk = `inlineDynamicImports`, NOT `codeSplitting`.** `codeSplitting` is not a real Rollup
   option — Rollup silently ignores it, the lazy renderer chunk stays split, and the inliner's stray-JS
   guard aborts every 3D-game playable. Only `inlineDynamicImports:true` folds dynamic imports into the entry.
