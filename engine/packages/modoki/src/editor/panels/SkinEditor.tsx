@@ -3,9 +3,10 @@
  *
  *  Architecture mirrors SpriteAnimEditor/ParticleEditor: the live rig def is the single
  *  source of truth in the editor store, so the GLOBAL undo stack applies edits even when
- *  this panel is unfocused; persistence is a debounced `/api/write-file`, and each edit
- *  re-seeds the shared rig2dCache (setRig2D) so any live SkinnedSprite2D referencing this
- *  asset re-skins next frame (spatial posing stays in the SceneView gizmo).
+ *  this panel is unfocused; the rig document is PARKED in the dirty-asset registry and written
+ *  by Cmd+S (Save All) — see useParkedAssetDoc.ts (#259) — and each edit re-seeds the shared
+ *  rig2dCache (setRig2D) so any live SkinnedSprite2D referencing this asset re-skins next frame
+ *  (spatial posing stays in the SceneView gizmo).
  *
  *  MVP scope: retarget to a selected/opened rig; show its sprite + bones + mesh stats;
  *  regenerate the mesh (Re-tessellate at a chosen grid density) and recompute weights
@@ -27,7 +28,9 @@ import SkinBoneList from './SkinBoneList';
 import { autoRig2D } from '../../runtime/skinning/rig2dBuild';
 import { spriteThumbStyle } from './SpritePicker';
 import { saveAssetDialog } from '../utils/saveDialog';
-import { useDebouncedSave } from './useDebouncedSave';
+import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
+import { pendingAssetDoc } from './pendingAssetDoc';
+import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { AssetRefField, assetDisplayName } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
 import { makeRigPrefabAsset } from '../scene/skinPrefab';
@@ -36,7 +39,6 @@ import { activePartOf, withActivePart, partsOf, partCount, addPart, removePart, 
 import { pushAction, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
 import { BufferedNumberInput, inputStyle } from './fields';
 
-const AUTOSAVE_MS = 400;
 
 /** Derive width/height/pivot in texture space from the current mesh's vertex bounds,
  *  so Re-tessellate can regenerate a grid over the same region without a texture fetch. */
@@ -216,6 +218,18 @@ export default function SkinEditor() {
     const existing = useEditorStore.getState().editingSkinDef;
     if (existing) { savedMarkRef.current?.(existing); return; } // bare re-mount — keep unsaved edits
     const { loadSkinDef } = useEditorStore.getState();
+    // An UNSAVED write parked for this rig is not on disk yet, so fetching the file would open the
+    // PRE-edit doc and re-seed the live cache with it (QA-CTX-0008). Since #259 the PANEL parks
+    // too, so without this, closing and reopening the panel silently discards the human's own
+    // unsaved bone/weight/part edits. Marked saved because it is parked, not written.
+    const parked = pendingAssetDoc(asset.path, 'rig2d') as Rig2DFile | null;
+    if (parked) {
+      if (!parked.id) parked.id = newGuid();
+      registerAsset(parked.id, asset.path, 'rig2d');
+      savedMarkRef.current?.(parked);
+      loadSkinDef(parked);
+      return;
+    }
     fetch(asset.path)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
       .then((json: Rig2DFile) => {
@@ -516,6 +530,7 @@ export default function SkinEditor() {
     const doc: Rig2DFile = { id: guid, sprite: '', bones: [{ name: 'root', parent: -1, x: 0, y: 0, rot: 0 }], mesh: { verts: [], uvs: [], tris: [] }, skinIndices: [], skinWeights: [] };
     const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(doc, null, 2) }) }).then((r) => r.ok).catch(() => false);
     if (!ok) return;
+    assetWrittenToDisk(path); // CREATE writes the file directly → it is authoritative over any park
     registerAsset(guid, path, 'rig2d');
     const name = (path.split('/').pop() || 'Rig').replace(/\.rig2d\.json$/i, '');
     useEditorStore.getState().openSkinEditor({ path, type: 'rig2d', name });
@@ -550,6 +565,11 @@ export default function SkinEditor() {
     const rigPath = sel.path.replace(/\.(png|jpe?g|webp|gif)$/i, '') + '.rig2d.json';
     const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: rigPath, content: JSON.stringify(rig, null, 2) }) }).then((r) => r.ok).catch(() => false);
     if (!ok) return;
+    // ⚠️ The one path where this REALLY matters: `rigPath` is DERIVED from the sprite, so
+    // auto-rigging the same sprite twice regenerates over a rig that may already have unsaved
+    // edits parked. The freshly generated file is authoritative — drop the park, loudly, or the
+    // next save flushes the old rig straight back over it.
+    assetWrittenToDisk(rigPath);
     registerAsset(rigGuid, rigPath, 'rig2d');
     const name = (rigPath.split('/').pop() || 'Rig').replace(/\.rig2d\.json$/i, '');
     useEditorStore.getState().openSkinEditor({ path: rigPath, type: 'rig2d', name });
@@ -573,18 +593,13 @@ export default function SkinEditor() {
       : 'Prefab created ✓ — drag it from Assets into a Canvas2D');
   }, []);
 
-  // ── Debounced auto-save (watches the store def → covers edits + undo/redo) ──
-  const writeDef = useCallback((d: Rig2DFile): Promise<boolean> => {
-    const path = asset?.path;
-    if (!path) return Promise.resolve(false);
-    setSaveMsg('Saving…');
-    return backendFetch('/api/write-file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, content: JSON.stringify(d, null, 2) }),
-    }).then((res) => { setSaveMsg(res.ok ? 'Saved ✓' : `Save failed (${res.status})`); return res.ok; })
-      .catch((e) => { console.error('[SkinEditor] auto-save failed', e); setSaveMsg('Save failed'); return false; });
-  }, [asset?.path]);
-  const { markSaved } = useDebouncedSave(def, writeDef, AUTOSAVE_MS);
+  // ── Park the edit; Cmd+S writes it (#259) ──
+  // Watches the store def, so it covers edits AND global undo/redo. The flush passes
+  // `replace:true` for a panel-origin write, which this panel specifically needs: the first
+  // structural part edit on a v1 rig runs `ensurePartsArray` (skinParts.ts), moving
+  // sprite/mesh/skinIndices/skinWeights into `parts[]` — a write that DROPS four top-level keys,
+  // which /api/asset-write refuses by default.
+  const { markSaved, dirty } = useParkedAssetDoc(def, asset?.path, 'rig2d');
   savedMarkRef.current = markSaved;
 
   const bones = coerceRigBones(def?.bones);
@@ -692,7 +707,8 @@ export default function SkinEditor() {
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, flexShrink: 0 }}>
         <button onClick={() => useEditorStore.getState().closeSkinEditor()} title="Close rig (back to the picker)" style={{ ...btn, padding: '1px 7px' }}>✕</button>
         <span style={{ fontWeight: 'bold', color: '#ddd', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{asset.name}</span>
-        <span style={{ fontSize: 10, color: saveMsg.includes('fail') ? '#e74c3c' : '#2ecc71' }}>{saveMsg || 'Auto-save'}</span>
+        {saveMsg && <span style={{ fontSize: 10, color: saveMsg.includes('fail') ? '#e74c3c' : '#8a8a96' }}>{saveMsg}</span>}
+        <span style={{ fontSize: 10, color: dirty ? '#f1c40f' : '#2ecc71' }}>{saveStatusLabel(dirty)}</span>
       </div>
 
       {/* Toolbar: one-click auto-rig + undo/redo. */}

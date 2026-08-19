@@ -868,7 +868,12 @@ export interface SaveResult {
    *
    *  Their dirty flags stay SET, so a later save retries them. */
   failed?: { path: string; guid: string; reason: string }[];
-  /** Pending particle/anim/timeline writes (Phase 3) flushed alongside this save, if any. */
+  /** Parked asset docs (particle/anim/timeline/spriteanim/rig2d) flushed by this save, if any.
+   *
+   *  Present on a FAILED result too, and that is the point: the asset flush no longer depends on
+   *  the scene write, so "the scene was refused but your 3 asset edits are on disk" is a real
+   *  outcome and the caller has to be able to say so (#259). Never report a bare failure over a
+   *  result that carries `assets.saved` — that is the C7 lie with the roles reversed. */
   assets?: FlushResult;
 }
 
@@ -932,9 +937,8 @@ export async function saveScene(opts: {
       if (knownPath !== _currentScenePath) setCurrentScenePath(knownPath);
       editorEmit('!save', { path: knownPath, entities: scene.entities.length }); // Editor Percept (V2)
       console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${knownPath}`);
-      const assets = await flushDirtyAssets(); // Phase 3: pending manual-mode particle/anim/timeline edits
       markSceneSaved();
-      return { saved: true, path: knownPath, reason: 'ok', ...(assets.saved.length || assets.failed.length ? { assets } : {}) };
+      return { saved: true, path: knownPath, reason: 'ok' };
     }
     console.error(`[Editor] Failed to save scene to ${knownPath}`);
     return { saved: false, path: knownPath, reason: 'write-failed' };
@@ -963,9 +967,8 @@ export async function saveScene(opts: {
     setCurrentScenePath(target); // persists, so the next Save All goes straight to it
     editorEmit('!save', { path: target, entities: scene.entities.length }); // Editor Percept (V2)
     console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${target}`);
-    const assets = await flushDirtyAssets(); // Phase 3: pending manual-mode particle/anim/timeline edits
     markSceneSaved();
-    return { saved: true, path: target, reason: 'ok', ...(assets.saved.length || assets.failed.length ? { assets } : {}) };
+    return { saved: true, path: target, reason: 'ok' };
   }
   console.error(`[Editor] Failed to save scene to ${target}`);
   return { saved: false, path: target, reason: 'write-failed' };
@@ -1108,11 +1111,17 @@ export function warnAuthoredWritesWhileStopped(): void {
   clearAuthoredWritesWhileStopped();
 }
 
-/** Save all editor-managed assets: the primary scene file (via `saveScene`), THEN
- *  every OTHER dirty scene in the loaded chain — a base edited in place (Phase 12,
- *  M3, scene-loading.md) — to ITS OWN file. Per-material edits are
- *  persisted separately in their own `.mat.json` files via the Asset Inspector, so
- *  there's nothing else to flush here.
+/** Save all editor-managed assets: every parked ASSET doc (the dirty-asset registry), the
+ *  primary scene file (via `saveScene`), THEN every OTHER dirty scene in the loaded chain — a
+ *  base edited in place (Phase 12, M3, scene-loading.md) — to ITS OWN file. Per-material edits
+ *  are persisted separately in their own `.mat.json` files via the Asset Inspector, so there's
+ *  nothing else to flush here.
+ *
+ *  ⚠️ **This is the only place the asset flush happens, and that is deliberate.** `saveScene` has
+ *  callers that are not "Save All" — `panels/builtinCreatableAssets.ts` (Create Scene) and
+ *  `undo/applyPrefabUndo.ts` (an Apply-to-Prefab undo/redo) — and while the flush lived inside it,
+ *  creating a scene file or pressing Cmd-Z committed every parked particle/anim/rig doc to disk as
+ *  a side effect. Keep it here.
  *
  *  A base is written ONLY after the primary's own save succeeds — `saveScene`'s
  *  run-mode refusal (no writing while playing/previewing) sits above this loop, so it
@@ -1122,8 +1131,18 @@ export function warnAuthoredWritesWhileStopped(): void {
  *  Hierarchy scene-group row (Phase 13) is the visibility half that makes a silent
  *  multi-file save legible instead of a surprise. */
 export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {}): Promise<SaveResult> {
+  // FIRST, and unconditionally (#259). Parked asset docs are authored documents an asset panel or
+  // an agent op owns; the scene's refusals below are all about the live WORLD holding state that
+  // must not reach an authored scene file, and none of that reasoning reaches a `.particle.json`.
+  // This used to live inside `saveScene`, AFTER the scene write had succeeded — so a save during
+  // scrub/preview, in a prefab-edit world, with no path, with the Save-As dialog cancelled, or
+  // with a failed scene write all silently dropped it. Once the panels park instead of autosaving,
+  // four of those five are "the human pressed Cmd+S and nothing saved their edit".
+  const assets = await flushDirtyAssets();
+  const withAssets = <T extends SaveResult>(r: T): T =>
+    (assets.saved.length || assets.failed.length ? { ...r, assets } : r);
   const primaryResult = await saveScene(opts);
-  if (!primaryResult.saved) return primaryResult;
+  if (!primaryResult.saved) return withAssets(primaryResult);
   // #124, warn-only: name any authored field a system rewrote while the editor was stopped —
   // those values were just written to disk. Reported AFTER the save succeeds so a refused save
   // (playing/previewing) doesn't warn about a file nothing wrote.
@@ -1163,9 +1182,9 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
     console.log(`[Editor] Saved scene: ${sceneFile.entities.length} entities → ${entry.path}`);
     extraSaved.push({ path: entry.path, guid: entry.guid });
   }
-  return {
+  return withAssets({
     ...primaryResult,
     ...(extraSaved.length ? { extraSaved } : {}),
     ...(failed.length ? { failed } : {}),
-  };
+  });
 }

@@ -30,7 +30,7 @@ export {
   useBufferedValue, BufferedTextInput, BufferedNumberInput, parseNumber, parseString,
   applyWheelStep, useWheelStep,
 } from './panels/fields';
-export { useDebouncedSave } from './panels/useDebouncedSave';
+export { useParkedAssetDoc, saveStatusLabel } from './panels/useParkedAssetDoc';
 // Device listing — shared by the AI panel's connect picker and the app shell's Build-menu target
 // picker (#170), which is why it leaves the package rather than staying panel-private.
 export {
@@ -69,6 +69,7 @@ export {
 export {
   markAssetDirty, hasDirtyAssets, getDirtyAssetPaths, peekDirtyAsset, clearDirtyAssets,
   discardDirtyAssets, assetWrittenToDisk, flushDirtyAssets, type FlushResult,
+  subscribeDirtyAssets, getDirtyAssetsVersion, isAssetDirty, type AssetWriteOrigin,
 } from './scene/dirtyAssets';
 export { importModel } from './scene/modelImport';
 export { useEditorStore } from './store/editorStore';
@@ -90,6 +91,8 @@ export { makePrefabInstantiateAction } from './undo/prefabInstantiateUndo';
 
 // C7: agent ops must refuse to DESTROY unsaved live work (load_scene/new_scene swap the world).
 export { hasUnsavedChanges, unsavedChangeCauses, markSceneSaved, type SaveResult } from './scene/serialize';
+// The ONE Save All command + its message, shared by the Cmd+S keymap and the native File menu.
+export { runSaveAll, toastForSave, type SaveOutcome } from './scene/saveCommand';
 
 // C7: the agent save-all path must honour prefab-edit mode like the human paths do —
 // otherwise an explicit `path` writes the SYNTHETIC prefab-edit world over a real scene.

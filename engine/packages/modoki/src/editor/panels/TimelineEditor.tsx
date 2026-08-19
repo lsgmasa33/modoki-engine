@@ -5,13 +5,12 @@
  *
  *  Architecture mirrors AnimationEditor: the live timeline doc is the single source of truth in the
  *  editor store, so the GLOBAL undo stack applies edits even when this panel is unfocused. Edits
- *  coalesce per group; persistence is a debounced validated /api/asset-write. */
+ *  coalesce per group; the timeline document is PARKED in the dirty-asset registry and written
+ *  by Cmd+S (Save All) — see useParkedAssetDoc.ts (#259). */
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { backendFetch } from '../backend/editorBackend';
 import { useEditorStore } from '../store/editorStore';
 import { pendingAssetDoc } from './pendingAssetDoc';
-import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { getCurrentWorld, onWorldSwap } from '../../runtime/core/ecs/world';
@@ -31,7 +30,7 @@ import {
   defaultTimeline, normalizeTimeline,
   type TimelineDef, type TrackDef, type TrackKind,
 } from '../../runtime/timeline/types';
-import { useDebouncedSave } from './useDebouncedSave';
+import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
 import { pushAction, peekUndo, isExecutingUndoRedo, type UndoAction } from '../undo/undoManager';
 import { shouldCoalesce } from '../animation/undoCoalesce';
 import { DEFAULT_VIEWPORT, type Viewport } from './animation/timelineMath';
@@ -41,7 +40,6 @@ import ItemInspector from './timeline/ItemInspector';
 import { withAddedItem, withMovedItem, withUpdatedItem, withDeletedItem, itemCount, type TrackItemPatch } from './timeline/itemEdit';
 
 const COALESCE_MS = 500;
-const AUTOSAVE_MS = 400;
 const TRACK_LIST_W = 190;
 const INSPECTOR_W = 232; // default; user-resizable (persisted) — see inspectorW state
 const INSPECTOR_MIN_W = 180;
@@ -81,7 +79,6 @@ export default function TimelineEditor() {
   const [viewport, setViewport] = useState<Viewport>(DEFAULT_VIEWPORT);
   const [selectedTrack, setSelectedTrack] = useState<number | null>(null);
   const [selectedItem, setSelectedItem] = useState<number | null>(null);
-  const [saveMsg, setSaveMsg] = useState('');
 
   // Resizable right-side inspector dock (persisted across reloads). The divider sits to the LEFT of
   // the dock, so dragging it left WIDENS the inspector (startW grows as clientX decreases).
@@ -456,24 +453,8 @@ export default function TimelineEditor() {
     if (asset) st.setDirectorRoot(resolveDirectorRootForTimeline(asset.path));
   }), []);
 
-  // ── Debounced validated save ──
-  const writeDoc = useCallback((d: TimelineDef): Promise<boolean> => {
-    const path = asset?.path;
-    if (!path) return Promise.resolve(false);
-    setSaveMsg('Saving…');
-    return backendFetch('/api/asset-write', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, type: 'timeline', data: d }),
-    }).then((res) => {
-      setSaveMsg(res.ok ? 'Saved ✓' : `Save failed (${res.status})`);
-      // The file is now authoritative — drop any OLDER parked write for it, or the next save_all
-      // flushes that stale doc back over what was just written (measured; see assetWrittenToDisk).
-      if (res.ok) assetWrittenToDisk(path);
-      return res.ok;
-    })
-      .catch((e) => { setSaveMsg('Save failed'); console.warn('[TimelineEditor] save failed', e); return false; });
-  }, [asset?.path]);
-  const { markSaved } = useDebouncedSave(doc, writeDoc, AUTOSAVE_MS);
+  // ── Park the edit; Cmd+S writes it (#259) ──
+  const { markSaved, dirty } = useParkedAssetDoc(doc, asset?.path, 'timeline');
   savedMarkRef.current = markSaved;
 
   if (!asset) return <div style={{ padding: 12, color: '#8a8a96', fontSize: 12 }}>No timeline open. Double-click a <code>.timeline.json</code> in Assets, or open a Director&apos;s timeline.</div>;
@@ -516,7 +497,7 @@ export default function TimelineEditor() {
               ? `● Preview ${runMode === 'preview' && advancing ? 'playing' : 'paused'}`
               : runMode === 'playing'
                 ? (advancing ? '▶ Playing (Game)' : '⏸ Play paused')
-                : 'Editing'}{saveMsg ? ` · ${saveMsg}` : ''}
+                : 'Editing'} · {saveStatusLabel(dirty)}
         </span>
       </div>
 

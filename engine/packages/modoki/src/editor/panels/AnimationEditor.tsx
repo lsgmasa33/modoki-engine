@@ -5,7 +5,8 @@
  *
  *  Architecture mirrors ParticleEditor: the live clip is the single source of truth in
  *  the editor store, so the GLOBAL undo stack applies edits even when this panel is
- *  unfocused. Edits coalesce per group; persistence is a debounced /api/write-file. */
+ *  unfocused. Edits coalesce per group; the clip document is PARKED in the dirty-asset registry
+ *  and written by Cmd+S (Save All) — see useParkedAssetDoc.ts (#259). */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { backendFetch } from '../backend/editorBackend';
@@ -27,7 +28,7 @@ import {
   defaultAnimationClip, normalizeAnimationClip,
   type AnimationClipDef, type AnimationTrack, type TrackValueType,
 } from '../../runtime/animation/types';
-import { useDebouncedSave } from './useDebouncedSave';
+import { useParkedAssetDoc } from './useParkedAssetDoc';
 import { pushAction, peekUndo, isExecutingUndoRedo, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
 import {
   setRecordHook, relativeEntityPath, encodeValue, upsertKey, findTrack, moveKeysInTime,
@@ -56,7 +57,6 @@ import {
 } from '../scene/timelinePreview';
 
 const COALESCE_MS = 500;
-const AUTOSAVE_MS = 400;
 const TRACK_LIST_MIN_W = 140;
 const TRACK_LIST_MAX_W = 560;
 /** Minimum gap (in frames) between a copied block and its paste, for tiny/single
@@ -114,7 +114,6 @@ export default function AnimationEditor() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recording, rootId, selectedEntityId, structureVersion]);
 
-  const [saveMsg, setSaveMsg] = useState('');
   const [showPicker, setShowPicker] = useState(false);
   const [showBindPicker, setShowBindPicker] = useState(false);
   // True while THIS panel holds a scrub/preview envelope — drives the ⏹ Exit Preview button.
@@ -178,6 +177,11 @@ export default function AnimationEditor() {
   const clipboardRef = useRef<KeyClipboard | null>(null);
   // Reactive mirror of "clipboard has content" so the Paste button can enable.
   const [hasClipboard, setHasClipboard] = useState(false);
+  /** Transient one-line feedback in the toolbar ("Copied 3 keys", "Bound to …", a warning).
+   *  It was called `saveMsg` and shared the span with the autosave status; with the autosave
+   *  gone that name described nothing it holds, and the save status now has its OWN slot that
+   *  a transient message can never hide. */
+  const [statusMsg, setStatusMsg] = useState('');
 
   const lastGroup = useRef<string | undefined>(undefined);
   const lastTime = useRef(0);
@@ -278,8 +282,13 @@ export default function AnimationEditor() {
       .then((json) => {
         if (cancelled) return;
         const loaded = normalizeAnimationClip(json);
-        if (!loaded.id) { loaded.id = newGuid(); registerAsset(loaded.id, asset.path, 'animation'); savedMarkRef.current?.(normalizeAnimationClip(json)); }
-        else { registerAsset(loaded.id, asset.path, 'animation'); savedMarkRef.current?.(loaded); }
+        // The saved-baseline is the doc WITH the minted id, never an id-less twin: that trick
+        // existed to make the autosave notice the new id and write it, and with the autosave gone
+        // it would park a write merely for OPENING a legacy clip. The asset scanner already heals
+        // missing GUIDs (buildManifest heal=true). See ParticleEditor for the full note.
+        if (!loaded.id) loaded.id = newGuid();
+        registerAsset(loaded.id, asset.path, 'animation');
+        savedMarkRef.current?.(loaded);
         loadAnimationClip(loaded);
       })
       .catch((e) => { if (cancelled) return; console.warn('[AnimationEditor] load failed, using default', e); const fb = defaultAnimationClip(newGuid(), asset.name); savedMarkRef.current?.(fb); loadAnimationClip(fb); });
@@ -414,7 +423,7 @@ export default function AnimationEditor() {
         const who = byId.get(entityId)?.name ?? `#${entityId}`;
         const rootName = byId.get(root)?.name ?? `#${root}`;
         console.warn(`[AnimationEditor] "${who}" is not under the Animator root "${rootName}" — edit not recorded. Move it under the Animator entity, or give it its own Animator, to animate it.`);
-        setSaveMsg(`⚠ "${who}" isn't under "${rootName}" — not keyed`);
+        setStatusMsg(`⚠ "${who}" isn't under "${rootName}" — not keyed`);
         return;
       }
       const existing = findTrack(cur.tracks, path, traitName, field);
@@ -628,7 +637,7 @@ export default function AnimationEditor() {
     clipboardRef.current = cb;
     setHasClipboard(true);
     const n = [...byTrack.values()].reduce((s, kis) => s + kis.size, 0);
-    setSaveMsg(`Copied ${n} key${n > 1 ? 's' : ''}`);
+    setStatusMsg(`Copied ${n} key${n > 1 ? 's' : ''}`);
   }, [selectionByTrack]);
 
   const pasteKeys = useCallback(() => {
@@ -638,7 +647,7 @@ export default function AnimationEditor() {
     const plan = planPaste(cur, cb, { minGapFrames: PASTE_MIN_GAP_FRAMES, gapMarginFrames: PASTE_GAP_MARGIN_FRAMES });
     commit((c) => ({ ...c, duration: Math.max(c.duration, plan.duration), tracks: plan.tracks }), 'paste');
     setSel(new Set(plan.selection));
-    setSaveMsg(`Pasted ${cb.tracks.reduce((s, t) => s + t.keys.length, 0)} key(s) after original`);
+    setStatusMsg(`Pasted ${cb.tracks.reduce((s, t) => s + t.keys.length, 0)} key(s) after original`);
   }, [commit, setSel]);
 
   // ── Duplicate the selected keys in one step (Cmd/Ctrl+D + toolbar button) ──
@@ -654,7 +663,7 @@ export default function AnimationEditor() {
     const plan = planPaste(cur, cb, { minGapFrames: PASTE_MIN_GAP_FRAMES, gapMarginFrames: PASTE_GAP_MARGIN_FRAMES });
     commit((c) => ({ ...c, duration: Math.max(c.duration, plan.duration), tracks: plan.tracks }), 'duplicate');
     setSel(new Set(plan.selection));
-    setSaveMsg(`Duplicated ${cb.tracks.reduce((s, t) => s + t.keys.length, 0)} key(s)`);
+    setStatusMsg(`Duplicated ${cb.tracks.reduce((s, t) => s + t.keys.length, 0)} key(s)`);
   }, [commit, selectionByTrack, setSel]);
 
   // ── Keyboard nudge of the selected keys (arrows) ──
@@ -806,24 +815,10 @@ export default function AnimationEditor() {
       nudgeValueSelected, toggleBreakSelected, removeSelectedTracks, duplicateSelectedKeys,
       selectedTracks, selectedTrack, setViewport, hmrEpoch]);
 
-  // ── Debounced auto-save ──
-  const writeClip = useCallback((c: AnimationClipDef): Promise<boolean> => {
-    const path = asset?.path;
-    if (!path) return Promise.resolve(false);
-    setSaveMsg('Saving…');
-    return backendFetch('/api/write-file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, content: JSON.stringify(c, null, 2) }),
-    }).then((res) => {
-      setSaveMsg(res.ok ? 'Saved ✓' : `Save failed (${res.status})`);
-      // The file is now authoritative — drop any OLDER parked write for it, or the next save_all
-      // flushes that stale doc back over what was just written (measured; see assetWrittenToDisk).
-      if (res.ok) assetWrittenToDisk(path);
-      return res.ok;
-    })
-      .catch((e) => { console.error('[AnimationEditor] auto-save failed', e); setSaveMsg('Save failed'); return false; });
-  }, [asset?.path]);
-  const { markSaved } = useDebouncedSave(clip, writeClip, AUTOSAVE_MS);
+  // ── Park the edit; Cmd+S writes it (#259) ──
+  // Watching the store's `clip` covers every mutation path — field edits, key drags, AND global
+  // undo/redo, which all rewrite editingAnimationClip.
+  const { markSaved, dirty } = useParkedAssetDoc(clip, asset?.path, 'animation');
   savedMarkRef.current = markSaved;
 
   const existingKeys = useMemo(
@@ -876,6 +871,9 @@ export default function AnimationEditor() {
     const guid = newGuid();
     const name = (path.split('/').pop() || 'Clip').replace(/\.anim\.json$/i, '');
     const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(defaultAnimationClip(guid, name), null, 2) }) }).then((r) => r.ok).catch(() => false);
+    // CREATE writes immediately (the file must exist for registerAsset/the manifest), so the file
+    // is authoritative — drop any parked write for that path.
+    if (ok) assetWrittenToDisk(path);
     if (!ok) return;
     registerAsset(guid, path, 'animation');
     const sel = useEditorStore.getState().selectedEntityId;
@@ -897,8 +895,8 @@ export default function AnimationEditor() {
     if (!path) return;
     const guid = cur?.id || getGuidForPath(path) || '';
     const name = (cur?.name || store.editingAnimationAsset?.name || 'clip').replace(/\.anim\.json$/i, '');
-    if (!bindClipToEntity(entityId, guid, name)) { setSaveMsg('⚠ Bind failed — see console'); return; }
-    setSaveMsg(`Bound to “${getAnimEntityIndex().byId.get(entityId)?.name || `#${entityId}`}”`);
+    if (!bindClipToEntity(entityId, guid, name)) { setStatusMsg('⚠ Bind failed — see console'); return; }
+    setStatusMsg(`Bound to “${getAnimEntityIndex().byId.get(entityId)?.name || `#${entityId}`}”`);
   }, []);
 
   if (!asset) {
@@ -930,7 +928,7 @@ export default function AnimationEditor() {
           onDuplicateKeys={duplicateSelectedKeys} canDuplicateKeys={selectedKeys.size > 0}
           onUndo={() => gUndo()} onRedo={() => gRedo()}
           inPreview={inPreview} onExitPreview={exitPreview}
-          saveMsg={saveMsg}
+          dirty={dirty} statusMsg={statusMsg}
         />
       )}
       {rootId == null && (

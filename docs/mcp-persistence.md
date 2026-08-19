@@ -26,7 +26,7 @@ is worse than either honouring or removing it; treat it as removed.
 | `particle_set`, `anim_set_clip`, `anim_add_key`, `timeline_set`, `timeline_add_clip` | apply live, park the disk write in the **dirty-asset registry** (`get_editor_state.dirtyAssetPaths`); each is UNDOABLE, with `_isFileDirect` so an asset-only edit still does not dirty the scene (S2.27) |
 | `create_entity`, `duplicate_entity`, `delete_entities`, `reparent_entity`, `prefab` | live-only — unchanged; this split predates the mode knob |
 | `write_asset`, `create_asset`, `import_file`, `reimport_asset` | always write — explicit "write this file" tools |
-| `save_all` | serializes the live scene **and** flushes every pending dirty asset |
+| `save_all` | flushes every parked asset doc (ALWAYS, first) **and** serializes the live scene. The two halves are independent: a scene save refused while scrubbing/previewing still writes the asset docs, and says so |
 | `discard_asset_edits` | the counterpart to `save_all` for the registry: drops parked asset writes **without** writing them. Names `paths`, or `all:true`; a bare call is refused (dropping everything is unrecoverable — the `set_selection` lesson). Drops the WRITE, not the edit: the editor cache keeps the applied def until the asset reloads |
 
 **`save_all` never silently drops a pending asset:** an entry that fails to write stays in the
@@ -99,16 +99,63 @@ different entities would collapse into an entry whose undo reverts only the firs
   separate events — N `!edit` events for one Cmd-Z step would claim a granularity the undo
   stack doesn't have.
 
-## 5. The dirty-asset registry (particle/anim/timeline in `manual` mode)
+## 5. The dirty-asset registry — the ONE path from an asset edit to disk
 
 `particle_set`/`anim_set_clip`/`anim_add_key`/`timeline_set`/`timeline_add_clip` apply live
-immediately either way, then either persist (auto) or park the pending doc in
-`engine/packages/modoki/src/editor/scene/dirtyAssets.ts`'s `path -> doc` map (manual). `saveAll`
-flushes it alongside the scene write (each entry via the same validated `/api/asset-write`
-route); a failed flush leaves its entry pending rather than silently dropping it.
-`hasUnsavedChanges()` and `get_editor_state`'s `dirtyAssetPaths` both account for it — a dirty
-asset an agent can't see is the same silent-loss trap the original `unsavedChanges` field
-exists to close for live scene edits.
+immediately, then park the pending doc in
+`engine/packages/modoki/src/editor/scene/dirtyAssets.ts`'s `path -> doc` map. `saveAll`
+flushes it (each entry via the same validated `/api/asset-write` route); a failed flush leaves its
+entry pending rather than silently dropping it. `hasUnsavedChanges()` and `get_editor_state`'s
+`dirtyAssetPaths` both account for it — a dirty asset an agent can't see is the same silent-loss
+trap the original `unsavedChanges` field exists to close for live scene edits.
+
+**The five asset PANELS park here too, as of #259 — there is no longer a second contract.** The
+Particle, Animation, Timeline, Skin and SpriteAnim editors used to POST their document to disk on a
+400 ms trailing debounce. That was a second way for one file to be written, and each half was right
+locally: the agent op answered `saved:false` while the panel had already put bytes on disk. What it
+cost, all three measured rather than argued:
+
+- **The two collided.** `particle_set` parked v1, a panel write put v2 on disk, `dirtyAssetPaths`
+  still listed the path, and `save_all` rewrote the file back to v1 — the human's panel edits gone.
+- **It wrote committed files behind your back** (CLAUDE.md #18), from inside the editor, so a QA
+  case whose cleanup relied on "nothing was saved" left a modified asset for someone else's
+  `git add -A`.
+- **There was no undo for it**: a debounced write lands with no undo entry, so a mis-drag on a
+  curve was permanent the moment the timer fired.
+
+Now every panel edit is a `markAssetDirty(path, type, doc, 'panel')` and **Cmd+S is the write**. Two
+consequences worth knowing:
+
+- **Parking is synchronous** (`editor/panels/useParkedAssetDoc.ts`). The debounce was not merely
+  unnecessary once the write became a `Map.set` — it was actively harmful: the old hook cancelled
+  its pending timer on unmount, so closing a panel tab within 400 ms of an edit dropped it, and a
+  re-open then marked the never-written document as the SAVED baseline.
+- **Origin is recorded per entry** (`'panel' | 'agent'`), because the flush is not identical for the
+  two. A panel is a full-document editor where deleting a field is a legitimate action, so its
+  writes carry `replace:true` past `/api/asset-write`'s drop-key guard — concretely, the first
+  "+ Add Part" on a v1 rig runs `ensurePartsArray` and drops four top-level keys. An agent's
+  read-modify-write flow carries every key back, so its writes keep the guard. Both are marked as
+  the editor's own write (`selfWrite`), because everything in the registry was already applied to
+  the live cache: without that, the flush's own watcher event comes back ~150 ms later and
+  `dropParkedWriteFor` discards whatever the human parked in the meantime.
+
+**A save ALWAYS flushes the registry, whatever the scene does.** The flush used to live inside
+`saveScene`, after the scene write had succeeded, so five refusals silently swallowed it: run-mode
+not `stopped`, a prefab-edit world, no scene path, a cancelled Save-As, and a failed scene write.
+While the panels autosaved that was invisible. With them parking, four of those five are "I pressed
+Cmd+S and my edit was not saved" — so the flush moved up into `saveAll`, first and unconditional,
+and the toast reports both halves (`editor/scene/saveCommand.ts`). The scene's own guards are
+unchanged: they exist to keep a preview pose or a physics-settled position out of an authored
+scene, and none of that reasoning reaches a `.particle.json` the panel owns. Moving it up also
+stopped two non-Save-All callers of `saveScene` — Create Scene, and an Apply-to-Prefab **undo** —
+from committing every parked asset doc as a side effect.
+
+**A parked write is keyed by PATH, so deleting or renaming the asset has to repair it.** The
+registry outlives both the panel binding and the panel itself, so a delete would otherwise leave a
+write that the next save turns back into the file you deleted, and a rename would leave the old path
+parked and fork the asset (#186's measured failure, one layer down). `applyMovesToParkedAssets`
+(`editor/panels/assetEditorBindings.ts`) moves the parked doc with a renamed asset — the edit is
+still valid, only its location changed — and drops it for a deleted one, loudly.
 
 **Opening the asset's PANEL must not resurrect the file (QA-CTX-0008).** A parked write means the
 doc on disk is the PRE-edit one, and every asset editor opened by fetching that file — which
@@ -119,22 +166,28 @@ so the panel displayed a document that disagreed with what `save_all` would have
 edit was gone from everything that reads the cache. The Timeline / Particle / Animation panels now
 ask `pendingAssetDoc(path, type)` (`editor/panels/pendingAssetDoc.ts`) first and open the parked doc
 when there is one, falling back to the file otherwise. It is marked as the panel's SAVED baseline
-deliberately: the write is parked, not written, so the panel's debounced autosave must not commit on
-open what the human never chose to save — verified live, the file stayed at `tracks: []` while the
-panel and the cache both showed the edit.
+deliberately: the write is parked, not written, so opening must not commit what the human never
+chose to save — verified live, the file stayed at `tracks: []` while the panel and the cache both
+showed the edit.
 
-**And the panel's own save must DROP the parked write, or it loses to it.** The registry entry
-outlives the panel's autosave, so the older parked doc was still queued after the panel had already
-written a newer one — measured the same session: `particle_set` parked v1, a panel-shaped
-`/api/write-file` put v2 on disk, `dirtyAssetPaths` still listed the path, and `save_all` rewrote
-the file back to **v1** with no warning. `dropParkedWriteFor` (agentBridge) already states the rule
-for an EXTERNAL change, but it rides the file watcher and cannot see these: `/api/write-file`
-fingerprints its own bytes via `markEditorWrite` precisely so the editor does not react to itself
-(the Particle and Animation panels), and the Timeline panel's un-suppressed `/api/asset-write` is
-still only debounced — a `save_all` in that gap loses the same way. So the writer says so directly:
-each panel calls `assetWrittenToDisk(path)` on a successful save, which drops the stale park and
-logs what it dropped. Verified live end-to-end — a duration edited in the Particle Editor now
-survives `save_all`, and `dirtyAssetPaths` clears at the panel write.
+Since #259 this covers all five panels (`SkinEditor` and `SpriteAnimEditor` were added), and it
+stopped being an agent-only concern: the panel parks its OWN edits now, so without this, closing and
+reopening a panel would silently discard the human's unsaved work.
+
+**A file the editor writes DIRECTLY must drop any parked write for it.** `dropParkedWriteFor`
+(agentBridge) states this rule for an EXTERNAL change, but it rides the file watcher and cannot see
+the editor's own writes: `/api/write-file` fingerprints its bytes via `markEditorWrite` precisely so
+the editor does not react to itself. So the writer says so directly, via `assetWrittenToDisk(path)`.
+
+Since #259 the panels' EDITING path no longer writes directly, so what is left is their one-shot
+CREATE/REGENERATE writes — a new file has to exist on disk for `registerAsset` and the manifest to
+see it. Of those, `SkinEditor`'s auto-rig is the one that matters: it derives `<sprite>.rig2d.json`,
+so re-rigging the same sprite regenerates over a rig that may already have unsaved edits parked.
+
+The collision this rule was written for was measured on the old panel autosave: `particle_set`
+parked v1, a panel-shaped `/api/write-file` put v2 on disk, `dirtyAssetPaths` still listed the path,
+and `save_all` rewrote the file back to **v1** with no warning. That whole class is gone now that
+the panel and the agent park in the same place — which is what #259 was for.
 
 The mode itself lives in the BACKEND process (Node), not the renderer — it fronts both the
 file-direct routes (Node-side) and the live-world routes (relayed to the renderer). The

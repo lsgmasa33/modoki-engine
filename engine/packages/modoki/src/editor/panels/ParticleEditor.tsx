@@ -1,9 +1,11 @@
 /** Particle Editor panel — a dedicated authoring surface for `.particle.json` effects.
  *  Left: a live WebGPU preview viewport (orbit camera) driving the real particle backend.
  *  Right: property sections (emission/shape/start/over-life/render) with live apply.
- *  Top: play / pause / restart / scrub timeline + Save. Edits apply to the running
- *  preview immediately (backend.setDef) and seed the shared cache so any ParticleEmitter
- *  entity referencing this asset in GameView updates too. */
+ *  Top: play / pause / restart / scrub timeline. Edits apply to the running preview immediately
+ *  (backend.setDef) and seed the shared cache so any ParticleEmitter entity referencing this asset
+ *  in GameView updates too; the DOCUMENT is parked in the dirty-asset registry and written by
+ *  Cmd+S (Save All), like every other authored surface. It used to autosave on a 400ms debounce —
+ *  see useParkedAssetDoc.ts and docs/mcp-persistence.md for why that went. */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { backendFetch } from '../backend/editorBackend';
@@ -17,7 +19,7 @@ import { defaultParticleEffect, type ParticleEffectDef, type ParticleHandle, typ
 import { normalizeParticleDef } from '../../runtime/loaders/particleCache';
 import { newGuid, registerAsset } from '../../runtime/loaders/assetManifest';
 import { saveAssetDialog } from '../utils/saveDialog';
-import { useDebouncedSave } from './useDebouncedSave';
+import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
 import { applyWheelStep, useWheelStep } from './fields';
 import { AssetRefField } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
@@ -31,10 +33,6 @@ import { displayElapsed } from './particle/previewMath';
 
 /** Consecutive edits to the same field within this window collapse into one undo step. */
 const COALESCE_MS = 500;
-/** Auto-save debounce: write `.particle.json` this long after the last edit. Particle
- *  edits (slider/curve/gradient drags) fire continuously, so unlike the material
- *  Inspector (discrete clicks, no debounce) we coalesce writes onto a trailing timer. */
-const AUTOSAVE_MS = 400;
 /** A particle undo entry; `_after` is the (coalescing-)mutable redo target. */
 type ParticleAction = UndoAction & { _after: ParticleEffectDef };
 
@@ -67,7 +65,6 @@ export default function ParticleEditor() {
   const [playing, setPlaying] = useState(true);
   const [elapsed, setElapsed] = useState(0);
   const [sceneReady, setSceneReady] = useState(false);
-  const [saveMsg, setSaveMsg] = useState('');
   const [showFloor, setShowFloor] = useState(false);
 
   // ── Viewport (renderer / scene / camera / orbit / rAF) ──
@@ -209,18 +206,17 @@ export default function ParticleEditor() {
       .then((json) => {
         if (cancelled) return;
         const loaded = normalizeParticleDef(json);
-        if (!loaded.id) {
-          // Legacy/new effect with no in-file guid. Assign + register one so scenes
-          // and sub-emitters can reference it by guid (survives move/rename). Seed the
-          // saved-baseline with an id-less twin so the autosave detects the new id as a
-          // change and persists it to disk.
-          loaded.id = newGuid();
-          registerAsset(loaded.id, asset.path, 'particle');
-          savedMarkRef.current?.(normalizeParticleDef(json));
-        } else {
-          registerAsset(loaded.id, asset.path, 'particle');
-          savedMarkRef.current?.(loaded);
-        }
+        // Legacy/new effect with no in-file guid: assign + register one so scenes and sub-emitters
+        // can reference it by guid (survives move/rename). The saved-baseline is the doc WITH the
+        // id — deliberately not an id-less twin. That trick existed to make the autosave notice the
+        // new id and write it, and with the autosave gone it would mean merely OPENING a legacy
+        // asset parks a write: the editor goes dirty because you looked at it, and
+        // `hasUnsavedChanges()` then blocks modoki_build and the file-direct routes. It is also
+        // redundant — `buildManifest(…, heal=true)` (vite-asset-scanner.ts) already mints AND
+        // persists a missing GUID at scan time, in dev and in the packaged Electron backend alike.
+        if (!loaded.id) loaded.id = newGuid();
+        registerAsset(loaded.id, asset.path, 'particle');
+        savedMarkRef.current?.(loaded);
         loadParticleDef(loaded);
       })
       .catch((e) => { if (cancelled) return; console.warn('[ParticleEditor] load failed, using default', e); const fallback = defaultParticleEffect(); savedMarkRef.current?.(fallback); loadParticleDef(fallback); });
@@ -309,6 +305,10 @@ export default function ParticleEditor() {
     const def = { ...defaultParticleEffect(), id: guid };
     const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(def, null, 2) }) }).then((r) => r.ok).catch(() => false);
     if (!ok) return;
+    // CREATE still writes immediately — the file has to exist for registerAsset + the manifest to
+    // see it — so the file is authoritative: drop any parked write for that path, or the next save
+    // flushes a stale doc over the one just created.
+    assetWrittenToDisk(path);
     registerAsset(guid, path, 'particle');
     const name = (path.split('/').pop() || 'Effect').replace(/\.particle\.json$/i, '');
     useEditorStore.getState().openParticleEditor({ path, type: 'particle', name });
@@ -321,29 +321,12 @@ export default function ParticleEditor() {
     return () => clearInterval(id);
   }, [playing]);
 
-  // ── Debounced auto-save to disk ──
-  // Like the material Inspector, edits persist without an explicit Save — but on a
-  // trailing timer so a slider/curve drag doesn't write the file every frame. Watching
-  // the store's `def` covers every mutation path (field edits AND global undo/redo,
-  // which both rewrite editingParticleDef). The live preview + shared cache were already
-  // updated synchronously by applyParticleDef; this only handles persistence. The load
-  // effect calls markSaved(def) so opening an asset never rewrites it.
-  const writeDef = useCallback((d: ParticleEffectDef): Promise<boolean> => {
-    const path = asset?.path;
-    if (!path) return Promise.resolve(false);
-    setSaveMsg('Saving…');
-    return backendFetch('/api/write-file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, content: JSON.stringify(d, null, 2) }),
-    }).then((res) => {
-      setSaveMsg(res.ok ? 'Saved ✓' : `Save failed (${res.status})`);
-      // The file is now authoritative — drop any OLDER parked write for it, or the next save_all
-      // flushes that stale doc back over what was just written (measured; see assetWrittenToDisk).
-      if (res.ok) assetWrittenToDisk(path);
-      return res.ok;
-    }).catch((e) => { console.error('[ParticleEditor] auto-save failed', e); setSaveMsg('Save failed'); return false; });
-  }, [asset?.path]);
-  const { markSaved } = useDebouncedSave(def, writeDef, AUTOSAVE_MS);
+  // ── Park the edit; Cmd+S writes it (#259) ──
+  // Watching the store's `def` covers every mutation path (field edits AND global undo/redo, which
+  // both rewrite editingParticleDef). The live preview + shared cache were already updated
+  // synchronously by applyParticleDef, so this is only about persistence. The load effect calls
+  // markSaved(def) so opening an asset never dirties it.
+  const { markSaved, dirty } = useParkedAssetDoc(def, asset?.path, 'particle');
   savedMarkRef.current = markSaved; // let the load effect seed the saved reference
 
   return (
@@ -376,8 +359,10 @@ export default function ParticleEditor() {
         <div style={{ width: 290, flexShrink: 0, borderLeft: '1px solid #333', overflowY: 'auto', padding: 10 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
             <input value={def.name ?? ''} onChange={(e) => patch({ name: e.target.value })} style={{ ...input, fontWeight: 'bold', width: 150 }} />
-            {/* Auto-saved — no Save button. This reflects the debounced write status. */}
-            <span style={{ fontSize: 10, color: saveMsg.includes('fail') ? '#e74c3c' : '#2ecc71' }}>{saveMsg || 'Auto-save'}</span>
+            {/* No Save button on purpose: Cmd+S (Save All) is the one save in this editor, and a
+                per-panel button would be a second one that saved less. This says whether THIS
+                asset is on disk. */}
+            <span style={{ fontSize: 10, color: dirty ? '#f1c40f' : '#2ecc71' }}>{saveStatusLabel(dirty)}</span>
           </div>
 
           <Section title="General">

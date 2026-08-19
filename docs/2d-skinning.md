@@ -282,6 +282,9 @@ an optional alpha coverage predicate; these return a ready `.rig2d.json` payload
   point — an authored set sums to 1 ± an ulp (`bar.rig2d.json`'s first vertex sums to 1 + 2.2e-16),
   so every value came back an ulp lighter. `SkinEditor`'s 400ms autosave then put that on disk: a
   60-line git diff on a rig nothing semantically changed, on every rig anyone opened and touched.
+  (That autosave is gone — #259, the panel parks its write for Cmd+S now — so the diff needs a save
+  rather than arriving unbidden. The renormalize bug is fixed either way; a churny write you DID ask
+  for is still churn.)
   `removeBone` now passes an untouched vertex through **verbatim** (only the indices move), and
   keeps the renormalize for a vertex that actually lost or merged a bucket, or whose weights do
   not sum to 1 — a genuinely malformed vertex still gets repaired, because the loader would

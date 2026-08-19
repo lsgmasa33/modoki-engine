@@ -32,10 +32,9 @@ import CleanupAssetsDialog from './panels/CleanupAssetsDialog';
 import PublishOtaDialog from './panels/PublishOtaDialog';
 import OtaKeysDialog from './panels/OtaKeysDialog';
 import PanelErrorBoundary from './panels/PanelErrorBoundary';
-import { saveAll } from './scene/serialize';
-import { enterPlay, pausePlay, getModeOwner } from './scene/playMode';
-import { getPlayState, setPlayState, onPlayStateChange, getRunMode, canEdit as canEditMode } from '../runtime/core/playState';
-import { savePrefabEdit, isEditingPrefab } from './scene/prefabEdit';
+import { runSaveAll, toastForSave } from './scene/saveCommand';
+import { enterPlay, pausePlay } from './scene/playMode';
+import { getPlayState, setPlayState, onPlayStateChange } from '../runtime/core/playState';
 import { useEditorStore } from './store/editorStore';
 import { setActionCallback } from './undo/entityActions';
 import { pushAction, undo, redo, canUndo, canRedo, undoLabel, redoLabel, subscribeUndo, getUndoVersion } from './undo/undoManager';
@@ -256,50 +255,25 @@ export default function EditorApp() {
         scope: 'app-chord',
         menu: { path: 'File/Save All' },
         run: () => {
-          // Saving is disabled unless fully STOPPED — while playing/previewing/scrubbing the live
-          // world holds mutated/temporary state (a preview pose, a control-spawned prefab). Persisting
-          // it would bake preview state into the scene. Stop/exit preview first to save authored data.
-          // (saveScene() also refuses on its own — this is the friendly early message; see Phase 2.)
-          if (!canEditMode()) {
-            const m = getRunMode();
-            // Name the panel that actually owns the mode: BOTH the Timeline and the Animation panel
-            // drive it, and a hardcoded "timeline" sent Animation users hunting for a control in the
-            // wrong window (which is also why the Animation panel now has its own ⏹ Exit Preview).
-            const who = getModeOwner() === 'animation' ? 'Animation' : 'Timeline';
-            const msg = m === 'scrub' || m === 'preview'
-              ? `Exit ${m} to save — press ⏹ Exit Preview in the ${who} panel (poses revert on exit).`
-              : 'Stop the game to save — Cmd+S is disabled during Play (live changes revert on Stop).';
-            console.warn(`[Editor] ${msg}`);
-            useEditorStore.getState().showToast(msg, 'warn');
-            return;
-          }
-          // ⚠️ AWAIT it and report what happened. This fired the green toast unconditionally, without
-          // awaiting — so a refused save (prefab root not found, the opened prefab gone from the
-          // editor cache, a failed write) told the human their work was safe when nothing had been
-          // written. Exactly the C7 class fixed for scenes three lines below, still live here.
-          if (isEditingPrefab()) {
-            void savePrefabEdit().then((ok) => {
-              const t = useEditorStore.getState().showToast;
-              if (ok) t('Prefab saved', 'success');
-              else t('Prefab save FAILED — nothing written to disk (see console)', 'warn');
-            });
-          }
-          // Report what actually happened. This showed a green "Scene saved" unconditionally —
-          // not even awaiting saveAll — so a Save-As CANCEL or a failed write (project moved,
-          // disk full, permissions) told the HUMAN their work was safe when it was not. (C7)
-          else {
-            void saveAll().then((r) => {
-              const t = useEditorStore.getState().showToast;
-              if (r.saved) t('Scene saved', 'success');
-              else if (r.reason === 'cancelled') t('Save cancelled — nothing written', 'info');
-              // Reachable only when the prefab-edit world is loaded but the editingPrefab flag is
-              // gone, so the branch above did not claim the keystroke. Say which save is missing
-              // rather than "Save FAILED (prefab-edit)", which reads like a bug in the prefab.
-              else if (r.reason === 'prefab-edit') {
-                t('This is a prefab-edit world — re-open the prefab to save it (nothing written)', 'warn');
-              } else t(`Save FAILED (${r.reason}) — nothing written to disk`, 'warn');
-            });
-          }
+          // ⚠️ NO run-mode early return here any more (#259). Saving used to be refused outright
+          // unless fully STOPPED, because the live world holds preview state (a pose, a
+          // control-spawned prefab) that must not be baked into an authored SCENE. That reasoning
+          // covers the scene and nothing else: a `.particle.json` / `.anim.json` the panel owns is
+          // authored data in every run mode, and now that the panels park instead of autosaving,
+          // refusing here would leave an Animation-Editor user in scrub mode with no way to save
+          // the clip they just edited. `saveScene` still refuses the SCENE (it owns that guard);
+          // the parked asset docs flush regardless, and the toast says which half happened.
+          //
+          // ⚠️ AWAIT it and report what happened. Both branches once fired a green toast
+          // unconditionally, without awaiting — so a refused save (prefab root not found, a
+          // cancelled Save-As, a failed write) told the human their work was safe when nothing had
+          // been written. That is the C7 class, and `toastForSave` is where it stays fixed for
+          // BOTH entry points at once.
+          void runSaveAll().then((o) => {
+            const { text, kind } = toastForSave(o);
+            if (kind !== 'success') console.warn(`[Editor] ${text}`);
+            useEditorStore.getState().showToast(text, kind);
+          });
         },
       }),
       register({
@@ -642,23 +616,16 @@ export default function EditorApp() {
       // FILE. Save Scene As → rename the scene in the Assets window. Both dropped here.
       { label: 'Save All', shortcut: 'Cmd+S', action: () => {
         // ⚠️ This is the NATIVE File-menu twin of the `app.saveAll` keymap handler above, reachable
-        // without the shortcut, and it must report failures the same way. It did not: the prefab
-        // branch was fire-and-forget with no toast at all, so a refused prefab save (root not
-        // found, prefab evicted from the editor cache, write rejected) told the user nothing. The
-        // keymap handler was fixed first and this duplicate 360 lines away was missed — the exact
-        // hazard of having two entry points for one command.
-        if (isEditingPrefab()) {
-          void savePrefabEdit().then((ok) => {
-            const t = useEditorStore.getState().showToast;
-            t(ok ? 'Prefab saved' : 'Prefab save FAILED — nothing written to disk (see console)', ok ? 'success' : 'warn');
-          });
-          return;
-        }
-        void saveAll().then((r) => { // never claim a save that didn't land (C7)
-          const t = useEditorStore.getState().showToast;
-          if (r.saved) t('Scene saved', 'success');
-          else if (r.reason === 'prefab-edit') t('This is a prefab-edit world — re-open the prefab to save it (nothing written)', 'warn');
-          else if (r.reason !== 'cancelled') t(`Save FAILED (${r.reason}) — nothing written to disk`, 'warn');
+        // without the shortcut, and it must report the same thing. It did not: the prefab branch
+        // was fire-and-forget with no toast at all, so a refused prefab save (root not found,
+        // prefab evicted from the editor cache, write rejected) told the user nothing. The keymap
+        // handler was fixed first and this duplicate 360 lines away was missed — the exact hazard
+        // of having two entry points for one command. Both now call ONE command that returns ONE
+        // message (scene/saveCommand.ts), so they cannot disagree again.
+        void runSaveAll().then((o) => {
+          const { text, kind } = toastForSave(o);
+          if (kind !== 'success') console.warn(`[Editor] ${text}`);
+          useEditorStore.getState().showToast(text, kind);
         });
       } },
     ],

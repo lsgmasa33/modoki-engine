@@ -15,9 +15,25 @@ import { defaultParticleEffect, type ParticleEffectDef } from '../particles/type
 import { defaultAnimationClip, normalizeAnimationClip, type AnimationClipDef } from '../animation/types';
 import { defaultTimeline, normalizeTimeline, type TimelineDef } from '../timeline/types';
 import { defaultSpriteClip } from '../traits/SpriteAnimator';
+import { defaultRig2DFile } from '../skinning/rig2dTypes';
 import { MATERIAL_TEXTURE_SLOTS } from './materialTextureSlots';
 
-export type AssetSchemaType = 'material' | 'particle' | 'animation' | 'spriteanim' | 'timeline';
+/** Every asset type this module serves a schema for — THE list, and the reason it is a `const`
+ *  array rather than a bare union: `SCHEMAS` below is a `Record<AssetSchemaType, …>`, so adding a
+ *  type here without adding its schema is a COMPILE error rather than a runtime `undefined`.
+ *
+ *  ⚠️ **It used to be copied by hand into three other places**, and drifted in two of them: the
+ *  router advertised a narrower set in its own 400s than it accepted, and the MCP tools' zod enum
+ *  was narrower still — which is how the timeline authoring loop ended up with no reachable schema
+ *  (`modoki_asset_schema {type:'timeline'}` was rejected by tools that told the agent to call it).
+ *  `editorBackendRouter.ts` now imports this list. The MCP package cannot (it bundles standalone
+ *  and imports nothing from the engine), so its copy is guarded behaviourally instead — see
+ *  `engine/tests/tools/assetTypeParity.test.ts`. */
+export const ASSET_SCHEMA_TYPES = [
+  'material', 'particle', 'animation', 'spriteanim', 'timeline', 'rig2d',
+] as const;
+
+export type AssetSchemaType = typeof ASSET_SCHEMA_TYPES[number];
 
 export type AssetFieldType =
   | 'number' | 'color' | 'boolean' | 'enum' | 'string' | 'ref' | 'curve' | 'gradient' | 'object' | 'array';
@@ -132,12 +148,29 @@ function defaultSpriteAnimData(): { clips: Record<string, ReturnType<typeof defa
   return { clips: { idle: defaultSpriteClip() } };
 }
 
+// ── Rig2D (the `.rig2d.json` 2D skinning rig — a SHARED bone skeleton + skinnable parts) ──
+// Dual-shape by design (runtime/skinning/rig2dTypes.ts): v1 keeps one implicit part's
+// sprite/mesh/skinIndices/skinWeights at the top level; v2 lists many in `parts[]` over the same
+// bones. Both are listed here because both are read — the editor converts v1 → v2 on the first
+// structural part edit, and a rig authored either way must validate.
+const RIG2D_FIELDS: FieldMeta[] = [
+  { key: 'id', type: 'string', note: 'stable GUID (mirrors .meta.json)' },
+  { key: 'version', type: 'number', note: 'present on rigs written by the editor; not interpreted — the SHAPE (parts[] or not) is what selects v1/v2' },
+  { key: 'bones', type: 'array', note: 'SHARED skeleton: [{ name, parent(-1 = root), x, y, rot, noScale? }] — each bone local to its parent' },
+  { key: 'parts', type: 'array', note: 'v2: [{ name?, sprite(GUID), mesh:{verts:[[x,y]],uvs:[[u,v]],tris:[i0,i1,i2,…]}, skinIndices:[4 per vertex], skinWeights:[4 per vertex], order?, visible? }] — omit for a v1 single-part rig' },
+  { key: 'sprite', type: 'ref', note: 'v1 only (single part): sprite/texture GUID. Ignored when `parts` is present' },
+  { key: 'mesh', type: 'object', note: 'v1 only: { verts:[[x,y]] (texture space), uvs:[[u,v]] 0..1, tris:[i0,i1,i2,…] }' },
+  { key: 'skinIndices', type: 'array', note: 'v1 only: 4 bone indices per vertex, flat' },
+  { key: 'skinWeights', type: 'array', note: 'v1 only: 4 weights per vertex, flat (normalized; unused slots 0)' },
+];
+
 const SCHEMAS: Record<AssetSchemaType, () => AssetSchema> = {
   material: () => ({ type: 'material', fields: MATERIAL_FIELDS, example: defaultMaterial(), notes: 'Texture slots are GUID refs, never literal paths. shader:"file" uses a custom shader (params block).' }),
   particle: () => ({ type: 'particle', fields: PARTICLE_FIELDS, example: defaultParticleEffect(), notes: 'Nested objects (emission/shape/MinMax/curves/render) follow the example shape. id assigned on save if absent.' }),
   animation: () => ({ type: 'animation', fields: ANIMATION_FIELDS, example: defaultAnimationClip('', 'New Clip'), notes: 'Tracks bind by relative name-path from the Animator root. Use modoki_anim_add_key to add keyframes.' }),
   timeline: () => ({ type: 'timeline', fields: TIMELINE_FIELDS, example: defaultTimeline('', 'New Timeline'), notes: 'A sequencer asset played by a Director trait. Tracks target descendants of the Director root by relative name-path. Animation-track clips are NAMES in the target animator bank; audio cues are audio GUIDs; video clips are video GUIDs; signal markers dispatch UIActions. An animation track drives the target entity own Animator trait — a target without one is silently inert.' }),
   spriteanim: () => ({ type: 'spriteanim', fields: SPRITEANIM_FIELDS, example: defaultSpriteAnimData(), notes: 'A named set of flipbook clips. Each clip\'s `frames` are sprite-slice GUID refs (never literal paths). Referenced by SpriteAnimator.clipSet + an active clip name.' }),
+  rig2d: () => ({ type: 'rig2d', fields: RIG2D_FIELDS, example: defaultRig2DFile(), notes: 'A 2D skinning rig: one SHARED bone skeleton plus one-or-more skinnable parts. Two shapes, both valid — v2 lists `parts[]`; v1 keeps a single part\'s sprite/mesh/skinIndices/skinWeights at the top level and is normalized into `parts[0]` at load. Editing parts in the Skin Editor converts v1 → v2, which DROPS those four top-level keys, so a write of a converted rig is a replace (the editor\'s own save passes `replace:true`). Sprite refs are GUIDs, never literal paths. Referenced by SkinnedSprite2D.rig.' }),
 };
 
 export function getAssetSchema(type: AssetSchemaType): AssetSchema | null {
@@ -150,6 +183,7 @@ export function defaultAssetData(type: AssetSchemaType): unknown {
   if (type === 'particle') return defaultParticleEffect();
   if (type === 'spriteanim') return defaultSpriteAnimData();
   if (type === 'timeline') return defaultTimeline('', 'New Timeline');
+  if (type === 'rig2d') return defaultRig2DFile();
   return defaultAnimationClip('', 'New Clip');
 }
 
@@ -175,6 +209,20 @@ export function validateAssetData(type: AssetSchemaType, data: unknown): { error
   }
   if (type === 'timeline' && !Array.isArray(obj.tracks) && obj.tracks !== undefined) {
     errors.push('timeline.tracks must be an array');
+  }
+  if (type === 'rig2d') {
+    // `bones` is the one field every consumer reads unconditionally (the skeleton is SHARED by
+    // every part, and `deriveBindMatrices` walks it), so a non-array is a hard error. `parts` is
+    // optional — its absence is what makes a rig v1, not what makes it malformed.
+    if (obj.bones !== undefined && !Array.isArray(obj.bones)) errors.push('rig2d.bones must be an array');
+    if (obj.parts !== undefined && !Array.isArray(obj.parts)) errors.push('rig2d.parts must be an array');
+    else if (Array.isArray(obj.parts)) {
+      for (const [i, part] of (obj.parts as unknown[]).entries()) {
+        if (!part || typeof part !== 'object' || Array.isArray(part)) {
+          warnings.push(`rig2d.parts[${i}] should be an object { sprite, mesh, skinIndices, skinWeights }`);
+        }
+      }
+    }
   }
   if (type === 'spriteanim') {
     if (obj.clips === undefined || obj.clips === null || typeof obj.clips !== 'object' || Array.isArray(obj.clips)) {

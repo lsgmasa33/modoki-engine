@@ -271,8 +271,9 @@ itself out of the deps, which matters for the same reason.
   agent-driven session, **read the value back with `modoki_get_scene_state`, never off the field.**
   And in mixed (multi-select) mode the guard is skipped entirely, so entering mixed mode still clears
   the buffer and shows the `----` placeholder.
-- **`ParticleEditor`'s `NumInput` had the same defect and auto-saves**, so the corrupted value reached
-  disk with no Save at all (`ParticleEditor.tsx` writes on a trailing timer, by design). Typing `-3.5`
+- **`ParticleEditor`'s `NumInput` had the same defect and auto-saved**, so the corrupted value reached
+  disk with no Save at all (it wrote on a trailing timer, by design — until #259 made the panel park
+  its document for Cmd+S like every other surface). Typing `-3.5`
   into one of its clamped fields committed **0.5** — the clamp of an in-progress `-3` to 0 is what
   moved the store and supplied the echo. Most of its number fields are clamped (25 of 38 carry a
   `min`/`max`, by `grep -nE "<(Num|NumInput)\b[^>]*(min|max)=\{"`), so the exposure is the panel,

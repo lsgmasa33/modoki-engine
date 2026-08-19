@@ -33,7 +33,7 @@ import {
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, reparentEntity, ensureGuid, type TraitSpec,
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
-  runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
+  runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets, flushDirtyAssets,
   getPrefabSource, instantiatePrefabAsync, setPrefabSource, serializePrefab, writePrefabFile,
   resolveExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance,
   detachPrefabInstance, reattachPrefabInstance,
@@ -1091,10 +1091,20 @@ export function registerEditorAgentOps(): void {
     // needs-path error below actively STEERS an agent into it ("pass an explicit path"), which
     // is exactly what it hits when the human simply happens to be editing a prefab. (C7)
     if (isEditingPrefab()) {
+      // Flush the parked ASSET docs even here (#259). They are documents a panel or an agent op
+      // owns and have nothing to do with which world is loaded — and this branch never reaches
+      // `saveAll`, which is where the flush lives. Then refuse the SCENE half, naming what did
+      // happen: an error that hides completed work is as misleading as a success that hides a
+      // failure.
+      const flushed = await flushDirtyAssets();
+      const note = flushed.saved.length
+        ? ` (${flushed.saved.length} parked asset doc(s) WERE written: ${flushed.saved.join(', ')})`
+        : '';
       throw new Error(
         'save-all: the editor is in PREFAB-EDIT mode — its world is a synthetic prefab scene, ' +
         'not a real one, so saving it to a scene path would overwrite that scene with prefab ' +
-        'scaffolding. Use the prefab editor\'s own save (Save Prefab), or leave prefab-edit mode first.',
+        'scaffolding. Use the prefab editor\'s own save (Save Prefab), or leave prefab-edit mode ' +
+        `first.${note}`,
       );
     }
     const r = await saveAll({ path: savePath, allowDialog: false });
@@ -1117,7 +1127,16 @@ export function registerEditorAgentOps(): void {
         `WITHOUT them. Fix the cause and call save_all again.`,
       );
     }
-    if (r.saved) return { ok: true, scenePath: r.path, ...(r.extraSaved?.length ? { extraSaved: r.extraSaved } : {}) };
+    if (r.saved) {
+      return {
+        ok: true, scenePath: r.path,
+        ...(r.extraSaved?.length ? { extraSaved: r.extraSaved } : {}),
+        // Name the asset docs this save wrote. They are the half a caller cannot otherwise see —
+        // `saved:false` was the answer when the edit was parked, and this is where that promise
+        // is kept.
+        ...(r.assets?.saved.length ? { savedAssets: r.assets.saved } : {}),
+      };
+    }
     if (r.reason === 'needs-path') {
       throw new Error(
         'save-all: this scene has no path yet (new_scene never saved), and the Save-As panel ' +
@@ -1125,7 +1144,12 @@ export function registerEditorAgentOps(): void {
       );
     }
     if (r.reason === 'playing') {
-      throw new Error('save-all: BLOCKED during Play — saving now would bake the runtime world (physics-settled positions, spawned entities) over your authored scene, and Stop would revert the live world anyway. Stop the editor first (modoki_play_control {action:"stop"}).');
+      // The SCENE half only. Parked asset docs already flushed above (#259) — say so, or an agent
+      // reads this as "nothing was saved" and re-parks work that is already on disk.
+      const note = r.assets?.saved.length
+        ? ` The ${r.assets.saved.length} parked asset doc(s) WERE written (${r.assets.saved.join(', ')}) — those are authored documents and are not affected by run mode.`
+        : '';
+      throw new Error(`save-all: the SCENE was NOT saved — blocked while the editor is playing/previewing, because saving now would bake the runtime world (physics-settled positions, spawned entities, a preview pose) over your authored scene, and Stop would revert the live world anyway. Stop the editor first (modoki_play_control {action:"stop"}).${note}`);
     }
     throw new Error(`save-all FAILED (${r.reason}) for ${r.path ?? '(no path)'} — NOTHING was written to disk.`);
   });

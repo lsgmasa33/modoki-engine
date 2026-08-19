@@ -12,10 +12,19 @@ import { SAVE_PARAM } from '../shapes.js';
 
 /** Every type the backend's `getAssetSchema` actually serves. ONE list, because three tools take
  *  it and they had drifted NARROWER than the backend: the enum was material|particle|animation
- *  while `assetSchemas.ts` defines five, so `modoki_asset_schema {type:'timeline'}` was rejected
+ *  while `assetSchemas.ts` defined five, so `modoki_asset_schema {type:'timeline'}` was rejected
  *  by zod — and `timeline_set`/`timeline_add_clip` both tell the agent to read exactly that. The
- *  timeline authoring loop had no reachable schema and no scaffolder. */
-const ASSET_TYPES = ['material', 'particle', 'animation', 'spriteanim', 'timeline'] as const;
+ *  timeline authoring loop had no reachable schema and no scaffolder.
+ *
+ *  ⚠️ **This is a hand-kept COPY of `ASSET_SCHEMA_TYPES` in the engine's
+ *  `engine/packages/modoki/src/runtime/assets/assetSchemas.ts`, and it cannot be an import**: this
+ *  package bundles standalone and imports nothing from the engine. It is also the copy that
+ *  ENFORCES (a zod enum rejects before any request is made), so drift here is not a bad error
+ *  message — it is a tool that refuses a type the backend serves. `engine/tests/tools/
+ *  assetTypeParity.test.ts` compares the two lists and fails the build when they disagree. */
+const ASSET_TYPES = ['material', 'particle', 'animation', 'spriteanim', 'timeline', 'rig2d'] as const;
+
+export { ASSET_TYPES as ASSET_TYPES_FOR_TESTS };
 
 export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   const { getJson, postJson, editorAction } = ctx;
@@ -24,7 +33,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_asset_schema',
     'Get the field schema (types, defaults, ranges, enums) + a valid example for an asset type ' +
-      '(material / particle / animation / spriteanim / timeline), so you can author the JSON ' +
+      '(material / particle / animation / spriteanim / timeline / rig2d), so you can author the JSON ' +
       'correctly. Read this BEFORE ' +
       'modoki_write_asset. Texture/effect refs must be GUIDs (use modoki_list_assets).',
     { type: z.enum(ASSET_TYPES)
@@ -33,7 +42,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   );
   tool(
     'modoki_create_asset',
-    'Scaffold a new asset (material/particle/animation/spriteanim/timeline) with sensible defaults + a fresh GUID at ' +
+    'Scaffold a new asset (material/particle/animation/spriteanim/timeline/rig2d) with sensible defaults + a fresh GUID at ' +
       'the given path. Then edit it with modoki_write_asset or (for live preview) the particle/anim ops. ' +
       'Always writes the file directly, regardless of persistence mode (modoki_persistence) — this is ' +
       'an explicit "write this file" tool, not a live-state edit.',

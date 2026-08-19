@@ -16,6 +16,7 @@ import { PREFAB_EDIT_SCENE_PREFIX, isPrefabEditWorld } from './prefabEditWorld';
 import type { SceneData, SceneEntityEntry } from '../../runtime/loaders/loadSceneFile';
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { getRunMode } from '../../runtime/core/playState';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
@@ -322,6 +323,25 @@ export function collectPreservedLocalIds(rootLocalId: number, rootEcsId: number)
 export async function savePrefabEdit(): Promise<boolean> {
   const { editingPrefab } = useEditorStore.getState();
   if (!editingPrefab) return false;
+  // TRANSIENCE guard, the prefab twin of `saveScene`'s (serialize.ts). Only ever WRITE authored
+  // data: while scrub/preview/play is live the world holds preview mutations (a posed skeleton, a
+  // control-spawned prefab, physics-settled positions), and this serializes the prefab subtree
+  // straight out of that world — so a save now bakes them into the .prefab.json, and every scene
+  // instantiating it inherits the pose.
+  //
+  // It lives HERE, not in the callers, for the reason the same guard lives inside `saveScene`:
+  // every caller inherits it and none can forget. It was in exactly one caller — the Cmd+S
+  // handler's `!canEdit()` early return — which meant the AGENT path (`prefab edit-save`) never
+  // had it at all, and deleting that early return in #259 (so parked asset docs could still flush
+  // during preview) removed the human's too. One guard, both paths.
+  if (getRunMode() !== 'stopped') {
+    console.error(
+      `[PrefabEdit] cannot save "${editingPrefab.name}" — run-mode is '${getRunMode()}', not 'stopped'. ` +
+      'Saving now would bake preview/play mutations (a posed rig, a spawned prefab) into the prefab ' +
+      'file, and every scene that instantiates it would inherit them. Exit preview / stop first.',
+    );
+    return false;
+  }
   const rootId = findPrefabEditRoot();
   if (!rootId) { console.error('[PrefabEdit] cannot save — prefab root not found'); return false; }
 

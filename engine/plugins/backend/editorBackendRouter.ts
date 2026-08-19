@@ -169,7 +169,13 @@ import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, 
 import { isGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
 import type { ErrorCode } from '../../tools/shared/mcpResult';
-import { getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData, type AssetSchemaType } from '../../packages/modoki/src/runtime/assets/assetSchemas';
+// ASSET_SCHEMA_TYPES is IMPORTED, never restated. This file used to keep its own copy, and it
+// advertised a narrower set in its 400s than `getAssetSchema` actually served — a wrong error
+// message is not cosmetic on a surface whose whole job is telling an agent what it may pass.
+import {
+  getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData,
+  ASSET_SCHEMA_TYPES, type AssetSchemaType,
+} from '../../packages/modoki/src/runtime/assets/assetSchemas';
 import { UNCLAMPED_OVERRIDES } from '../../packages/modoki/src/runtime/rendering/qualityTier';
 import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
@@ -252,11 +258,6 @@ export interface BackendRequest {
   query: URLSearchParams;
   body: unknown;
 }
-
-/** Every asset type `getAssetSchema` serves. The routes used to advertise a NARROWER set in their
- *  own 400s (material|particle|animation) than they actually accept, which is how the timeline
- *  authoring loop ended up with no reachable schema. */
-const ASSET_SCHEMA_TYPES = ['material', 'particle', 'animation', 'spriteanim', 'timeline'] as const;
 
 const json = (body: unknown, status?: number): BackendResult => ({ kind: 'json', status, body });
 
@@ -1989,7 +1990,9 @@ async function describeUnresolvedAgainstLiveWorld(
   // an existing file's `id` when the new data omits one.
   if (urlPath === '/api/asset-write' && method === 'POST') {
     try {
-      const { path: assetPath, type, data } = (body ?? {}) as { path?: string; type?: AssetSchemaType; data?: unknown; replace?: boolean };
+      const { path: assetPath, type, data } = (body ?? {}) as {
+        path?: string; type?: AssetSchemaType; data?: unknown; replace?: boolean; selfWrite?: boolean;
+      };
       if (!assetPath || !type) return json({ error: 'asset-write requires { path, type, data }' }, 400);
       if (!getAssetSchema(type)) return json({ error: `unknown asset type '${type}' — valid: ${ASSET_SCHEMA_TYPES.join(', ')}`, types: ASSET_SCHEMA_TYPES }, 400);
       const abs = ctx.resolveAssetPath(assetPath);
@@ -2044,6 +2047,18 @@ async function describeUnresolvedAgainstLiveWorld(
       // while doing the opposite. (C7)
       if (out && typeof out === 'object' && !out.id && fs.existsSync(abs)) {
         try { const prev = JSON.parse(fs.readFileSync(abs, 'utf-8')); if (prev?.id) out.id = prev.id; } catch { /* ignore */ }
+      }
+      // `selfWrite` — the editor is flushing a doc it ALREADY applied to the live cache
+      // (dirtyAssets.flushDirtyAssets), so fingerprint the bytes the way /api/write-file does and
+      // let the watcher skip its own save. Without it the flush's own change event comes back
+      // ~150ms later, invalidates the cache it just agreed with, and `dropParkedWriteFor` discards
+      // whatever the human parked in the meantime — an edit made in the second after Cmd+S,
+      // gone. A file-direct write_asset must NOT set this: there the cached def really is stale,
+      // which is the whole reason the invalidation exists.
+      const selfWrite = (body as { selfWrite?: boolean } | null)?.selfWrite === true;
+      if (selfWrite) {
+        const bytes = Buffer.from(JSON.stringify(out, null, 2));
+        ctx.markEditorWrite(abs, crypto.createHash('sha1').update(bytes).digest('hex'));
       }
       writeJsonAtomic(abs, out);
       return json({ ok: true, saved: true, warnings, path: assetPath });

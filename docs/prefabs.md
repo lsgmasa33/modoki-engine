@@ -372,6 +372,14 @@ shows there in normal mode too.
 - **Cmd+S** routes to `savePrefabEdit()`, which serializes the prefab subtree
   back to its `.prefab.json` (the `__PrefabEdit*` scaffolds are excluded — they
   aren't descendants of the root, located via a sentinel `EntityAttributes.guid`).
+- **It refuses while the run mode is not `stopped`** — the prefab twin of `saveScene`'s transience
+  guard, and for the same reason doubled: it serializes out of the LIVE world, so a save during a
+  scrub/preview envelope or during Play bakes a posed rig or a spawned prefab into the file, and
+  every scene instantiating it inherits them. Stop or ⏹ Exit Preview first. The guard lives inside
+  `savePrefabEdit`, not in its callers, so the agent op (`prefabAction:'edit-save'`) inherits it —
+  it had no such guard while the check sat in the Cmd+S handler alone.
+  Parked ASSET docs still flush in that state, because a `.particle.json` the panel owns is
+  authored data in every run mode — see [mcp-persistence.md](./mcp-persistence.md) § 5.
 - The breadcrumb **Back** button reloads the originating scene, which
   re-instantiates every instance of the just-saved prefab.
 - Right-click → **Instantiate** still adds a copy to the current scene (the old

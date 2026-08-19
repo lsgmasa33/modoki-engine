@@ -43,6 +43,20 @@ export interface Rig2DFile {
   skinWeights?: number[];
 }
 
+/** A fresh, valid `.rig2d.json` document: one root bone, one empty v1 part. The shape the Skin
+ *  editor's "+ New Rig2D" writes and the shape `create-asset {type:'rig2d'}` scaffolds — ONE
+ *  definition, so the two cannot drift into disagreeing about what an empty rig is. `id` is
+ *  assigned by the caller (the editor mints one; the create-asset route injects one). */
+export function defaultRig2DFile(): Rig2DFile {
+  return {
+    sprite: '',
+    bones: [{ name: 'root', parent: -1, x: 0, y: 0, rot: 0 }],
+    mesh: { verts: [], uvs: [], tris: [] },
+    skinIndices: [],
+    skinWeights: [],
+  };
+}
+
 /** A parsed, render-ready part: typed geometry buffers + its sprite + draw order. */
 export interface ParsedRig2DPart {
   name: string;

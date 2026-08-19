@@ -922,8 +922,11 @@ pans).
   dropped rather than silently lost.
 - **Preview envelope + ⏹ Exit Preview** — a scrub or ▶ preview opens a snapshot session
   (`editor/scene/timelinePreview.ts`, shared with the Timeline panel) and sets run-mode
-  `scrub`/`preview`. **Cmd+S is refused for the whole envelope** — the pose writes authored traits,
-  so a save would bake it. **⏹ Exit Preview** reverts to the authored snapshot, re-resolves the
+  `scrub`/`preview`. **The SCENE save is refused for the whole envelope** — the pose writes authored
+  traits, so a scene save would bake it. The CLIP is not: since #259 Cmd+S always flushes the parked
+  asset documents, because a `.anim.json` the panel owns is authored data in every run mode, and
+  refusing it would leave someone in scrub mode with edits and no way to save them. The toast names
+  which half happened. **⏹ Exit Preview** reverts to the authored snapshot, re-resolves the
   Animator root (the reload reassigns entity ids) and returns to `stopped`, which re-enables saving;
   unmount / clip-switch do the same. Without it the panel wedged saves with no way out but closing
   the tab. Caveat: poses made OUTSIDE the envelope (MCP `set_playhead`, a clip edit's re-pose) open
@@ -966,6 +969,13 @@ with sub-widgets including a `CurveEditor` (over-life curves) and `GradientEdito
 ramps). Top: play / pause / restart / scrub. Every edit calls `backend.setDef` immediately
 and seeds the shared particle cache, so a `ParticleEmitter` entity referencing the same
 asset in GameView updates too.
+
+**Saving is manual, in this panel and the four other asset editors** (Animation, Timeline, Skin,
+SpriteAnim). An edit parks its document in the dirty-asset registry and **Cmd+S writes it**; the
+status text next to the asset name says `Unsaved ●` or `Saved ✓`, and there is no Save button
+because Save All is the one save. They autosaved on a 400 ms debounce until #259 — see
+[mcp-persistence.md](./mcp-persistence.md) § 5 for what that cost and why the registry is now the
+single path from an asset edit to disk.
 
 ### Sprite Editor
 

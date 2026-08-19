@@ -4,6 +4,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { timeToFrame } from './timelineMath';
 import { Tooltip } from '../fields';
+import { saveStatusLabel } from '../useParkedAssetDoc';
 
 /** A toolbar button with a custom hover tooltip. Native HTML `title` tooltips do
  *  NOT render in the Electron editor (confirmed: hovering >5s shows nothing), so —
@@ -76,7 +77,12 @@ export interface ToolbarProps {
   inPreview: boolean;
   /** Leave the envelope: revert the previewed pose and return to stopped (re-enables Cmd+S). */
   onExitPreview: () => void;
-  saveMsg: string;
+  /** Is this clip's document unsaved (parked, awaiting Cmd+S)? */
+  dirty: boolean;
+  /** Transient feedback ("Copied 3 keys", a warning). Shown BESIDE the save status, never
+   *  instead of it — the two used to share one span, so any message hid whether the clip
+   *  was on disk. */
+  statusMsg: string;
 }
 
 export default function AnimationToolbar(p: ToolbarProps) {
@@ -145,7 +151,8 @@ export default function AnimationToolbar(p: ToolbarProps) {
       <TipButton tip="Undo (shared global)" onClick={p.onUndo} style={btn}>↶</TipButton>
       <TipButton tip="Redo (shared global)" onClick={p.onRedo} style={btn}>↷</TipButton>
       <span style={{ flex: 1 }} />
-      <span style={{ fontSize: 10, color: p.saveMsg.includes('fail') ? '#e74c3c' : '#2ecc71' }}>{p.saveMsg || 'Auto-save'}</span>
+      {p.statusMsg && <span style={{ fontSize: 10, color: '#8a8a96' }}>{p.statusMsg}</span>}
+      <span style={{ fontSize: 10, color: p.dirty ? '#f1c40f' : '#2ecc71' }}>{saveStatusLabel(p.dirty)}</span>
     </div>
   );
 }

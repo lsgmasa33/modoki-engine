@@ -5,19 +5,22 @@
  *
  *  Architecture mirrors ParticleEditor/AnimationEditor: the live def is the single
  *  source of truth in the editor store, so the GLOBAL undo stack applies edits even
- *  when this panel is unfocused; edits coalesce per group; persistence is a debounced
- *  /api/write-file, and each edit re-seeds the shared spriteAnimCache so any live
- *  SpriteAnimator referencing this asset updates next frame. */
+ *  when this panel is unfocused; edits coalesce per group; the document is PARKED in the
+ *  dirty-asset registry and written by Cmd+S (Save All) — see useParkedAssetDoc.ts (#259) — and
+ *  each edit re-seeds the shared spriteAnimCache so any live SpriteAnimator referencing this
+ *  asset updates next frame. */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { backendFetch } from '../backend/editorBackend';
 import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath } from '../../runtime/loaders/assetManifest';
 import { spriteThumbStyle } from './SpritePicker';
+import { pendingAssetDoc } from './pendingAssetDoc';
+import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { normalizeSpriteAnim, type SpriteAnimDef } from '../../runtime/loaders/spriteAnimCache';
 import { defaultSpriteClip, type SpriteClip } from '../../runtime/traits/SpriteAnimator';
 import { spriteIndexFromStep } from '../../runtime/particles/types';
 import { saveAssetDialog } from '../utils/saveDialog';
-import { useDebouncedSave } from './useDebouncedSave';
+import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
 import { AssetRefField } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
 import { pushAction, peekUndo, isExecutingUndoRedo, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
@@ -25,7 +28,6 @@ import { BufferedNumberInput, inputStyle } from './fields';
 import { FrameThumb, TrackNameField, iconBtn, labelStyle } from './SpriteAnimatorSection';
 
 const COALESCE_MS = 500;
-const AUTOSAVE_MS = 400;
 type SpriteAnimAction = UndoAction & { _after: SpriteAnimDef };
 
 export default function SpriteAnimEditor() {
@@ -41,7 +43,6 @@ export default function SpriteAnimEditor() {
   // Active track is LOCAL panel state — the asset is just the clip set, it has no
   // "active clip" concept (that lives on the SpriteAnimator trait instead).
   const [active, setActive] = useState('');
-  const [saveMsg, setSaveMsg] = useState('');
 
   // ── Load the asset def when the open target changes ──
   useEffect(() => {
@@ -52,19 +53,33 @@ export default function SpriteAnimEditor() {
     const existing = useEditorStore.getState().editingSpriteAnimDef;
     if (existing) { savedMarkRef.current?.(existing); return; } // bare re-mount — keep unsaved edits
     const { loadSpriteAnimDef } = useEditorStore.getState();
+    // An UNSAVED write parked for this asset is not on disk yet, so fetching the file would open
+    // the PRE-edit doc and re-seed the live cache with it — discarding the edit everywhere except
+    // the registry that still holds it (QA-CTX-0008, measured on the Timeline twin of this path).
+    // That used to be reachable only via an agent op; since #259 the PANEL parks too, so closing
+    // and reopening this panel with unsaved edits would silently throw the human's own work away.
+    // Marked saved because it is parked, not written: it stays pending until Save All.
+    const parked = pendingAssetDoc(asset.path, 'spriteanim');
+    if (parked) {
+      const doc = normalizeSpriteAnim(parked as Parameters<typeof normalizeSpriteAnim>[0]);
+      if (!doc.id) doc.id = newGuid();
+      registerAsset(doc.id, asset.path, 'spriteanim');
+      savedMarkRef.current?.(doc);
+      loadSpriteAnimDef(doc);
+      setActive(Object.keys(doc.clips)[0] ?? '');
+      return;
+    }
     fetch(asset.path)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
       .then((json) => {
         if (cancelled) return;
         const loaded = normalizeSpriteAnim(json);
-        if (!loaded.id) {
-          loaded.id = newGuid();
-          registerAsset(loaded.id, asset.path, 'spriteanim');
-          savedMarkRef.current?.(normalizeSpriteAnim(json)); // id-less twin → autosave persists the new id
-        } else {
-          registerAsset(loaded.id, asset.path, 'spriteanim');
-          savedMarkRef.current?.(loaded);
-        }
+        // Baseline is the doc WITH the minted id, never an id-less twin — that trick made the
+        // autosave write the new id, and without an autosave it would park a write just for
+        // OPENING a legacy asset. The scanner heals missing GUIDs already (buildManifest heal).
+        if (!loaded.id) loaded.id = newGuid();
+        registerAsset(loaded.id, asset.path, 'spriteanim');
+        savedMarkRef.current?.(loaded);
         loadSpriteAnimDef(loaded);
         setActive(Object.keys(loaded.clips)[0] ?? '');
       })
@@ -151,23 +166,17 @@ export default function SpriteAnimEditor() {
     const doc = { id: guid, clips: { idle: defaultSpriteClip() } };
     const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(doc, null, 2) }) }).then((r) => r.ok).catch(() => false);
     if (!ok) return;
+    // CREATE writes immediately (the file must exist for registerAsset/the manifest), so the file
+    // is authoritative — drop any parked write for that path.
+    assetWrittenToDisk(path);
     registerAsset(guid, path, 'spriteanim');
     const name = (path.split('/').pop() || 'SpriteAnim').replace(/\.spriteanim\.json$/i, '');
     useEditorStore.getState().openSpriteAnimEditor({ path, type: 'spriteanim', name });
   }, []);
 
-  // ── Debounced auto-save to disk (watches the store def → covers edits + undo/redo) ──
-  const writeDef = useCallback((d: SpriteAnimDef): Promise<boolean> => {
-    const path = asset?.path;
-    if (!path) return Promise.resolve(false);
-    setSaveMsg('Saving…');
-    return backendFetch('/api/write-file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, content: JSON.stringify(d, null, 2) }),
-    }).then((res) => { setSaveMsg(res.ok ? 'Saved ✓' : `Save failed (${res.status})`); return res.ok; })
-      .catch((e) => { console.error('[SpriteAnimEditor] auto-save failed', e); setSaveMsg('Save failed'); return false; });
-  }, [asset?.path]);
-  const { markSaved } = useDebouncedSave(def, writeDef, AUTOSAVE_MS);
+  // ── Park the edit; Cmd+S writes it (#259) ──
+  // Watches the store def, so it covers edits AND global undo/redo.
+  const { markSaved, dirty } = useParkedAssetDoc(def, asset?.path, 'spriteanim');
   savedMarkRef.current = markSaved;
 
   const frames = clip?.frames ?? [];
@@ -195,7 +204,7 @@ export default function SpriteAnimEditor() {
         <div style={{ width: 290, flexShrink: 0, borderLeft: '1px solid #333', overflowY: 'auto', padding: 10 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
             <span style={{ fontWeight: 'bold', color: '#ddd' }}>{asset?.name}</span>
-            <span style={{ fontSize: 10, color: saveMsg.includes('fail') ? '#e74c3c' : '#2ecc71' }}>{saveMsg || 'Auto-save'}</span>
+            <span style={{ fontSize: 10, color: dirty ? '#f1c40f' : '#2ecc71' }}>{saveStatusLabel(dirty)}</span>
           </div>
 
           {/* Track picker */}

@@ -1067,9 +1067,11 @@ export default function Assets() {
     setAssets((prev) => prev.filter((a) => !removed.has(a.path)));
     if (selected && removed.has(selected)) { setSelected(null); selectAsset(null); }
     // Same idea as the selection reset above, one layer deeper: an ASSET EDITOR bound to a
-    // deleted file would keep editing it and its debounced autosave would write the file
-    // back (#186). Checked against `allPaths`, not `removed`, so a generated file that a
-    // model delete drags along also unbinds.
+    // deleted file would keep editing it, and the write parked for that path would put the file
+    // back at the next Cmd+S (#186; the same hazard when the panels autosaved, now deferred to
+    // save time — which is also why this repairs the dirty-asset REGISTRY, not only the binding,
+    // see applyAssetPathMoves). Checked against `allPaths`, not `removed`, so a generated file
+    // that a model delete drags along also unbinds.
     logBindingChanges(unbindDeletedAssetEditors(allPaths));
     console.log(`[Assets] Moved ${allPaths.length} file(s) to trash`);
     pushDeleteUndo(results); // ONE undo entry for the whole gesture
