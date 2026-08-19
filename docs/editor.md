@@ -933,18 +933,35 @@ pans).
 - Editing a trait field **while recording** keys the clip at the playhead (the record hook in
   `animation/recording.ts`); editing an entity **not** under the Animator root warns and is
   dropped rather than silently lost.
-- **Preview envelope + ⏹ Exit Preview** — a scrub or ▶ preview opens a snapshot session
+- **Preview envelope + ⏹ Exit Preview** — a scrub, a ▶ preview, **or any clip edit** (every path
+  that poses; see `pose` in `AnimationEditor.tsx`) opens a snapshot session
   (`editor/scene/timelinePreview.ts`, shared with the Timeline panel) and sets run-mode
-  `scrub`/`preview`. **The SCENE save is refused for the whole envelope** — the pose writes authored
-  traits, so a scene save would bake it. The CLIP is not: since #259 Cmd+S always flushes the parked
-  asset documents, because a `.anim.json` the panel owns is authored data in every run mode, and
-  refusing it would leave someone in scrub mode with edits and no way to save them. The toast names
-  which half happened. **⏹ Exit Preview** reverts to the authored snapshot, re-resolves the
+  `scrub`/`preview`. The pose writes authored traits, so a scene save inside the envelope would bake
+  it — which is exactly what happened before the clip-edit path opened one.
+- **An asset-doc edit must not dirty the SCENE.** Every undo entry a panel pushes for a
+  `.anim/.particle/.timeline/.spriteanim/.rig2d/.mat/.shader/.animset` edit carries
+  `_isFileDirect: true` (`editor/undo/undoManager.ts`), so it does not bump the scene's
+  edit-version — its unsaved state is the dirty-asset registry's job, or (for the Inspector's
+  asset views) already on disk. A falsely-dirty scene is not cosmetic: it self-blocks the
+  file-direct agent routes, makes `modoki_build` refuse, and makes Cmd+S interrupt a preview to
+  rewrite a scene nothing changed. The agent twins have set it since S2.27; the panels did not
+  until this was found by the Cmd+S work.
+- **Cmd+S inside the envelope does not refuse; it works.** Three outcomes, in the order the save
+  checks them (`editor/scene/saveCommand.ts`):
+  - nothing needs an authored world — the scene is clean AND this is not a prefab-edit world (the
+    common case while authoring a clip) → **only the parked asset docs are flushed**, the preview is
+    left alone. No reload, no flicker, and no rewrite of a scene file that did not change.
+  - the scene was CHANGED inside the envelope → **the scene save is refused**, and the toast says
+    why. Exiting would restore the snapshot and revert those edits; a save must not destroy work to
+    make itself possible.
+  - otherwise → **exit → save → resume** at the same playhead (`PreviewSaveHandler`), so the save
+    serializes authored data and the animator keeps their frame. Costs one world reload; if the
+    owning panel closed mid-save, the toast says "preview ended" rather than resuming into it. **⏹ Exit Preview** reverts to the authored snapshot, re-resolves the
   Animator root (the reload reassigns entity ids) and returns to `stopped`, which re-enables saving;
   unmount / clip-switch do the same. Without it the panel wedged saves with no way out but closing
-  the tab. Caveat: poses made OUTSIDE the envelope (MCP `set_playhead`, a clip edit's re-pose) open
-  no session, so Exit reverts only to the envelope's start — see Phase 3 of
-  `docs/plans/preview-mode-refactor.md`.
+  the tab. (The old caveat — "poses made OUTSIDE the envelope open no session" — is retired: a clip
+  edit's re-pose now opens one like any other pose, and MCP `set_playhead` moves the playhead VALUE
+  without posing at all, answering `posed:false`.)
 - **Live pose** — scrubbing and preview playback pose the bound entities every frame via the
   shared runtime samplers `applyClipAtTime` + `applyClipDeform` (so a scrubbed clip previews
   skeletal/cloth deformation exactly as it plays), then fire the dirty listeners so the
@@ -1040,9 +1057,12 @@ The Material inspector (`editor/panels/assetViews/MaterialAssetView.tsx`) edits 
 file: a shader-kind dropdown plus one auto-dispatched **`ParamField`** widget per shader
 param — texture ref / color / bool / float / vecN, chosen from the shader schema (a
 multi-select shows a non-committal "mixed" placeholder that broadcasts on pick). Unlike the
-coalescing asset editors above, each discrete edit persists synchronously via
-`persistAssetEdit` (against the file **and** the material cache) and pushes its own undo
-entry. Alongside it, `MaterialPreview.tsx` renders the material on a **lit IBL sphere**
+asset editors above — which park their document for Cmd+S (#259) — each discrete edit here
+persists IMMEDIATELY via `persistAssetEdit` (against the file **and** the material cache) and
+pushes its own undo entry. The cache and the panel update optimistically, before the write is
+known to have landed, so the viewport reflects the edit at once; a write that then FAILS is
+reported (console + a warn toast) and the edited value is deliberately left live rather than
+reverted — the next edit rewrites the whole file, so editing again is the retry. Alongside it, `MaterialPreview.tsx` renders the material on a **lit IBL sphere**
 (built with the engine's own `buildPreviewMaterial` inside the shared `Preview3DShell`),
 rebuilt on any field change so a color/roughness tweak reflects live. The **Mesh**
 inspector (`MeshAssetView.tsx`) uses the same shell: `MeshPreview.tsx` loads the shared

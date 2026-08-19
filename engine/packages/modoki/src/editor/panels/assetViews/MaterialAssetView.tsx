@@ -75,6 +75,11 @@ export function MaterialAssetView({ path }: { path: string }) {
     if (!old) return;
     persistAssetEdit(path, updated, invalidateMaterialFile);
     pushAction({
+      // Asset-FILE edit: persistAssetEdit already wrote it to disk, so there is nothing pending for
+      // the scene's edit-version to represent — the literal case this flag names. Without it, editing
+      // a material marked the SCENE dirty, which self-blocks the file-direct agent routes and makes
+      // modoki_build refuse over a file that is already saved.
+      _isFileDirect: true,
       label,
       undo: () => persistAssetEdit(path, old, invalidateMaterialFile),
       redo: () => persistAssetEdit(path, updated, invalidateMaterialFile),

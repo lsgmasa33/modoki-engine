@@ -277,6 +277,13 @@ export default function ParticleEditor() {
       const a: ParticleAction = {
         _after: next,
         label: `particle ${group.split(':')[0]}`,
+        // Asset-document edit: it changes a .particle.json file, NOT any scene entity, so it must not
+        // bump the scene's edit-version. Its unsaved state is tracked by the dirty-asset registry
+        // (hasUnsavedChanges ORs both), and a falsely-dirty SCENE is not cosmetic — it self-blocks
+        // the file-direct agent routes, makes modoki_build refuse, and (since #259) makes Cmd+S
+        // interrupt a preview and rewrite the scene file on every save while authoring. The agent
+        // twins have set this since S2.27; the panels never did.
+        _isFileDirect: true,
         undo: () => useEditorStore.getState().applyParticleDef(path, before),
         redo: () => useEditorStore.getState().applyParticleDef(path, a._after),
       };

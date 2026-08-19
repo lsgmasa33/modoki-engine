@@ -66,7 +66,8 @@ export function MaterialBatchView({ paths }: { paths: string[] }) {
     const apply = (map: MatMap) => { for (const p of Object.keys(map)) persistAssetEdit(p, map[p], invalidateMaterialFile); };
     setMats((m) => ({ ...m, ...next }));
     apply(next);
-    pushAction({ label, undo: () => { setMats((m) => ({ ...m, ...prev })); apply(prev); }, redo: () => { setMats((m) => ({ ...m, ...next })); apply(next); } });
+    // Asset-FILE edits, already written by persistAssetEdit — see MaterialAssetView.
+    pushAction({ _isFileDirect: true, label, undo: () => { setMats((m) => ({ ...m, ...prev })); apply(prev); }, redo: () => { setMats((m) => ({ ...m, ...next })); apply(next); } });
   }, [paths, mats]);
 
   const writeFieldAll = useCallback((field: string, value: unknown) => {

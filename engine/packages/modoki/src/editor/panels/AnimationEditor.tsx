@@ -54,6 +54,7 @@ import { saveAssetDialog } from '../utils/saveDialog';
 import { enterScrubMode, enterPreviewMode, exitPreviewMode, getModeOwner } from '../scene/playMode';
 import {
   beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession,
+  setPreviewSaveHandler, clearPreviewSaveHandler, type PreviewSaveHandler,
 } from '../scene/timelinePreview';
 
 const COALESCE_MS = 500;
@@ -76,18 +77,23 @@ type ClipAction = UndoAction & { _after: AnimationClipDef };
  *  also fire while the Timeline owns a live preview — ending its session there would revert its
  *  world mid-run. (`exitPreviewMode` self-guards on owner; the session end does not, hence the
  *  explicit check.) */
-function endAnimationPreview(restore: boolean): void {
-  if (getModeOwner() !== 'animation') return;
+/** Returns a promise that resolves once the world has actually been restored — Cmd+S awaits it and
+ *  serializes immediately afterwards, so a fire-and-forget restore would let the save write the
+ *  POSED world, which is the whole thing the envelope exists to prevent. */
+function endAnimationPreview(restore: boolean): Promise<void> {
+  if (getModeOwner() !== 'animation') return Promise.resolve();
   const store = useEditorStore.getState();
   store.setPreviewPlaying(false);
+  let done: Promise<void> = Promise.resolve();
   if (hasTimelinePreviewSession()) {
     const path = store.editingAnimationAsset?.path;
-    void endTimelinePreviewSession({
+    done = endTimelinePreviewSession({
       restore,
       rebind: () => (path ? resolveAnimatorRootForClip(path, { fallbackToSelection: false }) : null),
     }).then((newRoot) => { if (newRoot != null) useEditorStore.getState().setAnimatorRoot(newRoot); });
   }
   exitPreviewMode('animation');
+  return done;
 }
 
 export default function AnimationEditor() {
@@ -223,8 +229,23 @@ export default function AnimationEditor() {
   }, [rootId, asset, nonce, structureVersion]);
 
   // ── Pose the bound entities at a given time (shared runtime sampler) ──
-  const pose = useCallback((c: AnimationClipDef | null, t: number) => {
+  /** Write the clip's sampled values into the bound entities. **Never call this directly** — go
+   *  through `pose`, which guarantees the preview envelope is open first. */
+  const applyPose = useCallback((c: AnimationClipDef | null, t: number) => {
     if (!c || rootId == null) return;
+    // The invariant, asserted where the damage would happen: a pose with no session held is
+    // unrevertible (⏹ Exit has nothing to restore) AND unguarded (run-mode reads 'stopped', so a
+    // save writes it to the scene file). Refuse rather than warn — a rig that visibly fails to pose
+    // is a bug report; a scene silently rewritten to a preview frame is what actually cost the
+    // owner data. Nothing legitimately poses outside the envelope: `pose` opens it first and
+    // `endAnimationPreview` does not re-pose after ending it.
+    if (!hasTimelinePreviewSession()) {
+      console.error(
+        '[AnimationEditor] refused to pose with no preview session held — the pose would be ' +
+        'unrevertible and a scene save would bake it. Every pose must go through `pose`.',
+      );
+      return;
+    }
     try {
       // applyClipAtTime writes trait values via bulk entity.set (bypassing
       // writeTraitField), so nothing marks the viewport/Inspector dirty. Signal
@@ -246,9 +267,35 @@ export default function AnimationEditor() {
     }
   }, [rootId]);
 
+  /** Pose INSIDE the preview envelope, opening it first if it is not already held.
+   *
+   *  ⚠️ **A pose writes AUTHORED trait values into the live world**, so every path that poses has to
+   *  be inside the envelope — the session snapshot is what ⏹ Exit reverts to, and the `scrub`
+   *  run-mode is what stops `saveScene` writing the pose into the scene file. Scrub and the preview
+   *  loop opened it; `commit()`'s re-pose and the undo/redo closures did NOT, so editing a keyframe
+   *  posed the world while `getRunMode()` still read `'stopped'` — and a save then baked the pose
+   *  over the authored entities, with the transience guard passing and nothing to revert to.
+   *
+   *  MEASURED, not theoretical (owner, 2026-08-19, `games/3d-test`): one Cmd+S after a keyframe
+   *  edit rewrote `2D Animation.scene.json`'s Circle 2D x/y and Square 2D color to the clip's t=0
+   *  values, silently. It was on `docs/plans/preview-mode-refactor.md` Phase 3's open list as
+   *  "poses OUTSIDE the envelope … neither revertible nor save-blocked" before it happened for real.
+   *
+   *  Opening it here rather than at each call site is the point: this is the ONE place that writes
+   *  a pose, so a future path that poses cannot forget. The session begin is async (it serializes
+   *  the authored world), so a first pose lands a tick later — the same shape `scrub` already had,
+   *  and what keeps the snapshot free of the pose it is meant to revert. */
+  const pose = useCallback((c: AnimationClipDef | null, t: number) => {
+    if (!c || rootId == null) return;
+    if (hasTimelinePreviewSession()) { applyPose(c, t); return; }
+    enterScrubMode('animation');
+    setInPreview(true);
+    void beginTimelinePreviewSession().then(() => applyPose(c, t));
+  }, [rootId, applyPose]);
+
   // ── Load the clip when the open target changes ──
   useEffect(() => {
-    endAnimationPreview(true); // opening/switching a clip ends our envelope: revert the pose, back to stopped
+    void endAnimationPreview(true); // opening/switching a clip ends our envelope: revert the pose, back to stopped
     setInPreview(false);
     lastAction.current = null;
     lastGroup.current = undefined;
@@ -319,6 +366,13 @@ export default function AnimationEditor() {
       const a: ClipAction = {
         _after: next,
         label: `animation ${group.split(':')[0]}`,
+        // Asset-document edit: it changes a .anim.json file, NOT any scene entity, so it must not
+        // bump the scene's edit-version. Its unsaved state is tracked by the dirty-asset registry
+        // (hasUnsavedChanges ORs both), and a falsely-dirty SCENE is not cosmetic — it self-blocks
+        // the file-direct agent routes, makes modoki_build refuse, and (since #259) makes Cmd+S
+        // interrupt a preview and rewrite the scene file on every save while authoring. The agent
+        // twins have set this since S2.27; the panels never did.
+        _isFileDirect: true,
         undo: () => { useEditorStore.getState().applyAnimationClip(path, before); poseLatest(before); },
         redo: () => { useEditorStore.getState().applyAnimationClip(path, a._after); poseLatest(a._after); },
       };
@@ -344,14 +398,14 @@ export default function AnimationEditor() {
     const clamped = Math.max(0, Math.min(cur?.duration ?? t, t));
     useEditorStore.getState().setPlayhead(clamped);
     useEditorStore.getState().setPreviewPlaying(false);
+    // Claim the run-mode for THIS panel even when a session is already held, so the "exit to save"
+    // message names the Animation panel rather than whichever one opened the envelope first.
     enterScrubMode('animation'); // clip scrub is a silent pose — carry the global run-mode (shared with the Timeline panel)
     setInPreview(true);
-    // MANDATORY session: snapshot the authored world BEFORE the first pose of the envelope, so
-    // "⏹ Exit Preview" can revert it. Without this the scrub wrote authored traits with nothing
-    // to revert to, which is why saves stayed refused with no way out (plan Phase 3 / M1).
-    // Concurrent begins during a drag collapse to one snapshot (see beginTimelinePreviewSession).
-    if (!hasTimelinePreviewSession()) void beginTimelinePreviewSession().then(() => pose(cur, clamped));
-    else pose(cur, clamped);
+    // The MANDATORY session (snapshot the authored world BEFORE the envelope's first pose, so
+    // "⏹ Exit Preview" can revert it — plan Phase 3 / M1) now lives inside `pose`, which is the one
+    // place that writes a pose and therefore the one place that can guarantee it.
+    pose(cur, clamped);
   }, [pose]);
 
   const stepFrame = useCallback((dir: 1 | -1) => {
@@ -368,6 +422,27 @@ export default function AnimationEditor() {
     const target = nextKeyTime(cur.tracks, useEditorStore.getState().playheadTime, dir);
     if (target !== undefined) scrub(target);
   }, [scrub]);
+
+  // ── Cmd+S inside the envelope: hand the save a way to put the preview down and back up ──
+  // Registered only while WE are previewing, so the save never calls into a panel that has since
+  // exited. `resume` re-poses at the current playhead, and `pose` re-opens the session for it.
+  useEffect(() => {
+    if (!inPreview) return;
+    const mine: PreviewSaveHandler = {
+      owner: 'animation',
+      suspend: () => endAnimationPreview(true),
+      resume: () => {
+        const st = useEditorStore.getState();
+        setInPreview(true);
+        pose(st.editingAnimationClip, st.playheadTime);
+      },
+    };
+    setPreviewSaveHandler(mine);
+    // Guarded: this effect re-runs whenever `pose` changes (a rebind does that), and the OTHER
+    // panel registers from its own effect — an unconditional clear deletes whichever registration
+    // happens to be current, including one we do not own.
+    return () => clearPreviewSaveHandler(mine);
+  }, [inPreview, pose]);
 
   // ── Preview playback loop ──
   // Also inside the preview envelope: it poses authored traits every frame exactly like a scrub,

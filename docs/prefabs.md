@@ -385,9 +385,12 @@ shows there in normal mode too.
 - **It refuses while the run mode is not `stopped`** — the prefab twin of `saveScene`'s transience
   guard, and for the same reason doubled: it serializes out of the LIVE world, so a save during a
   scrub/preview envelope or during Play bakes a posed rig or a spawned prefab into the file, and
-  every scene instantiating it inherits them. Stop or ⏹ Exit Preview first. The guard lives inside
-  `savePrefabEdit`, not in its callers, so the agent op (`prefabAction:'edit-save'`) inherits it —
-  it had no such guard while the check sat in the Cmd+S handler alone.
+  every scene instantiating it inherits them. The guard lives inside `savePrefabEdit`, not in its
+  callers, so the agent op (`prefabAction:'edit-save'`) inherits it — it had no such guard while the
+  check sat in the Cmd+S handler alone. **Cmd+S does not need you to exit preview first**:
+  `runSaveAll` puts a live envelope down before saving and picks it back up after (docs/editor.md
+  § Animation Editor), so the guard is already satisfied by the time it runs. Stopping Play is still
+  on you, and the agent op refuses in every non-stopped mode.
   Parked ASSET docs still flush in that state, because a `.particle.json` the panel owns is
   authored data in every run mode — see [mcp-persistence.md](./mcp-persistence.md) § 5.
 - The breadcrumb **Back** button reloads the originating scene, which

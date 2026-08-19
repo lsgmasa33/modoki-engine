@@ -583,7 +583,10 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
     const before = store.editingSkinDef;
     const path = store.editingSkinAsset?.path;
     if (!before || !path) return;
-    pushAction({ label: `rig2d ${label}`, undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, next) });
+    // Asset-doc edit (.rig2d.json): parked in the dirty-asset registry, so it must NOT bump the
+    // scene edit-version — a falsely-dirty scene self-blocks the file-direct routes, makes
+    // modoki_build refuse, and makes Cmd+S interrupt a preview to save a scene nothing changed.
+    pushAction({ _isFileDirect: true, label: `rig2d ${label}`, undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, next) });
     store.applySkinDef(path, next);
   }, []);
 
@@ -812,7 +815,10 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
       const store = useEditorStore.getState();
       const path = store.editingSkinAsset?.path, after = store.editingSkinDef, before = mp.before;
       if (path && after && after !== before) {
-        pushAction({ label: 'rig2d move part', undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, after) });
+        // Asset-doc edit (.rig2d.json): parked in the dirty-asset registry, so it must NOT bump the
+        // scene edit-version — a falsely-dirty scene self-blocks the file-direct routes, makes
+        // modoki_build refuse, and makes Cmd+S interrupt a preview to save a scene nothing changed.
+        pushAction({ _isFileDirect: true, label: 'rig2d move part', undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, after) });
       }
       return;
     }
@@ -825,7 +831,10 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
       const path = store.editingSkinAsset?.path, after = store.editingSkinDef, before = pg.before;
       if (path && after && after !== before) {
         const label = pg.handle === 'rotate' ? 'rig2d rotate part' : 'rig2d move part';
-        pushAction({ label, undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, after) });
+        // Asset-doc edit (.rig2d.json): parked in the dirty-asset registry, so it must NOT bump the
+        // scene edit-version — a falsely-dirty scene self-blocks the file-direct routes, makes
+        // modoki_build refuse, and makes Cmd+S interrupt a preview to save a scene nothing changed.
+        pushAction({ _isFileDirect: true, label, undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, after) });
       }
       return;
     }
@@ -836,7 +845,10 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
         const store = useEditorStore.getState();
         const path = store.editingSkinAsset?.path, after = store.editingSkinDef, before = g.before;
         if (path && after && after !== before) {
-          pushAction({ label: 'rig2d transform bone', undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, after) });
+          // Asset-doc edit (.rig2d.json): parked in the dirty-asset registry, so it must NOT bump the
+          // scene edit-version — a falsely-dirty scene self-blocks the file-direct routes, makes
+          // modoki_build refuse, and makes Cmd+S interrupt a preview to save a scene nothing changed.
+          pushAction({ _isFileDirect: true, label: 'rig2d transform bone', undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, after) });
         }
       }
       return;
@@ -847,7 +859,10 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
       const store = useEditorStore.getState();
       const path = store.editingSkinAsset?.path, after = store.editingSkinDef;
       if (path && after && after !== before) {
-        pushAction({ label: 'rig2d paint weights', undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, after) });
+        // Asset-doc edit (.rig2d.json): parked in the dirty-asset registry, so it must NOT bump the
+        // scene edit-version — a falsely-dirty scene self-blocks the file-direct routes, makes
+        // modoki_build refuse, and makes Cmd+S interrupt a preview to save a scene nothing changed.
+        pushAction({ _isFileDirect: true, label: 'rig2d paint weights', undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, after) });
       }
     }
   }, [draw]);

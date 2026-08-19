@@ -16,6 +16,7 @@ import { invalidateMaterial } from '../../../runtime/loaders/meshTemplateCache';
 import { invalidateAnimSet, setAnimSet, type AnimSetClipDef } from '../../../runtime/loaders/animSetCache';
 import { clearSpriteMaterialCache } from '../../../runtime/loaders/spriteMaterialCache';
 import { fireDirtyListeners } from '../../../runtime/core/ecs/entityUtils';
+import { useEditorStore } from '../../store/editorStore';
 
 export const clampNum = (v: number, min?: number, max?: number) => {
   let r = v;
@@ -26,15 +27,58 @@ export const clampNum = (v: number, min?: number, max?: number) => {
 
 const _assetViewSetters = new Map<string, (data: any) => void>();
 
+/** A write that did not land must SAY SO. The Inspector's asset edits are the last place in the
+ *  editor where a rejected write was silent: the response was never inspected and a rejection was
+ *  never caught, while the cache invalidation and the panel refresh ran regardless — so a failed
+ *  write left the editor confidently showing a value the file does not have, and the only trace
+ *  was an unhandled promise rejection nobody reads. Same class as the save toasts that were fixed
+ *  for scenes and prefabs (C7): never report a save that did not happen.
+ *
+ *  It reports rather than REVERTS, deliberately. The edited value is still live and still correct
+ *  as an intention; snapping the Inspector back to the old value would destroy the human's work to
+ *  resolve a failure that is usually transient (permissions, a full disk, the backend restarting),
+ *  and the next edit to the same asset rewrites the whole file — so editing again IS the retry.
+ *  Same reasoning as `discardDirtyAssets`'s scope note: dropping the write is not dropping the edit. */
+function reportWriteFailed(path: string, detail: string): void {
+  console.error(
+    `[Inspector] FAILED to write ${path} — ${detail}. The editor is showing the edited value, but ` +
+    'the file on disk still holds the previous one. Edit the asset again to retry the write.',
+  );
+  useEditorStore.getState().showToast(
+    `Save FAILED for ${path.split('/').pop() ?? path} — the file on disk is unchanged (see console)`,
+    'warn',
+  );
+}
+
 /** Persist an asset-file edit + refresh the live panel for `path` if mounted.
  *  Pure of any React instance — safe to call from an undo/redo closure after the
  *  originating panel has unmounted. `invalidate` is a stable module-level fn
- *  (per asset type), so capturing it in the undo closure is unmount-safe too. */
-export function persistAssetEdit(path: string, updated: unknown, invalidate: (path: string, updated: any) => void) {
-  backendFetch('/api/write-file', {
+ *  (per asset type), so capturing it in the undo closure is unmount-safe too.
+ *
+ *  Returns the write's promise so a test can await it; every caller ignores it on purpose — an
+ *  undo closure must not have to await a disk write, which is what keeps this callable from one. */
+export function persistAssetEdit(
+  path: string, updated: unknown, invalidate: (path: string, updated: any) => void,
+): Promise<void> {
+  const write = backendFetch('/api/write-file', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path, content: JSON.stringify(updated, null, 2) }),
-  });
+  })
+    .then(async (res) => {
+      if (res.ok) return;
+      // Prefer the route's own message over a bare status — /api/write-file answers 403 for a path
+      // outside the asset roots, which is a different fix from a 500.
+      let detail = `HTTP ${res.status}`;
+      try {
+        const body = await res.json() as { error?: unknown } | null;
+        if (typeof body?.error === 'string' && body.error) detail = body.error;
+      } catch { /* non-JSON body — the status is all there is */ }
+      reportWriteFailed(path, detail);
+    })
+    .catch((e) => reportWriteFailed(path, e instanceof Error ? e.message : String(e)));
+  // The cache + panel update OPTIMISTICALLY, before the write is known to have landed. That order
+  // is what makes the live viewport reflect an Inspector edit immediately; the failure path above
+  // is what stops it from being a LIE when the write does not land.
   invalidate(path, updated);
   _assetViewSetters.get(path)?.(updated); // refresh the mounted panel, if any
   // Wake the 3D viewport's idle dirty-gate. The Inspector saves via /api/write-file,
@@ -44,6 +88,7 @@ export function persistAssetEdit(path: string, updated: unknown, invalidate: (pa
   // dirty signal (the same one gizmo/trait writes use) draws for the grace window, long
   // enough for the async material re-fetch to land and syncMaterial to re-apply it live.
   fireDirtyListeners();
+  return write;
 }
 
 /** Register `setData` as the live refresher for `path` while the view is mounted. */

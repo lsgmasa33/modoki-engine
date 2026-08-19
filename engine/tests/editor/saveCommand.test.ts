@@ -13,7 +13,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { toastForSave, type SaveOutcome } from '@modoki/engine/editor';
+import { toastForSave, sceneNeedsWriting, type SaveOutcome } from '@modoki/engine/editor';
 
 const noAssets = { saved: [], failed: [] };
 const scene = (o: Partial<SaveOutcome> & { scene: SaveOutcome['scene'] }): SaveOutcome =>
@@ -143,5 +143,76 @@ describe('toastForSave — a failed asset write is never styled as benign', () =
   it('a clean cancel is still INFO — the downgrade must be caused by the failure, not by the branch', () => {
     const t = toastForSave(scene({ scene: { saved: false, path: null, reason: 'cancelled' } }));
     expect(t.kind).toBe('info');
+  });
+});
+
+
+/** Cmd+S inside a preview envelope: exit → save → resume (owner's call, 2026-08-19). Interrupting
+ *  the preview is only worth it when the scene actually has something to write — otherwise every
+ *  save while animating would reload the world and rewrite the scene file for no content. */
+describe('sceneNeedsWriting — whether a save is worth interrupting a preview for', () => {
+  it('is false while only ASSET docs are dirty (authoring a clip touches no scene)', () => {
+    expect(sceneNeedsWriting({ sceneDirty: false, dirtyScenes: [] })).toBe(false);
+  });
+
+  it('is true when the live world has unsaved scene edits', () => {
+    expect(sceneNeedsWriting({ sceneDirty: true, dirtyScenes: [] })).toBe(true);
+  });
+
+  it('counts a dirty BASE scene — skipping the scene half would strand it', () => {
+    // saveAll writes dirty bases after the primary; treating "the primary is clean" as "nothing to
+    // write" would leave a base edit in memory only, which is the failure the #259 flush had.
+    expect(sceneNeedsWriting({ sceneDirty: false, dirtyScenes: ['/assets/scenes/base.json'] })).toBe(true);
+  });
+});
+
+describe('toastForSave — the assets-only save (preview held, scene clean)', () => {
+  it('reports just the assets, with no warning about a scene nobody asked to save', () => {
+    const t = toastForSave({ assets: { saved: ['/a.anim.json'], failed: [] }, target: 'assets' });
+    expect(t.kind).toBe('success');
+    expect(t.text).toBe('1 asset saved');
+    expect(t.text).not.toMatch(/SCENE/i);
+  });
+
+  it('says so when there was nothing to save at all', () => {
+    const t = toastForSave({ assets: { saved: [], failed: [] }, target: 'assets' });
+    expect(t.kind).toBe('info');
+    expect(t.text).toMatch(/nothing to save/i);
+  });
+
+  it('still surfaces a FAILED asset write on this path', () => {
+    const t = toastForSave({ assets: { saved: [], failed: [{ path: '/a.anim.json', error: 'disk full' }] }, target: 'assets' });
+    expect(t.kind).toBe('warn');
+    expect(t.text).toContain('/a.anim.json');
+  });
+});
+
+
+/** A save must never destroy work to make itself possible. Exiting a preview restores the snapshot
+ *  taken when it began, so if the scene was edited INSIDE the envelope, cycling it for the save
+ *  would revert those edits and then write the pre-edit world — reporting success. Measured while
+ *  building the cycle: a set_transform made during a scrub was silently reverted that way. */
+describe('toastForSave — a preview that holds authored scene edits', () => {
+  it('names the edits, not "exit preview" — that advice would revert them', () => {
+    const t = toastForSave(scene({
+      assets: { saved: ['/a.anim.json'], failed: [] },
+      scene: { saved: false, path: '/s.json', reason: 'playing' },
+      mode: { runMode: 'scrub', owner: 'animation' },
+      previewHoldsEdits: true,
+    }));
+    expect(t.kind).toBe('warn');
+    expect(t.text).toMatch(/CHANGED while previewing/);
+    expect(t.text).toMatch(/reverts those changes/);
+    expect(t.text).not.toMatch(/⏹/);          // not the plain "press Exit Preview" advice
+    expect(t.text).toContain('1 asset saved'); // the clip still saved, and still says so
+  });
+
+  it('falls back to the plain exit advice when the envelope holds no scene edits', () => {
+    const t = toastForSave(scene({
+      scene: { saved: false, path: '/s.json', reason: 'playing' },
+      mode: { runMode: 'scrub', owner: 'animation' },
+    }));
+    expect(t.text).toContain('⏹ Exit Preview');
+    expect(t.text).not.toMatch(/CHANGED while previewing/);
   });
 });

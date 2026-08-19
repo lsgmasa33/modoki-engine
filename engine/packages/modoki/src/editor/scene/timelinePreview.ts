@@ -26,15 +26,93 @@ import { setTimelinePreviewActive } from '../../runtime/core/timelinePreview';
 import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
 import { clearControlSpawns } from '../../runtime/timeline/controlSpawnRegistry';
 import { serializeScene, getCurrentScenePath, type SceneFile } from './serialize';
+import { getEditVersion } from '../undo/undoManager';
 
 /** Authored-world snapshot captured at the first ▶ of a preview session, plus the scene path it
  *  belongs to (so a scene swap mid-preview can't revert the wrong scene). */
 let _snap: SceneFile | null = null;
 let _snapPath: string | null = null;
+/** The scene edit-version when the snapshot was taken, so `previewHasAuthoredEdits` can tell an
+ *  authored change made INSIDE the envelope from one that predates it. */
+let _snapEditVersion = 0;
 /** In-flight `begin`, so concurrent openers share ONE snapshot — see beginTimelinePreviewSession. */
 let _pending: Promise<void> | null = null;
+/** Bumped by every session END, so a `begin` that was already awaiting cannot seat its snapshot
+ *  after the envelope it belonged to was exited. */
+let _beginEpoch = 0;
 
 export { setTimelinePreviewActive };
+
+/** How Cmd+S puts a preview envelope down and picks it back up (#259 follow-up).
+ *
+ *  A SCENE save has to write authored data, and inside the envelope the live world holds a pose —
+ *  so the save used to be refused with "exit preview first". Owner's call (2026-08-19): don't
+ *  refuse, and don't just exit either; **exit, save, then put the preview back where it was**, so
+ *  Cmd+S always works and an animator keeps their frame. The cost is a world reload behind the
+ *  scenes, which is why the scene half is skipped entirely when the scene has nothing to write —
+ *  otherwise every save while animating would churn the scene file and flicker the viewport for no
+ *  reason.
+ *
+ *  The panel that owns the envelope registers this, because only it knows what to rebind to and
+ *  where its playhead is. `suspend` MUST resolve after the world has actually been restored — the
+ *  save serializes immediately afterwards, and a fire-and-forget restore would let it serialize the
+ *  posed world, which is the exact bug this exists to prevent. */
+export interface PreviewSaveHandler {
+  /** WHICH panel this belongs to — the identity that survives a re-registration. */
+  owner: 'animation' | 'timeline';
+  /** End the envelope, restoring the authored world (and rebinding this panel's root). */
+  suspend(): Promise<void>;
+  /** Re-open the envelope and re-pose at the panel's current playhead. */
+  resume(): void;
+}
+
+let _saveHandler: PreviewSaveHandler | null = null;
+
+/** Register the owner panel's save hooks. */
+export function setPreviewSaveHandler(h: PreviewSaveHandler): void { _saveHandler = h; }
+
+/** Clear them — but ONLY if `mine` is still the registered handler.
+ *
+ *  ⚠️ Unconditional clearing is how one panel deletes another's registration. Both panels register
+ *  in an effect and both clean up in its teardown, and their effects re-run on unrelated deps (a
+ *  world swap re-resolves the Timeline panel's Director root, for instance) — so an unguarded
+ *  `setPreviewSaveHandler(null)` from the panel that does NOT own the envelope silently disables
+ *  the feature for the one that does. Same lesson as `_modeOwner` in playMode.ts. */
+export function clearPreviewSaveHandler(mine: PreviewSaveHandler): void {
+  if (_saveHandler === mine) _saveHandler = null;
+}
+
+/** The owner panel's save hooks, or null when nothing owns an envelope. */
+export function getPreviewSaveHandler(): PreviewSaveHandler | null { return _saveHandler; }
+
+/** The CURRENT handler for `owner`, or null if that panel no longer owns the envelope.
+ *
+ *  ⚠️ This is why the handler carries an owner tag instead of being compared by object identity.
+ *  `suspend()` restores the world, which reassigns entity ids, which makes the panel re-resolve its
+ *  root — so its callbacks, and therefore its handler object, are REPLACED during the very save
+ *  that is about to resume it. An identity check (the first version of this) therefore failed on
+ *  every normal cycle and silently skipped the resume: the animator's frame vanished and the toast
+ *  said "Scene saved". Resuming through the CURRENT handler is also what makes the resume use the
+ *  freshly-rebound root rather than the dead one. */
+export function currentPreviewSaveHandlerFor(owner: PreviewSaveHandler['owner']): PreviewSaveHandler | null {
+  return _saveHandler?.owner === owner ? _saveHandler : null;
+}
+
+/** Has the authored world been EDITED since this envelope opened?
+ *
+ *  Restoring the snapshot reverts the world to how it looked when the preview began — which
+ *  silently throws away anything authored since. That has always been true of ⏹ Exit; what makes it
+ *  worth detecting is that Cmd+S now ends the envelope by itself (see `PreviewSaveHandler`), and a
+ *  SAVE that destroys work is a different order of wrong from a button that says "poses revert on
+ *  exit". So when this is true the save does NOT cycle the preview — it refuses and says why,
+ *  leaving the human to decide. False (the common case: only the clip was touched) means the
+ *  snapshot still equals the authored world and cycling loses nothing.
+ *
+ *  Fixing the underlying hole — an authored edit made inside the envelope being revertible at all —
+ *  belongs to `docs/plans/preview-mode-refactor.md`, not here. */
+export function previewHasAuthoredEdits(): boolean {
+  return _snap !== null && getEditVersion() !== _snapEditVersion;
+}
 
 /** Is a preview session currently held (snapshot pending restore)? */
 export function hasTimelinePreviewSession(): boolean {
@@ -52,10 +130,19 @@ export function hasTimelinePreviewSession(): boolean {
 export async function beginTimelinePreviewSession(): Promise<void> {
   if (_snap) return;
   if (_pending) return _pending;
+  const epoch = _beginEpoch;
+  // ⚠️ Sample the edit-version BEFORE the await, not after. `serializeScene()` is async, and an
+  // authored edit landing during it may or may not be in `snap` — but folding its bump into the
+  // baseline unconditionally makes `previewHasAuthoredEdits()` answer FALSE, which is the unsafe
+  // direction: the save then cycles the envelope, restores a snapshot that predates the edit, and
+  // writes the pre-edit world reporting success. Sampling first can only over-report (refuse a save
+  // that would have been fine), which costs a keystroke instead of the edit.
+  const version = getEditVersion();
   _pending = (async () => {
     const snap = await serializeScene();
     const path = getCurrentScenePath();
-    if (!_snap) { _snap = snap; _snapPath = path; }
+    // Only seat it if no session end intervened (see endTimelinePreviewSession).
+    if (!_snap && epoch === _beginEpoch) { _snap = snap; _snapPath = path; _snapEditVersion = version; }
   })().finally(() => { _pending = null; });
   return _pending;
 }
@@ -67,6 +154,13 @@ export async function beginTimelinePreviewSession(): Promise<void> {
  *  because BOTH preview panels end sessions here and each resolves its own root. No-op restore
  *  when the scene changed since the snapshot. */
 export async function endTimelinePreviewSession(opts: { restore: boolean; rebind?: () => number | null }): Promise<number | null> {
+  // ⚠️ Invalidate any in-flight `begin` FIRST. `beginTimelinePreviewSession` seats its snapshot on
+  // `if (!_snap)` alone, so a begin still awaiting `serializeScene()` when the envelope is exited
+  // used to seat a session AFTERWARDS — and the pose chained onto it then ran with run-mode back at
+  // 'stopped', where the next save serializes the posed world into the scene file and says "Scene
+  // saved". Exiting during that window is not exotic: it is pressing ⏹ or switching clips within
+  // the tens of ms a real scene takes to serialize.
+  _beginEpoch += 1;
   setTimelinePreviewActive(false);
   clearSkeletalSeeks();
   clearControlSpawns(); // preview-spawned prefabs are discarded by the snapshot reload below

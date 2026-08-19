@@ -22,7 +22,10 @@ export default function SkinBoneList({ selBone, setSelBone }: { selBone: number;
     const before = store.editingSkinDef;
     const path = store.editingSkinAsset?.path;
     if (!before || !path || next === before) return;
-    pushAction({ label: `rig2d ${label}`, undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, next) });
+    // Asset-doc edit (.rig2d.json): parked in the dirty-asset registry, so it must NOT bump the
+    // scene edit-version — a falsely-dirty scene self-blocks the file-direct routes, makes
+    // modoki_build refuse, and makes Cmd+S interrupt a preview to save a scene nothing changed.
+    pushAction({ _isFileDirect: true, label: `rig2d ${label}`, undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, next) });
     store.applySkinDef(path, next);
   }, []);
 

@@ -16,7 +16,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTestWorld, type TestWorld, setPlayState, registerAsset } from '@modoki/engine/runtime';
 import {
   clearHistory, clearDirtyAssets, getDirtyAssetPaths, markAssetDirty, saveAll,
-  setCurrentScenePath, markSceneSaved, hasUnsavedChanges,
+  setCurrentScenePath, markSceneSaved, hasUnsavedChanges, getLastFlushedAsset,
 } from '@modoki/engine/editor';
 import { enterScrubMode, exitPreviewMode } from '../../packages/modoki/src/editor/scene/playMode';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -160,5 +160,52 @@ describe('a panel write is a FULL-DOCUMENT write; an agent write is not — Risk
     await saveAll({ allowDialog: false });
 
     expect(assetWrites()[0].body.selfWrite).toBe(true);
+  });
+});
+
+
+/** `lastFlushed` is what a panel adopts as "this is on disk now". Both of its documented
+ *  properties were unguarded until an independent review mutated them and watched every test stay
+ *  green — and getting either wrong re-creates the bug the whole change exists to fix: a baseline
+ *  that names a doc the file does not have, so a later revert to it parks nothing and the editor
+ *  reports clean over an unsaveable edit. */
+describe('what the registry records as written', () => {
+  it('records the doc it WROTE, not whatever is parked by the time the loop ends', async () => {
+    setCurrentScenePath('/assets/scenes/lf1.scene.json');
+    markSceneSaved();
+    const written = { version: 1, duration: 1 };
+    markAssetDirty(PARTICLE, 'particle', written, 'panel');
+
+    // A newer edit lands DURING the write — the flush must still record what it actually sent.
+    const superseding = { version: 1, duration: 2 };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (init?.body) writes.push({ url, body: JSON.parse(init.body as string) as Record<string, unknown> });
+      if (url.includes('/api/asset-write')) markAssetDirty(PARTICLE, 'particle', superseding, 'panel');
+      return { ok: true, json: async () => ({ ok: true }) } as unknown as Response;
+    }));
+
+    await saveAll({ allowDialog: false });
+
+    expect(getLastFlushedAsset(PARTICLE)).toBe(written);
+    expect(getDirtyAssetPaths()).toEqual([PARTICLE]);      // the newer edit survived
+  });
+
+  it('records NOTHING for a write that failed', async () => {
+    // Advancing on a failed write hands the panel a baseline the file does not have — the editor
+    // then calls itself clean over an edit that never reached disk.
+    setCurrentScenePath('/assets/scenes/lf2.scene.json');
+    markSceneSaved();
+    markAssetDirty(PARTICLE, 'particle', { version: 1 }, 'panel');
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/asset-write')) return { ok: false, json: async () => ({ ok: false, error: 'disk full' }) } as unknown as Response;
+      return { ok: true, json: async () => ({ ok: true }) } as unknown as Response;
+    }));
+
+    await saveAll({ allowDialog: false });
+
+    expect(getLastFlushedAsset(PARTICLE)).toBeNull();
+    expect(getDirtyAssetPaths()).toEqual([PARTICLE]);      // still pending, as it must be
   });
 });

@@ -18,10 +18,22 @@
  *  load effect (which is declared above this hook, hence the ref dance in each panel) records the
  *  just-loaded document as already-persisted. Every later value — a field edit, an undo, a redo,
  *  all of which rewrite the store's def — differs from it and parks.
+ *
+ *  ⚠️ **That baseline has to ADVANCE when a save writes the parked doc, or undo breaks.** The
+ *  comparison is by identity, so while the baseline named the doc the panel OPENED, undoing back to
+ *  that value after a save compared equal and parked nothing: the panel showed the reverted doc, the
+ *  file kept the saved one, `unsavedChanges` read false, and Cmd+S was a no-op — the revert could
+ *  not be saved at all. Reported by the owner (2026-08-19) on a moved keyframe, which is the most
+ *  ordinary undo there is: "undo what I just did", right after saving it. The debounced autosave
+ *  this hook replaced advanced its own baseline on every successful write; parking moved the write
+ *  into the registry, so the advance now comes from there (`getLastFlushedAsset`).
  */
 
 import { useCallback, useEffect, useRef, useSyncExternalStore } from 'react';
-import { markAssetDirty, subscribeDirtyAssets, isAssetDirty } from '../scene/dirtyAssets';
+import {
+  markAssetDirty, subscribeDirtyAssets, isAssetDirty, getLastFlushedAsset, peekDirtyAsset,
+  discardDirtyAssets,
+} from '../scene/dirtyAssets';
 import type { AssetSchemaType } from '../../runtime/assets/assetSchemas';
 
 /**
@@ -36,12 +48,56 @@ export function useParkedAssetDoc<T>(
   type: AssetSchemaType,
 ): { markSaved: (value: T) => void; dirty: boolean } {
   const savedRef = useRef<T | null>(null);
+  /** The exact doc this panel last handed to the registry — the thing a flush would have written. */
+  const parkedRef = useRef<T | null>(null);
   const markSaved = useCallback((v: T) => { savedRef.current = v; }, []);
 
   useEffect(() => {
-    if (value == null || value === savedRef.current || !path) return; // nothing to park
+    if (value == null || !path) return;
+    if (value === savedRef.current) {
+      // ⚠️ Back to what is on disk — so there is nothing to save, and any park of OURS must go.
+      // Early-returning without dropping it is the mirror of the bug that started this: undo a
+      // keyframe with no save in between and the registry still holds the un-done edit, so the
+      // panel shows the reverted clip, the indicator says Unsaved, and Cmd+S writes the value the
+      // human just undid — reporting success. (The agent twin has always done this reconciliation:
+      // `pushAssetUndo` re-parks `before` when a write was pending and DISCARDS otherwise.)
+      //
+      // Only ours: compared by identity against what we parked, so an agent's park for the same
+      // path — which we did not make and cannot judge — survives.
+      if (parkedRef.current !== null && peekDirtyAsset(path)?.data === parkedRef.current) {
+        discardDirtyAssets([path]);
+      }
+      parkedRef.current = null;
+      return;
+    }
+    // Already parked, by whoever put this exact object there. An agent op (`particle_set`,
+    // `anim_set_clip`, …) applies its def through the same store action the panel reads, so the
+    // panel's `value` becomes the agent's object — and re-parking it here would relabel an AGENT
+    // write as `'panel'`, which sends `replace:true` at flush and DELETES top-level fields the
+    // drop-key guard exists to refuse. The same call would then be guarded or not depending on
+    // whether a panel happened to be open on that asset.
+    if (peekDirtyAsset(path)?.data === value) { parkedRef.current = value; return; }
+    parkedRef.current = value;
     markAssetDirty(path, type, value, 'panel');
   }, [value, path, type]);
+
+  // A save wrote OUR parked doc → that doc is the file now, so it becomes the baseline.
+  //
+  // Matched by IDENTITY against what this panel parked, not merely by "the path was written". Two
+  // cases depend on the difference: a panel that opens on an already-flushed asset must not adopt a
+  // stale doc and dirty itself on open, and an edit made while a save was in flight must keep its
+  // OWN park (the flush wrote the older doc, so the newer one is still unsaved and must stay so).
+  const flushed = useSyncExternalStore(
+    subscribeDirtyAssets,
+    useCallback(() => getLastFlushedAsset(path), [path]),
+    useCallback(() => getLastFlushedAsset(path), [path]),
+  );
+  useEffect(() => {
+    if (flushed != null && flushed === parkedRef.current) {
+      savedRef.current = parkedRef.current;
+      parkedRef.current = null;
+    }
+  }, [flushed]);
 
   // Subscribed, not read plainly: a save empties the registry without touching any panel state, so
   // a bare read would leave the indicator on "Unsaved" over a file that is on disk — stale in the

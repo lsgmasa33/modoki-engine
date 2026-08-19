@@ -31,6 +31,7 @@ export function AnimSetAssetView({ path }: { path: string }) {
     if (!old || !updated) return;
     persistAssetEdit(path, updated, invalidateAnimSetFile);
     pushAction({
+      _isFileDirect: true, // already on disk (persistAssetEdit) — see MaterialAssetView for why
       label,
       undo: () => persistAssetEdit(path, old, invalidateAnimSetFile),
       redo: () => persistAssetEdit(path, updated, invalidateAnimSetFile),

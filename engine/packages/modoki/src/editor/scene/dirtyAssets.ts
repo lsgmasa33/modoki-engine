@@ -54,6 +54,28 @@ const dirty = new Map<string, DirtyAsset>();
 // useSyncExternalStore (same shape as EditorApp's extra-menus store).
 let _version = 0;
 const listeners = new Set<() => void>();
+
+/** The doc most recently WRITTEN to each path by a flush — i.e. what the file holds, as far as the
+ *  editor knows. Identity is the signal: it stays the same object until the next flush of that
+ *  path, so a panel can use it as a `useSyncExternalStore` snapshot.
+ *
+ *  WHY IT EXISTS. A panel skips parking when its document is identity-equal to the one it knows is
+ *  on disk, and that baseline was seeded ONLY at load — so after a save it still named the doc the
+ *  panel had OPENED. Undo back to that value therefore looked "already saved", parked nothing, and
+ *  the revert lived in memory that no save could reach while the editor reported clean. Measured on
+ *  `games/3d-test` (owner, 2026-08-19): a keyframe moved from t=1.05 to t=1.0944 and saved, then
+ *  undone — the panel showed 1.05, the file held 1.0944, `dirtyAssetPaths` was empty, and Cmd+S was
+ *  a no-op. The debounced autosave this replaced advanced its own baseline on every successful
+ *  write; parking moved the write here, so the advance has to come from here too. */
+const lastFlushed = new Map<string, unknown>();
+
+/** What the last flush wrote for `path`, or null if this session has never written it. A panel
+ *  adopts it as its saved-baseline ONLY when it is the very doc that panel parked (see
+ *  `useParkedAssetDoc`) — never merely because the path was written, which would let one panel's
+ *  save re-baseline another's unsaved edit. */
+export function getLastFlushedAsset(path: string | undefined): unknown | null {
+  return path ? lastFlushed.get(path) ?? null : null;
+}
 function bump(): void { _version += 1; for (const fn of listeners) fn(); }
 /** Subscribe to registry changes (park / flush / discard). Returns an unsubscribe. */
 export function subscribeDirtyAssets(fn: () => void): () => void {
@@ -131,7 +153,7 @@ export function assetWrittenToDisk(path: string): boolean {
 }
 
 /** Test-only: drop every pending entry without writing it. */
-export function clearDirtyAssets(): void { dirty.clear(); bump(); }
+export function clearDirtyAssets(): void { dirty.clear(); lastFlushed.clear(); bump(); }
 
 /** Drop pending asset writes WITHOUT writing them — the missing counterpart to `flushDirtyAssets`.
  *
@@ -194,7 +216,11 @@ export interface FlushResult {
 export async function flushDirtyAssets(): Promise<FlushResult> {
   const saved: string[] = [];
   const failed: Array<{ path: string; error: string }> = [];
-  for (const [path, { type, data, origin }] of dirty) {
+  /** path → the exact entry object we wrote, so the cleanup below can tell it apart from one that
+   *  superseded it mid-flush. */
+  const written = new Map<string, DirtyAsset>();
+  for (const [path, entry] of dirty) {
+    const { type, data, origin } = entry;
     try {
       const res = await backendFetch('/api/asset-write', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -212,11 +238,21 @@ export async function flushDirtyAssets(): Promise<FlushResult> {
         continue;
       }
       saved.push(path);
+      written.set(path, entry);
     } catch (e) {
       failed.push({ path, error: e instanceof Error ? e.message : String(e) });
     }
   }
-  for (const path of saved) dirty.delete(path);
-  if (saved.length) bump();
+  for (const [path, entry] of written) {
+    // ⚠️ Delete ONLY the entry we actually wrote. Each write above is an `await`, and an edit
+    // landing in that window REPLACES the entry — a blind `dirty.delete(path)` then drops the
+    // human's newer doc, which is on screen, is not on disk, and no longer counts as unsaved. The
+    // window is short (one HTTP round trip) and it is exactly the "keep dragging after Cmd+S" case.
+    if (dirty.get(path) === entry) dirty.delete(path);
+    // Record what the FILE now holds — `entry.data`, not whatever is parked now, for the same
+    // reason. See `lastFlushed`.
+    lastFlushed.set(path, entry.data);
+  }
+  if (written.size) bump();
   return { saved, failed };
 }

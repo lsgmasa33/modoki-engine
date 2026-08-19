@@ -23,6 +23,7 @@ import { advanceClipTime } from '../../runtime/animation/sampleClip';
 import { previewTimelineAt, previewTimelineStep, previewControlAt, clearPreviewControls } from '../../runtime/timeline/timelineSystem';
 import {
   beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession, setTimelinePreviewActive,
+  setPreviewSaveHandler, clearPreviewSaveHandler, type PreviewSaveHandler,
 } from '../scene/timelinePreview';
 import { enterScrubMode, enterPreviewMode, exitPreviewMode } from '../scene/playMode';
 import { getRunMode, isAdvancing, onRunModeChange } from '../../runtime/core/playState';
@@ -125,8 +126,19 @@ export default function TimelineEditor() {
   }, []);
 
   // ── Pose the bound subtree at time t (state + keyframe sample), then repaint. ──
-  const pose = useCallback((d: TimelineDef | null, t: number) => {
+  /** Never call directly — go through `pose`, which guarantees the preview envelope is open. */
+  const applyPose = useCallback((d: TimelineDef | null, t: number) => {
     if (!d || rootId == null) return;
+    // The invariant, asserted where the damage would happen — the twin of AnimationEditor's. A pose
+    // with no session held is unrevertible AND unguarded (run-mode reads 'stopped', so a save bakes
+    // it), and this one is the worse of the two: `previewControlAt` SPAWNS control-track prefabs.
+    if (!hasTimelinePreviewSession()) {
+      console.error(
+        '[TimelineEditor] refused to pose with no preview session held — the pose would be ' +
+        'unrevertible and a scene save would bake it. Every pose must go through `pose`.',
+      );
+      return;
+    }
     try {
       previewTimelineAt(getCurrentWorld(), rootId, d, t);
       previewControlAt(getCurrentWorld(), rootId, d, t); // control-track prefab presence (span containment)
@@ -135,6 +147,20 @@ export default function TimelineEditor() {
       console.debug('[TimelineEditor] pose failed (world not ready)', e);
     }
   }, [rootId]);
+
+  /** Pose INSIDE the preview envelope, opening it first if it is not held.
+   *
+   *  ⚠️ Same fix as `AnimationEditor.pose`, same reason: `commit()` re-poses on every timeline edit
+   *  and did NOT open the envelope, so dragging a clip posed the world (and spawned control-track
+   *  prefabs) while `getRunMode()` still read `'stopped'` — and a save then baked it over the
+   *  authored scene, with the transience guard passing. Found sweeping for siblings of the
+   *  Animation-panel instance, which cost the owner real data first. */
+  const pose = useCallback((d: TimelineDef | null, t: number) => {
+    if (!d || rootId == null) return;
+    if (hasTimelinePreviewSession()) { applyPose(d, t); return; }
+    enterScrubMode('timeline');
+    void beginTimelinePreviewSession().then(() => applyPose(d, t));
+  }, [rootId, applyPose]);
   const poseLatest = useCallback((d: TimelineDef) => pose(d, useEditorStore.getState().playheadTime), [pose]);
 
   // ── Load the doc when the open target changes ──
@@ -210,6 +236,13 @@ export default function TimelineEditor() {
       const a: TLAction = {
         _after: next,
         label: `timeline ${group.split(':')[0]}`,
+        // Asset-document edit: it changes a .timeline.json file, NOT any scene entity, so it must not
+        // bump the scene's edit-version. Its unsaved state is tracked by the dirty-asset registry
+        // (hasUnsavedChanges ORs both), and a falsely-dirty SCENE is not cosmetic — it self-blocks
+        // the file-direct agent routes, makes modoki_build refuse, and (since #259) makes Cmd+S
+        // interrupt a preview and rewrite the scene file on every save while authoring. The agent
+        // twins have set this since S2.27; the panels never did.
+        _isFileDirect: true,
         undo: () => { useEditorStore.getState().applyTimelineDoc(path, before); poseLatest(before); },
         redo: () => { useEditorStore.getState().applyTimelineDoc(path, a._after); poseLatest(a._after); },
       };
@@ -335,17 +368,46 @@ export default function TimelineEditor() {
   // ── Exit the preview envelope: revert to the authored snapshot (discards scrub poses + forward-
   //    preview mutations + control spawns), rebind, and return to stopped. The explicit way out of
   //    preview mode (option #2), and the real fix for the scrub save-wedge. ──
-  const exitPreview = useCallback(() => {
+  /** Returns a promise resolving once the world is actually restored — Cmd+S awaits it and
+   *  serializes immediately after, so a fire-and-forget restore would let the save write the POSED
+   *  world. (The ⏹ button ignores the promise; only the save path needs it.) */
+  const exitPreview = useCallback((): Promise<void> => {
     const store = useEditorStore.getState();
     stopPreviewLoop(); // stop the loop + close gates synchronously (C7)
     store.setPreviewPlaying(false);
     clearPreviewControls();
     const path = store.editingTimelineAsset?.path;
-    void endTimelinePreviewSession({ restore: true, rebind: () => (path ? resolveDirectorRootForTimeline(path) : null) }).then((newRoot) => {
+    const done = endTimelinePreviewSession({ restore: true, rebind: () => (path ? resolveDirectorRootForTimeline(path) : null) }).then((newRoot) => {
       if (newRoot != null) useEditorStore.getState().setDirectorRoot(newRoot);
     });
     exitPreviewMode('timeline');
+    return done;
   }, [stopPreviewLoop]);
+
+  // ── Cmd+S inside the envelope: exit → save → resume at the same playhead (see PreviewSaveHandler) ──
+  // Registered only while a session is actually held, so the save never calls a panel that already
+  // exited — and the Animation panel's handler wins whenever IT owns the envelope, since whichever
+  // panel opened one registered last.
+  useEffect(() => {
+    // ⚠️ `runMode` here is the REACTIVE one (subscribed above), not `getRunMode()`. Reading it
+    // imperatively meant this effect had no dep that changed when a plain ruler scrub opened the
+    // envelope — so it never re-ran, the handler was never registered, and Cmd+S fell through to
+    // the flat refusal ("exit scrub to save") on a clean scene: exactly the non-event warning the
+    // assets-only branch exists to remove. The Animation panel worked only because its own dep
+    // happens to be a `useState` that the scrub sets.
+    if (!playing && runMode === 'stopped') return;
+    const mine: PreviewSaveHandler = {
+      owner: 'timeline',
+      suspend: () => exitPreview(),
+      resume: () => {
+        const st = useEditorStore.getState();
+        enterScrubMode('timeline');
+        void beginTimelinePreviewSession().then(() => poseAt(st.playheadTime));
+      },
+    };
+    setPreviewSaveHandler(mine);
+    return () => clearPreviewSaveHandler(mine);
+  }, [playing, runMode, exitPreview, poseAt]);
 
   // ── Preview playback loop ──
   // ── ▶ Preview: a real FORWARD playthrough — poses (keyframe + skeletal seek + activation) AND

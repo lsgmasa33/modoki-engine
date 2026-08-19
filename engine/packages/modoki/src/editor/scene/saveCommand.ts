@@ -13,17 +13,23 @@
  *  `toastForSave` is pure over `SaveOutcome` — it reads no globals, so the run-mode context it
  *  needs is captured INTO the outcome by `runSaveAll` rather than sampled later. */
 
-import { saveAll, type SaveResult } from './serialize';
+import { saveAll, unsavedChangeCauses, type SaveResult } from './serialize';
 import { flushDirtyAssets, type FlushResult } from './dirtyAssets';
 import { isEditingPrefab, savePrefabEdit } from './prefabEdit';
 import { getRunMode, canEdit, type RunMode } from '../../runtime/core/playState';
+import {
+  hasTimelinePreviewSession, getPreviewSaveHandler, previewHasAuthoredEdits,
+  currentPreviewSaveHandlerFor,
+} from './timelinePreview';
 import { getModeOwner } from './playMode';
 
 export interface SaveOutcome {
   /** Parked asset docs written by this save. ALWAYS attempted, whatever the scene half does. */
   assets: FlushResult;
-  /** Which half the scene-shaped save targeted. */
-  target: 'scene' | 'prefab';
+  /** Which half the scene-shaped save targeted. `'assets'` = only parked asset docs were written:
+   *  a preview envelope was open and the scene had nothing to write, so interrupting the preview
+   *  would have bought churn and a flicker for no content. */
+  target: 'scene' | 'prefab' | 'assets';
   /** `target:'scene'` — the full scene result (absent for a prefab save). */
   scene?: SaveResult;
   /** `target:'prefab'` — did the prefab write land? */
@@ -33,6 +39,27 @@ export interface SaveOutcome {
   prefabRefused?: boolean;
   /** Run mode + the panel owning it, captured at the moment a scene save was refused for it. */
   mode?: { runMode: RunMode; owner: string | null };
+  /** The preview envelope was put down for this save and picked back up afterwards. */
+  previewCycled?: boolean;
+  /** …and whether the pick-back-up actually happened. False when the owning panel closed or handed
+   *  the envelope over mid-save: the save is fine, but the human's preview is gone and only the
+   *  toast can tell them. */
+  previewResumed?: boolean;
+  /** The envelope was NOT cycled because the scene was edited inside it — exiting would have
+   *  reverted those edits, and a save must not destroy work to make itself possible. */
+  previewHoldsEdits?: boolean;
+}
+
+/** Does the SCENE half of a save have anything to write? Used only to decide whether a save is
+ *  worth interrupting a preview for — see `runSaveAll`. Pure over the unsaved-work causes, so the
+ *  decision is testable without an editor.
+ *
+ *  `dirtyScenes` counts too: `saveAll` writes dirty BASE scenes after the primary, and skipping the
+ *  scene half would strand them exactly the way the pre-#259 flush was stranded. */
+export function sceneNeedsWriting(
+  causes: { sceneDirty: boolean; dirtyScenes: string[] } = unsavedChangeCauses(),
+): boolean {
+  return causes.sceneDirty || causes.dirtyScenes.length > 0;
 }
 
 /**
@@ -44,7 +71,69 @@ export interface SaveOutcome {
  * on either would mean a human pressing Cmd+S in those states and having no way to save what they
  * just authored.
  */
-export async function runSaveAll(): Promise<SaveOutcome> {
+/** One save at a time. Both Cmd+S entry points are `void runSaveAll()`, so a second press during a
+ *  cycle started a second save while the first was mid-suspend — a window where the session is
+ *  already cleared and run-mode already 'stopped' while the world is still POSED, so the second
+ *  save takes the no-preview path and serializes the pose. Coalescing onto the in-flight promise
+ *  also stops two toasts claiming one write. */
+let _inFlight: Promise<SaveOutcome> | null = null;
+
+export function runSaveAll(): Promise<SaveOutcome> {
+  if (_inFlight) return _inFlight;
+  _inFlight = runSaveAllOnce().finally(() => { _inFlight = null; });
+  return _inFlight;
+}
+
+async function runSaveAllOnce(): Promise<SaveOutcome> {
+  // ── Inside a preview envelope: put it down, save, pick it back up ──
+  // A scene/prefab write must contain AUTHORED data, and the envelope's whole point is that the
+  // live world is posed. Refusing was the old answer and it cost two keystrokes every time; simply
+  // exiting would snap the animator's frame away. So the owner's call: exit → save → resume at the
+  // same playhead (`PreviewSaveHandler`).
+  //
+  // ⚠️ Only when the save actually needs a stopped world. A clip edit dirties no scene, so an
+  // unconditional cycle would reload the world and rewrite the scene file on EVERY Cmd+S while
+  // animating — a flicker plus real churn (the serializer reorders entities) in exchange for
+  // nothing. When there is nothing to write, the scene half is skipped instead and only the parked
+  // asset docs are flushed, which is the common case while authoring a clip.
+  const preview = hasTimelinePreviewSession() ? getPreviewSaveHandler() : null;
+  const needsAuthoredWorld = isEditingPrefab() || sceneNeedsWriting();
+  if (preview && !needsAuthoredWorld) {
+    return { assets: await flushDirtyAssets(), target: 'assets' };
+  }
+  if (preview && previewHasAuthoredEdits()) {
+    // ⚠️ DO NOT cycle here. Exiting restores the snapshot taken when the preview began, which would
+    // revert every authored change made since — and this path is reached by pressing SAVE. A save
+    // that silently destroys work to make itself possible is worse than the refusal it replaced, so
+    // fall through to the normal refusal and let the toast say what is actually in the way.
+    // (Measured while building this: a set_transform made during a scrub was reverted and the
+    // pre-edit world written, reporting success.)
+    const out = await runSaveTargets();
+    return { ...out, previewHoldsEdits: true };
+  }
+  if (preview) {
+    const owner = preview.owner;
+    try {
+      // MUST be awaited: the restore rebuilds the world, and the save serializes it a line later.
+      // Inside the try, because a restore that REJECTS (a failed scene load, a throwing rebind)
+      // otherwise leaves the world posed, the session cleared and run-mode 'stopped' — the state in
+      // which the NEXT Cmd+S bakes the pose and reports success — while the exception escapes into
+      // a `.then()` with no `.catch()`, so nothing is reported at all.
+      await preview.suspend();
+      const out = await runSaveTargets();
+      const resumed = currentPreviewSaveHandlerFor(owner);
+      resumed?.resume();
+      return { ...out, previewCycled: true, previewResumed: !!resumed };
+    } catch (e) {
+      currentPreviewSaveHandlerFor(owner)?.resume();
+      throw e;
+    }
+  }
+  return runSaveTargets();
+}
+
+/** The save itself, with the world already in whatever state it should be written from. */
+async function runSaveTargets(): Promise<SaveOutcome> {
   // Prefab-edit: the live world is a synthetic prefab scene, so `saveAll` would refuse it
   // ('prefab-edit') and the panel's own save is the right one. Flush the parked docs here, since
   // this branch never reaches `saveAll`'s own flush.
@@ -88,9 +177,21 @@ export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 
   // in a colour that says "nothing to see" — and colour is what gets read.
   const worst = (k: 'success' | 'warn' | 'info') => (assetFails.length ? 'warn' : k);
 
+  if (o.target === 'assets') {
+    // No scene half to report. Silence about it is the point: while authoring a clip the scene is
+    // untouched, so "the SCENE was not saved" would be a warning about a non-event.
+    return n
+      ? { text: `${assetPhrase}${failSuffix}`, kind: worst('success') }
+      : { text: `Nothing to save${failSuffix}`, kind: worst('info') };
+  }
+
   if (o.target === 'prefab') {
     if (o.prefabRefused) {
-      const why = whyBlocked(o.mode);
+      // Same reasoning as the scene branch: if the envelope holds authored scene edits, "press ⏹
+      // Exit Preview" is advice that REVERTS them, so it must not be what we say.
+      const why = o.previewHoldsEdits
+        ? 'the scene was CHANGED while previewing, and exiting preview reverts those changes — undo them, or exit and re-apply them, then save.'
+        : whyBlocked(o.mode);
       return { text: `${n ? `${assetPhrase} — but the PREFAB was not saved: ` : 'The prefab was not saved: '}${why}${failSuffix}`, kind: 'warn' };
     }
     if (!o.prefabSaved) {
@@ -104,8 +205,11 @@ export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 
 
   const r = o.scene!;
   if (r.saved) {
+    // A cycle whose resume did not land ended the human's preview. The save is fine; saying nothing
+    // would leave them wondering where their frame went.
+    const lostPreview = o.previewCycled && !o.previewResumed ? ' · preview ended' : '';
     return {
-      text: `Scene saved${n ? ` · ${assetPhrase}` : ''}${failSuffix}`,
+      text: `Scene saved${n ? ` · ${assetPhrase}` : ''}${lostPreview}${failSuffix}`,
       kind: worst('success'),
     };
   }
@@ -120,7 +224,12 @@ export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 
       : { text: `Save cancelled — nothing written${failSuffix}`, kind: worst('info') };
   }
   if (r.reason === 'playing') {
-    return { text: `${savedPart || 'The scene was not saved: '}${whyBlocked(o.mode)}${failSuffix}`, kind: 'warn' };
+    // The scene edits are the reason we did not just exit for them, so the message has to name
+    // them — "exit preview" alone would be advice that quietly reverts the very work they mean.
+    const why = o.previewHoldsEdits
+      ? 'the scene was CHANGED while previewing, and exiting preview reverts those changes — undo them, or exit and re-apply them, then save.'
+      : whyBlocked(o.mode);
+    return { text: `${savedPart || 'The scene was not saved: '}${why}${failSuffix}`, kind: 'warn' };
   }
   if (r.reason === 'prefab-edit') {
     return { text: `${savedPart}this is a prefab-edit world — re-open the prefab to save it${failSuffix}`, kind: 'warn' };

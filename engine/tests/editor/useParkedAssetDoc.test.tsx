@@ -7,10 +7,11 @@
  *  registry is the only path to disk. The unmount test below is that regression, inverted.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { renderHook, act, cleanup } from '@testing-library/react';
 import {
   useParkedAssetDoc, saveStatusLabel, clearDirtyAssets, getDirtyAssetPaths, peekDirtyAsset,
+  flushDirtyAssets, markAssetDirty, getLastFlushedAsset,
 } from '@modoki/engine/editor';
 
 const PATH = '/assets/fx/spark.particle.json';
@@ -97,6 +98,145 @@ describe('useParkedAssetDoc', () => {
     );
     rerender({ v: { n: 1 } });
     expect(getDirtyAssetPaths()).toEqual([]);
+  });
+});
+
+/** The saved-baseline has to ADVANCE when a save writes the parked doc. Reported by the owner:
+ *  move a keyframe, Cmd+S, Cmd+Z — the panel showed the reverted clip, the file kept the saved one,
+ *  the editor reported clean, and no save could ever write the revert. */
+describe('undo after a save', () => {
+  const okFetch = () => vi.fn(async () => ({ ok: true, json: async () => ({ ok: true }) } as unknown as Response));
+
+  it('parks the UNDO back to the doc the panel opened with', async () => {
+    vi.stubGlobal('fetch', okFetch());
+    const { rerender, result } = setup();
+    const loaded = { n: 0 };
+    result.current.markSaved(loaded);
+    rerender({ v: loaded });                 // open: not dirty
+    rerender({ v: { n: 1 } });               // edit
+    expect(getDirtyAssetPaths()).toEqual([PATH]);
+
+    await act(async () => { await flushDirtyAssets(); });  // Cmd+S
+    expect(getDirtyAssetPaths()).toEqual([]);
+
+    rerender({ v: loaded });                 // Cmd+Z — back to the doc we opened with
+
+    // Before the fix this parked NOTHING: `loaded` was still the panel's saved-baseline, so the
+    // revert compared equal to "already on disk" and the editor called itself clean.
+    expect(getDirtyAssetPaths()).toEqual([PATH]);
+    expect(peekDirtyAsset(PATH)?.data).toBe(loaded);
+    expect(result.current.dirty).toBe(true);
+  });
+
+  it('keeps an edit made WHILE the save is in flight parked, and does not adopt it as saved', async () => {
+    // The flush awaits per path, so an edit landing in that window replaces the entry. The write
+    // that completes wrote the OLDER doc, so the newer one is still unsaved — it must survive the
+    // flush's cleanup AND must not be taken as the new baseline.
+    let release: (() => void) | undefined;
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      await new Promise<void>((r) => { release = r; });
+      return { ok: true, json: async () => ({ ok: true }) } as unknown as Response;
+    }));
+    const { rerender, result } = setup();
+    const loaded = { n: 0 };
+    result.current.markSaved(loaded);
+    rerender({ v: loaded });
+    rerender({ v: { n: 1 } });               // edit A — parked
+
+    const flushing = flushDirtyAssets();     // Cmd+S, blocked on the stubbed write
+    await act(async () => { rerender({ v: { n: 2 } }); }); // edit B, mid-flight
+    await act(async () => { release!(); await flushing; });
+
+    expect(peekDirtyAsset(PATH)?.data).toEqual({ n: 2 }); // B survived the cleanup
+    expect(result.current.dirty).toBe(true);
+  });
+
+  it('does not adopt a doc THIS panel did not park (the identity match)', async () => {
+    // Replacing the identity check with a bare `if (flushed != null)` used to pass every test in
+    // this file. Distinguishing case: someone ELSE flushes this path while our value is untouched —
+    // the baseline must not move, or a later revert to our loaded doc parks nothing.
+    vi.stubGlobal('fetch', okFetch());
+    const { rerender, result } = setup();
+    const loaded = { n: 0 };
+    result.current.markSaved(loaded);
+    rerender({ v: loaded });
+
+    markAssetDirty(PATH, 'particle', { n: 42 }, 'agent');   // not ours
+    await act(async () => { await flushDirtyAssets(); });    // …and it is what got written
+
+    expect(getLastFlushedAsset(PATH)).toEqual({ n: 42 });
+    rerender({ v: { n: 1 } });                               // our first real edit
+    expect(getDirtyAssetPaths()).toEqual([PATH]);
+    rerender({ v: loaded });                                 // undo back to what WE loaded
+    // If the baseline had wrongly adopted the agent's doc, `loaded` would differ from it and this
+    // would re-park instead of clearing.
+    expect(getDirtyAssetPaths()).toEqual([]);
+  });
+
+  it('opening an asset already flushed this session still does not dirty it', async () => {
+    // The baseline advances only for the doc THIS panel parked — otherwise a fresh panel would
+    // adopt a stale doc, differ from what it just loaded, and park on open.
+    vi.stubGlobal('fetch', okFetch());
+    const first = setup();
+    first.result.current.markSaved({ n: 0 });
+    first.rerender({ v: { n: 5 } });
+    await act(async () => { await flushDirtyAssets(); });
+    first.unmount();
+
+    const second = setup();
+    const reloaded = { n: 5 };               // same content, fresh object, as a real fetch gives
+    second.result.current.markSaved(reloaded);
+    second.rerender({ v: reloaded });
+
+    expect(getDirtyAssetPaths()).toEqual([]);
+    expect(second.result.current.dirty).toBe(false);
+  });
+});
+
+/** Returning to the doc that is on disk must DROP the park, not leave the un-done edit queued.
+ *  Found by an independent review: the mirror of the bug that started all this. */
+describe('undo with no save in between', () => {
+  it('drops the park when the value returns to the saved baseline', () => {
+    const { rerender, result } = setup();
+    const loaded = { n: 0 };
+    result.current.markSaved(loaded);
+    rerender({ v: loaded });
+    rerender({ v: { n: 1 } });                    // edit → parked
+    expect(getDirtyAssetPaths()).toEqual([PATH]);
+
+    rerender({ v: loaded });                      // Cmd+Z, nothing saved in between
+
+    // Before the fix the registry still held { n: 1 }, so Cmd+S wrote the edit just undone while
+    // the panel showed the reverted doc — and then reported success.
+    expect(getDirtyAssetPaths()).toEqual([]);
+    expect(result.current.dirty).toBe(false);
+  });
+
+  it('leaves an AGENT park for the same path alone', () => {
+    // We only drop what WE parked: an agent's pending write is not ours to judge.
+    const { rerender, result } = setup();
+    const loaded = { n: 0 };
+    result.current.markSaved(loaded);
+    rerender({ v: loaded });
+    markAssetDirty(PATH, 'particle', { fromAgent: true }, 'agent');
+    rerender({ v: loaded });                      // still the baseline — must not touch the registry
+
+    expect(peekDirtyAsset(PATH)?.origin).toBe('agent');
+  });
+
+  it('does not relabel an AGENT-parked doc as a panel write', () => {
+    // particle_set applies its def through the same store action the panel reads, so the panel's
+    // value BECOMES the agent's object. Re-parking it would send replace:true at flush and delete
+    // top-level fields the drop-key guard exists to refuse.
+    const { rerender, result } = setup();
+    const loaded = { n: 0 };
+    result.current.markSaved(loaded);
+    rerender({ v: loaded });
+    const agentDoc = { n: 9 };
+    markAssetDirty(PATH, 'particle', agentDoc, 'agent');
+    rerender({ v: agentDoc });                    // the store handed us the agent's object
+
+    expect(peekDirtyAsset(PATH)?.origin).toBe('agent');
   });
 });
 
