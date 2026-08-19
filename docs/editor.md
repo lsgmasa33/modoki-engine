@@ -31,8 +31,21 @@ Related: [Architecture](./architecture.md) · [Scene Loading](./scene-loading.md
 ## Shell & layout
 
 `editor/EditorApp.tsx` is the shell. It uses **`flexlayout-react`** for dockable,
-resizable, Unity-style tabbed panels. The default layout is Hierarchy (left), a
-Scene/Game/Console/Assets column (center), and Inspector (right).
+resizable, Unity-style tabbed panels. The default layout is three columns: the
+viewports on the left (Game above a Scene tabset that also hosts the Particle
+Editor / Sprite Animation / 2D Skin editors, with Console/Animation/Timeline
+beneath), then Hierarchy over Assets, then Inspector over AI. It is a capture of
+the owner's working arrangement, so the retargeting asset editors are docked from
+the start rather than opened on demand — they show a placeholder until something
+is selected. They cost nothing at boot: FlexLayout's `tabEnableRenderOnDemand`
+defaults to **true** and nothing overrides it, so a tab's component is not mounted
+until its tab is first shown — only the visible tab of each tabset (Game, Scene,
+Console, Hierarchy, Assets, Inspector, AI) mounts on load.
+
+⚠️ That is what makes the column *weights* safe to read literally: they are 55/15/15
+and do **not** sum to 100. FlexLayout normalizes a row's weights against their sum,
+so the proportions are what matters, not the total. Don't "fix" them to 100 — that
+would silently rescale the columns.
 
 Layout state is persisted two ways:
 

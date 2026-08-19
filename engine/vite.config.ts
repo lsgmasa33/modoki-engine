@@ -629,6 +629,9 @@ export default defineConfig(({ command }) => {
       'tests/assets/**/*.test.ts',
       'tests/electron/**/*.test.ts',
       'tests/architecture/**/*.test.ts',
+      // App-shell boot (engine/app/App.tsx). `.tsx` because the once-per-gameId boot
+      // contract (#267) is a React SCHEDULING property — only a real render can pin it.
+      'tests/app/**/*.test.tsx',
       // MCP server units (result formatting, identity) — `tools/` ships to the agent,
       // not to a game, but it is still CI-gated code.
       'tests/tools/**/*.test.ts',

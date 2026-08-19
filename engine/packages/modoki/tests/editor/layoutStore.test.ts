@@ -33,6 +33,7 @@ function installLocalStorage() {
 installLocalStorage();
 
 import { AUTOSAVE_NAME } from '../../src/editor/utils/layoutNames';
+import { dockPanel } from '../../src/editor/panelDock';
 import {
   defaultLayout, PANEL_LABELS, panelLabel,
   LAYOUT_KEY, LAYOUT_NAME_KEY, AUTODOCK_KEY,
@@ -189,6 +190,69 @@ describe('normalizeTabTitles', () => {
     let name: string | undefined;
     m.visitNodes((n) => { if (n.getType() === 'tab') name = (n as unknown as { getName(): string }).getName(); });
     expect(name).toBe('My Panel');
+  });
+});
+
+/** `defaultLayout` is a hand-written literal that every new editor and every
+ *  *Reset Layout* renders, and nothing type-checks its `component` strings against
+ *  the panel registry — a typo ships "Unknown panel: <id>" to a first-time user, in
+ *  the one layout nobody's saved state can mask. These pin the literal itself. */
+describe('defaultLayout is a well-formed panel arrangement', () => {
+  const tabs = (): { component: string; name: string }[] => {
+    const out: { component: string; name: string }[] = [];
+    Model.fromJson(defaultLayout).visitNodes((n) => {
+      if (n.getType() !== 'tab') return;
+      const t = n as unknown as { getComponent(): string; getName(): string };
+      out.push({ component: t.getComponent(), name: t.getName() });
+    });
+    return out;
+  };
+
+  it('names only registered built-in panels, with their current labels', () => {
+    // PANEL_LABELS is the built-in panel vocabulary (EditorApp's PANELS mirrors it).
+    // A component outside it has no factory entry → the tab renders "Unknown panel".
+    for (const { component, name } of tabs()) {
+      expect(PANEL_LABELS, `unknown panel id "${component}" in defaultLayout`).toHaveProperty(component);
+      // A stale title is self-healed by normalizeTabTitles at load, but the SOURCE
+      // should not be the thing that needs healing.
+      expect(name).toBe(PANEL_LABELS[component]);
+    }
+  });
+
+  it('docks each panel exactly once', () => {
+    // A duplicate tab makes isPanelVisible/dockPanel ambiguous: the Window menu
+    // would tick the panel, closing one copy would leave the other open.
+    const ids = tabs().map((t) => t.component);
+    expect([...new Set(ids)].sort()).toEqual([...ids].sort());
+  });
+
+  it('keeps a Scene tabset for dockPanel to aim at', () => {
+    // The seam: the Window menu and the openByDefault auto-dock both route through
+    // dockPanel, which targets the tabset CONTAINING `scene` and only falls back to
+    // the first tabset. Restructuring the default must not strand that target — the
+    // first tabset is now Game's, so the fallback would dock panels in the wrong place.
+    const model = Model.fromJson(defaultLayout);
+    expect(dockPanel(model, 'profiler', 'Profiler')).toBe('added');
+    let sceneTabsetHasProfiler = false;
+    model.visitNodes((n) => {
+      if (n.getType() !== 'tabset') return;
+      const kids = (n as unknown as { getChildren(): { getComponent?: () => string }[] }).getChildren();
+      const ids = kids.map((c) => c.getComponent?.());
+      if (ids.includes('scene') && ids.includes('profiler')) sceneTabsetHasProfiler = true;
+    });
+    expect(sceneTabsetHasProfiler).toBe(true);
+  });
+
+  it('re-docking an already-present panel focuses it instead of duplicating it', () => {
+    // Every asset editor is in the default now, so the Window menu's common case is
+    // "already open" — which must take dockPanel's focus branch, not add a second tab.
+    const model = Model.fromJson(defaultLayout);
+    expect(dockPanel(model, 'particle-editor', 'Particle Editor')).toBe('focused');
+    let count = 0;
+    model.visitNodes((n) => {
+      if (n.getType() === 'tab' && (n as unknown as { getComponent(): string }).getComponent() === 'particle-editor') count++;
+    });
+    expect(count).toBe(1);
   });
 });
 

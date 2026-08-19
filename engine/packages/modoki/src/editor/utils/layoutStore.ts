@@ -23,7 +23,18 @@ import type { IJsonModel } from 'flexlayout-react';
 import { backendFetch } from '../backend/editorBackend';
 import { AUTOSAVE_NAME, sanitizeExportFileName } from './layoutNames';
 
-// Default layout — Unity-inspired
+/** Default layout — a capture of the owner's working arrangement, rendered on a
+ *  first-ever load and by *Reset Layout*. Three columns: the viewports (Game above
+ *  a Scene tabset that also hosts the asset editors, Console/Animation/Timeline
+ *  beneath), then Hierarchy/Assets, then Inspector/AI.
+ *
+ *  Two things here look like mistakes and are not — why the asset editors are
+ *  docked up front, and why the weights do not sum to 100:
+ *  [docs/editor.md](../../../../../../docs/editor.md) § "Shell & layout".
+ *
+ *  Pinned by `tests/editor/layoutStore.test.ts` — nothing type-checks a `component`
+ *  string against the panel registry, so a typo here ships "Unknown panel: <id>" to
+ *  a first-time user in the one layout no saved state can mask. */
 export const defaultLayout: IJsonModel = {
   global: {
     // Each panel tab shows a ✕ that closes (hides) it; re-show from the Window menu.
@@ -35,42 +46,84 @@ export const defaultLayout: IJsonModel = {
   borders: [],
   layout: {
     type: 'row',
-    weight: 100,
     children: [
-      {
-        type: 'tabset',
-        weight: 15,
-        children: [
-          { type: 'tab', name: 'Hierarchy', component: 'hierarchy' },
-        ],
-      },
       {
         type: 'row',
         weight: 55,
         children: [
           {
-            type: 'tabset',
+            type: 'row',
             weight: 60,
             children: [
-              { type: 'tab', name: 'Scene', component: 'scene' },
+              {
+                type: 'tabset',
+                weight: 50,
+                children: [
+                  { type: 'tab', name: 'Game', component: 'game' },
+                ],
+              },
+              {
+                type: 'tabset',
+                weight: 50,
+                active: true,
+                children: [
+                  { type: 'tab', name: 'Scene', component: 'scene' },
+                  { type: 'tab', name: 'Particle Editor', component: 'particle-editor' },
+                  { type: 'tab', name: 'Sprite Animation', component: 'spriteanim-editor' },
+                  { type: 'tab', name: '2D Skin', component: 'skin-editor' },
+                ],
+              },
             ],
           },
           {
             type: 'tabset',
             weight: 40,
             children: [
-              { type: 'tab', name: 'Game', component: 'game' },
               { type: 'tab', name: 'Console', component: 'console' },
+              { type: 'tab', name: 'Animation', component: 'animation-editor' },
+              { type: 'tab', name: 'Timeline', component: 'timeline-editor' },
+            ],
+          },
+        ],
+      },
+      {
+        type: 'row',
+        weight: 15,
+        children: [
+          {
+            type: 'tabset',
+            weight: 50,
+            children: [
+              { type: 'tab', name: 'Hierarchy', component: 'hierarchy' },
+            ],
+          },
+          {
+            type: 'tabset',
+            weight: 50,
+            children: [
               { type: 'tab', name: 'Assets', component: 'assets' },
             ],
           },
         ],
       },
       {
-        type: 'tabset',
-        weight: 30,
+        type: 'row',
+        weight: 15,
         children: [
-          { type: 'tab', name: 'Inspector', component: 'inspector' },
+          {
+            type: 'tabset',
+            weight: 50,
+            children: [
+              { type: 'tab', name: 'Inspector', component: 'inspector' },
+            ],
+          },
+          {
+            type: 'tabset',
+            weight: 50,
+            children: [
+              { type: 'tab', name: 'AI', component: 'ai' },
+            ],
+          },
         ],
       },
     ],

@@ -101,7 +101,10 @@ function findGame(gameId: string): GameDefinition | undefined {
  *  NOTE: Scene3D captures GameConfig at mount only (Scene3D.tsx). Today both
  *  games' sceneSetup hooks are no-ops so this is safe. If a future game needs
  *  per-game sceneSetup, Scene3D will need a gameConfig subscription. */
-const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) {
+/** Exported for `tests/app/gameShellLoadOnce.test.tsx` (#267) — the boot sequence's
+ *  once-per-game contract is a React SCHEDULING property, so it can only be pinned by
+ *  rendering the real component; there is no pure module to extract it into. */
+export const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) {
   useKeyboardShift();
 
   // The engine applies a quality-tier promotion mid-play when no scene boundary arrives to hide the
@@ -124,6 +127,26 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
    *  engine publishes it (`onTierSwitchOverlay`); this is its ONE reader. */
   const [tierSwitchMessage, setTierSwitchMessage] = useState<string | null>(null);
   const activeGameIdRef = useRef<string | null>(null);
+  /**
+   * Mirrors of `configReady` / `initialized` for the LOAD EFFECT to read (#267).
+   *
+   * ⚠️ THE EFFECT BELOW SETS BOTH OF THOSE STATE VALUES MID-BODY, so reading the state
+   * itself would put them in its dependency array — and an effect that depends on state it
+   * writes re-runs itself. It did: `setConfigReady(true)` (still ~100 lines from the end)
+   * flipped a dependency while `activeGameIdRef` was still null, so the re-entrancy guard at
+   * the top could not bail, and the whole sequence — `registerSystems`, `registerAppServices`,
+   * `attribution.init()`, `PlayerPrefs.init`, `loadScene` — ran a SECOND time for the same
+   * game. Measured on an iPhone 8, 2026-08-19: two ATT consent prompts in one launch
+   * (`requestTrackingAuthorization` at 21:49:33.175 and 21:49:35.364).
+   *
+   * So the dependency array of that effect is `[gameId]` and must stay that way. The contract
+   * that buys — every `GameDefinition` hook is called ONCE per game load, so a hook may hold a
+   * side effect that must not repeat — is documented in
+   * `docs/architecture.md` § "The boot effect runs EXACTLY ONCE per `gameId`", and pinned by
+   * `tests/app/gameShellLoadOnce.test.tsx`.
+   */
+  const configReadyRef = useRef(false);
+  const initializedRef = useRef(false);
   /** Whether this shell started the no-3D tier-calibration loop, so a game swap knows to stop it.
    *  A ref rather than state: it is read inside the load effect and must never re-run it. */
   const no3DTierLoopRef = useRef(false);
@@ -136,10 +159,25 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
       setError(`Unknown game: "${gameId}"`);
       return;
     }
-    if (activeGameIdRef.current === gameId) return; // no-op re-render
+    if (activeGameIdRef.current === gameId) {
+      // Already the loaded game, so there is no transition in progress — and saying so is
+      // load-bearing, not tidiness. A→B→A while B is still in flight cancels B's run before
+      // it can reach either `setTransitioning(false)` below, and lands here, where the old
+      // early return left `transitioning` stuck TRUE for the rest of the session: the
+      // opaque LoadingOverlay covers a game that is running perfectly well underneath.
+      setTransitioning(false);
+      return; // no-op re-render
+    }
+
+    // A previous game's failure must not outlive it. `error` gates the whole render tree
+    // (`if (error) return <error page>`) and had no path back to null anywhere in this file,
+    // so an unknown gameId — or one game failing to load — left the error screen up even
+    // after a later game loaded successfully behind it. React bails out of the re-render
+    // when the value is already null, so this costs nothing on the ordinary path.
+    setError(null);
 
     let cancelled = false;
-    const isFirstLoad = !initialized;
+    const isFirstLoad = !initializedRef.current;
 
     // Show overlay for game-to-game transitions. For first load, the opaque
     // overlay renders on top of the (empty) renderers — same visual as before.
@@ -275,7 +313,8 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
         // (Scene3D shader prewarm, Scene2D sprite preload) are registered in
         // time. configReady gates the mount; the opaque LoadingOverlay covers
         // everything until the scene is fully loaded and rendered.
-        if (!configReady) {
+        if (!configReadyRef.current) {
+          configReadyRef.current = true;
           setConfigReady(true);
           // Yield to React so Scene3D/Game/UIRenderer mount and their useEffects
           // run (registering beforeSwap hooks). Two rAFs to cover PixiJS
@@ -380,6 +419,7 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
         }
 
         activeGameIdRef.current = gameId;
+        initializedRef.current = true;
         setInitialized(true);
         setTransitioning(false);
       } catch (e) {
@@ -392,7 +432,10 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
     })();
 
     return () => { cancelled = true; };
-  }, [gameId, initialized, configReady]);
+    // ⚠️ `[gameId]` ONLY — see the `configReadyRef`/`initializedRef` note above (#267). This
+    // effect writes `configReady` and `initialized`; listing either here makes it re-run
+    // itself and double-drive every registration in the body.
+  }, [gameId]);
 
   // Shipped web build's screen sizing (rendering.web.sizeMode). `fixed` letterboxes
   // the game to its authored aspect; `free`/`max` fill the viewport (max clamps the

@@ -426,6 +426,51 @@ metadata. Current projects: `3d-test` (Tropical Island — Three.js/NPR/model im
 iOS+Android native), `alien-animal` (skeletal-animation showcase), `space-console`,
 `chess`, `llm-test`, and others; the template scaffold lives at `engine/templates/starter`.
 
+### The boot effect runs EXACTLY ONCE per `gameId` (#267)
+
+Every hook above is driven from one effect in `engine/app/App.tsx` (`GameShell`), in this
+order: `unregisterSystems` (previous game) → `registerPostprocessors` → `registerSystems` →
+`registerAppServices` → `attribution.init()`/`ads.init()` → `PlayerPrefs.init` → `resetPhase`
+registration → `loadConfig` → `initWorldSync` (first load) → quality-tier resolution →
+renderers mount → `loadScene` → `onSceneReady`. **A hook may assume it is called once per
+game load** — so a hook is allowed to have side effects that must not repeat (starting a native
+SDK, showing a consent prompt, spending a network call).
+
+That guarantee is younger than the code. The effect's dependency array used to be
+`[gameId, initialized, configReady]` while the effect itself calls `setConfigReady(true)`
+and `setInitialized(true)` mid-body, so it re-ran for the same game and drove the whole
+sequence twice. It was invisible for a long time because `loadScene` is cancel-and-replace
+and therefore idempotent — the screen was right and only the side effects doubled. What
+finally showed it was a native SDK: `games/court`'s AppsFlyer integration put **two App
+Tracking Transparency prompts** in front of the player on one launch (iPhone 8,
+2026-08-19 — `requestTrackingAuthorization` at 21:49:33.175 and again at 21:49:35.364).
+
+⚠️ **"Once" means once in a SHIPPED build.** `engine/app/main.tsx` wraps the app in React
+`<StrictMode>`, which deliberately double-invokes every effect in dev (mount → cleanup →
+mount), and that is unchanged by the fix — the boot sequence really does run twice in the
+editor and in `npm run dev`. The device measurement above was a production build, where
+StrictMode is inert. So a game hook whose side effect must not repeat still wants its own
+latch for the dev path (`games/court`'s AppsFlyer wrapper is the worked example); what the
+fix removes is the double-drive that reached PLAYERS.
+
+**The game-SWITCH path has two failure modes that outlive the switch**, both fixed alongside
+the above and both worth knowing before you touch the early-return guard. Switching A→B and
+back to A while B is still loading cancels B's run before it reaches either
+`setTransitioning(false)`, and lands on the `activeGameIdRef.current === gameId` guard — which
+must therefore clear `transitioning` itself, or the opaque loading overlay covers a game that
+is running perfectly well underneath, for the rest of the session. And `error` gates the whole
+render tree, so it is cleared at the start of every new load: it had no path back to `null`
+at all, which meant one unknown gameId left the error screen up even after a later game
+loaded successfully behind it.
+
+The rule that follows, for anyone editing that effect: **its dependency array is `[gameId]`
+and nothing else.** State the effect writes is mirrored into refs (`configReadyRef`,
+`initializedRef`) precisely so it cannot appear there. Re-entrancy for a *different* game is
+still supported and still cancels the in-flight load — that is what the `cancelled` flag and
+`activeGameIdRef` are for. Pinned by `engine/tests/app/gameShellLoadOnce.test.tsx`, whose
+third case is the one that matters: it proves a second game still loads, i.e. that the fix
+tightened the guard rather than freezing the effect.
+
 For how scenes are loaded into a world and how prefabs instantiate, see
 [Scene Loading](./scene-loading.md) and [Prefabs](./prefabs.md).
 
