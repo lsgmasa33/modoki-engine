@@ -31,6 +31,15 @@ data `layout-bounds` reports) rather than a second projection that could drift f
 Implementation: `engine/app/debug/entityResolve.ts` + the `resolve-entity-point` op, wired into the
 one `resolvePoint` seam in `engine/electron/inputRoutes.ts` so all five aimed routes get it at once.
 
+**A COVERED aim is refused, whichever resolvable form it took** (2026-08-19). `entity` and
+`selector` are one category — both resolved server-side inside the call — so both now answer
+`OCCLUDED` (400) naming the cover, with `allowOccluded:true` as the escape hatch. The selector path
+used to press anyway and report `occluded:true` beside `ok:true`; that is the false success
+`mcp-tool-conventions.md` §0 ranks worst, the device surface had refused a covered selector all
+along, and the editor was the lone holdout. Raw `{x,y}` is exempt — a coordinate is what you asked
+for. One carve-out, about delivery rather than aim: `modoki_pointer`'s `move`/`up` go to whatever
+captured the press, so occlusion at the destination cannot stop them and is not checked.
+
 **`occlusionScope` — the honest half, and the part to actually read.** An entity aim reports how far
 the occlusion check could see, because `occluded:false` does not mean the same thing on every path:
 

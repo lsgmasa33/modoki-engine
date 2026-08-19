@@ -91,6 +91,14 @@ legitimate exception: it *measures* a path).
   cannot silently mean a different panel than intended.
 - An entity aim reports the `surface` it resolved in, and `occlusionScope` so `occluded:false` is
   never over-read.
+- **A resolvable aim that something COVERS is refused** (`OCCLUDED`), naming the cover, with
+  `allowOccluded:true` as the escape hatch. The input would land on the covering element, so
+  reporting `ok` for it is the §0 rank-1 false success. This binds `entity` and `selector` alike —
+  they are the same category, both resolved server-side — and raw `{x,y}` is deliberately exempt:
+  a coordinate is exactly what the caller asked for, and there is no named target to be covered
+  *relative to*. One carve-out, because it is about delivery rather than aim: a held gesture's
+  `move`/`up` is delivered to whatever captured the press, so occlusion at the destination cannot
+  stop it and is not checked.
 - **Any id-shaped argument is validated.** `parentGuid` is validated today while `parentId` is
   passed through raw, so a stale numeric id produces an orphan entity — parented to nothing,
   invisible in the Hierarchy — reported as success (S1 `create_entity`/`reparent_entity`/`prefab`).
@@ -337,6 +345,23 @@ These three needed owner sign-off because each changes the advertised surface. A
    the component), and the mutating GETs (`?action=`/`?clear=`) now run their `ok:false` through the
    failure check so a refusal cannot arrive as a success. `project_settings` keeps one name because
    its `action:'set'` is already a different method on the wire and is declared as `varies`.
+
+4. **§3 occlusion refusal on the SELECTOR path — LANDED (2026-08-19).** `entity` aims had refused
+   since 2026-07-29 and the DEVICE surface refused a covered selector from the start
+   (`device_tap`: *"an OCCLUDED target is refused here rather than tapping something else"*), while
+   the editor's selector path pressed anyway and reported `ok:true` with `occluded:true` in a
+   field — §9's "a rule implemented twice diverges", and a rank-1 false success on the ranking in
+   §0. It reached `modoki_tap`/`hover`/`scroll`/`pointer:'down'` and both `drag` endpoints; the
+   handle aims (`tap_handle`/`drag_handle`) were closed in the same pass. The trigger was a
+   measured one: a 2D gizmo handle sitting under the SceneView's own toolbar was pressed INTO the
+   toolbar, answered `ok:true`, and was filed as a high-severity "the handle is completely inert"
+   bug — the handle was fine. Backwards compatibility does not outrank #1, which is what made this
+   a fix rather than a trade.
+
+   Residual, recorded rather than churned: `device_hover`/`device_scroll` accept a selector but do
+   not document the refusal their `device_tap`/`device_drag`/`device_pointer` siblings do. Closing
+   it belongs in the shared `resolve-dom-point` op (§9's registration rule), not in a second
+   per-route check.
 
 The remaining known asymmetries are recorded rather than churned: the device↔editor NAMING
 differences (`device_console_logs` vs `modoki_get_console_logs`, …) are tabulated in

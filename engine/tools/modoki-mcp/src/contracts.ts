@@ -138,12 +138,17 @@ const norm = (d: Decl): ToolContract => ({
 /** Shared by every `entitySpec`-aimable input tool (tap/drag/pointer/hover/scroll) — one string so
  *  the occlusion-scope behaviour can't drift per tool description (F15, docs/enact.md). */
 const TARGET_ENTITY_OCCLUSION_NOTE =
-  "An `entity` aim at a 2D/3D target on a surface with a registered pick provider "
-  + "(`occlusionScope:'entity'`) is REFUSED (400) when the surface's own hit-test says something "
-  + 'else is in front of it — "click the character" fails if the game would not select that '
-  + "character. Pass `entity.allowOccluded:true` to dispatch anyway and see what happens. A "
-  + "surface with no pick provider keeps the honest `occlusionScope:'canvas'` fallback (entity-vs-"
-  + 'entity occlusion inside the canvas is NOT checked there) — see `docs/enact.md`.';
+  'A RESOLVABLE aim covered by something else is REFUSED (400, `OCCLUDED`), naming the cover: the '
+  + 'input would land on that instead, and reporting ok for it is the false success §0 ranks worst. '
+  + 'This binds BOTH resolvable aims — `entity` and `selector` — and matches the device surface, '
+  + 'which has always refused a covered selector. Raw `{x,y}` is never refused: a coordinate is '
+  + 'exactly what was asked for. `allowOccluded:true` dispatches anyway (per-endpoint on `drag`); '
+  + "on `pointer` it applies to `action:'down'` only, since a move/up is delivered to whatever "
+  + 'captured the press. An `entity` aim at a 2D/3D target additionally reports how far the check '
+  + "could see: `occlusionScope:'entity'` is the surface's own hit-test (so 'click the character' "
+  + 'fails if the game would not select that character), while a surface with no pick provider '
+  + "keeps the honest `occlusionScope:'canvas'` fallback — entity-vs-entity occlusion inside the "
+  + 'canvas is NOT checked there. See `docs/enact.md`.';
 
 const DECLS: Record<string, Decl> = {
   // ── meta ──

@@ -150,10 +150,14 @@ export function resolveDomPointReport(spec: DomPointSpec): DomPointResolution {
   // relative to — report only what sits under the point.
   if (!spec.selector) return { ok: true, x: r.x, y: r.y, hitTarget: describeElement(r.el) };
   const top = document.elementFromPoint(r.x, r.y);
+  const occluded = isOccluded(r.el, top);
   return {
     ok: true, x: r.x, y: r.y,
     matched: describeElement(r.el),
-    hitTarget: describeElement(top),
-    occluded: isOccluded(r.el, top),
+    // When something COVERS the target, name it well enough to act on — the covering element is
+    // usually anonymous panel chrome, and "div" is not a thing a caller can move out of the way.
+    // Only when occluded: on a clean aim `top` IS the target, which describeElement already names.
+    hitTarget: occluded ? describeOccluder(top) : describeElement(top),
+    occluded,
   };
 }

@@ -73,7 +73,20 @@ export type InputRoutesHandler =
  *  selector-overrides-coordinates rule rather than replacing it (the tool descriptions have
  *  documented that ordering since selectors landed, so re-litigating it here would break
  *  callers for no gain). */
-export interface PointSpec { x?: number; y?: number; selector?: string; entity?: EntityPointSpec }
+export interface PointSpec {
+  x?: number; y?: number; selector?: string; entity?: EntityPointSpec;
+  /** Aim at the target even though something covers it. Default false = REFUSE.
+   *
+   *  A resolvable aim (`entity`, `selector`) names a THING, so a press the surface would deliver
+   *  somewhere else is a failed intent, not a caveat — `mcp-tool-conventions.md` §0 ranks a false
+   *  success as the worst outcome on this surface, above backwards compatibility. The entity path
+   *  has refused since 2026-07-29 and the DEVICE surface refuses a covered selector too
+   *  (`device_tap`: "a selector miss or an OCCLUDED target is refused here rather than tapping
+   *  something else"); the editor's selector path was the one holdout, which is the divergence §9
+   *  predicts when a rule is implemented twice. Raw `{x,y}` is deliberately NOT covered: you asked
+   *  for a coordinate and got the coordinate — §3's other category. */
+  allowOccluded?: boolean;
+}
 
 /** A resolved point plus the provenance an agent needs to trust it. */
 export interface ResolvedPoint {
@@ -120,8 +133,12 @@ export async function resolvePoint(
   // selector) there is no legacy call shape that passes it incidentally.
   if (spec && spec.entity && typeof spec.entity === 'object' && Object.keys(spec.entity).length > 0) {
     let res: EntityPointResolution | null;
+    // A top-level `allowOccluded` means the same thing whichever aim is used, so forward it —
+    // otherwise the flag would silently do nothing on the aim an agent is most likely to combine
+    // it with. An explicit `entity.allowOccluded` still wins.
+    const entitySpec = { ...spec.entity, allowOccluded: spec.entity.allowOccluded ?? spec.allowOccluded };
     try {
-      res = (await requestRenderer('resolve-entity-point', spec.entity)) as EntityPointResolution | null;
+      res = (await requestRenderer('resolve-entity-point', entitySpec)) as EntityPointResolution | null;
     } catch (e) {
       return { error: `${which}: renderer could not resolve entity (${e instanceof Error ? e.message : String(e)})` };
     }
@@ -146,6 +163,15 @@ export async function resolvePoint(
     }
     if (!res || !res.ok || typeof res.x !== 'number' || typeof res.y !== 'number') {
       return { error: `${which}: ${res?.error ?? 'selector did not resolve'}` };
+    }
+    if (res.occluded && !spec.allowOccluded) {
+      return {
+        error: `${which}: ${JSON.stringify(spec.selector)} resolves to a point covered by `
+          + `${res.hitTarget ?? 'something else'} — the input would land on THAT, not on your target. `
+          + 'Dismiss/move what covers it (an open menu, a modal, a panel that overlaps), scroll the '
+          + 'target clear, or pass allowOccluded:true to aim there anyway and see what happens.',
+        code: 'OCCLUDED',
+      };
     }
     return { point: { x: res.x, y: res.y, matched: res.matched, hitTarget: res.hitTarget, occluded: res.occluded } };
   }
@@ -319,18 +345,21 @@ export function createInputRoutes(deps: InputRouteDeps) {
   async function dispatchInput({ urlPath, body }: HostRequest): Promise<BackendResult | null> {
 
     if (urlPath === '/api/input/tap') {
-      const { x, y, selector, entity, button, clickCount, modifiers } = (body ?? {}) as PointSpec & { button?: MouseButton; clickCount?: number; modifiers?: InputModifier[] };
-      const r = await resolvePoint({ x, y, selector, entity }, 'tap', requestRenderer);
+      const { x, y, selector, entity, allowOccluded, button, clickCount, modifiers } = (body ?? {}) as PointSpec & { button?: MouseButton; clickCount?: number; modifiers?: InputModifier[] };
+      const r = await resolvePoint({ x, y, selector, entity, allowOccluded }, 'tap', requestRenderer);
       if ('error' in r) return bad(r.error, r.code);
       await ops.tap(r.point.x, r.point.y, { button, clickCount, modifiers });
       return json({ ok: true, tapped: { x: r.point.x, y: r.point.y, button: button ?? 'left', clickCount: clickCount ?? 1 }, ...provenance(r.point) });
     }
 
     if (urlPath === '/api/input/drag') {
-      const { from, to, steps, button, modifiers } = (body ?? {}) as { from?: PointSpec; to?: PointSpec; steps?: number; button?: MouseButton; modifiers?: InputModifier[] };
-      const rf = await resolvePoint(from, 'from', requestRenderer);
+      const { from, to, steps, button, modifiers, allowOccluded } = (body ?? {}) as { from?: PointSpec; to?: PointSpec; steps?: number; button?: MouseButton; modifiers?: InputModifier[]; allowOccluded?: boolean };
+      // A top-level flag covers BOTH ends; a per-endpoint one still wins, so a caller can allow a
+      // covered destination while keeping the press honest.
+      const withFlag = (p?: PointSpec) => (p ? { ...p, allowOccluded: p.allowOccluded ?? allowOccluded } : p);
+      const rf = await resolvePoint(withFlag(from), 'from', requestRenderer);
       if ('error' in rf) return bad(rf.error, rf.code);
-      const rt = await resolvePoint(to, 'to', requestRenderer);
+      const rt = await resolvePoint(withFlag(to), 'to', requestRenderer);
       if ('error' in rt) return bad(rt.error, rt.code);
       // A zero-length drag is a CLICK, not a drag: mouseDown+mouseUp at one pixel is what Blink
       // synthesizes a `click` from. Measured — `modoki_drag {from:{700,200},to:{700,200}}` over
@@ -358,7 +387,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
     // slingshot pull, a charge meter, a drag-to-aim rubber-band — with get_scene_state / eval /
     // a screenshot mid-gesture, which the atomic drag can't expose.
     if (urlPath === '/api/input/pointer') {
-      const { action, x, y, selector, entity, button, modifiers } =
+      const { action, x, y, selector, entity, allowOccluded, button, modifiers } =
         (body ?? {}) as PointSpec & { action?: 'down' | 'move' | 'up'; button?: MouseButton; modifiers?: InputModifier[] };
       if (action !== 'down' && action !== 'move' && action !== 'up') {
         return bad(`pointer: action must be 'down', 'move', or 'up' (got ${JSON.stringify(action)})`);
@@ -369,7 +398,13 @@ export function createInputRoutes(deps: InputRouteDeps) {
       if ((action === 'move' || action === 'up') && !heldPointer) {
         return json({ error: `no pointer is held — send action:'down' first (this ${action} would be a stray event).` }, 409);
       }
-      const r = await resolvePoint({ x, y, selector, entity }, `pointer ${action}`, requestRenderer);
+      // Only the PRESS is gated on occlusion. A `move`/`up` mid-gesture is delivered to whatever
+      // captured the press, so what happens to sit under the destination says nothing about
+      // whether the event lands — refusing there would break legitimate held drags.
+      const r = await resolvePoint(
+        { x, y, selector, entity, allowOccluded: action === 'down' ? allowOccluded : true },
+        `pointer ${action}`, requestRenderer,
+      );
       if ('error' in r) return bad(r.error, r.code);
       // 'down' takes its button from the request (default left); 'move'/'up' REUSE the held one so
       // the whole gesture is one consistent button and a move reads as a drag-move.
@@ -388,16 +423,16 @@ export function createInputRoutes(deps: InputRouteDeps) {
     }
 
     if (urlPath === '/api/input/hover') {
-      const { x, y, selector, entity, modifiers } = (body ?? {}) as PointSpec & { modifiers?: InputModifier[] };
-      const r = await resolvePoint({ x, y, selector, entity }, 'hover', requestRenderer);
+      const { x, y, selector, entity, allowOccluded, modifiers } = (body ?? {}) as PointSpec & { modifiers?: InputModifier[] };
+      const r = await resolvePoint({ x, y, selector, entity, allowOccluded }, 'hover', requestRenderer);
       if ('error' in r) return bad(r.error, r.code);
       await ops.hover(r.point.x, r.point.y, modifiers);
       return json({ ok: true, hovered: { x: r.point.x, y: r.point.y }, ...provenance(r.point) });
     }
 
     if (urlPath === '/api/input/scroll') {
-      const { x, y, selector, entity, deltaX, deltaY, modifiers } = (body ?? {}) as PointSpec & { deltaX?: number; deltaY?: number; modifiers?: InputModifier[] };
-      const r = await resolvePoint({ x, y, selector, entity }, 'scroll', requestRenderer);
+      const { x, y, selector, entity, allowOccluded, deltaX, deltaY, modifiers } = (body ?? {}) as PointSpec & { deltaX?: number; deltaY?: number; modifiers?: InputModifier[] };
+      const r = await resolvePoint({ x, y, selector, entity, allowOccluded }, 'scroll', requestRenderer);
       if ('error' in r) return bad(r.error, r.code);
       // A scroll with no delta is a no-op wearing an action's name (S3.15). `deltaY` documents no
       // default and the tool shape is non-strict about intent — a misspelled `dy` reaches here as

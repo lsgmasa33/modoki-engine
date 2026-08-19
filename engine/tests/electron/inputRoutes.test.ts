@@ -165,19 +165,39 @@ describe('tap', () => {
     expect(ops.tap).toHaveBeenCalledWith(210, 110, expect.anything());
   });
 
-  it('reports matched / hitTarget / occluded so a covered target is visible without a screenshot', async () => {
-    const res = await post('/api/input/tap', { selector: '#covered' });
+  /** REVERSED 2026-08-19, deliberately. Two tests here used to assert that a covered selector was
+   *  TAPPED and merely reported (`occlusion is provenance, not a veto`), on the grounds that the
+   *  agent might know the overlay was harmless and a swallowed dispatch would surprise more than a
+   *  click that lands somewhere the response names.
+   *
+   *  That reasoning does not survive `mcp-tool-conventions.md` §0, which ranks a FALSE SUCCESS as
+   *  the worst outcome on this surface — above backwards compatibility — and it was already
+   *  contradicted twice on the surface itself: an `entity` aim has refused since 2026-07-29, and
+   *  the DEVICE twin refuses a covered selector too (`device_tap`: "an OCCLUDED target is refused
+   *  here rather than tapping something else"). The editor's selector path was the sole holdout,
+   *  i.e. §9's "a rule implemented twice diverges". The harmless-overlay case is real but rare, and
+   *  it now has an explicit name: `allowOccluded:true`. `pointer-events:none` never needed it —
+   *  `elementFromPoint` skips such elements, so they never read as occluders. */
+  it('REFUSES a covered selector, naming the cover and the escape hatch, and dispatches nothing', async () => {
+    const res = await post('/api/input/tap', { selector: '#covered' }) as { status?: number; body: { error: string; code: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('OCCLUDED');
+    expect(res.body.error).toMatch(/covered by div\.menu/);
+    expect(res.body.error).toMatch(/allowOccluded/);
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('…and allowOccluded:true taps anyway, still reporting matched / hitTarget / occluded', async () => {
+    const res = await post('/api/input/tap', { selector: '#covered', allowOccluded: true });
     expect(res).toMatchObject({
       kind: 'json',
       body: { ok: true, tapped: { x: 50, y: 60 }, matched: 'button#covered', hitTarget: 'div.menu', occluded: true },
     });
+    expect(ops.tap).toHaveBeenCalledWith(50, 60, expect.anything());
   });
 
-  it('an occluded target is REPORTED, not refused — occlusion is provenance, not a veto', async () => {
-    // The agent may know the overlay is harmless (a pointer-events:none scrim), or may be
-    // deliberately clicking the thing on top. Silently swallowing the dispatch would be a
-    // far worse surprise than a click that lands somewhere the response names.
-    await post('/api/input/tap', { selector: '#covered' });
+  it('a RAW {x,y} aim is never refused for occlusion — a coordinate is what you asked for', async () => {
+    await post('/api/input/tap', { x: 50, y: 60 });
     expect(ops.tap).toHaveBeenCalledWith(50, 60, expect.anything());
   });
 
@@ -204,6 +224,31 @@ describe('tap', () => {
   });
 });
 
+/** The refusal is a property of the AIM, not of `tap` — so it binds every aimed route, and the one
+ *  carve-out is stated as a test rather than left to the reader (mcp-tool-conventions.md §9). */
+describe('occlusion refusal across the aimed routes', () => {
+  it('hover and scroll refuse a covered selector too', async () => {
+    const h = await post('/api/input/hover', { selector: '#covered' }) as { body: { code: string } };
+    expect(h.body.code).toBe('OCCLUDED');
+    expect(ops.hover).not.toHaveBeenCalled();
+    const sc = await post('/api/input/scroll', { selector: '#covered', deltaY: 120 }) as { body: { code: string } };
+    expect(sc.body.code).toBe('OCCLUDED');
+    expect(ops.scroll).not.toHaveBeenCalled();
+  });
+
+  it("pointer 'down' refuses, but 'move'/'up' do NOT — they land on whatever captured the press", async () => {
+    const down = await post('/api/input/pointer', { action: 'down', selector: '#covered' }) as { body: { code: string } };
+    expect(down.body.code).toBe('OCCLUDED');
+    expect(ops.pointerDown).not.toHaveBeenCalled();
+    // Establish a real held press somewhere clear, then re-aim it ONTO the covered element.
+    await post('/api/input/pointer', { action: 'down', x: 10, y: 10 });
+    await post('/api/input/pointer', { action: 'move', selector: '#covered' });
+    expect(ops.pointerMove).toHaveBeenCalledWith(50, 60, expect.anything());
+    await post('/api/input/pointer', { action: 'up', selector: '#covered' });
+    expect(ops.pointerUp).toHaveBeenCalledWith(50, 60, expect.anything());
+  });
+});
+
 describe('drag', () => {
   it('resolves BOTH endpoints before the single trusted drag', async () => {
     await post('/api/input/drag', { from: { selector: '#kebab' }, to: { x: 400, y: 400 } });
@@ -211,9 +256,18 @@ describe('drag', () => {
   });
 
   it('reports per-endpoint provenance only where a selector was used', async () => {
-    const res = await post('/api/input/drag', { from: { selector: '#covered' }, to: { x: 9, y: 9 } });
+    const res = await post('/api/input/drag', { from: { selector: '#covered' }, to: { x: 9, y: 9 }, allowOccluded: true });
     expect(res).toMatchObject({ body: { ok: true, fromTarget: { occluded: true, hitTarget: 'div.menu' } } });
     expect((res as { body: Record<string, unknown> }).body.toTarget).toBeUndefined();
+  });
+
+  it('REFUSES a covered endpoint, and a per-endpoint flag can allow just one of the two', async () => {
+    const refused = await post('/api/input/drag', { from: { selector: '#covered' }, to: { x: 9, y: 9 } }) as { body: { code: string } };
+    expect(refused.body.code).toBe('OCCLUDED');
+    expect(ops.drag).not.toHaveBeenCalled();
+    // Allow the covered SOURCE alone — the top-level flag is not needed, and not implied.
+    await post('/api/input/drag', { from: { selector: '#covered', allowOccluded: true }, to: { x: 9, y: 9 } });
+    expect(ops.drag).toHaveBeenCalledWith({ x: 50, y: 60 }, { x: 9, y: 9 }, expect.anything());
   });
 
   it('400s naming WHICH endpoint failed, and drags nothing', async () => {

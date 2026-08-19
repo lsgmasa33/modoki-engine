@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { modifierEnum, entitySpec, pointSpec } from '../shapes.js';
+import { modifierEnum, entitySpec, pointSpec, allowOccludedParam } from '../shapes.js';
 
 export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
   const { getJson, postJson, evalRenderer, editorAction } = ctx;
@@ -22,8 +22,9 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'resort. The first two resolve to a live point INSIDE this call — no read-then-tap race — ' +
       'so prefer them; `x,y` read from an earlier get_scene_state call is aiming at where the ' +
       'target WAS. The response reports `matched` (what resolved), `hitTarget` (the topmost ' +
-      'element at that point) and `occluded` — if occluded is true something covered your ' +
-      'target and the click went elsewhere. An entity aim also reports `occlusionScope`: read ' +
+      'element at that point). A target something COVERS is REFUSED, naming the cover — the click ' +
+      'would land on that instead, and reporting ok for it would be a false success; pass ' +
+      '`allowOccluded:true` to click anyway. An entity aim also reports `occlusionScope`: read ' +
       '`occluded:false` as trustworthy for "element" (UI) but NOT for "canvas" (2D/3D), where a ' +
       'mesh in front of the target is not detected. Then verify with get_scene_state. ' +
       "`button:'right'` opens a context menu; `clickCount:2` double-clicks; " +
@@ -39,8 +40,9 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button (default 'left')."),
       clickCount: z.number().optional().describe('1 = single (default), 2 = double-click.'),
       modifiers: z.array(modifierEnum).optional().describe('Held modifier keys.'),
+      allowOccluded: allowOccludedParam,
     },
-    async ({ x, y, selector, entity, button, clickCount, modifiers }) => postJson('/api/input/tap', { x, y, selector, entity, button, clickCount, modifiers }),
+    async ({ x, y, selector, entity, button, clickCount, modifiers, allowOccluded }) => postJson('/api/input/tap', { x, y, selector, entity, button, clickCount, modifiers, allowOccluded }),
   );
 
   // ── drag — trusted gesture (Electron editor only) ──
@@ -62,8 +64,9 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       steps: z.number().optional().describe('Intermediate move count (default 10).'),
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button (default 'left')."),
       modifiers: z.array(modifierEnum).optional().describe('Modifier keys held for the whole drag (real keyDown/keyUp around the gesture).'),
+      allowOccluded: allowOccludedParam.describe('Allow a covered endpoint on BOTH ends (default false = refused, naming the cover). Set it on `from`/`to` individually to allow just one — e.g. a covered destination while keeping the press honest.'),
     },
-    async ({ from, to, steps, button, modifiers }) => postJson('/api/input/drag', { from, to, steps, button, modifiers }),
+    async ({ from, to, steps, button, modifiers, allowOccluded }) => postJson('/api/input/drag', { from, to, steps, button, modifiers, allowOccluded }),
   );
 
   // ── pointer — SUSTAINED (held-across-calls) trusted press (Electron editor only) ──
@@ -86,9 +89,10 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       entity: entitySpec.optional(),
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button for 'down' (default 'left'); ignored on move/up (the held button is reused)."),
       modifiers: z.array(modifierEnum).optional().describe('Held modifier keys.'),
+      allowOccluded: allowOccludedParam.describe("Allow a covered target on `action:'down'` (default false = refused). Ignored on move/up: those are delivered to whatever captured the press, so what sits under the destination cannot stop them."),
     },
-    async ({ action, x, y, selector, entity, button, modifiers }) =>
-      postJson('/api/input/pointer', { action, x, y, selector, entity, button, modifiers }),
+    async ({ action, x, y, selector, entity, button, modifiers, allowOccluded }) =>
+      postJson('/api/input/pointer', { action, x, y, selector, entity, button, modifiers, allowOccluded }),
   );
 
   // ── hover — trusted bare mouse-move (Electron editor only) ──
@@ -103,8 +107,9 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       selector: z.string().optional().describe('CSS selector to aim at. Overrides x/y.'),
       entity: entitySpec.optional(),
       modifiers: z.array(modifierEnum).optional().describe('Held modifier keys.'),
+      allowOccluded: allowOccludedParam,
     },
-    async ({ x, y, selector, entity, modifiers }) => postJson('/api/input/hover', { x, y, selector, entity, modifiers }),
+    async ({ x, y, selector, entity, modifiers, allowOccluded }) => postJson('/api/input/hover', { x, y, selector, entity, modifiers, allowOccluded }),
   );
 
   // ── scroll — trusted mouse-wheel (Electron editor only) ──
@@ -128,8 +133,9 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       deltaY: z.number().optional().describe('Vertical wheel delta; positive = content down. Default 0, but a call with neither delta non-zero is REFUSED (~120 ≈ one wheel tick).'),
       modifiers: z.array(z.enum(['shift', 'control', 'alt', 'meta', 'cmd', 'command']))
         .optional().describe('Held modifier keys set on the wheel event (e.g. ["control"] or ["meta"] for Ctrl/Cmd+wheel zoom).'),
+      allowOccluded: allowOccludedParam,
     },
-    async ({ x, y, selector, entity, deltaX, deltaY, modifiers }) => postJson('/api/input/scroll', { x, y, selector, entity, deltaX, deltaY, modifiers }),
+    async ({ x, y, selector, entity, deltaX, deltaY, modifiers, allowOccluded }) => postJson('/api/input/scroll', { x, y, selector, entity, deltaX, deltaY, modifiers, allowOccluded }),
   );
 
   // ── eval — evaluate JS in the editor renderer (Electron editor only) ──

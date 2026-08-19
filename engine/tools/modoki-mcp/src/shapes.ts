@@ -67,11 +67,21 @@ export const entitySpec = z.object({
   'sampled point instead) and `occludedByEntity` (who is actually there) on the "entity" scope. ' +
   'Overrides `selector` and x/y.');
 
+/** The one description of the occlusion escape hatch, shared by every aimed input tool — a rule
+ *  worded differently per tool is a rule an agent reads as two rules (mcp-tool-conventions.md §2). */
+export const allowOccludedParam = z.boolean().optional().describe(
+  'Aim there even though something covers the target (default false = REFUSED, naming the cover). '
+  + 'A covered press lands on the covering element, so reporting ok would be a false success — the '
+  + 'worst outcome on this surface. Applies to `entity` and `selector` aims; raw {x,y} is never '
+  + 'refused, because a coordinate is exactly what you asked for.',
+);
+
 export const pointSpec = z.object({
   x: z.number().optional(),
   y: z.number().optional(),
   selector: z.string().optional(),
   entity: entitySpec.optional(),
+  allowOccluded: allowOccludedParam,
 });
 
 /** The `mutate_scene` op vocabulary as a REAL schema, not `z.record(z.any())`.
