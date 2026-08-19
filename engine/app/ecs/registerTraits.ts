@@ -946,7 +946,7 @@ export function registerAllTraits() {
       // ── Text section ──
       text: { type: 'string', tooltip: 'Text content. Supports {storeField} templates', ...S('Text'), sectionDivider: true },
       fontSize: { type: 'number', step: 1, tooltip: 'Text size, in fontSizeUnit (px by default).', ...S('Text') },
-      fontSizeUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for fontSize. Default px.\nSet it to vmin when the element\u2019s HEIGHT comes from its text and its parent is sized in %/vh \u2014 otherwise the parent scales and the text does not, and there is a viewport size below which the content overflows its container. lineHeight is still px-only, so leave it 0 (auto) with a scaling fontSize.', ...S('Text') },
+      fontSizeUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for fontSize. Default px.\nSet it to vh when the element\u2019s HEIGHT comes from its text and its parent is sized in %/vh \u2014 vh, NOT vmin, which is min(vw,vh) and so follows WIDTH on any viewport taller than wide (every phone in portrait), leaving the text fixed while the parent shrinks \u2014 otherwise the parent scales and the text does not, and there is a viewport size below which the content overflows its container. lineHeight is still px-only, so leave it 0 (auto) with a scaling fontSize.', ...S('Text') },
       fontWeight: { type: 'enum', options: ['normal', 'bold'], tooltip: 'Text weight', ...S('Text') },
       fontStyle: { type: 'enum', options: ['normal', 'italic'], tooltip: 'Text style', ...S('Text') },
       textColor: { type: 'color', alphaField: 'textOpacity', tooltip: 'Text color', ...S('Text') },

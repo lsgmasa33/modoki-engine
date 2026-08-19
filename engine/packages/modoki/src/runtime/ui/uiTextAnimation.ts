@@ -78,7 +78,8 @@ export interface UITextAnimStyle {
 }
 
 /** Map an effect + params → the CSS animation for a DOM text element, or null for
- *  `none`/unknown. `fontSize` scales the em amplitude to px. Pure. */
+ *  `none`/unknown. The amplitude comes back in **em** and is resolved by the renderer against
+ *  the element's own computed font size, so this takes no `fontSize` (#245). Pure. */
 export function uiTextAnimation(params: UITextAnimParams): UITextAnimStyle | null {
   const m = EFFECTS[params.effect];
   if (!m) return null;

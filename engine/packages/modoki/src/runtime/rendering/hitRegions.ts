@@ -33,9 +33,20 @@
 
 /** A region's geometry. Circles are not expressible as rects and the difference is exactly what
  *  was misread in the Court session, so the shape is a discriminated union rather than a
- *  lowest-common-denominator box. */
+ *  lowest-common-denominator box.
+ *
+ *  ⚠️ **`x`/`y` is the CENTRE on every variant, including `rect`** — the rect is (centre, size),
+ *  NOT (top-left, size). That is deliberate (it matches `circle`, and every provider hit-tests as
+ *  `|x - s.x| <= s.w / 2`; see `hitShapeContains`), and it is the opposite of every other rect an
+ *  agent meets in this repo — `get_layout_bounds`'s `screen: {x,y,w,h}`, `InputPressRecord`, DOM
+ *  `getBoundingClientRect` — all of which are top-left. So the reflex `cx = x + w / 2` computes a
+ *  point half a cell DOWN-RIGHT of the real centre, which on a grid lands exactly on the boundary
+ *  and tips into the neighbouring cell. That cost a session an hour of mis-aimed drags against
+ *  Court's board (2026-08-19) before the convention was read out of this file, so it is written
+ *  down here rather than left to be re-derived: to aim at a region, use `x`/`y` UNCHANGED. */
 export type HitShape =
   | { type: 'circle'; x: number; y: number; r: number }
+  /** `x`/`y` is the rect's CENTRE, not its top-left corner — see the warning above. */
   | { type: 'rect'; x: number; y: number; w: number; h: number }
   /** Points in viewport CSS px, implicitly closed. */
   | { type: 'poly'; points: Array<{ x: number; y: number }> };

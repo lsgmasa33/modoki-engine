@@ -128,7 +128,13 @@ export const UIElement = trait({
    * the main menu, where three difficulty buttons pushed the column off the paper page below a
    * ~975px window (measured, #245).
    *
-   * Set it to `vmin` to make text scale with the viewport the way `width`/`padding` already can.
+   * Set it to `vh` to make text scale with the viewport the way `width`/`padding` already can.
+   *
+   * ⚠️ **`vh`, not `vmin`.** `vmin` is `min(vw, vh)`, so it follows WIDTH on any viewport
+   * TALLER than it is wide — every phone in portrait. There, shrinking only the height leaves a
+   * `vmin` font unchanged while a `%`/`vh` parent shrinks under it, which is this bug intact. A
+   * vertical constraint needs a vertical unit, and `vh` is the one that tracks height in both
+   * orientations. Court authors all 11 of its scaling text fields in `vh` (#245).
    *
    * ⚠️ `lineHeight` has the SAME shape and is still px-only — deliberately out of scope here, so
    * a scaling `fontSize` with an authored `lineHeight` will drift. Author `lineHeight` 0 (auto)

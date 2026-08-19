@@ -62,8 +62,11 @@ Field groups (representative fields, verified against `UIElement.ts`):
   screen size and drifted at every other", and its main menu overflowing the paper page below a
   ~975px window. `fontSizeUnit` defaults to `'px'`, so nothing authored before it changes.
   **Pick the unit from the CONSTRAINT's axis**: if the thing that must fit is a height, use `vh` —
-  `vmin` is `min(vw,vh)` and tracks WIDTH on any landscape host, so a window that only gets shorter
-  would shrink the parent and leave the text alone. And remember margin/padding percentages resolve
+  `vmin` is `min(vw,vh)`, so it equals `vh` only while the host is WIDER than tall and follows
+  WIDTH the moment it is TALLER than wide, which is every phone in portrait. There a window that
+  only gets shorter shrinks the parent and leaves `vmin` text alone — the bug intact, on the
+  orientation a mobile game ships in. `vh` tracks height in both orientations, which is the whole
+  reason to prefer it. And remember margin/padding percentages resolve
   against WIDTH even for `marginTop`, so a `%` top margin is a width-derived vertical term.
   ⚠️ **`letterSpacing` carries a unit too, and it must MATCH `fontSizeUnit`.** Tracking is only
   meaningful as a ratio of the glyph size, so px tracking under a scaling font says something

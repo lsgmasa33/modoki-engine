@@ -410,7 +410,12 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'distance in px. A region may carry `drawnShape` when the game DRAWS a different shape than ' +
       'it hit-tests (a forgiving grab radius, a badge smaller than its ring) — that difference is ' +
       'usually the bug. READ `providers`: an empty region list with no provider registered means ' +
-      'NOBODY COULD ANSWER, which is not the same as "there is nothing there".',
+      'NOBODY COULD ANSWER, which is not the same as "there is nothing there". ' +
+      '⚠️ A shape\'s `x`/`y` is its CENTRE on EVERY type, `rect` included — a rect is ' +
+      '(centre, w, h), NOT (top-left, w, h), the opposite of get_layout_bounds\' `screen` rect ' +
+      'and of a DOM rect. To aim at a region pass its `x`/`y` UNCHANGED; the reflex `x + w/2` ' +
+      'lands half a cell down-right, which on a grid is exactly the boundary and resolves to the ' +
+      'NEIGHBOURING cell.',
     {
       action: z.enum(['read', 'show', 'hide']).optional().describe("read the regions as data (default) | show the on-screen overlay | hide it"),
       provider: z.string().optional().describe('(read) Only this provider\'s regions (a game id, e.g. "court").'),
