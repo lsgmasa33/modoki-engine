@@ -255,6 +255,45 @@ re-applies the root's extra traits, and replays the `overrides` map per localId.
 Override tracking is per-localId, so edits to a sub-entity (not just the root)
 survive a reload.
 
+## ⚠️ A prefab EDIT empties the runtime cache, and nothing refills it
+
+**Saving a prefab in the editor drops it out of the runtime cache, and only a SCENE LOAD puts it
+back.** A game that spawns prefab instances at runtime therefore stops being able to, silently,
+for the rest of the session — the symptom is whatever that game does when the prefab is missing.
+
+The mechanism, verified in a running editor (2026-08-19):
+
+- Every prefab write/overwrite/undo goes through `setPrefabCache()`
+  (`editor/scene/prefab.ts`), which calls `invalidatePrefab(source)` — deleting the entry from
+  the **runtime** `prefabCache` in `runtime/loaders/meshTemplateCache.ts`.
+- `acquirePrefab` is the only thing that refills it, and it is called from just two kinds of
+  place: `SceneManager` during a scene load, and games that preload deliberately
+  (`games/sling`, `demos/forest-camp`, each with its own owner-id sentinel).
+- So after an edit, `getCachedPrefab()` returns `undefined` until the next scene load
+  (Stop→Play, or reopening the project). **Nothing warns.**
+
+**What this looks like in a game**, and it is not hypothetical: Court's guard flag falls back to
+drawn primitives when its prefab is uncached, so flags planted before the edit kept the real art
+and every one planted after it drew a placeholder — a permanently half-placeholder board, in
+exactly the tweak-the-prefab-live workflow the prefab existed to support. Fixed there by
+recording the art each instance was spawned with, retiring on a mismatch, and asking for the
+prefab back once on a miss (`syncFlags`, `games/court/runtime/systems.ts`).
+
+**If you spawn prefab instances at runtime, handle the miss on purpose.** Two things, and the
+first alone is not enough:
+
+1. **Re-acquire on a cache miss** — `void acquirePrefab(<your owner sentinel>, guid)`, guarded so
+   it fires once per guid rather than every frame.
+2. **Remember what each live instance was built FROM**, and retire instances whose source no
+   longer matches. Without this, the window between the invalidation and the re-acquire leaves a
+   mixed population that never converges, because "this cell already has an instance" is true and
+   says nothing about which art that instance wears.
+
+⚠️ **`games/court`'s tray badge reads the same cache and has NOT been audited for this**
+(`refreshBadgeLayout` → `getCachedPrefab`, falling back to code constants). `games/court/art.md`
+claims the tray "picks the new offsets up when you leave edit mode"; that claim predates this
+finding and has not been re-tested against it. Tracked separately rather than fixed blind.
+
 ## Mesh sharing
 
 Instances are cheap: they reuse the cached mesh **template** geometry and
