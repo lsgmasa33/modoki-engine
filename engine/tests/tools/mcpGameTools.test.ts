@@ -20,6 +20,7 @@ import { createToolContext } from '../../tools/modoki-mcp/src/context';
 import { createGameToolSync, shapeFromDecl, fingerprint } from '../../tools/modoki-mcp/src/gameTools';
 import { registerAllTools } from '../../tools/modoki-mcp/src/registerAll';
 import { clearRegistry, getTool, toolNames } from '../../tools/modoki-mcp/src/registry';
+import { validateAgentToolArgs, type AgentToolDef } from '../../packages/modoki/src/runtime/debug/agentToolRegistry';
 
 const STUB = 'http://stub.modoki.test';
 
@@ -108,6 +109,48 @@ describe('shapeFromDecl', () => {
   // selection and reported ok).
   it('refuses the WHOLE tool on an unrecognised param type', () => {
     expect(shapeFromDecl({ ok: { type: 'string', description: 'a' }, bad: { type: 'object', description: 'b' } as never })).toBeNull();
+  });
+});
+
+// ── The declaration has TWO implementations, and they must agree ──────────────────────────
+//
+// `shapeFromDecl` rebuilds a zod shape (that is what puts a real schema in the tool list, and it
+// is what the EDITOR MCP validates with); `validateAgentToolArgs` is the engine-side enforcement
+// every OTHER caller inherits — curl, device_eval, the device relays. One declaration, two
+// validators, no shared code: exactly the shape that drifts, and the drift would be invisible
+// because each half is tested against itself. A call accepted on one path and refused on the
+// other is the bug this table exists to catch.
+describe('the zod rebuild and the op-side validator agree', () => {
+  const DECL = {
+    levelId: { type: 'string' as const, description: 'guid' },
+    track: { type: 'string' as const, description: 'ladder', enum: ['easy', 'hard'] },
+    index: { type: 'number' as const, description: 'position', int: true },
+    ratio: { type: 'number' as const, description: 'any number' },
+    settle: { type: 'boolean' as const, description: 'wait' },
+    must: { type: 'string' as const, description: 'required', required: true },
+  };
+  const def = { name: 'court_x', description: 'd', mutates: false, params: DECL, handler: async () => ({}) } as AgentToolDef;
+  const shape = shapeFromDecl(DECL as never)!;
+
+  const CASES: Array<[string, Record<string, unknown>]> = [
+    ['everything valid', { must: 'a', levelId: 'g', track: 'hard', index: 3, ratio: 1.5, settle: true }],
+    ['only the required one', { must: 'a' }],
+    ['required missing', {}],
+    ['unknown key', { must: 'a', nope: 1 }],
+    ['typo of a real key', { must: 'a', trak: 'hard' }],
+    ['enum value not in the list', { must: 'a', track: 'brutal' }],
+    ['int given a fraction', { must: 'a', index: 2.5 }],
+    ['number given a string', { must: 'a', ratio: '1.5' }],
+    ['boolean given a string', { must: 'a', settle: 'yes' }],
+    ['string given a number', { must: 'a', levelId: 7 }],
+    ['required given a number', { must: 7 }],
+    ['NaN for a number', { must: 'a', ratio: Number.NaN }],
+  ];
+
+  it.each(CASES)('agrees on: %s', (_label, args) => {
+    const zodOk = z.object(shape).strict().safeParse(args).success;
+    const opOk = validateAgentToolArgs(def, args) === null;
+    expect(opOk, `zod says ${zodOk ? 'accept' : 'reject'}, the op validator says ${opOk ? 'accept' : 'reject'}`).toBe(zodOk);
   });
 });
 

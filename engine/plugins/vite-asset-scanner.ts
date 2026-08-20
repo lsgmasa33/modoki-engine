@@ -9,7 +9,7 @@ import { fileURLToPath } from 'url';
 import { spawn, execFileSync } from 'child_process';
 import crypto, { randomUUID } from 'crypto';
 import type { Plugin } from 'vite';
-import { computeKeptAssets, formatBytes } from './asset-tree-shaker';
+import { computeKeptAssets, enumerateRefEdges, formatBytes } from './asset-tree-shaker';
 import { assertNoConversionFallback, type ConversionFailure } from './asset-conversion-strict';
 import { loadProjectConfig, loadProjectUserConfig, validateBuildConfig, projectConfigUnionErrors } from './load-project-config';
 import { stripPrivateBuildFields } from '../project-config';
@@ -1009,15 +1009,15 @@ export function buildManifest(assets: AssetEntry[], heal = false): { version: 2;
   if (heal) {
     for (const it of items) {
       if (it.entry.guid || !it.absPath || !fs.existsSync(it.absPath)) continue;
-      // Fonts are the one type referenced by CSS family name, never by GUID
-      // (see assetManifest's fontFamily exception) — minting sidecars for the
-      // bundled families would be pure churn, so skip them.
-      // NOTE this skips MINTING only. A font that already HAS a sidecar keeps its
-      // guid: the loop bails at the `it.entry.guid` check above, and the manifest
-      // reads the id like any other asset. That is how the engine's default MSDF
-      // font works — its sidecar is committed (builtinAssets' DEFAULT_FONT_GUID)
-      // rather than minted here, which is why it survives this skip.
-      if (it.entry.type === 'font') continue;
+      // ⚠️ Fonts used to be SKIPPED here, on the premise that they were "referenced by CSS
+      // family name, never by GUID". That premise was already half-wrong — `Text2D.font` /
+      // `Text3D.font` are manifest GUIDs — and #231 made it wholly wrong by turning
+      // `UIElement.fontFamily` into a GUID ref too. With the skip in place a font a user
+      // drops into their project has NO guid, so it cannot be assigned to any font field at
+      // all: the Inspector refuses the drop (it will not write a raw path) and the picker
+      // has nothing to offer. The engine's nine bundled families all carry COMMITTED
+      // sidecars, so nothing is minted for them and the "pure churn" the skip avoided does
+      // not arise; a game's own font mints one sidecar, exactly as a texture does.
       const fresh = randomUUID();
       if (writeAssetGuid(it.absPath, it.entry.type, fresh)) {
         it.entry.guid = fresh;
@@ -1567,6 +1567,7 @@ export function assetScannerPlugin(): Plugin {
               if (mod) server.moduleGraph.invalidateModule(mod);
             },
             computeUnused: () => computeKeptAssets(projectRoot, assetRoots),
+            computeRefEdges: () => enumerateRefEdges(projectRoot, assetRoots),
           };
           // Read the request body (empty for GET) before dispatch.
           let raw = '';
@@ -3208,14 +3209,15 @@ export function assetScannerPlugin(): Plugin {
       // The source `.ttf`/`.otf` ships ONLY when something needs it. There are two
       // distinct consumers, and only one needs the real outlines: CANVAS text
       // (`Text2D.font`, a GUID) renders from the atlas alone, while DOM/PixiJS text
-      // (`UIElement.fontFamily`, a CSS family NAME) goes through the browser's
+      // (`UIElement.fontFamily`, a font-asset GUID since #231) goes through the browser's
       // FontFace API — and the manifest entry for a font IS its source path, so
       // `loadAllFonts` FontFace-loads exactly that. Shipping it unconditionally wastes
       // ~300KB/font on a canvas-only game; never shipping it 404s at boot
       // ("[FontLoader] N/N fonts failed to load") for a DOM-using one. So: ship the
       // source iff `result.domFontFiles` (computed by the shaker's font-family walk —
       // see resolveFontsByFamily in asset-tree-shaker.ts) says a scene/prefab named
-      // this font's family in `fontFamily`, UNLESS `shipSource` overrides the call —
+      // this font in `fontFamily` (by GUID, or by family name in a pre-#231 scene),
+      // UNLESS `shipSource` overrides the call —
       // `'always'` for a family named from CODE (a runtime string, not a scene field,
       // which the static scan can't see) or `'never'` to force-drop despite detected
       // DOM usage. The decision is recorded as `sourceShipped` on the manifest's `font`

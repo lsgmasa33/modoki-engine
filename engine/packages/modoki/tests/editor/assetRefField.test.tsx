@@ -1,7 +1,8 @@
 /** AssetRefField drop invariant (editor-inspector Tests P1).
  *  The load-bearing rule: an asset drop must write a stable GUID, never a raw asset
  *  path (the runtime hard-rejects path refs). Dropping resolves guid-from-payload →
- *  guid-from-manifest → REFUSE. Font drops resolve to a CSS family name instead.
+ *  guid-from-manifest → REFUSE. Fonts are no exception since #231 — a font drop writes the
+ *  GUID too, and additionally registers the FontFace so DOM text can use it.
  *  Driven by dispatching the `asset-drop` CustomEvent the dragGhost emits. */
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -27,6 +28,7 @@ const loadFont = vi.fn((_p: string) => Promise.resolve('My Family'));
 vi.mock('../../src/runtime/loaders/fontLoader', () => ({
   loadFont: (p: string) => loadFont(p),
   fontPathFromFamily: () => null,
+  fontFamilyFromPath: (p: string) => p.split('/').pop()!.replace(/\.[^.]+$/, ''),
 }));
 
 import { AssetRefField, isAcceptableTypedRef } from '../../src/editor/panels/AssetRefField';
@@ -78,23 +80,30 @@ describe('AssetRefField — GUID-only drop invariant', () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  it('resolves a font drop to a CSS family name on a fontFamilyRef field (UIElement.fontFamily)', async () => {
-    const { onChange, wrapper } = renderField({ accept: ['.ttf'], fontFamilyRef: true });
-    drop(wrapper, { path: '/games/x/assets/Roboto.ttf', guid: 'guid-font' });
-    await Promise.resolve(); await Promise.resolve(); // let the loadFont().then settle
-    expect(loadFont).toHaveBeenCalledWith('/games/x/assets/Roboto.ttf');
-    expect(onChange).toHaveBeenCalledWith('My Family');
-  });
-
-  it('resolves a font drop to a GUID on an SDF font field (Text2D/Text3D.font)', async () => {
-    // Default (not fontFamilyRef): a font ref stores the asset GUID like any other
-    // asset — a family name here would fail the runtime's GUID-only resolve (renders
-    // nothing). Regression for "dropped a font on Text2D.font → stored 'Geologica'".
+  /** #231: EVERY font field stores a GUID now — `UIElement.fontFamily` included. It used to
+   *  be the one field a drop resolved to a CSS family NAME instead, which is what made it
+   *  invisible to the build's ref walk. Regression for both halves: the ref written is the
+   *  GUID, and the face is still registered with the browser (a DOM consumer needs the
+   *  FontFace, and nothing else would add it before the next scene load). */
+  it('stores the GUID on a font drop — and registers the face', async () => {
     const { onChange, wrapper } = renderField({ accept: ['.ttf'] });
     drop(wrapper, { path: '/games/x/assets/Roboto.ttf', guid: 'guid-font' });
     await Promise.resolve(); await Promise.resolve();
-    expect(loadFont).not.toHaveBeenCalled();
+    expect(loadFont).toHaveBeenCalledWith('/games/x/assets/Roboto.ttf');
+    expect(onChange).toHaveBeenCalledWith('guid-font');   // never the family name
+  });
+
+  it('a font whose FontFace fails to load still writes the ref', async () => {
+    // The ref is valid regardless — a failed fetch/decode is a rendering fallback, not a
+    // reason to drop an authored assignment (and never an unhandled rejection).
+    (loadFont as unknown as { mockRejectedValueOnce: (e: Error) => void })
+      .mockRejectedValueOnce(new Error('boom'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { onChange, wrapper } = renderField({ accept: ['.ttf'] });
+    drop(wrapper, { path: '/games/x/assets/Roboto.ttf', guid: 'guid-font' });
+    await Promise.resolve(); await Promise.resolve();
     expect(onChange).toHaveBeenCalledWith('guid-font');
+    warn.mockRestore();
   });
 
   // ── Typed-input guard: a GUID-only field must REJECT a stray string ──
@@ -128,13 +137,12 @@ describe('isAcceptableTypedRef — what manual text entry may commit', () => {
     expect(isAcceptableTypedRef('1', ['.png'])).toBe(false);
     expect(isAcceptableTypedRef('foo', ['sprite'])).toBe(false);
   });
-  it('allows a font-family name only for a CSS-family field (fontFamilyRef)', () => {
-    // UIElement.fontFamily (fontFamilyRef=true) takes a family name…
-    expect(isAcceptableTypedRef('Helvetica Neue', ['.ttf'], true)).toBe(true);
-    // …but an SDF font-GUID field (Text.font, fontFamilyRef=false) does NOT — a family
-    // name there resolves to nothing at runtime, so it's rejected.
+  it('rejects a font-family NAME in every font field (#231)', () => {
+    // Both UIElement.fontFamily and Text2D/Text3D.font hold a GUID now, so a typed family
+    // name is rejected in both — it would resolve to nothing at runtime. A system typeface
+    // is authored in `UIElement.systemFont`, a plain string field that never routes here.
     expect(isAcceptableTypedRef('Helvetica Neue', ['.ttf'])).toBe(false);
-    expect(isAcceptableTypedRef('Helvetica Neue', ['.png'], true)).toBe(false);
+    expect(isAcceptableTypedRef('Helvetica Neue', ['.png'])).toBe(false);
   });
   it('allows primitive sprite keywords only for sprite/image fields', () => {
     expect(isAcceptableTypedRef('circle', ['sprite'])).toBe(true);

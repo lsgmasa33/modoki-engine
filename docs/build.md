@@ -517,6 +517,87 @@ Nothing in committed content reaches it (`space-console`'s `Station.scene.json` 
 above: since a ref the walker cannot see now **fails the build**, leaving the gap would have turned a
 silent 404 into a hard stop on legitimate authoring.
 
+## Find References — the same walk, inverted (#284)
+
+"What references this?" is the reverse of the question the tree-shaker above answers, and it is
+served by **inverting that same walk** rather than by a second one. `enumerateRefEdges`
+(`engine/plugins/asset-tree-shaker.ts`) runs `computeKeptAssets` with three options a production
+shake never sets — an `onRef` observer, an `onEntity` observer, and `seedAllWalkable` — and
+`engine/plugins/assetRefGraph.ts` builds the reverse index out of the edges it emits. Consumers:
+`GET /api/find-references`, the `modoki_find_references` MCP tool, and the editor's **Find
+References** on an Assets row and a Hierarchy row.
+
+⚠️ **Do not write a second walker for this.** Two graphs over the same data drift, and the one that
+drifts is the one nothing in CI runs — which would be this one. The failure is silent: a wrong
+"0 references" looks exactly like a right one, and the reader acts on it by deleting something.
+
+**Why an ad-hoc grep is not merely inconvenient but WRONG.** The graph has edges no file records,
+and they are the majority of the 2D/UI surface:
+
+| implicit edge | what holds it | why a grep misses it |
+|---|---|---|
+| **derived sprite** | a `Renderable2D.sprite` / `UIElement.imageSrc` holds `deriveGuid('sprite:' + textureGuid)` | that guid appears in **no file** as the texture's id |
+| **slice** | a sprite-sheet slice guid, living in the texture's `.meta.json` `sprites[]` | the ref names the slice, not the sheet |
+| **atlas member** | a packed member guid, redirected to the built `.atlas.json` | the ref names the member, not the atlas |
+
+This is not hypothetical. An agent asked "is this texture still used?", swept for each texture's own
+guid, and reported **every icon in `games/court` as orphaned** — including two wired minutes
+earlier. Measured on Court today, over the DEDUPED graph: **108 of its 233 asset-to-asset edges are
+`derived-sprite`** — 46%, so that sweep was blind to nearly half the graph it was reasoning about.
+`buildGuidIndex` already models all three, which is exactly why the inversion reuses it.
+
+**What it returns, and the two distinctions that make an answer actionable:**
+- **Paths, not a count.** `Coin@tray-badge.prefab.json [Renderable2D.sprite derived-sprite]` names
+  the file AND the field to edit; "12 references" names nothing.
+- **direct vs indirect.** A texture reached only through material → mesh is still used, but what
+  you edit to break the link is a different file.
+- **`reachable`.** A referrer that is itself dropped from a production build is a weaker reference
+  than one that ships. Computed by forward BFS from the shake's real seeds (scenes + keep-list),
+  which is why `seedAllWalkable` is a graph-only option: the reverse index needs an orphan
+  prefab's OUTBOUND edges, but must not let seeding it make it look live.
+
+**Three traps recorded because each one produced a wrong answer during the build:**
+- **A prefab instance's identity is the entry's top-level `guid`, not `EntityAttributes.guid`** —
+  measured on Court, where all 25 instances are shaped that way and `PrefabInstance.rootInstanceId`
+  names that same guid. Reading only the trait made 26 live entity refs look dangling. That rule now
+  lives in ONE place, `entityGuid` in `runtime/scene/sceneMutate.ts`, and the walk calls it: the
+  mutate path already had it right, this walk re-derived it and got the fallback order wrong — which
+  is the same single-source-of-truth failure the feature itself is about, one level down.
+- **A self-edge is not a reference.** `rootInstanceId` on an instance root names its own guid, so
+  every prefab instance reported itself as its own referrer — which also made `unreferenced` wrong,
+  since a self-edge is an inbound edge.
+- **`meta` sidecars are not assets.** Both halves (`.meta.json` and the machine-local
+  `.meta.local.json`) are metadata ABOUT an asset; listing them added a phantom row per imported
+  binary, the same defect the Clean Up dialog already fixed once (QA-DLG-0006).
+
+**`unreferenced` is NOT `unused`, and conflating them reports every scene as garbage.**
+`/api/unused-assets` asks *would a production build DROP this?* — reachability from a root.
+`/api/find-references?unreferenced=1` asks *does anything point at it?* A root scene is referenced
+by nothing and is emphatically not unused, so seeds are excluded from that query. The two live on
+separate routes for this reason.
+
+**`dangling` is a lead, not a verdict.** A guid that resolves to neither a tracked asset nor an
+entity is reported as "could not resolve" — never as "broken" — because the guid index only covers
+asset kinds `classify()` knows, so a ref to a game-defined JSON kind lands there even when the file
+exists (Court's `.court.json` levels are `unknown-json`).
+
+Cost, measured warm on this Mac: **6-64 ms** to enumerate and **0-2 ms** to build the graph, across
+five committed projects (56-1,185 files). No caching — the query is on-demand and the walk is
+cheaper than the round trip. (It was roughly double that until the close-out review noticed
+`buildGuidIndex` — which stats every shippable file and reads every `.meta.json` sidecar — was
+running twice per query; `computeKeptAssets` now takes a prebuilt index.)
+
+**`dangling` covers declared asset slots too, and that is not where it started.** It was populated
+only from the generic entity-ref sweep, so a `.mesh.json` whose `model` guid pointed at nothing
+answered `unresolvedRefsFromTarget: []` — the structured signal silently absent for exactly the
+asset-to-asset refs this section is about, while the doc comment promised the opposite. Caught in
+the #284 close-out review, pinned by a mutation-checked test. A `font-family` edge is deliberately
+NOT dangling: a CSS family name is not a guid, and `resolveFontsByFamily` resolves it at the end of
+the walk.
+
+⚠️ **It reads FILES ON DISK.** An unsaved live-world edit is invisible to it, so a user who just
+wired something up and did not save will be told "0 references". Save first.
+
 ## Packaged editor loop (test the DMG faithfully, fast)
 
 ⚠️ **Why the packaged reaper is anchored to a bundle PATH, and must stay that way.** For months,
@@ -1075,7 +1156,7 @@ independent consumers needing different files:
 | consumer | authored as | needs |
 |---|---|---|
 | canvas text (`Text2D.font`) | a **GUID** | `~atlas.png` + `~metrics.json` |
-| DOM text (`UIElement.fontFamily`, CSS) | a **family NAME** | the source `.ttf`/`.otf`, via FontFace |
+| DOM text (`UIElement.fontFamily`) | a **GUID** (a family NAME before #231) | the source `.ttf`/`.otf`, via FontFace |
 
 `loadAllFonts` FontFace-loads the manifest path directly, so dropping the source 404'd every baked
 font at boot in every game — visible only as `[FontLoader] N/N fonts failed to load`, with the
@@ -1087,8 +1168,9 @@ the tree-shaker's font-family walk (`TreeShakeResult.domFontFiles`). The build l
 per font, and the manifest records `font.sourceShipped`, which `loadAllFonts` reads so a
 deliberately-dropped font is skipped rather than fetched-and-warned.
 
-⚠️ **`shipSource: 'auto'` cannot see a family named in CSS or assigned from game code** — a static
-scan only reaches scene/prefab `fontFamily`. A game that styles DOM text from a stylesheet must set
+⚠️ **`shipSource: 'auto'` cannot see a font named in CSS or assigned from game code** — a static
+scan only reaches scene/prefab `fontFamily` (a GUID since #231, so the walk follows it as a real
+ref and keeps its family's other variants too). A game that styles DOM text from a stylesheet must set
 `shipSource: 'always'` in the font's `.meta.json`, or its text silently falls back to a system face.
 This is the one known blind spot in the rule.
 

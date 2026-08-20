@@ -134,6 +134,9 @@ interface EditorState {
   projectSettingsOpen: boolean;
   /** "Clean Up Unused Assets" dialog open state */
   cleanupAssetsOpen: boolean;
+  /** "Find References" dialog target (#284) — an asset GUID/path or entity GUID plus
+   *  a display label. null = dialog closed. */
+  findReferencesTarget: { target: string; label: string } | null;
   /** "Build Support" dialog open state (toolchain detection + install/guide). */
   buildSupportOpen: boolean;
   /** "Publish OTA Update…" dialog open state (docs/plans/mobile-ota-updates-plan.md Phase 5a). */
@@ -254,6 +257,8 @@ interface EditorState {
   closeProjectSettings: () => void;
   openCleanupAssets: () => void;
   closeCleanupAssets: () => void;
+  openFindReferences: (target: string, label: string) => void;
+  closeFindReferences: () => void;
   openBuildSupport: () => void;
   closeBuildSupport: () => void;
   openOtaPublish: () => void;
@@ -447,6 +452,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   revertPrefabDialog: { active: false, rootInstanceId: null },
   projectSettingsOpen: false,
   cleanupAssetsOpen: false,
+  findReferencesTarget: null,
   buildSupportOpen: false,
   otaPublishOpen: false,
   otaKeysOpen: false,
@@ -628,6 +634,8 @@ export const useEditorStore = create<EditorState>((set, get) => {
   closeProjectSettings: () => set({ projectSettingsOpen: false }),
   openCleanupAssets: () => set({ cleanupAssetsOpen: true }),
   closeCleanupAssets: () => set({ cleanupAssetsOpen: false }),
+  openFindReferences: (target, label) => set({ findReferencesTarget: { target, label } }),
+  closeFindReferences: () => set({ findReferencesTarget: null }),
   openBuildSupport: () => set({ buildSupportOpen: true }),
   closeBuildSupport: () => set({ buildSupportOpen: false }),
   openOtaPublish: () => set({ otaPublishOpen: true }),

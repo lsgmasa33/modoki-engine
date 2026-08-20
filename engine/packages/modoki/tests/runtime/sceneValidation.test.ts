@@ -317,6 +317,38 @@ describe('validateSceneData — asset reference rule', () => {
     expect(res.warnings).toEqual([]);
   });
 
+  /** #231 — `UIElement.fontFamily` is a ref field now, which is the point of the whole
+   *  change: the validator, `diagnose` and the build tree-shaker all read the SAME registry,
+   *  so joining it is what makes a UI font ref checkable at all. A pre-#231 family name is
+   *  reported as the non-GUID it is (the runtime still renders it — warn-but-load), and a
+   *  literal font PATH is reported as the literal path it is, which the field-specific
+   *  exclusion used to prevent. */
+  describe('UIElement.fontFamily', () => {
+    const uiSchema: SceneSchema = {
+      traits: { UIElement: { category: 'component', fields: { fontFamily: { type: 'string' }, systemFont: { type: 'string' } } } },
+    };
+
+    it('accepts a font-asset GUID', () => {
+      const res = validateSceneData(scene([{ id: 1, name: 'X', traits: { UIElement: { fontFamily: GUID } } }]), uiSchema);
+      expect(res.warnings).toEqual([]);
+    });
+
+    it('flags a legacy CSS family NAME', () => {
+      const res = validateSceneData(scene([{ id: 1, name: 'X', traits: { UIElement: { fontFamily: 'Varela Round' } } }]), uiSchema);
+      expect(res.warnings.join('\n')).toMatch(/'Varela Round' is not a GUID or URL/);
+    });
+
+    it('flags a literal font path', () => {
+      const res = validateSceneData(scene([{ id: 1, name: 'X', traits: { UIElement: { fontFamily: '/games/x/assets/fonts/Inter.ttf' } } }]), uiSchema);
+      expect(res.warnings.join('\n')).toMatch(/internal asset path .* references must be a GUID/);
+    });
+
+    it('does not flag systemFont — a CSS family name there is the point of the field', () => {
+      const res = validateSceneData(scene([{ id: 1, name: 'X', traits: { UIElement: { systemFont: 'system-ui' } } }]), uiSchema);
+      expect(res.warnings).toEqual([]);
+    });
+  });
+
   // Renderable2D.material is a NEW ref field (REF_FIELDS_BY_TRAIT.Renderable2D = ['sprite','material']).
   // Unlike `sprite`, it gets NO primitive-keyword exemption — that carve-out is gated on field==='sprite'.
   describe('Renderable2D.material', () => {

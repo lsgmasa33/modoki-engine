@@ -998,6 +998,7 @@ describe('collectResourceRefsFromEntities', () => {
   const PRIM_MAT_GUID = 'b1000000-0000-4000-8000-000000000003';
   const SPRITE_GUID = 'b1000000-0000-4000-8000-000000000004';
   const IMG_GUID = 'b1000000-0000-4000-8000-000000000005';
+  const FONT_GUID = 'b1000000-0000-4000-8000-000000000007';
   const SHARED_MAT_GUID = 'b1000000-0000-4000-8000-000000000006';
   const MODEL_GUID = 'b1000000-0000-4000-8000-000000000010';
   const PREFAB_GUID = 'b1000000-0000-4000-8000-000000000011';
@@ -1108,10 +1109,71 @@ describe('collectResourceRefsFromEntities', () => {
   it('collects UIElement imageSrc and fontFamily', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([
-      { traits: { UIElement: { imageSrc: IMG_GUID, fontFamily: 'Roboto' } } },
+      { traits: { UIElement: { imageSrc: IMG_GUID, fontFamily: FONT_GUID } } },
     ]);
     expect(refs).toContainEqual({ type: 'texture', path: IMG_GUID });
-    expect(refs).toContainEqual({ type: 'font', path: 'Roboto' });
+    // `font-family`, not `font`: the DOM consumer needs every VARIANT of the family
+    // registered with the browser, where an SDF `font` acquire loads one atlas (#231).
+    expect(refs).toContainEqual({ type: 'font-family', path: FONT_GUID });
+  });
+
+  /** One font asset, TWO consumers — Court's shape: an SDF atlas for a canvas label and a
+   *  FontFace for DOM text. Both entries must survive. They did not at first: `add()` marks a
+   *  ref as `claimed` so the generic game-trait sweep will not re-type it, and the DOM ref
+   *  claimed the GUID first — silently dropping the atlas preload for a scene that renders both. */
+  it('emits BOTH font and font-family when one asset is referenced by each', async () => {
+    const { collectResourceRefsFromEntities } = await getLoader();
+    const refs = collectResourceRefsFromEntities([
+      { traits: { UIElement: { fontFamily: FONT_GUID } } },
+      { traits: { Text2D: { font: FONT_GUID } } },
+    ]);
+    expect(refs).toContainEqual({ type: 'font-family', path: FONT_GUID });
+    expect(refs).toContainEqual({ type: 'font', path: FONT_GUID });
+  });
+
+  /** The other half of the same rule, and the one that bit: a font referenced ONLY as a DOM
+   *  font must NOT also be acquired as an SDF atlas. The generic game-trait sweep types a GUID
+   *  by the asset's MANIFEST type, and a font asset's type is always 'font' — so with the
+   *  fontFamily field left un-skipped it re-derived an SDF `font` acquire from the fontFamily
+   *  field itself: a real ~atlas.png fetch + GPU upload on every scene load, for a game whose
+   *  font is DOM-only and where nothing renders canvas text at all. */
+  it('does NOT emit an SDF font acquire for a DOM-only font', async () => {
+    // REGISTERED on purpose: an unregistered GUID is skipped by the sweep for a trivial
+    // reason (it could be an entity reference), so the assertion below would hold whether or
+    // not the field-level skip works. The asset has to be a known font for this to mean
+    // anything.
+    const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
+    registerAsset(FONT_GUID, '/games/x/assets/fonts/VarelaRound-Regular.ttf', 'font');
+    const { collectResourceRefsFromEntities } = await getLoader();
+    const refs = collectResourceRefsFromEntities([
+      { traits: { UIElement: { fontFamily: FONT_GUID } } },
+    ]);
+    expect(refs).toEqual([{ type: 'font-family', path: FONT_GUID }]);
+  });
+
+  /** …and the sweep must still see a GAME trait's font ref, which is how Court's SDF board
+   *  font is collected (`CourtConfig.boardFont` is in no registry). This is the pair the
+   *  field-level skip has to satisfy at once. */
+  it('still collects an SDF font from a GAME trait naming the same asset', async () => {
+    // The sweep types a game-trait ref by the asset's MANIFEST type, so the asset has to be
+    // registered for this case to mean anything (an unregistered GUID is skipped silently —
+    // an entity reference is a GUID too).
+    const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
+    registerAsset(FONT_GUID, '/games/x/assets/fonts/VarelaRound-Regular.ttf', 'font');
+    const { collectResourceRefsFromEntities } = await getLoader();
+    const refs = collectResourceRefsFromEntities([
+      { traits: { UIElement: { fontFamily: FONT_GUID }, CourtConfig: { boardFont: FONT_GUID } } },
+    ]);
+    expect(refs).toContainEqual({ type: 'font-family', path: FONT_GUID });
+    expect(refs).toContainEqual({ type: 'font', path: FONT_GUID });
+  });
+
+  it('drops a legacy CSS family NAME in fontFamily — it is not a fetchable ref', async () => {
+    const { collectResourceRefsFromEntities } = await getLoader();
+    const refs = collectResourceRefsFromEntities([
+      { traits: { UIElement: { imageSrc: '', fontFamily: 'Roboto' } } },
+    ]);
+    expect(refs).toEqual([]);
   });
 
   it('collects ModelSource glbPath with postprocessor', async () => {

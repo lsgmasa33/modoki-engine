@@ -195,6 +195,33 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     async (p) => editorAction('timeline-add-clip', p),
   );
 
+  // ── find_references (#284) ──
+  tool(
+    'modoki_find_references',
+    'What references this? Walks the reverse asset/entity reference graph from a target — ' +
+      'direct AND indirect chains (e.g. texture ← material ← mesh ← entity), including implicit ' +
+      'edges no single file records (a UI imageSrc holding the auto-emitted whole-image sprite ' +
+      "guid rather than the texture's own). Use before deleting/renaming an asset, or to find " +
+      'every entity that would be affected by changing a shared material/prefab. ' +
+      'Reads FILES ON DISK, not the live world — an unsaved edit in the running scene is not ' +
+      'reflected here; modoki_save_all first if you just changed something. ' +
+      'Returns {target, direct, indirect, returnedCount, totalCount, truncated, ' +
+      'unresolvedRefsFromTarget, warnings} — direct/indirect are hop-1 vs hop>1 referrer chains.',
+    {
+      target: z.string().describe('What to find references TO: an asset GUID, an entity GUID (EntityAttributes.guid, or a prefab instance\'s own guid), or a virtual asset path starting with "/" (e.g. /assets/textures/wood.png).'),
+      limit: z.number().int().positive().optional().describe('Cap the returned referrer entries (default 50, max 1000). Sets truncated + totalCount.'),
+      maxDepth: z.number().int().positive().optional().describe('How many reference hops back to walk (default 6, max 20). 1 = direct referrers only.'),
+      reachableOnly: z.boolean().optional().describe('Count only references that survive a production build (reachable from a scene root) — drops references living in dead/unreferenced files.'),
+    },
+    async ({ target, limit, maxDepth, reachableOnly }) => {
+      const q = new URLSearchParams({ target });
+      if (limit != null) q.set('limit', String(limit));
+      if (maxDepth != null) q.set('maxDepth', String(maxDepth));
+      if (reachableOnly) q.set('reachableOnly', '1');
+      return getJson(`/api/find-references?${q.toString()}`);
+    },
+  );
+
   // ── Phase G: input-feel capture (Electron editor only) ──
   tool(
     'modoki_capture_gesture',

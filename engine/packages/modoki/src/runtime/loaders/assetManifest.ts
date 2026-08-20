@@ -97,8 +97,8 @@ export interface AssetEntry {
   /** Baked font block (`'font'` assets only), copied from the `.meta.json`
    *  `font` block at scan time. Present only once the font has been through the
    *  MSDF atlas converter (baked `~atlas.png` + `~metrics.json` variants exist).
-   *  Absent ⇒ the font is a plain CSS-family-name font (resolved by `fontFamily`,
-   *  never a GUID ref) and has no SDF atlas. */
+   *  Absent ⇒ the font has no SDF atlas — it is DOM/PixiJS-only, registered with the
+   *  browser by the FontFace loader. (Both kinds are referenced by GUID since #231.) */
   font?: FontManifestBlock;
   /** Baked environment block (`'environment'` HDR assets only) — present once the
    *  HDR has been downscaled (a `~env.hdr` variant exists). Absent ⇒ the HDR loads
@@ -208,8 +208,8 @@ const pathToGuid = new Map<string, string>();
 // Pure ref predicates live in assetRefRules.ts (zero imports, Node-safe) so they
 // can be shared with the dev-server plugin + scene validator/mutator. Imported
 // for internal use AND re-exported to keep assetManifest's public API stable.
-import { isGuid, isExternalUrl, isInternalAssetPath, isInternalFontPath, newGuid, deriveGuid } from '../core/assetRefRules';
-export { isGuid, isExternalUrl, isInternalAssetPath, isInternalFontPath, newGuid, deriveGuid };
+import { isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid } from '../core/assetRefRules';
+export { isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid };
 // FontManifestBlock is defined in the pure fontSettings module (Node-safe, so the
 // build plugins can import it without pulling this browser-coupled module into
 // their Node typecheck); re-exported here for runtime consumers.
@@ -533,12 +533,10 @@ const pathRefSeen = new Set<string>();
 export function resolveRef(ref: string): string | undefined {
   if (!ref) return undefined;
   if (isGuid(ref)) return guidToEntry.get(ref)?.path;
-  // A FONT path counts here too. `isInternalAssetPath` deliberately excludes font
-  // extensions for `UIElement.fontFamily`'s sake — but fontFamily is read straight into a
-  // CSS style and never reaches resolveRef, while `Text2D.font`/`Text3D.font` DO, and they
-  // are manifest-tracked GUIDs. So a literal font path used to pass through this function
-  // unrejected and with no error, unlike every other asset-ref field (QA-INSP-0004).
-  if (isInternalAssetPath(ref) || isInternalFontPath(ref)) {
+  // A FONT path counts here too — `isInternalAssetPath` covers font extensions since #231
+  // (before that a literal font path passed through unrejected and with no error, unlike
+  // every other asset-ref field — QA-INSP-0004).
+  if (isInternalAssetPath(ref)) {
     if (!pathRefSeen.has(ref)) {
       pathRefSeen.add(ref);
       console.error(

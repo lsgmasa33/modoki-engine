@@ -135,10 +135,13 @@ describe('isInternalAssetPath', () => {
     expect(isInternalAssetPath('/games/x/model.glb')).toBe(true);
   });
 
-  it('does NOT flag external URLs, fonts, guids, or keywords', () => {
+  it('flags font paths too (#231 — fontFamily is a GUID ref now)', () => {
+    expect(isInternalAssetPath('/games/x/font.ttf')).toBe(true);
+    expect(isInternalAssetPath('/games/x/font.woff2')).toBe(true);
+  });
+
+  it('does NOT flag external URLs, guids, or keywords', () => {
     expect(isInternalAssetPath('https://cdn.example.com/a.png')).toBe(false);
-    expect(isInternalAssetPath('/games/x/font.ttf')).toBe(false); // fonts excluded
-    expect(isInternalAssetPath('/games/x/font.woff2')).toBe(false);
     expect(isInternalAssetPath(newGuid())).toBe(false);
     expect(isInternalAssetPath('circle')).toBe(false);
     expect(isInternalAssetPath('Inter')).toBe(false);
@@ -165,10 +168,11 @@ describe('resolveRef', () => {
 
   /** QA-INSP-0004 — a literal FONT path used to pass through here silently. Every other
    *  asset-ref field was rejected loudly; `Text2D.font` / `Text3D.font` were not, because
-   *  isInternalAssetPath excludes font extensions for `UIElement.fontFamily`'s sake — and
-   *  fontFamily never reaches resolveRef at all (it is read straight into a CSS style). A
-   *  ref the build cannot see fails only once you ship, since dev serves off disk. */
-  it('rejects an internal FONT path too (Text2D/Text3D.font are manifest GUIDs)', () => {
+   *  isInternalAssetPath excluded font extensions for `UIElement.fontFamily`'s sake — and
+   *  fontFamily never reached resolveRef at all (it was read straight into a CSS style). A
+   *  ref the build cannot see fails only once you ship, since dev serves off disk. #231 made
+   *  fontFamily a GUID too, so the exclusion is gone and this holds for every font field. */
+  it('rejects an internal FONT path too (every font field is a manifest GUID)', () => {
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
     for (const p of [
       '/games/x/assets/fonts/Inter.ttf',

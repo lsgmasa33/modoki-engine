@@ -107,7 +107,7 @@ import {
   regionsAt, nearestRegionTo,
 } from '@modoki/engine/runtime';
 import {
-  listAgentTools, getAgentTool, agentToolsVersion, type AgentToolDef,
+  listAgentTools, getAgentTool, agentToolsVersion, validateAgentToolArgs, type AgentToolDef,
 } from '@modoki/engine/runtime';
 import { startWatch, readWatch, listWatches, clearWatch, type StartWatchParams } from './watch';
 // Percept S3: resolved world transforms + hierarchy-deactivation set, both computed
@@ -756,8 +756,14 @@ registerAgentOp('game-tool-call', async (params) => {
       known,
     };
   }
+  const args = p.args ?? {};
+  // Enforce the DECLARATION here, so every caller inherits it — the curl API, device_eval's
+  // modoki.call, and the device relays all land on this op, and only the editor MCP rebuilds a
+  // zod schema of its own. A declaration honoured by one caller in four is not a contract.
+  const invalid = validateAgentToolArgs(tool, args);
+  if (invalid) return { ok: false, reason: invalid, params: Object.keys(tool.params ?? {}) };
   try {
-    return await tool.handler(p.args ?? {});
+    return await tool.handler(args);
   } catch (e) {
     // A throwing handler is the game's bug, but it must not present as a transport failure: a 504
     // reads as "the editor is gone" and sends the agent diagnosing the wrong layer entirely.

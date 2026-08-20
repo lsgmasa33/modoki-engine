@@ -310,3 +310,60 @@ describe('uiTreeStore toggle', () => {
     expect(after.toggle?.value).toBe(true);
   });
 });
+
+/** `fontFamily` — the projection is where a font-asset GUID becomes a CSS family (#231), so
+ *  this is the WIRING test for it: a node whose authored `fontFamily` is a GUID must come out
+ *  of `buildTree` carrying the resolved family, because `UINode` writes that value straight
+ *  into `style.fontFamily` and would otherwise put a GUID there (text in the browser default,
+ *  silently — nothing errors when a `font-family` names no font).
+ *
+ *  Asserted through a real projection rather than by spying on `resolveUIFontFamily`: a spy
+ *  passes whether or not the result reaches the node. */
+describe('uiTreeStore fontFamily resolution', () => {
+  const FONT_GUID = '30000000-0000-4000-8000-000000000001';
+
+  async function loadWithFontProvider() {
+    const mod = await load();
+    const { domFontProvider } = await import('../../src/runtime/core/domFontProvider');
+    domFontProvider.provide({ familyForGuid: (g) => (g === FONT_GUID ? 'Varela Round' : undefined) });
+    return mod;
+  }
+
+  it('resolves an authored GUID to the CSS family on the node', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0, ui: { fontFamily: FONT_GUID } }];
+    const { uiTreeProjection, useUITreeStore } = await loadWithFontProvider();
+
+    uiTreeProjection(makeWorld(() => specs));
+    expect(useUITreeStore.getState().tree[0].fontFamily).toBe('"Varela Round"');
+  });
+
+  it('falls back to systemFont, and the asset wins when both are authored', async () => {
+    const specs: Spec[] = [
+      { id: 1, parentId: 0, ui: { fontFamily: '', systemFont: 'system-ui' } },
+      { id: 2, parentId: 0, ui: { fontFamily: FONT_GUID, systemFont: 'system-ui' } },
+    ];
+    const { uiTreeProjection, useUITreeStore } = await loadWithFontProvider();
+
+    uiTreeProjection(makeWorld(() => specs));
+    const byId = index(useUITreeStore.getState().tree);
+    expect(byId.get(1).fontFamily).toBe('system-ui');
+    expect(byId.get(2).fontFamily).toBe('"Varela Round"');
+  });
+
+  /** Perturbation, per CLAUDE.md's authoring rule: changing the authored value must change
+   *  the node. A value that coincides with the default cannot tell "read" from "ignored". */
+  it('a changed font ref produces a NEW node with the new family', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0, ui: { fontFamily: '', systemFont: 'system-ui' } }];
+    const { uiTreeProjection, useUITreeStore, markUIDirty } = await loadWithFontProvider();
+    const world = makeWorld(() => specs);
+
+    uiTreeProjection(world);
+    const before = useUITreeStore.getState().tree[0];
+
+    specs[0].ui = { fontFamily: FONT_GUID, systemFont: 'system-ui' };
+    markUIDirty(); uiTreeProjection(world);
+    const after = useUITreeStore.getState().tree[0];
+    expect(after).not.toBe(before);
+    expect(after.fontFamily).toBe('"Varela Round"');
+  });
+});

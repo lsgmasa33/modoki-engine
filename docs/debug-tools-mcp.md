@@ -41,7 +41,9 @@ Grouped:
   native logs" below) · `device_crash_reports` (iOS crash + jetsam reports — the only surface that
   explains a death that already happened).
 - **Percept (read-by-data):** `device_get_scene_state` · `device_diagnose` · `device_journal` ·
-  `device_resolve_refs` · `device_introspect` · `device_layout_bounds` · `device_watch` ·
+  `device_resolve_refs` · `device_introspect` · `device_game_tools` (what TOOLS the connected
+  game registers — [agent-tools.md](agent-tools.md); invoke one with `device_game_tool_call`) ·
+  `device_layout_bounds` · `device_watch` ·
   `device_profiler` (where did the frame go — the phone is the only place that question is real;
   `action:'boot'` answers the different question "where did the BOOT go", reading the always-on
   boot-phase timeline against the worst dropped frame — see
@@ -475,6 +477,15 @@ did exactly what the message said got the identical refusal on the next build, o
 build-and-refuse cycle later. The lease is a **preference, not a pin** (same rule the remembered
 target follows): a leased phone that has since been unplugged is ignored rather than hard-failing a
 build with a serial the human never typed.
+
+⚠️ **Read that order the other way round too: a held lease does NOT redirect a build away from the
+project's pin.** Claiming phone A and then running `Build → Android` on a project pinned to phone B
+installs on **B**, correctly and silently — the two mechanisms answer different questions ("which
+phone am I debugging" vs "which phone does this project deploy to"), and only the second decides an
+install. Measured 2026-08-21 (#286): a lease on the A23, a Court build, and the APK landed on the
+S22 that `games/court/project.user.json` pins. It reads like the lease being ignored, and it is not
+— to deploy to the leased phone, change the pin or install the built APK yourself with
+`adb -s <serial> install -r`.
 
 **Devices are named by what the PHONE calls itself, not by its model code.** `adb devices -l` reports
 only `model:` — `SC_56C`, `SM_S901U1`, `MRD_LX3` — which is precisely the string that fails to tell
@@ -974,7 +985,7 @@ Two things the table is worth reading FOR, not just referring to:
 
 <!-- BEGIN GENERATED TOOL CATALOG -->
 
-*83 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
+*84 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
 run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fails `npm test`.*
 
 #### Read — answer a question about state (never changes anything)
@@ -986,6 +997,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_diagnose` | GET `/api/diagnose` | read-only | editor + scene | — | *(no args)* |
 | `modoki_editor_journal` | GET `/api/editor-journal` | session · **IMPURE READ** (an optional arg destroys state) | editor | — | *(no args)* |
 | `modoki_eval_api` | GET `/api/eval-api` | read-only | editor + renderer | — | *(no args)* |
+| `modoki_find_references` | GET `/api/find-references` | read-only | project | asset | `{"target":"/assets/scenes/main.scene.json"}` |
 | `modoki_get_asset_meta` | GET `/api/read-meta` | read-only | project | asset | `{"path":"/assets/textures/probe.png"}` |
 | `modoki_get_console_logs` | GET `/api/console-logs` | read-only | editor | — | *(no args)* |
 | `modoki_get_editor_state` | GET `/api/editor-state` | read-only | editor | — | *(no args)* |
@@ -1108,6 +1120,15 @@ existing agent call for a cosmetic win. Read across:
 | screen-space rects | `modoki_get_layout_bounds` | `device_layout_bounds` |
 | a picture of it | `modoki_capture_viewport` | `device_screenshot` |
 | what can I dispatch? | `modoki_list_actions` | `device_introspect` |
+| the GAME's own tools | they appear as tools (`court_load_level`) | `device_game_tools` + `device_game_tool_call` — deliberately NOT a dynamic tail; see [agent-tools.md](agent-tools.md) |
+
+**Editor-only BY NATURE, recorded rather than filed as a gap: `modoki_find_references`.** It answers
+"what references this?" by walking the PROJECT ON DISK — the tree-shaker's own forward walk,
+inverted (#284). A device has no project checkout, only a built bundle whose reference graph has
+already been resolved and shaken, so there is nothing on that side for a device counterpart to read.
+This is the §9 "capability on one surface and not the other" case closed as deliberate, not left
+implicit. (It also means the tool is blind to unsaved live-world edits on the editor side — see its
+description.)
 
 Where the two DO share a param name, they now mean the same thing — `device_scroll` took `dx`/`dy`
 against the editor's `deltaX`/`deltaY` until the Phase-8 device sweep; `deltaX`/`deltaY` are canonical

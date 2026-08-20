@@ -12,7 +12,7 @@
  *  trait registry, structural + GUID-reference checks still run; trait/field
  *  type checks are skipped (reported once as an info note by the caller). */
 
-import { isGuid, isExternalUrl, isInternalAssetPath, isInternalFontPath } from '../core/assetRefRules';
+import { isGuid, isExternalUrl, isInternalAssetPath } from '../core/assetRefRules';
 import { isSizeInert } from '../ui/anchorLayout';
 
 /** Asset-reference fields, keyed by the trait they live on. A value in one of
@@ -27,7 +27,11 @@ export const REF_FIELDS_BY_TRAIT: Record<string, string[]> = {
   Text2D: ['font'],
   SpriteAnimator: ['clipSet'],
   SkinnedSprite2D: ['rig'],
-  UIElement: ['imageSrc'],
+  // fontFamily joined imageSrc in #231: it holds a font-ASSET GUID now, not a CSS family
+  // name, so the validator, `diagnose` and the build tree-shaker can all finally see a UI
+  // font reference. A plain CSS family name lives in the separate `systemFont` field, which
+  // is NOT a ref and is deliberately absent from this registry.
+  UIElement: ['imageSrc', 'fontFamily'],
   ModelSource: ['glbPath'],
   SkinnedModel: ['model'],
   SkeletalAnimator: ['animSet'],
@@ -47,16 +51,35 @@ export const REF_FIELDS_BY_TRAIT: Record<string, string[]> = {
 // NOTE: this registry is the single source of truth for SCALAR asset-ref fields —
 // consumed by the validator (above) AND the build tree-shaker's keep-walk
 // (plugins/asset-tree-shaker.ts), so a new ref field added here is covered by both.
-// Non-scalar refs (UIElement.fontFamily = a CSS family name; AnimationLibrary.animSets
-// = an array of guids) are intentionally NOT here and are handled explicitly.
+// Non-scalar refs (AnimationLibrary.animSets = an array of guids) are intentionally NOT
+// here and are handled explicitly.
 
-/** Primitive sprite keywords that are valid `Renderable2D.sprite` values even
- *  though they're neither GUIDs nor URLs. */
-/** The built-in 2D sprite keywords (not asset refs). Exported because `create_entity` validates
- *  `shape` against it — an unknown value used to produce an entity with an unresolvable sprite,
- *  reported as a clean success. ONE list, so the tool and the validator cannot drift. */
+/** The built-in 2D sprite SHAPES — the keywords that draw something on their own. Exported
+ *  because `create_entity` validates `shape` against it: an unknown value used to produce an
+ *  entity with an unresolvable sprite, reported as a clean success. ONE list, so the tool and
+ *  the validator cannot drift. */
 export const PRIMITIVE_SPRITE_NAMES = ['circle', 'square', 'triangle'] as const;
-const PRIMITIVE_SPRITES = new Set<string>(PRIMITIVE_SPRITE_NAMES);
+
+/** ⚠️ A copy of `rendering/render2DUtils.ts`'s `COLLIDER_SPRITE`, kept honest by
+ *  `tests/assets/spriteKeywords.test.ts` rather than imported: this module is deliberately
+ *  dependency-light so it runs in Node (the dev server's `/api/validate-scene`), and
+ *  `render2DUtils` reaches the texture provider and PixiJS.
+ *
+ *  It is a legal AUTHORED value that is not a shape — it draws the entity's own `Collider2D`
+ *  outline, which is how a polygon/polyline collider gets a visible body. It was missing from
+ *  the list below, so the validator reported both committed uses of it in
+ *  `demos/2d-physics-demo` as "'collider' is not a GUID or URL" on every load, and
+ *  `/api/validate-scene` / `modoki_validate_scene` reported those scenes as broken when they
+ *  are not. Found by #231's close-out sweep for the same class it fixed: a legitimate value a
+ *  ref guard cannot recognise. */
+const COLLIDER_SPRITE_KEYWORD = 'collider';
+
+/** Every `Renderable2D.sprite` value that is legal without being a GUID or URL. Deliberately
+ *  WIDER than `PRIMITIVE_SPRITE_NAMES`: the validator asks "is this legal to author", while
+ *  `create_entity` asks "will this draw something by itself" — and `collider` draws nothing
+ *  without a `Collider2D` on the same entity, so creating one from the tool would be a
+ *  successful-looking call that renders nothing. */
+const PRIMITIVE_SPRITES = new Set<string>([...PRIMITIVE_SPRITE_NAMES, COLLIDER_SPRITE_KEYWORD]);
 
 export type FieldType = 'number' | 'string' | 'boolean' | 'color' | 'enum' | 'entityRef' | 'bindings' | 'materialOverrides';
 
@@ -233,11 +256,10 @@ export function validateSceneData(data: unknown, schema?: SceneSchema, getPrefab
           if (typeof v !== 'string' || v === '') continue;
           if (traitName === 'Renderable2D' && field === 'sprite' && PRIMITIVE_SPRITES.has(v)) continue;
           if (isGuid(v) || isExternalUrl(v)) continue;
-          // Every field in this registry holds a manifest-asset GUID, `Text2D.font` /
-          // `Text3D.font` included — so a font PATH is a literal-path violation here, even
-          // though isInternalAssetPath excludes font extensions for fontFamily's sake
-          // (which is not in this registry). QA-INSP-0004.
-          if (isInternalAssetPath(v) || isInternalFontPath(v)) {
+          // Every field in this registry holds a manifest-asset GUID — `Text2D.font` /
+          // `Text3D.font` / `UIElement.fontFamily` included — so a font PATH is a
+          // literal-path violation here like any other (QA-INSP-0004, #231).
+          if (isInternalAssetPath(v)) {
             warnings.push(
               `${label}.${traitName}.${field}: internal asset path '${v}' — references must be a GUID (use the asset's id / .meta.json sidecar)`,
             );

@@ -192,6 +192,19 @@ const DECLS: Record<string, Decl> = {
     kind: 'read', method: 'GET', route: '/api/read-meta', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/textures/probe.png' },
   },
+  modoki_find_references: {
+    kind: 'read', method: 'GET', route: '/api/find-references', requires: ['project'], aim: 'asset',
+    filters: ['limit', 'maxDepth', 'reachableOnly'],
+    // `reachableOnly` NARROWS (drops references that don't survive a production build), it
+    // does not expand — same shape as `modoki_input_watch.unresolvedOnly`. See `narrowingFlags`.
+    narrowingFlags: ['reachableOnly'],
+    // A plausible path, not a guaranteed one — most projects have a `main.scene.json`,
+    // and one that does not answers NOT_FOUND, which the live sweep already classifies
+    // as an ENV code for exactly this case. Deliberately NOT a path that resolves
+    // unconditionally: an unknown target is a refusal here, because answering
+    // `unreferenced: true` for a file that does not exist reads as "safe to delete".
+    minimalArgs: { target: '/assets/scenes/main.scene.json' },
+  },
   modoki_reimport_asset: {
     kind: 'asset', method: 'POST', route: '/api/reimport',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',

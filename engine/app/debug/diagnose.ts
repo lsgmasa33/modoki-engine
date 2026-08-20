@@ -9,7 +9,7 @@
 
 import {
   getAllEntities, getAllTraits, readTraitData, readTraitDataFull,
-  REF_FIELDS_BY_TRAIT, isGuid, isExternalUrl, isInternalAssetPath, isInternalFontPath, resolveGuidToPath,
+  REF_FIELDS_BY_TRAIT, isGuid, isExternalUrl, isInternalAssetPath, resolveGuidToPath,
   getDeviceCaps, getDeviceCapsSync, readPerfProfile, getActiveQualityTier, getAutoLightCapStats,
   getShadowCasterCapStats,
   getAssessedQualityTier, getEffectiveTargetFps, getRenderSettings, configCount,
@@ -44,10 +44,9 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
         const v = data[field];
         if (typeof v !== 'string' || v === '') continue;
         if (isExternalUrl(v)) continue;                 // http/data/blob — fine
-        // A font PATH is a literal-path issue in these fields too (Text2D/Text3D.font are
-        // manifest GUIDs); isInternalAssetPath excludes font extensions only for
-        // UIElement.fontFamily, which is not in this registry. QA-INSP-0004.
-        if (isInternalAssetPath(v) || isInternalFontPath(v)) { refIssues.push({ entity: info.id, trait: traitName, field, value: v, kind: 'literal-path' }); continue; }
+        // A font PATH is a literal-path issue in these fields too — Text2D/Text3D.font and
+        // (since #231) UIElement.fontFamily are all manifest GUIDs. QA-INSP-0004.
+        if (isInternalAssetPath(v)) { refIssues.push({ entity: info.id, trait: traitName, field, value: v, kind: 'literal-path' }); continue; }
         if (isGuid(v) && !resolveGuidToPath(v)) refIssues.push({ entity: info.id, trait: traitName, field, value: v, kind: 'unresolved-guid' });
         // non-guid non-path (e.g. primitive sprite keyword 'circle') passes through.
       }

@@ -73,7 +73,12 @@ export interface SerializedEntity {
  *  in parallel before instantiating entities. Disposed when the scene unloads
  *  unless another scene also holds them. */
 export interface ResourceRef {
-  type: 'model' | 'riggedModel' | 'mesh' | 'material' | 'texture' | 'prefab' | 'font' | 'environment' | 'particle' | 'animation';
+  /** A SUBSET of the runtime `SceneResourceRef['type']` union — `collectResourceRefs`
+   *  delegates to the runtime collector and casts, so anything the runtime can emit may
+   *  appear here. Kept as a narrower list only because these are the kinds the editor
+   *  itself names. `font-family` = a DOM font ref (`UIElement.fontFamily`, #231), distinct
+   *  from `font` (an SDF font asset), since one asset can be acquired as both. */
+  type: 'model' | 'riggedModel' | 'mesh' | 'material' | 'texture' | 'prefab' | 'font' | 'font-family' | 'environment' | 'particle' | 'animation';
   path: string;
   loader?: string;
   postprocessor?: string;

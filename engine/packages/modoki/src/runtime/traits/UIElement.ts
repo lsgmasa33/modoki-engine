@@ -114,7 +114,26 @@ export const UIElement = trait({
 
   // ── Text ──
   text: '' as string,
+  /**
+   * The typeface for this element's text — a font-ASSET GUID, resolved through the manifest
+   * and inherited by descendants exactly as CSS `font-family` is (#231).
+   *
+   * ⚠️ **A GUID, not a family name.** It used to hold the CSS family name; that made it the
+   * one `accept:`-typed field in the engine that did NOT store a ref, so the build's
+   * tree-shaker could not see it (a UI font ref the build cannot follow — the #53 class). A
+   * legacy family name still renders, with a one-time warning; re-pick the font in the
+   * Inspector to migrate it.
+   *
+   * Empty ⇒ fall through to {@link systemFont}, then to the browser default. When BOTH are
+   * set the ASSET wins — see `ui/fontFamilyRef.ts`, the one place that decides.
+   */
   fontFamily: '' as string,
+  /**
+   * A plain CSS family name (`system-ui`, `Helvetica`) — the case a GUID cannot express,
+   * since no asset backs a system typeface (#231). Used only when `fontFamily` is empty or
+   * unresolvable; a font stack (`"Iowan Old Style", serif`) is legal here, as in CSS.
+   */
+  systemFont: '' as string,
   fontSize: 16,
   /**
    * Unit for `fontSize`. Defaults to `'px'`, which is what fontSize silently WAS before this

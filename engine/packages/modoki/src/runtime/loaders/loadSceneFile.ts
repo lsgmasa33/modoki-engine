@@ -72,7 +72,12 @@ export interface SceneEntityEntry {
 }
 
 export interface SceneResourceRef {
-  type: 'model' | 'riggedModel' | 'mesh' | 'material' | 'texture' | 'video' | 'prefab' | 'font' | 'environment' | 'particle' | 'animation' | 'animset' | 'spriteanim' | 'rig2d' | 'audio' | 'shader' | 'timeline';
+  /** `font` = an SDF font ASSET (`Text2D.font`/`Text3D.font`), acquired scene-scoped.
+   *  `font-family` = the same kind of asset consumed by the DOM (`UIElement.fontFamily`):
+   *  registered with the browser via the FontFace API instead, for every VARIANT of its
+   *  family. One asset can be both — Court names the same typeface from a canvas label and
+   *  from DOM text — which is why they are two resource types over one asset, not one (#231). */
+  type: 'model' | 'riggedModel' | 'mesh' | 'material' | 'texture' | 'video' | 'prefab' | 'font' | 'font-family' | 'environment' | 'particle' | 'animation' | 'animset' | 'spriteanim' | 'rig2d' | 'audio' | 'shader' | 'timeline';
   path: string;
   postprocessor?: string;
 }
@@ -1051,6 +1056,7 @@ const SCALAR_RESOURCE_TYPE_BY_FIELD: Record<string, SceneResourceRef['type']> = 
   'Text3D.font': 'font',
   'Text2D.font': 'font',
   'UIElement.imageSrc': 'texture',
+  'UIElement.fontFamily': 'font-family',   // a font asset consumed by the DOM (#231)
   'PrefabInstance.source': 'prefab',
   'Environment.hdrPath': 'environment',
   'ParticleEmitter.effect': 'particle',
@@ -1094,7 +1100,7 @@ const RESOURCE_TYPE_BY_ASSET_TYPE: Partial<Record<AssetType, SceneResourceRef['t
  *  The SCALAR ref fields are data-driven from REF_FIELDS_BY_TRAIT (via
  *  SCALAR_RESOURCE_TYPE_BY_FIELD); the non-scalar / dynamic / payload-bearing refs
  *  (AnimationLibrary.animSets, SkinnedMeshRenderer.materials, Renderable3DPrimitive.material,
- *  ModelSource.glbPath, UIElement.fontFamily, structural entry.prefab) stay explicit.
+ *  ModelSource.glbPath, structural entry.prefab) stay explicit.
  *  Anything held on a GAME-defined trait is caught by the generic sweep at the end. */
 export function collectResourceRefsFromEntities(
   entities: ReadonlyArray<{
@@ -1117,7 +1123,14 @@ export function collectResourceRefsFromEntities(
   const claimed = new Set<string>();
   const add = (type: SceneResourceRef['type'], ref: string) => {
     if (!ref) return;
-    claimed.add(ref);
+    // `font-family` deliberately does NOT claim: it is the DOM consumer of a font asset
+    // (`UIElement.fontFamily`), and the SAME asset may also be referenced as an SDF `font` by
+    // `Text2D.font` or a game trait — two different loads, both needed. Claiming would let
+    // whichever field is visited first suppress the other, which is not the ambiguity `claimed`
+    // exists to resolve (that one is about a single ref whose declared type differs from its
+    // manifest type). Court authors exactly this: one typeface, named from a canvas label and
+    // from DOM text; the claim silently dropped its atlas preload (#231).
+    if (type !== 'font-family') claimed.add(ref);
     const key = `${type}:${ref}`;
     if (seen.has(key)) return;
     seen.add(key);
@@ -1249,13 +1262,9 @@ export function collectResourceRefsFromEntities(
         add(t === 'texture' ? 'texture' : 'material', material!);
       }
     }
-    // UIElement.fontFamily — a CSS family NAME (not a guid), acquired as a font.
-    // (UIElement.imageSrc is the scalar 'texture' ref handled by the loop above.)
-    const ui = entry.traits['UIElement'] as Record<string, unknown> | undefined;
-    if (ui && typeof ui !== 'boolean') {
-      const fontFamily = ui.fontFamily as string | undefined;
-      if (fontFamily) add('font', fontFamily);
-    }
+    // (UIElement.imageSrc + .fontFamily are both scalar registry refs now, handled by the
+    //  loop above — fontFamily became a font-asset GUID in #231, so it no longer needs the
+    //  by-NAME special case that used to live here.)
     // ModelSource.glbPath — a 'model' ref that also threads a postprocessor payload,
     // so it can't go through the plain scalar add() (which carries no extra field).
     const ms = entry.traits['ModelSource'] as Record<string, unknown> | undefined;
@@ -1332,9 +1341,20 @@ export function collectResourceRefsFromEntities(
     if (rtype) add(rtype, value);
   };
   for (const entry of flat) {
-    for (const bag of Object.values(entry.traits)) {
+    for (const [traitName, bag] of Object.entries(entry.traits)) {
       if (!bag || typeof bag !== 'object') continue;
-      for (const value of Object.values(bag as Record<string, unknown>)) {
+      // A REGISTRY field is already typed by the loop above, by the field it sits in — the
+      // sweep must not re-type it from the asset's manifest type. `claimed` covers most of
+      // that by VALUE, but value-level suppression cannot express one asset legitimately
+      // acquired as two types: `UIElement.fontFamily` (a DOM `font-family`) and a game trait's
+      // SDF `font` ref can name the SAME typeface, which is Court. Claiming made the second
+      // one disappear; not claiming let the sweep re-derive an SDF `font` acquire FROM THE
+      // fontFamily FIELD ITSELF — a real atlas fetch + GPU upload, on every scene load, for a
+      // game whose font is DOM-only. Skipping by FIELD is what actually holds: the registry
+      // owns those fields, the sweep owns the rest (#231).
+      const registryFields = REF_FIELDS_BY_TRAIT[traitName];
+      for (const [field, value] of Object.entries(bag as Record<string, unknown>)) {
+        if (registryFields?.includes(field)) continue;
         // One level of array unwrap, to also catch an AnimationLibrary-shaped guid
         // array on a game trait (a level list, an enemy-prefab table).
         if (Array.isArray(value)) value.forEach(sweep);

@@ -5,6 +5,7 @@
 import { parseFontFilename, type FontInfo } from './fontNaming';
 import { assetUrl, withCacheBust } from './assetUrl';
 import { getAllAssets, getAssetEntry, resolveRef, onFontInvalidated, type FontManifestBlock } from './assetManifest';
+import { isGuid } from '../core/assetRefRules';
 
 export { parseFontFilename, type FontInfo };
 
@@ -359,4 +360,51 @@ export function fontPathFromFamily(family: string): string | null {
   if (regular) return regular.path;
   const normal = variants.find(v => v.style === 'normal');
   return (normal ?? variants[0]).path;
+}
+
+/** A `UIElement.fontFamily` REF → the CSS family name to put in a `font-family` style (#231).
+ *
+ *  The field holds a font-asset GUID like every other asset ref, so resolution is
+ *  guid → manifest path → {@link fontFamilyFromPath}. Returns `undefined` when the GUID
+ *  resolves to nothing (a deleted font, or a manifest that has not loaded yet) — the caller
+ *  decides what to fall back to, since "no font" is not an error worth blanking text over.
+ *
+ *  ⚠️ A non-GUID value is LEGACY: before #231 this field stored the CSS family name itself.
+ *  Such a value is returned unchanged (it is already a family name) — the migration's
+ *  read-side fallback. The warn-once lives at the UI seam (`ui/fontFamilyRef.ts`), which is
+ *  the only place that knows an *authored* value is being read rather than an internal call. */
+export function familyForFontRef(ref: string): string | undefined {
+  if (!ref) return undefined;
+  if (!isGuid(ref)) return ref;                 // legacy CSS family name
+  // ⚠️ The asset must actually BE a font. `fontFamilyFromPath` derives a family from any
+  // filename — it never looks at the extension — so a texture GUID pasted into `fontFamily`
+  // would resolve to the plausible-looking family "hero sprite" and be returned as a SUCCESS,
+  // silently: the caller's "this ref resolves to nothing" warning never fires, the DOM gets an
+  // inert `font-family`, and the text renders in the browser default with no diagnostic
+  // anywhere. Typing a syntactically-valid GUID into the field is enough to reach this
+  // (`isAcceptableTypedRef` checks GUID SHAPE, not the asset's type), so it is not a
+  // hand-edit-only path.
+  const entry = getAssetEntry(ref);
+  if (!entry || entry.type !== 'font') return undefined;
+  return fontFamilyFromPath(entry.path);
+}
+
+/** FontFace-register every variant of the family a `UIElement.fontFamily` ref names — the
+ *  scene-resource acquire for a `type:'font-family'` entry (#231). Accepts a GUID or a legacy
+ *  family name (see {@link familyForFontRef}). Returns the number of variants registered;
+ *  never rejects, for the reasons {@link loadFontFamily} does not. */
+export async function loadFontFamilyForRef(ref: string): Promise<number> {
+  const family = familyForFontRef(ref);
+  if (!family) {
+    if (ref && isGuid(ref)) {
+      console.warn(
+        `[FontLoader] font ref ${ref} resolves to no FONT asset — DOM text using it falls back ` +
+        `to the browser default. Either the font was deleted/moved without re-saving the scene, ` +
+        `or the GUID names an asset of another type (a texture, a mesh) that was pasted into a ` +
+        `font field.`,
+      );
+    }
+    return 0;
+  }
+  return loadFontFamily(family);
 }

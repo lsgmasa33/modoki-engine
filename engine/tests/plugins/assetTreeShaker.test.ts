@@ -901,6 +901,94 @@ describe('asset-tree-shaker', () => {
     expect(result.kept).not.toContain('/modoki/assets/fonts/Lato/Lato-Bold.ttf');
   });
 
+  /** #231 — `UIElement.fontFamily` holds a font-asset GUID now, and both halves matter:
+   *   1. the referenced FILE is kept (that is what a ref means), and
+   *   2. every other VARIANT of its family is kept too, because the runtime registers all of
+   *      them (`loadFontFamily`) — ship only the referenced Regular and a UI authoring
+   *      `fontWeight:'bold'` gets a browser-synthesized fake bold instead of the real face.
+   *  Neither implies the other, so both are asserted. */
+  it('resolves a fontFamily GUID to its file AND its family’s other variants', () => {
+    const FONT_GUID = '30000000-0000-4000-8000-000000000001';
+    fx.writeVirtual('/modoki/assets/fonts/Roboto/Roboto-Regular.ttf', 'fake');
+    fx.writeJson('/modoki/assets/fonts/Roboto/Roboto-Regular.ttf.meta.json', { id: FONT_GUID });
+    fx.writeVirtual('/modoki/assets/fonts/Roboto/Roboto-Bold.ttf', 'fake');
+    fx.writeVirtual('/modoki/assets/fonts/Lato/Lato-Regular.ttf', 'fake');
+
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6,
+      resources: [{ type: 'font-family', path: FONT_GUID }],
+      entities: [{ id: 1, traits: { UIElement: { fontFamily: FONT_GUID } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/modoki/assets/fonts/Roboto/Roboto-Regular.ttf');
+    expect(result.kept, 'sibling variant of the same family').toContain('/modoki/assets/fonts/Roboto/Roboto-Bold.ttf');
+    expect(result.kept).not.toContain('/modoki/assets/fonts/Lato/Lato-Regular.ttf');
+    // A DOM consumer — which is what makes `shipSource:'auto'` ship the source `.ttf`
+    // beside the baked atlas. Without this the font renders from the atlas on canvas and
+    // falls back to the browser default in the DOM, in production only.
+    expect(result.domFontFiles).toContain('/modoki/assets/fonts/Roboto/Roboto-Regular.ttf');
+    expect(result.warnings.filter((w) => /unresolved GUID|no matching files/i.test(w))).toEqual([]);
+  });
+
+  /** A font whose GUID pins it directly must NOT produce the by-name resolver's "has no
+   *  matching files on disk" warning — the file IS kept; it just does not live under a
+   *  `fonts/` dir, which is the only place that resolver looks. A warning here is one the
+   *  author cannot act on. */
+  it('does not warn about a GUID-pinned font outside a fonts/ directory', () => {
+    const FONT_GUID = '30000000-0000-4000-8000-000000000002';
+    fx.writeVirtual('/games/test/assets/ui/Inter-Regular.ttf', 'fake');
+    fx.writeJson('/games/test/assets/ui/Inter-Regular.ttf.meta.json', { id: FONT_GUID });
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6,
+      entities: [{ id: 1, traits: { UIElement: { fontFamily: FONT_GUID } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/games/test/assets/ui/Inter-Regular.ttf');
+    expect(result.domFontFiles).toContain('/games/test/assets/ui/Inter-Regular.ttf');
+    expect(result.warnings.filter((w) => /no matching files/i.test(w))).toEqual([]);
+  });
+
+  /** A `resources[]` entry of `{type:'font', path:'<guid>'}` is an SDF font asset
+   *  (`Text2D.font`), not a family name. Routing it through the by-name resolver made it a
+   *  "family" that matches nothing and warned about it on every build of a game with SDF
+   *  text — Court's, for one. */
+  it('treats a GUID font resource as an asset ref, not a family name', () => {
+    const FONT_GUID = '30000000-0000-4000-8000-000000000003';
+    fx.writeVirtual('/modoki/assets/fonts/Arimo/Arimo-Regular.ttf', 'fake');
+    fx.writeJson('/modoki/assets/fonts/Arimo/Arimo-Regular.ttf.meta.json', { id: FONT_GUID });
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6,
+      resources: [{ type: 'font', path: FONT_GUID }],
+      entities: [{ id: 1, traits: { Text2D: { font: FONT_GUID } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/modoki/assets/fonts/Arimo/Arimo-Regular.ttf');
+    expect(result.warnings.filter((w) => /no matching files/i.test(w))).toEqual([]);
+    // Canvas-only: no DOM consumer named it, so `shipSource:'auto'` may drop the source.
+    expect(result.domFontFiles).not.toContain('/modoki/assets/fonts/Arimo/Arimo-Regular.ttf');
+  });
+
+  /** One ref, one warning. `UIElement.fontFamily` is BOTH a REF_FIELDS_BY_TRAIT entry (so the
+   *  generic loop walks it) and the subject of a dedicated 'font-family' handler, and pushing
+   *  it through both reported a single stale ref as two — which reads as two broken fonts. */
+  it('reports an unresolved fontFamily GUID exactly once', () => {
+    const MISSING = '99999999-9999-4999-8999-999999999999';
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6,
+      entities: [{ id: 1, traits: { UIElement: { fontFamily: MISSING } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.warnings.filter((w) => w.includes(MISSING))).toHaveLength(1);
+  });
+
   it('drops all fonts when no scene sets fontFamily', () => {
     fx.writeVirtual('/modoki/assets/fonts/Roboto/Roboto-Regular.ttf', 'fake');
     fx.writeVirtual('/modoki/assets/fonts/Lato/Lato-Regular.ttf', 'fake');

@@ -16,6 +16,7 @@ import { isSimRunning } from '../core/playState';
 import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { markUIDirty, isUIDirty, clearUIDirty } from '../core/uiDirty';
 import { spriteEpoch } from '../core/textureRefs';
+import { resolveUIFontFamily, resetFontRefWarnings } from './fontFamilyRef';
 export { onEditorDirty, setEditorDirtyCallback, markUIDirty } from '../core/uiDirty';
 import type { World } from 'koota';
 import type { UIActionBinding } from './bindings';
@@ -46,6 +47,10 @@ export interface UINodeData {
   opacity: number;
   // ── Text ──
   text: string;
+  /** The RESOLVED CSS `font-family` value — `UIElement.fontFamily` (a font-asset GUID) run
+   *  through the manifest, else `UIElement.systemFont`, else '' (#231). Resolved here rather
+   *  than in `UINode` so the DOM layer stays a pure style writer and the precedence lives in
+   *  exactly one place (`ui/fontFamilyRef.ts`). */
   fontFamily: string; fontSize: number; fontSizeUnit: string; fontWeight: string; fontStyle: string;
   textColor: number; textOpacity: number; textAlign: string;
   lineHeight: number; letterSpacing: number; letterSpacingUnit: string;
@@ -117,6 +122,9 @@ function ensureInitialized() {
   // Force rebuild on world swap (scene change)
   onWorldSwap(() => {
     markUIDirty();
+    // Forget which broken font refs have been warned about: the NEXT scene may author the same
+    // dangling GUID and independently needs the diagnostic (#231).
+    resetFontRefWarnings();
     _prevById = new Map(); // drop old-scene refs so they're never reused
     useUITreeStore.setState({ tree: [] });
   });
@@ -285,7 +293,7 @@ function buildTree(world: World): UINodeData[] | null {
         backgroundColor: ui.backgroundColor || 0, backgroundOpacity: ui.backgroundOpacity || 0,
         borderRadius: ui.borderRadius || 0, borderWidth: ui.borderWidth || 0,
         borderColor: ui.borderColor || 0x333333, borderOpacity: ui.borderOpacity ?? 1, opacity: ui.opacity ?? 1,
-        text: ui.text || '', fontFamily: ui.fontFamily || '',
+        text: ui.text || '', fontFamily: resolveUIFontFamily(ui.fontFamily as string, ui.systemFont as string),
         fontSize: ui.fontSize || 16, fontSizeUnit: ui.fontSizeUnit || 'px', fontWeight: ui.fontWeight || 'normal',
         fontStyle: ui.fontStyle || 'normal', textColor: ui.textColor ?? 0xffffff, textOpacity: ui.textOpacity ?? 1,
         textAlign: ui.textAlign || 'left',

@@ -1059,9 +1059,9 @@ Findings come from four passes:
 `REF_FIELDS_BY_TRAIT` is the **single source of truth for scalar ref fields** —
 `editor/scene/serialize.ts` imports it for its save-time guard and the build
 tree-shaker's keep-walk (`plugins/asset-tree-shaker.ts`) walks it, so a new ref
-field added there is covered everywhere. Non-scalar refs (`UIElement.fontFamily`
-= a CSS family name; `AnimationLibrary.animSets` = a guid array) are intentionally
-excluded and handled explicitly. The predicates themselves live in
+field added there is covered everywhere — `UIElement.fontFamily` joined it in #231, which is
+what finally made a UI font ref visible to the validator and the build. Non-scalar refs
+(`AnimationLibrary.animSets` = a guid array) are intentionally excluded and handled explicitly. The predicates themselves live in
 `runtime/core/assetRefRules.ts`: `isGuid` (UUID-v4 shape), `isExternalUrl`
 (`http(s):`/`data:`/`blob:`), `isInternalAssetPath` (leading `/` + a managed
 asset extension).

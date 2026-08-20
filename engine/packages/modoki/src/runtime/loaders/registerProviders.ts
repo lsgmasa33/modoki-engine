@@ -33,6 +33,9 @@ import { audioAssetProvider } from '../audio/audioAssetProvider';
 import { getCachedAudioBuffer, resolveAudioUrl, retryFailedAudioDecodes } from './audioBufferCache';
 import { getAudioLoadType } from './assetManifest';
 
+import { domFontProvider } from '../core/domFontProvider';
+import { familyForFontRef } from './fontLoader';
+
 import { rig2dProvider } from '../skinning/rig2dProvider';
 import { getRig2D } from './rig2dCache';
 
@@ -60,6 +63,8 @@ animationAssetProvider.provide({
 });
 
 audioAssetProvider.provide({ getCachedAudioBuffer, resolveAudioUrl, retryFailedAudioDecodes, getAudioLoadType });
+
+domFontProvider.provide({ familyForGuid: familyForFontRef });
 
 rig2dProvider.provide({ getRig2D });
 

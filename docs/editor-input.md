@@ -80,11 +80,15 @@ Five, resolved by priority. `resolve()` picks the highest-priority candidate for
 | `overlay` | only for the top of the overlay **stack**; outranks everything, so it may swallow an app-chord | Escape-to-close, the SpriteEditor modal's ⌘Z |
 | `text-field` | when `document.activeElement` is text-editable | Enter/Escape commits, Backspace-clears-ref |
 | `<panelId>` | only when that panel is focused, and never while text-editable | everything panel-specific |
-| `app-key` | everywhere **except** text-editable | `f` (frame selected) |
+| `app-key` | everywhere **except** text-editable | *(no registrations today — see note)* |
 | `app-chord` | everywhere, **text fields included** | ⌘S, ⌘Z, ⌘⇧Z, ⌘P |
 
-The two-way split of "app" is the whole point: `f` must frame the selection from any panel, but
-must not fire while you type "fog" into a name field. A panel scope is a **FlexLayout tab component
+The two-way split of "app" is the whole point: a command must not fire while you type into a name
+field. ⚠️ **`app-key` currently has ZERO registrations** — `grep "scope: 'app-key'"` returns nothing.
+This doc long cited `f` ("frame selected") as its canonical example, and that was wrong: `f` is
+registered TWICE at PANEL scope (`Hierarchy.tsx`, `SceneView.tsx`), each deliberately, because
+`app-key` fires from every panel and framing should follow the panel you are in. The tier exists and
+is wired; nothing uses it yet. A panel scope is a **FlexLayout tab component
 id** — `scene`, `game`, `hierarchy`, `inspector`, `console`, `assets`, `particle-editor`,
 `animation-editor`, `timeline-editor`, `spriteanim-editor`, `skin-editor`, `ai`, plus any
 game-registered id.

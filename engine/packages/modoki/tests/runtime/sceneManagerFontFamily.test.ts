@@ -39,10 +39,11 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
 const FONT_GUID = '30000000-0000-4000-8000-000000000001';
 const FONT_PATH = '/assets/fonts/VarelaRound-Regular.ttf';
 
-/** A scene whose only resource is the font ref under test. */
-const sceneWithFont = (fontRef: string) => ({
+/** A scene whose only resource is the font ref under test. `type` defaults to the legacy
+ *  `'font'`; pass `'font-family'` for the post-#231 DOM-font resource. */
+const sceneWithFont = (fontRef: string, type: 'font' | 'font-family' = 'font') => ({
   version: 8,
-  resources: [{ type: 'font', path: fontRef }],
+  resources: [{ type, path: fontRef }],
   entities: [{ id: 1, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'UIRoot', parentId: 0 } } }],
 });
 
@@ -114,6 +115,56 @@ describe('SceneManager — a scene font family is registered by the scene, not b
     await sceneManager.loadScene('/font.json', { preloaded: sceneWithFont(FONT_GUID) as never });
 
     expect(added).toEqual([]);
+  });
+
+  /** #231 — the same asset, referenced the NEW way: `UIElement.fontFamily` holds a font-asset
+   *  GUID and is collected as `type:'font-family'`. End-to-end again (a real `loadScene` → a
+   *  real face in `document.fonts`), because what this asserts is the WIRING: the resource
+   *  type, its acquire branch, and the guid→path→family resolve all lining up. A spy on
+   *  `loadFontFamilyForRef` would pass against a case that registers nothing. */
+  it('registers a font-family GUID resource with the browser on scene load', async () => {
+    const added = installFontFaceMock();
+    const sceneManager = await setup();
+
+    await sceneManager.loadScene('/font.json', { preloaded: sceneWithFont(FONT_GUID, 'font-family') as never });
+
+    expect(added.map(f => f.family)).toEqual(['Varela Round']);
+    expect(added[0].source).toContain('VarelaRound-Regular.ttf');
+  });
+
+  /** The SAME asset can be BOTH — Court names one typeface from a canvas label (`Text2D.font`,
+   *  an SDF atlas) and from DOM text (`UIElement.fontFamily`). Two resource types over one
+   *  asset, each doing its own load; collapsing them into one would drop whichever consumer
+   *  the surviving branch does not serve. */
+  it('serves both consumers when one asset is referenced as font AND font-family', async () => {
+    const added = installFontFaceMock();
+    const sceneManager = await setup();
+
+    await sceneManager.loadScene('/font.json', {
+      preloaded: {
+        version: 8,
+        resources: [{ type: 'font', path: FONT_GUID }, { type: 'font-family', path: FONT_GUID }],
+        entities: [{ id: 1, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'UIRoot', parentId: 0 } } }],
+      } as never,
+    });
+
+    expect(added.map(f => f.family), 'the DOM half still registers a face').toEqual(['Varela Round']);
+    expect(sceneManager.getCurrent()?.state).toBe('active');
+  });
+
+  /** A font-family GUID that resolves to nothing (deleted font, stale ref) must not fail the
+   *  scene load — same forgiveness as an unmatched family name. */
+  it('loads the scene anyway when a font-family GUID resolves to no asset', async () => {
+    installFontFaceMock();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const sceneManager = await setup();
+    const MISSING = '30000000-0000-4000-8000-0000000000ff';
+
+    await sceneManager.loadScene('/font.json', { preloaded: sceneWithFont(MISSING, 'font-family') as never });
+
+    expect(sceneManager.getCurrent()?.state).toBe('active');
+    expect(warn.mock.calls.map(c => String(c[0])).some(m => m.includes(MISSING))).toBe(true);
+    warn.mockRestore();
   });
 
   /** A family naming no asset must not fail the scene load — it warns and the scene loads. */

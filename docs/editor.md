@@ -332,6 +332,25 @@ example — it looks and behaves like a pull-down and is fully drivable by `modo
 This applies to NEW chrome. The existing `<select>`s (Inspector enum fields, device presets) are not
 worth a sweep on their own; convert one when you are already changing it and it blocks a check.
 
+### Find References (Assets row, Hierarchy row)
+
+Right-click an asset in the Assets panel or an entity in the Hierarchy and pick **Find References**
+to see everything that points at it — direct AND indirect (a texture reached only through
+material to mesh reports the entities at the far end), with the field to edit named on each hop.
+
+Two things about it that are easy to misread:
+- **It reads files on disk, not the live world.** Unsaved scene edits are invisible to it, so wire
+  something up, save, then ask. A "0 references" answer on an unsaved edit is the instrument being
+  stale, not the truth.
+- **"Nothing references this" is not "the build would drop this."** For the second question the
+  Assets menu's **Clean Up Unused Assets** is the right tool; a root scene is referenced by nothing
+  and is not unused.
+
+The graph behind it is the asset tree-shaker's own walk, inverted — including the implicit
+texture-to-derived-sprite edge that makes an ad-hoc search for "who uses this texture?" wrong rather
+than merely incomplete. Mechanism, the measured numbers, and the traps:
+[build.md](build.md) § "Find References — the same walk, inverted".
+
 ### Where a panel's LOGIC belongs (and what is tested)
 
 A panel `.tsx` holds JSX, hooks and imperative wiring. **Its decisions belong in a

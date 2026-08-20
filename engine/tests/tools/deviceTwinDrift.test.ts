@@ -81,6 +81,54 @@ describe('device_diagnose: ok:false is the ANSWER, not a failed call', () => {
   });
 });
 
+describe('game-registered tools relay to the ops, not to a game-shaped route (#286)', () => {
+  it('device_game_tools reads the declaration feed', async () => {
+    s = await loadDeviceSurface(() => deviceReply({ version: 2, tools: [{ name: 'court_load_level', mutates: true }] }));
+    await s.call('device_game_tools', {});
+    expect(relayed(s).method).toBe('game-tools');
+  });
+
+  it('device_game_tool_call forwards the name and the args object', async () => {
+    s = await loadDeviceSurface(() => deviceReply({ ok: true }));
+    await s.call('device_game_tool_call', { name: 'court_load_level', args: { track: 'hard', trackIndex: 19 } });
+    expect(relayed(s).method).toBe('game-tool-call');
+    expect(relayed(s).params).toMatchObject({ name: 'court_load_level', args: { track: 'hard', trackIndex: 19 } });
+  });
+
+  it('omitted args become {} rather than undefined, so a no-argument tool is callable bare', async () => {
+    // The op reads `p.args ?? {}`, but sending `undefined` would make the relayed payload
+    // structurally different from the editor path's for the same call — and the two are meant to
+    // be the same surface reached two ways.
+    s = await loadDeviceSurface(() => deviceReply({ ok: true }));
+    await s.call('device_game_tool_call', { name: 'court_level_info' });
+    expect(relayed(s).params).toMatchObject({ name: 'court_level_info', args: {} });
+  });
+
+  it('a refusal names the GAME TOOL, not the relay op (§5, caller\'s terms)', async () => {
+    // Every refusal used to read "read game-tool-call from the connected device" — which names our
+    // plumbing rather than what the caller asked for, and calls a mutating jump a "read". The
+    // editor MCP's own postJson docs say exactly why that is wrong.
+    s = await loadDeviceSurface(() => deviceReply({ ok: false, reason: 'nope' }));
+    const r = await s.call('device_game_tool_call', { name: 'court_load_level', args: {} });
+    const body = s.text(r);
+    expect(r.isError).toBe(true);
+    expect(body).toMatch(/court_load_level/);
+    expect(body).not.toMatch(/read game-tool-call/);
+  });
+
+  it('names no specific game — the connected build decides what exists', async () => {
+    // Not purity: an example name is actively MISLEADING here. The editor's tools describe the
+    // OPEN PROJECT, but a phone may be running any game at all, so "e.g. court_load_level" hints
+    // at a tool that is probably not on the device in front of you. The description has to send
+    // the caller to the discovery call instead. (Substring check — it catches the name that was
+    // actually there, not every game a future description might invent.)
+    s = await loadDeviceSurface(() => deviceReply({ ok: true }));
+    const src = (s.descriptionOf('device_game_tool_call') + s.descriptionOf('device_game_tools')).toLowerCase();
+    expect(src).not.toMatch(/court/);
+    expect(src).toMatch(/device_game_tools/);   // …and it does point at discovery
+  });
+});
+
 describe('coordinate aims all carry the screenshot scale', () => {
   /** An adb lease with no prior screenshot: `currentScreenInfo()` is null and the device has no
    *  `lastScreenInfo` of its own, so raw pixels would be used unscaled as CSS coordinates. */

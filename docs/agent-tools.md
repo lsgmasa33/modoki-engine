@@ -16,7 +16,7 @@ anything game-specific had two routes to an agent, and both are worse than a too
 
 | Route | Why it falls short |
 |---|---|
-| A UIAction via `modoki_dispatch_action` | Untyped (one scalar `payload`), inert unless the sim is Playing, and it answers *"dispatched"* rather than answering the question. It also **cannot be aimed** when the argument lives in the firing entity's NAME — which is exactly why Court's `court.levelTilePick` cannot express "load level X": its 25 tiles are instances of one prefab, so the slot is read from `LevelTile_<slot>`. |
+| A UIAction via `modoki_dispatch_action` | Untyped (one scalar `payload`), inert unless the sim is Playing, and it answers *"dispatched"* rather than answering the question. Its `params` schema is **not** validated either — that field is documented as "editor-facing … drives typed widgets in the Inspector's binding editor", and only 8 of 68 registration sites declare one, so there is nothing to enforce against. It also **cannot be aimed** when the argument lives in the firing entity's NAME — which is exactly why Court's `court.levelTilePick` cannot express "load level X": its 25 tiles are instances of one prefab, so the slot is read from `LevelTile_<slot>`. |
 | The in-game debug menu | Keyboard-only, and F12 is swallowed whenever a DOM text field holds focus. Court's list is also indexed **two off** the on-disk manifest (`loadManifest` prepends the two tutorial lessons), which is invisible from the files and cost a live session a round trip on 2026-08-20. |
 
 ## The chain
@@ -82,6 +82,19 @@ damage to an open project.
 This is what buys game tools **real live coverage**: `test-live-tools.ts` asks the backend which
 tools the open game declares, calls every `mutates: false` one, and skips the rest — the same rule
 it applies to the static surface, answered from the declaration instead of from `contracts.ts`.
+
+### Where args are validated — and why it is not only in the MCP server
+
+The MCP server rebuilds a zod shape from `params`, which is what puts a real schema in the tool
+list. That used to be the *only* enforcement, and it made the declaration a promise kept for one
+caller in four: `curl -X POST /api/game-tool-call`, `device_eval`'s `modoki.call`, and the device
+relays all reached the handler with whatever they were given.
+
+So the declaration is now enforced at the **op** (`validateAgentToolArgs`, beside the
+`AgentToolParam` type that defines it), and every caller inherits it. The zod rebuild is the first
+line of defence rather than the only one. Practical consequence for a game author: **your handler
+can trust `args`** — an unknown key, a wrong type, a bad `enum` value or a missing `required` param
+is refused before you are called, with a reason naming your real parameters.
 
 ### `requiresPlaying` — so a correct refusal is not read as a defect
 
@@ -156,9 +169,31 @@ What covers it instead:
 |---|---|
 | `engine/tests/tools/mcpGameTools.test.ts` | Declaration → strict schema, unknown-type refusal, duplicate/engine-shadow refusal, routing to `/api/game-tool-call`, teardown when the backend goes away, re-registration on an in-place schema change |
 | `npm run test:mcp:live` (needs an editor) | The tail is really on the surface, and every `mutates:false` game tool answers for real |
+| `engine/tests/framework/gameToolCallOp.test.ts` | The op enforces the declaration for every non-MCP caller — a typo is refused, the handler is never reached |
+| `engine/tests/tools/deviceTwinDrift.test.ts` | The device relays send the right op, name no specific game, and refuse in the caller's terms |
+| `engine/tests/tools/mcpGameTools.test.ts` (conformance) | The zod rebuild and the op-side validator agree on 12 accept/reject cases — one declaration, two implementations, no shared code |
 | `engine/tests/framework/agentToolRegistry.test.ts` | Name validation, the reserved prefix, the debug gate on **both** list and lookup, change notification |
 | `engine/tests/architecture/gameAgentToolNames.test.ts` | `<gameId>_` namespacing across `games/` + `demos/`, no cross-project collisions |
 | `games/court/tests/agentTools.test.ts` | The worked example's behaviour |
+
+## Writing a handler that runs on a phone
+
+**Your tool inherits the device bridge's 5000 ms request budget** (`deviceConnection.ts`'s
+`REQUEST_TIMEOUT_MS`), and only two tools on the whole device surface can raise it —
+`device_eval` and `device_step`, both by passing an explicit `timeoutMs`. A game tool cannot.
+
+That ceiling is easy to miss because the same handler is fast everywhere else. Court's shape
+scan measured **495 ms** in the desktop editor, **2701 ms** on a Galaxy S22 and **~30 ms/file**
+on a Galaxy A23 — 13x the S22, roughly 33 s for the same work. On the A23 it ran straight past
+the deadline: the work *completed on the device* while the reply arrived too late to read, so the
+caller saw a timeout and the next identical call answered in 134 ms from a warm cache.
+
+So if your handler's work scales with anything — corpus size, entity count, an O(n²) pass —
+**give it a wall-clock budget and report that you stopped**, the way `court_list_levels` returns
+`capped: true, cappedBy: "time"` with the count it did read. A tool that times out and then
+succeeds is worse than one that answers a smaller question honestly. Use `rawNow()` from
+`@modoki/engine/runtime` (the sanctioned wall-clock wrapper; `setManualNow` makes the budget
+testable), not `Date.now()`.
 
 ## Limits worth knowing before you rely on this
 
@@ -166,11 +201,14 @@ What covers it instead:
   push an undo entry; a game tool pushes whatever its handler pushes, which is usually nothing. So
   a human's Cmd-Z will not unwind it, and neither will `modoki_history`. `modoki_batch`'s per-step
   undo cannot reach it either. If your tool should be undoable, the handler has to do that itself.
-- **There is no `device_*` twin.** The ops (`game-tools`, `game-tool-call`) live in `agentBridge`,
-  which the device bridge also serves, so the *capability* is reachable on a phone — but the
-  `game-debug` MCP is a separate server with its own static tool list and no dynamic tail, so a
-  game's tools do NOT appear there. Deliberate scope, not an oversight; on device, drive them
-  through `device_eval_api` or add the twin.
+- **On device you get two static relays, not the dynamic tail** (#286): `device_game_tools` lists
+  what the connected build declares, `device_game_tool_call {name, args}` invokes one. The game's
+  tools do **not** appear individually in the device tool list, and that is deliberate — the
+  `game-debug` MCP is a thin client of the lease with a static surface, and a tail keyed to *which
+  phone is leased and what build it carries* is far more volatile than one keyed to the open
+  project (the eval-api guidance already warns "an older app reports fewer ops"). A phone running a
+  build older than #270 has neither op; `device_eval`'s `modoki.call('game-tool-call', …)` reaches
+  the same place and always has.
 - **They appear a few seconds after the editor does**, and vanish with it. Do not write a script
   that assumes the tool exists the instant the MCP server starts.
 

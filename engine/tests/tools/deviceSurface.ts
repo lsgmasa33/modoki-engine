@@ -30,6 +30,10 @@ export type DeviceSurface = {
   /** The strict-validation verdict alone, for asserting on refusals without invoking anything. */
   validate: (name: string, args?: Record<string, unknown>) => { ok: boolean; error?: string };
   text: (r: { content: Array<{ type: string; text?: string }> }) => string;
+  /** The registered description — what the model actually reads before choosing the tool. The
+   *  editor harness has had this since the audit; the device surface needs it for the same reason,
+   *  since a description is the only thing standing between an agent and a wrong tool. */
+  descriptionOf: (name: string) => string;
   /** Requests excluding the once-per-process `/api/identity` probe. */
   real: () => StubRequest[];
   last: () => StubRequest | undefined;
@@ -84,6 +88,11 @@ export async function loadDeviceSurface(responder?: Responder): Promise<DeviceSu
   return {
     requests,
     names: deviceToolNames(),
+    descriptionOf: (name: string) => {
+      const entry = getDeviceTool(name);
+      if (!entry) throw new Error(`device tool '${name}' is not registered — have: ${deviceToolNames().join(', ')}`);
+      return entry.description;
+    },
     text,
     real: () => requests.filter((r) => r.path !== '/api/identity'),
     last: () => requests[requests.length - 1],

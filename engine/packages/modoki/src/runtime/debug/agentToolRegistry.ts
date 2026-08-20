@@ -141,6 +141,56 @@ export function getAgentTool(name: string): AgentToolDef | undefined {
   return tools.get(name);
 }
 
+/** Check `args` against a tool's DECLARED params. Returns a caller-facing reason, or null when
+ *  the args are acceptable.
+ *
+ *  WHY THIS LIVES HERE AND NOT IN A CALLER. The declaration promises a strict schema, and for a
+ *  while exactly ONE caller kept that promise: the MCP server rebuilds a zod shape from `params`,
+ *  so a typo'd key is refused there. Every other path into `game-tool-call` — the `curl` API,
+ *  `device_eval`'s `modoki.call`, the device MCP relays — reached the handler with whatever it was
+ *  given. A declaration honoured by one of four callers is the partially-wired authoring surface
+ *  this repo keeps getting bitten by: the field exists, the docs describe it, and most of the ways
+ *  in ignore it.
+ *
+ *  So the rule is enforced beside the {@link AgentToolParam} type that defines it, and the MCP's
+ *  zod rebuild becomes the FIRST line of defence rather than the only one — it still earns its
+ *  place by putting a real schema in the tool list, where the model can see it before calling.
+ *
+ *  STRICT about unknown keys, deliberately, for the reason the whole `modoki_*` surface is: for a
+ *  tool whose params are all optional, silently dropping an unrecognised key turns a typo into a
+ *  DIFFERENT operation that reports success. */
+export function validateAgentToolArgs(
+  def: AgentToolDef,
+  args: Record<string, unknown>,
+): string | null {
+  const params = def.params ?? {};
+  const declared = Object.keys(params);
+  for (const key of Object.keys(args)) {
+    if (!(key in params)) {
+      return `'${key}' is not a parameter of ${def.name}. It accepts: ${declared.length ? declared.join(', ') : '(no parameters)'}.`;
+    }
+  }
+  for (const [key, spec] of Object.entries(params)) {
+    const value = args[key];
+    if (value === undefined) {
+      if (spec.required) return `${def.name} requires '${key}' (${spec.type}).`;
+      continue;
+    }
+    if (spec.type === 'string') {
+      if (typeof value !== 'string') return `'${key}' must be a string.`;
+      if (spec.enum && !spec.enum.includes(value)) {
+        return `'${key}' must be one of: ${spec.enum.join(', ')}.`;
+      }
+    } else if (spec.type === 'number') {
+      if (typeof value !== 'number' || !Number.isFinite(value)) return `'${key}' must be a number.`;
+      if (spec.int && !Number.isInteger(value)) return `'${key}' must be a whole number.`;
+    } else if (spec.type === 'boolean') {
+      if (typeof value !== 'boolean') return `'${key}' must be true or false.`;
+    }
+  }
+  return null;
+}
+
 /** Subscribe to registry changes. The bridge uses this to bump {@link agentToolsVersion}, which
  *  is what lets the MCP server notice a new surface and send `tools/list_changed`. */
 export function subscribeAgentTools(fn: () => void): () => void {

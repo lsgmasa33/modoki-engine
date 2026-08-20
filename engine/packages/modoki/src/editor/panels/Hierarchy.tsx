@@ -539,6 +539,7 @@ export default function Hierarchy() {
   const selectedId = useEditorStore((s) => s.selectedEntityId);
   const selectedEntityIds = useEditorStore((s) => s.selectedEntityIds);
   const selectEntity = useEditorStore((s) => s.selectEntity);
+  const openFindReferences = useEditorStore((s) => s.openFindReferences);
   const setSelectedEntities = useEditorStore((s) => s.setSelectedEntities);
   const toggleEntitySelection = useEditorStore((s) => s.toggleEntitySelection);
   const [tree, setTree] = useState<EntityInfo[]>([]);
@@ -1387,6 +1388,10 @@ export default function Hierarchy() {
     const isActive = attr ? (attr.isActive as boolean) !== false : true;
     const dis = entity.isResource;
     const isPrefabInstance = entity.traits.includes('PrefabInstance');
+    // Find References needs a stable guid to send the backend (runtime ids are
+    // reassigned every scene reload) — disable rather than send a target that
+    // cannot resolve (a 404 the user can't act on is worse than a greyed-out item).
+    const guid = attr ? (attr.guid as string) || '' : '';
     return [
       { label: 'Rename', shortcut: 'F2', onClick: () => handleRename(entity), disabled: dis },
       { label: 'Duplicate', shortcut: '⌘D', onClick: () => handleDuplicate(entity), disabled: dis },
@@ -1399,6 +1404,8 @@ export default function Hierarchy() {
       { label: 'Create Prefab', onClick: () => handleCreatePrefab(entity), disabled: dis },
       ...(isPrefabInstance ? [{ label: 'Detach Prefab', onClick: () => handleDetachPrefab(entity), disabled: dis }] : []),
       { label: '', separator: true },
+      { label: 'Find References', onClick: () => openFindReferences(guid, entity.name), disabled: !guid },
+      { label: '', separator: true },
       { label: 'New Folder', onClick: () => createFolder(''), disabled: dis },
       ...(entity.parentId === 0 && entity.editorFolder ? [{ label: 'Remove from Folder', onClick: () => moveEntityToFolder(entity.id, '') }] : []),
       { label: '', separator: true },
@@ -1406,7 +1413,7 @@ export default function Hierarchy() {
       { label: '', separator: true },
       { label: 'Delete', shortcut: '⌫', onClick: () => handleDelete(entity), danger: true, disabled: dis },
     ];
-  }, [createItems, entityClipboard, handlePaste, handleRename, handleDuplicate, handleCopy, handleCut, handleFocus, handleToggleActive, handleCreatePrefab, handleDetachPrefab, handleDelete, createFolder, moveEntityToFolder]);
+  }, [createItems, entityClipboard, handlePaste, handleRename, handleDuplicate, handleCopy, handleCut, handleFocus, handleToggleActive, handleCreatePrefab, handleDetachPrefab, handleDelete, createFolder, moveEntityToFolder, openFindReferences]);
 
   // Reparent handler: entity dragged onto another entity or root
   const handleReparent = useCallback((entityId: number, newParentId: number, sortOrder?: number) => {

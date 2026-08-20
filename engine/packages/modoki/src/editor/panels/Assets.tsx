@@ -668,6 +668,7 @@ export default function Assets() {
   const selectedAsset = useEditorStore((s) => s.selectedAsset);
   const assetsVersion = useEditorStore((s) => s.assetsVersion);
   const setImportStatus = useEditorStore((s) => s.setImportStatus);
+  const openFindReferences = useEditorStore((s) => s.openFindReferences);
 
   // Publish a MULTI-asset selection to the store so the Inspector can render a
   // batch editor. Single/none selection is already handled by the selectAsset()
@@ -1456,9 +1457,12 @@ export default function Assets() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: asset.path }),
     }) });
+    // Inspection, not a mutation — GUID when we have one (the route also accepts a
+    // virtual path, but a GUID is the stable address a moved/renamed file keeps).
+    if (!many) items.push({ label: 'Find References', onClick: () => openFindReferences(asset.guid || asset.path, asset.name) });
     items.push({ label: `Move to Trash${suffix}`, onClick: () => (many ? deleteSelection() : handleDelete(asset)), danger: true });
     return items;
-  }, [handleDelete, handleDuplicate, refresh, reimport, selection, clipboard, duplicateSelection, deleteSelection, copySelection, pasteClipboard]);
+  }, [handleDelete, handleDuplicate, refresh, reimport, selection, clipboard, duplicateSelection, deleteSelection, copySelection, pasteClipboard, openFindReferences]);
 
   // Drop handler: entity dragged from Hierarchy → create prefab
   const [dropHighlight, setDropHighlight] = useState<string | null>(null); // folder path being hovered

@@ -84,9 +84,11 @@ URL at load time, so a file can be renamed or moved without touching a single sc
 with a loud `console.error` and resolves it to `undefined` — so a hand-written path
 fails visibly rather than silently working in dev and 404ing in a production build.
 Mint a GUID with `newGuid()`; look one up with `getGuidForPath()`. The only values that
-pass through unchanged are genuinely external resources (`http(s)://`, `data:`, `blob:`),
-the primitive sprite keywords (`circle`/`square`/`triangle`), and `UIElement.fontFamily`
-(a CSS family name). The invariant is guarded by `tests/assets/assetRefIntegrity.test.ts`.
+pass through unchanged are genuinely external resources (`http(s)://`, `data:`, `blob:`) and
+the primitive sprite keywords (`circle`/`square`/`triangle`). `UIElement.fontFamily` used to be
+a third exception (a CSS family name) and stopped being one in #231 — it is an ordinary font-asset
+GUID now, with a separate `systemFont` field for a typeface no asset can express. The invariant is
+guarded by `tests/assets/assetRefIntegrity.test.ts`.
 See [textures.md](./textures.md) and [scene-loading.md](./scene-loading.md).
 
 ### World

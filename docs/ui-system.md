@@ -80,7 +80,7 @@ Field groups (representative fields, verified against `UIElement.ts`):
 - **Style (box visuals)** — `backgroundColor` (packed hex int, `0` = transparent),
   `backgroundOpacity`, `borderRadius`, `borderWidth`, `borderColor`, `borderOpacity`
   (border color alpha, folded into the `borderColor` picker), `opacity`.
-- **Text** — `text`, `fontFamily`, `fontSize` + **`fontSizeUnit`**, `fontWeight`, `fontStyle`, `textColor`,
+- **Text** — `text`, **`fontFamily`** (a font-asset GUID) + **`systemFont`** (a CSS family name; the asset wins — see § Fonts), `fontSize` + **`fontSizeUnit`**, `fontWeight`, `fontStyle`, `textColor`,
   `textOpacity` (folded into the `textColor` picker), `textAlign`, `lineHeight`,
   `letterSpacing` + **`letterSpacingUnit`**, `textShadow*` (color/opacity/offsetX/offsetY/blur — `textShadowOpacity`
   folded into `textShadowColor`), `textStrokeColor`/`textStrokeOpacity`
@@ -734,28 +734,69 @@ Two independent font pipelines feed the two text worlds:
 
 `runtime/loaders/fontLoader.ts` loads `.ttf`/`.otf` files via the browser `FontFace` API
 and registers each family (`document.fonts.add`), serving both the DOM UI layer
-(`UIElement.fontFamily`, a CSS family name — never an asset GUID) and the PixiJS 2D layer,
-since both use the browser's font system. `loadAllFonts()` bulk-loads every `type:'font'`
+(`UIElement.fontFamily`) and the PixiJS 2D layer, since both use the browser's font system. `loadAllFonts()` bulk-loads every `type:'font'`
 asset from the scan; concurrent loads of the same path share one in-flight
 `FontFace.load()`, and a failed load is evicted so it can retry. Family/weight/style come
 from the filename (`parseFontFilename`); a (weight, style) collision within a family warns
-(last-added wins). The Inspector authors the field by DRAG-DROP — `AssetRefField` special-cases
-`fontFamily`, calling `loadFont(path)` on the dropped font and writing back the resolved family
-NAME (every other `accept:`-typed field writes a GUID; making this one match is issue #231).
+(last-added wins).
 `getLoadedFontFamilies()` / `getLoadedFonts()` expose the registry to game code; nothing in the
 engine or editor consumes them today (verified 2026-08-20).
+
+#### Two fields, one answer: `fontFamily` + `systemFont` (#231)
+
+**`UIElement.fontFamily` is a font-ASSET GUID**, resolved through the manifest like every
+other asset reference; **`UIElement.systemFont`** is a plain CSS family name, for the case a
+GUID cannot express (`system-ui`, `Helvetica`, a stack). **Precedence is one-way: the asset
+wins when set, else `systemFont`, else the browser default** — pinned in `resolveUIFontFamily`
+(`runtime/ui/fontFamilyRef.ts`), which is the only place that decides, so "both are set" is
+never a question answered by experiment.
+
+Resolution happens in the **UI tree projection**, not in `UINode`: `uiTreeStore` writes the
+RESOLVED CSS value into the node's `fontFamily`, and the DOM layer stays a pure style writer.
+`ui/` is an L2 subsystem and cannot import the L3 manifest, so it reaches it through the
+`core/domFontProvider` seam (installed by `loaders/registerProviders.ts`), the same shape
+`textureProvider` uses.
+
+**Why it changed.** `fontFamily` held the CSS family name, which made it the one
+`accept:`-typed field in the engine that did not store a ref — so the build's tree-shaker had
+to resolve it by matching family names against FILENAMES, the validator and `diagnose` could
+not check it at all, and a font named from anywhere the static scan cannot read was simply
+dropped from the shipped bundle. It also forced a second, field-aware path predicate
+(`isInternalFontPath`, QA-INSP-0004), since a literal font path was legitimate in that one
+field and invalid everywhere else; that predicate is retired and font extensions are now
+part of `isInternalAssetPath` like every other asset kind.
+
+**Migration.** A legacy family name still RENDERS — `resolveUIFontFamily` passes it through
+with a one-time warning — so a pre-#231 scene is not broken, merely invisible to the build.
+`engine/scripts/migrate-font-family-refs.mjs` rewrites authored values to GUIDs (dry-run by
+default, `--write` to apply); a family matching no font asset is reported rather than guessed
+at, since it is probably a system typeface that belongs in `systemFont`. In-repo, the only
+authored value was Court's `Intro` root, migrated with the script.
+
+**Authoring.** Drag a font from the Assets panel onto the field (the drop writes the GUID and
+registers the FontFace so the Game panel updates immediately), or use the field's **`Aa`**
+picker, which lists every font asset previewed in its own typeface. Typing is no longer an
+option for this field — `isAcceptableTypedRef` rejects a bare family name in every font field,
+because a GUID cannot be typed and a name would resolve to nothing.
 
 #### Who registers a scene's fonts — and the bug that answer used to have (#253)
 
 **A scene's own fonts are registered by the SCENE-LOAD path**, not by whoever happens to
 have called `loadAllFonts`. `collectResourceRefsFromEntities` emits each authored
-`UIElement.fontFamily` as a `{type:'font', path:'<CSS family name>'}` scene resource, and
-`SceneManager`'s `acquireResource` hands it to **`loadFontFamily(family)`** — which finds
+`UIElement.fontFamily` as a **`{type:'font-family', path:'<font GUID>'}`** scene resource, and
+`SceneManager`'s `acquireResource` hands it to **`loadFontFamilyForRef`** → `loadFontFamily(family)`
+— which finds
 every manifest `font` asset whose `parseFontFilename(path).family` matches and FontFace-loads
 them all (all variants: a UI authoring `fontWeight: 700` needs the real Bold file, or the
 browser synthesizes a fake bold). It is awaited with the scene's other resources, so the
 first frame has the face. The walk covers referenced PREFABS too — the same collector runs
 over each prefab's entities.
+
+⚠️ **`font-family` and `font` are two resource types over the same kind of asset, and that is
+deliberate.** A `font` resource is an SDF atlas acquire (`Text2D.font`/`Text3D.font`, scene-scoped
++ refcounted); a `font-family` resource is a FontFace registration for the DOM. **One asset can be
+both** — Court names one typeface from a canvas label and from DOM text — so collapsing them into
+one type would drop whichever consumer the surviving branch does not serve.
 
 ⚠️ **Matching is `parseFontFilename(path).family`, deliberately the same rule the build's
 `resolveFontsByFamily` (`asset-tree-shaker.ts`) uses** to decide whether a font's source
@@ -844,9 +885,10 @@ face the browser still holds after its registry is cleared can never be removed 
 cannot see a family NAME reached from anywhere but a scene/prefab field** (a stylesheet, a
 code constant), so the font is dropped and every string falls back — see
 [Build](./build.md) § "Converted assets: the manifest points at the SOURCE, the build ships the
-VARIANT". `UIElement.fontFamily` being a
-CSS name rather than a GUID is the root of both halves; making it a font-asset GUID ref is
-tracked as issue #231.
+VARIANT". **The scene/prefab half of that is closed** — `fontFamily` is a GUID as of #231, so a
+UI font ref is followed by the same walk as every other ref (and its family's other variants come
+with it). What remains is a family named from a place no static scan can read — a stylesheet or a
+runtime code string — which is what `shipSource: 'always'` exists for.
 
 ### MSDF world-text atlases (`Text2D`/`Text3D`)
 

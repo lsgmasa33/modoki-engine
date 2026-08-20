@@ -1268,6 +1268,7 @@ app.whenReady().then(async () => {
     getManifest: () => state.backend.getManifest(),
     rebuildManifest: () => state.backend.rebuildManifest(),
     computeUnused: () => state.backend.computeUnused(),
+    computeRefEdges: () => state.backend.computeRefEdges(),
     requestBrowser: requestRenderer,
     getSchema: () => cachedSchema,
     markEditorWrite: (p, h) => state.backend.markEditorWrite(p, h),

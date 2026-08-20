@@ -194,7 +194,7 @@ propagation** (so children follow post-physics positions).
 4. **Rapier → ECS (pull).** Dynamic bodies: write body position/angle → `Transform` (`x,y,rz`) and
    live velocity → `RigidBody2D` (inverse conversion).
 5. **Events → 3 sinks.** Drain Rapier collision/sensor event queues and fan each enter/exit to:
-   (a) the **journal** — `emit('@collision', {a,b})` / `emit('@sensor', {sensor, other, phase})`
+   (a) the **journal** — `emit('@collision', {a, b, phase})` / `emit('@sensor', {sensor, other, phase})`
    (observability; assertable in tests), (b) the **Physics2DEvents manager** (code subscribers),
    and (c) any **OnCollision2D** trait on either collider (declarative action dispatch). See below.
 

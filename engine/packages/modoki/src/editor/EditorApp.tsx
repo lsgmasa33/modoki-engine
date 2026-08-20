@@ -29,6 +29,7 @@ import ApplyPrefabDialog, { RevertPrefabDialog } from './panels/ApplyPrefabDialo
 import ProjectSettingsDialog from './panels/ProjectSettingsDialog';
 import BuildSupportDialog from './panels/BuildSupportDialog';
 import CleanupAssetsDialog from './panels/CleanupAssetsDialog';
+import FindReferencesDialog from './panels/FindReferencesDialog';
 import PublishOtaDialog from './panels/PublishOtaDialog';
 import OtaKeysDialog from './panels/OtaKeysDialog';
 import PanelErrorBoundary from './panels/PanelErrorBoundary';
@@ -747,6 +748,7 @@ export default function EditorApp() {
       <RevertPrefabDialog />
       <ProjectSettingsDialog />
       <CleanupAssetsDialog />
+      <FindReferencesDialog />
       <BuildSupportDialog />
       <PublishOtaDialog />
       <OtaKeysDialog />

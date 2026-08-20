@@ -16,14 +16,16 @@
  *  L0 and may import nothing (docs/architecture-layers.md), while the classifier is L3
  *  `loaders/`. So the copy is forced, and this test is what keeps it honest. */
 import { describe, it, expect } from 'vitest';
-import { isInternalAssetPath, isInternalFontPath } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { isInternalAssetPath } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import {
   JSON_ASSET_SUFFIX_TYPE, BINARY_EXT_TYPE,
 } from '../../packages/modoki/src/runtime/loaders/assetTypeClassifier';
 
-/** Fonts are deliberately NOT asset-path refs: `UIElement.fontFamily` is a CSS family name
- *  (or a font path), so rejecting one would break a legitimate authored value. Stated here
- *  so the exclusion is a decision the test defends, not a hole it happens to leave. */
+/** Font extensions, called out by name because they were the ONE exclusion from the
+ *  predicate and stopped being one in #231: `UIElement.fontFamily` held a CSS family name
+ *  (or a font path), so rejecting a font path would have broken a legitimate authored value.
+ *  It holds a font-asset GUID now, so a literal font path is a violation like any other, and
+ *  the field-aware second predicate (`isInternalFontPath`) has been retired. */
 const FONT_EXTS = new Set(['.ttf', '.otf', '.woff', '.woff2']);
 
 describe('isInternalAssetPath covers every managed asset kind', () => {
@@ -39,9 +41,8 @@ describe('isInternalAssetPath covers every managed asset kind', () => {
     ).toEqual([]);
   });
 
-  it('recognises a literal path for every shippable binary extension (fonts excepted)', () => {
+  it('recognises a literal path for every shippable binary extension, fonts included', () => {
     const missing = Object.keys(BINARY_EXT_TYPE)
-      .filter((ext) => !FONT_EXTS.has(ext))
       .filter((ext) => !isInternalAssetPath(`/games/x/assets/thing${ext}`));
     expect(
       missing,
@@ -50,33 +51,20 @@ describe('isInternalAssetPath covers every managed asset kind', () => {
     ).toEqual([]);
   });
 
-  it('still does NOT claim a font path — fontFamily is a CSS name, not an asset GUID', () => {
+  it('claims a font path too, in every font extension (#231)', () => {
     for (const ext of FONT_EXTS) {
-      expect(isInternalAssetPath(`/games/x/assets/fonts/thing${ext}`), ext).toBe(false);
+      expect(isInternalAssetPath(`/games/x/assets/fonts/thing${ext}`), ext).toBe(true);
     }
   });
 
-  /** QA-INSP-0004 — the exclusion above is right for `UIElement.fontFamily` and WRONG for
-   *  `Text2D.font` / `Text3D.font`, which are manifest-tracked font-asset GUIDs. The answer
-   *  depends on the FIELD, not the extension, so it is a second predicate rather than a
-   *  widening of the first — and the field-aware rejection sites (resolveRef, the scene
-   *  validator, diagnose) ask both. */
-  describe('isInternalFontPath — the field-aware other half', () => {
-    it('claims an internal font path for every font extension', () => {
-      for (const ext of FONT_EXTS) {
-        expect(isInternalFontPath(`/games/x/assets/fonts/thing${ext}`), ext).toBe(true);
-      }
-    });
-
-    it('claims nothing else — not a GUID, a URL, a bare filename, or another asset kind', () => {
-      expect(isInternalFontPath('7b5534ab-5bc6-4082-a813-a291f3a69e54')).toBe(false);
-      expect(isInternalFontPath('https://fonts.example.com/Inter.woff2')).toBe(false);
-      expect(isInternalFontPath('Inter.ttf')).toBe(false);          // no leading slash
-      expect(isInternalFontPath('Helvetica Neue')).toBe(false);     // a CSS family name
-      expect(isInternalFontPath('/games/x/assets/tex/hero.png')).toBe(false);
-      expect(isInternalFontPath('')).toBe(false);
-      expect(isInternalFontPath(undefined)).toBe(false);
-    });
+  /** The values that must still pass through — a font REF is a GUID, and a system typeface
+   *  is a bare CSS family name in the separate `systemFont` field. Neither is a path, so
+   *  neither may be claimed by a predicate whose whole job is rejecting paths. */
+  it('claims neither a font GUID nor a CSS family name', () => {
+    expect(isInternalAssetPath('713d4a4c-ec3f-4bf0-9b60-e6ad493bb7ad')).toBe(false);
+    expect(isInternalAssetPath('Helvetica Neue')).toBe(false);
+    expect(isInternalAssetPath('Inter.ttf')).toBe(false);            // no leading slash
+    expect(isInternalAssetPath('https://fonts.example.com/Inter.woff2')).toBe(false);
   });
 
   it('needs the leading slash — a bare filename or a URL is not an internal path', () => {

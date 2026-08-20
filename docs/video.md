@@ -41,6 +41,12 @@ All of them wrap the **same `HTMLVideoElement`** — one decoder, one audio path
 state. Two viewports showing the same clip get two GPU textures over that one decoder, which is
 what the per-surface binding tables exist to make possible.
 
+⚠️ **The live `<video>` element is never attached to the DOM.** `videoService.ts`'s `playVideo`
+does `document.createElement('video')` and nothing ever `appendChild`s it, so
+`document.querySelector('video')` finds NOTHING however healthy playback is — a texture surface only
+ever copies frames off a detached element. The one reach-in is `videoElementFor(entityId)`
+(`runtime/video/videoSystem.ts`). (The DOM-mounted case below is the exception that IS in the tree.)
+
 ⚠️ **The DOM surfaces are the exception: they cannot be duplicated.** A texture surface COPIES
 frames off the element, so any number of viewports can show the clip; a DOM `<video>` IS the
 element, and a DOM node exists in exactly one place. So with the editor's Game and Scene panels

@@ -298,10 +298,21 @@ function entityName(e: MutableEntity): string | undefined {
   return attrs && typeof attrs === 'object' ? (attrs as { name?: string }).name : undefined;
 }
 
-function entityGuid(e: MutableEntity): string | undefined {
+/** Which guid identifies a scene-FILE entity entry — the one rule, for every reader.
+ *
+ *  Exported because it is not obvious and gets re-derived wrong: a plain entity's
+ *  identity is `EntityAttributes.guid`, but a PREFAB INSTANCE has no such trait on
+ *  disk and carries its guid at the node top level instead (the trait comes from the
+ *  expanded prefab). The asset-tree-shaker's reverse-reference walk (#284) read only
+ *  the trait and so treated all 25 of `games/court`'s prefab instances as identity-less,
+ *  which made 26 live entity references look dangling. One helper, so the next reader
+ *  cannot half-learn it.
+ *
+ *  Deliberately takes a structural subset rather than `MutableEntity`: callers outside
+ *  the mutate path (the shaker) have their own entry type and no numeric `id`. */
+export function entityGuid(e: { traits?: Record<string, unknown>; guid?: string }): string | undefined {
   const attrs = e.traits?.EntityAttributes;
   const attrGuid = attrs && typeof attrs === 'object' ? (attrs as { guid?: string }).guid : undefined;
-  // Prefab instances carry their guid at the node top level, not in EntityAttributes.
   return attrGuid ?? e.guid;
 }
 

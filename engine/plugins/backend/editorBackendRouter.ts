@@ -192,7 +192,8 @@ import { listCrashReports, fetchCrashReport, filterCrashReports, summarizeCrashR
 import { resolveModules } from '../detect-modules';
 // Type-only — erased at runtime, so it does NOT pull the tree-shaker (and its
 // vite-asset-scanner import) into this host-agnostic router.
-import type { TreeShakeResult } from '../asset-tree-shaker';
+import type { TreeShakeResult, RefEdgeEnumeration } from '../asset-tree-shaker';
+import { buildRefGraph, resolveTarget, findReferences, findUnreferenced, type FindReferencesResponse } from '../assetRefGraph';
 
 /** Minimal shape of a manifest entry the router needs (structurally compatible
  *  with the scanner's AssetEntry — avoids an import cycle with the host). */
@@ -239,6 +240,11 @@ export interface BackendContext {
    *  Host-provided so the router stays free of the tree-shaker → scanner import
    *  cycle. */
   computeUnused(): TreeShakeResult;
+  /** Enumerate every reference edge in the open project — the shaker's own walk with
+   *  an observer attached (#284). Backs `/api/find-references`. Host-provided for the
+   *  same reason `computeUnused` is: it keeps the router free of the tree-shaker →
+   *  scanner import cycle. */
+  computeRefEdges(): RefEdgeEnumeration;
 }
 
 /** What a handler returns. The host serializes it onto its response object. */
@@ -1770,6 +1776,78 @@ async function describeUnresolvedAgainstLiveWorld(
         // Drop warnings about the engine root we filtered out — they'd be noise here.
         warnings: result.warnings,
       });
+    } catch (e) {
+      return json({ error: e instanceof Error ? e.message : String(e) }, 500);
+    }
+  }
+
+  // Parse a bounded integer query param. Out-of-range and non-numeric both fall back
+  // to the default rather than erroring: these are response-size knobs, and refusing a
+  // whole reference query over a mistyped `limit` costs the caller more than clamping.
+  const clampInt = (raw: string | null, dflt: number, min: number, max: number): number => {
+    const n = Number(raw);
+    if (raw == null || raw === '' || !Number.isFinite(n)) return dflt;
+    return Math.min(max, Math.max(min, Math.trunc(n)));
+  };
+
+  // ── GET /api/find-references?target=… (M) ── the reverse reference graph (#284).
+  // "What references this?" over assets AND entities, including the INDIRECT chains
+  // (texture ← material ← mesh ← entity) and the implicit edges no file records —
+  // most importantly a UI `imageSrc` holding the auto-emitted whole-image sprite guid
+  // rather than the texture's own. Reading the texture's guid out of the scene finds
+  // none of those, which is how every icon in games/court once read as orphaned.
+  //
+  // Backs the editor's Assets/Hierarchy "Find References" and the modoki_find_references
+  // MCP tool — one implementation, three consumers, because two reverse walks over the
+  // same data would drift and a wrong "0 references" is indistinguishable from a right one.
+  //
+  // `?unreferenced=1` lists every asset nothing points at. NOT the same question as
+  // /api/unused-assets, which asks what a production build would DROP: a root scene is
+  // referenced by nothing and is not unused. Kept on this route because it is the same
+  // index inverted, and named differently because it is a different answer.
+  if (urlPath === '/api/find-references' && method === 'GET') {
+    try {
+      const enumeration = ctx.computeRefEdges();
+      const graph = buildRefGraph(enumeration);
+
+      if (query.get('unreferenced') === '1') {
+        const all = findUnreferenced(graph, enumeration);
+        const limit = clampInt(query.get('limit'), 200, 1, 5000);
+        return json({
+          unreferenced: all.slice(0, limit).map(n => ({ path: n.path, name: n.name })),
+          returnedCount: Math.min(all.length, limit),
+          totalCount: all.length,
+          truncated: all.length > limit,
+          warnings: graph.warnings,
+        });
+      }
+
+      const target = (query.get('target') || '').trim();
+      if (!target) {
+        return json({ error: 'find-references needs a `target`: an asset GUID, an entity GUID, or a virtual asset path (/assets/…). Pass `unreferenced=1` instead to list assets nothing references.' }, 400);
+      }
+      const node = resolveTarget(graph, target);
+      if (!node) {
+        // "Could not look" is never reported as "nothing is there" — an unresolvable
+        // target is a refusal, not an answer of zero references.
+        return json({
+          error: `no asset or entity matches "${target}". Expected an asset GUID, an entity GUID (EntityAttributes.guid, or a prefab instance's own guid), or a virtual path starting with "/".`,
+        }, 404);
+      }
+
+      const result = findReferences(graph, node, {
+        limit: clampInt(query.get('limit'), 50, 1, 1000),
+        maxDepth: clampInt(query.get('maxDepth'), 6, 1, 20),
+        reachableOnly: query.get('reachableOnly') === '1',
+      });
+      const body: FindReferencesResponse = {
+        ...result,
+        // A lead, not a verdict — a ref to a game-defined JSON kind the shaker does
+        // not classify lands here even though the file exists. Scoped to this target
+        // so the payload does not carry the whole project's every time.
+        unresolvedRefsFromTarget: graph.dangling.filter(d => d.from.id === node.id).map(d => ({ via: d.via, guid: d.guid })),
+      };
+      return json(body);
     } catch (e) {
       return json({ error: e instanceof Error ? e.message : String(e) }, 500);
     }

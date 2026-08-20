@@ -44,7 +44,7 @@ import {
 import { acquireRiggedModel } from '../loaders/riggedModelCache';
 import { acquireAudio } from '../loaders/audioBufferCache';
 import { acquireFont } from '../loaders/fontAtlasLoader';
-import { loadFontFamily } from '../loaders/fontLoader';
+import { loadFontFamily, loadFontFamilyForRef } from '../loaders/fontLoader';
 import { registerAsset, isGuid, resolveGuidToPath, getAudioLoadType } from '../loaders/assetManifest';
 import { loadTimelineNow } from '../loaders/timelineCache';
 import { collectTimelineAudioRefs, collectTimelineControlRefs, collectTimelineVideoRefs } from '../timeline/types';
@@ -1440,6 +1440,18 @@ async function acquireResourceInner(sceneId: SceneId, ref: SceneResourceRef): Pr
       // mechanism, the measured A/B and the guard: docs/ui-system.md § "Who registers a
       // scene's fonts").
       await loadFontFamily(ref.path);
+      return;
+    case 'font-family':
+      // `UIElement.fontFamily` — a font ASSET consumed by the DOM (#231). Register every
+      // VARIANT of its family with the browser (a UI authoring `fontWeight:'bold'` needs the
+      // Bold file under the same family, or the browser synthesizes a fake bold). Not
+      // scene-scoped: a face added to `document.fonts` costs nothing to keep and the browser
+      // owns it — the same reasoning as the legacy by-name branch above.
+      //
+      // Registering from the SCENE-load path (rather than trusting the Assets panel's global
+      // `loadAllFonts`) is what makes a scene's typeface a property of the scene — see #253
+      // and docs/ui-system.md § "Who registers a scene's fonts".
+      await loadFontFamilyForRef(ref.path);
       return;
     case 'environment':
       // Preload the HDR so the first frame of the new scene has correct PBR

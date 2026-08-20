@@ -1008,7 +1008,7 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
             if (e?.type === 'sprite' && e.sprite) { write('pivotX', e.sprite.pivot.x); write('pivotY', e.sprite.pivot.y); }
           }
         : (v: string) => write(key, v);
-      return <div key={key} style={ov ? overrideStyle : undefined}><AssetRefField label={key} value={val as string} onChange={onChangeRef} overrideColor={ov} accept={hint.accept} mixed={mx} fontFamilyRef={key === 'fontFamily'} editorPanel={hint.editorPanel} /></div>;
+      return <div key={key} style={ov ? overrideStyle : undefined}><AssetRefField label={key} value={val as string} onChange={onChangeRef} overrideColor={ov} accept={hint.accept} mixed={mx} editorPanel={hint.editorPanel} /></div>;
     }
     if (hint.type === 'color') {
       // A color field can fold a sibling 0..1 field into an A slider (hint.alphaField),

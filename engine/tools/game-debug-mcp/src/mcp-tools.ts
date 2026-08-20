@@ -780,8 +780,13 @@ export function registerTools(server: McpServer) {
    *  one-line addition next to the reasoning instead of a second scattered special case. */
   const OK_IS_A_VERDICT = new Set(['diagnose']);
 
-  async function perceptCall(tool: string, method: string, params: Record<string, unknown> = {}) {
-    const what = `read ${method} from the connected device`;
+  async function perceptCall(tool: string, method: string, params: Record<string, unknown> = {}, whatOverride?: string) {
+    // §5 wants the envelope in the CALLER's terms. The default names the op, which is right for a
+    // tool that IS its op — but wrong for a relay, where the op is plumbing and the caller asked
+    // about something else entirely. `device_game_tool_call` is the case: every refusal read "read
+    // game-tool-call from the connected device", naming neither the game tool the caller invoked
+    // nor, for a mutating one, the right verb.
+    const what = whatOverride ?? `read ${method} from the connected device`;
     try {
       const parsed = parseReply<unknown>(await deviceRequest(method, params));
       if (isDeviceError(parsed)) {
@@ -885,6 +890,47 @@ export function registerTools(server: McpServer) {
       'live named read-values (e.g. canGoBack, timeSinceGameStart). Use before device_dispatch_action.',
     {},
     async () => perceptCall('device_introspect', 'game-introspect'),
+  );
+
+  // ── Game-registered tools (#286) ────────────────────────────────────────────
+  //
+  // The GAME's own tools, reached over the lease. Two STATIC relays, deliberately — not the
+  // dynamic tail the editor server materializes (#270). The device tool list is static by design
+  // (this server is a thin client of the lease), and a tail keyed to *which phone is leased and
+  // what build it carries* is far more volatile than one keyed to the open project: the
+  // device_eval_api guidance already warns that "an older app reports fewer ops".
+  //
+  // These add DISCOVERABILITY, not capability — `device_eval`'s `modoki.call('game-tool-call', …)`
+  // has reached the same ops since #270. An agent that does not already know that recipe will not
+  // find it, which is the whole reason these exist.
+  //
+  // Neither names a game: `name` is a runtime string and the declarations come from the connected
+  // build, so nothing here knows Court exists.
+  tool('device_game_tools',
+    'What TOOLS the game on the device registers for agents (registerAgentTool) — name, description, ' +
+      'params, whether each mutates, and whether it needs the sim Playing. These are the GAME\'s own ' +
+      'tools, not the engine\'s, so the list depends entirely on which game the connected build is: ' +
+      'this is the DISCOVERY call, ask it rather than guessing a name. Invoke one with ' +
+      'device_game_tool_call. Empty is normal — most projects register none, and a release build ' +
+      'reports none by design (the registry is gated on the debug menu).',
+    {},
+    async () => perceptCall('device_game_tools', 'game-tools', {}, "read the connected game's registered agent tools"),
+  );
+
+  tool('device_game_tool_call',
+    'Invoke one game-registered tool on the device by name. Discover the names AND their params with ' +
+      'device_game_tools first — `args` is validated on the device against that tool\'s declaration, ' +
+      'so a misspelled key is REFUSED rather than dropped. The reply is the tool\'s own answer, ' +
+      'passed through unchanged.',
+    {
+      name: z.string().describe('Tool name, exactly as device_game_tools reported it. Do not guess: the connected build decides which tools exist.'),
+      args: z.record(z.string(), z.any()).optional().describe('Arguments object, shaped by that tool\'s declared params. Omit for a no-argument tool.'),
+    },
+    async ({ name, args }) => perceptCall(
+      'device_game_tool_call', 'game-tool-call', { name, args: args ?? {} },
+      // Names the GAME TOOL, not the relay op. A refusal from court_load_level should say so.
+      `invoke the game tool ${name} on the connected device`,
+    ),
   );
 
   tool('device_layout_bounds',

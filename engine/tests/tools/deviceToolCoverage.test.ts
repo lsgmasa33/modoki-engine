@@ -81,6 +81,11 @@ const MINIMAL: Record<string, Record<string, unknown>> = {
   device_layout_bounds: {},
   device_resolve_refs: { refs: ['g-1'] },
   device_introspect: {},
+  device_game_tools: {},
+  // The ergonomic form is a name and nothing else: `args` is optional, and a game tool with no
+  // required params is called bare — which is also the shape the device VALIDATES against the
+  // declaration, so an over-specified fixture here would test a path callers do not take.
+  device_game_tool_call: { name: 'court_load_level' },
   device_dispatch_action: { name: 'engine.playClip' },
   device_mutate_scene: { guid: 'g-1', set: { 'Renderable3D.isVisible': false } },
   device_create_entity: { spec: { kind: 'primitive', mesh: 'sphere' } },

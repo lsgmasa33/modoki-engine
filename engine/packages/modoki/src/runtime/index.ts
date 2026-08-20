@@ -363,7 +363,7 @@ export { loadFont, loadAllFonts, loadFontFamily, getLoadedFontFamilies, getLoade
 // engine through this package specifier (see the portability guard). Pure — no GPU, no DOM.
 export { layoutText, type LayoutFont, type LayoutOptions, type TextLayout, type TextAlign } from './rendering/text/layoutText';
 export {
-  isGuid, isExternalUrl, isInternalAssetPath, isInternalFontPath, newGuid, deriveGuid, registerAsset, unregisterAsset, resolveGuidToPath,
+  isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid, registerAsset, unregisterAsset, resolveGuidToPath,
   getGuidForPath, getAssetType, getAssetEntry, getAudioLoadType, resolveRef, loadManifestJson, ensureManifestLoaded, serializeManifest,
   clearManifest, getAllAssets, resolveSceneByName,
   type AssetType, type AssetEntry, type AssetManifestEntry, type AssetManifestFile, type BinaryAssetMeta,
@@ -406,6 +406,7 @@ export {
   getAgentTool,
   subscribeAgentTools,
   agentToolsVersion,
+  validateAgentToolArgs,
   clearAgentTools,
 } from './debug/agentToolRegistry';
 export {
