@@ -3,13 +3,19 @@
  *
  *  It exists for ONE consumer so far, and the reason is worth stating where the signal lives
  *  rather than only where it is read. Quality-tier calibration judges the device by measuring
- *  frame times, and a phone that nobody is touching is not the phone the player plays on: mobile
- *  CPU governors drop clocks when there is no input, so the frames measured during an idle window
- *  describe a throttled device, not a slow one. Measured on a Galaxy S22 — the most powerful
- *  Android handset in the lab — sitting idle on Court's tutorial (bug `lvROp0yDYPSzS0VZM6LH`):
- *  ~41.6 ms medians against a 20 ms budget walked it `high → mid → low` inside ~66 ticks, while
- *  the GPU identity table had resolved `high` deterministically at boot on the same phone. The
- *  player then taps, the CPU unthrottles, and the game is running at `low` on a flagship.
+ *  frame times, and a phone that nobody is touching is not the phone the player plays on.
+ *  Measured on a Galaxy S22 — the most powerful Android handset in the lab — sitting idle on
+ *  Court's tutorial (bug `lvROp0yDYPSzS0VZM6LH`): ~41.6 ms medians against a 20 ms budget walked
+ *  it `high → mid → low` inside ~66 ticks, while the GPU identity table had resolved `high`
+ *  deterministically at boot on the same phone.
+ *
+ *  ⚠️ **This docblock used to explain that as "mobile CPU governors drop clocks when there is no
+ *  input". Measured on 2026-08-20, that is the minor term.** The S22's LTPO panel idles from
+ *  120 Hz to 24 Hz after ~20 s of static content, and 1000/24 is 41.67 ms — the reading, to three
+ *  digits; the governor moved `cpuMs` only 5.6 → 8.4 ms. The distinction matters because a
+ *  governor story implies the sample recovers once clocks ramp, and it does not: the interval
+ *  belongs to the display. Full measurement, and the second half of the fix this signal is only
+ *  one half of, in `docs/rendering.md` § "an idle window is not evidence".
  *
  *  The owner's rule (2026-08-20): **an idle window is not evidence, in either direction** — the
  *  same rule already applied to scene-load frames (`armTierCalibration`), rather than a

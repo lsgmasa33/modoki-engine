@@ -1645,8 +1645,21 @@ get backwards:
 
 - ⭐ **AN IDLE WINDOW IS NOT EVIDENCE EITHER** (owner, 2026-08-20, `core/userActivity.ts`). The
   arming rule above says a LOAD window does not describe the device the player plays on. The second
-  window that does not is an IDLE one: mobile CPU governors drop clocks when nothing is being
-  touched, so an idle sample measures a throttled phone rather than a slow one.
+  window that does not is an IDLE one: nothing is being touched, so what the frames describe is the
+  device's idle behaviour rather than its capability.
+
+  ⚠️ **THE MECHANISM IS THE DISPLAY, NOT THE CPU GOVERNOR — corrected 2026-08-20 after measuring
+  it.** This section originally attributed the idle readings to "mobile CPU governors drop clocks
+  when there is no input", which is plausible, was never measured, and is not what produces the
+  number. On the S22, `dumpsys display` shows `mActiveRenderFrameRate` dropping **120 → 24.000002**
+  after ~20 s of static content (an LTPO panel idling down), recovering in **<69 ms** on the first
+  touch. rAF follows the panel, so `frameMs` becomes **41.67 ms = 1000/24** — which is the 41.6 ms
+  in every reading below, to three digits. The governor contributes something (`cpuMs` rose 5.6 →
+  8.4 ms across the same transition) but it is the minor term: 8.4 ms of CPU cannot make a 41.6 ms
+  frame. **Why the distinction earns its place:** a governor story says "wait for the clocks to ramp
+  and the reading fixes itself", and that is what the idle guard alone assumed. A display story says
+  the interval is *somebody else's number entirely* — which is why the fix below had to change what
+  the demotion MEANS, not just when it may fire.
 
   **Measured on a Galaxy S22** — the most powerful Android handset in the lab — sitting idle on
   Court's tutorial (Testboard `lvROp0yDYPSzS0VZM6LH`):
@@ -1686,10 +1699,61 @@ get backwards:
     it. Cheap for the same reason the load-window cost is — the knobs a demotion turns change how a
     game LOOKS to a player who, by construction, is not looking.
 
-  ⚠️ **Not verified on hardware yet.** The unit tests pin the rule (including a mutation check that
-  the window-drop test fails without the reset), but the S22 repro itself has not been re-run
-  post-fix. `qa/cases/rendering/tier-calibration-idle-window.md` (QA-RENDER-0007) is the case for
-  it, targeted at that phone specifically — a device that does not throttle passes it vacuously.
+  ✅ **Verified on the S22, 2026-08-20.** Two runs of a 92 s measured idle window (`games/court`,
+  built from the fix): **zero `@tier` events**, tier held at `high`, `frameMs` 16.7 ms with `cpuMs`
+  5.6 ms throughout the following play window. The pre-fix build on the same phone demoted twice
+  within 10 s of boot. `qa/cases/rendering/tier-calibration-idle-window.md` (QA-RENDER-0007) is the
+  case, targeted at that phone specifically — a device whose panel does not idle down passes it
+  vacuously.
+
+- ⭐ **AND A FRAME WE ARE NOT FILLING IS NOT A FRAME WE CAN RELIEVE** (owner, 2026-08-20,
+  `frameIsFull` in `rendering/qualityTier.ts`). **The idle guard above was necessary and not
+  sufficient, and this is the half that actually closes the bug.**
+
+  With the idle fix in place the S22 still demoted — reproduced deliberately: launch, idle 92 s,
+  then tap every 2 s. It fell to `mid` **4 s after input resumed**, `median frame 41.1ms over the
+  20.0ms budget`, with the panel already measured back at **120 Hz**. Sampling the live profile
+  every 400 ms across that window (120 samples) shows why:
+
+  | frame interval | engine CPU | headroom | verdict |
+  |---|---|---|---|
+  | 41.6 ms | **8.4 ms** | ~33 ms | `overBudget: true` → demote |
+
+  The engine was using 8.4 ms of a 41.6 ms frame and being condemned for the 33 ms it spent
+  *waiting*. `overBudget` compares the frame INTERVAL against the budget, and an interval is set by
+  whatever paces the frame — the workload, the engine's own cap, or the display. Only the first is
+  something a tier can change.
+
+  **The rule:** demotion additionally requires `cpuMs.median >= budgetMs * DEMOTION_CPU_SHARE`
+  (0.7). If the engine's own work fits comfortably inside the budget there is nothing a lower tier
+  could give back — every knob it turns (DPR, shadows, IBL, texture size) buys time the engine is
+  not spending.
+
+  - **The bar scales with the target fps, because it is a ratio of the BUDGET** and the budget is
+    derived from the frame cap in force (`frameCapIntervalMs * 1.2`). At `targetFps: 60` it asks for
+    14 ms of engine CPU; at `targetFps: 30`, 28 ms. The same 20 ms of CPU is therefore full at 60
+    and not full at 30 — correct, since at 30 that engine still has half its frame left. (owner,
+    2026-08-20: *"if the current target fps is 30, we should increase the threshold"*.)
+  - **The demotion `reason` now carries the CPU share** — `median frame 41.6ms over the 20.0ms
+    budget for 2s (engine cpu 8.4ms of it)`. This is the one surface that explains a surprising
+    tier, and for months it asserted "slow device" by omission while the engine idled.
+  - ⚠️ **Stated cost: a purely GPU-bound device with an idle CPU no longer demotes automatically.**
+    `restMs` is GPU + present + idle *together* and cannot be split without timestamp queries
+    (`core/gpuTimings.ts`), so CPU is the only per-frame cost measured honestly. Accepted because it
+    is the direction that costs least: the low-end hardware this system exists for is CPU-bound in
+    the measurement the profiler was built from (the Y6 2019 sat at 83 ms with ~48 ms of it CPU,
+    58%), while the false demotion is silent, sticky, and hits the FASTEST phones hardest. A player
+    who wants that relief can still pick a tier by hand, which outranks calibration by design.
+  - ⚠️ **Two existing unit tests were DEFENDING this bug** and had to change. One asserted a
+    demotion on a vsync-pinned 33.4 ms frame with an 8 ms CPU, described as "real on a 30Hz display"
+    — which is the S22 shape exactly. See the comments on both in `tests/runtime/qualityTier.test.ts`.
+  - **Still open, deliberately not fixed here:** `VSYNC_INTERVALS_MS` in `core/frameProfiler.ts`
+    lists only 60/90/120/144 Hz, so a device presenting at 24/30/48 Hz reads `vsyncBound: false`.
+    That no longer causes a false demotion (fullness decides that now), but it does block
+    *promotion*: `hasHeadroom`'s non-vsync branch asks for `frameMs.median <= 16.67 ms`, which a
+    48 Hz panel (20.8 ms) can never satisfy however idle its CPU. Same family as the #202 frame-cap
+    defect. Fixing it means deciding whether a device may promote on evidence gathered while its
+    panel is idled down — an owner call, since "not evidence in either direction" argues it may not.
 
   ✅ **The overlay spinner survives the stall — measured, not inferred.** The mid-play promotion
   path covers a shader recompile with `LoadingOverlay`'s spinner, which only works if a

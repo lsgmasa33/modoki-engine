@@ -39,6 +39,7 @@ import {
   getPendingTierPromotion, CALIBRATION_INTERVAL_MS, applyActiveTierToRuntime, applyQualityTier,
   setTierFrameCapEnabled, setTierCalibrationEnabled, armTierCalibration, isTierCalibrationArmed,
   ARM_BACKSTOP_MS, PROMOTION_BOUNDARY_GRACE_MS, onTierSwitchOverlay, getTierSwitchOverlayMessage,
+  IDLE_REPORT_AFTER_MS,
 } from '../../src/runtime/rendering/tierCalibration';
 import * as frameDriver from '../../src/runtime/rendering/frameDriver';
 import {
@@ -63,6 +64,12 @@ function profileOf(frameMs: number, cpuMs: number): FrameProfile {
 }
 const ROOMY = () => profileOf(10, 4);
 const DROWNING = () => profileOf(80, 60);
+/** The Galaxy S22 reading that started this: an LTPO panel idled to 24 Hz, so the frame INTERVAL
+ *  is 41.6 ms (1000/24) against a 20 ms budget while the engine uses 8.4 ms of it. Over budget and
+ *  not remotely full — the device is waiting on the display, not on us. Measured 2026-08-20. */
+const PANEL_PACED = (): FrameProfile => ({
+  ...profileOf(41.6, 8.4), overBudget: true, budgetMs: 20,
+});
 
 beforeEach(() => {
   playerIsInteracting = true;
@@ -770,6 +777,51 @@ describe('an IDLE window is not evidence (bug lvROp0yDYPSzS0VZM6LH)', () => {
     const base = DEMOTION_HOLD_MS * 8;
     for (let t = base; t <= base + DEMOTION_HOLD_MS * 4; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
     expect(getActiveQualityTier()?.tier).toBe('low');
+  });
+
+  it('says nothing about idleness until the session is old enough — and never says "Infinity"', () => {
+    // ⚠️ TWO DEFECTS IN ONE LINE, and only one of them was cosmetic (measured on an S22, 2026-08-20).
+    // The report was gated on `msSinceUserInput(now) >= ARM_BACKSTOP_MS`, and before the first input
+    // of a session that value is `Infinity` — so the gate was true on the FIRST armed tick of every
+    // launch, ~0.2 s after boot, and printed `calibration idle for Infinitys`. It is a console.warn,
+    // and a console.warn is a Crashlytics ISSUE: logcat showed `FirebaseCrashlytics.recordException`
+    // firing directly behind it, so every ordinary launch filed an alerting issue about a player who
+    // simply had not tapped yet. A game that just started and has not been touched is NORMAL.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      playerIsInteracting = false;
+      mockProfile = ROOMY();
+      // A whole minute short of the report threshold: the session is young, so there is nothing
+      // worth saying yet.
+      for (let t = 0; t < IDLE_REPORT_AFTER_MS; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+      expect(warn.mock.calls.flat().join(' ')).not.toContain('calibration');
+
+      // Past it, the suppression says so out loud — once — and describes "no input at all" instead
+      // of formatting `Infinity` into a duration.
+      for (let t = IDLE_REPORT_AFTER_MS; t <= IDLE_REPORT_AFTER_MS * 2; t += CALIBRATION_INTERVAL_MS) {
+        tickTierCalibration(t);
+      }
+      const said = warn.mock.calls.flat().join(' ');
+      expect(said).toContain('seen no input at all this session');
+      expect(said).not.toContain('Infinity');
+      expect(warn.mock.calls.filter((c) => String(c[0]).includes('calibration')).length).toBe(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('does NOT demote a panel-paced frame even while the player IS interacting (S22)', () => {
+    // ⚠️ THE OTHER HALF OF THE SAME BUG, and the half the idle guard above cannot reach. Suppressing
+    // idle windows fixed the case where nobody was touching the phone; it did nothing for the four
+    // seconds AFTER a tap, when the ring still describes a 24 Hz panel. Measured on the S22 on
+    // 2026-08-20: launch, idle 92 s, then tap every 2 s — and it demoted at +4 s with the panel
+    // already back at 120 Hz (`mActiveRenderFrameRate`), reason "median frame 41.1ms over the
+    // 20.0ms budget". `playerIsInteracting` is TRUE here on purpose: this must hold when the idle
+    // guard is not helping, or the fix is only the idle guard wearing a different hat.
+    playerIsInteracting = true;
+    mockProfile = PANEL_PACED();
+    for (let t = 0; t <= DEMOTION_HOLD_MS * 10; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+    expect(getActiveQualityTier()?.tier).toBe('high');
   });
 
   it('does not let an idle stretch COUNT toward the sustain window it interrupts', () => {

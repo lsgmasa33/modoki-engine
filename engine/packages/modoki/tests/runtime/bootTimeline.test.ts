@@ -105,6 +105,24 @@ describe('bootTimeline', () => {
     expect(tl.dropped).toBe(1);
   });
 
+  it('a LEAKED span poisons the attribution — which is why every call site closes in a finally', () => {
+    // The close-out finding. A span opened with a raw begin/end and abandoned by a throw stays
+    // open forever, and `bootSpansOverlapping` treats an open span as running to the end of the
+    // window (deliberately — it may BE the stall). Together those mean a span that died seconds
+    // earlier ranks FIRST in a later stall attribution.
+    //
+    // Reachable on a NORMAL boot: the editor walks candidate scene paths, a miss returns
+    // 200 + index.html, and `parseAssetJson` throws (#91). This test states the consequence, so
+    // the `finally`s at those call sites cannot be quietly removed as noise.
+    advanceManual(100);
+    const leaked = beginBootSpan('scene-fetch-json', 'a-candidate-that-404s');
+    void leaked; // never closed — the bug being described
+    advanceManual(6900);
+    const stall = bootSpansOverlapping(7000, 8800);
+    expect(stall[0]).toMatchObject({ name: 'scene-fetch-json', endMs: -1 });
+    expect(stall[0].overlapMs).toBeCloseTo(1800, 6); // the WHOLE window, from a span that did nothing
+  });
+
   it('stops recording at the cap and says so, keeping the EARLIEST spans', () => {
     for (let i = 0; i < MAX_BOOT_SPANS; i++) endBootSpan(beginBootSpan(`s${i}`));
     const overflow = beginBootSpan('too-late');

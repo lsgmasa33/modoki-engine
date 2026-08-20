@@ -3212,7 +3212,18 @@ export async function prewarmShadersForWorld(
   // hiding in, and the only one whose cost was ever attributed (wrongly, twice) from frame
   // markers. Two spans, not one — the scene BUILD and the actual `compileAsync` are different
   // costs and the earlier guesses could not tell them apart.
-  const prewarmSpan = beginBootSpan('shader-prewarm');
+  //
+  // Wrapped rather than begin/end'd around the body: `bootSpanAsync` closes on a throw, and a
+  // leaked span is worse than a missing one — `bootSpansOverlapping` reads an open span as still
+  // running, so it would rank first in a later stall attribution.
+  return bootSpanAsync('shader-prewarm', () => prewarmShadersForWorldInner(world, renderer, camera));
+}
+
+async function prewarmShadersForWorldInner(
+  world: World,
+  renderer: WebGPURenderer | THREE.WebGLRenderer,
+  camera: THREE.PerspectiveCamera,
+): Promise<void> {
   const prewarmScene = new THREE.Scene();
   let count = 0;
 
@@ -3302,14 +3313,18 @@ export async function prewarmShadersForWorld(
 
   // compileAsync is available on both WebGLRenderer (r152+) and WebGPURenderer.
   const compile = (renderer as THREE.WebGLRenderer).compileAsync;
+  // try/finally: `compileAsync` can reject (a bad shader graph, a lost device), and a leaked span
+  // is worse than a missing one — `bootSpansOverlapping` reads an open span as still running, so it
+  // would rank first in a later stall attribution. Same reasoning as SceneManager's spans.
   const compileSpan = beginBootSpan('shader-compile', `${count} pairs`);
-  if (typeof compile === 'function') {
-    await (renderer as THREE.WebGLRenderer).compileAsync(prewarmScene, camera);
-  } else {
-    // Fallback: synchronous compile (still better than first-frame-stutter)
-    (renderer as THREE.WebGLRenderer).compile?.(prewarmScene, camera);
-  }
-  endBootSpan(compileSpan);
+  try {
+    if (typeof compile === 'function') {
+      await (renderer as THREE.WebGLRenderer).compileAsync(prewarmScene, camera);
+    } else {
+      // Fallback: synchronous compile (still better than first-frame-stutter)
+      (renderer as THREE.WebGLRenderer).compile?.(prewarmScene, camera);
+    }
+  } finally { endBootSpan(compileSpan); }
 
   // Dispose prewarm-owned objects but leave GLB template geometries/materials
   // (and the shared envCache-owned environment) alone.
@@ -3324,7 +3339,6 @@ export async function prewarmShadersForWorld(
   }
   prewarmScene.environment = null; // detach shared env before clear
   prewarmScene.clear();
-  endBootSpan(prewarmSpan);
 }
 
 // ── Renderer creation ───────────────────────────────────

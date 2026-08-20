@@ -753,7 +753,10 @@ describe('evaluateTierChange — demotion', () => {
     // 33.3ms budget": a sentence contradicting itself, on the one surface that exists to explain a
     // surprising tier. Restore the literal and this fails; nothing else does, which is the point —
     // the DECISION was right all along, only the account of it was wrong.
-    const capped: FrameProfile = { ...profile({ frameMs: 22, cpuMs: 12 }), overBudget: true, budgetMs: 20 };
+    // `cpuMs` is 18 rather than the original 12 because a demotion now requires the engine to be
+    // FILLING the frame (`frameIsFull`) — 12 ms is below 70% of this fixture's 20 ms budget, so the
+    // old value stopped reaching the branch whose REASON STRING this test is about.
+    const capped: FrameProfile = { ...profile({ frameMs: 22, cpuMs: 18 }), overBudget: true, budgetMs: 20 };
     const s = freshTierChangeState();
     const a = evaluateTierChange('high', capped, s, 1000, UNCAPPED);
     const b = evaluateTierChange('high', capped, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED);
@@ -777,6 +780,56 @@ describe('evaluateTierChange — demotion', () => {
       expect(r.decision.action).toBe('none');
       st = r.state;
     }
+  });
+
+  it('does NOT demote a frame the engine is not filling — the S22 adaptive-panel defect', () => {
+    // ⚠️ THE MEASUREMENT, on a Galaxy S22 running `games/court` (2026-08-20). Its LTPO panel drops
+    // 120 Hz → 24 Hz after ~20 s of static content, rAF follows, and `frameMs` becomes 41.6 ms —
+    // 1000/24 — against a 20 ms budget while the engine uses 8.4 ms of it. `overBudget` alone
+    // therefore said "slow device" about the fastest Android handset in the lab, demoting it
+    // high → mid → low; `demoted` is sticky, so the session never recovered and the player got
+    // pixelRatioCap 1 on a flagship. The numbers below are the ones read off the device.
+    const panelPaced: FrameProfile = {
+      ...profile({ frameMs: 41.6, cpuMs: 8.4 }), overBudget: true, budgetMs: 20,
+    };
+    const s = freshTierChangeState();
+    let st = s;
+    for (const t of [1000, 3000, 9000, 30000, 120000]) {
+      const r = evaluateTierChange('high', panelPaced, st, t, UNCAPPED);
+      expect(r.decision.action).toBe('none');
+      st = r.state;
+    }
+    expect(st.demoted).toBe(false);
+  });
+
+  it('still demotes when the engine IS filling the frame — the relief path is intact', () => {
+    // The other half of the same rule, so the fix cannot be "never demote". A Y6-2019-shaped frame:
+    // 83 ms with ~48 ms of it engine CPU (the measurement `frameProfiler`'s own docblock was
+    // written from). That clears the fullness bar with room to spare and must still demote.
+    const genuinelySlow: FrameProfile = {
+      ...profile({ frameMs: 83, cpuMs: 48 }), overBudget: true, budgetMs: 20,
+    };
+    const s = freshTierChangeState();
+    const a = evaluateTierChange('high', genuinelySlow, s, 1000, UNCAPPED);
+    const b = evaluateTierChange('high', genuinelySlow, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED);
+    expect(b.decision).toMatchObject({ action: 'demote', tier: 'mid' });
+    expect(String((b.decision as { reason: string }).reason)).toContain('engine cpu 48.0ms');
+  });
+
+  it('scales the fullness bar with the TARGET FPS, not a fixed millisecond count', () => {
+    // owner, 2026-08-20: "if the current target fps is 30, we should increase the threshold".
+    // It is a ratio of the budget, and the budget is derived from the frame cap in force — so a
+    // 30 fps project (budget 40 ms) demands 28 ms of engine CPU where a 60 fps one (budget 20 ms)
+    // demands 14. The SAME 20 ms of CPU is therefore full at 60 fps and not full at 30 fps, which
+    // is the whole point: at 30 fps that engine still has half its frame left.
+    const at60: FrameProfile = { ...profile({ frameMs: 45, cpuMs: 20 }), overBudget: true, budgetMs: 20 };
+    const at30: FrameProfile = { ...profile({ frameMs: 45, cpuMs: 20 }), overBudget: true, budgetMs: 40 };
+    const step = (p: FrameProfile) => {
+      const a = evaluateTierChange('high', p, freshTierChangeState(), 1000, UNCAPPED);
+      return evaluateTierChange('high', p, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED).decision.action;
+    };
+    expect(step(at60)).toBe('demote');
+    expect(step(at30)).toBe('none');
   });
 
   it('does not demote a high-tier device that is merely near budget', () => {
@@ -859,10 +912,27 @@ describe('evaluateTierChange — `mid` is the rung that moves BOTH ways', () => 
   });
 
   it('resolves the both-true case in the SAFE direction — demotion wins', () => {
-    // Real on a 30Hz display: a vsync-pinned 33.4ms frame is over the 33.3ms budget AND leaves the
-    // CPU under 40% of the interval, so `overBudget` and `hasHeadroom` are both true. Demotion has
-    // the shorter hold, so it fires first, and the sticky flag then ends the argument.
-    const both = { ...profile({ frameMs: 33.4, cpuMs: 8, vsyncBound: true }), overBudget: true };
+    // ⚠️ THIS FIXTURE USED TO BE `frameMs: 33.4, cpuMs: 8, vsyncBound` — "real on a 30Hz display"
+    // — and it was defending the S22 defect (2026-08-20). A vsync-pinned frame with the CPU at 8 ms
+    // is precisely the shape a panel produces when IT, not the engine, is pacing the frame; the
+    // demotion it asserted is the one that put a flagship on `low`. `frameIsFull` now refuses it,
+    // so the fixture had to become a frame the engine is actually filling.
+    //
+    // Both branches can still be true at once — this is a 120 fps-capped project (budget 10 ms)
+    // whose frames run 16 ms with 8 ms of engine CPU: over its own budget, full enough to judge,
+    // and still inside the 16.67 ms `hasHeadroom` asks for when not vsync-bound. Demotion has the
+    // shorter hold, so it fires first, and the sticky flag then ends the argument.
+    const both = { ...profile({ frameMs: 16, cpuMs: 8 }), overBudget: true, budgetMs: 10 };
+
+    // FIRST prove the fixture really is both-true, or this test degrades into "a demotable profile
+    // demotes" and would keep passing if the promotion side stopped qualifying. `low` cannot demote
+    // (no rung below it), so putting the SAME profile on `low` isolates the promotion branch.
+    const p1 = evaluateTierChange('low', both, freshTierChangeState(), 1000, UNCAPPED);
+    const p2 = evaluateTierChange('low', both, p1.state, 1000 + PROMOTION_HOLD_MS, UNCAPPED);
+    expect(p2.decision).toMatchObject({ action: 'promote' });
+
+    // NOW the ordering claim means something: on `mid`, where both branches are live, demotion's
+    // shorter hold wins and the sticky flag ends the argument.
     const s = freshTierChangeState();
     const a = evaluateTierChange('mid', both, s, 1000, UNCAPPED);
     const b = evaluateTierChange('mid', both, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED);

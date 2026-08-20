@@ -182,14 +182,24 @@ Two limits on that check, both measured on the Samsung 2026-08-02 — know them 
   the other app's pause), and an app built before #95 still squats — so when a connect fails on
   9095, closing the other Modoki apps remains the fix, and `device_connect` accepts an explicit
   `port` for the case where you can read the real one from the log or the in-game debug menu.
-- ⭐ **#283 narrowed that race further: the bridge now RETRIES the default port for 2 s before
-  accepting a fallback** (`bindWithRetry` in `GameDebugPlugin.java`; the iOS `startListener` mirrors
-  it with a scheduled re-attempt). Sized from the measured handover on a Galaxy A23 — launching a
-  game while another was foregrounded, the incoming app gave up **449 ms** before the outgoing one
-  released, because `startServer` runs off the webview boot while the release runs off the lifecycle
-  callback and nothing orders the two. Verified on device both ways: port freed mid-window →
-  `port 9095 acquired after 1 retry`; port held throughout → falls back after exactly 2,000 ms with
-  a message naming the fix. A fallback is now also **announced** — `startServer`/`getStatus` return
+- ⚠️ **#283's bind RETRY cannot win the foreground handover — measured across three window sizes,
+  and this is why the constant is small.** `bindWithRetry` (`GameDebugPlugin.java`; the iOS
+  `startListener` mirrors it) retries the default port before accepting a fallback, and on a Galaxy
+  A23 the outgoing app's release NEVER arrives while the loop runs — it lands after the loop gives
+  up, scaling with how long it waited:
+
+  | window | gave up at | released at | release − give-up |
+  |---|---|---|---|
+  | 0.5 s | +0.60 s | +1.10 s | 0.49 s |
+  | 2 s | +2.11 s | +2.88 s | 0.77 s |
+  | 5 s | +5.13 s | +6.32 s | 1.19 s |
+
+  The fallback happened every run (3/3 at 2 s, 3/3 at 5 s). Waiting longer only postpones the
+  release — **the retry defers the very thing it is waiting for**, so no value is long enough. The
+  original 2 s was sized on ONE 449 ms sample from a different situation (the outgoing app resuming
+  and immediately re-pausing) and did not generalise. The retry is kept at 1 s as cheap insurance
+  for the unrelated case where the previous owner is already gone; **host-side port discovery below
+  is what actually fixes the handover.** A fallback is now also **announced** — `startServer`/`getStatus` return
   `fallbackPort: true`, and the JS side `console.warn`s it (a `_log` would be invisible, since the
   console ring keeps only warn/error).
 - ⚠️ **iOS: the normal path is device-verified, the RETRY is not.** On an iPad mini (iPad11,1,

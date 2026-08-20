@@ -29,12 +29,13 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
     /// One retry announcement per start attempt — the retry re-enters `startListener`, so an
     /// unguarded log would print once per attempt across the whole window.
     private var retryAnnounced = false
-    /// How long to keep retrying the PREFERRED port before accepting an OS-assigned one (#283).
-    /// Mirrors the Android plugin, and is sized from the same measured handover: launching a
-    /// Modoki game while another is foregrounded, the incoming app lost the 9095 bind by 449 ms
-    /// because `startServer` runs off the webview boot while the release runs off the lifecycle
-    /// callback, and nothing orders the two.
-    private static let bindRetryWindowMs = 2000
+    /// How long to retry the PREFERRED port before accepting an OS-assigned one (#283).
+    /// Small on purpose — see the Java constant: on Android the outgoing app's release never
+    /// arrives while we retry, it lands after the loop gives up, and the delay scales with the
+    /// window, so no value wins that race. Host-side port discovery is the fix. iOS has not been
+    /// observed losing this race at all (its handover releases before the incoming app binds), so
+    /// this is parity rather than an iOS measurement.
+    private static let bindRetryWindowMs = 1000
     private static let bindRetryIntervalMs = 150
     private var running = false
     private var receiveBuffer = Data()

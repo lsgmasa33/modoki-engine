@@ -215,6 +215,32 @@ describe('SceneManager — basic load', () => {
     }
   });
 
+  /** #238 close-out. The boot timeline's spans are opened with a raw begin/end at several points
+   *  in `loadScene`, and a throw between them leaks the span forever. That is not merely a missing
+   *  row: `bootSpansOverlapping` treats an open span as still running (deliberately — it may BE the
+   *  stall), so a fetch that died on boot would rank FIRST in a later stall attribution and the
+   *  instrument would confidently name the wrong thing.
+   *
+   *  Driven through the REAL failure above rather than by calling the timeline directly, because
+   *  the leak is a property of the call sites, not of `bootTimeline`. */
+  it('a scene load that THROWS leaves no boot span open', async () => {
+    const { sceneManager } = await getSceneManager();
+    const { resetBootTimeline, getBootTimeline } = await import('../../src/runtime/core/bootTimeline');
+    resetBootTimeline();
+    const realFetch = global.fetch;
+    global.fetch = vi.fn(async () => completeResponse({
+      ok: true,
+      text: async () => '<!doctype html>\n<html><body><div id="root"></div></body></html>',
+    }));
+    try {
+      await expect(sceneManager.loadScene('/gone.json')).rejects.toThrow();
+    } finally {
+      global.fetch = realFetch;
+    }
+    const open = getBootTimeline().spans.filter((sp) => sp.endMs < 0);
+    expect(open.map((sp) => sp.name)).toEqual([]);
+  });
+
   it('loads from opts.preloaded without fetching the scene path', async () => {
     const { sceneManager } = await getSceneManager();
     const { getCurrentWorld } = await getWorld();

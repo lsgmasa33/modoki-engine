@@ -1068,6 +1068,9 @@ export const PROMOTION_HOLD_MS = 5_000;
 export const DEMOTION_HOLD_MS = 2_000;
 /** Samples below which a profile is not worth judging. */
 export const MIN_SAMPLES_TO_JUDGE = 30;
+/** Fraction of the BUDGET the engine's own main-thread work must occupy before a long frame
+ *  counts as evidence the device needs relief. See {@link frameIsFull}. */
+export const DEMOTION_CPU_SHARE = 0.7;
 
 export interface TierChangeState {
   /** When the current qualifying streak began, or 0 if not currently qualifying. */
@@ -1211,6 +1214,40 @@ function hasHeadroom(p: FrameProfile): boolean {
   return p.frameMs.median <= BUDGET_30FPS_MS * PROMOTION_HEADROOM_RATIO;
 }
 
+/** Is this long frame actually FULL — i.e. is the engine spending the time?
+ *
+ *  ⚠️ **`overBudget` ALONE IS NOT EVIDENCE OF A SLOW DEVICE, and believing it demoted a flagship
+ *  to `low` for a whole session** (S22, `games/court`, 2026-08-20). `overBudget` compares the
+ *  frame INTERVAL against the budget, and the interval is set by whatever paces the frame — which
+ *  on a modern handset is very often the DISPLAY, not the workload. A Galaxy S22's LTPO panel
+ *  drops from 120 Hz to **24 Hz** after ~20 s of static content (measured: `mActiveRenderFrameRate`
+ *  120 → 24.000002, recovering in <69 ms on the first touch). rAF follows the panel, so `frameMs`
+ *  became 41.6 ms — 1000/24 to three digits — against a 20 ms budget, and calibration demoted
+ *  `high → mid → low` while the engine was using **8.4 ms** of that 41.6 ms frame. The player
+ *  gets `pixelRatioCap 1`, shadows off, ibl off, `textureMaxSize 512` on a flagship, and
+ *  `TierChangeState.demoted` is sticky, so the session never climbs back.
+ *
+ *  The rule (owner, 2026-08-20): **a frame we are not filling is not a frame we can relieve.**
+ *  If the engine's own work fits comfortably inside the budget, there is nothing a demotion could
+ *  give back — every knob a lower tier turns (DPR, shadows, IBL, texture size) buys time the
+ *  engine is not spending. So the long interval is somebody else's: the panel's, the compositor's,
+ *  a frame cap's.
+ *
+ *  ⚠️ **THE ACCEPTED COST, stated so it is not rediscovered as a bug.** This judges the engine's
+ *  MAIN-THREAD work, which is the only per-frame cost the profiler measures honestly — `restMs`
+ *  is GPU + present + idle together and cannot be split without timestamp queries (see
+ *  `core/gpuTimings.ts`, and `frameProfiler`'s own warning against reading `restMs` as GPU time).
+ *  So a device that is purely GPU-bound with an idle CPU will no longer demote automatically.
+ *  That is deliberate, and it is the direction that costs least: the low-end hardware this system
+ *  exists for is CPU-bound in the measurement that motivated the profiler — the Y6 2019 sat at
+ *  83 ms with ~48 ms of it CPU (58%), which clears this bar comfortably — while the false
+ *  demotion above is silent, sticky, and hits the fastest phones hardest. A player who needs
+ *  relief a GPU-bound frame would have given can still pick a tier by hand
+ *  (`choosePlayerQualityTier`), which outranks calibration by design. */
+function frameIsFull(p: FrameProfile): boolean {
+  return p.cpuMs.median >= p.budgetMs * DEMOTION_CPU_SHARE;
+}
+
 /** Pure tier-change decision. Owns no state and reads no clock — the caller supplies both, so
  *  every branch is reachable in a test without waiting real seconds.
  *
@@ -1239,7 +1276,7 @@ export function evaluateTierChange(
     // `mid` un-promotable, since every pass would reset the streak it needs to accumulate. The
     // promotion branch below clears it for a tier that cannot promote (`high`), which is the same
     // guarantee expressed where it belongs.
-    if (profile.samples >= MIN_SAMPLES_TO_JUDGE && profile.overBudget) {
+    if (profile.samples >= MIN_SAMPLES_TO_JUDGE && profile.overBudget && frameIsFull(profile)) {
       // ⚠️ `0` IS BOTH "no streak" AND A LEGITIMATE `now`, and the collision is TOLERATED HERE
       // rather than fixed — but do not copy the shape. Under a manual clock starting at 0 the
       // first qualifying tick stamps 0, reads as "no streak" on the next tick, and re-stamps —
@@ -1259,8 +1296,13 @@ export function evaluateTierChange(
             // which stopped being the threshold once `overBudget` started reading the frame cap
             // in force. At the fleet's `targetFps: 60` this is 20 ms, and the old literal made
             // the log read "22.0ms over the 33.3ms budget" (close-out 2026-08-12).
+            // The CPU share is part of the SENTENCE, not just part of the test: this is the
+            // one surface that explains a surprising tier, and "41.6ms over the 20.0ms budget"
+            // read as a slow device for months while the engine was using 8.4 ms of that frame.
+            // A reason that carries what made it full cannot make that claim by omission.
             reason: `median frame ${profile.frameMs.median.toFixed(1)}ms over the `
-              + `${profile.budgetMs.toFixed(1)}ms budget for ${DEMOTION_HOLD_MS / 1000}s`,
+              + `${profile.budgetMs.toFixed(1)}ms budget for ${DEMOTION_HOLD_MS / 1000}s `
+              + `(engine cpu ${profile.cpuMs.median.toFixed(1)}ms of it)`,
           },
           state: { ...next, overBudgetSince: 0, demoted: true },
         };

@@ -304,9 +304,15 @@ class SceneManagerImpl implements SceneManager {
       } else {
         // assetUrl() is a no-op in dev/native (BASE_URL '/'), prefixes for sub-path web
         // hosting, and resolves to the inlined blob: URL in a playable single-file build.
+        // try/finally, NOT a bare end after the await: `parseAssetJson` throws on the editor's
+        // candidate-path walk (see below — a miss returns 200 + index.html), which is a normal boot
+        // path, and a leaked span is not merely missing. `bootSpansOverlapping` treats an open span
+        // as running to the end of the window, so a dead fetch would rank FIRST in a later stall
+        // attribution — the instrument confidently naming something that finished seconds earlier.
         const fetchSpan = beginBootSpan('scene-fetch-json', path);
+        try {
         const res = await fetch(assetUrl(path), { signal: controller.signal, ...ASSET_FETCH_INIT });
-        if (!res.ok) { endBootSpan(fetchSpan); throw new Error(`Failed to fetch scene "${path}": HTTP ${res.status}`); }
+        if (!res.ok) throw new Error(`Failed to fetch scene "${path}": HTTP ${res.status}`);
         // parseAssetJson, not res.json(): the dev server answers an unknown path with a 200 OK
         // `index.html` (its SPA fallback), so `res.ok` is true, there is no 404, and `.json()`
         // throws `Unexpected token '<', "<!doctype "…` — which reads as a CORRUPT scene when the
@@ -315,7 +321,7 @@ class SceneManagerImpl implements SceneManager {
         // path, and the resulting red console error is indistinguishable from a real failure to
         // `smoke-packaged.sh` / `assert-app-renders.sh`, both of which fail on ANY console error.
         data = await parseAssetJson(res, path) as SceneData;
-        endBootSpan(fetchSpan);
+        } finally { endBootSpan(fetchSpan); }
       }
       // Register scene id in the manifest so the editor can recover it on save
       const sceneGuid = (data as { id?: string }).id;
@@ -448,6 +454,7 @@ class SceneManagerImpl implements SceneManager {
       // (models, meshes, materials, environments, fonts) fetch here in parallel,
       // one scene at a time (parallel WITHIN a scene, same as today).
       const acquireSpan = beginBootSpan('scene-acquire-resources', `${totalResources} refs`);
+      try {
       for (const ref of toLoadRefs) {
         const sid = sceneIdByPath.get(ref.path)!;
         await Promise.all(perSceneRefs.get(ref.path)!.map(async (r) => {
@@ -456,7 +463,7 @@ class SceneManagerImpl implements SceneManager {
           opts.onProgress?.(loadedCount, totalResources);
         }));
       }
-      endBootSpan(acquireSpan);
+      } finally { endBootSpan(acquireSpan); }
 
       if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
@@ -537,6 +544,7 @@ class SceneManagerImpl implements SceneManager {
         for (const e of stagingWorld.entities) beforeIds.add((e as unknown as { id(): number }).id());
 
         const spawnSpan = beginBootSpan('scene-spawn-entities', ref.path);
+        try {
         await loadSceneFile(sceneData, {
           world: stagingWorld,
           clearMarks: false, // once-per-world clear above owns this (A9 defect 1)
@@ -634,7 +642,7 @@ class SceneManagerImpl implements SceneManager {
           },
           loadModels: false, // already preloaded above
         });
-        endBootSpan(spawnSpan);
+        } finally { endBootSpan(spawnSpan); }
 
         if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
 

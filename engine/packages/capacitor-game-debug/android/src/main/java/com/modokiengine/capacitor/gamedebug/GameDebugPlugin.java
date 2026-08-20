@@ -31,16 +31,29 @@ public class GameDebugPlugin extends Plugin {
 
     private static final String TAG = "GameDebug";
     private static final int DEFAULT_PORT = 9095;
-    /** How long to keep retrying the PREFERRED port before accepting an OS-assigned one (#283).
+    /** How long to retry the PREFERRED port before accepting an OS-assigned one (#283).
      *
-     *  Sized from a measured handover, not a guess. On a Galaxy A23, launching a Modoki game while
-     *  another one is foregrounded: the outgoing app released 9095 at 18:48:21.245 and the incoming
-     *  app had already given up at 18:48:20.796 — it lost by 449 ms. `startServer` runs off the
-     *  webview boot while the release runs off Android's `onPause`, and nothing orders the two, so
-     *  a single bind attempt decides the port by a race. 2 s covers that gap with room to spare
-     *  while still bounding a genuinely occupied port (a second Modoki app deliberately left in the
-     *  foreground) to a short wait. */
-    private static final int BIND_RETRY_WINDOW_MS = 2000;
+     *  ⚠️ **THE RETRY CANNOT WIN THE FOREGROUND HANDOVER — measured, and this constant is
+     *  deliberately small because of it.** Launching a Modoki game while another is foregrounded,
+     *  on a Galaxy A23, the outgoing app's release never arrives WHILE we are retrying; it lands
+     *  shortly after the loop gives up, and the delay scales with how long we waited:
+     *
+     *      window   gave up at   released at   release − give-up
+     *       0.5 s     +0.60 s      +1.10 s          0.49 s
+     *       2   s     +2.11 s      +2.88 s          0.77 s
+     *       5   s     +5.13 s      +6.32 s          1.19 s
+     *
+     *  Three window sizes, and the fallback happened every time (3/3 at 2 s, 3/3 at 5 s). Waiting
+     *  longer only postpones the release — the retry defers the very thing it waits for. So the
+     *  original 2000, sized on a single 449 ms sample from a DIFFERENT situation (the outgoing app
+     *  resuming and immediately re-pausing), was not merely too short: no value is long enough.
+     *
+     *  What actually fixes the case is HOST-SIDE PORT DISCOVERY (`androidBridgePort.ts`) — the
+     *  lease asks which app is foregrounded and connects to the socket that uid owns, so a fallback
+     *  port is reachable instead of fatal. This retry is kept small as cheap insurance for the
+     *  unrelated case where the previous owner is already gone (a killed app), which SO_REUSEADDR
+     *  alone does not cover; it is not the fix for the handover. */
+    private static final int BIND_RETRY_WINDOW_MS = 1000;
     private static final int BIND_RETRY_INTERVAL_MS = 150;
 
     private ServerSocket serverSocket;

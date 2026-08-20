@@ -89,6 +89,11 @@ export const ARM_BACKSTOP_MS = 30_000;
  *  that already has. */
 export const IDLE_EVIDENCE_MS = 5_000;
 
+/** How long a session must have run before "nobody is touching this" is worth reporting. Long
+ *  on purpose: this fires as a `console.warn`, which is a Crashlytics issue, so it must describe
+ *  a game whose input is genuinely unwired — not a player who has not tapped yet. */
+export const IDLE_REPORT_AFTER_MS = 60_000;
+
 let state: TierChangeState = freshTierChangeState();
 let lastCheck = 0;
 /** Whether the "held at the assessed ceiling" explanation has already been printed this session. */
@@ -385,6 +390,14 @@ export function tickTierCalibration(now: number = rawNow()): void {
   const active = getActiveQualityTier();
   if (!active) return; // no renderer has resolved a tier yet
 
+  // Stamped HERE rather than inside the `!armed` branch below, because two readers now depend on
+  // it and only one of them is reached through that branch. `armTierCalibration()` can arm from a
+  // world swap before this function has ever run, which used to leave `firstTickAt` at `-1` — and
+  // `now - (-1)` is `now`, a number in the millions, so the idle report below would have fired on
+  // the first armed tick instead of after IDLE_REPORT_AFTER_MS. Session start is a fact about the
+  // session, not about arming.
+  if (firstTickAt < 0) firstTickAt = now;
+
   // ⭐ NOT ARMED ⇒ THE PROFILE IS NOT EVIDENCE YET (#227). See `armTierCalibration` for the
   // measurement this exists for. Suppression covers BOTH directions deliberately, not just the
   // demotion that was observed misfiring: a promotion decided off load frames would be reading
@@ -403,7 +416,6 @@ export function tickTierCalibration(now: number = rawNow()): void {
   // before assets start fetching (`tierBoot.resolveTierBeforeSceneLoad`, #212); demoting mid-load
   // would not retroactively re-request textures already in flight.
   if (!armed) {
-    if (firstTickAt < 0) firstTickAt = now;
     // The failsafe. See ARM_BACKSTOP_MS — long on purpose, so a slow load can never trip it.
     if (now - firstTickAt >= ARM_BACKSTOP_MS) {
       console.warn(
@@ -440,10 +452,24 @@ export function tickTierCalibration(now: number = rawNow()): void {
     // does not call it) would otherwise have calibration disabled forever with nothing to say so —
     // the same no-silent-caps rule the listings follow. Once per session, and only after the
     // backstop, so an ordinary pause never prints.
-    if (!loggedIdle && msSinceUserInput(now) >= ARM_BACKSTOP_MS) {
+    //
+    // ⚠️ MEASURE THE SESSION, NOT `msSinceUserInput`. Before the first input of a session that
+    // value is `Infinity` — deliberately, it means "never" — so gating on it fired on the FIRST
+    // armed tick of every launch and printed `calibration idle for Infinitys` (measured on an
+    // S22, 2026-08-20, ~0.2 s after boot). Two things were wrong with that, and only one of them
+    // was cosmetic: a `console.warn` is a Crashlytics ISSUE since 2026-08-20, and logcat shows
+    // `FirebaseCrashlytics.recordException` firing directly behind this line — so an ordinary
+    // launch nobody had touched yet filed an alerting issue, per session, on every install.
+    // A device untouched since boot is the NORMAL state of a game that just started; it is worth
+    // saying only once it has lasted long enough to be a real answer.
+    if (!loggedIdle && now - firstTickAt >= IDLE_REPORT_AFTER_MS) {
       loggedIdle = true;
+      const since = msSinceUserInput(now);
+      const howLong = Number.isFinite(since)
+        ? `idle for ${Math.round(since / 1000)}s`
+        : 'seen no input at all this session';
       console.warn(
-        `[qualityTier] calibration idle for ${Math.round(msSinceUserInput(now) / 1000)}s — the `
+        `[qualityTier] calibration ${howLong} — the `
         + 'frame profile is not being judged, because a device nobody is touching is throttled '
         + 'rather than slow. If this game DOES take input, its InputSource should call '
         + 'noteUserInput() (runtime/core/userActivity.ts).',
