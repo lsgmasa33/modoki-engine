@@ -65,6 +65,23 @@ describe('threeLoaderModules — on-demand three example loaders (#254)', () => 
     const all = await Promise.all([meshoptDecoder(), meshoptDecoder(), meshoptDecoder()]);
     expect(new Set(all).size).toBe(1); // and every caller got the same value
     expect(meshoptCalls.n).toBe(1);    // the module really was evaluated, exactly once
+
+    // ⚠️ The assertions above all run in ONE tick, before anything resolves, and that is a real
+    // blind spot: a memo that clears itself ON SUCCESS — re-importing on every later call, the
+    // exact opposite of what this module promises — passed every one of them. Identity cannot
+    // see it either (two calls after the clear both get the same NEW promise), and the mock
+    // factory counter cannot: vitest's registry evaluates a mocked module once however many
+    // `import()`s the source issues. What distinguishes the two is whether the memoised promise
+    // is still SETTLED after resolution, or a fresh pending one.
+    //
+    // The race is deterministic, not a timing guess: `Promise.race` subscribes to its arguments
+    // in order, so when arg 0 is already settled its reaction is queued BEFORE the sentinel's
+    // and wins; when arg 0 is a fresh pending import, only the sentinel can settle first.
+    const PENDING = Symbol('pending');
+    const winner = await Promise.race([meshoptDecoder(), Promise.resolve(PENDING)]);
+    expect(winner, 'the memo was dropped after a successful load — every later caller re-imports')
+      .not.toBe(PENDING);
+    expect(meshoptCalls.n).toBe(1);
   });
 
   it('makeGltfLoader always attaches the meshopt decoder', async () => {

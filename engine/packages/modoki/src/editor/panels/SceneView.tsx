@@ -2399,6 +2399,17 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     }
     await setActiveRenderer(renderer); // KTX2Loader GPU-format detection (async since #254)
     noteRendererProgress('renderer registered (setActiveRenderer called)');
+    // RE-CHECK, and it is the SECOND await in this body, not the first. #254 made
+    // `setActiveRenderer` genuinely async (it fetches the KTX2Loader chunk on a cold boot), so
+    // an unmount can land here — past the guard above. `cleanup` is not assigned until the very
+    // END of setup(), ~2000 lines down, so bailing without this check makes the effect's
+    // teardown a no-op while setup runs on to `startFrameDriver()`: a zombie renderer animating
+    // a detached canvas, its container lease never released, one per open/close cycle.
+    if (outerDisposed) {
+      noteRendererProgress('viewport unmounted while the KTX2 loader chunk was in flight');
+      releaseRenderer(container);
+      return;
+    }
     rendererRef.current = renderer;
 
     let disposed = false;
@@ -4691,7 +4702,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       recovery.request();
     });
 
-    // Fire-and-forget; the async body guards on `outerDisposed` after its await.
+    // Fire-and-forget; the async body guards on `outerDisposed` after EACH of its awaits
+    // (renderer acquire, then `setActiveRenderer` — #254 added the second one).
     // The `.catch` is load-bearing, not hygiene: `setup()` registers the frame callback and
     // calls startFrameDriver() at its very END, after ~2000 lines of synchronous scene/gizmo
     // wiring. A throw anywhere in there leaves the renderer ALREADY registered (so

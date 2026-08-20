@@ -45,6 +45,50 @@ export function resolveRelative(fromFile: string, spec: string): string | null {
   return null;
 }
 
+/** One import STATEMENT, as source text plus its 1-based starting line.
+ *
+ *  Statement-based rather than line-based, because a line-anchored regex cannot see
+ *
+ *      import {
+ *        GLTFLoader,
+ *      } from 'three/examples/jsm/loaders/GLTFLoader.js';
+ *
+ *  and this repo has 103 such imports under `runtime/`+`app/` — five of them BARE, three of
+ *  those `three/tsl`. A guard blind to a shape that common is the vacuous-guard failure mode
+ *  this file exists to avoid. (Measured 2026-08-20: a sound walk that DOES see them still finds
+ *  no forbidden edge, so the blindness was latent, not hiding a live defect — but it defeated a
+ *  deliberate mutation, which is the standard that matters.)
+ *
+ *  ⚠️ The tempting one-character fix — relaxing the old `[^\n;]*?` to `[^;]*?` — is UNSOUND and
+ *  was measured producing a false positive: the match is then free to begin at an earlier
+ *  newline and run through a doc comment into the next statement's `from '…'`, so a single-line
+ *  `import type { WebGPURenderer } from 'three/webgpu'` got reported as a value import of a
+ *  forbidden module. Walk statements; do not widen the regex. */
+export interface ImportStatement {
+  /** 1-based line where the statement starts. */
+  line: number;
+  /** The statement's source text, newlines included. */
+  text: string;
+}
+
+/** Every `import …` statement in a file, joined across lines up to its specifier. */
+export function importStatements(src: string): ImportStatement[] {
+  const lines = src.split('\n');
+  const out: ImportStatement[] = [];
+  const DONE = /from\s*['"][^'"]+['"]|^import\s*['"][^'"]+['"]/;
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^import\b/.test(lines[i])) continue; // column 0 only — never a mention inside a comment
+    let text = lines[i];
+    let j = i;
+    // Bounded so an `import` line that never completes (mid-edit, or a stray token) cannot run
+    // the scan to the end of the file and swallow unrelated statements.
+    while (!DONE.test(text) && j + 1 < lines.length && j - i < 12) { j++; text += `\n${lines[j]}`; }
+    out.push({ line: i + 1, text });
+    i = j;
+  }
+  return out;
+}
+
 /** All import specifiers in a file — static `from '…'` / `import '…'` AND dynamic
  *  `import('…')`. `import type` is EXCLUDED deliberately: an erased type import carries no
  *  runtime dependency, in either direction (following a type-only relative import would
@@ -59,17 +103,19 @@ export function importsOf(file: string): { relatives: string[]; bare: string[] }
     if (spec.startsWith('.')) relatives.push(spec);
     else bare.push(spec);
   };
-  const re = /(?:^|\n)\s*(import\s+type\s+)?[^\n;]*?(?:from|import\()\s*['"]([^'"]+)['"]/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(src)) !== null) add(m[2], Boolean(m[1]));
-  // Side-effect imports (`import 'x'` — no bindings, so no `from`) need their own pass: the regex
-  // above is anchored on `from`/`import(` and cannot see them. It is a SEPARATE pass rather than
-  // another alternation so it cannot perturb the matching above. This shape is exactly how a
-  // polyfill or a registration module gets pulled in, and missing it made the walker answer
-  // "nothing reaches three/webgpu" about a file that imports it outright — silently, which is the
-  // failure mode these guards exist to prevent.
-  const sideEffect = /(?:^|\n)\s*import\s+['"]([^'"]+)['"]\s*;?/g;
-  while ((m = sideEffect.exec(src)) !== null) add(m[1], false);
+  for (const { text } of importStatements(src)) {
+    const m = /from\s*['"]([^'"]+)['"]/.exec(text) ?? /^import\s*['"]([^'"]+)['"]/.exec(text);
+    // Side-effect imports (`import 'x'` — no bindings, so no `from`) are covered by the second
+    // alternative. This shape is exactly how a polyfill or a registration module gets pulled in,
+    // and missing it once made the walker answer "nothing reaches three/webgpu" about a file
+    // that imports it outright — silently, which is the failure these guards exist to prevent.
+    if (m) add(m[1], /^import\s+type\b/.test(text));
+  }
+  // Dynamic imports are expression-position, so they are NOT statements and need their own pass.
+  // `typeof import('…')` is a type query — erased, no runtime edge.
+  const dyn = /(?<!typeof\s)import\(\s*['"]([^'"]+)['"]\s*\)/g;
+  let d: RegExpExecArray | null;
+  while ((d = dyn.exec(src)) !== null) add(d[1], false);
   return { relatives, bare };
 }
 

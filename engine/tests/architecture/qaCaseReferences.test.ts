@@ -132,6 +132,15 @@ export function parseFrontmatter(raw: string): Frontmatter | null {
         .split(',')
         .map((v) => stripQuotes(v.trim()))
         .filter(Boolean);
+    } else if (value.startsWith('[')) {
+      // An unquoted scalar starting with `[` but never CLOSING one (e.g. the unquoted
+      // `title: [win] some prose` shape from #277) opens a YAML flow sequence with no valid
+      // end — real YAML throws on the whole frontmatter block. This lenient parser could
+      // otherwise happily store it as a bare string, which is exactly how the Testboard's
+      // real parser choking on these 11 case files went unnoticed by `npm test` for a week.
+      // Reported as unparsed instead, so this class can't regress silently again.
+      unparsed.push(line);
+      currentList = null;
     } else {
       currentList = null;
       fields[currentKey] = stripQuotes(value);
@@ -491,6 +500,27 @@ describe('qa case guard helpers', () => {
 
     it('returns null when there is no frontmatter at all', () => {
       expect(parseFrontmatter('# just a heading')).toBeNull();
+    });
+
+    it('reports an unquoted value starting with "[" that never closes as unparsed (#277)', () => {
+      // Real YAML: an unquoted scalar starting with `[` opens a flow sequence; prose after it
+      // with no closing `]` is invalid syntax the Testboard's real parser throws on, even
+      // though this subset could otherwise store it as a harmless bare string.
+      const out = fm('id: QA-X-0001\ntitle: [win] npm run editor:stop actually stops it');
+      expect(out?.unparsed.some((u) => u.includes('title'))).toBe(true);
+      expect(out?.fields.title).toBeUndefined();
+    });
+
+    it('still parses a well-formed inline list starting with "["', () => {
+      const out = fm('targets: [editor, web]');
+      expect(out?.fields.targets).toEqual(['editor', 'web']);
+      expect(out?.unparsed).toEqual([]);
+    });
+
+    it('accepts a quoted value starting with "[" as a plain string', () => {
+      const out = fm('title: "[win] npm run editor:stop actually stops it"');
+      expect(out?.fields.title).toBe('[win] npm run editor:stop actually stops it');
+      expect(out?.unparsed).toEqual([]);
     });
 
     it('reports a line it cannot parse rather than dropping it', () => {

@@ -16,7 +16,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { walkClosure, importsOf, type ImportEdge } from '../helpers/importClosure';
+import { walkClosure, importStatements, type ImportEdge } from '../helpers/importClosure';
 
 const srcDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../src');
 
@@ -114,18 +114,18 @@ describe('render3d:false boundary — three\'s example loaders are imported on d
 
   it('no module on the 2D path STATICALLY imports a three example loader', () => {
     expect(reachable.length).toBeGreaterThan(100); // non-vacuity: an empty closure proves nothing
-    // Matched per LINE, not per specifier: the owner module legitimately names every one of
-    // these in an `import type` (erased, no runtime edge) and again in a gated `import()`. Only
-    // a value-carrying `from '…'` — or a bare side-effect import — is the defect.
-    const STATIC_IMPORT = /^\s*import\s+(?!type[\s{])[^;]*?from\s*['"](three\/examples\/jsm\/[^'"]+)['"]/;
-    const SIDE_EFFECT = /^\s*import\s*['"](three\/examples\/jsm\/[^'"]+)['"]/;
     const offenders: string[] = [];
     for (const rel of reachable) {
-      const lines = fs.readFileSync(path.join(srcDir, rel), 'utf8').split('\n');
-      lines.forEach((line, i) => {
-        const m = STATIC_IMPORT.exec(line) ?? SIDE_EFFECT.exec(line);
-        if (m) offenders.push(`${rel}:${i + 1} → ${m[1]}`);
-      });
+      for (const { line, text } of importStatements(fs.readFileSync(path.join(srcDir, rel), 'utf8'))) {
+        // The owner module legitimately names every one of these in an `import type` (erased, no
+        // runtime edge) and again in a gated `import()`. Only a value-carrying static import is
+        // the defect. Statement-based rather than line-based: a multi-line `import {\n X,\n}
+        // from '…'` slips straight past a per-line regex, and did — verified by mutation.
+        if (/^import\s+type\b/.test(text)) continue;
+        const m = /from\s*['"](three\/examples\/jsm\/[^'"]+)['"]/.exec(text)
+          ?? /^import\s*['"](three\/examples\/jsm\/[^'"]+)['"]/.exec(text);
+        if (m) offenders.push(`${rel}:${line} → ${m[1]}`);
+      }
     }
     expect(
       offenders,
@@ -139,27 +139,39 @@ describe('render3d:false boundary — three\'s example loaders are imported on d
     const abs = path.join(srcDir, LOADER_OWNER);
     expect(fs.existsSync(abs), `${LOADER_OWNER} no longer exists — this guard is stale`).toBe(true);
     const src = fs.readFileSync(abs, 'utf8');
-    const dynamic = [...src.matchAll(/import\(\s*['"](three\/examples\/jsm\/[^'"]+)['"]\s*\)/g)];
-    // Non-vacuity: a renamed module or a changed import shape would otherwise pass with zero
-    // matches and vouch for nothing. Every accessor this file exports owns one.
-    expect(dynamic.length).toBeGreaterThanOrEqual(4);
-    // The gate must come BEFORE the import in the same function, or Rolldown keeps the chunk.
-    // Checking per-line is what distinguishes "the flag is mentioned in this file somewhere"
-    // from "this particular import is unreachable when the flag is false".
-    const lines = src.split('\n');
-    const ungated = dynamic
-      .map((m) => lines.findIndex((l) => l.includes(m[0])))
-      .filter((i) => {
-        const fnStart = lines.slice(0, i).map((l, j) => ({ l, j })).reverse()
-          .find(({ l }) => /^(export )?(async )?function /.test(l))?.j ?? 0;
-        return !lines.slice(fnStart, i + 1).some((l) => l.includes('__MODOKI_MODULE_RENDER3D__'));
-      })
-      .map((i) => `${LOADER_OWNER}:${i + 1}`);
+    const lineOf = (idx: number) => src.slice(0, idx).split('\n').length;
+
+    // ⚠️ This used to find each import's enclosing function by scanning BACKWARDS for a line
+    // matching /^(export )?(async )?function /, then looking for the flag anywhere in that span.
+    // It was defeated by the exact shape it exists to catch: rewriting an accessor as
+    // `export const ktx2LoaderCtor = () => {…}` and DELETING its gate still passed 6/6, because
+    // the backward scan ran past the arrow function into the PREVIOUS accessor and found *its*
+    // gate. Measured, not theorised. So pair them structurally instead: gates and imports must
+    // ALTERNATE in source order, each gate immediately preceding the import it protects.
+    const GATE = /!__MODOKI_MODULE_RENDER3D__/g;
+    // `(?<!typeof )` excludes the type-position `typeof import('…')` that names MeshoptDecoder's
+    // type — erased, needs no gate, and counting it would inflate the floor below.
+    const DYN = /(?<!typeof )import\(\s*['"]three\/examples\/jsm\/[^'"]+['"]\s*\)/g;
+    const gates = [...src.matchAll(GATE)].map((m) => lineOf(m.index));
+    const imports = [...src.matchAll(DYN)].map((m) => lineOf(m.index));
+
+    // Non-vacuity: one accessor per loader, plus meshopt. A renamed module or a changed import
+    // shape would otherwise pass with zero matches and vouch for nothing.
+    expect(imports.length).toBeGreaterThanOrEqual(5);
+    expect(gates.length).toBeGreaterThanOrEqual(imports.length);
+
+    const ungated = imports
+      .map((imp, i) => ({ imp, gate: gates[i] as number | undefined }))
+      // Each import must be preceded by ITS OWN gate — the i-th gate, not any gate — and closely
+      // enough that the two are plainly the same accessor. Deleting one gate shifts every later
+      // pairing and fails here; moving a gate below its import fails here too.
+      .filter(({ imp, gate }) => gate === undefined || gate >= imp || imp - gate > 8)
+      .map(({ imp }) => `${LOADER_OWNER}:${imp}`);
     expect(
       ungated,
       `an import() of a three example loader is reachable when render3d is off — Rolldown will ` +
-        `emit its chunk into a 2D-only bundle. Put the __MODOKI_MODULE_RENDER3D__ check FIRST in ` +
-        `the accessor:\n  ${ungated.join('\n  ')}`,
+        `emit its chunk into a 2D-only bundle. Put the __MODOKI_MODULE_RENDER3D__ check on the ` +
+        `line immediately before it:\n  ${ungated.join('\n  ')}`,
     ).toEqual([]);
   });
 });

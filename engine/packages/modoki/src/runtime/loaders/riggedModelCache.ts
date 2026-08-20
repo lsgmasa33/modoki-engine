@@ -64,9 +64,15 @@ let _gltfLoader: Promise<GLTFLoader> | undefined;
  *  synchronous `getLoader()` never had: with the LOADER memoised, a second caller arriving
  *  after the assignment but before `setKTX2Loader` sees a truthy field and gets the loader
  *  back UNCONFIGURED — and an optimized `.processed.glb` then throws "setKTX2Loader must be
- *  called before loading KTX2 textures". Concurrent rigged acquires within one scene load are
- *  the normal case, not a corner. Memoising the promise closes it: every caller awaits the
- *  same fully-configured result, and there is still exactly one loader and one import. */
+ *  called before loading KTX2 textures". Memoising the promise closes it: every caller awaits
+ *  the same fully-configured result, and there is still exactly one loader and one import.
+ *
+ *  ⚠️ On REACHABILITY, because the first write-up of this overstated it: the only caller is
+ *  `ensureKtx2Caps().then(getLoader)`, and in a render3d build every way caps become ready runs
+ *  `await getKTX2Loader()` first (`setActiveRendererHandle`, or the probe). So by the time
+ *  `getLoader` runs the KTX2 module is already imported and the exposed window is one microtask,
+ *  not a chunk fetch — a second acquire has to be scheduled precisely inside it. Latent, not
+ *  "the normal case". Kept because the shape is wrong regardless and the fix is free. */
 function getLoader(): Promise<GLTFLoader> {
   return (_gltfLoader ??= (async () => {
     const loader = await makeGltfLoader();

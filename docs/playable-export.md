@@ -111,11 +111,22 @@ removes nothing" below for the two that were not, and why they are gone rather t
     value.** `riggedModelCache.getLoader()` assigned its loader, *then* awaited `getKTX2Loader()`
     to attach the transcoder. A second caller arriving in that gap saw a truthy field and got the
     loader back **unconfigured**, so an optimized `.processed.glb` carrying KTX2 textures throws
-    "setKTX2Loader must be called before loading KTX2 textures" — and concurrent rigged acquires
-    within one scene load are the normal case, not a corner. Found reviewing the #254 diff, not
-    by a failing test. The same shape is in `meshTemplateCache`'s HDR loaders (benign there —
+    "setKTX2Loader must be called before loading KTX2 textures". Found reviewing the #254 diff,
+    not by a failing test. ⚠️ **Latent, not routine** — the first write-up of this said
+    "concurrent rigged acquires within one scene load are the normal case", and an independent
+    re-read disproved it: the sole caller is `ensureKtx2Caps().then(getLoader)`, and every way
+    caps become ready has already awaited `getKTX2Loader()`, so the exposed window is one
+    microtask rather than a chunk fetch. Fixed anyway — the shape is wrong regardless and the fix
+    is free — but do not cite it as a bug that was firing. The same shape is in `meshTemplateCache`'s HDR loaders (benign there —
     nothing is configured post-construction) and was written correctly in `ModelPreview`; they
     are all `??= (async () => …)()` now, so the class is closed rather than one instance of it.
+  - **A promise CACHE has the same trap as a promise memo, and a `??=` sweep will not find it.**
+    `meshTemplateCache`'s `loading` map stores each in-flight parse and is also what makes a
+    second acquire dedupe — so nothing removed a REJECTED entry, and every later acquire of that
+    GLB got the same rejection back with no new attempt. Survivable while the only cause was a
+    missing/corrupt GLB; #254 added a transient one (the loader's own chunk fetch) and the
+    self-healing built into `threeLoaderModules` stopped one layer short of the caller. Evict on
+    rejection only, identity-checked, so a successful entry still dedupes.
   - **And do not memoise the REJECTION.** A failed chunk fetch stored in the memo leaves every
     later load rejecting for the life of the page, recoverable only by a reload. Each accessor
     clears its slot in a `.catch` — the rule `textureResolver`'s texture cache already states.

@@ -716,6 +716,15 @@ export function loadModelTemplates(
     });
   });
 
+  // Evict on REJECTION only. `loading` doubles as "already parsed" state — a successful entry
+  // must stay so a second acquire dedupes, and `invalidateModel` is what clears it on re-import.
+  // But a rejection stored here was permanent: every later acquire of that GLB got the same
+  // rejected promise back with no new attempt. That was survivable while the only way to reject
+  // was a missing/corrupt GLB (a permanent condition); #254 added a plausibly TRANSIENT cause —
+  // the loader's own chunk fetch — and `threeLoaderModules` self-heals from that one layer down,
+  // so leaving it poisoned here would strand the recovery just short of the caller.
+  // Identity-checked so a re-armed load started by an intervening `invalidateModel` survives.
+  void promise.catch(() => { if (loading.get(key) === promise) loading.delete(key); });
   loading.set(key, promise);
   return promise;
 }

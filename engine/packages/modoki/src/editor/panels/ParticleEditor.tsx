@@ -82,6 +82,11 @@ export default function ParticleEditor() {
       catch (e) { console.error('[ParticleEditor] renderer init failed', e); return; }
       if (disposed) { renderer.dispose(); renderer.domElement.remove(); return; }
       await setActiveRenderer(renderer); // async since #254 — imports three's KTX2Loader
+      // RE-CHECK: `setActiveRenderer` became a real await in #254 (it fetches the KTX2Loader
+      // chunk), so the panel can unmount HERE — after the check above. `cleanupRef.current` is
+      // not assigned until the rAF loop is already running below, so bailing without this leaves
+      // the effect's cleanup a no-op and the renderer + loop + ResizeObserver alive forever.
+      if (disposed) { renderer.dispose(); renderer.domElement.remove(); return; }
       rendererRef.current = renderer;
 
       const scene = new THREE.Scene();

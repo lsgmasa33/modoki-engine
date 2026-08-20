@@ -203,7 +203,7 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
       try { l.setKTX2Loader(await getKTX2Loader()); }
       catch (e) { console.warn('[ModelPreview] KTX2Loader unavailable:', e); }
       return l;
-    })());
+    })().catch((e) => { loaderPromise = null; throw e; }));
 
     // Make the raw-GLB material read like the engine will render it. The import
     // pipeline (.mat.json) drops the GLB's emissive entirely, so a source GLB
