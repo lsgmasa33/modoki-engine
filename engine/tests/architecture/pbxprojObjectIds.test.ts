@@ -27,6 +27,7 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { globSync } from 'node:fs';
 import path from 'node:path';
+import { hasInternalGames } from '../helpers/repoLayout';
 
 const repoRoot = path.resolve(__dirname, '..', '..', '..');
 
@@ -37,7 +38,12 @@ function definedIds(source: string): string[] {
   return [...source.matchAll(DEFINITION)].map((m) => m[1]);
 }
 
-describe('committed pbxproj object ids', () => {
+/** ⚠️ Gated on `hasInternalGames()` — the OSS snapshot ships no `games/`, and
+ *  `publish-demo.sh` strips `ios/` out of every demo, so the glob below matches ZERO files
+ *  there and the "finds the files it is meant to guard" assertion fires. `hasAnyProject()`
+ *  would not do: the snapshot does ship demos, but without their native folders, so the
+ *  count is still 0. The threshold itself (`> 5`) is a statement about `games/`. */
+describe.skipIf(!hasInternalGames())('committed pbxproj object ids', () => {
   const files = globSync('{games,demos}/*/ios/App/App.xcodeproj/project.pbxproj', { cwd: repoRoot });
 
   it('finds the pbxproj files it is meant to guard', () => {
