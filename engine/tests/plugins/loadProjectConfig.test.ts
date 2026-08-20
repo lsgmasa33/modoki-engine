@@ -111,7 +111,10 @@ describe('loadProjectConfig', () => {
   });
 
   it('round-trips through writeProjectConfig', () => {
-    const next = { ...DEFAULT_PROJECT_CONFIG, app: { appId: 'com.example.app', appName: 'Example', iconSource: '' } };
+    // Spread the default `app` rather than listing its fields: the loader fills any ABSENT key
+    // from defaults, so a hand-listed subset stops round-tripping the moment a field is added to
+    // the section (adding app.version/app.buildNumber broke exactly this).
+    const next = { ...DEFAULT_PROJECT_CONFIG, app: { ...DEFAULT_PROJECT_CONFIG.app, appId: 'com.example.app', appName: 'Example' } };
     writeProjectConfig(next, root);
     expect(loadProjectConfig(root)).toEqual(next);
   });

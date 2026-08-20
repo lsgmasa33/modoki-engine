@@ -16,6 +16,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { getSafeAreaInsets, measureSafeAreaInsets, resetSafeAreaInsets } from '../../src/runtime/ui/safeArea';
+import { setManualNow, advanceManual, restoreRealClock } from '../../src/runtime/core/clock';
 
 let root: HTMLElement;
 
@@ -27,6 +28,7 @@ beforeEach(() => {
 afterEach(() => {
   root.remove();
   resetSafeAreaInsets();
+  restoreRealClock();
 });
 
 describe('getSafeAreaInsets', () => {
@@ -106,5 +108,54 @@ describe('getSafeAreaInsets', () => {
     root.style.setProperty('--ui-sa-top', '0px');   // e.g. switching to a device with no notch
     measureSafeAreaInsets(root);
     expect(getSafeAreaInsets().top).toBe(0);
+  });
+
+  /**
+   * The read REFRESHES ITSELF, and this is the bug that made it necessary (#273).
+   *
+   * With `setDecorFitsSystemWindows(false)` an Android window keeps its size when the system
+   * bars hide — only the insets change — so no ResizeObserver fires and nothing tells the UI
+   * layer to re-measure. Court hides the bars a beat after first paint, so the value captured at
+   * mount (bottom 48px, the nav bar) stuck: measured on a Galaxy A23 where the live inset was 0
+   * while the game still laid out against 48. It lifted the ad band off the bottom edge AND
+   * shortened the paper, because the same number feeds `designToHostPct`'s vertical span — two
+   * reports, one stale cache.
+   *
+   * `env()` changing fires no event, so there is nothing to subscribe to. The read throttles
+   * itself on the sanctioned clock instead.
+   */
+  it('re-measures when the cache goes stale, with NO resize to prompt it', () => {
+    setManualNow(0);
+    root.style.setProperty('--ui-sa-bottom', '48px');
+    measureSafeAreaInsets(root);
+    expect(getSafeAreaInsets().bottom).toBe(48);
+
+    // The bars hide. Same element, same size — only the inset moved.
+    root.style.setProperty('--ui-sa-bottom', '0px');
+    // Within the throttle the cached value still stands...
+    expect(getSafeAreaInsets().bottom).toBe(48);
+    // ...and past it, the read refreshes itself.
+    advanceManual(300);
+    expect(getSafeAreaInsets().bottom).toBe(0);
+  });
+
+  it('does not re-measure on every call — a per-frame caller must not force a style read per frame', () => {
+    setManualNow(0);
+    root.style.setProperty('--ui-sa-top', '68px');
+    measureSafeAreaInsets(root);
+    root.style.setProperty('--ui-sa-top', '0px');
+    for (let i = 0; i < 20; i += 1) {
+      advanceManual(10);                       // 200ms total, under the throttle
+      expect(getSafeAreaInsets().top).toBe(68);
+    }
+    advanceManual(100);
+    expect(getSafeAreaInsets().top).toBe(0);
+  });
+
+  it('a read before anything mounted does not throw and stays zero', () => {
+    setManualNow(0);
+    resetSafeAreaInsets();
+    advanceManual(10_000);
+    expect(getSafeAreaInsets()).toMatchObject({ top: 0, bottom: 0 });
   });
 });

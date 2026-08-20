@@ -11,14 +11,14 @@
  *  meant for the game underneath, and it renders nothing at all when the device has no
  *  insets (every Android preset in landscape aside, that is the whole `Free` + `Aspect`
  *  half of the catalog). */
-import type { SafeAreaInsets } from '../scene/devicePresets';
+import type { SafeAreaPx } from '../scene/devicePresets';
 
 /** Faint warm tint + a dashed inner edge: legible over both a dark scene and a light
  *  one, and unmistakably editor chrome rather than something the game drew. */
 const BAND = 'rgba(255, 170, 60, 0.10)';
 const EDGE = 'rgba(255, 170, 60, 0.55)';
 
-export default function SafeAreaOverlay({ insets }: { insets: SafeAreaInsets }) {
+export default function SafeAreaOverlay({ insets }: { insets: SafeAreaPx }) {
   const { top, right, bottom, left } = insets;
   if (!top && !right && !bottom && !left) return null;
   return (

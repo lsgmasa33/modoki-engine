@@ -726,6 +726,12 @@ different fixes, and the second reads as the first otherwise. Generic CSS keywor
 (`sans-serif`, `system-ui`, …) name no asset by design and are silent. Before this, the
 failure produced no console output at all.
 
+⚠️ **The DOM loader has no INVALIDATION**, which is the next thing this path gets wrong: nothing
+ever deletes from `loadedPaths`/`loadedFonts`, and `doLoadFont` builds its URL with no
+`withCacheBust` (the SDF sibling has both). So a re-imported font re-bakes the SDF atlas and
+visibly changes `Text2D`/`Text3D` while DOM text keeps the old face until an editor restart —
+issue #276, with the three-part fix and the reproduce-first caveat.
+
 ⚠️ This is the dev-editor half of a class the production build has too: **the tree-shaker
 cannot see a family NAME reached from anywhere but a scene/prefab field** (a stylesheet, a
 code constant), so the font is dropped and every string falls back — see

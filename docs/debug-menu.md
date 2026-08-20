@@ -102,7 +102,7 @@ the input-source guard.
 | **Prefs** | `PlayerPrefs` viewer — the engine-owned per-key JSON store (per-game namespace). |
 | **Cheats** | Auto-listed UIActions (`getUIActionNames` → `dispatchUIAction`) **plus** game `registerDebugCommand` buttons. |
 | **Console** | Ring-buffer view of captured `console.*` with a level filter + Clear. |
-| **Device** | Platform / viewport / screen / DPR / cores / memory / safe-area (refreshes on rotation), plus the **Backing resolution** A/B and the **`Re-run probe (idle)`** button below. |
+| **Device** | Platform / viewport / screen / DPR / cores / memory / safe-area (refreshes on rotation), plus the **Backing resolution** A/B and the **`Re-run probe (idle)`** button below. The safe-area row reports the insets the LAYOUT is using, not a bare `env()` — in an editor device preview that is the simulated inset, because the probe reads `var(--ui-sa-*, env(…))` from inside the preview's cascade. Both halves are needed: the same expression probed off `document.body` still reads 0. |
 
 ### Backing resolution — the live `pixelRatioCap` A/B (Device tab)
 

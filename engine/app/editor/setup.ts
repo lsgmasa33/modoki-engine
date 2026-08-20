@@ -418,6 +418,8 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
                 { key: 'app.appId', label: 'Bundle ID', type: 'text' },
                 { key: 'app.appName', label: 'App name', type: 'text' },
                 { key: 'app.iconSource', label: 'App icon (source PNG)', type: 'path', pathMode: 'file', placeholder: 'empty = bundled Modoki icon', help: 'square, ≥1024px; all sizes generated on build' },
+                { key: 'app.version', label: 'Version', type: 'text', placeholder: '1.0', help: 'marketing version, what players see in the store listing — synced into Android versionName + iOS MARKETING_VERSION on open and before every build' },
+                { key: 'app.buildNumber', label: 'Build number', type: 'number', placeholder: '1', help: 'BUMP BEFORE EVERY STORE UPLOAD. Both stores refuse a build number they have already seen and do it SILENTLY — Play just reports "this release is empty". Synced into Android versionCode + iOS CURRENT_PROJECT_VERSION on open and before every build (not on save); never lowered — a lower value is reported in the log and ignored.' },
               ],
             },
             {

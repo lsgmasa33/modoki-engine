@@ -152,6 +152,35 @@ export interface ProjectConfig {
      *  ideally 1024×1024). The build generates all iOS AppIcon + Android mipmap
      *  sizes from it. Empty = use the bundled Modoki icon. */
     iconSource: string;
+    /** Marketing version — what a player sees in the store listing ("1.0", "2.3.1").
+     *  Synced by `healAndroidVersion` into `versionName` and by `healIosVersion` into
+     *  `MARKETING_VERSION` (which `Info.plist` reads as `CFBundleShortVersionString`
+     *  via `$(MARKETING_VERSION)`). Free-form: the stores accept anything dotted, and
+     *  it carries no ordering requirement of its own. */
+    version: string;
+    /** Build number — the MONOTONIC integer both stores dedupe uploads by
+     *  (`versionCode` on Android, `CFBundleVersion`/`CURRENT_PROJECT_VERSION` on iOS).
+     *  ONE field for both platforms: their counters are independent, but a single value
+     *  that only ever moves up satisfies both, and two fields is one more thing to
+     *  forget.
+     *
+     *  ⚠️ **This exists because a duplicate is refused SILENTLY** (#199). Play does not
+     *  say "that versionCode is taken" — the bundle simply never attaches, and the
+     *  release page then reports three errors that all mean "this release is empty"
+     *  and none of which mention versions. It reads as a broken upload rather than a
+     *  refused one, so the first instinct is to re-upload, re-export, or re-check
+     *  signing. App Store Connect behaves the same way, with a different but equally
+     *  indirect message. Before this field, every project shipped the scaffolder's
+     *  hardcoded `1` and nothing ever changed it.
+     *
+     *  ⚠️ **The heal never LOWERS a native value** — see `healAndroidVersion`. Lowering
+     *  is the one direction that is always a mistake, and it is exactly what a stale or
+     *  fresh-clone config would do to a project that has already uploaded.
+     *
+     *  NOT auto-incremented, on purpose: a build number that changes itself makes builds
+     *  non-reproducible and churns a committed file on every build (the #18
+     *  write-behind-your-back hazard). The owner bumps it. */
+    buildNumber: number;
   };
   content: {
     /** Ordered build scene list (see {@link SceneEntry}). The first INCLUDED
@@ -484,6 +513,14 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     appId: 'com.modokiengine.prototype',
     appName: 'Puzzle Prototype',
     iconSource: '',
+    // '1.0' / 1 are exactly what `cap add` scaffolds into versionName/versionCode and
+    // MARKETING_VERSION/CURRENT_PROJECT_VERSION, so adopting these fields rewrites NOTHING
+    // in any existing project (measured across all 20: every one is 1.0/1 bar iap-test,
+    // which has uploaded and carries its own). Deliberately unlike `androidMinSdk`, whose
+    // default overrides the scaffold because the scaffold's 24 is wrong; there is nothing
+    // wrong with starting at 1.0/1 — it was just unmanaged.
+    version: '1.0',
+    buildNumber: 1,
   },
   content: {
     scenes: [],
@@ -693,8 +730,26 @@ export const TONE_MAPPINGS = ['None', 'Linear', 'ACESFilmic', 'AgX', 'Neutral'] 
  *  erased the only evidence of intent and left a file that merely looked correct.
  *  Reading coerces (so the engine renders something a consumer handles); writing
  *  round-trips (so the file keeps saying what its author said). */
+/** What `mergeProjectConfig` actually accepts. `Partial<ProjectConfig>` was too strict and did
+ *  not describe the implementation: every section below is applied with a SPREAD
+ *  (`{...d.app, ...p.app}`), so a partial section has always worked — the type just demanded a
+ *  complete one. Nothing noticed while the input came off disk as arbitrary JSON, but it meant a
+ *  test fixture overriding one field had to name every sibling, so every field added to a section
+ *  broke unrelated fixtures (adding `app.version` broke addNativeTarget.test.ts). One level deep
+ *  is exactly what the implementation does; `build.modules` is the one nested case and it gets
+ *  its own spread below.
+ *
+ *  `postprocessors` is excluded because it is MAP-LIKE (keyed by postprocessor id, see the
+ *  deep-merge notes further down) rather than fixed-shape: a `Record` is already
+ *  "any subset of keys", and wrapping it in `Partial` would only widen its VALUES to
+ *  `ModelPostprocessorDecl | undefined`, which is a different and wrong claim. */
+type MapLikeSection = 'postprocessors';
+type PartialProjectConfig = {
+  [K in keyof ProjectConfig]?: K extends MapLikeSection ? ProjectConfig[K] : Partial<ProjectConfig[K]>;
+};
+
 export function mergeProjectConfig(
-  partial: Partial<ProjectConfig> | null | undefined,
+  partial: PartialProjectConfig | null | undefined,
   opts?: { coerceUnions?: boolean; issues?: ProjectConfigIssue[] },
 ): ProjectConfig {
   const p = partial ?? {};

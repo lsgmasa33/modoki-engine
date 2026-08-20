@@ -1075,6 +1075,26 @@ describe('healNativeConfig — orientation + status bar', () => {
       fs.writeFileSync(activityPath(), src);
     }
 
+    // MEASURED on a Galaxy A23: without this the window frame is [0,59][720,1560] — laid out
+    // BENEATH the 52px cutout — and since the bars are hidden nothing draws in that strip, so the
+    // window background shows through as a 59px BLACK BAND. `setDecorFitsSystemWindows(false)`
+    // does not cover it: that opts out of fitting the system BARS, not the cutout. The same fact
+    // is why `env(safe-area-inset-*)` read 0,0,0,0 there — a window that never reaches the cutout
+    // has no inset to report — which briefly got recorded as "Android has no insets".
+    it('lays the window INTO the display cutout — without it the hidden bars leave a black band', () => {
+      writeActivity();
+      writeCapConfig({ statusBarHidden: true });
+      healNativeConfig(root);
+      const out = fs.readFileSync(activityPath(), 'utf8');
+      expect(out).toContain('LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES');
+      expect(out).toContain('layoutInDisplayCutoutMode');
+      // Guarded on P — the constant does not exist below API 28 and the field would throw.
+      expect(out).toContain('Build.VERSION.SDK_INT >= Build.VERSION_CODES.P');
+      // The imports the block now needs, or it will not compile.
+      expect(out).toContain('import android.os.Build;');
+      expect(out).toContain('import android.view.WindowManager;');
+    });
+
     it('hides BOTH bars — the nav bar too, not just the status bar', () => {
       writeActivity();
       writeCapConfig({ statusBarHidden: true });
@@ -1265,6 +1285,215 @@ describe('healNativeConfig — orientation + status bar', () => {
         expect(out).toContain('platforms: [.iOS(.v16)],');   // the app's own floor, healed
         expect(out).toContain('.package(name: "Other", platforms: [.iOS(.v13)])'); // the dep's, untouched
       });
+    });
+  });
+
+  /** #199 — nothing managed an app's version or build number on either platform, so every
+   *  project shipped the scaffolder's hardcoded `versionCode 1`. That only ever mattered once a
+   *  project published, and then it mattered a lot: both stores refuse a build number they have
+   *  already seen and do it SILENTLY (Play reports "this release is empty"), so the rejection
+   *  reads as a broken upload rather than a refused one. */
+  describe('app version + build number', () => {
+    const GRADLE = [
+      'android {',
+      '    defaultConfig {',
+      '        versionCode 1',
+      '        versionName "1.0"',
+      '    }',
+      '}',
+      '',
+    ].join('\n');
+    // Two build configurations, exactly as a Capacitor pbxproj carries them.
+    const PBX = [
+      'buildSettings = {',
+      '\tCURRENT_PROJECT_VERSION = 1;',
+      '\tMARKETING_VERSION = 1.0;',
+      '};',
+      'buildSettings = {',
+      '\tCURRENT_PROJECT_VERSION = 1;',
+      '\tMARKETING_VERSION = 1.0;',
+      '};',
+      '',
+    ].join('\n');
+    const gradlePath = () => path.join(root, 'android', 'app', 'build.gradle');
+    const pbxPath = () => path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+    function writeNative(gradle = GRADLE, pbx = PBX) {
+      fs.mkdirSync(path.dirname(gradlePath()), { recursive: true });
+      fs.writeFileSync(gradlePath(), gradle);
+      fs.mkdirSync(path.dirname(pbxPath()), { recursive: true });
+      fs.writeFileSync(pbxPath(), pbx);
+    }
+    function writeAppCfg(app: Record<string, unknown>) {
+      fs.writeFileSync(path.join(root, 'project.config.json'), JSON.stringify({ app, build: {}, capacitor: {} }));
+    }
+
+    it('syncs both platforms from app.version / app.buildNumber', () => {
+      writeNative();
+      writeAppCfg({ version: '2.3.1', buildNumber: 7 });
+      healNativeConfig(root);
+      const g = fs.readFileSync(gradlePath(), 'utf8');
+      expect(g).toContain('versionCode 7');
+      expect(g).toContain('versionName "2.3.1"');
+      const x = fs.readFileSync(pbxPath(), 'utf8');
+      expect(x).toContain('CURRENT_PROJECT_VERSION = 7;');
+      expect(x).toContain('MARKETING_VERSION = 2.3.1;');
+    });
+
+    /** A pbxproj carries the keys once per build CONFIGURATION. Healing only the first leaves
+     *  Release behind — the configuration that actually ships. Same reasoning as the deployment
+     *  target above, which is why both are `replace_all`. */
+    it('heals EVERY build configuration, not just the first', () => {
+      writeNative();
+      writeAppCfg({ version: '2.0', buildNumber: 7 });
+      healNativeConfig(root);
+      const x = fs.readFileSync(pbxPath(), 'utf8');
+      expect(x.match(/CURRENT_PROJECT_VERSION = 7;/g)).toHaveLength(2);
+      expect(x.match(/MARKETING_VERSION = 2\.0;/g)).toHaveLength(2);
+    });
+
+    it('is idempotent', () => {
+      writeNative();
+      writeAppCfg({ version: '2.0', buildNumber: 7 });
+      healNativeConfig(root);
+      const once = fs.readFileSync(gradlePath(), 'utf8') + fs.readFileSync(pbxPath(), 'utf8');
+      healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8') + fs.readFileSync(pbxPath(), 'utf8')).toBe(once);
+    });
+
+    /** THE load-bearing case. A stale config, a fresh clone, or a forgotten bump would otherwise
+     *  walk a published project's build number BACKWARDS — the one direction that is always a
+     *  mistake, and the one whose failure is invisible at the store. */
+    it('REFUSES to lower a build number, and says so', () => {
+      writeNative(GRADLE.replace('versionCode 1', 'versionCode 11'), PBX.replaceAll('CURRENT_PROJECT_VERSION = 1;', 'CURRENT_PROJECT_VERSION = 5;'));
+      writeAppCfg({ version: '1.0', buildNumber: 1 });
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 11');
+      expect(fs.readFileSync(pbxPath(), 'utf8')).toContain('CURRENT_PROJECT_VERSION = 5;');
+      const notes = r.notes.join(' ');
+      expect(notes).toContain('REFUSED to lower Android versionCode 11');
+      expect(notes).toContain('REFUSED to lower iOS CURRENT_PROJECT_VERSION 5');
+      // Actionable, not just a complaint: it names the number that would work.
+      expect(notes).toContain('at least 12');
+      expect(notes).toContain('at least 6');
+    });
+
+    /** The two platforms' counters drift apart because each store counts its own uploads —
+     *  measured on games/iap-test (Android 11, iOS 5). ONE app.buildNumber still serves both: the
+     *  stores only require the number to RISE, so the lagging platform takes a one-time jump. */
+    it('raises the LAGGING platform without touching the ahead one, when the config passes both', () => {
+      writeNative(GRADLE.replace('versionCode 1', 'versionCode 11'), PBX.replaceAll('CURRENT_PROJECT_VERSION = 1;', 'CURRENT_PROJECT_VERSION = 5;'));
+      writeAppCfg({ version: '1.0', buildNumber: 11 });
+      healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 11');
+      expect(fs.readFileSync(pbxPath(), 'utf8')).toContain('CURRENT_PROJECT_VERSION = 11;');
+    });
+
+    /** A Debug configuration left at 1 must not authorise lowering a Release at 11 — "what is
+     *  this project at" is the MAX of the occurrences, not the first one the regex finds. */
+    it('compares against the HIGHEST existing value, not the first', () => {
+      // First configuration at 1, second at 11 — so a first-match read would see 1 and happily
+      // lower the whole file to 4.
+      const mixed = PBX.replace(/CURRENT_PROJECT_VERSION = 1;([\s\S]*)CURRENT_PROJECT_VERSION = 1;/, 'CURRENT_PROJECT_VERSION = 1;$1CURRENT_PROJECT_VERSION = 11;');
+      expect(mixed, 'fixture must actually hold two different values').toContain('CURRENT_PROJECT_VERSION = 11;');
+      expect(mixed).toContain('CURRENT_PROJECT_VERSION = 1;');
+      writeNative(GRADLE, mixed);
+      writeAppCfg({ version: '1.0', buildNumber: 4 });
+
+      healNativeConfig(root);
+
+      expect(fs.readFileSync(pbxPath(), 'utf8'), 'the 11 must not be lowered to 4').toBe(mixed);
+    });
+
+    /** AGP 8 writes `versionCode = 1`. No project uses it YET, but these very build.gradle files
+     *  already mix the assignment syntax (`namespace = `, `compileSdk = `), so the next Capacitor
+     *  template bump is how it arrives — and a pattern that only matched the Groovy form would
+     *  silently no-op, leaving the build number unmanaged again with nothing to show for it. */
+    it('heals the AGP-8 `versionCode = 1` form too, preserving the file\'s own separator', () => {
+      const agp = [
+        'android {',
+        '    namespace = "com.x.y"',
+        '    defaultConfig {',
+        '        versionCode = 1',
+        '        versionName = "1.0"',
+        '    }',
+        '}',
+        '',
+      ].join('\n');
+      writeNative(agp);
+      writeAppCfg({ version: '3.1', buildNumber: 8 });
+      healNativeConfig(root);
+      const g = fs.readFileSync(gradlePath(), 'utf8');
+      expect(g).toContain('versionCode = 8');
+      expect(g).toContain('versionName = "3.1"');
+      // Not rewritten into the other syntax — that would be a gratuitous diff on a file the
+      // project owns.
+      expect(g).not.toContain('versionCode 8');
+    });
+
+    /** A value the pattern cannot READ is not the same as no value. Reporting it is the whole
+     *  point: silence here is indistinguishable from "synced", which is how an unmanaged build
+     *  number ships. */
+    it('reports — and writes nothing — when versionCode is present in an unreadable form', () => {
+      const viaVar = GRADLE.replace('versionCode 1', 'versionCode rootProject.ext.buildNo');
+      writeNative(viaVar);
+      writeAppCfg({ version: '1.0', buildNumber: 8 });
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(viaVar);
+      expect(r.notes.join(' ')).toContain('versionCode is present but not in a form this heal can read');
+    });
+
+    /** THE hole the never-lower guard had. `CURRENT_PROJECT_VERSION = 1.2;` is legal — Apple
+     *  compares CFBundleVersion component-wise, so 1.2 > 1 — but it is not an integer to order
+     *  against. Skipping it left `current` null, which made the guard's `current !== null` false
+     *  and let the write LOWER 1.2 to 1: the exact silent rejection this heal exists to prevent,
+     *  produced by the code preventing it. */
+    it('refuses to write over a DOTTED build number rather than lowering it', () => {
+      const dotted = PBX.replaceAll('CURRENT_PROJECT_VERSION = 1;', 'CURRENT_PROJECT_VERSION = 1.2;');
+      writeNative(GRADLE, dotted);
+      writeAppCfg({ version: '1.0', buildNumber: 1 });
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(pbxPath(), 'utf8'), '1.2 must survive').toContain('CURRENT_PROJECT_VERSION = 1.2;');
+      expect(fs.readFileSync(pbxPath(), 'utf8')).not.toContain('CURRENT_PROJECT_VERSION = 1;');
+      expect(r.notes.join(' ')).toContain('cannot be ordered against');
+    });
+
+    /** …and the same refusal applies when the config number is HIGHER, because "1.2 vs 8" is still
+     *  a comparison we cannot make correctly — component-wise ordering is Apple's, not ours. */
+    it('refuses a dotted build number even when the config value looks larger', () => {
+      const dotted = PBX.replaceAll('CURRENT_PROJECT_VERSION = 1;', 'CURRENT_PROJECT_VERSION = 1.2;');
+      writeNative(GRADLE, dotted);
+      writeAppCfg({ version: '1.0', buildNumber: 8 });
+      healNativeConfig(root);
+      expect(fs.readFileSync(pbxPath(), 'utf8')).toContain('CURRENT_PROJECT_VERSION = 1.2;');
+    });
+
+    // Nothing validates config types (#39); junk must not become `versionCode banana`.
+    it('leaves the project ALONE on junk values', () => {
+      writeNative();
+      writeAppCfg({ version: 'banana', buildNumber: 'lots' });
+      healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(GRADLE);
+      expect(fs.readFileSync(pbxPath(), 'utf8')).toBe(PBX);
+    });
+
+    it('leaves the project ALONE on a zero / negative build number', () => {
+      writeNative();
+      writeAppCfg({ version: '1.0', buildNumber: 0 });
+      healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(GRADLE);
+    });
+
+    /** The defaults are chosen to match what `cap add` scaffolds, so adopting the feature
+     *  rewrites NOTHING in the twenty existing projects. A default that differed would churn
+     *  every project's native files on the next open — the #18 write-behind-your-back hazard. */
+    it('the DEFAULTS are a no-op against a freshly scaffolded project', () => {
+      writeNative();
+      writeAppCfg({});
+      healNativeConfig(root);
+      expect(DEFAULT_PROJECT_CONFIG.app.version).toBe('1.0');
+      expect(DEFAULT_PROJECT_CONFIG.app.buildNumber).toBe(1);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(GRADLE);
+      expect(fs.readFileSync(pbxPath(), 'utf8')).toBe(PBX);
     });
   });
 

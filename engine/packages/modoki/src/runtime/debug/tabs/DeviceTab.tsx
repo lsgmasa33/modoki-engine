@@ -17,13 +17,31 @@ import { asCeiling, pickedCap, capButtonMarks, capRowCaption, type CapRowState }
 
 interface Insets { top: string; right: string; bottom: string; left: string }
 
-function readInsets(): Insets {
+/** Probe the safe-area insets the LAYOUT is actually using.
+ *
+ *  ⚠️ **Two things here are deliberate, and both were wrong before #271.**
+ *
+ *  1. The expression is `var(--ui-sa-*, env(...))`, the same one `runtime/ui/anchorCss.ts`
+ *     emits — not a bare `env()`. An editor device preview simulates the insets by setting
+ *     those vars, so a bare `env()` reports 0 while the chrome around it is inset by 68.
+ *  2. The probe is appended to `host` (this tab's own element, which the debug menu mounts
+ *     INSIDE the preview container) rather than to `document.body`. The vars are set on the
+ *     preview frame, so a body-level probe sits outside that cascade and misses them however
+ *     the expression is written.
+ *
+ *  A diagnostic that disagrees with the system it is diagnosing is worse than no diagnostic —
+ *  this panel exists so an agent can stop guessing about device state, and reading 0 here while
+ *  the layout uses 68 is exactly how a correct fix gets re-opened as a bug. On a real device
+ *  nothing sets the vars, the `env()` fallback applies, and this reports what it always did. */
+function readInsets(host: HTMLElement | null): Insets {
   const probe = document.createElement('div');
   probe.style.cssText =
     'position:fixed;visibility:hidden;pointer-events:none;top:0;left:0;' +
-    'padding-top:env(safe-area-inset-top);padding-right:env(safe-area-inset-right);' +
-    'padding-bottom:env(safe-area-inset-bottom);padding-left:env(safe-area-inset-left);';
-  document.body.appendChild(probe);
+    'padding-top:var(--ui-sa-top, env(safe-area-inset-top));' +
+    'padding-right:var(--ui-sa-right, env(safe-area-inset-right));' +
+    'padding-bottom:var(--ui-sa-bottom, env(safe-area-inset-bottom));' +
+    'padding-left:var(--ui-sa-left, env(safe-area-inset-left));';
+  (host ?? document.body).appendChild(probe);
   const cs = getComputedStyle(probe);
   const insets = { top: cs.paddingTop, right: cs.paddingRight, bottom: cs.paddingBottom, left: cs.paddingLeft };
   probe.remove();
@@ -186,6 +204,9 @@ export function DeviceTab() {
   const [probeRunning, setProbeRunning] = useState(false);
   const [probeResult, setProbeResult] = useState<string | null>(null);
   const rafRef = useRef<number | null>(null);
+  /** This tab's own root. The inset probe is mounted INSIDE it so it inherits the
+   *  `--ui-sa-*` an editor device preview publishes — see `readInsets`. */
+  const insetHostRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const p = readDebugIp();
@@ -195,7 +216,7 @@ export function DeviceTab() {
   useEffect(() => {
     // Re-probe insets AND re-render (window-derived rows) on resize/rotation — the
     // safe area is exactly the value most likely to change when the device rotates.
-    const refresh = () => setInsets(readInsets());
+    const refresh = () => setInsets(readInsets(insetHostRef.current));
     const refreshBuffers = () => setBuffers(readCanvasBuffers());
     refresh();
     refreshBuffers();
@@ -349,7 +370,7 @@ export function DeviceTab() {
   const tierCeilingPixi = asCeiling(tierOverrides.pixiPixelRatioCap);
 
   return (
-    <div style={scrollRootStyle(3)}>
+    <div ref={insetHostRef} style={scrollRootStyle(3)}>
       {/* The IP the user types into Modoki's AI panel → Connect a Device. Full-width + wrapping
           (NOT the truncating row style) so it's never cut off on a narrow device, and selectable.
           Only present when the game-debug plugin is compiled in; '' means WiFi is down. */}

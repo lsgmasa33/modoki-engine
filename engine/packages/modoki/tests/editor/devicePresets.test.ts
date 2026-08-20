@@ -167,6 +167,21 @@ describe('devicePresets — safe area', () => {
     expect(resolveSafeArea(find('iPhone SE'), 'portrait')).toEqual({ top: 0, right: 0, bottom: 0, left: 0 });
   });
 
+  // MEASURED on TWO handsets that agree within 1dp: Galaxy A23 -> env() top 28, Galaxy S22 -> 27,
+  // both bottom 0 (Court hides both system bars). Bottom-of-screen chrome therefore sits flush on
+  // Android while it lifts 34pt on a home-indicator iPhone — the asymmetry is real, not an
+  // oversight, and a symmetric "24/24" guess got it wrong on both edges at once.
+  it('Android presets carry the cutout on top and nothing at the bottom', () => {
+    const android = DEVICE_PRESETS.filter((p) => ['Samsung', 'Google', 'Android'].includes(p.category));
+    expect(android.length).toBeGreaterThan(4);
+    for (const p of android) {
+      const portrait = resolveSafeArea(p, 'portrait');
+      expect(portrait.top, `${p.name} top`).toBe(28);
+      expect(portrait.bottom, `${p.name} bottom — both bars are hidden`).toBe(0);
+      expect(portrait.left + portrait.right, `${p.name} sides`).toBe(0);
+    }
+  });
+
   it('safeAreaCssVars emits the four px vars anchorCss reads', () => {
     expect(safeAreaCssVars({ top: 62, right: 0, bottom: 34, left: 0 })).toEqual({
       '--ui-sa-top': '62px',

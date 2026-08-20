@@ -176,53 +176,60 @@ export async function loadFontFamily(value: string): Promise<number> {
 
   const candidates = cssFamilyCandidates(value);
   if (candidates.length === 0) return 0;
+  // In PARALLEL, not one family after another: this is awaited as a scene resource, and a stack
+  // naming a Latin face plus a multi-megabyte CJK fallback would otherwise make scene load wait
+  // for their SUM instead of the slower one. Every other scene resource is acquired in parallel.
+  const counts = await Promise.all(candidates.map(loadOneFamily));
+  return counts.reduce((a, b) => a + b, 0);
+}
 
-  let registered = 0;
-  for (const family of candidates) {
-    const inManifest = getAllAssets().filter(
-      a => a.type === 'font' && parseFontFilename(a.path).family === family,
-    );
-    // `sourceShipped === false` = the shaker dropped the source `.ttf` next to its atlas, so
-    // the path is in the manifest but 404s. Reported separately below: "the build dropped it"
-    // is a different fix from "no such font", and the first reads as the second otherwise.
-    const loadable = inManifest.filter(a => a.font?.sourceShipped !== false);
+/** One family of a `font-family` value. Split out so {@link loadFontFamily} can run the
+ *  candidates concurrently. */
+async function loadOneFamily(family: string): Promise<number> {
+  const inManifest = getAllAssets().filter(
+    a => a.type === 'font' && parseFontFilename(a.path).family === family,
+  );
+  // `sourceShipped === false` = the shaker dropped the source `.ttf` next to its atlas, so
+  // the path is in the manifest but 404s. Reported separately below: "the build dropped it"
+  // is a different fix from "no such font", and the first reads as the second otherwise.
+  const loadable = inManifest.filter(a => a.font?.sourceShipped !== false);
 
-    if (loadable.length === 0) {
-      if (!familyWarned.has(family)) {
-        familyWarned.add(family);
-        if (inManifest.length > 0) {
-          console.warn(
-            `[FontLoader] font family "${family}" resolves to ${inManifest.map(a => a.path).join(', ')}, ` +
-              `whose source the build did not ship (shipSource:'never', or no DOM usage detected) — ` +
-              `text using it falls back to the browser default.`,
-          );
-        } else {
-          console.warn(
-            `[FontLoader] font family "${family}" matches no font asset — text using it falls back to ` +
-              `the browser default. (Expected if "${family}" is a system font; otherwise check the ` +
-              `filename: the family is derived from it, e.g. VarelaRound-Regular.ttf => "Varela Round".)`,
-          );
-        }
+  if (loadable.length === 0) {
+    if (!familyWarned.has(family)) {
+      familyWarned.add(family);
+      if (inManifest.length > 0) {
+        console.warn(
+          `[FontLoader] font family "${family}" resolves to ${inManifest.map(a => a.path).join(', ')}, ` +
+            `whose source the build did not ship (shipSource:'never', or no DOM usage detected) — ` +
+            `text using it falls back to the browser default.`,
+        );
+      } else {
+        console.warn(
+          `[FontLoader] font family "${family}" matches no font asset, so nothing was registered for ` +
+            `it — and the build's font scan uses the SAME rule, so it will not ship a source either. ` +
+            `Expected if "${family}" is a system font. Otherwise check the FILENAME, which is where ` +
+            `the family comes from, and its CASE — the match is exact: ` +
+            `VarelaRound-Regular.ttf => "Varela Round".`,
+        );
       }
-      continue;
     }
-
-    // It resolves now → forget the warning, so a genuine LATER break (an asset deleted
-    // mid-session in the editor) warns again instead of being silenced for the session.
-    // Same shape as fontAtlasLoader's `unknownSeen.delete`.
-    familyWarned.delete(family);
-
-    const results = await Promise.allSettled(loadable.map(a => loadFont(a.path)));
-    const failed = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
-    registered += results.length - failed.length;
-    if (failed.length > 0) {
-      console.warn(
-        `[FontLoader] ${failed.length}/${results.length} variants of "${family}" failed to load — ` +
-          failed.map(f => (f.reason instanceof Error ? f.reason.message : String(f.reason))).join('; '),
-      );
-    }
+    return 0;
   }
-  return registered;
+
+  // It resolves now → forget the warning, so a genuine LATER break (an asset deleted
+  // mid-session in the editor) warns again instead of being silenced for the session.
+  // Same shape as fontAtlasLoader's `unknownSeen.delete`.
+  familyWarned.delete(family);
+
+  const results = await Promise.allSettled(loadable.map(a => loadFont(a.path)));
+  const failed = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+  if (failed.length > 0) {
+    console.warn(
+      `[FontLoader] ${failed.length}/${results.length} variants of "${family}" failed to load — ` +
+        failed.map(f => (f.reason instanceof Error ? f.reason.message : String(f.reason))).join('; '),
+    );
+  }
+  return results.length - failed.length;
 }
 
 /** Get list of unique loaded font family names (for Inspector dropdowns). */

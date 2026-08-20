@@ -268,7 +268,13 @@ This is also why the repo once had a catalog attached while the phone was on the
   uninstalling destroys the on-device ledger, which is usually the state under test. A `versionCode`
   bump is still required for every Play upload.
 - A **duplicate `versionCode` is rejected silently** — the bundle simply does not attach, and the
-  release then reports three errors that never mention versions. Tracked as #199.
+  release then reports three errors that never mention versions. **Fixed by #199**: the number is
+  now `app.buildNumber` in `project.config.json`, healed into `versionCode` +
+  `CURRENT_PROJECT_VERSION` and never lowered. See
+  [Build](./build.md) § "The app version + build number".
+- ⚠️ **A native change that is not bumped never reaches the device.** The single-`BillingClient` fix
+  sat in the tree while the phone kept running the previous build, and the symptom — "it's not
+  fixed" — was simply true. Bump in the SAME change as the native edit.
 - Google **auto-refunds and revokes** a purchase that is not acknowledged within three days. So
   `acknowledge()` runs *before* the durable write: it is non-destructive, does not stop
   `unfinished()` re-reporting the purchase, and protects the player even when everything after it

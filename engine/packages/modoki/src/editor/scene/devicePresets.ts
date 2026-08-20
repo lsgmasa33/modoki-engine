@@ -31,12 +31,15 @@
  *     gets MORE top inset than these numbers on a non-notched device. Not modelled yet;
  *     every project that has hit this so far hides it.
  *
- *  ⚠️ **Only measured values are trustworthy, and almost none of these are measured.**
+ *  ⚠️ **Only measured values are trustworthy, and the two that ARE measured both overturned the
+ *  guess they replaced** — in opposite directions, which is the argument for measuring rather than
+ *  reasoning: the iPhone Air was seeded at 62 and reads **68** (a value in no published table),
+ *  and Android was seeded at 24/24 and reads **0** (the window is inset by the system, so CSS
+ *  never sees the cutout). A guess here is not "roughly right"; it is unbounded in either
+ *  direction.
  *  Apple's are from the published per-model table (useyourloaf, cross-checked against the
- *  logical sizes already in this file — they agree). Android's are the COMMON CASE
- *  (punch-hole cutout + gesture navigation), not per-device truth: real Android insets
- *  move with the OEM, the Android version and whether the user runs gesture or 3-button
- *  navigation. A wrong number here mis-authors a layout in a way that looks perfect in
+ *  logical sizes already in this file — they agree), except the iPhone Air, which is measured.
+ *  Android's come from two measured handsets that agree within 1dp — see `androidPhone`. A wrong number here mis-authors a layout in a way that looks perfect in
  *  the editor, so treat this table as data to be CORRECTED as devices get tested — there
  *  is an iPhone Air, a Galaxy S22 and a Galaxy A23 attached to this machine, and each one
  *  that gets measured should replace its guess and lose its `UNVERIFIED` marker.
@@ -49,13 +52,15 @@
 export type DeviceCategory = 'General' | 'Apple' | 'Samsung' | 'Google' | 'Android' | 'Aspect';
 
 /** Safe-area insets in LOGICAL points, one edge each — the same quartet
- *  `env(safe-area-inset-*)` exposes to CSS. */
-export interface SafeAreaInsets {
-  top: number;
-  right: number;
-  bottom: number;
-  left: number;
-}
+ *  `env(safe-area-inset-*)` exposes to CSS.
+ *
+ *  Re-exported rather than re-declared: `runtime/ui/anchorLayout` already owns this shape (the
+ *  pixel path takes one), and a second identically-shaped type here would be a third name for one
+ *  quartet — with `runtime/ui/safeArea.SafeAreaInsets`, which is the MEASURED value and carries
+ *  percentages too, that is exactly the same-name-different-shape hazard the layering rules exist
+ *  to avoid. One definition, imported by both. */
+import type { SafeAreaPx } from '../../runtime/ui/anchorLayout';
+export type { SafeAreaPx };
 
 /** A preset's insets for both orientations. Landscape is NOT a rotation of portrait and
  *  must be authored separately: an iPhone in portrait is inset at the TOP by the notch
@@ -64,13 +69,13 @@ export interface SafeAreaInsets {
  *  sides). Deriving one from the other by swapping w/h, the way `resolveLogicalSize`
  *  legitimately does for the screen box, produces a top inset that does not exist. */
 export interface SafeAreaSet {
-  portrait: SafeAreaInsets;
-  landscape: SafeAreaInsets;
+  portrait: SafeAreaPx;
+  landscape: SafeAreaPx;
 }
 
 /** No insets at all — a device with no notch and no home indicator (and the shape every
  *  abstract/Free preset takes). Frozen because it is shared by reference across presets. */
-export const NO_INSETS: SafeAreaInsets = Object.freeze({ top: 0, right: 0, bottom: 0, left: 0 });
+export const NO_INSETS: SafeAreaPx = Object.freeze({ top: 0, right: 0, bottom: 0, left: 0 });
 export const NO_SAFE_AREA: SafeAreaSet = Object.freeze({ portrait: NO_INSETS, landscape: NO_INSETS });
 
 /** Every home-indicator iPhone follows ONE pattern, so it is written once here rather
@@ -85,14 +90,31 @@ const notchedIPhone = (topPt: number): SafeAreaSet => ({
   landscape: { top: 0, right: topPt, bottom: 21, left: topPt },
 });
 
-/** The common-case Android phone: a punch-hole cutout under the status bar and a gesture
- *  navigation pill. Both are ~24dp. Landscape keeps the pill at the bottom (it rotates
- *  with the system) and, like iOS, treats the cutout symmetrically because the rotation
- *  direction is unknown. ⚠️ 3-button navigation makes the bottom inset ~48dp instead —
- *  a user setting, not a device fact, so it is deliberately not modelled. */
+/** An Android phone under Capacitor, bars hidden: the **display cutout on top, nothing else**.
+ *
+ *  ⭐ MEASURED on two devices, 2026-08-20, over each WebView's own devtools socket:
+ *    Galaxy A23 (Android 13, 52px cutout @ dpr 1.875 = 27.7dp) -> `env()` top **28**, bottom 0
+ *    Galaxy S22 (Android 14, 81px cutout @ dpr 3    = 27.0dp) -> `env()` top **27**, bottom 0
+ *  Two different OEMs, densities and Android versions landing within 1dp, which is what makes a
+ *  shared 28 defensible rather than one phone generalised.
+ *
+ *  **Bottom is 0 because both system bars are HIDDEN** (`capacitor.statusBarHidden`, which on
+ *  Android hides the navigation bar too). A project that shows them would see a bottom inset and
+ *  must re-measure.
+ *
+ *  ⚠️ **This row was WRONG TWICE, in both directions, and the reason is worth keeping.** It was
+ *  seeded at 24/24 by inference. It was then "corrected" to ZERO from a real measurement — which
+ *  was a real measurement of a BROKEN WINDOW: the generated `MainActivity` set
+ *  `setDecorFitsSystemWindows(false)` but never `layoutInDisplayCutoutMode`, so the window was
+ *  laid out BENEATH the cutout and CSS had no inset to report. The black band the owner saw on
+ *  that A23 was the same defect. Measuring a bug and generalising it as a platform fact is the
+ *  trap here: the question to ask of a zero is always "is this device insetless, or is my window
+ *  not reaching the edge?" */
 const androidPhone = (): SafeAreaSet => ({
-  portrait: { top: 24, right: 0, bottom: 24, left: 0 },
-  landscape: { top: 0, right: 24, bottom: 24, left: 24 },
+  portrait: { top: 28, right: 0, bottom: 0, left: 0 },
+  // Rotated, the cutout moves to a side. Both bars stay hidden, so still nothing at top/bottom.
+  // INFERRED, not measured: Court is portrait-locked, so nothing here could rotate to check it.
+  landscape: { top: 0, right: 28, bottom: 0, left: 28 },
 });
 
 /** A Face ID iPad: no notch, so NO top inset with the status bar hidden — only the 20pt
@@ -134,18 +156,18 @@ export const DEVICE_PRESETS: DevicePreset[] = [
   { name: 'iPad Pro 12.9"',     category: 'Apple', logicalW: 1024, logicalH: 1366, physicalW: 2048, physicalH: 2732, safeArea: faceIdIPad() }, // @2
 
   // ── Samsung ──
-  { name: 'Galaxy S22',              category: 'Samsung', logicalW: 360, logicalH: 780,  physicalW: 1080, physicalH: 2340, safeArea: androidPhone() }, // @3 — ⚠️ UNVERIFIED, and this device is attached (see the header)
-  { name: 'Galaxy S24',              category: 'Samsung', logicalW: 360, logicalH: 780,  physicalW: 1080, physicalH: 2340, safeArea: androidPhone() }, // @3 — ⚠️ UNVERIFIED
-  { name: 'Galaxy Z Fold7 (Folded)', category: 'Samsung', logicalW: 360, logicalH: 840,  physicalW: 1080, physicalH: 2520, safeArea: androidPhone() }, // cover, @3 — ⚠️ UNVERIFIED
-  { name: 'Galaxy Z Fold7 (Open)',   category: 'Samsung', logicalW: 656, logicalH: 728,  physicalW: 1968, physicalH: 2184, safeArea: androidPhone() }, // main, @3 (near-square) — ⚠️ UNVERIFIED
+  { name: 'Galaxy S22',              category: 'Samsung', logicalW: 360, logicalH: 780,  physicalW: 1080, physicalH: 2340, safeArea: androidPhone() }, // @3
+  { name: 'Galaxy S24',              category: 'Samsung', logicalW: 360, logicalH: 780,  physicalW: 1080, physicalH: 2340, safeArea: androidPhone() }, // @3
+  { name: 'Galaxy Z Fold7 (Folded)', category: 'Samsung', logicalW: 360, logicalH: 840,  physicalW: 1080, physicalH: 2520, safeArea: androidPhone() }, // cover, @3
+  { name: 'Galaxy Z Fold7 (Open)',   category: 'Samsung', logicalW: 656, logicalH: 728,  physicalW: 1968, physicalH: 2184, safeArea: androidPhone() }, // main, @3 (near-square)
 
   // ── Google ──
-  { name: 'Pixel 9',      category: 'Google', logicalW: 412, logicalH: 924, physicalW: 1080, physicalH: 2424, safeArea: androidPhone() }, // ~@2.62 — ⚠️ UNVERIFIED
+  { name: 'Pixel 9',      category: 'Google', logicalW: 412, logicalH: 924, physicalW: 1080, physicalH: 2424, safeArea: androidPhone() }, // ~@2.62
 
   // ── Other Android ──
-  { name: 'Xiaomi 14',         category: 'Android', logicalW: 400, logicalH: 890, physicalW: 1200, physicalH: 2670, safeArea: androidPhone() }, // @3 — ⚠️ UNVERIFIED
-  { name: 'Huawei Mate 60 Pro', category: 'Android', logicalW: 420, logicalH: 907, physicalW: 1260, physicalH: 2720, safeArea: androidPhone() }, // @3 — ⚠️ UNVERIFIED
-  { name: 'Motorola Edge 50',  category: 'Android', logicalW: 360, logicalH: 800, physicalW: 1080, physicalH: 2400, safeArea: androidPhone() }, // @3 — ⚠️ UNVERIFIED
+  { name: 'Xiaomi 14',         category: 'Android', logicalW: 400, logicalH: 890, physicalW: 1200, physicalH: 2670, safeArea: androidPhone() }, // @3
+  { name: 'Huawei Mate 60 Pro', category: 'Android', logicalW: 420, logicalH: 907, physicalW: 1260, physicalH: 2720, safeArea: androidPhone() }, // @3
+  { name: 'Motorola Edge 50',  category: 'Android', logicalW: 360, logicalH: 800, physicalW: 1080, physicalH: 2400, safeArea: androidPhone() }, // @3
 
   // ── Abstract aspect-ratio presets — logical == physical (DPR 1), no device chrome ──
   { name: '16:9 (720p)',  category: 'Aspect', logicalW: 1280, logicalH: 720,  physicalW: 1280, physicalH: 720,  safeArea: NO_SAFE_AREA },
@@ -176,7 +198,7 @@ export function resolvePhysicalSize(p: DevicePreset, orientation: Orientation): 
 /** Effective safe-area insets for a preset under an orientation. Unlike the size
  *  resolvers this is a LOOKUP, not a swap — see `SafeAreaSet` for why rotating the
  *  portrait quartet would invent a top inset the device does not have. */
-export function resolveSafeArea(p: DevicePreset, orientation: Orientation): SafeAreaInsets {
+export function resolveSafeArea(p: DevicePreset, orientation: Orientation): SafeAreaPx {
   return orientation === 'portrait' ? p.safeArea.portrait : p.safeArea.landscape;
 }
 
@@ -186,7 +208,7 @@ export function resolveSafeArea(p: DevicePreset, orientation: Orientation): Safe
  *  zero) desktop `env()` for everything inside the container, and NOT setting them —
  *  which is what every shipped build does — falls through to the device's real values.
  *  That fallback is the whole design: there is no editor branch in the runtime. */
-export function safeAreaCssVars(insets: SafeAreaInsets): Record<string, string> {
+export function safeAreaCssVars(insets: SafeAreaPx): Record<string, string> {
   return {
     '--ui-sa-top': `${insets.top}px`,
     '--ui-sa-right': `${insets.right}px`,

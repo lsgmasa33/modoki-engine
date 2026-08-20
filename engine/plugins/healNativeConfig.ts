@@ -1139,12 +1139,186 @@ function healAndroidMinSdk(projectRoot: string, minSdk: number): string | undefi
   return `synced Android minSdkVersion = ${minSdk} (from build.androidMinSdk)`;
 }
 
+/** A marketing version is free-form but must not be junk we paste into a gradle string or a
+ *  pbxproj literal. Dotted digits only — what both stores accept and what every scaffold writes. */
+function isMarketingVersion(v: unknown): v is string {
+  return typeof v === 'string' && /^\d+(\.\d+)*$/.test(v) && v.length <= 32;
+}
+
+/** A build number is the monotonic integer both stores dedupe by. */
+function isBuildNumber(n: unknown): n is number {
+  return Number.isInteger(n) && (n as number) > 0 && (n as number) < 2_100_000_000;
+}
+
+/** What a native file currently says about its build number — the input to the never-lower
+ *  decision below. Three cases, and the third is the one that matters: a value we cannot ORDER
+ *  against is not the same as no value, and treating it as "no value" would let the write proceed
+ *  unguarded. */
+type ExistingBuild =
+  | { kind: 'none' }                       // the key is not in this file — nothing to protect
+  | { kind: 'ok'; max: number }            // every occurrence is a plain integer
+  | { kind: 'unreadable'; why: string };   // present, but not comparable
+
+/** Read the build number a native file currently carries.
+ *
+ *  Returns the MAX of the occurrences, not the first: a pbxproj carries the key once per build
+ *  configuration and a gradle file could carry it per flavour, so "what is this project at" is the
+ *  highest of them — reading the first would let a Debug-only 1 authorise lowering a Release 11.
+ *
+ *  ⚠️ **`unreadable` is load-bearing, not defensive tidiness.** Two shapes reach it, and both
+ *  silently defeated the never-lower guard before it existed:
+ *   - a **dotted** value. `CURRENT_PROJECT_VERSION = 1.2;` is legal (Apple compares CFBundleVersion
+ *     component-wise, so 1.2 > 1), but it is not an integer to compare. Skipping it left `current`
+ *     null, the guard's `current !== null` false, and the write LOWERED 1.2 to 1 — the exact
+ *     rejection this whole heal exists to prevent, produced by the code preventing it.
+ *   - a value the regex cannot see at all, which is how this breaks NEXT: AGP 8 writes
+ *     `versionCode = 1`, and these very build.gradle files already mix that assignment syntax
+ *     (`namespace = `, `compileSdk = `). The patterns below accept both forms now, but the point
+ *     of this branch is that a THIRD form arriving later is reported rather than silently
+ *     unmanaged. */
+function readExistingBuild(text: string, re: RegExp, key: string): ExistingBuild {
+  let best: number | null = null;
+  let dotted = false;
+  let found = false;
+  for (const m of text.matchAll(re)) {
+    found = true;
+    const raw = m[m.length - 1];
+    if (!/^\d+$/.test(raw)) { dotted = true; continue; }
+    const n = parseInt(raw, 10);
+    if (best === null || n > best) best = n;
+  }
+  if (dotted) {
+    return { kind: 'unreadable', why: `${key} is not a plain integer here, so it cannot be ordered against` };
+  }
+  if (!found) {
+    // The key is in the file but in a shape the pattern does not match (a variable reference, or a
+    // syntax we have not met). Saying so beats writing nothing and reporting nothing.
+    return text.includes(key)
+      ? { kind: 'unreadable', why: `${key} is present but not in a form this heal can read` }
+      : { kind: 'none' };
+  }
+  return { kind: 'ok', max: best! };
+}
+
+/** The never-lower decision, shared so both platforms cannot drift apart. Returns whether to write
+ *  and, when not, the note explaining it — a refusal the owner never sees is a refusal that reads
+ *  as "the number I typed is the number that ships". */
+function decideBuildWrite(
+  existing: ExistingBuild,
+  buildNumber: number,
+  label: string,
+  store: string,
+): { write: boolean; note?: string } {
+  if (existing.kind === 'unreadable') {
+    return { write: false, note: `left ${label} alone: ${existing.why}. Set it by hand, or normalise it to a plain integer so app.buildNumber can manage it.` };
+  }
+  if (existing.kind === 'ok' && existing.max > buildNumber) {
+    return {
+      write: false,
+      note:
+        `REFUSED to lower ${label} ${existing.max} -> ${buildNumber}: ${store} rejects a build ` +
+        `number it has already seen, and does it silently. Raise app.buildNumber to at least ` +
+        `${existing.max + 1} before the next upload.`,
+    };
+  }
+  return { write: true };
+}
+
+/** Sync the Android marketing version + build number from `app.version` / `app.buildNumber`.
+ *
+ *  ⚠️ **`versionCode` is never LOWERED.** Play refuses a `versionCode` it has already seen and
+ *  does so SILENTLY — the bundle never attaches and the release page reports three errors that
+ *  all mean "this release is empty", none of which mention versions (#199). So a config value
+ *  BELOW what the project already carries is the single most expensive thing this heal could
+ *  write, and it is exactly what a stale config, a fresh clone, or a forgotten bump produces.
+ *  The refusal is reported rather than swallowed: the owner has to see that the number they
+ *  edited is not the number that will ship.
+ *
+ *  `versionName` has no such rule — it is a display string with no ordering requirement, so it
+ *  is synced in both directions.
+ *
+ *  Rewrites EVERY occurrence, mirroring healAndroidMinSdk/healIosDeploymentTarget: a flavoured
+ *  gradle file can carry the keys more than once and healing only the first leaves the shipping
+ *  variant behind. */
+function healAndroidVersion(projectRoot: string, version: unknown, buildNumber: unknown): string | undefined {
+  const gradle = path.join(projectRoot, 'android', 'app', 'build.gradle');
+  if (!fs.existsSync(gradle)) return undefined;
+  const orig = fs.readFileSync(gradle, 'utf8');
+  let text = orig;
+  const notes: string[] = [];
+
+  // Both the Groovy (`versionCode 1`) and the AGP-8 assignment (`versionCode = 1`) forms, with the
+  // file's OWN separator preserved on write — these build.gradle files already mix the two
+  // (`namespace = `, `compileSdk = `), so normalising one to the other would be a gratuitous diff.
+  if (isMarketingVersion(version)) {
+    text = text.replace(/(versionName)(\s*=\s*|\s+)"[^"]*"/g, (_m, k: string, sep: string) => `${k}${sep}"${version}"`);
+  }
+
+  if (isBuildNumber(buildNumber)) {
+    const decision = decideBuildWrite(
+      readExistingBuild(text, /versionCode(?:\s*=\s*|\s+)([0-9.]+)/g, 'versionCode'),
+      buildNumber, 'Android versionCode', 'Play',
+    );
+    if (decision.note) notes.push(decision.note);
+    if (decision.write) {
+      text = text.replace(/(versionCode)(\s*=\s*|\s+)[0-9.]+/g, (_m, k: string, sep: string) => `${k}${sep}${buildNumber}`);
+    }
+  }
+
+  if (text !== orig) {
+    fs.writeFileSync(gradle, text);
+    notes.unshift(`synced Android versionName/versionCode (from app.version/app.buildNumber)`);
+  }
+  return notes.length > 0 ? notes.join(' — ') : undefined;
+}
+
+/** The iOS half — `MARKETING_VERSION` (read by Info.plist as `CFBundleShortVersionString` through
+ *  `$(MARKETING_VERSION)`) and `CURRENT_PROJECT_VERSION` (`CFBundleVersion`). Same never-lower
+ *  rule as {@link healAndroidVersion}: App Store Connect refuses a duplicate `CFBundleVersion`
+ *  with an equally indirect message.
+ *
+ *  ⚠️ The two platforms' counters drift APART in practice — `games/iap-test` measured Android 11
+ *  against iOS 5 (2026-08-20), because each store counts its own uploads. One `app.buildNumber`
+ *  still serves both: the stores only require the number to RISE, so the lagging platform takes a
+ *  one-time jump to catch up and both stay valid from then on. That jump is why the never-lower
+ *  guard is per-platform rather than computed once. */
+function healIosVersion(projectRoot: string, version: unknown, buildNumber: unknown): string | undefined {
+  const pbx = path.join(projectRoot, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+  if (!fs.existsSync(pbx)) return undefined;
+  const orig = fs.readFileSync(pbx, 'utf8');
+  let text = orig;
+  const notes: string[] = [];
+
+  if (isMarketingVersion(version)) {
+    text = text.replace(/MARKETING_VERSION = [0-9.]+;/g, `MARKETING_VERSION = ${version};`);
+  }
+
+  if (isBuildNumber(buildNumber)) {
+    const decision = decideBuildWrite(
+      readExistingBuild(text, /CURRENT_PROJECT_VERSION = ([0-9.]+);/g, 'CURRENT_PROJECT_VERSION'),
+      buildNumber, 'iOS CURRENT_PROJECT_VERSION', 'App Store Connect',
+    );
+    if (decision.note) notes.push(decision.note);
+    if (decision.write) {
+      text = text.replace(/CURRENT_PROJECT_VERSION = [0-9.]+;/g, `CURRENT_PROJECT_VERSION = ${buildNumber};`);
+    }
+  }
+
+  if (text !== orig) {
+    fs.writeFileSync(pbx, text);
+    notes.unshift(`synced iOS MARKETING_VERSION/CURRENT_PROJECT_VERSION (from app.version/app.buildNumber)`);
+  }
+  return notes.length > 0 ? notes.join(' — ') : undefined;
+}
+
 /** The generated immersive-mode block in MainActivity.java. Fenced by marker comments so the
  *  heal can find, replace, or remove exactly its own code and never touch a hand edit. */
 const IMMERSIVE_BEGIN = '    // modoki:immersive-begin — generated from project.config.json (capacitor.statusBarHidden)';
 const IMMERSIVE_END = '    // modoki:immersive-end';
 const IMMERSIVE_IMPORTS = [
+  'import android.os.Build;',
   'import android.os.Bundle;',
+  'import android.view.WindowManager;',
   'import androidx.core.view.WindowCompat;',
   'import androidx.core.view.WindowInsetsCompat;',
   'import androidx.core.view.WindowInsetsControllerCompat;',
@@ -1166,6 +1340,18 @@ const IMMERSIVE_BODY = [
   '    }',
   '',
   '    private void applyImmersiveMode() {',
+  '        // Lay the window out INTO the display cutout. `setDecorFitsSystemWindows(false)`',
+  '        // below only opts out of fitting the system BARS — without this the window is',
+  '        // still placed beneath the cutout, and because the bars are hidden nothing draws',
+  '        // there: the window background shows through as a black band (measured 59px on a',
+  '        // Galaxy A23). It is also what makes `env(safe-area-inset-*)` report anything at',
+  '        // all — a window that never reaches the cutout has no inset to tell CSS about.',
+  '        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {',
+  '            WindowManager.LayoutParams lp = getWindow().getAttributes();',
+  '            lp.layoutInDisplayCutoutMode =',
+  '                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;',
+  '            getWindow().setAttributes(lp);',
+  '        }',
   '        WindowCompat.setDecorFitsSystemWindows(getWindow(), false);',
   '        WindowInsetsControllerCompat c =',
   '            WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());',
@@ -1270,6 +1456,13 @@ export function healNativeConfig(projectRoot: string): HealResult {
     if (sp) notes.push(sp);
     const ams = healAndroidMinSdk(projectRoot, cfg.build.androidMinSdk);
     if (ams) notes.push(ams);
+    // App version + build number → both platforms' native version fields (#199). Nothing
+    // managed these before, so every project shipped the scaffolder's hardcoded 1 — and a
+    // duplicate build number is refused SILENTLY by both stores.
+    const av = healAndroidVersion(projectRoot, cfg.app.version, cfg.app.buildNumber);
+    if (av) notes.push(av);
+    const iv = healIosVersion(projectRoot, cfg.app.version, cfg.app.buildNumber);
+    if (iv) notes.push(iv);
     // Orientation + status bar → native Info.plist / AndroidManifest.
     const io = healIosOrientationStatusBar(projectRoot, cfg.capacitor);
     if (io) notes.push(io);

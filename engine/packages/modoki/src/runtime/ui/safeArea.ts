@@ -26,6 +26,8 @@
  *  device with no notch reports — and it degrades to the pre-safe-area behaviour rather
  *  than to something arbitrary. */
 
+import { rawNow } from '../core/clock';
+
 export interface SafeAreaInsets {
   /** Logical px. */
   top: number;
@@ -54,11 +56,32 @@ const ZERO: SafeAreaInsets = {
 };
 
 let insets: SafeAreaInsets = { ...ZERO };
+/** The UI root to re-measure from, remembered so a READ can refresh itself. */
+let root: HTMLElement | null = null;
+let lastMeasuredAt = -Infinity;
 
-/** Read the current insets. Cheap — returns the value cached at the last measure, which
- *  the UI root refreshes on mount and on every resize (an orientation change and an
- *  editor device-preset change are both resizes). Safe to call every frame. */
+/** How stale a cached inset may get, ms. Small enough that a bar hiding is invisible to
+ *  the eye, large enough that a per-frame caller pays one forced style read every ~15
+ *  frames instead of 60. */
+const REFRESH_MS = 250;
+
+/** Read the current insets, re-measuring if the cache has gone stale.
+ *
+ *  ⚠️ **The refresh is not belt-and-braces — a resize alone MISSES the common Android
+ *  case, and this cost a real bug.** With `setDecorFitsSystemWindows(false)` the window
+ *  keeps its size when the system bars hide, so ONLY the insets change and no
+ *  ResizeObserver fires. Court's immersive mode hides the bars a beat after first paint,
+ *  so the value captured at mount (bottom 48px, the nav bar) never refreshed: measured on
+ *  a Galaxy A23 where the live inset was 0 while the game was still laying out against
+ *  48. It lifted the ad band off the bottom edge AND shortened the paper (the same number
+ *  feeds `designToHostPct`'s vertical span), which read as two unrelated bugs.
+ *
+ *  There is no event to listen for — `env()` changing fires nothing — so the read
+ *  refreshes itself on a throttle rather than waiting to be told. `rawNow` is the
+ *  sanctioned clock wrapper (`runtime/core/clock.ts`), so a manual clock in a headless
+ *  test still controls it and the determinism guard stays satisfied. */
 export function getSafeAreaInsets(): SafeAreaInsets {
+  if (root && rawNow() - lastMeasuredAt > REFRESH_MS) measureSafeAreaInsets(root);
   return insets;
 }
 
@@ -70,8 +93,10 @@ export function getSafeAreaInsets(): SafeAreaInsets {
  *  or, on device, nothing at all — the var is unset and only the `env()` fallback
  *  applies), and only laying it out as a real length makes the browser resolve the
  *  fallback chain. `padding` also clamps negatives to 0 for free. */
-export function measureSafeAreaInsets(root: HTMLElement | null): void {
-  if (!root || typeof getComputedStyle !== 'function') { insets = { ...ZERO }; return; }
+export function measureSafeAreaInsets(el: HTMLElement | null): void {
+  root = el;
+  lastMeasuredAt = rawNow();
+  if (!el || typeof getComputedStyle !== 'function') { insets = { ...ZERO }; return; }
   const probe = document.createElement('div');
   // `position: fixed` + zero size keeps the probe out of flow entirely, so it cannot
   // affect the layout it is measuring. `visibility: hidden` (not `display: none`) is
@@ -81,7 +106,7 @@ export function measureSafeAreaInsets(root: HTMLElement | null): void {
     + 'padding-right:var(--ui-sa-right, env(safe-area-inset-right));'
     + 'padding-bottom:var(--ui-sa-bottom, env(safe-area-inset-bottom));'
     + 'padding-left:var(--ui-sa-left, env(safe-area-inset-left));';
-  root.appendChild(probe);
+  el.appendChild(probe);
   try {
     const cs = getComputedStyle(probe);
     /** One edge: the simulated var if one is set, else the resolved padding, else 0.
@@ -112,8 +137,8 @@ export function measureSafeAreaInsets(root: HTMLElement | null): void {
     // `clientWidth`/`clientHeight` are the LAYOUT box — pre-transform, so this is the logical
     // device size in an editor device preview and the viewport on hardware. Same space as the
     // px insets above, which is the whole point (see the doc on the *Pct fields).
-    const w = root.clientWidth || 0;
-    const h = root.clientHeight || 0;
+    const w = el.clientWidth || 0;
+    const h = el.clientHeight || 0;
     const pct = (v: number, total: number) => (total > 0 ? (v / total) * 100 : 0);
     insets = {
       top, right, bottom, left,
@@ -131,4 +156,6 @@ export function measureSafeAreaInsets(root: HTMLElement | null): void {
  *  measurement (the cache is module state, and test files share a module registry). */
 export function resetSafeAreaInsets(): void {
   insets = { ...ZERO };
+  root = null;
+  lastMeasuredAt = -Infinity;
 }

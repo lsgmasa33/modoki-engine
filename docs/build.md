@@ -955,6 +955,61 @@ family→asset match (`loadFontFamily`) deliberately uses the SAME `parseFontFil
 rule as `resolveFontsByFamily` here; if they ever diverge, a font works in the editor and is
 absent from the shipped game.
 
+## The app version + build number (`app.version` / `app.buildNumber`)
+
+Two committed fields, synced into both platforms by `healNativeConfig` on project open and before
+every native build — the same shape as the platform floors below:
+
+| field | Android | iOS |
+|---|---|---|
+| `app.version` (marketing string, e.g. `"1.0"`) | `versionName` | `MARKETING_VERSION` → `CFBundleShortVersionString` |
+| `app.buildNumber` (monotonic integer) | `versionCode` | `CURRENT_PROJECT_VERSION` → `CFBundleVersion` |
+
+⚠️ **This exists because a duplicate build number is refused SILENTLY.** Play does not say "that
+`versionCode` is taken" — the bundle never attaches, and the release page then reports three errors
+that all mean *"this release is empty"* and none of which mention versions. It reads as a broken
+upload rather than a refused one, so the first instinct is to re-upload, re-export, or re-check
+signing. App Store Connect behaves the same way for a duplicate `CFBundleVersion`, with a different
+but equally indirect message. Before #199 nothing in the engine managed either number, so every
+project shipped the scaffolder's hardcoded `1` — which only mattered once a project published, and
+then cost a diagnosis cycle.
+
+**The heal never LOWERS a build number.** Lowering is the one direction that is always a mistake,
+and it is exactly what a stale config, a fresh clone, or a forgotten bump would produce on a project
+that has already uploaded. A would-be lowering is reported instead — naming the current value and
+the smallest number that would work — rather than silently written.
+
+⚠️ **A value the heal cannot READ is refused, not treated as absent** — that distinction is what
+makes the never-lower rule hold, and getting it wrong defeated the rule in the version that first
+shipped it. Two shapes reach it:
+
+- **A dotted build number.** `CURRENT_PROJECT_VERSION = 1.2;` is legal — Apple compares
+  `CFBundleVersion` component-wise, so `1.2` > `1` — but it is not an integer to order against.
+  Skipping it read as "no existing value", which let the write lower `1.2` to `1`: the exact silent
+  rejection this heal exists to prevent, produced by the code preventing it. Normalise such a value
+  to a plain integer if you want `app.buildNumber` to manage it.
+- **A form the pattern cannot see.** Both the Groovy `versionCode 1` and the AGP-8
+  `versionCode = 1` are handled (the file's own separator is preserved, since these `build.gradle`
+  files already mix the two — `namespace = `, `compileSdk = `). A *third* form — a variable
+  reference, a syntax a later template introduces — is reported rather than silently unmanaged,
+  which is the failure mode that would quietly reintroduce #199.
+
+⚠️ **The two platforms' counters DRIFT APART**, because each store counts its own uploads:
+`games/iap-test` measured Android 11 against iOS 5 (2026-08-20). One `app.buildNumber` still serves
+both — the stores only require the number to RISE, so the lagging platform takes a one-time jump and
+both stay valid from then on. That is why the never-lower guard compares per platform rather than
+once, and why it reads the **highest** of a file's occurrences: a pbxproj carries the key per build
+configuration, and a Debug left at 1 must not authorise lowering a Release at 11.
+
+**Auto-increment is deliberately not offered.** A build number that changes itself makes builds
+non-reproducible and churns a committed file on every build (the write-behind-your-back hazard in
+CLAUDE.md). The owner bumps it, in the same change as the native edit it ships — a native change
+that is not bumped never reaches the device.
+
+The defaults (`"1.0"` / `1`) are exactly what `cap add` scaffolds, so adopting these fields rewrote
+nothing: running the heal across all 20 projects touched **one file**, `games/iap-test`'s pbxproj,
+raising the lagging iOS counter to its Android value.
+
 ## The shipped platform floors (`build.iosMinVersion` / `build.androidMinSdk`)
 
 **Never let the bundler pick this.** Vite 8's default `build.target` is

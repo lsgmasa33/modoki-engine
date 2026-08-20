@@ -439,6 +439,9 @@ describe('fontLoader', () => {
       expect(msgs.length, 'warn-once, not once per UI string').toBe(1);
       expect(msgs[0]).toContain('matches no font asset');
       expect(msgs[0]).toContain('VarelaRound-Regular.ttf');
+      // The build's font scan uses the same exact-case rule, so a case slip drops the font from
+      // the shipped game too — the message has to say so or it reads as editor-only.
+      expect(msgs[0]).toMatch(/CASE|exact/);
       expect(Object.keys(loadCalls).length).toBe(0);
       warn.mockRestore();
     });
