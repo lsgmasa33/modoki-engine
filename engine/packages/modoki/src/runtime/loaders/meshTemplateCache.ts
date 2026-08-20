@@ -27,6 +27,7 @@ import { clearSpriteAnimCache } from './spriteAnimCache';
 import { releaseRiggedModelsForScene, disposeAllRiggedModels, getRiggedOwnerCounts } from './riggedModelCache';
 import { releaseAudioForScene, disposeAllAudioBuffers } from './audioBufferCache';
 import { releaseFontsForScene, disposeAllFonts } from './fontAtlasLoader';
+import { disposeAllFontFaces } from './fontLoader';
 
 // Ensure built-in material presets (pbr/unlit/custom) are registered regardless
 // of how this module is imported (production main bundle, tests with reset
@@ -1238,6 +1239,11 @@ export function disposeAllCachedResources() {
 
   // SDF font atlases (parallel cache) — drop this session's fonts on teardown.
   disposeAllFonts();
+
+  // Browser `FontFace` registrations (the DOM/CSS half — parallel cache, no GPU
+  // resources). Removed from `document.fonts` too: a face the browser still holds
+  // after its registry is cleared can never be removed afterwards (#276).
+  disposeAllFontFaces();
 
   // Drop any editor import parse offered but never consumed (F4) — bounds the leak
   // of an un-taken handoff to a full teardown.

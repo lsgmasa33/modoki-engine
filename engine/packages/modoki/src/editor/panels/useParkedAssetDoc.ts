@@ -76,7 +76,22 @@ export function useParkedAssetDoc<T>(
     // write as `'panel'`, which sends `replace:true` at flush and DELETES top-level fields the
     // drop-key guard exists to refuse. The same call would then be guarded or not depending on
     // whether a panel happened to be open on that asset.
-    if (peekDirtyAsset(path)?.data === value) { parkedRef.current = value; return; }
+    const alreadyParked = peekDirtyAsset(path);
+    if (alreadyParked?.data === value) {
+      // ⚠️ ADOPT ONLY OUR OWN PARK. `parkedRef` means "the doc THIS PANEL parked", and it is what
+      // the reconciliation branch above discards by identity — so adopting an AGENT's object here
+      // handed that branch someone else's write to throw away. Bug `EhE6JQkHRYttDGeGmtPK` (p0):
+      // an agent parked a clip edit while the panel was open, the human re-opened the clip, and
+      // the write was dropped while the panel went on showing it with a `Saved ✓` badge and disk
+      // kept the old document. Nothing errored; the edit died at the next reload.
+      //
+      // Re-opening is what fires it: that path NORMALIZES the parked doc into a fresh object and
+      // seeds it as the baseline, so `value === savedRef.current` on the following run and the
+      // discard branch matches. Re-rendering with the SAME object does not re-run this effect at
+      // all, which is why the obvious repro passes and the real one does not.
+      parkedRef.current = alreadyParked.origin === 'panel' ? value : null;
+      return;
+    }
     parkedRef.current = value;
     markAssetDirty(path, type, value, 'panel');
   }, [value, path, type]);

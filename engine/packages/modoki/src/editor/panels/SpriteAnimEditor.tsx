@@ -14,7 +14,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { backendFetch } from '../backend/editorBackend';
 import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath } from '../../runtime/loaders/assetManifest';
 import { spriteThumbStyle } from './SpritePicker';
-import { pendingAssetDoc } from './pendingAssetDoc';
+import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { normalizeSpriteAnim, type SpriteAnimDef } from '../../runtime/loaders/spriteAnimCache';
 import { defaultSpriteClip, type SpriteClip } from '../../runtime/traits/SpriteAnimator';
@@ -51,7 +51,16 @@ export default function SpriteAnimEditor() {
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingSpriteAnimDef;
-    if (existing) { savedMarkRef.current?.(existing); return; } // bare re-mount — keep unsaved edits
+    if (existing) {
+      // ⚠️ "In sync" means EQUAL TO DISK, and a parked write means it is not. This branch marked
+      // `existing` as the saved baseline unconditionally, so re-entering the effect while a write
+      // was pending told the hook the pending doc was already written — and its reconciliation
+      // branch then DISCARDED the write (bug 1MCF9DFktot8hXsgBuWp). The rename path reaches the
+      // effect exactly this way: repointing changes `asset.path`, the panel is already loaded, so
+      // it returns HERE and never reaches the pendingAssetDoc branch below.
+      if (!pendingAssetDoc(asset.path, 'spriteanim')) savedMarkRef.current?.(existing);
+      return;   // either way the loaded doc stays — that is what this branch is for
+    }
     const { loadSpriteAnimDef } = useEditorStore.getState();
     // An UNSAVED write parked for this asset is not on disk yet, so fetching the file would open
     // the PRE-edit doc and re-seed the live cache with it — discarding the edit everywhere except
@@ -64,7 +73,7 @@ export default function SpriteAnimEditor() {
       const doc = normalizeSpriteAnim(parked as Parameters<typeof normalizeSpriteAnim>[0]);
       if (!doc.id) doc.id = newGuid();
       registerAsset(doc.id, asset.path, 'spriteanim');
-      savedMarkRef.current?.(doc);
+      adoptParkedDoc(asset.path, 'spriteanim', doc);
       loadSpriteAnimDef(doc);
       setActive(Object.keys(doc.clips)[0] ?? '');
       return;

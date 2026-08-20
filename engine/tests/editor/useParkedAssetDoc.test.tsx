@@ -247,3 +247,66 @@ describe('saveStatusLabel', () => {
     expect(saveStatusLabel(true)).toContain('⌘S');
   });
 });
+
+/**
+ * Bug `EhE6JQkHRYttDGeGmtPK` (p0) — re-opening a panel already bound to the asset DISCARDED an
+ * agent's parked write. The end state was the worst kind: the panel showed the edited doc, disk
+ * held the old one, the registry was empty and the badge read `Saved ✓`, so Cmd+S wrote nothing
+ * and the edit died at the next reload with no error.
+ *
+ * The hook's own comment states the invariant that was violated — "an agent's park for the same
+ * path — which we did not make and cannot judge — survives" — so this is the code disagreeing
+ * with its own documented contract, not an undocumented edge.
+ *
+ * Mechanism: an agent op applies its def through the same store action the panel reads, so the
+ * panel's `value` BECOMES the agent's object. The "already parked" branch then adopted it into
+ * `parkedRef` regardless of who parked it, and the later reconciliation branch — which discards
+ * "our" park by identity — matched and dropped somebody else's write.
+ */
+describe('an agent park is not ours to discard (EhE6JQkHRYttDGeGmtPK)', () => {
+  it('survives the panel re-opening on the doc the agent parked', () => {
+    const { rerender, result } = setup();
+
+    // The agent parks its own document for this path.
+    const agentDoc = { n: 42 };
+    act(() => { markAssetDirty(PATH, 'particle', agentDoc, 'agent'); });
+
+    // The panel's value becomes that very object — the agent op wrote through the store the
+    // panel reads. This must NOT re-park (it would relabel an agent write as 'panel').
+    rerender({ v: agentDoc });
+    expect(peekDirtyAsset(PATH)).toEqual({ type: 'particle', data: agentDoc, origin: 'agent' });
+
+    // THE GESTURE: re-opening the already-bound panel takes the pendingAssetDoc branch, which
+    // NORMALIZES the parked doc into a fresh object and seeds it as the load baseline. The new
+    // identity is what makes the effect re-run — re-rendering with the same object would not,
+    // which is why an obvious-looking repro of this bug passes.
+    const normalized = { ...agentDoc };
+    act(() => { result.current.markSaved(normalized); });
+    rerender({ v: normalized });
+
+    // The agent's write must still be pending. Before the fix the registry was empty here.
+    expect(getDirtyAssetPaths()).toEqual([PATH]);
+    expect(peekDirtyAsset(PATH)).toEqual({ type: 'particle', data: agentDoc, origin: 'agent' });
+    expect(result.current.dirty).toBe(true);
+    expect(saveStatusLabel(result.current.dirty)).toContain('Unsaved');
+  });
+
+  it('still discards the panel’s OWN park when the panel returns to the saved doc', () => {
+    // The reverse control. The discard branch exists for a real bug (undo back to the baseline
+    // leaving a stale park that Cmd+S would then write), so narrowing it must not disable it.
+    const { rerender, result } = setup();
+    const loaded = { n: 1 };
+    act(() => { result.current.markSaved(loaded); });
+    rerender({ v: loaded });
+    expect(getDirtyAssetPaths()).toEqual([]);
+
+    const edited = { n: 2 };
+    rerender({ v: edited });
+    expect(peekDirtyAsset(PATH)?.origin).toBe('panel');
+
+    // Undo back to the loaded doc: our own park must go.
+    rerender({ v: loaded });
+    expect(getDirtyAssetPaths()).toEqual([]);
+    expect(result.current.dirty).toBe(false);
+  });
+});

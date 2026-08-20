@@ -11,7 +11,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { backendFetch } from '../backend/editorBackend';
 import { useEditorStore } from '../store/editorStore';
-import { pendingAssetDoc } from './pendingAssetDoc';
+import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
@@ -305,7 +305,16 @@ export default function AnimationEditor() {
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingAnimationClip;
-    if (existing) { savedMarkRef.current?.(existing); return; } // keep unsaved edits on re-mount
+    if (existing) {
+      // ⚠️ "In sync" means EQUAL TO DISK, and a parked write means it is not. This branch marked
+      // `existing` as the saved baseline unconditionally, so re-entering the effect while a write
+      // was pending told the hook the pending doc was already written — and its reconciliation
+      // branch then DISCARDED the write (bug 1MCF9DFktot8hXsgBuWp). The rename path reaches the
+      // effect exactly this way: repointing changes `asset.path`, the panel is already loaded, so
+      // it returns HERE and never reaches the pendingAssetDoc branch below.
+      if (!pendingAssetDoc(asset.path, 'animation')) savedMarkRef.current?.(existing);
+      return;   // either way the loaded doc stays — that is what this branch is for
+    }
     const { loadAnimationClip } = useEditorStore.getState();
     // An UNSAVED write parked for this asset (an agent `anim-set-clip` / `anim-add-key` under manual
     // persistence) is not on disk yet — fetching the file would open the PRE-edit doc and re-seed
@@ -320,7 +329,7 @@ export default function AnimationEditor() {
       // must still get one, or the asset stays unaddressable by GUID for as long as it is open.
       if (!doc.id) doc.id = newGuid();
       registerAsset(doc.id, asset.path, 'animation');
-      savedMarkRef.current?.(doc);
+      adoptParkedDoc(asset.path, 'animation', doc);
       loadAnimationClip(doc);
       return;
     }

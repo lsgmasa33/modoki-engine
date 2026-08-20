@@ -2174,6 +2174,17 @@ async function describeUnresolvedAgainstLiveWorld(
         catch { /* stat failed → treat as a real collision */ }
         if (!sameEntry) return json({ error: 'Destination exists' }, 409);
       }
+      // The destination is about to APPEAR, and the watcher cannot tell a rename from an
+      // external overwrite — so fingerprint it as the editor's own write, exactly as
+      // /api/asset-write and /api/write-file already do. Without this the rename's own change
+      // event comes back and `dropParkedWriteFor` discards the parked write that
+      // `applyMovesToParkedAssets` just deliberately moved ONTO this path: the human's unsaved
+      // edit is gone, the panel still shows it, and the badge reads `Saved ✓`
+      // (bug 1MCF9DFktot8hXsgBuWp). Read the bytes BEFORE the move — after it, absFrom is gone.
+      try {
+        const moved = fs.readFileSync(absFrom);
+        ctx.markEditorWrite(absTo, crypto.createHash('sha1').update(moved).digest('hex'));
+      } catch { /* unreadable (a directory move) — fall through; the guard is best-effort */ }
       moveAssetFile(absFrom, absTo);
       return json({ ok: true });
     } catch (e) {

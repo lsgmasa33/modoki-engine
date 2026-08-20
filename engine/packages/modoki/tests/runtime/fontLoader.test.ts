@@ -518,4 +518,372 @@ describe('fontLoader', () => {
       warn.mockRestore();
     });
   });
+
+  /** #276 — the browser-`FontFace` sibling of the SDF loader had no invalidation at all: a
+   *  re-import (same path, new bytes) left the OLD `FontFace` registered in `document.fonts`
+   *  forever, so DOM text kept the stale typeface while SDF text picked up the new one. These
+   *  drive the fix mostly through `registerAsset` (the real end-to-end signal — a re-register
+   *  with a changed hash), and reach for `invalidateFontFace` directly only where a test needs
+   *  a path that was never loaded, or teardown. */
+  describe('font re-import invalidation (#276)', () => {
+    const GUID = '40000000-0000-4000-8000-000000000001';
+    const PATH = '/assets/fonts/Geologica-Regular.ttf';
+
+    let loadCalls: Record<string, number>;
+    let instances: any[];
+    let addedFaces: any[];
+    let deletedFaces: any[];
+    let callOrder: string[]; // 'add:<idx>' | 'delete:<idx>' — idx is the instance's index in `instances`
+
+    /** Same shape as the `loadFontFamily` describe block's mock, but keyed by FontFace
+     *  INSTANCE rather than by source string — the re-import path can have two loads for
+     *  the SAME url in flight at once (dev builds don't cache-bust), and the generation-guard
+     *  test needs to resolve them independently and in a chosen order. */
+    function installFontFaceMock() {
+      loadCalls = {};
+      instances = [];
+      class FakeFontFace {
+        resolve!: () => void;
+        reject!: (e: Error) => void;
+        constructor(public family: string, public source: string, public descriptors: { weight: string; style: string }) {
+          instances.push(this);
+        }
+        load() {
+          loadCalls[this.source] = (loadCalls[this.source] ?? 0) + 1;
+          return new Promise<this>((resolve, reject) => {
+            this.resolve = () => resolve(this);
+            this.reject = reject;
+          });
+        }
+      }
+      (globalThis as any).FontFace = FakeFontFace;
+
+      addedFaces = [];
+      deletedFaces = [];
+      callOrder = [];
+      const live = new Set<any>();
+      (globalThis as any).document = {
+        fonts: {
+          add: vi.fn((f: any) => {
+            live.add(f);
+            addedFaces.push(f);
+            callOrder.push(`add:${instances.indexOf(f)}`);
+          }),
+          delete: vi.fn((f: any) => {
+            live.delete(f);
+            deletedFaces.push(f);
+            callOrder.push(`delete:${instances.indexOf(f)}`);
+          }),
+          has: (f: any) => live.has(f),
+          size: 0, // unused by the loader; present only in case something introspects it
+          __live: live,
+        },
+      };
+    }
+
+    /** Register (or re-register) `PATH` under `GUID` with the given hash, using the REAL
+     *  assetManifest — a hash change on a re-register of the same guid+path is what fires
+     *  `onFontInvalidated`, exactly like a real re-import. */
+    async function seedManifest(hash: string) {
+      const manifest = await import('../../src/runtime/loaders/assetManifest');
+      manifest.registerAsset(GUID, PATH, 'font', undefined, undefined, hash);
+      return manifest;
+    }
+
+    /** Kick off `loadFont(path)`, resolve the FontFace it creates, and await the result —
+     *  `document.fonts.add` never fires until the mock's `load()` promise settles, so a bare
+     *  `await loadFont(path)` would hang forever. Returns the FontFace instance that was
+     *  created (there may already be earlier instances from a prior call in the same test). */
+    async function loadSettled(loadFont: (path: string) => Promise<string>, path: string) {
+      const before = instances.length;
+      const p = loadFont(path);
+      await Promise.resolve();
+      instances[before].resolve();
+      await p;
+      return instances[before];
+    }
+
+    it('re-registering the manifest entry with a new hash re-loads the path', async () => {
+      installFontFaceMock();
+      await seedManifest('hash-v1');
+      const { loadFont } = await getLoader();
+
+      await loadSettled(loadFont, PATH);
+      expect(loadCalls[instances[0].source], 'first load').toBe(1);
+
+      // Re-import: same guid + path, new hash → fires onFontInvalidated → invalidateFontFace,
+      // which starts a second `loadFont(PATH)` internally.
+      await seedManifest('hash-v2');
+      expect(instances.length, 'the reload already started a second FontFace').toBe(2);
+      instances[1].resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // Dev builds don't cache-bust, so both FontFace instances share the same `source` URL —
+      // the count under that shared key is the total number of loads for the path (2), which
+      // is exactly the regression: before the fix it stayed at 1 forever.
+      expect(loadCalls[instances[1].source], 'loaded a second time for the same path').toBe(2);
+    });
+
+    it('deletes the superseded face from document.fonts after the reload settles', async () => {
+      installFontFaceMock();
+      await seedManifest('hash-v1');
+      const { loadFont } = await getLoader();
+      await loadSettled(loadFont, PATH);
+
+      await seedManifest('hash-v2');
+      instances[1].resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect((document as any).fonts.delete).toHaveBeenCalledWith(instances[0]);
+      expect((document as any).fonts.__live.has(instances[0]), 'stale face is gone').toBe(false);
+      expect((document as any).fonts.__live.has(instances[1]), 'fresh face remains').toBe(true);
+      expect((document as any).fonts.__live.size).toBe(1);
+    });
+
+    it('adds the new face BEFORE deleting the old one', async () => {
+      installFontFaceMock();
+      await seedManifest('hash-v1');
+      const { loadFont } = await getLoader();
+      await loadSettled(loadFont, PATH);
+
+      await seedManifest('hash-v2');
+      instances[1].resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const addIdx = callOrder.indexOf('add:1');
+      const deleteIdx = callOrder.indexOf('delete:0');
+      expect(addIdx, 'the new face was added').toBeGreaterThanOrEqual(0);
+      expect(deleteIdx, 'the old face was deleted').toBeGreaterThanOrEqual(0);
+      expect(addIdx, 'add happens before delete — no frame with a system fallback').toBeLessThan(deleteIdx);
+    });
+
+    it('registers exactly one variant after a re-import, with no self-collision warning', async () => {
+      installFontFaceMock();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+      await seedManifest('hash-v1');
+      const { loadFont, getLoadedFonts } = await getLoader();
+      await loadSettled(loadFont, PATH);
+
+      await seedManifest('hash-v2');
+      instances[1].resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const variants = getLoadedFonts().get('Geologica') ?? [];
+      expect(variants.length, 'no duplicate variant left behind').toBe(1);
+      const collisionMsgs = [...warn.mock.calls, ...log.mock.calls]
+        .map(c => String(c[0]))
+        .filter(m => m.includes('already has a'));
+      expect(collisionMsgs, 'no self-collision against its own previous registration').toEqual([]);
+      warn.mockRestore();
+      log.mockRestore();
+    });
+
+    it('invalidating a path that was never loaded is a no-op', async () => {
+      installFontFaceMock();
+      const { invalidateFontFace } = await getLoader();
+
+      invalidateFontFace('/assets/fonts/NeverLoaded-Regular.ttf');
+      await Promise.resolve();
+
+      expect(instances.length, 'eagerly loading here would FontFace-load fonts no scene asked for').toBe(0);
+    });
+
+    it('an in-flight load of the OLD bytes cannot register on top of the new one', async () => {
+      installFontFaceMock();
+      await seedManifest('hash-v1');
+      const { loadFont } = await getLoader();
+
+      const p1 = loadFont(PATH); // starts loading, does NOT settle yet
+      await Promise.resolve();
+      expect(instances.length).toBe(1);
+
+      // Invalidate while the first load is still in flight — bumps `generation` and starts
+      // a second load for the new bytes.
+      await seedManifest('hash-v2');
+      expect(instances.length).toBe(2);
+
+      // Settle the STALE (first) load AFTER the fresh one has already started, then the
+      // fresh one — the stale load's generation is behind, so it must not register.
+      instances[0].resolve();
+      await p1;
+      instances[1].resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect((document as any).fonts.add).not.toHaveBeenCalledWith(instances[0]);
+      expect((document as any).fonts.add).toHaveBeenCalledWith(instances[1]);
+      expect((document as any).fonts.__live.has(instances[0]), 'stale face never registered').toBe(false);
+      expect((document as any).fonts.delete).not.toHaveBeenCalledWith(instances[0]);
+    });
+
+    it('a failed reload keeps the old typeface registered and warns naming the path', async () => {
+      installFontFaceMock();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await seedManifest('hash-v1');
+      const { loadFont } = await getLoader();
+      await loadSettled(loadFont, PATH);
+
+      await seedManifest('hash-v2');
+      instances[1].reject(new Error('network error'));
+      // Let the rejection propagate through the chain `face.load()` (rejects) →
+      // `await` in doLoadFont (rethrows) → `doLoadFont(...).finally(...)` (loadFont's
+      // return value) → invalidateFontFace's `.catch(...)`, each link a microtask tick.
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+
+      expect((document as any).fonts.delete, 'the old face stays registered, not dropped to a system fallback')
+        .not.toHaveBeenCalled();
+      expect((document as any).fonts.__live.has(instances[0])).toBe(true);
+      const msgs = warn.mock.calls.map(c => String(c[0]));
+      expect(msgs.some(m => m.includes(PATH) && m.includes('network error'))).toBe(true);
+      warn.mockRestore();
+    });
+
+    it('disposeAllFontFaces removes every face and clears the dedup guard', async () => {
+      installFontFaceMock();
+      await seedManifest('hash-v1');
+      const { loadFont, disposeAllFontFaces, getLoadedFontFamilies } = await getLoader();
+      await loadSettled(loadFont, PATH);
+
+      disposeAllFontFaces();
+
+      expect((document as any).fonts.delete).toHaveBeenCalledWith(instances[0]);
+      expect(getLoadedFontFamilies()).toEqual([]);
+
+      // The dedup guard was really cleared — loading the same path again loads again.
+      const p2 = loadFont(PATH);
+      await Promise.resolve();
+      expect(instances.length, 'a fresh FontFace was created — the path was not still marked loaded').toBe(2);
+      instances[1].resolve();
+      await p2;
+    });
+
+    it('a superseded load settling does not evict the REPLACEMENT load from the in-flight map', async () => {
+      // Regression for a defect this fix's own invalidation made reachable. `loadFont`'s
+      // `.finally` evicts `loading[path]`; before #276 nothing else ever removed a path from
+      // that map, so the entry could only be its own. Invalidation breaks that assumption:
+      // it starts a REPLACEMENT load for the same path, and an unconditional delete would
+      // drop the replacement's entry when the superseded load settles — so the next caller
+      // misses the reload already in flight and starts a third, redundant load.
+      installFontFaceMock();
+      await seedManifest('hash-v1');
+      const { loadFont } = await getLoader();
+
+      const p1 = loadFont(PATH);          // load #1, deliberately left in flight
+      await Promise.resolve();
+      expect(instances.length).toBe(1);
+
+      await seedManifest('hash-v2');      // invalidation starts the replacement load #2
+      expect(instances.length, 'the replacement load started').toBe(2);
+
+      instances[0].resolve();             // the SUPERSEDED load settles last
+      await p1;
+      await Promise.resolve();
+
+      // The replacement is still in flight, so this must SHARE it — not open a third load.
+      void loadFont(PATH);
+      await Promise.resolve();
+      expect(instances.length, 'a third FontFace means the replacement was evicted').toBe(2);
+    });
+
+    it('invalidating ONE variant leaves the rest of its family registered', async () => {
+      // `forgetVariant` walks every family and splices the matching path out. A family
+      // normally holds SEVERAL variants (a UI authoring fontWeight:700 needs the real Bold
+      // file registered alongside the Regular), so a re-import of one file must not disturb
+      // the siblings — including in the window between eviction and the reload settling,
+      // where dropping the family key would make `fontPathFromFamily` return null for text
+      // that is still perfectly renderable.
+      installFontFaceMock();
+      const REG = '/assets/fonts/Fam-Regular.ttf';
+      const BOLD = '/assets/fonts/Fam-Bold.ttf';
+      const manifest = await import('../../src/runtime/loaders/assetManifest');
+      manifest.registerAsset('50000000-0000-4000-8000-000000000001', REG, 'font', undefined, undefined, 'h1');
+      manifest.registerAsset('50000000-0000-4000-8000-000000000002', BOLD, 'font', undefined, undefined, 'h1');
+      const { loadFont, getLoadedFonts, fontPathFromFamily } = await getLoader();
+
+      await loadSettled(loadFont, REG);
+      await loadSettled(loadFont, BOLD);
+      expect(getLoadedFonts().get('Fam')).toHaveLength(2);
+
+      // Re-import ONLY the regular.
+      manifest.registerAsset('50000000-0000-4000-8000-000000000001', REG, 'font', undefined, undefined, 'h2');
+      await Promise.resolve();
+      expect(
+        getLoadedFonts().get('Fam')?.map(v => v.path),
+        'the Bold variant must survive its sibling being invalidated',
+      ).toContain(BOLD);
+
+      instances[instances.length - 1].resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(getLoadedFonts().get('Fam'), 'both variants registered, none duplicated').toHaveLength(2);
+      expect(fontPathFromFamily('Fam'), 'the regular is still the representative').toBe(REG);
+      expect((document as any).fonts.__live.size, 'exactly two live faces').toBe(2);
+    });
+
+    it('a font whose reload FAILED can still be invalidated by the next re-import', async () => {
+      // The failure branch must not strand the font on its old face forever. A failed reload
+      // leaves nothing in `loadedPaths`/`loading`, which reads identically to "never loaded" —
+      // so an early-out keyed on those would drop EVERY later re-import silently, and the
+      // stale face (never deleted, because the delete only follows a successful add) would
+      // render until an editor restart. That is the very bug #276 exists to fix, re-created
+      // in the one branch the fix made reachable.
+      installFontFaceMock();
+      await seedManifest('hash-v1');
+      const { loadFont } = await getLoader();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const first = await loadSettled(loadFont, PATH);      // good load
+      await seedManifest('hash-v2');                        // re-import #1 -> reload
+      instances[1].reject(new Error('corrupt font'));       // ...which FAILS
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect((document as any).fonts.__live.has(first), 'old face still rendering').toBe(true);
+
+      // Re-import #2, with perfectly good bytes. This MUST retry.
+      await seedManifest('hash-v3');
+      expect(instances.length, 'a later re-import must still trigger a reload').toBe(3);
+      instances[2].resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect((document as any).fonts.__live.has(instances[2]), 'new face registered').toBe(true);
+      expect((document as any).fonts.__live.has(first), 'stale face finally deleted').toBe(false);
+      warn.mockRestore();
+    });
+
+    it('cache-busts the FontFace source with ?v=<hash> in production, but not in dev', async () => {
+      installFontFaceMock();
+      await seedManifest('hash-v1');
+      const { loadFont } = await getLoader();
+
+      // Dev (default test env): no cache-bust suffix.
+      const pDev = loadFont(PATH);
+      await Promise.resolve();
+      expect(instances[0].source).not.toContain('?v=');
+      instances[0].resolve();
+      await pDev;
+
+      // PROD: the same asset entry's hash appears as ?v=<hash>.
+      vi.stubEnv('PROD', true);
+      try {
+        const manifest = await import('../../src/runtime/loaders/assetManifest');
+        manifest.registerAsset(GUID, PATH, 'font', undefined, undefined, 'hash-v2');
+        const pProd = loadFont(PATH);
+        await Promise.resolve();
+        expect(instances.length).toBe(2);
+        expect(instances[1].source).toContain('?v=hash-v2');
+        instances[1].resolve();
+        await pProd;
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+  });
 });

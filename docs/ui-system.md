@@ -745,11 +745,58 @@ different fixes, and the second reads as the first otherwise. Generic CSS keywor
 (`sans-serif`, `system-ui`, …) name no asset by design and are silent. Before this, the
 failure produced no console output at all.
 
-⚠️ **The DOM loader has no INVALIDATION**, which is the next thing this path gets wrong: nothing
-ever deletes from `loadedPaths`/`loadedFonts`, and `doLoadFont` builds its URL with no
-`withCacheBust` (the SDF sibling has both). So a re-imported font re-bakes the SDF atlas and
-visibly changes `Text2D`/`Text3D` while DOM text keeps the old face until an editor restart —
-issue #276, with the three-part fix and the reproduce-first caveat.
+#### Re-importing a font: how the DOM face is replaced (#276)
+
+`fontLoader` subscribes to the **same `onFontInvalidated` signal the SDF loader uses** (fired by
+`registerAsset` when a `'font'` entry re-registers with a changed `hash` or `font.mode`), resolves
+the guid to a path, and re-registers the face. Until this landed the DOM half had **no
+invalidation at all**: `loadFont` short-circuited on `loadedPaths`, so a re-imported font re-baked
+the SDF atlas and visibly changed `Text2D`/`Text3D` **while DOM text kept the old typeface until
+the editor was restarted** — no error, and the two text systems silently disagreeing on screen
+about what one font looks like. Measured on the live editor before/after, one re-import swapping a
+font's bytes at the same path (Varela Round → Arimo, `games/anim-bug`, 2026-08-20):
+
+| | SDF `Text3D` world width | DOM span width @100px |
+|---|---|---|
+| before the fix | 8.412 → **7.848** ✅ re-baked | 837.91 → **837.91** ❌ stale |
+| after | 8.412 → **7.848** ✅ | 837.91 → **778.38** ✅ |
+
+The four parts are a **package** — any one alone still leaves the old face rendering:
+
+1. **The registry is evicted.** `invalidateFontFace(path)` drops the path from `loadedPaths`, and
+   `forgetVariant` drops its `FontInfo` from `loadedFonts` so the reload registers exactly one
+   variant instead of appending a duplicate (which would also trip the same-(weight,style)
+   collision log against the font's own previous self).
+2. **The URL is cache-busted** — `withCacheBust(assetUrl(path), getAssetEntry(path)?.hash)`,
+   matching `fontUrls()` in the SDF sibling. Without it the refetch is served the cached bytes and
+   the reload is a no-op. Like its sibling this is a **no-op in dev** (the Vite dev server does not
+   cache), so it is the production half of the fix; the editor half is (1) and (3).
+3. **The old `FontFace` is deleted from `document.fonts`** — the browser owns a face until
+   something removes it, so re-adding alone leaves the stale one registered. A `faces` map keys the
+   live face per path, and the delete happens in `doLoadFont` **immediately after the replacement is
+   added** — the only place a face is ever added, so the ordering cannot drift. That ordering is the
+   answer to "when is it safe to delete a face live text is rendering with": after its replacement
+   is registered, never before, so nothing falls back to a system font for a frame.
+4. **In-flight loads are fenced.** A `generation` counter (mirroring the SDF loader's) is bumped by
+   every invalidation; a load captures it before `await face.load()` and refuses to register if it
+   changed. Otherwise a load of the OLD bytes still in flight when the re-import lands resolves
+   afterwards and re-registers the stale face on top of the fresh one — last-added wins.
+
+A **failed** reload deliberately leaves the previous face registered (and warns) rather than
+dropping the family to a system fallback, which follows from the ordering in (3): the delete never
+runs if the replacement never arrives. ⚠️ **That branch is where the naive version of this fix
+re-created the very bug it was closing**, and it is worth knowing before touching the guard: a
+failed reload clears both `loadedPaths` and `loading`, which reads *identically to "never loaded"*
+— so an early-out keyed on those silently drops **every later re-import**, and the stale face
+(never deleted, because the delete only follows a successful add) renders until an editor restart.
+The early-out is therefore keyed on **`faces`**, which survives a failed reload precisely because
+the old face is still registered. For the same reason `forgetVariant` runs in `doLoadFont` at
+registration time rather than in the invalidation: the registry then keeps describing what is
+actually in `document.fonts`, instead of reporting a family as gone while its old face is visibly
+still rendering. A path this module never loaded IS a genuine no-op — eagerly loading on
+invalidation would FontFace-load fonts no scene asked for. `disposeAllFontFaces()`
+mirrors `disposeAllFonts()` for full teardown and removes the faces from `document.fonts` too: a
+face the browser still holds after its registry is cleared can never be removed afterwards.
 
 ⚠️ This is the dev-editor half of a class the production build has too: **the tree-shaker
 cannot see a family NAME reached from anywhere but a scene/prefab field** (a stylesheet, a

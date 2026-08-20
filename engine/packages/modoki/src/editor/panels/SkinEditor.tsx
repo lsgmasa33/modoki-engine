@@ -29,7 +29,7 @@ import { autoRig2D } from '../../runtime/skinning/rig2dBuild';
 import { spriteThumbStyle } from './SpritePicker';
 import { saveAssetDialog } from '../utils/saveDialog';
 import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
-import { pendingAssetDoc } from './pendingAssetDoc';
+import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { AssetRefField, assetDisplayName } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
@@ -216,7 +216,16 @@ export default function SkinEditor() {
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingSkinDef;
-    if (existing) { savedMarkRef.current?.(existing); return; } // bare re-mount — keep unsaved edits
+    if (existing) {
+      // ⚠️ "In sync" means EQUAL TO DISK, and a parked write means it is not. This branch marked
+      // `existing` as the saved baseline unconditionally, so re-entering the effect while a write
+      // was pending told the hook the pending doc was already written — and its reconciliation
+      // branch then DISCARDED the write (bug 1MCF9DFktot8hXsgBuWp). The rename path reaches the
+      // effect exactly this way: repointing changes `asset.path`, the panel is already loaded, so
+      // it returns HERE and never reaches the pendingAssetDoc branch below.
+      if (!pendingAssetDoc(asset.path, 'rig2d')) savedMarkRef.current?.(existing);
+      return;   // either way the loaded doc stays — that is what this branch is for
+    }
     const { loadSkinDef } = useEditorStore.getState();
     // An UNSAVED write parked for this rig is not on disk yet, so fetching the file would open the
     // PRE-edit doc and re-seed the live cache with it (QA-CTX-0008). Since #259 the PANEL parks
@@ -226,7 +235,7 @@ export default function SkinEditor() {
     if (parked) {
       if (!parked.id) parked.id = newGuid();
       registerAsset(parked.id, asset.path, 'rig2d');
-      savedMarkRef.current?.(parked);
+      adoptParkedDoc(asset.path, 'rig2d', parked);
       loadSkinDef(parked);
       return;
     }
