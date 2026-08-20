@@ -256,6 +256,25 @@ The bands are drawn over the preview (`editor/rendering/SafeAreaOverlay.tsx`), a
 with a device preset: simulating an inset without showing it trades one invisible failure
 for another.
 
+#### Game code reads the insets through `getSafeAreaInsets()`
+
+Chrome that only needs to CLEAR the notch should use `UIAnchor.safeArea` and never touch this.
+It exists for a game whose own layout ARITHMETIC has to account for the inset — Court reserves a
+band for a banner ad and derives the button row's position and the narration band's height from
+it. It reports px **and percentages of the UI root**; use the percentages, because dividing the
+px by your own `getBoundingClientRect` mixes a pre-transform inset with a post-transform box and
+is wrong in editor previews only.
+
+⚠️ **The read REFRESHES ITSELF on a throttle, and that is not defensive coding.** An inset can
+change with no resize to announce it: under `setDecorFitsSystemWindows(false)` an Android window
+keeps its size when the system bars hide, so only the insets move and no `ResizeObserver` fires
+— and `env()` changing fires no event of its own, so there is nothing to subscribe to. A value
+captured at mount stuck at a 48px nav-bar inset the device had already dropped to 0, which lifted
+Court's ad band off the bottom edge *and* shortened its paper (one number, two bug reports).
+A **detached** root is skipped rather than measured: a removed node answers empty computed styles
+and `clientHeight` 0, so refreshing off one would silently zero every inset when a viewport
+unmounts.
+
 ⚠️ **The preset numbers are mostly PUBLISHED, not measured**, and they model the
 **physical** insets — the notch/Dynamic Island and the home indicator, i.e. what a
 full-screen game sees with the status bar hidden. A device with no notch reports 0 there

@@ -224,7 +224,16 @@ export function DeviceTab() {
     window.addEventListener('resize', refreshBuffers);
     window.addEventListener('orientationchange', refresh);
     window.addEventListener('orientationchange', refreshBuffers);
+    // ⚠️ Resize is NOT enough for the insets, and this row is where that shows up first.
+    // Android hides its system bars a beat after first paint under
+    // `setDecorFitsSystemWindows(false)`: the window keeps its size, so only the insets move and
+    // no resize fires. Measured on a Galaxy A23 — the engine's own cache held a 48px bottom inset
+    // that the device had already dropped to 0. A DIAGNOSTIC that goes stale the same way is
+    // worse than the bug it is meant to expose, so this re-probes on a slow timer while the tab
+    // is open. Cheap: the debug menu is modal and this stops the moment it closes.
+    const insetTimer = setInterval(refresh, 500);
     return () => {
+      clearInterval(insetTimer);
       window.removeEventListener('resize', refresh);
       window.removeEventListener('resize', refreshBuffers);
       window.removeEventListener('orientationchange', refresh);

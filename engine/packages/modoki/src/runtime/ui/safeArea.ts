@@ -81,7 +81,20 @@ const REFRESH_MS = 250;
  *  sanctioned clock wrapper (`runtime/core/clock.ts`), so a manual clock in a headless
  *  test still controls it and the determinism guard stays satisfied. */
 export function getSafeAreaInsets(): SafeAreaInsets {
-  if (root && rawNow() - lastMeasuredAt > REFRESH_MS) measureSafeAreaInsets(root);
+  if (root && rawNow() - lastMeasuredAt > REFRESH_MS) {
+    // ⚠️ A DETACHED root must not be measured. `UIRenderer`'s callback ref returns early on
+    // unmount (it has other teardown to skip), so it never hands this module a null — the
+    // reference here simply goes stale, still pointing at a removed node. `getComputedStyle`
+    // on one answers empty strings and `clientHeight` 0, so the refresh would quietly rewrite
+    // every inset to ZERO and the layout would jump with no device change.
+    //
+    // Reachable two ways: in the editor both viewports mount a UIRenderer, so closing the one
+    // that registered last detaches this root while the other is still on screen; in a shipped
+    // game the tree empties for a beat across a scene swap. Keeping the LAST GOOD value is the
+    // right answer either way — a device's insets do not change because some UI unmounted.
+    if (root.isConnected) measureSafeAreaInsets(root);
+    else root = null;
+  }
   return insets;
 }
 

@@ -158,4 +158,48 @@ describe('getSafeAreaInsets', () => {
     advanceManual(10_000);
     expect(getSafeAreaInsets()).toMatchObject({ top: 0, bottom: 0 });
   });
+
+  /**
+   * A DETACHED root must never be measured (#273 close-out).
+   *
+   * `UIRenderer`'s callback ref returns early on unmount, so this module is never handed a null —
+   * its reference just goes stale. `getComputedStyle` on a removed node answers empty strings and
+   * `clientHeight` 0, so the self-refresh would rewrite every inset to ZERO and the layout would
+   * jump with no device change. Reachable in the editor (two viewports mount a UIRenderer; closing
+   * the one that registered last detaches this root while the other is still on screen) and in a
+   * shipped game (the UI tree empties for a beat across a scene swap).
+   */
+  it('does NOT re-measure a detached root — the value must stop tracking it', () => {
+    setManualNow(0);
+    root.style.setProperty('--ui-sa-top', '68px');
+    measureSafeAreaInsets(root);
+    expect(getSafeAreaInsets().top).toBe(68);
+
+    root.remove();                              // the viewport that registered it goes away
+    // Change what the detached node WOULD report. If the refresh still measures it, the cached
+    // value follows; if it correctly skips, the value stands.
+    // ⚠️ Asserted this way ON PURPOSE. The first version asserted "the insets do not become 0",
+    // which passes in jsdom whether or not the guard exists — jsdom still resolves a custom
+    // property on a removed node, so the mutation check went green against the defect. The
+    // observable that actually discriminates is whether a measure HAPPENED at all.
+    root.style.setProperty('--ui-sa-top', '999px');
+    advanceManual(1000);                        // well past the throttle
+    expect(getSafeAreaInsets().top, 'a detached root must not be re-measured').toBe(68);
+  });
+
+  it('picks up a NEW root after the old one detached', () => {
+    setManualNow(0);
+    root.style.setProperty('--ui-sa-top', '68px');
+    measureSafeAreaInsets(root);
+    root.remove();
+    advanceManual(1000);
+    expect(getSafeAreaInsets().top).toBe(68);   // stale ref dropped here
+
+    const fresh = document.createElement('div');
+    fresh.style.setProperty('--ui-sa-top', '44px');
+    document.body.appendChild(fresh);
+    measureSafeAreaInsets(fresh);
+    expect(getSafeAreaInsets().top).toBe(44);
+    fresh.remove();
+  });
 });
