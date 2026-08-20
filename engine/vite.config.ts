@@ -554,23 +554,13 @@ export default defineConfig(({ command }) => {
   test: {
     // Paths are relative to root (engineDir): tests/ and packages/ live under engine/.
     globals: true,
-    // ── WORKER COUNT: PERFORMANCE cores, not all cores (2026-08-06) ──
-    //
-    // Vitest defaults to `availableParallelism() - 1`, which on Apple Silicon counts EFFICIENCY
-    // cores as if they were performance ones. They are not: measured on this 12P+4E box, the same
-    // suite ran 179s at the default 15 workers and 84s at 12 — a 2.1x difference from nothing but
-    // the cap. The mechanism is that a CPU-bound test file scheduled onto an E core takes ~4x
-    // longer, and since vitest's wall-clock is set by its SLOWEST FILE, one unlucky placement
-    // becomes the whole run's critical path. Oversubscribing guarantees those placements.
-    //
-    // This got much worse when Court's hint sweeps were sharded across 19 files: with only 4 heavy
-    // files they almost always landed on P cores, so the problem was invisible. More parallelism
-    // exposed it rather than causing it.
-    //
-    // 8 workers measured 101s — undersubscribed — so this is a real optimum, not "smaller is
-    // better". Non-Apple-Silicon platforms fall through to vitest's default, which is correct for a
-    // homogeneous CPU; the sysctl simply does not exist there (Intel Macs included) and we keep the
-    // old behaviour rather than guessing.
+    // Worker cap, shared with the engine suite — vitest's `availableParallelism() - 1` counts
+    // Apple-Silicon EFFICIENCY cores and Windows SMT siblings as if they were cores, and both cost
+    // more than they buy. `engine/testWorkers.ts` owns the measurement for every platform; do not
+    // restate it here. (This comment used to carry a copy, and the copy went stale the day the
+    // win32 branch landed — it still claimed Windows keeps vitest's default.)
+    // `engine/scripts/verify.mjs` overrides it per lane so its concurrent pools do not
+    // oversubscribe each other.
     ...perfCoreWorkers(),
     // Coverage is OFF unless --coverage is passed; this block only says what to measure
     // when it is. It exists because every coverage number this repo had acted on came

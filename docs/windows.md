@@ -145,12 +145,13 @@ Windows gate.
 
 ## Tests, gates and timings
 
-- **Windows does not get the performance-core worker cap.** `perfCoreWorkers()`
-  ([engine/testWorkers.ts](../engine/testWorkers.ts)) reads an Apple-Silicon-only sysctl and
-  returns `{}` everywhere else, so vitest keeps its own default. **Never quote a Mac timing as if
-  it were Windows'** — the doc comment there says so explicitly. Expect a long run rather than
-  reading one as a hang, and re-measure rather than trusting any number written down, this
-  doc included.
+- **Windows caps vitest workers at HALF `availableParallelism()`** — `perfCoreWorkers()`
+  ([engine/testWorkers.ts](../engine/testWorkers.ts)) returns `{maxWorkers: ceil(n/2)}` on `win32`,
+  because these boxes are SMT and vitest's `availableParallelism() - 1` counts hyperthreads as
+  cores. **Never quote a Mac timing as if it were Windows'.** Expect a long run rather than reading
+  one as a hang, and re-measure rather than trusting any number written down, this doc included.
+  (This bullet said the opposite until 2026-08-20 — "Windows does not get the cap, and that is
+  correct for a homogeneous CPU". It was wrong: see the measurement below.)
 - **Do not run the two vitest suites concurrently by hand.** Under contention a file reads far
   slower, and the first casualties are the tests sitting closest to `testTimeout` — they fail as
   *timeouts*, not assertions, which is indistinguishable from a real regression until you re-run
@@ -158,19 +159,26 @@ Windows gate.
   typecheck and given a budgeted `MODOKI_TEST_MAX_WORKERS`
   ([engine/scripts/verify.mjs](../engine/scripts/verify.mjs)). Use it rather than hand-rolling
   parallelism; use `MODOKI_TEST_MAX_WORKERS` to bisect a contention problem.
-  - ⚠️ **That budget covers the ENGINE lane only — the app lane still sizes itself from the whole
-    machine, and on a hyperthreaded box that is enough to fail the gate on its own.** Measured
-    2026-08-20 on this clone (i5-11400, 6 physical / 12 logical): vitest's default of
-    `availableParallelism() - 1` = **11 workers on 6 cores**, and `npm run verify` came back red
-    with `qaCaseReferences` and `barrelImportOrder` failing as 20s **timeouts** — tests that need
-    4.6s and 8.4s when run alone. `verify:serial` failed the same way, so this is not lane
-    contention and serialising the lanes does not fix it. `MODOKI_TEST_MAX_WORKERS=6` (physical
-    cores) made the app suite fully green at **211.3s vs 198-210s red** — the oversubscription was
-    buying no throughput at all, only latency. Until that cap is wired in, **export
-    `MODOKI_TEST_MAX_WORKERS=<physical cores>` on a Windows clone** or the gate is unreliable.
-    ⚠️ Do NOT derive it from `os.cpus().length`, which reports LOGICAL cores; the PowerShell
-    `Get-CimInstance Win32_Processor` query that answers correctly costs ~1.9s per call, which is
-    why this is an env var rather than an automatic probe like the Mac's sysctl.
+  - ⚠️ **That budget covers the ENGINE lane only — the app lane sizes itself from the whole
+    machine, and on an SMT box that alone was enough to fail the gate.** This is why the `win32`
+    cap above exists. Measured 2026-08-20 on this clone (i5-11400, 6 physical / 12 logical),
+    one commit (`566d2af19`), both lanes:
+
+    | workers | app lane | engine lane | outcome |
+    |---|---|---|---|
+    | 6 (capped) | 489.2s | 308.6s | **green** |
+    | 11 (vitest default) | 493.0s | 443.7s | **red** — 3 failures |
+
+    Uncapped is *slower and red*: `qaCaseReferences` and `barrelImportOrder` time out at 20s
+    (they need 4.6s and 8.4s alone) and `rampProbeRunner`'s 5 ms budget measures 74.5 ms. The extra
+    workers buy nothing — so there was no tradeoff to tune, which is what made wiring the cap in an
+    easy call. `verify:serial` fails the same way, so this was never lane contention and
+    serialising does not fix it.
+  - **Why `ceil(n/2)` and not a physical-core probe.** On an SMT box half IS the physical count; on
+    a non-SMT box it over-halves, but the table shows halving costs ~0 wall-clock, so that downside
+    is empirically nil. `os.cpus().length` cannot answer (it reports LOGICAL cores), and the
+    PowerShell `Get-CimInstance Win32_Processor` query that can costs ~1.9s per vitest launch —
+    noise inside `verify`, but it would double a single-file run.
 - **Size time budgets from the slowest machine.** A budget tuned on a Mac is not a budget. An
   isolated timing is worth roughly a quarter of the real under-load cost. Worked example
   (2026-08-20): `rampProbeRunner.test.ts`'s `expect(performance.now() - started).toBeLessThan(5)`
@@ -203,6 +211,50 @@ A debug APK built on one machine will **not** install over one built on another 
 debug keystore. Uninstalling first destroys that app's on-device data, so ask before you do. The
 gradle step succeeds and only the install step fails, which reads like a Windows build bug and is
 not one.
+
+### A Windows clone can drive an Android device it has no cable to
+
+adb over TCP works from here, so a phone physically attached to another machine — or to nothing —
+is still reachable, and every host-side device tool works over it: `device_crash_reports`,
+`device_native_logs source:'system'`, and the `adb logcat` paths behind them. Verified 2026-08-20
+against a phone bootstrapped from a Mac; a `shell` round trip measured ~250 ms, slower than USB and
+entirely usable for diagnostics.
+
+Two things make this harder to set up than it should be:
+
+- **`adb mdns services` will NOT find it.** `adb tcpip <port>` does not advertise over mDNS — only
+  Android 11+ *Wireless debugging* (the pairing-code flow, `adb pair`) does. An empty mDNS listing
+  therefore says nothing about whether the port is open, and reading it as "the phone is not
+  reachable" is a false blocker. Either connect straight to a known `ip:port`, or find it by
+  scanning the subnet for the open port.
+- **Confirm WHICH phone by `ro.serialno`, not by `ro.product.model`.** The model string cannot
+  distinguish two handsets of the same kind, and this repo's fleet has several. A wireless target
+  is named by an IP that any DHCP lease can move, so the serial is the only address that means
+  anything.
+
+**What still serialises across machines, and what does not.** The two mechanisms have different
+enforcement points, and only one of them is a file:
+
+- **The socket lease is enforced ON THE DEVICE** — the app refuses a second client by dropping the
+  socket ([deviceConnection.ts](../engine/plugins/backend/deviceConnection.ts)). That exclusion
+  costs nothing to extend over TCP: a clone on another machine holding the lease refuses this one
+  exactly as a sibling clone would. Every tool that needs the lease is therefore already safe.
+- **The hardware claim is machine-local, by design and by necessity.** It exists for what "the
+  socket lease cannot arbitrate — adb, one machine-wide daemon a sibling clone shares" (#149), and
+  claims live in `~/.modoki/device-claims.json` on the claiming host. Two machines keep two files
+  and neither sees the other's.
+
+So over TCP the uncoordinated surface is the **adb-level** work — install, `am crash`, logcat and
+crash-report reads — not the lease. Reads collide harmlessly; the one that actually bites is two
+machines installing to the same phone at once. `device_list` on either host will show it as free.
+
+⚠️ **Do not "fix" this by pointing both machines at a shared claims file.** `isClaimDead` checks
+pid liveness FIRST (`process.kill(pid, 0)`, in [deviceClaims.ts](../engine/plugins/backend/deviceClaims.ts)),
+and that is a question only the claiming OS can answer. A foreign claim's pid is either absent —
+so a LIVE claim reads as dead and the phone is taken anyway, failing open — or coincidentally in
+use, so a DEAD claim is honoured for the full 12h TTL. There is no `host` field to scope the check
+by. Making it work needs a real change (record the host, apply the pid check only to local claims,
+and give foreign claims a short heartbeat-refreshed TTL), not a relocated file.
 
 ## Related
 
