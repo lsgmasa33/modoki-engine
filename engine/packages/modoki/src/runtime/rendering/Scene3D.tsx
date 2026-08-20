@@ -276,8 +276,16 @@ export default function Scene3D() {
 
       // TODO: config is captured once at mount. If a future game needs a non-trivial
       // sceneSetup (lighting presets, fog, etc.), Scene3D will need to subscribe to
-      // gameConfig changes and re-run sceneSetup on game switch. Today both games'
-      // sceneSetup hooks are no-ops so this is safe.
+      // gameConfig changes and re-run sceneSetup on game switch.
+      //
+      // ⚠️ THIS IS NOT A ONCE-PER-LAUNCH CALL, and this comment claimed otherwise until
+      // 2026-08-20 ("today both games' sceneSetup hooks are no-ops so this is safe"). Two
+      // things falsify it: `bringUp()` reaches here, and `rebuild` is `teardown(); await
+      // bringUp()`, which runs on GPU context-loss recovery — routine in a mobile webview;
+      // and React `<StrictMode>` double-invokes the mount effect in dev. Nor are the hooks
+      // no-ops any more: `games/court` starts its install-retention milestones here.
+      // **A `sceneSetup` hook must therefore be IDEMPOTENT** — Court's carries its own latch
+      // for exactly this reason (games/court/packages/app-services/src/milestones.ts).
       config.sceneSetup(scene);
 
       const ecsLights = new Map<number, THREE.Light>();

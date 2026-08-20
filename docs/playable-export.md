@@ -173,6 +173,15 @@ removes nothing" below for the two that were not, and why they are gone rather t
 - **Dead SDK / debug weight.** A game's `@<game>/app-services` (AppLovin/Adjust/Firebase) and the
   debug/MCP bridge are inlined into the one chunk unless explicitly cut — the app-services package is
   aliased to a no-op stub, and the bridge import is `!__MODOKI_PLAYABLE__`-gated, so both DCE out.
+  ⚠️ **That alias means the stub must export EVERY name a game imports from its app-services
+  package, and a missing one fails the build rather than degrading.** Rollup reports
+  `[MISSING_EXPORT] "track" is not exported by ".../playable-appservices-stub.ts"` — and only on
+  `--target playable`, which no routine gate runs, so the web build, the native build and the
+  whole test suite stay green while this target is dead. That is exactly how it broke when
+  `games/court` added `track`/`setTrackProperty` (#269). `engine/tests/architecture/playableAppServicesStub.test.ts`
+  derives the required set from the games' own imports, so a hand-kept list cannot go stale;
+  it also covers `import('@<game>/app-services').then((m) => m.foo())`, which Rollup does NOT
+  catch at build time — that one fails at runtime, inside the ad.
 - **The editor renders two Canvas2D canvases** (GameView + SceneView UI-preview), so a game that maps
   raw `window` pointer events to design space must pick the canvas UNDER the pointer
   (`@modoki/engine/runtime` `hostCanvasUnder`), not `querySelector`'s first match.
