@@ -96,6 +96,27 @@ also supports viewport units (`vw`/`vh`/`vmin`/`vmax`) via CSS custom properties
 `UIRenderer` sets on its container — so viewport-relative sizes resolve against the
 **game viewport**, not the browser window (critical for the editor's simulated device).
 
+⚠️ **`--ui-*` and `getBoundingClientRect` are in DIFFERENT SPACES in the editor, and code that
+mixes them is wrong by the preview's zoom factor.** The Game panel's device preset sizes
+`UIRenderer`'s container at the device's *logical* size (375x667 for an iPhone SE) and then
+displays it under a CSS `scale()` — so `--ui-vh` is `6.67px` while a rect measured off the same
+subtree reports the scaled number. Consequences, both measured on 2026-08-20:
+
+- A **ratio** of two measured values is safe: the scale cancels. That is why the game-side
+  helpers that must survive this emit **percentages** (see `games/court/runtime/sceneChrome.ts`,
+  whose patchers refuse px for exactly this reason).
+- A **length** derived from a measured rect and then handed back as a style value is scaled
+  twice. Court computed HUD font sizes that way and got `41.6px` where `22.8px` was intended —
+  1.83x, the preview's own factor — which pushed the HUD through the board on nine of twelve
+  device presets before it was caught.
+
+So: convert positions to `%`, and express a length that must track the canvas design box as a
+viewport unit rather than a computed px. Note that **no single viewport unit equals a
+`contain`-fitted design box** — it is `min(100vw, refW/refH * 100vh)` wide, so `vh` is exact only
+while the box is height-bound and `vw` only while it is width-bound. Court picks between them per
+frame from the host aspect (`designUnit()`); the `vmin` + `vh`-cap pairing used on its buttons is
+a hand-rolled approximation of the same thing.
+
 ### `UIBinding` — store-driven content & visibility
 
 Connects an element to a Zustand store (`UIBinding.ts`):
