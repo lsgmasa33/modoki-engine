@@ -1673,7 +1673,29 @@ get backwards:
   phone at boot (`Adreno (TM) 730`, byte-identical across three cold launches) — so the boot answer
   and the calibrated answer disagreed by two whole rungs on one device. And it does not come back:
   the player taps, the panel returns to full rate, and the game is still running at `low`
-  (pixelRatioCap 1, shadows off, IBL off, `textureMaxSize` 512) on a flagship.
+  on a flagship.
+
+  ⚠️ **What `low` actually costs COURT is narrower than the tier's field list suggests, and this
+  was overstated here until it was checked** (close-out, 2026-08-21). The obvious reading — DPR 1,
+  shadows off, IBL off, `textureMaxSize` 512 — is a list of the tier's fields, not of the fields
+  this project READS. Court renders no 3D, so shadows/IBL/`pixelRatioCap`/`shadowMapCeiling`/
+  `maxDirectional`/postFX are all inert for it; and `textureMaxSize` is inert too, for a reason
+  worth knowing generally: the cap applies only where the build EMITTED a variant at that size
+  (`resolveTextureVariantUrl` checks `settings.sizes?.includes(cap)` and falls through otherwise),
+  and **0 of Court's 51 textures carry a `sizes[]` array in the NATIVE manifest**. So on the builds
+  measured here a demotion changes exactly three things for Court: `pixiPixelRatioCap`,
+  `pixiAntialias`, and the 30 fps cap. That is still the difference between a sharp board and a
+  pixelated one — which is why the defect mattered — but a reader should not carry away that
+  texture memory or lighting moved.
+
+  ⚠️ **"Inert" here means IN A NATIVE BUILD, and the distinction is the gate's whole purpose** —
+  this qualifier was missing for about an hour after the paragraph above was written, which is the
+  same overstatement it exists to correct. `shouldEmitTextureTierVariants`
+  (`engine/plugins/textureTierEmit.ts`) emits per-tier sizes only for `--target web` or an OTA
+  publish; on native every size would ship inside the app bundle anyway, so there is no download to
+  save and emitting them is pure bloat. A **web or OTA** Court therefore does honour
+  `textureMaxSize` on `low`. Before quoting an empty `sizes[]` as evidence about a project, check
+  which target produced the manifest you are reading.
 
   ⚠️ **Why it did not come back is worth stating exactly, because "the `demoted` flag is sticky" is
   the tempting answer and it is not the whole one** (close-out, 2026-08-20). That flag is cleared by
@@ -1786,6 +1808,30 @@ get backwards:
     60 fps at `mid` with ~6.6 ms of headroom. The reason is the same at both ends and is the
     property this whole section turns on — **these devices are CPU-bound, not fill-bound**, so
     spending the idle GPU on sharpness is close to free.
+
+    ⚠️ **A DPR CAP ONLY BITES A DEVICE WHOSE OWN RATIO EXCEEDS IT** — `min(devicePixelRatio, cap)`
+    (`canvas2DSizing.ts`), so raising a cap above a phone's native ratio changes nothing at all.
+    Worth stating because it makes the table above read differently than the numbers suggest:
+
+    | device | density | its DPR | CSS viewport | cap | ratio actually used | backing buffer |
+    |---|---|---|---|---|---|---|
+    | Y6 2019 | 320 | 2.0 | 360×780 | 2 | 2.0 — binds exactly | 720×1560 ≈ 4.3 MiB |
+    | A23 5G | 300 | **1.875** | 384×832 | 2 | **1.875 — cap does NOT bind** | 720×1560 ≈ 4.3 MiB |
+    | S22 | 480 | 3.0 | 360×780 | 3 | 3.0 | 1080×2340 ≈ 10.1 MiB |
+
+    So `mid: 2` means "render at native" on the A23 rather than "render at 2", and the `low` rise
+    costs the Y6 about **+3.2 MiB** of backing buffer (1.07 → 4.3), not the ~12.6 MiB a
+    physical-pixel reading of the same arithmetic gives — a review got that wrong by treating the
+    720-px PHYSICAL width as the CSS viewport, which on a DPR-2 panel is 360. Small enough that the
+    Y6 held 30 fps with no stalls across the session; big enough to be worth computing rather than
+    waving at, since this is GPU/unified memory on a 1.8 GB phone and MSAA can multiply it again.
+
+    ✅ **A live tier switch DOES re-apply the pixel ratio**, unlike `antialias`.
+    `applyActiveTierToRuntime` ends in `forceResizeAllSurfaces()`, `Canvas2DMount` registers
+    `updateSize` on that bus, and `updateSize` re-reads `getEffectivePixiSettings()` fresh — so a
+    mid-session demotion really does shrink the buffer. Pointer math cannot desync from it either:
+    the 2D hit-test re-derives the backing size from `app.renderer.screen` on every call rather
+    than caching a ratio.
 
     ⚠️ **The A23 is the only rung whose calibration outcome is worth thinking about**: 13.4 ms of
     CPU sits just under `frameIsFull`'s 14 ms demotion bar and well over `hasHeadroom`'s 8.33 ms

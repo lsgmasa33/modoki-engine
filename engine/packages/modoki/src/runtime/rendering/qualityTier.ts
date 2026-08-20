@@ -1243,7 +1243,11 @@ function hasHeadroom(p: FrameProfile, promoteTargetMs: number): boolean {
  *  120 → 24.000002, recovering in <69 ms on the first touch). rAF follows the panel, so `frameMs`
  *  became 41.6 ms — 1000/24 to three digits — against a 20 ms budget, and calibration demoted
  *  `high → mid → low` while the engine was using **8.4 ms** of that 41.6 ms frame. The player
- *  gets `pixelRatioCap 1`, shadows off, ibl off, `textureMaxSize 512` on a flagship, and
+ *  got `pixiPixelRatioCap 1` at the time — a pixelated board on a flagship. (Court has authored
+ *  `2` on `low` since 2026-08-21, so the SAME demotion would cost less today; the defect was never
+ *  about how far the rung falls. The 3D fields and, on a native build, `textureMaxSize` are inert
+ *  for a 2D project — see docs/rendering.md for why.)
+ *
  *  `TierChangeState.demoted` then blocks promotion for the rest of the interacting stretch — it
  *  is cleared only by an idle→active bounce (`tickTierCalibration`'s `wasIdle` reset), so "sticky
  *  for the whole session" overstates it slightly. What made the S22 permanent in practice was
