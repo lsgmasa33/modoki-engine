@@ -509,6 +509,63 @@ hold and is not one; it was hand-deleted twice before being measured. Two things
 honest — Electron's `before-quit` releases on a normal quit, and every backend startup sweeps
 dead-pid entries — but the rule stands regardless of what the file says: **a dead pid holds nothing.**
 
+**The claim now covers the CLI surface too, not just the MCP one (#285).** #149 enforced the claim
+only along the path that consults it: `device_connect` refuses a claimed device and names the holder,
+while `adb`, `xcrun devicectl`, `xcodebuild -destination`, `ideviceinstaller` and go-ios do not,
+because they never ask. That left the claim protecting the polite surface and wide open on the one
+where the destructive operations live — `install -r`, `uninstall`, `am force-stop`, `pm clear`,
+`logcat -c`, `device process terminate`. On 2026-08-20 this clone released the Galaxy S22, `work-ai2`
+claimed it, and this clone then reinstalled Court on it, force-stopped it and cleared its logcat over
+raw `adb -s`. `device_list` showed the claim throughout; nothing warned, and the OWNER spotted it
+rather than the tooling. The rule was already written down in `CLAUDE.md` — which is the point: it
+was a rule with no enforcement, the same shape as #18's `git add -A` hazard, and discipline held for
+four hours and then lapsed once the device work became routine.
+
+Two mechanisms now close it, and they are deliberately different in reach:
+
+- **`engine/scripts/device.mjs`** — a standalone CLI (`npm run device:claim|release|list|run`) that
+  takes the SAME machine-wide claim the editor does. It is the universal path: it works for a human
+  in a terminal, for Codex/Cursor/Antigravity, and inside scripts. Because a CLI process exits
+  immediately, its claim cannot be pid-owned — it carries an **owner token** (`cli:<clone path>`) and
+  is expired purely by a **90-minute TTL**, far shorter than the pid-claim's 12h backstop for the
+  reason spelled out on `CLI_CLAIM_TTL_MS`: a pid-claim has a second, independent expiry and an
+  owner-claim has none. `device run -- <cmd>` claims (or refreshes), then execs, and KEEPS the claim.
+- **`engine/scripts/claim-guard.mjs`** — a Claude Code `PreToolUse` hook, registered in the committed
+  `.claude/settings.json`, that refuses a **destructive** raw device command unless this clone holds
+  a live claim on the device it names. This is the one that would have stopped the incident, because
+  the violation happens when an agent shells out. It is strict on purpose: a destructive call against
+  an UNCLAIMED phone is refused too, matching what CLAUDE.md already required, and the refusal names
+  `npm run device:claim <id>` so the remedy costs one command. Read-only calls (`adb devices`,
+  `getprop`, `logcat -d`, `devicectl device info`) are always allowed — the claim arbitrates
+  interference, not curiosity, and a guard that refused listings would be routed around.
+
+**Scope, because the hook looks more powerful than it is.** It intercepts the Bash tool of a Claude
+Code session in this repo and nothing else: your own terminal, the editor backend's own spawns, and
+every non-Claude agent CLI bypass it (none has a `PreToolUse` equivalent). It never reaches a Modoki
+USER either — `.claude/` is excluded from the OSS snapshot by `scripts/publish-engine-oss.sh`. And a
+hook whose path is mistyped **fails OPEN**: Claude Code reports a non-blocking status and runs the
+command, so a silently-disabled gate looks exactly like a gate with nothing to say. If you move or
+rename the script, break the path deliberately once and confirm you see the hook-error notice.
+
+⚠️ **A guard that fires on TEXT rather than on execution gets routed around, so the parser models the
+shell rather than grepping it.** `engine/scripts/deviceCommandTargets.mjs` matches a tool only in
+COMMAND position, splits on `;`/`&&`/`||`/`|` only outside quotes, and drops heredoc bodies before
+splitting. All three came from live misfires within minutes of the hook going up: it refused the
+command that was testing it, then the patch fixing that, then an attempt to write its tests — every
+one of them a command that merely CONTAINED device-command text. The asymmetry to preserve when
+editing it: an unknown VERB fails safe (refuse), an unknown COMMAND POSITION fails open (allow).
+`bash -c "…"` is parsed by recursing into the string, so quote-awareness does not open an evasion.
+
+**iOS keeps a residual gap, narrowed rather than closed.** One iPhone can be held under two claim
+ids: a WiFi lease can only claim it by ADDRESS (`ip:<host>`), while every raw iOS CLI targets a UDID
+(`ios:<udid>`) — and an iOS app is deliberately never allowed to report its own UDID (see
+`deviceHardware`). A WiFi lease therefore stamps the `model`/`osVersion` the phone DOES report onto
+its claim, and `device claim ios:<udid>` looks that UDID's product type up in `xcrun`'s listing and
+compares. It is a hint, not a proof — two identical handsets report one model — so the rule is
+asymmetric on purpose: **a match refuses (with `--force` to override), a mismatch allows, and an
+absent model warns but proceeds.** "Cannot tell" is never "different", and never grounds to block a
+Mac with no Xcode from claiming any iPhone at all.
+
 **⚠️ Listing devices must never be SYNCHRONOUS — the backend runs inside the Electron main process
 (#168).** `/api/device/list` resolved its iOS half with `execFileSync('xcrun', ['xctrace', 'list',
 'devices'])`, measured at **1.379s**. The AI panel's device picker polls that route every 2.5s and the
@@ -909,6 +966,11 @@ Two things the table is worth reading FOR, not just referring to:
   swap, `file` is on disk, `both` does both, `session` is editor state (selection, gizmo, watchers),
   and `undoable` means a human's Cmd-Z unwinds it as ONE step. Persistence is MANUAL-only — see the
   LIVE WORLD vs SCENE FILE section above.
+
+⚠️ **This catalog is the STATIC surface only.** A game can also register its own tools
+(`registerAgentTool`), which appear beside these, come and go with the open project, and have no
+`contracts.ts` entry — so they are not, and cannot be, in this table. See
+[agent-tools.md](./agent-tools.md).
 
 <!-- BEGIN GENERATED TOOL CATALOG -->
 

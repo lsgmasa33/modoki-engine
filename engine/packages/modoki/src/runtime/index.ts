@@ -400,6 +400,15 @@ export {
   setDebugMenuEnabled,
 } from './debug/debugMenuRegistry';
 export {
+  registerAgentTool,
+  unregisterAgentTool,
+  listAgentTools,
+  getAgentTool,
+  subscribeAgentTools,
+  agentToolsVersion,
+  clearAgentTools,
+} from './debug/agentToolRegistry';
+export {
   setDebugHandlesEnabled,
   areDebugHandlesEnabled,
 } from './core/debugHandles';
@@ -413,6 +422,7 @@ export {
   resetActiveTextureSizeCap,
 } from './core/textureSizeCap';
 export type { DebugTabDef, DebugCommandDef } from './debug/debugMenuRegistry';
+export type { AgentToolDef, AgentToolParam } from './debug/agentToolRegistry';
 
 // ── Frame Driver (no heavy deps — safe for all importers) ──
 export {

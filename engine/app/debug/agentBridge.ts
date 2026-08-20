@@ -106,6 +106,9 @@ import {
   collectHitRegions, hitRegionProviders, isHitRegionOverlayVisible, setHitRegionOverlayVisible,
   regionsAt, nearestRegionTo,
 } from '@modoki/engine/runtime';
+import {
+  listAgentTools, getAgentTool, agentToolsVersion, type AgentToolDef,
+} from '@modoki/engine/runtime';
 import { startWatch, readWatch, listWatches, clearWatch, type StartWatchParams } from './watch';
 // Percept S3: resolved world transforms + hierarchy-deactivation set, both computed
 // each frame by transformPropagationSystem. Same module instance the renderers read.
@@ -704,6 +707,63 @@ registerAgentOp('game-introspect', () => ({
   actions: getUIActionNames().map((name) => ({ name, params: getUIActionParams(name) ?? null })),
   readValues: getReadSourceNames().map((name) => ({ name, value: getReadValue(name) })),
 }));
+
+// ── Game-registered agent tools (#270) ── the game side of the MCP extension seam.
+//
+// `game-tools` is the DECLARATION feed: the MCP server polls it and materializes one real MCP
+// tool per entry, so a game's tools sit beside the engine's `modoki_*` ones with real schemas
+// instead of being squeezed through `dispatch_action`'s single scalar payload. See
+// `runtime/debug/agentToolRegistry.ts` for why the declarations are plain JSON (they cross a
+// process boundary) and docs/agent-tools.md for the whole chain.
+//
+// `version` is what makes the surface LIVE: it changes whenever a game registers or unregisters,
+// and the server sends `tools/list_changed` when it moves. Without it the server would have to
+// re-derive the surface by comparing full declarations on every poll, and a tool whose schema
+// changed in place would never be noticed.
+//
+// Both ops answer normally when the registry is EMPTY (no game tools, or a release build where
+// `isDebugMenuEnabled()` is false and `listAgentTools()` returns nothing). Empty is a valid
+// answer, not an error — most projects register none.
+registerAgentOp('game-tools', () => ({
+  version: agentToolsVersion(),
+  tools: listAgentTools().map((t: AgentToolDef) => ({
+    name: t.name,
+    description: t.description,
+    params: t.params ?? {},
+    mutates: t.mutates,
+    requiresPlaying: t.requiresPlaying === true,
+  })),
+}));
+// Invoke one. The handler's return value is passed through UNTOUCHED: a game tool answers its
+// own question, and wrapping it in an envelope here would bury that answer one level deeper for
+// every caller. A refusal follows the same convention as the rest of the surface (§5) —
+// `ok:false` + a `reason` + the options — so the MCP client's isFailureBody surfaces it as a
+// failed call rather than a cheerful 200.
+registerAgentOp('game-tool-call', async (params) => {
+  const p = (params ?? {}) as { name?: string; args?: Record<string, unknown> };
+  if (!p.name) return { ok: false, reason: 'missing tool name' };
+  const tool = getAgentTool(p.name);
+  if (!tool) {
+    // Name the alternatives. An unknown name is nearly always a stale tool list (the project was
+    // switched, or the game unregistered on a hot-reload), and the recovery is to look at what IS
+    // registered — so answer that question in the same call instead of making the agent ask it.
+    const known = listAgentTools().map((t: AgentToolDef) => t.name);
+    return {
+      ok: false,
+      reason: known.length
+        ? `unknown game tool '${p.name}'`
+        : `unknown game tool '${p.name}' — this project registers no agent tools (or the debug menu is disabled, which suppresses them)`,
+      known,
+    };
+  }
+  try {
+    return await tool.handler(p.args ?? {});
+  } catch (e) {
+    // A throwing handler is the game's bug, but it must not present as a transport failure: a 504
+    // reads as "the editor is gone" and sends the agent diagnosing the wrong layer entirely.
+    return { ok: false, reason: `game tool '${p.name}' threw: ${e instanceof Error ? e.message : String(e)}` };
+  }
+});
 // Trigger a game intent directly (no pixel-hunting a button). Dispatch is inert
 // unless the sim is playing, and throws in dev on an unknown name — so guard both.
 registerAgentOp('dispatch-action', (params) => {

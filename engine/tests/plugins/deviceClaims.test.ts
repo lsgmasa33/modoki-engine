@@ -13,9 +13,12 @@ import path from 'node:path';
 import {
   claimsDir, isPidAlive, isStale, listClaims, claimDevice, releaseDevice,
   releaseAllForThisProcess, sweepStaleClaims, describeConflict, adbDeviceId, iosDeviceId, wifiDeviceId,
-  CLAIM_TTL_MS,
+  CLAIM_TTL_MS, CLI_CLAIM_TTL_MS,
   type DeviceClaim,
 } from '../../plugins/backend/deviceClaims';
+// Imported from the .mjs directly: these two are the store's own clamp, and the point of the test
+// below is that the STORE applies it — going through the typed shell would test the shell instead.
+import { clampTtlMs, MAX_CLAIM_TTL_MS } from '../../scripts/deviceClaimsStore.mjs';
 
 let home: string;
 let prevHome: string | undefined;
@@ -317,6 +320,109 @@ describe('describeConflict', () => {
   });
 });
 
+describe('CLI-owned claims (#285) — owner/ttlMs', () => {
+  it('an owner-claim (pid 0) is NOT expired by a dead pid while inside its TTL', () => {
+    const claim: DeviceClaim = { deviceId: 'adb:X', clone: '/c', branch: 'main', pid: 0, at: 1_000_000, owner: 'wrapper-adb' };
+    // alive() would report pid 0 as dead if it were consulted at all — it must not be.
+    expect(isStale(claim, { now: 1_000_000 + 1000, alive: () => false })).toBe(false);
+  });
+
+  it('an owner-claim IS expired once it outlives CLI_CLAIM_TTL_MS, even with a generous `alive`', () => {
+    const claim: DeviceClaim = { deviceId: 'adb:X', clone: '/c', branch: 'main', pid: 0, at: 1_000_000, owner: 'wrapper-adb' };
+    expect(isStale(claim, { now: 1_000_000 + CLI_CLAIM_TTL_MS + 1, alive: () => true })).toBe(true);
+    expect(isStale(claim, { now: 1_000_000 + CLI_CLAIM_TTL_MS, alive: () => true })).toBe(false);
+  });
+
+  it('a per-claim ttlMs overrides CLI_CLAIM_TTL_MS for an owner-claim', () => {
+    const claim: DeviceClaim = { deviceId: 'adb:X', clone: '/c', branch: 'main', pid: 0, at: 1_000_000, owner: 'wrapper-adb', ttlMs: 5000 };
+    expect(isStale(claim, { now: 1_000_000 + 5000 + 1, alive: () => true })).toBe(true);
+    expect(isStale(claim, { now: 1_000_000 + 4999, alive: () => true })).toBe(false);
+  });
+
+  it('a plain pid-claim\'s expiry rule is completely unchanged: dead pid stale immediately, live pid stale only past CLAIM_TTL_MS', () => {
+    const claim: DeviceClaim = { deviceId: 'adb:X', clone: '/c', branch: 'main', pid: 999, at: 1_000_000 };
+    expect(isStale(claim, { now: 1_000_000 + 1, alive: () => false })).toBe(true);
+    expect(isStale(claim, { now: 1_000_000 + CLAIM_TTL_MS, alive: () => true })).toBe(false);
+    expect(isStale(claim, { now: 1_000_000 + CLAIM_TTL_MS + 1, alive: () => true })).toBe(true);
+  });
+
+  it('the same owner token re-claiming refreshes rather than conflicting', () => {
+    const first = claimDevice({ deviceId: 'adb:X', clone: '/clone/a', branch: 'main', owner: 'wrapper-adb' }, { now: 1000, alive: () => false });
+    expect(first.ok).toBe(true);
+    expect((first as { ok: true; claim: DeviceClaim }).claim.pid).toBe(0);
+
+    const second = claimDevice(
+      { deviceId: 'adb:X', clone: '/clone/a', branch: 'main', owner: 'wrapper-adb', purpose: 'installing' },
+      { now: 2000, alive: () => false },
+    );
+    expect(second.ok).toBe(true);
+    expect((second as { ok: true; claim: DeviceClaim }).claim.at).toBe(2000);
+    expect((second as { ok: true; claim: DeviceClaim }).claim.purpose).toBe('installing');
+    expect(listClaims({ now: 2000, alive: () => false })).toHaveLength(1);
+  });
+
+  it('a DIFFERENT owner token is refused, and describeConflict names the owner, not "pid 0"', () => {
+    fs.mkdirSync(home, { recursive: true });
+    const held: DeviceClaim = { deviceId: 'adb:X', clone: '/clone/other', branch: 'work-ai', pid: 0, at: 500, owner: 'wrapper-adb' };
+    fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [held] }));
+
+    const r = claimDevice(
+      { deviceId: 'adb:X', clone: '/clone/mine', branch: 'main', owner: 'other-wrapper' },
+      { now: 600, alive: () => false },
+    );
+    expect(r.ok).toBe(false);
+    const failure = r as { ok: false; held: DeviceClaim; message: string };
+    expect(failure.message).toMatch(/wrapper-adb/);
+    expect(failure.message).not.toMatch(/pid 0/);
+  });
+
+  it('an owner-claim from clone A does not block a request from clone A (takeover), but DOES block clone B', () => {
+    fs.mkdirSync(home, { recursive: true });
+    const held: DeviceClaim = { deviceId: 'adb:X', clone: '/clone/a', branch: 'main', pid: 0, at: 500, owner: 'wrapper-adb' };
+    fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [held] }));
+
+    // Same clone, no owner token (the editor taking over its own CLI's claim) — succeeds.
+    const takeover = claimDevice(
+      { deviceId: 'adb:X', clone: '/clone/a', branch: 'main' },
+      { now: 600, alive: () => false },
+    );
+    expect(takeover.ok).toBe(true);
+
+    // Reset and try from a different clone — refused.
+    fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [held] }));
+    const refused = claimDevice(
+      { deviceId: 'adb:X', clone: '/clone/b', branch: 'main' },
+      { now: 600, alive: () => false },
+    );
+    expect(refused.ok).toBe(false);
+  });
+
+  it('a pid-claim from another pid still conflicts even when clone matches (the MODOKI_MULTI regression — must NOT be loosened)', () => {
+    fs.mkdirSync(home, { recursive: true });
+    const held: DeviceClaim = { deviceId: 'adb:X', clone: '/clone/a', branch: 'main', pid: 424242, at: 500 };
+    fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [held] }));
+
+    const r = claimDevice(
+      { deviceId: 'adb:X', clone: '/clone/a', branch: 'main' },
+      { now: 600, alive: (pid) => pid === 424242 || pid === process.pid },
+    );
+    expect(r.ok).toBe(false);
+  });
+
+  it('releaseDevice with an owner drops only that owner\'s record and leaves another owner\'s record alone', () => {
+    fs.mkdirSync(home, { recursive: true });
+    const mine: DeviceClaim = { deviceId: 'adb:X', clone: '/c', branch: 'main', pid: 0, at: Date.now(), owner: 'wrapper-adb' };
+    const theirs: DeviceClaim = { deviceId: 'ios:Y', clone: '/c', branch: 'main', pid: 0, at: Date.now(), owner: 'other-wrapper' };
+    fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [mine, theirs] }));
+
+    releaseDevice('adb:X', { owner: 'wrapper-adb' });
+
+    // Read the raw file (not listClaims) so the assertion is about the release itself, not staleness.
+    const onDisk = JSON.parse(fs.readFileSync(claimsFilePath(), 'utf8')).claims as DeviceClaim[];
+    expect(onDisk.map((c) => c.deviceId)).toEqual(['ios:Y']);
+  });
+});
+
 describe('round-trip through the real file', () => {
   it('claim, then a fresh listClaims read parses the documented on-disk shape', () => {
     const r = claimDevice({ deviceId: 'adb:RFDEADBEEF1', clone: '/Users/x/Projects/modoki', branch: 'main', guid: 'g-1', label: 'SC_56C', purpose: 'device lease' });
@@ -339,5 +445,34 @@ describe('round-trip through the real file', () => {
     // A fresh read (simulating a separate process reading the same file) sees the same claim.
     const fresh = listClaims();
     expect(fresh).toEqual([claim]);
+  });
+});
+
+describe('ttlMs is clamped — an owner-claim must not be able to outlive its own backstop', () => {
+  // The TTL is the ONLY expiry an owner-claim has, so an unbounded one is a device locked out of
+  // every other clone with no mechanism left to free it. Measured before the clamp: `--ttl 999999999`
+  // wrote a ~1900-year expiry.
+  it('caps a wild TTL at MAX_CLAIM_TTL_MS rather than rejecting the claim', () => {
+    expect(clampTtlMs(999_999_999 * 60_000)).toBe(MAX_CLAIM_TTL_MS);
+    expect(clampTtlMs(Number.MAX_SAFE_INTEGER)).toBe(MAX_CLAIM_TTL_MS);
+  });
+
+  it('leaves a sane TTL alone, and treats junk as "use the default"', () => {
+    expect(clampTtlMs(CLI_CLAIM_TTL_MS)).toBe(CLI_CLAIM_TTL_MS);
+    expect(clampTtlMs(5 * 60_000)).toBe(5 * 60_000);
+    for (const junk of [undefined, null, 0, -1, NaN, Infinity]) {
+      expect(clampTtlMs(junk as number | undefined | null)).toBeUndefined();
+    }
+  });
+
+  it('applies the clamp at the point a claim is WRITTEN, not just in the helper', () => {
+    // The helper being right buys nothing if `claimDevice` does not use it — this is the assertion
+    // that actually pins the behaviour.
+    const res = claimDevice({ deviceId: adbDeviceId('RFTESTSERIAL1'), owner: 'cli:/tmp/x', ttlMs: 999_999_999 * 60_000 });
+    expect(res.ok).toBe(true);
+    const [written] = listClaims();
+    expect(written.ttlMs).toBe(MAX_CLAIM_TTL_MS);
+    // ...and it really does expire: one ms past the ceiling is stale.
+    expect(isStale(written, { now: written.at + MAX_CLAIM_TTL_MS + 1 })).toBe(true);
   });
 });

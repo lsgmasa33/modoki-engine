@@ -775,6 +775,7 @@ export class DeviceConnectionManager {
     // native capture 502s) — asking then would fail and refuse the feature in its motivating case.
     // Best-effort by construction: `devicePlatform` swallows its own errors and returns null.
     await this.devicePlatform();
+    this.stampClaimIdentity(landed);
     return this.status();
   }
 
@@ -808,6 +809,47 @@ export class DeviceConnectionManager {
     if (!this.target?.useAdb) return;
     try { adbRunner.removeForward(this.target.port, this.target.serial); }
     catch { /* forward may already be gone / adb absent — non-fatal */ }
+  }
+
+  /** Stamp what the phone says it IS onto this lease's claim (#285).
+   *
+   *  Only for a WiFi (`ip:`) claim, and the asymmetry is the whole point. An adb claim already names
+   *  a hardware SERIAL, which is exactly the id a raw `adb -s …` uses — a reader can match those
+   *  exactly. A WiFi claim can only name an ADDRESS, while every raw iOS CLI (`devicectl --device`,
+   *  `ideviceinstaller -u`, `xcodebuild -destination id=…`, go-ios `--udid`) names a UDID, and the
+   *  app is deliberately not allowed to report its UDID (see `deviceHardware`). So the two
+   *  namespaces cannot be joined directly, and the product type is the only fact that appears on
+   *  BOTH sides — the phone reports it here, and `xcrun`'s listing carries it for a given UDID.
+   *  Recording it lets the CLI guard say "the UDID you are about to install to is an iPhone18,4, and
+   *  another clone is holding an iPhone18,4 over WiFi" instead of shrugging.
+   *
+   *  Costs nothing on the connect path: `devicePlatform()` above has already run the one identity
+   *  probe, and `deviceHardware()` reads its latched result. Re-claiming with the same pid is a
+   *  refreshing no-op success by construction, so this can never turn a healthy lease into a refusal.
+   *  Best-effort throughout — a phone that does not report a model (a bridge older than #146) simply
+   *  leaves the field absent, which every reader is required to treat as "cannot tell". */
+  private stampClaimIdentity(landed: string): void {
+    if (landed !== 'connected') return;
+    const deviceId = this.claimedDeviceId;
+    if (!deviceId || !deviceId.startsWith('ip:')) return;
+    // Read the LATCHED identity; never call `deviceHardware()` here. That accessor ASKS, and a
+    // failed ask is deliberately not latched so it can be retried (see `deviceIdentity`) — so
+    // asking here would add a SECOND probe on precisely the connects where the first one already
+    // failed. Not hypothetical: it broke `deviceConnection.test.ts`'s "a FAILED ask is retried"
+    // (expected 1 call, got 2), which is the test that pins that rule. Nothing is lost by reading
+    // the latch: `devicePlatform()` immediately above has already run the one probe there is.
+    if (!this.platformResolved) return;
+    try {
+      const { deviceModel, osVersion } = this.hardware;
+      if (!deviceModel) return;
+      claimDevice({
+        deviceId,
+        guid: this.guid,
+        purpose: 'holding a device lease over WiFi',
+        model: deviceModel,
+        ...(osVersion ? { osVersion } : {}),
+      });
+    } catch { /* the claim is already held and usable; a missing model is never worth failing over */ }
   }
 
   /** Hand back the hardware claim, if this lease holds one. Idempotent — a second call after the

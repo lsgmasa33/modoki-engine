@@ -61,7 +61,7 @@
  *  {@link promotionCeiling}: once the boot probe measures a device, a CPU-only inference does not
  *  get to overrule the measurement. */
 
-import { BUDGET_30FPS_MS, type FrameProfile } from '../core/frameProfiler';
+import { type FrameProfile } from '../core/frameProfiler';
 import { probeVerdictStore } from '../core/probeVerdictStore';
 import { probeFingerprint, classifyMedianOf, type DeviceClass, type ProbeVerdict } from './rampProbe';
 // The GPU-identity layer (#210). Its import back to here is TYPE-ONLY (`QualityTier`), so it is
@@ -1055,12 +1055,15 @@ export function resolveTier(input: TierResolveInput): TierResolution {
 
 // ── Promotion / demotion ───────────────────────────────────────────────────────────────────
 
-/** Sustained headroom required before promotion is armed. Expressed as a RATIO of the budget,
- *  never as a device property, so it cannot ossify against hardware nobody has measured. */
-export const PROMOTION_HEADROOM_RATIO = 0.5;
-/** Fraction of the frame interval CPU may occupy and still count as headroom while vsync-bound
- *  (see `evaluateTierChange` for why the signal has to switch). */
-export const PROMOTION_CPU_RATIO = 0.4;
+/** Fraction of the NEXT tier's target frame the engine's own work may occupy and still count as
+ *  headroom. Half (owner, 2026-08-20) — see {@link hasHeadroom} for why it must stay clear of
+ *  {@link DEMOTION_CPU_SHARE}'s bar rather than merely "fit". */
+export const PROMOTION_TARGET_SHARE = 0.5;
+/** Assumed target when the tier above is UNCAPPED (`targetFps: 0` = "whatever the display gives").
+ *  Uncapped means the engine was never told what to aim for, and 60 is what the fleet's projects
+ *  author when they say anything at all — so it is the honest stand-in, and it is the CONSERVATIVE
+ *  one: assuming a longer frame would promote devices on the strength of a target nobody set. */
+export const ASSUMED_UNCAPPED_FPS = 60;
 /** Headroom must hold this long before promoting — one lucky second is not evidence. */
 export const PROMOTION_HOLD_MS = 5_000;
 /** Over budget this long triggers demotion. Shorter than promotion on purpose: promotion is an
@@ -1185,33 +1188,49 @@ export type TierDecision =
   /** Over budget. Apply IMMEDIATELY — this is an emergency, not an upgrade. */
   | { action: 'demote'; tier: QualityTier; reason: string };
 
-/** Does this profile show room to spare?
+/** Can the engine's own work fit inside the frame the tier ABOVE is asking for?
  *
- *  THE SIGNAL HAS TO SWITCH WITH THE REGIME, which is the whole reason `FrameProfile` carries
- *  `vsyncBound`. When the renderer is finishing early, `frameMs` is PINNED at the display
- *  interval and cannot go lower — so it reports "barely making 60" and "trivially making 60"
- *  identically, and judging headroom by it would promote a device that has none. While
- *  vsync-bound the honest question is how much of the frame the CPU is actually eating; only
- *  when frames run long does `frameMs` regain meaning.
+ *  ⚠️ **THIS NO LONGER LOOKS AT `frameMs` AT ALL, and that is the point** (owner, 2026-08-20).
+ *  Every previous version judged headroom from the frame INTERVAL and needed `vsyncBound` to know
+ *  which regime the interval was in — and that flag is a guess assembled from a hardcoded list of
+ *  display rates (`VSYNC_INTERVALS_MS`). The list knew 60/90/120/144 Hz, so:
  *
- *  ⚠️ **`vsyncBound` COVERS THE ENGINE'S OWN FRAME CAP, and it did not until 2026-08-12.** A loop
- *  pacing to `targetFps` is finishing early and waiting — the same regime as vsync — but the
- *  profiler's interval list held only DISPLAY intervals, so a 30-capped device (which is every
- *  project's `low` since #202 seeded `targetFps: 30`) read `frameMs.median ≈ 33.3 ms`, went
- *  `vsyncBound: false`, and fell to the branch below asking for <= 16.67 ms — **unreachable under
- *  the tier's own cap**. Live promotion out of `low` was therefore impossible fleet-wide, which
- *  silently voided #155's promised escape for a `calibrating` device. The cap is now pushed into
- *  `frameProfiler` from `setTargetFPS`, so a capped-and-comfortable device takes the CPU-ratio
- *  branch — the regime it is genuinely in. Any test for this must derive `vsyncBound` from a real
- *  profile; the hand-set `profileOf(10, 4)` fixtures describe a frame the `low` tier cannot
- *  produce and stayed green throughout the defect. */
-function hasHeadroom(p: FrameProfile): boolean {
+ *    - a 30-capped device read 33.3 ms, went `vsyncBound: false`, and fell to a branch asking for
+ *      <= 16.67 ms — unreachable under its own cap. Live promotion out of `low` was impossible
+ *      fleet-wide (#202 close-out patched it by pushing the frame cap into the profiler);
+ *    - a phone whose panel idles to 24/30/48 Hz — an LTPO S22 does exactly this after ~20 s of
+ *      static content — was in the same trap, and no amount of extending the table fixes the
+ *      class, because the next phone presents at a rate nobody listed.
+ *
+ *  The interval is set by whatever paces the frame: the workload, our own cap, or the display.
+ *  Only the first is ours. So ask the question that is actually ours to answer — **would our work
+ *  fit in the next tier's frame?** — and the whole regime problem disappears with the flag.
+ *
+ *  `promoteTargetMs` is the frame interval the tier ABOVE targets, from the caller (see
+ *  `tickTierCalibration`), because this function is pure and a tier's target is authored data.
+ *  The bar is HALF of it (owner, 2026-08-20: *"let's go half then"*), for two reasons: the higher
+ *  tier ADDS cost, so promoting a device that only just fits would promote it into a frame it no
+ *  longer fits; and the bar must sit clear of `frameIsFull`'s demotion bar or a promotion would
+ *  immediately re-qualify as a demotion — and `demoted` is sticky, so the device would land BELOW
+ *  where it started. At `targetFps: 60` that is 8.3 ms to promote against 14 ms to demote. */
+function hasHeadroom(p: FrameProfile, promoteTargetMs: number): boolean {
   if (p.samples < MIN_SAMPLES_TO_JUDGE) return false;
-  if (p.vsyncBound) {
-    const interval = p.frameMs.median;
-    return interval > 0 && p.cpuMs.median <= interval * PROMOTION_CPU_RATIO;
-  }
-  return p.frameMs.median <= BUDGET_30FPS_MS * PROMOTION_HEADROOM_RATIO;
+  // ⚠️ **A CPU STREAK CANNOT SEE A GPU-BOUND FRAME**, and dropping `frameMs` from this test
+  // dropped the only thing that could (close-out, 2026-08-20). `promotionCeiling` states the
+  // objection in as many words and is allowed to ignore it only because its own exception applies
+  // where "the GPU axis has already cleared the band above"; nothing granted this function the
+  // same cover. The scenario, which is not exotic — the Android GPU allowlist is empty, so
+  // `calibrating` is the ORDINARY state there: a device boots `low` with a ceiling of `mid`, is
+  // GPU-bound at ~100 ms frames with 5 ms of CPU, clears a 8.3 ms bar, and gets promoted into a
+  // tier that renders it slower still. Demotion cannot undo it either, because `frameIsFull` reads
+  // the same idle CPU and refuses — so the device climbs once and stays there for the session.
+  //
+  // Missing the budget you already have is disqualifying regardless of WHY. That keeps this
+  // honest without reintroducing an interval THRESHOLD (the thing that made 24 Hz look slow):
+  // `overBudget` is judged against the cap in force, so a device comfortably meeting its own
+  // target passes it, and one that is not meeting it has no business being given more work.
+  if (p.overBudget) return false;
+  return p.cpuMs.median <= promoteTargetMs * PROMOTION_TARGET_SHARE;
 }
 
 /** Is this long frame actually FULL — i.e. is the engine spending the time?
@@ -1225,7 +1244,10 @@ function hasHeadroom(p: FrameProfile): boolean {
  *  became 41.6 ms — 1000/24 to three digits — against a 20 ms budget, and calibration demoted
  *  `high → mid → low` while the engine was using **8.4 ms** of that 41.6 ms frame. The player
  *  gets `pixelRatioCap 1`, shadows off, ibl off, `textureMaxSize 512` on a flagship, and
- *  `TierChangeState.demoted` is sticky, so the session never climbs back.
+ *  `TierChangeState.demoted` then blocks promotion for the rest of the interacting stretch — it
+ *  is cleared only by an idle→active bounce (`tickTierCalibration`'s `wasIdle` reset), so "sticky
+ *  for the whole session" overstates it slightly. What made the S22 permanent in practice was
+ *  the OTHER half: promotion could not fire either, so clearing the flag bought nothing.
  *
  *  The rule (owner, 2026-08-20): **a frame we are not filling is not a frame we can relieve.**
  *  If the engine's own work fits comfortably inside the budget, there is nothing a demotion could
@@ -1260,6 +1282,7 @@ export function evaluateTierChange(
   state: TierChangeState,
   now: number,
   ceiling: QualityTier,
+  promoteTargetMs: number,
 ): { decision: TierDecision; state: TierChangeState } {
   const next = { ...state };
 
@@ -1328,12 +1351,14 @@ export function evaluateTierChange(
     return { decision: { action: 'none' }, state: next };
   }
 
-  if (hasHeadroom(profile)) {
+  if (hasHeadroom(profile, promoteTargetMs)) {
     if (next.headroomSince === 0) next.headroomSince = now;
     if (now - next.headroomSince >= PROMOTION_HOLD_MS) {
-      const detail = profile.vsyncBound
-        ? `cpu ${profile.cpuMs.median.toFixed(1)}ms of a ${profile.frameMs.median.toFixed(1)}ms frame`
-        : `median frame ${profile.frameMs.median.toFixed(1)}ms`;
+      // Reports what was actually JUDGED — cpu against the next tier's frame. It used to branch on
+      // `vsyncBound` and say "median frame Xms" in the other case, which since 2026-08-20 describes
+      // a number this decision never looked at.
+      const detail = `cpu ${profile.cpuMs.median.toFixed(1)}ms against the `
+        + `${promoteTargetMs.toFixed(1)}ms frame the next tier targets`;
       // ⚠️ THE CEILING IS CHECKED HERE, at the moment of promotion, and NOT at the top beside
       // `!up`. Both would suppress the promotion; only this one can say the device HELD the
       // headroom and was capped anyway, which is the entire difference between a diagnosable

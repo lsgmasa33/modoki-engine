@@ -52,6 +52,21 @@ export function registerTool(entry: RegisteredTool): void {
   registry.set(entry.name, entry);
 }
 
+/** Drop a tool by name. Returns whether it was there.
+ *
+ *  Exists for the DYNAMIC tail only — game-registered tools (#270), which come and go as the
+ *  human opens and closes projects. The static `modoki_*` surface never unregisters: it is
+ *  registered once at startup and lives as long as the process, which is why `registerTool`
+ *  throwing on a duplicate is safe there.
+ *
+ *  Kept deliberately narrow — there is no "replace" helper. A re-registration goes
+ *  unregister-then-register, so the duplicate throw stays armed for the case it exists to catch
+ *  (two DIFFERENT tools claiming one name) instead of being softened into an upsert that would
+ *  silently let one shadow the other. */
+export function unregisterTool(name: string): boolean {
+  return registry.delete(name);
+}
+
 export function getTool(name: string): RegisteredTool | undefined {
   return registry.get(name);
 }

@@ -602,6 +602,24 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
   }
 
+  // ── GET /api/game-tools (M→R) ── the GAME's own MCP tool declarations (#270). The MCP server
+  // polls this and materializes one real tool per entry; `version` moves whenever the game's
+  // registry changes, which is the signal to re-register and send `tools/list_changed`.
+  // An empty list is a normal answer (most projects register none, and a release build with the
+  // debug menu off reports none by design) — never an error.
+  if (urlPath === '/api/game-tools' && method === 'GET') {
+    try { return json(await ctx.requestBrowser('game-tools', {})); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+
+  // ── POST /api/game-tool-call {name, args} (M→R) ── invoke one game tool. POST because a game
+  // tool may mutate (it declares which); the reply is the handler's OWN answer, passed through.
+  if (urlPath === '/api/game-tool-call' && method === 'POST') {
+    const b = (body ?? {}) as { name?: string; args?: Record<string, unknown> };
+    try { return json(await ctx.requestBrowser('game-tool-call', { name: b.name, args: b.args ?? {} })); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+
   // ── GET /api/layout-bounds[?layer=&ids=&guids=&name=&entities=&overlaps=] (M→R) ── numeric screen-space
   // rects per entity (UI DOM rects + projected 2D/3D) + overlap/off-screen flags, so an agent
   // verifies layout WITHOUT a screenshot. Untargeted ⇒ counts only (the rects and the O(n²)

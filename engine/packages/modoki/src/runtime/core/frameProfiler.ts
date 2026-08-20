@@ -179,6 +179,12 @@ const VSYNC_INTERVALS_MS = [1000 / 60, 1000 / 120, 1000 / 90, 1000 / 144];
  *  fell to its `<= BUDGET_30FPS_MS * 0.5` branch — 16.67 ms, unreachable under a 30 fps cap — and
  *  the single promotion step `promotionCeiling` grants a `calibrating` device could never fire.
  *
+ *  ⚠️ **THAT BRANCH IS GONE (2026-08-20) — the history above is why the field exists, not how the
+ *  decision works now.** `hasHeadroom` no longer reads `frameMs` or `vsyncBound` at all; it asks
+ *  whether the engine's CPU fits the frame the NEXT tier targets. The cap still has to be pushed
+ *  in, because `budgetMs`/`overBudget` are derived from it and promotion is floored on
+ *  `!overBudget`. See `docs/rendering.md` § "an idle window is not evidence".
+ *
  *  A cap is a FRAME-DRIVER fact, not a display fact, so it is PUSHED IN rather than imported:
  *  `frameProfiler` is L0 core and the cap's owner (`frameDriver`, L2) may import downward but not
  *  the reverse. It is set from `setTargetFPS` — the single point every source of the cap goes

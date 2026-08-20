@@ -779,6 +779,30 @@ describe('an IDLE window is not evidence (bug lvROp0yDYPSzS0VZM6LH)', () => {
     expect(getActiveQualityTier()?.tier).toBe('low');
   });
 
+  it('stamps the session start even when arming happened BEFORE the first tick', () => {
+    // ⚠️ THE SENTINEL COLLISION. `firstTickAt` used to be stamped inside the `!armed` branch, which
+    // only runs while calibration is waiting to arm. `armTierCalibration()` fires from a world swap
+    // and can land BEFORE this function has ever run — and then `firstTickAt` is still `-1`, so
+    // `now - firstTickAt` is `now + 1`: in production `rawNow()` is already in the millions, so the
+    // idle report's "has this session run long enough" gate is true on the very first tick.
+    //
+    // The existing idle test cannot see this: it ticks from `t = 0`, where the sentinel and a real
+    // stamp give the same answer. Ticking from a large `now` — which is what production does — is
+    // the whole test.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      playerIsInteracting = false;
+      mockProfile = ROOMY();
+      const BOOT = 5_000_000;   // rawNow() on a real session, not a test clock starting at zero
+      for (let t = BOOT; t < BOOT + IDLE_REPORT_AFTER_MS; t += CALIBRATION_INTERVAL_MS) {
+        tickTierCalibration(t);
+      }
+      expect(warn.mock.calls.flat().join(' ')).not.toContain('calibration');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('says nothing about idleness until the session is old enough — and never says "Infinity"', () => {
     // ⚠️ TWO DEFECTS IN ONE LINE, and only one of them was cosmetic (measured on an S22, 2026-08-20).
     // The report was gated on `msSinceUserInput(now) >= ARM_BACKSTOP_MS`, and before the first input
@@ -808,6 +832,71 @@ describe('an IDLE window is not evidence (bug lvROp0yDYPSzS0VZM6LH)', () => {
     } finally {
       warn.mockRestore();
     }
+  });
+
+  it('judges promotion against the tier ABOVE\'s target — through the real caller, not a passed-in number', () => {
+    // ⚠️ THE SEAM, AND IT WAS UNCOVERED. `promotionTargetFrameMs` (tierCalibration.ts) is the only
+    // code that turns the policy into the number `evaluateTierChange` judges against in production
+    // — it reads the settings, walks `tierAbove`, resolves that tier's overrides and applies them
+    // to the project's `targetFps`. Every unit test in qualityTier.test.ts hands `promoteTargetMs`
+    // in READY-MADE, so none of them touch it. Measured during close-out: reverting `tierAbove(tier)`
+    // to `tier` — i.e. judging against the current tier's own roomy frame, the exact mistake the
+    // parameter exists to prevent — left ALL 8,006 tests green.
+    //
+    // The fixture is built so the two answers disagree, which is the only way this test can work:
+    //   authored  low.targetFps = 30  → the CURRENT tier's frame is 33.3ms → bar 16.67ms
+    //   authored  mid (no targetFps)  → inherits the project's 60 → frame 16.67ms → bar 8.33ms
+    // 12ms of engine CPU sits between them. Judged correctly (against `mid`) it must NOT promote.
+    resetRenderSettings();
+    resetTierCalibration();
+    setRenderSettings({ three: { qualityTier: 'auto', tiers: { mid: {}, low: { targetFps: 30 } } } } as never);
+    setActiveQualityTier({ tier: 'low', source: 'calibrating', reason: 'unrecognised device' });
+    armTierCalibration();
+    playerIsInteracting = true;
+    // Comfortably inside its own budget, so the `!overBudget` floor is satisfied and the CPU bar is
+    // genuinely what decides — otherwise this would pass for the wrong reason.
+    mockProfile = { ...profileOf(20, 12), overBudget: false, budgetMs: 40 };
+    for (let t = 0; t <= PROMOTION_HOLD_MS * 3; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+    expect(getPendingTierPromotion()).toBeNull();
+    expect(getActiveQualityTier()?.tier).toBe('low');
+  });
+
+  it('stands in a real target when the tier above is UNCAPPED, rather than dividing by zero', () => {
+    // `targetFps: 0` means "whatever the display gives" everywhere in this engine, and it reaches
+    // `promotionTargetFrameMs` as a plain 0. `1000 / 0` is Infinity, and a bar of Infinity makes
+    // `cpuMs <= bar` true for EVERY device — promotion would fire on hardware that has no headroom
+    // at all. The `fps > 0` guard is what stands `ASSUMED_UNCAPPED_FPS` in instead; a `>=` there
+    // reopens it, and nothing else in the suite exercises this branch because every other case
+    // leaves the project on its authored 60.
+    resetRenderSettings();
+    resetTierCalibration();
+    setRenderSettings({
+      targetFps: 0,
+      three: { qualityTier: 'auto', tiers: { mid: {}, low: { targetFps: 30 } } },
+    } as never);
+    setActiveQualityTier({ tier: 'low', source: 'calibrating', reason: 'unrecognised device' });
+    armTierCalibration();
+    playerIsInteracting = true;
+    // 12ms of CPU: over the 8.33ms bar the 60fps stand-in sets, and under the infinite one a
+    // divide-by-zero would produce. Only the guard separates these two outcomes.
+    mockProfile = { ...profileOf(20, 12), overBudget: false, budgetMs: 40 };
+    for (let t = 0; t <= PROMOTION_HOLD_MS * 3; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+    expect(getPendingTierPromotion()).toBeNull();
+  });
+
+  it('promotes when the tier above\'s target genuinely fits — the control for the seam test', () => {
+    // Same wiring, same `low` start, only the CPU changes: 6ms clears the 8.33ms bar that `mid`'s
+    // inherited 60fps target sets. Without this, the test above would pass just as happily against
+    // a `promotionTargetFrameMs` that returned 0 and made every promotion impossible.
+    resetRenderSettings();
+    resetTierCalibration();
+    setRenderSettings({ three: { qualityTier: 'auto', tiers: { mid: {}, low: { targetFps: 30 } } } } as never);
+    setActiveQualityTier({ tier: 'low', source: 'calibrating', reason: 'unrecognised device' });
+    armTierCalibration();
+    playerIsInteracting = true;
+    mockProfile = { ...profileOf(20, 6), overBudget: false, budgetMs: 40 };
+    for (let t = 0; t <= PROMOTION_HOLD_MS * 3; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+    expect(getPendingTierPromotion()).toMatchObject({ tier: 'mid' });
   });
 
   it('does NOT demote a panel-paced frame even while the player IS interacting (S22)', () => {

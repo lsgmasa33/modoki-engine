@@ -66,6 +66,10 @@
     "editor:ai": "MODOKI_BACKEND_PORT=5180 bash engine/scripts/launch-editor.sh games/3d-test",
     "editor:main:packaged": "MODOKI_BACKEND_PORT=5179 bash engine/scripts/test-packaged.sh games/3d-test",
     "editor:ai:packaged": "MODOKI_BACKEND_PORT=5180 bash engine/scripts/test-packaged.sh games/3d-test",
+    "device:claim": "node engine/scripts/device.mjs claim",
+    "device:release": "node engine/scripts/device.mjs release",
+    "device:list": "node engine/scripts/device.mjs list",
+    "device:run": "node engine/scripts/device.mjs run",
     "test:mcp:live": "npm --prefix engine/tools/modoki-mcp run test:live && npm --prefix engine/tools/modoki-mcp run smoke"
   },
   "dependencies": {

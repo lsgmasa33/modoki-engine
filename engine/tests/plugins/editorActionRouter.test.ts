@@ -339,7 +339,7 @@ describe('/api/asset-schema + /api/asset-write (Phase C, host-side)', () => {
 
 describe('relay GET routes 504 without a renderer', () => {
   const ctx = makeCtx({ requestBrowser: async () => { throw new Error('no renderer'); } });
-  for (const route of ['/api/journal', '/api/game-introspect', '/api/layout-bounds', '/api/diagnose']) {
+  for (const route of ['/api/journal', '/api/game-introspect', '/api/layout-bounds', '/api/diagnose', '/api/game-tools']) {
     it(`${route} → 504`, async () => {
       const r = (await get(route, ctx)) as { status?: number };
       expect(r.status).toBe(504);

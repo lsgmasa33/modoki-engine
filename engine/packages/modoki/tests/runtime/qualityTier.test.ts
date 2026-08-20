@@ -10,6 +10,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import {
   resolveTier, evaluateTierChange, freshTierChangeState, promotionCeiling,
+  PROMOTION_TARGET_SHARE, DEMOTION_CPU_SHARE,
   tierShadowMapSize, shadowBiasScale,
   TIER_ALLOWLIST, TIER_SETTINGS, DEFAULT_TIER_SETTING,
   iosModelTier, parseAppleModel, IOS_TIER_MIN_GENERATION,
@@ -54,6 +55,14 @@ function profile(o: {
  *  question — does sustained headroom promote — rather than accidentally testing the cap. The cap
  *  has its own describe block below, and it is the only place a lower ceiling appears. */
 const UNCAPPED: QualityTier = 'high';
+
+/** The frame the tier ABOVE is asking for, in ms — what promotion is judged against since the
+ *  headroom test stopped reading `frameMs` (owner, 2026-08-20). 60 fps is the fleet's default, so
+ *  it is what most cases here mean by "the next tier"; the bar these tests must clear is therefore
+ *  `T60 * PROMOTION_TARGET_SHARE` = 8.33 ms of engine CPU. Cases about a 30 fps next tier pass
+ *  `T30` explicitly. */
+const T60 = 1000 / 60;
+const T30 = 1000 / 30;
 
 /** Temporarily add allowlist entries — the shipped list is empty on purpose, so matching can
  *  only be exercised by injecting. Android only; iOS resolves from the model id instead. */
@@ -494,56 +503,133 @@ describe('evaluateTierChange — promotion', () => {
 
   it('does not promote before the hold elapses', () => {
     const s = freshTierChangeState();
-    const a = evaluateTierChange('low', roomy, s, 1000, UNCAPPED);
+    const a = evaluateTierChange('low', roomy, s, 1000, UNCAPPED, T60);
     expect(a.decision.action).toBe('none');
-    const b = evaluateTierChange('low', roomy, a.state, 1000 + PROMOTION_HOLD_MS - 1, UNCAPPED);
+    const b = evaluateTierChange('low', roomy, a.state, 1000 + PROMOTION_HOLD_MS - 1, UNCAPPED, T60);
     expect(b.decision.action).toBe('none');
   });
 
   it('promotes once headroom has held', () => {
     const s = freshTierChangeState();
-    const a = evaluateTierChange('low', roomy, s, 1000, UNCAPPED);
-    const b = evaluateTierChange('low', roomy, a.state, 1000 + PROMOTION_HOLD_MS, UNCAPPED);
+    const a = evaluateTierChange('low', roomy, s, 1000, UNCAPPED, T60);
+    const b = evaluateTierChange('low', roomy, a.state, 1000 + PROMOTION_HOLD_MS, UNCAPPED, T60);
     expect(b.decision.action).toBe('promote');
   });
 
   it('a single bad sample RESETS the streak — one lucky second is not evidence', () => {
     const s = freshTierChangeState();
-    const a = evaluateTierChange('low', roomy, s, 1000, UNCAPPED);
-    const b = evaluateTierChange('low', profile({ frameMs: 60, cpuMs: 50 }), a.state, 2000, UNCAPPED);
+    const a = evaluateTierChange('low', roomy, s, 1000, UNCAPPED, T60);
+    const b = evaluateTierChange('low', profile({ frameMs: 60, cpuMs: 50 }), a.state, 2000, UNCAPPED, T60);
     expect(b.state.headroomSince).toBe(0);
-    const c = evaluateTierChange('low', roomy, b.state, 1000 + PROMOTION_HOLD_MS, UNCAPPED);
+    const c = evaluateTierChange('low', roomy, b.state, 1000 + PROMOTION_HOLD_MS, UNCAPPED, T60);
     expect(c.decision.action).toBe('none'); // streak restarted, hold not yet met
   });
 
   it('will not judge on too few samples', () => {
     const thin = profile({ frameMs: 10, cpuMs: 4, samples: MIN_SAMPLES_TO_JUDGE - 1 });
     const s = freshTierChangeState();
-    const a = evaluateTierChange('low', thin, s, 1000, UNCAPPED);
-    const b = evaluateTierChange('low', thin, a.state, 1000 + PROMOTION_HOLD_MS * 3, UNCAPPED);
+    const a = evaluateTierChange('low', thin, s, 1000, UNCAPPED, T60);
+    const b = evaluateTierChange('low', thin, a.state, 1000 + PROMOTION_HOLD_MS * 3, UNCAPPED, T60);
     expect(b.decision.action).toBe('none');
   });
 });
 
-describe('evaluateTierChange — the vsync-bound signal switch', () => {
-  it('promotes a vsync-capped device that is barely working', () => {
-    // 3ms of CPU in a 16.7ms frame: genuinely idle, genuinely promotable.
+describe('evaluateTierChange — promotion is judged on CPU against the NEXT tier\'s frame', () => {
+  // ⚠️ THIS BLOCK WAS "the vsync-bound signal switch" AND THE SWITCH IS GONE (owner, 2026-08-20).
+  // Promotion used to read `frameMs` and needed `vsyncBound` to know which regime the interval was
+  // in; `vsyncBound` is a guess assembled from a hardcoded list of display rates, and a phone whose
+  // panel idles to 24 Hz (an LTPO S22 does) is in no listed regime at all. The interval is set by
+  // whatever paces the frame — workload, our cap, or the display — and only the first is ours. So
+  // the question is now "would our work fit in the frame the tier above asks for", and these cases
+  // still hold because they were always really about `cpuMs`; only the reason they hold changed.
+  it('promotes a device that is barely working', () => {
+    // 3ms of CPU against a 16.7ms next-tier frame — under the 8.33ms bar, genuinely promotable.
     const idle = profile({ frameMs: 1000 / 60, cpuMs: 3, vsyncBound: true });
     const s = freshTierChangeState();
-    const a = evaluateTierChange('low', idle, s, 1000, UNCAPPED);
-    const b = evaluateTierChange('low', idle, a.state, 1000 + PROMOTION_HOLD_MS, UNCAPPED);
+    const a = evaluateTierChange('low', idle, s, 1000, UNCAPPED, T60);
+    const b = evaluateTierChange('low', idle, a.state, 1000 + PROMOTION_HOLD_MS, UNCAPPED, T60);
     expect(b.decision.action).toBe('promote');
     expect(b.decision).toMatchObject({ reason: expect.stringContaining('cpu') });
   });
 
-  it('REFUSES to promote a vsync-capped device that is nearly out of frame', () => {
-    // THE test. 15ms of CPU in a 16.7ms frame is a device on the edge — but frameMs is pinned
-    // at the display interval, identical to the idle case above, so a frameMs-based rule would
-    // promote it and immediately blow the budget. Only cpuMs can tell these apart.
+  it('does NOT promote a GPU-bound device just because its CPU is idle', () => {
+    // ⚠️ THE HOLE THE CPU-ONLY RULE OPENED, found in close-out the same day it landed. Judging
+    // promotion purely on `cpuMs` means a frame can be catastrophic for reasons the CPU never
+    // sees — `promotionCeiling` says it outright ("a CPU streak cannot see a GPU-bound frame")
+    // and is only allowed to ignore it where the GPU axis already cleared the band above.
+    //
+    // Not exotic, either: the Android GPU allowlist ships EMPTY, so `calibrating` is the ordinary
+    // state there and such a device boots `low` with a ceiling of `mid`. At ~100 ms frames with
+    // 5 ms of CPU it clears the 8.3 ms bar, promotes into a tier that renders it slower still —
+    // and cannot come back, because `frameIsFull` reads that same idle CPU and refuses to demote.
+    // One-way, sticky, and in the direction that hurts.
+    const gpuBound: FrameProfile = {
+      ...profile({ frameMs: 100, cpuMs: 5 }), overBudget: true, budgetMs: 40,
+    };
+    const s = freshTierChangeState();
+    let st = s;
+    for (const t of [1000, 6000, 20000, 60000]) {
+      const r = evaluateTierChange('low', gpuBound, st, t, UNCAPPED, T60);
+      expect(r.decision.action).toBe('none');
+      st = r.state;
+    }
+  });
+
+  it('still promotes a device that is MEETING its budget with an idle CPU', () => {
+    // The control for the guard above, so it cannot degrade into "never promote". Same idle CPU,
+    // but the device is comfortably inside the budget it currently has — which is the entire
+    // population the promotion path exists for. If this goes quiet, live promotion is dead again
+    // (it already was, fleet-wide, before the #202 close-out).
+    const comfortable: FrameProfile = {
+      ...profile({ frameMs: 33.3, cpuMs: 5 }), overBudget: false, budgetMs: 40,
+    };
+    const a = evaluateTierChange('low', comfortable, freshTierChangeState(), 1000, UNCAPPED, T60);
+    const b = evaluateTierChange('low', comfortable, a.state, 1000 + PROMOTION_HOLD_MS, UNCAPPED, T60);
+    expect(b.decision).toMatchObject({ action: 'promote' });
+  });
+
+  it('scales the promote bar with the NEXT tier\'s target, not the current one', () => {
+    // ⭐ THE WHOLE POINT OF PASSING THE TARGET IN (owner, 2026-08-20: "current cpu time is less
+    // than 16, and next tier target fps is 60, we should promote?"). The same 12ms of engine CPU
+    // is promotable into a 30fps tier (33.3ms frame, 16.7ms bar) and is NOT promotable into a
+    // 60fps one (16.7ms frame, 8.3ms bar) — because the device has to fit in the frame it is
+    // moving TO, not the roomy one it is leaving. Judging by the CURRENT tier's frame is the
+    // mistake this parameter exists to prevent: a `low` device on a 30fps cap would look idle
+    // and get promoted into a 60fps tier it cannot hold.
+    const p = profile({ frameMs: 33.3, cpuMs: 12 });
+    const climb = (target: number) => {
+      const a = evaluateTierChange('low', p, freshTierChangeState(), 1000, UNCAPPED, target);
+      return evaluateTierChange('low', p, a.state, 1000 + PROMOTION_HOLD_MS, UNCAPPED, target)
+        .decision.action;
+    };
+    expect(climb(T30)).toBe('promote');
+    expect(climb(T60)).toBe('none');
+  });
+
+  it('cannot promote a device that would immediately qualify to demote', () => {
+    // ⚠️ THE FLAP, and why the bar is HALF the next frame rather than "does it fit". Promotion and
+    // demotion are judged against different references — the next tier's TARGET frame vs the
+    // current tier's BUDGET — so nothing structurally stops them overlapping, and an overlap is
+    // the worst outcome available: `demoted` is sticky, so a device would promote, re-qualify as
+    // over-budget-and-full, demote, and land BELOW where it started, permanently.
+    //
+    // Asserted as a property over both targets rather than one fixture, so a later tweak to either
+    // constant that reopens the gap fails here instead of on a phone.
+    for (const targetMs of [T60, T30]) {
+      const promoteBar = targetMs * PROMOTION_TARGET_SHARE;
+      const demoteBar = (targetMs * 1.2) * DEMOTION_CPU_SHARE; // budgetMs is the target * 1.2
+      expect(promoteBar).toBeLessThan(demoteBar);
+    }
+  });
+
+  it('REFUSES to promote a device that is nearly out of frame', () => {
+    // THE test, and it survives the rewrite unchanged. 15ms of CPU in a 16.7ms frame is a device
+    // on the edge — but its `frameMs` is identical to the idle case above, so any rule reading the
+    // interval promotes it and immediately blows the budget. Only `cpuMs` can tell these apart.
     const strained = profile({ frameMs: 1000 / 60, cpuMs: 15, vsyncBound: true });
     const s = freshTierChangeState();
-    const a = evaluateTierChange('low', strained, s, 1000, UNCAPPED);
-    const b = evaluateTierChange('low', strained, a.state, 1000 + PROMOTION_HOLD_MS * 3, UNCAPPED);
+    const a = evaluateTierChange('low', strained, s, 1000, UNCAPPED, T60);
+    const b = evaluateTierChange('low', strained, a.state, 1000 + PROMOTION_HOLD_MS * 3, UNCAPPED, T60);
     expect(b.decision.action).toBe('none');
   });
 });
@@ -573,22 +659,26 @@ describe('evaluateTierChange — promotion under the ENGINE\'S OWN frame cap (#2
   }
 
   it('a capped device with comfortable CPU headroom IS promotable — driven through the real profiler', () => {
-    const p = realCappedProfile(4); // 4ms of CPU in a 33.3ms capped frame: plenty of room
-    expect(p.vsyncBound).toBe(true); // sanity: this is the regime the fix targets
+    const p = realCappedProfile(4); // 4ms of CPU, well under the 8.33ms bar for a 60fps next tier
+    // `vsyncBound` is still asserted, but as a statement about the PROFILER rather than about the
+    // decision: since 2026-08-20 promotion does not read it at all. Kept because this block's value
+    // is that it drives the real `recordFrame`/`setProfilerFrameCap` path instead of a hand-set
+    // fixture — that is what made it catch #202, and it is still the only promotion test that does.
+    expect(p.vsyncBound).toBe(true);
     const s = freshTierChangeState();
-    const a = evaluateTierChange('low', p, s, 1000, 'high');
-    const b = evaluateTierChange('low', p, a.state, 1000 + PROMOTION_HOLD_MS, 'high');
+    const a = evaluateTierChange('low', p, s, 1000, 'high', T60);
+    const b = evaluateTierChange('low', p, a.state, 1000 + PROMOTION_HOLD_MS, 'high', T60);
     expect(b.decision.action).toBe('promote');
   });
 
   it('a capped device with NO cpu headroom does not promote — the cap alone is not evidence', () => {
-    // Distinguishing control: same cap, same regime, only the CPU cost differs (well past
-    // PROMOTION_CPU_RATIO of the 33.3ms capped interval).
+    // Distinguishing control: same cap, same regime, only the CPU cost differs — 20ms is well past
+    // the 8.33ms a 60fps next tier allows.
     const p = realCappedProfile(20);
     expect(p.vsyncBound).toBe(true);
     const s = freshTierChangeState();
-    const a = evaluateTierChange('low', p, s, 1000, 'high');
-    const b = evaluateTierChange('low', p, a.state, 1000 + PROMOTION_HOLD_MS * 3, 'high');
+    const a = evaluateTierChange('low', p, s, 1000, 'high', T60);
+    const b = evaluateTierChange('low', p, a.state, 1000 + PROMOTION_HOLD_MS * 3, 'high', T60);
     expect(b.decision.action).toBe('none');
   });
 });
@@ -683,8 +773,8 @@ describe('evaluateTierChange — the cap holds, and SAYS SO (#188)', () => {
 
   /** Run the profile long enough that promotion would fire if the ceiling allowed. */
   const held = (tier: QualityTier, ceiling: QualityTier) => {
-    const a = evaluateTierChange(tier, roomy, freshTierChangeState(), 1000, ceiling);
-    return evaluateTierChange(tier, roomy, a.state, 1000 + PROMOTION_HOLD_MS, ceiling);
+    const a = evaluateTierChange(tier, roomy, freshTierChangeState(), 1000, ceiling, T60);
+    return evaluateTierChange(tier, roomy, a.state, 1000 + PROMOTION_HOLD_MS, ceiling, T60);
   };
 
   it('does NOT promote past the ceiling, however long the headroom holds', () => {
@@ -707,6 +797,7 @@ describe('evaluateTierChange — the cap holds, and SAYS SO (#188)', () => {
     const noStreak = evaluateTierChange(
       'mid', profile({ frameMs: 1000 / 60, cpuMs: 15, vsyncBound: true }),
       freshTierChangeState(), 1000, 'mid',
+    T60,
     );
     expect(noStreak.decision.action).toBe('none');
   });
@@ -717,16 +808,16 @@ describe('evaluateTierChange — the cap holds, and SAYS SO (#188)', () => {
     // see one `hold` on a device that is still capped minutes later.
     const first = held('mid', 'mid');
     expect(first.state.headroomSince).toBe(0);
-    const again = evaluateTierChange('mid', roomy, first.state, 1000 + PROMOTION_HOLD_MS, 'mid');
+    const again = evaluateTierChange('mid', roomy, first.state, 1000 + PROMOTION_HOLD_MS, 'mid', T60);
     expect(again.decision.action).toBe('none'); // streak restarted
-    const later = evaluateTierChange('mid', roomy, again.state, 1000 + PROMOTION_HOLD_MS * 2, 'mid');
+    const later = evaluateTierChange('mid', roomy, again.state, 1000 + PROMOTION_HOLD_MS * 2, 'mid', T60);
     expect(later.decision.action).toBe('hold');
   });
 
   it('leaves DEMOTION completely alone — being wrong downward is the recoverable direction', () => {
     const drowning = profile({ frameMs: 60, cpuMs: 50 });
-    const a = evaluateTierChange('high', drowning, freshTierChangeState(), 1000, 'low');
-    const b = evaluateTierChange('high', drowning, a.state, 1000 + DEMOTION_HOLD_MS, 'low');
+    const a = evaluateTierChange('high', drowning, freshTierChangeState(), 1000, 'low', T60);
+    const b = evaluateTierChange('high', drowning, a.state, 1000 + DEMOTION_HOLD_MS, 'low', T60);
     expect(b.decision).toMatchObject({ action: 'demote', tier: 'mid' });
   });
 });
@@ -736,9 +827,9 @@ describe('evaluateTierChange — demotion', () => {
 
   it('demotes after sustained over-budget frames', () => {
     const s = freshTierChangeState();
-    const a = evaluateTierChange('high', slow, s, 1000, UNCAPPED);
+    const a = evaluateTierChange('high', slow, s, 1000, UNCAPPED, T60);
     expect(a.decision.action).toBe('none');
-    const b = evaluateTierChange('high', slow, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED);
+    const b = evaluateTierChange('high', slow, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED, T60);
     expect(b.decision.action).toBe('demote');
   });
 
@@ -758,8 +849,8 @@ describe('evaluateTierChange — demotion', () => {
     // old value stopped reaching the branch whose REASON STRING this test is about.
     const capped: FrameProfile = { ...profile({ frameMs: 22, cpuMs: 18 }), overBudget: true, budgetMs: 20 };
     const s = freshTierChangeState();
-    const a = evaluateTierChange('high', capped, s, 1000, UNCAPPED);
-    const b = evaluateTierChange('high', capped, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED);
+    const a = evaluateTierChange('high', capped, s, 1000, UNCAPPED, T60);
+    const b = evaluateTierChange('high', capped, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED, T60);
     expect(b.decision).toMatchObject({ action: 'demote' });
     expect(b.decision).toMatchObject({ reason: expect.stringContaining('22.0ms over the 20.0ms budget') });
     expect(String((b.decision as { reason: string }).reason)).not.toContain('33.3');
@@ -767,8 +858,8 @@ describe('evaluateTierChange — demotion', () => {
 
   it('a demotion is STICKY — never promote again, or the tier oscillates', () => {
     const s = freshTierChangeState();
-    const a = evaluateTierChange('high', slow, s, 1000, UNCAPPED);
-    const demoted = evaluateTierChange('high', slow, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED);
+    const a = evaluateTierChange('high', slow, s, 1000, UNCAPPED, T60);
+    const demoted = evaluateTierChange('high', slow, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED, T60);
     expect(demoted.state.demoted).toBe(true);
 
     // Now on `low` it runs beautifully — which is exactly what the low tier was FOR. Promoting
@@ -776,7 +867,7 @@ describe('evaluateTierChange — demotion', () => {
     const roomy = profile({ frameMs: 10, cpuMs: 4 });
     let st = demoted.state;
     for (const t of [2000, 8000, 20000, 60000]) {
-      const r = evaluateTierChange('low', roomy, st, t, UNCAPPED);
+      const r = evaluateTierChange('low', roomy, st, t, UNCAPPED, T60);
       expect(r.decision.action).toBe('none');
       st = r.state;
     }
@@ -787,7 +878,8 @@ describe('evaluateTierChange — demotion', () => {
     // 120 Hz → 24 Hz after ~20 s of static content, rAF follows, and `frameMs` becomes 41.6 ms —
     // 1000/24 — against a 20 ms budget while the engine uses 8.4 ms of it. `overBudget` alone
     // therefore said "slow device" about the fastest Android handset in the lab, demoting it
-    // high → mid → low; `demoted` is sticky, so the session never recovered and the player got
+    // high → mid → low; promotion could not fire either (see the promotion block), so the session
+    // never recovered in practice and the player got
     // pixelRatioCap 1 on a flagship. The numbers below are the ones read off the device.
     const panelPaced: FrameProfile = {
       ...profile({ frameMs: 41.6, cpuMs: 8.4 }), overBudget: true, budgetMs: 20,
@@ -795,11 +887,50 @@ describe('evaluateTierChange — demotion', () => {
     const s = freshTierChangeState();
     let st = s;
     for (const t of [1000, 3000, 9000, 30000, 120000]) {
-      const r = evaluateTierChange('high', panelPaced, st, t, UNCAPPED);
+      const r = evaluateTierChange('high', panelPaced, st, t, UNCAPPED, T60);
       expect(r.decision.action).toBe('none');
       st = r.state;
     }
     expect(st.demoted).toBe(false);
+  });
+
+  it('demotes the Huawei Y6 2019 off `mid` — measured on the phone, at both tiers', () => {
+    // ⚠️ THE ACCEPTED COST HAS A LIMIT, AND THIS IS WHERE IT SITS. `frameIsFull` declines to demote
+    // a device whose CPU is idle, which raises the obvious worry: does that strand the weak hardware
+    // this whole system exists for? Answered with the device rather than with arithmetic — Court was
+    // installed on the Huawei Y6 2019 (API 28, PowerVR Rogue GE8300, throughput index 4.782 against
+    // an S22's 143.244) on 2026-08-21 by temporarily lowering `androidMinSdk`, then PINNED to each
+    // tier in turn with `quality.set` and profiled while being played:
+    //
+    //     low (30fps cap):   frame 33.2ms = 30.1 fps   cpu 20.7ms   rest 12.6ms   over? no
+    //     mid (inherits 60): frame 22.0ms = 45.5 fps   cpu 20.5ms   rest  1.4ms   over? YES
+    //
+    // Court's `mid` authors `targetFps: 0`, so it inherits the project's 60 → budgetMs 20 → the
+    // fullness bar is 14ms. The Y6 spends 20.5ms of engine CPU there, well past it: this device
+    // demotes, and the guard is nowhere near wide enough to protect it from relief it needs.
+    //
+    // ⚠️ **THE Y6 IS CPU-BOUND, WHICH IS WHY A CPU BAR IS SAFE ON WEAK HARDWARE.** `restMs` on
+    // `mid` is 1.4ms — the GPU is barely waited on; the engine's own main thread IS the frame. It
+    // cannot reach 60 fps by arithmetic rather than by luck: 20.5ms of CPU does not fit in a
+    // 16.67ms frame whatever the GPU does. On `low` it makes its 30 fps target exactly and is NOT
+    // over budget, so nothing demotes it — the tier it boots into is already the right one.
+    //
+    // (On the phone the GPU table resolves `low` at boot and `promotionCeiling` pins it there, so
+    // it logged zero `@tier` events all session. This is the `mid` case the ladder would take on a
+    // device the table did not recognise.)
+    //
+    // ⚠️ An earlier version of this comment cited `frame 61.4ms / cpu 24.5ms` and called `low`
+    // 16 fps. That sample was taken seconds after boot with a 1678ms stall inside the window. The
+    // owner, watching the screen, said "when low, the game was running 30 fps constant" and was
+    // right — a re-read on a settled window gives 33.2ms, p95 33.6, `vsyncBound: true`. Recorded
+    // because the INSTRUMENT was what was wrong: a profiler read from a boot-adjacent window is
+    // not evidence about steady-state play, however precise its decimals look.
+    const y6OnMid: FrameProfile = {
+      ...profile({ frameMs: 22, cpuMs: 20.5 }), overBudget: true, budgetMs: 20,
+    };
+    const a = evaluateTierChange('mid', y6OnMid, freshTierChangeState(), 1000, UNCAPPED, T60);
+    const b = evaluateTierChange('mid', y6OnMid, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED, T60);
+    expect(b.decision).toMatchObject({ action: 'demote', tier: 'low' });
   });
 
   it('still demotes when the engine IS filling the frame — the relief path is intact', () => {
@@ -810,8 +941,8 @@ describe('evaluateTierChange — demotion', () => {
       ...profile({ frameMs: 83, cpuMs: 48 }), overBudget: true, budgetMs: 20,
     };
     const s = freshTierChangeState();
-    const a = evaluateTierChange('high', genuinelySlow, s, 1000, UNCAPPED);
-    const b = evaluateTierChange('high', genuinelySlow, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED);
+    const a = evaluateTierChange('high', genuinelySlow, s, 1000, UNCAPPED, T60);
+    const b = evaluateTierChange('high', genuinelySlow, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED, T60);
     expect(b.decision).toMatchObject({ action: 'demote', tier: 'mid' });
     expect(String((b.decision as { reason: string }).reason)).toContain('engine cpu 48.0ms');
   });
@@ -825,8 +956,8 @@ describe('evaluateTierChange — demotion', () => {
     const at60: FrameProfile = { ...profile({ frameMs: 45, cpuMs: 20 }), overBudget: true, budgetMs: 20 };
     const at30: FrameProfile = { ...profile({ frameMs: 45, cpuMs: 20 }), overBudget: true, budgetMs: 40 };
     const step = (p: FrameProfile) => {
-      const a = evaluateTierChange('high', p, freshTierChangeState(), 1000, UNCAPPED);
-      return evaluateTierChange('high', p, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED).decision.action;
+      const a = evaluateTierChange('high', p, freshTierChangeState(), 1000, UNCAPPED, T60);
+      return evaluateTierChange('high', p, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED, T60).decision.action;
     };
     expect(step(at60)).toBe('demote');
     expect(step(at30)).toBe('none');
@@ -835,8 +966,8 @@ describe('evaluateTierChange — demotion', () => {
   it('does not demote a high-tier device that is merely near budget', () => {
     const fine = profile({ frameMs: BUDGET_30FPS_MS - 1, cpuMs: 10 });
     const s = freshTierChangeState();
-    const a = evaluateTierChange('high', fine, s, 1000, UNCAPPED);
-    const b = evaluateTierChange('high', fine, a.state, 1000 + DEMOTION_HOLD_MS * 5, UNCAPPED);
+    const a = evaluateTierChange('high', fine, s, 1000, UNCAPPED, T60);
+    const b = evaluateTierChange('high', fine, a.state, 1000 + DEMOTION_HOLD_MS * 5, UNCAPPED, T60);
     expect(b.decision.action).toBe('none');
   });
 });
@@ -874,25 +1005,25 @@ describe('evaluateTierChange — `mid` is the rung that moves BOTH ways', () => 
 
   it('promotes mid -> high, not straight past it', () => {
     const s = freshTierChangeState();
-    const a = evaluateTierChange('mid', roomy, s, 1000, UNCAPPED);
-    const b = evaluateTierChange('mid', roomy, a.state, 1000 + PROMOTION_HOLD_MS, UNCAPPED);
+    const a = evaluateTierChange('mid', roomy, s, 1000, UNCAPPED, T60);
+    const b = evaluateTierChange('mid', roomy, a.state, 1000 + PROMOTION_HOLD_MS, UNCAPPED, T60);
     expect(b.decision).toMatchObject({ action: 'promote', tier: 'high' });
   });
 
   it('demotes mid -> low', () => {
     const s = freshTierChangeState();
-    const a = evaluateTierChange('mid', drowning, s, 1000, UNCAPPED);
-    const b = evaluateTierChange('mid', drowning, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED);
+    const a = evaluateTierChange('mid', drowning, s, 1000, UNCAPPED, T60);
+    const b = evaluateTierChange('mid', drowning, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED, T60);
     expect(b.decision).toMatchObject({ action: 'demote', tier: 'low' });
   });
 
   it('demotes high -> mid, and low promotes to mid — one rung each way', () => {
     const s = freshTierChangeState();
-    const d = evaluateTierChange('high', drowning, s, 1000, UNCAPPED);
-    expect(evaluateTierChange('high', drowning, d.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED).decision)
+    const d = evaluateTierChange('high', drowning, s, 1000, UNCAPPED, T60);
+    expect(evaluateTierChange('high', drowning, d.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED, T60).decision)
       .toMatchObject({ action: 'demote', tier: 'mid' });
-    const u = evaluateTierChange('low', roomy, s, 1000, UNCAPPED);
-    expect(evaluateTierChange('low', roomy, u.state, 1000 + PROMOTION_HOLD_MS, UNCAPPED).decision)
+    const u = evaluateTierChange('low', roomy, s, 1000, UNCAPPED, T60);
+    expect(evaluateTierChange('low', roomy, u.state, 1000 + PROMOTION_HOLD_MS, UNCAPPED, T60).decision)
       .toMatchObject({ action: 'promote', tier: 'mid' });
   });
 
@@ -906,44 +1037,59 @@ describe('evaluateTierChange — `mid` is the rung that moves BOTH ways', () => 
     // passes against the bug. What the reset actually destroys is the streak's ORIGIN — it would
     // be re-stamped to `now` every pass and never age past the hold.
     const s = freshTierChangeState();
-    const a = evaluateTierChange('mid', roomy, s, 1000, UNCAPPED);
-    const b = evaluateTierChange('mid', roomy, a.state, 3000, UNCAPPED);
+    const a = evaluateTierChange('mid', roomy, s, 1000, UNCAPPED, T60);
+    const b = evaluateTierChange('mid', roomy, a.state, 3000, UNCAPPED, T60);
     expect(b.state.headroomSince).toBe(1000);
   });
 
-  it('resolves the both-true case in the SAFE direction — demotion wins', () => {
-    // ⚠️ THIS FIXTURE USED TO BE `frameMs: 33.4, cpuMs: 8, vsyncBound` — "real on a 30Hz display"
-    // — and it was defending the S22 defect (2026-08-20). A vsync-pinned frame with the CPU at 8 ms
-    // is precisely the shape a panel produces when IT, not the engine, is pacing the frame; the
-    // demotion it asserted is the one that put a flagship on `low`. `frameIsFull` now refuses it,
-    // so the fixture had to become a frame the engine is actually filling.
+  it('promotion and demotion can never BOTH qualify — they are mutually exclusive now', () => {
+    // ⚠️ THIS TEST HAS BEEN WRONG TWICE, IN OPPOSITE DIRECTIONS, AND THE HISTORY IS THE POINT.
     //
-    // Both branches can still be true at once — this is a 120 fps-capped project (budget 10 ms)
-    // whose frames run 16 ms with 8 ms of engine CPU: over its own budget, full enough to judge,
-    // and still inside the 16.67 ms `hasHeadroom` asks for when not vsync-bound. Demotion has the
-    // shorter hold, so it fires first, and the sticky flag then ends the argument.
-    const both = { ...profile({ frameMs: 16, cpuMs: 8 }), overBudget: true, budgetMs: 10 };
-
-    // FIRST prove the fixture really is both-true, or this test degrades into "a demotable profile
-    // demotes" and would keep passing if the promotion side stopped qualifying. `low` cannot demote
-    // (no rung below it), so putting the SAME profile on `low` isolates the promotion branch.
-    const p1 = evaluateTierChange('low', both, freshTierChangeState(), 1000, UNCAPPED);
-    const p2 = evaluateTierChange('low', both, p1.state, 1000 + PROMOTION_HOLD_MS, UNCAPPED);
-    expect(p2.decision).toMatchObject({ action: 'promote' });
-
-    // NOW the ordering claim means something: on `mid`, where both branches are live, demotion's
-    // shorter hold wins and the sticky flag ends the argument.
-    const s = freshTierChangeState();
-    const a = evaluateTierChange('mid', both, s, 1000, UNCAPPED);
-    const b = evaluateTierChange('mid', both, a.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED);
-    expect(b.decision).toMatchObject({ action: 'demote', tier: 'low' });
-    expect(b.state.demoted).toBe(true);
+    // v1 asserted a demotion on `frameMs: 33.4, cpuMs: 8, vsyncBound` — "real on a 30Hz display".
+    // That is exactly the shape a panel produces when IT is pacing the frame, and it was defending
+    // the S22 defect: the demotion it demanded is the one that put a flagship on `low`.
+    //
+    // v2 (same day) kept the "both true, demotion wins" claim with a fixture contrived to satisfy
+    // both branches at once. That claim is now DEAD, structurally: promotion requires
+    // `!overBudget` and demotion requires `overBudget`, so no profile can qualify for both. The
+    // ordering rule it tested cannot be exercised because the situation it ordered cannot arise.
+    //
+    // So this asserts the stronger property instead — swept across the whole plausible space
+    // rather than at one hand-picked point, because "these are exclusive" is a claim about ALL
+    // profiles and a single fixture cannot make it.
+    // ⚠️ A SWEEP ASSERTING "never both" IS VACUOUS IF NEITHER EVER FIRES, and nothing in the
+    // assertion itself would say so — `false && false` passes exactly as loudly as a real
+    // exclusion. So both outcomes are counted and required below; a future change that quietly
+    // stopped either branch from ever qualifying fails here instead of leaving 90 green no-ops.
+    let promoted = 0, demoted = 0;
+    for (const frameMs of [8, 16, 22, 33.4, 41.6, 83]) {
+      for (const cpuMs of [2, 8, 15, 28, 60]) {
+        for (const budgetMs of [10, 20, 40]) {
+          const p: FrameProfile = {
+            ...profile({ frameMs, cpuMs }), overBudget: frameMs > budgetMs, budgetMs,
+          };
+          // Run each branch in isolation: `low` cannot demote, `high` cannot promote, so whatever
+          // each returns is that branch's own verdict rather than the pair's resolution.
+          const up1 = evaluateTierChange('low', p, freshTierChangeState(), 1000, UNCAPPED, T60);
+          const promotes = evaluateTierChange('low', p, up1.state, 1000 + PROMOTION_HOLD_MS, UNCAPPED, T60)
+            .decision.action === 'promote';
+          const dn1 = evaluateTierChange('high', p, freshTierChangeState(), 1000, UNCAPPED, T60);
+          const demotes = evaluateTierChange('high', p, dn1.state, 1000 + DEMOTION_HOLD_MS, UNCAPPED, T60)
+            .decision.action === 'demote';
+          if (promotes) promoted++;
+          if (demotes) demoted++;
+          expect(promotes && demotes).toBe(false);
+        }
+      }
+    }
+    expect(promoted).toBeGreaterThan(0);
+    expect(demoted).toBeGreaterThan(0);
   });
 
   it('never promotes after a demotion, from any rung', () => {
     const s = { ...freshTierChangeState(), demoted: true };
-    const a = evaluateTierChange('mid', roomy, s, 1000, UNCAPPED);
-    const b = evaluateTierChange('mid', roomy, a.state, 1000 + PROMOTION_HOLD_MS * 4, UNCAPPED);
+    const a = evaluateTierChange('mid', roomy, s, 1000, UNCAPPED, T60);
+    const b = evaluateTierChange('mid', roomy, a.state, 1000 + PROMOTION_HOLD_MS * 4, UNCAPPED, T60);
     expect(b.decision.action).toBe('none');
   });
 });

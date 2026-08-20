@@ -20,7 +20,9 @@ describe('agent op registry', () => {
       'layout-bounds', 'diagnose', 'set-timescale', 'set-traits',
       // #166 — the WRITE half, registered in agentBridge (runtime) so the device has it too.
       'create-entity', 'duplicate-entity', 'delete-entities', 'sim-step', 'load-scene',
-      'read-asset-def']) {
+      'read-asset-def',
+      // #270 — the game-owned MCP tool seam (runtime ops, so the device surface has them too).
+      'game-tools', 'game-tool-call']) {
       expect(ops).toContain(op);
     }
   });

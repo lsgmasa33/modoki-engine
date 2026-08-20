@@ -18,6 +18,9 @@ import { findGamesEntry } from './findGamesEntry';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './backend/gcloud';
 import { projectAssetRoots } from '../scripts/projectRoots.mjs';
 import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
+// Through the typed shell, not the .mjs directly: TypeScript consumers all enter the claim store
+// by one door, so a future caller cannot pick up a differently-typed view of the same rules.
+import { foreignClaimFor, describeConflict, adbDeviceId, iosDeviceId } from './backend/deviceClaims';
 import { acquireBuild, releasePolicy } from './backend/buildLock';
 import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, goIosBinFor, wdaTeamId, writeToolchainSettings, type BuildTarget, type ToolId } from '../toolchain';
 import { registerReimportHandler, type ReimportContext } from './reimport-registry';
@@ -1931,7 +1934,17 @@ export function assetScannerPlugin(): Plugin {
             const leaseSerial = lease.state === 'connected' && lease.target?.useAdb ? lease.target.serial : undefined;
             const picked = resolveBuildAndroidSerial(listAndroidDevices(), { projectPin: user.device.androidDeviceId, leaseSerial });
             if ('error' in picked) androidSerialError = picked.error;
-            else androidSerial = picked.serial;
+            else {
+              androidSerial = picked.serial;
+              // #285 sibling: a resolved serial can still be a SIBLING CLONE's claimed phone — the
+              // lease check just above only catches a device THIS clone leased; it says nothing
+              // about one leased elsewhere. Refused through the same androidSerialError channel as
+              // every other "can't pick a device" case, so it costs no gradle build first.
+              const foreign = foreignClaimFor(adbDeviceId(androidSerial));
+              if (foreign) {
+                androidSerialError = `${describeConflict(foreign)} (refused by the build, not just device_connect).`;
+              }
+            }
           }
           const adb = androidSerial ? `${adbBin} -s ${androidSerial}` : adbBin;
           // JAVA_HOME / ANDROID_HOME come from the SHARED toolchain (an explicit user.sdk override,
@@ -2283,6 +2296,21 @@ export function assetScannerPlugin(): Plugin {
             sendStatus(`FAILED:No iOS device configured\n${msg}`);
             res.end();
             return;
+          }
+
+          // #285 sibling: IOS_DEST is confirmed non-empty by the `iosInstall.ok` guard just above —
+          // check it against the machine-wide claims the same way the Android leg does, before the
+          // build spends minutes on `xcodebuild` only to install over a sibling clone's phone.
+          if (platform === 'ios') {
+            const foreign = foreignClaimFor(iosDeviceId(IOS_DEST));
+            if (foreign) {
+              const msg = `[build] Cannot build to this iOS device: ${describeConflict(foreign)} `
+                + '(refused by the build, not just device_connect).';
+              send(msg);
+              sendStatus(`FAILED:iOS device is claimed by another clone\n${msg}`);
+              res.end();
+              return;
+            }
           }
 
           // iOS signing needs a Team ID that maps to a signed-in Xcode account.

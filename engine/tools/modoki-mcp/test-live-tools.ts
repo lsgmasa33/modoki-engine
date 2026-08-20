@@ -47,10 +47,26 @@ await client.connect(transport);
 
 const listed = new Set((await client.listTools()).tools.map((t) => t.name));
 
+// ── The DYNAMIC tail (#270): tools the OPEN PROJECT's game registers. They are legitimately on
+// the server and legitimately absent from CONTRACTS — a contract is a static fact about the
+// engine's surface, and these are declared at runtime by whichever project happens to be open.
+//
+// Their names come from the backend, NOT from sniffing the `[game tool]` description prefix: the
+// prefix is presentation, and a guard keyed to presentation breaks the moment the wording changes
+// while still looking like it works.
+const gameTools = new Map<string, { mutates: boolean; requiresPlaying: boolean }>();
+try {
+  const res = await fetch(`${BACKEND}/api/game-tools`);
+  if (res.ok) {
+    const body = await res.json() as { tools?: { name: string; mutates: boolean; requiresPlaying?: boolean }[] };
+    for (const t of body.tools ?? []) gameTools.set(t.name, { mutates: t.mutates, requiresPlaying: t.requiresPlaying === true });
+  }
+} catch { /* no editor / older backend: there is simply no dynamic tail to account for */ }
+
 // ── The split must be TOTAL: every tool is swept, smoke-covered, or listed as uncovered. ──
 const declared = Object.keys(CONTRACTS);
 const missingFromServer = declared.filter((n) => !listed.has(n));
-const missingFromTable = [...listed].filter((n) => !declared.includes(n));
+const missingFromTable = [...listed].filter((n) => !declared.includes(n) && !gameTools.has(n));
 if (missingFromServer.length || missingFromTable.length) {
   console.error(`contract/server mismatch — table-only: ${missingFromServer.join(', ') || '(none)'}; server-only: ${missingFromTable.join(', ') || '(none)'}`);
   process.exit(1);
@@ -83,6 +99,18 @@ const overclaimed = [...COVERED_BY_SMOKE, ...Object.keys(LIVE_UNCOVERED)].filter
 if (overclaimed.length) {
   console.error(`\nThese are NON-MUTATING, so the sweep below calls them directly — remove them from the coverage buckets: ${overclaimed.join(', ')}`);
   process.exit(1);
+}
+
+// The dynamic tail gets swept too, on the same rule as the static surface: call what is safe,
+// declare what is not. `mutates` is REQUIRED on every game tool precisely so this is answerable
+// without a contract — a read-only game tool takes a bare `{}` (its params are optional by
+// construction unless declared required, and a required param would make the bare call a refusal,
+// which is still a live answer rather than a crash).
+const gameSweep = [...gameTools].filter(([, g]) => !g.mutates).map(([n]) => n);
+const gameSkipped = [...gameTools].filter(([, g]) => g.mutates).map(([n]) => n);
+if (gameTools.size) {
+  console.log(`[live] dynamic tail: ${gameTools.size} game tool(s) — sweeping ${gameSweep.join(', ') || '(none)'}`
+    + `${gameSkipped.length ? `; skipping ${gameSkipped.join(', ')} (declared mutating — would change the human's open project)` : ''}`);
 }
 
 console.log(`[live] backend ${BACKEND}`);
@@ -133,8 +161,11 @@ const EXPECTED_REFUSALS: Record<string, { match: RegExp; why: string; when?: () 
   },
 };
 
-for (const name of sweep) {
-  const args = CONTRACTS[name].minimalArgs ?? {};
+// The static surface first, then the dynamic tail. A game tool has no contract to take
+// `minimalArgs` from — a bare `{}` IS its ergonomic form, since declared params are optional
+// unless marked required.
+for (const name of [...sweep, ...gameSweep]) {
+  const args = CONTRACTS[name]?.minimalArgs ?? {};
   let verdict: Row['verdict'] = 'ok';
   let detail: string;
   try {
@@ -147,9 +178,16 @@ for (const name of sweep) {
       try { why = (JSON.parse(body) as { error?: { why?: string } }).error?.why ?? ''; } catch { /* handled below */ }
       const expected = EXPECTED_REFUSALS[name];
       const expectedActive = expected && (expected.when ? expected.when() : true);
+      // A game tool that DECLARED it needs Play, refusing while the editor is stopped, is giving a
+      // state answer — the dynamic-tail equivalent of an EXPECTED_REFUSALS entry, which cannot
+      // list a tool this harness has never heard of. Any OTHER refusal from it is still a defect,
+      // and so is this one while the editor IS playing.
+      const gameStateRefusal = gameTools.get(name)?.requiresPlaying === true
+        && observedRunMode !== 'playing' && code === 'REFUSED_BY_OP';
       if (!code) { verdict = 'DEFECT'; detail = `failed WITHOUT a §5 envelope: ${body.slice(0, 160)}`; }
       else if (ENV_CODES.has(code)) { verdict = 'env'; detail = code; }
       else if (expectedActive && expected.match.test(why)) { verdict = 'env'; detail = `${code} (expected: ${why.slice(0, 70)}…)`; }
+      else if (gameStateRefusal) { verdict = 'env'; detail = `${code} (declares requiresPlaying; editor is ${observedRunMode})`; }
       else { verdict = 'DEFECT'; detail = `${code}: ${body.slice(0, 200)}`; }
     } else {
       // A success still has to be a PARSEABLE payload — a severed blob or raw HTML is a defect the

@@ -46,6 +46,7 @@ import {
 import { setTargetFPS } from './frameDriver';
 import {
   evaluateTierChange, freshTierChangeState, promotionCeiling, configCount,
+  tierAbove, applyTierToTargetFps, resolveTierOverrides, ASSUMED_UNCAPPED_FPS,
   type QualityTier, type TierChangeState, type TierSource,
 } from './qualityTier';
 import { hasPlayerQualityTier } from './playerQualityTier';
@@ -362,6 +363,26 @@ export function applyQualityTier(tier: QualityTier, source: TierSource, reason: 
   );
 }
 
+/** The frame interval, in ms, that the tier ABOVE `tier` is asking for — the bar promotion is
+ *  judged against (see `hasHeadroom` in qualityTier.ts).
+ *
+ *  `0` from `applyTierToTargetFps` means UNCAPPED — the engine was never told what to aim for —
+ *  so it stands in {@link ASSUMED_UNCAPPED_FPS}. Returning a long frame instead (whatever the
+ *  display happens to give) would make the promotion bar trivially easy to clear, which is the
+ *  wrong direction for a target nobody authored.
+ *
+ *  With no tier above, the number is never read — the promotion branch returns first — but a real
+ *  frame is returned anyway rather than 0, so a later caller cannot inherit a bar of `0 * share`
+ *  and silently promote everything. */
+function promotionTargetFrameMs(tier: QualityTier): number {
+  const up = tierAbove(tier);
+  const settings = getRenderSettings();
+  const fps = up
+    ? applyTierToTargetFps(settings.targetFps, resolveTierOverrides(up, settings.three.tiers))
+    : settings.targetFps;
+  return 1000 / (fps > 0 ? fps : ASSUMED_UNCAPPED_FPS);
+}
+
 /** Judge the current frame profile and act. Call once per frame; it throttles itself.
  *
  *  A no-op unless the project asked for `'auto'` — a pinned tier is a decision the project
@@ -519,7 +540,15 @@ export function tickTierCalibration(now: number = rawNow()): void {
   // on a device nothing ever measured.
   const assessed = getAssessedQualityTier();
   const ceiling = promotionCeiling(assessed);
-  const { decision, state: next } = evaluateTierChange(active.tier, getFrameProfile(), state, now, ceiling);
+  // The frame the tier ABOVE is asking for — the only thing promotion is judged against now (see
+  // `hasHeadroom`). Resolved HERE rather than inside `evaluateTierChange` because a tier's
+  // `targetFps` is authored project data and that function is pure by contract; and through
+  // `resolveTierOverrides`, the one resolution point, so a project that authored no `targetFps`
+  // on that tier inherits the project's exactly as the live frame cap would.
+  const promoteTargetMs = promotionTargetFrameMs(active.tier);
+  const { decision, state: next } = evaluateTierChange(
+    active.tier, getFrameProfile(), state, now, ceiling, promoteTargetMs,
+  );
   state = next;
 
   // ⚠️ THE TARGET TIER COMES FROM THE DECISION, never from a literal here. It used to be

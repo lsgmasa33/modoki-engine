@@ -1671,9 +1671,16 @@ get backwards:
 
   Two tiers in ~66 ticks, while GPU identity had deterministically resolved `high` on that same
   phone at boot (`Adreno (TM) 730`, byte-identical across three cold launches) — so the boot answer
-  and the calibrated answer disagreed by two whole rungs on one device. And the demotion is sticky
-  in the direction that hurts: the player taps, the CPU unthrottles, and the game is now running at
-  `low` (pixelRatioCap 1, shadows off, IBL off, `textureMaxSize` 512) on a flagship. Not
+  and the calibrated answer disagreed by two whole rungs on one device. And it does not come back:
+  the player taps, the panel returns to full rate, and the game is still running at `low`
+  (pixelRatioCap 1, shadows off, IBL off, `textureMaxSize` 512) on a flagship.
+
+  ⚠️ **Why it did not come back is worth stating exactly, because "the `demoted` flag is sticky" is
+  the tempting answer and it is not the whole one** (close-out, 2026-08-20). That flag is cleared by
+  any idle→active bounce (`tickTierCalibration`'s `wasIdle` reset calls `freshTierChangeState()`),
+  so the device does get fresh chances to climb. It could not take them because PROMOTION was
+  independently impossible on that reading — see the promotion rule below. Two defects, one
+  symptom; fixing either alone leaves the phone on `low`. Not
   lab-specific either — reading a tutorial, taking a call, or looking away is the same window.
 
   The rules:
@@ -1737,6 +1744,59 @@ get backwards:
   - **The demotion `reason` now carries the CPU share** — `median frame 41.6ms over the 20.0ms
     budget for 2s (engine cpu 8.4ms of it)`. This is the one surface that explains a surprising
     tier, and for months it asserted "slow device" by omission while the engine idled.
+  - ✅ **The weak end was checked with the weak device, not with arithmetic** (2026-08-21). The
+    obvious worry about a CPU-based bar is that it strands the hardware this system exists for, so
+    Court was installed on the **Huawei Y6 2019** (API 28, below the shipping floor — `androidMinSdk`
+    lowered temporarily per [build.md](./build.md), reverted before commit) and profiled while being
+    played:
+
+    It was pinned to each tier in turn with `quality.set` and profiled while being played:
+
+    | Y6 2019 (throughput index **4.782**) | frame | fps | engine CPU | restMs | over budget? |
+    |---|---|---|---|---|---|
+    | on `low` (30 fps cap) | 33.2 ms | **30.1** | 20.7 ms | 12.6 ms | no |
+    | on `mid` (inherits 60) | 22.0 ms | **45.5** | 20.5 ms | **1.4 ms** | **yes** |
+
+    Court's `mid` authors `targetFps: 0` and so inherits the project's 60 → budget 20 ms → a
+    fullness bar of 14 ms. The Y6 spends **20.5 ms** there, well past it: on `mid` this device
+    demotes. Against the S22's idled-panel reading (41.8 ms frame, **8.7 ms** CPU) the two cases are
+    separated by ~2.4x on the one number the rule reads, which is the margin the bar actually
+    operates with.
+
+    ⭐ **The Y6 is CPU-BOUND, and that is what makes a CPU bar safe on weak hardware.** `restMs` on
+    `mid` is 1.4 ms — the GPU is barely waited on; the engine's own main thread IS the frame. It
+    therefore cannot reach 60 fps by arithmetic, not by measurement: 20.5 ms of CPU does not fit a
+    16.67 ms frame whatever the GPU does. On `low` it makes its 30 fps target exactly and is not
+    over budget, so nothing demotes it — the tier the GPU table boots it into is already right, and
+    `promotionCeiling` pins it there (zero `@tier` events all session).
+
+    ✅ **What each tier costs once its DPR was raised** (Court, 2026-08-21, owner's spec `high 3 /
+    mid 2 / low 2` for the 2D `pixiPixelRatioCap` — the knob that decides a 2D game's sharpness;
+    the three-side `pixelRatioCap` is inert for a project that renders no 3D). Each phone measured
+    on the tier the GPU table actually gives it, while being played:
+
+    | device | tier it gets | DPR | frame | fps | cpu | rest | over budget? |
+    |---|---|---|---|---|---|---|---|
+    | Galaxy S22 (index 143.2) | `high` | 3 | 16.7 ms | 59.9 | 5.6 ms | 11.2 ms | no |
+    | Galaxy A23 5G (39.4) | `mid` | 2 | 16.7 ms | 59.9 | 13.4 ms | 3.1 ms | no (budget 20) |
+    | Huawei Y6 2019 (4.8) | `low` | 2 | 33.2 ms | 30.1 | 23.3 ms | 9.9 ms | no (budget 40) |
+
+    Every rung holds its own target with room to spare, and the DPR rise cost nothing measurable on
+    either end: the Y6 took 4x the pixels at `low` with no change in frame time, and the A23 holds
+    60 fps at `mid` with ~6.6 ms of headroom. The reason is the same at both ends and is the
+    property this whole section turns on — **these devices are CPU-bound, not fill-bound**, so
+    spending the idle GPU on sharpness is close to free.
+
+    ⚠️ **The A23 is the only rung whose calibration outcome is worth thinking about**: 13.4 ms of
+    CPU sits just under `frameIsFull`'s 14 ms demotion bar and well over `hasHeadroom`'s 8.33 ms
+    promotion bar, so it stays on `mid` in both directions — which is correct, and is what a device
+    sitting comfortably in its own tier should look like.
+
+    ⚠️ **An earlier draft of this table said `low` ran at 61.4 ms / 16 fps.** That sample was taken
+    seconds after boot with a 1678 ms stall inside the window; the owner, watching the screen, said
+    the game was running at a constant 30 fps and was right. The instrument was what was wrong — a
+    profiler read from a boot-adjacent window is not evidence about steady-state play, however
+    precise its decimals look. Re-read on a settled window: 33.2 ms, p95 33.6, `vsyncBound: true`.
   - ⚠️ **Stated cost: a purely GPU-bound device with an idle CPU no longer demotes automatically.**
     `restMs` is GPU + present + idle *together* and cannot be split without timestamp queries
     (`core/gpuTimings.ts`), so CPU is the only per-frame cost measured honestly. Accepted because it
@@ -1747,13 +1807,59 @@ get backwards:
   - ⚠️ **Two existing unit tests were DEFENDING this bug** and had to change. One asserted a
     demotion on a vsync-pinned 33.4 ms frame with an 8 ms CPU, described as "real on a 30Hz display"
     — which is the S22 shape exactly. See the comments on both in `tests/runtime/qualityTier.test.ts`.
-  - **Still open, deliberately not fixed here:** `VSYNC_INTERVALS_MS` in `core/frameProfiler.ts`
-    lists only 60/90/120/144 Hz, so a device presenting at 24/30/48 Hz reads `vsyncBound: false`.
-    That no longer causes a false demotion (fullness decides that now), but it does block
-    *promotion*: `hasHeadroom`'s non-vsync branch asks for `frameMs.median <= 16.67 ms`, which a
-    48 Hz panel (20.8 ms) can never satisfy however idle its CPU. Same family as the #202 frame-cap
-    defect. Fixing it means deciding whether a device may promote on evidence gathered while its
-    panel is idled down — an owner call, since "not evidence in either direction" argues it may not.
+- ⭐ **AND PROMOTION ASKS THE SAME QUESTION, ABOUT THE NEXT TIER'S FRAME** (owner, 2026-08-20).
+  The demotion fix above left promotion still reading the interval, and that half had the mirror
+  defect: `VSYNC_INTERVALS_MS` lists only 60/90/120/144 Hz, so a device presenting at 24/30/48 Hz
+  read `vsyncBound: false` and fell to a branch asking for `frameMs.median <= 16.67 ms` — which a
+  48 Hz panel (20.8 ms) can never satisfy however idle its CPU. A phone that boots `low` on an
+  idling panel could never climb out. Same shape as the #202 frame-cap defect, one rung over.
+
+  **Extending the table was the obvious fix and is the wrong one** — the next phone presents at a
+  rate nobody listed, and it would also mean promoting on evidence gathered while the panel was
+  idled down, which "not evidence in either direction" forbids. So `hasHeadroom` stopped reading
+  `frameMs` entirely:
+
+  > **`cpuMs.median <= promoteTargetMs * PROMOTION_TARGET_SHARE`** — would our own work fit in the
+  > frame the tier ABOVE is asking for, at half of it.
+
+  - **The NEXT tier's target, not the current one**, and the difference is the bug it prevents: a
+    `low` device on a 30 fps cap has a roomy 33.3 ms frame, so judging by its own frame would call
+    12 ms of CPU idle and promote it into a 60 fps tier it cannot hold. Resolved in the caller
+    (`promotionTargetFrameMs`) through `resolveTierOverrides`, the one resolution point, so a tier
+    that authored no `targetFps` inherits the project's exactly as the live frame cap would; an
+    uncapped tier stands in `ASSUMED_UNCAPPED_FPS` (60) rather than "whatever the display gives",
+    which would make the bar trivial to clear.
+  - **HALF, not "does it fit"** (owner: *"let's go half then"*). The higher tier ADDS cost, so a
+    device that only just fits would be promoted into a frame it no longer fits. More sharply: the
+    promote bar must stay clear of the demote bar or the two overlap — at `targetFps: 60`,
+    promoting at 15 ms of CPU would immediately re-qualify as full (14 ms), and `demoted` is
+    sticky, so the device would land **below** where it started, permanently. 8.3 ms to promote
+    against 14 ms to demote. A property test asserts the gap over both targets, so a later tweak to
+    either constant fails in CI rather than on a phone.
+  - ⚠️ **BUT PROMOTION IS ALSO FLOORED ON `!overBudget`, and leaving that out was a real hole** —
+    caught in close-out the same day, before it shipped. A CPU-only rule cannot see a GPU-bound
+    frame; `promotionCeiling` says exactly that ("a CPU streak cannot see a GPU-bound frame") and
+    is allowed to ignore it only where the GPU axis already cleared the band above. Nothing granted
+    `hasHeadroom` that cover, and the old `frameMs <= 16.67 ms` branch had been carrying it by
+    accident. The scenario is ordinary rather than exotic, because the Android GPU allowlist ships
+    EMPTY and `calibrating` is the normal state there: a device boots `low` with a ceiling of
+    `mid`, sits GPU-bound at ~100 ms frames with 5 ms of CPU, clears the 8.3 ms bar and is promoted
+    into a tier that renders it slower — and it cannot come back, because `frameIsFull` reads that
+    same idle CPU and refuses to demote. One-way, and in the direction that hurts.
+
+    **Missing the budget you already have is disqualifying regardless of why.** That restores the
+    floor without reintroducing an interval THRESHOLD (the thing that made 24 Hz look slow):
+    `overBudget` is judged against the cap in force, so a device comfortably meeting its own target
+    passes, and one that is not has no business being handed more work.
+  - **A useful consequence: the two decisions are now mutually exclusive by construction** —
+    promotion requires `!overBudget`, demotion requires `overBudget`. The old "both can be true,
+    demotion wins because its hold is shorter" ordering rule is dead, and the situation it ordered
+    can no longer arise. A property test sweeps 90 profiles (frame × cpu × budget) asserting no
+    profile qualifies for both, which is the kind of claim a single fixture cannot make.
+  - **`vsyncBound` is now unread by either decision.** It survives as a profiler field (the debug
+    Profiler tab shows it, and `getRestBreakdown` still contrasts itself with it); nothing in the
+    tier policy consults it, and `VSYNC_INTERVALS_MS`' incompleteness is therefore no longer
+    load-bearing for anything.
 
   ✅ **The overlay spinner survives the stall — measured, not inferred.** The mid-play promotion
   path covers a shader recompile with `LoadingOverlay`'s spinner, which only works if a
@@ -1796,9 +1902,12 @@ get backwards:
   ✅ **The whole round trip is verified on a Galaxy S22** (2026-08-13): `mid via measured —
   cpu-limited`, a 5 s headroom streak, then `switched to 'high' — cpu 6.4ms of a 16.7ms frame
   sustained for 5s (applied at a scene boundary)`. ⚠️ Note what the same phone does on the *heavier*
-  scene: `cpu 6.8 ms` of a `16.7 ms` frame against a bar of `interval × PROMOTION_CPU_RATIO` =
+  scene: `cpu 6.8 ms` of a `16.7 ms` frame against a bar that was then `interval × 0.4` =
   **6.68 ms** — declining by 0.12 ms. The ceiling being raised does not mean a device climbs; on
   content that already spends ~41% of the frame on CPU the headroom rule is the binding constraint.
+  (That measurement predates the 2026-08-20 rewrite: the bar is now half the frame the NEXT tier
+  targets, so the same reading would be judged against 8.33 ms and would climb. The point it
+  illustrates — that headroom, not the ceiling, is usually what binds — is unchanged.)
 
   It is set **only** when the reading cleared the next band's GPU floor and missed its cpu floor,
   which is what keeps the objection above intact: there is no GPU verdict being overruled, and

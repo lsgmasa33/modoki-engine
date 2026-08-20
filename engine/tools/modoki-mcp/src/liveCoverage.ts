@@ -10,6 +10,25 @@
  *  for months because no live call ever exercised it. A list of what is NOT live-covered is only
  *  useful if something keeps it honest.
  *
+ *  THE DYNAMIC TAIL (#270) IS NOT IN THESE BUCKETS, and is not uncovered either. Tools a game
+ *  registers through `registerAgentTool` have no `CONTRACTS` entry — they are declared at runtime
+ *  by whichever project is open — so this table cannot name them. `test-live-tools.ts` sweeps them
+ *  anyway, on the same rule the static surface uses: it asks the BACKEND which tools the open game
+ *  declares, calls the ones declaring `mutates:false`, and skips the rest for the same reason
+ *  entries below are skipped — calling them would change the human's project.
+ *
+ *  That works because `mutates` is REQUIRED on every game tool, with no default, precisely so the
+ *  sweep can answer "is this safe to call" without a contract; `requiresPlaying` likewise lets it
+ *  tell a correct stopped-editor refusal from a defect. So the split stays total across BOTH
+ *  halves of the surface — it is just answered from two places, and the dynamic half's answer
+ *  cannot be asserted in CI (it needs an editor with that game open).
+ *
+ *  The CI-safe half is `engine/tests/tools/mcpGameTools.test.ts` (materialization, strict schema,
+ *  refusals, teardown when the editor goes away) plus
+ *  `engine/tests/architecture/gameAgentToolNames.test.ts` (namespacing). Spelled out here because
+ *  a coverage ledger that silently describes only part of the surface is the failure mode this
+ *  file exists to prevent.
+ *
  *  Side-effect-free — see `context.ts`.
  */
 
