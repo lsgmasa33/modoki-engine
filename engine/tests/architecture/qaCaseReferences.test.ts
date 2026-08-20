@@ -57,6 +57,13 @@ const TARGETS = [
   'web',
   'ios-air',
   'ios-8',
+  // Masaki's iPad (iPad11,1, an iPad mini 5). A THIRD iOS target rather than a variant of
+  // `ios-air`, for the same reason `editor-win` is not `editor`: the phones differ in what they
+  // can execute. The iPhone 8 cannot run WebDriverAgent at all (docs/trusted-device-input.md),
+  // so a trusted-input case handed to it is unrunnable, not failing — and an iPad is neither of
+  // the other two. Recording an iPad run under `ios-air` would be the false-pass this enum exists
+  // to prevent.
+  'ios-ipad',
   'android-s22',
   'android-a23',
   'packaged-mac',

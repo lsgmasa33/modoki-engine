@@ -807,6 +807,55 @@ No sudo, no tunnel, no manual Developer Disk Image mount is needed on 16.x — m
 8 (16.7.16): kill the running app, `ios install` + `ios launch`, whole cycle ~4s, verified by a new
 pid that outlives the tool.
 
+⚠️ **`ios install` is INTERMITTENT, and `ideviceinstaller` is the fallback that has never failed
+here** (2026-08-20, QA-BUILD-0004). The ~4s success above is real and reproducible at other times —
+but the same command also fails outright, and when it does the message points at the wrong thing:
+
+```
+ERROR failed writing — "your app is not properly signed for this device, check your codesigning
+and provisioningprofile. original error: 'ApplicationVerificationFailed' errorDescription:'Failed
+to verify code signature of .../installd.staging/temp.XXXX/extracted/App.app.ipa.app :
+0xe8008017 (A signed resource has been added, modified, or deleted.)'"
+```
+
+**Do not go hunting the signing — it is verifiably correct when this happens.** Measured on
+`games/3d-test`: `codesign --verify --deep --strict` reports *valid on disk* and *satisfies its
+Designated Requirement*; zero extended attributes; no AppleDouble, `.DS_Store`, symlinks or empty
+directories; six nested framework seals all validating; and the `embedded.mobileprovision` is the
+wildcard team profile **containing the target device's UDID**.
+
+Four controlled installs isolate it to go-ios, not to the bundle and not to iOS 16:
+
+| installer | device | result |
+|---|---|---|
+| go-ios 1.3.2 | iPhone 8 (16.7.16) | FAIL `0xe8008017` @ VerifyingApplication 40% — debug-dylib build |
+| go-ios 1.3.2 | iPhone 8 (16.7.16) | FAIL `0xe8008017` @ 40% — rebuilt `ENABLE_DEBUG_DYLIB=NO`, monolithic |
+| go-ios 1.3.2 | iPad mini (18.7.8) | FAIL `0xe8008017` @ 40% — same bundle |
+| **ideviceinstaller 1.2.0** | **iPhone 8 (16.7.16)** | **SUCCESS — InstallComplete (100%)**, same bundle |
+
+`ios install` zips the `.app` and lets `installd` extract it (note the `.ipa.app` in the error
+path); that round-trip is what breaks the signature's resource seal. libimobiledevice does not use
+that path. Two dead ends already ruled out, so nobody repeats them: it is **not** the Xcode 16
+debug-dylib layout (rebuilding monolithic changed nothing) and **not** an iOS-16 limitation (the
+iPadOS 18.7.8 control failed identically).
+
+**So: when `Build → iOS Device` fails this way, install with `ideviceinstaller` rather than
+debugging the certificate.** On 1.2.0 it takes the `.app` folder directly — no `Payload`/zip step:
+
+```bash
+ideviceinstaller -u <UDID> install /tmp/<id>-dd/Build/Products/Debug-iphoneos/App.app
+```
+
+⚠️ **`ideviceinstaller` is NOT part of Modoki's toolchain — do not design around it as a fallback.**
+`engine/toolchain/` provisions go-ios, the JDK, the Android SDK, Node, Ruby and WDA; libimobiledevice
+appears nowhere in engine code except two comments. It is on THIS Mac because it was `brew
+install`ed, so the recipe above is a machine-local workaround an agent can use here — not something
+a fresh clone on a fresh Mac will have. The product fix therefore cannot be "fall back to
+`ideviceinstaller`" as-is; it has to be either fixing/upgrading go-ios past 1.3.2, or provisioning
+libimobiledevice the way `goIosProvision.ts` provisions go-ios.
+
+Tracked as testboard bug `QMomlhq4qN3dFQfpfSVT` (p1).
+
 **iOS ≤16 — libimobiledevice** (`brew install libimobiledevice ideviceinstaller`; already on PATH on
 this Mac) is the older manual route — kept because it still works and #205 proved it, on a device
 class (an iPhone 7) that took a development-signed build with **no Xcode run at all**:
