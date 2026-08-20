@@ -168,27 +168,11 @@ function resolveEffectivePrefabOverride(
  *  Omitted (the default): behaves EXACTLY as before — this is the regression net
  *  every existing caller (enterPlay, timelinePreview, applyPrefabUndo, saveScene)
  *  depends on. */
-/** True when a live field value is indistinguishable from its trait's schema default,
- *  and therefore safe to OMIT from the scene file (the loader re-derives it).
- *
- *  Deliberately SCALAR-ONLY. A non-scalar default (array/object) in a koota SoA schema
- *  is a single shared instance handed to every entity, so "equal to the default" is
- *  neither cheap nor safe to decide: a deep compare would omit a live array that merely
- *  happens to match today, and identity compare would omit one the entity is actually
- *  ALIASING. Either way the file would stop recording a real value. Non-scalars are
- *  always written — the diff cost is small (few traits have them) and the semantics stay
- *  obvious. Same reasoning excludes AoS traits wholesale at the call site: their schema
- *  is a *function*, so there is no default to compare against at all.
- *
- *  `Object.is` (not `===`) so `NaN` matches its own default and `-0` does NOT collapse
- *  into `0` — a signed zero is a different authored value in a direction/velocity field.
- *
- *  Exported for unit testing. */
-export function isTraitDefault(value: unknown, def: unknown): boolean {
-  if (def !== null && (typeof def === 'object' || typeof def === 'function')) return false;
-  if (value !== null && (typeof value === 'object' || typeof value === 'function')) return false;
-  return Object.is(value, def);
-}
+// `isTraitDefault` moved to its own LEAF module so `prefab.ts` can share the rule without
+// importing this file's dependency graph. Re-exported here — this was its home, and
+// `@modoki/engine/editor` still surfaces it from this module.
+import { isTraitDefault } from './traitDefault';
+export { isTraitDefault };
 
 export async function serializeScene(opts?: {
   assignGuids?: boolean;

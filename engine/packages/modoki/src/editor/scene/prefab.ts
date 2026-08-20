@@ -12,6 +12,7 @@ import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { invalidatePrefab } from '../../runtime/loaders/meshTemplateCache';
 import { markOverride, clearOverrideMarks, getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
 import { isPersistentTraitField, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
+import { isTraitDefault } from './traitDefault';
 import type { AddedEntity, NestedOverridePaths } from '../../runtime/loaders/loadSceneFile';
 import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, prefabSubtreeLocalIds, deriveInstanceMemberGuids, applyStructureCore } from '../../runtime/loaders/loadSceneFile';
 
@@ -1058,9 +1059,34 @@ function snapshotAddedTraits(ecsId: number): { bag: Record<string, Record<string
     // here would silently drop them on a user-ADDED prefab child, breaking the
     // "survives a save" guarantee. data-key fallback keeps full fidelity.
     const schema = (meta.trait as { schema?: Record<string, unknown> }).schema;
-    const keys = schema && typeof schema === 'object' ? Object.keys(schema) : Object.keys(data);
+    const soa = !!schema && typeof schema === 'object';
+    const keys = soa ? Object.keys(schema!) : Object.keys(data);
     const copy: Record<string, unknown> = {};
-    for (const key of keys) copy[key] = data[key];
+    for (const key of keys) {
+      // Skip a field still holding its schema default — the rule serialize.ts applies to a
+      // top-level entity, which the note above has always CLAIMED this mirrors and did not.
+      //
+      // Safe because an added child has NO prefab base to diff against: it is a whole new entity,
+      // and `spawnNode` (loadSceneFile.ts) rebuilds it with `meta.trait(d)`, so koota refills
+      // every absent key from the same schema this compared against. Round-trip identical.
+      //
+      // NOT the same thing as a member OVERRIDE, and the distinction is load-bearing:
+      // `captureInstanceOverrides` diffs against the PREFAB's value, so overriding a prefab's
+      // non-default back to the schema default is still written. Nothing here touches that path.
+      //
+      // Safe through PROMOTION too (`insertAddedSubtree` folds an added child into the prefab as
+      // a member): `getOverrideValues` already reads an absent base field as the schema default
+      // — see its own ⚠️ note — because prefab files already omit fields. So a compacted child
+      // promoted into a prefab does not make every instance report a spurious override.
+      //
+      // Two exclusions carried over verbatim from serialize.ts. AoS traits (function schema) have
+      // no per-key schema to compare against and stay FULL — that is the fidelity case the note
+      // above exists for (AudioSource.clips, SkinnedMeshRenderer.materials,
+      // AnimationLibrary.animSets; the bone-map-lost-on-save bug). And an `entityId` field is
+      // never skipped: a default entity reference is a meaningful value, not an absence.
+      if (soa && !meta.fields[key]?.entityId && isTraitDefault(data[key], schema![key])) continue;
+      copy[key] = data[key];
+    }
     if (meta.name === 'EntityAttributes') guid = (data.guid as string) || '';
     bag[meta.name] = copy;
   }
@@ -1595,7 +1621,32 @@ function insertAddedSubtree(
   const traits: Record<string, Record<string, unknown> | boolean> = {};
   for (const [name, data] of Object.entries(node.traits)) {
     if (name === 'PrefabInstance') continue;
-    traits[name] = data === true ? true : { ...(data as Record<string, unknown>) };
+    if (data === true) { traits[name] = true; continue; }
+    // RE-EXPAND to the full schema on the way INTO a prefab. A scene's `added` bag is COMPACTED
+    // (a field at its schema default is omitted — see snapshotAddedTraits), but a prefab FILE is
+    // deliberately written FULL by serializePrefab, and the reason is a real consumer rather than
+    // taste: Court's `layoutFromPrefabDoc` reads prefab fields BY NAME and its `num()` helper
+    // returns null for a missing one, so the caller silently falls back to code constants. An
+    // authored value that merely HAPPENS to equal its default would read as "not authored".
+    //
+    // Promotion is the one place the two conventions meet, so it is the one place that has to
+    // convert. Without this, a child promoted out of an instance would land compacted beside
+    // members written full — the same prefab file in two shapes, and only the promoted rows
+    // misread. (Before compaction existed this was consistent by accident, which is exactly how a
+    // change like that introduces a bug two subsystems away.)
+    const meta = getTraitByName(name);
+    const schema = (meta?.trait as { schema?: Record<string, unknown> } | undefined)?.schema;
+    const bag: Record<string, unknown> = schema && typeof schema === 'object'
+      ? { ...schema, ...(data as Record<string, unknown>) }   // AoS (function schema) stays as-is
+      : { ...(data as Record<string, unknown>) };
+    // Then the same two subtractions serializePrefab applies, or promotion would smuggle in what
+    // a template must not carry: runtime read-back / scene-only fields, and BLANK asset refs
+    // (`authoredAssetRefs.test.ts` fails the build on those, #53).
+    if (meta) {
+      for (const key of Object.keys(bag)) if (isTemplateExcludedField(meta, key)) delete bag[key];
+      for (const field of REF_FIELDS_BY_TRAIT[name] ?? []) if (bag[field] === '') delete bag[field];
+    }
+    traits[name] = bag;
   }
   let ea = traits['EntityAttributes'];
   if (!ea || ea === true) { ea = {}; traits['EntityAttributes'] = ea; }

@@ -26,6 +26,9 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
     /// True when the listener ended up on an OS-assigned port instead of 9095 — i.e. no host can
     /// reach it without being told the number (#283).
     private var onFallbackPort = false
+    /// One retry announcement per start attempt — the retry re-enters `startListener`, so an
+    /// unguarded log would print once per attempt across the whole window.
+    private var retryAnnounced = false
     /// How long to keep retrying the PREFERRED port before accepting an OS-assigned one (#283).
     /// Mirrors the Android plugin, and is sized from the same measured handover: launching a
     /// Modoki game while another is foregrounded, the incoming app lost the 9095 bind by 449 ms
@@ -68,6 +71,7 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
         let preferred = UInt16(call.getInt("port") ?? 9095)
+        retryAnnounced = false
         let deadline = Date().addingTimeInterval(Double(Self.bindRetryWindowMs) / 1000.0)
         startListener(on: preferred, allowFallback: true, retryUntil: deadline, call: call)
     }
@@ -127,6 +131,13 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
                 self.listener = nil
                 if allowFallback, case .posix(let code) = err, code == .EADDRINUSE {
                     if Date() < retryUntil {
+                        // Announce the WAIT, not just its outcome — the Android side gained this
+                        // line only after a live test showed the port handover left no trace
+                        // anyone would grep for (#283). Logged once, on the first retry.
+                        if !self.retryAnnounced {
+                            self.retryAnnounced = true
+                            print("[GameDebug] port \(port) busy — retrying for up to \(Self.bindRetryWindowMs)ms")
+                        }
                         // Same port, after a beat — the previous owner is most likely mid-release.
                         // Async rather than a sleep: this runs on the listener's state-update
                         // handler, and blocking it would stall the very callback the retry needs.

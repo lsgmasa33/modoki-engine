@@ -192,6 +192,15 @@ Two limits on that check, both measured on the Samsung 2026-08-02 — know them 
   a message naming the fix. A fallback is now also **announced** — `startServer`/`getStatus` return
   `fallbackPort: true`, and the JS side `console.warn`s it (a `_log` would be invisible, since the
   console ring keeps only warn/error).
+- ⚠️ **iOS: the normal path is device-verified, the RETRY is not.** On an iPad mini (iPad11,1,
+  18.7.8) the rebuilt plugin binds 9095 and reports `{"port":9095,"fallbackPort":false}` from both
+  `startServer` and `getStatus` — so the Swift compiles, runs, and does not break the happy path.
+  The retry itself never fired: with `court` (an older build that does bind 9095) launched first at
+  gaps of 2/3/4/6 s, the incoming app got 9095 cleanly every time, because iOS released the
+  outgoing app's port before the new one bound. So iOS's handover looks clean where Android's is
+  not, and the retry path there is UNTRIGGERED rather than proven. Read the plugin's output with
+  `xcrun devicectl device process launch --console` — it carries the Swift `print()`s, and unlike
+  `idevicesyslog` (which captured nothing here) it is provisioned by the toolchain.
 - ⭐ **The host now DISCOVERS the port, because the retry alone is not a closure** — the outgoing
   app does not always release at all (measured: Court held 9095 through a full skin-test launch with
   no `Server stopped` ever logged, so no retry window could have helped). Over adb, with no explicit

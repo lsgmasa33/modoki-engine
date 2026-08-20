@@ -22,6 +22,28 @@ describe('getOverrideValues', () => {
     expect(getOverrideValues(1, { Transform: { x: 5, y: 10, z: 0 } }, prefab)).toEqual({});
   });
 
+  /** ── the boundary that makes added-child COMPACTION safe (kxcE2EBsVmrbbHpBzXMb) ──
+   *
+   *  `snapshotAddedTraits` now omits a field holding its SCHEMA default, because an added child
+   *  has no prefab base and the loader refills from the schema. A member OVERRIDE is the opposite
+   *  case and must NOT be compacted the same way: it is diffed against the PREFAB's value, so
+   *  setting a field back to the koota default is a real, writable override whenever the prefab
+   *  holds a non-default. This pins that the two rules stay apart.
+   *
+   *  (The mirror direction — an ABSENT base field reading as the schema default, which is what
+   *  lets a compacted child be promoted into a prefab without every instance reporting a spurious
+   *  override — is already covered by the "a base field that is ABSENT falls back to the schema
+   *  default" describe below, which registers a trait double so the fallback actually runs.
+   *  `Transform` is not registered in this file, so a test written here would pass on
+   *  `getTraitByName` returning undefined rather than on the behaviour.) */
+  it('WRITES an override that sets a field to the koota default, when the prefab holds a non-default', async () => {
+    const { getOverrideValues } = await getModule();
+    const prefab = makePrefab([{ localId: 1, traits: { Transform: { x: 42 } } }]);
+    // Live value 0 IS Transform.x's schema default — and still an override, because the base is 42.
+    // No schema lookup is involved: `x` is present in the base, so this is meaningful unregistered.
+    expect(getOverrideValues(1, { Transform: { x: 0 } }, prefab)).toEqual({ Transform: { x: 0 } });
+  });
+
   it('emits the new value for changed numeric fields', async () => {
     const { getOverrideValues } = await getModule();
     const prefab = makePrefab([{ localId: 1, traits: { Transform: { x: 5, y: 10, z: 0 } } }]);

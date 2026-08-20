@@ -156,8 +156,36 @@ the `modoki_list_traits` MCP tool.
 
 Note this is a *serializer* rule, not a format version: it changes what a save writes, not
 what a load accepts, so no migration is involved and older fully-populated files keep
-loading unchanged. It applies to scene files only — prefab files go through a separate
-path in `prefab.ts` and still write every field.
+loading unchanged.
+
+**Where it applies, and the one boundary between the two conventions:**
+
+- **Scene entities** — compacted, as above.
+- **A prefab instance's `added` children** (structural overrides, `snapshotAddedTraits` in
+  `prefab.ts`) — **also compacted**, and for the same reason: an added child has no prefab base
+  to diff against, it is a whole new entity, and `spawnNode` rebuilds it with `meta.trait(d)`
+  so koota refills every absent key. It used to be written FULL while its own comment claimed
+  to mirror `serialize.ts`, which made every added subtree track whatever fields the schema
+  happened to have on the day it was saved — `skinned-test.scene.json` grew
+  `castShadow`/`receiveShadow` on a re-save years later (bug `kxcE2EBsVmrbbHpBzXMb`).
+- **Prefab FILES** — still write every field, and that is deliberate rather than an oversight.
+  `serializePrefab` drops only blank asset refs (`REF_FIELDS_BY_TRAIT`, #53). Full omission
+  would break a real consumer: Court's `layoutFromPrefabDoc` reads prefab fields **by name**
+  and its `num()` helper returns `null` for a missing one, so the caller silently falls back to
+  code constants — an authored value that merely *happens* to equal its default would read as
+  "not authored".
+- ⚠️ **`insertAddedSubtree` is where those two meet and must CONVERT.** Applying an added child
+  to its prefab promotes it into a prefab member, so the compacted bag is re-expanded to the
+  full schema on the way in (minus template-excluded fields and blank refs, exactly as
+  `serializePrefab` does). Without that step a promoted row lands compacted beside members
+  written full — one prefab file in two shapes, with only the promoted rows misread.
+
+**Not the same thing as an OVERRIDE.** A member override is diffed against the *prefab's*
+value (`getOverrideValues`), not against the schema, so setting a field back to the koota
+default is still a real, written override whenever the base holds a non-default. And a field
+**absent** from a prefab base reads as the schema default rather than as `undefined` — which
+is what lets a compacted child be promoted without every instance reporting a spurious
+override.
 
 **Which fields persist is decided by the koota `.schema`, never by `meta.fields`.**
 `meta.fields` is the *Inspector's* curated list: a persistent field owned by a custom

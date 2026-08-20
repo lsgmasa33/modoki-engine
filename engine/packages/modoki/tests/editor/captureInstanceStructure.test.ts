@@ -123,6 +123,76 @@ describe('captureInstanceStructure', () => {
     entityInfos = [];
   });
 
+  /** ── added children are COMPACTED, like any top-level entity ──────────────────
+   *
+   *  `snapshotAddedTraits` used to copy every schema key unconditionally, while its own comment
+   *  claimed to "Mirror serialize.ts EXACTLY" — which skips a field still holding its default.
+   *  The result was churn: the written subtree tracked whatever fields the trait schema happened
+   *  to have on the day it was saved, so `skinned-test.scene.json` grew `castShadow`/`receiveShadow`
+   *  on a re-save years later (bug `kxcE2EBsVmrbbHpBzXMb`).
+   *
+   *  Omitting is lossless here because an added child has NO prefab base: `spawnNode` rebuilds it
+   *  with `meta.trait(d)` and koota refills every absent key from the same schema. */
+  describe('added-child trait compaction', () => {
+    it('omits a field still holding its schema default', async () => {
+      const { captureInstanceStructure } = await getModule();
+      const prefab = makePrefab([{ localId: 1, name: 'Root', traits: { EntityAttributes: { name: 'Root', parentId: 0 } } }]);
+      const rootId = spawnMember(1, 0, 'Root');
+      spawnPlain(rootId, 'Crown', 'guid-crown');   // Transform({x:1}) — y/z/rx../sz all default
+
+      const t = captureInstanceStructure(ROOT, prefab as any).added[0].traits.Transform as Record<string, unknown>;
+      expect(t.x).toBe(1);                          // the authored value survives
+      expect(Object.keys(t)).toEqual(['x']);        // ...and nothing else is written
+    });
+
+    it('keeps a non-default value on every field that has one', async () => {
+      const { captureInstanceStructure } = await getModule();
+      const prefab = makePrefab([{ localId: 1, name: 'Root', traits: { EntityAttributes: { name: 'Root', parentId: 0 } } }]);
+      const rootId = spawnMember(1, 0, 'Root');
+      const e = testWorld.spawn(EntityAttributes({ name: 'Tilted', parentId: rootId, guid: 'g-t' }), Transform({ x: 1, ry: 0.5, sz: 2 }));
+      entityIndex.set(e.id(), e);
+      entityInfos.push({ id: e.id(), name: 'Tilted', parentId: rootId, sortOrder: 0, traits: ['EntityAttributes', 'Transform'] });
+
+      const t = captureInstanceStructure(ROOT, prefab as any).added[0].traits.Transform as Record<string, unknown>;
+      expect(t).toEqual({ x: 1, ry: 0.5, sz: 2 });
+    });
+
+    /** AoS traits expose a FUNCTION schema, so there is no per-key default to compare against —
+     *  they stay full. This is the fidelity case the surrounding comment exists for: reading the
+     *  curated `meta.fields` here once dropped `slots`-shaped non-scalars on a save. */
+    it('leaves an AoS trait FULL, including a field absent from meta.fields', async () => {
+      const { captureInstanceStructure } = await getModule();
+      const prefab = makePrefab([{ localId: 1, name: 'Root', traits: { EntityAttributes: { name: 'Root', parentId: 0 } } }]);
+      const rootId = spawnMember(1, 0, 'Root');
+      const e = testWorld.spawn(
+        EntityAttributes({ name: 'Speaker', parentId: rootId, guid: 'g-s' }),
+        Transform({ x: 1 }),
+        AudioBank({ node: '', slots: { a: 'x' } }),   // `node` IS its default — must still survive
+      );
+      entityIndex.set(e.id(), e);
+      entityInfos.push({ id: e.id(), name: 'Speaker', parentId: rootId, sortOrder: 0, traits: ['EntityAttributes', 'Transform', 'AudioBank'] });
+
+      const bag = captureInstanceStructure(ROOT, prefab as any).added[0].traits.AudioBank as Record<string, unknown>;
+      expect(bag).toEqual({ node: '', slots: { a: 'x' } });
+    });
+
+    /** A trait whose every field is default still appears — compaction removes FIELDS, never a
+     *  whole trait. ApplyPrefabDialog counts trait NAMES off this bag, so dropping one would
+     *  silently shrink what the dialog offers to apply. */
+    it('keeps an all-default trait as an empty bag, so the trait itself is not lost', async () => {
+      const { captureInstanceStructure } = await getModule();
+      const prefab = makePrefab([{ localId: 1, name: 'Root', traits: { EntityAttributes: { name: 'Root', parentId: 0 } } }]);
+      const rootId = spawnMember(1, 0, 'Root');
+      const e = testWorld.spawn(EntityAttributes({ name: 'Plain', parentId: rootId, guid: 'g-p' }), Transform(), Rotate3D());
+      entityIndex.set(e.id(), e);
+      entityInfos.push({ id: e.id(), name: 'Plain', parentId: rootId, sortOrder: 0, traits: ['EntityAttributes', 'Transform', 'Rotate3D'] });
+
+      const traits = captureInstanceStructure(ROOT, prefab as any).added[0].traits;
+      expect(Object.keys(traits).sort()).toEqual(['EntityAttributes', 'Rotate3D', 'Transform']);
+      expect(traits.Rotate3D).toEqual({});          // present, and empty
+    });
+  });
+
   it('captures a user-added child as an added subtree anchored to its member parent', async () => {
     const { captureInstanceStructure } = await getModule();
     const prefab = makePrefab([{ localId: 1, name: 'Root', traits: { EntityAttributes: { name: 'Root', parentId: 0 } } }]);
