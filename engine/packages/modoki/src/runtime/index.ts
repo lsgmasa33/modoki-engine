@@ -28,9 +28,15 @@ export {
 } from './core/config';
 export type { GameDefinition, EditorPanelDef } from './core/gameDefinition';
 export {
-  registerAppServices, appServices, clearAppServices,
+  registerAppServices, appServices, clearAppServices, onAppServicesRegistered,
   type AppServices, type CrashlyticsService, type AdsService, type AttributionService,
 } from './core/appServices';
+// Global JS error capture -> the `crashlytics` service (#275). The test seam
+// (`__resetGlobalErrorsForTest`) is deliberately NOT here — a test imports the module directly,
+// and the barrel is the public API games and the editor see.
+export {
+  installGlobalErrorHandlers, captureToCrashlytics, reportReactError, type CaptureKind,
+} from './core/globalErrors';
 export {
   PlayerPrefs, InMemoryBackend, LocalStorageBackend, PreferencesBackend, selectDefaultBackend,
   type JsonValue, type PlayerPrefsInitOptions, type PrefsBackend,

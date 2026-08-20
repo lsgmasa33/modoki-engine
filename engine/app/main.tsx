@@ -5,9 +5,15 @@ import './sharedRegistry'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
+// Global JS error capture -> the game's `crashlytics` app-service (#275). A SIDE-EFFECT import,
+// and it must stay ABOVE `./App.tsx`: imports are hoisted and evaluated in source order before any
+// statement below runs, so calling the installer as main.tsx's first statement would still let
+// App.tsx's whole module graph execute uncovered. See ./installErrorCapture.ts.
+import './installErrorCapture'
 import App from './App.tsx'
 import { Capacitor } from '@capacitor/core'
 import { setJournalEnabled, setDebugMenuEnabled, setDebugHandlesEnabled, setTierFrameCapEnabled, setTierCalibrationEnabled, setBootProbeAllowed, readPerfProfile, setProfilerEnabled } from '@modoki/engine/runtime'
+
 
 // Debug build — event-journal recording gate. ON in the editor (dev + the packaged
 // Electron editor, __MODOKI_EDITOR__) and in a game build that opts in via

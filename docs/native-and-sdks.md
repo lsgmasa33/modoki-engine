@@ -110,13 +110,53 @@ Analytics, crashlytics, ads, and attribution are **app/game concerns, not engine
 - `engine/packages/modoki/src/runtime/core/appServices.ts` — the registry: `registerAppServices(services)` (merge-registers), `appServices()` (read the current set), `clearAppServices()` (drop them on game swap). Interfaces `CrashlyticsService` (`recordError`/`log`), `AdsService` (`init`/`cleanup`), `AttributionService` (`init`).
 - `engine/packages/modoki/src/runtime/core/gameDefinition.ts` — the `GameDefinition.registerAppServices?()` hook a project implements.
 - `games/3d-test/packages/app-services/src/index.ts` — a game's implementation: `register()` calls `registerAppServices({ crashlytics, ads, attribution })`, wiring its own `crashlytics.ts` / `ads.ts` / `attribution.ts` into the engine surface.
-- `engine/app/App.tsx` — the shell that drives the lifecycle; `engine/app/ui/components/ErrorBoundary.tsx` + `runtime/store/gameStore.ts` — the engine-side callers of `crashlytics`.
+- `engine/app/App.tsx` — the shell that drives the lifecycle.
+- `engine/packages/modoki/src/runtime/core/globalErrors.ts` + `engine/app/installErrorCapture.ts` — the engine's **global JS error capture** (#275). The largest caller of `crashlytics`, and the one a shipped build most depends on — see below.
+- `engine/app/ui/components/ErrorBoundary.tsx` (via `reportReactError`) and `runtime/store/gameStore.ts` (screen breadcrumbs) — the other two engine-side callers.
 
 ### How it works
 
-The engine sees only the **small hook surface** — `crashlytics.recordError/log`, `ads.init/cleanup`, `attribution.init`. A game's package keeps its full API (`showInterstitial`, `logEvent`, `setUserProperty`, …) for the game itself to import and call directly; the engine never sees those. On game bootstrap `App.tsx` calls, in order: `def.registerAppServices()` (the game populates the registry), then — **only on `Capacitor.isNativePlatform()`** — `appServices().attribution?.init()` and `appServices().ads?.init()`. Ads are cleaned up (`appServices().ads?.cleanup()`) on unmount. Crashlytics is pull-driven: `ErrorBoundary` calls `appServices().crashlytics?.recordError(message)` and `gameStore` logs screen breadcrumbs via `appServices().crashlytics?.log(...)`.
+The engine sees only the **small hook surface** — `crashlytics.recordError/log`, `ads.init/cleanup`, `attribution.init`. A game's package keeps its full API (`showInterstitial`, `logEvent`, `setUserProperty`, …) for the game itself to import and call directly; the engine never sees those. On game bootstrap `App.tsx` calls, in order: `def.registerAppServices()` (the game populates the registry), then — **only on `Capacitor.isNativePlatform()`** — `appServices().attribution?.init()` and `appServices().ads?.init()`. Ads are cleaned up (`appServices().ads?.cleanup()`) on unmount. Crashlytics is pull-driven: `gameStore` logs screen breadcrumbs via `appServices().crashlytics?.log(...)`, `ErrorBoundary` reports a React subtree crash through `reportReactError`, and the global capture below reports everything else.
 
 **Every hook is optional and every unregistered hook is a silent no-op** (callers use `?.`) — which is also the correct web/editor behaviour, since the underlying Capacitor plugins stub out off-device anyway. On a game switch `App.tsx` calls `clearAppServices()` **before** the next game's `registerAppServices()`, so a previous game's ad/attribution SDKs don't leak into the next game. Native SDK init is no longer wired in `main.tsx` — that comment there points here. The game package is also the dogfood stand-in for a future Modoki-hosted npm package (see `docs/modoki-package-manager.md`).
+
+### Global JS error capture (#275)
+
+**A shipped build had none.** `window.addEventListener('error'|'unhandledrejection')` existed in four
+files and every one is a debug or editor surface a release build does not carry — `agentBridge.ts`
+and `hmrStaleness.ts` behind `if (__MODOKI_EDITOR__)`, `bridge.ts` behind `build.debugBuild`, and
+`src/editor/consoleCapture.ts` by location. So an uncaught throw outside a React subtree, an async
+failure in a system, or a rejected asset load reached nothing at all in production. `globalErrors.ts`
+closes that, and it is **deliberately ungated** — the same reason analytics may not ride the event
+journal, which `setJournalEnabled` switches off in a release build.
+
+- **`console.error` → `recordError` (a non-fatal ISSUE); `console.warn` → `log` (a BREADCRUMB).**
+  Two different Crashlytics concepts: an issue is grouped and alerted on, a breadcrumb is visible
+  only inside somebody else's report. A game warns on ordinary paths, and promoting those to alerting
+  issues buries the one report that is a real crash.
+- ⚠️ **It is installed by a SIDE-EFFECT IMPORT above `./App.tsx`, not by a call.** ES imports are
+  hoisted and evaluated before any statement of the importing module, so the installer written as
+  `main.tsx`'s first statement still ran after App.tsx's whole module graph — leaving a top-level
+  throw there uncovered, which reaches a player as a blank screen on launch reporting nothing.
+  `engine/tests/architecture/errorCaptureInstallOrder.test.ts` parses the import list (a text match
+  would be satisfied by the comment explaining the rule) and fails if the order moves.
+- **Events raised before a game registers its services are QUEUED**, then flushed on
+  `onAppServicesRegistered` — a crash during boot is the one worth most and the one a
+  fire-and-forget handler loses.
+- **Rate limiting, three layers, and their ORDER is load-bearing**: per-message dedupe first (it
+  counts attempts), then the session cap, then the burst window — charged only for a message about
+  to be sent. Charging the burst window first meant a deduped per-frame warning could exhaust it
+  with attempts that never reached the SDK, and the next unrelated first-ever crash was dropped.
+- ⚠️ **Both Capacitor and React `console.error` an error they are already reporting**, so one fault
+  arrived as two issues until the capture learned to defer a lone-`Error` console report by a
+  microtask and let the richer report claim the object first.
+- The **re-entrancy latch is synchronous and a real service is async**, so what bounds the
+  report-the-report bounce is the game wrapper's own once-per-message latch. Measured at two
+  messages and pinned by a test.
+
+A worked example of a game filling the slot — including the Firebase wrapper, the Proxy-thenable
+trap, the gradle/dSYM wiring and the on-device verification — is
+[games/court/attribution.md](../games/court/attribution.md) § "Phase 7 — Crashlytics".
 
 ## AppLovin MAX Mediation (12 networks)
 

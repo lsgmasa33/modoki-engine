@@ -1,5 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react';
-import { getCurrentWorld, appServices, type World } from '@modoki/engine/runtime';
+import { getCurrentWorld, reportReactError, type World } from '@modoki/engine/runtime';
 
 /** Active game's reset function — set by GameShell when a game loads. */
 let activeResetPhase: ((world: World) => void) | null = null;
@@ -24,8 +24,12 @@ export default class ErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
-    const message = `${error.message}\n${info.componentStack ?? ''}`;
-    appServices().crashlytics?.recordError(message);
+    // NOT `appServices().crashlytics?.recordError(...)` directly any more (#275). Going through
+    // the engine's capture module buys two things this call site was missing: React ALSO logs a
+    // caught error to `console.error`, which the global console wrap would otherwise turn into a
+    // second Crashlytics issue for the same crash (measured on a Galaxy S22, 2026-08-20); and a
+    // boundary caught in a re-render loop is now rate-limited instead of flooding.
+    reportReactError(error, info.componentStack);
   }
 
   handleRestart = () => {

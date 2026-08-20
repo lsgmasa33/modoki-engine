@@ -22,3 +22,16 @@ export function register(): void {}
 export function track(_name: string, _params?: Record<string, string | number>): void {}
 export function setTrackProperty(_track: string): void {}
 export function startInstallMilestones(): void {}
+
+/** Crash reporting — a no-op for the same reason. An ad creative has no Firebase app, and the
+ *  Crashlytics SDK behind the real wrapper is byte weight the cap cannot afford. Exported as a
+ *  namespace object because that is the shape `export * as crashlytics from './crashlytics'`
+ *  gives the real package: a runtime that ever writes `crashlytics.setCustomKey(...)` must find
+ *  it here, or `--target playable` fails with [MISSING_EXPORT] and nothing else does. */
+export const crashlytics = {
+  recordError(_message: string): void {},
+  log(_message: string): void {},
+  setCustomKey(_key: string, _value: string | number | boolean): void {},
+  crash(): void {},
+  setEnabled(_enabled: boolean): void {},
+};
