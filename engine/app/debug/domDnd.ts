@@ -14,7 +14,7 @@
  *  drag. Runs renderer-side (DOM only), so it works in dev AND the packaged DMG. */
 
 import { resolveDomPoint, aimProvenance, type DomPointSpec } from './domResolve';
-import type { DomPointResolution } from './domPointContract';
+import { NOTHING_AT_POINT, type DomPointResolution } from './domPointContract';
 
 /** Where a drag endpoint is — either a CSS selector or viewport CSS coordinates.
  *  A selector targets the element's center; coordinates use `elementFromPoint`. */
@@ -140,12 +140,33 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
   // indistinguishable from a gesture a user could actually perform. So a QA case could pass on a
   // drop that is broken for every human. Both endpoints are affected: a covered SOURCE gets
   // `dragstart` dispatched onto something a human could not even grab.
-  const covered = [
-    ...(fromAim.occluded ? [`the source (from) is covered by ${fromAim.hitTarget}`] : []),
-    ...(toAim.occluded ? [`the target (to) is covered by ${toAim.hitTarget}`] : []),
-  ];
+  //
+  // COVERED and NOT-ON-SCREEN are different diagnoses with different remedies, and the field
+  // this reads can be either. `aimProvenance` reports `occluded` whenever the topmost element is
+  // not the target — including when `elementFromPoint` returns NOTHING, which means the point is
+  // off-window or clipped away rather than covered. Interpolating `hitTarget` blindly there
+  // produced the literal text "covered by null": false (nothing covers it) and unactionable
+  // (there is no menu to dismiss). `occlusionAt` already normalises this with NOTHING_AT_POINT;
+  // this is the second reader of the same field and it has to agree with the first.
+  const describeAim = (aim: typeof fromAim, which: string): string | null => {
+    if (!aim.occluded) return null;
+    // Most specific first: `clipped` means the target is scrolled out of its OWN panel, which
+    // reads as "covered" but is fixed by scrolling, not by dismissing anything.
+    if (aim.clipped) return `the ${which} is scrolled out of its own panel's visible area`;
+    const cover = aim.hitTarget && aim.hitTarget !== NOTHING_AT_POINT ? aim.hitTarget : null;
+    return cover
+      ? `the ${which} is covered by ${cover}`
+      : `the ${which} is off-window or clipped away — nothing is at its point at all`;
+  };
+  const covered = [describeAim(fromAim, 'source (from)'), describeAim(toAim, 'target (to)')]
+    .filter((m): m is string => m !== null);
   const warnings: string[] = [];
-  if (covered.length > 0) {
+  // Gated on the drop having actually LANDED, which is what `warning` claims by contract ("the
+  // drop landed, but ..."). Occlusion cannot cause a no-op here — dispatchEvent bypasses
+  // hit-testing — so on a failed drop the cover is irrelevant, and pairing it with the `error`
+  // that says nothing happened produced a self-contradicting result: an error stating the drop
+  // was a no-op beside a warning asserting a human could not have performed it.
+  if (covered.length > 0 && types.length > 0 && accepted) {
     warnings.push(
       `THIS DROP IS NOT ONE A HUMAN COULD PERFORM: ${covered.join(' and ')}. The events were dispatched straight at the element, which bypasses the browser's hit-testing, so the handler ran anyway — a real drag would have been delivered to the covering element and the intended handler would never have fired. Do not rest a QA verdict on this gesture: move the cover out of the way (close the menu/modal, scroll the row into view) and repeat it.`,
     );

@@ -44,6 +44,17 @@ function place<T extends Element>(el: T, x: number, y: number, w = 10, h = 10): 
   stack.push(el);
   return el;
 }
+/** An element with a real rect that the hit-test CANNOT see — nothing is registered at its
+ *  point, so `elementFromPoint` returns null there. That is the off-window / clipped-away case,
+ *  which reads as `occluded` with NO cover to name. */
+function placeInvisible<T extends Element>(el: T, x: number, y: number, w = 10, h = 10): T {
+  el.getBoundingClientRect = () => ({
+    left: x, top: y, width: w, height: h, right: x + w, bottom: y + h, x, y, toJSON() {},
+  }) as DOMRect;
+  document.body.appendChild(el);
+  return el;   // deliberately NOT pushed onto `stack`
+}
+
 document.elementFromPoint = (x: number, y: number) => {
   for (let i = stack.length - 1; i >= 0; i--) {
     const r = stack[i].getBoundingClientRect();
@@ -292,6 +303,43 @@ describe('performDomDnd', () => {
     /** A COORDINATE aim matched nothing by name, so there is nothing for it to be occluded
      *  relative to — whatever sits under the point IS the target. Reporting `occluded` there
      *  would be a category error, and it would fire on every coordinate drop. */
+    /** `elementFromPoint` returning null means the point is off-window or clipped away — NOT
+     *  that something covers it. `aimProvenance` still reports `occluded` (nothing is on top of
+     *  the target), but `hitTarget` is null, and interpolating that blindly produced the literal
+     *  agent-facing text "covered by null": false, and unactionable — there is no menu to
+     *  dismiss. The sibling reader of this same field (`occlusionAt`) already normalises it. */
+    it('says off-window rather than "covered by null" when nothing is at the point', async () => {
+      const src = document.createElement('div'); src.id = 'is';
+      const dst = document.createElement('div'); dst.id = 'id2';
+      place(src, 0, 0);
+      placeInvisible(dst, 400, 0);          // resolves by selector; hit-test sees nothing there
+      src.addEventListener('dragstart', (e) => (e as DragEvent).dataTransfer!.setData('application/editor-asset', '/p.prefab.json'));
+      dst.addEventListener('dragover', (e) => e.preventDefault());
+      const res = await performDomDnd({ from: { selector: '#is' }, to: { selector: '#id2' } }, { editVersion: () => 1 });
+      expect(res.to.occluded).toBe(true);
+      expect(res.warning).toMatch(/off-window or clipped away/);
+      expect(res.warning).not.toMatch(/covered by null/);
+      expect(res.warning).not.toMatch(/null/);
+    });
+
+    /** `warning`'s contract is "the drop landed, but ...". Occlusion cannot CAUSE a no-op here —
+     *  dispatchEvent bypasses hit-testing — so on a failed drop the cover is irrelevant, and
+     *  pairing it with the error that says nothing happened is self-contradicting. */
+    it('stays silent about a cover when the drop did not land at all', async () => {
+      const src = document.createElement('div'); src.id = 'ns';
+      const dst = document.createElement('div'); dst.id = 'nd';
+      place(src, 0, 0); place(dst, 100, 0);
+      const cover = document.createElement('div');
+      cover.setAttribute('data-ui-id', 'modal.scrim');
+      place(cover, -5, -5, 30, 30);          // covers the SOURCE
+      // No dragstart writer → empty transfer → ok:false with an error.
+      const res = await performDomDnd({ from: { selector: '#ns' }, to: { selector: '#nd' } });
+      expect(res.ok).toBe(false);
+      expect(res.error).toMatch(/no-op/);
+      expect(res.from.occluded).toBe(true);   // provenance is still REPORTED...
+      expect(res.warning).toBeUndefined();     // ...but not asserted as a human-impossible drop
+    });
+
     it('does not claim occlusion for a coordinate endpoint', async () => {
       scene(null);
       const res = await performDomDnd({ from: { x: 5, y: 5 }, to: { x: 105, y: 5 } });

@@ -346,7 +346,12 @@ export function applyQualityTier(tier: QualityTier, source: TierSource, reason: 
   setActiveQualityTier({ tier, source, reason });
   applyActiveTierToRuntime();
 
-  console.warn(
+  // `log`, not `warn` — same rule as tierResolve's boot lines, and this one was MISSED by that
+  // sweep. Measured on a Galaxy S22 (2026-08-20): a cold boot switched to 'mid' and then 'low' as
+  // the first frames came in over budget, and with `console.warn` reporting as a Crashlytics ISSUE
+  // that is two alerting issues per session for the adaptive tier system working exactly as
+  // designed. The device that most needs the headroom is the one that files the most noise.
+  console.log(
     `[qualityTier] switched to '${tier}' — ${reason}. `
     + 'Anti-aliasing changes only take effect on the next renderer creation (constructor option).',
   );
@@ -502,7 +507,8 @@ export function tickTierCalibration(now: number = rawNow()): void {
     // would print every 5 s for the life of the process and train everyone to filter it out.
     if (!loggedHold) {
       loggedHold = true;
-      console.warn(
+      // A hold is the steady state, not an anomaly — see the switch above.
+      console.log(
         `[qualityTier] holding at '${active.tier}' — ${decision.reason}`
         + `${assessed ? ` (assessed via ${assessed.source}: ${assessed.reason})` : ''}`,
       );

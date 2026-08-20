@@ -56,11 +56,15 @@ function sceneFiles(): string[] {
  *  Two-way, like `authoredAssetRefs.test.ts`'s BASELINE: a NEW legacy scene fails, and an entry
  *  that stops firing also fails (so the list cannot outlive the exceptions it documents). */
 const BASELINE: { file: string; why: string }[] = [
-  {
-    file: 'games/chess/runtime/assets/scenes/chess.scene.json',
-    why: 'spawns entities on load, so save-all bakes ~70 runtime entities into the file (#124). '
-      + 'Cannot be re-saved until save-all distinguishes authored from runtime-spawned.',
-  },
+  // EMPTY, and that is the two-way check working rather than a list nobody maintained.
+  // `games/chess/…/chess.scene.json` sat here because save-all baked its ~70 runtime-spawned
+  // entities into the file (#124) — but #124 is CLOSED: an entity spawned from inside a system
+  // tick is tagged `Transient` at the spawn site and never serialized, and chess's projection
+  // opts into `pauseWhileStopped` so a stopped-mode system cannot rewrite authored state either.
+  // The scene was re-saved in #268 and measured across the round trip: 83 entities before, 83
+  // after, none added or removed, `version` 9 -> 12 the only content change. So the exemption had
+  // outlived its exception, and this test said so — which is the whole point of failing on an
+  // entry that stops firing.
 ];
 
 /** The markers the current serializer never writes.

@@ -126,6 +126,38 @@ Two renderers read the same `skin2DBuffers` entry:
   click-selectable (dots hit-tested first; skinned bodies by mesh AABB) and gizmo-
   poseable (the 2D gizmo gate was generalized off the Renderable2D-only check to any
   Transform target, with extents from the mesh AABB / a bone point).
+- **Skin panel preview** (`editor/panels/SkinCanvas.tsx` + `texturedMesh.ts`) — a THIRD
+  deformed-mesh renderer, and the only hand-rolled one. SceneView and GameView both draw the
+  rig through a PixiJS `Mesh`, which textures per triangle in hardware and is therefore correct
+  by construction; the Skin panel draws its own preview in **Canvas2D**, which has no textured
+  primitive, so the per-triangle mapping has to be done by hand.
+  **`drawTexturedMesh` does it per TRIANGLE**: clip to the triangle's posed outline, then blit
+  the source rect under that triangle's own UV→vertex affine (`triUvToPosAffine`). Three
+  point-pairs determine an affine uniquely, so per triangle the map is exact.
+  ⚠️ **It used to derive ONE affine for the whole part**, from its first non-degenerate triangle.
+  That is exact while a part moves RIGIDLY — which is all Parts mode does, and where the affine
+  path came from — but a 2x3 affine expresses translation/rotation/scale/shear, i.e. a transform
+  that is the same everywhere, and a skinned BEND gives every triangle a different blend of bone
+  matrices. So in Weights/Pose the wireframe bent and the texture did not, drifting further from
+  the mesh the further a triangle sat from triangle #0 (bug `BHZa4wP22gXZ85p6dpbH`, case
+  QA-ASSET-0029). The preview's whole job is judging weights, and weights are judged on the ART —
+  so it could make correct weights look wrong. `uvToPosAffine` still exists for the one question
+  a single affine genuinely answers, "what is this part's orientation/size" (`partAngle`, the
+  Parts inspector), and says so in its doc comment.
+  Two consequences worth knowing before touching it:
+  - **Clips overlap by design.** Adjacent clips are antialiased, so abutting them exactly leaves
+    a background-coloured hairline on every shared edge — on a 60-triangle part that reads as a
+    wireframe drawn in background colour, worse than the bug. Each clip is pushed out from its
+    centroid, **clamped to a quarter of the triangle's own radius** so the overlap stays a
+    seam-width fix at any zoom; a flat half-pixel is unbounded relative to a triangle and, zoomed
+    far out, lets later triangles overpaint earlier ones.
+  - **A degenerate-UV triangle now leaves a HOLE** rather than being painted approximately by
+    another triangle's affine. That is deliberate — a visible gap beats a silently wrong texture —
+    but it is a behaviour change for any hand-edited rig carrying a collinear-UV sliver.
+  Cost is not the objection it looks like: measured on `zombie.rig2d.json` (16 parts, the
+  heaviest rig here), 952 clipped blits per redraw total **0.63 ms** against a 16 ms frame.
+  ⚠️ Measure it the same way if you change this — timing across two `requestAnimationFrame`
+  waits measures frame LATENCY, not draw cost, and reads ~26 ms for the same work.
 
 ## 2.5D billboards (`Billboard3D`)
 

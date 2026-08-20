@@ -204,17 +204,26 @@ describe('promotion WAITS for a scene boundary', () => {
     setRenderSettings({ three: { qualityTier: 'auto', tiers: { mid: TIER_SETTINGS.mid, low: TIER_SETTINGS.low } } });
     setActiveQualityTier({ tier: 'mid', source: 'measured', reason: 'probe measured middle' });
     armTierCalibration();   // the reset above un-armed it (#227)
+    // ⚠️ `log`, not `warn` — the channel moved on 2026-08-20 and the ONCE-ness is what this test is
+    // actually about, so it follows the line rather than pinning the old severity. `console.warn`
+    // now files a Crashlytics ISSUE, and a hold is the steady state of the adaptive tier system:
+    // on a Galaxy S22 a cold boot demoted twice while the first frames came in over budget, which
+    // filed two alerting issues for the system working as designed.
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     try {
       for (let t = 0; t <= PROMOTION_HOLD_MS * 4; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
       expect(getPendingTierPromotion()).toBeNull();
       expect(getActiveQualityTier()?.tier).toBe('mid');
       // ONE explanation, not one every hold period. Four hold periods elapsed above; an undeduped
       // log would print on each and train everyone to filter the channel out.
-      const holds = warn.mock.calls.filter((c) => String(c[0]).includes('holding at'));
+      const holds = log.mock.calls.filter((c) => String(c[0]).includes('holding at'));
       expect(holds).toHaveLength(1);
       expect(String(holds[0][0])).toContain('probe measured middle');
+      // and it must NOT have gone out as a warning, since that is now an alerting issue
+      expect(warn.mock.calls.filter((c) => String(c[0]).includes('holding at'))).toHaveLength(0);
     } finally {
+      log.mockRestore();
       warn.mockRestore();
     }
   });

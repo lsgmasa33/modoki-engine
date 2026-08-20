@@ -115,25 +115,49 @@ export function setPartVisible(def: Rig2DFile, idx: number, visible: boolean): R
 
 // ── Part geometry helpers (position/rotation are implicit in the mesh verts) ──
 
-/** Solve the affine UV→position map from the first non-degenerate triangle. Exact for a
- *  rigidly transformed grid; a single-affine approximation for a deformed mesh. Null when
- *  there are no UVs or no usable triangle. Shared by the SkinCanvas backdrop + the Parts
- *  inspector (both read the part's orientation from this map). */
-export function uvToPosAffine(verts: number[][], uvs: number[][], tris: number[]): { m00: number; m01: number; m10: number; m11: number; tx: number; ty: number } | null {
+export interface UvAffine { m00: number; m01: number; m10: number; m11: number; tx: number; ty: number }
+
+/** Solve the affine UV→position map for ONE triangle. Null when its UVs are collinear
+ *  (degenerate — no invertible map).
+ *
+ *  This is the unit the texture blit is built on, and that is the whole point. A 2x3 affine
+ *  expresses translation, rotation, scale and shear — i.e. a transform that is the SAME
+ *  everywhere on the part. It cannot express a skinned BEND, where each triangle receives a
+ *  different blend of bone matrices. Deriving one affine for a whole deformed part therefore
+ *  paints the art with one triangle's transform and lets it drift from the mesh everywhere else
+ *  (bug `BHZa4wP22gXZ85p6dpbH`, QA-ASSET-0029: the Weights/Pose preview's wireframe bent and its
+ *  texture did not). Per triangle, the map is EXACT — a triangle is three points, and three
+ *  point-pairs determine an affine uniquely. */
+export function triUvToPosAffine(
+  uv0: number[], uv1: number[], uv2: number[],
+  p0: number[], p1: number[], p2: number[],
+): UvAffine | null {
+  const e1x = uv1[0] - uv0[0], e1y = uv1[1] - uv0[1];
+  const e2x = uv2[0] - uv0[0], e2y = uv2[1] - uv0[1];
+  const det = e1x * e2y - e2x * e1y;
+  if (Math.abs(det) < 1e-9) return null; // collinear UVs → not invertible
+  const f1x = p1[0] - p0[0], f1y = p1[1] - p0[1];
+  const f2x = p2[0] - p0[0], f2y = p2[1] - p0[1];
+  const m00 = (f1x * e2y - f2x * e1y) / det, m01 = (-f1x * e2x + f2x * e1x) / det;
+  const m10 = (f1y * e2y - f2y * e1y) / det, m11 = (-f1y * e2x + f2y * e1x) / det;
+  return { m00, m01, m10, m11, tx: p0[0] - (m00 * uv0[0] + m01 * uv0[1]), ty: p0[1] - (m10 * uv0[0] + m11 * uv0[1]) };
+}
+
+/** The part's SINGLE affine UV→position map, from the first non-degenerate triangle. Exact for a
+ *  rigidly transformed grid; a coarse approximation for a deformed one — see
+ *  {@link triUvToPosAffine} for why, and do NOT use this to draw a deformed part.
+ *
+ *  Its remaining honest job is asking a whole part "what is your orientation?" ({@link partAngle},
+ *  the Parts inspector), where one answer is the question. Null when there are no UVs or no
+ *  usable triangle. */
+export function uvToPosAffine(verts: number[][], uvs: number[][], tris: number[]): UvAffine | null {
   if (uvs.length !== verts.length || tris.length < 3) return null;
   for (let t = 0; t + 2 < tris.length; t += 3) {
     const uv0 = uvs[tris[t]], uv1 = uvs[tris[t + 1]], uv2 = uvs[tris[t + 2]];
     const p0 = verts[tris[t]], p1 = verts[tris[t + 1]], p2 = verts[tris[t + 2]];
     if (!uv0 || !uv1 || !uv2 || !p0 || !p1 || !p2) continue;
-    const e1x = uv1[0] - uv0[0], e1y = uv1[1] - uv0[1];
-    const e2x = uv2[0] - uv0[0], e2y = uv2[1] - uv0[1];
-    const det = e1x * e2y - e2x * e1y;
-    if (Math.abs(det) < 1e-9) continue; // collinear UVs → skip
-    const f1x = p1[0] - p0[0], f1y = p1[1] - p0[1];
-    const f2x = p2[0] - p0[0], f2y = p2[1] - p0[1];
-    const m00 = (f1x * e2y - f2x * e1y) / det, m01 = (-f1x * e2x + f2x * e1x) / det;
-    const m10 = (f1y * e2y - f2y * e1y) / det, m11 = (-f1y * e2x + f2y * e1x) / det;
-    return { m00, m01, m10, m11, tx: p0[0] - (m00 * uv0[0] + m01 * uv0[1]), ty: p0[1] - (m10 * uv0[0] + m11 * uv0[1]) };
+    const aff = triUvToPosAffine(uv0, uv1, uv2, p0, p1, p2);
+    if (aff) return aff;
   }
   return null;
 }

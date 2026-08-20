@@ -7,7 +7,8 @@ import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
-import { activePartOf, withActivePart, partCount, uvToPosAffine, bboxCenter } from './skinParts';
+import { activePartOf, withActivePart, partCount, bboxCenter } from './skinParts';
+import { drawTexturedMesh } from './texturedMesh';
 import { coerceRigBones } from '../../runtime/skinning/rig2dTypes';
 import { getAssetEntry, resolveGuidToPath } from '../../runtime/loaders/assetManifest';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
@@ -344,28 +345,26 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
       if (!bindVerts.length) continue;
 
       // Sprite backdrop (full opacity, so parts occlude exactly like the runtime and the draw
-      // order reads true). Preferred path: an affine blit derived from the mesh's UV→vert map,
-      // so the art follows the mesh's rotation/scale/deform during authoring. Fallback (no UVs
-      // / degenerate tri): the old axis-aligned AABB blit. A sliced sprite draws its atlas
-      // sub-rect; a whole-image ref draws the full texture.
+      // order reads true). Preferred path: a PER-TRIANGLE textured blit, so the art follows the
+      // mesh's rotation/scale AND its skinned deformation. It used to derive ONE affine for the
+      // whole part, which is exact only while the part moves rigidly — under a Weights/Pose bend
+      // the wireframe deformed and the texture did not (bug `BHZa4wP22gXZ85p6dpbH`). Fallback (no
+      // UVs / no usable triangle): the old axis-aligned AABB blit. A sliced sprite draws its
+      // atlas sub-rect; a whole-image ref draws the full texture.
       const img = weightsOnly ? null : imgOf(dp);
       if (img) {
         const sp = dp.view.sprite ? getAssetEntry(dp.view.sprite)?.sprite : undefined;
         const sx = sp ? sp.rect.x : 0, sy = sp ? sp.rect.y : 0;
         const sw = sp ? sp.rect.w : img.naturalWidth, sh = sp ? sp.rect.h : img.naturalHeight;
-        const aff = uvToPosAffine(dverts, uvs, tris);
         ctx.save();
         ctx.globalAlpha = 1;
         ctx.imageSmoothingEnabled = true;
-        if (aff && sw > 0 && sh > 0) {
-          // imgPx → canvas: a = ∂canvasX/∂imgX etc. (UV 0..1 spans the sprite rect).
-          const a = scale * aff.m00 / sw, c = scale * aff.m01 / sh;
-          const b = scale * aff.m10 / sw, d = scale * aff.m11 / sh;
-          const e = -a * sx - c * sy + scale * aff.tx + ox;
-          const f = -b * sx - d * sy + scale * aff.ty + oy;
-          ctx.transform(a, b, c, d, e, f); // composes over the base dpr transform
-          ctx.drawImage(img, sx, sy, sw, sh, sx, sy, sw, sh);
-        } else {
+        // Per TRIANGLE, not per part: each triangle is clipped to its own posed outline and
+        // blitted under its own UV→vert affine, so the art follows a skinned bend. Falls back
+        // below when there are no usable UVs.
+        const drawn = sw > 0 && sh > 0
+          && drawTexturedMesh(ctx, img, dverts, uvs, tris, { sx, sy, sw, sh }, scale, ox, oy);
+        if (!drawn) {
           let vmnX = Infinity, vmnY = Infinity, vmxX = -Infinity, vmxY = -Infinity;
           for (const p of bindVerts) { if (p[0] < vmnX) vmnX = p[0]; if (p[0] > vmxX) vmxX = p[0]; if (p[1] < vmnY) vmnY = p[1]; if (p[1] > vmxY) vmxY = p[1]; }
           let umn = 0, vmn = 0, umx = 1, vmx = 1;

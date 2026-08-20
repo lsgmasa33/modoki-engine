@@ -94,6 +94,16 @@ no NDK reporting at all — rather than a resolution error, so no build log woul
 **Four rules the heal follows here, each of them a bug that was found and fixed rather than a
 principle someone thought of first** (close-out, 2026-08-20):
 
+- **An ordinary-path warn is a LOG, and the sweep for them is not done by grepping one shape.**
+  `console.warn` files a Crashlytics issue (owner, 2026-08-20), so anything that fires on a healthy
+  launch becomes an alerting issue per session. The first sweep caught `tierResolve`'s boot lines
+  and the OTA confirmBoot catch, and MISSED `tierCalibration`'s tier switch and hold reports —
+  because they only fire on a device that actually changes tier, which the iPad never did. Measured
+  on a Galaxy S22: a cold boot demoted to `mid` then `low` as the first frames came in over budget,
+  filing **4** `recordException` calls for the adaptive system working as designed; after the fix,
+  **0**. ⚠️ The device that needs the headroom most is the one that files the most noise, so a
+  one-device check is not a check. Genuine anomalies still warn — a scene that never finishes
+  loading (the `ARM_BACKSTOP_MS` failsafe) is a real problem and stays a warning.
 - **A note means a real change.** The dSYM phase and the archive-time "Debug build is ON" phase
   both used to splice in right after the `PBXShellScriptBuildPhase` section-open line, so each put
   ITSELF first and shoved the other second: the two objects swapped on every project open, each
