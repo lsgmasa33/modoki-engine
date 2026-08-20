@@ -104,15 +104,24 @@ entity at a new id, so the next save emitted byte-identical data in a different 
 so this is purely about making a scene diff readable, and about letting "`git status` is
 clean" mean something after a save.
 
-⚠️ **The committed scene files predate that fix, so the FIRST save of any project rewrites
-its scene with a one-time, contentless reorder.** Measured 2026-08-19: a bare Save All with
-no edit at all produces the diff on `games/anim-bug` and `games/timeline-demo` (a guid-keyed
-comparison shows the same entities, zero content differences, identical top-level fields),
-and a second save is byte-identical — one-shot, not churn. A static sweep of the ordering
-rule over every committed scene puts it at **52 of 53 files**. Two consequences: don't read
-that diff as a bug, and don't treat a post-save `git status` as evidence of a content change
-without comparing as parsed data first. Retiring it means re-saving every project once, which
-is a deliberate `games/**`+`demos/**` commit nobody has made yet.
+**The committed files have now been re-saved to match (`957fd9d7e`, #268), so a save no
+longer reorders anything.** They used to predate the fix, which made the FIRST save of any
+project rewrite its scene with a one-time contentless reorder; every project was opened and
+every scene loaded and saved through this serializer, and the 48 files that moved were
+verified against HEAD as parsed data keyed by guid — same entity set, no entity whose content
+differs, identical top-level fields, order only.
+
+⚠️ **So a reorder diff is now a FINDING.** Nothing routine produces one any more, which
+inverts the old advice: don't read such a diff as expected churn, report it. Still true, and
+the reason the guid-keyed comparison is worth keeping in hand: don't treat a post-save
+`git status` as evidence of a *content* change without comparing as parsed data first.
+
+**Three files were deliberately left un-normalized**, because their re-save is not order-only
+— `games/3d-test/…/skinned-test.scene.json` (a prefab-instance `added` child gains
+`castShadow`/`receiveShadow`, trait fields the engine grew after the file was written),
+`games/chess/…/chess.scene.json` (format `version` 9 → 12), and
+`games/iap-test/…/main.scene.json` (drops an orphan legacy top-level `id`). A save of one of
+those still produces a diff, and it is a content diff rather than a reorder.
 
 ### Only NON-DEFAULT trait fields are written
 

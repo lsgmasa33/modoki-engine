@@ -14,6 +14,12 @@
   ],
   "entities": [
     {
+      "name": "Time (resource)",
+      "traits": {
+        "Time": {}
+      }
+    },
+    {
       "name": "Camera",
       "traits": {
         "Transform": {},
@@ -73,17 +79,17 @@
       }
     },
     {
-      "name": "Ground",
+      "name": "Wall",
       "traits": {
         "Transform": {
-          "x": 500,
-          "y": 880
+          "x": 940,
+          "y": 780
         },
         "Renderable2D": {
           "sprite": "square",
-          "color": 5923954,
-          "width": 480,
-          "height": 25
+          "color": 12597547,
+          "width": 12,
+          "height": 75
         },
         "RigidBody2D": {
           "bodyType": "static",
@@ -91,48 +97,16 @@
         },
         "Collider2D": {
           "radius": 0,
-          "halfW": 480,
-          "halfH": 25,
+          "halfW": 12,
+          "halfH": 75,
           "friction": 0.9,
           "physicsLayer": "Ground"
         },
         "EntityAttributes": {
-          "name": "Ground",
+          "name": "Wall",
           "parentId": "e9963acc-f171-486a-86a1-a12a625a517d",
           "layer": "2d",
-          "guid": "5f1472de-eca3-4482-8ae4-d247b9a3f28f"
-        }
-      }
-    },
-    {
-      "name": "Step 1",
-      "traits": {
-        "Transform": {
-          "x": 430,
-          "y": 845
-        },
-        "Renderable2D": {
-          "sprite": "square",
-          "color": 5923954,
-          "width": 45,
-          "height": 10
-        },
-        "RigidBody2D": {
-          "bodyType": "static",
-          "angularDamping": 0.05
-        },
-        "Collider2D": {
-          "radius": 0,
-          "halfW": 45,
-          "halfH": 10,
-          "friction": 0.9,
-          "physicsLayer": "Ground"
-        },
-        "EntityAttributes": {
-          "name": "Step 1",
-          "parentId": "e9963acc-f171-486a-86a1-a12a625a517d",
-          "layer": "2d",
-          "guid": "cf5ca79a-82b3-4518-ad6b-5b37942b5926"
+          "guid": "0109e96b-0ddf-4f8a-b79c-f1f2376ffb00"
         }
       }
     },
@@ -164,6 +138,38 @@
           "parentId": "e9963acc-f171-486a-86a1-a12a625a517d",
           "layer": "2d",
           "guid": "33cf302f-b45a-4c8f-bf2c-8dd1091bdd39"
+        }
+      }
+    },
+    {
+      "name": "Ground",
+      "traits": {
+        "Transform": {
+          "x": 500,
+          "y": 880
+        },
+        "Renderable2D": {
+          "sprite": "square",
+          "color": 5923954,
+          "width": 480,
+          "height": 25
+        },
+        "RigidBody2D": {
+          "bodyType": "static",
+          "angularDamping": 0.05
+        },
+        "Collider2D": {
+          "radius": 0,
+          "halfW": 480,
+          "halfH": 25,
+          "friction": 0.9,
+          "physicsLayer": "Ground"
+        },
+        "EntityAttributes": {
+          "name": "Ground",
+          "parentId": "e9963acc-f171-486a-86a1-a12a625a517d",
+          "layer": "2d",
+          "guid": "5f1472de-eca3-4482-8ae4-d247b9a3f28f"
         }
       }
     },
@@ -200,17 +206,17 @@
       }
     },
     {
-      "name": "Platform",
+      "name": "Step 1",
       "traits": {
         "Transform": {
-          "x": 800,
-          "y": 720
+          "x": 430,
+          "y": 845
         },
         "Renderable2D": {
           "sprite": "square",
-          "color": 3447003,
-          "width": 70,
-          "height": 12
+          "color": 5923954,
+          "width": 45,
+          "height": 10
         },
         "RigidBody2D": {
           "bodyType": "static",
@@ -218,48 +224,16 @@
         },
         "Collider2D": {
           "radius": 0,
-          "halfW": 70,
-          "halfH": 12,
+          "halfW": 45,
+          "halfH": 10,
           "friction": 0.9,
           "physicsLayer": "Ground"
         },
         "EntityAttributes": {
-          "name": "Platform",
+          "name": "Step 1",
           "parentId": "e9963acc-f171-486a-86a1-a12a625a517d",
           "layer": "2d",
-          "guid": "ffd117ee-4655-4574-8d30-9fcbc69e3c13"
-        }
-      }
-    },
-    {
-      "name": "Wall",
-      "traits": {
-        "Transform": {
-          "x": 940,
-          "y": 780
-        },
-        "Renderable2D": {
-          "sprite": "square",
-          "color": 12597547,
-          "width": 12,
-          "height": 75
-        },
-        "RigidBody2D": {
-          "bodyType": "static",
-          "angularDamping": 0.05
-        },
-        "Collider2D": {
-          "radius": 0,
-          "halfW": 12,
-          "halfH": 75,
-          "friction": 0.9,
-          "physicsLayer": "Ground"
-        },
-        "EntityAttributes": {
-          "name": "Wall",
-          "parentId": "e9963acc-f171-486a-86a1-a12a625a517d",
-          "layer": "2d",
-          "guid": "0109e96b-0ddf-4f8a-b79c-f1f2376ffb00"
+          "guid": "cf5ca79a-82b3-4518-ad6b-5b37942b5926"
         }
       }
     },
@@ -305,6 +279,38 @@
           "clipSet": "c30624da-016c-40dc-a0f1-3f9330e0c665",
           "clip": "idle",
           "playing": false
+        }
+      }
+    },
+    {
+      "name": "Platform",
+      "traits": {
+        "Transform": {
+          "x": 800,
+          "y": 720
+        },
+        "Renderable2D": {
+          "sprite": "square",
+          "color": 3447003,
+          "width": 70,
+          "height": 12
+        },
+        "RigidBody2D": {
+          "bodyType": "static",
+          "angularDamping": 0.05
+        },
+        "Collider2D": {
+          "radius": 0,
+          "halfW": 70,
+          "halfH": 12,
+          "friction": 0.9,
+          "physicsLayer": "Ground"
+        },
+        "EntityAttributes": {
+          "name": "Platform",
+          "parentId": "e9963acc-f171-486a-86a1-a12a625a517d",
+          "layer": "2d",
+          "guid": "ffd117ee-4655-4574-8d30-9fcbc69e3c13"
         }
       }
     },
@@ -501,12 +507,6 @@
             }
           ]
         }
-      }
-    },
-    {
-      "name": "Time (resource)",
-      "traits": {
-        "Time": {}
       }
     }
   ]

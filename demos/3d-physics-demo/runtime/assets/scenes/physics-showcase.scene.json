@@ -110,6 +110,20 @@
       }
     },
     {
+      "name": "Walls",
+      "traits": {
+        "Transform": {},
+        "EntityAttributes": {
+          "name": "Walls",
+          "sortOrder": 5,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "96beab37-61a1-4c88-9549-16f7ae316777",
+          "editorFolder": "Level"
+        }
+      }
+    },
+    {
       "name": "Wall +X",
       "traits": {
         "Transform": {
@@ -861,20 +875,6 @@
           "layer": "3d",
           "guid": "beb971aa-24d8-470a-84d9-7e0acda6aba0",
           "editorFolder": "Interaction"
-        }
-      }
-    },
-    {
-      "name": "Walls",
-      "traits": {
-        "Transform": {},
-        "EntityAttributes": {
-          "name": "Walls",
-          "sortOrder": 5,
-          "parentId": "",
-          "layer": "3d",
-          "guid": "96beab37-61a1-4c88-9549-16f7ae316777",
-          "editorFolder": "Level"
         }
       }
     },

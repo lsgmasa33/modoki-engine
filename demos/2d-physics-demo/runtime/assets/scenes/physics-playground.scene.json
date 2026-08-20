@@ -5,31 +5,24 @@
   "resources": [],
   "entities": [
     {
-      "name": "Camera",
+      "name": "Time (resource)",
       "traits": {
-        "Transform": {},
-        "Camera": {
-          "fov": 50,
-          "far": 1000,
-          "overlayDistance": 10,
-          "clearColor": 921114
-        },
-        "EntityAttributes": {
-          "name": "Camera",
-          "parentId": "",
-          "layer": "3d",
-          "guid": "d331b383-a514-47a2-aed4-775fd058e57e"
-        }
+        "Time": {}
       }
     },
     {
-      "name": "Physics2D",
+      "name": "Pendulum Joint",
       "traits": {
-        "Physics2D": {},
+        "Joint2D": {
+          "type": "revolute",
+          "entityA": "d585385a-cc71-404c-a9e8-e96bee458f7a",
+          "entityB": "addc1d7c-85f1-4bca-a10c-8ce66606558b",
+          "anchorBX": -200
+        },
         "EntityAttributes": {
-          "name": "Physics2D",
+          "name": "Pendulum Joint",
           "parentId": "",
-          "guid": "f5269e82-411d-49b7-9a5a-ddde631ac053"
+          "guid": "3f727e26-9c14-485f-ae65-85f79f9a695d"
         }
       }
     },
@@ -58,6 +51,72 @@
         },
         "UIAnchor": {
           "safeArea": false
+        }
+      }
+    },
+    {
+      "name": "Spring Bob",
+      "traits": {
+        "Transform": {
+          "x": 780,
+          "y": 500
+        },
+        "Renderable2D": {
+          "sprite": "circle",
+          "color": 1752220,
+          "width": 28,
+          "height": 28
+        },
+        "RigidBody2D": {
+          "angularDamping": 0.05,
+          "ccd": true
+        },
+        "Collider2D": {
+          "shape": "circle",
+          "radius": 28,
+          "halfW": 0,
+          "halfH": 0,
+          "friction": 0.4,
+          "restitution": 0.4
+        },
+        "EntityAttributes": {
+          "name": "Spring Bob",
+          "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
+          "layer": "2d",
+          "guid": "008b5be1-dcb2-4f85-aac2-72fbdfd9e35e"
+        }
+      }
+    },
+    {
+      "name": "Spring Anchor",
+      "traits": {
+        "Transform": {
+          "x": 780,
+          "y": 150
+        },
+        "Renderable2D": {
+          "sprite": "circle",
+          "color": 8947848,
+          "width": 10,
+          "height": 10
+        },
+        "RigidBody2D": {
+          "bodyType": "static",
+          "angularDamping": 0.05
+        },
+        "Collider2D": {
+          "shape": "circle",
+          "radius": 10,
+          "halfW": 0,
+          "halfH": 0,
+          "friction": 0.4,
+          "restitution": 0.3
+        },
+        "EntityAttributes": {
+          "name": "Spring Anchor",
+          "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
+          "layer": "2d",
+          "guid": "07d36d40-a148-4f64-b4e2-4f8292de6b23"
         }
       }
     },
@@ -126,6 +185,73 @@
       }
     },
     {
+      "name": "Sensor Zone",
+      "traits": {
+        "Transform": {
+          "x": 500,
+          "y": 620
+        },
+        "Renderable2D": {
+          "sprite": "square",
+          "color": 15844367,
+          "opacity": 0.25,
+          "width": 400,
+          "height": 15
+        },
+        "RigidBody2D": {
+          "bodyType": "static",
+          "angularDamping": 0.05
+        },
+        "Collider2D": {
+          "radius": 0,
+          "halfW": 170,
+          "halfH": 15,
+          "restitution": 0.2,
+          "isSensor": true
+        },
+        "OnCollision2D": {
+          "onEnter": "sensorZone/enter",
+          "onExit": "sensorZone/exit"
+        },
+        "EntityAttributes": {
+          "name": "Sensor Zone",
+          "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
+          "layer": "2d",
+          "guid": "31dea4a2-f407-420e-a8a6-1b070d7ac099"
+        }
+      }
+    },
+    {
+      "name": "Box C",
+      "traits": {
+        "Transform": {
+          "x": 242,
+          "y": 360
+        },
+        "Renderable2D": {
+          "sprite": "square",
+          "color": 10181046,
+          "width": 40,
+          "height": 40
+        },
+        "RigidBody2D": {
+          "angularDamping": 0.05
+        },
+        "Collider2D": {
+          "radius": 0,
+          "halfW": 40,
+          "halfH": 40,
+          "restitution": 0.2
+        },
+        "EntityAttributes": {
+          "name": "Box C",
+          "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
+          "layer": "2d",
+          "guid": "75353351-ea1e-4ce7-a22c-52bcb1e4d5ac"
+        }
+      }
+    },
+    {
       "name": "Right Wall",
       "traits": {
         "Transform": {
@@ -188,62 +314,34 @@
       }
     },
     {
-      "name": "Box B",
+      "name": "Pendulum Bob",
       "traits": {
         "Transform": {
-          "x": 258,
-          "y": 560
+          "x": 450,
+          "y": 220
         },
         "Renderable2D": {
-          "sprite": "square",
-          "color": 15965202,
-          "width": 40,
-          "height": 40
+          "sprite": "circle",
+          "color": 3447003,
+          "width": 30,
+          "height": 30
         },
         "RigidBody2D": {
           "angularDamping": 0.05
         },
         "Collider2D": {
-          "radius": 0,
-          "halfW": 40,
-          "halfH": 40,
-          "restitution": 0.2
+          "shape": "circle",
+          "radius": 30,
+          "halfW": 0,
+          "halfH": 0,
+          "friction": 0,
+          "restitution": 0.3
         },
         "EntityAttributes": {
-          "name": "Box B",
+          "name": "Pendulum Bob",
           "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
           "layer": "2d",
-          "guid": "daf05f86-d8e6-447d-954b-1bdef005a53b"
-        }
-      }
-    },
-    {
-      "name": "Box C",
-      "traits": {
-        "Transform": {
-          "x": 242,
-          "y": 360
-        },
-        "Renderable2D": {
-          "sprite": "square",
-          "color": 10181046,
-          "width": 40,
-          "height": 40
-        },
-        "RigidBody2D": {
-          "angularDamping": 0.05
-        },
-        "Collider2D": {
-          "radius": 0,
-          "halfW": 40,
-          "halfH": 40,
-          "restitution": 0.2
-        },
-        "EntityAttributes": {
-          "name": "Box C",
-          "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
-          "layer": "2d",
-          "guid": "75353351-ea1e-4ce7-a22c-52bcb1e4d5ac"
+          "guid": "addc1d7c-85f1-4bca-a10c-8ce66606558b"
         }
       }
     },
@@ -282,38 +380,6 @@
       }
     },
     {
-      "name": "Bouncy Ball",
-      "traits": {
-        "Transform": {
-          "x": 500,
-          "y": 250
-        },
-        "Renderable2D": {
-          "sprite": "circle",
-          "color": 3066993,
-          "width": 45,
-          "height": 45
-        },
-        "RigidBody2D": {
-          "angularDamping": 0.05
-        },
-        "Collider2D": {
-          "shape": "circle",
-          "radius": 45,
-          "halfW": 0,
-          "halfH": 0,
-          "friction": 0.3,
-          "restitution": 0.9
-        },
-        "EntityAttributes": {
-          "name": "Bouncy Ball",
-          "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
-          "layer": "2d",
-          "guid": "ed229002-cd09-4c7c-8bdf-8f2d040d1b6e"
-        }
-      }
-    },
-    {
       "name": "Pendulum Anchor",
       "traits": {
         "Transform": {
@@ -347,116 +413,64 @@
       }
     },
     {
-      "name": "Pendulum Bob",
+      "name": "Box B",
       "traits": {
         "Transform": {
-          "x": 450,
-          "y": 220
+          "x": 258,
+          "y": 560
+        },
+        "Renderable2D": {
+          "sprite": "square",
+          "color": 15965202,
+          "width": 40,
+          "height": 40
+        },
+        "RigidBody2D": {
+          "angularDamping": 0.05
+        },
+        "Collider2D": {
+          "radius": 0,
+          "halfW": 40,
+          "halfH": 40,
+          "restitution": 0.2
+        },
+        "EntityAttributes": {
+          "name": "Box B",
+          "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
+          "layer": "2d",
+          "guid": "daf05f86-d8e6-447d-954b-1bdef005a53b"
+        }
+      }
+    },
+    {
+      "name": "Bouncy Ball",
+      "traits": {
+        "Transform": {
+          "x": 500,
+          "y": 250
         },
         "Renderable2D": {
           "sprite": "circle",
-          "color": 3447003,
-          "width": 30,
-          "height": 30
+          "color": 3066993,
+          "width": 45,
+          "height": 45
         },
         "RigidBody2D": {
           "angularDamping": 0.05
         },
         "Collider2D": {
           "shape": "circle",
-          "radius": 30,
+          "radius": 45,
           "halfW": 0,
           "halfH": 0,
-          "friction": 0,
-          "restitution": 0.3
+          "friction": 0.3,
+          "restitution": 0.9
         },
         "EntityAttributes": {
-          "name": "Pendulum Bob",
+          "name": "Bouncy Ball",
           "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
           "layer": "2d",
-          "guid": "addc1d7c-85f1-4bca-a10c-8ce66606558b"
-        }
-      }
-    },
-    {
-      "name": "Pendulum Joint",
-      "traits": {
-        "Joint2D": {
-          "type": "revolute",
-          "entityA": "d585385a-cc71-404c-a9e8-e96bee458f7a",
-          "entityB": "addc1d7c-85f1-4bca-a10c-8ce66606558b",
-          "anchorBX": -200
-        },
-        "EntityAttributes": {
-          "name": "Pendulum Joint",
-          "parentId": "",
-          "guid": "3f727e26-9c14-485f-ae65-85f79f9a695d"
-        }
-      }
-    },
-    {
-      "name": "Spring Anchor",
-      "traits": {
-        "Transform": {
-          "x": 780,
-          "y": 150
-        },
-        "Renderable2D": {
-          "sprite": "circle",
-          "color": 8947848,
-          "width": 10,
-          "height": 10
-        },
-        "RigidBody2D": {
-          "bodyType": "static",
-          "angularDamping": 0.05
-        },
-        "Collider2D": {
-          "shape": "circle",
-          "radius": 10,
-          "halfW": 0,
-          "halfH": 0,
-          "friction": 0.4,
-          "restitution": 0.3
-        },
-        "EntityAttributes": {
-          "name": "Spring Anchor",
-          "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
-          "layer": "2d",
-          "guid": "07d36d40-a148-4f64-b4e2-4f8292de6b23"
-        }
-      }
-    },
-    {
-      "name": "Spring Bob",
-      "traits": {
-        "Transform": {
-          "x": 780,
-          "y": 500
-        },
-        "Renderable2D": {
-          "sprite": "circle",
-          "color": 1752220,
-          "width": 28,
-          "height": 28
-        },
-        "RigidBody2D": {
-          "angularDamping": 0.05,
-          "ccd": true
-        },
-        "Collider2D": {
-          "shape": "circle",
-          "radius": 28,
-          "halfW": 0,
-          "halfH": 0,
-          "friction": 0.4,
-          "restitution": 0.4
-        },
-        "EntityAttributes": {
-          "name": "Spring Bob",
-          "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
-          "layer": "2d",
-          "guid": "008b5be1-dcb2-4f85-aac2-72fbdfd9e35e"
+          "guid": "ed229002-cd09-4c7c-8bdf-8f2d040d1b6e"
         }
       }
     },
@@ -478,46 +492,32 @@
       }
     },
     {
-      "name": "Sensor Zone",
+      "name": "Camera",
       "traits": {
-        "Transform": {
-          "x": 500,
-          "y": 620
-        },
-        "Renderable2D": {
-          "sprite": "square",
-          "color": 15844367,
-          "opacity": 0.25,
-          "width": 400,
-          "height": 15
-        },
-        "RigidBody2D": {
-          "bodyType": "static",
-          "angularDamping": 0.05
-        },
-        "Collider2D": {
-          "radius": 0,
-          "halfW": 170,
-          "halfH": 15,
-          "restitution": 0.2,
-          "isSensor": true
-        },
-        "OnCollision2D": {
-          "onEnter": "sensorZone/enter",
-          "onExit": "sensorZone/exit"
+        "Transform": {},
+        "Camera": {
+          "fov": 50,
+          "far": 1000,
+          "overlayDistance": 10,
+          "clearColor": 921114
         },
         "EntityAttributes": {
-          "name": "Sensor Zone",
-          "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
-          "layer": "2d",
-          "guid": "31dea4a2-f407-420e-a8a6-1b070d7ac099"
+          "name": "Camera",
+          "parentId": "",
+          "layer": "3d",
+          "guid": "d331b383-a514-47a2-aed4-775fd058e57e"
         }
       }
     },
     {
-      "name": "Time (resource)",
+      "name": "Physics2D",
       "traits": {
-        "Time": {}
+        "Physics2D": {},
+        "EntityAttributes": {
+          "name": "Physics2D",
+          "parentId": "",
+          "guid": "f5269e82-411d-49b7-9a5a-ddde631ac053"
+        }
       }
     }
   ]

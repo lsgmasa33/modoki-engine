@@ -17,7 +17,7 @@ import { audioDispose, audioResume } from '@modoki/engine/runtime';
 import { VideoOverlay } from '@modoki/engine/runtime';
 import { useKeyboardShift } from './hooks/useKeyboardShift';
 import { onTierSwitchOverlay } from '@modoki/engine/runtime';
-import { checkAppOtaUpdate, subscribeOtaGate, type OtaGateState } from './ota';
+import { checkAppOtaUpdate, isPluginUnimplemented, subscribeOtaGate, type OtaGateState } from './ota';
 import OtaRestartGate from './ui/components/OtaRestartGate';
 import { loadStagedSubgames } from './subgameLoader';
 import { findGame as findGameInRegistry } from './gameRegistry';
@@ -403,7 +403,14 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         if (Capacitor.isNativePlatform()) {
           import('capacitor-modoki-ota')
             .then((m) => m.ModokiOta.confirmBoot({ name: 'shell' }))
-            .catch((e) => console.warn('[GameShell] OTA confirmBoot failed (non-fatal):', e));
+            .catch((e) => {
+              // A project without the OTA native plugin rejects this on EVERY launch, so a warn
+              // here files a Crashlytics issue per session for a non-event. A real confirmBoot
+              // failure still warns — on a project that ships OTA it is what the rollback
+              // watchdog keys on. See `isPluginUnimplemented`.
+              if (isPluginUnimplemented(e)) console.log('[GameShell] no OTA plugin on this platform — confirmBoot skipped');
+              else console.warn('[GameShell] OTA confirmBoot failed (non-fatal):', e);
+            });
         }
 
         // Dismiss the native splash on this SAME "fully booted" signal (Phase 3b) —
@@ -415,7 +422,12 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         if (Capacitor.isNativePlatform() && isFirstLoad) {
           import('@capacitor/splash-screen')
             .then((m) => m.SplashScreen.hide())
-            .catch((e) => console.warn('[GameShell] SplashScreen.hide failed (non-fatal):', e));
+            .catch((e) => {
+              // Same shape as the OTA catch above. Not observed firing — SplashScreen ships in
+              // every project today — but a project that drops it would warn every launch.
+              if (isPluginUnimplemented(e)) console.log('[GameShell] no SplashScreen plugin — hide skipped');
+              else console.warn('[GameShell] SplashScreen.hide failed (non-fatal):', e);
+            });
         }
 
         activeGameIdRef.current = gameId;

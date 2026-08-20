@@ -235,6 +235,45 @@ describe('globalErrors — rate limiting', () => {
     expect(sink.errors[3]).toContain('BRAND NEW');
   });
 
+  /**
+   * ⚠️ REGRESSION (close-out, 2026-08-20). When `console.warn` became an ISSUE it also started
+   * spending the ERROR budget, and that inverted what this limiter exists for. Dedupe keys on
+   * exact text, so it does nothing against the ~97 runtime warn sites that interpolate a value
+   * (`[MeshCache] Texture load failed: ${ref}`, one per ref): 100 such warns exhausted
+   * `MAX_ERRORS_PER_SESSION`, and from then on EVERY genuine crash that session was dropped by the
+   * cap — silently, since `allow()` just returns false.
+   *
+   * Warns are still delivered as issues. They simply have their OWN session budget now, so they
+   * cannot spend the one that exists to guarantee a crash gets through.
+   */
+  it('does NOT let a warn flood spend the crash budget', async () => {
+    let t = 0;
+    const m = await load(() => t);
+    m.registerAppServices({ crashlytics: svc });
+
+    // Distinct text every time — the shape dedupe cannot touch. Step the clock so the BURST window
+    // (shared on purpose) is never the thing under test.
+    for (let i = 0; i < 300; i++) {
+      if (i % 20 === 0) t += 6000;
+      m.captureToCrashlytics('warn', `[console.warn] texture load failed: ref-${i}`);
+    }
+    const afterFlood = sink.errors.length;
+    expect(afterFlood, 'the warns are capped by their own budget').toBeLessThanOrEqual(100);
+
+    t += 6000;
+    m.captureToCrashlytics('error', 'REAL CRASH — the report that matters');
+    expect(sink.errors, 'and a genuine crash still gets through').toHaveLength(afterFlood + 1);
+    expect(sink.errors[sink.errors.length - 1]).toContain('REAL CRASH');
+  });
+
+  it('delivers a warn as an ISSUE, not a breadcrumb — a separate budget is not a separate destination', async () => {
+    const m = await load();
+    m.registerAppServices({ crashlytics: svc });
+    m.captureToCrashlytics('warn', 'something to look at');
+    expect(sink.errors).toEqual(['something to look at']);
+    expect(sink.logs).toEqual([]);
+  });
+
   it('bounds the dedupe table rather than growing a key per distinct message forever', async () => {
     let t = 0;
     const m = await load(() => t);

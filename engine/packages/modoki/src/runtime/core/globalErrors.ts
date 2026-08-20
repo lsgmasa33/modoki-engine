@@ -47,12 +47,29 @@ import { rawNow } from './clock';
  *
  * The caps below matter MORE under this decision, not less: they are what stops a warn inside a
  * per-frame system from becoming 60 issues a second. */
-export type CaptureKind = 'error' | 'breadcrumb';
+export type CaptureKind = 'error' | 'warn' | 'breadcrumb';
 
 /** Caps. A warn inside a per-frame system is 60 calls/second; unbounded, that is a flooded
  *  console, a throttled SDK and a real bridge cost on the player's phone for no information. */
 const MAX_REPEATS_PER_MESSAGE = 3;
 const MAX_ERRORS_PER_SESSION = 100;
+/**
+ * ⚠️ **A SEPARATE session budget for warn-derived issues, and the separation is the point.**
+ *
+ * When `console.warn` started reporting as an ISSUE it also started spending the ERROR budget, and
+ * that quietly inverted what this rate limiter is for. The dedupe above keys on exact message text,
+ * so it does nothing against the ~97 runtime warn sites that interpolate a value
+ * (`[MeshCache] Texture load failed: ${ref}`, one per distinct ref) — 100 such warns exhaust
+ * `MAX_ERRORS_PER_SESSION`, and from then on EVERY genuine crash in that session is dropped
+ * silently by the cap. Measured in a close-out review: 200 distinct warns followed by a real
+ * `console.error` delivered 100 warns and not the crash.
+ *
+ * Warns are still delivered as issues — the owner's decision is unchanged — they simply cannot
+ * consume the budget that exists to guarantee a crash gets through. The burst window below stays
+ * SHARED on purpose: that one is about instantaneous load on the SDK and the device, which does not
+ * care where a message came from.
+ */
+const MAX_WARNS_PER_SESSION = 100;
 const MAX_BREADCRUMBS_PER_SESSION = 500;
 /** Burst ceiling, for the flood that DEFEATS dedupe by varying its text (an entity id in the
  *  message). Sliding window, deliberately coarse. */
@@ -88,6 +105,7 @@ let reporting = false;
 
 const repeats = new Map<string, number>();
 let errorsSent = 0;
+let warnsSent = 0;
 let breadcrumbsSent = 0;
 let windowStart = 0;
 let windowCount = 0;
@@ -161,9 +179,13 @@ function allow(kind: CaptureKind, text: string): boolean {
   repeats.set(text, Math.min(seen, MAX_REPEATS_PER_MESSAGE + 1));
   if (seen > MAX_REPEATS_PER_MESSAGE) return false;
 
-  // 2. Session cap — read, not yet charged.
-  if (kind === 'error' ? errorsSent >= MAX_ERRORS_PER_SESSION
-                       : breadcrumbsSent >= MAX_BREADCRUMBS_PER_SESSION) return false;
+  // 2. Session cap — read, not yet charged. THREE budgets, not two: see MAX_WARNS_PER_SESSION for
+  //    why a warn flood must not be able to spend the crash budget.
+  const spent = kind === 'error' ? errorsSent : kind === 'warn' ? warnsSent : breadcrumbsSent;
+  const cap = kind === 'error' ? MAX_ERRORS_PER_SESSION
+            : kind === 'warn' ? MAX_WARNS_PER_SESSION
+            : MAX_BREADCRUMBS_PER_SESSION;
+  if (spent >= cap) return false;
 
   // 3. Burst window, charged only for a send.
   const t = now();
@@ -175,6 +197,7 @@ function allow(kind: CaptureKind, text: string): boolean {
   windowCount++;
 
   if (kind === 'error') errorsSent++;
+  else if (kind === 'warn') warnsSent++;
   else breadcrumbsSent++;
   return true;
 }
@@ -191,8 +214,10 @@ function deliver(kind: CaptureKind, text: string): void {
   }
   reporting = true;
   try {
-    if (kind === 'error') svc.recordError(text);
-    else svc.log(text);
+    // 'warn' delivers as an ISSUE exactly like 'error' — it is a separate BUDGET, not a separate
+    // destination. Only 'breadcrumb' takes the log path.
+    if (kind === 'breadcrumb') svc.log(text);
+    else svc.recordError(text);
   } catch {
     /* a reporting failure must never amplify the thing it is reporting */
   } finally {
@@ -314,8 +339,9 @@ export function installGlobalErrorHandlers(): void {
       };
       console.warn = (...args: unknown[]) => {
         try {
-          // 'error', not 'breadcrumb' — owner's call, see the CaptureKind doc above.
-          captureToCrashlytics('error', `[console.warn] ${describeArgs(args)}`);
+          // 'warn': delivered as an ISSUE (owner's call, see the CaptureKind doc above) but on its
+          // OWN session budget, so a warn flood cannot silence a later crash.
+          captureToCrashlytics('warn', `[console.warn] ${describeArgs(args)}`);
         } catch { /* ignore */ }
         realWarn(...args);
       };
@@ -338,6 +364,7 @@ export function __dedupeTableSizeForTest(): number {
 export function __resetGlobalErrorsForTest(opts?: { clock?: () => number; uninstall?: boolean }): void {
   repeats.clear();
   errorsSent = 0;
+  warnsSent = 0;
   breadcrumbsSent = 0;
   windowStart = 0;
   windowCount = 0;

@@ -570,6 +570,13 @@ export async function runProbeForDiagnostics(only2D = false): Promise<string> {
       () => runBootRampProbe((stage) => { lastStage = stage; }, only2D));
     if (!measurement) {
       const msg = `produced no measurement — last stage '${lastStage}'`;
+      // ⚠️ `log`, including for the FAILURE lines in this function — unlike the boot path above,
+      // where "no usable reading" and "threw at stage" stay warnings. The rule is the same one
+      // applied to a different caller: `runProbeForDiagnostics` is hand-triggered from the debug
+      // menu and its result is returned to the UI that asked for it, so nobody learns anything
+      // from an alerting issue that the person standing in front of the screen is not already
+      // being shown. (1b1e22400's message said anomalies stay warnings; that is true of the boot
+      // path and was imprecise about this one — noted rather than left to look like a slip.)
       console.log(`[rampProbe] DIAGNOSTIC (idle) ${msg}`);
       return msg;
     }

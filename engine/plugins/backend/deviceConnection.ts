@@ -212,6 +212,7 @@ export function explainConnectFailure(
 // the two modules import each other. Re-exported so the several call sites that resolve adb the
 // SAME way (never a bare `adb` on PATH) keep one import path.
 export { adbBinary } from './androidDevices';
+import { discoverBridgePort } from './androidBridgePort';
 
 /** The `adb forward` calls behind an overridable seam, so tests can inject a spy without mocking the
  *  `child_process` module (which fights vitest's per-file module cache in the full suite).
@@ -673,7 +674,71 @@ export class DeviceConnectionManager {
       onState: (s, d) => { this.state = s; this.detail = explainConnectFailure(d, devicePort, useAdb, debugBuild); },
     });
     this.target = { host, port, useAdb, ...(serial ? { serial } : {}) };
-    const landed = await this.client.connect();
+    let landed = await this.client.connect();
+    // #283 — the app may be up and listening on a port that is NOT the default. Ask the DEVICE
+    // where its bridge actually is and try once more.
+    //
+    // Only after a failed landing (this costs three `adb shell` reads, and the happy path must not
+    // pay for them), only over adb (the reads need a shell), and only when the caller did not name
+    // a port — an explicit port is an instruction, and second-guessing it would take the escape
+    // hatch away from the very case it exists for.
+    //
+    // `discoverBridgePort` resolves the FOREGROUND app's uid and returns the socket that uid owns,
+    // so this cannot wander onto a backgrounded sibling — which is #88, and is a worse outcome than
+    // the refusal it would be replacing.
+    if (useAdb && req.port === undefined) {
+      const found = discoverBridgePort(serial);
+      // The test is PORT OWNERSHIP, not an identity self-report. An earlier cut asked the connected
+      // app to name itself and only re-targeted on a mismatch — which was inert against exactly the
+      // app most likely to be squatting: `court`'s older bridge answers no `app-identity` at all,
+      // so the check saw "could not look" and stood down (the docs already say the squatter is
+      // usually the build that cannot answer). uid ownership is ground truth and needs nobody's
+      // cooperation: if the FOREGROUND app owns a listening socket that is not the one we reached,
+      // we are on the wrong app whether or not anyone will admit it.
+      if (found && found.port !== devicePort) {
+        if (landed === 'connected') {
+          console.warn(`[device] connected on ${devicePort}, but ${found.pkg} is in the foreground and `
+            + `owns ${found.port} — re-targeting, since every device_* call would otherwise drive the `
+            + `wrong app (#88/#283).`);
+        }
+        this.retargetIdentity();
+        try {
+          // Hang up on the wrong app BEFORE re-targeting. Two live lease clients over one host
+          // port would both hold sockets through the same forward rule, and the one we are
+          // abandoning is exactly the app we do not want driven.
+          try { await this.client.disconnect(); } catch { /* already dead is fine */ }
+          adbRunner.forward(port, serial, found.port);
+          this.transport = new TcpLeaseTransport(host, port);
+          this.client = new DeviceLeaseClient({
+            guid: this.guid,
+            transport: this.transport,
+            onState: (st, d) => { this.state = st; this.detail = explainConnectFailure(d, found.port, useAdb, debugBuild); },
+          });
+          this.target = { host, port, useAdb, ...(serial ? { serial } : {}) };
+          landed = await this.client.connect();
+          if (landed === 'connected') {
+            console.warn(`[device] the app is listening on ${found.port}, not the default ${devicePort} `
+              + `(${found.pkg} — it lost the bind race, #283). Connected there.`);
+            // Verify the app that ANSWERED is the one we aimed at. The port already belongs to the
+            // foreground app's uid, so this should always agree — but "should" is what #88 was too,
+            // and a lease pointed at a sibling game answers every later call plausibly and wrongly.
+            //
+            // Only when the bridge NAMES itself: a pre-#88 build reports null, and refusing or
+            // crying mismatch on "could not look" would break every older build for no signal.
+            const answering = await this.deviceAppId();
+            if (answering && answering !== found.pkg) {
+              console.warn(`[device] ⚠️ discovered port ${found.port} for ${found.pkg}, but the app `
+                + `answering is ${answering}. device_* calls will drive ${answering} — disconnect and `
+                + `relaunch the app you meant (#88/#283).`);
+            }
+          }
+        } catch (e) {
+          // Keep the ORIGINAL failure as the reported one: this retry is a bonus attempt, and
+          // replacing "the app never answered" with "adb forward failed" would hide the real cause.
+          console.warn(`[device] port rediscovery failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    }
     // A connect that did NOT land must hand the hardware back (#164). The adb-forward failure above
     // already does this; the handshake failure did not, so the commonest failure of all — the app
     // is not listening — left a machine-wide claim standing. The visible symptom is the nastiest
@@ -836,6 +901,30 @@ export class DeviceConnectionManager {
   async deviceHardware(): Promise<DeviceHardware> {
     const { deviceModel, osVersion } = await this.deviceIdentity();
     return { deviceModel, osVersion };
+  }
+
+  /** Should `connect` go looking for the bridge on another port? (#283)
+   *
+   *  TWO cases, and the second is the one that matters more in practice:
+   *
+   *   1. **The connect FAILED.** Nothing answered on the default port — the app may be up and
+   *      listening elsewhere.
+   *   2. **The connect SUCCEEDED, with the WRONG APP.** This is #88, and it is the commoner shape:
+   *      a backgrounded sibling that still holds the default port answers the handshake perfectly,
+   *      so there is no failure to notice. Measured on a Galaxy A23 — `court` held 9095 while
+   *      `skin-test` sat on 39213, and a bare `device_connect` landed on Court and reported
+   *      success. Every later `device_*` call would have driven the wrong game.
+   *
+   *  The mismatch test requires BOTH names to be known: a pre-#88 bridge reports a null appId, and
+   *  a phone with nothing in focus reports no package. "Could not look" is never a mismatch — that
+   *  would send every older build off rediscovering for no reason. */
+  private retargetIdentity(): void {
+    // The identity is LATCHED per lease, so it must be cleared before re-targeting or the new app
+    // would be reported under the OLD app's name — a wrong answer dressed as a verified one.
+    this.platformResolved = false;
+    this.platformInFlight = null;
+    this.platform = null;
+    this.appId = null;
   }
 
   /** One probe, every fact. Latching rules are unchanged (see `devicePlatform`'s doc): a null is

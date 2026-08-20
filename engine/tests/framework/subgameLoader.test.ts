@@ -32,7 +32,15 @@ vi.mock('@capacitor/core', () => ({
   Capacitor: { isNativePlatform: h.isNativePlatform, convertFileSrc: h.convertFileSrc },
 }));
 vi.mock('virtual:modoki-project-config', () => ({ default: { ota: h.ota } }));
-vi.mock('../../app/ota', () => ({ checkAppSubgameUpdates: h.checkAppSubgameUpdates }));
+// ⚠️ BOTH exports, not just the one this suite drives. `subgameLoader` also imports
+// `isPluginUnimplemented` to decide whether a confirmBoot rejection is worth a warning, and a
+// partial mock makes it `undefined` — harmless while every confirmBoot here RESOLVES, and a
+// TypeError inside the catch the moment one rejects. The reject-path test below is what makes
+// that visible instead of latent.
+vi.mock('../../app/ota', () => ({
+  checkAppSubgameUpdates: h.checkAppSubgameUpdates,
+  isPluginUnimplemented: (e: unknown) => (e as { code?: string } | null)?.code === 'UNIMPLEMENTED',
+}));
 vi.mock('capacitor-modoki-ota', () => ({
   ModokiOta: { listBundles: h.listBundles, confirmBoot: h.confirmBoot },
 }));
@@ -141,6 +149,42 @@ describe('subgameLoader — concurrency & error-visibility fixes', () => {
     expect(errors[0].bundleName).toBe('bundle-a');
     expect(errors[0].message).toMatch(/shared dependency load failed/);
     expect(getGames()).toEqual([]); // never registered — the failure happened before load
+    __resetGameRegistryForTest();
+  });
+
+  /**
+   * ⚠️ The confirmBoot REJECT path had no test, and that is what let a partial `app/ota` mock go
+   * unnoticed: `subgameLoader` imports `isPluginUnimplemented` to decide whether a rejection is
+   * worth a warning, the mock above did not provide it, and every existing test's confirmBoot
+   * RESOLVES — so the `undefined` was never called. It would have thrown a TypeError inside the
+   * catch on the first real rejection, turning a non-fatal OTA hiccup into a broken load path.
+   *
+   * Both branches asserted, because the whole point of the helper is telling them apart: an
+   * UNIMPLEMENTED rejection (no OTA plugin on this platform) is ordinary and must NOT warn — since
+   * `console.warn` files a Crashlytics issue — while any other failure still must.
+   */
+  it.each([
+    ['UNIMPLEMENTED (no OTA plugin) — quiet', Object.assign(new Error('not implemented'), { code: 'UNIMPLEMENTED' }), false],
+    ['a genuine confirmBoot failure — warns', new Error('watchdog write failed'), true],
+  ])('survives a confirmBoot rejection: %s', async (_label, rejection, expectWarn) => {
+    h.confirmBoot.mockRejectedValueOnce(rejection);
+    mockBundleEnv({
+      '/bundle-a': { manifest: { schema: 1, engineApi: 1, sharedDeps: [], entry: 'subgame.js' }, gameId: 'game-a', scriptDelayMs: 0 },
+    });
+    h.listBundles.mockResolvedValue({ bundles: [{ name: 'bundle-a', version: 'v1', path: '/bundle-a' }] });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    const { loadStagedSubgames } = await import('../../app/subgameLoader');
+    const { getGames, __resetGameRegistryForTest } = await import('../../app/gameRegistry');
+    __resetGameRegistryForTest();
+
+    // The load itself must still succeed — confirmBoot is best-effort.
+    await expect(loadStagedSubgames()).resolves.not.toThrow();
+    expect(getGames().map((g) => g.id)).toEqual(['game-a']);
+
+    const warnedAboutConfirmBoot = warn.mock.calls.some((c) => String(c[0]).includes('confirmBoot failed'));
+    expect(warnedAboutConfirmBoot).toBe(expectWarn);
     __resetGameRegistryForTest();
   });
 

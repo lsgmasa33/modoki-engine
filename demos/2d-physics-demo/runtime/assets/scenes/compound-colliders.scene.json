@@ -5,37 +5,6 @@
   "resources": [],
   "entities": [
     {
-      "name": "Camera",
-      "traits": {
-        "Transform": {},
-        "Camera": {
-          "fov": 50,
-          "far": 1000,
-          "overlayDistance": 10,
-          "clearColor": 921114
-        },
-        "EntityAttributes": {
-          "name": "Camera",
-          "parentId": "",
-          "layer": "3d",
-          "guid": "e6996373-44f0-447c-92fd-79a513697a35"
-        }
-      }
-    },
-    {
-      "name": "Physics2D",
-      "traits": {
-        "Physics2D": {
-          "gravityY": 15
-        },
-        "EntityAttributes": {
-          "name": "Physics2D",
-          "parentId": "",
-          "guid": "a5ebb8b4-6486-46a5-a0c6-38b90cd20bec"
-        }
-      }
-    },
-    {
       "name": "Playground",
       "traits": {
         "RenderableUI": true,
@@ -92,106 +61,6 @@
           "parentId": "41591727-2384-43e2-9665-ef48d0905c4e",
           "layer": "2d",
           "guid": "7d87b283-617f-422c-a6b8-ca9b2e3d838f"
-        }
-      }
-    },
-    {
-      "name": "Table",
-      "traits": {
-        "Transform": {
-          "x": 230,
-          "y": 220
-        },
-        "RigidBody2D": {
-          "angularDamping": 0.4
-        },
-        "EntityAttributes": {
-          "name": "Table",
-          "parentId": "41591727-2384-43e2-9665-ef48d0905c4e",
-          "guid": "be8be74d-04d0-4784-bb19-c959fd887eb6"
-        }
-      }
-    },
-    {
-      "name": "Table · top",
-      "traits": {
-        "Transform": {
-          "y": -60
-        },
-        "Renderable2D": {
-          "sprite": "square",
-          "color": 15105570,
-          "width": 90,
-          "height": 12
-        },
-        "Collider2D": {
-          "radius": 0,
-          "halfW": 90,
-          "halfH": 12,
-          "friction": 0.6,
-          "restitution": 0.1
-        },
-        "EntityAttributes": {
-          "name": "Table · top",
-          "parentId": "be8be74d-04d0-4784-bb19-c959fd887eb6",
-          "layer": "2d",
-          "guid": "8f341453-23b6-4c25-9902-8f0ac35966d0"
-        }
-      }
-    },
-    {
-      "name": "Table · leg L",
-      "traits": {
-        "Transform": {
-          "x": -70,
-          "y": 20
-        },
-        "Renderable2D": {
-          "sprite": "square",
-          "color": 15105570,
-          "width": 12,
-          "height": 60
-        },
-        "Collider2D": {
-          "radius": 0,
-          "halfW": 12,
-          "halfH": 60,
-          "friction": 0.6,
-          "restitution": 0.1
-        },
-        "EntityAttributes": {
-          "name": "Table · leg L",
-          "parentId": "be8be74d-04d0-4784-bb19-c959fd887eb6",
-          "layer": "2d",
-          "guid": "003d7537-de8e-496c-8864-e620ba315455"
-        }
-      }
-    },
-    {
-      "name": "Table · leg R",
-      "traits": {
-        "Transform": {
-          "x": 70,
-          "y": 20
-        },
-        "Renderable2D": {
-          "sprite": "square",
-          "color": 15105570,
-          "width": 12,
-          "height": 60
-        },
-        "Collider2D": {
-          "radius": 0,
-          "halfW": 12,
-          "halfH": 60,
-          "friction": 0.6,
-          "restitution": 0.1
-        },
-        "EntityAttributes": {
-          "name": "Table · leg R",
-          "parentId": "be8be74d-04d0-4784-bb19-c959fd887eb6",
-          "layer": "2d",
-          "guid": "03187cc3-5cc6-4c79-a8a8-7235467c34fd"
         }
       }
     },
@@ -280,6 +149,34 @@
       }
     },
     {
+      "name": "Dumbbell · weight R",
+      "traits": {
+        "Transform": {
+          "x": 80
+        },
+        "Renderable2D": {
+          "sprite": "circle",
+          "color": 2600544,
+          "width": 30,
+          "height": 30
+        },
+        "Collider2D": {
+          "shape": "circle",
+          "radius": 30,
+          "halfW": 0,
+          "halfH": 0,
+          "friction": 0.6,
+          "restitution": 0.1
+        },
+        "EntityAttributes": {
+          "name": "Dumbbell · weight R",
+          "parentId": "7e9fb453-9456-40b9-b9d4-959ee2fb6b8d",
+          "layer": "2d",
+          "guid": "70cff295-8fae-4a36-8031-987e68bf683b"
+        }
+      }
+    },
+    {
       "name": "Dumbbell · bar",
       "traits": {
         "Transform": {},
@@ -333,30 +230,133 @@
       }
     },
     {
-      "name": "Dumbbell · weight R",
+      "name": "Table",
       "traits": {
         "Transform": {
-          "x": 80
+          "x": 230,
+          "y": 220
+        },
+        "RigidBody2D": {
+          "angularDamping": 0.4
+        },
+        "EntityAttributes": {
+          "name": "Table",
+          "parentId": "41591727-2384-43e2-9665-ef48d0905c4e",
+          "guid": "be8be74d-04d0-4784-bb19-c959fd887eb6"
+        }
+      }
+    },
+    {
+      "name": "Table · leg L",
+      "traits": {
+        "Transform": {
+          "x": -70,
+          "y": 20
         },
         "Renderable2D": {
-          "sprite": "circle",
-          "color": 2600544,
-          "width": 30,
-          "height": 30
+          "sprite": "square",
+          "color": 15105570,
+          "width": 12,
+          "height": 60
         },
         "Collider2D": {
-          "shape": "circle",
-          "radius": 30,
-          "halfW": 0,
-          "halfH": 0,
+          "radius": 0,
+          "halfW": 12,
+          "halfH": 60,
           "friction": 0.6,
           "restitution": 0.1
         },
         "EntityAttributes": {
-          "name": "Dumbbell · weight R",
-          "parentId": "7e9fb453-9456-40b9-b9d4-959ee2fb6b8d",
+          "name": "Table · leg L",
+          "parentId": "be8be74d-04d0-4784-bb19-c959fd887eb6",
           "layer": "2d",
-          "guid": "70cff295-8fae-4a36-8031-987e68bf683b"
+          "guid": "003d7537-de8e-496c-8864-e620ba315455"
+        }
+      }
+    },
+    {
+      "name": "Table · leg R",
+      "traits": {
+        "Transform": {
+          "x": 70,
+          "y": 20
+        },
+        "Renderable2D": {
+          "sprite": "square",
+          "color": 15105570,
+          "width": 12,
+          "height": 60
+        },
+        "Collider2D": {
+          "radius": 0,
+          "halfW": 12,
+          "halfH": 60,
+          "friction": 0.6,
+          "restitution": 0.1
+        },
+        "EntityAttributes": {
+          "name": "Table · leg R",
+          "parentId": "be8be74d-04d0-4784-bb19-c959fd887eb6",
+          "layer": "2d",
+          "guid": "03187cc3-5cc6-4c79-a8a8-7235467c34fd"
+        }
+      }
+    },
+    {
+      "name": "Table · top",
+      "traits": {
+        "Transform": {
+          "y": -60
+        },
+        "Renderable2D": {
+          "sprite": "square",
+          "color": 15105570,
+          "width": 90,
+          "height": 12
+        },
+        "Collider2D": {
+          "radius": 0,
+          "halfW": 90,
+          "halfH": 12,
+          "friction": 0.6,
+          "restitution": 0.1
+        },
+        "EntityAttributes": {
+          "name": "Table · top",
+          "parentId": "be8be74d-04d0-4784-bb19-c959fd887eb6",
+          "layer": "2d",
+          "guid": "8f341453-23b6-4c25-9902-8f0ac35966d0"
+        }
+      }
+    },
+    {
+      "name": "Physics2D",
+      "traits": {
+        "Physics2D": {
+          "gravityY": 15
+        },
+        "EntityAttributes": {
+          "name": "Physics2D",
+          "parentId": "",
+          "guid": "a5ebb8b4-6486-46a5-a0c6-38b90cd20bec"
+        }
+      }
+    },
+    {
+      "name": "Camera",
+      "traits": {
+        "Transform": {},
+        "Camera": {
+          "fov": 50,
+          "far": 1000,
+          "overlayDistance": 10,
+          "clearColor": 921114
+        },
+        "EntityAttributes": {
+          "name": "Camera",
+          "parentId": "",
+          "layer": "3d",
+          "guid": "e6996373-44f0-447c-92fd-79a513697a35"
         }
       }
     }

@@ -5,24 +5,6 @@
   "resources": [],
   "entities": [
     {
-      "name": "Camera",
-      "traits": {
-        "Transform": {},
-        "Camera": {
-          "fov": 50,
-          "far": 1000,
-          "overlayDistance": 10,
-          "clearColor": 921114
-        },
-        "EntityAttributes": {
-          "name": "Camera",
-          "parentId": "",
-          "layer": "3d",
-          "guid": "b11b3657-d7b4-4bdf-8430-2d086d502d51"
-        }
-      }
-    },
-    {
       "name": "Physics2D",
       "traits": {
         "Physics2D": {
@@ -61,39 +43,6 @@
         },
         "UIAnchor": {
           "safeArea": false
-        }
-      }
-    },
-    {
-      "name": "Wall (thin)",
-      "traits": {
-        "Transform": {
-          "x": 850,
-          "y": 300
-        },
-        "Renderable2D": {
-          "sprite": "square",
-          "color": 8949916,
-          "width": 2,
-          "height": 250
-        },
-        "RigidBody2D": {
-          "bodyType": "static",
-          "angularDamping": 0.05
-        },
-        "Collider2D": {
-          "radius": 0,
-          "halfW": 2,
-          "halfH": 250,
-          "friction": 0.3,
-          "restitution": 0.2,
-          "physicsLayer": "Ground"
-        },
-        "EntityAttributes": {
-          "name": "Wall (thin)",
-          "parentId": "82724c73-4be0-4893-8c7c-86f6d8c34310",
-          "layer": "2d",
-          "guid": "c2666346-90db-4e7c-971c-fc66082d6192"
         }
       }
     },
@@ -159,6 +108,57 @@
           "parentId": "82724c73-4be0-4893-8c7c-86f6d8c34310",
           "layer": "2d",
           "guid": "b5fcc852-3640-4e63-9569-e3fff833bf1a"
+        }
+      }
+    },
+    {
+      "name": "Wall (thin)",
+      "traits": {
+        "Transform": {
+          "x": 850,
+          "y": 300
+        },
+        "Renderable2D": {
+          "sprite": "square",
+          "color": 8949916,
+          "width": 2,
+          "height": 250
+        },
+        "RigidBody2D": {
+          "bodyType": "static",
+          "angularDamping": 0.05
+        },
+        "Collider2D": {
+          "radius": 0,
+          "halfW": 2,
+          "halfH": 250,
+          "friction": 0.3,
+          "restitution": 0.2,
+          "physicsLayer": "Ground"
+        },
+        "EntityAttributes": {
+          "name": "Wall (thin)",
+          "parentId": "82724c73-4be0-4893-8c7c-86f6d8c34310",
+          "layer": "2d",
+          "guid": "c2666346-90db-4e7c-971c-fc66082d6192"
+        }
+      }
+    },
+    {
+      "name": "Camera",
+      "traits": {
+        "Transform": {},
+        "Camera": {
+          "fov": 50,
+          "far": 1000,
+          "overlayDistance": 10,
+          "clearColor": 921114
+        },
+        "EntityAttributes": {
+          "name": "Camera",
+          "parentId": "",
+          "layer": "3d",
+          "guid": "b11b3657-d7b4-4bdf-8430-2d086d502d51"
         }
       }
     }

@@ -5,34 +5,9 @@
   "resources": [],
   "entities": [
     {
-      "name": "Camera",
+      "name": "Time (resource)",
       "traits": {
-        "Transform": {},
-        "Camera": {
-          "fov": 50,
-          "far": 1000,
-          "overlayDistance": 10,
-          "clearColor": 921114
-        },
-        "EntityAttributes": {
-          "name": "Camera",
-          "parentId": "",
-          "layer": "3d",
-          "guid": "a4920ad1-d22c-4066-a5c5-d5c9cb1fa545"
-        }
-      }
-    },
-    {
-      "name": "Physics2D",
-      "traits": {
-        "Physics2D": {
-          "gravityY": 15
-        },
-        "EntityAttributes": {
-          "name": "Physics2D",
-          "parentId": "",
-          "guid": "a5510693-9274-4c6a-a726-dd897599be35"
-        }
+        "Time": {}
       }
     },
     {
@@ -60,72 +35,6 @@
         },
         "UIAnchor": {
           "safeArea": false
-        }
-      }
-    },
-    {
-      "name": "Floor",
-      "traits": {
-        "Transform": {
-          "x": 500,
-          "y": 900
-        },
-        "Renderable2D": {
-          "sprite": "square",
-          "color": 5923954,
-          "width": 460,
-          "height": 16
-        },
-        "RigidBody2D": {
-          "bodyType": "static",
-          "angularDamping": 0.05
-        },
-        "Collider2D": {
-          "radius": 0,
-          "halfW": 460,
-          "halfH": 16,
-          "friction": 0.8,
-          "physicsLayer": "Ground"
-        },
-        "EntityAttributes": {
-          "name": "Floor",
-          "parentId": "28c54561-bbea-48ce-80df-def65377a09e",
-          "layer": "2d",
-          "guid": "9c6a611c-d7b1-49f9-83b6-cdc1bd188df6"
-        }
-      }
-    },
-    {
-      "name": "Ramp (polygon — edit me)",
-      "traits": {
-        "Transform": {
-          "x": 687.8446766886324,
-          "y": 560
-        },
-        "Renderable2D": {
-          "sprite": "collider",
-          "color": 15105570,
-          "width": 10,
-          "height": 10
-        },
-        "RigidBody2D": {
-          "bodyType": "static",
-          "angularDamping": 0.05
-        },
-        "Collider2D": {
-          "shape": "polygon",
-          "radius": 0,
-          "halfW": 0,
-          "halfH": 0,
-          "points": "[[-170,70],[170,70],[170,-70]]",
-          "restitution": 0.1,
-          "physicsLayer": "Ground"
-        },
-        "EntityAttributes": {
-          "name": "Ramp (polygon — edit me)",
-          "parentId": "28c54561-bbea-48ce-80df-def65377a09e",
-          "layer": "2d",
-          "guid": "81e3d621-07cd-4283-b361-c9b491063e63"
         }
       }
     },
@@ -164,6 +73,72 @@
       }
     },
     {
+      "name": "Ramp (polygon — edit me)",
+      "traits": {
+        "Transform": {
+          "x": 687.8446766886324,
+          "y": 560
+        },
+        "Renderable2D": {
+          "sprite": "collider",
+          "color": 15105570,
+          "width": 10,
+          "height": 10
+        },
+        "RigidBody2D": {
+          "bodyType": "static",
+          "angularDamping": 0.05
+        },
+        "Collider2D": {
+          "shape": "polygon",
+          "radius": 0,
+          "halfW": 0,
+          "halfH": 0,
+          "points": "[[-170,70],[170,70],[170,-70]]",
+          "restitution": 0.1,
+          "physicsLayer": "Ground"
+        },
+        "EntityAttributes": {
+          "name": "Ramp (polygon — edit me)",
+          "parentId": "28c54561-bbea-48ce-80df-def65377a09e",
+          "layer": "2d",
+          "guid": "81e3d621-07cd-4283-b361-c9b491063e63"
+        }
+      }
+    },
+    {
+      "name": "Floor",
+      "traits": {
+        "Transform": {
+          "x": 500,
+          "y": 900
+        },
+        "Renderable2D": {
+          "sprite": "square",
+          "color": 5923954,
+          "width": 460,
+          "height": 16
+        },
+        "RigidBody2D": {
+          "bodyType": "static",
+          "angularDamping": 0.05
+        },
+        "Collider2D": {
+          "radius": 0,
+          "halfW": 460,
+          "halfH": 16,
+          "friction": 0.8,
+          "physicsLayer": "Ground"
+        },
+        "EntityAttributes": {
+          "name": "Floor",
+          "parentId": "28c54561-bbea-48ce-80df-def65377a09e",
+          "layer": "2d",
+          "guid": "9c6a611c-d7b1-49f9-83b6-cdc1bd188df6"
+        }
+      }
+    },
+    {
       "name": "Ball",
       "traits": {
         "Transform": {
@@ -196,9 +171,34 @@
       }
     },
     {
-      "name": "Time (resource)",
+      "name": "Camera",
       "traits": {
-        "Time": {}
+        "Transform": {},
+        "Camera": {
+          "fov": 50,
+          "far": 1000,
+          "overlayDistance": 10,
+          "clearColor": 921114
+        },
+        "EntityAttributes": {
+          "name": "Camera",
+          "parentId": "",
+          "layer": "3d",
+          "guid": "a4920ad1-d22c-4066-a5c5-d5c9cb1fa545"
+        }
+      }
+    },
+    {
+      "name": "Physics2D",
+      "traits": {
+        "Physics2D": {
+          "gravityY": 15
+        },
+        "EntityAttributes": {
+          "name": "Physics2D",
+          "parentId": "",
+          "guid": "a5510693-9274-4c6a-a726-dd897599be35"
+        }
       }
     }
   ]

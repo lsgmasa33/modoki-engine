@@ -9,10 +9,35 @@
  *  fires after the scene has already rendered) — a blocking gate for `mandatory` releases
  *  needs a pre-scene call site to block from. `checkAppOtaUpdate` resolves `false` when the
  *  caller must NOT proceed to load the scene this launch — see its doc comment. */
-import { Capacitor } from '@capacitor/core';
+import { Capacitor, ExceptionCode } from '@capacitor/core';
 import { checkForUpdate, fetchRelease } from '@modoki/engine/runtime';
 import type { OtaProgressEvent } from 'capacitor-modoki-ota';
 import projectConfig from 'virtual:modoki-project-config';
+
+/**
+ * Is this rejection just "this project does not ship that plugin"?
+ *
+ * ⚠️ **Exists because `console.warn` became a Crashlytics ISSUE** (owner, 2026-08-20). The OTA
+ * confirm is best-effort and native-only, and a project without the OTA native plugin rejects it
+ * on EVERY launch — observed verbatim on an iPad mini and a Galaxy A23 running `games/court`:
+ * `[GameShell] OTA confirmBoot failed (non-fatal)`. Warned about, that becomes the single most
+ * frequent issue such a project files, once per session, for a condition its own message calls
+ * non-fatal. Logged instead, it stays visible and stops crowding out real crashes.
+ *
+ * The distinction is NOT a blanket demotion, which is the tempting version and the wrong one: on
+ * a project that DOES ship OTA (`games/ota-test`), a failing confirmBoot is exactly the thing
+ * worth an alert — it is what the two-boot rollback watchdog keys on. So only the missing-plugin
+ * case is quiet.
+ *
+ * `@capacitor/core` throws `CapacitorException(…, ExceptionCode.Unimplemented)` for a plugin with
+ * no implementation on this platform, and both native bridges reject with the same
+ * `"UNIMPLEMENTED"` code when a method calls `unimplemented()` — verified in
+ * `@capacitor/core/dist/index.cjs.js`, `PluginCall.java` and `CAPPluginCall.swift` rather than
+ * assumed, since the two paths are different code.
+ */
+export function isPluginUnimplemented(e: unknown): boolean {
+  return (e as { code?: string } | null)?.code === ExceptionCode.Unimplemented;
+}
 
 /** The owner's Phase 3 decision (docs/plans/mobile-ota-updates-plan.md): a mandatory
  *  release blocks with a progress screen while it downloads, then a dead-end

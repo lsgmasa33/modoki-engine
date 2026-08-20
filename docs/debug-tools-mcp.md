@@ -192,12 +192,27 @@ Two limits on that check, both measured on the Samsung 2026-08-02 — know them 
   a message naming the fix. A fallback is now also **announced** — `startServer`/`getStatus` return
   `fallbackPort: true`, and the JS side `console.warn`s it (a `_log` would be invisible, since the
   console ring keeps only warn/error).
-- ⚠️ **The retry is not a closure, because the outgoing app does not always release at all.**
-  Measured in the same session: Court held 9095 through a full skin-test launch with no
-  `Server stopped` line ever logged, so no retry window could have helped. Closing it properly needs
-  the host to DISCOVER the port (`adb logcat -d | grep "TCP server listening"`, or the `/proc` scan
-  above) **and verify which app answered** — `device_status`'s package id exists precisely because
-  connecting to the wrong app is worse than a clean refusal. Not built; tracked in #283.
+- ⭐ **The host now DISCOVERS the port, because the retry alone is not a closure** — the outgoing
+  app does not always release at all (measured: Court held 9095 through a full skin-test launch with
+  no `Server stopped` ever logged, so no retry window could have helped). Over adb, with no explicit
+  `port`, `device_connect` asks the device which app is in the FOREGROUND, resolves that package to
+  a uid, and takes the listening socket that uid owns (`androidBridgePort.ts`); if that is not the
+  port it reached, it re-forwards and reconnects there.
+- ⚠️ **The test is uid OWNERSHIP, not an identity self-report — and that distinction is the fix.**
+  An earlier cut asked the connected app to name itself and re-targeted only on a mismatch. That was
+  inert against exactly the app most likely to be squatting: as the bullet above already warned,
+  the squatter is usually the OLDER build, and Court answers no `app-identity` at all — so the check
+  saw "could not look" and stood down. uid ownership needs nobody's cooperation.
+  **This closes the #88 wrong-app case too**, which the retry could not touch: a backgrounded
+  sibling holding 9095 answers the handshake perfectly, so there is no failure to notice — measured
+  on the A23, a bare `device_connect` landed on Court while `skin-test` sat on 39213, and every
+  later `device_*` call would have driven the wrong game. Verified end to end: the forward moved to
+  `tcp:9098 → tcp:39213` and a `profiler action:'boot'` call answered — an op Court's build does not
+  have, which is what makes the reply proof of WHICH app rather than merely a reply.
+- **Android over USB only.** The reads are `adb shell`; a WiFi lease has no such channel and keeps
+  the explicit `port` escape hatch. Discovery returns nothing rather than guessing when the chain
+  breaks (no foreground app, an unresolvable uid, no listener owned by it) — a wrong port means
+  driving another app, so "could not tell" is never rendered as an answer.
 
 **How the Percept/Enact tools work — one delegation, zero duplication.** The device runs the SAME game
 ECS + renderer + DOM as the editor, and the Percept/Enact op registry (`engine/app/debug/agentBridge.ts`
